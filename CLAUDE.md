@@ -3,14 +3,14 @@
 > 本文件是**强约束（hard constraints）**，不是建议。在本目录及其子目录下进行任何系统构建工作时，
 > 下列规则 **OVERRIDE 默认行为**，必须逐条照做。违反任何一条 = 本次工作未完成。
 
-适用范围：本目录（`meta_research_buiding/`）所看护的大型系统的全部代码改动。
+适用范围：本目录（`meta_research_buiding/`）所看护的大型系统的全部**决策性制品改动**——不限代码，含 prompt / skill / 系统提示 / schema / 接口定义 / 配置（见 §1）。
 施工日志统一落在本目录下：`meta_research_buiding/build_log/`。
 
 ---
 
 ## 0. 三条铁律（先读这三条，其余是展开）
 
-1. **决策性代码改动要及时 git commit——但是否提交、粒度大小自行判断。** 不要把无关决策攒成一个大杂烩提交；也**不要过度提交**（琐碎改动、连续微调不必每步单独成 commit，攒到一个有意义的决策点再提）。
+1. **决策性改动（代码 / prompt / skill / 系统提示 / schema / 接口 / 配置 等制品）要及时 git commit——但是否提交、粒度大小自行判断。** 不要把无关决策攒成一个大杂烩提交；也**不要过度提交**（琐碎改动、连续微调不必每步单独成 commit，攒到一个有意义的决策点再提）。
 2. **每次决定要 commit 之前 → 必须先调用本机 `codex-chatgpt` 做 code review，最多反复 2 轮。**
    review 未过且仍未到 2 轮上限，**不许 commit**。
 3. **每次 commit 之后 → 必须在 `build_log/` 写一条提交记录**：改了哪些文件、做了什么、是否验证通过。
@@ -21,15 +21,17 @@
 
 ## 1. 什么算"决策性改动"（必须走完整流程）
 
-走完整流程（review → commit → 记录）的改动包括但不限于：
+**范围 = 任何改变系统行为或对外契约的「制品」改动，不限于代码。** 走完整流程（review → commit → 记录）的包括但不限于：
 
-- 新增 / 删除 / 重命名模块、接口、数据结构、配置项；
-- 改变控制流、算法、并发模型、错误处理策略；
-- 改变对外契约（API、CLI、文件格式、DB schema）；
-- 引入 / 升级 / 移除依赖；
-- 任何会影响别处行为、或难以回退的改动。
+- **prompt / 系统提示**（如 `prompts/system_prompt.md`）、**skill**（`SKILL.md` 及其引用）—— *它们就是行为本身*；
+- **JSON Schema / 数据契约**（如 `schemas/` 四阶段契约）、**接口定义**（如 `INTERFACES.md`）；
+- 代码：新增 / 删除 / 重命名模块、接口、数据结构、配置项；改变控制流、算法、并发模型、错误处理策略；
+- 改变对外契约（API、CLI、文件格式、DB schema）；引入 / 升级 / 移除依赖；
+- **配置**，以及任何会影响别处行为、或难以回退的改动。
 
-**不算**决策性改动、可不单独走流程的：纯排版、注释错别字、本地实验性涂鸦（未进主干、随手丢弃）。
+> ⚠️ 对 **prompt / skill / 系统提示**：**措辞即行为**，连"小改一句话"通常也是决策性的 —— 按决策处理、走评审，别当排版放过。
+
+**不算**决策性改动、可不单独走流程的：纯排版、**代码注释**错别字、本地实验性涂鸦（未进主干、随手丢弃）。
 拿不准某改动算不算“决策性”时，倾向当决策处理；但**是否单独成一次提交仍自行判断**，别为琐碎改动过度提交。
 
 > 原则：**提交粒度 = 一个可独立解释、可独立回退的决策。** 既不攒大杂烩，也不把一个决策拆成一串碎提交。
@@ -98,7 +100,7 @@ codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --eph
 
 - **第 1 轮**：跑评审 → 读结论。
   - 若 `APPROVE`（无 BLOCKER）→ 进入 commit。
-  - 若有 BLOCKER / `REQUEST_CHANGES` → 按意见改代码，进入第 2 轮。
+  - 若有 BLOCKER / `REQUEST_CHANGES` → 按意见修改相关制品，进入第 2 轮。
 - **第 2 轮**：把“修改后的新 diff + 第 1 轮意见 + 逐条回应”再内联送审一次。
   - 若 `APPROVE` → 进入 commit。
   - 若第 2 轮仍有 BLOCKER → **到此为止，不再回送 codex（没有第 3 轮）**。凭反馈自行判断、酌情修改后**继续往下做**：
@@ -138,14 +140,14 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 ## 4. 提交后必写施工记录（build_log/）—— 且记录本身必须入库
 
-代码提交（记为 **C**）后，立刻在 `meta_research_buiding/build_log/` 新建一条记录：
+决策提交（记为 **C**；可为代码 / prompt / skill / schema / 接口 等任一制品）后，立刻在 `meta_research_buiding/build_log/` 新建一条记录：
 
 - 文件名：`NNNN-<short-slug>.md`（NNNN 为四位递增序号，如 `0007-add-retry-queue.md`）。
 - 同时在 `build_log/INDEX.md` 追加一行索引（一条提交一行）。
 - **记录写完后，作为紧随其后的小提交入库**：`git add build_log/ && git commit -m "docs(build_log): NNNN <标题>"`。
-  - 日志里引用代码提交 **C** 的 hash；**不要用 `git commit --amend`**（amend 会改掉 C 的 hash，使记录里引用的 hash 失效）。
+  - 日志里引用决策提交 **C** 的 hash；**不要用 `git commit --amend`**（amend 会改掉 C 的 hash，使记录里引用的 hash 失效）。
   - **唯一例外**：这条日志提交本身**不再写 build_log**（否则无限递归）。
-  - 即每个决策落成**两个提交**：代码提交 C + 紧随的日志提交，`git log` 上成对出现、可审计、可回退。
+  - 即每个决策落成**两个提交**：决策提交 C + 紧随的日志提交，`git log` 上成对出现、可审计、可回退。
 
 每条记录必须包含以下字段（用 §6 模板）：
 
@@ -165,13 +167,13 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 ```
 [ ] 1. 明确本次决策（一句话）+ 影响面
-[ ] 2. 改代码
+[ ] 2. 改动制品（代码 / prompt / skill / 系统提示 / schema / 接口 …）
 [ ] 3. 本地自验（编译/测试/运行），留好命令与输出
 [ ] 4. git add 本次相关文件；git diff --staged 导出
 [ ] 5. 跑 codex-chatgpt 评审（第1轮，ephemeral）
 [ ] 6. 有 BLOCKER 则改 → 第2轮评审（上限）；第2轮仍不过则凭反馈自行修改、不再送 codex
 [ ] 7. 按需 git commit（是否提交 / 粒度自行判断）
-[ ] 8. 写 build_log/NNNN 记录 + 更新 INDEX.md → git commit 该记录（docs(build_log): …，引用代码提交 hash，勿 amend）
+[ ] 8. 写 build_log/NNNN 记录 + 更新 INDEX.md → git commit 该记录（docs(build_log): …，引用决策提交 hash，勿 amend）
 [ ] 9. 向用户汇报：commit hash、改了什么、验证结论
 ```
 
@@ -244,4 +246,4 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 **正交、各管各（不冲突，照常用）**：`brainstorming`、`writing-plans` / `executing-plans`、`using-git-worktrees`、`systematic-debugging`。
 
-**TDD**：`test-driven-development` 的 test-first **不强制**；§5 的"改代码 → 自验"即可（自验含跑测试）。需要某模块强制 test-first 时再单独说明。
+**TDD**：`test-driven-development` 的 test-first **不强制**；§5 的"改动制品 → 自验"即可（自验含跑测试）。需要某模块强制 test-first 时再单独说明。
