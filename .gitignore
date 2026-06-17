@@ -1,0 +1,9 @@
+# 评审产物落在 /tmp，不入库（codexro-review / codex-review.sh 输出）
+
+# 大型归档：参考实现压缩包。解压成目录后再决定是否单独入库
+*.zip
+
+# OS / 编辑器杂物
+.DS_Store
+*.swp
+*~
