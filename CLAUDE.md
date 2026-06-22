@@ -8,14 +8,33 @@
 
 ---
 
-## 0. 三条铁律（先读这三条，其余是展开）
+## 0. 构建模型 + 三条铁律（先读本节，其余是展开）
 
-1. **决策性改动（代码 / prompt / skill / 系统提示 / schema / 接口 / 配置 等制品）要及时 git commit——但是否提交、粒度大小自行判断。** 不要把无关决策攒成一个大杂烩提交；也**不要过度提交**（琐碎改动、连续微调不必每步单独成 commit，攒到一个有意义的决策点再提）。
-2. **每次决定要 commit 之前 → 必须先调用本机 `codex-chatgpt` 做 code review，最多反复 2 轮。**
-   review 未过且仍未到 2 轮上限，**不许 commit**。
-3. **每次 commit 之后 → 必须在 `build_log/` 写一条提交记录**：改了哪些文件、做了什么、是否验证通过。
+### 构建模型：两级分解 → 检查点闭环
 
-任意一条没做，这次改动就**不算完成**，不要向用户声称"已完成 / 已提交 / 已验证"。
+大目标分两级落地：
+
+- **步（Level 1，用户给）**：粗阶段，例如"①流程层 ②资产层"，**每步附一个验证方法**。它比 superpowers 一次能稳的长度大，是不动的主线骨架。用户没给时，按需用 `brainstorming` 先对齐再拆。
+- **检查点（Level 2，模型切）**：把当前这一步切成若干**检查点**，每个 = superpowers 能稳定设计/构建的一截 = **一次对外 git 提交**的粒度。怎么切、切多大由模型自行判断（尺子：可独立解释 + 可独立回退 + superpowers 不易跑偏的长度）。后面步依赖前面步的产物，故**做到哪步才切那步的检查点**，不必一次列全。
+
+两级都登记在仓库根的 **`ROADMAP.md`**（活文档）：步 + 每步验证方法 = 不动主线；检查点 = 随进度展开的施工计划 + 完成勾选。
+
+每个检查点跑一个闭环：
+
+- **① 检查点内部**：正常用 superpowers 构建（`brainstorming` 需要时 / `writing-plans` / `executing-plans` / TDD，**含其自带的子代理审核 `requesting-code-review`**）—— 这是"内部把关"，过程可长，但**在工作区内构建、不落内部 git 提交**（子代理审核读工作区即可，无需提交）。
+- **② 检查点边界**：把本检查点全部改动 `git add` 后，独立开 codex 对**这份全量 staged diff**做外审（≤2 轮，§2）—— "外部独立审计"。因内部不落提交，staged diff 即本检查点全貌。
+- **③ 提交**：codex 过了（或 2 轮上限）**才**落"检查点提交"。
+- **④ 记账**：写**一条** build_log（中文给人读：做了什么 / 改了哪些文件 / 做了哪些验证 / 结论）+ 勾 ROADMAP。
+
+> 两层审查各司其职、互不替代：**superpowers 子代理 = 检查点内部把关；codex = 检查点边界的独立外审。** 详见 §8。
+
+### 三条铁律
+
+1. **以检查点为对外提交单元，及时 commit——检查点切多大、是否提交、粒度自行判断。** 检查点 = 一个可独立解释、可独立回退的决策 = superpowers 能稳定拿下的一截。不要把无关决策攒成大杂烩提交；也**不要过度提交**（检查点内部的琐碎微调靠 superpowers 内部流程消化，不必每步都单独成对外 commit）。
+2. **每个检查点边界（落该检查点提交之前）→ 必须先用本机 codex 做独立外审，最多反复 2 轮。** 外审未过且未到 2 轮上限，**不许落该检查点提交**。（检查点内部在工作区构建、不落 git 提交；到边界 `git add` 全部后由 codex 审全量 staged diff，过了再一次性提交。）
+3. **每个检查点提交之后 → 必须在 `build_log/` 写一条记录**：这个检查点做了什么、改了哪些文件、是否验证通过。
+
+任意一条没做，这个检查点就**不算完成**，不要向用户声称"已完成 / 已提交 / 已验证"。
 
 ---
 
@@ -38,12 +57,12 @@
 
 ---
 
-## 2. 提交前的 code review 流程（codex-chatgpt，最多 2 轮）
+## 2. 检查点边界的 code review 流程（codex，最多 2 轮）
 
-每次准备 commit 前，用本机独立实例 **`codex-chatgpt`（gpt-5.5 / xhigh）** 做只读评审。
+每个检查点准备落"检查点提交"前，把本检查点全部改动 `git add` 后，用本机独立实例 **codex（`codex-chatgpt`，gpt-5.5 / xhigh）** 对这份全量 staged diff 做只读外审。
 
-> **评审归口：本机 codex 是唯一的 pre-commit reviewer**（首选 `codexro-review` 直接读仓库；降级 `codex-chatgpt` 内联。见 §2.1）。
-> **不调用** superpowers 的 `requesting-code-review`（它会起 Claude 子代理评审）——本流程用 codex 评审**替代**它。详见 §8。
+> **评审归口：本机 codex 是唯一的"检查点提交闸门" reviewer**（首选 `codexro-review` 直接读仓库；降级 `codex-chatgpt` 内联。见 §2.1）。
+> codex 是**检查点边界的独立外审**，与 superpowers 检查点内部的子代理审核（`requesting-code-review`）**并存、互不替代**：内部审核帮你边做边把关，但**能否落检查点提交只由 codex 外审结论 + §2.2 决定**。详见 §8。
 
 ### 2.1 调用约定（本机已验证）
 
@@ -117,7 +136,8 @@ codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --eph
 
 ## 3. 提交规范（git commit）
 
-- 只提交本次决策相关的文件；无关改动另起提交。
+- 只提交本检查点相关的文件；无关改动另起检查点 / 提交。
+- commit message 标题建议带上 ROADMAP 里的检查点编号（如 `CP1.3`），便于和 build_log / ROADMAP 对应。
 - commit message 用祈使句，说清"做了什么 + 为什么"，并标注 review 状态。建议格式：
 
 ```
@@ -140,14 +160,14 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 ## 4. 提交后必写施工记录（build_log/）—— 且记录本身必须入库
 
-决策提交（记为 **C**；可为代码 / prompt / skill / schema / 接口 等任一制品）后，立刻在 `meta_research_buiding/build_log/` 新建一条记录：
+检查点提交（记为 **C**；**一个检查点一条记录**）后，立刻在 `meta_research_buiding/build_log/` 新建一条记录：
 
 - 文件名：`NNNN-<short-slug>.md`（NNNN 为四位递增序号，如 `0007-add-retry-queue.md`）。
 - 同时在 `build_log/INDEX.md` 追加一行索引（一条提交一行）。
-- **记录写完后，作为紧随其后的小提交入库**：`git add build_log/ && git commit -m "docs(build_log): NNNN <标题>"`。
-  - 日志里引用决策提交 **C** 的 hash；**不要用 `git commit --amend`**（amend 会改掉 C 的 hash，使记录里引用的 hash 失效）。
+- **记录写完后，作为紧随其后的小提交入库**：`git add build_log/ ROADMAP.md && git commit -m "docs(build_log): NNNN <标题>"`（连同 ROADMAP 的检查点勾选一并提交）。
+  - 日志里引用检查点提交 **C** 的 hash；**不要用 `git commit --amend`**（amend 会改掉 C 的 hash，使记录里引用的 hash 失效）。
   - **唯一例外**：这条日志提交本身**不再写 build_log**（否则无限递归）。
-  - 即每个决策落成**两个提交**：决策提交 C + 紧随的日志提交，`git log` 上成对出现、可审计、可回退。
+  - 即每个检查点落成**两个提交**：检查点提交 C + 紧随的日志提交，`git log` 上成对出现、可审计、可回退。
 
 每条记录必须包含以下字段（用 §6 模板）：
 
@@ -155,7 +175,7 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 2. **决策**：这次决定做了什么、为什么；
 3. **改动文件清单**：逐个文件 + 每个文件改了什么（新增/修改/删除）；
 4. **review**：第几轮过的 / 是否走满 2 轮 / 未采纳的意见及理由（附 `/tmp/review_out.md` 要点）；
-5. **验证**：跑了什么命令/测试，**贴关键输出**，结论 = 通过 / 未通过 / 未验证（并说明为何未验证）；
+5. **验证**：跑了什么命令/测试，**贴关键输出**，结论 = 通过 / 未通过 / 未验证（并说明为何未验证）；**若本检查点收尾了某一步，附跑该步「验证方法」的结果**；
 6. **遗留**：已知未解问题、待办、回退方式。
 
 > "是否验证通过"必须有**证据**（命令 + 输出），不能只写"通过"。
@@ -163,32 +183,41 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 ---
 
-## 5. 每次决策性改动的完整动作清单（照此 TodoWrite）
+## 5. 完整动作清单（宏观分解 + 每个检查点；照此建 todo）
 
+**接到目标 / 新的步（一次性 / 每步开头）**
 ```
-[ ] 1. 明确本次决策（一句话）+ 影响面
-[ ] 2. 改动制品（代码 / prompt / skill / 系统提示 / schema / 接口 …）
-[ ] 3. 本地自验（编译/测试/运行），留好命令与输出
-[ ] 4. git add 本次相关文件；git diff --staged 导出
-[ ] 5. 跑 codex-chatgpt 评审（第1轮，ephemeral）
-[ ] 6. 有 BLOCKER 则改 → 第2轮评审（上限）；第2轮仍不过则凭反馈自行修改、不再送 codex
-[ ] 7. 按需 git commit（是否提交 / 粒度自行判断）
-[ ] 8. 写 build_log/NNNN 记录 + 更新 INDEX.md → git commit 该记录（docs(build_log): …，引用决策提交 hash，勿 amend）
-[ ] 9. 向用户汇报：commit hash、改了什么、验证结论
+[ ] A. 在 ROADMAP.md 登记用户给的步 + 该步验证方法
+[ ] B. 把当前步切成检查点（superpowers 稳定长度；可边走边补，不必一次列全）
 ```
 
-任何一步跳过即视为本次未完成。
+**每个检查点（照此循环）**
+```
+[ ] 1. 明确本检查点要做什么（一句话）+ 影响面
+[ ] 2. 检查点内部用 superpowers 构建（含其子代理审核 / TDD / systematic-debugging）
+[ ] 3. 本地自验（编译/测试/运行；对 prompt·skill 做实读校验），留好命令与输出
+[ ] 4. git add 本检查点全部改动（内部未提交，故 staged = 全量）；git diff --staged 导出
+[ ] 5. 跑 codex 外审（第1轮，ephemeral）—— 见 §2 / bin/codex-review.sh
+[ ] 6. 有 BLOCKER 则改 → 第2轮（上限）；第2轮仍不过则凭反馈自行修改、不再送 codex
+[ ] 7. 落检查点提交（git commit；codex 过后）
+[ ] 8. 若本检查点收尾了某一步 → 跑该步验证方法，留输出（作为 build_log 的步级验证证据）
+[ ] 9. 写 build_log/NNNN（含步级验证结果）+ 更新 INDEX.md + 勾 ROADMAP.md → git commit 该记录（docs(build_log): …，引用检查点提交 hash，勿 amend）
+[ ] 10. 向用户汇报：检查点提交 hash、改了什么、验证结论
+```
+
+任何一步跳过即视为本检查点未完成。
 
 ---
 
 ## 6. build_log 记录模板
 
 ```markdown
-# NNNN · <一句话决策>
+# NNNN · <检查点一句话>
 
 - date: <YYYY-MM-DD>
 - commit: <hash> — <commit title>
 - branch: <branch>
+- 检查点 / 步: <ROADMAP 里的 CPx.y（属：步X 名称）>
 
 ## 决策
 <做了什么 / 为什么 / 影响面>
@@ -209,6 +238,7 @@ verify: <验证方式与结果，见 build_log/<id>.md>
   ```
   <贴输出>
   ```
+- 步级验证（若本检查点收尾了某一步）：跑该步「验证方法」→ <结果>
 - 结论：通过 / 未通过 / 未验证（原因）
 
 ## 遗留 / 回退
@@ -222,12 +252,12 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 - ❌ 决策性改动长期不 commit，或把无关决策攒成一个大杂烩提交。
 - ❌ **过度提交**：为琐碎改动 / 连续微调每步都单独 commit。
-- ❌ 跳过 codex-chatgpt review 直接 commit。
+- ❌ 跳过检查点边界的 codex 外审，直接落检查点提交。
 - ❌ 给 codex 起第 3 轮 review（最多 2 轮；第 2 轮不过就自行改、不再送审）。
 - ❌ commit 后不写 build_log。
 - ❌ 没真跑验证就写"验证通过"。
 - ❌ 用 `--dangerously-bypass-approvals-and-sandbox` 跑 codex（会被拒，且不安全）。
-- ❌ 用 superpowers 的 Claude 子代理评审顶替 / 跳过 codex-chatgpt（评审归口只认 codex，见 §8）。
+- ❌ 用 superpowers 子代理审核**顶替 / 跳过检查点边界的 codex 外审**（子代理审核只是内部把关；落检查点提交的闸门只认 codex，见 §8）。
 
 ---
 
@@ -235,15 +265,18 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 **优先级**：本 CLAUDE.md 属"用户显式指令"。按 superpowers 自己声明的优先级（`using-superpowers`：①用户指令 > ②技能 > ③默认行为），**任何冲突点以本文件为准**。
 
-**评审归口（本次决定）**：
-- 提交前评审**只用本机 codex**（首选 `codexro-review` 直接读仓库；降级 `codex-chatgpt` 内联。§2.1 / §2.2）。
-- **停用** superpowers 的 `requesting-code-review`（它会起 **Claude 子代理**评审）——不在提交关卡触发；若它被自动唤起，按本文件改走 codex 评审替代。
-- 仍可手动用 Claude 子代理做"非关卡"的辅助阅读，但**它不构成提交许可**；能否 commit 只由 codex 评审结论 + §2.2 决定。
+**评审归口（两层，本次修订）**：
+- **检查点内部 = superpowers 子代理审核**：`requesting-code-review`（及 `executing-plans` 的 review checkpoints、TDD 红绿灯）**恢复启用**，作为边做边把关的"内部审核"。它提升检查点交付质量，但**不构成检查点提交许可**。
+- **检查点边界 = codex 独立外审**：落"检查点提交"前，必须由本机 codex 对本检查点全量 staged diff 做一次独立外审（首选 `codexro-review`；降级 `codex-chatgpt` 内联。§2.1 / §2.2）。**能否落检查点提交只由 codex 外审结论 + §2.2 决定。**
+- 两者**并存、互不替代**：内部子代理审核**不能顶替也不能跳过**边界的 codex 外审（§7 红线）；codex 外审也不替你做内部把关。
+
+**作为检查点内部的构建引擎（按需用，不是每个检查点都强制走）**：
+- `brainstorming`：当某步 / 检查点本身是设计难题、意图不明时先用它对齐 —— **不强制每个检查点都走它的 HARD-GATE**；ROADMAP 里已对齐的步 / 检查点可直接进构建。
+- `writing-plans` / `executing-plans` / `subagent-driven-development`：把步切成检查点、把检查点内部拆成可执行任务并推进。
+- `using-git-worktrees`、`systematic-debugging`：按需。
 
 **保留为加强项（与本约束对齐，继续遵循）**：
 - `receiving-code-review`：收到 codex 意见时不盲从、先核实、不表演式同意 —— 对应 §2.2。
 - `verification-before-completion`：声称"完成 / 通过"前必须真跑命令看输出 —— 对应 §4 / §7。
 
-**正交、各管各（不冲突，照常用）**：`brainstorming`、`writing-plans` / `executing-plans`、`using-git-worktrees`、`systematic-debugging`。
-
-**TDD**：`test-driven-development` 的 test-first **不强制**；§5 的"改动制品 → 自验"即可（自验含跑测试）。需要某模块强制 test-first 时再单独说明。
+**TDD**：`test-driven-development` 的 test-first **不强制**；§5 的"检查点内部自验"即可（自验含跑测试）。需要某模块强制 test-first 时再单独说明。

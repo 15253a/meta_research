@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# codex-review.sh — pre-commit 评审入口（模式 A：codexro-review 直接读仓库）
+# codex-review.sh — 检查点边界评审入口（模式 A：codexro-review 直接读仓库）
 #
 # 评审【已 git add 的暂存改动】：把 diff 内联进 prompt，并允许 reviewer 自行
 # rg/读仓库其余文件核实跨文件假设。reviewer = 无写权限的 codexro 用户（见
 # CLAUDE.md §2.1）。“最多反复 2 轮”由调用方按 CLAUDE.md §2.2 控制。
 #
 # 用法：
-#   bin/codex-review.sh "<一句话决策>" [追加 codex 参数...]
+#   bin/codex-review.sh "<检查点一句话>" [追加 codex 参数...]
 #   例：bin/codex-review.sh "M0a 冻结四阶段 JSON Schema" -c model_reasoning_effort=high
 #
 # 退出码：0 = 已产出评审（去读结论）；2 = 暂存区无可评审改动。
 set -euo pipefail
 
-decision="${1:?用法: bin/codex-review.sh \"<一句话决策>\" [追加 codex 参数...]}"
+decision="${1:?用法: bin/codex-review.sh \"<检查点一句话>\" [追加 codex 参数...]}"
 shift || true
 
 repo="$(git rev-parse --show-toplevel)"
