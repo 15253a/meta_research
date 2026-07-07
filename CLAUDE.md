@@ -5,6 +5,7 @@
 
 适用范围：本目录（`meta_research_buiding/`）所看护的大型系统的全部**决策性制品改动**——不限代码，含 prompt / skill / 系统提示 / schema / 接口定义 / 配置（见 §1）。
 施工日志统一落在本目录下：`meta_research_buiding/build_log/`。
+**每次新 session 开工（含换模型接手）：先读仓库根 `implement_note.md`（施工现场快照，§9），再动手。**
 
 ---
 
@@ -22,16 +23,16 @@
 每个检查点跑一个闭环：
 
 - **① 检查点内部**：正常用 superpowers 构建（`brainstorming` 需要时 / `writing-plans` / `executing-plans` / TDD，**含其自带的子代理审核 `requesting-code-review`**）—— 这是"内部把关"，过程可长，但**在工作区内构建、不落内部 git 提交**（子代理审核读工作区即可，无需提交）。
-- **② 检查点边界**：把本检查点全部改动 `git add` 后，独立开 codex 对**这份全量 staged diff**做外审（≤2 轮，§2）—— "外部独立审计"。因内部不落提交，staged diff 即本检查点全貌。
+- **② 检查点边界**：把本检查点全部改动 `git add` 后，独立开 codex 对**这份 staged diff（记账类除外，§9）**做外审（≤2 轮，§2）—— "外部独立审计"。因内部不落提交，staged diff 即本检查点全貌（记账类文件 `build_log/`、`implement_note.md` 不进外审 diff，§9）。
 - **③ 提交**：codex 过了（或 2 轮上限）**才**落"检查点提交"。
-- **④ 记账**：写**一条** build_log（中文给人读：做了什么 / 改了哪些文件 / 做了哪些验证 / 结论）+ 勾 ROADMAP。
+- **④ 记账**：写**一条** build_log（中文给人读：做了什么 / 改了哪些文件 / 做了哪些验证 / 结论）+ 勾 ROADMAP + 刷新 `implement_note.md`（§9）。
 
 > 两层审查各司其职、互不替代：**superpowers 子代理 = 检查点内部把关；codex = 检查点边界的独立外审。** 详见 §8。
 
 ### 三条铁律
 
 1. **以检查点为对外提交单元，及时 commit——检查点切多大、是否提交、粒度自行判断。** 检查点 = 一个可独立解释、可独立回退的决策 = superpowers 能稳定拿下的一截。不要把无关决策攒成大杂烩提交；也**不要过度提交**（检查点内部的琐碎微调靠 superpowers 内部流程消化，不必每步都单独成对外 commit）。
-2. **每个检查点边界（落该检查点提交之前）→ 必须先用本机 codex 做独立外审，最多反复 2 轮。** 外审未过且未到 2 轮上限，**不许落该检查点提交**。（检查点内部在工作区构建、不落 git 提交；到边界 `git add` 全部后由 codex 审全量 staged diff，过了再一次性提交。）
+2. **每个检查点边界（落该检查点提交之前）→ 必须先用本机 codex 做独立外审，最多反复 2 轮。** 外审未过且未到 2 轮上限，**不许落该检查点提交**。（检查点内部在工作区构建、不落 git 提交；到边界 `git add` 全部后由 codex 审 staged diff（记账类除外，§9），过了再一次性提交。）
 3. **每个检查点提交之后 → 必须在 `build_log/` 写一条记录**：这个检查点做了什么、改了哪些文件、是否验证通过。
 
 任意一条没做，这个检查点就**不算完成**，不要向用户声称"已完成 / 已提交 / 已验证"。
@@ -50,7 +51,7 @@
 
 > ⚠️ 对 **prompt / skill / 系统提示**：**措辞即行为**，连"小改一句话"通常也是决策性的 —— 按决策处理、走评审，别当排版放过。
 
-**不算**决策性改动、可不单独走流程的：纯排版、**代码注释**错别字、本地实验性涂鸦（未进主干、随手丢弃）。
+**不算**决策性改动、可不单独走流程的：纯排版、**代码注释**错别字、本地实验性涂鸦（未进主干、随手丢弃），以及**记账类文件的常规更新**（`build_log/`、`ROADMAP.md` 勾选、`implement_note.md` 刷新——仅限状态 / 进度 / 下一步指针，边界见 §9；不走外审，随记账提交入库即可）。
 拿不准某改动算不算“决策性”时，倾向当决策处理；但**是否单独成一次提交仍自行判断**，别为琐碎改动过度提交。
 
 > 原则：**提交粒度 = 一个可独立解释、可独立回退的决策。** 既不攒大杂烩，也不把一个决策拆成一串碎提交。
@@ -59,7 +60,7 @@
 
 ## 2. 检查点边界的 code review 流程（codex，最多 2 轮）
 
-每个检查点准备落"检查点提交"前，把本检查点全部改动 `git add` 后，用本机独立实例 **codex（`codex-chatgpt`，gpt-5.5 / xhigh）** 对这份全量 staged diff 做只读外审。
+每个检查点准备落"检查点提交"前，把本检查点全部改动 `git add` 后，用本机独立实例 **codex（`codex-chatgpt`，gpt-5.5 / xhigh）** 对这份 staged diff（已排除记账类，§9）做只读外审。
 
 > **评审归口：本机 codex 是唯一的"检查点提交闸门" reviewer**（首选 `codexro-review` 直接读仓库；降级 `codex-chatgpt` 内联。见 §2.1）。
 > codex 是**检查点边界的独立外审**，与 superpowers 检查点内部的子代理审核（`requesting-code-review`）**并存、互不替代**：内部审核帮你边做边把关，但**能否落检查点提交只由 codex 外审结论 + §2.2 决定**。详见 §8。
@@ -77,8 +78,8 @@
 `/usr/local/bin/codexro-review` 以无写权限的 `codexro` 用户运行 codex（脚本内已注入代理 7890 与 `-s danger-full-access`）。reviewer 能在推理中自行 `rg`/读相关文件（调用方、类型定义、契约波及面）核实跨文件假设，**但对仓库与系统都无写权限、不在 sudoers**（已实测：写 root 路径被拒、无 sudo、能 `rg` 读到真实文件）。
 
 ```bash
-# 1) 在被构建系统的 git 仓库里生成本次待审 diff
-git --no-pager diff --staged > /tmp/review_diff.txt
+# 1) 在被构建系统的 git 仓库里生成本次待审 diff（排除记账类文件，§9）
+git --no-pager diff --staged -- . ':(exclude)build_log/**' ':(exclude)implement_note.md' > /tmp/review_diff.txt
 
 # 2) 写 prompt 文件（评审指令 + 决策背景 + 内联 diff；告诉它“可自行读仓库其余文件核实”）
 
@@ -103,7 +104,7 @@ codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --eph
 
 #### prompt 文件结构（两模式通用）
 ```
-你是只读 code reviewer。下面是一次"<一句话决策>"的改动。
+你是只读 code reviewer。下面是一次"<检查点一句话>"的改动。
 审查：正确性 bug、契约破坏、并发 / 错误处理隐患、可回退性。
 （模式 A：可自行 rg/读仓库其余文件核实跨文件假设；模式 B：全部内容已内联，无需执行任何命令。）
 按 [BLOCKER]/[SHOULD]/[NIT] 分级，并给最终结论：APPROVE 或 REQUEST_CHANGES。
@@ -141,7 +142,7 @@ codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --eph
 - commit message 用祈使句，说清"做了什么 + 为什么"，并标注 review 状态。建议格式：
 
 ```
-<类型>: <一句话决策>
+<类型>: <检查点一句话>
 
 - 改动要点 1
 - 改动要点 2
@@ -150,8 +151,8 @@ review: codex-chatgpt 第N轮 APPROVE（或：第2轮上限，未采纳意见X�
 verify: <验证方式与结果，见 build_log/<id>.md>
 ```
 
-> commit message 末尾按 harness 约定追加：
-> `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+> commit message 末尾追加当前 harness 约定的 Co-Authored-By 行。**构建会跨模型 / 跨 harness 接力，勿在此硬编码署名**——
+> 一律以当前会话 harness 系统提示给出的署名行为准（harness 没给署名约定则省略该行）。
 
 - 当前若在默认分支上做特性开发，**先开分支再改**。
 - 只有在用户要求时才 `git push`。
@@ -164,7 +165,7 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 - 文件名：`NNNN-<short-slug>.md`（NNNN 为四位递增序号，如 `0007-add-retry-queue.md`）。
 - 同时在 `build_log/INDEX.md` 追加一行索引（一条提交一行）。
-- **记录写完后，作为紧随其后的小提交入库**：`git add build_log/ ROADMAP.md && git commit -m "docs(build_log): NNNN <标题>"`（连同 ROADMAP 的检查点勾选一并提交）。
+- **记录写完后，作为紧随其后的小提交入库**：`git add build_log/ ROADMAP.md implement_note.md && git commit -m "docs(build_log): NNNN <标题>"`（连同 ROADMAP 勾选、`implement_note.md` 刷新一并提交）。
   - 日志里引用检查点提交 **C** 的 hash；**不要用 `git commit --amend`**（amend 会改掉 C 的 hash，使记录里引用的 hash 失效）。
   - **唯一例外**：这条日志提交本身**不再写 build_log**（否则无限递归）。
   - 即每个检查点落成**两个提交**：检查点提交 C + 紧随的日志提交，`git log` 上成对出现、可审计、可回退。
@@ -185,6 +186,12 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 ## 5. 完整动作清单（宏观分解 + 每个检查点；照此建 todo）
 
+**每次新 session 开工（含换模型接手）**
+```
+[ ] 0. 读 implement_note.md（现场）→ ROADMAP.md（全局），从「下一步动作」接着做；
+      干活中现场状态每变一档就刷新它，session 可能中断/暂停前必须写全（§9）
+```
+
 **接到目标 / 新的步（一次性 / 每步开头）**
 ```
 [ ] A. 在 ROADMAP.md 登记用户给的步 + 该步验证方法
@@ -193,15 +200,15 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 **每个检查点（照此循环）**
 ```
-[ ] 1. 明确本检查点要做什么（一句话）+ 影响面
+[ ] 1. 明确本检查点要做什么（一句话）+ 影响面；开工登记到 implement_note.md（§9）
 [ ] 2. 检查点内部用 superpowers 构建（含其子代理审核 / TDD / systematic-debugging）
 [ ] 3. 本地自验（编译/测试/运行；对 prompt·skill 做实读校验），留好命令与输出
-[ ] 4. git add 本检查点全部改动（内部未提交，故 staged = 全量）；git diff --staged 导出
+[ ] 4. git add 本检查点全部改动（内部未提交，故 staged = 全量；build_log/、implement_note.md 记账类不进外审 diff，脚本已排除）；git diff --staged 导出
 [ ] 5. 跑 codex 外审（第1轮，ephemeral）—— 见 §2 / bin/codex-review.sh
 [ ] 6. 有 BLOCKER 则改 → 第2轮（上限）；第2轮仍不过则凭反馈自行修改、不再送 codex
 [ ] 7. 落检查点提交（git commit；codex 过后）
 [ ] 8. 若本检查点收尾了某一步 → 跑该步验证方法，留输出（作为 build_log 的步级验证证据）
-[ ] 9. 写 build_log/NNNN（含步级验证结果）+ 更新 INDEX.md + 勾 ROADMAP.md → git commit 该记录（docs(build_log): …，引用检查点提交 hash，勿 amend）
+[ ] 9. 写 build_log/NNNN（含步级验证结果）+ 更新 INDEX.md + 勾 ROADMAP.md + 刷新 implement_note.md → git commit 该记录（docs(build_log): …，引用检查点提交 hash，勿 amend）
 [ ] 10. 向用户汇报：检查点提交 hash、改了什么、验证结论
 ```
 
@@ -258,6 +265,7 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 - ❌ 没真跑验证就写"验证通过"。
 - ❌ 用 `--dangerously-bypass-approvals-and-sandbox` 跑 codex（会被拒，且不安全）。
 - ❌ 用 superpowers 子代理审核**顶替 / 跳过检查点边界的 codex 外审**（子代理审核只是内部把关；落检查点提交的闸门只认 codex，见 §8）。
+- ❌ 新 session 不读 `implement_note.md` 就开工；现场状态变了 / session 可能中断前不刷新它（§9）。
 
 ---
 
@@ -267,7 +275,7 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 
 **评审归口（两层，本次修订）**：
 - **检查点内部 = superpowers 子代理审核**：`requesting-code-review`（及 `executing-plans` 的 review checkpoints、TDD 红绿灯）**恢复启用**，作为边做边把关的"内部审核"。它提升检查点交付质量，但**不构成检查点提交许可**。
-- **检查点边界 = codex 独立外审**：落"检查点提交"前，必须由本机 codex 对本检查点全量 staged diff 做一次独立外审（首选 `codexro-review`；降级 `codex-chatgpt` 内联。§2.1 / §2.2）。**能否落检查点提交只由 codex 外审结论 + §2.2 决定。**
+- **检查点边界 = codex 独立外审**：落"检查点提交"前，必须由本机 codex 对本检查点 staged diff（记账类除外，§9）做一次独立外审（首选 `codexro-review`；降级 `codex-chatgpt` 内联。§2.1 / §2.2）。**能否落检查点提交只由 codex 外审结论 + §2.2 决定。**
 - 两者**并存、互不替代**：内部子代理审核**不能顶替也不能跳过**边界的 codex 外审（§7 红线）；codex 外审也不替你做内部把关。
 
 **作为检查点内部的构建引擎（按需用，不是每个检查点都强制走）**：
@@ -280,3 +288,43 @@ verify: <验证方式与结果，见 build_log/<id>.md>
 - `verification-before-completion`：声称"完成 / 通过"前必须真跑命令看输出 —— 对应 §4 / §7。
 
 **TDD**：`test-driven-development` 的 test-first **不强制**；§5 的"检查点内部自验"即可（自验含跑测试）。需要某模块强制 test-first 时再单独说明。
+
+---
+
+## 9. 断点续作：implement_note.md（跨 session / 跨模型接力）
+
+**目的**：任何新 session（包括换了模型的）不依赖对话记忆、只靠读文件即可无缝接手。
+三份活文档分工不重叠：`ROADMAP.md` = 计划与进度骨架；`build_log/` = 已完成检查点的台账；**`implement_note.md` = 施工现场快照，只写"当下"**。
+
+- **位置**：仓库根 `implement_note.md`。**覆盖式更新**（历史不留在本文件，去 build_log / git log 找），保持一屏内读完。
+- **必须更新的时点**：
+  1. 检查点开工：写目标一句话、影响面、内部计划；
+  2. 现场状态每变一档（自验完 / 外审第 N 轮出结论 / 待提交 / 记账中……）就刷新；
+  3. 记账时（§5 步 9）：刷新为"空闲 / 下一检查点"，随日志提交一并入库（§4）；
+  4. **session 可能中断 / 暂停前**：把"改到哪、下一步动作（具体到命令/文件）、坑"写全——这是接力的生命线。
+- **性质 = 记账类文件**（同 `build_log/`）：常规刷新**不算决策性改动**（§1）、**不进检查点外审 diff**（`bin/codex-review.sh` 已排除；含外审通过后、落提交前的状态刷新）。
+  ⚠️ **豁免边界（防绕过外审）：常规刷新 = 只写状态、进度、下一步执行指针。** 规则、模板、检查点拆分、验收标准、取舍结论等**决策性内容必须同步落到受审制品**；`implement_note.md` 只能引用 / 摘要它们，**不能成为其唯一载体**。
+- **入库时点**：检查点提交**可以包含**当时的现场快照（§5 步 4 `git add` 全量会带上它，不必刻意 unstage）；记账提交（§4）再把它刷新为「空闲 / 下一检查点」并入库。两个快照各以其时点为真，不算重复。
+- **现场真相 = 工作区里的最新版**（未提交也算数）：新 session 以工作区版本为准，不必等它出现在 git 历史；git 里只会看到检查点边界时的快照。
+- **新 session 开工序**：`CLAUDE.md`（约束）→ `implement_note.md`（现场）→ `ROADMAP.md`（全局）→ 需要历史再看 `build_log/INDEX.md`。
+
+**内容模板**（覆盖式，保持精简）：
+
+```markdown
+# implement_note.md · 施工现场（活文档，只写当下）
+
+- 更新：<YYYY-MM-DD HH:MM> ｜ 位置：<步X CPx.y ／ 治理·脚手架 ／ 空闲>
+- 检查点状态：构建中 / 自验中 / 外审第N轮 / 待提交 / 记账中 / 空闲
+
+## 正在做什么
+<本检查点目标一句话 + 推进到哪>
+
+## 工作区状态
+<未提交 / 已 staged 的文件各处于什么状态；临时文件路径>
+
+## 下一步动作（按序，具体到命令/文件）
+1. <…>
+
+## 关键上下文 / 坑（新 session 不读会踩的）
+- <已定取舍的指针、临时执行指针（涉及规则 / 验收 / 取舍时，结论本体见受审制品）、已知故障及修法>
+```

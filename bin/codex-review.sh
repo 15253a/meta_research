@@ -23,11 +23,11 @@ prompt="$work/prompt.txt"
 out="$work/verdict.md"
 # 注：$work（/tmp/codexrev.*）故意保留供审计/排障；内含 staged diff，介意可手动清理
 
-# 评审暂存区改动；排除 build_log/（施工记录不参与评审）。不吞 git 错误：失败即 set -e 退出
-git -C "$repo" --no-pager diff --staged -- . ':(exclude)build_log/**' > "$diff_file"
+# 评审暂存区改动；排除记账类（build_log/ 施工记录、implement_note.md 现场快照，见 CLAUDE.md §9）。不吞 git 错误：失败即 set -e 退出
+git -C "$repo" --no-pager diff --staged -- . ':(exclude)build_log/**' ':(exclude)implement_note.md' > "$diff_file"
 if [ ! -s "$diff_file" ]; then
-  echo "！暂存区无可评审改动（git diff --staged 为空，已排除 build_log/）。" >&2
-  echo "  先 git add 本次决策相关文件再评审。" >&2
+  echo "！暂存区无可评审改动（git diff --staged 为空，已排除记账类 build_log/、implement_note.md）。" >&2
+  echo "  先 git add 本检查点相关文件再评审。" >&2
   exit 2
 fi
 
@@ -42,7 +42,7 @@ fi
   echo "=== 决策 ==="
   echo "$decision"
   echo
-  echo "=== DIFF（staged，已排除 build_log/）==="
+  echo "=== DIFF（staged，已排除记账类 build_log/、implement_note.md）==="
   cat "$diff_file"
 } > "$prompt"
 

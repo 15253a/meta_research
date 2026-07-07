@@ -6,7 +6,8 @@
 > - **检查点（Level 2，模型切到 superpowers 稳定长度）= 一次对外提交 + 一条 build_log**。
 >
 > 规则：做到哪一步，才把那步切成检查点（后面步依赖前面步的产物，不必一次列全）。
-> 每个检查点走：内部 superpowers（含子代理审核）→ 边界 codex 外审（≤2 轮）→ 检查点提交 → build_log + 回此勾选。
+> 每个检查点走：内部 superpowers（含子代理审核）→ 边界 codex 外审（≤2 轮）→ 检查点提交 → build_log + 回此勾选 + 刷新 `implement_note.md`。
+> 施工现场快照（当下在哪、下一步动作）见仓库根 `implement_note.md`（CLAUDE.md §9），新 session 开工先读它。
 
 ## 当前位置
 - 总目标：<一句话总目标（待用户给）>
