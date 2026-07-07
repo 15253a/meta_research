@@ -36,8 +36,14 @@
       "items": { "$ref": "#/$defs/execution_log" }
     },
     "execution_observation": { "$ref": "#/$defs/execution_observation" },
-    "code_review": { "$ref": "#/$defs/review_verdict" },
-    "result_review": { "$ref": "#/$defs/review_verdict" }
+    "code_review": {
+      "$ref": "#/$defs/review_verdict",
+      "properties": { "review_kind": { "const": "bundle_code_review" } }
+    },
+    "result_review": {
+      "$ref": "#/$defs/review_verdict",
+      "properties": { "review_kind": { "const": "bundle_result_review" } }
+    }
   },
   "allOf": [
     {
@@ -49,13 +55,15 @@
         "properties": { "execution_logs": { "minItems": 1 } }
       },
       "else": {
-        "description": "skipped = 未执行旁路：不得携带任何执行事实对象（§4.2.1 旁路语义）",
+        "description": "skipped = 未执行旁路：不得携带任何执行事实 / 失败事实 / 评审 / identity（§4.2.1 旁路语义——它从未开工）",
         "not": {
           "anyOf": [
             { "required": ["execution_logs"] }, { "required": ["execution_observation"] },
             { "required": ["variant"] }, { "required": ["run"] },
             { "required": ["checkpoints"] }, { "required": ["evaluation"] },
-            { "required": ["attempt"] }, { "required": ["metric_results"] }
+            { "required": ["attempt"] }, { "required": ["metric_results"] },
+            { "required": ["failure_kind"] }, { "required": ["identity_draft_md"] },
+            { "required": ["code_review"] }, { "required": ["result_review"] }
           ]
         }
       }
@@ -68,14 +76,16 @@
         }
       },
       "then": {
-        "required": ["variant", "run", "checkpoints", "evaluation", "attempt", "metric_results", "identity_draft_md"],
+        "required": ["variant", "run", "checkpoints", "evaluation", "attempt", "metric_results", "identity_draft_md", "code_review", "result_review"],
         "properties": {
           "run": { "properties": { "status": { "const": "success" } } },
           "checkpoints": { "minItems": 1 },
           "metric_results": {
             "minItems": 1,
             "contains": { "properties": { "scope": { "const": "aggregate" } }, "required": ["scope"] }
-          }
+          },
+          "code_review": { "properties": { "verdict": { "const": "pass" } } },
+          "result_review": { "properties": { "verdict": { "const": "pass" } } }
         }
       }
     },
@@ -87,12 +97,13 @@
         }
       },
       "then": {
-        "required": ["evaluation", "attempt", "metric_results"],
+        "required": ["evaluation", "attempt", "metric_results", "result_review"],
         "properties": {
           "metric_results": {
             "minItems": 1,
             "contains": { "properties": { "scope": { "const": "aggregate" } }, "required": ["scope"] }
-          }
+          },
+          "result_review": { "properties": { "verdict": { "const": "pass" } } }
         }
       }
     },

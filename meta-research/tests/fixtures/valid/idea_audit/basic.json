@@ -1,0 +1,31 @@
+{
+  "audit_scores": [
+    {
+      "candidate_id": "c1",
+      "scores": {
+        "structural_depth": 7,
+        "domain_distance": 3,
+        "applicability": 8,
+        "novelty": 2,
+        "unexpectedness": 2,
+        "non_obviousness": 3
+      },
+      "decision": "pass",
+      "rationale": "旁路候选：适配当前 NEED，SD 过线；DD/novelty 诚实低分不作淘汰理由"
+    },
+    {
+      "candidate_id": "c2",
+      "scores": {
+        "structural_depth": 4,
+        "domain_distance": 6,
+        "applicability": 5,
+        "novelty": 5,
+        "unexpectedness": 5,
+        "non_obviousness": 4
+      },
+      "decision": "fail",
+      "rationale": "SD=4 低于阈值 6，淘汰"
+    }
+  ],
+  "selected_id": "c1"
+}

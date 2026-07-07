@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/idea_set_draft.schema.json",
+  "title": "idea_set_draft",
+  "description": "idea 阶段第 1 次 runner_call（生成，phase=idea）的输出契约：idea_set 去掉判官产物字段（audit_scores/selected_id 由判官调用产出，编排器合并成完整 idea_set.json 后按 idea_set.schema.json 终校）。全部子结构经 $ref 复用 idea_set 定义（单一权威，防漂移）。",
+  "type": "object",
+  "required": ["candidates", "novelty_refs"],
+  "additionalProperties": false,
+  "properties": {
+    "need_innovation": {
+      "$ref": "https://meta-research.local/schemas/idea_set.schema.json#/properties/need_innovation"
+    },
+    "candidates": {
+      "$ref": "https://meta-research.local/schemas/idea_set.schema.json#/properties/candidates"
+    },
+    "novelty_refs": {
+      "$ref": "https://meta-research.local/schemas/idea_set.schema.json#/properties/novelty_refs"
+    },
+    "provenance": {
+      "$ref": "https://meta-research.local/schemas/idea_set.schema.json#/$defs/provenance"
+    }
+  }
+}
