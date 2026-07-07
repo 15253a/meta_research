@@ -1,0 +1,28 @@
+{
+  "needs": [
+    { "need_id": "n1", "statement_md": "eval target 缺 eval_action/attempt_purpose 必须被拒（§3.3.1）" }
+  ],
+  "reuse_evidence": [],
+  "targets": [
+    {
+      "target_key": "t1",
+      "target_kind": "eval",
+      "seq": 1,
+      "critical": false,
+      "budget_estimate": 0.5,
+      "spec_md": "免训练评估但没有声明 eval_action"
+    }
+  ],
+  "protocol": {
+    "name": "toy-gauss-cls",
+    "version": 1,
+    "scope_spec": { "data": "占位" }
+  },
+  "metric_defs": [
+    { "metric_id": "accuracy", "version": 1, "name": "准确率", "direction": "higher", "compute_spec_md": "占位" }
+  ],
+  "readout_rules": [
+    { "metric_id": "accuracy", "metric_ver": 1, "rule_md": "占位" }
+  ],
+  "build_target_required_metric": []
+}

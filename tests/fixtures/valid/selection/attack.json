@@ -1,0 +1,27 @@
+{
+  "next_question_id": "q2",
+  "next_intent": "attack",
+  "scores": [
+    {
+      "question_id": "q2",
+      "score": 0.72,
+      "est_cost": 2.5,
+      "expected_gain": 0.8,
+      "info_gain": 0.6,
+      "cost_norm": 0.3,
+      "ucb": 0.42,
+      "directive_adjust": 0.0,
+      "rationale_md": "直接对齐根谓词、成本在 B(t) 内"
+    },
+    {
+      "question_id": "q3",
+      "score": 0.31,
+      "est_cost": 6.0,
+      "expected_gain": 0.5,
+      "info_gain": 0.4,
+      "cost_norm": 0.8,
+      "ucb": 0.35,
+      "directive_adjust": 0.0
+    }
+  ]
+}

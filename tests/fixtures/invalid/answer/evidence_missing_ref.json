@@ -1,0 +1,11 @@
+{
+  "question_id": "q1",
+  "verdict": "answered",
+  "answer_md": "evaluation 证据缺 metric_result_id 必须被拒（I3：evaluation 证据必指向具体成功测量）",
+  "evidence": [
+    {
+      "kind": "evaluation",
+      "note_md": "没有 metric_result_id"
+    }
+  ]
+}

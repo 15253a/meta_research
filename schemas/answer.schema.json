@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/answer.schema.json",
+  "title": "answer",
+  "description": "reasoning R1 产物（第二部分 §6.11）。仅 verdict ∈ {answered, refuted} 时产本文件；首轮 / inconclusive 不产 answer（I3：关问需 ≥1 条有效证据）。evidence 四态互斥（oneOf 分支 + 每分支封闭字段集，对齐 DDL evidence 多态 CHECK：kind 之外的引用字段不得混带）。",
+  "type": "object",
+  "required": ["question_id", "verdict", "answer_md", "evidence"],
+  "additionalProperties": false,
+  "properties": {
+    "question_id": { "type": "string", "minLength": 1 },
+    "verdict": { "enum": ["answered", "refuted"] },
+    "answer_md": { "type": "string", "minLength": 1, "description": "结论正文（中文）" },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/evidence" }
+    }
+  },
+  "$defs": {
+    "evidence": {
+      "description": "多态证据（§3.5.2）：evaluation / literature / child_answer / human；raw log / 观测内容永不作证据（§3.1.2 铁律）",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "metric_result_id"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "evaluation" },
+            "metric_result_id": { "type": "string", "minLength": 1, "description": "指向一次成功测量的具体 metric_result（M0 为产物级 id，M1 起 DB 行）" },
+            "note_md": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "citation_md"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "literature" },
+            "citation_md": { "type": "string", "minLength": 1 },
+            "note_md": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "child_question_id"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "child_answer" },
+            "child_question_id": { "type": "string", "minLength": 1, "description": "已关闭子问题" },
+            "child_answer_ref": { "type": "string", "description": "子问题 answer 的产物级引用（可选）" },
+            "note_md": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "human_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "human" },
+            "human_ref": { "type": "string", "minLength": 1, "description": "人类裁定的 directive / 决策引用" },
+            "note_md": { "type": "string" }
+          }
+        }
+      ]
+    }
+  }
+}

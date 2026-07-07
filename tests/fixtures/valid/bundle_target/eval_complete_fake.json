@@ -1,0 +1,48 @@
+{
+  "target_key": "t2",
+  "target_kind": "eval",
+  "status": "complete",
+  "evaluation": {
+    "eval_key": "metric-append-1",
+    "protocol_name": "toy-gauss-cls",
+    "protocol_ver": 1,
+    "source": "fake",
+    "status": "success"
+  },
+  "attempt": {
+    "attempt_no": 2,
+    "purpose": "metric_append",
+    "status": "success",
+    "cost": 0.002
+  },
+  "metric_results": [
+    {
+      "metric_result_id": "mr:t2#accuracy@1:aggregate",
+      "metric_id": "accuracy",
+      "metric_ver": 1,
+      "value": 0.52,
+      "scope": "aggregate"
+    }
+  ],
+  "execution_logs": [
+    {
+      "log_kind": "eval",
+      "ref": "questions/q1/cycles/c2/build/t2/eval.fake.log",
+      "content_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "synthetic": true
+    }
+  ],
+  "execution_observation": {
+    "source": "fake",
+    "synthetic": true,
+    "nan_seen": false,
+    "loss_trend": "unknown",
+    "wall_clock_sec": 1.1
+  },
+  "result_review": {
+    "review_kind": "bundle_result_review",
+    "verdict": "pass",
+    "round_no": 1,
+    "stub": true
+  }
+}

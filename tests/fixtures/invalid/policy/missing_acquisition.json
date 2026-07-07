@@ -1,0 +1,38 @@
+{
+  "budget": { "B0": 5, "doubling_period_m": 8, "B_max": 40 },
+  "flow": {
+    "decompose_threshold": 1.0,
+    "tau": { "score_floor": 0.25, "consecutive_rounds": 3 },
+    "audit_cadence_K": 5,
+    "retry": { "artifact_parse": 2, "plan_review": 2, "bundle_code_review": 3, "bundle_result_review": 3 },
+    "watchdog": { "probe_h": 2, "full_h": 24 }
+  },
+  "retrieval": {
+    "recipe": "default_v1",
+    "budget_by_question_scale": { "small": 2, "medium": 5, "large": 10 },
+    "gate2_stuck_threshold": { "visit_count": 3, "consecutive_inconclusive": 2 }
+  },
+  "session": { "dual_mode": "A" },
+  "tree_guard": { "max_decompose_depth": 4, "max_children_per_node": 6, "max_open_questions": 30 },
+  "question_guard": { "max_inconclusive_per_question": 3 },
+  "answer_review": { "max_reviews_per_cycle": 5, "spawn_counts_toward_max_open": true },
+  "goal_amend": { "max_closed_revalidate_per_cycle": 10, "max_spawn_from_goal_amend": 5 },
+  "cards": { "subtree_card_depth": 1, "tag_policy": "free_v1" },
+  "idea": {
+    "sd_threshold": 6,
+    "candidate_top_k": 3,
+    "dedup_budget": 10,
+    "forbid_proto_term_source": "question_task_terms",
+    "cross_phase": { "decompose_assist": true, "spawn_assist": true, "budget": 5 }
+  },
+  "interaction": {
+    "classify_conservativeness": "high",
+    "ack_sla_s": 2,
+    "query_sla_s": 2,
+    "responder_fallback": { "grounding_fail_to_template": 1 },
+    "mediator_rebuild_last_n": 20,
+    "notify_matrix": "all_qq_on"
+  },
+  "resources": { "gpus": 4, "gpu_mem_gb": 80, "disk_quota_gb": 500 },
+  "interaction_request": { "enabled": true, "max_items_per_request": 10, "max_requests_per_goal": 5, "remind_interval_h": 24 }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/selection.schema.json",
+  "title": "selection",
+  "description": "reasoning R3 产物（第二部分 §6.11）。只选下一步、不写 route（route 由编排器 derive_next_route 派生，§2.3）。terminate ⇒ next_question_id 必为 null（持久停机标志，§4.2.4）；attack/decompose ⇒ 非空。scores[] 经 persist_selection 写回 question.score / est_cost（唯一维护点）。",
+  "type": "object",
+  "required": ["next_question_id", "next_intent", "scores"],
+  "additionalProperties": false,
+  "properties": {
+    "next_question_id": {
+      "type": ["string", "null"],
+      "description": "下一攻坚/分解目标；可为同批 tree_ops 的 local_key（StateStore 同事务解析）"
+    },
+    "next_intent": { "enum": ["attack", "decompose", "terminate"] },
+    "scores": {
+      "type": "array",
+      "description": "对 open（含 inconclusive）集逐问题四元打分留痕；bootstrap 首轮可为空",
+      "items": {
+        "type": "object",
+        "required": ["question_id", "score", "est_cost"],
+        "additionalProperties": false,
+        "properties": {
+          "question_id": { "type": "string", "minLength": 1, "description": "既有 question_id 或同批 local_key" },
+          "score": { "type": "number" },
+          "est_cost": { "type": "number", "minimum": 0 },
+          "expected_gain": { "type": "number" },
+          "info_gain": { "type": "number" },
+          "cost_norm": { "type": "number" },
+          "ucb": { "type": "number" },
+          "directive_adjust": { "type": "number" },
+          "rationale_md": { "type": "string" }
+        }
+      }
+    },
+    "terminate_reason_md": { "type": "string", "description": "terminate 时说明命中哪条终止判据（τ 三判据，§4.4.6）。注：terminate 时必填是本实现追加的审计约束（§4.2.4 最小要求只有 next_question_id=null）" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "next_intent": { "const": "terminate" } } },
+      "then": { "properties": { "next_question_id": { "const": null } }, "required": ["terminate_reason_md"] },
+      "else": { "properties": { "next_question_id": { "type": "string", "minLength": 1 } } }
+    }
+  ]
+}

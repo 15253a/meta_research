@@ -1,0 +1,24 @@
+{
+  "ops": [
+    {
+      "op": "spawn_question",
+      "local_key": "nq1",
+      "kind": "revalidate",
+      "parent_question_id": "q2",
+      "text": "复核：q2 的结论在协议升版（新增 macro-F1 指标）后是否仍然成立？",
+      "rationale_md": "回看题：applicability 判定要求"
+    },
+    {
+      "op": "mark_answer_applicability",
+      "answer_id": "a-q2",
+      "status": "needs_revalidation",
+      "rationale_md": "协议场景变化可能影响旧结论适用性；范围暂限原协议版本",
+      "spawned_question_ref": "nq1"
+    },
+    {
+      "op": "propose_prune",
+      "question_id": "q3",
+      "reason_md": "该分支的验证需求已被 q2 的更强结论覆盖，继续投入无期望增益"
+    }
+  ]
+}

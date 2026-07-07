@@ -1,0 +1,97 @@
+{
+  "target_key": "t1",
+  "target_kind": "exec",
+  "status": "complete",
+  "variant": {
+    "variant_key": "lr0.1-epoch50",
+    "config_json": { "lr": 0.1, "epochs": 50, "seed": 7 },
+    "overrides": []
+  },
+  "run": {
+    "kind": "exec",
+    "status": "success",
+    "seed": 7,
+    "env_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cost": 0.01
+  },
+  "checkpoints": [
+    {
+      "ckpt_key": "final",
+      "path": "questions/q1/cycles/c2/build/t1/ckpt-final.fake.json",
+      "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "hash_alg": "sha256"
+    }
+  ],
+  "evaluation": {
+    "eval_key": "factory-1",
+    "protocol_name": "toy-gauss-cls",
+    "protocol_ver": 1,
+    "source": "fake",
+    "status": "success"
+  },
+  "attempt": {
+    "attempt_no": 1,
+    "purpose": "factory",
+    "status": "success",
+    "env_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cost": 0.005
+  },
+  "metric_results": [
+    {
+      "metric_result_id": "mr:t1#accuracy@1:final",
+      "metric_id": "accuracy",
+      "metric_ver": 1,
+      "value": 0.93,
+      "scope": "fold",
+      "ckpt_key": "final"
+    },
+    {
+      "metric_result_id": "mr:t1#accuracy@1:aggregate",
+      "metric_id": "accuracy",
+      "metric_ver": 1,
+      "value": 0.93,
+      "scope": "aggregate"
+    }
+  ],
+  "identity_draft_md": "## identity 草稿\n- 名称：logreg-gauss2d / lr0.1-epoch50\n- 用途：toy 基线对照\n- 复现命令：python train.py --lr 0.1 --epochs 50 --seed 7（M0 假执行占位）\n- 环境指纹：env_hash 见上",
+  "execution_logs": [
+    {
+      "log_kind": "train",
+      "ref": "questions/q1/cycles/c2/build/t1/train.fake.log",
+      "content_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "synthetic": true
+    },
+    {
+      "log_kind": "eval",
+      "ref": "questions/q1/cycles/c2/build/t1/eval.fake.log",
+      "content_hash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "synthetic": true
+    }
+  ],
+  "execution_observation": {
+    "source": "fake",
+    "synthetic": true,
+    "nan_seen": false,
+    "divergence_flag": false,
+    "oom_count": 0,
+    "warning_count": 0,
+    "retry_count": 0,
+    "last_loss": 0.21,
+    "loss_trend": "down",
+    "wall_clock_sec": 3.2
+  },
+  "code_review": {
+    "review_kind": "bundle_code_review",
+    "verdict": "pass",
+    "round_no": 1,
+    "stub": true,
+    "comments_md": "M0 占位判官：自动通过"
+  },
+  "result_review": {
+    "review_kind": "bundle_result_review",
+    "verdict": "pass",
+    "round_no": 1,
+    "stub": true,
+    "comments_md": "M0 占位判官：自动通过"
+  }
+}

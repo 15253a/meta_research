@@ -1,0 +1,333 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/bundle_target.schema.json",
+  "title": "bundle_target",
+  "description": "bundle 阶段逐目标产物（第二部分 §6.11）。成败同记（P4）：complete 携全套注册对象，failed/engineering_blocked 携 failure_kind，skipped（未执行旁路）免执行审计对象。枚举与字段绑定对齐《第一部分》附录 A DDL（log_kind / loss_trend / oom_count / failure_kind / fold⇒checkpoint）。M0 边界：evaluation.source='fake' 与 synthetic=true 仅 M0–M3 假执行期合法（第三部分 §7.1 M0 行），M4 真执行起移除；DB 侧 source 枚举无 'fake'，M1 落库时假执行如何入账在 M1 检查点向用户确认。",
+  "type": "object",
+  "required": ["target_key", "target_kind", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "target_key": { "type": "string", "minLength": 1, "description": "对应 plan.targets[].target_key（接口参数名 target_id 在 M0 装载此值）" },
+    "target_kind": { "enum": ["build", "exec", "eval"] },
+    "status": {
+      "enum": ["complete", "failed", "skipped", "engineering_blocked"],
+      "description": "本目标终态（对齐 build_target 状态机 §4.2.1 的终态子集）"
+    },
+    "failure_kind": {
+      "enum": ["build", "smoke", "timeout", "runtime", "data_invalid", "aborted", "review_failed", "metric_missing", "protocol_violation", "env_invalid", "artifact_invalid"],
+      "description": "失败类别（failed / engineering_blocked 必带）。DDL build_target.failure_kind 为自由文本，本枚举是产物层纪律 = run 六值 ∪ attempt 八值 ∪ review_failed"
+    },
+    "variant": { "$ref": "#/$defs/variant" },
+    "run": { "$ref": "#/$defs/run" },
+    "checkpoints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/checkpoint" }
+    },
+    "evaluation": { "$ref": "#/$defs/evaluation" },
+    "attempt": { "$ref": "#/$defs/attempt" },
+    "metric_results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/metric_result" }
+    },
+    "identity_draft_md": { "type": "string", "description": "identity 草稿（名称/用途/复现命令/环境指纹；中文）" },
+    "execution_logs": {
+      "type": "array",
+      "description": "训/评产物 + smoke/stderr raw log 的 ref+content_hash（§3.1.2；只作分析输入、永不作证据）",
+      "items": { "$ref": "#/$defs/execution_log" }
+    },
+    "execution_observation": { "$ref": "#/$defs/execution_observation" },
+    "code_review": { "$ref": "#/$defs/review_verdict" },
+    "result_review": { "$ref": "#/$defs/review_verdict" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "enum": ["complete", "failed", "engineering_blocked"] } }
+      },
+      "then": {
+        "required": ["execution_logs", "execution_observation"],
+        "properties": { "execution_logs": { "minItems": 1 } }
+      },
+      "else": {
+        "description": "skipped = 未执行旁路：不得携带任何执行事实对象（§4.2.1 旁路语义）",
+        "not": {
+          "anyOf": [
+            { "required": ["execution_logs"] }, { "required": ["execution_observation"] },
+            { "required": ["variant"] }, { "required": ["run"] },
+            { "required": ["checkpoints"] }, { "required": ["evaluation"] },
+            { "required": ["attempt"] }, { "required": ["metric_results"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "target_kind": { "enum": ["build", "exec"] },
+          "status": { "const": "complete" }
+        }
+      },
+      "then": {
+        "required": ["variant", "run", "checkpoints", "evaluation", "attempt", "metric_results", "identity_draft_md"],
+        "properties": {
+          "run": { "properties": { "status": { "const": "success" } } },
+          "checkpoints": { "minItems": 1 },
+          "metric_results": {
+            "minItems": 1,
+            "contains": { "properties": { "scope": { "const": "aggregate" } }, "required": ["scope"] }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "target_kind": { "const": "eval" },
+          "status": { "const": "complete" }
+        }
+      },
+      "then": {
+        "required": ["evaluation", "attempt", "metric_results"],
+        "properties": {
+          "metric_results": {
+            "minItems": 1,
+            "contains": { "properties": { "scope": { "const": "aggregate" } }, "required": ["scope"] }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "complete" } } },
+      "then": {
+        "description": "complete = 注册通过：嵌套事实必须全 success（target_complete 证据边界；评审失败/执行失败不得以 complete 携带）",
+        "properties": {
+          "evaluation": { "properties": { "status": { "const": "success" } } },
+          "attempt": { "properties": { "status": { "const": "success" } } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "enum": ["failed", "engineering_blocked"] } }
+      },
+      "then": {
+        "required": ["failure_kind"],
+        "description": "失败目标可携带已发生的执行事实（run/attempt 成败同记，P4），但测量整包不注册（§4.2.5 段(ii) 不发生）",
+        "properties": { "metric_results": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "target_kind": { "const": "eval" } }
+      },
+      "then": { "not": { "required": ["run"] } }
+    },
+    {
+      "if": {
+        "properties": { "evaluation": { "required": ["source"], "properties": { "source": { "const": "fake" } } } },
+        "required": ["evaluation"]
+      },
+      "then": {
+        "description": "M0 边界焊死（正向）：假 evaluation ⇒ 全部执行日志与观测必须 synthetic=true 且观测 source=fake（M0 验收断言的 schema 层落点）",
+        "properties": {
+          "execution_logs": { "items": { "properties": { "synthetic": { "const": true } } } },
+          "execution_observation": {
+            "properties": {
+              "source": { "const": "fake" },
+              "synthetic": { "const": true }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "evaluation": { "required": ["source"], "properties": { "source": { "enum": ["factory", "protocol_upgrade", "standalone_eval"] } } } },
+        "required": ["evaluation"]
+      },
+      "then": {
+        "description": "M0 边界焊死（反向）：真 source 的 evaluation ⇒ 日志/观测不得标 synthetic、观测 source 只能 parser/codex——防「假执行不标 fake」绕过边界",
+        "properties": {
+          "execution_logs": { "items": { "properties": { "synthetic": { "const": false } } } },
+          "execution_observation": {
+            "properties": {
+              "source": { "enum": ["parser", "codex"] },
+              "synthetic": { "const": false }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "variant": {
+      "type": "object",
+      "required": ["variant_key", "config_json", "overrides"],
+      "additionalProperties": false,
+      "properties": {
+        "variant_key": { "type": "string", "minLength": 1 },
+        "config_json": { "type": "object", "description": "训练任务设置（不是评估协议——协议只经 evaluation 进入，§1.2.2）" },
+        "overrides": {
+          "type": "array",
+          "description": "只改动的代码文件相对路径（覆盖 baseline src/ 执行；变体不复制整份源码，§5.1）",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "description": "训练执行事实（eval 目标不建 run——审计落 attempt，§3.6.4）。failure_kind 枚举 = DDL run 表六值",
+      "required": ["kind", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["build", "exec"] },
+        "status": { "enum": ["success", "failed"] },
+        "seed": { "type": ["integer", "null"] },
+        "env_hash": { "type": "string" },
+        "commit_hash": { "type": "string" },
+        "failure_kind": { "enum": ["build", "smoke", "timeout", "runtime", "data_invalid", "aborted"] },
+        "cost": { "type": "number", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "failed" } } },
+          "then": { "required": ["failure_kind"] }
+        }
+      ]
+    },
+    "checkpoint": {
+      "type": "object",
+      "description": "可评 target（DDL：ckpt_key/path/content_hash/hash_alg 必填）",
+      "required": ["ckpt_key", "path", "content_hash", "hash_alg"],
+      "additionalProperties": false,
+      "properties": {
+        "ckpt_key": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "content_hash": { "type": "string", "minLength": 1 },
+        "hash_alg": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "required": ["eval_key", "protocol_name", "protocol_ver", "source", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "eval_key": { "type": "string", "minLength": 1 },
+        "protocol_name": { "type": "string", "minLength": 1 },
+        "protocol_ver": { "type": "integer", "minimum": 1 },
+        "source": {
+          "enum": ["factory", "protocol_upgrade", "standalone_eval", "fake"],
+          "description": "'fake' 仅 M0–M3 假执行合法（驱动器造假必须用它，M0 验收断言）；DB 枚举无 'fake'，M4 起移除"
+        },
+        "status": { "enum": ["success", "failed"] }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "description": "一次真实评估执行（审计载体）。failure_kind 枚举 = DDL evaluation_attempt 八值",
+      "required": ["attempt_no", "purpose", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "attempt_no": { "type": "integer", "minimum": 1 },
+        "purpose": { "enum": ["factory", "retry", "metric_append", "repro_eval", "standalone_eval", "protocol_upgrade"] },
+        "status": { "enum": ["success", "failed", "aborted"] },
+        "env_hash": { "type": "string" },
+        "failure_kind": { "enum": ["timeout", "runtime", "data_invalid", "metric_missing", "protocol_violation", "env_invalid", "artifact_invalid", "aborted"] },
+        "cost": { "type": "number", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "failed" } } },
+          "then": { "required": ["failure_kind"] }
+        }
+      ]
+    },
+    "metric_result": {
+      "type": "object",
+      "description": "测量结果。折绑定对齐 DDL CHECK：scope=fold ⇒ 必带 ckpt_key（折以 checkpoint 定身份，无 fold_key 列）；scope=aggregate ⇒ 不带 ckpt_key",
+      "required": ["metric_result_id", "metric_id", "metric_ver", "value", "scope"],
+      "additionalProperties": false,
+      "properties": {
+        "metric_result_id": { "type": "string", "minLength": 1, "description": "产物级 id（reasoning evidence 以此回指；M1 起映射 DB 行）" },
+        "metric_id": { "type": "string", "minLength": 1 },
+        "metric_ver": { "type": "integer", "minimum": 1 },
+        "value": { "type": "number" },
+        "scope": { "enum": ["fold", "aggregate"] },
+        "ckpt_key": { "type": "string", "minLength": 1, "description": "scope=fold 时该折的 checkpoint" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "scope": { "const": "fold" } } },
+          "then": { "required": ["ckpt_key"] },
+          "else": { "not": { "required": ["ckpt_key"] } }
+        }
+      ]
+    },
+    "execution_log": {
+      "type": "object",
+      "description": "log_kind 枚举与列名对齐 DDL execution_log（train/eval/smoke/stderr/platform/import_clone；content_hash）；曲线/event/csv 是 train/eval 产物的内容、不是 log_kind 值",
+      "required": ["log_kind", "ref", "content_hash", "synthetic"],
+      "additionalProperties": false,
+      "properties": {
+        "log_kind": { "enum": ["train", "eval", "smoke", "stderr", "platform", "import_clone"] },
+        "ref": { "type": "string", "minLength": 1 },
+        "content_hash": { "type": "string", "minLength": 1 },
+        "synthetic": { "type": "boolean", "description": "M0–M3 驱动器造假必须 true（M0 验收断言）；M4 起移除本字段" }
+      }
+    },
+    "execution_observation": {
+      "type": "object",
+      "description": "结构化观测（§4.3.1）：机器事实仅确定性 parser 写；source=codex 时机器事实字段须空、只存 digest ref+hash（DDL CHECK 同构）；source=fake 仅 M0–M3。字段名/枚举对齐 DDL execution_observation（oom_count；loss_trend ∈ down/flat/up/nan/unknown）",
+      "required": ["source", "synthetic"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "enum": ["parser", "codex", "fake"] },
+        "synthetic": { "type": "boolean" },
+        "nan_seen": { "type": "boolean" },
+        "divergence_flag": { "type": "boolean" },
+        "oom_count": { "type": "integer", "minimum": 0 },
+        "warning_count": { "type": "integer", "minimum": 0 },
+        "retry_count": { "type": "integer", "minimum": 0 },
+        "last_loss": { "type": ["number", "null"] },
+        "loss_trend": { "enum": ["down", "flat", "up", "nan", "unknown"] },
+        "wall_clock_sec": { "type": "number", "minimum": 0 },
+        "digest_ref": { "type": "string" },
+        "digest_hash": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "source": { "const": "fake" } } },
+          "then": { "properties": { "synthetic": { "const": true } } }
+        },
+        {
+          "if": { "properties": { "source": { "const": "codex" } } },
+          "then": {
+            "required": ["digest_ref", "digest_hash"],
+            "not": {
+              "anyOf": [
+                { "required": ["nan_seen"] }, { "required": ["divergence_flag"] },
+                { "required": ["oom_count"] }, { "required": ["warning_count"] },
+                { "required": ["retry_count"] }, { "required": ["last_loss"] },
+                { "required": ["loss_trend"] }, { "required": ["wall_clock_sec"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "review_verdict": {
+      "type": "object",
+      "description": "双评审桩的结论占位（M0：占位判官，§3.4.3；判据机械化在 M1+ 门禁）",
+      "required": ["review_kind", "verdict", "round_no"],
+      "additionalProperties": false,
+      "properties": {
+        "review_kind": { "enum": ["bundle_code_review", "bundle_result_review"] },
+        "verdict": { "enum": ["pass", "fail"] },
+        "round_no": { "type": "integer", "minimum": 1 },
+        "subject_hash": { "type": "string" },
+        "comments_md": { "type": "string" },
+        "stub": { "type": "boolean", "description": "true = M0 占位判官出具（非真实独立评审会话）" }
+      }
+    }
+  }
+}

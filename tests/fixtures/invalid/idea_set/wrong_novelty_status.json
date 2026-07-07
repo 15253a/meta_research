@@ -1,0 +1,37 @@
+{
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "generation_path": "bypass",
+      "audit_mapping": {
+        "source_domain": "现成方案",
+        "target_domain": "toy 任务",
+        "object_mapping": "直接套用",
+        "shared_relations": "同构"
+      },
+      "core_claim": "novelty_status 写「查重通过」必须被拒（诚实纪律 P4：只准固定文本）",
+      "mechanism": "占位",
+      "assumptions": ["占位"],
+      "min_falsifiable_experiment": "占位",
+      "novelty_type": "表征结构",
+      "novelty_status": "查重通过"
+    }
+  ],
+  "audit_scores": [
+    {
+      "candidate_id": "c1",
+      "scores": {
+        "structural_depth": 7,
+        "domain_distance": 3,
+        "applicability": 8,
+        "novelty": 2,
+        "unexpectedness": 2,
+        "non_obviousness": 2
+      },
+      "decision": "pass",
+      "rationale": "占位"
+    }
+  ],
+  "selected_id": "c1",
+  "novelty_refs": []
+}

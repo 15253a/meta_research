@@ -1,0 +1,70 @@
+# policies/policy.yaml —— 全部可调旋钮（P2 机制与策略分离；版本入 Git）
+# 注册表唯一权威 = 《第一部分》附录 C：每旋钮带默认值，用户只改想改的；标 [M6 调] 的项在 M6 实测后复核默认。
+# 机制代码零硬编码：影响研究语义 / 门禁 / 预算 / 选择的数值只在本文件（纯工程常量如 busy_timeout 不在此列，§1.1.4）。
+# observation 节（parser 阈值：nan / divergence / loss_trend）为既有缺口，随 M4 真 parser 落地补全（OPEN #5）。
+
+# —— 采集四元打分 ——
+# w1=期望增益(gain) w2=信息量(info) w3=成本惩罚(cost) 权重，c=UCB 探索系数；公式见《第二部分》§6.4 R3 [M6 调]
+acquisition: { w1: 0.35, w2: 0.25, w3: 0.30, c: 0.10 }
+
+# —— 预算 ——
+# 单位与 ledger 一致（USD 等效）；初值≈廉价探针
+budget: { B0: 5, doubling_period_m: 8, B_max: 40 }
+
+# —— 流程阈值 ——
+flow:
+  decompose_threshold: 1.0            # est_cost > 1.0×B(t) ⇒ 走 decompose（软约束，执行点=reasoning R3 提示词；§4.4.4）
+  tau: { score_floor: 0.25, consecutive_rounds: 3 }   # 终止判据①：open 最高分连续 3 轮 < 0.25
+  audit_cadence_K: 5                  # 每 5 轮推送摘要
+  retry:
+    artifact_parse: 2                 # 产物解析重试 ≤2（三级校验统一口径）
+    plan_review: 2                    # plan 可回答性评审 ≤2（§3.1.3 审计契约）
+    bundle_code_review: 3             # bundle 代码适配评审 ≤3（§3.4.3 / §4.1.4 附注）
+    bundle_result_review: 3           # bundle 结果评审 ≤3
+  watchdog: { probe_h: 2, full_h: 24 }   # 单次执行时限唯一定义点（资源硬件在 resources）
+
+# —— 检索 / import ——
+retrieval:
+  recipe: default_v1                  # 检索配方（provider 组合与排序）
+  budget_by_question_scale: { small: 2, medium: 5, large: 10 }   # 每轮检索调用上限档位（闸3，随 est_cost/score+B(t)）
+  gate2_stuck_threshold: { visit_count: 3, consecutive_inconclusive: 2 }   # 闸2 外部普查触发
+
+# —— 会话 ——
+session: { dual_mode: A }             # A=一 turn 一阶段 [M6 实测后定默认]
+
+# —— 树规模护栏 ——
+tree_guard: { max_decompose_depth: 4, max_children_per_node: 6, max_open_questions: 30 }
+
+# —— 问题重访 / 回看护栏 ——
+question_guard: { max_inconclusive_per_question: 3 }   # 到限后对 attack 不可选，仅可作 decompose/propose_prune 对象（执行点 §4.2.1）
+answer_review: { max_reviews_per_cycle: 5, spawn_counts_toward_max_open: true }   # 每轮回看判定上限（执行点 §4.2.4 apply_tree_ops）
+
+# —— goal_amend 护栏 ——
+goal_amend: { max_closed_revalidate_per_cycle: 10, max_spawn_from_goal_amend: 5 }
+
+# —— 卡片 / 召回 ——
+cards: { subtree_card_depth: 1, tag_policy: free_v1 }   # subtree 默认深度 1、宽度全部
+
+# —— idea / wildidea ——
+idea:
+  sd_threshold: 6                     # Structural Depth 淘汰阈值（SD<6 淘汰，§3.1.3）
+  candidate_top_k: 3                  # 自评筛选前 3
+  dedup_budget: 10                    # 查重预算 = 每候选联网查重调用上限
+  forbid_proto_term_source: question_task_terms   # 禁词取自本问题任务词
+  cross_phase: { decompose_assist: true, spawn_assist: true, budget: 5 }   # 跨阶段调用开关与预算（§3.2.5）；附录 C 原文写 on，YAML1.1 下 on ≡ true，此处取 true 防解析歧义
+
+# —— interaction（§4.6 / 二部 §6.12 ④）——
+interaction:
+  classify_conservativeness: high     # 保守三分类：可能改状态一律 directive/回显
+  ack_sla_s: 2                        # M5 验收 p95 目标
+  query_sla_s: 2
+  responder_fallback: { grounding_fail_to_template: 1 }   # grounding 不过 1 次即退模板渲染
+  mediator_rebuild_last_n: 20         # 中介重建对话条数（§4.6.2）
+  notify_matrix: all_qq_on            # 事件→通道开关表（§4.6.6）；默认全事件走 qq，细表运行期调
+
+# —— resources（启动输入③：只放硬件事实，§4.6.7；时限唯一归 flow.watchdog）——
+resources: { gpus: 4, gpu_mem_gb: 80, disk_quota_gb: 500 }
+
+# —— interaction_request（文件请求，§4.6.8；执行点 = interaction_request_create 创建拒绝判据）——
+# 无自动超时放弃：全局等待 + 周期提醒，用户可 cancel
+interaction_request: { enabled: true, max_items_per_request: 10, max_requests_per_goal: 5, remind_interval_h: 24 }

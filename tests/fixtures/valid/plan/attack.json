@@ -1,0 +1,59 @@
+{
+  "needs": [
+    { "need_id": "n1", "statement_md": "验证逻辑回归基线在锁定协议下 aggregate accuracy ≥ 0.90", "source": "min_falsifiable_experiment" },
+    { "need_id": "n2", "statement_md": "同协议下多数类基线对照（失败判据下界）", "source": "assumptions" }
+  ],
+  "reuse_evidence": [],
+  "targets": [
+    {
+      "target_key": "t1",
+      "target_kind": "build",
+      "seq": 1,
+      "critical": true,
+      "budget_estimate": 2.0,
+      "spec_md": "构建逻辑回归基线（新 baseline）：合成双高斯数据生成 + 训练脚本 + 出厂评估",
+      "need_ids": ["n1"],
+      "claim": { "canonical_key": "logreg-gauss2d", "slug": "logreg-gauss2d" }
+    },
+    {
+      "target_key": "t2",
+      "target_kind": "eval",
+      "seq": 2,
+      "critical": false,
+      "budget_estimate": 0.5,
+      "spec_md": "对既有多数类基线 checkpoint 免训练补测 accuracy（对照）",
+      "need_ids": ["n2"],
+      "eval_action": "append_attempt",
+      "attempt_purpose": "metric_append",
+      "evaluation_id": "eval:majority-cls@toy-gauss-cls@1"
+    }
+  ],
+  "protocol": {
+    "name": "toy-gauss-cls",
+    "version": 1,
+    "scope_spec": {
+      "data": "二维双高斯混合，seed=42，n=2000",
+      "split": "train 0.7 / heldout 0.3，分层",
+      "checkpoint_selection": "最终 epoch",
+      "procedure": "单次训练后在 heldout 上测全部声明指标"
+    },
+    "smoke_md": "以 n=64 子样本跑一遍训练+评估流水，产出 accuracy 数值即通过"
+  },
+  "metric_defs": [
+    {
+      "metric_id": "accuracy",
+      "version": 1,
+      "name": "留出集准确率",
+      "direction": "higher",
+      "unit": "ratio",
+      "compute_spec_md": "heldout 上 argmax 预测与标签一致的比例"
+    }
+  ],
+  "readout_rules": [
+    { "metric_id": "accuracy", "metric_ver": 1, "rule_md": "aggregate ≥ 0.90 判达标；与对照差 ≥ 0.02 判显著优" }
+  ],
+  "build_target_required_metric": [
+    { "target_key": "t1", "metric_id": "accuracy", "metric_ver": 1 },
+    { "target_key": "t2", "metric_id": "accuracy", "metric_ver": 1 }
+  ]
+}

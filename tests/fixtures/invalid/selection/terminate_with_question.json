@@ -1,0 +1,6 @@
+{
+  "next_question_id": "q2",
+  "next_intent": "terminate",
+  "scores": [],
+  "terminate_reason_md": "terminate 时 next_question_id 必须为 null（§4.2.4 persist_selection 拒绝判据）"
+}

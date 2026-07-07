@@ -1,0 +1,63 @@
+{
+  "need_innovation": true,
+  "candidates": [
+    {
+      "candidate_id": "w1",
+      "generation_path": "wildidea",
+      "audit_mapping": {
+        "source_domain": "蚁群信息素挥发机制",
+        "target_domain": "toy 双高斯二分类的训练课程设计",
+        "object_mapping": "信息素浓度 → 样本权重；挥发速率 → 权重衰减周期；蚁群路径 → 误分类样本簇",
+        "shared_relations": "正反馈富集 + 时间衰减共同防止早期错误被永久放大"
+      },
+      "core_claim": "按误分类历史施加带衰减的样本重加权可提升边界样本上的 accuracy",
+      "mechanism": "每轮按近期误分类频次上调样本权重、按固定半衰期衰减，形成自适应课程",
+      "assumptions": ["边界样本误分类具有时间局部性", "重加权不破坏收敛"],
+      "min_falsifiable_experiment": "同一划分下对照均匀权重训练；若加权组 aggregate accuracy 不高于对照 ≥0.02 则证伪",
+      "novelty_type": "训练目标",
+      "novelty_status": "联网粗查已启用·文献级待人工验证",
+      "wildidea_extra": {
+        "source_isof": "输入=局部信息素浓度；状态=路径上浓度分布；输出=转移概率；反馈=成功路径追加信息素、全场按速率挥发",
+        "source_prototype": "P01 带挥发的正反馈富集回路（冻结时不含分类任务词）",
+        "deanchor_level": "部分成立",
+        "degenerate_form": "退化为带衰减的 boosting 样本重加权",
+        "nearest_neighbor_diff": "同：AdaBoost 的误差驱动重加权；异：显式时间衰减半衰期；风险：被视作 boosting 平凡变体",
+        "strongest_rebuttal": "toy 线性可分数据上课程设计的增益可能小于噪声（审稿人视角）"
+      }
+    }
+  ],
+  "audit_scores": [
+    {
+      "candidate_id": "w1",
+      "scores": {
+        "structural_depth": 6,
+        "domain_distance": 8,
+        "applicability": 6,
+        "novelty": 5,
+        "unexpectedness": 6,
+        "non_obviousness": 5
+      },
+      "decision": "pass",
+      "rationale": "SD 过线（≥6）；机制迁移完整、退化物已识别，最近邻差异明确",
+      "ref": "novelty_refs[0]"
+    }
+  ],
+  "selected_id": "w1",
+  "novelty_refs": [
+    {
+      "query": "decayed sample reweighting curriculum classification",
+      "provider": "lit-search-stub",
+      "result_content_hashes": ["sha256:1111111111111111111111111111111111111111111111111111111111111111"],
+      "ranking": ["r1"],
+      "policy_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ],
+  "provenance": {
+    "engine_version": "wildidea-vendored-0",
+    "adapter_version": "m0-skeleton",
+    "prompt_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "judge_prompt_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "model": "gpt-5.5",
+    "sampling": { "seed": 7, "temperature": 1.0 }
+  }
+}

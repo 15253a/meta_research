@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/resource_request.schema.json",
+  "title": "resource_request",
+  "description": "统一可选 sidecar（四阶段皆适用，§3.1.1 / §4.6.8）：系统确实无法自行获取资料时的文件请求单。非 Gate 产物：schema 校验后经 WriteDaemon interaction_request_create 落请求单，不入研究库。attempted_paths / failure_reason 必填 = 「能自己获取的不得请求」的自证落点（缺失即 schema 拒）。",
+  "type": "object",
+  "required": ["summary_md", "items"],
+  "additionalProperties": false,
+  "properties": {
+    "summary_md": {
+      "type": "string",
+      "minLength": 1,
+      "description": "易懂语言（中文）：期望做什么 / 为何自己获取不到 / 需要用户提供什么"
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["kind", "desc", "expected_files", "attempted_paths", "failure_reason", "dest_hint"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["dataset", "paper", "wet_lab", "other"] },
+          "desc": { "type": "string", "minLength": 1 },
+          "expected_files": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "attempted_paths": {
+            "type": "array",
+            "minItems": 1,
+            "description": "已尝试的获取路径（必填，防「能自己获取还请求」）",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "failure_reason": { "type": "string", "minLength": 1 },
+          "dest_hint": { "type": "string", "minLength": 1, "description": "期望落位提示（恢复后从托管区引用/复制到消费位置）" }
+        }
+      }
+    }
+  }
+}

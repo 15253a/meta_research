@@ -1,0 +1,9 @@
+{
+  "ops": [
+    {
+      "op": "create_root",
+      "text": "在 toy-gauss-cls 协议下，逻辑回归与单隐层 MLP 两基线家族谁能以 aggregate accuracy ≥ 0.90 稳定达标、差距是否 ≥ 0.02？",
+      "rationale_md": "bootstrap 首题：直接对齐 goal 成功谓词草案"
+    }
+  ]
+}

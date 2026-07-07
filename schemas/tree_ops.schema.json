@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/tree_ops.schema.json",
+  "title": "tree_ops",
+  "description": "reasoning 写树产物（第二部分 §6.11）。op 封闭七词表，与 §4.2.4 apply_tree_ops 一字一致：create_root / add_children / spawn_question / mark_answer_applicability / propose_prune / amend_goal / seed_applicability_audit。同批引用：spawn_question 可带 local_key，mark_answer_applicability.spawned_question_ref 可为既有 question_id 或同批 local_key。",
+  "type": "object",
+  "required": ["ops"],
+  "additionalProperties": false,
+  "properties": {
+    "ops": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/create_root" },
+          { "$ref": "#/$defs/add_children" },
+          { "$ref": "#/$defs/spawn_question" },
+          { "$ref": "#/$defs/mark_answer_applicability" },
+          { "$ref": "#/$defs/propose_prune" },
+          { "$ref": "#/$defs/amend_goal" },
+          { "$ref": "#/$defs/seed_applicability_audit" }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "create_root": {
+      "type": "object",
+      "description": "bootstrap 轮专用：建首题",
+      "required": ["op", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "const": "create_root" },
+        "text": { "type": "string", "minLength": 1, "description": "问题语义身份（中文）" },
+        "rationale_md": { "type": "string" }
+      }
+    },
+    "add_children": {
+      "type": "object",
+      "description": "decompose 轮专用：写子问题（同事务父问题释放 + 逐子 dep，由 StateStore 落地，§4.2.5）",
+      "required": ["op", "parent_question_id", "children"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "const": "add_children" },
+        "parent_question_id": { "type": "string", "minLength": 1 },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["local_key", "text"],
+            "additionalProperties": false,
+            "properties": {
+              "local_key": { "type": "string", "minLength": 1, "description": "同批引用键（selection 选子题用）" },
+              "text": { "type": "string", "minLength": 1 },
+              "rationale_md": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "spawn_question": {
+      "type": "object",
+      "description": "新问题（诊断/后续/回看/import 参照/goal_retarget）；kind→question.source 映射见 §4.2.4",
+      "required": ["op", "kind", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "const": "spawn_question" },
+        "local_key": { "type": "string", "description": "同批引用键（mark_answer_applicability.spawned_question_ref 可回指）" },
+        "kind": { "enum": ["diagnosis", "followup", "revalidate", "import_reference", "goal_retarget"] },
+        "parent_question_id": {
+          "type": ["string", "null"],
+          "description": "挂点：诊断/后续 = 触发它的问题；revalidate = 被回看问题；goal_retarget = null（新 root，goal_amend 轮专用）"
+        },
+        "text": { "type": "string", "minLength": 1 },
+        "dep_note_md": { "type": "string", "description": "依赖声明（可读；结构化 dep 由 StateStore 落）" },
+        "rationale_md": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "goal_retarget" } } },
+          "then": { "properties": { "parent_question_id": { "const": null } } },
+          "else": { "required": ["parent_question_id"], "properties": { "parent_question_id": { "type": "string" } } }
+        }
+      ]
+    },
+    "mark_answer_applicability": {
+      "type": "object",
+      "description": "回看旧结论（§4.6.4 三步闭环）：needs_revalidation / contradicted 必须带 spawned_question_ref（source=revalidate 回看题）",
+      "required": ["op", "answer_id", "status", "rationale_md"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "const": "mark_answer_applicability" },
+        "answer_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pending", "blocked", "still_applicable", "needs_revalidation", "contradicted", "obsolete"] },
+        "rationale_md": { "type": "string", "minLength": 1, "description": "判定理由；范围限定写在此（如「仅 SEED/DEAP 成立」）" },
+        "spawned_question_ref": { "type": "string", "description": "既有 question_id 或同批 spawn_question 的 local_key" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "enum": ["needs_revalidation", "contradicted"] } } },
+          "then": { "required": ["spawned_question_ref"] }
+        }
+      ]
+    },
+    "propose_prune": {
+      "type": "object",
+      "description": "agent 剪枝：StateStore 先写 decision(type=prune_branch) 再置 dead_end（非 I3 evidence）",
+      "required": ["op", "question_id", "reason_md"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "const": "propose_prune" },
+        "question_id": { "type": "string", "minLength": 1 },
+        "reason_md": { "type": "string", "minLength": 1 }
+      }
+    },
+    "amend_goal": {
+      "type": "object",
+      "description": "goal_amend 轮专用：INSERT goal 新版本 + open 重打分（StateStore 落地）",
+      "required": ["op", "new_goal_text", "rationale_md"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "const": "amend_goal" },
+        "new_goal_text": { "type": "string", "minLength": 1 },
+        "predicate_json": { "type": "object", "description": "新版本成功谓词（合法 JSON）" },
+        "rationale_md": { "type": "string", "minLength": 1 }
+      }
+    },
+    "seed_applicability_audit": {
+      "type": "object",
+      "description": "goal_amend 轮专用：对可能受新根谓词影响的 closed 结论批量建 pending applicability 行（受 max_closed_revalidate_per_cycle）",
+      "required": ["op", "answer_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "op": { "const": "seed_applicability_audit" },
+        "answer_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "rationale_md": { "type": "string" }
+      }
+    }
+  }
+}

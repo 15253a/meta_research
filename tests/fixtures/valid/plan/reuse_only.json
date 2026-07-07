@@ -1,0 +1,38 @@
+{
+  "needs": [
+    { "need_id": "n1", "statement_md": "该 need 所需指标已在池中测过（同协议@版本 + env 兼容）", "source": "assumptions" }
+  ],
+  "reuse_evidence": [
+    {
+      "need_id": "n1",
+      "kind": "evaluation",
+      "ref_md": "复用 logreg-gauss2d 变体 v1 在 toy-gauss-cls@1 的既有成功 evaluation",
+      "evaluation_id": "eval:logreg-gauss2d/v1@toy-gauss-cls@1",
+      "metric_result_id": "mr:logreg-gauss2d/v1@toy-gauss-cls@1#accuracy@1:aggregate"
+    }
+  ],
+  "targets": [],
+  "protocol": {
+    "name": "toy-gauss-cls",
+    "version": 1,
+    "scope_spec": {
+      "data": "二维双高斯混合，seed=42，n=2000",
+      "split": "train 0.7 / heldout 0.3，分层",
+      "checkpoint_selection": "最终 epoch",
+      "procedure": "单次训练后在 heldout 上测全部声明指标"
+    }
+  },
+  "metric_defs": [
+    {
+      "metric_id": "accuracy",
+      "version": 1,
+      "name": "留出集准确率",
+      "direction": "higher",
+      "compute_spec_md": "heldout 上 argmax 预测与标签一致的比例"
+    }
+  ],
+  "readout_rules": [
+    { "metric_id": "accuracy", "metric_ver": 1, "rule_md": "aggregate ≥ 0.90 判达标" }
+  ],
+  "build_target_required_metric": []
+}

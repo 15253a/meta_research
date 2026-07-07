@@ -1,0 +1,8 @@
+{
+  "next_question_id": null,
+  "next_intent": "terminate",
+  "scores": [
+    { "question_id": "q4", "score": 0.12, "est_cost": 3.0 }
+  ],
+  "terminate_reason_md": "终止判据③：目标谓词满足（根问题已以合规证据关闭），等待人类确认"
+}

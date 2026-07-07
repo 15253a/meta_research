@@ -1,0 +1,17 @@
+{
+  "question_id": "q1",
+  "verdict": "answered",
+  "answer_md": "逻辑回归基线在锁定协议 toy-gauss-cls@1 下 aggregate accuracy = 0.93 ≥ 0.90，达标；与多数类对照差 0.41 ≥ 0.02，显著优。",
+  "evidence": [
+    {
+      "kind": "evaluation",
+      "metric_result_id": "mr:t1#accuracy@1:aggregate",
+      "note_md": "出厂评估（M0 假执行，source=fake，仅验流程契约）"
+    },
+    {
+      "kind": "evaluation",
+      "metric_result_id": "mr:t2#accuracy@1:aggregate",
+      "note_md": "多数类对照"
+    }
+  ]
+}

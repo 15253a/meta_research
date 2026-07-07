@@ -1,0 +1,35 @@
+{
+  "target_key": "t8",
+  "target_kind": "eval",
+  "status": "complete",
+  "evaluation": {
+    "eval_key": "fake-with-real-log",
+    "protocol_name": "toy-gauss-cls",
+    "protocol_ver": 1,
+    "source": "fake",
+    "status": "success"
+  },
+  "attempt": {
+    "attempt_no": 1,
+    "purpose": "standalone_eval",
+    "status": "success"
+  },
+  "metric_results": [
+    {
+      "metric_result_id": "mr:t8#accuracy@1:aggregate",
+      "metric_id": "accuracy",
+      "metric_ver": 1,
+      "value": 0.5,
+      "scope": "aggregate"
+    }
+  ],
+  "execution_logs": [
+    {
+      "log_kind": "eval",
+      "ref": "questions/q1/cycles/c2/build/t8/eval.log",
+      "content_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "synthetic": false
+    }
+  ],
+  "execution_observation": { "source": "fake", "synthetic": true }
+}

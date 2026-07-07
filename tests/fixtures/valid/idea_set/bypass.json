@@ -1,0 +1,44 @@
+{
+  "need_innovation": false,
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "generation_path": "bypass",
+      "audit_mapping": {
+        "source_domain": "经典机器学习教材基线（现成方案来源）",
+        "target_domain": "toy 双高斯二分类",
+        "object_mapping": "教材逻辑回归 → 本任务基线家族 A；决策边界 → 线性判别面",
+        "shared_relations": "线性可分性假设下，最大似然训练与留出集评估的关系在两域一致"
+      },
+      "core_claim": "逻辑回归在双高斯合成数据上能以 accuracy ≥ 0.90 稳定达标",
+      "mechanism": "线性判别面拟合两高斯的贝叶斯最优边界近似",
+      "assumptions": ["两类协方差近似相等", "训练集规模足以估计二维权重"],
+      "min_falsifiable_experiment": "固定数据种子与划分，训练逻辑回归并在留出集测 accuracy；若 aggregate < 0.90 则证伪（对照：多数类基线）",
+      "novelty_type": "表征结构",
+      "novelty_status": "联网粗查已启用·文献级待人工验证"
+    }
+  ],
+  "audit_scores": [
+    {
+      "candidate_id": "c1",
+      "scores": {
+        "structural_depth": 7,
+        "domain_distance": 2,
+        "applicability": 9,
+        "novelty": 1,
+        "unexpectedness": 1,
+        "non_obviousness": 2
+      },
+      "decision": "pass",
+      "rationale": "无需重大创新的问题，现成基线适配度高；DD/novelty 诚实低分不作淘汰理由（§3.2.4 统一门口径）"
+    }
+  ],
+  "selected_id": "c1",
+  "novelty_refs": [],
+  "provenance": {
+    "adapter_version": "m0-skeleton",
+    "prompt_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "model": "gpt-5.5",
+    "sampling": { "seed": null, "temperature": null }
+  }
+}
