@@ -12,3 +12,6 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# 被建系统的运行时工作目录（轮临时+产物快照；验收报告单独归档进 build_log 引用）
+meta-research/questions/

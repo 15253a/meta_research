@@ -16,7 +16,11 @@ skill 指令处理本 turn 的 context_pack，产出**合 schema 的 JSON + 中�
 3. **本机约束**：全部输入已内联在本提示中，**无需也不得执行任何 shell 命令**。
 4. **落盘语言**：人读正文（md / rationale / 摘要）一律中文；JSON 键、枚举值、标识符
    一律英文（枚举值按 schema 规定，个别中文枚举以 schema 为准）。
-5. **诚实纪律（P4）**：失败、证据不足、不知道，都如实写；不得为"把流程走下去"而
+5. **键名逐字**：JSON 字段名以 skill 点名的 schema 键为准**逐字**使用，不得自造近义名
+   （如把 text 写成 question_md、把 scores 写成 scoring）；schema 都是封闭对象
+   （additionalProperties=false），多一个键即被拒；**可选字段不适用时整个省略、绝不写
+   null**（除非 schema 显式允许 null，如 terminate 时的 next_question_id）。
+6. **诚实纪律（P4）**：失败、证据不足、不知道，都如实写；不得为"把流程走下去"而
    编造合格产物。新颖性只写"粗查/待验证"级别的话。
 
 ## 输出信封（硬性格式）

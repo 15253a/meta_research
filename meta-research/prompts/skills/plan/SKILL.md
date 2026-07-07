@@ -55,6 +55,32 @@
    M0 单驱动器串行、通常不会触发，契约仍在此声明。
 6. `md` 写计划正文（中文）：needs 表、复用判定逐条结论、协议锁定理由、预算分配。
 
+**输出骨架（键名逐字，封闭对象；`<>` 占位、`?` 表可省键）**：
+
+```json
+{ "needs": [ { "need_id": "n1", "statement_md": "<>", "source?": "<assumptions|min_falsifiable_experiment|other>" } ],
+  "reuse_evidence": [ { "need_id?": "n1", "kind": "<evaluation|child_answer>", "ref_md": "<>",
+                        "evaluation_id?": "<>", "metric_result_id?": "<>", "answer_id?": "<>" } ],
+  "targets": [
+    { "target_key": "t1", "target_kind": "<build|exec|eval>", "seq": 1, "critical": <true|false>,
+      "budget_estimate": <数值>, "spec_md": "<bundle 只照办的执行说明>", "need_ids?": ["n1"],
+      "claim?": { "canonical_key?": "<build 必>", "slug?": "<build 必>",
+                  "baseline_ref?": "<exec 必>", "variant_key?": "<exec 必>", "config_json?": {} },
+      "eval_action?": "<create_evaluation|append_attempt>", "attempt_purpose?": "<按情形表>",
+      "eval_key?": "<create 必>", "evaluation_source?": "<create 必>", "evaluation_id?": "<append 必>" } ],
+  "protocol": { "name": "<>", "version": 1, "scope_spec": { "<场景字段自定>": "<>" }, "smoke_md?": "<>" },
+  "metric_defs": [ { "metric_id": "<>", "version": 1, "name": "<>",
+                     "direction": "<higher|lower>", "compute_spec_md": "<>", "unit?": "<>" } ],
+  "readout_rules": [ { "metric_id": "<>", "metric_ver": 1, "rule_md": "<>" } ],
+  "build_target_required_metric": [ { "target_key": "t1", "metric_id": "<>", "metric_ver": 1 } ] }
+```
+
+骨架纪律：顶层只许上列七键（第八种可能键 import_defer M0 不产）；target 内不加自造键；
+聚合轮：needs/targets 均为 []、protocol/metric_defs/readout_rules **整体省略**，但
+`reuse_evidence`（child_answer 证据逐条）与 `build_target_required_metric`（=[]）**仍必须在场**。
+**scope_spec 只写评估场景**（评估数据/分割/checkpoint 选择/评估流程）——训练配置的唯一
+载体是 target 的 `claim.config_json`，**不得在协议里双写训练配置**（双写必然漂移、评审打回）。
+
 ## 【评审任务】（phase=audit，独立会话，≤2 轮）
 
 输入 = plan.json + normalized selected idea（**不含计划推理过程**）。

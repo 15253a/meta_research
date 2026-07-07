@@ -41,6 +41,9 @@ class StubCompiler:
         self.policy = policy
         self.goal_body_md = goal_body_md
         self.cycles_root = cycles_root
+        # pack → 来源清单（amend 续写 manifest 用）。以 id(pack) 为键：pack 生命周期 = 单次
+        # 调用点，M0 单进程内安全；M1 起随 DECISION 入账后此缓存消失
+        self._pack_sources: Dict[int, List[str]] = {}
 
     # -- Compiler Protocol -------------------------------------------------------
     def render(self, *, cycle_id: str, stage: Stage, target_id: Optional[str] = None) -> ContextPack:
@@ -54,11 +57,79 @@ class StubCompiler:
             retrieval_md="（M0：池空，召回无命中）",
             refs=[],
         )
+        self._seal(pack, sources)
+        return pack
+
+    # -- 输入追加（唯一合法的 pack 变异口：重算 hash + 续写 manifest，保 P6 溯源） -----
+    def amend(self, pack: ContextPack, *, title: str, body_md: str,
+              source: str, label: str) -> None:
+        """驱动器向 pack 追加输入（评审意见回传 / 重试反馈 / 阶段失败提示…）。
+
+        禁止绕过本方法直改 anchor_md——那会让 manifest/pack_hash 不再反映真实 runner 输入
+        （验收②的可证伪性所在）。label 使追加版 manifest 不覆盖初始版（每次调用留痕）。
+        """
+        pack.anchor_md += f"\n\n## {title}\n{body_md}"
+        sources = self._pack_sources.setdefault(id(pack), [])
+        sources.append(source)
+        self._seal(pack, None, label=label)
+
+    def render_idea_audit(self, *, cycle_id: str, draft: Dict[str, Any]) -> ContextPack:
+        """判官映射包（§3.1.3 穷举清单）：由编译器出、自带溯源（draft 是 staging 中间产物）。"""
+        cycle = self.state.cycles[cycle_id]
+        qn = self.state.questions[cycle.question_id]
+        mapping = [{"candidate_id": c["candidate_id"], "audit_mapping": c["audit_mapping"]}
+                   for c in draft["candidates"]]
+        sd = self.policy["idea"]["sd_threshold"]
+        pack = ContextPack(
+            cycle_id=cycle_id, stage="idea", target_id=None,
+            anchor_md=(f"## 用户问题\n{qn.text}\n\n## 候选映射包（只此信息，盲评）\n```json\n"
+                       + json.dumps(mapping, ensure_ascii=False, indent=2) + "\n```\n\n"
+                       f"## 淘汰阈值\nStructural Depth < {sd} 即 fail"),
+            neighborhood_md="", retrieval_md="", refs=[],
+        )
+        self._seal(pack, [f"state:question:{qn.qid}", "staging:idea_set.draft.json",
+                          "policy:idea.sd_threshold"], label="audit")
+        return pack
+
+    def render_plan_review(self, *, cycle_id: str, plan: Dict[str, Any], round_no: int) -> ContextPack:
+        """可回答性评审包 = plan.json（staging）+ normalized selected idea（上游契约，
+        plan/SKILL 评审任务的输入定义）——评审须能核 needs 是否覆盖 idea 的 assumptions。"""
+        sources = ["staging:plan.json"]
+        idea_block = ""
+        idea = self.index.get(cycle_id, "idea", "idea_set.json")
+        if idea:
+            idea_block = ("\n\n## normalized selected idea（上游契约）\n```json\n"
+                          + json.dumps(self._normalize_selected(idea), ensure_ascii=False, indent=2)
+                          + "\n```")
+            sources.append(f"artifact:{cycle_id}:idea:idea_set.json")
+        pack = ContextPack(
+            cycle_id=cycle_id, stage="plan", target_id=None,
+            anchor_md=("## 待评审 plan.json（独立评审：只见产物与上游契约）\n```json\n"
+                       + json.dumps(plan, ensure_ascii=False, indent=2)
+                       + f"\n```{idea_block}\n\n本次为第 {round_no} 轮评审；round_no 照此填。"),
+            neighborhood_md="", retrieval_md="", refs=[],
+        )
+        self._seal(pack, sources, label=f"review{round_no}")
+        return pack
+
+    def write_stub_manifest(self, *, cycle_id: str, stage: Stage, target_id: str,
+                            sources: List[str], content_hash: str) -> None:
+        """无 runner 调用的阶段（M0 bundle 驱动器代跑）也留输入溯源：记假执行消费了什么。"""
+        d = self.cycles_root / f"cycles/{cycle_id}/context_pack"
+        d.mkdir(parents=True, exist_ok=True)
+        manifest = {"pack_hash": content_hash, "stage": stage, "target_id": target_id,
+                    "sources": sorted(set(sources)), "note": "M0 驱动器代跑（无 runner 调用）"}
+        (d / f"{stage}.{target_id}.manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _seal(self, pack: ContextPack, sources: Optional[List[str]], label: str = "") -> None:
+        if sources is not None:
+            self._pack_sources[id(pack)] = list(sources)
         pack.pack_hash = hashlib.sha256(
             (pack.anchor_md + pack.neighborhood_md + pack.retrieval_md).encode("utf-8")
         ).hexdigest()
-        self._write_manifest(cycle_id, stage, target_id, pack, sources)
-        return pack
+        self._write_manifest(pack.cycle_id, pack.stage, pack.target_id, pack,
+                             self._pack_sources.get(id(pack), []), label=label)
 
     # -- 分区渲染 -----------------------------------------------------------------
     def _anchor(self, cycle_id: str, stage: Stage, target_id: Optional[str],
@@ -92,10 +163,11 @@ class StubCompiler:
             parts.append(f"## 目标全文（当前版 v{self.state.goal['ver']}）\n" + self.goal_body_md)
             sources.append("input:goal_brief.md")
             parts.append(self._bundle_results(cycle_id, sources))
-            parts.append(self._open_set(sources))
+            parts.append(self._open_set(cycle, sources))
             parts.append("## 采集打分参数\n```json\n"
                          + json.dumps({"acquisition": self.policy["acquisition"],
                                        "B_t": self._budget(),
+                                       "decompose_threshold": self.policy["flow"]["decompose_threshold"],
                                        "tau": self.policy["flow"]["tau"]}, ensure_ascii=False) + "\n```")
             sources.append("policy:acquisition")
         return "\n\n".join(p for p in parts if p)
@@ -154,12 +226,17 @@ class StubCompiler:
             sources.append(f"artifact:{cycle_id}:plan:plan.json#reuse_evidence")
         return "## 本轮 bundle 结果（含运行观测摘要；观测只作解释、不作证据）\n" + ("\n".join(rows) or "（本轮无执行目标）") + reuse
 
-    def _open_set(self, sources: List[str]) -> str:
+    def _open_set(self, cycle, sources: List[str]) -> str:
         rows = [f"- {q['question_id']}（{q['status']}，visit={q['visit_count']}，"
                 f"score={q['score']}，est_cost={q['est_cost']}）: {q['text']}"
                 for q in self.state.list_schedulable_questions()]
+        # 本轮 active Qn 也列入（reasoning 轮尾它即将被关闭或置 inconclusive、重新可选——
+        # 与 reasoning skill「可选集含本轮 Qn」一致，防单问题场景下工人"无题可选"误终止）
+        qn = cycle.question_id and self.state.questions.get(cycle.question_id)
+        if qn and qn.status == "active":
+            rows.append(f"- {qn.qid}（active·本轮 Qn，收尾后可重选，visit={qn.visit_count}）: {qn.text}")
         sources.append("state:schedulable_questions")
-        return "## 可调度问题集（open/inconclusive 且无 pending dep）\n" + ("\n".join(rows) or "（空）")
+        return "## 可调度问题集（open/inconclusive 且无 pending dep；含本轮 Qn）\n" + ("\n".join(rows) or "（空）")
 
     # -- 工具 ----------------------------------------------------------------------
     @staticmethod
@@ -191,10 +268,10 @@ class StubCompiler:
         return min(b["B0"] * (2 ** (n // b["doubling_period_m"])), b["B_max"])
 
     def _write_manifest(self, cycle_id: str, stage: Stage, target_id: Optional[str],
-                        pack: ContextPack, sources: List[str]) -> None:
+                        pack: ContextPack, sources: List[str], label: str = "") -> None:
         d = self.cycles_root / f"cycles/{cycle_id}/context_pack"
         d.mkdir(parents=True, exist_ok=True)
-        name = f"{stage}{'.' + target_id if target_id else ''}"
+        name = f"{stage}{'.' + target_id if target_id else ''}{'.' + label if label else ''}"
         manifest = {"pack_hash": pack.pack_hash, "stage": stage, "target_id": target_id,
                     "sources": sorted(set(sources))}
         (d / f"{name}.manifest.json").write_text(
