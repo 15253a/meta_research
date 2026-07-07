@@ -1,0 +1,16 @@
+{
+  "summary_md": "系统期望在 DEAP 数据集上补充跨数据集对照，但该数据集需签署 EULA 后人工下载，系统无法自行获取；请提供预处理前的原始数据包。",
+  "items": [
+    {
+      "kind": "dataset",
+      "desc": "DEAP 情绪 EEG 数据集（data_preprocessed_python 版本）",
+      "expected_files": ["data_preprocessed_python.zip"],
+      "attempted_paths": [
+        "官方下载页（需 EULA 签署与人工审批，系统无凭据）",
+        "input/corpus/ 检索（未包含该数据集）"
+      ],
+      "failure_reason": "需要人工签署 EULA 并经维护方审批，系统无法自动完成",
+      "dest_hint": "input/corpus/deap/"
+    }
+  ]
+}

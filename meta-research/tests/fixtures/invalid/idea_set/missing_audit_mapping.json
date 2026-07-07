@@ -1,0 +1,31 @@
+{
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "generation_path": "bypass",
+      "core_claim": "缺 audit_mapping 的候选（所有候选必有 audit_mapping，§3.2.4）",
+      "mechanism": "无",
+      "assumptions": ["无"],
+      "min_falsifiable_experiment": "无",
+      "novelty_type": "表征结构",
+      "novelty_status": "联网粗查已启用·文献级待人工验证"
+    }
+  ],
+  "audit_scores": [
+    {
+      "candidate_id": "c1",
+      "scores": {
+        "structural_depth": 5,
+        "domain_distance": 5,
+        "applicability": 5,
+        "novelty": 5,
+        "unexpectedness": 5,
+        "non_obviousness": 5
+      },
+      "decision": "fail",
+      "rationale": "占位"
+    }
+  ],
+  "selected_id": null,
+  "novelty_refs": []
+}

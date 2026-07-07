@@ -7,3 +7,8 @@
 .DS_Store
 *.swp
 *~
+
+# Python 运行痕迹
+__pycache__/
+.pytest_cache/
+*.pyc

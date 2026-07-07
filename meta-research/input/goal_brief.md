@@ -1,0 +1,34 @@
+---
+predicate_json: {
+  "kind": "metric_comparison",
+  "protocol": "toy-gauss-cls",
+  "protocol_ver": 1,
+  "metric_id": "accuracy",
+  "metric_ver": 1,
+  "scope": "aggregate",
+  "success": { "op": ">=", "value": 0.9 },
+  "note": "成功谓词草案（§4.6.7）：根问题以满足此谓词的 metric_result 证据关闭；随 goal_amend 版本演化"
+}
+---
+
+# 研究目标书（toy · M0 验收固定输入）
+
+> 本文件是启动输入①（《第一部分》§4.6.7）：YAML frontmatter 含合法 `predicate_json` 成功谓词草案 + 中文正文。
+> M0 用途：作为固定 toy bundle 的研究目标驱动 3–5 轮元循环（假执行、标 fake）；真研究目标在 M6 换入。
+
+## 研究目标
+
+在合成「二维双高斯混合」二分类数据上，比较两个简单基线家族——**逻辑回归**与**单隐层 MLP**——
+在受限训练预算下的留出集分类准确率，回答：**哪个家族能以 aggregate accuracy ≥ 0.90 稳定达标，
+且两家族差距是否 ≥ 0.02**。给出可复现、可回溯到具体测量的结论。
+
+## 研究说明
+
+- **背景**：这是系统联调用的玩具目标——问题空间刻意小（两个基线家族 × 少量训练设置 ×
+  一个评估协议），使 3–5 轮内可走完「出题 → 建基线 → 变体对照 → 收口」的完整链路。
+- **注意事项**：
+  - 评估协议一旦锁定（数据生成种子、划分、指标口径），改场景必须升版（I1）；
+  - 结论只能回溯到 evaluation 的 `metric_result`（I3）；M0 阶段执行为假（`source=fake`），
+    结论仅用于流程契约验收、不具研究效力。
+- **资源与数据说明**：数据为运行时合成（无外部数据集依赖）；计算资源声明见
+  `policies/policy.yaml` 的 `resources` 节。

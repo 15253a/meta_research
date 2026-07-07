@@ -1,0 +1,41 @@
+{
+  "target_key": "t3",
+  "target_kind": "eval",
+  "status": "complete",
+  "evaluation": {
+    "eval_key": "codex-obs-bad",
+    "protocol_name": "toy-gauss-cls",
+    "protocol_ver": 1,
+    "source": "fake",
+    "status": "success"
+  },
+  "attempt": {
+    "attempt_no": 1,
+    "purpose": "standalone_eval",
+    "status": "success"
+  },
+  "metric_results": [
+    {
+      "metric_result_id": "mr:t3#accuracy@1:aggregate",
+      "metric_id": "accuracy",
+      "metric_ver": 1,
+      "value": 0.5,
+      "scope": "aggregate"
+    }
+  ],
+  "execution_logs": [
+    {
+      "log_kind": "eval",
+      "ref": "questions/q1/cycles/c2/build/t3/eval.fake.log",
+      "content_hash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "synthetic": true
+    }
+  ],
+  "execution_observation": {
+    "source": "codex",
+    "synthetic": true,
+    "nan_seen": true,
+    "digest_ref": "questions/q1/cycles/c2/build/t3/digest.md",
+    "digest_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+  }
+}

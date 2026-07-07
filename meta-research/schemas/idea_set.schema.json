@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/idea_set.schema.json",
+  "title": "idea_set",
+  "description": "idea 阶段产物（第二部分 §6.11）。顶层权威 ABI = candidates / audit_scores / selected_id / novelty_refs 四字段；need_innovation / provenance 为 optional non-consuming。gate / plan 只依赖 common normalized 字段、不引用 wildidea_extra。selected_id=null 表示全部候选不合格（阶段失败，全部候选及结局仍入账防复造）。",
+  "type": "object",
+  "required": ["candidates", "audit_scores", "selected_id", "novelty_refs"],
+  "additionalProperties": false,
+  "properties": {
+    "need_innovation": {
+      "type": "boolean",
+      "description": "NEED 分支判断：true=需要发散（wildidea），false=旁路现成想法（§3.2.2）"
+    },
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/candidate" }
+    },
+    "audit_scores": {
+      "type": "array",
+      "minItems": 1,
+      "description": "统一独立判官（phase=audit）对全部候选的 6 维评分；自评筛选不在此列（§3.2.4）",
+      "items": { "$ref": "#/$defs/audit_score" }
+    },
+    "selected_id": {
+      "type": ["string", "null"],
+      "description": "选定候选的 candidate_id；全不合格 = null。多个过线先按审计分排序、seed 只作同分 tie-break（§3.2.4）"
+    },
+    "novelty_refs": {
+      "type": "array",
+      "description": "联网查重的内容寻址快照（§3.2.3(7)）；M0 无检索工具时可为空数组",
+      "items": { "$ref": "#/$defs/novelty_ref" }
+    },
+    "provenance": { "$ref": "#/$defs/provenance" }
+  },
+  "$defs": {
+    "candidate": {
+      "type": "object",
+      "required": [
+        "candidate_id", "generation_path", "audit_mapping", "core_claim",
+        "mechanism", "assumptions", "min_falsifiable_experiment",
+        "novelty_type", "novelty_status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "generation_path": { "enum": ["wildidea", "bypass"] },
+        "audit_mapping": {
+          "type": "object",
+          "description": "所有候选必有（含 bypass：源域 = 现成方案来源 / 目标域基线 / 近邻先例，§3.2.4）",
+          "required": ["source_domain", "target_domain", "object_mapping", "shared_relations"],
+          "additionalProperties": false,
+          "properties": {
+            "source_domain": { "type": "string", "minLength": 1 },
+            "target_domain": { "type": "string", "minLength": 1 },
+            "object_mapping": { "type": "string", "minLength": 1 },
+            "shared_relations": { "type": "string", "minLength": 1 }
+          }
+        },
+        "core_claim": { "type": "string", "minLength": 1 },
+        "mechanism": { "type": "string", "minLength": 1 },
+        "assumptions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "min_falsifiable_experiment": {
+          "type": "string",
+          "minLength": 1,
+          "description": "最小可证伪实验（带对照与失败判据）；对 plan 是输入素材、不具约束力（§3.2.5）"
+        },
+        "novelty_type": {
+          "enum": ["评估协议", "训练目标", "表征结构", "推理机制", "部署策略", "数据准入", "采样", "校准", "路由", "损失"],
+          "description": "novelty 类型封闭词表（§3.2.3(5)）"
+        },
+        "novelty_status": {
+          "const": "联网粗查已启用·文献级待人工验证",
+          "description": "新颖性诚实纪律固定文本（P4，§3.2.3(4)）：绝不写「查重通过」"
+        },
+        "wildidea_extra": { "$ref": "#/$defs/wildidea_extra" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "generation_path": { "const": "wildidea" } } },
+          "then": { "required": ["wildidea_extra"] },
+          "else": { "not": { "required": ["wildidea_extra"] } }
+        }
+      ]
+    },
+    "wildidea_extra": {
+      "type": "object",
+      "description": "wildidea 路径专属字段（bypass 为空；gate/plan 不消费，§3.2.4）",
+      "required": ["source_isof", "source_prototype", "deanchor_level", "degenerate_form", "nearest_neighbor_diff", "strongest_rebuttal"],
+      "additionalProperties": false,
+      "properties": {
+        "source_isof": { "type": "string", "minLength": 1, "description": "源域 输入/状态/输出/反馈 机制原文摘录" },
+        "source_prototype": { "type": "string", "minLength": 1, "description": "源域原型编号与描述（P01…，冻结时不含用户领域禁词）" },
+        "deanchor_level": { "enum": ["不成立", "部分成立", "成立"], "description": "去锚点成立等级（§3.2.3(2)）" },
+        "degenerate_form": { "type": "string", "minLength": 1, "description": "去锚点退化物" },
+        "nearest_neighbor_diff": { "type": "string", "minLength": 1, "description": "最近邻同异 + 被吃掉风险" },
+        "strongest_rebuttal": { "type": "string", "minLength": 1, "description": "最强反驳（审稿人视角）" }
+      }
+    },
+    "audit_score": {
+      "type": "object",
+      "required": ["candidate_id", "scores", "decision", "rationale"],
+      "additionalProperties": false,
+      "properties": {
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "scores": {
+          "type": "object",
+          "description": "6 维 0–10（§3.1.3）；SD = structural_depth，低于阈值（policy idea.sd_threshold，默认 6）即淘汰",
+          "required": ["structural_depth", "domain_distance", "applicability", "novelty", "unexpectedness", "non_obviousness"],
+          "additionalProperties": false,
+          "properties": {
+            "structural_depth": { "type": "number", "minimum": 0, "maximum": 10 },
+            "domain_distance": { "type": "number", "minimum": 0, "maximum": 10 },
+            "applicability": { "type": "number", "minimum": 0, "maximum": 10 },
+            "novelty": { "type": "number", "minimum": 0, "maximum": 10 },
+            "unexpectedness": { "type": "number", "minimum": 0, "maximum": 10 },
+            "non_obviousness": { "type": "number", "minimum": 0, "maximum": 10 }
+          }
+        },
+        "decision": { "enum": ["pass", "fail"] },
+        "rationale": { "type": "string", "minLength": 1 },
+        "ref": { "type": "string" }
+      }
+    },
+    "novelty_ref": {
+      "type": "object",
+      "description": "内容寻址快照（非仅外部 ref，护 P6 可回放）",
+      "required": ["query", "provider", "result_content_hashes"],
+      "additionalProperties": false,
+      "properties": {
+        "query": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "result_content_hashes": { "type": "array", "items": { "type": "string" } },
+        "ranking": { "type": "array", "items": { "type": "string" } },
+        "policy_hash": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "description": "vendored 引擎隐藏上下文入账（§3.2.3(7) 全清单；M0 adapter 骨架期填已知项）",
+      "additionalProperties": false,
+      "properties": {
+        "engine_version": { "type": "string" },
+        "adapter_version": { "type": "string" },
+        "prompt_hash": { "type": "string" },
+        "judge_prompt_hash": { "type": "string" },
+        "anchor_pack_hash": { "type": "string" },
+        "input_card_hash": { "type": "string" },
+        "policy_yaml_hash": { "type": "string" },
+        "dependency_lock_hash": { "type": "string" },
+        "model": { "type": "string" },
+        "sampling": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "seed": { "type": ["integer", "null"] },
+            "temperature": { "type": ["number", "null"] }
+          }
+        },
+        "retrieval_provider_version": { "type": "string" }
+      }
+    }
+  }
+}

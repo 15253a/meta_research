@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/plan.schema.json",
+  "title": "plan",
+  "description": "plan 阶段产物（第二部分 §6.11）。评估协议在此锁死、bundle 只照办（I2 源头）；targets=[] ⇔ reuse_only，仅 eval ⇔ eval_only；import 三闸命中走 import_defer 可选区（deferred 决定，不产 target、不进 bundle，§3.3.1/§3.6.3）。父问题聚合轮不产生验证需求（§3.3.1）：needs 可为 []、以 child_answer 作 reuse_evidence；targets 非空时 protocol/metric_defs/readout_rules 必填（见 allOf）。",
+  "type": "object",
+  "required": ["needs", "reuse_evidence", "targets", "build_target_required_metric"],
+  "additionalProperties": false,
+  "properties": {
+    "needs": {
+      "type": "array",
+      "description": "verification needs：从 selected idea 的 assumptions / min_falsifiable_experiment 派生；聚合轮（child_answer 关闭父问题）天然为 []",
+      "items": { "$ref": "#/$defs/need" }
+    },
+    "reuse_evidence": {
+      "type": "array",
+      "description": "复用判定命中（情形一：零执行引用历史 evaluation）或父问题聚合轮的 child_answer 证据（§3.3.1）",
+      "items": { "$ref": "#/$defs/reuse_evidence_item" }
+    },
+    "targets": {
+      "type": "array",
+      "description": "要执行的事（按依赖序 seq）；每项一个 target_kind ∈ {build,exec,eval}（import 永不在此，§3.3.1）",
+      "items": { "$ref": "#/$defs/target" }
+    },
+    "import_defer": { "$ref": "#/$defs/import_defer" },
+    "protocol": { "$ref": "#/$defs/protocol" },
+    "metric_defs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/metric_def" }
+    },
+    "readout_rules": {
+      "type": "array",
+      "description": "每指标判读规则（可回答性评审判据之一：每个指标有判读）",
+      "items": { "$ref": "#/$defs/readout_rule" }
+    },
+    "build_target_required_metric": {
+      "type": "array",
+      "description": "plan 声明的 required 指标集（I2 核覆盖依据；gate_finish_attempt / gate_register_* 逐项核 aggregate 覆盖）",
+      "items": { "$ref": "#/$defs/required_metric" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "targets": { "minItems": 1 } } },
+      "then": {
+        "required": ["protocol", "metric_defs", "readout_rules"],
+        "properties": {
+          "metric_defs": { "minItems": 1 },
+          "readout_rules": { "minItems": 1 }
+        }
+      }
+    },
+    {
+      "if": { "required": ["import_defer"] },
+      "then": {
+        "properties": { "targets": { "maxItems": 0 } }
+      }
+    }
+  ],
+  "$defs": {
+    "need": {
+      "type": "object",
+      "required": ["need_id", "statement_md"],
+      "additionalProperties": false,
+      "properties": {
+        "need_id": { "type": "string", "minLength": 1 },
+        "statement_md": { "type": "string", "minLength": 1 },
+        "source": { "enum": ["assumptions", "min_falsifiable_experiment", "other"] }
+      }
+    },
+    "reuse_evidence_item": {
+      "type": "object",
+      "required": ["kind", "ref_md"],
+      "additionalProperties": false,
+      "properties": {
+        "need_id": { "type": "string", "minLength": 1, "description": "关联的 verification need；聚合轮（needs=[] 的 child_answer 证据）可省" },
+        "kind": { "enum": ["evaluation", "child_answer"] },
+        "ref_md": { "type": "string", "minLength": 1, "description": "指向历史 evaluation / 子问题 answer 的可读引用；M1+ 附结构化 id" },
+        "evaluation_id": { "type": "string" },
+        "metric_result_id": { "type": "string" },
+        "answer_id": { "type": "string" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["target_key", "target_kind", "seq", "critical", "budget_estimate", "spec_md"],
+      "additionalProperties": false,
+      "properties": {
+        "target_key": { "type": "string", "minLength": 1, "description": "plan 内稳定键；bundle 产物与 required_metric 以此关联" },
+        "target_kind": { "enum": ["build", "exec", "eval"] },
+        "seq": { "type": "integer", "minimum": 1, "description": "依赖序（bundle 严格串行按此执行）" },
+        "critical": { "type": "boolean", "description": "关键目标失败 → 早退；非关键 → skipped（§3.4 RFAIL）" },
+        "budget_estimate": { "type": "number", "minimum": 0 },
+        "spec_md": { "type": "string", "minLength": 1, "description": "本目标做什么（构建/训练/评估内容，bundle 只照办）" },
+        "need_ids": { "type": "array", "items": { "type": "string" } },
+        "claim": {
+          "type": "object",
+          "description": "占坑意图（I5，gate_claim_baseline/variant 的输入）：build 必带 canonical_key+slug；exec 必带 baseline_ref+variant_key+config_json（必填性由 target 级 allOf 按 target_kind 强制）",
+          "additionalProperties": false,
+          "properties": {
+            "canonical_key": { "type": "string", "minLength": 1 },
+            "slug": { "type": "string", "minLength": 1 },
+            "baseline_ref": { "type": "string", "minLength": 1 },
+            "variant_key": { "type": "string", "minLength": 1 },
+            "config_json": { "type": "object" }
+          }
+        },
+        "eval_action": { "enum": ["create_evaluation", "append_attempt"] },
+        "attempt_purpose": { "enum": ["factory", "retry", "metric_append", "repro_eval", "standalone_eval", "protocol_upgrade"] },
+        "evaluation_id": { "type": "string", "description": "append_attempt 时定位既有 evaluation（M0 为产物级 id，M1 起 DB id；§6.11 字段名）" },
+        "eval_key": { "type": "string", "minLength": 1, "description": "create_evaluation 时新格子的 eval_key（DDL build_target CHECK 要求）" },
+        "evaluation_source": { "enum": ["factory", "protocol_upgrade", "standalone_eval"], "description": "create_evaluation 时声明来源（DDL build_target CHECK 要求；M0 假执行由驱动器改标 fake 落 bundle 产物）" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "target_kind": { "const": "build" } } },
+          "then": {
+            "required": ["claim"],
+            "properties": { "claim": { "required": ["canonical_key", "slug"] } }
+          }
+        },
+        {
+          "if": { "properties": { "target_kind": { "const": "exec" } } },
+          "then": {
+            "required": ["claim"],
+            "properties": { "claim": { "required": ["baseline_ref", "variant_key", "config_json"] } }
+          }
+        },
+        {
+          "if": { "properties": { "target_kind": { "const": "eval" } } },
+          "then": { "required": ["eval_action", "attempt_purpose"] }
+        },
+        {
+          "if": {
+            "properties": { "eval_action": { "const": "append_attempt" } },
+            "required": ["eval_action"]
+          },
+          "then": { "required": ["evaluation_id"] }
+        },
+        {
+          "if": {
+            "properties": { "eval_action": { "const": "create_evaluation" } },
+            "required": ["eval_action"]
+          },
+          "then": { "required": ["eval_key", "evaluation_source"] }
+        }
+      ]
+    },
+    "import_defer": {
+      "type": "object",
+      "description": "三闸命中的 deferred 决定（§6.11）：M1–M3 phase_commit 业务三写入（external_import + 占位 baseline(planned) + question_dep(pending)）的输入，故选择锚与占位 identity 必填；出现本区 ⇒ targets 必为 []（deferred 轮派生 dependency_wait、不进 bundle，路由矩阵无 attack+import_defer 组合）。M0 不产此区（M0 plan skill 指示引外部参照的 need 记为自建或搁置）",
+      "required": ["reason_md", "candidate_set_hash", "selection_key", "policy_hash", "placeholder_baseline_identity"],
+      "additionalProperties": false,
+      "properties": {
+        "reason_md": { "type": "string", "minLength": 1 },
+        "candidate_set_hash": { "type": "string", "minLength": 1 },
+        "selection_key": { "type": "string", "minLength": 1 },
+        "policy_hash": { "type": "string", "minLength": 1 },
+        "placeholder_baseline_identity": {
+          "type": "object",
+          "description": "占位 baseline identity 草案（commit 前由 gate 规范化为最终 canonical_key/slug、写入即冻结——trg_baseline_identity_frozen）",
+          "required": ["canonical_key_draft", "slug_draft", "identity_md"],
+          "additionalProperties": false,
+          "properties": {
+            "canonical_key_draft": { "type": "string", "minLength": 1 },
+            "slug_draft": { "type": "string", "minLength": 1 },
+            "identity_md": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "required": ["name", "version", "scope_spec"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "integer", "minimum": 1 },
+        "scope_spec": {
+          "type": "object",
+          "description": "评估场景（评估数据 / 分割 / checkpoint 选择 / 流程）：不可变，改即升 version（I1）",
+          "minProperties": 1
+        },
+        "smoke_md": { "type": "string", "description": "smoke 定义（可回答性评审判据之一：每个构建/训练计划有 smoke+预算）" }
+      }
+    },
+    "metric_def": {
+      "type": "object",
+      "required": ["metric_id", "version", "name", "direction", "compute_spec_md"],
+      "additionalProperties": false,
+      "properties": {
+        "metric_id": { "type": "string", "minLength": 1 },
+        "version": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "direction": { "enum": ["higher", "lower"] },
+        "unit": { "type": "string" },
+        "compute_spec_md": { "type": "string", "minLength": 1 }
+      }
+    },
+    "readout_rule": {
+      "type": "object",
+      "required": ["metric_id", "metric_ver", "rule_md"],
+      "additionalProperties": false,
+      "properties": {
+        "metric_id": { "type": "string", "minLength": 1 },
+        "metric_ver": { "type": "integer", "minimum": 1 },
+        "rule_md": { "type": "string", "minLength": 1 }
+      }
+    },
+    "required_metric": {
+      "type": "object",
+      "required": ["target_key", "metric_id", "metric_ver"],
+      "additionalProperties": false,
+      "properties": {
+        "target_key": { "type": "string", "minLength": 1 },
+        "metric_id": { "type": "string", "minLength": 1 },
+        "metric_ver": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

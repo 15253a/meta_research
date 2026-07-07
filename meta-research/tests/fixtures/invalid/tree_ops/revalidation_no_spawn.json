@@ -1,0 +1,10 @@
+{
+  "ops": [
+    {
+      "op": "mark_answer_applicability",
+      "answer_id": "a-q2",
+      "status": "needs_revalidation",
+      "rationale_md": "置 needs_revalidation 却没有 spawned_question_ref，必须被拒（§4.6.4 ②）"
+    }
+  ]
+}

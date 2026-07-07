@@ -1,0 +1,7 @@
+{
+  "next_question_id": null,
+  "next_intent": "attack",
+  "scores": [
+    { "question_id": "q1", "score": 0.5, "est_cost": 1.0 }
+  ]
+}

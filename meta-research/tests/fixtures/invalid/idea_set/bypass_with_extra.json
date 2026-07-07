@@ -1,0 +1,45 @@
+{
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "generation_path": "bypass",
+      "audit_mapping": {
+        "source_domain": "现成方案",
+        "target_domain": "toy 任务",
+        "object_mapping": "直接套用",
+        "shared_relations": "同任务结构"
+      },
+      "core_claim": "bypass 路径不得携带 wildidea_extra（oneOf：wildidea 填 / bypass 空，§6.11）",
+      "mechanism": "无",
+      "assumptions": ["无"],
+      "min_falsifiable_experiment": "无",
+      "novelty_type": "表征结构",
+      "novelty_status": "联网粗查已启用·文献级待人工验证",
+      "wildidea_extra": {
+        "source_isof": "不该出现",
+        "source_prototype": "P00",
+        "deanchor_level": "成立",
+        "degenerate_form": "无",
+        "nearest_neighbor_diff": "无",
+        "strongest_rebuttal": "无"
+      }
+    }
+  ],
+  "audit_scores": [
+    {
+      "candidate_id": "c1",
+      "scores": {
+        "structural_depth": 7,
+        "domain_distance": 3,
+        "applicability": 8,
+        "novelty": 2,
+        "unexpectedness": 2,
+        "non_obviousness": 2
+      },
+      "decision": "pass",
+      "rationale": "占位"
+    }
+  ],
+  "selected_id": "c1",
+  "novelty_refs": []
+}

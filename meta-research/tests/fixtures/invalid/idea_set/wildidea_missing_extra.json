@@ -1,0 +1,37 @@
+{
+  "candidates": [
+    {
+      "candidate_id": "w1",
+      "generation_path": "wildidea",
+      "audit_mapping": {
+        "source_domain": "蚁群信息素",
+        "target_domain": "toy 分类",
+        "object_mapping": "浓度→样本权重",
+        "shared_relations": "正反馈+衰减"
+      },
+      "core_claim": "wildidea 路径缺 wildidea_extra 必须被拒（oneOf：wildidea 填，§6.11）",
+      "mechanism": "占位",
+      "assumptions": ["占位"],
+      "min_falsifiable_experiment": "占位",
+      "novelty_type": "训练目标",
+      "novelty_status": "联网粗查已启用·文献级待人工验证"
+    }
+  ],
+  "audit_scores": [
+    {
+      "candidate_id": "w1",
+      "scores": {
+        "structural_depth": 6,
+        "domain_distance": 7,
+        "applicability": 6,
+        "novelty": 5,
+        "unexpectedness": 5,
+        "non_obviousness": 5
+      },
+      "decision": "pass",
+      "rationale": "占位"
+    }
+  ],
+  "selected_id": "w1",
+  "novelty_refs": []
+}

@@ -1,0 +1,12 @@
+{
+  "summary_md": "缺 attempted_paths 的请求单必须被 schema 拒（防「能自己获取还请求」，§4.6.8）",
+  "items": [
+    {
+      "kind": "paper",
+      "desc": "某论文全文",
+      "expected_files": ["paper.pdf"],
+      "failure_reason": "付费墙",
+      "dest_hint": "input/user_provided/"
+    }
+  ]
+}

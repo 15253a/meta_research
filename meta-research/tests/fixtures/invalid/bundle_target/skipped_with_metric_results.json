@@ -1,0 +1,14 @@
+{
+  "target_key": "t5",
+  "target_kind": "eval",
+  "status": "skipped",
+  "metric_results": [
+    {
+      "metric_result_id": "mr:t5#accuracy@1:aggregate",
+      "metric_id": "accuracy",
+      "metric_ver": 1,
+      "value": 0.5,
+      "scope": "aggregate"
+    }
+  ]
+}

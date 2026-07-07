@@ -1,0 +1,39 @@
+{
+  "needs": [
+    { "need_id": "n1", "statement_md": "import_defer 与非空 targets 共存必须被拒（deferred 轮派生 dependency_wait、不进 bundle，§3.6.3）" }
+  ],
+  "reuse_evidence": [],
+  "targets": [
+    {
+      "target_key": "t1",
+      "target_kind": "exec",
+      "seq": 1,
+      "critical": true,
+      "budget_estimate": 1.0,
+      "spec_md": "不该存在的目标"
+    }
+  ],
+  "import_defer": {
+    "reason_md": "需引入外部 SOTA 参照家族",
+    "candidate_set_hash": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+    "selection_key": "stars_desc",
+    "policy_hash": "sha256:3434343434343434343434343434343434343434343434343434343434343434",
+    "placeholder_baseline_identity": {
+      "canonical_key_draft": "ext-sota-attn",
+      "slug_draft": "ext-sota-attn",
+      "identity_md": "占位 identity 草案"
+    }
+  },
+  "protocol": {
+    "name": "toy-gauss-cls",
+    "version": 1,
+    "scope_spec": { "data": "占位" }
+  },
+  "metric_defs": [
+    { "metric_id": "accuracy", "version": 1, "name": "准确率", "direction": "higher", "compute_spec_md": "占位" }
+  ],
+  "readout_rules": [
+    { "metric_id": "accuracy", "metric_ver": 1, "rule_md": "占位" }
+  ],
+  "build_target_required_metric": []
+}

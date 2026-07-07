@@ -1,0 +1,12 @@
+{
+  "question_id": "q1",
+  "verdict": "answered",
+  "answer_md": "literature 证据混带 metric_result_id 必须被拒（evidence 多态互斥，对齐 DDL CHECK）",
+  "evidence": [
+    {
+      "kind": "literature",
+      "citation_md": "某论文 2024",
+      "metric_result_id": "mr:t1#accuracy@1:aggregate"
+    }
+  ]
+}

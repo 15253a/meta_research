@@ -1,0 +1,10 @@
+{
+  "ops": [
+    {
+      "op": "spawn_question",
+      "kind": "goal_retarget",
+      "parent_question_id": "q1",
+      "text": "goal_retarget 必须建新 root（parent=null），带 parent 必须被拒（§4.2.4 挂点规则）"
+    }
+  ]
+}

@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/policy.schema.json",
+  "title": "policy",
+  "description": "policies/policy.yaml 的机械校验 schema（启动前提 §7.5 #4）。旋钮注册表唯一权威 = 第一部分附录 C（全量、每旋钮带默认值）；本 schema 与之逐节对齐、封闭（additionalProperties=false）。observation 节（parser 阈值）为既有缺口，随 M4 真 parser 落地补全（OPEN #5）。",
+  "type": "object",
+  "required": ["acquisition", "budget", "flow", "retrieval", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "resources", "interaction_request"],
+  "additionalProperties": false,
+  "properties": {
+    "acquisition": {
+      "type": "object",
+      "required": ["w1", "w2", "w3", "c"],
+      "additionalProperties": false,
+      "properties": {
+        "w1": { "type": "number", "minimum": 0, "description": "期望增益权重" },
+        "w2": { "type": "number", "minimum": 0, "description": "信息量权重" },
+        "w3": { "type": "number", "minimum": 0, "description": "成本惩罚权重" },
+        "c": { "type": "number", "minimum": 0, "description": "UCB 探索系数" }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "required": ["B0", "doubling_period_m", "B_max"],
+      "additionalProperties": false,
+      "properties": {
+        "B0": { "type": "number", "exclusiveMinimum": 0 },
+        "doubling_period_m": { "type": "integer", "minimum": 1 },
+        "B_max": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "flow": {
+      "type": "object",
+      "required": ["decompose_threshold", "tau", "audit_cadence_K", "retry", "watchdog"],
+      "additionalProperties": false,
+      "properties": {
+        "decompose_threshold": { "type": "number", "exclusiveMinimum": 0 },
+        "tau": {
+          "type": "object",
+          "required": ["score_floor", "consecutive_rounds"],
+          "additionalProperties": false,
+          "properties": {
+            "score_floor": { "type": "number" },
+            "consecutive_rounds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "audit_cadence_K": { "type": "integer", "minimum": 1 },
+        "retry": {
+          "type": "object",
+          "required": ["artifact_parse", "plan_review", "bundle_code_review", "bundle_result_review"],
+          "additionalProperties": false,
+          "properties": {
+            "artifact_parse": { "type": "integer", "minimum": 0 },
+            "plan_review": { "type": "integer", "minimum": 1 },
+            "bundle_code_review": { "type": "integer", "minimum": 1 },
+            "bundle_result_review": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "watchdog": {
+          "type": "object",
+          "description": "单次执行时限唯一定义点（资源硬件事实在 resources 节，不在此）",
+          "required": ["probe_h", "full_h"],
+          "additionalProperties": false,
+          "properties": {
+            "probe_h": { "type": "number", "exclusiveMinimum": 0 },
+            "full_h": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        }
+      }
+    },
+    "retrieval": {
+      "type": "object",
+      "required": ["recipe", "budget_by_question_scale", "gate2_stuck_threshold"],
+      "additionalProperties": false,
+      "properties": {
+        "recipe": { "type": "string", "minLength": 1 },
+        "budget_by_question_scale": {
+          "type": "object",
+          "required": ["small", "medium", "large"],
+          "additionalProperties": false,
+          "properties": {
+            "small": { "type": "integer", "minimum": 0 },
+            "medium": { "type": "integer", "minimum": 0 },
+            "large": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "gate2_stuck_threshold": {
+          "type": "object",
+          "required": ["visit_count", "consecutive_inconclusive"],
+          "additionalProperties": false,
+          "properties": {
+            "visit_count": { "type": "integer", "minimum": 1 },
+            "consecutive_inconclusive": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "session": {
+      "type": "object",
+      "required": ["dual_mode"],
+      "additionalProperties": false,
+      "properties": {
+        "dual_mode": { "enum": ["A", "B"], "description": "A=一 turn 一阶段（M6 实测后定默认）" }
+      }
+    },
+    "tree_guard": {
+      "type": "object",
+      "required": ["max_decompose_depth", "max_children_per_node", "max_open_questions"],
+      "additionalProperties": false,
+      "properties": {
+        "max_decompose_depth": { "type": "integer", "minimum": 1 },
+        "max_children_per_node": { "type": "integer", "minimum": 1 },
+        "max_open_questions": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "question_guard": {
+      "type": "object",
+      "required": ["max_inconclusive_per_question"],
+      "additionalProperties": false,
+      "properties": {
+        "max_inconclusive_per_question": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "answer_review": {
+      "type": "object",
+      "required": ["max_reviews_per_cycle", "spawn_counts_toward_max_open"],
+      "additionalProperties": false,
+      "properties": {
+        "max_reviews_per_cycle": { "type": "integer", "minimum": 1 },
+        "spawn_counts_toward_max_open": { "type": "boolean" }
+      }
+    },
+    "goal_amend": {
+      "type": "object",
+      "required": ["max_closed_revalidate_per_cycle", "max_spawn_from_goal_amend"],
+      "additionalProperties": false,
+      "properties": {
+        "max_closed_revalidate_per_cycle": { "type": "integer", "minimum": 1 },
+        "max_spawn_from_goal_amend": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "cards": {
+      "type": "object",
+      "required": ["subtree_card_depth", "tag_policy"],
+      "additionalProperties": false,
+      "properties": {
+        "subtree_card_depth": { "type": "integer", "minimum": 1 },
+        "tag_policy": { "type": "string", "minLength": 1 }
+      }
+    },
+    "idea": {
+      "type": "object",
+      "required": ["sd_threshold", "candidate_top_k", "dedup_budget", "forbid_proto_term_source", "cross_phase"],
+      "additionalProperties": false,
+      "properties": {
+        "sd_threshold": { "type": "number", "minimum": 0, "maximum": 10 },
+        "candidate_top_k": { "type": "integer", "minimum": 1 },
+        "dedup_budget": { "type": "integer", "minimum": 0 },
+        "forbid_proto_term_source": { "type": "string", "minLength": 1 },
+        "cross_phase": {
+          "type": "object",
+          "required": ["decompose_assist", "spawn_assist", "budget"],
+          "additionalProperties": false,
+          "properties": {
+            "decompose_assist": { "type": "boolean" },
+            "spawn_assist": { "type": "boolean" },
+            "budget": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "interaction": {
+      "type": "object",
+      "required": ["classify_conservativeness", "ack_sla_s", "query_sla_s", "responder_fallback", "mediator_rebuild_last_n", "notify_matrix"],
+      "additionalProperties": false,
+      "properties": {
+        "classify_conservativeness": { "enum": ["low", "medium", "high"] },
+        "ack_sla_s": { "type": "number", "exclusiveMinimum": 0 },
+        "query_sla_s": { "type": "number", "exclusiveMinimum": 0 },
+        "responder_fallback": {
+          "type": "object",
+          "required": ["grounding_fail_to_template"],
+          "additionalProperties": false,
+          "properties": {
+            "grounding_fail_to_template": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "mediator_rebuild_last_n": { "type": "integer", "minimum": 1 },
+        "notify_matrix": { "type": "string", "minLength": 1 }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "description": "启动输入③：只放硬件事实（时限唯一归 flow.watchdog，§4.6.7）",
+      "required": ["gpus", "gpu_mem_gb", "disk_quota_gb"],
+      "additionalProperties": false,
+      "properties": {
+        "gpus": { "type": "integer", "minimum": 0 },
+        "gpu_mem_gb": { "type": "number", "minimum": 0 },
+        "disk_quota_gb": { "type": "number", "minimum": 0 }
+      }
+    },
+    "interaction_request": {
+      "type": "object",
+      "required": ["enabled", "max_items_per_request", "max_requests_per_goal", "remind_interval_h"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_items_per_request": { "type": "integer", "minimum": 1 },
+        "max_requests_per_goal": { "type": "integer", "minimum": 1 },
+        "remind_interval_h": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}

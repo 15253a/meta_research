@@ -1,0 +1,36 @@
+{
+  "target_key": "t2",
+  "target_kind": "eval",
+  "status": "complete",
+  "evaluation": {
+    "eval_key": "no-aggregate",
+    "protocol_name": "toy-gauss-cls",
+    "protocol_ver": 1,
+    "source": "fake",
+    "status": "success"
+  },
+  "attempt": {
+    "attempt_no": 1,
+    "purpose": "standalone_eval",
+    "status": "success"
+  },
+  "metric_results": [
+    {
+      "metric_result_id": "mr:bad#accuracy@1:fold0",
+      "metric_id": "accuracy",
+      "metric_ver": 1,
+      "value": 0.5,
+      "scope": "fold",
+      "ckpt_key": "fold0"
+    }
+  ],
+  "execution_logs": [
+    {
+      "log_kind": "eval",
+      "ref": "questions/q1/cycles/c2/build/bad/eval.fake.log",
+      "content_hash": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "synthetic": true
+    }
+  ],
+  "execution_observation": { "source": "fake", "synthetic": true }
+}
