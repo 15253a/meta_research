@@ -9,6 +9,8 @@
 - gate_sqlite.py — SqliteGate（M1a-Gate：authorizer 隔离 + gate_input_* 视图 + gate_close_question；M0 并存不替换）
 - statestore.py — InMemoryStateStore（七 op / 调度可见性 / 释放语义；M0）
 - statestore_sqlite.py — SQLiteStateStore（M1b：状态机落 SQLite，经 WriteDaemon；decompose 单事务原子）
+- importer.py   — DeferredImporter（M1c：外部 import M1–M3 降级——发现+登记+deferred 三写入，不物化=M4）
+- interaction.py — InteractionIngest（M1c：人机 durable 入站 + 模板 ACK + 文件请求单，不触发真 responder=M5）
 - compiler.py  — StubCompiler（确定性四区包 + manifest 溯源）+ StubCtx / StubRecall（M2 换真）
 - runner.py    — CodexRunner（真 codex exec，M0 起即真）
 - goalbrief.py — 启动输入①解析（§4.6.7 机械校验唯一实现）
