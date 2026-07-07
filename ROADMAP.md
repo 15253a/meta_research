@@ -15,7 +15,8 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步①（M0）已完成**（CP1.1 965d1a3 / CP1.2 9ee4c45 / CP1.3 7deb14a / CP1.4 45641cc）。步②（M1）待开工——开工前须向用户确认三事项（见步② OPEN 注记与 implement_note）。
+- 进行中的步 / 检查点：**步②（M1）进行中**——CP2.1 已完成（6d45b53，M1a 的 DB 层半）；下一步 CP2.2（Gate 换真）。步①（M0）已完成。
+  - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
 
@@ -34,8 +35,14 @@
 - 步级验证结果：**通过**（真 codex 端到端 `scripts/run_m0_acceptance.py --cycles 5` exit=0：①27 份产物逐项过 schema validator ②29 份 context_pack manifest 输入来源全在白名单 ③未建任何 DB 文件 ④8 个假执行 target 全标 `source=fake`/`synthetic=true` ⑤只验流程契约。证据全文见 build_log/0009。）
 
 ### 步②（M1）资产层落地（分层验收 M1a/M1b/M1c）
-- 验证方法（§7.1 M1 行）：M1a 附录 A DDL 建库（36 表+72 触发器+29 索引+1 视图，migration/checksum 锁定）+ 门禁 + 三级校验 → 不变量 I1–I6 + v2.3/v2.4 否定用例全过；M1b StateStore 落 SQLite + decompose 释放断言（kill -9 无半写）；M1c v2.3/v2.4 表只做约束 + 「M1–M3 隔离拒绝用例」。开工前先向用户确认 OPEN #1/#2。
-- 状态：未开始；检查点待步①完成后切
+- 验证方法（§7.1 M1 行）：M1a 附录 A DDL 建库（36 表+72 触发器+29 索引+1 视图，migration/checksum 锁定）+ 门禁 + 三级校验 → 不变量 I1–I6 + v2.3/v2.4 否定用例全过；M1b StateStore 落 SQLite + decompose 释放断言（kill -9 无半写）；M1c v2.3/v2.4 表只做约束 + 「M1–M3 隔离拒绝用例」。OPEN #1/#2 已在全自动模式下自主裁决（落 db/README.md）。
+- 状态：**进行中**
+- 检查点（模型切，边走边补）：
+  - [x] CP2.1 冻结 Appendix-A DDL 落库 + database.py 三重锁 + 全套 **DB 层**不变量否定用例（I1–I6/append-only/v2.3-2.4 表约束，91 例）— commit 6d45b53（build_log 0010）
+  - [ ] CP2.2 Gate 三级校验换真：写路径→真 DB + gate_input authorizer 隔离拒读（9 表）+ gate_close_question 业务门禁 + 应用层否定用例（M1a 的 Gate 半）
+  - [ ] CP2.3 StateStore → SQLite（cycle/question/route，共用 WriteDaemon）+ decompose 原子性（单事务，kill-9 无半写）（M1b）
+  - [ ] CP2.4 v2.3/v2.4 表隔离行为 + 「M1–M3 隔离拒绝用例」（M1c）
+  - > 注：Gate/StateStore 共用单写 WriteDaemon（§6.6）；M0 driver 端到端切真 loop 归 M3 Advancer（M1 交付真实组件 + 组件级验收，裁量待 CP2.2 精读后定）。切分可随进度调整。
 
 ### 步③（M2）上下文编译器 + 召回 + 观测摘要 + status_card
 - 验证方法（§7.1 M2 行）：同快照+配方+预算→字节一致（diff=0）；召回四级可停；复用判定 O(1)（EXPLAIN QUERY PLAN 证明走测量索引）；观测摘要进锚点而门禁 authorizer 拒读（负例）；import 仍 deferred、不产 target。

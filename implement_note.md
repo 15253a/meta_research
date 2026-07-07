@@ -4,28 +4,39 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-07 18:00 ｜ 位置：空闲（步① M0 已完成；步② M1 待开工）
-- 检查点状态：空闲
+- 更新：2026-07-07 21:30 ｜ 位置：步② M1 · CP2.1 已提交，CP2.2 待开工
+- 检查点状态：空闲（CP2.1 记账完成；CP2.2 未开工）
 
 ## 正在做什么
-无进行中检查点。**步①（M0）已完成**：CP1.1–1.4 四检查点（commit 965d1a3 / 9ee4c45 / 7deb14a / 45641cc，build_log 0006–0009），步级验证 = 真 codex 端到端验收通过（5 轮元循环，①–④判据全过，证据见 build_log/0009）。
+**全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
+**CP2.1 已完成并记账**（commit 6d45b53，build_log 0010）：冻结 Appendix-A DDL 落库 + database.py 三重锁 +
+91 条 DB 层不变量否定用例（I1–I6/append-only/v2.3-2.4 表约束）。codex 第2轮 APPROVE，pytest 198 passed。
+三 OPEN 裁定已落 db/README.md（受审载体）。
 
 ## 工作区状态
-- 干净（待记账提交本文件+ROADMAP+build_log 0009）。
-- `meta-research/questions/toy/` 有最近一次验收运行产物（gitignored，留作回放参考，可随时删）。
+- 干净（CP2.1 检查点提交 6d45b53 + 本记账提交后）。
+- CP2.2 参考速查已备：开发期 scratchpad `CP2.2_refsheet.md`（§6.13 WriteDaemon/authorizer + §4.1.4 16 个 gate_* + §6.6/§6.10）；
+  `M1_refsheet.md`（I1–I6/gate_close_question/decompose/v2.3-2.4 表约束精摘）。
+  ⚠️ scratchpad 是 session 临时目录，换 session 会丢——新 session 需时重跑 Explore 提取（reference §6.13/§4.1.4）。
+
+## M1 检查点计划（步②，边走边定；细节见 ROADMAP）
+- [x] **CP2.1（M1a-DB）** 冻结 schema + DB 层否定用例 — 6d45b53 / build_log 0010
+- [ ] **CP2.2（M1a-Gate）** Gate 三级校验换真：单写 WriteDaemon + Gate 受限只读连接（authorizer deny 9 表）+ gate_input_* 视图 + level-3 业务门禁 gate_close_question + 应用层否定用例（authorizer 拒读 v_metric_result_trajectory/observation/interaction_request；gate_close_question 拒 target_complete/applicability 同版负向）
+- [ ] **CP2.3（M1b）** StateStore→SQLite（共用 WriteDaemon）+ decompose 单事务原子性（kill-9 无半写）
+- [ ] **CP2.4（M1c）** v2.3/v2.4 表隔离行为 + M1–M3 隔离拒绝用例
 
 ## 下一步动作（按序，具体到命令/文件）
-1. **先向用户确认三事项，才能开 M1**（步② 验收含 DDL 冻结，不得自行填空）：
-   ① 规范内部缺口：《二》§6.12 提及 import 旋钮（selection_key 排序 / policy_hash / license scope）而附录 C（policy 唯一注册表）无对应键——补进 policy 还是维持附录 C 现状？
-   ② DB `evaluation.source` 枚举无 'fake'：M1–M3 假执行的 evaluation 以什么口径入真实 DB（用 factory+synthetic 标记列？还是 M1 扩枚举再 M4 收缩）？
-   ③ reference/OPEN.md #1（可选 DDL 三项）与 #2（applicability 同版触发器）——按登记表须在 M1 开工时评估确认。
-2. 用户确认后：把步②（M1）切检查点（建议：CP2.1 附录 A DDL 落库+checksum 锁定+否定用例（M1a 前半）；CP2.2 门禁三级校验换真+I1–I6 否定用例（M1a 后半）；CP2.3 StateStore 落 SQLite+decompose 释放断言（M1b）；CP2.4 v2.3/v2.4 表约束+隔离拒绝用例（M1c））——精读附录 A（第一部分 909–1620 行）后定稿。
-3. 每检查点照 §5 循环（内审 Opus 子代理 + codex 外审 ≤2 轮）。
+1. 开 CP2.2：先定**裁量**——WriteDaemon 先落还是随 Gate？（倾向：CP2.2 引入 WriteDaemon 骨架 + Gate 受限连接/authorizer/gate_input_* 视图 + gate_close_question；池注册 gate_*(baseline/variant/eval…) 体量大，可能拆到 CP2.2b 或并入 CP2.3 前）。精读 reference §4.1.4 附注（结果评审 subject_hash 判据）后定检查点边界，落 implement_note + ROADMAP。
+2. 关键设计点：gate_input_* 视图集（不含 9 禁表）+ SQLite authorizer 回调（sqlite3 set_authorizer）deny 9 表 SELECT；三级校验第③级换真（业务门禁只从 gate_input_* 取数）。
+3. 照 §5 循环：内审 Opus 子代理 + codex 外审 ≤2 轮 → commit → build_log 0011。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
-- M0 期定下的驱动器/编译器纪律（M1 换真时保持）：pack 变异唯一入口 = Compiler.amend（manifest 溯源）；sidecar 不走 Gate；reasoning 必产检查先于 commit；破坏性护栏不用 assert；transcript 唯一序号；route 矩阵不可达分支要显式拒。
-- prompt 工程铁律（实测 6 次端到端换来的）：给工人的字段说明必须是"逐字键名 + JSON 骨架"，散文描述必然自造键；oneOf 校验错误必须展平子错误否则重试不收敛。
-- M0 已知简化（M1 消化清单）：无事务收尾（→phase_commit）、业务门禁放过（→I1–I6）、baseline dep 不校验目标、验收②是编译器自一致性而非独立数据流审计（→DECISION 入账后 DB 审计）、聚合轮未真跑（单测覆盖）。
-- 测试：`cd meta-research && /root/miniconda3/bin/python -m pytest tests/ -q`（107 基线）；端到端：`/root/miniconda3/bin/python scripts/run_m0_acceptance.py --cycles 5`（花真 token，~25 调用）。
-- pip 镜像源不带代理 / codex 要代理 127.0.0.1:7890。
+- **全自动模式**：OPEN/裁量项不停下问用户，自行裁决 + 落受审载体（db/README.md 或对应制品）+ 记 build_log。
+- **codex 外审用模式 B**（settings.local.json 无 codexro-review 放行，agent 不能自加）：
+  `env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`
+  必须**后台跑**（Bash 工具默认 120s 超时会杀掉；xhigh 审 1600 行需数分钟）+ prompt 声明「全部内联、无需执行命令」。proxy 必带（codex-chatgpt 会 unset 代理）。
+- DDL 是字节冻结对象：改 schema 要同步更新 database.py 的 MIGRATION_SHA256（decisional，走评审）。
+- 否定用例纪律：多守卫可能都拒同一写时，用 `_raises_msg`（消息断言）钉死命中目标触发器；写完用 diag 脚本核每例命中预期约束。
+- 测试基线现 198；端到端 `scripts/run_m0_acceptance.py --cycles 5`（花真 token）。
+- prompt 工程铁律（M0 实测）：给工人字段说明逐字键名+JSON骨架；oneOf 校验错误必须展平子错误。
