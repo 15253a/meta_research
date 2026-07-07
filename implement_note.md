@@ -4,26 +4,25 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-07 14:35 ｜ 位置：步①（M0）CP1.2 流程层
-- 检查点状态：开工（CP1.1 已完成：commit 965d1a3 + build_log 0006）
+- 更新：2026-07-07 15:10 ｜ 位置：步①（M0）CP1.3 资产层接口桩
+- 检查点状态：开工（CP1.1 965d1a3 / CP1.2 9ee4c45 已完成，build_log 0006/0007）
 
 ## 正在做什么
-CP1.2（流程层）：prompts/system_prompt.md + 四阶段 SKILL.md（全中文；idea 两 runner_call：生成+独立判官 / plan 复用判定+可回答性评审独立调用 ≤2 轮 / bundle M0 驱动器代跑+双评审占位 / reasoning R1–R4 与 reasoning-only 轮）+ 两份过程产物 schema（idea_audit：$ref 复用 idea_set 的 audit_score；plan_review）。**五份草稿已写好**在 scratchpad `cp12/`（system_prompt / idea_SKILL / plan_SKILL / bundle_SKILL / reasoning_SKILL + 两 schema），移入仓库后：更新 tests 清单断言（STAGE_SCHEMAS 增两项）+ 补两 schema 正负例 + skill 实读校验测试（要素齐全性）。
+CP1.3：orchestrator 六模块——schemas.py（SchemaSet+ARTIFACT_SCHEMA_MAP）/ gate.py（StubGate：schema+引用两级真、业务放过；ArtifactIndex；staging 原子写）/ statestore.py（InMemoryStateStore：七 op、调度可见性、close_question/release）/ compiler.py（StubCompiler 四区包+manifest 溯源+确定性；StubCtx/StubRecall）/ runner.py（CodexRunner：codex exec ephemeral、信封解析、transcripts 归档）/ goalbrief.py（启动契约解析，tests 反向 import）。**六份草稿已在 scratchpad `cp13/`**，移入后写单测（gate 拒非法/statestore op 语义/compiler 确定性/runner 用假 bin 测解析、不烧真 token）。
 
 ## 工作区状态
-- 干净（CP1.1 与记账均已提交）。
-- 产物信封约定（CP1.2/1.3 共用）：codex 最终回复 = 单个 ```json 块 `{"files": {...}, "md": "..."}`；本机 bwrap 不可用 → prompt 声明全部输入已内联、无需执行命令。
-- idea_audit.schema 用跨文件 $ref（https://meta-research.local/schemas/idea_set.schema.json#/$defs/audit_score）→ 校验器需 referencing.Registry 装载全部 schema（conftest 要加 registry helper）。
+- 干净（CP1.2 与记账均已提交）。
+- scratchpad `cp13/` 草稿注意两处需同步终稿：schemas.py 的 idea_set_draft 已有真 schema 文件（不再用 _draft_validator 派生——删掉派生逻辑、直接映射 "idea_set.draft.json"→"idea_set_draft"）；statestore.create_root 支持 local_key（tree_ops schema 已加）。
 
 ## 下一步动作（按序，具体到命令/文件）
-1. `cp scratchpad/cp12/* → meta-research/prompts/{system_prompt.md,skills/<stage>/SKILL.md} + schemas/`（路径映射：idea_SKILL.md→skills/idea/SKILL.md 等）
-2. tests：conftest 加 schema Registry；test_schemas STAGE_SCHEMAS + fixtures（idea_audit 正/负、plan_review 正/负）；新增 test_skills.py（实读校验：每 SKILL 含 触发/读取/任务/产物 schema 指向/门禁写入/失败语义 六要素 + 关键锚词如 R1–R4/NEED/复用判定/两段提交）
-3. 内审（Agent model:"opus"）→ 修复 → `git add` → `bin/codex-review.sh "CP1.2 流程层……"` ≤2 轮 → commit → build_log/0007
-4. 然后 CP1.3（接口桩：gate/statestore/compiler/ctx/recall/runner + validate_artifact；goal_brief 解析移入 orchestrator）
+1. cp scratchpad/cp13/*.py → meta-research/orchestrator/（按上述两处修正）
+2. tests/test_orchestrator.py：gate 两级校验（用既有 invalid fixtures 过 StubGate 应拒）+ statestore（bootstrap→attack→decompose→聚合解锁→terminate 链路 + 拒绝判据）+ compiler 确定性（同状态两次 render pack_hash 相等）+ runner 信封解析（METARESEARCH_CODEX_BIN 指向假脚本）+ goalbrief 迁移（test_schemas 的解析测试改 import orchestrator.goalbrief）
+3. 内审（Agent model:"opus"）→ 修复 → git add → bin/codex-review.sh ≤2 轮 → commit → build_log/0008
+4. CP1.4：driver.py（advance 环 + route 派生 + idea 两调用/plan 评审环/bundle 假执行）+ M0 验收脚本跑 toy 3–5 轮（真 codex 调用，模型/档位走 env）
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
-- bundle_target/execution_* 词表以附录 A DDL 为准（log_kind 六值；loss_trend down/flat/up/nan/unknown；oom_count；fold ⇒ ckpt_key；attempt failure_kind 八值；content_hash 非 hash）。
-- 契约焊点（外审两轮的成果，改 schema 时勿松）：import_defer ⇔ targets=[] 且锚必填；fake ⇔ synthetic 双向；evidence oneOf 互斥；claim 按 target_kind 必填；complete ⇔ 嵌套全 success；skipped 无执行事实；负例必须配 .expect。
-- 留给 M1 开工前问用户：①《二》§6.12 提及 import 旋钮而附录 C 无键；②DB evaluation.source 无 'fake'，M1–M3 假执行入账方式；③OPEN #1/#2。
-- pip 走镜像源不带代理；codex 要代理 127.0.0.1:7890。测试跑法：`cd meta-research && /root/miniconda3/bin/python -m pytest tests/ -q`。
+- RFAIL 口径已裁定并焊进 schema/skill：已执行失败恒 failed（携事实），仅未执行旁路 skipped（不携任何执行/失败/评审事实）；图 05 原文"非 critical→skipped"是措辞松动（build_log 0007 有记录）。
+- bundle_target 契约焊点清单见 build_log 0006/0007（fake⇔synthetic 双向、complete⇒全 success+双评审 kind+pass、skipped 全禁、fold⇒ckpt_key、DDL 词表）。改 schema 勿松。
+- 留给 M1 开工前问用户：①《二》§6.12 import 旋钮 vs 附录 C 缺键；②DB evaluation.source 无 'fake' 的 M1–M3 入账方式；③OPEN #1/#2。
+- pip 镜像源不带代理 / codex 要代理；测试：`cd meta-research && /root/miniconda3/bin/python -m pytest tests/ -q`。
