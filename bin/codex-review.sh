@@ -33,7 +33,7 @@ fi
 
 {
   echo "你是严格的只读 code reviewer。下面是一次「$decision」的暂存改动 diff。"
-  echo "审查重点：正确性 bug、契约破坏、并发/错误处理隐患、可回退性。"
+  echo "审查重点：正确性 bug、契约破坏、并发/错误处理隐患、可回退性、可维护性/可读性（CLAUDE.md §10）。"
   echo "你可以自行用 rg / 读取 $repo 下的其它文件来核实跨文件假设（调用方、类型/接口定义、契约波及面）。"
   echo "按 [BLOCKER] / [SHOULD] / [NIT] 分级列出问题；最后单独一行给结论："
   echo "  VERDICT: APPROVE         （无 BLOCKER，可提交）"

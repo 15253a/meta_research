@@ -22,7 +22,7 @@
 4. bin/codex-review.sh "<检查点一句话>"     # 检查点边界 codex 外审，第 1 轮
 5. 有 BLOCKER → 改 → 再跑一次（第 2 轮，上限）；仍不过则凭反馈自行改、不再送 codex
 6. git commit                              # 落检查点提交（codex 过后）
-7. build_log/ 写一条记录 + 更新 INDEX.md + 勾 ROADMAP.md + 刷新 implement_note.md → git commit 该记录（`docs(build_log): …`，见 CLAUDE.md §4）
+7. build_log/ 写一条记录 + 更新 INDEX.md + 勾 ROADMAP.md（含同步「当前位置」）+ 刷新 implement_note.md → git commit 该记录（`docs(build_log): …`，见 CLAUDE.md §4）
 ```
 
 ## 前置（一次性）
