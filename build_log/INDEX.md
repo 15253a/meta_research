@@ -6,12 +6,8 @@
 
 ---
 
-- [0005](0005-position-authority-quality-bar.md) — 位置双写权威归属（implement_note 权威、ROADMAP 记账时同步兜底）+ 工程质量基线 §10 · commit `ccfcdb8` · 验证: 通过
-- [0004](0004-implement-note-handoff.md) — 断点续作机制 implement_note.md（跨 session/跨模型接力；记账类豁免硬边界）· commit `bac84ef` · 验证: 通过
-- [0003](0003-checkpoint-build-model.md) — 两级分解(步→检查点)+检查点闭环构建模型（codex 退到检查点边界独立外审）· commit `a45c59b` · 验证: 通过
-- [0002](0002-scope-artifacts.md) — 评审范围扩到所有决策性制品（prompt/skill/系统提示/schema/接口，不只代码）· commit `2265869` · 验证: 通过
-- [0001](0001-scaffold.md) — 施工脚手架 baseline（git 仓库 + 评审入口 + 施工说明）· commit `f968be9` · 验证: 通过
+_（空。0001–0005 为脚手架 / 治理期日志，已按用户指示于 2026-07-07 清理出工作区，内容完整保留在 git 历史（提交 `034d6a6` 及更早）。正式构建的记录从 **0006** 起编号——NNNN 全程递增、不复用旧号，避免与历史重名。）_
 
 <!-- 在此追加记录，例：
-- [0001](0001-init.md) — 初始化系统骨架 · commit `abc1234` · 验证: 通过
+- [0006](0006-xxx.md) — <检查点一句话> · commit `abc1234` · 验证: 通过
 -->
