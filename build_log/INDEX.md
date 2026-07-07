@@ -6,6 +6,7 @@
 
 ---
 
+- [0005](0005-position-authority-quality-bar.md) — 位置双写权威归属（implement_note 权威、ROADMAP 记账时同步兜底）+ 工程质量基线 §10 · commit `ccfcdb8` · 验证: 通过
 - [0004](0004-implement-note-handoff.md) — 断点续作机制 implement_note.md（跨 session/跨模型接力；记账类豁免硬边界）· commit `bac84ef` · 验证: 通过
 - [0003](0003-checkpoint-build-model.md) — 两级分解(步→检查点)+检查点闭环构建模型（codex 退到检查点边界独立外审）· commit `a45c59b` · 验证: 通过
 - [0002](0002-scope-artifacts.md) — 评审范围扩到所有决策性制品（prompt/skill/系统提示/schema/接口，不只代码）· commit `2265869` · 验证: 通过
