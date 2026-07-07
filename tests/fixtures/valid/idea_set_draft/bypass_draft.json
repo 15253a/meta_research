@@ -1,0 +1,23 @@
+{
+  "need_innovation": false,
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "generation_path": "bypass",
+      "audit_mapping": {
+        "source_domain": "经典机器学习教材基线（现成方案来源）",
+        "target_domain": "toy 双高斯二分类",
+        "object_mapping": "教材逻辑回归 → 本任务基线家族 A",
+        "shared_relations": "线性可分性假设下训练/评估关系一致"
+      },
+      "core_claim": "逻辑回归在双高斯合成数据上能以 accuracy ≥ 0.90 稳定达标",
+      "mechanism": "线性判别面拟合贝叶斯最优边界近似",
+      "assumptions": ["两类协方差近似相等"],
+      "min_falsifiable_experiment": "固定种子与划分训练并测留出集 accuracy；aggregate < 0.90 即证伪",
+      "novelty_type": "表征结构",
+      "novelty_status": "联网粗查已启用·文献级待人工验证"
+    }
+  ],
+  "novelty_refs": [],
+  "provenance": { "model": "gpt-5.5" }
+}

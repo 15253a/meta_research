@@ -89,7 +89,7 @@
         "target_key": { "type": "string", "minLength": 1, "description": "plan 内稳定键；bundle 产物与 required_metric 以此关联" },
         "target_kind": { "enum": ["build", "exec", "eval"] },
         "seq": { "type": "integer", "minimum": 1, "description": "依赖序（bundle 严格串行按此执行）" },
-        "critical": { "type": "boolean", "description": "关键目标失败 → 早退；非关键 → skipped（§3.4 RFAIL）" },
+        "critical": { "type": "boolean", "description": "关键目标失败 → 早退（剩余未执行 pending 置 skipped）；非关键失败 → 本目标 failed、继续取下一个（RFAIL 口径对齐 06f 状态机）" },
         "budget_estimate": { "type": "number", "minimum": 0 },
         "spec_md": { "type": "string", "minLength": 1, "description": "本目标做什么（构建/训练/评估内容，bundle 只照办）" },
         "need_ids": { "type": "array", "items": { "type": "string" } },

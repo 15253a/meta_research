@@ -1,0 +1,22 @@
+{
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "generation_path": "bypass",
+      "audit_mapping": {
+        "source_domain": "现成方案",
+        "target_domain": "toy",
+        "object_mapping": "套用",
+        "shared_relations": "同构"
+      },
+      "core_claim": "生成调用不得携带判官产物字段（audit_scores 属判官调用，§3.1.3 独立性）",
+      "mechanism": "占位",
+      "assumptions": ["占位"],
+      "min_falsifiable_experiment": "占位",
+      "novelty_type": "表征结构",
+      "novelty_status": "联网粗查已启用·文献级待人工验证"
+    }
+  ],
+  "novelty_refs": [],
+  "audit_scores": []
+}

@@ -1,0 +1,18 @@
+{
+  "audit_scores": [
+    {
+      "candidate_id": "c1",
+      "scores": {
+        "structural_depth": 11,
+        "domain_distance": 3,
+        "applicability": 8,
+        "novelty": 2,
+        "unexpectedness": 2,
+        "non_obviousness": 3
+      },
+      "decision": "pass",
+      "rationale": "SD=11 超出 0–10 量表，必须被拒（跨文件 $ref 到 idea_set.$defs.audit_score 生效的证明）"
+    }
+  ],
+  "selected_id": "c1"
+}

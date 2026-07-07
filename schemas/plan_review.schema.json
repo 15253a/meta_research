@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/plan_review.schema.json",
+  "title": "plan_review",
+  "description": "plan 可回答性评审（独立会话，≤2 轮，图 04 REVIEW / 附录 C flow.retry.plan_review）的输出契约。评审是过程产物：结论供编排器决定回传修复或阶段失败，不入研究库为事实（M1 起以 DECISION(actor=judge) 记账）。",
+  "type": "object",
+  "required": ["verdict", "round_no", "issues"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": { "enum": ["pass", "fail"] },
+    "round_no": { "type": "integer", "minimum": 1 },
+    "issues": {
+      "type": "array",
+      "description": "verdict=fail 时逐条问题（回传计划会话修复的依据）；pass 时可为空",
+      "items": {
+        "type": "object",
+        "required": ["item", "why"],
+        "additionalProperties": false,
+        "properties": {
+          "item": { "type": "string", "minLength": 1, "description": "违反可回答性清单的哪一条（对应 SKILL 评审任务 1–5）" },
+          "why": { "type": "string", "minLength": 1 },
+          "fix_hint": { "type": "string" }
+        }
+      }
+    },
+    "notes_md": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "verdict": { "const": "fail" } } },
+      "then": { "properties": { "issues": { "minItems": 1 } } }
+    }
+  ]
+}

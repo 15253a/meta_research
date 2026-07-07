@@ -30,6 +30,7 @@
       "additionalProperties": false,
       "properties": {
         "op": { "const": "create_root" },
+        "local_key": { "type": "string", "minLength": 1, "description": "同批引用键（bootstrap 轮 selection.next_question_id 以此回指新 root，与 add_children/spawn_question 对称）" },
         "text": { "type": "string", "minLength": 1, "description": "问题语义身份（中文）" },
         "rationale_md": { "type": "string" }
       }

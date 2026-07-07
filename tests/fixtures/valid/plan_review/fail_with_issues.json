@@ -1,0 +1,12 @@
+{
+  "verdict": "fail",
+  "round_no": 1,
+  "issues": [
+    {
+      "item": "每个 need ≥1 个声明指标覆盖",
+      "why": "n2 无任何 required_metric 或 reuse_evidence 覆盖",
+      "fix_hint": "为 n2 追加 build_target_required_metric 或改为复用证据"
+    }
+  ],
+  "notes_md": "第 1 轮：一条可回答性缺口"
+}

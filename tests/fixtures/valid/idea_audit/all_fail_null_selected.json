@@ -1,0 +1,18 @@
+{
+  "audit_scores": [
+    {
+      "candidate_id": "c1",
+      "scores": {
+        "structural_depth": 3,
+        "domain_distance": 5,
+        "applicability": 4,
+        "novelty": 4,
+        "unexpectedness": 4,
+        "non_obviousness": 3
+      },
+      "decision": "fail",
+      "rationale": "SD=3 低于阈值，淘汰；全部候选不合格 → 阶段失败（轮正常收尾、Qn inconclusive）"
+    }
+  ],
+  "selected_id": null
+}

@@ -15,18 +15,17 @@ from jsonschema.exceptions import ValidationError
 
 from conftest import (
     FIXTURES_DIR, SCHEMAS_DIR, SYSTEM_ROOT,
-    iter_fixture_cases, load_json, load_schema,
+    iter_fixture_cases, load_json, load_schema, make_validator,
 )
 
 STAGE_SCHEMAS = [
+    # 四阶段最终产物 + sidecar + policy（Gate 校验对象）
     "idea_set", "plan", "bundle_target",
     "answer", "tree_ops", "selection",
     "resource_request", "policy",
+    # 过程产物（runner_call 级契约：生成草稿 / 判官 / 评审输出，驱动器消费）
+    "idea_set_draft", "idea_audit", "plan_review",
 ]
-
-
-def make_validator(name: str) -> Draft202012Validator:
-    return Draft202012Validator(load_schema(name))
 
 
 # ---------------------------------------------------------------------------
