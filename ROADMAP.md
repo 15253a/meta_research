@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步②（M1）进行中**——CP2.1（6d45b53，M1a-DB）+ CP2.2（be84a90，M1b）+ CP2.3（d07c6c6，M1a-Gate）已完成；下一步 **CP2.4（M1c 隔离拒绝用例）** 收尾 M1。步①（M0）已完成。
+- 进行中的步 / 检查点：**步②（M1）已完成**（CP2.1 6d45b53 / CP2.2 be84a90 / CP2.3 d07c6c6 / CP2.4 1182a5a；步级验证 267 全绿）。下一步 **步③（M2）**：上下文编译器 + 召回 + 观测摘要 + status_card。步①（M0）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -41,7 +41,8 @@
   - [x] CP2.1 冻结 Appendix-A DDL 落库 + database.py 三重锁 + 全套 **DB 层**不变量否定用例（I1–I6/append-only/v2.3-2.4 表约束，91 例）— commit 6d45b53（build_log 0010）
   - [x] CP2.2 单写 WriteDaemon（短事务）+ SQLiteStateStore 落 SQLite（cycle/question/route/树/dep/selection，语义等价 M0 InMemory）+ decompose 单事务原子性（kill-9 无半写）（M1b）— commit be84a90（build_log 0011）
   - [x] CP2.3 SqliteGate（M1a-Gate）：authorizer 隔离拒 9 表+v_trajectory + gate_input_* TEMP 视图 + 三级校验 + gate_close_question（gate-only 判据写锁内重跑防 TOCTOU + 触发器兜底转干净拒）— commit d07c6c6（build_log 0012）
-  - [ ] CP2.4 v2.3/v2.4 表隔离行为 + 「M1–M3 隔离拒绝用例」（M1c）——收尾 M1
+  - [x] CP2.4 v2.3/v2.4 表隔离行为 + 「M1–M3 隔离拒绝用例」（M1c）— commit 1182a5a（build_log 0013）
+- 步级验证结果：**通过**（`pytest tests/ -q` = 267 全绿；§7.1 M1 逐项↔用例映射见 build_log/0013：DDL/checksum 锁 + I1–I6 + v2.3/v2.4 否定 + 门禁三级校验/gate_close_question + StateStore/decompose kill-9 + M1–M3 隔离 全过）。
   - > 注：M1a-Gate 本轮只 gate_close_question；池注册 gate_*（baseline/variant/eval/attempt… 15 个，§4.1.4）随 M3/M4 真执行需要时补（M1–M3 假执行不产真池对象，隔离用例证之）。parser_suspect=M4；reasoning-finish 全序原子=M3。
   - > 注：**顺序调整**——StateStore/WriteDaemon（M1b）先落（自足 + 供 Gate 共用同一写服务，§6.6），Gate（M1a-Gate）后落。二者共用单写 WriteDaemon；M0 driver 端到端切真 loop 归 M3 Advancer（M1 交付真实组件 + 组件级验收）。切分可随进度调整。
 

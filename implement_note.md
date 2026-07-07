@@ -4,47 +4,42 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 00:45 ｜ 位置：步② M1 · CP2.3 已提交，CP2.4（M1c）待开工
-- 检查点状态：空闲（CP2.3 记账完成；CP2.4 未开工）
+- 更新：2026-07-08 01:50 ｜ 位置：**步②（M1）已完成**；步③（M2）待开工
+- 检查点状态：空闲（M1 收尾记账完成；M2 未开工）
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**M1 进度**：CP2.1（6d45b53，M1a-DB）+ CP2.2（be84a90，M1b StateStore/WriteDaemon）+ **CP2.3（d07c6c6，
-M1a-Gate：SqliteGate authorizer 隔离 + gate_input 视图 + gate_close_question）** 已完成记账。pytest 255 passed。
-**下一步 CP2.4（M1c）收尾 M1**。
+**步②（M1）资产层落地——完成**：CP2.1（6d45b53 M1a-DB）+ CP2.2（be84a90 M1b）+ CP2.3（d07c6c6 M1a-Gate）
++ CP2.4（1182a5a M1c）。步级验证 267 全绿（§7.1 M1 逐项过，见 build_log 0013）。**下一步 步③（M2）**。
 
-## 关键裁量：M1 收尾范围（全自动自主裁决，落 ROADMAP + build_log 0012）
-- **M1 acceptance（§7.1）= CP2.1（DDL+DB负例）+ CP2.2（StateStore）+ CP2.3（门禁+三级校验+gate_close_question 负例）+ CP2.4（M1c 隔离）**。
-- **池注册 gate_*（baseline/variant/evaluation/attempt/run/build_target… §4.1.4 其余 15 个）不在 M1 acceptance**——
-  它们是 bundle 事实写入路径，**M1–M3 假执行不产真池对象**；随 **M3 Advancer 跑真 loop**（或 M4 真执行）需要时补。
-  M1c 隔离用例正是证「假执行期这些真池对象/target 不被产生」。
-- parser_suspect=M4；reasoning-finish 全序原子（gate 关问+tree_ops+selection 一事务）=M3。
+## M1 交付的真实资产层（未接 driver；M3 Advancer 才接，M0 driver 仍走桩、基线保持绿）
+- `orchestrator/database.py`：附录 A 冻结 DDL 建库 + checksum/计数/版本三重锁。
+- `orchestrator/writedaemon.py`：单写连接 + 短事务（BEGIN IMMEDIATE，不可嵌套，鲁棒回滚）。
+- `orchestrator/statestore_sqlite.py`：SQLiteStateStore（状态机 + decompose 单事务原子 + kill-9 无半写 + 类型前缀 id + active_question_id 落库 + 投影随事务回滚 + atomic() 供 M3 裹全序）。
+- `orchestrator/gate_sqlite.py`：SqliteGate（authorizer mode=ro 拒 9 表 + gate_input_* TEMP 视图 + gate_close_question：gate-only 判据写锁内重跑防 TOCTOU + 触发器 ABORT→干净拒 + _reject FK-null）。
+- `orchestrator/importer.py` / `interaction.py` / `ids.py`：M1c 桩（import 发现+登记 deferred / 人机 durable 入站 + 隔离）。
 
-## 工作区状态
-- 干净（CP2.3 检查点提交 d07c6c6 + 本记账提交后）。
-- 真实资产层组件（未接 driver，M3 Advancer 接）：database.py / writedaemon.py / statestore_sqlite.py / gate_sqlite.py。
-- 参考速查（开发期 scratchpad，换 session 会丢）：M1_refsheet.md、CP2.2_refsheet.md（§6.13/§4.1.4 16 gate_*）。
-
-## CP2.4（M1c）目标
-「M1–M3 隔离拒绝用例」（§7.1 M1 行 + 第三部分「M1–M3 隔离拒绝用例」）：证 v2.3/v2.4 子系统（import/interaction）
-在假执行期不破 M0–M3 边界——
-① external_candidate/选择**不产** executable target、不入 baseline pool、不参与 evidence/report（断言查无此类行）；
-② 入站消息**不触发**真 query responder、不改 route/decision/question；pending interaction_request 不触发真通知/全局等待（桩）；
-③ import 分支恒 deferred（占位 baseline(planned) + pending question_dep；真物化只 M4）。
-→ 这些多为**断言 + 桩**（子系统本身 M4/M5 才落真），本轮证「不越界」。需精读第三部分 §7.1「M1–M3 隔离拒绝用例」段 + 第一部分 §3.6.3/§4.2.1/§4.6.2。
+## 步③（M2）目标（§7.1 M2 行）
+上下文编译器 + 召回 + 运行观测摘要段 + status_card 发布。验收（可证伪）：
+- **同快照+配方+预算 → context_pack 字节一致（diff=0）**（确定性四区包 §4.5.1：①固定锚 ②结构邻域 ③检索区 ④引用区）。
+- 召回四级可停（§3.6.2 渐进召回）。
+- **复用判定 O(1)**：命中走测量索引 `(variant_id,protocol_id,protocol_ver)`，`EXPLAIN QUERY PLAN` 证明用索引、非全表扫。
+- 运行观测摘要进锚点，而**门禁 authorizer 拒读**（负例——CP2.3 authorizer 已拒 execution_observation，此处证摘要进 pack 但不进 gate 判据）。
+- import 仍 deferred（占位 baseline + pending dep）、**不产 target**。
+- 桩→真：Compiler / Ctx / Recall（M0 固定模板/假数据 → M2 换真：FTS5+嵌入+测量索引）。
 
 ## 下一步动作（按序）
-1. 精读第三部分「M1–M3 隔离拒绝用例」+ 第一部分 §3.6.3（import deferred 三写入）/§4.2.1（pending dep 排除调度）/§4.6.2（分类 unclear）。
-2. 裁量 CP2.4 落地形态：多为「桩子系统 + 隔离断言」（import register 只登记不物化；interaction 入站 durable 但不触发真 responder）。可能需薄桩 importer/interaction 写入 + 断言。定检查点边界落 implement_note+ROADMAP。
-3. 照 §5 循环：内审 Opus + codex 外审 ≤2 轮 → commit → build_log 0013 → **收尾步② M1**（跑 M1 步级验证：I1–I6 + v2.3/v2.4 否定 + decompose kill-9 + 隔离用例全过）。
+1. **精读 M2 规格**（建议 Explore 提取，省上下文）：第一部分 §4.5（上下文编译器四区包/确定性契约）、§3.6.2（渐进四级召回）、§4.7（运行观测摘要）、§4.6.6（status_card）、第二部分 §6.7（编译器实现）/§6.10（Compiler/Ctx/Recall 换真行）。看现有 `orchestrator/compiler.py`（StubCompiler，M0 固定模板 + manifest 溯源）作起点。
+2. **裁量 M2 检查点切分**（建议：CP3.1 Compiler 确定性四区包换真 + 字节一致；CP3.2 Recall 四级召回 + 复用判定 O(1)/EXPLAIN；CP3.3 观测摘要进锚点 + status_card 发布 + authorizer 负例）。精读后定，落 implement_note + ROADMAP。
+3. 每检查点照 §5 循环：内审 Opus 子代理 + codex 外审 ≤2 轮 → commit → build_log。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
-- **全自动模式**：OPEN/裁量项不停下问用户，自行裁决 + 落受审载体 + 记 build_log。
-- **codex 外审模式 B 后台跑**（Bash 120s 会杀，必须 run_in_background）：`env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`；prompt 声明「全部内联、无需执行命令」。
-- **评审很能抓真 bug**（CP2.1–2.3 共 codex 8 BLOCKER + 内审 3 BLOCKER）。写资产层务必：类型前缀 id 解码、进程内投影随事务回滚、护栏取策略键名累计口径、可恢复字段落库、gate 拒因不撞 FK（NULL+payload）、gate-only 判据写锁内重跑防 TOCTOU、except 只收 IntegrityError、门禁读连接 mode=ro。
-- **否定用例纪律**：多守卫可能都拒同一写 → 消息断言（match=）钉死目标；写完 diag 核每例命中预期。
-- gate 测试须**文件库**（门禁 mode=ro 独立连接；:memory: 每连接独立库）。
+- **全自动模式**：OPEN/裁量项不停下问用户，自行裁决 + 落受审载体（对应制品/build_log）。M2 无 OPEN 阻塞（OPEN #1/#2 已 M1 裁）。
+- **codex 外审模式 B 后台跑**（Bash 120s 会杀，必须 run_in_background）：`env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`；prompt 声明「全部内联、无需执行命令」。两轮上限；APPROVE 才 commit。
+- **评审极能抓真 bug**（M1 期 codex 共 ~10 BLOCKER + 内审 ~4 BLOCKER）。资产层务必：类型前缀 id 解码（ids.py）、进程内投影随事务回滚、护栏取策略键名累计口径、可恢复字段落库、gate 拒不撞 FK、gate-only 判据写锁内重跑、except 只收 IntegrityError、门禁读连接 mode=ro、写子系统前置一致性校验（candidate↔question 等）、幂等锚正确。
+- **确定性纪律（M2 核心）**：context_pack 字节一致——无 wall-clock/随机/dict 无序；ORDER BY 定序；manifest 溯源。
+- gate/文件库测试须**文件库**（门禁 mode=ro 独立连接）；importer/interaction/statestore 可 :memory:（单 WriteDaemon 连接）。
 - DDL 字节冻结：改 schema 同步 database.py 的 MIGRATION_SHA256（走评审）。
-- 测试基线现 255；端到端 `scripts/run_m0_acceptance.py --cycles 5`（花真 token）。
+- 测试基线现 **267**；端到端 `scripts/run_m0_acceptance.py --cycles 5`（花真 token，走 M0 桩栈）。
 - 悬案（build_log 0011/0012）：resolve_deps dead_end 依赖（保 M0 语义，M3/M6 定）；跨版 child_answer applicability（现 try/except 兜底，M3 goal-amend 验）。
