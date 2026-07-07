@@ -44,6 +44,31 @@ idea_set.json 后按 `schemas/idea_set.schema.json` 终校）。步骤：
 4. 每个候选给 `min_falsifiable_experiment`（带对照与失败判据）——它只是 plan 的输入素材。
 5. `provenance` 填已知项（prompt_hash/model 由编排器注入 context_pack 提供，照抄）。
 
+**输出骨架（键名逐字，封闭对象——多一键即被拒；`<>` 为占位）**：
+
+```json
+{ "need_innovation": <true|false>,
+  "candidates": [
+    { "candidate_id": "c1",
+      "generation_path": "<wildidea|bypass>",
+      "audit_mapping": { "source_domain": "<>", "target_domain": "<>",
+                         "object_mapping": "<>", "shared_relations": "<>" },
+      "core_claim": "<>", "mechanism": "<>",
+      "assumptions": ["<>"],
+      "min_falsifiable_experiment": "<>",
+      "novelty_type": "<十选一：评估协议/训练目标/表征结构/推理机制/部署策略/数据准入/采样/校准/路由/损失>",
+      "novelty_status": "联网粗查已启用·文献级待人工验证",
+      "wildidea_extra": { "source_isof": "<>", "source_prototype": "<>",
+                          "deanchor_level": "<不成立|部分成立|成立>", "degenerate_form": "<>",
+                          "nearest_neighbor_diff": "<>", "strongest_rebuttal": "<>" } } ],
+  "novelty_refs": [],
+  "provenance": { "model": "<照抄注入值>" } }
+```
+
+骨架纪律：顶层只许这四个键；候选内除上列键外**一律不加**（无 title/phase/cycle/question_id）；
+`wildidea_extra` **仅** generation_path=wildidea 时携带、bypass 必须整体省略；
+最近邻/最强反驳属 `wildidea_extra` 内、不放候选顶层。
+
 ## 【判官任务】（第 2 次调用，phase=audit，独立会话）
 
 输入 = **映射包**（编排器抽取，严格对齐 §3.1.3 的穷举清单：用户问题 + 每候选的
@@ -60,3 +85,15 @@ candidate_id（仅作评分回指键）+ audit_mapping 四字段——源域 / �
 3. `selected_id` = 过线者中**审计总分最高**者（同分按 candidate_id 字典序，确定性 tie-break）；
    全不过线 → null。
 4. 你是独立判官：不得向生成侧妥协，不得因"流程需要一个想法"而放水。
+
+**输出骨架（键名逐字）**：
+
+```json
+{ "audit_scores": [
+    { "candidate_id": "<对应候选>",
+      "scores": { "structural_depth": <0-10>, "domain_distance": <0-10>,
+                  "applicability": <0-10>, "novelty": <0-10>,
+                  "unexpectedness": <0-10>, "non_obviousness": <0-10> },
+      "decision": "<pass|fail>", "rationale": "<中文理由>" } ],
+  "selected_id": "<candidate_id 或 null>" }
+```

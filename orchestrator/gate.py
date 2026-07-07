@@ -97,7 +97,19 @@ class StubGate:
             v = self.schemas.validator_for_artifact(filename)
             for e in v.iter_errors(payload):
                 errors.append(f"{filename}: {e.json_path} {e.message}")
+                # 展平 oneOf/anyOf 的子错误：顶层「不 valid under any …」不含具体键名，
+                # 工人拿不到可行动反馈会反复撞同一堵墙（重试收敛性的关键）
+                for sub in self._iter_context(e, depth=0):
+                    errors.append(f"{filename}: {sub.json_path} {sub.message}")
         return errors
+
+    @staticmethod
+    def _iter_context(err, depth: int):
+        if depth > 3:
+            return
+        for sub in err.context or []:
+            yield sub
+            yield from StubGate._iter_context(sub, depth + 1)
 
     def _level2_refs(self, artifact: Artifact, target_id: Optional[str] = None) -> List[str]:
         """引用完整性（M0 范围）：产物所引 id 在状态 / 产物索引 / 同批 local_key 中真实存在。"""

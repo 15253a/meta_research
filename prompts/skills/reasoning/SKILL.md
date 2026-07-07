@@ -28,9 +28,12 @@
 
 **先判轮型**（context_pack 固定锚标明 route）：
 
-- **bootstrap**：只做「出首题」——tree_ops=create_root（首题直接对齐 goal 成功谓词、
-  可由证据关闭；**带 `local_key`，如 "root"**）+ selection 选它攻坚
-  （`next_question_id` 填该 local_key，编排器同事务解析为真实 id）。不答题。
+- **bootstrap**：只做「出首题」——tree_ops 恰一条 op，**精确键**：
+  `{"op":"create_root", "local_key":"root", "text":"<首题一句话>", "rationale_md"?}`
+  （问题正文的键是 **text**，不是 question_md/题面等自造名）；selection 选它，
+  **intent 按 R3 预算规则定**：est_cost ≤ B(t) → attack；**est_cost > B(t) → decompose**
+  （下一轮分解首题，别硬塞进一轮）。`next_question_id` 填该 local_key（编排器同事务
+  解析为真实 id）。不答题。
 - **decompose**：对选中的超预算问题写子问题（add_children，受树规模护栏：
   max_children_per_node / max_decompose_depth）+ selection 选一个子问题攻坚。不答题。
 - **goal_amend**：消费 goal_amend directive → tree_ops=amend_goal（+按需
@@ -58,9 +61,18 @@ revalidate/import_reference，须带 `parent_question_id`——诊断/后续挂�
 **R3 选择出题**（selection，必产）：对 open（含 inconclusive）集**逐个**四元打分并全程留痕：
 `score = w1·expected_gain + w2·info_gain − w3·cost_norm + c·√(ln N/(1+visit)) + directive_adjust`
 （权重从 context_pack 注入的 policy acquisition 节取；N=总轮数）。与单轮预算 B(t) 比较定
-next_intent：最优问题 est_cost ≤ B(t) → attack；> B(t) → decompose（选该问题）；终止三判据
-（连续低分 / 预算耗尽 / 目标谓词满足）任一满足 → terminate（next_question_id=null +
-terminate_reason_md）。**你只产 selection、不写 route**（route 由编排器派生）。
+next_intent：最优问题 est_cost ≤ decompose_threshold×B(t) → attack；超过 → decompose
+（选该问题；threshold 与 B_t 均在采集打分参数区注入，默认 threshold=1.0）；终止三判据
+（连续低分 / 预算耗尽 / 目标谓词满足）任一满足 → terminate。
+可选集 = 固定锚给出的可调度问题集（含本轮 Qn——若它被置 inconclusive）∪ 同批 tree_ops
+新建题（用 local_key 引用）。**证据不足 ≠ 终止**：Qn 没答上来时通常重选 Qn（换 idea 再攻）
+或 decompose，terminate 只认三判据（连续低分 / 预算耗尽 / 目标谓词满足）。
+**selection.json 精确键（顶层只许这四个）**：`next_question_id`（terminate 时为 null）·
+`next_intent` · `scores`（数组名是 **scores**，不是 scoring/评分）· `terminate_reason_md`
+（**仅 terminate 时给字符串；非 terminate 直接省略该键，不要写 null**）。
+scores 每项只许：`question_id / score / est_cost / expected_gain / info_gain / cost_norm /
+ucb / directive_adjust / rationale_md`（不要自加 visit 等键——visit 已在问题卡里）。
+**你只产 selection、不写 route**（route 由编排器派生）。
 
 **R4 收尾**：md 写 cycle_report 正文（中文），含：本轮四阶段结果一句话链、证据与结论、
 打分表摘要、下一步与理由。
