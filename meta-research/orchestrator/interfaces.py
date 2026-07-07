@@ -97,12 +97,18 @@ class PlanOutcome:
 
 @dataclass
 class Cycle:
-    """一轮（过程侧对象，§1.3.3）。M0 由内存 StateStore 持有，M1 落 SQLite。"""
+    """一轮（过程侧对象，§1.3.3）。M0 由内存 StateStore 持有，M1 落 SQLite。
+
+    next_question_id / next_intent 由 persist_selection 落（§4.2.4）；
+    terminate ⇒ next_question_id=None 是持久停机标志（§4.4.6）。
+    """
     cycle_id: str
     status: str = "created"            # created/…/done/failed/aborted（§4.2.1）
     route: Optional[Route] = None
     question_id: Optional[str] = None  # 本轮攻坚目标 Qn（reasoning-only 轮可空）
     stage_cursor: Optional[Stage] = None
+    next_question_id: Optional[str] = None
+    next_intent: Optional[Intent] = None
 
 
 @dataclass
@@ -172,8 +178,23 @@ class StateStore(Protocol):
     def set_route(self, cycle_id: str, route: Route) -> None: ...
 
     def persist_selection(self, cycle_id: str, sel: Selection) -> None: ...
+    # 同批 local_key（tree_ops 的 create_root/add_children/spawn_question 所建）由
+    # StateStore 在同一事务内解析为真实 id 后再校验（§6.10）——调用方不做穿线。
 
     def apply_tree_ops(self, cycle_id: str, ops: List[Dict[str, Any]]) -> None: ...
+
+    def close_question(self, cycle_id: str, question_id: str, verdict: str,
+                       evidence: List[Dict[str, Any]], answer_md: str) -> str:
+        """关问状态迁移（answered/refuted + answer 登记 + resolve_deps）。
+
+        M0 归属说明：业务判据（I3 证据合法性）在 Gate 第三级（M1 落 gate_close_question）；
+        状态迁移在 StateStore（与 Gate 共用同一写服务，§4.1.1）。返回 answer_id。
+        """
+        ...
+
+    def release_question(self, question_id: str) -> None:
+        """active→open 释放（cycle failed/aborted / dependency_wait；不增 visit，§4.2.3）。"""
+        ...
 
     def mark_inconclusive(self, question_id: str) -> None: ...
 

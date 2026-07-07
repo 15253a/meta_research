@@ -5,24 +5,23 @@
 - policy.yaml 解析且过 schema = 运行前提 #4（§7.5）；
 - goal_brief.md frontmatter 含合法 predicate_json = 运行前提 #2（缺失/非法 → 启动失败，§4.6.7）。
 """
-import json
-from pathlib import Path
-
 import pytest
 import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
 from conftest import (
-    FIXTURES_DIR, SCHEMAS_DIR, SYSTEM_ROOT,
+    SCHEMAS_DIR, SYSTEM_ROOT,
     iter_fixture_cases, load_json, load_schema, make_validator,
 )
 
 STAGE_SCHEMAS = [
-    # 四阶段最终产物 + sidecar + policy（Gate 校验对象）
+    # 四阶段最终产物 + policy（Gate 校验对象）
     "idea_set", "plan", "bundle_target",
     "answer", "tree_ops", "selection",
-    "resource_request", "policy",
+    "policy",
+    # sidecar（非 Gate 产物：schema 校验后经 interaction_request_create，不入研究库，§6.11）
+    "resource_request",
     # 过程产物（runner_call 级契约：生成草稿 / 判官 / 评审输出，驱动器消费）
     "idea_set_draft", "idea_audit", "plan_review",
 ]
@@ -121,47 +120,5 @@ def test_policy_defaults_match_appendix_c_spotchecks():
 
 
 # ---------------------------------------------------------------------------
-# 4. goal_brief.md：frontmatter 契约（运行前提 #2；缺失/非法 → 启动失败）
-# ---------------------------------------------------------------------------
-
-def parse_goal_brief(path: Path) -> dict:
-    """解析研究目标书 frontmatter（§4.6.7 机械校验的最小实现；CP1.3 编排器复用同规则）。
-
-    返回 frontmatter dict；不合契约即抛 ValueError（对应「启动失败并报错」）。
-    """
-    text = path.read_text(encoding="utf-8")
-    if not text.startswith("---\n"):
-        raise ValueError("goal_brief 缺 YAML frontmatter（须以 --- 开头）")
-    end = text.find("\n---\n", 4)
-    if end < 0:
-        raise ValueError("goal_brief frontmatter 未闭合（缺结尾 ---）")
-    front = yaml.safe_load(text[4:end + 1])
-    if not isinstance(front, dict) or "predicate_json" not in front:
-        raise ValueError("goal_brief frontmatter 缺 predicate_json 字段")
-    predicate = front["predicate_json"]
-    if not isinstance(predicate, dict):
-        raise ValueError("predicate_json 须为合法 JSON 对象")
-    json.dumps(predicate)   # 可 JSON 序列化 = 合法 JSON（YAML 特有类型在此被拒）
-    body = text[end + 5:].strip()
-    if not body:
-        raise ValueError("goal_brief 缺中文正文")
-    return front
-
-
-def test_goal_brief_frontmatter_valid():
-    front = parse_goal_brief(SYSTEM_ROOT / "input" / "goal_brief.md")
-    assert front["predicate_json"]["metric_id"] == "accuracy"
-
-
-def test_goal_brief_negative_missing_predicate(tmp_path):
-    bad = tmp_path / "goal_brief.md"
-    bad.write_text("---\ntitle: 没有谓词\n---\n\n正文\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="predicate_json"):
-        parse_goal_brief(bad)
-
-
-def test_goal_brief_negative_no_frontmatter(tmp_path):
-    bad = tmp_path / "goal_brief.md"
-    bad.write_text("# 只有正文\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="frontmatter"):
-        parse_goal_brief(bad)
+# 4. goal_brief.md：frontmatter 契约（运行前提 #2）——唯一实现在 orchestrator.goalbrief，
+#    解析与正负例测试见 tests/test_orchestrator.py（防两份规则漂移）。
