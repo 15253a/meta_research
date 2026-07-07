@@ -38,6 +38,6 @@
 - 结论：**通过**。
 
 ## 遗留 / 回退
-- **⚠️ 本检查点构建期间发生工作区文件丢失事件**：08:20 左右 `build_log/` 目录被外部原因清空（本 session 未执行任何删除；目录 mtime 08:20，介于 0004 记账完成 ~08:10 与自验 ~08:50 之间，原因未知——疑似外部误操作或清理进程）。已用 `git restore --staged --worktree build_log/` 从 HEAD 完整恢复（INDEX.md md5 与 HEAD 一致）。**未入库的 implement_note.md 同样暴露于此风险**——这正是本次用户选 B（ROADMAP 兜底）的现实佐证。若再发生：先 `git status` 看 D 记录，再 `git restore --staged --worktree <path>` 恢复；勿把意外删除提交进检查点。
+- **⚠️ 本检查点构建期间 `build_log/` 工作区文件被清空**：08:20 左右目录被清空（本 session 未执行任何删除；**事后用户确认：系用户手动清理，非环境故障**）。已用 `git restore --staged --worktree build_log/` 从 HEAD 完整恢复（INDEX.md md5 与 HEAD 一致）。教训仍成立：**git 之外的工作区文件（含未入库的 implement_note.md）不受保护**——这正是本次用户选 B（ROADMAP 兜底）的现实佐证。若再遇 `git status` 出现莫名 `D` 记录：先与用户确认是否有意清理，无意则 `git restore --staged --worktree <path>` 恢复；勿把意外删除提交进检查点。
 - 待办（承 0001/0003/0004，需用户）：`.claude/settings.local.json` 放行规则仍未落地。
 - 回退：`git revert ccfcdb8`（及本日志提交）。
