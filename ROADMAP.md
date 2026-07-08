@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步③（M2）进行中**——CP3.1（2110f02，SqliteCompiler 确定性四区包）已完成；下一步 CP3.2（Recall 四级 + 复用判定 O(1)）。步①（M0）、步②（M1，CP2.1–2.4）已完成。
+- 进行中的步 / 检查点：**步③（M2）进行中**——CP3.1（2110f02，SqliteCompiler 确定性四区包）+ CP3.2（1a099fc，Recall 四级 + 复用判定 O(1)）已完成；下一步 CP3.3（观测摘要进锚点 + status_card + authorizer 负例 + import deferred 断言，收尾 M2）。步①（M0）、步②（M1，CP2.1–2.4）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -51,7 +51,7 @@
 - 状态：**进行中**
 - 检查点（模型切，边走边补）：
   - [x] CP3.1 SqliteCompiler：DB→确定性四区 context_pack（**字节一致 diff=0**，render 单读快照 + ORDER BY 定序）+ applicability 六枚举徽标 + manifest 纯函数 — commit 2110f02（build_log 0014）
-  - [ ] CP3.2 Recall 四级可停 + **复用判定 O(1) selector（§4.1.5）+ EXPLAIN QUERY PLAN 证明走测量索引** + Ctx 深潜（retrieval/refs 填入 render 单读事务）
+  - [x] CP3.2 Recall 四级可停（卡片 LIKE+faceted tag / 变体矩阵 / 测量索引 / ctx-fetch）+ **复用判定 O(1) selector（§4.1.5）+ EXPLAIN QUERY PLAN 证走测量索引（e/mr 均走索引、无全表扫）** + Ctx 深潜 — commit 1a099fc（build_log 0015）
   - [ ] CP3.3 观测摘要段进 reasoning 锚点（从 execution_observation）+ status_card 发布（§4.6.6 封闭字段）+ authorizer 拒读负例 + import deferred 不产 target 断言
   - > 注：架构同 M1——M2 交付真实 DB-backed 组件（读 DB），M0 driver 仍走桩、基线绿；M3 Advancer 接。嵌入语义召回 defer（无模型，用 FTS5+tag+测量索引）。
 

@@ -4,20 +4,20 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 03:00 ｜ 位置：步③（M2）· CP3.1 已提交，CP3.2 待开工
-- 检查点状态：空闲（CP3.1 记账完成；CP3.2 未开工）
+- 更新：2026-07-08 ｜ 位置：步③（M2）· CP3.2 已提交，CP3.3 待开工
+- 检查点状态：空闲（CP3.2 记账完成；CP3.3 未开工）
 
 ## M2 检查点计划（步③）
 - [x] **CP3.1** SqliteCompiler：DB→确定性四区包（字节一致 diff=0；render 单读快照 + ORDER BY 定序 + json sort_keys + budget float + pack_hash \x00 含 refs）+ applicability 六枚举徽标 + _open_set 限 goal_id 含本轮 Qn + manifest 纯函数（sources 落 ContextPack）— commit 2110f02 / build_log 0014
-- [ ] **CP3.2** Recall 四级可停（§3.6.2：卡片→变体矩阵→测量索引→ctx-fetch）+ **复用判定 O(1) selector（§4.1.5 规范 SQL）+ EXPLAIN QUERY PLAN 证明走测量索引 (variant,protocol,ver)、非全表扫** + Ctx 深潜（reference：`<scratchpad>/M2_refsheet.md` §3.6.2/§4.1.5，换 session 需重跑 Explore）
-- [ ] **CP3.3** 观测摘要段进 reasoning 锚点（从 execution_observation 渲 nan/loss_trend…，替 CP3.1 占位）+ status_card 发布（§4.6.6 封闭字段）+ authorizer 拒读负例（gate 读 observation/v_trajectory 被拒，CP2.3 已焊、此处证「摘要进 pack 但不进 gate_input」）+ import deferred 不产 target 断言
-- **CP3.2 必接（codex 第2轮前瞻，见 build_log 0014）**：retrieval/refs 的 DB 读须放进 render 现有的**同一 BEGIN…COMMIT** 读事务；refs 规范化形式明确（若 Ref 变对象则 asdict+sort_keys；pack_hash 已把 json.dumps(refs) 纳入定口径）。
-- 架构同 M1：M2 交付真实 DB-backed 组件（读 DB），M0 driver 仍走桩、基线绿；M3 Advancer 接。SqliteCompiler 只读连接 mode=ro 由 M3 调用方传入。嵌入 defer（无模型，用 FTS5+tag+测量索引）。
+- [x] **CP3.2** Recall 四级可停（§3.6.2：卡片 LIKE+faceted tag→变体矩阵→测量索引→ctx-fetch）+ **复用判定 O(1) selector（§4.1.5 规范 SQL）+ EXPLAIN 证走测量索引（e 走 sqlite_autoindex_evaluation_1、mr 走 uq_mr_agg、无 SCAN e/ea/mr）** + Ctx 深潜（isascii+isdigit 双护）— commit 1a099fc / build_log 0015
+- [ ] **CP3.3** 观测摘要段进 reasoning 锚点（从 execution_observation 渲 nan/loss_trend…，替 CP3.1 占位 compiler_sqlite.py:98）+ status_card 发布（§4.6.6 封闭字段）+ authorizer 拒读负例（gate 读 observation 被拒，CP2.3 已焊、此处证「摘要进 pack 但不进 gate_input」）+ import deferred 不产 target 断言 —— **收尾步③ M2**。reference：`<scratchpad>/CP3.3_refsheet.md`（换 session 需重跑 Explore）
+- 架构同 M1：M2 交付真实 DB-backed 组件（读 DB），M0 driver 仍走桩、基线绿；M3 Advancer 接。SqliteCompiler 只读连接 mode=ro 由 M3 调用方传入。嵌入 defer（无模型，用 card_md LIKE + baseline_tag + 测量索引）。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**步②（M1）资产层落地——完成**：CP2.1（6d45b53 M1a-DB）+ CP2.2（be84a90 M1b）+ CP2.3（d07c6c6 M1a-Gate）
-+ CP2.4（1182a5a M1c）。步级验证 267 全绿（§7.1 M1 逐项过，见 build_log 0013）。**下一步 步③（M2）**。
+**步③（M2）推进中**：CP3.1（2110f02 编译器四区包）+ CP3.2（1a099fc Recall+复用 O(1)）已提交，均 codex APPROVE。
+**下一步 CP3.3 收尾 M2**（见下「下一步动作」）。测试基线 298 绿。
+**已完成**：步①（M0）+ 步②（M1）CP2.1–2.4 全绿（267）+ 步③ CP3.1/CP3.2。
 
 ## M1 交付的真实资产层（未接 driver；M3 Advancer 才接，M0 driver 仍走桩、基线保持绿）
 - `orchestrator/database.py`：附录 A 冻结 DDL 建库 + checksum/计数/版本三重锁。
@@ -35,10 +35,20 @@
 - import 仍 deferred（占位 baseline + pending dep）、**不产 target**。
 - 桩→真：Compiler / Ctx / Recall（M0 固定模板/假数据 → M2 换真：FTS5+嵌入+测量索引）。
 
-## 下一步动作（按序）
-1. **精读 M2 规格**（建议 Explore 提取，省上下文）：第一部分 §4.5（上下文编译器四区包/确定性契约）、§3.6.2（渐进四级召回）、§4.7（运行观测摘要）、§4.6.6（status_card）、第二部分 §6.7（编译器实现）/§6.10（Compiler/Ctx/Recall 换真行）。看现有 `orchestrator/compiler.py`（StubCompiler，M0 固定模板 + manifest 溯源）作起点。
-2. **裁量 M2 检查点切分**（建议：CP3.1 Compiler 确定性四区包换真 + 字节一致；CP3.2 Recall 四级召回 + 复用判定 O(1)/EXPLAIN；CP3.3 观测摘要进锚点 + status_card 发布 + authorizer 负例）。精读后定，落 implement_note + ROADMAP。
-3. 每检查点照 §5 循环：内审 Opus 子代理 + codex 外审 ≤2 轮 → commit → build_log。
+## 下一步动作（按序）—— CP3.3（收尾 M2）
+CP3.3 规格全提取见 `<scratchpad>/CP3.3_refsheet.md`（字段清单 + 铁律 + 当前占位行号）。四件事：
+1. **观测摘要段真渲染**：替 `compiler_sqlite.py:98` 占位。reasoning stage 固定锚从 `execution_observation`
+   渲 nan_seen/divergence_flag/oom/warning/retry/last_loss/loss_trend/wall_clock_sec（append-only；source∈parser/codex，
+   codex 只写 digest）。确定性纪律：ORDER BY 定序、无 wall-clock/随机、纳入 pack_hash。**铁律**：观测只影响调试/复现/
+   下一步评估，不得作 novelty/success/correctness/关问题选择输入（防绕过门禁）。
+2. **status_card 发布**（§4.6.6 封闭字段，prose 契约、非核心 DDL）：snapshot_cycle/goal 版本摘要/active question 卡/
+   cycle.status·route/selection intent+最近 selection DECISION 摘要/预算(B(t)·已花·剩余)/open·inconclusive 计数/
+   heartbeat ref/pending 文件请求摘要。M2 先做发布函数（真 advance 接入=M3）。呈现已关闭结论处须 join answer_applicability 徽标。
+3. **authorizer 拒读负例**：证观测摘要进 pack（编译器普通只读连接读到 execution_observation），但 gate authorizer
+   拒读 execution_observation（CP2.3 SqliteGate 已焊 9 表 deny；此处加测试证「摘要进 pack 但不进 gate_input」分离）。
+4. **import deferred 不产 target 断言**：import 三写入（external_import selected + 占位 baseline planned + question_dep pending）
+   跑完后，build_target 表无新增行（M1–M3 deferred，M4 才物化产 run.kind=import）。DeferredImporter（importer.py）已实现三写入，此处加断言测试。
+5. 照 §5 循环：内审 Opus 子代理 + codex 外审 ≤2 轮 → commit → build_log 0016 → 跑步③ M2 步级验证（§7.1 M2 全项）收尾步③。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
@@ -48,5 +58,5 @@
 - **确定性纪律（M2 核心）**：context_pack 字节一致——无 wall-clock/随机/dict 无序；ORDER BY 定序；manifest 溯源。
 - gate/文件库测试须**文件库**（门禁 mode=ro 独立连接）；importer/interaction/statestore 可 :memory:（单 WriteDaemon 连接）。
 - DDL 字节冻结：改 schema 同步 database.py 的 MIGRATION_SHA256（走评审）。
-- 测试基线现 **267**；端到端 `scripts/run_m0_acceptance.py --cycles 5`（花真 token，走 M0 桩栈）。
+- 测试基线现 **298**（M0/M1 267 + CP3.1 16 + CP3.2 15）；端到端 `scripts/run_m0_acceptance.py --cycles 5`（花真 token，走 M0 桩栈）。
 - 悬案（build_log 0011/0012）：resolve_deps dead_end 依赖（保 M0 语义，M3/M6 定）；跨版 child_answer applicability（现 try/except 兜底，M3 goal-amend 验）。
