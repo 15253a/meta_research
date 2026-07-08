@@ -4,30 +4,34 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.1
-- 检查点状态：自验通过（498 绿=489+9）→ 内审/外审中。改动=stopcontroller.py 新建（§4.4.6 τ 判据①分数
-  衰退 in-process 计数/②预算耗尽 DB 派生/durable global_stop）+ advancer.run_cycles 接线（启动查
-  already_stopped + 每轮 check_after_round）+ policy.budget.session_max 新增（决策性，schema 同步）+
-  test_stopcontroller.py(9)。**注意：policy.yaml/schema 改动是决策性，外审重点。**
+- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.2 开工
+- 检查点状态：空闲（CP7.1 已完成 da38b2f + docs 记账；CP7.2 = 真 Codex 生产装配 + 全系统入口 run.py）
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**步⑥（M5）已完成**：CP6.1（702071e 保守分类器+directive 生命周期）6.2（28c6117 query 只读应答链+
-status_card 发布）6.3（bee3b9e 通知矩阵 outbox+文件请求全流水+全局等待）。§7.1 M5 步级验证过
-（build_log 0028，64 测联合勾兑）。**已完成：M0–M5 全部**。测试基线 **489 绿**。
-**下一步 步⑦（M6）**：长跑 + 验收剧本——数百轮无人值守不漂移；双模式 A/B 实测定默认；§7.3 机制剧本
-（happy+失败路径）；§7.4 研究能力任务 T1/T2。**开工前确认 OPEN #4（paper-gap 谓词）**——全自动模式：
-自主裁决 + 落受审载体 + build_log 记录。
+**M0–M5 全完成；M6 进行中**：CP7.1（da38b2f 长跑自终止安全网 §4.4.6 τ）已完成并记账。测试基线 **502 绿**。
+M6 refsheet 在 scratchpad/M6_refsheet.md（含 §7.3 机制剧本 4 场景 + §7.4 T1/T2 + OPEN #4 + τ 三停）。
+**建造/执行边界**（已裁决入 ROADMAP）：M6 建造=让系统「完整运行进入全自动」的机器（自终止✓ + 真 Codex
+装配 + 双模式 + §7.3 机制集成验收）；§7.4 T1/T2 真跑（数百轮×24h 真 EEG）属运维执行、非本轮建造。
 
-## 步⑦（M6）开工序（下一 session 从这里接）
-1. **精读 M6 规格**：reference/ 第三部分 §7.1 M6 行原文 + §7.3 机制验收剧本 + §7.4 研究能力任务
-   （T1/T2）+ OPEN.md #4（paper-gap 谓词）。建议 Explore 提取到 scratchpad refsheet 省上下文。
-2. **OPEN #4 自主裁决**（全自动）：paper-gap 谓词定义落受审制品（goal_brief/policy/schema 视规格），
-   build_log 记裁决理由。
-3. **裁量 M6 检查点切分**（落 ROADMAP+本文件）。粗切设想：CP7.1 长跑 harness（数百轮驱动脚本+漂移
-   断言+资源看护）；CP7.2 §7.3 机制剧本逐条（happy+失败路径）；CP7.3 §7.4 T1/T2 研究任务 + 双模式
-   A/B + 硬化清单选做；按需增减。
-4. 照 §5 循环：内审 Opus 子代理 + codex 外审 ≤2 轮 → commit → build_log 0029 起。
+**CP7.2 目标**（真 Codex 生产装配——让系统真能全自动跑起来）：
+1. **StageProvider 适配器**（新）：把 CodexRunner 包成 advancer/attack_stages 消费的 provider 回调——
+   compiler.render(cycle,stage) → runner.run_task(system_prompt, skill, pack) → 解析信封 {files, md} →
+   逐产物 schema 校验（artifact_parse 重试 ≤2，§4.2.3）→ 返回 files dict。参考 driver.py:405/450 的
+   真 Codex 调用+解析逻辑（那是 M0 桩栈版，本次绑真组件）。system_prompt/skill 取 prompts/ + SKILL.md。
+2. **全系统装配入口 run.py**（新）：goalbrief.parse → database.connect+建库 → 装配 WriteDaemon/
+   SQLiteStateStore/SqliteCompiler/SqliteGate/AttackStages/ImportWorker/Console/Mediator/notify/
+   StatusPublisher/StopController → SqliteAdvancer(全部注入) → run_cycles。CLI：目标书路径 + 工作目录。
+3. **kill-9 真栈恢复冒烟**：装配入口在真组件上跑几轮 + 中途杀 + 重启续跑终库一致（复用 M3 范式）。
+   真 Codex 冒烟可选（1 轮 bootstrap，环境允许时），确定性验证用 mock provider。
+
+## 步⑦（M6）CP7.2 下一步动作（按序）
+1. 精读 driver.py（M0 真 Codex 调用+信封解析+schema 校验+失败语义 §4.2.3）+ interfaces.py Runner/
+   provider 签名 + attack_stages 的 p dict 期望 + prompts/system_prompt.md + 四阶段 SKILL.md 路径。
+2. 写 orchestrator/stage_provider.py（StageProvider：render→run→parse→validate→files；四阶段+reasoning
+   +attack idea/plan/bundle 全覆盖；artifact_parse 重试）。
+3. 写 run.py（装配入口）。测试：mock runner 端到端装配跑通 + kill-9 恢复 + schema 校验失败重试。
+4. §5 循环：内审 Opus → codex ≤2 轮 → commit → build_log 0030。
 
 ## 已交付组件全景（M0–M5；M0 driver 走桩栈并存、基线绿）
 - 存储/守卫：database（冻结 DDL 三重锁）/writedaemon（单写短事务）/statestore_sqlite/gate_sqlite
