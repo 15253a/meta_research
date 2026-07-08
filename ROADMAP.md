@@ -15,7 +15,10 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑥（M5）已完成**（CP6.1–6.3；§7.1 M5 步级验证 64 测通过，build_log 0028）。**下一步 步⑦（M6）长跑 + 验收剧本**（开工前确认 OPEN #4）。步①–⑤（M0–M4）已完成。
+- 进行中的步 / 检查点：**M0–M6 建造面全部完成**（步①–⑦；CP7.5 收尾，535 测绿）。系统「完整运行、进入
+  全自动」达成——reasoning-only 全自动闭环真 Codex CLI 端到端跑通（CP7.3 冒烟 ce11d00）。剩余非建造：
+  §7.4 T1/T2 真跑（运维执行）+ 双模式 A/B 实测 + real-Codex attack（待用户裁 plan 制品契约缺口，见步⑦
+  「设计发现」）。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -143,7 +146,9 @@
 
 ### 步⑦（M6）长跑 + 验收剧本
 - 验证方法（§7.1 M6 行 + §7.3/§7.4）：数百轮无人值守不漂移；双模式 A/B 实测定默认；§7.3 机制剧本（happy+失败路径）与 §7.4 研究能力任务（T1/T2）全通。开工前确认 OPEN #4。
-- 状态：**进行中**（2026-07-08 开工）
+- 状态：**建造面已完成**（2026-07-08；CP7.1–7.5，535 测绿；系统 reasoning-only 真 Codex 全自动跑通）。
+  剩余 = 运维执行（§7.4 T1/T2 真跑、双模式 A/B 实测）+ 一处待用户裁的设计缺口（plan 制品契约→real-Codex
+  attack）。
 - **建造 / 执行边界（全自动裁量，2026-07-08）**：M6 建造面 = 让系统「完整运行、进入全自动」的机器
   （自终止安全网 + 真 Codex 装配入口 + 双模式 + §7.3 机制集成验收）；§7.4 T1/T2 是**真算力多日运维执行**
   （数百轮×24h 真 EEG），非本轮建造可完成——建造交付 = 系统可全自动启动 T1/T2 且机制验收过，跑到科学
@@ -176,8 +181,16 @@
     gate 消费侧 fail-closed / 人机 §7.3-item4 三向负例）——**mock provider 驱动真组件**端到端串联断言
     —— commit 6be7566（build_log 0032；剧本 3 验消费侧 gate 拒 suspect 证据；I2 绑 run.status、I3 绑
     answered↔证据；evidence.kind CHECK 显式 raises）。
-  - [ ] CP7.5 M6 步级验证收尾：长跑漂移断言（mock 数百轮 kill-9 一致 + τ 自停）+ §7.3 全过 + §7.1 M6
-    行勾兑。
+  - [x] CP7.5 M6 步级验证收尾：长跑步级验证（守卫上界内不漂移 + 中途重启终库一致 + τ 价值衰退自停）
+    —— commit f45dd6f（build_log 0033）。诚实裁量：pure reasoning-only 受 tree_guard 约束（有限深度树），
+    「数百轮」需 attack 答问+前沿更新（阻于 plan 契约缺口）——验尺度不变三性质，非字面数百轮。
+- 步级验证结果：**建造面通过**（M6 §7.1 建造可达判据全落：CP7.1 τ 自终止安全网 / CP7.2 真 Codex
+  StageProvider / CP7.3 run.py 全系统入口[**真 Codex CLI 冒烟跑通 reasoning-only 全自动闭环**] / CP7.4
+  §7.3 机制验收[主链路 I1/I2/I3+import 三失败+日志 suspect fail-closed+人机负例] / CP7.5 长跑不漂移+
+  可恢复+τ 自停）。**系统「完整运行、进入全自动」达成**（reasoning-only 真 Codex 端到端；535 测绿）。
+  **未落（属运维执行 / 待用户裁 plan 契约）**：§7.4 T1/T2 真跑（真 Codex+真 EEG 数百轮×24h）+ 双模式
+  A/B 实测定默认 + real-Codex attack（judge provider + idea/plan↔schema 校准 + sidecar 桥，须先裁 plan
+  制品契约缺口方向）。这些是**运维执行 + 一处待用户定向的设计裁决**，非本轮建造可完成（见上「设计发现」）。
 
 - **⚠ 设计发现（2026-07-08，CP7.4 勘查）· plan 制品契约二分 → real-Codex attack 阻塞**：
   冻结 `plan.schema` 的 target 字段（**抽象层**：target_key/spec_md/claim/eval_action/…）与

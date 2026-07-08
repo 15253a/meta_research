@@ -6,6 +6,7 @@
 
 ---
 
+- [0033](0033-cp75-longrun-verification.md) — CP7.5 M6 长跑步级验证 **——收尾步⑦ M6 建造**（不漂移[守卫上界内 question_dep/父指针/全 done]/可恢复[中途重启终库逐字节一致]/τ 自停[新实例拒推进]；诚实裁量：数百轮真跑属运维）· commit `f45dd6f` · 验证: 通过（pytest 535/535，3 新用例）
 - [0032](0032-cp74-mechanism-scenarios.md) — CP7.4 §7.3 机制验收剧本（主链路 I1/I2/I3 因果链 / import 三失败 / 日志 suspect→gate 消费侧 fail-closed / 人机 §7.3-item4 三向负例；mock 驱动真组件、非真 Codex）· commit `6be7566` · 验证: 通过（pytest 532/532，8 新用例）
 - [0031](0031-cp73-run-entrypoint.md) — CP7.3 run.py 全系统装配入口（一条命令：真组件+StageProvider(真 Codex)→run_cycles；**真 Codex CLI 冒烟通过**；只读连接单写边界；DB 权威 goal_body；τ/阻断端到端）· commit `ce11d00` · 验证: 通过（pytest 524/524，9 新用例 + 真 Codex 冒烟 exit 0）
 - [0030](0030-cp72-stage-provider.md) — CP7.2 StageProvider 真 Codex 生产装配（run+信封解析+逐产物 schema 校验+artifact_parse 重试 封成真组件 (cyc,pack)→files；answer 语义下沉组件；sidecar fail-loud；真 SqliteAdvancer e2e）· commit `2ce750e` · 验证: 通过（pytest 515/515，13 新用例）
