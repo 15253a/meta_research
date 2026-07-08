@@ -99,8 +99,10 @@
     （content_hash 锚校验 + P6 复算）+ **parser_result_suspect 真派生**（当前 (version,policy_hash) 过滤 +
     stale≠clean fail-closed + 多 log OR；替 M2 桩，复用判定/关问证据拒接真）+ **policy observation 节
     （OPEN #5 落地闭）** — commit 215c694（build_log 0022）
-  - [ ] CP5.4 attack 轮 advance 全链（idea/plan/bundle 阶段推进 + phase_commit 幂等 + 两段提交 + bundle_cursor 续跑 +
-    恢复扩展到 attack 阶段）
+  - [x] CP5.4 attack 轮 advance 全链**（首次全链跑通）**：idea/plan 单事务阶段 + bundle 逐目标两段提交（真子进程
+    训练/评估 + 双评审 + 注册入池）+ phase_commit 幂等 + 结构恢复（5 类崩溃缝隙楔死/洗白/分裂全修：补登幂等锚校验、
+    eval-final 续注册 exit 侧车、judge replay-safe、reasoning 产物持久化、终态早退落 pc）+ reasoning 真证据关问 —
+    commit 6af22cf（build_log 0023）。M5/M6 硬化：注册段合一事务、route plan 后特化
   - [ ] CP5.5 import 物化（**OPEN #6 落地**：worker cycle + clone pinned/manifest 供应链闭包 + 沙箱 smoke + 出厂 eval +
     gate_register_baseline 占位→legal + resolve_deps + pool_publish）+ 失败路径负例全拒
   - [ ] CP5.6 语义判据 5 判例 + M4 步级验证收尾

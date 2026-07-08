@@ -4,15 +4,15 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑤（M4）· CP5.3 已提交，CP5.4 待开工
-- 检查点状态：空闲（CP5.3 记账完成；CP5.4 未开工）。测试基线 409 绿。
+- 更新：2026-07-08 ｜ 位置：步⑤（M4）· CP5.4 已提交，CP5.5 待开工
+- 检查点状态：空闲（CP5.4 记账完成；CP5.5 未开工）。测试基线 421 绿。**系统首次全链跑通**（bootstrap→attack 真训练/评估/评审/入池/真证据关问→terminate）。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**步⑤（M4）进行中**：CP5.1（7d64ec5 执行生命周期 gates）+ CP5.2（439d716 注册/评审 gates + subject manifest）+
-CP5.3（215c694 真执行 harness + 确定性 parser + suspect 真派生；OPEN #5 闭）已提交。**下一步 CP5.4
-（attack advance 全链：idea/plan/bundle 阶段推进 + phase_commit 幂等 + 注册段组合 + 管线强制先 ingest 再注册）**。
-**已完成**：步①–④（M0–M3）+ 步⑤ CP5.1/5.2/5.3。测试基线 **409 绿**。
+**步⑤（M4）进行中**：CP5.1–5.3（gates/manifest/harness+parser）+ **CP5.4（6af22cf attack 轮全链——首次全链
+跑通：真训练/评估/双评审/注册入池/真证据关问；5 类崩溃缝隙修复）**已提交。**下一步 CP5.5（import 物化，
+OPEN #6 落地）**。
+**已完成**：步①–④（M0–M3）+ 步⑤ CP5.1–5.4。测试基线 **421 绿**。
 
 ## 步⑤（M4）目标（§7.1 M4 行）——真执行 + 真 log + import 物化
 验收（可证伪）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例
@@ -41,21 +41,21 @@ CP5.3（215c694 真执行 harness + 确定性 parser + suspect 真派生；OPEN 
   NotImplementedError；reasoning provider 为注入式（测试确定性替身；真 Codex provider = M4 接，范式在 M0
   driver._run_reasoning_with_retry）。
 
-## 下一步动作（按序）—— CP5.4（attack advance 全链）
-M4 refsheet=`<scratch>/M4_refsheet.md`（session 重启后 scratchpad 清空，需重跑 Explore 提取 §4.2.5/§3.4.1/§6.13）。CP5.4：
-1. **attack 轮 advance**（advancer.py 的 attack NotImplementedError 处接）：idea/plan/bundle 阶段推进——
-   cycle.status 作 stage cursor（idea→plan→bundle→reasoning）+ 注入式 provider（同 reasoning provider 范式；
-   真 Codex provider 范式在 M0 driver._run_with_retry）。plan 落 build_target 行 + required_metric（真 DB）。
-2. **bundle 逐目标两段提交**（§4.2.5）：(i) 执行事实——gate_start_run→harness.run_staged（真子进程）→
-   checkpoint 登记→gate_finish_run + execution_log 入账 + **ingest_observation（管线强制：注册前先 ingest**，
-   否则 suspect=0 无据不疑成绕过）；(ii) 注册段——subject manifest 重算→result_review（注入 judge provider）→
-   gate_register_evaluation→gate_register_baseline/variant→gate_finish_build_target(complete)。目标间串行
-   （结构推导），崩溃从 build_target 状态续。
-3. **phase_commit 幂等**（§4.2.5 键 (cycle,stage,target)+artifact_hash：同键同 hash 跳过、异 hash 拒）——
-   PhaseCommitStore 接真（phase_commit 表已在 DDL；interfaces.py:303 Protocol）。
-4. **恢复扩展**：attack 阶段 kill-9 恢复测试（对齐 CP4.2 范式：阶段边界杀→续跑终库一致）。
-5. 照 §5 循环 → commit → build_log 0023。后续 CP5.5 import 物化（OPEN #6；两处 import NotImplementedError 接）、
-   CP5.6 语义判据 5 判例 + M4 步级验证收尾。
+## 下一步动作（按序）—— CP5.5（import 物化，OPEN #6 落地）
+M4 refsheet=`<scratch>/M4_refsheet.md` §6（session 重启后 scratchpad 清空，需重跑 Explore 提取 §3.6.3/§4.2.1）。CP5.5：
+1. **物化 worker（Advancer 独立入口）**：扫 external_import(selected_for_materialization) 工作队列 → 起
+   **worker cycle**（OPEN #6 裁决已定：route 终身 NULL + 开轮事务内 DECISION(orchestrator,import_worker_cycle)
+   权威标记 + 不产 cycle_report + 研究驱动循环 _resume_or_open 识别 worker 标记交物化 resumer——防误当
+   未 setup 研究轮）。
+2. **物化链**（§3.6.3）：clone pinned revision（toy=复制固定内容文件+revision 校验）→ manifest（供应链闭包
+   hash）→ 沙箱 smoke（真子进程）→ target_ready → 出厂 evaluation（真子进程+register_evaluation 复用）→
+   **gate_register_baseline 把占位 baseline planned→legal**（scope 消费点核 license allow_*）→ resolve_deps
+   机械 satisfied → 原问题回 open 可调度 → pool_publish（=legal，卡片侧写后续）。
+3. **失败路径负例全拒**（§7.1 M4）：license deny→不物化；smoke 失败→不 target_ready；factory eval 失败→
+   不 pool_publish（占位 baseline 留 planned/build_failed、dep 不 satisfied、问题保持不可调度）。
+4. **两处 NotImplementedError 接**：gate_start_build_target(import kind)、gate_register_evaluation(import
+   target)；select_deferred 幂等守卫的 supersession 注记核（M4 无 supersession 则不动）。
+5. 照 §5 循环 → commit → build_log 0024。CP5.6 = 语义判据 5 判例 + M4 步级验证收尾。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
