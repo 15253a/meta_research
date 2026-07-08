@@ -27,6 +27,8 @@
 - import_worker.py — ImportWorker（M4：外部 import 物化——worker cycle[OPEN #6]+供应链 manifest+失败路径全拒）
 - console.py    — Console（M5：保守关键词分类器 + directive 生命周期——润色≠raw 时序/回显确认/按时机消费+DECISION）
 - mediator.py   — Mediator（M5：query 只读应答链——mode=ro+全写拒 authorizer/grounding 校验+模板回退/中介重建）
+- notify.py     — 通知矩阵（M5：outbox 文件队列幂等投递 + directive 7 态/文件请求 3 事件扫描派生 +
+                  FileRequestService 全流水 + make_advancer_precheck 全局等待）
 - runner.py    — CodexRunner（真 codex exec，M0 起即真）
 - goalbrief.py — 启动输入①解析（§4.6.7 机械校验唯一实现）
 """

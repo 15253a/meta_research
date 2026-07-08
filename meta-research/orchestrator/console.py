@@ -216,12 +216,14 @@ class Console:
                                   "ORDER BY consumed_decision_id DESC LIMIT 1")
         return bool(r) and r[0] == "pause"
 
-    def consume_directive(self, *, directive_id: int, cycle_id: str, state=None) -> Dict[str, Any]:
+    def consume_directive(self, *, directive_id: int, cycle_id: Optional[str] = None,
+                          state=None) -> Dict[str, Any]:
         """按时机消费——**单事务内**读校验+效果+DECISION(actor='human', directive_id 回指)+条件更新
         consumed（读写同事务，WriteDaemon 单写串行 → 无 TOCTOU 窗口；条件更新 rowcount 兜底）。
         拒：非 pending；**硬指令未确认**（§7.1 M5「未确认硬指令 consume_directive 拒」）。
-        返回 {kind, effect} 供通知层（applied 事件，CP6.3）。"""
-        ci = _cnum(cycle_id)
+        cycle_id 可空（Advancer 前置检查在开轮前消费 immediate 指令时无在途轮；DECISION.cycle_id/
+        consumed_cycle 本可空）。返回 {kind, effect} 供通知层（applied 事件，CP6.3）。"""
+        ci = _cnum(cycle_id) if cycle_id else None
         with self.daemon.transaction() as conn:
             row = conn.execute("SELECT kind, hardness, status, payload_json FROM directive WHERE id=?",
                                (directive_id,)).fetchone()

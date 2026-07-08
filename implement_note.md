@@ -4,9 +4,12 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑥（M5）CP6.3 开工
-- 检查点状态：构建中（CP6.1=702071e、CP6.2=28c6117 已完成并记账；CP6.3 = 通知矩阵 outbox +
-  文件请求全流水 + 全局等待，收尾 M5）
+- 更新：2026-07-08 ｜ 位置：步⑥（M5）CP6.3
+- 检查点状态：自验通过（482 绿=470+12；M5 步级联合勾兑 57/57）→ 内审/外审中。
+  改动=notify.py 新建（Outbox 文件队列幂等/DirectiveNotifier 7 态扫描派生/FileRequestService
+  create_checked·resolve·cancel/FileRequestNotifier 3 事件[now 注入]/make_advancer_precheck 全局等待）
+  + console.py consume cycle_id 可空 + advancer.py precheck 装配（run_cycles 开轮前+格间查阻断）
+  + tests/test_notify.py(12)。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
