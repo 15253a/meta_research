@@ -1,19 +1,18 @@
 """status_card 构建器（§4.6.6 封闭字段清单）—— 人机控制台的**阶段边界发布派生卡**。
 
-**性质**：派生快照，可从 DB 真相重建 → **不在核心 DDL**（附录 A 无此表，§4.6.2）。故此处是**构建器**，
-不建表、不落库；「阶段边界原子发布」的真接入（advance 在 phase 边界调用 + 写 outbox）= M3。M2 交付：
-从 DB 真相构建**封闭字段集**、确定性可测。
+**性质**：派生快照，可从 DB 真相重建 → **不在核心 DDL**（附录 A 无此表，§4.6.2）。此处 = **构建器**
+（M2：封闭字段集、确定性可测）+ **SqliteStatusPublisher 原子发布器**（M5 CP6.2：advance 阶段边界调用，
+tmp→rename 覆盖 latest 文件；Mediator/应答器只读该发布快照，不读在途 DB）。
 
 **封闭字段**（§4.6.6，顺序固定、集合封闭——不多不少）：
   snapshot_cycle · goal(版本摘要) · active_question(问题卡) · cycle_status/route
   · selection(intent + 最近 selection DECISION 摘要) · budget(B(t)/本轮已花/全局剩余)
   · counts(open/inconclusive) · heartbeat_ref · pending_file_request(pending 文件请求摘要)
 
-**M2 暂缺真源的字段**（诚实置 None + 注明，字段仍在封闭集内，M3 接线填）：
-  - selection.latest_decision：persist_selection 只更新 cycle.next_*（不写 decision 行）；selection DECISION
-    审计行由 advance 落（M3）。M2 的权威 selection 状态 = cycle.next_intent/next_question_id（已渲）。
+**字段真源现状**：
+  - selection.latest_decision：**已接线（M5 CP6.2）**= 本 cycle 作用域最近 decision 摘要（{id,actor,type}）。
   - budget.global_remaining：policy 只有单轮 B_max，无全局会话上限（会话级旋钮，非核心 DDL）→ None。
-  - heartbeat_ref：heartbeat/outbox 是实现层幂等队列、非核心 DDL（§4.6.2）→ None（M3 outbox 落）。
+  - heartbeat_ref：heartbeat/outbox 是实现层幂等队列、非核心 DDL（§4.6.2）→ None（CP6.3 outbox 落）。
 
 **纯函数 / 可测**：不调 wall-clock。pending 请求「已等待时长」= 展示时刻 − created_at，由控制台在展示时算；
 M2 只给锚点 created_at（不在卡内假造时长——精确换算需全系统时区/格式约定，M3 定）。
@@ -21,6 +20,7 @@ M2 只给锚点 created_at（不在卡内假造时长——精确换算需全系
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .budgeting import compute_budget
@@ -50,14 +50,16 @@ def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any], goal_body_
             q = conn.execute("SELECT text, status, visit_count FROM question WHERE id=?", (aq,)).fetchone()
             active_question = {"id": f"q{aq}", "text": q[0], "status": q[1], "visit_count": q[2]}
 
-        # selection：M2 权威状态取自 cycle.next_*（persist_selection 只更新 cycle、不写 decision 行）。
-        # latest_decision（最近 selection DECISION 摘要）审计行由 advance 落（M3）。**此处不写查询**——
-        # selection DECISION 无 goal_id，须按「选出本轮问题的那次选择」定作用域（非全局最新），语义属 M3；
-        # 先留显式 None，防 M3 误当「已接线且正确」而漏 scope（内审 SHOULD：全局 LIMIT 1 会跨 goal 串卡）。
+        # selection：权威状态取自 cycle.next_*（persist_selection 只更新 cycle、不写专门 selection decision）。
+        # latest_decision（M5 CP6.2 接线）= **本 cycle 作用域**最近一条 decision 摘要（decision.cycle_id=ci，
+        # 非全局 LIMIT 1——早前内审 SHOULD：全局最新会跨 goal/轮串卡）。reasoning 落的 create_root/decompose/
+        # answer_review、consume_directive 落的 directive_* 都在此可见；无则诚实 None（如轮刚开）。
+        ld = conn.execute("SELECT id, actor, type FROM decision WHERE cycle_id=? ORDER BY id DESC LIMIT 1",
+                          (ci,)).fetchone()
         selection = {
             "intent": next_intent,
-            "next_question_id": f"q{next_q}" if next_q is not None else None,   # M2 权威选择状态（代 DECISION 摘要"选了哪题"）
-            "latest_decision": None,   # TODO(M3): advance 落 selection DECISION 后，按 cycle 作用域查其摘要
+            "next_question_id": f"q{next_q}" if next_q is not None else None,   # 权威选择状态（"选了哪题"）
+            "latest_decision": {"id": ld[0], "actor": ld[1], "type": ld[2]} if ld else None,
         }
 
         # §4.6.6 预算三元（不多不少）：B(t) / 本轮已花 / 全局剩余
@@ -118,5 +120,30 @@ def _first_line(md: str) -> str:
 
 
 def status_card_json(card: Dict[str, Any]) -> str:
-    """canonical JSON（sort_keys，防 dict 序差异）——供确定性比对 / 发布落盘（M3 outbox）。"""
+    """canonical JSON（sort_keys，防 dict 序差异）——供确定性比对 / 发布落盘。"""
     return json.dumps(card, ensure_ascii=False, sort_keys=True)
+
+
+class SqliteStatusPublisher:
+    """阶段边界原子发布（§4.6.6；M5 CP6.2）：build_status_card → canonical JSON → tmp→os.replace
+    覆盖 latest 文件。读者（Mediator/应答器）任意时刻读到的都是**完整**卡（rename 原子，无半完成态）。
+    满足 interfaces.StatusPublisher Protocol：publish(cycle_id) -> str（发布文件路径）。
+
+    conn 契约同 build_status_card：**专用**只读用途连接（本类掌控其事务）——传 mode=ro 连接最稳
+    （mediator.open_responder_read_conn 同源）。发布失败（磁盘满等）向上抛：卡是派生可重建的，
+    但静默丢发布会让人机窗口无声过期——fail loud，重试/降级 = M6 硬化。"""
+
+    def __init__(self, conn, *, policy: Dict[str, Any], goal_body_md: str, out_path: str):
+        self.conn = conn
+        self.policy = policy
+        self.goal_body_md = goal_body_md
+        self.out_path = Path(out_path)
+
+    def publish(self, cycle_id: str) -> str:
+        card = build_status_card(self.conn, cycle_id=cycle_id, policy=self.policy,
+                                 goal_body_md=self.goal_body_md)
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.out_path.with_name(self.out_path.name + ".tmp")
+        tmp.write_text(status_card_json(card), encoding="utf-8")
+        tmp.replace(self.out_path)               # 原子替换：读者不见半写
+        return str(self.out_path)

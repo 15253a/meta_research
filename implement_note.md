@@ -4,8 +4,12 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑥（M5）CP6.2 开工
-- 检查点状态：构建中（CP6.1 已完成 702071e + docs 记账；CP6.2 = query 只读应答器 + 中介 + status_card 接线）
+- 更新：2026-07-08 ｜ 位置：步⑥（M5）CP6.2
+- 检查点状态：外审第 2 轮进行中（codex 后台 bvpy40bf5 → scratchpad/cp62_review_r2_out.md）。
+  内审 REQUEST_CHANGES→B1 CJK 实体漏检已修；外审第 1 轮 REQUEST_CHANGES→5 条全修（VTABLE authorizer/
+  缺 kind fail-loud/raw_text 改按 message_id 取[handle_query 签名变]/rebuild 相关子查询防扇出/
+  isolation_level+fallback None）。**全套 470 绿**。出结论后按 §2.2：APPROVE→commit→build_log 0027
+  （草稿 scratchpad/build_log_0027_draft.md）。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。

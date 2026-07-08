@@ -66,16 +66,18 @@ def derive_next_route(prev_selection: Selection, outcome: PlanOutcome) -> Option
 
 class SqliteAdvancer:
     def __init__(self, state, compiler, reasoning_provider: ReasoningProvider,
-                 gate=None, recall=None, attack=None):
+                 gate=None, recall=None, attack=None, status_publisher=None):
         """state = SQLiteStateStore；compiler = SqliteCompiler；reasoning_provider 见模块注释。
         attack = attack_stages.AttackStages（M4 CP5.4：idea/plan/bundle/reasoning 阶段推进；None = 拒 attack 轮）。
-        gate/recall 预留。"""
+        status_publisher = status_card.SqliteStatusPublisher（M5 CP6.2：阶段边界原子发布人机快照；
+        None = 不发布——发布是派生观测，不参与研究状态机，故可选装）。gate/recall 预留。"""
         self.state = state
         self.compiler = compiler
         self._reasoning = reasoning_provider
         self.gate = gate
         self.recall = recall
         self.attack = attack
+        self.status_publisher = status_publisher
         self.import_worker = None    # M4 CP5.5：物化 worker（set 后 _resume_or_open 识别 worker 轮交其续跑）
 
     def derive_next_route(self, prev_selection: Selection, outcome: PlanOutcome) -> Optional[Route]:
@@ -93,12 +95,20 @@ class SqliteAdvancer:
             if cyc is None:
                 break                        # 停机（上轮 terminate）
             for _step in range(8):               # attack 轮多阶段：逐格推进到 done（每格独立提交）
-                if self.advance(cyc.cycle_id) == "done":
+                done = self.advance(cyc.cycle_id) == "done"
+                self._publish_card(cyc.cycle_id)     # 阶段边界发布（§4.6.6）：每格提交后快照即时对人可见
+                if done:
                     break
             else:   # 进度护栏（codex NIT）：>8 格未到 done = 游标损坏（如 pc duplicate 而 status 未推进），fail loud
                 raise RuntimeError(f"cycle {cyc.cycle_id} 推进 8 格未达 done——游标疑似损坏（status 未随阶段推进）")
             ids.append(cyc.cycle_id)
         return ids
+
+    def _publish_card(self, cycle_id: str) -> None:
+        """阶段边界原子发布 status_card（装了 publisher 才发）。发布失败向上抛（fail loud，见
+        SqliteStatusPublisher 注）——卡可重建，但静默丢发布会让人机窗口无声过期。"""
+        if self.status_publisher is not None:
+            self.status_publisher.publish(cycle_id)
 
     def _resume_or_open(self):
         """取本轮要推进的（已 setup 的）cycle；None = 应停机。恢复安全：先看在途轮（续跑其未竟阶段），
