@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步②（M1）已完成**（CP2.1 6d45b53 / CP2.2 be84a90 / CP2.3 d07c6c6 / CP2.4 1182a5a；步级验证 267 全绿）。下一步 **步③（M2）**：上下文编译器 + 召回 + 观测摘要 + status_card。步①（M0）已完成。
+- 进行中的步 / 检查点：**步③（M2）进行中**——CP3.1（2110f02，SqliteCompiler 确定性四区包）已完成；下一步 CP3.2（Recall 四级 + 复用判定 O(1)）。步①（M0）、步②（M1，CP2.1–2.4）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -48,7 +48,12 @@
 
 ### 步③（M2）上下文编译器 + 召回 + 观测摘要 + status_card
 - 验证方法（§7.1 M2 行）：同快照+配方+预算→字节一致（diff=0）；召回四级可停；复用判定 O(1)（EXPLAIN QUERY PLAN 证明走测量索引）；观测摘要进锚点而门禁 authorizer 拒读（负例）；import 仍 deferred、不产 target。
-- 状态：未开始
+- 状态：**进行中**
+- 检查点（模型切，边走边补）：
+  - [x] CP3.1 SqliteCompiler：DB→确定性四区 context_pack（**字节一致 diff=0**，render 单读快照 + ORDER BY 定序）+ applicability 六枚举徽标 + manifest 纯函数 — commit 2110f02（build_log 0014）
+  - [ ] CP3.2 Recall 四级可停 + **复用判定 O(1) selector（§4.1.5）+ EXPLAIN QUERY PLAN 证明走测量索引** + Ctx 深潜（retrieval/refs 填入 render 单读事务）
+  - [ ] CP3.3 观测摘要段进 reasoning 锚点（从 execution_observation）+ status_card 发布（§4.6.6 封闭字段）+ authorizer 拒读负例 + import deferred 不产 target 断言
+  - > 注：架构同 M1——M2 交付真实 DB-backed 组件（读 DB），M0 driver 仍走桩、基线绿；M3 Advancer 接。嵌入语义召回 defer（无模型，用 FTS5+tag+测量索引）。
 
 ### 步④（M3）编排器 Advancer + 恢复 + import M1–3 降级
 - 验证方法（§7.1 M3 行）：任意阶段 kill -9 重启续跑，终库状态与不杀一致（排除非确定字段）；import deferred 隔离断言（pending dep 排除调度、不重复登记、不产 target）。开工前确认 OPEN #3。

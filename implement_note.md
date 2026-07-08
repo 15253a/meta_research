@@ -4,8 +4,15 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 01:50 ｜ 位置：**步②（M1）已完成**；步③（M2）待开工
-- 检查点状态：空闲（M1 收尾记账完成；M2 未开工）
+- 更新：2026-07-08 03:00 ｜ 位置：步③（M2）· CP3.1 已提交，CP3.2 待开工
+- 检查点状态：空闲（CP3.1 记账完成；CP3.2 未开工）
+
+## M2 检查点计划（步③）
+- [x] **CP3.1** SqliteCompiler：DB→确定性四区包（字节一致 diff=0；render 单读快照 + ORDER BY 定序 + json sort_keys + budget float + pack_hash \x00 含 refs）+ applicability 六枚举徽标 + _open_set 限 goal_id 含本轮 Qn + manifest 纯函数（sources 落 ContextPack）— commit 2110f02 / build_log 0014
+- [ ] **CP3.2** Recall 四级可停（§3.6.2：卡片→变体矩阵→测量索引→ctx-fetch）+ **复用判定 O(1) selector（§4.1.5 规范 SQL）+ EXPLAIN QUERY PLAN 证明走测量索引 (variant,protocol,ver)、非全表扫** + Ctx 深潜（reference：`<scratchpad>/M2_refsheet.md` §3.6.2/§4.1.5，换 session 需重跑 Explore）
+- [ ] **CP3.3** 观测摘要段进 reasoning 锚点（从 execution_observation 渲 nan/loss_trend…，替 CP3.1 占位）+ status_card 发布（§4.6.6 封闭字段）+ authorizer 拒读负例（gate 读 observation/v_trajectory 被拒，CP2.3 已焊、此处证「摘要进 pack 但不进 gate_input」）+ import deferred 不产 target 断言
+- **CP3.2 必接（codex 第2轮前瞻，见 build_log 0014）**：retrieval/refs 的 DB 读须放进 render 现有的**同一 BEGIN…COMMIT** 读事务；refs 规范化形式明确（若 Ref 变对象则 asdict+sort_keys；pack_hash 已把 json.dumps(refs) 纳入定口径）。
+- 架构同 M1：M2 交付真实 DB-backed 组件（读 DB），M0 driver 仍走桩、基线绿；M3 Advancer 接。SqliteCompiler 只读连接 mode=ro 由 M3 调用方传入。嵌入 defer（无模型，用 FTS5+tag+测量索引）。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
