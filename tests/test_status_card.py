@@ -62,11 +62,26 @@ def test_core_fields_from_db(conn):
 
 
 def test_selection_from_cycle(conn):
-    """selection 权威状态取 cycle.next_*；M2 无 selection DECISION 审计行 → latest_decision None。"""
+    """selection 权威状态取 cycle.next_*；latest_decision（M5 CP6.2 接线）= 本 cycle 作用域最近 decision
+    摘要；本轮无 decision 行 → 诚实 None。"""
     sel = _card(conn)["selection"]
     assert set(sel.keys()) == {"intent", "next_question_id", "latest_decision"}   # 子字段封闭（防悄悄扩表）
     assert sel["intent"] == "attack" and sel["next_question_id"] == "q3"
-    assert sel["latest_decision"] is None
+    assert sel["latest_decision"] is None                                         # 本轮无 decision（无跨轮串卡）
+
+
+def test_latest_decision_cycle_scoped(conn):
+    """latest_decision 按 cycle 作用域取最近一条（非全局 LIMIT 1——防跨轮/跨 goal 串卡）。"""
+    conn.executescript("""
+      INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (1,'agent','decompose','{}');
+      INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (1,'human','directive_pause','{}');
+      INSERT INTO cycle(id,goal_id,goal_ver,status,policy_version) VALUES (2,1,1,'reasoning','v0');
+      INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (2,'agent','create_root','{}');
+    """)
+    conn.commit()
+    ld = _card(conn)["selection"]["latest_decision"]          # 卡取 c1：c2 的更新 decision 不串入
+    assert (ld["actor"], ld["type"]) == ("human", "directive_pause")
+    assert ld["id"] == conn.execute("SELECT max(id) FROM decision WHERE cycle_id=1").fetchone()[0]
 
 
 def test_budget_fields(conn):
