@@ -6,6 +6,7 @@
 
 ---
 
+- [0025](0025-cp56-m4-semantic-cases.md) — CP5.6 语义判据 5 判例显式命名验收 **——收尾步⑤ M4**（步级验证 47 测联合勾兑全过）· commit `eb5e7d9` · 验证: 通过（pytest 436/436）
 - [0024](0024-cp55-import-worker.md) — CP5.5 外部 import 物化 ImportWorker（OPEN #6 落地：worker cycle route NULL+标记；失败路径全拒含 judge FAIL；provenance 五件套）· commit `d9de442` · 验证: 通过（pytest 431/431，10 新用例）
 - [0023](0023-cp54-attack-advance.md) — CP5.4 attack 轮 advance 全链**（首次全链跑通）**：两段提交+结构恢复+锚校验+judge replay-safe · commit `6af22cf` · 验证: 通过（pytest 421/421，12 attack 用例含 5 类崩溃缝隙恢复）
 - [0022](0022-cp53-harness-obs-parser.md) — CP5.3 真执行 harness + 确定性观测 parser + parser_result_suspect 真派生（OPEN #5 落地闭；stale fail-closed + 多 log OR） · commit `215c694` · 验证: 通过（pytest 409/409，20 obs_parser 用例）

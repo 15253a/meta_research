@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步④（M3）已完成**（CP4.1 148c907 + CP4.2 ff30463 + CP4.3 6dd2387；§7.1 M3 两判据步级验证全过，见 build_log 0019）。**下一步 步⑤（M4）真执行 + 真 log + import 物化**。步①（M0）、步②（M1）、步③（M2）已完成。
+- 进行中的步 / 检查点：**步⑤（M4）已完成**（CP5.1–5.6；§7.1 M4 全判据步级验证通过，见 build_log 0025）。**下一步 步⑥（M5）人类控制台 + query 只读应答器**。步①–④（M0–M3）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -77,7 +77,7 @@
 
 ### 步⑤（M4）真执行 + 真 log + import 物化
 - 验证方法（§7.1 M4 行）：语义判据 5 判例确定归属（①自建 ②import factory ③复用零重训 ④训练失败入账不入树 ⑤log suspect 不成证据）；证据可回溯到一次真实 evaluation；imported 经本系统 harness 出 factory evidence、report 带 provenance；import 失败路径负例（license deny→不物化 / smoke 失败→不 target_ready / factory eval 失败→不 pool_publish，全拒）。
-- 状态：**进行中**
+- 状态：**已完成**（§7.1 M4 全判据步级验证通过，436 绿，见 build_log 0025；OPEN #5/#6 落地闭）
 - **OPEN #5 裁决（全自动，2026-07-08）**：policy.yaml 补 `observation` 节（§4.7 声明的 parser 阈值旋钮：nan / divergence /
   loss_trend → parser_result_suspect），随真 parser 落地（CP5.3）一并成文走评审；`extraction_policy_hash` = 该节规范化
   JSON 的 sha256（同 log + 同 parser_version + 同 policy → 同 observation，P6 可回放）。
@@ -108,7 +108,8 @@
     provenance→出厂 eval[source 仍 factory]→占位→legal→imported 事件→resolve_deps 解锁问题）+ **失败路径
     全拒含 judge FAIL**（settling 不死循环；attack 侧 lockstep 同修）+ 崩溃缝隙全修（收尾+resolve_deps 同
     atomic 等）— commit d9de442（build_log 0024）
-  - [ ] CP5.6 语义判据 5 判例 + M4 步级验证收尾
+  - [x] CP5.6 语义判据 5 判例显式命名验收 + M4 步级验证收尾（两文件联合勾兑 47 测全过）— commit eb5e7d9
+    （build_log 0025）
 - **M3 移交清单**（各处裁量汇总，M4 开工先读）：attack 轮 advance（idea/plan/bundle 阶段 + phase_commit 幂等 + 恢复扩展）；
   池注册 gate_register_*（15 函数，build_log 0013）；真执行 + 真 log/观测 + parser_result_suspect 真派生（此前复用判定不得
   对真执行上线，build_log 0015）；import 物化 materialize（占位→legal、scope 消费点、supersession——select_deferred 幂等
