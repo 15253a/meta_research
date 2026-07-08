@@ -4,60 +4,64 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步④（M3）· CP4.2 已提交，CP4.3 待开工
-- 检查点状态：空闲（CP4.2 记账完成；CP4.3 未开工）。测试基线 336 绿。
+- 更新：2026-07-08 ｜ 位置：步⑤（M4）待开工（步④ M3 已完成）
+- 检查点状态：空闲（M3 收尾记账完成；M4 未开工）
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**步③（M2）已完成**：CP3.1（2110f02 编译器确定性四区包）+ CP3.2（1a099fc Recall 四级+复用 O(1)）+ CP3.3
-（72647f8 观测摘要进锚点+status_card+authorizer 负例）。§7.1 M2 五判据步级验证全过（见 build_log 0016）。
-**步④（M3）进行中**：CP4.1（148c907 Advancer 骨架 + derive_next_route）+ CP4.2（ff30463 run_cycles 驱动循环 +
-decompose advance + **真 kill-9 恢复**，§7.1 M3 首判据过）已提交。**下一步 CP4.3（import deferred 隔离，收尾 M3）**。
-**已完成**：步①（M0）+ 步②（M1）+ 步③（M2）+ 步④ CP4.1/CP4.2。测试基线 **336 绿**。
+**步④（M3）已完成**：CP4.1（148c907 Advancer+derive_next_route）+ CP4.2（ff30463 run_cycles+decompose+真 kill-9
+恢复）+ CP4.3（6dd2387 select_deferred 幂等守卫）。§7.1 M3 两判据 10 测步级验证全过（build_log 0019）。
+**已完成**：步①（M0）+ 步②（M1）+ 步③（M2）+ 步④（M3）。测试基线 **341 绿**。**下一步 步⑤（M4）**。
 
-## 步④（M3）目标（§7.1 M3 行）——编排器 Advancer + 恢复 + import 降级
-Advancer 把 M1/M2 真实组件接进循环（现 M0 driver 仍走桩）。验收（可证伪）：
-- **恢复性**：任意阶段 kill -9 重启续跑，终库状态与不杀一致（排除非确定字段）。阶段边界即检查点（P6，§4.4.5）。
-- **import deferred 隔离**：pending dep 排除调度、不重复登记、不产 target（部分已由 test_isolation_m1c 覆盖，M3 补全链）。
-- 开工前确认 OPEN #3（全自动：自主裁决 + 落受审载体，勿停问用户）。
+## 步⑤（M4）目标（§7.1 M4 行）——真执行 + 真 log + import 物化
+验收（可证伪）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例
+（license deny / smoke 失败 / factory eval 失败全拒）。开工前确认 OPEN #5/#6（reference/OPEN.md；全自动=自主裁决落受审载体）。
 
-## M1/M2 已交付的真实组件（未接 driver；M3 Advancer 才接，M0 driver 仍走桩、基线绿）
-- `orchestrator/database.py`：附录 A 冻结 DDL + checksum/计数/版本三重锁。
-- `orchestrator/writedaemon.py`：单写连接 + 短事务（BEGIN IMMEDIATE，不可嵌套，鲁棒回滚）。
-- `orchestrator/statestore_sqlite.py`：SQLiteStateStore（状态机 + decompose 单事务原子 + kill-9 无半写 + 类型前缀 id
-  + active_question_id 落库 + 投影随事务回滚 + **atomic() 供 M3 裹全序**）。
-- `orchestrator/gate_sqlite.py`：SqliteGate（authorizer mode=ro 拒 9 表 + gate_input_* TEMP 视图 + gate_close_question
-  gate-only 判据写锁内重跑防 TOCTOU）。**注**：池注册类 gate_*（15 函数）M1 未做，M3 需补（见 build_log 0013）。
-- `orchestrator/importer.py`/`interaction.py`/`ids.py`：M1c（import 发现+登记 deferred / 人机 durable 入站 + 隔离）。
-- `orchestrator/compiler_sqlite.py`：SqliteCompiler（确定性四区包 + applicability 徽标 + 观测摘要段）。
-  **M3 接线点**：render 的 retrieval/refs 现留空 → 按 policy 配方调 recall_sqlite 填检索区/引用区。
-- `orchestrator/recall_sqlite.py`：SqliteRecall/SqliteCtx + 复用判定 O(1) selector（四级召回）。
-- `orchestrator/status_card.py`：build_status_card（§4.6.6 封闭字段）。**M3 接线点**：advance 阶段边界原子发布 +
-  写 outbox；填 selection.latest_decision（按 cycle scope 查）/ global_remaining / heartbeat_ref。
-- `orchestrator/budgeting.py`：compute_budget（B(t) 唯一定义）。
+## M4 移交清单（M1–M3 各处裁量汇总，开工先读；同 ROADMAP 步⑤）
+- **attack 轮 advance**：idea/plan/bundle 阶段推进 + phase_commit 幂等（键 (cycle,stage,target)+artifact_hash）+
+  恢复扩展到 attack 阶段（M3 恢复只覆盖 reasoning-only）。M0 driver 的阶段实现（idea 双调用/plan 评审/bundle 造假）
+  是流程范式，M4 换真组件重做。
+- **池注册 gate_register_***：15 函数（baseline/variant/eval/attempt…，§4.1.4），M1 只做了 gate_close_question（build_log 0013）。
+- **真执行 + 真 log/观测**：runner 真训练/评估；execution_log/observation 真登记（两段提交 §4.2.5(i)/(ii)）；
+  **parser_result_suspect 真派生**（此前复用判定不得对真执行上线，build_log 0015；recall_sqlite 注册桩恒 0）。
+- **import 物化 materialize**：占位 baseline→legal（gate_register_baseline）、license scope 消费点校验、supersession
+  （届时 select_deferred 幂等守卫改判「未被 superseded 的」+ 复核 selection_key 每选择唯一，见 importer.py 注释）；
+  phase_commit 级 import-defer 捆绑（三写入+set_route(dependency_wait)+Qn 释放+mark_done 同一事务，build_log 0019）。
+- **compiler 接线**：检索区/引用区接 recall_sqlite（按 policy 配方，build_log 0016）；bundle 计划切片渲染（compiler_sqlite
+  bundle 分支现占位）。status_card selection.latest_decision 按 cycle scope 查（advance 落 selection DECISION 后）。
 
-## 下一步动作（按序）—— CP4.3（import deferred 隔离，收尾 M3）
-M3 规格全提取见 `<scratchpad>/M3_refsheet.md` §4（import 三写入）。CP4.1/4.2 已交付 Advancer + 驱动循环 + 恢复。CP4.3：
-1. **import deferred 隔离全链**（§7.1 M3 第二判据）：import 三写入（external_import(selected_for_materialization) + 占位
-   baseline(planned) + question_dep(pending)）与 set_route(dependency_wait)/Qn 释放/mark_cycle_done **同一 phase_commit 事务**；
-   断言：**不产 build_target** + 该 question 因 pending question_dep **被调度排除**（§4.2.1）+ **不重复登记**（幂等）。
-   现状：importer.py 的 DeferredImporter 已有三写入（M1c，test_isolation_m1c 已断言不产 target/pending dep）；CP4.3 = 把它
-   接进 Advancer 的 dependency_wait 路径（plan 阶段命中 import → advance 走 dependency_wait 收尾）或补全链隔离断言 + 幂等测。
-   **裁量**：dependency_wait 的 advance 需 plan 阶段（attack 轮）——若纯 M3 无 plan 真环，可用注入 provider 模拟 plan 落
-   import_defer 决定 + 驱动 dependency_wait 收尾（对齐 M0 driver 的 import_defer 处理，但落真三写入）。精读 §3.6.3/§4.2.5 后定。
-2. 照 §5 循环：内审 Opus + codex ≤2 轮 → commit → build_log 0019。**收尾 M3 → 跑 §7.1 M3 步级验证**（恢复[CP4.2 已过] +
-   import 隔离[CP4.3]）→ 记 build_log。
-   精读指针（存档）：第一部分 §3.6.3（import 三写入）/§4.2.1（调度可见性）/§4.2.5（phase_commit 原子）；第二部分 §6.11（import decision）。
+## 已交付的真实组件全景（M1–M3；M0 driver 走桩栈并存、基线绿）
+- database.py（冻结 DDL 三重锁）/ writedaemon.py（单写短事务）/ statestore_sqlite.py（状态机+atomic()+kill-9 安全
+  +inflight/last_done_cycle）/ gate_sqlite.py（authorizer 拒 9 表+gate_close_question）/ importer.py（deferred 三写入+
+  幂等守卫）/ interaction.py（durable 入站）/ compiler_sqlite.py（确定性四区包+观测摘要+applicability 徽标）/
+  recall_sqlite.py（四级召回+复用 O(1)）/ status_card.py（§4.6.6 封闭字段）/ budgeting.py / advancer.py
+  （derive_next_route 全矩阵+run_cycles 驱动循环+reasoning-only advance+恢复）。
+- **advancer 现状**：reasoning-only（bootstrap/decompose/terminate）真环可跑、可恢复；attack route 诚实
+  NotImplementedError；reasoning provider 为注入式（测试确定性替身；真 Codex provider = M4 接，范式在 M0
+  driver._run_reasoning_with_retry）。
+
+## 下一步动作（按序）—— 步⑤（M4）开工
+1. **读 OPEN #5/#6**（reference/OPEN.md）→ 全自动裁决、落受审载体。
+2. **精读 M4 规格**（建议 Explore 提取省上下文，session 重启后 scratchpad 已清）：第一部分 §4.1.4（池注册 gate 全家）/
+   §4.2.5 两段提交/§4.3.1（parser 观测派生）/§3.4.3+§4.1.4 附注（双评审 DECISION 机械判据）/§3.6.3+§4.2.1（import 物化）；
+   第二部分 §6.9（语义判据 5 判例）/§6.13。第三部分 §7.1 M4 行。
+3. **裁量 M4 检查点切分**（精读后定，落 implement_note+ROADMAP）。粗切设想：CP5.1 池注册 gate_register_* + attack plan
+   阶段（phase_commit 幂等）；CP5.2 真执行两段提交 + parser 真派生；CP5.3 import 物化 + 失败路径负例；CP5.4 语义判据
+   5 判例 + 步级验证收尾。
+4. 每检查点照 §5 循环：内审 Opus 子代理 + codex 外审 ≤2 轮 → commit → build_log。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
-- **全自动模式**：OPEN/裁量项不停下问用户，自行裁决 + 落受审载体（对应制品/build_log）。M3 有 OPEN #3 待自主裁决。
-- **codex 外审模式 B 后台跑**（Bash 120s 会杀，必须 run_in_background）：`env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`；prompt 声明「全部内联、无需执行命令」。两轮上限；APPROVE 才 commit。
-- **评审极能抓真 bug**（M1 期 codex ~10 BLOCKER + 内审 ~4；M2 期 codex/内审共 ~6 SHOULD 全采纳）。资产层务必：类型前缀 id 解码（ids.py）、进程内投影随事务回滚、可恢复字段落库、gate 拒不撞 FK、gate-only 判据写锁内重跑、门禁读连接 mode=ro、写子系统前置一致性校验、幂等锚正确。
-- **确定性纪律（M2 核心，M3 续守）**：context_pack 字节一致——无 wall-clock（含 DB created_at）/随机/dict 无序；ORDER BY 定序。
-- gate/文件库测试须**文件库**（门禁 mode=ro 独立连接）；importer/interaction/statestore/compiler/status_card 可 :memory:。
-- DDL 字节冻结：改 schema 同步 database.py 的 MIGRATION_SHA256（走评审）。
-- 测试基线现 **316**；端到端 `scripts/run_m0_acceptance.py --cycles 5`（花真 token，走 M0 桩栈）。
-- 悬案（build_log 0011/0012）：resolve_deps dead_end 依赖（保 M0 语义，M3/M6 定）；跨版 child_answer applicability
-  （现 try/except 兜底，M3 goal-amend 验）。status_card selection.latest_decision / global_remaining / heartbeat_ref
-  与 compiler 检索区/引用区接线 = M3（见 build_log 0016 遗留）。
+- **全自动模式**：OPEN/裁量项不停下问用户，自行裁决 + 落受审载体（对应制品/build_log）。
+- **codex 外审模式 B 后台跑**（Bash 120s 会杀，必须 run_in_background）：`env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`；prompt 声明「全部内联、无需执行命令」。两轮上限；APPROVE 才 commit。**外审 diff 排除记账类**：`git diff --staged -- . ':(exclude)build_log/**' ':(exclude)implement_note.md'`。
+- **评审极能抓真 bug**（M1–M3 期 codex ~12 BLOCKER/REQUEST + 内审多轮；全部两层评审意见至今 100% 采纳或有记录理由）。
+- **确定性纪律**：context_pack 字节一致——无 wall-clock（含 DB created_at）/随机/dict 无序；ORDER BY 定序。恢复一致性
+  比较排除 timestamp/attempt_id/log offset（advancer.py docstring）。
+- gate/文件库测试须**文件库**（门禁 mode=ro 独立连接）；statestore/importer/compiler/status_card 可 :memory:。
+  kill-9 测试范式：subprocess + marker 文件 + SIGKILL（test_advancer.py / test_statestore_sqlite.py）。
+- DDL 字节冻结：改 schema 须同步 database.py 的 MIGRATION_SHA256（走评审）。M4 池注册若需新表/触发器 → 属决策性
+  schema 变更，务必全流程评审。
+- 测试基线现 **341**；端到端 `scripts/run_m0_acceptance.py --cycles 5`（花真 token，走 M0 桩栈）。
+- 悬案：resolve_deps dead_end 依赖（M3/M6 定，build_log 0011）；跨版 child_answer applicability（M3 goal-amend 验，
+  build_log 0012——M3 未涉 goal_amend 轮，顺延 M4/M6）；status_card M3 待填三字段（latest_decision/global_remaining/
+  heartbeat_ref，build_log 0016）。

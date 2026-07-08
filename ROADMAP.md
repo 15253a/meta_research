@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步③（M2）已完成**（CP3.1 2110f02 + CP3.2 1a099fc + CP3.3 72647f8；§7.1 M2 五判据步级验证全过，见 build_log 0016）。**下一步 步④（M3）Advancer + 恢复 + import 降级**。步①（M0）、步②（M1，CP2.1–2.4）已完成。
+- 进行中的步 / 检查点：**步④（M3）已完成**（CP4.1 148c907 + CP4.2 ff30463 + CP4.3 6dd2387；§7.1 M3 两判据步级验证全过，见 build_log 0019）。**下一步 步⑤（M4）真执行 + 真 log + import 物化**。步①（M0）、步②（M1）、步③（M2）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -36,7 +36,7 @@
 
 ### 步②（M1）资产层落地（分层验收 M1a/M1b/M1c）
 - 验证方法（§7.1 M1 行）：M1a 附录 A DDL 建库（36 表+72 触发器+29 索引+1 视图，migration/checksum 锁定）+ 门禁 + 三级校验 → 不变量 I1–I6 + v2.3/v2.4 否定用例全过；M1b StateStore 落 SQLite + decompose 释放断言（kill -9 无半写）；M1c v2.3/v2.4 表只做约束 + 「M1–M3 隔离拒绝用例」。OPEN #1/#2 已在全自动模式下自主裁决（落 db/README.md）。
-- 状态：**进行中**
+- 状态：**已完成**（步级验证通过，见下；此前漏改状态行，2026-07-08 补正）
 - 检查点（模型切，边走边补）：
   - [x] CP2.1 冻结 Appendix-A DDL 落库 + database.py 三重锁 + 全套 **DB 层**不变量否定用例（I1–I6/append-only/v2.3-2.4 表约束，91 例）— commit 6d45b53（build_log 0010）
   - [x] CP2.2 单写 WriteDaemon（短事务）+ SQLiteStateStore 落 SQLite（cycle/question/route/树/dep/selection，语义等价 M0 InMemory）+ decompose 单事务原子性（kill-9 无半写）（M1b）— commit be84a90（build_log 0011）
@@ -57,7 +57,7 @@
 
 ### 步④（M3）编排器 Advancer + 恢复 + import M1–3 降级
 - 验证方法（§7.1 M3 行）：任意阶段 kill -9 重启续跑，终库状态与不杀一致（排除非确定字段）；import deferred 隔离断言（pending dep 排除调度、不重复登记、不产 target）。开工前确认 OPEN #3（全自动模式：自主裁决 + 落受审载体）。
-- 状态：**进行中**
+- 状态：**已完成**（§7.1 M3 两判据 10 测步级验证全过，341 绿，见 build_log 0019。恢复覆盖 reasoning-only 轮；attack 阶段恢复扩展 = M4，见步④裁量）
 - **裁量（全自动，2026-07-08）·M3/M4 边界**：M3 交付真 Advancer（状态机步进 + 恢复 + import 隔离），操作真
   SQLiteStateStore/SqliteGate/SqliteCompiler（与 M0 桩 driver 并存不替换、M0 基线绿）。**pool 注册类 gate_register_\***
   （M1 未做，build_log 0013）与**真执行**归 **M4**——M3 的 attack 全环收尾依赖它们，故 M3 聚焦其验收所需的
@@ -69,13 +69,20 @@
   - [x] CP4.2 外层驱动循环 run_cycles（开轮/据上轮 selection 派 route/激活目标/loop advance；durable 交接、无进程内记忆）
     + decompose advance + **恢复**：真 kill -9 重启续跑终库状态与不杀一致（排除 timestamp/attempt_id/log offset；subprocess
     杀进程测）— commit ff30463（build_log 0018）。范围 reasoning-only；attack 阶段恢复（池注册 gate_register_* + 真执行）= M4。
-  - [ ] CP4.3 import deferred 隔离：三写入（external_import+占位 baseline+question_dep）同 phase_commit + dependency_wait
-    + 不产 target + pending dep 排除调度 + 不重复登记（幂等）
+  - [x] CP4.3 import deferred「不重复登记」：select_deferred 幂等守卫（真重放返回既有三元；candidate/license/dep/重复
+    四道 fail-loud）— commit 6dd2387（build_log 0019）。范围：importer 函数级幂等；phase_commit 级捆绑（三写入+
+    set_route(dependency_wait)+Qn 释放+mark_done 同事务）随 dependency_wait plan 阶段接入 = M4。其余隔离断言
+    （pending dep 排除调度/不产 target/三写入原子）CP2.4 已覆盖
   - > 注：M0 driver（走桩+真 Codex）保留为 M0 验收栈；M3 Advancer 是真组件上的可恢复步进器。
 
 ### 步⑤（M4）真执行 + 真 log + import 物化
-- 验证方法（§7.1 M4 行）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例（license deny / smoke 失败 / factory eval 失败全拒）。开工前确认 OPEN #5/#6。
-- 状态：未开始
+- 验证方法（§7.1 M4 行）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例（license deny / smoke 失败 / factory eval 失败全拒）。开工前确认 OPEN #5/#6（全自动模式：自主裁决 + 落受审载体）。
+- 状态：**下一步**（M3 已完成）
+- **M3 移交清单**（各处裁量汇总，M4 开工先读）：attack 轮 advance（idea/plan/bundle 阶段 + phase_commit 幂等 + 恢复扩展）；
+  池注册 gate_register_*（15 函数，build_log 0013）；真执行 + 真 log/观测 + parser_result_suspect 真派生（此前复用判定不得
+  对真执行上线，build_log 0015）；import 物化 materialize（占位→legal、scope 消费点、supersession——select_deferred 幂等
+  守卫届时改判「未被 superseded 的」，见 importer.py 注释）；phase_commit 级 import-defer 捆绑（build_log 0019）；
+  compiler 检索区/引用区接 recall（build_log 0016）；status_card selection.latest_decision 按 cycle scope 查（build_log 0016）。
 
 ### 步⑥（M5）人类控制台 + query 只读应答器
 - 验证方法（§7.1 M5 行）：directive 按时机消费同记 DECISION；query 只读边界负例（responder 写库全被 authorizer 拒）；分类负例（unclear 不自动答）；ACK/query p95<2s；中介线程重建一致；润色≠raw；通知矩阵逐态推送断言；文件请求全流水 + 负例。
