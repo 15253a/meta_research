@@ -89,8 +89,9 @@
   + execution_log + 开轮决策行）；
   ④ **恢复** = 研究驱动循环 `_resume_or_open` 遇 route=NULL 且带 worker 标记的在途轮 → 交物化 resumer 续跑、不走研究 setup。
 - 检查点（模型切，边走边补）:
-  - [ ] CP5.1 执行生命周期 gates（gate_start/finish_run、gate_start/finish_attempt、gate_start/progress/finish_build_target、
-    gate_finish/abandon_evaluation，§4.1.4 判据）+ 否定用例（连坐/I2/I6/bundle_cursor 串行）
+  - [x] CP5.1 执行生命周期 gates（九函数，§4.1.4 判据）+ review_passed 双评审机械判据（subject_hash 当下重算 +
+    runner_call 核 + 畸形 fail-closed）+ 否定用例 28（连坐×kind 守卫/I2/I6/串行结构推导/腐化态）— commit 7d64ec5
+    （build_log 0020）。import 目标生命周期 defer CP5.5
   - [ ] CP5.2 注册/评审 gates（gate_claim/register_baseline、gate_claim/register_variant、gate_new_protocol）+ 双评审
     DECISION 机械判据（subject manifest 确定性构造 + subject_hash 当下重算 + runner_call 核验）+ pool 侧写 + 否定用例
   - [ ] CP5.3 真执行管线 + 真 parser：runner 起真子进程（toy harness）→ execution_log 登记 → 确定性 parser 解析 →

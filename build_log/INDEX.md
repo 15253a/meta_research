@@ -6,6 +6,7 @@
 
 ---
 
+- [0020](0020-cp51-exec-gates.md) — CP5.1 ExecGate 执行生命周期 gates（§4.1.4 九函数 + review_passed 双评审机械判据；OPEN #5/#6 裁决） · commit `7d64ec5` · 验证: 通过（pytest 369/369，28 gate_exec 用例）
 - [0019](0019-cp43-import-idempotency.md) — CP4.3 select_deferred 幂等守卫（不重复登记，四道 fail-loud）**——收尾步④ M3** · commit `6dd2387` · 验证: 通过（pytest 341/341；M3 §7.1 两判据 10 测步级全过）
 - [0018](0018-cp42-run-cycles-decompose-recovery.md) — CP4.2 外层驱动循环 run_cycles + decompose advance + **真 kill-9 恢复**（终库与不杀一致，§7.1 M3 首判据）· commit `ff30463` · 验证: 通过（pytest 336/336，含 kill-9 subprocess 测）
 - [0017](0017-cp41-advancer-derive-route-bootstrap.md) — CP4.1 Advancer 骨架：derive_next_route 全矩阵（§6.13(3)）+ advance bootstrap 创世轮（真 SQLite，单一 atomic 阶段 + 续跑幂等）· commit `148c907` · 验证: 通过（pytest 333/333，17 advancer 用例）

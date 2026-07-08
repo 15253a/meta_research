@@ -4,14 +4,14 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑤（M4）待开工（步④ M3 已完成）
-- 检查点状态：空闲（M3 收尾记账完成；M4 未开工）
+- 更新：2026-07-08 ｜ 位置：步⑤（M4）· CP5.1 已提交，CP5.2 待开工
+- 检查点状态：空闲（CP5.1 记账完成；CP5.2 未开工）。测试基线 369 绿。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**步④（M3）已完成**：CP4.1（148c907 Advancer+derive_next_route）+ CP4.2（ff30463 run_cycles+decompose+真 kill-9
-恢复）+ CP4.3（6dd2387 select_deferred 幂等守卫）。§7.1 M3 两判据 10 测步级验证全过（build_log 0019）。
-**已完成**：步①（M0）+ 步②（M1）+ 步③（M2）+ 步④（M3）。测试基线 **341 绿**。**下一步 步⑤（M4）**。
+**步⑤（M4）进行中**：CP5.1（7d64ec5 ExecGate 执行生命周期九 gates + review_passed 双评审机械判据；OPEN #5/#6
+裁决落 ROADMAP）已提交。**下一步 CP5.2（注册/评审 gates）**。
+**已完成**：步①（M0）+ 步②（M1）+ 步③（M2）+ 步④（M3）+ 步⑤ CP5.1。测试基线 **369 绿**。
 
 ## 步⑤（M4）目标（§7.1 M4 行）——真执行 + 真 log + import 物化
 验收（可证伪）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例
@@ -40,15 +40,18 @@
   NotImplementedError；reasoning provider 为注入式（测试确定性替身；真 Codex provider = M4 接，范式在 M0
   driver._run_reasoning_with_retry）。
 
-## 下一步动作（按序）—— 步⑤（M4）开工
-1. **读 OPEN #5/#6**（reference/OPEN.md）→ 全自动裁决、落受审载体。
-2. **精读 M4 规格**（建议 Explore 提取省上下文，session 重启后 scratchpad 已清）：第一部分 §4.1.4（池注册 gate 全家）/
-   §4.2.5 两段提交/§4.3.1（parser 观测派生）/§3.4.3+§4.1.4 附注（双评审 DECISION 机械判据）/§3.6.3+§4.2.1（import 物化）；
-   第二部分 §6.9（语义判据 5 判例）/§6.13。第三部分 §7.1 M4 行。
-3. **裁量 M4 检查点切分**（精读后定，落 implement_note+ROADMAP）。粗切设想：CP5.1 池注册 gate_register_* + attack plan
-   阶段（phase_commit 幂等）；CP5.2 真执行两段提交 + parser 真派生；CP5.3 import 物化 + 失败路径负例；CP5.4 语义判据
-   5 判例 + 步级验证收尾。
-4. 每检查点照 §5 循环：内审 Opus 子代理 + codex 外审 ≤2 轮 → commit → build_log。
+## 下一步动作（按序）—— CP5.2（注册/评审 gates）
+M4 计划已定（ROADMAP 步⑤ CP5.1–5.6；OPEN #5/#6 已裁决）。M4 refsheet=`<scratch>/M4_refsheet.md`（session 重启
+后 scratchpad 会清空，需重跑 Explore 提取 §4.1.4/§4.2.5/§3.6.3/§7.1-M4）。CP5.2：
+1. **注册/评审 gates**（§4.1.4 line466-470/480）：gate_claim_baseline（canonical_key 占用 I5 拒/identity 不全拒→
+   baseline+variant planned）、gate_register_baseline（run success+checkpoint hash+eval success canonical
+   target_set_hash I6+required 全+**通过 result_review**[review_passed 已备]→baseline/variant legal+绑 factory eval）、
+   gate_claim_variant/gate_register_variant（同判据面）、gate_new_protocol（改 scope 不升版拒 I1）。
+2. **subject manifest 确定性构造**（§4.1.4 附注）：编排器侧 canonical JSON（键排序+条目按 ref 排序）→ sha256；
+   code_review 集与 result_review 集两配方。放 gate_exec.py 旁（或新 subject_manifest.py，判读依赖面定）。
+3. pool 侧写（baseline/variant→legal 即入池；pool_publish 语义查 spec 是否只是状态或另有副本表——精读后定）。
+4. 照 §5 循环：内审 Opus + codex ≤2 轮 → commit → build_log 0021。后续 CP5.3 真执行+parser、CP5.4 attack advance、
+   CP5.5 import 物化、CP5.6 语义判据收尾。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
