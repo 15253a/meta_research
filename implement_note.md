@@ -4,8 +4,11 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.2 开工
-- 检查点状态：空闲（CP7.1 已完成 da38b2f + docs 记账；CP7.2 = 真 Codex 生产装配 + 全系统入口 run.py）
+- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.2
+- 检查点状态：自验通过（510 绿=502+8）→ 内审/外审中。改动=stage_provider.py 新建（StageProvider：真
+  CodexRunner→(cyc,pack)→files 阶段回调 idea/plan/reasoning；render 由调用方、run+信封解析+逐产物 schema
+  校验+artifact_parse 重试[附错误反馈]；与真 SqliteAdvancer 端到端 mock 跑通）+ test_stage_provider.py(8)。
+  **CP7.2 收窄为 StageProvider 适配器**（judge provider + 全系统入口 run.py 移 CP7.3；attack 场景 CP7.4）。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
