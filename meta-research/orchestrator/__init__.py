@@ -22,6 +22,7 @@
 - budgeting.py  — compute_budget：单轮 B(t) 唯一定义（compiler/status_card 共用，防公式漂移）
 - status_card.py — build_status_card：人机控制台派生卡（M2：§4.6.6 封闭字段集构建器；原子发布接入=M3）
 - advancer.py  — SqliteAdvancer（M3：真组件上可恢复状态机步进 + derive_next_route 全矩阵；M0 driver 并存不替换）
+- stopcontroller.py — StopController（M6：长跑自终止安全网——§4.4.6 τ 判据①分数衰退/②预算耗尽，durable global_stop）
 - attack_stages.py — AttackStages（M4：attack 轮 idea/plan/bundle/reasoning 阶段推进——两段提交+结构恢复+管线强制 ingest）
 - phase_commit.py — 阶段级原子提交幂等落库（§4.2.5：同键同 hash 跳过、异 hash conflict 拒）
 - import_worker.py — ImportWorker（M4：外部 import 物化——worker cycle[OPEN #6]+供应链 manifest+失败路径全拒）

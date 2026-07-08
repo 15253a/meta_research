@@ -4,8 +4,11 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑦（M6）待开工（步⑥ M5 已完成）
-- 检查点状态：空闲（M5 收尾记账完成；M6 未开工）
+- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.1
+- 检查点状态：自验通过（498 绿=489+9）→ 内审/外审中。改动=stopcontroller.py 新建（§4.4.6 τ 判据①分数
+  衰退 in-process 计数/②预算耗尽 DB 派生/durable global_stop）+ advancer.run_cycles 接线（启动查
+  already_stopped + 每轮 check_after_round）+ policy.budget.session_max 新增（决策性，schema 同步）+
+  test_stopcontroller.py(9)。**注意：policy.yaml/schema 改动是决策性，外审重点。**
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。

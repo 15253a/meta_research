@@ -143,4 +143,29 @@
 
 ### 步⑦（M6）长跑 + 验收剧本
 - 验证方法（§7.1 M6 行 + §7.3/§7.4）：数百轮无人值守不漂移；双模式 A/B 实测定默认；§7.3 机制剧本（happy+失败路径）与 §7.4 研究能力任务（T1/T2）全通。开工前确认 OPEN #4。
-- 状态：未开始
+- 状态：**进行中**（2026-07-08 开工）
+- **建造 / 执行边界（全自动裁量，2026-07-08）**：M6 建造面 = 让系统「完整运行、进入全自动」的机器
+  （自终止安全网 + 真 Codex 装配入口 + 双模式 + §7.3 机制集成验收）；§7.4 T1/T2 是**真算力多日运维执行**
+  （数百轮×24h 真 EEG），非本轮建造可完成——建造交付 = 系统可全自动启动 T1/T2 且机制验收过，跑到科学
+  结论属运维。理由：§7.4「从头」任务本质是长跑执行，代码就绪后由运维发起。
+- **OPEN #4 裁决（全自动，2026-07-08）**：paper-gap **不引入独立谓词机制**——「论文可写/缺口闭合」已被
+  `goal.predicate_json` 的成功条件涵盖（T1=universal+novel+robust 或可审计负结论；T2=SOTA 超越+CI/Holm/
+  ablation）；满足目标谓词即 = paper-gap 闭合，由既有 reasoning 收口(I3)+τ判据③（谓词满足）判定。另设
+  paper-gap 审计题会与 τ判据③重复、且破坏 §2.3 七研究形态封闭。故 OPEN #4：折入 goal.predicate_json，
+  不新增题型/机制。**机器契约（非仅文档约定）**：goalbrief.py 已强制 goal_brief frontmatter 含合法
+  predicate_json（缺/非法即启动失败，§4.6.7）——「论文可写」成功条件即编码于此谓词、由 reasoning 收口
+  按 I3 回溯证据判定，故是机器可执行契约。裁决落 build_log 0029 + goal_brief 模板注释。
+- 检查点（模型切，边走边补）:
+  - [ ] CP7.1 自终止安全网（§4.4.6 τ 三判据强制）：run_cycles 每轮前 StopController 评估——①open/active
+    最高分连续 N 轮 < score_floor（in-process 计数，恢复保守重置注明）②全局成本 ≥ budget.session_max
+    （**ledger.money 求和**，覆盖 reasoning/Codex 等全 phase；DB 派生、恢复安全的预算门每轮开工前评估）
+    ③provider terminate（既有）；停机记 DECISION(orchestrator, global_stop, 原因)。policy.budget.session_max
+    新增（决策性，走评审）。
+  - [ ] CP7.2 真 Codex 生产装配：StageProvider 适配器（compiler.render→CodexRunner.run_task→信封解析→
+    schema 校验→files；artifact_parse 重试）绑真组件（SqliteAdvancer+AttackStages+ImportWorker）+ 全系统
+    装配入口 `run.py`（goal_brief 解析→DB init→装配→run_cycles）+ kill-9 真栈恢复冒烟。
+  - [ ] CP7.3 会话双模式 A/B（policy.session.mode_default；模式 A 一 turn 一格 / 模式 B 一 turn 多格 Codex
+    自停，共用恢复不变式）+ 双模式对比脚手架（记吞吐/恢复/token）。
+  - [ ] CP7.4 §7.3 机制验收剧本集成测试（主链路对照 / import 三失败路径 / 日志 suspect→复现 / 人机安全
+    四负例）+ M6 步级验证收尾（含长跑漂移断言：mock 数百轮 kill-9 一致 + τ 自停）。
+- 执行交付（本 session 外，运维发起）：§7.4 T1/T2 真跑（真 Codex + 真 EEG，数百轮×24h）。

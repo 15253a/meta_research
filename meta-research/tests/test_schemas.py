@@ -107,7 +107,7 @@ def test_policy_defaults_match_appendix_c_spotchecks():
     with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
         p = yaml.safe_load(f)
     assert p["acquisition"] == {"w1": 0.35, "w2": 0.25, "w3": 0.30, "c": 0.10}
-    assert p["budget"] == {"B0": 5, "doubling_period_m": 8, "B_max": 40}
+    assert p["budget"] == {"B0": 5, "doubling_period_m": 8, "B_max": 40, "session_max": 100000}  # session_max: M6 CP7.1 全局安全网
     assert p["flow"]["retry"] == {
         "artifact_parse": 2, "plan_review": 2,
         "bundle_code_review": 3, "bundle_result_review": 3,

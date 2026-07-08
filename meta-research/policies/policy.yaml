@@ -9,7 +9,7 @@ acquisition: { w1: 0.35, w2: 0.25, w3: 0.30, c: 0.10 }
 
 # —— 预算 ——
 # 单位与 ledger 一致（USD 等效）；初值≈廉价探针
-budget: { B0: 5, doubling_period_m: 8, B_max: 40 }
+budget: { B0: 5, doubling_period_m: 8, B_max: 40, session_max: 100000 }   # session_max=全局成本(ledger.money 求和)安全网上限（§4.4.6 判据②，M6；null 关闭）；100000 为失控兜底、远高于合法长跑（B_max=40×数百轮），A/B 实测后细化。ledger 写入=M6 硬化，未接前本网休眠
 
 # —— 流程阈值 ——
 flow:
