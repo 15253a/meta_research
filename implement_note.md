@@ -4,8 +4,10 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.3 开工
-- 检查点状态：空闲（CP7.2 已完成 2ce750e + docs 记账；CP7.3 = 全系统装配入口 run.py + 双模式 A/B）
+- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.3
+- 检查点状态：自验通过（519 绿=515+4）+ **真 Codex CLI 冒烟通过**（`python -m orchestrator.run` 真跑一轮
+  bootstrap：Codex 建真根问题、cycle done route=bootstrap next=decompose、决策落账、status_card 发布）
+  → 内审/外审中。改动=run.py 新建（build_system 全装配+System.run+main CLI）+ test_run.py(4)。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
