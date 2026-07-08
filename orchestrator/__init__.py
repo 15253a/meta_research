@@ -24,6 +24,7 @@
 - advancer.py  — SqliteAdvancer（M3：真组件上可恢复状态机步进 + derive_next_route 全矩阵；M0 driver 并存不替换）
 - attack_stages.py — AttackStages（M4：attack 轮 idea/plan/bundle/reasoning 阶段推进——两段提交+结构恢复+管线强制 ingest）
 - phase_commit.py — 阶段级原子提交幂等落库（§4.2.5：同键同 hash 跳过、异 hash conflict 拒）
+- import_worker.py — ImportWorker（M4：外部 import 物化——worker cycle[OPEN #6]+供应链 manifest+失败路径全拒）
 - runner.py    — CodexRunner（真 codex exec，M0 起即真）
 - goalbrief.py — 启动输入①解析（§4.6.7 机械校验唯一实现）
 """

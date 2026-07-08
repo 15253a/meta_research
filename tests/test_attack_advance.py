@@ -429,6 +429,32 @@ def test_judge_replay_safe(tmp_path):
 
 
 # ============ phase_commit conflict ============
+def test_attack_judge_fail_settles_target(tmp_path):
+    """lockstep 回归（codex CP5.5 BLOCKER 的 attack 侧）：judge FAIL → target failed(review_failed)、
+    轮正常收尾（Qn inconclusive），不确定性重试死循环。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    def fail_judge(cycle_id, bt_id, kind, sh):
+        from orchestrator.ids import cnum
+        with daemon.transaction() as conn:
+            rc = conn.execute("INSERT INTO runner_call(cycle_id,phase,purpose,status) VALUES (?,'audit',?,'success')",
+                              (cnum(cycle_id), kind)).lastrowid
+            conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'judge',?,?)",
+                         (cnum(cycle_id), kind, json.dumps({"build_target_id": bt_id, "review_kind": kind,
+                                                            "round_no": 1, "verdict": "fail", "subject_hash": sh,
+                                                            "runner_call_id": rc, "policy_hash": "ph"})))
+    attack.p["judge"] = fail_judge
+    attack.p["reasoning"] = lambda cyc, pack: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == ("failed", "review_failed")
+    assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0            # 测量整包不注册
+    assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "inconclusive"
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
+    daemon.conn.close()
+
+
 def test_phase_commit_conflict_rejected(env):
     """staging 被改写后重做 → 同键异 hash → conflict 拒（§4.2.5 防误判已提交）。"""
     d = env["daemon"]

@@ -112,8 +112,7 @@ class PoolGate(ExecGate):
             var_id, pid, pver = create["variant_id"], create["protocol_id"], create["protocol_ver"]
         else:
             var_id = pid = pver = None   # append：从既有 evaluation 读（下）
-        if bt[2] == "import":
-            raise NotImplementedError("import 目标的测量注册随物化设计 = CP5.5（OPEN #6）")
+        # import 目标（M4 CP5.5 物化 worker）的出厂 eval 走同一注册口——绑定核/评审闸与 build 完全同判据面
         if create is not None and bt[6] != var_id:
             # target↔variant 绑定（codex BLOCKER×2）：不许拿 variant A 的评审/target 注册 variant B 的测量；
             # **NULL 不作通配**——未绑 variant 的 build/exec/eval 目标是非法态，同样拒（第2轮 BLOCKER）。
@@ -255,9 +254,12 @@ class PoolGate(ExecGate):
             self._reject(ci, f"register_baseline：初变体 {variant_id} 态非法（{vrow[1]}）")
         if not identity_doc.strip() or not repro_cmd.strip():
             self._reject(ci, "register_baseline：identity/复现命令字段缺")
+        # 自建走 build 目标；外部导入物化（CP5.5）走 import 目标——按 baseline.provenance 择 kind 判据
+        prov = self._q1("SELECT provenance FROM baseline WHERE id=?", (baseline_id,))[0]
         self._register_common_checks(ci, variant_id=variant_id, build_target_id=build_target_id,
                                      run_id=run_id, evaluation_id=evaluation_id,
-                                     current_subject_hash=current_subject_hash, expect_kind="build")
+                                     current_subject_hash=current_subject_hash,
+                                     expect_kind="import" if prov == "external_import" else "build")
         try:
             with self.daemon.transaction() as conn:
                 # repro_cmd 进 identity_doc（自由 markdown）；code_ref/commit_hash 是**仓库引用**语义（喂卡片/召回），

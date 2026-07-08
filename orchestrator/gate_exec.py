@@ -84,15 +84,13 @@ class ExecGate:
                         "eval_action FROM build_target WHERE id=?", (build_target_id,))
 
     def gate_start_build_target(self, *, build_target_id: int) -> None:
-        """pending → building（build/exec，池对象连动 building）/ running（eval，不动池）。
+        """pending → building（build/exec/import，池对象连动 building）/ running（eval，不动池）。
         拒：非 pending；非当前串行目标（= 本 cycle 最小 seq 非终态者；有同 cycle 目标在途亦拒）。
-        import 目标 = CP5.5（物化 worker 设计里定其生命周期，§3.6.3/OPEN #6——此处不预写未审语义）。"""
+        import 目标（M4 CP5.5 物化 worker）：连动同 build（占位 baseline planned→building + 物化变体）。"""
         bt = self._bt(build_target_id)
         if bt is None:
             self._reject(None, f"build_target 不存在: {build_target_id}", attempted_target=build_target_id)
         _, ci, kind, _seq, status, bl, var, _eid, _ea = bt
-        if kind == "import":
-            raise NotImplementedError("import 目标生命周期随物化设计 = CP5.5（OPEN #6），本 gate 暂不处理")
         if status != "pending":
             self._reject(ci, f"build_target {build_target_id} 非 pending（当前 {status}），不可 start")
         inflight = self._q1("SELECT id FROM build_target WHERE cycle_id=? AND status IN ('building','smoke','running')", (ci,))
@@ -107,8 +105,8 @@ class ExecGate:
                 conn.execute("UPDATE build_target SET status='running' WHERE id=?", (build_target_id,))
                 return
             conn.execute("UPDATE build_target SET status='building' WHERE id=?", (build_target_id,))
-            # 池对象连动（§4.1.4）：build → baseline+初变体 building；exec → 仅本 target 新变体 building
-            if kind == "build" and bl is not None:
+            # 池对象连动（§4.1.4）：build/import → baseline+变体 building；exec → 仅本 target 新变体 building
+            if kind in ("build", "import") and bl is not None:
                 conn.execute("UPDATE baseline SET status='building' WHERE id=? AND status='planned'", (bl,))
             if var is not None:
                 conn.execute("UPDATE variant SET status='building' WHERE id=? AND status='planned'", (var,))
@@ -170,10 +168,10 @@ class ExecGate:
             conn.execute("UPDATE build_target SET status=?, failure_kind=? WHERE id=?",
                          (status, failure_kind, build_target_id))
             # 连坐（§4.1.4「失败/blocked 时」）：failed **与 engineering_blocked** 都连坐（内审 BLOCKER——
-            # 只 failed 会把池对象永久卡在 building）；**仅 build/exec 连坐、eval 目标不动池**（codex BLOCKER——
-            # eval 目标也带 variant_id，不加 kind 守卫会误伤被评变体）；失败卡/通知 outbox = M5 基建。
-            if status in ("failed", "engineering_blocked") and kind in ("build", "exec"):
-                if kind == "build" and bl is not None:
+            # 只 failed 会把池对象永久卡在 building）；**仅 build/exec/import 连坐、eval 目标不动池**（codex
+            # BLOCKER——eval 目标也带 variant_id，不加 kind 守卫会误伤被评变体）；失败卡/通知 outbox = M5 基建。
+            if status in ("failed", "engineering_blocked") and kind in ("build", "exec", "import"):
+                if kind in ("build", "import") and bl is not None:
                     conn.execute("UPDATE baseline SET status='build_failed' WHERE id=? AND status IN ('planned','building')", (bl,))
                 if var is not None:
                     conn.execute("UPDATE variant SET status='build_failed' WHERE id=? AND status IN ('planned','building')", (var,))

@@ -348,14 +348,19 @@ def test_review_old_malformed_does_not_block_newer_valid_pass(env):
     assert gate.review_passed(build_target_id=10, review_kind="bundle_code_review", current_subject_hash="sh1") is True
 
 
-def test_import_target_not_implemented(env):
-    """import 目标生命周期 = CP5.5（物化设计定，OPEN #6）——诚实 NotImplementedError，不预写未审语义。"""
+def test_import_target_start_moves_pool(env):
+    """import 目标（CP5.5 物化）：start 连动同 build——占位 baseline+物化变体 → building。"""
     gate, d = env
-    with d.transaction() as conn:
-        conn.execute("INSERT INTO build_target(id,cycle_id,target_kind,seq,status,variant_id) "
-                     "VALUES (12,2,'import',3,'pending',2)")
-    with pytest.raises(NotImplementedError, match="CP5.5"):
-        gate.gate_start_build_target(build_target_id=12)
+    with d.transaction() as conn:   # 占位 baseline（import 语义：provenance=external_import 须 license allow）
+        conn.execute("INSERT INTO baseline(id,slug,canonical_key,status,provenance,license_status) "
+                     "VALUES (3,'imp','ck-imp','planned','external_import','allow')")
+        conn.execute("INSERT INTO variant(id,baseline_id,variant_key,config_json,status) VALUES (5,3,'imported','{}','planned')")
+        conn.execute("INSERT INTO build_target(id,cycle_id,target_kind,seq,status,baseline_id,variant_id) "
+                     "VALUES (12,2,'import',3,'pending',3,5)")
+        conn.execute("UPDATE build_target SET status='complete' WHERE id IN (10,11)")   # 让 12 成当前串行目标
+    gate.gate_start_build_target(build_target_id=12)
+    assert d.query_one("SELECT status FROM baseline WHERE id=3")[0] == "building"
+    assert d.query_one("SELECT status FROM variant WHERE id=5")[0] == "building"
 
 
 # ============ abandon ============
