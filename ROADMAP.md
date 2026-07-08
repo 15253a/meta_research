@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑤（M4）已完成**（CP5.1–5.6；§7.1 M4 全判据步级验证通过，见 build_log 0025）。**下一步 步⑥（M5）人类控制台 + query 只读应答器**。步①–④（M0–M3）已完成。
+- 进行中的步 / 检查点：**步⑥（M5）进行中**——CP6.1 已完成（702071e，build_log 0026），当前推进 CP6.2（query 只读应答器 + 中介 + status_card 接线）。步①–⑤（M0–M4）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -120,10 +120,12 @@
 - 验证方法（§7.1 M5 行）：directive 按时机消费同记 DECISION；query 只读边界负例（responder 写库全被 authorizer 拒）；分类负例（unclear 不自动答）；ACK/query p95<2s；中介线程重建一致；润色≠raw；通知矩阵逐态推送断言；文件请求全流水 + 负例。
 - 状态：**进行中**
 - 检查点（模型切，边走边补）:
-  - [ ] CP6.1 保守分类器 + directive 生命周期：关键词规则确定性分类（query/directive/note/unclear；可能改状态
+  - [x] CP6.1 保守分类器 + directive 生命周期：关键词规则确定性分类（query/directive/note/unclear；可能改状态
     一律 directive）+ 润色≠raw 时序（directive pending 先行、分类行回指，trg_iclass_directive_prov）+ 硬指令
     回显确认 confirm/reject + **consume_directive 按时机消费**（immediate/stage_boundary/reasoning_start；
     DECISION actor=human 经 directive；软指令不从记理由；未确认硬指令拒）+ 负例（unclear 无 directive 行）
+    —— commit 702071e（build_log 0026；pause 状态模型=消费即进暂停态、阻断按 consumed_decision_id 消费序、
+    resume 消费解除并只清早于它的 pending pause）
   - [ ] CP6.2 query 只读应答器 + 中介：responder mode=ro+authorizer（写 decision/route/question/cycle/
     metric_result 全拒负例）+ grounding 校验/模板回退 + status_card 接线（advance 阶段边界发布 +
     latest_decision 按 cycle scope 补）+ 中介线程重建（interaction_*+status_card 重建、前后回答一致断言）
