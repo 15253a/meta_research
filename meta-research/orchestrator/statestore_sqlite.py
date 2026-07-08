@@ -157,6 +157,13 @@ class SQLiteStateStore:
             cid = cur.lastrowid
         return self._load_cycle(cid)
 
+    def cycle(self, cycle_id: str) -> Cycle:
+        """按 id 读某一轮的过程侧对象（M3 Advancer 用：cycle.status = 续跑游标）。不存在 → ValueError。"""
+        r = self._q1("SELECT 1 FROM cycle WHERE id=?", (_cnum(cycle_id),))
+        if r is None:
+            raise ValueError(f"cycle 不存在: {cycle_id}")
+        return self._load_cycle(_cnum(cycle_id))
+
     def _load_cycle(self, cid: int) -> Cycle:
         r = self._q1("SELECT id,status,route,active_question_id,next_question_id,next_intent FROM cycle WHERE id=?", (cid,))
         return Cycle(
