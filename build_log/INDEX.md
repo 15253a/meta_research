@@ -6,6 +6,7 @@
 
 ---
 
+- [0022](0022-cp53-harness-obs-parser.md) — CP5.3 真执行 harness + 确定性观测 parser + parser_result_suspect 真派生（OPEN #5 落地闭；stale fail-closed + 多 log OR） · commit `215c694` · 验证: 通过（pytest 409/409，20 obs_parser 用例）
 - [0021](0021-cp52-pool-gates-subject-manifest.md) — CP5.2 PoolGate 注册/评审 gates（claim/register + §4.2.5(ii) 单事务注册 + 绑定核）+ subject manifest 确定性 · commit `439d716` · 验证: 通过（pytest 389/389，20 gate_pool 用例）
 - [0020](0020-cp51-exec-gates.md) — CP5.1 ExecGate 执行生命周期 gates（§4.1.4 九函数 + review_passed 双评审机械判据；OPEN #5/#6 裁决） · commit `7d64ec5` · 验证: 通过（pytest 369/369，28 gate_exec 用例）
 - [0019](0019-cp43-import-idempotency.md) — CP4.3 select_deferred 幂等守卫（不重复登记，四道 fail-loud）**——收尾步④ M3** · commit `6dd2387` · 验证: 通过（pytest 341/341；M3 §7.1 两判据 10 测步级全过）

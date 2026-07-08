@@ -95,9 +95,10 @@
   - [x] CP5.2 注册/评审 gates（claim/register baseline·variant + **register_evaluation=§4.2.5(ii) 单事务注册入口** +
     new_protocol I1 全口径）+ subject manifest 确定性构造 + **target↔variant/kind 绑定核（NULL 不作通配）** +
     20 否定/全链用例 — commit 439d716（build_log 0021）。注册段整体单事务组合器 = CP5.4；import 两处 defer CP5.5
-  - [ ] CP5.3 真执行管线 + 真 parser：runner 起真子进程（toy harness）→ execution_log 登记 → 确定性 parser 解析 →
-    execution_observation(source=parser) + **policy observation 节（OPEN #5 落地）** + parser_result_suspect 真派生
-    （替 recall_sqlite 桩；此后复用判定方可对真执行上线）
+  - [x] CP5.3 真执行 harness（真子进程 + staging .partial→原子改名 + execution_log 幂等入账）+ 确定性 parser
+    （content_hash 锚校验 + P6 复算）+ **parser_result_suspect 真派生**（当前 (version,policy_hash) 过滤 +
+    stale≠clean fail-closed + 多 log OR；替 M2 桩，复用判定/关问证据拒接真）+ **policy observation 节
+    （OPEN #5 落地闭）** — commit 215c694（build_log 0022）
   - [ ] CP5.4 attack 轮 advance 全链（idea/plan/bundle 阶段推进 + phase_commit 幂等 + 两段提交 + bundle_cursor 续跑 +
     恢复扩展到 attack 阶段）
   - [ ] CP5.5 import 物化（**OPEN #6 落地**：worker cycle + clone pinned/manifest 供应链闭包 + 沙箱 smoke + 出厂 eval +
