@@ -6,6 +6,7 @@
 
 ---
 
+- [0032](0032-cp74-mechanism-scenarios.md) — CP7.4 §7.3 机制验收剧本（主链路 I1/I2/I3 因果链 / import 三失败 / 日志 suspect→gate 消费侧 fail-closed / 人机 §7.3-item4 三向负例；mock 驱动真组件、非真 Codex）· commit `6be7566` · 验证: 通过（pytest 532/532，8 新用例）
 - [0031](0031-cp73-run-entrypoint.md) — CP7.3 run.py 全系统装配入口（一条命令：真组件+StageProvider(真 Codex)→run_cycles；**真 Codex CLI 冒烟通过**；只读连接单写边界；DB 权威 goal_body；τ/阻断端到端）· commit `ce11d00` · 验证: 通过（pytest 524/524，9 新用例 + 真 Codex 冒烟 exit 0）
 - [0030](0030-cp72-stage-provider.md) — CP7.2 StageProvider 真 Codex 生产装配（run+信封解析+逐产物 schema 校验+artifact_parse 重试 封成真组件 (cyc,pack)→files；answer 语义下沉组件；sidecar fail-loud；真 SqliteAdvancer e2e）· commit `2ce750e` · 验证: 通过（pytest 515/515，13 新用例）
 - [0029](0029-cp71-stopcontroller.md) — CP7.1 长跑自终止安全网（M6 开工：§4.4.6 τ 判据①分数衰退[前沿全评分才判]②ledger.money 预算门恢复安全；durable global_stop；OPEN #4 折入 predicate_json）· commit `da38b2f` · 验证: 通过（pytest 502/502，13 新用例）

@@ -172,8 +172,10 @@
     **真 Codex CLI 冒烟通过**：一轮 bootstrap Codex 建真根问题+cycle done+决策落账+卡发布；只读连接单写
     边界、DB 权威 goal_body、τ/阻断/exit-2 端到端）。双模式 A/B：reasoning-only 下 A≡B，真 stage-granular
     分驱随 attack 落 CP7.4。
-  - [ ] CP7.4 §7.3 机制验收剧本集成测试（主链路对照 I1/I2/I3 / import 三失败路径 / 日志 suspect→复现 /
-    人机安全四负例）——**mock provider 驱动真组件**的端到端串联断言（验状态机+不变量，非真 Codex）。
+  - [x] CP7.4 §7.3 机制验收剧本集成测试（主链路对照 I1/I2/I3 因果链 / import 三失败路径 / 日志 suspect→
+    gate 消费侧 fail-closed / 人机 §7.3-item4 三向负例）——**mock provider 驱动真组件**端到端串联断言
+    —— commit 6be7566（build_log 0032；剧本 3 验消费侧 gate 拒 suspect 证据；I2 绑 run.status、I3 绑
+    answered↔证据；evidence.kind CHECK 显式 raises）。
   - [ ] CP7.5 M6 步级验证收尾：长跑漂移断言（mock 数百轮 kill-9 一致 + τ 自停）+ §7.3 全过 + §7.1 M6
     行勾兑。
 
