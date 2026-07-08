@@ -118,7 +118,19 @@
 
 ### 步⑥（M5）人类控制台 + query 只读应答器
 - 验证方法（§7.1 M5 行）：directive 按时机消费同记 DECISION；query 只读边界负例（responder 写库全被 authorizer 拒）；分类负例（unclear 不自动答）；ACK/query p95<2s；中介线程重建一致；润色≠raw；通知矩阵逐态推送断言；文件请求全流水 + 负例。
-- 状态：未开始
+- 状态：**进行中**
+- 检查点（模型切，边走边补）:
+  - [ ] CP6.1 保守分类器 + directive 生命周期：关键词规则确定性分类（query/directive/note/unclear；可能改状态
+    一律 directive）+ 润色≠raw 时序（directive pending 先行、分类行回指，trg_iclass_directive_prov）+ 硬指令
+    回显确认 confirm/reject + **consume_directive 按时机消费**（immediate/stage_boundary/reasoning_start；
+    DECISION actor=human 经 directive；软指令不从记理由；未确认硬指令拒）+ 负例（unclear 无 directive 行）
+  - [ ] CP6.2 query 只读应答器 + 中介：responder mode=ro+authorizer（写 decision/route/question/cycle/
+    metric_result 全拒负例）+ grounding 校验/模板回退 + status_card 接线（advance 阶段边界发布 +
+    latest_decision 按 cycle scope 补）+ 中介线程重建（interaction_*+status_card 重建、前后回答一致断言）
+    + ACK/query p95<2s 断言
+  - [ ] CP6.3 通知矩阵 outbox + 文件请求全流水 + 全局等待：directive 逐态推送断言（7 态+文件请求 3 事件）；
+    outbox 幂等投递；pending 请求→Advancer 不开新研究 runner call 而 query/通知照常；uploads 校验 hash 入账
+    并入 input/user_provided/ 恢复推进；创建拒绝三负例 + schema 拒 —— 收尾 M5 跑步级验证
 
 ### 步⑦（M6）长跑 + 验收剧本
 - 验证方法（§7.1 M6 行 + §7.3/§7.4）：数百轮无人值守不漂移；双模式 A/B 实测定默认；§7.3 机制剧本（happy+失败路径）与 §7.4 研究能力任务（T1/T2）全通。开工前确认 OPEN #4。

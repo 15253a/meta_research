@@ -25,6 +25,7 @@
 - attack_stages.py — AttackStages（M4：attack 轮 idea/plan/bundle/reasoning 阶段推进——两段提交+结构恢复+管线强制 ingest）
 - phase_commit.py — 阶段级原子提交幂等落库（§4.2.5：同键同 hash 跳过、异 hash conflict 拒）
 - import_worker.py — ImportWorker（M4：外部 import 物化——worker cycle[OPEN #6]+供应链 manifest+失败路径全拒）
+- console.py    — Console（M5：保守关键词分类器 + directive 生命周期——润色≠raw 时序/回显确认/按时机消费+DECISION）
 - runner.py    — CodexRunner（真 codex exec，M0 起即真）
 - goalbrief.py — 启动输入①解析（§4.6.7 机械校验唯一实现）
 """
