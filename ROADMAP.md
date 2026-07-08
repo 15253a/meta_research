@@ -103,8 +103,11 @@
     训练/评估 + 双评审 + 注册入池）+ phase_commit 幂等 + 结构恢复（5 类崩溃缝隙楔死/洗白/分裂全修：补登幂等锚校验、
     eval-final 续注册 exit 侧车、judge replay-safe、reasoning 产物持久化、终态早退落 pc）+ reasoning 真证据关问 —
     commit 6af22cf（build_log 0023）。M5/M6 硬化：注册段合一事务、route plan 后特化
-  - [ ] CP5.5 import 物化（**OPEN #6 落地**：worker cycle + clone pinned/manifest 供应链闭包 + 沙箱 smoke + 出厂 eval +
-    gate_register_baseline 占位→legal + resolve_deps + pool_publish）+ 失败路径负例全拒
+  - [x] CP5.5 import 物化 ImportWorker（**OPEN #6 落地闭**：worker cycle route 终身 NULL+同事务标记+无条件探测
+    fail-loud；scope 消费点→clone 卫生→供应链 manifest→真 smoke→适配评审→import run+checkpoint 五件套
+    provenance→出厂 eval[source 仍 factory]→占位→legal→imported 事件→resolve_deps 解锁问题）+ **失败路径
+    全拒含 judge FAIL**（settling 不死循环；attack 侧 lockstep 同修）+ 崩溃缝隙全修（收尾+resolve_deps 同
+    atomic 等）— commit d9de442（build_log 0024）
   - [ ] CP5.6 语义判据 5 判例 + M4 步级验证收尾
 - **M3 移交清单**（各处裁量汇总，M4 开工先读）：attack 轮 advance（idea/plan/bundle 阶段 + phase_commit 幂等 + 恢复扩展）；
   池注册 gate_register_*（15 函数，build_log 0013）；真执行 + 真 log/观测 + parser_result_suspect 真派生（此前复用判定不得
