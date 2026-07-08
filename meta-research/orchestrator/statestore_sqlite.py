@@ -145,8 +145,13 @@ class SQLiteStateStore:
         row = self._q1("SELECT max(version) FROM goal WHERE id=1")
         return row[0] if row and row[0] is not None else 1
 
+    def _inflight_row(self):
+        """在途（非终态）轮的 id 行或 None——open_or_resume_cycle 与 inflight_cycle 共用一处口径（防漂移，内审 NIT）。
+        单驱动器模型下至多一条。"""
+        return self._q1("SELECT id FROM cycle WHERE status NOT IN ('done','failed','aborted') ORDER BY id LIMIT 1")
+
     def open_or_resume_cycle(self) -> Cycle:
-        row = self._q1("SELECT id FROM cycle WHERE status NOT IN ('done','failed','aborted') ORDER BY id LIMIT 1")
+        row = self._inflight_row()
         if row:
             return self._load_cycle(row[0])
         gver = self._goal_ver()
@@ -163,6 +168,17 @@ class SQLiteStateStore:
         if r is None:
             raise ValueError(f"cycle 不存在: {cycle_id}")
         return self._load_cycle(_cnum(cycle_id))
+
+    def inflight_cycle(self) -> Optional[Cycle]:
+        """在途（非终态）轮，**不创建**（区别于 open_or_resume_cycle）。M3 驱动循环恢复用：重启先看有无在途轮续跑。"""
+        r = self._inflight_row()
+        return self._load_cycle(r[0]) if r else None
+
+    def last_done_cycle(self) -> Optional[Cycle]:
+        """最近**成功收尾**（status='done'）的轮。M3 驱动循环用其 next_intent/next_question_id 定下一轮 route/目标
+        （durable 交接，不靠进程内记忆——护恢复）。failed/aborted 不算（其 selection 未落或无效）。"""
+        r = self._q1("SELECT id FROM cycle WHERE status='done' ORDER BY id DESC LIMIT 1")
+        return self._load_cycle(r[0]) if r else None
 
     def _load_cycle(self, cid: int) -> Cycle:
         r = self._q1("SELECT id,status,route,active_question_id,next_question_id,next_intent FROM cycle WHERE id=?", (cid,))

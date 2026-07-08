@@ -7,6 +7,10 @@
 """
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -188,10 +192,136 @@ def test_advance_bootstrap_requires_create_root(env):
     assert state.cycle(cyc.cycle_id).status == "created"      # 未标 done
 
 
-def test_advance_non_bootstrap_not_implemented(env):
-    """CP4.1 仅 bootstrap；attack/decompose route → NotImplementedError（诚实拒，后续检查点接）。"""
+def test_advance_attack_not_implemented(env):
+    """CP4.2 仅 reasoning-only（bootstrap/decompose）；attack route → NotImplementedError（诚实拒，M4 接池注册/真执行）。"""
     state, compiler = env
     cyc = _prepared_bootstrap(state, route="attack")
     adv = SqliteAdvancer(state, compiler, _bootstrap_provider)
-    with pytest.raises(NotImplementedError, match="bootstrap"):
+    with pytest.raises(NotImplementedError, match="attack"):
         adv.advance(cyc.cycle_id)
+
+
+# ============ 外层驱动循环 + decompose（reasoning-only：bootstrap→decompose→terminate）============
+def _seq_provider(cyc, pack):
+    """确定性序列 provider：bootstrap 造根 + 选 decompose；decompose 给活跃根挂两子 + 选 terminate。"""
+    if cyc.route == "bootstrap":
+        return {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根问题：EEG 有跨数据集通用规律吗？", "local_key": "root"}]},
+                "selection.json": {"next_question_id": "root", "next_intent": "decompose",
+                                   "scores": [{"question_id": "root", "score": 0.9, "est_cost": 1.0}]}}
+    return {"tree_ops.json": {"ops": [{"op": "add_children", "parent_question_id": cyc.question_id,
+                                       "children": [{"text": "子问题1", "local_key": "c1"},
+                                                    {"text": "子问题2", "local_key": "c2"}]}]},
+            "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+
+
+def _final_state(path):
+    """终库确定性状态（**排除 timestamp/attempt_id/log offset 等非确定字段**，§7.1 M3）：cycle 全过程字段
+    （含 durable handoff 的 next_question_id/next_intent）+ question（含 visit/score/est_cost）+ question_dep 全列。"""
+    c = db.connect(path)
+    cycles = c.execute("SELECT id,status,route,next_intent,next_question_id,active_question_id FROM cycle ORDER BY id").fetchall()
+    questions = c.execute("SELECT id,parent_id,text,status,visit_count,score,est_cost FROM question ORDER BY id").fetchall()
+    deps = c.execute("SELECT question_id,dep_type,depends_on_question_id,depends_on_baseline_id,status "
+                     "FROM question_dep ORDER BY id").fetchall()
+    c.close()
+    return {"cycles": cycles, "questions": questions, "deps": deps}
+
+
+def test_run_cycles_bootstrap_decompose_terminate(env, tmp_path):
+    state, compiler = env
+    ids = SqliteAdvancer(state, compiler, _seq_provider).run_cycles(max_cycles=8)
+    assert len(ids) == 2                                  # bootstrap + decompose，then terminate 停机
+    qs = {q[2]: q for q in state._qall("SELECT id,parent_id,text,status FROM question ORDER BY id")}
+    assert "根问题：EEG 有跨数据集通用规律吗？" in {q[2] for q in qs.values()}
+    assert "子问题1" in qs and "子问题2" in qs             # decompose 挂了两子
+    assert state.last_done_cycle().next_intent == "terminate"
+
+
+def test_run_cycles_resume_after_restart(tmp_path):
+    """恢复：跑 1 轮（bootstrap）后**换新 Advancer/StateStore（模拟重启）**指向同库 → 续跑 decompose 并停机，
+    终库与一次跑完全一致（durable 交接、无进程内记忆）。"""
+    path = str(tmp_path / "research.sqlite")
+
+    def _fresh(p):
+        daemon = WriteDaemon(db.connect(p))
+        st = SQLiteStateStore(daemon, POLICY)
+        comp = SqliteCompiler(db.connect(p), POLICY, goal_body_md="EEG 通用规律研究")
+        return daemon, st, comp
+
+    # 参照：一次跑完（另一库）
+    ref_path = str(tmp_path / "ref.sqlite")
+    d0, s0, c0 = _fresh(ref_path); s0.create_goal(text="EEG 通用规律研究", predicate_json={})
+    SqliteAdvancer(s0, c0, _seq_provider).run_cycles(max_cycles=8)
+    d0.conn.close(); c0.conn.close()
+
+    # 断点跑：先 1 轮（bootstrap），关连接（模拟进程死），再新实例续跑
+    d1, s1, c1 = _fresh(path); s1.create_goal(text="EEG 通用规律研究", predicate_json={})
+    SqliteAdvancer(s1, c1, _seq_provider).run_cycles(max_cycles=1)   # 只 bootstrap
+    d1.conn.close(); c1.conn.close()                                  # 模拟重启：旧连接消失
+
+    d2, s2, c2 = _fresh(path)
+    SqliteAdvancer(s2, c2, _seq_provider).run_cycles(max_cycles=8)    # 续跑 → decompose → terminate
+    d2.conn.close(); c2.conn.close()
+
+    assert _final_state(path) == _final_state(ref_path)              # 续跑终库 == 一次跑完（排除时间戳字段）
+
+
+def test_kill9_recovery_final_state_identical(tmp_path):
+    """§7.1 M3 恢复验收（**真 kill -9**）：驱动循环进到 decompose 轮（阶段将写未写）时 SIGKILL 子进程 →
+    全新进程续跑 → 终库状态与不杀一次跑完**一致**（排除 timestamp/attempt_id/log offset 等非确定字段）。"""
+    # 参照：一次跑完（另一库）
+    ref = str(tmp_path / "ref.sqlite")
+    d0 = WriteDaemon(db.connect(ref)); s0 = SQLiteStateStore(d0, POLICY)
+    s0.create_goal(text="EEG 通用规律研究", predicate_json={})
+    c0 = SqliteCompiler(db.connect(ref), POLICY, goal_body_md="EEG 通用规律研究")
+    SqliteAdvancer(s0, c0, _seq_provider).run_cycles(max_cycles=8)
+    d0.conn.close(); c0.conn.close()
+
+    # 断点库：父建 goal + 关连接（子进程独占写）
+    path = str(tmp_path / "research.sqlite")
+    dp = WriteDaemon(db.connect(path)); SQLiteStateStore(dp, POLICY).create_goal(text="EEG 通用规律研究", predicate_json={})
+    dp.conn.close()
+
+    marker = tmp_path / "ready.flag"
+    worker = tmp_path / "worker.py"
+    worker.write_text(textwrap.dedent(f"""
+        import sys, time, yaml
+        from pathlib import Path
+        sys.path.insert(0, {str(SYSTEM_ROOT)!r})
+        from orchestrator import database as db
+        from orchestrator.statestore_sqlite import SQLiteStateStore
+        from orchestrator.compiler_sqlite import SqliteCompiler
+        from orchestrator.writedaemon import WriteDaemon
+        from orchestrator.advancer import SqliteAdvancer
+        POL = yaml.safe_load((Path({str(SYSTEM_ROOT)!r})/"policies"/"policy.yaml").read_text(encoding="utf-8"))
+        def prov(cyc, pack):
+            if cyc.route == "bootstrap":
+                return {{"tree_ops.json": {{"ops":[{{"op":"create_root","text":"根问题：EEG 有跨数据集通用规律吗？","local_key":"root"}}]}},
+                        "selection.json": {{"next_question_id":"root","next_intent":"decompose","scores":[{{"question_id":"root","score":0.9,"est_cost":1.0}}]}}}}
+            open({str(marker)!r}, "w").close()   # 已进 decompose 轮、阶段将写未写 → 信号父可杀
+            time.sleep(60)                        # 挂起等 kill -9（decompose 阶段永不提交）
+        s = SQLiteStateStore(WriteDaemon(db.connect({path!r})), POL)
+        comp = SqliteCompiler(db.connect({path!r}), POL, goal_body_md="EEG 通用规律研究")
+        SqliteAdvancer(s, comp, prov).run_cycles(max_cycles=8)
+    """), encoding="utf-8")
+
+    proc = subprocess.Popen([sys.executable, str(worker)])
+    try:
+        for _ in range(200):
+            if marker.exists():
+                break
+            time.sleep(0.1)
+        assert marker.exists(), "worker 未到达 decompose 挂起点"
+        proc.kill()                               # SIGKILL：不给清理机会
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    # 续跑（全新实例指向同库 = 重启进程语义）→ 正常 provider 完成 decompose→terminate
+    d2 = WriteDaemon(db.connect(path)); s2 = SQLiteStateStore(d2, POLICY)
+    c2 = SqliteCompiler(db.connect(path), POLICY, goal_body_md="EEG 通用规律研究")
+    ids = SqliteAdvancer(s2, c2, _seq_provider).run_cycles(max_cycles=8)
+    d2.conn.close(); c2.conn.close()
+
+    assert ids, "续跑应至少推进一轮（decompose）"
+    assert _final_state(path) == _final_state(ref)   # 杀后续跑 == 不杀跑完（排除非确定字段）
