@@ -66,11 +66,15 @@ def derive_next_route(prev_selection: Selection, outcome: PlanOutcome) -> Option
 
 class SqliteAdvancer:
     def __init__(self, state, compiler, reasoning_provider: ReasoningProvider,
-                 gate=None, recall=None, attack=None, status_publisher=None):
+                 gate=None, recall=None, attack=None, status_publisher=None, precheck=None):
         """state = SQLiteStateStore；compiler = SqliteCompiler；reasoning_provider 见模块注释。
         attack = attack_stages.AttackStages（M4 CP5.4：idea/plan/bundle/reasoning 阶段推进；None = 拒 attack 轮）。
         status_publisher = status_card.SqliteStatusPublisher（M5 CP6.2：阶段边界原子发布人机快照；
-        None = 不发布——发布是派生观测，不参与研究状态机，故可选装）。gate/recall 预留。"""
+        None = 不发布——发布是派生观测，不参与研究状态机，故可选装）。
+        precheck = notify.make_advancer_precheck 产物（M5 CP6.3，§4.4.1 全局等待）：callable(cyc_or_None)
+        -> Optional[str]——先按时机消费到期 directive，再返回阻断拒因（pause 生效中 / pending 文件请求）；
+        非 None ⇒ 本轮 run_cycles 停止推进（不发新研究 Runner 调用、不推阶段；query/通知不走本类、照常）。
+        gate/recall 预留。"""
         self.state = state
         self.compiler = compiler
         self._reasoning = reasoning_provider
@@ -78,6 +82,8 @@ class SqliteAdvancer:
         self.recall = recall
         self.attack = attack
         self.status_publisher = status_publisher
+        self.precheck = precheck
+        self.last_block_reason: Optional[str] = None   # 最近一次阻断拒因（观测用；None=未被阻断）
         self.import_worker = None    # M4 CP5.5：物化 worker（set 后 _resume_or_open 识别 worker 轮交其续跑）
 
     def derive_next_route(self, prev_selection: Selection, outcome: PlanOutcome) -> Optional[Route]:
@@ -91,18 +97,30 @@ class SqliteAdvancer:
         上轮 selection.next_intent=terminate → 停机。返回本次推进的 cycle_id 序列。"""
         ids: List[str] = []
         for _ in range(max_cycles):
+            if self._blocked(None):
+                break                        # 全局等待（§4.4.1）：开新轮前被阻断（pause / pending 文件请求）
             cyc = self._resume_or_open()
             if cyc is None:
                 break                        # 停机（上轮 terminate）
             for _step in range(8):               # attack 轮多阶段：逐格推进到 done（每格独立提交）
+                if self._blocked(cyc):
+                    return ids               # 格间阻断：不推阶段（在途轮保持游标，解除后续跑）
                 done = self.advance(cyc.cycle_id) == "done"
                 self._publish_card(cyc.cycle_id)     # 阶段边界发布（§4.6.6）：每格提交后快照即时对人可见
                 if done:
                     break
+                cyc = self.state.cycle(cyc.cycle_id)   # 刷新游标（precheck 按 status 判 reasoning_start 到期）
             else:   # 进度护栏（codex NIT）：>8 格未到 done = 游标损坏（如 pc duplicate 而 status 未推进），fail loud
                 raise RuntimeError(f"cycle {cyc.cycle_id} 推进 8 格未达 done——游标疑似损坏（status 未随阶段推进）")
             ids.append(cyc.cycle_id)
         return ids
+
+    def _blocked(self, cyc) -> bool:
+        """跑 precheck（装了才跑）：消费到期 directive + 判阻断。拒因记 last_block_reason 供观测/上层日志。"""
+        if self.precheck is None:
+            return False
+        self.last_block_reason = self.precheck(cyc)
+        return self.last_block_reason is not None
 
     def _publish_card(self, cycle_id: str) -> None:
         """阶段边界原子发布 status_card（装了 publisher 才发）。发布失败向上抛（fail loud，见
