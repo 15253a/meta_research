@@ -4,37 +4,43 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.2
-- 检查点状态：自验通过（510 绿=502+8）→ 内审/外审中。改动=stage_provider.py 新建（StageProvider：真
-  CodexRunner→(cyc,pack)→files 阶段回调 idea/plan/reasoning；render 由调用方、run+信封解析+逐产物 schema
-  校验+artifact_parse 重试[附错误反馈]；与真 SqliteAdvancer 端到端 mock 跑通）+ test_stage_provider.py(8)。
-  **CP7.2 收窄为 StageProvider 适配器**（judge provider + 全系统入口 run.py 移 CP7.3；attack 场景 CP7.4）。
+- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.3 开工
+- 检查点状态：空闲（CP7.2 已完成 2ce750e + docs 记账；CP7.3 = 全系统装配入口 run.py + 双模式 A/B）
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**M0–M5 全完成；M6 进行中**：CP7.1（da38b2f 长跑自终止安全网 §4.4.6 τ）已完成并记账。测试基线 **502 绿**。
-M6 refsheet 在 scratchpad/M6_refsheet.md（含 §7.3 机制剧本 4 场景 + §7.4 T1/T2 + OPEN #4 + τ 三停）。
-**建造/执行边界**（已裁决入 ROADMAP）：M6 建造=让系统「完整运行进入全自动」的机器（自终止✓ + 真 Codex
-装配 + 双模式 + §7.3 机制集成验收）；§7.4 T1/T2 真跑（数百轮×24h 真 EEG）属运维执行、非本轮建造。
+**M0–M5 全完成；M6 进行中**：CP7.1（da38b2f 自终止安全网）+ CP7.2（2ce750e StageProvider 真 Codex
+适配器：idea/plan/reasoning 的 (cyc,pack)→files）已完成并记账。测试基线 **515 绿**。M6 refsheet 在
+scratchpad/M6_refsheet.md。**建造/执行边界**（ROADMAP 已裁决）：建造=全自动运行机器；§7.4 T1/T2 真跑属运维。
 
-**CP7.2 目标**（真 Codex 生产装配——让系统真能全自动跑起来）：
-1. **StageProvider 适配器**（新）：把 CodexRunner 包成 advancer/attack_stages 消费的 provider 回调——
-   compiler.render(cycle,stage) → runner.run_task(system_prompt, skill, pack) → 解析信封 {files, md} →
-   逐产物 schema 校验（artifact_parse 重试 ≤2，§4.2.3）→ 返回 files dict。参考 driver.py:405/450 的
-   真 Codex 调用+解析逻辑（那是 M0 桩栈版，本次绑真组件）。system_prompt/skill 取 prompts/ + SKILL.md。
-2. **全系统装配入口 run.py**（新）：goalbrief.parse → database.connect+建库 → 装配 WriteDaemon/
-   SQLiteStateStore/SqliteCompiler/SqliteGate/AttackStages/ImportWorker/Console/Mediator/notify/
-   StatusPublisher/StopController → SqliteAdvancer(全部注入) → run_cycles。CLI：目标书路径 + 工作目录。
-3. **kill-9 真栈恢复冒烟**：装配入口在真组件上跑几轮 + 中途杀 + 重启续跑终库一致（复用 M3 范式）。
-   真 Codex 冒烟可选（1 轮 bootstrap，环境允许时），确定性验证用 mock provider。
+**CP7.3 目标**（全系统装配入口——让系统真能一条命令全自动跑起来）：
+1. **run.py 装配入口**（新）：goalbrief.parse(goal_brief.md) → database.connect+建库（若无）→ 装配
+   WriteDaemon/SQLiteStateStore/SqliteCompiler/SqliteGate/StopController/StatusPublisher/Console/
+   notify.make_advancer_precheck → StageProvider(真 CodexRunner) → SqliteAdvancer(全部注入 incl.
+   stop_controller/status_publisher/precheck) → run_cycles。CLI：目标书路径 + 工作目录 + max_cycles +
+   mode。**先落 reasoning-only 全自动闭环**（bootstrap→decompose→terminate/τ 自停）；attack 装配需
+   judge provider（CP7.4）——run.py 装 attack=None 时 attack 轮拒（既有），reasoning-only 闭环即「系统
+   完整运行进入全自动」的最小可跑证据。
+2. **会话双模式 A/B**（policy.session 新增，决策性）：模式 A=一 turn 一格（run_cycles 每 advance 一格
+   即返回、外层重入）；模式 B=一 turn 多格（现状 run_cycles 内循环到 done）。共用恢复不变式（都从 DB 续）。
+   mode_default 入 policy。
+3. **kill-9 真栈恢复冒烟**：装配入口在真组件（mock runner 保确定性）上跑几轮 + subprocess 杀 + 重启
+   续跑终库一致（复用 M3 test_advancer kill-9 范式）。
 
-## 步⑦（M6）CP7.2 下一步动作（按序）
-1. 精读 driver.py（M0 真 Codex 调用+信封解析+schema 校验+失败语义 §4.2.3）+ interfaces.py Runner/
-   provider 签名 + attack_stages 的 p dict 期望 + prompts/system_prompt.md + 四阶段 SKILL.md 路径。
-2. 写 orchestrator/stage_provider.py（StageProvider：render→run→parse→validate→files；四阶段+reasoning
-   +attack idea/plan/bundle 全覆盖；artifact_parse 重试）。
-3. 写 run.py（装配入口）。测试：mock runner 端到端装配跑通 + kill-9 恢复 + schema 校验失败重试。
-4. §5 循环：内审 Opus → codex ≤2 轮 → commit → build_log 0030。
+## 步⑦（M6）CP7.3 下一步动作（按序）
+1. 精读 driver.py 的 goal_brief 解析+建库+装配序（M0 桩栈版，本次换真组件）+ goalbrief.py parse 签名 +
+   database.connect/建库 API + policy.session 是否已有（无则新增，决策性走评审）。
+2. 写 run.py（装配入口 + CLI + 双模式 A/B）+ policy.session.mode_default。
+3. 测试：mock runner 端到端装配跑通 reasoning-only 闭环 + τ 自停 + kill-9 恢复 + 双模式等价（同产出）。
+4. §5 循环：内审 Opus → codex ≤2 轮 → commit → build_log 0031。
+
+## CP7.4 硬前置（务必先解，接 attack 全链前）
+- ①attack_stages._idea_stage 读 c["content_md"]/audit_score 与冻结 idea_set.schema（core_claim/mechanism/
+  audit_mapping/novelty_*+wildidea_extra）不符——过 schema 的候选会 KeyError；接 idea 到真 Codex 前校准
+  attack_stages↔schema（改消费者读法，schema 冻结不动）。
+- ②stage-emitted resource_request sidecar → notify.create_file_request 桥（CP7.2 暂 fail-loud 占位）。
+- ③judge provider（真 Codex 评审 verdict + 写 runner_call(audit)+DECISION(judge)；范式见
+  test_attack_advance.py:59 的 mock judge）。
 
 ## 已交付组件全景（M0–M5；M0 driver 走桩栈并存、基线绿）
 - 存储/守卫：database（冻结 DDL 三重锁）/writedaemon（单写短事务）/statestore_sqlite/gate_sqlite

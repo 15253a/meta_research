@@ -6,6 +6,7 @@
 
 ---
 
+- [0030](0030-cp72-stage-provider.md) — CP7.2 StageProvider 真 Codex 生产装配（run+信封解析+逐产物 schema 校验+artifact_parse 重试 封成真组件 (cyc,pack)→files；answer 语义下沉组件；sidecar fail-loud；真 SqliteAdvancer e2e）· commit `2ce750e` · 验证: 通过（pytest 515/515，13 新用例）
 - [0029](0029-cp71-stopcontroller.md) — CP7.1 长跑自终止安全网（M6 开工：§4.4.6 τ 判据①分数衰退[前沿全评分才判]②ledger.money 预算门恢复安全；durable global_stop；OPEN #4 折入 predicate_json）· commit `da38b2f` · 验证: 通过（pytest 502/502，13 新用例）
 - [0028](0028-cp63-notify-filereq-global-wait.md) — CP6.3 通知矩阵 outbox + 文件请求全流水 + 全局等待 **——收尾步⑥ M5**（§7.1 M5 联合勾兑 64 测全过；outbox committed=换行终止；symlink 全链不跟；幂等先于 quota）· commit `bee3b9e` · 验证: 通过（pytest 489/489，19 新用例）
 - [0027](0027-cp62-mediator-status-publish.md) — CP6.2 query 只读应答链 + 中介重建 + status_card 发布（mode=ro+全写拒双保险[含 temp/VTABLE]；grounding 四规则；重建一致；latest_decision cycle 作用域；阶段边界原子发布）· commit `28c6117` · 验证: 通过（pytest 470/470，16 新用例）
