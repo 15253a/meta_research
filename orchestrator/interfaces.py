@@ -46,6 +46,7 @@ class ContextPack:
     retrieval_md: str                  # 检索区：按配方召回 top-k（有额度）
     refs: List[Ref] = field(default_factory=list)   # 引用区：可深潜的 ref 清单
     pack_hash: str = ""                # 包哈希（写 DECISION / 归档回放，P6）
+    sources: List[str] = field(default_factory=list)   # 溯源来源清单（确定性排序）；manifest 从此取，使溯源是 pack 的纯函数（M2）
 
 
 @dataclass
