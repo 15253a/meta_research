@@ -76,6 +76,7 @@ class SqliteAdvancer:
         self.gate = gate
         self.recall = recall
         self.attack = attack
+        self.import_worker = None    # M4 CP5.5：物化 worker（set 后 _resume_or_open 识别 worker 轮交其续跑）
 
     def derive_next_route(self, prev_selection: Selection, outcome: PlanOutcome) -> Optional[Route]:
         return derive_next_route(prev_selection, outcome)
@@ -103,6 +104,17 @@ class SqliteAdvancer:
         """取本轮要推进的（已 setup 的）cycle；None = 应停机。恢复安全：先看在途轮（续跑其未竟阶段），
         无在途轮再据上轮 selection 决定开新轮还是停机。"""
         cyc = self.state.inflight_cycle()
+        if cyc is not None and cyc.route is None and self.state.daemon.query_one(
+                # 标记探测**无条件**（内联 ImportWorker.is_worker_cycle 同口径查询——不依赖 worker 已装配，
+                # 内审 SHOULD：否则未装配时在途 worker 轮会被 _setup_cycle 误派研究 route = 静默损坏）
+                "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='import_worker_cycle' AND cycle_id=?",
+                (int(cyc.cycle_id[1:]),)) is not None:
+            if self.import_worker is None:
+                raise RuntimeError(f"在途物化 worker 轮 {cyc.cycle_id} 但 import_worker 未装配——"
+                                   "拒绝当研究轮处理（装配 ImportWorker 后重启续物化）")
+            # 在途物化 worker 轮（OPEN #6 裁决④：route=NULL + 标记）→ 交物化 resumer 续跑
+            self.import_worker.resume_cycle(cyc)
+            cyc = self.state.inflight_cycle()    # worker 已终态 → 落回常规研究轮取位
         if cyc is None:
             prior = self.state.last_done_cycle()
             if prior is not None:

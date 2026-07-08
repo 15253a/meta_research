@@ -175,9 +175,10 @@ class SQLiteStateStore:
         return self._load_cycle(r[0]) if r else None
 
     def last_done_cycle(self) -> Optional[Cycle]:
-        """最近**成功收尾**（status='done'）的轮。M3 驱动循环用其 next_intent/next_question_id 定下一轮 route/目标
-        （durable 交接，不靠进程内记忆——护恢复）。failed/aborted 不算（其 selection 未落或无效）。"""
-        r = self._q1("SELECT id FROM cycle WHERE status='done' ORDER BY id DESC LIMIT 1")
+        """最近**成功收尾的研究轮**（status='done' 且 route 非 NULL）。M3 驱动循环用其 next_intent/
+        next_question_id 定下一轮 route/目标（durable 交接）。failed/aborted 不算（selection 未落或无效）；
+        **route=NULL 的物化 worker 轮不算**（非研究轮、无 selection——OPEN #6：混入会污染研究交接）。"""
+        r = self._q1("SELECT id FROM cycle WHERE status='done' AND route IS NOT NULL ORDER BY id DESC LIMIT 1")
         return self._load_cycle(r[0]) if r else None
 
     def _load_cycle(self, cid: int) -> Cycle:

@@ -51,6 +51,21 @@ def _canon_hash(obj: Any) -> str:
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def judge_once(daemon, judge_provider: Callable, cycle_id: str, bt_id: int,
+               review_kind: str, subject_hash: str) -> None:
+    """judge 调用 replay-safe（codex CP5.4 第2轮 SHOULD；attack 与 import 物化共用）：同 (target, kind,
+    subject_hash) 已有 judge DECISION → 复用既有裁决、不重调 provider——否则崩在「judge 已写 DECISION →
+    gate 消费前」的缝隙会重调非确定 judge（有 fail 权，第二次结果可能改变杀/不杀结局）。
+    subject_hash 不同（产物变）→ 照常重评审。"""
+    row = daemon.query_one(
+        "SELECT json_extract(payload_json,'$.subject_hash') FROM decision WHERE actor='judge' AND type=? "
+        "AND json_valid(payload_json) AND json_extract(payload_json,'$.build_target_id')=? "
+        "ORDER BY id DESC LIMIT 1", (review_kind, bt_id))
+    if row is not None and row[0] == subject_hash:
+        return
+    judge_provider(cycle_id, bt_id, review_kind, subject_hash)
+
+
 class AttackStages:
     def __init__(self, *, state, compiler, pool_gate: PoolGate, close_gate, providers: Dict[str, Callable],
                  obs_policy: Dict[str, Any], work_root: str):
@@ -181,13 +196,21 @@ class AttackStages:
         if st() == "smoke":                       # 代码适配评审（subject 编排器重算；judge replay-safe）
             code_sh = self._code_subject_hash(bt_id, spec, staging)
             self._judge_once(cyc.cycle_id, bt_id, "bundle_code_review", code_sh)
+            if not g.review_passed(build_target_id=bt_id, review_kind="bundle_code_review",
+                                   current_subject_hash=code_sh):
+                # judge FAIL → 目标失败收尾（lockstep：import_worker 同修——直接闯 gate 会拒 → 重启复用同
+                # fail 裁决 → 确定性重试死循环；修复重评的轮数语义 = M6 硬化）
+                g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="review_failed")
+                self._ensure_target_pc(cyc, bt_id)
+                return
             g.gate_progress_build_target(build_target_id=bt_id, to="running", current_subject_hash=code_sh)
         if st() == "running":
             self._run_and_register(cyc, bt_id, spec, staging)
         self._ensure_target_pc(cyc, bt_id)
 
     def _run_and_register(self, cyc, bt_id: int, spec, staging: Path) -> None:
-        """phase (i) 执行事实 + phase (ii) 注册段（结构可恢复的短事务序列）。"""
+        """phase (i) 执行事实 + phase (ii) 注册段（结构可恢复的短事务序列）。
+        ⚠️ 与 import_worker._run_and_register_import **同构**（恢复缝隙修复须双向同步；共享骨架=M6 硬化）。"""
         g, d = self.gate, self.state.daemon
         ci = cyc.cycle_id
         vid = d.query_one("SELECT variant_id FROM build_target WHERE id=?", (bt_id,))[0]
@@ -246,6 +269,12 @@ class AttackStages:
             metrics = self._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"), spec)
             res_sh = self._result_subject_hash(bt_id, spec, rid, metrics, ev)
             self._judge_once(ci, bt_id, "bundle_result_review", res_sh)
+            if not g.review_passed(build_target_id=bt_id, review_kind="bundle_result_review",
+                                   current_subject_hash=res_sh):
+                # 结果评审 FAIL → review_failed：run(success)+checkpoint 保留（训练事实），测量整包不注册
+                # （§4.2.5：第(ii)段不发生）——lockstep：import_worker 同修
+                g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="review_failed")
+                return
             reg = self.gate.gate_register_evaluation(
                 cycle_id=ci, build_target_id=bt_id, purpose="factory", current_subject_hash=res_sh,
                 metric_results=metrics,
@@ -280,16 +309,7 @@ class AttackStages:
             self.gate.gate_finish_build_target(build_target_id=bt_id, status="complete")
 
     def _judge_once(self, cycle_id: str, bt_id: int, review_kind: str, subject_hash: str) -> None:
-        """judge 调用 replay-safe（codex 第2轮 SHOULD）：同 (target, kind, subject_hash) 已有 judge DECISION
-        → 复用既有裁决、不重调 provider——否则崩在「judge 已写 DECISION → gate 消费前」的缝隙会重调非确定
-        judge（有 fail 权，第二次结果可能改变杀/不杀结局）。subject_hash 不同（产物变）→ 照常重评审。"""
-        row = self.state.daemon.query_one(
-            "SELECT json_extract(payload_json,'$.subject_hash') FROM decision WHERE actor='judge' AND type=? "
-            "AND json_valid(payload_json) AND json_extract(payload_json,'$.build_target_id')=? "
-            "ORDER BY id DESC LIMIT 1", (review_kind, bt_id))
-        if row is not None and row[0] == subject_hash:
-            return
-        self.p["judge"](cycle_id, bt_id, review_kind, subject_hash)
+        judge_once(self.state.daemon, self.p["judge"], cycle_id, bt_id, review_kind, subject_hash)
 
     def _register_and_ingest_log(self, cycle_id: str, log_path: Path, *, log_kind: str,
                                  run_id: Optional[int] = None,
