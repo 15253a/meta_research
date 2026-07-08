@@ -8,6 +8,8 @@
 - gate.py      — StubGate（三级校验：schema+引用真、业务放过）+ ArtifactIndex（M0）
 - gate_sqlite.py — SqliteGate（M1a-Gate：authorizer 隔离 + gate_input_* 视图 + gate_close_question；M0 并存不替换）
 - gate_exec.py  — ExecGate（M4：执行生命周期 gates——run/attempt/build_target/evaluation + 双评审机械判据 review_passed）
+- gate_pool.py  — PoolGate（M4：注册/评审 gates——claim/register baseline·variant·evaluation + new_protocol；legal 即入池）
+- subject_manifest.py — 双评审 subject manifest 确定性构造（canonical JSON→sha256；code/result 两配方，§4.1.4 附注）
 - statestore.py — InMemoryStateStore（七 op / 调度可见性 / 释放语义；M0）
 - statestore_sqlite.py — SQLiteStateStore（M1b：状态机落 SQLite，经 WriteDaemon；decompose 单事务原子）
 - importer.py   — DeferredImporter（M1c：外部 import M1–M3 降级——发现+登记+deferred 三写入，不物化=M4）
