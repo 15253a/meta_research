@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑥（M5）进行中**——CP6.1（702071e）/CP6.2（28c6117）已完成，当前推进 CP6.3（通知矩阵 outbox + 文件请求全流水 + 全局等待，收尾 M5）。步①–⑤（M0–M4）已完成。
+- 进行中的步 / 检查点：**步⑥（M5）已完成**（CP6.1–6.3；§7.1 M5 步级验证 64 测通过，build_log 0028）。**下一步 步⑦（M6）长跑 + 验收剧本**（开工前确认 OPEN #4）。步①–⑤（M0–M4）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -118,7 +118,7 @@
 
 ### 步⑥（M5）人类控制台 + query 只读应答器
 - 验证方法（§7.1 M5 行）：directive 按时机消费同记 DECISION；query 只读边界负例（responder 写库全被 authorizer 拒）；分类负例（unclear 不自动答）；ACK/query p95<2s；中介线程重建一致；润色≠raw；通知矩阵逐态推送断言；文件请求全流水 + 负例。
-- 状态：**进行中**
+- 状态：**已完成**（2026-07-08；CP6.1–6.3，步级验证 64 测联合勾兑通过，见 build_log 0028）
 - 检查点（模型切，边走边补）:
   - [x] CP6.1 保守分类器 + directive 生命周期：关键词规则确定性分类（query/directive/note/unclear；可能改状态
     一律 directive）+ 润色≠raw 时序（directive pending 先行、分类行回指，trg_iclass_directive_prov）+ 硬指令
@@ -131,9 +131,15 @@
     latest_decision 按 cycle scope 补）+ 中介线程重建（interaction_*+status_card 重建、前后回答一致断言）
     + ACK/query p95<2s 断言 —— commit 28c6117（build_log 0027；temp/VTABLE 亦拒；查询文本按
     message_id 从持久层取[审计链]；rebuild 相关子查询防多回复扇出）
-  - [ ] CP6.3 通知矩阵 outbox + 文件请求全流水 + 全局等待：directive 逐态推送断言（7 态+文件请求 3 事件）；
+  - [x] CP6.3 通知矩阵 outbox + 文件请求全流水 + 全局等待：directive 逐态推送断言（7 态+文件请求 3 事件）；
     outbox 幂等投递；pending 请求→Advancer 不开新研究 runner call 而 query/通知照常；uploads 校验 hash 入账
     并入 input/user_provided/ 恢复推进；创建拒绝三负例 + schema 拒 —— 收尾 M5 跑步级验证
+    —— commit bee3b9e（build_log 0028；committed=换行终止/symlink 全链不跟/幂等先于 quota/
+    provenance 同 goal/reasoning_start 时机矩阵）
+- 步级验证结果：**通过**（M5 四文件联合勾兑 `pytest tests/test_console.py tests/test_mediator.py
+  tests/test_status_card.py tests/test_notify.py` → **64 passed**。判据对照全表见 build_log/0028：
+  按时机消费+DECISION / 只读边界负例矩阵 / unclear 负例 / ACK·query p95<2s / 中介重建一致 /
+  润色≠raw+未确认硬拒 / 通知逐态断言 / 文件请求全流水+三负例+schema 拒+全局等待。）
 
 ### 步⑦（M6）长跑 + 验收剧本
 - 验证方法（§7.1 M6 行 + §7.3/§7.4）：数百轮无人值守不漂移；双模式 A/B 实测定默认；§7.3 机制剧本（happy+失败路径）与 §7.4 研究能力任务（T1/T2）全通。开工前确认 OPEN #4。

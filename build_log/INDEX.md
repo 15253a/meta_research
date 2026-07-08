@@ -6,6 +6,7 @@
 
 ---
 
+- [0028](0028-cp63-notify-filereq-global-wait.md) — CP6.3 通知矩阵 outbox + 文件请求全流水 + 全局等待 **——收尾步⑥ M5**（§7.1 M5 联合勾兑 64 测全过；outbox committed=换行终止；symlink 全链不跟；幂等先于 quota）· commit `bee3b9e` · 验证: 通过（pytest 489/489，19 新用例）
 - [0027](0027-cp62-mediator-status-publish.md) — CP6.2 query 只读应答链 + 中介重建 + status_card 发布（mode=ro+全写拒双保险[含 temp/VTABLE]；grounding 四规则；重建一致；latest_decision cycle 作用域；阶段边界原子发布）· commit `28c6117` · 验证: 通过（pytest 470/470，16 新用例）
 - [0026](0026-cp61-console-directive-lifecycle.md) — CP6.1 保守分类器 + directive 生命周期（M5 开工：unclear 不猜+润色≠raw+回显确认门+单事务消费；pause 状态模型按消费序阻断）· commit `702071e` · 验证: 通过（pytest 454/454，18 新用例）
 - [0025](0025-cp56-m4-semantic-cases.md) — CP5.6 语义判据 5 判例显式命名验收 **——收尾步⑤ M4**（步级验证 47 测联合勾兑全过）· commit `eb5e7d9` · 验证: 通过（pytest 436/436）
