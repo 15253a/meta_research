@@ -33,4 +33,5 @@
 - stage_provider.py — StageProvider（M6：真 CodexRunner→真组件的 (cyc,pack)→files 阶段回调——render 由调用方，run+信封解析+逐产物 schema 校验+artifact_parse 重试）
 - runner.py    — CodexRunner（真 codex exec，M0 起即真）
 - goalbrief.py — 启动输入①解析（§4.6.7 机械校验唯一实现）
+- run.py       — 全系统装配入口（M6：goal_brief→真组件全装配+StageProvider(真 Codex)+StopController+precheck→run_cycles；一条命令全自动，reasoning-only 闭环，attack=CP7.4）
 """
