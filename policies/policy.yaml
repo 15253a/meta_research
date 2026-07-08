@@ -68,3 +68,19 @@ resources: { gpus: 4, gpu_mem_gb: 80, disk_quota_gb: 500 }
 # —— interaction_request（文件请求，§4.6.8；执行点 = interaction_request_create 创建拒绝判据）——
 # 无自动超时放弃：全局等待 + 周期提醒，用户可 cancel
 interaction_request: { enabled: true, max_items_per_request: 10, max_requests_per_goal: 5, remind_interval_h: 24 }
+
+# —— observation（§4.7/§4.3.1 parser 阈值；OPEN #5 落地，M4 CP5.3）——
+# extraction_policy_hash = 本节规范化 JSON 的 sha256（obs_parser.extraction_policy_hash）：
+# 同 log + 同 parser_version + 同本节 → 同 observation / 同 parser_result_suspect（P6 可回放）。
+# 改本节任一值 = 决策性变更（走评审）；旧观测行带旧 hash——复算须按行内 extraction_policy_hash 取当时口径。
+observation:
+  parse:                              # raw log → 机器事实字段的确定性规则（obs_parser.parse_log）
+    divergence_ratio: 2.0             # last_loss > first_loss × ratio → divergence_flag=1（**仅对正 loss 序列**；首 loss ≤0 不判——负 loss 域判据留扩展）
+    trend_window: 3                   # loss_trend 取最后 N 个 loss 判势
+    flat_epsilon: 0.001               # 窗口内 |首尾差| ≤ ε → flat
+  suspect:                            # parser_result_suspect 置位判据（任一命中 → 1；仅负向过滤：挡复用/挡关问，不支持结论）
+    nan_seen: true                    # nan_seen=1 即存疑
+    divergence_flag: true             # divergence_flag=1 即存疑
+    loss_trend_suspect: [nan]         # loss_trend ∈ 此集即存疑
+    max_oom_count: 0                  # oom_count > 此值即存疑
+    max_retry_count: 2                # retry_count > 此值即存疑

@@ -10,6 +10,8 @@
 - gate_exec.py  — ExecGate（M4：执行生命周期 gates——run/attempt/build_target/evaluation + 双评审机械判据 review_passed）
 - gate_pool.py  — PoolGate（M4：注册/评审 gates——claim/register baseline·variant·evaluation + new_protocol；legal 即入池）
 - subject_manifest.py — 双评审 subject manifest 确定性构造（canonical JSON→sha256；code/result 两配方，§4.1.4 附注）
+- harness.py    — 执行 harness（M4：真子进程→staging log 原子改名→execution_log 幂等入账；零 DB 长操作）
+- obs_parser.py — 确定性观测 parser（M4：log→execution_observation(source=parser) + parser_result_suspect 真派生，OPEN #5 observation 节）
 - statestore.py — InMemoryStateStore（七 op / 调度可见性 / 释放语义；M0）
 - statestore_sqlite.py — SQLiteStateStore（M1b：状态机落 SQLite，经 WriteDaemon；decompose 单事务原子）
 - importer.py   — DeferredImporter（M1c：外部 import M1–M3 降级——发现+登记+deferred 三写入，不物化=M4）

@@ -19,8 +19,10 @@ from .interfaces import Hit, RecallSpec, Ref
 
 
 def register_parser_suspect_stub(conn: sqlite3.Connection) -> None:
-    """注册 parser_result_suspect(attempt_id)->0 的 M2 桩（真派生谓词 M4 落；恒 0 = 不挡复用）。
-    必须在跑复用 selector 前对该连接注册一次。"""
+    """注册 parser_result_suspect(attempt_id)->0 的 M2 桩（恒 0 = 不挡复用）。
+    必须在跑复用 selector 前对该连接注册一次。**真派生自 M4 CP5.3 起可用**：
+    `obs_parser.register_parser_suspect_real(conn, 观测读连接, policy['observation'])`——真执行数据上
+    复用判定须用真谓词（本桩仅限 M2/M3 无观测数据的测试/桩栈）。"""
     conn.create_function("parser_result_suspect", 1, lambda _attempt_id: 0, deterministic=True)
 
 

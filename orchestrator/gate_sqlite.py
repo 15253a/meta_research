@@ -10,10 +10,10 @@ authorizer 对「日志 / 人机 / 外部检索」9 表的 SELECT 一律 DENY（
 它须能写全表；两条连接分工，§6.6）。
 
 范围（CP2.3）：authorizer 隔离 + 三级校验框架 + **gate_close_question**（关问业务门禁）。
-池注册 gate_*（baseline/variant/evaluation/attempt/…，§4.1.4 其余 15 个）= CP2.4。
-`gate_close_question` 的 **parser_result_suspect** 判据（§4.3.1）依赖真 execution_observation，M4 才有真
-parser——本检查点不实现该分支（M0–M3 假执行无真观测），其余 I3 判据（含 target_complete /
-applicability 同版负向）本轮落地。
+池注册 gate_*（§4.1.4 其余）= M4 gate_exec/gate_pool。
+`gate_close_question` 的 **parser_result_suspect** 判据（§4.3.1）自 M4 CP5.3 起接真：构造时传
+`parser_suspect=lambda aid: obs_parser.suspect_for_attempt(普通只读连接, aid, policy['observation'])`
+——gate SQL 仍不可 SELECT 观测表（authorizer 拒），负向过滤豁免仅经该派生谓词；None = 不查（M0–M3 无真观测）。
 """
 from __future__ import annotations
 
@@ -89,10 +89,14 @@ class GateReject(Exception):
 
 
 class SqliteGate:
-    def __init__(self, daemon: WriteDaemon, read_conn: sqlite3.Connection, schema_set: SchemaSet):
+    def __init__(self, daemon: WriteDaemon, read_conn: sqlite3.Connection, schema_set: SchemaSet,
+                 parser_suspect=None):
         self.daemon = daemon            # 写路径（无 authorizer）
         self.read = read_conn           # 门禁判据读路径（有 authorizer，禁 9 表）
         self.schemas = schema_set
+        # parser_result_suspect(attempt_id)->0/1（§4.3.1 派生谓词，M4 CP5.3 起接真：obs_parser.suspect_for_attempt
+        # + 独立普通只读连接——gate SQL 仍不可 SELECT 观测表，负向过滤豁免仅经此谓词）。None = 不查（M2/M3 行为）。
+        self.parser_suspect = parser_suspect
 
     # -- 三级校验：① schema ----------------------------------------------------
     def _level1_schema(self, artifact: Artifact) -> List[str]:
@@ -192,6 +196,11 @@ class SqliteGate:
         """无触发器兜底的 gate-only 不变量（写锁内重跑，TOCTOU-safe）：target_complete + applicability 同版负向。
         经 self.read（受限连接 + gate_input 视图）取数；返回首个违规拒因或 None。"""
         for r in resolved:
+            if r["kind"] == "evaluation" and self.parser_suspect is not None \
+               and r.get("evaluation_attempt_id") is not None \
+               and self.parser_suspect(r["evaluation_attempt_id"]):
+                # §4.1.4/§4.3.1：证据 attempt 被 parser 派生标存疑 → 拒（负向过滤：只挡引用、不支持结论）
+                return f"evidence attempt {r['evaluation_attempt_id']} 被 parser_result_suspect 标存疑，不可作证据"
             if r["kind"] == "evaluation" and r.get("build_target_id") is not None:
                 bt = self._q1("SELECT status FROM gate_input_build_target WHERE id=?", (r["build_target_id"],))
                 if bt is None or bt[0] != "complete":

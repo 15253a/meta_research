@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/policy.schema.json",
   "title": "policy",
-  "description": "policies/policy.yaml 的机械校验 schema（启动前提 §7.5 #4）。旋钮注册表唯一权威 = 第一部分附录 C（全量、每旋钮带默认值）；本 schema 与之逐节对齐、封闭（additionalProperties=false）。observation 节（parser 阈值）为既有缺口，随 M4 真 parser 落地补全（OPEN #5）。",
+  "description": "policies/policy.yaml 的机械校验 schema（启动前提 §7.5 #4）。旋钮注册表唯一权威 = 第一部分附录 C（全量、每旋钮带默认值）；本 schema 与之逐节对齐、封闭（additionalProperties=false）。observation 节（parser 阈值）已随 M4 CP5.3 真 parser 落地（OPEN #5 已闭；extraction_policy_hash = 该节规范化 JSON 的 sha256，见 obs_parser）。",
   "type": "object",
-  "required": ["acquisition", "budget", "flow", "retrieval", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "resources", "interaction_request"],
+  "required": ["acquisition", "budget", "flow", "retrieval", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "resources", "interaction_request", "observation"],
   "additionalProperties": false,
   "properties": {
     "acquisition": {
@@ -208,6 +208,35 @@
         "max_items_per_request": { "type": "integer", "minimum": 1 },
         "max_requests_per_goal": { "type": "integer", "minimum": 1 },
         "remind_interval_h": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "required": ["parse", "suspect"],
+      "additionalProperties": false,
+      "properties": {
+        "parse": {
+          "type": "object",
+          "required": ["divergence_ratio", "trend_window", "flat_epsilon"],
+          "additionalProperties": false,
+          "properties": {
+            "divergence_ratio": { "type": "number", "exclusiveMinimum": 0 },
+            "trend_window": { "type": "integer", "minimum": 2 },
+            "flat_epsilon": { "type": "number", "minimum": 0 }
+          }
+        },
+        "suspect": {
+          "type": "object",
+          "required": ["nan_seen", "divergence_flag", "loss_trend_suspect", "max_oom_count", "max_retry_count"],
+          "additionalProperties": false,
+          "properties": {
+            "nan_seen": { "type": "boolean" },
+            "divergence_flag": { "type": "boolean" },
+            "loss_trend_suspect": { "type": "array", "items": { "enum": ["down", "flat", "up", "nan", "unknown"] } },
+            "max_oom_count": { "type": "integer", "minimum": 0 },
+            "max_retry_count": { "type": "integer", "minimum": 0 }
+          }
+        }
       }
     }
   }
