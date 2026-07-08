@@ -25,7 +25,8 @@
       "properties": {
         "B0": { "type": "number", "exclusiveMinimum": 0 },
         "doubling_period_m": { "type": "integer", "minimum": 1 },
-        "B_max": { "type": "number", "exclusiveMinimum": 0 }
+        "B_max": { "type": "number", "exclusiveMinimum": 0 },
+        "session_max": { "type": ["number", "null"], "exclusiveMinimum": 0 }
       }
     },
     "flow": {

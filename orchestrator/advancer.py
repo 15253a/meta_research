@@ -66,7 +66,8 @@ def derive_next_route(prev_selection: Selection, outcome: PlanOutcome) -> Option
 
 class SqliteAdvancer:
     def __init__(self, state, compiler, reasoning_provider: ReasoningProvider,
-                 gate=None, recall=None, attack=None, status_publisher=None, precheck=None):
+                 gate=None, recall=None, attack=None, status_publisher=None, precheck=None,
+                 stop_controller=None):
         """state = SQLiteStateStore；compiler = SqliteCompiler；reasoning_provider 见模块注释。
         attack = attack_stages.AttackStages（M4 CP5.4：idea/plan/bundle/reasoning 阶段推进；None = 拒 attack 轮）。
         status_publisher = status_card.SqliteStatusPublisher（M5 CP6.2：阶段边界原子发布人机快照；
@@ -83,7 +84,9 @@ class SqliteAdvancer:
         self.attack = attack
         self.status_publisher = status_publisher
         self.precheck = precheck
+        self.stop_controller = stop_controller   # M6 CP7.1：长跑自终止安全网（§4.4.6 τ）；None = 不装（只认 provider terminate）
         self.last_block_reason: Optional[str] = None   # 最近一次阻断拒因（观测用；None=未被阻断）
+        self.last_stop_reason: Optional[str] = None    # 最近一次自终止停因（None=未自停）
         self.import_worker = None    # M4 CP5.5：物化 worker（set 后 _resume_or_open 识别 worker 轮交其续跑）
 
     def derive_next_route(self, prev_selection: Selection, outcome: PlanOutcome) -> Optional[Route]:
@@ -96,7 +99,16 @@ class SqliteAdvancer:
         每轮：取在途轮（续跑）或据上轮 selection 开新轮 + setup（route + decompose 激活目标）→ advance 到 done。
         上轮 selection.next_intent=terminate → 停机。返回本次推进的 cycle_id 序列。"""
         ids: List[str] = []
+        if self.stop_controller is not None:     # durable 停机（§4.4.6）：已落 global_stop 决策 → 拒推进
+            self.last_stop_reason = self.stop_controller.already_stopped()
+            if self.last_stop_reason is not None:
+                return ids
         for _ in range(max_cycles):
+            if self.stop_controller is not None:  # 恢复安全预算门（§4.4.6 判据②）：每轮开工前（含重启后首轮）
+                hit = self.stop_controller.check_before_round()   # ledger 已超限则立即停、不白跑一轮
+                if hit is not None:
+                    self.last_stop_reason = hit["reason"]
+                    break
             if self._blocked(None):
                 break                        # 全局等待（§4.4.1）：开新轮前被阻断（pause / pending 文件请求）
             cyc = self._resume_or_open()
@@ -113,6 +125,11 @@ class SqliteAdvancer:
             else:   # 进度护栏（codex NIT）：>8 格未到 done = 游标损坏（如 pc duplicate 而 status 未推进），fail loud
                 raise RuntimeError(f"cycle {cyc.cycle_id} 推进 8 格未达 done——游标疑似损坏（status 未随阶段推进）")
             ids.append(cyc.cycle_id)
+            if self.stop_controller is not None:  # §4.4.6 安全网：本轮完成后评估 τ 判据①②（每轮恰一次）
+                hit = self.stop_controller.check_after_round()
+                if hit is not None:
+                    self.last_stop_reason = hit["reason"]
+                    break                    # 自终止：落了 durable global_stop，下次 run_cycles 亦拒推进
         return ids
 
     def _blocked(self, cyc) -> bool:
