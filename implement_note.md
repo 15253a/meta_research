@@ -4,37 +4,42 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.3
-- 检查点状态：自验通过（519 绿=515+4）+ **真 Codex CLI 冒烟通过**（`python -m orchestrator.run` 真跑一轮
-  bootstrap：Codex 建真根问题、cycle done route=bootstrap next=decompose、决策落账、status_card 发布）
-  → 内审/外审中。改动=run.py 新建（build_system 全装配+System.run+main CLI）+ test_run.py(4)。
+- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.4 开工
+- 检查点状态：空闲（CP7.3 已完成 ce11d00 + docs 记账；CP7.4 = judge provider + attack 全链 + §7.3 机制
+  验收剧本集成测试 + M6 步级验证收尾）
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
 **M0–M5 全完成；M6 进行中**：CP7.1（da38b2f 自终止安全网）+ CP7.2（2ce750e StageProvider 真 Codex
-适配器：idea/plan/reasoning 的 (cyc,pack)→files）已完成并记账。测试基线 **515 绿**。M6 refsheet 在
-scratchpad/M6_refsheet.md。**建造/执行边界**（ROADMAP 已裁决）：建造=全自动运行机器；§7.4 T1/T2 真跑属运维。
+适配器）+ CP7.3（ce11d00 run.py 全系统装配入口——**真 Codex CLI 冒烟通过**：一条命令跑通 bootstrap 全自动
+闭环）已完成并记账。测试基线 **524 绿**。**系统「完整运行、进入全自动」核心已达成**（reasoning-only
+真 Codex 端到端）。M6 refsheet 在 scratchpad/M6_refsheet.md。**建造/执行边界**（ROADMAP 已裁决）：
+§7.4 T1/T2 真跑属运维。
 
-**CP7.3 目标**（全系统装配入口——让系统真能一条命令全自动跑起来）：
-1. **run.py 装配入口**（新）：goalbrief.parse(goal_brief.md) → database.connect+建库（若无）→ 装配
-   WriteDaemon/SQLiteStateStore/SqliteCompiler/SqliteGate/StopController/StatusPublisher/Console/
-   notify.make_advancer_precheck → StageProvider(真 CodexRunner) → SqliteAdvancer(全部注入 incl.
-   stop_controller/status_publisher/precheck) → run_cycles。CLI：目标书路径 + 工作目录 + max_cycles +
-   mode。**先落 reasoning-only 全自动闭环**（bootstrap→decompose→terminate/τ 自停）；attack 装配需
-   judge provider（CP7.4）——run.py 装 attack=None 时 attack 轮拒（既有），reasoning-only 闭环即「系统
-   完整运行进入全自动」的最小可跑证据。
-2. **会话双模式 A/B**（policy.session 新增，决策性）：模式 A=一 turn 一格（run_cycles 每 advance 一格
-   即返回、外层重入）；模式 B=一 turn 多格（现状 run_cycles 内循环到 done）。共用恢复不变式（都从 DB 续）。
-   mode_default 入 policy。
-3. **kill-9 真栈恢复冒烟**：装配入口在真组件（mock runner 保确定性）上跑几轮 + subprocess 杀 + 重启
-   续跑终库一致（复用 M3 test_advancer kill-9 范式）。
+**CP7.4 目标**（attack 全链接真 + 机制验收剧本——收尾 M6 建造）：
+1. **CP7.2/7.3 硬前置先解**：①attack_stages._idea_stage 读 c["content_md"]/audit_score 与冻结
+   idea_set.schema（core_claim/mechanism/audit_mapping/novelty_*+wildidea_extra）不符——改**消费者读法**
+   对齐 schema（schema 冻结不动，走评审）；②stage-sidecar→notify.create_file_request 桥（StageProvider
+   当前 fail-loud 占位）。
+2. **judge provider**（新，StageProvider 扩展或独立）：真 Codex 评审 verdict（pass/fail）+ 写
+   runner_call(audit)+DECISION(judge)（含 subject_hash/verdict/build_target_id/runner_call_id/round_no）；
+   范式见 test_attack_advance.py:59 mock judge + judge_once replay-safe。run.py 装 attack=AttackStages(全
+   provider) 后 attack 轮可跑。
+3. **§7.3 机制验收剧本集成测试**（4 场景 happy+失败路径，多为 mock-provider 驱动真组件的集成测试）：
+   主链路 baseline→多变体→多 evaluation→对照下结论（I1/I2/I3 断言）/import 三失败路径（license deny/
+   smoke 失败/factory eval 失败）/日志 suspect→复现 eval/人机安全四负例（query 误判 directive、directive
+   误判 query、responder 写拒、未确认硬指令拒）。多数场景已有单测覆盖组件，本步做**端到端串联断言**。
+4. **M6 步级验证收尾**（§7.1 M6 行）：数百轮无漂移（mock 长跑 + kill-9 一致 + τ 自停）+ §7.3 全过。
+   §7.4 T1/T2 真跑 = 运维执行交付（本 session 外）。
 
-## 步⑦（M6）CP7.3 下一步动作（按序）
-1. 精读 driver.py 的 goal_brief 解析+建库+装配序（M0 桩栈版，本次换真组件）+ goalbrief.py parse 签名 +
-   database.connect/建库 API + policy.session 是否已有（无则新增，决策性走评审）。
-2. 写 run.py（装配入口 + CLI + 双模式 A/B）+ policy.session.mode_default。
-3. 测试：mock runner 端到端装配跑通 reasoning-only 闭环 + τ 自停 + kill-9 恢复 + 双模式等价（同产出）。
-4. §5 循环：内审 Opus → codex ≤2 轮 → commit → build_log 0031。
+## 步⑦（M6）CP7.4 下一步动作（按序）
+1. 精读 idea_set.schema 全字段 vs attack_stages._idea_stage/plan_stage 消费读法（找全部 KeyError 风险点）+
+   test_attack_advance.py 的 mock provider 全套（idea/plan/reasoning/judge）作真 provider 范式。
+2. 校准 attack_stages 消费者读法（idea content_md→core_claim/mechanism 等）+ 补 judge provider +
+   sidecar 桥。run.py 增 attack 装配选项。
+3. §7.3 四场景集成测试 + M6 长跑漂移断言。
+4. §5 循环：内审 Opus → codex ≤2 轮 → commit → build_log 0032。可能拆多个检查点（CP7.4a 前置校准+judge、
+   CP7.4b §7.3 场景、CP7.4c M6 收尾）——边走边定。
 
 ## CP7.4 硬前置（务必先解，接 attack 全链前）
 - ①attack_stages._idea_stage 读 c["content_md"]/audit_score 与冻结 idea_set.schema（core_claim/mechanism/

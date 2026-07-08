@@ -167,9 +167,11 @@
     移 CP7.3；judge provider + attack 全链移 CP7.4。
     - CP7.4 硬前置（内审记）：①attack_stages._idea_stage 读 c["content_md"] 与冻结 idea_set.schema
       （无 content_md）漂移，接 idea 到真 Codex 前须校准；②stage-sidecar→notify.create_file_request 桥。
-  - [ ] CP7.3 全系统装配入口 run.py（goal_brief→DB init→装配真组件+StageProvider+CodexRunner+StopController
-    +console/mediator/notify+precheck+publish→run_cycles）+ 会话双模式 A/B（policy.session.mode_default；
-    模式 A 一 turn 一格 / 模式 B 一 turn 多格 Codex 自停）+ kill-9 真栈恢复冒烟。
+  - [x] CP7.3 全系统装配入口 run.py（goal_brief→DB init→装配真组件+StageProvider(真 Codex)+StopController
+    +precheck+publish→run_cycles；一条命令全自动 reasoning-only 闭环）—— commit ce11d00（build_log 0031；
+    **真 Codex CLI 冒烟通过**：一轮 bootstrap Codex 建真根问题+cycle done+决策落账+卡发布；只读连接单写
+    边界、DB 权威 goal_body、τ/阻断/exit-2 端到端）。双模式 A/B：reasoning-only 下 A≡B，真 stage-granular
+    分驱随 attack 落 CP7.4。
   - [ ] CP7.4 judge provider + §7.3 机制验收剧本集成测试（主链路对照 / import 三失败路径 / 日志
     suspect→复现 / 人机安全四负例；attack 全链）+ CP7.2 前置②③校准 + M6 步级验证收尾（含长跑漂移断言：
     mock 数百轮 kill-9 一致 + τ 自停）。
