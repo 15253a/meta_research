@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步③（M2）进行中**——CP3.1（2110f02，SqliteCompiler 确定性四区包）+ CP3.2（1a099fc，Recall 四级 + 复用判定 O(1)）已完成；下一步 CP3.3（观测摘要进锚点 + status_card + authorizer 负例 + import deferred 断言，收尾 M2）。步①（M0）、步②（M1，CP2.1–2.4）已完成。
+- 进行中的步 / 检查点：**步③（M2）已完成**（CP3.1 2110f02 + CP3.2 1a099fc + CP3.3 72647f8；§7.1 M2 五判据步级验证全过，见 build_log 0016）。**下一步 步④（M3）Advancer + 恢复 + import 降级**。步①（M0）、步②（M1，CP2.1–2.4）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -48,16 +48,16 @@
 
 ### 步③（M2）上下文编译器 + 召回 + 观测摘要 + status_card
 - 验证方法（§7.1 M2 行）：同快照+配方+预算→字节一致（diff=0）；召回四级可停；复用判定 O(1)（EXPLAIN QUERY PLAN 证明走测量索引）；观测摘要进锚点而门禁 authorizer 拒读（负例）；import 仍 deferred、不产 target。
-- 状态：**进行中**
+- 状态：**已完成**（§7.1 M2 五判据步级验证全过，316 绿，见 build_log 0016）
 - 检查点（模型切，边走边补）：
   - [x] CP3.1 SqliteCompiler：DB→确定性四区 context_pack（**字节一致 diff=0**，render 单读快照 + ORDER BY 定序）+ applicability 六枚举徽标 + manifest 纯函数 — commit 2110f02（build_log 0014）
   - [x] CP3.2 Recall 四级可停（卡片 LIKE+faceted tag / 变体矩阵 / 测量索引 / ctx-fetch）+ **复用判定 O(1) selector（§4.1.5）+ EXPLAIN QUERY PLAN 证走测量索引（e/mr 均走索引、无全表扫）** + Ctx 深潜 — commit 1a099fc（build_log 0015）
-  - [ ] CP3.3 观测摘要段进 reasoning 锚点（从 execution_observation）+ status_card 发布（§4.6.6 封闭字段）+ authorizer 拒读负例 + import deferred 不产 target 断言
-  - > 注：架构同 M1——M2 交付真实 DB-backed 组件（读 DB），M0 driver 仍走桩、基线绿；M3 Advancer 接。嵌入语义召回 defer（无模型，用 FTS5+tag+测量索引）。
+  - [x] CP3.3 观测摘要段进 reasoning 锚点（§4.7，从 execution_observation 渲机器事实、不渲 created_at）+ status_card 封闭字段构建器（§4.6.6）+ authorizer 拒读负例（观测进 pack 不进 gate）+ import deferred 不产 target（既有 test_isolation_m1c 覆盖）— commit 72647f8（build_log 0016）
+  - > 注：架构同 M1——M2 交付真实 DB-backed 组件（读 DB），M0 driver 仍走桩、基线绿；M3 Advancer 接。嵌入语义召回 defer（无模型，用 card_md LIKE+baseline_tag+测量索引）。
 
 ### 步④（M3）编排器 Advancer + 恢复 + import M1–3 降级
-- 验证方法（§7.1 M3 行）：任意阶段 kill -9 重启续跑，终库状态与不杀一致（排除非确定字段）；import deferred 隔离断言（pending dep 排除调度、不重复登记、不产 target）。开工前确认 OPEN #3。
-- 状态：未开始
+- 验证方法（§7.1 M3 行）：任意阶段 kill -9 重启续跑，终库状态与不杀一致（排除非确定字段）；import deferred 隔离断言（pending dep 排除调度、不重复登记、不产 target）。开工前确认 OPEN #3（全自动模式：自主裁决 + 落受审载体）。
+- 状态：**下一步**（M2 已完成，M3 待开工）
 
 ### 步⑤（M4）真执行 + 真 log + import 物化
 - 验证方法（§7.1 M4 行）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例（license deny / smoke 失败 / factory eval 失败全拒）。开工前确认 OPEN #5/#6。
