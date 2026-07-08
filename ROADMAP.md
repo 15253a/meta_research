@@ -76,8 +76,31 @@
   - > 注：M0 driver（走桩+真 Codex）保留为 M0 验收栈；M3 Advancer 是真组件上的可恢复步进器。
 
 ### 步⑤（M4）真执行 + 真 log + import 物化
-- 验证方法（§7.1 M4 行）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例（license deny / smoke 失败 / factory eval 失败全拒）。开工前确认 OPEN #5/#6（全自动模式：自主裁决 + 落受审载体）。
-- 状态：**下一步**（M3 已完成）
+- 验证方法（§7.1 M4 行）：语义判据 5 判例确定归属（①自建 ②import factory ③复用零重训 ④训练失败入账不入树 ⑤log suspect 不成证据）；证据可回溯到一次真实 evaluation；imported 经本系统 harness 出 factory evidence、report 带 provenance；import 失败路径负例（license deny→不物化 / smoke 失败→不 target_ready / factory eval 失败→不 pool_publish，全拒）。
+- 状态：**进行中**
+- **OPEN #5 裁决（全自动，2026-07-08）**：policy.yaml 补 `observation` 节（§4.7 声明的 parser 阈值旋钮：nan / divergence /
+  loss_trend → parser_result_suspect），随真 parser 落地（CP5.3）一并成文走评审；`extraction_policy_hash` = 该节规范化
+  JSON 的 sha256（同 log + 同 parser_version + 同 policy → 同 observation，P6 可回放）。
+- **OPEN #6 裁决（全自动，2026-07-08，CP5.5 落地时随 codex 复核）**：物化 worker cycle 表达 =
+  ① `cycle.route` **终身 NULL**（§2.3 七研究形态封闭不扩；NULL=非研究轮）；
+  ② **权威标记** = 开轮同一事务写 `decision(actor='orchestrator', type='import_worker_cycle', cycle_id, payload={external_import_id})`
+  （durable，恢复可识别——防研究驱动循环把在途 worker 轮误当「未 setup 研究轮」去 _setup_cycle）；
+  ③ **收尾** = mark_cycle_done(done/failed)，**不产 cycle_report**（非研究轮；审计 = external_import 事件链 + run(kind=import)
+  + execution_log + 开轮决策行）；
+  ④ **恢复** = 研究驱动循环 `_resume_or_open` 遇 route=NULL 且带 worker 标记的在途轮 → 交物化 resumer 续跑、不走研究 setup。
+- 检查点（模型切，边走边补）:
+  - [ ] CP5.1 执行生命周期 gates（gate_start/finish_run、gate_start/finish_attempt、gate_start/progress/finish_build_target、
+    gate_finish/abandon_evaluation，§4.1.4 判据）+ 否定用例（连坐/I2/I6/bundle_cursor 串行）
+  - [ ] CP5.2 注册/评审 gates（gate_claim/register_baseline、gate_claim/register_variant、gate_new_protocol）+ 双评审
+    DECISION 机械判据（subject manifest 确定性构造 + subject_hash 当下重算 + runner_call 核验）+ pool 侧写 + 否定用例
+  - [ ] CP5.3 真执行管线 + 真 parser：runner 起真子进程（toy harness）→ execution_log 登记 → 确定性 parser 解析 →
+    execution_observation(source=parser) + **policy observation 节（OPEN #5 落地）** + parser_result_suspect 真派生
+    （替 recall_sqlite 桩；此后复用判定方可对真执行上线）
+  - [ ] CP5.4 attack 轮 advance 全链（idea/plan/bundle 阶段推进 + phase_commit 幂等 + 两段提交 + bundle_cursor 续跑 +
+    恢复扩展到 attack 阶段）
+  - [ ] CP5.5 import 物化（**OPEN #6 落地**：worker cycle + clone pinned/manifest 供应链闭包 + 沙箱 smoke + 出厂 eval +
+    gate_register_baseline 占位→legal + resolve_deps + pool_publish）+ 失败路径负例全拒
+  - [ ] CP5.6 语义判据 5 判例 + M4 步级验证收尾
 - **M3 移交清单**（各处裁量汇总，M4 开工先读）：attack 轮 advance（idea/plan/bundle 阶段 + phase_commit 幂等 + 恢复扩展）；
   池注册 gate_register_*（15 函数，build_log 0013）；真执行 + 真 log/观测 + parser_result_suspect 真派生（此前复用判定不得
   对真执行上线，build_log 0015）；import 物化 materialize（占位→legal、scope 消费点、supersession——select_deferred 幂等
