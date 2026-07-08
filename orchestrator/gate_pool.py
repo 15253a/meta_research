@@ -8,8 +8,8 @@ gate_register_variant / gate_new_protocol。
 非剪切语义体现在 legal 状态 + 卡片/索引侧写，卡片物化 = 编译器/召回已读 legal 池）。
 **§4.2.5(ii) 单事务**：gate_register_evaluation 把 evaluation+attempt(success)+metric_result 一次事务写入
 （成功 attempt 在此之前**不存在**——执行期只有 staging；失败 attempt 才走 gate_start/finish_attempt 入账）。
-register_baseline/variant 是其后的池迁移短事务；把「注册段」整体裹一个事务的组合器 = CP5.4 attack advance
-（WriteDaemon 事务不可嵌套，届时以组合式 gate 或 statestore.atomic 复用同事务，此处先交付单 gate 语义）。
+register_baseline/variant 是其后的池迁移短事务；CP5.4 attack advance 以**可恢复短事务序列 + 结构续跑**组合
+注册段（每步幂等或可从状态跳过）；整段合一事务（需 WriteDaemon 可嵌套/组合式 gate）= M5/M6 硬化项。
 
 **smoke 判据注**：gate 不可读 execution_log（authorizer 拒）——「smoke 未过」由 build_target 已推进到
 'running'（经 smoke 阶段 + 代码评审）结构性保证，本模块据此判。
@@ -84,7 +84,7 @@ class PoolGate(ExecGate):
                                  current_subject_hash: str, metric_results: List[Dict[str, Any]],
                                  evaluation_id: Optional[int] = None, create: Optional[Dict[str, Any]] = None,
                                  env_hash: Optional[str] = None, commit_hash: Optional[str] = None,
-                                 cost: float = 0.0) -> Dict[str, int]:
+                                 cost: float = 0.0, artifact_ref: Optional[str] = None) -> Dict[str, int]:
         """§4.2.5(ii) 测量注册入口（**单事务**）：结果评审通过后，一次写 evaluation(create)/复用(append) +
         attempt(**success**) + metric_result[] + eval success/canonical。成功 attempt 此前不存在（执行期只有
         staging）。拒：无通过结果评审；create 撞格子/缺 target_set_hash；append 无既有；I2；ckpt 跨 variant；
@@ -164,9 +164,9 @@ class PoolGate(ExecGate):
                                  (eid,)).fetchone()[0]
                 aid = conn.execute(
                     "INSERT INTO evaluation_attempt(evaluation_id,cycle_id,build_target_id,attempt_no,purpose,"
-                    "status,env_hash,commit_hash,started_cycle,completed_cycle,cost) "
-                    "VALUES (?,?,?,?,?,'success',?,?,?,?,?)",
-                    (eid, ci, build_target_id, n, purpose, env_hash, commit_hash, ci, ci, cost)).lastrowid
+                    "status,env_hash,commit_hash,started_cycle,completed_cycle,cost,artifact_ref) "
+                    "VALUES (?,?,?,?,?,'success',?,?,?,?,?,?)",
+                    (eid, ci, build_target_id, n, purpose, env_hash, commit_hash, ci, ci, cost, artifact_ref)).lastrowid
                 for m in metric_results:
                     conn.execute("INSERT INTO metric_result(evaluation_id,evaluation_attempt_id,metric_id,"
                                  "metric_ver,value,scope,checkpoint_id) VALUES (?,?,?,?,?,?,?)",

@@ -161,6 +161,18 @@ def suspect_for_attempt(plain_conn: sqlite3.Connection, attempt_id: int, obs_pol
     return 0
 
 
+def suspect_attempt_has_current_obs(plain_conn: sqlite3.Connection, attempt_id: int,
+                                    obs_policy: Dict[str, Any]) -> bool:
+    """attempt 是否已有**当前口径**（PARSER_VERSION + extraction_policy_hash）的 parser 观测行。
+    bundle 管线的「先 ingest 再 complete」强制点用（防 suspect『无据不疑』默认成绕过——只有 ingest 过
+    才谈得上 0/1 派生）。"""
+    return plain_conn.execute(
+        "SELECT 1 FROM execution_observation eo JOIN execution_log el ON el.id=eo.execution_log_id "
+        "WHERE el.evaluation_attempt_id=? AND eo.source='parser' AND eo.parser_version=? "
+        "AND eo.extraction_policy_hash=? LIMIT 1",
+        (attempt_id, PARSER_VERSION, extraction_policy_hash(obs_policy))).fetchone() is not None
+
+
 def register_parser_suspect_real(conn: sqlite3.Connection, obs_conn: sqlite3.Connection,
                                  obs_policy: Dict[str, Any]) -> None:
     """在 conn 上注册**真** parser_result_suspect(attempt_id)（替 M2 桩 recall_sqlite.register_parser_suspect_stub）。
