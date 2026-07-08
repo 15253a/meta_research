@@ -30,6 +30,7 @@
 - mediator.py   — Mediator（M5：query 只读应答链——mode=ro+全写拒 authorizer/grounding 校验+模板回退/中介重建）
 - notify.py     — 通知矩阵（M5：outbox 文件队列幂等投递 + directive 7 态/文件请求 3 事件扫描派生 +
                   FileRequestService 全流水 + make_advancer_precheck 全局等待）
+- stage_provider.py — StageProvider（M6：真 CodexRunner→真组件的 (cyc,pack)→files 阶段回调——render 由调用方，run+信封解析+逐产物 schema 校验+artifact_parse 重试）
 - runner.py    — CodexRunner（真 codex exec，M0 起即真）
 - goalbrief.py — 启动输入①解析（§4.6.7 机械校验唯一实现）
 """
