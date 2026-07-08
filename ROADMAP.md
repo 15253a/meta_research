@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑥（M5）进行中**——CP6.1 已完成（702071e，build_log 0026），当前推进 CP6.2（query 只读应答器 + 中介 + status_card 接线）。步①–⑤（M0–M4）已完成。
+- 进行中的步 / 检查点：**步⑥（M5）进行中**——CP6.1（702071e）/CP6.2（28c6117）已完成，当前推进 CP6.3（通知矩阵 outbox + 文件请求全流水 + 全局等待，收尾 M5）。步①–⑤（M0–M4）已完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -126,10 +126,11 @@
     DECISION actor=human 经 directive；软指令不从记理由；未确认硬指令拒）+ 负例（unclear 无 directive 行）
     —— commit 702071e（build_log 0026；pause 状态模型=消费即进暂停态、阻断按 consumed_decision_id 消费序、
     resume 消费解除并只清早于它的 pending pause）
-  - [ ] CP6.2 query 只读应答器 + 中介：responder mode=ro+authorizer（写 decision/route/question/cycle/
+  - [x] CP6.2 query 只读应答器 + 中介：responder mode=ro+authorizer（写 decision/route/question/cycle/
     metric_result 全拒负例）+ grounding 校验/模板回退 + status_card 接线（advance 阶段边界发布 +
     latest_decision 按 cycle scope 补）+ 中介线程重建（interaction_*+status_card 重建、前后回答一致断言）
-    + ACK/query p95<2s 断言
+    + ACK/query p95<2s 断言 —— commit 28c6117（build_log 0027；temp/VTABLE 亦拒；查询文本按
+    message_id 从持久层取[审计链]；rebuild 相关子查询防多回复扇出）
   - [ ] CP6.3 通知矩阵 outbox + 文件请求全流水 + 全局等待：directive 逐态推送断言（7 态+文件请求 3 事件）；
     outbox 幂等投递；pending 请求→Advancer 不开新研究 runner call 而 query/通知照常；uploads 校验 hash 入账
     并入 input/user_provided/ 恢复推进；创建拒绝三负例 + schema 拒 —— 收尾 M5 跑步级验证
