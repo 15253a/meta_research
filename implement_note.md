@@ -4,10 +4,10 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.4 待开工（勘查中发现 plan 契约设计缺口，已面陈用户）
-- 检查点状态：空闲。**核心里程碑已达**：系统「完整运行、进入全自动」——reasoning-only 全自动闭环
-  真 Codex CLI 端到端跑通（CP7.3 冒烟 ce11d00）。M6 建造剩：CP7.4 §7.3 机制验收（mock 驱动真组件）+
-  CP7.5 长跑收尾（不依赖下述缺口，可续建）。
+- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.4
+- 检查点状态：自验通过（532 绿=524+8）→ 内审/外审中。改动=test_m6_mechanism_scenarios.py 新建（§7.3 四
+  剧本命名验收：主链路 I1/I2/I3 因果链 / import 三失败路径 / 日志 nan→suspect fail-closed / 人机三负例；
+  复用 test_attack_advance/test_import_worker/harness/obs_parser/console/mediator 脚手架，非真 Codex）。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
