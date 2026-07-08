@@ -172,7 +172,21 @@
     **真 Codex CLI 冒烟通过**：一轮 bootstrap Codex 建真根问题+cycle done+决策落账+卡发布；只读连接单写
     边界、DB 权威 goal_body、τ/阻断/exit-2 端到端）。双模式 A/B：reasoning-only 下 A≡B，真 stage-granular
     分驱随 attack 落 CP7.4。
-  - [ ] CP7.4 judge provider + §7.3 机制验收剧本集成测试（主链路对照 / import 三失败路径 / 日志
-    suspect→复现 / 人机安全四负例；attack 全链）+ CP7.2 前置②③校准 + M6 步级验证收尾（含长跑漂移断言：
-    mock 数百轮 kill-9 一致 + τ 自停）。
-- 执行交付（本 session 外，运维发起）：§7.4 T1/T2 真跑（真 Codex + 真 EEG，数百轮×24h）。
+  - [ ] CP7.4 §7.3 机制验收剧本集成测试（主链路对照 I1/I2/I3 / import 三失败路径 / 日志 suspect→复现 /
+    人机安全四负例）——**mock provider 驱动真组件**的端到端串联断言（验状态机+不变量，非真 Codex）。
+  - [ ] CP7.5 M6 步级验证收尾：长跑漂移断言（mock 数百轮 kill-9 一致 + τ 自停）+ §7.3 全过 + §7.1 M6
+    行勾兑。
+
+- **⚠ 设计发现（2026-07-08，CP7.4 勘查）· plan 制品契约二分 → real-Codex attack 阻塞**：
+  冻结 `plan.schema` 的 target 字段（**抽象层**：target_key/spec_md/claim/eval_action/…）与
+  attack_stages/harness 消费的执行 TARGET_SPEC（**具体层**：train_cmd/smoke_cmd/eval_cmd/canonical_key/
+  slug/identity_draft_md/required/…）**仅 {eval_key,seq} 重叠**，13 个执行字段冻结 schema 不含。后果：
+  经 StageProvider（schema 校验）接 attack 到真 Codex 时，Codex 产 schema-conform 的抽象 plan **拿不出
+  harness 跑训练所需的命令**。这是**设计级缺口**（plan 制品契约需裁决：解冻 schema 让其携命令？加抽象→
+  执行的翻译层？TARGET_SPEC 作独立执行制品？），非检查点级修补——超出「搭全自动机器」范围、触及研究
+  执行契约设计。**影响面**：仅**真 Codex attack 轮**（=§7.4 T1/T2 运维执行的前置）；reasoning-only 全自动
+  闭环（已真 Codex 跑通）与 §7.3 机制验收（mock provider 驱动真组件、验状态机+不变量）**不受影响**。
+  **裁量**：M6 建造收尾 = §7.3 机制 + M6 长跑（CP7.4/7.5，不依赖本缺口）；judge provider + attack 真
+  Codex 接线归**运维就绪**（与 §7.4 同批，须先裁 plan 契约）。已向用户面陈此发现待其定 plan 契约方向。
+- 执行交付（本 session 外，运维发起，**且 real-Codex attack 前须裁 plan 契约缺口**）：§7.4 T1/T2 真跑
+  （真 Codex + 真 EEG，数百轮×24h）+ judge provider + idea/plan 消费者↔schema 校准 + sidecar 桥。

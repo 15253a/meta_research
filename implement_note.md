@@ -4,9 +4,10 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.4 开工
-- 检查点状态：空闲（CP7.3 已完成 ce11d00 + docs 记账；CP7.4 = judge provider + attack 全链 + §7.3 机制
-  验收剧本集成测试 + M6 步级验证收尾）
+- 更新：2026-07-08 ｜ 位置：步⑦（M6）CP7.4 待开工（勘查中发现 plan 契约设计缺口，已面陈用户）
+- 检查点状态：空闲。**核心里程碑已达**：系统「完整运行、进入全自动」——reasoning-only 全自动闭环
+  真 Codex CLI 端到端跑通（CP7.3 冒烟 ce11d00）。M6 建造剩：CP7.4 §7.3 机制验收（mock 驱动真组件）+
+  CP7.5 长跑收尾（不依赖下述缺口，可续建）。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
@@ -16,30 +17,28 @@
 真 Codex 端到端）。M6 refsheet 在 scratchpad/M6_refsheet.md。**建造/执行边界**（ROADMAP 已裁决）：
 §7.4 T1/T2 真跑属运维。
 
-**CP7.4 目标**（attack 全链接真 + 机制验收剧本——收尾 M6 建造）：
-1. **CP7.2/7.3 硬前置先解**：①attack_stages._idea_stage 读 c["content_md"]/audit_score 与冻结
-   idea_set.schema（core_claim/mechanism/audit_mapping/novelty_*+wildidea_extra）不符——改**消费者读法**
-   对齐 schema（schema 冻结不动，走评审）；②stage-sidecar→notify.create_file_request 桥（StageProvider
-   当前 fail-loud 占位）。
-2. **judge provider**（新，StageProvider 扩展或独立）：真 Codex 评审 verdict（pass/fail）+ 写
-   runner_call(audit)+DECISION(judge)（含 subject_hash/verdict/build_target_id/runner_call_id/round_no）；
-   范式见 test_attack_advance.py:59 mock judge + judge_once replay-safe。run.py 装 attack=AttackStages(全
-   provider) 后 attack 轮可跑。
-3. **§7.3 机制验收剧本集成测试**（4 场景 happy+失败路径，多为 mock-provider 驱动真组件的集成测试）：
-   主链路 baseline→多变体→多 evaluation→对照下结论（I1/I2/I3 断言）/import 三失败路径（license deny/
-   smoke 失败/factory eval 失败）/日志 suspect→复现 eval/人机安全四负例（query 误判 directive、directive
-   误判 query、responder 写拒、未确认硬指令拒）。多数场景已有单测覆盖组件，本步做**端到端串联断言**。
-4. **M6 步级验证收尾**（§7.1 M6 行）：数百轮无漂移（mock 长跑 + kill-9 一致 + τ 自停）+ §7.3 全过。
-   §7.4 T1/T2 真跑 = 运维执行交付（本 session 外）。
+## ⚠ 设计发现（2026-07-08）· plan 制品契约二分 → real-Codex attack 阻塞（已面陈用户，ROADMAP 详载）
+勘查接 attack 到真 Codex 时发现：冻结 `plan.schema` target（抽象：target_key/spec_md/claim/eval_action）
+与 attack_stages/harness 消费的执行 TARGET_SPEC（具体：train_cmd/smoke_cmd/eval_cmd/canonical_key/…）
+**仅 {eval_key,seq} 重叠**（13 执行字段 schema 不含）→ 经 StageProvider（schema 校验）接 attack，Codex
+产抽象 plan 拿不出 harness 跑训练的命令。**设计级缺口**（需裁 plan 契约：解冻 schema 携命令 / 加翻译层 /
+TARGET_SPEC 作独立执行制品），触及冻结 schema（MIGRATION_SHA256 锁），超检查点级——**已面陈用户待其定向**。
+**影响面**：仅真 Codex attack 轮（=§7.4 运维前置）；reasoning-only 全自动（已真跑）+ §7.3 机制验收
+（mock 驱动真组件）**不受影响**。
 
-## 步⑦（M6）CP7.4 下一步动作（按序）
-1. 精读 idea_set.schema 全字段 vs attack_stages._idea_stage/plan_stage 消费读法（找全部 KeyError 风险点）+
-   test_attack_advance.py 的 mock provider 全套（idea/plan/reasoning/judge）作真 provider 范式。
-2. 校准 attack_stages 消费者读法（idea content_md→core_claim/mechanism 等）+ 补 judge provider +
-   sidecar 桥。run.py 增 attack 装配选项。
-3. §7.3 四场景集成测试 + M6 长跑漂移断言。
-4. §5 循环：内审 Opus → codex ≤2 轮 → commit → build_log 0032。可能拆多个检查点（CP7.4a 前置校准+judge、
-   CP7.4b §7.3 场景、CP7.4c M6 收尾）——边走边定。
+## CP7.4/7.5 目标（不依赖上述缺口，可续建；等用户对 plan 契约的定向后再接 real-Codex attack）
+- **CP7.4 §7.3 机制验收剧本集成测试**：mock provider 驱动**真组件**端到端串联断言（验状态机+不变量，
+  非真 Codex）——主链路 baseline→多变体→多 evaluation→对照下结论（I1/I2/I3）/import 三失败路径（license
+  deny/smoke 失败/eval 失败）/日志 suspect→复现/人机安全四负例。多数组件已有单测，本步做**§7.3 命名
+  场景的端到端串联**（范式仿 test_m4_semantic_cases）。
+- **CP7.5 M6 步级验证收尾**：长跑漂移断言（mock 数百轮 + kill-9 一致 + τ 自停）+ §7.3 全过 + §7.1 M6 勾兑。
+- **运维就绪（§7.4 前置，须先裁 plan 契约）**：judge provider + idea/plan 消费者↔schema 校准 + sidecar 桥。
+
+## 步⑦（M6）下一步动作
+1. 等用户对 plan 契约缺口的定向（若要接 real-Codex attack）。
+2. 无论定向如何，CP7.4 §7.3 机制验收 + CP7.5 长跑收尾均可先建（不依赖缺口）——仿 test_m4_semantic_cases
+   建 test_m6_mechanism_scenarios（§7.3 四场景命名断言，复用 test_attack_advance/test_import_worker 设置）。
+3. §5 循环：内审 Opus → codex ≤2 轮 → commit → build_log 0032。
 
 ## CP7.4 硬前置（务必先解，接 attack 全链前）
 - ①attack_stages._idea_stage 读 c["content_md"]/audit_score 与冻结 idea_set.schema（core_claim/mechanism/
