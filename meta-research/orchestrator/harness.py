@@ -32,7 +32,8 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
     if final.exists():   # 防旧 final 冒充本次产物（重试须换名/清 staging——超时后旧 final+新 .partial 会混淆，codex NIT）
         raise FileExistsError(f"staging 已有同名 final {final}——log_name 须每次执行唯一（或先清 staging）")
     with open(partial, "wb") as fh:
-        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
+        # cwd=staging：脚本的相对路径产物（checkpoint/指标文件）落 staging（半成品目录纪律的自然延伸）
+        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=str(d),
                                 env={**os.environ, **(env or {})})
         try:
             exit_code = proc.wait(timeout=timeout_s)
@@ -40,6 +41,11 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
             proc.kill()
             proc.wait()
             raise
+    # exit 侧车**先于** final 改名（原子 tmp→replace）：final 存在 ⟹ 退出码可读——崩后续跑须复用同一
+    # exit 判定（非 0 的 eval 也会产 final，恢复方不得把失败进程的完整输出当成功续注册，codex BLOCKER）
+    exit_tmp = d / (log_name + ".exit.tmp")
+    exit_tmp.write_text(str(exit_code), encoding="ascii")
+    os.replace(exit_tmp, d / (log_name + ".exit"))
     os.replace(partial, final)          # 原子改名：只有完整跑完的 log 得正式名（P6 staging 纪律）
     data = final.read_bytes()
     return {"exit_code": exit_code, "log_path": str(final),

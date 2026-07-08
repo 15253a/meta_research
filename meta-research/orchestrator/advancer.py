@@ -66,14 +66,16 @@ def derive_next_route(prev_selection: Selection, outcome: PlanOutcome) -> Option
 
 class SqliteAdvancer:
     def __init__(self, state, compiler, reasoning_provider: ReasoningProvider,
-                 gate=None, recall=None):
+                 gate=None, recall=None, attack=None):
         """state = SQLiteStateStore；compiler = SqliteCompiler；reasoning_provider 见模块注释。
-        gate/recall 为后续检查点（attack 轮 close_question / 检索）预留，CP4.1 未用。"""
+        attack = attack_stages.AttackStages（M4 CP5.4：idea/plan/bundle/reasoning 阶段推进；None = 拒 attack 轮）。
+        gate/recall 预留。"""
         self.state = state
         self.compiler = compiler
         self._reasoning = reasoning_provider
         self.gate = gate
         self.recall = recall
+        self.attack = attack
 
     def derive_next_route(self, prev_selection: Selection, outcome: PlanOutcome) -> Optional[Route]:
         return derive_next_route(prev_selection, outcome)
@@ -89,7 +91,11 @@ class SqliteAdvancer:
             cyc = self._resume_or_open()
             if cyc is None:
                 break                        # 停机（上轮 terminate）
-            self.advance(cyc.cycle_id)
+            for _step in range(8):               # attack 轮多阶段：逐格推进到 done（每格独立提交）
+                if self.advance(cyc.cycle_id) == "done":
+                    break
+            else:   # 进度护栏（codex NIT）：>8 格未到 done = 游标损坏（如 pc duplicate 而 status 未推进），fail loud
+                raise RuntimeError(f"cycle {cyc.cycle_id} 推进 8 格未达 done——游标疑似损坏（status 未随阶段推进）")
             ids.append(cyc.cycle_id)
         return ids
 
@@ -102,10 +108,11 @@ class SqliteAdvancer:
             if prior is not None:
                 if prior.next_intent == "terminate":
                     return None              # 上轮选择停机（持久标志）
-                # **开新轮前**就按 intent 拒不支持的续轮（attack=M4）——否则会先落一个 route=None 死轮污染 DB（codex SHOULD）。
-                if prior.next_intent != "decompose":
-                    raise NotImplementedError(
-                        f"CP4.2 驱动循环续轮仅 decompose；next_intent={prior.next_intent!r}（attack 需池注册/真执行 = M4）")
+                # **开新轮前**拒不支持的续轮（免落 route=None 死轮）：attack 须已装配 AttackStages（M4 CP5.4）。
+                if prior.next_intent == "attack" and self.attack is None:
+                    raise NotImplementedError("attack 续轮需装配 attack=AttackStages（M4 CP5.4）")
+                if prior.next_intent not in ("decompose", "attack"):
+                    raise NotImplementedError(f"未知续轮 intent: {prior.next_intent!r}")
             cyc = self.state.open_or_resume_cycle()   # 无在途轮 → 创建新轮（created, route=None）
         if cyc.route is None:                # 新轮/未 setup → 定 route + decompose 激活目标
             self._setup_cycle(cyc)
@@ -124,9 +131,14 @@ class SqliteAdvancer:
             if prior is None:
                 self.state.set_route(cyc.cycle_id, "bootstrap")        # 首轮创世
                 return
+            if prior.next_intent == "attack":
+                # attack 起手 route='attack'（§2.3 规则5：route 在 plan 后特化——本实现 plan 只落 build 目标，
+                # 起手即 attack；reuse_only/eval_only/dependency_wait 特化随对应 plan 形态接入）
+                self.state.set_route(cyc.cycle_id, "attack")
+                self.state.activate_question(prior.next_question_id)
+                return
             if prior.next_intent != "decompose":                      # 防御（run_cycles 已前置拒）
-                raise NotImplementedError(
-                    f"驱动循环续轮仅 decompose；next_intent={prior.next_intent!r}（attack 需池注册/真执行 = M4）")
+                raise NotImplementedError(f"未知续轮 intent: {prior.next_intent!r}")
             route = derive_next_route(   # decompose → decompose（走矩阵，canonical 路由源）
                 Selection(next_question_id=prior.next_question_id, next_intent="decompose"), PlanOutcome())
             self.state.set_route(cyc.cycle_id, route)
@@ -140,9 +152,12 @@ class SqliteAdvancer:
         cyc = self.state.cycle(cycle_id)
         if cyc.status in ("done", "failed", "aborted"):
             return "done"                # 幂等 / 恢复：已提交轮跳过（不重复写；权威判定在写事务内二次核，见 _reasoning_cycle）
+        if cyc.route == "attack":
+            if self.attack is None:
+                raise NotImplementedError("attack 轮需装配 attack=AttackStages（M4 CP5.4）")
+            return self.attack.advance_stage(cyc)   # 按 cycle.status 游标推进一格（多格轮，run_cycles 内循环驱动）
         if cyc.route not in ("bootstrap", "decompose"):
-            raise NotImplementedError(
-                f"CP4.2 仅驱动 reasoning-only 轮（bootstrap/decompose）；attack route = M4（需池注册/真执行）（route={cyc.route!r}）")
+            raise NotImplementedError(f"未支持的 route={cyc.route!r}（reuse_only/eval_only/dependency_wait 特化随对应 plan 形态接入）")
         self._reasoning_cycle(cyc)
         return "done"
 
