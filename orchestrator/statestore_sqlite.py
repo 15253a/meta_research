@@ -544,7 +544,8 @@ class SQLiteStateStore:
             "evaluation/metric_result，CP2.4 才有）——不在 M1b（纯状态机）范围")
 
     def consume_directive(self, directive_id: str) -> None:
-        raise NotImplementedError("directive 收件箱 M5 落地（M0–M4 无人机入站）")
+        raise NotImplementedError("directive 消费归 console.Console.consume_directive（M5 CP6.1：效果+DECISION+"
+                                  "状态迁移单事务；本 Protocol 位保留给未来 statestore 级接线）")
 
     # -- bundle cursor（进程内瞬态调度位；非 DDL 持久列，§4.2.1 由 build_target 状态派生的恢复留 M3/M4） --
     def bundle_cursor(self, cycle_id: str) -> Optional[str]:
