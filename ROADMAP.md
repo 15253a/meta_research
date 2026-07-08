@@ -92,8 +92,9 @@
   - [x] CP5.1 执行生命周期 gates（九函数，§4.1.4 判据）+ review_passed 双评审机械判据（subject_hash 当下重算 +
     runner_call 核 + 畸形 fail-closed）+ 否定用例 28（连坐×kind 守卫/I2/I6/串行结构推导/腐化态）— commit 7d64ec5
     （build_log 0020）。import 目标生命周期 defer CP5.5
-  - [ ] CP5.2 注册/评审 gates（gate_claim/register_baseline、gate_claim/register_variant、gate_new_protocol）+ 双评审
-    DECISION 机械判据（subject manifest 确定性构造 + subject_hash 当下重算 + runner_call 核验）+ pool 侧写 + 否定用例
+  - [x] CP5.2 注册/评审 gates（claim/register baseline·variant + **register_evaluation=§4.2.5(ii) 单事务注册入口** +
+    new_protocol I1 全口径）+ subject manifest 确定性构造 + **target↔variant/kind 绑定核（NULL 不作通配）** +
+    20 否定/全链用例 — commit 439d716（build_log 0021）。注册段整体单事务组合器 = CP5.4；import 两处 defer CP5.5
   - [ ] CP5.3 真执行管线 + 真 parser：runner 起真子进程（toy harness）→ execution_log 登记 → 确定性 parser 解析 →
     execution_observation(source=parser) + **policy observation 节（OPEN #5 落地）** + parser_result_suspect 真派生
     （替 recall_sqlite 桩；此后复用判定方可对真执行上线）

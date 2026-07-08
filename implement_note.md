@@ -4,14 +4,15 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步⑤（M4）· CP5.1 已提交，CP5.2 待开工
-- 检查点状态：空闲（CP5.1 记账完成；CP5.2 未开工）。测试基线 369 绿。
+- 更新：2026-07-08 ｜ 位置：步⑤（M4）· CP5.2 已提交，CP5.3 待开工
+- 检查点状态：空闲（CP5.2 记账完成；CP5.3 未开工）。测试基线 389 绿。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**步⑤（M4）进行中**：CP5.1（7d64ec5 ExecGate 执行生命周期九 gates + review_passed 双评审机械判据；OPEN #5/#6
-裁决落 ROADMAP）已提交。**下一步 CP5.2（注册/评审 gates）**。
-**已完成**：步①（M0）+ 步②（M1）+ 步③（M2）+ 步④（M3）+ 步⑤ CP5.1。测试基线 **369 绿**。
+**步⑤（M4）进行中**：CP5.1（7d64ec5 ExecGate 执行生命周期九 gates）+ CP5.2（439d716 PoolGate 注册/评审 gates +
+subject manifest；claim→build→双评审→register→legal→complete 与 exec 全链均绿）已提交。**下一步 CP5.3
+（真执行管线 + 真 parser + observation 节 OPEN #5 落地）**。
+**已完成**：步①（M0）+ 步②（M1）+ 步③（M2）+ 步④（M3）+ 步⑤ CP5.1/5.2。测试基线 **389 绿**。
 
 ## 步⑤（M4）目标（§7.1 M4 行）——真执行 + 真 log + import 物化
 验收（可证伪）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例
@@ -40,18 +41,22 @@
   NotImplementedError；reasoning provider 为注入式（测试确定性替身；真 Codex provider = M4 接，范式在 M0
   driver._run_reasoning_with_retry）。
 
-## 下一步动作（按序）—— CP5.2（注册/评审 gates）
-M4 计划已定（ROADMAP 步⑤ CP5.1–5.6；OPEN #5/#6 已裁决）。M4 refsheet=`<scratch>/M4_refsheet.md`（session 重启
-后 scratchpad 会清空，需重跑 Explore 提取 §4.1.4/§4.2.5/§3.6.3/§7.1-M4）。CP5.2：
-1. **注册/评审 gates**（§4.1.4 line466-470/480）：gate_claim_baseline（canonical_key 占用 I5 拒/identity 不全拒→
-   baseline+variant planned）、gate_register_baseline（run success+checkpoint hash+eval success canonical
-   target_set_hash I6+required 全+**通过 result_review**[review_passed 已备]→baseline/variant legal+绑 factory eval）、
-   gate_claim_variant/gate_register_variant（同判据面）、gate_new_protocol（改 scope 不升版拒 I1）。
-2. **subject manifest 确定性构造**（§4.1.4 附注）：编排器侧 canonical JSON（键排序+条目按 ref 排序）→ sha256；
-   code_review 集与 result_review 集两配方。放 gate_exec.py 旁（或新 subject_manifest.py，判读依赖面定）。
-3. pool 侧写（baseline/variant→legal 即入池；pool_publish 语义查 spec 是否只是状态或另有副本表——精读后定）。
-4. 照 §5 循环：内审 Opus + codex ≤2 轮 → commit → build_log 0021。后续 CP5.3 真执行+parser、CP5.4 attack advance、
-   CP5.5 import 物化、CP5.6 语义判据收尾。
+## 下一步动作（按序）—— CP5.3（真执行管线 + 真 parser + observation 节）
+M4 refsheet=`<scratch>/M4_refsheet.md`（session 重启后 scratchpad 会清空，需重跑 Explore 提取 §4.3.1/§4.7/§3.1.2）。CP5.3：
+1. **真执行 harness**：runner 起真子进程跑 toy 训练/评估脚本（确定性、秒级；产真 log 文件+checkpoint 文件）——
+   流程真（两段提交语义、staging 目录、产物 hash），执行本身轻量。落 execution_log 登记（ref+content_hash；
+   run-owned §4.2.5(i)）。
+2. **真 parser（确定性）**：解析 log 文件 → execution_observation(source='parser', nan_seen/divergence_flag/oom_count/
+   warning_count/retry_count/last_loss/loss_trend/wall_clock_sec, parser_version, extraction_policy_hash)。
+   同 log+同 parser_version+同 policy → 同 observation（P6 可回放）。
+3. **policy observation 节（OPEN #5 落地，决策性 policy.yaml 变更走全流程）**：nan/divergence/loss_trend 阈值旋钮；
+   extraction_policy_hash = 该节规范化 JSON 的 sha256。
+4. **parser_result_suspect 真派生**：读 attempt 的 parser observation（source='parser'）按 policy 阈值复算 →
+   0/1；替 recall_sqlite 的注册桩（M2 桩恒 0）；gate_close_question 的存疑证据拒（CP2.3 面）接真谓词。
+   此后复用判定方可对真执行上线（build_log 0015 遗留）。
+5. 照 §5 循环：内审 Opus + codex ≤2 轮 → commit → build_log 0022。后续 CP5.4 attack advance（注册段单事务组合）、
+   CP5.5 import 物化（gate_start_build_target/register_evaluation 两处 import NotImplementedError 在此接）、
+   CP5.6 语义判据 5 判例收尾。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
