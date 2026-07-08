@@ -5,10 +5,12 @@
 2. **确定性（M2 验收核心）**：同快照 + 同配方(policy) + 同预算 + 同 target → **字节一致（diff=0）**——
    一切遍历 `ORDER BY id` 定序、无 wall-clock / 随机 / dict 无序；pack_hash = sha256(四区拼接)。
 
-四区（§4.5.1）：①固定锚(任务关键集、不截断) ②结构邻域(祖先链) ③检索区(top-k 卡片，CP3.2 recall 填) ④引用区(ctx-fetch ref，CP3.2)。
+四区（§4.5.1）：①固定锚(任务关键集、不截断) ②结构邻域(祖先链) ③检索区(top-k 卡片) ④引用区(ctx-fetch ref)。
 **applicability 徽标（编译器确定性规则，§4.5.1）**：任何呈现已关闭结论处必 join 该 answer 当前 goal_ver 的
 `answer_applicability` 行、渲染单行六枚举徽标；无行=无徽标。
-运行观测摘要段(§3.1.2)与 status_card(§4.6.6) = CP3.3；本检查点检索区/引用区留空、观测段占位。
+运行观测摘要段(§4.7)于 reasoning 固定锚**已渲**（CP3.3，`_observation_summary`）。检索区/引用区留空——recall
+组件(recall_sqlite)已备（CP3.2），**接入 compiler.render 检索区 = M3 Advancer**（编译器按配方调 recall）。
+status_card(§4.6.6)另置 `status_card.py`（派生卡，非 render 产物）。
 
 与 M0 StubCompiler 并存不替换（M0 driver 仍用 Stub、基线绿）；M3 Advancer 接真组件。
 读连接为普通只读连接（**非** gate 的受限连接——编译器可读 execution_observation 渲观测摘要给 reasoning；
@@ -20,6 +22,7 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
+from .budgeting import compute_budget
 from .ids import cnum as _cnum
 from .interfaces import ContextPack, Stage
 
@@ -95,7 +98,7 @@ class SqliteCompiler:
             sources.append("input:goal_brief.md")
             parts.append(self._closed_conclusions(goal_id, goal_ver, sources))
             parts.append(self._open_set(aq, goal_id, sources))
-            parts.append("## 本轮运行观测摘要\n（CP3.3 从 execution_observation 渲染；本检查点占位）")
+            parts.append(self._observation_summary(ci, sources))
             parts.append("## 采集打分参数\n```json\n" + json.dumps(
                 {"acquisition": self.policy["acquisition"], "B_t": self._budget(),
                  "decompose_threshold": self.policy["flow"]["decompose_threshold"],
@@ -181,7 +184,38 @@ class SqliteCompiler:
                 lines.append(f"- q{aq}（active·本轮 Qn，收尾后可重选，visit={a[2]}）: {a[0]}")
         return "## 可调度问题集（open/inconclusive 且无 pending dep；含本轮 Qn）\n" + ("\n".join(lines) or "（空）")
 
+    def _observation_summary(self, ci, sources) -> str:
+        """本轮运行观测摘要（§4.7）：从 `execution_observation` 渲机器事实进 reasoning 固定锚（不塞全量 log）。
+        经 `execution_log(cycle_id=本轮)` 一跳取本轮观测；ORDER BY eo.id 定序（护字节一致）。
+        **只渲机器事实字段**（nan/发散/oom/warning/retry/last_loss/loss_trend/wall_clock_sec）——
+        `wall_clock_sec` 是 parser 从日志解析的**观测值**（P6 可回放、同快照同值），**非**行 `created_at`
+        （插入 wall-clock，绝不渲，否则破字节一致）。source='codex' 行按 DDL CHECK 机器列恒 NULL、只带
+        digest_ref → 单独标注「codex 摘要」不冒充机器事实（§3.1.2）。
+
+        **铁律（§3.1.2 原样，硬约束）**：观测摘要进锚点后**只影响调试 / 复现 / 下一步评估计划，不得作
+        novelty / success / correctness / 关问题的选择输入**（防 log 经 reasoning 间接绕过门禁）。header
+        显式声明此约束，提示 reasoning 工人。真正的隔离强制在门禁侧（authorizer 拒读 execution_observation，
+        §CP2.3）——本段只负责「诚实渲染 + 用途声明」，不承担门禁职责。"""
+        rows = self.conn.execute(
+            "SELECT eo.id, eo.source, eo.nan_seen, eo.divergence_flag, eo.oom_count, eo.warning_count, "
+            "eo.retry_count, eo.last_loss, eo.loss_trend, eo.wall_clock_sec, eo.digest_ref, el.log_kind "
+            "FROM execution_observation eo JOIN execution_log el ON el.id = eo.execution_log_id "
+            "WHERE el.cycle_id=? ORDER BY eo.id", (ci,)).fetchall()
+        header = ("## 本轮运行观测摘要（§4.7）\n"
+                  "> 用途限定：仅供**解释指标可信度 / 失败模式 / 调试 / 复现 / 下一步评估计划**；"
+                  "**不得作 novelty / success / correctness / 关问题的选择输入**（I3 铁律，§3.1.2）。")
+        if not rows:
+            return header + "\n（本轮无运行观测）"
+        sources.append(f"db:execution_observation:{ci}")
+        lines = []
+        for (oid, src, nan, div, oom, warn, retry, last_loss, trend, wall, digest, kind) in rows:
+            if src == "codex":   # 机器列恒 NULL（DDL CHECK）→ 只报 digest，不冒充观测事实
+                lines.append(f"- [obs{oid}·codex 摘要·{kind}] digest_ref={digest}")
+            else:                # parser：机器事实
+                lines.append(
+                    f"- [obs{oid}·parser·{kind}] nan={nan} 发散={div} oom={oom} warning={warn} "
+                    f"retry={retry} last_loss={last_loss} loss_trend={trend} wall_clock_sec={wall}")
+        return header + "\n" + "\n".join(lines)
+
     def _budget(self) -> float:
-        b = self.policy["budget"]
-        n = self.conn.execute("SELECT count(*) FROM cycle WHERE status='done'").fetchone()[0]
-        return float(min(b["B0"] * (2 ** (n // b["doubling_period_m"])), b["B_max"]))   # float 统一（整型 policy 也渲成 x.0）
+        return compute_budget(self.conn, self.policy["budget"])   # 唯一定义在 budgeting.compute_budget（防漂移）
