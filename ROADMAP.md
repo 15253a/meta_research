@@ -66,7 +66,9 @@
   - [x] CP4.1 `derive_next_route`（§6.13(3) 全矩阵，纯函数，fail-closed）+ Advancer 骨架（advance 读 cycle.status 续跑 +
     state.atomic() 裹阶段短写 + 事务内二次核终态 TOCTOU 幂等）+ 驱动 bootstrap 创世轮真 SQLite 全环（注入确定性产物）
     — commit 148c907（build_log 0017）。注：decompose/attack route + 外层驱动循环留 CP4.2
-  - [ ] CP4.2 恢复：任意阶段 kill -9 重启续跑，终库状态与不杀一致（排除非确定字段；subprocess 杀进程测）
+  - [x] CP4.2 外层驱动循环 run_cycles（开轮/据上轮 selection 派 route/激活目标/loop advance；durable 交接、无进程内记忆）
+    + decompose advance + **恢复**：真 kill -9 重启续跑终库状态与不杀一致（排除 timestamp/attempt_id/log offset；subprocess
+    杀进程测）— commit ff30463（build_log 0018）。范围 reasoning-only；attack 阶段恢复（池注册 gate_register_* + 真执行）= M4。
   - [ ] CP4.3 import deferred 隔离：三写入（external_import+占位 baseline+question_dep）同 phase_commit + dependency_wait
     + 不产 target + pending dep 排除调度 + 不重复登记（幂等）
   - > 注：M0 driver（走桩+真 Codex）保留为 M0 验收栈；M3 Advancer 是真组件上的可恢复步进器。

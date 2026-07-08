@@ -4,16 +4,16 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：步④（M3）· CP4.1 已提交，CP4.2 待开工
-- 检查点状态：空闲（CP4.1 记账完成；CP4.2 未开工）。测试基线 333 绿。
+- 更新：2026-07-08 ｜ 位置：步④（M3）· CP4.2 已提交，CP4.3 待开工
+- 检查点状态：空闲（CP4.2 记账完成；CP4.3 未开工）。测试基线 336 绿。
 
 ## 正在做什么
 **全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
 **步③（M2）已完成**：CP3.1（2110f02 编译器确定性四区包）+ CP3.2（1a099fc Recall 四级+复用 O(1)）+ CP3.3
 （72647f8 观测摘要进锚点+status_card+authorizer 负例）。§7.1 M2 五判据步级验证全过（见 build_log 0016）。
-**步④（M3）进行中**：CP4.1（148c907 Advancer 骨架：derive_next_route 全矩阵 + advance bootstrap 创世轮，
-真 SQLite 单一 atomic 阶段 + 续跑幂等）已提交。**下一步 CP4.2**。
-**已完成**：步①（M0）+ 步②（M1）+ 步③（M2）+ 步④ CP4.1。测试基线 **333 绿**。
+**步④（M3）进行中**：CP4.1（148c907 Advancer 骨架 + derive_next_route）+ CP4.2（ff30463 run_cycles 驱动循环 +
+decompose advance + **真 kill-9 恢复**，§7.1 M3 首判据过）已提交。**下一步 CP4.3（import deferred 隔离，收尾 M3）**。
+**已完成**：步①（M0）+ 步②（M1）+ 步③（M2）+ 步④ CP4.1/CP4.2。测试基线 **336 绿**。
 
 ## 步④（M3）目标（§7.1 M3 行）——编排器 Advancer + 恢复 + import 降级
 Advancer 把 M1/M2 真实组件接进循环（现 M0 driver 仍走桩）。验收（可证伪）：
@@ -36,13 +36,18 @@ Advancer 把 M1/M2 真实组件接进循环（现 M0 driver 仍走桩）。验�
   写 outbox；填 selection.latest_decision（按 cycle scope 查）/ global_remaining / heartbeat_ref。
 - `orchestrator/budgeting.py`：compute_budget（B(t) 唯一定义）。
 
-## 下一步动作（按序）—— CP4.2（外层驱动循环 + decompose/attack + kill-9 恢复）
-M3 规格全提取见 `<scratchpad>/M3_refsheet.md`（换 session 需重跑 Explore）。CP4.1 已交付 derive_next_route + bootstrap advance。CP4.2：
-1. **外层驱动循环**：open_or_resume_cycle→set_route（首轮 bootstrap，其后 derive_next_route）→激活目标问题→loop advance() until done→从 selection 派下轮 route/问题（对齐 M0 driver.run_cycles 但用真组件+Advancer；注入确定性 provider）。
-2. **decompose/attack advance**：_bootstrap_cycle 之外加 decompose（activate 目标+add_children）与 attack 骨架（idea/plan 用 cycle.status 作 stage cursor + phase_commit 幂等；池注册/真执行留 M4）。
-3. **kill-9 恢复测试**（M3 核心验收）：subprocess 阶段边界杀进程，重启续跑终库与不杀一致（**比较排除 timestamp/attempt_id/log offset**，见 advancer.py docstring）。对齐 statestore kill-9 子进程测试范式。
-4. 每检查点照 §5 循环。CP4.3 = import deferred 隔离全链（收尾 M3，跑 §7.1 M3 步级验证）。
-   精读指针（存档）：第一部分 §4.2/§4.4/§3.6.3/§4.2.4-5；第二部分 §6.7/§6.11/§6.13；M0 `orchestrator/driver.py` 作接入范式。
+## 下一步动作（按序）—— CP4.3（import deferred 隔离，收尾 M3）
+M3 规格全提取见 `<scratchpad>/M3_refsheet.md` §4（import 三写入）。CP4.1/4.2 已交付 Advancer + 驱动循环 + 恢复。CP4.3：
+1. **import deferred 隔离全链**（§7.1 M3 第二判据）：import 三写入（external_import(selected_for_materialization) + 占位
+   baseline(planned) + question_dep(pending)）与 set_route(dependency_wait)/Qn 释放/mark_cycle_done **同一 phase_commit 事务**；
+   断言：**不产 build_target** + 该 question 因 pending question_dep **被调度排除**（§4.2.1）+ **不重复登记**（幂等）。
+   现状：importer.py 的 DeferredImporter 已有三写入（M1c，test_isolation_m1c 已断言不产 target/pending dep）；CP4.3 = 把它
+   接进 Advancer 的 dependency_wait 路径（plan 阶段命中 import → advance 走 dependency_wait 收尾）或补全链隔离断言 + 幂等测。
+   **裁量**：dependency_wait 的 advance 需 plan 阶段（attack 轮）——若纯 M3 无 plan 真环，可用注入 provider 模拟 plan 落
+   import_defer 决定 + 驱动 dependency_wait 收尾（对齐 M0 driver 的 import_defer 处理，但落真三写入）。精读 §3.6.3/§4.2.5 后定。
+2. 照 §5 循环：内审 Opus + codex ≤2 轮 → commit → build_log 0019。**收尾 M3 → 跑 §7.1 M3 步级验证**（恢复[CP4.2 已过] +
+   import 隔离[CP4.3]）→ 记 build_log。
+   精读指针（存档）：第一部分 §3.6.3（import 三写入）/§4.2.1（调度可见性）/§4.2.5（phase_commit 原子）；第二部分 §6.11（import decision）。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
