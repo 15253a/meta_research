@@ -57,7 +57,19 @@
 
 ### 步④（M3）编排器 Advancer + 恢复 + import M1–3 降级
 - 验证方法（§7.1 M3 行）：任意阶段 kill -9 重启续跑，终库状态与不杀一致（排除非确定字段）；import deferred 隔离断言（pending dep 排除调度、不重复登记、不产 target）。开工前确认 OPEN #3（全自动模式：自主裁决 + 落受审载体）。
-- 状态：**下一步**（M2 已完成，M3 待开工）
+- 状态：**进行中**
+- **裁量（全自动，2026-07-08）·M3/M4 边界**：M3 交付真 Advancer（状态机步进 + 恢复 + import 隔离），操作真
+  SQLiteStateStore/SqliteGate/SqliteCompiler（与 M0 桩 driver 并存不替换、M0 基线绿）。**pool 注册类 gate_register_\***
+  （M1 未做，build_log 0013）与**真执行**归 **M4**——M3 的 attack 全环收尾依赖它们，故 M3 聚焦其验收所需的
+  「状态机可恢复 + import 隔离」，attack 全环入池留 M4。理由：M3 §7.1 验收=恢复+import 隔离，均不需入池。
+- 检查点（模型切，边走边补）:
+  - [x] CP4.1 `derive_next_route`（§6.13(3) 全矩阵，纯函数，fail-closed）+ Advancer 骨架（advance 读 cycle.status 续跑 +
+    state.atomic() 裹阶段短写 + 事务内二次核终态 TOCTOU 幂等）+ 驱动 bootstrap 创世轮真 SQLite 全环（注入确定性产物）
+    — commit 148c907（build_log 0017）。注：decompose/attack route + 外层驱动循环留 CP4.2
+  - [ ] CP4.2 恢复：任意阶段 kill -9 重启续跑，终库状态与不杀一致（排除非确定字段；subprocess 杀进程测）
+  - [ ] CP4.3 import deferred 隔离：三写入（external_import+占位 baseline+question_dep）同 phase_commit + dependency_wait
+    + 不产 target + pending dep 排除调度 + 不重复登记（幂等）
+  - > 注：M0 driver（走桩+真 Codex）保留为 M0 验收栈；M3 Advancer 是真组件上的可恢复步进器。
 
 ### 步⑤（M4）真执行 + 真 log + import 物化
 - 验证方法（§7.1 M4 行）：语义判据 5 判例确定归属；证据回溯到真实 evaluation；import 全链 provenance + 失败路径负例（license deny / smoke 失败 / factory eval 失败全拒）。开工前确认 OPEN #5/#6。

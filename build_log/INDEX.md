@@ -6,6 +6,7 @@
 
 ---
 
+- [0017](0017-cp41-advancer-derive-route-bootstrap.md) — CP4.1 Advancer 骨架：derive_next_route 全矩阵（§6.13(3)）+ advance bootstrap 创世轮（真 SQLite，单一 atomic 阶段 + 续跑幂等）· commit `148c907` · 验证: 通过（pytest 333/333，17 advancer 用例）
 - [0016](0016-cp33-observation-status-card.md) — CP3.3 观测摘要进 reasoning 锚点（§4.7）+ status_card 封闭字段（§4.6.6）+ 门禁拒读负例 **——收尾步③ M2** · commit `72647f8` · 验证: 通过（pytest 316/316；M2 §7.1 五判据步级全过）
 - [0015](0015-cp32-recall-reuse-selector.md) — CP3.2 Recall 四级可停 + 复用判定 O(1) selector（§4.1.5，EXPLAIN 证走测量索引 + faceted tag） · commit `1a099fc` · 验证: 通过（pytest 298/298，15 recall 用例）
 - [0014](0014-cp31-sqlite-compiler.md) — CP3.1 SqliteCompiler（M2：DB→确定性四区 context_pack，字节一致 diff=0 + applicability 徽标） · commit `2110f02` · 验证: 通过（pytest 283/283，16 compiler 用例）
