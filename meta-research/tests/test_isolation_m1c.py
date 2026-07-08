@@ -81,6 +81,88 @@ def test_import_produces_no_executable_target_or_pool_entry(env):
     assert d.query_one("SELECT count(*) FROM decision WHERE type='import_defer'")[0] == 0
 
 
+def test_select_deferred_idempotent_no_duplicate_registration(env):
+    """§7.1 M3「不重复登记」：同 (question, selection_key) 重放 select_deferred → 返回**既有**三元、不重复三写入
+    （崩溃续跑 / 重入不产重复占位 baseline / external_import / dep）。"""
+    cid, lic = _register_and_select(env)
+    d = env["daemon"]
+    args = dict(question_id="q2", candidate_id=cid, license_review_id=lic, action_cycle="c1",
+                candidate_set_hash="csh", selection_key="sk", policy_hash="ph",
+                license_decision_snapshot_hash="ldsh", placeholder_canonical_key="import-cand-1")
+    r1 = env["importer"].select_deferred(**args)
+    r2 = env["importer"].select_deferred(**args)      # 重放（同 selection_key）
+    assert r1 == r2                                     # 幂等：返回同一三元
+    assert d.query_one("SELECT count(*) FROM external_import WHERE question_id=2 AND action='selected_for_materialization'")[0] == 1
+    assert d.query_one("SELECT count(*) FROM baseline WHERE provenance='external_import'")[0] == 1
+    assert d.query_one("SELECT count(*) FROM question_dep WHERE question_id=2 AND dep_type='baseline'")[0] == 1
+
+
+def test_select_deferred_replay_mismatched_license_fails_loud(env):
+    """codex SHOULD 回归：同候选同 selection_key 但 license_review_id 不符 → fail loud
+    （授权前置条件是契约、非「首次登记为准」的审计细节；防换裁定静默复用旧登记）。"""
+    cid, lic = _register_and_select(env)
+    args = dict(question_id="q2", candidate_id=cid, action_cycle="c1",
+                candidate_set_hash="csh", selection_key="sk", policy_hash="ph",
+                license_decision_snapshot_hash="ldsh", placeholder_canonical_key="import-cand-1")
+    env["importer"].select_deferred(license_review_id=lic, **args)
+    lic2 = env["importer"].review_license(candidate_id=cid, decision="allow", license_scope_json="{}")  # 同候选另一裁定
+    with pytest.raises(ValueError, match="license 裁定不符"):
+        env["importer"].select_deferred(license_review_id=lic2, **args)
+
+
+def test_select_deferred_replay_missing_dep_fails_loud(env):
+    """codex SHOULD 回归：既有登记但 question_dep 缺失（隔离锚破损）→ fail loud，不得以 None 伪装成功
+    （dep 是「不产 target/不可调度」的关键隔离锚；缺失意味着问题会错误恢复可调度）。"""
+    cid, lic = _register_and_select(env)
+    args = dict(question_id="q2", candidate_id=cid, license_review_id=lic, action_cycle="c1",
+                candidate_set_hash="csh", selection_key="sk", policy_hash="ph",
+                license_decision_snapshot_hash="ldsh", placeholder_canonical_key="import-cand-1")
+    r = env["importer"].select_deferred(**args)
+    with env["daemon"].transaction() as conn:   # 模拟破损：直删 dep（DDL 无护栏，隔离在代码层）
+        conn.execute("DELETE FROM question_dep WHERE id=?", (r["question_dep_id"],))
+    with pytest.raises(ValueError, match="隔离锚破损"):
+        env["importer"].select_deferred(**args)
+
+
+def test_select_deferred_duplicate_rows_detected_fails_loud(env):
+    """codex NIT 回归：同 (question, selection_key, action) 竟有多条 external_import（守卫失效/旁路写入的腐化态）
+    → fail loud「重复登记…须人工修复」，勿 fetchone 任取一条静默继续。"""
+    cid, lic = _register_and_select(env)
+    args = dict(question_id="q2", candidate_id=cid, license_review_id=lic, action_cycle="c1",
+                candidate_set_hash="csh", selection_key="sk", policy_hash="ph",
+                license_decision_snapshot_hash="ldsh", placeholder_canonical_key="import-cand-1")
+    r = env["importer"].select_deferred(**args)
+    with env["daemon"].transaction() as conn:   # 旁路直插第二条同锚登记（模拟腐化；正常路径已被幂等守卫挡）
+        conn.execute(
+            "INSERT INTO external_import(question_id,candidate_id,action,action_cycle,candidate_set_hash,"
+            "selection_key,policy_hash,license_decision_snapshot_hash,license_review_id,baseline_id) "
+            "VALUES (2,?, 'selected_for_materialization',1,'csh','sk','ph','ldsh',?,?)",
+            (cid, lic, r["baseline_id"]))
+    with pytest.raises(ValueError, match="重复登记"):
+        env["importer"].select_deferred(**args)
+
+
+def test_select_deferred_replay_mismatched_candidate_fails_loud(env):
+    """内审 SHOULD 回归：selection_key 撞但候选不符的「重放」= 调用方选择锚错乱 → fail loud，
+    不得静默返回旧登记冒充成功（幂等只豁免真重放，不豁免校验）。"""
+    cid, lic = _register_and_select(env)
+    env["importer"].select_deferred(
+        question_id="q2", candidate_id=cid, license_review_id=lic, action_cycle="c1",
+        candidate_set_hash="csh", selection_key="sk", policy_hash="ph",
+        license_decision_snapshot_hash="ldsh", placeholder_canonical_key="import-cand-1")
+    # 另一候选（不同 canonical_uri，避开发现快照唯一索引；甚至 allow 也不行——锚不符即错乱）
+    cid2 = env["importer"].register_candidate(
+        question_id="q2", discovered_cycle="c1", trigger_kind="sota_reference", trigger_snapshot_hash="tsh",
+        need_summary="need", source_kind="paper", canonical_uri="uri-2", search_snapshot_json="{}",
+        search_snapshot_hash="ssh", rank=1, retrieved_at="t")
+    lic2 = env["importer"].review_license(candidate_id=cid2, decision="allow", license_scope_json="{}")
+    with pytest.raises(ValueError, match="候选不符"):
+        env["importer"].select_deferred(
+            question_id="q2", candidate_id=cid2, license_review_id=lic2, action_cycle="c1",
+            candidate_set_hash="csh", selection_key="sk", policy_hash="ph",
+            license_decision_snapshot_hash="ldsh", placeholder_canonical_key="import-cand-2")
+
+
 def test_pending_baseline_dep_blocks_scheduling(env):
     """③ pending question_dep（占位 baseline 未 legal）使问题不可调度（§4.2.1）。"""
     cid, lic = _register_and_select(env)

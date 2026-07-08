@@ -58,6 +58,7 @@ class DeferredImporter:
         ② external_import(selected_for_materialization, baseline_id=占位, 无 manifest)
         ③ question_dep(baseline → 占位, pending) 使问题不可调度。
         返回 {baseline_id, external_import_id, question_dep_id}。**不物化**（M4）。
+        **幂等（§7.1 M3「不重复登记」）**：同 (question, selection_key) 重放返回既有三元、不重复登记（护崩溃续跑 / 重入）。
         provenance 全在 append-only external_import 行（候选/选择锚），**不写 decision 账**（M1c 隔离口径「三写入」，
         避免 import 污染研究账本；与 interaction 同纪律，用例负断言之）。
 
@@ -66,6 +67,42 @@ class DeferredImporter:
         """
         qi, aci = _qnum(question_id), _cnum(action_cycle)
         with self.daemon.transaction() as conn:
+            # 幂等（§7.1 M3「不重复登记」）：同 (question, selection_key) 已有 selected_for_materialization →
+            # 返回既有三元、**不重复三写入**。I6 选择锚确定性 → 同一选择重放（崩溃续跑 / 重入）不产重复占位 baseline / dep。
+            # **锚假设（M4 接手者注意）**：(question, selection_key) 唯一标识一个**在生效**的选择——M3 成立因
+            # ① select 后问题带 pending dep 不可调度（调度器不可能对它再出新选择）② M3 无 supersession（=M4；
+            # 届时须改判「未被 superseded 的」并复核 selection_key 是否仍每选择唯一，勿静默沿用）。
+            # 此 check-then-act 依赖单写者（WriteDaemon 单连接 + BEGIN IMMEDIATE 串行）；DDL 无唯一约束兜底——
+            # 引入多写者/写队列（M5）时须补 DB 级约束或队内去重。
+            existing_rows = conn.execute(
+                "SELECT id, baseline_id, candidate_id, license_review_id FROM external_import "
+                "WHERE question_id=? AND selection_key=? AND action='selected_for_materialization'",
+                (qi, selection_key)).fetchall()
+            if len(existing_rows) > 1:   # 无 DB 唯一约束兜底 → 主动探测重复（守卫失效/旁路写入即 fail loud，勿任取一条）
+                raise ValueError(
+                    f"external_import 存在 {len(existing_rows)} 条 (q{qi}, selection_key={selection_key!r}, "
+                    "selected_for_materialization) 重复登记——「不重复登记」不变量已破，须人工修复")
+            if existing_rows:
+                eid0, bid0, cand0, lic0 = existing_rows[0]
+                # fail loud（内审/外审 SHOULD）：幂等只豁免**真重放**（同候选 + 同 license 裁定）——
+                # candidate 或 license_review_id 不符 = 调用方选择锚错乱 / 授权前置被换，不得静默返回旧登记冒充成功。
+                # （candidate_set_hash/policy_hash 等审计锚分量按首次登记为准，不校验：同一候选+同一裁定已证同一选择。）
+                if cand0 != candidate_id:
+                    raise ValueError(
+                        f"select_deferred 幂等重放候选不符：(q{qi}, selection_key={selection_key!r}) 既有登记属 "
+                        f"candidate {cand0}，本次传 {candidate_id}——疑调用方选择锚错乱，拒绝静默复用")
+                if lic0 != license_review_id:
+                    raise ValueError(
+                        f"select_deferred 幂等重放 license 裁定不符：既有登记据 license_review {lic0}，"
+                        f"本次传 {license_review_id}——授权前置条件是契约、非审计细节，拒绝静默复用")
+                did0 = conn.execute(
+                    "SELECT id FROM question_dep WHERE question_id=? AND dep_type='baseline' AND depends_on_baseline_id=?",
+                    (qi, bid0)).fetchone()
+                if did0 is None:   # 三写入原子 → 合法态必有 dep；缺失 = 隔离锚已破（问题会错误恢复可调度），fail loud
+                    raise ValueError(
+                        f"select_deferred 幂等重放发现隔离锚破损：登记 {eid0} 存在但 question_dep(baseline→{bid0}) "
+                        "缺失——不产 target/不可调度不变量失效，须人工修复")
+                return {"baseline_id": bid0, "external_import_id": eid0, "question_dep_id": did0[0]}
             cand = conn.execute("SELECT question_id FROM external_candidate WHERE id=?", (candidate_id,)).fetchone()
             if cand is None or cand[0] != qi:   # 候选须属本问题（防把 q1 发现的候选错挂到 q2、污染 provenance / 错阻别问题）
                 raise ValueError(f"candidate {candidate_id} 不属于 question {question_id}（当前 {cand}）")
