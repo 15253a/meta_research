@@ -15,9 +15,9 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑧（M7）CP8.6**（plan 全形态受理：exec/eval/import_defer + route 特化 +
-  ImportWorker 装配）。CP8.1–8.5 已落（…/`4f39559`/`650aace`，618 测绿）——真 Codex 完整 attack build 链
-  已端到端跑通 + 文件请求全等待环闭合。剩余=CP8.6 + CP8.7（运维文档+步级验证收口）。步①–⑦全完成。
+- 进行中的步 / 检查点：**步⑧（M7）CP8.7**（运维操作面文档 + 步级验证收口——「直接可用」最后一块）。
+  CP8.1–8.6 已落（…/`650aace`/`a713509`，623 测绿）——真 Codex 完整 attack build+exec 链端到端跑通 +
+  文件请求全等待环闭合。剩余=CP8.7 + CP8.6b（eval/import/route，模型裁量拆出的独立检查点）。步①–⑦全完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -262,7 +262,8 @@
     身份前置判（baseline_ref→legal / variant_key 未占 / config 非空）+ gate_claim_variant（自建 exec bt）+
     终局 UPDATE plan_ref/eval_key + manifest 驱动真训练/评估（run.kind='exec'）+ gate_register_variant 入池
     （baseline 身份不动）。append 绑定核收准（同 variant 别 target 可追加、跨 variant 仍拒，DDL-safe）——
-    commit `<pending>`（build_log 0039）。
+    commit `a713509`（build_log 0039；pytest 623/623；内审 1 BLOCKER + codex 两轮 2 BLOCKER 全修，
+    第2轮 APPROVE）。
     **切分（模型裁量）**：eval target（frozen schema 对 create_evaluation 无 variant 引用，需设计）+
     import_defer/ImportWorker 装配 + route dependency_wait 特化 → CP8.6b（独立检查点）；exec 已覆盖
     「build 家族 + 变体迭代」核心研究形态。

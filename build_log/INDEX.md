@@ -6,6 +6,7 @@
 
 ---
 
+- [0039](0039-cp86-exec-target-kind.md) — CP8.6 exec target kind（既有 legal baseline 上建变体：gate_claim_variant→manifest 真执行→gate_register_variant 入池；崩溃自占复用严核身份+config；append 绑定锚收准 build_target.evaluation_id）· commit `a713509` · 验证: 通过（pytest 623/623；内审+codex 两轮，3 BLOCKER 全修，第2轮 APPROVE）
 - [0038](0038-cp85-sidecar-file-request-bridge.md) — CP8.5 sidecar→file_request 桥（阶段资源请求全局等待闭环：落单→干净停→precheck 拦→resolve→同一在途轮续跑；业务拒重试/损坏 fail-loud 分流）· commit `650aace` · 验证: 通过（pytest 618/618；内审+codex 第1轮双 APPROVE）
 - [0037](0037-cp84-run-attack-assembly-smoke.md) — CP8.4 run.py attack 全装配 + 全链 E2E + **真 Codex 冒烟**（第二次冒烟：真 Codex 完整走通 attack build 链——注册协议/占坑/真训练 MLP acc=0.9949/双评审 pass/legal 入池/τ 安全网真实触发；第一次冒烟暴露的 kind 教学缺口与拒因不回流已修成自纠环）· commit `4f39559` · 验证: 通过（pytest 613/613 + 冒烟 exit 0×2；codex 第1轮 APPROVE）
 - [0036](0036-cp83-production-assembly.md) — CP8.3 生产装配（bundle SKILL m7-1 真执行契约 + judge SKILL/review_verdict 契约 + StageProvider bundle passthrough + JudgeProvider 写 runner_call/DECISION；SKILL↔机器契约逐字段一致）· commit `c7863c0` · 验证: 通过（pytest 608/608；codex 第2轮 APPROVE）
