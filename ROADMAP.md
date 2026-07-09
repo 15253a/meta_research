@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑨（M8）CP9.4**（端到端验收，步⑨收尾）。CP9.1 数据面 + CP9.2 前端真数据 + CP9.3 入站闭环已落（662 测绿）。步①–⑧全完成（625 测绿；步⑧「正式直接
+- 进行中的步 / 检查点：**步①–⑨全完成**（664 测绿）。步⑨（M8 人类控制台）CP9.1–9.4 达成——系统在控制台可查看真实状态 + 可交互。下一批 = 存量（非阻塞）：成本记账接线（M6 硬化，让 budget_exhausted 安全网转活）、CP8.6b（eval/import/route）、worktree 隔离等（§7）。步①–⑧全完成（625 测绿；步⑧「正式直接
   可用」达成并在部署副本真 Codex 实跑验证——CP8.8 修复首跑发现的 reasoning selection 楔死 bug、复跑越过、
   τ 干净自停）。步⑨=把 `reference/人类控制台原型-v2.html` 接上真系统（用户 2026-07-09 明确要真接入控制台
   可视化，纠正 CP8.8 期「系统无 web 组件」结论）——CP9.1 控制台数据面已落（console_server.py 独立只读进程 +
@@ -320,4 +320,9 @@
     [幂等落 directive/note] → query 经 mediator 应答；no-loss/no-dup：query-once 落持久层、只有 durable reply 才推进
     游标、line-index 游标、有限重试+终态回执、顶层兜底不崩主循环）+ 控制台 pause/resume/query 端到端测试。
     → commit `6967dc3`（build_log 0044；codex 两轮 §2.2 修毕；662 测绿，含 pause→确认→阻断→resume 端到端）。
-  - [ ] CP9.4 端到端验收：真 Codex 跑 + 控制台并行真查看实测 + README 控制台节 + 步级验证收口。
+  - [x] CP9.4 端到端验收：test_console_e2e 全栈真跑（真 HTTP+真 DB+真 spool+入站闭环）——①真视图 GET / 真页 +
+    /api/db 真数据 + /api/file 白名单[含逃逸负例]；③单写纪律**强证** _open_ro(mode=ro) 写被物理拒 + 逻辑快照
+    (WAL-proof)不变；②POST→spool→ingest→pause→确认 provenance 落库→precheck 阻断、query→grounded+no-dup；
+    README §4.1 控制台节；实机 CLI 起 console_server + curl 真跑留证。→ commit `cd97ee0`（build_log 0045；codex
+    两轮 §2.2 修毕；664 测绿）。**⇒ 步⑨（M8 人类控制台接入）达成**：系统在人类控制台上可查看真实状态 + 可交互
+    （pause/resume/query），单写纪律不破。

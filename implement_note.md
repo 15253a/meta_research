@@ -4,27 +4,30 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-09 ｜ 位置：**步⑨（M8）CP9.4**（端到端验收，步⑨收尾）——**空闲/待开工**
-- 检查点状态：CP9.3 已提交（**6967dc3** + build_log 0044）。测试 **662 绿**（642+ingest 20）。
+- 更新：2026-07-09 ｜ 位置：**步①–⑨全完成**——**空闲**。下一批=存量硬化（用户可定优先级）。
+- 检查点状态：CP9.4 已提交（**cd97ee0** + build_log 0045）。**步⑨（M8 人类控制台）达成**。测试 **664 绿**。
 
-> 步⑨进度：CP9.1 数据面（console_server）+ CP9.2 前端真数据 + **CP9.3 入站闭环（ConsoleInboxIngest）已落**。
-> CP9.3 经内审(Opus)+外审(codex 两轮，§2.2 修毕)收敛出 no-loss/no-dup 不变量：query-once 落持久层（查 reply 存在性）、
-> **只有 durable reply 才推进游标**、line-index 游标、有限重试(5)+终态回执、顶层兜底不崩主循环。剩 CP9.4 收尾步⑨。
+> **步⑨完成**：人类控制台真接入——CP9.1 数据面(console_server 只读 /api/db + spool)、CP9.2 前端真数据(去 mock)、
+> CP9.3 入站闭环(ConsoleInboxIngest)、CP9.4 端到端验收(test_console_e2e 强证零 DB 写 + 入站闭环 + grounded)。
+> 系统现可：全研究循环(步①–⑧「正式直接可用」)+ 人类控制台查看真状态 & 交互(pause/resume/query)，单写纪律不破。
+>
+> **下一批（存量，非阻塞；建议先与用户确认优先级）**：
+> 1. **成本记账接线（M6 硬化，最有价值）**：`INSERT INTO ledger`(money) 未接 → `budget.session_max` 安全网休眠、
+>    `budget_exhausted` 永不触发（§7/README §6）。真跑长时研究前须接，否则失控成本无自动上限（只 τ + --max-cycles 兜底）。
+> 2. CP8.6b：eval target（免训练评估）+ import（外部基线导入）+ route dependency_wait 特化（现遇到干净业务拒、不楔死）。
+> 3. worktree 隔离 + env lock 强校验、双模 A/B 会话粒度实测（§7）。
+> 4. CP9.3 已知取舍：`_attempts` 不跨重启持久化（注释在案，需要跨重启 liveness 契约时再补）。
 
 ## 正在做什么
-**空闲 / CP9.4 待开工（步⑨收尾）。** 步⑨（M8）人类控制台接入（用户 2026-07-09：要系统在控制台上真查看）已落三关：
-CP9.1 数据面（console_server 独立只读 /api/db + spool 入站）、CP9.2 前端真数据（views/console/index.html 全真化）、
-CP9.3 入站闭环（ConsoleInboxIngest：precheck 边界 ingest console_inbox → handle_inbound/mediator）。CP9.4 收尾即完成步⑨。
+**空闲。步①–⑨全完成、664 测绿。** 步⑨（M8 人类控制台）本 session 收官：CP9.2 前端真数据 + CP9.3 入站闭环 +
+CP9.4 端到端验收 全部提交。系统现可全自动跑研究循环 + 在人类控制台查看真状态 & 交互。等用户定下一批优先级。
 
-## 下一步动作（按序）—— CP9.4 端到端验收（步⑨收尾）
-1. **真查看实测**：起 run（真 Codex，代理 7890）+ 并行起 console_server（`python -m orchestrator.console_server
-   --system-root . --work-root <同 run 的 work> --port 8765`）→ 浏览器/HEADLESS 打开 `views/console/index.html`
-   （或 console_server 静态托管的 /）→ 核 /api/db 真数据在页上渲染、/api/file 白名单、控制台发命令→console_inbox
-   →run precheck ingest→生效/应答 全链真跑一遍留证。
-2. **README 控制台节**：补运维手册——如何起 console_server、如何查看、入站命令闭环（pause/resume/query）、单写纪律边界。
-3. **步⑨步级验证收口**：跑步⑨「验证方法」（用户给的那条），留输出作 build_log 步级证据。
-4. 内审(Opus) → codex 外审(≤2轮) → 提交 → build_log 0045。
-5. 步⑨完成后：回看存量 CP8.6b（eval/import/route，非阻塞）+ 运维执行/硬化（§7.4 T1/T2、双模 A/B、成本账网）。
+## 下一步动作（存量，建议先与用户确认优先级）
+1. **成本记账接线（M6 硬化，最有价值）**：`INSERT INTO ledger`(money) 未接 → budget.session_max 安全网休眠、
+   budget_exhausted 永不触发（真跑长时研究前须接，否则失控成本无自动上限）。
+2. CP8.6b：eval target（免训练评估）+ import（外部基线导入）+ route dependency_wait 特化（现干净业务拒、不楔死）。
+3. worktree 隔离 + env lock 强校验、双模 A/B 会话粒度实测（§7）。
+4. CP9.3 已知取舍：`_attempts` 不跨重启持久化（注释在案）。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **⚠ 开工先看 `git status`**（CP9.1 教训，build_log 0042 载）：工作区若带未提交改动（本次是一份误带的
