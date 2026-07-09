@@ -50,15 +50,27 @@ class ContextPack:
 
 
 @dataclass
+class CallUsage:
+    """一次 runner(LLM) 调用的真实用量（步⑩ M6 成本记账）：codex CLI 在 stderr 报**总 token**，本机计墙钟秒。
+    CP10.2 据此写 ledger（money=tokens/1000×price）。codex 只报总 token 不拆输入/输出 → input/output 置 0、total 为真值。"""
+    tokens_total: int = 0
+    tokens_input: int = 0
+    tokens_output: int = 0
+    wallclock_sec: float = 0.0
+
+
+@dataclass
 class Artifact:
     """一次阶段执行的全部产物：文件名 → 合 schema 的 JSON 对象，外加中文 md 正文。
 
     files 的键 = 产物文件名（如 "idea_set.json" / "answer.json"），值 = 待校验 JSON；
     Gate 逐文件按 schemas/ 对应 schema 校验。md 为该阶段的中文正文（可空）。
+    usage = 本次调用用量（真 runner 填；stub / 无用量时 None）——CP10.2 成本记账消费，不影响产物校验。
     """
     stage: Stage
     files: Dict[str, Any]
     md: str = ""
+    usage: Optional["CallUsage"] = None
 
 
 @dataclass

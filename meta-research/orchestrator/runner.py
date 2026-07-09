@@ -16,11 +16,31 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
-from .interfaces import Artifact, ContextPack
+from .interfaces import Artifact, CallUsage, ContextPack
 
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
+# codex CLI 在 stderr 打**汇总行**「tokens used」+ 总 token（实机：标签独占一行、数字在下一行；亦容「tokens used: N」单行）。
+# 严格匹配（codex 外审 SHOULD，防误报/半解析）：①标签行首锚定（`^[ \t]*tokens used`）——不吃「cache tokens used」这类内嵌；
+# ②数字须整字段消费且合法千分组（`1,800`/`21046` 收，`1,abc`/`1,2,3` 拒）；③行尾锚定。多次出现取**最后**一条（汇总）。
+_TOKENS_RE = re.compile(
+    # 标签与数字间须有**分隔符**（冒号 / 换行 / 空白之一）——不吃 `tokens used123` 这种粘连（codex NIT）。
+    r"^[ \t]*tokens used(?:[ \t]*:[ \t]*|[ \t]*\n[ \t]*|[ \t]+)(\d{1,3}(?:,\d{3})+|\d+)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_tokens_used(stderr_text: str) -> int:
+    """从 codex stderr 抽总 token（步⑩ 成本记账）。无匹配 / 格式变 → 0（健壮，绝不因用量解析失败拖垮调用）。"""
+    matches = _TOKENS_RE.findall(stderr_text or "")
+    if not matches:
+        return 0
+    try:
+        return int(matches[-1].replace(",", ""))       # 多次出现取最后一条汇总
+    except ValueError:
+        return 0
 
 
 class RunnerError(RuntimeError):
@@ -40,9 +60,9 @@ class CodexRunner:
     # -- Runner Protocol -----------------------------------------------------
     def run_task(self, *, system_prompt: str, skill: str, context_pack: ContextPack) -> Artifact:
         prompt = self._build_prompt(system_prompt, skill, context_pack)
-        raw = self._invoke(prompt, context_pack)
+        raw, usage = self._invoke(prompt, context_pack)
         files, md = self._parse_envelope(raw)
-        return Artifact(stage=context_pack.stage, files=files, md=md)
+        return Artifact(stage=context_pack.stage, files=files, md=md, usage=usage)
 
     # -- 内部 ------------------------------------------------------------------
     def _build_prompt(self, system_prompt: str, skill: str, pack: ContextPack) -> str:
@@ -63,7 +83,9 @@ class CodexRunner:
         ]
         return "".join(parts)
 
-    def _invoke(self, prompt: str, pack: ContextPack) -> str:
+    def _invoke(self, prompt: str, pack: ContextPack) -> "tuple[str, CallUsage]":
+        """跑一次 codex exec，返回 (信封文本, CallUsage)。用量：stderr 报的总 token + 墙钟秒（步⑩ 成本记账）。
+        用量捕获**只在成功路径**（失败→raise、不记账；失败调用的 token 属已知欠计，量小、由后续重试主导）。"""
         self._call_no += 1
         tag = f"{pack.stage}-{self.purpose_tag or 'call'}-{self._call_no}"
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
@@ -80,6 +102,7 @@ class CodexRunner:
             "-o", str(out_file),
             "-",
         ]
+        t0 = time.monotonic()
         try:
             with prompt_file.open("rb") as fh:
                 proc = subprocess.run(
@@ -88,10 +111,13 @@ class CodexRunner:
                 )
         except subprocess.TimeoutExpired as e:
             raise RunnerError(f"runner 超时（{self.timeout_s}s）：{tag}") from e
+        wallclock = round(time.monotonic() - t0, 3)
         if proc.returncode != 0 or not out_file.exists():
             tail = (proc.stderr or b"")[-500:].decode("utf-8", "replace")
             raise RunnerError(f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}")
-        return out_file.read_text(encoding="utf-8")
+        tokens = parse_tokens_used((proc.stderr or b"").decode("utf-8", "replace"))   # codex 把用量打到 stderr
+        usage = CallUsage(tokens_total=tokens, wallclock_sec=wallclock)
+        return out_file.read_text(encoding="utf-8"), usage
 
     @staticmethod
     def _parse_envelope(raw: str) -> tuple:

@@ -103,7 +103,8 @@ def test_goal_body_from_db_not_edited_brief(tmp_path, monkeypatch):
 def test_main_cli_smoke(tmp_path, monkeypatch, capsys):
     """main() argparse→build→run→print 全路径（注入 mock runner，不调真 Codex）。"""
     import orchestrator.run as R
-    monkeypatch.setattr(R.CodexRunner, "__new__", lambda cls, **kw: object())   # 不会被调（terminate 前无 runner）
+    # 注：不 monkeypatch CodexRunner.__new__——它继承自 object，patch 后 monkeypatch 会把 object.__new__ 显式绑到类上、
+    # 使之后 CodexRunner(**kw) 构造抛 TypeError（污染全局）。真 runner 不构造已由下方 mock build_system 保证。
     # 用 build_system 的注入点：monkeypatch build_system 塞 mock runner
     orig = R.build_system
     monkeypatch.setattr(R, "build_system",
