@@ -6,6 +6,7 @@
 
 ---
 
+- [0049](0049-cp112a-user-asset-authority.md) — CP11.2a 用户文件原子接纳 + goal-wide 有界回执 + 生成时最小资产授权 · commit `c077cd2` · 验证: 通过（staged-only 全量 844；外审两轮上限后全部本地修复；三路内部 APPROVE）
 - [0048](0048-cp111-external-artifact-no-wedge.md) — CP11.1 严格 metric/SQLite ID 边界 + reasoning 语义拒收持久收敛 + DB 损坏 fail-loud · commit `ac53516` · 验证: 通过（定向 132，全量 754，codex 第1轮 APPROVE）
 - [0047](0047-cp102-cost-ledger-budget-stop.md) — CP10.2 成本账本覆盖失败/非法调用 + 未知用量 fail-closed + 单次越线即 durable 停机 · commit `03d3ffd` · 验证: 通过（pytest 754 全量；codex 第2轮 APPROVE）
 - [0046](0046-cp101-runner-cost-capture.md) — CP10.1 runner 成本捕获（**步⑩ M6 成本记账·第一关**：实机 probe 定 `codex-chatgpt exec` 把 `tokens used\n<N>` 总 token 打到 **stderr**[runner 捕获但成功时丢弃]；加 CallUsage + Artifact.usage[非破坏]；runner.py parse_tokens_used[行首锚定/合法千分组/取末条/坏输入→0] + _invoke 计墙钟解析→Artifact.usage；只成功路径捕获；**不改循环行为**；顺带修 test_run.py 既有 `__new__` monkeypatch 全局污染 bug）· commit `1b415f9` · 验证: 通过（pytest 678 全量 + runner 15 例；codex 第2轮 APPROVE）

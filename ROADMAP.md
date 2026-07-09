@@ -15,12 +15,8 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑩（M6 硬化）CP10.2**（ledger 写入 + 激活安全网）。CP10.1 runner 成本捕获已落（678 测绿）。步⑩接 `INSERT INTO ledger` 让 budget_exhausted 安全网转活。步①–⑨全完成。步①–⑧全完成（625 测绿；步⑧「正式直接
-  可用」达成并在部署副本真 Codex 实跑验证——CP8.8 修复首跑发现的 reasoning selection 楔死 bug、复跑越过、
-  τ 干净自停）。步⑨=把 `reference/人类控制台原型-v2.html` 接上真系统（用户 2026-07-09 明确要真接入控制台
-  可视化，纠正 CP8.8 期「系统无 web 组件」结论）——CP9.1 控制台数据面已落（console_server.py 独立只读进程 +
-  spool 入站，638 测绿）。剩余=CP9.2–9.4 + 存量 CP8.6b（eval/import/route，非阻塞）+ 运维执行/硬化
-  （§7.4 数百轮真跑、双模式 A/B、成本记账接线、worktree 隔离）。
+- 进行中的步 / 检查点：**步⑪ CP11.2b 人类控制面**。CP11.2a 用户文件资产原子接纳、goal-wide 有界回执与生成时最小授权已落 `c077cd2`（staged-only 全量 844）；当前提交已隔离的
+  console confirm/reject 与 file request resolve/cancel HTTP→spool→run 单写控制链。步①–⑨已完成；步⑩ CP10.1/CP10.2 已完成，CP10.3 对账收口待后续；步⑪ CP11.1 已完成，CP11.2b/CP11.3/CP11.4 继续。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -364,6 +360,8 @@
   - [x] CP11.1 外部产物接纳硬化：metric 严格解析/有限值 + 统一 SQLite ID 边界 +
     reasoning 语义拒收，首次/全新实例重启 no-wedge，DB 损坏 fail-loud。→ commit `ac53516`
     （build_log 0048；定向 132；全量 754；codex 第1轮 APPROVE）。
-  - [ ] CP11.2 人类控制闭环：真实 console confirm/reject + 文件请求 resolve/cancel/已解决请求重做语义。
+  - [ ] CP11.2 人类控制闭环（子检查点全完成后勾选）：
+    - [x] CP11.2a 用户文件资产闭环：原子接纳、goal-wide 有界回执、稳定 fd 真消费、生成时身份冻结与 root-global 并发/配额闭合。→ commit `c077cd2`（build_log 0049；staged-only 全量 844；外审两轮上限后全部本地修复）。
+    - [ ] CP11.2b 人类控制面：真实 console confirm/reject + 文件请求 resolve/cancel + 生产 notifier 接线，继续保持 HTTP 进程 DB mode=ro、run 单写。
   - [ ] CP11.3 状态与执行边界：critical/budget_estimate 落库与早退、goal 最新版、orchestrator 单实例锁、超时终止进程组。
   - [ ] CP11.4 残余架构边界：调用意图/回执补账、执行容器/VM 隔离与内容寻址 artifact store 方案化。
