@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Union
 
+from .cost_ledger import BudgetExhausted, CostAccountingFailed
 from .interfaces import PlanOutcome, Route, Selection, Stage, StageBlockedOnResources
 
 # reasoning 产物提供者：(cycle, context_pack) -> {"tree_ops.json":{...}, "selection.json":{...}, "answer.json"?:{...}}
@@ -119,6 +120,15 @@ class SqliteAdvancer:
                     return ids               # 格间阻断：不推阶段（在途轮保持游标，解除后续跑）
                 try:
                     done = self.advance(cyc.cycle_id) == "done"
+                except BudgetExhausted:
+                    # 账本与 durable global_stop 已在 provider 的短事务中提交；本阶段业务产物尚未进入
+                    # state.atomic。干净停在当前游标，绝不继续 retry/target，也不把在途轮误记 done。
+                    self.last_stop_reason = "budget_exhausted"
+                    return ids
+                except CostAccountingFailed:
+                    # 未知用量/落账失败的 durable global_stop 已提交；禁止重启后在同游标重发模型调用。
+                    self.last_stop_reason = "cost_accounting_failed"
+                    return ids
                 except StageBlockedOnResources as e:
                     # 阶段等文件（CP8.5）：请求单已落——干净停止推进（在途轮保持游标，本阶段零提交），
                     # 下次 run_cycles 由 precheck 的 pending 文件请求阻断接管；resolve 后续跑重做本阶段

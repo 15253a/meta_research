@@ -30,14 +30,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .cost_ledger import BudgetExhausted, CostAccountingFailed
 from .harness import latest_smoke_log as _latest_smoke_log
 from .ids import cnum as _cnum
 from .interfaces import ContextPack, StageBlockedOnResources
 from .notify import FileRequestReject
 from .runner import RunnerError
+
+logger = logging.getLogger(__name__)
 
 # 阶段 → 产物契约：required=阶段必产（缺即重试）、optional=在场才校验；passthrough=返回信封全部文件
 # （bundle 的代码文件名任意、不可枚举——由 attack_stages 按 manifest.code_files 物化并交叉核）。
@@ -59,7 +63,7 @@ _CALL_NOTE = {
 class StageProvider:
     def __init__(self, *, runner_factory, schemas, policy: Dict[str, Any],
                  system_prompt: str, skills: Dict[str, str], work_root: str,
-                 file_request_bridge=None):
+                 file_request_bridge=None, cost_ledger=None):
         """runner_factory(transcripts_dir, purpose_tag)→Runner（默认真 CodexRunner，见 run.py 装配）；
         schemas=SchemaSet（产物校验）；skills={stage: SKILL.md 文本}；work_root=cycles/<id>/transcripts 的根。
         不持 compiler——pack 由调用方（advancer/attack_stages）渲染后传入，本类不 render。
@@ -73,6 +77,11 @@ class StageProvider:
         self.skills = skills
         self.work = Path(work_root)
         self.file_request_bridge = file_request_bridge
+        self.cost_ledger = cost_ledger         # None 仅允许 session_max=null 的显式诊断/测试装配
+        self._cost_required = policy.get("budget", {}).get("session_max") is not None
+        if self._cost_required and self.cost_ledger is None:
+            raise ValueError("budget.session_max 已启用，StageProvider 必须注入 cost_ledger；"
+                             "测试/诊断须显式设 session_max=null")
         self._call_seq = 0                     # 全局调用序（transcript 文件名唯一，P6 回放防覆盖）
 
     # -- provider 回调（绑定阶段）------------------------------------------------
@@ -104,8 +113,13 @@ class StageProvider:
             try:
                 art = runner.run_task(system_prompt=self.system_prompt, skill=skill, context_pack=pack)
             except RunnerError as e:               # 进程失败/超时/信封不可解析 → 计入重试
+                self._record_cost(cyc, stage, e.usage, status="failed", failure_kind="runner_error",
+                                  attempt=attempt)
                 last_err = str(e)
                 continue
+            # 步⑩ CP10.2：每次真 LLM 调用都记账，但 runner_call 还要诚实区分「有效产物」与
+            # 「进程成功但产物被拒」。因此各分支在结论确定后各记恰好一次；基础设施异常也会先
+            # 记本次已发生的调用再 fail loud。session_max 启用时写账失败 fail-closed。
             if "resource_request.json" in art.files:
                 # 阶段发资源请求 sidecar（§3.1.1「需用户提供文件」，步⑧ CP8.5 接桥）。
                 # **有意置于 stage 漂移/schema 校验之前**（codex NIT 注记）：sidecar 是「无法工作」的控制
@@ -117,26 +131,61 @@ class StageProvider:
                 # - 桥拒（sidecar 非法/quota 尽）→ 计入重试反馈（工人可修正或放弃 sidecar）；
                 # - 未接桥（诊断装配）→ 保持 fail loud，绝不静默丢弃。
                 if self.file_request_bridge is None:
+                    self._record_cost(cyc, stage, art.usage, status="failed",
+                                      failure_kind="artifact_parse", attempt=attempt)
                     raise RunnerError(f"{stage} 产出 resource_request.json sidecar，但本装配未接文件请求桥"
                                       "——不静默丢弃")
                 try:
                     rid = self.file_request_bridge(stage, art.files["resource_request.json"], cyc)
                 except FileRequestReject as e:  # 只兜业务拒（sidecar 非法/quota 尽）→ 反馈重试（有界）；
+                    self._record_cost(cyc, stage, art.usage, status="failed",
+                                      failure_kind="artifact_parse", attempt=attempt)
                     last_err = f"resource_request sidecar 被拒: {e}"   # 其余异常（DB 损坏等）fail loud（内审 NIT）
                     continue
+                except Exception:              # noqa: BLE001 —— 调用已发生，先记账再保留原异常
+                    self._record_cost(cyc, stage, art.usage, status="failed",
+                                      failure_kind="postprocess_error", attempt=attempt)
+                    raise
+                self._record_cost(cyc, stage, art.usage, status="success", attempt=attempt)
                 raise StageBlockedOnResources(rid, stage)
             if art.stage != stage:              # 阶段漂移（外审 SHOULD）：文件对但 envelope stage 错 → 计入重试
+                self._record_cost(cyc, stage, art.usage, status="failed",
+                                  failure_kind="artifact_parse", attempt=attempt)
                 last_err = f"产物 stage 漂移：envelope stage={art.stage!r} ≠ 期望 {stage!r}"
                 continue
             err = self._validate_files(art.files, spec)
             if err:
+                self._record_cost(cyc, stage, art.usage, status="failed",
+                                  failure_kind="artifact_parse", attempt=attempt)
                 last_err = err
                 continue
+            self._record_cost(cyc, stage, art.usage, status="success", attempt=attempt)
             if spec.get("passthrough"):        # bundle：代码文件名任意 → 信封全量透传（物化/交叉核在组件侧）
                 return dict(art.files)
             return {k: art.files[k] for k in spec["required"] + [o for o in spec["optional"] if o in art.files]}
         # 完整 last_err（外审 NIT：不截断——这是 fail-fast 排障入口，schema oneOf 展开的字段路径不能丢）
         raise RunnerError(f"{stage} 产物结构非法，artifact_parse 重试（≤{self.retries}）用尽：{last_err}")
+
+    def _record_cost(self, cyc, stage: str, usage, *, status: str,
+                     attempt: int, failure_kind: Optional[str] = None) -> None:
+        """本次调用记账。预算网开启时 fail-closed；只有 session_max=null 时才容忍记账故障。
+
+        usage=None 也写 money=0 行；RunnerError 携带多少就记多少，保证失败重试不从调用历史消失。
+        cost_ledger=None 仅保留给 session_max=null 的显式诊断/测试装配，生产 run.py 总会注入。
+        """
+        if self.cost_ledger is None:
+            return
+        try:
+            self.cost_ledger.record(cycle_id=cyc.cycle_id, phase=stage,
+                                    purpose=f"{stage}-n{self._call_seq}-a{attempt + 1}", usage=usage,
+                                    status=status, failure_kind=failure_kind)
+        except (BudgetExhausted, CostAccountingFailed):
+            raise                               # ledger/global_stop 已提交；立即阻断，不当作写账故障吞掉
+        except Exception:                      # noqa: BLE001 —— 预算开启时必须 fail-closed
+            logger.error("成本记账失败 (cycle=%s phase=%s)", getattr(cyc, "cycle_id", "?"), stage,
+                         exc_info=True)
+            if self._cost_required:
+                raise
 
     def _validate_files(self, files: Dict[str, Any], spec: Dict[str, Any]) -> Optional[str]:
         """校验：required 全在场 + required/在场 optional 各过 schema（.json 走对应 schema；.md 只须
@@ -188,7 +237,7 @@ class JudgeProvider:
     policy_hash = judge SKILL 文本 sha256（prompt 版本指纹：措辞即行为，换 prompt 即换裁决口径）。"""
 
     def __init__(self, *, runner_factory, schemas, policy: Dict[str, Any], system_prompt: str,
-                 skill: str, daemon, work_root: str):
+                 skill: str, daemon, work_root: str, cost_ledger=None):
         self.runner_factory = runner_factory
         self.schemas = schemas
         self.retries = policy["flow"]["retry"]["artifact_parse"]
@@ -197,6 +246,11 @@ class JudgeProvider:
         self.daemon = daemon
         self.work = Path(work_root)
         self.policy_hash = hashlib.sha256(skill.encode("utf-8")).hexdigest()
+        self.cost_ledger = cost_ledger         # 步⑩ CP10.2：judge(audit) 调用记账（复用 _record 建的 runner_call）
+        self._cost_required = policy.get("budget", {}).get("session_max") is not None
+        if self._cost_required and self.cost_ledger is None:
+            raise ValueError("budget.session_max 已启用，JudgeProvider 必须注入 cost_ledger；"
+                             "测试/诊断须显式设 session_max=null")
         self._call_seq = 0
 
     def __call__(self, cycle_id: str, build_target_id: int, review_kind: str, subject_hash: str) -> None:
@@ -218,40 +272,79 @@ class JudgeProvider:
             try:
                 art = runner.run_task(system_prompt=self.system_prompt, skill=sk, context_pack=pack)
             except RunnerError as e:
+                self._record_cost(cycle_id, review_kind, e.usage, status="failed",
+                                  failure_kind="runner_error", attempt=attempt)
                 last_err = str(e)
                 continue
             if "resource_request.json" in art.files:
                 # 判官不许要文件（评审对象已全在材料里；sidecar 出现=越界）——反馈重试，不静默丢弃
+                self._record_cost(cycle_id, review_kind, art.usage, status="failed",
+                                  failure_kind="artifact_parse", attempt=attempt)
                 last_err = "judge 不受理 resource_request sidecar（评审材料已全量给出，产 review_verdict.json 即可）"
                 continue
             verdict = art.files.get("review_verdict.json")
             if verdict is None:
+                self._record_cost(cycle_id, review_kind, art.usage, status="failed",
+                                  failure_kind="artifact_parse", attempt=attempt)
                 last_err = f"缺 review_verdict.json（files 键: {list(art.files)}）"
                 continue
             errs = [f"{e.json_path} {e.message}"
                     for e in self.schemas.validator("review_verdict").iter_errors(verdict)]
             if errs:
+                self._record_cost(cycle_id, review_kind, art.usage, status="failed",
+                                  failure_kind="artifact_parse", attempt=attempt)
                 last_err = "review_verdict.json schema 校验失败:\n" + "\n".join(errs[:8])
                 continue
-            self._record(cycle_id, build_target_id, review_kind, subject_hash, verdict)
+            self._record(cycle_id, build_target_id, review_kind, subject_hash, verdict, art.usage)
             return
         raise RunnerError(f"judge {review_kind} 产物结构非法，artifact_parse 重试（≤{self.retries}）用尽：{last_err}")
 
-    # -- 落库（短事务；runner_call 与 DECISION 同生共死）------------------------
-    def _record(self, cycle_id: str, bt_id: int, kind: str, subject_hash: str, verdict: Dict[str, Any]) -> None:
+    def _record_cost(self, cycle_id: str, review_kind: str, usage, *, status: str,
+                     attempt: int, failure_kind: Optional[str] = None) -> None:
+        """记录未形成最终裁决的 judge 调用（RunnerError 或 Artifact 被拒）。"""
+        if self.cost_ledger is None:
+            return
+        try:
+            self.cost_ledger.record(cycle_id=cycle_id, phase="audit",
+                                    purpose=f"{review_kind}-n{self._call_seq}-a{attempt + 1}", usage=usage,
+                                    status=status, failure_kind=failure_kind)
+        except (BudgetExhausted, CostAccountingFailed):
+            raise
+        except Exception:                      # noqa: BLE001 —— 预算开启时必须 fail-closed
+            logger.error("judge 成本记账失败 (cycle=%s kind=%s attempt=%s)",
+                         cycle_id, review_kind, attempt + 1, exc_info=True)
+            if self._cost_required:
+                raise
+
+    # -- 落库（短事务；runner_call + ledger + DECISION 同生共死）-----------------
+    def _record(self, cycle_id: str, bt_id: int, kind: str, subject_hash: str,
+                verdict: Dict[str, Any], usage) -> int:
+        """最终有效裁决原子落 runner_call(audit)+ledger+DECISION；任一步失败则整体回滚。"""
         ci = _cnum(cycle_id)
-        with self.daemon.transaction() as conn:
-            round_no = conn.execute(
-                "SELECT COUNT(*)+1 FROM decision WHERE actor='judge' AND type=? AND json_valid(payload_json) "
-                "AND json_extract(payload_json,'$.build_target_id')=?", (kind, bt_id)).fetchone()[0]
-            rc = conn.execute("INSERT INTO runner_call(cycle_id,phase,purpose,status) VALUES (?,'audit',?,'success')",
-                              (ci, kind)).lastrowid
-            conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'judge',?,?)",
-                         (ci, kind, json.dumps(
-                             {"build_target_id": bt_id, "review_kind": kind, "round_no": round_no,
-                              "verdict": verdict["verdict"], "issues": verdict.get("issues", []),
-                              "notes_md": verdict.get("notes_md", ""), "subject_hash": subject_hash,
-                              "runner_call_id": rc, "policy_hash": self.policy_hash}, ensure_ascii=False)))
+        budget_hit = None
+        try:
+            with self.daemon.transaction() as conn:
+                round_no = conn.execute(
+                    "SELECT COUNT(*)+1 FROM decision WHERE actor='judge' AND type=? AND json_valid(payload_json) "
+                    "AND json_extract(payload_json,'$.build_target_id')=?", (kind, bt_id)).fetchone()[0]
+                rc = conn.execute("INSERT INTO runner_call(cycle_id,phase,purpose,status) VALUES (?,'audit',?,'success')",
+                                  (ci, kind)).lastrowid
+                if self.cost_ledger is not None:
+                    budget_hit = self.cost_ledger.insert_ledger_for_runner(conn, runner_call_id=rc, usage=usage)
+                conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'judge',?,?)",
+                             (ci, kind, json.dumps(
+                                 {"build_target_id": bt_id, "review_kind": kind, "round_no": round_no,
+                                  "verdict": verdict["verdict"], "issues": verdict.get("issues", []),
+                                  "notes_md": verdict.get("notes_md", ""), "subject_hash": subject_hash,
+                                  "runner_call_id": rc, "policy_hash": self.policy_hash}, ensure_ascii=False)))
+        except Exception as e:
+            if self.cost_ledger is not None:
+                self.cost_ledger.fail_closed(
+                    cycle_id=cycle_id, phase="audit", purpose=kind, cause=e)
+            raise
+        if budget_hit is not None:              # runner_call+ledger+DECISION+global_stop 已提交后才阻断后续调用
+            raise BudgetExhausted(**budget_hit)
+        return rc
 
     # -- subject 材料装配（编排器机械拼装，零推理；judge 只读它）-----------------
     def _subject_md(self, cycle_id: str, bt_id: int, kind: str) -> str:

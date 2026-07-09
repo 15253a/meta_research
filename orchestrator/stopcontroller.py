@@ -12,8 +12,9 @@ terminate 时无限空转。本控制器补齐另两条安全网：
   global_stop 决策，重启不再推进（下方 already_stopped）。
 - **判据② ·预算耗尽**：全局成本台账 `ledger.money` 求和（§ ledger 覆盖所有 phase——含 reasoning/Codex
   调用，是「全局成本」的**唯一权威源**）≥ policy.budget.session_max。DB 派生、恢复安全。session_max=null
-  关闭本条。**当前状态**：ledger 写入（成本记账）尚未接线（M6 硬化项）——本网**已装、待成本落账即生效**
-  （在此之前 SUM=0、不误触发）。故不用 run.cost/attempt.cost（那是分执行的局部成本、且漏掉 reasoning）。
+  关闭本条。CostLedger 已把 stage/judge 的成功、失败与非法产物重试落账；单次写账越线会在同一事务
+  落 durable global_stop，提交后立即阻断同轮后续调用。故不用 run.cost/attempt.cost（那是分执行的局部成本、且漏掉
+  reasoning）。
 - **判据③ ·谓词满足**：仍由 provider terminate 走（不在此——它是研究判断，Codex 出；本控制器只管
   「provider 该停却不停」的安全网）。
 

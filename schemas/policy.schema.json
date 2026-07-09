@@ -20,13 +20,26 @@
     },
     "budget": {
       "type": "object",
-      "required": ["B0", "doubling_period_m", "B_max"],
+      "required": ["B0", "doubling_period_m", "B_max", "session_max"],
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": ["session_max"],
+            "properties": { "session_max": { "type": "number" } }
+          },
+          "then": {
+            "required": ["price_per_1k_tokens"],
+            "properties": { "price_per_1k_tokens": { "exclusiveMinimum": 0 } }
+          }
+        }
+      ],
       "properties": {
         "B0": { "type": "number", "exclusiveMinimum": 0 },
         "doubling_period_m": { "type": "integer", "minimum": 1 },
         "B_max": { "type": "number", "exclusiveMinimum": 0 },
-        "session_max": { "type": ["number", "null"], "exclusiveMinimum": 0 }
+        "session_max": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+        "price_per_1k_tokens": { "type": "number", "minimum": 0, "description": "步⑩ M6：tokens→money 汇率（ledger.money=tokens/1000×本值，notional/USD-等效）。session_max 为数字时本项必填且须>0；仅 session_max=null 关闭预算网时允许缺键/0" }
       }
     },
     "flow": {

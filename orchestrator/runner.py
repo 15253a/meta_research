@@ -18,6 +18,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from typing import Optional
 
 from .interfaces import Artifact, CallUsage, ContextPack
 
@@ -32,19 +33,28 @@ _TOKENS_RE = re.compile(
 )
 
 
-def parse_tokens_used(stderr_text: str) -> int:
-    """从 codex stderr 抽总 token（步⑩ 成本记账）。无匹配 / 格式变 → 0（健壮，绝不因用量解析失败拖垮调用）。"""
+def parse_tokens_used(stderr_text: str) -> Optional[int]:
+    """从 codex stderr 抽总 token；无匹配/格式漂移返回 None，不能冒充真 0。"""
     matches = _TOKENS_RE.findall(stderr_text or "")
     if not matches:
-        return 0
+        return None
     try:
         return int(matches[-1].replace(",", ""))       # 多次出现取最后一条汇总
     except ValueError:
-        return 0
+        return None
 
 
 class RunnerError(RuntimeError):
-    """一次 Runner 调用失败（进程失败 / 超时 / 信封不可解析）。驱动器据 artifact_parse 策略重试。"""
+    """一次 Runner 调用失败（进程失败 / 超时 / 信封不可解析）。
+
+    ``usage`` 保留失败发生前能观测到的真实用量；provider 即使决定重试，也必须先把这次已经发生的
+    LLM 调用写入成本账。拿不到 token 时仍携墙钟并标 `tokens_known=False`；预算开启时这会
+    触发持久计账停机，不会把未知成本冒充真 0。
+    """
+
+    def __init__(self, message: str, *, usage=None):
+        super().__init__(message)
+        self.usage = usage
 
 
 class CodexRunner:
@@ -61,7 +71,13 @@ class CodexRunner:
     def run_task(self, *, system_prompt: str, skill: str, context_pack: ContextPack) -> Artifact:
         prompt = self._build_prompt(system_prompt, skill, context_pack)
         raw, usage = self._invoke(prompt, context_pack)
-        files, md = self._parse_envelope(raw)
+        try:
+            files, md = self._parse_envelope(raw)
+        except RunnerError as e:
+            # 子进程已经成功结束、stderr 用量也已捕获；不能因信封坏而把这次真调用从 ledger 漏掉。
+            if e.usage is None:
+                e.usage = usage
+            raise
         return Artifact(stage=context_pack.stage, files=files, md=md, usage=usage)
 
     # -- 内部 ------------------------------------------------------------------
@@ -85,7 +101,7 @@ class CodexRunner:
 
     def _invoke(self, prompt: str, pack: ContextPack) -> "tuple[str, CallUsage]":
         """跑一次 codex exec，返回 (信封文本, CallUsage)。用量：stderr 报的总 token + 墙钟秒（步⑩ 成本记账）。
-        用量捕获**只在成功路径**（失败→raise、不记账；失败调用的 token 属已知欠计，量小、由后续重试主导）。"""
+        失败也把当下可见的 token/墙钟挂到 RunnerError.usage，供 provider 在重试前记账。"""
         self._call_no += 1
         tag = f"{pack.stage}-{self.purpose_tag or 'call'}-{self._call_no}"
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
@@ -110,14 +126,34 @@ class CodexRunner:
                     capture_output=True, timeout=self.timeout_s,
                 )
         except subprocess.TimeoutExpired as e:
-            raise RunnerError(f"runner 超时（{self.timeout_s}s）：{tag}") from e
+            wallclock = round(time.monotonic() - t0, 3)
+            stderr = self._stream_text(getattr(e, "stderr", None))
+            usage = self._usage(stderr, wallclock)
+            raise RunnerError(f"runner 超时（{self.timeout_s}s）：{tag}", usage=usage) from e
         wallclock = round(time.monotonic() - t0, 3)
+        stderr = self._stream_text(proc.stderr)
+        usage = self._usage(stderr, wallclock)
         if proc.returncode != 0 or not out_file.exists():
-            tail = (proc.stderr or b"")[-500:].decode("utf-8", "replace")
-            raise RunnerError(f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}")
-        tokens = parse_tokens_used((proc.stderr or b"").decode("utf-8", "replace"))   # codex 把用量打到 stderr
-        usage = CallUsage(tokens_total=tokens, wallclock_sec=wallclock)
-        return out_file.read_text(encoding="utf-8"), usage
+            tail = stderr[-500:]
+            raise RunnerError(f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}", usage=usage)
+        try:
+            raw = out_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            raise RunnerError(f"runner 输出读取失败：{tag}（{e}）", usage=usage) from e
+        return raw, usage
+
+    @staticmethod
+    def _usage(stderr: str, wallclock: float) -> CallUsage:
+        tokens = parse_tokens_used(stderr)
+        return CallUsage(tokens_total=tokens or 0, wallclock_sec=wallclock,
+                         tokens_known=tokens is not None)
+
+    @staticmethod
+    def _stream_text(raw) -> str:
+        """subprocess/TimeoutExpired 的流可能是 bytes、str 或 None，统一为可解析文本。"""
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", "replace")
+        return raw if isinstance(raw, str) else ""
 
     @staticmethod
     def _parse_envelope(raw: str) -> tuple:

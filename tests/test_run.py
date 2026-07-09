@@ -11,9 +11,10 @@ import json
 from pathlib import Path
 
 import pytest
+from jsonschema.exceptions import ValidationError
 
 from orchestrator import database as db
-from orchestrator.interfaces import Artifact
+from orchestrator.interfaces import Artifact, CallUsage
 from orchestrator.run import build_system
 from orchestrator.writedaemon import WriteDaemon
 
@@ -33,7 +34,8 @@ def _mock_factory(files_seq):
 
     class MockRunner:
         def run_task(self, *, system_prompt, skill, context_pack):
-            return Artifact(stage=context_pack.stage, files=box["seq"].pop(0), md="")
+            return Artifact(stage=context_pack.stage, files=box["seq"].pop(0), md="",
+                            usage=CallUsage(tokens_known=True))
     return lambda td, pt: MockRunner()
 
 
@@ -50,6 +52,77 @@ def test_build_and_run_bootstrap_terminate(tmp_path):
     card = tmp_path / "state" / "status_card.json"
     assert card.exists() and json.loads(card.read_text())["snapshot_cycle"] == ids[0]
     assert (tmp_path / "research.sqlite").exists()             # 真冻结库落盘
+
+
+def test_build_system_validates_policy_before_opening_database(tmp_path, monkeypatch):
+    """生产入口须执行 schema，并补拒 YAML 可表达但非 JSON number 的 NaN。"""
+    import orchestrator.run as R
+    raw = (Path(SYSTEM_ROOT) / "policies" / "policy.yaml").read_text(encoding="utf-8")
+    base = R.yaml.safe_load(raw)
+
+    missing = {**base, "budget": {k: v for k, v in base["budget"].items()
+                                    if k != "price_per_1k_tokens"}}
+    monkeypatch.setattr(R.yaml, "safe_load", lambda text: missing)
+    with pytest.raises(ValidationError, match="price_per_1k_tokens"):
+        R.build_system(SYSTEM_ROOT, str(tmp_path / "missing"), runner_factory=_mock_factory([]))
+    assert not (tmp_path / "missing").exists()
+
+    nonfinite = {**base, "budget": {**base["budget"], "price_per_1k_tokens": float("nan")}}
+    monkeypatch.setattr(R.yaml, "safe_load", lambda text: nonfinite)
+    with pytest.raises(ValueError, match="非有限数字"):
+        R.build_system(SYSTEM_ROOT, str(tmp_path / "nan"), runner_factory=_mock_factory([]))
+    assert not (tmp_path / "nan").exists()
+
+    overflow = {**base, "budget": {**base["budget"], "session_max": 10 ** 10000}}
+    monkeypatch.setattr(R.yaml, "safe_load", lambda text: overflow)
+    with pytest.raises(ValueError, match="session_max"):
+        R.build_system(SYSTEM_ROOT, str(tmp_path / "overflow"), runner_factory=_mock_factory([]))
+    assert not (tmp_path / "overflow").exists()
+
+
+def test_system_budget_crossing_stops_cleanly_without_committing_inflight_cycle(tmp_path, monkeypatch):
+    """BudgetExhausted 在 run_cycles 阶段边界转成干净停；账/stop durable，在途 reasoning 不误提交。"""
+    import orchestrator.run as R
+    raw = (Path(SYSTEM_ROOT) / "policies" / "policy.yaml").read_text(encoding="utf-8")
+    policy = R.yaml.safe_load(raw)
+    policy = {**policy, "budget": {**policy["budget"], "session_max": 0.1,
+                                    "price_per_1k_tokens": 0.3}}
+    import types
+    monkeypatch.setattr(R, "yaml", types.SimpleNamespace(safe_load=lambda text: policy))
+    calls = {"n": 0}
+
+    class CostedRunner:
+        def run_task(self, *, system_prompt, skill, context_pack):
+            calls["n"] += 1
+            return Artifact(stage=context_pack.stage, files=_BOOT_TERMINATE, md="",
+                            usage=CallUsage(tokens_total=1000, tokens_known=True))
+
+    sys = R.build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=lambda td, pt: CostedRunner())
+    assert sys.run(max_cycles=5) == []
+    assert sys.last_stop_reason == "budget_exhausted" and calls["n"] == 1
+    assert sys.daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] != "done"
+    assert sys.daemon.query_one("SELECT COUNT(*) FROM ledger WHERE runner_call_id IS NOT NULL")[0] == 1
+    assert sys.daemon.query_one("SELECT COUNT(*) FROM decision WHERE type='global_stop'")[0] == 1
+
+
+def test_system_unknown_usage_durably_stops_without_retry(tmp_path):
+    """CLI 用量汇总未知时不得冒充真 0：落 durable stop，当前游标不提交/不重调。"""
+    calls = {"n": 0}
+
+    class UnknownUsageRunner:
+        def run_task(self, *, system_prompt, skill, context_pack):
+            calls["n"] += 1
+            return Artifact(stage=context_pack.stage, files=_BOOT_TERMINATE, md="", usage=None)
+
+    sys = build_system(SYSTEM_ROOT, str(tmp_path),
+                       runner_factory=lambda td, pt: UnknownUsageRunner())
+    assert sys.run(max_cycles=5) == []
+    assert calls["n"] == 1 and sys.last_stop_reason == "cost_accounting_failed"
+    assert sys.daemon.query_one("SELECT COUNT(*) FROM ledger")[0] == 0
+    assert sys.daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] != "done"
+    assert sys.daemon.query_one(
+        "SELECT json_extract(payload_json,'$.reason') FROM decision WHERE type='global_stop'") == (
+            "cost_accounting_failed",)
 
 
 def test_resume_same_work_root_no_goal_recreate(tmp_path):
@@ -148,7 +221,8 @@ def test_global_wait_honored_end_to_end(tmp_path):
         class R:
             def run_task(self, **kw):
                 called["n"] += 1
-                return Artifact(stage="reasoning", files=_BOOT_TERMINATE, md="")
+                return Artifact(stage="reasoning", files=_BOOT_TERMINATE, md="",
+                                usage=CallUsage(tokens_known=True))
         return R()
     sys = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=counting_factory)
     with sys.daemon.transaction() as conn:                     # 造 pending 文件请求
@@ -169,7 +243,8 @@ def _lazy_factory(items):
         def run_task(self, *, system_prompt, skill, context_pack):
             item = box["seq"].pop(0)
             files = item(context_pack) if callable(item) else item
-            return Artifact(stage=context_pack.stage, files=files, md="")
+            return Artifact(stage=context_pack.stage, files=files, md="",
+                            usage=CallUsage(tokens_known=True))
     return lambda td, pt: MockRunner()
 
 

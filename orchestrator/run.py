@@ -22,6 +22,7 @@ CP8.6）——NotImplementedError 干净报，不静默。
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -34,6 +35,7 @@ from .attack_stages import AttackStages
 from .compiler_sqlite import SqliteCompiler
 from .console import Console
 from .console_ingest import ConsoleInboxIngest
+from .cost_ledger import CostLedger
 from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
@@ -48,6 +50,21 @@ from .stopcontroller import StopController
 from .writedaemon import WriteDaemon
 
 _STAGES = ("idea", "plan", "bundle", "reasoning")
+
+
+def _reject_nonfinite_policy_numbers(value: Any, path: str = "$") -> None:
+    """YAML 可构造 NaN/±Inf，但它们不是合法 JSON number，jsonschema 的 Python 类型层未必会拒。
+
+    policy 是研究与预算契约；在建 DB/启动循环前递归拒绝所有非有限浮点，避免比较式静默失效。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"policy 含非有限数字 {path}={value!r}")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _reject_nonfinite_policy_numbers(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            _reject_nonfinite_policy_numbers(item, f"{path}[{idx}]")
 
 
 class System:
@@ -79,8 +96,12 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     （诊断用）；AttackStages 实例=注入自定装配（codex NIT：保留可注入性，不破外部调用方）。"""
     root = Path(system_root)
     work = Path(work_root)
-    work.mkdir(parents=True, exist_ok=True)
     policy = yaml.safe_load((root / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+    schemas = SchemaSet(root / "schemas")
+    schemas.validator("policy").validate(policy)    # 启动前机械校验；不能只靠 tests 校验仓库默认文件
+    _reject_nonfinite_policy_numbers(policy)         # JSON Schema/Python 边界：显式拒 NaN/±Inf
+    CostLedger.validate_policy(policy)               # 成本边界（float 溢出/布尔值等）也在创建 work/DB 前验完
+    work.mkdir(parents=True, exist_ok=True)
 
     db_path = str(work / "research.sqlite")
     daemon = WriteDaemon(_db.connect(db_path))            # 新库建 / 既有库续（checksum 三重锁）
@@ -115,7 +136,6 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
         inbox_ingest.ingest(cyc)              # 先 ingest 控制台入站（落 directive / 应答 query）——辅助面，不崩推进
         return base_precheck(cyc)             # 再消费到期 directive + 查阻断（pause / 文件请求全局等待）
 
-    schemas = SchemaSet(root / "schemas")
     system_prompt = (root / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
     skills = {s: (root / "prompts" / "skills" / s / "SKILL.md").read_text(encoding="utf-8") for s in _STAGES}
     rf = runner_factory or (lambda transcripts_dir, purpose_tag:
@@ -132,9 +152,10 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
             goal_id=gid, goal_ver=gver, stage=stage, request=request,
             cycle_id=getattr(cyc, "cycle_id", None), question_id=getattr(cyc, "question_id", None))
 
+    cost_ledger = CostLedger(daemon, policy)     # 步⑩ CP10.2：LLM 调用成本记账（激活 budget_exhausted 安全网）
     provider = StageProvider(runner_factory=rf, schemas=schemas, policy=policy,
                              system_prompt=system_prompt, skills=skills, work_root=str(work),
-                             file_request_bridge=file_request_bridge)
+                             file_request_bridge=file_request_bridge, cost_ledger=cost_ledger)
 
     attack_stages = attack if isinstance(attack, AttackStages) else None
     if attack is True:
@@ -149,7 +170,7 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
         judge = JudgeProvider(
             runner_factory=rf, schemas=schemas, policy=policy, system_prompt=system_prompt,
             skill=(root / "prompts" / "skills" / "judge" / "SKILL.md").read_text(encoding="utf-8"),
-            daemon=daemon, work_root=str(work))
+            daemon=daemon, work_root=str(work), cost_ledger=cost_ledger)
         attack_stages = AttackStages(
             state=state, compiler=compiler, pool_gate=pool_gate, close_gate=close_gate,
             providers={"idea": provider.idea, "plan": provider.plan, "bundle": provider.bundle,
