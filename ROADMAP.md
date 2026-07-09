@@ -349,6 +349,7 @@
   - [x] CP10.1 runner 成本捕获：`runner.py` 解析 stderr `tokens used` 总 token（行首锚定+合法千分组+取末条+坏输入→0）
     + subprocess wallclock → `Artifact.usage`（interfaces.py 加 CallUsage + Artifact.usage 非破坏）；不改循环行为。
     顺带修 test_run.py 既有 `__new__` monkeypatch 全局污染 bug。→ commit `1b415f9`（build_log 0046；codex 第2轮 APPROVE；678 测绿）。
-  - [ ] CP10.2 ledger 写入 + 激活安全网：`CostLedger`（写 runner_call + ledger/txn）+ 装配进 StageProvider/JudgeProvider
-    + policy `price_per_1k_tokens` 旋钮（+schema）。`SUM(ledger.money)` 随真用量增长 → budget_exhausted 转活。
+  - [x] CP10.2 ledger 写入 + 激活安全网：`CostLedger`覆盖成功/失败/非法产物重试，
+    未知用量持久 fail-closed，Judge 三写原子，单次越线即 `global_stop`；`price_per_1k_tokens`
+    + schema 接线。→ commit `03d3ffd`（build_log 0047；pytest 754；codex 第2轮 APPROVE）。
   - [ ] CP10.3 对账 + 步级收口：status_card `cycle_spent` ← SUM(ledger)；budget_exhausted 端到端真触发验证（步级）。

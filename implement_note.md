@@ -1,73 +1,31 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-> 任何新 session（含换模型）开工先读本文件，从「下一步动作」接着做；用法与更新时点见 `CLAUDE.md` §9。
-> 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
-> 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
-
-- 更新：2026-07-09 ｜ 位置：**步⑩（M6 硬化）CP10.2**（ledger 写入 + 激活安全网）——**待开工**。
-- 检查点状态：CP10.1 已提交（**1b415f9** + build_log 0046）。测试 **678 绿**。
-
-> 步⑩勘察定论（Explore + 实机 probe，全在案）：读侧已装（stopcontroller 读 SUM(ledger.money)≥session_max），无任何
-> INSERT INTO ledger（休眠）。**CP10.1 已落**：runner 从 stderr 抽真总 token + 墙钟 → Artifact.usage（不改循环）。
-> 关键事实（CP10.2 要用）：①ledger DDL 列见 db/migrations/0001_appendix_a.sql:268——cycle_id/phase(enum)/ 四选一 FK
-> (run/eval/attempt/runner_call 至少一非空)/tokens_*/wallclock_sec/money/policy_version；**append-only 触发器**（累计靠新
-> INSERT，不 UPDATE）。②runner_call 目前**仅 audit(judge)** 写（stage_provider.py:247，短 txn）；idea/plan/bundle/reasoning
-> 从不写 → ledger 的 runner_call_id FK 需一并补建。③StageProvider **无 daemon**（build_system 未注入）；JudgeProvider 有。
-
-## CP10.2 计划：ledger 写入 + 激活安全网
-- **CostLedger 服务**（新模块）：`record(cyc_id, phase, purpose, usage: CallUsage, policy_version) → runner_call_id`：
-  单 txn 内 INSERT runner_call(status=success) + INSERT ledger(cycle_id/phase/runner_call_id/tokens_*/wallclock_sec/money/policy_version)。
-  money = `usage.tokens_total/1000 × policy.budget.price_per_1k_tokens`。
-- **pricing 旋钮**：policy.yaml `budget.price_per_1k_tokens`（notional/provisional，缺省 ~0.3 使 cycle≈B_max 量级、
-  session_max=100000 为失控兜底，A/B 细化）+ policy.schema.json 加该键。
-- **装配**：给 StageProvider 注入 daemon + CostLedger（build_system），`_produce` 各 phase 调用后 record；JudgeProvider
-  用 CostLedger（替其现有 runner_call INSERT，保留 DECISION 写）。usage 从 Artifact.usage 取。
-- **验证**：注入已知 usage 的 mock runner 跑几轮 → ledger 有行、SUM(money)>0；喂到 session_max → budget_exhausted 干净停
-  + durable global_stop；ledger append-only 不破。（真触发端到端留 CP10.3 步级收口。）
-- **坑**：StageProvider 现无 daemon（构造器 + build_system 装配要改）；runner_call.phase 是 enum（idea/plan/bundle/reasoning/
-  audit/… 已在枚举内）；ledger.money REAL；失败调用不记账（CP10.1 已定）。
-
-> **步⑨完成**：人类控制台真接入——CP9.1 数据面(console_server 只读 /api/db + spool)、CP9.2 前端真数据(去 mock)、
-> CP9.3 入站闭环(ConsoleInboxIngest)、CP9.4 端到端验收(test_console_e2e 强证零 DB 写 + 入站闭环 + grounded)。
-> 系统现可：全研究循环(步①–⑧「正式直接可用」)+ 人类控制台查看真状态 & 交互(pause/resume/query)，单写纪律不破。
->
-> **下一批（存量，非阻塞；建议先与用户确认优先级）**：
-> 1. **成本记账接线（M6 硬化，最有价值）**：`INSERT INTO ledger`(money) 未接 → `budget.session_max` 安全网休眠、
->    `budget_exhausted` 永不触发（§7/README §6）。真跑长时研究前须接，否则失控成本无自动上限（只 τ + --max-cycles 兜底）。
-> 2. CP8.6b：eval target（免训练评估）+ import（外部基线导入）+ route dependency_wait 特化（现遇到干净业务拒、不楔死）。
-> 3. worktree 隔离 + env lock 强校验、双模 A/B 会话粒度实测（§7）。
-> 4. CP9.3 已知取舍：`_attempts` 不跨重启持久化（注释在案，需要跨重启 liveness 契约时再补）。
+- 更新：2026-07-09 ｜ 位置：步⑪ CP11.1 外部产物接纳硬化
+- 检查点状态：代码已构建，待隔离 staged diff + 外审 + 提交
 
 ## 正在做什么
-**空闲。步①–⑨全完成、664 测绿。** 步⑨（M8 人类控制台）本 session 收官：CP9.2 前端真数据 + CP9.3 入站闭环 +
-CP9.4 端到端验收 全部提交。系统现可全自动跑研究循环 + 在人类控制台查看真状态 & 交互。等用户定下一批优先级。
 
-## 下一步动作（存量，建议先与用户确认优先级）
-1. **成本记账接线（M6 硬化，最有价值）**：`INSERT INTO ledger`(money) 未接 → budget.session_max 安全网休眠、
-   budget_exhausted 永不触发（真跑长时研究前须接，否则失控成本无自动上限）。
-2. CP8.6b：eval target（免训练评估）+ import（外部基线导入）+ route dependency_wait 特化（现干净业务拒、不楔死）。
-3. worktree 隔离 + env lock 强校验、双模 A/B 会话粒度实测（§7）。
-4. CP9.3 已知取舍：`_attempts` 不跨重启持久化（注释在案）。
+CP10.2 已以 `03d3ffd` 提交并记账。当前工作树已有 CP11.1：严格解析 metric，所有外部前缀 ID
+在转 int 前限 SQLite 边界，reasoning 语义拒收落 durable terminate，且区分 Gate 业务拒与 DB 不变量损坏。
+下一步只暂存 CP11.1 的 6 个文件，不得混入已完成的 CP11.2 控制面工作树改动。
 
-## 关键上下文 / 坑（新 session 不读会踩的）
-- **⚠ 开工先看 `git status`**（CP9.1 教训，build_log 0042 载）：工作区若带未提交改动（本次是一份误带的
-  CP8.8 no-wedge 反向改动），`git add -A` 会误 staged 进你的提交。核 `git diff --staged --name-only` 只含
-  本检查点文件。
-- **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
-- **codex 外审模式 B 后台跑**（Bash 120s 会杀，必须 run_in_background）：`env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`；prompt 声明「全部内联、无需执行命令」。两轮上限；外审 diff 排除记账类。
-- **本 harness 署名**：`Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`。
-- console_server 关键事实：
-  - 起服务：`python -m orchestrator.console_server --system-root . --work-root <同 run 的 work> --port 8765`。
-  - /api/db 形状：`{tables:{<表名>:[行dict…]}, status_card, live, notification, ledger_by_cycle, policy, fs}`。
-    真表投影动态列（PRAGMA），高基数表（execution_log/ledger/runner_call/decision/metric_result/…）id DESC
-    LIMIT 500。派生对象各字段见 console_server.py 内 _live/_notifications/_fs_tree。
-  - /api/file?p=<虚拟根>/… 白名单：work/ · schemas/ · prompts/ · policies/ · input/（虚拟根显式映射真目录）。
-  - /api/message POST {text} → 写 <work>/state/console_inbox.jsonl（connector 固定 console；seq 单调；不碰 DB）。
-  - 原型 DB 表字段清单（照真 DDL 画）可用 node 从原型脚本提取（见本 session 勘察）；server 用真列名投影。
-- M5 入站链（CP9.3 用）：InteractionIngest.inbound(connector,raw_text,idempotency_key,goal_id,goal_ver) →
-  interaction_message；Console.handle_inbound 分类→directive/回执；Mediator.handle_query(message_id) 应答。
-- 测试基线 **642**（638 + 前端 4）。真 Codex 冒烟需代理 7890。
-- 控制台前端（CP9.2，build_log 0043）：`views/console/index.html` 已全真化；调试用 node 冒烟遍历全 9 标签页——
-  `python -c` 造 assemble_db payload（seeded/空库/null-cap）→ `node tests/console_smoke.js <页> <payload.json>`，
-  期望 `SMOKE_OK ... tabs=9`。去 mock 原则：**自动渲染面一律读真 payload**；mock DB/SCENARIOS/FILE_CONTENT/classify
-  仅离线 demo 回退（连线后 refreshDB/sendCmd 覆盖绕过）。原型原件 `reference/人类控制台原型-v2.html` 不动，diff 它=真决策面。
+## 工作区状态
+
+- 分支：`fix/architecture-hardening-20260709`。
+- CP10.2：`03d3ffd` + build_log 0047；最终全量 `754 passed`。
+- CP11.1 修改文件：`ids.py` / `gate_sqlite.py` / `statestore_sqlite.py` / `attack_stages.py`
+  / `test_attack_advance.py` / `test_gate_sqlite.py`。子代理定向 102 + 当时全量 746 已绿。
+- CP11.2 已有未提交改动（console/notify/interaction/run/frontend/tests），严禁混入 CP11.1。
+
+## 下一步动作
+
+1. 在 ROADMAP 登记步⑪ / CP11.1，只 stage CP11.1 六文件。
+2. 复跑 CP11.1 定向测试，对 staged diff 跑 codex 外审（最多两轮），提交。
+3. 写 build_log 0048，再单独审查/提交 CP11.2 真实 confirm/reject + 文件 resolve/cancel 闭环。
+
+## 关键上下文 / 坑
+
+- `run.py` 只剩 CP11.2 未提交差异；CP11.1 不应 stage 它。
+- CP11.1 重点反例：5000 位 metric/ID 不能先 `int()` 裸崩；未知 DB IntegrityError 不能洗成业务 GateReject；
+  answer 与 tree/selection 按「独立单调关问 + 后续原子批」分段接纳。
+- 每个检查点必须：定向+全量测试 → staged diff codex 外审（最多两轮）→ 功能提交 → 独立 build_log 提交。
