@@ -33,10 +33,11 @@ from .advancer import SqliteAdvancer
 from .attack_stages import AttackStages
 from .compiler_sqlite import SqliteCompiler
 from .console import Console
+from .console_ingest import ConsoleInboxIngest
 from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
-from .mediator import open_responder_read_conn
+from .mediator import Mediator, open_responder_read_conn
 from .notify import FileRequestService, make_advancer_precheck
 from .runner import CodexRunner
 from .schemas import SchemaSet
@@ -103,7 +104,16 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
                                       goal_body_md=goal_body, out_path=str(work / "state" / "status_card.json"))
     stop = StopController(daemon, policy)
     console = Console(daemon)
-    precheck = make_advancer_precheck(console, daemon)
+    # 步⑨ CP9.3 入站闭环：控制台命令经 console_server 落 <work>/state/console_inbox.jsonl（连接器缓冲）→
+    # precheck 边界 ingest 进权威入站链（handle_inbound 落 directive/note；query 经 mediator 应答）。
+    # mediator 用同一 status_card.json（publisher 阶段边界原子发布的那份）做接地卡。
+    mediator = Mediator(daemon, str(work / "state" / "status_card.json"))
+    inbox_ingest = ConsoleInboxIngest(console, mediator, str(work))
+    base_precheck = make_advancer_precheck(console, daemon)
+
+    def precheck(cyc=None) -> Optional[str]:
+        inbox_ingest.ingest(cyc)              # 先 ingest 控制台入站（落 directive / 应答 query）——辅助面，不崩推进
+        return base_precheck(cyc)             # 再消费到期 directive + 查阻断（pause / 文件请求全局等待）
 
     schemas = SchemaSet(root / "schemas")
     system_prompt = (root / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
