@@ -15,9 +15,9 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑧（M7）开工**——plan 契约缺口补齐 → 全流程 real-Codex attack（用户 2026-07-09
-  指令）。步①–⑦（M0–M6）建造面全部完成（535 测绿；reasoning-only 全自动真 Codex 端到端已跑通，CP7.3
-  冒烟 ce11d00）。步⑦遗留的「plan 制品契约缺口」已定向（不解冻，见步⑧方案），本步落地。
+- 进行中的步 / 检查点：**步⑧（M7）CP8.2**（attack_stages 真契约化）。CP8.1 契约层已落（commit `8b4f59a`，
+  build_log 0034，578 测绿）。步①–⑦（M0–M6）建造面全部完成。步⑦遗留的「plan 制品契约缺口」已定向
+  （不解冻），本步落地中。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -227,10 +227,11 @@
   代码评审→训练→出厂评估→结果评审→注册入池）→真证据关问→terminate；②真 Codex CLI 冒烟：一条命令跑通
   ≥1 个完整 attack 轮；③回归：既有 535 测全绿 + 冻结件字节不变（plan.schema、MIGRATION_SHA256）。
 - 检查点（模型切，边走边补）:
-  - [ ] CP8.1 execution_manifest 契约 + harness manifest 适配层：新增 `schemas/execution_manifest.schema.json`
+  - [x] CP8.1 execution_manifest 契约 + harness manifest 适配层：新增 `schemas/execution_manifest.schema.json`
     + `orchestrator/manifest.py`（schema 校验 / 与 plan 切片交叉核 / 占位符 {src}/{ckpt} 解析 / argv·路径·
-    env·超时围栏 / staging 文件物化）+ policy.execution 节（默认/上限超时、path_allowlist）。纯新增，
-    不改既有行为。
+    env·超时围栏 + 禁 shell 启动器 / 净土物化正反双向对账 + symlink 审计）+ policy.execution 节。纯新增，
+    不改既有行为 —— commit `8b4f59a`（build_log 0034；codex 两轮外审：第1轮 2 BLOCKER[禁 shell·checkpoint
+    ../x]+2 SHOULD 全修，第2轮无 BLOCKER 仅 2 SHOULD[. 段·ledger 校验]亦修；pytest 578/578，43 新，535 无回归）。
   - [ ] CP8.2 attack_stages 真契约化：idea/plan 消费冻结 schema 真形态（content_md 等机械合成）；plan 段
     改走 gate_new_protocol + gate_claim_baseline（可恢复幂等短事务序列，phase_commit 收口）；机械派生
     protocol_id/metric 映射/eval_key/target_set_hash；bundle 段逐目标 Codex bundle 产物（persist-then-
