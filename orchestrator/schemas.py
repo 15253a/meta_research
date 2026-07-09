@@ -22,6 +22,7 @@ ARTIFACT_SCHEMA_MAP: Dict[str, str] = {
     "plan.json": "plan",
     "plan_review.json": "plan_review",
     "bundle_target.json": "bundle_target",
+    "execution_manifest.json": "execution_manifest",
     "answer.json": "answer",
     "tree_ops.json": "tree_ops",
     "selection.json": "selection",

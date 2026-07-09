@@ -62,6 +62,12 @@ interaction:
   mediator_rebuild_last_n: 20         # 中介重建对话条数（§4.6.2）
   notify_matrix: all_qq_on            # 事件→通道开关表（§4.6.6）；默认全事件走 qq，细表运行期调
 
+# —— execution（步⑧ CP8.1：execution_manifest 命令围栏——manifest 命令的超时与路径边界唯一定义点）——
+execution:
+  default_timeout_s: 600              # manifest 命令未声明 timeout_s 时的默认
+  max_timeout_s: 86400                # 声明值上限截断（真训练需长时；与 flow.watchdog.full_h=24h 对齐）
+  path_allowlist: []                  # argv 允许出现的 work_root 以外绝对路径前缀（如真数据根）；默认空 = 只许 work_root 内
+
 # —— resources（启动输入③：只放硬件事实，§4.6.7；时限唯一归 flow.watchdog）——
 resources: { gpus: 4, gpu_mem_gb: 80, disk_quota_gb: 500 }
 
