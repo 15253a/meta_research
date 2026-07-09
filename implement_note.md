@@ -5,7 +5,10 @@
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
 - 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.5**（sidecar→file_request 桥）
-- 检查点状态：待开工（CP8.4 已提交 4f39559 + 记账中）
+- 检查点状态：构建+自验完成（617 测绿，+4）：interfaces.StageBlockedOnResources + StageProvider 桥
+  （bridge 注入；桥拒→重试反馈；未接桥 fail-loud 保持）+ JudgeProvider 拒 sidecar + advancer 捕获
+  （在途轮保持游标）+ run.py 装配 FileRequestService/bridge + 全等待环 E2E（阻断→precheck 拦→resolve→
+  同一在途轮续跑）。内审（Opus）进行中 → codex 外审 → 提交 → build_log 0038。
 
 ## 正在做什么
 **步⑧：plan 契约缺口补齐 → 全流程 real-Codex attack + 正式直接可用**（用户 2026-07-09 两道指令）。

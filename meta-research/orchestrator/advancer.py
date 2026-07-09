@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .interfaces import PlanOutcome, Route, Selection, Stage
+from .interfaces import PlanOutcome, Route, Selection, Stage, StageBlockedOnResources
 
 # reasoning 产物提供者：(cycle, context_pack) -> {"tree_ops.json":{...}, "selection.json":{...}, "answer.json"?:{...}}
 # 生产路径 = 包 CodexRunner + schema 校验 + 重试（对齐 M0 driver._run_reasoning_with_retry，后续检查点接）；
@@ -117,7 +117,13 @@ class SqliteAdvancer:
             for _step in range(8):               # attack 轮多阶段：逐格推进到 done（每格独立提交）
                 if self._blocked(cyc):
                     return ids               # 格间阻断：不推阶段（在途轮保持游标，解除后续跑）
-                done = self.advance(cyc.cycle_id) == "done"
+                try:
+                    done = self.advance(cyc.cycle_id) == "done"
+                except StageBlockedOnResources as e:
+                    # 阶段等文件（CP8.5）：请求单已落——干净停止推进（在途轮保持游标，本阶段零提交），
+                    # 下次 run_cycles 由 precheck 的 pending 文件请求阻断接管；resolve 后续跑重做本阶段
+                    self.last_block_reason = str(e)
+                    return ids
                 self._publish_card(cyc.cycle_id)     # 阶段边界发布（§4.6.6）：每格提交后快照即时对人可见
                 if done:
                     break

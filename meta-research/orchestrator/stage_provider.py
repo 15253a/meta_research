@@ -35,7 +35,8 @@ from typing import Any, Dict, List, Optional
 
 from .harness import latest_smoke_log as _latest_smoke_log
 from .ids import cnum as _cnum
-from .interfaces import ContextPack
+from .interfaces import ContextPack, StageBlockedOnResources
+from .notify import FileRequestReject
 from .runner import RunnerError
 
 # 阶段 → 产物契约：required=阶段必产（缺即重试）、optional=在场才校验；passthrough=返回信封全部文件
@@ -57,16 +58,21 @@ _CALL_NOTE = {
 
 class StageProvider:
     def __init__(self, *, runner_factory, schemas, policy: Dict[str, Any],
-                 system_prompt: str, skills: Dict[str, str], work_root: str):
+                 system_prompt: str, skills: Dict[str, str], work_root: str,
+                 file_request_bridge=None):
         """runner_factory(transcripts_dir, purpose_tag)→Runner（默认真 CodexRunner，见 run.py 装配）；
         schemas=SchemaSet（产物校验）；skills={stage: SKILL.md 文本}；work_root=cycles/<id>/transcripts 的根。
-        不持 compiler——pack 由调用方（advancer/attack_stages）渲染后传入，本类不 render。"""
+        不持 compiler——pack 由调用方（advancer/attack_stages）渲染后传入，本类不 render。
+        file_request_bridge（步⑧ CP8.5）：callable(stage, request, cyc)→request_id——把 resource_request
+        sidecar 落成 interaction_request（notify.FileRequestService.create_checked 的装配闭包）；None=未接
+        桥（如诊断装配），sidecar 保持 fail-loud。"""
         self.runner_factory = runner_factory
         self.schemas = schemas
         self.retries = policy["flow"]["retry"]["artifact_parse"]
         self.system_prompt = system_prompt
         self.skills = skills
         self.work = Path(work_root)
+        self.file_request_bridge = file_request_bridge
         self._call_seq = 0                     # 全局调用序（transcript 文件名唯一，P6 回放防覆盖）
 
     # -- provider 回调（绑定阶段）------------------------------------------------
@@ -101,11 +107,24 @@ class StageProvider:
                 last_err = str(e)
                 continue
             if "resource_request.json" in art.files:
-                # 阶段发资源请求 sidecar（§3.1.1「需用户提供文件」）：本路径尚未接 sidecar→
-                # notify.create_file_request 桥（全局等待走 CP6.3 独立通道）。**fail loud**，绝不静默丢弃
-                # （否则 worker 的资源诉求无声消失、阶段假装成功）——接线 = CP7.4 硬化。
-                raise RunnerError(f"{stage} 产出 resource_request.json sidecar，但本路径未接文件请求桥"
-                                  "（CP7.4 接 notify.create_file_request）——不静默丢弃")
+                # 阶段发资源请求 sidecar（§3.1.1「需用户提供文件」，步⑧ CP8.5 接桥）。
+                # **有意置于 stage 漂移/schema 校验之前**（codex NIT 注记）：sidecar 是「无法工作」的控制
+                # 信号，优先于产物质量判定——信封哪怕 stage 漂移/产物残缺，资源诉求也须落单，不得因产物
+                # 校验失败而丢。
+                # - 已接桥 → 落 interaction_request（create_checked：schema+幂等+quota 闸）→ 抛
+                #   StageBlockedOnResources（本轮停在游标处等待；信封里的其余阶段产物**弃用**——工人
+                #   自述缺文件无法完成，半成品不冒充阶段产物；resolve 后重做本阶段）；
+                # - 桥拒（sidecar 非法/quota 尽）→ 计入重试反馈（工人可修正或放弃 sidecar）；
+                # - 未接桥（诊断装配）→ 保持 fail loud，绝不静默丢弃。
+                if self.file_request_bridge is None:
+                    raise RunnerError(f"{stage} 产出 resource_request.json sidecar，但本装配未接文件请求桥"
+                                      "——不静默丢弃")
+                try:
+                    rid = self.file_request_bridge(stage, art.files["resource_request.json"], cyc)
+                except FileRequestReject as e:  # 只兜业务拒（sidecar 非法/quota 尽）→ 反馈重试（有界）；
+                    last_err = f"resource_request sidecar 被拒: {e}"   # 其余异常（DB 损坏等）fail loud（内审 NIT）
+                    continue
+                raise StageBlockedOnResources(rid, stage)
             if art.stage != stage:              # 阶段漂移（外审 SHOULD）：文件对但 envelope stage 错 → 计入重试
                 last_err = f"产物 stage 漂移：envelope stage={art.stage!r} ≠ 期望 {stage!r}"
                 continue
@@ -200,6 +219,10 @@ class JudgeProvider:
                 art = runner.run_task(system_prompt=self.system_prompt, skill=sk, context_pack=pack)
             except RunnerError as e:
                 last_err = str(e)
+                continue
+            if "resource_request.json" in art.files:
+                # 判官不许要文件（评审对象已全在材料里；sidecar 出现=越界）——反馈重试，不静默丢弃
+                last_err = "judge 不受理 resource_request sidecar（评审材料已全量给出，产 review_verdict.json 即可）"
                 continue
             verdict = art.files.get("review_verdict.json")
             if verdict is None:
