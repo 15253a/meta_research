@@ -15,9 +15,10 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑧（M7）CP8.4**（run.py attack 全装配 + 全链 E2E + 真 Codex 冒烟——步级验证
-  核心）。CP8.1 契约层（`8b4f59a`）+ CP8.2 attack_stages 真契约化（`d822add`）+ CP8.3 生产装配
-  （`c7863c0`）已落，608 测绿。步①–⑦（M0–M6）建造面全部完成。
+- 进行中的步 / 检查点：**步⑧（M7）CP8.5**（sidecar→file_request 桥）。CP8.1–8.4 已落（`8b4f59a`/
+  `d822add`/`c7863c0`/`4f39559`，613 测绿）——**真 Codex 完整 attack build 链已端到端跑通**（冒烟：
+  注册协议/占坑/真训练 acc=0.9949/双评审/legal 入池）。剩余=正式可用收口三件（CP8.5 桥 / CP8.6 plan
+  全形态受理 / CP8.7 运维文档+步级验证收口，用户 2026-07-09 升格必做）。步①–⑦（M0–M6）全完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -248,8 +249,12 @@
     + harness.latest_smoke_log 数值序（attack/judge 两侧同口径）—— commit `c7863c0`（build_log 0036；
     pytest 608/608；codex 两轮：第1轮 2 BLOCKER[?键诱导非法 JSON/result 材料缺代码]+3 SHOULD 全修，
     第2轮 APPROVE）。
-  - [ ] CP8.4 run.py attack 全装配 + 步级验证：build_system 装配 AttackStages 全家 → 全链 E2E（mock）+
-    真 Codex CLI 冒烟 ≥1 完整 attack 轮。
+  - [x] CP8.4 run.py attack 全装配 + 步级验证①②：build_system 装配 AttackStages 全家（连接分工：gate 判据
+    open_gate_read_conn / 观测 open_responder_read_conn / judge 写 daemon）→ 全链 E2E（mock，含 JudgeProvider
+    真落库与真证据关问）+ **真 Codex CLI 冒烟完整 attack build 链跑通**（协议注册/占坑/真训练 acc=0.9949/
+    双评审/legal 入池/τ 真实触发）；含冒烟发现的自纠环（plan SKILL kind 前置条件 + 拒因回流·成功后静默）
+    与 import_defer 显式拒 —— commit `4f39559`（build_log 0037；pytest 613/613；codex 第1轮 APPROVE，
+    2 SHOULD+3 NIT 全采纳）。
   - [ ] CP8.5 sidecar→file_request 桥（**必做**，正式可用性①）：StageProvider resource_request →
     notify.create_file_request + 干净阻断（全局等待闭环，替换 fail-loud 占位）。
   - [ ] CP8.6 plan 全形态受理（**必做**，正式可用性②）：exec/eval target kinds（gate_claim_variant /

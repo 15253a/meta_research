@@ -6,6 +6,7 @@
 
 ---
 
+- [0037](0037-cp84-run-attack-assembly-smoke.md) — CP8.4 run.py attack 全装配 + 全链 E2E + **真 Codex 冒烟**（第二次冒烟：真 Codex 完整走通 attack build 链——注册协议/占坑/真训练 MLP acc=0.9949/双评审 pass/legal 入池/τ 安全网真实触发；第一次冒烟暴露的 kind 教学缺口与拒因不回流已修成自纠环）· commit `4f39559` · 验证: 通过（pytest 613/613 + 冒烟 exit 0×2；codex 第1轮 APPROVE）
 - [0036](0036-cp83-production-assembly.md) — CP8.3 生产装配（bundle SKILL m7-1 真执行契约 + judge SKILL/review_verdict 契约 + StageProvider bundle passthrough + JudgeProvider 写 runner_call/DECISION；SKILL↔机器契约逐字段一致）· commit `c7863c0` · 验证: 通过（pytest 608/608；codex 第2轮 APPROVE）
 - [0035](0035-cp82-attack-stages-real-contract.md) — CP8.2 attack_stages 真契约化（消费冻结 plan/idea schema + gate_new_protocol/gate_claim_baseline 正式通道 + bundle manifest 驱动真执行 + toy TARGET_SPEC 清理；全自动不楔死[业务拒]与损毁 fail-loud 分流）· commit `d822add` · 验证: 通过（pytest 594/594；codex 两轮，BLOCKER 采纳修复+误读记录）
 - [0034](0034-cp81-execution-manifest.md) — CP8.1 execution_manifest 契约 + harness manifest 适配层（**步⑧ M7 开工**：不解冻冻结件，bundle 编译产物承载机器执行契约；防旁路交叉核 + 禁 shell/路径/env/超时围栏 + 净土物化正反对账）· commit `8b4f59a` · 验证: 通过（pytest 578/578，43 新；codex 两轮外审 BLOCKER 全修）
