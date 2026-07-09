@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/execution_manifest.schema.json",
+  "title": "execution_manifest",
+  "description": "bundle 阶段的编译产物：机器可验证执行契约（步⑧）。分层定位：plan 保持抽象（冻结 plan.schema 不动，命令永不入 plan）；本清单由 bundle 阶段 Codex 与代码/identity.md 一同产出，经编排器交叉核对（orchestrator/manifest.py：target_ref 回引 plan 切片、protocol 绑定一致、路径/env/超时围栏）后，harness 只机械执行它——不推理、不猜命令、不读 plan 找命令。防「新 plan 旁路」：manifest 不得引入 plan 未声明的目标/协议（plan_slice_hash 由编排器按库中切片重算核对）。命令 = argv 数组（禁 shell 字符串）；占位符 {src}=代码物化目录、{ckpt}=训练产 checkpoint 路径（仅 eval 命令可用）。指标契约：eval 命令须向 stdout 打印 `metric_value: <metric_id>@<metric_ver>=<float>` 行（int id 以 bundle 上下文包给出的协议绑定为准）。诚实边界（canary）：env_hash 为声明值，真 env lock / git worktree 隔离 / 产物集 hash 强校验 = 后续硬化步。",
+  "type": "object",
+  "required": ["manifest_version", "target_ref", "protocol_ref", "env_hash", "config_json", "code_files", "commands"],
+  "additionalProperties": false,
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "target_ref": {
+      "type": "object",
+      "description": "回引本 cycle 的 plan 切片（编排器以 build_target.plan_ref 中的 resolved 切片重算 plan_slice_hash 核对；不符即拒——manifest 不能自立目标）",
+      "required": ["target_key", "target_kind", "seq", "plan_slice_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "target_key": { "type": "string", "minLength": 1 },
+        "target_kind": { "enum": ["build", "exec", "eval"] },
+        "seq": { "type": "integer", "minimum": 1 },
+        "plan_slice_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "resolved plan 切片的规范哈希（bundle 上下文包原样给出，工人照抄）" }
+      }
+    },
+    "protocol_ref": {
+      "type": "object",
+      "description": "评估协议绑定（plan 阶段经 gate_new_protocol 注册的 int id@ver；bundle 上下文包给出，工人照抄；I1/I2：bundle 只照办、不发明口径）",
+      "required": ["protocol_id", "protocol_ver"],
+      "additionalProperties": false,
+      "properties": {
+        "protocol_id": { "type": "integer", "minimum": 1 },
+        "protocol_ver": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "env_hash": { "type": "string", "minLength": 1, "description": "环境指纹声明值（进 run/attempt.env_hash；canary 期为声明、后续硬化步接真 env lock）" },
+    "config_json": {
+      "type": "object",
+      "description": "本目标代码实际使用的变体配置。一致性规则（manifest.py 执法）：plan 切片 claim.config_json 非空 ⇒ 须与之相等（计划切片是配置的决定者，bundle 只照办）"
+    },
+    "code_files": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "构成本目标代码/配置的文件清单（相对 POSIX 路径，禁 .. 段/反斜杠；须与 manifest 同信封在场，manifest.py 物化并记 sha256）。保留名 execution_manifest.json / identity.md / _staged.ok 不得列入。运行期 _check_rel_path 再兜底执法",
+      "items": { "type": "string", "minLength": 1, "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\].*$", "not": { "enum": ["execution_manifest.json", "identity.md", "_staged.ok"] } }
+    },
+    "commands": {
+      "type": "object",
+      "description": "可执行步骤（build/exec 须 smoke+train+eval；eval 目标只须 eval）。argv 相对 token 以 run staging 为 cwd 解析；{src} 指向代码物化目录",
+      "additionalProperties": false,
+      "properties": {
+        "smoke": { "$ref": "#/$defs/command" },
+        "train": { "$ref": "#/$defs/command" },
+        "eval": { "$ref": "#/$defs/command" }
+      }
+    },
+    "expected_outputs": {
+      "type": "object",
+      "description": "命令预期产物（编排器核在场性/入账）",
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint": { "type": "string", "minLength": 1, "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\].*$", "description": "train 命令产出的 checkpoint 相对路径（相对 train run staging 目录，禁 .. 段/绝对/反斜杠；build/exec 必填；运行期 checkpoint_dest 再兜底解析进 run 目录内）" }
+      }
+    },
+    "env": {
+      "type": "object",
+      "description": "附加环境变量（合入子进程 env）。禁改 PATH/PYTHONPATH/PYTHONHOME/HOME/LD_PRELOAD/LD_LIBRARY_PATH（manifest.py 执法）",
+      "propertyNames": { "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+      "additionalProperties": { "type": "string" }
+    },
+    "repro_cmd_md": { "type": "string", "minLength": 1, "description": "人可读复现命令块（进 baseline identity_doc 的「复现命令」节，gate_register_baseline 必填输入；build/exec 必填）" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "target_ref": { "properties": { "target_kind": { "enum": ["build", "exec"] } }, "required": ["target_kind"] } },
+              "required": ["target_ref"] },
+      "then": {
+        "required": ["expected_outputs", "repro_cmd_md"],
+        "properties": {
+          "commands": { "required": ["smoke", "train", "eval"] },
+          "expected_outputs": { "required": ["checkpoint"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "target_ref": { "properties": { "target_kind": { "const": "eval" } }, "required": ["target_kind"] } },
+              "required": ["target_ref"] },
+      "then": {
+        "properties": {
+          "commands": {
+            "required": ["eval"],
+            "not": { "anyOf": [ { "required": ["train"] }, { "required": ["smoke"] } ] }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "command": {
+      "type": "object",
+      "required": ["argv"],
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "argv 数组（禁 shell 字符串/管道/重定向）；绝对路径 token 须落 work_root 或 policy.execution.path_allowlist 前缀内，相对 token 不得含 .. 组件（manifest.py 执法）"
+        },
+        "timeout_s": { "type": "number", "exclusiveMinimum": 0, "description": "本命令超时（缺省 policy.execution.default_timeout_s；上限 max_timeout_s 截断）" }
+      }
+    }
+  }
+}

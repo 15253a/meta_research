@@ -4,7 +4,7 @@
   "title": "policy",
   "description": "policies/policy.yaml 的机械校验 schema（启动前提 §7.5 #4）。旋钮注册表唯一权威 = 第一部分附录 C（全量、每旋钮带默认值）；本 schema 与之逐节对齐、封闭（additionalProperties=false）。observation 节（parser 阈值）已随 M4 CP5.3 真 parser 落地（OPEN #5 已闭；extraction_policy_hash = 该节规范化 JSON 的 sha256，见 obs_parser）。",
   "type": "object",
-  "required": ["acquisition", "budget", "flow", "retrieval", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "resources", "interaction_request", "observation"],
+  "required": ["acquisition", "budget", "flow", "retrieval", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "execution", "resources", "interaction_request", "observation"],
   "additionalProperties": false,
   "properties": {
     "acquisition": {
@@ -187,6 +187,17 @@
         },
         "mediator_rebuild_last_n": { "type": "integer", "minimum": 1 },
         "notify_matrix": { "type": "string", "minLength": 1 }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "description": "execution_manifest 命令围栏（步⑧ CP8.1；执法点 orchestrator/manifest.py）：manifest 命令超时与路径边界唯一定义点",
+      "required": ["default_timeout_s", "max_timeout_s", "path_allowlist"],
+      "additionalProperties": false,
+      "properties": {
+        "default_timeout_s": { "type": "number", "exclusiveMinimum": 0 },
+        "max_timeout_s": { "type": "number", "exclusiveMinimum": 0 },
+        "path_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^/" }, "description": "允许 argv 引用的 work_root 以外绝对路径前缀（如真数据根）" }
       }
     },
     "resources": {

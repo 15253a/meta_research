@@ -4,54 +4,55 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-08 ｜ 位置：**M0–M6 建造面全完成**（空闲；剩余=运维执行 + 一处待用户裁的设计缺口）
-- 检查点状态：空闲。系统「完整运行、进入全自动」**已达成**——reasoning-only 全自动闭环真 Codex CLI
-  端到端跑通。测试基线 **535 绿**。
+- 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.1**（execution_manifest 契约 + harness manifest 适配层）
+- 检查点状态：内审 APPROVE + 外审第 1 轮 REQUEST_CHANGES（2 BLOCKER+2 SHOULD 全修，572 测绿）→
+  **外审第 2 轮进行中**（codex 后台 bu8g09u5s；out=scratchpad cp81_r2_out.md）。已 `git add -A`。
+  build_log 0034 草稿已备（scratchpad build_log_0034_draft.md，待填第2轮结论）。CP8.2 施工图定稿：
+  scratchpad **cp82_design.md**（compiler bundle 锚区占位须补真切片、gate skipped 可用、import_worker
+  plan_ref 按 kind 隔离不动 三勘察结论）。
+- 外审第1轮修复（已 staged）：①_check_no_shell(argv[0]∈shell∪env 拒) ②checkpoint schema 负向前瞻拒 ..
+  +checkpoint_dest 解析入口 ③staged_hashes symlink 审计+反向对账 ④哨兵损坏→ManifestError ⑤code_files
+  uniqueItems ⑥env overlay 确认+加测。
 
 ## 正在做什么
-**全自动模式**（用户 2026-07-07：继续实现后续所有 M、遇问题自行裁决、目标系统完整运行进入全自动）。
-**M6 建造面收尾**（步⑦ CP7.1–7.5 全落）：
-- CP7.1 da38b2f 长跑自终止安全网（§4.4.6 τ：分数衰退 + ledger 预算，durable global_stop）
-- CP7.2 2ce750e StageProvider（真 CodexRunner→(cyc,pack)→files 阶段回调，schema 校验+重试）
-- CP7.3 ce11d00 run.py 全系统装配入口（**真 Codex CLI 冒烟跑通** bootstrap 全自动闭环）
-- CP7.4 6be7566 §7.3 机制验收剧本（主链路 I1/I2/I3 + import 三失败 + 日志 suspect fail-closed + 人机负例）
-- CP7.5 f45dd6f M6 长跑步级验证（守卫内不漂移 + 中途重启终库一致 + τ 自停）
+**步⑧：plan 契约缺口补齐 → 全流程 real-Codex attack**（用户 2026-07-09：开始补齐缺口，成品要能完整走完
+整个流程）。方案已与用户 + codex-chatgpt 对齐（不解冻冻结件；execution_manifest 作 bundle 编译产物；
+attack_stages 走正式 gate 通道；canary 不接真 worktree）——全案见 ROADMAP 步⑧节 + scratchpad
+`plan_contract_design_out.md`。
+当前 CP8.1：新增 `schemas/execution_manifest.schema.json` + `orchestrator/manifest.py`（校验/交叉核/
+占位符/围栏/staging 物化）+ policy.execution 节。纯新增，不改既有行为。
 
-**里程碑达成**：系统能一条命令（`python -m orchestrator.run --system-root . --work-root <dir>`）装配真
-组件 + 真 Codex，全自动跑 reasoning-only 元循环到停机（provider terminate / τ 自终止），kill-9 可恢复、
-人机可查询/指令、自终止安全网齐。**M0–M6 建造面全绿（535 测）**。
+## 工作区状态
+- ROADMAP.md 已登记步⑧（方案 + 验证方法 + CP8.1–8.6 切分）——未提交，随 CP8.1 检查点提交入库。
+- 其余工作区干净（0033 已收尾，基线 535 测绿）。
 
-## 剩余（非本轮建造——运维执行 + 一处待用户定向）
-1. **运维执行交付**（本 session 外，运维发起，真算力多日）：§7.4 T1/T2 真跑（真 Codex + 真 EEG 数百轮×
-   24h，数据根 `/vepfs-mlp2/c20250511/250806010/mxm/paper1/data/EEG_Data`）+ 双模式 A/B 实测定默认。
-2. **⚠ 待用户裁的设计缺口 · plan 制品契约二分 → real-Codex attack**（ROADMAP 步⑦「设计发现」+ commit
-   06c4a70 详载）：冻结 plan.schema target（抽象 target_key/spec_md/claim）vs attack_stages/harness 执行
-   TARGET_SPEC（具体 train_cmd/canonical_key…）仅 {eval_key,seq} 重叠 → 经 StageProvider（schema 校验）
-   接 attack 到真 Codex，Codex 产抽象 plan 拿不出跑训练的命令。**需用户定 plan 契约方向**（解冻 schema 携
-   命令[动 MIGRATION_SHA256]／加抽象→执行翻译层／TARGET_SPEC 作独立执行制品）。定向后接 real-Codex
-   attack：judge provider（真 Codex 评审+写 runner_call/DECISION，范式见 test_attack_advance.py:59）+
-   idea/plan 消费者↔schema 校准（attack_stages._idea_stage 读 c["content_md"] vs schema core_claim/
-   mechanism…）+ stage-sidecar→notify.create_file_request 桥（StageProvider 当前 fail-loud 占位）。
-   **影响面**：仅真 Codex attack 轮；reasoning-only 全自动 + §7.3 机制（mock 驱动真组件）不受影响。
+## 下一步动作（按序，具体到命令/文件）
+1. 等内审结论 → 修 BLOCKER/SHOULD。
+2. codex 外审（≤2 轮）：`git add -A` 后导出 staged diff（排除 build_log/、implement_note.md），模式 B 内联后台跑。
+3. APPROVE → 检查点提交（CP8.1）→ build_log 0034 + INDEX + 勾 ROADMAP + 刷本文件 → 记账提交。
+4. 接着开工 CP8.2（attack_stages 真契约化，切分见 ROADMAP 步⑧）。
 
-## 已交付组件全景（M0–M6）
-- 存储/守卫：database（冻结 DDL 三重锁）/writedaemon（单写短事务）/statestore_sqlite/gate_sqlite/
-  gate_exec/gate_pool/phase_commit。
-- 证据/观测：harness/obs_parser（suspect 真派生）/subject_manifest。
-- 循环：advancer（run_cycles+恢复+status 发布+precheck 全局等待+**stop_controller 自终止**）/attack_stages/
-  import_worker/**stopcontroller（M6 τ 安全网）**。
-- 检索/编译：compiler_sqlite/recall_sqlite/budgeting/status_card（含原子发布器）。
-- 人机（M5）：interaction/console/mediator/notify。
-- **装配（M6）：stage_provider（真 Codex 适配器）/run.py（全系统入口）**。
+CP8.1 已产文件：schemas/execution_manifest.schema.json、orchestrator/manifest.py、tests/test_manifest.py（20 测）、
+tests/fixtures/{valid,invalid}/execution_manifest/*、policy.yaml+policy.schema.json（execution 节）、
+orchestrator/schemas.py（ARTIFACT_SCHEMA_MAP 注册）、两清单锁测试更新。559 测绿。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
-- **全自动模式**：OPEN/裁量项不停下问用户，自行裁决 + 落受审载体；**但 plan 制品契约缺口是唯一已上交
-  用户定向的设计裁决**（触及 MIGRATION_SHA256 冻结锁，不自行解冻）。
-- **codex 外审模式 B 后台跑**（Bash 120s 会杀，必须 run_in_background）：`env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`；prompt 声明「全部内联、无需执行命令」。两轮上限；APPROVE 才 commit；外审 diff 排除记账类。
+- **codex 外审模式 B 后台跑**（Bash 120s 会杀，必须 run_in_background）：`env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`；prompt 声明「全部内联、无需执行命令」。两轮上限；APPROVE 才 commit；外审 diff 排除记账类（build_log/、implement_note.md）。
 - **本 harness 署名**：`Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`。
-- 真 Codex 全系统冒烟：`python -m orchestrator.run --system-root . --work-root <tmp> --max-cycles 1`
-  （需代理 7890；reasoning-only 闭环）。attack 轮遇 NotImplementedError（main 干净报 exit 2，需 CP7.4 之后）。
-- 测试基线 **535**；M6 各套：test_stopcontroller(13)/test_stage_provider(13)/test_run(9)/
-  test_m6_mechanism_scenarios(8)/test_m6_longrun(3)。
-- DDL/schema 冻结：改 schema 须同步 MIGRATION_SHA256（走评审）；policy.yaml 改动=决策性。
+- 步⑧关键代码事实（已勘明，直接用）：
+  - attack_stages.py:172 `_target_spec` 从 build_target.plan_ref 读 toy TARGET_SPEC（CP8.2 清理对象）；
+    消费字段：smoke_cmd/train_cmd/eval_cmd/**ckpt_name**（非 ckpt_path）/env_hash/identity_draft_md/
+    repro_cmd/protocol_id/protocol_ver/eval_key/target_set_hash/required。
+  - gate_pool.gate_claim_baseline（I5 占坑）/gate_new_protocol（I1，(id,version) 重复即拒——replay 须调用方
+    预检「已存在且内容同→跳过」）；gate_register_baseline 接收 identity_doc+repro_cmd（bundle 终版身份）。
+  - DDL：protocol PK(id,version)（id 由编排器按 name 查复用/分配 max+1）；metric_def PK(id,version) int
+    ——plan.schema 的 metric_id 是 **string**，须机械映射到 int（同 name/direction/unit/compute_spec 复用，
+    否则分配新 id）；build_target UNIQUE(cycle_id,seq)；idea.content_md NOT NULL（schema 无 content_md，
+    须由 core_claim/mechanism/assumptions/MFE 机械合成）。
+  - compiler_sqlite.render 已支持 stage="bundle"+target_id（bundle pack 渲染就绪）。
+  - judge 写库范式：tests/test_attack_advance.py:59（runner_call(phase='audit',status='success') +
+    decision(actor='judge',type=review_kind,payload{build_target_id,review_kind,round_no,verdict,
+    subject_hash,runner_call_id,policy_hash})）。
+  - run_staged cwd=staging_dir、同名 final 拒（log_name 须唯一）；eval 侧车 .exit 先于 final 落。
+- 测试基线 **535**。真 Codex 冒烟需代理 7890。

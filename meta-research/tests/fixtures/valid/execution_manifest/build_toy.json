@@ -1,0 +1,21 @@
+{
+  "manifest_version": 1,
+  "target_ref": {
+    "target_key": "t1",
+    "target_kind": "build",
+    "seq": 1,
+    "plan_slice_hash": "0f2a1c9d8b7e6f5a4c3b2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a"
+  },
+  "protocol_ref": { "protocol_id": 1, "protocol_ver": 1 },
+  "env_hash": "toy-env",
+  "config_json": { "lr": 0.1, "epochs": 3 },
+  "code_files": ["train.py", "eval.py", "cfg.json"],
+  "commands": {
+    "smoke": { "argv": ["python", "{src}/train.py", "--smoke"], "timeout_s": 120 },
+    "train": { "argv": ["python", "{src}/train.py"], "timeout_s": 600 },
+    "eval": { "argv": ["python", "{src}/eval.py", "--ckpt", "{ckpt}"] }
+  },
+  "expected_outputs": { "checkpoint": "ckpt.bin" },
+  "env": { "TOY_SEED": "7" },
+  "repro_cmd_md": "python train.py 后 python eval.py --ckpt <ckpt>（详见 identity.md 复现命令节）"
+}

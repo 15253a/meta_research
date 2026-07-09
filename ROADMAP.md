@@ -15,10 +15,9 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**M0–M6 建造面全部完成**（步①–⑦；CP7.5 收尾，535 测绿）。系统「完整运行、进入
-  全自动」达成——reasoning-only 全自动闭环真 Codex CLI 端到端跑通（CP7.3 冒烟 ce11d00）。剩余非建造：
-  §7.4 T1/T2 真跑（运维执行）+ 双模式 A/B 实测 + real-Codex attack（待用户裁 plan 制品契约缺口，见步⑦
-  「设计发现」）。
+- 进行中的步 / 检查点：**步⑧（M7）开工**——plan 契约缺口补齐 → 全流程 real-Codex attack（用户 2026-07-09
+  指令）。步①–⑦（M0–M6）建造面全部完成（535 测绿；reasoning-only 全自动真 Codex 端到端已跑通，CP7.3
+  冒烟 ce11d00）。步⑦遗留的「plan 制品契约缺口」已定向（不解冻，见步⑧方案），本步落地。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -205,3 +204,47 @@
   Codex 接线归**运维就绪**（与 §7.4 同批，须先裁 plan 契约）。已向用户面陈此发现待其定 plan 契约方向。
 - 执行交付（本 session 外，运维发起，**且 real-Codex attack 前须裁 plan 契约缺口**）：§7.4 T1/T2 真跑
   （真 Codex + 真 EEG，数百轮×24h）+ judge provider + idea/plan 消费者↔schema 校准 + sidecar 桥。
+  → **缺口已定向并转入步⑧落地**（2026-07-09）：不解冻 plan.schema；execution_manifest 作 bundle 编译
+  产物承载执行契约（与 codex-chatgpt 联合设计结论）。judge provider / schema 校准 / sidecar 桥全部随
+  步⑧检查点落。
+
+### 步⑧（M7）plan 契约缺口补齐 → 全流程 real-Codex attack
+
+- 来源：用户 2026-07-09「开始补齐这个缺口吧，我要的是成品最后能完整走完整个流程的系统」。
+- **方案（已与用户对齐 + codex-chatgpt 联合设计，2026-07-08/09；设计记录
+  scratchpad `plan_contract_design_out.md`，要点如下）**：
+  - **不解冻任何冻结件**（plan.schema / DDL / MIGRATION_SHA256 不动）；plan 保持抽象（本来就对）。
+  - **新增 additive 契约 `execution_manifest.schema.json`**：bundle 阶段 Codex 的**编译产物**——机器可
+    验证执行契约（argv 数组禁 shell / cwd 限 staging / env 白名单 / 期望产物 / 超时 / 回引 plan 切片与
+    protocol，防「新 plan 旁路」）。harness 只执行 manifest，不推理不猜命令。
+  - **attack_stages 走正式 gate 通道**：gate_new_protocol（I1）+ gate_claim_baseline（I5），消费冻结
+    plan.schema 真形态；机械派生 protocol_id / metric int 映射 / eval_key / target_set_hash / identity
+    草稿；清理 toy TARGET_SPEC（不再从 plan_ref 读命令）。
+  - **诚实边界（operational canary）**：本步不接真 git worktree——Codex 在 staging 产码 + manifest 即可
+    端到端；worktree 隔离 + diff/tree hash + env lock 强校验 = 后续硬化步（正式数百轮前补）。
+- 验证方法（步级）：①全链 E2E 测试：mock Codex 产 schema-conform 制品（含真 toy 代码，经 manifest 由
+  harness 真子进程执行）驱动 run.py 装配系统跑通 bootstrap→decompose→attack（build 目标：占坑→smoke→
+  代码评审→训练→出厂评估→结果评审→注册入池）→真证据关问→terminate；②真 Codex CLI 冒烟：一条命令跑通
+  ≥1 个完整 attack 轮；③回归：既有 535 测全绿 + 冻结件字节不变（plan.schema、MIGRATION_SHA256）。
+- 检查点（模型切，边走边补）:
+  - [ ] CP8.1 execution_manifest 契约 + harness manifest 适配层：新增 `schemas/execution_manifest.schema.json`
+    + `orchestrator/manifest.py`（schema 校验 / 与 plan 切片交叉核 / 占位符 {src}/{ckpt} 解析 / argv·路径·
+    env·超时围栏 / staging 文件物化）+ policy.execution 节（默认/上限超时、path_allowlist）。纯新增，
+    不改既有行为。
+  - [ ] CP8.2 attack_stages 真契约化：idea/plan 消费冻结 schema 真形态（content_md 等机械合成）；plan 段
+    改走 gate_new_protocol + gate_claim_baseline（可恢复幂等短事务序列，phase_commit 收口）；机械派生
+    protocol_id/metric 映射/eval_key/target_set_hash；bundle 段逐目标 Codex bundle 产物（persist-then-
+    consume）→ manifest 驱动执行；toy TARGET_SPEC 清理 + 冻结件不变回归测试。
+    **硬约束（CP8.1 内审记）**：①每目标 staging 物化目录唯一（stage_bundle_files 净土物化=整目录清空，
+    勿与 run/eval 产物混目录）；②驱动按 target_kind **静态**定命令序列（build/exec: smoke→train→eval；
+    eval: 仅 eval），勿动态猜 kind；③manifest 记账/寻址一律对**值**（canon_hash）勿对文件字节
+    （物化本体是规范化字节，与 Codex 原样字节不同）。
+  - [ ] CP8.3 生产装配：bundle SKILL.md 真执行契约改写 + judge（review_verdict schema + judge skill +
+    JudgeProvider 写 runner_call(audit)+DECISION(judge)）+ StageProvider bundle/judge 扩展（passthrough
+    代码文件 + manifest 校验）。
+  - [ ] CP8.4 run.py attack 全装配 + 步级验证：build_system 装配 AttackStages 全家 → 全链 E2E（mock）+
+    真 Codex CLI 冒烟 ≥1 完整 attack 轮。
+  - [ ] CP8.5 sidecar→file_request 桥：StageProvider resource_request → notify.create_file_request +
+    干净阻断（全局等待闭环，替换 fail-loud 占位）。
+  - [ ]（边走边补）CP8.6+ exec/eval target kinds + route 特化（reuse_only/eval_only/dependency_wait）+
+    import_defer→DeferredImporter/ImportWorker 接线。
