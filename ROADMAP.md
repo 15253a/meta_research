@@ -361,7 +361,9 @@
 - 验证方法：每类外部坏产物首次与全新实例重启均能业务收尾或受控停机、不重复裸崩；真实 HTTP 控制台可完成
   hard directive confirm/reject 与文件请求 resolve/cancel；多目标 critical 语义、goal 最新版、单实例锁和子进程组终止均有正反例；全量测试绿。
 - 检查点（模型切，边走边补）：
-  - [ ] CP11.1 外部产物接纳硬化：metric 严格解析/有限值 + reasoning 语义拒收，跨重启 no-wedge。
+  - [x] CP11.1 外部产物接纳硬化：metric 严格解析/有限值 + 统一 SQLite ID 边界 +
+    reasoning 语义拒收，首次/全新实例重启 no-wedge，DB 损坏 fail-loud。→ commit `ac53516`
+    （build_log 0048；定向 132；全量 754；codex 第1轮 APPROVE）。
   - [ ] CP11.2 人类控制闭环：真实 console confirm/reject + 文件请求 resolve/cancel/已解决请求重做语义。
   - [ ] CP11.3 状态与执行边界：critical/budget_estimate 落库与早退、goal 最新版、orchestrator 单实例锁、超时终止进程组。
   - [ ] CP11.4 残余架构边界：调用意图/回执补账、执行容器/VM 隔离与内容寻址 artifact store 方案化。

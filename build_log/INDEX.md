@@ -6,6 +6,7 @@
 
 ---
 
+- [0048](0048-cp111-external-artifact-no-wedge.md) — CP11.1 严格 metric/SQLite ID 边界 + reasoning 语义拒收持久收敛 + DB 损坏 fail-loud · commit `ac53516` · 验证: 通过（定向 132，全量 754，codex 第1轮 APPROVE）
 - [0047](0047-cp102-cost-ledger-budget-stop.md) — CP10.2 成本账本覆盖失败/非法调用 + 未知用量 fail-closed + 单次越线即 durable 停机 · commit `03d3ffd` · 验证: 通过（pytest 754 全量；codex 第2轮 APPROVE）
 - [0046](0046-cp101-runner-cost-capture.md) — CP10.1 runner 成本捕获（**步⑩ M6 成本记账·第一关**：实机 probe 定 `codex-chatgpt exec` 把 `tokens used\n<N>` 总 token 打到 **stderr**[runner 捕获但成功时丢弃]；加 CallUsage + Artifact.usage[非破坏]；runner.py parse_tokens_used[行首锚定/合法千分组/取末条/坏输入→0] + _invoke 计墙钟解析→Artifact.usage；只成功路径捕获；**不改循环行为**；顺带修 test_run.py 既有 `__new__` monkeypatch 全局污染 bug）· commit `1b415f9` · 验证: 通过（pytest 678 全量 + runner 15 例；codex 第2轮 APPROVE）
 - [0045](0045-cp94-console-e2e-step9-close.md) — CP9.4 人类控制台端到端验收 + README（**步⑨收尾达成**：test_console_e2e 全栈真跑[真 HTTP+真 DB+真 spool+入站闭环]——①真视图 GET / 真页 + /api/db 真数据 + /api/file 白名单[含逃逸负例]；③单写纪律**强证** _open_ro(mode=ro) 写被物理拒 + DB 逻辑快照 WAL-proof 不变；②POST→spool→ingest→pause→确认 provenance 落库→precheck 阻断、query→grounded[据卡 c1/q1]+no-dup；README §4.1 控制台节；实机 CLI 起服务 curl 真跑留证）· commit `cd97ee0` · 验证: 通过（pytest 664/664；codex 两轮 REQUEST_CHANGES[R1 主库 sha256 假绿、R2 逻辑快照仍漏→补结构强证]全按 §2.2 修毕）—— **步⑨（M8 人类控制台接入）达成**
