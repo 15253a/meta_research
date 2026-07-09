@@ -21,7 +21,7 @@ import json
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
-from .interfaces import Cycle, Route, Selection
+from .interfaces import InvalidSelectionError, Cycle, Route, Selection
 from .writedaemon import WriteDaemon
 
 _TERMINAL_Q = {"answered", "refuted", "dead_end"}
@@ -314,22 +314,22 @@ class SQLiteStateStore:
 
     def persist_selection(self, cycle_id: str, sel: Selection) -> None:
         if sel.next_intent not in ("attack", "decompose", "terminate"):
-            raise ValueError(f"next_intent 非法: {sel.next_intent}")
+            raise InvalidSelectionError(f"next_intent 非法: {sel.next_intent}")
         next_qid = self._resolve_local(cycle_id, sel.next_question_id)
         next_int = _qnum_opt(next_qid)     # 未解析 local_key / 畸形 id → None → 走干净「不存在」拒因
         if sel.next_intent == "terminate":
             if next_qid is not None:
-                raise ValueError("terminate 时 next_question_id 必须为 null")
+                raise InvalidSelectionError("terminate 时 next_question_id 必须为 null")
         else:
             if next_int is None or self._q1("SELECT 1 FROM question WHERE id=?", (next_int,)) is None:
-                raise ValueError(f"next_question_id 缺失或不存在: {sel.next_question_id}")
+                raise InvalidSelectionError(f"next_question_id 缺失或不存在: {sel.next_question_id}")
             if not self.is_schedulable(next_qid, for_intent=sel.next_intent):
-                raise ValueError(f"目标问题不可调度: {next_qid}")
+                raise InvalidSelectionError(f"目标问题不可调度: {next_qid}")
         with self._write() as conn:
             for row in sel.scores:   # 唯一维护点：写回 question.score/est_cost（local_key 同样解析）
                 ri = _qnum_opt(self._resolve_local(cycle_id, row.get("question_id")))
                 if ri is None or conn.execute("SELECT 1 FROM question WHERE id=?", (ri,)).fetchone() is None:
-                    raise ValueError(f"scores 引用的问题不存在: {row.get('question_id')}（不静默丢弃）")
+                    raise InvalidSelectionError(f"scores 引用的问题不存在: {row.get('question_id')}（不静默丢弃）")
                 if "est_cost" in row:   # 显式提供（含 null）才改；缺省保留旧值（对齐 InMemory row.get 语义）
                     conn.execute("UPDATE question SET score=?, est_cost=? WHERE id=?", (row.get("score"), row["est_cost"], ri))
                 else:

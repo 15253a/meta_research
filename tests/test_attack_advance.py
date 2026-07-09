@@ -850,3 +850,51 @@ def test_exec_replay_config_drift_rejected(tmp_path):
     assert rej is not None and "已占" in rej[0]
     assert daemon.query_one("SELECT count(*) FROM build_target WHERE plan_ref IS NOT NULL")[0] == 0
     daemon.conn.close()
+
+
+def test_reasoning_selection_ineligible_question_no_wedge(tmp_path):
+    """步⑧ CP8.8 回归（部署首跑实录）：attack 轮反复攻同一题、visit 达 max_inconclusive_per_question 上限后，
+    Codex 仍选 next=该题 intent=attack（现对 attack 不可调度）→ **不楔死**：记 decision(selection_invalid) +
+    改持久 terminate 干净收尾（否则持久化 reasoning 重启确定性重崩=永久楔死）。"""
+    path = str(tmp_path / "research.sqlite")
+    # 坏 train：attack 轮不产 answer → Qn 置 inconclusive、visit 增（本轮把 root 从 limit-1 顶到 limit）
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
+                                              train_body="import sys; print('loss:1.0'); sys.exit(1)")
+    _bootstrap_attack(state)
+    limit = POLICY["question_guard"]["max_inconclusive_per_question"]
+    with daemon.transaction() as conn:   # 预置 root：再 attack 一轮即达上限
+        conn.execute("UPDATE question SET status='inconclusive', visit_count=? WHERE id=1", (limit - 1,))
+    # reasoning 选回本题 attack——达上限后对 attack 不可调度（Codex 路由错误，编排器不代其重选）
+    attack.p["reasoning"] = lambda cyc, pack: {
+        "selection.json": {"next_question_id": "q1", "next_intent": "attack",
+                           "scores": [{"question_id": "q1", "score": 0.5, "est_cost": 1.0}]}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=3)
+    assert len(ids) == 1                                        # 轮跑完（未楔死、无 traceback）
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='selection_invalid'")[0] == 1
+    assert daemon.query_one("SELECT next_intent FROM cycle WHERE id=?", (int(ids[0][1:]),))[0] == "terminate"
+    assert daemon.query_one("SELECT visit_count FROM question WHERE id=1")[0] == limit   # 达上限
+    daemon.conn.close()
+    # **真实重启**（全新进程/连接/组件，同 DB + 同 work_root：reasoning.json 仍在盘）：原生 bug 的永久楔死点
+    # ——terminate 已持久 → 干净停、不重崩（内审 NIT：用全新实例更忠实复现跨进程楔死）
+    d2, s2, c2, a2 = _mk_env(path, tmp_path / "w",
+                             train_body="import sys; print('loss:1.0'); sys.exit(1)")
+    assert SqliteAdvancer(s2, c2, lambda c, p: None, attack=a2).run_cycles(max_cycles=3) == []
+    d2.conn.close()
+
+
+def test_open_set_annotates_attack_ineligible(tmp_path):
+    """CP8.8 Fix1：可调度问题集向 Codex 标注「attack 已达上限」的题（防它选不可调度的 attack）。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    limit = POLICY["question_guard"]["max_inconclusive_per_question"]
+    with daemon.transaction() as conn:
+        conn.execute("UPDATE question SET status='inconclusive', visit_count=? WHERE id=1", (limit,))
+        conn.execute("UPDATE cycle SET active_question_id=NULL WHERE id=1")
+    c = state.open_or_resume_cycle()
+    state.set_route(c.cycle_id, "decompose"); 
+    with daemon.transaction() as conn:
+        conn.execute("UPDATE cycle SET active_question_id=1 WHERE id=?", (int(c.cycle_id[1:]),))
+    pack = compiler.render(cycle_id=c.cycle_id, stage="reasoning")
+    assert "attack 已达上限" in pack.anchor_md and "只可 decompose" in pack.anchor_md
+    daemon.conn.close()
