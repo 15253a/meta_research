@@ -30,16 +30,26 @@ query/通知照常——它们不走 Advancer）。
 """
 from __future__ import annotations
 
+import codecs
+import fcntl
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
+import stat
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote
 
 from .console import Console
+from .resource_limits import (MAX_ASSETS_PER_GOAL, MAX_CANCEL_REASON_CHARS,
+                              MAX_FILE_REQUESTS_PER_GOAL, MAX_REQUEST_ITEMS)
 from .writedaemon import WriteDaemon
+
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------- outbox --
 
@@ -68,7 +78,8 @@ class Outbox:
             return []
         if not data.endswith(b"\n"):
             data = data[:data.rfind(b"\n") + 1]       # 未终止末段=未 committed（无换行则整文件丢弃）
-        return [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+        # JSON 字符串可含 U+2028/U+2029；事件协议只以物理 LF 分隔，不能用 splitlines() 误拆 payload。
+        return [json.loads(line) for line in data.decode("utf-8").split("\n") if line.strip()]
 
     def _queued_keys(self) -> set:
         if self._seen is None:
@@ -187,6 +198,13 @@ class DirectiveNotifier:
 
 # ----------------------------------------------------- file-request service --
 
+_COPY_CHUNK_BYTES = 1024 * 1024
+# 必须与 compiler goal-wide ContextPack 总资产上限保持一致；resolve 在不可变终态前执行同口径接纳闸。
+_MAX_MANAGED_FILES_PER_GOAL = MAX_ASSETS_PER_GOAL
+# 非 bundle 阶段只能看到有界文本预览；双层预算防单个/多个附件把 ContextPack 挤爆。
+_MAX_ASSET_PREVIEW_BYTES = 8 * 1024
+_MAX_REQUEST_PREVIEW_BYTES = 32 * 1024
+
 
 def _regular_files_no_symlink(src: Path) -> List[Path]:
     """收集 src 下常规文件，**全链路不跟随符号链接**（外审 BLOCKER：item 目录本身或中途目录是 symlink
@@ -195,17 +213,340 @@ def _regular_files_no_symlink(src: Path) -> List[Path]:
     终检 resolve 落点必须在 src 实路径内（防花式逃逸）。"""
     if not src.is_dir() or src.is_symlink():
         return []
-    root_real = src.resolve()
+    try:
+        root_real = src.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return []
     out: List[Path] = []
     for dirpath, _dirnames, filenames in os.walk(src, followlinks=False):
         for name in filenames:
             p = Path(dirpath) / name
             if p.is_symlink() or not p.is_file():
                 continue
-            if not str(p.resolve()).startswith(str(root_real) + os.sep):
+            try:
+                resolved = p.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if root_real not in resolved.parents:
                 continue                     # 落点逃出 uploads item 根：拒收
             out.append(p)
     return sorted(out)
+
+
+def _remove_private_tree(path: Path) -> None:
+    """删除 daemon 专属 staging/final 树；任何 symlink 都 fail closed，避免清理时跟出托管根。"""
+    if not os.path.lexists(str(path)):
+        return
+    if path.is_symlink():
+        raise OSError(f"托管路径不得是 symlink: {path}")
+    if not path.is_dir():
+        raise OSError(f"托管路径不是目录: {path}")
+    # 已发布树是只读的；重试/取消清理前只给 owner 临时恢复目录写权限和文件写权限。
+    for dirpath, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+        for name in dirnames:
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                raise OSError(f"托管树内出现 symlink: {p}")
+            p.chmod(0o700)
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                raise OSError(f"托管树内出现 symlink: {p}")
+            p.chmod(0o600)
+        Path(dirpath).chmod(0o700)
+    shutil.rmtree(path)
+
+
+def _publish_read_only(root: Path) -> None:
+    """减少解析后被意外改写的机会（同 UID 对抗隔离仍留给后续内容寻址/只读挂载检查点）。"""
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                raise OSError(f"staging 内出现 symlink: {p}")
+            p.chmod(0o444)
+        for name in dirnames:
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                raise OSError(f"staging 内出现 symlink: {p}")
+            p.chmod(0o555)
+        Path(dirpath).chmod(0o555)
+
+
+def _fsync_directory(path: Path) -> None:
+    """持久化目录项；O_NOFOLLOW 保证 fsync 的仍是预期托管目录而非替换后的 symlink。"""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(f"fsync 目标不是目录: {path}")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _validated_tree_bytes(root: Path, *, count_bytes: bool) -> int:
+    """验证一棵 daemon 托管树只含真实目录/常规文件，并按需累计逻辑文件字节。"""
+    if root.is_symlink() or not root.is_dir():
+        raise OSError(f"托管树不是实体目录: {root}")
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in dirnames:
+            child = Path(dirpath) / name
+            info = os.stat(str(child), follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                raise OSError(f"托管树目录项异常（含 symlink）: {child}")
+        for name in filenames:
+            child = Path(dirpath) / name
+            info = os.stat(str(child), follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError(f"托管树文件项异常（含 symlink）: {child}")
+            if count_bytes:
+                total += info.st_size
+    return total
+
+
+def _managed_published_bytes(managed_root: Path) -> int:
+    """累计既有 final 与遗留 staging 的实体文件；调用方须先删除本 request 的旧 attempt。
+
+    ``.staging`` 中可能有别的 request 崩溃后留下的实体字节；若只验证不计费，反复制造遗留 attempt
+    就能绕过 root-global disk quota。当前 request 在调用本函数前已清理，因此不会重复计费。
+    """
+    total = 0
+    for child in managed_root.iterdir():
+        if child.name == ".staging":
+            total += _validated_tree_bytes(child, count_bytes=True)
+            continue
+        if not child.name.isdecimal():
+            raise OSError(f"input/user_provided 出现未知托管项: {child}")
+        total += _validated_tree_bytes(child, count_bytes=True)
+    return total
+
+
+def _remove_attempt_durable(managed_root: Path, stage_root: Path, dest_root: Path) -> None:
+    """撤回非权威 attempt，并把两个父目录的删除目录项落盘。"""
+    _remove_private_tree(stage_root)
+    _remove_private_tree(dest_root)
+    _fsync_directory(stage_root.parent)
+    _fsync_directory(managed_root)
+
+
+def _rollback_attempt_best_effort(managed_root: Path, stage_root: Path, dest_root: Path,
+                                  primary: BaseException) -> None:
+    """主流程已失败时尽力撤回 attempt；cleanup 失败只注记，不得覆盖 ``primary``。
+
+    生产环境仍支持 Python 3.9，故在没有 ``BaseException.add_note`` 时写入同语义的
+    ``__notes__``；升级至 3.11+ 后会自动使用原生异常注记。
+    """
+    try:
+        _remove_attempt_durable(managed_root, stage_root, dest_root)
+    except BaseException as cleanup_error:
+        note = ("file request rollback cleanup 失败："
+                f"{type(cleanup_error).__name__}: {cleanup_error}")
+        try:
+            add_note = getattr(primary, "add_note", None)
+            if callable(add_note):
+                add_note(note)
+            else:
+                notes = list(getattr(primary, "__notes__", ()))
+                notes.append(note)
+                primary.__notes__ = notes
+        except BaseException:
+            # 异常对象若拒绝自定义属性，仍必须保留并重抛原始失败。
+            pass
+        try:
+            logger.exception("file request rollback cleanup 失败；保留原始异常 %s",
+                             type(primary).__name__)
+        except BaseException:
+            # 日志 handler 也不应反客为主覆盖原始异常。
+            pass
+
+
+def _fsync_managed_ancestors(managed_root: Path) -> None:
+    """持久化首次创建链：managed 自身 fsync 不会替代其父目录中的目录项落盘。"""
+    input_root = managed_root.parent
+    work_root = input_root.parent
+    _fsync_directory(input_root)   # user_provided 在 input/ 中的目录项
+    _fsync_directory(work_root)    # input/ 在 work_root 中的目录项
+
+
+@contextmanager
+def _claim_file_request_operation(managed_root: Path):
+    """跨进程独占同一 managed_root 的 FS→DB 操作，进程退出时由内核自动释放。
+
+    锁文件使用永不 unlink 的稳定 inode；否则旧持有者锁住被删 inode、新调用者锁住新 inode，会形成
+    split-brain。root-global 临界区覆盖 cleanup→累计 quota→copy/publish→DB 终态：既串行同 request 的
+    resolve/cancel，也保证不同 goal/request 不会各自基于同一旧 quota 快照同时超额接纳。锁内仍须重读
+    DB pending，因为调用者可能在等锁期间已被另一个进程迁入终态。
+    """
+    work_root = managed_root.parent.parent
+    lock_path = work_root / ".file-request-operation.lock"
+    flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(str(lock_path), flags, 0o600)
+    acquired = False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"file request claim 不是独占常规文件: {lock_path}")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        else:
+            os.close(fd)
+
+
+def _count_resolved_assets_for_goal(daemon: WriteDaemon, goal_id: int) -> int:
+    """严格解析同 goal 的不可变 resolved 回执并累计 provided 资产；旧回执损坏即 fail closed。"""
+    total = 0
+    seen_refs = set()
+    rows = daemon.query(
+        "SELECT id,items_json,resolution_json FROM interaction_request "
+        "WHERE goal_id=? AND status='resolved' ORDER BY id", (goal_id,))
+    for request_id, items_json, resolution_json in rows:
+        try:
+            items = json.loads(items_json)
+            resolution = json.loads(resolution_json)
+        except (TypeError, json.JSONDecodeError) as e:
+            raise ValueError(f"interaction_request {request_id} resolved 回执 JSON 损坏") from e
+        if (not isinstance(items, list) or not items or any(not isinstance(item, dict) for item in items)
+                or not isinstance(resolution, list)
+                or len(resolution) != len(items)):
+            raise ValueError(
+                f"interaction_request {request_id} resolved 回执须与非空 items 等长")
+        for item_no, outcome in enumerate(resolution, start=1):
+            outcome_keys = set(outcome) if isinstance(outcome, dict) else set()
+            if outcome_keys != {"provided"} and outcome_keys != {"unavailable"}:
+                raise ValueError(
+                    f"interaction_request {request_id} item {item_no} 回执须恰含 provided/unavailable")
+            if "unavailable" in outcome:
+                if not isinstance(outcome["unavailable"], str) or not outcome["unavailable"].strip():
+                    raise ValueError(
+                        f"interaction_request {request_id} item {item_no} unavailable 理由损坏")
+                continue
+            provided = outcome["provided"]
+            if not isinstance(provided, list) or not provided or any(not isinstance(a, dict) for a in provided):
+                raise ValueError(
+                    f"interaction_request {request_id} item {item_no} provided 回执损坏")
+            legacy_flags = []
+            for asset_no, asset in enumerate(provided, start=1):
+                digest = asset.get("hash")
+                if (not isinstance(asset.get("path"), str) or not asset["path"]
+                        or asset.get("hash_alg") != "sha256" or not isinstance(digest, str)
+                        or len(digest) != 64
+                        or any(ch not in "0123456789abcdefABCDEF" for ch in digest)):
+                    raise ValueError(
+                        f"interaction_request {request_id} item {item_no} asset {asset_no} 身份损坏")
+                ref = asset.get("ref")
+                size = asset.get("size_bytes")
+                legacy = ref is None and size is None
+                legacy_flags.append(legacy)
+                if not legacy:
+                    expected_ref = (
+                        f"user-file-request:r{request_id}:item:{item_no}:asset:{asset_no}")
+                    if (ref != expected_ref or isinstance(size, bool)
+                            or not isinstance(size, int) or size < 0 or ref in seen_refs):
+                        raise ValueError(
+                            f"interaction_request {request_id} item {item_no} asset {asset_no} ref/size 损坏")
+                    seen_refs.add(ref)
+            if any(legacy_flags) and not all(legacy_flags):
+                raise ValueError(
+                    f"interaction_request {request_id} item {item_no} 混合 legacy/新版资产回执")
+            total += len(provided)
+            if total > _MAX_MANAGED_FILES_PER_GOAL:
+                raise ValueError(
+                    f"goal {goal_id} 已 resolved 资产数超过安全上限 {_MAX_MANAGED_FILES_PER_GOAL}")
+    return total
+
+
+def _read_committed_resolution_state(daemon: WriteDaemon, request_id: int) -> Optional[tuple]:
+    """用全新只读连接判定 COMMIT 后的外部可见真相；同 writer 连接可能仍看到未提交行。"""
+    databases = daemon.conn.execute("PRAGMA database_list").fetchall()
+    main = next((row for row in databases if row[1] == "main"), None)
+    if main is None or not main[2]:
+        raise sqlite3.OperationalError("内存库/匿名主库无法独立确认 COMMIT 终态")
+    db_path = Path(main[2])
+    if db_path.is_symlink():
+        raise sqlite3.OperationalError("research.sqlite 路径为 symlink，拒绝独立确认")
+    conn = sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT status,resolution_json,resolved_message_id "
+            "FROM interaction_request WHERE id=?", (request_id,)).fetchone()
+    finally:
+        conn.close()
+    return row
+
+
+def _copy_hash_regular(src: Path, dest: Path, *, source_root: Path,
+                       remaining_bytes: int, preview_limit_bytes: int) -> tuple:
+    """从同一 O_NOFOLLOW fd 流式复制/hash/校验 UTF-8；绝不为 preview 再按路径打开源文件。
+
+    返回 ``(size, sha256, preview_or_none, preview_bytes, preview_truncated)``。只有整个文件都是严格
+    UTF-8 时才返回 preview；预览原始字节受调用方预算限制，尾部若截在多字节字符中间则只丢该残片。
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(src), flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"上传源不是常规文件: {src}")
+        # 打开后再核路径/inode：若中间目录在检查与 open 间被换成 symlink/别树，拒绝该 fd。
+        actual = src.resolve(strict=True)
+        actual_info = os.stat(actual, follow_symlinks=False)
+        if source_root not in actual.parents or (actual_info.st_dev, actual_info.st_ino) != (info.st_dev, info.st_ino):
+            raise OSError(f"上传源在复制前发生路径替换: {src}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        utf8_valid = True
+        preview_raw = bytearray()
+        copied = 0
+        with os.fdopen(fd, "rb", closefd=False) as inp, dest.open("xb") as out:
+            while True:
+                chunk = inp.read(_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > remaining_bytes:
+                    raise ValueError("用户文件总字节数超过 resources.disk_quota_gb")
+                out.write(chunk)
+                digest.update(chunk)
+                if utf8_valid:
+                    try:
+                        decoded = utf8_decoder.decode(chunk, final=False)
+                        # 严格 UTF-8 仍可能是带 NUL/终端控制符的二进制；只保留常用文本空白。
+                        if any((ord(ch) < 0x20 and ch not in "\t\n\r") or ord(ch) == 0x7f
+                               for ch in decoded):
+                            utf8_valid = False
+                    except UnicodeDecodeError:
+                        utf8_valid = False
+                if len(preview_raw) < preview_limit_bytes:
+                    preview_raw.extend(chunk[:preview_limit_bytes - len(preview_raw)])
+            out.flush()
+            os.fsync(out.fileno())
+        if utf8_valid:
+            try:
+                utf8_decoder.decode(b"", final=True)
+            except UnicodeDecodeError:
+                utf8_valid = False
+        preview = None
+        preview_bytes = 0
+        preview_truncated = False
+        if utf8_valid:
+            # final=False 保留被预算截断的 UTF-8 尾部残片，确保返回 str 始终可安全 JSON 化。
+            preview = codecs.getincrementaldecoder("utf-8")("strict").decode(bytes(preview_raw), final=False)
+            preview_bytes = len(preview.encode("utf-8"))
+            preview_truncated = copied > preview_bytes
+        return copied, digest.hexdigest(), preview, preview_bytes, preview_truncated
+    finally:
+        os.close(fd)
 
 
 class FileRequestReject(Exception):
@@ -213,20 +554,48 @@ class FileRequestReject(Exception):
 
 
 class FileRequestService:
-    """文件请求全流水：create_checked（schema+policy 闸）→ [全局等待] → resolve/cancel（一次性迁终态）。"""
+    """文件请求全流水：create_checked → [全局等待] → managed-root 跨进程 claim → 一次性终态。
+
+    resolve/cancel 的文件系统副作用与 DB 条件迁移始终处于同一稳定 ``flock`` claim 内；锁内二次读取
+    pending，保证等待者不会拿过时初检去删除赢家已发布的资产；root-global 锁同时串行累计 disk quota。
+    锁不写 DB 中间态，崩溃由内核释锁后可重试。
+    """
 
     def __init__(self, daemon: WriteDaemon, schema_set, policy: Dict[str, Any], input_root: str):
         self.daemon = daemon
         self.schema_set = schema_set          # SchemaSet：validator("resource_request")
         self.policy = policy["interaction_request"]
         self.input_root = Path(input_root)    # input/user_provided/ 的父目录（input/）
+        self.max_managed_bytes = int(float(policy["resources"]["disk_quota_gb"]) * (1024 ** 3))
+
+    def _managed_paths(self, request_id: int) -> tuple:
+        """构造同文件系统 staging/final 路径，并机械拒绝托管根 symlink/越界。"""
+        # ``Path.mkdir(exist_ok=True)`` 会默许现有的目录 symlink；必须在创建/解析任何子路径前拒绝，
+        # 否则攻击者可让整个 user_provided 树落到 work/input 之外。
+        if self.input_root.is_symlink():
+            raise OSError("input_root 不得是 symlink")
+        self.input_root.mkdir(parents=True, exist_ok=True)
+        input_real = self.input_root.resolve(strict=True)
+        managed = self.input_root / "user_provided"
+        if managed.is_symlink():
+            raise OSError("input/user_provided 不得是 symlink")
+        managed.mkdir(mode=0o700, exist_ok=True)
+        managed_real = managed.resolve(strict=True)
+        if input_real not in managed_real.parents:
+            raise OSError("input/user_provided 逃出 input_root")
+        staging_parent = managed_real / ".staging"
+        if staging_parent.is_symlink():
+            raise OSError("input/user_provided/.staging 不得是 symlink")
+        staging_parent.mkdir(mode=0o700, exist_ok=True)
+        return managed_real, staging_parent / str(request_id), managed_real / str(request_id)
 
     def create_checked(self, *, goal_id: int, goal_ver: int, stage: str, request: Dict[str, Any],
                        cycle_id: Optional[str] = None, question_id: Optional[str] = None) -> int:
         """schema 校验 → **幂等先行** → 三判据 → interaction_request(pending)。
-        幂等在 quota 之前（外审 SHOULD）：同 (goal_id, request_hash) 重试须返回既有单——否则达到上限后
-        合法重试会被 quota 误拒，可重试性破坏。落单撞 uq_ireq_one_pending（同 goal 另一张 pending）→
-        转业务拒因，不外泄 DDL 错误文本（外审 NIT）。"""
+        幂等在 quota 之前（外审 SHOULD），但**只复用 pending attempt**：同一阶段调用在请求仍等待时重放
+        返回既有单；resolved/cancelled 是已完成的回执，后续无状态工人若再次提出同 hash 请求会收到明确
+        ``FileRequestReject`` 反馈，必须消费已有托管资产/取消理由或改变请求条件，不能再开一张相同 pending。
+        落单撞 uq_ireq_one_pending（同 goal 另一张 pending）→ 转业务拒因，不外泄 DDL 错误文本。"""
         from jsonschema import ValidationError
         try:
             self.schema_set.validator("resource_request").validate(request)
@@ -236,20 +605,45 @@ class FileRequestService:
         items_json = json.dumps(items, ensure_ascii=False, sort_keys=True)
         request_hash = hashlib.sha256(items_json.encode()).hexdigest()
         existing = self.daemon.query_one(
-            "SELECT id FROM interaction_request WHERE goal_id=? AND request_hash=? ORDER BY id LIMIT 1",
+            "SELECT id FROM interaction_request WHERE goal_id=? AND request_hash=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1",
             (goal_id, request_hash))
         if existing:
-            return existing[0]                     # 幂等重试：quota/enabled 都不再拦（单已存在）
+            return existing[0]                     # 同一 pending attempt 的幂等重试：quota/enabled 不再拦
+        terminal = self.daemon.query_one(
+            "SELECT id,status,resolution_json FROM interaction_request WHERE goal_id=? AND request_hash=? "
+            "AND status<>'pending' ORDER BY id DESC LIMIT 1", (goal_id, request_hash))
+        if terminal:
+            legacy = False
+            if terminal[1] == "resolved":
+                try:
+                    old_resolution = json.loads(terminal[2])
+                    legacy = any(
+                        isinstance(outcome, dict) and isinstance(outcome.get("provided"), list)
+                        and any(isinstance(asset, dict)
+                                and ("ref" not in asset or "size_bytes" not in asset)
+                                for asset in outcome["provided"])
+                        for outcome in old_resolution)
+                except (TypeError, json.JSONDecodeError):
+                    raise FileRequestReject(
+                        f"同 hash 文件请求终态 attempt #{terminal[0]} resolution 损坏，须人工修复") from None
+            detail = ("旧版回执缺安全 ref/size，须改变请求条件后重新上传" if legacy else
+                      "已提供托管资产，须消费 ContextPack 文件回执") if terminal[1] == "resolved" else \
+                     "用户已取消，须消费取消理由并改道"
+            raise FileRequestReject(
+                f"同 hash 文件请求已有终态 attempt #{terminal[0]}（{terminal[1]}）：{detail}；不得原样重提")
         if not self.policy.get("enabled", True):
             raise FileRequestReject("文件请求通道未启用（policy.interaction_request.enabled=false）")
         if len(items) > self.policy["max_items_per_request"]:
             raise FileRequestReject(f"条目数 {len(items)} 超上限 {self.policy['max_items_per_request']}")
+        # cancelled 也是不可变终态并会进入 goal-wide ContextPack；若不计它，模型可用不同 hash
+        # 无限“创建→取消”撑爆固定锚。额度按全部历史请求计，和回执可见范围保持一致。
         n = self.daemon.query_one(
-            "SELECT count(*) FROM interaction_request WHERE goal_id=? AND status IN ('pending','resolved')",
-            (goal_id,))[0]
-        if n >= self.policy["max_requests_per_goal"]:
-            raise FileRequestReject(f"goal {goal_id} 请求数已达上限 {self.policy['max_requests_per_goal']}"
-                                    "（pending+resolved 口径）")
+            "SELECT count(*) FROM interaction_request WHERE goal_id=?", (goal_id,))[0]
+        request_limit = min(int(self.policy["max_requests_per_goal"]), MAX_FILE_REQUESTS_PER_GOAL)
+        if n >= request_limit:
+            raise FileRequestReject(f"goal {goal_id} 请求数已达上限 {request_limit}"
+                                    "（含 cancelled 的全部历史请求口径）")
         from .interaction import InteractionIngest
         try:
             return InteractionIngest(self.daemon).create_file_request(
@@ -263,7 +657,7 @@ class FileRequestService:
     def _check_provenance(self, request_id: int, resolved_message_id: int) -> tuple:
         """终态 provenance 校验（外审 SHOULD）：resolved_message_id 必须存在且与请求同 goal——
         否则可把别的 goal 的入站消息挂到本请求终态上，破坏"用户答复/取消 provenance"语义。
-        消息 goal 未绑定（NULL）也拒（fail closed）。返回 (status, items_json)。"""
+        消息 goal 未绑定（NULL）也拒（fail closed）。返回 (status, items_json, goal_id)。"""
         row = self.daemon.query_one("SELECT status, items_json, goal_id FROM interaction_request WHERE id=?",
                                     (request_id,))
         if row is None:
@@ -273,58 +667,239 @@ class FileRequestService:
             raise ValueError(f"provenance 消息不存在: {resolved_message_id}")
         if msg[0] is None or msg[0] != row[2]:
             raise ValueError(f"provenance 消息 goal（{msg[0]}）与请求 goal（{row[2]}）不符，拒绝挂账")
-        return row[0], row[1]
+        return row[0], row[1], row[2]
+
+    def _validate_pending_request(self, request_id: int, resolved_message_id: int) -> tuple:
+        """锁内、任何 attempt 清理前校验 pending 请求的完整不可变载荷。
+
+        不信任仅因其已在 DB 就默认合法的 ``summary_md/items_json/request_hash``：旧版本、人工修复或
+        损坏数据库都可能留下绕过 create_checked 的 pending 行。resolve/cancel 共用此闸；失败时只读
+        DB，保留 pending 与现有 staging/final 供人工诊断。
+        """
+        row = self.daemon.query_one(
+            "SELECT status,summary_md,items_json,request_hash,goal_id "
+            "FROM interaction_request WHERE id=?", (request_id,))
+        if row is None:
+            raise ValueError(f"interaction_request 不存在: {request_id}")
+        status, summary_md, items_json, request_hash, goal_id = row
+        msg = self.daemon.query_one(
+            "SELECT goal_id FROM interaction_message WHERE id=?", (resolved_message_id,))
+        if msg is None:
+            raise ValueError(f"provenance 消息不存在: {resolved_message_id}")
+        if msg[0] is None or msg[0] != goal_id:
+            raise ValueError(f"provenance 消息 goal（{msg[0]}）与请求 goal（{goal_id}）不符，拒绝挂账")
+        if status != "pending":
+            raise ValueError(f"request {request_id} 非 pending（{status}），不可迁终态")
+
+        try:
+            items = json.loads(items_json)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"request {request_id} pending request 损坏：items_json 不是合法 JSON") from error
+        if not isinstance(items, list):
+            raise ValueError(f"request {request_id} pending request 损坏：items 必须为数组")
+        if not 1 <= len(items) <= MAX_REQUEST_ITEMS:
+            raise ValueError(
+                f"request {request_id} pending request 损坏：items 数须在 1..{MAX_REQUEST_ITEMS}")
+        try:
+            policy_limit = int(self.policy["max_items_per_request"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("interaction_request.max_items_per_request policy 损坏") from error
+        if len(items) > policy_limit:
+            raise ValueError(
+                f"request {request_id} pending request 损坏：items 数 {len(items)} 超 policy 上限 "
+                f"{policy_limit}")
+
+        from jsonschema import ValidationError
+        try:
+            self.schema_set.validator("resource_request").validate(
+                {"summary_md": summary_md, "items": items})
+        except ValidationError as error:
+            raise ValueError(
+                f"request {request_id} pending request 损坏：resource_request schema 拒："
+                f"{error.message}") from error
+
+        canonical_items_json = json.dumps(items, ensure_ascii=False, sort_keys=True)
+        canonical_hash = hashlib.sha256(canonical_items_json.encode()).hexdigest()
+        if request_hash != canonical_hash:
+            raise ValueError(
+                f"request {request_id} pending request 损坏：request_hash 与 canonical items 不一致")
+        return items, goal_id
 
     def resolve(self, *, request_id: int, uploads_dir: str, resolved_message_id: int) -> Dict[str, Any]:
         """uploads/<item_no>/ 逐文件复制并入 input/user_provided/<request_id>/<item_no>/ → 对**并入后
         字节**sha256 → resolution_json + resolved_* 一次性迁终态（trg_ireq_identity_frozen 只许这一跳）。
         条目目录缺失 = 用户未提供 → 该条记 unavailable（合法：部分提供也算 resolved，§4.6.8）。"""
-        status, items_json = self._check_provenance(request_id, resolved_message_id)
+        status, _items_json, _goal_id = self._check_provenance(request_id, resolved_message_id)
         if status != "pending":
             raise ValueError(f"request {request_id} 非 pending（{status}），不可 resolve")
-        items = json.loads(items_json)
+        managed_paths = self._managed_paths(request_id)
+        with _claim_file_request_operation(managed_paths[0]):
+            # 初检到 claim 之间可能等待另一个进程；锁内完整校验才有权触碰 final/staging。
+            items, goal_id = self._validate_pending_request(request_id, resolved_message_id)
+            return self._resolve_claimed(
+                request_id=request_id, uploads_dir=uploads_dir,
+                resolved_message_id=resolved_message_id, items=items,
+                goal_id=goal_id, managed_paths=managed_paths)
+
+    def _resolve_claimed(self, *, request_id: int, uploads_dir: str, resolved_message_id: int,
+                         items: List[Dict[str, Any]], goal_id: int,
+                         managed_paths: tuple) -> Dict[str, Any]:
+        """claim 锁内实体；调用方已完整校验 DB pending 请求且尚未清理 attempt。"""
         up = Path(uploads_dir)
-        dest_root = self.input_root / "user_provided" / str(request_id)
+        managed_root, stage_root, dest_root = managed_paths
+        # pending 请求的这些目录都不是权威状态：每次 attempt 从空 staging/final 重建，绝不继承半复制陈货。
+        _remove_attempt_durable(managed_root, stage_root, dest_root)
+        existing_managed_bytes = _managed_published_bytes(managed_root)
+        existing_goal_assets = _count_resolved_assets_for_goal(self.daemon, goal_id)
         resolution: List[Dict[str, Any]] = []
-        for i, _item in enumerate(items, start=1):
-            src = up / str(i)
-            files = _regular_files_no_symlink(src)
-            if not files:
-                resolution.append({"unavailable": "用户未提供该条目文件"})
-                continue
-            provided = []
-            for f in files:
-                dest = dest_root / str(i) / f.relative_to(src)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(f, dest)
-                # hash 算在**并入后的目标字节**上（外审 SHOULD：uploads 是外部输入面，hash 源文件后
-                # 再 copy 存在改写窗口——manifest 必须锚"实际并入的东西"）
-                digest = hashlib.sha256(dest.read_bytes()).hexdigest()
-                provided.append({"path": str(dest), "hash": digest, "hash_alg": "sha256"})
-            resolution.append({"provided": provided})
-        with self.daemon.transaction() as conn:
-            n = conn.execute(
-                "UPDATE interaction_request SET status='resolved', resolution_json=?, "
-                "resolved_at=CURRENT_TIMESTAMP, resolved_message_id=? WHERE id=? AND status='pending'",
-                (json.dumps(resolution, ensure_ascii=False), resolved_message_id, request_id)).rowcount
-            if n != 1:
-                raise RuntimeError(f"request {request_id} resolve 竞态：迁移失败")
+        asset_manifest: List[Dict[str, Any]] = []
+        total_bytes = 0
+        preview_bytes = 0
+        file_count = 0
+        populated_items: List[int] = []
+        try:
+            stage_root.mkdir(mode=0o700, parents=True)
+            _fsync_directory(stage_root.parent)
+            for i, _item in enumerate(items, start=1):
+                src = up / str(i)
+                files = _regular_files_no_symlink(src)
+                if not files:
+                    resolution.append({"unavailable": "用户未提供该条目文件"})
+                    continue
+                source_root = src.resolve(strict=True)
+                provided = []
+                for asset_no, f in enumerate(files, start=1):
+                    file_count += 1
+                    if file_count > _MAX_MANAGED_FILES_PER_GOAL:
+                        raise ValueError(
+                            f"用户文件数超过 goal-wide 安全上限 {_MAX_MANAGED_FILES_PER_GOAL}；"
+                            "请先打包成 tar/zip 再上传")
+                    rel = f.relative_to(src)
+                    # 外部文件名不进入托管路径/ref（文件名可含换行/```/引号，直接进 prompt 会注入）。
+                    # 请求条目仍保留 expected_files；真实原相对名只留 DB 审计字段，不参与路径解析。
+                    safe_name = f"asset-{asset_no}"
+                    stage_dest = stage_root / str(i) / safe_name
+                    preview_limit = min(
+                        _MAX_ASSET_PREVIEW_BYTES,
+                        max(0, _MAX_REQUEST_PREVIEW_BYTES - preview_bytes))
+                    size, digest, preview, preview_size, preview_truncated = _copy_hash_regular(
+                        f, stage_dest, source_root=source_root,
+                        remaining_bytes=self.max_managed_bytes - existing_managed_bytes - total_bytes,
+                        preview_limit_bytes=preview_limit)
+                    total_bytes += size
+                    preview_bytes += preview_size
+                    final_dest = dest_root / str(i) / safe_name
+                    opaque_ref = f"user-file-request:r{request_id}:item:{i}:asset:{asset_no}"
+                    asset = {
+                        "path": str(final_dest),
+                        "ref": opaque_ref,
+                        "original_relpath": rel.as_posix(),
+                        "hash": digest,
+                        "hash_alg": "sha256",
+                        "size_bytes": size,
+                    }
+                    if preview is not None:
+                        asset["preview"] = preview
+                        if preview_truncated:
+                            asset["preview_truncated"] = True
+                    provided.append(asset)
+                    asset_manifest.append({
+                        "ref": opaque_ref,
+                        "relative_path": f"{i}/{safe_name}",
+                        "sha256": digest,
+                        "size_bytes": size,
+                    })
+                _fsync_directory(stage_root / str(i))
+                populated_items.append(i)
+                resolution.append({"provided": provided})
+            if existing_goal_assets + file_count > _MAX_MANAGED_FILES_PER_GOAL:
+                raise ValueError(
+                    f"goal {goal_id} resolved 资产累计将达 {existing_goal_assets + file_count}，"
+                    f"超过 ContextPack 上限 {_MAX_MANAGED_FILES_PER_GOAL}；请减少本次文件数")
+            # staging 与 final 同属 managed_root，rename 在同一文件系统；发布完整树后才允许 DB 进终态。
+            # 全部 unavailable 时没有资产可发布，保持 final 不存在（避免空目录冒充已提供输入）。
+            if file_count:
+                manifest_path = stage_root / "assets.manifest.json"
+                manifest_bytes = (json.dumps(
+                    {"version": 1, "request_id": request_id, "assets": asset_manifest},
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                if existing_managed_bytes + total_bytes + len(manifest_bytes) > self.max_managed_bytes:
+                    raise ValueError("用户文件总字节数超过 resources.disk_quota_gb（含既有托管资产与 manifest）")
+                with manifest_path.open("xb") as manifest_file:
+                    manifest_file.write(manifest_bytes)
+                    manifest_file.flush()
+                    os.fsync(manifest_file.fileno())
+                # stage 内子目录和根先持久化，再跨 .staging/ 与 managed/ 两个父目录原子发布。
+                _fsync_directory(stage_root)
+                _fsync_directory(stage_root.parent)
+                os.replace(str(stage_root), str(dest_root))
+                _publish_read_only(dest_root)
+                for item_no in populated_items:
+                    _fsync_directory(dest_root / str(item_no))
+                _fsync_directory(dest_root)
+                _fsync_directory(stage_root.parent)
+                _fsync_directory(managed_root)
+            else:
+                _remove_attempt_durable(managed_root, stage_root, dest_root)
+            # DB 只有在从 work_root 到已发布树的完整目录创建链都持久化后才可迁 resolved。
+            _fsync_managed_ancestors(managed_root)
+        except BaseException as primary:
+            _rollback_attempt_best_effort(managed_root, stage_root, dest_root, primary)
+            raise
+        resolution_json = json.dumps(resolution, ensure_ascii=False)
+        try:
+            with self.daemon.transaction() as conn:
+                n = conn.execute(
+                    "UPDATE interaction_request SET status='resolved', resolution_json=?, "
+                    "resolved_at=CURRENT_TIMESTAMP, resolved_message_id=? WHERE id=? AND status='pending'",
+                    (resolution_json, resolved_message_id, request_id)).rowcount
+                if n != 1:
+                    raise RuntimeError(f"request {request_id} resolve 竞态：迁移失败")
+        except BaseException as db_error:
+            # COMMIT 报错并不总能说明事务未提交（例如连接在确认提交后才丢失响应）。以重新读取的权威
+            # 终态裁决：只有本次 resolution/provenance **逐字段精确一致**才算成功；明确读到 pending、
+            # 别的终态时撤回 final。
+            try:
+                authoritative = _read_committed_resolution_state(self.daemon, request_id)
+            except BaseException:
+                # 回读失败无法区分「未提交」与「提交成功后连接损坏」。保留已 fsync final 作为 quarantine
+                # 并抛原事务异常；消费者仍须经 DB resolved 授权，后续 resolve/cancel 会清理重建。
+                raise db_error from None
+            if authoritative == ("resolved", resolution_json, resolved_message_id):
+                return {"request_id": request_id, "resolution": resolution}
+            _rollback_attempt_best_effort(managed_root, stage_root, dest_root, db_error)
+            raise
         return {"request_id": request_id, "resolution": resolution}
 
     def cancel(self, *, request_id: int, reason: str, resolved_message_id: int) -> None:
         """用户取消（同 provenance：入站消息回指，goal 校验同 resolve）。"""
-        status, _ = self._check_provenance(request_id, resolved_message_id)
-        with self.daemon.transaction() as conn:
-            row = conn.execute("SELECT status FROM interaction_request WHERE id=?", (request_id,)).fetchone()
-            if row[0] != "pending":
-                raise ValueError(f"request {request_id} 非 pending（{row[0]}），不可 cancel")
-            n = conn.execute(
-                "UPDATE interaction_request SET status='cancelled', resolution_json=?, "
-                "resolved_at=CURRENT_TIMESTAMP, resolved_message_id=? WHERE id=? AND status='pending'",
-                (json.dumps({"cancelled": True, "reason": reason}, ensure_ascii=False),
-                 resolved_message_id, request_id)).rowcount
-            if n != 1:            # 兜底同 resolve（同事务已校验，理论不可达）
-                raise RuntimeError(f"request {request_id} cancel 竞态：迁移失败")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("cancel reason 须为非空字符串")
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in reason):
+            raise ValueError("cancel reason 不得含 C0/DEL 控制字符")
+        if len(reason) > MAX_CANCEL_REASON_CHARS:
+            raise ValueError(f"cancel reason 超过 {MAX_CANCEL_REASON_CHARS} 字符上限")
+        status, _, _goal_id = self._check_provenance(request_id, resolved_message_id)
+        if status != "pending":
+            raise ValueError(f"request {request_id} 非 pending（{status}），不可 cancel")
+        managed_paths = self._managed_paths(request_id)
+        with _claim_file_request_operation(managed_paths[0]):
+            self._validate_pending_request(request_id, resolved_message_id)
+            # resolve 失败可能留下旧版本实现的 final 或本版 staging；claim 后才可清非权威资产。
+            managed_root, stage_root, dest_root = managed_paths
+            _remove_attempt_durable(managed_root, stage_root, dest_root)
+            with self.daemon.transaction() as conn:
+                row = conn.execute("SELECT status FROM interaction_request WHERE id=?", (request_id,)).fetchone()
+                if row[0] != "pending":
+                    raise ValueError(f"request {request_id} 非 pending（{row[0]}），不可 cancel")
+                n = conn.execute(
+                    "UPDATE interaction_request SET status='cancelled', resolution_json=?, "
+                    "resolved_at=CURRENT_TIMESTAMP, resolved_message_id=? WHERE id=? AND status='pending'",
+                    (json.dumps({"cancelled": True, "reason": reason}, ensure_ascii=False),
+                     resolved_message_id, request_id)).rowcount
+                if n != 1:            # 兜底同 resolve（同事务已校验，理论不可达）
+                    raise RuntimeError(f"request {request_id} cancel 竞态：迁移失败")
 
 
 class FileRequestNotifier:

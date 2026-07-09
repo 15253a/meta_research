@@ -207,6 +207,145 @@ def test_full_attack_cycle(env):
     assert env["state"].last_done_cycle().next_intent == "terminate"
 
 
+@pytest.mark.parametrize("resume_after_staging", [False, True])
+def test_attack_bundle_consumes_context_authorized_user_asset(tmp_path, resume_after_staging, monkeypatch):
+    """fresh/resume 的 AttackStages→manifest→harness 都消费 ContextPack 授权的同一只读资产 fd。"""
+    from orchestrator.interaction import InteractionIngest
+    from orchestrator.notify import FileRequestService
+
+    work = tmp_path / "work"
+    work.mkdir()
+    path = str(work / "research.sqlite")       # manifest resolver 的权威库固定在 work root
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+
+    request = {"summary_md": "需要 UTF-8 toy 数据", "items": [{
+        "kind": "dataset", "desc": "toy 输入", "expected_files": ["data.txt"],
+        "attempted_paths": ["/missing/toy"], "failure_reason": "测试环境无该数据",
+        "dest_hint": "input/user_provided/",
+    }]}
+    service = FileRequestService(daemon, SchemaSet(SYSTEM_ROOT / "schemas"), POLICY,
+                                 str(work / "input"))
+    rid = service.create_checked(goal_id=1, goal_ver=1, stage="bundle", request=request)
+    uploads = tmp_path / "uploads"
+    (uploads / "1").mkdir(parents=True)
+    (uploads / "1" / "hostile-name.txt").write_bytes(b"AUTHORIZED-USER-DATA")
+    mid = InteractionIngest(daemon).inbound(
+        connector="test", raw_text="uploaded", idempotency_key="attack-asset-1",
+        goal_id=1, goal_ver=1)
+    resolved = service.resolve(request_id=rid, uploads_dir=str(uploads), resolved_message_id=mid)
+    provided = resolved["resolution"][0]["provided"][0]
+    ref = provided["ref"]
+
+    base_bundle = _bundle_provider(daemon)
+
+    def bundle_with_asset(cyc, pack):
+        assert ref in pack.refs
+        files = base_bundle(cyc, pack)
+        files["train.py"] = (
+            "import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes()==b'AUTHORIZED-USER-DATA'; "
+            "print('loss: 1.0'); print('loss: 0.2'); pathlib.Path('ckpt.bin').write_text('weights-v1'); "
+            "print('wall_clock_sec: 1.0')")
+        files["execution_manifest.json"]["commands"]["train"]["argv"].append(
+            "{asset:" + ref + "}")
+        return files
+
+    attack.p["bundle"] = bundle_with_asset
+    later_ref = None
+    if resume_after_staging:
+        # _obtain_manifest 已将含 asset ref 的包物化，随后在 target 状态迁移前模拟 kill；新实例必须
+        # 从 DB 重编 ContextPack 授权集合并复用 staging，不能靠 fresh 调用残留的内存 pack。
+        attack.gate.gate_start_build_target = lambda **_kw: (_ for _ in ()).throw(
+            SystemExit("SIM-KILL9-after-bundle-staging"))
+        with pytest.raises(SystemExit, match="after-bundle-staging"):
+            SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+        assert list(work.glob("c*/t*/src/execution_manifest.json"))
+
+        # staging 后追加另一个同 goal resolved 资产：恢复 pack 会看到它，但生成时授权快照没有它；
+        # smoke/train/eval 的能力集合必须保持最小冻结集，不能随当前 pack 扩张。
+        later_request = json.loads(json.dumps(request))
+        later_request["items"][0]["desc"] = "later input"
+        later_rid = service.create_checked(goal_id=1, goal_ver=1, stage="bundle", request=later_request)
+        later_uploads = tmp_path / "later-uploads"
+        (later_uploads / "1").mkdir(parents=True)
+        (later_uploads / "1" / "later.txt").write_bytes(b"LATER-DATA")
+        later_mid = InteractionIngest(daemon).inbound(
+            connector="test", raw_text="later uploaded", idempotency_key="attack-asset-later",
+            goal_id=1, goal_ver=1)
+        later_ref = service.resolve(
+            request_id=later_rid, uploads_dir=str(later_uploads),
+            resolved_message_id=later_mid)["resolution"][0]["provided"][0]["ref"]
+        daemon.conn.close()
+        daemon, state, compiler, attack = _mk_env(path, work)
+
+    actual_run_manifest = AS.MF.run_manifest_command
+    actual_verify_authorization = AS.MF.verify_asset_authorization
+    seen_authorizations = []
+    verified_authorizations = []
+
+    def capture_authorization(*args, **kwargs):
+        seen_authorizations.append((
+            frozenset(kwargs.get("allowed_asset_refs") or ()),
+            dict(kwargs.get("expected_asset_identities") or {}),
+        ))
+        return actual_run_manifest(*args, **kwargs)
+
+    def capture_verification(authorization, **kwargs):
+        verified_authorizations.append(authorization)
+        return actual_verify_authorization(authorization, **kwargs)
+
+    monkeypatch.setattr(AS.MF, "run_manifest_command", capture_authorization)
+    monkeypatch.setattr(AS.MF, "verify_asset_authorization", capture_verification)
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert daemon.query_one("SELECT status FROM run")[0] == "success"
+    assert daemon.query_one("SELECT status FROM build_target")[0] == "complete"
+    assert seen_authorizations
+    assert verified_authorizations
+    assert all(auth is not None and auth.asset_refs == frozenset({ref})
+               and set(auth.identities) == {ref} for auth in verified_authorizations)
+    assert all(refs == frozenset({ref}) and set(identities) == {ref}
+               for refs, identities in seen_authorizations)
+    assert all(
+        identity.ref == ref
+        and identity.request_id == rid
+        and identity.item_no == 1
+        and identity.asset_no == 1
+        and identity.sha256 == provided["hash"]
+        and identity.size_bytes == provided["size_bytes"]
+        and identity.managed_path == provided["path"]
+        for _refs, identities in seen_authorizations
+        for identity in [identities[ref]])
+    if later_ref is not None:
+        assert all(later_ref not in refs and later_ref not in identities
+                   for refs, identities in seen_authorizations)
+    daemon.conn.close()
+
+
+def test_bundle_cannot_predeclare_future_predictable_asset_ref(tmp_path):
+    """生成 pack 未授权的可预测 ref 在 staging 前即拒，不能靠 kill→后续 resolve→resume 获权。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "work")
+    _bootstrap_attack(state)
+    base_bundle = _bundle_provider(daemon)
+    predicted = "user-file-request:r1:item:1:asset:1"
+
+    def bundle_with_future_ref(cyc, pack):
+        assert predicted not in pack.refs
+        files = base_bundle(cyc, pack)
+        files["execution_manifest.json"]["commands"]["train"]["argv"].append(
+            "{asset:" + predicted + "}")
+        return files
+
+    attack.p["bundle"] = bundle_with_future_ref
+    attack.p["reasoning"] = lambda cyc, pack: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == (
+        "failed", "artifact_invalid")
+    assert not list((tmp_path / "work").glob("c*/t*/src/_staged.ok"))
+    daemon.conn.close()
+
+
 def test_advance_idempotent_after_done(env):
     env["adv"].run_cycles(max_cycles=4)
     before = env["daemon"].query_one("SELECT count(*) FROM idea")[0]

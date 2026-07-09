@@ -10,31 +10,36 @@
     "summary_md": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]*$",
       "description": "易懂语言（中文）：期望做什么 / 为何自己获取不到 / 需要用户提供什么"
     },
     "items": {
       "type": "array",
       "minItems": 1,
+      "maxItems": 10,
       "items": {
         "type": "object",
         "required": ["kind", "desc", "expected_files", "attempted_paths", "failure_reason", "dest_hint"],
         "additionalProperties": false,
         "properties": {
           "kind": { "enum": ["dataset", "paper", "wet_lab", "other"] },
-          "desc": { "type": "string", "minLength": 1 },
+          "desc": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" },
           "expected_files": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string", "minLength": 1 }
+            "maxItems": 16,
+            "items": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" }
           },
           "attempted_paths": {
             "type": "array",
             "minItems": 1,
+            "maxItems": 8,
             "description": "已尝试的获取路径（必填，防「能自己获取还请求」）",
-            "items": { "type": "string", "minLength": 1 }
+            "items": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" }
           },
-          "failure_reason": { "type": "string", "minLength": 1 },
-          "dest_hint": { "type": "string", "minLength": 1, "description": "期望落位提示（恢复后从托管区引用/复制到消费位置）" }
+          "failure_reason": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" },
+          "dest_hint": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000-\\u001F\\u007F]*$", "description": "期望落位提示（恢复后从托管区引用/复制到消费位置）" }
         }
       }
     }

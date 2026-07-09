@@ -142,6 +142,10 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 
 - 代码物化在编排器管理的 staging（净土物化 + sha256 哈希对账 + argv-only 禁 shell + 路径/env 围栏），
   **但真 git worktree 隔离 + env lock 强校验属后续硬化步**。
+- 用户文件已有 DB 终态授权、ContextPack ref 白名单、hash/size 复验和稳定只读 fd；非 bundle 阶段只看
+  有界 UTF-8 预览。**这不是机械 prompt-injection/恶意代码隔离**：当前 Codex 仍可使用只读工具，bundle
+  代码仍由主机 harness 执行。CP11.4 容器/VM 隔离完成前，只能接纳操作者信任的文件或人工审过的文本摘要，
+  不得把任意第三方附件当作对抗性安全输入。
 - **成本护栏已转活，但不是供应商账单**：`ledger.money` 用 Codex CLI 回报的总 token 与本地
   `price_per_1k_tokens` 折算，用于运行护栏和趋势观测。如果编排器在外部调用已完成、但用量落库前被
   `SIGKILL`，该次用量仍可漏记；生产级精确账单需再加「调用前意图 + 持久回执 + 幂等补账」协议。

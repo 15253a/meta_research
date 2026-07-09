@@ -586,7 +586,9 @@ class AttackStages:
 
     def _obtain_manifest(self, cyc, bt_id: int, slice_: Dict[str, Any], src_dir: Path) -> tuple:
         """取本目标的 execution_manifest（persist-then-consume）：src 未物化 → 调 bundle provider 产信封
-        → 校验 + 交叉核 + 净土物化；已物化 → 复用。返回 (manifest, ledger)。
+        → 校验 + 交叉核 + 净土物化；已物化 → 复用。fresh / resume 都重新编译当前 bundle ContextPack，
+        返回 (manifest, ledger, allowed_asset_refs, asset_identities)，使可预测 opaque ref 只能
+        消费当前 goal 在 bundle 生成时已授权且内容身份未变的资产。
 
         **fresh 与 resume 同校验口径**（codex SHOULD-1）：两路径都 validate_manifest + cross_check(切片)。
         **失败分流**（codex SHOULD-2）：
@@ -595,9 +597,12 @@ class AttackStages:
           fail loud（同 staged_hashes 篡改）——我们只物化校验通过的 manifest，故此路径校验失败 = 数据损毁。"""
         if self.policy is None:
             raise RuntimeError("AttackStages 须注入 policy（manifest 命令围栏 execution 节）")
+        # 不只在 fresh provider 调用时拿 pack：resume 也要确认“生成时冻结的 refs”在当前 DB 快照仍可见。
+        # 注意当前 refs 是追加集，绝不能直接拿它当恢复授权——否则旧 manifest 可预猜未来 request id，
+        # kill 后等该请求 resolved 再扩权。实际能力只来自 staging ledger 内的生成时授权快照。
+        pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="bundle", target_id=str(bt_id))
         ledger = MF.staged_hashes(src_dir)        # 篡改自查（损毁→ManifestError fail loud）
         if ledger is None:                        # fresh：Codex 出错归业务拒
-            pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="bundle", target_id=str(bt_id))
             files = self.p["bundle"](cyc, pack)
             try:
                 if not isinstance(files, dict) or "execution_manifest.json" not in files:
@@ -605,13 +610,37 @@ class AttackStages:
                                            f"{list(files) if isinstance(files, dict) else type(files)}）")
                 manifest = files["execution_manifest.json"]
                 self._check_manifest(manifest, slice_)
-                ledger = MF.stage_bundle_files(files, manifest, src_dir)
+                actual_refs = MF.extract_manifest_asset_refs(manifest)
+                unauthorized = sorted(set(actual_refs) - set(pack.refs))
+                if unauthorized:
+                    raise MF.ManifestError(
+                        f"manifest 使用未获生成时 ContextPack 授权的输入资产 ref: {unauthorized}")
+                identities = MF.capture_asset_identities(actual_refs, work_root=self.work)
+                ledger = MF.stage_bundle_files(
+                    files, manifest, src_dir,
+                    authorization_pack_hash=pack.pack_hash,
+                    allowed_asset_refs=pack.refs,
+                    asset_identities=identities)
+                authorization = MF.load_asset_authorization(src_dir, manifest)
+                MF.verify_asset_authorization(authorization, work_root=self.work)
             except MF.ManifestError as e:
                 raise _BundleReject(str(e)) from e
-            return manifest, ledger
+            frozen_refs = authorization.asset_refs if authorization is not None else frozenset()
+            frozen_identities = authorization.identities if authorization is not None else {}
+            return manifest, ledger, frozen_refs, frozen_identities
         manifest = json.loads((src_dir / MF.MANIFEST_FILE).read_text(encoding="utf-8"))
         self._check_manifest(manifest, slice_)    # resume 再校验（损坏→ManifestError 上抛，不吞）
-        return manifest, ledger
+        authorization = MF.load_asset_authorization(src_dir, manifest)
+        frozen_refs = authorization.asset_refs if authorization is not None else frozenset()
+        missing_now = sorted(set(frozen_refs) - set(pack.refs))
+        if missing_now:
+            raise MF.ManifestError(
+                f"staging 生成时资产授权已不在当前 ContextPack：{missing_now}——DB/回执损坏，拒绝恢复")
+        # pack_hash 是「当时生成包」的受 ledger 保护审计锚，不是 resume 等值闸：后续 append-only
+        # 回执会合法改变当前 pack hash。恢复时的执法闸是「冻结 ref 仍在当前 pack」+「内容身份未变」。
+        MF.verify_asset_authorization(authorization, work_root=self.work)
+        frozen_identities = authorization.identities if authorization is not None else {}
+        return manifest, ledger, frozen_refs, frozen_identities
 
     def _check_manifest(self, manifest: Dict[str, Any], slice_: Dict[str, Any]) -> None:
         """manifest 结构 + 交叉核 + kind 支持（fresh/resume 共用）。非 build kind → ManifestError（fresh 侧
@@ -647,13 +676,16 @@ class AttackStages:
             return
         staging = self.work / f"c{_cnum(cyc.cycle_id)}" / f"t{bt_id}"
         src_dir = staging / "src"                 # 代码物化目录（每目标唯一；净土物化，与 run/eval 产物分离）
-        manifest, ledger = self._obtain_manifest(cyc, bt_id, slice_, src_dir)
+        manifest, ledger, allowed_asset_refs, asset_identities = self._obtain_manifest(
+            cyc, bt_id, slice_, src_dir)
         if st() == "pending":
             g.gate_start_build_target(build_target_id=bt_id)
         if st() == "building":                    # 真 smoke（manifest.commands.smoke 子进程）→ 过了才进 smoke 态
             sm = MF.run_manifest_command(manifest, "smoke", staging_dir=str(staging / "smoke"),
                                          log_name=f"smoke-{self._next_serial(staging, 'smoke')}.log",
-                                         src_dir=src_dir, work_root=self.work, policy=self.policy)
+                                         src_dir=src_dir, work_root=self.work, policy=self.policy,
+                                         allowed_asset_refs=allowed_asset_refs,
+                                         expected_asset_identities=asset_identities)
             if sm["exit_code"] != 0:              # smoke 失败 → target 失败连坐（codex SHOULD：exit code 不得忽略）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._ensure_target_pc(cyc, bt_id)   # 终态早退**也**落 pc（codex 第2轮 BLOCKER：漏落致杀/不杀分裂）
@@ -671,10 +703,12 @@ class AttackStages:
                 return
             g.gate_progress_build_target(build_target_id=bt_id, to="running", current_subject_hash=code_sh)
         if st() == "running":
-            self._run_and_register(cyc, bt_id, slice_, manifest, ledger, staging, src_dir)
+            self._run_and_register(cyc, bt_id, slice_, manifest, ledger, staging, src_dir,
+                                   allowed_asset_refs, asset_identities)
         self._ensure_target_pc(cyc, bt_id)
 
-    def _run_and_register(self, cyc, bt_id: int, slice_, manifest, ledger, staging: Path, src_dir: Path) -> None:
+    def _run_and_register(self, cyc, bt_id: int, slice_, manifest, ledger, staging: Path, src_dir: Path,
+                          allowed_asset_refs, asset_identities) -> None:
         """phase (i) 执行事实 + phase (ii) 注册段（结构可恢复的短事务序列）。命令由 manifest 驱动（步⑧）。
         ⚠️ 与 import_worker._run_and_register_import **同构**（恢复缝隙修复须双向同步；共享骨架=M6 硬化）。"""
         g, d = self.gate, self.state.daemon
@@ -694,7 +728,9 @@ class AttackStages:
                                    kind=slice_["target_kind"],   # exec 目标→run.kind='exec'（trg_run_target_consistent）
                                    env_hash=env_hash)
             r = MF.run_manifest_command(manifest, "train", staging_dir=str(staging / f"run{rid}"),
-                                        log_name="train.log", src_dir=src_dir, work_root=self.work, policy=self.policy)
+                                        log_name="train.log", src_dir=src_dir, work_root=self.work,
+                                        policy=self.policy, allowed_asset_refs=allowed_asset_refs,
+                                        expected_asset_identities=asset_identities)
             if r["exit_code"] != 0:
                 g.gate_finish_run(run_id=rid, status="failed", failure_kind="runtime")
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
@@ -730,7 +766,10 @@ class AttackStages:
             else:
                 ev = MF.run_manifest_command(manifest, "eval", staging_dir=str(staging / f"eval{rid}"),
                                              log_name="eval.log", src_dir=src_dir, work_root=self.work,
-                                             policy=self.policy, ckpt_path=MF.checkpoint_dest(manifest, staging / f"run{rid}"))
+                                             policy=self.policy,
+                                             ckpt_path=MF.checkpoint_dest(manifest, staging / f"run{rid}"),
+                                             allowed_asset_refs=allowed_asset_refs,
+                                             expected_asset_identities=asset_identities)
                 eval_log = Path(ev["log_path"]).read_bytes()
             if ev["exit_code"] != 0:              # fresh 与 resume 同一判定点（评估进程失败 → target failed）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")

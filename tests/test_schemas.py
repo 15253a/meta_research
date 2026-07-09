@@ -96,6 +96,40 @@ def test_invalid_fixture_rejected(name, case):
     )
 
 
+def test_resource_request_metadata_bounds_match_runtime_quota():
+    """请求 schema 自身限制 prompt 元数据；items 上限须与 policy 默认的 10 对齐。"""
+    schema = load_schema("resource_request")
+    props = schema["properties"]
+    item_props = props["items"]["items"]["properties"]
+    assert props["items"]["maxItems"] == 10
+    assert item_props["expected_files"]["maxItems"] == 16
+    assert item_props["attempted_paths"]["maxItems"] == 8
+
+    validator = make_validator("resource_request")
+    max_item = {
+        "kind": "dataset",
+        "desc": "D" * 1024,
+        "expected_files": ["E" * 512] * 16,
+        "attempted_paths": ["P" * 1024] * 8,
+        "failure_reason": "F" * 1024,
+        "dest_hint": "H" * 512,
+    }
+    validator.validate({"summary_md": "S" * 2048, "items": [max_item] * 10})
+
+    invalid = [
+        {"summary_md": "S" * 2049, "items": [max_item]},
+        {"summary_md": "ok", "items": [max_item] * 11},
+        {"summary_md": "ok", "items": [{**max_item, "expected_files": ["x"] * 17}]},
+        {"summary_md": "ok", "items": [{**max_item, "attempted_paths": ["x"] * 9}]},
+        {"summary_md": "ok", "items": [{**max_item, "desc": "D" * 1025}]},
+        {"summary_md": "bad\x01control", "items": [max_item]},
+        {"summary_md": "ok", "items": [{**max_item, "failure_reason": "bad\nline"}]},
+    ]
+    for request in invalid:
+        with pytest.raises(ValidationError):
+            validator.validate(request)
+
+
 # ---------------------------------------------------------------------------
 # 3. policy.yaml：解析 + 过 schema（运行前提 #4）
 # ---------------------------------------------------------------------------

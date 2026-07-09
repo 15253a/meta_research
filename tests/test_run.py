@@ -432,15 +432,27 @@ def test_file_request_wait_loop_end_to_end(tmp_path):
     assert sys2.run(max_cycles=3) == []
     assert f"#{rid}" in sys2.advancer.last_block_reason
 
-    # 用户 resolve（条目未提供=unavailable，合法部分解决）→ 第三次 run 续跑同一阶段成功
+    # 用户 resolve 真文件 → 第三次 run 的真实 compiler/provider pack 必须看见 opaque asset 回执，
+    # 不能只靠“pending 清掉 + fake runner 凭空成功”的假闭环。
     mid = InteractionIngest(sys2.daemon).inbound(connector="qq", raw_text="数据给不了，先跑",
                                                  idempotency_key="fr-1", goal_id=1, goal_ver=1)
     policy = _yaml.safe_load((Path(SYSTEM_ROOT) / "policies" / "policy.yaml").read_text(encoding="utf-8"))
     frs = FileRequestService(sys2.daemon, SchemaSet(Path(SYSTEM_ROOT) / "schemas"), policy,
                              input_root=str(tmp_path / "input"))
-    up = tmp_path / "uploads"; up.mkdir()
-    frs.resolve(request_id=rid, uploads_dir=str(up), resolved_message_id=mid)
-    sys3 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory([boot]))
+    up = tmp_path / "uploads"; (up / "1").mkdir(parents=True)
+    (up / "1" / "eeg-user-name.zip").write_bytes(b"EEG-USER-DATA")
+    resolved = frs.resolve(request_id=rid, uploads_dir=str(up), resolved_message_id=mid)
+    asset = resolved["resolution"][0]["provided"][0]
+
+    def finish_after_resource(pack):
+        assert pack.refs == [f"user-file-request:r{rid}:item:1:asset:1"]
+        assert "用户文件输入资产回执（非 evidence）" in pack.anchor_md
+        assert asset["hash"] in pack.anchor_md
+        assert "EEG-USER-DATA" in pack.anchor_md and "untrusted_non_evidence" in pack.anchor_md
+        assert "eeg-user-name.zip" not in pack.anchor_md              # 外部文件名不进入 prompt
+        return boot
+
+    sys3 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory([finish_after_resource]))
     ids = sys3.run(max_cycles=3)
     assert len(ids) == 1                                         # 同一在途轮续跑完成
     assert sys3.daemon.query_one("SELECT count(*) FROM question")[0] == 1
