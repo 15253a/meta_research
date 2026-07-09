@@ -277,7 +277,9 @@ def test_register_evaluation_rejects_cross_variant_target(env):
 
 
 def test_register_evaluation_append_mode(env):
-    """append 模式：绑定核（target 不符拒）+ 已 success 的 evaluation 追加保留原 canonical + abandoned 拒。"""
+    """append 模式（步⑧ CP8.6 收准）：**同 variant 的别的 target 可追加**（跨轮 metric_append/repro_eval
+    的 eval 目标正是 §3.3.1 情形三/四——evaluation.build_target_id 是创建者锚，append 者身份记 attempt 侧）；
+    **不同 variant 的 target 仍拒**（target↔variant 真不变量）；success 追加保留原 canonical + abandoned 拒。"""
     gate, d = env
     ids = _build_chain(gate, d)
     reg = gate.gate_register_evaluation(
@@ -286,15 +288,22 @@ def test_register_evaluation_append_mode(env):
         create={"variant_id": ids["variant_id"], "protocol_id": 1, "protocol_ver": 1,
                 "eval_key": "fac", "source": "factory", "target_set_hash": "tsh"})
     eid, first_aid = reg["evaluation_id"], reg["attempt_id"]
-    with d.transaction() as conn:   # 另一 eval 目标（append 型须带 evaluation_id，DDL CHECK）
+    with d.transaction() as conn:   # 另一 variant 上的 eval 目标（append 型须带 evaluation_id，DDL CHECK）
+        bl2 = conn.execute("INSERT INTO baseline(slug,canonical_key,identity_doc,born_cycle,status) "
+                           "VALUES ('b2','ck-b2','id2',2,'legal')").lastrowid
+        vid2 = conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status) "
+                            "VALUES (?,'base','{}','legal')", (bl2,)).lastrowid
+        bt_bad = conn.execute("INSERT INTO build_target(cycle_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
+                              "VALUES (2,'eval',89,'running',?,'append_attempt',?)", (vid2, eid)).lastrowid
         bt2 = conn.execute("INSERT INTO build_target(cycle_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
                            "VALUES (2,'eval',90,'running',?,'append_attempt',?)", (ids["variant_id"], eid)).lastrowid
-    _judge_pass(d, bt2, "bundle_result_review", "res-sh2")
-    with pytest.raises(GateReject, match="target 绑定不符"):    # eval 绑 ids["bt"]，传别的 target
-        gate.gate_register_evaluation(cycle_id="c2", build_target_id=bt2, purpose="metric_append",
-                                      current_subject_hash="res-sh2", metric_results=[], evaluation_id=eid)
-    r2 = gate.gate_register_evaluation(   # 合法 append（同 target）：保留原 canonical
-        cycle_id="c2", build_target_id=ids["bt"], purpose="metric_append", current_subject_hash="res-sh",
+    _judge_pass(d, bt_bad, "bundle_result_review", "res-sh-bad")
+    with pytest.raises(GateReject, match="target 绑定不符"):    # bt_bad 绑 variant2，eval 属 variant1 → 拒
+        gate.gate_register_evaluation(cycle_id="c2", build_target_id=bt_bad, purpose="metric_append",
+                                      current_subject_hash="res-sh-bad", metric_results=[], evaluation_id=eid)
+    _judge_pass(d, bt2, "bundle_result_review", "res-sh")
+    r2 = gate.gate_register_evaluation(   # 合法 append（同 variant 的别的 target）：保留原 canonical
+        cycle_id="c2", build_target_id=bt2, purpose="metric_append", current_subject_hash="res-sh",
         metric_results=[{"metric_id": 1, "metric_ver": 1, "value": 0.92}], evaluation_id=eid)
     assert d.query_one("SELECT canonical_attempt_id FROM evaluation WHERE id=?", (eid,))[0] == first_aid
     assert r2["attempt_id"] != first_aid
@@ -391,3 +400,27 @@ def test_new_protocol_version_and_i1(env):
     with pytest.raises(GateReject, match="不存在的 metric_def"):
         gate.gate_new_protocol(protocol_id=1, version=3, name="p3", scope_spec_json="{}", cycle_id="c2",
                                metrics=[(99, 1)])
+
+
+def test_register_evaluation_append_wrong_cell_rejected(env):
+    """codex 第2轮 BLOCKER 回归：同 variant 但 append 目标未显式绑定该 evaluation（build_target.evaluation_id
+    指向别的格子/NULL）→ 拒（防同 variant 多格子错格污染）。"""
+    gate, d = env
+    ids = _build_chain(gate, d)
+    reg = gate.gate_register_evaluation(
+        cycle_id="c2", build_target_id=ids["bt"], purpose="factory", current_subject_hash="res-sh",
+        metric_results=[{"metric_id": 1, "metric_ver": 1, "value": 0.91}],
+        create={"variant_id": ids["variant_id"], "protocol_id": 1, "protocol_ver": 1,
+                "eval_key": "fac", "source": "factory", "target_set_hash": "tsh"})
+    eid = reg["evaluation_id"]
+    with d.transaction() as conn:   # 同 variant、但第二个格子（protocol@2）+ 一个指向它的 append 目标
+        conn.execute("INSERT INTO protocol(id,version,name,scope_spec_json) VALUES (1,2,'p','{}')")
+        eid2 = conn.execute("INSERT INTO evaluation(variant_id,protocol_id,protocol_ver,eval_key,source,status,"
+                            "created_cycle,target_set_hash) VALUES (?,1,2,'e2','factory','created',2,'t2')",
+                            (ids["variant_id"],)).lastrowid
+        bt_wrong = conn.execute("INSERT INTO build_target(cycle_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
+                                "VALUES (2,'eval',91,'running',?,'append_attempt',?)", (ids["variant_id"], eid2)).lastrowid
+    _judge_pass(d, bt_wrong, "bundle_result_review", "sh-w")
+    with pytest.raises(GateReject, match="未显式绑定"):   # bt_wrong 绑 eid2，却往 eid 追加 → 拒
+        gate.gate_register_evaluation(cycle_id="c2", build_target_id=bt_wrong, purpose="metric_append",
+                                      current_subject_hash="sh-w", metric_results=[], evaluation_id=eid)

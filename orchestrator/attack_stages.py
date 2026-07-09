@@ -221,15 +221,15 @@ class AttackStages:
                 raise _PlanReject("plan 含 import_defer——外部导入延迟决定 CP8.6 接线，本轮拒收；defer="
                                   + json.dumps(plan["import_defer"], ensure_ascii=False, sort_keys=True))
             targets = sorted(plan["targets"], key=lambda x: x["seq"])   # schema 保证 targets/seq 在场
-            for t in targets:                   # exec/eval/import target kind = CP8.6（graceful 拒、不楔死）
-                if t["target_kind"] != "build":
-                    raise _PlanReject(f"CP8.2 只支持 build 目标（exec/eval/import=CP8.6）：{t['target_kind']}")
+            for t in targets:                   # eval/import target kind = 后续检查点（graceful 拒、不楔死）
+                if t["target_kind"] not in ("build", "exec"):
+                    raise _PlanReject(f"暂只支持 build/exec 目标（eval/import 后续接线）：{t['target_kind']}")
             if not targets:                     # 无 target（复用/聚合/idea 失败）：合法终态、零 target（非拒）
                 self._commit_plan_terminal(cyc, plan, built=[], reject=None)
                 return
-            derived = self._derive_plan(ci, plan, targets)      # 纯读派生（含 canonical_key/required/I1 前置判）
+            derived = self._derive_plan(ci, plan, targets)      # 纯读派生（build/exec 占坑身份前置判）
             self._register_protocol(cyc.cycle_id, derived)      # gate_new_protocol（幂等跳过）
-            claims = self._claim_baselines(ci, cyc.cycle_id, derived)   # 逐目标 gate_claim_baseline（本轮已占则复用）
+            claims = self._claim_targets(ci, cyc.cycle_id, derived)   # build→claim_baseline / exec→claim_variant
         except (_PlanReject, GateReject) as e:                  # 非法 plan / gate 拒 → 业务拒收尾（不楔死）
             self._commit_plan_terminal(cyc, plan, built=[], reject=str(e))
             return
@@ -339,30 +339,66 @@ class AttackStages:
                                    "AND metric_id=? AND metric_ver=?", (pid, pver, mid_int, mver)) is None:
                         raise _PlanReject(f"复用 protocol {pname}@{pver} 但 required metric {mid_int}@{mver} "
                                           "不在其 protocol_metric（I1：改 metric 集须升 version）")
-        seen_ck = set()                         # plan 内 canonical_key 唯一 + 未被他轮占（内审 SHOULD-高：防同轮别名共 variant / 跨轮毒化）
+        # 占坑身份前置判（按 kind）：build 占 canonical_key（唯一 + 未被他轮占）；exec 占既有 legal baseline
+        # 下的新 variant_key（baseline_ref 须解析到 legal baseline；variant_key 未占；config 非空）。
+        seen_ck, seen_bv = set(), set()
         for t in targets:
-            ck, slug = t["claim"]["canonical_key"], t["claim"]["slug"]
-            if ck in seen_ck:
-                raise _PlanReject(f"plan 内 canonical_key 重复: {ck!r}（同轮多目标不得共占坑）")
-            seen_ck.add(ck)
-            occ = d.query_one("SELECT born_cycle, slug FROM baseline WHERE canonical_key=?", (ck,))
-            if occ is not None and not (occ[0] == ci and occ[1] == slug):
-                raise _PlanReject(f"canonical_key 被他轮占（I5）: {ck!r}")   # 派生期拦下 → claim 段不会半途失败留孤儿
+            tk = t["target_key"]
+            claim = t.get("claim", {})
+            if t["target_kind"] == "build":
+                ck, slug = claim["canonical_key"], claim["slug"]
+                if ck in seen_ck:
+                    raise _PlanReject(f"plan 内 canonical_key 重复: {ck!r}（同轮多目标不得共占坑）")
+                seen_ck.add(ck)
+                occ = d.query_one("SELECT born_cycle, slug FROM baseline WHERE canonical_key=?", (ck,))
+                if occ is not None and not (occ[0] == ci and occ[1] == slug):
+                    raise _PlanReject(f"canonical_key 被他轮占（I5）: {ck!r}")   # 派生期拦下→claim 段不半途留孤儿
+            else:   # exec
+                bref, vkey = claim["baseline_ref"], claim["variant_key"]
+                brow = d.query_one("SELECT id, status FROM baseline WHERE canonical_key=?", (bref,))
+                if brow is None or brow[1] != "legal":
+                    raise _PlanReject(f"exec baseline_ref {bref!r} 未解析到 legal baseline"
+                                      f"（{'缺失' if brow is None else brow[1]}——首攻新家族须 build）")
+                if not claim.get("config_json"):
+                    raise _PlanReject(f"exec 目标 {tk} 缺 config_json（变体须有配置增量）")
+                key = (brow[0], vkey)
+                if key in seen_bv:
+                    raise _PlanReject(f"plan 内 exec variant_key 重复: {vkey!r}（baseline {bref}）")
+                seen_bv.add(key)
+                vrow = d.query_one("SELECT id, config_json FROM variant WHERE baseline_id=? AND variant_key=?", key)
+                if vrow is not None and not self._is_own_exec_reoccupy(vrow[0], ci, claim["config_json"]):
+                    # variant_key 已占且**不是本轮自己的未终局 exec 占坑**（崩溃重放）→ 拒（他处占/身份漂移）。
+                    # 「本轮自占」严核（codex 第2轮 BLOCKER）：pending + plan_ref NULL + config 一致——防身份
+                    # 漂移（重放 plan 若换 config/seq 会把新 plan_ref 写到旧 variant 上，破坏确定性）。
+                    raise _PlanReject(f"exec variant_key {vkey!r} 已占（baseline {bref}）")
         dts = []
         for t in targets:
             claim = t.get("claim", {})
-            tk = t["target_key"]
+            tk, kind = t["target_key"], t["target_kind"]
+            id_anchor = claim.get("canonical_key") if kind == "build" else \
+                f"{claim.get('baseline_ref')}/{claim.get('variant_key')}"
             slice_ = dict(t)                    # 冻结 target 原样 + 绑定四件（plan_ref 权威；bundle manifest 交叉核锚）
             slice_.update({"protocol_id": pid, "protocol_ver": pver, "eval_key": tk,
                            "target_set_hash": _canon_hash({"factory_of": {"cycle": ci, "target_key": tk,
-                                                                          "canonical_key": claim.get("canonical_key")}})})
-            dts.append({"target_key": tk, "seq": t["seq"], "slice": slice_,
+                                                                          "id_anchor": id_anchor}})})
+            dts.append({"target_key": tk, "kind": kind, "seq": t["seq"], "slice": slice_,
                         "required": req_by_tk.get(tk, []), "identity_md": _synth_identity_md(t),
                         "claim": claim})
         return {"protocol": {"id": pid, "version": pver, "name": pname, "scope_json": scope_json,
                              "exists": proto_exists, "defs": defs,
                              "metrics": [(dd["id"], dd["version"]) for dd in defs]},
                 "targets": dts}
+
+    def _is_own_exec_reoccupy(self, variant_id: int, ci: int, claim_config: Dict[str, Any]) -> bool:
+        """variant 是否 == 本轮自己的**未终局** exec 占坑（崩溃重放待复用）：挂一个本 cycle 的 exec
+        build_target 且 status='pending'、plan_ref IS NULL（终局未落），且 variant.config_json 与 plan claim
+        一致（身份不漂移）。满足才允许复用（否则视作他处占/漂移，拒）——codex 第2轮 BLOCKER 严核。"""
+        d = self.state.daemon
+        if d.query_one("SELECT 1 FROM build_target WHERE variant_id=? AND cycle_id=? AND target_kind='exec' "
+                       "AND status='pending' AND plan_ref IS NULL", (variant_id, ci)) is None:
+            return False
+        cfg = d.query_one("SELECT config_json FROM variant WHERE id=?", (variant_id,))[0]
+        return json.loads(cfg) == claim_config
 
     def _register_protocol(self, cycle_id: str, derived: Dict[str, Any]) -> None:
         """gate_new_protocol（I1）——**幂等**：protocol (id,ver) 已存在（scope 已在 derive 核一致）则跳过，
@@ -374,32 +410,63 @@ class AttackStages:
                                     scope_spec_json=p["scope_json"], cycle_id=cycle_id,
                                     metric_defs=p["defs"], metrics=p["metrics"])
 
-    def _claim_baselines(self, ci: int, cycle_id: str, derived: Dict[str, Any]) -> Dict[str, tuple]:
-        """逐目标 gate_claim_baseline（I5 占坑）——**本 cycle 已占则复用**（崩溃重放：我们上次已 claim →
-        canonical_key 被自己占，gate 会拒 → 须复用既有 ids）。canonical_key 冲突已在 _derive_plan 前置拦下，
-        故本段正常不会因占坑失败；万一 gate 仍拒（如未预见约束），**回滚本次已占的孤儿 baseline**（DELETE，
-        无 build_target 引用、状态仍 planned）——免多目标 plan 半途失败留孤儿毒化 canonical_key（内审 SHOULD）。"""
+    def _claim_targets(self, ci: int, cycle_id: str, derived: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """逐目标占坑（I5）——build 走 gate_claim_baseline（占 canonical_key）；**exec 走 gate_claim_variant**
+        （既有 legal baseline 下占 variant_key，**gate 自建 exec build_target**）。**本 cycle 已占则复用**
+        （崩溃重放：canonical_key/variant_key 被自己占，gate 会拒 → 复用既有 ids）。冲突已在 _derive_plan
+        前置拦下，故正常不半途失败；万一 gate 仍拒，**回滚本次已占的孤儿**（DELETE planned 无引用者，释放键）。
+        返回 {tk: {kind, baseline_id, variant_id, build_target_id[exec 有、build 为 None，终局 INSERT]}}。"""
         d = self.state.daemon
-        claims: Dict[str, tuple] = {}
-        fresh: List[int] = []                                # 本调用新占的 baseline_id（回滚用）
+        qi = int(self.state.cycle(cycle_id).question_id[1:])   # exec 目标绑本轮活跃问题（gate_claim_variant 入参）
+        claims: Dict[str, Dict[str, Any]] = {}
+        fresh_bl: List[int] = []                             # 本调用新占的 baseline_id（build 回滚用）
+        fresh_bt: List[int] = []                             # 本调用新建的 exec build_target（回滚用，连带 variant）
         try:
             for dt in derived["targets"]:
-                ck, slug = dt["claim"].get("canonical_key"), dt["claim"].get("slug")
-                row = d.query_one("SELECT id, born_cycle, slug FROM baseline WHERE canonical_key=?", (ck,))
-                if row and row[1] == ci and row[2] == slug:  # 本 cycle 已占（重放）→ 复用 baseline+base variant
-                    vrow = d.query_one("SELECT id FROM variant WHERE baseline_id=? AND variant_key='base'", (row[0],))
-                    claims[dt["target_key"]] = (row[0], vrow[0])
-                else:
-                    r = self.gate.gate_claim_baseline(canonical_key=ck, slug=slug, cycle_id=cycle_id,
-                                                      identity_draft_md=dt["identity_md"])
-                    fresh.append(r["baseline_id"])
-                    claims[dt["target_key"]] = (r["baseline_id"], r["variant_id"])
+                tk, claim = dt["target_key"], dt["claim"]
+                if dt["kind"] == "build":
+                    ck, slug = claim["canonical_key"], claim["slug"]
+                    row = d.query_one("SELECT id, born_cycle, slug FROM baseline WHERE canonical_key=?", (ck,))
+                    if row and row[1] == ci and row[2] == slug:   # 本 cycle 已占（重放）→ 复用 baseline+base variant
+                        vrow = d.query_one("SELECT id FROM variant WHERE baseline_id=? AND variant_key='base'", (row[0],))
+                        claims[tk] = {"kind": "build", "baseline_id": row[0], "variant_id": vrow[0], "build_target_id": None}
+                    else:
+                        r = self.gate.gate_claim_baseline(canonical_key=ck, slug=slug, cycle_id=cycle_id,
+                                                          identity_draft_md=dt["identity_md"])
+                        fresh_bl.append(r["baseline_id"])
+                        claims[tk] = {"kind": "build", "baseline_id": r["baseline_id"],
+                                      "variant_id": r["variant_id"], "build_target_id": None}
+                else:   # exec：gate_claim_variant 自建 exec build_target
+                    bid = d.query_one("SELECT id FROM baseline WHERE canonical_key=?", (claim["baseline_ref"],))[0]
+                    vkey = claim["variant_key"]
+                    # 本 cycle **未终局**自占（重放）：pending+plan_ref NULL 的 exec bt → 复用。claim 侧
+                    # **独立重核 config**（codex 第2轮硬化建议：不只依赖 derive 已核，复用分支自防身份漂移）。
+                    reuse = d.query_one(
+                        "SELECT v.id, bt.id FROM variant v JOIN build_target bt ON bt.variant_id=v.id "
+                        "WHERE v.baseline_id=? AND v.variant_key=? AND bt.cycle_id=? AND bt.target_kind='exec' "
+                        "AND bt.status='pending' AND bt.plan_ref IS NULL", (bid, vkey, ci))
+                    if reuse and not self._is_own_exec_reoccupy(reuse[0], ci, claim["config_json"]):
+                        raise _PlanReject(f"exec variant_key {vkey!r} 自占身份漂移（config 不符）——拒复用")
+                    if reuse:
+                        claims[tk] = {"kind": "exec", "baseline_id": bid, "variant_id": reuse[0], "build_target_id": reuse[1]}
+                    else:
+                        r = self.gate.gate_claim_variant(
+                            baseline_id=bid, variant_key=vkey, config_json=json.dumps(claim["config_json"], sort_keys=True),
+                            cycle_id=cycle_id, seq=dt["seq"], question_id=qi)
+                        fresh_bt.append(r["build_target_id"])
+                        claims[tk] = {"kind": "exec", "baseline_id": bid, "variant_id": r["variant_id"],
+                                      "build_target_id": r["build_target_id"]}
         except GateReject:
-            if fresh:                                        # 回滚孤儿（DELETE 释放 canonical_key；仅 planned 无引用者）
+            if fresh_bl or fresh_bt:                         # 回滚孤儿（DELETE planned 无引用者，释放键）
                 with d.transaction() as conn:
-                    for bid in fresh:
+                    for bid in fresh_bl:
                         conn.execute("DELETE FROM variant WHERE baseline_id=? AND status='planned'", (bid,))
                         conn.execute("DELETE FROM baseline WHERE id=? AND status='planned'", (bid,))
+                    for bt in fresh_bt:
+                        vrow = conn.execute("SELECT variant_id FROM build_target WHERE id=?", (bt,)).fetchone()
+                        conn.execute("DELETE FROM build_target WHERE id=? AND status='pending'", (bt,))
+                        if vrow:
+                            conn.execute("DELETE FROM variant WHERE id=? AND status='planned'", (vrow[0],))
             raise
         return claims
 
@@ -422,11 +489,17 @@ class AttackStages:
                 # compiler 的拒因回流（下一轮 plan pack「上轮被拒原因」）须按此锚定位本问题的拒记录
                 conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'orchestrator','plan_rejected',?)",
                              (ci, json.dumps({"reason": reject, "question_id": qi}, ensure_ascii=False)))
-            for dt, (bid, vid) in built:
-                bt = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,"
-                                  "baseline_id,variant_id,eval_key,plan_ref) VALUES (?,?,'build',?,'pending',?,?,?,?)",
-                                  (ci, qi, dt["seq"], bid, vid, dt["slice"]["eval_key"],
-                                   json.dumps(dt["slice"], ensure_ascii=False, sort_keys=True))).lastrowid
+            for dt, claim_info in built:
+                slice_json = json.dumps(dt["slice"], ensure_ascii=False, sort_keys=True)
+                if claim_info["build_target_id"] is None:       # build：终局 INSERT build_target
+                    bt = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,"
+                                      "baseline_id,variant_id,eval_key,plan_ref) VALUES (?,?,'build',?,'pending',?,?,?,?)",
+                                      (ci, qi, dt["seq"], claim_info["baseline_id"], claim_info["variant_id"],
+                                       dt["slice"]["eval_key"], slice_json)).lastrowid
+                else:                                        # exec：gate_claim_variant 已建 bt → 补 plan_ref/eval_key
+                    bt = claim_info["build_target_id"]
+                    conn.execute("UPDATE build_target SET eval_key=?, plan_ref=? WHERE id=?",
+                                 (dt["slice"]["eval_key"], slice_json, bt))
                 for (mid, mver) in dt["required"]:
                     conn.execute("INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) "
                                  "VALUES (?,?,?)", (bt, mid, mver))
@@ -434,13 +507,28 @@ class AttackStages:
 
     # ---------------------------------------------------------------- bundle --
     def _bundle_stage(self, cyc) -> None:
-        """bundle：逐目标（seq 序）两段提交；每目标进度从 DB 状态结构性续。全部终态后推 status='bundle'。"""
+        """bundle：逐目标（seq 序）两段提交；每目标进度从 DB 状态结构性续。全部终态后推 status='bundle'。
+        **进场先收敛未终局 exec 孤儿**（codex SHOULD）：exec 的 build_target 由 gate_claim_variant 先建
+        （plan_ref=NULL），终局事务补 plan_ref——正常全部已补，且崩溃重放靠自占复用/回滚兜底。万一有 pending
+        +plan_ref NULL 的孤儿逃逸到此（否则 _slice 的 json.loads(None) 裸崩、且孤儿永占 variant_key 毒化后续
+        轮），**显式清理**（DELETE bt+其 planned variant，释放 variant_key）+ 记 decision——不静默过滤。"""
         ci = _cnum(cyc.cycle_id)
-        rows = self.state.daemon.query(
-            "SELECT id FROM build_target WHERE cycle_id=? ORDER BY seq", (ci,))
+        d = self.state.daemon
+        orphans = d.query("SELECT id, variant_id FROM build_target WHERE cycle_id=? AND target_kind='exec' "
+                          "AND status='pending' AND plan_ref IS NULL", (ci,))
+        if orphans:
+            with d.transaction() as conn:
+                for (obt, ovar) in orphans:
+                    conn.execute("DELETE FROM build_target WHERE id=?", (obt,))
+                    conn.execute("DELETE FROM variant WHERE id=? AND status='planned'", (ovar,))
+                conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'orchestrator','orphan_exec_cleanup',?)",
+                             (ci, json.dumps({"cleaned": [o[0] for o in orphans],
+                                              "reason": "未终局 exec 占坑（plan_ref NULL）进 bundle——清理释放 variant_key"},
+                                             ensure_ascii=False)))
+        rows = d.query("SELECT id FROM build_target WHERE cycle_id=? AND plan_ref IS NOT NULL ORDER BY seq", (ci,))
         for (bt_id,) in rows:
             self._drive_target(cyc, bt_id)
-        with self.state.daemon.transaction() as conn:
+        with d.transaction() as conn:
             conn.execute("UPDATE cycle SET status='bundle' WHERE id=?", (ci,))
 
     def _slice(self, bt_id: int) -> Dict[str, Any]:
@@ -484,8 +572,8 @@ class AttackStages:
         if self.schemas is not None:
             MF.validate_manifest(self.schemas, manifest)
         MF.cross_check(manifest, slice_)          # 防「manifest 自立目标/换协议/改配置」
-        if manifest["target_ref"]["target_kind"] != "build":
-            raise MF.ManifestError(f"CP8.2 bundle 只驱动 build 目标（exec/eval=CP8.6）：{manifest['target_ref']['target_kind']}")
+        if manifest["target_ref"]["target_kind"] not in ("build", "exec"):
+            raise MF.ManifestError(f"bundle 只驱动 build/exec 目标（eval 后续接线）：{manifest['target_ref']['target_kind']}")
 
     def _drive_target(self, cyc, bt_id: int) -> None:
         """单目标推进（可重入）：按当前状态从断点续。执行命令由 manifest 承载（步⑧）。
@@ -555,7 +643,8 @@ class AttackStages:
         if run_row and run_row[1] == "success":
             rid = run_row[0]
         else:
-            rid = g.gate_start_run(build_target_id=bt_id, cycle_id=ci, variant_id=vid, kind="build",
+            rid = g.gate_start_run(build_target_id=bt_id, cycle_id=ci, variant_id=vid,
+                                   kind=slice_["target_kind"],   # exec 目标→run.kind='exec'（trg_run_target_consistent）
                                    env_hash=env_hash)
             r = MF.run_manifest_command(manifest, "train", staging_dir=str(staging / f"run{rid}"),
                                         log_name="train.log", src_dir=src_dir, work_root=self.work, policy=self.policy)
@@ -640,12 +729,18 @@ class AttackStages:
                 "SELECT json_extract(payload_json,'$.subject_hash') FROM decision WHERE actor='judge' "
                 "AND type='bundle_result_review' AND json_extract(payload_json,'$.build_target_id')=? "
                 "ORDER BY id DESC LIMIT 1", (bt_id,))[0]
-            # 终版身份 = bundle 产的 identity.md 全文（替换 plan 期占位草稿）；复现命令 = manifest.repro_cmd_md
-            identity_doc = (src_dir / MF.IDENTITY_FILE).read_text(encoding="utf-8")
-            self.gate.gate_register_baseline(
-                baseline_id=bid, variant_id=vid, build_target_id=bt_id, evaluation_id=eid,
-                cycle_id=ci, current_subject_hash=res_sh2,
-                identity_doc=identity_doc, repro_cmd=manifest["repro_cmd_md"], run_id=rid)
+            if slice_["target_kind"] == "exec":
+                # exec：只把本变体入池（baseline 已 legal，身份不动）——register_variant（非 register_baseline）
+                self.gate.gate_register_variant(
+                    variant_id=vid, build_target_id=bt_id, evaluation_id=eid,
+                    cycle_id=ci, current_subject_hash=res_sh2, run_id=rid)
+            else:
+                # build：终版身份 = bundle 产的 identity.md 全文（替换 plan 期占位草稿）；复现 = manifest.repro_cmd_md
+                identity_doc = (src_dir / MF.IDENTITY_FILE).read_text(encoding="utf-8")
+                self.gate.gate_register_baseline(
+                    baseline_id=bid, variant_id=vid, build_target_id=bt_id, evaluation_id=eid,
+                    cycle_id=ci, current_subject_hash=res_sh2,
+                    identity_doc=identity_doc, repro_cmd=manifest["repro_cmd_md"], run_id=rid)
         if d.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0] not in _TERMINAL_TARGET:
             self.gate.gate_finish_build_target(build_target_id=bt_id, status="complete")
 
