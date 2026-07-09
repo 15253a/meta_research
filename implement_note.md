@@ -4,8 +4,13 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-09 ｜ 位置：**步⑧（M7）建造面全完成**（空闲；剩余=CP8.6b 独立检查点 + 运维执行）
-- 检查点状态：空闲。**「系统完整走完整个流程 + 正式直接可用」达成**——测试基线 **623 绿**。
+- 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.8**（部署首跑发现的 reasoning selection 楔死 bug 修复）
+- 检查点状态：构建+自验完成（625 测绿，+2）。用户要求把系统部署到 fixed_and_test_factory 并真跑验证——
+  真 Codex 首跑 5 轮成功（3 baseline legal + 真测量 0.97–0.99）后 c6 reasoning 楔死（Codex 选 attack 已达
+  visit 上限的题→persist_selection 未捕获 ValueError→持久化 reasoning 重启确定性重崩=永久楔死）。已修
+  （persist_selection_safe: 非法 selection→decision+terminate 干净收尾；compiler 标注 attack 不可调度题；
+  advancer 路径不改[非 persist、rollback 契约]）+ 2 回归。内审（Opus）+ 部署复跑（second_run，8 轮）并行中。
+  **注：无 web 组件**（系统是 CLI orchestrator，用户「查看 web」实为看系统能否跑）。
 
 ## 已达成（用户 2026-07-09 两道指令收口）
 ① 补齐 plan 契约缺口、能完整走完整个流程；② 最后是正式直接可用系统。→ **步⑧（M7）CP8.1–8.7 全落**：

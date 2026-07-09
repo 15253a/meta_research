@@ -47,7 +47,7 @@ from .gate_exec import ExecGate
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
 from .ids import cnum as _cnum
-from .interfaces import Selection
+from .interfaces import InvalidSelectionError, Selection
 from .phase_commit import check_or_record
 
 _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
@@ -72,6 +72,35 @@ class _BundleReject(Exception):
 def _canon_hash(obj: Any) -> str:
     return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def persist_selection_safe(state, cycle_id: str, sel: Dict[str, Any]) -> None:
+    """持久化 reasoning 的下一步 selection——**Codex 选了不可调度的 (question, intent) 不楔死**（步⑧ CP8.8）。
+
+    真实发现（部署首跑）：Codex 反复 attack 同一问题，visit 达 question_guard.max_inconclusive_per_question
+    后该题对 attack 不可调度，但 Codex 仍选 `next=该题, intent=attack` → persist_selection 抛 ValueError →
+    未捕获打死驱动循环；且 reasoning 产物已持久化（persist-then-consume），重启确定性重崩 = **永久楔死**。
+
+    修法：任何**非法/不可调度**的 Codex selection（不可调度题 / 悬挂 id / 缺 intent / scores 引用不存在
+    …均属 Codex 产物问题，非编排器 bug）→ 记 decision(selection_invalid) + 改持久 **terminate** 干净收尾
+    （route 停机，durable；对齐 plan/bundle 的「Codex 产物站不住 → 业务收尾不楔死」全自动纪律）。
+    编排器不代 Codex 重选题（那是研究决策，违「编排器从不推理」）；停机后运维/后续可续。
+    **只兜 InvalidSelectionError**（persist_selection 判定的「Codex 路由产物非法」专用异常，codex SHOULD）：
+    编排器内部状态/schema/DB 错误仍抛原生异常 fail loud，不被误吞成正常停机。缺 next_intent（Codex 未产
+    该键）也归此类。"""
+    try:
+        if "next_intent" not in sel:
+            raise InvalidSelectionError("selection 缺 next_intent（Codex 产物不完整）")
+        state.persist_selection(cycle_id, Selection(
+            next_question_id=sel.get("next_question_id"), next_intent=sel["next_intent"],
+            scores=sel.get("scores", [])))
+    except InvalidSelectionError as e:
+        state.daemon.conn.execute(          # atomic 内：daemon.conn == 外层事务连接（单写，随 atomic 提交/回滚）
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'orchestrator','selection_invalid',?)",
+            (_cnum(cycle_id), json.dumps({"reason": str(e), "requested": {
+                "next_question_id": sel.get("next_question_id"), "next_intent": sel.get("next_intent")}},
+                ensure_ascii=False)))
+        state.persist_selection(cycle_id, Selection(next_question_id=None, next_intent="terminate", scores=[]))
 
 
 def _synth_content_md(c: Dict[str, Any]) -> str:
@@ -875,7 +904,5 @@ class AttackStages:
                 # 「阶段失败=轮正常收尾」口径，对齐 M0 driver；训练/评估失败路径由此收干净）
                 self.state.mark_inconclusive(cyc.question_id)
             self.state.apply_tree_ops(cyc.cycle_id, files.get("tree_ops.json", {"ops": []}).get("ops", []))
-            self.state.persist_selection(cyc.cycle_id, Selection(
-                next_question_id=sel.get("next_question_id"), next_intent=sel["next_intent"],
-                scores=sel.get("scores", [])))
+            persist_selection_safe(self.state, cyc.cycle_id, sel)
             self.state.mark_cycle_done(cyc.cycle_id)

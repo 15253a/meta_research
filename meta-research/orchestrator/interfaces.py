@@ -307,6 +307,14 @@ class PhaseCommitStore(Protocol):
                         target_id: Optional[str], artifact_hash: str) -> Literal["new", "duplicate", "conflict"]: ...
 
 
+class InvalidSelectionError(ValueError):
+    """persist_selection 判定 Codex 的 selection 产物**站不住**（不可调度题 / 悬挂 id / 缺 intent /
+    scores 引用不存在 / terminate 时带 next 等）——语义 = 「Codex 路由产物非法」，与编排器内部状态/
+    schema/DB 错误区分开（后者仍抛原生异常 fail loud）。attack 轮的 persist_selection_safe 只兜本类，
+    改持久 terminate 干净收尾（步⑧ CP8.8，codex SHOULD：专用异常防未来内部 KeyError 被误吞成正常停机）。
+    子类 ValueError：既有 `pytest.raises(ValueError)`（advancer rollback 契约测）仍匹配。"""
+
+
 class StageBlockedOnResources(RuntimeError):
     """阶段发出 resource_request sidecar 且请求单已落（步⑧ CP8.5）：本轮**不能**继续（工人声明缺文件
     无法工作），也**不是**失败——run_cycles 捕获后干净停止推进（在途轮保持游标），precheck 的全局等待

@@ -223,8 +223,16 @@ class SqliteCompiler:
             "WHERE goal_id=? AND status IN ('open','inconclusive') AND id NOT IN "
             "(SELECT question_id FROM question_dep WHERE status='pending') ORDER BY id", (goal_id,)).fetchall()
         sources.append("db:schedulable")
-        lines = [f"- q{i}（{s}，visit={v}，score={sc}，est_cost={ec}）: {t}"
-                 for i, t, s, v, sc, ec in rows]
+        # 标注 attack 可调度性（步⑧ CP8.8）：inconclusive 且 visit≥max_inconclusive_per_question 的题对 attack
+        # 不可调度（question_guard，§4.2.1），**只可 decompose / propose_prune**——不告知 Codex 会让它选
+        # 该题 attack → persist_selection 拒 → 干净收尾但白停一轮（部署首跑实录）。明示引导 Codex 选合法路由。
+        max_inc = self.policy["question_guard"]["max_inconclusive_per_question"]
+        lines = []
+        for i, t, s, v, sc, ec in rows:
+            note = ""
+            if s == "inconclusive" and v >= max_inc:
+                note = f"，**attack 已达上限（visit≥{max_inc}）：本题只可 decompose 或 propose_prune、不可 attack**"
+            lines.append(f"- q{i}（{s}，visit={v}，score={sc}，est_cost={ec}{note}）: {t}")
         if aq is not None:   # 本轮 active Qn 也列入（收尾后重新可选）
             a = self.conn.execute("SELECT text, status, visit_count FROM question WHERE id=?", (aq,)).fetchone()
             if a and a[1] == "active":

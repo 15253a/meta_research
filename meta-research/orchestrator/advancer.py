@@ -246,6 +246,10 @@ class SqliteAdvancer:
                 raise ValueError("reasoning 产物缺 selection.json（reasoning 必产；生产路径由 provider 上游 schema 校验保证）")
             sel = files["selection.json"]
             self.state.apply_tree_ops(cyc.cycle_id, ops)
+            # reasoning-only 轮（bootstrap/decompose）**不** persist-then-consume（不同 attack 轮）：非法
+            # selection 抛 ValueError → 整 atomic 回滚（create_root 等一并复原，投影不漂移）→ 重启重调
+            # provider（非确定，可复原）——这是本路径的既定恢复契约（test_advance_*_rollback 锁）。graceful
+            # terminate 只用于 attack 轮的**持久化** reasoning（那里非法 selection 会确定性重崩=真楔死，CP8.8）。
             self.state.persist_selection(cyc.cycle_id, Selection(
                 next_question_id=sel.get("next_question_id"),
                 next_intent=sel["next_intent"],
