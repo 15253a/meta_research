@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑨（M8）CP9.2**（人类控制台前端接入）。步①–⑧全完成（625 测绿；步⑧「正式直接
+- 进行中的步 / 检查点：**步⑨（M8）CP9.3**（入站闭环）。CP9.1 数据面 + CP9.2 前端接入真数据已落（642 测绿）。步①–⑧全完成（625 测绿；步⑧「正式直接
   可用」达成并在部署副本真 Codex 实跑验证——CP8.8 修复首跑发现的 reasoning selection 楔死 bug、复跑越过、
   τ 干净自停）。步⑨=把 `reference/人类控制台原型-v2.html` 接上真系统（用户 2026-07-09 明确要真接入控制台
   可视化，纠正 CP8.8 期「系统无 web 组件」结论）——CP9.1 控制台数据面已落（console_server.py 独立只读进程 +
@@ -312,8 +312,10 @@
     containment 防逃逸/symlink）+ /api/message spool 写（不碰 DB，connector 固定 console）+ 静态服务；
     组装/读失败泛化报不泄细节；高基数表 LIMIT。—— commit `<pending>`（build_log 0042；内审 APPROVE +
     codex 两轮；test_console_server 13 测：单写零 DB 写实证 + 路径逃逸/symlink + 撕裂尾行 + 并发 seq）。
-  - [ ] CP9.2 控制台前端接入：`views/console/index.html` 由原型 v2 派生（换数据源手术，渲染保真）+
-    node HEADLESS 渲染冒烟 + 前后端形状契约测试。
+  - [x] CP9.2 控制台前端接入：`views/console/index.html` 由原型 v2 派生（换数据源 /api/db + **去 mock 渲染码**：
+    原型把 mock 焊进渲染码，全改读真 payload；adaptPayload/buildLive/applyLive/clampSelections/streamSyncReal/
+    refreshDB/fsRefresh；删 6 魔法轮号面板+2 死函数；空/稀疏/null 真库全守卫）+ node HEADLESS 遍历全 9 标签页冒烟
+    (seeded+空库+null-cap) + 前后端形状契约测试。→ commit `302261a`（build_log 0043；codex 第2轮 APPROVE；642 测绿）。
   - [ ] CP9.3 入站闭环：run 进程 precheck 边界 ingest console_inbox.jsonl（ingest→classify→directive/query→
     Mediator 应答）+ 控制台 pause/resume/query 端到端测试。
   - [ ] CP9.4 端到端验收：真 Codex 跑 + 控制台并行真查看实测 + README 控制台节 + 步级验证收口。

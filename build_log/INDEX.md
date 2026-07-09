@@ -6,6 +6,7 @@
 
 ---
 
+- [0043](0043-cp92-console-frontend-realdata.md) — CP9.2 人类控制台前端接入真数据（**去 mock 渲染码**：`views/console/index.html` 由原型派生，换数据源 /api/db——adaptPayload[表平铺+status_card 拍平+budget/fs/directive/ledger 归一] + buildLive/applyLive[真 payload.live 覆盖 SCENARIOS] + streamSyncReal[seen-set 真事件流] + refreshDB[in-flight 保护] + fsRefresh[真文件树 DB.fs]；原型把 mock 焊进渲染码[假 goal v2/cycle 19/telemetry/排行/魔法轮号剧情]全改读真 payload、删 6 面板+2 死函数；空/稀疏/null 真库全守卫；单写纪律不破[仅 GET/POST，零 DB 写]）· commit `302261a` · 验证: 通过（pytest 642/642 + node 冒烟 seeded/空库/null-cap 全 9 标签页 render 不抛；内审抓 budget 崩已修，codex 第1轮 2 BLOCKER[r2 硬编码/fs 树未接]+6 SHOULD+1 NIT 全改，第2轮 APPROVE）
 - [0042](0042-cp91-console-data-plane.md) — CP9.1 人类控制台数据面（**步⑨ M8 开工**：console_server.py 独立只读进程——/api/db 真表动态列投影+派生[status_card/live/notification/policy/FS] / /api/file 白名单虚拟根+containment / /api/message spool 入站；**单写纪律铁律不破**[mode=ro+零 DB 写]）· commit `295f84d` · 验证: 通过（pytest 638/638；内审 APPROVE，codex 两轮[第1轮抓出并还原误带的 CP8.8 回滚]第2轮 APPROVE）
 - [0041](0041-cp88-reasoning-selection-no-wedge.md) — CP8.8 reasoning selection 不可调度不楔死（**部署真跑发现的真实楔死修复**：Codex 选 visit 达上限的题 attack→InvalidSelectionError→decision+terminate 干净收尾；部署复跑 7 轮越过首跑 c6 楔死点、τ 干净自停、selection_invalid 活证据）· commit `5e7108d` · 验证: 通过（pytest 625/625 + 部署系统真跑 exit 0 零 traceback；内审+codex 双 APPROVE）
 - [0040](0040-cp87-operating-manual-step-verification.md) — CP8.7 运维操作手册（README 重写）+ 步⑧步级验证收口（全链 E2E + 真 Codex 冒烟 + 冻结锁三条留证）· commit `d627a39` · 验证: 通过（pytest 623/623；内审逐条实证事实一致[1 BLOCKER budget 停因休眠 caveat 已修]，codex APPROVE）—— **步⑧「正式直接可用」达成**

@@ -4,36 +4,29 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-09 ｜ 位置：**步⑨（M8）CP9.2**（人类控制台前端接入）
-- 检查点状态：CP9.1 已提交（295f84d + build_log 0042）。测试基线 **638 绿**（CP8.8 基线 625 + console 13）。
+- 更新：2026-07-09 ｜ 位置：**步⑨（M8）CP9.3**（入站闭环）——**空闲/待开工**
+- 检查点状态：CP9.2 已提交（**302261a** + build_log 0043）。CP9.1（295f84d + 0042）。测试 **642 绿**（638+前端4）。
+
+> CP9.2 收口：外审第1轮 codex REQUEST_CHANGES（2 BLOCKER[r2 硬编码 / fs 树未接] + 6 SHOULD + 1 NIT）→全改；
+> 第2轮 **APPROVE**（余 2 SHOULD[refreshDB 跳拍防并发 / fsOpen 保留 demo 回退] + 2 NIT[session_max=null 显关闭 /
+> clampSelections 用 max id] 均已补齐复验）。前端只读观测面全真化 + 稀疏/空/null 守卫，单写纪律不破。
 
 ## 正在做什么
-**步⑨（M8）人类控制台接入**（用户 2026-07-09：人类控制台原型没接入系统，最终要系统在控制台上查看；
-纠正 CP8.8 期「系统无 web 组件」结论）。原型 = `reference/人类控制台原型-v2.html`。
-- CP9.1（295f84d）**控制台数据面已落**：`orchestrator/console_server.py` 独立只读进程——/api/db 真表动态列
-  投影 + 派生对象（status_card/live/notification/policy/FS）/ /api/file 白名单虚拟根读 / /api/message spool
-  入站。**单写纪律铁律不破**（mode=ro 读 + 零 DB 写；入站只写 <work>/state/console_inbox.jsonl）。
+**空闲 / CP9.3 待开工。** 步⑨（M8）人类控制台接入（用户 2026-07-09：要系统在控制台上真查看；纠正 CP8.8
+期「系统无 web 组件」结论）。原型 = `reference/人类控制台原型-v2.html`。已落：CP9.1 数据面（console_server.py
+独立只读 /api/db + spool 入站）、CP9.2 前端接入真数据（views/console/index.html 全真化 + 去 mock 渲染码）。
+剩 CP9.3 入站闭环 + CP9.4 端到端验收。
 
-## 下一步动作（按序）—— CP9.2 前端接入
-1. `views/console/index.html` 由 `reference/人类控制台原型-v2.html` 派生（reference 原件不动，拷到 views/
-   console/ 再改）：
-   - 剥 mock：`const DB = {…}` 常量 → loader `fetch('/api/db')` 轮询（如每 3s）填充；`SCENARIOS` 假 live 条
-     → 真 payload.live；`FILE_CONTENT` → `fetch('/api/file?p=…')`；假事件 ticker（setInterval streamTick）
-     → 真轮询 payload.notification 增量。
-   - **形状适配层**：server 是 `payload.tables.<表>`（数组）+ 派生平铺顶层；原型渲染码访问顶层 `DB.<表>` +
-     `DB.status_card`/`DB.budget`/`DB.runner_call_live` 等。写一个 `adaptPayload(p)→DB` 把 server 形状映射成
-     原型 DB 形状（tables 摊平到顶层 + 字段名对齐：decision.summary←payload_json 截断 / directive.payload←
-     payload_json / baseline.tags←baseline_tag join / execution_log.owner←run_id?attempt / live.runner_call→
-     runner_call_live / budget←status_card.budget 或 policy）。渲染码尽量不动（保真）。
-   - cmdin/narrin 提交 → `POST /api/message {text}`。
-2. **验证**：原型自带 HEADLESS node 冒烟（`const HEADLESS=(typeof window==='undefined')`）——可用 node 加载
-   改后页 + 喂一份 assemble_db 真产的 payload，断言 adaptPayload + 关键渲染函数不炸（无 window 依赖的纯数据
-   路径）。前后端形状契约测试（test：assemble_db 产的键 ⊇ adaptPayload 消费的键）。
-3. 内审(Opus) → codex 外审(≤2轮) → 提交 → build_log 0043。
-4. CP9.3 入站闭环：run 进程 precheck 边界 ingest console_inbox.jsonl（读未消费行→InteractionIngest.inbound→
-   Console.handle_inbound 分类落 directive/message；query→Mediator.handle_query 应答；已消费行游标持久化，
-   幂等）。装配进 run.py（make_advancer_precheck 或独立 ingest 步）。pause/resume/query 端到端测试。
-5. CP9.4：真 Codex 跑 + console_server 并行 + 浏览器/HEADLESS 真查看实测 + README 控制台节 + 步级验证收口。
+## 下一步动作（按序）—— CP9.3 入站闭环
+1. run 进程 precheck 边界 ingest `<work>/state/console_inbox.jsonl`（console_server 的 /api/message 已把人工
+   入站写进该 spool，一行 JSON `{connector:console, raw_text, seq, idempotency_key}`，换行终止=committed）：
+   读未消费行（游标持久化、幂等）→ `InteractionIngest.inbound(connector, raw_text, idempotency_key, goal_id,
+   goal_ver)` → interaction_message；`Console.handle_inbound` 分类 → directive（落库）/ 回执；
+   query → `Mediator.handle_query(message_id)` 应答。（M5 入站链已存在，见下「关键上下文」。）
+2. 装配进 run.py（advancer precheck 或独立 ingest 步）；ingest 按 UNIQUE(connector,idempotency_key) 去重重放。
+3. pause/resume/query 端到端测试（控制台发命令 → run ingest → 生效/应答）。
+4. 内审(Opus) → codex 外审(≤2轮) → 提交 → build_log 0044。
+5. 之后 CP9.4：真 Codex 跑 + console_server 并行 + 浏览器/HEADLESS 真查看实测 + README 控制台节 + 步⑨步级验证收口。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **⚠ 开工先看 `git status`**（CP9.1 教训，build_log 0042 载）：工作区若带未提交改动（本次是一份误带的
@@ -52,4 +45,8 @@
   - 原型 DB 表字段清单（照真 DDL 画）可用 node 从原型脚本提取（见本 session 勘察）；server 用真列名投影。
 - M5 入站链（CP9.3 用）：InteractionIngest.inbound(connector,raw_text,idempotency_key,goal_id,goal_ver) →
   interaction_message；Console.handle_inbound 分类→directive/回执；Mediator.handle_query(message_id) 应答。
-- 测试基线 **638**。真 Codex 冒烟需代理 7890。
+- 测试基线 **642**（638 + 前端 4）。真 Codex 冒烟需代理 7890。
+- 控制台前端（CP9.2，build_log 0043）：`views/console/index.html` 已全真化；调试用 node 冒烟遍历全 9 标签页——
+  `python -c` 造 assemble_db payload（seeded/空库/null-cap）→ `node tests/console_smoke.js <页> <payload.json>`，
+  期望 `SMOKE_OK ... tabs=9`。去 mock 原则：**自动渲染面一律读真 payload**；mock DB/SCENARIOS/FILE_CONTENT/classify
+  仅离线 demo 回退（连线后 refreshDB/sendCmd 覆盖绕过）。原型原件 `reference/人类控制台原型-v2.html` 不动，diff 它=真决策面。
