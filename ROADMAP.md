@@ -15,12 +15,11 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑧（M7）建造面全部完成 + 部署验证过**（CP8.1–8.8，`8b4f59a`…`5e7108d`，
-  625 测绿）——**「正式直接可用」达成并在部署副本真 Codex 实跑验证**：CP8.7 交付后部署到
-  fixed_and_test_factory 真跑，首跑发现一处 reasoning selection 楔死 bug（测试未覆盖），CP8.8 修复并复跑
-  7 轮越过楔死点、τ 干净自停、零 traceback。系统一条命令真 Codex 全自动跑完整研究元循环（build+exec
-  target + 文件请求全等待环 + kill-9 恢复 + 人机控制 + 全自动不楔死），运维手册文档化，不解冻冻结件。
-  步①–⑧全完成。剩余=**CP8.6b**（eval/import/route dependency_wait，独立检查点，非阻塞）+ 运维执行/硬化
+- 进行中的步 / 检查点：**步⑨（M8）CP9.2**（人类控制台前端接入）。步①–⑧全完成（625 测绿；步⑧「正式直接
+  可用」达成并在部署副本真 Codex 实跑验证——CP8.8 修复首跑发现的 reasoning selection 楔死 bug、复跑越过、
+  τ 干净自停）。步⑨=把 `reference/人类控制台原型-v2.html` 接上真系统（用户 2026-07-09 明确要真接入控制台
+  可视化，纠正 CP8.8 期「系统无 web 组件」结论）——CP9.1 控制台数据面已落（console_server.py 独立只读进程 +
+  spool 入站，638 测绿）。剩余=CP9.2–9.4 + 存量 CP8.6b（eval/import/route，非阻塞）+ 运维执行/硬化
   （§7.4 数百轮真跑、双模式 A/B、成本记账接线、worktree 隔离）。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
@@ -286,3 +285,35 @@
   ②真 git worktree 隔离 + env lock 强校验（canary→硬化）；③**CP8.6b** = eval target（frozen schema
   create_evaluation 缺 variant 引用，需设计）+ import_defer/ImportWorker 装配 + route dependency_wait
   特化；④§7.4 T1/T2 数百轮真跑 + 双模式 A/B 实测 = 运维执行。
+
+### 步⑨（M8）人类控制台接入——系统在控制台上可查看/可交互
+
+- 来源：用户 2026-07-09「现在代码里好像没有接入控制台啊，人类控制台原型没有接入系统呀。最终目的是要
+  系统在人类控制台上查看」+「控制原型文件在 reference/人类控制台原型-v2.html，在 meta_research_buiding
+  文件夹里构建！这不是 bug，是架构问题」。**纠正 CP8.8 期「系统无 web 组件」的结论**——用户明确要真接入
+  控制台可视化（§4.6 的可视化载体）。原型 = `reference/人类控制台原型-v2.html`。
+- **接入方案（勘察结论）**：原型内嵌 mock `DB` 对象与真 DDL 表名一一对应（+派生键 status_card/live/
+  notification/policy/FS）——**保留原型渲染代码，换数据源**：
+  - **控制台服务 = 独立只读进程**（单写纪律：mode=ro 读库 + 只写入站 spool 文件，绝不写 DB）：
+    `orchestrator/console_server.py` 组装 `/api/db`（真表动态列投影 + status_card.json + live[游标/心跳=
+    transcript mtime 年龄/模式 running·idle·awaiting_user] + ledger_by_cycle + outbox 事件 + policy + 真 FS 树）
+    + `/api/file` 白名单读 + `/api/message` 写 spool + 静态服务控制台页。stdlib http.server，零新依赖。
+  - **前端 = 原型派生**（reference 原件不动）：`views/console/index.html` 剥 mock（DB 常量→loader 轮询
+    /api/db；假事件 ticker→真轮询；cmdin/narrin→POST /api/message）。server 形状=payload.tables.<表>+派生
+    平铺，前端 loader 做适配（原型访问顶层 DB.<表>）。原型自带 HEADLESS node 冒烟可自动化验证。
+  - **入站闭环走 M5 既有机制**：run 进程在 precheck 边界（既有 directive 消费点）ingest spool →
+    InteractionIngest → Console.handle_inbound（保守分类/回显确认）→ query 走 Mediator 应答（grounded）。
+- 验证方法（步级）：①系统真跑 + console_server 并行 → 浏览器看到**真实运行状态**随刷新（真 Codex 冒烟留证）；
+  ②控制台发 pause→系统停推进、resume→续跑、query→grounded 回复（端到端）；③测试基线全绿、单写纪律不破
+  （控制台进程零 DB 写）。
+- 检查点（模型切，边走边补）:
+  - [x] CP9.1 控制台数据面：`orchestrator/console_server.py`——只读组装 /api/db（真表动态列投影 +
+    status_card + live + notification + policy + FS 树）+ /api/file 白名单读（虚拟根显式映射 + resolve
+    containment 防逃逸/symlink）+ /api/message spool 写（不碰 DB，connector 固定 console）+ 静态服务；
+    组装/读失败泛化报不泄细节；高基数表 LIMIT。—— commit `<pending>`（build_log 0042；内审 APPROVE +
+    codex 两轮；test_console_server 13 测：单写零 DB 写实证 + 路径逃逸/symlink + 撕裂尾行 + 并发 seq）。
+  - [ ] CP9.2 控制台前端接入：`views/console/index.html` 由原型 v2 派生（换数据源手术，渲染保真）+
+    node HEADLESS 渲染冒烟 + 前后端形状契约测试。
+  - [ ] CP9.3 入站闭环：run 进程 precheck 边界 ingest console_inbox.jsonl（ingest→classify→directive/query→
+    Mediator 应答）+ 控制台 pause/resume/query 端到端测试。
+  - [ ] CP9.4 端到端验收：真 Codex 跑 + 控制台并行真查看实测 + README 控制台节 + 步级验证收口。
