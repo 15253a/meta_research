@@ -17,11 +17,13 @@ import yaml
 
 from orchestrator import database as db
 from orchestrator import obs_parser as OP
+from orchestrator import attack_stages as AS
 from orchestrator.advancer import SqliteAdvancer
 from orchestrator.attack_stages import AttackStages
 from orchestrator.compiler_sqlite import SqliteCompiler
 from orchestrator.gate_pool import PoolGate
-from orchestrator.gate_sqlite import SqliteGate, open_gate_read_conn
+from orchestrator.gate_sqlite import GateInvariantError, SqliteGate, open_gate_read_conn
+from orchestrator.ids import SQLITE_INT_MAX
 from orchestrator.manifest import canon_hash as manifest_canon
 from orchestrator.schemas import SchemaSet
 from orchestrator.statestore_sqlite import SQLiteStateStore
@@ -675,6 +677,63 @@ def test_eval_missing_required_metric_target_failed(tmp_path):
     daemon.conn.close()
 
 
+@pytest.mark.parametrize("eval_body", [
+    "print('metric_value: broken')",
+    "print('metric_value: 1@1=0.5'); print('metric_value: 1@1=0.6')",
+    "print('metric_value: 1@1=inf')",
+    "print('metric_value: 1@1=NaN')",
+    "print('metric_value: 1@1=1e999')",
+    f"print('metric_value: {SQLITE_INT_MAX + 1}@1=0.5')",
+    f"print('metric_value: {'9' * 5000}@1=0.5')",
+], ids=["malformed", "duplicate", "literal-inf", "literal-nan", "float-overflow",
+        "sqlite-id-overflow", "python-int-digit-limit"])
+def test_eval_metric_record_protocol_rejected_and_restart_safe(tmp_path, eval_body):
+    """CP11.1：eval 的保留 metric_value 记录只接受严格、唯一、有限的 `<id>@<ver>=<float>`。
+
+    畸形、重复和非有限值都应成为 target 的 protocol_violation 业务失败，不得抛裸 ValueError，也不得
+    让 inf/部分 metrics 进入 DB；reasoning 正常收尾后，全新实例复读同 work_root 也不会再次撞坏 log。
+    """
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w", eval_body=eval_body)
+    _bootstrap_attack(state)
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
+                           "terminate_reason_md": "评估测量包协议违规，安全停机"}}
+
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1
+    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == (
+        "failed", "protocol_violation")
+    assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM metric_result")[0] == 0       # 尤其 inf 不得入库
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    assert daemon.query_one("SELECT status,next_intent FROM cycle ORDER BY id DESC LIMIT 1")[:2] == (
+        "done", "terminate")
+    daemon.conn.close()
+
+    # 全新连接/组件 + 同 DB/work_root：坏 eval.log 尚在，但轮已持久收尾，不再确定性重崩。
+    d2, s2, c2, a2 = _mk_env(path, tmp_path / "w", eval_body=eval_body)
+    assert SqliteAdvancer(s2, c2, lambda c, p: None, attack=a2).run_cycles(max_cycles=4) == []
+    assert d2.query_one("SELECT count(*) FROM metric_result")[0] == 0
+    d2.conn.close()
+
+
+def test_metric_parser_sqlite_integer_boundaries_are_prechecked():
+    """max 可解；max+1/超长/前导零/NaN 均只抛可收敛的 protocol reject。"""
+    got = AttackStages._metrics_from_eval_log(
+        f"metric_value: {SQLITE_INT_MAX}@{SQLITE_INT_MAX}=1.25")
+    assert got == [{"metric_id": SQLITE_INT_MAX, "metric_ver": SQLITE_INT_MAX, "value": 1.25}]
+    for text in (
+            f"metric_value: {SQLITE_INT_MAX + 1}@1=1",
+            f"metric_value: {'9' * 5000}@1=1",
+            "metric_value: 01@1=1",
+            "metric_value: 1@1=NaN"):
+        with pytest.raises(AS._BundleReject) as ei:
+            AttackStages._metrics_from_eval_log(text)
+        assert ei.value.failure_kind == "protocol_violation"
+
+
 def test_statemachine_gatereject_still_fails_loud(tmp_path):
     """codex 第2轮 BLOCKER 回归（反面）：状态机类 GateReject（如 progress 非法转移）**不得**被吞成
     failed 终态——必须 fail loud 上抛（误终态化会掩埋恢复/篡改问题）。"""
@@ -880,6 +939,156 @@ def test_reasoning_selection_ineligible_question_no_wedge(tmp_path):
                              train_body="import sys; print('loss:1.0'); sys.exit(1)")
     assert SqliteAdvancer(s2, c2, lambda c, p: None, attack=a2).run_cycles(max_cycles=3) == []
     d2.conn.close()
+
+
+@pytest.mark.parametrize("bad_kind", ["tree_ops", "tree_ref_oversize", "answer_ref", "answer_ref_oversize"])
+def test_reasoning_semantic_reject_is_durable_terminal(tmp_path, bad_kind):
+    """CP11.1：schema 合法、语义非法的持久 reasoning 不得成为跨重启 poison pill。
+
+    覆盖 attack 轮非法 add_children（route 语义错）和悬挂 answer evidence 引用（gate 业务拒）；首次消费
+    统一落 reasoning_rejected + terminate，树批次无半写，全新实例面对仍在盘的 reasoning.json 干净停机。
+    """
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+
+    def bad_reasoning(cyc, pack):
+        files = {
+            "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
+                               "terminate_reason_md": "语义拒收后的安全停机"}}
+        if bad_kind == "tree_ops":
+            files["tree_ops.json"] = {"ops": [{
+                "op": "add_children", "parent_question_id": "q1",
+                "children": [{"local_key": "bad-child", "text": "attack 轮不得分解出的子题"}]}]}
+        elif bad_kind == "tree_ref_oversize":
+            files["tree_ops.json"] = {"ops": [{
+                "op": "spawn_question", "kind": "diagnosis",
+                "parent_question_id": "q" + "9" * 5000, "text": "越界父引用"}]}
+        else:
+            mrref = "mr999999" if bad_kind == "answer_ref" else "mr" + "9" * 5000
+            files["answer.json"] = {
+                "question_id": cyc.question_id, "verdict": "answered", "answer_md": "引用不存在的测量",
+                "evidence": [{"kind": "evaluation", "metric_result_id": mrref,
+                              "note_md": "悬挂引用应被拒"}]}
+        # 锁住回归前提：这两批并非 schema 错，而是消费时依赖 route/真 DB 才能发现的语义错误。
+        schemas = SchemaSet(SYSTEM_ROOT / "schemas")
+        for filename, payload in files.items():
+            schemas.validator_for_artifact(filename).validate(payload)
+        return files
+
+    attack.p["reasoning"] = bad_reasoning
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1
+    assert daemon.query_one("SELECT status,next_intent FROM cycle ORDER BY id DESC LIMIT 1")[:2] == (
+        "done", "terminate")
+    assert daemon.query_one("SELECT status,visit_count FROM question WHERE id=1")[:2] == ("inconclusive", 1)
+    assert daemon.query_one("SELECT count(*) FROM question")[0] == 1             # tree_ops 批次无半写
+    assert daemon.query_one("SELECT count(*) FROM answer")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='reasoning_rejected'")[0] == 1
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE type='reasoning_rejected'")[0])
+    assert payload["fallback_next_intent"] == "terminate" and len(payload["artifact_hash"]) == 64
+    assert (tmp_path / "w" / f"c{int(ids[0][1:])}" / "reasoning.json").exists()
+    daemon.conn.close()
+
+    # 全新实例会从 durable terminate 停住；若终态未落，仍在盘的同一坏产物会在这里复现原生永久重崩。
+    d2, s2, c2, a2 = _mk_env(path, tmp_path / "w")
+    assert SqliteAdvancer(s2, c2, lambda c, p: None, attack=a2).run_cycles(max_cycles=4) == []
+    assert d2.query_one("SELECT count(*) FROM decision WHERE type='reasoning_rejected'")[0] == 1
+    d2.conn.close()
+
+
+def test_reasoning_oversize_selection_score_is_terminal_without_partial_score_write(tmp_path):
+    """selection 的越界 next/score ref 转 selection_invalid；整批 score 预检，不留「前一项已写」半批。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
+                                              train_body="import sys; print('loss:1.0'); sys.exit(1)")
+    _bootstrap_attack(state)
+    huge = "q" + "9" * 5000
+    attack.p["reasoning"] = lambda cyc, pack: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate",
+                           "terminate_reason_md": "坏 score ref 应收敛",
+                           "scores": [
+                               {"question_id": "q1", "score": 0.8, "est_cost": 1.0},
+                               {"question_id": huge, "score": 0.7, "est_cost": 1.0}]}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1
+    assert daemon.query_one("SELECT status,next_intent FROM cycle ORDER BY id DESC LIMIT 1")[:2] == (
+        "done", "terminate")
+    assert daemon.query_one("SELECT score,est_cost FROM question WHERE id=1") == (None, None)
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='selection_invalid'")[0] == 1
+    daemon.conn.close()
+
+    d2, s2, c2, a2 = _mk_env(path, tmp_path / "w",
+                             train_body="import sys; print('loss:1.0'); sys.exit(1)")
+    assert SqliteAdvancer(s2, c2, lambda c, p: None, attack=a2).run_cycles(max_cycles=4) == []
+    assert d2.query_one("SELECT count(*) FROM decision WHERE type='selection_invalid'")[0] == 1
+    d2.conn.close()
+
+
+def test_tree_ops_late_reject_rolls_back_rows_and_local_projection(tmp_path):
+    """首 op 已可写入、第二 op 越界时，SQLite 与 local_key 进程内投影必须一起回滚。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, _, _ = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    cyc = state.open_or_resume_cycle()
+    state.set_route(cyc.cycle_id, "attack")
+    state.activate_question("q1")
+    with pytest.raises(ValueError, match="SQLite INTEGER"):
+        state.apply_tree_ops(cyc.cycle_id, [
+            {"op": "spawn_question", "kind": "diagnosis", "parent_question_id": "q1",
+             "local_key": "would-have-existed", "text": "先写的合法诊断题"},
+            {"op": "spawn_question", "kind": "diagnosis", "parent_question_id": "q" + "9" * 5000,
+             "local_key": "bad", "text": "后续越界引用"}])
+    assert daemon.query_one("SELECT count(*) FROM question")[0] == 1
+    assert "would-have-existed" not in state._local_maps.get(cyc.cycle_id, {})
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='spawn_question'")[0] == 0
+    daemon.conn.close()
+
+
+def test_valid_answer_is_monotone_when_later_tree_batch_rejected(tmp_path):
+    """reasoning 是明确两段：I3 已接纳 answer 不回滚；后续非法 tree 批回滚并安全停机。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    base_reasoning = attack.p["reasoning"]
+
+    def answer_then_bad_tree(cyc, pack):
+        files = base_reasoning(cyc, pack)
+        files["tree_ops.json"] = {"ops": [{
+            "op": "add_children", "parent_question_id": cyc.question_id,
+            "children": [{"local_key": "must-rollback", "text": "attack 轮非法分解"}]}]}
+        return files
+
+    attack.p["reasoning"] = answer_then_bad_tree
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1
+    assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "answered"
+    assert daemon.query_one("SELECT count(*) FROM answer WHERE question_id=1")[0] == 1
+    assert daemon.query_one("SELECT count(*) FROM evidence WHERE question_id=1")[0] == 1
+    assert daemon.query_one("SELECT count(*) FROM question")[0] == 1
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='reasoning_rejected'")[0] == 1
+    assert daemon.query_one("SELECT status,next_intent FROM cycle ORDER BY id DESC LIMIT 1")[:2] == (
+        "done", "terminate")
+    daemon.conn.close()
+
+
+def test_reasoning_gate_invariant_corruption_still_fails_loud(tmp_path):
+    """Gate 内部/状态损毁不得被 reasoning 洗成 reasoning_rejected 终态。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+
+    def corrupt_gate(**kwargs):
+        raise GateInvariantError("SIM gate invariant corruption")
+
+    attack.close_gate.gate_close_question = corrupt_gate
+    with pytest.raises(GateInvariantError, match="invariant corruption"):
+        SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='reasoning_rejected'")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM answer")[0] == 0
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "bundle"
+    daemon.conn.close()
 
 
 def test_open_set_annotates_attack_ineligible(tmp_path):

@@ -22,6 +22,7 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
+from .ids import decode_optional
 from .interfaces import Artifact, ValidationResult
 from .schemas import ARTIFACT_SCHEMA_MAP, SchemaSet
 from .writedaemon import WriteDaemon
@@ -80,12 +81,25 @@ def open_gate_read_conn(path: str) -> sqlite3.Connection:
 
 
 def _num(s: Any, prefix: str) -> Optional[int]:
-    """解码前缀 id（mr/q/d/ev…）→ int；前缀/格式不符返回 None（供引用完整性给干净拒因）。"""
-    return int(s[len(prefix):]) if isinstance(s, str) and s.startswith(prefix) and s[len(prefix):].isdigit() else None
+    """解码前缀 id（mr/q/d/ev…）→ SQLite 正整数；任何格式/越界均返回 None。"""
+    return decode_optional(s, prefix)
 
 
 class GateReject(Exception):
     """业务门禁拒绝（记 DECISION(actor=gate,type=reject)，§4.1.1）。"""
+
+
+class GateInvariantError(RuntimeError):
+    """Gate 写路径命中非预期 DB 约束：视为实现/状态损毁，不得洗成外部产物业务拒绝。"""
+
+
+# 这些 RAISE(ABORT) 是 Gate 所有的 I3 最终焊死层：即使前置给出的可行动拒因漏了
+# TOCTOU/跨版细节，仍属 answer/evidence 业务不成立。其他 IntegrityError（FK/CHECK/未知触发器）
+# 说明 Gate 自身写入形状或 DB 状态异常，必须 GateInvariantError fail loud。
+_EXPECTED_I3_INTEGRITY_MARKERS = (
+    "I3:", "answer 的 goal 版本", "evidence question_id", "evidence 的 goal 版本",
+    "evaluation 证据", "evidence.evaluation_attempt_id", "child_answer", "human 证据",
+)
 
 
 class SqliteGate:
@@ -187,7 +201,11 @@ class SqliteGate:
                                  "AND depends_on_question_id=?", (qi,))
                 # gate_err 非空 → 不写、空事务照常提交（无半写），出块后 _reject
         except sqlite3.IntegrityError as e:
-            gate_err = f"DB 不变量拒绝: {e}"
+            detail = str(e)
+            if any(marker in detail for marker in _EXPECTED_I3_INTEGRITY_MARKERS):
+                gate_err = f"DB 不变量拒绝: {e}"
+            else:
+                raise GateInvariantError(f"gate_close_question 命中非预期 DB 约束: {e}") from e
         if gate_err is not None:
             self._reject(cycle_id, qi, gate_err, question_id_raw=question_id)   # 事务已（空）提交/回滚，_reject 另开短事务记 DECISION
         return f"a{aid}"

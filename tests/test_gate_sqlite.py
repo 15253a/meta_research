@@ -14,8 +14,8 @@ import pytest
 
 import conftest
 from orchestrator import database as db
-from orchestrator.gate_sqlite import (GATE_DENY_TABLES, GATE_INPUT_VIEW_NAMES, GateReject,
-                                       SqliteGate, open_gate_read_conn)
+from orchestrator.gate_sqlite import (GATE_DENY_TABLES, GATE_INPUT_VIEW_NAMES, GateInvariantError,
+                                       GateReject, SqliteGate, open_gate_read_conn)
 from orchestrator.schemas import SchemaSet
 from orchestrator.writedaemon import WriteDaemon
 
@@ -205,6 +205,22 @@ def test_trigger_abort_becomes_clean_reject(gate_env):
                                  evidence=[{"kind": "child_answer", "child_question_id": "q1"}], answer_md="因")
     assert daemon.query_one("SELECT count(*) FROM decision WHERE actor='gate' AND type='reject'")[0] == before + 1
     assert daemon.query_one("SELECT status FROM question WHERE id=2")[0] == "open"          # 未半写
+    assert daemon.query_one("SELECT count(*) FROM answer WHERE question_id=2")[0] == 0
+
+
+def test_unknown_integrity_error_fails_loud_as_gate_invariant(gate_env, monkeypatch):
+    """只有已知 I3 焊死触发器属业务拒；未知 IntegrityError 不得被统一洗成 GateReject。"""
+    gate, daemon = gate_env
+    before = daemon.query_one("SELECT count(*) FROM decision WHERE actor='gate' AND type='reject'")[0]
+
+    def corrupt_write(*args, **kwargs):
+        raise sqlite3.IntegrityError("SIM unexpected internal constraint")
+
+    monkeypatch.setattr(gate, "_insert_evidence", corrupt_write)
+    with pytest.raises(GateInvariantError, match="非预期 DB 约束"):
+        gate.gate_close_question(cycle_id="c1", question_id="q2", verdict="answered",
+                                 evidence=[{"kind": "literature", "citation_md": "x"}], answer_md="因")
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE actor='gate' AND type='reject'")[0] == before
     assert daemon.query_one("SELECT count(*) FROM answer WHERE question_id=2")[0] == 0
 
 
