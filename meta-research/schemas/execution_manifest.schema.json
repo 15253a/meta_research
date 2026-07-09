@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/execution_manifest.schema.json",
   "title": "execution_manifest",
-  "description": "bundle 阶段的编译产物：机器可验证执行契约（步⑧）。分层定位：plan 保持抽象（冻结 plan.schema 不动，命令永不入 plan）；本清单由 bundle 阶段 Codex 与代码/identity.md 一同产出，经编排器交叉核对（orchestrator/manifest.py：target_ref 回引 plan 切片、protocol 绑定一致、路径/env/超时围栏）后，harness 只机械执行它——不推理、不猜命令、不读 plan 找命令。防「新 plan 旁路」：manifest 不得引入 plan 未声明的目标/协议（plan_slice_hash 由编排器按库中切片重算核对）。命令 = argv 数组（禁 shell 字符串）；占位符 {src}=代码物化目录、{ckpt}=训练产 checkpoint 路径（仅 eval 命令可用）。指标契约：eval 命令须向 stdout 打印 `metric_value: <metric_id>@<metric_ver>=<float>` 行（int id 以 bundle 上下文包给出的协议绑定为准）。诚实边界（canary）：env_hash 为声明值，真 env lock / git worktree 隔离 / 产物集 hash 强校验 = 后续硬化步。",
+  "description": "bundle 阶段的编译产物：机器可验证执行契约（步⑧）。分层定位：plan 保持抽象（冻结 plan.schema 不动，命令永不入 plan）；本清单由 bundle 阶段 Codex 与代码/identity.md 一同产出，经编排器交叉核对（orchestrator/manifest.py：target_ref 回引 plan 切片、protocol 绑定一致、路径/env/超时围栏）后，harness 只机械执行它——不推理、不猜命令、不读 plan 找命令。防「新 plan 旁路」：manifest 不得引入 plan 未声明的目标/协议（plan_slice_hash 由编排器按库中切片重算核对）。命令 = argv 数组（禁 shell 字符串）；占位符 {src}=代码物化目录、{ckpt}=训练产 checkpoint 路径（仅 eval 命令可用）、{asset:<ContextPack opaque ref>}=用户托管输入（启动前受信解析并复验 sha256）。指标契约：eval 命令须向 stdout 打印 `metric_value: <metric_id>@<metric_ver>=<float>` 行（int id 以 bundle 上下文包给出的协议绑定为准）。诚实边界（canary）：env_hash 为声明值，真 env lock / git worktree 隔离 / 产物集 hash 强校验 = 后续硬化步。",
   "type": "object",
   "required": ["manifest_version", "target_ref", "protocol_ref", "env_hash", "config_json", "code_files", "commands"],
   "additionalProperties": false,
@@ -103,7 +103,7 @@
           "type": "array",
           "minItems": 1,
           "items": { "type": "string", "minLength": 1 },
-          "description": "argv 数组（禁 shell 字符串/管道/重定向）；绝对路径 token 须落 work_root 或 policy.execution.path_allowlist 前缀内，相对 token 不得含 .. 组件（manifest.py 执法）"
+          "description": "argv 数组（禁 shell 字符串/管道/重定向）；可用 {asset:<ContextPack opaque ref>} 引用用户托管输入，启动前由 manifest.py 做 containment+sha256 复验；绝对路径 token 须落 work_root 或 policy.execution.path_allowlist 前缀内，相对 token 不得含 .. 组件"
         },
         "timeout_s": { "type": "number", "exclusiveMinimum": 0, "description": "本命令超时（缺省 policy.execution.default_timeout_s；上限 max_timeout_s 截断）" }
       }

@@ -58,16 +58,22 @@ class InteractionIngest:
     def create_file_request(self, *, goal_id: int, goal_ver: int, stage: str, summary_md: str,
                             items_json: str, request_hash: str, cycle_id: Optional[str] = None,
                             question_id: Optional[str] = None) -> int:
-        """文件请求单登记：interaction_request(pending)。幂等锚 (goal_id, request_hash)；同 goal 至多一 pending
-        （uq_ireq_one_pending，DDL 焊）。M1–M3 **不触发真实通知/全局等待**（M5）。返回 request id。"""
+        """文件请求单登记：interaction_request(pending)。同一 pending attempt 以 (goal_id, request_hash)
+        幂等；同 hash 已有终态时拒绝原样重提（上层须消费 resolved/cancelled 回执或改变请求条件），
+        防无状态工人形成终态→同单重提循环。同 goal 至多一 pending（uq_ireq_one_pending，DDL 焊）。"""
         with self.daemon.transaction() as conn:
-            # 幂等锚 = (goal_id, request_hash)，**不限 status**（同请求即便已 resolved 也返其既有 id，防重复登记）；
-            # 「一 goal 一 pending」是另一层约束（uq_ireq_one_pending），不同请求撞它时 DDL 拒。
+            # 幂等锚只覆盖 pending attempt；resolved/cancelled 是不可变历史，不能冒充下一次等待。
             existing = conn.execute(
-                "SELECT id FROM interaction_request WHERE goal_id=? AND request_hash=? ORDER BY id LIMIT 1",
+                "SELECT id FROM interaction_request WHERE goal_id=? AND request_hash=? AND status='pending' "
+                "ORDER BY id DESC LIMIT 1",
                 (goal_id, request_hash)).fetchone()
             if existing:
                 return existing[0]
+            terminal = conn.execute(
+                "SELECT id,status FROM interaction_request WHERE goal_id=? AND request_hash=? "
+                "AND status<>'pending' ORDER BY id DESC LIMIT 1", (goal_id, request_hash)).fetchone()
+            if terminal:
+                raise ValueError(f"同 hash 文件请求已有终态 attempt #{terminal[0]}（{terminal[1]}），不得原样重提")
             return conn.execute(
                 "INSERT INTO interaction_request(goal_id,goal_ver,cycle_id,question_id,stage,status,summary_md,"
                 "items_json,request_hash) VALUES (?,?,?,?,?,'pending',?,?,?)",

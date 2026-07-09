@@ -14,14 +14,15 @@ import hashlib
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .ids import cnum as _cnum
 from .writedaemon import WriteDaemon
 
 
 def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: float = 600.0,
-               env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+               env: Optional[Dict[str, str]] = None,
+               pass_fds: Sequence[int] = ()) -> Dict[str, Any]:
     """跑真子进程，stdout+stderr 合流写 staging log（.partial → 原子改名）。返回
     {exit_code, log_path, log_sha256, log_bytes}。超时 → kill 并抛 subprocess.TimeoutExpired
     （.partial 留在 staging 供审计，不改名——半成品不冒充完整产物）。"""
@@ -34,7 +35,7 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
     with open(partial, "wb") as fh:
         # cwd=staging：脚本的相对路径产物（checkpoint/指标文件）落 staging（半成品目录纪律的自然延伸）
         proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=str(d),
-                                env={**os.environ, **(env or {})})
+                                env={**os.environ, **(env or {})}, pass_fds=tuple(pass_fds))
         try:
             exit_code = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:

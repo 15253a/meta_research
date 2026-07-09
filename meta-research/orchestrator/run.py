@@ -144,7 +144,7 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     # sidecar→文件请求桥（步⑧ CP8.5）：阶段产 resource_request.json → interaction_request(pending) →
     # StageBlockedOnResources → run_cycles 干净停 → precheck 全局等待；用户 resolve 到 input/user_provided/
     # 后续跑重做该阶段。goal 版本按当下最新（goal_amend 后新请求挂新版）。
-    file_requests = FileRequestService(daemon, schemas, policy, input_root=str(root / "input"))
+    file_requests = FileRequestService(daemon, schemas, policy, input_root=str(work / "input"))
 
     def file_request_bridge(stage: str, request: Dict[str, Any], cyc) -> int:
         gid, gver = daemon.query_one("SELECT id, version FROM goal ORDER BY version DESC LIMIT 1")

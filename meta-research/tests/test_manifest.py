@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import stat
 import sys
 from pathlib import Path
 
@@ -196,9 +198,259 @@ def test_stage_rejects_missing_or_bad_paths(tmp_path):
     assert MF.staged_hashes(tmp_path / "a") is None  # 拒绝路径不留哨兵（重物化幂等）
 
 
+def _manifest_with_asset_refs(*refs):
+    manifest = _manifest(_slice())
+    manifest["commands"]["smoke"]["argv"].extend(
+        "{asset:" + ref + "}" for ref in reversed(refs))
+    manifest["commands"]["train"]["argv"].extend(
+        "{asset:" + ref + "}" for ref in refs)
+    if refs:  # 同一 ref 可在多个 command 中使用，但快照只冻结唯一授权集合
+        manifest["commands"]["eval"]["argv"].append("{asset:" + refs[0] + "}")
+    return manifest
+
+
+def _fake_asset_identities(work_root: Path, refs):
+    """授权快照结构单测不依赖 DB/实体文件；只构造严格 canonical 的生成时身份。"""
+    identities = {}
+    for ref in refs:
+        request_id, item_no, asset_no = MF._parse_canonical_asset_ref(ref)
+        managed_path = work_root / "input" / "user_provided" / str(request_id) / str(item_no) / f"asset-{asset_no}"
+        identities[ref] = MF.AssetIdentity(
+            ref=ref, request_id=request_id, item_no=item_no, asset_no=asset_no,
+            sha256="b" * 64, size_bytes=9, managed_path=str(managed_path.resolve()))
+    return identities
+
+
+def _rewrite_staged_ledger_file(dest: Path, rel: str, payload) -> None:
+    """测试专用：同步改文件与哨兵哈希，让 loader 的结构校验而非外层篡改检测接到坏 payload。"""
+    import hashlib
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    (dest / rel).write_bytes(data)
+    sentinel = json.loads((dest / MF._SENTINEL).read_text(encoding="utf-8"))
+    sentinel["files"][rel] = hashlib.sha256(data).hexdigest()
+    (dest / MF._SENTINEL).write_text(json.dumps(sentinel, sort_keys=True), encoding="utf-8")
+
+
+def test_asset_authorization_snapshot_roundtrip_and_actual_ref_subset(tmp_path):
+    refs = ["user-file-request:r7:item:1:asset:2", "user-file-request:r7:item:1:asset:1"]
+    manifest = _manifest_with_asset_refs(*refs)
+    assert MF.extract_manifest_asset_refs(manifest) == sorted(refs)
+    dest = tmp_path / "authorized"
+    identities = _fake_asset_identities(tmp_path, refs)
+    ledger = MF.stage_bundle_files(
+        _envelope(), manifest, dest, authorization_pack_hash="a" * 64,
+        allowed_asset_refs=[*refs, "user-file-request:r8:item:1:asset:1"],
+        asset_identities=identities)
+    assert MF.ASSET_AUTHORIZATION_FILE in ledger
+    auth = MF.load_asset_authorization(dest, manifest)
+    assert auth.pack_hash == "a" * 64
+    assert auth.asset_refs == frozenset(refs)  # 不冻结 ContextPack 中未被 manifest 实际引用的额外权限
+    assert auth.identities == identities
+    payload = json.loads((dest / MF.ASSET_AUTHORIZATION_FILE).read_text(encoding="utf-8"))
+    assert payload["version"] == 2
+    assert [item["ref"] for item in payload["assets"]] == sorted(refs)
+
+
+def test_stage_bundle_fsync_topology_makes_sentinel_last(tmp_path, monkeypatch):
+    """payload 文件→深层目录→新建祖先须先持久化；sentinel 自身 fsync+rename 后最后再刷 src。"""
+    ref = "user-file-request:r7:item:1:asset:1"
+    manifest = _manifest_with_asset_refs(ref)
+    manifest["code_files"].append("pkg/util.py")
+    files = {**_envelope(), "pkg/util.py": "VALUE = 1"}
+    dest = tmp_path / "work" / "c1" / "t1" / "src"
+    events = []
+    original_fsync = MF.os.fsync
+
+    def track_fsync(fd):
+        info = os.fstat(fd)
+        events.append(("dir" if stat.S_ISDIR(info.st_mode) else "file",
+                       Path(os.readlink(f"/proc/self/fd/{fd}"))))
+        return original_fsync(fd)
+
+    monkeypatch.setattr(MF.os, "fsync", track_fsync)
+    ledger = MF.stage_bundle_files(
+        files, manifest, dest, authorization_pack_hash="a" * 64,
+        allowed_asset_refs=[ref], asset_identities=_fake_asset_identities(tmp_path, [ref]))
+
+    file_events = [path for kind, path in events if kind == "file"]
+    for rel in ledger:
+        final = dest / rel
+        assert final.exists()
+        assert final.with_name(final.name + ".partial") in file_events
+    sentinel_tmp = dest / (MF._SENTINEL + ".partial")
+    sentinel_fsync_index = events.index(("file", sentinel_tmp))
+    assert (dest / MF._SENTINEL).is_file() and not sentinel_tmp.exists()
+
+    # payload 目录自底向上；随后持久化 mkdir(parents=True) 新建的 t1/c1/work 及既有锚 tmp_path。
+    pre_sentinel_dirs = [path for no, (kind, path) in enumerate(events)
+                         if kind == "dir" and no < sentinel_fsync_index]
+    expected_chain = [dest / "pkg", dest, dest.parent, dest.parent.parent,
+                      dest.parent.parent.parent, tmp_path]
+    positions = [pre_sentinel_dirs.index(path) for path in expected_chain]
+    assert positions == sorted(positions)
+    # sentinel tmp 的文件 fsync 之后必须还有一次 dest_dir fsync，持久化最终 rename。
+    assert any(kind == "dir" and path == dest
+               for kind, path in events[sentinel_fsync_index + 1:])
+
+
+def test_stage_bundle_final_fsync_failure_withdraws_sentinel_and_preserves_original_error(
+        tmp_path, monkeypatch):
+    """sentinel rename 后确认失败不得留下假 committed；撤回 fsync 再失败也不能覆盖第一次错误。"""
+    manifest = _manifest(_slice())
+    dest = tmp_path / "durability-failure"
+    original_fsync_directory = MF._fsync_directory
+    dest_calls = {"count": 0}
+
+    def fail_commit_and_cleanup(path):
+        path = Path(path)
+        if path == dest:
+            dest_calls["count"] += 1
+            if dest_calls["count"] == 2:   # payload 目录已成功刷过；这是 sentinel replace 后的确认
+                raise OSError("sentinel durability confirmation failed")
+            if dest_calls["count"] == 3:   # 撤回后的 best-effort fsync 也失败
+                raise RuntimeError("cleanup fsync must not mask original")
+        return original_fsync_directory(path)
+
+    monkeypatch.setattr(MF, "_fsync_directory", fail_commit_and_cleanup)
+    with pytest.raises(OSError, match="sentinel durability confirmation failed"):
+        MF.stage_bundle_files(_envelope(), manifest, dest)
+
+    assert dest_calls["count"] == 3
+    assert not (dest / MF._SENTINEL).exists()
+    assert not (dest / (MF._SENTINEL + ".partial")).exists()
+    assert MF.staged_hashes(dest) is None
+
+
+def test_asset_authorization_stage_rejects_missing_or_ungranted_context(tmp_path):
+    ref = "user-file-request:r7:item:1:asset:1"
+    manifest = _manifest_with_asset_refs(ref)
+    with pytest.raises(MF.ManifestError, match="缺生成时 ContextPack 授权快照"):
+        MF.stage_bundle_files(_envelope(), manifest, tmp_path / "missing")
+    with pytest.raises(MF.ManifestError, match="未获生成时 ContextPack 授权"):
+        MF.stage_bundle_files(
+            _envelope(), manifest, tmp_path / "ungranted",
+            authorization_pack_hash="a" * 64,
+            allowed_asset_refs=["user-file-request:r8:item:1:asset:1"],
+            asset_identities=_fake_asset_identities(tmp_path, [ref]))
+
+
+def test_asset_authorization_filename_is_reserved_from_code_files(tmp_path):
+    manifest = _manifest(_slice(), code_files=[MF.ASSET_AUTHORIZATION_FILE])
+    with pytest.raises(MF.ManifestError, match="保留名"):
+        MF.stage_bundle_files(
+            {**_envelope(), MF.ASSET_AUTHORIZATION_FILE: "attacker supplied"},
+            manifest, tmp_path / "reserved")
+
+
+def test_asset_authorization_tamper_is_caught_by_staging_ledger(tmp_path):
+    ref = "user-file-request:r7:item:1:asset:1"
+    manifest = _manifest_with_asset_refs(ref)
+    dest = tmp_path / "tamper"
+    MF.stage_bundle_files(_envelope(), manifest, dest, authorization_pack_hash="a" * 64,
+                          allowed_asset_refs=[ref],
+                          asset_identities=_fake_asset_identities(tmp_path, [ref]))
+    (dest / MF.ASSET_AUTHORIZATION_FILE).write_text("{}", encoding="utf-8")
+    with pytest.raises(MF.ManifestError, match="损毁|哈希不符"):
+        MF.load_asset_authorization(dest, manifest)
+
+
+@pytest.mark.parametrize("mutate,match", [
+    (lambda payload, ref: payload.update(version=True), "version"),
+    (lambda payload, ref: payload["assets"].append(dict(payload["assets"][0])), "重复"),
+    (lambda payload, ref: payload["assets"][0].update(
+        ref="user-file-request:r07:item:1:asset:1"), "canonical"),
+    (lambda payload, ref: payload["assets"][0].update(request_id=True), "bool|整数"),
+    (lambda payload, ref: payload["assets"][0].update(size_bytes=True), "size_bytes"),
+    (lambda payload, ref: payload["assets"][0].update(managed_path="relative/asset-1"), "managed_path"),
+])
+def test_asset_authorization_snapshot_strict_validation(tmp_path, mutate, match):
+    ref = "user-file-request:r7:item:1:asset:1"
+    manifest = _manifest_with_asset_refs(ref)
+    dest = tmp_path / "strict"
+    MF.stage_bundle_files(_envelope(), manifest, dest, authorization_pack_hash="a" * 64,
+                          allowed_asset_refs=[ref],
+                          asset_identities=_fake_asset_identities(tmp_path, [ref]))
+    path = dest / MF.ASSET_AUTHORIZATION_FILE
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mutate(payload, ref)
+    _rewrite_staged_ledger_file(dest, MF.ASSET_AUTHORIZATION_FILE, payload)
+    with pytest.raises(MF.ManifestError, match=match):
+        MF.load_asset_authorization(dest, manifest)
+
+
+def test_legacy_staging_with_asset_ref_but_no_authorization_is_rejected(tmp_path):
+    """模拟旧版本已受 ledger 保护的 staging：manifest 后来包含 ref，但历史格式没有授权快照。"""
+    dest = tmp_path / "legacy"
+    plain = _manifest(_slice())
+    MF.stage_bundle_files(_envelope(), plain, dest)
+    with_ref = _manifest_with_asset_refs("user-file-request:r7:item:1:asset:1")
+    _rewrite_staged_ledger_file(dest, MF.MANIFEST_FILE, with_ref)
+    assert MF.staged_hashes(dest) is not None
+    with pytest.raises(MF.ManifestError, match="旧 staging.*缺.*授权快照"):
+        MF.load_asset_authorization(dest, with_ref)
+
+
+def test_legacy_staging_without_asset_ref_remains_compatible(tmp_path):
+    manifest = _manifest(_slice())
+    dest = tmp_path / "legacy-no-assets"
+    MF.stage_bundle_files(_envelope(), manifest, dest)
+    assert MF.load_asset_authorization(dest, manifest) is None
+
+
 # ============ 命令解析 / 围栏 ============
 def _pol(allow=()):
     return {"execution": {"default_timeout_s": 5, "max_timeout_s": 10, "path_allowlist": list(allow)}}
+
+
+def _managed_asset(work_root: Path, body: bytes = b"USER-DATA", *, request_id: int = 7,
+                   status: str = "resolved"):
+    import hashlib
+    ref = f"user-file-request:r{request_id}:item:1:asset:1"
+    root = work_root / "input" / "user_provided" / str(request_id)
+    asset = root / "1" / "asset-1"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    (root / "assets.manifest.json").write_text(json.dumps({
+        "version": 1, "request_id": request_id, "assets": [{
+            "ref": ref, "relative_path": "1/asset-1", "sha256": digest, "size_bytes": len(body)}]
+    }, sort_keys=True), encoding="utf-8")
+    resolution = [{"provided": [{
+        "path": str(asset), "ref": ref, "original_relpath": "user-name.txt",
+        "hash": digest, "hash_alg": "sha256", "size_bytes": len(body),
+    }]}]
+    conn = sqlite3.connect(work_root / "research.sqlite")
+    conn.execute("CREATE TABLE IF NOT EXISTS interaction_request "
+                 "(id INTEGER PRIMARY KEY,status TEXT NOT NULL,resolution_json TEXT)")
+    conn.execute("INSERT OR REPLACE INTO interaction_request(id,status,resolution_json) VALUES (?,?,?)",
+                 (request_id, status, json.dumps(resolution, sort_keys=True)))
+    conn.commit()
+    conn.close()
+    return ref, asset
+
+
+def _rewrite_managed_asset_authority(work_root: Path, ref: str, asset: Path, body: bytes) -> None:
+    """模拟离线恢复/人工修复同步改写三个当前权威，使 live resolver 本身仍会接受同 ref。"""
+    import hashlib
+    digest = hashlib.sha256(body).hexdigest()
+    asset.write_bytes(body)
+    manifest_path = asset.parents[1] / "assets.manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["assets"][0]["sha256"] = digest
+    payload["assets"][0]["size_bytes"] = len(body)
+    manifest_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    conn = sqlite3.connect(work_root / "research.sqlite")
+    resolution = json.loads(conn.execute(
+        "SELECT resolution_json FROM interaction_request WHERE id=7").fetchone()[0])
+    db_asset = resolution[0]["provided"][0]
+    assert db_asset["ref"] == ref
+    db_asset["hash"] = digest
+    db_asset["size_bytes"] = len(body)
+    conn.execute("UPDATE interaction_request SET resolution_json=? WHERE id=7",
+                 (json.dumps(resolution, sort_keys=True),))
+    conn.commit()
+    conn.close()
 
 
 def test_resolve_substitutes_src_and_ckpt(tmp_path):
@@ -206,9 +458,200 @@ def test_resolve_substitutes_src_and_ckpt(tmp_path):
     src, ck = tmp_path / "src", tmp_path / "run1" / "ckpt.bin"
     rc = MF.resolve_command(m, "eval", src_dir=src, work_root=tmp_path, policy=_pol(), ckpt_path=ck)
     assert rc.argv == ["python", f"{src.resolve()}/eval.py", "--ckpt", str(ck.resolve())]
+    assert rc.pass_fds == ()                         # 无资产命令保持原执行路径，不要求额外资源生命周期
     assert rc.timeout_s == 5                          # 未声明 → default
     rc_t = MF.resolve_command(m, "train", src_dir=src, work_root=tmp_path, policy=_pol())
     assert rc_t.timeout_s == 10                       # 声明 60 → max 截断
+
+
+def test_asset_placeholder_resolves_hash_checks_and_runs(tmp_path, monkeypatch):
+    """只有 ContextPack+DB 双授权的 ref 可用；已验 fd 跨 Popen 保活，路径替换不能换掉子进程输入。"""
+    ref, asset = _managed_asset(tmp_path)
+    frozen_identities = MF.capture_asset_identities({ref}, work_root=tmp_path)
+    m = _manifest(_slice())
+    m["commands"]["train"]["argv"] = [
+        sys.executable, "-c", "import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes()==b'USER-DATA'",
+        "{asset:" + ref + "}"]
+    with pytest.raises(MF.ManifestError, match="ContextPack 授权"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol())
+    with pytest.raises(MF.ManifestError, match="缺生成时冻结身份"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref})
+    rc = MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                            allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
+    assert rc.argv[-1] == f"/proc/self/fd/{rc.pass_fds[0]}"
+    for fd in rc.pass_fds:
+        os.close(fd)
+
+    original_run_staged = MF.H.run_staged
+    inherited_fds = []
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"REPLACED!")
+
+    def replace_after_check(cmd, **kwargs):
+        inherited_fds.extend(kwargs["pass_fds"])
+        os.replace(replacement, asset)  # resolve 已完成；若子进程二次按原路径打开就会读到坏内容
+        return original_run_staged(cmd, **kwargs)
+
+    monkeypatch.setattr(MF.H, "run_staged", replace_after_check)
+    result = MF.run_manifest_command(m, "train", staging_dir=str(tmp_path / "run-asset"),
+                                     log_name="asset.log", src_dir=tmp_path,
+                                     work_root=tmp_path, policy=_pol(), allowed_asset_refs={ref},
+                                     expected_asset_identities=frozen_identities)
+    assert result["exit_code"] == 0
+    assert inherited_fds
+    for fd in inherited_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)                 # run_manifest_command finally 已关闭父进程 fd
+
+    asset.write_bytes(b"TAMPERED")
+    with pytest.raises(MF.ManifestError, match="大小|sha256"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
+
+
+def test_asset_authorization_rejects_same_ref_rewritten_to_different_bytes(tmp_path):
+    """即使 DB resolution + FS manifest + 实际文件被一起改写成自洽新值，resume/启动也不扩权。"""
+    ref, asset = _managed_asset(tmp_path)
+    manifest = _manifest_with_asset_refs(ref)
+    frozen = MF.capture_asset_identities({ref}, work_root=tmp_path)
+    dest = tmp_path / "frozen-authorization"
+    MF.stage_bundle_files(
+        _envelope(), manifest, dest, authorization_pack_hash="a" * 64,
+        allowed_asset_refs={ref}, asset_identities=frozen)
+    authorization = MF.load_asset_authorization(dest, manifest)
+    assert authorization is not None
+
+    _rewrite_managed_asset_authority(tmp_path, ref, asset, b"DIFFERENT-CONTENT")
+    current = MF.resolve_input_asset_ref(ref, work_root=tmp_path)
+    try:
+        assert current.identity != frozen[ref]  # 三方当前权威自洽，现有 live resolver 本可接受
+    finally:
+        os.close(current.fd)
+
+    with pytest.raises(MF.ManifestError, match="生成时冻结身份"):
+        MF.verify_asset_authorization(authorization, work_root=tmp_path)
+    with pytest.raises(MF.ManifestError, match="生成时冻结身份"):
+        MF.resolve_command(
+            manifest, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+            allowed_asset_refs=authorization.asset_refs,
+            expected_asset_identities=authorization.identities)
+
+
+def test_asset_placeholder_rejects_malformed_duplicate_and_symlink(tmp_path):
+    ref, asset = _managed_asset(tmp_path)
+    frozen_identities = MF.capture_asset_identities({ref}, work_root=tmp_path)
+    m = _manifest(_slice())
+    m["commands"]["train"]["argv"] = ["python", "{asset:bad-ref}"]
+    with pytest.raises(MF.ManifestError, match="占位符"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref})
+
+    root = tmp_path / "input" / "user_provided" / "7"
+    payload = json.loads((root / "assets.manifest.json").read_text())
+    payload["assets"].append(dict(payload["assets"][0]))
+    (root / "assets.manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+    m["commands"]["train"]["argv"] = ["python", "{asset:" + ref + "}"]
+    with pytest.raises(MF.ManifestError, match="恰出现一次"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
+
+    payload["assets"].pop()
+    (root / "assets.manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+    outside = tmp_path / "outside.bin"; outside.write_bytes(b"USER-DATA")
+    asset.unlink(); asset.symlink_to(outside)
+    with pytest.raises(MF.ManifestError, match="symlink"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
+
+
+@pytest.mark.parametrize("identity_field", ["version", "request_id"])
+def test_asset_manifest_identity_rejects_bool(tmp_path, identity_field):
+    """True 不得利用 bool 是 int 子类冒充 manifest version/request_id 的整数 1。"""
+    ref, _asset = _managed_asset(tmp_path, request_id=1)
+    frozen_identities = MF.capture_asset_identities({ref}, work_root=tmp_path)
+    manifest_path = tmp_path / "input" / "user_provided" / "1" / "assets.manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload[identity_field] = True
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    m = _manifest(_slice())
+    m["commands"]["train"]["argv"] = ["python", "{asset:" + ref + "}"]
+    with pytest.raises(MF.ManifestError, match="manifest 身份非法"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
+
+
+def test_asset_manifest_symlink_rejected_by_single_fd_open(tmp_path):
+    ref, _asset = _managed_asset(tmp_path)
+    frozen_identities = MF.capture_asset_identities({ref}, work_root=tmp_path)
+    manifest_path = tmp_path / "input" / "user_provided" / "7" / "assets.manifest.json"
+    outside = tmp_path / "outside-manifest.json"
+    outside.write_bytes(manifest_path.read_bytes())
+    manifest_path.unlink()
+    manifest_path.symlink_to(outside)
+    m = _manifest(_slice())
+    m["commands"]["train"]["argv"] = ["python", "{asset:" + ref + "}"]
+    with pytest.raises(MF.ManifestError, match="manifest"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
+
+
+def test_asset_requires_resolved_database_authority(tmp_path):
+    ref, _asset = _managed_asset(tmp_path, status="pending")
+    m = _manifest(_slice())
+    m["commands"]["train"]["argv"] = ["python", "{asset:" + ref + "}"]
+    with pytest.raises(MF.ManifestError, match="非 resolved"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref},
+                           expected_asset_identities=_fake_asset_identities(tmp_path, [ref]))
+
+
+def test_resolve_command_failure_closes_assets_already_opened(tmp_path, monkeypatch):
+    ref, _asset = _managed_asset(tmp_path)
+    frozen_identities = MF.capture_asset_identities({ref}, work_root=tmp_path)
+    m = _manifest(_slice(), env={"PATH": "/forbidden"})  # 资产解析完成后才进入 env 围栏
+    m["commands"]["train"]["argv"] = ["python", "{asset:" + ref + "}"]
+    original_resolve = MF.resolve_input_asset_ref
+    opened = []
+
+    def capture_fd(*args, **kwargs):
+        resolved = original_resolve(*args, **kwargs)
+        opened.append(resolved.fd)
+        return resolved
+
+    monkeypatch.setattr(MF, "resolve_input_asset_ref", capture_fd)
+    with pytest.raises(MF.ManifestError, match="PATH"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
+    assert opened
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("ref", "user-file-request:r7:item:1:asset:2"),
+    ("hash", "0" * 64),
+    ("size_bytes", 999),
+    ("path", "/tmp/not-the-managed-asset"),
+])
+def test_asset_database_mapping_must_exactly_match_manifest(tmp_path, field, bad):
+    ref, _asset = _managed_asset(tmp_path)
+    frozen_identities = MF.capture_asset_identities({ref}, work_root=tmp_path)
+    db_path = tmp_path / "research.sqlite"
+    conn = sqlite3.connect(db_path)
+    resolution = json.loads(conn.execute(
+        "SELECT resolution_json FROM interaction_request WHERE id=7").fetchone()[0])
+    resolution[0]["provided"][0][field] = bad
+    conn.execute("UPDATE interaction_request SET resolution_json=? WHERE id=7",
+                 (json.dumps(resolution, sort_keys=True),))
+    conn.commit()
+    conn.close()
+    m = _manifest(_slice())
+    m["commands"]["train"]["argv"] = ["python", "{asset:" + ref + "}"]
+    with pytest.raises(MF.ManifestError, match="resolution"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol(),
+                           allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
 
 
 def test_ckpt_placeholder_only_in_eval(tmp_path):
