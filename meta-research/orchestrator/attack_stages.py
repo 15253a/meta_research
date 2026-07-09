@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -46,7 +48,7 @@ from . import subject_manifest as SM
 from .gate_exec import ExecGate
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
-from .ids import cnum as _cnum
+from .ids import cnum as _cnum, parse_positive_sqlite_int
 from .interfaces import InvalidSelectionError, Selection
 from .phase_commit import check_or_record
 
@@ -59,14 +61,30 @@ class _PlanReject(Exception):
 
 
 class _BundleReject(Exception):
-    """bundle 阶段的业务拒（Codex 产物层面站不住）——转目标 failed(failure_kind)+pc，不楔死。两类来源：
+    """bundle 阶段的业务拒（Codex 产物层面站不住）——转目标 failed(failure_kind)+pc，不楔死。来源：
     ① fresh manifest/信封非法（artifact_invalid；resume 的已物化 manifest 校验不过 = 数据损毁，走
-    ManifestError fail loud）；② gate_register_evaluation 拒（protocol_violation：测量包不满足协议/required
-    契约——**只在该调用点显式转换**，其余 GateReject[状态机/库损毁类]一律 fail loud 上抛，codex 第2轮 BLOCKER）。"""
+    ManifestError fail loud）；② eval.log 指标记录非法或 gate_register_evaluation 拒（protocol_violation：
+    测量包不满足解析/协议/required 契约——GateReject **只在该注册调用点显式转换**，其余 GateReject
+    [状态机/库损毁类]一律 fail loud 上抛，codex 第2轮 BLOCKER）。"""
 
     def __init__(self, msg: str, failure_kind: str = "artifact_invalid"):
         super().__init__(msg)
         self.failure_kind = failure_kind
+
+
+class _ReasoningReject(Exception):
+    """已持久化 reasoning 产物的**语义**业务拒。
+
+    只用于标记由外部产物直接决定的拒绝（answer 目标/证据引用、tree_ops 状态语义）；SQLite、IO、
+    staging 损毁等基础设施异常不得转换成此类型。调用方会把它收敛为可恢复的 terminate 终态，避免
+    persist-then-consume 的坏产物在每次重启时被确定性复读、永久楔死同一轮。
+    """
+
+
+_METRIC_VALUE_RE = re.compile(
+    r"metric_value:\s*([1-9][0-9]*)@([1-9][0-9]*)="
+    r"([+-]?(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+))(?:[eE][+-]?[0-9]+)?)"
+)
 
 
 def _canon_hash(obj: Any) -> str:
@@ -846,15 +864,48 @@ class AttackStages:
     def _metrics_from_eval_log(text: str) -> List[Dict[str, Any]]:
         """评估产物口径（toy 最小）：eval log 每行 `metric_value: <mid>@<mver>=<float>` → aggregate metric_result。
         <mid>/<mver> = 编排器派生的 int 协议绑定（bundle pack 给 Codex，eval 命令照打印）。
-        真评估产物规范 artifact（fold+aggregate 文件）= M6 硬化；此处值真来自真评估子进程输出。"""
-        out = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("metric_value:"):
-                body = line.split(":", 1)[1].strip()          # "1@1=0.93"
-                key, val = body.split("=", 1)
-                mid, mver = key.split("@", 1)
-                out.append({"metric_id": int(mid), "metric_ver": int(mver), "value": float(val)})
+        真评估产物规范 artifact（fold+aggregate 文件）= M6 硬化；此处值真来自真评估子进程输出。
+
+        `metric_value` 是保留记录前缀：出现该前缀却不完全匹配语法、同一 (metric_id, metric_ver) 重复、
+        id 超出 SQLite INTEGER，或值为 NaN/Inf（含十进制溢出成 Inf），均是外部测量包协议违规，必须在
+        进入 judge/DB 前转成 `_BundleReject(protocol_violation)`。普通日志行仍可共存。"""
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for line_no, raw in enumerate(text.splitlines(), start=1):
+            line = raw.strip()
+            if not line.startswith("metric_value"):
+                continue
+            match = _METRIC_VALUE_RE.fullmatch(line)
+            if match is None:
+                raise _BundleReject(
+                    f"eval.log 第 {line_no} 行 metric_value 记录格式非法: {line!r}",
+                    failure_kind="protocol_violation")
+            try:
+                # 必须在 int() 前作字符串边界判定：数千位数字会先命中 Python
+                # int_max_str_digits 而抛裸 ValueError，变成可跨重启复读的 poison pill。
+                mid = parse_positive_sqlite_int(match.group(1), label="metric_id")
+                mver = parse_positive_sqlite_int(match.group(2), label="metric_ver")
+            except ValueError as e:
+                raise _BundleReject(
+                    f"eval.log 第 {line_no} 行 metric 绑定非法: {e}",
+                    failure_kind="protocol_violation") from e
+            key = (mid, mver)
+            if key in seen:
+                raise _BundleReject(
+                    f"eval.log 第 {line_no} 行重复 metric_value 绑定: {mid}@{mver}",
+                    failure_kind="protocol_violation")
+            try:
+                value = float(match.group(3))
+            except (ValueError, OverflowError) as e:
+                raise _BundleReject(
+                    f"eval.log 第 {line_no} 行 metric_value 数值非法: {match.group(3)!r}",
+                    failure_kind="protocol_violation") from e
+            if not math.isfinite(value):
+                raise _BundleReject(
+                    f"eval.log 第 {line_no} 行 metric_value 非有限值: {match.group(3)!r}",
+                    failure_kind="protocol_violation")
+            seen.add(key)
+            out.append({"metric_id": mid, "metric_ver": mver, "value": value})
         return out
 
     @staticmethod
@@ -867,7 +918,13 @@ class AttackStages:
         """attack 轮收尾：gate_close_question（真证据 + suspect 谓词）→ atomic(tree_ops+selection+mark_done)。
         **产物先持久化再消费**（codex SHOULD）：reasoning files 先原子落 staging（tmp→replace），resume 时
         复用持久产物、不重调 provider——否则崩在 close 与 atomic 之间时非确定 provider 会产生杀/不杀分歧
-        （close 用旧 answer、selection 用新产物的分裂）。可重入：问题已终态 → 跳过 close。"""
+        （close 用旧 answer、selection 用新产物的分裂）。可重入：问题已终态 → 跳过 close。
+
+        schema 合法但语义非法的外部产物不能成为 poison pill：answer 的目标/证据引用被拒，或 tree_ops
+        被 StateStore 以 ValueError 拒绝时，tree/selection 原子批整体回滚，再以 reasoning_rejected +
+        terminate 原子收尾。answer Gate 是独立、单调的事实接纳段：若 answer 已经 I3 门禁成功提交、
+        后续 tree 语义才被拒，保留已接纳 answer，只回滚 tree/selection 批并停机；不对有写操作做「预演+
+        再执行」。SQLite/IO/GateInvariantError/RuntimeError 等内部或损毁错误仍 fail loud。"""
         art = self.work / f"c{_cnum(cyc.cycle_id)}" / "reasoning.json"
         if art.exists():
             files = json.loads(art.read_text(encoding="utf-8"))
@@ -879,30 +936,79 @@ class AttackStages:
             tmp.write_text(json.dumps(files, ensure_ascii=False, sort_keys=True), encoding="utf-8")
             tmp.replace(art)
         if "selection.json" not in files:
-            raise ValueError("reasoning 必产 selection.json")
+            self._finish_reasoning_rejected(cyc, files, "reasoning 必产 selection.json")
+            return
         ans = files.get("answer.json")
         if ans is not None:
             if ans.get("question_id") != cyc.question_id:
                 # 树契约（codex SHOULD）：attack 轮只许关**本轮 Qn**——关别的问题再把本 Qn 置 inconclusive
                 # 属状态破坏（对齐 M0 driver「不得关别的问题」判据）
-                raise ValueError(f"answer.question_id（{ans.get('question_id')}）≠ 本轮 Qn（{cyc.question_id}）"
-                                 "——不得关别的问题")
+                self._finish_reasoning_rejected(
+                    cyc, files, f"answer.question_id（{ans.get('question_id')}）≠ 本轮 Qn（{cyc.question_id}）"
+                    "——不得关别的问题")
+                return
             qi = int(ans["question_id"][1:])
-            qst = self.state.daemon.query_one("SELECT status FROM question WHERE id=?", (qi,))[0]
+            qrow = self.state.daemon.query_one("SELECT status FROM question WHERE id=?", (qi,))
+            if qrow is None:
+                # cyc 指向的活跃题在真库消失不是外部 answer 的错，而是 DB/状态损毁；不得洗成正常拒收。
+                raise RuntimeError(f"cycle {cyc.cycle_id} 的 active question {ans['question_id']} 在 DB 不存在")
+            qst = qrow[0]
             if qst not in ("answered", "refuted", "dead_end"):
-                self.close_gate.gate_close_question(
-                    cycle_id=cyc.cycle_id, question_id=ans["question_id"], verdict=ans["verdict"],
-                    evidence=ans["evidence"], answer_md=ans["answer_md"])
+                try:
+                    self.close_gate.gate_close_question(
+                        cycle_id=cyc.cycle_id, question_id=ans["question_id"], verdict=ans["verdict"],
+                        evidence=ans["evidence"], answer_md=ans["answer_md"])
+                except GateReject as e:
+                    # GateReject 仅表示 answer/evidence 业务门禁拒；未预期 SQLite 约束由
+                    # GateInvariantError 单独 fail loud，不会在此被洗成外部产物错。
+                    self._finish_reasoning_rejected(cyc, files, f"answer 语义被 gate 拒绝: {e}")
+                    return
         sel = files["selection.json"]
+        try:
+            with self.state.atomic():
+                if self.state.cycle(cyc.cycle_id).status in ("done", "failed", "aborted"):
+                    return
+                qi = int(cyc.question_id[1:]) if cyc.question_id else None
+                if qi is not None and self.state.daemon.query_one(
+                        "SELECT status FROM question WHERE id=?", (qi,))[0] == "active":
+                    # 无 answer（或未关成）的攻坚轮：Qn 不得永卡 active——置 inconclusive（增 visit，§4.2.3
+                    # 「阶段失败=轮正常收尾」口径，对齐 M0 driver；训练/评估失败路径由此收干净）
+                    self.state.mark_inconclusive(cyc.question_id)
+                try:
+                    self.state.apply_tree_ops(
+                        cyc.cycle_id, files.get("tree_ops.json", {"ops": []}).get("ops", []))
+                except ValueError as e:
+                    # apply_tree_ops 的 ValueError 是封闭 op/route/引用/guard 等产物语义拒；让自定义异常
+                    # 逃出 atomic，保证之前的 mark_inconclusive/tree 半写一并回滚。SQLite 异常不在此捕获。
+                    raise _ReasoningReject(f"tree_ops 语义被拒绝: {e}") from e
+                persist_selection_safe(self.state, cyc.cycle_id, sel)
+                self.state.mark_cycle_done(cyc.cycle_id)
+        except _ReasoningReject as e:
+            self._finish_reasoning_rejected(cyc, files, str(e))
+
+    def _finish_reasoning_rejected(self, cyc, files: Dict[str, Any], reason: str) -> None:
+        """把已持久化的坏 reasoning 收敛为可审计、可重启的业务终态。
+
+        decision、当前活跃题 inconclusive、terminate selection 与 cycle done 同一事务；终态二次核保证重入
+        不重复记拒。这里使用编排器自产的固定 Selection，不消费坏 selection 的 scores/local refs。
+        """
         with self.state.atomic():
             if self.state.cycle(cyc.cycle_id).status in ("done", "failed", "aborted"):
                 return
             qi = int(cyc.question_id[1:]) if cyc.question_id else None
-            if qi is not None and self.state.daemon.query_one(
-                    "SELECT status FROM question WHERE id=?", (qi,))[0] == "active":
-                # 无 answer（或未关成）的攻坚轮：Qn 不得永卡 active——置 inconclusive（增 visit，§4.2.3
-                # 「阶段失败=轮正常收尾」口径，对齐 M0 driver；训练/评估失败路径由此收干净）
-                self.state.mark_inconclusive(cyc.question_id)
-            self.state.apply_tree_ops(cyc.cycle_id, files.get("tree_ops.json", {"ops": []}).get("ops", []))
-            persist_selection_safe(self.state, cyc.cycle_id, sel)
+            if qi is not None:
+                qrow = self.state.daemon.query_one("SELECT status FROM question WHERE id=?", (qi,))
+                if qrow is None:
+                    raise RuntimeError(f"cycle {cyc.cycle_id} 的 active question {cyc.question_id} 在 DB 不存在")
+                if qrow[0] == "active":
+                    self.state.mark_inconclusive(cyc.question_id)
+            self.state.daemon.conn.execute(
+                "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+                "VALUES (?,?,'orchestrator','reasoning_rejected',?)",
+                (_cnum(cyc.cycle_id), qi, json.dumps({
+                    "reason": reason, "question_id": cyc.question_id,
+                    "artifact_hash": _canon_hash(files), "fallback_next_intent": "terminate"},
+                    ensure_ascii=False, sort_keys=True)))
+            self.state.persist_selection(
+                cyc.cycle_id, Selection(next_question_id=None, next_intent="terminate", scores=[]))
             self.state.mark_cycle_done(cyc.cycle_id)

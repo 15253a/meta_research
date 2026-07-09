@@ -21,6 +21,7 @@ import json
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
+from .ids import decode as _bounded_decode, decode_optional as _bounded_decode_optional
 from .interfaces import InvalidSelectionError, Cycle, Route, Selection
 from .writedaemon import WriteDaemon
 
@@ -39,10 +40,9 @@ def _aid(n: int) -> str: return f"a{n}"
 
 def _decode(s: Any, prefix: str) -> int:
     """按类型前缀（c/q/a/g）解码为整型主键，**校验前缀**——防类型错 id（如把 'c1' 当问题）静默命中
-    别的表的同号行。对齐 InMemory 的 dict-key 类型天然隔离（其键含前缀、跨类型不撞）。"""
-    if not (isinstance(s, str) and len(s) > 1 and s[0] == prefix and s[1:].isdigit()):
-        raise ValueError(f"id 前缀/格式非法（期望 {prefix}<数字>）: {s!r}")
-    return int(s[1:])
+    别的表的同号行。同时经 ids.decode 限制为 SQLite 正整数，外部超长 id 只产生可分类
+    ValueError，不会在 int/SQLite 边界泄出 OverflowError。"""
+    return _bounded_decode(s, prefix)
 
 
 def _cnum(s: Any) -> int: return _decode(s, "c")
@@ -53,7 +53,7 @@ def _anum(s: Any) -> int: return _decode(s, "a")
 def _qnum_opt(s: Any) -> Optional[int]:
     """问题 id 安全解码：形如 q<数字> 才转 int，否则 None——供 selection 处理可能是未解析 local_key /
     畸形 / 类型错 id 的入参（给干净「不存在」拒因，而非裸 ValueError）。"""
-    return int(s[1:]) if isinstance(s, str) and len(s) > 1 and s[0] == "q" and s[1:].isdigit() else None
+    return _bounded_decode_optional(s, "q")
 
 
 class SQLiteStateStore:
@@ -325,11 +325,17 @@ class SQLiteStateStore:
                 raise InvalidSelectionError(f"next_question_id 缺失或不存在: {sel.next_question_id}")
             if not self.is_schedulable(next_qid, for_intent=sel.next_intent):
                 raise InvalidSelectionError(f"目标问题不可调度: {next_qid}")
+        # 先纯读解析/校验整批 score ref，再做任何 UPDATE。persist_selection_safe 会把
+        # InvalidSelectionError 转成 terminate；若边写边校验，「首个合法 score + 后一个越界 id」
+        # 会在同一外层 atomic 中吞掉异常并提交首个半写。预检不执行状态变更，也不是双执行。
+        resolved_scores = []
+        for row in sel.scores:
+            ri = _qnum_opt(self._resolve_local(cycle_id, row.get("question_id")))
+            if ri is None or self._q1("SELECT 1 FROM question WHERE id=?", (ri,)) is None:
+                raise InvalidSelectionError(f"scores 引用的问题不存在: {row.get('question_id')}（不静默丢弃）")
+            resolved_scores.append((row, ri))
         with self._write() as conn:
-            for row in sel.scores:   # 唯一维护点：写回 question.score/est_cost（local_key 同样解析）
-                ri = _qnum_opt(self._resolve_local(cycle_id, row.get("question_id")))
-                if ri is None or conn.execute("SELECT 1 FROM question WHERE id=?", (ri,)).fetchone() is None:
-                    raise InvalidSelectionError(f"scores 引用的问题不存在: {row.get('question_id')}（不静默丢弃）")
+            for row, ri in resolved_scores:   # 唯一维护点：写回 question.score/est_cost（local_key 同样解析）
                 if "est_cost" in row:   # 显式提供（含 null）才改；缺省保留旧值（对齐 InMemory row.get 语义）
                     conn.execute("UPDATE question SET score=?, est_cost=? WHERE id=?", (row.get("score"), row["est_cost"], ri))
                 else:
