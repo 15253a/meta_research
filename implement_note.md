@@ -4,47 +4,60 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.5**（sidecar→file_request 桥）
-- 检查点状态：构建+自验完成（617 测绿，+4）：interfaces.StageBlockedOnResources + StageProvider 桥
-  （bridge 注入；桥拒→重试反馈；未接桥 fail-loud 保持）+ JudgeProvider 拒 sidecar + advancer 捕获
-  （在途轮保持游标）+ run.py 装配 FileRequestService/bridge + 全等待环 E2E（阻断→precheck 拦→resolve→
-  同一在途轮续跑）。内审（Opus）进行中 → codex 外审 → 提交 → build_log 0038。
+- 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.6**（plan 全形态受理）
+- 检查点状态：待开工（CP8.5 已提交 650aace + 记账中）
 
 ## 正在做什么
-**步⑧：plan 契约缺口补齐 → 全流程 real-Codex attack + 正式直接可用**（用户 2026-07-09 两道指令）。
-已落 CP8.1–8.4（613 测绿）：**真 Codex 完整 attack build 链端到端跑通**（冒烟第二次：真 Codex 注册协议
-@1[自声明 2 metric]、占坑并训练 MLP baseline、真子进程 acc=0.9949、双评审 pass、legal 入池、τ score_floor
-真实触发；第一次冒烟暴露 kind 教学缺口+拒因不回流 → 已修成自纠环）。
-剩余=正式可用收口三件（用户升格必做）：CP8.5 桥 / CP8.6 plan 全形态受理 / CP8.7 运维文档+步级收口。
+**步⑧：plan 契约缺口补齐 → 全流程 real-Codex attack + 正式直接可用**。已落 CP8.1–8.5（618 测绿）：
+真 Codex 完整 attack build 链端到端跑通（冒烟 acc=0.9949 legal 入池）+ 文件请求全等待环闭合。
+剩余：CP8.6（本检查点）+ CP8.7（运维文档+步级验证收口）。
 
-## 下一步动作（按序）—— CP8.5 sidecar→file_request 桥
-1. StageProvider._produce 的 resource_request.json 处理：fail-loud 占位 → 真桥：
-   - 校验 sidecar 过 resource_request.schema（validator("resource_request")）；
-   - 经注入的 file_request 服务（notify.FileRequestService.create_checked）落请求单（幂等：同内容不重复建）；
-   - 抛专用异常（如 StageBlockedOnResources，携 request id）——advancer/attack_stages 把它转「轮干净收尾 +
-     全局等待」（precheck 已会因 pending 文件请求阻断下一轮：notify.make_advancer_precheck 既有）。
-   ⚠ 设计点：阶段半途发请求 → 本轮怎么收？最省事且诚实：attack 轮=该阶段业务失败收尾（inconclusive）+
-     请求单已建，解除后重攻；reasoning-only 轮同理。核 notify.create_checked 签名与 interaction_request
-     语义（CP6.3 落的：全局等待+提醒，无自动超时）。
-2. run.py 装配桥（FileRequestService 需要 daemon+policy+work 根）；测试：sidecar → 请求单建 + 轮收尾 +
-   precheck 阻断 + 用户 resolve 后续跑（notify 侧已有 resolve 测试可借力）。
-3. 内审(Opus) → codex 外审(≤2轮) → 提交 → build_log 0038。
-4. 接 CP8.6：exec/eval target kinds（gate_claim_variant / eval_action append·create 驱动；manifest 的
-   eval-kind 分支 schema 已备）+ route 特化（reuse_only/eval_only/dependency_wait——derive_next_route 矩阵
-   已在，缺 PlanOutcome 真来源）+ import_defer→DeferredImporter（orchestrator/importer.py 既有）+
-   ImportWorker 装配 run.py。
-5. 接 CP8.7：README 运维操作面（启动命令/goal_brief 写法/policy 旋钮/console·status_card·文件请求交互/
-   恢复与停机语义/代理 7890）+ 步⑧步级验证三条全跑留证 + ROADMAP/本文件终态。
+## 下一步动作（按序）—— CP8.6 plan 全形态受理（正式可用性②）
+1. **exec target kind**（既有 legal baseline 上建变体）：
+   - _derive_plan：exec 目标校验 claim{baseline_ref,variant_key,config_json}；baseline_ref 解析
+     （canonical_key 字符串→baseline id，须 legal）；variant_key 未占核。
+   - claim 段：gate_claim_variant（返回 variant_id+build_target_id！注意它**自己建 build_target**——
+     与 build 的终局统一事务模式不同，须理顺：让 exec 走 gate_claim_variant 建的 bt，终局事务只补
+     plan_ref/eval_key/required？或改为 exec 也统一终局建（gate_claim_variant 的 bt 创建将重复）——
+     **设计点，开工时先读 gate_pool.gate_claim_variant 再定**。
+   - bundle 驱动：manifest target_kind=exec（schema 已备 build/exec 同约束）；register 走
+     gate_register_variant（非 register_baseline）。
+2. **eval target kind**（免训练评估）：manifest 只须 eval 命令（schema 已备）；无 run/checkpoint；
+   eval_action=create_evaluation（gate_register_evaluation create）或 append_attempt（append 模式 +
+   gate_start/finish_attempt？核 §4.2.5 eval 目标的 attempt 语义——附录/既有 gate_exec 有
+   gate_start_attempt/gate_finish_attempt）。{ckpt} 占位符来源=被评对象 checkpoint（claim/eval 定位）。
+3. **route 特化**：_setup_cycle 现对 attack intent 恒 route='attack'——按 plan 后 outcome 特化需要
+   plan 先行……但 route 在 setup 定、plan 在轮内跑。§2.3 规则5「route 在 plan 后特化」——现实现是
+   起手 attack、plan 落什么算什么。特化真正需要的：dependency_wait（import_defer/claim 撞占用→写
+   question_dep+释放 Qn+机械收尾不经 reasoning）。eval_only/reuse_only 可作为 attack 轮内自然形态
+   （targets 全 eval / 空）先不改 route 字面——**开工时按 §4.2.5 原文裁量，注意别过度工程**。
+4. **import_defer 接线**：_plan_stage 的显式拒 → 改为真受理：DeferredImporter（orchestrator/importer.py，
+   CP4.3 select_deferred 幂等守卫）落 external_import+占位 baseline+question_dep(pending) → 轮收
+   dependency_wait；ImportWorker 装配进 run.py（advancer.import_worker= + judge 需 import 侧 subject
+   装配器——CP8.3 注记：JudgeProvider 是 attack 专用，import 布局不同！给 ImportWorker 配一个
+   import-subject 版 judge 或复用 test 的写库范式？**开工先读 import_worker.resume_cycle/材料需求**）。
+5. 测试：exec 全链（先 build 得 legal baseline 再 exec 变体）/ eval 目标（append+create 两模式）/
+   import_defer→dependency_wait→物化→resolve dep / route 矩阵回归。真 Codex 冒烟可选（多轮成本高，
+   mock E2E 为主 + 保留既有冒烟证据）。
+6. 内审(Opus) → codex 外审(≤2轮) → 提交 → build_log 0039。
+7. 接 CP8.7：README 运维操作面 + 步⑧步级验证三条全跑留证 + 终态记账。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **审查类子代理一律 model:"opus"**（用户指示，见 memory）。
 - **codex 外审模式 B 后台跑**（Bash 120s 会杀，必须 run_in_background）：`env HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=… codex-chatgpt exec -s read-only --skip-git-repo-check --ignore-user-config --ephemeral -m gpt-5.5 -c model_reasoning_effort=xhigh -c approval_policy=never -C <scratch> -o <out> - < <prompt>`；prompt 声明「全部内联、无需执行命令」。两轮上限；外审 diff 排除记账类。
 - **本 harness 署名**：`Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`。
-- CP8.5 关键事实：
-  - StageProvider._produce 现对 resource_request.json 直接 raise RunnerError（fail-loud 占位，
-    stage_provider.py ~L100）；sidecar 校验 schema 名 "resource_request"（不在 ARTIFACT_SCHEMA_MAP，
-    经 validator() 直取——schemas.py 注释有说明）。
-  - notify.FileRequestService.create_checked（CP6.3）：schema→幂等→enabled→items 上限→quota→create；
-    make_advancer_precheck 已把 pending 文件请求作为全局阻断源。
-  - 真 Codex 冒烟工作区：scratchpad/smoke_m7（第一次）、smoke_m7b（第二次，build 链全通证据库）。
-- 测试基线 **613**。真 Codex 冒烟需代理 7890。
+- CP8.6 关键事实：
+  - gate_claim_variant(baseline_id, variant_key, config_json, cycle_id, seq, question_id)→
+    {variant_id, build_target_id}——**它自己建 exec build_target**（与 build 终局统一建不同）。
+  - gate_register_variant(variant_id, build_target_id, evaluation_id, cycle_id, subject_hash, run_id)。
+  - gate_exec 有 gate_start_attempt/gate_finish_attempt（失败 attempt 入账用；成功 attempt 只在
+    gate_register_evaluation 单事务里生）。
+  - manifest schema：eval kind 只须 commands.eval（禁 train/smoke）；exec 同 build（smoke+train+eval+
+    checkpoint+repro_cmd_md）。
+  - attack_stages 现状：_derive_plan 对 target_kind != build 一律 _PlanReject；_bundle_stage 命令序列
+    按 build 静态；manifest._check_manifest 拒非 build。
+  - derive_next_route 矩阵已在（advancer.py）：attack+blocked/import_deferred→dependency_wait、
+    仅 eval→eval_only、空→reuse_only——PlanOutcome 从未被真填过（PlanOutcome() 默认全 False）。
+  - importer.py=DeferredImporter（plan 侧三写入）；import_worker.py=物化 worker（resume_cycle 已接
+    advancer.import_worker 探测）。
+- 测试基线 **618**。真 Codex 冒烟需代理 7890；冒烟证据库 scratchpad/smoke_m7b。
