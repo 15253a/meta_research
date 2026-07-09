@@ -6,6 +6,7 @@
 
 ---
 
+- [0036](0036-cp83-production-assembly.md) — CP8.3 生产装配（bundle SKILL m7-1 真执行契约 + judge SKILL/review_verdict 契约 + StageProvider bundle passthrough + JudgeProvider 写 runner_call/DECISION；SKILL↔机器契约逐字段一致）· commit `c7863c0` · 验证: 通过（pytest 608/608；codex 第2轮 APPROVE）
 - [0035](0035-cp82-attack-stages-real-contract.md) — CP8.2 attack_stages 真契约化（消费冻结 plan/idea schema + gate_new_protocol/gate_claim_baseline 正式通道 + bundle manifest 驱动真执行 + toy TARGET_SPEC 清理；全自动不楔死[业务拒]与损毁 fail-loud 分流）· commit `d822add` · 验证: 通过（pytest 594/594；codex 两轮，BLOCKER 采纳修复+误读记录）
 - [0034](0034-cp81-execution-manifest.md) — CP8.1 execution_manifest 契约 + harness manifest 适配层（**步⑧ M7 开工**：不解冻冻结件，bundle 编译产物承载机器执行契约；防旁路交叉核 + 禁 shell/路径/env/超时围栏 + 净土物化正反对账）· commit `8b4f59a` · 验证: 通过（pytest 578/578，43 新；codex 两轮外审 BLOCKER 全修）
 - [0033](0033-cp75-longrun-verification.md) — CP7.5 M6 长跑步级验证 **——收尾步⑦ M6 建造**（不漂移[守卫上界内 question_dep/父指针/全 done]/可恢复[中途重启终库逐字节一致]/τ 自停[新实例拒推进]；诚实裁量：数百轮真跑属运维）· commit `f45dd6f` · 验证: 通过（pytest 535/535，3 新用例）

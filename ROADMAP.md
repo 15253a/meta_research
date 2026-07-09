@@ -15,10 +15,9 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑧（M7）CP8.3**（生产装配：bundle SKILL + judge provider + StageProvider 扩展）。
-  CP8.1 契约层（`8b4f59a`）+ CP8.2 attack_stages 真契约化（`d822add`）已落，594 测绿——mock provider 驱动
-  真组件的完整 attack 轮（idea→plan[真 gate]→bundle[manifest 真执行]→注册入池→真证据关问）已端到端跑通。
-  步①–⑦（M0–M6）建造面全部完成。
+- 进行中的步 / 检查点：**步⑧（M7）CP8.4**（run.py attack 全装配 + 全链 E2E + 真 Codex 冒烟——步级验证
+  核心）。CP8.1 契约层（`8b4f59a`）+ CP8.2 attack_stages 真契约化（`d822add`）+ CP8.3 生产装配
+  （`c7863c0`）已落，608 测绿。步①–⑦（M0–M6）建造面全部完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -240,9 +239,11 @@
     Codex 产物层 manifest/测量违约→目标 failed(artifact_invalid/protocol_violation)+pc；状态机/损毁类
     GateReject 仍 fail loud —— commit `d822add`（build_log 0035；pytest 594/594；codex 两轮：第1轮 3 BLOCKER
     +2 SHOULD 全修，第2轮采纳收窄 GateReject 捕获、驳回误读项[render 返回 ContextPack]并记录）。
-  - [ ] CP8.3 生产装配：bundle SKILL.md 真执行契约改写 + judge（review_verdict schema + judge skill +
-    JudgeProvider 写 runner_call(audit)+DECISION(judge)）+ StageProvider bundle/judge 扩展（passthrough
-    代码文件 + manifest 校验）。
+  - [x] CP8.3 生产装配：bundle SKILL.md 真执行契约改写（m7-1）+ judge（review_verdict schema + judge skill
+    + JudgeProvider 写 runner_call(audit)+DECISION(judge)，attack 专用）+ StageProvider bundle passthrough
+    + harness.latest_smoke_log 数值序（attack/judge 两侧同口径）—— commit `c7863c0`（build_log 0036；
+    pytest 608/608；codex 两轮：第1轮 2 BLOCKER[?键诱导非法 JSON/result 材料缺代码]+3 SHOULD 全修，
+    第2轮 APPROVE）。
   - [ ] CP8.4 run.py attack 全装配 + 步级验证：build_system 装配 AttackStages 全家 → 全链 E2E（mock）+
     真 Codex CLI 冒烟 ≥1 完整 attack 轮。
   - [ ] CP8.5 sidecar→file_request 桥：StageProvider resource_request → notify.create_file_request +
