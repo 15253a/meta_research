@@ -271,7 +271,7 @@ class ImportWorker:
                 self._target_pc(cyc_id, bt_id)
                 return False
             from .attack_stages import AttackStages
-            metrics = AttackStages._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"), spec)
+            metrics = AttackStages._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"))
             ckrow = d.query_one("SELECT ckpt_key, content_hash FROM checkpoint WHERE produced_by_run=?", (rid,))
             res_sh = SM.subject_hash(SM.result_review_manifest(
                 metrics_artifact_hash=_canon_hash(metrics), checkpoint_hashes={ckrow[0]: ckrow[1]},

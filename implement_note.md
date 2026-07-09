@@ -5,7 +5,10 @@
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
 - 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.2**（attack_stages 真契约化）
-- 检查点状态：待开工（CP8.1 已提交入库 + 记账完毕）
+- 检查点状态：内审全修（586）→ codex 第1轮 REQUEST_CHANGES（3 BLOCKER[复用协议 metric 绑定/target_key·seq·
+  metric_id 唯一/plan artifact 获取在 try 外]+2 SHOULD[resume 未 re-validate manifest/bundle 契约违规楔死]全修，
+  593 测绿）→ **外审第 2 轮进行中**（codex 后台 b182slwam；out=scratchpad cp82_r2_out.md）。已 git add。
+  build_log 0035 草稿备好（scratchpad build_log_0035_draft.md，待填第2轮结论）。
 
 ## 正在做什么
 **步⑧：plan 契约缺口补齐 → 全流程 real-Codex attack**（用户 2026-07-09：补齐缺口，成品要能完整走完整个
