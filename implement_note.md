@@ -5,7 +5,10 @@
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
 - 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.3**（生产装配：bundle SKILL + judge + StageProvider 扩展）
-- 检查点状态：待开工（CP8.2 已提交 d822add + 记账中）
+- 检查点状态：内审 APPROVE（1 SHOULD+2 NIT 已修）→ codex 第1轮 REQUEST_CHANGES（2 BLOCKER[judge SKILL
+  ?键诱导非法 JSON / result review 缺代码+metric 可被截断]+3 SHOULD[kind 白名单/smoke 数值序两侧统一/
+  SKILL cfg.json 措辞]+1 NIT 全修，608 测绿）→ **外审第 2 轮进行中**（be6bjv7q7；out=scratchpad
+  cp83_r2_out.md）。已 git add。build_log 0036 草稿在 scratchpad（待填第2轮结论）。
 
 ## 正在做什么
 **步⑧：plan 契约缺口补齐 → 全流程 real-Codex attack**。已落：

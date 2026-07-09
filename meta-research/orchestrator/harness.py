@@ -57,6 +57,21 @@ def file_sha256(path: str) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def latest_smoke_log(smoke_dir: Path) -> Optional[Path]:
+    """smoke-<N>.log 按 **N 数值**取最新——字典序会把 smoke-10 排在 smoke-2 前（崩溃重跑序号可超 9，
+    codex SHOULD）。非法名（serial 非整数）不参与。无则 None。消费方：attack_stages subject 构造 +
+    JudgeProvider 材料装配（两侧必须同一「最新」口径，否则 subject_hash 与评审材料看的不是同一份）。"""
+    best: Optional[tuple] = None
+    for p in Path(smoke_dir).glob("smoke-*.log"):
+        try:
+            n = int(p.stem.split("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if best is None or n > best[0]:
+            best = (n, p)
+    return best[1] if best else None
+
+
 def register_execution_log(daemon: WriteDaemon, *, cycle_id: str, log_kind: str, ref: str,
                            content_hash: str, n_bytes: int, run_id: Optional[int] = None,
                            evaluation_attempt_id: Optional[int] = None) -> int:

@@ -1,53 +1,72 @@
-# SKILL · bundle —— 逐目标串行执行（KIND 分支 + 双评审）
+# SKILL · bundle —— 产可执行包：代码 + identity + execution_manifest（一目标一调用）
 
-> 版本：m0-1。按《第一部分》§3.4 与流程图 05-Bundle；产物 schema = `schemas/bundle_target.schema.json`
-> （逐目标一份）。
-> **M0 桩行为（重要）**：本阶段由驱动器确定性代跑——不起 Codex 构建会话、不真训练；
-> 每个 target 由驱动器生成**造假产物**（evaluation.source='fake'、execution_log/observation
-> synthetic=true），双评审为**占位判官**（review 对象 stub=true、自动 pass）。
-> 本文件同时写明 M4 起的真执行契约：届时只换执行方式、不换产物契约与流程序。
+> 版本：m7-1（步⑧：真执行契约，替换 M0 造假桩说明）。按《第一部分》§3.4 与流程图 05-Bundle。
+> 产物 schema = `schemas/execution_manifest.schema.json`（manifest）；代码/identity 为自由文件。
+> **分层铁律**：计划（做什么）在上游 plan 已锁死并以「resolved 计划切片」给你（上下文包①固定锚）；
+> 你产「怎么做」的**可执行包**；编排器交叉核对切片后由 harness **机械执行** manifest 命令——
+> 你写错契约字段，包会被拒（目标 failed），所以照抄锚区给出的绑定值、不要自创。
 
 ## 通用
 
-- **触发条件**：plan 产出 targets 非空（route=attack / eval_only）。
-- **读取**（逐目标）：计划切片（该 target + 协议 + required_metric）+ identity 模板 + env 锁 +
-  依赖基线 identity · 同 failure_kind 失败卡。
-- **门禁与写入**：逐目标产 bundle_target 产物 → 三级校验 → gate 注册（M0 门禁桩放过业务级）。
-- **失败语义**（P4 失败即观测，不自行兜底）：
-  - 工程问题在阶段内自愈（smoke 修复循环无次数上限、受预算+watchdog）；预算尽+追加一次+
-    换会话仍败 → `engineering_blocked` + 通知人，**工程失败永不入问题树**；
-  - 训练失败/超时 → run(failed,failure_kind) + 失败卡 → 目标 failed；
-  - 训练成功但评估失败 → run 保持 success + attempt(failed)，目标 failed（两条不同的边）；
-  - 双评审轮数用尽 → 目标 failed(review_failed)（代码评审失败不训练省成本；结果评审失败
-    测量整包不注册，run+checkpoint 保留）；
-  - RFAIL 分流（状态归属对齐 06f 状态机）：**已执行而失败的目标恒为 `failed`（携
-    failure_kind 与执行事实，成败同记）**；critical 失败 → **早退**带失败摘要，此时
-    **剩余未执行的 pending 目标才置 `skipped`**（未执行旁路，不携任何执行事实）；
-    非 critical 失败 → 本目标记 failed，继续取下一个 pending 目标；
-  - 一切失败裁决权属轮尾 reasoning。
+- **触发条件**：plan 产出 targets 非空（route=attack）后，编排器按 seq **严格串行**、逐目标调用你
+  （一次一个 target、一信封一包；目标间不共上下文）。
+- **读取**（上下文包①固定锚「本目标」节）：resolved 计划切片全文（target_key/target_kind/seq/spec_md/
+  claim/budget…）+ **plan_slice_hash**（64 个十六进制字符的 sha256 串，照抄）+ **required 指标绑定**
+  （形如 `1@1` 的 int 对，eval 输出用）+ 协议绑定 protocol_id/protocol_ver。
+- **门禁与写入**：你的包经编排器三级校验（schema + 切片交叉核 + 围栏）后物化执行；执行事实与测量经
+  gate 注册入库（**两段提交**：段(i) 执行事实随发生入账，段(ii) 结果评审过后才注册测量整包）——
+  全部由编排器负责，你不写库。
+- **失败语义**（P4 成败同记，编排器状态机执法，你须知其后果）：
+  - manifest/包非法 → 目标 failed(artifact_invalid)；smoke 败 → failed(smoke)；训练/评估败 →
+    failed(runtime)；评审否决 → failed(review_failed)；测量不满足协议 → failed(protocol_violation)；
+    工程性无法推进 → engineering_blocked。
+  - **critical 目标失败 → 早退**：本 cycle 剩余未执行的 pending 目标置 **skipped**（未执行旁路）；
+    非 critical 失败 → 本目标 failed、继续下一目标。一切失败裁决权属轮尾 reasoning。
+  - 隔离说明：canary 期代码物化在编排器管理的 staging（净土物化+哈希对账）；git worktree 级隔离与
+    env lock 强校验属后续硬化步——不要在包里假设可写任意路径。
 
-## 执行流程（每 target，严格串行；游标 bundle_cursor 由编排器落库）
+## 产出（一个信封装齐；文件名即信封 files 的键）
 
-按 `target_kind` 分支：
+1. **代码文件**（≥1 个，通常 `train.py` / `eval.py` / `smoke.py` / 配置文件）：实现切片 `spec_md`
+   声明的构建/训练/评估。代码/文本文件的值为字符串；`.json` 配置文件的值可为 JSON 对象（编排器物化
+   为规范化 JSON）。可用子目录（如 `pkg/util.py`）；相对路径，禁 `.`/`..` 段。
+2. **`identity.md`**：该 baseline 的人可读身份——名称、用途、结构/机制摘要、能力摘要，**必含
+   「## 复现命令」节**（注册入池后它就是池资产的身份文档）。
+3. **`execution_manifest.json`**（机器执行契约，逐字段规则）：
+   - `manifest_version`: 1。
+   - `target_ref`: `{target_key, target_kind, seq, plan_slice_hash}` —— 全部**照抄锚区切片与
+     plan_slice_hash**（编排器重算核对，抄错即拒）。
+   - `protocol_ref`: `{protocol_id, protocol_ver}` —— 照抄锚区（int）。
+   - `env_hash`: 环境指纹声明串（如 `"py311-torch21-cpu"`；同环境同串）。
+   - `config_json`: 代码实际使用的配置对象。**切片 claim.config_json 非空时须与之完全一致**
+     （计划是配置的决定者）；切片未给则你自定（并让代码真用它）。
+   - `code_files`: 信封中全部代码/配置文件名的清单（**不含**保留名 identity.md / execution_manifest.json /
+     _staged.ok）。
+   - `commands`: `{smoke, train, eval}` 三个都要（build 目标）。每个 = `{"argv": [程序, 参数…],
+     "timeout_s": 秒}`（timeout_s 可整键省略；**键名逐字，不要加 `?` 等多余字符**）：
+     - **argv 数组、禁 shell**：不得用 `bash -c` / `sh` / `env` 作程序名；一个 token 一个参数。
+     - 占位符：`{src}` = 代码物化目录（如 `["python", "{src}/train.py"]`）；`{ckpt}` = 训练产
+       checkpoint 路径（**仅 eval 命令可用**，如 `["python", "{src}/eval.py", "{ckpt}"]`）。
+     - 命令的 cwd 是独立的 run 目录（不是代码目录）：读代码走 `{src}`，写产物写 cwd 相对路径。
+     - 路径围栏：绝对路径 token 只许指向运行区或运维放行的数据根；相对 token 禁 `..`。
+   - `expected_outputs`: `{checkpoint: "<train 命令在其 cwd 产出的 checkpoint 相对路径>"}`（如
+     `"ckpt.bin"`）。train 代码**必须**真产出该文件。
+   - `repro_cmd_md`: 人可读复现命令块（与 identity.md 复现节一致）。
+   - `env`: 附加环境变量（可整键省略；大写键；禁改 PATH/PYTHONPATH/PYTHONHOME/HOME/LD_*）。
 
-- **eval（免训练）**：用既有 legal 变体 checkpoint 评估 → 结果落 staging →
-  **结果评审**（result_review）→ 三级校验 → gate_register_evaluation（按 eval_action 定位/
-  创建 evaluation 或追加 attempt）。**不建 run**。评估失败/超时 → attempt(failed)。
-- **build / exec**：开隔离工作区（M4：Git worktree，写权仅 worktree+artifacts、网络默认关）→
-  构建变体（config + overrides，不复制整份 src）→ **smoke**（快速能跑判定）→
-  **代码适配评审**（code_review：独立评审只见 plan 切片+代码产物+smoke 结论；判据 = 实现与
-  plan 适配、无缩水、无不当实现；≤policy bundle_code_review 轮）→ 训练 run(kind=build|exec) →
-  checkpoint(s) → **出厂评估**（source=factory）→ **结果评审**（result_review：对象一律 staging
-  产物——结果 artifact + checkpoint hash + 运行日志/观测 staging + identity 草稿；判据 = 结果与
-  log 合理、据结果反查代码无明显 bug；**log 仅供评审读、不进门禁不作证据**；
-  ≤policy bundle_result_review 轮）→ 三级校验（I2）→ 注册入池（复制非剪切）→ 目标 complete。
+## 执行流程契约（你的代码必须满足；编排器按此机械驱动 smoke→train→eval）
 
-**两段提交纪律**（§4.2.5；M0 由驱动器模拟同一顺序）：段(i) 执行事实**随发生**短事务入账
-（start_run 开训即 running、finish_run+checkpoint、run-owned log/观测、失败 attempt）；
-段(ii) **结果评审通过后**才单事务注册测量整包（evaluation+attempt(success)+metric_result+
-attempt-owned log 补登+gate_register_*+target complete）。评审否决 → 段(ii) 不发生
-（run(success)+checkpoint 保留、测量不注册）。目标间不共事务，崩溃从 bundle_cursor 续。
+- **smoke**：秒级快速可跑判定（如小步前向）；退出码 0=过。失败 → 目标 failed(smoke)。
+- **train**：真训练；向 stdout 打印 `loss: <float>` 轨迹行（观测 parser 消费）；结束前在 cwd 写出
+  `expected_outputs.checkpoint`；退出码 0=成功。
+- **eval**：读 `{ckpt}` 评估，向 stdout 对**锚区 required 的每个绑定**打印一行
+  `metric_value: <metric_id>@<metric_ver>=<float>`（int 照抄，如 `metric_value: 1@1=0.93`）；
+  退出码 0=成功。**漏打 required 指标 = 测量注册被拒（目标 failed）**。
+- 失败语义（P4 成败同记，状态机由编排器负责）：训练/评估失败会如实入账（run/attempt failed），
+  不要在代码里吞错误装成功；**指标值必须来自真计算**——硬编码/伪造会被结果评审 fail。
 
-每 target 产物必含：execution_logs（train/eval/smoke 的 ref+content_hash）+ execution_observation
-（结构化观测）+ identity 草稿（build/exec）。**M0：以上全部由驱动器造假生成并显式标记**
-（source='fake'、synthetic=true），metric 数值为固定 toy 序列——只验流程契约、不代表任何研究结论。
+## 双评审（编排器另行调用独立判官，你无须产评审文件）
+
+代码适配评审 **bundle_code_review**（smoke 后、训练前）与结果评审 **bundle_result_review**（评估后、
+注册前）见 `prompts/skills/judge/SKILL.md`；被 fail 即目标 failed(review_failed)。
+把 spec_md 忠实实现、让 log 与结果自洽，是过审的全部要诀。
