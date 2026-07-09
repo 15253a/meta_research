@@ -1,35 +1,151 @@
-# meta-research 元循环系统（施工中）
+# meta-research 元循环系统 —— 运维操作手册
 
-依据 `../reference/`（三部分施工标准 + 流程图）实现；当前进度见仓库根 `ROADMAP.md`。
-本 README 只说明目录布局与当前里程碑边界，**设计真相唯一在 `../reference/第一部分-系统架构设计.md`**。
+自主研究编排器：一条命令让真 Codex 全自动跑「出题 → 分解 → 建基线/变体 → 训练 → 评估 → 双评审 →
+关问」的研究元循环。**确定性编排器从不推理**（Codex 是无状态阶段工人，只产合 schema 的产物，永不碰
+数据库）；SQLite 是唯一真相（36 表冻结 DDL + 三重锁）；真执行由 harness 跑真子进程；崩溃 kill-9 可
+从 DB 无半写恢复。
 
-## 目录布局（对齐《第二部分》§6.3；随里程碑逐步补齐）
+> 设计真相唯一在 `../reference/第一部分-系统架构设计.md`；本 README 是**操作面**（怎么跑、怎么配、怎么
+> 观测/干预、边界在哪）。构建历史见仓库根 `ROADMAP.md` / `build_log/`。
+
+## 0. 一分钟跑起来
+
+```bash
+cd meta-research
+python -m pip install -r requirements-dev.txt          # pytest / jsonschema / PyYAML（+真 Codex 见下）
+python -m pytest tests/ -q                              # 自验：623 测应全绿
+
+# 全自动跑（需真 Codex CLI + 代理，见 §2）：
+export HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890
+python -m orchestrator.run --system-root . --work-root /path/to/run_dir --max-cycles 50
+```
+
+- `--system-root`：含 `input/goal_brief.md`、`policies/`、`prompts/`、`schemas/` 的仓库根（一般就是 `.`）。
+- `--work-root`：本次运行的产物根（`research.sqlite` / `cycles/` / `state/` 落这里）。**重启用同一个
+  work-root 即从断点续跑**（DB 权威，非进程内记忆）。
+- `--max-cycles`：本次最多推进轮数（安全上限，默认 100，与系统自终止并存）。
+
+停机时打印 `[run] dual_mode=… 推进 N 轮：[…]；停因=…`。停因见 §6。
+
+## 1. 启动输入：研究目标书
+
+`input/goal_brief.md` 是启动输入①（§4.6.7）：YAML frontmatter 必含合法 `predicate_json`（成功谓词——
+**首次建库时**缺失/非法则**启动即失败**，这是机器契约不是约定；重启已建库时以 DB 里的 goal 为权威、
+不重解析 brief，故改 brief 不会污染在建目标——演化走 goal_amend），其后是中文正文。仓库内已有一个 toy
+示例（合成二维双高斯二分类）。写你自己的目标时：
+
+```markdown
+---
+predicate_json: {
+  "kind": "metric_comparison",
+  "protocol": "<协议名>", "protocol_ver": 1,
+  "metric_id": "<指标名>", "metric_ver": 1, "scope": "aggregate",
+  "success": { "op": ">=", "value": 0.90 }
+}
+---
+# 研究目标
+<中文正文：背景、要回答什么、评估口径注意事项>
+```
+
+`predicate_json` 编码「什么算研究成功」——根问题由满足此谓词的真实测量证据关闭；随 `goal_amend` 版本演化。
+目标正文引导真 Codex 的出题方向（例：想让它先建基线家族再做变体对照，就在正文里说清）。
+
+## 2. 真 Codex 运行时（工程配置）
+
+真执行走本机 `codex exec` 一次性无状态调用。工程配置走**环境变量**（模型/二进制是工程事实，不进
+`policy.yaml` 旋钮注册表）：
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `METARESEARCH_CODEX_BIN` | `codex-chatgpt` | 本机已认证的 codex 包装 |
+| `METARESEARCH_CODEX_MODEL` | `gpt-5.5` | 模型 |
+| `METARESEARCH_CODEX_EFFORT` | `medium` | 推理力度 |
+| `METARESEARCH_RUNNER_TIMEOUT_S` | `900` | 单次 Codex 调用超时（工程超时；研究执行时限另见 policy.flow.watchdog） |
+| `HTTP_PROXY`/`HTTPS_PROXY` | — | 真 Codex 需要（本机 7890）；OS 级，由 codex 子进程继承（runner 不显式读） |
+
+冒烟自检（一条命令跑通至少一个完整 attack 轮）：
+```bash
+python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
+```
+
+## 3. 可调旋钮：policy.yaml
+
+`policies/policy.yaml` 是全部可调旋钮的唯一权威（机制代码零硬编码；全量注册表 = 第一部分附录 C）。常改的：
+
+- `budget`：`B0` 单轮预算、`B_max` 上限、`session_max` 全局成本安全网（ledger.money 求和上限）。
+- `flow.tau`：自终止判据①——`score_floor` 分数地板、`consecutive_rounds` 连续几轮低分即停。
+- `tree_guard`：`max_decompose_depth` / `max_children_per_node` / `max_open_questions`（问题树规模护栏）。
+- `execution`：manifest 命令围栏——`default_timeout_s` / `max_timeout_s` / `path_allowlist`（允许 argv
+  引用的 work_root 以外绝对路径前缀，如真数据根）。
+- `session.dual_mode`：A=一 turn 一阶段（默认；A/B 实测定默认属运维）。
+
+> **改 policy.yaml 是决策性变更**（影响研究语义/门禁/预算）——生产改动应走评审。改后 `pytest
+> tests/test_schemas.py` 会校验它仍合 `schemas/policy.schema.json`。
+
+## 4. 观测与人工干预（跑起来之后）
+
+- **状态卡**：`<work-root>/state/status_card.json`——每阶段边界原子发布的人可读快照（当前轮/问题/进度）。
+- **控制台指令**：通过 `interaction_message` 入站（连接器落库）→ 分类器保守三分类（可能改状态的一律当
+  directive 并回显确认）。`pause`/`resume` 控制推进；`query` 走只读应答器（不改研究状态）。
+- **文件请求**：某阶段确实无法自取资料时会产 `resource_request` → 落 `interaction_request(pending)` →
+  **系统干净停在该轮游标处等待**（全局等待，无自动超时）。把文件放到 `input/user_provided/` 后由运维
+  `resolve` 请求单 → 重启/续跑即从同一阶段重做。
+- **审计链**：一切决策/执行/测量都在 DB（`decision` / `run` / `evaluation` / `execution_log` /
+  `runner_call` / `ledger`）；产物 transcript 归档在 `<work-root>/cycles/<id>/transcripts/`。
+
+## 5. 系统能做什么（当前研究形态）
+
+- **build target**：从零建 baseline 家族（写代码 → smoke → 代码评审 → 训练 → 出厂评估 → 结果评审 →
+  注册入池）。
+- **exec target**：既有 legal baseline 上建变体（消融/替换/超参对照）→ register_variant 入池。
+- **reasoning-only**：bootstrap 创世根问题 / decompose 分解 / terminate 收口。
+- **人机**：query 应答、directive（pause/resume）、文件请求全等待环。
+- **安全网**：τ 自终止（价值衰退 / 预算耗尽）；kill-9 崩溃恢复；全自动**不楔死**（任何站不住的 Codex
+  产物 → 业务拒/目标 failed + 记账，绝不死循环）。
+
+## 6. 停机语义（停因）
+
+| 停因 | 含义 |
+|---|---|
+| `score_floor` | τ 判据①：前沿问题最高分连续 N 轮低于地板（价值衰退自终止） |
+| `budget_exhausted` | τ 判据②：全局成本（ledger.money 求和）≥ session_max。⚠️ **当前休眠**：成本记账（`INSERT INTO ledger`）尚未接线，SUM 恒 0、永不触发——安全网已装、待成本落账即生效（M6 硬化项，见 §7）。**在此之前 session_max 不构成真实成本护栏** |
+| `prior-terminate` / `max_cycles/terminate` | 上轮选择 terminate / 达 max_cycles |
+| `pause 指令生效中` | 人工 pause 阻断 |
+| `文件请求 #N 等待用户提供` | 全局等待（阶段发文件请求，待 resolve） |
+
+durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 启动也拒推进，直到状态改变。
+
+## 7. 诚实边界（operational canary）
+
+当前是**运维金丝雀态**，足以让真 Codex 端到端跑通并验证研究链路，但正式跑数百轮真研究前仍须硬化：
+
+- 代码物化在编排器管理的 staging（净土物化 + sha256 哈希对账 + argv-only 禁 shell + 路径/env 围栏），
+  **但真 git worktree 隔离 + env lock 强校验属后续硬化步**。
+- **全局成本安全网（`budget.session_max`）当前休眠**：`ledger.money` 成本落账尚未接线（`INSERT INTO
+  ledger` 未接），故 `SUM=0`、`budget_exhausted` 永不触发——真跑长时研究前须先接成本记账，否则失控成本
+  无自动上限（只有 `--max-cycles` 与 τ 分数衰退兜底）。
+- 已支持 build / exec target；**eval target（免训练评估）与 import（外部基线导入）+ route dependency_wait
+  特化 = 后续检查点（CP8.6b）**——遇到它们系统会干净业务拒、不楔死。
+- 假执行标记（`source=fake` / `synthetic=true`）是 M0–M3 验收期语义，真执行起已移除。
+
+## 8. 自验
+
+```bash
+python -m pytest tests/ -q                       # 全量（含契约/gate/恢复/attack 全链/frozen 锁）
+python -m pytest tests/test_frozen_contracts.py  # 冻结件锁：plan.schema + MIGRATION_SHA256 未漂移
+```
+
+## 目录布局
 
 ```
 meta-research/
-├── policies/policy.yaml     # 全部可调旋钮（P2；全量注册表 = 第一部分附录 C，每旋钮带默认值）
-├── prompts/                  # system_prompt + 四阶段 skill（CP1.2 落地）
-├── schemas/                  # 四阶段产物 JSON Schema + sidecar + policy schema（Gate 校验对象，§6.11）
-├── orchestrator/             # 确定性编排器（Python；M0 = 接口 + 桩 + 最小驱动器）
-│   └── interfaces.py         #   流程层↔资产层唯一缝（§6.10 Protocol；桩与真实现共用签名）
-├── input/
-│   └── goal_brief.md         # 启动输入①：研究目标书（YAML frontmatter 含 predicate_json，§4.6.7）
-├── tests/                    # 自验（pytest）：schema 元校验 + 正/负例 + policy / goal_brief 解析
-├── engines/wildidea/         # vendored idea 引擎（M0 仅 adapter 骨架位，后续里程碑落）
-├── db/                       # SQLite 唯一真相（M1 落地；M0 禁建——见下）
-├── views/ baselines/ protocols/ questions/ uploads/ connectors/   # 后续里程碑落地
+├── input/goal_brief.md      # 启动输入①：研究目标书（frontmatter predicate_json + 中文正文）
+├── policies/policy.yaml     # 全部可调旋钮（唯一权威 = 第一部分附录 C）
+├── prompts/                 # system_prompt + idea/plan/bundle/reasoning/judge SKILL（措辞即行为）
+├── schemas/                 # 产物 JSON Schema（四阶段 + execution_manifest + review_verdict + policy + sidecar）
+├── orchestrator/            # 确定性编排器：run.py 入口 / advancer / attack_stages / gate_* / manifest /
+│                            #   harness / stage_provider / compiler / recall / notify / console / mediator …
+├── db/migrations/           # 冻结 DDL（0001_appendix_a.sql；三重锁 = checksum + count + user_version）
+├── tests/                   # pytest 自验（623）
+└── <work-root>/             # 运行期产物（research.sqlite / cycles / state；--work-root 指定，不在仓库内）
 ```
-
-## 自验
-
-```bash
-python -m pip install -r requirements-dev.txt   # pytest / jsonschema / PyYAML
-python -m pytest tests/ -q                       # 在本目录（meta-research/）下运行
-```
-
-## 当前里程碑边界（M0，验收 = 第三部分 §7.1 M0 行）
-
-- **只验流程契约、不验不变量**：Gate 桩只做 schema + 引用完整性两级，业务门禁放过。
-- **不建 DB**：不得写 M1 才存在的真实 DB 表（`db/` 目录保持为空）。
-- **假执行必须显式标记**：驱动器造假的 evaluation 标 `source=fake`；execution_log / execution_observation 标 `synthetic=true`。
-- **Runner 从 M0 起即真**（`codex exec` 一次性调用，无状态工人）。
