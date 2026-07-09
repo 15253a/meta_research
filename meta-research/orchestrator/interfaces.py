@@ -52,11 +52,15 @@ class ContextPack:
 @dataclass
 class CallUsage:
     """一次 runner(LLM) 调用的真实用量（步⑩ M6 成本记账）：codex CLI 在 stderr 报**总 token**，本机计墙钟秒。
-    CP10.2 据此写 ledger（money=tokens/1000×price）。codex 只报总 token 不拆输入/输出 → input/output 置 0、total 为真值。"""
+    CP10.2 据此写 ledger（money=tokens/1000×price）。tokens_known 明确区分「真 0」与「未捕获到汇总」；
+    codex 只报总 token 不拆输入/输出 → input/output 置 0、total 为真值。"""
     tokens_total: int = 0
     tokens_input: int = 0
     tokens_output: int = 0
     wallclock_sec: float = 0.0
+    # True 表示 runner 确实观测到用量汇总（值可以是 0）；False 表示 CLI 未回报/格式漂移。
+    # 预算开启时两者不得混同：未知不能冒充真 0 继续产生成本。
+    tokens_known: bool = False
 
 
 @dataclass

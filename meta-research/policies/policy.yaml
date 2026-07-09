@@ -9,7 +9,7 @@ acquisition: { w1: 0.35, w2: 0.25, w3: 0.30, c: 0.10 }
 
 # —— 预算 ——
 # 单位与 ledger 一致（USD 等效）；初值≈廉价探针
-budget: { B0: 5, doubling_period_m: 8, B_max: 40, session_max: 100000 }   # session_max=全局成本(ledger.money 求和)安全网上限（§4.4.6 判据②，M6；null 关闭）；100000 为失控兜底、远高于合法长跑（B_max=40×数百轮），A/B 实测后细化。ledger 写入=M6 硬化，未接前本网休眠
+budget: { B0: 5, doubling_period_m: 8, B_max: 40, session_max: 100000, price_per_1k_tokens: 0.3 }   # session_max=全局成本(ledger.money 求和)安全网上限（§4.4.6 判据②，M6；null 关闭）；100000 为失控兜底、远高于合法长跑（B_max=40×数百轮），A/B 实测后细化。price_per_1k_tokens=步⑩ tokens→money 汇率（ledger.money=tokens/1000×本值），notional/USD-等效、provisional（缺省使 cycle≈B_max 量级、session_max 为失控兜底）；session_max 启用时本值必须有限且>0，只有 session_max=null 关闭预算网时才允许 0。A/B 实测后细化。ledger 写入=M6 硬化（步⑩ CP10.2 接线）
 
 # —— 流程阈值 ——
 flow:

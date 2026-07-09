@@ -106,12 +106,28 @@ def test_policy_yaml_parses_and_validates():
     make_validator("policy").validate(policy)
 
 
+def test_policy_budget_price_required_and_positive_when_session_limit_enabled():
+    with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
+        base = yaml.safe_load(f)
+    validator = make_validator("policy")
+    for budget in (
+            {k: v for k, v in base["budget"].items() if k != "session_max"},
+            {k: v for k, v in base["budget"].items() if k != "price_per_1k_tokens"},
+            {**base["budget"], "price_per_1k_tokens": 0}):
+        with pytest.raises(ValidationError):
+            validator.validate({**base, "budget": budget})
+    # 明确关闭 session 网时允许零价（仍可保留零成本审计行）。
+    validator.validate({**base, "budget": {**base["budget"], "session_max": None,
+                                             "price_per_1k_tokens": 0}})
+
+
 def test_policy_defaults_match_appendix_c_spotchecks():
     """抽核与附录 C 的关键默认值一致（防手滑改默认；全量对齐由 schema 结构保证）。"""
     with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
         p = yaml.safe_load(f)
     assert p["acquisition"] == {"w1": 0.35, "w2": 0.25, "w3": 0.30, "c": 0.10}
-    assert p["budget"] == {"B0": 5, "doubling_period_m": 8, "B_max": 40, "session_max": 100000}  # session_max: M6 CP7.1 全局安全网
+    assert p["budget"] == {"B0": 5, "doubling_period_m": 8, "B_max": 40, "session_max": 100000,
+                           "price_per_1k_tokens": 0.3}  # session_max: M6 CP7.1 全局安全网；price: 步⑩ CP10.2 记账汇率
     assert p["flow"]["retry"] == {
         "artifact_parse": 2, "plan_review": 2,
         "bundle_code_review": 3, "bundle_result_review": 3,

@@ -22,6 +22,7 @@ from orchestrator.stage_provider import StageProvider
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+NO_BUDGET_POLICY = {**POLICY, "budget": {**POLICY["budget"], "session_max": None}}
 SCHEMAS = SchemaSet(SYSTEM_ROOT / "schemas")
 SKILLS = {s: f"[skill:{s}]" for s in ("idea", "plan", "bundle", "reasoning")}
 
@@ -46,7 +47,7 @@ class MockRunner:
 def _provider(scripted, work):
     runner = MockRunner(scripted)
     sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS,
-                       policy=POLICY, system_prompt="SYS", skills=SKILLS, work_root=str(work))
+                       policy=NO_BUDGET_POLICY, system_prompt="SYS", skills=SKILLS, work_root=str(work))
     return sp, runner
 
 
@@ -130,7 +131,7 @@ def test_stage_drift_retries(tmp_path):
             return Artifact(stage=st, files=files, md="")
     runner = DriftRunner([("plan", {"selection.json": _GOOD_SELECTION}),      # 漂移
                           ("reasoning", {"selection.json": _GOOD_SELECTION})])
-    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
                        system_prompt="S", skills=SKILLS, work_root=str(tmp_path))
     out = sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning"))
     assert out == {"selection.json": _GOOD_SELECTION}
@@ -141,7 +142,7 @@ def test_transcript_purpose_unique_per_call(tmp_path):
     """调用序号递增（transcript 文件名唯一，P6 回放防覆盖）。"""
     seen = []
     sp = StageProvider(runner_factory=lambda td, pt: (seen.append(pt), MockRunner(
-        [{"selection.json": _GOOD_SELECTION}]))[1], schemas=SCHEMAS, policy=POLICY,
+        [{"selection.json": _GOOD_SELECTION}]))[1], schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
         system_prompt="S", skills=SKILLS, work_root=str(tmp_path))
     sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning"))
     sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning"))
@@ -268,7 +269,7 @@ def _judge_env(tmp_path):
 def _judge(daemon, work, scripted):
     from orchestrator.stage_provider import JudgeProvider
     runner = MockRunner(scripted)
-    jp = JudgeProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+    jp = JudgeProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
                        system_prompt="SYS", skill="[skill:judge]", daemon=daemon, work_root=str(work))
     return jp, runner
 
@@ -385,7 +386,7 @@ def test_sidecar_bridged_to_file_request(tmp_path):
         seen.update(stage=stage, request=request, cyc=cyc)
         return 42
     runner = MockRunner([{"selection.json": _GOOD_SELECTION, "resource_request.json": _SIDECAR}])
-    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
                        system_prompt="S", skills=SKILLS, work_root=str(tmp_path), file_request_bridge=bridge)
     cyc = NS(cycle_id="c1", question_id="q1")
     with pytest.raises(StageBlockedOnResources) as ei:
@@ -402,7 +403,7 @@ def test_sidecar_bridge_reject_feeds_retry(tmp_path):
         raise FileRequestReject("quota 已达上限")   # 只有业务拒进重试；其余异常 fail loud（内审 NIT）
     runner = MockRunner([{"selection.json": _GOOD_SELECTION, "resource_request.json": _SIDECAR},
                          {"selection.json": _GOOD_SELECTION}])                    # 第 2 次放弃 sidecar
-    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
                        system_prompt="S", skills=SKILLS, work_root=str(tmp_path), file_request_bridge=bridge)
     out = sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning"))
     assert out == {"selection.json": _GOOD_SELECTION}
@@ -429,7 +430,7 @@ def test_sidecar_bridge_nonbusiness_error_fails_loud(tmp_path):
         raise _sqlite3.OperationalError("database disk image is malformed")
     runner = MockRunner([{"selection.json": _GOOD_SELECTION, "resource_request.json": _SIDECAR},
                          {"selection.json": _GOOD_SELECTION}])   # 若误重试会吃到第 2 项
-    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
                        system_prompt="S", skills=SKILLS, work_root=str(tmp_path), file_request_bridge=bridge)
     with pytest.raises(_sqlite3.OperationalError, match="malformed"):
         sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning"))

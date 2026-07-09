@@ -1,0 +1,252 @@
+"""CostLedger —— LLM 调用成本记账（步⑩ M6 CP10.2）。
+
+每次可知用量的真 LLM(Codex) 调用后写一行 `ledger`（+ 需要时补 `runner_call`），把 CP10.1 捕获的真用量（token/墙钟）
+折成 `money = tokens/1000 × policy.budget.price_per_1k_tokens`。这**激活**了 `stopcontroller` 早已装好的全局
+预算安全网（`SUM(ledger.money) ≥ session_max` → `budget_exhausted` 干净停）——在此之前 ledger 无写者、SUM 恒 0、网休眠。
+用量缺失/不可信时不伪造零成本 ledger：预算开启则落 failed runner_call + durable
+`cost_accounting_failed` 并立即停；只有 `session_max=null` 的显式诊断模式允许未知按零 best-effort 审计。
+
+**两个写法**（因 runner_call 归属不同）：
+- `record(...)`：StageProvider 用——idea/plan/bundle/reasoning 阶段**原本不写 runner_call**，故自开短 txn 先建
+  runner_call 再写 ledger，返回 runner_call_id。
+- `insert_ledger_for_runner(...)`：JudgeProvider 在其现有短 txn 内调用，使最终有效裁决的
+  runner_call + ledger + DECISION 同生共死；`record_ledger_only(...)` 保留给已有 runner_call 的独立补账。
+
+**预算启用时 fail-closed**：`session_max != null` 表示成本护栏是运行契约，任何记账失败都必须中止推进，不能
+继续制造不可见成本；只有明确以 `session_max=null` 关闭护栏时，调用方才可 best-effort 记录。
+ledger append-only（DDL 触发器）→ 累计靠新 INSERT，本类只 INSERT、从不 UPDATE。
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from typing import Any, Optional
+
+from .ids import cnum as _cnum
+from .interfaces import CallUsage
+
+_SQLITE_INT_MAX = (1 << 63) - 1
+
+
+def policy_fingerprint(policy: dict) -> str:
+    """整份 policy 的规范化 JSON sha256；ledger.policy_version 由内容派生，不引入可手填版本旋钮。"""
+    try:
+        canonical = json.dumps(policy, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"policy 无法规范化为有限 JSON：{e}") from e
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class BudgetExhausted(RuntimeError):
+    """本次成本已提交且触发 durable global_stop；调用方必须立即停止后续 LLM 调用。"""
+
+    def __init__(self, *, spent: float, session_max: float):
+        self.spent = spent
+        self.session_max = session_max
+        super().__init__(f"budget_exhausted: spent={spent} >= session_max={session_max}")
+
+
+class CostAccountingFailed(RuntimeError):
+    """成本无法可信计算；失败事实与 durable stop 已尽力提交。"""
+
+    def __init__(self, message: str, *, runner_call_id: Optional[int] = None):
+        self.runner_call_id = runner_call_id
+        super().__init__(message)
+
+
+class CostLedger:
+    """成本记账写入器（daemon 单写者内；见模块 docstring）。"""
+
+    def __init__(self, daemon, policy: dict):
+        self.daemon = daemon
+        cfg = self.validate_policy(policy)
+        self.budget_enabled = cfg["budget_enabled"]
+        self.session_max = cfg["session_max"]
+        self.price_per_1k = cfg["price_per_1k"]
+        self.policy_version = cfg["policy_version"]
+
+    @classmethod
+    def validate_policy(cls, policy: dict) -> dict:
+        """纯预验证成本配置；build_system 在开 DB 前调用，避免半初始化后才暴露溢出/类型错误。"""
+        budget = policy.get("budget") or {}
+        if "session_max" not in budget:
+            raise ValueError("budget.session_max 必须显式存在（有限正数启用，null 关闭）")
+        raw_session_max = budget.get("session_max")
+        budget_enabled = raw_session_max is not None
+        session_max = None
+        if budget_enabled:
+            if isinstance(raw_session_max, bool):
+                raise ValueError("budget.session_max 必须是有限正数或 null")
+            try:
+                session_max = float(raw_session_max)
+            except (OverflowError, TypeError, ValueError) as e:
+                raise ValueError("budget.session_max 必须是有限正数或 null") from e
+            if not math.isfinite(session_max) or session_max <= 0:
+                raise ValueError("budget.session_max 必须是有限正数或 null")
+        raw_price = budget.get("price_per_1k_tokens", 0.0)
+        if isinstance(raw_price, bool):
+            raise ValueError(f"price_per_1k_tokens 必须是有限数字，实收 {raw_price!r}")
+        try:
+            price_per_1k = float(raw_price)
+        except (OverflowError, TypeError, ValueError) as e:
+            raise ValueError(f"price_per_1k_tokens 必须是有限数字，实收 {raw_price!r}") from e
+        if not math.isfinite(price_per_1k) or price_per_1k < 0:
+            raise ValueError(f"price_per_1k_tokens 必须是有限非负数，实收 {raw_price!r}")
+        # session_max=null 是关闭预算网的唯一显式方式；网已开却 price=0 会让 SUM 永不增长，必须启动失败。
+        if budget_enabled and price_per_1k <= 0:
+            raise ValueError("budget.session_max 已启用时 price_per_1k_tokens 必须是有限正数")
+        return {"budget_enabled": budget_enabled, "session_max": session_max,
+                "price_per_1k": price_per_1k, "policy_version": policy_fingerprint(policy)}
+
+    def money_for(self, usage: Optional[CallUsage]) -> float:
+        """token → money。未知用量：预算开启时拒绝，显式关闭时才按 0 best-effort。"""
+        u = self._validated_usage(usage)
+        if self.budget_enabled and not u.tokens_known:
+            raise ValueError("token 汇总未知，预算启用时不能按真 0 记账")
+        try:
+            money = (u.tokens_total / 1000.0) * self.price_per_1k
+        except (OverflowError, ValueError) as e:
+            raise ValueError("tokens_total × price_per_1k_tokens 无法表示为有限成本") from e
+        if not math.isfinite(money) or money < 0:
+            raise ValueError(f"计算出的 money 必须有限非负，实收 {money!r}")
+        if u.tokens_total > 0 and self.price_per_1k > 0 and money == 0:
+            raise ValueError("正 tokens_total 的成本下溢为 0；price_per_1k_tokens 过小")
+        # 不固定小数位 round：SQLite REAL 可保存极小正成本，逐次舍入为 0 会系统性欠计。
+        return money
+
+    @staticmethod
+    def _validated_usage(usage: Optional[CallUsage]) -> CallUsage:
+        """校验并规范化一次调用用量，拒绝 bool/负数/NaN/Inf，避免污染 append-only ledger。"""
+        u = usage if usage is not None else CallUsage(tokens_known=False)
+        known = getattr(u, "tokens_known", None)
+        if not isinstance(known, bool):
+            raise ValueError(f"CallUsage.tokens_known 必须是 bool，实收 {known!r}")
+        values = {}
+        for name in ("tokens_input", "tokens_output", "tokens_total"):
+            value = getattr(u, name, None)
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0 or value > _SQLITE_INT_MAX):
+                raise ValueError(f"CallUsage.{name} 必须是 0..{_SQLITE_INT_MAX} 的整数，实收 {value!r}")
+            values[name] = value
+        if not known and any(values.values()):
+            raise ValueError("CallUsage.tokens_known=false 时 token 字段必须全为 0")
+        if (values["tokens_input"] or values["tokens_output"]) and (
+                values["tokens_total"] < values["tokens_input"] + values["tokens_output"]):
+            raise ValueError("CallUsage.tokens_total 不得小于 tokens_input+tokens_output")
+        wallclock = getattr(u, "wallclock_sec", None)
+        if isinstance(wallclock, bool) or not isinstance(wallclock, (int, float)):
+            raise ValueError(f"CallUsage.wallclock_sec 必须是有限非负数，实收 {wallclock!r}")
+        try:
+            wallclock_f = float(wallclock)
+        except (OverflowError, TypeError, ValueError) as e:
+            raise ValueError(f"CallUsage.wallclock_sec 必须是有限非负数，实收 {wallclock!r}") from e
+        if not math.isfinite(wallclock_f) or wallclock_f < 0:
+            raise ValueError(f"CallUsage.wallclock_sec 必须是有限非负数，实收 {wallclock!r}")
+        return CallUsage(wallclock_sec=wallclock_f, tokens_known=known, **values)
+
+    def record(self, *, cycle_id: str, phase: str, purpose: str,
+               usage: Optional[CallUsage], status: str = "success",
+               failure_kind: Optional[str] = None) -> int:
+        """自开短 txn：INSERT runner_call + INSERT ledger。返回 runner_call_id。
+        （StageProvider 各阶段原本不写 runner_call，由此补建——ledger.runner_call_id FK 有真行可指。）"""
+        ci = _cnum(cycle_id)
+        budget_hit = None
+        try:
+            with self.daemon.transaction() as conn:
+                rc = conn.execute(
+                    "INSERT INTO runner_call(cycle_id,phase,purpose,status,failure_kind) VALUES (?,?,?,?,?)",
+                    (ci, phase, purpose, status, failure_kind)).lastrowid
+                budget_hit = self.insert_ledger_for_runner(conn, runner_call_id=rc, usage=usage)
+        except Exception as e:                  # 未知用量/校验/落账失败：已发生的外部调用不得重发
+            self.fail_closed(cycle_id=cycle_id, phase=phase, purpose=purpose, cause=e)
+        if budget_hit is not None:              # 必须在 COMMIT 之后抛；事务内抛会把账和 global_stop 一起回滚
+            raise BudgetExhausted(**budget_hit)
+        return rc
+
+    def record_ledger_only(self, *, runner_call_id: int, usage: Optional[CallUsage]) -> None:
+        """自开短 txn：只 INSERT ledger，引用**既有** runner_call。
+        cycle_id/phase **从该 runner_call 派生**（INSERT…SELECT），不信调用方复述——防交叉 cycle / phase 不一致（外审 SHOULD）。
+        runner_call 不存在时抛错，禁止空写伪装成成功记账。"""
+        row = self.daemon.query_one(
+            "SELECT cycle_id,phase,purpose FROM runner_call WHERE id=?", (runner_call_id,))
+        if row is None:
+            self.fail_closed(
+                cycle_id=None, phase="orchestrator", purpose=f"ledger-only:{runner_call_id}",
+                cause=RuntimeError(f"runner_call {runner_call_id} 不存在，ledger 未写入"))
+        budget_hit = None
+        try:
+            with self.daemon.transaction() as conn:
+                budget_hit = self.insert_ledger_for_runner(conn, runner_call_id=runner_call_id, usage=usage)
+        except Exception as e:
+            self.fail_closed(cycle_id=f"c{row[0]}", phase=row[1], purpose=row[2], cause=e)
+        if budget_hit is not None:
+            raise BudgetExhausted(**budget_hit)
+
+    def fail_closed(self, *, cycle_id: Optional[str], phase: str, purpose: str,
+                    cause: Exception) -> None:
+        """预算开启时把「成本不可信」变成 durable stop；提交后抛 typed 异常。
+
+        原记账事务已回滚，故这里单独写一条 failed runner_call（无伪造 ledger 金额）与
+        global_stop。若 DB 本身不可写，保留原异常 fail loud，不伪称已持久停机。
+        """
+        if not self.budget_enabled:
+            raise cause
+        ci = _cnum(cycle_id) if cycle_id is not None else None
+        try:
+            with self.daemon.transaction() as conn:
+                rc = conn.execute(
+                    "INSERT INTO runner_call(cycle_id,phase,purpose,status,failure_kind) "
+                    "VALUES (?,?,?,'failed','cost_accounting')", (ci, phase, purpose)).lastrowid
+                payload = {"reason": "cost_accounting_failed", "phase": phase, "purpose": purpose,
+                           "runner_call_id": rc, "error_type": type(cause).__name__,
+                           "error": str(cause)[:500]}
+                if conn.execute(
+                        "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' LIMIT 1"
+                ).fetchone() is None:
+                    conn.execute(
+                        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                        "VALUES (?,'orchestrator','global_stop',?)",
+                        (ci, json.dumps(payload, ensure_ascii=False)))
+        except Exception:
+            raise cause
+        raise CostAccountingFailed(
+            f"cost_accounting_failed: {phase}/{purpose}: {cause}", runner_call_id=rc) from cause
+
+    def insert_ledger_for_runner(self, conn: Any, *, runner_call_id: int,
+                                 usage: Optional[CallUsage]) -> Optional[dict]:
+        """在调用方已有事务内补 ledger；JudgeProvider 用它把 runner_call+ledger+DECISION 原子提交。
+
+        cycle_id/phase 从 runner_call 派生，且 runner_call 不存在时 fail loud，避免 INSERT…SELECT 空写后
+        调用方误以为已经记账。此方法不开事务，必须传 WriteDaemon.transaction() 给出的连接。
+        """
+        if conn.execute("SELECT 1 FROM ledger WHERE runner_call_id=? LIMIT 1",
+                        (runner_call_id,)).fetchone() is not None:
+            raise RuntimeError(f"runner_call {runner_call_id} 已有 ledger，拒绝重复记账")
+        u = self._validated_usage(usage)
+        money = self.money_for(u)
+        cur = conn.execute(
+            "INSERT INTO ledger(cycle_id,phase,runner_call_id,tokens_input,tokens_output,tokens_total,"
+            "wallclock_sec,money,policy_version) "
+            "SELECT cycle_id, phase, id, ?, ?, ?, ?, ?, ? FROM runner_call WHERE id=?",
+            (u.tokens_input, u.tokens_output, u.tokens_total, u.wallclock_sec,
+             money, self.policy_version, runner_call_id))
+        if cur.rowcount != 1:
+            raise RuntimeError(f"runner_call {runner_call_id} 不存在，ledger 未写入")
+        return self._record_budget_stop_if_needed(conn)
+
+    def _record_budget_stop_if_needed(self, conn: Any) -> Optional[dict]:
+        """在 ledger 写事务内检查累计并幂等落 global_stop；只返回命中，绝不在事务内抛。"""
+        if not self.budget_enabled:
+            return None
+        spent = conn.execute("SELECT COALESCE(SUM(money),0) FROM ledger").fetchone()[0]
+        if spent < self.session_max:
+            return None
+        hit = {"spent": spent, "session_max": self.session_max}
+        if conn.execute("SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' "
+                        "LIMIT 1").fetchone() is None:
+            conn.execute(
+                "INSERT INTO decision(actor,type,payload_json) VALUES ('orchestrator','global_stop',?)",
+                (json.dumps({"reason": "budget_exhausted", **hit}, ensure_ascii=False),))
+        return hit

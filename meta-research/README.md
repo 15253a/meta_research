@@ -128,7 +128,8 @@ python -m orchestrator.console_server --system-root . --work-root <同 run 的 w
 | 停因 | 含义 |
 |---|---|
 | `score_floor` | τ 判据①：前沿问题最高分连续 N 轮低于地板（价值衰退自终止） |
-| `budget_exhausted` | τ 判据②：全局成本（ledger.money 求和）≥ session_max。⚠️ **当前休眠**：成本记账（`INSERT INTO ledger`）尚未接线，SUM 恒 0、永不触发——安全网已装、待成本落账即生效（M6 硬化项，见 §7）。**在此之前 session_max 不构成真实成本护栏** |
+| `budget_exhausted` | τ 判据②：全局成本（ledger.money 求和）≥ session_max。每次 stage/judge 调用按 `price_per_1k_tokens` 折算；单次越线即落 durable `global_stop` 并阻断后续调用 |
+| `cost_accounting_failed` | 预算已开启，但 token 汇总缺失/格式漂移或落账不可信；不把未知冒充真 0，持久停机待人工核账 |
 | `prior-terminate` / `max_cycles/terminate` | 上轮选择 terminate / 达 max_cycles |
 | `pause 指令生效中` | 人工 pause 阻断 |
 | `文件请求 #N 等待用户提供` | 全局等待（阶段发文件请求，待 resolve） |
@@ -141,9 +142,9 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 
 - 代码物化在编排器管理的 staging（净土物化 + sha256 哈希对账 + argv-only 禁 shell + 路径/env 围栏），
   **但真 git worktree 隔离 + env lock 强校验属后续硬化步**。
-- **全局成本安全网（`budget.session_max`）当前休眠**：`ledger.money` 成本落账尚未接线（`INSERT INTO
-  ledger` 未接），故 `SUM=0`、`budget_exhausted` 永不触发——真跑长时研究前须先接成本记账，否则失控成本
-  无自动上限（只有 `--max-cycles` 与 τ 分数衰退兜底）。
+- **成本护栏已转活，但不是供应商账单**：`ledger.money` 用 Codex CLI 回报的总 token 与本地
+  `price_per_1k_tokens` 折算，用于运行护栏和趋势观测。如果编排器在外部调用已完成、但用量落库前被
+  `SIGKILL`，该次用量仍可漏记；生产级精确账单需再加「调用前意图 + 持久回执 + 幂等补账」协议。
 - 已支持 build / exec target；**eval target（免训练评估）与 import（外部基线导入）+ route dependency_wait
   特化 = 后续检查点（CP8.6b）**——遇到它们系统会干净业务拒、不楔死。
 - 假执行标记（`source=fake` / `synthetic=true`）是 M0–M3 验收期语义，真执行起已移除。
