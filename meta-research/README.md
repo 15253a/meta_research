@@ -93,6 +93,26 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
 - **审计链**：一切决策/执行/测量都在 DB（`decision` / `run` / `evaluation` / `execution_log` /
   `runner_call` / `ledger`）；产物 transcript 归档在 `<work-root>/cycles/<id>/transcripts/`。
 
+### 4.1 人类控制台（web 查看 + 交互，步⑨）
+
+系统跑起来后，另起一个**独立只读进程**在浏览器里看实时状态、下指令。**单写纪律**：控制台进程 `mode=ro` 读库、
+只写入站 spool 文件，**绝不写 DB**——研究真相始终只有 run 进程一个写者。
+
+```bash
+# 与 run 并行（同一 work-root）：
+python -m orchestrator.console_server --system-root . --work-root <同 run 的 work-root> --port 8765
+# 浏览器打开 http://127.0.0.1:8765/  （GET / 出控制台页；每 3s 轮询 /api/db 刷新真数据）
+```
+
+- **看什么**：顶栏 goal/cycle/预算/心跳 + 九个标签页（问题树 / Baseline 池 / 轮次 / 结论证据 / Import 准入 /
+  指令请求 / 决策账 / Goal 策略 / 人机审计）全部来自 `/api/db`（真表投影 + status_card/live/notification/FS）；
+  左侧文件浏览器经 `/api/file` 白名单只读（work/ · schemas/ · prompts/ · policies/ · input/）。
+- **下指令（入站闭环）**：命令行发命令 → `POST /api/message` 写 `<work>/state/console_inbox.jsonl` →
+  run 进程在 **precheck 边界** ingest → 保守分类：`pause`/`resume`（硬指令，回显确认后生效，停/续推进）、
+  `query`（只读 grounded 应答，不改研究状态）、`note`（软注解）。**恰一语义**：入站幂等、query 只答一次
+  （no-loss/no-dup）。控制台自身不联机推理、绝不直接改状态。
+- **未连线降级**：控制台页在没有 server 时仍可作离线 demo（内嵌 mock 数据）；一旦连上 `/api/db` 即切真数据。
+
 ## 5. 系统能做什么（当前研究形态）
 
 - **build target**：从零建 baseline 家族（写代码 → smoke → 代码评审 → 训练 → 出厂评估 → 结果评审 →
