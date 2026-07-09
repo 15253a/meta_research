@@ -22,6 +22,7 @@ from orchestrator.attack_stages import AttackStages
 from orchestrator.compiler_sqlite import SqliteCompiler
 from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import SqliteGate, open_gate_read_conn
+from orchestrator.manifest import canon_hash as manifest_canon
 from orchestrator.schemas import SchemaSet
 from orchestrator.statestore_sqlite import SQLiteStateStore
 from orchestrator.writedaemon import WriteDaemon
@@ -30,31 +31,85 @@ SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
 OBS = POLICY["observation"]
 
-TRAIN_CMD = [sys.executable, "-c",
-             "import pathlib; print('loss: 1.0'); print('loss: 0.5'); print('loss: 0.2'); "
-             "pathlib.Path('ckpt.bin').write_text('weights-v1'); print('wall_clock_sec: 1.0')"]
-EVAL_CMD = [sys.executable, "-c", "print('loss: 0.2'); print('metric_value: 1@1=0.93')"]
-SMOKE_CMD = [sys.executable, "-c", "print('loss: 0.9'); print('smoke ok')"]
+# 步⑧ CP8.2：命令由 bundle 产的 manifest 承载、跑物化的代码文件（cwd=run/eval staging；train.py 写 ckpt.bin、
+# eval.py 读 {ckpt} 打印 int 绑定 metric_value）。行为参数化以复用各恢复剧本（bad train/smoke、lying eval）。
+TRAIN_OK = ("import pathlib; print('loss: 1.0'); print('loss: 0.5'); print('loss: 0.2'); "
+            "pathlib.Path('ckpt.bin').write_text('weights-v1'); print('wall_clock_sec: 1.0')")
+EVAL_OK = ("import sys, pathlib; assert pathlib.Path(sys.argv[1]).read_text() == 'weights-v1'; "
+           "print('loss: 0.2'); print('metric_value: 1@1=0.93')")
+SMOKE_OK = "print('loss: 0.9'); print('smoke ok')"
 
 
-def _target_spec(seq=1, ck="ck-attack"):
-    return {"kind": "build", "seq": seq, "canonical_key": ck, "slug": "toy-b", "variant_key": "base",
-            "identity_draft_md": "# toy baseline\n结构:线性", "repro_cmd": "python train.py",
-            "train_cmd": TRAIN_CMD, "smoke_cmd": SMOKE_CMD, "eval_cmd": EVAL_CMD,
-            "ckpt_name": "ckpt.bin", "eval_key": "fac", "target_set_hash": "tsh-1",
-            "protocol_id": 1, "protocol_ver": 1, "required": [[1, 1]], "env_hash": "toy-env"}
+def _idea_set():
+    """冻结 idea_set.schema 的确定性产物（cand-1 选中、cand-2 审计 fail——防重复造轮全量入账）。"""
+    _am = {"source_domain": "线性模型", "target_domain": "toy 分类", "object_mapping": "权重→决策",
+           "shared_relations": "线性可分"}
+    _six = {"structural_depth": 8, "domain_distance": 7, "applicability": 8, "novelty": 6,
+            "unexpectedness": 6, "non_obviousness": 7}
+    _low = {"structural_depth": 3, "domain_distance": 3, "applicability": 3, "novelty": 2,
+            "unexpectedness": 2, "non_obviousness": 3}
+    _NS = "联网粗查已启用·文献级待人工验证"
+    return {"idea_set.json": {
+        "candidates": [
+            {"candidate_id": "cand-1", "generation_path": "bypass", "audit_mapping": _am,
+             "core_claim": "线性基线可达 0.9", "mechanism": "最小二乘拟合", "assumptions": ["数据近似线性可分"],
+             "min_falsifiable_experiment": "训练线性模型，acc<0.9 即否证", "novelty_type": "训练目标",
+             "novelty_status": _NS},
+            {"candidate_id": "cand-2", "generation_path": "bypass", "audit_mapping": _am,
+             "core_claim": "弱想法", "mechanism": "随机猜", "assumptions": ["无"],
+             "min_falsifiable_experiment": "无对照", "novelty_type": "训练目标", "novelty_status": _NS}],
+        "audit_scores": [
+            {"candidate_id": "cand-1", "scores": _six, "decision": "pass", "rationale": "结构深"},
+            {"candidate_id": "cand-2", "scores": _low, "decision": "fail", "rationale": "太浅"}],
+        "selected_id": "cand-1", "novelty_refs": []}}
 
 
-def _providers(daemon):
+def _plan_json(ck="ck-attack", slug="toy-b"):
+    """冻结 plan.schema 的**抽象** plan（一 build 目标 + 协议 + 指标；命令不在此——由 bundle manifest 承载）。"""
+    return {"plan.json": {
+        "needs": [{"need_id": "n1", "statement_md": "toy 基线可达 0.9"}],
+        "reuse_evidence": [],
+        "targets": [{"target_key": "t1", "target_kind": "build", "seq": 1, "critical": True,
+                     "budget_estimate": 1.0, "spec_md": "训练线性 toy 基线并出厂评估", "need_ids": ["n1"],
+                     "claim": {"canonical_key": ck, "slug": slug}}],
+        "protocol": {"name": "toy-proto", "version": 1,
+                     "scope_spec": {"dataset": "toy", "split": "holdout"}, "smoke_md": "快速跑一步"},
+        "metric_defs": [{"metric_id": "m_acc", "version": 1, "name": "acc", "direction": "higher",
+                         "compute_spec_md": "正确率"}],
+        "readout_rules": [{"metric_id": "m_acc", "metric_ver": 1, "rule_md": "越高越好"}],
+        "build_target_required_metric": [{"target_key": "t1", "metric_id": "m_acc", "metric_ver": 1}]}}
+
+
+def _bundle_provider(daemon, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_body=SMOKE_OK):
+    """bundle provider（真 Codex 范式：读 pack 的 plan_slice_hash → 回引，产 manifest + 代码 + identity.md）。
+    测试从 DB 读切片自算 plan_slice_hash（真 Codex 从 pack 照抄）；命令跑物化代码文件。"""
+    def bundle(cyc, pack):
+        bt = int(pack.target_id)
+        slice_ = json.loads(daemon.query_one("SELECT plan_ref FROM build_target WHERE id=?", (bt,))[0])
+        manifest = {
+            "manifest_version": 1,
+            "target_ref": {"target_key": slice_["target_key"], "target_kind": slice_["target_kind"],
+                           "seq": slice_["seq"], "plan_slice_hash": manifest_canon(slice_)},
+            "protocol_ref": {"protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"]},
+            "env_hash": "toy-env", "config_json": {"lr": 0.1},
+            "code_files": ["train.py", "eval.py", "smoke.py"],
+            "commands": {"smoke": {"argv": [sys.executable, "{src}/smoke.py"]},
+                         "train": {"argv": [sys.executable, "{src}/train.py"]},
+                         "eval": {"argv": [sys.executable, "{src}/eval.py", "{ckpt}"]}},
+            "expected_outputs": {"checkpoint": "ckpt.bin"},
+            "repro_cmd_md": "python train.py 后 python eval.py <ckpt>"}
+        return {"execution_manifest.json": manifest, "identity.md": "# toy 基线\n结构: 线性\n\n## 能力\nacc≈0.93",
+                "train.py": train_body, "eval.py": eval_body, "smoke.py": smoke_body}
+    return bundle
+
+
+def _providers(daemon, *, bundle=None):
     """确定性 providers（生产 = 真 Codex 会话；judge 写真 runner_call+DECISION 行）。"""
     def idea(cyc, pack):
-        return {"idea_set.json": {"candidates": [
-            {"candidate_id": "cand-1", "content_md": "线性基线", "audit_score": 8.0},
-            {"candidate_id": "cand-2", "content_md": "弱想法", "audit_score": 3.0, "status": "failed"}],
-            "selected_id": "cand-1"}}
+        return _idea_set()
 
     def plan(cyc, pack):
-        return {"plan.json": {"protocol": {"id": 1, "version": 1}, "targets": [_target_spec()]}}
+        return _plan_json()
 
     def judge(cycle_id, bt_id, kind, subject_hash):
         from orchestrator.ids import cnum
@@ -75,10 +130,11 @@ def _providers(daemon):
                                 "answer_md": "以出厂测量关问"},
                 "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
 
-    return {"idea": idea, "plan": plan, "judge": judge, "reasoning": reasoning}
+    return {"idea": idea, "plan": plan, "judge": judge, "reasoning": reasoning,
+            "bundle": bundle if bundle is not None else _bundle_provider(daemon)}
 
 
-def _mk_env(path, work):
+def _mk_env(path, work, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_body=SMOKE_OK):
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY)
     compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="toy 研究目标")
@@ -86,18 +142,17 @@ def _mk_env(path, work):
     obs_conn = db.connect(path)
     close_gate = SqliteGate(daemon, open_gate_read_conn(path), SchemaSet(SYSTEM_ROOT / "schemas"),
                             parser_suspect=lambda aid: OP.suspect_for_attempt(obs_conn, aid, OBS))
+    bundle = _bundle_provider(daemon, train_body=train_body, eval_body=eval_body, smoke_body=smoke_body)
     attack = AttackStages(state=state, compiler=compiler, pool_gate=pool, close_gate=close_gate,
-                          providers=_providers(daemon), obs_policy=OBS, work_root=str(work))
+                          providers=_providers(daemon, bundle=bundle), obs_policy=OBS, work_root=str(work),
+                          schemas=SchemaSet(SYSTEM_ROOT / "schemas"), policy=POLICY)
     return daemon, state, compiler, attack
 
 
 def _bootstrap_attack(state):
-    """创世：goal + 协议/指标注册 + root 问题（open）+ 上轮 selection 指向 attack root。"""
+    """创世：goal + root 问题（open）+ 上轮 selection 指向 attack root。
+    **步⑧**：协议/指标不再预插——plan 阶段经 gate_new_protocol 真注册（derive 空表 → protocol/metric id=1）。"""
     state.create_goal(text="toy 研究目标", predicate_json={})
-    with state.daemon.transaction() as conn:   # 协议注册（gate_new_protocol 语义；测试直插同构行）
-        conn.execute("INSERT INTO protocol(id,version,name,scope_spec_json) VALUES (1,1,'proto','{}')")
-        conn.execute("INSERT INTO metric_def(id,version,name,direction) VALUES (1,1,'acc','higher')")
-        conn.execute("INSERT INTO protocol_metric(protocol_id,protocol_ver,metric_id,metric_ver) VALUES (1,1,1,1)")
     c0 = state.open_or_resume_cycle()
     state.set_route(c0.cycle_id, "bootstrap")
     with state.atomic():
@@ -131,8 +186,11 @@ def test_full_attack_cycle(env):
     assert d.query_one("SELECT status FROM run WHERE kind='build'")[0] == "success"
     assert d.query_one("SELECT count(*) FROM checkpoint WHERE ckpt_key LIKE 'final-r%'")[0] == 1
     assert d.query_one("SELECT count(*) FROM execution_observation WHERE source='parser'")[0] == 2
-    # 真 evaluation + metric_result + 证据回溯 + 关问
-    assert d.query_one("SELECT status FROM evaluation WHERE source='factory' AND eval_key='fac'")[0] == "success"
+    # 真 evaluation + metric_result + 证据回溯 + 关问（eval_key=target_key='t1'，步⑧派生）
+    assert d.query_one("SELECT status FROM evaluation WHERE source='factory' AND eval_key='t1'")[0] == "success"
+    # plan 阶段真注册协议（gate_new_protocol；派生空表 → id=1）
+    assert d.query_one("SELECT count(*) FROM protocol WHERE name='toy-proto'")[0] == 1
+    assert d.query_one("SELECT id FROM metric_def WHERE name='acc'")[0] == 1
     assert d.query_one("SELECT value FROM metric_result ORDER BY id DESC LIMIT 1")[0] == 0.93
     assert d.query_one("SELECT status FROM question WHERE id=1")[0] == "answered"
     ev = d.query_one("SELECT kind, valid, metric_result_id FROM evidence ORDER BY id DESC LIMIT 1")
@@ -261,11 +319,9 @@ def test_failed_train_target_cycle_closes_clean(tmp_path):
     """§7.1 判例④ 雏形：训练失败 → run(failed)+target(failed) 入账；无证据不关问、Qn 置 inconclusive、
     轮正常收尾（不楔死、不入树）。"""
     path = str(tmp_path / "research.sqlite")
-    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
+                                              train_body="import sys; print('loss: 1.0'); sys.exit(1)")
     _bootstrap_attack(state)
-    bad_spec = _target_spec()
-    bad_spec["train_cmd"] = [sys.executable, "-c", "import sys; print('loss: 1.0'); sys.exit(1)"]
-    attack.p["plan"] = lambda cyc, pack: {"plan.json": {"protocol": {"id": 1, "version": 1}, "targets": [bad_spec]}}
     attack.p["reasoning"] = lambda cyc, pack: {   # 无 answer（无测量可证）；只 selection
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
@@ -334,11 +390,8 @@ def test_smoke_failure_fails_target(tmp_path):
     """codex SHOULD 回归：smoke 子进程非 0 → target failed(smoke)（exit code 不得忽略）；
     codex 第2轮 BLOCKER 回归：终态早退也落 phase_commit(bundle,target)（否则杀/不杀分裂）。"""
     path = str(tmp_path / "research.sqlite")
-    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w", smoke_body="import sys; sys.exit(2)")
     _bootstrap_attack(state)
-    bad = _target_spec()
-    bad["smoke_cmd"] = [sys.executable, "-c", "import sys; sys.exit(2)"]
-    attack.p["plan"] = lambda cyc, pack: {"plan.json": {"protocol": {"id": 1, "version": 1}, "targets": [bad]}}
     attack.p["reasoning"] = lambda cyc, pack: {
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
@@ -351,13 +404,10 @@ def test_smoke_failure_fails_target(tmp_path):
 def test_failed_eval_resume_not_registered(tmp_path):
     """codex 第2轮 BLOCKER 回归：eval 进程输出合法 metrics 但 exit≠0——崩在 final 改名后（finish-failed 前）
     → resume 读 exit 侧车、同一判定 → target failed，**不得**把失败进程续注册成成功。终库与不杀一致。"""
-    lying_eval = [sys.executable, "-c", "import sys; print('metric_value: 1@1=0.99'); sys.exit(1)"]
+    lying_eval = "import sys; print('metric_value: 1@1=0.99'); sys.exit(1)"
 
     def _mk(path, work):
-        d, s, c, a = _mk_env(path, work)
-        bad = _target_spec()
-        bad["eval_cmd"] = lying_eval
-        a.p["plan"] = lambda cyc, pack: {"plan.json": {"protocol": {"id": 1, "version": 1}, "targets": [bad]}}
+        d, s, c, a = _mk_env(path, work, eval_body=lying_eval)
         a.p["reasoning"] = lambda cyc, pack: {
             "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
         return d, s, c, a
@@ -452,6 +502,163 @@ def test_attack_judge_fail_settles_target(tmp_path):
     assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0            # 测量整包不注册
     assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "inconclusive"
     assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
+    daemon.conn.close()
+
+
+def test_plan_reject_graceful_no_wedge(tmp_path):
+    """步⑧ 全自动不楔死回归：非法抽象 plan（required 引用未声明 metric）→ 业务拒（decision(plan_rejected)
+    + 零 target），轮正常收尾（Qn inconclusive、cycle done），**不 raise 死循环**。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+
+    def bad_plan(cyc, pack):
+        p = _plan_json()
+        p["plan.json"]["build_target_required_metric"] = [
+            {"target_key": "t1", "metric_id": "ghost", "metric_ver": 1}]   # 未声明的 metric
+        return p
+    attack.p["plan"] = bad_plan
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1                                                    # 轮跑完（未楔死）
+    assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0    # 零 target
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_rejected'")[0] == 1
+    assert daemon.query_one("SELECT count(*) FROM baseline")[0] == 0        # 未占坑（派生期拒，先于 gate）
+    assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "inconclusive"
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
+    # phase_commit(plan) 已落 → 重跑幂等不重做（终态）
+    assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='plan'")[0] == 1
+    daemon.conn.close()
+
+
+@pytest.mark.parametrize("mutate,tag", [
+    (lambda p: p.pop("protocol"), "缺 protocol 键（结构非法→曾裸 KeyError 楔死）"),
+    (lambda p: p["targets"][0].__setitem__("target_kind", "exec"), "exec 目标（CP8.6 未接）"),
+    (lambda p: p["targets"].append({**p["targets"][0], "seq": 2}), "同轮 canonical_key 重复"),
+    (lambda p: (p["targets"].append({**p["targets"][0], "target_key": "t1", "seq": 2,
+                                     "claim": {"canonical_key": "ck2", "slug": "s2"}})),
+     "同轮 target_key 重复（codex BLOCKER：claims 覆盖错绑）"),
+    (lambda p: p["targets"].append({**p["targets"][0], "target_key": "t2", "seq": 1,
+                                    "claim": {"canonical_key": "ck2", "slug": "s2"}}),
+     "同轮 seq 重复（撞 UNIQUE(cycle,seq)）"),
+    (lambda p: p["metric_defs"].append({"metric_id": "m_acc", "version": 1, "name": "dup",
+                                        "direction": "higher", "compute_spec_md": "x"}),
+     "metric_id 重复（plan 内 join 键）"),
+    (lambda p: p["build_target_required_metric"].__setitem__(0, {"target_key": "t1", "metric_id": "m_acc", "metric_ver": 9}),
+     "required 版本与 metric_defs 不符"),
+    (lambda p: p["build_target_required_metric"].__setitem__(0, {"target_key": "tX", "metric_id": "m_acc", "metric_ver": 1}),
+     "required.target_key 悬挂引用"),
+])
+def test_illegal_plan_graceful_no_wedge(tmp_path, mutate, tag):
+    """内审 SHOULD-高 回归：结构非法 / 未支持 kind / 同轮重复 canonical_key / required 版本不符——**任何**
+    站不住的 plan 都 → 业务拒（decision(plan_rejected) + 零 target），轮正常收尾，**绝不 raise 楔死驱动循环**。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+
+    def bad_plan(cyc, pack):
+        p = _plan_json()["plan.json"]
+        mutate(p)
+        return {"plan.json": p}
+    attack.p["plan"] = bad_plan
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1, f"{tag}: 轮未跑完（疑楔死）"
+    assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0, tag
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_rejected'")[0] == 1, tag
+    assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "inconclusive", tag
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done", tag
+    daemon.conn.close()
+
+
+def test_reuse_protocol_missing_metric_binding_rejected(tmp_path):
+    """codex BLOCKER-1 回归：复用既有 protocol（同名同 scope，_register_protocol 跳过 gate）但 required 的
+    metric 未绑定到该 protocol_metric → 派生期 _PlanReject（否则跑到 gate_register_evaluation 才 I2 拒→楔死）。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    with daemon.transaction() as conn:            # 模拟前轮：toy-proto@1 已注册，但只绑 acc(1@1)，未绑 f1(2@1)
+        conn.execute("INSERT INTO protocol(id,version,name,scope_spec_json) VALUES (1,1,'toy-proto',?)",
+                     (json.dumps({"dataset": "toy", "split": "holdout"}, sort_keys=True),))
+        conn.execute("INSERT INTO metric_def(id,version,name,direction) VALUES (1,1,'acc','higher')")
+        conn.execute("INSERT INTO metric_def(id,version,name,direction) VALUES (2,1,'f1','higher')")
+        conn.execute("INSERT INTO protocol_metric(protocol_id,protocol_ver,metric_id,metric_ver) VALUES (1,1,1,1)")
+
+    def reuse_plan(cyc, pack):
+        p = _plan_json()["plan.json"]
+        p["metric_defs"] = [{"metric_id": "m_f1", "version": 1, "name": "f1", "direction": "higher",
+                             "compute_spec_md": "F1"}]                       # 复用 toy-proto@1，却要 f1（未绑）
+        p["readout_rules"] = [{"metric_id": "m_f1", "metric_ver": 1, "rule_md": "越高越好"}]
+        p["build_target_required_metric"] = [{"target_key": "t1", "metric_id": "m_f1", "metric_ver": 1}]
+        return {"plan.json": p}
+    attack.p["plan"] = reuse_plan
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1                                                        # 未楔死
+    assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0        # 派生期拒、未占坑
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_rejected'")[0] == 1
+    assert daemon.query_one("SELECT count(*) FROM baseline")[0] == 0
+    daemon.conn.close()
+
+
+def test_bad_manifest_target_failed_not_wedge(tmp_path):
+    """codex SHOULD-2 回归：Codex 产的 manifest 交叉核不过（换协议=旁路）→ 目标 failed(artifact_invalid)
+    + 落 pc，轮正常收尾（不楔死）。resume 语义：已物化 manifest 校验不过属损毁 fail-loud（不在此测）。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    real_bundle = attack.p["bundle"]
+
+    def evil_bundle(cyc, pack):
+        files = real_bundle(cyc, pack)
+        files["execution_manifest.json"]["protocol_ref"]["protocol_ver"] = 99   # 换协议 → cross_check 拒
+        return files
+    attack.p["bundle"] = evil_bundle
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1                                                        # 未楔死
+    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == ("failed", "artifact_invalid")
+    assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0          # 未注册
+    assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
+    daemon.conn.close()
+
+
+def test_eval_missing_required_metric_target_failed(tmp_path):
+    """codex SHOULD-2/第2轮 BLOCKER 回归：eval 打印的 metric 不覆盖 required（gate_register_evaluation
+    GateReject，**唯一**被转业务失败的 gate 调用点）→ 目标 failed(protocol_violation) + pc，不楔死。"""
+    path = str(tmp_path / "research.sqlite")
+    # eval 打印一个不在 required(1@1) 的 metric → required 未覆盖 → register GateReject
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
+                                              eval_body="import sys, pathlib; print('metric_value: 7@1=0.5')")
+    _bootstrap_attack(state)
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1
+    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == ("failed", "protocol_violation")
+    assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    daemon.conn.close()
+
+
+def test_statemachine_gatereject_still_fails_loud(tmp_path):
+    """codex 第2轮 BLOCKER 回归（反面）：状态机类 GateReject（如 progress 非法转移）**不得**被吞成
+    failed 终态——必须 fail loud 上抛（误终态化会掩埋恢复/篡改问题）。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    from orchestrator.gate_sqlite import GateReject
+    orig = attack.gate.gate_progress_build_target
+    def corrupt_progress(**kw):                   # 模拟状态机损毁类拒（非 register_evaluation 调用点）
+        raise GateReject("SIM-状态机损毁")
+    attack.gate.gate_progress_build_target = corrupt_progress
+    with pytest.raises(GateReject, match="状态机损毁"):
+        SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert daemon.query_one("SELECT count(*) FROM build_target WHERE status='failed'")[0] == 0  # 未被误终态化
     daemon.conn.close()
 
 

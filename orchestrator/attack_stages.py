@@ -18,12 +18,17 @@ status 从下一阶段续跑。idea/plan 各为**单一事务**（阶段写 + ph
 attempt 已有当前口径 parser 观测（防「无据不疑」默认成绕过——suspect 谓词只对已 ingest 数据有效）。
 
 **长操作零事务**（§6.13）：providers（Codex/judge）与 harness 子进程全部在事务外。
+
+**契约分层（步⑧ CP8.2）**：plan 保持**抽象**（消费冻结 `plan.schema`——命令永不入 plan）；执行命令由 bundle
+阶段 Codex 产的 `execution_manifest.json`（+ 代码文件 + identity.md）承载，经 `orchestrator/manifest.py`
+校验/交叉核/围栏后由 harness 机械执行。plan 阶段走**正式 gate 通道**（gate_new_protocol I1 + gate_claim_baseline
+I5），不再内联建 baseline、不再把命令塞进 plan_ref——plan_ref 存**resolved 切片**（冻结 target 原样 +
+编排器机械派生的 protocol_id/protocol_ver/eval_key/target_set_hash），是 bundle manifest 交叉核的锚。
+
 provider 契约（注入式；生产 = 真 Codex 会话，范式见 M0 driver._run_with_retry；测试 = 确定性替身）：
-- idea(cyc, pack) → {"idea_set.json": {candidates:[{candidate_id, content_md, audit_score?}], selected_id}}
-- plan(cyc, pack) → {"plan.json": {protocol:{id, version}, targets:[TARGET_SPEC…]}}
-  TARGET_SPEC（build 种）= {kind:'build', seq, canonical_key, slug, identity_draft_md, repro_cmd,
-    train_cmd:[…], smoke_cmd:[…], eval_cmd:[…], ckpt_path, eval_key, target_set_hash,
-    required:[[metric_id,metric_ver]…], config_json?}
+- idea(cyc, pack) → {"idea_set.json": 冻结 idea_set.schema（candidates[]/audit_scores[]/selected_id/novelty_refs[]）}
+- plan(cyc, pack) → {"plan.json": 冻结 plan.schema（needs/targets[抽象]/protocol/metric_defs/…）}
+- bundle(cyc, pack) → {"execution_manifest.json": 冻结 execution_manifest.schema, "identity.md": str, <code_files…>}
 - judge(cycle_id, build_target_id, review_kind, subject_hash) → 写 runner_call(audit)+DECISION(judge)（含 fail 权）
 - reasoning(cyc, pack) → {"answer.json"?, "tree_ops.json"?, "selection.json"}（answer.evidence 引用真 metric_result）
 """
@@ -35,10 +40,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import harness as H
+from . import manifest as MF
 from . import obs_parser as OP
 from . import subject_manifest as SM
 from .gate_exec import ExecGate
 from .gate_pool import PoolGate
+from .gate_sqlite import GateReject
 from .ids import cnum as _cnum
 from .interfaces import Selection
 from .phase_commit import check_or_record
@@ -46,9 +53,54 @@ from .phase_commit import check_or_record
 _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
 
 
+class _PlanReject(Exception):
+    """plan 派生期的业务拒（非法/不可满足的抽象 plan）——转 decision(plan_rejected)+零 target 终态，
+    不 raise 到 advance（否则轮永不推进 = 全自动死循环）。与 GateReject 一并在 _plan_stage 捕获。"""
+
+
+class _BundleReject(Exception):
+    """bundle 阶段的业务拒（Codex 产物层面站不住）——转目标 failed(failure_kind)+pc，不楔死。两类来源：
+    ① fresh manifest/信封非法（artifact_invalid；resume 的已物化 manifest 校验不过 = 数据损毁，走
+    ManifestError fail loud）；② gate_register_evaluation 拒（protocol_violation：测量包不满足协议/required
+    契约——**只在该调用点显式转换**，其余 GateReject[状态机/库损毁类]一律 fail loud 上抛，codex 第2轮 BLOCKER）。"""
+
+    def __init__(self, msg: str, failure_kind: str = "artifact_invalid"):
+        super().__init__(msg)
+        self.failure_kind = failure_kind
+
+
 def _canon_hash(obj: Any) -> str:
     return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _synth_content_md(c: Dict[str, Any]) -> str:
+    """把冻结 idea_set.schema 的候选字段机械合成 idea.content_md（NOT NULL；供卡片/召回读）——
+    编排器不推理，只是确定性拼装（同候选恒同串）。"""
+    am = c.get("audit_mapping", {})
+    lines = [f"# {c['candidate_id']}", f"## 核心主张\n{c['core_claim']}", f"## 机制\n{c['mechanism']}",
+             "## 假设\n" + "\n".join(f"- {a}" for a in c.get("assumptions", [])),
+             f"## 最小可证伪实验\n{c['min_falsifiable_experiment']}",
+             f"## 类比映射\n源域={am.get('source_domain','')}；目标域={am.get('target_domain','')}；"
+             f"对象={am.get('object_mapping','')}；共享关系={am.get('shared_relations','')}",
+             f"## novelty\n类型={c.get('novelty_type','')}；状态={c.get('novelty_status','')}"]
+    return "\n\n".join(lines)
+
+
+def _audit_mean(audit: Optional[Dict[str, Any]]) -> Optional[float]:
+    """六维审计分均值（idea.audit_score REAL）；无审计条目 → None。"""
+    if not audit:
+        return None
+    sc = audit.get("scores", {})
+    return round(sum(sc.values()) / len(sc), 4) if sc else None
+
+
+def _synth_identity_md(t: Dict[str, Any]) -> str:
+    """从冻结 plan.schema 的 build target 机械合成 identity 草稿（gate_claim_baseline 非空判据用；
+    bundle 出真 identity.md 后 register_baseline 时替换为终版）。"""
+    claim = t.get("claim", {})
+    return (f"# {claim.get('slug','')}（canonical_key={claim.get('canonical_key','')}）\n\n"
+            f"## 计划意图\n{t.get('spec_md','')}\n\n## claim\n{json.dumps(claim, ensure_ascii=False, sort_keys=True)}")
 
 
 def judge_once(daemon, judge_provider: Callable, cycle_id: str, bt_id: int,
@@ -68,9 +120,11 @@ def judge_once(daemon, judge_provider: Callable, cycle_id: str, bt_id: int,
 
 class AttackStages:
     def __init__(self, *, state, compiler, pool_gate: PoolGate, close_gate, providers: Dict[str, Callable],
-                 obs_policy: Dict[str, Any], work_root: str):
+                 obs_policy: Dict[str, Any], work_root: str, schemas=None, policy: Optional[Dict[str, Any]] = None):
         """state=SQLiteStateStore；compiler=SqliteCompiler；pool_gate=PoolGate(含 ExecGate 全家)；
-        close_gate=SqliteGate（parser_suspect 已接真）；providers 见模块注释；work_root=staging 根目录。"""
+        close_gate=SqliteGate（parser_suspect 已接真）；providers 见模块注释；work_root=staging 根目录。
+        schemas=SchemaSet（步⑧：manifest 校验执法在编排器侧，不只靠 StageProvider）；
+        policy=policy.yaml dict（manifest 命令围栏 execution 节；缺省从既有 obs_policy 无法取，须显式传）。"""
         self.state = state
         self.compiler = compiler
         self.gate: PoolGate = pool_gate
@@ -78,6 +132,8 @@ class AttackStages:
         self.p = providers
         self.obs_policy = obs_policy
         self.work = Path(work_root)
+        self.schemas = schemas
+        self.policy = policy
 
     # ---------------------------------------------------------------- 调度 --
     def advance_stage(self, cyc) -> str:
@@ -98,11 +154,16 @@ class AttackStages:
 
     # ---------------------------------------------------------------- idea --
     def _idea_stage(self, cyc) -> None:
-        """idea 阶段（§3.2）：候选全量入 IDEA 表（防重复造轮的关键边，含 failed）+ selected 标记。单一事务。"""
+        """idea 阶段（§3.2）：候选全量入 IDEA 表（防重复造轮的关键边，含 failed）+ selected 标记。单一事务。
+        **消费冻结 idea_set.schema**（步⑧ CP8.2）：content_md **机械合成**（schema 无 content_md 键——
+        由 core_claim/mechanism/assumptions/MFE/audit_mapping 拼装）；audit_score 取该候选六维审计均值、
+        status 由 selected_id / audit decision 派生（audit_scores 是独立顶层数组，按 candidate_id 关联）。"""
         pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="idea")
         files = self.p["idea"](cyc, pack)
         iset = files["idea_set.json"]
         cands, selected = iset["candidates"], iset.get("selected_id")
+        audits = {a["candidate_id"]: a for a in iset.get("audit_scores", [])}
+        nrefs = json.dumps(iset.get("novelty_refs", []), ensure_ascii=False, sort_keys=True)
         if selected is not None and selected not in {c["candidate_id"] for c in cands}:
             raise ValueError(f"idea selected_id {selected!r} 不在候选集")
         ah = _canon_hash(iset)
@@ -116,44 +177,248 @@ class AttackStages:
             if pc == "duplicate":
                 return                        # 已提交（kill-9 后重做路径）；status 同事务已推进过
             for c in cands:
-                st = "selected" if c["candidate_id"] == selected else c.get("status", "candidate")
-                conn.execute("INSERT INTO idea(question_id,cycle_id,content_md,audit_score,status) VALUES (?,?,?,?,?)",
-                             (qi, ci, c["content_md"], c.get("audit_score"), st))
+                cid = c["candidate_id"]
+                audit = audits.get(cid)
+                if cid == selected:
+                    st = "selected"
+                elif audit is not None and audit.get("decision") == "fail":
+                    st = "failed"
+                else:
+                    st = "candidate"
+                conn.execute(
+                    "INSERT INTO idea(question_id,cycle_id,content_md,novelty_refs_json,audit_score,audit_json,status) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (qi, ci, _synth_content_md(c), nrefs, _audit_mean(audit),
+                     json.dumps(audit, ensure_ascii=False, sort_keys=True) if audit else None, st))
             conn.execute("UPDATE cycle SET status='idea' WHERE id=?", (ci,))
 
     # ---------------------------------------------------------------- plan --
     def _plan_stage(self, cyc) -> None:
-        """plan 阶段：落 build_target[] + 池占位（claim 语义**事务内内联**——gate_claim_* 是外部单独入口，
-        此处与 phase_commit/status 同生共死防「claim 成功但 target 未落」的半态；判据面同 claim：canonical_key
-        I5 前置、identity 非空）。单一事务。"""
+        """plan 阶段（步⑧ CP8.2 重写）：消费**冻结 plan.schema** → 走正式 gate 通道（gate_new_protocol I1 +
+        gate_claim_baseline I5）→ 落 build_target[]（plan_ref=**resolved 切片**）。
+
+        **可恢复短事务序列**（gate 各自事务，不共一大事务——WriteDaemon 单写不可嵌套；同 bundle 注册段范式）：
+        persist-then-consume plan.json（崩溃重放得同一 plan）→ 纯读派生（protocol/metric int 映射确定性）→
+        gate_new_protocol（幂等：已注册则跳过）→ 逐目标 gate_claim_baseline（本 cycle 已占则复用）→ 终局单
+        事务落全部 build_target + required_metric + phase_commit + status。
+        **全自动不楔死**：Codex 产的**任何**站不住的 plan——结构非法（缺键/非 schema-conform）、语义非法
+        （I1 冲突 / canonical_key 被他轮占 / plan 内 canonical_key 重复 / required 版本不符 / 未支持的 target
+        kind）——一律 **_PlanReject → 业务拒**（记 decision(plan_rejected) + 零 target 终态）→ bundle 空转 →
+        reasoning 收 inconclusive，**绝不 raise 到 advance**（否则轮永不推进=死循环）。故 schema 校验 + 结构
+        取键 + 派生 + gate 全裹在 try 内、异常一律归 _PlanReject/GateReject（内审 SHOULD-高：裸 KeyError 曾逃逸）。"""
+        ci, qi = _cnum(cyc.cycle_id), int(cyc.question_id[1:])
+        if self._plan_committed(ci):
+            return                              # 幂等/恢复：plan 阶段已终态（成功或业务拒）
+        plan = None                             # 信封获取也纳入 try（codex BLOCKER：缺 plan.json 键/JSON 损坏不得逃逸）
+        try:
+            plan = self._plan_artifact(cyc)     # persist-then-consume（原子落盘、恢复复用；失败转 _PlanReject）
+            self._validate_plan_schema(plan)    # 结构闸（防裸 KeyError 逃逸）：非 schema-conform → _PlanReject
+            targets = sorted(plan["targets"], key=lambda x: x["seq"])   # schema 保证 targets/seq 在场
+            for t in targets:                   # exec/eval/import target kind = CP8.6（graceful 拒、不楔死）
+                if t["target_kind"] != "build":
+                    raise _PlanReject(f"CP8.2 只支持 build 目标（exec/eval/import=CP8.6）：{t['target_kind']}")
+            if not targets:                     # 无 target（复用/聚合/idea 失败）：合法终态、零 target（非拒）
+                self._commit_plan_terminal(cyc, plan, built=[], reject=None)
+                return
+            derived = self._derive_plan(ci, plan, targets)      # 纯读派生（含 canonical_key/required/I1 前置判）
+            self._register_protocol(cyc.cycle_id, derived)      # gate_new_protocol（幂等跳过）
+            claims = self._claim_baselines(ci, cyc.cycle_id, derived)   # 逐目标 gate_claim_baseline（本轮已占则复用）
+        except (_PlanReject, GateReject) as e:                  # 非法 plan / gate 拒 → 业务拒收尾（不楔死）
+            self._commit_plan_terminal(cyc, plan, built=[], reject=str(e))
+            return
+        self._commit_plan_terminal(cyc, plan, built=[(d, claims[d["target_key"]]) for d in derived["targets"]],
+                                   reject=None)
+
+    def _validate_plan_schema(self, plan: Dict[str, Any]) -> None:
+        """plan.json 结构闸（编排器侧防御，不只靠 StageProvider——同 manifest 校验在 _obtain_manifest 侧）：
+        非 schema-conform → _PlanReject（业务拒，不楔死）。schemas 未注入（老测试路径）则跳过。"""
+        if self.schemas is None:
+            return
+        errs = [f"{e.json_path} {e.message}" for e in self.schemas.validator("plan").iter_errors(plan)]
+        if errs:
+            raise _PlanReject("plan.json 非 schema-conform: " + "; ".join(errs[:5]))
+
+    def _plan_committed(self, ci: int) -> bool:
+        return self.state.daemon.query_one(
+            "SELECT 1 FROM phase_commit WHERE cycle_id=? AND stage='plan' AND target_id IS NULL", (ci,)) is not None
+
+    def _plan_artifact(self, cyc) -> Dict[str, Any]:
+        """persist-then-consume（同 _reasoning_stage）：plan.json 先原子落盘，恢复复用同一 plan——否则多事务
+        gate 序列下崩溃重调非确定 provider 会产不同 plan → 半注册孤儿（protocol 注册了但 target 用了新 plan）。
+        **信封/解析失败统一转 _PlanReject**（codex BLOCKER：provider 返回缺 plan.json 键 / 落盘文件 JSON 损坏
+        会抛裸 KeyError/JSONDecodeError 逃出 _plan_stage 的 except → 楔死）。本方法在 _plan_stage 的 try 内调，
+        故 _PlanReject 会被业务拒兜住。**注**：provider 进程级失败（RunnerError）不在此转——那是「未产出 plan」
+        的另一失败类，与其他阶段（idea/reasoning）一致向上传播。"""
+        art = self.work / f"c{_cnum(cyc.cycle_id)}" / "plan.json"
+        if art.exists():
+            try:
+                return json.loads(art.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as e:
+                raise _PlanReject(f"持久 plan.json 解析失败（staging 损坏？）：{e}") from e
         pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="plan")
         files = self.p["plan"](cyc, pack)
+        if not isinstance(files, dict) or "plan.json" not in files:
+            raise _PlanReject(f"plan provider 未产 plan.json（返回键: {list(files) if isinstance(files, dict) else type(files)}）")
         plan = files["plan.json"]
-        ah = _canon_hash(plan)
-        ci, qi = _cnum(cyc.cycle_id), int(cyc.question_id[1:])
+        art.parent.mkdir(parents=True, exist_ok=True)
+        tmp = art.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(plan, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        tmp.replace(art)
+        return plan
+
+    def _derive_plan(self, ci: int, plan: Dict[str, Any], targets: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """纯读派生（编排器机械翻译，不推理；确定性 = 崩溃重放同结果）：抽象 plan → protocol int id / metric
+        string→int 映射 / 每目标 resolved 切片（冻结 target + 绑定四件）+ required int 对 + identity 草稿。
+        全部前置判失败一律 → _PlanReject（业务拒，不 raise 死循环）：I1 scope 冲突 / 复用协议缺 metric 绑定 /
+        target_key·seq·metric_id 重复 / required 悬挂引用 / canonical_key 冲突（codex BLOCKER×3）。"""
+        d = self.state.daemon
+        # target 平面唯一性（codex BLOCKER：target_key 重复 → claims dict 覆盖、build_target 错绑；seq 重复 →
+        # 终局事务撞 UNIQUE(cycle_id,seq) IntegrityError 楔死）——派生期拦下转业务拒
+        tkeys = [t["target_key"] for t in targets]
+        if len(set(tkeys)) != len(tkeys):
+            raise _PlanReject(f"targets 内 target_key 重复: {tkeys}")
+        if len({t["seq"] for t in targets}) != len(targets):
+            raise _PlanReject(f"targets 内 seq 重复: {[t['seq'] for t in targets]}")
+        for rm in plan.get("build_target_required_metric", []):
+            if rm["target_key"] not in set(tkeys):
+                raise _PlanReject(f"required_metric.target_key {rm['target_key']!r} 无对应 target")
+        proto = plan["protocol"]
+        pname, pver = proto["name"], proto["version"]
+        scope_json = json.dumps(proto["scope_spec"], ensure_ascii=False, sort_keys=True)
+        prow = d.query_one("SELECT id FROM protocol WHERE name=? ORDER BY id LIMIT 1", (pname,))
+        pid = prow[0] if prow else (d.query_one("SELECT COALESCE(MAX(id),0) FROM protocol")[0] + 1)
+        exist = d.query_one("SELECT scope_spec_json FROM protocol WHERE id=? AND version=?", (pid, pver))
+        proto_exists = exist is not None
+        if proto_exists and json.dumps(json.loads(exist[0]), sort_keys=True) != json.dumps(json.loads(scope_json), sort_keys=True):
+            raise _PlanReject(f"I1：protocol {pname}@{pver} 已存在且 scope 不同——改场景须升 version")
+        # metric string→int 映射（身份=name；同 plan 内重名共 id；DB 已有按 name 复用；否则顺序分配 max+1..）
+        mmap: Dict[str, int] = {}
+        def_versions = set()                    # (plan_metric_id, version) 声明集——required 版本一致性核（内审 SHOULD）
+        defs: List[Dict[str, Any]] = []
+        next_id = d.query_one("SELECT COALESCE(MAX(id),0) FROM metric_def")[0]
+        for md in plan.get("metric_defs", []):
+            if md["metric_id"] in mmap:         # metric_id 是 plan 内 join 键，须唯一（codex BLOCKER）
+                raise _PlanReject(f"metric_defs 内 metric_id 重复: {md['metric_id']!r}")
+            def_versions.add((md["metric_id"], md["version"]))
+            name = md["name"]
+            if name in {defs_e["name"] for defs_e in defs}:
+                mmap[md["metric_id"]] = next(dd["id"] for dd in defs if dd["name"] == name)
+                continue
+            row = d.query_one("SELECT id FROM metric_def WHERE name=? ORDER BY id LIMIT 1", (name,))
+            if row:
+                mid_int = row[0]
+            else:
+                next_id += 1
+                mid_int = next_id
+            mmap[md["metric_id"]] = mid_int
+            defs.append({"id": mid_int, "version": md["version"], "name": name, "direction": md["direction"],
+                         "unit": md.get("unit"), "compute_spec": md.get("compute_spec_md")})
+        req_by_tk: Dict[str, List[tuple]] = {}
+        for rm in plan.get("build_target_required_metric", []):
+            if rm["metric_id"] not in mmap:
+                raise _PlanReject(f"required_metric 引用未声明的 metric_id {rm['metric_id']!r}（不在 metric_defs）")
+            if (rm["metric_id"], rm["metric_ver"]) not in def_versions:
+                # required 版本须与 metric_defs 声明一致（内审 SHOULD）：否则 protocol_metric 落 def_ver、
+                # eval/register 用 req_ver → I2 在 bundle 阶段拒（不 catch）→ 楔死；派生侧拦下转业务拒。
+                raise _PlanReject(f"required_metric {rm['metric_id']}@{rm['metric_ver']} 版本与 metric_defs 声明不符")
+            req_by_tk.setdefault(rm["target_key"], []).append((mmap[rm["metric_id"]], rm["metric_ver"]))
+        if proto_exists:
+            # 复用既有 protocol（跳过 gate_new_protocol）时，required 的每个 (int_id, ver) 必须已在
+            # protocol_metric(pid,pver) 里——否则 bundle 的 gate_register_evaluation I2 拒→楔死（codex BLOCKER）。
+            # 协议不可变（I1）：要用新 metric 集须升 version。派生期拦下转业务拒。
+            for pairs in req_by_tk.values():
+                for (mid_int, mver) in pairs:
+                    if d.query_one("SELECT 1 FROM protocol_metric WHERE protocol_id=? AND protocol_ver=? "
+                                   "AND metric_id=? AND metric_ver=?", (pid, pver, mid_int, mver)) is None:
+                        raise _PlanReject(f"复用 protocol {pname}@{pver} 但 required metric {mid_int}@{mver} "
+                                          "不在其 protocol_metric（I1：改 metric 集须升 version）")
+        seen_ck = set()                         # plan 内 canonical_key 唯一 + 未被他轮占（内审 SHOULD-高：防同轮别名共 variant / 跨轮毒化）
+        for t in targets:
+            ck, slug = t["claim"]["canonical_key"], t["claim"]["slug"]
+            if ck in seen_ck:
+                raise _PlanReject(f"plan 内 canonical_key 重复: {ck!r}（同轮多目标不得共占坑）")
+            seen_ck.add(ck)
+            occ = d.query_one("SELECT born_cycle, slug FROM baseline WHERE canonical_key=?", (ck,))
+            if occ is not None and not (occ[0] == ci and occ[1] == slug):
+                raise _PlanReject(f"canonical_key 被他轮占（I5）: {ck!r}")   # 派生期拦下 → claim 段不会半途失败留孤儿
+        dts = []
+        for t in targets:
+            claim = t.get("claim", {})
+            tk = t["target_key"]
+            slice_ = dict(t)                    # 冻结 target 原样 + 绑定四件（plan_ref 权威；bundle manifest 交叉核锚）
+            slice_.update({"protocol_id": pid, "protocol_ver": pver, "eval_key": tk,
+                           "target_set_hash": _canon_hash({"factory_of": {"cycle": ci, "target_key": tk,
+                                                                          "canonical_key": claim.get("canonical_key")}})})
+            dts.append({"target_key": tk, "seq": t["seq"], "slice": slice_,
+                        "required": req_by_tk.get(tk, []), "identity_md": _synth_identity_md(t),
+                        "claim": claim})
+        return {"protocol": {"id": pid, "version": pver, "name": pname, "scope_json": scope_json,
+                             "exists": proto_exists, "defs": defs,
+                             "metrics": [(dd["id"], dd["version"]) for dd in defs]},
+                "targets": dts}
+
+    def _register_protocol(self, cycle_id: str, derived: Dict[str, Any]) -> None:
+        """gate_new_protocol（I1）——**幂等**：protocol (id,ver) 已存在（scope 已在 derive 核一致）则跳过，
+        护跨轮复用 + 崩溃重放（gate 对已存在 (id,ver) 会 GateReject）。"""
+        p = derived["protocol"]
+        if p["exists"]:
+            return
+        self.gate.gate_new_protocol(protocol_id=p["id"], version=p["version"], name=p["name"],
+                                    scope_spec_json=p["scope_json"], cycle_id=cycle_id,
+                                    metric_defs=p["defs"], metrics=p["metrics"])
+
+    def _claim_baselines(self, ci: int, cycle_id: str, derived: Dict[str, Any]) -> Dict[str, tuple]:
+        """逐目标 gate_claim_baseline（I5 占坑）——**本 cycle 已占则复用**（崩溃重放：我们上次已 claim →
+        canonical_key 被自己占，gate 会拒 → 须复用既有 ids）。canonical_key 冲突已在 _derive_plan 前置拦下，
+        故本段正常不会因占坑失败；万一 gate 仍拒（如未预见约束），**回滚本次已占的孤儿 baseline**（DELETE，
+        无 build_target 引用、状态仍 planned）——免多目标 plan 半途失败留孤儿毒化 canonical_key（内审 SHOULD）。"""
+        d = self.state.daemon
+        claims: Dict[str, tuple] = {}
+        fresh: List[int] = []                                # 本调用新占的 baseline_id（回滚用）
+        try:
+            for dt in derived["targets"]:
+                ck, slug = dt["claim"].get("canonical_key"), dt["claim"].get("slug")
+                row = d.query_one("SELECT id, born_cycle, slug FROM baseline WHERE canonical_key=?", (ck,))
+                if row and row[1] == ci and row[2] == slug:  # 本 cycle 已占（重放）→ 复用 baseline+base variant
+                    vrow = d.query_one("SELECT id FROM variant WHERE baseline_id=? AND variant_key='base'", (row[0],))
+                    claims[dt["target_key"]] = (row[0], vrow[0])
+                else:
+                    r = self.gate.gate_claim_baseline(canonical_key=ck, slug=slug, cycle_id=cycle_id,
+                                                      identity_draft_md=dt["identity_md"])
+                    fresh.append(r["baseline_id"])
+                    claims[dt["target_key"]] = (r["baseline_id"], r["variant_id"])
+        except GateReject:
+            if fresh:                                        # 回滚孤儿（DELETE 释放 canonical_key；仅 planned 无引用者）
+                with d.transaction() as conn:
+                    for bid in fresh:
+                        conn.execute("DELETE FROM variant WHERE baseline_id=? AND status='planned'", (bid,))
+                        conn.execute("DELETE FROM baseline WHERE id=? AND status='planned'", (bid,))
+            raise
+        return claims
+
+    def _commit_plan_terminal(self, cyc, plan: Optional[Dict[str, Any]], *, built: List[tuple],
+                              reject: Optional[str]) -> None:
+        """plan 阶段终态单事务：build_target[]（plan_ref=切片）+ required_metric + phase_commit + status='plan'。
+        reject 非 None → 零 target + 记 decision(plan_rejected)（业务拒，不楔死）。phase_commit 幂等/conflict 兜底。
+        plan=None（信封获取即失败的业务拒）→ 用固定哨兵 hash（该轮无有效 plan 产物可锚）。"""
+        ci = _cnum(cyc.cycle_id)
+        qi = int(cyc.question_id[1:])
+        ah = _canon_hash(plan) if plan is not None else _canon_hash({"plan_artifact_failed": True})
         with self.state.daemon.transaction() as conn:
             pc = check_or_record(conn, cycle_id=cyc.cycle_id, stage="plan", target_id=None, artifact_hash=ah)
             if pc == "conflict":
-                raise ValueError("plan 阶段 phase_commit 冲突：同键异 artifact_hash")
+                raise ValueError("plan 阶段 phase_commit 冲突：同键异 artifact_hash（plan.json 被改写？）")
             if pc == "duplicate":
                 return
-            for t in sorted(plan.get("targets", []), key=lambda x: x["seq"]):
-                if t["kind"] != "build":
-                    raise NotImplementedError(f"CP5.4 plan 只落 build 目标（exec 链已由 gate 级验证；import=CP5.5）：{t['kind']}")
-                if not t.get("identity_draft_md", "").strip():
-                    raise ValueError("plan build 目标缺 identity 草稿（claim 判据面）")
-                if conn.execute("SELECT 1 FROM baseline WHERE canonical_key=?", (t["canonical_key"],)).fetchone():
-                    raise ValueError(f"canonical_key 已占（I5）: {t['canonical_key']!r}")
-                bid = conn.execute("INSERT INTO baseline(slug,canonical_key,identity_doc,born_cycle,status) "
-                                   "VALUES (?,?,?,?,'planned')",
-                                   (t["slug"], t["canonical_key"], t["identity_draft_md"], ci)).lastrowid
-                vid = conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status) "
-                                   "VALUES (?,?,?,'planned')",
-                                   (bid, t.get("variant_key", "base"), t.get("config_json", "{}"))).lastrowid
+            if reject is not None:
+                conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'orchestrator','plan_rejected',?)",
+                             (ci, json.dumps({"reason": reject}, ensure_ascii=False)))
+            for dt, (bid, vid) in built:
                 bt = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,"
-                                  "baseline_id,variant_id,plan_ref) VALUES (?,?,'build',?,'pending',?,?,?)",
-                                  (ci, qi, t["seq"], bid, vid, json.dumps(t, sort_keys=True))).lastrowid
-                for (mid, mver) in t["required"]:
+                                  "baseline_id,variant_id,eval_key,plan_ref) VALUES (?,?,'build',?,'pending',?,?,?,?)",
+                                  (ci, qi, dt["seq"], bid, vid, dt["slice"]["eval_key"],
+                                   json.dumps(dt["slice"], ensure_ascii=False, sort_keys=True))).lastrowid
+                for (mid, mver) in dt["required"]:
                     conn.execute("INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) "
                                  "VALUES (?,?,?)", (bt, mid, mver))
             conn.execute("UPDATE cycle SET status='plan' WHERE id=?", (ci,))
@@ -169,32 +434,89 @@ class AttackStages:
         with self.state.daemon.transaction() as conn:
             conn.execute("UPDATE cycle SET status='bundle' WHERE id=?", (ci,))
 
-    def _target_spec(self, bt_id: int) -> Dict[str, Any]:
+    def _slice(self, bt_id: int) -> Dict[str, Any]:
+        """resolved plan 切片（plan_ref）：冻结 target 原样 + 编排器派生绑定四件（protocol_id/protocol_ver/
+        eval_key/target_set_hash）。bundle manifest 交叉核的锚。"""
         row = self.state.daemon.query_one("SELECT plan_ref FROM build_target WHERE id=?", (bt_id,))
         return json.loads(row[0])
 
+    def _obtain_manifest(self, cyc, bt_id: int, slice_: Dict[str, Any], src_dir: Path) -> tuple:
+        """取本目标的 execution_manifest（persist-then-consume）：src 未物化 → 调 bundle provider 产信封
+        → 校验 + 交叉核 + 净土物化；已物化 → 复用。返回 (manifest, ledger)。
+
+        **fresh 与 resume 同校验口径**（codex SHOULD-1）：两路径都 validate_manifest + cross_check(切片)。
+        **失败分流**（codex SHOULD-2）：
+        - fresh 路径（Codex 刚产的 manifest 非法/信封缺件）→ **_BundleReject**（业务拒→目标 failed，不楔死）；
+        - resume 路径（已物化的 manifest 竟校验不过 = 已入库产物损坏，而非 Codex 出错）→ ManifestError 上抛
+          fail loud（同 staged_hashes 篡改）——我们只物化校验通过的 manifest，故此路径校验失败 = 数据损毁。"""
+        if self.policy is None:
+            raise RuntimeError("AttackStages 须注入 policy（manifest 命令围栏 execution 节）")
+        ledger = MF.staged_hashes(src_dir)        # 篡改自查（损毁→ManifestError fail loud）
+        if ledger is None:                        # fresh：Codex 出错归业务拒
+            pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="bundle", target_id=str(bt_id))
+            files = self.p["bundle"](cyc, pack)
+            try:
+                if not isinstance(files, dict) or "execution_manifest.json" not in files:
+                    raise MF.ManifestError(f"bundle provider 未产 execution_manifest.json（键: "
+                                           f"{list(files) if isinstance(files, dict) else type(files)}）")
+                manifest = files["execution_manifest.json"]
+                self._check_manifest(manifest, slice_)
+                ledger = MF.stage_bundle_files(files, manifest, src_dir)
+            except MF.ManifestError as e:
+                raise _BundleReject(str(e)) from e
+            return manifest, ledger
+        manifest = json.loads((src_dir / MF.MANIFEST_FILE).read_text(encoding="utf-8"))
+        self._check_manifest(manifest, slice_)    # resume 再校验（损坏→ManifestError 上抛，不吞）
+        return manifest, ledger
+
+    def _check_manifest(self, manifest: Dict[str, Any], slice_: Dict[str, Any]) -> None:
+        """manifest 结构 + 交叉核 + kind 支持（fresh/resume 共用）。非 build kind → ManifestError（fresh 侧
+        转 _BundleReject 业务拒；CP8.6 接 exec/eval）。"""
+        if self.schemas is not None:
+            MF.validate_manifest(self.schemas, manifest)
+        MF.cross_check(manifest, slice_)          # 防「manifest 自立目标/换协议/改配置」
+        if manifest["target_ref"]["target_kind"] != "build":
+            raise MF.ManifestError(f"CP8.2 bundle 只驱动 build 目标（exec/eval=CP8.6）：{manifest['target_ref']['target_kind']}")
+
     def _drive_target(self, cyc, bt_id: int) -> None:
-        """单目标推进（可重入）：按当前状态从断点续。"""
+        """单目标推进（可重入）：按当前状态从断点续。执行命令由 manifest 承载（步⑧）。
+        **契约违规不楔死、损毁必楔**（codex 第2轮 BLOCKER 收窄）：只捕 _BundleReject（Codex 产物层业务拒：
+        非法 manifest = artifact_invalid / 测量包违约 = protocol_violation，见 _BundleReject 注）→ 目标
+        failed(failure_kind) + 落 pc、续下一目标。**GateReject 不在此捕**——状态机/库损毁类拒绝（start/
+        progress/finish/register_baseline）必须 fail loud，误终态化会把恢复/篡改问题永久掩埋。"""
+        st = lambda: self.state.daemon.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0]
+        try:
+            self._drive_target_inner(cyc, bt_id)
+        except _BundleReject as e:
+            if st() not in _TERMINAL_TARGET:      # 产物层业务拒 → 目标 failed（携 failure_kind）+ pc
+                self.gate.gate_finish_build_target(build_target_id=bt_id, status="failed",
+                                                   failure_kind=e.failure_kind)
+            self._ensure_target_pc(cyc, bt_id)
+
+    def _drive_target_inner(self, cyc, bt_id: int) -> None:
         g = self.gate
         d = self.state.daemon
-        spec = self._target_spec(bt_id)
+        slice_ = self._slice(bt_id)
         st = lambda: d.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0]
         if st() in _TERMINAL_TARGET:
             self._ensure_target_pc(cyc, bt_id)   # 崩在 complete 与 pc 之间 → 补 pc（幂等）
             return
         staging = self.work / f"c{_cnum(cyc.cycle_id)}" / f"t{bt_id}"
+        src_dir = staging / "src"                 # 代码物化目录（每目标唯一；净土物化，与 run/eval 产物分离）
+        manifest, ledger = self._obtain_manifest(cyc, bt_id, slice_, src_dir)
         if st() == "pending":
             g.gate_start_build_target(build_target_id=bt_id)
-        if st() == "building":                    # 真 smoke（子进程）→ 过了才进 smoke 态
-            sm = H.run_staged(spec["smoke_cmd"], staging_dir=str(staging / "smoke"),
-                              log_name=f"smoke-{self._next_serial(staging, 'smoke')}.log", timeout_s=120)
+        if st() == "building":                    # 真 smoke（manifest.commands.smoke 子进程）→ 过了才进 smoke 态
+            sm = MF.run_manifest_command(manifest, "smoke", staging_dir=str(staging / "smoke"),
+                                         log_name=f"smoke-{self._next_serial(staging, 'smoke')}.log",
+                                         src_dir=src_dir, work_root=self.work, policy=self.policy)
             if sm["exit_code"] != 0:              # smoke 失败 → target 失败连坐（codex SHOULD：exit code 不得忽略）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._ensure_target_pc(cyc, bt_id)   # 终态早退**也**落 pc（codex 第2轮 BLOCKER：漏落致杀/不杀分裂）
                 return
             g.gate_progress_build_target(build_target_id=bt_id, to="smoke")
         if st() == "smoke":                       # 代码适配评审（subject 编排器重算；judge replay-safe）
-            code_sh = self._code_subject_hash(bt_id, spec, staging)
+            code_sh = self._code_subject_hash(slice_, manifest, ledger, staging)
             self._judge_once(cyc.cycle_id, bt_id, "bundle_code_review", code_sh)
             if not g.review_passed(build_target_id=bt_id, review_kind="bundle_code_review",
                                    current_subject_hash=code_sh):
@@ -205,16 +527,17 @@ class AttackStages:
                 return
             g.gate_progress_build_target(build_target_id=bt_id, to="running", current_subject_hash=code_sh)
         if st() == "running":
-            self._run_and_register(cyc, bt_id, spec, staging)
+            self._run_and_register(cyc, bt_id, slice_, manifest, ledger, staging, src_dir)
         self._ensure_target_pc(cyc, bt_id)
 
-    def _run_and_register(self, cyc, bt_id: int, spec, staging: Path) -> None:
-        """phase (i) 执行事实 + phase (ii) 注册段（结构可恢复的短事务序列）。
+    def _run_and_register(self, cyc, bt_id: int, slice_, manifest, ledger, staging: Path, src_dir: Path) -> None:
+        """phase (i) 执行事实 + phase (ii) 注册段（结构可恢复的短事务序列）。命令由 manifest 驱动（步⑧）。
         ⚠️ 与 import_worker._run_and_register_import **同构**（恢复缝隙修复须双向同步；共享骨架=M6 硬化）。"""
         g, d = self.gate, self.state.daemon
         ci = cyc.cycle_id
         vid = d.query_one("SELECT variant_id FROM build_target WHERE id=?", (bt_id,))[0]
         bid = d.query_one("SELECT baseline_id FROM build_target WHERE id=?", (bt_id,))[0]
+        env_hash = manifest["env_hash"]
         # —— (i) 训练 run（结构续：残留 running run 先 abort；成功 run 直接复用）——
         run_row = d.query_one("SELECT id,status FROM run WHERE build_target_id=? ORDER BY id DESC", (bt_id,))
         if run_row and run_row[1] == "running":   # 崩溃残留：终结后重跑（run append-only，不复用半途 run）
@@ -224,14 +547,14 @@ class AttackStages:
             rid = run_row[0]
         else:
             rid = g.gate_start_run(build_target_id=bt_id, cycle_id=ci, variant_id=vid, kind="build",
-                                   env_hash=spec.get("env_hash", "toy-env"))
-            r = H.run_staged(spec["train_cmd"], staging_dir=str(staging / f"run{rid}"),
-                             log_name="train.log", timeout_s=600)
+                                   env_hash=env_hash)
+            r = MF.run_manifest_command(manifest, "train", staging_dir=str(staging / f"run{rid}"),
+                                        log_name="train.log", src_dir=src_dir, work_root=self.work, policy=self.policy)
             if r["exit_code"] != 0:
                 g.gate_finish_run(run_id=rid, status="failed", failure_kind="runtime")
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
                 return                            # 训练失败入账不入树（§7.1 判例④；答题侧自然无证据）
-            ck_path = staging / f"run{rid}" / spec["ckpt_name"]
+            ck_path = MF.checkpoint_dest(manifest, staging / f"run{rid}")   # 围栏解析进 run 目录内
             with d.transaction() as conn:         # checkpoint 登记（run 产物；finish_run success 的前置）
                 # ckpt_key 带 run id（codex SHOULD）：UNIQUE(variant,ckpt_key) 下，崩在 ckpt 与 finish_run 之间
                 # → 旧 run 被 abort、新 run 重训——固定 'final' 会撞唯一键永久楔死；残留 ckpt 归属 aborted run
@@ -260,14 +583,15 @@ class AttackStages:
                 ev = {"log_path": str(eval_final), "log_sha256": hashlib.sha256(eval_log).hexdigest(),
                       "log_bytes": len(eval_log), "exit_code": exit_code}
             else:
-                ev = H.run_staged(spec["eval_cmd"], staging_dir=str(staging / f"eval{rid}"),
-                                  log_name="eval.log", timeout_s=600)
+                ev = MF.run_manifest_command(manifest, "eval", staging_dir=str(staging / f"eval{rid}"),
+                                             log_name="eval.log", src_dir=src_dir, work_root=self.work,
+                                             policy=self.policy, ckpt_path=MF.checkpoint_dest(manifest, staging / f"run{rid}"))
                 eval_log = Path(ev["log_path"]).read_bytes()
             if ev["exit_code"] != 0:              # fresh 与 resume 同一判定点（评估进程失败 → target failed）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
                 return
-            metrics = self._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"), spec)
-            res_sh = self._result_subject_hash(bt_id, spec, rid, metrics, ev)
+            metrics = self._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"))
+            res_sh = self._result_subject_hash(bt_id, slice_, ledger, rid, metrics, ev)
             self._judge_once(ci, bt_id, "bundle_result_review", res_sh)
             if not g.review_passed(build_target_id=bt_id, review_kind="bundle_result_review",
                                    current_subject_hash=res_sh):
@@ -275,13 +599,19 @@ class AttackStages:
                 # （§4.2.5：第(ii)段不发生）——lockstep：import_worker 同修
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="review_failed")
                 return
-            reg = self.gate.gate_register_evaluation(
-                cycle_id=ci, build_target_id=bt_id, purpose="factory", current_subject_hash=res_sh,
-                metric_results=metrics,
-                create={"variant_id": vid, "protocol_id": spec["protocol_id"], "protocol_ver": spec["protocol_ver"],
-                        "eval_key": spec["eval_key"], "source": "factory", "target_set_hash": spec["target_set_hash"]},
-                env_hash=spec.get("env_hash", "toy-env"),
-                artifact_ref=f"sha256:{ev['log_sha256']}")   # 评估 log 哈希锚落 attempt（补登强校验用，codex BLOCKER）
+            try:
+                reg = self.gate.gate_register_evaluation(
+                    cycle_id=ci, build_target_id=bt_id, purpose="factory", current_subject_hash=res_sh,
+                    metric_results=metrics,
+                    create={"variant_id": vid, "protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"],
+                            "eval_key": slice_["eval_key"], "source": "factory", "target_set_hash": slice_["target_set_hash"]},
+                    env_hash=env_hash,
+                    artifact_ref=f"sha256:{ev['log_sha256']}")   # 评估 log 哈希锚落 attempt（补登强校验用，codex BLOCKER）
+            except GateReject as e:
+                # **只在此调用点**把注册闸拒转业务失败（codex 第2轮 BLOCKER 收窄）：此处的拒 = 评估测量包
+                # 不满足协议/required 契约（Codex eval 产物层问题）→ 目标 failed(protocol_violation)、不楔死。
+                # 其余 gate（start/progress/finish/register_baseline）的拒仍 fail loud。
+                raise _BundleReject(f"测量注册被拒: {e}", failure_kind="protocol_violation") from e
             eid, aid = reg["evaluation_id"], reg["attempt_id"]
         else:
             eid = erow[0]
@@ -301,10 +631,12 @@ class AttackStages:
                 "SELECT json_extract(payload_json,'$.subject_hash') FROM decision WHERE actor='judge' "
                 "AND type='bundle_result_review' AND json_extract(payload_json,'$.build_target_id')=? "
                 "ORDER BY id DESC LIMIT 1", (bt_id,))[0]
+            # 终版身份 = bundle 产的 identity.md 全文（替换 plan 期占位草稿）；复现命令 = manifest.repro_cmd_md
+            identity_doc = (src_dir / MF.IDENTITY_FILE).read_text(encoding="utf-8")
             self.gate.gate_register_baseline(
                 baseline_id=bid, variant_id=vid, build_target_id=bt_id, evaluation_id=eid,
                 cycle_id=ci, current_subject_hash=res_sh2,
-                identity_doc=spec["identity_draft_md"], repro_cmd=spec["repro_cmd"], run_id=rid)
+                identity_doc=identity_doc, repro_cmd=manifest["repro_cmd_md"], run_id=rid)
         if d.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0] not in _TERMINAL_TARGET:
             self.gate.gate_finish_build_target(build_target_id=bt_id, status="complete")
 
@@ -355,28 +687,33 @@ class AttackStages:
                 raise ValueError(f"bundle target {bt_id} phase_commit 冲突（终态被改写？）")
 
     # -- subject 构造（编排器确定性重算，judge 不自算，§4.1.4 附注）----------------
-    def _code_subject_hash(self, bt_id: int, spec, staging: Path) -> str:
+    def _code_subject_hash(self, slice_: Dict[str, Any], manifest, ledger: Dict[str, str], staging: Path) -> str:
+        """代码评审 subject（步⑧：真材料）：plan 切片哈希 + 物化代码 ledger 哈希（=真代码内容）+ 配置哈希 +
+        identity 草稿哈希（staged）+ smoke transcript。编排器确定性重算，judge/register 两处一致。"""
         smoke_dir = staging / "smoke"
         logs = sorted(smoke_dir.glob("smoke-*.log"))
         smoke_ref = str(logs[-1]) if logs else "smoke:none"
         smoke_hash = H.file_sha256(smoke_ref) if logs else "0" * 64
         return SM.subject_hash(SM.code_review_manifest(
-            plan_slice_hash=_canon_hash(spec), code_diff_hash=_canon_hash(spec["train_cmd"]),
-            config_hashes={}, identity_draft_hash=_canon_hash(spec["identity_draft_md"]),
+            plan_slice_hash=_canon_hash(slice_), code_diff_hash=_canon_hash(ledger),
+            config_hashes={"config_json": _canon_hash(manifest["config_json"])},
+            identity_draft_hash=ledger[MF.IDENTITY_FILE],
             smoke_transcript_ref=smoke_ref, smoke_transcript_hash=smoke_hash))
 
-    def _result_subject_hash(self, bt_id: int, spec, rid: int, metrics, ev) -> str:
+    def _result_subject_hash(self, bt_id: int, slice_: Dict[str, Any], ledger: Dict[str, str],
+                             rid: int, metrics, ev) -> str:
         ckrow = self.state.daemon.query_one(
             "SELECT ckpt_key, content_hash FROM checkpoint WHERE produced_by_run=?", (rid,))
         return SM.subject_hash(SM.result_review_manifest(
             metrics_artifact_hash=_canon_hash(metrics), checkpoint_hashes={ckrow[0]: ckrow[1]},
             run_log_hashes={ev["log_path"]: ev["log_sha256"]},
             parser_obs_hash=_canon_hash(OP.parse_log(Path(ev["log_path"]).read_text(), self.obs_policy)),
-            identity_draft_hash=_canon_hash(spec["identity_draft_md"])))
+            identity_draft_hash=ledger[MF.IDENTITY_FILE]))
 
     @staticmethod
-    def _metrics_from_eval_log(text: str, spec) -> List[Dict[str, Any]]:
+    def _metrics_from_eval_log(text: str) -> List[Dict[str, Any]]:
         """评估产物口径（toy 最小）：eval log 每行 `metric_value: <mid>@<mver>=<float>` → aggregate metric_result。
+        <mid>/<mver> = 编排器派生的 int 协议绑定（bundle pack 给 Codex，eval 命令照打印）。
         真评估产物规范 artifact（fold+aggregate 文件）= M6 硬化；此处值真来自真评估子进程输出。"""
         out = []
         for line in text.splitlines():

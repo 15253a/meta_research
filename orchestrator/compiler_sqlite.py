@@ -89,10 +89,10 @@ class SqliteCompiler:
             parts.append(f"## 单轮预算\nB(t) = {self._budget()}（policy budget 节）")
             sources.append("policy:budget")
         elif stage == "bundle" and target_id is not None:
-            # target_id 已消费（不同 target → 不同 pack）；完整计划切片（build_target 行 + 协议 + required_metric）
-            # = M3（plan gate 产 build_target 行后编译），本检查点占位——同 retrieval/观测段的延后。
-            parts.append(f"## 本目标\n- target: {target_id}\n（完整计划切片 = CP-M3：plan gate 产 build_target 后编译）")
-            sources.append(f"db:build_target:{target_id}")
+            # 完整计划切片（步⑧ CP8.2）：resolved 切片（plan_ref）+ plan_slice_hash（manifest 须回引此值）+
+            # required 指标 int 绑定（eval 命令 metric_value 行须用这些 int id@ver）——真 Codex 据此产
+            # execution_manifest.json + 代码 + identity.md。target_id 已消费（不同 target → 不同 pack）。
+            parts.append(self._bundle_target(target_id, sources))
         elif stage == "reasoning":
             parts.append(f"## 目标全文（当前版 v{goal_ver}）\n{self.goal_body_md}")
             sources.append("input:goal_brief.md")
@@ -105,6 +105,32 @@ class SqliteCompiler:
                  "tau": self.policy["flow"]["tau"]}, ensure_ascii=False, sort_keys=True) + "\n```")
             sources.append("policy:acquisition")
         return "\n\n".join(p for p in parts if p)
+
+    def _bundle_target(self, target_id, sources) -> str:
+        """bundle 目标锚区（步⑧）：resolved 切片全文 + plan_slice_hash（manifest.target_ref 须回引）+ required
+        指标 int 绑定。target_id = build_target.id 的字符串（attack_stages 传 str(bt_id)）。"""
+        try:
+            bt = int(target_id)
+        except (TypeError, ValueError):
+            return f"## 本目标\n- target: {target_id}（无效 build_target id）"
+        row = self.conn.execute("SELECT plan_ref, baseline_id, variant_id, eval_key FROM build_target WHERE id=?",
+                                (bt,)).fetchone()
+        sources.append(f"db:build_target:{bt}")
+        if row is None or row[0] is None:
+            return f"## 本目标\n- target: {target_id}（build_target 缺失或无 plan_ref）"
+        slice_ = json.loads(row[0])
+        # plan_slice_hash：manifest.target_ref.plan_slice_hash 须等于此值（编排器交叉核）；工人照抄
+        slice_hash = hashlib.sha256(json.dumps(slice_, ensure_ascii=False, sort_keys=True,
+                                               separators=(",", ":")).encode("utf-8")).hexdigest()
+        reqs = self.conn.execute("SELECT metric_id, metric_ver FROM build_target_required_metric "
+                                 "WHERE build_target_id=? ORDER BY metric_id, metric_ver", (bt,)).fetchall()
+        req_md = "、".join(f"{m}@{v}" for m, v in reqs) or "（无）"
+        return ("## 本目标（bundle 编译执行契约）\n"
+                f"- build_target: {bt}（eval_key={row[3]}）\n"
+                f"- **plan_slice_hash（manifest.target_ref.plan_slice_hash 须回引此值）**: `{slice_hash}`\n"
+                f"- required 指标绑定（eval 命令 `metric_value: <id>@<ver>=<float>` 须用这些 int）: {req_md}\n"
+                "- resolved 计划切片（manifest 须与之 target_key/target_kind/seq/protocol 绑定/config 一致）:\n"
+                "```json\n" + json.dumps(slice_, ensure_ascii=False, sort_keys=True, indent=2) + "\n```")
 
     def _neighborhood(self, aq, sources) -> str:
         """结构邻域 = 祖先链（recursive on parent_id；DDL trg_question_parent_frozen 防环，seen 兜底坏数据）。"""

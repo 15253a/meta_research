@@ -12,7 +12,6 @@ provenance 五件套 join = test_import_worker.test_materialize_full_chain——
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -106,11 +105,9 @@ def test_case3_reuse_hit_zero_retrain(tmp_path):
 # ============ 判例④：训练失败入账不入树 ============
 def test_case4_failure_accounted_not_in_tree(tmp_path):
     path = str(tmp_path / "research.sqlite")
-    daemon, state, compiler, attack = TA._mk_env(path, tmp_path / "w")
+    daemon, state, compiler, attack = TA._mk_env(path, tmp_path / "w",
+                                                 train_body="import sys; print('loss: 1.0'); sys.exit(1)")
     TA._bootstrap_attack(state)
-    bad = TA._target_spec()
-    bad["train_cmd"] = [sys.executable, "-c", "import sys; print('loss: 1.0'); sys.exit(1)"]
-    attack.p["plan"] = lambda cyc, pack: {"plan.json": {"protocol": {"id": 1, "version": 1}, "targets": [bad]}}
     attack.p["reasoning"] = lambda cyc, pack: {
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
