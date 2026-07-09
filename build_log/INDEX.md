@@ -6,6 +6,7 @@
 
 ---
 
+- [0041](0041-cp88-reasoning-selection-no-wedge.md) — CP8.8 reasoning selection 不可调度不楔死（**部署真跑发现的真实楔死修复**：Codex 选 visit 达上限的题 attack→InvalidSelectionError→decision+terminate 干净收尾；部署复跑 7 轮越过首跑 c6 楔死点、τ 干净自停、selection_invalid 活证据）· commit `5e7108d` · 验证: 通过（pytest 625/625 + 部署系统真跑 exit 0 零 traceback；内审+codex 双 APPROVE）
 - [0040](0040-cp87-operating-manual-step-verification.md) — CP8.7 运维操作手册（README 重写）+ 步⑧步级验证收口（全链 E2E + 真 Codex 冒烟 + 冻结锁三条留证）· commit `d627a39` · 验证: 通过（pytest 623/623；内审逐条实证事实一致[1 BLOCKER budget 停因休眠 caveat 已修]，codex APPROVE）—— **步⑧「正式直接可用」达成**
 - [0039](0039-cp86-exec-target-kind.md) — CP8.6 exec target kind（既有 legal baseline 上建变体：gate_claim_variant→manifest 真执行→gate_register_variant 入池；崩溃自占复用严核身份+config；append 绑定锚收准 build_target.evaluation_id）· commit `a713509` · 验证: 通过（pytest 623/623；内审+codex 两轮，3 BLOCKER 全修，第2轮 APPROVE）
 - [0038](0038-cp85-sidecar-file-request-bridge.md) — CP8.5 sidecar→file_request 桥（阶段资源请求全局等待闭环：落单→干净停→precheck 拦→resolve→同一在途轮续跑；业务拒重试/损坏 fail-loud 分流）· commit `650aace` · 验证: 通过（pytest 618/618；内审+codex 第1轮双 APPROVE）
