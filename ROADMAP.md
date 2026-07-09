@@ -15,9 +15,10 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑧（M7）CP8.2**（attack_stages 真契约化）。CP8.1 契约层已落（commit `8b4f59a`，
-  build_log 0034，578 测绿）。步①–⑦（M0–M6）建造面全部完成。步⑦遗留的「plan 制品契约缺口」已定向
-  （不解冻），本步落地中。
+- 进行中的步 / 检查点：**步⑧（M7）CP8.3**（生产装配：bundle SKILL + judge provider + StageProvider 扩展）。
+  CP8.1 契约层（`8b4f59a`）+ CP8.2 attack_stages 真契约化（`d822add`）已落，594 测绿——mock provider 驱动
+  真组件的完整 attack 轮（idea→plan[真 gate]→bundle[manifest 真执行]→注册入池→真证据关问）已端到端跑通。
+  步①–⑦（M0–M6）建造面全部完成。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -232,14 +233,13 @@
     env·超时围栏 + 禁 shell 启动器 / 净土物化正反双向对账 + symlink 审计）+ policy.execution 节。纯新增，
     不改既有行为 —— commit `8b4f59a`（build_log 0034；codex 两轮外审：第1轮 2 BLOCKER[禁 shell·checkpoint
     ../x]+2 SHOULD 全修，第2轮无 BLOCKER 仅 2 SHOULD[. 段·ledger 校验]亦修；pytest 578/578，43 新，535 无回归）。
-  - [ ] CP8.2 attack_stages 真契约化：idea/plan 消费冻结 schema 真形态（content_md 等机械合成）；plan 段
-    改走 gate_new_protocol + gate_claim_baseline（可恢复幂等短事务序列，phase_commit 收口）；机械派生
-    protocol_id/metric 映射/eval_key/target_set_hash；bundle 段逐目标 Codex bundle 产物（persist-then-
-    consume）→ manifest 驱动执行；toy TARGET_SPEC 清理 + 冻结件不变回归测试。
-    **硬约束（CP8.1 内审记）**：①每目标 staging 物化目录唯一（stage_bundle_files 净土物化=整目录清空，
-    勿与 run/eval 产物混目录）；②驱动按 target_kind **静态**定命令序列（build/exec: smoke→train→eval；
-    eval: 仅 eval），勿动态猜 kind；③manifest 记账/寻址一律对**值**（canon_hash）勿对文件字节
-    （物化本体是规范化字节，与 Codex 原样字节不同）。
+  - [x] CP8.2 attack_stages 真契约化：idea/plan 消费冻结 schema 真形态（content_md 机械合成）；plan 段走
+    gate_new_protocol + gate_claim_baseline（persist-then-consume + 纯读派生[protocol/metric string→int]+
+    gate 幂等/复用 + 终局单事务）；bundle 逐目标 manifest 驱动真执行（fresh/resume 同口径校验+净土物化）；
+    toy TARGET_SPEC 清理 + frozen_contracts 锁。**全自动不楔死**：任何站不住的 plan→业务拒(plan_rejected)、
+    Codex 产物层 manifest/测量违约→目标 failed(artifact_invalid/protocol_violation)+pc；状态机/损毁类
+    GateReject 仍 fail loud —— commit `d822add`（build_log 0035；pytest 594/594；codex 两轮：第1轮 3 BLOCKER
+    +2 SHOULD 全修，第2轮采纳收窄 GateReject 捕获、驳回误读项[render 返回 ContextPack]并记录）。
   - [ ] CP8.3 生产装配：bundle SKILL.md 真执行契约改写 + judge（review_verdict schema + judge skill +
     JudgeProvider 写 runner_call(audit)+DECISION(judge)）+ StageProvider bundle/judge 扩展（passthrough
     代码文件 + manifest 校验）。
