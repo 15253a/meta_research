@@ -88,6 +88,7 @@ class SqliteCompiler:
         elif stage == "plan":
             parts.append(f"## 单轮预算\nB(t) = {self._budget()}（policy budget 节）")
             sources.append("policy:budget")
+            parts.append(self._plan_reject_feedback(aq, sources))
         elif stage == "bundle" and target_id is not None:
             # 完整计划切片（步⑧ CP8.2）：resolved 切片（plan_ref）+ plan_slice_hash（manifest 须回引此值）+
             # required 指标 int 绑定（eval 命令 metric_value 行须用这些 int id@ver）——真 Codex 据此产
@@ -105,6 +106,26 @@ class SqliteCompiler:
                  "tau": self.policy["flow"]["tau"]}, ensure_ascii=False, sort_keys=True) + "\n```")
             sources.append("policy:acquisition")
         return "\n\n".join(p for p in parts if p)
+
+    def _plan_reject_feedback(self, aq, sources) -> str:
+        """本问题**最近一次** plan 业务拒的拒因（步⑧ CP8.4 自纠环）：没有它，真 Codex 会在后续轮对同一
+        问题重复同一被拒 plan（冒烟实证：连续 3 轮产 exec 目标被拒）。确定性派生（decision 表）；
+        **拒后已有更晚的成功 plan（该问题在更晚 cycle 落过 build_target）→ 不再渲染**（codex SHOULD：
+        陈旧拒因会在 CP8.6 后把本已合法的 exec/eval 引导走偏）。无可渲染记录 → 空串。"""
+        if aq is None:
+            return ""
+        row = self.conn.execute(
+            # 按 payload.question_id 锚定（轮末 cycle.active_question_id 已随问题释放置 NULL，不可 JOIN）
+            "SELECT json_extract(payload_json,'$.reason'), cycle_id FROM decision "
+            "WHERE type='plan_rejected' AND actor='orchestrator' AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.question_id')=? ORDER BY id DESC LIMIT 1", (aq,)).fetchone()
+        if row is None or not row[0]:
+            return ""
+        if self.conn.execute("SELECT 1 FROM build_target WHERE question_id=? AND cycle_id>?",
+                             (aq, row[1] or -1)).fetchone():
+            return ""                       # 拒因之后本问题已有成功 plan → 反馈已消费，不再纠缠
+        sources.append(f"db:decision:plan_rejected:q{aq}")
+        return ("## ⚠ 最近一次 plan 被拒原因（先修正它再产出本轮 plan）\n" + str(row[0]))
 
     def _bundle_target(self, target_id, sources) -> str:
         """bundle 目标锚区（步⑧）：resolved 切片全文 + plan_slice_hash（manifest.target_ref 须回引）+ required

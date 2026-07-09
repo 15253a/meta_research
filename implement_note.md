@@ -5,7 +5,15 @@
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
 - 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.4**（run.py attack 全装配 + 全链 E2E + 真 Codex 冒烟）
-- 检查点状态：待开工（CP8.3 已提交 c7863c0 + 记账中）
+- 检查点状态：内审 APPROVE（零 BLOCKER/SHOULD）。**第一次真 Codex 冒烟完成**（scratchpad/smoke_m7）：
+  全自动 6 轮不楔死（bootstrap→decompose→attack×4），但真 Codex 对 toy 家族连产 exec/eval target 被
+  CP8.6 守卫业务拒（池空时语义非法）→ 已修两处并加测（612 绿）：①plan SKILL 补「kind 前置条件」
+  （池空必 build）②compiler plan 锚区拒因回流自纠环（payload 带 question_id 锚）。
+  **第二次冒烟后台跑**（brrgu8a90，scratchpad/smoke_m7b）——等结果 → codex 外审（prompt 头已备
+  scratchpad/cp84_review_head.txt）→ 提交 → build_log 0037。
+- **用户追加要求（2026-07-09，已登记 ROADMAP 步⑧）**：最终交付=正式直接可用系统 → CP8.5（sidecar 桥）/
+  CP8.6（plan 全形态受理：exec/eval/import_defer + route 特化 + ImportWorker 装配）/ CP8.7（运维操作面
+  文档+步级验证收口）升格为**必做**。
 
 ## 正在做什么
 **步⑧：plan 契约缺口补齐 → 全流程 real-Codex attack**。已落三检查点（608 测绿）：

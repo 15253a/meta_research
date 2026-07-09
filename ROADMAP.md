@@ -210,7 +210,11 @@
 
 ### 步⑧（M7）plan 契约缺口补齐 → 全流程 real-Codex attack
 
-- 来源：用户 2026-07-09「开始补齐这个缺口吧，我要的是成品最后能完整走完整个流程的系统」。
+- 来源：用户 2026-07-09「开始补齐这个缺口吧，我要的是成品最后能完整走完整个流程的系统」；同日追加
+  「**最后要是正式的系统直接可用的系统**」——完成定义升格：不止 toy 链路跑通，交付面须**正式
+  直接可用**：①plan 全形态受理（build/exec/eval targets + import_defer——真 Codex 冒烟实证它天然会产
+  exec/eval，缺特化即浪费轮次）②阶段资源请求桥（真研究要向用户要数据文件）③运维入口可用（一条命令 +
+  文档化操作面）。CP8.5–8.7 因此为**必做**，非边走边补。
 - **方案（已与用户对齐 + codex-chatgpt 联合设计，2026-07-08/09；设计记录
   scratchpad `plan_contract_design_out.md`，要点如下）**：
   - **不解冻任何冻结件**（plan.schema / DDL / MIGRATION_SHA256 不动）；plan 保持抽象（本来就对）。
@@ -246,7 +250,11 @@
     第2轮 APPROVE）。
   - [ ] CP8.4 run.py attack 全装配 + 步级验证：build_system 装配 AttackStages 全家 → 全链 E2E（mock）+
     真 Codex CLI 冒烟 ≥1 完整 attack 轮。
-  - [ ] CP8.5 sidecar→file_request 桥：StageProvider resource_request → notify.create_file_request +
-    干净阻断（全局等待闭环，替换 fail-loud 占位）。
-  - [ ]（边走边补）CP8.6+ exec/eval target kinds + route 特化（reuse_only/eval_only/dependency_wait）+
-    import_defer→DeferredImporter/ImportWorker 接线。
+  - [ ] CP8.5 sidecar→file_request 桥（**必做**，正式可用性①）：StageProvider resource_request →
+    notify.create_file_request + 干净阻断（全局等待闭环，替换 fail-loud 占位）。
+  - [ ] CP8.6 plan 全形态受理（**必做**，正式可用性②）：exec/eval target kinds（gate_claim_variant /
+    eval_action append·create 驱动）+ route 特化（reuse_only/eval_only/dependency_wait）+
+    import_defer→DeferredImporter + ImportWorker 装配进 run.py。
+  - [ ] CP8.7 正式可用收口（**必做**，正式可用性③）：运维操作面文档（README：启动命令/goal_brief 写法/
+    policy 旋钮/console·status_card·文件请求交互/恢复与停机语义）+ 步⑧步级验证全跑 + ROADMAP/
+    implement_note 终态。

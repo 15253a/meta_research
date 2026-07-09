@@ -119,10 +119,10 @@ def test_main_cli_attack_clean_error(tmp_path, monkeypatch, capsys):
                    "selection.json": {"next_question_id": "root", "next_intent": "attack",
                                       "scores": [{"question_id": "root", "score": 0.9, "est_cost": 1.0}]}}
     orig = R.build_system
-    monkeypatch.setattr(R, "build_system",
-                        lambda sr, wr, **kw: orig(sr, wr, runner_factory=_mock_factory([boot_attack])))
+    monkeypatch.setattr(R, "build_system",           # attack=False：验证退化装配仍干净拒（CP8.4 后 attack 默认全装）
+                        lambda sr, wr, **kw: orig(sr, wr, runner_factory=_mock_factory([boot_attack]), attack=False))
     rc = R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path), "--max-cycles", "3"])
-    assert rc == 2 and "CP7.4 装配 attack" in capsys.readouterr().out
+    assert rc == 2 and "尚未装配的组件" in capsys.readouterr().out
 
 
 def test_stop_reason_print_prefers_block(tmp_path, monkeypatch, capsys):
@@ -156,3 +156,171 @@ def test_global_wait_honored_end_to_end(tmp_path):
     assert sys.run(max_cycles=5) == []
     assert called["n"] == 0                                     # 阻断：一次 runner 都未调
     assert "文件请求" in sys.advancer.last_block_reason
+
+
+# ============ CP8.4 · attack 全装配端到端（真子进程执行 + 真 judge 落库链）============
+def _lazy_factory(items):
+    """runner 工厂：items 元素为 dict（原样吐）或 callable(context_pack)→dict（吐前按当下 DB/staging 现算
+    ——bundle 须回引 plan_slice_hash、attack reasoning 须引用真 metric_result id，均只在调用时可知）。"""
+    box = {"seq": list(items)}
+
+    class MockRunner:
+        def run_task(self, *, system_prompt, skill, context_pack):
+            item = box["seq"].pop(0)
+            files = item(context_pack) if callable(item) else item
+            return Artifact(stage=context_pack.stage, files=files, md="")
+    return lambda td, pt: MockRunner()
+
+
+def test_full_attack_flow_end_to_end(tmp_path):
+    """步⑧步级验证①：run.py 装配的**全系统**跑通完整流程——bootstrap→attack（idea→plan[真 gate 注册
+    协议/占坑]→bundle[manifest→harness 真子进程 smoke/train/eval]→双评审[JudgeProvider 真落库链]→
+    注册入池→真证据关问）→terminate。runner 为脚本化 mock（Codex 替身），其余全为真组件。"""
+    import sys as _sys
+    import test_attack_advance as TA
+    from orchestrator.manifest import canon_hash
+
+    db_path = str(tmp_path / "research.sqlite")
+
+    def bundle_env(pack):                       # 按 pack.target_id 读切片、回引 hash、产真 toy 代码
+        conn = db.connect(db_path)
+        slice_ = json.loads(conn.execute("SELECT plan_ref FROM build_target WHERE id=?",
+                                         (int(pack.target_id),)).fetchone()[0])
+        conn.close()
+        return {"execution_manifest.json": {
+                    "manifest_version": 1,
+                    "target_ref": {"target_key": slice_["target_key"], "target_kind": "build",
+                                   "seq": slice_["seq"], "plan_slice_hash": canon_hash(slice_)},
+                    "protocol_ref": {"protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"]},
+                    "env_hash": "toy-env", "config_json": {"lr": 0.1},
+                    "code_files": ["train.py", "eval.py", "smoke.py"],
+                    "commands": {"smoke": {"argv": [_sys.executable, "{src}/smoke.py"]},
+                                 "train": {"argv": [_sys.executable, "{src}/train.py"]},
+                                 "eval": {"argv": [_sys.executable, "{src}/eval.py", "{ckpt}"]}},
+                    "expected_outputs": {"checkpoint": "ckpt.bin"},
+                    "repro_cmd_md": "python train.py 后 python eval.py <ckpt>"},
+                "identity.md": "# toy 基线\n结构: 线性\n\n## 复现命令\npython train.py",
+                "train.py": TA.TRAIN_OK, "eval.py": TA.EVAL_OK, "smoke.py": TA.SMOKE_OK}
+
+    def attack_reasoning(pack):                 # 以真 metric_result 关问 + terminate
+        conn = db.connect(db_path)
+        mr = conn.execute("SELECT id FROM metric_result ORDER BY id DESC LIMIT 1").fetchone()[0]
+        qid = conn.execute("SELECT active_question_id FROM cycle WHERE id=?",
+                           (int(pack.cycle_id[1:]),)).fetchone()[0]
+        conn.close()
+        return {"answer.json": {"question_id": f"q{qid}", "verdict": "answered",
+                                "evidence": [{"kind": "evaluation", "metric_result_id": f"mr{mr}",
+                                              "note_md": "toy 基线 acc=0.93"}],
+                                "answer_md": "以出厂测量关问"},
+                "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
+                                   "terminate_reason_md": "toy 目标已以真测量关问"}}
+
+    boot_attack = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "toy 基线能到 0.9 吗",
+                                              "local_key": "root"}]},
+                   "selection.json": {"next_question_id": "root", "next_intent": "attack", "scores": []}}
+    verdict_pass = {"review_verdict.json": {"verdict": "pass", "issues": []}}
+    seq = [boot_attack,                          # c1 bootstrap（reasoning）
+           TA._idea_set(), TA._plan_json(),      # c2 attack：idea → plan（冻结 schema 真形态）
+           bundle_env,                           # bundle 信封（manifest+代码）
+           verdict_pass, verdict_pass,           # judge：code review → result review（经 JudgeProvider 落库）
+           attack_reasoning]                     # 轮尾：真证据关问 + terminate
+    sys_ = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory(seq))
+    ids = sys_.run(max_cycles=6)
+    assert len(ids) == 2                                         # bootstrap + attack 两轮后 terminate
+    d = sys_.daemon
+    # 全链断言：协议真注册 / 池 legal / 真测量 / 双评审真落库（JudgeProvider 链）/ 真证据关问
+    assert d.query_one("SELECT count(*) FROM protocol WHERE name='toy-proto'")[0] == 1
+    assert d.query_one("SELECT status FROM baseline WHERE canonical_key='ck-attack'")[0] == "legal"
+    assert d.query_one("SELECT status, eval_key FROM evaluation WHERE source='factory'")[0:2] == ("success", "t1")
+    assert d.query_one("SELECT value FROM metric_result ORDER BY id DESC LIMIT 1")[0] == 0.93
+    assert d.query_one("SELECT count(*) FROM runner_call WHERE phase='audit' AND status='success'")[0] == 2
+    assert d.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 2
+    assert d.query_one("SELECT status FROM question WHERE text LIKE 'toy 基线%'")[0] == "answered"
+    assert d.query_one("SELECT count(*) FROM build_target WHERE status='complete'")[0] == 1
+    # 执行是真子进程：checkpoint 文件真实存在且被登记
+    ck = d.query_one("SELECT path, content_hash FROM checkpoint")
+    assert Path(ck[0]).exists() and len(ck[1]) == 64
+    assert sys_.last_stop_reason is None                         # 正常 terminate（非 τ/阻断）
+
+
+def test_attack_assembly_optional_off(tmp_path):
+    """attack=False 退化装配（诊断用）：遇 attack 续轮仍干净拒（NotImplementedError），不静默。"""
+    boot_attack = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根", "local_key": "root"}]},
+                   "selection.json": {"next_question_id": "root", "next_intent": "attack", "scores": []}}
+    sys_ = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory([boot_attack]),
+                        attack=False)
+    with pytest.raises(NotImplementedError):
+        sys_.run(max_cycles=3)
+
+
+def test_plan_reject_feedback_in_next_pack(tmp_path):
+    """CP8.4 自纠环：plan 业务拒后，同一问题下一 attack 轮的 plan pack 含「上轮 plan 被拒原因」
+    （冒烟实证：无此反馈真 Codex 连续 3 轮重复同一被拒 plan）。"""
+    import test_attack_advance as TA
+    from orchestrator.advancer import SqliteAdvancer
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = TA._mk_env(path, tmp_path / "w")
+    TA._bootstrap_attack(state)
+
+    def exec_plan(cyc, pack):                    # 被拒的 plan（exec 目标 CP8.6 未接）
+        p = TA._plan_json()["plan.json"]
+        p["targets"][0]["target_kind"] = "exec"
+        p["targets"][0]["claim"] = {"baseline_ref": "b1", "variant_key": "v2", "config_json": {"lr": 1}}
+        return {"plan.json": p}
+    attack.p["plan"] = exec_plan
+    attack.p["reasoning"] = lambda c, pk: {      # 拒后收尾：继续攻同一问题
+        "selection.json": {"next_question_id": TA_root_qid(daemon), "next_intent": "attack", "scores": []}}
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_rejected'")[0] == 1
+    # 下一轮同问题的 plan pack：拒因在锚区
+    c2 = state.open_or_resume_cycle()
+    state.set_route(c2.cycle_id, "attack")
+    state.activate_question(TA_root_qid(daemon))
+    pack = compiler.render(cycle_id=c2.cycle_id, stage="plan")
+    assert "最近一次 plan 被拒原因" in pack.anchor_md and "只支持 build" in pack.anchor_md
+    daemon.conn.close()
+
+
+def TA_root_qid(daemon):
+    return f"q{daemon.query_one('SELECT id FROM question ORDER BY id LIMIT 1')[0]}"
+
+
+def test_plan_reject_feedback_suppressed_after_success(tmp_path):
+    """codex SHOULD 回归：拒因之后本问题已有成功 plan（更晚 cycle 落过 build_target）→ 反馈不再渲染
+    （陈旧拒因会在 CP8.6 后把本已合法的 exec/eval 引导走偏）。"""
+    import test_attack_advance as TA
+    from orchestrator.advancer import SqliteAdvancer
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = TA._mk_env(path, tmp_path / "w")
+    TA._bootstrap_attack(state)
+    box = {"n": 0}
+    real_plan = attack.p["plan"]
+
+    def flip_plan(cyc, pack):                    # 第 1 轮产被拒 plan（exec），第 2 轮产合法 build plan
+        box["n"] += 1
+        if box["n"] == 1:
+            p = TA._plan_json()["plan.json"]
+            p["targets"][0]["target_kind"] = "exec"
+            p["targets"][0]["claim"] = {"baseline_ref": "b1", "variant_key": "v2", "config_json": {"lr": 1}}
+            return {"plan.json": p}
+        return real_plan(cyc, pack)
+    attack.p["plan"] = flip_plan
+    rq = TA_root_qid(daemon)
+    sels = iter([{"selection.json": {"next_question_id": rq, "next_intent": "attack", "scores": []}},
+                 {"answer.json": None, "selection.json": {"next_question_id": None, "next_intent": "terminate",
+                                                          "scores": [], "terminate_reason_md": "done"}}])
+    def reasoning(c, pk):
+        files = dict(next(sels))
+        if files.get("answer.json") is None:
+            files.pop("answer.json", None)
+        return files
+    attack.p["reasoning"] = reasoning
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=3)
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_rejected'")[0] == 1
+    assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 1     # 第 2 轮成功 plan 落了 target
+    c3 = state.open_or_resume_cycle()
+    state.set_route(c3.cycle_id, "attack")
+    state.activate_question(rq)
+    pack = compiler.render(cycle_id=c3.cycle_id, stage="plan")
+    assert "plan 被拒原因" not in pack.anchor_md                # 已有更晚成功 plan → 反馈静默
+    daemon.conn.close()

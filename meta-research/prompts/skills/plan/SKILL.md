@@ -33,6 +33,11 @@
    | 同协议@版本缺指标 | `eval` target（追加 attempt） | `append_attempt` | `metric_append` | `evaluation_id`（既有格子） |
    | env 失配 / 结果存疑 | `eval` target（identity 复现） | `append_attempt` | `repro_eval` | `evaluation_id` |
    | 池中无 + 自建角色（消融/替换/超参/评估） | `build` / `exec` / `eval`（身份按三问决策树 §1.2.2：前向逻辑变=新 baseline、要重训=新 variant、只改评估=新 evaluation） | （eval 时按上表） | （eval 时按上表） | **build ⇒ `claim{canonical_key, slug}`；exec ⇒ `claim{baseline_ref, variant_key, config_json}`**（I5 占坑输入） |
+
+   ⚠️ **kind 前置条件（选错即整轮被拒）**：`exec` 的 `baseline_ref` 与 `eval` 的评估对象都**必须指向
+   检索区已有的 legal 池资产**——检索区没有该家族的 legal baseline（含池空）时，`exec`/`eval` 语义非法，
+   **必须走 `build` 先建 baseline**（首攻新家族恒为 build）。若上下文包给出「上轮 plan 被拒原因」，
+   先修正该原因再产出本轮 plan。
    | 池中无 + 需引入外部 baseline 家族/公认参照 | **M0 不走 import**：能自建对照则改自建；否则该 need 记入 md 正文"本轮无法覆盖"，由轮尾 reasoning 裁决（M1–M3 起此分支写 `import_defer`；M0 不产该字段） | — | — | — |
 3. **锁评估协议**（字段名按 schema 逐字写）：
    - `protocol`：`{name, version（整数≥1）, scope_spec（对象：评估数据/分割/checkpoint 选择/
