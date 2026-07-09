@@ -604,6 +604,34 @@ def test_reuse_protocol_missing_metric_binding_rejected(tmp_path):
     daemon.conn.close()
 
 
+def test_import_defer_rejected_not_silently_dropped(tmp_path):
+    """CP8.4 回归：plan 含 import_defer（schema 合法、targets 必空）——CP8.6 未接线，**显式业务拒**留痕
+    （decision(plan_rejected) 记录导入意图），不得静默当空 plan 丢意图。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+
+    def defer_plan(cyc, pack):
+        p = _plan_json()["plan.json"]
+        p["targets"] = []
+        del p["protocol"], p["metric_defs"], p["readout_rules"]
+        p["needs"], p["build_target_required_metric"] = [], []
+        p["import_defer"] = {"reason_md": "须引入公认外部基线", "candidate_set_hash": "csh",
+                             "selection_key": "sel", "policy_hash": "ph",
+                             "placeholder_baseline_identity": {"canonical_key_draft": "ext-b",
+                                                               "slug_draft": "ext", "identity_md": "外部基线"}}
+        return {"plan.json": p}
+    attack.p["plan"] = defer_plan
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1
+    rej = daemon.query_one("SELECT payload_json FROM decision WHERE type='plan_rejected'")[0]
+    assert "import_defer" in rej                                # 意图留痕，不静默
+    assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0
+    daemon.conn.close()
+
+
 def test_bad_manifest_target_failed_not_wedge(tmp_path):
     """codex SHOULD-2 回归：Codex 产的 manifest 交叉核不过（换协议=旁路）→ 目标 failed(artifact_invalid)
     + 落 pc，轮正常收尾（不楔死）。resume 语义：已物化 manifest 校验不过属损毁 fail-loud（不在此测）。"""

@@ -213,6 +213,13 @@ class AttackStages:
         try:
             plan = self._plan_artifact(cyc)     # persist-then-consume（原子落盘、恢复复用；失败转 _PlanReject）
             self._validate_plan_schema(plan)    # 结构闸（防裸 KeyError 逃逸）：非 schema-conform → _PlanReject
+            if "import_defer" in plan:
+                # schema 允许（targets 必空）但 CP8.6 未接线（DeferredImporter+dependency_wait）——静默当
+                # 空 plan 会**丢外部导入意图**且无痕；显式业务拒并把 defer 对象**整体嵌入拒因**（codex
+                # SHOULD：decision 是恢复/检索面，只留 reason 字符串不够——意图全文随 payload 可查，
+                # 持久化的 plan.json 是制品级备份）
+                raise _PlanReject("plan 含 import_defer——外部导入延迟决定 CP8.6 接线，本轮拒收；defer="
+                                  + json.dumps(plan["import_defer"], ensure_ascii=False, sort_keys=True))
             targets = sorted(plan["targets"], key=lambda x: x["seq"])   # schema 保证 targets/seq 在场
             for t in targets:                   # exec/eval/import target kind = CP8.6（graceful 拒、不楔死）
                 if t["target_kind"] != "build":
@@ -411,8 +418,10 @@ class AttackStages:
             if pc == "duplicate":
                 return
             if reject is not None:
+                # payload 带 question_id（步⑧ CP8.4）：轮末 active_question_id 会随问题释放置 NULL，
+                # compiler 的拒因回流（下一轮 plan pack「上轮被拒原因」）须按此锚定位本问题的拒记录
                 conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'orchestrator','plan_rejected',?)",
-                             (ci, json.dumps({"reason": reject}, ensure_ascii=False)))
+                             (ci, json.dumps({"reason": reject, "question_id": qi}, ensure_ascii=False)))
             for dt, (bid, vid) in built:
                 bt = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,"
                                   "baseline_id,variant_id,eval_key,plan_ref) VALUES (?,?,'build',?,'pending',?,?,?,?)",

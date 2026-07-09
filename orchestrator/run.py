@@ -10,14 +10,14 @@ brief 文件）→ goal_body_md 取 DB goal.text（权威）→ SqliteCompiler/S
 StopController + Console + make_advancer_precheck → StageProvider(CodexRunner) → SqliteAdvancer(全注入)。
 重启同 work_dir 即续跑（状态在 DB，非进程内）——kill-9 恢复同 M3。
 
-**M6 范围**：本入口落 **reasoning-only 全自动闭环**（bootstrap→decompose→terminate/τ 自停）——这是
-「系统能全自动跑起来」的最小完整证据。**attack 轮**需 idea/plan/judge provider 全接（CP7.4：judge
-写库形态 + idea_set schema↔attack_stages 校准），故本入口 attack=None（遇 attack 续轮由既有
-NotImplementedError 明确拒，不静默）。
+**步⑧（M7）范围**：本入口装配**全流程**——reasoning-only 闭环（M6 已落）+ **attack 轮全家**（CP8.4）：
+StageProvider 四阶段（idea/plan/bundle/reasoning）+ JudgeProvider（真 Codex 双评审写库）+ AttackStages
+（消费冻结 schema + manifest 驱动真执行）。仍明确拒的续轮：在途 import 物化轮（ImportWorker 未装配，
+CP8.6）——NotImplementedError 干净报，不静默。
 
-**双模式 A/B**（policy.session.dual_mode）：模式 A=一 turn 一阶段、模式 B=一 turn 跨多阶段。**对
-reasoning-only 轮二者等价**（bootstrap/decompose 每轮恰一阶段=一 turn），差异只在 attack 多阶段轮
-显现 → 真 A/B 驱动随 attack 落 CP7.4。本入口读并记录 dual_mode，reasoning-only 下走 run_cycles。
+**双模式 A/B**（policy.session.dual_mode）：模式 A=一 turn 一阶段、模式 B=一 turn 跨多阶段。run_cycles
+的内循环按阶段推进（格间过 precheck + 发布卡片），对两模式都成立；A/B 的会话粒度实测定默认 = 运维执行
+（§7.4）。本入口读并记录 dual_mode。
 """
 from __future__ import annotations
 
@@ -28,21 +28,25 @@ from typing import Any, Callable, Dict, List, Optional
 import yaml
 
 from . import database as _db
+from . import obs_parser as OP
 from .advancer import SqliteAdvancer
+from .attack_stages import AttackStages
 from .compiler_sqlite import SqliteCompiler
 from .console import Console
+from .gate_pool import PoolGate
+from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
 from .mediator import open_responder_read_conn
 from .notify import make_advancer_precheck
 from .runner import CodexRunner
 from .schemas import SchemaSet
-from .stage_provider import StageProvider
+from .stage_provider import JudgeProvider, StageProvider
 from .statestore_sqlite import SQLiteStateStore
 from .status_card import SqliteStatusPublisher
 from .stopcontroller import StopController
 from .writedaemon import WriteDaemon
 
-_STAGES = ("idea", "plan", "reasoning")
+_STAGES = ("idea", "plan", "bundle", "reasoning")
 
 
 class System:
@@ -67,10 +71,11 @@ class System:
 
 
 def build_system(system_root: str, work_root: str, *, runner_factory: Optional[Callable] = None,
-                 attack=None) -> System:
+                 attack=True) -> System:
     """装配全系统。system_root=含 input/goal_brief.md · policies/ · prompts/ · schemas/ 的仓库根；
     work_root=运行产物根（research.sqlite / cycles / state 落此）。runner_factory=注入式 Runner 工厂
-    （默认真 CodexRunner；测试传 mock）。attack=AttackStages 或 None（None=reasoning-only，CP7.4 接真）。"""
+    （默认真 CodexRunner；测试传 mock）。attack：True=全装（默认）；False/None=退化 reasoning-only
+    （诊断用）；AttackStages 实例=注入自定装配（codex NIT：保留可注入性，不破外部调用方）。"""
     root = Path(system_root)
     work = Path(work_root)
     work.mkdir(parents=True, exist_ok=True)
@@ -108,7 +113,27 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     provider = StageProvider(runner_factory=rf, schemas=schemas, policy=policy,
                              system_prompt=system_prompt, skills=skills, work_root=str(work))
 
-    advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack,
+    attack_stages = attack if isinstance(attack, AttackStages) else None
+    if attack is True:
+        # attack 全家（步⑧ CP8.4）：正式 gate 通道 + manifest 驱动真执行 + 真 Codex 双评审。
+        # 判据读连接各司其职：gate 家族走 open_gate_read_conn（authorizer 拒观测 9 表——判据隔离）；
+        # parser_suspect 须读 execution_observation → 走 open_responder_read_conn（mode=ro 全写拒，可读全表）。
+        pool_gate = PoolGate(daemon, open_gate_read_conn(db_path))
+        obs_conn = open_responder_read_conn(db_path)
+        close_gate = SqliteGate(daemon, open_gate_read_conn(db_path), schemas,
+                                parser_suspect=lambda aid: OP.suspect_for_attempt(
+                                    obs_conn, aid, policy["observation"]))
+        judge = JudgeProvider(
+            runner_factory=rf, schemas=schemas, policy=policy, system_prompt=system_prompt,
+            skill=(root / "prompts" / "skills" / "judge" / "SKILL.md").read_text(encoding="utf-8"),
+            daemon=daemon, work_root=str(work))
+        attack_stages = AttackStages(
+            state=state, compiler=compiler, pool_gate=pool_gate, close_gate=close_gate,
+            providers={"idea": provider.idea, "plan": provider.plan, "bundle": provider.bundle,
+                       "judge": judge, "reasoning": provider.reasoning},
+            obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy)
+
+    advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
                               status_publisher=publisher, precheck=precheck, stop_controller=stop)
     return System(advancer=advancer, state=state, daemon=daemon,
                   dual_mode=policy.get("session", {}).get("dual_mode", "A"), work_root=work)
@@ -124,8 +149,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         ids = system.run(args.max_cycles)
     except NotImplementedError as e:
-        # attack 续轮需 CP7.4 装配 judge/idea/plan provider（本入口 reasoning-only）——干净报，非裸 traceback
-        print(f"[run] 停：需 CP7.4 装配 attack provider 才能续本轮——{e}")
+        # 干净报（非裸 traceback）：具体缺哪个组件由异常文本自述（如 attack 退化装配缺 AttackStages、
+        # 在途 import 物化轮缺 ImportWorker[CP8.6]）——文案不预设单一来源（codex NIT）
+        print(f"[run] 停：续本轮需尚未装配的组件——{e}")
         return 2
     # 停因优先级（外审 SHOULD）：τ 自终止 > precheck 阻断（pause/文件请求）> 正常收尾——阻断对运维判断
     # 关键，不能被 idle 掩盖
