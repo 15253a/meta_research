@@ -243,7 +243,9 @@ class ConsoleData:
         if not text:
             raise ValueError("空消息")
         self.inbox.parent.mkdir(parents=True, exist_ok=True)
-        with self._inbox_lock:
+        with self._inbox_lock:                 # 锁仅进程内串行 seq——**单 console_server 实例假设**：多实例会分配重复
+            #                                    idempotency_key(console-{seq})，被 ingest 幂等层(interaction_message UNIQUE)
+            #                                    当重放吞掉第二条。运维部署须保证单实例（同 run 单写纪律）。
             seq = 1 + sum(1 for _ in self.inbox.open(encoding="utf-8")) if self.inbox.exists() else 1
             rec = {"connector": connector, "raw_text": text, "seq": seq,
                    "idempotency_key": f"console-{seq}"}
