@@ -15,9 +15,11 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑧（M7）CP8.7**（运维操作面文档 + 步级验证收口——「直接可用」最后一块）。
-  CP8.1–8.6 已落（…/`650aace`/`a713509`，623 测绿）——真 Codex 完整 attack build+exec 链端到端跑通 +
-  文件请求全等待环闭合。剩余=CP8.7 + CP8.6b（eval/import/route，模型裁量拆出的独立检查点）。步①–⑦全完成。
+- 进行中的步 / 检查点：**步⑧（M7）建造面全部完成**（CP8.1–8.7，`8b4f59a`…`d627a39`，623 测绿）——
+  **「正式直接可用」达成**：一条命令真 Codex 全自动跑完整研究元循环（build+exec target + 文件请求全等待环
+  + kill-9 恢复 + 人机控制 + 全自动不楔死），运维手册文档化，不解冻任何冻结件。步①–⑧全完成。
+  剩余=**CP8.6b**（eval/import/route dependency_wait，模型裁量拆出的独立检查点，非阻塞交付）+ 运维执行
+  （§7.4 T1/T2 数百轮真跑、双模式 A/B 实测、成本记账接线）。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -267,6 +269,18 @@
     **切分（模型裁量）**：eval target（frozen schema 对 create_evaluation 无 variant 引用，需设计）+
     import_defer/ImportWorker 装配 + route dependency_wait 特化 → CP8.6b（独立检查点）；exec 已覆盖
     「build 家族 + 变体迭代」核心研究形态。
-  - [ ] CP8.7 正式可用收口（**必做**，正式可用性③）：运维操作面文档（README：启动命令/goal_brief 写法/
-    policy 旋钮/console·status_card·文件请求交互/恢复与停机语义）+ 步⑧步级验证全跑 + ROADMAP/
-    implement_note 终态。
+  - [x] CP8.7 正式可用收口（正式可用性③）：运维操作手册（meta-research/README.md 重写：启动命令/goal_brief
+    写法/policy 旋钮/console·status_card·文件请求交互/恢复与停机语义/诚实边界）+ 步⑧步级验证三条留证——
+    commit `d627a39`（build_log 0040；pytest 623/623；内审逐条实证事实一致[1 BLOCKER budget 停因休眠
+    caveat 已修]，codex APPROVE）。
+- 步级验证结果（步⑧ M7）：**「正式直接可用」达成**——一条命令 `python -m orchestrator.run --system-root .
+  --work-root <dir>` 让真 Codex 全自动跑完整研究元循环（idea→plan[真 gate 注册协议/占坑]→bundle[manifest
+  → harness 真子进程 build/exec smoke·train·eval]→双评审[JudgeProvider 真落库]→注册入池→真证据关问→
+  decompose/terminate/τ 自停），带文件请求全等待环、kill-9 崩溃恢复、人机 pause/resume/query、全自动不楔死。
+  三条步级验证全过：①全链 E2E（test_full_attack_flow_end_to_end）②真 Codex CLI 冒烟（build 链 acc=0.9949
+  legal 入池，exit 0）③冻结件锁（plan.schema+MIGRATION_SHA256 步⑧零漂移）。623 测绿；不解冻任何冻结件。
+  运维面文档化（README §0–§8），边界诚实标注。
+- 遗留（诚实边界，非阻塞交付；README §7 载）：①全局成本安全网休眠（ledger 成本落账未接，真长跑前须接）；
+  ②真 git worktree 隔离 + env lock 强校验（canary→硬化）；③**CP8.6b** = eval target（frozen schema
+  create_evaluation 缺 variant 引用，需设计）+ import_defer/ImportWorker 装配 + route dependency_wait
+  特化；④§7.4 T1/T2 数百轮真跑 + 双模式 A/B 实测 = 运维执行。
