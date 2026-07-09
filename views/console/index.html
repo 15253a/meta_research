@@ -1,0 +1,2434 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>meta-research 人类控制台 · 原型</title>
+<style>
+:root{
+  --bg:#F4F6F5; --panel:#FFFFFF; --panel2:#FAFBFA; --ink:#1B2422; --sub:#5A6963;
+  --line:#DCE3E0; --line2:#EBEFED;
+  --accent:#0B6B5D; --accent-ink:#0A5A4E; --accent-bg:#E3F0ED; --accent-bg2:#F0F7F5;
+  --ok:#276B45; --ok-bg:#E4F1E8;
+  --bad:#A93A2F; --bad-bg:#F6E6E2;
+  --warn:#8A6400; --warn-bg:#F5EDD6;
+  --human:#5B4A9E; --human-bg:#EAE6F5;
+  --dead:#6B7370; --dead-bg:#ECEEEC;
+  --mono:ui-monospace,"SFMono-Regular","JetBrains Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,"PingFang SC","Hiragino Sans GB","Source Han Sans SC","Noto Sans CJK SC","Microsoft YaHei",system-ui,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--ink); font-family:var(--sans);
+  font-size:13.5px; line-height:1.65;
+  display:grid; grid-template-columns:240px minmax(0,1fr) 340px; grid-template-rows:52px minmax(0,1fr);
+  height:100vh; overflow:hidden;
+}
+@media (max-width:1180px){ body{grid-template-columns:0 minmax(0,1fr) 300px} .fstree{display:none} }
+.mono{font-family:var(--mono); font-size:.92em}
+.num{font-variant-numeric:tabular-nums}
+a{color:var(--accent-ink)}
+button{font-family:var(--sans)}
+
+/* ---------- 顶栏 ---------- */
+.topbar{
+  grid-column:1/4; display:flex; align-items:center; gap:14px; padding:0 16px;
+  background:var(--panel); border-bottom:1px solid var(--line); z-index:5;
+}
+.brand{display:flex; align-items:baseline; gap:8px; white-space:nowrap}
+.brand b{font-size:14.5px; letter-spacing:.02em}
+.brand .mono{color:var(--sub); font-size:11px}
+.sim-tag{
+  font-size:11px; padding:2px 8px; border-radius:3px; white-space:nowrap;
+  background:var(--warn-bg); color:var(--warn); border:1px solid #E5D9AE; font-weight:600;
+}
+.topbar .spacer{flex:1}
+.topstat{display:flex; align-items:center; gap:8px; white-space:nowrap; flex-wrap:nowrap}
+.tchip{
+  display:inline-flex; align-items:center; gap:6px; padding:3px 9px; border:1px solid var(--line);
+  border-radius:4px; background:var(--panel2); font-size:12px; color:var(--sub);
+}
+.tchip b{color:var(--ink); font-weight:600}
+.scen{display:inline-flex; border:1px solid var(--line); border-radius:4px; overflow:hidden}
+.scen button{
+  border:0; background:var(--panel); color:var(--sub); font-size:11.5px; padding:4px 9px; cursor:pointer;
+  border-left:1px solid var(--line);
+}
+.scen button:first-child{border-left:0}
+.scen button.on{background:var(--accent); color:#fff}
+.scen button:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+
+/* ---------- 左侧导航 ---------- */
+.nav{
+  background:var(--panel); border-right:1px solid var(--line); padding:12px 10px; overflow-y:auto;
+  display:flex; flex-direction:column; gap:2px;
+}
+.nav .grp{font-size:10.5px; letter-spacing:.14em; color:var(--sub); margin:12px 8px 4px; text-transform:uppercase}
+.nav .grp:first-child{margin-top:2px}
+.navbtn{
+  display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%;
+  border:0; background:transparent; text-align:left; padding:7px 10px; border-radius:5px;
+  font-size:13px; color:var(--ink); cursor:pointer;
+}
+.navbtn .en{font-family:var(--mono); font-size:10px; color:var(--sub)}
+.navbtn:hover{background:var(--panel2)}
+.navbtn.on{background:var(--accent-bg); color:var(--accent-ink); font-weight:600}
+.navbtn.on .en{color:var(--accent-ink)}
+.navbtn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.navfoot{margin-top:auto; padding:10px 8px 4px; font-size:10.5px; color:var(--sub); line-height:1.5; border-top:1px dashed var(--line)}
+
+/* ---------- 主区 ---------- */
+.main{overflow-y:auto; padding:18px 22px 60px; scroll-behavior:smooth}
+.page{max-width:1280px; margin:0 auto}
+.pagehead{display:flex; align-items:baseline; gap:12px; margin:2px 0 4px}
+.pagehead h1{font-size:17px; margin:0; letter-spacing:.01em}
+.pagehead .en{font-family:var(--mono); font-size:11px; color:var(--sub)}
+.pagesub{color:var(--sub); font-size:12.5px; margin:0 0 14px; max-width:72em}
+.pagesub .mono{font-size:11px}
+.docref{
+  margin-top:26px; padding-top:10px; border-top:1px dashed var(--line);
+  font-size:11px; color:var(--sub); line-height:1.7;
+}
+.docref b{color:var(--sub)}
+
+/* ---------- 卡片与栅格 ---------- */
+.card{background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:14px 16px; min-width:0}
+.card.pad0{padding:0; overflow:hidden}
+.card h3{margin:0 0 10px; font-size:13.5px; display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+.card h3 .en{font-family:var(--mono); font-size:10px; color:var(--sub); font-weight:400}
+.eyebrow{font-size:10.5px; letter-spacing:.13em; color:var(--sub); text-transform:uppercase; font-family:var(--mono)}
+.grid{display:grid; gap:12px}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.g21{grid-template-columns:minmax(0,2fr) minmax(0,1fr)}
+.g12{grid-template-columns:minmax(0,1fr) minmax(0,2fr)}
+@media (max-width:1080px){.g2,.g3,.g21,.g12{grid-template-columns:minmax(0,1fr)}}
+.stack{display:flex; flex-direction:column; gap:12px}
+
+/* ---------- 芯片 / 状态 ---------- */
+.chip{
+  display:inline-flex; align-items:center; gap:4px; padding:1px 7px; border-radius:3px;
+  font-size:11px; font-weight:600; border:1px solid transparent; white-space:nowrap; vertical-align:middle;
+}
+.chip .mono{font-weight:500}
+.c-ok{background:var(--ok-bg); color:var(--ok); border-color:#CBE3D2}
+.c-bad{background:var(--bad-bg); color:var(--bad); border-color:#EBCFC8}
+.c-warn{background:var(--warn-bg); color:var(--warn); border-color:#E5D9AE}
+.c-human{background:var(--human-bg); color:var(--human); border-color:#D6CEEC}
+.c-dead{background:var(--dead-bg); color:var(--dead); border-color:#D8DCDA}
+.c-acc{background:var(--accent-bg); color:var(--accent-ink); border-color:#C5DED8}
+.c-line{background:var(--panel); color:var(--sub); border-color:var(--line)}
+.c-ink{background:#EDF0EF; color:var(--ink); border-color:var(--line)}
+.dot{width:7px; height:7px; border-radius:50%; display:inline-block; flex:none}
+.dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+.dot.acc{background:var(--accent)} .dot.dead{background:var(--dead)} .dot.human{background:var(--human)}
+.dot.pulse{animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.dot.pulse{animation:none}}
+
+/* applicability 徽标(§4.5.1:单行、六枚举全渲染) */
+.appb{
+  display:inline-flex; align-items:center; gap:5px; font-size:11px; padding:1px 7px;
+  border-radius:3px; border:1px dashed; font-family:var(--mono); white-space:nowrap;
+}
+.appb.still{color:var(--ok); border-color:#9CC7AB; background:var(--ok-bg)}
+.appb.pending{color:var(--warn); border-color:#D3BE79; background:var(--warn-bg)}
+.appb.blocked{color:var(--dead); border-color:#B9BFBC; background:var(--dead-bg)}
+.appb.needs{color:var(--warn); border-color:#D3BE79; background:var(--warn-bg)}
+.appb.contradicted{color:var(--bad); border-color:#D9A49B; background:var(--bad-bg)}
+.appb.obsolete{color:var(--dead); border-color:#B9BFBC; background:var(--dead-bg)}
+
+/* ---------- 键值 / 表格 ---------- */
+.kv{display:grid; grid-template-columns:auto 1fr; gap:3px 14px; font-size:12.5px}
+.kv dt{color:var(--sub); white-space:nowrap}
+.kv dd{margin:0; min-width:0}
+table.t{width:100%; border-collapse:collapse; font-size:12.5px}
+table.t th{
+  text-align:left; font-size:10.5px; letter-spacing:.08em; color:var(--sub); font-weight:600;
+  padding:7px 10px; border-bottom:1px solid var(--line); background:var(--panel2); white-space:nowrap;
+  font-family:var(--mono);
+}
+table.t td{padding:7px 10px; border-bottom:1px solid var(--line2); vertical-align:top}
+table.t tr:last-child td{border-bottom:0}
+table.t tr.rowbtn{cursor:pointer}
+table.t tr.rowbtn:hover td{background:var(--accent-bg2)}
+table.t tr.rowsel td{background:var(--accent-bg2); box-shadow:inset 2px 0 0 var(--accent)}
+.tw{overflow-x:auto}
+.right{text-align:right}
+
+/* ---------- 按钮 ---------- */
+.btn{
+  display:inline-flex; align-items:center; gap:6px; padding:5px 12px; border-radius:5px; font-size:12.5px;
+  border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; font-weight:600;
+}
+.btn:hover{background:var(--accent-ink)}
+.btn.ghost{background:var(--panel); color:var(--accent-ink)}
+.btn.ghost:hover{background:var(--accent-bg)}
+.btn.gray{background:var(--panel); color:var(--sub); border-color:var(--line)}
+.btn.gray:hover{background:var(--panel2)}
+.btn.danger{background:var(--panel); color:var(--bad); border-color:#D9A49B}
+.btn.danger:hover{background:var(--bad-bg)}
+.btn:focus-visible{outline:2px solid var(--ink); outline-offset:1px}
+.btn[disabled]{opacity:.45; cursor:not-allowed}
+
+/* ---------- 总览:快照 vs 执行 双层带 ---------- */
+.duo{display:grid; grid-template-columns:minmax(0,7fr) minmax(0,5fr); gap:12px}
+@media (max-width:1080px){.duo{grid-template-columns:minmax(0,1fr)}}
+.snapcard{border:1px solid var(--line); border-radius:7px; background:var(--panel); overflow:hidden}
+.snapcard>.hd{
+  display:flex; align-items:center; gap:10px; padding:9px 14px; border-bottom:1px solid var(--line);
+  background:var(--panel2);
+}
+.snapcard>.hd .ttl{font-weight:700; font-size:12.5px}
+.snapcard>.hd .en{font-family:var(--mono); font-size:10px; color:var(--sub)}
+.snapcard>.bd{padding:13px 16px}
+.livecard{border:1px solid #BFD9D3; border-radius:7px; background:var(--accent-bg2); overflow:hidden}
+.livecard>.hd{
+  display:flex; align-items:center; gap:10px; padding:9px 14px; border-bottom:1px solid #BFD9D3;
+  background:var(--accent-bg); color:var(--accent-ink);
+}
+.livecard>.hd .ttl{font-weight:700; font-size:12.5px}
+.livecard>.hd .en{font-family:var(--mono); font-size:10px}
+.livecard>.bd{padding:13px 16px}
+.stripgrid{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px 16px; font-size:12.5px}
+.stripgrid .lbl{color:var(--sub); font-size:11px; display:block}
+.stripgrid .val{font-weight:600}
+.qcard{
+  border:1px solid var(--line); border-left:3px solid var(--accent); background:var(--panel2);
+  border-radius:5px; padding:9px 12px; font-size:12.5px; margin-top:8px;
+}
+.qcard .qid{font-family:var(--mono); font-size:11px; color:var(--accent-ink); font-weight:700}
+.meter{height:7px; border-radius:4px; background:var(--line2); overflow:hidden; margin-top:4px}
+.meter>i{display:block; height:100%; background:var(--accent); border-radius:4px}
+.meter>i.warn{background:var(--warn)}
+
+/* ---------- 问题树 ---------- */
+.tree{font-size:13px}
+.tnode{margin:0; padding:0}
+.trow{
+  display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:5px; cursor:pointer;
+  border:1px solid transparent; min-width:0;
+}
+.trow:hover{background:var(--panel2)}
+.trow.sel{background:var(--accent-bg2); border-color:#C5DED8}
+.trow .tog{
+  width:16px; height:16px; flex:none; display:inline-flex; align-items:center; justify-content:center;
+  border:1px solid var(--line); border-radius:3px; background:var(--panel); font-size:10px; color:var(--sub);
+  cursor:pointer; font-family:var(--mono);
+}
+.trow .tog.leaf{visibility:hidden}
+.trow .qid{font-family:var(--mono); font-size:11px; color:var(--sub); flex:none; width:32px}
+.trow .txt{white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0}
+.trow .txt.closed{color:var(--sub)}
+.trow .meta{margin-left:auto; display:flex; gap:5px; flex:none; align-items:center}
+.tchildren{margin-left:22px; border-left:1px solid var(--line2); padding-left:6px}
+.human-mark{box-shadow:inset 3px 0 0 var(--human); background:linear-gradient(90deg,var(--human-bg),transparent 45%)}
+
+/* ---------- 时间线 / 流水 ---------- */
+.tl{list-style:none; margin:0; padding:0}
+.tl li{display:flex; gap:10px; padding:7px 2px; border-bottom:1px solid var(--line2); font-size:12.5px}
+.tl li:last-child{border-bottom:0}
+.tl .when{font-family:var(--mono); font-size:11px; color:var(--sub); flex:none; width:118px}
+.tl .who{flex:none; width:86px}
+.tl .what{min-width:0}
+
+/* ---------- 四阶段 stepper ---------- */
+.stepper{display:flex; align-items:center; gap:0; margin:6px 0 2px; flex-wrap:wrap}
+.step{display:flex; align-items:center; gap:7px; padding:5px 12px; border:1px solid var(--line); background:var(--panel);
+  font-family:var(--mono); font-size:11.5px; color:var(--sub)}
+.step:first-child{border-radius:5px 0 0 5px}
+.step:last-child{border-radius:0 5px 5px 0}
+.step+.step{border-left:0}
+.step.done{background:var(--ok-bg); color:var(--ok)}
+.step.now{background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700}
+.step.todo{background:var(--panel2)}
+.step.fail{background:var(--bad-bg); color:var(--bad)}
+
+/* ---------- 对话 ---------- */
+.chatwrap{display:flex; flex-direction:column; height:calc(100vh - 210px); min-height:420px}
+.chatlog{flex:1; overflow-y:auto; padding:6px 4px 12px; display:flex; flex-direction:column; gap:10px}
+.msg{max-width:76%; display:flex; flex-direction:column; gap:4px}
+.msg.in{align-self:flex-end; align-items:flex-end}
+.msg.out{align-self:flex-start; align-items:flex-start}
+.bubble{padding:8px 12px; border-radius:9px; font-size:13px; line-height:1.6; border:1px solid var(--line); background:var(--panel)}
+.msg.in .bubble{background:var(--accent); border-color:var(--accent); color:#fff; border-bottom-right-radius:3px}
+.msg.out .bubble{border-bottom-left-radius:3px}
+.msg .meta{font-size:10.5px; color:var(--sub); display:flex; gap:6px; align-items:center; flex-wrap:wrap}
+.msg .meta .mono{font-size:10px}
+.sysline{align-self:center; font-size:11px; color:var(--sub); background:var(--panel2); border:1px dashed var(--line);
+  padding:2px 10px; border-radius:10px; max-width:88%; text-align:center}
+.polish{
+  border:1px dashed #C5DED8; background:var(--accent-bg2); border-radius:6px; padding:7px 10px;
+  font-size:12px; margin-top:5px;
+}
+.polish .lbl{font-size:10px; color:var(--accent-ink); font-family:var(--mono); letter-spacing:.08em}
+.chatinput{display:flex; gap:8px; padding-top:10px; border-top:1px solid var(--line)}
+.chatinput input{
+  flex:1; border:1px solid var(--line); border-radius:5px; padding:8px 12px; font-size:13px; font-family:var(--sans);
+  background:var(--panel); color:var(--ink);
+}
+.chatinput input:focus-visible{outline:2px solid var(--accent); outline-offset:-1px}
+
+/* ---------- 台账条形 ---------- */
+.bars{display:flex; align-items:flex-end; gap:5px; height:110px; padding:6px 2px 0}
+.bar{flex:1; min-width:10px; display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer}
+.bar>i{width:100%; background:#B8D4CD; border-radius:2px 2px 0 0; display:block; min-height:2px}
+.bar.cur>i{background:var(--accent)}
+.bar.fail>i{background:#D9A49B}
+.bar>span{font-size:9.5px; font-family:var(--mono); color:var(--sub)}
+.bar:hover>i{filter:brightness(.88)}
+
+/* ---------- 杂项 ---------- */
+.callout{
+  border:1px solid #C5DED8; background:var(--accent-bg2); border-radius:7px; padding:10px 14px; font-size:12.5px;
+}
+.callout.warn{border-color:#E5D9AE; background:#FCF8EC}
+.callout.bad{border-color:#EBCFC8; background:#FBF1EF}
+.lognote{
+  display:inline-block; font-size:10px; font-family:var(--mono); letter-spacing:.1em; color:var(--warn);
+  border:1px solid #E5D9AE; background:var(--warn-bg); border-radius:3px; padding:0 6px; margin-left:8px;
+}
+.rawlog{
+  background:#202724; color:#C9D4CF; font-family:var(--mono); font-size:11.5px; line-height:1.75;
+  border-radius:6px; padding:12px 14px; overflow-x:auto; white-space:pre;
+}
+.rawlog .nan{color:#F0A599; font-weight:700}
+.rawlog .dim{color:#7C8883}
+.hash{color:var(--sub); font-family:var(--mono); font-size:10.5px}
+.divider{border:0; border-top:1px dashed var(--line); margin:14px 0}
+.small{font-size:11.5px; color:var(--sub)}
+.toast{
+  position:fixed; bottom:22px; right:22px; background:var(--ink); color:#fff; padding:10px 16px; border-radius:6px;
+  font-size:12.5px; box-shadow:0 6px 20px rgba(0,0,0,.25); z-index:50; max-width:420px;
+}
+.legend{display:flex; gap:8px; flex-wrap:wrap; align-items:center; font-size:11px; color:var(--sub)}
+.statebox{border:1px solid var(--line); border-radius:6px; background:var(--panel2); padding:9px 12px; font-size:12px}
+.arrowflow{font-family:var(--mono); font-size:11.5px; color:var(--sub); line-height:2.1; overflow-x:auto; white-space:nowrap}
+.arrowflow b{color:var(--ink)}
+.gatechip{display:inline-block; font-family:var(--mono); font-size:10.5px; border:1px solid var(--line); background:var(--panel);
+  border-radius:3px; padding:0 6px; color:var(--accent-ink)}
+
+/* ==================== v2 外壳:三列持久区 ==================== */
+.fstree{grid-column:1; grid-row:2; overflow-y:auto; background:var(--panel); border-right:1px solid var(--line); padding:10px 8px 24px; font-size:12px}
+.fstitle{font-size:10px; letter-spacing:.12em; color:var(--sub); font-family:var(--mono); margin:2px 6px 8px; text-transform:uppercase}
+.fsrow{display:flex; align-items:center; gap:5px; padding:3px 6px; border-radius:4px; cursor:pointer; white-space:nowrap; color:var(--ink)}
+.fsrow:hover{background:var(--panel2)}
+.fsrow.on{background:var(--accent-bg2); color:var(--accent-ink)}
+.fsrow .fscaret{width:13px; flex:none; font-family:var(--mono); font-size:9.5px; color:var(--sub); text-align:center}
+.fsrow .fsname{overflow:hidden; text-overflow:ellipsis; font-family:var(--mono); font-size:11.5px}
+.fsrow.dir>.fsname{font-weight:700}
+.fsrow .fslive{width:6px; height:6px; border-radius:50%; background:var(--accent); margin-left:auto; flex:none; animation:pulse 1.6s ease-in-out infinite}
+@media (prefers-reduced-motion:reduce){.fsrow .fslive{animation:none}}
+.fskids{margin-left:12px; border-left:1px solid var(--line2); padding-left:4px}
+.fsnote{margin:12px 6px 0; padding-top:8px; border-top:1px dashed var(--line); font-size:10.5px; color:var(--sub); line-height:1.6}
+
+.centercol{grid-column:2; grid-row:2; display:grid; grid-template-rows:38px minmax(0,1fr) auto; min-width:0; min-height:0}
+.stagetabs{display:flex; align-items:stretch; gap:2px; padding:0 10px; background:var(--panel); border-bottom:1px solid var(--line); overflow-x:auto}
+.stagetabs button{border:0; background:transparent; cursor:pointer; font-size:12.5px; color:var(--sub); padding:0 11px;
+  border-bottom:2px solid transparent; white-space:nowrap; display:inline-flex; align-items:center; gap:6px; font-family:var(--sans)}
+.stagetabs button .en{font-family:var(--mono); font-size:9px; color:var(--sub)}
+.stagetabs button:hover{color:var(--ink); background:var(--panel2)}
+.stagetabs button.on{color:var(--accent-ink); border-bottom-color:var(--accent); font-weight:700}
+.stagetabs button.main-tab{font-size:13px}
+.stagetabs button:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+
+.stage{position:relative; overflow:hidden; min-height:0; background:var(--bg)}
+#stage-page{height:100%; overflow-y:auto}
+#stage-page>.page{max-width:1160px; margin:0 auto; padding:16px 20px 48px}
+#preview{position:absolute; inset:0; z-index:8; background:var(--panel); display:flex; flex-direction:column}
+#preview:empty{display:none}
+.pvhead{display:flex; align-items:center; gap:10px; padding:9px 14px; border-bottom:1px solid var(--line); background:var(--panel2)}
+.pvhead .path{font-family:var(--mono); font-size:12px; color:var(--accent-ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.pvbody{flex:1; overflow:auto; padding:14px 16px}
+.pvnote{padding:8px 16px; border-top:1px dashed var(--line); font-size:11px; color:var(--sub)}
+
+/* ---------- dock:持续输出记录 ---------- */
+.dock{display:grid; grid-template-rows:30px minmax(0,1fr) 44px; height:212px; border-top:1px solid var(--line); background:var(--panel); overflow:hidden}
+.dock.folded{height:30px; grid-template-rows:30px 0 0}
+.dockhead{display:flex; align-items:center; gap:10px; padding:0 12px; background:var(--panel2); border-bottom:1px solid var(--line2); font-size:12px; min-height:0}
+.dockhead .en{font-family:var(--mono); font-size:9.5px; color:var(--sub)}
+.sfilter{display:flex; gap:4px; margin-left:8px}
+.fchip{border:1px solid var(--line); background:var(--panel); color:var(--sub); border-radius:3px; font-size:10.5px; padding:0 7px; cursor:pointer; font-family:var(--mono)}
+.fchip.on{background:var(--accent); border-color:var(--accent); color:#fff}
+.fchip:focus-visible{outline:2px solid var(--ink); outline-offset:1px}
+.dockfold{margin-left:auto; border:1px solid var(--line); background:var(--panel); border-radius:3px; cursor:pointer; font-size:11px; color:var(--sub); padding:1px 8px}
+.stream{overflow-y:auto; padding:4px 10px; font-size:11.5px; line-height:1.5; background:var(--panel)}
+.sline{display:flex; gap:8px; padding:2.5px 8px; border-left:3px solid var(--line); margin:2px 0; border-radius:0 3px 3px 0; background:var(--panel2)}
+.sline .st{font-family:var(--mono); font-size:10px; color:var(--sub); flex:none; width:78px; padding-top:1px}
+.sline .sk{font-family:var(--mono); font-size:9.5px; flex:none; width:62px; color:var(--sub); padding-top:1px}
+.sline .sx{min-width:0; word-break:break-word}
+.k-advance{border-left-color:#9DB3AC}
+.k-gate{border-left-color:var(--ink)}
+.k-notify{border-left-color:var(--warn)}
+.k-runner{border-left-color:#7C8883}
+.k-heartbeat{border-left-color:#C4CFCA}
+.k-directive{border-left-color:var(--human)}
+.k-cmd{border-left-color:var(--accent); background:var(--accent-bg2)}
+.k-reply{border-left-color:var(--accent)}
+.cmdline{display:flex; gap:8px; align-items:center; padding:6px 10px; border-top:1px solid var(--line2); background:var(--panel)}
+.cmdline .prompt{color:var(--accent-ink); font-weight:700; font-family:var(--mono)}
+.cmdline input{flex:1; border:1px solid var(--line); border-radius:5px; padding:6px 10px; font-size:12.5px; font-family:var(--sans); background:var(--panel); color:var(--ink); min-width:0}
+.cmdline input:focus-visible{outline:2px solid var(--accent); outline-offset:-1px}
+
+/* ---------- narrator:讲解员(常驻) ---------- */
+.narrator{grid-column:3; grid-row:2; display:grid; grid-template-rows:40px minmax(0,1fr) 54px; border-left:1px solid var(--line); background:var(--panel); min-height:0}
+.narrhead{display:flex; align-items:center; gap:8px; padding:0 14px; border-bottom:1px solid var(--line); background:var(--panel2)}
+.narrhead b{font-size:12.5px}
+.narrhead .en{font-family:var(--mono); font-size:9.5px; color:var(--sub)}
+.narrlog{overflow-y:auto; padding:12px 12px 14px; display:flex; flex-direction:column; gap:10px; background:var(--bg)}
+.narrlog .msg{max-width:94%}
+.narrinput{display:flex; gap:7px; align-items:center; padding:9px 10px; border-top:1px solid var(--line)}
+.narrinput input{flex:1; border:1px solid var(--line); border-radius:5px; padding:7px 10px; font-size:12.5px; font-family:var(--sans); background:var(--panel); color:var(--ink); min-width:0}
+.narrinput input:focus-visible{outline:2px solid var(--accent); outline-offset:-1px}
+.narr-sys{font-size:11px; color:var(--sub); background:var(--panel); border:1px dashed var(--line); border-radius:7px; padding:7px 10px; line-height:1.6}
+.draft{border:1px dashed #C5DED8; background:var(--accent-bg2); border-radius:6px; padding:7px 10px; font-size:12px; margin-top:7px}
+.draft .lbl{font-size:10px; color:var(--accent-ink); font-family:var(--mono); letter-spacing:.08em; display:block; margin-bottom:2px}
+.draft .cmdtxt{font-family:var(--mono); font-size:12px; background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:4px 8px; margin:4px 0 7px; word-break:break-all}
+.draft .row{display:flex; gap:7px}
+
+/* ---------- 问题树画布 ---------- */
+.cvroot{height:100%; display:flex; flex-direction:column; min-height:0}
+.band{display:flex; align-items:center; gap:9px; flex-wrap:nowrap; overflow-x:auto; padding:7px 14px; border-bottom:1px solid var(--line); background:var(--panel); font-size:12px; white-space:nowrap; flex:none}
+.band .sep{color:var(--line); flex:none}
+.band a.chip{text-decoration:none}
+.band .hint{margin-left:auto; color:var(--sub); font-size:10px; font-family:var(--mono); flex:none; padding-left:12px}
+.cvview{flex:1; position:relative; overflow:hidden; cursor:grab; min-height:0; touch-action:none;
+  background:radial-gradient(circle at 1px 1px, #DCE4E0 1px, transparent 0) 0 0/26px 26px, var(--panel2)}
+.cvview.dragging{cursor:grabbing}
+.cvworld{position:absolute; left:0; top:0; transform-origin:0 0}
+.cvedges{position:absolute; left:0; top:0; overflow:visible}
+.cedge{fill:none; stroke:#B9C8C2; stroke-width:1.6}
+.cedge.dep{stroke:var(--human); stroke-dasharray:5 4; stroke-width:1.3; opacity:.7}
+.cedge.hl{stroke:var(--accent); stroke-width:2.6; opacity:1}
+.cnode{position:absolute; width:210px; height:64px; background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--dead);
+  border-radius:6px; padding:5px 9px 4px; cursor:pointer; box-shadow:0 1px 2px rgba(27,36,34,.05); box-sizing:border-box}
+.cnode:hover{border-color:#A8BBB4; box-shadow:0 3px 10px rgba(27,36,34,.12); z-index:2}
+.cnode.sel{outline:2px solid var(--accent); outline-offset:1px; z-index:2}
+.cnode .top{display:flex; align-items:center; gap:5px; font-size:10px}
+.cnode .top .chip{font-size:9px; padding:0 5px}
+.cnode .qid{font-family:var(--mono); font-weight:700; color:var(--sub); font-size:10.5px}
+.cnode .qtxt{font-size:11px; line-height:1.4; margin-top:1px; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; color:var(--ink)}
+.cnode.closed .qtxt{color:var(--sub)}
+.cnode .subline{position:absolute; left:9px; right:9px; bottom:2px; font-size:8.5px; color:var(--sub); font-family:var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.st-open{border-left-color:#9DB3AC}
+.st-active{border-left-color:var(--accent); animation:nodepulse 1.8s ease-in-out infinite}
+.st-answered{border-left-color:var(--ok)}
+.st-refuted{border-left-color:var(--bad)}
+.st-inconclusive{border-left-color:var(--warn)}
+.st-dead_end{border-left-color:var(--dead); opacity:.62}
+.cnode.human{background:linear-gradient(90deg, var(--human-bg), var(--panel) 46%)}
+@keyframes nodepulse{0%,100%{box-shadow:0 0 0 0 rgba(11,107,93,.35)} 55%{box-shadow:0 0 0 7px rgba(11,107,93,0)}}
+@media (prefers-reduced-motion:reduce){.st-active{animation:none}}
+.cvhud{position:absolute; top:10px; right:12px; display:flex; gap:5px; z-index:5}
+.cvhud button{border:1px solid var(--line); background:var(--panel); border-radius:4px; cursor:pointer; font-size:12.5px; color:var(--ink); min-width:28px; height:26px; font-family:var(--mono)}
+.cvhud button:hover{background:var(--accent-bg)}
+.cvhud button:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
+.cvlegend{position:absolute; left:12px; bottom:10px; z-index:5; background:rgba(255,255,255,.92); border:1px solid var(--line); border-radius:5px;
+  padding:5px 9px; display:flex; gap:6px; align-items:center; font-size:10px; flex-wrap:wrap; max-width:52%}
+.cvmini{position:absolute; right:12px; bottom:10px; width:146px; height:94px; background:rgba(255,255,255,.94); border:1px solid var(--line); border-radius:5px; z-index:5; cursor:crosshair}
+.cvdrawer{position:absolute; top:0; right:0; bottom:0; width:378px; z-index:6; background:var(--panel); border-left:1px solid var(--line);
+  box-shadow:-8px 0 22px rgba(27,36,34,.08); transform:translateX(103%); transition:transform .18s ease; overflow-y:auto; padding:12px}
+.cvdrawer.open{transform:translateX(0)}
+@media (prefers-reduced-motion:reduce){.cvdrawer{transition:none}}
+.cvclose{float:right; border:1px solid var(--line); background:var(--panel); border-radius:4px; cursor:pointer; font-size:11.5px; padding:2px 9px; color:var(--sub); margin:0 0 6px 8px}
+.cvclose:hover{background:var(--panel2)}
+</style>
+</head><body>
+<header class="topbar">
+  <div class="brand">
+    <b>meta-research · 人类控制台</b>
+    <span class="mono">M5 web console · v2</span>
+  </div>
+  <span class="sim-tag">HTML 原型 · 全部数据为模拟</span>
+  <div class="spacer"></div>
+  <div class="topstat" id="topstat"></div>
+  <div class="scen" id="scen" role="group" aria-label="模拟运行场景切换"></div>
+</header>
+
+<aside class="fstree" id="fstree" aria-label="落盘目录(只读镜像)"></aside>
+
+<div class="centercol">
+  <nav class="stagetabs" id="stagetabs" aria-label="视图页签"></nav>
+  <div class="stage">
+    <div id="stage-page"></div>
+    <div id="preview"></div>
+  </div>
+  <footer class="dock" id="dock" aria-label="持续输出记录">
+    <div class="dockhead">
+      <b>输出记录</b><span class="en">event stream · 命令在此入账</span>
+      <span class="sfilter" id="sfilter"></span>
+      <button class="dockfold" id="dockfoldbtn" onclick="dockToggle()" title="折叠 / 展开输出窗">收起 ▾</button>
+    </div>
+    <div class="stream" id="stream" aria-live="polite"></div>
+    <div class="cmdline">
+      <span class="prompt">&gt;</span>
+      <input id="cmdin" type="text"
+        placeholder="命令行(入账→三分类→directive):进展怎么样 / 预算调到 50 / 优先验证 32k / 暂停 / 批准 t3"
+        onkeydown="if(event.key==='Enter')sendCmd()">
+      <button class="btn" onclick="sendCmd()">发送</button>
+    </div>
+  </footer>
+</div>
+
+<aside class="narrator" id="narrator" aria-label="讲解员(只读中介,常驻)">
+  <div class="narrhead">
+    <b>讲解员</b><span class="en">narrator · read-only mediator</span>
+    <span style="margin-left:auto" class="chip c-line">不改状态</span>
+  </div>
+  <div class="narrlog" id="narrlog"></div>
+  <div class="narrinput">
+    <input id="narrin" type="text" placeholder="讨论 / 解释 / 帮我组织下一步命令…"
+      onkeydown="if(event.key==='Enter')sendNarr()">
+    <button class="btn ghost" onclick="sendNarr()">发送</button>
+  </div>
+</aside>
+<script>
+/* =====================================================================
+ * 模拟数据(mock)。表名 / 列名 / 枚举值与《第一部分》附录 A DDL 一致。
+ * 剧本 = 《第三部分》§7.3「注意力研究流」:baseline → 变体 → 协议升版 /
+ * 加指标 → import 三闸(license deny→下一个)→ NaN 存疑→复现 → 人机。
+ * ===================================================================== */
+/* 步⑨ CP9.2：DB 由 mock 常量改为可重赋值——首屏用下方 mock 演示，接入后 refreshDB() 换成 /api/db 真数据。
+   原型渲染码一律不动（保真），仅换数据源（见文件末「真数据接入」块）。 */
+let DB = {
+
+goal: [
+  { id:1, version:1, text:"在 4×GPU、单轮 24h 预算内改进 Transformer 注意力机制:在锁定语言建模评估协议(lm-wt103)下,验证集困惑度相对标准多头注意力 baseline 改善 ≥2%,且训练吞吐不劣。",
+    predicate_json:'{"metric":"val_ppl","improve_rel":">=0.02","vs":"std-mha","throughput":"not_worse"}',
+    previous_version:null, created_cycle:null, directive_id:null, created_at:"2026-06-28 09:00" },
+  { id:1, version:2, text:"(v1 全部保留)新增:长上下文可用性——4k→16k 上下文外推的困惑度退化 ≤5%。",
+    predicate_json:'{"inherit":"v1","extra":{"metric":"degradation_16k_pct","max":5.0}}',
+    previous_version:1, created_cycle:16, directive_id:2, created_at:"2026-07-03 10:41" },
+],
+
+question: [
+  { id:1,  parent_id:null, text:"标准多头注意力 baseline(std-mha, 350M)在 lm-wt103@1 下的参考性能是多少?", status:"answered", source:"agent", goal_ver:1, born_goal_ver:1, visit_count:1, decompose_count:0, score:null, est_cost:6.0,  born_cycle:1,  closed_cycle:2 },
+  { id:2,  parent_id:1,    text:"在 std-mha 上把注意力头数 16→8,能否 ppl 不劣且吞吐 +15%?",                    status:"answered", source:"agent", goal_ver:1, born_goal_ver:1, visit_count:1, decompose_count:0, score:null, est_cost:5.5,  born_cycle:2,  closed_cycle:3 },
+  { id:3,  parent_id:1,    text:"线性注意力族能否在 lm-wt103 协议下逼近 std-mha(ppl 差距 ≤3%)?",               status:"answered", source:"agent", goal_ver:1, born_goal_ver:1, visit_count:1, decompose_count:1, score:null, est_cost:42.0, born_cycle:2,  closed_cycle:13 },
+  { id:4,  parent_id:3,    text:"自建最小线性注意力实现(linear-attn-min)在同协议下的可达 ppl?",                 status:"answered", source:"decompose", goal_ver:1, born_goal_ver:1, visit_count:2, decompose_count:0, score:null, est_cost:9.0, born_cycle:5, closed_cycle:7 },
+  { id:5,  parent_id:3,    text:"公认 SOTA 线性注意力开源实现(import)在锁定协议下表现如何?",                    status:"answered", source:"decompose", goal_ver:1, born_goal_ver:1, visit_count:1, decompose_count:0, score:null, est_cost:8.0, born_cycle:5, closed_cycle:10 },
+  { id:6,  parent_id:3,    text:"lr=3e-3 高学习率下线性注意力能否稳定训练?",                                    status:"refuted",  source:"decompose", goal_ver:1, born_goal_ver:1, visit_count:2, decompose_count:0, score:null, est_cost:11.0, born_cycle:5, closed_cycle:12 },
+  { id:7,  parent_id:1,    text:"现有各族实现的 4k→16k 长上下文外推退化是否 ≤5%?(人工优先级)",                  status:"answered", source:"human", goal_ver:2, born_goal_ver:2, visit_count:1, decompose_count:0, score:null, est_cost:4.0, born_cycle:17, closed_cycle:18 },
+  { id:8,  parent_id:2,    text:"goal v2(新增 16k 外推约束)下,「头数减半不劣」结论(A2)是否仍成立?",             status:"refuted",  source:"revalidate", goal_ver:2, born_goal_ver:2, visit_count:1, decompose_count:0, score:null, est_cost:5.0, born_cycle:16, closed_cycle:17 },
+  { id:10, parent_id:1,    text:"把 softmax 换成 ReLU 注意力是否值得单独立题验证?",                              status:"dead_end", source:"agent", goal_ver:1, born_goal_ver:1, visit_count:1, decompose_count:0, score:null, est_cost:5.0, born_cycle:3, closed_cycle:7 },
+  { id:11, parent_id:3,    text:"三族实现(std/min/GLA)的训练吞吐差异有多大?(补测 throughput 指标)",             status:"answered", source:"agent", goal_ver:1, born_goal_ver:1, visit_count:1, decompose_count:0, score:null, est_cost:3.0, born_cycle:13, closed_cycle:14 },
+  { id:13, parent_id:5,    text:"在 imported GLA 地基上自建门控改动(gla-gate),能否在 lm-wt103@1 上超过 GLA 本体?", status:"active",  source:"agent", goal_ver:2, born_goal_ver:1, visit_count:1, decompose_count:0, score:0.87, est_cost:28.0, born_cycle:14, closed_cycle:null },
+  { id:14, parent_id:8,    text:"head8 的 16k 退化根因是位置编码还是注意力稀释?(诊断)",                          status:"open",   source:"agent", goal_ver:2, born_goal_ver:2, visit_count:0, decompose_count:0, score:0.74, est_cost:9.0,  born_cycle:17, closed_cycle:null },
+  { id:15, parent_id:7,    text:"外推长度继续升到 32k,GLA 是否仍满足退化 ≤5%?",                                 status:"open",   source:"agent", goal_ver:2, born_goal_ver:2, visit_count:0, decompose_count:0, score:0.61, est_cost:12.0, born_cycle:18, closed_cycle:null },
+  { id:16, parent_id:13,   text:"gla-gate 消融:移除门控归一化对 ppl 的影响?",                                   status:"open",   source:"agent", goal_ver:2, born_goal_ver:2, visit_count:0, decompose_count:0, score:0.55, est_cost:6.0,  born_cycle:18, closed_cycle:null },
+],
+
+question_dep: [
+  { id:1, question_id:3, dep_type:"question", depends_on_question_id:4, depends_on_baseline_id:null, status:"satisfied", created_cycle:5 },
+  { id:2, question_id:3, dep_type:"question", depends_on_question_id:5, depends_on_baseline_id:null, status:"satisfied", created_cycle:5 },
+  { id:3, question_id:3, dep_type:"question", depends_on_question_id:6, depends_on_baseline_id:null, status:"satisfied", created_cycle:5 },
+  { id:4, question_id:5, dep_type:"baseline", depends_on_question_id:null, depends_on_baseline_id:3, status:"satisfied", created_cycle:8 },
+],
+
+cycle: [
+  { id:1,  route:"bootstrap",       status:"done",   active_question_id:null, cost_total:0.3,  note:"reasoning 出首题 Q1", started_at:"06-28 09:12" },
+  { id:2,  route:"attack",          status:"done",   active_question_id:1,  cost_total:7.2,  note:"B1 std-mha 建库+出厂评估 → A1;spawn Q2/Q3", started_at:"06-28 10:05" },
+  { id:3,  route:"attack",          status:"done",   active_question_id:2,  cost_total:5.8,  note:"v-head8 训练+评估 → A2;spawn Q10", started_at:"06-28 22:40" },
+  { id:4,  route:"attack",          status:"done",   active_question_id:10, cost_total:1.1,  note:"idea 全候选 SD<6 淘汰 → Q10 inconclusive;selection: Q3 est_cost 42 > B(t) → intent=decompose", started_at:"06-29 09:31" },
+  { id:5,  route:"decompose",       status:"done",   active_question_id:3,  cost_total:0.7,  note:"add_children Q4/Q5/Q6 + 逐子 question_dep(pending);父 Q3 active→open 释放", started_at:"06-29 11:02" },
+  { id:6,  route:"attack",          status:"done",   active_question_id:4,  cost_total:9.4,  note:"smoke 修复循环预算尽 → engineering_blocked → Q4 inconclusive;通知人", started_at:"06-29 12:10" },
+  { id:7,  route:"attack",          status:"done",   active_question_id:4,  cost_total:8.9,  note:"重 plan 新 target:B2 linear-attn-min 成功 → A4;R2 propose_prune Q10 → dead_end", started_at:"06-30 07:44" },
+  { id:8,  route:"dependency_wait", status:"done",   active_question_id:5,  cost_total:2.6,  note:"import 三闸命中:发现 3 候选→登记;GPL deny→下一个 Apache allow→selected_for_materialization;B3 占位(planned)+question_dep,Q5 释放", started_at:"06-30 21:15" },
+  { id:9,  route:null,              status:"done",   active_question_id:null, cost_total:6.3, note:"(物化 worker cycle,不占 route 枚举)clone@pinned→manifest(供应链闭包)→沙箱 smoke→run(import)→出厂 E4→gate_register_baseline→B3 legal→dep satisfied", started_at:"07-01 02:20" },
+  { id:10, route:"reuse_only",      status:"done",   active_question_id:5,  cost_total:1.4,  note:"plan 复用判定命中 E4 factory 指标 → targets=[] → A5(引历史 evaluation)", started_at:"07-01 09:02" },
+  { id:11, route:"attack",          status:"done",   active_question_id:6,  cost_total:11.0, note:"v-lr3e3 训练 loss NaN;E5 attempt#1 名义 success 但 parser 观测 nan → 结果存疑,gate 拒作证据 → Q6 inconclusive", started_at:"07-01 10:30" },
+  { id:12, route:"eval_only",       status:"done",   active_question_id:6,  cost_total:2.2,  note:"repro_eval attempt#2 复现(ppl 905 确认爆炸)→ A6 refuted(证据=复现 metric_result)", started_at:"07-02 08:12" },
+  { id:13, route:"reuse_only",      status:"done",   active_question_id:3,  cost_total:0.9,  note:"三子依赖全 satisfied → 聚合轮:child_answer×3 关闭 Q3 → A3;spawn Q11", started_at:"07-02 11:47" },
+  { id:14, route:"eval_only",       status:"done",   active_question_id:11, cost_total:3.1,  note:"protocol_metric 追加 throughput(不升版)→ 三变体 append_attempt(metric_append)→ A7;spawn Q13", started_at:"07-02 14:20" },
+  { id:15, route:"attack",          status:"failed", active_question_id:13, cost_total:1.8,  note:"reasoning 产物 schema 校验失败,重试 2 次仍败 → cycle failed(通知人);Q13 回 open", started_at:"07-02 20:05" },
+  { id:16, route:"goal_amend",      status:"done",   active_question_id:null, cost_total:0.6, note:"消费 d2:goal v2;open 问题 goal_ver 原地迁移+重打分;适用性审计 4 项(A1/A2/A5/A6),A2→needs_revalidation spawn Q8;A3 留 pending", started_at:"07-03 10:41" },
+  { id:17, route:"eval_only",       status:"done",   active_question_id:8,  cost_total:4.7,  note:"gate_new_protocol lm-wt103@2(场景升版:16k 外推);head8/base 重评 → A9 refuted;A2 applicability→contradicted;spawn Q14;消费 d3 生成 Q7", started_at:"07-03 12:30" },
+  { id:18, route:"eval_only",       status:"done",   active_question_id:7,  cost_total:3.9,  note:"B2/B3 十六k 外推补测 → A10(GLA 3.8% 达标);spawn Q15/Q16;selection: Q13 attack(0.87)", started_at:"07-04 09:10" },
+  { id:19, route:"attack",          status:"bundle", active_question_id:13, cost_total:13.7, note:"进行中:B4 gla-gate 建库;bundle_cursor 3/5;t3 smoke+代码适配评审通过后训练中", started_at:"07-04 16:02" },
+],
+
+baseline: [
+  { id:1, slug:"std-mha",         canonical_key:"std-mha@lm350m",         parent_id:null, status:"legal",    provenance:"self_built",      license_status:"na",    born_cycle:2,  capability_summary:"标准多头注意力 350M 参考实现;族根;lm-wt103 参考锚点", tags:["attention","softmax","reference"] },
+  { id:2, slug:"linear-attn-min", canonical_key:"linear-attn-min@lm350m", parent_id:1,    status:"legal",    provenance:"self_built",      license_status:"na",    born_cycle:7,  capability_summary:"自建最小线性注意力(核化 softmax 近似);验证族可行性下界", tags:["attention","linear"] },
+  { id:3, slug:"gla-sota",        canonical_key:"gla-sota@r4b7d9aa",      parent_id:null, status:"legal",    provenance:"external_import", license_status:"allow", born_cycle:9,  capability_summary:"外部导入门控线性注意力(公认 SOTA 参照);pinned revision;经本系统 harness 出厂", tags:["attention","linear","gated","comparator"] },
+  { id:4, slug:"gla-gate",        canonical_key:"gla-gate@lm350m",        parent_id:3,    status:"legal",    provenance:"self_built",      license_status:"na",    born_cycle:19, capability_summary:"在 GLA 地基上的自建门控改动(前向逻辑变 → 新 baseline,parent=B3)", tags:["attention","linear","gated"] },
+],
+
+variant: [
+  { id:1, baseline_id:1, variant_key:"v-base",         status:"legal",    born_question:1,  env_hash:"e7a1f2", config_json:'{"heads":16,"lr":1e-3,"steps":24000}', result_summary:"参考:ppl 24.82 / acc 46.2% / 41.2k tok/s" },
+  { id:2, baseline_id:1, variant_key:"v-head8",        status:"legal",    born_question:2,  env_hash:"e7a1f2", config_json:'{"heads":8,"lr":1e-3,"steps":24000}',  result_summary:"ppl 24.93(+0.11)/ 吞吐 +18%;16k 外推退化 9.2%(goal v2 不达)" },
+  { id:3, baseline_id:2, variant_key:"v-min",          status:"legal",    born_question:4,  env_hash:"e7a1f2", config_json:'{"kernel":"elu+1","lr":1e-3}',         result_summary:"ppl 26.10,距参考 +5.2%,未达 ≤3%" },
+  { id:4, baseline_id:2, variant_key:"v-lr3e3",        status:"legal",    born_question:6,  env_hash:"e7a1f2", config_json:'{"kernel":"elu+1","lr":3e-3}',         result_summary:"训练发散(NaN);复现确认 ppl 905 → 不可用设置" },
+  { id:5, baseline_id:3, variant_key:"v-import",       status:"legal",    born_question:5,  env_hash:"e9c2b7", config_json:'{"upstream_default":true}',            result_summary:"出厂:ppl 24.31 / acc 46.8%;16k 退化 3.8% 达标" },
+  { id:6, baseline_id:4, variant_key:"v-gate-base",    status:"legal",    born_question:13, env_hash:"e7a1f2", config_json:'{"gate":"sigmoid","lr":1e-3}',         result_summary:"出厂:ppl 23.94(−1.5% vs GLA)" },
+  { id:7, baseline_id:4, variant_key:"v-gate-lr",      status:"legal",    born_question:13, env_hash:"e7a1f2", config_json:'{"gate":"sigmoid","lr":6e-4}',         result_summary:"出厂:ppl 24.12" },
+  { id:8, baseline_id:4, variant_key:"v-gate-headmix", status:"building", born_question:13, env_hash:"e7a1f2", config_json:'{"gate":"sigmoid","headmix":true}',    result_summary:"(训练中)" },
+],
+
+run: [
+  { id:1, cycle_id:2,  variant_id:1, build_target_id:1,  kind:"build",  status:"success", failure_kind:null, env_hash:"e7a1f2", cost:5.9, seed:1 },
+  { id:2, cycle_id:3,  variant_id:2, build_target_id:4,  kind:"exec",   status:"success", failure_kind:null, env_hash:"e7a1f2", cost:4.6, seed:1 },
+  { id:3, cycle_id:7,  variant_id:3, build_target_id:7,  kind:"build",  status:"success", failure_kind:null, env_hash:"e7a1f2", cost:7.1, seed:1 },
+  { id:4, cycle_id:11, variant_id:4, build_target_id:9,  kind:"exec",   status:"success", failure_kind:null, env_hash:"e7a1f2", cost:9.2, seed:1 },
+  { id:5, cycle_id:9,  variant_id:5, build_target_id:11, kind:"import", status:"success", failure_kind:null, env_hash:"e9c2b7", cost:1.2, seed:null },
+  { id:6, cycle_id:19, variant_id:6, build_target_id:21, kind:"build",  status:"success", failure_kind:null, env_hash:"e7a1f2", cost:6.0, seed:1 },
+  { id:7, cycle_id:19, variant_id:7, build_target_id:22, kind:"exec",   status:"success", failure_kind:null, env_hash:"e7a1f2", cost:4.4, seed:1 },
+  { id:8, cycle_id:19, variant_id:8, build_target_id:23, kind:"exec",   status:"running", failure_kind:null, env_hash:"e7a1f2", cost:2.9, seed:1 },
+],
+
+protocol: [
+  { id:1, version:1, name:"lm-wt103", scope_spec_json:'{"data":"wikitext-103 val","ctx":4096,"ckpt":"final","decode":"teacher-forcing"}', derived_from_question:1 },
+  { id:1, version:2, name:"lm-wt103", scope_spec_json:'{"data":"wikitext-103 val","ctx":16384,"mode":"extrapolation","ckpt":"final"}',     derived_from_question:8 },
+],
+metric_def: [
+  { id:1, version:1, name:"val_ppl",             direction:"lower",  unit:"ppl",   readout_rule:"越低越好;主指标" },
+  { id:2, version:1, name:"token_acc",           direction:"higher", unit:"%",     readout_rule:"next-token top-1" },
+  { id:3, version:1, name:"throughput_tok_s",    direction:"higher", unit:"tok/s", readout_rule:"训练吞吐(A100×4)" },
+  { id:4, version:1, name:"degradation_16k_pct", direction:"lower",  unit:"%",     readout_rule:"16k 外推 ppl 相对 4k 的退化百分比;goal v2 阈值 ≤5%" },
+],
+protocol_metric: [
+  { protocol_id:1, protocol_ver:1, metric_id:1, metric_ver:1, appended_cycle:null },
+  { protocol_id:1, protocol_ver:1, metric_id:2, metric_ver:1, appended_cycle:null },
+  { protocol_id:1, protocol_ver:1, metric_id:3, metric_ver:1, appended_cycle:14 },
+  { protocol_id:1, protocol_ver:2, metric_id:1, metric_ver:1, appended_cycle:null },
+  { protocol_id:1, protocol_ver:2, metric_id:4, metric_ver:1, appended_cycle:null },
+],
+
+evaluation: [
+  { id:1,  variant_id:1, protocol_id:1, protocol_ver:1, eval_key:"eval0",     source:"factory",          status:"success", canonical_attempt_id:1,  created_cycle:2,  target_set_hash:"ts-4f21", cost:0.8 },
+  { id:2,  variant_id:2, protocol_id:1, protocol_ver:1, eval_key:"eval0",     source:"factory",          status:"success", canonical_attempt_id:3,  created_cycle:3,  target_set_hash:"ts-9d02", cost:0.7 },
+  { id:3,  variant_id:3, protocol_id:1, protocol_ver:1, eval_key:"eval0",     source:"factory",          status:"success", canonical_attempt_id:5,  created_cycle:7,  target_set_hash:"ts-1cc8", cost:0.7 },
+  { id:4,  variant_id:5, protocol_id:1, protocol_ver:1, eval_key:"eval0",     source:"factory",          status:"success", canonical_attempt_id:7,  created_cycle:9,  target_set_hash:"ts-77ae", cost:0.9 },
+  { id:5,  variant_id:4, protocol_id:1, protocol_ver:1, eval_key:"eval0",     source:"factory",          status:"success", canonical_attempt_id:9,  created_cycle:11, target_set_hash:"ts-b3e0", cost:0.8 },
+  { id:6,  variant_id:2, protocol_id:1, protocol_ver:2, eval_key:"eval-16k",  source:"protocol_upgrade", status:"success", canonical_attempt_id:11, created_cycle:17, target_set_hash:"ts-52aa", cost:1.1 },
+  { id:7,  variant_id:1, protocol_id:1, protocol_ver:2, eval_key:"eval-16k",  source:"protocol_upgrade", status:"success", canonical_attempt_id:12, created_cycle:17, target_set_hash:"ts-52ab", cost:1.1 },
+  { id:8,  variant_id:3, protocol_id:1, protocol_ver:2, eval_key:"eval-16k",  source:"protocol_upgrade", status:"success", canonical_attempt_id:13, created_cycle:18, target_set_hash:"ts-6c19", cost:1.0 },
+  { id:9,  variant_id:5, protocol_id:1, protocol_ver:2, eval_key:"eval-16k",  source:"protocol_upgrade", status:"success", canonical_attempt_id:14, created_cycle:18, target_set_hash:"ts-6c1a", cost:1.0 },
+  { id:10, variant_id:6, protocol_id:1, protocol_ver:1, eval_key:"eval0",     source:"factory",          status:"success", canonical_attempt_id:15, created_cycle:19, target_set_hash:"ts-e044", cost:0.8 },
+  { id:11, variant_id:7, protocol_id:1, protocol_ver:1, eval_key:"eval0",     source:"factory",          status:"success", canonical_attempt_id:16, created_cycle:19, target_set_hash:"ts-e045", cost:0.8 },
+  { id:12, variant_id:8, protocol_id:1, protocol_ver:1, eval_key:"eval0",     source:"factory",          status:"running", canonical_attempt_id:null, created_cycle:19, target_set_hash:"ts-e046", cost:0 },
+],
+
+evaluation_attempt: [
+  { id:1,  evaluation_id:1,  cycle_id:2,  attempt_no:1, purpose:"factory",       status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:2,  evaluation_id:1,  cycle_id:14, attempt_no:2, purpose:"metric_append", status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:3,  evaluation_id:2,  cycle_id:3,  attempt_no:1, purpose:"factory",       status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:4,  evaluation_id:2,  cycle_id:14, attempt_no:2, purpose:"metric_append", status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:5,  evaluation_id:3,  cycle_id:7,  attempt_no:1, purpose:"factory",       status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:6,  evaluation_id:3,  cycle_id:14, attempt_no:2, purpose:"metric_append", status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:7,  evaluation_id:4,  cycle_id:9,  attempt_no:1, purpose:"factory",       status:"success", env_hash:"e9c2b7", suspect:false },
+  { id:8,  evaluation_id:4,  cycle_id:14, attempt_no:2, purpose:"metric_append", status:"success", env_hash:"e9c2b7", suspect:false },
+  { id:9,  evaluation_id:5,  cycle_id:11, attempt_no:1, purpose:"factory",       status:"success", env_hash:"e7a1f2", suspect:true  },
+  { id:10, evaluation_id:5,  cycle_id:12, attempt_no:2, purpose:"repro_eval",    status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:11, evaluation_id:6,  cycle_id:17, attempt_no:1, purpose:"protocol_upgrade", status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:12, evaluation_id:7,  cycle_id:17, attempt_no:1, purpose:"protocol_upgrade", status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:13, evaluation_id:8,  cycle_id:18, attempt_no:1, purpose:"protocol_upgrade", status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:14, evaluation_id:9,  cycle_id:18, attempt_no:1, purpose:"protocol_upgrade", status:"success", env_hash:"e9c2b7", suspect:false },
+  { id:15, evaluation_id:10, cycle_id:19, attempt_no:1, purpose:"factory",       status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:16, evaluation_id:11, cycle_id:19, attempt_no:1, purpose:"factory",       status:"success", env_hash:"e7a1f2", suspect:false },
+  { id:17, evaluation_id:12, cycle_id:19, attempt_no:1, purpose:"factory",       status:"running", env_hash:"e7a1f2", suspect:false },
+],
+
+metric_result: [
+  { id:1,  evaluation_id:1,  evaluation_attempt_id:1,  metric_id:1, metric_ver:1, value:24.82,  scope:"aggregate" },
+  { id:2,  evaluation_id:1,  evaluation_attempt_id:1,  metric_id:2, metric_ver:1, value:46.2,   scope:"aggregate" },
+  { id:3,  evaluation_id:1,  evaluation_attempt_id:2,  metric_id:3, metric_ver:1, value:41200,  scope:"aggregate" },
+  { id:4,  evaluation_id:2,  evaluation_attempt_id:3,  metric_id:1, metric_ver:1, value:24.93,  scope:"aggregate" },
+  { id:5,  evaluation_id:2,  evaluation_attempt_id:3,  metric_id:2, metric_ver:1, value:46.1,   scope:"aggregate" },
+  { id:6,  evaluation_id:2,  evaluation_attempt_id:4,  metric_id:3, metric_ver:1, value:48700,  scope:"aggregate" },
+  { id:7,  evaluation_id:3,  evaluation_attempt_id:5,  metric_id:1, metric_ver:1, value:26.10,  scope:"aggregate" },
+  { id:8,  evaluation_id:3,  evaluation_attempt_id:5,  metric_id:2, metric_ver:1, value:44.9,   scope:"aggregate" },
+  { id:9,  evaluation_id:3,  evaluation_attempt_id:6,  metric_id:3, metric_ver:1, value:52300,  scope:"aggregate" },
+  { id:10, evaluation_id:4,  evaluation_attempt_id:7,  metric_id:1, metric_ver:1, value:24.31,  scope:"aggregate" },
+  { id:11, evaluation_id:4,  evaluation_attempt_id:7,  metric_id:2, metric_ver:1, value:46.8,   scope:"aggregate" },
+  { id:12, evaluation_id:4,  evaluation_attempt_id:8,  metric_id:3, metric_ver:1, value:55100,  scope:"aggregate" },
+  { id:13, evaluation_id:5,  evaluation_attempt_id:9,  metric_id:1, metric_ver:1, value:890.4,  scope:"aggregate" },
+  { id:14, evaluation_id:5,  evaluation_attempt_id:10, metric_id:1, metric_ver:1, value:905.2,  scope:"aggregate" },
+  { id:15, evaluation_id:6,  evaluation_attempt_id:11, metric_id:4, metric_ver:1, value:9.2,    scope:"aggregate" },
+  { id:16, evaluation_id:7,  evaluation_attempt_id:12, metric_id:4, metric_ver:1, value:4.1,    scope:"aggregate" },
+  { id:17, evaluation_id:8,  evaluation_attempt_id:13, metric_id:4, metric_ver:1, value:5.9,    scope:"aggregate" },
+  { id:18, evaluation_id:9,  evaluation_attempt_id:14, metric_id:4, metric_ver:1, value:3.8,    scope:"aggregate" },
+  { id:19, evaluation_id:10, evaluation_attempt_id:15, metric_id:1, metric_ver:1, value:23.94,  scope:"aggregate" },
+  { id:20, evaluation_id:10, evaluation_attempt_id:15, metric_id:2, metric_ver:1, value:47.3,   scope:"aggregate" },
+  { id:21, evaluation_id:11, evaluation_attempt_id:16, metric_id:1, metric_ver:1, value:24.12,  scope:"aggregate" },
+],
+
+answer: [
+  { id:1,  question_id:1,  goal_ver:1, cycle_id:2,  verdict:"answered", answer_md:"std-mha(350M)在 lm-wt103@1 参考性能:val_ppl 24.82,token_acc 46.2%。作为全池对照锚点。" },
+  { id:2,  question_id:2,  goal_ver:1, cycle_id:3,  verdict:"answered", answer_md:"头数 16→8:ppl 24.93(+0.11,不劣判读内),吞吐 +18%(>15%)。结论成立。" },
+  { id:3,  question_id:3,  goal_ver:1, cycle_id:13, verdict:"answered", answer_md:"族级聚合:imported GLA 24.31(−2.1%,反超);自建 min 26.10(+5.2%,不达);高 lr 设置不可用。线性族可逼近甚至反超,依赖门控设计。" },
+  { id:4,  question_id:4,  goal_ver:1, cycle_id:7,  verdict:"answered", answer_md:"自建最小线性注意力 ppl 26.10,距参考 +5.2%,未达 ≤3% 门槛;可行性下界确立。" },
+  { id:5,  question_id:5,  goal_ver:1, cycle_id:10, verdict:"answered", answer_md:"imported GLA(pinned 4b7d9aa)经本系统 harness 出厂:ppl 24.31、acc 46.8%,优于 std-mha 参考 2.1%。" },
+  { id:6,  question_id:6,  goal_ver:1, cycle_id:12, verdict:"refuted",  answer_md:"lr=3e-3 不能稳定训练:训练 NaN;复现评估(attempt#2)确认 ppl 905.2。该设置排除。" },
+  { id:7,  question_id:11, goal_ver:1, cycle_id:14, verdict:"answered", answer_md:"吞吐:min 52.3k(+27%)、GLA 55.1k(+34%)、head8 48.7k(+18%),均相对 std-mha 41.2k。线性族吞吐优势确认。" },
+  { id:9,  question_id:8,  goal_ver:2, cycle_id:17, verdict:"refuted",  answer_md:"goal v2 下 A2 不再成立:head8 十六k 外推退化 9.2% > 5%(参考 std-mha 为 4.1%)。原 4k 结论保留但被限定。" },
+  { id:10, question_id:7,  goal_ver:2, cycle_id:18, verdict:"answered", answer_md:"16k 外推:GLA 3.8% ≤5% 达标;自建 min 5.9% 不达;(head8 9.2% 已由 A9 判定)。" },
+],
+
+/* UNIQUE(answer_id, goal_id, goal_ver) —— 每 answer 对 goal v2 至多一行,行内可 UPDATE(历史在 DECISION) */
+answer_applicability: [
+  { id:1, answer_id:1, goal_ver:2, status:"still_applicable",   audit_cycle:16, spawned_question_id:null, rationale_md:"参考锚点与新增谓词无冲突。" },
+  { id:2, answer_id:2, goal_ver:2, status:"contradicted",       audit_cycle:17, spawned_question_id:8,    rationale_md:"16k 外推退化 9.2%>5%;结论在 goal v2 被反驳(4k 范围内仍成立,范围限定)。" },
+  { id:3, answer_id:3, goal_ver:2, status:"pending",            audit_cycle:16, spawned_question_id:null, rationale_md:"本轮回看额度(max_closed_revalidate_per_cycle=4)已用尽,待后续轮判定。" },
+  { id:4, answer_id:5, goal_ver:2, status:"still_applicable",   audit_cycle:16, spawned_question_id:null, rationale_md:"GLA 16k 退化 3.8% 达标(后由 A10 佐证)。" },
+  { id:5, answer_id:6, goal_ver:2, status:"still_applicable",   audit_cycle:16, spawned_question_id:null, rationale_md:"稳定性负结论与上下文长度无关。" },
+],
+
+evidence: [
+  { id:1,  answer_id:1,  kind:"evaluation",   metric_result_id:1,  claim_md:"E1 出厂 canonical:val_ppl 24.82" },
+  { id:2,  answer_id:1,  kind:"evaluation",   metric_result_id:2,  claim_md:"E1 出厂 canonical:token_acc 46.2%" },
+  { id:3,  answer_id:2,  kind:"evaluation",   metric_result_id:4,  claim_md:"E2:head8 val_ppl 24.93" },
+  { id:4,  answer_id:2,  kind:"evaluation",   metric_result_id:1,  claim_md:"对照:E1 参考 24.82(同协议同指标)" },
+  { id:5,  answer_id:4,  kind:"evaluation",   metric_result_id:7,  claim_md:"E3:v-min val_ppl 26.10" },
+  { id:6,  answer_id:5,  kind:"evaluation",   metric_result_id:10, claim_md:"E4(source=factory,imported 经本池 harness):val_ppl 24.31" },
+  { id:7,  answer_id:6,  kind:"evaluation",   metric_result_id:14, claim_md:"E5 attempt#2(repro_eval):val_ppl 905.2;attempt#1 被 parser_result_suspect 拒作证据" },
+  { id:8,  answer_id:3,  kind:"child_answer", child_answer_id:4,   claim_md:"子答案 A4:自建下界 +5.2%" },
+  { id:9,  answer_id:3,  kind:"child_answer", child_answer_id:5,   claim_md:"子答案 A5:GLA −2.1% 反超" },
+  { id:10, answer_id:3,  kind:"child_answer", child_answer_id:6,   claim_md:"子答案 A6:高 lr 排除" },
+  { id:11, answer_id:7,  kind:"evaluation",   metric_result_id:9,  claim_md:"E3 metric_append:min 52.3k tok/s" },
+  { id:12, answer_id:7,  kind:"evaluation",   metric_result_id:12, claim_md:"E4 metric_append:GLA 55.1k tok/s" },
+  { id:13, answer_id:9,  kind:"evaluation",   metric_result_id:15, claim_md:"E6(lm-wt103@2):head8 退化 9.2%" },
+  { id:14, answer_id:9,  kind:"evaluation",   metric_result_id:16, claim_md:"对照 E7:std-mha 退化 4.1%" },
+  { id:15, answer_id:10, kind:"evaluation",   metric_result_id:18, claim_md:"E9:GLA 退化 3.8% ≤5%" },
+  { id:16, answer_id:10, kind:"evaluation",   metric_result_id:17, claim_md:"E8:自建 min 退化 5.9%(不达)" },
+],
+
+decision: [
+  { id:1,  cycle_id:1,  actor:"orchestrator", type:"bootstrap",        summary:"建首题 Q1(create_root)" },
+  { id:2,  cycle_id:2,  actor:"judge",        type:"idea_audit",       summary:"Q1 idea 判官:6 维过线,SD 7.5;selected=std-mha 参考实现" },
+  { id:3,  cycle_id:4,  actor:"judge",        type:"idea_audit",       summary:"Q10 全部候选 Structural Depth < 6 → 淘汰;阶段失败(cycle 正常收尾)" },
+  { id:4,  cycle_id:4,  actor:"agent",        type:"selection",        summary:"R3:选 Q3,est_cost 42 > B(t) 16 → intent=decompose" },
+  { id:5,  cycle_id:5,  actor:"agent",        type:"decompose",        summary:"Q3 拆 Q4/Q5/Q6(wildidea 助产 rationale hash wd-31f0 入 payload)" },
+  { id:6,  cycle_id:6,  actor:"orchestrator", type:"engineering_blocked", summary:"Q4 t2 smoke 预算尽+换会话仍败 → engineering_blocked,通知人;失败卡 fc-06" },
+  { id:7,  cycle_id:7,  actor:"agent",        type:"prune_branch",     summary:"Q10 剪枝:两次探索无信号,机制查重命中近邻(propose_prune → dead_end)" },
+  { id:8,  cycle_id:8,  actor:"gate",         type:"import_select",    summary:"import 确定性选择:candidate_set_hash cs-a1d3,按 selection_key 序;EC1(GPL)deny → EC2(Apache)allow" },
+  { id:9,  cycle_id:11, actor:"gate",         type:"reject",           summary:"gate_close_question 拒:evidence attempt#1 为 parser_result_suspect(nan)→ 不得作证据" },
+  { id:10, cycle_id:12, actor:"agent",        type:"answer",           summary:"Q6 refuted:复现 metric_result(905.2)为唯一有效证据" },
+  { id:11, cycle_id:15, actor:"gate",         type:"reject",           summary:"reasoning 产物 schema 校验失败 ×2(selection.scores 缺字段)" },
+  { id:12, cycle_id:15, actor:"orchestrator", type:"cycle_failed",     summary:"重试耗尽 → cycle.status=failed;通知人;等下一轮" },
+  { id:13, cycle_id:16, actor:"human",        type:"goal_amend",       summary:"消费 d2:goal v1→v2(新增 16k 外推 ≤5%);open 重打分" },
+  { id:14, cycle_id:16, actor:"agent",        type:"answer_review",    summary:"A2 → needs_revalidation,spawn Q8(source=revalidate);A1/A5/A6 still_applicable;A3 pending(额度尽)" },
+  { id:15, cycle_id:17, actor:"gate",         type:"new_protocol",     summary:"lm-wt103@2 登记(场景升版:ctx 16k 外推;I1)" },
+  { id:16, cycle_id:17, actor:"agent",        type:"answer_review",    summary:"回看题 Q8 关闭 → A2 applicability 终值 contradicted(4k 内保留,范围限定)" },
+  { id:17, cycle_id:18, actor:"agent",        type:"selection",        summary:"R3:Q13 得分 0.87(gain .9/info .8/cost −.2/UCB +.12+directive_adjust 0)→ intent=attack" },
+  { id:18, cycle_id:19, actor:"judge",        type:"plan_review",      summary:"可回答性评审 1 轮通过:每 need ≥1 指标/每构建有 smoke+预算" },
+  { id:19, cycle_id:19, actor:"judge",        type:"bundle_code_review", summary:"t3 代码适配评审 pass(round 1,subject_hash sm-4e01,runner_call #806 audit):实现与 plan 适配、无缩水 → smoke→running" },
+],
+
+directive: [
+  { id:1, kind:"set_budget",      hardness:"hard", status:"consumed", consume_at:"stage_boundary",  created_cycle:14, consumed_cycle:15, source_interaction_message_id:2,
+    payload:{ polished:"将单轮预算封顶 B_max 由 $32 上调至 $40(B0/翻倍周期不变)。", confirmed:true },  effect:"policy.budget.B_max=40;B(t) 现值 $40" },
+  { id:2, kind:"goal_amend",      hardness:"hard", status:"consumed", consume_at:"reasoning_start", created_cycle:15, consumed_cycle:16, source_interaction_message_id:5,
+    payload:{ polished:"研究目标新增约束:4k→16k 上下文外推的困惑度退化 ≤5%(建立 goal v2,不重开已关问题,走适用性审计)。", confirmed:true }, effect:"goal v2;适用性审计 4 项;spawn Q8" },
+  { id:3, kind:"inject_question", hardness:"soft", status:"consumed", consume_at:"reasoning_start", created_cycle:17, consumed_cycle:17, source_interaction_message_id:8,
+    payload:{ polished:"插入问题:现有各族实现 16k 外推退化是否 ≤5%,置高优先级。", confirmed:true }, effect:"生成 Q7(source=human)并 boost" },
+  { id:5, kind:"note",            hardness:"soft", status:"pending",  consume_at:"reasoning_start", created_cycle:18, consumed_cycle:null, source_interaction_message_id:9,
+    payload:{ polished:"注解:gate 初始化可能对结果敏感,评审与消融时留意。", confirmed:true }, effect:"(待 cycle 19 轮尾 reasoning 消费)" },
+  { id:6, kind:"goal_amend",      hardness:"hard", status:"pending",  consume_at:"reasoning_start", created_cycle:19, consumed_cycle:null, source_interaction_message_id:12,
+    payload:{ polished:"研究目标追加:32k 外推退化 ≤8% 纳入 goal v3 谓词(在 16k 约束之上)。", confirmed:false }, effect:"(待确认;确认后下一 goal_amend 轮消费)" },
+],
+
+/* ------- import 三表 ------- */
+external_candidate: [
+  { id:1, question_id:5, discovered_cycle:8, trigger_kind:"new_structure", source_kind:"repo", canonical_uri:"github.com/fla-org/flash-linear-attention", revision:"9f3c21e", license_id_seen:"GPL-3.0",  rank:0, search_snapshot_hash:"ss-e88a", trigger_snapshot_hash:"tg-b901" },
+  { id:2, question_id:5, discovered_cycle:8, trigger_kind:"new_structure", source_kind:"repo", canonical_uri:"github.com/sustcsonglin/gated-linear-attention", revision:"4b7d9aa", license_id_seen:"Apache-2.0", rank:1, search_snapshot_hash:"ss-e88a", trigger_snapshot_hash:"tg-b901" },
+  { id:3, question_id:5, discovered_cycle:8, trigger_kind:"new_structure", source_kind:"repo", canonical_uri:"github.com/lucidrains/linear-attention-transformer", revision:"77e01b2", license_id_seen:"MIT", rank:2, search_snapshot_hash:"ss-e88a", trigger_snapshot_hash:"tg-b901" },
+],
+license_review: [
+  { id:1, candidate_id:1, decision:"deny",  actor:"auto", license_id:"GPL-3.0",    decided_cycle:8, scope:null, note:"copyleft:入池再分发不满足 allow_publish_pool" },
+  { id:2, candidate_id:2, decision:"allow", actor:"auto", license_id:"Apache-2.0", decided_cycle:8, scope:{ allow_eval:true, allow_modify:true, allow_publish_pool:true, allow_redistribute:false } },
+  { id:3, candidate_id:3, decision:"allow", actor:"auto", license_id:"MIT",        decided_cycle:8, scope:{ allow_eval:true, allow_modify:true, allow_publish_pool:true, allow_redistribute:true } },
+],
+external_import: [
+  { id:1, question_id:5, candidate_id:1, action:"selected",                     action_cycle:8, candidate_set_hash:"cs-a1d3", selection_key:"rank:0|uri:fla-org/flash-linear-attention", policy_hash:"pol-77e2", license_decision_snapshot_hash:null,      baseline_id:null, manifest_hash:null },
+  { id:2, question_id:5, candidate_id:1, action:"rejected_by_license",          action_cycle:8, candidate_set_hash:"cs-a1d3", selection_key:"rank:0|uri:fla-org/flash-linear-attention", policy_hash:"pol-77e2", license_decision_snapshot_hash:"lds-3fa2", baseline_id:null, manifest_hash:null },
+  { id:3, question_id:5, candidate_id:2, action:"selected_for_materialization", action_cycle:8, candidate_set_hash:"cs-a1d3", selection_key:"rank:1|uri:sustcsonglin/gated-linear-attention", policy_hash:"pol-77e2", license_decision_snapshot_hash:"lds-3fa2", baseline_id:null, manifest_hash:null },
+  { id:4, question_id:5, candidate_id:2, action:"imported",                     action_cycle:9, candidate_set_hash:"cs-a1d3", selection_key:"rank:1|uri:sustcsonglin/gated-linear-attention", policy_hash:"pol-77e2", license_decision_snapshot_hash:"lds-3fa2", baseline_id:3,    manifest_hash:"mfa-8e12" },
+],
+
+/* ------- 运行日志 / 观测 ------- */
+execution_log: [
+  { id:1, owner:"run:4",      log_kind:"train",        ref:"questions/q6/cycles/11/build/t2/train.log",   content_hash:"lg-77aa", bytes:18874368 },
+  { id:2, owner:"attempt:9",  log_kind:"eval",         ref:"questions/q6/cycles/11/build/t2/eval.log",    content_hash:"lg-4c02", bytes:262144 },
+  { id:3, owner:"attempt:10", log_kind:"eval",         ref:"questions/q6/cycles/12/artifacts/repro/eval.log", content_hash:"lg-9be1", bytes:270336 },
+  { id:4, owner:"run:5",      log_kind:"import_clone", ref:"questions/q5/cycles/9/build/import/clone.log", content_hash:"lg-ab77", bytes:52480 },
+  { id:5, owner:"run:8",      log_kind:"train",        ref:"questions/q13/cycles/19/build/t3/train.log",  content_hash:"lg-(streaming)", bytes:null },
+],
+execution_observation: [
+  { id:1, execution_log_id:1, source:"parser", nan_seen:1, divergence_flag:1, oom_count:0, warning_count:37, retry_count:0, last_loss:null, loss_trend:"nan",  wall_clock_sec:9834, parser_version:"p1.3", extraction_policy_hash:"obs-p2", suspect:true },
+  { id:2, execution_log_id:2, source:"parser", nan_seen:1, divergence_flag:0, oom_count:0, warning_count:12, retry_count:0, last_loss:null, loss_trend:"unknown", wall_clock_sec:611, parser_version:"p1.3", extraction_policy_hash:"obs-p2", suspect:true },
+  { id:3, execution_log_id:3, source:"parser", nan_seen:0, divergence_flag:0, oom_count:0, warning_count:1,  retry_count:0, last_loss:6.81, loss_trend:"flat", wall_clock_sec:598, parser_version:"p1.3", extraction_policy_hash:"obs-p2", suspect:false },
+  { id:4, execution_log_id:1, source:"codex",  digest_ref:"questions/q6/cycles/11/artifacts/log_digest.md", digest_hash:"dg-55e0" },
+  { id:5, execution_log_id:5, source:"parser", nan_seen:0, divergence_flag:0, oom_count:0, warning_count:2,  retry_count:0, last_loss:3.41, loss_trend:"down", wall_clock_sec:7560, parser_version:"p1.3", extraction_policy_hash:"obs-p2", suspect:false },
+],
+
+/* ------- 人机 ------- */
+interaction_message: [
+  { id:1,  connector:"qq",          conversation_id:"qq:7742", raw_text:"现在进展怎么样了?", received_at:"07-02 12:03", ack_s:1.1 },
+  { id:2,  connector:"qq",          conversation_id:"qq:7742", raw_text:"预算有点紧,单轮上限提到 40 吧", received_at:"07-02 15:12", ack_s:0.9 },
+  { id:3,  connector:"qq",          conversation_id:"qq:7742", raw_text:"确认", received_at:"07-02 15:14", ack_s:0.8 },
+  { id:4,  connector:"web",         conversation_id:"web:a01", raw_text:"继续", received_at:"07-02 21:40", ack_s:0.6 },
+  { id:5,  connector:"qq",          conversation_id:"qq:7742", raw_text:"把长上下文也纳入研究目标吧,16k 外推退化别超 5%", received_at:"07-03 09:58", ack_s:1.0 },
+  { id:6,  connector:"qq",          conversation_id:"qq:7742", raw_text:"确认", received_at:"07-03 10:02", ack_s:0.7 },
+  { id:7,  connector:"qq",          conversation_id:"qq:7742", raw_text:"帮我看看是不是该停了", received_at:"07-03 11:20", ack_s:0.9 },
+  { id:8,  connector:"qq",          conversation_id:"qq:7742", raw_text:"优先验证一下 16k 长上下文外推", received_at:"07-03 12:05", ack_s:1.2 },
+  { id:9,  connector:"qq",          conversation_id:"qq:7742", raw_text:"gate 的初始化可能比较敏感,留意一下", received_at:"07-04 10:15", ack_s:0.8 },
+  { id:10, connector:"web_control", conversation_id:"web:a01", raw_text:'{"control":"request_provide","request":"r1","items":[1]}', received_at:"07-04 11:05", ack_s:0.4 },
+  { id:11, connector:"qq",          conversation_id:"qq:7742", raw_text:"现在在跑什么?", received_at:"07-05 08:20", ack_s:1.0 },
+  { id:12, connector:"qq",          conversation_id:"qq:7742", raw_text:"把 32k 外推也纳入目标吧", received_at:"07-05 09:41", ack_s:0.9 },
+],
+interaction_classification: [
+  { message_id:1,  intent:"query" },
+  { message_id:2,  intent:"directive", directive_id:1 },
+  { message_id:3,  intent:"note", note:"确认消息:daemon 置 d1.payload_json.confirmed=true(原型假设:确认消息按 note 入账+daemon 动作)" },
+  { message_id:4,  intent:"query", note:"continue 特例:系统在跑 → 仅 ACK,不产 directive" },
+  { message_id:5,  intent:"directive", directive_id:2 },
+  { message_id:6,  intent:"note", note:"确认消息 → d2.confirmed=true" },
+  { message_id:7,  intent:"unclear", note:"低置信 → directive_pending:回显确认,不自动答、不改状态" },
+  { message_id:8,  intent:"directive", directive_id:3 },
+  { message_id:9,  intent:"directive", directive_id:5 },
+  { message_id:10, intent:"note", note:"文件请求答复(web_control):daemon 校验 uploads/r1/1/ → hash 入账 → 并入 input/user_provided/r1/ → r1 resolved(原型假设:答复按 note 入账+daemon 动作,不产 directive)" },
+  { message_id:11, intent:"query" },
+  { message_id:12, intent:"directive", directive_id:6 },
+],
+interaction_reply: [
+  { message_id:1,  responder_kind:"codex",    snapshot_cycle:12, grounding_ok:true, latency_s:1.6,
+    reply_text:"截至已完成快照 cycle 12:目标 v1;Q6(高学习率稳定性)刚以复现评估收口为 refuted;open/inconclusive 1/0;本轮花费 $2.2,单轮预算 $16,全局剩余 $543。正在执行:cycle 13 reasoning 聚合中。" },
+  { message_id:4,  responder_kind:"template", snapshot_cycle:14, grounding_ok:true, latency_s:0.6,
+    reply_text:"已在继续,当前快照 cycle 14,正在执行 cycle 15(attack Q13)。未产生任何状态变更指令。" },
+  { message_id:7,  responder_kind:"template", snapshot_cycle:15, grounding_ok:true, latency_s:0.8,
+    reply_text:"您的消息可能涉及状态变更,已按低置信登记待确认:您是想 (a) 查询终止判据当前状态(τ 判据/预算余量),还是 (b) 下达停机/暂停指令?回复 a 或 b。" },
+  { message_id:11, responder_kind:"codex",    snapshot_cycle:18, grounding_ok:true, latency_s:1.4,
+    reply_text:"上次完成快照 cycle 18:Q7 已回答(GLA 16k 退化 3.8% 达标);选题 Q13(gla-gate 超 GLA?)intent=attack。当前正在执行:cycle 19 bundle,target 3/5(v-gate-headmix 训练中),心跳 8 秒前,本轮已花 $13.7 / B(t) $40。" },
+  { message_id:12, responder_kind:"template", snapshot_cycle:18, grounding_ok:true, latency_s:0.7,
+    reply_text:"这是一条硬指令,已登记为待确认 d6。润色稿:「研究目标追加:32k 外推退化 ≤8% 纳入 goal v3 谓词」。请确认后生效(确认前不会改变任何状态)。" },
+],
+
+/* ------- 通知(outbox 幂等投递;§4.6.6 通知矩阵) ------- */
+notification: [
+  { at:"06-29 23:58", event:"engineering_blocked", channel:"qq", text:"Q4/t2 smoke 修复预算尽:engineering_blocked。已写失败卡 fc-06,轮尾按 inconclusive 收尾,等待下轮重 plan。" },
+  { at:"06-30 08:10", event:"digest_K",            channel:"qq", text:"每 K=7 轮摘要:7 轮完成;A1/A2 落定;线性族分解为 3 子题;成本累计 $33.4。" },
+  { at:"07-02 15:12", event:"directive:received",  channel:"qq", text:"d1 已收到(ACK 0.9s)。" },
+  { at:"07-02 15:13", event:"directive:pending_confirmation", channel:"qq", text:"d1(set_budget,硬)回显润色稿:「B_max $32→$40」,请确认。" },
+  { at:"07-02 15:14", event:"directive:pending_effect", channel:"qq", text:"d1 已确认入队;预计消费点:下一阶段边界(cycle 15)。" },
+  { at:"07-02 20:31", event:"directive:applied",   channel:"qq", text:"d1 已生效(consumed_cycle=15):B_max=$40。" },
+  { at:"07-02 23:57", event:"cycle_failed",        channel:"qq", text:"cycle 15 失败:reasoning 产物 schema 校验重试耗尽。Q13 回 open,等下一轮。" },
+  { at:"07-03 10:41", event:"directive:applied",   channel:"qq", text:"d2 goal_amend 已生效:goal v2;适用性审计 4 项(1 项 needs_revalidation → Q8)。" },
+  { at:"07-03 18:22", event:"applicability_changed", channel:"qq", text:"旧结论 A2(头数减半)在 goal v2 被判 contradicted(16k 退化 9.2%>5%);4k 范围内保留。" },
+  { at:"07-04 09:12", event:"request_pending",     channel:"qq", text:"文件请求 r1:需要 PG-19 长文本评估集(须签署使用协议,系统无法自行获取,已附尝试路径与失败原因)。请放入 uploads/r1/1/;期间系统全局等待(问答/通知照常)。" },
+  { at:"07-04 11:05", event:"request_resolved",    channel:"qq", text:"文件请求 r1 已解决:uploads/r1/1/ 校验入账(hash up-90df)→ 并入 input/user_provided/r1/,恢复推进。" },
+  { at:"07-05 08:00", event:"digest_K",            channel:"qq", text:"每 K=7 轮摘要:goal v2 生效;GLA 16k 达标;gla-gate 建库中(出厂 23.94 反超);成本累计 $85.6。" },
+  { at:"07-05 09:41", event:"directive:pending_confirmation", channel:"qq", text:"d6(goal_amend,硬)回显润色稿待确认:「32k 外推 ≤8% 纳入 goal v3」。" },
+],
+
+/* ------- 当前轮 bundle targets ------- */
+build_target: [
+  { id:21, cycle_id:19, seq:1, target_kind:"build", status:"complete", desc:"B4 gla-gate 建库 + v-gate-base 训练 + 出厂评估", budget_estimate:12, variant_id:6 },
+  { id:22, cycle_id:19, seq:2, target_kind:"exec",  status:"complete", desc:"v-gate-lr(lr 6e-4)训练 + 出厂评估",             budget_estimate:8,  variant_id:7 },
+  { id:23, cycle_id:19, seq:3, target_kind:"exec",  status:"running",  desc:"v-gate-headmix 训练 + 出厂评估(smoke+代码适配评审通过 → 直接 running;注册前过结果评审)", budget_estimate:22, variant_id:8 },
+  { id:24, cycle_id:19, seq:4, target_kind:"eval",  status:"pending",  desc:"gla-gate 各变体 16k 外推评估(lm-wt103@2,create_evaluation)", budget_estimate:3, variant_id:null },
+  { id:25, cycle_id:19, seq:5, target_kind:"eval",  status:"pending",  desc:"throughput 补测(append_attempt / metric_append)", budget_estimate:2, variant_id:null },
+],
+
+/* ------- 台账聚合(ledger 按轮) ------- */
+ledger_by_cycle: [
+  { cycle:1, money:0.3 },{ cycle:2, money:7.2 },{ cycle:3, money:5.8 },{ cycle:4, money:1.1 },
+  { cycle:5, money:0.7 },{ cycle:6, money:9.4 },{ cycle:7, money:8.9 },{ cycle:8, money:2.6 },
+  { cycle:9, money:6.3 },{ cycle:10, money:1.4 },{ cycle:11, money:11.0 },{ cycle:12, money:2.2 },
+  { cycle:13, money:0.9 },{ cycle:14, money:3.1 },{ cycle:15, money:1.8 },{ cycle:16, money:0.6 },
+  { cycle:17, money:4.7 },{ cycle:18, money:3.9 },{ cycle:19, money:13.7 },
+],
+ledger_phase_c19: [
+  { phase:"idea",      tokens_total:181000,  money:0.9 },
+  { phase:"audit",     tokens_total:62000,   money:0.3 },
+  { phase:"plan",      tokens_total:143000,  money:0.8 },
+  { phase:"bundle",    tokens_total:1240000, money:11.2 },
+  { phase:"watchdog",  tokens_total:0,       money:0.1 },
+  { phase:"interaction_query", tokens_total:41000, money:0.4 },
+],
+
+runner_call_live: { id:812, cycle_id:19, phase:"bundle", purpose:"target t3 smoke→train 驱动", status:"running", started_at:"07-05 07:58", transcript_ref:"questions/q13/cycles/19/transcripts/bundle-t3.jsonl" },
+
+/* ------- policy.yaml(附录 C 形状;数值为部署期模拟值) ------- */
+policy: {
+  acquisition: { w1:0.40, w2:0.25, w3:0.20, c:0.15 },
+  budget: { B0:4, doubling_period_m:4, B_max:"40(d1 生效前 32)" },
+  flow: { decompose_threshold:"est_cost > B(t)", tau:{ score_floor:0.25, consecutive_rounds:5 }, audit_cadence_K:7, retry:{ artifact_parse:2, plan_review:2, bundle_code_review:3, bundle_result_review:3 }, watchdog:{ probe_h:2, full_h:24 } },
+  retrieval: { gate2_stuck_threshold:"visit≥3 或 连续 inconclusive≥2", budget_by_question_scale:"随 est_cost/score 与 B(t) 缩放" },
+  session: { dual_mode:"A(M6 实测后定默认)" },
+  tree_guard: { max_decompose_depth:4, max_children_per_node:6, max_open_questions:24 },
+  question_guard: { max_inconclusive_per_question:3 },
+  answer_review: { max_reviews_per_cycle:4, spawn_counts_toward_max_open:true },
+  goal_amend: { max_closed_revalidate_per_cycle:4, max_spawn_from_goal_amend:6 },
+  cards: { subtree_card_depth:1, tag_policy:"free_v1" },
+  idea: { sd_threshold:6, candidate_top_k:3, cross_phase:{ decompose_assist:"on", spawn_assist:"on" } },
+  interaction: { ack_sla_s:2, query_sla_s:2, mediator_rebuild_last_n:8, classify_conservativeness:"conservative" },
+  resources: { gpus:4, gpu_mem_gb:80, disk_quota_gb:500 },
+  interaction_request: { enabled:true, max_items_per_request:10, max_requests_per_goal:5, remind_interval_h:24 },
+  observation: "OPEN #5:附录 C 尚缺 observation 节(nan / divergence / loss_trend → parser_result_suspect 阈值已在 §4.7 声明,yaml 未登;随 M4 真 parser 落地补全)",
+},
+
+/* ------- 全局预算 ------- */
+budget: { global_total:600, global_spent:85.6, B_t:40, cycle_spent:13.7 },
+
+/* ------- status_card(§4.6.6 字段封闭清单;snapshot=上次完成) ------- */
+status_card: {
+  snapshot_cycle: 18,
+  goal_summary: "goal v2:改进注意力机制(ppl ≥2% 相对改善、吞吐不劣)+ 16k 外推退化 ≤5%",
+  active_question: 13,
+  cycle_status: "done", cycle_route: "eval_only",
+  selection_intent: "attack",
+  selection_decision: "R3:Q13 得分 0.87(gain .9 / info .8 / cost −.2 / UCB +.12)→ intent=attack(decision #17)",
+  open_count: 3, inconclusive_count: 0,
+  heartbeat_ref: "questions/q13/cycles/19/transcripts/bundle-t3.jsonl",
+  pending_request: null,   // §4.6.6:有 pending interaction_request 时携摘要(request_id/条目数/已等待时长);见 awaiting_user 场景
+},
+
+/* ------- 文件请求(interaction_request,§4.6.8) ------- */
+interaction_request: [
+  { id:1, goal_id:1, goal_ver:2, cycle_id:18, question_id:13, stage:"plan", status:"resolved",
+    summary_md:"为验证 gla-gate 的 16k/32k 长文本外推,需要 PG-19 长文本评估集。它须在官网签署使用协议后人工下载,系统无法自行获取(已试 HF 镜像与直链均 403)。请您申请后把解压包放入 uploads/r1/1/。",
+    items:[ { no:1, kind:"dataset", desc:"PG-19 长文本评估集(约 11GB)", expected_files:"pg19_eval.tar.gz", attempted_paths:"HF datasets 镜像(403)· 官网直链(需协议签署)· repo-search 镜像仓(license 不允许再分发)", failure_reason:"需人工签署使用协议", dest_hint:"input/user_provided/r1/pg19/" } ],
+    request_hash:"rq-7c31", created_at:"07-04 09:12", resolved_at:"07-04 11:05", resolved_message_id:10,
+    resolution:[ { no:1, provided:"input/user_provided/r1/pg19/", hash:"up-90df" } ] },
+],
+};
+
+/* ---------- 模拟运行场景(仅影响 live strip 呈现) ---------- */
+const SCENARIOS = {
+  running: { label:"训练执行中", heartbeat_age:"8 秒前", runner:"runner_call #812 · bundle · running · 始于 07-05 07:58(2.1h 前)",
+             cursor:"3 / 5", cursor_pct:52, watchdog:"剩余 21.9h / 24h", watchdog_pct:9, cost:"$13.7", idle:false, approval:false },
+  awaiting_user:{ label:"等待用户供给", heartbeat_age:"41 分钟前(无活跃研究 runner)", runner:"(不开新研究 runner_call —— 文件请求 r2 pending,全局等待;问答/通知/上传校验照常)",
+             cursor:"3 / 5(等待用户供给)", cursor_pct:44, watchdog:"暂停计时(等待用户供给)", watchdog_pct:0, cost:"$11.6", idle:false, request:true },
+  idle:    { label:"轮间空闲", heartbeat_age:"—(上一轮已收尾)", runner:"(advance 等待下次唤醒;cycle 19 done)",
+             cursor:"—", cursor_pct:0, watchdog:"—", watchdog_pct:0, cost:"$0.0", idle:true, approval:false },
+};
+
+/* ==================== v2:落盘目录镜像(§6.3 / §5.2) ==================== */
+const FS = [
+  { p:"policies", d:[ {p:"policy.yaml"}, {p:"notify.yaml"} ] },
+  { p:"prompts", d:[ {p:"system_prompt.md"},
+    { p:"skills", d:[ {p:"idea",d:[{p:"SKILL.md"}]}, {p:"plan",d:[{p:"SKILL.md"}]}, {p:"bundle",d:[{p:"SKILL.md"}]},
+                      {p:"reasoning",d:[{p:"SKILL.md"}]}, {p:"interaction_query",d:[{p:"SKILL.md"}]} ] } ] },
+  { p:"schemas", d:[ {p:"idea_set.schema.json"}, {p:"plan.schema.json"}, {p:"selection.schema.json"}, {p:"tree_ops.schema.json"} ] },
+  { p:"orchestrator", d:[ {p:"advancer.py"}, {p:"gate.py"}, {p:"statestore.py"},
+    {p:"interaction",d:[{p:"responder.py"}]}, {p:"importer",d:[{p:"select.py"}]} ] },
+  { p:"engines", d:[ {p:"wildidea",d:[{p:"idea_engine_adapter.py"}]} ] },
+  { p:"db", d:[ {p:"research.sqlite"} ] },
+  { p:"views", d:[ {p:"tree.md"}, {p:"pool.md"}, {p:"goal.md"}, {p:"digest.md"} ] },
+  { p:"baselines", d:[
+    {p:"std-mha-3f9c1", d:[{p:"identity.md"}]},
+    {p:"linear-attn-min-b21e7", d:[{p:"identity.md"}]},
+    {p:"gla-sota-4b7d9", d:[{p:"identity.md"},{p:"manifest.json"}]},
+    {p:"gla-gate-77a02", d:[{p:"identity.md"}]} ] },
+  { p:"protocols", d:[ {p:"lm-wt103@1",d:[{p:"spec.md"}]}, {p:"lm-wt103@2",d:[{p:"spec.md"}]} ] },
+  { p:"questions", d:[
+    { p:"q13", d:[ { p:"cycles", d:[ { p:"19", d:[
+        {p:"context_pack",d:[{p:"pack-bundle-t3.md"}]},
+        {p:"artifacts",d:[{p:"idea_set.json"},{p:"plan.json"}]},
+        {p:"build",d:[{p:"t3",d:[{p:"train.log"}]}]},
+        {p:"transcripts",d:[{p:"bundle-t3.jsonl"}]},
+        {p:"handoff-2.md"} ] } ] } ] },
+    { p:"q7", d:[ { p:"cycles", d:[ { p:"18", d:[ {p:"cycle_report.md"} ] } ] } ] },
+    { p:"q6", d:[ { p:"cycles", d:[
+        { p:"11", d:[ {p:"build",d:[{p:"t2",d:[{p:"train.log"},{p:"eval.log"}]}]}, {p:"artifacts",d:[{p:"log_digest.md"}]} ] },
+        { p:"12", d:[ {p:"cycle_report.md"} ] } ] } ] } ] },
+  { p:"input", d:[ {p:"goal_brief.md"},
+    { p:"corpus", d:[ {p:"papers",d:[{p:"gla-2312.06635.pdf"}]}, {p:"datasets",d:[{p:"wikitext103 -> /data/wt103(只读)"}]} ] },
+    { p:"user_provided", d:[ {p:"r1",d:[{p:"pg19(hash up-90df)"}]} ] } ] },
+  { p:"uploads", d:[ {p:"r1",d:[{p:"1",d:[{p:"pg19_eval.tar.gz"}]}]} ] },
+  { p:"connectors", d:[ {p:"qq.toml"}, {p:"web.toml"} ] },
+];
+
+const FILE_LIVE = new Set([
+  "questions/q13/cycles/19/build/t3/train.log",
+  "questions/q13/cycles/19/transcripts/bundle-t3.jsonl",
+]);
+
+const FILE_CONTENT = {
+  "policies/policy.yaml": { panel:"goal", panelLabel:"Goal·策略", note:"全部数值旋钮唯一所在(P2);版本入 Git。",
+    body:'# policy.yaml(模拟值;附录 C:每旋钮带默认值,用户只改想改的)\nacquisition: { w1: 0.40, w2: 0.25, w3: 0.20, c: 0.15 }\nbudget: { B0: 4, doubling_period_m: 4, B_max: 40 }\nflow:\n  decompose_threshold: est_cost > B(t)\n  tau: { score_floor: 0.25, consecutive_rounds: 5 }\n  audit_cadence_K: 7\n  retry: { artifact_parse: 2, plan_review: 2, bundle_code_review: 3, bundle_result_review: 3 }\n  watchdog: { probe_h: 2, full_h: 24 }\ntree_guard: { max_decompose_depth: 4, max_children_per_node: 6, max_open_questions: 24 }\nquestion_guard: { max_inconclusive_per_question: 3 }\nanswer_review: { max_reviews_per_cycle: 4, spawn_counts_toward_max_open: true }\ngoal_amend: { max_closed_revalidate_per_cycle: 4, max_spawn_from_goal_amend: 6 }\ncards: { subtree_card_depth: 1, tag_policy: free_v1 }\nidea: { sd_threshold: 6, candidate_top_k: 3, cross_phase: { decompose_assist: on, spawn_assist: on } }\ninteraction: { ack_sla_s: 2, query_sla_s: 2, mediator_rebuild_last_n: 8 }\nresources: { gpus: 4, gpu_mem_gb: 80, disk_quota_gb: 500 }   # 启动输入③:只放硬件事实(§4.6.7)\ninteraction_request: { enabled: true, max_items_per_request: 10, max_requests_per_goal: 5, remind_interval_h: 24 }\n# OPEN #5: observation 节待 M4 真 parser 落地补全' },
+  "input/goal_brief.md": { panel:"goal", panelLabel:"Goal·策略", note:"启动输入①:研究目标书(§4.6.7);frontmatter 缺失/非法 → 启动失败。",
+    body:'---\npredicate_json: { "metric": "val_ppl", "improve_rel": 0.02, "throughput": "not_worse", "extrapolation_16k_degradation_max": 0.05 }\n---\n# 研究目标(goal v1 来源)\n改进注意力机制:在 WikiText-103 语言建模上相对 std-mha 取得 ≥2% 困惑度相对改善,吞吐不劣。\n\n# 研究说明\n- 现状资料见 input/corpus/(文献 + 数据集只读挂载);\n- 计算资源见 policy.resources(4×GPU/80GB/500GB);\n- 底线:所有结论须经本系统 harness 的 metric_result 支撑。\n\n(编排器初始化:解析本文件 → state:create_goal 建 goal v1 + DECISION(goal_bootstrap, brief hash)→ bootstrap 轮出首题)' },
+  "policies/notify.yaml": { panel:"directives", panelLabel:"指令与请求", note:"通知矩阵开关(事件→通道)。",
+    body:'# 通知矩阵(§4.6.6;模拟)\ndirective_lifecycle: { received: [qq], classified: [qq], pending_confirmation: [qq], pending_effect: [qq], applied: [qq], rejected: [qq], superseded: [qq] }\npush: { cycle_failed: [qq], engineering_blocked: [qq], digest_K: [qq] }\nrequest: { request_pending: [qq, web], request_reminder: [qq], request_resolved: [qq] }\napplicability_changed: [qq]' },
+  "prompts/system_prompt.md": { note:"Codex 角色锁定:无状态阶段工人。",
+    body:'# system_prompt(角色锁定,模拟摘要)\n- 你是无状态阶段工人:只处理本 turn 的 context_pack;要历史经 MCP 只读工具取,不得「记住」上一轮。\n- 产物只产合 schema 的 JSON + md 正文;提交前 validate_artifact 自检。\n- 永不直接碰 DB / views;跨 turn 经「上下文包 + 中文交接摘要」续接。' },
+  "prompts/skills/idea/SKILL.md": { panel:"cycles", panelLabel:"轮次", note:"版本化提示词;prompt 是实验对象。",
+    body:'# idea SKILL(骨架,模拟)\n触发条件:route=attack 的轮首。\n读取:Qn 问题卡+祖先链 · 已试 IDEA 及结局 · 相关已关闭结论(带适用性徽标) · 相似失败卡 · 文献检索。\n任务:判「需要全新创新?」→ wildidea 发散(自评前3) / 旁路现成想法 → 统一独立判官(6 维,SD<6 淘汰)。\n产物:idea_set.json(schema 指向 schemas/)。\n门禁与写入:gate 写 IDEA 表(全部候选及结局入账防复造)。\n失败语义:全不合格 → cycle=done、Qn inconclusive。' },
+  "prompts/skills/plan/SKILL.md": { panel:"pool", panelLabel:"Baseline 池", note:"复用判定是 plan 的核心机械步。",
+    body:'# plan SKILL(骨架,模拟)\n拆 verification needs → 逐 need 机械复用判定(测量索引 O(1),排除 parser_result_suspect)→ 锁评估协议(I1)+metric_defs+readout+smoke+预算 → 可回答性评审(≤2 轮) → gate_new_protocol / gate_claim_* / build_target 队列。\ntargets=[] ⇒ reuse_only;仅 eval ⇒ eval_only;build/exec ⇒ attack;缺外部能力 ⇒ import 三闸。' },
+  "prompts/skills/bundle/SKILL.md": { panel:"cycles", panelLabel:"轮次",
+    body:'# bundle SKILL(骨架,模拟)\n逐 build_target 严格串行(bundle_cursor 落库),两段提交(§4.2.5):worktree → 构建 → smoke(修复循环无次数上限,受预算+watchdog)→ 代码适配评审(≤3,不过回修;轮尽 review_failed 不训练)→ 训练 run → 出厂评估(source=factory,结果落 staging)→ 结果评审(≤3:结果与 log 合理性+反查代码 bug;轮尽 review_failed 测量不注册)→ 三级校验 → gate_register_*(注册段单事务)→ 复制入池。eval 免训练同过结果评审。\nrun-owned log 随段(i)、成功评估 attempt-owned log 随段(ii)补登(parser 先行)。' },
+  "prompts/skills/reasoning/SKILL.md": { panel:"evidence", panelLabel:"结论与证据",
+    body:'# reasoning SKILL(骨架,模拟)\n轮尾四步:R1 答题(verdict+evidence,I3)→ R2 树维护(spawn/prune/applicability)→ R3 选题(四元打分,产 selection 不写 route)→ R4 收尾(cycle_report/views/LEDGER/通知,同一事务)。\nlog/观测只解释、不作证据;存疑 → 喂 plan 复现 eval。' },
+  "prompts/skills/interaction_query/SKILL.md": { panel:"audit", panelLabel:"人机审计",
+    body:'# interaction_query SKILL(骨架,模拟)\n只读中介:输入 = 已消毒查询 + status_card 文本(无 DB 凭据、不拿 raw 对话)。\n回答须区分「上次完成快照」与「当前正在执行」;过 grounding 校验(卡外事实/宣称已执行/引 log 作证/自产 directive 均不许),不过退模板。' },
+  "schemas/idea_set.schema.json": { panel:"cycles", panelLabel:"轮次",
+    body:'{ "$id": "idea_set.schema.json",\n  "required": ["candidates", "audit_scores", "selected_id", "novelty_refs"],\n  "properties": {\n    "need_innovation": {"type": "boolean"},\n    "candidates": {"items": {"required": ["generation_path", "audit_mapping", "core_claim", "mechanism", "assumptions", "min_falsifiable_experiment"]}},\n    "audit_scores": {"items": {"required": ["candidate_id", "six_dims", "sd", "decision"]}},\n    "novelty_refs": {"description": "内容寻址快照:query/provider/content_hashes/ranking/policy_hash"}\n  } }' },
+  "schemas/plan.schema.json": { panel:"pool", panelLabel:"Baseline 池",
+    body:'{ "$id": "plan.schema.json",\n  "required": ["needs", "reuse_evidence", "targets", "protocol", "metric_defs", "readout_rules"],\n  "properties": { "targets": {"items": {"required": ["target_kind", "seq", "critical", "budget_estimate"],\n    "properties": {"target_kind": {"enum": ["build", "exec", "eval", "import"]}}}} } }' },
+  "schemas/selection.schema.json": { panel:"ledger", panelLabel:"决策账",
+    body:'{ "$id": "selection.schema.json",\n  "required": ["next_question_id", "next_intent", "scores"],\n  "properties": { "next_intent": {"enum": ["attack", "decompose", "terminate"]},\n    "scores": {"items": {"required": ["question_id", "score", "est_cost"]}} },\n  "note": "selection 只选下一步,不写 route(route 由 Advancer 派生)" }' },
+  "schemas/tree_ops.schema.json": { panel:"evidence", panelLabel:"结论与证据",
+    body:'{ "$id": "tree_ops.schema.json",\n  "properties": { "ops": {"items": {"properties": {"op": {"enum": ["create_root", "add_children", "spawn_question", "mark_answer_applicability", "propose_prune", "amend_goal", "seed_applicability_audit"]}}}} },\n  "note": "op 封闭七词表,与 §4.2.4 一字一致" }' },
+  "orchestrator/advancer.py": { panel:"cycles", panelLabel:"轮次",
+    body:'# advancer.py(签名摘要,模拟)\nclass Advancer:\n    def advance(self, cycle_id) -> "Stage | done":\n        """读 StateStore 把状态机推进一格 → 落库 → 退出;幂等(已成功则跳过)。"""\n    def derive_next_route(self, prev_selection, outcome) -> "Route | None":\n        """§2.3 全转移矩阵;reasoning 从不写 route。"""' },
+  "orchestrator/gate.py": { panel:"ledger", panelLabel:"决策账",
+    body:'# gate.py(签名摘要,模拟)\nclass Gate:\n    def preview(self, artifact): ...   # MCP 只读预检,不写库、不被信任\n    def commit(self, artifact, *, cycle_id, stage, target_id=None): ...\n# 三级校验:schema → 引用完整性 → 业务门禁(I1–I6)\n# authorizer:deny SELECT execution_log / execution_observation / interaction_* / external_*(gate_input 隔离)' },
+  "orchestrator/statestore.py": { panel:"cycles", panelLabel:"轮次",
+    body:'# statestore.py(签名摘要,模拟)\nclass StateStore:\n    def open_or_resume_cycle(self): ...\n    def set_route(self, cycle_id, route): ...\n    def persist_selection(self, cycle_id, sel): ...   # scores 写回 question 的唯一维护点\n    def apply_tree_ops(self, cycle_id, ops): ...      # 七词表\n    def consume_directive(self, directive_id): ...    # 拒未确认硬指令\n# 一切写经 WriteDaemon 单线程队列(§6.13(1))' },
+  "orchestrator/interaction/responder.py": { panel:"audit", panelLabel:"人机审计",
+    body:'# responder.py(签名摘要,模拟)\nclass Responder:\n    def answer(self, sanitized_query: str, status_card) -> "Reply":\n        """只读连接(mode=ro + authorizer 禁写);只拿状态卡+消毒摘要;\n        grounding 不过 → 退模板;interaction_reply 由 daemon 写,非 Codex。"""' },
+  "orchestrator/importer/select.py": { panel:"import", panelLabel:"Import 准入",
+    body:'# select.py(签名摘要,模拟)\ndef select(question_id, action_cycle) -> "ExternalImport":\n    """确定性可回放:候选集按 action_cycle 冻结,按 selection_key 序取\n    第一个 license allow 且 scope 匹配者;deny → 下一个(仍确定性)。\n    输入元组含 candidate_set_hash / license_decision_snapshot_hash / policy_hash(I6)。"""' },
+  "engines/wildidea/idea_engine_adapter.py": { panel:"cycles", panelLabel:"轮次",
+    body:'# idea_engine_adapter.py(唯一壳,模拟)\n# vendored wildidea 的所有输入/检索/禁词/anchor_pack 只能由上下文编译器+只读 MCP 提供;\n# engine 不得自取上下文;联网查重结果作内容寻址快照入库;\n# 隐藏上下文(engine/prompt/judge_prompt/anchor_pack/policy hash + model + sampling)入 idea.audit_json。' },
+  "db/research.sqlite": { panel:"ledger", panelLabel:"决策账",
+    note:"结构化状态唯一真相(P1);35 表 / 69 触发器 / 28 索引 / 1 视图。",
+    body:'-- research.sqlite(表清单,模拟展示)\ngoal question question_dep idea cycle build_target\nbaseline baseline_tag variant checkpoint run\nprotocol metric_def protocol_metric evaluation evaluation_attempt metric_result\nanswer answer_applicability evidence decision directive runner_call ledger card\nbuild_target_required_metric phase_commit\nexecution_log execution_observation\nexternal_candidate license_review external_import\ninteraction_message interaction_classification interaction_reply\n-- 视图:v_metric_result_trajectory(人/审计/对照;gate authorizer 拒读其底表)' },
+  "views/tree.md": { panel:"tree", panelLabel:"问题树画布", note:"DB 投影,可删可重建;Git 仓每轮提交。",
+    body:'# tree.md(DB 投影,c19 渲染,模拟)\n- Q1 [answered] std-mha 参考性能 → A1\n  - Q2 [answered→适用性 contradicted@v2] 头数 16→8 → A2\n    - Q8 [refuted] goal v2 下 A2 是否仍成立 → A9\n      - Q14 [open 0.74] 退化根因诊断\n  - Q3 [answered] 线性族逼近? → A3(child_answer×3)\n    - Q4 [answered] 自建最小实现 → A4\n    - Q5 [answered] import SOTA 表现 → A5\n      - Q13 [active] gla-gate 超 GLA?(c19 攻坚中)\n        - Q16 [open 0.55] gate 消融\n    - Q6 [refuted] 高 lr 稳定性 → A6\n    - Q11 [answered] 吞吐补测 → A7\n  - Q7 [answered · source=human] 16k 外推达标? → A10\n    - Q15 [open 0.61] 32k 外推\n  - Q10 [dead_end] ReLU 注意力(prune #7)' },
+  "views/pool.md": { panel:"pool", panelLabel:"Baseline 池",
+    body:'# pool.md(DB 投影,模拟)\n## std-mha(legal,self_built)\n- v-base:ppl 24.82 / acc 46.2 / 41.2k tok/s\n- v-head8:ppl 24.93 / 吞吐 +18% / 16k 退化 9.2%\n## linear-attn-min(legal,parent=std-mha)\n- v-min:ppl 26.10;v-lr3e3:发散(复现 905.2)\n## gla-sota(legal,external_import · Apache-2.0 allow · mfa-8e12@4b7d9aa)\n- v-import:ppl 24.31 / 16k 退化 3.8%\n## gla-gate(building,parent=gla-sota)\n- v-gate-base:23.94;v-gate-lr:24.12;v-gate-headmix:训练中' },
+  "views/goal.md": { panel:"goal", panelLabel:"Goal·策略",
+    body:'# goal.md(DB 投影,模拟)\n当前 v2(c16,经 d2):改进注意力(ppl ≥2% 相对改善、吞吐不劣)+ 16k 外推退化 ≤5%。\nv1(初始):无长上下文约束。\n适用性审计@v2:A1 still / A2 contradicted(→Q8) / A3 pending / A5 still / A6 still。' },
+  "views/digest.md": { panel:"directives", panelLabel:"指令与请求",
+    body:'# digest.md(每 K=7 轮摘要,c19 期,模拟)\n- goal v2 生效;GLA 16k 退化 3.8% 达标;head8 9.2% 不达(A2 contradicted)。\n- gla-gate 建库中:出厂 23.94(−1.5% vs GLA,当前池内最优)。\n- 成本累计 $85.6 / $600;open 3;待确认指令 d6(32k 入目标)。' },
+  "baselines/std-mha-3f9c1/identity.md": { panel:"pool", panelLabel:"Baseline 池", note:"真相载体:identity 冻结(铁律⑥)。",
+    body:'# identity.md · std-mha(冻结,模拟)\ncanonical_key: std-mha@lm350m\n结构:标准多头注意力 Transformer(350M,16 头)。\n复现命令:python train.py --config configs/std-mha.yaml --seed 1\nsmoke:100 step loss 下降且无 NaN。\n出厂 evaluation:lm-wt103@1(E1,canonical attempt#1)。' },
+  "baselines/linear-attn-min-b21e7/identity.md": { panel:"pool", panelLabel:"Baseline 池",
+    body:'# identity.md · linear-attn-min(冻结,模拟)\ncanonical_key: linear-attn-min@lm350m\n结构:核化线性注意力(elu+1),前向逻辑变 → 独立 baseline(parent=std-mha)。\n复现命令:python train.py --config configs/lin-min.yaml --seed 1' },
+  "baselines/gla-sota-4b7d9/identity.md": { panel:"import", panelLabel:"Import 准入",
+    body:'# identity.md · gla-sota(冻结,模拟)\ncanonical_key: gla-sota@r4b7d9aa\nprovenance: external_import(license Apache-2.0 allow;LR#2)\npinned revision: 4b7d9aa;manifest: mfa-8e12\n出厂 evaluation:lm-wt103@1(E4,source=factory,经本系统 harness)。' },
+  "baselines/gla-sota-4b7d9/manifest.json": { panel:"import", panelLabel:"Import 准入", note:"供应链闭包(§6.13):回放物化的全部输入。",
+    body:'{ "revision": "4b7d9aa",\n  "submodule_shas": {"kernels": "1f0e9c2"},\n  "patch_set_hash": "ps-0a11",\n  "lfs_artifact_hashes": ["wt-88ffe1"],\n  "dependency_lock_hash": "dl-7c31",\n  "harness_adapter_hash": "ha-2be9",\n  "build_image_env_hash": "e9c2b7",\n  "download_sources": ["github.com/sustcsonglin/gated-linear-attention"],\n  "container_digest": "sha256:baf1…",\n  "run_command": "python eval.py --protocol lm-wt103@1",\n  "env_whitelist": ["CUDA_VISIBLE_DEVICES"],\n  "network_isolation": "off_after_clone" }' },
+  "baselines/gla-gate-77a02/identity.md": { panel:"pool", panelLabel:"Baseline 池",
+    body:'# identity.md · gla-gate(草稿→入库,c19,模拟)\ncanonical_key: gla-gate@lm350m\n结构:GLA 地基上的输出门控+头间混合(前向逻辑变 → 新 baseline,parent=gla-sota)。\n出厂 evaluation:E10(v-gate-base,23.94)。' },
+  "protocols/lm-wt103@1/spec.md": { panel:"pool", panelLabel:"Baseline 池", note:"协议场景冻结(I1);加指标不升版。",
+    body:'# lm-wt103@1 spec(冻结,模拟)\n评估数据:wikitext-103 验证集;ctx 4096;teacher-forcing;checkpoint=final。\n声明指标:val_ppl@1(lower)· token_acc@1(higher)· throughput_tok_s@1(higher,c14 追加)。' },
+  "protocols/lm-wt103@2/spec.md": { panel:"pool", panelLabel:"Baseline 池",
+    body:'# lm-wt103@2 spec(冻结,模拟)\n场景升版:ctx 16384 外推评估(其余同 @1)。\n声明指标:val_ppl@1 · degradation_16k_pct@1(lower;goal v2 阈值 ≤5%)。' },
+  "questions/q13/cycles/19/context_pack/pack-bundle-t3.md": { panel:"cycles", panelLabel:"轮次", note:"临时快照:每 turn 产生,归档供回放(P6)。",
+    body:'# context_pack · bundle/t3(四区,模拟)\n[固定锚] Q13 问题卡 · plan 切片(t3:v-gate-headmix)· lm-wt103@1 协议 · identity 模板 · env 锁 e7a1f2\n[结构邻域] B4 基线卡 · B3 变体矩阵\n[检索区] 相似失败卡 fc-06(smoke)· gate 初始化 note(d5 尚未消费,不在锚点)\n[引用区] execution_log refs(按需 ctx-fetch)' },
+  "questions/q13/cycles/19/artifacts/idea_set.json": { panel:"cycles", panelLabel:"轮次",
+    body:'{ "need_innovation": true,\n  "candidates": [\n    {"id": "cand-1", "generation_path": "wildidea", "core_claim": "输出门控+头间混合", "audit_mapping": {"source_domain": "水利:闸门分流"}},\n    {"id": "cand-2", "generation_path": "wildidea", "core_claim": "衰减核重参数化"},\n    {"id": "cand-3", "generation_path": "bypass", "core_claim": "直接调 GLA 门控温度"}\n  ],\n  "audit_scores": [{"candidate_id": "cand-1", "sd": 7.2, "decision": "pass"}],\n  "selected_id": "cand-1",\n  "novelty_refs": [{"query": "gated linear attention head mixing", "content_hashes": ["nr-3fa0"]}],\n  "provenance": {"engine": "wildidea@vnd-1.3", "prompt_hash": "ph-90aa", "seed": 17} }' },
+  "questions/q13/cycles/19/artifacts/plan.json": { panel:"cycles", panelLabel:"轮次",
+    body:'{ "needs": ["gate 改动可训练且优于 GLA", "16k 外推不退化", "吞吐不劣"],\n  "reuse_evidence": [{"need": "GLA 参照", "metric_result_id": 10}],\n  "targets": [\n    {"seq": 1, "target_kind": "build", "critical": 1, "budget_estimate": 12},\n    {"seq": 2, "target_kind": "exec", "budget_estimate": 8},\n    {"seq": 3, "target_kind": "exec", "budget_estimate": 22},\n    {"seq": 4, "target_kind": "eval", "eval_action": "create_evaluation", "budget_estimate": 3},\n    {"seq": 5, "target_kind": "eval", "eval_action": "append_attempt", "attempt_purpose": "metric_append", "budget_estimate": 2}\n  ],\n  "protocol": {"name": "lm-wt103", "version": 1},\n  "build_target_required_metric": [["val_ppl", 1], ["token_acc", 1]] }' },
+  "questions/q13/cycles/19/build/t3/train.log": { panel:"cycles", arg:19, panelLabel:"轮次(c19)", note:"raw log:运行观测 · 非证据;冷数据经 ctx-fetch 深潜。",
+    body:'step 03040/24000  loss 3.4479  lr 8.2e-4  tok/s 50.8k  gnorm 0.91\nstep 03080/24000  loss 3.4302  lr 8.2e-4  tok/s 51.4k  gnorm 0.88\nstep 03120/24000  loss 3.4121  lr 8.1e-4  tok/s 51.2k  gnorm 0.90\nstep 03160/24000  loss 3.3987  lr 8.1e-4  tok/s 51.3k  gnorm 0.87\n[watchdog] transcript mtime 8s ago · pid alive · gpu util 96%' },
+  "questions/q13/cycles/19/transcripts/bundle-t3.jsonl": { panel:"cycles", arg:19, panelLabel:"轮次(c19)", note:"runner transcript(心跳来源:文件 mtime)。",
+    body:'{"ts":"07-05 09:38","ev":"runner_heartbeat","phase":"bundle","target":"t3","step":3080}\n{"ts":"07-05 09:39","ev":"runner_heartbeat","phase":"bundle","target":"t3","step":3120}\n{"ts":"07-05 09:41","ev":"runner_heartbeat","phase":"bundle","target":"t3","step":3160}' },
+  "questions/q13/cycles/19/handoff-2.md": { panel:"cycles", arg:19, panelLabel:"轮次(c19)",
+    body:'# handoff-2(中文交接摘要,模拟)\n上 turn 完成:t2(v-gate-lr)训练+出厂+结果评审通过(24.12),已 gate_register_variant 入池。\n本 turn:t3(v-gate-headmix)smoke+代码适配评审通过(DECISION #21),训练进行中(step 3160/24000);出厂评估后过结果评审再注册。\n待办:t4 十六k 外推 eval(用 user_provided/r1 的 PG-19)、t5 吞吐 metric_append;轮尾 reasoning 收口 Q13。' },
+  "questions/q7/cycles/18/cycle_report.md": { panel:"evidence", arg:10, panelLabel:"证据链(A10)",
+    body:'# cycle_report · c18(模拟)\nroute=eval_only,Q7(source=human):16k 外推达标?\n复用判定:E6/E7 已有(c17);新增 E8(v-min,5.9%)、E9(v-import,3.8%)。\n结论:A10 answered——GLA 3.8% ≤5% 达标;自建 min 5.9% 不达。\nR2:spawn Q15(32k)、Q16(gate 消融);R3:selection → Q13(0.87,attack)。\n收尾:views 渲染 + Git 提交 + LEDGER $3.9 + 通知。' },
+  "questions/q6/cycles/11/build/t2/train.log": { panel:"cycles", arg:11, panelLabel:"轮次(c11)", note:"NaN 现场:parser 观测→ 存疑 → 复现(§7.3-3 剧本)。",
+    body:'step 11840/24000  loss 7.8821   lr 3.0e-3  gnorm 41.2\nstep 11880/24000  loss 132.4407 lr 3.0e-3  gnorm 3892.7  [warn] grad spike\nstep 11920/24000  loss nan      lr 3.0e-3  gnorm nan\nstep 11960/24000  loss nan      lr 3.0e-3  gnorm nan' },
+  "questions/q6/cycles/11/build/t2/eval.log": { panel:"cycles", arg:11, panelLabel:"轮次(c11)",
+    body:'[eval] loading checkpoint ckpt-final (variant v-lr3e3)\n[eval] warning: 3121 logits contain inf/nan\n[eval] val_ppl = 890.4  token_acc = 12.1\n[eval] done in 611s' },
+  "questions/q6/cycles/11/artifacts/log_digest.md": { panel:"cycles", arg:11, panelLabel:"轮次(c11)", note:"codex 摘要:只存 ref+hash,不得冒充观测事实(DB CHECK)。",
+    body:'# log_digest(codex 叙述,dg-55e0,模拟)\n训练在 ~12k step 处梯度爆炸转 NaN;此前 loss 已现锯齿。疑与 lr=3e-3 过高有关。\n(本文件仅供解释;机器事实以 parser 的 execution_observation 为准。)' },
+  "questions/q6/cycles/12/cycle_report.md": { panel:"evidence", arg:6, panelLabel:"证据链(A6)",
+    body:'# cycle_report · c12(模拟)\nroute=eval_only,Q6 复现:attempt#2(purpose=repro_eval)成功,val_ppl 905.2(观测干净)。\n结论:A6 refuted——lr=3e-3 不能稳定训练;证据 = attempt#2 的 metric_result(attempt#1 被 parser_result_suspect 拒)。' },
+  "connectors/qq.toml": { panel:"audit", panelLabel:"人机审计", note:"凭据只引用不落明文;不入 Git。",
+    body:'# qq connector profile(模拟)\nchannel = "qq"\nconversation_binding = "qq:7742 -> goal 1"\ncredential_ref = "keyring://meta-research/qq-bot"   # 只引用不落明文\nack_sla_s = 2' },
+  "connectors/web.toml": { panel:"audit", panelLabel:"人机审计",
+    body:'# web / web_control connector profile(模拟)\nchannel = "web"\ncontrols = ["pause", "resume", "set_budget", "request_provide", "request_unavailable", "request_cancel"]\nnote = "控件点按也先落 interaction_message(raw=结构化 payload);request_* 由 daemon 消费(资源请求答复,§4.6.8)"' },
+};
+
+/* 讲解员解释词典(命中「解释类」问句时使用) */
+const NARR_TOPICS = [
+  { re:/适用性|applicability|徽标/i, label:"结论与证据", panel:"evidence",
+    body:"<b>适用性徽标(§4.5.1/§4.6.4)</b>:goal 改版后旧结论不重开,而是对每个 answer 写当前 goal_ver 的 applicability 行,六枚举 pending / blocked / still_applicable / needs_revalidation(必须派生回看题)/ contradicted / obsolete。呈现旧结论的所有界面都必须渲染此徽标;无行 = 无徽标。它只影响 answer 的复用与呈现,不级联作废 metric_result。" },
+  { re:/存疑|suspect|nan|发散/i, label:"轮次(c11 现场)", panel:"cycles", arg:11,
+    body:"<b>parser_result_suspect(§4.3.1)</b>:确定性 parser 从运行日志提取观测(nan/发散/loss 趋势),按 policy 阈值派生「结果存疑」谓词——它不是证据、不支持结论,只做负向过滤:挡复用、挡关问。存疑后正确动作是走复现 eval(c11→c12 就是实例:attempt#1 被拒,结论只回溯到复现 attempt#2)。" },
+  { re:/import|三闸|license|物化|外部/i, label:"Import 准入", panel:"import",
+    body:"<b>import 三闸与准入链(§3.3.2/§3.6.3)</b>:闸1 按实验角色(引入外部 comparator 家族才 import-eligible)、闸2 卡壳时只读普查、闸3 规模缩放。命中后:发现登记(不可变快照)→ 确定性选择(候选集按轮冻结,license deny 换下一个)→ 物化(manifest 供应链闭包 + 沙箱 smoke)→ 出厂 eval → 入池。imported 的证据仍是本系统 harness 的 factory evaluation,报表必须带 provenance。" },
+  { re:/预算|B_max|B\(t\)/i, label:"决策账·台账", panel:"ledger",
+    body:"<b>预算(§4.4.4/§4.3.3)</b>:单轮预算 B(t) 从廉价探针起、每 m 轮翻倍封顶 B_max(现 $40,d1 上调);选中问题 est_cost 超 B(t) 就走 decompose。成本护栏全靠 B(t)——无审批门,bundle 由双评审把关质量(§3.4.3)。LEDGER 三消费:打分成本项、单轮路由、全局判停。" },
+  { re:/评审|code_review|result_review|缩水|反查/i, label:"双评审", panel:"cycles",
+    body:"<b>bundle 双评审(§3.4.3)</b>:smoke 通过后先<b>代码适配评审</b>(独立子智能体只见 plan+代码产物:防缩水/防不当实现,≤3 轮,轮尽 review_failed 不训练省成本);训练+出厂评估后<b>结果评审</b>(staging 产物+运行日志:结果合理性+据结果反查代码 bug,≤3 轮,轮尽测量整包不注册)。通过判据机械化:pass DECISION 的 subject_hash 须与当下产物集哈希相符(§4.1.4 附注)。" },
+  { re:/文件请求|uploads|user_provided|无法获取|interaction_request/i, label:"文件请求", panel:"directives",
+    body:"<b>文件请求(§4.6.8)</b>:系统确实无法自行获取的资料(数据集需申请/湿实验/论文全文)→ 聚合请求单(一 goal 一张 pending 单)用易懂语言说明需要什么,强制披露已尝试路径+失败原因 → 全局等待(只停研究推进,问答/通知照常)→ 用户放文件入 uploads/&lt;request_id&gt;/ → daemon 校验 hash → 并入 input/user_provided/ → 恢复。文件是输入资产、非 evidence。" },
+  { re:/启动输入|goal_brief|corpus|resources|目标书/i, label:"启动输入", panel:"goal",
+    body:"<b>启动输入四件套(§4.6.7)</b>:① input/goal_brief.md 研究目标书(YAML frontmatter 必含 predicate_json,缺失/非法启动失败;正文=目标+研究说明);② input/corpus/ 研究现状文件夹(只读;代码/模型入池必须走门禁);③ policy resources 节(GPU/显存/磁盘,硬件事实);④ 附录 C 全旋钮默认值,只改想改的。goal v1 由编排器初始化经 state:create_goal 建立。" },
+  { re:/route|轮次是|cycle 是|七形态|轮的形态/i, label:"轮次", panel:"cycles",
+    body:"<b>route 七形态(§2.3)</b>:bootstrap / attack / decompose / reuse_only / eval_only / goal_amend / dependency_wait。reasoning 只产 selection(选谁+intent),route 由编排器按转移矩阵确定性派生。研究失败(idea 不合格、engineering_blocked)不改 route、cycle 仍 done;只有 reasoning 产物非法才 cycle=failed。" },
+  { re:/快照|status_card|心跳|live|正在执行/i, label:"问题树(概览带)", panel:"tree",
+    body:"<b>快照 vs 执行(§4.6.2/§4.6.6)</b>:status_card 是 advance 在阶段边界原子发布的「上次完成快照」,字段封闭清单,应答器只许照卡说话;live strip(心跳/runner/bundle_cursor/watchdog/成本)是「正在执行」的只读活性信号,不经任何 LLM。画布顶部概览带就是这两层的压缩呈现。" },
+  { re:/directive|指令|润色|确认流程|硬指令|软指令/i, label:"指令与请求", panel:"directives",
+    body:"<b>directive 流水(§4.6.2/§4.6.4)</b>:人不直接改库——消息入账→保守三分类→硬指令先建 pending directive(payload 携润色稿)→回显确认(确认的是润色后的语义,raw 原文不可变)→按时机消费(立即/阶段边界/轮始)并同记 DECISION。软指令系统可有理由不从。全生命周期逐态外显通知。" },
+  { re:/baseline|variant|协议|三.?维|池是/i, label:"Baseline 池", panel:"pool",
+    body:"<b>池的三正交维度(§1.2.2)</b>:结构(baseline,前向逻辑)× 训练任务设置(variant,产 checkpoint)× 评估协议(evaluation=对照元)。三问判归属:前向逻辑变→新 baseline;要重训→新 variant;只改评估→同变体新 evaluation。对照必须同协议@版本同指标,报表 join provenance。" },
+  { re:/讲解员|你是谁|这个窗口|你能干/i, label:"人机审计", panel:"audit",
+    body:"我是<b>讲解员</b>——设计里「只读中介线程」(§4.6.2)的界面化:只拿发布快照与消毒摘要,解释状态、讨论下一步、帮你把想法组织成命令草稿。我<b>不改任何状态、不产生 directive</b>;草稿要经下方输出窗的命令行发送才入账(interaction_message→三分类→directive)。" },
+  { re:/证据|evidence|关问|I3/i, label:"结论与证据", panel:"evidence",
+    body:"<b>I3 关问需证据</b>:answered/refuted 必须 ≥1 条有效 evidence(evaluation 证据必指向成功测量的具体 metric_result;另有 literature / child_answer / human 三种多态)。log/观测/聊天永不作证据。证据面板只渲染 answer→evidence→metric_result 链。" },
+];
+/* ============================ 渲染层 ============================ */
+const HEADLESS = (typeof window === "undefined");   // node stub 冒烟环境
+const state = {
+  tab:"tree", scenario:"running",
+  selQ:13, selB:4, selCycle:19, selA:6,
+  actorFilter:"all",
+  d6:"pending_confirmation",           // 演示:待确认硬指令
+  chatExtra:[],                        // 命令行入账的新消息(模拟)
+  canvas:{ k:1, tx:0, ty:0, inited:false, drawerQ:null },
+  fs:{ expand:new Set(["questions","questions/q13","questions/q13/cycles","questions/q13/cycles/19","db","views","baselines"]), sel:null },
+  preview:null,
+  stream:{ filter:"all", timer:null, loss:3.3987, step:3160, seq:0, hh:9, mm:41 },
+  dockFolded:false,
+};
+
+const esc = s => String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+const q  = id => DB.question.find(x=>x.id===id);
+const bl = id => DB.baseline.find(x=>x.id===id);
+const vr = id => DB.variant.find(x=>x.id===id);
+const ev = id => DB.evaluation.find(x=>x.id===id);
+const at = id => DB.evaluation_attempt.find(x=>x.id===id);
+const mr = id => DB.metric_result.find(x=>x.id===id);
+const md = id => DB.metric_def.find(x=>x.id===id);
+const an = id => DB.answer.find(x=>x.id===id);
+const cy = id => DB.cycle.find(x=>x.id===id);
+
+const chip = (cls,txt,dot) => '<span class="chip '+cls+'">'+(dot?'<span class="dot '+dot+'"></span>':'')+txt+'</span>';
+const mono = s => '<span class="mono">'+esc(s)+'</span>';
+
+const Q_CHIP = {
+  open:        ()=>chip("c-line",'open'),
+  active:      ()=>chip("c-acc",'active',"acc pulse"),
+  answered:    ()=>chip("c-ok",'answered'),
+  refuted:     ()=>chip("c-bad",'refuted'),
+  inconclusive:()=>chip("c-warn",'inconclusive'),
+  dead_end:    ()=>chip("c-dead",'dead_end'),
+};
+const BV_CHIP = {
+  planned:chip("c-line","planned"), building:chip("c-warn","building"), legal:chip("c-ok","legal"),
+  build_failed:chip("c-bad","build_failed"), abandoned:chip("c-dead","abandoned"), deprecated:chip("c-dead","deprecated"),
+  running:chip("c-acc","running","acc pulse"), complete:chip("c-ok","complete"), pending:chip("c-line","pending"),
+  smoke:chip("c-warn","smoke"),
+  skipped:chip("c-dead","skipped"), failed:chip("c-bad","failed"), engineering_blocked:chip("c-bad","engineering_blocked"),
+  success:chip("c-ok","success"), done:chip("c-ok","done"), aborted:chip("c-dead","aborted"),
+};
+const routeChip = r => r==null ? chip("c-dead","worker") : chip("c-ink",r);
+const actorChip = a => ({agent:chip("c-acc","agent"),gate:chip("c-ink","gate"),judge:chip("c-warn","judge"),human:chip("c-human","human"),orchestrator:chip("c-dead","orchestrator")})[a]||esc(a);
+const srcChip = s => s==="human"?chip("c-human","source=human"):s==="revalidate"?chip("c-warn","source=revalidate"):s==="decompose"?chip("c-line","source=decompose"):"";
+
+const APP_LABEL = {
+  pending:["pending","待判定"], blocked:["blocked","被阻"], still_applicable:["still","仍适用"],
+  needs_revalidation:["needs","需回看"], contradicted:["contradicted","已反驳"], obsolete:["obsolete","已过时"],
+};
+function appBadge(row){
+  if(!row) return "";
+  const cls = {pending:"pending",blocked:"blocked",still_applicable:"still",needs_revalidation:"needs",contradicted:"contradicted",obsolete:"obsolete"}[row.status];
+  let extra = "";
+  if(row.status==="needs_revalidation" && row.spawned_question_id){ const sq=q(row.spawned_question_id); extra = " → Q"+row.spawned_question_id+"("+sq.status+")"; }
+  if(row.status==="contradicted" && row.spawned_question_id){ extra = " ← Q"+row.spawned_question_id; }
+  return '<span class="appb '+cls+'">适用性@v2 · '+row.status+esc(extra)+'</span>';
+}
+const appRowOf = answerId => DB.answer_applicability.find(a=>a.answer_id===answerId);
+
+function metricLine(m){
+  const def = md(m.metric_id);
+  const v = def.name==="throughput_tok_s" ? (m.value/1000).toFixed(1)+"k" : m.value;
+  return mono(def.name+"@"+m.metric_ver)+' = <b class="num">'+v+'</b>'+(def.unit?' <span class="small">'+esc(def.unit)+'</span>':'')+' <span class="small">('+m.scope+')</span>';
+}
+
+const IDEA_NOTES = {
+  10:"idea 记录:3 候选全部 Structural Depth < 6 → 淘汰(判官 decision #3);全部候选及结局已写 IDEA 表(防复造)。",
+  13:"idea 记录:3 候选(wildidea×2 + bypass×1,均带 audit_mapping);判官 6 维过线,selected =「输出门控 + 头间混合」SD 7.2;audit_json 含 engine / adapter / prompt / judge_prompt / anchor_pack / policy hash 组与联网查重内容寻址快照。",
+  4:"idea 记录:c6 selected「elu+1 核化近似」;c7 重访依 R1 差异纪律写明与前一 idea 的差异(数值稳定化项)。",
+};
+
+const docref = s => '<div class="docref">'+s+'</div>';
+const simNote = s => '<span class="lognote" style="color:var(--sub);border-color:var(--line);background:var(--panel2)">'+esc(s)+'</span>';
+
+/* ============ 画布顶部概览带(status_card ⇄ live 压缩;替代旧总览页) ============ */
+function bandHTML(){
+  const sc = DB.status_card||{}, scen = SCENARIOS[state.scenario];
+  const scenBit = state.scenario==="awaiting_user"
+    ? `${chip("c-warn","等待用户供给"+(sc.pending_request&&sc.pending_request.request_id!=null?(" r"+sc.pending_request.request_id):""))}${LIVE_MODE?"":` <button class="btn" style="padding:1px 9px;font-size:11px" onclick="provideR2()">模拟:已放入 uploads/r2/</button>`}`
+    : state.scenario==="idle"
+    ? chip("c-dead","轮间空闲")
+    : `<span class="dot acc pulse"></span><span class="num">心跳 ${esc(scen.heartbeat_age)}</span><span class="sep">·</span><span class="num">bundle ${esc(scen.cursor)}</span><span class="sep">·</span><span class="num">本轮 ${esc(scen.cost)}</span>`;
+  return `<div class="band">
+    <span class="eyebrow">status_card</span>
+    ${chip("c-ink","快照 c"+(sc.snapshot_cycle!=null?sc.snapshot_cycle:"—")+" · "+(sc.cycle_status||"—")+" · "+(sc.cycle_route||"—"))}
+    <span>goal <b>${esc("v"+(sc.goal_ver!=null&&sc.goal_ver!==""?sc.goal_ver:"?"))}</b></span><span class="sep">|</span>
+    <span>selection → ${mono("Q"+sc.active_question)} ${chip("c-acc",sc.selection_intent)}</span><span class="sep">|</span>
+    <span class="num">open <b>${sc.open_count}</b> / incl <b>${sc.inconclusive_count}</b></span><span class="sep">|</span>
+    <span class="num">B(t) <b>$${DB.budget.B_t}</b> · 全局余 ${DB.budget.global_remaining!=null?("$"+DB.budget.global_remaining):"—"}</span><span class="sep">|</span>
+    <span class="eyebrow">live</span>${scenBit}<span class="sep">|</span>
+    <span class="small">active</span>${(sc.active_question&&sc.active_question!=="—")?`<a href="javascript:go('tree',${parseInt(sc.active_question,10)||("'"+sc.active_question+"'")})" class="chip c-acc">Q${esc(String(sc.active_question))}→active</a>`:'<span class="small">—</span>'}
+    <span class="hint">单击=详情 · 双击=复盘 · 拖拽/滚轮 · F=适配</span>
+  </div>`;
+}
+function evChip(e){
+  if(e.startsWith("directive:")) return chip("c-human",e.slice(10));
+  return ({engineering_blocked:chip("c-bad","engineering_blocked"),cycle_failed:chip("c-bad","cycle_failed"),
+    request_pending:chip("c-warn","文件请求"),request_resolved:chip("c-ok","请求已解决"),digest_K:chip("c-line","每K轮摘要"),
+    applicability_changed:chip("c-warn","applicability")})[e]||chip("c-line",e);
+}
+
+/* ============ 问题树画布(主视图;手写 pan/zoom,零依赖) ============ */
+const CV = { NODE_W:210, NODE_H:64, COL_GAP:72, ROW_GAP:18, PAD:40,
+             K_MIN:0.25, K_MAX:2.5, ZOOM_SPEED:0.0012, FIT_MARGIN:0.94,
+             CLICK_SLOP:4, MINI_W:146, MINI_H:94 };
+const COL_PITCH = CV.NODE_W + CV.COL_GAP;
+const ROW_PITCH = CV.NODE_H + CV.ROW_GAP;
+let CVL = null;   // 最近一次布局(树数据静态,布局可缓存)
+
+function treeLayout(){
+  const qs = DB.question.slice().sort((a,b)=>a.id-b.id);
+  const kids = {};
+  qs.forEach(x=>{ const p = x.parent_id==null ? 0 : x.parent_id; (kids[p]=kids[p]||[]).push(x); });
+  const pos = {}; let cursor = 0;
+  function assign(n, depth){
+    const ch = kids[n.id] || [];
+    if(!ch.length){ pos[n.id] = { row:cursor++, depth }; return; }
+    ch.forEach(c=>assign(c, depth+1));
+    pos[n.id] = { row:(pos[ch[0].id].row + pos[ch[ch.length-1].id].row)/2, depth };
+  }
+  (kids[0]||[]).forEach(r=>assign(r,0));
+  let maxDepth = 0;
+  const nodes = qs.filter(x=>pos[x.id]).map(x=>{
+    const p = pos[x.id]; maxDepth = Math.max(maxDepth, p.depth);
+    return { q:x, x:CV.PAD + p.depth*COL_PITCH, y:CV.PAD + p.row*ROW_PITCH, depth:p.depth };
+  });
+  const W = CV.PAD*2 + (maxDepth+1)*COL_PITCH - CV.COL_GAP;
+  const H = CV.PAD*2 + cursor*ROW_PITCH - CV.ROW_GAP;
+  const byId = {}; nodes.forEach(n=>byId[n.q.id]=n);
+  const edges = [];
+  qs.forEach(x=>{ if(x.parent_id!=null && byId[x.parent_id] && byId[x.id]) edges.push({a:byId[x.parent_id], b:byId[x.id], kind:"tree"}); });
+  DB.question_dep.forEach(d=>{
+    if(d.dep_type==="question" && byId[d.depends_on_question_id] && byId[d.question_id])
+      edges.push({a:byId[d.depends_on_question_id], b:byId[d.question_id], kind:"dep", status:d.status});
+  });
+  return { nodes, edges, W, H, byId };
+}
+function edgePath(e){
+  const x1=e.a.x+CV.NODE_W, y1=e.a.y+CV.NODE_H/2, x2=e.b.x, y2=e.b.y+CV.NODE_H/2;
+  const dx=Math.min(90, Math.max(24, Math.abs(x2-x1)/2));
+  return "M "+x1+" "+y1+" C "+(x1+dx)+" "+y1+", "+(x2-dx)+" "+y2+", "+x2+" "+y2;
+}
+function canvasHTML(){
+  CVL = treeLayout();
+  const edges = CVL.edges.map(e=>`<path class="cedge ${e.kind==="dep"?"dep":""}" data-a="${e.a.q.id}" data-b="${e.b.q.id}" d="${edgePath(e)}"></path>`).join("");
+  const nodes = CVL.nodes.map(n=>{
+    const x=n.q, closed=["answered","refuted","dead_end"].includes(x.status);
+    const deps=DB.question_dep.filter(d=>d.question_id===x.id);
+    const a=DB.answer.find(z=>z.question_id===x.id);
+    const app=a?appRowOf(a.id):null;
+    const sub=[ x.score!=null?("score "+x.score):null, "est $"+x.est_cost,
+      x.visit_count>1?("visit "+x.visit_count):null,
+      deps.length?("dep "+deps.filter(d=>d.status==="satisfied").length+"/"+deps.length):null,
+      (x.source==="human"||x.source==="revalidate")?x.source:null,
+      a?("A"+a.id):null, app?("适用性:"+app.status):null ].filter(Boolean).join(" · ");
+    return `<div class="cnode st-${x.status} ${x.source==="human"?"human":""} ${closed?"closed":""} ${state.canvas.drawerQ===x.id?"sel":""}"
+      data-q="${x.id}" style="left:${n.x}px;top:${n.y}px" title="Q${x.id} ${esc(x.text)}">
+      <div class="top"><span class="qid">Q${x.id}</span>${Q_CHIP[x.status]()}</div>
+      <div class="qtxt">${esc(x.text)}</div>
+      <div class="subline">${esc(sub)}</div></div>`;
+  }).join("");
+  const legend = Q_CHIP.open()+Q_CHIP.active()+Q_CHIP.answered()+Q_CHIP.refuted()+Q_CHIP.inconclusive()+Q_CHIP.dead_end()
+    +'<span class="small">实线=父子 · 虚线=question_dep · 紫底=source-human</span>';
+  return `<div class="cvview" id="cvview">
+    <div class="cvworld" id="cvworld" style="width:${CVL.W}px;height:${CVL.H}px">
+      <svg class="cvedges" id="cvedges" width="${CVL.W}" height="${CVL.H}">${edges}</svg>
+      ${nodes}
+    </div>
+    <div class="cvhud">
+      <button onclick="canvasFit()" title="适配全图(F)">⤢</button>
+      <button onclick="canvasZoomBtn(1)" title="放大">+</button>
+      <button onclick="canvasZoomBtn(-1)" title="缩小">−</button>
+    </div>
+    <div class="cvlegend">${legend}</div>
+    <svg class="cvmini" id="cvmini" viewBox="0 0 ${CV.MINI_W} ${CV.MINI_H}"></svg>
+    <div class="cvdrawer ${state.canvas.drawerQ?"open":""}" id="cvdrawer">${state.canvas.drawerQ?drawerHTML(state.canvas.drawerQ):""}</div>
+  </div>`;
+}
+function drawerHTML(qid){
+  return `<button class="cvclose" onclick="canvasSelect(null)">关闭 ×</button>` + qDetail(qid);
+}
+
+/* --- 变换:纯函数 + 应用 --- */
+function zoomAt(v, deltaY, mx, my){
+  const k2 = Math.min(CV.K_MAX, Math.max(CV.K_MIN, v.k * Math.exp(-deltaY * CV.ZOOM_SPEED)));
+  return { k:k2, tx: mx - (mx - v.tx) * (k2 / v.k), ty: my - (my - v.ty) * (k2 / v.k) };
+}
+function fitView(W, H, vw, vh){
+  const k = Math.min(CV.K_MAX, Math.min(vw/W, vh/H) * CV.FIT_MARGIN);
+  return { k, tx:(vw - W*k)/2, ty:(vh - H*k)/2 };
+}
+function canvasApply(){
+  const w = document.getElementById("cvworld"); if(!w) return;
+  const c = state.canvas;
+  w.style.transform = "translate(" + c.tx + "px," + c.ty + "px) scale(" + c.k + ")";
+  miniSync();
+}
+function canvasFit(){
+  const view = document.getElementById("cvview"); if(!view || !CVL) return;
+  const r = view.getBoundingClientRect();
+  if(!r.width || !r.height) return;                     // 布局未就绪 / stub:短路防 Infinity
+  Object.assign(state.canvas, fitView(CVL.W, CVL.H, r.width, r.height));
+  state.canvas.inited = true;
+  canvasApply();
+}
+function canvasRestore(){ if(state.canvas.inited) canvasApply(); else canvasFit(); }
+function canvasZoomBtn(dir){
+  const view = document.getElementById("cvview"); if(!view) return;
+  const r = view.getBoundingClientRect();
+  Object.assign(state.canvas, zoomAt(state.canvas, dir>0?-220:220, (r.width||0)/2, (r.height||0)/2));
+  state.canvas.inited = true;
+  canvasApply();
+}
+function canvasCenterOn(qid){
+  const view = document.getElementById("cvview"); const n = CVL && CVL.byId[qid];
+  if(!view || !n) return;
+  const r = view.getBoundingClientRect(); if(!r.width) return;
+  state.canvas.tx = r.width/2  - (n.x + CV.NODE_W/2) * state.canvas.k;
+  state.canvas.ty = r.height/2 - (n.y + CV.NODE_H/2) * state.canvas.k;
+  state.canvas.inited = true;
+  canvasApply();
+}
+function canvasSelect(qid){
+  state.canvas.drawerQ = qid;
+  if(qid!=null) state.selQ = qid;
+  const dr = document.getElementById("cvdrawer");
+  if(dr){ dr.innerHTML = qid!=null ? drawerHTML(qid) : ""; dr.classList.toggle("open", qid!=null); }
+  const view = document.getElementById("cvview");
+  if(view && view.querySelectorAll) view.querySelectorAll(".cnode").forEach(el=>{
+    el.classList.toggle("sel", el.dataset && String(qid)===el.dataset.q);
+  });
+}
+function canvasJump(qid){
+  const a = DB.answer.find(z=>z.question_id===qid);
+  if(a){ go("evidence", a.id); return; }
+  const x = q(qid);
+  go("cycles", x.status==="active" ? 19 : (x.closed_cycle || x.born_cycle || 19));
+}
+function edgeHl(qid, on){
+  const svg = document.getElementById("cvedges");
+  if(!svg || !svg.querySelectorAll) return;
+  svg.querySelectorAll('path[data-a="'+qid+'"],path[data-b="'+qid+'"]').forEach(p=>p.classList.toggle("hl", on));
+}
+function miniSync(){
+  const mini = document.getElementById("cvmini"), view = document.getElementById("cvview");
+  if(!mini || !view || !CVL) return;
+  const mk = Math.min(CV.MINI_W/CVL.W, CV.MINI_H/CVL.H);
+  const dots = CVL.nodes.map(n=>{
+    const col = {open:"#9DB3AC",active:"#0B6B5D",answered:"#276B45",refuted:"#A93A2F",inconclusive:"#8A6400",dead_end:"#B9BFBC"}[n.q.status] || "#B9BFBC";
+    return '<rect x="'+(n.x*mk).toFixed(1)+'" y="'+(n.y*mk).toFixed(1)+'" width="'+(CV.NODE_W*mk).toFixed(1)+'" height="'+(CV.NODE_H*mk).toFixed(1)+'" rx="1.5" fill="'+col+'"></rect>';
+  }).join("");
+  const r = view.getBoundingClientRect ? view.getBoundingClientRect() : {width:0,height:0};
+  const c = state.canvas;
+  const vp = r.width ? '<rect x="'+((-c.tx/c.k)*mk).toFixed(1)+'" y="'+((-c.ty/c.k)*mk).toFixed(1)
+    +'" width="'+((r.width/c.k)*mk).toFixed(1)+'" height="'+((r.height/c.k)*mk).toFixed(1)
+    +'" fill="rgba(11,107,93,.07)" stroke="#0B6B5D" stroke-width="1.2"></rect>' : "";
+  mini.innerHTML = dots + vp;
+}
+function canvasBind(){
+  const view = document.getElementById("cvview");
+  if(!view || !view.addEventListener) return;
+  view.addEventListener("wheel", e=>{
+    e.preventDefault();
+    const r = view.getBoundingClientRect();
+    Object.assign(state.canvas, zoomAt(state.canvas, e.deltaY, e.clientX - r.left, e.clientY - r.top));
+    state.canvas.inited = true;
+    canvasApply();
+  }, {passive:false});
+  let drag = null;
+  view.addEventListener("pointerdown", e=>{
+    if(e.target.closest && e.target.closest(".cvhud,.cvdrawer,.cvmini,.cvlegend,button,a")) return;
+    drag = { x0:e.clientX, y0:e.clientY, tx0:state.canvas.tx, ty0:state.canvas.ty, moved:false, t:e.target };
+    if(view.setPointerCapture && e.pointerId!=null){ try{ view.setPointerCapture(e.pointerId); }catch(_){} }
+  });
+  view.addEventListener("pointermove", e=>{
+    if(!drag) return;
+    const dx = e.clientX - drag.x0, dy = e.clientY - drag.y0;
+    if(Math.abs(dx) > CV.CLICK_SLOP || Math.abs(dy) > CV.CLICK_SLOP) drag.moved = true;
+    if(drag.moved){
+      state.canvas.tx = drag.tx0 + dx; state.canvas.ty = drag.ty0 + dy;
+      state.canvas.inited = true;
+      view.classList.add("dragging");
+      canvasApply();
+    }
+  });
+  view.addEventListener("pointerup", e=>{
+    view.classList.remove("dragging");
+    if(!drag) return;
+    const moved = drag.moved, t = drag.t; drag = null;
+    if(moved) return;
+    const nodeEl = (t && t.closest) ? t.closest(".cnode") : null;
+    canvasSelect(nodeEl ? Number(nodeEl.dataset.q) : null);
+  });
+  view.addEventListener("pointercancel", ()=>{ drag = null; view.classList.remove("dragging"); });
+  view.addEventListener("dblclick", e=>{
+    const nodeEl = e.target.closest && e.target.closest(".cnode");
+    if(nodeEl) canvasJump(Number(nodeEl.dataset.q));
+  });
+  view.addEventListener("mouseover", e=>{
+    const nodeEl = e.target.closest && e.target.closest(".cnode");
+    if(nodeEl) edgeHl(nodeEl.dataset.q, true);
+  });
+  view.addEventListener("mouseout", e=>{
+    const nodeEl = e.target.closest && e.target.closest(".cnode");
+    if(nodeEl) edgeHl(nodeEl.dataset.q, false);
+  });
+  const mini = document.getElementById("cvmini");
+  if(mini && mini.addEventListener){
+    const jumpTo = e=>{
+      const mr = mini.getBoundingClientRect(); if(!mr.width || !CVL) return;
+      const mk = Math.min(CV.MINI_W/CVL.W, CV.MINI_H/CVL.H);
+      const sx = (e.clientX - mr.left) * (CV.MINI_W / mr.width);
+      const sy = (e.clientY - mr.top)  * (CV.MINI_H / mr.height);
+      const vr = view.getBoundingClientRect();
+      state.canvas.tx = vr.width/2  - (sx/mk) * state.canvas.k;
+      state.canvas.ty = vr.height/2 - (sy/mk) * state.canvas.k;
+      state.canvas.inited = true;
+      canvasApply();
+    };
+    let md = false;
+    mini.addEventListener("pointerdown", e=>{ md = true; jumpTo(e); e.stopPropagation(); });
+    mini.addEventListener("pointermove", e=>{ if(md) jumpTo(e); });
+    mini.addEventListener("pointerup",   ()=>{ md = false; });
+    mini.addEventListener("pointerleave",()=>{ md = false; });
+  }
+}
+function qDetail(id){
+  const x = q(id); if(!x) return "";
+  const a = DB.answer.find(z=>z.question_id===id);
+  const app = a ? appRowOf(a.id) : null;
+  const deps = DB.question_dep.filter(d=>d.question_id===id);
+  const evs = a ? DB.evidence.filter(e=>e.answer_id===a.id) : [];
+  const decs = DB.decision.filter(d=>d.summary.includes("Q"+id)||d.cycle_id===x.closed_cycle&&d.type==="answer");
+  return `
+  <section class="card">
+    <h3>问题卡 ${mono("Q"+id)} <span class="en">card_md · ≤200 tok</span>${Q_CHIP[x.status]()}</h3>
+    <div style="font-size:13px;margin-bottom:8px">${esc(x.text)}</div>
+    <dl class="kv">
+      <dt>source / goal_ver</dt><dd>${mono(x.source)} · v${x.goal_ver}(born v${x.born_goal_ver})</dd>
+      <dt>born / closed cycle</dt><dd class="num">c${x.born_cycle}${x.closed_cycle?" → c"+x.closed_cycle:""}</dd>
+      <dt>visit / decompose</dt><dd class="num">${x.visit_count} / ${x.decompose_count}</dd>
+      <dt>score / est_cost</dt><dd class="num">${x.score??"—"} / $${x.est_cost}</dd>
+      ${deps.length?'<dt>question_dep</dt><dd>'+deps.map(d=>mono(d.dep_type==="question"?("→ Q"+d.depends_on_question_id):("→ baseline "+bl(d.depends_on_baseline_id).slug))+" "+chip(d.status==="satisfied"?"c-ok":d.status==="blocked"?"c-dead":"c-warn",d.status)).join("<br>")+"</dd>":""}
+    </dl>
+    ${IDEA_NOTES[id]?'<hr class="divider"><div class="small">'+esc(IDEA_NOTES[id])+"</div>":""}
+    ${a?`<hr class="divider">
+      <div><b>${a.verdict==="answered"?"结论":"反驳"}(A${a.id})</b> ${chip(a.verdict==="answered"?"c-ok":"c-bad",a.verdict)} ${app?appBadge(app):'<span class="small">(无 applicability 行 → 无徽标)</span>'}</div>
+      <div style="font-size:12.5px;margin:6px 0">${esc(a.answer_md)}</div>
+      ${app&&app.rationale_md?'<div class="small">回看:'+esc(app.rationale_md)+"</div>":""}
+      <div class="small" style="margin-top:6px">证据(${evs.length} 条,I3):</div>
+      <ul class="tl">${evs.map(e=>`<li><span class="who">${chip("c-line",e.kind)}</span><span class="what">${e.kind==="evaluation"?metricLine(mr(e.metric_result_id))+" · "+esc(e.claim_md):esc(e.claim_md)}</span></li>`).join("")}</ul>
+      <div class="small"><a href="javascript:go('evidence',${a.id})">→ 证据链详情</a></div>`
+    :x.status==="dead_end"?'<hr class="divider"><div class="small">dead_end 关闭须 decision(type=prune_branch):decision #7「两次探索无信号,机制查重命中近邻」。</div>'
+    :""}
+    ${decs.length&&!a?'<hr class="divider"><div class="small">相关决策:'+decs.map(d=>"#"+d.id+" "+esc(d.type)).join(" · ")+"</div>":""}
+  </section>`;
+}
+
+/* ============ Baseline 池 ============ */
+function vPool(){
+  const b = bl(state.selB);
+  if(!b) return emptyPage("Baseline 池","暂无基线（池为空）。");
+  // 对照台：由真 metric_result（aggregate）join 到 variant/metric_def 得出——原型此处焊了两张假 ppl/degradation 排行，已换成真数据（无则空表，不编数字）
+  const results = (DB.metric_result||[]).filter(m=>m.scope==="aggregate").map(m=>{
+    const e2=ev(m.evaluation_id), v=e2&&vr(e2.variant_id), bb=v&&bl(v.baseline_id), def=md(m.metric_id);
+    return { label:(bb?bb.slug:"?")+" / "+(v?v.variant_key:"?"), metric:(def?def.name:("metric#"+m.metric_id)),
+             ver:m.metric_ver, value:m.value, proto:(e2?("lm-wt103@"+e2.protocol_ver):"—"),
+             prov:(bb&&bb.provenance==="external_import")?"external_import":"self_built" };
+  }).filter(r=>r.value!=null).sort((a,c)=>(a.metric<c.metric?-1:a.metric>c.metric?1:(a.value-c.value)));
+  return `
+  <div class="pagehead"><h1>Baseline 池</h1><span class="en">pool · views/pool.md</span></div>
+  <p class="pagesub">三正交维度:结构(baseline)× 训练任务设置(variant)× 评估协议(evaluation)。对照元 = evaluation;跨 baseline 对照必须同协议@版本、同指标(I1/I2);报表必 join provenance,自建与导入不混同(§3.6.3)。</p>
+
+  <div class="grid g12">
+    <section class="card pad0">
+      <table class="t"><thead><tr><th>baseline</th><th>status</th><th>provenance</th><th>parent</th></tr></thead><tbody>
+      ${DB.baseline.map(x=>`<tr class="rowbtn ${state.selB===x.id?"rowsel":""}" onclick="selB(${x.id})">
+        <td>${mono(x.slug)}<div class="hash">${esc(x.canonical_key)}</div></td>
+        <td>${BV_CHIP[x.status]}</td>
+        <td>${x.provenance==="external_import"?chip("c-human","external_import")+' '+chip("c-ok","license allow"):chip("c-line","self_built")}</td>
+        <td>${x.parent_id?mono(bl(x.parent_id).slug):'<span class="small">—(族根)</span>'}</td></tr>`).join("")}
+      </tbody></table>
+    </section>
+
+    <section class="card">
+      <h3>基线卡 ${mono(b.slug)} <span class="en">card · ≤250 tok · 含变体矩阵</span>${BV_CHIP[b.status]}</h3>
+      <dl class="kv">
+        <dt>canonical_key(I5 UNIQUE)</dt><dd>${mono(b.canonical_key)}</dd>
+        <dt>能力摘要</dt><dd>${esc(b.capability_summary)}</dd>
+        <dt>tag(baseline 级)</dt><dd>${b.tags.map(t=>chip("c-line",t)).join(" ")}</dd>
+        ${b.provenance==="external_import"?'<dt>import provenance</dt><dd class="mono" style="font-size:11px">manifest mfa-8e12 · revision 4b7d9aa · license_review #2(Apache-2.0 allow) · <a href="javascript:go(\'import\')">准入链</a></dd>':""}
+      </dl>
+      <div class="tw" style="margin-top:9px">
+      <table class="t"><thead><tr><th>variant_key</th><th>status</th><th>born_question</th><th>evaluation(格子)</th><th>result_summary</th></tr></thead><tbody>
+      ${DB.variant.filter(v=>v.baseline_id===b.id).map(v=>{
+        const es = DB.evaluation.filter(e=>e.variant_id===v.id);
+        return `<tr><td>${mono(v.variant_key)}<div class="hash">env ${v.env_hash}</div></td><td>${BV_CHIP[v.status]}</td>
+        <td>${mono("Q"+v.born_question)}</td>
+        <td>${es.map(e=>'<div class="small">'+mono("lm-wt103@"+e.protocol_ver)+' '+chip(e.status==="success"?"c-ok":e.status==="running"?"c-acc":"c-warn",e.status)+' <span class="hash">'+e.source+" · "+e.target_set_hash+'</span></div>').join("")||'<span class="small">—</span>'}</td>
+        <td class="small">${esc(v.result_summary)}</td></tr>`;}).join("")}
+      </tbody></table></div>
+    </section>
+  </div>
+
+  <div class="grid g2" style="margin-top:12px">
+    <section class="card">
+      <h3>对照台 · 真 metric_result <span class="en">aggregate · variant × 指标</span></h3>
+      <div class="tw"><table class="t"><thead><tr><th>variant</th><th>指标</th><th class="right">value</th><th>协议</th><th>provenance</th></tr></thead><tbody>
+      ${results.length?results.map(r=>`<tr>
+        <td>${mono(r.label)}</td>
+        <td class="small">${esc(r.metric)}@${esc(String(r.ver))}</td>
+        <td class="right num"><b>${esc(String(r.value))}</b></td>
+        <td class="small">${mono(r.proto)}</td>
+        <td class="small"><span class="mono" style="font-size:10px">${esc(r.prov)}</span></td></tr>`).join(""):`<tr><td colspan="5" class="small">暂无 aggregate metric_result</td></tr>`}
+      </tbody></table></div>
+      <div class="small" style="margin-top:6px">复用判定 O(1):测量索引 ${mono("(variant_id, protocol_id, protocol_ver)")};存疑 attempt 被 selector 前置过滤(§4.1.5)。</div>
+    </section>
+    <section class="card">
+      <h3 style="margin-bottom:6px">协议卡 <span class="en">protocol · I1</span></h3>
+      ${DB.protocol.map(p=>`<div class="statebox" style="margin-bottom:7px">
+        ${mono(p.name+"@"+p.version)} <span class="small">derived_from ${mono("Q"+p.derived_from_question)}</span>
+        <div class="hash" style="margin:3px 0">${esc(p.scope_spec_json)}</div>
+        <div>${DB.protocol_metric.filter(m=>m.protocol_ver===p.version).map(m=>{const def=md(m.metric_id);return chip("c-line",(def?def.name:("metric#"+m.metric_id))+"@"+m.metric_ver)+(m.appended_cycle?' <span class="small">c'+m.appended_cycle+' 追加·不升版</span>':"");}).join(" ")}</div>
+      </div>`).join("")}
+      <div class="small">场景(scope_spec)变 → 升 version;加指标 → append protocol_metric 不升版;指标口径变 → 升 metric_def version(§3.3.1)。</div>
+    </section>
+  </div>
+  ${docref('契约对照:三维模型与语义判据三问 = §1.2.2;池八事件 = §4.2.2;对照 join provenance = §3.6.3/§6.9;复用 selector = §4.1.5;基线/变体卡额度 = §4.5.2。')}
+  `;
+}
+
+/* ============ 轮次 ============ */
+function vCycles(){
+  const c = cy(state.selCycle);
+  if(!c) return emptyPage("轮次","暂无轮次（尚未推进）。");
+  const max = Math.max(1, ...DB.ledger_by_cycle.map(x=>x.money||0));   // 空账时 Math.max(1) 避免 -Infinity
+  return `
+  <div class="pagehead"><h1>轮次</h1><span class="en">cycle · advance 幂等步进</span></div>
+  <p class="pagesub">稳态单元 = CYCLE;route 7 形态由编排器派生,reasoning 只产 selection 不写 route(§2.3)。研究失败(idea 不合格 / engineering_blocked)≠ 系统失败:前者 cycle=done + 问题 inconclusive,仅 reasoning 产物非法才 cycle=failed(§4.2.3)。</p>
+
+  <section class="card">
+    <h3>成本 × 轮次 <span class="en">ledger by cycle</span><span style="margin-left:auto" class="small num">累计 $${DB.budget.global_spent} / 全局 $${DB.budget.global_total}</span></h3>
+    <div class="bars">${DB.ledger_by_cycle.map(x=>{const cc=cy(x.cycle);return `<div class="bar ${x.cycle===state.selCycle?"cur":""} ${cc&&cc.status==="failed"?"fail":""}" onclick="selC(${x.cycle})" title="c${x.cycle} $${x.money}"><i style="height:${Math.max((x.money||0)/max*100,3)}%"></i><span>${x.cycle}</span></div>`;}).join("")}</div>
+  </section>
+
+  <div class="grid g12" style="margin-top:12px">
+    <section class="card pad0" style="max-height:520px;overflow-y:auto">
+      <table class="t"><thead><tr><th>c</th><th>route</th><th>Q</th><th>status</th><th class="right">$</th></tr></thead><tbody>
+      ${DB.cycle.map(x=>`<tr class="rowbtn ${x.id===state.selCycle?"rowsel":""}" onclick="selC(${x.id})">
+        <td class="num">${x.id}</td><td>${routeChip(x.route)}</td>
+        <td>${x.active_question_id?mono("Q"+x.active_question_id):"—"}</td>
+        <td>${BV_CHIP[x.status]||esc(x.status)}</td><td class="right num">${x.cost_total.toFixed(1)}</td></tr>`).join("")}
+      </tbody></table>
+    </section>
+    <div class="stack">${cycleDetail(c)}</div>
+  </div>
+  ${docref('契约对照:route 派生矩阵 = §2.3 与《第二部分》§6.13(3);失败语义矩阵 = §4.2.3;bundle 串行与自愈边界 = §3.4;watchdog = §4.4.3;阶段原子提交 = §4.2.5。')}
+  `;
+}
+function cycleDetail(c){
+  let head = `
+  <section class="card">
+    <h3>cycle ${c.id} <span class="en">${c.started_at}</span> ${routeChip(c.route)} ${BV_CHIP[c.status]||esc(c.status)}</h3>
+    <div class="small" style="margin-bottom:8px">${esc(c.note)}</div>
+    ${c.route==="attack"||c.route==="eval_only"?stepper(c):""}
+    ${DB.decision.filter(d=>d.cycle_id===c.id).map(d=>`<div class="small" style="margin-top:4px">${actorChip(d.actor)} ${mono(d.type)} — ${esc(d.summary)}</div>`).join("")}
+  </section>`;
+  // （原型此处按 mock 轮号 c.id===19/11/6/15/9 焊了 6 段演示剧情——含假 telemetry/失败卡等；真数据接入已删，
+  //   真轮次明细由上方 stepper + 真 DB.decision 渲染，不再按魔法轮号贴死剧情）
+  return head;
+}
+function stepper(c){
+  const order=["idea","plan","bundle","reasoning"];
+  const nowIdx = c.status==="done"?4:c.status==="failed"?3:order.indexOf(c.status);
+  return '<div class="stepper">'+order.map((s,i)=>{
+    let cls = i<nowIdx?"done":i===nowIdx?(c.status==="failed"?"fail":"now"):"todo";
+    if(c.route==="eval_only"&&s==="idea") cls=i<nowIdx?"done":cls;
+    return '<span class="step '+cls+'">'+s+(cls==="now"?' ·<span class="dot acc pulse" style="background:#fff"></span>':"")+'</span>';
+  }).join("")+'</div>';
+}
+// （原型的 c19Detail() / obs11Detail() 是按 mock 轮号贴死的演示剧情——含假 telemetry / NaN 日志；真数据接入已连调用一并删）
+
+/* ============ 证据链 ============ */
+function vEvidence(){
+  const a = an(state.selA);
+  if(!a) return emptyPage("结论与证据","暂无结论（尚无 answer）。");
+  const qq = q(a.question_id) || {};
+  const evs = DB.evidence.filter(e=>e.answer_id===a.id);
+  const app = appRowOf(a.id);
+  return `
+  <div class="pagehead"><h1>结论与证据链</h1><span class="en">answer → evidence → metric_result</span></div>
+  <p class="pagesub">证据面板只渲染 answer → evidence → metric_result 链(I3);log / 观测 / 聊天永不进此面板。训练评估产物经只读视图 ${mono("v_metric_result_trajectory")} 一跳可达,供人 / 审计 / 对照——gate 的 authorizer 禁读该视图底表。</p>
+  <div class="grid g12">
+    <section class="card pad0" style="max-height:560px;overflow-y:auto">
+      <table class="t"><thead><tr><th>A</th><th>question</th><th>verdict</th><th>适用性@v2</th></tr></thead><tbody>
+      ${DB.answer.map(x=>{const r=appRowOf(x.id);return `<tr class="rowbtn ${x.id===state.selA?"rowsel":""}" onclick="selA(${x.id})">
+        <td class="num">A${x.id}<div class="hash">c${x.cycle_id} · v${x.goal_ver}</div></td>
+        <td class="small">${mono("Q"+x.question_id)} ${esc(q(x.question_id).text.slice(0,30))}…</td>
+        <td>${chip(x.verdict==="answered"?"c-ok":"c-bad",x.verdict)}</td>
+        <td>${r?appBadge(r):'<span class="small">无行(无徽标)</span>'}</td></tr>`;}).join("")}
+      </tbody></table>
+    </section>
+    <div class="stack">
+      <section class="card">
+        <h3>A${a.id} · ${mono("Q"+qq.id)} ${chip(a.verdict==="answered"?"c-ok":"c-bad",a.verdict)} ${app?appBadge(app):""}</h3>
+        <div class="small" style="margin-bottom:6px">${esc(qq.text)}</div>
+        <div style="font-size:13px">${esc(a.answer_md)}</div>
+        <hr class="divider">
+        <span class="eyebrow">evidence(${evs.length})</span>
+        ${evs.map(e=>{
+          if(e.kind==="evaluation"){
+            const m=mr(e.metric_result_id), e2=ev(m.evaluation_id), a2=at(m.evaluation_attempt_id), v=vr(e2.variant_id), b=bl(v.baseline_id);
+            return `<div class="statebox" style="margin-top:7px">
+              ${chip("c-line","evaluation")} ${metricLine(m)}
+              <div class="hash" style="margin-top:3px">E${e2.id} ${b.slug}/${v.variant_key} · lm-wt103@${e2.protocol_ver} · source=${e2.source} · attempt#${a2.attempt_no}(${a2.purpose})${a2.suspect?' · <span style="color:var(--warn)">suspect</span>':""} · target_set_hash ${e2.target_set_hash}</div>
+              <div class="small" style="margin-top:2px">${esc(e.claim_md)}</div>
+              <div class="hash" style="margin-top:4px">v_metric_result_trajectory → eval: ${trajRefs(m,"eval")} · train: ${trajRefs(m,"train")}</div>
+            </div>`;
+          }
+          if(e.kind==="child_answer"){
+            const ca=an(e.child_answer_id);
+            return `<div class="statebox" style="margin-top:7px">${chip("c-line","child_answer")} A${ca.id}(${mono("Q"+ca.question_id)},${ca.verdict})<div class="small" style="margin-top:2px">${esc(e.claim_md)} — 须来自子树或 satisfied dep(触发器焊死)</div></div>`;
+          }
+          return `<div class="statebox" style="margin-top:7px">${chip("c-line",e.kind)} ${esc(e.claim_md)}</div>`;
+        }).join("")}
+        ${a.id===6?'<div class="callout warn" style="margin-top:9px"><b>负向过滤示例</b>:attempt#1(890.4)被 <span class="mono">parser_result_suspect</span> 拒作证据(gate decision #9);结论只回溯到复现 attempt#2 的 metric_result(905.2)。存疑只挡引用、不支持结论。</div>':""}
+      </section>
+    </div>
+  </div>
+  ${docref('契约对照:I3 与证据多态 = §1.4.3/§3.5.2;gate_close_question 拒绝判据(含 suspect / child_answer 范围 / applicability 负向分支)= §4.1.4;v_metric_result_trajectory = 附录 A 视图;徽标 = §4.5.1。')}
+  `;
+}
+function trajRefs(m,kind){
+  if(m.id===14) return kind==="eval" ? "lg-9be1@…/repro/eval.log" : "lg-77aa@…/t2/train.log";
+  if(m.id===13) return kind==="eval" ? "lg-4c02@…/t2/eval.log" : "lg-77aa@…/t2/train.log";
+  return kind==="eval" ? "lg-…@…/eval.log" : "lg-…@…/train.log";
+}
+
+/* ============ Import 准入 ============ */
+function vImport(){
+  return `
+  <div class="pagehead"><h1>Import 准入链</h1><span class="en">external_candidate → license_review → external_import</span></div>
+  <p class="pagesub">三闸决定「要不要 import」;命中后走准入链 pipeline:发现登记 → 确定性选择 → license → 物化(M4)→ 出厂 eval → pool_publish。选择确定性(I6):候选集按 action_cycle 冻结,按 selection_key 序取第一个 license 通过者;可回放。</p>
+
+  <div class="grid g3">
+    <div class="statebox"><b>闸1 类型门</b><div class="small">按实验角色:局部干预/消融 → 自建(拓扑变也不 import);引入独立 comparator 家族/公认 SOTA → import-eligible。本例:Q5 缺外部参照家族 → 命中。</div></div>
+    <div class="statebox"><b>闸2 状态门(只读)</b><div class="small">连续不理想(visit≥3 或连续 inconclusive≥2)→ 只读外部普查;产物只生成新 idea/question,不在原问题直产 import target。本例:未触发。</div></div>
+    <div class="statebox"><b>闸3 规模缩放</b><div class="small">普查活跃度随 est_cost/score 与 B(t) 缩放(policy)。Q5 est $8 → 中等预算检索,快照 ss-e88a。</div></div>
+  </div>
+
+  <section class="card" style="margin-top:12px">
+    <h3>发现快照(append-only)<span class="en">external_candidate · discovered_cycle=8</span></h3>
+    <div class="tw"><table class="t"><thead><tr><th>rank</th><th>canonical_uri @ revision(pinned)</th><th>license_seen</th><th>license_review</th><th>scope</th></tr></thead><tbody>
+    ${DB.external_candidate.map(c=>{const lr=DB.license_review.find(l=>l.candidate_id===c.id);return `<tr>
+      <td class="num">${c.rank}</td>
+      <td>${mono(c.canonical_uri)}<div class="hash">@${c.revision} · trigger ${c.trigger_kind} · ss ${c.search_snapshot_hash} · tg ${c.trigger_snapshot_hash}</div></td>
+      <td>${mono(c.license_id_seen)}</td>
+      <td>${chip(lr.decision==="allow"?"c-ok":lr.decision==="deny"?"c-bad":"c-warn",lr.decision)} <span class="small">${lr.actor}</span>${lr.note?'<div class="small">'+esc(lr.note)+"</div>":""}</td>
+      <td class="small mono" style="font-size:10px">${lr.scope?["eval","modify","publish_pool","redistribute"].map(k=>(lr.scope["allow_"+k]?"✓":"✗")+k).join(" "):"—"}</td></tr>`;}).join("")}
+    </tbody></table></div>
+  </section>
+
+  <div class="grid g2" style="margin-top:12px">
+    <section class="card">
+      <h3>选择 / 导入事件流 <span class="en">external_import · append-only · I6</span></h3>
+      <ul class="tl">
+      ${DB.external_import.map(x=>{const c=DB.external_candidate.find(z=>z.id===x.candidate_id);return `<li>
+        <span class="when">c${x.action_cycle}</span>
+        <span class="what">${chip(x.action==="imported"?"c-ok":x.action==="rejected_by_license"?"c-bad":x.action==="selected_for_materialization"?"c-warn":"c-line",x.action)}
+        ${mono(c.canonical_uri.split("/").pop())}
+        <div class="hash">cs ${x.candidate_set_hash} · key ${esc(x.selection_key)} · pol ${x.policy_hash}${x.license_decision_snapshot_hash?" · lds "+x.license_decision_snapshot_hash:""}${x.manifest_hash?" · mfa "+x.manifest_hash+" → baseline "+bl(x.baseline_id).slug:""}</div></span></li>`;}).join("")}
+      </ul>
+      <div class="small" style="margin-top:6px">状态机:selected →(冻结 license 快照下)selected_for_materialization / rejected_by_license(取下一个,仍确定性)→ imported / materialize_failed;后到 license 裁定不改既有事件,要用须新 action_cycle 重选(《第二部分》§6.13(4))。</div>
+    </section>
+    <section class="card">
+      <h3>证据归属与降级 <span class="en">provenance · M1–M3</span></h3>
+      <dl class="kv">
+        <dt>evaluation.source</dt><dd>${mono("factory")}(经本系统 harness;<b>不新增 metric source</b>)</dd>
+        <dt>外部性落点</dt><dd>${mono("checkpoint.origin=external_import")} + ${mono("manifest_hash mfa-8e12")}</dd>
+        <dt>manifest 闭包</dt><dd class="small">revision / submodule SHAs / patch_set_hash / LFS·artifact hashes / dependency lock / harness_adapter_hash / build image·env hash / 下载源 / 容器 digest / 运行命令 / 环境变量白名单 / 网络隔离声明</dd>
+        <dt>报表纪律</dt><dd class="small">所有 comparison / report 必 join checkpoint.origin / external_import_id / manifest_hash / revision / license_review_id;论文 reported 数字只作背景,绝不作 factory 证据</dd>
+      </dl>
+      <div class="callout" style="margin-top:9px"><b>M1–M3 降级</b>:只登记 + 审计状态;gate 建 baseline(planned) 占位 + 写 question_dep(baseline)使问题不可调度(处境名 ${mono("import_pending_materialization")},非新增 status);M4 物化注册 legal → dep 机械 satisfied → 问题回 open。本例时间线按 M4+ 展示完整链。</div>
+    </section>
+  </div>
+  ${docref('契约对照:三闸 = §3.3.2;准入链与证据归属 = §3.6.3;I6 选择确定性 = §4.1.6;import/license 状态机 = 《第二部分》§6.13(4);manifest 闭包 = §6.13 供应链闭包。')}
+  `;
+}
+
+/* ============ 人机审计(复盘视图;实时对话在右侧讲解员窗口) ============ */
+function vAudit(){
+  const rows = DB.interaction_message.map(m=>({
+    m,
+    cls: DB.interaction_classification.find(c=>c.message_id===m.id),
+    rep: DB.interaction_reply.find(r=>r.message_id===m.id),
+  }));
+  return `
+  <div class="pagehead"><h1>人机审计</h1><span class="en">interaction_message ⨝ classification ⨝ reply ⨝ directive</span></div>
+  <p class="pagesub">复盘视图:入站 raw 不可变、每消息恰一分类、回复带快照与 grounding 标记。实时讨论在右侧「讲解员」窗口;命令入账在底部输出窗——三者共用同一套 interaction 设计(§4.6.2)。本会话经命令行发送的消息以绿底行追加在表尾。</p>
+  <div class="grid g21">
+    <section class="card pad0">
+      <div class="tw"><table class="t"><thead><tr><th>#</th><th>connector</th><th>raw_text(不可变)</th><th>ACK</th><th>intent</th><th>directive</th><th>reply</th></tr></thead><tbody>
+      ${rows.map(({m,cls,rep})=>{
+        const d = cls&&cls.directive_id ? DB.directive.find(x=>x.id===cls.directive_id) : null;
+        const dst = d ? (d.id===6 ? state.d6 : d.status) : null;
+        return `<tr>
+          <td class="num">${m.id}<div class="hash">${esc(m.received_at)}</div></td>
+          <td>${mono(m.connector)}</td>
+          <td class="small">${esc(m.raw_text)}</td>
+          <td class="num small">${m.ack_s}s</td>
+          <td>${cls?intentChip(cls.intent):"—"}${cls&&cls.note?'<div class="small">'+esc(cls.note)+"</div>":""}</td>
+          <td class="small">${d?mono("d"+d.id+" "+d.kind)+" "+(dst==="consumed"?chip("c-ok","consumed"):dst==="rejected"?chip("c-bad","rejected"):chip("c-warn",String(dst))):"—"}</td>
+          <td class="small">${rep?(rep.responder_kind==="codex"?chip("c-acc","codex"):chip("c-line","模板"))+" "+mono("snap c"+rep.snapshot_cycle)+(rep.grounding_ok?" ✓":" ✗")+'<div>'+esc(rep.reply_text.slice(0,80))+"…</div>":"—"}</td></tr>`;
+      }).join("")}
+      ${state.chatExtra.map(x=>`<tr style="background:var(--accent-bg2)">
+        <td class="num">·<div class="hash">本会话(模拟)</div></td><td>${mono("web")}</td>
+        <td class="small">${esc(x.raw)}</td><td class="num small">0.8s</td>
+        <td>${intentChip(x.intent)}</td>
+        <td class="small">${x.dlabel?mono(x.dlabel)+" "+(x.dstate==="confirmed"?chip("c-warn","pending_effect"):x.dstate==="rejected"?chip("c-bad","rejected"):chip("c-warn","pending_confirmation")):"—"}</td>
+        <td class="small">${x.reply?esc(x.reply.slice(0,80))+"…":"—"}</td></tr>`).join("")}
+      </tbody></table></div>
+    </section>
+    <div class="stack">
+      <section class="card"><h3>中介线程 <span class="en">responder · mode=ro</span></h3>
+        <dl class="kv">
+          <dt>conversation_id</dt><dd>${mono("qq:7742")} ↔ goal 1</dd>
+          <dt>会话重建</dt><dd class="small">杀线程可重建:最近发布 status_card + 同 conversation 最近 N=8 条已消毒入站/出站;唯一持久状态在 interaction_* 表</dd>
+          <dt>输入边界</dt><dd class="small">只拿状态卡文本 + 已分类消毒摘要;无 DB 凭据、不拿 raw 对话(防注入)</dd>
+          <dt>写库</dt><dd class="small">interaction_reply 由 daemon 单写队列写,非 Codex;authorizer 禁应答器写</dd>
+        </dl></section>
+      <section class="card"><h3>grounding 校验(非门禁)</h3>
+        <ul class="tl">
+          <li><span class="what small">✓ 不得声称状态卡外的事实</span></li>
+          <li><span class="what small">✓ 不得宣称状态变更已执行</span></li>
+          <li><span class="what small">✓ 不得引 log / interaction 作 evidence</span></li>
+          <li><span class="what small">✓ 不得自行生成 directive;不过 → 退模板</span></li>
+        </ul></section>
+      <section class="card"><h3>SLA(v1)</h3>
+        <dl class="kv">
+          <dt>ACK</dt><dd class="num">p95 1.1s <span class="chip c-ok">&lt; 2s ✓</span></dd>
+          <dt>query</dt><dd class="num">p95 1.6s <span class="chip c-ok">&lt; 2s ✓</span>(基于发布快照)</dd>
+          <dt>directive</dt><dd class="small">不承诺抢占;只承诺入账 + 回显生效时机</dd>
+        </dl></section>
+    </div>
+  </div>
+  ${docref('契约对照:入站流水与三分类 = §4.6.2;continue 特例与润色时序 = §4.6.2;中介重建 = 《第二部分》§6.8;query 不写 decision = §4.3.2。')}
+  `;
+}
+function intentChip(i){
+  return ({query:chip("c-acc","query"),directive:chip("c-human","directive"),note:chip("c-line","note"),unclear:chip("c-warn","unclear")})[i]||"";
+}
+/* ============ 指令与请求 ============ */
+function vDirectives(){
+  return `
+  <div class="pagehead"><h1>指令与请求</h1><span class="en">directive inbox · 文件请求 · 通知矩阵</span></div>
+  <p class="pagesub">P5:人不直接改库——一切介入经 DIRECTIVE 收件箱,门禁在指定时机消费,与系统同记一本 DECISION 账。软指令可被有理由地不从(理由入 DECISION);硬指令确认后按时机生效。</p>
+
+  <section class="card pad0">
+    <div class="tw"><table class="t"><thead><tr><th>d</th><th>kind</th><th>硬/软</th><th>status</th><th>consume_at</th><th>润色稿(payload_json)</th><th>效果</th></tr></thead><tbody>
+    ${DB.directive.map(d=>{
+      const st = d.id===6 ? (state.d6==="applied"?"consumed":state.d6==="rejected"?"rejected":"pending") : d.status;
+      return `<tr>
+      <td>${mono("d"+d.id)}<div class="hash">msg#${d.source_interaction_message_id} · c${d.created_cycle}${d.consumed_cycle?"→c"+d.consumed_cycle:""}</div></td>
+      <td>${mono(d.kind)}</td>
+      <td>${d.hardness==="hard"?chip("c-human","hard"):chip("c-line","soft")}</td>
+      <td>${st==="consumed"?chip("c-ok","consumed"):st==="rejected"?chip("c-bad","rejected"):chip("c-warn","pending")}${d.payload&&d.payload.confirmed===false?'<div class="small">confirmed:false</div>':d.payload&&d.payload.confirmed===true?'<div class="small">confirmed:true</div>':""}</td>
+      <td>${mono(d.consume_at)}</td>
+      <td class="small">${esc((d.payload&&d.payload.polished)||"")}</td>
+      <td class="small">${esc(d.effect)}</td></tr>`;}).join("")}
+    </tbody></table></div>
+  </section>
+
+  <div class="grid g2" style="margin-top:12px">
+    <section class="card">
+      <h3>消费时机矩阵 <span class="en">§4.6.4</span></h3>
+      <div class="tw"><table class="t"><thead><tr><th>类型</th><th>指令</th><th>消费时机</th></tr></thead><tbody>
+        <tr><td>立即生效(硬)</td><td class="mono" style="font-size:11px">set_budget / pause / resume / abort_cycle</td><td>立即 / 阶段边界</td></tr>
+        <tr><td>轮始(软为主)</td><td class="mono" style="font-size:11px">inject_question(软) / reprioritize(pin硬,boost/suppress软) / prune_branch(硬) / goal_amend(硬) / note(软)</td><td>下一轮 reasoning 开头</td></tr>
+      </tbody></table></div>
+      <div class="callout" style="margin-top:10px">
+        <b>文件请求(§4.6.8,当前)</b>:${(()=>{                       // 由真 interaction_request 表驱动（不再焊死 r1/r2 演示剧情）
+          const reqs=DB.interaction_request||[], pend=reqs.filter(r=>r.status==="pending")[0];
+          if(pend) return "r"+pend.id+" pending:「"+esc((pend.summary_md||"").slice(0,140))+"」→ "+chip("c-warn","全局等待:只停研究推进（用户放入 uploads/ 后经命令行入站恢复）");
+          const last=reqs.slice().reverse()[0];
+          return last ? ("无 pending 请求。最近:r"+last.id+"（"+esc(last.status)+"）") : "无 pending 请求。";
+        })()}
+        <div class="small" style="margin-top:6px">防滥用:请求单 schema 强制披露「已尝试路径+失败原因」;同 goal 至多一张 pending 单(uq_ireq_one_pending);开关/上限/提醒在 policy.interaction_request;文件是输入资产、非 evidence;请求/答复不写 decision。</div>
+      </div>
+    </section>
+    <section class="card">
+      <h3>interaction_request 表 <span class="en">§4.6.8 · pending→resolved|cancelled(终态须 provenance)</span></h3>
+      <div class="tw"><table class="t"><thead><tr><th>id</th><th>stage/cycle</th><th>status</th><th>摘要</th><th>resolution</th></tr></thead><tbody>
+      ${DB.interaction_request.map(r=>`<tr><td>${mono("r"+r.id)}</td><td class="small">${esc(r.stage)} / c${r.cycle_id}</td><td>${r.status==="pending"?chip("c-warn","pending"):r.status==="resolved"?chip("c-ok","resolved"):chip("c-dead","cancelled")}</td><td class="small">${esc(r.summary_md.slice(0,64))}…</td><td class="small">${r.resolution?esc(r.resolution.map(x=>x.provided?("#"+x.no+" → "+x.provided+"("+x.hash+")"):("#"+x.no+" unavailable")).join(" · "))+" · msg#"+r.resolved_message_id:"—"}</td></tr>`).join("")}
+      </tbody></table></div>
+    </section>
+    <section class="card">
+      <h3>通知流 <span class="en">事件 → 通道;outbox 幂等</span></h3>
+      <ul class="tl" style="max-height:340px;overflow-y:auto;display:block">
+        ${DB.notification.slice().reverse().map(n=>`<li><span class="when">${esc(n.at)}</span><span class="who">${mono(n.channel)}</span><span class="what">${evChip(n.event)} ${esc(n.text)}</span></li>`).join("")}
+      </ul>
+      <div class="small" style="margin-top:6px">directive 全生命周期外显:received / classified / pending_confirmation(展示润色稿)/ pending_effect(预计消费点)/ applied(consumed_cycle+效果)/ rejected(附 DECISION 理由)/ superseded;叠加四类推送与 applicability 变更。</div>
+    </section>
+  </div>
+  ${docref('契约对照:指令分类与消费时机 = §4.6.4;通知矩阵 = §4.6.6;文件请求 = §4.6.8(interaction_request · 全局等待 · uploads→托管区);润色确认流水 = §4.6.2。')}
+  `;
+}
+
+/* ============ 决策账 · 台账 ============ */
+function vLedger(){
+  const f = state.actorFilter;
+  const rows = DB.decision.filter(d=>f==="all"||d.actor===f);
+  return `
+  <div class="pagehead"><h1>决策账 · 台账</h1><span class="en">DECISION · LEDGER · append-only</span></div>
+  <p class="pagesub">三层分清(§4.3):运行证据层(log/观测)只解释;DECISION 只记研究决策(query/reply/ACK 不入);LEDGER 记成本。全部 append-only,给定 policy_hash 与冻结输入可回放。</p>
+  <div class="grid g21">
+    <section class="card">
+      <h3>DECISION 流 <span class="en">actor ∈ agent/gate/judge/human/orchestrator</span>
+        <span style="margin-left:auto;display:flex;gap:4px">${["all","agent","gate","judge","human","orchestrator"].map(a=>`<button class="btn ${f===a?"":"gray"}" style="padding:2px 8px;font-size:11px" onclick="setActor('${a}')">${a}</button>`).join("")}</span></h3>
+      <ul class="tl">
+        ${rows.map(d=>`<li><span class="when">c${d.cycle_id} · #${d.id}</span><span class="who">${actorChip(d.actor)}</span><span class="what">${mono(d.type)} — ${esc(d.summary)}</span></li>`).join("")}
+      </ul>
+    </section>
+    <div class="stack">
+      <section class="card">
+        <h3>预算三消费 <span class="en">LEDGER</span></h3>
+        <dl class="kv">
+          <dt>① 采集打分成本项</dt><dd class="small">cost_norm 进 R3 四元打分</dd>
+          <dt>② 单轮预算 B(t)</dt><dd class="num">$${DB.budget.B_t}${(DB.policy&&DB.policy.budget)?("(B0 $"+DB.policy.budget.B0+" · 每 "+DB.policy.budget.doubling_period_m+"m 翻倍 · 封顶 $"+DB.policy.budget.B_max+")"):""}</dd>
+          <dt>③ 全局判停</dt><dd><div class="num">$${DB.budget.global_spent} / ${DB.budget.global_total!=null?("$"+DB.budget.global_total):"关闭(session_max=null)"}</div>
+            <div class="meter"><i style="width:${(DB.budget.global_total?DB.budget.global_spent/DB.budget.global_total*100:0).toFixed(0)}%"></i></div></dd>
+        </dl>
+      </section>
+      <section class="card">
+        <h3>runner_call(当前)</h3>
+        ${DB.runner_call_live ? `<dl class="kv">
+          <dt>#${esc(String(DB.runner_call_live.id))}</dt><dd>${mono("phase="+(DB.runner_call_live.phase||"—")+" · "+(DB.runner_call_live.status||"—"))}</dd>
+          <dt>purpose</dt><dd class="small">${esc(DB.runner_call_live.purpose||"—")}</dd>
+          <dt>transcript</dt><dd class="hash">${esc(DB.runner_call_live.transcript_ref||"—")}</dd>
+          <dt>phase 枚举</dt><dd class="hash">idea / plan / bundle / reasoning / audit / watchdog / orchestrator / interaction_query / import_search</dd>
+        </dl>` : `<div class="small">无活跃 runner_call（轮间空闲或等待用户供给）。</div>`}
+      </section>
+      <section class="card">
+        <h3>审计回放(P6)</h3>
+        <div class="small">decision / ledger / runner_call + 内容寻址快照(检索 / import 选择 / wildidea 隐藏上下文)全 append-only;同 policy_hash + 冻结输入 → 回放即重算同一决策。独立审计只消费、不改写真相。</div>
+      </section>
+    </div>
+  </div>
+  ${docref('契约对照:三层账本 = §4.3;DECISION 写入点与边界 = §4.3.2;LEDGER 三消费 = §4.3.3;回放 = §4.3.4。')}
+  `;
+}
+
+/* ============ Goal · 策略 ============ */
+function vGoal(){
+  const topOpen=(DB.question||[]).filter(x=>x.status==="open").sort((a,b)=>(b.score||0)-(a.score||0))[0];   // 真 open 最高分（判据①）
+  const topScore=topOpen?topOpen.score:null, spent=DB.budget.global_spent, total=DB.budget.global_total;
+  return `
+  <div class="pagehead"><h1>Goal · 策略</h1><span class="en">goal 版本链 · 适用性审计 · policy.yaml</span></div>
+  <p class="pagesub">goal append-only:改目标 = INSERT 新 version(经 goal_amend 硬指令)。不批量重开已关问题——走适用性审计三步闭环(§4.6.4)。全部数值旋钮只在 policy.yaml(P2)。</p>
+  <div class="grid g2">
+    <div class="stack">
+      ${DB.goal.slice().reverse().map(g=>`
+      <section class="card">
+        <h3>goal v${g.version} ${g.version===2?chip("c-acc","当前"):chip("c-dead","已被 v2 继承")}<span class="en">${g.version===2?"c16 · directive d2":"初始"}</span></h3>
+        <div style="font-size:13px">${esc(g.text)}</div>
+        <div class="hash" style="margin-top:6px">predicate_json ${esc(g.predicate_json)}</div>
+        ${g.version===2?'<div class="small" style="margin-top:5px">provenance:d2 ← interaction_message #5(触发器焊死回指);open 问题 goal_ver 原地迁移 + 重打分;closed 结论走审计 →</div>':""}
+      </section>`).join("")}
+      <section class="card">
+        <h3>适用性审计 <span class="en">answer_applicability @ goal v2</span></h3>
+        <div class="tw"><table class="t"><thead><tr><th>answer</th><th>徽标</th><th>rationale</th></tr></thead><tbody>
+        ${DB.answer_applicability.map(r=>{const a=an(r.answer_id);return `<tr>
+          <td>${mono("A"+a.id)} <span class="small">(Q${a.question_id})</span></td>
+          <td>${appBadge(r)}</td><td class="small">${esc(r.rationale_md)}</td></tr>`;}).join("")}
+        </tbody></table></div>
+        <div class="legend" style="margin-top:8px">六枚举:
+          <span class="appb pending">pending</span><span class="appb blocked">blocked</span><span class="appb still">still_applicable</span>
+          <span class="appb needs">needs_revalidation→QN</span><span class="appb contradicted">contradicted</span><span class="appb obsolete">obsolete</span>
+        </div>
+        <div class="small" style="margin-top:6px">回看不级联作废测量:applicability 只作用于 answer 的复用与呈现,metric_result / evaluation 复用判定不受影响(§4.6.4 硬边界)。A4 无行 → 无徽标、不占额度(§4.5.1)。</div>
+      </section>
+      <section class="card">
+        <h3>终止三判据 τ <span class="en">§4.4.6 · 任一满足即停机</span></h3>
+        <dl class="kv">
+          <dt>① 分数地板</dt><dd class="num">open 最高分 ${topScore==null?"—":esc(String(topScore))} &gt; τ 0.25 ${(topScore!=null&&topScore>0.25)?'<span class="chip c-line">未触发</span>':'<span class="chip c-warn">近阈</span>'}</dd>
+          <dt>② 全局预算</dt><dd class="num">$${spent} / ${total!=null?("$"+total):"关闭"}${total?"("+(spent/total*100).toFixed(0)+"%)":""} ${total==null?'<span class="chip c-line">关闭</span>':(spent<total?'<span class="chip c-line">未触发</span>':'<span class="chip c-warn">检视</span>')}</dd>
+          <dt>③ 目标谓词</dt><dd class="small">由 goal predicate 判定（详见 goal 定义与「结论与证据」）<span class="chip c-line">见 predicate_json</span></dd>
+        </dl>
+        <div class="small" style="margin-top:5px">停机 = selection.intent=terminate(next_question_id=NULL 持久标志)+人类确认(判据③)。</div>
+      </section>
+    </div>
+    <section class="card">
+      <h3>启动输入(四件套)<span class="en">§4.6.7 · 用户初始供给契约</span></h3>
+      <dl class="kv">
+        <dt>① 研究目标书</dt><dd>${mono("input/goal_brief.md")}(YAML frontmatter 必含 predicate_json,缺失/非法 → <b>启动失败</b>;正文=目标+研究说明)<a href="javascript:fsOpen('input/goal_brief.md')" class="small"> → 查看</a></dd>
+        <dt>② 现状文件夹</dt><dd>${mono("input/corpus/")}(数据集/文献/既有代码结果;<b>只读</b>,DB 记 path+hash;代码/模型入池必须走 claim/register 或 import 门禁)</dd>
+        <dt>③ 资源声明</dt><dd>${mono("policy.resources")} = 4×GPU · 80GB 显存 · 500GB 磁盘(只放硬件事实;时限唯一归 flow.watchdog)</dd>
+        <dt>④ policy 默认值</dt><dd>附录 C 全旋钮带默认值,用户只改想改的(右侧)</dd>
+      </dl>
+      <div class="small" style="margin-top:5px">goal v1 由编排器初始化建立(state:create_goal + DECISION(goal_bootstrap));运行期补交文件走文件请求 → ${mono("input/user_provided/")}(§4.6.8)。</div>
+    </section>
+    <section class="card">
+      <h3>policy.yaml(全量旋钮)<span class="en">附录 C · 版本入 Git · 每旋钮带默认值</span></h3>
+      ${Object.entries(DB.policy).map(([k,v])=>`
+        <div style="margin-bottom:9px">
+          <span class="eyebrow">${esc(k)}</span>
+          <div class="hash" style="font-size:11px;white-space:pre-wrap;line-height:1.8">${esc(typeof v==="string"?v:JSON.stringify(v,null,0).replace(/[{}"]/g,"").replace(/,/g," · "))}</div>
+        </div>`).join("")}
+      <div class="callout warn"><b>OPEN #5</b>:observation 节未入附录 C(parser 阈值旋钮已在 §4.7 声明);随 M4 真 parser 落地补全。本原型此处展示为占位。</div>
+    </section>
+  </div>
+  ${docref('契约对照:goal_amend 五步 = §4.6.4;applicability 三步闭环与硬边界 = §4.6.4;policy 全量 = 附录 C;终止判据 = §4.4.6。')}
+  `;
+}
+
+/* ============ v2:落盘树 / 文件预览 / 输出流(字符串构建层) ============ */
+function fsHTML(list, prefix){
+  return list.map(item=>{
+    const path = prefix ? prefix + "/" + item.p : item.p;
+    if(item.d){
+      const open = state.fs.expand.has(path);
+      return `<div class="fsrow dir" onclick="fsToggle('${path}')"><span class="fscaret">${open?"▾":"▸"}</span><span class="fsname">${esc(item.p)}/</span></div>`
+        + (open ? `<div class="fskids">${fsHTML(item.d, path)}</div>` : "");
+    }
+    return `<div class="fsrow ${state.fs.sel===path?"on":""}" onclick="fsOpen('${path}')"><span class="fscaret"></span><span class="fsname">${esc(item.p)}</span>${FILE_LIVE.has(path)?'<span class="fslive" title="流式写入中"></span>':""}</div>`;
+  }).join("");
+}
+function previewHTML(p){
+  const f = FILE_CONTENT[p] || { body:"(原型未挂载此文件的模拟内容)" };
+  const jump = f.panel
+    ? `<button class="btn ghost" onclick="jumpPanel('${f.panel}',${f.arg!=null?f.arg:"null"})">→ 相关面板:${esc(f.panelLabel||f.panel)}</button>` : "";
+  return `<div class="pvhead"><span class="path">${esc(p)}</span>
+      <span style="margin-left:auto;display:flex;gap:8px;flex:none">${jump}<button class="btn gray" onclick="closePreview()">关闭 ×(Esc)</button></span></div>
+    <div class="pvbody"><pre class="rawlog" style="white-space:pre-wrap">${esc(f.body)}</pre></div>
+    <div class="pvnote">${esc(f.note||"落盘镜像为只读;文件由 DB 的 path+hash 索引与校验(§5.0)。")} <span class="mono">· 模拟内容</span></div>`;
+}
+
+const MAX_STREAM = 400, FOLLOW_SLOP = 40;
+const FILTER_GROUPS = { all:null, advance:["advance"], gate:["gate"], notify:["notify"],
+                        runner:["runner","heartbeat"], directive:["directive"], cmd:["cmd","reply"] };
+const FILTER_LABELS = { all:"全部", advance:"推进", gate:"门禁", notify:"通知", runner:"runner", directive:"指令", cmd:"命令" };
+function streamAtBottom(el){ return (el.scrollHeight - el.scrollTop - el.clientHeight) < FOLLOW_SLOP; }
+function hiddenAttr(k){
+  const g = FILTER_GROUPS[state.stream.filter];
+  return (g && !g.includes(k)) ? "hidden" : "";
+}
+function streamLineHTML(e){
+  return `<div class="sline k-${e.k}" data-k="${e.k}" ${hiddenAttr(e.k)}><span class="st">${esc(e.t||"")}</span><span class="sk">${e.k}</span><span class="sx">${e.html || esc(e.text||"")}</span></div>`;
+}
+function buildStreamHistory(){
+  const out = [];
+  DB.cycle.forEach(c=>{
+    out.push({ t:c.started_at, k:"advance", text:"cycle "+c.id+" start · route="+(c.route||"worker")+(c.active_question_id?" · Q"+c.active_question_id:"") });
+    DB.decision.filter(d=>d.cycle_id===c.id).forEach(d=>{
+      out.push({ t:c.started_at, k:(d.actor==="gate"||d.actor==="judge")?"gate":"advance",
+                 text:"#"+d.id+" "+d.actor+" "+d.type+" — "+String(d.summary||"").slice(0,72) });   // 真数据 summary 可空
+    });
+    if(c.status!=="bundle"){ const note=c.note||"";                                                  // 真数据 note 可空
+      out.push({ t:c.started_at, k:"advance", text:"cycle "+c.id+" → "+c.status+"("+note.slice(0,56)+(note.length>56?"…":"")+")" }); }
+  });
+  DB.notification.forEach(n=>{
+    out.push({ t:n.at, k:String(n.event||"").indexOf("directive")===0?"directive":"notify", text:"["+(n.event||"")+"] "+(n.text||"") });
+  });
+  // （原型此处焊了 9 行假 runner/heartbeat telemetry 作演示——真数据接入已删；事件流仅由真 cycle/decision/notification 铺成）
+  out.sort((a,b)=> a.t<b.t ? -1 : a.t>b.t ? 1 : 0);
+  return out;
+}
+/* ============================ v2 交互与启动 ============================ */
+/* 铁律:render() 只许触碰 #topstat / #scen / #stagetabs / #stage-page 四处;
+   #fstree(fsRefresh)/#stream(appendStream)/#narrlog(appendNarrator)/#cmdin/#narrin 为持久区。 */
+
+const NAV = [
+  ["tree","问题树","canvas"], ["pool","Baseline 池","pool"], ["cycles","轮次","cycles"],
+  ["evidence","结论与证据","evidence"], ["import","Import 准入","import"], ["directives","指令与请求","directives"],
+  ["ledger","决策账 · 台账","ledger"], ["goal","Goal · 策略","goal"], ["audit","人机审计","audit"],
+];
+const VIEWS = { pool:vPool, cycles:vCycles, evidence:vEvidence, import:vImport,
+                directives:vDirectives, ledger:vLedger, goal:vGoal, audit:vAudit };
+
+function renderTopbar(){
+  const scen = SCENARIOS[state.scenario], sc = DB.status_card||{};
+  document.getElementById("topstat").innerHTML =
+    `<span class="tchip">goal <b>${esc("v"+(sc.goal_ver!=null&&sc.goal_ver!==""?sc.goal_ver:"?"))}</b></span>
+     <span class="tchip">cycle <b class="num">${esc(String(sc.snapshot_cycle!=null?sc.snapshot_cycle:"—"))}</b> · <span class="mono">${esc((sc.cycle_route||"—")+" · "+(sc.cycle_status||"—"))}</span></span>
+     <span class="tchip">B(t) <b class="num">$${DB.budget.B_t}</b> · 已花 <b class="num">$${DB.budget.cycle_spent}</b></span>
+     <span class="tchip"><span class="dot ${scen.idle?"dead":"acc"} ${scen.idle?"":"pulse"}"></span>心跳 <b>${esc(scen.idle?"—":scen.heartbeat_age)}</b></span>`;
+  // 场景切换器是 mock 演示件（人手翻三态 live）；真数据模式只有一个真状态 → 显示真状态标签，不给切换按钮
+  document.getElementById("scen").innerHTML = LIVE_MODE
+    ? `<span class="mono" style="font-size:11px;opacity:.75">${esc(scen.label||scen.mode||"")}</span>`
+    : Object.entries(SCENARIOS).map(([k,s])=>
+        `<button class="${state.scenario===k?"on":""}" onclick="setScen('${k}')" title="模拟场景切换(仅影响 live 展示)">${s.label}</button>`).join("");
+}
+function renderTabs(){
+  document.getElementById("stagetabs").innerHTML = NAV.map(([k,zh,en])=>
+    `<button class="${state.tab===k?"on":""} ${k==="tree"?"main-tab":""}" onclick="go('${k}')">${zh}<span class="en">${en}</span></button>`).join("");
+}
+function renderStage(){
+  const page = document.getElementById("stage-page");
+  if(state.tab==="tree"){
+    page.innerHTML = `<div class="cvroot">${bandHTML()}${canvasHTML()}</div>`;
+    canvasBind();
+    canvasRestore();
+  } else {
+    page.innerHTML = `<div class="page">${VIEWS[state.tab]()}</div>`;
+    page.scrollTop = 0;
+  }
+}
+function render(){ renderTopbar(); renderTabs(); renderStage(); }
+
+function go(tab, arg){
+  state.tab = tab;
+  if(tab==="tree"     && arg!=null){ state.selQ=arg; state.canvas.drawerQ=arg; }
+  if(tab==="evidence" && arg!=null) state.selA = arg;
+  if(tab==="cycles"   && arg!=null) state.selCycle = arg;
+  closePreview();
+  render();
+  if(tab==="tree" && arg!=null) canvasCenterOn(arg);
+}
+function selB(id){ state.selB=id; render(); }
+function selC(id){ state.selCycle=id; render(); }
+function selA(id){ state.selA=id; render(); }
+function setActor(a){ state.actorFilter=a; render(); }
+function setScen(k){
+  state.scenario = k;
+  streamSetScenario();
+  emitEvent({ k:"notify", text:"演示场景切换 → "+SCENARIOS[k].label+"(模拟,仅影响 live 展示)" });
+  render();
+}
+
+function toast(msg){
+  const t=document.createElement("div"); t.className="toast"; t.textContent=msg;
+  document.body.appendChild(t); setTimeout(()=>t.remove(),3200);
+}
+
+/* ---------------- 落盘树 / 文件预览 ---------------- */
+function fsRefresh(){
+  const el = document.getElementById("fstree"); if(!el) return;
+  const st = el.scrollTop;
+  const tree = (typeof DB!=="undefined" && DB.fs) ? DB.fs : FS;   // 真模式用 server 真文件树(DB.fs)，未连线 demo 回退 mock FS
+  const note = (typeof DB!=="undefined" && DB.fs) ? "work/ 运行产物 + schemas/prompts/policies/input 只读镜像;点击文件经 /api/file 拉真内容(白名单)。"
+                                                  : "db/ = 唯一真相(SQLite);views/ 与卡片可重建;大文件只引用不复制(path+hash)。点击文件看模拟内容。";
+  el.innerHTML = `<div class="fstitle">落盘镜像(只读)</div>` + fsHTML(tree, "") + `<div class="fsnote">${note}</div>`;
+  el.scrollTop = st;
+}
+function fsToggle(p){
+  state.fs.expand.has(p) ? state.fs.expand.delete(p) : state.fs.expand.add(p);
+  fsRefresh();
+}
+function fsOpen(p){ state.fs.sel = p; fsRefresh(); openPreview(p); }
+function openPreview(p){ state.preview = p; document.getElementById("preview").innerHTML = previewHTML(p); }
+function closePreview(){
+  state.preview = null;
+  const el = document.getElementById("preview"); if(el) el.innerHTML = "";
+}
+function jumpPanel(panel, arg){ closePreview(); go(panel, arg==null?undefined:arg); }
+
+/* ---------------- 输出记录窗口(dock) ---------------- */
+function dockToggle(){
+  state.dockFolded = !state.dockFolded;
+  const d = document.getElementById("dock");
+  if(d && d.classList) d.classList.toggle("folded", state.dockFolded);
+  const b = document.getElementById("dockfoldbtn");
+  if(b) b.textContent = state.dockFolded ? "展开 ▴" : "收起 ▾";
+}
+function renderFilterChips(){
+  const el = document.getElementById("sfilter"); if(!el) return;
+  el.innerHTML = Object.keys(FILTER_GROUPS).map(g=>
+    `<button class="fchip ${state.stream.filter===g?"on":""}" onclick="setStreamFilter('${g}')">${FILTER_LABELS[g]}</button>`).join("");
+}
+function setStreamFilter(g){
+  state.stream.filter = g;
+  renderFilterChips();
+  const el = document.getElementById("stream"); if(!el || !el.children) return;
+  const grp = FILTER_GROUPS[g];
+  for(const c of Array.from(el.children)){
+    const k = c.dataset ? c.dataset.k : null;
+    if(k==null) continue;
+    c.hidden = !!(grp && grp.indexOf(k)===-1);
+  }
+  if(streamAtBottom(el)) el.scrollTop = el.scrollHeight;
+}
+function nowStr(){
+  const s = state.stream;
+  return "07-05 " + String(s.hh).padStart(2,"0") + ":" + String(s.mm).padStart(2,"0");
+}
+function appendStream(e){
+  const el = document.getElementById("stream"); if(!el) return;
+  const stick = streamAtBottom(el);
+  state.stream.seq++;
+  if(!e.t) e.t = nowStr();
+  el.insertAdjacentHTML("beforeend", streamLineHTML(e));
+  while(el.children && el.children.length > MAX_STREAM && el.firstElementChild) el.removeChild(el.firstElementChild);
+  if(stick) el.scrollTop = el.scrollHeight;
+}
+/* 统一事件汇合点:落输出流一行;带 narr 则讲解员自动插解说 */
+function emitEvent(e){
+  appendStream(e);
+  if(e.narr) appendNarrator({ role:"narr", html:e.narr });
+}
+function streamSeed(){
+  buildStreamHistory().forEach(appendStream);
+  const el = document.getElementById("stream");
+  if(el) el.scrollTop = el.scrollHeight;
+}
+function streamSetScenario(){
+  if(state.stream.timer){ clearInterval(state.stream.timer); state.stream.timer = null; }
+  if(HEADLESS || LIVE_MODE || state.scenario!=="running") return;   // 真数据模式不跑 mock 假 ticker（改 streamSyncReal 增量真事件）
+  state.stream.timer = setInterval(streamTick, 5000);
+}
+let tickFlip = false;
+function streamTick(){
+  const s = state.stream;
+  s.mm += 1; if(s.mm>=60){ s.mm=0; s.hh=(s.hh+1)%24; }
+  tickFlip = !tickFlip;
+  if(tickFlip){
+    emitEvent({ k:"heartbeat", text:"[watchdog] transcript mtime "+(2+Math.floor(Math.random()*7))+"s ago · pid alive · gpu util 9"+Math.floor(Math.random()*8)+"%" });
+  } else {
+    s.step += 40;
+    s.loss = Math.max(2.2, s.loss - 0.002 - Math.random()*0.004);
+    emitEvent({ k:"runner", text:"step "+String(s.step).padStart(5,"0")+"/24000  loss "+s.loss.toFixed(4)+"  lr 8.1e-4  tok/s 51."+Math.floor(Math.random()*9)+"k" });
+  }
+}
+
+/* ---------------- 命令行(入账 → 三分类 → directive;§4.6.2) ---------------- */
+let extraSeq = 100;
+function sendCmd(textArg){
+  const inp = document.getElementById("cmdin");
+  const t = (textArg!=null ? textArg : (inp && inp.value || "")).trim();
+  if(!t) return;
+  if(inp) inp.value = "";
+  emitEvent({ k:"cmd", html:"<b>&gt; "+esc(t)+"</b>" });
+  const x = classify(t); x.id = ++extraSeq; x.raw = t;
+  state.chatExtra.push(x);
+  emitEvent({ k:"cmd", text:"ACK 0.8s ✓ 已入账 interaction_message(ik-"+(1000+x.id)+")· 分类 → "+x.intent });
+  if(x.intent==="query"){
+    emitEvent({ k:"reply", html:(x.template?chip("c-line","模板"):chip("c-acc","codex 中介"))+" "+esc(x.reply)+' <span class="hash">snapshot_cycle=18 · grounding ✓</span>' });
+  } else if(x.intent==="note"){
+    emitEvent({ k:"notify", text:"note 入队:"+(x.note||t),
+      narr:"你的 note 已入队,下一轮 reasoning 开头消费;note 是软注解,不改状态、不写 decision。" });
+  } else if(x.intent==="unclear"){
+    emitEvent({ k:"reply", html:chip("c-warn","unclear")+" "+esc(x.reply||"") ,
+      narr:"这条消息分类置信度低,被登记为待确认(directive_pending):系统不自动答、也不自动改状态。想细聊可以在我这儿说清意图,我帮你草拟。" });
+  } else if(x.intent==="directive"){
+    if(x.dstate==="ask"){
+      emitEvent({ k:"directive",
+        html: chip("c-human", x.dlabel) + " " + chip("c-warn","pending_confirmation")
+          + " 润色稿:" + esc(x.polish)
+          + ` <span id="cmdln-${x.id}"><button class="btn" style="padding:1px 8px;font-size:11px" onclick="confirmCmd(${x.id})">确认</button> <button class="btn gray" style="padding:1px 8px;font-size:11px" onclick="rejectCmd(${x.id})">取消</button></span>`,
+        narr:"这是一条<b>硬指令</b>("+esc(x.dlabel)+"):先建 pending directive(payload 携润色稿),回显待确认——确认前不会改任何状态(consume_directive 拒未确认硬指令)。在输出窗点「确认」即可。" });
+    } else {
+      emitEvent({ k:"directive",
+        html: chip("c-human", x.dlabel) + " " + chip("c-warn","pending_effect") + " " + esc(x.polish||"") + "(软指令入队,下一轮 reasoning 开头消费)",
+        narr:"软指令已入队:"+esc(x.polish||t)+"。系统可有理由地不从,不从时理由会写进 DECISION 并通知你。" });
+    }
+  }
+  if(state.tab==="audit") render();
+}
+function confirmCmd(id){
+  const x = state.chatExtra.find(z=>z.id===id); if(!x || x.dstate!=="ask") return;
+  x.dstate = "confirmed";
+  const box = document.getElementById("cmdln-"+id);
+  if(box) box.innerHTML = chip("c-ok","confirmed=true → pending_effect");
+  emitEvent({ k:"directive", text:x.dlabel+" 已确认 → pending_effect(到消费时机生效;模拟,不落库)",
+    narr:"已确认。指令现在排在收件箱,到消费点(立即/阶段边界/轮始)才生效;生效时会有 applied 通知与 DECISION 记账。" });
+  if(state.tab==="audit"||state.tab==="directives") render();
+}
+function rejectCmd(id){
+  const x = state.chatExtra.find(z=>z.id===id); if(!x || x.dstate!=="ask") return;
+  x.dstate = "rejected";
+  const box = document.getElementById("cmdln-"+id);
+  if(box) box.innerHTML = chip("c-bad","rejected(不消费)");
+  emitEvent({ k:"directive", text:x.dlabel+" 已取消 → rejected(raw 原文仍在 interaction_message)(模拟)" });
+  if(state.tab==="audit"||state.tab==="directives") render();
+}
+
+/* 关键词模拟分类器(真实实现 =《第二部分》§6.8 classifier;此处仅演示三分类行为) */
+function classify(t){
+  const num = (t.match(/(\d+(?:\.\d+)?)/)||[])[1];
+  if(/继续|接着跑|接着来/.test(t))
+    return { intent:"query", template:true,
+      note:"continue 特例:系统在跑 → 仅 ACK,不产 directive(§4.6.2)",
+      reply:"已在继续,当前快照 cycle 18,正在执行 cycle 19(bundle target 3/5,v-gate-headmix 训练中)。未产生任何状态变更指令。" };
+  if(/该不该|要不要|是不是该|帮我看看/.test(t))
+    return { intent:"unclear", template:true,
+      note:"低置信 → directive_pending:回显确认、不自动答、不自动改状态",
+      reply:"您的消息可能涉及状态变更,已登记待确认:请说明是想「查询现状」还是「下达指令」,并给出具体内容。确认前不会改变任何状态。" };
+  if(/预算|上限|B_max/i.test(t))
+    return { intent:"directive", dlabel:"d(new) set_budget", dstate:"ask",
+      polish:"将单轮预算封顶 B_max 由 $40 调整为 $"+(num||"50")+"(B0 / 翻倍周期不变)。",
+      note:"硬指令:先建 directive(status=pending, confirmed:false),回显润色稿等待确认" };
+  if(/暂停|停下|先停|停止|停机/.test(t))
+    return { intent:"directive", dlabel:"d(new) pause", dstate:"ask",
+      polish:"暂停研究循环:当前阶段收尾后不再开新轮,直至 resume。",
+      note:"硬指令回显确认;consume_at=immediate / 阶段边界" };
+  if(/已提供|已上传|放好了|r\d+ ?已/.test(t))
+    return { intent:"note", dlabel:"request_provide", dstate:"confirmed",
+      polish:"文件请求答复:uploads/ 已放好,请校验。",
+      note:"答复按 note 入账 + daemon 动作:校验 hash → 并入 input/user_provided/ → resolved → 恢复推进(§4.6.8,不产 directive)" };
+  if(/优先|插入|插一个|加一个问题|安排.*验证|先验证/.test(t))
+    return { intent:"directive", dlabel:"d(new) inject_question", dstate:"confirmed",
+      polish:"插入问题:"+t+"(置高优先级,directive_adjust 加成)。",
+      note:"软指令入队,下一轮 reasoning 开头消费;系统可有理由地不从(理由入 DECISION)" };
+  if(/注意|留意|觉得|担心|可能.*敏感|提醒/.test(t))
+    return { intent:"note",
+      note:"note(软注解)→ 下一轮 reasoning 开头消费;不写 decision、不改状态" };
+  if(/进展|怎么样|状态|在跑|现在|多少|剩|情况|什么|[??]/.test(t)){
+    const scen = SCENARIOS[state.scenario];
+    return { intent:"query", template:false,
+      reply:"上次完成快照 cycle 18:goal v2;Q7 已回答(GLA 16k 退化 3.8% 达标);选题 Q13 intent=attack;open/inconclusive 3/0;预算 B(t) $40、全局剩余 $514.4。当前正在执行:"
+        +(state.scenario==="idle" ? "无(轮间空闲,等待下次唤醒)。"
+          : "cycle 19 bundle,target "+scen.cursor+","+(state.scenario==="awaiting_user"?"文件请求 r2 pending,全局等待用户供给(问答/通知照常)。":"v-gate-headmix 训练中,心跳 "+scen.heartbeat_age+"。")) };
+  }
+  return { intent:"unclear", template:true,
+    note:"低置信 → directive_pending:回显确认",
+    reply:"未能确定意图(保守三分类)。请说明是「查询现状」还是「下达指令」;可能改状态的请求都需要回显确认。" };
+}
+
+/* ---------------- 讲解员(常驻只读中介;绝不产生 directive) ---------------- */
+const NARR_DRAFTS = {};
+let narrSeq = 0;
+function narrMsgHTML(m){
+  if(m.role==="sys")  return `<div class="narr-sys">${m.html}</div>`;
+  if(m.role==="user") return `<div class="msg in"><div class="bubble">${m.html}</div></div>`;
+  let draft = "";
+  if(m.draft){
+    const id = ++narrSeq; NARR_DRAFTS[id] = m.draft;
+    draft = `<div class="draft"><span class="lbl">草拟命令 · 经下方命令行发送才入账</span><div class="cmdtxt">${esc(m.draft)}</div>
+      <div class="row"><button class="btn ghost" style="padding:3px 10px;font-size:11.5px" onclick="narrCopy(${id})">复制</button>
+      <button class="btn" style="padding:3px 10px;font-size:11.5px" onclick="narrSend(${id})">一键发送</button></div></div>`;
+  }
+  return `<div class="msg out"><div class="bubble">${m.html}${draft}</div><div class="meta">${chip("c-acc","讲解员")}<span class="small">只读中介 · 不改状态</span></div></div>`;
+}
+function appendNarrator(m){
+  const el = document.getElementById("narrlog"); if(!el) return;
+  const stick = streamAtBottom(el);
+  el.insertAdjacentHTML("beforeend", narrMsgHTML(m));
+  if(stick) el.scrollTop = el.scrollHeight;
+}
+function narrCopy(id){
+  const t = NARR_DRAFTS[id]; if(!t) return;
+  if(!HEADLESS && typeof navigator!=="undefined" && navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(()=>toast("已复制:"+t)).catch(()=>toast("复制失败,请手动选中文本:"+t));
+  } else toast("请手动复制:"+t);
+}
+function narrSend(id){
+  const t = NARR_DRAFTS[id]; if(!t) return;
+  if(state.dockFolded) dockToggle();
+  const inp = document.getElementById("cmdin");
+  if(inp) inp.value = t;
+  sendCmd(t);
+  if(inp) inp.value = "";
+  toast("已经命令行发送(入账 → 三分类)");
+}
+function sendNarr(){
+  const inp = document.getElementById("narrin");
+  const t = (inp && inp.value || "").trim(); if(!t) return;
+  inp.value = "";
+  appendNarrator({ role:"user", html:esc(t) });
+  const r = narratorRespond(t);
+  appendNarrator({ role:"narr", html:r.html, draft:r.draft });
+}
+function narratorRespond(t){
+  // ① 解释类:显式问「是什么/为什么」才走词典(避免拦截命令组织类)
+  if(/什么是|为什么|解释|区别|怎么回事|啥意思|是啥|含义|看不懂|讲讲|说说/.test(t)){
+    for(const topic of NARR_TOPICS){
+      if(topic.re.test(t))
+        return { html: topic.body + (topic.panel ? ` <a href="javascript:go('${topic.panel}'${topic.arg!=null?","+topic.arg:""})">→ 打开${esc(topic.label)}</a>` : "") };
+    }
+  }
+  // 讲解员自身
+  if(/讲解员|你是谁|这个窗口|你能干/.test(t)) return { html: NARR_TOPICS.find(x=>/讲解员/.test(x.re.source)).body };
+  // ② 组织命令类
+  const num = (t.match(/(\d+(?:\.\d+)?)/)||[])[1];
+  if(/预算|B_max|上限/i.test(t))
+    return { html:"set_budget 是<b>硬指令</b>(消费时机 = 立即 / 阶段边界):确认后改 policy.budget.B_max,单轮预算 B(t) 随之封顶。当前 B(t) $"+DB.budget.B_t+"、本轮已花 $"+DB.budget.cycle_spent+"、全局 $"+DB.budget.global_spent+"/$"+DB.budget.global_total+"。草拟如下——发送后需在输出窗确认。",
+             draft:"预算调到 "+(num||"50") };
+  if(/暂停|停机|先停|停止/.test(t))
+    return { html:"pause 是硬指令:当前阶段收尾后不再开新轮,直至 resume;<b>不会打断进行中的训练</b>(v1 不承诺抢占,只承诺入账与生效时机)。",
+             draft:"暂停一下" };
+  if(/文件请求|上传|供给|uploads|无法获取|数据集.*(申请|提供)/i.test(t)){
+    const pend=(DB.interaction_request||[]).filter(r=>r.status==="pending")[0];
+    return { html: pend
+        ? "当前有 pending 文件请求 <b>r"+pend.id+"</b>:「"+esc((pend.summary_md||"").slice(0,90))+"」。系统在<b>全局等待</b>:不开新研究 runner call,问答/通知照常。把文件放入 <b>uploads/</b> 后经命令行入站恢复;也可答复「无法提供」(缺口按失败观测交轮尾裁决)。"
+        : "当前没有 pending 文件请求。防滥用:请求单必须披露已尝试路径+失败原因,同 goal 至多一张 pending 单。",
+      draft: pend ? ("r"+pend.id+" 已提供") : undefined };
+  }
+  if(/优先|插入|安排|先验证|先做/.test(t)){
+    const topic = t.replace(/^.*?(优先|先验证|先做|插入|安排)/,"").replace(/验证|一下|吧|。/g,"").trim();
+    return { html:"这可以走 <b>inject_question(软指令)</b>:下一轮 reasoning 轮始消费,生成 source=human 的新问题并加 directive_adjust 权重;树上会紫标高亮。系统可有理由不从(理由入 DECISION)。",
+             draft:"优先验证 "+(topic||"32k 外推") };
+  }
+  // ③ 讨论类
+  if(/该不该|要不要|下一步|建议|怎么办|停不停|值得/.test(t)){                    // 据真 DB.question 提示（不焊死具体分数/预算/问题号）
+    const open = (DB.question||[]).filter(x=>x.status==="open").sort((a,b)=>(b.score||0)-(a.score||0)), top=open[0];
+    return { html: top
+      ? `仍有 open 问题未收敛:最高分 <b>${esc(String(top.score))}</b>（Q${esc(String(top.id))},${esc((top.text||"").slice(0,18))}…）。是否终止/推进取决于 goal 谓词与预算——请对照顶栏 B(t)/已花 与「结论与证据」标签页判断（讲解员据只读快照，不代作裁决）。`
+      : `当前无 open 问题。请对照顶栏与各标签页的实时快照判断下一步。`, draft:"" };
+  }
+  if(/在跑什么|进展|怎么样|状态|现在/.test(t)){                                  // 据真 DB.status_card / live 报现状（不焊死 c18/Q7/Q13 剧情）
+    const sc=DB.status_card||{}, scen=SCENARIOS[state.scenario];
+    return { html:`<b>快照</b> c${esc(String(sc.snapshot_cycle!=null?sc.snapshot_cycle:"—"))} · goal v${esc(String(sc.goal_ver||"?"))} · 选题 ${mono("Q"+sc.active_question)} intent=${esc(sc.selection_intent||"—")} · open/incl ${esc(String(sc.open_count))}/${esc(String(sc.inconclusive_count))}。<b>正在执行</b>:${scen.idle?"无（轮间空闲）":scen.request?"暂停研究（等待用户供给）":(esc(sc.cycle_route||"—")+" · "+esc(sc.cycle_status||"—")+"，心跳 "+esc(scen.heartbeat_age))}。<a href="javascript:go('cycles')">→ 轮次详情</a>（讲解员据只读快照，不联机推理）` };
+  }
+  return { html:"我可以:① <b>解释</b>系统概念(问「什么是适用性 / suspect / import 三闸 / B(t) / route / 快照 / directive」);② <b>讨论</b>进展与下一步权衡(问「该不该停 / 下一步建议」);③ <b>帮你组织命令</b>(说「预算调到 60 / 暂停 / 优先验证 32k / 批准」),我给草稿,[一键发送] 走命令行入账。我本身只读,绝不直接改状态。" };
+}
+function narratorSeed(){
+  appendNarrator({ role:"sys", html:"界面导览:<b>左</b>=落盘目录(只读镜像,点文件看内容)· <b>中</b>=问题树画布(单击节点看详情、双击进复盘、F 适配、拖拽/滚轮)· <b>下</b>=输出记录+命令行(指令从这里入账)· <b>右</b>=讲解员(只读中介:解释/讨论/帮你草拟命令,绝不直接改状态)。" });
+  appendNarrator({ role:"narr", html:"当前状态见顶栏与各标签页（实时快照）。可在此<b>解释</b>系统概念、<b>讨论</b>下一步、或<b>帮你组织命令</b>——我只读、据快照提示，绝不直接改状态、不联机推理。" });
+}
+
+/* ---------------- 既有演示动作(接入事件流 + 讲解) ---------------- */
+function confirmD6(){
+  state.d6 = "pending_effect";
+  emitEvent({ k:"directive", text:"d6(goal_amend)确认 → pending_effect:待下一 goal_amend 轮消费(模拟)",
+    narr:"d6 已确认。goal_amend 在下一个 goal_amend 轮消费:建 goal v3、open 问题原地迁移重打分、closed 结论走适用性审计(不批量重开)。" });
+  toast("d6 已确认(模拟,不落库)");
+  render();
+}
+function rejectD6(){
+  state.d6 = "rejected";
+  emitEvent({ k:"directive", text:"d6 → rejected(不消费);raw 原文仍在 interaction_message(模拟)" });
+  toast("d6 已取消(模拟)");
+  render();
+}
+function provideR2(){
+  state.scenario = "running";
+  streamSetScenario();
+  emitEvent({ k:"notify", text:"[request_resolved] r2:uploads/r2/1/ 校验 hash 入账 → 并入 input/user_provided/r2/ → resolved;Advancer 恢复推进(模拟)",
+    narr:"文件请求 r2 已解决:daemon 校验上传文件、hash 入账、复制并入托管区(流程层只读),写 resolution_json + resolved_message_id(provenance),系统自动恢复。全局等待期间只停研究推进,问答/通知/上传校验一直照常(§4.6.8)。" });
+  toast("r2 已解决 → 恢复推进(模拟)");
+  render();
+}
+
+/* ---------------- 全局绑定与启动 ---------------- */
+function bindGlobal(){
+  if(HEADLESS || typeof window==="undefined") return;
+  window.addEventListener("resize", ()=>{ if(state.tab==="tree") miniSync(); });
+  document.addEventListener("keydown", e=>{
+    const tag = e.target && e.target.tagName;
+    if(tag==="INPUT" || tag==="TEXTAREA") return;
+    if(e.key==="f" || e.key==="F") canvasFit();
+    else if(e.key==="Escape"){
+      if(state.preview) closePreview();
+      else if(state.canvas.drawerQ!=null) canvasSelect(null);
+    }
+    else if(e.key==="+" || e.key==="=") canvasZoomBtn(1);
+    else if(e.key==="-") canvasZoomBtn(-1);
+  });
+}
+function renderShell(){
+  fsRefresh();
+  renderFilterChips();
+  streamSeed();
+  narratorSeed();
+  bindGlobal();
+}
+
+/* ==================== 步⑨ CP9.2 · 真数据接入（console_server /api）====================
+   原型渲染码保真不动，仅把数据源从 mock DB 换成 /api/db。server 形状（payload.tables.<表> + 派生平铺）
+   经 adaptPayload() 映射回原型 DB 形状（顶层 DB.<表> + status_card/notification/policy/live/派生列），
+   render() 照原样渲染。命令行→POST /api/message；文件预览→GET /api/file。HEADLESS(node 冒烟)下不 fetch。 */
+function _summ(pj){ try{ const o=JSON.parse(pj); return o.reason||o.type||o.verdict||o.review_kind||JSON.stringify(o).slice(0,90);}catch(e){ return String(pj||"").slice(0,90);} }
+function emptyPage(title,sub){ return `<div class="pagehead"><h1>${esc(title)}</h1></div><p class="pagesub">${esc(sub)}</p>`; }  // 空表占位（稀疏/新建真库不崩）
+function _fsConv(nodes){ return (nodes||[]).map(n=> n.dir ? {p:n.p, d:_fsConv(n.children||[])} : {p:n.p}); }  // server fs {p,dir,children} → 渲染器 {p,d}
+function adaptPayload(p){
+  const T=(p&&p.tables)||{}, D={};
+  for(const k in T) D[k]=T[k];                                   // 真表平铺到顶层（原型访问 DB.<表>）
+  D.notification=(p&&p.notification)||[];
+  D.ledger_by_cycle=((p&&p.ledger_by_cycle)||[]).map(l=>{ const n=parseInt(String(l&&l.cycle).replace(/\D/g,""),10); return {cycle:(isNaN(n)?(l&&l.cycle):n), money:l&&l.money}; });  // server 发 "c1" → 归一为数字 id（cy() 按数字 find；isNaN 才回退，保住 c0）
+  D.policy=(p&&p.policy)||{}; D.live=(p&&p.live)||{}; D.runner_call_live=(D.live&&D.live.runner_call)||null;
+  // status_card：真 builder 是**嵌套**（goal/selection/counts/budget）；原型渲染读**扁平**键 → 拍平改名。
+  const sc=(p&&p.status_card)||{}, scb=sc.budget||{};
+  const aqid=sc.active_question&&(sc.active_question.id!=null?sc.active_question.id:sc.active_question);
+  D.status_card={
+    snapshot_cycle: sc.snapshot_cycle,
+    goal_ver: (sc.goal&&sc.goal.ver!=null)?sc.goal.ver:(sc.goal_ver!=null?sc.goal_ver:""),
+    goal_summary: (sc.goal&&sc.goal.summary)||sc.goal_summary||"",
+    active_question: aqid!=null?String(aqid).replace(/^[a-z]/i,""):"—",
+    cycle_status: sc.cycle_status||"", cycle_route: sc.route||sc.cycle_route||"",
+    selection_intent: (sc.selection&&sc.selection.intent)||sc.selection_intent||"—",
+    selection_decision: (sc.selection&&sc.selection.latest_decision&&("decision #"+sc.selection.latest_decision.id))||sc.selection_decision||"",
+    open_count: (sc.counts&&sc.counts.open!=null)?sc.counts.open:(sc.open_count||0),
+    inconclusive_count: (sc.counts&&sc.counts.inconclusive!=null)?sc.counts.inconclusive:(sc.inconclusive_count||0),
+    heartbeat_ref: sc.heartbeat_ref||null, pending_request: sc.pending_file_request||sc.pending_request||null,
+  };
+  // budget（每拍 topbar 必读）：从 status_card.budget + policy.session_max + ledger 求和合成（真成本网休眠→0）。
+  const _gspent=(D.ledger_by_cycle||[]).reduce((s,l)=>s+((l&&l.money)||0),0);
+  const _sm=(p&&p.policy&&p.policy.budget)?p.policy.budget.session_max:null;
+  const _gtotal=(_sm==null)?null:_sm;                            // session_max=null ⇒ 全局预算网关闭（policy 语义）→ 保留 null，不折成 0
+  D.budget={ B_t: scb.B_t!=null?scb.B_t:0, cycle_spent: scb.cycle_spent!=null?scb.cycle_spent:0,
+    global_total: _gtotal, global_spent: _gspent,
+    // 全局余优先用 server 真值 status_card.budget.global_remaining（口径权威）；缺失才由 total-spent 兜底
+    global_remaining: (scb.global_remaining!=null)?scb.global_remaining:(_gtotal!=null?_gtotal-_gspent:null) };
+  D.fs = (p&&p.fs&&p.fs.roots) ? _fsConv(p.fs.roots) : null;     // 真文件树（server _fs_tree）→ 渲染器形状；缺失=demo 用 mock FS
+  (D.decision||[]).forEach(d=>{ if(d.summary==null) d.summary=_summ(d.payload_json); });   // 派生列映射
+  // directive.payload_json 是 JSON 串（携 polished/confirmed）；渲染码读 d.payload.polished/.confirmed → 解析成对象
+  (D.directive||[]).forEach(d=>{ if(d.payload==null){ try{ d.payload=JSON.parse(d.payload_json||"{}")||{}; }catch(e){ d.payload={polished:String(d.payload_json||"")}; } } });
+  const tg={}; (T.baseline_tag||[]).forEach(t=>{(tg[t.baseline_id]=tg[t.baseline_id]||[]).push(t.tag);});
+  (D.baseline||[]).forEach(b=>{ if(b.tags==null) b.tags=tg[b.id]||[]; });
+  (D.execution_log||[]).forEach(l=>{ if(l.owner==null) l.owner=(l.run_id!=null)?('run '+l.run_id):(l.evaluation_attempt_id!=null?('attempt '+l.evaluation_attempt_id):''); });
+  return D;
+}
+// ---- live 真数据模型：原型用 mock SCENARIOS[state.scenario] 供「心跳/游标/成本/运行中」，此处用真 payload.live 覆盖 ----
+let LIVE_MODE=false;                                              // 接入真数据后置真 → 渲染码隐藏 mock 演示件（场景切换器 / 「模拟」按钮）
+function buildLive(p){                                            // payload.live + status_card → 原型 scen 形状；真值优先，未知诚实置「—」（不编造）
+  const lv=(p&&p.live)||{}, bud=((p&&p.status_card&&p.status_card.budget)||{}), rc=lv.runner_call;
+  const mode=lv.mode||"idle", LBL={running:"训练执行中",awaiting_user:"等待用户供给",idle:"轮间空闲"};
+  return { mode, label:LBL[mode]||mode, idle:mode==="idle", request:mode==="awaiting_user", approval:false,
+    heartbeat_age:(lv.heartbeat_age_s!=null)?(lv.heartbeat_age_s+" 秒前"):"—",
+    runner: rc?("runner_call #"+rc.id+" · "+(rc.phase||"")+" · "+(rc.status||"")):"（无活跃 runner）",
+    cursor:"—", cursor_pct:0, watchdog:"—", watchdog_pct:0,      // bundle 游标 / watchdog 不在 live 载荷 → 诚实置空
+    cost:"$"+(bud.cycle_spent!=null?bud.cycle_spent:0) };
+}
+function applyLive(p){                                            // 覆盖 SCENARIOS[真 mode] + 指向它 → 10+ 处读 SCENARIOS[state.scenario] 的渲染码零改即得真值
+  const L=buildLive(p); SCENARIOS[L.mode]=L; state.scenario=L.mode; LIVE_MODE=true; return L;
+}
+function clampSelections(){                                       // mock 默认选中 id（selB:4/selCycle:19/selA:6/selQ:13）在稀疏真数据里可能不存在 → 夹到真实存在的 id，避免 find 落空崩渲染
+  if(!bl(state.selB))     state.selB=(DB.baseline&&DB.baseline[0])?DB.baseline[0].id:null;
+  if(!cy(state.selCycle)) state.selCycle=(DB.cycle&&DB.cycle.length)?DB.cycle.reduce((m,c)=>c.id>m?c.id:m,DB.cycle[0].id):null;   // 最新=max id（不依赖行序）
+  if(!an(state.selA))     state.selA=(DB.answer&&DB.answer[0])?DB.answer[0].id:null;
+  if(!q(state.selQ))      state.selQ=(DB.question&&DB.question[0])?DB.question[0].id:null;
+}
+function streamSyncReal(){                                        // 真事件流：每拍重算 cycle/decision/notification 全量历史，按稳定键只追加**未见过**的
+  if(!state.stream.seen) state.stream.seen=new Set();             // → 新轮/新决策/新通知都进流；乱序/outbox 坏行重排也不重复不漏（不再靠 notification 数组长度）
+  if(!state.stream.realSeeded){                                  // 首个真刷新：清 mock 种子的流
+    const el=(typeof document!=="undefined")&&document.getElementById("stream"); if(el) el.innerHTML="";
+    state.stream.seen.clear(); state.stream.realSeeded=true;
+  }
+  buildStreamHistory().forEach(ev=>{ const key=ev.t+"|"+ev.k+"|"+ev.text;
+    if(!state.stream.seen.has(key)){ state.stream.seen.add(key); appendStream(ev); } });
+}
+let _dbInFlight=false;                                           // 本拍已有 /api/db 在途 → 跳过，不在 3s 轮询下堆并发（慢响应也只有一个在飞）
+async function refreshDB(){
+  if(HEADLESS || typeof fetch==="undefined" || _dbInFlight) return;
+  _dbInFlight=true;
+  try{ const r=await fetch('/api/db'); if(!r.ok) return; const p=await r.json();
+    DB=adaptPayload(p); applyLive(p); clampSelections();
+    if(state.stream.timer){ clearInterval(state.stream.timer); state.stream.timer=null; }  // 停 mock 假 ticker
+    streamSyncReal(); render();
+  }catch(e){ /* 只读观测面：拉取失败静默，下一轮重试 */ }
+  finally{ _dbInFlight=false; }
+}
+if(typeof window!=="undefined" && !HEADLESS){
+  fsOpen=function(p){ state.fs.sel=p; fsRefresh();
+    if(!LIVE_MODE){ openPreview(p); return; }                    // 未连线 demo：仍走 mock FILE_CONTENT（否则点文件全报白名单不可读）
+    fetch('/api/file?p='+encodeURIComponent(p)).then(r=>r.ok?r.text():Promise.reject()).then(txt=>{  // 真模式换真拉取（白名单 /api/file）
+      FILE_CONTENT[p]={body:txt, note:"由 /api/file 拉取（只读镜像）"}; openPreview(p);
+    }).catch(()=>{ FILE_CONTENT[p]={body:"(该文件不在白名单或不可读)"}; openPreview(p); });
+  };
+  sendCmd=function(textArg){                                      // 命令行换真入站（写 spool，run 进程 ingest）
+    const inp=document.getElementById("cmdin");
+    const t=(textArg!=null?textArg:(inp&&inp.value||"")).trim(); if(!t) return;
+    if(inp) inp.value="";
+    emitEvent({k:"cmd", html:"<b>&gt; "+esc(t)+"</b>"});
+    fetch('/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})
+      .then(r=>r.json().then(j=>({ok:r.ok, j})))                 // 非 2xx 也可能带 JSON → 必须核 r.ok + j.queued，否则给人错误确认
+      .then(({ok,j})=>{ if(!ok || !j || !j.queued){ emitEvent({k:"cmd", text:"入队失败:"+((j&&j.error)||"服务器拒绝")}); return; }
+        emitEvent({k:"cmd", text:"已入队 console_inbox（seq "+j.queued.seq+"）· 待 run 进程 ingest→分类"}); })
+      .catch(e=>emitEvent({k:"cmd", text:"入队失败:"+e}));
+  };
+}
+
+renderShell();
+render();
+streamSetScenario();
+if(typeof window!=="undefined" && !HEADLESS){ refreshDB(); setInterval(refreshDB, 3000); }   // 首拉 + 3s 轮询真数据
+</script></body></html>
