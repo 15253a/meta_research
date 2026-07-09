@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步①–⑨全完成**（664 测绿）。步⑨（M8 人类控制台）CP9.1–9.4 达成——系统在控制台可查看真实状态 + 可交互。下一批 = 存量（非阻塞）：成本记账接线（M6 硬化，让 budget_exhausted 安全网转活）、CP8.6b（eval/import/route）、worktree 隔离等（§7）。步①–⑧全完成（625 测绿；步⑧「正式直接
+- 进行中的步 / 检查点：**步⑩（M6 硬化）CP10.2**（ledger 写入 + 激活安全网）。CP10.1 runner 成本捕获已落（678 测绿）。步⑩接 `INSERT INTO ledger` 让 budget_exhausted 安全网转活。步①–⑨全完成。步①–⑧全完成（625 测绿；步⑧「正式直接
   可用」达成并在部署副本真 Codex 实跑验证——CP8.8 修复首跑发现的 reasoning selection 楔死 bug、复跑越过、
   τ 干净自停）。步⑨=把 `reference/人类控制台原型-v2.html` 接上真系统（用户 2026-07-09 明确要真接入控制台
   可视化，纠正 CP8.8 期「系统无 web 组件」结论）——CP9.1 控制台数据面已落（console_server.py 独立只读进程 +
@@ -326,3 +326,29 @@
     README §4.1 控制台节；实机 CLI 起 console_server + curl 真跑留证。→ commit `cd97ee0`（build_log 0045；codex
     两轮 §2.2 修毕；664 测绿）。**⇒ 步⑨（M8 人类控制台接入）达成**：系统在人类控制台上可查看真实状态 + 可交互
     （pause/resume/query），单写纪律不破。
+
+### 步⑩（M6 硬化）成本记账接线——激活全局预算安全网
+
+- 来源：用户 2026-07-09「开始接入」（承接步⑨达成后的存量优先级）。§7 诚实边界 + README §6：`INSERT INTO ledger`
+  （成本记账）**尚未接线** → `SUM(ledger.money)=0` → `budget_exhausted`（§4.4.6 判据②）**永不触发**、`budget.session_max`
+  安全网**休眠**。真跑长时研究前失控成本无自动上限（只 τ 分数衰退 + `--max-cycles` 兜底）。本步接线，让安全网转活。
+- **勘察结论（Explore 代理 + 实机 probe 定）**：
+  - 读侧已装：`stopcontroller._budget_exhausted` 读 `SUM(ledger.money) ≥ session_max`（轮前/轮后各查）；无任何 `INSERT INTO ledger`。
+  - **token 来源**：`codex-chatgpt exec` 把 `tokens used\n<N>`（总 token，逗号分隔）打到 **stderr**（stdout=信封）；
+    生产 runner `capture_output=True` 已捕获 stderr、但仅失败时读——成功时丢弃。解析即得真 token。
+  - runner_call 行：目前**仅 audit(judge)** 写；idea/plan/bundle/reasoning 从不写 → ledger 的 runner_call_id FK 需一并补建。
+  - 无 tokens→money 汇率（policy 无 pricing）；status_card 读 `cycle.cost_total`（列，从不写）与 stopcontroller 读
+    `SUM(ledger)` 两套 dormant 成本面互不对账。ledger append-only（触发器）→ 累计靠新 INSERT。
+- **设计（自主决定，"遇到问题先自行处理"）**：① runner 解析 stderr token + 计 wallclock → `Artifact.usage`；
+  ② `CostLedger` 服务：每次 LLM 调用写 `runner_call`(补全各 phase) + `ledger`(tokens/wallclock/money)；money =
+  tokens/1000 × `budget.price_per_1k_tokens`（notional/provisional，缺省使 cycle≈B_max 量级、session_max 为失控兜底，A/B 细化）；
+  ③ status_card `cycle_spent` 改读 `SUM(ledger per cycle)` 统一口径。
+- 验证方法（步级）：真跑（或 mock usage 注入）积累 `ledger.money` → `SUM ≥ session_max` → `budget_exhausted` 干净停
+  + durable global_stop 落库（恢复也拒推进）；ledger append-only 不破；测试基线全绿。
+- 检查点（模型切，边走边补）:
+  - [x] CP10.1 runner 成本捕获：`runner.py` 解析 stderr `tokens used` 总 token（行首锚定+合法千分组+取末条+坏输入→0）
+    + subprocess wallclock → `Artifact.usage`（interfaces.py 加 CallUsage + Artifact.usage 非破坏）；不改循环行为。
+    顺带修 test_run.py 既有 `__new__` monkeypatch 全局污染 bug。→ commit `1b415f9`（build_log 0046；codex 第2轮 APPROVE；678 测绿）。
+  - [ ] CP10.2 ledger 写入 + 激活安全网：`CostLedger`（写 runner_call + ledger/txn）+ 装配进 StageProvider/JudgeProvider
+    + policy `price_per_1k_tokens` 旋钮（+schema）。`SUM(ledger.money)` 随真用量增长 → budget_exhausted 转活。
+  - [ ] CP10.3 对账 + 步级收口：status_card `cycle_spent` ← SUM(ledger)；budget_exhausted 端到端真触发验证（步级）。

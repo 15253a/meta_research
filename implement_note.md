@@ -4,8 +4,28 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-09 ｜ 位置：**步①–⑨全完成**——**空闲**。下一批=存量硬化（用户可定优先级）。
-- 检查点状态：CP9.4 已提交（**cd97ee0** + build_log 0045）。**步⑨（M8 人类控制台）达成**。测试 **664 绿**。
+- 更新：2026-07-09 ｜ 位置：**步⑩（M6 硬化）CP10.2**（ledger 写入 + 激活安全网）——**待开工**。
+- 检查点状态：CP10.1 已提交（**1b415f9** + build_log 0046）。测试 **678 绿**。
+
+> 步⑩勘察定论（Explore + 实机 probe，全在案）：读侧已装（stopcontroller 读 SUM(ledger.money)≥session_max），无任何
+> INSERT INTO ledger（休眠）。**CP10.1 已落**：runner 从 stderr 抽真总 token + 墙钟 → Artifact.usage（不改循环）。
+> 关键事实（CP10.2 要用）：①ledger DDL 列见 db/migrations/0001_appendix_a.sql:268——cycle_id/phase(enum)/ 四选一 FK
+> (run/eval/attempt/runner_call 至少一非空)/tokens_*/wallclock_sec/money/policy_version；**append-only 触发器**（累计靠新
+> INSERT，不 UPDATE）。②runner_call 目前**仅 audit(judge)** 写（stage_provider.py:247，短 txn）；idea/plan/bundle/reasoning
+> 从不写 → ledger 的 runner_call_id FK 需一并补建。③StageProvider **无 daemon**（build_system 未注入）；JudgeProvider 有。
+
+## CP10.2 计划：ledger 写入 + 激活安全网
+- **CostLedger 服务**（新模块）：`record(cyc_id, phase, purpose, usage: CallUsage, policy_version) → runner_call_id`：
+  单 txn 内 INSERT runner_call(status=success) + INSERT ledger(cycle_id/phase/runner_call_id/tokens_*/wallclock_sec/money/policy_version)。
+  money = `usage.tokens_total/1000 × policy.budget.price_per_1k_tokens`。
+- **pricing 旋钮**：policy.yaml `budget.price_per_1k_tokens`（notional/provisional，缺省 ~0.3 使 cycle≈B_max 量级、
+  session_max=100000 为失控兜底，A/B 细化）+ policy.schema.json 加该键。
+- **装配**：给 StageProvider 注入 daemon + CostLedger（build_system），`_produce` 各 phase 调用后 record；JudgeProvider
+  用 CostLedger（替其现有 runner_call INSERT，保留 DECISION 写）。usage 从 Artifact.usage 取。
+- **验证**：注入已知 usage 的 mock runner 跑几轮 → ledger 有行、SUM(money)>0；喂到 session_max → budget_exhausted 干净停
+  + durable global_stop；ledger append-only 不破。（真触发端到端留 CP10.3 步级收口。）
+- **坑**：StageProvider 现无 daemon（构造器 + build_system 装配要改）；runner_call.phase 是 enum（idea/plan/bundle/reasoning/
+  audit/… 已在枚举内）；ledger.money REAL；失败调用不记账（CP10.1 已定）。
 
 > **步⑨完成**：人类控制台真接入——CP9.1 数据面(console_server 只读 /api/db + spool)、CP9.2 前端真数据(去 mock)、
 > CP9.3 入站闭环(ConsoleInboxIngest)、CP9.4 端到端验收(test_console_e2e 强证零 DB 写 + 入站闭环 + grounded)。
