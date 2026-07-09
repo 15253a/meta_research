@@ -4,8 +4,11 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.6**（plan 全形态受理）
-- 检查点状态：待开工（CP8.5 已提交 650aace + 记账中）
+- 更新：2026-07-09 ｜ 位置：**步⑧（M7）CP8.6**（exec target kind）
+- 检查点状态：内审 + codex 第1轮各 REQUEST_CHANGES 全修（内审 1 BLOCKER exec kill-9 楔死；codex 2 BLOCKER
+  [append 放宽过头同 variant 错格污染 / exec 自占未核 config 漂移] + 2 SHOULD[orphan 显式清理 / 补测] +
+  NIT）→ 623 测绿 → **codex 外审第2轮进行中**（bhtzmq2r7）。build_log 0039 待起。
+  **模型裁量收窄 CP8.6=exec 一种**（eval frozen schema 无 variant 引用需设计、import 独立子系统→CP8.6b）。
 
 ## 正在做什么
 **步⑧：plan 契约缺口补齐 → 全流程 real-Codex attack + 正式直接可用**。已落 CP8.1–8.5（618 测绿）：

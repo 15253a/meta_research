@@ -86,12 +86,14 @@ def _bundle_provider(daemon, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_bo
     def bundle(cyc, pack):
         bt = int(pack.target_id)
         slice_ = json.loads(daemon.query_one("SELECT plan_ref FROM build_target WHERE id=?", (bt,))[0])
+        # exec 目标：plan claim.config_json 是配置决定者 → manifest 须照抄（cross_check 强制相等）
+        cfg = (slice_.get("claim") or {}).get("config_json") or {"lr": 0.1}
         manifest = {
             "manifest_version": 1,
             "target_ref": {"target_key": slice_["target_key"], "target_kind": slice_["target_kind"],
                            "seq": slice_["seq"], "plan_slice_hash": manifest_canon(slice_)},
             "protocol_ref": {"protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"]},
-            "env_hash": "toy-env", "config_json": {"lr": 0.1},
+            "env_hash": "toy-env", "config_json": cfg,
             "code_files": ["train.py", "eval.py", "smoke.py"],
             "commands": {"smoke": {"argv": [sys.executable, "{src}/smoke.py"]},
                          "train": {"argv": [sys.executable, "{src}/train.py"]},
@@ -710,3 +712,141 @@ def test_pipeline_requires_current_obs(env, monkeypatch):
     with pytest.raises(RuntimeError, match="先 ingest"):
         env["adv"].run_cycles(max_cycles=4)
     assert env["daemon"].query_one("SELECT count(*) FROM build_target WHERE status='complete'")[0] == 0
+
+def test_exec_variant_of_legal_baseline(tmp_path):
+    """步⑧ CP8.6：exec 目标——既有 legal baseline 上建变体（gate_claim_variant 自建 bt）→ manifest 驱动
+    真训练/评估 → gate_register_variant 入池（baseline 身份不动，只本变体 legal）→ 真证据关问。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    # 预置：一个 legal baseline（'ck-base' 的 base 变体）+ 已注册协议/指标（模拟前轮 build 产物）
+    with daemon.transaction() as conn:
+        bl = conn.execute("INSERT INTO baseline(slug,canonical_key,identity_doc,born_cycle,status) "
+                          "VALUES ('toy-b','ck-base','# base',1,'legal')").lastrowid
+        conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status) VALUES (?,'base','{}','legal')", (bl,))
+        conn.execute("INSERT INTO protocol(id,version,name,scope_spec_json) VALUES (1,1,'toy-proto',?)",
+                     (json.dumps({"dataset": "toy", "split": "holdout"}, sort_keys=True),))
+        conn.execute("INSERT INTO metric_def(id,version,name,direction) VALUES (1,1,'acc','higher')")
+        conn.execute("INSERT INTO protocol_metric(protocol_id,protocol_ver,metric_id,metric_ver) VALUES (1,1,1,1)")
+
+    def exec_plan(cyc, pack):
+        p = _plan_json()["plan.json"]
+        p["targets"][0].update({"target_kind": "exec",
+                                "claim": {"baseline_ref": "ck-base", "variant_key": "lr01", "config_json": {"lr": 0.01}}})
+        return {"plan.json": p}
+    attack.p["plan"] = exec_plan
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    # exec 变体入池 legal（baseline 身份不动——仍 1 个 baseline，2 个 variant）
+    assert daemon.query_one("SELECT count(*) FROM baseline")[0] == 1
+    assert daemon.query_one("SELECT status FROM variant WHERE variant_key='lr01'")[0] == "legal"
+    assert json.loads(daemon.query_one("SELECT config_json FROM variant WHERE variant_key='lr01'")[0]) == {"lr": 0.01}
+    assert daemon.query_one("SELECT target_kind, status FROM build_target")[0:2] == ("exec", "complete")
+    # 真训练/评估 + 出厂测量 + 关问（exec 目标 → run.kind='exec'）
+    assert daemon.query_one("SELECT status FROM run WHERE kind='exec'")[0] == "success"
+    assert daemon.query_one("SELECT value FROM metric_result ORDER BY id DESC LIMIT 1")[0] == 0.93
+    assert daemon.query_one("SELECT status FROM question WHERE text LIKE 'toy 基线%'")[0] == "answered"
+    # gate_register_variant（非 register_baseline）：baseline 表未新增身份行
+    assert daemon.query_one("SELECT count(*) FROM baseline WHERE canonical_key='ck-attack'")[0] == 0
+    daemon.conn.close()
+
+
+def test_exec_baseline_ref_not_legal_rejected(tmp_path):
+    """exec baseline_ref 未解析到 legal baseline（含池空/首攻新家族）→ 派生期业务拒（须先 build），不楔死。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+
+    def exec_plan(cyc, pack):
+        p = _plan_json()["plan.json"]
+        p["targets"][0].update({"target_kind": "exec",
+                                "claim": {"baseline_ref": "ck-nonexist", "variant_key": "v1", "config_json": {"lr": 1}}})
+        return {"plan.json": p}
+    attack.p["plan"] = exec_plan
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(ids) == 1
+    assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0
+    rej = daemon.query_one("SELECT payload_json FROM decision WHERE type='plan_rejected'")[0]
+    assert "legal baseline" in rej
+    daemon.conn.close()
+
+
+def _exec_env(path, work):
+    """exec 测试栈：预置 legal baseline 'ck-base'/base + 协议/指标，plan 产 exec 目标。
+    **幂等**（续跑复用同 DB）：goal 已在 → 跳过创世/播种（对齐既有恢复测试的 resume 走 _mk_env 语义）。"""
+    daemon, state, compiler, attack = _mk_env(path, work)
+    if daemon.query_one("SELECT 1 FROM goal LIMIT 1") is None:
+        _bootstrap_attack(state)
+        with daemon.transaction() as conn:
+            bl = conn.execute("INSERT INTO baseline(slug,canonical_key,identity_doc,born_cycle,status) "
+                              "VALUES ('toy-b','ck-base','# base',1,'legal')").lastrowid
+            conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status) VALUES (?,'base','{}','legal')", (bl,))
+            conn.execute("INSERT INTO protocol(id,version,name,scope_spec_json) VALUES (1,1,'toy-proto',?)",
+                         (json.dumps({"dataset": "toy", "split": "holdout"}, sort_keys=True),))
+            conn.execute("INSERT INTO metric_def(id,version,name,direction) VALUES (1,1,'acc','higher')")
+            conn.execute("INSERT INTO protocol_metric(protocol_id,protocol_ver,metric_id,metric_ver) VALUES (1,1,1,1)")
+
+    def exec_plan(cyc, pack):
+        p = _plan_json()["plan.json"]
+        p["targets"][0].update({"target_kind": "exec",
+                                "claim": {"baseline_ref": "ck-base", "variant_key": "lr01", "config_json": {"lr": 0.01}}})
+        return {"plan.json": p}
+    attack.p["plan"] = exec_plan
+    return daemon, state, compiler, attack
+
+
+def test_exec_crash_between_claim_and_terminal_recovers(tmp_path):
+    """内审 BLOCKER 回归：exec kill-9 落在 gate_claim_variant（已提交，plan_ref=NULL 孤儿 bt）与终局
+    _commit_plan_terminal 之间 → 稳定 work_root 续跑**不楔死**（复用自占分支补 plan_ref），终库与不杀一致。"""
+    ref = str(tmp_path / "ref.sqlite")
+    d0, s0, _, a0 = _exec_env(ref, tmp_path / "wref")
+    SqliteAdvancer(s0, a0.compiler, lambda c, p: None, attack=a0).run_cycles(max_cycles=4)
+    d0.conn.close()
+
+    path = str(tmp_path / "research.sqlite")
+    d1, s1, _, a1 = _exec_env(path, tmp_path / "w")
+    orig = a1.gate.gate_claim_variant
+    box = {"crashed": False}
+    def crash_after_claim(**kw):                       # claim 提交后、终局 UPDATE 前炸
+        r = orig(**kw)
+        if not box["crashed"]:
+            box["crashed"] = True
+            raise SystemExit("SIM-KILL9-after-claim_variant")
+        return r
+    a1.gate.gate_claim_variant = crash_after_claim
+    with pytest.raises(SystemExit):
+        SqliteAdvancer(s1, a1.compiler, lambda c, p: None, attack=a1).run_cycles(max_cycles=4)
+    assert d1.query_one("SELECT plan_ref FROM build_target WHERE target_kind='exec'")[0] is None
+    d1.conn.close()
+
+    d2, s2, _, a2 = _exec_env(path, tmp_path / "w")    # 同 work_root 续跑（真实生产重启）
+    SqliteAdvancer(s2, a2.compiler, lambda c, p: None, attack=a2).run_cycles(max_cycles=4)
+    d2.conn.close()
+    assert _final_state(path) == _final_state(ref)     # 终库与不杀逐字节一致（复用自占、补 plan_ref、完成）
+    c = db.connect(path)
+    assert c.execute("SELECT status FROM variant WHERE variant_key='lr01'").fetchone()[0] == "legal"
+    assert c.execute("SELECT status FROM build_target WHERE target_kind='exec'").fetchone()[0] == "complete"
+    c.close()
+
+
+def test_exec_replay_config_drift_rejected(tmp_path):
+    """codex 第2轮 BLOCKER 回归：exec 自占复用严核——若崩溃后重放 plan 换了 config（身份漂移），
+    自占放行逃生口不认（config 不符），转业务拒（不把新 plan_ref 写到旧 config 的 variant 上）。
+    实测：手工造一个本 cycle pending+plan_ref NULL 的 exec 占坑（config A），plan 却要 config B → 拒。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _exec_env(path, tmp_path / "w")
+    ci = int(state.open_or_resume_cycle().cycle_id[1:])   # 开一个 attack 轮
+    state.set_route(f"c{ci}", "attack"); state.activate_question("q1")
+    bl = daemon.query_one("SELECT id FROM baseline WHERE canonical_key='ck-base'")[0]
+    with daemon.transaction() as conn:   # 手工残留：config={"lr":0.99} 的 pending exec 占坑（模拟前次崩溃、且 config 漂移）
+        v = conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status) VALUES (?,'lr01',?,'planned')",
+                         (bl, json.dumps({"lr": 0.99}, sort_keys=True))).lastrowid
+        conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id) "
+                     "VALUES (?,1,'exec',1,'pending',?,?)", (ci, bl, v))
+    # plan 要 lr=0.01（与残留 lr=0.99 不符）→ 派生自占核 config 不符 → _PlanReject
+    attack._plan_stage(state.cycle(f"c{ci}"))
+    rej = daemon.query_one("SELECT payload_json FROM decision WHERE type='plan_rejected'")
+    assert rej is not None and "已占" in rej[0]
+    assert daemon.query_one("SELECT count(*) FROM build_target WHERE plan_ref IS NOT NULL")[0] == 0
+    daemon.conn.close()

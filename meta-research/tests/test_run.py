@@ -277,7 +277,7 @@ def test_plan_reject_feedback_in_next_pack(tmp_path):
     state.set_route(c2.cycle_id, "attack")
     state.activate_question(TA_root_qid(daemon))
     pack = compiler.render(cycle_id=c2.cycle_id, stage="plan")
-    assert "最近一次 plan 被拒原因" in pack.anchor_md and "只支持 build" in pack.anchor_md
+    assert "最近一次 plan 被拒原因" in pack.anchor_md and "legal baseline" in pack.anchor_md
     daemon.conn.close()
 
 

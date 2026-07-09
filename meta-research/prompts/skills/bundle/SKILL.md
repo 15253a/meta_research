@@ -42,8 +42,9 @@
      （计划是配置的决定者）；切片未给则你自定（并让代码真用它）。
    - `code_files`: 信封中全部代码/配置文件名的清单（**不含**保留名 identity.md / execution_manifest.json /
      _staged.ok）。
-   - `commands`: `{smoke, train, eval}` 三个都要（build 目标）。每个 = `{"argv": [程序, 参数…],
-     "timeout_s": 秒}`（timeout_s 可整键省略；**键名逐字，不要加 `?` 等多余字符**）：
+   - `commands`: `{smoke, train, eval}` 三个都要（build **与 exec** 目标同——exec 是既有 baseline 的
+     新变体，一样要 smoke/训练/评估）。每个 = `{"argv": [程序, 参数…], "timeout_s": 秒}`
+     （timeout_s 可整键省略；**键名逐字，不要加 `?` 等多余字符**）：
      - **argv 数组、禁 shell**：不得用 `bash -c` / `sh` / `env` 作程序名；一个 token 一个参数。
      - 占位符：`{src}` = 代码物化目录（如 `["python", "{src}/train.py"]`）；`{ckpt}` = 训练产
        checkpoint 路径（**仅 eval 命令可用**，如 `["python", "{src}/eval.py", "{ckpt}"]`）。

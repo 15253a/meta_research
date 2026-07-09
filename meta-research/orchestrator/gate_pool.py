@@ -126,9 +126,15 @@ class PoolGate(ExecGate):
             var_id, pid, pver = erow[0], erow[1], erow[2]
             if erow[3] == "abandoned":
                 self._reject(ci, f"evaluation {evaluation_id} 已 abandoned")
-            if erow[4] is not None and erow[4] != build_target_id:
-                self._reject(ci, f"target 绑定不符：evaluation 绑 target {erow[4]}，本次 {build_target_id}")
-            if bt[6] != var_id:   # append 侧同样核 target↔variant（NULL 不作通配，codex BLOCKER×2）
+            # append 的目标身份核（步⑧ CP8.6 收准，codex 第2轮 BLOCKER）：绑定锚从「== 创建者目标」
+            # （evaluation.build_target_id，太严——跨轮 metric_append/repro_eval 的 append 目标≠创建者）
+            # 改为「append 目标**显式声明**追加此 evaluation」= build_target.evaluation_id == evaluation_id
+            #（DDL：eval_action='append_attempt' ⇒ evaluation_id NOT NULL）。堵住「同 variant 别的 target
+            # 把结果污染进它并不指向的格子」（仅 variant 核不够——同 variant 多格子会错格）。
+            if bt[7] != evaluation_id:
+                self._reject(ci, f"append 目标 {build_target_id} 未显式绑定 evaluation {evaluation_id}"
+                                 f"（build_target.evaluation_id={bt[7]}）——不得往未声明的格子追加")
+            if bt[6] != var_id:   # 真不变量兜底：target↔variant（NULL 不通配，CP5.2 codex BLOCKER×2）
                 self._reject(ci, f"target 绑定不符：target {build_target_id} 绑 variant {bt[6]}（NULL=未绑，非法），"
                                  f"evaluation 属 {var_id}")
         for m in metric_results:   # I2 + scope/checkpoint 配对 + ckpt 跨 variant 前置干净拒

@@ -258,9 +258,14 @@
     （create_checked 落单→干净停[在途轮保持游标零提交]→precheck 拦→resolve→同一在途轮续跑；业务拒
     重试/损坏 fail-loud 分流；判官拒 sidecar）—— commit `650aace`（build_log 0038；pytest 618/618；
     内审+codex 第1轮双 APPROVE，NIT 全采纳）。
-  - [ ] CP8.6 plan 全形态受理（**必做**，正式可用性②）：exec/eval target kinds（gate_claim_variant /
-    eval_action append·create 驱动）+ route 特化（reuse_only/eval_only/dependency_wait）+
-    import_defer→DeferredImporter + ImportWorker 装配进 run.py。
+  - [x] CP8.6 exec target kind（正式可用性②之一）：既有 legal baseline 上建变体——_derive_plan exec 占坑
+    身份前置判（baseline_ref→legal / variant_key 未占 / config 非空）+ gate_claim_variant（自建 exec bt）+
+    终局 UPDATE plan_ref/eval_key + manifest 驱动真训练/评估（run.kind='exec'）+ gate_register_variant 入池
+    （baseline 身份不动）。append 绑定核收准（同 variant 别 target 可追加、跨 variant 仍拒，DDL-safe）——
+    commit `<pending>`（build_log 0039）。
+    **切分（模型裁量）**：eval target（frozen schema 对 create_evaluation 无 variant 引用，需设计）+
+    import_defer/ImportWorker 装配 + route dependency_wait 特化 → CP8.6b（独立检查点）；exec 已覆盖
+    「build 家族 + 变体迭代」核心研究形态。
   - [ ] CP8.7 正式可用收口（**必做**，正式可用性③）：运维操作面文档（README：启动命令/goal_brief 写法/
     policy 旋钮/console·status_card·文件请求交互/恢复与停机语义）+ 步⑧步级验证全跑 + ROADMAP/
     implement_note 终态。
