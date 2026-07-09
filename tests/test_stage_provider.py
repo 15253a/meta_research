@@ -368,3 +368,69 @@ def test_judge_result_review_includes_code_and_full_metrics(tmp_path):
     md = jp._subject_md("c1", bt_id, "bundle_result_review")
     assert "print('train')" in md                               # 代码在场（反查代码）
     assert "metric_value: 1@1=0.93" in md                       # metric 行全量显式列出，未被 tail 截掉
+
+
+# ============ CP8.5 · sidecar→file_request 桥 ============
+_SIDECAR = {"summary_md": "需要 EEG 数据集", "items": [{
+    "kind": "dataset", "desc": "EEG 原始数据", "expected_files": ["eeg.zip"],
+    "attempted_paths": ["/data/eeg"], "failure_reason": "无读取权限", "dest_hint": "input/user_provided/"}]}
+
+
+def test_sidecar_bridged_to_file_request(tmp_path):
+    """已接桥：sidecar → 桥落请求单 → StageBlockedOnResources（信封其余产物弃用——工人自述缺文件）。"""
+    from orchestrator.interfaces import StageBlockedOnResources
+    seen = {}
+
+    def bridge(stage, request, cyc):
+        seen.update(stage=stage, request=request, cyc=cyc)
+        return 42
+    runner = MockRunner([{"selection.json": _GOOD_SELECTION, "resource_request.json": _SIDECAR}])
+    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+                       system_prompt="S", skills=SKILLS, work_root=str(tmp_path), file_request_bridge=bridge)
+    cyc = NS(cycle_id="c1", question_id="q1")
+    with pytest.raises(StageBlockedOnResources) as ei:
+        sp.reasoning(cyc, _pack("reasoning"))
+    assert ei.value.request_id == 42 and ei.value.stage == "reasoning"
+    assert seen["stage"] == "reasoning" and seen["request"] == _SIDECAR and seen["cyc"] is cyc
+
+
+def test_sidecar_bridge_reject_feeds_retry(tmp_path):
+    """桥拒（sidecar 非法/quota 尽）→ 计入重试反馈（工人可修正或放弃 sidecar），有界后 fail loud。"""
+    from orchestrator.notify import FileRequestReject
+
+    def bridge(stage, request, cyc):
+        raise FileRequestReject("quota 已达上限")   # 只有业务拒进重试；其余异常 fail loud（内审 NIT）
+    runner = MockRunner([{"selection.json": _GOOD_SELECTION, "resource_request.json": _SIDECAR},
+                         {"selection.json": _GOOD_SELECTION}])                    # 第 2 次放弃 sidecar
+    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+                       system_prompt="S", skills=SKILLS, work_root=str(tmp_path), file_request_bridge=bridge)
+    out = sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning"))
+    assert out == {"selection.json": _GOOD_SELECTION}
+    assert "sidecar 被拒" in runner.skills_seen[1] and "quota" in runner.skills_seen[1]
+
+
+def test_judge_rejects_sidecar_with_feedback(tmp_path):
+    """判官不受理 sidecar（评审材料已全量给出）——反馈重试，不静默丢弃。"""
+    daemon, bt_id, work = _judge_env(tmp_path)
+    jp, runner = _judge(daemon, work, [
+        {"review_verdict.json": {"verdict": "pass", "issues": []}, "resource_request.json": _SIDECAR},
+        {"review_verdict.json": {"verdict": "pass", "issues": []}}])
+    jp("c1", bt_id, "bundle_code_review", "sh-1")
+    assert "不受理 resource_request" in runner.skills_seen[1]
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 1
+
+
+def test_sidecar_bridge_nonbusiness_error_fails_loud(tmp_path):
+    """codex NIT 回归（关键异常边界钉牢）：桥抛**非** FileRequestReject（如 DB 损坏）→ 原样 fail loud，
+    不进 artifact_parse 重试（重试会把损坏掩成「工人产物问题」）。"""
+    import sqlite3 as _sqlite3
+
+    def bridge(stage, request, cyc):
+        raise _sqlite3.OperationalError("database disk image is malformed")
+    runner = MockRunner([{"selection.json": _GOOD_SELECTION, "resource_request.json": _SIDECAR},
+                         {"selection.json": _GOOD_SELECTION}])   # 若误重试会吃到第 2 项
+    sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+                       system_prompt="S", skills=SKILLS, work_root=str(tmp_path), file_request_bridge=bridge)
+    with pytest.raises(_sqlite3.OperationalError, match="malformed"):
+        sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning"))
+    assert len(runner.skills_seen) == 1                          # 未重试（原样上抛）

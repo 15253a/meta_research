@@ -37,7 +37,7 @@ from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
 from .mediator import open_responder_read_conn
-from .notify import make_advancer_precheck
+from .notify import FileRequestService, make_advancer_precheck
 from .runner import CodexRunner
 from .schemas import SchemaSet
 from .stage_provider import JudgeProvider, StageProvider
@@ -110,8 +110,21 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     skills = {s: (root / "prompts" / "skills" / s / "SKILL.md").read_text(encoding="utf-8") for s in _STAGES}
     rf = runner_factory or (lambda transcripts_dir, purpose_tag:
                             CodexRunner(transcripts_dir=transcripts_dir, purpose_tag=purpose_tag))
+
+    # sidecar→文件请求桥（步⑧ CP8.5）：阶段产 resource_request.json → interaction_request(pending) →
+    # StageBlockedOnResources → run_cycles 干净停 → precheck 全局等待；用户 resolve 到 input/user_provided/
+    # 后续跑重做该阶段。goal 版本按当下最新（goal_amend 后新请求挂新版）。
+    file_requests = FileRequestService(daemon, schemas, policy, input_root=str(root / "input"))
+
+    def file_request_bridge(stage: str, request: Dict[str, Any], cyc) -> int:
+        gid, gver = daemon.query_one("SELECT id, version FROM goal ORDER BY version DESC LIMIT 1")
+        return file_requests.create_checked(
+            goal_id=gid, goal_ver=gver, stage=stage, request=request,
+            cycle_id=getattr(cyc, "cycle_id", None), question_id=getattr(cyc, "question_id", None))
+
     provider = StageProvider(runner_factory=rf, schemas=schemas, policy=policy,
-                             system_prompt=system_prompt, skills=skills, work_root=str(work))
+                             system_prompt=system_prompt, skills=skills, work_root=str(work),
+                             file_request_bridge=file_request_bridge)
 
     attack_stages = attack if isinstance(attack, AttackStages) else None
     if attack is True:

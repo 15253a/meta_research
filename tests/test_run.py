@@ -324,3 +324,47 @@ def test_plan_reject_feedback_suppressed_after_success(tmp_path):
     pack = compiler.render(cycle_id=c3.cycle_id, stage="plan")
     assert "plan 被拒原因" not in pack.anchor_md                # 已有更晚成功 plan → 反馈静默
     daemon.conn.close()
+
+
+# ============ CP8.5 · sidecar→file_request 全等待环（E2E 经 run.py 装配）============
+_SIDECAR_REQ = {"summary_md": "需要 EEG 数据集", "items": [{
+    "kind": "dataset", "desc": "EEG 原始数据", "expected_files": ["eeg.zip"],
+    "attempted_paths": ["/data/eeg"], "failure_reason": "无读取权限", "dest_hint": "input/user_provided/"}]}
+
+
+def test_file_request_wait_loop_end_to_end(tmp_path):
+    """全等待环：阶段发 sidecar → 请求单落库 + run 干净停（在途轮保持游标）→ 再 run 被 precheck 全局
+    等待阻断 → 用户 resolve → 再 run 续跑同一阶段成功。"""
+    from orchestrator.interaction import InteractionIngest
+    from orchestrator.notify import FileRequestService
+    from orchestrator.schemas import SchemaSet
+    import yaml as _yaml
+
+    boot = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根", "local_key": "root"}]},
+            "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
+                               "terminate_reason_md": "创世即止"}}
+    # 第一次 run：reasoning 阶段发 sidecar → 阻断
+    sys1 = build_system(SYSTEM_ROOT, str(tmp_path),
+                        runner_factory=_lazy_factory([{**boot, "resource_request.json": _SIDECAR_REQ}]))
+    assert sys1.run(max_cycles=3) == []                          # 零轮完成（在途轮保持游标）
+    assert "文件请求" in sys1.advancer.last_block_reason
+    rid = sys1.daemon.query_one("SELECT id FROM interaction_request WHERE status='pending'")[0]
+    assert sys1.daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "created"
+
+    # 第二次 run（同 work root）：precheck 全局等待阻断（provider 一次都不调）
+    sys2 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory([]))
+    assert sys2.run(max_cycles=3) == []
+    assert f"#{rid}" in sys2.advancer.last_block_reason
+
+    # 用户 resolve（条目未提供=unavailable，合法部分解决）→ 第三次 run 续跑同一阶段成功
+    mid = InteractionIngest(sys2.daemon).inbound(connector="qq", raw_text="数据给不了，先跑",
+                                                 idempotency_key="fr-1", goal_id=1, goal_ver=1)
+    policy = _yaml.safe_load((Path(SYSTEM_ROOT) / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+    frs = FileRequestService(sys2.daemon, SchemaSet(Path(SYSTEM_ROOT) / "schemas"), policy,
+                             input_root=str(tmp_path / "input"))
+    up = tmp_path / "uploads"; up.mkdir()
+    frs.resolve(request_id=rid, uploads_dir=str(up), resolved_message_id=mid)
+    sys3 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory([boot]))
+    ids = sys3.run(max_cycles=3)
+    assert len(ids) == 1                                         # 同一在途轮续跑完成
+    assert sys3.daemon.query_one("SELECT count(*) FROM question")[0] == 1

@@ -305,3 +305,15 @@ class PhaseCommitStore(Protocol):
 
     def check_or_record(self, *, cycle_id: str, stage: Stage,
                         target_id: Optional[str], artifact_hash: str) -> Literal["new", "duplicate", "conflict"]: ...
+
+
+class StageBlockedOnResources(RuntimeError):
+    """阶段发出 resource_request sidecar 且请求单已落（步⑧ CP8.5）：本轮**不能**继续（工人声明缺文件
+    无法工作），也**不是**失败——run_cycles 捕获后干净停止推进（在途轮保持游标），precheck 的全局等待
+    （pending 文件请求阻断）接管；用户 resolve 后重启/续跑即从同一阶段重做（provider 重调，文件已在
+    input/user_provided/ 托管区）。"""
+
+    def __init__(self, request_id: int, stage: str):
+        super().__init__(f"阶段 {stage} 等待文件请求 #{request_id}（全局等待：用户提供后续跑）")
+        self.request_id = request_id
+        self.stage = stage
