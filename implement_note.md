@@ -4,29 +4,27 @@
 > 覆盖式更新，只写当下；历史去 `build_log/`（INDEX.md 索引）与 `git log` 找。
 > 位置指针以本文件为权威；`ROADMAP.md`「当前位置」是记账时才同步的兜底备份（§9）。
 
-- 更新：2026-07-09 ｜ 位置：**步⑨（M8）CP9.3**（入站闭环）——**空闲/待开工**
-- 检查点状态：CP9.2 已提交（**302261a** + build_log 0043）。CP9.1（295f84d + 0042）。测试 **642 绿**（638+前端4）。
+- 更新：2026-07-09 ｜ 位置：**步⑨（M8）CP9.4**（端到端验收，步⑨收尾）——**空闲/待开工**
+- 检查点状态：CP9.3 已提交（**6967dc3** + build_log 0044）。测试 **662 绿**（642+ingest 20）。
 
-> CP9.2 收口：外审第1轮 codex REQUEST_CHANGES（2 BLOCKER[r2 硬编码 / fs 树未接] + 6 SHOULD + 1 NIT）→全改；
-> 第2轮 **APPROVE**（余 2 SHOULD[refreshDB 跳拍防并发 / fsOpen 保留 demo 回退] + 2 NIT[session_max=null 显关闭 /
-> clampSelections 用 max id] 均已补齐复验）。前端只读观测面全真化 + 稀疏/空/null 守卫，单写纪律不破。
+> 步⑨进度：CP9.1 数据面（console_server）+ CP9.2 前端真数据 + **CP9.3 入站闭环（ConsoleInboxIngest）已落**。
+> CP9.3 经内审(Opus)+外审(codex 两轮，§2.2 修毕)收敛出 no-loss/no-dup 不变量：query-once 落持久层（查 reply 存在性）、
+> **只有 durable reply 才推进游标**、line-index 游标、有限重试(5)+终态回执、顶层兜底不崩主循环。剩 CP9.4 收尾步⑨。
 
 ## 正在做什么
-**空闲 / CP9.3 待开工。** 步⑨（M8）人类控制台接入（用户 2026-07-09：要系统在控制台上真查看；纠正 CP8.8
-期「系统无 web 组件」结论）。原型 = `reference/人类控制台原型-v2.html`。已落：CP9.1 数据面（console_server.py
-独立只读 /api/db + spool 入站）、CP9.2 前端接入真数据（views/console/index.html 全真化 + 去 mock 渲染码）。
-剩 CP9.3 入站闭环 + CP9.4 端到端验收。
+**空闲 / CP9.4 待开工（步⑨收尾）。** 步⑨（M8）人类控制台接入（用户 2026-07-09：要系统在控制台上真查看）已落三关：
+CP9.1 数据面（console_server 独立只读 /api/db + spool 入站）、CP9.2 前端真数据（views/console/index.html 全真化）、
+CP9.3 入站闭环（ConsoleInboxIngest：precheck 边界 ingest console_inbox → handle_inbound/mediator）。CP9.4 收尾即完成步⑨。
 
-## 下一步动作（按序）—— CP9.3 入站闭环
-1. run 进程 precheck 边界 ingest `<work>/state/console_inbox.jsonl`（console_server 的 /api/message 已把人工
-   入站写进该 spool，一行 JSON `{connector:console, raw_text, seq, idempotency_key}`，换行终止=committed）：
-   读未消费行（游标持久化、幂等）→ `InteractionIngest.inbound(connector, raw_text, idempotency_key, goal_id,
-   goal_ver)` → interaction_message；`Console.handle_inbound` 分类 → directive（落库）/ 回执；
-   query → `Mediator.handle_query(message_id)` 应答。（M5 入站链已存在，见下「关键上下文」。）
-2. 装配进 run.py（advancer precheck 或独立 ingest 步）；ingest 按 UNIQUE(connector,idempotency_key) 去重重放。
-3. pause/resume/query 端到端测试（控制台发命令 → run ingest → 生效/应答）。
-4. 内审(Opus) → codex 外审(≤2轮) → 提交 → build_log 0044。
-5. 之后 CP9.4：真 Codex 跑 + console_server 并行 + 浏览器/HEADLESS 真查看实测 + README 控制台节 + 步⑨步级验证收口。
+## 下一步动作（按序）—— CP9.4 端到端验收（步⑨收尾）
+1. **真查看实测**：起 run（真 Codex，代理 7890）+ 并行起 console_server（`python -m orchestrator.console_server
+   --system-root . --work-root <同 run 的 work> --port 8765`）→ 浏览器/HEADLESS 打开 `views/console/index.html`
+   （或 console_server 静态托管的 /）→ 核 /api/db 真数据在页上渲染、/api/file 白名单、控制台发命令→console_inbox
+   →run precheck ingest→生效/应答 全链真跑一遍留证。
+2. **README 控制台节**：补运维手册——如何起 console_server、如何查看、入站命令闭环（pause/resume/query）、单写纪律边界。
+3. **步⑨步级验证收口**：跑步⑨「验证方法」（用户给的那条），留输出作 build_log 步级证据。
+4. 内审(Opus) → codex 外审(≤2轮) → 提交 → build_log 0045。
+5. 步⑨完成后：回看存量 CP8.6b（eval/import/route，非阻塞）+ 运维执行/硬化（§7.4 T1/T2、双模 A/B、成本账网）。
 
 ## 关键上下文 / 坑（新 session 不读会踩的）
 - **⚠ 开工先看 `git status`**（CP9.1 教训，build_log 0042 载）：工作区若带未提交改动（本次是一份误带的

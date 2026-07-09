@@ -15,7 +15,7 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑨（M8）CP9.3**（入站闭环）。CP9.1 数据面 + CP9.2 前端接入真数据已落（642 测绿）。步①–⑧全完成（625 测绿；步⑧「正式直接
+- 进行中的步 / 检查点：**步⑨（M8）CP9.4**（端到端验收，步⑨收尾）。CP9.1 数据面 + CP9.2 前端真数据 + CP9.3 入站闭环已落（662 测绿）。步①–⑧全完成（625 测绿；步⑧「正式直接
   可用」达成并在部署副本真 Codex 实跑验证——CP8.8 修复首跑发现的 reasoning selection 楔死 bug、复跑越过、
   τ 干净自停）。步⑨=把 `reference/人类控制台原型-v2.html` 接上真系统（用户 2026-07-09 明确要真接入控制台
   可视化，纠正 CP8.8 期「系统无 web 组件」结论）——CP9.1 控制台数据面已落（console_server.py 独立只读进程 +
@@ -316,6 +316,8 @@
     原型把 mock 焊进渲染码，全改读真 payload；adaptPayload/buildLive/applyLive/clampSelections/streamSyncReal/
     refreshDB/fsRefresh；删 6 魔法轮号面板+2 死函数；空/稀疏/null 真库全守卫）+ node HEADLESS 遍历全 9 标签页冒烟
     (seeded+空库+null-cap) + 前后端形状契约测试。→ commit `302261a`（build_log 0043；codex 第2轮 APPROVE；642 测绿）。
-  - [ ] CP9.3 入站闭环：run 进程 precheck 边界 ingest console_inbox.jsonl（ingest→classify→directive/query→
-    Mediator 应答）+ 控制台 pause/resume/query 端到端测试。
+  - [x] CP9.3 入站闭环：run 进程 precheck 边界 ingest console_inbox.jsonl（ConsoleInboxIngest → handle_inbound
+    [幂等落 directive/note] → query 经 mediator 应答；no-loss/no-dup：query-once 落持久层、只有 durable reply 才推进
+    游标、line-index 游标、有限重试+终态回执、顶层兜底不崩主循环）+ 控制台 pause/resume/query 端到端测试。
+    → commit `6967dc3`（build_log 0044；codex 两轮 §2.2 修毕；662 测绿，含 pause→确认→阻断→resume 端到端）。
   - [ ] CP9.4 端到端验收：真 Codex 跑 + 控制台并行真查看实测 + README 控制台节 + 步级验证收口。
