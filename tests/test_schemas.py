@@ -22,6 +22,8 @@ STAGE_SCHEMAS = [
     "policy",
     # bundle 编译产物：机器执行契约（步⑧ CP8.1；plan 保持抽象，命令只在此，executor=orchestrator/manifest.py）
     "execution_manifest",
+    # bundle 双评审裁决（步⑧ CP8.3；judge 产，JudgeProvider 落 runner_call+DECISION）
+    "review_verdict",
     # sidecar（非 Gate 产物：schema 校验后经 interaction_request_create，不入研究库，§6.11）
     "resource_request",
     # 过程产物（runner_call 级契约：生成草稿 / 判官 / 评审输出，驱动器消费）

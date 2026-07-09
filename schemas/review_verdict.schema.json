@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/review_verdict.schema.json",
+  "title": "review_verdict",
+  "description": "bundle 双评审（judge）产物（步⑧ CP8.3）：bundle_code_review（代码适配评审）与 bundle_result_review（结果评审）共用。judge 只产此裁决文件、永不碰 DB——runner_call(audit) 与 DECISION(judge) 行由编排器（JudgeProvider）落库，subject_hash 由编排器确定性重算注入（judge 不自算，§4.1.4 附注）。verdict=fail 拥有否决权（目标 failed(review_failed)，测量整包不注册）。",
+  "type": "object",
+  "required": ["verdict", "issues"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": { "enum": ["pass", "fail"] },
+    "issues": {
+      "type": "array",
+      "description": "发现的问题（fail 必至少一条；pass 可为空数组或列非阻塞观察）",
+      "items": {
+        "type": "object",
+        "required": ["item", "why"],
+        "additionalProperties": false,
+        "properties": {
+          "item": { "type": "string", "minLength": 1 },
+          "why": { "type": "string", "minLength": 1 },
+          "fix_hint": { "type": "string" }
+        }
+      }
+    },
+    "notes_md": { "type": "string", "description": "评审说明（中文；给轮尾 reasoning 与人读）" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "verdict": { "const": "fail" } }, "required": ["verdict"] },
+      "then": { "properties": { "issues": { "minItems": 1 } } }
+    }
+  ]
+}

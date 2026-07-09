@@ -53,10 +53,11 @@ STAGE_ANCHORS = {
         "smoke", "worktree",
         "code_review", "result_review",   # 双评审
         "engineering_blocked",
-        "fake", "synthetic",              # M0 造假必标
+        # （步⑧ m7-1：删 "fake"/"synthetic" 锚——它们是 M0 造假桩必标；真执行契约起不再造假）
         "两段提交",
         "早退", "skipped",                # RFAIL 分支
         "critical",
+        "execution_manifest", "plan_slice_hash", "metric_value", "{src}", "{ckpt}",   # 步⑧真执行契约锚
     ],
     "reasoning": [
         "R1", "R2", "R3", "R4",

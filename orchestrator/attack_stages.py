@@ -690,10 +690,9 @@ class AttackStages:
     def _code_subject_hash(self, slice_: Dict[str, Any], manifest, ledger: Dict[str, str], staging: Path) -> str:
         """代码评审 subject（步⑧：真材料）：plan 切片哈希 + 物化代码 ledger 哈希（=真代码内容）+ 配置哈希 +
         identity 草稿哈希（staged）+ smoke transcript。编排器确定性重算，judge/register 两处一致。"""
-        smoke_dir = staging / "smoke"
-        logs = sorted(smoke_dir.glob("smoke-*.log"))
-        smoke_ref = str(logs[-1]) if logs else "smoke:none"
-        smoke_hash = H.file_sha256(smoke_ref) if logs else "0" * 64
+        latest = H.latest_smoke_log(staging / "smoke")   # 数值序取最新（字典序 smoke-10<smoke-2，codex SHOULD）
+        smoke_ref = str(latest) if latest else "smoke:none"
+        smoke_hash = H.file_sha256(smoke_ref) if latest else "0" * 64
         return SM.subject_hash(SM.code_review_manifest(
             plan_slice_hash=_canon_hash(slice_), code_diff_hash=_canon_hash(ledger),
             config_hashes={"config_json": _canon_hash(manifest["config_json"])},

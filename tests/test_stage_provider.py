@@ -23,7 +23,7 @@ from orchestrator.stage_provider import StageProvider
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
 SCHEMAS = SchemaSet(SYSTEM_ROOT / "schemas")
-SKILLS = {s: f"[skill:{s}]" for s in ("idea", "plan", "reasoning")}
+SKILLS = {s: f"[skill:{s}]" for s in ("idea", "plan", "bundle", "reasoning")}
 
 _GOOD_SELECTION = {"next_question_id": None, "next_intent": "terminate", "scores": [],
                    "terminate_reason_md": "目标达成"}
@@ -200,3 +200,171 @@ def test_end_to_end_with_real_advancer(tmp_path):
     assert len(ids) == 1                                       # bootstrap 轮跑通 + terminate
     assert state.cycle(ids[0]).status == "done"
     assert daemon.query_one("SELECT count(*) FROM question WHERE text='根问题'")[0] == 1   # 真落库
+
+
+# ============ CP8.3 · bundle 阶段（passthrough）============
+_MANIFEST = json.loads((_FIX / "execution_manifest" / "build_toy.json").read_text(encoding="utf-8"))
+
+
+def _bundle_envelope():
+    return {"execution_manifest.json": _MANIFEST, "identity.md": "# toy\n## 复现命令\npython train.py",
+            "train.py": "print('t')", "eval.py": "print('e')", "cfg.json": {"lr": 0.1}}
+
+
+def test_bundle_passthrough_all_files(tmp_path):
+    """bundle 信封全量透传（代码文件名任意、不可枚举）——required 校验后原样返回，物化归组件。"""
+    sp, _ = _provider([_bundle_envelope()], tmp_path)
+    out = sp.bundle(NS(cycle_id="c1"), _pack("bundle"))
+    assert out == _bundle_envelope()                            # 含代码文件与 cfg.json（未被丢弃）
+
+
+def test_bundle_missing_identity_retried_then_ok(tmp_path):
+    bad = {k: v for k, v in _bundle_envelope().items() if k != "identity.md"}
+    sp, runner = _provider([bad, _bundle_envelope()], tmp_path)
+    out = sp.bundle(NS(cycle_id="c1"), _pack("bundle"))
+    assert "identity.md" in out
+    assert "identity.md" in runner.skills_seen[1]               # 重试反馈里点名缺的文件
+
+
+def test_bundle_blank_identity_rejected(tmp_path):
+    bad = {**_bundle_envelope(), "identity.md": "   "}
+    sp, _ = _provider([bad] * (POLICY["flow"]["retry"]["artifact_parse"] + 1), tmp_path)
+    with pytest.raises(RunnerError, match="identity.md"):
+        sp.bundle(NS(cycle_id="c1"), _pack("bundle"))
+
+
+def test_bundle_invalid_manifest_retried_with_feedback(tmp_path):
+    bad_manifest = {**_MANIFEST, "commands": {"eval": _MANIFEST["commands"]["eval"]}}   # build 缺 train/smoke
+    sp, runner = _provider([{**_bundle_envelope(), "execution_manifest.json": bad_manifest},
+                            _bundle_envelope()], tmp_path)
+    out = sp.bundle(NS(cycle_id="c1"), _pack("bundle"))
+    assert out["execution_manifest.json"] == _MANIFEST
+    assert "execution_manifest.json" in runner.skills_seen[1]   # schema 错误反馈进重试 skill
+
+
+# ============ CP8.3 · JudgeProvider（真 Codex 双评审装配）============
+def _judge_env(tmp_path):
+    """真 SQLite（goal/cycle/question/baseline/variant/build_target[plan_ref=切片]）+ staging 物化材料。"""
+    from orchestrator.writedaemon import WriteDaemon
+    import conftest
+    path = str(tmp_path / "j.sqlite")
+    seed = db.connect(path)
+    conftest.seed_minimal(seed)                                  # goal/cycle1/question1/baseline1(variant1)
+    seed.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id,plan_ref) "
+                 "VALUES (1,1,'build',3,'smoke',1,1,?)", (json.dumps({"target_key": "t1", "spec_md": "toy"}),))  # seq=3：seed_minimal 已占 1/2
+    seed.commit(); seed.close()
+    daemon = WriteDaemon(db.connect(path))
+    bt_id = daemon.query_one("SELECT id FROM build_target WHERE seq=3")[0]
+    src = tmp_path / "work" / "c1" / f"t{bt_id}" / "src"
+    src.mkdir(parents=True)
+    (src / "train.py").write_text("print('train')", encoding="utf-8")
+    (src / "identity.md").write_text("# toy 身份", encoding="utf-8")
+    smoke = tmp_path / "work" / "c1" / f"t{bt_id}" / "smoke"
+    smoke.mkdir(parents=True)
+    (smoke / "smoke-1.log").write_text("smoke ok", encoding="utf-8")
+    return daemon, bt_id, tmp_path / "work"
+
+
+def _judge(daemon, work, scripted):
+    from orchestrator.stage_provider import JudgeProvider
+    runner = MockRunner(scripted)
+    jp = JudgeProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS, policy=POLICY,
+                       system_prompt="SYS", skill="[skill:judge]", daemon=daemon, work_root=str(work))
+    return jp, runner
+
+
+def test_judge_records_runner_call_and_decision(tmp_path):
+    daemon, bt_id, work = _judge_env(tmp_path)
+    jp, runner = _judge(daemon, work, [{"review_verdict.json": {"verdict": "pass", "issues": []}}])
+    jp("c1", bt_id, "bundle_code_review", "sh-1")
+    rc = daemon.query_one("SELECT phase, purpose, status FROM runner_call ORDER BY id DESC LIMIT 1")
+    assert rc == ("audit", "bundle_code_review", "success")
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE actor='judge' ORDER BY id DESC LIMIT 1")[0])
+    assert payload["verdict"] == "pass" and payload["subject_hash"] == "sh-1"
+    assert payload["build_target_id"] == bt_id and payload["round_no"] == 1
+    assert payload["runner_call_id"] is not None and len(payload["policy_hash"]) == 64
+    # subject 材料真装配：物化代码 + smoke transcript 进 anchor（judge 只读材料、不碰仓库）
+    # MockRunner 未存 pack；用 _subject_md 直接断言装配面
+    md = jp._subject_md("c1", bt_id, "bundle_code_review")
+    assert "train.py" in md and "smoke ok" in md and "toy" in md
+
+
+def test_judge_fail_verdict_recorded_with_round_increment(tmp_path):
+    daemon, bt_id, work = _judge_env(tmp_path)
+    jp, _ = _judge(daemon, work, [
+        {"review_verdict.json": {"verdict": "pass", "issues": []}},
+        {"review_verdict.json": {"verdict": "fail", "issues": [{"item": "指标硬编码", "why": "eval 不读 ckpt"}]}}])
+    jp("c1", bt_id, "bundle_code_review", "sh-1")
+    jp("c1", bt_id, "bundle_code_review", "sh-2")               # 产物变 → 重评审 → round_no 递增
+    rows = daemon.query("SELECT json_extract(payload_json,'$.round_no'), json_extract(payload_json,'$.verdict') "
+                        "FROM decision WHERE actor='judge' ORDER BY id")
+    assert rows == [(1, "pass"), (2, "fail")]
+
+
+def test_judge_invalid_verdict_retries_then_raises(tmp_path):
+    daemon, bt_id, work = _judge_env(tmp_path)
+    bad = {"review_verdict.json": {"verdict": "fail", "issues": []}}     # fail 必至少一条 issue（schema）
+    jp, runner = _judge(daemon, work, [bad] * (POLICY["flow"]["retry"]["artifact_parse"] + 1))
+    with pytest.raises(RunnerError, match="review_verdict"):
+        jp("c1", bt_id, "bundle_code_review", "sh-1")
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 0   # 非法裁决不落库
+    assert daemon.query_one("SELECT count(*) FROM runner_call")[0] == 0
+    assert "should be non-empty" in runner.skills_seen[-1]      # schema 反馈进重试
+
+
+def test_judge_result_review_subject_includes_logs(tmp_path):
+    """result review 材料装配：train/eval log 尾部 + checkpoint 哈希 + identity（log 仅供评审读）。"""
+    daemon, bt_id, work = _judge_env(tmp_path)
+    with daemon.transaction() as conn:
+        rid = conn.execute("INSERT INTO run(cycle_id,variant_id,build_target_id,kind,status) "
+                           "VALUES (1,1,?,'build','success')", (bt_id,)).lastrowid
+        conn.execute("INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,produced_by_run) "
+                     "VALUES (1,'final-r1','/x/ckpt.bin','ab12','sha256',?)", (rid,))
+    t_dir = work / "c1" / f"t{bt_id}"
+    (t_dir / f"run{rid}").mkdir(parents=True)
+    (t_dir / f"run{rid}" / "train.log").write_text("loss: 0.2", encoding="utf-8")
+    (t_dir / f"eval{rid}").mkdir(parents=True)
+    (t_dir / f"eval{rid}" / "eval.log").write_text("metric_value: 1@1=0.93", encoding="utf-8")
+    jp, _ = _judge(daemon, work, [{"review_verdict.json": {"verdict": "pass", "issues": []}}])
+    md = jp._subject_md("c1", bt_id, "bundle_result_review")
+    assert "loss: 0.2" in md and "metric_value: 1@1=0.93" in md and "ab12" in md and "toy 身份" in md
+
+
+def test_judge_unknown_kind_fails_loud(tmp_path):
+    """codex SHOULD 回归：拼错的 review_kind 当场拒（否则写任意 decision.type，下游永远看不到期望评审）。"""
+    daemon, bt_id, work = _judge_env(tmp_path)
+    jp, _ = _judge(daemon, work, [])
+    with pytest.raises(ValueError, match="review_kind"):
+        jp("c1", bt_id, "bundle_code_reviw", "sh-1")            # typo kind
+    assert daemon.query_one("SELECT count(*) FROM runner_call")[0] == 0
+
+
+def test_smoke_latest_is_numeric_order(tmp_path):
+    """codex SHOULD 回归：smoke-10.log 数值序 > smoke-2.log（字典序会取错「最新」）。
+    attack subject 构造与 judge 材料装配共用 harness.latest_smoke_log 同一口径。"""
+    from orchestrator.harness import latest_smoke_log
+    daemon, bt_id, work = _judge_env(tmp_path)
+    smoke = work / "c1" / f"t{bt_id}" / "smoke"
+    (smoke / "smoke-2.log").write_text("OLD-2", encoding="utf-8")
+    (smoke / "smoke-10.log").write_text("NEW-10", encoding="utf-8")
+    assert latest_smoke_log(smoke).name == "smoke-10.log"
+    jp, _ = _judge(daemon, work, [])
+    assert "NEW-10" in jp._subject_md("c1", bt_id, "bundle_code_review")
+
+
+def test_judge_result_review_includes_code_and_full_metrics(tmp_path):
+    """codex BLOCKER 回归：result review 材料须含**代码**（判据「据结果反查代码」）与 metric_value 行
+    **全量**（不受 log tail 截断）。"""
+    daemon, bt_id, work = _judge_env(tmp_path)
+    with daemon.transaction() as conn:
+        rid = conn.execute("INSERT INTO run(cycle_id,variant_id,build_target_id,kind,status) "
+                           "VALUES (1,1,?,'build','success')", (bt_id,)).lastrowid
+    t_dir = work / "c1" / f"t{bt_id}"
+    (t_dir / f"eval{rid}").mkdir(parents=True)
+    big_log = ("filler\n" * 2000) + "metric_value: 1@1=0.93\n" + ("post\n" * 600)   # metric 行不在尾部 2000 字符内
+    (t_dir / f"eval{rid}" / "eval.log").write_text(big_log, encoding="utf-8")
+    jp, _ = _judge(daemon, work, [])
+    md = jp._subject_md("c1", bt_id, "bundle_result_review")
+    assert "print('train')" in md                               # 代码在场（反查代码）
+    assert "metric_value: 1@1=0.93" in md                       # metric 行全量显式列出，未被 tail 截掉
