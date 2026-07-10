@@ -22,16 +22,18 @@ has_blocking_pause = 最近一次被消费的 pause/resume 是 pause**（按消�
 先消费到期 directive 再查阻断（Advancer 前置检查顺序，CP6.3 接线）。resume 消费顺带把**早于它的**
 pending pause 置 superseded（队列清理；晚到的 pause 保留、到时机再生效）。
 
-其余效果（M5）：abort_cycle（在途轮 aborted）、inject_question（open 问题，source='human'）、
+其余效果：abort_cycle（在途轮 aborted，并原子释放 active 问题）、inject_question（open 问题，source='human'）、
 prune_branch（decision(type=prune_branch) 先行再 dead_end，且**该决策即消费决策**——一次消费一条
-人类决策，不重复记账）、note/set_budget/reprioritize/goal_amend（记 DECISION+效果摘要；score 权重
-应用/预算 runtime override/goal 版本升级接线 = M6，payload 注明——按时机消费+同记 DECISION 的验收面
-本检查点全量落）。
+人类决策，不重复记账）、note（按 consumed_cycle 真正编入下一次 reasoning ContextPack）。
+`set_budget/reprioritize/goal_amend` 在对应运行时 override、选题约束、goal_amend reasoning-only 路由
+闭合前**不得标 consumed**：precheck 会把它们终态 rejected，并以 DECISION 明示能力尚不可用，避免
+“状态显示已应用、实际上无效果”的假控制面。
 
 **P1**：query/reply/ACK 不写 decision；人机原文只在 interaction_*。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -39,6 +41,7 @@ from typing import Any, Callable, Dict, Optional
 
 from .ids import cnum as _cnum
 from .interaction import InteractionIngest
+from .resource_limits import MAX_REASONING_DIRECTIVES_PER_CYCLE
 from .writedaemon import WriteDaemon
 
 # 指令词表：kind → (触发词, hardness, consume_at)。§4.6.4 表逐行对齐。
@@ -58,10 +61,34 @@ _DIRECTIVE_RULES = [
 _QUERY_HINTS = ("现状", "进展", "进度", "状态", "结果", "为什么", "什么", "多少", "哪",
                 "status", "why", "what", "how")
 
+# console HTTP/spool 的 operation domain 必须进入权威 append-only message；只留在 JSONL 会在 cursor
+# 丢失/跨端点 nonce 复用时失去判别力。复用冻结 DDL 的 session_ref，不新增 migration。
+CONSOLE_MESSAGE_SESSION_REF = "console-op:message:v1"
+DIRECTIVE_ACTION_SESSION_REF = "console-op:directive-action:v1"
+FILE_REQUEST_ACTION_SESSION_REF = "console-op:file-request-action:v1"
+
+
+class IdempotencyCollisionError(ValueError):
+    """同一 connector nonce 已绑定另一份不可变入站内容/goal。"""
+
+
+class DirectiveApplicationError(ValueError):
+    """A durable directive is well-formed enough to audit but cannot be applied."""
+
 
 def sanitize(text: str, max_len: int = 2000) -> str:
     """消毒（中介/应答器输入用）：去控制字符 + 截断。raw 永不改，此为衍生视图。"""
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)[:max_len]
+
+
+def directive_action_text(action: str, directive_id: int, *, reason: str = "") -> str:
+    """显式 directive 控件动作的唯一不可变原文口径（server/ingest/事务终检共用）。"""
+    if action == "confirm":
+        return f"确认指令 d{directive_id}"
+    if action == "reject":
+        digest = hashlib.sha256(reason.encode("utf-8")).hexdigest()
+        return f"拒绝指令 d{directive_id} reason_sha256:{digest}"
+    raise ValueError(f"directive action 非法: {action!r}")
 
 
 def _hit(low: str, w: str) -> bool:
@@ -98,12 +125,25 @@ class Console:
     # ---------------------------------------------------------------- 入站 --
     def handle_inbound(self, *, connector: str, raw_text: str, idempotency_key: str,
                        goal_id: Optional[int] = None, goal_ver: Optional[int] = None,
-                       cycle_id: Optional[str] = None) -> Dict[str, Any]:
+                       cycle_id: Optional[str] = None,
+                       session_ref: Optional[str] = None) -> Dict[str, Any]:
         """durable 入站 → 恰一分类（幂等：message UNIQUE）→ directive/note 先建行再回指（DDL 时序）。
         返回 {message_id, intent, directive_id?, needs_confirmation?}。unclear：不自动答不产 directive
         （ACK 回显请确认由通知层出，CP6.3）。"""
         mid = self.ingest.inbound(connector=connector, raw_text=raw_text, idempotency_key=idempotency_key,
-                                  goal_id=goal_id, goal_ver=goal_ver, cycle_id=cycle_id)
+                                  goal_id=goal_id, goal_ver=goal_ver, cycle_id=cycle_id,
+                                  session_ref=session_ref)
+        # InteractionIngest 的 UNIQUE 只负责找回 message id；在读取既有 classification 或调用分类器前，
+        # 必须先证明 replay 的不可变 payload 相同。否则“首事务只落 message 后崩溃”的窗口里，撞键 body
+        # 可把自己的 directive 语义提交到另一条 raw message 上。cycle_id 不参与比较：传输重放可能跨
+        # precheck/cycle 才到达，但仍应收敛到首次 durable message。
+        stored = self.daemon.query_one(
+            "SELECT connector,raw_text,raw_hash,goal_id,goal_ver,session_ref "
+            "FROM interaction_message WHERE id=?", (mid,))
+        expected_hash = "sha256:" + hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        if stored != (connector, raw_text, expected_hash, goal_id, goal_ver, session_ref):
+            raise IdempotencyCollisionError(
+                f"{connector} idempotency_key 已绑定其他不可变消息: {idempotency_key}")
         ex = self._existing_classification(mid)
         if ex:                                 # 幂等重放：分类恰一（UNIQUE），返回既有
             return ex
@@ -155,17 +195,58 @@ class Console:
         return {"message_id": mid, "intent": ex[0], "directive_id": did, "needs_confirmation": needs}
 
     # ---------------------------------------------------------------- 确认 --
+    @staticmethod
+    def _validate_action_provenance(conn, *, directive_id: int, source_message_id: int,
+                                    action_message_id: int, action: str, reason: str = "") -> None:
+        """在最终状态迁移事务内验证控件消息，而不是信任上游调用者已经检查过。
+
+        action message 必须是 ``unclear`` 分类、具有 deterministic raw，且 goal 绑定与 directive 的
+        source message 完全一致（含 NULL/goal_ver）。这样任意既有消息、原 directive 源消息或跨 goal
+        消息都不能冒充确认/拒绝 provenance。
+        """
+        action_row = conn.execute(
+            "SELECT m.raw_text,m.goal_id,m.goal_ver,c.intent,c.directive_id,m.session_ref "
+            "FROM interaction_message m LEFT JOIN interaction_classification c ON c.message_id=m.id "
+            "WHERE m.id=?", (action_message_id,)).fetchone()
+        if action_row is None:
+            raise ValueError(f"{action} provenance 消息不存在: {action_message_id}")
+        if action_row[0] != directive_action_text(action, directive_id, reason=reason):
+            raise ValueError(f"directive {directive_id} {action} provenance 原文不符")
+        if (action_row[3], action_row[4]) != ("unclear", None):
+            raise ValueError(f"directive {directive_id} {action} provenance 须为 unclear 控件消息")
+        if action_row[5] != DIRECTIVE_ACTION_SESSION_REF:
+            raise ValueError(f"directive {directive_id} {action} provenance 操作域不符")
+        source_goal = conn.execute(
+            "SELECT goal_id,goal_ver FROM interaction_message WHERE id=?", (source_message_id,)).fetchone()
+        if source_goal is None:
+            raise ValueError(f"directive {directive_id} source provenance 消息不存在")
+        if (action_row[1], action_row[2]) != source_goal:
+            raise ValueError(f"directive {directive_id} {action} provenance 与 source goal 不一致")
+
     def confirm_directive(self, *, directive_id: int, confirm_message_id: int) -> None:
         """硬指令回显确认（用户确认的是润色稿语义）：payload.confirmed=true + 确认消息 provenance。
         directive 无 append-only 触发器（状态机表），UPDATE 合法；status 保持 pending（待时机消费）。
         读校验与更新同事务（防 TOCTOU，同 consume）。"""
         with self.daemon.transaction() as conn:
-            row = conn.execute("SELECT status, payload_json FROM directive WHERE id=?", (directive_id,)).fetchone()
+            row = conn.execute(
+                "SELECT status,hardness,payload_json,source_interaction_message_id FROM directive WHERE id=?",
+                               (directive_id,)).fetchone()
             if row is None:
                 raise ValueError(f"directive 不存在: {directive_id}")
             if row[0] != "pending":
                 raise ValueError(f"directive {directive_id} 非 pending（{row[0]}），不可确认")
-            payload = json.loads(row[1])
+            if row[1] != "hard":
+                raise ValueError(f"directive {directive_id} 是软指令，无需回显确认")
+            self._validate_action_provenance(
+                conn, directive_id=directive_id, source_message_id=row[3],
+                action_message_id=confirm_message_id, action="confirm")
+            payload = json.loads(row[2])
+            if payload.get("confirmed") is True:
+                if payload.get("confirmation_message_id") == confirm_message_id:
+                    return
+                raise ValueError(f"directive {directive_id} 已由另一条消息确认")
+            if payload.get("confirmed") is not False:
+                raise ValueError(f"directive {directive_id} confirmed 字段损坏")
             payload["confirmed"] = True
             payload["confirmation_message_id"] = confirm_message_id
             n = conn.execute("UPDATE directive SET payload_json=? WHERE id=? AND status='pending'",
@@ -173,31 +254,81 @@ class Console:
             if n != 1:        # 兜底同 consume（同事务已校验，理论不可达）
                 raise RuntimeError(f"directive {directive_id} 确认竞态：更新失败")
 
-    def reject_directive(self, *, directive_id: int, reason: str,
+    def reject_directive(self, *, directive_id: int, reason: str, reject_message_id: Optional[int] = None,
                          by_decision: bool = False, cycle_id: Optional[str] = None) -> None:
         """确认不过（用户否掉润色稿）→ rejected 不消费；by_decision=True = **软指令系统有理由不从**
         （§4.6.4：须 DECISION 写明理由——此路记账；用户否决路不写 decision[P1：非研究决策]）。
         读校验与更新同事务（防 TOCTOU，同 consume）。"""
         with self.daemon.transaction() as conn:
-            row = conn.execute("SELECT status, hardness FROM directive WHERE id=?", (directive_id,)).fetchone()
+            row = conn.execute(
+                "SELECT status,hardness,payload_json,source_interaction_message_id FROM directive WHERE id=?",
+                               (directive_id,)).fetchone()
             if row is None:
                 raise ValueError(f"directive 不存在: {directive_id}")
             if row[0] != "pending":
                 raise ValueError(f"directive {directive_id} 非 pending（{row[0]}），不可拒")
             if by_decision:
+                if reject_message_id is not None:
+                    raise ValueError("系统不从路径不得冒充用户拒绝 provenance")
                 if row[1] != "soft":
                     raise ValueError("系统不从仅限软指令（硬指令绕过权衡直接生效，§4.6.4）")
                 conn.execute("INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
                              "VALUES (?,?,'orchestrator','soft_directive_declined',?)",
                              (_cnum(cycle_id) if cycle_id else None, directive_id,
                               json.dumps({"reason": reason}, ensure_ascii=False)))
-            # 用户拒绝路不写 decision（P1），但理由入 payload 供审计/通知（rejected 事件附理由，CP6.3）
+            else:
+                if reject_message_id is None:
+                    raise ValueError("用户拒绝须提供 reject_message_id provenance")
+                self._validate_action_provenance(
+                    conn, directive_id=directive_id, source_message_id=row[3],
+                    action_message_id=reject_message_id, action="reject", reason=reason)
+            # 用户拒绝路不写 decision（P1），但理由和控件消息 id 入 payload 供审计/幂等重放。
+            payload = json.loads(row[2])
+            payload["rejection_reason"] = reason
+            if reject_message_id is not None:
+                payload["rejection_message_id"] = reject_message_id
             n = conn.execute(
-                "UPDATE directive SET status='rejected', "
-                "payload_json=json_set(payload_json,'$.rejection_reason',?) "
-                "WHERE id=? AND status='pending'", (reason, directive_id)).rowcount
+                "UPDATE directive SET status='rejected', payload_json=? WHERE id=? AND status='pending'",
+                (json.dumps(payload, ensure_ascii=False), directive_id)).rowcount
             if n != 1:        # 兜底同 consume（同事务已校验，理论不可达）
                 raise RuntimeError(f"directive {directive_id} 拒绝竞态：更新失败")
+
+    def reject_unapplicable_directive(self, *, directive_id: int, reason: str,
+                                      cycle_id: Optional[str] = None) -> None:
+        """Terminalize a confirmed/due directive whose requested effect is unavailable.
+
+        This is not a user rejection and is valid for hard as well as soft
+        directives.  The explicit DECISION prevents an unsupported command
+        from being advertised as ``consumed`` while also avoiding a permanent
+        poison-pill at every precheck.
+        """
+        with self.daemon.transaction() as conn:
+            row = conn.execute(
+                "SELECT status,payload_json FROM directive WHERE id=?", (directive_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"directive 不存在: {directive_id}")
+            if row[0] == "rejected":
+                return
+            if row[0] != "pending":
+                raise ValueError(f"directive {directive_id} 非 pending（{row[0]}），不可终态拒绝")
+            payload = json.loads(row[1])
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"directive {directive_id} payload 不是 JSON object")
+            payload["rejection_reason"] = str(reason)[:2_000]
+            payload["rejection_kind"] = "application_unavailable"
+            dec = conn.execute(
+                "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+                "VALUES (?,?,'orchestrator','directive_application_rejected',?)",
+                (_cnum(cycle_id) if cycle_id else None, directive_id,
+                 json.dumps({"reason": str(reason)[:2_000]}, ensure_ascii=False))).lastrowid
+            changed = conn.execute(
+                "UPDATE directive SET status='rejected',payload_json=? "
+                "WHERE id=? AND status='pending'",
+                (json.dumps(payload, ensure_ascii=False), directive_id)).rowcount
+            if changed != 1:
+                raise RuntimeError(f"directive {directive_id} 终态拒绝竞态：更新失败")
+            if dec is None:
+                raise RuntimeError(f"directive {directive_id} 终态拒绝 DECISION 未落库")
 
     # ---------------------------------------------------------------- 消费 --
     def pending_directives(self, consume_at: str) -> list:
@@ -225,20 +356,38 @@ class Console:
         consumed_cycle 本可空）。返回 {kind, effect} 供通知层（applied 事件，CP6.3）。"""
         ci = _cnum(cycle_id) if cycle_id else None
         with self.daemon.transaction() as conn:
-            row = conn.execute("SELECT kind, hardness, status, payload_json FROM directive WHERE id=?",
+            row = conn.execute(
+                "SELECT kind,hardness,status,consume_at,payload_json FROM directive WHERE id=?",
                                (directive_id,)).fetchone()
             if row is None:
                 raise ValueError(f"directive 不存在: {directive_id}")
-            kind, hardness, status, payload_raw = row
+            kind, hardness, status, consume_at, payload_raw = row
             if status != "pending":
                 raise ValueError(f"directive {directive_id} 非 pending（{status}），不可消费")
             payload = json.loads(payload_raw)
             if hardness == "hard" and not payload.get("confirmed"):
                 raise ValueError(f"硬指令 {directive_id}（{kind}）未经回显确认，不可消费（§4.6.2 润色确认硬门）")
+            if kind in ("set_budget", "reprioritize", "goal_amend"):
+                raise DirectiveApplicationError(
+                    f"{kind} 尚未接入其 reference 要求的真实状态语义，拒绝伪装为已应用")
+            # Only reasoning_start directives are compiled into this cycle's reasoning pack.  Operational
+            # immediate controls (especially resume/abort) must remain available even after the prompt budget
+            # is full, otherwise a note flood could make a paused cycle impossible to resume.
+            if ci is not None and consume_at == "reasoning_start":
+                consumed_for_cycle = conn.execute(
+                    "SELECT count(*) FROM directive WHERE status='consumed' AND consumed_cycle=? "
+                    "AND consume_at='reasoning_start'",
+                    (ci,)).fetchone()[0]
+                if consumed_for_cycle >= MAX_REASONING_DIRECTIVES_PER_CYCLE:
+                    raise DirectiveApplicationError(
+                        f"cycle c{ci} 人类 directive 已达上下文安全上限 "
+                        f"{MAX_REASONING_DIRECTIVES_PER_CYCLE}；本条未执行")
             effect: Dict[str, Any] = {"kind": kind}
             dec = None            # prune_branch 复用其 prune 决策为消费决策（一次消费恰一条人类决策）
             if kind == "inject_question":
                 # goal_id=1 + MAX(version) = 全库单目标约定（statestore/advancer 同口径）；多目标=系统级改造
+                if conn.execute("SELECT 1 FROM goal WHERE id=1 LIMIT 1").fetchone() is None:
+                    raise DirectiveApplicationError("inject_question 时当前 goal 不存在")
                 qid = conn.execute(
                     "INSERT INTO question(goal_id,goal_ver,born_goal_ver,text,status,source) "
                     "SELECT 1, MAX(version), MAX(version), ?, 'open', 'human' FROM goal WHERE id=1",
@@ -247,11 +396,16 @@ class Console:
             elif kind == "prune_branch":
                 qref = payload.get("question_id")
                 if not qref:
-                    raise ValueError("prune_branch 需 payload.question_id（润色/确认阶段补齐）")
-                qi = int(str(qref)[1:]) if str(qref).startswith("q") else int(qref)
+                    raise DirectiveApplicationError("prune_branch 需 payload.question_id（润色/确认阶段补齐）")
+                try:
+                    qi = int(str(qref)[1:]) if str(qref).startswith("q") else int(qref)
+                except (TypeError, ValueError):
+                    raise DirectiveApplicationError(f"prune_branch question_id 非法: {qref!r}") from None
                 qs = conn.execute("SELECT status FROM question WHERE id=?", (qi,)).fetchone()
-                if qs is None or qs[0] in ("answered", "refuted", "dead_end"):
-                    raise ValueError(f"prune_branch 目标问题缺失/已终态: {qref}")
+                if qs is None or qs[0] not in ("open", "inconclusive"):
+                    raise DirectiveApplicationError(
+                        f"prune_branch 只允许 open/inconclusive 目标: {qref}"
+                        f"（{qs[0] if qs else '缺失'}）")
                 effect["question_id"] = f"q{qi}"
                 dec = conn.execute("INSERT INTO decision(cycle_id,question_id,directive_id,actor,type,payload_json) "
                                    "VALUES (?,?,?,'human','prune_branch',?)",
@@ -261,10 +415,23 @@ class Console:
                 conn.execute("UPDATE question SET status='dead_end' WHERE id=?", (qi,))   # trg_q_deadend 要求 decision 先行
             elif kind == "abort_cycle":
                 # 单轮在途约定（Advancer 串行推进）：非终态轮至多一个，即"本轮"；多轮并发=系统级改造
-                cur = conn.execute("SELECT id FROM cycle WHERE status NOT IN ('done','failed','aborted') "
+                cur = conn.execute("SELECT id,active_question_id FROM cycle "
+                                   "WHERE status NOT IN ('done','failed','aborted') "
                                    "ORDER BY id LIMIT 1").fetchone()
                 if cur:
-                    conn.execute("UPDATE cycle SET status='aborted', finished_at=CURRENT_TIMESTAMP WHERE id=?", (cur[0],))
+                    active_question_id = cur[1]
+                    if active_question_id is not None:
+                        released = conn.execute(
+                            "UPDATE question SET status='open' WHERE id=? AND status='active'",
+                            (active_question_id,)).rowcount
+                        if released != 1:
+                            raise DirectiveApplicationError(
+                                f"cycle c{cur[0]} active_question_id=q{active_question_id} "
+                                "未指向 active 问题；abort 未执行，需先修复权威状态漂移")
+                        effect["released_question"] = f"q{active_question_id}"
+                    conn.execute(
+                        "UPDATE cycle SET status='aborted', active_question_id=NULL, "
+                        "finished_at=CURRENT_TIMESTAMP WHERE id=?", (cur[0],))
                     effect["aborted_cycle"] = f"c{cur[0]}"
             # pause：消费即进入暂停态（阻断语义在 has_blocking_pause，按消费序判定），无额外行内效果
             elif kind == "resume":
@@ -274,8 +441,9 @@ class Console:
                                       (directive_id,)).fetchall():
                     conn.execute("UPDATE directive SET status='superseded' WHERE id=?", (r[0],))
                     effect.setdefault("superseded_pause", []).append(r[0])
-            # set_budget/reprioritize/goal_amend/note：记账消费（效果接线注 M6——预算 runtime override /
-            # score 权重 / goal 版本升级 / note 进 reasoning 锚点；按时机消费+DECISION 的验收面此处已全）
+            elif kind == "note":
+                # compiler 按 consumed_cycle 把该注解注入同一 reasoning ContextPack。
+                effect["published_to_reasoning_cycle"] = cycle_id
             if dec is None:
                 dec = conn.execute("INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
                                    "VALUES (?,?,'human',?,?)",

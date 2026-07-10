@@ -15,7 +15,7 @@ from jsonschema.exceptions import ValidationError
 
 from orchestrator import database as db
 from orchestrator.interfaces import Artifact, CallUsage
-from orchestrator.run import build_system
+from orchestrator.run import System, build_system
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -37,6 +37,90 @@ def _mock_factory(files_seq):
             return Artifact(stage=context_pack.stage, files=box["seq"].pop(0), md="",
                             usage=CallUsage(tokens_known=True))
     return lambda td, pt: MockRunner()
+
+
+def test_system_run_keeps_primary_when_exit_notification_scan_also_fails(tmp_path):
+    class PrimaryFailure(RuntimeError):
+        pass
+
+    class BrokenAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            raise PrimaryFailure("研究主链失败")
+
+    def broken_scan():
+        raise OSError("outbox 不可写")
+
+    system = System(advancer=BrokenAdvancer(), state=None, daemon=None,
+                    dual_mode="A", work_root=tmp_path, sync_notifications=broken_scan)
+    with pytest.raises(PrimaryFailure, match="研究主链失败") as caught:
+        system.run(1)
+    assert any("notification scan" in note and "outbox 不可写" in note
+               for note in getattr(caught.value, "__notes__", ()))
+
+
+def test_run_forever_waits_and_counts_max_cycles_across_reentry(tmp_path, monkeypatch):
+    class BlockingAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def __init__(self):
+            self.budgets = []
+            self.results = iter([(["c1"], "等待文件"), ([], "等待文件"), (["c2", "c3"], None)])
+
+        def run_cycles(self, max_cycles):
+            self.budgets.append(max_cycles)
+            result, self.last_block_reason = next(self.results)
+            return result
+
+    advancer = BlockingAdvancer()
+    scans = []
+    system = System(advancer=advancer, state=None, daemon=None,
+                    dual_mode="A", work_root=tmp_path, sync_notifications=lambda: scans.append(1))
+    monkeypatch.setattr("orchestrator.run.time.sleep", lambda _seconds: None)
+    assert system.run_forever(3, poll_interval_s=0.01) == ["c1", "c2", "c3"]
+    assert advancer.budgets == [3, 2, 2]                    # 阻断重入不重置总推进预算
+    assert len(scans) == 3                                  # 等待每拍仍扫描通知/reminder
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("nan"), float("inf"), True])
+def test_run_forever_rejects_hot_spin_poll_intervals(tmp_path, interval):
+    class IdleAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            raise AssertionError("非法 interval 必须在推进前拒绝")
+
+    system = System(advancer=IdleAdvancer(), state=None, daemon=None,
+                    dual_mode="A", work_root=tmp_path)
+    with pytest.raises(ValueError, match="0.01"):
+        system.run_forever(1, poll_interval_s=interval)
+
+
+def test_main_ctrl_c_exits_cleanly(tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    class InterruptSystem:
+        dual_mode = "A"
+
+        def __init__(self):
+            self.scans = 0
+
+        def run_forever(self, _max_cycles, *, poll_interval_s):
+            raise KeyboardInterrupt
+
+        def sync_notifications(self):
+            self.scans += 1
+
+    system = InterruptSystem()
+    monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: system)
+    rc = R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+                 "--poll-interval-s", "0.01"])
+    assert rc == 130 and system.scans == 1
+    assert "Ctrl-C" in capsys.readouterr().out
 
 
 # ============ 全装配端到端（reasoning-only 闭环）============
@@ -209,7 +293,7 @@ def test_stop_reason_print_prefers_block(tmp_path, monkeypatch, capsys):
                          "request_hash) VALUES (1,1,'plan','pending','需数据','[]','rh')")
         return s
     monkeypatch.setattr(R, "build_system", factory)
-    R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path), "--max-cycles", "3"])
+    R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path), "--max-cycles", "3", "--once"])
     assert "文件请求" in capsys.readouterr().out
 
 
@@ -231,6 +315,145 @@ def test_global_wait_honored_end_to_end(tmp_path):
     assert sys.run(max_cycles=5) == []
     assert called["n"] == 0                                     # 阻断：一次 runner 都未调
     assert "文件请求" in sys.advancer.last_block_reason
+
+
+def test_console_backlog_over_one_bounded_batch_blocks_before_later_pause(tmp_path):
+    """>4MiB backlog 后的 pause-confirm 尚未 ingest 时，precheck 不得先放行 provider。"""
+    from orchestrator.console import Console
+    from orchestrator.console_spool import MAX_BATCH_BYTES, MAX_RECORD_BYTES
+
+    called = {"n": 0}
+
+    def counting_factory(_td, _pt):
+        class Runner:
+            def run_task(self, **_kw):
+                called["n"] += 1
+                return Artifact(stage="reasoning", files=_BOOT_TERMINATE, md="",
+                                usage=CallUsage(tokens_known=True))
+        return Runner()
+
+    system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=counting_factory)
+    console = Console(system.daemon)
+    pause = console.handle_inbound(
+        connector="console", raw_text="暂停", idempotency_key="seed-backlog-pause")
+    # 每行都超过单 record 上限，故会作为可推进 poison；总量刚越过一批，confirm 在下一批。
+    oversized = b"x" * (MAX_RECORD_BYTES + 1) + b"\n"
+    count = MAX_BATCH_BYTES // len(oversized) + 1
+    confirm = json.dumps({
+        "connector": "console", "idempotency_key": "post-backlog-confirm",
+        "action": "confirm", "directive_id": pause["directive_id"],
+        "raw_text": "展示文本不可信",
+    }, ensure_ascii=False).encode("utf-8") + b"\n"
+    inbox = tmp_path / "state" / "console_inbox.jsonl"
+    inbox.write_bytes(oversized * count + confirm)
+
+    assert system.run(max_cycles=1) == []
+    assert called["n"] == 0
+    assert "控制台入站待处理" in system.advancer.last_block_reason
+    assert system.daemon.query_one(
+        "SELECT json_extract(payload_json,'$.confirmed') FROM directive WHERE id=?",
+        (pause["directive_id"],)) == (0,)
+
+    assert system.run(max_cycles=1) == []                      # 下一拍处理 confirm，pause 成为更高优先阻断
+    assert called["n"] == 0
+    assert "pause" in system.advancer.last_block_reason
+    assert system.daemon.query_one(
+        "SELECT json_extract(payload_json,'$.confirmed') FROM directive WHERE id=?",
+        (pause["directive_id"],)) == (1,)
+
+
+def test_retry_at_console_head_blocks_provider_before_following_action(tmp_path):
+    """队首 query 尚无 status card 而 retry 时，后置 confirm 未处理也绝不能越过并调用 provider。"""
+    from orchestrator.console import Console
+    from orchestrator.console_spool import ConsoleSpool
+
+    called = {"n": 0}
+
+    def counting_factory(_td, _pt):
+        class Runner:
+            def run_task(self, **_kw):
+                called["n"] += 1
+                return Artifact(stage="reasoning", files=_BOOT_TERMINATE, md="",
+                                usage=CallUsage(tokens_known=True))
+        return Runner()
+
+    system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=counting_factory)
+    pause = Console(system.daemon).handle_inbound(
+        connector="console", raw_text="暂停", idempotency_key="seed-retry-pause")
+    spool = ConsoleSpool(tmp_path)
+    spool.append({"connector": "console", "raw_text": "现在进展如何"})
+    spool.append({"connector": "console", "raw_text": "展示文本不可信",
+                  "action": "confirm", "directive_id": pause["directive_id"]})
+
+    assert system.run(max_cycles=1) == []                      # query 无卡 → retry at head
+    assert called["n"] == 0
+    assert "控制台入站待处理" in system.advancer.last_block_reason
+    assert system.daemon.query_one(
+        "SELECT json_extract(payload_json,'$.confirmed') FROM directive WHERE id=?",
+        (pause["directive_id"],)) == (0,)                     # 后置 action 尚未越过队首
+
+
+def test_broken_inbound_state_blocks_due_directive_consumption(tmp_path):
+    """入站 fail-closed 必须早于 base_precheck；更晚已 ACK 的 reject 未读时不得先消费 pause。"""
+    from orchestrator.console import (DIRECTIVE_ACTION_SESSION_REF, Console,
+                                      directive_action_text)
+    from orchestrator.console_spool import ConsoleSpool
+
+    calls = {"n": 0}
+
+    def counting_factory(_td, _pt):
+        class Runner:
+            def run_task(self, **_kw):
+                calls["n"] += 1
+                return Artifact(stage="reasoning", files=_BOOT_TERMINATE, md="",
+                                usage=CallUsage(tokens_known=True))
+        return Runner()
+
+    first = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=counting_factory)
+    console = Console(first.daemon)
+    pause = console.handle_inbound(
+        connector="console", raw_text="暂停", idempotency_key="ordered-pause")
+    did = pause["directive_id"]
+    mid = console.ingest.inbound(
+        connector="console", raw_text=directive_action_text("confirm", did),
+        idempotency_key="ordered-confirm", session_ref=DIRECTIVE_ACTION_SESSION_REF)
+    with first.daemon.transaction() as conn:
+        conn.execute("INSERT INTO interaction_classification(message_id,intent,directive_id) "
+                     "VALUES (?,'unclear',NULL)", (mid,))
+    console.confirm_directive(directive_id=did, confirm_message_id=mid)
+
+    reason = "用户在 pause 生效前撤回"
+    ConsoleSpool(tmp_path).append({
+        "connector": "console", "action": "reject", "directive_id": did,
+        "reason": reason, "raw_text": directive_action_text("reject", did, reason=reason),
+    })
+    (tmp_path / "state" / ".console_inbox.retry.json").write_text("{broken", encoding="utf-8")
+
+    # 重启后加载到坏 sidecar；即使 pause 已确认且 immediate due，也必须停在入站顺序闸前。
+    second = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=counting_factory)
+    assert second.run(max_cycles=1) == []
+    assert calls["n"] == 0
+    assert "控制台入站待处理" in second.advancer.last_block_reason
+    assert second.daemon.query_one(
+        "SELECT status,json_extract(payload_json,'$.confirmed') FROM directive WHERE id=?", (did,)) == (
+            "pending", 1)
+
+
+def test_production_system_scans_directive_and_file_notifications_on_exit(tmp_path):
+    """notifier 不能只存在于单测：System.run 的退出边界须把新状态幂等派生到真实 outbox。"""
+    from orchestrator.console import Console
+    sys = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))
+    directive = Console(sys.daemon).handle_inbound(
+        connector="console", raw_text="暂停", idempotency_key="notify-wire")
+    with sys.daemon.transaction() as conn:
+        rid = conn.execute(
+            "INSERT INTO interaction_request(goal_id,goal_ver,stage,status,summary_md,items_json,request_hash) "
+            "VALUES (1,1,'plan','pending','需文件','[]','notify-wire-fr')").lastrowid
+    assert sys.run(max_cycles=0) == []
+    events = [json.loads(line) for line in (tmp_path / "state" / "outbox.jsonl").read_text().split("\n") if line]
+    keys = {e["event_key"] for e in events}
+    assert f"directive:{directive['directive_id']}:pending_confirmation" in keys
+    assert f"filereq:{rid}:pending" in keys
 
 
 # ============ CP8.4 · attack 全装配端到端（真子进程执行 + 真 judge 落库链）============
@@ -456,3 +679,61 @@ def test_file_request_wait_loop_end_to_end(tmp_path):
     ids = sys3.run(max_cycles=3)
     assert len(ids) == 1                                         # 同一在途轮续跑完成
     assert sys3.daemon.query_one("SELECT count(*) FROM question")[0] == 1
+
+
+def test_resident_build_system_ingests_spooled_file_action_and_resumes(tmp_path):
+    """真实常驻拓扑：阶段阻断→HTTP 只入 spool→run 单写 resolve→自动续同阶段。"""
+    import threading
+    import urllib.request
+    from orchestrator import console_server as CS
+
+    boot = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根", "local_key": "root"}]},
+            "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
+                               "terminate_reason_md": "创世即止"}}
+    upload = tmp_path / "uploads" / "r1" / "1"
+    upload.mkdir(parents=True)
+    (upload / "eeg-user-name.zip").write_bytes(b"RESIDENT-EEG-DATA")
+    appended = threading.Event()
+    response = {}
+    token = "d" * 64
+
+    def enqueue_resolve():
+        request = urllib.request.Request(
+            base + "/api/file-request", method="POST",
+            data=json.dumps({"action": "resolve", "request_id": 1,
+                             "source_ref": "work/uploads/r1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}",
+                     "Idempotency-Key": "e" * 32})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        response.update(json.loads(opener.open(request, timeout=5).read()))
+        appended.set()
+
+    def request_resource(_pack):
+        # runner 返回 sidecar 后 provider 才建 r1；稍后到达的 spool 模拟独立 console_server。
+        threading.Timer(0.05, enqueue_resolve).start()
+        return {**boot, "resource_request.json": _SIDECAR_REQ}
+
+    def finish_after_resource(pack):
+        assert pack.refs == ["user-file-request:r1:item:1:asset:1"]
+        assert "RESIDENT-EEG-DATA" in pack.anchor_md
+        assert "untrusted_non_evidence" in pack.anchor_md
+        return boot
+
+    system = build_system(
+        SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory([request_resource, finish_after_resource]))
+    httpd = CS.serve(str(tmp_path / "research.sqlite"), str(tmp_path), SYSTEM_ROOT,
+                     host="127.0.0.1", port=0, capability_token=token)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    try:
+        assert system.run_forever(max_cycles=1, poll_interval_s=0.01) == ["c1"]
+        assert appended.wait(1) and response["queued"]["action"] == "resolve"
+    finally:
+        httpd.shutdown(); httpd.server_close(); server_thread.join(timeout=5)
+    assert system.daemon.query_one(
+        "SELECT status FROM interaction_request WHERE id=1")[0] == "resolved"
+    assert (tmp_path / "input" / "user_provided" / "1" / "1" / "asset-1").read_bytes() == b"RESIDENT-EEG-DATA"
+    events = [json.loads(line) for line in (tmp_path / "state" / "outbox.jsonl").read_text().splitlines()]
+    assert "filereq:1:resolved" in {event["event_key"] for event in events}

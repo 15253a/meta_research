@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -40,7 +41,8 @@ from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
 from .mediator import Mediator, open_responder_read_conn
-from .notify import FileRequestService, make_advancer_precheck
+from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
+                     Outbox, make_advancer_precheck)
 from .runner import CodexRunner
 from .schemas import SchemaSet
 from .stage_provider import JudgeProvider, StageProvider
@@ -71,17 +73,63 @@ class System:
     """装配好的全系统句柄：run() 驱动到停机，last_stop_reason 说明为何停（观测）。"""
 
     def __init__(self, *, advancer: SqliteAdvancer, state: SQLiteStateStore, daemon: WriteDaemon,
-                 dual_mode: str, work_root: Path):
+                 dual_mode: str, work_root: Path, sync_notifications: Optional[Callable[[], None]] = None):
         self.advancer = advancer
         self.state = state
         self.daemon = daemon
         self.dual_mode = dual_mode
         self.work_root = work_root
+        self.sync_notifications = sync_notifications or (lambda: None)
 
     def run(self, max_cycles: int) -> List[str]:
         """驱动 run_cycles 到停机（terminate / τ 自终止 / 阻断 / max_cycles）。返回本次推进的 cycle_id。
         reasoning-only 下模式 A≡B（每轮一阶段）——故直接 run_cycles；attack 多阶段的 A/B 分驱 = CP7.4。"""
-        return self.advancer.run_cycles(max_cycles)
+        try:
+            result = self.advancer.run_cycles(max_cycles)
+        except BaseException as primary:
+            # provider 可在抛 StageBlockedOnResources 前刚创建请求；异常退出也尽力补扫。但 outbox 是 DB
+            # 派生物，扫描失败绝不能覆盖研究主链的 primary（否则真正损坏因会被 finally 异常遮蔽）。
+            try:
+                self.sync_notifications()
+            except BaseException as secondary:
+                note = f"退出边界 notification scan 失败: {type(secondary).__name__}: {secondary}"
+                add_note = getattr(primary, "add_note", None)
+                if callable(add_note):
+                    add_note(note)
+                else:
+                    notes = list(getattr(primary, "__notes__", ()))
+                    notes.append(note)
+                    try:
+                        primary.__notes__ = notes
+                    except BaseException:
+                        pass
+            raise
+        # 正常停机时 notifier 失败仍 fail loud；调用方可修复派生 outbox 后从 DB 重扫。
+        self.sync_notifications()
+        return result
+
+    def run_forever(self, max_cycles: int, *, poll_interval_s: float = 1.0) -> List[str]:
+        """默认 CLI 常驻闭环：pause/file-request 阻断时保留唯一写进程并周期重跑 precheck。
+
+        每次 poll 都会 ingest spool、消费可执行动作并扫描通知/reminder；解除阻断后从 DB 游标续同一阶段。
+        ``max_cycles`` 是本次常驻会话**累计完成轮数**，不会因一次阻断后重入而重新获得预算。
+        prior terminate / durable τ stop / 非阻断空闲会正常返回；Ctrl-C 由 CLI 捕获并干净退出。
+        """
+        if isinstance(max_cycles, bool) or not isinstance(max_cycles, int) or max_cycles < 0:
+            raise ValueError("max_cycles 须为非负整数")
+        if (isinstance(poll_interval_s, bool) or not isinstance(poll_interval_s, (int, float))
+                or not math.isfinite(float(poll_interval_s)) or poll_interval_s < 0.01):
+            raise ValueError("poll_interval_s 须为不小于 0.01 的有限秒数（防阻断时热自旋）")
+        completed: List[str] = []
+        while len(completed) < max_cycles:
+            batch = self.run(max_cycles - len(completed))
+            completed.extend(batch)
+            if len(completed) >= max_cycles or self.last_stop_reason is not None:
+                break
+            if self.advancer.last_block_reason is None:
+                break                       # prior terminate / idle，不把非阻断空转误当常驻等待
+            time.sleep(float(poll_interval_s))
+        return completed
 
     @property
     def last_stop_reason(self) -> Optional[str]:
@@ -125,16 +173,36 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
                                       goal_body_md=goal_body, out_path=str(work / "state" / "status_card.json"))
     stop = StopController(daemon, policy)
     console = Console(daemon)
+    # sidecar 创建与控制台 resolve/cancel 共用同一服务实例；托管文件必须落在**本次 work_root** 内：
+    # ①不同运行的 request_id 不会在仓库 input/ 互相覆盖；②manifest 默认 work_root 路径围栏可真实消费；
+    # ③大文件/敏感文件不进入 Git 工作树。后者由 inbox ingest 在 run 单写进程内调用。
+    file_requests = FileRequestService(daemon, schemas, policy, input_root=str(work / "input"))
     # 步⑨ CP9.3 入站闭环：控制台命令经 console_server 落 <work>/state/console_inbox.jsonl（连接器缓冲）→
     # precheck 边界 ingest 进权威入站链（handle_inbound 落 directive/note；query 经 mediator 应答）。
     # mediator 用同一 status_card.json（publisher 阶段边界原子发布的那份）做接地卡。
     mediator = Mediator(daemon, str(work / "state" / "status_card.json"))
-    inbox_ingest = ConsoleInboxIngest(console, mediator, str(work))
+    inbox_ingest = ConsoleInboxIngest(console, mediator, str(work), file_requests=file_requests,
+                                      system_root=str(root))
     base_precheck = make_advancer_precheck(console, daemon)
+    outbox = Outbox(str(work / "state"))
+    directive_notifier = DirectiveNotifier(daemon, outbox)
+    file_request_notifier = FileRequestNotifier(
+        daemon, outbox, policy["interaction_request"]["remind_interval_h"])
+
+    def sync_notifications() -> None:
+        directive_notifier.scan()
+        file_request_notifier.scan(time.time())
 
     def precheck(cyc=None) -> Optional[str]:
-        inbox_ingest.ingest(cyc)              # 先 ingest 控制台入站（落 directive / 应答 query）——辅助面，不崩推进
-        return base_precheck(cyc)             # 再消费到期 directive + 查阻断（pause / 文件请求全局等待）
+        inbox_ingest.ingest(cyc)              # 先 ingest 控制台入站；故障不裸崩，但 backlog 会在本边界阻断研究
+        if inbox_ingest.has_pending:
+            # Spool 是人类动作的到达顺序。队首 retry/sidecar 损坏/下一批 backlog 未排空时，不能先消费
+            # 已在 DB 的 due directive；更晚到但已 ACK 的 reject/resume 可能正卡在该入站故障之后。
+            sync_notifications()               # 观测/提醒仍可重扫，但不产生任何 directive 状态效果
+            return "控制台入站待处理/故障（等待下轮重试）"
+        reason = base_precheck(cyc)            # 再消费到期 directive + 查阻断（pause / 文件请求全局等待）
+        sync_notifications()                   # 动作/消费后的真实状态立即派生通知（emit 幂等）
+        return reason
 
     system_prompt = (root / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
     skills = {s: (root / "prompts" / "skills" / s / "SKILL.md").read_text(encoding="utf-8") for s in _STAGES}
@@ -144,8 +212,6 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     # sidecar→文件请求桥（步⑧ CP8.5）：阶段产 resource_request.json → interaction_request(pending) →
     # StageBlockedOnResources → run_cycles 干净停 → precheck 全局等待；用户 resolve 到 input/user_provided/
     # 后续跑重做该阶段。goal 版本按当下最新（goal_amend 后新请求挂新版）。
-    file_requests = FileRequestService(daemon, schemas, policy, input_root=str(work / "input"))
-
     def file_request_bridge(stage: str, request: Dict[str, Any], cyc) -> int:
         gid, gver = daemon.query_one("SELECT id, version FROM goal ORDER BY version DESC LIMIT 1")
         return file_requests.create_checked(
@@ -180,7 +246,8 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
                               status_publisher=publisher, precheck=precheck, stop_controller=stop)
     return System(advancer=advancer, state=state, daemon=daemon,
-                  dual_mode=policy.get("session", {}).get("dual_mode", "A"), work_root=work)
+                  dual_mode=policy.get("session", {}).get("dual_mode", "A"), work_root=work,
+                  sync_notifications=sync_notifications)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -188,10 +255,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--system-root", required=True, help="仓库根（含 input/policies/prompts/schemas）")
     ap.add_argument("--work-root", required=True, help="运行产物根（research.sqlite 落此，重启同目录即续跑）")
     ap.add_argument("--max-cycles", type=int, default=100, help="本次最多推进轮数（安全上限，与 τ 自终止并存）")
+    ap.add_argument("--once", action="store_true",
+                    help="一次性模式：遇 pause/文件请求即返回；默认保持 run 单写进程常驻等待并自动续跑")
+    ap.add_argument("--poll-interval-s", type=float, default=1.0,
+                    help="常驻等待时 ingest spool / 扫描 reminder 的轮询秒数（默认 1.0）")
     args = ap.parse_args(argv)
     system = build_system(args.system_root, args.work_root)
     try:
-        ids = system.run(args.max_cycles)
+        ids = (system.run(args.max_cycles) if args.once else
+               system.run_forever(args.max_cycles, poll_interval_s=args.poll_interval_s))
+    except KeyboardInterrupt:
+        try:
+            system.sync_notifications()
+        except Exception as e:               # 派生通知失败也不把 Ctrl-C 变 traceback
+            print(f"[run] Ctrl-C 退出前通知扫描失败：{e}")
+        print("[run] 收到 Ctrl-C，已停止单写循环")
+        return 130
     except NotImplementedError as e:
         # 干净报（非裸 traceback）：具体缺哪个组件由异常文本自述（如 attack 退化装配缺 AttackStages、
         # 在途 import 物化轮缺 ImportWorker[CP8.6]）——文案不预设单一来源（codex NIT）

@@ -13,6 +13,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -20,11 +21,14 @@ import yaml
 import conftest
 from orchestrator import database as db
 from orchestrator import status_card as SC
-from orchestrator.console import Console
+from orchestrator.console import (DIRECTIVE_ACTION_SESSION_REF, Console,
+                                  directive_action_text)
+from orchestrator.compiler_sqlite import SqliteCompiler
 from orchestrator.interaction import InteractionIngest
 from orchestrator.mediator import Mediator, open_responder_read_conn
 from orchestrator.notify import (DirectiveNotifier, FileRequestNotifier, FileRequestReject,
                                  FileRequestService, Outbox, make_advancer_precheck)
+from orchestrator.resource_limits import MAX_REASONING_DIRECTIVES_PER_CYCLE
 from orchestrator.schemas import SchemaSet
 from orchestrator.writedaemon import WriteDaemon
 
@@ -61,6 +65,22 @@ def _file_daemon(tmp_path):
     return daemon
 
 
+def _action_message(d, c, result, action):
+    """模拟 ConsoleInboxIngest 落下的结构化控件 provenance。"""
+    did = result["directive_id"]
+    goal = d.query_one(
+        "SELECT m.goal_id,m.goal_ver FROM directive x JOIN interaction_message m "
+        "ON m.id=x.source_interaction_message_id WHERE x.id=?", (did,))
+    mid = c.ingest.inbound(
+        connector="test-console-action", raw_text=directive_action_text(action, did),
+        idempotency_key=f"test-{action}-d{did}", goal_id=goal[0], goal_ver=goal[1],
+        session_ref=DIRECTIVE_ACTION_SESSION_REF)
+    with d.transaction() as conn:
+        conn.execute("INSERT INTO interaction_classification(message_id,intent,directive_id) "
+                     "VALUES (?,'unclear',NULL)", (mid,))
+    return mid
+
+
 def _items(n=1):
     return [{"kind": "dataset", "desc": f"数据集{i}", "expected_files": ["data.bin"],
              "attempted_paths": ["/data/公共区已找过"], "failure_reason": "镜像不含该集",
@@ -69,6 +89,96 @@ def _items(n=1):
 
 def _request(n=1):
     return {"summary_md": "需要外部数据集：镜像不含、无法自行获取", "items": _items(n)}
+
+
+def test_precheck_terminally_rejects_unavailable_directive_semantics(env):
+    d, c = env["d"], env["c"]
+    result = c.handle_inbound(
+        connector="qq", raw_text="设置预算 50", idempotency_key="unsupported-budget",
+        goal_id=1, goal_ver=1)
+    c.confirm_directive(
+        directive_id=result["directive_id"],
+        confirm_message_id=_action_message(d, c, result, "confirm"))
+
+    assert make_advancer_precheck(c, d)() is None
+    status, payload = d.query_one(
+        "SELECT status,payload_json FROM directive WHERE id=?", (result["directive_id"],))
+    assert status == "rejected"
+    parsed = json.loads(payload)
+    assert parsed["rejection_kind"] == "application_unavailable"
+    assert "真实状态语义" in parsed["rejection_reason"]
+    assert d.query_one(
+        "SELECT actor,type FROM decision WHERE directive_id=? ORDER BY id DESC LIMIT 1",
+        (result["directive_id"],)) == ("orchestrator", "directive_application_rejected")
+
+
+def test_precheck_rejects_reasoning_directive_overflow_before_consumption(env):
+    """第 129 条不能先 consumed 再让 compiler 永久报错；超额项须可审计 rejected，前 128 条可渲染。"""
+    d, c = env["d"], env["c"]
+    for index in range(MAX_REASONING_DIRECTIVES_PER_CYCLE + 1):
+        c.handle_inbound(
+            connector="qq", raw_text=f"备注：批量控制输入 {index}",
+            idempotency_key=f"reasoning-note-{index}", goal_id=1, goal_ver=1)
+
+    cyc = SimpleNamespace(cycle_id="c1", route="decompose", status="reasoning")
+    assert make_advancer_precheck(c, d)(cyc) is None
+    assert d.query_one(
+        "SELECT count(*) FROM directive WHERE status='consumed' AND consumed_cycle=1 "
+        "AND consume_at='reasoning_start'")[0] == MAX_REASONING_DIRECTIVES_PER_CYCLE
+    rejected_id, payload_raw = d.query_one(
+        "SELECT id,payload_json FROM directive WHERE status='rejected' ORDER BY id DESC LIMIT 1")
+    payload = json.loads(payload_raw)
+    assert payload["rejection_kind"] == "application_unavailable"
+    assert "上下文安全上限" in payload["rejection_reason"]
+    assert d.query_one(
+        "SELECT actor,type FROM decision WHERE directive_id=? ORDER BY id DESC LIMIT 1",
+        (rejected_id,)) == ("orchestrator", "directive_application_rejected")
+
+    pack = SqliteCompiler(d.conn, POLICY, goal_body_md="测试目标").render(
+        cycle_id="c1", stage="reasoning")
+    assert f'"directive_id":"d{MAX_REASONING_DIRECTIVES_PER_CYCLE}"' in pack.anchor_md
+    assert f'"directive_id":"d{MAX_REASONING_DIRECTIVES_PER_CYCLE + 1}"' not in pack.anchor_md
+
+    # Prompt capacity must never reject the operational controls needed to stop or unpause the same cycle.
+    pause = c.handle_inbound(
+        connector="qq", raw_text="暂停", idempotency_key="capacity-pause", goal_id=1, goal_ver=1)
+    resume = c.handle_inbound(
+        connector="qq", raw_text="继续", idempotency_key="capacity-resume", goal_id=1, goal_ver=1)
+    c.confirm_directive(
+        directive_id=pause["directive_id"],
+        confirm_message_id=_action_message(d, c, pause, "confirm"))
+    c.confirm_directive(
+        directive_id=resume["directive_id"],
+        confirm_message_id=_action_message(d, c, resume, "confirm"))
+    assert make_advancer_precheck(c, d)(cyc) is None
+    assert d.query(
+        "SELECT status FROM directive WHERE id IN (?,?) ORDER BY id",
+        (pause["directive_id"], resume["directive_id"])) == [("consumed",), ("consumed",)]
+    SqliteCompiler(d.conn, POLICY, goal_body_md="测试目标").render(
+        cycle_id="c1", stage="reasoning")
+
+
+def test_precheck_terminally_rejects_abort_on_active_question_drift(env):
+    """权威 cycle/question 漂移时 abort 不得半写或每拍重撞；终态拒绝后保留现场供修复。"""
+    d, c = env["d"], env["c"]
+    with d.transaction() as conn:
+        conn.execute(
+            "INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
+            "VALUES (2,1,1,1,'状态漂移问题','open','agent')")
+        conn.execute("UPDATE cycle SET active_question_id=2 WHERE id=1")
+    result = c.handle_inbound(
+        connector="qq", raw_text="abort 本轮", idempotency_key="abort-drift",
+        goal_id=1, goal_ver=1)
+    c.confirm_directive(
+        directive_id=result["directive_id"],
+        confirm_message_id=_action_message(d, c, result, "confirm"))
+
+    assert make_advancer_precheck(c, d)() is None
+    assert d.query_one("SELECT status,active_question_id FROM cycle WHERE id=1") == ("reasoning", 2)
+    status, payload_raw = d.query_one(
+        "SELECT status,payload_json FROM directive WHERE id=?", (result["directive_id"],))
+    assert status == "rejected"
+    assert "权威状态漂移" in json.loads(payload_raw)["rejection_reason"]
 
 
 def _insert_raw_pending(daemon, *, summary_md, items_json, request_hash):
@@ -575,7 +685,8 @@ def test_directive_hard_full_lifecycle_events(env):
     ev = [json.loads(l) for l in (ob.queue_path.read_text().splitlines())]
     pc = next(e for e in ev if e["kind"] == "directive_pending_confirmation")
     assert pc["payload"]["polished"].startswith("[pause]")                  # 确认事件展示润色稿
-    c.confirm_directive(directive_id=did, confirm_message_id=r["message_id"])
+    c.confirm_directive(directive_id=did,
+                        confirm_message_id=_action_message(d, c, r, "confirm"))
     dn.scan()
     assert f"directive:{did}:pending_effect" in _keys(ob)                   # 确认后 → 就绪态
     c.consume_directive(directive_id=did, cycle_id="c1")
@@ -598,7 +709,8 @@ def test_directive_rejected_and_superseded_events(env):
     # pause 被 resume 覆盖 → superseded
     r2 = c.handle_inbound(connector="qq", raw_text="暂停", idempotency_key="n-p", goal_id=1, goal_ver=1)
     r3 = c.handle_inbound(connector="qq", raw_text="继续", idempotency_key="n-c", goal_id=1, goal_ver=1)
-    c.confirm_directive(directive_id=r3["directive_id"], confirm_message_id=r3["message_id"])
+    c.confirm_directive(directive_id=r3["directive_id"],
+                        confirm_message_id=_action_message(d, c, r3, "confirm"))
     c.consume_directive(directive_id=r3["directive_id"], cycle_id="c1")
     dn.scan()
     ks = _keys(ob)
@@ -1487,7 +1599,9 @@ def test_global_wait_query_answers_during_block(adv_env):
     ids = adv.run_cycles(1)                                                  # 先正常跑一轮 → 卡已发布
     assert ids
     r = Console(d).handle_inbound(connector="qq", raw_text="暂停", idempotency_key="gw-p", goal_id=1, goal_ver=1)
-    Console(d).confirm_directive(directive_id=r["directive_id"], confirm_message_id=r["message_id"])
+    console = Console(d)
+    console.confirm_directive(directive_id=r["directive_id"],
+                              confirm_message_id=_action_message(d, console, r, "confirm"))
     assert adv.run_cycles(1) == []                                           # precheck 消费 pause → 阻断
     assert "pause" in adv.last_block_reason
     med = Mediator(d, str(adv_env["card"]))
@@ -1501,7 +1615,8 @@ def test_precheck_consumes_immediate_directive_with_decision(adv_env):
     """前置检查按时机消费：immediate pause 在 run_cycles 入口被消费（DECISION 落账）后生效阻断。"""
     d, c, adv = adv_env["d"], adv_env["c"], adv_env["adv"]
     r = c.handle_inbound(connector="qq", raw_text="暂停", idempotency_key="pc-1", goal_id=1, goal_ver=1)
-    c.confirm_directive(directive_id=r["directive_id"], confirm_message_id=r["message_id"])
+    c.confirm_directive(directive_id=r["directive_id"],
+                        confirm_message_id=_action_message(d, c, r, "confirm"))
     assert adv.run_cycles(1) == []
     st = d.query_one("SELECT status, consumed_cycle FROM directive WHERE id=?", (r["directive_id"],))
     assert st[0] == "consumed" and st[1] is None                             # 开轮前消费：无在途轮，cycle 空
@@ -1509,5 +1624,6 @@ def test_precheck_consumes_immediate_directive_with_decision(adv_env):
                        (r["directive_id"],))[0] == 1                        # 同记 DECISION
     # resume 解除后恢复
     r2 = c.handle_inbound(connector="qq", raw_text="继续", idempotency_key="pc-2", goal_id=1, goal_ver=1)
-    c.confirm_directive(directive_id=r2["directive_id"], confirm_message_id=r2["message_id"])
+    c.confirm_directive(directive_id=r2["directive_id"],
+                        confirm_message_id=_action_message(d, c, r2, "confirm"))
     assert adv.run_cycles(1)                                                 # resume 被消费 → 放行

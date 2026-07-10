@@ -6,15 +6,37 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
 
 import conftest
 from orchestrator import console_server as CS
+from orchestrator import console_spool as CSP
 from orchestrator import database as db
 
 SYSTEM_ROOT = str(Path(__file__).resolve().parent.parent)
+TEST_CAPABILITY = "a" * 64
+TEST_IDEMPOTENCY = "1" * 32
+
+
+def _assert_random_idempotency_key(rec):
+    assert re.fullmatch(r"console-[0-9a-f]{32}", rec["idempotency_key"])
+
+
+def _process_append(work: str, count: int, prefix: str, result_queue) -> None:
+    """Multiprocessing target must stay at module scope for non-fork test runners."""
+    try:
+        data = CS.ConsoleData(db_path=str(Path(work) / "unused.sqlite"),
+                              work_root=work, system_root=SYSTEM_ROOT)
+        result_queue.put([data.enqueue_message(f"{prefix}-{i}")["idempotency_key"]
+                          for i in range(count)])
+    except BaseException as error:
+        result_queue.put((type(error).__name__, str(error)))
 
 
 @pytest.fixture()
@@ -96,13 +118,113 @@ def test_enqueue_message_spool_only(seeded):
     before = db.connect(path).execute("SELECT count(*) FROM interaction_message").fetchone()[0]
     r1 = data.enqueue_message("暂停一下")
     r2 = data.enqueue_message("q13 现在到哪了？")
-    assert r1["seq"] == 1 and r2["seq"] == 2
+    assert r1["seq"] == 1 and r2["seq"] > r1["seq"]
+    _assert_random_idempotency_key(r1); _assert_random_idempotency_key(r2)
     lines = (Path(work) / "state" / "console_inbox.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2 and json.loads(lines[0])["raw_text"] == "暂停一下"
     # **不碰 DB**：interaction_message 未增（run 进程 ingest 才入库）
     assert db.connect(path).execute("SELECT count(*) FROM interaction_message").fetchone()[0] == before
     with pytest.raises(ValueError):
         data.enqueue_message("   ")                                      # 空消息拒
+    with pytest.raises(ValueError, match="字符串"):
+        data.enqueue_message({})                                         # JSON object 不得打穿 handler
+
+
+def test_enqueue_fences_torn_tail_before_acknowledging_next_record(seeded):
+    """崩溃残尾不会与下一条 HTTP 已 ACK intent 粘接；残尾单独成 poison 行，新动作保持完整。"""
+    path, work = seeded
+    data = CS.ConsoleData(db_path=path, work_root=work, system_root=SYSTEM_ROOT)
+    data.inbox.write_bytes(b'{"connector":"console","raw_text":"torn"')
+    rec = data.enqueue_message("下一条必须可消费")
+    lines = data.inbox.read_bytes().split(b"\n")
+    assert len(lines) == 3 and lines[0].startswith(b'{"connector"')
+    assert json.loads(lines[1])["raw_text"] == "下一条必须可消费"
+    assert rec["seq"] > 1
+    _assert_random_idempotency_key(rec)
+
+
+def test_enqueue_directive_action_spool_only(seeded):
+    """确认/拒绝控件也只写 spool，与普通消息共用 seq；server 不查/改 directive 表。"""
+    path, work = seeded
+    data = CS.ConsoleData(db_path=path, work_root=work, system_root=SYSTEM_ROOT)
+    before = db.connect(path).execute("SELECT count(*) FROM interaction_message").fetchone()[0]
+    data.enqueue_message("暂停一下")
+    confirm = data.enqueue_directive_action(action="confirm", directive_id=7)
+    reject = data.enqueue_directive_action(action="reject", directive_id="8", reason="润色语义不对")
+    assert {key: confirm[key] for key in ("connector", "raw_text", "action", "directive_id")} == {
+        "connector": "console", "raw_text": "确认指令 d7", "action": "confirm",
+        "directive_id": 7}
+    _assert_random_idempotency_key(confirm)
+    _assert_random_idempotency_key(reject)
+    assert confirm["idempotency_key"] != reject["idempotency_key"]
+    assert reject["seq"] > confirm["seq"] and reject["action"] == "reject" and reject["reason"] == "润色语义不对"
+    assert db.connect(path).execute("SELECT count(*) FROM interaction_message").fetchone()[0] == before
+    for bad in ({"action": "apply", "directive_id": 1}, {"action": "confirm", "directive_id": 0},
+                {"action": "reject", "directive_id": True}, {"action": "confirm", "directive_id": "1.5"}):
+        with pytest.raises(ValueError):
+            data.enqueue_directive_action(**bad)
+
+
+def test_enqueue_file_request_action_whitelist_and_spool_only(seeded):
+    """resolve 只接受 work/input uploads 虚拟目录；server 只读核 pending 后写 spool，不迁请求状态。"""
+    path, work = seeded
+    conn = db.connect(path)
+    rid = conn.execute(
+        "INSERT INTO interaction_request(goal_id,goal_ver,stage,status,summary_md,items_json,request_hash) "
+        "VALUES (1,1,'plan','pending','需文件','[]','fr-http')").lastrowid
+    conn.commit(); conn.close()
+    src = Path(work) / "uploads" / f"r{rid}" / "1"
+    src.mkdir(parents=True); (src / "data.bin").write_bytes(b"DATA")
+    data = CS.ConsoleData(db_path=path, work_root=work, system_root=SYSTEM_ROOT)
+
+    queued = data.enqueue_file_request_action(
+        action="resolve", request_id=rid, source_ref=f"work/uploads/r{rid}")
+    assert queued["action_target"] == "file_request" and queued["source_ref"] == f"work/uploads/r{rid}"
+    assert queued["raw_text"].startswith(f"解决文件请求 r{rid}")
+    assert db.connect(path).execute(
+        "SELECT status,resolved_message_id FROM interaction_request WHERE id=?", (rid,)).fetchone() == (
+        "pending", None)
+
+    for bad_ref in ("../outside", "/work/uploads/x", "work/state", "work/uploads/x\ncontrol"):
+        with pytest.raises(ValueError):
+            data.enqueue_file_request_action(action="resolve", request_id=rid, source_ref=bad_ref)
+    # HTTP 只核纯语法；目录可能在入队后、run 消费前才出现，实体/fd 校验属于权威 ingest。
+    missing = data.enqueue_file_request_action(
+        action="resolve", request_id=rid, source_ref="work/uploads/missing")
+    assert missing["source_ref"] == "work/uploads/missing"
+    with pytest.raises(ValueError, match="不存在"):
+        data.enqueue_file_request_action(action="cancel", request_id=999, reason="x")
+
+
+def test_file_request_http_does_not_treat_path_preflight_as_authority(seeded):
+    """HTTP 只持久化规范 ref；symlink/存在性由 run 的 openat(O_NOFOLLOW) 权威拒绝。"""
+    path, work = seeded
+    conn = db.connect(path)
+    rid = conn.execute(
+        "INSERT INTO interaction_request(goal_id,goal_ver,stage,status,summary_md,items_json,request_hash) "
+        "VALUES (1,1,'plan','pending','需文件','[]','fr-symlink-root')").lastrowid
+    conn.commit(); conn.close()
+    (Path(work) / "uploads").symlink_to(Path(work) / "state", target_is_directory=True)
+    data = CS.ConsoleData(db_path=path, work_root=work, system_root=SYSTEM_ROOT)
+    queued = data.enqueue_file_request_action(
+        action="resolve", request_id=rid, source_ref="work/uploads")
+    assert queued["source_ref"] == "work/uploads"
+    assert db.connect(path).execute(
+        "SELECT status FROM interaction_request WHERE id=?", (rid,)).fetchone() == ("pending",)
+
+
+@pytest.mark.parametrize("bad", [1.0, "01", (1 << 63), True])
+def test_action_ids_are_canonical_sqlite_integers(seeded, bad):
+    path, work = seeded
+    data = CS.ConsoleData(db_path=path, work_root=work, system_root=SYSTEM_ROOT)
+    with pytest.raises(ValueError):
+        data.enqueue_directive_action(action="confirm", directive_id=bad)
+
+
+def test_console_refuses_non_loopback_bind(seeded):
+    path, work = seeded
+    with pytest.raises(ValueError, match="loopback"):
+        CS.serve(path, work, SYSTEM_ROOT, host="0.0.0.0", port=0)
 
 
 # ============ HTTP 端到端（真起服务、真请求）============
@@ -110,8 +232,16 @@ def test_http_endpoints(seeded):
     import threading
     import urllib.request
     path, work = seeded
+    conn = db.connect(path)
+    rid = conn.execute(
+        "INSERT INTO interaction_request(goal_id,goal_ver,stage,status,summary_md,items_json,request_hash) "
+        "VALUES (1,1,'plan','pending','需文件','[]','fr-endpoint')").lastrowid
+    conn.commit(); conn.close()
+    (Path(work) / "uploads" / f"r{rid}" / "1").mkdir(parents=True)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 绕过 shell 的 HTTP_PROXY（本机直连）
-    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0)     # port=0 自选空闲端口
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     capability_token=TEST_CAPABILITY)                     # port=0 自选空闲端口
     port = httpd.server_address[1]
     t = threading.Thread(target=httpd.serve_forever, daemon=True); t.start()
     try:
@@ -122,11 +252,297 @@ def test_http_endpoints(seeded):
         assert b"tree_guard" in f
         req = urllib.request.Request(base + "/api/message", method="POST",
                                      data=json.dumps({"text": "pause"}).encode(),
-                                     headers={"Content-Type": "application/json"})
-        assert json.loads(opener.open(req, timeout=5).read())["ok"] is True
+                                     headers={"Content-Type": "application/json", "Idempotency-Key": "1" * 32})
+        first_queued = json.loads(opener.open(req, timeout=5).read())["queued"]
+        req = urllib.request.Request(base + "/api/directive", method="POST",
+                                     data=json.dumps({"action": "confirm", "directive_id": 99}).encode(),
+                                     headers={"Content-Type": "application/json", "Idempotency-Key": "2" * 32})
+        queued = json.loads(opener.open(req, timeout=5).read())["queued"]
+        assert queued["action"] == "confirm" and queued["directive_id"] == 99
+        assert queued["seq"] > first_queued["seq"]
+        directive_seq = queued["seq"]
+        req = urllib.request.Request(base + "/api/file-request", method="POST",
+                                     data=json.dumps({"action": "resolve", "request_id": rid,
+                                                      "source_ref": f"work/uploads/r{rid}"}).encode(),
+                                     headers={"Content-Type": "application/json", "Idempotency-Key": "3" * 32})
+        queued = json.loads(opener.open(req, timeout=5).read())["queued"]
+        assert queued["action_target"] == "file_request" and queued["request_id"] == rid
+        assert queued["seq"] > directive_seq
+        assert db.connect(path).execute(
+            "SELECT status FROM interaction_request WHERE id=?", (rid,)).fetchone()[0] == "pending"
+        # 浏览器简单跨站请求（text/plain）与 evil Origin 均在动作入队前拒绝。
+        req = urllib.request.Request(base + "/api/directive", method="POST",
+                                     data=b'{"action":"confirm","directive_id":99}',
+                                     headers={"Content-Type": "text/plain", "Idempotency-Key": "4" * 32})
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            opener.open(req, timeout=5)
+        assert ei.value.code == 400
+        req = urllib.request.Request(base + "/api/directive", method="POST",
+                                     data=b'{"action":"confirm","directive_id":99}',
+                                     headers={"Content-Type": "application/json", "Origin": "http://evil.invalid"})
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            opener.open(req, timeout=5)
+        assert ei.value.code == 403
         assert (Path(work) / "state" / "console_inbox.jsonl").exists()
     finally:
         httpd.shutdown()
+
+
+def test_http_post_requires_one_canonical_idempotency_key_before_spooling(seeded):
+    """缺失、重复或非 128-bit 小写 hex 的客户端键都必须在 append 前失败。"""
+    import http.client
+    import threading
+
+    path, work = seeded
+    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     capability_token=TEST_CAPABILITY)
+    port = httpd.server_address[1]
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    body = b'{"text":"must-not-queue"}'
+
+    def rejected(keys):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/api/message")
+        conn.putheader("Authorization", f"Bearer {TEST_CAPABILITY}")
+        for key in keys:
+            conn.putheader("Idempotency-Key", key)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders(body)
+        response = conn.getresponse()
+        response_body = response.read()
+        status = response.status
+        conn.close()
+        assert status == 400, response_body
+
+    try:
+        rejected([])                                             # missing
+        rejected([TEST_IDEMPOTENCY, TEST_IDEMPOTENCY])           # duplicate fields
+        rejected(["1" * 31])                                    # short
+        rejected(["A" * 32])                                    # uppercase is non-canonical
+        rejected(["console-" + "1" * 32])                     # stored namespace is server-owned
+        assert not (Path(work) / "state" / "console_inbox.jsonl").exists()
+    finally:
+        httpd.shutdown(); httpd.server_close(); worker.join(timeout=5)
+
+
+def test_http_retry_reuses_client_key_in_every_spool_record(seeded):
+    """服务端不在只读进程中去重；重试须把同一键原样映射，留给单写 ingest 收敛。"""
+    import threading
+    import urllib.request
+
+    path, work = seeded
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     capability_token=TEST_CAPABILITY)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    client_key = "d" * 32
+
+    def post():
+        request = urllib.request.Request(
+            base + "/api/message", method="POST",
+            data=json.dumps({"text": "same operation"}).encode(),
+            headers={"Content-Type": "application/json", "Idempotency-Key": client_key})
+        return json.loads(opener.open(request, timeout=5).read())["queued"]
+
+    try:
+        first = post()
+        second = post()
+        expected = "console-" + client_key
+        assert first["idempotency_key"] == second["idempotency_key"] == expected
+        assert second["seq"] > first["seq"]
+        records = [json.loads(line) for line in
+                   (Path(work) / "state" / "console_inbox.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert [record["idempotency_key"] for record in records] == [expected, expected]
+        assert [record["raw_text"] for record in records] == ["same operation", "same operation"]
+    finally:
+        httpd.shutdown(); httpd.server_close(); worker.join(timeout=5)
+
+
+def test_custom_static_directory_cannot_publish_capability_dotfile(seeded, tmp_path):
+    """即使运维误把含 secret 的目录配成 static_dir，dotfile 也不进入公开静态面。"""
+    import threading
+    import urllib.error
+    import urllib.request
+
+    path, work = seeded
+    static = tmp_path / "custom-static"
+    static.mkdir()
+    (static / "index.html").write_text("PUBLIC", encoding="utf-8")
+    secret = "must-never-be-served"
+    (static / CSP.CAPABILITY_NAME).write_text(secret, encoding="utf-8")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     static_dir=str(static), capability_token=TEST_CAPABILITY)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        assert opener.open(base + "/", timeout=5).read() == b"PUBLIC"
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            opener.open(base + "/" + CSP.CAPABILITY_NAME, timeout=5)
+        body = denied.value.read()
+        assert denied.value.code == 403 and secret.encode() not in body
+    finally:
+        httpd.shutdown(); httpd.server_close(); worker.join(timeout=5)
+
+
+def test_api_requires_unique_bearer_but_static_is_public(seeded):
+    import http.client
+    import threading
+    import urllib.request
+
+    path, work = seeded
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     capability_token=TEST_CAPABILITY)
+    port = httpd.server_address[1]
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        assert b"<!doctype html>" in opener.open(base + "/", timeout=5).read()[:100].lower()
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            opener.open(base + "/api/db", timeout=5)
+        assert missing.value.code == 401
+        wrong = urllib.request.Request(
+            base + "/api/db", headers={"Authorization": f"Bearer {'b' * 64}"})
+        with pytest.raises(urllib.error.HTTPError) as invalid:
+            opener.open(wrong, timeout=5)
+        assert invalid.value.code == 401
+
+        good = urllib.request.Request(
+            base + "/api/db", headers={"Authorization": f"bEaReR {TEST_CAPABILITY}"})
+        assert json.loads(opener.open(good, timeout=5).read())["tables"]["goal"]
+
+        hidden = urllib.request.Request(
+            base + "/api/file?p=work/state/.console-capability",
+            headers={"Authorization": f"Bearer {TEST_CAPABILITY}"})
+        with pytest.raises(urllib.error.HTTPError) as secret:
+            opener.open(hidden, timeout=5)
+        assert secret.value.code == 404
+
+        bad_host = urllib.request.Request(
+            base + "/api/db", headers={"Authorization": f"Bearer {TEST_CAPABILITY}",
+                                       "Host": "evil.invalid"})
+        with pytest.raises(urllib.error.HTTPError) as rebound:
+            opener.open(bad_host, timeout=5)
+        assert rebound.value.code == 421
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("GET", "/api/db", skip_host=True)
+        conn.putheader("Host", f"127.0.0.1:{port}")
+        conn.putheader("Host", f"127.0.0.1:{port}")
+        conn.putheader("Authorization", f"Bearer {TEST_CAPABILITY}")
+        conn.endheaders()
+        response = conn.getresponse()
+        assert response.status == 421                         # duplicate Host 不能留下代理/解析歧义
+        response.read(); conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("GET", "/api/db")
+        conn.putheader("Authorization", f"Bearer {TEST_CAPABILITY}")
+        conn.putheader("Authorization", f"Bearer {TEST_CAPABILITY}")
+        conn.endheaders()
+        response = conn.getresponse()
+        assert response.status == 401
+        response.read(); conn.close()
+
+        inbox = Path(work) / "state" / "console_inbox.jsonl"
+        before_size = inbox.stat().st_size if inbox.exists() else 0
+        body = b'{"text":"must-not-queue"}'
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/api/message")
+        conn.putheader("Authorization", f"Bearer {TEST_CAPABILITY}")
+        conn.putheader("Idempotency-Key", TEST_IDEMPOTENCY)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(body)))
+        conn.putheader("Origin", f"http://127.0.0.1:{port}")
+        conn.putheader("Origin", "http://evil.invalid")
+        conn.endheaders(body)
+        response = conn.getresponse()
+        assert response.status == 403                         # duplicate Origin 不能由 get() 任取其一
+        response.read(); conn.close()
+        assert (inbox.stat().st_size if inbox.exists() else 0) == before_size
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("PUT", "/api/message", headers={"Authorization": f"Bearer {TEST_CAPABILITY}"})
+        response = conn.getresponse()
+        assert response.status == 405 and response.getheader("Allow") == "GET, POST"
+        response.read(); conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("DELETE", "/api/message")
+        response = conn.getresponse()
+        assert response.status == 401                   # unsupported /api methods do not bypass auth as 501
+        response.read(); conn.close()
+    finally:
+        httpd.shutdown(); httpd.server_close()
+
+
+def test_http_json_framing_rejects_transfer_encoding_oversize_and_short_body(seeded):
+    import http.client
+    import socket
+    import threading
+
+    path, work = seeded
+    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     capability_token=TEST_CAPABILITY)
+    port = httpd.server_address[1]
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    auth = f"Bearer {TEST_CAPABILITY}"
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/api/message")
+        conn.putheader("Authorization", auth)
+        conn.putheader("Idempotency-Key", TEST_IDEMPOTENCY)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", "2")
+        conn.putheader("Transfer-Encoding", "chunked")
+        conn.endheaders(b"{}")
+        response = conn.getresponse()
+        assert response.status == 400 and b"Transfer-Encoding" in response.read()
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/api/message")
+        conn.putheader("Authorization", auth)
+        conn.putheader("Idempotency-Key", TEST_IDEMPOTENCY)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(CS._MAX_HTTP_BODY_BYTES + 1))
+        conn.endheaders()
+        response = conn.getresponse()
+        assert response.status == 400 and b"65536" in response.read()
+        conn.close()
+
+        raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+        request = (
+            "POST /api/message HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"Authorization: {auth}\r\n"
+            f"Idempotency-Key: {TEST_IDEMPOTENCY}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 100\r\n"
+            "Connection: close\r\n\r\n{}"
+        ).encode("ascii")
+        raw.sendall(request)
+        raw.shutdown(socket.SHUT_WR)
+        response_bytes = b""
+        while True:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            response_bytes += chunk
+        raw.close()
+        assert b" 400 " in response_bytes.split(b"\r\n", 1)[0]
+        assert "提前结束".encode("utf-8") in response_bytes
+    finally:
+        httpd.shutdown(); httpd.server_close()
 
 
 def test_malformed_policy_degrades_gracefully(seeded, tmp_path):
@@ -157,6 +573,19 @@ def test_heartbeat_age_seconds(seeded):
     assert 28 <= live["heartbeat_age_s"] <= 40                  # ~30s 年龄
 
 
+def test_heartbeat_transcript_symlink_is_not_followed(seeded, tmp_path):
+    path, work = seeded
+    outside = tmp_path / "outside-transcript"
+    outside.write_text("secret", encoding="utf-8")
+    link = Path(work) / "state" / "hb-link"
+    link.symlink_to(outside)
+    d = db.connect(path)
+    d.execute("INSERT INTO runner_call(cycle_id,phase,purpose,status,transcript_ref) "
+              "VALUES (1,'bundle','t','running','state/hb-link')")
+    d.commit(); d.close()
+    assert CS.assemble_db(path, work, SYSTEM_ROOT)["live"]["heartbeat_age_s"] is None
+
+
 def test_concurrent_enqueue_unique_seq(seeded):
     """内审 SHOULD 回归：ThreadingHTTPServer 并发 POST 下 seq 分配串行——100 并发提交得 100 个唯一 seq。"""
     import threading
@@ -173,6 +602,333 @@ def test_concurrent_enqueue_unique_seq(seeded):
     for t in ts: t.join()
     assert len(set(seqs)) == 100                               # 无撞 seq
     assert len((Path(work) / "state" / "console_inbox.jsonl").read_text().splitlines()) == 100
+
+
+def test_cross_process_enqueue_uses_stable_claim_and_random_idempotency(tmp_path):
+    """不同 server 进程必须共享 work-root claim；随机幂等键不依赖 spool 行号。"""
+    import multiprocessing
+
+    work = tmp_path / "work"
+    work.mkdir()
+    ctx = multiprocessing.get_context("fork")
+    result_queue = ctx.Queue()
+    workers = [ctx.Process(target=_process_append, args=(str(work), 25, f"p{i}", result_queue))
+               for i in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(15)
+        assert not worker.is_alive() and worker.exitcode == 0
+    keys = []
+    for _ in workers:
+        result = result_queue.get(timeout=5)
+        assert isinstance(result, list), result
+        keys.extend(result)
+    records = [json.loads(line) for line in (work / "state" / "console_inbox.jsonl").read_text().splitlines()]
+    seqs = [record["seq"] for record in records]
+    assert seqs == sorted(seqs) and len(set(seqs)) == 100 and seqs[0] == 1
+    assert len(records) == len(set(keys)) == 100
+    assert all(re.fullmatch(r"console-[0-9a-f]{32}", key) for key in keys)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
+def test_spool_rejects_symlink_hardlink_and_fifo(tmp_path, kind):
+    work = tmp_path / "work"
+    state = work / "state"
+    state.mkdir(parents=True)
+    inbox = state / "console_inbox.jsonl"
+    target = tmp_path / "target"
+    target.write_bytes(b"DO-NOT-TOUCH")
+    if kind == "symlink":
+        inbox.symlink_to(target)
+    elif kind == "hardlink":
+        os.link(target, inbox)
+    else:
+        os.mkfifo(inbox)
+    data = CS.ConsoleData(db_path=str(work / "unused.sqlite"), work_root=str(work),
+                          system_root=SYSTEM_ROOT)
+    with pytest.raises(OSError):
+        data.enqueue_message("must fail closed")
+    assert target.read_bytes() == b"DO-NOT-TOUCH"
+
+
+def test_spool_rejects_state_and_claim_symlinks(tmp_path):
+    work = tmp_path / "work"
+    outside = tmp_path / "outside"
+    work.mkdir(); outside.mkdir()
+    (work / "state").symlink_to(outside, target_is_directory=True)
+    data = CS.ConsoleData(db_path=str(work / "unused.sqlite"), work_root=str(work),
+                          system_root=SYSTEM_ROOT)
+    with pytest.raises(OSError):
+        data.enqueue_message("must not leave work")
+    assert list(outside.iterdir()) == []
+
+    work2 = tmp_path / "work-claim"
+    work2.mkdir()
+    data2 = CS.ConsoleData(db_path=str(work2 / "unused.sqlite"), work_root=str(work2),
+                           system_root=SYSTEM_ROOT)
+    target = tmp_path / "claim-target"
+    target.write_bytes(b"LOCK")
+    (work2 / ".console-inbox.lock").symlink_to(target)
+    with pytest.raises(OSError):
+        data2.enqueue_message("must not lock alias")
+    assert target.read_bytes() == b"LOCK"
+
+
+def test_first_spool_append_fsyncs_creation_chain_and_sets_private_modes(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    calls = []
+    real_fsync = os.fsync
+
+    def trace_fsync(fd):
+        info = os.fstat(fd)
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            target = "?"
+        calls.append((stat.S_IFMT(info.st_mode), target))
+        real_fsync(fd)
+
+    monkeypatch.setattr(CSP.os, "fsync", trace_fsync)
+    data = CS.ConsoleData(db_path=str(work / "unused.sqlite"), work_root=str(work),
+                          system_root=SYSTEM_ROOT)
+    data.enqueue_message("durable")
+    state = work / "state"
+    inbox = state / "console_inbox.jsonl"
+    claim = work / ".console-inbox.lock"
+    assert stat.S_IMODE(state.stat().st_mode) == 0o700
+    assert stat.S_IMODE(inbox.stat().st_mode) == 0o600
+    assert stat.S_IMODE(claim.stat().st_mode) == 0o600
+    targets = [target for _kind, target in calls]
+    assert any(target.endswith("/work") for target in targets)
+    assert any(target.endswith("/work/state") for target in targets)
+    assert any(target.endswith("console_inbox.jsonl") for target in targets)
+    assert any(target.endswith(".console-inbox.lock") for target in targets)
+
+
+def test_append_does_not_rescan_spool_history(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    data = CS.ConsoleData(db_path=str(work / "unused.sqlite"), work_root=str(work),
+                          system_root=SYSTEM_ROOT)
+    first = data.enqueue_message("first")
+
+    def forbid_full_read(*_args, **_kwargs):
+        raise AssertionError("append must not read historical spool")
+
+    monkeypatch.setattr(CSP, "_read_all", forbid_full_read)
+    second = data.enqueue_message("second")
+    assert second["seq"] > first["seq"]
+
+
+def test_consumer_cursor_is_incremental_and_detects_same_inode_regrow(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    spool = CSP.ConsoleSpool(work)
+    spool.append({"connector": "console", "raw_text": "first"})
+    spool.append({"connector": "console", "raw_text": "second"})
+    first_batch = spool.read_pending()
+    assert len(first_batch.records) == 2
+    first_end = first_batch.records[0].end_offset
+    spool.write_cursor(first_batch, first_end)
+    second_batch = spool.read_pending()
+    assert second_batch.start_offset == first_end
+    assert len(second_batch.records) == 1 and "second" in second_batch.records[0].line
+
+    # Same inode, truncate, then regrow beyond the old numeric offset.  A bare
+    # offset would silently skip the replacement prefix; the anchor must replay.
+    replacement = b"X" * first_end + b"\n" + b'{"raw_text":"replacement"}\n'
+    with spool.inbox_path.open("r+b") as inbox:
+        inbox.truncate(0); inbox.write(replacement); inbox.flush(); os.fsync(inbox.fileno())
+    replay = spool.read_pending()
+    assert replay.start_offset == 0
+
+
+def test_legacy_cursor_at_large_spool_eof_is_migrated_once(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    state = work / "state"
+    state.mkdir(parents=True)
+    spool = CSP.ConsoleSpool(work)
+    lines = [json.dumps({"seq": i, "raw_text": "x" * 32}) for i in range(20_000)]
+    spool.inbox_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    spool.inbox_path.chmod(0o600)
+    cursor_path = state / "console_inbox.cursor"
+    cursor_path.write_text(str(len(lines)), encoding="ascii")
+
+    first = spool.read_pending()
+    assert first.records == () and first.start_offset == spool.inbox_path.stat().st_size
+    migrated = json.loads(cursor_path.read_text(encoding="ascii"))
+    assert migrated["version"] == 1 and migrated["offset"] == spool.inbox_path.stat().st_size
+
+    monkeypatch.setattr(
+        CSP.ConsoleSpool, "_legacy_line_cursor",
+        staticmethod(lambda *_args: (_ for _ in ()).throw(AssertionError("legacy rescan"))))
+    second = spool.read_pending()
+    assert second.records == () and second.start_offset == first.start_offset
+
+
+def test_cursor_rejects_offset_not_returned_by_batch(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    spool = CSP.ConsoleSpool(work)
+    spool.append({"raw_text": "one"})
+    batch = spool.read_pending()
+    with pytest.raises(ValueError, match="本批"):
+        spool.write_cursor(batch, batch.start_offset + 1)
+
+
+def test_consumer_oversized_committed_record_is_poison_not_wedge(tmp_path):
+    work = tmp_path / "work"
+    state = work / "state"
+    state.mkdir(parents=True)
+    spool = CSP.ConsoleSpool(work)
+    valid = json.dumps({"connector": "console", "raw_text": "after"}).encode() + b"\n"
+    spool.inbox_path.write_bytes(b"x" * (CSP.MAX_RECORD_BYTES + 1) + b"\n" + valid)
+    spool.inbox_path.chmod(0o600)
+    batch = spool.read_pending()
+    assert len(batch.records) == 2
+    assert batch.records[0].line is None and "超过" in batch.records[0].error
+    assert json.loads(batch.records[1].line)["raw_text"] == "after"
+    spool.write_cursor(batch, batch.records[0].end_offset)
+    after = spool.read_pending()
+    assert len(after.records) == 1 and json.loads(after.records[0].line)["raw_text"] == "after"
+
+
+def test_bounded_batch_more_flag_counts_only_committed_following_record(tmp_path):
+    work = tmp_path / "work"
+    state = work / "state"
+    state.mkdir(parents=True)
+    spool = CSP.ConsoleSpool(work)
+    record = b"x" * (CSP.MAX_RECORD_BYTES + 1) + b"\n"
+    count = CSP.MAX_BATCH_BYTES // len(record) + 1
+    spool.inbox_path.write_bytes(record * count + b"uncommitted-tail")
+    spool.inbox_path.chmod(0o600)
+    assert spool.read_pending().has_more_committed is False       # torn tail 不造成常驻假阻断
+    with spool.inbox_path.open("ab") as inbox:
+        inbox.write(b"\n"); inbox.flush(); os.fsync(inbox.fileno())
+    assert spool.read_pending().has_more_committed is True        # 同一后缀落 LF 后才算 backlog
+
+
+def test_retry_sidecar_is_bounded_private_and_corruption_fails_closed(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    spool = CSP.ConsoleSpool(work)
+    spool.store_retry_counts({"console-a": 3})
+    assert spool.load_retry_counts() == {"console-a": 3}
+    retry_path = work / "state" / ".console_inbox.retry.json"
+    assert stat.S_IMODE(retry_path.stat().st_mode) == 0o600
+    retry_path.write_text("{broken", encoding="utf-8")
+    retry_path.chmod(0o600)
+    with pytest.raises(ValueError, match="损坏"):
+        spool.load_retry_counts()
+
+
+def test_capability_is_persistent_private_and_fail_closed(seeded):
+    path, work_raw = seeded
+    work = Path(work_raw)
+    first = CS.serve(path, str(work), SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     capability_token=TEST_CAPABILITY)
+    first.server_close()
+    capability = work / "state" / CSP.CAPABILITY_NAME
+    assert capability.read_text(encoding="ascii") == TEST_CAPABILITY
+    assert stat.S_IMODE(capability.stat().st_mode) == 0o600
+    assert capability.stat().st_nlink == 1
+
+    second = CS.serve(path, str(work), SYSTEM_ROOT, host="127.0.0.1", port=0,
+                      capability_token=TEST_CAPABILITY)
+    second.server_close()
+    with pytest.raises(OSError, match="不一致"):
+        CS.serve(path, str(work), SYSTEM_ROOT, host="127.0.0.1", port=0,
+                 capability_token="b" * 64)
+    capability.chmod(0o644)
+    with pytest.raises(OSError, match="0600"):
+        CS.serve(path, str(work), SYSTEM_ROOT, host="127.0.0.1", port=0,
+                 capability_token=TEST_CAPABILITY)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
+def test_capability_rejects_nonexclusive_nonregular_entry(tmp_path, kind):
+    work = tmp_path / "work"
+    state = work / "state"
+    state.mkdir(parents=True)
+    capability = state / CSP.CAPABILITY_NAME
+    target = tmp_path / "cap-target"
+    target.write_text(TEST_CAPABILITY)
+    if kind == "symlink":
+        capability.symlink_to(target)
+    elif kind == "hardlink":
+        os.link(target, capability)
+    else:
+        os.mkfifo(capability)
+    spool = CSP.ConsoleSpool(work)
+    with pytest.raises(OSError):
+        spool.load_or_create_capability(TEST_CAPABILITY)
+    assert target.read_text() == TEST_CAPABILITY
+
+
+def test_pinned_upload_capability_survives_parent_swap(tmp_path):
+    work = tmp_path / "work"
+    system = tmp_path / "system"
+    safe = work / "uploads" / "r1" / "1"
+    safe.mkdir(parents=True)
+    (safe / "data.bin").write_bytes(b"SAFE")
+    outside = tmp_path / "outside"
+    (outside / "r1" / "1").mkdir(parents=True)
+    (outside / "r1" / "1" / "data.bin").write_bytes(b"SECRET")
+
+    with CSP.open_pinned_upload_ref(
+            "work/uploads/r1", work_root=work, system_root=system) as pinned:
+        (work / "uploads").rename(work / "uploads-old")
+        (work / "uploads").symlink_to(outside, target_is_directory=True)
+        assert Path(pinned.proc_path, "1", "data.bin").read_bytes() == b"SAFE"
+        assert Path(pinned.proc_path, "1", "data.bin").read_bytes() != b"SECRET"
+
+
+def test_fd_read_is_bounded_and_not_retargeted_after_check(seeded, tmp_path, monkeypatch):
+    path, work_raw = seeded
+    work = Path(work_raw)
+    victim = work / "state" / "shown.txt"
+    victim.write_bytes(b"SAFE")
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"SECRET")
+    data = CS.ConsoleData(db_path=path, work_root=str(work), system_root=SYSTEM_ROOT)
+    original_verify = CSP._verify_entry_matches_fd
+    swapped = False
+
+    def swap_after_fd_check(parent_fd, name, fd, *, label, regular):
+        nonlocal swapped
+        info = original_verify(parent_fd, name, fd, label=label, regular=regular)
+        if label == "读取目标" and not swapped:
+            swapped = True
+            victim.unlink()
+            victim.symlink_to(secret)
+        return info
+
+    monkeypatch.setattr(CSP, "_verify_entry_matches_fd", swap_after_fd_check)
+    assert data.read_file("work/state/shown.txt") == b"SAFE"
+    assert swapped
+
+    large = work / "state" / "large"
+    large.write_bytes(b"x" * (CS._MAX_FILE_RESPONSE_BYTES + 1))
+    assert data.read_file("work/state/large") is None
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
+def test_fd_read_rejects_symlink_hardlink_and_fifo(seeded, tmp_path, kind):
+    path, work_raw = seeded
+    work = Path(work_raw)
+    target = tmp_path / "read-target"
+    target.write_bytes(b"SECRET")
+    entry = work / "state" / "entry"
+    if kind == "symlink":
+        entry.symlink_to(target)
+    elif kind == "hardlink":
+        os.link(target, entry)
+    else:
+        os.mkfifo(entry)
+    data = CS.ConsoleData(db_path=path, work_root=str(work), system_root=SYSTEM_ROOT)
+    assert data.read_file("work/state/entry") is None
 
 
 def test_read_file_virtual_root_any_work_name(tmp_path):
@@ -209,13 +965,221 @@ def test_notifications_drops_unterminated_tail(seeded):
     assert [n["event_key"] for n in got] == ["a"]         # b 未终止 → 丢
 
 
+def test_projected_db_rows_and_text_are_bounded_before_json(seeded):
+    """高基数表和巨型 TEXT 在 SQLite→Python 边界即裁剪，不能只靠最终 JSON 总上限兜底。"""
+    path, _work = seeded
+    conn = db.connect(path)
+    conn.executemany(
+        "INSERT INTO decision(actor,type,payload_json) VALUES ('orchestrator',?,?)",
+        [(f"bulk-{index}", "{}") for index in range(CS._ROW_CAP + 25)])
+    oversized = "x" * (CS._MAX_DB_TEXT_CHARS + 123)
+    newest_id = conn.execute(
+        "INSERT INTO decision(actor,type,payload_json) VALUES ('orchestrator',?,?)",
+        (oversized, oversized)).lastrowid
+    conn.commit(); conn.close()
+
+    ro = CS._open_ro(path)
+    try:
+        rows = CS._rows(ro, "decision")
+    finally:
+        ro.close()
+    assert len(rows) == CS._ROW_CAP
+    assert rows[0]["id"] == newest_id                         # cap 取最新态，不是任意旧前缀
+    assert rows[0]["type"] == oversized[:CS._MAX_DB_TEXT_CHARS]
+    assert rows[0]["payload_json"] == oversized[:CS._MAX_DB_TEXT_CHARS]
+    assert all(len(row["type"]) <= CS._MAX_DB_TEXT_CHARS for row in rows)
+
+
+def test_assemble_db_applies_per_table_and_global_projection_byte_budgets(
+        seeded, monkeypatch):
+    """多张巨型 TEXT 表的 compact JSON 也只能达到全局预算加对象键名开销。"""
+    path, work = seeded
+    conn = db.connect(path)
+    table_names = [f"projection_stress_{index:02d}" for index in range(14)]
+    huge = "x" * CS._MAX_DB_TEXT_CHARS
+    for table in table_names:
+        conn.execute(f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY, body TEXT NOT NULL)')
+        conn.executemany(f'INSERT INTO "{table}"(body) VALUES (?)', [(huge,)] * 9)
+    conn.commit(); conn.close()
+    monkeypatch.setattr(CS, "_PROJECT_TABLES", table_names)
+
+    tables = CS.assemble_db(path, work, SYSTEM_ROOT)["tables"]
+    compact = json.dumps(tables, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    for rows in tables.values():
+        encoded = json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        assert len(encoded) <= CS._MAX_DB_TABLE_BYTES
+
+    # 全局预算统计的是各 list 本身；外层 object 另有固定的键名/冒号/逗号结构开销。
+    empty_object = json.dumps(
+        {name: [] for name in table_names}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    structural_overhead = len(empty_object) - 2 * len(table_names)
+    assert len(compact) <= CS._MAX_DB_PROJECTION_BYTES + structural_overhead
+    assert len(compact) > 4 * CS._MAX_DB_TABLE_BYTES          # 确实覆盖多表压力，不是空载假绿
+
+
+def test_projection_budget_cannot_starve_pending_control_rows(seeded, monkeypatch):
+    """研究表先后顺序/大量历史都不能把 actionable directive/request 挤出一个成功响应。"""
+    path, work = seeded
+    conn = db.connect(path)
+    pending_id = conn.execute(
+        "INSERT INTO directive(kind,hardness,status,consume_at,payload_json) "
+        "VALUES ('pause','hard','pending','immediate','{\"confirmed\":false}')").lastrowid
+    conn.executemany(
+        "INSERT INTO directive(kind,hardness,status,consume_at,payload_json) "
+        "VALUES ('note','soft','rejected','reasoning_start','{}')", [()] * (CS._ROW_CAP + 25))
+    request_id = conn.execute(
+        "INSERT INTO interaction_request(goal_id,goal_ver,stage,status,summary_md,items_json,request_hash) "
+        "VALUES (1,1,'plan','pending','待用户供给','[]','projection-pending')").lastrowid
+    stress = [f"projection_before_control_{index:02d}" for index in range(14)]
+    huge = "x" * CS._MAX_DB_TEXT_CHARS
+    for table in stress:
+        conn.execute(f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY, body TEXT NOT NULL)')
+        conn.executemany(f'INSERT INTO "{table}"(body) VALUES (?)', [(huge,)] * 9)
+    conn.commit(); conn.close()
+    monkeypatch.setattr(
+        CS, "_PROJECT_TABLES",
+        stress + ["directive", "interaction_request", "interaction_message",
+                  "interaction_classification", "interaction_reply"])
+
+    tables = CS.assemble_db(path, work, SYSTEM_ROOT)["tables"]
+    assert any(row["id"] == pending_id and row["status"] == "pending"
+               for row in tables["directive"])
+    assert any(row["id"] == request_id and row["status"] == "pending"
+               for row in tables["interaction_request"])
+    assert len(tables["directive"]) == CS._ROW_CAP             # pending 优先 + 最近历史，而非纯最新
+
+
+def test_ledger_policy_and_json_encoding_are_resource_bounded(seeded, tmp_path, monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE ledger(id INTEGER PRIMARY KEY, cycle_id INTEGER, money REAL)")
+    conn.executemany("INSERT INTO ledger(cycle_id,money) VALUES (?,?)",
+                     [(index, 1.0) for index in range(1, 11)])
+    monkeypatch.setattr(CS, "_MAX_LEDGER_CYCLES", 3)
+    assert [row["cycle"] for row in CS._ledger_by_cycle(conn)] == ["c8", "c9", "c10"]
+
+    conn.execute("DELETE FROM ledger")
+    conn.executemany("INSERT INTO ledger(cycle_id,money) VALUES (?,?)",
+                     [(1, 1.0), (2, 1.0), (2, 2.0), (3, 1.0), (3, 2.0), (4, 4.0)])
+    monkeypatch.setattr(CS, "_MAX_LEDGER_RECORDS", 4)
+    assert CS._ledger_by_cycle(conn) == [
+        {"cycle": "c3", "money": 3.0}, {"cycle": "c4", "money": 4.0}]
+    # 尾窗切在 c2 中间；宁可省略 c2，也不能显示部分和 1.0 冒充完整成本。
+    conn.close()
+
+    path, work = seeded
+    alias_root = tmp_path / "alias-policy"
+    (alias_root / "policies").mkdir(parents=True)
+    (alias_root / "policies" / "policy.yaml").write_text(
+        "base: &base [x, y, z]\nexpanded: [*base, *base, *base]\n", encoding="utf-8")
+    assert CS.assemble_db(path, work, str(alias_root))["policy"] == {}
+    with pytest.raises(CS.JsonResponseTooLarge):
+        CS._bounded_json_bytes(["x"] * 1000, max_bytes=32)
+
+
+def test_fs_tree_stops_directory_iteration_at_per_directory_cap(tmp_path, monkeypatch):
+    """目录条目预算必须限制实际迭代量，不能先 materialize 百万项再切片。"""
+    work = tmp_path / "work"
+    work.mkdir()
+    for index in range(50):
+        (work / f"entry-{index:03d}").write_text("x", encoding="utf-8")
+    empty_system = tmp_path / "empty-system"
+    empty_system.mkdir()
+    original_scandir = CS.os.scandir
+    yielded = 0
+
+    class CountedScandir:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.inner.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal yielded
+            entry = next(self.inner)
+            yielded += 1
+            return entry
+
+    def counted_scandir(path):
+        return CountedScandir(original_scandir(path))
+
+    monkeypatch.setattr(CS.os, "scandir", counted_scandir)
+    monkeypatch.setattr(CS, "_MAX_FS_ENTRIES_PER_DIRECTORY", 4)
+    monkeypatch.setattr(CS, "_MAX_FS_NODES", 100)
+    tree = CS._fs_tree(work, empty_system)
+    # ``for`` 为判断 break 最多会多取一项，但仍是与目录规模无关的固定上界。
+    assert yielded <= CS._MAX_FS_ENTRIES_PER_DIRECTORY + 1
+    assert len(tree["roots"][0]["children"]) == 4
+
+
+def test_fs_tree_does_not_follow_directory_swapped_to_symlink(tmp_path, monkeypatch):
+    """symlink 检查之后的 rename 也不能让只读树递归到 work_root 之外。"""
+    work = tmp_path / "work"
+    victim = work / "victim"
+    victim.mkdir(parents=True)
+    (victim / "safe.txt").write_text("SAFE", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    unique = "outside-only-secret.txt"
+    (outside / unique).write_text("SECRET", encoding="utf-8")
+    empty_system = tmp_path / "empty-system"
+    empty_system.mkdir()
+    original_open = CS.os.open
+    swapped = False
+
+    def swap_before_child_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == victim.name and dir_fd is not None and not swapped:
+            swapped = True
+            victim.rename(work / "victim-safe-old")
+            victim.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(CS.os, "open", swap_before_child_open)
+    tree = CS._fs_tree(work, empty_system)
+
+    def names(nodes):
+        for node in nodes:
+            yield node["p"]
+            yield from names(node.get("children", []))
+
+    assert swapped
+    assert unique not in set(names(tree["roots"]))
+
+
+def test_notifications_and_fs_tree_have_global_read_budgets(seeded, monkeypatch):
+    path, work_raw = seeded
+    work = Path(work_raw)
+    outbox = work / "state" / "outbox.jsonl"
+    outbox.write_bytes(b'{"event_key":"too-large"}\n' + b"x" * 100)
+    monkeypatch.setattr(CS, "_MAX_NOTIFICATION_BYTES", 32)
+    monkeypatch.setattr(CS, "_MAX_FS_NODES", 5)
+    for i in range(20):
+        (work / f"node-{i:02d}").write_text("x")
+    payload = CS.assemble_db(path, str(work), SYSTEM_ROOT)
+    assert payload["notification"] == []
+
+    def count(nodes):
+        return sum(1 + count(node.get("children", [])) for node in nodes)
+
+    assert count(payload["fs"]["roots"]) <= 5 + len(payload["fs"]["roots"])
+
+
 def test_api_db_error_generic(seeded, monkeypatch):
     """codex SHOULD 回归：/api/db 组装失败 → 泛化错误（不泄内部细节/路径）。"""
     import threading, urllib.request
     path, work = seeded
     monkeypatch.setattr(CS, "assemble_db", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("secret path /etc/x")))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0)
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     capability_token=TEST_CAPABILITY)
     t = threading.Thread(target=httpd.serve_forever, daemon=True); t.start()
     try:
         base = f"http://127.0.0.1:{httpd.server_address[1]}"

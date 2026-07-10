@@ -27,11 +27,16 @@ class InteractionIngest:
 
     def inbound(self, *, connector: str, raw_text: str, idempotency_key: str,
                 goal_id: Optional[int] = None, goal_ver: Optional[int] = None,
-                cycle_id: Optional[str] = None) -> int:
+                cycle_id: Optional[str] = None, session_ref: Optional[str] = None) -> int:
         """唯一权威入站记录：写 raw 不可变 interaction_message（append-only）。
         幂等：同 (connector, idempotency_key) 已入则返回既有 id（durable JSONL 只是 connector 缓冲、非权威）。"""
         if (goal_id is None) != (goal_ver is None):   # DDL CHECK((goal_id IS NULL)=(goal_ver IS NULL)) 前置为干净拒
             raise ValueError("goal_id 与 goal_ver 须同为 None 或同非 None")
+        if session_ref is not None and (
+                not isinstance(session_ref, str) or not session_ref
+                or len(session_ref) > 256
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in session_ref)):
+            raise ValueError("session_ref 须为 1–256 字符且不得含控制字符")
         with self.daemon.transaction() as conn:
             existing = conn.execute("SELECT id FROM interaction_message WHERE connector=? AND idempotency_key=?",
                                     (connector, idempotency_key)).fetchone()
@@ -39,8 +44,8 @@ class InteractionIngest:
                 return existing[0]
             return conn.execute(
                 "INSERT INTO interaction_message(connector,conversation_id,session_ref,goal_id,goal_ver,cycle_id,"
-                "raw_text,raw_hash,idempotency_key) VALUES (?,NULL,NULL,?,?,?,?,?,?)",
-                (connector, goal_id, goal_ver, _cnum(cycle_id) if cycle_id else None,
+                "raw_text,raw_hash,idempotency_key) VALUES (?,NULL,?,?,?,?,?,?,?)",
+                (connector, session_ref, goal_id, goal_ver, _cnum(cycle_id) if cycle_id else None,
                  raw_text, _sha(raw_text), idempotency_key)
             ).lastrowid
 
