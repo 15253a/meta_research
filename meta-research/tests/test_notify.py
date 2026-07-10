@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -150,6 +151,243 @@ def test_resolve_symlinked_item_dir_not_ingested(env, tmp_path):
     out = svc.resolve(request_id=rid, uploads_dir=str(up), resolved_message_id=mid)
     assert out["resolution"][0] == {"unavailable": "用户未提供该条目文件"}   # 不跟随、不并入
     assert not (tmp_path / "input" / "user_provided" / str(rid)).exists()
+
+
+def test_resolve_rejects_symlink_in_upload_root_path(env, tmp_path):
+    """uploads_dir 的任一父组件也必须是固定实体目录，不能只给最终组件 O_NOFOLLOW。"""
+    d = env["d"]
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=_request(1))
+    outside = tmp_path / "outside"
+    (outside / "uploads" / "1").mkdir(parents=True)
+    (outside / "uploads" / "1" / "secret.bin").write_bytes(b"SECRET")
+    carrier = tmp_path / "carrier"
+    carrier.mkdir()
+    (carrier / "redirect").symlink_to(outside, target_is_directory=True)
+    mid = InteractionIngest(d).inbound(
+        connector="qq", raw_text="文件已上传", idempotency_key="upload-parent-symlink",
+        goal_id=1, goal_ver=1)
+
+    with pytest.raises(OSError):
+        svc.resolve(
+            request_id=rid, uploads_dir=str(carrier / "redirect" / "uploads"),
+            resolved_message_id=mid)
+    assert d.query_one("SELECT status FROM interaction_request WHERE id=?", (rid,)) == ("pending",)
+    assert not (tmp_path / "input" / "user_provided" / str(rid)).exists()
+
+
+def test_resolve_rejects_parent_component_before_abspath_can_hide_symlink(env, tmp_path):
+    """不得先词法折叠 symlink/../；否则被跳过的 symlink 父组件从未经过 O_NOFOLLOW。"""
+    d = env["d"]
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=_request(1))
+    carrier = tmp_path / "carrier"
+    (carrier / "uploads" / "1").mkdir(parents=True)
+    (carrier / "uploads" / "1" / "data.bin").write_bytes(b"SAFE")
+    (carrier / "redirect").symlink_to(tmp_path, target_is_directory=True)
+    mid = InteractionIngest(d).inbound(
+        connector="qq", raw_text="文件已上传", idempotency_key="upload-parent-component",
+        goal_id=1, goal_ver=1)
+
+    with pytest.raises(ValueError, match="不得含.*\\.\\."):
+        svc.resolve(
+            request_id=rid,
+            uploads_dir=str(carrier / "redirect" / ".." / "uploads"),
+            resolved_message_id=mid)
+    assert d.query_one("SELECT status FROM interaction_request WHERE id=?", (rid,)) == ("pending",)
+    assert not (tmp_path / "input" / "user_provided" / str(rid)).exists()
+
+
+@pytest.mark.parametrize("replacement", ["item_symlink", "middle_symlink", "file_symlink", "file_inode"])
+def test_resolve_enumerated_upload_replacement_never_ingests_external_secret(
+        env, tmp_path, monkeypatch, replacement):
+    """枚举已完成后替换 item/中间目录/文件：固定 fd 不得转而读外部 SECRET，且整次 resolve 回滚。"""
+    import orchestrator.notify as N
+
+    d = env["d"]
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=_request(1))
+    up = tmp_path / "uploads"
+    source = up / "1" / "middle" / "data.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"SAFE")
+    outside = tmp_path / "outside"
+    (outside / "middle").mkdir(parents=True)
+    (outside / "middle" / "data.bin").write_bytes(b"SECRET")
+    (outside / "data.bin").write_bytes(b"SECRET")
+    secret = outside / "secret.bin"
+    secret.write_bytes(b"SECRET")
+    mid = InteractionIngest(d).inbound(
+        connector="qq", raw_text="文件已上传", idempotency_key=f"upload-race-{replacement}",
+        goal_id=1, goal_ver=1)
+
+    original_enumerate = N._enumerate_upload_directory
+    replaced = False
+
+    def enumerate_then_replace(*args, **kwargs):
+        nonlocal replaced
+        result = original_enumerate(*args, **kwargs)
+        if replaced or not kwargs["opened_files"]:
+            return result
+        replaced = True                         # 文件 fd 已固定；复制尚未开始
+        if replacement == "item_symlink":
+            (up / "1").rename(up / "1-original")
+            (up / "1").symlink_to(outside, target_is_directory=True)
+        elif replacement == "middle_symlink":
+            source.parent.rename(up / "1" / "middle-original")
+            source.parent.symlink_to(outside, target_is_directory=True)
+        elif replacement == "file_symlink":
+            source.rename(source.with_name("data-original.bin"))
+            source.symlink_to(secret)
+        else:
+            os.replace(secret, source)           # 新常规 inode，路径名完全不变
+        return result
+
+    monkeypatch.setattr(N, "_enumerate_upload_directory", enumerate_then_replace)
+    with pytest.raises(OSError, match="替换|改写"):
+        svc.resolve(request_id=rid, uploads_dir=str(up), resolved_message_id=mid)
+
+    assert replaced
+    assert d.query_one(
+        "SELECT status,resolution_json,resolved_message_id FROM interaction_request WHERE id=?", (rid,)) == (
+            "pending", None, None)
+    managed = tmp_path / "input" / "user_provided"
+    assert not (managed / str(rid)).exists()
+    assert not (managed / ".staging" / str(rid)).exists()
+
+
+def test_resolve_rejects_in_place_source_mutation_during_copy(env, tmp_path, monkeypatch):
+    """第一次身份复验后原 inode 被原地改写，复制后的第二次复验必须让整次 resolve 回滚。"""
+    import orchestrator.notify as N
+
+    d = env["d"]
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=_request(1))
+    source = tmp_path / "uploads" / "1" / "data.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"SAFE")
+    original_inode = source.stat().st_ino
+    mid = InteractionIngest(d).inbound(
+        connector="qq", raw_text="文件已上传", idempotency_key="upload-in-place-mutation",
+        goal_id=1, goal_ver=1)
+    original_verify = N._verify_opened_upload_file
+    calls = 0
+
+    def mutate_after_pre_copy_verify(opened):
+        nonlocal calls
+        original_verify(opened)
+        calls += 1
+        if calls == 1:
+            source.write_bytes(b"EVIL-LONGER")       # truncate/write 保留 inode，但确定改变 size/ctime
+            assert source.stat().st_ino == original_inode
+
+    monkeypatch.setattr(N, "_verify_opened_upload_file", mutate_after_pre_copy_verify)
+    with pytest.raises(OSError, match="替换|改写"):
+        svc.resolve(request_id=rid, uploads_dir=str(tmp_path / "uploads"), resolved_message_id=mid)
+
+    assert calls == 1                                  # 第二次 original_verify 在递增前即拒绝
+    assert d.query_one("SELECT status FROM interaction_request WHERE id=?", (rid,)) == ("pending",)
+    managed = tmp_path / "input" / "user_provided"
+    assert not (managed / str(rid)).exists()
+    assert not (managed / ".staging" / str(rid)).exists()
+
+
+def test_resolve_rejects_hardlinked_upload_file(env, tmp_path):
+    """上传文件必须是 nlink=1 的独占 inode；外部 hardlink 不得被当成稳定上传 capability。"""
+    d = env["d"]
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=_request(1))
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"SECRET")
+    item = tmp_path / "uploads" / "1"
+    item.mkdir(parents=True)
+    os.link(outside, item / "linked.bin")
+    mid = InteractionIngest(d).inbound(
+        connector="qq", raw_text="文件已上传", idempotency_key="upload-hardlink",
+        goal_id=1, goal_ver=1)
+
+    with pytest.raises(OSError, match="独占常规文件"):
+        svc.resolve(request_id=rid, uploads_dir=str(tmp_path / "uploads"), resolved_message_id=mid)
+    assert d.query_one("SELECT status FROM interaction_request WHERE id=?", (rid,))[0] == "pending"
+    assert not (tmp_path / "input" / "user_provided" / str(rid)).exists()
+
+
+@pytest.mark.parametrize("budget_kind", ["per_directory", "request_entries", "directories"])
+def test_resolve_upload_tree_traversal_is_bounded(env, tmp_path, monkeypatch, budget_kind):
+    """海量空目录/symlink/FIFO 也必须消耗 resolve 枚举预算，不能只按最终 regular file 数限流。"""
+    import orchestrator.notify as N
+
+    d = env["d"]
+    item_count = 2 if budget_kind == "request_entries" else 1
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=_request(item_count))
+    up = tmp_path / "uploads"
+    for item_no in range(1, item_count + 1):
+        item = up / str(item_no)
+        item.mkdir(parents=True)
+        if budget_kind == "directories":
+            (item / "d1" / "d2").mkdir(parents=True)
+        else:
+            for index in range(3):
+                (item / f"ignored-{index}").symlink_to(tmp_path / f"missing-{index}")
+
+    if budget_kind == "per_directory":
+        monkeypatch.setattr(N, "_MAX_UPLOAD_ENTRIES_PER_DIRECTORY", 2)
+    elif budget_kind == "request_entries":
+        monkeypatch.setattr(N, "_MAX_UPLOAD_ENTRIES_PER_REQUEST", 4)
+    else:
+        monkeypatch.setattr(N, "_MAX_UPLOAD_DIRECTORIES_PER_REQUEST", 2)
+    mid = InteractionIngest(d).inbound(
+        connector="qq", raw_text="文件已上传", idempotency_key=f"upload-tree-{budget_kind}",
+        goal_id=1, goal_ver=1)
+
+    with pytest.raises(ValueError, match="安全上限"):
+        svc.resolve(request_id=rid, uploads_dir=str(up), resolved_message_id=mid)
+    assert d.query_one("SELECT status FROM interaction_request WHERE id=?", (rid,)) == ("pending",)
+    assert not (tmp_path / "input" / "user_provided" / str(rid)).exists()
+
+
+def test_resolve_accepts_pinned_proc_upload_directory_capability(env, tmp_path):
+    """console ingest 可把逐组件固定后的目录以 /proc/self/fd/N 交给 service，service 必须 dup 而非跟 symlink。"""
+    d = env["d"]
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=_request(1))
+    up = tmp_path / "uploads"
+    item = up / "1"
+    item.mkdir(parents=True)
+    (item / "data.bin").write_bytes(b"PINNED")
+    mid = InteractionIngest(d).inbound(
+        connector="qq", raw_text="文件已上传", idempotency_key="upload-proc-fd",
+        goal_id=1, goal_ver=1)
+
+    upload_fd = os.open(up, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        out = svc.resolve(
+            request_id=rid, uploads_dir=f"/proc/self/fd/{upload_fd}", resolved_message_id=mid)
+    finally:
+        os.close(upload_fd)
+    accepted = Path(out["resolution"][0]["provided"][0]["path"])
+    assert accepted.read_bytes() == b"PINNED"
+
+
+def test_resolve_fd_walk_preserves_relative_path_asset_order(env, tmp_path):
+    """fd 遍历不能把既有 Path 相对路径排序偷换成 scandir/纯字符串顺序，避免 asset ref 身份漂移。"""
+    d = env["d"]
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=_request(1))
+    item = tmp_path / "uploads" / "1"
+    for relpath in ("a.z", "a/z", "A/x", "a0/x"):
+        path = item / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relpath, encoding="utf-8")
+    mid = InteractionIngest(d).inbound(
+        connector="qq", raw_text="文件已上传", idempotency_key="upload-fd-order",
+        goal_id=1, goal_ver=1)
+
+    out = svc.resolve(
+        request_id=rid, uploads_dir=str(tmp_path / "uploads"), resolved_message_id=mid)
+    assert [asset["original_relpath"] for asset in out["resolution"][0]["provided"]] == [
+        "A/x", "a/z", "a.z", "a0/x"]
 
 
 def test_create_checked_idempotent_retry_wins_over_quota(env, tmp_path):
