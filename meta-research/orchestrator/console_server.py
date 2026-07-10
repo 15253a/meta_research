@@ -23,6 +23,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -49,6 +50,7 @@ _MAX_STATIC_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_NOTIFICATION_BYTES = 4 * 1024 * 1024
 _MAX_NOTIFICATION_RECORDS = 1_000
+_MAX_DELIVERY_STATE_BYTES = 1024 * 1024
 _MAX_STATUS_CARD_BYTES = 1024 * 1024
 _MAX_POLICY_BYTES = 1024 * 1024
 _MAX_DB_TEXT_CHARS = 64 * 1024
@@ -309,14 +311,106 @@ def _load_status_card(work_root: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _strict_projection_json(raw: str) -> Any:
+    def unique_object(pairs):  # noqa: ANN001
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"JSON key 重复: {key}")
+            value[key] = item
+        return value
+
+    return json.loads(
+        raw, object_pairs_hook=unique_object,
+        parse_constant=lambda token: (_ for _ in ()).throw(
+            ValueError(f"JSON 非有限数字: {token}")))
+
+
+def _valid_delivery_receipt(value: Any) -> bool:
+    required = {"version", "channel", "event_key", "accepted_at", "attempt_count",
+                "delivery_id", "ack_hash"}
+    return bool(
+        isinstance(value, dict) and set(value) == required and value.get("version") == 1
+        and isinstance(value.get("channel"), str)
+        and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", value["channel"]) is not None
+        and isinstance(value.get("event_key"), str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}", value["event_key"]) is not None
+        and not isinstance(value.get("accepted_at"), bool)
+        and isinstance(value.get("accepted_at"), (int, float))
+        and math.isfinite(float(value["accepted_at"]))
+        and not isinstance(value.get("attempt_count"), bool)
+        and isinstance(value.get("attempt_count"), int) and value["attempt_count"] >= 1
+        and (value.get("delivery_id") is None
+             or (isinstance(value.get("delivery_id"), str) and len(value["delivery_id"]) <= 256))
+        and isinstance(value.get("ack_hash"), str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", value["ack_hash"]) is not None)
+
+
+def _valid_retry_document(value: Any) -> bool:
+    if (not isinstance(value, dict) or set(value) != {"version", "events"}
+            or value.get("version") != 1 or not isinstance(value.get("events"), dict)):
+        return False
+    required = {"channel", "event_key", "attempt_count", "first_failed_at",
+                "last_attempt_at", "next_attempt_at", "last_error_kind", "last_error"}
+    for identity, entry in value["events"].items():
+        if not isinstance(entry, dict) or set(entry) != required:
+            return False
+        channel, key = entry.get("channel"), entry.get("event_key")
+        if (not isinstance(identity, str) or not isinstance(channel, str)
+                or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", channel) is None
+                or not isinstance(key, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}", key) is None
+                or identity != f"{channel}\x1f{key}"
+                or isinstance(entry.get("attempt_count"), bool)
+                or not isinstance(entry.get("attempt_count"), int)
+                or not 1 <= entry["attempt_count"] <= 2 ** 31 - 1
+                or any(isinstance(entry.get(name), bool)
+                       or not isinstance(entry.get(name), (int, float))
+                       or not math.isfinite(float(entry[name]))
+                       for name in ("first_failed_at", "last_attempt_at", "next_attempt_at"))
+                or not isinstance(entry.get("last_error_kind"), str)
+                or not isinstance(entry.get("last_error"), str)):
+            return False
+    return True
+
+
+def _valid_outbox_event(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) not in (
+            {"event_key", "kind", "payload"},
+            {"event_key", "kind", "payload", "channel"}):
+        return False
+    channel = value.get("channel")
+    return bool(
+        isinstance(value.get("event_key"), str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}", value["event_key"]) is not None
+        and isinstance(value.get("kind"), str) and 1 <= len(value["kind"]) <= 128
+        and isinstance(value.get("payload"), dict)
+        and (channel is None or (isinstance(channel, str)
+             and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", channel) is not None)))
+
+
 def _notifications(work_root: Path) -> List[Dict[str, Any]]:
     """读 outbox 事件队列（notify.Outbox 落的每行 JSON；committed=换行终止，撕裂尾行忽略）。"""
+    authority_errors: List[str] = []
     try:
         raw = read_regular_file_beneath(
             work_root, "state/outbox.jsonl", max_bytes=_MAX_NOTIFICATION_BYTES, tail=True)
-    except (OSError, ValueError, RuntimeError):
+    except FileNotFoundError:
         return []
-    text = raw.decode("utf-8", errors="replace")
+    except (OSError, ValueError, RuntimeError) as error:
+        return [{
+            "event_key": "transport-authority-corrupt",
+            "kind": "transport_authority_corrupt",
+            "payload": {"errors": [f"outbox_corrupt:{type(error).__name__}"],
+                        "message": "投递权威状态损坏；不得把通知视为已交付"},
+            "deliveries": [{"status": "authority_corrupt", "channel": "transport",
+                            "last_error_kind": f"outbox_corrupt:{type(error).__name__}"}],
+        }]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        text = ""
+        authority_errors.append(f"outbox_corrupt:{type(error).__name__}")
     # JSON 字符串可合法包含 U+2028/U+2029；``splitlines`` 会把它们误当物理记录边界。spool 协议只认 LF。
     # 只保留最近固定条数；``split`` 百万条短行会在 4 MiB 字节上限内仍制造百万 Python 对象。
     parts = text.rsplit("\n", _MAX_NOTIFICATION_RECORDS + 1)
@@ -324,14 +418,95 @@ def _notifications(work_root: Path) -> List[Dict[str, Any]]:
     if len(lines) > _MAX_NOTIFICATION_RECORDS:
         lines = lines[-_MAX_NOTIFICATION_RECORDS:]
     out = []                               # JSON 前缀也不当已发事件（committed=换行终止，同 outbox 纪律，codex SHOULD）
-    for line in lines:
+    event_keys = set()
+    tail_may_start_mid_record = len(raw) >= _MAX_NOTIFICATION_BYTES
+    for line_index, line in enumerate(lines):
         line = line.strip()
         if not line:
             continue
         try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue                       # 中段坏行忽略（只读观测面，不 fail loud）
+            value = _strict_projection_json(line)
+            if not _valid_outbox_event(value) or value["event_key"] in event_keys:
+                raise ValueError("outbox event schema/identity 损坏")
+            event_keys.add(value["event_key"])
+            out.append(value)
+        except (json.JSONDecodeError, ValueError) as error:
+            if line_index == 0 and tail_may_start_mid_record:
+                continue
+            authority_errors.append(f"outbox_corrupt:{type(error).__name__}")
+    delivery: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        receipt_raw = read_regular_file_beneath(
+            work_root, "state/delivery_receipts.jsonl",
+            max_bytes=_MAX_NOTIFICATION_BYTES, tail=True).decode("utf-8", errors="replace")
+        receipt_parts = receipt_raw.rsplit("\n", _MAX_NOTIFICATION_RECORDS + 1)
+        receipt_identities = set()
+        receipt_lines = receipt_parts[:-1][- _MAX_NOTIFICATION_RECORDS:]
+        receipt_tail_partial = len(receipt_raw.encode("utf-8")) >= _MAX_NOTIFICATION_BYTES
+        for line_index, line in enumerate(receipt_lines):
+            if not line.strip():
+                continue
+            try:
+                receipt = _strict_projection_json(line)
+            except (json.JSONDecodeError, ValueError):
+                if line_index == 0 and receipt_tail_partial:
+                    continue
+                raise
+            if not _valid_delivery_receipt(receipt):
+                raise ValueError("delivery receipt schema 损坏")
+            identity = f"{receipt['channel']}\x1f{receipt['event_key']}"
+            if identity in receipt_identities:
+                raise ValueError("delivery receipt identity 重复")
+            receipt_identities.add(identity)
+            delivery.setdefault(receipt["event_key"], []).append({
+                "status": "delivered", "channel": receipt.get("channel"),
+                "accepted_at": receipt.get("accepted_at"),
+                "attempt_count": receipt.get("attempt_count"),
+                "delivery_id": receipt.get("delivery_id"),
+            })
+    except FileNotFoundError:
+        pass
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError, RuntimeError) as error:
+        delivery.clear()
+        authority_errors.append(f"receipt_corrupt:{type(error).__name__}")
+    try:
+        state_raw = read_regular_file_beneath(
+            work_root, "state/outbound_delivery_state.json",
+            max_bytes=_MAX_DELIVERY_STATE_BYTES)
+        if not state_raw:
+            raise ValueError("outbound retry state 为空")
+        state = _strict_projection_json(state_raw.decode("utf-8"))
+        if not _valid_retry_document(state):
+            raise ValueError("outbound retry state schema 损坏")
+        for retry in list(state["events"].values())[:_MAX_NOTIFICATION_RECORDS]:
+            existing = delivery.get(retry["event_key"], [])
+            if any(item.get("status") == "delivered"
+                   and item.get("channel") == retry.get("channel") for item in existing):
+                continue                    # durable ACK outranks stale retry state after cleanup crash
+            delivery.setdefault(retry["event_key"], []).append({
+                "status": "retrying", "channel": retry.get("channel"),
+                "attempt_count": retry.get("attempt_count"),
+                "next_attempt_at": retry.get("next_attempt_at"),
+                "last_error_kind": retry.get("last_error_kind"),
+                "last_error": retry.get("last_error"),
+            })
+    except FileNotFoundError:
+        pass
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError, RuntimeError) as error:
+        authority_errors.append(f"retry_state_corrupt:{type(error).__name__}")
+    for event in out:
+        statuses = delivery.get(event.get("event_key"))
+        if statuses:
+            event["deliveries"] = statuses
+    if authority_errors:
+        out.append({
+            "event_key": "transport-authority-corrupt",
+            "kind": "transport_authority_corrupt",
+            "payload": {"errors": authority_errors,
+                        "message": "投递权威状态损坏；不得把通知视为已交付"},
+            "deliveries": [{"status": "authority_corrupt", "channel": "transport",
+                            "last_error_kind": authority_errors[0]}],
+        })
     return out
 
 

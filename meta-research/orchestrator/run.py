@@ -22,9 +22,11 @@ CP8.6）——NotImplementedError 干净报，不静默。
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -39,13 +41,15 @@ from .attack_stages import AttackStages
 from .compiler_sqlite import SqliteCompiler
 from .console import Console
 from .console_ingest import ConsoleInboxIngest
+from .connectors import ConnectorConfigError, OutboundDelivery, load_connectors
 from .cost_ledger import CostLedger
 from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
 from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
-                     Outbox, make_advancer_precheck)
+                     InteractionNotifier, Outbox, ResearchNotifier,
+                     make_advancer_precheck)
 from .runner import CodexRunner, terminate_active_process_groups
 from .schemas import SchemaSet
 from .stage_provider import JudgeProvider, StageProvider
@@ -55,6 +59,7 @@ from .stopcontroller import StopController
 from .writedaemon import WriteDaemon
 
 _STAGES = ("idea", "plan", "bundle", "reasoning")
+logger = logging.getLogger(__name__)
 
 
 def _reject_nonfinite_policy_numbers(value: Any, path: str = "$") -> None:
@@ -72,6 +77,37 @@ def _reject_nonfinite_policy_numbers(value: Any, path: str = "$") -> None:
             _reject_nonfinite_policy_numbers(item, f"{path}[{idx}]")
 
 
+def _validate_outbound_config(policy: Dict[str, Any], config: Optional[Dict[str, Any]]) -> None:
+    """Validate transport assembly before creating/chmod'ing the work root or DB."""
+    if config is None:
+        return
+    if not isinstance(config, dict) or set(config) != {
+            "channels", "retry_initial_s", "retry_max_s", "batch_size"}:
+        raise ValueError("outbound_config 结构非法")
+    if policy["interaction"].get("notify_matrix") != "all_qq_on":
+        raise ValueError(
+            f"尚不支持的 interaction.notify_matrix: {policy['interaction'].get('notify_matrix')!r}")
+    channels = config["channels"]
+    if not isinstance(channels, dict) or "qq" not in channels:
+        raise ValueError("notify_matrix=all_qq_on 要求 connector profile 配置 qq channel")
+    for channel, connector in channels.items():
+        if not isinstance(channel, str) or not channel:
+            raise ValueError("outbound_config channel 非法")
+        if not callable(getattr(connector, "send", None)) or not callable(getattr(connector, "status", None)):
+            raise ValueError(f"outbound connector {channel!r} 缺 send/status")
+    initial = config["retry_initial_s"]
+    maximum = config["retry_max_s"]
+    batch = config["batch_size"]
+    if (isinstance(initial, bool) or not isinstance(initial, (int, float))
+            or not math.isfinite(float(initial)) or float(initial) < 0.1):
+        raise ValueError("outbound retry_initial_s 非法")
+    if (isinstance(maximum, bool) or not isinstance(maximum, (int, float))
+            or not math.isfinite(float(maximum)) or float(maximum) < float(initial)):
+        raise ValueError("outbound retry_max_s 非法")
+    if isinstance(batch, bool) or not isinstance(batch, int) or not 4 <= batch <= 256:
+        raise ValueError("outbound batch_size 非法")
+
+
 class System:
     """装配好的全系统句柄：run() 驱动到停机，last_stop_reason 说明为何停（观测）。"""
 
@@ -80,7 +116,9 @@ class System:
                  sync_interactions: Optional[Callable[[], None]] = None,
                  interaction_pending: Optional[Callable[[], bool]] = None,
                  sync_accepted_interactions: Optional[Callable[[], None]] = None,
-                 accepted_interaction_pending: Optional[Callable[[], bool]] = None):
+                 accepted_interaction_pending: Optional[Callable[[], bool]] = None,
+                 sync_sideband: Optional[Callable[[], None]] = None,
+                 outbound_delivery: Optional[OutboundDelivery] = None):
         self.advancer = advancer
         self.state = state
         self.daemon = daemon
@@ -92,42 +130,75 @@ class System:
         self.sync_accepted_interactions = sync_accepted_interactions or self.sync_interactions
         self.accepted_interaction_pending = (
             accepted_interaction_pending or self.interaction_pending)
+        self.sync_sideband = sync_sideband or (lambda: None)
+        self.outbound_delivery = outbound_delivery
         self._pump_guard = threading.RLock()
         self._pump_thread: Optional[threading.Thread] = None
         self._pump_stop: Optional[threading.Event] = None
         self._pump_error: Optional[BaseException] = None
+        self._pump_owns_delivery = False
         self._interaction_exit_drained = False
         self._hard_stop_requested = False
 
     def _start_interaction_pump(self, poll_interval_s: float) -> bool:
         """Start the one resident spool/completion pump; return whether this call owns it."""
+        sideband_interval = max(0.05, min(0.25, float(poll_interval_s)))
         with self._pump_guard:
-            if self._pump_thread is not None and self._pump_thread.is_alive():
+            # A dead-but-uncollected thread still owns its error and delivery
+            # lifecycle.  Nested run_forever→run must not overwrite that
+            # evidence by silently starting a replacement.
+            if self._pump_thread is not None:
                 return False
             stop = threading.Event()
             self._pump_stop = stop
             self._pump_error = None
+            delivery_owned = False
+            if self.outbound_delivery is not None:
+                delivery_owned = self.outbound_delivery.start(sideband_interval)
+            self._pump_owns_delivery = delivery_owned
 
             def pump() -> None:
                 while not stop.is_set():
                     try:
                         self.sync_interactions()
+                        # Query completion may happen during a multi-hour research provider.  Derive and
+                        # deliver its reply here instead of waiting for the next research stage boundary.
+                        self.sync_sideband()
+                        if self.outbound_delivery is not None:
+                            self.outbound_delivery.raise_if_failed()
                     except sqlite3.OperationalError:
                         # Mediator retains the exact completion in memory;
                         # storage busy/full must be retried, not converted to
                         # unknown cost by ending the pump.
-                        stop.wait(poll_interval_s)
+                        stop.wait(sideband_interval)
                         continue
                     except BaseException as error:
                         self._pump_error = error
                         stop.set()
                         return
-                    stop.wait(poll_interval_s)
+                    stop.wait(sideband_interval)
 
             thread = threading.Thread(target=pump, daemon=False, name="interaction-pump")
             self._pump_thread = thread
-            thread.start()
+            try:
+                thread.start()
+            except BaseException:
+                self._pump_thread = None
+                self._pump_stop = None
+                if delivery_owned:
+                    self.outbound_delivery.stop()
+                self._pump_owns_delivery = False
+                raise
             return True
+
+    def _raise_resident_failure(self) -> None:
+        """Surface a dead sideband/transport worker at the next safe supervisor poll."""
+        with self._pump_guard:
+            error = self._pump_error
+        if error is not None:
+            raise error
+        if self.outbound_delivery is not None:
+            self.outbound_delivery.raise_if_failed()
 
     def _stop_interaction_pump(self) -> Optional[BaseException]:
         with self._pump_guard:
@@ -137,12 +208,35 @@ class System:
             if stop is not None:
                 stop.set()
         thread.join()
+        delivery_error = None
+        if self._pump_owns_delivery and self.outbound_delivery is not None:
+            delivery_error = self.outbound_delivery.stop()
         with self._pump_guard:
             error = self._pump_error
             self._pump_thread = None
             self._pump_stop = None
             self._pump_error = None
-        return error
+            self._pump_owns_delivery = False
+        if error is not None and delivery_error is not None:
+            add_note = getattr(error, "add_note", None)
+            if callable(add_note):
+                add_note(f"outbound delivery 失败: {type(delivery_error).__name__}: {delivery_error}")
+            return error
+        return error or delivery_error
+
+    def flush_outbound(self) -> Dict[str, Any]:
+        """Attempt one bounded priority batch, then report every item left durable."""
+        if self.outbound_delivery is not None:
+            delivered = self.outbound_delivery.tick()
+            status = self.outbound_delivery.pending_status()
+            status["delivered_now"] = len(delivered)
+            if status["pending"]:
+                logger.warning(
+                    "受控退出后仍有 durable outbound backlog pending=%s retrying=%s urgent=%s",
+                    status["pending"], status["retrying"], status["urgent_pending"])
+            return status
+        return {"pending": 0, "retrying": 0, "urgent_pending": 0,
+                "channels": {}, "delivered_now": 0}
 
     def _sync_interactions_retry(self, attempts: int = 3) -> None:
         self._retry_interaction_sync(self.sync_interactions, attempts=attempts)
@@ -238,6 +332,8 @@ class System:
             self._sync_interactions_retry()
         # 正常停机时 notifier 失败仍 fail loud；调用方可修复派生 outbox 后从 DB 重扫。
         self.sync_notifications()
+        if pump_owner:                         # nested run_forever already owns the non-blocking delivery thread
+            self.flush_outbound()
         return result
 
     def drain_interactions(self, *, poll_interval_s: float = 0.1,
@@ -299,6 +395,7 @@ class System:
         pump_owner = self._start_interaction_pump(float(poll_interval_s))
         try:
             while not external_stop.is_set():
+                self._raise_resident_failure()
                 batch: List[str] = []
                 ran_research = False
                 if not research_terminal:
@@ -324,6 +421,7 @@ class System:
                 if research_terminal and not linger_after_terminal and not pending:
                     break
                 external_stop.wait(float(poll_interval_s))
+                self._raise_resident_failure()
         except BaseException as primary:
             pump_error = None
             if pump_owner:
@@ -382,6 +480,7 @@ class System:
             self._hard_stop_requested = True
             raise
         self._interaction_exit_drained = True
+        self.flush_outbound()
         return completed
 
     @property
@@ -390,11 +489,12 @@ class System:
 
 
 def build_system(system_root: str, work_root: str, *, runner_factory: Optional[Callable] = None,
-                 attack=True) -> System:
+                 attack=True, outbound_config: Optional[Dict[str, Any]] = None) -> System:
     """装配全系统。system_root=含 input/goal_brief.md · policies/ · prompts/ · schemas/ 的仓库根；
     work_root=运行产物根（research.sqlite / cycles / state 落此）。runner_factory=注入式 Runner 工厂
     （默认真 CodexRunner；测试传 mock）。attack：True=全装（默认）；False/None=退化 reasoning-only
-    （诊断用）；AttackStages 实例=注入自定装配（codex NIT：保留可注入性，不破外部调用方）。"""
+    （诊断用）；AttackStages 实例=注入自定装配。``outbound_config`` 来自受限 connector profile；None
+    仅用于单测/显式 ``--no-outbound``，绝不伪装成已投递。"""
     root = Path(system_root)
     work = Path(work_root)
     policy = yaml.safe_load((root / "policies" / "policy.yaml").read_text(encoding="utf-8"))
@@ -402,6 +502,7 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     schemas.validator("policy").validate(policy)    # 启动前机械校验；不能只靠 tests 校验仓库默认文件
     _reject_nonfinite_policy_numbers(policy)         # JSON Schema/Python 边界：显式拒 NaN/±Inf
     CostLedger.validate_policy(policy)               # 成本边界（float 溢出/布尔值等）也在创建 work/DB 前验完
+    _validate_outbound_config(policy, outbound_config)
     work.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(work, 0o700)                  # query service UID cannot traverse to DB/raw artifacts
 
@@ -456,12 +557,40 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     base_precheck = make_advancer_precheck(console, daemon)
     outbox = Outbox(str(work / "state"))
     directive_notifier = DirectiveNotifier(daemon, outbox)
+    interaction_notifier = InteractionNotifier(daemon, outbox)
+    research_notifier = ResearchNotifier(daemon, outbox, policy["flow"]["audit_cadence_K"])
     file_request_notifier = FileRequestNotifier(
         daemon, outbox, policy["interaction_request"]["remind_interval_h"])
+    delivery = None
+    if outbound_config is not None:
+        channels = outbound_config.get("channels")
+        delivery = OutboundDelivery(
+            outbox, channels, default_channels=["qq"],
+            retry_initial_s=outbound_config["retry_initial_s"],
+            retry_max_s=outbound_config["retry_max_s"],
+            batch_size=outbound_config["batch_size"],
+        )
+    notification_lock = threading.RLock()
+    sideband_notification_lock = threading.Lock()
+    sideband_last_scan = [float("-inf")]
 
     def sync_notifications() -> None:
-        directive_notifier.scan()
-        file_request_notifier.scan(time.time())
+        with notification_lock:
+            directive_notifier.scan()
+            interaction_notifier.scan()
+            research_notifier.scan()
+            file_request_notifier.scan(time.time())
+
+    def sync_sideband_notifications() -> None:
+        # Full notifier scans are derived/replayable but grow with audit history;
+        # 4 Hz keeps query replies well inside the 2 s SLA without polling every
+        # 50 ms during a multi-hour provider.
+        now = time.monotonic()
+        with sideband_notification_lock:
+            if now - sideband_last_scan[0] < 0.25:
+                return
+            sideband_last_scan[0] = now
+        sync_notifications()
 
     def precheck(cyc=None) -> Optional[str]:
         inbox_ingest.ingest(cyc)              # 先 ingest 控制台入站；故障不裸崩，但 backlog 会在本边界阻断研究
@@ -516,7 +645,9 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
                   interaction_pending=lambda: inbox_ingest.interaction_pending,
                   sync_accepted_interactions=inbox_ingest.poll_accepted,
                   accepted_interaction_pending=(
-                      lambda: inbox_ingest.accepted_interaction_pending))
+                      lambda: inbox_ingest.accepted_interaction_pending),
+                  sync_sideband=sync_sideband_notifications,
+                  outbound_delivery=delivery)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -528,8 +659,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="一次性模式：遇 pause/文件请求即返回；默认保持 run 单写进程常驻等待并自动续跑")
     ap.add_argument("--poll-interval-s", type=float, default=1.0,
                     help="常驻等待时 ingest spool / 扫描 reminder 的轮询秒数（默认 1.0）")
+    outbound = ap.add_mutually_exclusive_group()
+    outbound.add_argument(
+        "--connector-profile",
+        help="出站 connector JSON（默认 <system-root>/connectors/outbound.json；凭据只从其中命名的环境变量读取）")
+    outbound.add_argument(
+        "--no-outbound", action="store_true",
+        help="显式禁用外部投递（仅离线/测试；通知仍在本地 outbox，不得视为生产交付）")
     args = ap.parse_args(argv)
-    system = build_system(args.system_root, args.work_root)
+    outbound_config = None
+    if args.no_outbound:
+        print("[run] 警告：外部 connector 已显式禁用；本地 outbox 不代表通知已交付", file=sys.stderr)
+    else:
+        profile = args.connector_profile or str(Path(args.system_root) / "connectors" / "outbound.json")
+        try:
+            outbound_config = load_connectors(profile)
+        except (ConnectorConfigError, OSError) as error:
+            print(f"[run] connector 配置失败：{error}；离线运行须显式加 --no-outbound", file=sys.stderr)
+            return 2
+    system = build_system(args.system_root, args.work_root, outbound_config=outbound_config)
     try:
         if args.once:
             ids = system.run(args.max_cycles)
@@ -564,6 +712,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not hard_stop:
             try:
                 system.sync_notifications()
+                flush = getattr(system, "flush_outbound", None)
+                if callable(flush):
+                    flush()
             except KeyboardInterrupt:
                 hard_stop_now()
             except Exception as e:

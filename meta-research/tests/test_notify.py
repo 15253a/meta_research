@@ -1580,7 +1580,16 @@ def test_file_request_events_pending_reminder_resolved(env, tmp_path):
                                        goal_id=1, goal_ver=1)
     up = tmp_path / "up"; (up / "1").mkdir(parents=True); (up / "1" / "f").write_bytes(b"x")
     svc.resolve(request_id=rid, uploads_dir=str(up), resolved_message_id=mid)
-    assert f"filereq:{rid}:resolved" in fn.scan(now_ts=created + 50 * 3600)  # 终态事件
+    assert f"filereq:{rid}:resolved:v2" in fn.scan(now_ts=created + 50 * 3600)  # 终态事件
+    resolved = next(event for event in ob._events()
+                    if event["event_key"] == f"filereq:{rid}:resolved:v2")
+    encoded = json.dumps(resolved, ensure_ascii=False)
+    assert resolved["payload"]["resolution_summary"] == {
+        "cancelled": False, "item_count": 1,
+        "provided_file_count": 1, "unavailable_item_count": 0,
+    }
+    assert all(secret not in encoded for secret in (
+        "preview", "original_relpath", str(tmp_path), "user_provided"))
 
 
 # ============ 全局等待（§7.1 M5：Advancer 停、query/通知照常）============
