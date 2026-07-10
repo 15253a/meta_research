@@ -6,6 +6,7 @@
 
 ---
 
+- [0056](0056-cp112b3e-authenticated-connector-ingress.md) — CP11.2b.3e webhook/OneBot 认证耐久入站 + 身份/会话绑定 + 精确继续/动作语义 + 有限退出排空 · commit `5056736` · 验证: 通过（相关 344+30；内审 166；唯一一次全量 1137；外审第1轮 401、第2轮超时，均无 verdict）—— **CP11.2 人类控制闭环达成**
 - [0055](0055-cp112b3d-durable-connector-delivery.md) — CP11.2b.3d 真实 webhook/OneBot 出站 + 耐久 queue/retry/receipt + 严格 ACK/公平调度/诚实投影 · commit `6098a69` · 验证: 通过（相关 239；唯一一次全量 1105；外审第1轮 401、第2轮超时，均无 verdict）
 - [0054](0054-cp112b3c-readonly-query-responder.md) — CP11.2b.3c facts-only 只读 Codex 查询 + 不同 UID/tool-free 隔离 + 耐久 FIFO/成本/reply 收尾 · commit `92ecf18` · 验证: 通过（唯一一次全量 1055 过/1 败；对应前端修复后定向 6/6，依指示未二次全量；外审两次均因账号限额无 verdict）
 - [0053](0053-cp112b3b-goal-amend-versioning.md) — CP11.2b.3b 不可变目标升版 + 专用 reasoning route + applicability/revalidate + 崩溃恢复 · commit `2dfa653` · 验证: 通过（控制面/调度面 374、全量 992；外审两轮上限后全部反馈本地修复）
