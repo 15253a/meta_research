@@ -13,7 +13,7 @@ import pytest
 import conftest
 from orchestrator import database as db
 from orchestrator.console import (DIRECTIVE_ACTION_SESSION_REF, Console,
-                                  DirectiveApplicationError, IdempotencyCollisionError,
+                                  IdempotencyCollisionError,
                                   KeywordClassifier, directive_action_text, sanitize)
 from orchestrator.writedaemon import WriteDaemon
 
@@ -145,7 +145,7 @@ def test_unconfirmed_hard_directive_consume_rejected(env):
     assert dec == ("human", "directive_pause", r["directive_id"])                    # 同记 DECISION（经 directive 回指）
 
 
-def test_goal_amend_unimplemented_never_claims_consumed_success(env):
+def test_goal_amend_consumption_records_exact_confirmed_effect(env):
     d, c = env["d"], env["c"]
     r = c.handle_inbound(
         connector="qq", raw_text="修订目标：改成新目标", idempotency_key="k-goal-amend",
@@ -153,11 +153,129 @@ def test_goal_amend_unimplemented_never_claims_consumed_success(env):
     c.confirm_directive(
         directive_id=r["directive_id"],
         confirm_message_id=_action_message(d, c, r, "confirm"))
-    with pytest.raises(DirectiveApplicationError, match="真实状态语义"):
-        c.consume_directive(directive_id=r["directive_id"], cycle_id="c1")
+    with d.transaction() as conn:
+        conn.execute("UPDATE cycle SET route='goal_amend' WHERE id=1")
+    effect = c.consume_directive(directive_id=r["directive_id"], cycle_id="c1")
+    assert effect == {
+        "kind": "goal_amend", "new_goal_text": "新目标", "predicate_json": {},
+        "rationale_md": "用户明确修订研究目标", "source_goal_ver": 1,
+        "target_goal_ver": 2, "applies_to_reasoning_cycle": "c1"}
     assert d.query_one(
         "SELECT status,consumed_cycle,consumed_decision_id FROM directive WHERE id=?",
-        (r["directive_id"],)) == ("pending", None, None)
+        (r["directive_id"],))[:2] == ("consumed", 1)
+    assert d.query_one(
+        "SELECT actor,type FROM decision WHERE directive_id=? ORDER BY id DESC LIMIT 1",
+        (r["directive_id"],)) == ("human", "directive_goal_amend")
+    assert d.query_one("SELECT count(*) FROM goal")[0] == 1  # 应用须等 reasoning 原子收尾
+
+
+def test_goal_amend_classifier_structured_json_and_rejects_unknown():
+    k = KeywordClassifier()
+    parsed = k.classify({"raw_text":
+        'goal amend {"new_goal_text":"新目标","predicate_json":{"metric":"acc"},"rationale_md":"收紧"}'})
+    assert parsed["structured"] == {
+        "new_goal_text": "新目标", "predicate_json": {"metric": "acc"}, "rationale_md": "收紧"}
+    bad = k.classify({"raw_text": '修订目标 {"new_goal_text":"x","unknown":1}'})
+    assert "不允许字段" in bad["structured"]["parse_error"]
+    braces = k.classify({"raw_text": "修订目标：研究集合 A={x|x>0} 的稳健规律"})
+    assert braces["structured"]["new_goal_text"] == "研究集合 A={x|x>0} 的稳健规律"
+
+
+def test_goal_amend_stale_confirmation_becomes_superseded(env):
+    d, c = env["d"], env["c"]
+    r = c.handle_inbound(
+        connector="qq", raw_text="修订目标：旧页面里的改版", idempotency_key="stale-amend",
+        goal_id=1, goal_ver=1)
+    with d.transaction() as conn:
+        conn.execute(
+            "INSERT INTO goal(id,version,text,predicate_json,previous_version) "
+            "VALUES (1,2,'已由其他改版生效','{}',1)")
+    c.confirm_directive(
+        directive_id=r["directive_id"],
+        confirm_message_id=_action_message(d, c, r, "confirm"))
+    status, payload_raw = d.query_one(
+        "SELECT status,payload_json FROM directive WHERE id=?", (r["directive_id"],))
+    assert status == "superseded"
+    assert json.loads(payload_raw)["superseded_reason"] == "source_goal_not_current"
+
+
+def test_latest_confirmed_goal_amend_supersedes_older_pending(env):
+    d, c = env["d"], env["c"]
+    first = c.handle_inbound(
+        connector="qq", raw_text="修订目标：第一版", idempotency_key="amend-first",
+        goal_id=1, goal_ver=1)
+    second = c.handle_inbound(
+        connector="qq", raw_text="修订目标：第二版", idempotency_key="amend-second",
+        goal_id=1, goal_ver=1)
+    c.confirm_directive(
+        directive_id=first["directive_id"],
+        confirm_message_id=_action_message(d, c, first, "confirm"))
+    c.confirm_directive(
+        directive_id=second["directive_id"],
+        confirm_message_id=_action_message(d, c, second, "confirm"))
+    assert d.query(
+        "SELECT status FROM directive WHERE id IN (?,?) ORDER BY id",
+        (first["directive_id"], second["directive_id"])) == [("superseded",), ("pending",)]
+
+
+def test_malformed_confirmed_goal_amend_is_rejected_without_superseding_valid(env):
+    """不可执行的新修订不是 effective amendment，不能抹掉较早的有效用户意图。"""
+    d, c = env["d"], env["c"]
+    valid = c.handle_inbound(
+        connector="qq", raw_text="修订目标：有效目标", idempotency_key="valid-amend",
+        goal_id=1, goal_ver=1)
+    c.confirm_directive(
+        directive_id=valid["directive_id"],
+        confirm_message_id=_action_message(d, c, valid, "confirm"))
+    malformed = c.handle_inbound(
+        connector="qq", raw_text='修订目标 {"new_goal_text":"坏目标","unknown":1}',
+        idempotency_key="malformed-amend", goal_id=1, goal_ver=1)
+    c.confirm_directive(
+        directive_id=malformed["directive_id"],
+        confirm_message_id=_action_message(d, c, malformed, "confirm"))
+
+    assert d.query_one(
+        "SELECT status FROM directive WHERE id=?", (valid["directive_id"],))[0] == "pending"
+    status, payload_raw = d.query_one(
+        "SELECT status,payload_json FROM directive WHERE id=?", (malformed["directive_id"],))
+    assert status == "rejected"
+    payload = json.loads(payload_raw)
+    assert payload["confirmed"] is True and payload["confirmation_message_id"]
+    assert payload["rejection_kind"] == "application_unavailable"
+    assert d.query_one(
+        "SELECT actor,type FROM decision WHERE directive_id=?",
+        (malformed["directive_id"],)) == ("orchestrator", "directive_application_rejected")
+
+
+def test_goal_amend_current_version_and_supersession_are_goal_id_scoped(env):
+    """其它 goal 的更高 version / 更新 directive 不得把本 goal 的合法修订判 stale 或覆盖。"""
+    d, c = env["d"], env["c"]
+    with d.transaction() as conn:
+        conn.execute(
+            "INSERT INTO goal(id,version,text,predicate_json) VALUES (2,2,'另一个目标 v2','{}')")
+    goal1 = c.handle_inbound(
+        connector="qq", raw_text="修订目标：目标一新版", idempotency_key="g1-amend",
+        goal_id=1, goal_ver=1)
+    goal2 = c.handle_inbound(
+        connector="qq", raw_text="修订目标：目标二新版", idempotency_key="g2-amend",
+        goal_id=2, goal_ver=2)
+    # goal2 directive id 更新且先确认；随后确认 goal1 时不能跨 goal 看见/覆盖它。
+    c.confirm_directive(
+        directive_id=goal2["directive_id"],
+        confirm_message_id=_action_message(d, c, goal2, "confirm"))
+    c.confirm_directive(
+        directive_id=goal1["directive_id"],
+        confirm_message_id=_action_message(d, c, goal1, "confirm"))
+    c.supersede_stale_goal_amends()
+    assert d.query(
+        "SELECT status FROM directive WHERE id IN (?,?) ORDER BY id",
+        (goal1["directive_id"], goal2["directive_id"])) == [("pending",), ("pending",)]
+
+    with d.transaction() as conn:
+        conn.execute("UPDATE cycle SET route='goal_amend' WHERE id=1")
+    effect = c.consume_directive(directive_id=goal1["directive_id"], cycle_id="c1")
+    assert effect["source_goal_ver"] == 1 and effect["target_goal_ver"] == 2
+    assert effect["new_goal_text"] == "目标一新版"
 
 
 def test_reject_by_user_no_decision(env):

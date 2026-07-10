@@ -205,7 +205,7 @@ def test_unwired_worker_fails_loud(tmp_path):
     daemon.conn.close()
     daemon2 = WriteDaemon(db.connect(path))
     state2 = SQLiteStateStore(daemon2, POLICY)
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="g")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
     adv = SqliteAdvancer(state2, compiler, lambda c, p: None)        # 未装配 import_worker
     with pytest.raises(RuntimeError, match="import_worker 未装配"):
         adv.run_cycles(max_cycles=1)
@@ -281,7 +281,7 @@ def test_advancer_hands_inflight_worker_to_resumer(tmp_path):
     daemon.conn.close()
 
     daemon2, state2, w2 = _mk_worker(path, tmp_path / "w")           # 重启：研究驱动循环入口
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="import 研究目标")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
     adv = SqliteAdvancer(state2, compiler, lambda c, p: None)
     adv.import_worker = w2
     adv.run_cycles(max_cycles=1)                                     # _resume_or_open 识别 worker → 续物化

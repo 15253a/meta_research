@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import textwrap
@@ -71,6 +72,50 @@ def _force_answer(s, qid, cycle_id, verdict="answered"):
     return f"a{aid}"
 
 
+def _start_goal_amend(s, *, text="g2", predicate=None, rationale="r"):
+    """Install the exact consumed human authority required by production StateStore."""
+    c = s.open_or_resume_cycle()
+    ci = _cnum(c.cycle_id)
+    with s.daemon.transaction() as conn:
+        current_ver, current_predicate = conn.execute(
+            "SELECT version,predicate_json FROM goal WHERE id=1 ORDER BY version DESC LIMIT 1").fetchone()
+        effective_predicate = (json.loads(current_predicate) if predicate is None else predicate)
+        serial = conn.execute("SELECT coalesce(max(id),0)+1 FROM directive").fetchone()[0]
+        mid = conn.execute(
+            "INSERT INTO interaction_message(connector,goal_id,goal_ver,cycle_id,raw_text,raw_hash,idempotency_key) "
+            "VALUES ('test',1,?,?,?,'sha256:test',?)",
+            (current_ver, ci, f"amend {text}", f"goal-amend-{serial}")).lastrowid
+        payload = {"confirmed": True, "new_goal_text": text,
+                   "predicate_json": effective_predicate, "rationale_md": rationale,
+                   "polished": "test goal amendment"}
+        did = conn.execute(
+            "INSERT INTO directive(kind,hardness,status,consume_at,payload_json,created_cycle,"
+            "source_interaction_message_id) VALUES ('goal_amend','hard','pending','reasoning_start',?,?,?)",
+            (json.dumps(payload, ensure_ascii=False), ci, mid)).lastrowid
+        conn.execute(
+            "INSERT INTO interaction_classification(message_id,intent,directive_id) "
+            "VALUES (?,'directive',?)", (mid, did))
+        conn.execute(
+            "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+            "VALUES (?,?,'orchestrator','goal_amend_routed','{\"route\":\"goal_amend\"}')",
+            (ci, did))
+        effect = {"kind": "goal_amend", "new_goal_text": text,
+                  "predicate_json": effective_predicate, "rationale_md": rationale,
+                  "source_goal_ver": current_ver, "target_goal_ver": current_ver + 1,
+                  "applies_to_reasoning_cycle": c.cycle_id}
+        decision = conn.execute(
+            "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+            "VALUES (?,?,'human','directive_goal_amend',?)",
+            (ci, did, json.dumps({"effect": effect}, ensure_ascii=False))).lastrowid
+        conn.execute(
+            "UPDATE directive SET status='consumed',consumed_cycle=?,consumed_decision_id=? WHERE id=?",
+            (ci, decision, did))
+        conn.execute("UPDATE cycle SET route='goal_amend' WHERE id=?", (ci,))
+    op = {"op": "amend_goal", "new_goal_text": text,
+          "predicate_json": effective_predicate, "rationale_md": rationale}
+    return c, op, did
+
+
 def _store_with(**tree_guard):
     pol = {"policy_version": "t",
            "tree_guard": {"max_decompose_depth": 3, "max_children_per_node": 3, "max_open_questions": 20, **tree_guard},
@@ -132,8 +177,9 @@ def test_max_closed_revalidate_cumulative(store):
     aids = [_force_answer(store, f"q{r[0]}", c.cycle_id)
             for r in store.daemon.query("SELECT id FROM question WHERE parent_id=?", (_qnum(root),))]
     store.mark_cycle_done(c.cycle_id)
-    g = store.open_or_resume_cycle(); store.set_route(g.cycle_id, "goal_amend")
-    store.apply_tree_ops(g.cycle_id, [{"op": "seed_applicability_audit", "answer_ids": aids[:2], "rationale_md": "r"}])
+    g, amend, _ = _start_goal_amend(store)
+    store.apply_tree_ops(g.cycle_id, [amend,
+        {"op": "seed_applicability_audit", "answer_ids": aids[:2], "rationale_md": "r"}])
     with pytest.raises(ValueError, match="max_closed_revalidate_per_cycle"):   # 累计 2+2=4 > 3
         store.apply_tree_ops(g.cycle_id, [{"op": "seed_applicability_audit", "answer_ids": aids[2:], "rationale_md": "r"}])
 
@@ -141,7 +187,7 @@ def test_max_closed_revalidate_cumulative(store):
 def test_revalidate_cumulative_across_cycles_no_bypass(store):
     """codex 第2轮 BLOCKER 回归：re-seed 旧轮同版 applicability 行会把 audit_cycle 迁到本轮、计入本轮预算，
     防「分批 re-seed 旧行」绕过 per-cycle 上限（无 audit_cycle 更新时可无限绕过）。"""
-    root = _bootstrap_root(store)                              # cap=3，不 amend → 全 goal_ver 1
+    root = _bootstrap_root(store)                              # cap=3；答案生于 v1
     c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "attack")
     for i in range(4):
         store.apply_tree_ops(c.cycle_id, [{"op": "spawn_question", "kind": "followup",
@@ -149,11 +195,13 @@ def test_revalidate_cumulative_across_cycles_no_bypass(store):
     aids = [_force_answer(store, f"q{r[0]}", c.cycle_id)
             for r in store.daemon.query("SELECT id FROM question WHERE parent_id=?", (_qnum(root),))]
     store.mark_cycle_done(c.cycle_id)
-    a = store.open_or_resume_cycle(); store.set_route(a.cycle_id, "goal_amend")   # 轮 A：seed 前 2（audit_cycle=A）
-    store.apply_tree_ops(a.cycle_id, [{"op": "seed_applicability_audit", "answer_ids": aids[:2], "rationale_md": "r"}])
+    a, amend_a, _ = _start_goal_amend(store, text="g2")
+    store.apply_tree_ops(a.cycle_id, [amend_a,
+        {"op": "seed_applicability_audit", "answer_ids": aids[:2], "rationale_md": "r"}])
     store.mark_cycle_done(a.cycle_id)
-    b = store.open_or_resume_cycle(); store.set_route(b.cycle_id, "goal_amend")   # 轮 B：re-seed 那 2（迁 audit_cycle→B）
-    store.apply_tree_ops(b.cycle_id, [{"op": "seed_applicability_audit", "answer_ids": aids[:2], "rationale_md": "r"}])
+    b, amend_b, _ = _start_goal_amend(store, text="g3")
+    store.apply_tree_ops(b.cycle_id, [amend_b,
+        {"op": "seed_applicability_audit", "answer_ids": aids[:2], "rationale_md": "r"}])
     with pytest.raises(ValueError, match="max_closed_revalidate_per_cycle"):      # 再 seed 另 2 → 本轮累计 4 > 3
         store.apply_tree_ops(b.cycle_id, [{"op": "seed_applicability_audit", "answer_ids": aids[2:], "rationale_md": "r"}])
 
@@ -293,14 +341,15 @@ def test_spawn_and_prune(store):
 
 
 def test_goal_amend_spawn_cap_counts_only_goal_amend_route(store):
-    """spawn 的 goal_amend 上限只数 goal_amend 路由下的 spawn（对齐 InMemory，内审 SHOULD）——
-    同轮先前别的路由下的 spawn 不占 goal_amend 预算（cap=2：attack followup 不计，2 个 goal_retarget 应过）。"""
+    """goal_amend spawn 上限由本轮 durable decisions 计数，分批调用/重启不能绕过。"""
     root = _bootstrap_root(store)
     c = store.open_or_resume_cycle()
     store.set_route(c.cycle_id, "attack")
     store.apply_tree_ops(c.cycle_id, [{"op": "spawn_question", "kind": "followup",
                                        "parent_question_id": root, "text": "f", "local_key": "f"}])
-    store.set_route(c.cycle_id, "goal_amend")
+    store.mark_cycle_done(c.cycle_id)
+    c, amend, _ = _start_goal_amend(store)
+    store.apply_tree_ops(c.cycle_id, [amend])
     for i in (1, 2):   # cap=2：两个 goal_retarget 应成功（attack 那次不占额）
         store.apply_tree_ops(c.cycle_id, [{"op": "spawn_question", "kind": "goal_retarget",
                                            "text": f"r{i}", "local_key": f"r{i}"}])
@@ -311,10 +360,15 @@ def test_goal_amend_spawn_cap_counts_only_goal_amend_route(store):
 
 def test_amend_goal_bumps_version(store):
     root = _bootstrap_root(store)
-    c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "goal_amend")
-    store.apply_tree_ops(c.cycle_id, [{"op": "amend_goal", "new_goal_text": "g2", "predicate_json": {"k": 2}}])
+    with store.daemon.transaction() as conn:
+        conn.execute("UPDATE question SET score=0.9,est_cost=2 WHERE id=?", (_qnum(root),))
+    c, amend, did = _start_goal_amend(store, predicate={"k": 2})
+    store.apply_tree_ops(c.cycle_id, [amend])
     assert store.daemon.query_one("SELECT max(version) FROM goal WHERE id=1")[0] == 2
-    assert store.daemon.query_one("SELECT goal_ver FROM question WHERE id=?", (_qnum(root),))[0] == 2   # 未关问题迁新版
+    assert store.daemon.query_one("SELECT goal_ver,score,est_cost FROM question WHERE id=?", (_qnum(root),)) == (2, None, None)
+    assert store.daemon.query_one(
+        "SELECT previous_version,created_cycle,directive_id FROM goal WHERE id=1 AND version=2") == (1, _cnum(c.cycle_id), did)
+    assert store.daemon.query_one("SELECT goal_ver FROM cycle WHERE id=?", (_cnum(c.cycle_id),))[0] == 2
 
 
 def test_mark_answer_applicability_binding(store):
@@ -322,10 +376,12 @@ def test_mark_answer_applicability_binding(store):
     cid = _decompose(store, root, n=1)
     child = f"q{store.daemon.query_one('SELECT id FROM question WHERE parent_id=?', (_qnum(root),))[0]}"
     aid = _force_answer(store, child, cid)
+    store.resolve_deps(); store.mark_cycle_done(cid)
     # 建 revalidate 回看题（parent=被回看 answer 所属问题=child）
-    c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "goal_amend")
-    store.apply_tree_ops(c.cycle_id, [{"op": "spawn_question", "kind": "revalidate", "parent_question_id": child,
-                                       "text": "reval", "local_key": "rv"}])
+    c, amend, _ = _start_goal_amend(store)
+    store.apply_tree_ops(c.cycle_id, [amend,
+        {"op": "spawn_question", "kind": "revalidate", "parent_question_id": child,
+         "text": "reval", "local_key": "rv"}])
     store.apply_tree_ops(c.cycle_id, [{"op": "mark_answer_applicability", "answer_id": aid, "status": "needs_revalidation",
                                        "spawned_question_ref": "rv", "rationale_md": "why"}])
     row = store.daemon.query_one("SELECT status FROM answer_applicability WHERE answer_id=?", (_anum(aid),))
@@ -337,10 +393,12 @@ def test_mark_applicability_rejects_wrong_revalidate_parent(store):
     cid = _decompose(store, root, n=1)
     child = f"q{store.daemon.query_one('SELECT id FROM question WHERE parent_id=?', (_qnum(root),))[0]}"
     aid = _force_answer(store, child, cid)
-    c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "goal_amend")
+    store.resolve_deps(); store.mark_cycle_done(cid)
+    c, amend, _ = _start_goal_amend(store)
     # 回看题 parent=root（≠ 被回看 answer 所属问题 child）→ 拒
-    store.apply_tree_ops(c.cycle_id, [{"op": "spawn_question", "kind": "revalidate", "parent_question_id": root,
-                                       "text": "reval", "local_key": "rv"}])
+    store.apply_tree_ops(c.cycle_id, [amend,
+        {"op": "spawn_question", "kind": "revalidate", "parent_question_id": root,
+         "text": "reval", "local_key": "rv"}])
     with pytest.raises(ValueError, match="回看题 parent"):
         store.apply_tree_ops(c.cycle_id, [{"op": "mark_answer_applicability", "answer_id": aid,
                                            "status": "contradicted", "spawned_question_ref": "rv", "rationale_md": "x"}])

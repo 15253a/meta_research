@@ -243,8 +243,7 @@ def test_tau_score_floor_self_stop_end_to_end(tmp_path):
 
 
 def test_goal_body_from_db_not_edited_brief(tmp_path, monkeypatch):
-    """外审 SHOULD 回归：重启时 goal_body_md 取 DB goal.text（权威），不受 goal_brief.md 编辑影响
-    （防绕过 goal_amend 的静默漂移）。"""
+    """重启后 compiler 在读快照内按 cycle 的精确 goal version 取正文。"""
     sys1 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE]))
     sys1.run(5)
     db_goal = sys1.daemon.query_one("SELECT text FROM goal WHERE id=1")[0]
@@ -253,8 +252,10 @@ def test_goal_body_from_db_not_edited_brief(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "parse_goal_brief", lambda p: {"body_md": "【被篡改的目标】", "predicate_json": {},
                                                           "frontmatter": {}})
     sys2 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))
-    assert sys2.advancer.compiler.goal_body_md == db_goal      # 用 DB 正文，非篡改 brief
-    assert "篡改" not in sys2.advancer.compiler.goal_body_md
+    pack = sys2.advancer.compiler.render(cycle_id="c1", stage="reasoning")
+    assert db_goal in pack.anchor_md
+    assert "篡改" not in pack.anchor_md
+    assert "db:goal:1:v1" in pack.sources
 
 
 def test_main_cli_smoke(tmp_path, monkeypatch, capsys):

@@ -157,10 +157,9 @@ def _directive_state_events(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         evs.append({"event_key": f"directive:{d['id']}:pending_effect",
                     "kind": "directive_pending_effect",
                     "payload": {**payload_base, "consume_at": d["consume_at"]}})
-        # reprioritize is consumed at reasoning_start but its real effect only
-        # exists when selection is atomically normalized.  Do not announce
-        # "applied" in the precheck→Runner window; the final enforcement
-        # decision unlocks this event.  Other directives apply in consume itself.
+        # reprioritize and goal_amend are consumed at reasoning_start but their
+        # real effects exist only in the later atomic selection / goal-version
+        # commit.  Do not announce "applied" in the precheck→Runner window.
         if not d.get("_application_pending"):
             evs.append({"event_key": f"directive:{d['id']}:applied", "kind": "directive_applied",
                         "payload": {**payload_base,
@@ -206,6 +205,16 @@ class DirectiveNotifier:
                     row["_application_pending"] = True
                 else:
                     row["_decision_effect"] = json.loads(actual[1])
+            if kind == "goal_amend" and status == "consumed":
+                actual = self.daemon.query_one(
+                    "SELECT payload_json FROM decision WHERE directive_id=? "
+                    "AND actor='agent' AND type='goal_amend' "
+                    "ORDER BY id DESC LIMIT 1", (did,))
+                if actual is None:
+                    row["_application_pending"] = True
+                else:
+                    payload = json.loads(actual[0])
+                    row["_decision_effect"] = payload.get("effect", payload)
             for ev in _directive_state_events(row):
                 if self.outbox.emit(ev["event_key"], ev["kind"], ev["payload"]):
                     new_keys.append(ev["event_key"])
@@ -1216,7 +1225,7 @@ def _due_timings(cyc) -> List[str]:
     status='bundle' 的下一格才是 reasoning（早一格消费即违约）。cyc=None（开轮前）只消费前两类。"""
     due = ["immediate", "stage_boundary"]
     if cyc is not None and (
-            cyc.route in ("bootstrap", "decompose") or
+            cyc.route in ("bootstrap", "decompose", "goal_amend") or
             (cyc.route == "attack" and cyc.status == "bundle")):
         due.append("reasoning_start")
     return due
@@ -1226,8 +1235,27 @@ def make_advancer_precheck(console: Console, daemon: WriteDaemon) -> Callable:
     """§4.4.1 前置检查（SqliteAdvancer.precheck 装配件）：先消费到期 directive（_due_timings）、再查
     阻断。返回 callable(cyc_or_none) -> Optional[str]（None=放行；str=拒因，Advancer 停止推进）。"""
     def precheck(cyc=None) -> Optional[str]:
+        console.supersede_stale_goal_amends()
         for timing in _due_timings(cyc):
             for did in console.pending_directives(timing):
+                kind_row = daemon.query_one("SELECT kind FROM directive WHERE id=?", (did,))
+                kind = kind_row[0] if kind_row is not None else None
+                # A goal amendment arriving during an attack/decompose cycle is
+                # intentionally deferred: the current cycle closes under its
+                # old goal version, then route priority opens a dedicated amend
+                # cycle.  Consuming it here would expose it to the wrong pack.
+                if kind == "goal_amend" and (cyc is None or cyc.route != "goal_amend"):
+                    continue
+                # goal_amend is a dedicated control round.  Its bound hard
+                # amendment must not sit behind up to 128 older notes/priority
+                # controls and then be terminally rejected by the per-pack cap.
+                # Defer every companion reasoning_start directive to the next
+                # ordinary reasoning boundary under the newly committed goal.
+                # Immediate/stage-boundary controls (pause/abort/budget) remain
+                # unaffected and are still handled by their earlier timing.
+                if (timing == "reasoning_start" and cyc is not None
+                        and cyc.route == "goal_amend" and kind != "goal_amend"):
+                    continue
                 cycle_id = cyc.cycle_id if cyc is not None else None
                 try:
                     console.consume_directive(directive_id=did, cycle_id=cycle_id)

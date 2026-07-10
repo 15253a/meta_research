@@ -269,18 +269,20 @@ class InMemoryStateStore:
                 self._record("agent", "prune_branch", {"qid": q.qid, "reason": op["reason_md"]})
                 q.status = "dead_end"              # decision 先行、再置 dead_end（§4.2.4）
             elif kind == "amend_goal":
-                # M0 偏差注记：§4.2.4 说迁移「open（含 inconclusive）」；goal_amend 是
-                # reasoning-only 轮、正常无 active——此处连带 active 迁移是防御性宽化；
-                # 「按新版本重打分」由随后的 R3/persist_selection 完成、不在本 op 内。
                 if cycle.route != "goal_amend":
                     raise ValueError("amend_goal 仅限 goal_amend 轮")
+                if any(q.status == "active" for q in self.questions.values()):
+                    raise ValueError("goal_amend 轮不得携 active 问题")
+                if not isinstance(op.get("predicate_json"), dict):
+                    raise ValueError("amend_goal.predicate_json 须为 object")
                 self.goal["ver"] += 1
                 self.goal["text"] = op["new_goal_text"]
-                if op.get("predicate_json"):
-                    self.goal["predicate_json"] = op["predicate_json"]
+                self.goal["predicate_json"] = op["predicate_json"]
                 for q in self.questions.values():
-                    if q.status in ("open", "inconclusive", "active"):
+                    if q.status in ("open", "inconclusive"):
                         q.goal_ver = self.goal["ver"]
+                        q.score = None
+                        q.est_cost = None
                 self._record("agent", "goal_amend", {"new_ver": self.goal["ver"]})
             elif kind == "seed_applicability_audit":
                 if cycle.route != "goal_amend":

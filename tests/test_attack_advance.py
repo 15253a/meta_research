@@ -141,7 +141,7 @@ def _providers(daemon, *, bundle=None):
 def _mk_env(path, work, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_body=SMOKE_OK):
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY)
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="toy 研究目标")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
     pool = PoolGate(daemon, open_gate_read_conn(path))
     obs_conn = db.connect(path)
     close_gate = SqliteGate(daemon, open_gate_read_conn(path), SchemaSet(SYSTEM_ROOT / "schemas"),

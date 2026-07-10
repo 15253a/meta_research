@@ -29,13 +29,12 @@ from .ids import cnum as _cnum
 from .runtime_control import effective_budget_config
 
 
-def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any], goal_body_md: str) -> Dict[str, Any]:
+def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any]) -> Dict[str, Any]:
     """从 DB 真相构建 status_card（封闭字段集）。conn 须为专用只读连接（isolation_level=None，同 compiler 约定）。
     整卡在一个读事务内构建（钉一致快照，杜绝混态：cycle 取 A 态、questions 取 B 态）。
 
-    **goal_body_md 契约**（同 compiler 的 goal_body_md）：须是**本 cycle 当前 goal_ver 绑定**的目标正文——
-    由调用方（M3 advance）按 cycle.goal_id/goal_ver 解析后传入；本函数不跨版校验（它不在 BEGIN 快照内）。
-    M3 接线务必传版本正确的正文，勿跨 goal/version 复用同一参数（否则 goal.summary 会串版）。"""
+    Goal text is read by exact ``(goal_id, goal_ver)`` inside this same snapshot;
+    callers cannot accidentally cache v1 after a runtime amendment."""
     ci = _cnum(cycle_id)
     conn.isolation_level = None            # 本函数掌控事务（钉读快照）；调用方应传专用读连接
     conn.execute("BEGIN")                  # 钉一致读快照（只读，COMMIT 即释放）
@@ -46,6 +45,11 @@ def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any], goal_body_
         if cyc is None:
             raise ValueError(f"cycle 不存在: {cycle_id}")
         goal_id, goal_ver, aq, cstatus, route, next_q, next_intent = cyc
+        goal = conn.execute(
+            "SELECT text FROM goal WHERE id=? AND version=?", (goal_id, goal_ver)).fetchone()
+        if goal is None:
+            raise RuntimeError(
+                f"cycle {cycle_id} 绑定的 goal {goal_id}@v{goal_ver} 不存在")
 
         active_question = None
         if aq is not None:
@@ -81,15 +85,16 @@ def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any], goal_body_
 
         counts = {"open": 0, "inconclusive": 0}
         for st, n in conn.execute(
-                "SELECT status, count(*) FROM question WHERE goal_id=? AND status IN ('open','inconclusive') "
-                "GROUP BY status", (goal_id,)).fetchall():
+                "SELECT status, count(*) FROM question WHERE goal_id=? AND goal_ver=? "
+                "AND status IN ('open','inconclusive') GROUP BY status",
+                (goal_id, goal_ver)).fetchall():
             counts[st] = n
 
         pending_file_request = _pending_file_request(conn, goal_id)
 
         return {
             "snapshot_cycle": cycle_id,
-            "goal": {"id": goal_id, "ver": goal_ver, "summary": _first_line(goal_body_md)},
+            "goal": {"id": goal_id, "ver": goal_ver, "summary": _first_line(goal[0])},
             "active_question": active_question,
             "cycle_status": cstatus,
             "route": route,
@@ -143,15 +148,13 @@ class SqliteStatusPublisher:
     （mediator.open_responder_read_conn 同源）。发布失败（磁盘满等）向上抛：卡是派生可重建的，
     但静默丢发布会让人机窗口无声过期——fail loud，重试/降级 = M6 硬化。"""
 
-    def __init__(self, conn, *, policy: Dict[str, Any], goal_body_md: str, out_path: str):
+    def __init__(self, conn, *, policy: Dict[str, Any], out_path: str):
         self.conn = conn
         self.policy = policy
-        self.goal_body_md = goal_body_md
         self.out_path = Path(out_path)
 
     def publish(self, cycle_id: str) -> str:
-        card = build_status_card(self.conn, cycle_id=cycle_id, policy=self.policy,
-                                 goal_body_md=self.goal_body_md)
+        card = build_status_card(self.conn, cycle_id=cycle_id, policy=self.policy)
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.out_path.with_name(self.out_path.name + ".tmp")
         tmp.write_text(status_card_json(card), encoding="utf-8")

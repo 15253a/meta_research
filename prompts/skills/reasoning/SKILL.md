@@ -36,8 +36,15 @@
   解析为真实 id）。不答题。
 - **decompose**：对选中的超预算问题写子问题（add_children，受树规模护栏：
   max_children_per_node / max_decompose_depth）+ selection 选一个子问题攻坚。不答题。
-- **goal_amend**：消费 goal_amend directive → tree_ops=amend_goal（+按需
-  seed_applicability_audit，受 max_closed_revalidate_per_cycle）+ selection。不答题。
+- **goal_amend**：只做目标改版，不答题。`tree_ops.ops[0]` **必须且只能是一个**
+  `amend_goal`；其中 `new_goal_text / predicate_json / rationale_md` 必须逐字段复制固定锚里
+  已确认的 goal_amend directive，禁止自行润色、补写或换谓词。升版后才可追加：
+  `seed_applicability_audit`（只选可能受新根谓词影响的旧版 closed answer，受
+  `max_closed_revalidate_per_cycle`）以及按需 `spawn_question(kind=goal_retarget/revalidate)`
+  （受 `max_spawn_from_goal_amend` 和树护栏）。**绝不重开 closed 问题**；旧 answer/evidence
+  保留出生版本，跨版本 child_answer 复用必须先得到 `still_applicable`。selection 必须对固定锚
+  给出的新版全部可调度 open/inconclusive 问题（含本批新题）逐一重打分，不能沿用旧 score；
+  无法派生新问题且没有可复用旧结论时 terminate，编排器会记 `blocked_by_goal_amend`。
 - **攻坚 / reuse_only / eval_only（正常轮尾）**：走 R1–R4：
 
 **R1 答题**：解释本轮证据（指标可信度、失败模式；运行观测摘要只影响"可信度/下一步"，

@@ -224,13 +224,21 @@ class ConsoleInboxIngest:
             self._clear_attempt(idem)
             return "poison"
         if self._attempts.get(idem, 0) >= self._MAX_ATTEMPTS:
+            goal_id, goal_ver = self._message_goal_binding(connector, idem)
             return self._terminalize_inbound_failure(
-                connector=connector, raw=raw, idem=idem, cycle_id=cycle_id)
+                connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
+                goal_id=goal_id, goal_ver=goal_ver)
+        goal_id: Optional[int] = None
+        goal_ver: Optional[int] = None
         try:
+            goal_id, goal_ver = self._message_goal_binding(connector, idem)
             res = self.console.handle_inbound(connector=connector, raw_text=raw,
                                               idempotency_key=idem, cycle_id=cycle_id,
+                                              goal_id=goal_id, goal_ver=goal_ver,
                                               session_ref=CONSOLE_MESSAGE_SESSION_REF)
-            self._verify_inbound_message(res["message_id"], raw=raw, idem=idem)
+            self._verify_inbound_message(
+                res["message_id"], raw=raw, idem=idem,
+                goal_id=goal_id, goal_ver=goal_ver)
         except IdempotencyCollisionError:
             logger.error("console_inbox 普通消息 idempotency collision (idem=%s) → 拒绝", idem, exc_info=True)
             self._clear_attempt(idem)
@@ -241,23 +249,52 @@ class ConsoleInboxIngest:
                        "console_inbox ingest 内部故障 (idem=%s, 第%d次)", idem, attempts, exc_info=True)
             if attempts < self._MAX_ATTEMPTS:
                 return "retry"
+            if goal_id is None or goal_ver is None:
+                goal_id, goal_ver = self._message_goal_binding(connector, idem)
             return self._terminalize_inbound_failure(
-                connector=connector, raw=raw, idem=idem, cycle_id=cycle_id)
+                connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
+                goal_id=goal_id, goal_ver=goal_ver)
         if res.get("intent") == "query" and res.get("message_id") is not None:
             return self._answer_query(idem, res["message_id"])
         self._clear_attempt(idem)              # 成功 → 清计数
         return "ok"
 
-    def _verify_inbound_message(self, mid: int, *, raw: str, idem: str) -> None:
+    def _message_goal_binding(self, connector: str, idem: str) -> tuple[Optional[int], Optional[int]]:
+        """Bind a spool message to one immutable goal version across retries.
+
+        If the durable message already exists, its original binding wins.  On
+        first ingest the current latest goal is captured.  This is required for
+        stale goal-amend detection and prevents a cursor retry after a revision
+        from colliding with its own previously stored message.
+        """
+        existing = self.console.daemon.query_one(
+            "SELECT goal_id,goal_ver FROM interaction_message "
+            "WHERE connector=? AND idempotency_key=?", (connector, idem))
+        if existing is not None:
+            # Pre-CP11.2b.3 messages were intentionally stored with no goal
+            # binding.  Preserve that immutable legacy tuple on replay so a
+            # crash between message/classification can still converge; only
+            # newly ingested records receive the current version binding.
+            return (int(existing[0]), int(existing[1])) if existing[0] is not None else (None, None)
+        current = self.console.daemon.query_one(
+            "SELECT id,version FROM goal ORDER BY version DESC LIMIT 1")
+        if current is None:
+            raise RuntimeError("控制台普通消息入站时当前 goal 不存在")
+        return int(current[0]), int(current[1])
+
+    def _verify_inbound_message(self, mid: int, *, raw: str, idem: str,
+                                goal_id: Optional[int], goal_ver: Optional[int]) -> None:
         row = self.console.daemon.query_one(
             "SELECT connector,raw_text,raw_hash,goal_id,goal_ver,session_ref "
             "FROM interaction_message WHERE id=?", (mid,))
         expected_hash = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        if row != ("console", raw, expected_hash, None, None, CONSOLE_MESSAGE_SESSION_REF):
+        if row != ("console", raw, expected_hash, goal_id, goal_ver,
+                   CONSOLE_MESSAGE_SESSION_REF):
             raise IdempotencyCollisionError(f"console idempotency_key 已绑定其他普通消息: {idem}")
 
     def _terminalize_inbound_failure(self, *, connector: str, raw: str, idem: str,
-                                     cycle_id: Optional[str]) -> str:
+                                     cycle_id: Optional[str], goal_id: Optional[int],
+                                     goal_ver: Optional[int]) -> str:
         """连续内部失败达上限后，先落可审计终态，再允许 cursor 越过当前记录。
 
         新消息的 ``unclear`` 分类和失败 reply 共用一个事务；事务/commit 任一失败都返回 ``retry``。
@@ -267,8 +304,10 @@ class ConsoleInboxIngest:
         try:
             mid = self.console.ingest.inbound(
                 connector=connector, raw_text=raw, idempotency_key=idem, cycle_id=cycle_id,
+                goal_id=goal_id, goal_ver=goal_ver,
                 session_ref=CONSOLE_MESSAGE_SESSION_REF)
-            self._verify_inbound_message(mid, raw=raw, idem=idem)
+            self._verify_inbound_message(
+                mid, raw=raw, idem=idem, goal_id=goal_id, goal_ver=goal_ver)
             failure_text = _INBOUND_FAILURE_PREFIX + "控制台消息处理持续失败，未执行任何控制语义"
             failure_hash = "sha256:" + hashlib.sha256(failure_text.encode("utf-8")).hexdigest()
             with self.console.daemon.transaction() as conn:

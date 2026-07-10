@@ -169,7 +169,7 @@ def test_spurious_answer_in_bootstrap_does_not_close(tmp_path):
     path = str(tmp_path / "sa.sqlite")
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY); state.create_goal(text="g", predicate_json={})
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="g")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
     boot = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根", "local_key": "root"}]},
             "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
                                "terminate_reason_md": "止"},
@@ -191,7 +191,7 @@ def test_end_to_end_with_real_advancer(tmp_path):
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY)
     state.create_goal(text="EEG 通用规律", predicate_json={})
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="EEG 通用规律")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
     boot = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根问题", "local_key": "root"}]},
             "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
                                "terminate_reason_md": "创世即终止"}}
