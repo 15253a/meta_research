@@ -28,13 +28,15 @@ def env():
 def _action_message(d, c, result, action, *, reason=""):
     """模拟结构化控件经单写 ingest 落下的确定性 provenance 消息。"""
     did = result["directive_id"]
-    goal = d.query_one(
-        "SELECT m.goal_id,m.goal_ver FROM directive x JOIN interaction_message m "
+    source = d.query_one(
+        "SELECT m.goal_id,m.goal_ver,m.connector,m.conversation_id,m.session_ref "
+        "FROM directive x JOIN interaction_message m "
         "ON m.id=x.source_interaction_message_id WHERE x.id=?", (did,))
     mid = c.ingest.inbound(
-        connector="test-console-action", raw_text=directive_action_text(action, did, reason=reason),
-        idempotency_key=f"test-{action}-d{did}", goal_id=goal[0], goal_ver=goal[1],
-        session_ref=DIRECTIVE_ACTION_SESSION_REF)
+        connector=source[2], raw_text=directive_action_text(action, did, reason=reason),
+        idempotency_key=f"test-{action}-d{did}", goal_id=source[0], goal_ver=source[1],
+        conversation_id=source[3],
+        session_ref=(DIRECTIVE_ACTION_SESSION_REF if source[2] == "console" else None))
     with d.transaction() as conn:
         conn.execute("INSERT INTO interaction_classification(message_id,intent,directive_id) "
                      "VALUES (?,'unclear',NULL)", (mid,))
@@ -396,17 +398,17 @@ def test_pause_blocks_from_consume_until_resume_consumed(env):
     assert c.has_blocking_pause() is False                                           # resume 消费解除
 
 
-def test_resume_supersedes_only_earlier_pending_pauses(env):
-    """外审 SHOULD 回归：resume 只清早于它的 pending pause；晚到的 pause 是新诉求、保留。"""
+def test_running_continue_is_ack_not_resume_and_keeps_pending_pauses(env):
+    """reference 特例：尚未消费的 pause 不等于已暂停；继续只 ACK、零状态效果。"""
     d, c = env["d"], env["c"]
     p1 = c.handle_inbound(connector="qq", raw_text="暂停", idempotency_key="k-p1", goal_id=1, goal_ver=1)
     rs = c.handle_inbound(connector="qq", raw_text="继续", idempotency_key="k-rs", goal_id=1, goal_ver=1)
     p2 = c.handle_inbound(connector="qq", raw_text="暂停 再停一次", idempotency_key="k-p2", goal_id=1, goal_ver=1)
-    c.confirm_directive(directive_id=rs["directive_id"],
-                        confirm_message_id=_action_message(d, c, rs, "confirm"))
-    eff = c.consume_directive(directive_id=rs["directive_id"], cycle_id="c1")
-    assert eff.get("superseded_pause") == [p1["directive_id"]]                       # 只清 p1
-    assert d.query_one("SELECT status FROM directive WHERE id=?", (p1["directive_id"],))[0] == "superseded"
+    assert rs["intent"] == "query" and rs["directive_id"] is None
+    assert rs["special"] == "continue_running"
+    assert d.query_one(
+        "SELECT count(*) FROM interaction_reply WHERE message_id=?", (rs["message_id"],))[0] == 1
+    assert d.query_one("SELECT status FROM directive WHERE id=?", (p1["directive_id"],))[0] == "pending"
     assert d.query_one("SELECT status FROM directive WHERE id=?", (p2["directive_id"],))[0] == "pending"  # p2 保留
 
 

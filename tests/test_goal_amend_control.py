@@ -59,13 +59,17 @@ def _closed_answer(daemon: WriteDaemon, cycle_id: str) -> str:
 
 def _action_message(daemon: WriteDaemon, console: Console, result: dict) -> int:
     did = result["directive_id"]
-    goal_id, goal_ver = daemon.query_one(
-        "SELECT m.goal_id,m.goal_ver FROM directive d JOIN interaction_message m "
+    source = daemon.query_one(
+        "SELECT m.goal_id,m.goal_ver,m.connector,m.conversation_id,m.session_ref "
+        "FROM directive d JOIN interaction_message m "
         "ON m.id=d.source_interaction_message_id WHERE d.id=?", (did,))
+    session_ref = (DIRECTIVE_ACTION_SESSION_REF
+                   if source[2] == "console" else
+                   (source[4] + ":action" if source[4] is not None else None))
     mid = console.ingest.inbound(
-        connector="test-action", raw_text=directive_action_text("confirm", did),
-        idempotency_key=f"confirm-d{did}", goal_id=goal_id, goal_ver=goal_ver,
-        session_ref=DIRECTIVE_ACTION_SESSION_REF)
+        connector=source[2], raw_text=directive_action_text("confirm", did),
+        idempotency_key=f"confirm-d{did}", goal_id=source[0], goal_ver=source[1],
+        session_ref=session_ref, conversation_id=source[3])
     with daemon.transaction() as conn:
         conn.execute(
             "INSERT INTO interaction_classification(message_id,intent,directive_id) "
@@ -150,8 +154,8 @@ def test_goal_amend_route_restart_versioning_and_notifications(tmp_path):
         "consumed", int(c2.cycle_id[1:]))
     notifier1.scan()
     queued = outbox._queued_keys()
-    assert f"directive:{did}:pending_effect" in queued
-    assert f"directive:{did}:applied" not in queued   # consume != goal version committed
+    assert f"directive:{did}:pending_effect:v2" in queued
+    assert f"directive:{did}:applied:v2" not in queued   # consume != goal version committed
 
     # Crash/restart after consume but before model/application: a fresh process
     # resumes the same control cycle and commits the whole version transition.
@@ -187,9 +191,9 @@ def test_goal_amend_route_restart_versioning_and_notifications(tmp_path):
         2, "goal_amend", "done", "attack")
 
     notifier2 = DirectiveNotifier(d2, outbox)
-    assert f"directive:{did}:applied" in notifier2.scan()
+    assert f"directive:{did}:applied:v2" in notifier2.scan()
     applied = [json.loads(line) for line in outbox.queue_path.read_text(encoding="utf-8").splitlines()
-               if json.loads(line)["event_key"] == f"directive:{did}:applied"][0]
+               if json.loads(line)["event_key"] == f"directive:{did}:applied:v2"][0]
     assert applied["payload"]["effect"]["target_goal_ver"] == 2
 
     # Exact-cycle rendering remains version-correct both backward and forward;

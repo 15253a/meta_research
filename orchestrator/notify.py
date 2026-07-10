@@ -1,7 +1,8 @@
 """notify —— 通知矩阵 outbox + 文件请求全流水 + 全局等待前置检查（§4.6.6/§4.6.8/§4.4.1；M5 CP6.3）。
 
 **outbox = 实现层文件队列，不建表**（核心 DDL 36 表冻结；§4.6.2 heartbeat/outbox 明示非核心 DDL）：
-`outbox.jsonl` 追加事件（一行一 JSON），`delivery_receipts.jsonl` 记录远端 ACK，
+`outbox.jsonl` 追加事件（一行一 JSON），`delivery_receipts.jsonl` 记录远端 ACK 或
+安全抑制终态，
 `outbound_delivery_state.json` 原子保存跨重启退避。emit 按 event_key 去重并拒绝同键异文；远端成功但
 本地 receipt 前崩溃会重发同一 key（at-least-once），严格 webhook 接收端据 key 耐久去重。
 
@@ -562,27 +563,47 @@ class Outbox:
             self._repair_torn_jsonl_tail(self.receipts_path)
             rows, identity_snapshot = self._committed_jsonl_snapshot(self.receipts_path)
             keys = set()
-            required = {"version", "channel", "event_key", "accepted_at", "attempt_count",
-                        "delivery_id", "ack_hash"}
             for row in rows:
                 channel, key = row.get("channel") if isinstance(row, dict) else None, \
                     row.get("event_key") if isinstance(row, dict) else None
                 identity = (self._delivery_identity(channel, key)
                             if isinstance(channel, str) and isinstance(key, str) else None)
-                if (not isinstance(row, dict) or set(row) != required or row.get("version") != 1
-                        or not isinstance(channel, str) or self._CHANNEL_RE.fullmatch(channel) is None
-                        or not isinstance(key, str) or self._EVENT_KEY_RE.fullmatch(key) is None
-                        or isinstance(row.get("accepted_at"), bool)
-                        or not isinstance(row.get("accepted_at"), (int, float))
-                        or not math.isfinite(float(row["accepted_at"]))
-                        or isinstance(row.get("attempt_count"), bool)
-                        or not isinstance(row.get("attempt_count"), int) or row["attempt_count"] < 1
-                        or (row.get("delivery_id") is not None
-                            and (not isinstance(row.get("delivery_id"), str)
-                                 or len(row["delivery_id"]) > 256))
-                        or not isinstance(row.get("ack_hash"), str)
-                        or re.fullmatch(r"sha256:[0-9a-f]{64}", row["ack_hash"]) is None
-                        or identity in keys):
+                common_valid = bool(
+                    isinstance(row, dict)
+                    and isinstance(channel, str)
+                    and self._CHANNEL_RE.fullmatch(channel) is not None
+                    and isinstance(key, str)
+                    and self._EVENT_KEY_RE.fullmatch(key) is not None
+                    and not isinstance(row.get("attempt_count"), bool)
+                    and isinstance(row.get("attempt_count"), int)
+                    and identity not in keys)
+                version_one = bool(
+                    common_valid and row.get("version") == 1
+                    and set(row) == {
+                        "version", "channel", "event_key", "accepted_at", "attempt_count",
+                        "delivery_id", "ack_hash"}
+                    and not isinstance(row.get("accepted_at"), bool)
+                    and isinstance(row.get("accepted_at"), (int, float))
+                    and math.isfinite(float(row["accepted_at"]))
+                    and row["attempt_count"] >= 1
+                    and (row.get("delivery_id") is None
+                         or (isinstance(row.get("delivery_id"), str)
+                             and len(row["delivery_id"]) <= 256))
+                    and isinstance(row.get("ack_hash"), str)
+                    and re.fullmatch(r"sha256:[0-9a-f]{64}", row["ack_hash"]) is not None)
+                version_two = bool(
+                    common_valid and row.get("version") == 2
+                    and set(row) == {
+                        "version", "channel", "event_key", "completed_at", "attempt_count",
+                        "disposition", "reason_hash"}
+                    and not isinstance(row.get("completed_at"), bool)
+                    and isinstance(row.get("completed_at"), (int, float))
+                    and math.isfinite(float(row["completed_at"]))
+                    and row["attempt_count"] >= 0
+                    and row.get("disposition") == "suppressed_unsafe_route"
+                    and isinstance(row.get("reason_hash"), str)
+                    and re.fullmatch(r"sha256:[0-9a-f]{64}", row["reason_hash"]) is not None)
+                if not (version_one or version_two):
                     raise ValueError("delivery_receipts.jsonl committed receipt 损坏")
                 keys.add(identity)
             self._receipt_seen = keys
@@ -650,6 +671,13 @@ class Outbox:
             self._seen[event_key] = rendered
             self._event_cache.append(durable_event)
             return True
+
+    def contains_event(self, event_key: str) -> bool:
+        """Return whether an immutable local event identity is already bound."""
+        if not isinstance(event_key, str) or self._EVENT_KEY_RE.fullmatch(event_key) is None:
+            raise ValueError("outbox event_key 非法")
+        with self._lock:
+            return event_key in self._queued_keys()
 
     def pending_for_channel(self, channel: str, *, include_default: bool) -> List[Dict[str, Any]]:
         """Return a stable FIFO snapshot not yet ACKed for ``channel``."""
@@ -793,6 +821,62 @@ class Outbox:
                 del updated["events"][identity]
                 self._store_retry_document(updated)
 
+    def record_delivery_suppressed(self, channel: str, event: Dict[str, Any], *,
+                                   reason: str, completed_at: float) -> None:
+        """Durably terminalize an event whose historical route is not safe to infer.
+
+        This is deliberately distinct from a remote ACK: operators must be
+        able to see that no connector accepted the event.  A newly derived,
+        explicitly routed successor event may still be delivered normally.
+        """
+        key = event["event_key"]
+        if (self._CHANNEL_RE.fullmatch(channel) is None
+                or isinstance(completed_at, bool)
+                or not isinstance(completed_at, (int, float))
+                or not math.isfinite(float(completed_at))
+                or not isinstance(reason, str) or not reason or len(reason) > 1024):
+            raise ValueError("delivery suppression 参数非法")
+        reason_bytes = reason.encode("utf-8")
+        with self._lock:
+            identity = self._delivery_identity(channel, key)
+            receipts = self._receipt_keys()
+            if identity in receipts:
+                return
+            retry_document = self._retry_document()
+            retry = retry_document["events"].get(identity, {})
+            receipt = {
+                "version": 2,
+                "channel": channel,
+                "event_key": key,
+                "completed_at": float(completed_at),
+                "attempt_count": int(retry.get("attempt_count", 0)),
+                "disposition": "suppressed_unsafe_route",
+                "reason_hash": "sha256:" + hashlib.sha256(reason_bytes).hexdigest(),
+            }
+            try:
+                receipt_identity = self._append_line(
+                    self.receipts_path,
+                    json.dumps(receipt, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"), allow_nan=False) + "\n",
+                )
+            except BaseException as append_error:
+                self._clear_receipt_cache()
+                try:
+                    self._receipt_keys()
+                except BaseException as calibration_error:
+                    add_note = getattr(append_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "suppression receipt append 失败后的落盘校准也失败: "
+                            f"{type(calibration_error).__name__}: {calibration_error}")
+                raise
+            self._receipt_fingerprint = receipt_identity
+            receipts.add(identity)
+            if identity in retry_document["events"]:
+                updated = self._copy_retry_document(retry_document)
+                del updated["events"][identity]
+                self._store_retry_document(updated)
+
     def deliver_pending(self, connector) -> List[str]:
         """把未投递事件按队列序经 connector.send 发出；成功一条标记一条（append delivered.log）。
         send 与标记之间崩溃 → 该条重发（at-least-once；接收端按 event_key 去重）。send 抛错则中断
@@ -823,42 +907,45 @@ def _directive_state_events(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     远大于扫描节拍）；若 directive 在首次扫描前已走完生命周期，中间态事件不补发（对已生效指令追发
     "请确认"是误导）——consumed 分支例外补 pending_effect（它无行动含义、只是就绪记录）。"""
     d = row
-    payload_base = {"directive_id": d["id"], "kind": d["kind"], "hardness": d["hardness"]}
+    payload_base = {
+        "directive_id": d["id"], "kind": d["kind"], "hardness": d["hardness"],
+        "conversation_id": d.get("conversation_id"),
+    }
     evs = [
-        {"event_key": f"directive:{d['id']}:received", "kind": "directive_received",
+        {"event_key": f"directive:{d['id']}:received:v2", "kind": "directive_received",
          "payload": {**payload_base, "message_id": d["source_interaction_message_id"]}},
-        {"event_key": f"directive:{d['id']}:classified", "kind": "directive_classified",
+        {"event_key": f"directive:{d['id']}:classified:v2", "kind": "directive_classified",
          "payload": {**payload_base, "consume_at": d["consume_at"]}},
     ]
     p = json.loads(d["payload_json"])
     if d["status"] == "pending":
         if d["hardness"] == "hard" and not p.get("confirmed"):
-            evs.append({"event_key": f"directive:{d['id']}:pending_confirmation",
+            evs.append({"event_key": f"directive:{d['id']}:pending_confirmation:v2",
                         "kind": "directive_pending_confirmation",
                         "payload": {**payload_base, "polished": p.get("polished")}})   # 展示润色稿（§4.6.3）
         else:
-            evs.append({"event_key": f"directive:{d['id']}:pending_effect",
+            evs.append({"event_key": f"directive:{d['id']}:pending_effect:v2",
                         "kind": "directive_pending_effect",
                         "payload": {**payload_base, "consume_at": d["consume_at"]}})   # 预计消费点
     elif d["status"] == "consumed":
         # 已确认硬指令必然途径 pending_effect；补齐该态事件（若消费前未扫描过，幂等 emit 不重复）
-        evs.append({"event_key": f"directive:{d['id']}:pending_effect",
+        evs.append({"event_key": f"directive:{d['id']}:pending_effect:v2",
                     "kind": "directive_pending_effect",
                     "payload": {**payload_base, "consume_at": d["consume_at"]}})
         # reprioritize and goal_amend are consumed at reasoning_start but their
         # real effects exist only in the later atomic selection / goal-version
         # commit.  Do not announce "applied" in the precheck→Runner window.
         if not d.get("_application_pending"):
-            evs.append({"event_key": f"directive:{d['id']}:applied", "kind": "directive_applied",
+            evs.append({"event_key": f"directive:{d['id']}:applied:v2", "kind": "directive_applied",
                         "payload": {**payload_base,
                                     "consumed_cycle": f"c{d['consumed_cycle']}" if d["consumed_cycle"] else None,
                                     "effect": (d.get("_decision_effect") or {})}})
     elif d["status"] == "rejected":
         # 理由恒在 payload.rejection_reason（console.reject_directive 两条路径都 json_set 写入）
-        evs.append({"event_key": f"directive:{d['id']}:rejected", "kind": "directive_rejected",
+        evs.append({"event_key": f"directive:{d['id']}:rejected:v2", "kind": "directive_rejected",
                     "payload": {**payload_base, "reason": p.get("rejection_reason")}})
     elif d["status"] == "superseded":
-        evs.append({"event_key": f"directive:{d['id']}:superseded", "kind": "directive_superseded",
+        evs.append({"event_key": f"directive:{d['id']}:superseded:v2", "kind": "directive_superseded",
                     "payload": payload_base})
     return evs
 
@@ -874,12 +961,16 @@ class DirectiveNotifier:
         """全量扫描（幂等：已排队事件跳过）。返回本次新排队的 event_key。"""
         new_keys: List[str] = []
         rows = self.daemon.query(
-            "SELECT id, kind, hardness, status, consume_at, payload_json, consumed_cycle, "
-            "consumed_decision_id, source_interaction_message_id FROM directive ORDER BY id")
-        for (did, kind, hardness, status, consume_at, payload_json, ccy, cdec, smid) in rows:
+            "SELECT d.id,d.kind,d.hardness,d.status,d.consume_at,d.payload_json,d.consumed_cycle,"
+            "d.consumed_decision_id,d.source_interaction_message_id,m.connector,m.conversation_id "
+            "FROM directive d JOIN interaction_message m ON m.id=d.source_interaction_message_id "
+            "ORDER BY d.id")
+        for (did, kind, hardness, status, consume_at, payload_json, ccy, cdec, smid,
+             connector, conversation_id) in rows:
             row = {"id": did, "kind": kind, "hardness": hardness, "status": status,
                    "consume_at": consume_at, "payload_json": payload_json,
-                   "consumed_cycle": ccy, "source_interaction_message_id": smid}
+                   "consumed_cycle": ccy, "source_interaction_message_id": smid,
+                   "conversation_id": conversation_id}
             if cdec is not None:      # applied 效果摘要取自消费决策 payload（真相在 decision 台账）
                 dp = self.daemon.query_one("SELECT payload_json FROM decision WHERE id=?", (cdec,))
                 row["_decision_effect"] = (json.loads(dp[0]).get("effect") if dp else None)
@@ -904,7 +995,8 @@ class DirectiveNotifier:
                     payload = json.loads(actual[0])
                     row["_decision_effect"] = payload.get("effect", payload)
             for ev in _directive_state_events(row):
-                if self.outbox.emit(ev["event_key"], ev["kind"], ev["payload"]):
+                if self.outbox.emit(
+                        ev["event_key"], ev["kind"], ev["payload"], channel=connector):
                     new_keys.append(ev["event_key"])
         return new_keys
 
@@ -932,9 +1024,9 @@ class InteractionNotifier:
             "SELECT m.id,m.connector,m.conversation_id,m.session_ref,c.intent,"
             "r.id,r.reply_ref,r.reply_text,r.snapshot_cycle,r.responder_kind "
             "FROM interaction_message m "
-            "JOIN interaction_classification c ON c.message_id=m.id "
+            "LEFT JOIN interaction_classification c ON c.message_id=m.id "
             "LEFT JOIN interaction_reply r ON r.message_id=m.id "
-            "WHERE c.intent IN ('query','unclear') ORDER BY m.id,r.id")
+            "ORDER BY m.id,r.id")
         new_keys: List[str] = []
         received = set()
         unclear = set()
@@ -942,14 +1034,20 @@ class InteractionNotifier:
              reply_id, reply_ref, reply_text, snapshot_cycle, responder_kind) in rows:
             if mid not in received:
                 received.add(mid)
-                key = f"interaction:{mid}:received"
-                if self.outbox.emit(
+                legacy_key = f"interaction:{mid}:received"
+                key = f"interaction:{mid}:received:v2"
+                # A v1 receipt already proves this historical message was
+                # surfaced.  Do not replay a second human ACK merely because
+                # v2 removed the then-premature intent field.
+                if (not self.outbox.contains_event(legacy_key) and self.outbox.emit(
                         key, "interaction_received",
-                        {"message_id": mid, "intent": intent,
-                         "conversation_id": conversation_id}, channel=connector):
+                        {"message_id": mid, "conversation_id": conversation_id},
+                        channel=connector)):
                     new_keys.append(key)
             if (intent == "unclear" and mid not in unclear
-                    and session_ref not in self._ACTION_SESSION_REFS):
+                    and session_ref not in self._ACTION_SESSION_REFS
+                    and not (isinstance(session_ref, str)
+                             and session_ref.endswith(":action"))):
                 unclear.add(mid)
                 key = f"interaction:{mid}:unclear"
                 if self.outbox.emit(

@@ -200,6 +200,36 @@ def test_drain_does_not_keep_consuming_new_spool_after_boundary(tmp_path, monkey
     assert state == {"accepted": False, "intake_calls": 1, "completion_calls": 1}
 
 
+def test_drain_exhausts_finite_closed_connector_backlog(tmp_path):
+    class IdleAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+    state = {"general_probes": 0, "closed_backlog": 3, "accepted": 0}
+
+    def general_probe():
+        state["general_probes"] += 1
+        state["closed_backlog"] -= 1
+        state["accepted"] += 1
+
+    def closed_probe():
+        state["closed_backlog"] -= 1
+        state["accepted"] += 1
+
+    def complete():
+        state["accepted"] = 0
+
+    system = System(
+        advancer=IdleAdvancer(), state=None, daemon=None, dual_mode="A", work_root=tmp_path,
+        sync_interactions=general_probe,
+        sync_closed_inbound=closed_probe,
+        closed_inbound_pending=lambda: state["closed_backlog"] > 0,
+        sync_accepted_interactions=complete,
+        accepted_interaction_pending=lambda: state["accepted"] > 0)
+    system.drain_interactions(poll_interval_s=0.01)
+    assert state == {"general_probes": 1, "closed_backlog": 0, "accepted": 0}
+
+
 def test_drain_finishes_accepted_query_before_reporting_notification_error(tmp_path):
     class IdleAdvancer:
         last_stop_reason = None
@@ -855,7 +885,7 @@ def test_retry_at_console_head_blocks_provider_before_following_action(tmp_path)
 
     assert system.run(max_cycles=1) == []                      # query 无卡 → retry at head
     assert called["n"] == 0
-    assert "控制台入站待处理" in system.advancer.last_block_reason
+    assert "人机入站待处理" in system.advancer.last_block_reason
     assert system.daemon.query_one(
         "SELECT json_extract(payload_json,'$.confirmed') FROM directive WHERE id=?",
         (pause["directive_id"],)) == (0,)                     # 后置 action 尚未越过队首
@@ -901,7 +931,7 @@ def test_broken_inbound_state_blocks_due_directive_consumption(tmp_path):
     second = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=counting_factory)
     assert second.run(max_cycles=1) == []
     assert calls["n"] == 0
-    assert "控制台入站待处理" in second.advancer.last_block_reason
+    assert "人机入站待处理" in second.advancer.last_block_reason
     assert second.daemon.query_one(
         "SELECT status,json_extract(payload_json,'$.confirmed') FROM directive WHERE id=?", (did,)) == (
             "pending", 1)
@@ -920,7 +950,7 @@ def test_production_system_scans_directive_and_file_notifications_on_exit(tmp_pa
     assert sys.run(max_cycles=0) == []
     events = [json.loads(line) for line in (tmp_path / "state" / "outbox.jsonl").read_text().split("\n") if line]
     keys = {e["event_key"] for e in events}
-    assert f"directive:{directive['directive_id']}:pending_confirmation" in keys
+    assert f"directive:{directive['directive_id']}:pending_confirmation:v2" in keys
     assert f"filereq:{rid}:pending" in keys
 
 

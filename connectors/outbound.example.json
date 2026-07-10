@@ -5,7 +5,21 @@
       "type": "webhook_v1",
       "url": "https://connector.example.invalid/meta-research/events",
       "token_env": "METARESEARCH_QQ_CONNECTOR_TOKEN",
-      "timeout_s": 1
+      "timeout_s": 1,
+      "inbound": {
+        "type": "webhook_v1",
+        "listen_host": "127.0.0.1",
+        "listen_port": 8766,
+        "path": "/meta-research/inbound",
+        "secret_env": "METARESEARCH_QQ_INBOUND_SECRET",
+        "consumer_id": "research-run-primary",
+        "source_id": "qq-gateway-primary",
+        "conversation_id": "qq:operator-primary",
+        "principal_id": "operator-primary",
+        "key_id": "qq-inbound-key-v1",
+        "max_skew_s": 300,
+        "request_timeout_s": 1
+      }
     }
   },
   "delivery": {

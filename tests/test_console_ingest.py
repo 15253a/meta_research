@@ -384,7 +384,7 @@ def test_directive_and_file_actions_cannot_share_operation_nonce(env):
     """首个 directive action 可成功；同 nonce 的 file action 必须零迁移、零新 provenance。"""
     console, daemon = env["console"], env["daemon"]
     pause = console.handle_inbound(
-        connector="seed", raw_text="暂停", idempotency_key="domain-pause")
+        connector="console", raw_text="暂停", idempotency_key="domain-pause")
     did = pause["directive_id"]
     rid = env["file_requests"].create_checked(
         goal_id=1, goal_ver=1, stage="plan", request=_file_request())

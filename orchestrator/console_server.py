@@ -327,23 +327,38 @@ def _strict_projection_json(raw: str) -> Any:
 
 
 def _valid_delivery_receipt(value: Any) -> bool:
-    required = {"version", "channel", "event_key", "accepted_at", "attempt_count",
-                "delivery_id", "ack_hash"}
-    return bool(
-        isinstance(value, dict) and set(value) == required and value.get("version") == 1
+    common = bool(
+        isinstance(value, dict)
         and isinstance(value.get("channel"), str)
         and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", value["channel"]) is not None
         and isinstance(value.get("event_key"), str)
         and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}", value["event_key"]) is not None
+        and not isinstance(value.get("attempt_count"), bool)
+        and isinstance(value.get("attempt_count"), int))
+    remote_ack = bool(
+        common and value.get("version") == 1
+        and set(value) == {"version", "channel", "event_key", "accepted_at",
+                           "attempt_count", "delivery_id", "ack_hash"}
         and not isinstance(value.get("accepted_at"), bool)
         and isinstance(value.get("accepted_at"), (int, float))
         and math.isfinite(float(value["accepted_at"]))
-        and not isinstance(value.get("attempt_count"), bool)
-        and isinstance(value.get("attempt_count"), int) and value["attempt_count"] >= 1
+        and value["attempt_count"] >= 1
         and (value.get("delivery_id") is None
              or (isinstance(value.get("delivery_id"), str) and len(value["delivery_id"]) <= 256))
         and isinstance(value.get("ack_hash"), str)
         and re.fullmatch(r"sha256:[0-9a-f]{64}", value["ack_hash"]) is not None)
+    suppressed = bool(
+        common and value.get("version") == 2
+        and set(value) == {"version", "channel", "event_key", "completed_at",
+                           "attempt_count", "disposition", "reason_hash"}
+        and not isinstance(value.get("completed_at"), bool)
+        and isinstance(value.get("completed_at"), (int, float))
+        and math.isfinite(float(value["completed_at"]))
+        and value["attempt_count"] >= 0
+        and value.get("disposition") == "suppressed_unsafe_route"
+        and isinstance(value.get("reason_hash"), str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", value["reason_hash"]) is not None)
+    return remote_ack or suppressed
 
 
 def _valid_retry_document(value: Any) -> bool:
@@ -458,12 +473,21 @@ def _notifications(work_root: Path) -> List[Dict[str, Any]]:
             if identity in receipt_identities:
                 raise ValueError("delivery receipt identity 重复")
             receipt_identities.add(identity)
-            delivery.setdefault(receipt["event_key"], []).append({
-                "status": "delivered", "channel": receipt.get("channel"),
-                "accepted_at": receipt.get("accepted_at"),
-                "attempt_count": receipt.get("attempt_count"),
-                "delivery_id": receipt.get("delivery_id"),
-            })
+            if receipt["version"] == 1:
+                projected = {
+                    "status": "delivered", "channel": receipt.get("channel"),
+                    "accepted_at": receipt.get("accepted_at"),
+                    "attempt_count": receipt.get("attempt_count"),
+                    "delivery_id": receipt.get("delivery_id"),
+                }
+            else:
+                projected = {
+                    "status": "suppressed", "channel": receipt.get("channel"),
+                    "completed_at": receipt.get("completed_at"),
+                    "attempt_count": receipt.get("attempt_count"),
+                    "disposition": receipt.get("disposition"),
+                }
+            delivery.setdefault(receipt["event_key"], []).append(projected)
     except FileNotFoundError:
         pass
     except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError, RuntimeError) as error:
@@ -480,7 +504,7 @@ def _notifications(work_root: Path) -> List[Dict[str, Any]]:
             raise ValueError("outbound retry state schema 损坏")
         for retry in list(state["events"].values())[:_MAX_NOTIFICATION_RECORDS]:
             existing = delivery.get(retry["event_key"], [])
-            if any(item.get("status") == "delivered"
+            if any(item.get("status") in {"delivered", "suppressed"}
                    and item.get("channel") == retry.get("channel") for item in existing):
                 continue                    # durable ACK outranks stale retry state after cleanup crash
             delivery.setdefault(retry["event_key"], []).append({
@@ -834,6 +858,7 @@ class ConsoleData:
 
     def enqueue_directive_action(self, *, action: str, directive_id: Any,
                                  reason: str = "", connector: str = "console",
+                                 conversation_id: Optional[str] = None,
                                  client_idempotency_key: Optional[str] = None) -> Dict[str, Any]:
         """把显式 directive 确认/拒绝追加到 spool；**绝不查询或写研究 DB**。
 
@@ -853,8 +878,11 @@ class ConsoleData:
         if len(reason) > _MAX_REASON_CHARS:
             raise ValueError(f"拒绝理由过长（最多 {_MAX_REASON_CHARS} 字符）")
         raw = directive_action_text(action, did, reason=reason)
+        conversation_id = _console_conversation_id(conversation_id)
         rec: Dict[str, Any] = {"connector": connector, "raw_text": raw,
                                "action": action, "directive_id": did}
+        if conversation_id is not None:
+            rec["conversation_id"] = conversation_id
         if action == "reject":
             rec["reason"] = reason
         return self._enqueue(rec, client_idempotency_key=client_idempotency_key)
@@ -1082,6 +1110,7 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                     rec = data.enqueue_directive_action(action=body.get("action"),
                                                         directive_id=body.get("directive_id"),
                                                         reason=body.get("reason", ""),
+                                                        conversation_id=body.get("conversation_id"),
                                                         client_idempotency_key=client_key)
                     self._json(200, {"ok": True, "queued": rec})
                 except (ValueError, json.JSONDecodeError) as e:

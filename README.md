@@ -147,7 +147,7 @@ tunnel（例如 `ssh -L 8765:127.0.0.1:8765 <host>`），不得把服务直接�
   或明确改变请求条件。
 - **显式演示**：只有 `?demo=1` 启用内嵌 mock 数据，且不发 API；正常页面断线时 fail closed，不会把 mock 当成真状态。
 
-### 4.2 真实出站 connector
+### 4.2 真实双向 connector
 
 通知和 query reply 先按确定性 event_key 写 `<work-root>/state/outbox.jsonl`，并以该 work-root 持久
 `producer_id` 构成远端幂等身份，再由独立 delivery 线程投递，
@@ -157,11 +157,17 @@ tunnel（例如 `ssh -L 8765:127.0.0.1:8765 <host>`），不得把服务直接�
 - `onebot_v11`：直接向本地 OneBot HTTP API 发送固定 QQ 私聊或群消息；配置强绑定 conversation，
   `producer_id:event_key` 写入正文和 echo。
 
+同一 channel 可配置认证 inbound：严格 webhook HMAC-SHA256，或 OneBot v11 reverse HTTP POST 的
+HMAC-SHA1。网络 listener 只写 channel 隔离的 durable spool，run 单写进程再以非破坏 poll/显式 commit
+接入 `interaction_message`；只有接纳记录 fsync 后才回 transport ACK。connector/profile/source/conversation/
+principal/session/idempotency 均由本地配置派生，provider JSON 不能选择控制域。精确“继续”会在同一事务按
+到达时 pause 状态解释，运行中不产生 resume，暂停中才建立待确认 resume。
+
 配置、ACK 协议、OneBot 示例和运行期回执文件见 [connectors/README.md](connectors/README.md)。失败会在
 `outbound_delivery_state.json` 保留 attempt/下次重试/消毒错误，成功写 `delivery_receipts.jsonl`；两者均
 投影到 web 控制台通知流。query/unclear 事件只回原 channel；直连 OneBot 还会机械校验来源
-conversation_id 与固定 target 绑定，系统级通知按当前 `all_qq_on` 矩阵走 QQ，不会把 web console 或另一
-QQ 会话的回复误投到该目标。
+conversation_id 与固定 target 绑定；directive 生命周期也回原 source connector/conversation。升级前没有
+可信来源路由的旧 interaction/directive 事件会记录为 `suppressed`，不会回退到默认 QQ 后误投。
 
 ## 5. 系统能做什么（当前研究形态）
 

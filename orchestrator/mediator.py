@@ -476,6 +476,13 @@ class Mediator:
             raise ValueError("status_card 须为 JSON object")
         return card
 
+    def continue_ack_payload(self) -> tuple[Optional[str], str]:
+        """Deterministic no-call ACK for the state-aware ``continue`` special case."""
+        card = self.latest_card()
+        snapshot = card.get("snapshot_cycle")
+        _cnum(snapshot)
+        return snapshot, f"[快照 {snapshot}] 已在继续；本消息未产生状态变更。"
+
     def handle_query(self, *, message_id: int) -> Dict[str, Any]:
         """Synchronous template path. Production codex calls use ``enqueue_query`` + ``poll``.
 

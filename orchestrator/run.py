@@ -41,6 +41,7 @@ from .attack_stages import AttackStages
 from .compiler_sqlite import SqliteCompiler
 from .console import Console
 from .console_ingest import ConsoleInboxIngest
+from .connector_ingest import ConnectorInboxIngest
 from .connectors import ConnectorConfigError, OutboundDelivery, load_connectors
 from .cost_ledger import CostLedger
 from .gate_pool import PoolGate
@@ -93,8 +94,31 @@ def _validate_outbound_config(policy: Dict[str, Any], config: Optional[Dict[str,
     for channel, connector in channels.items():
         if not isinstance(channel, str) or not channel:
             raise ValueError("outbound_config channel 非法")
-        if not callable(getattr(connector, "send", None)) or not callable(getattr(connector, "status", None)):
-            raise ValueError(f"outbound connector {channel!r} 缺 send/status")
+        if (not callable(getattr(connector, "send", None))
+                or not callable(getattr(connector, "poll", None))
+                or not callable(getattr(connector, "status", None))):
+            raise ValueError(f"connector {channel!r} 缺 send/poll/status")
+        has_inbound = getattr(connector, "has_inbound", False)
+        if not isinstance(has_inbound, bool):
+            raise ValueError(f"connector {channel!r} has_inbound 须为 bool")
+        if has_inbound:
+            required = (
+                "commit_poll", "load_inbound_retry_counts",
+                "store_inbound_retry_counts", "inbound_pending_status",
+                "validate_inbound_envelope", "record_inbound_fatal",
+                "prepare_inbound", "start_inbound", "stop_inbound",
+                "inbound_stopped", "raise_if_inbound_failed",
+            )
+            missing = [name for name in required
+                       if not callable(getattr(connector, name, None))]
+            inbound_spool = getattr(connector, "inbound_spool", None)
+            if missing or inbound_spool is None:
+                detail = ",".join(missing + (["inbound_spool"]
+                                             if inbound_spool is None else []))
+                raise ValueError(
+                    f"connector {channel!r} durable inbound 契约不完整: {detail}")
+            if getattr(connector, "channel", None) != channel:
+                raise ValueError(f"connector {channel!r} inbound channel 绑定漂移")
     initial = config["retry_initial_s"]
     maximum = config["retry_max_s"]
     batch = config["batch_size"]
@@ -117,8 +141,15 @@ class System:
                  interaction_pending: Optional[Callable[[], bool]] = None,
                  sync_accepted_interactions: Optional[Callable[[], None]] = None,
                  accepted_interaction_pending: Optional[Callable[[], bool]] = None,
+                 sync_closed_inbound: Optional[Callable[[], None]] = None,
+                 closed_inbound_pending: Optional[Callable[[], bool]] = None,
                  sync_sideband: Optional[Callable[[], None]] = None,
-                 outbound_delivery: Optional[OutboundDelivery] = None):
+                 outbound_delivery: Optional[OutboundDelivery] = None,
+                 start_inbound: Optional[Callable[[], Any]] = None,
+                 stop_inbound: Optional[Callable[[Any], Optional[BaseException]]] = None,
+                 raise_inbound: Optional[Callable[[], None]] = None,
+                 inbound_cleanup_pending: Optional[
+                     Callable[[Any, Optional[BaseException]], bool]] = None):
         self.advancer = advancer
         self.state = state
         self.daemon = daemon
@@ -130,13 +161,28 @@ class System:
         self.sync_accepted_interactions = sync_accepted_interactions or self.sync_interactions
         self.accepted_interaction_pending = (
             accepted_interaction_pending or self.interaction_pending)
+        # A resident connector probe intentionally accepts only one event per
+        # channel for fairness.  Once the owned listeners are closed, however,
+        # their already-fsynced spool is a finite acceptance boundary and must
+        # be consumed to EOF before process exit.  Keep this separate from the
+        # console/general intake probe: an independently running console
+        # producer must not be able to postpone shutdown forever.
+        self.sync_closed_inbound = sync_closed_inbound or (lambda: None)
+        self.closed_inbound_pending = closed_inbound_pending or (lambda: False)
         self.sync_sideband = sync_sideband or (lambda: None)
         self.outbound_delivery = outbound_delivery
+        self.start_inbound = start_inbound or (lambda: [])
+        self.stop_inbound = stop_inbound or (lambda _owned: None)
+        self.raise_inbound = raise_inbound or (lambda: None)
+        self.inbound_cleanup_pending = (
+            inbound_cleanup_pending
+            or (lambda _owned, error: error is not None))
         self._pump_guard = threading.RLock()
         self._pump_thread: Optional[threading.Thread] = None
         self._pump_stop: Optional[threading.Event] = None
         self._pump_error: Optional[BaseException] = None
         self._pump_owns_delivery = False
+        self._pump_inbound_owned: Any = []
         self._interaction_exit_drained = False
         self._hard_stop_requested = False
 
@@ -149,12 +195,55 @@ class System:
             # evidence by silently starting a replacement.
             if self._pump_thread is not None:
                 return False
+            if self._pump_inbound_owned:
+                raise RuntimeError("前次 connector inbound listener 尚未完成清理")
             stop = threading.Event()
             self._pump_stop = stop
             self._pump_error = None
+            try:
+                inbound_owned = self.start_inbound()
+            except BaseException as primary:
+                inbound_owned = getattr(primary, "inbound_owned", [])
+                cleanup_error = None
+                if inbound_owned:
+                    cleanup_error = self.stop_inbound(inbound_owned)
+                pending_cleanup = self.inbound_cleanup_pending(
+                    inbound_owned, cleanup_error)
+                self._pump_inbound_owned = inbound_owned if pending_cleanup else []
+                self._pump_stop = None
+                if cleanup_error is not None:
+                    add_note = getattr(primary, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            f"connector inbound partial-start 外层回滚失败: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}")
+                raise
+            self._pump_inbound_owned = inbound_owned
             delivery_owned = False
-            if self.outbound_delivery is not None:
-                delivery_owned = self.outbound_delivery.start(sideband_interval)
+            try:
+                if self.outbound_delivery is not None:
+                    delivery_owned = self.outbound_delivery.start(sideband_interval)
+            except BaseException as primary:
+                cleanup_error = self.stop_inbound(inbound_owned)
+                pending_cleanup = self.inbound_cleanup_pending(
+                    inbound_owned, cleanup_error)
+                retry_error = None
+                if pending_cleanup:
+                    retry_error = self.stop_inbound(inbound_owned)
+                    pending_cleanup = self.inbound_cleanup_pending(
+                        inbound_owned, retry_error)
+                self._pump_inbound_owned = inbound_owned if pending_cleanup else []
+                if cleanup_error is not None:
+                    add_note = getattr(primary, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            f"connector inbound 启动回滚失败: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}")
+                        if retry_error is not None:
+                            add_note(
+                                f"connector inbound 启动二次回滚失败: "
+                                f"{type(retry_error).__name__}: {retry_error}")
+                raise
             self._pump_owns_delivery = delivery_owned
 
             def pump() -> None:
@@ -164,6 +253,7 @@ class System:
                         # Query completion may happen during a multi-hour research provider.  Derive and
                         # deliver its reply here instead of waiting for the next research stage boundary.
                         self.sync_sideband()
+                        self.raise_inbound()
                         if self.outbound_delivery is not None:
                             self.outbound_delivery.raise_if_failed()
                     except sqlite3.OperationalError:
@@ -182,12 +272,31 @@ class System:
             self._pump_thread = thread
             try:
                 thread.start()
-            except BaseException:
+            except BaseException as primary:
                 self._pump_thread = None
                 self._pump_stop = None
                 if delivery_owned:
                     self.outbound_delivery.stop()
+                cleanup_error = self.stop_inbound(inbound_owned)
+                pending_cleanup = self.inbound_cleanup_pending(
+                    inbound_owned, cleanup_error)
+                retry_error = None
+                if pending_cleanup:
+                    retry_error = self.stop_inbound(inbound_owned)
+                    pending_cleanup = self.inbound_cleanup_pending(
+                        inbound_owned, retry_error)
+                self._pump_inbound_owned = inbound_owned if pending_cleanup else []
                 self._pump_owns_delivery = False
+                if cleanup_error is not None:
+                    add_note = getattr(primary, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            f"connector inbound thread 启动回滚失败: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}")
+                        if retry_error is not None:
+                            add_note(
+                                f"connector inbound thread 启动二次回滚失败: "
+                                f"{type(retry_error).__name__}: {retry_error}")
                 raise
             return True
 
@@ -199,30 +308,58 @@ class System:
             raise error
         if self.outbound_delivery is not None:
             self.outbound_delivery.raise_if_failed()
+        self.raise_inbound()
 
     def _stop_interaction_pump(self) -> Optional[BaseException]:
         with self._pump_guard:
             thread, stop = self._pump_thread, self._pump_stop
+            inbound_owned = self._pump_inbound_owned
             if thread is None:
-                return None
-            if stop is not None:
-                stop.set()
+                if not inbound_owned:
+                    return None
+                cleanup_error = self.stop_inbound(inbound_owned)
+                if not self.inbound_cleanup_pending(inbound_owned, cleanup_error):
+                    self._pump_inbound_owned = []
+                return cleanup_error
+        # Close intake and wait for bounded in-flight handlers while the DB
+        # pump is still alive; then stop the pump.  This closes the race where
+        # a request could append+ACK after the one final drain probe.
+        inbound_error = self.stop_inbound(inbound_owned)
+        if stop is not None:
+            stop.set()
         thread.join()
         delivery_error = None
         if self._pump_owns_delivery and self.outbound_delivery is not None:
             delivery_error = self.outbound_delivery.stop()
+        pending_inbound_cleanup = self.inbound_cleanup_pending(
+            inbound_owned, inbound_error)
+        if inbound_error is not None and pending_inbound_cleanup:
+            retry_error = self.stop_inbound(inbound_owned)
+            pending_inbound_cleanup = self.inbound_cleanup_pending(
+                inbound_owned, retry_error)
+            if retry_error is not None:
+                add_note = getattr(inbound_error, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        f"connector inbound 二次清理失败: "
+                        f"{type(retry_error).__name__}: {retry_error}")
         with self._pump_guard:
             error = self._pump_error
             self._pump_thread = None
             self._pump_stop = None
             self._pump_error = None
             self._pump_owns_delivery = False
-        if error is not None and delivery_error is not None:
+            self._pump_inbound_owned = (
+                inbound_owned if pending_inbound_cleanup else [])
+        secondary_errors = [item for item in (inbound_error, delivery_error) if item is not None]
+        if error is not None and secondary_errors:
             add_note = getattr(error, "add_note", None)
             if callable(add_note):
-                add_note(f"outbound delivery 失败: {type(delivery_error).__name__}: {delivery_error}")
+                for secondary in secondary_errors:
+                    add_note(
+                        f"connector lifecycle 失败: {type(secondary).__name__}: {secondary}")
             return error
-        return error or delivery_error
+        return error or inbound_error or delivery_error
 
     def flush_outbound(self) -> Dict[str, Any]:
         """Attempt one bounded priority batch, then report every item left durable."""
@@ -338,14 +475,17 @@ class System:
 
     def drain_interactions(self, *, poll_interval_s: float = 0.1,
                            accept_final_spool: bool = True) -> None:
-        """Accept one final spool boundary, then drain only that durable work (safe CLI exit boundary)."""
+        """Accept the finite closed-listener boundary, then terminalize its work."""
         if (isinstance(poll_interval_s, bool) or not isinstance(poll_interval_s, (int, float))
                 or not math.isfinite(float(poll_interval_s)) or poll_interval_s < 0.01):
             raise ValueError("poll_interval_s 须为不小于 0.01 的有限秒数（防交互排空热自旋）")
         if not isinstance(accept_final_spool, bool):
             raise ValueError("accept_final_spool 须为 bool")
-        # Exactly one intake probe closes the append-during-final-provider race.  Subsequent iterations only
-        # finalize the runner_calls accepted by this boundary, so a live producer cannot postpone shutdown forever.
+        # Exactly one general intake probe closes the append-during-final-provider
+        # race without allowing a live, independently hosted console producer to
+        # postpone shutdown forever.  Owned connector listeners have already
+        # stopped at this call site, so their remaining fsynced backlog is finite
+        # and is drained separately below.
         notification_error: Optional[Exception] = None
 
         def scan_notifications() -> None:
@@ -361,6 +501,9 @@ class System:
         if accept_final_spool:
             self._sync_interactions_retry()
         scan_notifications()
+        while accept_final_spool and self.closed_inbound_pending():
+            self._retry_interaction_sync(self.sync_closed_inbound)
+            scan_notifications()
         while self.accepted_interaction_pending():
             self._retry_interaction_sync(self.sync_accepted_interactions)
             scan_notifications()
@@ -505,6 +648,14 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     _validate_outbound_config(policy, outbound_config)
     work.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(work, 0o700)                  # query service UID cannot traverse to DB/raw artifacts
+    if outbound_config is not None:
+        # Validate existing inbound spool/profile authority before opening or
+        # creating SQLite.  A binding/config drift must not run research first
+        # and discover the control plane is unusable later.
+        for connector in outbound_config["channels"].values():
+            prepare = getattr(connector, "prepare_inbound", None)
+            if callable(prepare):
+                prepare()
 
     db_path = str(work / "research.sqlite")
     writer_conn = _db.connect(db_path)
@@ -552,8 +703,34 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
         rebuild_last_n=policy["interaction"]["mediator_rebuild_last_n"],
         cost_ledger=cost_ledger,
     )
+    console.continue_snapshot = mediator.continue_ack_payload
     inbox_ingest = ConsoleInboxIngest(console, mediator, str(work), file_requests=file_requests,
                                       system_root=str(root))
+    connector_inbox = ConnectorInboxIngest(
+        console, mediator, str(work),
+        outbound_config["channels"] if outbound_config is not None else {})
+    interaction_sync_lock = threading.RLock()
+
+    def sync_interactions(cyc=None) -> int:
+        # Console is always first: an authenticated remote flood/poison cannot
+        # head-of-line block the local emergency pause/reject trust domain.
+        with interaction_sync_lock:
+            processed = inbox_ingest.ingest(cyc)
+            processed += connector_inbox.ingest(cyc)
+            return processed
+
+    def interactions_pending() -> bool:
+        with interaction_sync_lock:
+            return bool(inbox_ingest.has_pending or connector_inbox.has_pending
+                        or mediator.has_pending_queries)
+
+    def sync_accepted_interactions() -> None:
+        with interaction_sync_lock:
+            mediator.poll()
+
+    def accepted_interactions_pending() -> bool:
+        with interaction_sync_lock:
+            return mediator.has_pending_queries
     base_precheck = make_advancer_precheck(console, daemon)
     outbox = Outbox(str(work / "state"))
     directive_notifier = DirectiveNotifier(daemon, outbox)
@@ -593,12 +770,12 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
         sync_notifications()
 
     def precheck(cyc=None) -> Optional[str]:
-        inbox_ingest.ingest(cyc)              # 先 ingest 控制台入站；故障不裸崩，但 backlog 会在本边界阻断研究
-        if inbox_ingest.has_pending:
+        sync_interactions(cyc)                # 两个信任域独立 cursor；console 始终先推进
+        if inbox_ingest.has_pending or connector_inbox.has_pending:
             # Spool 是人类动作的到达顺序。队首 retry/sidecar 损坏/下一批 backlog 未排空时，不能先消费
             # 已在 DB 的 due directive；更晚到但已 ACK 的 reject/resume 可能正卡在该入站故障之后。
             sync_notifications()               # 观测/提醒仍可重扫，但不产生任何 directive 状态效果
-            return "控制台入站待处理/故障（等待下轮重试）"
+            return "人机入站待处理/故障（等待下轮重试）"
         reason = base_precheck(cyc)            # 再消费到期 directive + 查阻断（pause / 文件请求全局等待）
         sync_notifications()                   # 动作/消费后的真实状态立即派生通知（emit 幂等）
         return reason
@@ -641,13 +818,18 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     return System(advancer=advancer, state=state, daemon=daemon,
                   dual_mode=policy.get("session", {}).get("dual_mode", "A"), work_root=work,
                   sync_notifications=sync_notifications,
-                  sync_interactions=lambda: inbox_ingest.ingest(None),
-                  interaction_pending=lambda: inbox_ingest.interaction_pending,
-                  sync_accepted_interactions=inbox_ingest.poll_accepted,
-                  accepted_interaction_pending=(
-                      lambda: inbox_ingest.accepted_interaction_pending),
+                  sync_interactions=lambda: sync_interactions(None),
+                  interaction_pending=interactions_pending,
+                  sync_accepted_interactions=sync_accepted_interactions,
+                  accepted_interaction_pending=accepted_interactions_pending,
+                  sync_closed_inbound=lambda: connector_inbox.ingest(None),
+                  closed_inbound_pending=lambda: connector_inbox.has_pending,
                   sync_sideband=sync_sideband_notifications,
-                  outbound_delivery=delivery)
+                  outbound_delivery=delivery,
+                  start_inbound=connector_inbox.start,
+                  stop_inbound=connector_inbox.stop,
+                  raise_inbound=connector_inbox.raise_if_failed,
+                  inbound_cleanup_pending=lambda owned, _error: bool(owned))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -673,7 +855,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         profile = args.connector_profile or str(Path(args.system_root) / "connectors" / "outbound.json")
         try:
-            outbound_config = load_connectors(profile)
+            outbound_config = load_connectors(profile, work_root=args.work_root)
         except (ConnectorConfigError, OSError) as error:
             print(f"[run] connector 配置失败：{error}；离线运行须显式加 --no-outbound", file=sys.stderr)
             return 2

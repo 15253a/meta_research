@@ -40,7 +40,7 @@ import json
 import math
 import re
 import sqlite3
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from .ids import cnum as _cnum
 from .interaction import InteractionIngest
@@ -65,6 +65,8 @@ _DIRECTIVE_RULES = [
 # 若据此归 query 会被静默只读作答而非进澄清环（保守铁律：宁 unclear 勿误 query）。
 _QUERY_HINTS = ("现状", "进展", "进度", "状态", "结果", "为什么", "什么", "多少", "哪",
                 "status", "why", "what", "how")
+_CONTINUE_ONLY_RE = re.compile(
+    r"(?i)^\s*(?:继续(?:跑|运行|执行)?|接着跑|接着执行|continue|keep\s+going)\s*[。.!！?？]?\s*$")
 
 _NUMBER = r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+))(?:[eE][+-]?[0-9]+)?"
 _QREF_RE = re.compile(r"(?<![0-9A-Za-z])[qQ]([1-9][0-9]*)(?![0-9A-Za-z])")
@@ -105,6 +107,11 @@ def directive_action_text(action: str, directive_id: int, *, reason: str = "") -
     raise ValueError(f"directive action 非法: {action!r}")
 
 
+def is_continue_only(text: Any) -> bool:
+    """Closed phrase set for the state-aware ``continue`` special case."""
+    return isinstance(text, str) and _CONTINUE_ONLY_RE.fullmatch(text) is not None
+
+
 def _hit(low: str, w: str) -> bool:
     """词命中：ASCII 词要求词边界（防 "pin"∈"opinion" 这类中缀假阳性——软指令假阳会污染 decision 台账）；
     CJK 词无空格分词、保持子串匹配。"""
@@ -113,15 +120,51 @@ def _hit(low: str, w: str) -> bool:
     return w in low
 
 
+def _load_bounded_control_json(raw: str) -> Any:
+    """Parse operator JSON as a small, total control value.
+
+    ``json.loads`` is recursive and accepts duplicate keys/non-finite numbers
+    by default.  Neither behavior is suitable for a durable state mutation.
+    """
+    def unique_object(pairs):  # noqa: ANN001
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"重复 JSON key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            raw, object_pairs_hook=unique_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"非有限 JSON number: {token}")))
+    except (json.JSONDecodeError, RecursionError, ValueError) as error:
+        message = error.msg if isinstance(error, json.JSONDecodeError) else str(error)
+        raise ValueError(f"JSON 参数非法: {message}") from error
+    nodes = 0
+    stack = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if depth > 16 or nodes > 4096:
+            raise ValueError("JSON 参数嵌套/节点数超过控制面上限")
+        if isinstance(item, dict):
+            stack.extend((key, depth + 1) for key in item)
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str) and any(0xD800 <= ord(ch) <= 0xDFFF for ch in item):
+            raise ValueError("JSON 参数含非法 Unicode surrogate")
+    return value
+
+
 def _json_object_suffix(text: str) -> Optional[Dict[str, Any]]:
     """Parse an explicit JSON object suffix, if present; malformed JSON is an application error, not a guess."""
     start = text.find("{")
     if start < 0:
         return None
-    try:
-        value = json.loads(text[start:])
-    except json.JSONDecodeError as error:
-        raise ValueError(f"JSON 参数非法: {error.msg}") from error
+    value = _load_bounded_control_json(text[start:])
     if not isinstance(value, dict):
         raise ValueError("JSON 参数须为 object")
     return value
@@ -213,10 +256,7 @@ def _parse_goal_amend(text: str) -> Dict[str, Any]:
     suffix = text[match.end():].strip()
     suffix = re.sub(r"^(?:[：:，,\-]\s*)", "", suffix)
     if suffix.startswith("{"):
-        try:
-            explicit = json.loads(suffix)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"JSON 参数非法: {error.msg}") from error
+        explicit = _load_bounded_control_json(suffix)
         if not isinstance(explicit, dict):
             raise ValueError("goal_amend JSON 参数须为 object")
         allowed = {"new_goal_text", "predicate_json", "rationale_md"}
@@ -292,11 +332,14 @@ class KeywordClassifier:
 
 
 class Console:
-    def __init__(self, daemon: WriteDaemon, classifier=None, policy: Optional[Dict[str, Any]] = None):
+    def __init__(self, daemon: WriteDaemon, classifier=None, policy: Optional[Dict[str, Any]] = None,
+                 continue_snapshot: Optional[
+                     Callable[[], Tuple[Optional[str], str]]] = None):
         self.daemon = daemon
         self.ingest = InteractionIngest(daemon)
         self.classifier = classifier or KeywordClassifier()
         self.policy = policy
+        self.continue_snapshot = continue_snapshot
 
     # ---------------------------------------------------------------- 入站 --
     def handle_inbound(self, *, connector: str, raw_text: str, idempotency_key: str,
@@ -307,6 +350,12 @@ class Console:
         """durable 入站 → 恰一分类（幂等：message UNIQUE）→ directive/note 先建行再回指（DDL 时序）。
         返回 {message_id, intent, directive_id?, needs_confirmation?}。unclear：不自动答不产 directive
         （ACK 回显请确认由通知层出，CP6.3）。"""
+        if is_continue_only(raw_text):
+            return self._handle_continue_atomic(
+                connector=connector, raw_text=raw_text,
+                idempotency_key=idempotency_key, goal_id=goal_id,
+                goal_ver=goal_ver, cycle_id=cycle_id,
+                session_ref=session_ref, conversation_id=conversation_id)
         mid = self.ingest.inbound(connector=connector, raw_text=raw_text, idempotency_key=idempotency_key,
                                   goal_id=goal_id, goal_ver=goal_ver, cycle_id=cycle_id,
                                   session_ref=session_ref, conversation_id=conversation_id)
@@ -370,11 +419,130 @@ class Console:
         return {"message_id": mid, "intent": c["intent"], "directive_id": did,
                 "needs_confirmation": bool(did) and c.get("hardness") == "hard" and c["intent"] == "directive"}
 
+    def _handle_continue_atomic(self, *, connector: str, raw_text: str,
+                                idempotency_key: str, goal_id: Optional[int],
+                                goal_ver: Optional[int], cycle_id: Optional[str],
+                                session_ref: Optional[str],
+                                conversation_id: Optional[str]) -> Dict[str, Any]:
+        """Freeze message arrival, pause-state interpretation and ACK/directive atomically.
+
+        A two-transaction implementation can reinterpret the same immutable
+        message after a crash if pause/resume changes in between.  This path is
+        deliberately self-contained in one WriteDaemon transaction.
+        """
+        if (goal_id is None) != (goal_ver is None):
+            raise ValueError("goal_id 与 goal_ver 须同为 None 或同非 None")
+        if session_ref is not None and (
+                not isinstance(session_ref, str) or not session_ref or len(session_ref) > 256
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in session_ref)):
+            raise ValueError("session_ref 须为 1–256 字符且不得含控制字符")
+        if conversation_id is not None and (
+                not isinstance(conversation_id, str) or not conversation_id
+                or len(conversation_id) > 128
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in conversation_id)):
+            raise ValueError("conversation_id 须为 1–128 字符且不得含控制字符")
+        ci = _cnum(cycle_id) if cycle_id else None
+        expected_hash = "sha256:" + hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        snapshot: Optional[str] = None
+        ack_text: Optional[str] = None
+        if self.continue_snapshot is not None:
+            try:
+                snapshot, ack_text = self.continue_snapshot()
+            except (OSError, ValueError, RuntimeError):
+                snapshot, ack_text = None, None
+        with self.daemon.transaction() as conn:
+            existing = conn.execute(
+                "SELECT id,connector,raw_text,raw_hash,goal_id,goal_ver,session_ref,conversation_id "
+                "FROM interaction_message WHERE connector=? AND idempotency_key=?",
+                (connector, idempotency_key)).fetchone()
+            if existing is not None:
+                mid = int(existing[0])
+                if existing[1:] != (connector, raw_text, expected_hash, goal_id, goal_ver,
+                                    session_ref, conversation_id):
+                    raise IdempotencyCollisionError(
+                        f"{connector} idempotency_key 已绑定其他不可变消息: {idempotency_key}")
+                classified = conn.execute(
+                    "SELECT intent FROM interaction_classification WHERE message_id=?", (mid,)).fetchone()
+                if classified is None:
+                    # A legacy/pre-upgrade half-ingest has no durable arrival-state
+                    # snapshot.  Never guess resume from today's pause state.
+                    conn.execute(
+                        "INSERT INTO interaction_classification(message_id,intent,directive_id) "
+                        "VALUES (?,'unclear',NULL)", (mid,))
+                    text = "这条‘继续’消息的到达状态无法安全恢复；系统未执行 resume，请重新发送。"
+                    digest = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    conn.execute(
+                        "INSERT INTO interaction_reply(message_id,reply_ref,reply_hash,reply_text,"
+                        "snapshot_cycle,responder_kind) VALUES (?,?,?,?,NULL,'template')",
+                        (mid, f"reply:{mid}:final-template", digest, text))
+            else:
+                mid = conn.execute(
+                    "INSERT INTO interaction_message(connector,conversation_id,session_ref,goal_id,goal_ver,"
+                    "cycle_id,raw_text,raw_hash,idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (connector, conversation_id, session_ref, goal_id, goal_ver, ci,
+                     raw_text, expected_hash, idempotency_key)).lastrowid
+                latest_control = conn.execute(
+                    "SELECT kind FROM directive WHERE status='consumed' "
+                    "AND kind IN ('pause','resume') ORDER BY consumed_decision_id DESC LIMIT 1").fetchone()
+                paused = latest_control is not None and latest_control[0] == "pause"
+                if paused:
+                    payload = {
+                        "polished": f"[resume] {raw_text.strip()}",
+                        "confirmed": False,
+                        "classifier": "continue-special-v1",
+                    }
+                    did = conn.execute(
+                        "INSERT INTO directive(kind,hardness,status,consume_at,payload_json,created_cycle,"
+                        "source_interaction_message_id) VALUES ('resume','hard','pending','immediate',?,?,?)",
+                        (json.dumps(payload, ensure_ascii=False), ci, mid)).lastrowid
+                    conn.execute(
+                        "INSERT INTO interaction_classification(message_id,intent,directive_id) "
+                        "VALUES (?,'directive',?)", (mid, did))
+                else:
+                    did = None
+                    conn.execute(
+                        "INSERT INTO interaction_classification(message_id,intent,directive_id) "
+                        "VALUES (?,'query',NULL)", (mid,))
+                    if snapshot is not None:
+                        try:
+                            snapshot_id = _cnum(snapshot)
+                        except ValueError:
+                            snapshot_id = None
+                        if snapshot_id is not None and conn.execute(
+                                "SELECT 1 FROM cycle WHERE id=?", (snapshot_id,)).fetchone() is None:
+                            snapshot_id = None
+                    else:
+                        fallback = conn.execute("SELECT id FROM cycle ORDER BY id DESC LIMIT 1").fetchone()
+                        snapshot_id = int(fallback[0]) if fallback is not None else None
+                        snapshot = f"c{snapshot_id}" if snapshot_id is not None else None
+                    if not isinstance(ack_text, str) or not ack_text.strip():
+                        ack_text = (f"[快照 {snapshot}] 已在继续；本消息未产生状态变更。"
+                                    if snapshot is not None else
+                                    "已在继续；尚无已发布快照，本消息未产生状态变更。")
+                    ack_text = ack_text.strip()
+                    if (len(ack_text) > 4_000
+                            or any((ord(ch) < 0x20 and ch not in "\n\t")
+                                   or ord(ch) == 0x7f for ch in ack_text)):
+                        raise ValueError("continue ACK 文本非法")
+                    digest = "sha256:" + hashlib.sha256(ack_text.encode("utf-8")).hexdigest()
+                    conn.execute(
+                        "INSERT INTO interaction_reply(message_id,reply_ref,reply_hash,reply_text,"
+                        "snapshot_cycle,responder_kind) VALUES (?,?,?,?,?,'template')",
+                        (mid, f"reply:{mid}:final-template", digest, ack_text, snapshot_id))
+        result = self._existing_classification(mid)
+        if result is None:
+            raise RuntimeError("continue special 未产生 classification")
+        return result
+
     def _existing_classification(self, mid: int) -> Optional[Dict[str, Any]]:
         """既有分类 → 幂等返回值（与首次返回**等价**，含 needs_confirmation——重放丢首次响应后调用方
         仍能据此触发确认 UI）；note 分类行 directive_id 必空，经 directive.source 回指找回。"""
-        ex = self.daemon.query_one("SELECT intent, directive_id FROM interaction_classification WHERE message_id=?",
-                                   (mid,))
+        ex = self.daemon.query_one(
+            "SELECT c.intent,c.directive_id,m.raw_text,EXISTS("
+            " SELECT 1 FROM interaction_reply r WHERE r.message_id=m.id "
+            " AND r.reply_ref=('reply:' || m.id || ':final-template')) "
+            "FROM interaction_classification c JOIN interaction_message m ON m.id=c.message_id "
+            "WHERE c.message_id=?", (mid,))
         if ex is None:
             return None
         did = ex[1]
@@ -385,7 +553,11 @@ class Console:
         if did is not None and ex[0] == "directive":
             dr = self.daemon.query_one("SELECT hardness, status, payload_json FROM directive WHERE id=?", (did,))
             needs = bool(dr) and dr[0] == "hard" and dr[1] == "pending" and not json.loads(dr[2]).get("confirmed")
-        return {"message_id": mid, "intent": ex[0], "directive_id": did, "needs_confirmation": needs}
+        result = {"message_id": mid, "intent": ex[0], "directive_id": did,
+                  "needs_confirmation": needs}
+        if ex[0] == "query" and bool(ex[3]) and is_continue_only(ex[2]):
+            result["special"] = "continue_running"
+        return result
 
     # ---------------------------------------------------------------- 确认 --
     @staticmethod
@@ -398,23 +570,44 @@ class Console:
         消息都不能冒充确认/拒绝 provenance。
         """
         action_row = conn.execute(
-            "SELECT m.raw_text,m.goal_id,m.goal_ver,c.intent,c.directive_id,m.session_ref "
+            "SELECT m.raw_text,m.goal_id,m.goal_ver,c.intent,c.directive_id,m.session_ref,"
+            "m.connector,m.conversation_id "
             "FROM interaction_message m LEFT JOIN interaction_classification c ON c.message_id=m.id "
             "WHERE m.id=?", (action_message_id,)).fetchone()
         if action_row is None:
             raise ValueError(f"{action} provenance 消息不存在: {action_message_id}")
-        if action_row[0] != directive_action_text(action, directive_id, reason=reason):
+        source_row = conn.execute(
+            "SELECT goal_id,goal_ver,session_ref,connector,conversation_id "
+            "FROM interaction_message WHERE id=?", (source_message_id,)).fetchone()
+        if source_row is None:
+            raise ValueError(f"directive {directive_id} source provenance 消息不存在")
+        if source_row[3] == "console" or source_row[2] is None:
+            expected_raw = directive_action_text(action, directive_id, reason=reason)
+        else:
+            expected_raw = (f"确认指令 d{directive_id}" if action == "confirm"
+                            else f"拒绝指令 d{directive_id}")
+        if action_row[0] != expected_raw:
             raise ValueError(f"directive {directive_id} {action} provenance 原文不符")
         if (action_row[3], action_row[4]) != ("unclear", None):
             raise ValueError(f"directive {directive_id} {action} provenance 须为 unclear 控件消息")
-        if action_row[5] != DIRECTIVE_ACTION_SESSION_REF:
-            raise ValueError(f"directive {directive_id} {action} provenance 操作域不符")
-        source_goal = conn.execute(
-            "SELECT goal_id,goal_ver FROM interaction_message WHERE id=?", (source_message_id,)).fetchone()
-        if source_goal is None:
-            raise ValueError(f"directive {directive_id} source provenance 消息不存在")
-        if (action_row[1], action_row[2]) != source_goal:
+        if (action_row[1], action_row[2]) != source_row[:2]:
             raise ValueError(f"directive {directive_id} {action} provenance 与 source goal 不一致")
+        if action_row[6] != source_row[3] or action_row[7] != source_row[4]:
+            raise ValueError(f"directive {directive_id} {action} provenance 跨 connector/conversation")
+        if source_row[3] == "console":
+            if action_row[5] != DIRECTIVE_ACTION_SESSION_REF:
+                raise ValueError(f"directive {directive_id} {action} provenance 操作域不符")
+        elif source_row[2] is None:
+            # Compatibility for pre-connector rows.  Authenticated connector
+            # ingress never emits a NULL session_ref.
+            if action_row[5] is not None:
+                raise ValueError(f"directive {directive_id} {action} legacy 操作域不符")
+        else:
+            source_session = source_row[2]
+            if (not isinstance(source_session, str)
+                    or not source_session.startswith("connector-inbound-v1:")
+                    or action_row[5] != source_session + ":action"):
+                raise ValueError(f"directive {directive_id} {action} principal/profile binding 不一致")
 
     def confirm_directive(self, *, directive_id: int, confirm_message_id: int) -> None:
         """硬指令回显确认（用户确认的是润色稿语义）：payload.confirmed=true + 确认消息 provenance。

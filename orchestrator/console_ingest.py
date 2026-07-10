@@ -90,14 +90,16 @@ class ConsoleInboxIngest:
     _MAX_ATTEMPTS = 5                          # 瞬时故障自愈窗口；超限=持久故障 → 终态处理并推进（防饥饿）
 
     def __init__(self, console, mediator, work_root: str, *, file_requests=None,
-                 system_root: Optional[str] = None):
+                 system_root: Optional[str] = None, spool: Optional[ConsoleSpool] = None,
+                 source_label: str = "console_inbox"):
         self.console = console
         self.mediator = mediator
         self.work_root = Path(work_root)
         self.system_root = Path(system_root) if system_root is not None else None
         self.file_requests = file_requests
         state = self.work_root / "state"
-        self.spool = ConsoleSpool(self.work_root)
+        self.spool = spool or ConsoleSpool(self.work_root)
+        self.source_label = source_label
         self.inbox = self.spool.inbox_path
         self.cursor_path = state / "console_inbox.cursor"
         self.retry_path = state / ".console_inbox.retry.json"
@@ -262,11 +264,24 @@ class ConsoleInboxIngest:
             logger.warning("console_inbox 普通消息 raw_text 非法，跳过: idem=%s", idem)
             self._clear_attempt(idem)
             return "poison"
+        return self._process_text(
+            connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
+            conversation_id=conversation_id,
+            session_ref=CONSOLE_MESSAGE_SESSION_REF)
+
+    def _process_text(self, *, connector: str, raw: str, idem: str,
+                      cycle_id: Optional[str], conversation_id: Optional[str],
+                      session_ref: str, strict_failures: bool = False) -> str:
+        """Process one already authenticated/shape-checked natural-language record."""
         if self._attempts.get(idem, 0) >= self._MAX_ATTEMPTS:
+            if strict_failures:
+                raise RuntimeError(
+                    f"{self.source_label} DB ingest 重试达到上限，拒绝伪装成 unclear")
             goal_id, goal_ver = self._message_goal_binding(connector, idem)
             return self._terminalize_inbound_failure(
                 connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
-                goal_id=goal_id, goal_ver=goal_ver, conversation_id=conversation_id)
+                goal_id=goal_id, goal_ver=goal_ver, conversation_id=conversation_id,
+                session_ref=session_ref)
         goal_id: Optional[int] = None
         goal_ver: Optional[int] = None
         try:
@@ -274,17 +289,37 @@ class ConsoleInboxIngest:
             res = self.console.handle_inbound(connector=connector, raw_text=raw,
                                               idempotency_key=idem, cycle_id=cycle_id,
                                               goal_id=goal_id, goal_ver=goal_ver,
-                                              session_ref=CONSOLE_MESSAGE_SESSION_REF,
+                                              session_ref=session_ref,
                                               conversation_id=conversation_id)
             self._verify_inbound_message(
                 res["message_id"], raw=raw, idem=idem,
                 goal_id=goal_id, goal_ver=goal_ver,
-                conversation_id=conversation_id)
+                conversation_id=conversation_id, connector=connector,
+                session_ref=session_ref)
         except IdempotencyCollisionError:
             logger.error("console_inbox 普通消息 idempotency collision (idem=%s) → 拒绝", idem, exc_info=True)
+            if strict_failures:
+                raise
             self._clear_attempt(idem)
             return "poison"
-        except Exception:                      # noqa: BLE001 —— 通过 shape 闸后的内部故障统一有限重试+durable terminal
+        except sqlite3.OperationalError:
+            attempts = self._bump(idem)
+            logger.log(logging.ERROR if attempts >= self._MAX_ATTEMPTS else logging.WARNING,
+                       "console_inbox ingest 内部故障 (idem=%s, 第%d次)", idem, attempts, exc_info=True)
+            if attempts < self._MAX_ATTEMPTS:
+                return "retry"
+            if strict_failures:
+                raise RuntimeError(
+                    f"{self.source_label} DB ingest 重试达到上限，保持 durable cursor")
+            if goal_id is None or goal_ver is None:
+                goal_id, goal_ver = self._message_goal_binding(connector, idem)
+            return self._terminalize_inbound_failure(
+                connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
+                goal_id=goal_id, goal_ver=goal_ver, conversation_id=conversation_id,
+                session_ref=session_ref)
+        except Exception:                      # noqa: BLE001 —— console 辅助面保留既有有限终态；认证 connector fail-loud
+            if strict_failures:
+                raise
             attempts = self._bump(idem)
             logger.log(logging.ERROR if attempts >= self._MAX_ATTEMPTS else logging.WARNING,
                        "console_inbox ingest 内部故障 (idem=%s, 第%d次)", idem, attempts, exc_info=True)
@@ -294,9 +329,11 @@ class ConsoleInboxIngest:
                 goal_id, goal_ver = self._message_goal_binding(connector, idem)
             return self._terminalize_inbound_failure(
                 connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
-                goal_id=goal_id, goal_ver=goal_ver, conversation_id=conversation_id)
+                goal_id=goal_id, goal_ver=goal_ver, conversation_id=conversation_id,
+                session_ref=session_ref)
         if res.get("intent") == "query" and res.get("message_id") is not None:
-            return self._answer_query(idem, res["message_id"])
+            return self._answer_query(
+                idem, res["message_id"], special=res.get("special"))
         self._clear_attempt(idem)              # 成功 → 清计数
         return "ok"
 
@@ -325,18 +362,21 @@ class ConsoleInboxIngest:
 
     def _verify_inbound_message(self, mid: int, *, raw: str, idem: str,
                                 goal_id: Optional[int], goal_ver: Optional[int],
-                                conversation_id: Optional[str]) -> None:
+                                conversation_id: Optional[str], connector: str = "console",
+                                session_ref: str = CONSOLE_MESSAGE_SESSION_REF) -> None:
         row = self.console.daemon.query_one(
             "SELECT connector,raw_text,raw_hash,goal_id,goal_ver,session_ref,conversation_id "
             "FROM interaction_message WHERE id=?", (mid,))
         expected_hash = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        if row != ("console", raw, expected_hash, goal_id, goal_ver,
-                   CONSOLE_MESSAGE_SESSION_REF, conversation_id):
-            raise IdempotencyCollisionError(f"console idempotency_key 已绑定其他普通消息: {idem}")
+        if row != (connector, raw, expected_hash, goal_id, goal_ver,
+                   session_ref, conversation_id):
+            raise IdempotencyCollisionError(
+                f"{connector} idempotency_key 已绑定其他普通消息: {idem}")
 
     def _terminalize_inbound_failure(self, *, connector: str, raw: str, idem: str,
                                      cycle_id: Optional[str], goal_id: Optional[int],
-                                     goal_ver: Optional[int], conversation_id: Optional[str]) -> str:
+                                     goal_ver: Optional[int], conversation_id: Optional[str],
+                                     session_ref: str = CONSOLE_MESSAGE_SESSION_REF) -> str:
         """连续内部失败达上限后，先落可审计终态，再允许 cursor 越过当前记录。
 
         新消息的 ``unclear`` 分类和失败 reply 共用一个事务；事务/commit 任一失败都返回 ``retry``。
@@ -347,11 +387,12 @@ class ConsoleInboxIngest:
             mid = self.console.ingest.inbound(
                 connector=connector, raw_text=raw, idempotency_key=idem, cycle_id=cycle_id,
                 goal_id=goal_id, goal_ver=goal_ver,
-                session_ref=CONSOLE_MESSAGE_SESSION_REF,
+                session_ref=session_ref,
                 conversation_id=conversation_id)
             self._verify_inbound_message(
                 mid, raw=raw, idem=idem, goal_id=goal_id, goal_ver=goal_ver,
-                conversation_id=conversation_id)
+                conversation_id=conversation_id, connector=connector,
+                session_ref=session_ref)
             failure_text = _INBOUND_FAILURE_PREFIX + "控制台消息处理持续失败，未执行任何控制语义"
             failure_hash = "sha256:" + hashlib.sha256(failure_text.encode("utf-8")).hexdigest()
             with self.console.daemon.transaction() as conn:
@@ -408,6 +449,7 @@ class ConsoleInboxIngest:
         """
         action = rec.get("action")
         did = rec.get("directive_id")
+        conversation_id = rec.get("conversation_id")
         if action not in ("confirm", "reject"):
             logger.warning("console_inbox directive action 形状非法，跳过: %r", str(rec)[:160])
             self._clear_attempt(idem)
@@ -416,6 +458,12 @@ class ConsoleInboxIngest:
             did = _action_positive_id(did, label="directive_id")
         except ValueError:
             logger.warning("console_inbox directive_id 非法，跳过: %r", did)
+            self._clear_attempt(idem)
+            return "poison"
+        if (conversation_id is not None
+                and (not isinstance(conversation_id, str)
+                     or _CONVERSATION_ID_RE.fullmatch(conversation_id) is None)):
+            logger.warning("console_inbox directive action conversation_id 非法: idem=%s", idem)
             self._clear_attempt(idem)
             return "poison"
         reason = ""
@@ -441,12 +489,16 @@ class ConsoleInboxIngest:
                                               idempotency_key=idem, cycle_id=cycle_id,
                                               goal_id=(source_goal[0] if source_goal else None),
                                               goal_ver=(source_goal[1] if source_goal else None),
-                                              session_ref=DIRECTIVE_ACTION_SESSION_REF)
+                                              session_ref=DIRECTIVE_ACTION_SESSION_REF,
+                                              conversation_id=conversation_id)
             stored = self.console.daemon.query_one(
-                "SELECT raw_text,goal_id,goal_ver,session_ref FROM interaction_message WHERE id=?", (mid,))
-            expected_stored = ((raw, source_goal[0], source_goal[1], DIRECTIVE_ACTION_SESSION_REF)
+                "SELECT raw_text,goal_id,goal_ver,session_ref,connector,conversation_id "
+                "FROM interaction_message WHERE id=?", (mid,))
+            expected_stored = ((raw, source_goal[0], source_goal[1], DIRECTIVE_ACTION_SESSION_REF,
+                                connector, conversation_id)
                                if source_goal else
-                               (raw, None, None, DIRECTIVE_ACTION_SESSION_REF))
+                               (raw, None, None, DIRECTIVE_ACTION_SESSION_REF,
+                                connector, conversation_id))
             if stored != expected_stored:
                 raise IdempotencyCollisionError(f"action idempotency_key 已绑定其他 raw: {idem}")
             self._ensure_action_classification(mid)
@@ -640,12 +692,14 @@ class ConsoleInboxIngest:
         self._clear_attempt(idem)
         return "ok"
 
-    def _answer_query(self, idem: str, mid: int) -> str:
+    def _answer_query(self, idem: str, mid: int, *, special: Optional[str] = None) -> str:
         """query 应答。
 
         模板路径保持 reply-durable 才推进。Codex 路径在 ``enqueue_query`` 已原子落 active runner intent
         （或已落 terminal reply）后即可推进；后台调用不持 DB，完成由后续 main-writer ``poll`` 收口。
         """
+        if special not in (None, "continue_running"):
+            raise ValueError(f"未知 interaction query special: {special!r}")
         last_error: Optional[BaseException] = None
         try:
             has_terminal = (self.mediator.has_terminal_query_reply(mid)

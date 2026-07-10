@@ -68,13 +68,17 @@ def _file_daemon(tmp_path):
 def _action_message(d, c, result, action):
     """模拟 ConsoleInboxIngest 落下的结构化控件 provenance。"""
     did = result["directive_id"]
-    goal = d.query_one(
-        "SELECT m.goal_id,m.goal_ver FROM directive x JOIN interaction_message m "
+    source = d.query_one(
+        "SELECT m.goal_id,m.goal_ver,m.connector,m.conversation_id,m.session_ref "
+        "FROM directive x JOIN interaction_message m "
         "ON m.id=x.source_interaction_message_id WHERE x.id=?", (did,))
+    session_ref = (DIRECTIVE_ACTION_SESSION_REF
+                   if source[2] == "console" else
+                   (source[4] + ":action" if source[4] is not None else None))
     mid = c.ingest.inbound(
-        connector="test-console-action", raw_text=directive_action_text(action, did),
-        idempotency_key=f"test-{action}-d{did}", goal_id=goal[0], goal_ver=goal[1],
-        session_ref=DIRECTIVE_ACTION_SESSION_REF)
+        connector=source[2], raw_text=directive_action_text(action, did),
+        idempotency_key=f"test-{action}-d{did}", goal_id=source[0], goal_ver=source[1],
+        session_ref=session_ref, conversation_id=source[3])
     with d.transaction() as conn:
         conn.execute("INSERT INTO interaction_classification(message_id,intent,directive_id) "
                      "VALUES (?,'unclear',NULL)", (mid,))
@@ -143,11 +147,12 @@ def test_precheck_rejects_reasoning_directive_overflow_before_consumption(env):
     # Prompt capacity must never reject the operational controls needed to stop or unpause the same cycle.
     pause = c.handle_inbound(
         connector="qq", raw_text="暂停", idempotency_key="capacity-pause", goal_id=1, goal_ver=1)
-    resume = c.handle_inbound(
-        connector="qq", raw_text="继续", idempotency_key="capacity-resume", goal_id=1, goal_ver=1)
     c.confirm_directive(
         directive_id=pause["directive_id"],
         confirm_message_id=_action_message(d, c, pause, "confirm"))
+    assert make_advancer_precheck(c, d)(cyc) is not None
+    resume = c.handle_inbound(
+        connector="qq", raw_text="继续", idempotency_key="capacity-resume", goal_id=1, goal_ver=1)
     c.confirm_directive(
         directive_id=resume["directive_id"],
         confirm_message_id=_action_message(d, c, resume, "confirm"))
@@ -717,18 +722,18 @@ def test_directive_hard_full_lifecycle_events(env):
     r = c.handle_inbound(connector="qq", raw_text="暂停", idempotency_key="n-1", goal_id=1, goal_ver=1)
     did = r["directive_id"]
     dn.scan()
-    assert _keys(ob) == {f"directive:{did}:received", f"directive:{did}:classified",
-                         f"directive:{did}:pending_confirmation"}          # 硬未确认：三态，无 pending_effect
+    assert _keys(ob) == {f"directive:{did}:received:v2", f"directive:{did}:classified:v2",
+                         f"directive:{did}:pending_confirmation:v2"}       # 硬未确认：三态，无 pending_effect
     ev = [json.loads(l) for l in (ob.queue_path.read_text().splitlines())]
     pc = next(e for e in ev if e["kind"] == "directive_pending_confirmation")
     assert pc["payload"]["polished"].startswith("[pause]")                  # 确认事件展示润色稿
     c.confirm_directive(directive_id=did,
                         confirm_message_id=_action_message(d, c, r, "confirm"))
     dn.scan()
-    assert f"directive:{did}:pending_effect" in _keys(ob)                   # 确认后 → 就绪态
+    assert f"directive:{did}:pending_effect:v2" in _keys(ob)                # 确认后 → 就绪态
     c.consume_directive(directive_id=did, cycle_id="c1")
     new = dn.scan()
-    assert f"directive:{did}:applied" in new
+    assert f"directive:{did}:applied:v2" in new
     applied = [json.loads(l) for l in ob.queue_path.read_text().splitlines()
                if json.loads(l)["kind"] == "directive_applied"][0]
     assert applied["payload"]["consumed_cycle"] == "c1"                     # applied 带消费轮+效果摘要
@@ -743,19 +748,25 @@ def test_directive_rejected_and_superseded_events(env):
     r1 = c.handle_inbound(connector="qq", raw_text="注入问题：试试量子计算", idempotency_key="n-r",
                           goal_id=1, goal_ver=1)
     c.reject_directive(directive_id=r1["directive_id"], reason="与目标谓词无关", by_decision=True, cycle_id="c1")
-    # pause 被 resume 覆盖 → superseded
+    # pause 先消费进入 paused；随后精确“继续”才解释为 resume 并覆盖旧 pause。
     r2 = c.handle_inbound(connector="qq", raw_text="暂停", idempotency_key="n-p", goal_id=1, goal_ver=1)
+    c.confirm_directive(directive_id=r2["directive_id"],
+                        confirm_message_id=_action_message(d, c, r2, "confirm"))
+    c.consume_directive(directive_id=r2["directive_id"], cycle_id="c1")
+    pending_pause = c.handle_inbound(
+        connector="qq", raw_text="暂停", idempotency_key="n-pending-p",
+        goal_id=1, goal_ver=1)
     r3 = c.handle_inbound(connector="qq", raw_text="继续", idempotency_key="n-c", goal_id=1, goal_ver=1)
     c.confirm_directive(directive_id=r3["directive_id"],
                         confirm_message_id=_action_message(d, c, r3, "confirm"))
     c.consume_directive(directive_id=r3["directive_id"], cycle_id="c1")
     dn.scan()
     ks = _keys(ob)
-    assert f"directive:{r1['directive_id']}:rejected" in ks
+    assert f"directive:{r1['directive_id']}:rejected:v2" in ks
     rej = [json.loads(l) for l in ob.queue_path.read_text().splitlines()
-           if json.loads(l)["event_key"] == f"directive:{r1['directive_id']}:rejected"][0]
+           if json.loads(l)["event_key"] == f"directive:{r1['directive_id']}:rejected:v2"][0]
     assert rej["payload"]["reason"] == "与目标谓词无关"                     # rejected 附理由
-    assert f"directive:{r2['directive_id']}:superseded" in ks
+    assert f"directive:{pending_pause['directive_id']}:superseded:v2" in ks
 
 
 # ============ 文件请求：创建负例 + schema 拒 ============
