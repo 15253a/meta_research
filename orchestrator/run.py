@@ -172,7 +172,7 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     publisher = SqliteStatusPublisher(open_responder_read_conn(db_path), policy=policy,
                                       goal_body_md=goal_body, out_path=str(work / "state" / "status_card.json"))
     stop = StopController(daemon, policy)
-    console = Console(daemon)
+    console = Console(daemon, policy=policy)
     # sidecar 创建与控制台 resolve/cancel 共用同一服务实例；托管文件必须落在**本次 work_root** 内：
     # ①不同运行的 request_id 不会在仓库 input/ 互相覆盖；②manifest 默认 work_root 路径围栏可真实消费；
     # ③大文件/敏感文件不进入 Git 工作树。后者由 inbox ingest 在 run 单写进程内调用。

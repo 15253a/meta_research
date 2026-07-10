@@ -54,7 +54,7 @@ def env(tmp_path):
     daemon = WriteDaemon(db.connect(":memory:"))
     conftest.seed_minimal(daemon.conn)
     outbox = Outbox(str(tmp_path / "outbox"))
-    return {"d": daemon, "c": Console(daemon), "ob": outbox,
+    return {"d": daemon, "c": Console(daemon, policy=POLICY), "ob": outbox,
             "dn": DirectiveNotifier(daemon, outbox), "tmp": tmp_path}
 
 
@@ -91,7 +91,7 @@ def _request(n=1):
     return {"summary_md": "需要外部数据集：镜像不含、无法自行获取", "items": _items(n)}
 
 
-def test_precheck_terminally_rejects_unavailable_directive_semantics(env):
+def test_precheck_applies_durable_set_budget_semantics(env):
     d, c = env["d"], env["c"]
     result = c.handle_inbound(
         connector="qq", raw_text="设置预算 50", idempotency_key="unsupported-budget",
@@ -103,13 +103,14 @@ def test_precheck_terminally_rejects_unavailable_directive_semantics(env):
     assert make_advancer_precheck(c, d)() is None
     status, payload = d.query_one(
         "SELECT status,payload_json FROM directive WHERE id=?", (result["directive_id"],))
-    assert status == "rejected"
+    assert status == "consumed"
     parsed = json.loads(payload)
-    assert parsed["rejection_kind"] == "application_unavailable"
-    assert "真实状态语义" in parsed["rejection_reason"]
-    assert d.query_one(
-        "SELECT actor,type FROM decision WHERE directive_id=? ORDER BY id DESC LIMIT 1",
-        (result["directive_id"],)) == ("orchestrator", "directive_application_rejected")
+    assert parsed["budget_patch"] == {"session_max": 50.0}
+    actor, kind, effect_limit = d.query_one(
+        "SELECT actor,type,json_extract(payload_json,'$.effect.budget.session_max') "
+        "FROM decision WHERE directive_id=? ORDER BY id DESC LIMIT 1",
+        (result["directive_id"],))
+    assert (actor, kind, effect_limit) == ("human", "directive_set_budget", 50.0)
 
 
 def test_precheck_rejects_reasoning_directive_overflow_before_consumption(env):

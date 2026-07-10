@@ -205,7 +205,7 @@ class SqliteCompiler:
             parts.append(self._prior_ideas(aq, sources))
         elif stage == "plan":
             parts.append(f"## 单轮预算\nB(t) = {self._budget()}（policy budget 节）")
-            sources.append("policy:budget")
+            self._budget_sources(sources)
             parts.append(self._plan_reject_feedback(aq, sources))
         elif stage == "bundle" and target_id is not None:
             # 完整计划切片（步⑧ CP8.2）：resolved 切片（plan_ref）+ plan_slice_hash（manifest 须回引此值）+
@@ -224,6 +224,7 @@ class SqliteCompiler:
                  "decompose_threshold": self.policy["flow"]["decompose_threshold"],
                  "tau": self.policy["flow"]["tau"]}, ensure_ascii=False, sort_keys=True) + "\n```")
             sources.append("policy:acquisition")
+            self._budget_sources(sources)
         return "\n\n".join(p for p in parts if p)
 
     def _reasoning_directives(self, cycle_id: int, sources: List[str]) -> str:
@@ -678,3 +679,14 @@ class SqliteCompiler:
 
     def _budget(self) -> float:
         return compute_budget(self.conn, self.policy["budget"])   # 唯一定义在 budgeting.compute_budget（防漂移）
+
+    def _budget_sources(self, sources: List[str]) -> None:
+        """Record both the boot policy and the consumed directive behind B(t)."""
+        sources.append("policy:budget")
+        row = self.conn.execute(
+            "SELECT x.id FROM decision d JOIN directive x ON x.id=d.directive_id "
+            "WHERE d.actor='human' AND d.type='directive_set_budget' "
+            "AND x.status='consumed' AND x.consumed_decision_id=d.id "
+            "ORDER BY d.id DESC LIMIT 1").fetchone()
+        if row is not None:
+            sources.append(f"db:directive:{row[0]}")

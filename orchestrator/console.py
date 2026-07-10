@@ -25,8 +25,9 @@ pending pause 置 superseded（队列清理；晚到的 pause 保留、到时机
 其余效果：abort_cycle（在途轮 aborted，并原子释放 active 问题）、inject_question（open 问题，source='human'）、
 prune_branch（decision(type=prune_branch) 先行再 dead_end，且**该决策即消费决策**——一次消费一条
 人类决策，不重复记账）、note（按 consumed_cycle 真正编入下一次 reasoning ContextPack）。
-`set_budget/reprioritize/goal_amend` 在对应运行时 override、选题约束、goal_amend reasoning-only 路由
-闭合前**不得标 consumed**：precheck 会把它们终态 rejected，并以 DECISION 明示能力尚不可用，避免
+`set_budget` 以消费 DECISION 的完整预算投影为耐久权威，所有预算消费者重启后同源读取；
+`reprioritize` 的 pin/boost/suppress 由 StateStore 在 selection 提交时机械执行并另记实际效果。
+`goal_amend` 在 reasoning-only 路由闭合前仍**不得标 consumed**：precheck 会把它终态 rejected，避免
 “状态显示已应用、实际上无效果”的假控制面。
 
 **P1**：query/reply/ACK 不写 decision；人机原文只在 interaction_*。
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 from typing import Any, Callable, Dict, Optional
@@ -42,6 +44,7 @@ from typing import Any, Callable, Dict, Optional
 from .ids import cnum as _cnum
 from .interaction import InteractionIngest
 from .resource_limits import MAX_REASONING_DIRECTIVES_PER_CYCLE
+from .runtime_control import apply_budget_patch, effective_budget_config
 from .writedaemon import WriteDaemon
 
 # 指令词表：kind → (触发词, hardness, consume_at)。§4.6.4 表逐行对齐。
@@ -51,7 +54,8 @@ _DIRECTIVE_RULES = [
     ("abort_cycle",     ("中止本轮", "中止当前轮", "abort"),     "hard", "immediate"),
     ("set_budget",      ("预算", "budget"),                      "hard", "stage_boundary"),
     ("inject_question", ("注入问题", "加个问题", "inject"),      "soft", "reasoning_start"),
-    ("reprioritize",    ("优先", "pin", "降权", "提权"),         "soft", "reasoning_start"),
+    ("reprioritize",    ("优先", "pin", "boost", "suppress", "降权", "提权"),
+                                                                  "soft", "reasoning_start"),
     ("prune_branch",    ("剪枝", "砍掉", "prune"),               "hard", "reasoning_start"),
     ("goal_amend",      ("改目标", "修订目标", "goal amend"),    "hard", "reasoning_start"),
     ("note",            ("备注", "note:", "注："),               "soft", "reasoning_start"),
@@ -60,6 +64,15 @@ _DIRECTIVE_RULES = [
 # 若据此归 query 会被静默只读作答而非进澄清环（保守铁律：宁 unclear 勿误 query）。
 _QUERY_HINTS = ("现状", "进展", "进度", "状态", "结果", "为什么", "什么", "多少", "哪",
                 "status", "why", "what", "how")
+
+_NUMBER = r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+))(?:[eE][+-]?[0-9]+)?"
+_QREF_RE = re.compile(r"(?<![0-9A-Za-z])[qQ]([1-9][0-9]*)(?![0-9A-Za-z])")
+_BUDGET_FIELD_PATTERNS = (
+    ("doubling_period_m", re.compile(rf"(?i)(?:doubling_period_m|doubling[_ -]?period|翻倍周期)\s*[:=]?\s*({_NUMBER})")),
+    ("B_max", re.compile(rf"(?i)(?:B_max|Bmax|单轮上限)\s*[:=]?\s*({_NUMBER})")),
+    ("B0", re.compile(rf"(?i)(?:B0|单轮初始)\s*[:=]?\s*({_NUMBER})")),
+    ("session_max", re.compile(rf"(?i)(?:session_max|session[_ -]?budget|总预算|预算上限|预算)\s*[:=]?\s*({_NUMBER})")),
+)
 
 # console HTTP/spool 的 operation domain 必须进入权威 append-only message；只留在 JSONL 会在 cursor
 # 丢失/跨端点 nonce 复用时失去判别力。复用冻结 DDL 的 session_ref，不新增 migration。
@@ -99,28 +112,143 @@ def _hit(low: str, w: str) -> bool:
     return w in low
 
 
+def _json_object_suffix(text: str) -> Optional[Dict[str, Any]]:
+    """Parse an explicit JSON object suffix, if present; malformed JSON is an application error, not a guess."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        value = json.loads(text[start:])
+    except json.JSONDecodeError as error:
+        raise ValueError(f"JSON 参数非法: {error.msg}") from error
+    if not isinstance(value, dict):
+        raise ValueError("JSON 参数须为 object")
+    return value
+
+
+def _parse_budget_patch(text: str) -> Dict[str, Any]:
+    """Conservative deterministic grammar for a live budget command.
+
+    Accepted forms include ``设置预算 50``, named fields such as
+    ``B0=5 B_max=20`` and an explicit JSON object.  No unit conversion or
+    inferred field other than the common single ``预算 <n>`` → session ceiling
+    shorthand is performed.
+    """
+    explicit = _json_object_suffix(text)
+    if explicit is not None:
+        return explicit
+    patch: Dict[str, Any] = {}
+    for name, pattern in _BUDGET_FIELD_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        raw = match.group(1)
+        try:
+            number = float(raw)
+        except (OverflowError, ValueError) as error:
+            raise ValueError(f"{name} 数值非法: {raw!r}") from error
+        if not math.isfinite(number):
+            raise ValueError(f"{name} 须为有限数字")
+        if name == "doubling_period_m":
+            if not number.is_integer():
+                raise ValueError("doubling_period_m 须为正整数")
+            patch[name] = int(number)
+        else:
+            patch[name] = number
+    if not patch:
+        raise ValueError("未识别预算值；请用“设置预算 50”或显式字段/JSON")
+    return patch
+
+
+def _parse_reprioritize(text: str) -> Dict[str, Any]:
+    """Parse pin/boost/suppress without inventing a target or adjustment."""
+    low = text.lower()
+    qmatch = _QREF_RE.search(text)
+    if qmatch is None:
+        raise ValueError("reprioritize 缺 question_id（例如 q17）")
+    question_id = f"q{qmatch.group(1)}"
+    if _hit(low, "pin") or "固定优先" in low or (
+            "优先" in low and not any(word in low for word in ("提权", "降权", "boost", "suppress"))):
+        return {"mode": "pin", "question_id": question_id}
+    if _hit(low, "suppress") or "降权" in low:
+        mode = "suppress"
+    elif _hit(low, "boost") or "提权" in low:
+        mode = "boost"
+    else:
+        raise ValueError("reprioritize 须明确 pin / boost(提权) / suppress(降权)")
+
+    # Remove qN before looking for the magnitude so the question id itself can
+    # never be mistaken for an adjustment.
+    without_q = text[:qmatch.start()] + text[qmatch.end():]
+    explicit = re.search(rf"(?i)adjust\s*[:=]\s*({_NUMBER})", without_q)
+    numbers = re.findall(_NUMBER, without_q) if explicit is None else []
+    if explicit is None and len(numbers) > 1:
+        raise ValueError(f"{mode} 出现多个数值；请用 adjust=<数值> 明确调整量")
+    raw = explicit.group(1) if explicit is not None else (numbers[0] if numbers else None)
+    if raw is None:
+        raise ValueError(f"{mode} 缺调整量（例如 {mode} {question_id} 0.25）")
+    try:
+        magnitude = abs(float(raw))
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"reprioritize 调整量非法: {raw!r}") from error
+    if not math.isfinite(magnitude) or magnitude <= 0:
+        raise ValueError("reprioritize 调整量须为有限正数")
+    return {"mode": mode, "question_id": question_id,
+            "adjust": magnitude if mode == "boost" else -magnitude}
+
+
 class KeywordClassifier:
     """廉价关键词保守分类（确定性）。返回 {intent, kind?, hardness?, consume_at?, polished?}。"""
 
     def classify(self, message: Dict[str, Any]) -> Dict[str, Any]:
         text = sanitize(str(message.get("raw_text", "")))
         low = text.lower()
+        explicit_budget_fields = any(pattern.search(text) is not None
+                                     for _, pattern in _BUDGET_FIELD_PATTERNS)
+        budget_query = any(phrase in low for phrase in (
+            "预算多少", "预算还剩", "剩余预算", "当前预算", "预算状态", "budget status", "remaining budget"))
+        budget_mutation = any(phrase in low for phrase in (
+            "设置", "调整", "改为", "提高", "降低", "set budget", "change budget", "adjust budget"))
+        if budget_query and not budget_mutation:
+            return {"intent": "query"}
         for kind, words, hardness, consume_at in _DIRECTIVE_RULES:
-            if any(_hit(low, w) for w in words):
+            if (kind == "set_budget" and explicit_budget_fields) or any(_hit(low, w) for w in words):
+                structured: Dict[str, Any] = {}
+                parse_error = None
+                try:
+                    if kind == "set_budget":
+                        structured["budget_patch"] = _parse_budget_patch(text)
+                    elif kind == "reprioritize":
+                        structured.update(_parse_reprioritize(text))
+                except ValueError as error:
+                    parse_error = str(error)
+                    structured["parse_error"] = parse_error
+                pin_wording = (kind == "reprioritize" and (
+                    structured.get("mode") == "pin" or _hit(low, "pin")
+                    or ("优先" in low and not any(
+                        word in low for word in ("提权", "降权", "boost", "suppress")))))
+                if pin_wording:
+                    hardness = "hard"                  # reference: pin hard; boost/suppress soft
+                if structured and parse_error is None:
+                    polished = f"[{kind}] " + json.dumps(
+                        structured, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                else:
+                    polished = f"[{kind}] {text.strip()}"
                 # note 是 DDL 独立 intent（分类行 directive_id 必空）；其余指令词 → directive
                 return {"intent": "note" if kind == "note" else "directive",
                         "kind": kind, "hardness": hardness, "consume_at": consume_at,
-                        "polished": f"[{kind}] {text.strip()}"}   # 润色=规范化表述（真 Codex 润色=M6，确定性先行）
+                        "polished": polished, "structured": structured}
         if any(_hit(low, h) for h in _QUERY_HINTS) and text.strip():
             return {"intent": "query"}
         return {"intent": "unclear"}          # 词表未命中 → 不猜（保守铁律：绝不静默当 query/directive）
 
 
 class Console:
-    def __init__(self, daemon: WriteDaemon, classifier=None):
+    def __init__(self, daemon: WriteDaemon, classifier=None, policy: Optional[Dict[str, Any]] = None):
         self.daemon = daemon
         self.ingest = InteractionIngest(daemon)
         self.classifier = classifier or KeywordClassifier()
+        self.policy = policy
 
     # ---------------------------------------------------------------- 入站 --
     def handle_inbound(self, *, connector: str, raw_text: str, idempotency_key: str,
@@ -148,6 +276,13 @@ class Console:
         if ex:                                 # 幂等重放：分类恰一（UNIQUE），返回既有
             return ex
         c = self.classifier.classify({"raw_text": raw_text})
+        if (c.get("kind") == "set_budget"
+                and (self.policy is None or not isinstance(self.policy.get("budget"), dict))):
+            # A Console assembled without the versioned policy is intentionally
+            # useful for protocol/ingest diagnostics, but must not advertise a
+            # budget mutation that it cannot turn into a durable complete
+            # projection.  Production build_system always supplies the policy.
+            c = {"intent": "unclear"}
         ci = _cnum(cycle_id) if cycle_id else None
         try:
             with self.daemon.transaction() as conn:
@@ -158,6 +293,14 @@ class Console:
                     payload = {"polished": c.get("polished", sanitize(raw_text)),
                                "confirmed": hardness != "hard",     # 软指令免确认；硬指令须回显确认后置 true
                                "classifier": "keyword-v1"}
+                    structured = c.get("structured") or {}
+                    if not isinstance(structured, dict):
+                        raise ValueError("classifier.structured 须为 object")
+                    reserved = set(structured) & {"polished", "confirmed", "classifier",
+                                                   "confirmation_message_id"}
+                    if reserved:
+                        raise ValueError(f"classifier.structured 不得覆盖 directive 控制字段: {sorted(reserved)}")
+                    payload.update(structured)
                     did = conn.execute(
                         "INSERT INTO directive(kind,hardness,status,consume_at,payload_json,created_cycle,"
                         "source_interaction_message_id) VALUES (?,?,'pending',?,?,?,?)",
@@ -253,6 +396,15 @@ class Console:
                              (json.dumps(payload, ensure_ascii=False), directive_id)).rowcount
             if n != 1:        # 兜底同 consume（同事务已校验，理论不可达）
                 raise RuntimeError(f"directive {directive_id} 确认竞态：更新失败")
+            if payload.get("mode") == "pin":
+                # Only a *confirmed* newer hard pin is an effective ordering
+                # intent.  Inbound-but-unconfirmed text has no state effect and
+                # therefore cannot erase an older confirmed command.
+                conn.execute(
+                    "UPDATE directive SET status='superseded' WHERE id<? "
+                    "AND kind='reprioritize' AND hardness='hard' AND status='pending' "
+                    "AND json_extract(payload_json,'$.mode')='pin'",
+                    (directive_id,))
 
     def reject_directive(self, *, directive_id: int, reason: str, reject_message_id: Optional[int] = None,
                          by_decision: bool = False, cycle_id: Optional[str] = None) -> None:
@@ -367,7 +519,7 @@ class Console:
             payload = json.loads(payload_raw)
             if hardness == "hard" and not payload.get("confirmed"):
                 raise ValueError(f"硬指令 {directive_id}（{kind}）未经回显确认，不可消费（§4.6.2 润色确认硬门）")
-            if kind in ("set_budget", "reprioritize", "goal_amend"):
+            if kind == "goal_amend":
                 raise DirectiveApplicationError(
                     f"{kind} 尚未接入其 reference 要求的真实状态语义，拒绝伪装为已应用")
             # Only reasoning_start directives are compiled into this cycle's reasoning pack.  Operational
@@ -384,7 +536,71 @@ class Console:
                         f"{MAX_REASONING_DIRECTIVES_PER_CYCLE}；本条未执行")
             effect: Dict[str, Any] = {"kind": kind}
             dec = None            # prune_branch 复用其 prune 决策为消费决策（一次消费恰一条人类决策）
-            if kind == "inject_question":
+            budget_stop = None
+            if kind == "set_budget":
+                if self.policy is None or not isinstance(self.policy.get("budget"), dict):
+                    raise DirectiveApplicationError("set_budget 未装配启动 policy，不能构造耐久有效预算")
+                if payload.get("parse_error"):
+                    raise DirectiveApplicationError(f"set_budget 参数未解析: {payload['parse_error']}")
+                if conn.execute(
+                        "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' LIMIT 1"
+                ).fetchone() is not None:
+                    raise DirectiveApplicationError("系统已有 durable global_stop；set_budget 不具备撤销停机语义")
+                try:
+                    previous = effective_budget_config(conn, self.policy["budget"])
+                    budget = apply_budget_patch(previous, payload.get("budget_patch"))
+                except (TypeError, ValueError, RuntimeError) as error:
+                    raise DirectiveApplicationError(str(error)) from error
+                spent = float(conn.execute("SELECT COALESCE(SUM(money),0) FROM ledger").fetchone()[0])
+                effect.update({"previous_budget": previous, "budget": budget,
+                               "global_spent": spent})
+                if budget["session_max"] is not None and spent >= budget["session_max"]:
+                    budget_stop = {"reason": "budget_exhausted", "spent": spent,
+                                   "session_max": budget["session_max"],
+                                   "trigger": "directive_set_budget"}
+                    effect["global_stop"] = budget_stop
+            elif kind == "reprioritize":
+                if payload.get("parse_error"):
+                    raise DirectiveApplicationError(f"reprioritize 参数未解析: {payload['parse_error']}")
+                mode = payload.get("mode")
+                qref = payload.get("question_id")
+                if mode not in ("pin", "boost", "suppress") or not qref:
+                    raise DirectiveApplicationError("reprioritize 缺合法 mode/question_id")
+                try:
+                    qi = int(str(qref)[1:]) if str(qref).lower().startswith("q") else int(qref)
+                except (TypeError, ValueError, OverflowError):
+                    raise DirectiveApplicationError(f"reprioritize question_id 非法: {qref!r}") from None
+                if qi <= 0 or qi > (1 << 63) - 1:
+                    raise DirectiveApplicationError(f"reprioritize question_id 超出 SQLite 正整数范围: {qref!r}")
+                qrow = conn.execute(
+                    "SELECT status FROM question WHERE id=? AND NOT EXISTS ("
+                    "SELECT 1 FROM question_dep WHERE question_id=? AND status='pending')",
+                    (qi, qi)).fetchone()
+                is_current_active = bool(qrow and qrow[0] == "active" and ci is not None
+                                         and conn.execute(
+                                             "SELECT 1 FROM cycle WHERE id=? AND active_question_id=? "
+                                             "AND status NOT IN ('done','failed','aborted')",
+                                             (ci, qi)).fetchone())
+                if qrow is None or (qrow[0] not in ("open", "inconclusive")
+                                    and not is_current_active):
+                    raise DirectiveApplicationError(
+                        "reprioritize 目标须为无 pending 依赖的 open/inconclusive 问题，"
+                        f"或当前 cycle 的 active Qn: q{qi}")
+                effect.update({"mode": mode, "question_id": f"q{qi}",
+                               "applies_to_reasoning_cycle": cycle_id})
+                if mode == "pin":
+                    if hardness != "hard":
+                        raise DirectiveApplicationError("reprioritize pin 必须是 hard directive")
+                else:
+                    if hardness != "soft":
+                        raise DirectiveApplicationError(f"reprioritize {mode} 必须是 soft directive")
+                    adjust = payload.get("adjust")
+                    if (isinstance(adjust, bool) or not isinstance(adjust, (int, float))
+                            or not math.isfinite(float(adjust)) or adjust == 0
+                            or (mode == "boost") != (adjust > 0)):
+                        raise DirectiveApplicationError(f"reprioritize {mode} 缺合法有符号 adjust")
+                    effect["adjust"] = float(adjust)
+            elif kind == "inject_question":
                 # goal_id=1 + MAX(version) = 全库单目标约定（statestore/advancer 同口径）；多目标=系统级改造
                 if conn.execute("SELECT 1 FROM goal WHERE id=1 LIMIT 1").fetchone() is None:
                     raise DirectiveApplicationError("inject_question 时当前 goal 不存在")
@@ -450,6 +666,11 @@ class Console:
                                    (ci, directive_id, f"directive_{kind}",
                                     json.dumps({"effect": effect, "polished": payload.get("polished")},
                                                ensure_ascii=False))).lastrowid
+            if budget_stop is not None:
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'orchestrator','global_stop',?)",
+                    (ci, json.dumps(budget_stop, ensure_ascii=False)))
             claimed = conn.execute("UPDATE directive SET status='consumed', consumed_cycle=?, consumed_decision_id=? "
                                    "WHERE id=? AND status='pending'", (ci, dec, directive_id)).rowcount
             if claimed != 1:      # 理论不可达（同事务已校验+单写串行）；兜底防未来改动引入窗口

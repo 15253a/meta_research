@@ -18,11 +18,13 @@ driver / Gate 的既有契约一致，未来 InMemory→SQLite 可透明替换�
 from __future__ import annotations
 
 import json
+import math
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from .ids import decode as _bounded_decode, decode_optional as _bounded_decode_optional
 from .interfaces import InvalidSelectionError, Cycle, Route, Selection
+from .budgeting import compute_budget
 from .writedaemon import WriteDaemon
 
 _TERMINAL_Q = {"answered", "refuted", "dead_end"}
@@ -316,32 +318,232 @@ class SQLiteStateStore:
         if sel.next_intent not in ("attack", "decompose", "terminate"):
             raise InvalidSelectionError(f"next_intent 非法: {sel.next_intent}")
         next_qid = self._resolve_local(cycle_id, sel.next_question_id)
+        next_intent = sel.next_intent
+
+        # Resolve and validate the whole score batch before applying the human
+        # priority overlay.  The overlay is deterministic and durable: hard pin
+        # chooses its target; soft boost/suppress replaces the model-proposed
+        # directive_adjust and re-ranks the scored frontier.  This keeps the
+        # orchestrator from merely *showing* reprioritize in a prompt while
+        # accepting an unrelated selection.
+        resolved_scores = []
+        seen_score_ids = set()
+        for original in sel.scores:
+            row = dict(original)
+            ri = _qnum_opt(self._resolve_local(cycle_id, row.get("question_id")))
+            if ri is None or self._q1("SELECT 1 FROM question WHERE id=?", (ri,)) is None:
+                raise InvalidSelectionError(f"scores 引用的问题不存在: {row.get('question_id')}（不静默丢弃）")
+            if ri in seen_score_ids:
+                raise InvalidSelectionError(f"scores 重复引用问题 q{ri}")
+            seen_score_ids.add(ri)
+            missing = [field for field in ("score", "est_cost") if field not in row]
+            if missing:
+                raise InvalidSelectionError(f"scores.q{ri} 缺必填字段: {missing}")
+            for field in ("score", "est_cost", "directive_adjust"):
+                if field not in row:
+                    continue
+                value = row[field]
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))):
+                    raise InvalidSelectionError(f"scores.q{ri}.{field} 须为有限数字")
+                if field == "est_cost" and value < 0:
+                    raise InvalidSelectionError(f"scores.q{ri}.est_cost 不得为负")
+            resolved_scores.append((row, ri))
+
+        next_qid, next_intent, resolved_scores, priority_audit = self._apply_reprioritize(
+            cycle_id, next_qid, next_intent, resolved_scores)
         next_int = _qnum_opt(next_qid)     # 未解析 local_key / 畸形 id → None → 走干净「不存在」拒因
-        if sel.next_intent == "terminate":
+        if next_intent == "terminate":
             if next_qid is not None:
                 raise InvalidSelectionError("terminate 时 next_question_id 必须为 null")
         else:
             if next_int is None or self._q1("SELECT 1 FROM question WHERE id=?", (next_int,)) is None:
                 raise InvalidSelectionError(f"next_question_id 缺失或不存在: {sel.next_question_id}")
-            if not self.is_schedulable(next_qid, for_intent=sel.next_intent):
+            if not self.is_schedulable(next_qid, for_intent=next_intent):
                 raise InvalidSelectionError(f"目标问题不可调度: {next_qid}")
-        # 先纯读解析/校验整批 score ref，再做任何 UPDATE。persist_selection_safe 会把
-        # InvalidSelectionError 转成 terminate；若边写边校验，「首个合法 score + 后一个越界 id」
-        # 会在同一外层 atomic 中吞掉异常并提交首个半写。预检不执行状态变更，也不是双执行。
-        resolved_scores = []
-        for row in sel.scores:
-            ri = _qnum_opt(self._resolve_local(cycle_id, row.get("question_id")))
-            if ri is None or self._q1("SELECT 1 FROM question WHERE id=?", (ri,)) is None:
-                raise InvalidSelectionError(f"scores 引用的问题不存在: {row.get('question_id')}（不静默丢弃）")
-            resolved_scores.append((row, ri))
         with self._write() as conn:
-            for row, ri in resolved_scores:   # 唯一维护点：写回 question.score/est_cost（local_key 同样解析）
-                if "est_cost" in row:   # 显式提供（含 null）才改；缺省保留旧值（对齐 InMemory row.get 语义）
-                    conn.execute("UPDATE question SET score=?, est_cost=? WHERE id=?", (row.get("score"), row["est_cost"], ri))
-                else:
-                    conn.execute("UPDATE question SET score=? WHERE id=?", (row.get("score"), ri))
+            for row, ri in resolved_scores:   # schema 要求二者必填；此处是唯一写回点（local_key 同样解析）
+                conn.execute(
+                    "UPDATE question SET score=?, est_cost=? WHERE id=?",
+                    (row["score"], row["est_cost"], ri))
+            for directive_id, decision_type, payload in priority_audit:
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+                    "VALUES (?,?,'orchestrator',?,?)",
+                    (_cnum(cycle_id), directive_id, decision_type,
+                     json.dumps(payload, ensure_ascii=False)))
+                if decision_type == "soft_directive_declined":
+                    directive_row = conn.execute(
+                        "SELECT payload_json FROM directive WHERE id=? AND status='consumed'",
+                        (directive_id,)).fetchone()
+                    if directive_row is None:
+                        raise RuntimeError(
+                            f"soft reprioritize d{directive_id} 不在 consumed 状态，无法原子拒绝")
+                    directive_payload = json.loads(directive_row[0])
+                    directive_payload["rejection_reason"] = payload["reason"]
+                    directive_payload["rejection_kind"] = "soft_directive_declined"
+                    changed = conn.execute(
+                        "UPDATE directive SET status='rejected',payload_json=? "
+                        "WHERE id=? AND status='consumed'",
+                        (json.dumps(directive_payload, ensure_ascii=False), directive_id)).rowcount
+                    if changed != 1:
+                        raise RuntimeError(f"soft reprioritize d{directive_id} 拒绝迁移竞态")
             conn.execute("UPDATE cycle SET next_question_id=?, next_intent=? WHERE id=?",
-                         (next_int, sel.next_intent, _cnum(cycle_id)))
+                         (next_int, next_intent, _cnum(cycle_id)))
+
+    def _apply_reprioritize(self, cycle_id: str, next_qid: Optional[str], next_intent: str,
+                            resolved_scores):
+        """Apply consumed reprioritize controls to a selection projection.
+
+        Returns ``(next_qid, next_intent, scores, audit_decisions)``.  The
+        actual DB writes remain in ``persist_selection``'s one write scope so a
+        crash cannot commit an audit decision without the normalized scores and
+        selected target (or vice versa).
+        """
+        ci = _cnum(cycle_id)
+        rows = self._qall(
+            "SELECT id,hardness,payload_json FROM directive WHERE kind='reprioritize' "
+            "AND status='consumed' AND consumed_cycle=? ORDER BY id", (ci,))
+        if not rows:
+            return next_qid, next_intent, resolved_scores, []
+
+        by_qid = {ri: row for row, ri in resolved_scores}
+        soft_by_qid: Dict[int, list] = {}
+        pin = None
+        for directive_id, hardness, payload_raw in rows:
+            try:
+                payload = json.loads(payload_raw)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"reprioritize d{directive_id} payload_json 损坏") from error
+            mode = payload.get("mode")
+            qi = _qnum_opt(payload.get("question_id"))
+            if qi is None:
+                raise RuntimeError(f"已消费 reprioritize d{directive_id} 缺合法 question_id")
+            if mode == "pin":
+                if hardness != "hard":
+                    raise RuntimeError(f"已消费 reprioritize pin d{directive_id} 非 hard")
+                if pin is not None:
+                    raise RuntimeError(
+                        f"cycle {cycle_id} 同时消费多个 hard pin: d{pin[0]}, d{directive_id}")
+                pin = (directive_id, qi)
+            elif mode in ("boost", "suppress"):
+                adjust = payload.get("adjust")
+                if (hardness != "soft" or isinstance(adjust, bool)
+                        or not isinstance(adjust, (int, float))
+                        or not math.isfinite(float(adjust)) or adjust == 0
+                        or (mode == "boost") != (adjust > 0)):
+                    raise RuntimeError(f"已消费 reprioritize d{directive_id} 的 {mode}/adjust 契约损坏")
+                soft_by_qid.setdefault(qi, []).append((directive_id, float(adjust)))
+            else:
+                raise RuntimeError(f"已消费 reprioritize d{directive_id} mode 非法: {mode!r}")
+
+        audit = []
+        soft_applied = False
+        for qi, controls in soft_by_qid.items():
+            row = by_qid.get(qi)
+            if row is None:
+                reason = f"selection.scores 未包含 q{qi}，无法安全计算 directive_adjust"
+                for directive_id, _ in controls:
+                    audit.append((directive_id, "soft_directive_declined", {"reason": reason}))
+                continue
+            actual = float(row.get("directive_adjust", 0.0))
+            requested = sum(adjust for _, adjust in controls)
+            row["score"] = float(row["score"]) - actual + requested
+            row["directive_adjust"] = requested
+            soft_applied = True
+            for directive_id, adjust in controls:
+                audit.append((directive_id, "reprioritize_applied", {
+                    "question_id": f"q{qi}", "adjust": adjust,
+                    "aggregate_adjust": requested, "normalized_score": row["score"],
+                }))
+
+        # Soft priority changes the ranking but never overrides an explicit
+        # terminate.  All scored, currently schedulable rows participate; ties
+        # use the stable question id.
+        if soft_applied and next_intent != "terminate":
+            candidates = [
+                (float(row["score"]), -ri, ri, row)
+                for row, ri in resolved_scores
+                if (self.is_schedulable(f"q{ri}", for_intent="attack")
+                    or self.is_schedulable(f"q{ri}", for_intent="decompose"))
+            ]
+            if candidates:
+                _, _, selected, selected_row = max(candidates)
+                if f"q{selected}" != next_qid:
+                    next_qid = f"q{selected}"
+                    next_intent = self._intent_for_est_cost(next_qid, selected_row.get("est_cost"))
+
+        if pin is not None:
+            directive_id, qi = pin
+            if not (self.is_schedulable(f"q{qi}", for_intent="attack")
+                    or self.is_schedulable(f"q{qi}", for_intent="decompose")):
+                raise InvalidSelectionError(f"hard pin d{directive_id} 的目标 q{qi} 已不可调度")
+            next_qid = f"q{qi}"
+            score_row = by_qid.get(qi)
+            est_cost = (score_row.get("est_cost") if score_row is not None else
+                        self._q1("SELECT est_cost FROM question WHERE id=?", (qi,))[0])
+            next_intent = self._intent_for_est_cost(next_qid, est_cost)
+            audit.append((directive_id, "reprioritize_enforced", {
+                "question_id": next_qid, "next_intent": next_intent,
+                "source": "hard_pin",
+            }))
+        return next_qid, next_intent, resolved_scores, audit
+
+    def _intent_for_est_cost(self, question_id: str, est_cost: Any) -> str:
+        """Reference R3's cost split, constrained by the target's live guards."""
+        if (isinstance(est_cost, bool) or not isinstance(est_cost, (int, float))
+                or not math.isfinite(float(est_cost)) or est_cost < 0):
+            # A hard pin with no trustworthy cost must not silently launch an
+            # unbudgeted attack; decomposition is the conservative route.
+            preferred = "decompose"
+        else:
+            threshold = self.policy["flow"]["decompose_threshold"]
+            budget = compute_budget(self._rconn(), self.policy["budget"])
+            preferred = ("attack" if float(est_cost) <= float(threshold) * budget
+                         else "decompose")
+        alternate = "decompose" if preferred == "attack" else "attack"
+        if self.is_schedulable(question_id, for_intent=preferred):
+            return preferred
+        if self.is_schedulable(question_id, for_intent=alternate):
+            return alternate
+        # The caller performs the authoritative schedulability validation and
+        # will reject this selection.  Returning the deterministic preference
+        # here preserves a useful error path without inventing a third route.
+        return preferred
+
+    def reject_unapplied_reprioritize(self, cycle_id: str, reason: str) -> None:
+        """Terminalize consumed priority controls when the cycle cannot persist a selection.
+
+        Attack's no-wedge fallback converts an invalid external selection into a
+        durable terminate.  Without this companion transition, a reprioritize
+        consumed just before that selection would remain forever in a false
+        "pending actual effect" state.
+        """
+        ci = _cnum(cycle_id)
+        bounded_reason = str(reason)[:2_000]
+        with self._write() as conn:
+            rows = conn.execute(
+                "SELECT x.id,x.payload_json FROM directive x WHERE x.kind='reprioritize' "
+                "AND x.status='consumed' AND x.consumed_cycle=? AND NOT EXISTS ("
+                "SELECT 1 FROM decision d WHERE d.directive_id=x.id "
+                "AND d.type IN ('reprioritize_applied','reprioritize_enforced',"
+                "'soft_directive_declined','directive_application_rejected')) ORDER BY x.id",
+                (ci,)).fetchall()
+            for directive_id, payload_raw in rows:
+                payload = json.loads(payload_raw)
+                payload["rejection_reason"] = bounded_reason
+                payload["rejection_kind"] = "selection_invalid"
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+                    "VALUES (?,?,'orchestrator','directive_application_rejected',?)",
+                    (ci, directive_id,
+                     json.dumps({"reason": bounded_reason}, ensure_ascii=False)))
+                changed = conn.execute(
+                    "UPDATE directive SET status='rejected',payload_json=? "
+                    "WHERE id=? AND status='consumed'",
+                    (json.dumps(payload, ensure_ascii=False), directive_id)).rowcount
+                if changed != 1:
+                    raise RuntimeError(f"reprioritize d{directive_id} 终态拒绝竞态")
 
     # -- 七 op 树操作（单事务原子；§4.2.4 封闭词表 / §4.2.5 原子性） --------------
     def apply_tree_ops(self, cycle_id: str, ops: List[Dict[str, Any]]) -> None:

@@ -12,7 +12,7 @@
 - `insert_ledger_for_runner(...)`：JudgeProvider 在其现有短 txn 内调用，使最终有效裁决的
   runner_call + ledger + DECISION 同生共死；`record_ledger_only(...)` 保留给已有 runner_call 的独立补账。
 
-**预算启用时 fail-closed**：`session_max != null` 表示成本护栏是运行契约，任何记账失败都必须中止推进，不能
+**预算启用时 fail-closed**：最新耐久预算投影的 `session_max != null` 表示成本护栏是运行契约，任何记账失败都必须中止推进，不能
 继续制造不可见成本；只有明确以 `session_max=null` 关闭护栏时，调用方才可 best-effort 记录。
 ledger append-only（DDL 触发器）→ 累计靠新 INSERT，本类只 INSERT、从不 UPDATE。
 """
@@ -25,6 +25,8 @@ from typing import Any, Optional
 
 from .ids import cnum as _cnum
 from .interfaces import CallUsage
+from .runtime_control import (effective_budget_config, policy_with_effective_budget,
+                              validate_budget_config)
 
 _SQLITE_INT_MAX = (1 << 63) - 1
 
@@ -61,6 +63,8 @@ class CostLedger:
 
     def __init__(self, daemon, policy: dict):
         self.daemon = daemon
+        self.policy = policy
+        self._base_budget = dict(policy.get("budget") or {})
         cfg = self.validate_policy(policy)
         self.budget_enabled = cfg["budget_enabled"]
         self.session_max = cfg["session_max"]
@@ -100,10 +104,11 @@ class CostLedger:
         return {"budget_enabled": budget_enabled, "session_max": session_max,
                 "price_per_1k": price_per_1k, "policy_version": policy_fingerprint(policy)}
 
-    def money_for(self, usage: Optional[CallUsage]) -> float:
+    def money_for(self, usage: Optional[CallUsage], *, budget_enabled: Optional[bool] = None) -> float:
         """token → money。未知用量：预算开启时拒绝，显式关闭时才按 0 best-effort。"""
         u = self._validated_usage(usage)
-        if self.budget_enabled and not u.tokens_known:
+        enabled = self.budget_enabled if budget_enabled is None else budget_enabled
+        if enabled and not u.tokens_known:
             raise ValueError("token 汇总未知，预算启用时不能按真 0 记账")
         try:
             money = (u.tokens_total / 1000.0) * self.price_per_1k
@@ -191,7 +196,10 @@ class CostLedger:
         原记账事务已回滚，故这里单独写一条 failed runner_call（无伪造 ledger 金额）与
         global_stop。若 DB 本身不可写，保留原异常 fail loud，不伪称已持久停机。
         """
-        if not self.budget_enabled:
+        effective = (effective_budget_config(
+            self.daemon.conn, self._base_budget, require_schedule=False)
+            if self.daemon is not None else self._base_budget)
+        if effective.get("session_max") is None:
             raise cause
         ci = _cnum(cycle_id) if cycle_id is not None else None
         try:
@@ -224,26 +232,38 @@ class CostLedger:
         if conn.execute("SELECT 1 FROM ledger WHERE runner_call_id=? LIMIT 1",
                         (runner_call_id,)).fetchone() is not None:
             raise RuntimeError(f"runner_call {runner_call_id} 已有 ledger，拒绝重复记账")
+        effective = effective_budget_config(conn, self._base_budget, require_schedule=False)
+        budget_enabled = effective["session_max"] is not None
         u = self._validated_usage(usage)
-        money = self.money_for(u)
+        money = self.money_for(u, budget_enabled=budget_enabled)
+        # Preserve the historical base-policy fingerprint byte-for-byte until a
+        # live override actually changes the projection; numeric normalization
+        # alone (100000 -> 100000.0) must not fork ledger identity.
+        policy_version = (self.policy_version
+                          if effective == validate_budget_config(
+                              self._base_budget, require_schedule=False)
+                          else policy_fingerprint(policy_with_effective_budget(self.policy, effective)))
         cur = conn.execute(
             "INSERT INTO ledger(cycle_id,phase,runner_call_id,tokens_input,tokens_output,tokens_total,"
             "wallclock_sec,money,policy_version) "
             "SELECT cycle_id, phase, id, ?, ?, ?, ?, ?, ? FROM runner_call WHERE id=?",
             (u.tokens_input, u.tokens_output, u.tokens_total, u.wallclock_sec,
-             money, self.policy_version, runner_call_id))
+             money, policy_version, runner_call_id))
         if cur.rowcount != 1:
             raise RuntimeError(f"runner_call {runner_call_id} 不存在，ledger 未写入")
-        return self._record_budget_stop_if_needed(conn)
+        return self._record_budget_stop_if_needed(conn, effective)
 
-    def _record_budget_stop_if_needed(self, conn: Any) -> Optional[dict]:
+    def _record_budget_stop_if_needed(self, conn: Any, effective_budget: Optional[dict] = None) -> Optional[dict]:
         """在 ledger 写事务内检查累计并幂等落 global_stop；只返回命中，绝不在事务内抛。"""
-        if not self.budget_enabled:
+        budget = effective_budget or effective_budget_config(
+            conn, self._base_budget, require_schedule=False)
+        session_max = budget["session_max"]
+        if session_max is None:
             return None
         spent = conn.execute("SELECT COALESCE(SUM(money),0) FROM ledger").fetchone()[0]
-        if spent < self.session_max:
+        if spent < session_max:
             return None
-        hit = {"spent": spent, "session_max": self.session_max}
+        hit = {"spent": spent, "session_max": session_max}
         if conn.execute("SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' "
                         "LIMIT 1").fetchone() is None:
             conn.execute(

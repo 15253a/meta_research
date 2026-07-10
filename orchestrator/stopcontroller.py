@@ -11,8 +11,9 @@ terminate 时无限空转。本控制器补齐另两条安全网：
   **恢复语义**：进程重启计数归零 = **保守**（只会延后停机，绝不误停/漂移）；一旦真触发即落 durable
   global_stop 决策，重启不再推进（下方 already_stopped）。
 - **判据② ·预算耗尽**：全局成本台账 `ledger.money` 求和（§ ledger 覆盖所有 phase——含 reasoning/Codex
-  调用，是「全局成本」的**唯一权威源**）≥ policy.budget.session_max。DB 派生、恢复安全。session_max=null
-  关闭本条。CostLedger 已把 stage/judge 的成功、失败与非法产物重试落账；单次写账越线会在同一事务
+  调用，是「全局成本」的**唯一权威源**）≥ 最新耐久预算投影的 session_max（无 set_budget 时即
+  policy.budget.session_max）。DB 派生、恢复安全。session_max=null 关闭本条。CostLedger 已把
+  stage/judge 的成功、失败与非法产物重试落账；单次写账越线会在同一事务
   落 durable global_stop，提交后立即阻断同轮后续调用。故不用 run.cost/attempt.cost（那是分执行的局部成本、且漏掉
   reasoning）。
 - **判据③ ·谓词满足**：仍由 provider terminate 走（不在此——它是研究判断，Codex 出；本控制器只管
@@ -33,6 +34,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
+from .runtime_control import effective_budget_config
 from .writedaemon import WriteDaemon
 
 
@@ -42,7 +44,8 @@ class StopController:
         tau = policy.get("flow", {}).get("tau", {})
         self.score_floor = tau.get("score_floor")
         self.consecutive_rounds = tau.get("consecutive_rounds")
-        self.session_max = policy.get("budget", {}).get("session_max")   # None = 关闭预算安全网
+        self._base_budget = dict(policy.get("budget", {}))
+        self.session_max = self._base_budget.get("session_max")   # 向后兼容观测字段；实际检查每次投影 durable override
         self._below_floor_streak = 0                                     # 判据① 进程内连续计数
 
     # ---------------------------------------------------------------- durable --
@@ -65,11 +68,14 @@ class StopController:
 
     # ---------------------------------------------------------------- 判据 --
     def _budget_exhausted(self) -> Optional[Dict[str, Any]]:
-        if self.session_max is None:
+        budget = effective_budget_config(
+            self.daemon.conn, self._base_budget, require_schedule=False)
+        session_max = budget["session_max"]
+        if session_max is None:
             return None
         spent = self.daemon.query_one("SELECT COALESCE(SUM(money),0) FROM ledger")[0]
-        if spent >= self.session_max:
-            return {"reason": "budget_exhausted", "spent": spent, "session_max": self.session_max}
+        if spent >= session_max:
+            return {"reason": "budget_exhausted", "spent": spent, "session_max": session_max}
         return None
 
     def _score_floor_hit(self) -> Optional[Dict[str, Any]]:

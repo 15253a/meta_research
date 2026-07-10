@@ -11,7 +11,8 @@ tmp→rename 覆盖 latest 文件；Mediator/应答器只读该发布快照，�
 
 **字段真源现状**：
   - selection.latest_decision：**已接线（M5 CP6.2）**= 本 cycle 作用域最近 decision 摘要（{id,actor,type}）。
-  - budget.global_remaining：policy 只有单轮 B_max，无全局会话上限（会话级旋钮，非核心 DDL）→ None。
+  - budget：B(t) 与全局上限投影最新已消费 set_budget；花费统一来自 append-only ledger，
+    global_remaining = max(session_max-SUM(ledger), 0)，显式关闭上限时才为 None。
   - heartbeat_ref：heartbeat/outbox 是实现层幂等队列、非核心 DDL（§4.6.2）→ None（CP6.3 outbox 落）。
 
 **纯函数 / 可测**：不调 wall-clock。pending 请求「已等待时长」= 展示时刻 − created_at，由控制台在展示时算；
@@ -25,6 +26,7 @@ from typing import Any, Dict, Optional
 
 from .budgeting import compute_budget
 from .ids import cnum as _cnum
+from .runtime_control import effective_budget_config
 
 
 def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any], goal_body_md: str) -> Dict[str, Any]:
@@ -39,11 +41,11 @@ def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any], goal_body_
     conn.execute("BEGIN")                  # 钉一致读快照（只读，COMMIT 即释放）
     try:
         cyc = conn.execute(
-            "SELECT goal_id, goal_ver, active_question_id, status, route, cost_total, "
+            "SELECT goal_id, goal_ver, active_question_id, status, route, "
             "next_question_id, next_intent FROM cycle WHERE id=?", (ci,)).fetchone()
         if cyc is None:
             raise ValueError(f"cycle 不存在: {cycle_id}")
-        goal_id, goal_ver, aq, cstatus, route, cost_total, next_q, next_intent = cyc
+        goal_id, goal_ver, aq, cstatus, route, next_q, next_intent = cyc
 
         active_question = None
         if aq is not None:
@@ -62,11 +64,19 @@ def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any], goal_body_
             "latest_decision": {"id": ld[0], "actor": ld[1], "type": ld[2]} if ld else None,
         }
 
-        # §4.6.6 预算三元（不多不少）：B(t) / 本轮已花 / 全局剩余
+        # §4.6.6 预算三元（不多不少）：三者统一取 append-only ledger + durable runtime budget
+        # projection。cycle.cost_total 是旧的局部列，漏 reasoning/query 调用，不能再作为人向真相。
+        effective_budget = effective_budget_config(conn, policy["budget"])
+        cycle_spent = float(conn.execute(
+            "SELECT COALESCE(SUM(money),0) FROM ledger WHERE cycle_id=?", (ci,)).fetchone()[0])
+        global_spent = float(conn.execute(
+            "SELECT COALESCE(SUM(money),0) FROM ledger").fetchone()[0])
+        session_max = effective_budget["session_max"]
         budget = {
             "B_t": compute_budget(conn, policy["budget"]),
-            "cycle_spent": float(cost_total),      # 本轮已花 = cycle.cost_total
-            "global_remaining": None,              # M2: 无全局会话上限（会话级旋钮，非核心 DDL）→ 无从算剩余
+            "cycle_spent": cycle_spent,
+            "global_remaining": (None if session_max is None
+                                  else float(max(session_max - global_spent, 0.0))),
         }
 
         counts = {"open": 0, "inconclusive": 0}

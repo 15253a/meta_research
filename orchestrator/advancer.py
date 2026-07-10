@@ -153,6 +153,17 @@ class SqliteAdvancer:
         if self.precheck is None:
             return False
         self.last_block_reason = self.precheck(cyc)
+        # A stage-boundary set_budget can lower the durable ceiling below money
+        # already spent *after* run_cycles' round-start budget check.  Re-read
+        # global_stop here so the same precheck cannot proceed to one extra
+        # Runner call (and so resident mode exits instead of polling forever as
+        # if this were a reversible pause).
+        if self.stop_controller is not None:
+            stopped = self.stop_controller.already_stopped()
+            if stopped is not None:
+                self.last_stop_reason = stopped
+                self.last_block_reason = None
+                return True
         return self.last_block_reason is not None
 
     def _publish_card(self, cycle_id: str) -> None:
