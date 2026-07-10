@@ -15,8 +15,8 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑪ CP11.2b.3d 真实 connector 投递**。CP11.2a/CP11.2a.1 用户文件资产与嵌套树身份已落 `c077cd2`/`3c4c9b4`；
-  CP11.2b.1–2 鉴权耐久控制入口已落 `10215db`，CP11.2b.3a/b/c 动态预算、机械优先级、目标版本控制与只读查询旁路已落 `7f4fd73`/`2dfa653`/`92ecf18`。步①–⑩已完成；步⑪ CP11.1 已完成，CP11.2b.3d/CP11.3/CP11.4 继续。
+- 进行中的步 / 检查点：**步⑪ CP11.2b.3e 真实 connector 入站闭环**。CP11.2a/CP11.2a.1 用户文件资产与嵌套树身份已落 `c077cd2`/`3c4c9b4`；
+  CP11.2b.1–2 鉴权耐久控制入口已落 `10215db`，CP11.2b.3a/b/c/d 动态预算、机械优先级、目标版本控制、只读查询旁路与真实 connector 耐久出站已落 `7f4fd73`/`2dfa653`/`92ecf18`/`6098a69`。步①–⑩已完成；步⑪ CP11.1 已完成，CP11.2b.3e/CP11.3/CP11.4 继续。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -370,6 +370,7 @@
         - [x] CP11.2b.3a 耐久动态预算、预算/账本/状态卡对账与机械 `pin/boost/suppress`；确认前零效果，实际应用/不从/失败均有 decision，重启同源投影。→ commit `7f4fd73`（build_log 0052；相关 234、全量 976；外审两轮上限后全部反馈本地修复）。
         - [x] CP11.2b.3b `goal_amend`：确认 effect 精确绑定不可变目标新版本；专用 reasoning-only route；open/inconclusive 迁移重评，closed answer/evidence 保持出生版本并走 applicability/revalidate；覆盖 route/consume/application 崩溃与竞态恢复。→ commit `2dfa653`（build_log 0053；控制面/调度面 374、全量 992；外审两轮上限后全部反馈本地修复）。
         - [x] CP11.2b.3c 真正只读 Codex query responder：发布卡 facts-only 回复、不同 UID/tool-free 调用、耐久逐会话 FIFO、调用/成本/reply 原子收尾与未知调用失败终态。→ commit `92ecf18`（build_log 0054；唯一一次全量 1055 过/1 败，唯一前端契约失败修复后定向 6/6；外审两次均因账号限额无 verdict）。
-        - [ ] CP11.2b.3d 真实 connector 投递：event_key 幂等、at-least-once 重试与可观测回执。
+        - [x] CP11.2b.3d 真实 connector 耐久出站：`producer_id + event_key` 幂等、queue/retry/receipt at-least-once 收敛、严格 webhook/OneBot ACK、因果 FIFO 与公平调度、worker 健康及诚实 console 投影。→ commit `6098a69`（build_log 0055；相关 239；唯一全量 1105；外审两轮均无 verdict）。
+        - [ ] CP11.2b.3e 真实 connector 入站闭环：webhook/OneBot poll 入站、认证且耐久的 source/conversation 绑定、幂等接入既有 durable interaction spool，并闭合“继续”特殊控制语义。
   - [ ] CP11.3 状态与执行边界：critical/budget_estimate 落库与早退、goal 最新版、orchestrator 单实例锁、超时终止进程组。
   - [ ] CP11.4 残余架构边界：调用意图/回执补账、执行容器/VM 隔离与内容寻址 artifact store 方案化。
