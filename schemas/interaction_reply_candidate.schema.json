@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/interaction_reply_candidate.schema.json",
+  "title": "interaction_reply_candidate",
+  "description": "只读 Codex 中介的事实选择单；模型没有自由回复文本，只能选择发布 status_card 的封闭标量 path 并逐值照抄，编排器交叉核值后构造性渲染回复。",
+  "type": "object",
+  "required": ["facts"],
+  "additionalProperties": false,
+  "properties": {
+    "facts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 24,
+      "items": {
+        "type": "object",
+        "required": ["path", "value"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "enum": [
+              "snapshot_cycle",
+              "goal.id", "goal.ver", "goal.summary",
+              "active_question.id", "active_question.text", "active_question.status", "active_question.visit_count",
+              "cycle_status", "route",
+              "selection.intent", "selection.next_question_id",
+              "selection.latest_decision.id", "selection.latest_decision.actor", "selection.latest_decision.type",
+              "budget.B_t", "budget.cycle_spent", "budget.global_remaining",
+              "counts.open", "counts.inconclusive",
+              "heartbeat_ref",
+              "pending_file_request.request_id", "pending_file_request.item_count", "pending_file_request.created_at"
+            ]
+          },
+          "value": {}
+        }
+      }
+    }
+  }
+}

@@ -8,6 +8,7 @@ work_root 续跑（goal 不重建）；durable 停机与全局等待端到端生
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -68,7 +69,10 @@ def test_run_forever_waits_and_counts_max_cycles_across_reentry(tmp_path, monkey
 
         def __init__(self):
             self.budgets = []
-            self.results = iter([(["c1"], "等待文件"), ([], "等待文件"), (["c2", "c3"], None)])
+            self.results = iter([
+                (["c1"], "等待文件"), ([], "等待文件"),
+                (["c2"], None), (["c3"], None),
+            ])
 
         def run_cycles(self, max_cycles):
             self.budgets.append(max_cycles)
@@ -80,9 +84,10 @@ def test_run_forever_waits_and_counts_max_cycles_across_reentry(tmp_path, monkey
     system = System(advancer=advancer, state=None, daemon=None,
                     dual_mode="A", work_root=tmp_path, sync_notifications=lambda: scans.append(1))
     monkeypatch.setattr("orchestrator.run.time.sleep", lambda _seconds: None)
-    assert system.run_forever(3, poll_interval_s=0.01) == ["c1", "c2", "c3"]
-    assert advancer.budgets == [3, 2, 2]                    # 阻断重入不重置总推进预算
-    assert len(scans) == 3                                  # 等待每拍仍扫描通知/reminder
+    assert system.run_forever(3, poll_interval_s=0.01,
+                              linger_after_terminal=False) == ["c1", "c2", "c3"]
+    assert advancer.budgets == [1, 1, 1, 1]                 # 每轮归还控制；阻断不重置累计上限
+    assert len(scans) == 5                                  # 四次推进边界 + 受控退出排空扫描
 
 
 @pytest.mark.parametrize("interval", [0, -1, float("nan"), float("inf"), True])
@@ -98,6 +103,152 @@ def test_run_forever_rejects_hot_spin_poll_intervals(tmp_path, interval):
                     dual_mode="A", work_root=tmp_path)
     with pytest.raises(ValueError, match="0.01"):
         system.run_forever(1, poll_interval_s=interval)
+
+
+def test_drain_unconditionally_probes_and_retries_transient_completion(tmp_path, monkeypatch):
+    import sqlite3
+
+    class IdleAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+    state = {"calls": 0, "pending": False}
+
+    def sync():
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        state["pending"] = False
+
+    system = System(
+        advancer=IdleAdvancer(), state=None, daemon=None, dual_mode="A", work_root=tmp_path,
+        sync_interactions=sync, interaction_pending=lambda: state["pending"])
+    monkeypatch.setattr("orchestrator.run.time.sleep", lambda _seconds: None)
+    system.drain_interactions(poll_interval_s=0.01)
+    assert state["calls"] == 2       # cached pending=false 也先扫，且保留瞬时回执重试
+
+
+def test_run_forever_stop_event_drains_already_accepted_interaction(tmp_path, monkeypatch):
+    class IdleAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            raise AssertionError("pre-set stop_event 不应推进研究")
+
+    stop = __import__("threading").Event()
+    stop.set()
+    state = {"pending": True, "syncs": 0}
+
+    def sync():
+        state["syncs"] += 1
+        state["pending"] = False
+
+    system = System(
+        advancer=IdleAdvancer(), state=None, daemon=None, dual_mode="A", work_root=tmp_path,
+        sync_interactions=sync, interaction_pending=lambda: state["pending"])
+    monkeypatch.setattr("orchestrator.run.time.sleep", lambda _seconds: None)
+    assert system.run_forever(1, poll_interval_s=0.01, stop_event=stop) == []
+    assert not state["pending"] and state["syncs"] >= 1
+
+
+def test_run_forever_observes_stop_event_between_cycles(tmp_path):
+    stop = __import__("threading").Event()
+
+    class CountingAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def run_cycles(self, max_cycles):
+            assert max_cycles == 1
+            self.calls += 1
+            stop.set()
+            return [f"c{self.calls}"]
+
+    advancer = CountingAdvancer()
+    system = System(
+        advancer=advancer, state=None, daemon=None, dual_mode="A", work_root=tmp_path)
+    assert system.run_forever(150, poll_interval_s=0.01, stop_event=stop) == ["c1"]
+    assert advancer.calls == 1
+
+
+def test_drain_does_not_keep_consuming_new_spool_after_boundary(tmp_path, monkeypatch):
+    class IdleAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+    state = {"accepted": True, "intake_calls": 0, "completion_calls": 0}
+
+    def intake():
+        state["intake_calls"] += 1
+        # A live connector still has newer spool input, represented by interaction_pending=True below.
+
+    def complete():
+        state["completion_calls"] += 1
+        state["accepted"] = False
+
+    system = System(
+        advancer=IdleAdvancer(), state=None, daemon=None, dual_mode="A", work_root=tmp_path,
+        sync_interactions=intake, interaction_pending=lambda: True,
+        sync_accepted_interactions=complete,
+        accepted_interaction_pending=lambda: state["accepted"])
+    monkeypatch.setattr("orchestrator.run.time.sleep", lambda _seconds: None)
+    system.drain_interactions(poll_interval_s=0.01)
+    assert state == {"accepted": False, "intake_calls": 1, "completion_calls": 1}
+
+
+def test_drain_finishes_accepted_query_before_reporting_notification_error(tmp_path):
+    class IdleAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+    state = {"accepted": True, "completion_calls": 0}
+
+    def complete():
+        state["completion_calls"] += 1
+        state["accepted"] = False
+
+    system = System(
+        advancer=IdleAdvancer(), state=None, daemon=None, dual_mode="A", work_root=tmp_path,
+        sync_accepted_interactions=complete,
+        accepted_interaction_pending=lambda: state["accepted"],
+        sync_notifications=lambda: (_ for _ in ()).throw(OSError("outbox unavailable")))
+    with pytest.raises(OSError, match="outbox unavailable"):
+        system.drain_interactions(poll_interval_s=0.01)
+    assert state == {"accepted": False, "completion_calls": 1}
+
+
+def test_pump_error_still_drains_already_accepted_query(tmp_path):
+    pump_failed = __import__("threading").Event()
+    state = {"accepted": True, "completion_calls": 0}
+
+    class WaitingAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            assert pump_failed.wait(1)
+            return []
+
+    def broken_intake():
+        pump_failed.set()
+        raise RuntimeError("pump broke")
+
+    def complete():
+        state["completion_calls"] += 1
+        state["accepted"] = False
+
+    system = System(
+        advancer=WaitingAdvancer(), state=None, daemon=None, dual_mode="A", work_root=tmp_path,
+        sync_interactions=broken_intake,
+        sync_accepted_interactions=complete,
+        accepted_interaction_pending=lambda: state["accepted"])
+    with pytest.raises(RuntimeError, match="pump broke"):
+        system.run(1)
+    assert state == {"accepted": False, "completion_calls": 1}
 
 
 def test_main_ctrl_c_exits_cleanly(tmp_path, monkeypatch, capsys):
@@ -123,6 +274,96 @@ def test_main_ctrl_c_exits_cleanly(tmp_path, monkeypatch, capsys):
     assert "Ctrl-C" in capsys.readouterr().out
 
 
+def test_second_ctrl_c_during_run_forever_drain_is_hard_stop(tmp_path):
+    class InterruptAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            raise KeyboardInterrupt("first")
+
+    system = System(
+        advancer=InterruptAdvancer(), state=None, daemon=None,
+        dual_mode="A", work_root=tmp_path,
+        interaction_pending=lambda: True,
+        accepted_interaction_pending=lambda: True,
+        sync_accepted_interactions=lambda: (_ for _ in ()).throw(KeyboardInterrupt("second")))
+    with pytest.raises(KeyboardInterrupt) as caught:
+        system.run_forever(1, poll_interval_s=0.01)
+    assert str(caught.value) == "second"
+    assert system._hard_stop_requested is True
+
+
+def test_second_ctrl_c_during_direct_run_drain_is_hard_stop(tmp_path):
+    class InterruptAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            raise KeyboardInterrupt("first")
+
+    system = System(
+        advancer=InterruptAdvancer(), state=None, daemon=None,
+        dual_mode="A", work_root=tmp_path,
+        interaction_pending=lambda: True,
+        accepted_interaction_pending=lambda: True,
+        sync_accepted_interactions=lambda: (_ for _ in ()).throw(KeyboardInterrupt("second")))
+    with pytest.raises(KeyboardInterrupt) as caught:
+        system.run(1)
+    assert str(caught.value) == "second"
+    assert system._hard_stop_requested is True
+
+
+def test_main_hard_stop_kills_registered_groups_without_redrain(tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    class HardInterruptSystem:
+        _hard_stop_requested = True
+        _interaction_exit_drained = False
+
+        def run_forever(self, _max_cycles, *, poll_interval_s):
+            raise KeyboardInterrupt("second")
+
+        def drain_interactions(self, **_kwargs):
+            raise AssertionError("hard stop must not redrain")
+
+        def sync_notifications(self):
+            raise AssertionError("hard stop must not rescan notifications")
+
+    killed = []
+    monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: HardInterruptSystem())
+    monkeypatch.setattr(R, "terminate_active_process_groups", lambda: killed.append(True))
+    assert R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+                   "--poll-interval-s", "0.01"]) == 130
+    assert killed == [True]
+    assert "立即硬停" in capsys.readouterr().out
+
+
+def test_main_second_ctrl_c_during_fallback_drain_kills_groups(tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    class TwiceInterruptedSystem:
+        _hard_stop_requested = False
+        _interaction_exit_drained = False
+
+        def run_forever(self, _max_cycles, *, poll_interval_s):
+            raise KeyboardInterrupt("first")
+
+        def drain_interactions(self, **_kwargs):
+            raise KeyboardInterrupt("second")
+
+        def sync_notifications(self):
+            raise AssertionError("hard stop must skip notifications")
+
+    killed = []
+    monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: TwiceInterruptedSystem())
+    monkeypatch.setattr(R, "terminate_active_process_groups", lambda: killed.append(True))
+    assert R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+                   "--poll-interval-s", "0.01"]) == 130
+    assert killed == [True]
+    assert "立即硬停" in capsys.readouterr().out
+
+
 # ============ 全装配端到端（reasoning-only 闭环）============
 def test_build_and_run_bootstrap_terminate(tmp_path):
     sys = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE]))
@@ -136,6 +377,200 @@ def test_build_and_run_bootstrap_terminate(tmp_path):
     card = tmp_path / "state" / "status_card.json"
     assert card.exists() and json.loads(card.read_text())["snapshot_cycle"] == ids[0]
     assert (tmp_path / "research.sqlite").exists()             # 真冻结库落盘
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+    assert stat.S_IMODE((tmp_path / "research.sqlite").stat().st_mode) == 0o600
+
+
+def test_production_assembly_uses_codex_query_responder_and_drains_on_exit(tmp_path):
+    """生产 build_system 不再装模板：query 走独立 runner、interaction_query 账本并在研究到上限后收口。"""
+    from orchestrator.console_spool import ConsoleSpool
+
+    boot = {
+        "tree_ops.json": {"ops": [{"op": "create_root", "text": "根问题", "local_key": "root"}]},
+        "selection.json": {
+            "next_question_id": "root", "next_intent": "decompose",
+            "scores": [{"question_id": "root", "score": 0.8, "est_cost": 2.0}],
+        },
+    }
+    finish = {
+        "tree_ops.json": {"ops": [{
+            "op": "add_children", "parent_question_id": "q1",
+            "children": [{"local_key": "a", "text": "子问题 A"},
+                         {"local_key": "b", "text": "子问题 B"}],
+        }]},
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate",
+            "scores": [{"question_id": "a", "score": 0.4, "est_cost": 1.0},
+                       {"question_id": "b", "score": 0.3, "est_cost": 1.0}],
+            "terminate_reason_md": "装配测试收口",
+        },
+    }
+    research = iter([boot, finish])
+    calls = []
+
+    def factory(_transcripts, purpose):
+        class Runner:
+            def run_task(self, *, system_prompt, skill, context_pack):
+                calls.append(purpose)
+                if purpose == "interaction-query":
+                    return Artifact(
+                        stage="reasoning", md="", usage=CallUsage(
+                            tokens_total=17, tokens_known=True),
+                        files={"interaction_reply.json": {
+                            "facts": [{"path": "snapshot_cycle", "value": "c1"}],
+                        }})
+                return Artifact(
+                    stage=context_pack.stage, files=next(research), md="",
+                    usage=CallUsage(tokens_known=True))
+        return Runner()
+
+    system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=factory, attack=False)
+    assert system.run(max_cycles=1) == ["c1"]                  # 先有一份可答的发布卡
+    ConsoleSpool(tmp_path).append({"connector": "console", "raw_text": "现在进展如何"})
+    assert system.run_forever(max_cycles=1, poll_interval_s=0.01,
+                              linger_after_terminal=False) == ["c2"]
+
+    message_id = system.daemon.query_one(
+        "SELECT id FROM interaction_message WHERE connector='console' ORDER BY id DESC LIMIT 1")[0]
+    reply = system.daemon.query_one(
+        "SELECT responder_kind,runner_call_id,snapshot_cycle FROM interaction_reply WHERE message_id=?",
+        (message_id,))
+    assert reply[0] == "codex" and reply[2] == 1
+    assert system.daemon.query_one(
+        "SELECT phase,status,purpose FROM runner_call WHERE id=?", (reply[1],)) == (
+            "interaction_query", "success", f"message:{message_id}")
+    assert system.daemon.query_one(
+        "SELECT tokens_total FROM ledger WHERE runner_call_id=?", (reply[1],)) == (17,)
+    assert calls.count("interaction-query") == 1
+
+
+def test_interaction_pump_answers_query_while_research_runner_is_blocked(tmp_path):
+    """Query arriving after a long research call starts is answered before that call returns."""
+    import threading
+    import time
+    from orchestrator.console_spool import ConsoleSpool
+
+    boot = {
+        "tree_ops.json": {"ops": [{"op": "create_root", "text": "根问题", "local_key": "root"}]},
+        "selection.json": {
+            "next_question_id": "root", "next_intent": "decompose",
+            "scores": [{"question_id": "root", "score": 0.8, "est_cost": 1.0}],
+        },
+    }
+    finish = {
+        "tree_ops.json": {"ops": [{
+            "op": "add_children", "parent_question_id": "q1",
+            "children": [{"local_key": "child", "text": "子问题"}],
+        }]},
+        "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
+                           "terminate_reason_md": "done"},
+    }
+    research_started = threading.Event()
+    release_research = threading.Event()
+    research_calls = {"n": 0}
+
+    def factory(_transcripts, purpose):
+        class Runner:
+            def run_task(self, *, system_prompt, skill, context_pack):
+                if purpose == "interaction-query":
+                    return Artifact(
+                        stage="reasoning", md="", usage=CallUsage(tokens_total=7, tokens_known=True),
+                        files={"interaction_reply.json": {
+                            "facts": [{"path": "snapshot_cycle", "value": "c1"}],
+                        }})
+                research_calls["n"] += 1
+                if research_calls["n"] == 1:
+                    files = boot
+                else:
+                    research_started.set()
+                    assert release_research.wait(3)
+                    files = finish
+                return Artifact(stage=context_pack.stage, files=files, md="",
+                                usage=CallUsage(tokens_known=True))
+        return Runner()
+
+    system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=factory, attack=False)
+    assert system.run(1) == ["c1"]
+    observed = {}
+
+    def append_and_observe():
+        assert research_started.wait(2)
+        ConsoleSpool(tmp_path).append({"connector": "console", "raw_text": "长调用期间进展？"})
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            reply = system.daemon.query_one(
+                "SELECT r.runner_call_id,rc.status FROM interaction_reply r "
+                "JOIN runner_call rc ON rc.id=r.runner_call_id "
+                "WHERE rc.phase='interaction_query' ORDER BY r.id DESC LIMIT 1")
+            if reply is not None:
+                observed["reply"] = reply
+                break
+            time.sleep(0.01)
+        release_research.set()
+
+    observer = threading.Thread(target=append_and_observe)
+    observer.start()
+    assert system.run(1) == ["c2"]
+    observer.join(2)
+    assert not observer.is_alive()
+    reply = observed.get("reply")
+    assert reply is not None and reply[1] == "success"
+    assert system.daemon.query_one(
+        "SELECT tokens_total FROM ledger WHERE runner_call_id=?", (reply[0],)) == (7,)
+
+
+def test_global_stop_keeps_query_sideband_available(tmp_path):
+    """研究 durable stop 在 Advancer precheck 之前返回；System 层仍须 ingest/回答新 query。"""
+    import threading
+    import time
+    from orchestrator.console_spool import ConsoleSpool
+
+    research = iter([_BOOT_TERMINATE])
+    calls = []
+
+    def factory(_transcripts, purpose):
+        class Runner:
+            def run_task(self, *, system_prompt, skill, context_pack):
+                calls.append(purpose)
+                if purpose == "interaction-query":
+                    return Artifact(
+                        stage="reasoning", md="", usage=CallUsage(
+                            tokens_total=5, tokens_known=True),
+                        files={"interaction_reply.json": {
+                            "facts": [{"path": "snapshot_cycle", "value": "c1"}],
+                        }})
+                return Artifact(
+                    stage=context_pack.stage, files=next(research), md="",
+                    usage=CallUsage(tokens_known=True))
+        return Runner()
+
+    system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=factory, attack=False)
+    assert system.run(1) == ["c1"]
+    with system.daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO decision(actor,type,payload_json) VALUES "
+            "('orchestrator','global_stop','{\"reason\":\"score_floor\"}')")
+    stop_event = threading.Event()
+    result = {}
+    thread = threading.Thread(target=lambda: result.setdefault(
+        "ids", system.run_forever(max_cycles=1, poll_interval_s=0.01,
+                                  stop_event=stop_event)))
+    thread.start()
+    time.sleep(0.05)
+    assert thread.is_alive(), "durable stop 后 interaction daemon 应保持长在线"
+    ConsoleSpool(tmp_path).append({"connector": "console", "raw_text": "停止后还能查状态吗"})
+    deadline = time.monotonic() + 2
+    while (system.daemon.query_one(
+            "SELECT 1 FROM interaction_reply WHERE responder_kind='codex' LIMIT 1") is None
+           and time.monotonic() < deadline):
+        time.sleep(0.01)
+    stop_event.set()
+    thread.join(2)
+    assert not thread.is_alive() and result["ids"] == []
+    assert system.last_stop_reason == "score_floor"
+    assert calls.count("interaction-query") == 1
+    assert system.daemon.query_one(
+        "SELECT responder_kind FROM interaction_reply ORDER BY id DESC LIMIT 1") == ("codex",)
 
 
 def test_build_system_validates_policy_before_opening_database(tmp_path, monkeypatch):
@@ -267,7 +702,8 @@ def test_main_cli_smoke(tmp_path, monkeypatch, capsys):
     orig = R.build_system
     monkeypatch.setattr(R, "build_system",
                         lambda sr, wr, **kw: orig(sr, wr, runner_factory=_mock_factory([_BOOT_TERMINATE])))
-    rc = R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path), "--max-cycles", "3"])
+    rc = R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+                 "--max-cycles", "3", "--once"])
     assert rc == 0 and "推进 1 轮" in capsys.readouterr().out
 
 
@@ -350,10 +786,14 @@ def test_console_backlog_over_one_bounded_batch_blocks_before_later_pause(tmp_pa
 
     assert system.run(max_cycles=1) == []
     assert called["n"] == 0
-    assert "控制台入站待处理" in system.advancer.last_block_reason
-    assert system.daemon.query_one(
+    # Resident pump may drain both bounded batches before precheck; either way
+    # research cannot pass the backlog, and the later pause is already durable.
+    assert ("控制台入站待处理" in system.advancer.last_block_reason
+            or "pause 指令生效" in system.advancer.last_block_reason)
+    first_confirmed = system.daemon.query_one(
         "SELECT json_extract(payload_json,'$.confirmed') FROM directive WHERE id=?",
-        (pause["directive_id"],)) == (0,)
+        (pause["directive_id"],))[0]
+    assert first_confirmed in (0, 1)       # pump/precheck 谁先取第二批取决于调度
 
     assert system.run(max_cycles=1) == []                      # 下一拍处理 confirm，pause 成为更高优先阻断
     assert called["n"] == 0
@@ -729,7 +1169,8 @@ def test_resident_build_system_ingests_spooled_file_action_and_resumes(tmp_path)
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
 
     try:
-        assert system.run_forever(max_cycles=1, poll_interval_s=0.01) == ["c1"]
+        assert system.run_forever(max_cycles=1, poll_interval_s=0.01,
+                                  linger_after_terminal=False) == ["c1"]
         assert appended.wait(1) and response["queued"]["action"] == "resolve"
     finally:
         httpd.shutdown(); httpd.server_close(); server_thread.join(timeout=5)

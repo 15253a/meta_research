@@ -76,7 +76,11 @@ def connect(path: Union[str, Path] = ":memory:") -> sqlite3.Connection:
     """
     is_memory = str(path) == ":memory:"
     migration_sql = _read_migration()   # 无条件校验文件 checksum（漂移即在此抛 SchemaDriftError）
-    conn = sqlite3.connect(str(path))
+    # The run process has one writer connection, but the interaction pump and
+    # research driver use it from different threads.  WriteDaemon serializes
+    # every access; disabling sqlite's thread-affinity check is therefore safe
+    # and avoids opening a second writer connection.
+    conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     fresh = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
     if fresh:

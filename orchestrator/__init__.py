@@ -27,7 +27,8 @@
 - phase_commit.py — 阶段级原子提交幂等落库（§4.2.5：同键同 hash 跳过、异 hash conflict 拒）
 - import_worker.py — ImportWorker（M4：外部 import 物化——worker cycle[OPEN #6]+供应链 manifest+失败路径全拒）
 - console.py    — Console（M5：保守关键词分类器 + directive 生命周期——润色≠raw 时序/回显确认/按时机消费+DECISION）
-- mediator.py   — Mediator（M5：query 只读应答链——mode=ro+全写拒 authorizer/grounding 校验+模板回退/中介重建）
+- mediator.py   — Mediator（query sideband：发布快照+无工具 Codex、created→running 耐久意图、grounding/
+                  成本回执原子收口、模板降级与按 conversation 重建）
 - notify.py     — 通知矩阵（M5：outbox 文件队列幂等投递 + directive 7 态/文件请求 3 事件扫描派生 +
                   FileRequestService 全流水 + make_advancer_precheck 全局等待）
 - stage_provider.py — StageProvider（M6：真 CodexRunner→真组件的 (cyc,pack)→files 阶段回调——render 由调用方，run+信封解析+逐产物 schema 校验+artifact_parse 重试）

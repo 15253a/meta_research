@@ -64,6 +64,18 @@ class CallUsage:
 
 
 @dataclass
+class ResponderReply:
+    """真只读 responder 的一次外部调用回执。
+
+    ``text`` 是 responder 边界已校验/构造的最终文本；usage/transcript_ref 由 interaction daemon
+    用来把 runner_call + ledger + interaction_reply 原子收口，Codex 本身不接触数据库。
+    """
+    text: str
+    usage: Optional["CallUsage"] = None
+    transcript_ref: Optional[str] = None
+
+
+@dataclass
 class Artifact:
     """一次阶段执行的全部产物：文件名 → 合 schema 的 JSON 对象，外加中文 md 正文。
 
@@ -257,7 +269,7 @@ class WriteCommand:
 
 
 class WriteDaemon(Protocol):
-    """唯一写库执行者（单线程、单 connection）；各模块只提交命令、不自开写连接。"""
+    """唯一写库执行者（多调用线程串行化到单 connection）；各模块不自开写连接。"""
 
     def submit(self, cmd: WriteCommand) -> CommitResult: ...
 
@@ -279,7 +291,7 @@ class Classifier(Protocol):
 class Responder(Protocol):
     """只读应答器：不收 raw 对话，只收已消毒查询 + 状态卡（§4.6.2 / §6.8）。"""
 
-    def answer(self, sanitized_query: str, status_card: str) -> str: ...
+    def answer(self, sanitized_query: str, status_card: str) -> Union[str, ResponderReply]: ...
 
 
 class StatusPublisher(Protocol):

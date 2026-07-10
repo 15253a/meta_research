@@ -117,17 +117,20 @@ def test_enqueue_message_spool_only(seeded):
     data = CS.ConsoleData(db_path=path, work_root=work, system_root=SYSTEM_ROOT)
     before = db.connect(path).execute("SELECT count(*) FROM interaction_message").fetchone()[0]
     r1 = data.enqueue_message("暂停一下")
-    r2 = data.enqueue_message("q13 现在到哪了？")
+    r2 = data.enqueue_message("q13 现在到哪了？", conversation_id="a" * 32)
     assert r1["seq"] == 1 and r2["seq"] > r1["seq"]
     _assert_random_idempotency_key(r1); _assert_random_idempotency_key(r2)
     lines = (Path(work) / "state" / "console_inbox.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2 and json.loads(lines[0])["raw_text"] == "暂停一下"
+    assert json.loads(lines[1])["conversation_id"] == "a" * 32
     # **不碰 DB**：interaction_message 未增（run 进程 ingest 才入库）
     assert db.connect(path).execute("SELECT count(*) FROM interaction_message").fetchone()[0] == before
     with pytest.raises(ValueError):
         data.enqueue_message("   ")                                      # 空消息拒
     with pytest.raises(ValueError, match="字符串"):
         data.enqueue_message({})                                         # JSON object 不得打穿 handler
+    with pytest.raises(ValueError, match="conversation_id"):
+        data.enqueue_message("bad conversation", conversation_id="shared")
 
 
 def test_enqueue_fences_torn_tail_before_acknowledging_next_record(seeded):

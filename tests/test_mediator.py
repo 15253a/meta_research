@@ -205,13 +205,16 @@ def test_advancer_publishes_at_stage_boundary(tmp_path):
 def test_mediator_rebuild_consistent_answers(env):
     med, d = env["med"], env["daemon"]
     ing = InteractionIngest(d)
-    mid = ing.inbound(connector="qq", raw_text="进展？", idempotency_key="rb-1", goal_id=1, goal_ver=1)
+    conversation_id = "rebuild-consistent"
+    mid = ing.inbound(connector="qq", conversation_id=conversation_id,
+                      raw_text="进展？", idempotency_key="rb-1", goal_id=1, goal_ver=1)
     a1 = med.handle_query(message_id=mid)["reply_text"]
     med2 = Mediator(d, str(env["card_path"]))      # 杀掉重建：新实例只靠持久层
-    ctx = med2.rebuild("qq")
+    ctx = med2.rebuild("qq", conversation_id)
     assert ctx["card"]["snapshot_cycle"] == "c1"
     assert any(h["message_id"] == mid and h["reply"] == a1 for h in ctx["history"])   # 历史含既有问答
-    mid2 = ing.inbound(connector="qq", raw_text="进展？", idempotency_key="rb-2", goal_id=1, goal_ver=1)
+    mid2 = ing.inbound(connector="qq", conversation_id=conversation_id,
+                       raw_text="进展？", idempotency_key="rb-2", goal_id=1, goal_ver=1)
     a2 = med2.handle_query(message_id=mid2)["reply_text"]
     assert a2 == a1                                                             # 重建前后回答逐字节一致
 
@@ -221,12 +224,16 @@ def test_rebuild_multi_reply_takes_latest_no_fanout(env):
     数不被 join 扇出截短。"""
     med, d = env["med"], env["daemon"]
     ing = InteractionIngest(d)
-    mid = ing.inbound(connector="qq", raw_text="双回复", idempotency_key="fan-1", goal_id=1, goal_ver=1)
+    conversation_id = "rebuild-fanout"
+    mid = ing.inbound(connector="qq", conversation_id=conversation_id,
+                      raw_text="双回复", idempotency_key="fan-1", goal_id=1, goal_ver=1)
     ing.ack(message_id=mid, reply_text="收到（ACK）")
     r = med.handle_query(message_id=mid)                        # 第二条回复（应答）
-    mids = [ing.inbound(connector="qq", raw_text=f"填充{i}", idempotency_key=f"fan-f{i}",
+    mids = [ing.inbound(connector="qq", conversation_id=conversation_id,
+                        raw_text=f"填充{i}", idempotency_key=f"fan-f{i}",
                         goal_id=1, goal_ver=1) for i in range(3)]
-    ctx = Mediator(d, str(env["card_path"]), rebuild_last_n=4).rebuild("qq")
+    ctx = Mediator(d, str(env["card_path"]), rebuild_last_n=4).rebuild(
+        "qq", conversation_id)
     assert [h["message_id"] for h in ctx["history"]] == [mid] + mids            # 4 条 message，无扇出重复
     assert ctx["history"][0]["reply"] == r["reply_text"]                        # 取最新回复（非 ACK）
 
@@ -234,9 +241,12 @@ def test_rebuild_multi_reply_takes_latest_no_fanout(env):
 def test_rebuild_last_n_window(env):
     med, d = env["med"], env["daemon"]
     ing = InteractionIngest(d)
+    conversation_id = "rebuild-window"
     for i in range(25):
-        ing.inbound(connector="qq", raw_text=f"消息{i}", idempotency_key=f"w-{i}", goal_id=1, goal_ver=1)
-    ctx = Mediator(d, str(env["card_path"]), rebuild_last_n=20).rebuild("qq")
+        ing.inbound(connector="qq", conversation_id=conversation_id,
+                    raw_text=f"消息{i}", idempotency_key=f"w-{i}", goal_id=1, goal_ver=1)
+    ctx = Mediator(d, str(env["card_path"]), rebuild_last_n=20).rebuild(
+        "qq", conversation_id)
     assert len(ctx["history"]) == 20
     assert ctx["history"][-1]["text"] == "消息24"                               # 最近 N 条、时序升序
 

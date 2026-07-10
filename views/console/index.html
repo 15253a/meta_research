@@ -1067,6 +1067,7 @@ const NARR_TOPICS = [
 const HEADLESS = (typeof window === "undefined");   // node stub 冒烟环境
 const CAPABILITY_STORAGE_KEY = "meta_research_console_capability";
 const IDEMPOTENCY_STORAGE_KEY = "meta_research_console_pending_posts_v1";
+const CONVERSATION_STORAGE_KEY = "meta_research_console_conversation_v1";
 const API_TIMEOUT_MS = 10000;
 const SNAPSHOT_MAX_AGE_MS = 10000;
 const DEMO_MODE = !HEADLESS && new URLSearchParams(window.location.search||"").get("demo")==="1";
@@ -1185,6 +1186,17 @@ function _newIdempotencyKey(){
   if(HEADLESS || !window.crypto || !window.crypto.getRandomValues) throw new Error("浏览器缺少安全随机源");
   const bytes=new Uint8Array(16); window.crypto.getRandomValues(bytes);
   return Array.from(bytes,b=>b.toString(16).padStart(2,"0")).join("");
+}
+function _conversationId(){
+  let value="";
+  try{ value=window.sessionStorage.getItem(CONVERSATION_STORAGE_KEY)||""; }catch(e){}
+  if(!/^[0-9a-f]{32}$/.test(value)){
+    value=_newIdempotencyKey();
+    window.sessionStorage.setItem(CONVERSATION_STORAGE_KEY,value);
+  }
+  if(window.sessionStorage.getItem(CONVERSATION_STORAGE_KEY)!==value)
+    throw new Error("conversation_id 未能持久化");
+  return value;
 }
 function _postOperationKey(url,payload){
   if(typeof url!=="string" || !/^\/api(?:[/?]|$)/.test(url)) throw new Error("apiPost 只允许同源 /api 路径");
@@ -2677,7 +2689,7 @@ if(typeof window!=="undefined" && !HEADLESS && !DEMO_MODE){
     if(!_consoleReady){ showConnectionGuard("控制台连接已失效，拒绝发送命令。"); return; }
     if(inp) inp.value="";
     emitEvent({k:"cmd", html:"<b>&gt; "+esc(t)+"</b>"});
-    apiPost('/api/message',{text:t})
+    apiPost('/api/message',{text:t,conversation_id:_conversationId()})
       .then(({response,body:j})=>{ const ok=response.ok; if(!ok || !j || !j.queued){ emitEvent({k:"cmd", text:"入队失败:"+((j&&j.error)||"服务器拒绝")}); return; }
         emitEvent({k:"cmd", text:"已入队 console_inbox（seq "+j.queued.seq+"）· 待 run 进程 ingest→分类"}); })
       .catch(e=>emitEvent({k:"cmd", text:"入队失败:"+e}));
