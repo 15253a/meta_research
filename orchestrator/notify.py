@@ -40,8 +40,9 @@ import shutil
 import sqlite3
 import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from .console import Console
@@ -206,31 +207,288 @@ _MAX_ASSET_PREVIEW_BYTES = 8 * 1024
 _MAX_REQUEST_PREVIEW_BYTES = 32 * 1024
 
 
-def _regular_files_no_symlink(src: Path) -> List[Path]:
-    """收集 src 下常规文件，**全链路不跟随符号链接**（外审 BLOCKER：item 目录本身或中途目录是 symlink
-    时，rglob/is_dir 会跟进外部目录，其内常规文件绕过逐文件 is_symlink 检查把外部内容并入输入资产区）：
-    src 自身是 symlink → 空；os.walk(followlinks=False) 不下钻 symlink 目录；逐文件再排 symlink；
-    终检 resolve 落点必须在 src 实路径内（防花式逃逸）。"""
-    if not src.is_dir() or src.is_symlink():
-        return []
+_UPLOAD_DIRECTORY_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                           | getattr(os, "O_NOFOLLOW", 0)
+                           | getattr(os, "O_CLOEXEC", 0))
+_UPLOAD_FILE_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                      | getattr(os, "O_CLOEXEC", 0)
+                      | getattr(os, "O_NONBLOCK", 0))
+_MAX_UPLOAD_DIRECTORY_DEPTH = 64
+_MAX_UPLOAD_ENTRIES_PER_DIRECTORY = 1024
+_MAX_UPLOAD_ENTRIES_PER_REQUEST = 4096
+_MAX_UPLOAD_DIRECTORIES_PER_REQUEST = 1024
+
+
+def _inode_identity(info: os.stat_result) -> Tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+def _regular_fingerprint(info: os.stat_result) -> tuple:
+    """复制期间必须稳定的常规文件身份；ctime 可捕获原 inode 的原地改写。"""
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _require_same_directory(*, expected: Tuple[int, int], path_info: os.stat_result,
+                            opened_info: os.stat_result, display: Path) -> None:
+    if (not stat.S_ISDIR(path_info.st_mode) or not stat.S_ISDIR(opened_info.st_mode)
+            or _inode_identity(path_info) != expected
+            or _inode_identity(opened_info) != expected):
+        raise OSError(f"上传目录在枚举期间发生路径替换: {display}")
+
+
+def _require_same_regular(*, expected_fingerprint: tuple, path_info: os.stat_result,
+                          opened_info: os.stat_result, display: Path) -> None:
+    if (not stat.S_ISREG(path_info.st_mode) or not stat.S_ISREG(opened_info.st_mode)
+            or path_info.st_nlink != 1 or opened_info.st_nlink != 1
+            or _inode_identity(path_info) != _inode_identity(opened_info)
+            or _regular_fingerprint(opened_info) != expected_fingerprint):
+        raise OSError(f"上传文件在接纳期间发生替换/改写或不是独占常规文件: {display}")
+
+
+@dataclass
+class _OpenedUploadFile:
+    """枚举时固定的上传文件 capability；``display_path`` 只供审计/兼容测试，绝不用于重开。"""
+
+    fd: int
+    root_fd: int
+    components: Tuple[str, ...]
+    directory_identities: Tuple[Tuple[int, int], ...]
+    fingerprint: tuple
+    display_path: Path
+    relative_path: Path
+
+    def __fspath__(self) -> str:
+        # 保留现有 monkeypatch 中 ``Path(src)`` 的可观测形态；安全逻辑不信任这个字符串。
+        return str(self.display_path)
+
+
+@dataclass
+class _UploadTraversalBudget:
+    """一次 resolve 的目录枚举总预算；非文件项和失败 stat 同样不能绕过。"""
+
+    entries: int = 0
+    directories: int = 0
+
+    def observe_entry(self, display: Path) -> None:
+        self.entries += 1
+        if self.entries > _MAX_UPLOAD_ENTRIES_PER_REQUEST:
+            raise ValueError(
+                f"用户上传树目录项超过安全上限 {_MAX_UPLOAD_ENTRIES_PER_REQUEST}: {display}")
+
+    def enter_directory(self, display: Path) -> None:
+        self.directories += 1
+        if self.directories > _MAX_UPLOAD_DIRECTORIES_PER_REQUEST:
+            raise ValueError(
+                f"用户上传树目录数超过安全上限 {_MAX_UPLOAD_DIRECTORIES_PER_REQUEST}: {display}")
+
+
+def _open_directory_entry(parent_fd: int, name: str, expected: os.stat_result,
+                          display: Path) -> int:
+    """从已固定父目录 openat 子目录，并把 scandir 快照、fd、当前目录项三方对齐。"""
+    fd = os.open(name, _UPLOAD_DIRECTORY_FLAGS, dir_fd=parent_fd)
     try:
-        root_real = src.resolve(strict=True)
-    except (OSError, RuntimeError):
-        return []
-    out: List[Path] = []
-    for dirpath, _dirnames, filenames in os.walk(src, followlinks=False):
-        for name in filenames:
-            p = Path(dirpath) / name
-            if p.is_symlink() or not p.is_file():
-                continue
+        opened = os.fstat(fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        identity = _inode_identity(expected)
+        if not stat.S_ISDIR(expected.st_mode):
+            raise OSError(f"上传目录项不是目录: {display}")
+        _require_same_directory(
+            expected=identity, path_info=current, opened_info=opened, display=display)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_upload_file(parent_fd: int, name: str, expected: os.stat_result, *, root_fd: int,
+                      components: Tuple[str, ...],
+                      directory_identities: Tuple[Tuple[int, int], ...],
+                      display: Path, relative: Path) -> _OpenedUploadFile:
+    """从固定父目录 openat 常规文件；O_NONBLOCK 防检查后被换 FIFO 时阻塞 daemon。"""
+    if not stat.S_ISREG(expected.st_mode) or expected.st_nlink != 1:
+        raise OSError(f"上传文件不是独占常规文件: {display}")
+    fd = os.open(name, _UPLOAD_FILE_FLAGS, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        fingerprint = _regular_fingerprint(expected)
+        _require_same_regular(
+            expected_fingerprint=fingerprint, path_info=current,
+            opened_info=opened, display=display)
+        return _OpenedUploadFile(
+            fd=fd, root_fd=root_fd, components=components,
+            directory_identities=directory_identities,
+            fingerprint=fingerprint, display_path=display, relative_path=relative)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _enumerate_upload_directory(*, directory_fd: int, root_fd: int,
+                                components: Tuple[str, ...],
+                                directory_identities: Tuple[Tuple[int, int], ...],
+                                display_root: Path, relative_root: Path,
+                                opened_files: List[_OpenedUploadFile],
+                                max_files: int, traversal_budget: _UploadTraversalBudget) -> None:
+    """只经已持有 dirfd 递归；先 lstat 分类，再用 openat 固定每个被接纳文件。"""
+    if len(components) > _MAX_UPLOAD_DIRECTORY_DEPTH:
+        raise ValueError(
+            f"用户文件目录嵌套超过安全上限 {_MAX_UPLOAD_DIRECTORY_DEPTH}: {display_root}")
+    entries = []
+    with os.scandir(directory_fd) as iterator:
+        for entry in iterator:
+            traversal_budget.observe_entry(display_root / entry.name)
+            if len(entries) >= _MAX_UPLOAD_ENTRIES_PER_DIRECTORY:
+                raise ValueError(
+                    f"单个上传目录项超过安全上限 {_MAX_UPLOAD_ENTRIES_PER_DIRECTORY}: {display_root}")
+            entries.append((entry.name, entry.stat(follow_symlinks=False)))
+    for name, entry_info in sorted(entries, key=lambda pair: pair[0]):
+        display = display_root / name
+        relative = relative_root / name
+        if stat.S_ISLNK(entry_info.st_mode):
+            continue                         # 既有 symlink 从来不是“已提供文件”
+        if stat.S_ISDIR(entry_info.st_mode):
+            traversal_budget.enter_directory(display)
+            child_fd = _open_directory_entry(directory_fd, name, entry_info, display)
             try:
-                resolved = p.resolve(strict=True)
-            except (OSError, RuntimeError):
-                continue
-            if root_real not in resolved.parents:
-                continue                     # 落点逃出 uploads item 根：拒收
-            out.append(p)
-    return sorted(out)
+                child_identity = _inode_identity(os.fstat(child_fd))
+                _enumerate_upload_directory(
+                    directory_fd=child_fd, root_fd=root_fd,
+                    components=components + (name,),
+                    directory_identities=directory_identities + (child_identity,),
+                    display_root=display, relative_root=relative,
+                    opened_files=opened_files, max_files=max_files,
+                    traversal_budget=traversal_budget)
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(entry_info.st_mode):
+            if len(opened_files) >= max_files:
+                raise ValueError(
+                    f"用户文件数超过 goal-wide 安全上限 {_MAX_MANAGED_FILES_PER_GOAL}；"
+                    "请先打包成 tar/zip 再上传")
+            opened_files.append(_open_upload_file(
+                directory_fd, name, entry_info, root_fd=root_fd,
+                components=components + (name,),
+                directory_identities=directory_identities,
+                display=display, relative=relative))
+        # FIFO/device/socket 不是文件上传，且绝不 open，避免阻塞或设备副作用。
+
+
+@contextmanager
+def _regular_files_no_symlink(root_fd: int, item_name: str, src: Path, *,
+                              max_files: int, traversal_budget: _UploadTraversalBudget):
+    """固定 item 目录并返回已打开的常规文件；结束时统一关闭 capability。
+
+    初始缺失、既有 symlink/非目录仍按“用户未提供”处理；一旦观察到目录后发生替换则 fail closed，
+    由 resolve rollback 保持请求 pending。
+    """
+    opened_files: List[_OpenedUploadFile] = []
+    item_fd: Optional[int] = None
+    try:
+        try:
+            item_info = os.stat(item_name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            yield opened_files
+            return
+        if not stat.S_ISDIR(item_info.st_mode):
+            yield opened_files
+            return
+        traversal_budget.enter_directory(src)
+        item_fd = _open_directory_entry(root_fd, item_name, item_info, src)
+        item_identity = _inode_identity(os.fstat(item_fd))
+        _enumerate_upload_directory(
+            directory_fd=item_fd, root_fd=root_fd, components=(item_name,),
+            directory_identities=(item_identity,), display_root=src,
+            relative_root=Path(), opened_files=opened_files, max_files=max_files,
+            traversal_budget=traversal_budget)
+        # 与旧实现 ``sorted(List[Path])`` 完全同序，确保 asset-N/ref 的确定性身份不漂移。
+        opened_files.sort(key=lambda opened: opened.relative_path)
+        yield opened_files
+    finally:
+        if item_fd is not None:
+            os.close(item_fd)
+        for opened in opened_files:
+            os.close(opened.fd)
+
+
+@contextmanager
+def _open_upload_root(path: Path):
+    """固定 uploads 根；允许上层安全解析器传入本进程的 ``/proc/self/fd/N`` capability。"""
+    raw = str(path)
+    proc_prefix = "/proc/self/fd/"
+    fd: Optional[int] = None
+    if raw.startswith(proc_prefix) and raw[len(proc_prefix):].isdigit():
+        fd = os.dup(int(raw[len(proc_prefix):]))
+    else:
+        # abspath 会在真正的路径解析前词法折叠 ``..``，从而跳过本应被 O_NOFOLLOW
+        # 检查的中间 symlink（例如 symlink/../uploads）。上传路径不需要父级穿越，直接拒绝。
+        if os.pardir in raw.split(os.sep):
+            raise ValueError("uploads_dir 不得含 '..' 路径组件")
+        try:
+            absolute = os.path.abspath(raw)
+            fd = os.open(os.sep, _UPLOAD_DIRECTORY_FLAGS)
+            for component in (part for part in absolute.split(os.sep) if part):
+                next_fd = os.open(component, _UPLOAD_DIRECTORY_FLAGS, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+        except FileNotFoundError:
+            if fd is not None:
+                os.close(fd)
+            yield None                       # 整个上传根缺失 = 所有 item 未提供
+            return
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"uploads_dir 不是目录 capability: {path}")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _verify_opened_upload_file(source: _OpenedUploadFile) -> None:
+    """从固定 uploads 根逐组件重走目录项，确认枚举身份仍在；文件本体始终使用原 fd。"""
+    directory_components = source.components[:-1]
+    if len(directory_components) != len(source.directory_identities):
+        raise RuntimeError("上传 capability 的目录组件与身份数量不一致")
+    current_fd = os.dup(source.root_fd)
+    try:
+        for index, (name, expected_identity) in enumerate(zip(
+                directory_components, source.directory_identities)):
+            display = source.display_path.parents[
+                len(source.components) - index - 2]
+            child_fd: Optional[int] = None
+            try:
+                child_fd = os.open(name, _UPLOAD_DIRECTORY_FLAGS, dir_fd=current_fd)
+                opened = os.fstat(child_fd)
+                path_info = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+                _require_same_directory(
+                    expected=expected_identity, path_info=path_info,
+                    opened_info=opened, display=display)
+            except OSError as error:
+                if child_fd is not None:
+                    os.close(child_fd)
+                raise OSError(
+                    f"上传源目录在枚举后发生替换: {source.display_path}") from error
+            os.close(current_fd)
+            current_fd = child_fd
+
+        filename = source.components[-1]
+        opened_info = os.fstat(source.fd)
+        path_info = os.stat(filename, dir_fd=current_fd, follow_symlinks=False)
+        _require_same_regular(
+            expected_fingerprint=source.fingerprint, path_info=path_info,
+            opened_info=opened_info, display=source.display_path)
+    except OSError as error:
+        if str(source.display_path) in str(error):
+            raise
+        raise OSError(f"上传源在枚举后发生替换: {source.display_path}") from error
+    finally:
+        os.close(current_fd)
 
 
 def _remove_private_tree(path: Path) -> None:
@@ -484,69 +742,63 @@ def _read_committed_resolution_state(daemon: WriteDaemon, request_id: int) -> Op
     return row
 
 
-def _copy_hash_regular(src: Path, dest: Path, *, source_root: Path,
+def _copy_hash_regular(src: _OpenedUploadFile, dest: Path, *, source_root: Path,
                        remaining_bytes: int, preview_limit_bytes: int) -> tuple:
-    """从同一 O_NOFOLLOW fd 流式复制/hash/校验 UTF-8；绝不为 preview 再按路径打开源文件。
+    """从枚举时已固定的同一 fd 流式复制/hash/校验 UTF-8；绝不再按源路径打开。
 
     返回 ``(size, sha256, preview_or_none, preview_bytes, preview_truncated)``。只有整个文件都是严格
     UTF-8 时才返回 preview；预览原始字节受调用方预算限制，尾部若截在多字节字符中间则只丢该残片。
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(str(src), flags)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise OSError(f"上传源不是常规文件: {src}")
-        # 打开后再核路径/inode：若中间目录在检查与 open 间被换成 symlink/别树，拒绝该 fd。
-        actual = src.resolve(strict=True)
-        actual_info = os.stat(actual, follow_symlinks=False)
-        if source_root not in actual.parents or (actual_info.st_dev, actual_info.st_ino) != (info.st_dev, info.st_ino):
-            raise OSError(f"上传源在复制前发生路径替换: {src}")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256()
-        utf8_decoder = codecs.getincrementaldecoder("utf-8")("strict")
-        utf8_valid = True
-        preview_raw = bytearray()
-        copied = 0
-        with os.fdopen(fd, "rb", closefd=False) as inp, dest.open("xb") as out:
-            while True:
-                chunk = inp.read(_COPY_CHUNK_BYTES)
-                if not chunk:
-                    break
-                copied += len(chunk)
-                if copied > remaining_bytes:
-                    raise ValueError("用户文件总字节数超过 resources.disk_quota_gb")
-                out.write(chunk)
-                digest.update(chunk)
-                if utf8_valid:
-                    try:
-                        decoded = utf8_decoder.decode(chunk, final=False)
-                        # 严格 UTF-8 仍可能是带 NUL/终端控制符的二进制；只保留常用文本空白。
-                        if any((ord(ch) < 0x20 and ch not in "\t\n\r") or ord(ch) == 0x7f
-                               for ch in decoded):
-                            utf8_valid = False
-                    except UnicodeDecodeError:
+    del source_root                         # 兼容既有 monkeypatch 签名；安全边界已是 src capability。
+    if not isinstance(src, _OpenedUploadFile):
+        raise TypeError("_copy_hash_regular 只接受枚举时固定的上传文件 capability")
+    _verify_opened_upload_file(src)
+    os.lseek(src.fd, 0, os.SEEK_SET)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    utf8_decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    utf8_valid = True
+    preview_raw = bytearray()
+    copied = 0
+    with dest.open("xb") as out:
+        while True:
+            chunk = os.read(src.fd, _COPY_CHUNK_BYTES)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > remaining_bytes:
+                raise ValueError("用户文件总字节数超过 resources.disk_quota_gb")
+            out.write(chunk)
+            digest.update(chunk)
+            if utf8_valid:
+                try:
+                    decoded = utf8_decoder.decode(chunk, final=False)
+                    # 严格 UTF-8 仍可能是带 NUL/终端控制符的二进制；只保留常用文本空白。
+                    if any((ord(ch) < 0x20 and ch not in "\t\n\r") or ord(ch) == 0x7f
+                           for ch in decoded):
                         utf8_valid = False
-                if len(preview_raw) < preview_limit_bytes:
-                    preview_raw.extend(chunk[:preview_limit_bytes - len(preview_raw)])
-            out.flush()
-            os.fsync(out.fileno())
-        if utf8_valid:
-            try:
-                utf8_decoder.decode(b"", final=True)
-            except UnicodeDecodeError:
-                utf8_valid = False
-        preview = None
-        preview_bytes = 0
-        preview_truncated = False
-        if utf8_valid:
-            # final=False 保留被预算截断的 UTF-8 尾部残片，确保返回 str 始终可安全 JSON 化。
-            preview = codecs.getincrementaldecoder("utf-8")("strict").decode(bytes(preview_raw), final=False)
-            preview_bytes = len(preview.encode("utf-8"))
-            preview_truncated = copied > preview_bytes
-        return copied, digest.hexdigest(), preview, preview_bytes, preview_truncated
-    finally:
-        os.close(fd)
+                except UnicodeDecodeError:
+                    utf8_valid = False
+            if len(preview_raw) < preview_limit_bytes:
+                preview_raw.extend(chunk[:preview_limit_bytes - len(preview_raw)])
+        out.flush()
+        os.fsync(out.fileno())
+    # 路径替换、hardlink、新 inode 或原 inode 原地改写都必须在发布前让整个 attempt 回滚。
+    _verify_opened_upload_file(src)
+    if utf8_valid:
+        try:
+            utf8_decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            utf8_valid = False
+    preview = None
+    preview_bytes = 0
+    preview_truncated = False
+    if utf8_valid:
+        # final=False 保留被预算截断的 UTF-8 尾部残片，确保返回 str 始终可安全 JSON 化。
+        preview = codecs.getincrementaldecoder("utf-8")("strict").decode(bytes(preview_raw), final=False)
+        preview_bytes = len(preview.encode("utf-8"))
+        preview_truncated = copied > preview_bytes
+    return copied, digest.hexdigest(), preview, preview_bytes, preview_truncated
 
 
 class FileRequestReject(Exception):
@@ -758,61 +1010,65 @@ class FileRequestService:
         preview_bytes = 0
         file_count = 0
         populated_items: List[int] = []
+        traversal_budget = _UploadTraversalBudget()
         try:
             stage_root.mkdir(mode=0o700, parents=True)
             _fsync_directory(stage_root.parent)
-            for i, _item in enumerate(items, start=1):
-                src = up / str(i)
-                files = _regular_files_no_symlink(src)
-                if not files:
-                    resolution.append({"unavailable": "用户未提供该条目文件"})
-                    continue
-                source_root = src.resolve(strict=True)
-                provided = []
-                for asset_no, f in enumerate(files, start=1):
-                    file_count += 1
-                    if file_count > _MAX_MANAGED_FILES_PER_GOAL:
-                        raise ValueError(
-                            f"用户文件数超过 goal-wide 安全上限 {_MAX_MANAGED_FILES_PER_GOAL}；"
-                            "请先打包成 tar/zip 再上传")
-                    rel = f.relative_to(src)
-                    # 外部文件名不进入托管路径/ref（文件名可含换行/```/引号，直接进 prompt 会注入）。
-                    # 请求条目仍保留 expected_files；真实原相对名只留 DB 审计字段，不参与路径解析。
-                    safe_name = f"asset-{asset_no}"
-                    stage_dest = stage_root / str(i) / safe_name
-                    preview_limit = min(
-                        _MAX_ASSET_PREVIEW_BYTES,
-                        max(0, _MAX_REQUEST_PREVIEW_BYTES - preview_bytes))
-                    size, digest, preview, preview_size, preview_truncated = _copy_hash_regular(
-                        f, stage_dest, source_root=source_root,
-                        remaining_bytes=self.max_managed_bytes - existing_managed_bytes - total_bytes,
-                        preview_limit_bytes=preview_limit)
-                    total_bytes += size
-                    preview_bytes += preview_size
-                    final_dest = dest_root / str(i) / safe_name
-                    opaque_ref = f"user-file-request:r{request_id}:item:{i}:asset:{asset_no}"
-                    asset = {
-                        "path": str(final_dest),
-                        "ref": opaque_ref,
-                        "original_relpath": rel.as_posix(),
-                        "hash": digest,
-                        "hash_alg": "sha256",
-                        "size_bytes": size,
-                    }
-                    if preview is not None:
-                        asset["preview"] = preview
-                        if preview_truncated:
-                            asset["preview_truncated"] = True
-                    provided.append(asset)
-                    asset_manifest.append({
-                        "ref": opaque_ref,
-                        "relative_path": f"{i}/{safe_name}",
-                        "sha256": digest,
-                        "size_bytes": size,
-                    })
-                _fsync_directory(stage_root / str(i))
-                populated_items.append(i)
-                resolution.append({"provided": provided})
+            with _open_upload_root(up) as upload_root_fd:
+                for i, _item in enumerate(items, start=1):
+                    src = up / str(i)
+                    if upload_root_fd is None:
+                        resolution.append({"unavailable": "用户未提供该条目文件"})
+                        continue
+                    with _regular_files_no_symlink(
+                            upload_root_fd, str(i), src,
+                            max_files=_MAX_MANAGED_FILES_PER_GOAL - file_count,
+                            traversal_budget=traversal_budget) as files:
+                        if not files:
+                            resolution.append({"unavailable": "用户未提供该条目文件"})
+                            continue
+                        provided = []
+                        for asset_no, f in enumerate(files, start=1):
+                            file_count += 1
+                            rel = f.relative_path
+                            # 外部文件名不进入托管路径/ref（文件名可含换行/```/引号，直接进 prompt 会注入）。
+                            # 请求条目仍保留 expected_files；真实原相对名只留 DB 审计字段，不参与路径解析。
+                            safe_name = f"asset-{asset_no}"
+                            stage_dest = stage_root / str(i) / safe_name
+                            preview_limit = min(
+                                _MAX_ASSET_PREVIEW_BYTES,
+                                max(0, _MAX_REQUEST_PREVIEW_BYTES - preview_bytes))
+                            size, digest, preview, preview_size, preview_truncated = _copy_hash_regular(
+                                f, stage_dest, source_root=src,
+                                remaining_bytes=(self.max_managed_bytes - existing_managed_bytes
+                                                 - total_bytes),
+                                preview_limit_bytes=preview_limit)
+                            total_bytes += size
+                            preview_bytes += preview_size
+                            final_dest = dest_root / str(i) / safe_name
+                            opaque_ref = f"user-file-request:r{request_id}:item:{i}:asset:{asset_no}"
+                            asset = {
+                                "path": str(final_dest),
+                                "ref": opaque_ref,
+                                "original_relpath": rel.as_posix(),
+                                "hash": digest,
+                                "hash_alg": "sha256",
+                                "size_bytes": size,
+                            }
+                            if preview is not None:
+                                asset["preview"] = preview
+                                if preview_truncated:
+                                    asset["preview_truncated"] = True
+                            provided.append(asset)
+                            asset_manifest.append({
+                                "ref": opaque_ref,
+                                "relative_path": f"{i}/{safe_name}",
+                                "sha256": digest,
+                                "size_bytes": size,
+                            })
+                        _fsync_directory(stage_root / str(i))
+                        populated_items.append(i)
+                        resolution.append({"provided": provided})
             if existing_goal_assets + file_count > _MAX_MANAGED_FILES_PER_GOAL:
                 raise ValueError(
                     f"goal {goal_id} resolved 资产累计将达 {existing_goal_assets + file_count}，"
