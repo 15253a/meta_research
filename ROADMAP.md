@@ -15,8 +15,8 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑪ CP11.2b 人类控制面**。CP11.2a 用户文件资产原子接纳、goal-wide 有界回执与生成时最小授权已落 `c077cd2`（staged-only 全量 844）；当前提交已隔离的
-  console confirm/reject 与 file request resolve/cancel HTTP→spool→run 单写控制链。步①–⑨已完成；步⑩ CP10.1/CP10.2 已完成，CP10.3 对账收口待后续；步⑪ CP11.1 已完成，CP11.2b/CP11.3/CP11.4 继续。
+- 进行中的步 / 检查点：**步⑪ CP11.2b.3 reference 完整控制能力**。CP11.2a/CP11.2a.1 用户文件资产与嵌套树身份已落 `c077cd2`/`3c4c9b4`；
+  CP11.2b.1–2 的鉴权 HTTP→durable spool→run 单写 confirm/reject/resolve/cancel 与常驻控制台已落 `10215db`（staged-only 全量 959）。步①–⑨已完成；步⑩ CP10.1/CP10.2 已完成，CP10.3 对账收口待后续；步⑪ CP11.1 已完成，CP11.2b.3/CP11.3/CP11.4 继续。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -364,8 +364,8 @@
     - [x] CP11.2a 用户文件资产闭环：原子接纳、goal-wide 有界回执、稳定 fd 真消费、生成时身份冻结与 root-global 并发/配额闭合。→ commit `c077cd2`（build_log 0049；staged-only 全量 844；外审两轮上限后全部本地修复）。
     - [x] CP11.2a.1 嵌套上传树身份跟进：逐组件 `openat(O_NOFOLLOW)` 固定目录/文件身份、同一 fd 复制与复制前后指纹复验，并为一次 resolve 的目录深度、目录项和目录数设置总预算；独立于控制面提交，保证 CP11.2b 可单独回退。→ commit `3c4c9b4`（build_log 0050；staged-only 定向 80、全量 857；外审第2轮 APPROVE）。
     - [ ] CP11.2b 人类控制面：真实 console confirm/reject + 文件请求 resolve/cancel + 生产 notifier 接线，继续保持 HTTP 进程 DB mode=ro、run 单写。
-      - [ ] CP11.2b.1 耐久动作入口与诚实语义：稳定 spool/cursor/retry、结构化动作 provenance、跨操作幂等域、abort 原子释放、note 真正进入 reasoning；尚未闭合的指令明确 rejected，禁止空效果伪报 consumed。
-      - [ ] CP11.2b.2 鉴权常驻控制台：loopback capability HTTP、默认 resident run、权威 live/ledger/文件投影与 fresh-snapshot 前端动作门。
+      - [x] CP11.2b.1 耐久动作入口与诚实语义：稳定 spool/cursor/retry、结构化动作 provenance、跨操作幂等域、abort 原子释放、note 真正进入 reasoning；尚未闭合的指令明确 rejected，禁止空效果伪报 consumed。→ commit `10215db`（build_log 0051；与 b.2 合并闭合真实生产入口）。
+      - [x] CP11.2b.2 鉴权常驻控制台：loopback capability HTTP、默认 resident run、权威 live/ledger/文件投影与 fresh-snapshot 前端动作门。→ commit `10215db`（staged-only 定向 292、全量 959；外审两轮上限后全部装配 BLOCKER 本地修复）。
       - [ ] CP11.2b.3 reference 完整控制能力：动态 set_budget、reprioritize、goal_amend reasoning-only 路由、只读 Codex query responder 与真实 connector 投递。
   - [ ] CP11.3 状态与执行边界：critical/budget_estimate 落库与早退、goal 最新版、orchestrator 单实例锁、超时终止进程组。
   - [ ] CP11.4 残余架构边界：调用意图/回执补账、执行容器/VM 隔离与内容寻址 artifact store 方案化。
