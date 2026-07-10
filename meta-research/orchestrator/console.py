@@ -27,8 +27,9 @@ prune_branch（decision(type=prune_branch) 先行再 dead_end，且**该决策�
 人类决策，不重复记账）、note（按 consumed_cycle 真正编入下一次 reasoning ContextPack）。
 `set_budget` 以消费 DECISION 的完整预算投影为耐久权威，所有预算消费者重启后同源读取；
 `reprioritize` 的 pin/boost/suppress 由 StateStore 在 selection 提交时机械执行并另记实际效果。
-`goal_amend` 在 reasoning-only 路由闭合前仍**不得标 consumed**：precheck 会把它终态 rejected，避免
-“状态显示已应用、实际上无效果”的假控制面。
+`goal_amend` 的消费只登记经确认的新目标语义；真正的 GOAL 新版本由随后专用
+``route='goal_amend'`` reasoning 轮在同一收尾事务中创建。消费决策与应用决策分别绑定同一
+directive，通知层在应用决策提交前只显示 ``pending_effect``，避免“已消费=已改版”的假成功。
 
 **P1**：query/reply/ACK 不写 decision；人机原文只在 interaction_*。
 """
@@ -197,6 +198,51 @@ def _parse_reprioritize(text: str) -> Dict[str, Any]:
             "adjust": magnitude if mode == "boost" else -magnitude}
 
 
+def _parse_goal_amend(text: str) -> Dict[str, Any]:
+    """Parse a confirmed goal revision without asking the model to guess it.
+
+    The explicit form is a JSON object containing ``new_goal_text`` and
+    optionally ``predicate_json`` / ``rationale_md``.  The shorthand form is
+    deliberately narrow: text after 改目标/修订目标/``goal amend`` becomes the
+    complete new goal text.  The confirmed payload is therefore a stable,
+    machine-checkable authority for the later reasoning tree operation.
+    """
+    match = re.search(r"(?i)(改目标|修订目标|goal\s+amend)", text)
+    if match is None:
+        raise ValueError("goal_amend 缺明确的新目标")
+    suffix = text[match.end():].strip()
+    suffix = re.sub(r"^(?:[：:，,\-]\s*)", "", suffix)
+    if suffix.startswith("{"):
+        try:
+            explicit = json.loads(suffix)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"JSON 参数非法: {error.msg}") from error
+        if not isinstance(explicit, dict):
+            raise ValueError("goal_amend JSON 参数须为 object")
+        allowed = {"new_goal_text", "predicate_json", "rationale_md"}
+        unknown = set(explicit) - allowed
+        if unknown:
+            raise ValueError(f"goal_amend 不允许字段: {sorted(unknown)}")
+        value = dict(explicit)
+    else:
+        new_text = re.sub(r"^(?:改成|改为|为|to)\s*", "", suffix,
+                          flags=re.IGNORECASE).strip()
+        value = {"new_goal_text": new_text}
+
+    new_goal_text = value.get("new_goal_text")
+    if not isinstance(new_goal_text, str) or not new_goal_text.strip():
+        raise ValueError("goal_amend.new_goal_text 须为非空字符串")
+    value["new_goal_text"] = new_goal_text.strip()
+    predicate = value.get("predicate_json")
+    if "predicate_json" in value and not isinstance(predicate, dict):
+        raise ValueError("goal_amend.predicate_json 须为 JSON object")
+    rationale = value.get("rationale_md", "用户明确修订研究目标")
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise ValueError("goal_amend.rationale_md 须为非空字符串")
+    value["rationale_md"] = rationale.strip()
+    return value
+
+
 class KeywordClassifier:
     """廉价关键词保守分类（确定性）。返回 {intent, kind?, hardness?, consume_at?, polished?}。"""
 
@@ -220,6 +266,8 @@ class KeywordClassifier:
                         structured["budget_patch"] = _parse_budget_patch(text)
                     elif kind == "reprioritize":
                         structured.update(_parse_reprioritize(text))
+                    elif kind == "goal_amend":
+                        structured.update(_parse_goal_amend(text))
                 except ValueError as error:
                     parse_error = str(error)
                     structured["parse_error"] = parse_error
@@ -372,7 +420,7 @@ class Console:
         读校验与更新同事务（防 TOCTOU，同 consume）。"""
         with self.daemon.transaction() as conn:
             row = conn.execute(
-                "SELECT status,hardness,payload_json,source_interaction_message_id FROM directive WHERE id=?",
+                "SELECT status,hardness,payload_json,source_interaction_message_id,kind FROM directive WHERE id=?",
                                (directive_id,)).fetchone()
             if row is None:
                 raise ValueError(f"directive 不存在: {directive_id}")
@@ -392,6 +440,62 @@ class Console:
                 raise ValueError(f"directive {directive_id} confirmed 字段损坏")
             payload["confirmed"] = True
             payload["confirmation_message_id"] = confirm_message_id
+            if row[4] == "goal_amend":
+                # 解析失败的“修订”没有可确认的机械语义。确认动作仍作为 provenance 留在 payload，
+                # 但同事务终态拒绝并记 orchestrator decision；它绝不能覆盖旧的有效修订或占用专用轮。
+                if payload.get("parse_error"):
+                    reason = f"goal_amend 参数未解析: {payload['parse_error']}"
+                    payload["rejection_reason"] = reason[:2_000]
+                    payload["rejection_kind"] = "application_unavailable"
+                    conn.execute(
+                        "INSERT INTO decision(directive_id,actor,type,payload_json) "
+                        "VALUES (?,'orchestrator','directive_application_rejected',?)",
+                        (directive_id, json.dumps(
+                            {"reason": reason[:2_000]}, ensure_ascii=False)))
+                    changed = conn.execute(
+                        "UPDATE directive SET status='rejected',payload_json=? "
+                        "WHERE id=? AND status='pending'",
+                        (json.dumps(payload, ensure_ascii=False), directive_id)).rowcount
+                    if changed != 1:
+                        raise RuntimeError(f"directive {directive_id} 终态拒绝竞态：更新失败")
+                    return
+                source_goal = conn.execute(
+                    "SELECT goal_id,goal_ver FROM interaction_message WHERE id=?", (row[3],)).fetchone()
+                current = (conn.execute(
+                    "SELECT id,version FROM goal WHERE id=? ORDER BY version DESC LIMIT 1",
+                    (source_goal[0],)).fetchone()
+                    if source_goal is not None and source_goal[0] is not None else None)
+                # A revision is meaningful only against the exact immutable
+                # goal version the user saw.  Confirming stale UI must converge
+                # to a visible terminal state, never leave a poison pending row.
+                if source_goal is None or current is None or source_goal != current:
+                    payload["superseded_reason"] = "source_goal_not_current"
+                    conn.execute(
+                        "UPDATE directive SET status='superseded',payload_json=? "
+                        "WHERE id=? AND status='pending'",
+                        (json.dumps(payload, ensure_ascii=False), directive_id))
+                    return
+                newer = conn.execute(
+                    "SELECT d.id FROM directive d JOIN interaction_message m "
+                    "ON m.id=d.source_interaction_message_id "
+                    "WHERE d.id>? AND d.kind='goal_amend' AND d.status='pending' "
+                    "AND json_extract(d.payload_json,'$.confirmed')=1 "
+                    "AND json_type(d.payload_json,'$.parse_error') IS NULL "
+                    "AND json_type(d.payload_json,'$.new_goal_text')='text' "
+                    "AND trim(json_extract(d.payload_json,'$.new_goal_text'))<>'' "
+                    "AND json_type(d.payload_json,'$.rationale_md')='text' "
+                    "AND trim(json_extract(d.payload_json,'$.rationale_md'))<>'' "
+                    "AND (json_type(d.payload_json,'$.predicate_json') IS NULL "
+                    "OR json_type(d.payload_json,'$.predicate_json')='object') "
+                    "AND m.goal_id=? AND m.goal_ver=? ORDER BY d.id DESC LIMIT 1",
+                    (directive_id, source_goal[0], source_goal[1])).fetchone()
+                if newer is not None:
+                    payload["superseded_reason"] = f"newer_confirmed_goal_amend:d{newer[0]}"
+                    conn.execute(
+                        "UPDATE directive SET status='superseded',payload_json=? "
+                        "WHERE id=? AND status='pending'",
+                        (json.dumps(payload, ensure_ascii=False), directive_id))
+                    return
             n = conn.execute("UPDATE directive SET payload_json=? WHERE id=? AND status='pending'",
                              (json.dumps(payload, ensure_ascii=False), directive_id)).rowcount
             if n != 1:        # 兜底同 consume（同事务已校验，理论不可达）
@@ -405,6 +509,45 @@ class Console:
                     "AND kind='reprioritize' AND hardness='hard' AND status='pending' "
                     "AND json_extract(payload_json,'$.mode')='pin'",
                     (directive_id,))
+            if row[4] == "goal_amend":
+                # Only the latest *confirmed* revision is effective.  A newer
+                # unconfirmed draft has zero state effect and is retained.
+                conn.execute(
+                    "UPDATE directive SET status='superseded' WHERE id<? "
+                    "AND kind='goal_amend' AND status='pending' "
+                    "AND source_interaction_message_id IN ("
+                    "SELECT id FROM interaction_message WHERE goal_id=? AND goal_ver=?)",
+                    (directive_id, source_goal[0], source_goal[1]))
+
+    def supersede_stale_goal_amends(self) -> None:
+        """Terminalize confirmed amendments whose source goal is no longer current.
+
+        This is called at every precheck, including the no-cycle boundary, so a
+        crash/restart or a previously applied newer revision cannot leave an
+        unreachable pending directive in the control plane.
+        """
+        stale_where = (
+            "d.kind='goal_amend' AND d.status='pending' "
+            "AND json_extract(d.payload_json,'$.confirmed')=1 "
+            "AND (m.goal_id IS NULL OR m.goal_ver IS NULL OR m.goal_ver IS NOT "
+            "(SELECT max(g.version) FROM goal g WHERE g.id=m.goal_id))")
+        if self.daemon.query_one(
+                "SELECT 1 FROM directive d LEFT JOIN interaction_message m "
+                "ON m.id=d.source_interaction_message_id "
+                f"WHERE {stale_where} LIMIT 1") is None:
+            return                              # common path: no write transaction / lock
+        with self.daemon.transaction() as conn:
+            rows = conn.execute(
+                "SELECT d.id,d.payload_json FROM directive d "
+                "LEFT JOIN interaction_message m ON m.id=d.source_interaction_message_id "
+                f"WHERE {stale_where} ORDER BY d.id").fetchall()
+            for did, payload_raw in rows:
+                payload = json.loads(payload_raw)
+                payload["superseded_reason"] = "source_goal_not_current"
+                conn.execute(
+                    "UPDATE directive SET status='superseded',payload_json=? "
+                    "WHERE id=? AND status='pending'",
+                    (json.dumps(payload, ensure_ascii=False), did))
 
     def reject_directive(self, *, directive_id: int, reason: str, reject_message_id: Optional[int] = None,
                          by_decision: bool = False, cycle_id: Optional[str] = None) -> None:
@@ -509,19 +652,18 @@ class Console:
         ci = _cnum(cycle_id) if cycle_id else None
         with self.daemon.transaction() as conn:
             row = conn.execute(
-                "SELECT kind,hardness,status,consume_at,payload_json FROM directive WHERE id=?",
+                "SELECT d.kind,d.hardness,d.status,d.consume_at,d.payload_json,"
+                "m.goal_id,m.goal_ver FROM directive d LEFT JOIN interaction_message m "
+                "ON m.id=d.source_interaction_message_id WHERE d.id=?",
                                (directive_id,)).fetchone()
             if row is None:
                 raise ValueError(f"directive 不存在: {directive_id}")
-            kind, hardness, status, consume_at, payload_raw = row
+            kind, hardness, status, consume_at, payload_raw, source_goal_id, source_goal_ver = row
             if status != "pending":
                 raise ValueError(f"directive {directive_id} 非 pending（{status}），不可消费")
             payload = json.loads(payload_raw)
             if hardness == "hard" and not payload.get("confirmed"):
                 raise ValueError(f"硬指令 {directive_id}（{kind}）未经回显确认，不可消费（§4.6.2 润色确认硬门）")
-            if kind == "goal_amend":
-                raise DirectiveApplicationError(
-                    f"{kind} 尚未接入其 reference 要求的真实状态语义，拒绝伪装为已应用")
             # Only reasoning_start directives are compiled into this cycle's reasoning pack.  Operational
             # immediate controls (especially resume/abort) must remain available even after the prompt budget
             # is full, otherwise a note flood could make a paused cycle impossible to resume.
@@ -600,6 +742,61 @@ class Console:
                             or (mode == "boost") != (adjust > 0)):
                         raise DirectiveApplicationError(f"reprioritize {mode} 缺合法有符号 adjust")
                     effect["adjust"] = float(adjust)
+            elif kind == "goal_amend":
+                if ci is None:
+                    raise DirectiveApplicationError("goal_amend 必须绑定专用 reasoning cycle")
+                route_row = conn.execute(
+                    "SELECT route FROM cycle WHERE id=? AND status NOT IN ('done','failed','aborted')",
+                    (ci,)).fetchone()
+                if route_row is None or route_row[0] != "goal_amend":
+                    raise DirectiveApplicationError("goal_amend 只能在 route='goal_amend' 的在途轮消费")
+                if payload.get("parse_error"):
+                    raise DirectiveApplicationError(
+                        f"goal_amend 参数未解析: {payload['parse_error']}")
+                new_goal_text = payload.get("new_goal_text")
+                rationale = payload.get("rationale_md")
+                if not isinstance(new_goal_text, str) or not new_goal_text.strip():
+                    raise DirectiveApplicationError("goal_amend 缺非空 new_goal_text")
+                if not isinstance(rationale, str) or not rationale.strip():
+                    raise DirectiveApplicationError("goal_amend 缺非空 rationale_md")
+                current = conn.execute(
+                    "SELECT id,version,predicate_json FROM goal WHERE id=? "
+                    "ORDER BY version DESC LIMIT 1", (source_goal_id,)).fetchone()
+                if current is None or (source_goal_id, source_goal_ver) != current[:2]:
+                    raise DirectiveApplicationError(
+                        "goal_amend source goal 已过期；必须基于当前目标版本重新提交并确认")
+                if conn.execute(
+                        "SELECT 1 FROM directive WHERE kind='goal_amend' AND status='consumed' "
+                        "AND consumed_cycle=? LIMIT 1", (ci,)).fetchone() is not None:
+                    raise DirectiveApplicationError(f"cycle c{ci} 已消费另一条 goal_amend")
+                routed = conn.execute(
+                    "SELECT directive_id FROM decision WHERE cycle_id=? "
+                    "AND actor='orchestrator' AND type IN ('goal_amend_routed','goal_amend_rebound') "
+                    "ORDER BY id DESC LIMIT 1", (ci,)).fetchone()
+                if routed is not None and routed[0] != directive_id:
+                    conn.execute(
+                        "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+                        "VALUES (?,?,'orchestrator','goal_amend_rebound',?)",
+                        (ci, directive_id, json.dumps({
+                            "previous_directive_id": routed[0],
+                            "reason": "newer_confirmed_amend_before_reasoning_start",
+                        }, ensure_ascii=False)))
+                predicate = payload.get("predicate_json")
+                if predicate is None:
+                    try:
+                        predicate = json.loads(current[2])
+                    except json.JSONDecodeError as error:
+                        raise DirectiveApplicationError("当前 goal.predicate_json 损坏") from error
+                if not isinstance(predicate, dict):
+                    raise DirectiveApplicationError("goal_amend.predicate_json 须为 object")
+                effect.update({
+                    "new_goal_text": new_goal_text.strip(),
+                    "predicate_json": predicate,
+                    "rationale_md": rationale.strip(),
+                    "source_goal_ver": current[1],
+                    "target_goal_ver": current[1] + 1,
+                    "applies_to_reasoning_cycle": cycle_id,
+                })
             elif kind == "inject_question":
                 # goal_id=1 + MAX(version) = 全库单目标约定（statestore/advancer 同口径）；多目标=系统级改造
                 if conn.execute("SELECT 1 FROM goal WHERE id=1 LIMIT 1").fetchone() is None:

@@ -6,7 +6,7 @@
 
 **装配序**（幂等可恢复）：database.connect（新库建、既有库续，checksum 三重锁）→ WriteDaemon →
 SQLiteStateStore → **查 goal 是否存在：仅首次才 parse_goal_brief + create_goal**（既有库续跑不依赖
-brief 文件）→ goal_body_md 取 DB goal.text（权威）→ SqliteCompiler/StatusPublisher（各**只读连接**）→
+brief 文件）→ SqliteCompiler/StatusPublisher 在各自**只读快照**按 cycle 的精确 goal 版本取正文 →
 StopController + Console + make_advancer_precheck → StageProvider(CodexRunner) → SqliteAdvancer(全注入)。
 重启同 work_dir 即续跑（状态在 DB，非进程内）——kill-9 恢复同 M3。
 
@@ -160,17 +160,12 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
         brief = parse_goal_brief(root / "input" / "goal_brief.md")
         state.create_goal(text=brief["body_md"], predicate_json=brief["predicate_json"])
 
-    # **goal_body_md 以 DB goal.text 为权威**（内审 SHOULD）：重启时若 operator 改过 goal_brief.md，
-    # 编译器/发布器若用新 brief 会与 DB goal_ver 绑定的目标漂移（污染 context pack「目标全文」+ 卡片
-    # 摘要），绕过 goal_amend。故取 DB 里当前 goal 正文——首次运行它 == brief body，无行为变化。
-    goal_body = daemon.query_one("SELECT text FROM goal WHERE id=1")[0]
-
     # compiler/publisher 各用**只读连接**（外审 BLOCKER：单写纪律——入口层就 enforce 只读边界，
     # 防 compiler 侧误写绕过 WriteDaemon/账本/authorizer）。open_responder_read_conn = mode=ro+全写拒
     # authorizer（放行 SELECT/TRANSACTION，render/publish 的 BEGIN…COMMIT 读快照可跑）。
-    compiler = SqliteCompiler(open_responder_read_conn(db_path), policy, goal_body_md=goal_body)
+    compiler = SqliteCompiler(open_responder_read_conn(db_path), policy)
     publisher = SqliteStatusPublisher(open_responder_read_conn(db_path), policy=policy,
-                                      goal_body_md=goal_body, out_path=str(work / "state" / "status_card.json"))
+                                      out_path=str(work / "state" / "status_card.json"))
     stop = StopController(daemon, policy)
     console = Console(daemon, policy=policy)
     # sidecar 创建与控制台 resolve/cancel 共用同一服务实例；托管文件必须落在**本次 work_root** 内：

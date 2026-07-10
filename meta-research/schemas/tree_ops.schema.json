@@ -116,8 +116,8 @@
     },
     "amend_goal": {
       "type": "object",
-      "description": "goal_amend 轮专用：INSERT goal 新版本 + open 重打分（StateStore 落地）",
-      "required": ["op", "new_goal_text", "rationale_md"],
+      "description": "goal_amend 轮专用：必须是批次首个且恰一；字段须与已确认 directive 完全一致。StateStore INSERT goal 新版本、迁移 open/inconclusive 并清空旧分数",
+      "required": ["op", "new_goal_text", "predicate_json", "rationale_md"],
       "additionalProperties": false,
       "properties": {
         "op": { "const": "amend_goal" },

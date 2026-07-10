@@ -68,7 +68,7 @@ def running(tmp_path):
     daemon.conn.commit()
     card_path = work / "state" / "status_card.json"
     SC.SqliteStatusPublisher(open_responder_read_conn(db_path), policy=POLICY,
-                             goal_body_md="目标首行\n次行", out_path=str(card_path)).publish("c1")
+                             out_path=str(card_path)).publish("c1")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 绕过 shell HTTP_PROXY（本机直连）
     opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
     httpd = CS.serve(db_path, str(work), str(SYSTEM_ROOT), host="127.0.0.1", port=0,

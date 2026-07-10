@@ -128,7 +128,7 @@ def test_set_budget_is_durable_authority_for_schedule_stop_and_ledger(env):
         "SELECT policy_version FROM ledger WHERE runner_call_id=?", (runner_call,))[0]
     assert version != policy_fingerprint(POLICY)  # row binds the effective runtime policy
     card_budget = build_status_card(
-        daemon.conn, cycle_id="c1", policy=POLICY, goal_body_md="g")["budget"]
+        daemon.conn, cycle_id="c1", policy=POLICY)["budget"]
     assert card_budget["B_t"] == 7.0
     assert card_budget["cycle_spent"] == pytest.approx(0.3)
     assert card_budget["global_remaining"] == pytest.approx(199.7)

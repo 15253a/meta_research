@@ -35,7 +35,7 @@ def _seed(conn):
 def comp():
     conn = db.connect(":memory:")
     _seed(conn)
-    return SqliteCompiler(conn, POLICY, goal_body_md="目标全文正文（跨数据集 EEG 通用规律）")
+    return SqliteCompiler(conn, POLICY)
 
 
 def _bytes(pack):
@@ -120,6 +120,20 @@ def test_open_set_scoped_to_goal(comp):
     comp.conn.execute("COMMIT")
     p = comp.render(cycle_id="c1", stage="reasoning")   # cycle 1 属 goal 1
     assert "别 goal 的问题" not in p.anchor_md
+
+
+def test_open_set_scoped_to_cycle_goal_version(comp):
+    """历史 cycle 的 v1 目标锚不得混入同 goal 的 v2 前沿。"""
+    comp.conn.executescript("""
+      INSERT INTO goal(id,version,text,predicate_json,previous_version)
+        VALUES (1,2,'g-v2','{}',1);
+      INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source)
+        VALUES (99,1,2,2,'只属于 v2 的开放问题','open','goal_amend');
+    """)
+    comp.conn.commit()
+    p = comp.render(cycle_id="c1", stage="reasoning")
+    assert "只属于 v2 的开放问题" not in p.anchor_md
+    assert "db:schedulable:1:v1" in p.sources
 
 
 def test_different_stage_different_pack(comp):

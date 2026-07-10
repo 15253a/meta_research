@@ -36,7 +36,7 @@ def env(tmp_path):
     daemon.conn.commit()
     card_path = tmp_path / "state" / "status_card.json"
     pub = SC.SqliteStatusPublisher(open_responder_read_conn(dbp), policy=POLICY,
-                                   goal_body_md="目标首行\n次行", out_path=str(card_path))
+                                   out_path=str(card_path))
     pub.publish("c1")
     return {"dbp": dbp, "daemon": daemon, "pub": pub, "card_path": card_path,
             "med": Mediator(daemon, str(card_path))}
@@ -184,10 +184,10 @@ def test_advancer_publishes_at_stage_boundary(tmp_path):
     daemon = WriteDaemon(db.connect(dbp))
     state = SQLiteStateStore(daemon, POLICY)
     state.create_goal(text="g", predicate_json={})
-    compiler = SqliteCompiler(db.connect(dbp), POLICY, goal_body_md="g")
+    compiler = SqliteCompiler(db.connect(dbp), POLICY)
     card_path = tmp_path / "sc.json"
     pub = SC.SqliteStatusPublisher(open_responder_read_conn(dbp), policy=POLICY,
-                                   goal_body_md="g", out_path=str(card_path))
+                                   out_path=str(card_path))
 
     def provider(cyc, pack):    # 创世轮产物：建根 + 终止（最短可跑）
         return {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根问题", "local_key": "r"}]},

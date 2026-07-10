@@ -84,7 +84,7 @@ def _mk(path):
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY)
     state.create_goal(text="长跑目标", predicate_json={})
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="长跑目标")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
     return daemon, state, compiler
 
 
@@ -140,7 +140,7 @@ def test_longrun_restart_equivalence(tmp_path):
     seg1 = SqliteAdvancer(s1, c1, _bounded_provider(d1)).run_cycles(max_cycles=6)
     assert 0 < len(seg1) < len(full) and s1.last_done_cycle().next_intent != "terminate"  # 确在途、未收口
     d2 = WriteDaemon(db.connect(seg)); s2 = SQLiteStateStore(d2, POLICY)
-    c2 = SqliteCompiler(db.connect(seg), POLICY, goal_body_md="长跑目标")
+    c2 = SqliteCompiler(db.connect(seg), POLICY)
     seg2 = SqliteAdvancer(s2, c2, _bounded_provider(d2)).run_cycles(max_cycles=200)   # 新实例续跑到 done
     assert len(seg2) > 0                                      # 续跑段真推进（防退化为「跑完再空 resume」的空真）
 
@@ -164,7 +164,7 @@ def test_longrun_tau_selfstop_on_decay(tmp_path):
     # 重启仍拒推进（durable 停机）——**全新实例**（重开 DB + 新 daemon/state/compiler/StopController），
     # 证停机事实在 DB 而非对象内存缓存（外审 BLOCKER）
     d2 = WriteDaemon(db.connect(path)); s2 = SQLiteStateStore(d2, POLICY)
-    c2 = SqliteCompiler(db.connect(path), POLICY, goal_body_md="长跑目标")
+    c2 = SqliteCompiler(db.connect(path), POLICY)
     adv2 = SqliteAdvancer(s2, c2, _bounded_provider(d2, terminate=False, score=0.1),
                           stop_controller=StopController(d2, POLICY))
     assert adv2.run_cycles(max_cycles=10) == []              # 新实例读 DB 里的 global_stop → 拒推进

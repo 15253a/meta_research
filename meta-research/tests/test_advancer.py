@@ -85,7 +85,7 @@ def env(tmp_path):
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY)
     state.create_goal(text="EEG 跨数据集通用规律研究", predicate_json={})
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="EEG 跨数据集通用规律研究")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
     return state, compiler
 
 
@@ -244,7 +244,7 @@ def test_run_cycles_resume_after_restart(tmp_path):
     def _fresh(p):
         daemon = WriteDaemon(db.connect(p))
         st = SQLiteStateStore(daemon, POLICY)
-        comp = SqliteCompiler(db.connect(p), POLICY, goal_body_md="EEG 通用规律研究")
+        comp = SqliteCompiler(db.connect(p), POLICY)
         return daemon, st, comp
 
     # 参照：一次跑完（另一库）
@@ -272,7 +272,7 @@ def test_kill9_recovery_final_state_identical(tmp_path):
     ref = str(tmp_path / "ref.sqlite")
     d0 = WriteDaemon(db.connect(ref)); s0 = SQLiteStateStore(d0, POLICY)
     s0.create_goal(text="EEG 通用规律研究", predicate_json={})
-    c0 = SqliteCompiler(db.connect(ref), POLICY, goal_body_md="EEG 通用规律研究")
+    c0 = SqliteCompiler(db.connect(ref), POLICY)
     SqliteAdvancer(s0, c0, _seq_provider).run_cycles(max_cycles=8)
     d0.conn.close(); c0.conn.close()
 
@@ -300,7 +300,7 @@ def test_kill9_recovery_final_state_identical(tmp_path):
             open({str(marker)!r}, "w").close()   # 已进 decompose 轮、阶段将写未写 → 信号父可杀
             time.sleep(60)                        # 挂起等 kill -9（decompose 阶段永不提交）
         s = SQLiteStateStore(WriteDaemon(db.connect({path!r})), POL)
-        comp = SqliteCompiler(db.connect({path!r}), POL, goal_body_md="EEG 通用规律研究")
+        comp = SqliteCompiler(db.connect({path!r}), POL)
         SqliteAdvancer(s, comp, prov).run_cycles(max_cycles=8)
     """), encoding="utf-8")
 
@@ -319,7 +319,7 @@ def test_kill9_recovery_final_state_identical(tmp_path):
 
     # 续跑（全新实例指向同库 = 重启进程语义）→ 正常 provider 完成 decompose→terminate
     d2 = WriteDaemon(db.connect(path)); s2 = SQLiteStateStore(d2, POLICY)
-    c2 = SqliteCompiler(db.connect(path), POLICY, goal_body_md="EEG 通用规律研究")
+    c2 = SqliteCompiler(db.connect(path), POLICY)
     ids = SqliteAdvancer(s2, c2, _seq_provider).run_cycles(max_cycles=8)
     d2.conn.close(); c2.conn.close()
 

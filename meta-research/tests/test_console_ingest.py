@@ -40,7 +40,7 @@ def env(tmp_path):
     work = tmp_path                                    # work_root：state/ 落 card + inbox + cursor
     card_path = work / "state" / "status_card.json"
     pub = SC.SqliteStatusPublisher(open_responder_read_conn(dbp), policy=POLICY,
-                                   goal_body_md="目标首行\n次行", out_path=str(card_path))
+                                   out_path=str(card_path))
     pub.publish("c1")
     console = Console(daemon)
     mediator = Mediator(daemon, str(card_path))
@@ -111,6 +111,8 @@ def test_ingest_directive_creates_pending(env):
     assert env["ingest"].ingest() == 1
     msg = env["daemon"].query_one("SELECT id FROM interaction_message WHERE connector='console' AND idempotency_key='console-1'")
     assert msg is not None
+    assert env["daemon"].query_one(
+        "SELECT goal_id,goal_ver FROM interaction_message WHERE id=?", (msg[0],)) == (1, 1)
     d = env["daemon"].query_one("SELECT kind, status, json_extract(payload_json,'$.confirmed') FROM directive WHERE kind='pause'")
     assert d == ("pause", "pending", 0)                # 硬指令 confirmed=false（待回显确认）
 

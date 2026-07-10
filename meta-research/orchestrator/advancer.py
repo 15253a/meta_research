@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .cost_ledger import BudgetExhausted, CostAccountingFailed
+from .ids import cnum as _cnum
 from .interfaces import PlanOutcome, Route, Selection, Stage, StageBlockedOnResources
 
 # reasoning 产物提供者：(cycle, context_pack) -> {"tree_ops.json":{...}, "selection.json":{...}, "answer.json"?:{...}}
@@ -190,12 +191,13 @@ class SqliteAdvancer:
         if cyc is None:
             prior = self.state.last_done_cycle()
             if prior is not None:
-                if prior.next_intent == "terminate":
+                pending_amend = self.state.pending_goal_amend_directive()
+                if prior.next_intent == "terminate" and pending_amend is None:
                     return None              # 上轮选择停机（持久标志）
                 # **开新轮前**拒不支持的续轮（免落 route=None 死轮）：attack 须已装配 AttackStages（M4 CP5.4）。
-                if prior.next_intent == "attack" and self.attack is None:
+                if pending_amend is None and prior.next_intent == "attack" and self.attack is None:
                     raise NotImplementedError("attack 续轮需装配 attack=AttackStages（M4 CP5.4）")
-                if prior.next_intent not in ("decompose", "attack"):
+                if pending_amend is None and prior.next_intent not in ("decompose", "attack"):
                     raise NotImplementedError(f"未知续轮 intent: {prior.next_intent!r}")
             cyc = self.state.open_or_resume_cycle()   # 无在途轮 → 创建新轮（created, route=None）
         if cyc.route is None:                # 新轮/未 setup → 定 route + decompose 激活目标
@@ -214,6 +216,23 @@ class SqliteAdvancer:
             prior = self.state.last_done_cycle()   # 事务内读（与 route 二次核同一快照，NIT）；done 轮不可变，读位不影响正确性
             if prior is None:
                 self.state.set_route(cyc.cycle_id, "bootstrap")        # 首轮创世
+                return
+            amend_id = self.state.pending_goal_amend_directive()
+            if amend_id is not None:
+                # Reference §2.3 rule 2 precedes prior terminate/decompose/attack.
+                # No question becomes active: this is a dedicated reasoning-only
+                # control cycle bound to the current immutable goal version.
+                self.state.set_goal_amend_route(cyc.cycle_id, amend_id)
+                return
+            if prior.next_intent == "terminate":
+                # A confirmed amendment may be rejected/superseded between the
+                # pre-open check and this transactional route decision.  Leave no
+                # route=NULL poison cycle; abort it and resume the prior stop.
+                self.state.daemon.conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'orchestrator','route_setup_cancelled',?)",
+                    (_cnum(cyc.cycle_id), '{"reason":"goal_amend_no_longer_pending"}'))
+                self.state.mark_cycle_done(cyc.cycle_id, "aborted")
                 return
             if prior.next_intent == "attack":
                 # attack 起手 route='attack'（§2.3 规则5：route 在 plan 后特化——本实现 plan 只落 build 目标，
@@ -240,18 +259,36 @@ class SqliteAdvancer:
             if self.attack is None:
                 raise NotImplementedError("attack 轮需装配 attack=AttackStages（M4 CP5.4）")
             return self.attack.advance_stage(cyc)   # 按 cycle.status 游标推进一格（多格轮，run_cycles 内循环驱动）
-        if cyc.route not in ("bootstrap", "decompose"):
+        if cyc.route not in ("bootstrap", "decompose", "goal_amend"):
             raise NotImplementedError(f"未支持的 route={cyc.route!r}（reuse_only/eval_only/dependency_wait 特化随对应 plan 形态接入）")
         self._reasoning_cycle(cyc)
         return "done"
 
     def _reasoning_cycle(self, cyc) -> None:
-        """reasoning-only 轮（bootstrap/decompose）：render→取产物→**单一 atomic 事务**落 tree_ops + selection + mark_done。
+        """reasoning-only 轮（bootstrap/decompose/goal_amend）：render→取产物→**单一 atomic 事务**收尾。
 
         - 长操作（render / provider = Codex）在事务**外**（§6.13 铁律：绝不持写事务）；只把短写序列裹进 atomic。
         - atomic 契约（statestore）：块内任一写抛异常须传播中止整事务（半写随事务回滚、投影复原）——本方法不吞异常，
           故 kill-9 / 校验失败都留下干净的「阶段前」状态供重做（恢复语义）。
         - **fail closed**：bootstrap 须含 create_root（创世无根=系统无题可攻）；decompose 须含 add_children（对活跃父）。"""
+        if cyc.route == "goal_amend" and self.state.consumed_goal_amend_directive(cyc.cycle_id) is None:
+            # Crash-safe cancellation window: route was committed, but the
+            # bound directive was rejected/superseded before reasoning_start.
+            # Never call a model with an amendment route that has no confirmed
+            # authority; terminalize the empty control cycle and let the next
+            # loop derive from the previous successful selection.
+            with self.state.atomic():
+                fresh = self.state.cycle(cyc.cycle_id)
+                if (fresh.status not in ("done", "failed", "aborted")
+                        and self.state.consumed_goal_amend_directive(cyc.cycle_id) is None):
+                    self.state.daemon.conn.execute(
+                        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                        "VALUES (?,'orchestrator','goal_amend_cancelled_before_effect',?)",
+                        (_cnum(cyc.cycle_id),
+                         '{"reason":"no_consumed_goal_amend_directive"}'))
+                    self.state.mark_cycle_done(cyc.cycle_id, "aborted")
+            return
+
         pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="reasoning")
         files = self._reasoning(cyc, pack)   # 长操作（render / provider=Codex）在事务外（§6.13 铁律）
         with self.state.atomic():
@@ -260,7 +297,7 @@ class SqliteAdvancer:
             fresh = self.state.cycle(cyc.cycle_id)
             if fresh.status in ("done", "failed", "aborted"):
                 return
-            if fresh.route not in ("bootstrap", "decompose"):   # 防御：route 本不可变，二次核补全 TOCTOU 契约（NIT）
+            if fresh.route not in ("bootstrap", "decompose", "goal_amend"):   # 防御：route 本不可变
                 raise RuntimeError(f"reasoning-only 轮 route 在途被改？{fresh.route!r}")
             ops = self._validated_ops(files, fresh.route)
             if "selection.json" not in files:
@@ -279,10 +316,19 @@ class SqliteAdvancer:
 
     @staticmethod
     def _validated_ops(files: Dict[str, Any], route: str) -> list:
-        """fail-closed 产物校验：reasoning-only 轮必产 tree_ops，且 bootstrap 须含 create_root、decompose 须含 add_children。"""
+        """Fail closed on the route-specific reasoning tree contract."""
         if "tree_ops.json" not in files:
             raise ValueError(f"{route} 轮必产 tree_ops.json")
         ops = files["tree_ops.json"].get("ops", [])
+        if not isinstance(ops, list):
+            raise ValueError(f"{route} 轮 tree_ops.ops 须为数组")
+        if route == "goal_amend":
+            amend_indexes = [i for i, op in enumerate(ops)
+                             if isinstance(op, dict) and op.get("op") == "amend_goal"]
+            if amend_indexes != [0]:
+                raise ValueError(
+                    "goal_amend 轮须恰有一个 amend_goal 且必须是首个 op（先升版，再 seed/spawn）")
+            return ops
         need = "create_root" if route == "bootstrap" else "add_children"
         if not any(op.get("op") == need for op in ops):
             raise ValueError(f"{route} 轮 tree_ops 须含 {need}（fail closed；创世/分解无实质 op = 空转/无题）")

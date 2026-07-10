@@ -176,7 +176,7 @@ def test_run_cycles_stops_mid_run_on_score_floor(tmp_path):
     d = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(d, POLICY)
     state.create_goal(text="g", predicate_json={})
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="g")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
 
     def low_provider(cyc, pack):   # 造根、低分、选 decompose（非 terminate → 本应续跑）
         return {"tree_ops.json": {"ops": [{"op": "create_root", "text": "低价值根", "local_key": "root"}]},
@@ -202,7 +202,7 @@ def test_run_cycles_budget_gate_stops_before_any_round(tmp_path):
     d = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(d, POLICY)
     state.create_goal(text="g", predicate_json={})
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="g")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
     calls = []
 
     def provider(cyc, pack):
@@ -233,7 +233,7 @@ def test_controller_does_not_break_provider_terminate(tmp_path):
     d = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(d, POLICY)
     state.create_goal(text="g", predicate_json={})
-    compiler = SqliteCompiler(db.connect(path), POLICY, goal_body_md="g")
+    compiler = SqliteCompiler(db.connect(path), POLICY)
 
     def high_provider(cyc, pack):   # 造高分根 + terminate（正常收口）
         return {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根", "local_key": "root"}]},

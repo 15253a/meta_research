@@ -17,6 +17,7 @@ driver / Gate 的既有契约一致，未来 InMemory→SQLite 可透明替换�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from contextlib import contextmanager
@@ -68,23 +69,19 @@ class SQLiteStateStore:
         # 同批 local_key→qid（§6.10：StateStore 同事务内解析）；per-cycle 累积，跨 apply_tree_ops→
         # persist_selection 存活（进程内；跨重启的耐久是 M3 恢复主题，非 M1b 验收）。
         self._local_maps: Dict[str, Dict[str, str]] = {}
-        # goal_amend 轮 spawn 计数（in-memory，语义同 InMemoryStateStore._spawns_in_cycle：只数
-        # goal_amend 路由下的 spawn，不同于「本轮全部 spawn」）。与 _local_maps 同属**进程内投影**，
-        # 须随写事务回滚一并复原（否则 SQLite 复用回滚 rowid 会致 local_key 静默错绑，见 _projection_snapshot）。
-        self._spawns_in_cycle: Dict[str, int] = {}
 
     # -- 事务 / 读写原语 --------------------------------------------------------
-    # 进程内投影（_local_maps / _spawns_in_cycle）随 DB 事务同生共死：DB 回滚而投影不回滚 = 在
+    # 进程内投影（_local_maps / _bundle_cursor）随 DB 事务同生共死：DB 回滚而投影不回滚 = 在
     # 「本检查点要焊死的那一层」留半写（SQLite 复用回滚 rowid → 陈旧 local_key 静默错绑到别的问题）。
     # 故凡开写事务处（atomic() 外层 / 独立 apply_tree_ops）都先快照、异常回滚时复原（对齐
     # InMemoryStateStore._tree_snapshot/_tree_restore）。写计数（answer_review）走 DB decision 计数，
     # 随事务天然回滚，无需在此快照。
     def _projection_snapshot(self):
         return ({k: dict(v) for k, v in self._local_maps.items()},
-                dict(self._spawns_in_cycle), dict(self._bundle_cursor))
+                dict(self._bundle_cursor))
 
     def _projection_restore(self, snap) -> None:
-        self._local_maps, self._spawns_in_cycle, self._bundle_cursor = snap
+        self._local_maps, self._bundle_cursor = snap
 
     @contextmanager
     def atomic(self) -> Iterator[None]:
@@ -147,6 +144,73 @@ class SQLiteStateStore:
         row = self._q1("SELECT max(version) FROM goal WHERE id=1")
         return row[0] if row and row[0] is not None else 1
 
+    def pending_goal_amend_directive(self) -> Optional[int]:
+        """Return the one confirmed amendment for the current immutable goal.
+
+        Route derivation calls this inside ``atomic()`` as well as outside it;
+        ``_qall`` therefore uses the same transaction snapshot when present.
+        Multiple effective hard amendments are a control-plane invariant breach
+        and fail loudly instead of choosing by accident.
+        """
+        rows = self._qall(
+            "SELECT d.id FROM directive d "
+            "JOIN interaction_message m ON m.id=d.source_interaction_message_id "
+            "WHERE d.kind='goal_amend' AND d.hardness='hard' AND d.status='pending' "
+            "AND json_extract(d.payload_json,'$.confirmed')=1 "
+            "AND json_type(d.payload_json,'$.parse_error') IS NULL "
+            "AND json_type(d.payload_json,'$.new_goal_text')='text' "
+            "AND trim(json_extract(d.payload_json,'$.new_goal_text'))<>'' "
+            "AND json_type(d.payload_json,'$.rationale_md')='text' "
+            "AND trim(json_extract(d.payload_json,'$.rationale_md'))<>'' "
+            "AND (json_type(d.payload_json,'$.predicate_json') IS NULL "
+            "OR json_type(d.payload_json,'$.predicate_json')='object') "
+            "AND m.goal_id=1 AND m.goal_ver=(SELECT max(version) FROM goal WHERE id=1) "
+            "ORDER BY d.id")
+        if len(rows) > 1:
+            raise RuntimeError(
+                "当前 goal 同时存在多个 confirmed pending goal_amend；拒绝非确定路由")
+        return int(rows[0][0]) if rows else None
+
+    def consumed_goal_amend_directive(self, cycle_id: str) -> Optional[int]:
+        rows = self._qall(
+            "SELECT d.id FROM directive d JOIN decision x ON x.id=d.consumed_decision_id "
+            "WHERE d.kind='goal_amend' AND d.status='consumed' AND d.consumed_cycle=? "
+            "AND x.directive_id=d.id AND x.actor='human' AND x.type='directive_goal_amend'",
+            (_cnum(cycle_id),))
+        if len(rows) > 1:
+            raise RuntimeError(f"cycle {cycle_id} 消费了多个 goal_amend")
+        return int(rows[0][0]) if rows else None
+
+    def set_goal_amend_route(self, cycle_id: str, directive_id: int) -> None:
+        """Atomically bind route choice to the confirmed directive it observed."""
+        with self._write() as conn:
+            rows = conn.execute(
+                "SELECT d.id FROM directive d "
+                "JOIN interaction_message m ON m.id=d.source_interaction_message_id "
+                "WHERE d.kind='goal_amend' AND d.hardness='hard' AND d.status='pending' "
+                "AND json_extract(d.payload_json,'$.confirmed')=1 "
+                "AND json_type(d.payload_json,'$.parse_error') IS NULL "
+                "AND json_type(d.payload_json,'$.new_goal_text')='text' "
+                "AND trim(json_extract(d.payload_json,'$.new_goal_text'))<>'' "
+                "AND json_type(d.payload_json,'$.rationale_md')='text' "
+                "AND trim(json_extract(d.payload_json,'$.rationale_md'))<>'' "
+                "AND (json_type(d.payload_json,'$.predicate_json') IS NULL "
+                "OR json_type(d.payload_json,'$.predicate_json')='object') "
+                "AND m.goal_id=1 AND m.goal_ver=(SELECT max(version) FROM goal WHERE id=1) "
+                "ORDER BY d.id").fetchall()
+            if len(rows) != 1 or rows[0][0] != directive_id:
+                raise ValueError(f"goal_amend d{directive_id} 已不再是当前唯一有效修订")
+            status = conn.execute("SELECT status,route FROM cycle WHERE id=?",
+                                  (_cnum(cycle_id),)).fetchone()
+            if status is None or status[0] in ("done", "failed", "aborted") or status[1] is not None:
+                raise ValueError(f"cycle {cycle_id} 不可绑定 goal_amend route")
+            conn.execute("UPDATE cycle SET route='goal_amend' WHERE id=?", (_cnum(cycle_id),))
+            conn.execute(
+                "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+                "VALUES (?,?,'orchestrator','goal_amend_routed',?)",
+                (_cnum(cycle_id), directive_id,
+                 json.dumps({"route": "goal_amend"}, ensure_ascii=False)))
+
     def _inflight_row(self):
         """在途（非终态）轮的 id 行或 None——open_or_resume_cycle 与 inflight_cycle 共用一处口径（防漂移，内审 NIT）。
         单驱动器模型下至多一条。"""
@@ -208,10 +272,9 @@ class SQLiteStateStore:
             raise ValueError(f"cycle 终态非法: {status}")
         with self._write() as conn:
             conn.execute("UPDATE cycle SET status=?, finished_at=CURRENT_TIMESTAMP WHERE id=?", (status, _cnum(cycle_id)))
-        # 无条件清本轮进程内投影（防长跑无界增长）——三者均在 _projection_snapshot 内，故若在 atomic()
+        # 无条件清本轮进程内投影（防长跑无界增长）——二者均在 _projection_snapshot 内，故若在 atomic()
         # 中且外层回滚，会随投影一并复原（cycle 未真终态时投影不丢）。
         self._local_maps.pop(cycle_id, None)
-        self._spawns_in_cycle.pop(cycle_id, None)
         self._bundle_cursor.pop(cycle_id, None)
 
     # -- question 调度可见性 ----------------------------------------------------
@@ -350,6 +413,23 @@ class SQLiteStateStore:
                     raise InvalidSelectionError(f"scores.q{ri}.est_cost 不得为负")
             resolved_scores.append((row, ri))
 
+        cycle_meta = self._q1("SELECT route,goal_id,goal_ver FROM cycle WHERE id=?",
+                              (_cnum(cycle_id),))
+        if cycle_meta is None:
+            raise InvalidSelectionError(f"cycle 不存在: {cycle_id}")
+        if cycle_meta[0] == "goal_amend":
+            expected = {r[0] for r in self._qall(
+                "SELECT q.id FROM question q WHERE q.goal_id=? AND q.goal_ver=? "
+                "AND q.status IN ('open','inconclusive') AND NOT EXISTS ("
+                "SELECT 1 FROM question_dep d WHERE d.question_id=q.id AND d.status='pending')",
+                (cycle_meta[1], cycle_meta[2]))}
+            if seen_score_ids != expected:
+                missing = sorted(expected - seen_score_ids)
+                extra = sorted(seen_score_ids - expected)
+                raise InvalidSelectionError(
+                    "goal_amend 必须重评全部且仅限当前可调度 open/inconclusive 前沿；"
+                    f"missing={[f'q{x}' for x in missing]}, extra={[f'q{x}' for x in extra]}")
+
         next_qid, next_intent, resolved_scores, priority_audit = self._apply_reprioritize(
             cycle_id, next_qid, next_intent, resolved_scores)
         next_int = _qnum_opt(next_qid)     # 未解析 local_key / 畸形 id → None → 走干净「不存在」拒因
@@ -388,6 +468,23 @@ class SQLiteStateStore:
                         (json.dumps(directive_payload, ensure_ascii=False), directive_id)).rowcount
                     if changed != 1:
                         raise RuntimeError(f"soft reprioritize d{directive_id} 拒绝迁移竞态")
+            if cycle_meta[0] == "goal_amend" and next_intent == "terminate":
+                has_frontier = conn.execute(
+                    "SELECT 1 FROM question q WHERE q.goal_id=? AND q.goal_ver=? "
+                    "AND q.status IN ('open','inconclusive') AND NOT EXISTS ("
+                    "SELECT 1 FROM question_dep d WHERE d.question_id=q.id AND d.status='pending') LIMIT 1",
+                    (cycle_meta[1], cycle_meta[2])).fetchone()
+                reusable = conn.execute(
+                    "SELECT 1 FROM answer_applicability WHERE goal_id=? AND goal_ver=? "
+                    "AND status='still_applicable' LIMIT 1",
+                    (cycle_meta[1], cycle_meta[2])).fetchone()
+                if has_frontier is None and reusable is None:
+                    conn.execute(
+                        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                        "VALUES (?,'orchestrator','blocked_by_goal_amend',?)",
+                        (_cnum(cycle_id), json.dumps({
+                            "reason": "no_schedulable_frontier_or_applicable_prior_answer",
+                            "goal_ver": cycle_meta[2]}, ensure_ascii=False)))
             conn.execute("UPDATE cycle SET next_question_id=?, next_intent=? WHERE id=?",
                          (next_int, next_intent, _cnum(cycle_id)))
 
@@ -552,6 +649,17 @@ class SQLiteStateStore:
 
     def _apply_ops(self, conn, cycle_id: str, ops: List[Dict[str, Any]]) -> None:
         route = self._q1("SELECT route FROM cycle WHERE id=?", (_cnum(cycle_id),))[0]
+        if route == "goal_amend":
+            amend_indexes = [i for i, op in enumerate(ops)
+                             if isinstance(op, dict) and op.get("op") == "amend_goal"]
+            already_amended = self._q1(
+                "SELECT 1 FROM goal WHERE id=1 AND created_cycle=? LIMIT 1",
+                (_cnum(cycle_id),)) is not None
+            if (not already_amended and amend_indexes != [0]) or (
+                    already_amended and amend_indexes):
+                raise ValueError(
+                    "goal_amend 首批 tree_ops 须恰有一个 amend_goal 且位于首位；"
+                    "同 cycle 已升版后不得再次 amend")
         local = self._local_maps.setdefault(cycle_id, {})
         guard = self.policy["tree_guard"]
         gver = self._goal_ver()
@@ -641,9 +749,11 @@ class SQLiteStateStore:
             raise ValueError("超出 max_open_questions")
         if route == "goal_amend":   # 只数 goal_amend 路由下的 spawn（对齐 InMemory；非「本轮全部 spawn」）
             cap = self.policy["goal_amend"]["max_spawn_from_goal_amend"]
-            if self._spawns_in_cycle.get(cycle_id, 0) + 1 > cap:
+            already = conn.execute(
+                "SELECT count(*) FROM decision WHERE cycle_id=? AND type='spawn_question'",
+                (_cnum(cycle_id),)).fetchone()[0]
+            if already + 1 > cap:
                 raise ValueError("超出 max_spawn_from_goal_amend（goal_amend 护栏）")
-            self._spawns_in_cycle[cycle_id] = self._spawns_in_cycle.get(cycle_id, 0) + 1
         parent = op.get("parent_question_id")
         if op["kind"] == "goal_retarget":
             if route != "goal_amend":
@@ -673,16 +783,99 @@ class SQLiteStateStore:
     def _amend_goal(self, conn, cycle_id, route, op) -> None:
         if route != "goal_amend":
             raise ValueError("amend_goal 仅限 goal_amend 轮")
-        cur = conn.execute("SELECT max(version) FROM goal WHERE id=1").fetchone()[0]
+        ci = _cnum(cycle_id)
+        cycle_row = conn.execute(
+            "SELECT goal_id,goal_ver,active_question_id,status FROM cycle WHERE id=?", (ci,)).fetchone()
+        if cycle_row is None or cycle_row[0] != 1 or cycle_row[3] in ("done", "failed", "aborted"):
+            raise ValueError(f"goal_amend cycle 状态非法: {cycle_id}")
+        if cycle_row[2] is not None or conn.execute(
+                "SELECT 1 FROM question WHERE status='active' LIMIT 1").fetchone() is not None:
+            raise ValueError("goal_amend 轮不得携 active 问题；旧轮必须先按旧 goal 收口")
+        directives = conn.execute(
+            "SELECT d.id,x.payload_json FROM directive d "
+            "JOIN decision x ON x.id=d.consumed_decision_id "
+            "WHERE d.kind='goal_amend' AND d.status='consumed' AND d.consumed_cycle=? "
+            "AND x.directive_id=d.id AND x.actor='human' AND x.type='directive_goal_amend'",
+            (ci,)).fetchall()
+        if len(directives) != 1:
+            raise ValueError(
+                f"goal_amend 轮须恰好绑定一条已消费的人类 goal_amend（当前 {len(directives)}）")
+        directive_id, decision_raw = directives[0]
+        routed = conn.execute(
+            "SELECT directive_id FROM decision WHERE cycle_id=? AND actor='orchestrator' "
+            "AND type IN ('goal_amend_routed','goal_amend_rebound') "
+            "ORDER BY id DESC LIMIT 1", (ci,)).fetchone()
+        if routed is None or routed[0] != directive_id:
+            raise ValueError(
+                f"goal_amend 轮路由绑定与已消费 directive 不一致: routed={routed}, consumed=d{directive_id}")
+        try:
+            decision_payload = json.loads(decision_raw)
+            effect = decision_payload["effect"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise RuntimeError(f"goal_amend d{directive_id} 消费决策损坏") from error
+        if not isinstance(effect, dict):
+            raise RuntimeError(f"goal_amend d{directive_id} effect 非 object")
+
+        current = conn.execute(
+            "SELECT version,predicate_json FROM goal WHERE id=1 ORDER BY version DESC LIMIT 1").fetchone()
+        if current is None:
+            raise RuntimeError("goal_amend 时当前 goal 不存在")
+        cur, old_predicate_raw = current
+        if cycle_row[1] != cur:
+            raise ValueError(
+                f"goal_amend cycle 绑定 v{cycle_row[1]}，当前 goal 已是 v{cur}；拒绝重复/越版")
+        if effect.get("source_goal_ver") != cur or effect.get("target_goal_ver") != cur + 1:
+            raise ValueError("goal_amend 消费决策的 source/target goal version 与当前状态不符")
+        try:
+            json.loads(old_predicate_raw)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("当前 goal.predicate_json 损坏") from error
+        expected_predicate = effect.get("predicate_json")
+        if not isinstance(expected_predicate, dict):
+            raise ValueError("goal_amend 已确认 predicate_json 非 object")
+        if (op.get("new_goal_text") != effect.get("new_goal_text")
+                or op.get("rationale_md") != effect.get("rationale_md")
+                or op.get("predicate_json") != expected_predicate):
+            raise ValueError(
+                "amend_goal op 与用户已确认的 new_goal_text/predicate_json/rationale_md 不一致")
+        if conn.execute(
+                "SELECT 1 FROM goal WHERE id=1 AND created_cycle=? LIMIT 1", (ci,)).fetchone() is not None:
+            raise ValueError(f"cycle {cycle_id} 已创建过 goal 版本")
+
         newv = cur + 1
-        old = conn.execute("SELECT predicate_json FROM goal WHERE id=1 AND version=?", (cur,)).fetchone()[0]
-        pj = json.dumps(op["predicate_json"], ensure_ascii=False) if op.get("predicate_json") else old
-        conn.execute("INSERT INTO goal(id,version,text,predicate_json,previous_version,created_cycle) "
-                     "VALUES (1,?,?,?,?,?)", (newv, op["new_goal_text"], pj, cur, _cnum(cycle_id)))
-        # 未关闭问题迁到新版本（closed 问题受 trg_q_closed_goalfrozen 保护、留旧版）
-        conn.execute("UPDATE question SET goal_ver=? WHERE status IN ('open','inconclusive','active')", (newv,))
-        conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'agent','goal_amend',?)",
-                     (_cnum(cycle_id), json.dumps({"new_ver": newv})))
+        predicate_raw = json.dumps(
+            expected_predicate, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            "INSERT INTO goal(id,version,text,predicate_json,previous_version,created_cycle,directive_id) "
+            "VALUES (1,?,?,?,?,?,?)",
+            (newv, effect["new_goal_text"], predicate_raw, cur, ci, directive_id))
+        # Closed questions/answers/evidence stay on their born version.  Only
+        # unresolved questions move in place; stale scores are erased before R3
+        # is required to write the complete new-version schedulable frontier.
+        conn.execute(
+            "UPDATE question SET goal_ver=?,score=NULL,est_cost=NULL "
+            "WHERE goal_id=1 AND status IN ('open','inconclusive')", (newv,))
+        conn.execute("UPDATE cycle SET goal_ver=? WHERE id=?", (newv, ci))
+        canonical_effect = {
+            "new_goal_text": effect["new_goal_text"],
+            "predicate_json": expected_predicate,
+            "rationale_md": effect["rationale_md"],
+            "source_goal_ver": cur,
+            "target_goal_ver": newv,
+        }
+        effect_hash = hashlib.sha256(json.dumps(
+            canonical_effect, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+            "VALUES (?,?,'agent','goal_amend',?)",
+            (ci, directive_id, json.dumps({
+                "effect": canonical_effect,
+                "effect_sha256": effect_hash,
+                "migrated_open_questions": conn.execute(
+                    "SELECT count(*) FROM question WHERE goal_id=1 AND goal_ver=? "
+                    "AND status IN ('open','inconclusive')", (newv,)).fetchone()[0],
+            }, ensure_ascii=False, sort_keys=True)))
 
     def _seed_applicability(self, conn, cycle_id, route, op) -> None:
         if route != "goal_amend":
@@ -692,9 +885,18 @@ class SQLiteStateStore:
         for a in op["answer_ids"]:
             raw_by_id.setdefault(_anum(a), a)
         new_ids = list(raw_by_id)
+        if not new_ids:
+            raise ValueError("seed_applicability_audit.answer_ids 不得为空")
+        gver = self._goal_ver()
         for ai in new_ids:
-            if conn.execute("SELECT 1 FROM answer WHERE id=?", (ai,)).fetchone() is None:
+            answer = conn.execute(
+                "SELECT a.goal_id,a.goal_ver,q.status FROM answer a "
+                "JOIN question q ON q.id=a.question_id WHERE a.id=?", (ai,)).fetchone()
+            if answer is None:
                 raise ValueError(f"seed_applicability_audit 引用悬空 answer: {raw_by_id[ai]}")
+            if answer[0] != 1 or answer[1] >= gver or answer[2] not in ("answered", "refuted"):
+                raise ValueError(
+                    f"seed_applicability_audit 仅允许当前 goal 旧版本的 closed answer: {raw_by_id[ai]}")
         # max_closed_revalidate_per_cycle = 本轮**累计**上限（按策略键名 per_cycle 语义；修正 InMemory per-op
         # 疏漏）。计数按 audit_cycle=本轮；upsert 把 audit_cycle 迁到本轮（下方 excluded.audit_cycle），故
         # 再 seed 旧轮同版行也计入本轮预算——否则分批 re-seed 旧行可绕过上限（codex 第2轮 BLOCKER）。
@@ -705,7 +907,6 @@ class SQLiteStateStore:
                                (cnum, *new_ids)).fetchone()[0]
         if seeded + (len(new_ids) - already) > limit:
             raise ValueError("超出 max_closed_revalidate_per_cycle")
-        gver = self._goal_ver()
         for ai in new_ids:
             conn.execute("INSERT INTO answer_applicability(answer_id,goal_id,goal_ver,audit_cycle,status,rationale_md) "
                          "VALUES (?,1,?,?,'pending',?) "

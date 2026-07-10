@@ -46,6 +46,9 @@ _MAX_DEST_HINT_BYTES = 256
 _MAX_TERMINAL_REASON_BYTES = 512
 _MAX_REQUEST_HASH_BYTES = 128
 _MAX_DIRECTIVE_POLISHED_BYTES = 2_000
+# ``goal_amend`` 的三项有效字段属于控制权威，不是可裁剪的展示摘要。正常入口先经
+# console.sanitize（最多 2,000 字符），此上限只防损坏/手工旧库把超大 decision 塞进固定锚。
+_MAX_GOAL_AMEND_EFFECT_BYTES = 64 * 1024
 
 
 def _bounded_utf8(value: Any, limit: int, *, label: str) -> tuple[str, bool]:
@@ -140,14 +143,13 @@ def _normalized_requested_item(item: Any, *, request_id: int, item_no: int) -> D
 
 
 class SqliteCompiler:
-    def __init__(self, conn, policy: Dict[str, Any], goal_body_md: str):
+    def __init__(self, conn, policy: Dict[str, Any]):
         # conn = 本类**独占**的只读用连接（isolation_level=None 交本类掌控事务，供 render 钉单一读快照）。
         # 「只读」是架构约定：调用方（M3 Advancer）应传一条专用读连接（宜 mode=ro，§6.2 WAL 读写分离）；
         # 本类只读不写，不在此强制 mode=ro（编译器不该越俎给连接改物理模式）。
         conn.isolation_level = None
         self.conn = conn
         self.policy = policy
-        self.goal_body_md = goal_body_md
 
     # -- Compiler Protocol ------------------------------------------------------
     def render(self, *, cycle_id: str, stage: Stage, target_id: Optional[str] = None) -> ContextPack:
@@ -213,11 +215,16 @@ class SqliteCompiler:
             # execution_manifest.json + 代码 + identity.md。target_id 已消费（不同 target → 不同 pack）。
             parts.append(self._bundle_target(target_id, sources))
         elif stage == "reasoning":
-            parts.append(f"## 目标全文（当前版 v{goal_ver}）\n{self.goal_body_md}")
-            sources.append("input:goal_brief.md")
+            goal = self.conn.execute(
+                "SELECT text FROM goal WHERE id=? AND version=?", (goal_id, goal_ver)).fetchone()
+            if goal is None:
+                raise RuntimeError(
+                    f"cycle {cycle_id} 绑定的 goal {goal_id}@v{goal_ver} 不存在")
+            parts.append(f"## 目标全文（当前版 v{goal_ver}）\n{goal[0]}")
+            sources.append(f"db:goal:{goal_id}:v{goal_ver}")
             parts.append(self._reasoning_directives(ci, sources))
             parts.append(self._closed_conclusions(goal_id, goal_ver, sources))
-            parts.append(self._open_set(aq, goal_id, sources))
+            parts.append(self._open_set(aq, goal_id, goal_ver, sources))
             parts.append(self._observation_summary(ci, sources))
             parts.append("## 采集打分参数\n```json\n" + json.dumps(
                 {"acquisition": self.policy["acquisition"], "B_t": self._budget(),
@@ -235,16 +242,19 @@ class SqliteCompiler:
         dropping human control input from a successful ContextPack.
         """
         rows = self.conn.execute(
-            "SELECT id,kind,hardness,payload_json FROM directive "
-            "WHERE status='consumed' AND consumed_cycle=? AND consume_at='reasoning_start' "
-            "ORDER BY id LIMIT ?",
+            "SELECT d.id,d.kind,d.hardness,d.payload_json,d.consumed_decision_id,"
+            "x.actor,x.type,x.directive_id,x.payload_json "
+            "FROM directive d LEFT JOIN decision x ON x.id=d.consumed_decision_id "
+            "WHERE d.status='consumed' AND d.consumed_cycle=? "
+            "AND d.consume_at='reasoning_start' ORDER BY d.id LIMIT ?",
             (cycle_id, MAX_REASONING_DIRECTIVES_PER_CYCLE + 1)).fetchall()
         if len(rows) > MAX_REASONING_DIRECTIVES_PER_CYCLE:
             raise RuntimeError(
                 f"cycle c{cycle_id} consumed directive 超过 {MAX_REASONING_DIRECTIVES_PER_CYCLE}，"
                 "拒绝静默截断人类控制输入")
         rendered = []
-        for directive_id, kind, hardness, payload_raw in rows:
+        for (directive_id, kind, hardness, payload_raw, consumed_decision_id,
+             decision_actor, decision_type, decision_directive_id, decision_raw) in rows:
             try:
                 payload = json.loads(payload_raw)
             except json.JSONDecodeError as error:
@@ -258,6 +268,51 @@ class SqliteCompiler:
                 "directive_id": f"d{directive_id}", "kind": kind,
                 "hardness": hardness, "polished": polished,
             }
+            if kind == "goal_amend":
+                # 这里必须渲染 consume 时已经解析/继承完毕的 human decision.effect，而不是原 directive：
+                # shorthand 可以省略 predicate_json，此时有效谓词来自旧 goal。若只给 polished（还会裁剪），
+                # 模型永远无法逐字段复制出 StateStore 要求的精确 amend_goal op。
+                if (consumed_decision_id is None or decision_actor != "human"
+                        or decision_type != "directive_goal_amend"
+                        or decision_directive_id != directive_id):
+                    raise RuntimeError(
+                        f"goal_amend d{directive_id} consumed_decision provenance 损坏")
+                try:
+                    decision_payload = json.loads(decision_raw)
+                    effect = decision_payload["effect"]
+                except (json.JSONDecodeError, KeyError, TypeError) as error:
+                    raise RuntimeError(
+                        f"goal_amend d{directive_id} consumed decision payload 损坏") from error
+                if not isinstance(effect, dict):
+                    raise RuntimeError(f"goal_amend d{directive_id} effect 须为 object")
+                new_text = effect.get("new_goal_text")
+                predicate = effect.get("predicate_json")
+                rationale = effect.get("rationale_md")
+                source_ver = effect.get("source_goal_ver")
+                target_ver = effect.get("target_goal_ver")
+                if (not isinstance(new_text, str) or not new_text.strip()
+                        or not isinstance(predicate, dict)
+                        or not isinstance(rationale, str) or not rationale.strip()
+                        or isinstance(source_ver, bool) or not isinstance(source_ver, int)
+                        or isinstance(target_ver, bool) or not isinstance(target_ver, int)
+                        or target_ver != source_ver + 1
+                        or effect.get("applies_to_reasoning_cycle") != f"c{cycle_id}"):
+                    raise RuntimeError(f"goal_amend d{directive_id} effect 字段损坏")
+                exact = {
+                    "new_goal_text": new_text,
+                    "predicate_json": predicate,
+                    "rationale_md": rationale,
+                    "source_goal_ver": source_ver,
+                    "target_goal_ver": target_ver,
+                }
+                exact_raw = json.dumps(
+                    exact, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if len(exact_raw.encode("utf-8")) > _MAX_GOAL_AMEND_EFFECT_BYTES:
+                    raise RuntimeError(
+                        f"goal_amend d{directive_id} effect 超过固定锚绝对上限 "
+                        f"{_MAX_GOAL_AMEND_EFFECT_BYTES} bytes；拒绝裁剪控制权威")
+                item.update(exact)
+                sources.append(f"db:decision:{consumed_decision_id}")
             for key in ("question_id", "mode", "adjust"):
                 value = payload.get(key)
                 if isinstance(value, (str, int, float)) and not isinstance(value, bool):
@@ -619,15 +674,17 @@ class SqliteCompiler:
             return f" [applicability: needs_revalidation→q{spawned}({sq[0] if sq else '?'})]"
         return f" [applicability: {status}]"
 
-    def _open_set(self, aq, goal_id, sources) -> str:
-        """可调度问题集（本 goal 的 open/inconclusive 且无 pending dep），ORDER BY id 定序（护字节一致）。
-        **限 goal_id**（防跨 goal 泄漏别目标的问题，codex BLOCKER）。**含本轮 active Qn**（收尾后可重选）——
+    def _open_set(self, aq, goal_id, goal_ver, sources) -> str:
+        """可调度问题集（本 goal version 的 open/inconclusive 且无 pending dep），ORDER BY id 定序。
+        **同时限 goal_id + goal_ver**：历史 cycle 重渲染不得在 v1 目标下混入 v2 前沿。
+        **含本轮 active Qn**（收尾后可重选）——
         对齐 M0 StubCompiler，防单问题场景工人「无题可选」误终止（driver.py 依赖；reasoning skill 亦同批 union，双保险）。"""
         rows = self.conn.execute(
             "SELECT id, text, status, visit_count, score, est_cost FROM question "
-            "WHERE goal_id=? AND status IN ('open','inconclusive') AND id NOT IN "
-            "(SELECT question_id FROM question_dep WHERE status='pending') ORDER BY id", (goal_id,)).fetchall()
-        sources.append("db:schedulable")
+            "WHERE goal_id=? AND goal_ver=? AND status IN ('open','inconclusive') AND id NOT IN "
+            "(SELECT question_id FROM question_dep WHERE status='pending') ORDER BY id",
+            (goal_id, goal_ver)).fetchall()
+        sources.append(f"db:schedulable:{goal_id}:v{goal_ver}")
         # 标注 attack 可调度性（步⑧ CP8.8）：inconclusive 且 visit≥max_inconclusive_per_question 的题对 attack
         # 不可调度（question_guard，§4.2.1），**只可 decompose / propose_prune**——不告知 Codex 会让它选
         # 该题 attack → persist_selection 拒 → 干净收尾但白停一轮（部署首跑实录）。明示引导 Codex 选合法路由。
@@ -639,7 +696,9 @@ class SqliteCompiler:
                 note = f"，**attack 已达上限（visit≥{max_inc}）：本题只可 decompose 或 propose_prune、不可 attack**"
             lines.append(f"- q{i}（{s}，visit={v}，score={sc}，est_cost={ec}{note}）: {t}")
         if aq is not None:   # 本轮 active Qn 也列入（收尾后重新可选）
-            a = self.conn.execute("SELECT text, status, visit_count FROM question WHERE id=?", (aq,)).fetchone()
+            a = self.conn.execute(
+                "SELECT text,status,visit_count FROM question "
+                "WHERE id=? AND goal_id=? AND goal_ver=?", (aq, goal_id, goal_ver)).fetchone()
             if a and a[1] == "active":
                 lines.append(f"- q{aq}（active·本轮 Qn，收尾后可重选，visit={a[2]}）: {a[0]}")
         return "## 可调度问题集（open/inconclusive 且无 pending dep；含本轮 Qn）\n" + ("\n".join(lines) or "（空）")

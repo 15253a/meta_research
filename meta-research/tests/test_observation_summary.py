@@ -36,7 +36,7 @@ def _obs_seed(conn):
 
 
 def _comp(conn):
-    return SqliteCompiler(conn, POLICY, goal_body_md="目标全文（EEG 通用规律）")
+    return SqliteCompiler(conn, POLICY)
 
 
 @pytest.fixture()

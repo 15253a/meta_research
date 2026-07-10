@@ -46,7 +46,7 @@ def conn():
 
 
 def _card(conn):
-    return SC.build_status_card(conn, cycle_id="c1", policy=POLICY, goal_body_md="目标首行摘要\n第二行不取")
+    return SC.build_status_card(conn, cycle_id="c1", policy=POLICY)
 
 
 # ============ 封闭字段集（不多不少）============
@@ -58,7 +58,7 @@ def test_closed_field_set_exact(conn):
 def test_core_fields_from_db(conn):
     c = _card(conn)
     assert c["snapshot_cycle"] == "c1"
-    assert c["goal"] == {"id": 1, "ver": 1, "summary": "目标首行摘要"}   # 首个非空行
+    assert c["goal"] == {"id": 1, "ver": 1, "summary": "g"}   # 精确取 DB goal 版本首行
     assert c["active_question"]["id"] == "q2" and c["active_question"]["status"] == "active"
     assert c["cycle_status"] == "reasoning" and c["route"] == "attack"
 
@@ -97,6 +97,17 @@ def test_counts_open_inconclusive(conn):
     assert _card(conn)["counts"] == {"open": 1, "inconclusive": 1}   # q3 open, q4 inconclusive（q1 answered/q2 active 不计）
 
 
+def test_counts_are_scoped_to_snapshot_goal_version(conn):
+    conn.executescript("""
+      INSERT INTO goal(id,version,text,predicate_json,previous_version)
+        VALUES (1,2,'g-v2','{}',1);
+      INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source)
+        VALUES (99,1,2,2,'v2 open','open','goal_amend');
+    """)
+    conn.commit()
+    assert _card(conn)["counts"] == {"open": 1, "inconclusive": 1}
+
+
 def test_pending_file_request(conn):
     p = _card(conn)["pending_file_request"]
     assert p["request_id"] == 1 and p["item_count"] == 2 and p["created_at"]
@@ -109,7 +120,7 @@ def test_pending_request_non_list_items_count_none():
     c.execute("INSERT INTO interaction_request(id,goal_id,goal_ver,cycle_id,stage,status,summary_md,items_json,request_hash) "
               "VALUES (1,1,1,1,'plan','pending','s','{\"kind\":\"dataset\"}','rh')")   # JSON 对象，非数组
     c.commit()
-    p = SC.build_status_card(c, cycle_id="c1", policy=POLICY, goal_body_md="g")["pending_file_request"]
+    p = SC.build_status_card(c, cycle_id="c1", policy=POLICY)["pending_file_request"]
     assert p["request_id"] == 1 and p["item_count"] is None
 
 
@@ -122,7 +133,7 @@ def test_m3_pending_fields_none(conn):
 def test_no_active_question_and_no_pending():
     c = db.connect(":memory:")
     conftest.seed_minimal(c)   # cycle1 无 active_question_id、无 pending 请求
-    card = SC.build_status_card(c, cycle_id="c1", policy=POLICY, goal_body_md="g")
+    card = SC.build_status_card(c, cycle_id="c1", policy=POLICY)
     assert card["active_question"] is None and card["pending_file_request"] is None
     assert set(card.keys()) == CLOSED_FIELDS         # 封闭集不变（None 也占字段位）
 
@@ -135,4 +146,4 @@ def test_status_card_json_roundtrip(conn):
 
 def test_missing_cycle_raises(conn):
     with pytest.raises(ValueError, match="cycle 不存在"):
-        SC.build_status_card(conn, cycle_id="c999", policy=POLICY, goal_body_md="g")
+        SC.build_status_card(conn, cycle_id="c999", policy=POLICY)

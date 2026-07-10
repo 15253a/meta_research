@@ -135,7 +135,7 @@ def test_precheck_rejects_reasoning_directive_overflow_before_consumption(env):
         "SELECT actor,type FROM decision WHERE directive_id=? ORDER BY id DESC LIMIT 1",
         (rejected_id,)) == ("orchestrator", "directive_application_rejected")
 
-    pack = SqliteCompiler(d.conn, POLICY, goal_body_md="测试目标").render(
+    pack = SqliteCompiler(d.conn, POLICY).render(
         cycle_id="c1", stage="reasoning")
     assert f'"directive_id":"d{MAX_REASONING_DIRECTIVES_PER_CYCLE}"' in pack.anchor_md
     assert f'"directive_id":"d{MAX_REASONING_DIRECTIVES_PER_CYCLE + 1}"' not in pack.anchor_md
@@ -155,8 +155,44 @@ def test_precheck_rejects_reasoning_directive_overflow_before_consumption(env):
     assert d.query(
         "SELECT status FROM directive WHERE id IN (?,?) ORDER BY id",
         (pause["directive_id"], resume["directive_id"])) == [("consumed",), ("consumed",)]
-    SqliteCompiler(d.conn, POLICY, goal_body_md="测试目标").render(
+    SqliteCompiler(d.conn, POLICY).render(
         cycle_id="c1", stage="reasoning")
+
+
+def test_goal_amend_round_reserves_reasoning_boundary_from_old_notes(env):
+    """专用改版轮先且只消费 amendment；旧 note 不得吃满配额后永久拒掉用户改目标。"""
+    d, c = env["d"], env["c"]
+    for index in range(MAX_REASONING_DIRECTIVES_PER_CYCLE):
+        c.handle_inbound(
+            connector="qq", raw_text=f"备注：改版前积压 {index}",
+            idempotency_key=f"pre-amend-note-{index}", goal_id=1, goal_ver=1)
+    amend = c.handle_inbound(
+        connector="qq", raw_text="修订目标：配额下仍须生效", idempotency_key="capacity-amend",
+        goal_id=1, goal_ver=1)
+    c.confirm_directive(
+        directive_id=amend["directive_id"],
+        confirm_message_id=_action_message(d, c, amend, "confirm"))
+    with d.transaction() as conn:
+        conn.execute("UPDATE cycle SET route='goal_amend',status='created' WHERE id=1")
+        conn.execute(
+            "INSERT INTO decision(cycle_id,directive_id,actor,type,payload_json) "
+            "VALUES (1,?,'orchestrator','goal_amend_routed','{\"route\":\"goal_amend\"}')",
+            (amend["directive_id"],))
+
+    cyc = SimpleNamespace(cycle_id="c1", route="goal_amend", status="created")
+    assert make_advancer_precheck(c, d)(cyc) is None
+    assert d.query_one(
+        "SELECT status,consumed_cycle FROM directive WHERE id=?",
+        (amend["directive_id"],)) == ("consumed", 1)
+    assert d.query_one(
+        "SELECT count(*) FROM directive WHERE kind='note' AND status='pending'")[0] == \
+        MAX_REASONING_DIRECTIVES_PER_CYCLE
+    assert d.query_one(
+        "SELECT count(*) FROM directive WHERE status='consumed' AND consumed_cycle=1 "
+        "AND consume_at='reasoning_start'")[0] == 1
+    pack = SqliteCompiler(d.conn, POLICY).render(cycle_id="c1", stage="reasoning")
+    assert '"kind":"goal_amend"' in pack.anchor_md
+    assert "改版前积压" not in pack.anchor_md
 
 
 def test_precheck_terminally_rejects_abort_on_active_question_drift(env):
@@ -667,7 +703,7 @@ def test_due_timings_matrix():
     for st in ("created", "idea", "plan", "reasoning"):
         assert "reasoning_start" not in _due_timings(NS(route="attack", status=st)), st
     assert "reasoning_start" in _due_timings(NS(route="attack", status="bundle"))
-    for route in ("bootstrap", "decompose"):
+    for route in ("bootstrap", "decompose", "goal_amend"):
         assert "reasoning_start" in _due_timings(NS(route=route, status="created"))
 
 
@@ -1561,13 +1597,13 @@ def adv_env(tmp_path):
     console = Console(daemon)
     card_path = tmp_path / "sc.json"
     pub = SC.SqliteStatusPublisher(open_responder_read_conn(dbp), policy=POLICY,
-                                   goal_body_md="g", out_path=str(card_path))
+                                   out_path=str(card_path))
 
     def provider(cyc, pack):
         return {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根问题", "local_key": "r"}]},
                 "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
 
-    adv = SqliteAdvancer(state, SqliteCompiler(db.connect(dbp), POLICY, goal_body_md="g"), provider,
+    adv = SqliteAdvancer(state, SqliteCompiler(db.connect(dbp), POLICY), provider,
                          status_publisher=pub, precheck=make_advancer_precheck(console, daemon))
     return {"d": daemon, "c": console, "adv": adv, "tmp": tmp_path, "card": card_path, "dbp": dbp}
 
