@@ -6,6 +6,7 @@
 
 ---
 
+- [0054](0054-cp112b3c-readonly-query-responder.md) — CP11.2b.3c facts-only 只读 Codex 查询 + 不同 UID/tool-free 隔离 + 耐久 FIFO/成本/reply 收尾 · commit `92ecf18` · 验证: 通过（唯一一次全量 1055 过/1 败；对应前端修复后定向 6/6，依指示未二次全量；外审两次均因账号限额无 verdict）
 - [0053](0053-cp112b3b-goal-amend-versioning.md) — CP11.2b.3b 不可变目标升版 + 专用 reasoning route + applicability/revalidate + 崩溃恢复 · commit `2dfa653` · 验证: 通过（控制面/调度面 374、全量 992；外审两轮上限后全部反馈本地修复）
 - [0052](0052-cp112b3a-runtime-budget-priority.md) — CP11.2b.3a 耐久动态预算 + 账本/状态卡对账 + 机械 pin/boost/suppress · commit `7f4fd73` · 验证: 通过（相关 234、全量 976；外审两轮上限后全部反馈本地修复）
 - [0051](0051-cp112b-durable-authenticated-control-plane.md) — CP11.2b.1–2 鉴权 HTTP→durable spool→run 单写动作全链 + 常驻/fail-closed 控制台 · commit `10215db` · 验证: 通过（staged-only 全量 959；外审两轮上限后 3 个装配 BLOCKER 全部本地修复）

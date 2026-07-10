@@ -1,45 +1,52 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-10 ｜ 位置：步⑪ CP11.2b.3c 真正只读 Codex query responder
-- 检查点状态：空闲；CP11.2b.3b 已提交并记账，控制面总检查点仍未完成
+- 更新：2026-07-10 ｜ 位置：步⑪ CP11.2b.3d 真实 connector 投递
+- 检查点状态：CP11.2b.3c 已完成；下一检查点 CP11.2b.3d
 
 ## 正在做什么
 
-CP11.2b.3b 功能提交 `2dfa653` 已把 `goal_amend` 闭成真实耐久版本控制：确认的人类 decision.effect 是
-精确权威；专用 reasoning-only 轮原子创建不可变 vN+1、迁移并重评未决前沿；closed answer/evidence
-不重开而走 applicability/revalidate；route/consume/apply 各崩溃窗可恢复。记录见 build_log 0053，
-控制面/调度面 `374 passed`、全量 `992 passed`。
+CP11.2b.3c 功能提交 `92ecf18` 已把 query 闭成真实的只读 Codex 旁路：模型只能从已发布状态卡选择
+逐项复核的精确 facts，回复由确定性 renderer 生成；调用运行在不同 `codexro` UID、tool-free 配置和隔离临时
+目录中。调用前耐久落 intent，完成时 runner_call 用量、ledger 与 reply 原子收尾；未知调用不重放。逐 conversation
+FIFO、重启恢复、预算/卡片重核、常驻 interaction pump、受控 drain 和第二次 Ctrl-C 硬停均已有回归。
 
-下一检查点是 CP11.2b.3c 真正只读 Codex query responder。其后仍有真实 connector 投递、CP11.3/CP11.4
-和字面 100+ 轮生产验收；完成前不得把 CP11.2/CP11.2b 或 M6 数百轮验收标为完成。
+记录见 build_log 0054。唯一一次最终全量为 `1055 passed, 1 failed`；唯一失败是浏览器 conversation id 初版
+使用 localStorage，改为 sessionStorage 后对应前端测试 `6 passed`。按用户要求没有再跑第二次全量，所以不记成
+新的全量全绿。外审两次均在 verdict 前撞到账号用量上限，没有外部 APPROVE；内部设计/耐久/安全复核无
+BLOCKER。
+
+下一步是 CP11.2b.3d：把当前耐久回复接到真实 connector，闭合 event_key 幂等、at-least-once 重试、投递
+回执和可观测失败。其后仍有 CP11.3/CP11.4 与字面意义的真实 100+ 轮生产验收；完成前不得把
+CP11.2/CP11.2b/CP11.2b.3 或 reference 完整落地标为完成。
 
 ## 工作区状态
 
 - 分支：`fix/architecture-hardening-20260709`。
 - 已提交：CP11.1 `ac53516`；CP11.2a `c077cd2`；CP11.2a.1 `3c4c9b4`；
-  CP11.2b.1–2 `10215db`；CP11.2b.3a `7f4fd73`；CP11.2b.3b `2dfa653`
-  （对应 build_log 0048–0053）。
-- CP11.2b.3b 外审两轮均 `REQUEST_CHANGES`：第 1 轮 2 BLOCKER + 1 SHOULD + 1 NIT；第 2 轮
-  1 BLOCKER + 1 SHOULD。两轮上限后全部本地修复，未启动第 3 轮。最终全量
-  `992 passed in 195.27s`。
-- 当前无未提交功能 WIP；本记账提交完成后工作区应 clean。
+  CP11.2b.1–2 `10215db`；CP11.2b.3a `7f4fd73`；CP11.2b.3b `2dfa653`；
+  CP11.2b.3c `92ecf18`（对应 build_log 0048–0054）。
+- CP11.2b.3c 回退点：`git revert 92ecf18`；无 DDL migration，但 revert 不会删除已有 query
+  runner_call/ledger/reply 审计记录。
+- 当前仍是受约束的 operational canary，不是最终 production-ready/reference-complete 系统。
 
 ## 下一步动作
 
-1. 对照 reference §4.6.2 的中介/只读应答契约，列 query 调用、成本、reply 和失败终态的事务顺序。
-2. 把模板 responder 升级为独立只读 Codex 调用：只读快照 + authorizer，不给 DB 写凭据，不接研究 Runner 状态。
-3. 为外部调用完成但回执未落库的崩溃窗定义耐久 intent/receipt 或显式失败收敛，并补重启/超时负例。
-4. 完成 CP11.2b.3c 的评审与独立提交；再做 b.3d connector、CP11.3/CP11.4 与真实 100+ 轮验收。
+1. 从 reference 的 connector/通知语义提取 event_key、投递状态、退避、重启恢复和回执的机械不变量。
+2. 接入真实 connector adapter；发送前后均落耐久状态，重复消费同一 event_key 不重复形成用户可见效果。
+3. 覆盖外部成功但本地 receipt 未落、瞬时/永久失败、进程重启、乱序与连续新消息下的 at-least-once 行为。
+4. 完成 CP11.2b.3d 定向验证、评审和独立提交，再推进 CP11.3/CP11.4 与真实 100+ 轮验收。
 
 ## 关键上下文 / 坑
 
-- `reference/` 是设计文档，不是运行时输入；只有进入 prompt/skill/schema/policy/DDL/代码和反例测试的概念才算实现。
+- `reference/` 是设计权威，不是自动加载的运行时 skill；只有已进入 prompt/skill/schema/policy/DDL/代码和
+  反例测试的概念才算实现。
 - HTTP 进程必须保持 DB `mode=ro`；所有状态效果只允许 run 进程的 WriteDaemon 路径。
-- reasoning 控制输入上限只统计 `consume_at=reasoning_start`；绝不能让 note 洪泛拒掉 resume/abort。
-- `set_budget` 的耐久权威是与 directive `consumed_decision_id` 对账的完整 decision.effect.budget；禁止新增进程内 override。
-- active Qn 是 reasoning 收尾后的合法 selection 候选；reprioritize 消费期只允许“当前 cycle 的 active_question_id”例外。
-- `goal_amend` 的权威是已消费 human decision.effect，不是可截断 polished；专用轮只消费 amendment，积压 note/优先级延后到新版下一 reasoning 边界。
-- 改版只迁移 open/inconclusive；closed question/answer/evidence 永不重开。活库已生成 v2+ 后不能靠 Git revert 自动删历史，回退须 pause + 兼容部署或恢复 DB 快照。
-- query responder 必须真正只读且有可审计调用/成本回执；当前模板 grounding 不可冒充 reference 的 Codex responder。
-- connector 投递与供应商调用都存在“外部成功、持久回执前 SIGKILL”窗口；CP11.2b.3 先闭通知投递，通用调用补账仍属 CP11.4。
-- CP11.3/CP11.4 和 reference M6 数百轮真实验收未完成，所以当前仍是受约束的 operational canary，不是最终生产级系统。
+- query reply 只接受已发布卡中的精确标量 facts；任何模型自由文本、越界 path/value、旧 goal 卡或没有可靠
+  conversation id 的历史复用都必须拒绝或隔离。
+- query 外部调用的 intent/成本/reply 已闭合，但 connector 仍有“外部成功、本地 receipt 前 SIGKILL”窗口；
+  CP11.2b.3d 必须用 event_key 幂等与耐久投递状态收敛，不能靠内存去重。
+- `heartbeat_ref` 尚未接通；CP11.3/CP11.4 和 reference M6 数百轮真实验收未完成，所以当前不能声称支持
+  无条件上百轮生产执行。
+- 后续安全 SHOULD：只给查询进程认证所需的 `CODEX_HOME` 内容、固定/记录 CLI 版本身份、限制 trace 总字节。
+- 活库已有 append-only 版本、directive、runner_call 或 ledger 后，Git revert 只回代码；回退须先 pause，保留
+  审计历史并部署兼容版本或恢复完整 DB 快照，禁止用破坏性 SQL 伪造自动回退。
