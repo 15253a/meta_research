@@ -362,7 +362,7 @@
     （build_log 0048；定向 132；全量 754；codex 第1轮 APPROVE）。
   - [ ] CP11.2 人类控制闭环（子检查点全完成后勾选）：
     - [x] CP11.2a 用户文件资产闭环：原子接纳、goal-wide 有界回执、稳定 fd 真消费、生成时身份冻结与 root-global 并发/配额闭合。→ commit `c077cd2`（build_log 0049；staged-only 全量 844；外审两轮上限后全部本地修复）。
-    - [ ] CP11.2a.1 嵌套上传树身份跟进：逐组件 `openat(O_NOFOLLOW)` 固定目录/文件身份、同一 fd 复制与复制前后指纹复验，并为一次 resolve 的目录深度、目录项和目录数设置总预算；独立于控制面提交，保证 CP11.2b 可单独回退。
+    - [x] CP11.2a.1 嵌套上传树身份跟进：逐组件 `openat(O_NOFOLLOW)` 固定目录/文件身份、同一 fd 复制与复制前后指纹复验，并为一次 resolve 的目录深度、目录项和目录数设置总预算；独立于控制面提交，保证 CP11.2b 可单独回退。→ commit `3c4c9b4`（build_log 0050；staged-only 定向 80、全量 857；外审第2轮 APPROVE）。
     - [ ] CP11.2b 人类控制面：真实 console confirm/reject + 文件请求 resolve/cancel + 生产 notifier 接线，继续保持 HTTP 进程 DB mode=ro、run 单写。
   - [ ] CP11.3 状态与执行边界：critical/budget_estimate 落库与早退、goal 最新版、orchestrator 单实例锁、超时终止进程组。
   - [ ] CP11.4 残余架构边界：调用意图/回执补账、执行容器/VM 隔离与内容寻址 artifact store 方案化。

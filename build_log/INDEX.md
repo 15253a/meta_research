@@ -6,6 +6,7 @@
 
 ---
 
+- [0050](0050-cp112a1-upload-tree-identity.md) — CP11.2a.1 逐组件固定嵌套上传树身份 + 同 fd 消费 + resolve 遍历总预算 · commit `3c4c9b4` · 验证: 通过（staged-only 定向 80、全量 857；外审第2轮 APPROVE）
 - [0049](0049-cp112a-user-asset-authority.md) — CP11.2a 用户文件原子接纳 + goal-wide 有界回执 + 生成时最小资产授权 · commit `c077cd2` · 验证: 通过（staged-only 全量 844；外审两轮上限后全部本地修复；三路内部 APPROVE）
 - [0048](0048-cp111-external-artifact-no-wedge.md) — CP11.1 严格 metric/SQLite ID 边界 + reasoning 语义拒收持久收敛 + DB 损坏 fail-loud · commit `ac53516` · 验证: 通过（定向 132，全量 754，codex 第1轮 APPROVE）
 - [0047](0047-cp102-cost-ledger-budget-stop.md) — CP10.2 成本账本覆盖失败/非法调用 + 未知用量 fail-closed + 单次越线即 durable 停机 · commit `03d3ffd` · 验证: 通过（pytest 754 全量；codex 第2轮 APPROVE）
