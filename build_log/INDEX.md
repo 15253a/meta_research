@@ -6,6 +6,7 @@
 
 ---
 
+- [0053](0053-cp112b3b-goal-amend-versioning.md) — CP11.2b.3b 不可变目标升版 + 专用 reasoning route + applicability/revalidate + 崩溃恢复 · commit `2dfa653` · 验证: 通过（控制面/调度面 374、全量 992；外审两轮上限后全部反馈本地修复）
 - [0052](0052-cp112b3a-runtime-budget-priority.md) — CP11.2b.3a 耐久动态预算 + 账本/状态卡对账 + 机械 pin/boost/suppress · commit `7f4fd73` · 验证: 通过（相关 234、全量 976；外审两轮上限后全部反馈本地修复）
 - [0051](0051-cp112b-durable-authenticated-control-plane.md) — CP11.2b.1–2 鉴权 HTTP→durable spool→run 单写动作全链 + 常驻/fail-closed 控制台 · commit `10215db` · 验证: 通过（staged-only 全量 959；外审两轮上限后 3 个装配 BLOCKER 全部本地修复）
 - [0050](0050-cp112a1-upload-tree-identity.md) — CP11.2a.1 逐组件固定嵌套上传树身份 + 同 fd 消费 + resolve 遍历总预算 · commit `3c4c9b4` · 验证: 通过（staged-only 定向 80、全量 857；外审第2轮 APPROVE）

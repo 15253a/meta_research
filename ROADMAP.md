@@ -15,8 +15,8 @@
 > **只在每个检查点记账时同步**；实时现场以 `implement_note.md` 为准，检查点进行中本节落后属正常（CLAUDE.md §9）。
 
 - 总目标：按 `reference/`（三部分施工标准 + 流程图）在 `meta-research/` 实现 meta-research 元循环系统，最终**能正确运行**（M0–M6 逐里程碑验收）。
-- 进行中的步 / 检查点：**步⑪ CP11.2b.3b goal_amend 真实语义**。CP11.2a/CP11.2a.1 用户文件资产与嵌套树身份已落 `c077cd2`/`3c4c9b4`；
-  CP11.2b.1–2 鉴权耐久控制入口已落 `10215db`，CP11.2b.3a 动态预算、预算对账与机械优先级已落 `7f4fd73`（全量 976）。步①–⑩已完成；步⑪ CP11.1 已完成，CP11.2b.3b–d/CP11.3/CP11.4 继续。
+- 进行中的步 / 检查点：**步⑪ CP11.2b.3c 真正只读 Codex query responder**。CP11.2a/CP11.2a.1 用户文件资产与嵌套树身份已落 `c077cd2`/`3c4c9b4`；
+  CP11.2b.1–2 鉴权耐久控制入口已落 `10215db`，CP11.2b.3a/b 动态预算、机械优先级与目标版本控制已落 `7f4fd73`/`2dfa653`（最新全量 992）。步①–⑩已完成；步⑪ CP11.1 已完成，CP11.2b.3c–d/CP11.3/CP11.4 继续。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -368,7 +368,7 @@
       - [x] CP11.2b.2 鉴权常驻控制台：loopback capability HTTP、默认 resident run、权威 live/ledger/文件投影与 fresh-snapshot 前端动作门。→ commit `10215db`（staged-only 定向 292、全量 959；外审两轮上限后全部装配 BLOCKER 本地修复）。
       - [ ] CP11.2b.3 reference 完整控制能力（子项全完成后勾选）：
         - [x] CP11.2b.3a 耐久动态预算、预算/账本/状态卡对账与机械 `pin/boost/suppress`；确认前零效果，实际应用/不从/失败均有 decision，重启同源投影。→ commit `7f4fd73`（build_log 0052；相关 234、全量 976；外审两轮上限后全部反馈本地修复）。
-        - [ ] CP11.2b.3b `goal_amend`：目标新版本、reasoning-only route、旧答案 applicability/revalidate 与恢复语义。
+        - [x] CP11.2b.3b `goal_amend`：确认 effect 精确绑定不可变目标新版本；专用 reasoning-only route；open/inconclusive 迁移重评，closed answer/evidence 保持出生版本并走 applicability/revalidate；覆盖 route/consume/application 崩溃与竞态恢复。→ commit `2dfa653`（build_log 0053；控制面/调度面 374、全量 992；外审两轮上限后全部反馈本地修复）。
         - [ ] CP11.2b.3c 真正只读 Codex query responder：独立只读快照、调用/成本/reply 回执和失败终态。
         - [ ] CP11.2b.3d 真实 connector 投递：event_key 幂等、at-least-once 重试与可观测回执。
   - [ ] CP11.3 状态与执行边界：critical/budget_estimate 落库与早退、goal 最新版、orchestrator 单实例锁、超时终止进程组。
