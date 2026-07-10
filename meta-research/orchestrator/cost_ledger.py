@@ -121,6 +121,40 @@ class CostLedger:
         # 不固定小数位 round：SQLite REAL 可保存极小正成本，逐次舍入为 0 会系统性欠计。
         return money
 
+    def new_external_call_block_reason(self, conn=None) -> Optional[str]:
+        """Return the durable/effective cost reason that forbids starting another external call.
+
+        Do not rely only on the single ``global_stop`` row: a prior score-floor stop may already occupy that
+        append-only slot when a later interaction call crosses budget or loses its usage receipt.
+        """
+        if conn is None:
+            # A consistent check is useful to callers, but only a caller that
+            # also creates its intent in this same transaction closes the
+            # check-to-start race (Mediator does so).
+            with self.daemon.transaction() as locked:
+                return self.new_external_call_block_reason(locked)
+        effective = effective_budget_config(
+            conn, self._base_budget, require_schedule=False)
+        if effective["session_max"] is None:
+            return None
+        explicit = conn.execute(
+            "SELECT json_extract(payload_json,'$.reason') FROM decision "
+            "WHERE actor='orchestrator' AND type='global_stop' "
+            "AND json_extract(payload_json,'$.reason') IN ('budget_exhausted','cost_accounting_failed') "
+            "ORDER BY id LIMIT 1").fetchone()
+        if explicit is not None:
+            return str(explicit[0])
+        unaccounted = conn.execute(
+            "SELECT 1 FROM runner_call rc WHERE rc.status='failed' "
+            "AND rc.failure_kind IN ('cost_accounting','orphaned_query_intent') "
+            "AND NOT EXISTS (SELECT 1 FROM ledger l WHERE l.runner_call_id=rc.id) LIMIT 1").fetchone()
+        if unaccounted is not None:
+            return "cost_accounting_failed"
+        spent = float(conn.execute("SELECT COALESCE(SUM(money),0) FROM ledger").fetchone()[0])
+        if spent >= effective["session_max"]:
+            return "budget_exhausted"
+        return None
+
     @staticmethod
     def _validated_usage(usage: Optional[CallUsage]) -> CallUsage:
         """校验并规范化一次调用用量，拒绝 bool/负数/NaN/Inf，避免污染 append-only ledger。"""
@@ -252,6 +286,53 @@ class CostLedger:
         if cur.rowcount != 1:
             raise RuntimeError(f"runner_call {runner_call_id} 不存在，ledger 未写入")
         return self._record_budget_stop_if_needed(conn, effective)
+
+    def fail_existing_unaccounted_call(self, conn: Any, *, runner_call_id: int,
+                                       failure_kind: str, cause: Exception) -> Optional[dict]:
+        """把已有调用意图终态化为“成本未知”；调用方须在同一事务内补其业务失败回执。
+
+        interaction_query 在外部调用**之前**先落 ``created``，主线程提交 ``running`` 后才放行 worker；
+        若恢复时只剩 running intent，无法知道调用发生到哪一步，也没有可信 usage 可写 ledger：预算开启时
+        必须沿用 CostLedger 的 fail-closed 原则落 durable global_stop；预算显式关闭时只记失败。
+        本方法不开事务、不另造第二条 runner_call，保持原 intent 的审计身份。
+        """
+        if not isinstance(failure_kind, str) or not failure_kind.strip():
+            raise ValueError("failure_kind 须为非空字符串")
+        row = conn.execute(
+            "SELECT cycle_id,phase,purpose,status FROM runner_call WHERE id=?",
+            (runner_call_id,)).fetchone()
+        if row is None:
+            raise RuntimeError(f"runner_call {runner_call_id} 不存在，无法终态化未知成本")
+        cycle_id, phase, purpose, status = row
+        if status not in ("created", "running"):
+            raise RuntimeError(
+                f"runner_call {runner_call_id} 已是终态 {status}，拒绝改写为未知成本失败")
+        changed = conn.execute(
+            "UPDATE runner_call SET status='failed',failure_kind=?,finished_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status IN ('created','running')",
+            (failure_kind.strip()[:200], runner_call_id)).rowcount
+        if changed != 1:
+            raise RuntimeError(f"runner_call {runner_call_id} 未知成本终态迁移竞态")
+
+        effective = effective_budget_config(conn, self._base_budget, require_schedule=False)
+        if effective["session_max"] is None:
+            return None
+        payload = {
+            "reason": "cost_accounting_failed",
+            "phase": phase,
+            "purpose": purpose,
+            "runner_call_id": runner_call_id,
+            "error_type": type(cause).__name__,
+            "error": str(cause)[:500],
+        }
+        if conn.execute(
+                "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' LIMIT 1"
+        ).fetchone() is None:
+            conn.execute(
+                "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                "VALUES (?,'orchestrator','global_stop',?)",
+                (cycle_id, json.dumps(payload, ensure_ascii=False)))
+        return payload
 
     def _record_budget_stop_if_needed(self, conn: Any, effective_budget: Optional[dict] = None) -> Optional[dict]:
         """在 ledger 写事务内检查累计并幂等落 global_stop；只返回命中，绝不在事务内抛。"""

@@ -1,6 +1,9 @@
 """CP2.2 · WriteDaemon 短事务原语（单写连接 / 提交回滚 / 不可嵌套）。"""
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from orchestrator import database as db
@@ -46,3 +49,34 @@ def test_reusable_after_rollback(daemon):
     with daemon.transaction() as conn:
         conn.execute("INSERT INTO goal(id,version,text,predicate_json) VALUES (2,1,'g2','{}')")
     assert daemon.query_one("SELECT count(*) FROM goal")[0] == 1
+
+
+def test_transaction_serializes_cross_thread_query_until_commit(daemon):
+    entered = threading.Event()
+    release = threading.Event()
+    reader_started = threading.Event()
+    reader_done = threading.Event()
+    observed = []
+
+    def writer():
+        with daemon.transaction() as conn:
+            conn.execute("INSERT INTO goal(id,version,text,predicate_json) VALUES (1,1,'g','{}')")
+            entered.set()
+            assert release.wait(1)
+
+    def reader():
+        assert entered.wait(1)
+        reader_started.set()
+        observed.append(daemon.query_one("SELECT count(*) FROM goal")[0])
+        reader_done.set()
+
+    writer_thread = threading.Thread(target=writer)
+    reader_thread = threading.Thread(target=reader)
+    writer_thread.start(); reader_thread.start()
+    assert reader_started.wait(1)
+    time.sleep(0.03)
+    assert not reader_done.is_set(), "另一线程不得插入事务中间读取同一 writer connection"
+    release.set()
+    writer_thread.join(1); reader_thread.join(1)
+    assert not writer_thread.is_alive() and not reader_thread.is_alive()
+    assert observed == [1]

@@ -11,6 +11,8 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
+import threading
+import time
 
 import pytest
 import yaml
@@ -20,6 +22,8 @@ from orchestrator import database as db
 from orchestrator import status_card as SC
 from orchestrator.console import Console
 from orchestrator.console_ingest import ConsoleInboxIngest
+from orchestrator.cost_ledger import CostLedger
+from orchestrator.interfaces import CallUsage, ResponderReply
 from orchestrator.mediator import Mediator, open_responder_read_conn
 from orchestrator.notify import FileRequestService, make_advancer_precheck
 from orchestrator.schemas import SchemaSet
@@ -124,6 +128,107 @@ def test_ingest_query_writes_reply(env):
     mid = env["daemon"].query_one("SELECT id FROM interaction_message WHERE idempotency_key='console-1'")[0]
     rep = env["daemon"].query_one("SELECT id FROM interaction_reply WHERE message_id=?", (mid,))
     assert rep is not None                             # query → 应答落 interaction_reply
+
+
+def test_async_query_advances_cursor_on_durable_intent_and_replay_is_once(env):
+    """慢 Codex 不阻断研究 precheck：runner intent durable 即消费 spool；完成仍由主写线程原子收口。"""
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowCodex:
+        kind = "codex"
+        prompt_version = "slow-test"
+        calls = 0
+
+        def answer(self, sanitized_query, status_card):
+            self.calls += 1
+            started.set()
+            assert release.wait(2)
+            return ResponderReply(
+                text="[快照 c1] 发布轮状态为 reasoning。",
+                usage=CallUsage(tokens_total=12, wallclock_sec=0.1, tokens_known=True),
+                transcript_ref="interactions/slow.out.md")
+
+    responder = SlowCodex()
+    mediator = Mediator(
+        env["daemon"], str(env["card_path"]), responder=responder,
+        cost_ledger=CostLedger(env["daemon"], POLICY))
+    env["mediator"] = mediator
+    env["ingest"].mediator = mediator
+    _spool(env["inbox"], _rec(1, "现在进展如何"))
+
+    assert env["ingest"].ingest() == 1
+    assert started.wait(1) and _cursor_at_inbox_end(env)
+    mid = env["daemon"].query_one(
+        "SELECT id FROM interaction_message WHERE idempotency_key='console-1'")[0]
+    assert env["daemon"].query_one(
+        "SELECT status FROM runner_call WHERE phase='interaction_query' AND purpose=?",
+        (f"message:{mid}",)) == ("running",)
+    assert env["daemon"].query_one(
+        "SELECT 1 FROM interaction_reply WHERE message_id=?", (mid,)) is None
+
+    (env["work"] / "state" / "console_inbox.cursor").unlink()
+    assert env["ingest"].ingest() == 1                 # replay 命中同一 in-memory/durable intent
+    assert responder.calls == 1
+    assert env["daemon"].query_one(
+        "SELECT COUNT(*) FROM runner_call WHERE phase='interaction_query' AND purpose=?",
+        (f"message:{mid}",))[0] == 1
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while mediator.has_pending_queries and time.monotonic() < deadline:
+        env["ingest"].ingest()                        # 空 spool poll 仍负责 main-writer 收口
+        time.sleep(0.005)
+    assert not mediator.has_pending_queries
+    assert env["daemon"].query_one(
+        "SELECT COUNT(*) FROM interaction_reply WHERE message_id=?", (mid,))[0] == 1
+    assert env["daemon"].query_one(
+        "SELECT COUNT(*) FROM ledger l JOIN runner_call r ON r.id=l.runner_call_id "
+        "WHERE r.phase='interaction_query' AND r.purpose=?", (f"message:{mid}",))[0] == 1
+
+
+def test_same_conversation_queue_does_not_block_following_spool_control(env):
+    """Normal FIFO wait is durable scheduler state, not a retry that pins the global byte cursor."""
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowCodex:
+        kind = "codex"
+        prompt_version = "fifo-spool-test"
+
+        def answer(self, sanitized_query, status_card):
+            started.set()
+            assert release.wait(2)
+            return ResponderReply(
+                text="[快照 c1] 发布轮状态为 reasoning。",
+                usage=CallUsage(tokens_total=3, tokens_known=True),
+                transcript_ref="interactions/fifo-spool.out.md")
+
+    mediator = Mediator(
+        env["daemon"], str(env["card_path"]), responder=SlowCodex(),
+        cost_ledger=CostLedger(env["daemon"], POLICY))
+    env["mediator"] = mediator
+    env["ingest"].mediator = mediator
+    first, second, control = _rec(1, "现在进展如何"), _rec(2, "结果是多少"), _rec(3, "暂停一下")
+    first["conversation_id"] = second["conversation_id"] = "a" * 32
+    _spool(env["inbox"], first, second, control)
+
+    assert env["ingest"].ingest() == 3 and started.wait(1)
+    assert _cursor_at_inbox_end(env)
+    queued_mid = env["daemon"].query_one(
+        "SELECT id FROM interaction_message WHERE idempotency_key='console-2'")[0]
+    assert env["daemon"].query_one(
+        "SELECT status,failure_kind FROM runner_call WHERE purpose=?",
+        (f"message:{queued_mid}",)) == ("created", "query_queued")
+    assert env["daemon"].query_one(
+        "SELECT status FROM directive WHERE kind='pause'") == ("pending",)
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while mediator.has_pending_queries and time.monotonic() < deadline:
+        env["ingest"].ingest()
+        time.sleep(0.005)
+    assert not mediator.has_pending_queries
 
 
 # ---------------- ③ 幂等 + 游标 ----------------
@@ -234,7 +339,8 @@ def test_action_idempotency_collision_does_not_pollute_old_message(env):
     """撞键 action 只拒当前 spool 行；不能给旧 query 追加失败 reply 或改变目标 directive。"""
     console, daemon = env["console"], env["daemon"]
     original = console.handle_inbound(
-        connector="console", raw_text="现在进展如何", idempotency_key="collision-old")
+        connector="console", raw_text="现在进展如何", idempotency_key="collision-old",
+        goal_id=1, goal_ver=1)
     env["mediator"].handle_query(message_id=original["message_id"])
     pause = console.handle_inbound(
         connector="console", raw_text="暂停", idempotency_key="collision-target")
@@ -750,6 +856,34 @@ def test_query_persistent_failure_writes_terminal_fallback(env, monkeypatch):
     reps = env["daemon"].query("SELECT reply_text FROM interaction_reply WHERE message_id=?", (mid,))
     assert len(reps) == 1 and "应答暂不可用" in reps[0][0]   # 恰一条终态失败回执（不漏、不双）
     assert _cursor_at_inbox_end(env)                            # 已推进（不饿死后续）
+
+
+def test_async_query_prepare_failure_binds_terminal_runner_receipt(env):
+    class NeverCalled:
+        kind = "codex"
+        prompt_version = "prepare-failure-test"
+
+        def answer(self, sanitized_query, status_card):
+            raise AssertionError("无 status card 时不得调用 provider")
+
+    mediator = Mediator(
+        env["daemon"], str(env["card_path"]), responder=NeverCalled(),
+        cost_ledger=CostLedger(env["daemon"], POLICY))
+    env["ingest"].mediator = mediator
+    env["card_path"].unlink()
+    _spool(env["inbox"], _rec(1, "现在进展如何"))
+    for _ in range(env["ingest"]._MAX_ATTEMPTS - 1):
+        assert env["ingest"].ingest() == 0
+    assert env["ingest"].ingest() == 1
+    mid = env["daemon"].query_one(
+        "SELECT id FROM interaction_message WHERE idempotency_key='console-1'")[0]
+    receipt = env["daemon"].query_one(
+        "SELECT r.status,r.failure_kind,ir.runner_call_id,ir.snapshot_cycle,ir.responder_kind "
+        "FROM interaction_reply ir JOIN runner_call r ON r.id=ir.runner_call_id "
+        "WHERE ir.message_id=?", (mid,))
+    assert receipt[:2] == ("aborted", "query_prepare_failed")
+    assert receipt[2] is not None and receipt[3:] == (None, "template")
+    assert _cursor_at_inbox_end(env)
 
 
 # ---------------- ⑬ 无序号坏尾行也被行数游标消费（不每拍重扫；外审 SHOULD）----------------

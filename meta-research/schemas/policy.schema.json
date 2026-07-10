@@ -198,7 +198,7 @@
             "grounding_fail_to_template": { "type": "integer", "minimum": 1 }
           }
         },
-        "mediator_rebuild_last_n": { "type": "integer", "minimum": 1 },
+        "mediator_rebuild_last_n": { "type": "integer", "minimum": 1, "maximum": 100 },
         "notify_matrix": { "type": "string", "minLength": 1 }
       }
     },

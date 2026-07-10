@@ -26,6 +26,8 @@ STAGE_SCHEMAS = [
     "review_verdict",
     # sidecar（非 Gate 产物：schema 校验后经 interaction_request_create，不入研究库，§6.11）
     "resource_request",
+    # interaction_query runner 候选回执：中介再按发布卡逐 path 交叉核值后落 interaction_reply
+    "interaction_reply_candidate",
     # 过程产物（runner_call 级契约：生成草稿 / 判官 / 评审输出，驱动器消费）
     "idea_set_draft", "idea_audit", "plan_review",
 ]

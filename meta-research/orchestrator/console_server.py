@@ -166,6 +166,16 @@ def _stored_idempotency_key(client_key: Optional[str]) -> Optional[str]:
     return "console-" + client_key
 
 
+def _console_conversation_id(value: Optional[str]) -> Optional[str]:
+    """A browser-profile-scoped 128-bit id; omitted only for legacy/direct callers."""
+    if value is None:
+        return None
+    if (not isinstance(value, str) or len(value) != 32
+            or any(ch not in "0123456789abcdef" for ch in value)):
+        raise ValueError("conversation_id 须为 128-bit 小写 hex（32 字符）")
+    return value
+
+
 def _is_loopback_host(host: str) -> bool:
     """控制台当前只支持本机监听；远程使用应走 SSH tunnel，而不是暴露无 TLS 的控制面。"""
     candidate = str(host or "").strip().rstrip(".").lower()
@@ -630,6 +640,7 @@ class ConsoleData:
         return self.spool.append(rec)
 
     def enqueue_message(self, text: str, connector: str = "console", *,
+                        conversation_id: Optional[str] = None,
                         client_idempotency_key: Optional[str] = None) -> Dict[str, Any]:
         """人工文本入站 → 追加写 inbox spool；**不写 DB**。"""
         if not isinstance(text, str):
@@ -639,7 +650,11 @@ class ConsoleData:
             raise ValueError("空消息")
         if len(text) > _MAX_MESSAGE_CHARS:
             raise ValueError(f"消息过长（最多 {_MAX_MESSAGE_CHARS} 字符）")
-        return self._enqueue({"connector": connector, "raw_text": text},
+        conversation_id = _console_conversation_id(conversation_id)
+        record = {"connector": connector, "raw_text": text}
+        if conversation_id is not None:
+            record["conversation_id"] = conversation_id
+        return self._enqueue(record,
                              client_idempotency_key=client_idempotency_key)
 
     def enqueue_directive_action(self, *, action: str, directive_id: Any,
@@ -877,7 +892,8 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                     body = self._read_json_object()
                     # connector 固定 "console"（codex NIT：不许客户端伪造成其他来源；控制台入口即 console）
                     rec = data.enqueue_message(
-                        body.get("text", ""), client_idempotency_key=client_key)
+                        body.get("text", ""), conversation_id=body.get("conversation_id"),
+                        client_idempotency_key=client_key)
                     self._json(200, {"ok": True, "queued": rec})
                 except (ValueError, json.JSONDecodeError) as e:
                     self._json(400, {"error": str(e)})

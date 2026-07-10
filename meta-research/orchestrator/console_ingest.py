@@ -4,7 +4,7 @@ console_server（独立只读进程）把运维在控制台敲的命令 append �
 （连接器缓冲、**非权威**）。本模块在 run 进程的 **precheck 边界**把这些行 ingest 进权威入站链：
 
   未消费行 → Console.handle_inbound（幂等：写 interaction_message + 分类落 directive/note）
-           → intent=query 再 Mediator.handle_query（写 interaction_reply 应答）
+           → intent=query 再交给 Mediator（模板同步回复；Codex 先写 durable runner intent、后台只读应答）
   action 行   → 先写 interaction_message + unclear 分类（显式控件动作，不重跑自然语言分类）
                → Console.confirm_directive / reject_directive（确认绑定 message provenance）
   file_request action 行 → 按 request 所属 goal 写 interaction_message + unclear 分类
@@ -14,8 +14,9 @@ console_server（独立只读进程）把运维在控制台敲的命令 append �
 **byte offset + inbox identity/anchor**）是纯优化、
 可丢：
 - directive/note：interaction_message UNIQUE(connector, idempotency_key) → 重复 ingest 命中既有 message、不重复建。
-- query：handle_query **非幂等**（每调一次写一条 interaction_reply）——故应答前先查「该 message 是否已有 reply」，
-  有则跳过。query-once 语义因此落在**持久层（reply 存在性）**而非游标上，游标丢失/崩溃重放都不会重复回复。
+- query：模板路径以 reply 存在性去重；Codex 路径以 ``phase=interaction_query,purpose=message:<id>`` 的
+  durable runner intent 接受后立即推进，不等待外部调用。游标丢失/崩溃重放会命中同一 reply/intent；未知在途
+  调用只终态化、不重发，故研究推进不被慢 query 阻塞，也不会制造重复外部调用。
 - directive action：动作 message 复用同一 idempotency key；confirmed/rejected 已达成即 no-op。因而
   「message 已落库、directive 尚未更新」的 crash window 可重放，游标丢失也不会重复改写 provenance。
 - file_request action：终态的 resolved_message_id 等于本动作 message 才视为 replay no-op；其他终态/目标
@@ -29,18 +30,22 @@ console_server（独立只读进程）把运维在控制台敲的命令 append �
 - **有限重试**：瞬时故障（DB locked/busy、卡片尚未发布 FileNotFoundError 等）→ 停批、不推进游标，下轮 precheck 重试；
   连续 `_MAX_ATTEMPTS` 次仍败 → 判**持久故障**、按终态处理并推进（防单条卡死饿死整队）：
     · handle_inbound 持久败 → 原子落 `unclear` 分类 + 可见失败回执，二者 durable 后才推进；
-    · query 应答持久败 → 写一条**终态失败回执**（reply 存在→守卫防再答），推进——既不漏答、不双答、也不饿死。
+    · query 应答持久败 → 写一条**终态失败回执**；生产 Codex 路径另绑 aborted interaction_query runner_call
+      （reply 存在→守卫防再答），推进——既不漏答、不双答、也不饿死。
 - **毒消息**只限无法形成安全幂等语义的外部形状错误（坏 JSON、坏 identity 等）；通过形状闸后的
   handle_inbound 任意内部异常都走上述持久重试/终态回执，不能静默丢弃。
 
-**并发/单写**：console_server 只 append spool + mode=ro 读 DB；run 进程 precheck 独占 cursor + DB 写（单写纪律不破）。
+**并发/单写**：console_server 只 append spool + mode=ro 读 DB；run 进程内 resident pump 与
+precheck 经同一 ingest lock 独占 cursor/retry sidecar，DB 操作再经 WriteDaemon 唯一连接串行化。
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+import re
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,6 +61,7 @@ _MAX_RAW_TEXT_CHARS = 20_000
 _MAX_IDEMPOTENCY_KEY_CHARS = 256
 _ACTION_FAILURE_PREFIX = "[console-action-failed] "
 _INBOUND_FAILURE_PREFIX = "[console-inbound-failed] "
+_CONVERSATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 class RetryStateError(RuntimeError):
@@ -100,6 +106,10 @@ class ConsoleInboxIngest:
         self._attempts: dict[str, int] = {}
         self._retry_state_error: Optional[Exception] = None
         self._retry_write_error: Optional[Exception] = None
+        # Research precheck and the resident interaction pump may both probe
+        # the spool.  One lock owns cursor/retry-sidecar transitions and also
+        # serializes Mediator's in-memory inflight map.
+        self._ingest_lock = threading.RLock()
         self._reload_retry_state()
         self.has_pending = self._retry_state_error is not None
 
@@ -133,9 +143,31 @@ class ConsoleInboxIngest:
                 raise
 
     def ingest(self, cyc: Any = None) -> int:
+        with self._ingest_lock:
+            return self._ingest_locked(cyc)
+
+    def poll_accepted(self) -> None:
+        """Finalize only already durable query work; do not consume newly appended spool records."""
+        with self._ingest_lock:
+            self.mediator.poll()
+
+    @property
+    def interaction_pending(self) -> bool:
+        with self._ingest_lock:
+            return self.has_pending or self.mediator.has_pending_queries
+
+    @property
+    def accepted_interaction_pending(self) -> bool:
+        with self._ingest_lock:
+            return self.mediator.has_pending_queries
+
+    def _ingest_locked(self, cyc: Any = None) -> int:
         """消费 cursor 之后所有已提交行；返回本次处理条数。cyc=当前 cycle（有则把 directive 绑到该轮）。
         **顶层兜底**：读 spool / 写游标故障不抛崩主循环，但置 ``has_pending`` 阻断研究推进，下轮重试。"""
         try:
+            # Codex worker 永不持 DB；只有本 precheck/main-writer 边界可以把完成回执原子写入
+            # runner_call + ledger + interaction_reply。poll 不等待，因此不会把研究链卡在模型调用上。
+            self.mediator.poll()
             if self._retry_state_error is not None and not self._reload_retry_state():
                 self.has_pending = True
                 return 0
@@ -206,6 +238,7 @@ class ConsoleInboxIngest:
         seq = rec.get("seq")
         idem = rec.get("idempotency_key") or (f"console-{seq}" if seq is not None else None)
         connector = rec.get("connector", "console")
+        conversation_id = rec.get("conversation_id")
         if (not isinstance(idem, str) or not idem
                 or len(idem) > _MAX_IDEMPOTENCY_KEY_CHARS):
             # 无规范幂等键且无 seq → 无法安全去重 → 判毒（跳过并推进），console_server 恒带二者
@@ -219,6 +252,12 @@ class ConsoleInboxIngest:
             return self._process_file_request_action(rec, connector=connector, idem=idem)
         if "action" in rec:
             return self._process_directive_action(rec, connector=connector, idem=idem, cycle_id=cycle_id)
+        if (conversation_id is not None
+                and (not isinstance(conversation_id, str)
+                     or _CONVERSATION_ID_RE.fullmatch(conversation_id) is None)):
+            logger.warning("console_inbox conversation_id 非 128-bit hex，跳过: idem=%s", idem)
+            self._clear_attempt(idem)
+            return "poison"
         if not isinstance(raw, str) or not raw.strip() or len(raw) > _MAX_RAW_TEXT_CHARS:
             logger.warning("console_inbox 普通消息 raw_text 非法，跳过: idem=%s", idem)
             self._clear_attempt(idem)
@@ -227,7 +266,7 @@ class ConsoleInboxIngest:
             goal_id, goal_ver = self._message_goal_binding(connector, idem)
             return self._terminalize_inbound_failure(
                 connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
-                goal_id=goal_id, goal_ver=goal_ver)
+                goal_id=goal_id, goal_ver=goal_ver, conversation_id=conversation_id)
         goal_id: Optional[int] = None
         goal_ver: Optional[int] = None
         try:
@@ -235,10 +274,12 @@ class ConsoleInboxIngest:
             res = self.console.handle_inbound(connector=connector, raw_text=raw,
                                               idempotency_key=idem, cycle_id=cycle_id,
                                               goal_id=goal_id, goal_ver=goal_ver,
-                                              session_ref=CONSOLE_MESSAGE_SESSION_REF)
+                                              session_ref=CONSOLE_MESSAGE_SESSION_REF,
+                                              conversation_id=conversation_id)
             self._verify_inbound_message(
                 res["message_id"], raw=raw, idem=idem,
-                goal_id=goal_id, goal_ver=goal_ver)
+                goal_id=goal_id, goal_ver=goal_ver,
+                conversation_id=conversation_id)
         except IdempotencyCollisionError:
             logger.error("console_inbox 普通消息 idempotency collision (idem=%s) → 拒绝", idem, exc_info=True)
             self._clear_attempt(idem)
@@ -253,7 +294,7 @@ class ConsoleInboxIngest:
                 goal_id, goal_ver = self._message_goal_binding(connector, idem)
             return self._terminalize_inbound_failure(
                 connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
-                goal_id=goal_id, goal_ver=goal_ver)
+                goal_id=goal_id, goal_ver=goal_ver, conversation_id=conversation_id)
         if res.get("intent") == "query" and res.get("message_id") is not None:
             return self._answer_query(idem, res["message_id"])
         self._clear_attempt(idem)              # 成功 → 清计数
@@ -283,18 +324,19 @@ class ConsoleInboxIngest:
         return int(current[0]), int(current[1])
 
     def _verify_inbound_message(self, mid: int, *, raw: str, idem: str,
-                                goal_id: Optional[int], goal_ver: Optional[int]) -> None:
+                                goal_id: Optional[int], goal_ver: Optional[int],
+                                conversation_id: Optional[str]) -> None:
         row = self.console.daemon.query_one(
-            "SELECT connector,raw_text,raw_hash,goal_id,goal_ver,session_ref "
+            "SELECT connector,raw_text,raw_hash,goal_id,goal_ver,session_ref,conversation_id "
             "FROM interaction_message WHERE id=?", (mid,))
         expected_hash = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
         if row != ("console", raw, expected_hash, goal_id, goal_ver,
-                   CONSOLE_MESSAGE_SESSION_REF):
+                   CONSOLE_MESSAGE_SESSION_REF, conversation_id):
             raise IdempotencyCollisionError(f"console idempotency_key 已绑定其他普通消息: {idem}")
 
     def _terminalize_inbound_failure(self, *, connector: str, raw: str, idem: str,
                                      cycle_id: Optional[str], goal_id: Optional[int],
-                                     goal_ver: Optional[int]) -> str:
+                                     goal_ver: Optional[int], conversation_id: Optional[str]) -> str:
         """连续内部失败达上限后，先落可审计终态，再允许 cursor 越过当前记录。
 
         新消息的 ``unclear`` 分类和失败 reply 共用一个事务；事务/commit 任一失败都返回 ``retry``。
@@ -305,9 +347,11 @@ class ConsoleInboxIngest:
             mid = self.console.ingest.inbound(
                 connector=connector, raw_text=raw, idempotency_key=idem, cycle_id=cycle_id,
                 goal_id=goal_id, goal_ver=goal_ver,
-                session_ref=CONSOLE_MESSAGE_SESSION_REF)
+                session_ref=CONSOLE_MESSAGE_SESSION_REF,
+                conversation_id=conversation_id)
             self._verify_inbound_message(
-                mid, raw=raw, idem=idem, goal_id=goal_id, goal_ver=goal_ver)
+                mid, raw=raw, idem=idem, goal_id=goal_id, goal_ver=goal_ver,
+                conversation_id=conversation_id)
             failure_text = _INBOUND_FAILURE_PREFIX + "控制台消息处理持续失败，未执行任何控制语义"
             failure_hash = "sha256:" + hashlib.sha256(failure_text.encode("utf-8")).hexdigest()
             with self.console.daemon.transaction() as conn:
@@ -319,7 +363,7 @@ class ConsoleInboxIngest:
                         "INSERT INTO interaction_classification(message_id,intent,directive_id) "
                         "VALUES (?,'unclear',NULL)", (mid,))
                     classification = ("unclear", None)
-                if classification[0] in ("query", "unclear"):
+                if classification[0] == "unclear":
                     exists = conn.execute(
                         "SELECT 1 FROM interaction_reply WHERE message_id=? LIMIT 1", (mid,)).fetchone()
                     if exists is None:
@@ -327,8 +371,20 @@ class ConsoleInboxIngest:
                             "INSERT INTO interaction_reply(message_id,reply_ref,reply_hash,reply_text,"
                             "snapshot_cycle,responder_kind) VALUES (?,?,?,?,NULL,'template')",
                             (mid, f"reply:{mid}", failure_hash, failure_text))
+            if classification[0] == "query":
+                # A connector ACK is not a final query receipt.  Preserve any
+                # active intent, or create an auditable no-call terminal if
+                # preparation itself remains broken.
+                if self.mediator.async_enabled:
+                    try:
+                        self.mediator.enqueue_query(message_id=mid)
+                    except Exception as cause:
+                        self.mediator.terminalize_query_prepare_failure(
+                            message_id=mid, cause=cause)
+                else:
+                    self.mediator.handle_query(message_id=mid)
             self._clear_attempt(idem)
-            return "ok" if classification[0] in ("directive", "note") else "poison"
+            return "ok" if classification[0] in ("directive", "note", "query") else "poison"
         except RetryStateError:
             raise
         except IdempotencyCollisionError:
@@ -585,11 +641,22 @@ class ConsoleInboxIngest:
         return "ok"
 
     def _answer_query(self, idem: str, mid: int) -> str:
-        """query 应答（**no-loss 不变量：只有当该 message 有 durable interaction_reply 时才推进游标**）。
-        已答→推进（不重复）；未答→应答；应答失败→有限重试；超限→写终态失败回执，**仅回执 durable 写入才推进**，
-        否则 'retry'（DB 持续故障时不推进 ingest 无害——那时推进主循环本身也已停）。"""
+        """query 应答。
+
+        模板路径保持 reply-durable 才推进。Codex 路径在 ``enqueue_query`` 已原子落 active runner intent
+        （或已落 terminal reply）后即可推进；后台调用不持 DB，完成由后续 main-writer ``poll`` 收口。
+        """
+        last_error: Optional[BaseException] = None
         try:
-            if self._has_reply(mid):           # 已答（并发/前次/重放）→ 推进，不重复回复
+            has_terminal = (self.mediator.has_terminal_query_reply(mid)
+                            if self.mediator.async_enabled else self._has_reply(mid))
+            if has_terminal:                   # 已答（ACK 不算 async 终态）→不重复回复
+                self._clear_attempt(idem)
+                return "ok"
+            if self.mediator.async_enabled:
+                # 返回 accepted/recovered/rejected/completed 时均已有可重放的权威持久态；若 prepare/DB
+                # 失败则抛到有限重试，绝不先推进 cursor。
+                self.mediator.enqueue_query(message_id=mid)
                 self._clear_attempt(idem)
                 return "ok"
             if self._attempts.get(idem, 0) < self._MAX_ATTEMPTS:
@@ -598,10 +665,10 @@ class ConsoleInboxIngest:
                 return "ok"
         except RetryStateError:
             raise                             # reply 可能已 durable；保留 cursor 后按 reply-exists 重放
-        except sqlite3.OperationalError:       # 查 reply / 应答的瞬时故障 → 落有限重试
-            pass
-        except Exception:                      # noqa: BLE001 —— 卡片未发布(FileNotFoundError)/应答器故障等 → 落有限重试
-            pass
+        except sqlite3.OperationalError as error:       # 查 reply / 应答的瞬时故障 → 落有限重试
+            last_error = error
+        except Exception as error:                      # noqa: BLE001 —— 卡片未发布/应答器故障等 → 有限重试
+            last_error = error
         if self._attempts.get(idem, 0) < self._MAX_ATTEMPTS:
             if self._bump(idem) < self._MAX_ATTEMPTS:
                 logger.warning("console_inbox query 应答可重试 (message_id=%s, 第%d次)",
@@ -609,9 +676,18 @@ class ConsoleInboxIngest:
                 return "retry"
         logger.error("console_inbox query 应答超重试上限 (message_id=%s) → 写终态失败回执", mid, exc_info=True)
         try:                                   # 终态失败回执：写一条 reply（存在→守卫防再答）。查/写任一失败 → 不推进（no-loss）
-            if not self._has_reply(mid):
-                self.console.ingest.ack(message_id=mid,
-                                        reply_text="（应答暂不可用：状态卡未发布或应答器故障，请稍后重试或直接查看各标签页）")
+            has_terminal = (self.mediator.has_terminal_query_reply(mid)
+                            if self.mediator.async_enabled else self._has_reply(mid))
+            if not has_terminal:
+                if self.mediator.async_enabled:
+                    self.mediator.terminalize_query_prepare_failure(
+                        message_id=mid,
+                        cause=last_error or RuntimeError("query prepare retries exhausted"))
+                else:
+                    self.console.ingest.ack(
+                        message_id=mid,
+                        reply_text="（应答暂不可用：状态卡未发布或应答器故障，请稍后重试或直接查看各标签页）",
+                        reply_role="final-template")
         except Exception:                      # noqa: BLE001 —— 连终态回执/查 reply 都失败（DB 持续故障）→ **不推进**、下轮再来
             logger.warning("console_inbox 终态回执写入/查询失败 (message_id=%s) → 不推进游标", mid, exc_info=True)
             return "retry"

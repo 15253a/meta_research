@@ -6,9 +6,9 @@
 - **短事务铁律**：长操作（runner 调用 / 训练 / import clone）**绝不持写事务**——在事务外执行、完成后
   才提交一个短写命令。本类只提供短事务上下文，不给任何长事务接口。
 
-M1 形态（本检查点 CP2.2）：**同进程同步**执行——单线程驱动器下，`transaction()` 即一个短事务。
-形式化 `WriteCommand` 队列 + 独立 daemon 线程（§6.13(1) 表 / interfaces.WriteDaemon.submit）留到 M5
-（interaction daemon 并发入站时才需要串行化队列）；此前的核心保证——唯一写连接 + 原子短事务——现已就位。
+CP11 形态：研究驱动与 interaction pump 同进程两线程，仍共用**唯一** writer
+connection。`RLock` 串行化每次连接操作，`transaction()` 持锁覆盖整个短事务；长外部调用仍在
+事务外。因此并发仅是入站/回执及时性，不会变成两个 writer 或交叉事务。
 
 事务语义：`BEGIN IMMEDIATE`（立即取写锁，避免升级死锁）→ 块内任一步抛异常即整体 `ROLLBACK`
 （decompose 等多写原子性的落点，§4.2.5：kill-9 / 异常后无半写）→ 正常退出 `COMMIT`。
@@ -17,8 +17,68 @@ M1 形态（本检查点 CP2.2）：**同进程同步**执行——单线程驱�
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from typing import Any, Iterator, List, Optional, Sequence, Tuple
+
+
+class _LockedCursor:
+    """Cursor facade that keeps every sqlite C call under the daemon lock."""
+
+    def __init__(self, cursor: sqlite3.Cursor, lock: threading.RLock):
+        self._cursor = cursor
+        self._lock = lock
+
+    def __getattr__(self, name):
+        attr = getattr(self._cursor, name)
+        if not callable(attr):
+            return attr
+
+        def guarded(*args, **kwargs):
+            with self._lock:
+                result = attr(*args, **kwargs)
+                return self if result is self._cursor else result
+        return guarded
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            return next(self._cursor)
+
+
+class _LockedConnection:
+    """Compatibility facade for legacy ``daemon.conn`` call sites.
+
+    Transaction bodies receive the real connection while WriteDaemon holds the
+    same re-entrant lock.  Out-of-transaction readers that still use
+    ``daemon.conn`` are serialized here, so the interaction pump cannot execute
+    on the connection midway through another sqlite operation.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_lock", lock)
+
+    def __getattr__(self, name):
+        attr = getattr(self._conn, name)
+        if not callable(attr):
+            with self._lock:
+                return getattr(self._conn, name)
+
+        def guarded(*args, **kwargs):
+            with self._lock:
+                result = attr(*args, **kwargs)
+                return _LockedCursor(result, self._lock) if isinstance(result, sqlite3.Cursor) else result
+        return guarded
+
+    def __setattr__(self, name, value):
+        if name in {"_conn", "_lock"}:
+            object.__setattr__(self, name, value)
+            return
+        with self._lock:
+            setattr(self._conn, name, value)
 
 
 class WriteDaemon:
@@ -31,11 +91,13 @@ class WriteDaemon:
         """
         conn.isolation_level = None   # 显式掌控事务（关隐式 BEGIN）
         self._conn = conn
+        self._lock = threading.RLock()
+        self._public_conn = _LockedConnection(conn, self._lock)
         self._in_txn = False
 
     @property
-    def conn(self) -> sqlite3.Connection:
-        return self._conn
+    def conn(self):
+        return self._public_conn
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -45,31 +107,34 @@ class WriteDaemon:
         daemon 永久卡在「事务中」；`COMMIT` 失败（罕见，如磁盘满）则尽力 ROLLBACK，避免真实事务态与
         `_in_txn` 不一致、堵死后续写入。
         """
-        if self._in_txn:
-            raise RuntimeError("WriteDaemon 事务不可嵌套（一个写命令一个短事务；长操作须在事务外）")
-        self._in_txn = True
-        try:
-            self._conn.execute("BEGIN IMMEDIATE")
+        with self._lock:
+            if self._in_txn:
+                raise RuntimeError("WriteDaemon 事务不可嵌套（一个写命令一个短事务；长操作须在事务外）")
+            self._in_txn = True
             try:
-                yield self._conn
-            except BaseException:
-                self._conn.execute("ROLLBACK")
-                raise
-            else:
+                self._conn.execute("BEGIN IMMEDIATE")
                 try:
-                    self._conn.execute("COMMIT")
+                    yield self._conn
                 except BaseException:
-                    try:
-                        self._conn.execute("ROLLBACK")
-                    except Exception:
-                        pass
+                    self._conn.execute("ROLLBACK")
                     raise
-        finally:
-            self._in_txn = False
+                else:
+                    try:
+                        self._conn.execute("COMMIT")
+                    except BaseException:
+                        try:
+                            self._conn.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        raise
+            finally:
+                self._in_txn = False
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> List[Tuple]:
         """只读查询（同连接；事务内可见未提交写，事务外见已提交态）。"""
-        return self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> Optional[Tuple]:
-        return self._conn.execute(sql, params).fetchone()
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()

@@ -302,22 +302,24 @@ class Console:
     def handle_inbound(self, *, connector: str, raw_text: str, idempotency_key: str,
                        goal_id: Optional[int] = None, goal_ver: Optional[int] = None,
                        cycle_id: Optional[str] = None,
-                       session_ref: Optional[str] = None) -> Dict[str, Any]:
+                       session_ref: Optional[str] = None,
+                       conversation_id: Optional[str] = None) -> Dict[str, Any]:
         """durable 入站 → 恰一分类（幂等：message UNIQUE）→ directive/note 先建行再回指（DDL 时序）。
         返回 {message_id, intent, directive_id?, needs_confirmation?}。unclear：不自动答不产 directive
         （ACK 回显请确认由通知层出，CP6.3）。"""
         mid = self.ingest.inbound(connector=connector, raw_text=raw_text, idempotency_key=idempotency_key,
                                   goal_id=goal_id, goal_ver=goal_ver, cycle_id=cycle_id,
-                                  session_ref=session_ref)
+                                  session_ref=session_ref, conversation_id=conversation_id)
         # InteractionIngest 的 UNIQUE 只负责找回 message id；在读取既有 classification 或调用分类器前，
         # 必须先证明 replay 的不可变 payload 相同。否则“首事务只落 message 后崩溃”的窗口里，撞键 body
         # 可把自己的 directive 语义提交到另一条 raw message 上。cycle_id 不参与比较：传输重放可能跨
         # precheck/cycle 才到达，但仍应收敛到首次 durable message。
         stored = self.daemon.query_one(
-            "SELECT connector,raw_text,raw_hash,goal_id,goal_ver,session_ref "
+            "SELECT connector,raw_text,raw_hash,goal_id,goal_ver,session_ref,conversation_id "
             "FROM interaction_message WHERE id=?", (mid,))
         expected_hash = "sha256:" + hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-        if stored != (connector, raw_text, expected_hash, goal_id, goal_ver, session_ref):
+        if stored != (connector, raw_text, expected_hash, goal_id, goal_ver,
+                      session_ref, conversation_id):
             raise IdempotencyCollisionError(
                 f"{connector} idempotency_key 已绑定其他不可变消息: {idempotency_key}")
         ex = self._existing_classification(mid)

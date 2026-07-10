@@ -78,6 +78,43 @@ def test_record_ledger_only_reuses_existing_runner_call(daemon):
     assert daemon.query_one("SELECT COUNT(*) FROM runner_call WHERE id=?", (rc,))[0] == 1   # 未重复建 runner_call
 
 
+def test_fail_existing_unaccounted_call_reuses_intent_and_stops(daemon):
+    """interaction_query 崩溃恢复：原 running intent 终态化；不另造伪调用，预算开启则 durable stop。"""
+    cl = CostLedger(daemon, POLICY)
+    with daemon.transaction() as conn:
+        rc = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+            "VALUES (1,'interaction_query','message:99','running')").lastrowid
+    with daemon.transaction() as conn:
+        payload = cl.fail_existing_unaccounted_call(
+            conn, runner_call_id=rc, failure_kind="orphaned_query_intent",
+            cause=RuntimeError("unknown external state"))
+    assert payload["runner_call_id"] == rc
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM runner_call WHERE id=?", (rc,)) == (
+            "failed", "orphaned_query_intent")
+    assert daemon.query_one("SELECT COUNT(*) FROM runner_call")[0] == 1
+    assert daemon.query_one("SELECT COUNT(*) FROM ledger WHERE runner_call_id=?", (rc,))[0] == 0
+    stop = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE actor='orchestrator' AND type='global_stop'")[0])
+    assert stop["reason"] == "cost_accounting_failed" and stop["runner_call_id"] == rc
+
+
+def test_fail_existing_unaccounted_call_without_budget_only_marks_failure(daemon):
+    policy = {**POLICY, "budget": {**POLICY["budget"], "session_max": None}}
+    cl = CostLedger(daemon, policy)
+    with daemon.transaction() as conn:
+        rc = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+            "VALUES (1,'interaction_query','message:100','created')").lastrowid
+        assert cl.fail_existing_unaccounted_call(
+            conn, runner_call_id=rc, failure_kind="orphaned_query_intent",
+            cause=RuntimeError("unknown")) is None
+    assert daemon.query_one("SELECT status FROM runner_call WHERE id=?", (rc,)) == ("failed",)
+    assert daemon.query_one(
+        "SELECT COUNT(*) FROM decision WHERE actor='orchestrator' AND type='global_stop'")[0] == 0
+
+
 def test_duplicate_ledger_for_same_runner_call_fails_loud(daemon):
     cl = CostLedger(daemon, POLICY)
     rc = cl.record(cycle_id="c1", phase="idea", purpose="once", usage=_known_usage(tokens_total=10))

@@ -1,21 +1,31 @@
 """CodexRunner —— 智能运行时窄接口的真实现（M0 起即真，《第二部分》§6.2/§6.10）。
 
 一任务一会话：每次 run_task 起一个全新 `codex exec --ephemeral` 进程，无跨调用状态（P3）。
-prompt = system_prompt + skill 节选 + 四区上下文包 + 信封提醒，全部内联（本机 bwrap 不可用，
-prompt 已声明不得执行命令）。产物 = 最后一个 ```json 代码块，结构 {"files": {...}, "md": "..."}。
+prompt = system_prompt + skill 节选 + 四区上下文包 + 信封提醒，全部内联。普通研究 runner 保留只读 shell；
+``tool_free=True`` 的交互 responder 还会以不同 UID 在临时 cwd 运行（writer work/DB =
+0700/0600，该 UID 无法 traverse），关闭 web/shell/apps/browser/computer/multi-agent，并对 JSON 事件流
+拒绝任何工具项；不是仅靠 prompt 自律。产物 = 最后一个 ```json 代码块。
 
 工程配置走环境变量（非 policy.yaml——模型/二进制是工程事实，不在附录 C 旋钮注册表内）：
   METARESEARCH_CODEX_BIN     默认 codex-chatgpt（本机已认证包装）
   METARESEARCH_CODEX_MODEL   默认 gpt-5.5
   METARESEARCH_CODEX_EFFORT  默认 medium
   METARESEARCH_RUNNER_TIMEOUT_S 默认 900（M0 工程超时；真 watchdog 见 M3/policy flow.watchdog）
+  METARESEARCH_QUERY_RUN_AS_USER interaction query 专用低权用户（root 本机默认 codexro）
+  METARESEARCH_QUERY_CODEX_BIN / METARESEARCH_QUERY_CODEX_HOME 专用用户的 CLI 与认证目录
 """
 from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
+import signal
+import shutil
+import stat
 import subprocess
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -31,6 +41,172 @@ _TOKENS_RE = re.compile(
     r"^[ \t]*tokens used(?:[ \t]*:[ \t]*|[ \t]*\n[ \t]*|[ \t]+)(\d{1,3}(?:,\d{3})+|\d+)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
+TOOL_FREE_POLICY_VERSION = (
+    "interaction-query-tools-v3:web-disabled:no-host-tools:uid-isolated:"
+    "trace-allowlist:process-group")
+_TOOL_FREE_ALLOWED_ITEMS = frozenset({"agent_message", "reasoning"})
+_TOOL_FREE_ALLOWED_EVENTS = frozenset({
+    "thread.started", "turn.started", "item.started", "item.updated",
+    "item.completed", "turn.completed",
+})
+_MAX_TOOL_FREE_OUTPUT_BYTES = 1024 * 1024
+_ACTIVE_PROCESS_GROUPS = {}
+_ACTIVE_PROCESS_GROUPS_LOCK = threading.Lock()
+_PROCESS_GROUP_SHUTDOWN = threading.Event()
+
+
+def _terminate_process_group(proc: subprocess.Popen, *, grace_s: float = 1.0):
+    """Terminate the whole new session, drain its pipes, then reap the direct child."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        return proc.communicate(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return proc.communicate()
+
+
+def _run_process_group(cmd, *, stdin, timeout, cwd=None):
+    """``subprocess.run`` equivalent whose timeout/interrupt cannot orphan sudo descendants."""
+    with _ACTIVE_PROCESS_GROUPS_LOCK:
+        if _PROCESS_GROUP_SHUTDOWN.is_set():
+            raise RuntimeError("tool-free process registry 已进入 hard-stop，拒绝启动新调用")
+        # Popen + register share the same lock as hard-stop snapshot.  Therefore a shutdown either
+        # precedes this spawn (and rejects it) or observes the fully registered process group.
+        proc = subprocess.Popen(
+            cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True, cwd=cwd)
+        _ACTIVE_PROCESS_GROUPS[proc.pid] = proc
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            stdout, stderr = _terminate_process_group(proc)
+            raise subprocess.TimeoutExpired(
+                error.cmd, error.timeout,
+                output=stdout if stdout is not None else error.output,
+                stderr=stderr if stderr is not None else error.stderr) from error
+        except BaseException:
+            _terminate_process_group(proc)
+            raise
+    finally:
+        with _ACTIVE_PROCESS_GROUPS_LOCK:
+            _ACTIVE_PROCESS_GROUPS.pop(proc.pid, None)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def terminate_active_process_groups(*, grace_s: float = 0.25) -> None:
+    """Hard-stop escape hatch: signal tool-free calls running in background worker threads."""
+    with _ACTIVE_PROCESS_GROUPS_LOCK:
+        _PROCESS_GROUP_SHUTDOWN.set()
+        active = list(_ACTIVE_PROCESS_GROUPS.values())
+    errors = []
+    try:
+        for proc in active:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                errors.append(error)
+        if active and grace_s > 0:
+            time.sleep(grace_s)
+    finally:
+        # Even a third SIGINT during the grace sleep cannot skip SIGKILL.
+        with _ACTIVE_PROCESS_GROUPS_LOCK:
+            still_registered = {
+                pid: proc for pid, proc in _ACTIVE_PROCESS_GROUPS.items()
+                if any(proc is candidate for candidate in active)
+            }
+        for proc in still_registered.values():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                errors.append(error)
+    if errors:
+        raise RuntimeError(
+            "部分 tool-free 进程组无法终止: "
+            + "; ".join(f"{type(error).__name__}: {error}" for error in errors))
+
+
+def _copy_isolated_output(src: Path, dst: Path, *, expected_uid: int) -> None:
+    """Copy one bounded regular result across the query-UID boundary without following paths."""
+    read_flags = (os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+                  | getattr(os, "O_NOFOLLOW", 0))
+    src_fd = os.open(src, read_flags)
+    try:
+        info = os.fstat(src_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid or info.st_nlink != 1:
+            raise ValueError("interaction_query 输出须为隔离 UID 独占的常规文件")
+        if info.st_size > _MAX_TOOL_FREE_OUTPUT_BYTES:
+            raise ValueError(
+                f"interaction_query 输出超过 {_MAX_TOOL_FREE_OUTPUT_BYTES} bytes")
+        chunks = []
+        remaining = _MAX_TOOL_FREE_OUTPUT_BYTES + 1
+        while remaining:
+            chunk = os.read(src_fd, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > _MAX_TOOL_FREE_OUTPUT_BYTES:
+            raise ValueError(
+                f"interaction_query 输出超过 {_MAX_TOOL_FREE_OUTPUT_BYTES} bytes")
+    finally:
+        os.close(src_fd)
+    write_flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+                   | getattr(os, "O_NOFOLLOW", 0))
+    dst_fd = os.open(dst, write_flags, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(dst_fd, view)
+            view = view[written:]
+        os.fsync(dst_fd)
+        os.fchmod(dst_fd, 0o600)
+    finally:
+        os.close(dst_fd)
+
+
+def validate_tool_free_trace(stdout_text: str) -> None:
+    """Fail the receipt if Codex reports any tool/state item.
+
+    Capability flags prevent host/network tools from being exposed.  JSON event
+    auditing is a second guard against future CLI surface drift: a response is
+    never accepted if it invoked even an otherwise harmless plan tool.
+    """
+    if not stdout_text.strip():
+        raise RunnerError("tool-free runner 缺 JSON 事件回执")
+    saw_turn = False
+    for line in stdout_text.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RunnerError("tool-free runner 事件流非 JSON") from error
+        if not isinstance(event, dict):
+            raise RunnerError("tool-free runner 事件须为 JSON object")
+        event_type = event.get("type")
+        if event_type not in _TOOL_FREE_ALLOWED_EVENTS:
+            raise RunnerError(f"tool-free runner 观测到未知顶层事件: {event_type!r}")
+        if event_type == "turn.completed":
+            saw_turn = True
+        if event_type.startswith("item."):
+            item = event.get("item")
+            if not isinstance(item, dict):
+                raise RunnerError("tool-free runner item 事件须含 JSON object")
+            item_type = item.get("type")
+            if item_type not in _TOOL_FREE_ALLOWED_ITEMS:
+                raise RunnerError(f"tool-free runner 观测到禁止工具/状态项: {item_type!r}")
+    if not saw_turn:
+        raise RunnerError("tool-free runner 缺 turn.completed 回执")
 
 
 def parse_tokens_used(stderr_text: str) -> Optional[int]:
@@ -44,6 +220,33 @@ def parse_tokens_used(stderr_text: str) -> Optional[int]:
         return None
 
 
+def parse_json_tokens_used(stdout_text: str) -> Optional[int]:
+    """Read the last completed-turn usage emitted by ``codex exec --json``."""
+    usage = None
+    for line in (stdout_text or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+    if usage is None:
+        return None
+    total = usage.get("total_tokens")
+    if total is None:
+        input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
+        if (isinstance(input_tokens, bool) or not isinstance(input_tokens, int)
+                or isinstance(output_tokens, bool) or not isinstance(output_tokens, int)
+                or input_tokens < 0 or output_tokens < 0):
+            return None
+        total = input_tokens + output_tokens
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        return None
+    return total
+
+
 class RunnerError(RuntimeError):
     """一次 Runner 调用失败（进程失败 / 超时 / 信封不可解析）。
 
@@ -52,19 +255,48 @@ class RunnerError(RuntimeError):
     触发持久计账停机，不会把未知成本冒充真 0。
     """
 
-    def __init__(self, message: str, *, usage=None):
+    def __init__(self, message: str, *, usage=None, transcript_ref: Optional[str] = None):
         super().__init__(message)
         self.usage = usage
+        self.transcript_ref = transcript_ref
 
 
 class CodexRunner:
-    def __init__(self, *, transcripts_dir: Path, purpose_tag: str = ""):
+    def __init__(self, *, transcripts_dir: Path, purpose_tag: str = "", tool_free: bool = False):
         self.bin = os.environ.get("METARESEARCH_CODEX_BIN", "codex-chatgpt")
         self.model = os.environ.get("METARESEARCH_CODEX_MODEL", "gpt-5.5")
         self.effort = os.environ.get("METARESEARCH_CODEX_EFFORT", "medium")
         self.timeout_s = int(os.environ.get("METARESEARCH_RUNNER_TIMEOUT_S", "900"))
         self.transcripts_dir = transcripts_dir
         self.purpose_tag = purpose_tag
+        self.tool_free = tool_free
+        self.query_user = None
+        self.query_user_home = None
+        self.query_uid = None
+        self.query_gid = None
+        if tool_free:
+            requested = os.environ.get("METARESEARCH_QUERY_RUN_AS_USER")
+            if requested is None and os.geteuid() == 0:
+                try:
+                    pwd.getpwnam("codexro")
+                except KeyError:
+                    pass
+                else:
+                    requested = "codexro"
+            if not requested:
+                raise ValueError(
+                    "interaction_query 须配置与 writer 不同 UID 的 "
+                    "METARESEARCH_QUERY_RUN_AS_USER")
+            try:
+                account = pwd.getpwnam(requested)
+            except KeyError as error:
+                raise ValueError(f"interaction_query 隔离账户不存在: {requested}") from error
+            if account.pw_uid == os.geteuid():
+                raise ValueError("interaction_query 隔离账户不得与 writer 同 UID")
+            self.query_user = account.pw_name
+            self.query_user_home = account.pw_dir
+            self.query_uid = account.pw_uid
+            self.query_gid = account.pw_gid
         self._call_no = 0
 
     # -- Runner Protocol -----------------------------------------------------
@@ -112,47 +344,148 @@ class CodexRunner:
         失败也把当下可见的 token/墙钟挂到 RunnerError.usage，供 provider 在重试前记账。"""
         self._call_no += 1
         tag = f"{pack.stage}-{self.purpose_tag or 'call'}-{self._call_no}"
-        self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+        self.transcripts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.transcripts_dir, 0o700)
         prompt_file = self.transcripts_dir / f"{tag}.prompt.md"
         out_file = self.transcripts_dir / f"{tag}.out.md"
+        events_file = self.transcripts_dir / f"{tag}.events.jsonl"
+        for stale in (out_file, events_file):
+            try:
+                stale.unlink()                 # deterministic tag must never accept a prior call's stale receipt
+            except FileNotFoundError:
+                pass
         prompt_file.write_text(prompt, encoding="utf-8")   # 快照归档供回放（P6）
+        os.chmod(prompt_file, 0o600)
+        runtime_dir = None
+        runtime_cwd = self.transcripts_dir
+        if self.tool_free:
+            runtime_dir = Path(tempfile.mkdtemp(prefix="meta-research-query-"))
+            os.chmod(runtime_dir, 0o700)
+            os.chown(runtime_dir, self.query_uid, self.query_gid)
+            runtime_cwd = runtime_dir
+        runtime_out_file = (runtime_dir / f"{tag}.out.md"
+                            if runtime_dir is not None else out_file)
+        command_bin = (os.environ.get("METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex")
+                       if self.tool_free else self.bin)
         cmd = [
-            self.bin, "exec",
+            command_bin, "exec",
             "-s", "read-only", "--skip-git-repo-check", "--ignore-user-config", "--ephemeral",
             "-m", self.model,
             "-c", f"model_reasoning_effort={self.effort}",
             "-c", "approval_policy=never",
-            "-C", str(self.transcripts_dir),
-            "-o", str(out_file),
+            "-C", str(runtime_cwd),
+            "-o", str(runtime_out_file),
             "-",
         ]
+        if self.tool_free:
+            # interaction_query 只能基于内联投影回答。关闭可读取宿主文件/外部状态或再委派的能力；
+            # --strict-config 使未来 CLI 移除/改名能力开关时 fail loud，不静默退回带工具 agent。
+            cmd[2:2] = [
+                "--json", "--strict-config", "--ignore-rules",
+                "-c", 'web_search="disabled"',
+                "--disable", "shell_tool",
+                "--disable", "unified_exec",
+                "--disable", "apps",
+                "--disable", "plugins",
+                "--disable", "memories",
+                "--disable", "hooks",
+                "--disable", "workspace_dependencies",
+                "--disable", "browser_use",
+                "--disable", "browser_use_external",
+                "--disable", "browser_use_full_cdp_access",
+                "--disable", "computer_use",
+                "--disable", "image_generation",
+                "--disable", "multi_agent",
+                "--disable", "multi_agent_v2",
+                "--disable", "enable_fanout",
+                "--disable", "standalone_web_search",
+                "--disable", "goals",
+                "--disable", "tool_suggest",
+                "--disable", "code_mode_host",
+                "--disable", "in_app_browser",
+            ]
+            query_home = os.environ.get(
+                "METARESEARCH_QUERY_CODEX_HOME", str(Path(self.query_user_home) / ".codex"))
+            if not (Path(query_home) / "auth.json").is_file():
+                raise ValueError("interaction_query 隔离账户缺 Codex auth.json")
+            env_args = [f"CODEX_HOME={query_home}", f"HOME={self.query_user_home}"]
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                         "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE"):
+                if name in os.environ:
+                    env_args.append(f"{name}={os.environ[name]}")
+            cmd = ["/usr/bin/sudo", "-n", "-u", self.query_user, "-H", "env", *env_args, *cmd]
         t0 = time.monotonic()
+        copy_error = None
         try:
             with prompt_file.open("rb") as fh:
-                proc = subprocess.run(
-                    cmd, stdin=fh,
-                    capture_output=True, timeout=self.timeout_s,
-                )
+                if self.tool_free:
+                    proc = _run_process_group(
+                        cmd, stdin=fh, timeout=self.timeout_s, cwd=runtime_cwd)
+                else:
+                    proc = subprocess.run(
+                        cmd, stdin=fh,
+                        capture_output=True, timeout=self.timeout_s,
+                    )
         except subprocess.TimeoutExpired as e:
             wallclock = round(time.monotonic() - t0, 3)
             stderr = self._stream_text(getattr(e, "stderr", None))
-            usage = self._usage(stderr, wallclock)
+            stdout = self._stream_text(getattr(e, "stdout", None))
+            usage = self._usage(stderr, wallclock, stdout)
+            if self.tool_free and stdout:
+                try:
+                    events_file.write_text(stdout, encoding="utf-8")
+                    os.chmod(events_file, 0o600)
+                except OSError:
+                    pass
             raise RunnerError(f"runner 超时（{self.timeout_s}s）：{tag}", usage=usage) from e
+        finally:
+            if runtime_dir is not None:
+                try:
+                    _copy_isolated_output(
+                        runtime_out_file, out_file, expected_uid=int(self.query_uid))
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError) as error:
+                    copy_error = error
+                shutil.rmtree(runtime_dir, ignore_errors=True)
         wallclock = round(time.monotonic() - t0, 3)
         stderr = self._stream_text(proc.stderr)
-        usage = self._usage(stderr, wallclock)
+        stdout = self._stream_text(proc.stdout)
+        usage = self._usage(stderr, wallclock, stdout if self.tool_free else "")
+        if copy_error is not None:
+            raise RunnerError(
+                f"tool-free runner 输出接收失败：{tag}（{copy_error}）", usage=usage)
+        if self.tool_free:
+            try:
+                events_file.write_text(stdout, encoding="utf-8")
+                os.chmod(events_file, 0o600)
+            except OSError as error:
+                raise RunnerError(
+                    f"tool-free runner 事件回执归档失败：{tag}（{error}）", usage=usage) from error
         if proc.returncode != 0 or not out_file.exists():
             tail = stderr[-500:]
             raise RunnerError(f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}", usage=usage)
+        if self.tool_free:
+            try:
+                validate_tool_free_trace(stdout)
+            except RunnerError as error:
+                error.usage = usage
+                raise
         try:
             raw = out_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as e:
             raise RunnerError(f"runner 输出读取失败：{tag}（{e}）", usage=usage) from e
+        try:
+            os.chmod(out_file, 0o600)
+        except OSError as error:
+            raise RunnerError(f"runner 输出权限收紧失败：{tag}（{error}）", usage=usage) from error
         return raw, usage
 
     @staticmethod
-    def _usage(stderr: str, wallclock: float) -> CallUsage:
+    def _usage(stderr: str, wallclock: float, json_trace: str = "") -> CallUsage:
         tokens = parse_tokens_used(stderr)
+        if tokens is None and json_trace:
+            tokens = parse_json_tokens_used(json_trace)
         return CallUsage(tokens_total=tokens or 0, wallclock_sec=wallclock,
                          tokens_known=tokens is not None)
 
