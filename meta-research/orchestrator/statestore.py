@@ -148,8 +148,11 @@ class InMemoryStateStore:
             q = self.questions.get(rid)
             if q is None:
                 raise ValueError(f"scores 引用的问题不存在: {row.get('question_id')}（不静默丢弃）")
-            q.score = row.get("score")
-            q.est_cost = row.get("est_cost", q.est_cost)
+            missing = [field for field in ("score", "est_cost") if field not in row]
+            if missing:
+                raise ValueError(f"scores.{rid} 缺 schema 必填字段: {missing}")
+            q.score = row["score"]
+            q.est_cost = row["est_cost"]
         c = self.cycles[cycle_id]
         c.next_question_id = next_qid
         c.next_intent = sel.next_intent

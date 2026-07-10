@@ -30,6 +30,8 @@ def _seed(conn):
       INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) VALUES (4,1,1,1,'q4 无定论','open','agent');
       UPDATE question SET status='inconclusive' WHERE id=4;   -- 初始须 open/active，再转 inconclusive（触发器）
       UPDATE cycle SET active_question_id=2, route='attack', next_question_id=3, next_intent='attack', cost_total=3.5 WHERE id=1;
+      INSERT INTO ledger(id,cycle_id,phase,evaluation_attempt_id,money,policy_version)
+        VALUES (2,1,'reasoning',1,3.5,'v0');
       INSERT INTO interaction_request(id,goal_id,goal_ver,cycle_id,stage,status,summary_md,items_json,request_hash)
         VALUES (1,1,1,1,'plan','pending','需要数据集 X','[{"kind":"dataset","desc":"X"},{"kind":"paper","desc":"Y"}]','rh1');
     """)
@@ -87,8 +89,8 @@ def test_latest_decision_cycle_scoped(conn):
 def test_budget_fields(conn):
     b = _card(conn)["budget"]
     assert set(b.keys()) == {"B_t", "cycle_spent", "global_remaining"}   # §4.6.6 预算三元（不多不少）
-    assert b["B_t"] == 5.0 and b["cycle_spent"] == 3.5   # 无 done cycle → B0=5
-    assert b["global_remaining"] is None                 # M2：无全局会话上限
+    assert b["B_t"] == 5.0 and b["cycle_spent"] == 3.5   # 无 done cycle → B0=5；花费只认 ledger
+    assert b["global_remaining"] == 99996.5              # session_max - 全局 ledger
 
 
 def test_counts_open_inconclusive(conn):

@@ -157,10 +157,15 @@ def _directive_state_events(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         evs.append({"event_key": f"directive:{d['id']}:pending_effect",
                     "kind": "directive_pending_effect",
                     "payload": {**payload_base, "consume_at": d["consume_at"]}})
-        evs.append({"event_key": f"directive:{d['id']}:applied", "kind": "directive_applied",
-                    "payload": {**payload_base,
-                                "consumed_cycle": f"c{d['consumed_cycle']}" if d["consumed_cycle"] else None,
-                                "effect": (d.get("_decision_effect") or {})}})
+        # reprioritize is consumed at reasoning_start but its real effect only
+        # exists when selection is atomically normalized.  Do not announce
+        # "applied" in the precheck→Runner window; the final enforcement
+        # decision unlocks this event.  Other directives apply in consume itself.
+        if not d.get("_application_pending"):
+            evs.append({"event_key": f"directive:{d['id']}:applied", "kind": "directive_applied",
+                        "payload": {**payload_base,
+                                    "consumed_cycle": f"c{d['consumed_cycle']}" if d["consumed_cycle"] else None,
+                                    "effect": (d.get("_decision_effect") or {})}})
     elif d["status"] == "rejected":
         # 理由恒在 payload.rejection_reason（console.reject_directive 两条路径都 json_set 写入）
         evs.append({"event_key": f"directive:{d['id']}:rejected", "kind": "directive_rejected",
@@ -191,6 +196,16 @@ class DirectiveNotifier:
             if cdec is not None:      # applied 效果摘要取自消费决策 payload（真相在 decision 台账）
                 dp = self.daemon.query_one("SELECT payload_json FROM decision WHERE id=?", (cdec,))
                 row["_decision_effect"] = (json.loads(dp[0]).get("effect") if dp else None)
+            if kind == "reprioritize" and status == "consumed":
+                actual = self.daemon.query_one(
+                    "SELECT type,payload_json FROM decision WHERE directive_id=? "
+                    "AND actor='orchestrator' "
+                    "AND type IN ('reprioritize_applied','reprioritize_enforced') "
+                    "ORDER BY id DESC LIMIT 1", (did,))
+                if actual is None:
+                    row["_application_pending"] = True
+                else:
+                    row["_decision_effect"] = json.loads(actual[1])
             for ev in _directive_state_events(row):
                 if self.outbox.emit(ev["event_key"], ev["kind"], ev["payload"]):
                     new_keys.append(ev["event_key"])

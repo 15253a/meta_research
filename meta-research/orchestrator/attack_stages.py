@@ -113,6 +113,8 @@ def persist_selection_safe(state, cycle_id: str, sel: Dict[str, Any]) -> None:
             next_question_id=sel.get("next_question_id"), next_intent=sel["next_intent"],
             scores=sel.get("scores", [])))
     except InvalidSelectionError as e:
+        state.reject_unapplied_reprioritize(
+            cycle_id, f"selection 无法持久化，reprioritize 未应用: {e}")
         state.daemon.conn.execute(          # atomic 内：daemon.conn == 外层事务连接（单写，随 atomic 提交/回滚）
             "INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'orchestrator','selection_invalid',?)",
             (_cnum(cycle_id), json.dumps({"reason": str(e), "requested": {

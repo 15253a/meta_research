@@ -145,10 +145,10 @@ def test_unconfirmed_hard_directive_consume_rejected(env):
     assert dec == ("human", "directive_pause", r["directive_id"])                    # 同记 DECISION（经 directive 回指）
 
 
-def test_unimplemented_directive_never_claims_consumed_success(env):
+def test_goal_amend_unimplemented_never_claims_consumed_success(env):
     d, c = env["d"], env["c"]
     r = c.handle_inbound(
-        connector="qq", raw_text="设置预算 50", idempotency_key="k-budget",
+        connector="qq", raw_text="修订目标：改成新目标", idempotency_key="k-goal-amend",
         goal_id=1, goal_ver=1)
     c.confirm_directive(
         directive_id=r["directive_id"],
