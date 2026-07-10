@@ -172,8 +172,9 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   重复调用 Runner。进程级非阻塞 instance lease 属 CP11.3，在它完成前不得并行启动第二个 run 进程。
 - 当前执行超时只可靠终止直接子进程，主动脱离/派生的孙进程可能继续存活；整组 session teardown 与 timeout
   终态收敛属 CP11.3。完成前只能运行受信任、不会自行 daemonize 的 manifest 命令。
-- plan 的 `critical/budget_estimate` 权威落库/早退，以及按 cycle `(goal_id, goal_ver)` 解析正文仍待 CP11.3；
-  当前金丝雀运行不要依赖“非关键 target 失败后继续”或在长驻进程中动态 `goal_amend` 的严格版本隔离。
+- plan 的 `critical/budget_estimate` 权威落库/早退仍待 CP11.3；当前金丝雀运行不要依赖“非关键 target
+  失败后继续”。动态 `goal_amend` 的专用路由、不可变升版、reasoning/status 按 cycle goal version 隔离与
+  applicability 恢复已由 CP11.2b.3b 闭合。
 - 代码物化在编排器管理的 staging（净土物化 + sha256 哈希对账 + argv-only 禁 shell + 路径/env 围栏），
   **但真 git worktree 隔离 + env lock 强校验属后续硬化步**。
 - 用户文件已有 DB 终态授权、ContextPack ref 白名单、hash/size 复验和稳定只读 fd；非 bundle 阶段只看
