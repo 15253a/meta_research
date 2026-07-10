@@ -2499,7 +2499,7 @@ function directiveAction(id, action){
     if(reason===null) return;
   }
   if(typeof document!=="undefined") document.querySelectorAll('[data-directive-action="'+id+'"]').forEach(b=>b.disabled=true);
-  apiPost('/api/directive',{action:action,directive_id:id,reason:reason})
+  apiPost('/api/directive',{action:action,directive_id:id,reason:reason,conversation_id:_conversationId()})
     .then(({response,body:j})=>{
       const ok=response.ok;
       if(!ok || !j || !j.queued){
@@ -2592,6 +2592,7 @@ function adaptPayload(p){
     if(n&&n.kind){
       const ds=Array.isArray(n.deliveries)?n.deliveries:[], last=ds.length?ds[ds.length-1]:null;
       const delivery=last?(last.status==="delivered"?` [${last.channel||"connector"} 已投递]`:
+        last.status==="suppressed"?` [${last.channel||"connector"} 已安全抑制：无可信路由]`:
         last.status==="authority_corrupt"?` [投递权威损坏: ${last.last_error_kind||"unknown"}]`:
         ` [${last.channel||"connector"} 重试中: ${last.last_error_kind||"unknown"}]`):"";
       return {event_key:n.event_key, at:n.at||"—", channel:n.channel||(last&&last.channel)||"outbox",

@@ -18,6 +18,7 @@ window and is why the webhook contract requires receiver-side idempotency.
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import http.client
 import json
@@ -33,6 +34,9 @@ import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+from .connector_ingress import (InboundConfigError, InboundHTTPConnector,
+                                build_inbound_connector)
 
 
 _MAX_PROFILE_BYTES = 64 * 1024
@@ -156,12 +160,17 @@ def _read_profile(path: Path) -> Dict[str, Any]:
 
 
 def _token_from_env(profile: Mapping[str, Any], *, label: str) -> Optional[str]:
-    name = profile.get("token_env")
+    return _named_secret_from_env(profile, field="token_env", label=label)
+
+
+def _named_secret_from_env(profile: Mapping[str, Any], *, field: str,
+                           label: str) -> Optional[str]:
+    name = profile.get(field)
     if name is None:
         return None
     if not isinstance(name, str) or _ENV_RE.fullmatch(name) is None:
         raise ConnectorConfigError(
-            f"{label}.token_env 须为 METARESEARCH_*_TOKEN/SECRET 专用环境变量名")
+            f"{label}.{field} 须为 METARESEARCH_*_TOKEN/SECRET 专用环境变量名")
     token = os.environ.get(name)
     if not token:
         raise ConnectorConfigError(f"{label} 所需环境变量 {name} 未设置")
@@ -454,9 +463,11 @@ def render_event_text(event: Dict[str, Any]) -> str:
     elif kind == "interaction_unclear":
         body = "这条消息的意图不明确；系统没有执行状态变更，请明确说明是查询、备注还是控制指令。"
     elif kind == "interaction_received":
-        body = f"消息 #{payload.get('message_id')} 已耐久入账；分类意图：{payload.get('intent') or '待定'}。"
+        body = f"消息 #{payload.get('message_id')} 已耐久入账；正在进行后续分类。"
     elif kind == "directive_pending_confirmation":
-        body = f"请确认规范化指令：{payload.get('polished') or '未提供'}。确认前不会改变研究状态。"
+        did = payload.get("directive_id")
+        body = (f"请确认规范化指令：{payload.get('polished') or '未提供'}。"
+                f"确认前不会改变研究状态；请精确回复“确认指令 d{did}”或“拒绝指令 d{did}”。")
     elif kind == "directive_pending_effect":
         body = f"指令 #{payload.get('directive_id')} 已入队，将在 {payload.get('consume_at')} 边界应用。"
     elif kind == "directive_applied":
@@ -502,7 +513,8 @@ class OneBotV11Connector(_HTTPJSONConnector):
             raise ConnectorConfigError(f"channel {channel}.target_id 须为正整数")
         if (not isinstance(conversation_id, str) or not conversation_id
                 or len(conversation_id) > 128
-                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in conversation_id)):
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f
+                       or 0xD800 <= ord(ch) <= 0xDFFF for ch in conversation_id)):
             raise ConnectorConfigError(
                 f"channel {channel}.conversation_id 须为 1..128 字符且不得含控制字符")
         base = _validate_https_or_loopback_http(base_url, label=f"channel {channel}.base_url")
@@ -516,10 +528,12 @@ class OneBotV11Connector(_HTTPJSONConnector):
 
     def send(self, event: Dict[str, Any]) -> Dict[str, Any]:
         producer_id, event_key, delivery_key = _event_identity(event)
-        if (event.get("kind") in {"interaction_received", "interaction_reply", "interaction_unclear"}
+        kind = event.get("kind")
+        if ((kind in {"interaction_received", "interaction_reply", "interaction_unclear"}
+             or (isinstance(kind, str) and kind.startswith("directive_")))
                 and event["payload"].get("conversation_id") != self.conversation_id):
             raise ConnectorDeliveryError(
-                "OneBot interaction conversation_id 与固定 target 绑定不一致",
+                "OneBot interaction/directive conversation_id 与固定 target 绑定不一致",
                 kind="invalid_route")
         target_field = "user_id" if self.target_kind == "private" else "group_id"
         ack = self._post({
@@ -543,6 +557,66 @@ class OneBotV11Connector(_HTTPJSONConnector):
                 "event_key": event_key, "delivery_id": str(message_id)}
 
 
+class BidirectionalConnector:
+    """One logical channel with outbound send and authenticated durable poll."""
+
+    has_inbound = True
+
+    def __init__(self, outbound: Any, inbound: InboundHTTPConnector):
+        self.outbound = outbound
+        self.inbound = inbound
+        self.channel = outbound.channel
+        self.timeout_s = outbound.timeout_s
+
+    def send(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        return self.outbound.send(event)
+
+    @property
+    def inbound_spool(self):  # noqa: ANN201 - concrete spool type stays transport-private
+        return self.inbound.spool
+
+    def poll(self) -> List[Dict[str, Any]]:
+        return self.inbound.poll()
+
+    def commit_poll(self, token: Any) -> None:
+        self.inbound.commit_poll(token)
+
+    def load_inbound_retry_counts(self) -> Dict[str, int]:
+        return self.inbound.load_retry_counts()
+
+    def store_inbound_retry_counts(self, counts: Dict[str, int]) -> None:
+        self.inbound.store_retry_counts(counts)
+
+    def inbound_pending_status(self) -> Dict[str, Any]:
+        return self.inbound.pending_status()
+
+    def validate_inbound_envelope(self, value: Dict[str, Any]) -> Dict[str, Any]:
+        return self.inbound.validate_envelope(value)
+
+    def record_inbound_fatal(self, error: BaseException) -> None:
+        self.inbound.record_fatal(error)
+
+    def start_inbound(self) -> bool:
+        return self.inbound.start()
+
+    def prepare_inbound(self) -> None:
+        self.inbound.prepare()
+
+    def stop_inbound(self) -> Optional[BaseException]:
+        return self.inbound.stop()
+
+    def inbound_stopped(self) -> bool:
+        return self.inbound.is_stopped()
+
+    def raise_if_inbound_failed(self) -> None:
+        self.inbound.raise_if_failed()
+
+    def status(self) -> Dict[str, Any]:
+        result = dict(self.outbound.status())
+        result["inbound"] = self.inbound.status()
+        return result
+
+
 def _event_identity(event: Mapping[str, Any]) -> Tuple[str, str, str]:
     value = event.get("event_key")
     if not isinstance(value, str) or _EVENT_KEY_RE.fullmatch(value) is None:
@@ -558,7 +632,7 @@ def _event_identity(event: Mapping[str, Any]) -> Tuple[str, str, str]:
     return producer_id, value, delivery_key
 
 
-def load_connectors(profile_path: str) -> Dict[str, Any]:
+def load_connectors(profile_path: str, *, work_root: Optional[str] = None) -> Dict[str, Any]:
     """Load a bounded profile and instantiate channel connectors.
 
     Secrets are never accepted in JSON.  Profiles name an environment variable
@@ -571,6 +645,8 @@ def load_connectors(profile_path: str) -> Dict[str, Any]:
     channels = raw.get("channels")
     if not isinstance(channels, dict) or not channels:
         raise ConnectorConfigError("connector profile.channels 须为非空 object")
+    if len(channels) > 16:
+        raise ConnectorConfigError("connector profile.channels 最多 16 个")
     delivery = raw.get("delivery", {})
     if not isinstance(delivery, dict):
         raise ConnectorConfigError("connector profile.delivery 须为 object")
@@ -585,9 +661,27 @@ def load_connectors(profile_path: str) -> Dict[str, Any]:
 
     result: Dict[str, Any] = {}
     secret_env_names = set()
+    claimed_secret_envs: Dict[str, str] = {}
+    claimed_secret_values: Dict[str, str] = {}
+
+    def claim_secret(name: str, value: str, *, owner: str) -> None:
+        previous_env = claimed_secret_envs.get(name)
+        digest = hashlib.sha256(value.encode("ascii")).hexdigest()
+        previous_value = claimed_secret_values.get(digest)
+        if previous_env is not None:
+            raise ConnectorConfigError(
+                f"{owner} 不得复用 {previous_env} 的 secret environment")
+        if previous_value is not None:
+            raise ConnectorConfigError(
+                f"{owner} 不得复用 {previous_value} 的 secret value")
+        claimed_secret_envs[name] = owner
+        claimed_secret_values[digest] = owner
+
     for channel, profile in channels.items():
         if not isinstance(channel, str) or _CHANNEL_RE.fullmatch(channel) is None:
             raise ConnectorConfigError(f"connector channel 名非法: {channel!r}")
+        if channel == "console":
+            raise ConnectorConfigError("connector channel 名 console 保留给本地控制台信任域")
         if not isinstance(profile, dict):
             raise ConnectorConfigError(f"channel {channel} profile 须为 object")
         kind = profile.get("type")
@@ -598,25 +692,53 @@ def load_connectors(profile_path: str) -> Dict[str, Any]:
             raise ConnectorConfigError(
                 f"channel {channel} 生产 profile 必须配置 token_env（loopback 也需防端口冒占）")
         if profile.get("token_env") is not None:
+            claim_secret(profile["token_env"], token, owner=f"channel {channel} outbound")
             secret_env_names.add(profile["token_env"])
+        outbound_connector = None
         if kind == "webhook_v1":
-            _strict_keys(profile, {"type", "url", "token_env", "timeout_s"}, label=f"channel {channel}")
-            result[channel] = WebhookV1Connector(
+            _strict_keys(
+                profile, {"type", "url", "token_env", "timeout_s", "inbound"},
+                label=f"channel {channel}")
+            outbound_connector = WebhookV1Connector(
                 channel=channel, url=profile.get("url"), token=token, timeout_s=timeout_s)
         elif kind == "onebot_v11":
             _strict_keys(
                 profile,
                 {"type", "base_url", "token_env", "timeout_s", "target_kind", "target_id",
-                 "conversation_id"},
+                 "conversation_id", "inbound"},
                 label=f"channel {channel}",
             )
-            result[channel] = OneBotV11Connector(
+            outbound_connector = OneBotV11Connector(
                 channel=channel, base_url=profile.get("base_url"), token=token,
                 timeout_s=timeout_s, target_kind=profile.get("target_kind"),
                 target_id=profile.get("target_id"), conversation_id=profile.get("conversation_id"),
             )
         else:
             raise ConnectorConfigError(f"channel {channel}.type 不支持: {kind!r}")
+        inbound_profile = profile.get("inbound")
+        if inbound_profile is not None:
+            if not isinstance(inbound_profile, dict):
+                raise ConnectorConfigError(f"channel {channel}.inbound 须为 object")
+            inbound_env = inbound_profile.get("secret_env")
+            if inbound_env == profile.get("token_env"):
+                raise ConnectorConfigError(
+                    f"channel {channel} inbound secret_env 不得复用 outbound token_env")
+            inbound_secret = _named_secret_from_env(
+                inbound_profile, field="secret_env", label=f"channel {channel}.inbound")
+            if inbound_secret is None:
+                raise ConnectorConfigError(f"channel {channel}.inbound 必须配置 secret_env")
+            claim_secret(inbound_env, inbound_secret, owner=f"channel {channel} inbound")
+            secret_env_names.add(inbound_env)
+            try:
+                inbound_connector = build_inbound_connector(
+                    channel=channel, outbound_type=kind, outbound_profile=profile,
+                    inbound_profile=inbound_profile, secret=inbound_secret,
+                    outbound_secret=token, work_root=work_root or "")
+            except InboundConfigError as error:
+                raise ConnectorConfigError(str(error)) from error
+            result[channel] = BidirectionalConnector(outbound_connector, inbound_connector)
+        else:
+            result[channel] = outbound_connector
     if "qq" not in result:
         raise ConnectorConfigError("当前 notify_matrix=all_qq_on，profile 必须配置 qq channel")
     # Research Codex and manifest subprocesses inherit the run process
@@ -700,6 +822,29 @@ class OutboundDelivery:
             return 2
         return 3
 
+    @staticmethod
+    def _unsafe_route_reason(event: Mapping[str, Any]) -> Optional[str]:
+        """Return why an event must terminate locally without transport.
+
+        Source-bound notifications before authenticated ingress routing could
+        lack explicit channel/conversation authority.  Falling back to the
+        default QQ target after an upgrade could disclose one operator's
+        message to another.  New interaction/directive events bind both fields.
+        """
+        kind = event.get("kind")
+        if (not isinstance(kind, str)
+                or not (kind.startswith("directive_") or kind.startswith("interaction_"))):
+            return None
+        if event.get("channel") is None:
+            return "source-bound event has no source channel authority"
+        payload = event.get("payload")
+        conversation = payload.get("conversation_id") if isinstance(payload, dict) else None
+        if (not isinstance(conversation, str) or not conversation
+                or len(conversation) > 128
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in conversation)):
+            return "source-bound event has no valid source conversation authority"
+        return None
+
     def tick(self, now_ts: Optional[float] = None,
              stop_requested: Optional[Callable[[], bool]] = None) -> List[str]:
         """Attempt due causal groups; urgent replies can overtake unrelated backlog.
@@ -760,6 +905,15 @@ class OutboundDelivery:
                         if not math.isfinite(current):
                             raise ValueError("delivery clock 须返回有限数字")
                         retry = retries.get(event["event_key"])
+                        unsafe_reason = self._unsafe_route_reason(event)
+                        if unsafe_reason is not None:
+                            attempted += 1
+                            self.outbox.record_delivery_suppressed(
+                                channel, event, reason=unsafe_reason, completed_at=current)
+                            logger.warning(
+                                "outbound delivery 安全抑制 channel=%s event_key=%s reason=%s",
+                                channel, event["event_key"], unsafe_reason)
+                            continue
                         if retry is not None and float(retry["next_attempt_at"]) > current:
                             blocked_groups.add(group_key)
                             break
@@ -769,6 +923,11 @@ class OutboundDelivery:
                         try:
                             ack = connector.send(outbound_event)
                         except ConnectorDeliveryError as error:
+                            if getattr(error, "kind", None) in {"invalid_event", "invalid_route"}:
+                                # These are local authority/program failures;
+                                # time cannot repair them and durable retry
+                                # would disguise a poisoned route as outage.
+                                raise
                             completed_at = current if now_ts is not None else float(self.clock())
                             if not math.isfinite(completed_at):
                                 raise ValueError("delivery clock 须返回有限数字")

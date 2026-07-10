@@ -16,10 +16,12 @@ import conftest
 from orchestrator import database as db
 from orchestrator.connectors import (ConnectorConfigError, ConnectorDeliveryError,
                                      OneBotV11Connector, OutboundDelivery,
-                                     WebhookV1Connector, load_connectors)
+                                     WebhookV1Connector, load_connectors,
+                                     render_event_text)
 from orchestrator.console import Console, DIRECTIVE_ACTION_SESSION_REF
 from orchestrator.interaction import InteractionIngest
-from orchestrator.notify import InteractionNotifier, Outbox, ResearchNotifier
+from orchestrator.notify import (DirectiveNotifier, InteractionNotifier, Outbox,
+                                 ResearchNotifier)
 from orchestrator.console_server import assemble_db
 from orchestrator.run import build_system
 from orchestrator.run import System
@@ -166,7 +168,9 @@ def test_onebot_v11_real_http_payload_contains_event_key_and_human_text():
         connector = OneBotV11Connector(
             channel="qq", base_url=base, token="onebot-token", timeout_s=2,
             target_kind="private", target_id=123456, conversation_id="qq:123456")
-        result = connector.send(_event())
+        event = _event()
+        event["payload"]["conversation_id"] = "qq:123456"
+        result = connector.send(event)
 
     request = requests[0]
     assert request["path"] == "/send_private_msg"
@@ -249,6 +253,9 @@ class _FlakyConnector:
             raise ConnectorDeliveryError("temporary", kind="transport")
         return {"accepted": True, "producer_id": event["producer_id"],
                 "event_key": event["event_key"], "delivery_id": "ok"}
+
+    def poll(self):
+        return []
 
     def status(self):
         return {"configured": True}
@@ -359,6 +366,93 @@ def test_interaction_notifier_derives_query_reply_and_skips_action_clarification
         "[快照 c1] 正常"
 
 
+def test_interaction_received_is_derived_before_classification(tmp_path):
+    daemon = WriteDaemon(db.connect(":memory:"))
+    conftest.seed_minimal(daemon.conn)
+    mid = InteractionIngest(daemon).inbound(
+        connector="qq", conversation_id="qq:7", session_ref="connector-inbound-v1:test",
+        raw_text="尚未分类", idempotency_key="pre-classification", goal_id=1, goal_ver=1)
+    outbox = Outbox(str(tmp_path))
+
+    assert InteractionNotifier(daemon, outbox).scan() == [f"interaction:{mid}:received:v2"]
+    assert outbox._events()[0] == {
+        "event_key": f"interaction:{mid}:received:v2",
+        "kind": "interaction_received",
+        "payload": {"message_id": mid, "conversation_id": "qq:7"},
+        "channel": "qq",
+    }
+
+
+def test_existing_v1_interaction_receipt_is_not_replayed_as_v2(tmp_path):
+    daemon = WriteDaemon(db.connect(":memory:"))
+    conftest.seed_minimal(daemon.conn)
+    result = Console(daemon).handle_inbound(
+        connector="qq", conversation_id="qq:7", raw_text="当前状态是什么？",
+        idempotency_key="already-acked", goal_id=1, goal_ver=1)
+    mid = result["message_id"]
+    outbox = Outbox(str(tmp_path))
+    outbox.emit(
+        f"interaction:{mid}:received", "interaction_received",
+        {"message_id": mid, "intent": "query", "conversation_id": "qq:7"},
+        channel="qq")
+
+    assert f"interaction:{mid}:received:v2" not in InteractionNotifier(daemon, outbox).scan()
+    assert not outbox.contains_event(f"interaction:{mid}:received:v2")
+
+
+def test_directive_v2_routes_to_source_and_legacy_unrouted_is_suppressed(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    daemon = WriteDaemon(db.connect(str(work / "research.sqlite")))
+    conftest.seed_minimal(daemon.conn)
+    outbox = Outbox(str(work / "state"))
+    outbox.emit(
+        "directive:99:received", "directive_received",
+        {"directive_id": 99, "message_id": 99})
+    outbox.emit(
+        "interaction:99:received", "interaction_received",
+        {"message_id": 99, "conversation_id": None})
+    result = Console(daemon).handle_inbound(
+        connector="qq", conversation_id="qq:7",
+        session_ref="connector-inbound-v1:test:principal:7",
+        raw_text="暂停", idempotency_key="routed-pause", goal_id=1, goal_ver=1)
+
+    new = DirectiveNotifier(daemon, outbox).scan()
+    assert new and all(key.endswith(":v2") for key in new)
+    routed = [event for event in outbox._events() if event["event_key"] in new]
+    assert all(event["channel"] == "qq" for event in routed)
+    assert all(event["payload"]["conversation_id"] == "qq:7" for event in routed)
+
+    connector = _FlakyConnector()
+    delivered = OutboundDelivery(
+        outbox, {"qq": connector}, default_channels=["qq"]).tick(10)
+    assert "directive:99:received" not in connector.calls
+    assert "interaction:99:received" not in connector.calls
+    assert all(not item.endswith(("directive:99:received", "interaction:99:received"))
+               for item in delivered)
+    assert set(connector.calls) == set(new)
+    receipts = [json.loads(line) for line in outbox.receipts_path.read_text().splitlines()]
+    suppressed = [item for item in receipts if item["event_key"] in {
+        "directive:99:received", "interaction:99:received"}]
+    assert len(suppressed) == 2
+    assert all(item["version"] == 2 for item in suppressed)
+    assert all(item["disposition"] == "suppressed_unsafe_route" for item in suppressed)
+    assert all("reason" not in item for item in suppressed)
+    assert OutboundDelivery(
+        Outbox(str(work / "state")), {"qq": _FlakyConnector()},
+        default_channels=["qq"]).tick(20) == []
+
+    did = result["directive_id"]
+    rendered = render_event_text({
+        "producer_id": outbox.producer_id,
+        "event_key": f"directive:{did}:pending_confirmation:v2",
+        "kind": "directive_pending_confirmation",
+        "payload": {"directive_id": did, "polished": "[pause] 暂停",
+                    "conversation_id": "qq:7"},
+    })
+    assert f"确认指令 d{did}" in rendered and f"拒绝指令 d{did}" in rendered
+
+
 def test_build_system_wires_interaction_reply_to_configured_connector(tmp_path):
     class Capture(_FlakyConnector):
         def __init__(self):
@@ -378,7 +472,8 @@ def test_build_system_wires_interaction_reply_to_configured_connector(tmp_path):
         SYSTEM_ROOT, str(tmp_path), runner_factory=lambda _td, _pt: None,
         attack=False, outbound_config=config)
     result = Console(system.daemon).handle_inbound(
-        connector="qq", raw_text="当前状态是什么？", idempotency_key="wired-query",
+        connector="qq", conversation_id="qq:7", raw_text="当前状态是什么？",
+        idempotency_key="wired-query",
         goal_id=1, goal_ver=1)
     InteractionIngest(system.daemon).ack(
         message_id=result["message_id"], reply_text="已接地回复", reply_role="final-template")
@@ -475,6 +570,19 @@ def test_console_projection_exposes_retry_and_success_receipts(tmp_path):
     assert delivered["deliveries"] == [{
         "status": "delivered", "channel": "qq", "accepted_at": 30.0,
         "attempt_count": 2, "delivery_id": "r1",
+    }]
+    outbox.emit("legacy-route", "directive_received", {"directive_id": 9})
+    legacy = next(event for event in outbox._events()
+                  if event["event_key"] == "legacy-route")
+    outbox.record_delivery_suppressed(
+        "qq", legacy, reason="legacy directive event has no source channel authority",
+        completed_at=31)
+    suppressed = next(
+        item for item in assemble_db(str(database_path), str(work), SYSTEM_ROOT)["notification"]
+        if item["event_key"] == "legacy-route")
+    assert suppressed["deliveries"] == [{
+        "status": "suppressed", "channel": "qq", "completed_at": 31.0,
+        "attempt_count": 0, "disposition": "suppressed_unsafe_route",
     }]
     # Receipt append succeeded but retry-state cleanup crashed: the durable ACK
     # remains authoritative in the read-only operations projection.
@@ -927,10 +1035,11 @@ def test_scheduler_reserves_low_priority_progress_after_urgent_first(tmp_path):
     outbox = Outbox(str(tmp_path / "state"))
     for message_id in (1, 2):
         outbox.emit(f"interaction:{message_id}:received", "interaction_received",
-                    {"message_id": message_id, "conversation_id": f"qq:{message_id}"})
+                    {"message_id": message_id, "conversation_id": f"qq:{message_id}"},
+                    channel="qq")
         outbox.emit(f"interaction:{message_id}:reply:1", "interaction_reply",
                     {"message_id": message_id, "conversation_id": f"qq:{message_id}",
-                     "reply_text": "ok"})
+                     "reply_text": "ok"}, channel="qq")
     outbox.emit("audit:old", "cycle_summary", {"cycle_id": "c1"})
     connector = _FlakyConnector()
 
@@ -998,8 +1107,10 @@ def test_onebot_requires_request_bound_ack_and_conversation(tmp_path, monkeypatc
         target_kind="private", target_id=7, conversation_id="qq:7")
     monkeypatch.setattr(connector, "_post", lambda *_args, **_kwargs: {
         "status": "ok", "retcode": 0, "data": {"message_id": 1}})
+    event = _event()
+    event["payload"]["conversation_id"] = "qq:7"
     with pytest.raises(ConnectorDeliveryError, match="echo"):
-        connector.send(_event())
+        connector.send(event)
 
     mismatched = _event("interaction:1:reply")
     mismatched["kind"] = "interaction_reply"
@@ -1007,6 +1118,13 @@ def test_onebot_requires_request_bound_ack_and_conversation(tmp_path, monkeypatc
                              "reply_text": "secret"}
     with pytest.raises(ConnectorDeliveryError, match="conversation_id"):
         connector.send(mismatched)
+
+    mismatched_directive = _event("directive:2:pending_confirmation:v2")
+    mismatched_directive["kind"] = "directive_pending_confirmation"
+    mismatched_directive["payload"] = {
+        "directive_id": 2, "conversation_id": "qq:other", "polished": "[pause]"}
+    with pytest.raises(ConnectorDeliveryError, match="conversation_id"):
+        connector.send(mismatched_directive)
 
 
 def test_http_connect_phase_is_inside_total_wall_deadline(monkeypatch):

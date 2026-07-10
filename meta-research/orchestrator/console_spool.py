@@ -303,21 +303,50 @@ def _ensure_private_state(work_fd: int) -> Tuple[int, bool]:
         raise
 
 
-class ConsoleSpool:
-    """Cross-thread/process durable append-only console inbox."""
+class DurableInboxSpool:
+    """Cross-thread/process durable append-only inbox with an isolated namespace.
 
-    def __init__(self, work_root: Union[str, Path]):
+    ``ConsoleSpool`` and authenticated connector ingress deliberately use
+    different files, locks, cursors and retry state.  They share only these
+    fd-level durability mechanics; a remote connector can therefore never
+    manufacture a console control record or head-of-line block the emergency
+    console queue.
+    """
+
+    def __init__(self, work_root: Union[str, Path], *, lock_name: str,
+                 inbox_name: str, cursor_name: str, retry_name: str,
+                 key_prefix: str, label: str, capability_name: Optional[str] = None,
+                 fence_uncommitted_tail: bool = False):
         self.work_root = Path(work_root)
-        self.inbox_path = self.work_root / _STATE_NAME / _INBOX_NAME
+        names = (lock_name, inbox_name, cursor_name, retry_name)
+        if (any(not isinstance(name, str) or not name or "/" in name or "\x00" in name
+                or name in (".", "..") for name in names)
+                or not isinstance(key_prefix, str)
+                or not key_prefix
+                or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in key_prefix)
+                or not isinstance(label, str) or not label
+                or not isinstance(fence_uncommitted_tail, bool)):
+            raise ValueError("durable inbox namespace 非法")
+        self._lock_name = lock_name
+        self._inbox_name = inbox_name
+        self._cursor_name = cursor_name
+        self._retry_name = retry_name
+        self._key_prefix = key_prefix
+        self._label = label
+        self._capability_name = capability_name
+        self._fence_uncommitted_tail = fence_uncommitted_tail
+        self.inbox_path = self.work_root / _STATE_NAME / self._inbox_name
         self._thread_lock = threading.Lock()
 
     def _open_lock(self, work_fd: int) -> Tuple[int, bool]:
-        lock_fd, created = _open_exclusive_or_existing(work_fd, _LOCK_NAME, _FILE_RW_FLAGS, 0o600)
+        lock_fd, created = _open_exclusive_or_existing(
+            work_fd, self._lock_name, _FILE_RW_FLAGS, 0o600)
         try:
-            info = _verify_entry_matches_fd(work_fd, _LOCK_NAME, lock_fd,
-                                            label="console spool claim", regular=True)
+            info = _verify_entry_matches_fd(
+                work_fd, self._lock_name, lock_fd,
+                label=f"{self._label} spool claim", regular=True)
             if info.st_uid != os.geteuid():
-                raise UnsafeConsolePath("console spool claim owner 不是当前 uid")
+                raise UnsafeConsolePath(f"{self._label} spool claim owner 不是当前 uid")
             os.fchmod(lock_fd, 0o600)
             if created:
                 os.fsync(lock_fd)
@@ -339,8 +368,9 @@ class ConsoleSpool:
                 lock_fd, _ = self._open_lock(work_fd)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 acquired = True
-                _verify_entry_matches_fd(work_fd, _LOCK_NAME, lock_fd,
-                                         label="console spool claim", regular=True)
+                _verify_entry_matches_fd(
+                    work_fd, self._lock_name, lock_fd,
+                    label=f"{self._label} spool claim", regular=True)
                 state_fd, _ = _ensure_private_state(work_fd)
                 yield work_fd, state_fd
             finally:
@@ -397,7 +427,7 @@ class ConsoleSpool:
     def _load_cursor_locked(self, state_fd: int, inbox_fd: int,
                             inbox_info: os.stat_result) -> Tuple[int, bool]:
         cursor_fd = _open_optional_private_regular(
-            state_fd, _CURSOR_NAME, label="console inbox cursor")
+            state_fd, self._cursor_name, label=f"{self._label} inbox cursor")
         if cursor_fd is None:
             return 0, False
         try:
@@ -448,7 +478,7 @@ class ConsoleSpool:
             "anchor": self._cursor_anchor(inbox_fd, offset),
         }, sort_keys=True, separators=(",", ":")).encode("ascii")
         _atomic_write_private_sidecar(
-            state_fd, _CURSOR_NAME, payload, label="console inbox cursor")
+            state_fd, self._cursor_name, payload, label=f"{self._label} inbox cursor")
 
     @staticmethod
     def _next_record(inbox_fd: int, start: int, inbox_size: int) -> Optional[SpoolRecord]:
@@ -494,7 +524,7 @@ class ConsoleSpool:
         """
         with self._claimed_state() as (_work_fd, state_fd):
             inbox_fd = _open_optional_private_regular(
-                state_fd, _INBOX_NAME, label="console inbox")
+                state_fd, self._inbox_name, label=f"{self._label} inbox")
             if inbox_fd is None:
                 return SpoolBatch(0, 0, 0, ())
             try:
@@ -543,7 +573,7 @@ class ConsoleSpool:
             raise ValueError("console cursor 只能落在本批起点或 record end_offset")
         with self._claimed_state() as (_work_fd, state_fd):
             inbox_fd = _open_optional_private_regular(
-                state_fd, _INBOX_NAME, label="console inbox")
+                state_fd, self._inbox_name, label=f"{self._label} inbox")
             if inbox_fd is None:
                 if offset == 0:
                     return
@@ -567,7 +597,7 @@ class ConsoleSpool:
         """Load durable retry counters; corrupt state fails closed."""
         with self._claimed_state() as (_work_fd, state_fd):
             retry_fd = _open_optional_private_regular(
-                state_fd, _RETRY_NAME, label="console inbox retry state")
+                state_fd, self._retry_name, label=f"{self._label} inbox retry state")
             if retry_fd is None:
                 return {}
             try:
@@ -607,7 +637,8 @@ class ConsoleSpool:
         payload = json.dumps(clean, sort_keys=True, separators=(",", ":")).encode("utf-8")
         with self._claimed_state() as (_work_fd, state_fd):
             _atomic_write_private_sidecar(
-                state_fd, _RETRY_NAME, payload, label="console inbox retry state")
+                state_fd, self._retry_name, payload,
+                label=f"{self._label} inbox retry state")
 
     @staticmethod
     def _validate_capability_token(token: str) -> str:
@@ -623,6 +654,8 @@ class ConsoleSpool:
         receives a cryptographically random token.  An existing file is never
         silently repaired: owner/mode/content drift is a fail-closed condition.
         """
+        if self._capability_name is None:
+            raise ValueError(f"{self._label} inbox 不提供 HTTP capability")
         if explicit_token is not None:
             explicit_token = self._validate_capability_token(explicit_token)
         with self._thread_lock:
@@ -635,13 +668,14 @@ class ConsoleSpool:
                 lock_fd, _ = self._open_lock(work_fd)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 acquired = True
-                _verify_entry_matches_fd(work_fd, _LOCK_NAME, lock_fd,
-                                         label="console spool claim", regular=True)
+                _verify_entry_matches_fd(
+                    work_fd, self._lock_name, lock_fd,
+                    label=f"{self._label} spool claim", regular=True)
                 state_fd, _ = _ensure_private_state(work_fd)
                 capability_fd, created = _open_exclusive_or_existing(
-                    state_fd, CAPABILITY_NAME, _FILE_CREATE_FLAGS, 0o600)
+                    state_fd, self._capability_name, _FILE_CREATE_FLAGS, 0o600)
                 info = _verify_entry_matches_fd(
-                    state_fd, CAPABILITY_NAME, capability_fd,
+                    state_fd, self._capability_name, capability_fd,
                     label="console bearer capability", regular=True)
                 if info.st_uid != os.geteuid():
                     raise UnsafeConsolePath("console bearer capability owner 不是当前 uid")
@@ -653,7 +687,7 @@ class ConsoleSpool:
                     os.fsync(capability_fd)
                     os.fsync(state_fd)
                     _verify_entry_matches_fd(
-                        state_fd, CAPABILITY_NAME, capability_fd,
+                        state_fd, self._capability_name, capability_fd,
                         label="console bearer capability", regular=True)
                 else:
                     if stat.S_IMODE(info.st_mode) != 0o600:
@@ -703,14 +737,16 @@ class ConsoleSpool:
                 acquired = True
                 # Re-check after waiting: a replaced/unlinked inode must never
                 # become a split-brain claim.
-                _verify_entry_matches_fd(work_fd, _LOCK_NAME, lock_fd,
-                                         label="console spool claim", regular=True)
+                _verify_entry_matches_fd(
+                    work_fd, self._lock_name, lock_fd,
+                    label=f"{self._label} spool claim", regular=True)
 
                 state_fd, _ = _ensure_private_state(work_fd)
                 inbox_fd, created = _open_exclusive_or_existing(
-                    state_fd, _INBOX_NAME, _FILE_RW_FLAGS, 0o600)
+                    state_fd, self._inbox_name, _FILE_RW_FLAGS, 0o600)
                 inbox_info = _verify_entry_matches_fd(
-                    state_fd, _INBOX_NAME, inbox_fd, label="console inbox", regular=True)
+                    state_fd, self._inbox_name, inbox_fd,
+                    label=f"{self._label} inbox", regular=True)
                 if inbox_info.st_uid != os.geteuid():
                     raise UnsafeConsolePath("console inbox owner 不是当前 uid")
                 os.fchmod(inbox_fd, 0o600)
@@ -721,19 +757,30 @@ class ConsoleSpool:
                     raise UnsafeConsolePath(
                         f"console inbox 已超过 {MAX_INBOX_BYTES} 字节安全上限，须人工归档")
                 if size and os.pread(inbox_fd, 1, size - 1) != b"\n":
-                    # A process-crash tail is evidence, not a prefix for the
-                    # next acknowledged action.  Fence it as one poison line.
+                    if not self._fence_uncommitted_tail:
+                        # Connector transport ACK means the whole durable log
+                        # remains consumable.  Turning an old partial write
+                        # into a committed poison line immediately before ACK
+                        # would violate that contract.  Startup owns safe
+                        # hash-only audit + truncation instead.
+                        raise UnsafeConsolePath(
+                            f"{self._label} inbox 含未提交尾部；须重启执行恢复")
+                    # Browser console keeps its historical poison-line
+                    # behavior: no remote transport ACK depends on this log.
                     _write_all(inbox_fd, b"\n")
                     size += 1
 
                 stored = dict(rec)
                 supplied_key = stored.get("idempotency_key")
                 if supplied_key is None:
-                    supplied_key = f"console-{secrets.token_hex(16)}"
-                if (not isinstance(supplied_key, str) or len(supplied_key) != 40
-                        or not supplied_key.startswith("console-")
-                        or any(ch not in "0123456789abcdef" for ch in supplied_key[8:])):
-                    raise ValueError("console spool idempotency_key 须为 console- 加 128-bit 小写 hex")
+                    supplied_key = f"{self._key_prefix}-{secrets.token_hex(16)}"
+                prefix = self._key_prefix + "-"
+                if (not isinstance(supplied_key, str)
+                        or len(supplied_key) != len(prefix) + 32
+                        or not supplied_key.startswith(prefix)
+                        or any(ch not in "0123456789abcdef" for ch in supplied_key[len(prefix):])):
+                    raise ValueError(
+                        f"{self._label} spool idempotency_key 须为 {prefix} 加 128-bit 小写 hex")
                 stored.update({
                     # Human display cursor only: one-based byte position at
                     # which this JSON record begins.  It is monotonic and O(1)
@@ -753,8 +800,9 @@ class ConsoleSpool:
                 os.fsync(state_fd)
                 if created:
                     os.fsync(work_fd)
-                _verify_entry_matches_fd(state_fd, _INBOX_NAME, inbox_fd,
-                                         label="console inbox", regular=True)
+                _verify_entry_matches_fd(
+                    state_fd, self._inbox_name, inbox_fd,
+                    label=f"{self._label} inbox", regular=True)
                 return stored
             finally:
                 if inbox_fd >= 0:
@@ -769,6 +817,300 @@ class ConsoleSpool:
                 if state_fd >= 0:
                     os.close(state_fd)
                 os.close(work_fd)
+
+    def scan_committed(self, *, max_records: int = 100_000) -> List[Dict[str, Any]]:
+        """Return every LF-committed JSON object, independent of the consumer cursor.
+
+        Authenticated ingress uses this once at startup to reconstruct its
+        acceptance/idempotency index.  A duplicate provider delivery can then
+        receive the same transport ACK without appending another physical
+        record.  Corrupt history fails loud; it is never silently forgotten.
+        """
+        if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records < 1:
+            raise ValueError("scan_committed max_records 须为正整数")
+        with self._claimed_state() as (_work_fd, state_fd):
+            inbox_fd = _open_optional_private_regular(
+                state_fd, self._inbox_name, label=f"{self._label} inbox")
+            if inbox_fd is None:
+                return []
+            try:
+                info = os.fstat(inbox_fd)
+                if info.st_size > MAX_INBOX_BYTES:
+                    raise UnsafeConsolePath(
+                        f"{self._label} inbox 超过 {MAX_INBOX_BYTES} 字节安全上限")
+                position = 0
+                records: List[Dict[str, Any]] = []
+                while position < info.st_size:
+                    record = self._next_record(inbox_fd, position, info.st_size)
+                    if record is None:
+                        break
+                    if record.line is None:
+                        raise UnsafeConsolePath(
+                            f"{self._label} inbox 历史含不可恢复 committed record: {record.error}")
+                    def unique_object(pairs):  # noqa: ANN001
+                        value = {}
+                        for key, item in pairs:
+                            if key in value:
+                                raise ValueError(f"重复 JSON key: {key}")
+                            value[key] = item
+                        return value
+
+                    try:
+                        value = json.loads(
+                            record.line, object_pairs_hook=unique_object,
+                            parse_constant=lambda token: (_ for _ in ()).throw(
+                                ValueError(f"非有限 JSON number: {token}")))
+                    except (json.JSONDecodeError, ValueError) as error:
+                        raise UnsafeConsolePath(
+                            f"{self._label} inbox 历史含坏 JSON") from error
+                    if not isinstance(value, dict):
+                        raise UnsafeConsolePath(f"{self._label} inbox 历史记录须为 object")
+                    records.append(value)
+                    if len(records) > max_records:
+                        raise UnsafeConsolePath(
+                            f"{self._label} inbox 记录数超过 {max_records}，须人工归档")
+                    position = record.end_offset
+                if position != info.st_size and not self._fence_uncommitted_tail:
+                    raise UnsafeConsolePath(
+                        f"{self._label} inbox 含未提交尾部；拒绝建立 acceptance index")
+                return records
+            finally:
+                os.close(inbox_fd)
+
+    def append_audit_record(self, name: str, record: Dict[str, Any], *,
+                            max_bytes: int = 16 * 1024 * 1024) -> None:
+        """Durably append a bounded, non-consumable security audit record."""
+        if (not isinstance(name, str) or not name or "/" in name or "\x00" in name
+                or name in (".", "..")):
+            raise ValueError("audit record 文件名非法")
+        if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1024):
+            raise ValueError("audit record 大小上限非法")
+        if not isinstance(record, dict):
+            raise ValueError("audit record 须为 object")
+        payload = (json.dumps(
+            record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False) + "\n").encode("utf-8")
+        if len(payload) > MAX_RECORD_BYTES:
+            raise ValueError("audit record 超过单条上限")
+        with self._claimed_state() as (_work_fd, state_fd):
+            fd, _created = _open_exclusive_or_existing(
+                state_fd, name, _FILE_RW_FLAGS, 0o600)
+            try:
+                info = _verify_entry_matches_fd(
+                    state_fd, name, fd, label=f"{self._label} audit", regular=True)
+                if info.st_uid != os.geteuid():
+                    raise UnsafeConsolePath(f"{self._label} audit owner 不是当前 uid")
+                os.fchmod(fd, 0o600)
+                size = os.fstat(fd).st_size
+                if size and os.pread(fd, 1, size - 1) != b"\n":
+                    _write_all(fd, b"\n")
+                    size += 1
+                if size + len(payload) > max_bytes:
+                    raise UnsafeConsolePath(
+                        f"{self._label} audit 将超过 {max_bytes} 字节上限")
+                _write_all(fd, payload)
+                os.fsync(fd)
+                os.fsync(state_fd)
+                _verify_entry_matches_fd(
+                    state_fd, name, fd, label=f"{self._label} audit", regular=True)
+            finally:
+                os.close(fd)
+
+    def scan_audit_records(self, name: str, *, max_bytes: int = 16 * 1024 * 1024,
+                           max_records: int = 100_000) -> List[Dict[str, Any]]:
+        """Strictly read a security log; any torn/corrupt evidence fails loud."""
+        if (not isinstance(name, str) or not name or "/" in name or "\x00" in name
+                or name in (".", "..")):
+            raise ValueError("audit record 文件名非法")
+        if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1024
+                or isinstance(max_records, bool) or not isinstance(max_records, int)
+                or max_records < 1):
+            raise ValueError("audit record 读取上限非法")
+        with self._claimed_state() as (_work_fd, state_fd):
+            fd = _open_optional_private_regular(
+                state_fd, name, label=f"{self._label} audit")
+            if fd is None:
+                return []
+            try:
+                raw = _read_all(fd, max_bytes=max_bytes)
+            finally:
+                os.close(fd)
+        if raw and not raw.endswith(b"\n"):
+            raise UnsafeConsolePath(f"{self._label} audit 含未提交尾部")
+        records: List[Dict[str, Any]] = []
+
+        def unique_object(pairs):  # noqa: ANN001
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError(f"重复 JSON key: {key}")
+                value[key] = item
+            return value
+
+        for line in raw.split(b"\n")[:-1]:
+            if not line:
+                continue
+            try:
+                value = json.loads(
+                    line.decode("utf-8"), object_pairs_hook=unique_object,
+                    parse_constant=lambda token: (_ for _ in ()).throw(
+                        ValueError(f"非有限 JSON number: {token}")))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                raise UnsafeConsolePath(f"{self._label} audit 历史损坏") from error
+            if not isinstance(value, dict):
+                raise UnsafeConsolePath(f"{self._label} audit 历史记录须为 object")
+            records.append(value)
+            if len(records) > max_records:
+                raise UnsafeConsolePath(
+                    f"{self._label} audit 记录数超过 {max_records}")
+        return records
+
+    def repair_uncommitted_tail(self, audit_name: str, *,
+                                max_audit_bytes: int = 16 * 1024 * 1024
+                                ) -> Optional[Dict[str, Any]]:
+        """Durably audit and truncate bytes after the final committed LF.
+
+        Connector append ACKs only LF-committed records.  Therefore a crash
+        tail has never been acknowledged and may be discarded, but only after
+        preserving a hash/length/offset record.  No provider text is copied to
+        the audit log.
+        """
+        if self._fence_uncommitted_tail:
+            raise ValueError("console spool 不使用 connector tail recovery")
+        if (not isinstance(audit_name, str) or not audit_name or "/" in audit_name
+                or "\x00" in audit_name or audit_name in (".", "..")):
+            raise ValueError("tail recovery audit 文件名非法")
+        with self._claimed_state() as (_work_fd, state_fd):
+            inbox_fd = _open_optional_private_regular(
+                state_fd, self._inbox_name, label=f"{self._label} inbox")
+            if inbox_fd is None:
+                return None
+            audit_fd = -1
+            try:
+                info = os.fstat(inbox_fd)
+                size = info.st_size
+                if size == 0 or os.pread(inbox_fd, 1, size - 1) == b"\n":
+                    return None
+                position = size
+                boundary = 0
+                while position > 0:
+                    start = max(0, position - 1024 * 1024)
+                    chunk = os.pread(inbox_fd, position - start, start)
+                    if len(chunk) != position - start:
+                        raise UnsafeConsolePath(
+                            f"{self._label} inbox tail 恢复读取被截断")
+                    index = chunk.rfind(b"\n")
+                    if index >= 0:
+                        boundary = start + index + 1
+                        break
+                    position = start
+                digest = hashlib.sha256()
+                position = boundary
+                while position < size:
+                    chunk = os.pread(inbox_fd, min(1024 * 1024, size - position), position)
+                    if not chunk:
+                        raise UnsafeConsolePath(
+                            f"{self._label} inbox tail 恢复 hash 读取被截断")
+                    digest.update(chunk)
+                    position += len(chunk)
+                record = {
+                    "version": 1,
+                    "kind": "uncommitted_tail_truncated",
+                    "inbox_name": self._inbox_name,
+                    "start_offset": boundary,
+                    "byte_count": size - boundary,
+                    "tail_hash": "sha256:" + digest.hexdigest(),
+                }
+                payload = (json.dumps(
+                    record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                    allow_nan=False) + "\n").encode("utf-8")
+                audit_fd, _created = _open_exclusive_or_existing(
+                    state_fd, audit_name, _FILE_RW_FLAGS, 0o600)
+                audit_info = _verify_entry_matches_fd(
+                    state_fd, audit_name, audit_fd,
+                    label=f"{self._label} tail recovery audit", regular=True)
+                if audit_info.st_uid != os.geteuid():
+                    raise UnsafeConsolePath(
+                        f"{self._label} tail recovery audit owner 不是当前 uid")
+                os.fchmod(audit_fd, 0o600)
+                audit_size = os.fstat(audit_fd).st_size
+                if audit_size and os.pread(audit_fd, 1, audit_size - 1) != b"\n":
+                    # The prior recovery attempt did not durably commit its
+                    # audit row and also did not remove the inbox tail.  Drop
+                    # only that uncommitted audit suffix, then regenerate the
+                    # same hash-only evidence from the still-present inbox.
+                    audit_position = audit_size
+                    audit_boundary = 0
+                    while audit_position > 0:
+                        audit_start = max(0, audit_position - 1024 * 1024)
+                        audit_chunk = os.pread(
+                            audit_fd, audit_position - audit_start, audit_start)
+                        audit_index = audit_chunk.rfind(b"\n")
+                        if audit_index >= 0:
+                            audit_boundary = audit_start + audit_index + 1
+                            break
+                        audit_position = audit_start
+                    os.ftruncate(audit_fd, audit_boundary)
+                    os.fsync(audit_fd)
+                    audit_size = audit_boundary
+                if audit_size + len(payload) > max_audit_bytes:
+                    raise UnsafeConsolePath(
+                        f"{self._label} tail recovery audit 超过大小上限")
+                _write_all(audit_fd, payload)
+                os.fsync(audit_fd)
+                os.fsync(state_fd)
+                os.ftruncate(inbox_fd, boundary)
+                os.fsync(inbox_fd)
+                os.fsync(state_fd)
+                _verify_entry_matches_fd(
+                    state_fd, self._inbox_name, inbox_fd,
+                    label=f"{self._label} inbox", regular=True)
+                return record
+            finally:
+                if audit_fd >= 0:
+                    os.close(audit_fd)
+                os.close(inbox_fd)
+
+
+class ConsoleSpool(DurableInboxSpool):
+    """The browser/console trust domain (backward-compatible filenames)."""
+
+    def __init__(self, work_root: Union[str, Path]):
+        super().__init__(
+            work_root, lock_name=_LOCK_NAME, inbox_name=_INBOX_NAME,
+            cursor_name=_CURSOR_NAME, retry_name=_RETRY_NAME,
+            key_prefix="console", label="console", capability_name=CAPABILITY_NAME,
+            fence_uncommitted_tail=True)
+
+
+class ConnectorSpool(DurableInboxSpool):
+    """One authenticated connector channel's isolated ingress trust domain."""
+
+    def __init__(self, work_root: Union[str, Path], channel: str):
+        if (not isinstance(channel, str) or not channel
+                or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in channel)):
+            raise ValueError("connector spool channel 非法")
+        stem = f"connector_{channel}_inbox"
+        self.channel = channel
+        self.quarantine_name = f"connector_{channel}_quarantine.jsonl"
+        self.recovery_name = f"connector_{channel}_recovery.jsonl"
+        super().__init__(
+            work_root, lock_name=f".connector-{channel}-inbox.lock",
+            inbox_name=stem + ".jsonl", cursor_name=stem + ".cursor",
+            retry_name=f".{stem}.retry.json", key_prefix="connector",
+            label=f"connector {channel}")
+
+    def record_quarantine(self, record: Dict[str, Any]) -> None:
+        self.append_audit_record(self.quarantine_name, record)
+
+    def quarantine_records(self) -> List[Dict[str, Any]]:
+        return self.scan_audit_records(self.quarantine_name)
+
+    def repair_uncommitted_inbox_tail(self) -> Optional[Dict[str, Any]]:
+        return self.repair_uncommitted_tail(self.recovery_name)
+
+    def recovery_records(self) -> List[Dict[str, Any]]:
+        return self.scan_audit_records(self.recovery_name)
 
 
 def normalize_upload_ref(source_ref: Any) -> Tuple[str, str, Tuple[str, ...]]:

@@ -37,13 +37,17 @@ def env():
 
 def _confirm(daemon, console, result):
     did = result["directive_id"]
-    goal_id, goal_ver = daemon.query_one(
-        "SELECT m.goal_id,m.goal_ver FROM directive d JOIN interaction_message m "
+    source = daemon.query_one(
+        "SELECT m.goal_id,m.goal_ver,m.connector,m.conversation_id,m.session_ref "
+        "FROM directive d JOIN interaction_message m "
         "ON m.id=d.source_interaction_message_id WHERE d.id=?", (did,))
+    session_ref = (DIRECTIVE_ACTION_SESSION_REF
+                   if source[2] == "console" else
+                   (source[4] + ":action" if source[4] is not None else None))
     mid = console.ingest.inbound(
-        connector="test-control", raw_text=directive_action_text("confirm", did),
-        idempotency_key=f"confirm-d{did}", goal_id=goal_id, goal_ver=goal_ver,
-        session_ref=DIRECTIVE_ACTION_SESSION_REF)
+        connector=source[2], raw_text=directive_action_text("confirm", did),
+        idempotency_key=f"confirm-d{did}", goal_id=source[0], goal_ver=source[1],
+        session_ref=session_ref, conversation_id=source[3])
     with daemon.transaction() as conn:
         conn.execute(
             "INSERT INTO interaction_classification(message_id,intent,directive_id) "
@@ -53,13 +57,17 @@ def _confirm(daemon, console, result):
 
 def _reject(daemon, console, result, reason="用户未确认新优先级"):
     did = result["directive_id"]
-    goal_id, goal_ver = daemon.query_one(
-        "SELECT m.goal_id,m.goal_ver FROM directive d JOIN interaction_message m "
+    source = daemon.query_one(
+        "SELECT m.goal_id,m.goal_ver,m.connector,m.conversation_id,m.session_ref "
+        "FROM directive d JOIN interaction_message m "
         "ON m.id=d.source_interaction_message_id WHERE d.id=?", (did,))
+    session_ref = (DIRECTIVE_ACTION_SESSION_REF
+                   if source[2] == "console" else
+                   (source[4] + ":action" if source[4] is not None else None))
     mid = console.ingest.inbound(
-        connector="test-control", raw_text=directive_action_text("reject", did, reason=reason),
-        idempotency_key=f"reject-d{did}", goal_id=goal_id, goal_ver=goal_ver,
-        session_ref=DIRECTIVE_ACTION_SESSION_REF)
+        connector=source[2], raw_text=directive_action_text("reject", did, reason=reason),
+        idempotency_key=f"reject-d{did}", goal_id=source[0], goal_ver=source[1],
+        session_ref=session_ref, conversation_id=source[3])
     with daemon.transaction() as conn:
         conn.execute(
             "INSERT INTO interaction_classification(message_id,intent,directive_id) "
@@ -295,15 +303,15 @@ def test_reprioritize_notification_waits_for_real_selection_effect(env, tmp_path
     console.consume_directive(directive_id=boost["directive_id"], cycle_id="c1")
     notifier = DirectiveNotifier(daemon, Outbox(str(tmp_path / "outbox")))
     early = notifier.scan()
-    assert f"directive:{boost['directive_id']}:pending_effect" in early
-    assert f"directive:{boost['directive_id']}:applied" not in early
+    assert f"directive:{boost['directive_id']}:pending_effect:v2" in early
+    assert f"directive:{boost['directive_id']}:applied:v2" not in early
 
     SQLiteStateStore(daemon, POLICY).persist_selection("c1", Selection(
         next_question_id="q3", next_intent="attack", scores=[
             {"question_id": "q2", "score": 0.4, "est_cost": 1.0},
             {"question_id": "q3", "score": 1.0, "est_cost": 1.0},
         ]))
-    assert f"directive:{boost['directive_id']}:applied" in notifier.scan()
+    assert f"directive:{boost['directive_id']}:applied:v2" in notifier.scan()
 
 
 def test_soft_reprioritize_missing_score_is_terminally_declined(env):

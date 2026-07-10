@@ -293,6 +293,46 @@ class Connector(Protocol):
     def status(self) -> Dict[str, Any]: ...
 
 
+class DurableInboundConnector(Connector, Protocol):
+    """Authenticated connector with an explicit durable receive receipt.
+
+    ``poll`` is non-destructive: every returned envelope carries an opaque
+    queue-head token and remains replayable until ``commit_poll`` durably moves
+    the cursor over that exact token.  Retry state is separate durable
+    authority.  ``prepare_inbound`` validates both authorities before the
+    research database is opened; listener start/stop ownership and fatal-state
+    reporting must remain explicit so a half-started receiver cannot be
+    orphaned or silently treated as healthy.
+    """
+
+    has_inbound: bool
+
+    @property
+    def inbound_spool(self) -> Any: ...
+
+    def commit_poll(self, token: Any) -> None: ...
+
+    def load_inbound_retry_counts(self) -> Dict[str, int]: ...
+
+    def store_inbound_retry_counts(self, counts: Dict[str, int]) -> None: ...
+
+    def inbound_pending_status(self) -> Dict[str, Any]: ...
+
+    def validate_inbound_envelope(self, value: Dict[str, Any]) -> Dict[str, Any]: ...
+
+    def record_inbound_fatal(self, error: BaseException) -> None: ...
+
+    def prepare_inbound(self) -> None: ...
+
+    def start_inbound(self) -> bool: ...
+
+    def stop_inbound(self) -> Optional[BaseException]: ...
+
+    def inbound_stopped(self) -> bool: ...
+
+    def raise_if_inbound_failed(self) -> None: ...
+
+
 class Classifier(Protocol):
     """保守三分类 + unclear 低置信出口（§4.6.2）。"""
 
