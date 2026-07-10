@@ -251,6 +251,31 @@ def test_pump_error_still_drains_already_accepted_query(tmp_path):
     assert state == {"accepted": False, "completion_calls": 1}
 
 
+def test_run_forever_never_restarts_over_uncollected_pump_error(tmp_path):
+    failed = __import__("threading").Event()
+    calls = {"n": 0}
+
+    class OneCycle:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            assert failed.wait(1)
+            return ["c1"]
+
+    def fail_once():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            failed.set()
+            raise RuntimeError("resident pump evidence")
+
+    system = System(
+        advancer=OneCycle(), state=None, daemon=None, dual_mode="A", work_root=tmp_path,
+        sync_interactions=fail_once)
+    with pytest.raises(RuntimeError, match="resident pump evidence"):
+        system.run_forever(1, poll_interval_s=0.01, linger_after_terminal=False)
+
+
 def test_main_ctrl_c_exits_cleanly(tmp_path, monkeypatch, capsys):
     import orchestrator.run as R
 
@@ -269,7 +294,7 @@ def test_main_ctrl_c_exits_cleanly(tmp_path, monkeypatch, capsys):
     system = InterruptSystem()
     monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: system)
     rc = R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
-                 "--poll-interval-s", "0.01"])
+                 "--poll-interval-s", "0.01", "--no-outbound"])
     assert rc == 130 and system.scans == 1
     assert "Ctrl-C" in capsys.readouterr().out
 
@@ -334,7 +359,7 @@ def test_main_hard_stop_kills_registered_groups_without_redrain(tmp_path, monkey
     monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: HardInterruptSystem())
     monkeypatch.setattr(R, "terminate_active_process_groups", lambda: killed.append(True))
     assert R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
-                   "--poll-interval-s", "0.01"]) == 130
+                   "--poll-interval-s", "0.01", "--no-outbound"]) == 130
     assert killed == [True]
     assert "立即硬停" in capsys.readouterr().out
 
@@ -359,7 +384,7 @@ def test_main_second_ctrl_c_during_fallback_drain_kills_groups(tmp_path, monkeyp
     monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: TwiceInterruptedSystem())
     monkeypatch.setattr(R, "terminate_active_process_groups", lambda: killed.append(True))
     assert R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
-                   "--poll-interval-s", "0.01"]) == 130
+                   "--poll-interval-s", "0.01", "--no-outbound"]) == 130
     assert killed == [True]
     assert "立即硬停" in capsys.readouterr().out
 
@@ -703,7 +728,7 @@ def test_main_cli_smoke(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(R, "build_system",
                         lambda sr, wr, **kw: orig(sr, wr, runner_factory=_mock_factory([_BOOT_TERMINATE])))
     rc = R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
-                 "--max-cycles", "3", "--once"])
+                 "--max-cycles", "3", "--once", "--no-outbound"])
     assert rc == 0 and "推进 1 轮" in capsys.readouterr().out
 
 
@@ -716,7 +741,8 @@ def test_main_cli_attack_clean_error(tmp_path, monkeypatch, capsys):
     orig = R.build_system
     monkeypatch.setattr(R, "build_system",           # attack=False：验证退化装配仍干净拒（CP8.4 后 attack 默认全装）
                         lambda sr, wr, **kw: orig(sr, wr, runner_factory=_mock_factory([boot_attack]), attack=False))
-    rc = R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path), "--max-cycles", "3"])
+    rc = R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+                 "--max-cycles", "3", "--no-outbound"])
     assert rc == 2 and "尚未装配的组件" in capsys.readouterr().out
 
 
@@ -730,7 +756,8 @@ def test_stop_reason_print_prefers_block(tmp_path, monkeypatch, capsys):
                          "request_hash) VALUES (1,1,'plan','pending','需数据','[]','rh')")
         return s
     monkeypatch.setattr(R, "build_system", factory)
-    R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path), "--max-cycles", "3", "--once"])
+    R.main(["--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+            "--max-cycles", "3", "--once", "--no-outbound"])
     assert "文件请求" in capsys.readouterr().out
 
 
@@ -1178,4 +1205,4 @@ def test_resident_build_system_ingests_spooled_file_action_and_resumes(tmp_path)
         "SELECT status FROM interaction_request WHERE id=1")[0] == "resolved"
     assert (tmp_path / "input" / "user_provided" / "1" / "1" / "asset-1").read_bytes() == b"RESIDENT-EEG-DATA"
     events = [json.loads(line) for line in (tmp_path / "state" / "outbox.jsonl").read_text().splitlines()]
-    assert "filereq:1:resolved" in {event["event_key"] for event in events}
+    assert "filereq:1:resolved:v2" in {event["event_key"] for event in events}

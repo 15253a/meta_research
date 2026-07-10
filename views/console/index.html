@@ -2589,8 +2589,14 @@ function adaptPayload(p){
   for(const k in T) D[k]=T[k];                                   // 真表平铺到顶层（原型访问 DB.<表>）
   D.notification=((p&&p.notification)||[]).map(n=>{
     // 真 Outbox 形状={event_key,kind,payload}；旧原型形状={at,channel,event,text}。统一后通知面不再空白。
-    if(n&&n.kind) return {event_key:n.event_key, at:n.at||"—", channel:n.channel||"outbox",
-      event:n.kind, text:n.text||JSON.stringify(n.payload||{})};
+    if(n&&n.kind){
+      const ds=Array.isArray(n.deliveries)?n.deliveries:[], last=ds.length?ds[ds.length-1]:null;
+      const delivery=last?(last.status==="delivered"?` [${last.channel||"connector"} 已投递]`:
+        last.status==="authority_corrupt"?` [投递权威损坏: ${last.last_error_kind||"unknown"}]`:
+        ` [${last.channel||"connector"} 重试中: ${last.last_error_kind||"unknown"}]`):"";
+      return {event_key:n.event_key, at:n.at||"—", channel:n.channel||(last&&last.channel)||"outbox",
+        event:n.kind, text:(n.text||JSON.stringify(n.payload||{}))+delivery};
+    }
     return n||{};
   });
   D.ledger_by_cycle=((p&&p.ledger_by_cycle)||[]).map(l=>{

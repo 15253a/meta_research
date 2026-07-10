@@ -275,6 +275,17 @@ class WriteDaemon(Protocol):
 
 
 class Connector(Protocol):
+    """Transport adapter.
+
+    ``send`` receives the work-root's durable ``producer_id`` plus its local
+    ``event_key`` and returns a normalized ACK with ``accepted is True`` and
+    both identities unchanged; raising means the event remains pending.
+    Idempotent transports must treat a repeated ``(producer_id,event_key)`` as
+    the same logical event because the local receipt can be lost after remote
+    acceptance (at-least-once boundary).  A weaker transport such as direct
+    OneBot must disclose that the crash window can duplicate user-visible IO.
+    """
+
     def send(self, payload: Dict[str, Any]) -> Dict[str, Any]: ...
 
     def poll(self) -> List[Dict[str, Any]]: ...

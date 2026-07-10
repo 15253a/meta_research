@@ -17,13 +17,19 @@ python -m pytest tests/ -q                              # 自验：以当前测�
 
 # 全自动跑（需真 Codex CLI + 代理，见 §2）：
 export HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890
+# 生产还须先配置 connectors/outbound.json + 对应 token 环境变量（见 §4.2）
 python -m orchestrator.run --system-root . --work-root /path/to/run_dir --max-cycles 50
+
+# 仅离线/测试（明确承认外部通知不会交付）：
+python -m orchestrator.run --system-root . --work-root /tmp/canary --max-cycles 5 --no-outbound
 ```
 
 - `--system-root`：含 `input/goal_brief.md`、`policies/`、`prompts/`、`schemas/` 的仓库根（一般就是 `.`）。
 - `--work-root`：本次运行的产物根（`research.sqlite` / `cycles/` / `state/` 落这里）。**重启用同一个
   work-root 即从断点续跑**（DB 权威，非进程内记忆）。
 - `--max-cycles`：本次最多推进轮数（安全上限，默认 100，与系统自终止并存）。
+- 生产入口默认读取 `<system-root>/connectors/outbound.json`；缺失、权限不安全、token 环境变量缺失或协议
+  不合法都会在建库/调用 Codex 前失败。只有显式 `--no-outbound` 才允许离线运行。
 - 默认入口在人工 pause 或文件请求阻断时**保持单写进程常驻**，周期消费控制台 spool、扫描提醒，解除阻断后
   自动从同一 DB 游标继续；批处理/调试若希望遇阻即返回，显式加 `--once`。`--poll-interval-s` 可调等待轮询
   间隔（默认 1 秒，最小 0.01 秒）。
@@ -141,6 +147,22 @@ tunnel（例如 `ssh -L 8765:127.0.0.1:8765 <host>`），不得把服务直接�
   或明确改变请求条件。
 - **显式演示**：只有 `?demo=1` 启用内嵌 mock 数据，且不发 API；正常页面断线时 fail closed，不会把 mock 当成真状态。
 
+### 4.2 真实出站 connector
+
+通知和 query reply 先按确定性 event_key 写 `<work-root>/state/outbox.jsonl`，并以该 work-root 持久
+`producer_id` 构成远端幂等身份，再由独立 delivery 线程投递，
+网络慢或失败不会阻塞研究 Runner/interaction pump。支持：
+
+- `webhook_v1`：推荐；接收端必须按 `(producer_id,event_key)` 耐久去重并精确 ACK，可闭合崩溃重放；
+- `onebot_v11`：直接向本地 OneBot HTTP API 发送固定 QQ 私聊或群消息；配置强绑定 conversation，
+  `producer_id:event_key` 写入正文和 echo。
+
+配置、ACK 协议、OneBot 示例和运行期回执文件见 [connectors/README.md](connectors/README.md)。失败会在
+`outbound_delivery_state.json` 保留 attempt/下次重试/消毒错误，成功写 `delivery_receipts.jsonl`；两者均
+投影到 web 控制台通知流。query/unclear 事件只回原 channel；直连 OneBot 还会机械校验来源
+conversation_id 与固定 target 绑定，系统级通知按当前 `all_qq_on` 矩阵走 QQ，不会把 web console 或另一
+QQ 会话的回复误投到该目标。
+
 ## 5. 系统能做什么（当前研究形态）
 
 - **build target**：从零建 baseline 家族（写代码 → smoke → 代码评审 → 训练 → 出厂评估 → 结果评审 →
@@ -184,6 +206,8 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 - Web capability 用于隔离其他本机 OS 用户、跨站浏览器请求和无 token 的本机客户端；同 UID 恶意进程仍可
   读取 0600 token，同源 XSS 也可读取 sessionStorage。轮换时先停 console server，删除
   `<work-root>/state/.console-capability`，再重启并用新 fragment 打开；它不替代 loopback/SSH tunnel 边界。
+- 严格 webhook 能让接收网关按 `(producer_id,event_key)` 去重；OneBot v11 标准 API 没有幂等写语义，所以“QQ 已发送但本地
+  receipt 前 SIGKILL”可能显示重复消息。不能接受重复时必须用严格 webhook 包住 OneBot，而不是直连。
 - **成本护栏已转活，但不是供应商账单**：`ledger.money` 用 Codex CLI 回报的总 token 与本地
   `price_per_1k_tokens` 折算，用于运行护栏和趋势观测。如果编排器在外部调用已完成、但用量落库前被
   `SIGKILL`，该次用量仍可漏记；生产级精确账单需再加「调用前意图 + 持久回执 + 幂等补账」协议。

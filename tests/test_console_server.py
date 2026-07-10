@@ -53,7 +53,8 @@ def seeded(tmp_path):
          "cycle_status": "done", "route": "bootstrap", "counts": {"open": 0, "inconclusive": 0}},
         ensure_ascii=False), encoding="utf-8")
     (work / "state" / "outbox.jsonl").write_text(
-        json.dumps({"event_key": "e1", "kind": "cycle_done", "text": "轮完成"}) + "\n"
+        json.dumps({"event_key": "e1", "kind": "cycle_done",
+                    "payload": {"summary_md": "轮完成"}}) + "\n"
         + "{半行撕裂无换行", encoding="utf-8")            # 撕裂尾行须被忽略
     return path, str(work)
 
@@ -70,7 +71,9 @@ def test_assemble_db_shape(seeded):
     # 派生对象在场
     assert payload["status_card"]["snapshot_cycle"] == "c1"
     assert payload["live"]["mode"] in ("running", "idle", "awaiting_user")
-    assert payload["notification"] == [{"event_key": "e1", "kind": "cycle_done", "text": "轮完成"}]  # 撕裂行被弃
+    assert payload["notification"] == [{
+        "event_key": "e1", "kind": "cycle_done", "payload": {"summary_md": "轮完成"},
+    }]  # 撕裂行被弃
     assert "budget" in payload["policy"] and "tree_guard" in payload["policy"]                       # 真 policy.yaml
     assert payload["fs"]["roots"][0]["p"] == "work"            # FS 树含 work 根
     # ledger 当前空 → 空数组（不炸）
@@ -962,8 +965,9 @@ def test_notifications_drops_unterminated_tail(seeded):
     """codex SHOULD 回归：尾行无换行（append 中途）即便是合法 JSON 也丢——committed=换行终止。"""
     path, work = seeded
     ob = Path(work) / "state" / "outbox.jsonl"
-    ob.write_text(json.dumps({"event_key": "a", "kind": "k", "text": "done"}) + "\n"
-                  + json.dumps({"event_key": "b", "kind": "k", "text": "partial"}), encoding="utf-8")  # 尾行无 \n
+    ob.write_text(json.dumps({"event_key": "a", "kind": "k", "payload": {"text": "done"}}) + "\n"
+                  + json.dumps({"event_key": "b", "kind": "k",
+                                "payload": {"text": "partial"}}), encoding="utf-8")  # 尾行无 \n
     got = CS.assemble_db(path, work, SYSTEM_ROOT)["notification"]
     assert [n["event_key"] for n in got] == ["a"]         # b 未终止 → 丢
 

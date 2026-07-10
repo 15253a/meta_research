@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "channels": {
+    "qq": {
+      "type": "webhook_v1",
+      "url": "https://connector.example.invalid/meta-research/events",
+      "token_env": "METARESEARCH_QQ_CONNECTOR_TOKEN",
+      "timeout_s": 1
+    }
+  },
+  "delivery": {
+    "retry_initial_s": 1,
+    "retry_max_s": 300,
+    "batch_size": 32
+  }
+}

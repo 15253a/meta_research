@@ -1,11 +1,11 @@
 """notify —— 通知矩阵 outbox + 文件请求全流水 + 全局等待前置检查（§4.6.6/§4.6.8/§4.4.1；M5 CP6.3）。
 
 **outbox = 实现层文件队列，不建表**（核心 DDL 36 表冻结；§4.6.2 heartbeat/outbox 明示非核心 DDL）：
-`outbox.jsonl` 追加事件（一行一 JSON）+ `delivered.log` 投递标记。**幂等两层**：emit 按 event_key
-去重（重扫不重排队）；deliver 按 delivered 标记去重（重启不重发；send 成功与标记落盘之间崩溃 →
-重发一次 = at-least-once，事件带 event_key 供接收端去重）。
+`outbox.jsonl` 追加事件（一行一 JSON），`delivery_receipts.jsonl` 记录远端 ACK，
+`outbound_delivery_state.json` 原子保存跨重启退避。emit 按 event_key 去重并拒绝同键异文；远端成功但
+本地 receipt 前崩溃会重发同一 key（at-least-once），严格 webhook 接收端据 key 耐久去重。
 
-**事件从 DB 状态扫描派生**（DirectiveNotifier/FileRequestNotifier），不在 console/interaction 内联发
+**事件从 DB 状态扫描派生**（Directive/Interaction/Research/FileRequest Notifier），不在 console/interaction 内联发
 ——写路径保持单一职责，通知层随时可重扫补发（崩溃后 outbox 丢了也能从 DB 重建全部事件）。
 event_key 确定性（directive:{id}:{state} / filereq:{id}:{event}）⇒ 重扫幂等。
 
@@ -31,100 +31,788 @@ query/通知照常——它们不走 Advancer）。
 from __future__ import annotations
 
 import codecs
+import copy
 import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
+import re
+import secrets
 import shutil
 import sqlite3
 import stat
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from .console import Console, DirectiveApplicationError
+from .console import (DIRECTIVE_ACTION_SESSION_REF, FILE_REQUEST_ACTION_SESSION_REF,
+                      Console, DirectiveApplicationError)
 from .resource_limits import (MAX_ASSETS_PER_GOAL, MAX_CANCEL_REASON_CHARS,
                               MAX_FILE_REQUESTS_PER_GOAL, MAX_REQUEST_ITEMS)
 from .writedaemon import WriteDaemon
 
 logger = logging.getLogger(__name__)
 
+
+def _state_json_object(pairs):  # noqa: ANN001
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"outbox JSON key 重复: {key}")
+        value[key] = item
+    return value
+
+
+def _load_state_json(raw: str) -> Any:
+    return json.loads(
+        raw, object_pairs_hook=_state_json_object,
+        parse_constant=lambda token: (_ for _ in ()).throw(
+            ValueError(f"outbox JSON 非有限数字: {token}")))
+
 # ------------------------------------------------------------------- outbox --
 
 
 class Outbox:
-    """文件队列：emit 幂等排队 → deliver_pending 经 Connector 投递（幂等标记）。
-    单进程单写者假设（同目录只应有一个活 Outbox——与系统单写纪律一致）；进程内用 _seen 缓存免每次重读
-    队列文件（O(n²)→O(n)）。"""
+    """Durable event queue plus per-channel delivery receipts/retry state.
+
+    ``outbox.jsonl`` remains a DB-derived, replayable event stream.  Transport
+    facts live separately: a newline-committed receipt proves a remote ACK,
+    while an atomically replaced state file holds the latest retry schedule.
+    The in-process locks permit the research boundary and resident interaction
+    sideband to scan concurrently; CP11.3 still owns cross-process exclusion.
+    """
+
+    _MAX_EVENT_BYTES = 64 * 1024
+    _MAX_LOG_BYTES = 64 * 1024 * 1024
+    _MAX_ERROR_CHARS = 1000
+    _EVENT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$")
+    _CHANNEL_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
     def __init__(self, out_dir: str):
         self.dir = Path(out_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
+        directory_info = self.dir.lstat()
+        if not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != os.geteuid():
+            raise OSError("outbox 目录须为当前进程拥有的真实目录")
+        os.chmod(self.dir, 0o700)
         self.queue_path = self.dir / "outbox.jsonl"
         self.delivered_path = self.dir / "delivered.log"
-        self._seen: Optional[set] = None      # 进程内 emit 去重缓存（首用时从文件懒加载）
+        self.receipts_path = self.dir / "delivery_receipts.jsonl"
+        self.retry_path = self.dir / "outbound_delivery_state.json"
+        self.producer_path = self.dir / "outbound_producer_id"
+        self.producer_id = self._load_or_create_producer_id()
+        # event_key -> canonical JSON.  Keeping the full canonical value makes
+        # idempotency collisions O(1) without re-reading the growing queue for
+        # every notifier rescan (the old set-only cache regressed to O(n²)).
+        self._seen: Optional[Dict[str, str]] = None
+        self._event_cache: Optional[List[Dict[str, Any]]] = None
+        self._queue_fingerprint: Optional[Tuple[int, int, int, int, int]] = None
+        self._receipt_seen: Optional[set] = None
+        self._receipt_fingerprint: Optional[Tuple[int, int, int, int, int]] = None
+        self._retry_cache: Optional[Dict[str, Any]] = None
+        self._retry_fingerprint: Optional[Tuple[int, int, int, int, int]] = None
+        self._lock = threading.RLock()
+        self._legacy_delivery_lock = threading.Lock()
+
+    @staticmethod
+    def _fingerprint(info: os.stat_result) -> Tuple[int, int, int, int, int]:
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def _read_regular_snapshot(
+            self, path: Path, *, max_bytes: Optional[int] = None,
+    ) -> Tuple[bytes, Optional[Tuple[int, int, int, int, int]]]:
+        flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return b"", None
+        try:
+            info = os.fstat(fd)
+            limit = self._MAX_LOG_BYTES if max_bytes is None else max_bytes
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or info.st_size > limit):
+                raise OSError(f"outbox 状态文件身份/大小非法: {path.name}")
+            chunks: List[bytes] = []
+            remaining = info.st_size
+            while remaining:
+                chunk = os.read(fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(fd)
+            if (len(data) != info.st_size
+                    or self._fingerprint(after) != self._fingerprint(info)):
+                raise OSError(f"outbox 状态文件读取期间变化: {path.name}")
+            return data, self._fingerprint(after)
+        finally:
+            os.close(fd)
+
+    def _read_regular_bytes(self, path: Path, *, max_bytes: Optional[int] = None) -> bytes:
+        return self._read_regular_snapshot(path, max_bytes=max_bytes)[0]
+
+    def _path_fingerprint(self, path: Path) -> Optional[Tuple[int, int, int, int, int]]:
+        flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or info.st_size > self._MAX_LOG_BYTES):
+                raise OSError(f"outbox 状态文件身份/大小非法: {path.name}")
+            return self._fingerprint(info)
+        finally:
+            os.close(fd)
+
+    def _load_or_create_producer_id(self) -> str:
+        """Return one durable namespace shared by every restart of this work-root.
+
+        Initialization has its own cross-process lock because it precedes the
+        CP11.3 run-owner lock.  Without it, one constructor could misclassify
+        another constructor's O_EXCL-but-not-yet-written file as a crash orphan
+        and both would return different producer IDs.
+        """
+        lock_path = self.dir / ".outbound_producer_id.lock"
+        flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(lock_path, flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid()):
+                raise OSError("outbound producer init lock 身份非法")
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return self._load_or_create_producer_id_locked()
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def _load_or_create_producer_id_locked(self) -> str:
+        pattern = re.compile(r"^mr-[0-9a-f]{32}$")
+
+        def parse_existing(raw: bytes) -> str:
+            try:
+                value = raw.decode("ascii")
+            except UnicodeDecodeError as error:
+                raise OSError("outbound producer id 非 ASCII") from error
+            if not value.endswith("\n") or pattern.fullmatch(value[:-1]) is None:
+                raise OSError("outbound producer id 损坏")
+            return value[:-1]
+
+        # queue/delivered existed before real transport wiring and can migrate
+        # safely: their local keys remain unchanged.  A receipt/retry, however,
+        # proves that a producer namespace was already used remotely; losing it
+        # must fail loud rather than minting duplicate user-visible effects.
+        namespace_authority_paths = (self.receipts_path, self.retry_path)
+        any_transport_paths = (
+            self.queue_path, self.delivered_path, self.receipts_path, self.retry_path)
+
+        raw, identity = self._read_regular_snapshot(self.producer_path, max_bytes=128)
+        if identity is not None:
+            try:
+                return parse_existing(raw)
+            except OSError as error:
+                if any(self._path_fingerprint(path) is not None
+                       for path in any_transport_paths):
+                    raise OSError(
+                        "outbound producer id 损坏且已有投递状态；请从同一 work-root 备份恢复该文件") from error
+                # First initialization can be killed between O_EXCL and fsync.
+                # No transport state can yet reference that value, so this one
+                # malformed orphan is safe to remove and recreate.
+                if self._path_fingerprint(self.producer_path) != identity:
+                    raise OSError("outbound producer id 修复时发生身份漂移") from error
+                self.producer_path.unlink()
+                self._fsync_dir()
+                return self._load_or_create_producer_id_locked()
+        if any(self._path_fingerprint(path) is not None for path in namespace_authority_paths):
+            raise OSError(
+                "已有 outbox/receipt/retry 但缺 outbound_producer_id；拒绝生成新远端幂等命名空间")
+        candidate = "mr-" + secrets.token_hex(16)
+        temp = self.dir / (
+            f".outbound_producer_id.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        fd = None
+        try:
+            fd = os.open(temp, flags, 0o600)
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != os.geteuid()):
+                    raise OSError("outbound producer id 创建目标身份非法")
+                os.fchmod(fd, 0o600)
+                encoded = (candidate + "\n").encode("ascii")
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("outbound producer id 短写")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                try:
+                    os.close(fd)
+                finally:
+                    fd = None
+            if self._path_fingerprint(self.producer_path) is not None:
+                raw, _identity = self._read_regular_snapshot(self.producer_path, max_bytes=128)
+                return parse_existing(raw)
+            os.replace(temp, self.producer_path)
+            self._fsync_dir()
+            return candidate
+        finally:
+            try:
+                if fd is not None:
+                    os.close(fd)
+            finally:
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+
+    def _committed_jsonl_snapshot(
+            self, path: Path,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Tuple[int, int, int, int, int]]]:
+        data, identity = self._read_regular_snapshot(path)
+        if not data:
+            return [], identity
+        if not data.endswith(b"\n"):
+            data = data[:data.rfind(b"\n") + 1]
+        return ([_load_state_json(line) for line in data.decode("utf-8").split("\n") if line.strip()],
+                identity)
+
+    def _committed_jsonl(self, path: Path) -> List[Dict[str, Any]]:
+        return self._committed_jsonl_snapshot(path)[0]
+
+    def _events_snapshot(
+            self,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Tuple[int, int, int, int, int]]]:
+        events, identity = self._committed_jsonl_snapshot(self.queue_path)
+        seen: Dict[str, str] = {}
+        for event in events:
+            if (not isinstance(event, dict)
+                    or set(event) not in ({"event_key", "kind", "payload"},
+                                          {"event_key", "kind", "payload", "channel"})):
+                raise ValueError("outbox committed event 结构损坏")
+            key, kind, payload = event.get("event_key"), event.get("kind"), event.get("payload")
+            channel = event.get("channel")
+            if (not isinstance(key, str) or self._EVENT_KEY_RE.fullmatch(key) is None
+                    or not isinstance(kind, str) or not kind or len(kind) > 128
+                    or not isinstance(payload, dict)
+                    or (channel is not None and (
+                        not isinstance(channel, str) or self._CHANNEL_RE.fullmatch(channel) is None))):
+                raise ValueError("outbox committed event 字段损坏")
+            canonical = json.dumps(
+                event, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if len(canonical.encode("utf-8")) > self._MAX_EVENT_BYTES:
+                raise ValueError("outbox committed event 超过字节上限")
+            if key in seen:
+                raise ValueError(f"outbox committed event_key 重复: {key}")
+            seen[key] = canonical
+        return events, identity
 
     def _events(self) -> List[Dict[str, Any]]:
         """读全队列。**committed 判据 = 换行终止**（外审 BLOCKER：append 崩溃可能留下"完整 JSON 但无
         尾换行"——若按可解析性判会先算入 _seen、后被 emit 截修丢弃 → 事件永久丢失。故无尾换行的末段
         一律当未入队丢弃，与 emit 的截修口径一致；重扫会补）。换行终止段解析失败 = 中段损坏
         （非崩溃可造成，磁盘/人为改写），fail loud。"""
-        if not self.queue_path.exists():
-            return []
-        data = self.queue_path.read_bytes()
-        if not data:
-            return []
-        if not data.endswith(b"\n"):
-            data = data[:data.rfind(b"\n") + 1]       # 未终止末段=未 committed（无换行则整文件丢弃）
-        # JSON 字符串可含 U+2028/U+2029；事件协议只以物理 LF 分隔，不能用 splitlines() 误拆 payload。
-        return [json.loads(line) for line in data.decode("utf-8").split("\n") if line.strip()]
+        with self._lock:
+            return self._events_snapshot()[0]
 
-    def _queued_keys(self) -> set:
-        if self._seen is None:
-            self._seen = {e["event_key"] for e in self._events()}
-        return self._seen
+    def _verify_cached_fingerprint(
+            self, path: Path, expected: Optional[Tuple[int, int, int, int, int]], *, label: str,
+    ) -> None:
+        if self._path_fingerprint(path) != expected:
+            raise OSError(f"{label} 在进程外被替换/截断/改写；拒绝使用过期缓存")
+
+    def _load_queue_cache(self) -> None:
+        # Repair once when binding the cache.  Every subsequent use verifies
+        # the exact fingerprint, and every in-process append is known to end in
+        # LF, avoiding an O(n²) full-log repair scan per emit.
+        self._repair_torn_jsonl_tail(self.queue_path)
+        events, identity = self._events_snapshot()
+        self._event_cache = events
+        self._seen = {
+            event["event_key"]: json.dumps(
+                event, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            for event in events
+        }
+        self._queue_fingerprint = identity
+
+    def _clear_queue_cache(self) -> None:
+        self._seen = None
+        self._event_cache = None
+        self._queue_fingerprint = None
+
+    def _queued_keys(self) -> Dict[str, str]:
+        with self._lock:
+            if self._seen is None:
+                self._load_queue_cache()
+            else:
+                self._verify_cached_fingerprint(
+                    self.queue_path, self._queue_fingerprint, label="outbox queue")
+            return self._seen
+
+    def _queued_events(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            self._queued_keys()
+            return self._event_cache
 
     def _delivered_keys(self) -> set:
-        if not self.delivered_path.exists():
-            return set()
-        return {line.strip() for line in self.delivered_path.read_text(encoding="utf-8").splitlines() if line.strip()}
+        with self._lock:
+            raw = self._read_regular_bytes(self.delivered_path)
+            if not raw:
+                return set()
+            # Legacy authority also obeys newline commit.  A crash-written
+            # prefix must never suppress a different, shorter event key.
+            if not raw.endswith(b"\n"):
+                raw = raw[:raw.rfind(b"\n") + 1]
+            keys = [line.strip() for line in raw.decode("utf-8").split("\n") if line.strip()]
+            if any(self._EVENT_KEY_RE.fullmatch(key) is None for key in keys):
+                raise ValueError("legacy delivered.log 含非法 event_key")
+            if len(keys) != len(set(keys)):
+                raise ValueError("legacy delivered.log 含重复 event_key")
+            return set(keys)
 
-    def emit(self, event_key: str, kind: str, payload: Dict[str, Any]) -> bool:
+    def _append_line(self, path: Path, line: str) -> Tuple[int, int, int, int, int]:
+        encoded = line.encode("utf-8")
+        flags = (os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        created = False
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            try:
+                fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
+            except FileExistsError:
+                fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid()):
+                raise OSError(f"outbox append 目标身份非法: {path.name}")
+            if info.st_size + len(encoded) > self._MAX_LOG_BYTES:
+                raise OSError(f"outbox append 超过日志上限: {path.name}")
+            os.fchmod(fd, 0o600)
+            view = memoryview(encoded)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("outbox append 短写")
+                view = view[written:]
+            os.fsync(fd)
+            identity = self._fingerprint(os.fstat(fd))
+        finally:
+            os.close(fd)
+        if created:
+            self._fsync_dir()
+        return identity
+
+    def _repair_torn_jsonl_tail(
+            self, path: Path,
+    ) -> Optional[Tuple[int, int, int, int, int]]:
+        """Discard only the non-LF-committed tail, using the identity just read."""
+        data, identity = self._read_regular_snapshot(path)
+        if not data or data.endswith(b"\n"):
+            return identity
+        flags = (os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or self._fingerprint(info) != identity):
+                raise OSError(f"outbox torn-tail 修复目标身份漂移: {path.name}")
+            os.ftruncate(fd, data.rfind(b"\n") + 1)
+            os.fsync(fd)
+            return self._fingerprint(os.fstat(fd))
+        finally:
+            os.close(fd)
+
+    def _fsync_dir(self) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(self.dir, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _read_retry_document(self) -> Tuple[Dict[str, Any], Optional[Tuple[int, int, int, int, int]]]:
+        raw, identity_snapshot = self._read_regular_snapshot(
+            self.retry_path, max_bytes=1024 * 1024)
+        if identity_snapshot is None:
+            return {"version": 1, "events": {}}, identity_snapshot
+        if not raw:
+            raise ValueError("outbound_delivery_state.json 为空（原子状态文件损坏）")
+        value = _load_state_json(raw.decode("utf-8"))
+        if (not isinstance(value, dict) or set(value) != {"version", "events"}
+                or value.get("version") != 1 or not isinstance(value.get("events"), dict)):
+            raise ValueError("outbound_delivery_state.json 结构损坏")
+        for identity, entry in value["events"].items():
+            if not isinstance(identity, str) or not isinstance(entry, dict):
+                raise ValueError("outbound delivery retry entry 损坏")
+            required = {"channel", "event_key", "attempt_count", "first_failed_at",
+                        "last_attempt_at", "next_attempt_at", "last_error_kind", "last_error"}
+            channel, key = entry.get("channel"), entry.get("event_key")
+            times = (entry.get("first_failed_at"), entry.get("last_attempt_at"),
+                     entry.get("next_attempt_at"))
+            if (set(entry) != required
+                    or not isinstance(channel, str) or self._CHANNEL_RE.fullmatch(channel) is None
+                    or not isinstance(key, str) or self._EVENT_KEY_RE.fullmatch(key) is None
+                    or identity != self._delivery_identity(channel, key)
+                    or isinstance(entry.get("attempt_count"), bool)
+                    or not isinstance(entry.get("attempt_count"), int)
+                    or not 1 <= entry["attempt_count"] <= 2 ** 31 - 1
+                    or any(isinstance(item, bool) or not isinstance(item, (int, float))
+                           or not math.isfinite(float(item)) for item in times)
+                    or not isinstance(entry.get("last_error_kind"), str)
+                    or not isinstance(entry.get("last_error"), str)):
+                raise ValueError("outbound delivery retry entry 字段损坏")
+        return value, identity_snapshot
+
+    def _retry_document(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._retry_cache is None:
+                self._retry_cache, self._retry_fingerprint = self._read_retry_document()
+            else:
+                self._verify_cached_fingerprint(
+                    self.retry_path, self._retry_fingerprint,
+                    label="outbound retry state")
+            return self._retry_cache
+
+    @staticmethod
+    def _copy_retry_document(value: Dict[str, Any]) -> Dict[str, Any]:
+        return {"version": 1, "events": {
+            identity: dict(entry) for identity, entry in value["events"].items()
+        }}
+
+    def _clear_retry_cache(self) -> None:
+        self._retry_cache = None
+        self._retry_fingerprint = None
+
+    def _store_retry_document(self, value: Dict[str, Any]) -> None:
+        encoded = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                              allow_nan=False) + "\n").encode("utf-8")
+        if len(encoded) > 1024 * 1024:
+            raise OSError("outbound delivery retry state 超过字节上限")
+        temp = self.dir / (
+            f".outbound_delivery_state.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            fd = os.open(temp, flags, 0o600)
+            try:
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("delivery retry state 短写")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temp, self.retry_path)
+            self._fsync_dir()
+            self._retry_cache = value
+            self._retry_fingerprint = self._path_fingerprint(self.retry_path)
+        except BaseException as store_error:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+            self._clear_retry_cache()
+            try:
+                self._retry_document()
+            except BaseException as calibration_error:
+                add_note = getattr(store_error, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        "retry state 写入失败后的落盘校准也失败: "
+                        f"{type(calibration_error).__name__}: {calibration_error}")
+            raise
+
+    @staticmethod
+    def _delivery_identity(channel: str, event_key: str) -> str:
+        return f"{channel}\x1f{event_key}"
+
+    def _receipt_keys(self) -> set:
+        with self._lock:
+            if self._receipt_seen is not None:
+                self._verify_cached_fingerprint(
+                    self.receipts_path, self._receipt_fingerprint,
+                    label="delivery receipt log")
+                return self._receipt_seen
+            # Same discipline as the event cache: repair only while (re)binding
+            # to disk, then guard every O(1) cache lookup with a fingerprint.
+            self._repair_torn_jsonl_tail(self.receipts_path)
+            rows, identity_snapshot = self._committed_jsonl_snapshot(self.receipts_path)
+            keys = set()
+            required = {"version", "channel", "event_key", "accepted_at", "attempt_count",
+                        "delivery_id", "ack_hash"}
+            for row in rows:
+                channel, key = row.get("channel") if isinstance(row, dict) else None, \
+                    row.get("event_key") if isinstance(row, dict) else None
+                identity = (self._delivery_identity(channel, key)
+                            if isinstance(channel, str) and isinstance(key, str) else None)
+                if (not isinstance(row, dict) or set(row) != required or row.get("version") != 1
+                        or not isinstance(channel, str) or self._CHANNEL_RE.fullmatch(channel) is None
+                        or not isinstance(key, str) or self._EVENT_KEY_RE.fullmatch(key) is None
+                        or isinstance(row.get("accepted_at"), bool)
+                        or not isinstance(row.get("accepted_at"), (int, float))
+                        or not math.isfinite(float(row["accepted_at"]))
+                        or isinstance(row.get("attempt_count"), bool)
+                        or not isinstance(row.get("attempt_count"), int) or row["attempt_count"] < 1
+                        or (row.get("delivery_id") is not None
+                            and (not isinstance(row.get("delivery_id"), str)
+                                 or len(row["delivery_id"]) > 256))
+                        or not isinstance(row.get("ack_hash"), str)
+                        or re.fullmatch(r"sha256:[0-9a-f]{64}", row["ack_hash"]) is None
+                        or identity in keys):
+                    raise ValueError("delivery_receipts.jsonl committed receipt 损坏")
+                keys.add(identity)
+            self._receipt_seen = keys
+            self._receipt_fingerprint = identity_snapshot
+            return self._receipt_seen
+
+    def _clear_receipt_cache(self) -> None:
+        self._receipt_seen = None
+        self._receipt_fingerprint = None
+
+    def emit(self, event_key: str, kind: str, payload: Dict[str, Any], *,
+             channel: Optional[str] = None) -> bool:
         """幂等排队：event_key 已在队列即跳过（返回 False）。追加写单行 JSON（行内自含 event_key，
         队列文件本身即持久事件序）。"""
-        if event_key in self._queued_keys():
-            return False
-        # 尾行撕裂先修复（截掉半行）再追加：半行事件未完整落队=未 emit（重扫会补）；若不截、直接 append
-        # 会把新 JSON 粘在半行上，且半行会随后续追加变成"中段坏行"触发 fail loud
-        if self.queue_path.exists() and self.queue_path.stat().st_size > 0:
-            data = self.queue_path.read_bytes()
-            if not data.endswith(b"\n"):
-                with self.queue_path.open("rb+") as f:
-                    f.truncate(data.rfind(b"\n") + 1)     # 无任何换行 → 0 = 清空
-        with self.queue_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"event_key": event_key, "kind": kind, "payload": payload},
-                               ensure_ascii=False) + "\n")
-        self._seen.add(event_key)
-        return True
+        if not isinstance(event_key, str) or self._EVENT_KEY_RE.fullmatch(event_key) is None:
+            raise ValueError("outbox event_key 非法")
+        if self._EVENT_KEY_RE.fullmatch(f"{self.producer_id}:{event_key}") is None:
+            raise ValueError("outbox event_key 加 producer namespace 后超过线协议上限")
+        if not isinstance(kind, str) or not kind or len(kind) > 128:
+            raise ValueError("outbox kind 须为 1..128 字符")
+        if not isinstance(payload, dict):
+            raise ValueError("outbox payload 须为 object")
+        if channel is not None and (
+                not isinstance(channel, str) or self._CHANNEL_RE.fullmatch(channel) is None):
+            raise ValueError("outbox channel 非法")
+        event = {"event_key": event_key, "kind": kind, "payload": payload}
+        if channel is not None:
+            event["channel"] = channel
+        rendered = json.dumps(
+            event, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if len(rendered.encode("utf-8")) > self._MAX_EVENT_BYTES:
+            raise ValueError("outbox event 超过字节上限")
+        # Cache exactly the JSON value committed to disk, never caller-owned
+        # mutable dict/list aliases.  Otherwise one post-emit mutation could
+        # change the current-process wire payload while restart replays the
+        # original bytes under the same idempotency identity.
+        durable_event = _load_state_json(rendered)
+        with self._lock:
+            queued = self._queued_keys()
+            if event_key in queued:
+                if queued[event_key] != rendered:
+                    raise ValueError(f"outbox event_key 已绑定不同事件: {event_key}")
+                return False
+            # Cache binding already repaired any torn tail; its fingerprint
+            # check above proves no out-of-process drift before this append.
+            try:
+                identity = self._append_line(self.queue_path, rendered + "\n")
+            except BaseException as append_error:
+                # fsync may throw after the complete LF-terminated record is
+                # already durable.  Rebuild before propagating so a caller
+                # retry observes that committed key instead of appending it a
+                # second time.  A torn record remains uncommitted and will be
+                # repaired on the retry.
+                self._clear_queue_cache()
+                try:
+                    self._load_queue_cache()
+                except BaseException as calibration_error:
+                    add_note = getattr(append_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "outbox append 失败后的落盘校准也失败: "
+                            f"{type(calibration_error).__name__}: {calibration_error}")
+                raise
+            self._queue_fingerprint = identity
+            self._seen[event_key] = rendered
+            self._event_cache.append(durable_event)
+            return True
+
+    def pending_for_channel(self, channel: str, *, include_default: bool) -> List[Dict[str, Any]]:
+        """Return a stable FIFO snapshot not yet ACKed for ``channel``."""
+        if self._CHANNEL_RE.fullmatch(channel) is None:
+            raise ValueError("delivery channel 非法")
+        with self._lock:
+            receipts = self._receipt_keys()
+            legacy = self._delivered_keys()
+            pending = []
+            for event in self._queued_events():
+                target = event.get("channel")
+                if target is None:
+                    if not include_default:
+                        continue
+                elif target != channel:
+                    continue
+                key = event.get("event_key")
+                if key in legacy or self._delivery_identity(channel, key) in receipts:
+                    continue
+                pending.append(copy.deepcopy(event))
+            return pending
+
+    def delivery_retry(self, channel: str, event_key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            value = self._retry_document()["events"].get(
+                self._delivery_identity(channel, event_key))
+            return dict(value) if isinstance(value, dict) else None
+
+    def delivery_retries(self, channel: str) -> Dict[str, Dict[str, Any]]:
+        """Return one O(1)-lookup snapshot for a scheduler channel tick."""
+        if self._CHANNEL_RE.fullmatch(channel) is None:
+            raise ValueError("delivery channel 非法")
+        with self._lock:
+            result = {}
+            for entry in self._retry_document()["events"].values():
+                if entry["channel"] == channel:
+                    result[entry["event_key"]] = dict(entry)
+            return result
+
+    def reconcile_delivery_state(self) -> int:
+        """Prune retry entries already dominated by a durable remote receipt."""
+        with self._lock:
+            receipts = self._receipt_keys()
+            document = self._retry_document()
+            stale = set(document["events"]) & receipts
+            if not stale:
+                return 0
+            updated = self._copy_retry_document(document)
+            for identity in stale:
+                del updated["events"][identity]
+            self._store_retry_document(updated)
+            return len(stale)
+
+    def record_delivery_failure(self, channel: str, event: Dict[str, Any], *, attempt_count: int,
+                                next_attempt_at: float, error_kind: str, error_text: str,
+                                attempted_at: float) -> None:
+        key = event["event_key"]
+        if (self._CHANNEL_RE.fullmatch(channel) is None
+                or isinstance(attempt_count, bool) or not isinstance(attempt_count, int)
+                or not 1 <= attempt_count <= 2 ** 31 - 1
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(float(value))
+                       for value in (next_attempt_at, attempted_at))):
+            raise ValueError("delivery failure receipt 参数非法")
+        cleaned = "".join(ch for ch in str(error_text) if ord(ch) >= 0x20 and ord(ch) != 0x7f)
+        with self._lock:
+            document = self._copy_retry_document(self._retry_document())
+            identity = self._delivery_identity(channel, key)
+            previous = document["events"].get(identity, {})
+            document["events"][identity] = {
+                "channel": channel,
+                "event_key": key,
+                "attempt_count": int(attempt_count),
+                "first_failed_at": previous.get("first_failed_at", float(attempted_at)),
+                "last_attempt_at": float(attempted_at),
+                "next_attempt_at": float(next_attempt_at),
+                "last_error_kind": str(error_kind)[:128],
+                "last_error": cleaned[:self._MAX_ERROR_CHARS],
+            }
+            self._store_retry_document(document)
+
+    def record_delivery_success(self, channel: str, event: Dict[str, Any], *, ack: Dict[str, Any],
+                                accepted_at: float) -> None:
+        key = event["event_key"]
+        if (self._CHANNEL_RE.fullmatch(channel) is None
+                or isinstance(accepted_at, bool) or not isinstance(accepted_at, (int, float))
+                or not math.isfinite(float(accepted_at))):
+            raise ValueError("delivery success accepted_at 非法")
+        if (not isinstance(ack, dict) or ack.get("accepted") is not True
+                or ack.get("producer_id") != self.producer_id
+                or ack.get("event_key") != key):
+            raise ValueError("connector success ACK 非法")
+        delivery_id = ack.get("delivery_id")
+        if delivery_id is not None and (
+                not isinstance(delivery_id, str) or len(delivery_id) > 256):
+            raise ValueError("connector success delivery_id 非法")
+        ack_bytes = json.dumps(
+            ack, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        if len(ack_bytes) > 16 * 1024:
+            raise ValueError("connector ACK 超过本地回执上限")
+        with self._lock:
+            identity = self._delivery_identity(channel, key)
+            receipts = self._receipt_keys()
+            if identity in receipts:
+                return
+            retry_document = self._retry_document()
+            retry = retry_document["events"].get(identity, {})
+            receipt = {
+                "version": 1,
+                "channel": channel,
+                "event_key": key,
+                "accepted_at": float(accepted_at),
+                "attempt_count": int(retry.get("attempt_count", 0)) + 1,
+                "delivery_id": delivery_id,
+                "ack_hash": "sha256:" + hashlib.sha256(ack_bytes).hexdigest(),
+            }
+            try:
+                receipt_identity = self._append_line(
+                    self.receipts_path,
+                    json.dumps(receipt, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"), allow_nan=False) + "\n",
+                )
+            except BaseException as append_error:
+                self._clear_receipt_cache()
+                try:
+                    self._receipt_keys()
+                except BaseException as calibration_error:
+                    add_note = getattr(append_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "receipt append 失败后的落盘校准也失败: "
+                            f"{type(calibration_error).__name__}: {calibration_error}")
+                raise
+            self._receipt_fingerprint = receipt_identity
+            receipts.add(identity)
+            # Receipt is the success authority.  If state cleanup crashes, the
+            # receipt still suppresses replay on restart.
+            if identity in retry_document["events"]:
+                updated = self._copy_retry_document(retry_document)
+                del updated["events"][identity]
+                self._store_retry_document(updated)
 
     def deliver_pending(self, connector) -> List[str]:
         """把未投递事件按队列序经 connector.send 发出；成功一条标记一条（append delivered.log）。
         send 与标记之间崩溃 → 该条重发（at-least-once；接收端按 event_key 去重）。send 抛错则中断
         （后续事件保持未投递，下次续投——不吞错、不乱序跳发）。返回本次投出的 event_key 序列。"""
-        done = self._delivered_keys()
-        sent: List[str] = []
-        with self.delivered_path.open("a", encoding="utf-8") as marker:
+        with self._legacy_delivery_lock:
+            with self._lock:
+                self._repair_torn_jsonl_tail(self.delivered_path)
+            done = self._delivered_keys()
+            sent: List[str] = []
             for ev in self._events():
                 if ev["event_key"] in done:
                     continue
-                connector.send(ev)                      # 抛错即中断，本条未标记 → 下次重试
-                marker.write(ev["event_key"] + "\n")
-                marker.flush()
+                outbound_event = copy.deepcopy(ev)
+                outbound_event["producer_id"] = self.producer_id
+                connector.send(outbound_event)          # 抛错即中断，本条未标记 → 下次重试
+                with self._lock:
+                    self._append_line(self.delivered_path, ev["event_key"] + "\n")
+                done.add(ev["event_key"])
                 sent.append(ev["event_key"])
-        return sent
+            return sent
 
 
 # ------------------------------------------------------- directive notifier --
@@ -218,6 +906,184 @@ class DirectiveNotifier:
             for ev in _directive_state_events(row):
                 if self.outbox.emit(ev["event_key"], ev["kind"], ev["payload"]):
                     new_keys.append(ev["event_key"])
+        return new_keys
+
+
+# ------------------------------------------------------ interaction notifier --
+
+class InteractionNotifier:
+    """Derive outbound ACK/query/clarification events from append-only interaction truth.
+
+    Directive/note messages are already covered by ``DirectiveNotifier``.  This
+    scanner owns query and unclear messages, including every durable
+    ``interaction_reply``.  Events target the source connector, so a web-console
+    query remains local while a QQ query returns to QQ instead of leaking across
+    channels.
+    """
+
+    _ACTION_SESSION_REFS = {DIRECTIVE_ACTION_SESSION_REF, FILE_REQUEST_ACTION_SESSION_REF}
+
+    def __init__(self, daemon: WriteDaemon, outbox: Outbox):
+        self.daemon = daemon
+        self.outbox = outbox
+
+    def scan(self) -> List[str]:
+        rows = self.daemon.query(
+            "SELECT m.id,m.connector,m.conversation_id,m.session_ref,c.intent,"
+            "r.id,r.reply_ref,r.reply_text,r.snapshot_cycle,r.responder_kind "
+            "FROM interaction_message m "
+            "JOIN interaction_classification c ON c.message_id=m.id "
+            "LEFT JOIN interaction_reply r ON r.message_id=m.id "
+            "WHERE c.intent IN ('query','unclear') ORDER BY m.id,r.id")
+        new_keys: List[str] = []
+        received = set()
+        unclear = set()
+        for (mid, connector, conversation_id, session_ref, intent,
+             reply_id, reply_ref, reply_text, snapshot_cycle, responder_kind) in rows:
+            if mid not in received:
+                received.add(mid)
+                key = f"interaction:{mid}:received"
+                if self.outbox.emit(
+                        key, "interaction_received",
+                        {"message_id": mid, "intent": intent,
+                         "conversation_id": conversation_id}, channel=connector):
+                    new_keys.append(key)
+            if (intent == "unclear" and mid not in unclear
+                    and session_ref not in self._ACTION_SESSION_REFS):
+                unclear.add(mid)
+                key = f"interaction:{mid}:unclear"
+                if self.outbox.emit(
+                        key, "interaction_unclear",
+                        {"message_id": mid, "conversation_id": conversation_id},
+                        channel=connector):
+                    new_keys.append(key)
+            if reply_id is not None:
+                key = f"interaction:{mid}:reply:{reply_id}"
+                text = reply_text if isinstance(reply_text, str) else f"回复制品：{reply_ref}"
+                if self.outbox.emit(
+                        key, "interaction_reply",
+                        {"message_id": mid, "reply_id": reply_id, "reply_ref": reply_ref,
+                         "reply_text": text,
+                         "snapshot_cycle": f"c{snapshot_cycle}" if snapshot_cycle else None,
+                         "responder_kind": responder_kind,
+                         "conversation_id": conversation_id},
+                        channel=connector):
+                    new_keys.append(key)
+        return new_keys
+
+
+# --------------------------------------------------------- research notifier --
+
+class ResearchNotifier:
+    """Derive the remaining §4.6.6 research notification matrix.
+
+    Terminal cycle/target facts are immutable.  ``answer_applicability`` is
+    intentionally mutable, so its event key includes a canonical state hash;
+    a later restriction or contradiction cannot collide with the earlier
+    notification while an identical rescan remains idempotent.
+    """
+
+    def __init__(self, daemon: WriteDaemon, outbox: Outbox, audit_cadence_k: int):
+        if isinstance(audit_cadence_k, bool) or not isinstance(audit_cadence_k, int) \
+                or audit_cadence_k < 1:
+            raise ValueError("audit_cadence_k 须为正整数")
+        self.daemon = daemon
+        self.outbox = outbox
+        self.audit_cadence_k = audit_cadence_k
+
+    @staticmethod
+    def _bounded_text(value: Any, max_chars: int = 4096) -> Tuple[Optional[str], Optional[str]]:
+        if value is None:
+            return None, None
+        text = str(value)
+        digest = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if len(text) <= max_chars:
+            return text, digest
+        return text[:max_chars] + "…（通知投影已截断，完整值见 DB）", digest
+
+    def scan(self) -> List[str]:
+        events: List[Dict[str, Any]] = []
+        for (cycle_id, goal_id, goal_ver, route, question_id, failure_kind) in self.daemon.query(
+                "SELECT id,goal_id,goal_ver,route,active_question_id,failure_kind "
+                "FROM cycle WHERE status='failed' ORDER BY id"):
+            failure_preview, failure_hash = self._bounded_text(failure_kind, 512)
+            events.append({
+                "event_key": f"cycle:{cycle_id}:failed",
+                "kind": "cycle_failed",
+                "payload": {
+                    "cycle_id": f"c{cycle_id}", "goal_id": goal_id, "goal_ver": goal_ver,
+                    "route": route, "active_question_id": (
+                        f"q{question_id}" if question_id is not None else None),
+                    "failure_kind": failure_preview, "failure_kind_hash": failure_hash,
+                    "summary_md": f"轮次 c{cycle_id} 失败；失败类型：{failure_preview or '未分类'}。",
+                },
+            })
+        for (target_id, cycle_id, question_id, target_kind, seq, failure_kind) in self.daemon.query(
+                "SELECT id,cycle_id,question_id,target_kind,seq,failure_kind FROM build_target "
+                "WHERE status='engineering_blocked' ORDER BY id"):
+            failure_preview, failure_hash = self._bounded_text(failure_kind, 512)
+            events.append({
+                "event_key": f"build_target:{target_id}:engineering_blocked",
+                "kind": "engineering_blocked",
+                "payload": {
+                    "build_target_id": target_id, "cycle_id": f"c{cycle_id}",
+                    "question_id": f"q{question_id}" if question_id is not None else None,
+                    "target_kind": target_kind, "seq": seq,
+                    "failure_kind": failure_preview, "failure_kind_hash": failure_hash,
+                    "summary_md": (
+                        f"构建目标 #{target_id}（c{cycle_id} 第 {seq} 项）遇到工程阻塞，"
+                        "需要人工检查环境后由后续轮建立新 target。"),
+                },
+            })
+        for (cycle_id, goal_id, goal_ver, status, route, question_id,
+             cost_total, next_intent) in self.daemon.query(
+                "SELECT id,goal_id,goal_ver,status,route,active_question_id,cost_total,next_intent "
+                "FROM cycle WHERE status IN ('done','failed','aborted') AND (id % ?)=0 ORDER BY id",
+                (self.audit_cadence_k,)):
+            events.append({
+                "event_key": f"cycle:{cycle_id}:summary",
+                "kind": "cycle_summary",
+                "payload": {
+                    "cycle_id": f"c{cycle_id}", "goal_id": goal_id, "goal_ver": goal_ver,
+                    "status": status, "route": route,
+                    "active_question_id": f"q{question_id}" if question_id is not None else None,
+                    "cost_total": cost_total, "next_intent": next_intent,
+                    "summary_md": (
+                        f"周期摘要：c{cycle_id} 状态 {status}，路线 {route or '未定'}，"
+                        f"下一意图 {next_intent or '未定'}。"),
+                },
+            })
+        for (answer_id, goal_id, goal_ver, audit_cycle, status, rationale,
+             spawned_question_id, question_id) in self.daemon.query(
+                "SELECT aa.answer_id,aa.goal_id,aa.goal_ver,aa.audit_cycle,aa.status,"
+                "aa.rationale_md,aa.spawned_question_id,a.question_id "
+                "FROM answer_applicability aa JOIN answer a ON a.id=aa.answer_id "
+                "WHERE aa.status IN ('blocked','needs_revalidation','obsolete','contradicted') "
+                "ORDER BY aa.answer_id,aa.goal_id,aa.goal_ver"):
+            rationale_preview, rationale_hash = self._bounded_text(rationale)
+            payload = {
+                "answer_id": answer_id, "question_id": f"q{question_id}",
+                "goal_id": goal_id, "goal_ver": goal_ver,
+                "audit_cycle": f"c{audit_cycle}" if audit_cycle is not None else None,
+                "status": status, "rationale_md": rationale_preview,
+                "rationale_hash": rationale_hash,
+                "spawned_question_id": (
+                    f"q{spawned_question_id}" if spawned_question_id is not None else None),
+                "summary_md": (
+                    f"旧结论 #{answer_id} 在目标 v{goal_ver} 的适用性变为 {status}："
+                    f"{(rationale_preview or '未提供理由')[:1200]}"),
+            }
+            canonical = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+            events.append({
+                "event_key": f"applicability:{answer_id}:{goal_id}:{goal_ver}:{digest}",
+                "kind": "answer_applicability_changed", "payload": payload,
+            })
+        new_keys: List[str] = []
+        for event in events:
+            if self.outbox.emit(event["event_key"], event["kind"], event["payload"]):
+                new_keys.append(event["event_key"])
         return new_keys
 
 
@@ -1191,6 +2057,30 @@ class FileRequestNotifier:
         self.outbox = outbox
         self.remind_interval_s = remind_interval_h * 3600
 
+    @staticmethod
+    def _safe_resolution_summary(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Project completion counts only; never export file paths/previews/user data."""
+        if raw is None:
+            return None
+        value = _load_state_json(raw)
+        if isinstance(value, dict) and value.get("cancelled") is True:
+            return {"cancelled": True, "item_count": 0,
+                    "provided_file_count": 0, "unavailable_item_count": 0}
+        if not isinstance(value, list):
+            raise ValueError("interaction_request resolution_json 结构损坏")
+        provided = 0
+        unavailable = 0
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("interaction_request resolution item 结构损坏")
+            assets = item.get("provided")
+            if isinstance(assets, list):
+                provided += len(assets)
+            if "unavailable" in item:
+                unavailable += 1
+        return {"cancelled": False, "item_count": len(value),
+                "provided_file_count": provided, "unavailable_item_count": unavailable}
+
     def scan(self, now_ts: float) -> List[str]:
         new_keys: List[str] = []
         rows = self.daemon.query(
@@ -1209,10 +2099,13 @@ class FileRequestNotifier:
                                                   {**base, "waited_intervals": tier}):
                     new_keys.append(f"filereq:{rid}:reminder:{tier}")
             else:
-                if self.outbox.emit(f"filereq:{rid}:resolved", "file_request_resolved",
+                # v2 removes resolution paths/previews from the wire payload.
+                # Versioning the key avoids same-key/different-body collision
+                # when upgrading a work-root that already queued legacy v1.
+                if self.outbox.emit(f"filereq:{rid}:resolved:v2", "file_request_resolved",
                                     {**base, "status": status,
-                                     "resolution": json.loads(resolution) if resolution else None}):
-                    new_keys.append(f"filereq:{rid}:resolved")
+                                     "resolution_summary": self._safe_resolution_summary(resolution)}):
+                    new_keys.append(f"filereq:{rid}:resolved:v2")
         return new_keys
 
 
