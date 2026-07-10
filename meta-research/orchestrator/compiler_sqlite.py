@@ -26,7 +26,7 @@ from .budgeting import compute_budget
 from .ids import cnum as _cnum
 from .interfaces import ContextPack, Stage, StageBlockedOnResources
 from .resource_limits import (MAX_ASSETS_PER_GOAL, MAX_FILE_REQUESTS_PER_GOAL,
-                              MAX_REQUEST_ITEMS)
+                              MAX_REASONING_DIRECTIVES_PER_CYCLE, MAX_REQUEST_ITEMS)
 
 _MAX_CONTEXT_ASSETS = MAX_ASSETS_PER_GOAL
 _MAX_CONTEXT_ASSETS_TOTAL = MAX_ASSETS_PER_GOAL
@@ -45,6 +45,7 @@ _MAX_FAILURE_REASON_BYTES = 512
 _MAX_DEST_HINT_BYTES = 256
 _MAX_TERMINAL_REASON_BYTES = 512
 _MAX_REQUEST_HASH_BYTES = 128
+_MAX_DIRECTIVE_POLISHED_BYTES = 2_000
 
 
 def _bounded_utf8(value: Any, limit: int, *, label: str) -> tuple[str, bool]:
@@ -214,6 +215,7 @@ class SqliteCompiler:
         elif stage == "reasoning":
             parts.append(f"## 目标全文（当前版 v{goal_ver}）\n{self.goal_body_md}")
             sources.append("input:goal_brief.md")
+            parts.append(self._reasoning_directives(ci, sources))
             parts.append(self._closed_conclusions(goal_id, goal_ver, sources))
             parts.append(self._open_set(aq, goal_id, sources))
             parts.append(self._observation_summary(ci, sources))
@@ -223,6 +225,49 @@ class SqliteCompiler:
                  "tau": self.policy["flow"]["tau"]}, ensure_ascii=False, sort_keys=True) + "\n```")
             sources.append("policy:acquisition")
         return "\n\n".join(p for p in parts if p)
+
+    def _reasoning_directives(self, cycle_id: int, sources: List[str]) -> str:
+        """Render directives actually consumed for this reasoning boundary.
+
+        ``note`` would otherwise be marked consumed without ever reaching its
+        intended consumer.  The fixed cap fails loudly instead of silently
+        dropping human control input from a successful ContextPack.
+        """
+        rows = self.conn.execute(
+            "SELECT id,kind,hardness,payload_json FROM directive "
+            "WHERE status='consumed' AND consumed_cycle=? AND consume_at='reasoning_start' "
+            "ORDER BY id LIMIT ?",
+            (cycle_id, MAX_REASONING_DIRECTIVES_PER_CYCLE + 1)).fetchall()
+        if len(rows) > MAX_REASONING_DIRECTIVES_PER_CYCLE:
+            raise RuntimeError(
+                f"cycle c{cycle_id} consumed directive 超过 {MAX_REASONING_DIRECTIVES_PER_CYCLE}，"
+                "拒绝静默截断人类控制输入")
+        rendered = []
+        for directive_id, kind, hardness, payload_raw in rows:
+            try:
+                payload = json.loads(payload_raw)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"directive d{directive_id} payload_json 损坏") from error
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"directive d{directive_id} payload_json 须为 object")
+            polished, _ = _bounded_utf8(
+                payload.get("polished", ""), _MAX_DIRECTIVE_POLISHED_BYTES,
+                label=f"directive d{directive_id}.polished")
+            item: Dict[str, Any] = {
+                "directive_id": f"d{directive_id}", "kind": kind,
+                "hardness": hardness, "polished": polished,
+            }
+            for key in ("question_id", "mode", "adjust"):
+                value = payload.get(key)
+                if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                    item[key] = value
+            rendered.append(item)
+            sources.append(f"db:directive:{directive_id}")
+        if not rendered:
+            return "## 本轮已消费人类 directive\n（无）"
+        return ("## 本轮已消费人类 directive（按 id 顺序；硬指令必须执行，软指令不从须在选择理由中说明）\n"
+                "```json\n" + json.dumps(
+                    rendered, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n```")
 
     def _input_asset_receipts(self, goal_id, goal_ver, cycle_id, stage, sources, refs) -> str:
         """渲染同 ``goal`` 的最新文件请求回执（跨 version/cycle/stage 固定资产）。

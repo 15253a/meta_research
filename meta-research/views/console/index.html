@@ -1065,6 +1065,170 @@ const NARR_TOPICS = [
 ];
 /* ============================ 渲染层 ============================ */
 const HEADLESS = (typeof window === "undefined");   // node stub 冒烟环境
+const CAPABILITY_STORAGE_KEY = "meta_research_console_capability";
+const IDEMPOTENCY_STORAGE_KEY = "meta_research_console_pending_posts_v1";
+const API_TIMEOUT_MS = 10000;
+const SNAPSHOT_MAX_AGE_MS = 10000;
+const DEMO_MODE = !HEADLESS && new URLSearchParams(window.location.search||"").get("demo")==="1";
+let _consoleCapability = null;
+let _capabilityErrorShown = false;
+let _consoleReady = DEMO_MODE;
+let _lastDbSuccessAt = null;
+
+function _clearCapabilityFragment(){
+  if(HEADLESS) return true;
+  if(!window.location || !window.history) return false;
+  if(!window.location.hash) return true;
+  try{
+    window.history.replaceState(null, document.title, window.location.pathname+window.location.search);
+    return true;
+  }catch(e){ return false; }                                   // 不能从地址栏清掉 capability 时拒绝使用它
+}
+function bootstrapConsoleCapability(){
+  if(HEADLESS) return null;
+  let fragmentToken=null, fragmentPresent=false;
+  try{
+    const raw=(window.location.hash||"").replace(/^#/,"");
+    const params=new URLSearchParams(raw);
+    const values=params.getAll("token"); fragmentPresent=values.length>0;
+    if(values.length===1 && /^[0-9a-f]{64}$/.test(values[0])) fragmentToken=values[0];
+    if(!_clearCapabilityFragment()) fragmentToken=null;      // fragment 不发送给 server；读取后也不留在地址栏/历史项
+    if(fragmentToken) window.sessionStorage.setItem(CAPABILITY_STORAGE_KEY, fragmentToken);
+    else if(fragmentPresent) window.sessionStorage.removeItem(CAPABILITY_STORAGE_KEY);
+    const stored=fragmentToken||window.sessionStorage.getItem(CAPABILITY_STORAGE_KEY);
+    if(stored && /^[0-9a-f]{64}$/.test(stored)) _consoleCapability=stored;
+    else { window.sessionStorage.removeItem(CAPABILITY_STORAGE_KEY); _consoleCapability=null; }
+  }catch(e){
+    _clearCapabilityFragment(); _consoleCapability=null;            // storage 不可用则 fail closed，不另造隐式持久/内存通道
+  }
+  return _consoleCapability;
+}
+function clearConsoleCapability(){
+  _consoleCapability=null;
+  if(!HEADLESS){ try{ window.sessionStorage.removeItem(CAPABILITY_STORAGE_KEY); }catch(e){} }
+}
+function showCapabilityError(){
+  if(_capabilityErrorShown || HEADLESS) return;
+  _capabilityErrorShown=true;
+  const msg="控制台 API 需要 capability；请用 server 提供的 #token=… 地址重新打开本页。";
+  showConnectionGuard(msg);
+  toast(msg);
+  emitEvent({k:"notify", text:msg});
+}
+function showConnectionGuard(message){
+  if(HEADLESS || DEMO_MODE) return;
+  _consoleReady=false;
+  let guard=document.getElementById("console-connection-guard");
+  if(!guard){
+    guard=document.createElement("div"); guard.id="console-connection-guard";
+    guard.style.cssText="position:fixed;inset:0;z-index:99999;background:rgba(12,16,22,.96);color:#f4f7fb;display:flex;align-items:center;justify-content:center;padding:32px;text-align:center;font:600 16px/1.7 system-ui;white-space:pre-wrap";
+    document.body.appendChild(guard);
+  }
+  const age=_lastDbSuccessAt==null?"尚未取得真实快照":("上次真实快照距今 "+Math.max(0,Math.round((Date.now()-_lastDbSuccessAt)/1000))+" 秒");
+  guard.textContent=message+"\n"+age+"\n控制动作已禁用；不会显示或操作内嵌演示状态。";
+  guard.style.display="flex";
+}
+function clearConnectionGuard(){
+  if(HEADLESS || DEMO_MODE) return;
+  const guard=document.getElementById("console-connection-guard"); if(guard) guard.style.display="none";
+  _consoleReady=true;
+}
+function snapshotIsFresh(){
+  return _lastDbSuccessAt!=null && (Date.now()-_lastDbSuccessAt)<=SNAPSHOT_MAX_AGE_MS;
+}
+function markConsoleSnapshotFresh(){
+  _lastDbSuccessAt=Date.now(); clearConnectionGuard();
+}
+function enforceSnapshotFreshness(){
+  if(HEADLESS || DEMO_MODE) return;
+  if(!snapshotIsFresh()) showConnectionGuard("真实状态快照已过期或尚未取得。");
+}
+async function apiFetch(url, options){
+  if(typeof url!=="string" || !/^\/api(?:[/?]|$)/.test(url)) throw new Error("apiFetch 只允许同源 /api 路径");
+  if(!_consoleCapability){ showCapabilityError(); throw new Error("console capability required"); }
+  const opts=Object.assign({}, options||{}), headers=new Headers(opts.headers||{});
+  if(headers.has("Authorization")) throw new Error("Authorization 由 apiFetch 管理");
+  if(opts.signal) throw new Error("AbortSignal 由 apiFetch 管理");
+  headers.set("Authorization", "Bearer "+_consoleCapability);
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),API_TIMEOUT_MS);
+  let response;
+  try{
+    response=await fetch(url, Object.assign(opts, {
+      headers:headers, signal:controller.signal, credentials:"omit", redirect:"error",
+      referrerPolicy:"no-referrer", cache:"no-store"
+    }));
+  }catch(e){
+    showConnectionGuard("控制台 API 网络错误："+(e&&e.message?e.message:String(e)));
+    throw e;
+  }finally{ clearTimeout(timeout); }
+  if(response.status===401){ clearConsoleCapability(); showCapabilityError(); }
+  else if(response.status>=500) showConnectionGuard("控制台 API 返回 HTTP "+response.status+"。");
+  return response;
+}
+function _pendingPostMap(){
+  let value;
+  try{ value=JSON.parse(window.sessionStorage.getItem(IDEMPOTENCY_STORAGE_KEY)||"{}"); }
+  catch(e){ value={}; }
+  if(!value || typeof value!=="object" || Array.isArray(value)) return {};
+  const valid={};
+  Object.entries(value).forEach(([operation,key])=>{
+    try{
+      const parsed=JSON.parse(operation);
+      if(Array.isArray(parsed)&&parsed.length===2&&typeof parsed[0]==="string"&&/^\/api(?:[/?]|$)/.test(parsed[0])
+          && /^[0-9a-f]{32}$/.test(key||"")) valid[operation]=key;
+    }catch(e){}
+  });
+  return valid;
+}
+function _newIdempotencyKey(){
+  if(HEADLESS || !window.crypto || !window.crypto.getRandomValues) throw new Error("浏览器缺少安全随机源");
+  const bytes=new Uint8Array(16); window.crypto.getRandomValues(bytes);
+  return Array.from(bytes,b=>b.toString(16).padStart(2,"0")).join("");
+}
+function _postOperationKey(url,payload){
+  if(typeof url!=="string" || !/^\/api(?:[/?]|$)/.test(url)) throw new Error("apiPost 只允许同源 /api 路径");
+  return JSON.stringify([url,payload]);
+}
+function _idempotencyKeyFor(url,payload){
+  const operation=_postOperationKey(url,payload), pending=_pendingPostMap();
+  let key=pending[operation];
+  if(!key){
+    if(Object.keys(pending).length>=64){
+      window.sessionStorage.setItem(IDEMPOTENCY_STORAGE_KEY,JSON.stringify(pending)); // 先清理格式非法项，但绝不淘汰未决请求
+      throw new Error("未决控制请求已达 64 条；请先确认或恢复连接");
+    }
+    key=_newIdempotencyKey();
+  }
+  pending[operation]=key;
+  window.sessionStorage.setItem(IDEMPOTENCY_STORAGE_KEY,JSON.stringify(pending));
+  if(_pendingPostMap()[operation]!==key) throw new Error("Idempotency-Key 未能持久化");
+  return {operation,key};
+}
+function _clearPostKey(operation,key){
+  try{
+    const pending=_pendingPostMap();
+    if(pending[operation]===key){ delete pending[operation]; window.sessionStorage.setItem(IDEMPOTENCY_STORAGE_KEY,JSON.stringify(pending)); }
+  }catch(e){}
+}
+async function apiPost(url,payload){
+  if(DEMO_MODE) throw new Error("demo 模式不发送控制请求");
+  if(!_consoleReady || !snapshotIsFresh()){
+    showConnectionGuard("真实状态快照已过期，拒绝发送控制请求。");
+    throw new Error("fresh console snapshot required");
+  }
+  const pending=_idempotencyKeyFor(url,payload);
+  const response=await apiFetch(url,{method:"POST",headers:{"Content-Type":"application/json","Idempotency-Key":pending.key},body:JSON.stringify(payload)});
+  let body=null; try{ body=await response.json(); }catch(e){}
+  const echoed=body&&body.queued&&body.queued.idempotency_key;
+  if((response.ok&&echoed==="console-"+pending.key)||(response.status>=400&&response.status<500))
+    _clearPostKey(pending.operation,pending.key);                // network/5xx may follow durable append: retain key
+  return {response,body};
+}
+if(!HEADLESS){
+  if(DEMO_MODE) _clearCapabilityFragment();
+  else bootstrapConsoleCapability();
+}
 const state = {
   tab:"tree", scenario:"running",
   selQ:13, selB:4, selCycle:19, selA:6,
@@ -1088,8 +1252,14 @@ const mr = id => DB.metric_result.find(x=>x.id===id);
 const md = id => DB.metric_def.find(x=>x.id===id);
 const an = id => DB.answer.find(x=>x.id===id);
 const cy = id => DB.cycle.find(x=>x.id===id);
+const proto = (id,ver) => (DB.protocol||[]).find(x=>x.id===id&&x.version===ver);
+const protoLabel = e => {
+  if(!e) return "—";
+  const p=proto(e.protocol_id,e.protocol_ver);
+  return p ? (p.name+"@"+p.version) : ("protocol#"+e.protocol_id+"@"+e.protocol_ver);
+};
 
-const chip = (cls,txt,dot) => '<span class="chip '+cls+'">'+(dot?'<span class="dot '+dot+'"></span>':'')+txt+'</span>';
+const chip = (cls,txt,dot) => '<span class="chip '+esc(cls)+'">'+(dot?'<span class="dot '+esc(dot)+'"></span>':'')+esc(txt)+'</span>';
 const mono = s => '<span class="mono">'+esc(s)+'</span>';
 
 const Q_CHIP = {
@@ -1122,14 +1292,14 @@ function appBadge(row){
   let extra = "";
   if(row.status==="needs_revalidation" && row.spawned_question_id){ const sq=q(row.spawned_question_id); extra = " → Q"+row.spawned_question_id+"("+sq.status+")"; }
   if(row.status==="contradicted" && row.spawned_question_id){ extra = " ← Q"+row.spawned_question_id; }
-  return '<span class="appb '+cls+'">适用性@v2 · '+row.status+esc(extra)+'</span>';
+  return '<span class="appb '+esc(cls||"pending")+'">适用性@v'+esc(row.goal_ver==null?"?":row.goal_ver)+' · '+esc(row.status)+esc(extra)+'</span>';
 }
 const appRowOf = answerId => DB.answer_applicability.find(a=>a.answer_id===answerId);
 
 function metricLine(m){
   const def = md(m.metric_id);
   const v = def.name==="throughput_tok_s" ? (m.value/1000).toFixed(1)+"k" : m.value;
-  return mono(def.name+"@"+m.metric_ver)+' = <b class="num">'+v+'</b>'+(def.unit?' <span class="small">'+esc(def.unit)+'</span>':'')+' <span class="small">('+m.scope+')</span>';
+  return mono(def.name+"@"+m.metric_ver)+' = <b class="num">'+esc(v)+'</b>'+(def.unit?' <span class="small">'+esc(def.unit)+'</span>':'')+' <span class="small">('+esc(m.scope)+')</span>';
 }
 
 const IDEA_NOTES = {
@@ -1144,8 +1314,14 @@ const simNote = s => '<span class="lognote" style="color:var(--sub);border-color
 /* ============ 画布顶部概览带(status_card ⇄ live 压缩;替代旧总览页) ============ */
 function bandHTML(){
   const sc = DB.status_card||{}, scen = SCENARIOS[state.scenario];
+  const activeQuestionText=String(sc.active_question==null?"":sc.active_question);
+  const activeQuestionNumber=Number(activeQuestionText);
+  const activeQuestionId=/^[1-9]\d*$/.test(activeQuestionText)&&Number.isSafeInteger(activeQuestionNumber)
+    ?activeQuestionNumber:null;
   const scenBit = state.scenario==="awaiting_user"
     ? `${chip("c-warn","等待用户供给"+(sc.pending_request&&sc.pending_request.request_id!=null?(" r"+sc.pending_request.request_id):""))}${LIVE_MODE?"":` <button class="btn" style="padding:1px 9px;font-size:11px" onclick="provideR2()">模拟:已放入 uploads/r2/</button>`}`
+    : state.scenario==="paused"
+    ? chip("c-warn","人工 pause 生效中 · 等待 resume")
     : state.scenario==="idle"
     ? chip("c-dead","轮间空闲")
     : `<span class="dot acc pulse"></span><span class="num">心跳 ${esc(scen.heartbeat_age)}</span><span class="sep">·</span><span class="num">bundle ${esc(scen.cursor)}</span><span class="sep">·</span><span class="num">本轮 ${esc(scen.cost)}</span>`;
@@ -1154,10 +1330,10 @@ function bandHTML(){
     ${chip("c-ink","快照 c"+(sc.snapshot_cycle!=null?sc.snapshot_cycle:"—")+" · "+(sc.cycle_status||"—")+" · "+(sc.cycle_route||"—"))}
     <span>goal <b>${esc("v"+(sc.goal_ver!=null&&sc.goal_ver!==""?sc.goal_ver:"?"))}</b></span><span class="sep">|</span>
     <span>selection → ${mono("Q"+sc.active_question)} ${chip("c-acc",sc.selection_intent)}</span><span class="sep">|</span>
-    <span class="num">open <b>${sc.open_count}</b> / incl <b>${sc.inconclusive_count}</b></span><span class="sep">|</span>
-    <span class="num">B(t) <b>$${DB.budget.B_t}</b> · 全局余 ${DB.budget.global_remaining!=null?("$"+DB.budget.global_remaining):"—"}</span><span class="sep">|</span>
+    <span class="num">open <b>${esc(sc.open_count)}</b> / incl <b>${esc(sc.inconclusive_count)}</b></span><span class="sep">|</span>
+    <span class="num">B(t) <b>$${esc(DB.budget.B_t)}</b> · 全局余 ${DB.budget.global_remaining!=null?("$"+esc(DB.budget.global_remaining)):"—"}</span><span class="sep">|</span>
     <span class="eyebrow">live</span>${scenBit}<span class="sep">|</span>
-    <span class="small">active</span>${(sc.active_question&&sc.active_question!=="—")?`<a href="javascript:go('tree',${parseInt(sc.active_question,10)||("'"+sc.active_question+"'")})" class="chip c-acc">Q${esc(String(sc.active_question))}→active</a>`:'<span class="small">—</span>'}
+    <span class="small">active</span>${activeQuestionId!=null?`<a href="javascript:go('tree',${activeQuestionId})" class="chip c-acc">Q${esc(activeQuestionText)}→active</a>`:'<span class="small">—</span>'}
     <span class="hint">单击=详情 · 双击=复盘 · 拖拽/滚轮 · F=适配</span>
   </div>`;
 }
@@ -1400,6 +1576,7 @@ function qDetail(id){
   const deps = DB.question_dep.filter(d=>d.question_id===id);
   const evs = a ? DB.evidence.filter(e=>e.answer_id===a.id) : [];
   const decs = DB.decision.filter(d=>d.summary.includes("Q"+id)||d.cycle_id===x.closed_cycle&&d.type==="answer");
+  const pruneDec = DB.decision.find(d=>d.question_id===id&&d.type==="prune_branch");
   return `
   <section class="card">
     <h3>问题卡 ${mono("Q"+id)} <span class="en">card_md · ≤200 tok</span>${Q_CHIP[x.status]()}</h3>
@@ -1411,7 +1588,7 @@ function qDetail(id){
       <dt>score / est_cost</dt><dd class="num">${x.score??"—"} / $${x.est_cost}</dd>
       ${deps.length?'<dt>question_dep</dt><dd>'+deps.map(d=>mono(d.dep_type==="question"?("→ Q"+d.depends_on_question_id):("→ baseline "+bl(d.depends_on_baseline_id).slug))+" "+chip(d.status==="satisfied"?"c-ok":d.status==="blocked"?"c-dead":"c-warn",d.status)).join("<br>")+"</dd>":""}
     </dl>
-    ${IDEA_NOTES[id]?'<hr class="divider"><div class="small">'+esc(IDEA_NOTES[id])+"</div>":""}
+    ${!LIVE_MODE&&IDEA_NOTES[id]?'<hr class="divider"><div class="small">'+esc(IDEA_NOTES[id])+"</div>":""}
     ${a?`<hr class="divider">
       <div><b>${a.verdict==="answered"?"结论":"反驳"}(A${a.id})</b> ${chip(a.verdict==="answered"?"c-ok":"c-bad",a.verdict)} ${app?appBadge(app):'<span class="small">(无 applicability 行 → 无徽标)</span>'}</div>
       <div style="font-size:12.5px;margin:6px 0">${esc(a.answer_md)}</div>
@@ -1419,7 +1596,7 @@ function qDetail(id){
       <div class="small" style="margin-top:6px">证据(${evs.length} 条,I3):</div>
       <ul class="tl">${evs.map(e=>`<li><span class="who">${chip("c-line",e.kind)}</span><span class="what">${e.kind==="evaluation"?metricLine(mr(e.metric_result_id))+" · "+esc(e.claim_md):esc(e.claim_md)}</span></li>`).join("")}</ul>
       <div class="small"><a href="javascript:go('evidence',${a.id})">→ 证据链详情</a></div>`
-    :x.status==="dead_end"?'<hr class="divider"><div class="small">dead_end 关闭须 decision(type=prune_branch):decision #7「两次探索无信号,机制查重命中近邻」。</div>'
+    :x.status==="dead_end"?'<hr class="divider"><div class="small">dead_end 关闭依据:'+(pruneDec?('decision #'+esc(pruneDec.id)+' '+esc(pruneDec.summary||pruneDec.type)):'未投影到对应 prune_branch decision')+'.</div>'
     :""}
     ${decs.length&&!a?'<hr class="divider"><div class="small">相关决策:'+decs.map(d=>"#"+d.id+" "+esc(d.type)).join(" · ")+"</div>":""}
   </section>`;
@@ -1433,7 +1610,7 @@ function vPool(){
   const results = (DB.metric_result||[]).filter(m=>m.scope==="aggregate").map(m=>{
     const e2=ev(m.evaluation_id), v=e2&&vr(e2.variant_id), bb=v&&bl(v.baseline_id), def=md(m.metric_id);
     return { label:(bb?bb.slug:"?")+" / "+(v?v.variant_key:"?"), metric:(def?def.name:("metric#"+m.metric_id)),
-             ver:m.metric_ver, value:m.value, proto:(e2?("lm-wt103@"+e2.protocol_ver):"—"),
+             ver:m.metric_ver, value:m.value, proto:protoLabel(e2),
              prov:(bb&&bb.provenance==="external_import")?"external_import":"self_built" };
   }).filter(r=>r.value!=null).sort((a,c)=>(a.metric<c.metric?-1:a.metric>c.metric?1:(a.value-c.value)));
   return `
@@ -1457,15 +1634,15 @@ function vPool(){
         <dt>canonical_key(I5 UNIQUE)</dt><dd>${mono(b.canonical_key)}</dd>
         <dt>能力摘要</dt><dd>${esc(b.capability_summary)}</dd>
         <dt>tag(baseline 级)</dt><dd>${b.tags.map(t=>chip("c-line",t)).join(" ")}</dd>
-        ${b.provenance==="external_import"?'<dt>import provenance</dt><dd class="mono" style="font-size:11px">manifest mfa-8e12 · revision 4b7d9aa · license_review #2(Apache-2.0 allow) · <a href="javascript:go(\'import\')">准入链</a></dd>':""}
+        ${b.provenance==="external_import"?'<dt>import provenance</dt><dd class="mono" style="font-size:11px">external_import（具体 candidate / revision / license_review 见权威导入表） · <a href="javascript:go(\'import\')">准入链</a></dd>':""}
       </dl>
       <div class="tw" style="margin-top:9px">
       <table class="t"><thead><tr><th>variant_key</th><th>status</th><th>born_question</th><th>evaluation(格子)</th><th>result_summary</th></tr></thead><tbody>
       ${DB.variant.filter(v=>v.baseline_id===b.id).map(v=>{
         const es = DB.evaluation.filter(e=>e.variant_id===v.id);
-        return `<tr><td>${mono(v.variant_key)}<div class="hash">env ${v.env_hash}</div></td><td>${BV_CHIP[v.status]}</td>
+        return `<tr><td>${mono(v.variant_key)}<div class="hash">env ${esc(v.env_hash)}</div></td><td>${BV_CHIP[v.status]}</td>
         <td>${mono("Q"+v.born_question)}</td>
-        <td>${es.map(e=>'<div class="small">'+mono("lm-wt103@"+e.protocol_ver)+' '+chip(e.status==="success"?"c-ok":e.status==="running"?"c-acc":"c-warn",e.status)+' <span class="hash">'+e.source+" · "+e.target_set_hash+'</span></div>').join("")||'<span class="small">—</span>'}</td>
+        <td>${es.map(e=>'<div class="small">'+mono(protoLabel(e))+' '+chip(e.status==="success"?"c-ok":e.status==="running"?"c-acc":"c-warn",e.status)+' <span class="hash">'+esc(e.source)+" · "+esc(e.target_set_hash)+'</span></div>').join("")||'<span class="small">—</span>'}</td>
         <td class="small">${esc(v.result_summary)}</td></tr>`;}).join("")}
       </tbody></table></div>
     </section>
@@ -1508,7 +1685,7 @@ function vCycles(){
   <p class="pagesub">稳态单元 = CYCLE;route 7 形态由编排器派生,reasoning 只产 selection 不写 route(§2.3)。研究失败(idea 不合格 / engineering_blocked)≠ 系统失败:前者 cycle=done + 问题 inconclusive,仅 reasoning 产物非法才 cycle=failed(§4.2.3)。</p>
 
   <section class="card">
-    <h3>成本 × 轮次 <span class="en">ledger by cycle</span><span style="margin-left:auto" class="small num">累计 $${DB.budget.global_spent} / 全局 $${DB.budget.global_total}</span></h3>
+    <h3>成本 × 轮次 <span class="en">ledger by cycle</span><span style="margin-left:auto" class="small num">累计 $${esc(DB.budget.global_spent)} / 全局 $${esc(DB.budget.global_total)}</span></h3>
     <div class="bars">${DB.ledger_by_cycle.map(x=>{const cc=cy(x.cycle);return `<div class="bar ${x.cycle===state.selCycle?"cur":""} ${cc&&cc.status==="failed"?"fail":""}" onclick="selC(${x.cycle})" title="c${x.cycle} $${x.money}"><i style="height:${Math.max((x.money||0)/max*100,3)}%"></i><span>${x.cycle}</span></div>`;}).join("")}</div>
   </section>
 
@@ -1529,7 +1706,7 @@ function vCycles(){
 function cycleDetail(c){
   let head = `
   <section class="card">
-    <h3>cycle ${c.id} <span class="en">${c.started_at}</span> ${routeChip(c.route)} ${BV_CHIP[c.status]||esc(c.status)}</h3>
+    <h3>cycle ${esc(c.id)} <span class="en">${esc(c.started_at)}</span> ${routeChip(c.route)} ${BV_CHIP[c.status]||esc(c.status)}</h3>
     <div class="small" style="margin-bottom:8px">${esc(c.note)}</div>
     ${c.route==="attack"||c.route==="eval_only"?stepper(c):""}
     ${DB.decision.filter(d=>d.cycle_id===c.id).map(d=>`<div class="small" style="margin-top:4px">${actorChip(d.actor)} ${mono(d.type)} — ${esc(d.summary)}</div>`).join("")}
@@ -1561,7 +1738,7 @@ function vEvidence(){
   <p class="pagesub">证据面板只渲染 answer → evidence → metric_result 链(I3);log / 观测 / 聊天永不进此面板。训练评估产物经只读视图 ${mono("v_metric_result_trajectory")} 一跳可达,供人 / 审计 / 对照——gate 的 authorizer 禁读该视图底表。</p>
   <div class="grid g12">
     <section class="card pad0" style="max-height:560px;overflow-y:auto">
-      <table class="t"><thead><tr><th>A</th><th>question</th><th>verdict</th><th>适用性@v2</th></tr></thead><tbody>
+      <table class="t"><thead><tr><th>A</th><th>question</th><th>verdict</th><th>适用性</th></tr></thead><tbody>
       ${DB.answer.map(x=>{const r=appRowOf(x.id);return `<tr class="rowbtn ${x.id===state.selA?"rowsel":""}" onclick="selA(${x.id})">
         <td class="num">A${x.id}<div class="hash">c${x.cycle_id} · v${x.goal_ver}</div></td>
         <td class="small">${mono("Q"+x.question_id)} ${esc(q(x.question_id).text.slice(0,30))}…</td>
@@ -1581,18 +1758,18 @@ function vEvidence(){
             const m=mr(e.metric_result_id), e2=ev(m.evaluation_id), a2=at(m.evaluation_attempt_id), v=vr(e2.variant_id), b=bl(v.baseline_id);
             return `<div class="statebox" style="margin-top:7px">
               ${chip("c-line","evaluation")} ${metricLine(m)}
-              <div class="hash" style="margin-top:3px">E${e2.id} ${b.slug}/${v.variant_key} · lm-wt103@${e2.protocol_ver} · source=${e2.source} · attempt#${a2.attempt_no}(${a2.purpose})${a2.suspect?' · <span style="color:var(--warn)">suspect</span>':""} · target_set_hash ${e2.target_set_hash}</div>
+              <div class="hash" style="margin-top:3px">E${esc(e2.id)} ${esc(b.slug)}/${esc(v.variant_key)} · ${esc(protoLabel(e2))} · source=${esc(e2.source)} · attempt#${esc(a2.attempt_no)}(${esc(a2.purpose)})${a2.suspect?' · <span style="color:var(--warn)">suspect</span>':""} · target_set_hash ${esc(e2.target_set_hash)}</div>
               <div class="small" style="margin-top:2px">${esc(e.claim_md)}</div>
               <div class="hash" style="margin-top:4px">v_metric_result_trajectory → eval: ${trajRefs(m,"eval")} · train: ${trajRefs(m,"train")}</div>
             </div>`;
           }
           if(e.kind==="child_answer"){
             const ca=an(e.child_answer_id);
-            return `<div class="statebox" style="margin-top:7px">${chip("c-line","child_answer")} A${ca.id}(${mono("Q"+ca.question_id)},${ca.verdict})<div class="small" style="margin-top:2px">${esc(e.claim_md)} — 须来自子树或 satisfied dep(触发器焊死)</div></div>`;
+            return `<div class="statebox" style="margin-top:7px">${chip("c-line","child_answer")} A${esc(ca.id)}(${mono("Q"+ca.question_id)},${esc(ca.verdict)})<div class="small" style="margin-top:2px">${esc(e.claim_md)} — 须来自子树或 satisfied dep(触发器焊死)</div></div>`;
           }
           return `<div class="statebox" style="margin-top:7px">${chip("c-line",e.kind)} ${esc(e.claim_md)}</div>`;
         }).join("")}
-        ${a.id===6?'<div class="callout warn" style="margin-top:9px"><b>负向过滤示例</b>:attempt#1(890.4)被 <span class="mono">parser_result_suspect</span> 拒作证据(gate decision #9);结论只回溯到复现 attempt#2 的 metric_result(905.2)。存疑只挡引用、不支持结论。</div>':""}
+        ${!LIVE_MODE&&a.id===6?'<div class="callout warn" style="margin-top:9px"><b>负向过滤示例</b>:attempt#1(890.4)被 <span class="mono">parser_result_suspect</span> 拒作证据(gate decision #9);结论只回溯到复现 attempt#2 的 metric_result(905.2)。存疑只挡引用、不支持结论。</div>':""}
       </section>
     </div>
   </div>
@@ -1621,10 +1798,10 @@ function vImport(){
     <h3>发现快照(append-only)<span class="en">external_candidate · discovered_cycle=8</span></h3>
     <div class="tw"><table class="t"><thead><tr><th>rank</th><th>canonical_uri @ revision(pinned)</th><th>license_seen</th><th>license_review</th><th>scope</th></tr></thead><tbody>
     ${DB.external_candidate.map(c=>{const lr=DB.license_review.find(l=>l.candidate_id===c.id);return `<tr>
-      <td class="num">${c.rank}</td>
-      <td>${mono(c.canonical_uri)}<div class="hash">@${c.revision} · trigger ${c.trigger_kind} · ss ${c.search_snapshot_hash} · tg ${c.trigger_snapshot_hash}</div></td>
+      <td class="num">${esc(c.rank)}</td>
+      <td>${mono(c.canonical_uri)}<div class="hash">@${esc(c.revision)} · trigger ${esc(c.trigger_kind)} · ss ${esc(c.search_snapshot_hash)} · tg ${esc(c.trigger_snapshot_hash)}</div></td>
       <td>${mono(c.license_id_seen)}</td>
-      <td>${chip(lr.decision==="allow"?"c-ok":lr.decision==="deny"?"c-bad":"c-warn",lr.decision)} <span class="small">${lr.actor}</span>${lr.note?'<div class="small">'+esc(lr.note)+"</div>":""}</td>
+      <td>${chip(lr.decision==="allow"?"c-ok":lr.decision==="deny"?"c-bad":"c-warn",lr.decision)} <span class="small">${esc(lr.actor)}</span>${lr.note?'<div class="small">'+esc(lr.note)+"</div>":""}</td>
       <td class="small mono" style="font-size:10px">${lr.scope?["eval","modify","publish_pool","redistribute"].map(k=>(lr.scope["allow_"+k]?"✓":"✗")+k).join(" "):"—"}</td></tr>`;}).join("")}
     </tbody></table></div>
   </section>
@@ -1634,10 +1811,10 @@ function vImport(){
       <h3>选择 / 导入事件流 <span class="en">external_import · append-only · I6</span></h3>
       <ul class="tl">
       ${DB.external_import.map(x=>{const c=DB.external_candidate.find(z=>z.id===x.candidate_id);return `<li>
-        <span class="when">c${x.action_cycle}</span>
+        <span class="when">c${esc(x.action_cycle)}</span>
         <span class="what">${chip(x.action==="imported"?"c-ok":x.action==="rejected_by_license"?"c-bad":x.action==="selected_for_materialization"?"c-warn":"c-line",x.action)}
         ${mono(c.canonical_uri.split("/").pop())}
-        <div class="hash">cs ${x.candidate_set_hash} · key ${esc(x.selection_key)} · pol ${x.policy_hash}${x.license_decision_snapshot_hash?" · lds "+x.license_decision_snapshot_hash:""}${x.manifest_hash?" · mfa "+x.manifest_hash+" → baseline "+bl(x.baseline_id).slug:""}</div></span></li>`;}).join("")}
+        <div class="hash">cs ${esc(x.candidate_set_hash)} · key ${esc(x.selection_key)} · pol ${esc(x.policy_hash)}${x.license_decision_snapshot_hash?" · lds "+esc(x.license_decision_snapshot_hash):""}${x.manifest_hash?" · mfa "+esc(x.manifest_hash)+" → baseline "+esc(bl(x.baseline_id).slug):""}</div></span></li>`;}).join("")}
       </ul>
       <div class="small" style="margin-top:6px">状态机:selected →(冻结 license 快照下)selected_for_materialization / rejected_by_license(取下一个,仍确定性)→ imported / materialize_failed;后到 license 裁定不改既有事件,要用须新 action_cycle 重选(《第二部分》§6.13(4))。</div>
     </section>
@@ -1663,51 +1840,52 @@ function vAudit(){
     cls: DB.interaction_classification.find(c=>c.message_id===m.id),
     rep: DB.interaction_reply.find(r=>r.message_id===m.id),
   }));
+  const connectors=[...new Set(DB.interaction_message.map(m=>String(m.connector||"—")))];
   return `
   <div class="pagehead"><h1>人机审计</h1><span class="en">interaction_message ⨝ classification ⨝ reply ⨝ directive</span></div>
-  <p class="pagesub">复盘视图:入站 raw 不可变、每消息恰一分类、回复带快照与 grounding 标记。实时讨论在右侧「讲解员」窗口;命令入账在底部输出窗——三者共用同一套 interaction 设计(§4.6.2)。本会话经命令行发送的消息以绿底行追加在表尾。</p>
+  <p class="pagesub">复盘视图:入站 raw 不可变、每消息恰一分类、回复记录 responder_kind 与快照。grounding 是写入前机械检查，当前 DDL 不保存逐回复布尔标记；响应时延也未采集。实时讨论在右侧「讲解员」窗口，命令入账在底部输出窗。</p>
   <div class="grid g21">
     <section class="card pad0">
-      <div class="tw"><table class="t"><thead><tr><th>#</th><th>connector</th><th>raw_text(不可变)</th><th>ACK</th><th>intent</th><th>directive</th><th>reply</th></tr></thead><tbody>
+      <div class="tw"><table class="t"><thead><tr><th>#</th><th>connector</th><th>raw_text(不可变)</th><th>入账</th><th>intent</th><th>directive</th><th>reply</th></tr></thead><tbody>
       ${rows.map(({m,cls,rep})=>{
         const d = cls&&cls.directive_id ? DB.directive.find(x=>x.id===cls.directive_id) : null;
-        const dst = d ? (d.id===6 ? state.d6 : d.status) : null;
+        const dst = d ? ((!LIVE_MODE && d.id===6) ? state.d6 : d.status) : null;
         return `<tr>
           <td class="num">${m.id}<div class="hash">${esc(m.received_at)}</div></td>
           <td>${mono(m.connector)}</td>
           <td class="small">${esc(m.raw_text)}</td>
-          <td class="num small">${m.ack_s}s</td>
+          <td class="small">${chip("c-ok","durable")}</td>
           <td>${cls?intentChip(cls.intent):"—"}${cls&&cls.note?'<div class="small">'+esc(cls.note)+"</div>":""}</td>
           <td class="small">${d?mono("d"+d.id+" "+d.kind)+" "+(dst==="consumed"?chip("c-ok","consumed"):dst==="rejected"?chip("c-bad","rejected"):chip("c-warn",String(dst))):"—"}</td>
-          <td class="small">${rep?(rep.responder_kind==="codex"?chip("c-acc","codex"):chip("c-line","模板"))+" "+mono("snap c"+rep.snapshot_cycle)+(rep.grounding_ok?" ✓":" ✗")+'<div>'+esc(rep.reply_text.slice(0,80))+"…</div>":"—"}</td></tr>`;
+          <td class="small">${rep?chip(rep.responder_kind==="codex"?"c-acc":"c-line",rep.responder_kind||"unknown")+" "+mono(rep.snapshot_cycle==null?"snap —":"snap c"+rep.snapshot_cycle)+'<div>'+esc(String(rep.reply_text||"").slice(0,80))+"…</div>":"—"}</td></tr>`;
       }).join("")}
       ${state.chatExtra.map(x=>`<tr style="background:var(--accent-bg2)">
         <td class="num">·<div class="hash">本会话(模拟)</div></td><td>${mono("web")}</td>
-        <td class="small">${esc(x.raw)}</td><td class="num small">0.8s</td>
+        <td class="small">${esc(x.raw)}</td><td class="small">${chip("c-line","demo")}</td>
         <td>${intentChip(x.intent)}</td>
         <td class="small">${x.dlabel?mono(x.dlabel)+" "+(x.dstate==="confirmed"?chip("c-warn","pending_effect"):x.dstate==="rejected"?chip("c-bad","rejected"):chip("c-warn","pending_confirmation")):"—"}</td>
         <td class="small">${x.reply?esc(x.reply.slice(0,80))+"…":"—"}</td></tr>`).join("")}
       </tbody></table></div>
     </section>
     <div class="stack">
-      <section class="card"><h3>中介线程 <span class="en">responder · mode=ro</span></h3>
+      <section class="card"><h3>应答实现边界 <span class="en">responder · mode=ro</span></h3>
         <dl class="kv">
-          <dt>conversation_id</dt><dd>${mono("qq:7742")} ↔ goal 1</dd>
-          <dt>会话重建</dt><dd class="small">杀线程可重建:最近发布 status_card + 同 conversation 最近 N=8 条已消毒入站/出站;唯一持久状态在 interaction_* 表</dd>
-          <dt>输入边界</dt><dd class="small">只拿状态卡文本 + 已分类消毒摘要;无 DB 凭据、不拿 raw 对话(防注入)</dd>
+          <dt>当前审计量</dt><dd>${connectors.length?connectors.map(mono).join(" · "):"—"} · ${rows.length} messages</dd>
+          <dt>消费模型</dt><dd class="small">run 进程在 precheck 同步 ingest/query;故障有限重试，只有 durable reply/终态回执后才推进 spool cursor</dd>
+          <dt>输入边界</dt><dd class="small">模板应答器只拿已消毒 query + 最近发布 status_card；不把 raw 对话或写连接交给 responder</dd>
           <dt>写库</dt><dd class="small">interaction_reply 由 daemon 单写队列写,非 Codex;authorizer 禁应答器写</dd>
         </dl></section>
-      <section class="card"><h3>grounding 校验(非门禁)</h3>
+      <section class="card"><h3>grounding 写入前检查 <span class="en">非逐回复存储字段</span></h3>
         <ul class="tl">
-          <li><span class="what small">✓ 不得声称状态卡外的事实</span></li>
-          <li><span class="what small">✓ 不得宣称状态变更已执行</span></li>
-          <li><span class="what small">✓ 不得引 log / interaction 作 evidence</span></li>
-          <li><span class="what small">✓ 不得自行生成 directive;不过 → 退模板</span></li>
+          <li><span class="what small">不得引用状态卡外 q/c 实体</span></li>
+          <li><span class="what small">不得宣称状态变更已执行</span></li>
+          <li><span class="what small">不得引 log / interaction 作 evidence</span></li>
+          <li><span class="what small">不得自行生成 directive；不过则退安全模板</span></li>
         </ul></section>
-      <section class="card"><h3>SLA(v1)</h3>
+      <section class="card"><h3>时延观测</h3>
         <dl class="kv">
-          <dt>ACK</dt><dd class="num">p95 1.1s <span class="chip c-ok">&lt; 2s ✓</span></dd>
-          <dt>query</dt><dd class="num">p95 1.6s <span class="chip c-ok">&lt; 2s ✓</span>(基于发布快照)</dd>
+          <dt>ACK</dt><dd class="small">未采集 p95；表内仅证明消息已 durable</dd>
+          <dt>query</dt><dd class="small">未采集 p95；回复可追溯 responder_kind / snapshot_cycle</dd>
           <dt>directive</dt><dd class="small">不承诺抢占;只承诺入账 + 回显生效时机</dd>
         </dl></section>
     </div>
@@ -1725,9 +1903,10 @@ function vDirectives(){
   <p class="pagesub">P5:人不直接改库——一切介入经 DIRECTIVE 收件箱,门禁在指定时机消费,与系统同记一本 DECISION 账。软指令可被有理由地不从(理由入 DECISION);硬指令确认后按时机生效。</p>
 
   <section class="card pad0">
-    <div class="tw"><table class="t"><thead><tr><th>d</th><th>kind</th><th>硬/软</th><th>status</th><th>consume_at</th><th>润色稿(payload_json)</th><th>效果</th></tr></thead><tbody>
+    <div class="tw"><table class="t"><thead><tr><th>d</th><th>kind</th><th>硬/软</th><th>status</th><th>consume_at</th><th>润色稿(payload_json)</th><th>操作</th><th>效果</th></tr></thead><tbody>
     ${DB.directive.map(d=>{
-      const st = d.id===6 ? (state.d6==="applied"?"consumed":state.d6==="rejected"?"rejected":"pending") : d.status;
+      const st = (!LIVE_MODE && d.id===6) ? (state.d6==="applied"?"consumed":state.d6==="rejected"?"rejected":"pending") : d.status;
+      const needsConfirm=st==="pending" && d.hardness==="hard" && d.payload && d.payload.confirmed===false;
       return `<tr>
       <td>${mono("d"+d.id)}<div class="hash">msg#${d.source_interaction_message_id} · c${d.created_cycle}${d.consumed_cycle?"→c"+d.consumed_cycle:""}</div></td>
       <td>${mono(d.kind)}</td>
@@ -1735,6 +1914,7 @@ function vDirectives(){
       <td>${st==="consumed"?chip("c-ok","consumed"):st==="rejected"?chip("c-bad","rejected"):chip("c-warn","pending")}${d.payload&&d.payload.confirmed===false?'<div class="small">confirmed:false</div>':d.payload&&d.payload.confirmed===true?'<div class="small">confirmed:true</div>':""}</td>
       <td>${mono(d.consume_at)}</td>
       <td class="small">${esc((d.payload&&d.payload.polished)||"")}</td>
+      <td class="small">${needsConfirm?`<button class="btn" data-directive-action="${d.id}" style="padding:2px 8px;font-size:11px" onclick="directiveAction(${d.id},'confirm')">确认</button> <button class="btn gray" data-directive-action="${d.id}" style="padding:2px 8px;font-size:11px" onclick="directiveAction(${d.id},'reject')">拒绝</button>`:"—"}</td>
       <td class="small">${esc(d.effect)}</td></tr>`;}).join("")}
     </tbody></table></div>
   </section>
@@ -1749,17 +1929,18 @@ function vDirectives(){
       <div class="callout" style="margin-top:10px">
         <b>文件请求(§4.6.8,当前)</b>:${(()=>{                       // 由真 interaction_request 表驱动（不再焊死 r1/r2 演示剧情）
           const reqs=DB.interaction_request||[], pend=reqs.filter(r=>r.status==="pending")[0];
-          if(pend) return "r"+pend.id+" pending:「"+esc((pend.summary_md||"").slice(0,140))+"」→ "+chip("c-warn","全局等待:只停研究推进（用户放入 uploads/ 后经命令行入站恢复）");
+          if(pend) return "r"+pend.id+" pending:「"+esc((pend.summary_md||"").slice(0,140))+"」→ "+chip("c-warn","全局等待:只停研究推进")+
+            (LIVE_MODE?`<div style="margin-top:7px"><button class="btn" data-file-request-action="${pend.id}" style="padding:3px 9px;font-size:11px" onclick="fileRequestAction(${pend.id},'resolve')">从 uploads 解决</button> <button class="btn gray" data-file-request-action="${pend.id}" style="padding:3px 9px;font-size:11px" onclick="fileRequestAction(${pend.id},'cancel')">取消请求</button></div>`:"（离线演示）");
           const last=reqs.slice().reverse()[0];
           return last ? ("无 pending 请求。最近:r"+last.id+"（"+esc(last.status)+"）") : "无 pending 请求。";
         })()}
-        <div class="small" style="margin-top:6px">防滥用:请求单 schema 强制披露「已尝试路径+失败原因」;同 goal 至多一张 pending 单(uq_ireq_one_pending);开关/上限/提醒在 policy.interaction_request;文件是输入资产、非 evidence;请求/答复不写 decision。</div>
+        <div class="small" style="margin-top:6px">先把按条目编号组织的文件放到 work/uploads/&lt;目录&gt;/1、2… 或 input/uploads/&lt;目录&gt;/1、2…，再点「从 uploads 解决」并填写虚拟路径。文件是输入资产、非 evidence；请求/答复不写 decision。</div>
       </div>
     </section>
     <section class="card">
       <h3>interaction_request 表 <span class="en">§4.6.8 · pending→resolved|cancelled(终态须 provenance)</span></h3>
-      <div class="tw"><table class="t"><thead><tr><th>id</th><th>stage/cycle</th><th>status</th><th>摘要</th><th>resolution</th></tr></thead><tbody>
-      ${DB.interaction_request.map(r=>`<tr><td>${mono("r"+r.id)}</td><td class="small">${esc(r.stage)} / c${r.cycle_id}</td><td>${r.status==="pending"?chip("c-warn","pending"):r.status==="resolved"?chip("c-ok","resolved"):chip("c-dead","cancelled")}</td><td class="small">${esc(r.summary_md.slice(0,64))}…</td><td class="small">${r.resolution?esc(r.resolution.map(x=>x.provided?("#"+x.no+" → "+x.provided+"("+x.hash+")"):("#"+x.no+" unavailable")).join(" · "))+" · msg#"+r.resolved_message_id:"—"}</td></tr>`).join("")}
+      <div class="tw"><table class="t"><thead><tr><th>id</th><th>stage/cycle</th><th>status</th><th>摘要</th><th>resolution</th><th>操作</th></tr></thead><tbody>
+      ${DB.interaction_request.map(r=>`<tr><td>${mono("r"+r.id)}</td><td class="small">${esc(r.stage)} / c${r.cycle_id}</td><td>${r.status==="pending"?chip("c-warn","pending"):r.status==="resolved"?chip("c-ok","resolved"):chip("c-dead","cancelled")}</td><td class="small">${esc((r.summary_md||"").slice(0,64))}…</td><td class="small">${r.resolution?esc(JSON.stringify(r.resolution).slice(0,180))+" · msg#"+r.resolved_message_id:"—"}</td><td class="small">${r.status==="pending"&&LIVE_MODE?`<button class="btn" data-file-request-action="${r.id}" style="padding:2px 8px;font-size:11px" onclick="fileRequestAction(${r.id},'resolve')">解决</button> <button class="btn gray" data-file-request-action="${r.id}" style="padding:2px 8px;font-size:11px" onclick="fileRequestAction(${r.id},'cancel')">取消</button>`:"—"}</td></tr>`).join("")}
       </tbody></table></div>
     </section>
     <section class="card">
@@ -1778,6 +1959,8 @@ function vDirectives(){
 function vLedger(){
   const f = state.actorFilter;
   const rows = DB.decision.filter(d=>f==="all"||d.actor===f);
+  const budgetPct=DB.budget.global_total
+    ?Math.max(0,Math.min(100,DB.budget.global_spent/DB.budget.global_total*100)):0;
   return `
   <div class="pagehead"><h1>决策账 · 台账</h1><span class="en">DECISION · LEDGER · append-only</span></div>
   <p class="pagesub">三层分清(§4.3):运行证据层(log/观测)只解释;DECISION 只记研究决策(query/reply/ACK 不入);LEDGER 记成本。全部 append-only,给定 policy_hash 与冻结输入可回放。</p>
@@ -1794,9 +1977,9 @@ function vLedger(){
         <h3>预算三消费 <span class="en">LEDGER</span></h3>
         <dl class="kv">
           <dt>① 采集打分成本项</dt><dd class="small">cost_norm 进 R3 四元打分</dd>
-          <dt>② 单轮预算 B(t)</dt><dd class="num">$${DB.budget.B_t}${(DB.policy&&DB.policy.budget)?("(B0 $"+DB.policy.budget.B0+" · 每 "+DB.policy.budget.doubling_period_m+"m 翻倍 · 封顶 $"+DB.policy.budget.B_max+")"):""}</dd>
-          <dt>③ 全局判停</dt><dd><div class="num">$${DB.budget.global_spent} / ${DB.budget.global_total!=null?("$"+DB.budget.global_total):"关闭(session_max=null)"}</div>
-            <div class="meter"><i style="width:${(DB.budget.global_total?DB.budget.global_spent/DB.budget.global_total*100:0).toFixed(0)}%"></i></div></dd>
+          <dt>② 单轮预算 B(t)</dt><dd class="num">$${esc(DB.budget.B_t)}${(DB.policy&&DB.policy.budget)?("(B0 $"+esc(DB.policy.budget.B0)+" · 每 "+esc(DB.policy.budget.doubling_period_m)+"m 翻倍 · 封顶 $"+esc(DB.policy.budget.B_max)+")"):""}</dd>
+          <dt>③ 全局判停</dt><dd><div class="num">$${esc(DB.budget.global_spent)} / ${DB.budget.global_total!=null?("$"+esc(DB.budget.global_total)):"关闭(session_max=null)"}</div>
+            <div class="meter"><i style="width:${budgetPct.toFixed(0)}%"></i></div></dd>
         </dl>
       </section>
       <section class="card">
@@ -1851,7 +2034,7 @@ function vGoal(){
         <h3>终止三判据 τ <span class="en">§4.4.6 · 任一满足即停机</span></h3>
         <dl class="kv">
           <dt>① 分数地板</dt><dd class="num">open 最高分 ${topScore==null?"—":esc(String(topScore))} &gt; τ 0.25 ${(topScore!=null&&topScore>0.25)?'<span class="chip c-line">未触发</span>':'<span class="chip c-warn">近阈</span>'}</dd>
-          <dt>② 全局预算</dt><dd class="num">$${spent} / ${total!=null?("$"+total):"关闭"}${total?"("+(spent/total*100).toFixed(0)+"%)":""} ${total==null?'<span class="chip c-line">关闭</span>':(spent<total?'<span class="chip c-line">未触发</span>':'<span class="chip c-warn">检视</span>')}</dd>
+          <dt>② 全局预算</dt><dd class="num">$${esc(spent)} / ${total!=null?("$"+esc(total)):"关闭"}${total?"("+esc((spent/total*100).toFixed(0))+"%)":""} ${total==null?'<span class="chip c-line">关闭</span>':(spent<total?'<span class="chip c-line">未触发</span>':'<span class="chip c-warn">检视</span>')}</dd>
           <dt>③ 目标谓词</dt><dd class="small">由 goal predicate 判定（详见 goal 定义与「结论与证据」）<span class="chip c-line">见 predicate_json</span></dd>
         </dl>
         <div class="small" style="margin-top:5px">停机 = selection.intent=terminate(next_question_id=NULL 持久标志)+人类确认(判据③)。</div>
@@ -1887,10 +2070,10 @@ function fsHTML(list, prefix){
     const path = prefix ? prefix + "/" + item.p : item.p;
     if(item.d){
       const open = state.fs.expand.has(path);
-      return `<div class="fsrow dir" onclick="fsToggle('${path}')"><span class="fscaret">${open?"▾":"▸"}</span><span class="fsname">${esc(item.p)}/</span></div>`
+      return `<div class="fsrow dir" data-fs-action="toggle" data-fs-path="${esc(path)}"><span class="fscaret">${open?"▾":"▸"}</span><span class="fsname">${esc(item.p)}/</span></div>`
         + (open ? `<div class="fskids">${fsHTML(item.d, path)}</div>` : "");
     }
-    return `<div class="fsrow ${state.fs.sel===path?"on":""}" onclick="fsOpen('${path}')"><span class="fscaret"></span><span class="fsname">${esc(item.p)}</span>${FILE_LIVE.has(path)?'<span class="fslive" title="流式写入中"></span>':""}</div>`;
+    return `<div class="fsrow ${state.fs.sel===path?"on":""}" data-fs-action="open" data-fs-path="${esc(path)}"><span class="fscaret"></span><span class="fsname">${esc(item.p)}</span>${FILE_LIVE.has(path)?'<span class="fslive" title="流式写入中"></span>':""}</div>`;
   }).join("");
 }
 function previewHTML(p){
@@ -1913,7 +2096,9 @@ function hiddenAttr(k){
   return (g && !g.includes(k)) ? "hidden" : "";
 }
 function streamLineHTML(e){
-  return `<div class="sline k-${e.k}" data-k="${e.k}" ${hiddenAttr(e.k)}><span class="st">${esc(e.t||"")}</span><span class="sk">${e.k}</span><span class="sx">${e.html || esc(e.text||"")}</span></div>`;
+  const allowed=new Set(["advance","gate","notify","runner","heartbeat","directive","cmd","reply"]);
+  const kind=allowed.has(e.k)?e.k:"notify";
+  return `<div class="sline k-${kind}" data-k="${kind}" ${hiddenAttr(kind)}><span class="st">${esc(e.t||"")}</span><span class="sk">${esc(kind)}</span><span class="sx">${e.html || esc(e.text||"")}</span></div>`;
 }
 function buildStreamHistory(){
   const out = [];
@@ -1950,7 +2135,7 @@ function renderTopbar(){
   document.getElementById("topstat").innerHTML =
     `<span class="tchip">goal <b>${esc("v"+(sc.goal_ver!=null&&sc.goal_ver!==""?sc.goal_ver:"?"))}</b></span>
      <span class="tchip">cycle <b class="num">${esc(String(sc.snapshot_cycle!=null?sc.snapshot_cycle:"—"))}</b> · <span class="mono">${esc((sc.cycle_route||"—")+" · "+(sc.cycle_status||"—"))}</span></span>
-     <span class="tchip">B(t) <b class="num">$${DB.budget.B_t}</b> · 已花 <b class="num">$${DB.budget.cycle_spent}</b></span>
+     <span class="tchip">B(t) <b class="num">$${esc(DB.budget.B_t)}</b> · 已花 <b class="num">$${esc(DB.budget.cycle_spent)}</b></span>
      <span class="tchip"><span class="dot ${scen.idle?"dead":"acc"} ${scen.idle?"":"pulse"}"></span>心跳 <b>${esc(scen.idle?"—":scen.heartbeat_age)}</b></span>`;
   // 场景切换器是 mock 演示件（人手翻三态 live）；真数据模式只有一个真状态 → 显示真状态标签，不给切换按钮
   document.getElementById("scen").innerHTML = LIVE_MODE
@@ -2008,6 +2193,14 @@ function fsRefresh(){
   const note = (typeof DB!=="undefined" && DB.fs) ? "work/ 运行产物 + schemas/prompts/policies/input 只读镜像;点击文件经 /api/file 拉真内容(白名单)。"
                                                   : "db/ = 唯一真相(SQLite);views/ 与卡片可重建;大文件只引用不复制(path+hash)。点击文件看模拟内容。";
   el.innerHTML = `<div class="fstitle">落盘镜像(只读)</div>` + fsHTML(tree, "") + `<div class="fsnote">${note}</div>`;
+  // 文件名来自 work/uploads 等不可信输入面：只放经过 HTML 转义的 data 属性，再由事件委托读取；
+  // 禁止把 path 拼进 inline onclick（引号文件名会形成 stored XSS）。赋值 onclick 避免 refresh 累积监听器。
+  el.onclick = ev=>{
+    const row=ev.target&&ev.target.closest?ev.target.closest("[data-fs-action]"):null;
+    if(!row) return;
+    const p=row.getAttribute("data-fs-path"), action=row.getAttribute("data-fs-action");
+    if(action==="toggle") fsToggle(p); else if(action==="open") fsOpen(p);
+  };
   el.scrollTop = st;
 }
 function fsToggle(p){
@@ -2049,7 +2242,11 @@ function setStreamFilter(g){
 }
 function nowStr(){
   const s = state.stream;
-  return "07-05 " + String(s.hh).padStart(2,"0") + ":" + String(s.mm).padStart(2,"0");
+  if(LIVE_MODE){
+    const d=new Date(), pad=n=>String(n).padStart(2,"0");
+    return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes());
+  }
+  return "demo " + String(s.hh).padStart(2,"0") + ":" + String(s.mm).padStart(2,"0");
 }
 function appendStream(e){
   const el = document.getElementById("stream"); if(!el) return;
@@ -2104,7 +2301,7 @@ function sendCmd(textArg){
     emitEvent({ k:"reply", html:(x.template?chip("c-line","模板"):chip("c-acc","codex 中介"))+" "+esc(x.reply)+' <span class="hash">snapshot_cycle=18 · grounding ✓</span>' });
   } else if(x.intent==="note"){
     emitEvent({ k:"notify", text:"note 入队:"+(x.note||t),
-      narr:"你的 note 已入队,下一轮 reasoning 开头消费;note 是软注解,不改状态、不写 decision。" });
+      narr:"你的 note 已入队,下一轮 reasoning 开头消费;消费时会写 directive_note DECISION，并进入该轮 ContextPack。" });
   } else if(x.intent==="unclear"){
     emitEvent({ k:"reply", html:chip("c-warn","unclear")+" "+esc(x.reply||"") ,
       narr:"这条消息分类置信度低,被登记为待确认(directive_pending):系统不自动答、也不自动改状态。想细聊可以在我这儿说清意图,我帮你草拟。" });
@@ -2163,7 +2360,7 @@ function classify(t){
   if(/已提供|已上传|放好了|r\d+ ?已/.test(t))
     return { intent:"note", dlabel:"request_provide", dstate:"confirmed",
       polish:"文件请求答复:uploads/ 已放好,请校验。",
-      note:"答复按 note 入账 + daemon 动作:校验 hash → 并入 input/user_provided/ → resolved → 恢复推进(§4.6.8,不产 directive)" };
+      note:"答复只按 note 入账，不会自动 resolve；真实控制面须在「指令与请求」面板点击解决，由 daemon 校验并接纳" };
   if(/优先|插入|插一个|加一个问题|安排.*验证|先验证/.test(t))
     return { intent:"directive", dlabel:"d(new) inject_question", dstate:"confirmed",
       polish:"插入问题:"+t+"(置高优先级,directive_adjust 加成)。",
@@ -2240,7 +2437,7 @@ function narratorRespond(t){
   // ② 组织命令类
   const num = (t.match(/(\d+(?:\.\d+)?)/)||[])[1];
   if(/预算|B_max|上限/i.test(t))
-    return { html:"set_budget 是<b>硬指令</b>(消费时机 = 立即 / 阶段边界):确认后改 policy.budget.B_max,单轮预算 B(t) 随之封顶。当前 B(t) $"+DB.budget.B_t+"、本轮已花 $"+DB.budget.cycle_spent+"、全局 $"+DB.budget.global_spent+"/$"+DB.budget.global_total+"。草拟如下——发送后需在输出窗确认。",
+    return { html:"set_budget 在 reference 中是<b>硬指令</b>，但当前运行时 override 尚未闭合；提交并确认后会被明确 rejected，而不会伪报已应用。当前 B(t) $"+DB.budget.B_t+"、本轮已花 $"+DB.budget.cycle_spent+"、全局 $"+DB.budget.global_spent+"/$"+DB.budget.global_total+"。",
              draft:"预算调到 "+(num||"50") };
   if(/暂停|停机|先停|停止/.test(t))
     return { html:"pause 是硬指令:当前阶段收尾后不再开新轮,直至 resume;<b>不会打断进行中的训练</b>(v1 不承诺抢占,只承诺入账与生效时机)。",
@@ -2248,13 +2445,13 @@ function narratorRespond(t){
   if(/文件请求|上传|供给|uploads|无法获取|数据集.*(申请|提供)/i.test(t)){
     const pend=(DB.interaction_request||[]).filter(r=>r.status==="pending")[0];
     return { html: pend
-        ? "当前有 pending 文件请求 <b>r"+pend.id+"</b>:「"+esc((pend.summary_md||"").slice(0,90))+"」。系统在<b>全局等待</b>:不开新研究 runner call,问答/通知照常。把文件放入 <b>uploads/</b> 后经命令行入站恢复;也可答复「无法提供」(缺口按失败观测交轮尾裁决)。"
+        ? "当前有 pending 文件请求 <b>r"+pend.id+"</b>:「"+esc((pend.summary_md||"").slice(0,90))+"」。系统在<b>全局等待</b>:不开新研究 runner call,问答/通知照常。把文件放入 <b>uploads/</b> 后，请在「指令与请求」面板点击<b>解决</b>并填写虚拟目录；无法提供时点<b>取消请求</b>并留下理由。命令行备注不会自动迁移请求终态。"
         : "当前没有 pending 文件请求。防滥用:请求单必须披露已尝试路径+失败原因,同 goal 至多一张 pending 单。",
-      draft: pend ? ("r"+pend.id+" 已提供") : undefined };
+      draft: undefined };
   }
   if(/优先|插入|安排|先验证|先做/.test(t)){
     const topic = t.replace(/^.*?(优先|先验证|先做|插入|安排)/,"").replace(/验证|一下|吧|。/g,"").trim();
-    return { html:"这可以走 <b>inject_question(软指令)</b>:下一轮 reasoning 轮始消费,生成 source=human 的新问题并加 directive_adjust 权重;树上会紫标高亮。系统可有理由不从(理由入 DECISION)。",
+    return { html:"这可以走 <b>inject_question(软指令)</b>:下一轮 reasoning 轮始消费并生成 source=human 的新问题；之后仍由正常 selection 打分，不伪造尚未实现的优先级加成。",
              draft:"优先验证 "+(topic||"32k 外推") };
   }
   // ③ 讨论类
@@ -2276,18 +2473,63 @@ function narratorSeed(){
 }
 
 /* ---------------- 既有演示动作(接入事件流 + 讲解) ---------------- */
-function confirmD6(){
-  state.d6 = "pending_effect";
-  emitEvent({ k:"directive", text:"d6(goal_amend)确认 → pending_effect:待下一 goal_amend 轮消费(模拟)",
-    narr:"d6 已确认。goal_amend 在下一个 goal_amend 轮消费:建 goal v3、open 问题原地迁移重打分、closed 结论走适用性审计(不批量重开)。" });
-  toast("d6 已确认(模拟,不落库)");
-  render();
+function directiveAction(id, action){
+  if(action!=="confirm" && action!=="reject") return;
+  if(!DEMO_MODE && !_consoleReady){ showConnectionGuard("控制台尚未连接真实状态，拒绝执行动作。"); return; }
+  if(!LIVE_MODE){                                             // 离线原型仍可演示；连上真 server 后绝不在浏览器伪改状态
+    if(id===6) state.d6=(action==="confirm"?"pending_effect":"rejected");
+    emitEvent({k:"directive", text:"d"+id+(action==="confirm"?" 已确认 → pending_effect":" 已拒绝 → rejected")+"(离线演示)"});
+    render(); return;
+  }
+  let reason="";
+  if(action==="reject"){
+    reason=window.prompt("请输入拒绝理由（将进入 directive 审计 payload）", "用户从控制台拒绝");
+    if(reason===null) return;
+  }
+  if(typeof document!=="undefined") document.querySelectorAll('[data-directive-action="'+id+'"]').forEach(b=>b.disabled=true);
+  apiPost('/api/directive',{action:action,directive_id:id,reason:reason})
+    .then(({response,body:j})=>{
+      const ok=response.ok;
+      if(!ok || !j || !j.queued){
+        emitEvent({k:"directive",text:"d"+id+" "+action+" 入队失败:"+((j&&j.error)||"服务器拒绝")});
+        if(typeof document!=="undefined") document.querySelectorAll('[data-directive-action="'+id+'"]').forEach(b=>b.disabled=false);
+        return;
+      }
+      emitEvent({k:"directive",text:"d"+id+" "+action+" 已入队 console_inbox（seq "+j.queued.seq+"）· 待 run 进程 ingest 后生效"});
+    })
+    .catch(e=>{
+      emitEvent({k:"directive",text:"d"+id+" "+action+" 入队失败:"+e});
+      if(typeof document!=="undefined") document.querySelectorAll('[data-directive-action="'+id+'"]').forEach(b=>b.disabled=false);
+    });
 }
-function rejectD6(){
-  state.d6 = "rejected";
-  emitEvent({ k:"directive", text:"d6 → rejected(不消费);raw 原文仍在 interaction_message(模拟)" });
-  toast("d6 已取消(模拟)");
-  render();
+function confirmD6(){ directiveAction(6,"confirm"); }          // 保留原型外部链接兼容
+function rejectD6(){ directiveAction(6,"reject"); }
+function fileRequestAction(id, action){
+  if(!LIVE_MODE || (action!=="resolve" && action!=="cancel")) return;
+  if(!_consoleReady){ showConnectionGuard("控制台连接已失效，拒绝执行文件请求动作。"); return; }
+  let sourceRef="", reason="";
+  if(action==="resolve"){
+    sourceRef=window.prompt("请输入已放好文件的虚拟目录（目录内按 1、2… 对应请求条目）", "work/uploads/r"+id);
+    if(sourceRef===null) return; sourceRef=sourceRef.trim(); if(!sourceRef) return;
+  }else{
+    reason=window.prompt("请输入取消理由（进入请求 resolution provenance）", "用户暂时无法提供");
+    if(reason===null) return; reason=reason.trim(); if(!reason) return;
+  }
+  if(typeof document!=="undefined") document.querySelectorAll('[data-file-request-action="'+id+'"]').forEach(b=>b.disabled=true);
+  apiPost('/api/file-request',{action:action,request_id:id,source_ref:sourceRef,reason:reason})
+    .then(({response,body:j})=>{
+      const ok=response.ok;
+      if(!ok || !j || !j.queued){
+        emitEvent({k:"notify",text:"文件请求 r"+id+" "+action+" 入队失败:"+((j&&j.error)||"服务器拒绝")});
+        if(typeof document!=="undefined") document.querySelectorAll('[data-file-request-action="'+id+'"]').forEach(b=>b.disabled=false);
+        return;
+      }
+      emitEvent({k:"notify",text:"文件请求 r"+id+" "+action+" 已入队（seq "+j.queued.seq+"）· 待 run 单写进程校验并生效"});
+    })
+    .catch(e=>{
+      emitEvent({k:"notify",text:"文件请求 r"+id+" "+action+" 入队失败:"+e});
+      if(typeof document!=="undefined") document.querySelectorAll('[data-file-request-action="'+id+'"]').forEach(b=>b.disabled=false);
+    });
 }
 function provideR2(){
   state.scenario = "running";
@@ -2329,11 +2571,20 @@ function renderShell(){
 function _summ(pj){ try{ const o=JSON.parse(pj); return o.reason||o.type||o.verdict||o.review_kind||JSON.stringify(o).slice(0,90);}catch(e){ return String(pj||"").slice(0,90);} }
 function emptyPage(title,sub){ return `<div class="pagehead"><h1>${esc(title)}</h1></div><p class="pagesub">${esc(sub)}</p>`; }  // 空表占位（稀疏/新建真库不崩）
 function _fsConv(nodes){ return (nodes||[]).map(n=> n.dir ? {p:n.p, d:_fsConv(n.children||[])} : {p:n.p}); }  // server fs {p,dir,children} → 渲染器 {p,d}
+function _finiteNumber(value, fallback){ return typeof value==="number"&&Number.isFinite(value)?value:fallback; }
 function adaptPayload(p){
   const T=(p&&p.tables)||{}, D={};
   for(const k in T) D[k]=T[k];                                   // 真表平铺到顶层（原型访问 DB.<表>）
-  D.notification=(p&&p.notification)||[];
-  D.ledger_by_cycle=((p&&p.ledger_by_cycle)||[]).map(l=>{ const n=parseInt(String(l&&l.cycle).replace(/\D/g,""),10); return {cycle:(isNaN(n)?(l&&l.cycle):n), money:l&&l.money}; });  // server 发 "c1" → 归一为数字 id（cy() 按数字 find；isNaN 才回退，保住 c0）
+  D.notification=((p&&p.notification)||[]).map(n=>{
+    // 真 Outbox 形状={event_key,kind,payload}；旧原型形状={at,channel,event,text}。统一后通知面不再空白。
+    if(n&&n.kind) return {event_key:n.event_key, at:n.at||"—", channel:n.channel||"outbox",
+      event:n.kind, text:n.text||JSON.stringify(n.payload||{})};
+    return n||{};
+  });
+  D.ledger_by_cycle=((p&&p.ledger_by_cycle)||[]).map(l=>{
+    const raw=String(l&&l.cycle), match=/^c?(0|[1-9]\d*)$/.exec(raw), n=match?Number(match[1]):null;
+    return {cycle:(Number.isSafeInteger(n)?n:null), money:_finiteNumber(l&&l.money,0)};
+  }).filter(l=>l.cycle!=null);                                  // server 发 "c1"；非法 cycle/type 不进入 inline 图表属性
   D.policy=(p&&p.policy)||{}; D.live=(p&&p.live)||{}; D.runner_call_live=(D.live&&D.live.runner_call)||null;
   // status_card：真 builder 是**嵌套**（goal/selection/counts/budget）；原型渲染读**扁平**键 → 拍平改名。
   const sc=(p&&p.status_card)||{}, scb=sc.budget||{};
@@ -2346,22 +2597,26 @@ function adaptPayload(p){
     cycle_status: sc.cycle_status||"", cycle_route: sc.route||sc.cycle_route||"",
     selection_intent: (sc.selection&&sc.selection.intent)||sc.selection_intent||"—",
     selection_decision: (sc.selection&&sc.selection.latest_decision&&("decision #"+sc.selection.latest_decision.id))||sc.selection_decision||"",
-    open_count: (sc.counts&&sc.counts.open!=null)?sc.counts.open:(sc.open_count||0),
-    inconclusive_count: (sc.counts&&sc.counts.inconclusive!=null)?sc.counts.inconclusive:(sc.inconclusive_count||0),
+    open_count: _finiteNumber((sc.counts&&sc.counts.open!=null)?sc.counts.open:sc.open_count,0),
+    inconclusive_count: _finiteNumber((sc.counts&&sc.counts.inconclusive!=null)?sc.counts.inconclusive:sc.inconclusive_count,0),
     heartbeat_ref: sc.heartbeat_ref||null, pending_request: sc.pending_file_request||sc.pending_request||null,
   };
   // budget（每拍 topbar 必读）：从 status_card.budget + policy.session_max + ledger 求和合成（真成本网休眠→0）。
   const _gspent=(D.ledger_by_cycle||[]).reduce((s,l)=>s+((l&&l.money)||0),0);
   const _sm=(p&&p.policy&&p.policy.budget)?p.policy.budget.session_max:null;
-  const _gtotal=(_sm==null)?null:_sm;                            // session_max=null ⇒ 全局预算网关闭（policy 语义）→ 保留 null，不折成 0
-  D.budget={ B_t: scb.B_t!=null?scb.B_t:0, cycle_spent: scb.cycle_spent!=null?scb.cycle_spent:0,
+  const _gtotal=(_sm==null)?null:_finiteNumber(_sm,null);        // session_max=null/非法 ⇒ 观测面关闭，不把字符串带进 HTML/算术
+  D.budget={ B_t:_finiteNumber(scb.B_t,0), cycle_spent:_finiteNumber(scb.cycle_spent,0),
     global_total: _gtotal, global_spent: _gspent,
     // 全局余优先用 server 真值 status_card.budget.global_remaining（口径权威）；缺失才由 total-spent 兜底
-    global_remaining: (scb.global_remaining!=null)?scb.global_remaining:(_gtotal!=null?_gtotal-_gspent:null) };
+    global_remaining: (scb.global_remaining!=null)?_finiteNumber(scb.global_remaining,null):(_gtotal!=null?_gtotal-_gspent:null) };
   D.fs = (p&&p.fs&&p.fs.roots) ? _fsConv(p.fs.roots) : null;     // 真文件树（server _fs_tree）→ 渲染器形状；缺失=demo 用 mock FS
   (D.decision||[]).forEach(d=>{ if(d.summary==null) d.summary=_summ(d.payload_json); });   // 派生列映射
   // directive.payload_json 是 JSON 串（携 polished/confirmed）；渲染码读 d.payload.polished/.confirmed → 解析成对象
   (D.directive||[]).forEach(d=>{ if(d.payload==null){ try{ d.payload=JSON.parse(d.payload_json||"{}")||{}; }catch(e){ d.payload={polished:String(d.payload_json||"")}; } } });
+  (D.interaction_request||[]).forEach(r=>{
+    if(r.items==null){ try{ r.items=JSON.parse(r.items_json||"[]")||[]; }catch(e){ r.items=[]; } }
+    if(r.resolution==null && r.resolution_json){ try{ r.resolution=JSON.parse(r.resolution_json); }catch(e){ r.resolution={invalid_json:true}; } }
+  });
   const tg={}; (T.baseline_tag||[]).forEach(t=>{(tg[t.baseline_id]=tg[t.baseline_id]||[]).push(t.tag);});
   (D.baseline||[]).forEach(b=>{ if(b.tags==null) b.tags=tg[b.id]||[]; });
   (D.execution_log||[]).forEach(l=>{ if(l.owner==null) l.owner=(l.run_id!=null)?('run '+l.run_id):(l.evaluation_attempt_id!=null?('attempt '+l.evaluation_attempt_id):''); });
@@ -2371,12 +2626,14 @@ function adaptPayload(p){
 let LIVE_MODE=false;                                              // 接入真数据后置真 → 渲染码隐藏 mock 演示件（场景切换器 / 「模拟」按钮）
 function buildLive(p){                                            // payload.live + status_card → 原型 scen 形状；真值优先，未知诚实置「—」（不编造）
   const lv=(p&&p.live)||{}, bud=((p&&p.status_card&&p.status_card.budget)||{}), rc=lv.runner_call;
-  const mode=lv.mode||"idle", LBL={running:"训练执行中",awaiting_user:"等待用户供给",idle:"轮间空闲"};
-  return { mode, label:LBL[mode]||mode, idle:mode==="idle", request:mode==="awaiting_user", approval:false,
-    heartbeat_age:(lv.heartbeat_age_s!=null)?(lv.heartbeat_age_s+" 秒前"):"—",
+  const allowedModes=new Set(["running","awaiting_user","paused","idle"]), mode=allowedModes.has(lv.mode)?lv.mode:"idle";
+  const LBL={running:"训练执行中",awaiting_user:"等待用户供给",paused:"人工暂停",idle:"轮间空闲"};
+  return { mode, label:LBL[mode], idle:mode==="idle", request:mode==="awaiting_user",
+    paused:mode==="paused", approval:false,
+    heartbeat_age:(typeof lv.heartbeat_age_s==="number"&&Number.isFinite(lv.heartbeat_age_s))?(lv.heartbeat_age_s+" 秒前"):"—",
     runner: rc?("runner_call #"+rc.id+" · "+(rc.phase||"")+" · "+(rc.status||"")):"（无活跃 runner）",
     cursor:"—", cursor_pct:0, watchdog:"—", watchdog_pct:0,      // bundle 游标 / watchdog 不在 live 载荷 → 诚实置空
-    cost:"$"+(bud.cycle_spent!=null?bud.cycle_spent:0) };
+    cost:"$"+_finiteNumber(bud.cycle_spent,0) };
 }
 function applyLive(p){                                            // 覆盖 SCENARIOS[真 mode] + 指向它 → 10+ 处读 SCENARIOS[state.scenario] 的渲染码零改即得真值
   const L=buildLive(p); SCENARIOS[L.mode]=L; state.scenario=L.mode; LIVE_MODE=true; return L;
@@ -2400,28 +2657,28 @@ let _dbInFlight=false;                                           // 本拍已有
 async function refreshDB(){
   if(HEADLESS || typeof fetch==="undefined" || _dbInFlight) return;
   _dbInFlight=true;
-  try{ const r=await fetch('/api/db'); if(!r.ok) return; const p=await r.json();
+  try{ const r=await apiFetch('/api/db'); if(!r.ok){ showConnectionGuard("真实状态接口返回 HTTP "+r.status+"。"); return; } const p=await r.json();
     DB=adaptPayload(p); applyLive(p); clampSelections();
     if(state.stream.timer){ clearInterval(state.stream.timer); state.stream.timer=null; }  // 停 mock 假 ticker
-    streamSyncReal(); render();
-  }catch(e){ /* 只读观测面：拉取失败静默，下一轮重试 */ }
+    streamSyncReal(); render(); markConsoleSnapshotFresh();
+  }catch(e){ showConnectionGuard("无法连接真实控制台 API："+(e&&e.message?e.message:String(e))); }
   finally{ _dbInFlight=false; }
 }
-if(typeof window!=="undefined" && !HEADLESS){
+if(typeof window!=="undefined" && !HEADLESS && !DEMO_MODE){
   fsOpen=function(p){ state.fs.sel=p; fsRefresh();
     if(!LIVE_MODE){ openPreview(p); return; }                    // 未连线 demo：仍走 mock FILE_CONTENT（否则点文件全报白名单不可读）
-    fetch('/api/file?p='+encodeURIComponent(p)).then(r=>r.ok?r.text():Promise.reject()).then(txt=>{  // 真模式换真拉取（白名单 /api/file）
+    apiFetch('/api/file?p='+encodeURIComponent(p)).then(r=>r.ok?r.text():Promise.reject()).then(txt=>{  // 真模式换真拉取（白名单 /api/file）
       FILE_CONTENT[p]={body:txt, note:"由 /api/file 拉取（只读镜像）"}; openPreview(p);
     }).catch(()=>{ FILE_CONTENT[p]={body:"(该文件不在白名单或不可读)"}; openPreview(p); });
   };
   sendCmd=function(textArg){                                      // 命令行换真入站（写 spool，run 进程 ingest）
     const inp=document.getElementById("cmdin");
     const t=(textArg!=null?textArg:(inp&&inp.value||"")).trim(); if(!t) return;
+    if(!_consoleReady){ showConnectionGuard("控制台连接已失效，拒绝发送命令。"); return; }
     if(inp) inp.value="";
     emitEvent({k:"cmd", html:"<b>&gt; "+esc(t)+"</b>"});
-    fetch('/api/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})
-      .then(r=>r.json().then(j=>({ok:r.ok, j})))                 // 非 2xx 也可能带 JSON → 必须核 r.ok + j.queued，否则给人错误确认
-      .then(({ok,j})=>{ if(!ok || !j || !j.queued){ emitEvent({k:"cmd", text:"入队失败:"+((j&&j.error)||"服务器拒绝")}); return; }
+    apiPost('/api/message',{text:t})
+      .then(({response,body:j})=>{ const ok=response.ok; if(!ok || !j || !j.queued){ emitEvent({k:"cmd", text:"入队失败:"+((j&&j.error)||"服务器拒绝")}); return; }
         emitEvent({k:"cmd", text:"已入队 console_inbox（seq "+j.queued.seq+"）· 待 run 进程 ingest→分类"}); })
       .catch(e=>emitEvent({k:"cmd", text:"入队失败:"+e}));
   };
@@ -2430,5 +2687,8 @@ if(typeof window!=="undefined" && !HEADLESS){
 renderShell();
 render();
 streamSetScenario();
-if(typeof window!=="undefined" && !HEADLESS){ refreshDB(); setInterval(refreshDB, 3000); }   // 首拉 + 3s 轮询真数据
+if(typeof window!=="undefined" && !HEADLESS && !DEMO_MODE){
+  showConnectionGuard(_consoleCapability?"正在连接真实控制台…":"需要 capability 才能连接真实控制台。");
+  refreshDB(); setInterval(refreshDB, 3000); setInterval(enforceSnapshotFreshness,1000);
+}   // 首拉 + 3s 轮询真数据；mock 只在显式 ?demo=1 下启用
 </script></body></html>

@@ -4,9 +4,10 @@
 //   ② adaptPayload 把 console_server /api/db payload 映射回原型 DB 形状（真表平铺顶层 + 派生列）。
 // 用法：node console_smoke.js <index.html 路径> <payload.json 路径>；SMOKE_OK → exit 0。
 const fs = require('fs');
-const [pagePath, payloadPath] = process.argv.slice(2);
+const [pagePath, payloadPath, forbiddenHtml] = process.argv.slice(2);
 const html = fs.readFileSync(pagePath, 'utf8');
 const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).join('\n');
+const htmlWrites = [];
 
 // 通用假元素：Proxy 吸收任意属性/方法访问，让 render 调 innerHTML/classList/addEventListener/... 不抛。
 function fakeEl() {
@@ -22,7 +23,7 @@ function fakeEl() {
       if (k === 'querySelectorAll' || k === 'children') return [];
       return () => fakeEl();
     },
-    set(t, k, v) { t[k] = v; return true; },
+    set(t, k, v) { if (k === 'innerHTML') htmlWrites.push(String(v)); t[k] = v; return true; },
   });
 }
 global.document = { getElementById: () => fakeEl(), querySelector: () => fakeEl(), querySelectorAll: () => [],
@@ -34,7 +35,7 @@ try {
   // __setDB/__applyLive/__setTab 是脚本作用域内的闭包 → 能重赋值 `let DB`/触发 live 覆盖/切标签（外部拿不到词法变量），供冒烟走真渲染路径。
   new Function(scripts + '\n; this.__adapt=adaptPayload; this.__render=render; this.__setDB=function(d){DB=d;};'
     + ' this.__applyLive=applyLive; this.__streamSync=streamSyncReal; this.__clamp=clampSelections; this.__fsRefresh=fsRefresh;'
-    + ' this.__setTab=function(k){state.tab=k;}; this.__tabs=NAV.map(x=>x[0]);').call(ctx);
+    + ' this.__buildLive=buildLive; this.__setTab=function(k){state.tab=k;}; this.__tabs=NAV.map(x=>x[0]);').call(ctx);
 } catch (e) { console.log('SMOKE_FAIL load/render: ' + e.message); process.exit(1); }
 
 const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
@@ -44,6 +45,12 @@ const shapeOk = Array.isArray(D.question) && Array.isArray(D.baseline) && Array.
   && D.budget && typeof D.budget.B_t === 'number'                               // budget 派生就位（顶栏每拍必读）
   && (D.decision.length === 0 || typeof D.decision[0].summary === 'string');
 if (!shapeOk) { console.log('SMOKE_FAIL adapt shape'); process.exit(1); }
+for (const mode of ['running', 'awaiting_user', 'paused', 'idle']) {
+  const live = ctx.__buildLive({live: {mode}});
+  if (live.idle !== (mode === 'idle')) {
+    console.log('SMOKE_FAIL live mode mislabeled idle: ' + mode); process.exit(1);
+  }
+}
 
 // 真数据模式装配：DB ← 真投影；applyLive 用真 payload.live 覆盖（LIVE_MODE=true）；streamSyncReal 铺真事件流。
 ctx.__setDB(D);
@@ -59,6 +66,9 @@ for (const tab of ctx.__tabs) {
   try { ctx.__render(); } catch (e) { fails.push(tab + ': ' + e.message); }
 }
 if (fails.length) { console.log('SMOKE_FAIL render tabs:\n  ' + fails.join('\n  ')); process.exit(1); }
+if (forbiddenHtml && htmlWrites.some(value => value.includes(forbiddenHtml))) {
+  console.log('SMOKE_FAIL raw HTML reached innerHTML: ' + forbiddenHtml); process.exit(1);
+}
 console.log('SMOKE_OK tables=' + Object.keys(payload.tables).length + ' q=' + D.question.length
             + ' dec=' + D.decision.length + ' B_t=' + D.budget.B_t + ' tabs=' + ctx.__tabs.length);
 process.exit(0);

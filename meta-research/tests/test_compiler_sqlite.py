@@ -89,6 +89,23 @@ def test_render_byte_identical(comp, stage):
     assert comp.manifest(p1) == comp.manifest(p2)   # 来源清单亦确定
 
 
+def test_consumed_note_is_present_in_same_cycle_reasoning_context(comp):
+    decision_id = comp.conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (1,'human','directive_note','{}')").lastrowid
+    directive_id = comp.conn.execute(
+        "INSERT INTO directive(kind,hardness,status,consume_at,payload_json,consumed_cycle,"
+        "consumed_decision_id) VALUES ('note','soft','consumed','reasoning_start',?,1,?)",
+        (json.dumps({"polished": "[note] 请在下一轮核对跨数据集方差"}, ensure_ascii=False),
+         decision_id)).lastrowid
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c1", stage="reasoning")
+    assert "本轮已消费人类 directive" in pack.anchor_md
+    assert "请在下一轮核对跨数据集方差" in pack.anchor_md
+    assert f"db:directive:{directive_id}" in pack.sources
+
+
 def test_bundle_requires_target_id(comp):
     with pytest.raises(ValueError, match="target_id 不可为 None"):
         comp.render(cycle_id="c1", stage="bundle")

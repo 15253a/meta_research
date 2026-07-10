@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from .console import Console
+from .console import Console, DirectiveApplicationError
 from .resource_limits import (MAX_ASSETS_PER_GOAL, MAX_CANCEL_REASON_CHARS,
                               MAX_FILE_REQUESTS_PER_GOAL, MAX_REQUEST_ITEMS)
 from .writedaemon import WriteDaemon
@@ -1213,8 +1213,12 @@ def make_advancer_precheck(console: Console, daemon: WriteDaemon) -> Callable:
     def precheck(cyc=None) -> Optional[str]:
         for timing in _due_timings(cyc):
             for did in console.pending_directives(timing):
-                console.consume_directive(directive_id=did,
-                                          cycle_id=(cyc.cycle_id if cyc is not None else None))
+                cycle_id = cyc.cycle_id if cyc is not None else None
+                try:
+                    console.consume_directive(directive_id=did, cycle_id=cycle_id)
+                except DirectiveApplicationError as error:
+                    console.reject_unapplicable_directive(
+                        directive_id=did, reason=str(error), cycle_id=cycle_id)
         if console.has_blocking_pause():
             return "pause 指令生效中（等待 resume）"
         pending = daemon.query_one("SELECT id FROM interaction_request WHERE status='pending' LIMIT 1")
