@@ -510,6 +510,67 @@ def test_judge_import_subject_uses_import_snapshot_layout(tmp_path):
     assert "import smoke ok" in md and '"frozen": true' in md.lower()
 
 
+def test_judge_subject_bounds_large_and_binary_repository_previews(tmp_path):
+    """真实仓库可含大模型/二进制；judge prompt 必须有界，不能把完整文件读入内存。"""
+    daemon, bt_id, work = _judge_env(tmp_path)
+    src = work / "c1" / f"t{bt_id}" / "src"
+    large = b"HEAD-MARKER\n" + (b"a" * 40_000) + b"MIDDLE-SECRET" + (
+        b"z" * 40_000) + b"\nTAIL-MARKER"
+    (src / "large.txt").write_bytes(large)
+    (src / "weights.bin").write_bytes(b"BINARY-HEAD\x00UNSAFE-PAYLOAD")
+
+    jp, _ = _judge(daemon, work, [])
+    md = jp._subject_md("c1", bt_id, "bundle_code_review")
+
+    assert "files=4" in md and f"total_bytes={sum(p.stat().st_size for p in src.iterdir())}" in md
+    assert "HEAD-MARKER" in md and "TAIL-MARKER" in md
+    assert "MIDDLE-SECRET" not in md
+    assert "binary 预览省略" in md and "UNSAFE-PAYLOAD" not in md
+    assert "未载入评审 prompt" in md
+    assert len(md.encode("utf-8")) < 60_000
+
+
+def test_judge_subject_prioritizes_entrypoint_and_caps_total_repository_preview(tmp_path):
+    """大量源码不能挤掉真实命令入口，全部 preview 也必须受一个总 prompt 预算约束。"""
+    daemon, bt_id, work = _judge_env(tmp_path)
+    plan_ref = {
+        "materialization_contract": {
+            "smoke_cmd": ["python", "{repo}/zz_entry.py"],
+            "eval_cmd": ["python", "{repo}/zz_entry.py", "{artifact}"],
+            "artifact_relpath": "weights.bin",
+        },
+    }
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE build_target SET plan_ref=? WHERE id=?",
+            (json.dumps(plan_ref, sort_keys=True), bt_id))
+    src = work / "c1" / f"t{bt_id}" / "src"
+    (src / "zz_entry.py").write_text(
+        "ENTRYPOINT-MARKER = True\n", encoding="utf-8")
+    (src / "weights.bin").write_bytes(b"model\x00payload")
+    for index in range(70):
+        (src / f"aa_module_{index:02d}.py").write_text(
+            f"# module {index}\n" + ("x = 1\n" * 5_000), encoding="utf-8")
+
+    jp, _ = _judge(daemon, work, [])
+    md = jp._subject_md("c1", bt_id, "bundle_code_review")
+
+    assert "ENTRYPOINT-MARKER" in md
+    assert "预览截断声明" in md and "未冒充已做语义评审" in md
+    assert "files=74" in md
+    assert len(md.encode("utf-8")) < 230_000
+
+
+def test_judge_subject_rejects_unlisted_symlink_material(tmp_path):
+    daemon, bt_id, work = _judge_env(tmp_path)
+    src = work / "c1" / f"t{bt_id}" / "src"
+    (src / "alias.py").symlink_to(src / "train.py")
+    jp, _ = _judge(daemon, work, [])
+
+    with pytest.raises(RuntimeError, match="非常规文件"):
+        jp._subject_md("c1", bt_id, "bundle_code_review")
+
+
 def test_judge_unknown_kind_fails_loud(tmp_path):
     """codex SHOULD 回归：拼错的 review_kind 当场拒（否则写任意 decision.type，下游永远看不到期望评审）。"""
     daemon, bt_id, work = _judge_env(tmp_path)

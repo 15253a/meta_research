@@ -35,7 +35,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 if __package__:
     from .artifact_capability import (
@@ -430,7 +430,9 @@ def _write_private(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
     _fsync_dir(path.parent)
 
 
-def _copy_fd_to(fd: int, destination: Path, *, size: int) -> str:
+def _copy_fd_to(
+        fd: int, destination: Path, *, size: int,
+        progress_guard: Optional[Callable[[], None]] = None) -> str:
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     out_fd = os.open(
         destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -440,6 +442,8 @@ def _copy_fd_to(fd: int, destination: Path, *, size: int) -> str:
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         while copied < size:
+            if progress_guard is not None:
+                progress_guard()
             chunk = os.read(fd, min(1024 * 1024, size - copied))
             if not chunk:
                 raise ExecutionSandboxError("sandbox input snapshot 读取被截断")
@@ -494,6 +498,7 @@ class DockerExecutionSandbox:
         self.owner_guard = owner_guard or (lambda: None)
         self._preflight_done = False
         self._resource_mode: Optional[str] = None
+        self.image_environment: Dict[str, str] = {}
         self.engine_path = ""
         self.seccomp_path = Path()
         self.seccomp_spec_hash = ""
@@ -658,11 +663,13 @@ class DockerExecutionSandbox:
                 "docker 实测 resource_mode 与 policy pin 不一致；须显式更新 policy/env_hash")
         image = _bounded_text(_engine(
             engine, host, ["image", "inspect", self.config["image"],
-                           "--format", "{{.Id}}|{{.Os}}|{{.Architecture}}"]),
+                           "--format",
+                           "{{.Id}}|{{.Os}}|{{.Architecture}}|{{json .Config.Env}}"]),
             what="pinned sandbox image inspect")
         try:
-            image_id, os_name, arch = image.split("|", 2)
-        except ValueError as error:
+            image_id, os_name, arch, image_env_json = image.split("|", 3)
+            image_env_items = json.loads(image_env_json)
+        except (ValueError, json.JSONDecodeError) as error:
             raise ExecutionSandboxError("sandbox image inspect 输出不可解析") from error
         host_arch = {
             "x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm",
@@ -670,6 +677,18 @@ class DockerExecutionSandbox:
         if (image_id != self.config["image_id"] or os_name != "linux"
                 or arch != host_arch or arch != self.config["seccomp_bpf_arch"]):
             raise ExecutionSandboxError("本地 sandbox image 与 policy exact pin/platform 不一致")
+        if (not isinstance(image_env_items, list)
+                or any(not isinstance(item, str) or "=" not in item
+                       or "\x00" in item for item in image_env_items)):
+            raise ExecutionSandboxError("sandbox image Config.Env 非法")
+        image_environment: Dict[str, str] = {}
+        for item in image_env_items:
+            key, value = item.split("=", 1)
+            if not key or key in image_environment:
+                raise ExecutionSandboxError(
+                    "sandbox image Config.Env 空 key/重复 key")
+            image_environment[key] = value
+        self.image_environment = image_environment
         probe = subprocess.run(
             [sys.executable, "-I", "-c", _SECCOMP_PROBE, self.seccomp_bpf_b64],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -693,13 +712,20 @@ class DockerExecutionSandbox:
         ledger = []
         total = 0
         index = 0
+        maximum = self.config["input_max_mb"] * 1024 * 1024
         try:
             for fd, expected_hash, size, device, inode in fd_expectations:
                 identity = verify_open_fd(
                     fd, expected_hash=expected_hash, expected_size=size,
-                    expected_device=device, expected_inode=inode)
+                    expected_device=device, expected_inode=inode,
+                    progress_guard=self.owner_guard)
+                if total + identity.size_bytes > maximum:
+                    raise ExecutionSandboxError(
+                        "sandbox verified input snapshot 超 policy 上限")
                 destination = root / f"fd-{index}"
-                actual = _copy_fd_to(fd, destination, size=identity.size_bytes)
+                actual = _copy_fd_to(
+                    fd, destination, size=identity.size_bytes,
+                    progress_guard=self.owner_guard)
                 if actual != normalize_sha256(expected_hash):
                     raise ExecutionSandboxError("sandbox file snapshot hash 漂移")
                 replacements[f"/proc/self/fd/{fd}"] = f"/mr/input/fd-{index}"
@@ -710,19 +736,25 @@ class DockerExecutionSandbox:
             for fd, hashes, allowed_extra in tree_expectations:
                 verify_tree_fd(
                     fd, hashes, label="sandbox source snapshot", exact=True,
-                    allowed_extra=allowed_extra)
+                    allowed_extra=allowed_extra,
+                    progress_guard=self.owner_guard)
                 base = root / f"fd-{index}"
-                base.mkdir(mode=0o555)
+                base.mkdir(mode=0o700)
                 for rel, expected_hash in sorted(hashes.items()):
                     rel = _safe_relpath(rel)
                     with open_artifact(
                             Path(f"/proc/self/fd/{fd}") / rel,
                             expected_hash=expected_hash,
-                            label=f"sandbox source:{rel}") as capability:
+                            label=f"sandbox source:{rel}",
+                            progress_guard=self.owner_guard) as capability:
+                        if total + capability.identity.size_bytes > maximum:
+                            raise ExecutionSandboxError(
+                                "sandbox verified input snapshot 超 policy 上限")
                         destination = base / rel
                         actual = _copy_fd_to(
                             capability.fd, destination,
-                            size=capability.identity.size_bytes)
+                            size=capability.identity.size_bytes,
+                            progress_guard=self.owner_guard)
                         if actual != normalize_sha256(expected_hash):
                             raise ExecutionSandboxError("sandbox tree snapshot hash 漂移")
                         ledger.append({"path": f"fd-{index}/{rel}", "sha256": actual,
@@ -730,19 +762,21 @@ class DockerExecutionSandbox:
                         total += capability.identity.size_bytes
                 replacements[f"/proc/self/fd/{fd}"] = f"/mr/input/fd-{index}"
                 index += 1
-            if total > self.config["input_max_mb"] * 1024 * 1024:
-                raise ExecutionSandboxError("sandbox verified input snapshot 超 policy 上限")
             for current, dirs, files in os.walk(root, topdown=False, followlinks=False):
                 for name in files:
                     os.chmod(Path(current) / name, 0o444, follow_symlinks=False)
                 for name in dirs:
                     os.chmod(Path(current) / name, 0o555, follow_symlinks=False)
-            os.chmod(root, 0o555)
+                os.chmod(Path(current), 0o555, follow_symlinks=False)
+                _fsync_dir(Path(current))
             _fsync_dir(root.parent)
             manifest_hash = _sha(_canonical({"files": ledger, "total_bytes": total}))
             return root, replacements, manifest_hash
         except BaseException:
-            shutil.rmtree(root, ignore_errors=True)
+            try:
+                _safe_remove_tree(root, parent=root.parent)
+            except OSError:
+                pass
             raise
 
     def recover_unstarted_session(
@@ -1202,6 +1236,23 @@ def _safe_remove_tree(path: Path, *, parent: Path) -> None:
     if os.path.lexists(path):
         if stat.S_ISLNK(os.lstat(path).st_mode):
             raise ExecutionSandboxError("sandbox cleanup root 不得是 symlink")
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError:
+            # Non-root deployments cannot unlink children from a published
+            # 0555 input snapshot.  Do not chmod the ordinary 0777 output
+            # quarantine pre-emptively: a rootless daemon can release its bind
+            # asynchronously after container absence, and mutating that inode
+            # first creates a transient permission view for a later mount.
+            pass
+        for current, dirs, _files in os.walk(
+                path, topdown=True, followlinks=False):
+            os.chmod(current, 0o700, follow_symlinks=False)
+            for name in dirs:
+                child = Path(current) / name
+                if not stat.S_ISLNK(os.lstat(child).st_mode):
+                    os.chmod(child, 0o700, follow_symlinks=False)
         shutil.rmtree(path)
 
 

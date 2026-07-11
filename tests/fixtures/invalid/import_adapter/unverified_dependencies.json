@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "artifact_relpath": "artifact.bin",
+  "artifact_type": "external_model",
+  "smoke_argv": ["python", "{repo}/smoke.py"],
+  "eval_argv": ["python", "{repo}/eval.py", "{artifact}"],
+  "dependency_mode": "image_locked",
+  "dependency_locks": ["requirements.lock"],
+  "factory_protocol": {
+    "name": "repository factory",
+    "version": 1,
+    "scope_spec": {},
+    "metrics": [{
+      "log_key": "accuracy",
+      "name": "accuracy",
+      "version": 1,
+      "direction": "higher",
+      "unit": null,
+      "compute_spec": null,
+      "readout_rule": null
+    }],
+    "required": ["accuracy"]
+  }
+}

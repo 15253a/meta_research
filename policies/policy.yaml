@@ -45,6 +45,29 @@ import_search:
     allow_spdx: [Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC]
     scope: { allow_eval: true, allow_modify: true, allow_publish_pool: true, allow_redistribute: false }
 
+# selected_for_materialization 的默认 production fetcher。只接受 GitHub 40-hex commit，经 Git tree API
+# 取得对象闭包并用 commit tar archive 的逐文件 Git blob SHA 交叉核；archive 外层压缩字节不作复现身份。
+# CP11.4c.2a 对 LFS pointer 明确 fail-closed；CP11.4c.2b 接受前须实现 batch 下载+OID/size 复核。
+import_materialization:
+  provider: github_archive_v1
+  adapter_path: .meta-research/import-adapter.json
+  timeout_s: 60
+  max_api_response_bytes: 8388608
+  max_archive_bytes: 8589934592
+  max_file_bytes: 8589934592
+  max_total_bytes: 68719476736
+  max_files: 100000
+  max_tree_depth: 64
+  max_tree_objects: 10000
+  max_submodules: 64
+  lfs_policy: reject
+  allowed_archive_hosts: [codeload.github.com]
+  dependency_lock_names: [requirements.lock, requirements.txt, poetry.lock, uv.lock, conda-lock.yml, package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock]
+  compiler:
+    implementation: CPython
+    version: 3.11.15
+    artifact_sha256: sha256:272179ddd9a2e41a0fc8e42e33dfbdca0b3711aa5abf372d3f2d51543d09b625
+
 # 非默认三闸：stuck/sota 只派生独立参照问题；human_named 只消费已确认 directive authority。
 # SOTA 来源正文由受信 host 以私有内容寻址 blob 冻结；严格 host allowlist 防任意 URL/SSRF。
 import_reference:

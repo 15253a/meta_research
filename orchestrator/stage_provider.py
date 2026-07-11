@@ -33,6 +33,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -635,6 +637,71 @@ def _tail(text: str, n: int = 2000) -> str:
     return text if len(text) <= n else f"…（前 {len(text) - n} 字符截断）…\n" + text[-n:]
 
 
+_REVIEW_INVENTORY_PATHS = 256
+_REVIEW_INVENTORY_TOTAL_BYTES = 32_000
+_REVIEW_PREVIEW_FILES = 64
+_REVIEW_PREVIEW_FILE_BYTES = 20_000
+_REVIEW_PREVIEW_TOTAL_BYTES = 160_000
+
+
+def _bounded_review_preview(path: Path, limit: int = 20000) -> str:
+    """Read at most *limit* bytes from a no-follow regular file for an LLM prompt."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("judge preview limit 须为正整数")
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return f"（非常规文件，拒绝预览；mode={oct(info.st_mode)}）"
+    fd = os.open(
+        path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(fd)
+        if (not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino, opened.st_size)
+                != (info.st_dev, info.st_ino, info.st_size)):
+            raise RuntimeError(f"judge preview 文件身份漂移: {path}")
+        if opened.st_size <= limit:
+            payload = bytearray()
+            while len(payload) < opened.st_size:
+                chunk = os.read(fd, opened.st_size - len(payload))
+                if not chunk:
+                    raise RuntimeError(f"judge preview 文件读取截断: {path}")
+                payload.extend(chunk)
+            payload = bytes(payload)
+            prefix = ""
+        else:
+            head_size = limit // 2
+            tail_size = limit - head_size
+            head = bytearray()
+            while len(head) < head_size:
+                chunk = os.read(fd, head_size - len(head))
+                if not chunk:
+                    raise RuntimeError(f"judge preview 文件头读取截断: {path}")
+                head.extend(chunk)
+            os.lseek(fd, opened.st_size - tail_size, os.SEEK_SET)
+            tail = bytearray()
+            while len(tail) < tail_size:
+                chunk = os.read(fd, tail_size - len(tail))
+                if not chunk:
+                    raise RuntimeError(f"judge preview 文件尾读取截断: {path}")
+                tail.extend(chunk)
+            payload = bytes(head + tail)
+            prefix = (
+                f"…（文件 {opened.st_size} bytes，中间 "
+                f"{opened.st_size - len(payload)} bytes 未载入评审 prompt）…\n")
+        after = os.fstat(fd)
+        if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+             after.st_ctime_ns)
+                != (opened.st_dev, opened.st_ino, opened.st_size,
+                    opened.st_mtime_ns, opened.st_ctime_ns)):
+            raise RuntimeError(f"judge preview 文件读取期间漂移: {path}")
+    finally:
+        os.close(fd)
+    if b"\x00" in payload:
+        return f"（binary 预览省略；{info.st_size} bytes）"
+    return prefix + payload.decode("utf-8", errors="replace")
+
+
 class JudgeProvider:
     """真 Codex 双评审装配（步⑧ CP8.3）：attack/import target 的 judge 契约实现——
     judge(cycle_id, build_target_id, review_kind, subject_hash)。
@@ -704,12 +771,14 @@ class JudgeProvider:
                                            or str(getattr(error, "receipt_path", "") or "") or None))
                 raise
             if "resource_request.json" in art.files:
-                # 判官不许要文件（评审对象已全在材料里；sidecar 出现=越界）——反馈重试，不静默丢弃
+                # 判官不能借 sidecar 扩大读取权限；有界材料若不足，必须在 verdict
+                # 中 fail 并指出缺口，而不是发起一个不可审计的新取数路径。
                 self._record_cost(cycle_id, review_kind, art.usage, status="failed",
                                   failure_kind="artifact_parse", attempt=attempt, call=call,
                                   transcript_ref=art.transcript_ref,
                                   execution_receipt_ref=art.execution_receipt_ref)
-                last_err = "judge 不受理 resource_request sidecar（评审材料已全量给出，产 review_verdict.json 即可）"
+                last_err = ("judge 不受理 resource_request sidecar（材料由编排器有界冻结；"
+                            "若关键路径不足，请在 review_verdict.json 中 fail 并指出缺口）")
                 continue
             verdict = art.files.get("review_verdict.json")
             if verdict is None:
@@ -875,10 +944,112 @@ class JudgeProvider:
             t_dir = self.work / f"c{_cnum(cycle_id)}" / f"t{bt_id}"
             src = t_dir / "src"
         parts = [f"## 评审对象（{kind}）", f"### resolved 计划切片\n```json\n{slice_md}\n```"]
-        for p in sorted(src.rglob("*")):        # 两种评审都给代码（result review 须能据结果反查代码）
-            if p.is_file() and p.name != "_staged.ok":
-                parts.append(f"### 物化文件 {p.relative_to(src)}\n```\n"
-                             f"{_tail(p.read_text(encoding='utf-8', errors='replace'), 20000)}\n```")
+        review_files = []
+        total_bytes = 0
+        if os.path.lexists(src):
+            src_info = os.lstat(src)
+            if (not stat.S_ISDIR(src_info.st_mode)
+                    or stat.S_ISLNK(src_info.st_mode)):
+                raise RuntimeError("judge 物化源码根不是可信目录")
+        for current, dirs, files in os.walk(src, followlinks=False):
+            for name in dirs:
+                info = os.lstat(Path(current) / name)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise RuntimeError(
+                        f"judge 物化源码含非常规目录: {Path(current) / name}")
+            for name in files:
+                path = Path(current) / name
+                if name == "_staged.ok":
+                    continue
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    raise RuntimeError(f"judge 物化源码含非常规文件: {path}")
+                review_files.append((path, info.st_size))
+                total_bytes += info.st_size
+        command_paths = set()
+        artifact_path = None
+        try:
+            plan_ref = json.loads(slice_md)
+            contract = (plan_ref.get("materialization_contract")
+                        if isinstance(plan_ref, dict) else None)
+            if isinstance(contract, dict):
+                raw_artifact = contract.get("artifact_relpath")
+                if isinstance(raw_artifact, str):
+                    artifact_path = raw_artifact
+                for command_key in ("smoke_cmd", "eval_cmd"):
+                    command = contract.get(command_key)
+                    if not isinstance(command, list):
+                        continue
+                    for argument in command:
+                        if isinstance(argument, str) and argument.startswith("{repo}/"):
+                            command_paths.add(argument.removeprefix("{repo}/"))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        def review_priority(item):  # noqa: ANN001, ANN202 - local sort key
+            rel = str(item[0].relative_to(src))
+            if rel == ".meta-research/import-adapter.json":
+                rank = 0
+            elif rel in command_paths:
+                rank = 1
+            elif item[0].suffix == ".py":
+                rank = 2
+            elif rel == artifact_path:
+                rank = 3
+            else:
+                rank = 4
+            return rank, rel
+
+        review_files.sort(key=review_priority)
+        inventory_lines = []
+        inventory_bytes = 0
+        for path, size in review_files[:_REVIEW_INVENTORY_PATHS]:
+            line = f"- {path.relative_to(src)} ({size} bytes)"
+            line_bytes = len((line + "\n").encode("utf-8"))
+            if inventory_bytes + line_bytes > _REVIEW_INVENTORY_TOTAL_BYTES:
+                break
+            inventory_lines.append(line)
+            inventory_bytes += line_bytes
+        inventory_omitted = len(review_files) - len(inventory_lines)
+        parts.append(
+            f"### 物化文件清单摘要\nfiles={len(review_files)} "
+            f"total_bytes={total_bytes} paths_shown={len(inventory_lines)}\n"
+            + "\n".join(inventory_lines)
+            + (f"\n- …其余 {inventory_omitted} 个路径只由 manifest hash 闭包"
+               if inventory_omitted else ""))
+        # Both reviews need code for result backtracking, but a repository may
+        # legitimately contain a multi-GB model or 100k files.  Prompt material
+        # is therefore a bounded, explicitly truncated view; the complete byte
+        # closure remains enforced by the independently hashed subject manifest.
+        remaining_preview_bytes = _REVIEW_PREVIEW_TOTAL_BYTES
+        previewed_files = 0
+        for path, _size in review_files[:_REVIEW_PREVIEW_FILES]:
+            if remaining_preview_bytes <= 0:
+                break
+            per_file_limit = min(
+                _REVIEW_PREVIEW_FILE_BYTES, remaining_preview_bytes)
+            preview = _bounded_review_preview(path, per_file_limit)
+            encoded = preview.encode("utf-8")
+            if len(encoded) > remaining_preview_bytes:
+                preview = (encoded[:remaining_preview_bytes]
+                           .decode("utf-8", errors="ignore")
+                           + "\n…（总预览预算已用尽）…")
+                consumed = remaining_preview_bytes
+            else:
+                consumed = len(encoded)
+            parts.append(
+                f"### 物化文件 {path.relative_to(src)}\n```\n"
+                f"{preview}\n```")
+            remaining_preview_bytes -= consumed
+            previewed_files += 1
+        if len(review_files) > previewed_files:
+            parts.append(
+                f"### 预览截断声明\n已按 adapter/命令入口/Python 优先顺序预览 "
+                f"{previewed_files}/{len(review_files)} 个文件；内容总预算 "
+                f"{_REVIEW_PREVIEW_TOTAL_BYTES} bytes，单文件上限 "
+                f"{_REVIEW_PREVIEW_FILE_BYTES} bytes。其余 "
+                f"{len(review_files) - previewed_files} 个文件仍在 subject manifest hash 闭包中，"
+                "但未冒充已做语义评审。")
         smoke = _latest_smoke_log(t_dir / "smoke")
         if smoke is not None:
             parts.append("### smoke transcript（最新）\n```\n"

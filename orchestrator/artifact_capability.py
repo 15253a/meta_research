@@ -21,7 +21,7 @@ import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Collection, Mapping, Optional
+from typing import Any, Callable, Collection, Mapping, Optional
 
 
 _SHA256_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
@@ -40,7 +40,9 @@ def normalize_sha256(value: Any, *, field: str = "content_hash") -> str:
     return "sha256:" + match.group(1)
 
 
-def _hash_fd(fd: int) -> tuple[str, int]:
+def _hash_fd(
+        fd: int, progress_guard: Optional[Callable[[], None]] = None
+) -> tuple[str, int]:
     try:
         os.lseek(fd, 0, os.SEEK_SET)
     except OSError as error:
@@ -48,6 +50,8 @@ def _hash_fd(fd: int) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
     while True:
+        if progress_guard is not None:
+            progress_guard()
         chunk = os.read(fd, 1024 * 1024)
         if not chunk:
             break
@@ -85,14 +89,16 @@ class ArtifactCapability:
         fd, self.fd = self.fd, -1
         return fd
 
-    def verify_unchanged(self) -> None:
+    def verify_unchanged(
+            self, progress_guard: Optional[Callable[[], None]] = None) -> None:
         if self.fd < 0:
             raise ArtifactCapabilityError("artifact capability 已转移/关闭")
         verify_open_fd(
             self.fd, expected_hash=self.identity.content_hash,
             expected_size=self.identity.size_bytes,
             expected_device=self.identity.device,
-            expected_inode=self.identity.inode)
+            expected_inode=self.identity.inode,
+            progress_guard=progress_guard)
 
     def verify_path_binding(self) -> None:
         """Verify that the durable path still names this exact open inode."""
@@ -122,7 +128,8 @@ class ArtifactCapability:
 
 def open_artifact(
         path: Path | str, *, expected_hash: Optional[str] = None,
-        expected_size: Optional[int] = None, label: str = "artifact"
+        expected_size: Optional[int] = None, label: str = "artifact",
+        progress_guard: Optional[Callable[[], None]] = None,
 ) -> ArtifactCapability:
     """Open and hash one regular file without following the final component."""
     raw_path = os.fspath(path)
@@ -152,7 +159,7 @@ def open_artifact(
                 or (opened.st_dev, opened.st_ino, opened.st_size)
                 != (before.st_dev, before.st_ino, before.st_size)):
             raise ArtifactCapabilityError(f"{label} open 前后身份漂移")
-        content_hash, size = _hash_fd(fd)
+        content_hash, size = _hash_fd(fd, progress_guard)
         if size != opened.st_size:
             raise ArtifactCapabilityError(f"{label} 读取期间 size 漂移")
         if expected_size is not None and size != expected_size:
@@ -177,7 +184,8 @@ def open_artifact(
 
 def verify_open_fd(
         fd: int, *, expected_hash: str, expected_size: Optional[int] = None,
-        expected_device: Optional[int] = None, expected_inode: Optional[int] = None
+        expected_device: Optional[int] = None, expected_inode: Optional[int] = None,
+        progress_guard: Optional[Callable[[], None]] = None,
 ) -> ArtifactIdentity:
     """Re-hash a still-open descriptor after use and verify its inode identity."""
     if isinstance(fd, bool) or not isinstance(fd, int) or fd < 0:
@@ -190,7 +198,7 @@ def verify_open_fd(
         raise ArtifactCapabilityError("artifact fd device 漂移")
     if expected_inode is not None and info.st_ino != expected_inode:
         raise ArtifactCapabilityError("artifact fd inode 漂移")
-    content_hash, size = _hash_fd(fd)
+    content_hash, size = _hash_fd(fd, progress_guard)
     if expected_size is not None and size != expected_size:
         raise ArtifactCapabilityError("artifact fd size 漂移")
     if content_hash != expected:
@@ -203,11 +211,12 @@ def verify_open_fd(
 def read_artifact_bytes(
         path: Path | str, *, expected_hash: Optional[str] = None,
         expected_size: Optional[int] = None, max_bytes: Optional[int] = None,
-        label: str = "artifact") -> bytes:
+        label: str = "artifact",
+        progress_guard: Optional[Callable[[], None]] = None) -> bytes:
     """Read bytes and identity from the same descriptor."""
     with open_artifact(
             path, expected_hash=expected_hash, expected_size=expected_size,
-            label=label) as capability:
+            label=label, progress_guard=progress_guard) as capability:
         size = capability.identity.size_bytes
         if (max_bytes is not None and (
                 isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
@@ -219,6 +228,8 @@ def read_artifact_bytes(
         chunks = []
         remaining = size
         while remaining:
+            if progress_guard is not None:
+                progress_guard()
             chunk = os.read(capability.fd, min(1024 * 1024, remaining))
             if not chunk:
                 raise ArtifactCapabilityError(f"{label} 读取被截断")
@@ -229,7 +240,7 @@ def read_artifact_bytes(
                 != capability.identity.content_hash):
             raise ArtifactCapabilityError(
                 f"{label} bytes 在校验后读取期间被改写")
-        capability.verify_unchanged()
+        capability.verify_unchanged(progress_guard)
         return payload
 
 
@@ -262,7 +273,8 @@ def open_directory(root: Path | str, *, label: str = "artifact tree") -> int:
 def verify_tree_fd(
         dir_fd: int, expected_hashes: Mapping[str, str], *,
         label: str = "artifact tree", exact: bool = False,
-        allowed_extra: Collection[str] = ()) -> None:
+        allowed_extra: Collection[str] = (),
+        progress_guard: Optional[Callable[[], None]] = None) -> None:
     """Verify a file ledger relative to an already-open directory inode."""
     if isinstance(dir_fd, bool) or not isinstance(dir_fd, int) or dir_fd < 0:
         raise ArtifactCapabilityError(f"{label} dirfd 非法")
@@ -270,6 +282,8 @@ def verify_tree_fd(
         if not stat.S_ISDIR(os.fstat(dir_fd).st_mode):
             raise ArtifactCapabilityError(f"{label} 根不是目录")
         for rel, expected in sorted(expected_hashes.items()):
+            if progress_guard is not None:
+                progress_guard()
             if (not isinstance(rel, str) or not rel or rel.startswith("/")
                     or "\\" in rel or any(part in ("", ".", "..")
                                            for part in rel.split("/"))):
@@ -280,12 +294,14 @@ def verify_tree_fd(
             path = Path(f"/proc/self/fd/{dir_fd}") / rel
             with open_artifact(
                     path, expected_hash=expected,
-                    label=f"{label}:{rel}"):
+                    label=f"{label}:{rel}", progress_guard=progress_guard):
                 pass
         if exact:
             disk = set()
             root = Path(f"/proc/self/fd/{dir_fd}")
             for current, dirs, files in os.walk(root, followlinks=False):
+                if progress_guard is not None:
+                    progress_guard()
                 for name in dirs:
                     entry = Path(current) / name
                     if entry.is_symlink():

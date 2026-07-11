@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import open_gate_read_conn
 from orchestrator.import_worker import ImportWorker
 from orchestrator.import_fetcher import FrozenCandidateFetcher
+from orchestrator.repository_materializer import ProductionCandidateFetcher
 from orchestrator.execution_sandbox import (
     DockerExecutionSandbox,
     ExecutionSandboxError,
@@ -212,6 +214,40 @@ def test_default_frozen_candidate_fetcher_validates_content_and_adapter():
             "search_snapshot_hash": "sha256:" + "0" * 64})
 
 
+def test_worker_passes_complete_candidate_contract_to_production_fetcher(tmp_path):
+    """ImportWorker 的 DB 查询/组装必须覆盖 repository materializer 的封闭输入字段。"""
+    captured = {}
+
+    def repository_fetcher(candidate):
+        captured.update(candidate)
+        return _fetch_ok(candidate)
+
+    def unexpected_legacy(_candidate):
+        pytest.fail("non-legacy discovery snapshot 被错误路由到 legacy fetcher")
+
+    fetcher = ProductionCandidateFetcher(
+        legacy_fetcher=unexpected_legacy,
+        repository_fetcher=repository_fetcher)
+    path = str(tmp_path / "production-bridge.sqlite")
+    daemon, state, worker = _mk_worker(
+        path, tmp_path / "work", fetch=fetcher)
+    selection = _seed_deferred(
+        daemon, state, search_snapshot_json="{}")
+
+    assert worker.materialize_pending(max_items=1)
+    assert set(captured) == {
+        "id", "question_id", "canonical_uri", "revision", "source_kind",
+        "search_snapshot_json", "search_snapshot_hash",
+    }
+    assert captured == {
+        "id": selection["cid"], "question_id": 1,
+        "canonical_uri": "hub://model-x", "revision": "rev-abc",
+        "source_kind": "repo", "search_snapshot_json": "{}",
+        "search_snapshot_hash": (
+            "sha256:" + hashlib.sha256(b"{}").hexdigest()),
+    }
+
+
 def test_default_frozen_materialization_refuses_host_execution_without_sandbox(tmp_path):
     path = str(tmp_path / "r.sqlite")
     snapshot = _frozen_snapshot()
@@ -299,6 +335,134 @@ def test_materialize_full_chain(env):
     assert s.is_schedulable("q1") is True
     # 幂等：再扫不重物化
     assert w.materialize_pending() == []
+
+
+def test_file_backed_repository_spec_registers_protocol_and_named_metrics(tmp_path):
+    """Discovery-to-worker v2 hand-off uses files, not a giant DB/raw-bytes snapshot."""
+    source = tmp_path / "repository-object" / "tree"
+    source.mkdir(parents=True)
+    files = {
+        "model.bin": b"repository model",
+        "smoke.py": b"print('smoke ok')\n",
+        "eval.py": b"print('metric_value: accuracy=0.87')\n",
+    }
+    ledger = []
+    for name, payload in sorted(files.items()):
+        path = source / name
+        path.write_bytes(payload)
+        path.chmod(0o444)
+        ledger.append({
+            "path": name,
+            "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+            "bytes": len(payload), "git_mode": "100644",
+        })
+    source.chmod(0o555)
+    protocol = {
+        "id": 42, "version": 1, "name": "repository factory",
+        "scope_spec_json": '{"dataset":"frozen"}',
+        "metric_defs": [{
+            "id": 43, "version": 1, "name": "accuracy",
+            "direction": "higher", "unit": "ratio",
+            "compute_spec": "adapter aggregate",
+            "readout_rule": "higher is better", "log_key": "accuracy",
+        }],
+        "metrics": [[43, 1]],
+    }
+    spec = {
+        "source_tree": str(source), "file_ledger": ledger,
+        "repository_snapshot_hash": "sha256:" + "a" * 64,
+        "smoke_cmd": [sys.executable, "{repo}/smoke.py"],
+        "eval_cmd": [sys.executable, "{repo}/eval.py", "{artifact}"],
+        "protocol_id": 42, "protocol_ver": 1,
+        "factory_protocol": protocol,
+        "metric_log_map": {"accuracy": [43, 1]},
+        "eval_key": "repo-factory", "target_set_hash": "repo-targets",
+        "required": [[43, 1]], "artifact_relpath": "model.bin",
+        "artifact_type": "external_model", "env_hash": "repo-env",
+        "supply_chain": {
+            "dependency_lock_hash": "sha256:" + "1" * 64,
+            "harness_adapter_hash": "sha256:" + "2" * 64,
+            "environment_hash": "repo-env", "network_isolation": True,
+        },
+    }
+    path = str(tmp_path / "repository.sqlite")
+    daemon, state, worker = _mk_worker(
+        path, tmp_path / "work", fetch=lambda _candidate: spec)
+    _seed_deferred(daemon, state)
+
+    assert worker.materialize_pending(max_items=1)
+    assert daemon.query_one(
+        "SELECT name,scope_spec_json,derived_from_question FROM protocol "
+        "WHERE id=42 AND version=1") == (
+            "repository factory", '{"dataset":"frozen"}', 1)
+    target_id = daemon.query_one(
+        "SELECT id FROM build_target WHERE target_kind='import'")[0]
+    assert daemon.query_one(
+        "SELECT metric_id,metric_ver FROM build_target_required_metric "
+        "WHERE build_target_id=?", (target_id,)) == (43, 1)
+    assert daemon.query_one(
+        "SELECT metric_id,metric_ver,value FROM metric_result") == (43, 1, 0.87)
+    assert daemon.query_one(
+        "SELECT compute_spec FROM metric_def WHERE id=43 AND version=1")[0] == (
+            '{"compute_spec":"adapter aggregate",'
+            '"readout_rule":"higher is better"}')
+    clone = tmp_path / "work" / "import1" / "clone"
+    assert stat.S_IMODE((clone / "model.bin").stat().st_mode) == 0o444
+    assert stat.S_IMODE(clone.stat().st_mode) == 0o555
+
+    drift_protocol = {
+        **protocol,
+        "metric_defs": [{
+            **protocol["metric_defs"][0],
+            "readout_rule": "changed without a metric version bump",
+        }],
+    }
+    drift_spec = {**spec, "factory_protocol": drift_protocol}
+    cycle_id = daemon.query_one(
+        "SELECT cycle_id FROM build_target WHERE target_kind='import'")[0]
+    with pytest.raises(ValueError, match="semantic drift"):
+        worker._ensure_factory_protocol(f"c{cycle_id}", drift_spec)
+
+    protocol_bump_with_metric_drift = {
+        **drift_protocol, "version": 2,
+    }
+    protocol_bump_spec = {
+        **spec, "protocol_ver": 2,
+        "factory_protocol": protocol_bump_with_metric_drift,
+    }
+    with pytest.raises(ValueError, match="metric id collision/semantic drift"):
+        worker._ensure_factory_protocol(f"c{cycle_id}", protocol_bump_spec)
+
+    failed_protocol = {
+        **protocol, "id": 52,
+        "metric_defs": [{**protocol["metric_defs"][0], "id": 53}],
+        "metrics": [[53, 1]],
+    }
+    failed_spec = {
+        **spec,
+        "smoke_cmd": [sys.executable, "-c", "raise SystemExit(1)"],
+        "protocol_id": 52, "factory_protocol": failed_protocol,
+        "metric_log_map": {"accuracy": [53, 1]}, "required": [[53, 1]],
+        "eval_key": "failed-repo-factory",
+    }
+    failed_path = str(tmp_path / "failed-repository.sqlite")
+    failed_daemon, failed_state, failed_worker = _mk_worker(
+        failed_path, tmp_path / "failed-work", fetch=lambda _candidate: failed_spec)
+    _seed_deferred(failed_daemon, failed_state)
+    assert failed_worker.materialize_pending(max_items=1)
+    assert failed_daemon.query_one(
+        "SELECT 1 FROM protocol WHERE id=52 AND version=1") is None
+
+
+@pytest.mark.parametrize("line", [
+    "metric_value: unknown=0.1",
+    "metric_value: accuracy=0.1\nmetric_value: accuracy=0.2",
+    "metric_value: accuracy=inf",
+])
+def test_named_repository_metric_protocol_rejects_ambiguity(line):
+    spec = {"metric_log_map": {"accuracy": [43, 1]}}
+    with pytest.raises(Exception, match="metric|Metric"):
+        ImportWorker._import_metrics_from_eval_log(spec, line)
 
 
 def test_advancer_materializes_queue_then_reopens_satisfied_dependency(env):

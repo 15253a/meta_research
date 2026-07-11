@@ -107,6 +107,9 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
   `sandbox.readonly_mounts` 完全相同（外部数据根只读映射）。`sandbox` 还固定 engine unix socket、image digest+ID、
   memory/pids/nofile/日志轮转/单文件/输出/CPU/tmpfs 上限；bundle 锚区给出的 runtime `env_hash` 由这些声明机械派生，
   manifest 只能逐字回引。
+- `import_materialization`：GitHub commit 物化的 API/archive/file/tree/submodule 大小与数量上限、
+  archive redirect host allowlist、LFS 明示策略、adapter 路径和 pinned image 中 CPython 版本/源码
+  artifact SHA-256。当前 `lfs_policy=reject`，不会偷偷把 pointer 当模型。
 - `session.dual_mode`：A=一 turn 一阶段（默认；A/B 实测定默认属运维）。
 
 > **改 policy.yaml 是决策性变更**（影响研究语义/门禁/预算）——生产改动应走评审。改后 `pytest
@@ -295,10 +298,23 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   dependency，永不直接登记候选或 `import_defer`。`sota_reference` 先从 policy host allowlist 做有界 HTTPS
   读取，把 paper/benchmark 原始 bytes 私有写入 SHA-256 内容寻址 blob，再派生独立 baseline-reference 问题；不是按
   `latest` 取隐式事实。两个参照子题在自己的 action-cycle 从父轮 receipt 激活冻结候选，不重复联网。
-- import adapter 已能在 pinned sandbox 内执行；兼容的、已随候选冻结 `materialization` 文件/命令/供应链闭包的
-  snapshot 已有 smoke→双评审→factory eval→入池全链。**默认 GitHub REST discovery snapshot 目前只含 repo/
-  commit/license，不自动下载整仓、合成 harness adapter 或 LFS/依赖闭包**，所以任意搜索命中的普通仓库仍不能
-  直接物化；把这条窄兼容路径说成“自动复现任意 SOTA repo”仍是过度声明。
+- 默认 GitHub discovery 候选已能从 40-hex commit 进入真实物化：逐个非 recursive Git tree
+  API 对象重算 Git SHA-1，commit archive 不使用 `extract()`，每个 regular file 的 size/mode/blob SHA
+  与 tree 交叉核，再记 SHA-256 ledger。同一 commit 的 archive 压缩字节可被 GitHub 重生，因此
+  transport SHA 只是审计证据，复现身份用 root tree + 文件 ledger，不会因 gzip 漂移换一个源。
+  根仓库和固定 gitlink 子模块的 license evidence path/content SHA 都与同一 commit 文件 ledger 交叉核；
+  子模块还独立执行 allowlist 决策。symlink 和 Git LFS pointer 当前 fail-closed。
+- 仓库须携 `.meta-research/import-adapter.json` v2：只允许 pinned Python 直接 argv、
+  `pinned_image_only` 且无项目级 lock 安装，显式声明 artifact、smoke/eval 和 named factory metrics。
+  adapter 通过 sandbox smoke + 代码评审后才能以 repository/name 稳定协议家族 ID 注册；同版本
+  scope/指标变了会碰撞并拒绝，不能用换 ID 逃避升版。发布快照在
+  `<work-root>/state/import-materializations/{objects,indexes}` 内内容寻址，worker DB 只存有界身份。
+  旧候选内嵌 `materialization` v1 仍可恢复。
+- 大仓库的 judge prompt 不会整仓读入内存：给出文件数/总 bytes、至多 256 条且合计 32KB 的路径，并按
+  adapter/命令入口/Python 优先，在 160KB 总预算（单文件 20KB）内展示内容；其余文件仍受 exact
+  manifest hash 闭包约束，但不会冒充已经过语义评审。关键执行路径因截断不可判断时，judge 应 fail-closed。
+- 这仍不是“自动复现任意 SOTA repo”：普通仓库缺 adapter 会被拒；LFS OID 下载、项目 lock
+  构建/验证的专用 image、adapter 生成+独立评审与部署级 quota/cgroup/device 合同属下一检查点。
 - CP11.3c 的 120 轮是无真实 provider 工作负载的控制面/投影回归；尚未完成跨节点 VEPFS 双 owner 实机竞态，
   也尚未运行 100+ 轮含真实 Codex/import/训练与 owner-kill/daemon-loss/预算失败注入的 soak。这两项完成前，
   对“上百轮可用”的结论仍只能是机制上可推进、不是运营验收通过。

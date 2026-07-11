@@ -32,6 +32,8 @@ STAGE_SCHEMAS = [
     "idea_set_draft", "idea_audit", "plan_review",
     # plan 只读发现控制 sidecar（编排器消费，不入 Gate）
     "import_search_request",
+    # 外部 repository 声明式适配合同（物化器还会叠加路径/命令/稳定 ID 业务核）
+    "import_adapter",
 ]
 
 
