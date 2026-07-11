@@ -22,8 +22,10 @@
   120 轮状态稳定性已落 `a32629d`。CP11.4a.1 冻结 import 消费/dependency_wait/worker 恢复与独立 plan 评审
   已落 `43c4134`；CP11.4a.2 `new_structure` 生产 import_search/import_register 与 license provenance 已落
   `43dd99e`；CP11.4a.3 human/stuck/SOTA 可信来源、独立参照题与冻结激活已落 `a31658e`，CP11.4a 达成；
-  CP11.4b fd-safe artifact capability、guardian capture 与 provider invocation 精确补账已落 `e236487`；当前进入
-  CP11.4c 敌对隔离、跨节点信任边界与真实长程验收。
+  CP11.4b fd-safe artifact capability、guardian capture 与 provider invocation 精确补账已落 `e236487`；
+  CP11.4c.1 exact-pinned Docker 敌对执行边界、launcher rlimit+seccomp BPF、guardian container drain 与
+  quarantine 晋升/恢复已落 `a05584d`。当前进入 CP11.4c.2 通用 pinned repository 物化与部署信任边界，随后仍须
+  CP11.4c.3 跨节点 VEPFS 与真实 100+ 轮故障注入验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -414,3 +416,15 @@
       （build_log 0063；相关验证；外审第 2 轮成立项全修/架构误判留据；唯一全量 1332）。
     - [ ] CP11.4c 敌对隔离与最终长程验收：container/cgroup/VM 或等价强隔离、guardian/receipt 防篡改、跨节点
       VEPFS owner 验收，并运行 100+ 轮含真实外调/失败注入的 soak（区别于 CP11.3c 控制面 120 轮回归）。
+      - [x] CP11.4c.1 pinned 敌对执行边界：默认生产 manifest/import adapter 只进入 exact image Docker；输入为
+        已验证私有只读快照、输出先入 quarantine，network/rootfs/cap/user/PID/resource 请求经 create 后 inspect
+        反核；trusted launcher 在 payload env/代码前设置 hard rlimit 并加载 hash-pinned amd64 seccomp BPF。
+        guardian 以随机 name+label 持 exact container cleanup authority，terminal 前证明 host tree 与 daemon
+        container 均 drained；prepare→guardian、return→publish 与非 exit 恢复窗口由中央 session index/receipt
+        幂等收口。→ commit `a05584d`（build_log 0064；外审第 2 轮 3 BLOCKER 全修，seccomp SHOULD 以更强
+        launcher BPF 解决；最终有效全量 1354）。
+      - [ ] CP11.4c.2 通用 pinned repository 物化与部署信任：补 GitHub discovery → exact archive/tree/LFS/依赖
+        闭包与 adapter 生成/评审的生产路径；明确独立 service account/VM、Docker socket、cgroup/device/GPU、
+        hard byte+inode quota 与环境镜像供应链验收，不能把 bootstrap image/host 同 UID 信任域冒充完整隔离。
+      - [ ] CP11.4c.3 最终实机验收：目标 VEPFS 两节点 owner/lease/fd 行为，100+ 轮含真实 Codex/import/训练、
+        owner-kill/daemon-loss/预算与资源失败注入的 soak，并发布可重放证据包。

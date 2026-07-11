@@ -1,44 +1,51 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4c 敌对隔离与最终长程验收
-- 检查点状态：CP11.4b 功能已提交 `e236487`；唯一全量 1332 passed；build_log 0063 已记账；CP11.4b 达成
+- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4c.2 通用 pinned repository 物化与部署信任边界
+- 检查点状态：CP11.4c.1 功能已提交 `a05584d`；最终有效全量 1354 passed；build_log 0064 已记账；
+  CP11.4c 父项仍未达成
 
 ## 刚完成什么
 
-CP11.4b 已把 source tree、checkpoint 与 imported artifact 从“hash 后再按 path open”改为 fd capability：同一
-`O_NOFOLLOW` fd 上取得 device/inode/size/hash 并读取，source tree 从稳定 root dirfd 相对遍历，外部进程通过
-`/proc/self/fd` + `pass_fds` 消费，使用后复核 capability、路径绑定或整棵树。manifest、attack、harness 与 import worker
-已接入，path swap、symlink 和内容变化均 fail-closed。
+CP11.4c.1 已把生产 bundle/import 的不可信命令从 host lifecycle guardian 后面移入 exact-pinned Docker：只读
+verified snapshot/input mount、单一 quarantine writable mount、network none、readonly rootfs、non-root、cap-drop ALL、
+no-new-privileges、private PID/IPC 与 daemon 资源声明均在 create 后 inspect 反核。trusted pinned-image launcher 先设置
+hard `RLIMIT_AS/NPROC/NOFILE/FSIZE/CORE`，再加载 vendored Moby profile 生成且 SHA-256 固定的 amd64 seccomp BPF，最后
+才解析 payload env 并 exec；host env/凭据不会进入 runner spec/container。
 
-所有 Codex 调用现在有本地 invocation identity；guardian 将 stdout/stderr 写入 0600 capture，terminal receipt 锚定
-inode/size/hash。owner 在 provider 返回与 DB 提交之间死亡时，可从 capture 重建严格 `provider-invocation-v1` receipt，
-再把 runner_call、usage 与本地 policy cost ledger 在一个 WriteDaemon 事务中只对账一次。usage 冲突、capture 失败或无法
-确认时记 unknown 并 fail-closed；regular/query 恢复不伪造业务成功。
+guardian receipt 现在携 exact random container name+private label authority，只有 local descendant tree 与 daemon container
+都证明 drained 才发布 terminal。输出在 drain 后经过 no-symlink/regular-single-link/file-count/bytes/hash 闭包再幂等晋升；
+不安全输出原子结算 exact run/attempt/target。prepare→guardian、非 exit 与 return→publish 崩溃窗由中央 session index、
+owner receipt 和 absence proof 恢复；索引先于 metadata fsync，index-only kill window 也可启动清理。
 
 ## 验证 / Review
 
-- 开发期相关组：runner 32、supervisor 22、execution/reconcile 36、cost/query 76、artifact/import/manifest 87、run 47、
-  attack 76、manifest/import/stage 123 均通过；compile/check 通过。
-- 检查点末唯一一次全量：`pytest -q` → `1332 passed in 313.81s`，无失败、无第二次全量。
-- 外审第 1 轮独立账号 401，无 verdict；第 2 轮 `REQUEST_CHANGES`。成立的 capture 无限 running、README overclaim、
-  fd rewind 与 str→bytes 均已修；specialized owner 与 unique-index 两项经冻结架构/单写事务核实不成立，增加注释和
-  active-transaction 机械断言。两轮上限后未发第 3 轮。
-- 功能提交：`e236487e31c4f30de1ae2d344afc4100e8faebca`；尚未 push。
+- 相关验证：sandbox 最终 `18 passed`；schema/manifest/run `197 passed`；attack/import/supervisor/observation
+  `127 passed`；M4 env reuse 与完整 attack flow 修复后各 `1 passed`；compile、canonical seccomp JSON/BPF hash、
+  `git diff --check` 均通过。
+- 首次本地全量在根盘达到 100% 后失效（`1032 passed, 3 failed, 318 errors`）；其中旧 M4 用例的 `toy-env` 是真实
+  契约回归并已修，其余用 VEPFS last-failed 子集复核为环境级联。修复 GPFS rootless bindfs 精确映射后，最终有效
+  全量固定 VEPFS `TMPDIR/basetemp`：`1354 passed in 1026.33s`。
+- 外审第 1 轮独立账号 401，无 verdict；第 2 轮 `REQUEST_CHANGES`。prepare→guardian/非 exit 恢复、payload env
+  pre-rlimit 注入、readonly mount 覆盖 work-root 三个 BLOCKER 均已修。daemon 显式 seccomp 在本平台会被替换，故以
+  更强的 pinned launcher BPF 闭合 SHOULD；两轮上限后未发第 3 轮。
+- 功能提交：`a05584de1e63db86d786f14d6b1772758f78a3b9`；尚未 push。
 
 ## 当前关键边界
 
-- CP11.4b 完成不等于 provider 侧 exactly-once：只保证每个已观察 invocation 在本地入账一次；policy cost projection
-  不是供应商 invoice。
-- 同 UID 敌手仍可能攻击嵌套目录/进程证据；container/cgroup/VM 等强隔离、guardian/receipt 跨信任域防篡改、VEPFS
-  跨节点 owner/fd 语义和含真实外调/故障注入的 100+ 轮 soak 尚未完成。
-- CP11.3c 的 120 轮是控制面/状态投影回归，不是 100+ 轮真实 provider 工作负载验收。
-- 不得 push；继续按用户节奏：开发期只跑相关验证，检查点末只跑一次全量，再提交功能和记账。
+- 当前 rootless daemon 明示 `CgroupDriver=none`，receipt 诚实写 `rlimit-fallback`；hard rlimit 是 per-process，不能
+  冒充 aggregate memory/CPU cgroup。输出 bytes/files 是晋升前后验闸，host/VEPFS 仍须 hard byte+inode quota。
+- 默认镜像是 CPU/Python bootstrap，没有 GPU/device/项目锁定依赖；同 host 的 root/orchestrator UID 与 Docker socket
+  仍在信任域内。防 host 对手需要独立 service account/VM/远端 attestation，不是 0600 自签 receipt 能解决。
+- 默认 GitHub discovery snapshot 只有 repo/commit/license；尚无任意仓库 exact archive/tree/LFS/依赖闭包与 adapter
+  生成路径。当前只支持候选中已冻结、尺寸有界的兼容 materialization。
+- 仍未完成两节点 VEPFS owner/lease/fd 实机竞态，也未完成含真实 Codex/import/训练及故障注入的 100+ 轮 soak；
+  CP11.3c 的 120 轮仍只证明控制面/状态投影。
+- 不得 push；开发期继续只跑相关验证，检查点冻结后再做最终全量。
 
 ## 下一步动作
 
-1. 逐条映射 `reference/` 对敌对代码执行、资源限制、owner/receipt 信任域、跨节点共享文件系统和长程验收的原始要求，
-   划定 CP11.4c 可在当前环境机械证明与必须诚实标注为部署验收的部分。
-2. 设计最小强隔离边界：优先 rootless container/user+mount+pid+network namespace、cgroup v2 与只读/显式 capability mount；
-   环境不支持时 fail-closed，不以普通 subprocess/same-UID 权限冒充沙箱。
-3. 把 guardian/capture/provider receipt 放入隔离执行者不可写的信任域，并补篡改、owner-death、资源耗尽与跨节点 canary。
-4. 设计 100+ 轮真实 provider/失败注入 soak 的可恢复证据包；开发期只跑相关验证，检查点边界外审后只跑一次全量。
+1. CP11.4c.2：设计 discovery candidate → exact commit archive/tree（含 submodule/LFS 明示策略）→ content-addressed
+   materialization → sandbox adapter review 的生产协议，禁止隐式网络/动态依赖。
+2. 把镜像 SBOM/依赖 lock、service account/VM、Docker socket、cgroup v2/device/GPU 与 VEPFS hard quota 写成可启动
+   fail-closed 的 deployment contract；当前节点不具备的能力只列验收，不伪造通过。
+3. CP11.4c.3：准备两节点 owner canary 与 100+ 轮真实 workload/owner-kill/daemon-loss/资源失败 soak 证据包。
