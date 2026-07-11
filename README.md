@@ -310,6 +310,10 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   scope/指标变了会碰撞并拒绝，不能用换 ID 逃避升版。发布快照在
   `<work-root>/state/import-materializations/{objects,indexes}` 内内容寻址，worker DB 只存有界身份。
   旧候选内嵌 `materialization` v1 仍可恢复。
+- 物化实现以 `repository_materializer.py` 作为兼容 facade 与单次编排入口；共享 identity primitives、HTTPS
+  transport、Git tree、archive/submodule、adapter compiler、content store 分属
+  `repository_materialization_common.py` 与 `repository_materializer_{transport,tree,archive,adapter,store}.py`。
+  扩展 LFS、依赖构建或 adapter 生成时应落入对应组件，不得把供应链职责重新堆回 facade。
 - 大仓库的 judge prompt 不会整仓读入内存：给出文件数/总 bytes、至多 256 条且合计 32KB 的路径，并按
   adapter/命令入口/Python 优先，在 160KB 总预算（单文件 20KB）内展示内容；其余文件仍受 exact
   manifest hash 闭包约束，但不会冒充已经过语义评审。关键执行路径因截断不可判断时，judge 应 fail-closed。
