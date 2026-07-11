@@ -20,17 +20,21 @@ import json
 import os
 import pwd
 import re
-import signal
 import shutil
 import stat
 import subprocess
 import tempfile
-import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 from .interfaces import Artifact, CallUsage, ContextPack
+from .process_supervisor import (
+    ExecutionCleanupError,
+    ExecutionSupervisor,
+    ExecutionSupervisorError,
+    terminate_all_supervised_executions,
+)
 
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
 # codex CLI 在 stderr 打**汇总行**「tokens used」+ 总 token（实机：标签独占一行、数字在下一行；亦容「tokens used: N」单行）。
@@ -42,98 +46,29 @@ _TOKENS_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 TOOL_FREE_POLICY_VERSION = (
-    "interaction-query-tools-v3:web-disabled:no-host-tools:uid-isolated:"
-    "trace-allowlist:process-group")
+    "interaction-query-tools-v4:web-disabled:no-host-tools:uid-isolated:"
+    "trace-allowlist:guardian-subtree")
 _TOOL_FREE_ALLOWED_ITEMS = frozenset({"agent_message", "reasoning"})
 _TOOL_FREE_ALLOWED_EVENTS = frozenset({
     "thread.started", "turn.started", "item.started", "item.updated",
     "item.completed", "turn.completed",
 })
 _MAX_TOOL_FREE_OUTPUT_BYTES = 1024 * 1024
-_ACTIVE_PROCESS_GROUPS = {}
-_ACTIVE_PROCESS_GROUPS_LOCK = threading.Lock()
-_PROCESS_GROUP_SHUTDOWN = threading.Event()
-
-
-def _terminate_process_group(proc: subprocess.Popen, *, grace_s: float = 1.0):
-    """Terminate the whole new session, drain its pipes, then reap the direct child."""
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        return proc.communicate(timeout=grace_s)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        return proc.communicate()
-
-
 def _run_process_group(cmd, *, stdin, timeout, cwd=None):
-    """``subprocess.run`` equivalent whose timeout/interrupt cannot orphan sudo descendants."""
-    with _ACTIVE_PROCESS_GROUPS_LOCK:
-        if _PROCESS_GROUP_SHUTDOWN.is_set():
-            raise RuntimeError("tool-free process registry 已进入 hard-stop，拒绝启动新调用")
-        # Popen + register share the same lock as hard-stop snapshot.  Therefore a shutdown either
-        # precedes this spawn (and rejects it) or observes the fully registered process group.
-        proc = subprocess.Popen(
-            cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True, cwd=cwd)
-        _ACTIVE_PROCESS_GROUPS[proc.pid] = proc
+    """Compatibility entry routed through the same guardian as production."""
+    receipt_dir = Path(tempfile.mkdtemp(prefix="meta-research-execution-"))
+    supervisor = ExecutionSupervisor.standalone(receipt_dir)
     try:
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired as error:
-            stdout, stderr = _terminate_process_group(proc)
-            raise subprocess.TimeoutExpired(
-                error.cmd, error.timeout,
-                output=stdout if stdout is not None else error.output,
-                stderr=stderr if stderr is not None else error.stderr) from error
-        except BaseException:
-            _terminate_process_group(proc)
-            raise
+        return supervisor.run(
+            cmd, stdin=stdin, capture_output=True, timeout_s=timeout,
+            cwd=cwd, kind="compat-process")
     finally:
-        with _ACTIVE_PROCESS_GROUPS_LOCK:
-            _ACTIVE_PROCESS_GROUPS.pop(proc.pid, None)
-    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        supervisor.close()
 
 
 def terminate_active_process_groups(*, grace_s: float = 0.25) -> None:
-    """Hard-stop escape hatch: signal tool-free calls running in background worker threads."""
-    with _ACTIVE_PROCESS_GROUPS_LOCK:
-        _PROCESS_GROUP_SHUTDOWN.set()
-        active = list(_ACTIVE_PROCESS_GROUPS.values())
-    errors = []
-    try:
-        for proc in active:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except OSError as error:
-                errors.append(error)
-        if active and grace_s > 0:
-            time.sleep(grace_s)
-    finally:
-        # Even a third SIGINT during the grace sleep cannot skip SIGKILL.
-        with _ACTIVE_PROCESS_GROUPS_LOCK:
-            still_registered = {
-                pid: proc for pid, proc in _ACTIVE_PROCESS_GROUPS.items()
-                if any(proc is candidate for candidate in active)
-            }
-        for proc in still_registered.values():
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError as error:
-                errors.append(error)
-    if errors:
-        raise RuntimeError(
-            "部分 tool-free 进程组无法终止: "
-            + "; ".join(f"{type(error).__name__}: {error}" for error in errors))
+    """Backward-compatible hard-stop name; now covers every execution kind."""
+    terminate_all_supervised_executions(wait_s=max(5.0, float(grace_s)))
 
 
 def _copy_isolated_output(src: Path, dst: Path, *, expected_uid: int) -> None:
@@ -255,26 +190,39 @@ class RunnerError(RuntimeError):
     触发持久计账停机，不会把未知成本冒充真 0。
     """
 
-    def __init__(self, message: str, *, usage=None, transcript_ref: Optional[str] = None):
+    def __init__(self, message: str, *, usage=None, transcript_ref: Optional[str] = None,
+                 failure_kind: str = "runner_error",
+                 execution_receipt_ref: Optional[str] = None):
         super().__init__(message)
         self.usage = usage
         self.transcript_ref = transcript_ref
+        self.failure_kind = failure_kind
+        self.execution_receipt_ref = execution_receipt_ref
 
 
 class CodexRunner:
-    def __init__(self, *, transcripts_dir: Path, purpose_tag: str = "", tool_free: bool = False):
+    def __init__(self, *, transcripts_dir: Path, purpose_tag: str = "", tool_free: bool = False,
+                 execution_supervisor: Optional[ExecutionSupervisor] = None):
         self.bin = os.environ.get("METARESEARCH_CODEX_BIN", "codex-chatgpt")
         self.model = os.environ.get("METARESEARCH_CODEX_MODEL", "gpt-5.5")
         self.effort = os.environ.get("METARESEARCH_CODEX_EFFORT", "medium")
         self.timeout_s = int(os.environ.get("METARESEARCH_RUNNER_TIMEOUT_S", "900"))
-        self.transcripts_dir = transcripts_dir
+        self.transcripts_dir = Path(transcripts_dir)
+        self.transcripts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.transcripts_dir, 0o700)
         self.purpose_tag = purpose_tag
         self.tool_free = tool_free
+        self.execution_supervisor = execution_supervisor or ExecutionSupervisor.standalone(
+            self.transcripts_dir / ".execution-receipts")
         self.query_user = None
         self.query_user_home = None
         self.query_uid = None
         self.query_gid = None
         if tool_free:
+            if os.geteuid() != 0:
+                raise ValueError(
+                    "interaction_query guardian 须以 root 运行，才能对 sudo 降权后的"
+                    "完整子树执行 TERM/KILL；非 root 装配拒绝启动")
             requested = os.environ.get("METARESEARCH_QUERY_RUN_AS_USER")
             if requested is None and os.geteuid() == 0:
                 try:
@@ -418,14 +366,16 @@ class CodexRunner:
         copy_error = None
         try:
             with prompt_file.open("rb") as fh:
-                if self.tool_free:
-                    proc = _run_process_group(
-                        cmd, stdin=fh, timeout=self.timeout_s, cwd=runtime_cwd)
-                else:
-                    proc = subprocess.run(
-                        cmd, stdin=fh,
-                        capture_output=True, timeout=self.timeout_s,
-                    )
+                proc = self.execution_supervisor.run(
+                    cmd, stdin=fh, capture_output=True,
+                    timeout_s=self.timeout_s,
+                    cwd=runtime_cwd if self.tool_free else None,
+                    kind="codex-query" if self.tool_free else "codex-runner",
+                    operation_context={
+                        "cycle_id": pack.cycle_id,
+                        "stage": pack.stage,
+                        "target_id": pack.target_id,
+                        "call_tag": tag})
         except subprocess.TimeoutExpired as e:
             wallclock = round(time.monotonic() - t0, 3)
             stderr = self._stream_text(getattr(e, "stderr", None))
@@ -437,7 +387,22 @@ class CodexRunner:
                     os.chmod(events_file, 0o600)
                 except OSError:
                     pass
-            raise RunnerError(f"runner 超时（{self.timeout_s}s）：{tag}", usage=usage) from e
+            raise RunnerError(
+                f"runner 超时（{self.timeout_s}s）：{tag}", usage=usage,
+                failure_kind="timeout",
+                execution_receipt_ref=(str(e.receipt_path)
+                                       if hasattr(e, "receipt_path") else None)) from e
+        except ExecutionCleanupError as e:
+            wallclock = round(time.monotonic() - t0, 3)
+            usage = self._usage("", wallclock, "")
+            raise RunnerError(
+                f"runner descendant cleanup 拒绝结果：{tag}（{e.receipt.get('outcome')}）",
+                usage=usage, failure_kind=str(e.receipt.get("outcome") or "runtime"),
+                execution_receipt_ref=str(e.receipt_path)) from e
+        except ExecutionSupervisorError:
+            # Cancellation/hard-stop and unsafe recovery are lifecycle control
+            # signals, not retryable model/artifact failures.
+            raise
         finally:
             if runtime_dir is not None:
                 try:
@@ -464,7 +429,11 @@ class CodexRunner:
                     f"tool-free runner 事件回执归档失败：{tag}（{error}）", usage=usage) from error
         if proc.returncode != 0 or not out_file.exists():
             tail = stderr[-500:]
-            raise RunnerError(f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}", usage=usage)
+            raise RunnerError(
+                f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}", usage=usage,
+                failure_kind="runtime",
+                execution_receipt_ref=(str(proc.receipt_path)
+                                       if hasattr(proc, "receipt_path") else None))
         if self.tool_free:
             try:
                 validate_tool_free_trace(stdout)

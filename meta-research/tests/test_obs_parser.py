@@ -5,6 +5,7 @@ suspect 真派生挡复用（§4.1.5 selector）+ 挡关问（gate_close_questio
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -76,6 +77,9 @@ def test_harness_real_subprocess_and_atomic_log(tmp_path):
     assert r["exit_code"] == 0
     p = Path(r["log_path"])
     assert p.name == "train.log" and p.exists()
+    pointer = json.loads(Path(r["process_pointer_path"]).read_text())
+    assert pointer["operation_id"] == r["process_receipt"]["operation_id"]
+    assert r["process_receipt"]["context"]["log_name"] == "train.log"
     assert not p.with_name("train.log.partial").exists()          # 已原子改名，无残留半成品
     f = OP.parse_log(p.read_text(), OBS)
     assert f["loss_trend"] == "down" and OP.derive_suspect(f, OBS) == 0
@@ -89,6 +93,65 @@ def test_harness_timeout_leaves_partial(tmp_path):
                      staging_dir=str(tmp_path), log_name="hang.log", timeout_s=0.5)
     assert (tmp_path / "hang.log.partial").exists()               # 半成品留 .partial（可辨识丢弃）
     assert not (tmp_path / "hang.log").exists()                   # 绝不冒充完整 log
+    receipts = list((tmp_path / ".execution-receipts").glob("execution-*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text())
+    assert receipt["outcome"] == "timeout" and receipt["group_drained"] is True
+    pointer = json.loads((tmp_path / "hang.log.process.json").read_text())
+    assert pointer["operation_id"] == receipt["operation_id"]
+    assert receipt["context"]["log_name"] == "hang.log"
+
+
+def test_harness_pointer_failure_preserves_timeout_authority(tmp_path, monkeypatch):
+    """Pointer 是便利索引；写坏它不得覆盖 guardian 的 timeout+receipt 权威。"""
+    original = H.atomic_write_receipt
+
+    def fail_process_pointer(path, receipt):
+        if str(path).endswith(".process.json"):
+            raise OSError("pointer-fsync")
+        return original(path, receipt)
+
+    monkeypatch.setattr(H, "atomic_write_receipt", fail_process_pointer)
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        H.run_staged(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            staging_dir=str(tmp_path), log_name="hang.log", timeout_s=0.2)
+    error = caught.value
+    assert error.receipt["outcome"] == "timeout"
+    assert error.receipt["group_drained"] is True
+    assert str(error.process_pointer_error) == "pointer-fsync"
+    assert (tmp_path / "hang.log.partial").exists()
+    assert not (tmp_path / "hang.log").exists()
+    assert not (tmp_path / "hang.log.exit").exists()
+    assert not (tmp_path / "hang.log.process.json").exists()
+
+
+def test_harness_success_pointer_failure_does_not_promote_partial(tmp_path, monkeypatch):
+    def fail_process_pointer(_path, _receipt):
+        raise OSError("pointer-fsync")
+
+    monkeypatch.setattr(H, "atomic_write_receipt", fail_process_pointer)
+    with pytest.raises(OSError, match="pointer-fsync"):
+        H.run_staged(
+            [sys.executable, "-c", "print('complete')"],
+            staging_dir=str(tmp_path), log_name="train.log", timeout_s=2)
+    assert (tmp_path / "train.log.partial").exists()
+    assert not (tmp_path / "train.log").exists()
+    assert not (tmp_path / "train.log.exit").exists()
+
+
+def test_harness_exit_sidecar_write_all_handles_short_writes(tmp_path, monkeypatch):
+    original_write = H.os.write
+
+    def one_byte_write(fd, payload):
+        return original_write(fd, memoryview(payload)[:1])
+
+    monkeypatch.setattr(H.os, "write", one_byte_write)
+    result = H.run_staged(
+        [sys.executable, "-c", "raise SystemExit(17)"],
+        staging_dir=str(tmp_path), log_name="nonzero.log", timeout_s=2)
+    assert result["exit_code"] == 17
+    assert (tmp_path / "nonzero.log.exit").read_text() == "17"
 
 
 # ============ 入账 + 观测落库（幂等）============

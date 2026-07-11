@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator import runner as R
+from orchestrator import process_supervisor as PS
 from orchestrator.interfaces import ContextPack
 from orchestrator.runner import CodexRunner, parse_json_tokens_used, parse_tokens_used
 
@@ -56,11 +57,28 @@ def _pack() -> ContextPack:
 
 
 def _fake_run_factory(stderr: bytes, rc: int = 0):
-    def fake_run(cmd, stdin=None, capture_output=False, timeout=None):
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         out = Path(cmd[cmd.index("-o") + 1])                   # 生产同构：向 -o 目标写合法信封
         out.write_text('```json\n{"files":{"idea_set.json":{}},"md":"ok"}\n```', encoding="utf-8")
         return types.SimpleNamespace(returncode=rc, stdout=b"envelope-on-stdout", stderr=stderr)
     return fake_run
+
+
+class _FakeExecutionSupervisor:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def run(self, cmd, *, stdin=None, capture_output=False, timeout_s=None,
+            cwd=None, **_kwargs):
+        return self.fn(
+            cmd, stdin=stdin, capture_output=capture_output,
+            timeout=timeout_s, cwd=cwd)
+
+
+def _fake_runner(tmp_path, fn, **kwargs):
+    return CodexRunner(
+        transcripts_dir=tmp_path,
+        execution_supervisor=_FakeExecutionSupervisor(fn), **kwargs)
 
 
 def test_untrusted_file_receipt_guard_is_present_even_without_resolved_refs(tmp_path):
@@ -73,9 +91,9 @@ def test_untrusted_file_receipt_guard_is_present_even_without_resolved_refs(tmp_
 
 
 def test_runner_captures_usage(tmp_path, monkeypatch):
-    monkeypatch.setattr(subprocess, "run",
-                        _fake_run_factory(b"progress...\ntokens used\n1,800\n"))
-    art = CodexRunner(transcripts_dir=tmp_path).run_task(system_prompt="s", skill="k", context_pack=_pack())
+    art = _fake_runner(
+        tmp_path, _fake_run_factory(b"progress...\ntokens used\n1,800\n")).run_task(
+            system_prompt="s", skill="k", context_pack=_pack())
     assert art.files == {"idea_set.json": {}}                  # 产物校验路径不受影响
     assert art.usage is not None
     assert art.usage.tokens_total == 1800                      # 真 token 从 stderr 抽到
@@ -87,7 +105,7 @@ def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch
     """interaction_query 的“只读”是能力边界：命令行必须关 shell/浏览器/apps/再委派，不只靠 prompt。"""
     captured = {}
 
-    def fake_run(cmd, stdin=None, timeout=None, cwd=None):
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         captured["cmd"] = cmd
         captured["cwd"] = cwd
         out = Path(cmd[cmd.index("-o") + 1])
@@ -100,8 +118,7 @@ def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch
                  b'{"type":"turn.completed","usage":{}}\n')
         return types.SimpleNamespace(returncode=0, stdout=trace, stderr=b"tokens used\n1\n")
 
-    monkeypatch.setattr(R, "_run_process_group", fake_run)
-    CodexRunner(transcripts_dir=tmp_path, tool_free=True).run_task(
+    _fake_runner(tmp_path, fake_run, tool_free=True).run_task(
         system_prompt="s", skill="k", context_pack=_pack())
     cmd = captured["cmd"]
     assert cmd[:2] == ["/usr/bin/sudo", "-n"] and "-u" in cmd
@@ -119,7 +136,7 @@ def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch
 
 
 def test_tool_free_runner_rejects_any_observed_tool_item(tmp_path, monkeypatch):
-    def fake_run(cmd, stdin=None, timeout=None, cwd=None):
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         out = Path(cmd[cmd.index("-o") + 1])
         out.write_text('```json\n{"files":{"idea_set.json":{}},"md":""}\n```', encoding="utf-8")
         account = pwd.getpwnam("codexro")
@@ -129,9 +146,8 @@ def test_tool_free_runner_rejects_any_observed_tool_item(tmp_path, monkeypatch):
                  b'{"type":"turn.completed","usage":{}}\n')
         return types.SimpleNamespace(returncode=0, stdout=trace, stderr=b"tokens used\n1\n")
 
-    monkeypatch.setattr(R, "_run_process_group", fake_run)
     with pytest.raises(R.RunnerError, match="禁止工具") as error:
-        CodexRunner(transcripts_dir=tmp_path, tool_free=True).run_task(
+        _fake_runner(tmp_path, fake_run, tool_free=True).run_task(
             system_prompt="s", skill="k", context_pack=_pack())
     assert error.value.usage.tokens_total == 1
 
@@ -158,16 +174,15 @@ def test_tool_free_output_copy_rejects_symlink_from_query_uid(tmp_path, monkeypa
     protected = tmp_path / "protected.txt"
     protected.write_text("writer-only-secret", encoding="utf-8")
 
-    def fake_run(cmd, stdin=None, timeout=None, cwd=None):
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         out = Path(cmd[cmd.index("-o") + 1])
         out.symlink_to(protected)
         trace = (b'{"type":"turn.started"}\n'
                  b'{"type":"turn.completed","usage":{"total_tokens":1}}\n')
         return types.SimpleNamespace(returncode=0, stdout=trace, stderr=b"")
 
-    monkeypatch.setattr(R, "_run_process_group", fake_run)
     with pytest.raises(R.RunnerError, match="输出接收失败"):
-        CodexRunner(transcripts_dir=tmp_path / "transcripts", tool_free=True).run_task(
+        _fake_runner(tmp_path / "transcripts", fake_run, tool_free=True).run_task(
             system_prompt="s", skill="k", context_pack=_pack())
     assert protected.read_text(encoding="utf-8") == "writer-only-secret"
 
@@ -226,8 +241,8 @@ def test_hard_stop_registry_kills_sudo_group_running_in_worker(tmp_path):
     thread.start()
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
-        with R._ACTIVE_PROCESS_GROUPS_LOCK:
-            if R._ACTIVE_PROCESS_GROUPS:
+        with PS._GLOBAL_CONDITION:
+            if PS._GLOBAL_ACTIVE:
                 break
         time.sleep(0.005)
     else:
@@ -239,7 +254,7 @@ def test_hard_stop_registry_kills_sudo_group_running_in_worker(tmp_path):
         time.sleep(0.5)
         assert not marker.exists()
     finally:
-        R._PROCESS_GROUP_SHUTDOWN.clear()
+        PS._reset_global_hard_stop_for_tests()
 
 
 def test_hard_stop_registry_rejects_future_process_spawn(tmp_path):
@@ -253,44 +268,32 @@ def test_hard_stop_registry_rejects_future_process_spawn(tmp_path):
         with open("/dev/null", "rb") as devnull, pytest.raises(RuntimeError, match="hard-stop"):
             R._run_process_group(command, stdin=devnull, timeout=1)
     finally:
-        R._PROCESS_GROUP_SHUTDOWN.clear()
+        PS._reset_global_hard_stop_for_tests()
     assert not marker.exists()
 
 
 def test_hard_stop_kill_scan_continues_after_term_error(monkeypatch):
-    fake = types.SimpleNamespace(pid=987654)
     calls = []
-
-    def denied(pid, sig):
-        calls.append((pid, sig))
-        raise PermissionError("denied")
-
-    with R._ACTIVE_PROCESS_GROUPS_LOCK:
-        R._ACTIVE_PROCESS_GROUPS[fake.pid] = fake
-    monkeypatch.setattr(R.os, "killpg", denied)
-    try:
-        with pytest.raises(RuntimeError, match="无法终止"):
-            R.terminate_active_process_groups(grace_s=0)
-        assert calls == [(fake.pid, R.signal.SIGTERM), (fake.pid, R.signal.SIGKILL)]
-    finally:
-        with R._ACTIVE_PROCESS_GROUPS_LOCK:
-            R._ACTIVE_PROCESS_GROUPS.clear()
-        R._PROCESS_GROUP_SHUTDOWN.clear()
+    monkeypatch.setattr(
+        R, "terminate_all_supervised_executions",
+        lambda *, wait_s: calls.append(wait_s))
+    R.terminate_active_process_groups(grace_s=0.1)
+    assert calls == [5.0]
 
 
 def test_runner_usage_zero_when_no_token_line(tmp_path, monkeypatch):
-    monkeypatch.setattr(subprocess, "run", _fake_run_factory(b"just some logs, no usage"))
-    art = CodexRunner(transcripts_dir=tmp_path).run_task(system_prompt="s", skill="k", context_pack=_pack())
+    art = _fake_runner(tmp_path, _fake_run_factory(b"just some logs, no usage")).run_task(
+        system_prompt="s", skill="k", context_pack=_pack())
     assert art.usage is not None and art.usage.tokens_total == 0
     assert art.usage.tokens_known is False                     # 未知不再冒充真 0
 
 
 def test_runner_failure_still_raises(tmp_path, monkeypatch):
-    def fail_run(cmd, stdin=None, capture_output=False, timeout=None):
+    def fail_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         return types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom\ntokens used\n2,500\n")   # 不写 out_file
-    monkeypatch.setattr(subprocess, "run", fail_run)
     with pytest.raises(R.RunnerError) as ei:
-        CodexRunner(transcripts_dir=tmp_path).run_task(system_prompt="s", skill="k", context_pack=_pack())
+        _fake_runner(tmp_path, fail_run).run_task(
+            system_prompt="s", skill="k", context_pack=_pack())
     assert ei.value.usage is not None and ei.value.usage.tokens_total == 2500
     assert ei.value.usage.wallclock_sec >= 0.0
 
@@ -298,49 +301,48 @@ def test_runner_failure_still_raises(tmp_path, monkeypatch):
 def test_runner_never_reuses_stale_output_for_same_deterministic_tag(tmp_path, monkeypatch):
     calls = {"n": 0}
 
-    def first_writes_second_does_not(cmd, stdin=None, capture_output=False, timeout=None):
+    def first_writes_second_does_not(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         calls["n"] += 1
         if calls["n"] == 1:
             Path(cmd[cmd.index("-o") + 1]).write_text(
                 '```json\n{"files":{"idea_set.json":{}},"md":"ok"}\n```', encoding="utf-8")
         return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"tokens used\n1\n")
 
-    monkeypatch.setattr(subprocess, "run", first_writes_second_does_not)
-    CodexRunner(transcripts_dir=tmp_path).run_task(
+    _fake_runner(tmp_path, first_writes_second_does_not).run_task(
         system_prompt="s", skill="k", context_pack=_pack())
     with pytest.raises(R.RunnerError, match="runner 进程失败"):
-        CodexRunner(transcripts_dir=tmp_path).run_task(
+        _fake_runner(tmp_path, first_writes_second_does_not).run_task(
             system_prompt="s", skill="k", context_pack=_pack())
 
 
 def test_runner_bad_envelope_preserves_usage(tmp_path, monkeypatch):
     """子进程成功但信封坏：_invoke 已取得的 usage 必须随 RunnerError 上浮，供 provider 记账。"""
-    def bad_envelope(cmd, stdin=None, capture_output=False, timeout=None):
+    def bad_envelope(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         out = Path(cmd[cmd.index("-o") + 1])
         out.write_text("模型确实跑完了，但没有 JSON 信封", encoding="utf-8")
         return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"tokens used\n3,200\n")
 
-    monkeypatch.setattr(subprocess, "run", bad_envelope)
     with pytest.raises(R.RunnerError, match="信封不可解析") as ei:
-        CodexRunner(transcripts_dir=tmp_path).run_task(system_prompt="s", skill="k", context_pack=_pack())
+        _fake_runner(tmp_path, bad_envelope).run_task(
+            system_prompt="s", skill="k", context_pack=_pack())
     assert ei.value.usage is not None and ei.value.usage.tokens_total == 3200
 
 
 def test_runner_timeout_preserves_partial_usage(tmp_path, monkeypatch):
     """timeout 也至少记已刷到 stderr 的 token 与实际墙钟，不能整次消失。"""
-    def timeout_run(cmd, stdin=None, capture_output=False, timeout=None):
+    def timeout_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         raise subprocess.TimeoutExpired(cmd, timeout, stderr=b"progress\ntokens used\n4,100\n")
 
-    monkeypatch.setattr(subprocess, "run", timeout_run)
     with pytest.raises(R.RunnerError, match="超时") as ei:
-        CodexRunner(transcripts_dir=tmp_path).run_task(system_prompt="s", skill="k", context_pack=_pack())
+        _fake_runner(tmp_path, timeout_run).run_task(
+            system_prompt="s", skill="k", context_pack=_pack())
     assert ei.value.usage is not None and ei.value.usage.tokens_total == 4100
     assert ei.value.usage.wallclock_sec >= 0.0
+    assert ei.value.failure_kind == "timeout"
 
 
 def test_runner_output_read_error_preserves_usage(tmp_path, monkeypatch):
     """子进程已完成后读 out_file 失败也须携 usage 上浮，不能越过 provider 记账。"""
-    monkeypatch.setattr(subprocess, "run", _fake_run_factory(b"tokens used\n2,750\n"))
     original = Path.read_text
 
     def fail_out(self, *args, **kwargs):
@@ -350,5 +352,6 @@ def test_runner_output_read_error_preserves_usage(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "read_text", fail_out)
     with pytest.raises(R.RunnerError, match="输出读取失败") as ei:
-        CodexRunner(transcripts_dir=tmp_path).run_task(system_prompt="s", skill="k", context_pack=_pack())
+        _fake_runner(tmp_path, _fake_run_factory(b"tokens used\n2,750\n")).run_task(
+            system_prompt="s", skill="k", context_pack=_pack())
     assert ei.value.usage.tokens_total == 2750 and ei.value.usage.tokens_known is True

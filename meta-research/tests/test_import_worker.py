@@ -20,6 +20,8 @@ from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import open_gate_read_conn
 from orchestrator.import_worker import ImportWorker
 from orchestrator.importer import DeferredImporter
+from orchestrator.instance_lease import InstanceLease
+from orchestrator.process_supervisor import ExecutionSupervisor
 from orchestrator.statestore_sqlite import SQLiteStateStore
 from orchestrator.writedaemon import WriteDaemon
 
@@ -91,6 +93,61 @@ def env(tmp_path):
     daemon, state, w = _mk_worker(path, tmp_path / "w")
     sel = _seed_deferred(daemon, state)
     return {"d": daemon, "s": state, "w": w, "sel": sel, "path": path, "tmp": tmp_path}
+
+
+def test_owner_guard_requires_shared_execution_supervisor(env):
+    """Leased import 只接受同 owner guard 且持 delegated fence 的 supervisor。"""
+    with pytest.raises(ValueError, match="ExecutionSupervisor"):
+        ImportWorker(
+            state=env["s"], pool_gate=env["w"].gate,
+            providers=env["w"].p, obs_policy=OBS,
+            work_root=str(env["tmp"] / "guarded-import"),
+            owner_guard=lambda: None)
+
+    guard = lambda: None
+    standalone = ExecutionSupervisor.standalone(env["tmp"] / "standalone-receipts")
+    try:
+        with pytest.raises(ValueError, match="delegated instance fence"):
+            ImportWorker(
+                state=env["s"], pool_gate=env["w"].gate,
+                providers=env["w"].p, obs_policy=OBS,
+                work_root=str(env["tmp"] / "standalone-import"),
+                owner_guard=guard, execution_supervisor=standalone)
+    finally:
+        standalone.close()
+
+    lease_a = InstanceLease.acquire(
+        env["tmp"] / "lease-a", heartbeat_interval_s=0.05)
+    lease_b = InstanceLease.acquire(
+        env["tmp"] / "lease-b", heartbeat_interval_s=0.05)
+    supervisor_a = ExecutionSupervisor(
+        receipt_dir=env["tmp"] / "lease-a" / "state" / "executions",
+        owner_id=lease_a.owner_id, owner_guard=lease_a.assert_owned,
+        fence_context_factory=lease_a.delegate_owner_fence)
+    supervisor_b = ExecutionSupervisor(
+        receipt_dir=env["tmp"] / "lease-b" / "state" / "executions",
+        owner_id=lease_b.owner_id, owner_guard=lease_b.assert_owned,
+        fence_context_factory=lease_b.delegate_owner_fence)
+    try:
+        worker = ImportWorker(
+            state=env["s"], pool_gate=env["w"].gate,
+            providers=env["w"].p, obs_policy=OBS,
+            work_root=str(env["tmp"] / "same-owner-import"),
+            owner_guard=lease_a.assert_owned,
+            execution_supervisor=supervisor_a)
+        assert worker.execution_supervisor is supervisor_a
+        with pytest.raises(ValueError, match="同一 owner guard"):
+            ImportWorker(
+                state=env["s"], pool_gate=env["w"].gate,
+                providers=env["w"].p, obs_policy=OBS,
+                work_root=str(env["tmp"] / "foreign-owner-import"),
+                owner_guard=lease_a.assert_owned,
+                execution_supervisor=supervisor_b)
+    finally:
+        supervisor_a.close()
+        supervisor_b.close()
+        assert lease_a.close() is None
+        assert lease_b.close() is None
 
 
 # ============ happy：全链 provenance + dep 解锁 ============

@@ -54,6 +54,7 @@ from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
                      InteractionNotifier, Outbox, ResearchNotifier,
                      make_advancer_precheck)
+from .process_supervisor import ExecutionSupervisor
 from .runner import CodexRunner, terminate_active_process_groups
 from .schemas import SchemaSet
 from .stage_provider import JudgeProvider, StageProvider
@@ -202,6 +203,7 @@ class System:
                  inbound_cleanup_pending: Optional[
                      Callable[[Any, Optional[BaseException]], bool]] = None,
                  instance_lease: Optional[InstanceLease] = None,
+                 execution_supervisor: Optional[ExecutionSupervisor] = None,
                  resource_closers: Optional[List[Callable[[], None]]] = None):
         self.advancer = advancer
         self.state = state
@@ -232,6 +234,7 @@ class System:
             inbound_cleanup_pending
             or (lambda _owned, error: error is not None))
         self.instance_lease = instance_lease
+        self.execution_supervisor = execution_supervisor
         self._resource_closers = list(resource_closers or [])
         self._lifecycle_guard = threading.RLock()
         self._active_operations = 0
@@ -938,6 +941,17 @@ class System:
                         "System 仍有 accepted interaction/query capability；instance lease 保留供重试")
                 self._accepted_interactions_drained = True
 
+            # External guardians are a shared capability just like DB workers.
+            # They must be terminal, reaped and receipt-durable before any DB
+            # handle closes or the instance flock can move to a new owner.
+            if self.execution_supervisor is not None:
+                try:
+                    self.execution_supervisor.close(timeout_s=10.0)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                    return first_error
+
             remaining: List[Callable[[], None]] = []
             for closer in reversed(self._resource_closers):
                 try:
@@ -1059,6 +1073,18 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     """Assemble under an already-held owner lease; caller owns rollback."""
     owner_guard = instance_lease.assert_owned if instance_lease is not None else (lambda: None)
 
+    execution_supervisor = ExecutionSupervisor(
+        receipt_dir=work / "state" / "executions",
+        owner_id=(instance_lease.owner_id if instance_lease is not None
+                  else f"unleased-{os.getpid()}-{time.time_ns()}"),
+        owner_guard=owner_guard,
+        fence_context_factory=(instance_lease.delegate_owner_fence
+                               if instance_lease is not None else None))
+    # This happens before connector preparation and before SQLite is opened.
+    # A prior running receipt without its guardian fence is an unsafe recovery,
+    # so assembly fails closed before any new external capability can start.
+    execution_supervisor.recover_previous_generation()
+
     expected_work_fd = open_directory_path(work, label="system work_root")
     try:
         expected_work_info = os.fstat(expected_work_fd)
@@ -1126,7 +1152,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     base_rf = runner_factory or (lambda transcripts_dir, purpose_tag:
                                  CodexRunner(transcripts_dir=transcripts_dir,
                                              purpose_tag=purpose_tag,
-                                             tool_free=purpose_tag == "interaction-query"))
+                                             tool_free=purpose_tag == "interaction-query",
+                                             execution_supervisor=execution_supervisor))
 
     def rf(transcripts_dir, purpose_tag):  # noqa: ANN001, ANN202 - injection boundary
         owner_guard()
@@ -1264,7 +1291,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             providers={"idea": provider.idea, "plan": provider.plan, "bundle": provider.bundle,
                        "judge": judge, "reasoning": provider.reasoning},
             obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy,
-            owner_guard=owner_guard)
+            owner_guard=(owner_guard if instance_lease is not None else None),
+            execution_supervisor=execution_supervisor)
 
     advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
                               status_publisher=publisher, precheck=precheck, stop_controller=stop)
@@ -1287,6 +1315,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                   raise_inbound=connector_inbox.raise_if_failed,
                   inbound_cleanup_pending=lambda owned, _error: bool(owned),
                   instance_lease=instance_lease,
+                  execution_supervisor=execution_supervisor,
                   resource_closers=resource_closers)
 
 
