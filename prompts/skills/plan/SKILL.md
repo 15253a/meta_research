@@ -1,6 +1,7 @@
 # SKILL · plan —— 复用判定 + 锁评估协议
 
-> 版本：m4-cp114a。按《第一部分》§3.3 与流程图 04-Plan；产物 schema = `schemas/plan.schema.json`。
+> 版本：m4-cp114a2。按《第一部分》§3.3 与流程图 04-Plan；产物 schema =
+> `schemas/plan.schema.json` 或受限控制 sidecar `schemas/import_search_request.schema.json`。
 > 本阶段 = 计划调用（phase=plan）+ **可回答性评审**独立调用（phase=audit，≤2 轮，本文件
 > 【评审任务】节）。评估协议在本阶段锁死，bundle 只照办、不再发明（I2 源头）。
 
@@ -16,7 +17,9 @@
 
 ## 【计划任务】（phase=plan）
 
-产出 `files["plan.json"]`。步骤：
+每次调用二选一：产出 `files["plan.json"]`，或在下述精确条件下**只产**
+`files["import_search_request.json"]`。搜索 sidecar 不能与 plan.json/其他文件共存；编排器完成受信
+只读搜索与登记后，会用**全新无状态 plan 会话**给出重渲染的冻结候选锚。步骤：
 
 1. **拆 verification needs**：从 selected idea 的 `assumptions` 与 `min_falsifiable_experiment`
    派生（每 need 一句可判定命题；来源标 source）。**协议/指标/target 由你依本 skill 重新推导**，
@@ -33,27 +36,35 @@
    | 同协议@版本缺指标 | `eval` target（追加 attempt） | `append_attempt` | `metric_append` | `evaluation_id`（既有格子） |
    | env 失配 / 结果存疑 | `eval` target（identity 复现） | `append_attempt` | `repro_eval` | `evaluation_id` |
    | 池中无 + 自建角色（消融/替换/超参/评估） | `build` / `exec` / `eval`（身份按三问决策树 §1.2.2：前向逻辑变=新 baseline、要重训=新 variant、只改评估=新 evaluation） | （eval 时按上表） | （eval 时按上表） | **build ⇒ `claim{canonical_key, slug}`；exec ⇒ `claim{baseline_ref, variant_key, config_json}`**（I5 占坑输入） |
+   | 池中无 + 需引入独立外部 baseline 家族 | 先读固定锚的 external import 状态。`may_emit_import_defer=true` 时才产顶层 `import_defer`、`targets=[]`，逐字照抄四锚；候选/license 由编排器事务重算，**不得自造 URI、candidate id 或 hash**。若候选为空且 `may_request_import_search=true`，并且实验角色确属“引入独立 comparator 家族”，只产一次下方搜索 sidecar。`search_completed=true` 后无论零结果/无 allow 候选都不得再搜：能自建则 build，否则诚实产零 target 计划。 | — | — | — |
 
    ⚠️ **kind 前置条件（选错即整轮被拒）**：`exec` 的 `baseline_ref` 与 `eval` 的评估对象都**必须指向
    检索区已有的 legal 池资产**——检索区没有该家族的 legal baseline（含池空）时，`exec`/`eval` 语义非法，
    **必须走 `build` 先建 baseline**（首攻新家族恒为 build）。若上下文包给出「上轮 plan 被拒原因」，
    先修正该原因再产出本轮 plan。
-   | 池中无 + 需引入外部 baseline 家族/公认参照 | 只读固定锚中的“本轮已登记 external import 候选”。仅当 `anchors.may_emit_import_defer=true`，才产顶层 `import_defer`、`targets=[]`，并逐字照抄 `candidate_set_hash/license_decision_snapshot_hash/selection_key/policy_hash`；候选/license 由编排器在提交事务内重算选择，**不得自造 URI、candidate id 或 hash**。无已登记可物化候选时，能自建则走 build，否则在 md 诚实写本轮无法覆盖，绝不伪造 import。 | — | — | — |
-3. **锁评估协议**（字段名按 schema 逐字写）：
+3. **import 三闸与搜索 sidecar 边界**：
+   - sidecar 当前只接受 `trigger_kind="new_structure"`（类型门）。它只可提交
+     搜索 query 与需求摘要；不得上报 repo URI/revision/rank/license/SPDX/授权范围。
+   - `stuck` 状态门只允许外部普查产新 idea/新 question，**不得在原问题上用本 sidecar 直达 import**。
+   - `human_named` 须有受信的结构化 directive 来源，`sota_reference` 须有冻结论文/榜单快照；
+     当前包未给出这类权威锚时不得借 `new_structure` 冒充直达。
+   - 候选数与检索强度由编排器按 question score/est_cost + B(t) + policy 机械决定，
+     所以 sidecar 中没有也不得自造“搜几个”字段。
+4. **锁评估协议**（字段名按 schema 逐字写）：
    - `protocol`：`{name, version（整数≥1）, scope_spec（对象：评估数据/分割/checkpoint 选择/
      流程——一字一句都是 I1 冻结对象）, smoke_md?（smoke 定义）}`；
    - `metric_defs[]`：每项 `{metric_id, version（整数）, name, direction ∈ {higher,lower},
      compute_spec_md, unit?}`；
    - `readout_rules[]`：每项 `{metric_id, metric_ver, rule_md}`（每指标必有判读）；
    - 每 target `budget_estimate`（总和 ≤ B(t)）。
-4. **写 targets 队列**——每个 target 的完整必填字段（schema 硬性要求）：
+5. **写 targets 队列**——每个 target 的完整必填字段（schema 硬性要求）：
    `target_key`（plan 内稳定键，如 "t1"，bundle 产物与 required_metric 以此关联）·
    `target_kind ∈ {build,exec,eval}` · `seq`（依赖序，从 1 起）· `critical`（true=失败即早退）·
    `budget_estimate`（数值，总和 ≤ B(t)）· `spec_md`（本目标做什么，bundle 只照办）·
    按 kind 另加上表"另须携带"列（build/exec 的 `claim`、eval 的三件套）。
    `build_target_required_metric` 逐 target 声明 required 指标集
    （`{target_key, metric_id, metric_ver}`，I2 核覆盖依据）。
-5. **依赖等待分支**（图 04 DEP 判断）：所需 baseline 正被他轮 building（占坑互斥 I5，
+6. **依赖等待分支**（图 04 DEP 判断）：所需 baseline 正被他轮 building（占坑互斥 I5，
    检索区基线卡会标 building）→ 不重复开工：在 `md` 里声明「等待 <baseline> 就绪」，
    由编排器写 `question_dep(dep_type=baseline, pending)` 并把本轮收成 **dependency_wait**
    （机械收尾：写 dep + 释放 Qn 回 open + mark_cycle_done，不经 reasoning，§4.2.5）。
@@ -62,9 +73,22 @@
    收尾，不进普通 plan 可回答性评审、bundle/reasoning（图 04 IMP→WAIT 发生在 PROTO/REVIEW 之前）。
    物化成功、dep satisfied 后同一 Qn 重新进入 attack；物化终败则编排器写失败裁决并把 exact dep 置
    `blocked`，同一 Qn 回到可重规划集合，下一轮必须消费失败摘要后改候选/自建/分解，禁止原样死循环。
-6. `md` 写计划正文（中文）：needs 表、复用判定逐条结论、协议锁定理由、预算分配。
+7. `md` 写计划正文（中文）：needs 表、复用判定逐条结论、协议锁定理由、预算分配。
 
 **输出骨架（键名逐字，封闭对象；`<>` 占位、`?` 表可省键）**：
+
+**import_search_request 专用骨架**（独占 files；产出后立即结束本次调用）：
+
+```json
+{ "version": 1,
+  "trigger_kind": "new_structure",
+  "query": "用于找到对应实现的简短 GitHub 代码检索词",
+  "need_summary": "为什么当前 verification need 需要独立外部 baseline 家族" }
+```
+
+`文件名 = import_search_request.json`，不是 plan.json；不加 max_candidates/provider/license/repo URL 等键。
+
+**普通 plan 骨架**：
 
 ```json
 { "needs": [ { "need_id": "n1", "statement_md": "<>", "source?": "<assumptions|min_falsifiable_experiment|other>" } ],

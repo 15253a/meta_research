@@ -50,10 +50,11 @@ from .gate_exec import ExecGate
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
 from .ids import cnum as _cnum, decode as _decode_id, qnum as _qnum, parse_positive_sqlite_int
+from .import_search import ImportSearchError, validate_import_search_request
 from .importer import DeferredImporter
 from .interfaces import InvalidSelectionError, Selection
 from .phase_commit import check_or_record
-from .process_supervisor import ExecutionSupervisor
+from .process_supervisor import ExecutionSupervisor, atomic_write_receipt, read_receipt
 
 _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
 
@@ -378,6 +379,7 @@ class AttackStages:
         cycle_dir = self.work / f"c{_cnum(cyc.cycle_id)}"
         art = cycle_dir / "plan.json"
         review_result_path = cycle_dir / "plan.review-result.json"
+        search_request_path = cycle_dir / "import_search_request.json"
         legacy_plan = None
         if art.exists():
             try:
@@ -404,9 +406,19 @@ class AttackStages:
             legacy_plan = plan
 
         pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="plan")
+        search_requested = False
+        if search_request_path.exists():
+            request = self._read_import_search_request(search_request_path)
+            self._run_import_search(cyc, request, pack)
+            # Registration is a short atomic DB commit.  The old pack was
+            # rendered before it and must never be passed to the next plan
+            # call, otherwise the model could not see the exact frozen anchors.
+            pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="plan")
+            search_requested = True
         if "plan_review" not in self.p:
-            files = self.p["plan"](cyc, pack)
-            plan = self._plan_from_provider(files)
+            plan, pack, search_requested = self._plan_provider_with_import_search(
+                cyc, pack, search_request_path=search_request_path,
+                search_requested=search_requested)
             self._validate_plan_schema(plan)
             self._write_json_atomic(art, plan)
             return plan
@@ -431,8 +443,18 @@ class AttackStages:
                 self._validate_plan_schema(plan)
                 self._write_json_atomic(draft_path, plan)
             else:
-                files = self.p["plan"](cyc, pack)
-                plan = self._plan_from_provider(files)
+                if round_no == 1:
+                    plan, pack, search_requested = self._plan_provider_with_import_search(
+                        cyc, pack, search_request_path=search_request_path,
+                        search_requested=search_requested)
+                else:
+                    files = self.p["plan"](cyc, pack)
+                    if (isinstance(files, dict)
+                            and "import_search_request.json" in files):
+                        raise _PlanReject(
+                            "plan 可回答性修订轮不得新发 import_search；"
+                            "每 action-cycle 最多一次只读发现")
+                    plan = self._plan_from_provider(files)
                 self._validate_plan_schema(plan)
                 self._write_json_atomic(draft_path, plan)
             self._validate_plan_schema(plan)
@@ -480,8 +502,87 @@ class AttackStages:
         raise _PlanReviewReject(
             f"plan 可回答性评审 {max_rounds} 轮未通过：{last_review.get('issues', [])}", plan)
 
+    def _plan_provider_with_import_search(
+            self, cyc, pack, *, search_request_path: Path,
+            search_requested: bool):
+        """Run one plan call, optionally consume one discovery sidecar, then re-plan.
+
+        The request is persisted before any network call.  Recovery therefore
+        resumes the same request and lets ImportSearchService reconcile its
+        receipt instead of asking a non-deterministic planner for a new query.
+        """
+        files = self.p["plan"](cyc, pack)
+        if not (isinstance(files, dict)
+                and "import_search_request.json" in files):
+            return self._plan_from_provider(files), pack, search_requested
+        if search_requested or search_request_path.exists():
+            raise _PlanReject(
+                "同一 action-cycle 的第二个 import_search_request 被拒绝")
+        if set(files) != {"import_search_request.json"}:
+            raise _PlanReject(
+                "import_search_request.json 须独占 plan provider files")
+        try:
+            request = validate_import_search_request(
+                files["import_search_request.json"])
+            if self.schemas is not None:
+                errors = [
+                    f"{error.json_path} {error.message}"
+                    for error in self.schemas.validator(
+                        "import_search_request").iter_errors(request)
+                ]
+                if errors:
+                    raise ImportSearchError("; ".join(errors[:5]))
+        except ImportSearchError as error:
+            raise _PlanReject(
+                f"import_search_request 非 schema-conform：{error}") from error
+        # This control record is the recovery authority for the external read,
+        # so unlike ordinary staging drafts it is fsync'd before the connector
+        # is invoked and published as a private no-follow receipt.
+        atomic_write_receipt(search_request_path, request)
+        self._run_import_search(cyc, request, pack)
+        refreshed = self.compiler.render(cycle_id=cyc.cycle_id, stage="plan")
+        final_files = self.p["plan"](cyc, refreshed)
+        if (isinstance(final_files, dict)
+                and "import_search_request.json" in final_files):
+            raise _PlanReject(
+                "import_search 完成后 plan 仍请求第二次搜索；"
+                "必须消费冻结候选/零结果并做决策")
+        return self._plan_from_provider(final_files), refreshed, True
+
+    def _run_import_search(self, cyc, request: Dict[str, Any], pack) -> Dict[str, Any]:
+        provider = self.p.get("import_search")
+        if provider is None:
+            raise RuntimeError(
+                "plan 产出 import_search_request，但本装配缺 import_search 受信 connector")
+        return provider(cyc, request, pack)
+
+    def _read_import_search_request(self, path: Path) -> Dict[str, Any]:
+        try:
+            payload = read_receipt(path)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            raise RuntimeError(
+                f"持久 import_search_request 损坏: {path}") from error
+        try:
+            request = validate_import_search_request(payload)
+        except ImportSearchError as error:
+            raise RuntimeError(
+                f"持久 import_search_request 边界非法: {error}") from error
+        if self.schemas is not None:
+            errors = [
+                f"{item.json_path} {item.message}"
+                for item in self.schemas.validator(
+                    "import_search_request").iter_errors(request)
+            ]
+            if errors:
+                raise RuntimeError(
+                    "持久 import_search_request schema 损坏: " + "; ".join(errors[:5]))
+        return request
+
     @staticmethod
     def _plan_from_provider(files: Any) -> Dict[str, Any]:
+        if isinstance(files, dict) and "import_search_request.json" in files:
+            raise _PlanReject(
+                "import_search_request 未在受限的 plan 首轮控制边界消费")
         if not isinstance(files, dict) or "plan.json" not in files:
             raise _PlanReject(
                 f"plan provider 未产 plan.json（返回键: "

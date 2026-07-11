@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/import_search_request.schema.json",
+  "title": "import_search_request",
+  "description": "plan 阶段的只读外部 baseline 发现请求。它是编排器控制 sidecar，不是 Gate 事实产物；模型不能在此上报 candidate/license 事实。",
+  "type": "object",
+  "required": ["version", "trigger_kind", "query", "need_summary"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "trigger_kind": {
+      "const": "new_structure",
+      "description": "仅开放类型门：引入独立外部 baseline 家族。stuck 不得直达 import；human_named/sota_reference 须先有受信冻结来源。"
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    },
+    "need_summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^[^\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]+$"
+    }
+  }
+}

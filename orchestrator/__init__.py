@@ -26,7 +26,8 @@
 - stopcontroller.py — StopController（M6：长跑自终止安全网——§4.4.6 τ 判据①分数衰退/②预算耗尽，durable global_stop）
 - attack_stages.py — AttackStages（M4：attack 轮 idea/plan/bundle/reasoning 阶段推进——两段提交+结构恢复+管线强制 ingest）
 - phase_commit.py — 阶段级原子提交幂等落库（§4.2.5：同键同 hash 跳过、异 hash conflict 拒）
-- import_worker.py — ImportWorker（M4：外部 import 物化——worker cycle[OPEN #6]+供应链 manifest+失败路径全拒）
+- import_search.py — plan 受限只读 repo 发现、耐久回执与原子 candidate/license 登记
+- import_worker.py — ImportWorker（M4：外部 import 物化——worker cycle+供应链 manifest+失败路径全拒）
 - console.py    — Console（M5：保守关键词分类器 + directive 生命周期——润色≠raw 时序/回显确认/按时机消费+DECISION）
 - mediator.py   — Mediator（query sideband：发布快照+无工具 Codex、created→running 耐久意图、grounding/
                   成本回执原子收口、模板降级与按 conversation 重建）

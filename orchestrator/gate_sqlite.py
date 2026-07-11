@@ -121,8 +121,9 @@ class SqliteGate:
         if not artifact.files:
             return ["产物为空（files 无内容）"]
         for filename, payload in artifact.files.items():
-            if filename == "resource_request.json":
-                errors.append("resource_request.json: sidecar 非 Gate 产物（§6.11）——驱动器须在 commit 前摘出")
+            if filename in ("resource_request.json", "import_search_request.json"):
+                errors.append(
+                    f"{filename}: sidecar 非 Gate 产物——驱动器须在 commit 前摘出")
                 continue
             if filename not in ARTIFACT_SCHEMA_MAP:
                 errors.append(f"{filename}: 未知产物文件名")

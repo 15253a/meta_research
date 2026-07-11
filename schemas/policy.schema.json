@@ -4,7 +4,7 @@
   "title": "policy",
   "description": "policies/policy.yaml 的机械校验 schema（启动前提 §7.5 #4）。旋钮注册表唯一权威 = 第一部分附录 C（全量、每旋钮带默认值）；本 schema 与之逐节对齐、封闭（additionalProperties=false）。observation 节（parser 阈值）已随 M4 CP5.3 真 parser 落地（OPEN #5 已闭；extraction_policy_hash = 该节规范化 JSON 的 sha256，见 obs_parser）。",
   "type": "object",
-  "required": ["acquisition", "budget", "flow", "retrieval", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "execution", "resources", "interaction_request", "observation"],
+  "required": ["acquisition", "budget", "flow", "retrieval", "import_search", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "execution", "resources", "interaction_request", "observation"],
   "additionalProperties": false,
   "properties": {
     "acquisition": {
@@ -83,7 +83,7 @@
     },
     "retrieval": {
       "type": "object",
-      "required": ["recipe", "budget_by_question_scale", "gate2_stuck_threshold"],
+      "required": ["recipe", "budget_by_question_scale", "scale_thresholds", "gate2_stuck_threshold"],
       "additionalProperties": false,
       "properties": {
         "recipe": { "type": "string", "minLength": 1 },
@@ -97,6 +97,28 @@
             "large": { "type": "integer", "minimum": 0 }
           }
         },
+        "scale_thresholds": {
+          "type": "object",
+          "description": "import_search 闸3 的机械分档线；est_cost_ratio=question.est_cost/B(t)，或 score 任一达线即进档",
+          "required": ["medium", "large"],
+          "additionalProperties": false,
+          "properties": {
+            "medium": {
+              "type": "object", "required": ["est_cost_ratio", "score"], "additionalProperties": false,
+              "properties": {
+                "est_cost_ratio": { "type": "number", "minimum": 0 },
+                "score": { "type": "number" }
+              }
+            },
+            "large": {
+              "type": "object", "required": ["est_cost_ratio", "score"], "additionalProperties": false,
+              "properties": {
+                "est_cost_ratio": { "type": "number", "minimum": 0 },
+                "score": { "type": "number" }
+              }
+            }
+          }
+        },
         "gate2_stuck_threshold": {
           "type": "object",
           "required": ["visit_count", "consecutive_inconclusive"],
@@ -104,6 +126,40 @@
           "properties": {
             "visit_count": { "type": "integer", "minimum": 1 },
             "consecutive_inconclusive": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "import_search": {
+      "type": "object",
+      "description": "受信 host 只读 repo-search 与机械 license 策略；凭据从命名环境变量读取，不进 policy",
+      "required": ["provider", "max_candidates", "timeout_s", "max_response_bytes", "auto_license"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "const": "github_rest_v1" },
+        "max_candidates": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "timeout_s": { "type": "number", "minimum": 1, "maximum": 60 },
+        "max_response_bytes": { "type": "integer", "minimum": 65536, "maximum": 4194304 },
+        "auto_license": {
+          "type": "object",
+          "required": ["allow_spdx", "scope"],
+          "additionalProperties": false,
+          "properties": {
+            "allow_spdx": {
+              "type": "array", "maxItems": 32, "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9.+-]*$" }
+            },
+            "scope": {
+              "type": "object",
+              "required": ["allow_eval", "allow_modify", "allow_publish_pool", "allow_redistribute"],
+              "additionalProperties": false,
+              "properties": {
+                "allow_eval": { "type": "boolean" },
+                "allow_modify": { "type": "boolean" },
+                "allow_publish_pool": { "type": "boolean" },
+                "allow_redistribute": { "type": "boolean" }
+              }
+            }
           }
         }
       }
