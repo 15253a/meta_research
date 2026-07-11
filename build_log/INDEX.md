@@ -6,6 +6,7 @@
 
 ---
 
+- [0063](0063-cp114b-artifact-provider-accounting.md) — CP11.4b fd-safe artifact capability + guardian capture/provider invocation 精确补账 · commit `e236487` · 验证: 通过（相关验证；外审成立项全修；唯一全量 1332）
 - [0062](0062-cp114a3-trusted-import-trigger-sources.md) — CP11.4a.3 human/stuck/SOTA 可信来源 + 独立参照题 + 冻结激活/恢复 · commit `a31658e` · 验证: 通过（相关 217/392/130/17；外审反馈全修；唯一全量 1322）—— **CP11.4a 达成**
 - [0061](0061-cp114a2-durable-import-discovery.md) — CP11.4a.2 `new_structure` 耐久只读发现 + pinned candidate/license provenance + 原子登记/恢复 · commit `43dd99e` · 验证: 通过（相关 358/158/20/91；唯一全量 1297；外审第2轮上限后反馈处置）
 - [0060](0060-cp114a1-deferred-import-plan-review.md) — CP11.4a.1 冻结 import 选择/dependency_wait/worker 恢复 + 独立 plan 评审 · commit `43c4134` · 验证: 通过（相关 84/92/105/93；唯一全量 1267 过/7 旧契约锚，修后 exact 7/7；外审第2轮上限后反馈处置）

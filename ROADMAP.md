@@ -22,7 +22,8 @@
   120 轮状态稳定性已落 `a32629d`。CP11.4a.1 冻结 import 消费/dependency_wait/worker 恢复与独立 plan 评审
   已落 `43c4134`；CP11.4a.2 `new_structure` 生产 import_search/import_register 与 license provenance 已落
   `43dd99e`；CP11.4a.3 human/stuck/SOTA 可信来源、独立参照题与冻结激活已落 `a31658e`，CP11.4a 达成；
-  当前进入 CP11.4b artifact capability/fd-safe 与 provider 精确补账。
+  CP11.4b fd-safe artifact capability、guardian capture 与 provider invocation 精确补账已落 `e236487`；当前进入
+  CP11.4c 敌对隔离、跨节点信任边界与真实长程验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -406,7 +407,10 @@
         action-cycle 按冻结 authority 激活，禁止原问题直接登记候选/`import_defer`。三路均可重启回放并与
         candidate/license 四锚闭合。→ commit `a31658e`（build_log 0062；相关 217/392/130/17；外审反馈全修；
         唯一全量 1322）—— **CP11.4a 达成**。
-    - [ ] CP11.4b 内容寻址与精确调用补账：artifact capability/fd-safe 消费，消除 checkpoint hash/open TOCTOU；
-      provider invocation ID、usage/billing receipt 与 runner_call exactly-once 对账。
+    - [x] CP11.4b 内容寻址与精确调用补账：artifact capability/fd-safe 消费消除 source/checkpoint/import 的
+      hash/open TOCTOU；guardian 0600 capture 与 terminal identity 支持 owner-death receipt 重建；provider invocation
+      ID、usage receipt、runner_call 与本地 policy cost ledger 单事务一次对账，unknown usage fail-closed。这里的
+      exactly-once 只指每个 invocation 在本地记账一次，不声称 provider 侧执行或供应商 invoice。→ commit `e236487`
+      （build_log 0063；相关验证；外审第 2 轮成立项全修/架构误判留据；唯一全量 1332）。
     - [ ] CP11.4c 敌对隔离与最终长程验收：container/cgroup/VM 或等价强隔离、guardian/receipt 防篡改、跨节点
       VEPFS owner 验收，并运行 100+ 轮含真实外调/失败注入的 soak（区别于 CP11.3c 控制面 120 轮回归）。
