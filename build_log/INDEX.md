@@ -6,6 +6,7 @@
 
 ---
 
+- [0059](0059-cp113c-durable-state-semantics.md) — CP11.3c current lineage + owner-first 外调 + receipt→DB 对账 + eval-only + 120 轮状态稳定性 · commit `a32629d` · 验证: 通过（相关 78/101/102/80/45/77/59/20/13；唯一全量 1235 过/5 旧契约锚，修后 exact 5/5；外审两轮均无 verdict）—— **CP11.3 状态与执行边界达成**
 - [0058](0058-cp113b-execution-owner-death.md) — CP11.3b 统一 owner-death execution guardian + delegated fence + 可信子孙树整组排空 + 耐久 receipt · commit `2f4a5d5` · 验证: 通过（相关 21/32/30/75/53/62/45；VEPFS canary 1；唯一全量 1209 过/1 时序断言假阳性，修后定向 1；外审第2轮上限后反馈处置）
 - [0057](0057-cp113a-instance-owner-lease.md) — CP11.3a 共享 work-root 单实例 owner lease + heartbeat + lifecycle/connector/console fencing · commit `d79d3d0` · 验证: 通过（唯一全量 1180 过/1 测试隔离假阳性；修复后定向 38，依指示未二次全量；外审两轮上限后反馈全修）
 - [0056](0056-cp112b3e-authenticated-connector-ingress.md) — CP11.2b.3e webhook/OneBot 认证耐久入站 + 身份/会话绑定 + 精确继续/动作语义 + 有限退出排空 · commit `5056736` · 验证: 通过（相关 344+30；内审 166；唯一一次全量 1137；外审第1轮 401、第2轮超时，均无 verdict）—— **CP11.2 人类控制闭环达成**

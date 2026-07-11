@@ -1,42 +1,47 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-11 ｜ 位置：步⑪ CP11.3c 状态语义收口
-- 检查点状态：CP11.3b 已提交 `2f4a5d5`（build_log 0058）；CP11.3c 待开工
+- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4a 默认 import/dependency_wait + 独立 plan 评审
+- 检查点状态：CP11.3c 功能已提交 `a32629d`，build_log 0059 已写；CP11.4a 待开工
 
 ## 正在做什么
 
-CP11.3b 已把默认外部执行的同机可信 descendant-tree 生命周期闭合：shared supervisor 的 guardian 持
-delegated instance fence，以 owner pipe + PDEATHSIG 检测父死亡，以 subreaper/session + TERM→KILL + ECHILD
-证明整树排空，terminal receipt/output fsync 后才释放 fence；System 在 DB/lease 前关闭 supervisor。普通/
-tool-free Codex、manifest/harness 与显式 import smoke/eval 已统一接线。
+CP11.3c 已把 guardian 的 OS 事实接回 SQLite 业务状态面：plan target `critical/budget_estimate`、严格 current
+goal/cycle/question/target lineage、reasoning answer/evidence/tree/selection 原子提交；runner/model/train/eval/smoke
+均先建 durable owner 再外调；启动时按 exact receipt 对账，但 exit(0) 绝不伪造指标、评审或 Gate 成功。新增
+eval-only 复用既有合法 checkpoint，并用 120 个 attack-intent cycle + 重启证明控制面状态/投影不漂移。
 
-下一检查点 CP11.3c 回到 reference 的业务状态面：把 plan target `critical/budget_estimate`、严格 current goal
-lineage、runner/evaluation heartbeat，以及 timeout/owner_lost execution receipt 与 runner_call/run/attempt/target
-的权威终态、重试、通知对账闭合。CP11.3b receipt 当前证明的是 OS 进程树事实，不能替代这些 DB 语义。
+下一检查点 CP11.4a 处理仍属根本缺口的默认 import 路径与 plan 独立评审：当前 `ImportWorker` 虽有显式组件和
+owner-first 物化逻辑，但 `run.py` 未装配/驱动，plan `import_defer` 仍被拒；StageProvider 也只有生成产物/schema
+重试，没有 reference 所要求的独立 answerability reviewer。
 
 ## 工作区状态
 
 - 分支：`fix/architecture-hardening-20260709`。
-- 已提交：CP11.3b 功能 `2f4a5d5`；build_log 0058 与 ROADMAP/现场快照已入库。
-- 唯一全量：`1 failed, 1209 passed in 269.66s`；唯一失败为 console backlog 的通用/专用阻断文案时序断言，
-  隔离复跑通过，放宽到稳定 `入站待处理` 子串后定向 `1 passed, 44 deselected`；按用户要求未二跑全量。
-- 外审已达两轮上限：第 1 轮凭据 401 无 verdict；第 2 轮 REQUEST_CHANGES，误报/采纳/不采纳见 build_log 0058。
+- 已提交：CP11.3c 功能 `a32629d`；build_log 0059、ROADMAP 与本现场快照已随紧邻记账提交入库。
+- 唯一全量：`5 failed, 1235 passed in 277.44s`；五项均为有意契约收紧后的旧测试锚，更新后 exact
+  `5 passed in 1.59s`；按用户要求未二跑全量。相关批次 78/101/102/80/45/77/59/20/13 均通过。
+- 外审已达两轮上限且均无 verdict：第 1 轮独立账号 401；第 2 轮完整 staged diff 内联后耗尽 5/5 WebSocket
+  重连并降级 HTTPS 仍 idle。未伪报 APPROVE，详见 build_log 0059。
 - 当前仍是 operational canary，不是 reference-complete 或 hostile-workload production-ready 系统。
 
 ## 下一步动作
 
-1. 对照 reference 审计 plan schema→build_target 的 `critical/budget_estimate` 数据路径与非关键失败早退语义。
-2. 审计 goal_amend 后所有新执行/证据的 current goal lineage，以及 runner_call/run/evaluation_attempt 残留状态。
-3. 设计 receipt→DB 对账和 heartbeat：owner_lost/timeout/cancelled 的权威映射、崩溃恢复、重试/通知；开发期仍
-   只跑相关验证，检查点最后只跑一次全量。
-4. CP11.3c 后再进入 CP11.4 敌对隔离/补账/内容寻址，并做真实 100+ 轮运维验收。
+1. 在默认 `build_system/run_system` 装配同 owner fenced `ImportWorker`，生产循环调用
+   `materialize_pending()`；先补 restart/idempotency/失败通知，禁止仅测试工厂可用。
+2. 接通 plan `import_defer`：候选经 `import_register` 落耐久身份，原子写 dependency_wait route、question dep 与
+   cycle 收尾；物化成功后只释放精确问题，崩溃重放不重复 fetch/eval/publish。
+3. 将 answerability review 与 plan generator 分离，最多两轮，runner_call/cost/verdict 全耐久；两轮不通过正常
+   终结本轮而非楔死。
+4. 仍按用户节奏：开发期只跑相关验证，CP11.4a 末尾仅一次全量、功能提交 + build_log 提交。
 
 ## 关键上下文 / 坑
 
-- `reference/` 是设计权威，不是运行时自动加载的 skill；CP11.3b 只补齐 execution lifecycle 子概念。
-- 当前 backend 不是 cgroup/container：要求 Linux `/proc`、prctl、signal 权限；PID namespace PID1 拒绝，
-  tool-free 异 UID 回收要求 root。同 UID hostile workload、guardian/receipt 篡改留 CP11.4。
-- 同机 GPFS/VEPFS owner-kill canary 已通过；跨节点 flock 仍须真实两节点同时 acquire 验收。
-- `ImportWorker` 组件要求同 owner fenced supervisor，但默认 build_system 尚未装配 import resumer；fetch provider
-  未来若执行 git/subprocess 也必须进入 supervisor。
-- 不得 push；下一检查点仍须先内部审查、最多两轮 codex 外审、一次最终全量、功能提交 + build_log 提交。
+- `reference/` 是设计权威，不是运行时自动加载的 skill；当前实现只是逐检查点把概念落实，尚不能称几乎完全
+  对应或 production-ready。
+- `ImportWorker` 默认未装配，`import_defer` 被拒，是当前最直接的生产链断口；fetch provider 若执行
+  git/subprocess 也必须进入 shared supervisor。
+- eval-only 当前要求恰一个 checkpoint；hash 校验后子进程仍按路径打开，存在 TOCTOU。content-addressed/fd-safe
+  capability、provider invocation/billing exactly-once 留 CP11.4b。
+- 当前 backend 不是 cgroup/container：要求 Linux `/proc`、prctl、signal 权限；同 UID hostile workload、
+  guardian/receipt 篡改与跨节点 VEPFS 验收留 CP11.4c。120 轮回归只证明控制面长程状态，不代表 120 次真实外调。
+- 不得 push；后续每检查点仍须内部审查、最多两轮 codex 外审、仅一次最终全量、功能提交 + build_log 提交。
