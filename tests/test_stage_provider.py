@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import hashlib
 import json
 
 import pytest
@@ -18,7 +19,7 @@ from orchestrator import database as db
 from orchestrator.interfaces import Artifact
 from orchestrator.runner import RunnerError
 from orchestrator.schemas import SchemaSet
-from orchestrator.stage_provider import StageProvider
+from orchestrator.stage_provider import PlanReviewProvider, StageProvider
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
@@ -52,8 +53,14 @@ def _provider(scripted, work):
 
 
 def _pack(stage):
+    sources = []
+    if stage == "plan":
+        plan_hash = hashlib.sha256(json.dumps(
+            _PLAN, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        sources.append(f"staging:plan-draft:{plan_hash}")
     return NS(cycle_id="c1", stage=stage, target_id=None, anchor_md="", neighborhood_md="",
-              retrieval_md="", refs=[])
+              retrieval_md="", refs=[], sources=sources)
 
 
 _FIX = SYSTEM_ROOT / "tests" / "fixtures" / "valid"
@@ -243,6 +250,80 @@ def test_bundle_invalid_manifest_retried_with_feedback(tmp_path):
     assert "execution_manifest.json" in runner.skills_seen[1]   # schema 错误反馈进重试 skill
 
 
+# ============ plan answerability 独立评审装配 ============
+def test_plan_review_provider_records_audit_call_and_durable_verdict(tmp_path):
+    daemon, _bt_id, work = _judge_env(tmp_path)
+    runner = MockRunner([{
+        "plan_review.json": {"verdict": "pass", "round_no": 1, "issues": []}}])
+    provider = PlanReviewProvider(
+        runner_factory=lambda _td, _purpose: runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="SYS", skill="[skill:plan]",
+        daemon=daemon, work_root=str(work))
+
+    review, decision_id = provider(NS(cycle_id="c1"), _PLAN, 1, _pack("plan"))
+
+    assert review["verdict"] == "pass"
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE id=?", (decision_id,))[0])
+    assert payload["round_no"] == 1 and payload["plan_hash"]
+    assert daemon.query_one(
+        "SELECT status,phase,purpose FROM runner_call WHERE id=?",
+        (payload["runner_call_id"],)) == ("success", "audit", "plan_review")
+
+
+def test_plan_review_provider_retries_bad_round_envelope(tmp_path):
+    daemon, _bt_id, work = _judge_env(tmp_path)
+    runner = MockRunner([
+        {"plan_review.json": {"verdict": "pass", "round_no": 2, "issues": []}},
+        {"plan_review.json": {"verdict": "pass", "round_no": 1, "issues": []}},
+    ])
+    provider = PlanReviewProvider(
+        runner_factory=lambda _td, _purpose: runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="SYS", skill="[skill:plan]",
+        daemon=daemon, work_root=str(work))
+
+    review, _decision_id = provider(NS(cycle_id="c1"), _PLAN, 1, _pack("plan"))
+
+    assert review["round_no"] == 1
+    assert "期望 1" in runner.skills_seen[1]
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 1
+
+
+def test_plan_review_provider_rejects_pack_for_different_plan(tmp_path):
+    daemon, _bt_id, work = _judge_env(tmp_path)
+    runner = MockRunner([{
+        "plan_review.json": {"verdict": "pass", "round_no": 1, "issues": []}}])
+    provider = PlanReviewProvider(
+        runner_factory=lambda _td, _purpose: runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="SYS", skill="[skill:plan]",
+        daemon=daemon, work_root=str(work))
+    pack = _pack("plan")
+    pack.sources = ["staging:plan-draft:" + "0" * 64]
+
+    with pytest.raises(ValueError, match="exact plan hash"):
+        provider(NS(cycle_id="c1"), _PLAN, 1, pack)
+    assert runner.skills_seen == []
+    assert daemon.query_one("SELECT count(*) FROM runner_call WHERE purpose='plan_review'")[0] == 0
+
+
+def test_plan_review_provider_does_not_retry_runner_failure(tmp_path):
+    daemon, _bt_id, work = _judge_env(tmp_path)
+    runner = MockRunner([
+        RunnerError("transport down", failure_kind="transport"),
+        {"plan_review.json": {"verdict": "pass", "round_no": 1, "issues": []}},
+    ])
+    provider = PlanReviewProvider(
+        runner_factory=lambda _td, _purpose: runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="SYS", skill="[skill:plan]",
+        daemon=daemon, work_root=str(work))
+
+    with pytest.raises(RunnerError, match="transport down") as error:
+        provider(NS(cycle_id="c1"), _PLAN, 1, _pack("plan"))
+    assert error.value.failure_kind == "transport"
+    assert len(runner.skills_seen) == 1
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 0
+
+
 # ============ CP8.3 · JudgeProvider（真 Codex 双评审装配）============
 def _judge_env(tmp_path):
     """真 SQLite（goal/cycle/question/baseline/variant/build_target[plan_ref=切片]）+ staging 物化材料。"""
@@ -351,6 +432,48 @@ def test_judge_eval_only_subject_includes_existing_checkpoint_and_attempt_log(tm
     md = jp._subject_md("c1", bt_id, "bundle_result_review")
     assert "checkpoint ck1" in md and "h" in md
     assert "metric_value: 1@1=0.95" in md and "loss: 0.1" in md
+
+
+def test_judge_import_subject_uses_import_snapshot_layout(tmp_path):
+    daemon, _bt_id, work = _judge_env(tmp_path)
+    with daemon.transaction() as conn:
+        candidate_id = conn.execute(
+            "INSERT INTO external_candidate(question_id,discovered_cycle,trigger_kind,"
+            "trigger_snapshot_hash,need_summary,source_kind,canonical_uri,revision,"
+            "search_snapshot_json,search_snapshot_hash,rank,retrieved_at) "
+            "VALUES (1,1,'sota_reference','th','need','repo','https://example.invalid/r','rev','{}','sh',0,'t')"
+        ).lastrowid
+        license_id = conn.execute(
+            "INSERT INTO license_review(candidate_id,decision,actor,license_scope_json,decided_cycle,policy_hash) "
+            "VALUES (?,'allow','auto','{\"allow_eval\":true,\"allow_publish_pool\":true}',1,'ph')",
+            (candidate_id,)).lastrowid
+        baseline_id = conn.execute(
+            "INSERT INTO baseline(slug,canonical_key,status,provenance,license_status,born_cycle) "
+            "VALUES ('ext','ext','planned','external_import','allow',1)").lastrowid
+        variant_id = conn.execute(
+            "INSERT INTO variant(baseline_id,variant_key,config_json,status) "
+            "VALUES (?,'imported','{}','planned')", (baseline_id,)).lastrowid
+        external_import_id = conn.execute(
+            "INSERT INTO external_import(question_id,candidate_id,action,action_cycle,candidate_set_hash,"
+            "selection_key,policy_hash,license_decision_snapshot_hash,license_review_id,baseline_id) "
+            "VALUES (1,?,'selected_for_materialization',1,'csh','rank_asc','ph','lh',?,?)",
+            (candidate_id, license_id, baseline_id)).lastrowid
+        bt_id = conn.execute(
+            "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id,plan_ref) "
+            "VALUES (1,1,'import',4,'smoke',?,?,?)",
+            (baseline_id, variant_id, json.dumps({"frozen": True}))).lastrowid
+    clone = work / f"import{external_import_id}" / "clone"
+    clone.mkdir(parents=True)
+    (clone / "model.py").write_text("print('imported-code')", encoding="utf-8")
+    smoke = work / f"import{external_import_id}" / "smoke"
+    smoke.mkdir(parents=True)
+    (smoke / "smoke-1.log").write_text("import smoke ok", encoding="utf-8")
+
+    jp, _ = _judge(daemon, work, [])
+    md = jp._subject_md("c1", bt_id, "bundle_code_review")
+
+    assert "model.py" in md and "imported-code" in md
+    assert "import smoke ok" in md and '"frozen": true' in md.lower()
 
 
 def test_judge_unknown_kind_fails_loud(tmp_path):

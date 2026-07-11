@@ -12,6 +12,8 @@
   - plan(cyc, pack) → {"plan.json": …}（冻结 plan.schema 抽象形态；命令不在 plan）
   - bundle(cyc, pack) → {"execution_manifest.json": …, "identity.md": str, <代码文件passthrough…>}
   - reasoning(cyc, pack) → {"selection.json": …, "tree_ops.json"?: …, "answer.json"?: …}
+- PlanReviewProvider（写库形态）：独立会话审 plan answerability →
+  runner_call(audit/plan_review)+DECISION(judge/plan_review)。
 - JudgeProvider（写库形态）：judge(cycle_id, bt_id, review_kind, subject_hash) →
   真 Codex 产 review_verdict.json → 本模块落 runner_call(audit)+DECISION(judge)（Codex 永不碰 DB）。
 
@@ -357,17 +359,231 @@ class StageProvider:
         return errors
 
 
+class PlanReviewProvider:
+    """Independent plan answerability judge (semantic rounds ≤ policy, artifact retries per call)."""
+
+    def __init__(self, *, runner_factory, schemas, policy: Dict[str, Any],
+                 system_prompt: str, skill: str, daemon, work_root: str,
+                 cost_ledger=None):
+        self.runner_factory = runner_factory
+        self.schemas = schemas
+        self.retries = policy["flow"]["retry"]["artifact_parse"]
+        self.system_prompt = system_prompt
+        self.skill = skill
+        self.daemon = daemon
+        self.work = Path(work_root)
+        self.cost_ledger = cost_ledger
+        self._cost_required = policy.get("budget", {}).get("session_max") is not None
+        if self._cost_required and cost_ledger is None:
+            raise ValueError("budget.session_max 已启用，PlanReviewProvider 必须注入 cost_ledger")
+        self.policy_hash = hashlib.sha256(skill.encode("utf-8")).hexdigest()
+        self._call_seq = 0
+
+    def __call__(self, cyc, plan: Dict[str, Any], round_no: int,
+                 pack: ContextPack) -> tuple[Dict[str, Any], int]:
+        if isinstance(round_no, bool) or not isinstance(round_no, int) or not 1 <= round_no <= 2:
+            raise ValueError("plan review round_no 必须在 1..2")
+        if not isinstance(plan, dict):
+            raise ValueError("plan review 输入 plan 须为 object")
+        if (pack.cycle_id != cyc.cycle_id or pack.stage != "plan"
+                or getattr(pack, "target_id", None) is not None):
+            raise ValueError("plan review ContextPack cycle/stage/target 身份漂移")
+        self._call_seq += 1
+        runner = self.runner_factory(
+            self.work / f"cycles/{cyc.cycle_id}/transcripts",
+            f"plan-review-r{round_no}-n{self._call_seq}")
+        plan_hash = hashlib.sha256(json.dumps(
+            plan, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        if f"staging:plan-draft:{plan_hash}" not in getattr(pack, "sources", []):
+            raise ValueError(
+                "plan review ContextPack 未锚定调用参数中的 exact plan hash")
+        prior = self.daemon.query(
+            "SELECT id,json_extract(payload_json,'$.plan_hash') FROM decision "
+            "WHERE cycle_id=? AND actor='judge' AND type='plan_review' "
+            "AND json_valid(payload_json) AND json_extract(payload_json,'$.round_no')=? "
+            "ORDER BY id", (_cnum(cyc.cycle_id), round_no))
+        if prior:
+            raise RuntimeError(
+                f"plan review c{_cnum(cyc.cycle_id)} round {round_no} 已有 durable verdict: {prior}")
+        base = self.skill + (
+            "\n\n===== 调用点 =====\n只执行【评审任务】；这是与 plan generator 独立的新会话。"
+            f"产 plan_review.json，round_no 必须为 {round_no}。")
+        last_err = ""
+        for attempt in range(self.retries + 1):
+            skill = base if not last_err else (
+                base + f"\n\n===== 上次评审产物被拒（第 {attempt} 次重试）=====\n"
+                + last_err + "\n只修正评审信封，不生成 plan.json。")
+            call = self._begin_call(cyc.cycle_id, runner, round_no, attempt)
+            try:
+                art = runner.run_task(
+                    system_prompt=self.system_prompt, skill=skill, context_pack=pack)
+            except RunnerError as error:
+                self._finish_failed(
+                    call, error.usage, failure_kind=error.failure_kind,
+                    transcript_ref=error.transcript_ref,
+                    execution_receipt_ref=error.execution_receipt_ref)
+                # flow.retry.artifact_parse only repairs a returned but structurally invalid verdict.
+                # Process/transport/timeout/envelope RunnerError is an infrastructure call failure:
+                # retrying it here would spend again and later misreport it as artifact_parse exhaustion.
+                raise
+            except Exception as error:
+                self._finish_failed(
+                    call, getattr(error, "usage", None),
+                    failure_kind=getattr(error, "failure_kind", type(error).__name__.lower()),
+                    transcript_ref=getattr(error, "transcript_ref", None),
+                    execution_receipt_ref=(getattr(error, "execution_receipt_ref", None)
+                                           or str(getattr(error, "receipt_path", "") or "") or None))
+                raise
+            review = art.files.get("plan_review.json")
+            errors = []
+            if art.stage != "plan":
+                errors.append(f"envelope stage={art.stage!r}，期望 'plan'")
+            if "resource_request.json" in art.files:
+                errors.append("plan reviewer 不受理 resource_request sidecar")
+            unexpected = sorted(set(art.files) - {"plan_review.json"})
+            if unexpected:
+                errors.append(f"plan reviewer 含未授权额外 files: {unexpected}")
+            if review is None:
+                errors.append(f"缺 plan_review.json（files 键: {list(art.files)}）")
+            else:
+                errors.extend(
+                    f"{error.json_path} {error.message}"
+                    for error in self.schemas.validator("plan_review").iter_errors(review))
+                if review.get("round_no") != round_no:
+                    errors.append(
+                        f"plan_review.round_no={review.get('round_no')!r}，期望 {round_no}")
+            if errors:
+                self._finish_failed(
+                    call, art.usage, failure_kind="artifact_parse",
+                    transcript_ref=art.transcript_ref,
+                    execution_receipt_ref=art.execution_receipt_ref)
+                last_err = "\n".join(errors[:8])
+                continue
+            decision_id = self._record(
+                cyc.cycle_id, round_no, plan_hash, review, art.usage, call=call,
+                transcript_ref=art.transcript_ref,
+                execution_receipt_ref=art.execution_receipt_ref)
+            return review, decision_id
+        raise RunnerError(
+            f"plan_review 第 {round_no} 轮产物结构非法，artifact_parse 重试"
+            f"（≤{self.retries}）用尽：{last_err}")
+
+    def _begin_call(self, cycle_id: str, runner, round_no: int, attempt: int):
+        if self.cost_ledger is None:
+            return None
+        heartbeat_path = (
+            self.work / f"cycles/{cycle_id}/transcripts" /
+            f"plan-review-r{round_no}-n{self._call_seq}-a{attempt + 1}.heartbeat.json")
+        runner_call_id = self.cost_ledger.begin_call(
+            cycle_id=cycle_id, phase="audit", purpose="plan_review",
+            transcript_ref=str(heartbeat_path))
+        heartbeat = _RunnerCallHeartbeat(
+            heartbeat_path, runner_call_id=runner_call_id, cycle_id=cycle_id,
+            phase="audit", purpose="plan_review")
+        try:
+            _bind_runner_call(
+                runner, runner_call_id, phase="audit", purpose="plan_review")
+            self.cost_ledger.mark_call_running(runner_call_id=runner_call_id)
+            heartbeat.start()
+        except BaseException:
+            try:
+                heartbeat.finish("aborted")
+            except BaseException:
+                pass
+            self.cost_ledger.abort_unstarted_call(
+                runner_call_id=runner_call_id, failure_kind="call_prepare_failed")
+            raise
+        return runner_call_id, heartbeat
+
+    def _finish_failed(self, call, usage, *, failure_kind: str,
+                       transcript_ref=None, execution_receipt_ref=None) -> None:
+        if call is None:
+            return
+        runner_call_id, heartbeat = call
+        heartbeat_error = None
+        try:
+            heartbeat.finish("failed", execution_receipt_ref=execution_receipt_ref)
+        except Exception as error:
+            heartbeat_error = error
+            failure_kind = "heartbeat_failed"
+        self.cost_ledger.finish_call(
+            runner_call_id=runner_call_id, usage=usage, status="failed",
+            failure_kind=failure_kind,
+            transcript_ref=transcript_ref or str(heartbeat.path))
+        if heartbeat_error is not None:
+            raise heartbeat_error
+
+    def _record(self, cycle_id: str, round_no: int, plan_hash: str,
+                review: Dict[str, Any], usage, *, call,
+                transcript_ref=None, execution_receipt_ref=None) -> int:
+        ci = _cnum(cycle_id)
+        budget_hit = None
+        if self.cost_ledger is not None and call is None:
+            raise RuntimeError("plan review verdict 缺预调用 runner_call")
+        if call is not None:
+            runner_call_id, heartbeat = call
+            try:
+                heartbeat.finish("success", execution_receipt_ref=execution_receipt_ref)
+            except Exception as error:
+                self.cost_ledger.finish_call(
+                    runner_call_id=runner_call_id, status="failed", usage=usage,
+                    failure_kind="heartbeat_failed",
+                    transcript_ref=transcript_ref or str(heartbeat.path))
+                raise error
+        try:
+            with self.daemon.transaction() as conn:
+                duplicate = conn.execute(
+                    "SELECT id FROM decision WHERE cycle_id=? AND actor='judge' "
+                    "AND type='plan_review' AND json_valid(payload_json) "
+                    "AND json_extract(payload_json,'$.round_no')=? ORDER BY id",
+                    (ci, round_no)).fetchall()
+                if duplicate:
+                    raise RuntimeError(
+                        f"plan review c{ci} round {round_no} 已有 durable decision {duplicate}")
+                if self.cost_ledger is not None:
+                    budget_hit = self.cost_ledger.finish_call_in_txn(
+                        conn, runner_call_id=runner_call_id, status="success", usage=usage,
+                        transcript_ref=transcript_ref or str(heartbeat.path))
+                else:
+                    runner_call_id = conn.execute(
+                        "INSERT INTO runner_call(cycle_id,phase,purpose,status,transcript_ref,"
+                        "started_at,finished_at) VALUES (?,'audit','plan_review','success',?,"
+                        "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                        (ci, transcript_ref)).lastrowid
+                decision_id = conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'judge','plan_review',?)",
+                    (ci, json.dumps({
+                        "round_no": round_no, "verdict": review["verdict"],
+                        "issues": review.get("issues", []),
+                        "notes_md": review.get("notes_md", ""),
+                        "plan_hash": plan_hash, "runner_call_id": runner_call_id,
+                        "policy_hash": self.policy_hash,
+                    }, ensure_ascii=False, sort_keys=True))).lastrowid
+        except Exception:
+            if self.cost_ledger is not None:
+                self.cost_ledger.finish_call(
+                    runner_call_id=runner_call_id, status="failed", usage=usage,
+                    failure_kind="postprocess_error",
+                    transcript_ref=transcript_ref or str(heartbeat.path))
+            raise
+        if budget_hit is not None:
+            raise BudgetExhausted(**budget_hit)
+        return decision_id
+
+
 def _tail(text: str, n: int = 2000) -> str:
     """材料摘要截尾（评审对象走 prompt，防超长；截断显式标注，不冒充全文）。"""
     return text if len(text) <= n else f"…（前 {len(text) - n} 字符截断）…\n" + text[-n:]
 
 
 class JudgeProvider:
-    """真 Codex 双评审装配（步⑧ CP8.3）：**attack 轮**的 judge 契约实现——
+    """真 Codex 双评审装配（步⑧ CP8.3）：attack/import target 的 judge 契约实现——
     judge(cycle_id, build_target_id, review_kind, subject_hash)。
-    ⚠️ 只服务 attack 目标：_subject_md 按 attack staging 布局（work/c<ci>/t<bt>/{src,smoke,run*,eval*}）装
-    材料；import 物化的布局不同（work/import<ei>/{clone,smoke}，代码在 clone/ 非 src/）——给 import_worker
-    接真 judge 时须另配 subject 装配器（内审 SHOULD 记：勿把本类直接塞给 import_worker）。
+    ``_subject_md`` 先由 build_target.kind 机械解析布局：研究 target 读
+    ``work/c<ci>/t<bt>/{src,smoke,run*,eval*}``，import worker target 读
+    ``work/import<external_import_id>/{clone,smoke,eval*}``；两者仍走同一 subject_hash/runner_call/decision 判据。
 
     分工（§4.1.4 附注）：**编排器**机械装 subject 材料（DB 切片/checkpoint 哈希 + staging 物化代码/
     log 摘要）→ 独立 Codex 会话按 judge SKILL 产 review_verdict.json（schema 校验 + artifact_parse
@@ -579,10 +795,24 @@ class JudgeProvider:
         「据结果反查代码」，codex BLOCKER）+ smoke + metric_value 行**全量显式列出**（不受 log tail 截断）
         + train/eval log 尾部 + checkpoint 哈希 + identity。"""
         d = self.daemon
-        row = d.query_one("SELECT plan_ref FROM build_target WHERE id=?", (bt_id,))
+        row = d.query_one(
+            "SELECT plan_ref,target_kind,baseline_id FROM build_target WHERE id=?", (bt_id,))
         slice_md = row[0] if row and row[0] else "（无 plan_ref）"
-        t_dir = self.work / f"c{_cnum(cycle_id)}" / f"t{bt_id}"
-        src = t_dir / "src"
+        if row is None:
+            raise ValueError(f"judge build_target {bt_id} 不存在")
+        if row[1] == "import":
+            selected_rows = d.query(
+                "SELECT id FROM external_import WHERE baseline_id=? "
+                "AND action='selected_for_materialization' ORDER BY id", (row[2],))
+            if len(selected_rows) != 1:
+                raise RuntimeError(
+                    f"import target {bt_id} 须恰一 selected_for_materialization provenance，"
+                    f"实收 {len(selected_rows)}")
+            t_dir = self.work / f"import{selected_rows[0][0]}"
+            src = t_dir / "clone"
+        else:
+            t_dir = self.work / f"c{_cnum(cycle_id)}" / f"t{bt_id}"
+            src = t_dir / "src"
         parts = [f"## 评审对象（{kind}）", f"### resolved 计划切片\n```json\n{slice_md}\n```"]
         for p in sorted(src.rglob("*")):        # 两种评审都给代码（result review 须能据结果反查代码）
             if p.is_file() and p.name != "_staged.ok":

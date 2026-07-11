@@ -1,6 +1,6 @@
 # SKILL · plan —— 复用判定 + 锁评估协议
 
-> 版本：m0-1。按《第一部分》§3.3 与流程图 04-Plan；产物 schema = `schemas/plan.schema.json`。
+> 版本：m4-cp114a。按《第一部分》§3.3 与流程图 04-Plan；产物 schema = `schemas/plan.schema.json`。
 > 本阶段 = 计划调用（phase=plan）+ **可回答性评审**独立调用（phase=audit，≤2 轮，本文件
 > 【评审任务】节）。评估协议在本阶段锁死，bundle 只照办、不再发明（I2 源头）。
 
@@ -9,7 +9,7 @@
 - **触发条件**：idea 阶段产出 selected idea 后。
 - **读取**：normalized selected idea（candidate_id / core_claim / mechanism / assumptions /
   min_falsifiable_experiment / audit_mapping / novelty_refs）· 单轮预算 B(t) · 依赖基线卡 ·
-  召回的三层池卡与相似协议卡（M0 池空 → 检索区为空属正常）。
+  召回的三层池卡与相似协议卡；本 action-cycle 已登记的 external candidate/license 冻结摘要（可能为空）。
 - **门禁与写入**：plan.json 经 gate 落 protocol + 占坑 + build_target 队列 + required_metric。
 - **失败语义**：评审两轮不过 → 阶段失败 = 研究轮正常收尾（cycle=done、Qn inconclusive、
   visit+1）汇入 reasoning；**无从设计实验 = idea 不合格**，同样收尾、创造性回流上游（§3.2.5）。
@@ -23,7 +23,7 @@
    不受 idea 文本约束。特例：父问题**聚合轮**（全部子依赖 satisfied、以 child_answer 关闭）
    不产生验证需求——`needs=[]`、`targets=[]`，reuse_evidence 逐条引子问题 answer（kind=child_answer），
    此时 protocol/metric_defs/readout_rules 可省。
-2. **逐 need 机械复用判定**（§3.3.1 五情形；判定依据只能是检索区给出的池事实，M0 池空即"池中无"）。
+2. **逐 need 机械复用判定**（§3.3.1 五情形；判定依据只能是固定锚/检索区给出的已提交事实，池空即"池中无"）。
    **情形 → 处置 → target 必带字段**（照表写、缺一即被 schema 拒）：
 
    | 情形 | 处置 | eval_action | attempt_purpose | 另须携带 |
@@ -38,7 +38,7 @@
    检索区已有的 legal 池资产**——检索区没有该家族的 legal baseline（含池空）时，`exec`/`eval` 语义非法，
    **必须走 `build` 先建 baseline**（首攻新家族恒为 build）。若上下文包给出「上轮 plan 被拒原因」，
    先修正该原因再产出本轮 plan。
-   | 池中无 + 需引入外部 baseline 家族/公认参照 | **M0 不走 import**：能自建对照则改自建；否则该 need 记入 md 正文"本轮无法覆盖"，由轮尾 reasoning 裁决（M1–M3 起此分支写 `import_defer`；M0 不产该字段） | — | — | — |
+   | 池中无 + 需引入外部 baseline 家族/公认参照 | 只读固定锚中的“本轮已登记 external import 候选”。仅当 `anchors.may_emit_import_defer=true`，才产顶层 `import_defer`、`targets=[]`，并逐字照抄 `candidate_set_hash/license_decision_snapshot_hash/selection_key/policy_hash`；候选/license 由编排器在提交事务内重算选择，**不得自造 URI、candidate id 或 hash**。无已登记可物化候选时，能自建则走 build，否则在 md 诚实写本轮无法覆盖，绝不伪造 import。 | — | — | — |
 3. **锁评估协议**（字段名按 schema 逐字写）：
    - `protocol`：`{name, version（整数≥1）, scope_spec（对象：评估数据/分割/checkpoint 选择/
      流程——一字一句都是 I1 冻结对象）, smoke_md?（smoke 定义）}`；
@@ -57,7 +57,11 @@
    检索区基线卡会标 building）→ 不重复开工：在 `md` 里声明「等待 <baseline> 就绪」，
    由编排器写 `question_dep(dep_type=baseline, pending)` 并把本轮收成 **dependency_wait**
    （机械收尾：写 dep + 释放 Qn 回 open + mark_cycle_done，不经 reasoning，§4.2.5）。
-   M0 单驱动器串行、通常不会触发，契约仍在此声明。
+   import 三闸命中且固定锚允许时，输出 `import_defer`（不得同时有 target/protocol/metric）；编排器在一个
+   plan phase_commit 中机械写选择事件 + 占位 baseline + pending dep + `dependency_wait` route，释放 Qn 并
+   收尾，不进普通 plan 可回答性评审、bundle/reasoning（图 04 IMP→WAIT 发生在 PROTO/REVIEW 之前）。
+   物化成功、dep satisfied 后同一 Qn 重新进入 attack；物化终败则编排器写失败裁决并把 exact dep 置
+   `blocked`，同一 Qn 回到可重规划集合，下一轮必须消费失败摘要后改候选/自建/分解，禁止原样死循环。
 6. `md` 写计划正文（中文）：needs 表、复用判定逐条结论、协议锁定理由、预算分配。
 
 **输出骨架（键名逐字，封闭对象；`<>` 占位、`?` 表可省键）**：
@@ -80,13 +84,33 @@
   "build_target_required_metric": [ { "target_key": "t1", "metric_id": "<>", "metric_ver": 1 } ] }
 ```
 
-骨架纪律：顶层只许上列七键（第八种可能键 import_defer M0 不产）；target 内不加自造键；
+骨架纪律：普通 plan 顶层只许上列七键；`import_defer` 只按下方专用骨架出现；target 内不加自造键；
 聚合轮：needs/targets 均为 []、protocol/metric_defs/readout_rules **整体省略**，但
 `reuse_evidence`（child_answer 证据逐条）与 `build_target_required_metric`（=[]）**仍必须在场**。
 **scope_spec 只写评估场景**（评估数据/分割/checkpoint 选择/评估流程）——训练配置的唯一
 载体是 target 的 `claim.config_json`，**不得在协议里双写训练配置**（双写必然漂移、评审打回）。
 
+**import_defer 专用骨架**（与上方普通 plan 二选一）：
+
+```json
+{ "needs": [], "reuse_evidence": [], "targets": [], "build_target_required_metric": [],
+  "import_defer": {
+    "reason_md": "为什么该问题需要已登记的外部基线",
+    "candidate_set_hash": "<逐字照抄 anchors.candidate_set_hash>",
+    "license_decision_snapshot_hash": "<逐字照抄 anchors.license_decision_snapshot_hash>",
+    "selection_key": "<逐字照抄 anchors.selection_key>",
+    "policy_hash": "<逐字照抄 anchors.policy_hash>",
+    "placeholder_baseline_identity": {
+      "canonical_key_draft": "<稳定方法族键>", "slug_draft": "<稳定可读 slug>",
+      "identity_md": "<中文占位身份；只描述用途，不宣称已物化/已验证>"
+    }
+  }
+}
+```
+
 ## 【评审任务】（phase=audit，独立会话，≤2 轮）
+
+本任务只审普通实验 plan；`import_defer` 专用 plan 不调用本任务。
 
 输入 = plan.json + normalized selected idea（**不含计划推理过程**）。
 产出 `files["plan_review.json"]`：`{ "verdict": "pass"|"fail", "issues": [ {"item": "...",

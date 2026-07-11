@@ -11,9 +11,10 @@ StopController + Console + make_advancer_precheck → StageProvider(CodexRunner)
 重启同 work_dir 即续跑（状态在 DB，非进程内）——kill-9 恢复同 M3。
 
 **步⑧（M7）范围**：本入口装配**全流程**——reasoning-only 闭环（M6 已落）+ **attack 轮全家**（CP8.4）：
-StageProvider 四阶段（idea/plan/bundle/reasoning）+ JudgeProvider（真 Codex 双评审写库）+ AttackStages
-（消费冻结 schema + manifest 驱动真执行）。仍明确拒的续轮：在途 import 物化轮（ImportWorker 未装配，
-CP8.6）——NotImplementedError 干净报，不静默。
+StageProvider 四阶段（idea/plan/bundle/reasoning）+ PlanReviewProvider（plan 独审）+
+JudgeProvider（bundle 双评审写库）+ AttackStages
+（消费冻结 schema + manifest 驱动真执行）+ ImportWorker（冻结候选 snapshot 解码、worker-cycle 恢复；
+默认 untrusted adapter 在 adversarial sandbox capability 落地前 fail closed，绝不在 host 裸跑）。
 
 **双模式 A/B**（policy.session.dual_mode）：模式 A=一 turn 一阶段、模式 B=一 turn 跨多阶段。run_cycles
 的内循环按阶段推进（格间过 precheck + 发布卡片），对两模式都成立；A/B 的会话粒度实测定默认 = 运维执行
@@ -51,6 +52,8 @@ from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
 from .instance_lease import InstanceLease, InstanceLeaseError
+from .import_fetcher import FrozenCandidateFetcher
+from .import_worker import ImportWorker
 from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
                      InteractionNotifier, Outbox, ResearchNotifier,
@@ -58,7 +61,7 @@ from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
 from .process_supervisor import ExecutionSupervisor
 from .runner import CodexRunner, terminate_active_process_groups
 from .schemas import SchemaSet
-from .stage_provider import JudgeProvider, StageProvider
+from .stage_provider import JudgeProvider, PlanReviewProvider, StageProvider
 from .statestore_sqlite import SQLiteStateStore
 from .status_card import SqliteStatusPublisher
 from .stopcontroller import StopController
@@ -1282,6 +1285,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                              file_request_bridge=file_request_bridge, cost_ledger=cost_ledger)
 
     attack_stages = attack if isinstance(attack, AttackStages) else None
+    import_worker = None
     if attack_stages is not None:
         attack_stages.bind_owner_guard(owner_guard)
     if attack is True:
@@ -1299,16 +1303,28 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             runner_factory=rf, schemas=schemas, policy=policy, system_prompt=system_prompt,
             skill=(root / "prompts" / "skills" / "judge" / "SKILL.md").read_text(encoding="utf-8"),
             daemon=daemon, work_root=str(work), cost_ledger=cost_ledger)
+        plan_reviewer = PlanReviewProvider(
+            runner_factory=rf, schemas=schemas, policy=policy,
+            system_prompt=system_prompt, skill=skills["plan"], daemon=daemon,
+            work_root=str(work), cost_ledger=cost_ledger)
         attack_stages = AttackStages(
             state=state, compiler=compiler, pool_gate=pool_gate, close_gate=close_gate,
             providers={"idea": provider.idea, "plan": provider.plan, "bundle": provider.bundle,
-                       "judge": judge, "reasoning": provider.reasoning},
+                       "plan_review": plan_reviewer, "judge": judge,
+                       "reasoning": provider.reasoning},
             obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy,
+            owner_guard=(owner_guard if instance_lease is not None else None),
+            execution_supervisor=execution_supervisor)
+        import_worker = ImportWorker(
+            state=state, pool_gate=pool_gate,
+            providers={"fetch": FrozenCandidateFetcher(), "judge": judge},
+            obs_policy=policy["observation"], work_root=str(work),
             owner_guard=(owner_guard if instance_lease is not None else None),
             execution_supervisor=execution_supervisor)
 
     advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
-                              status_publisher=publisher, precheck=precheck, stop_controller=stop)
+                              status_publisher=publisher, precheck=precheck, stop_controller=stop,
+                              import_worker=import_worker)
     owner_guard()
     if instance_lease is not None:
         instance_lease.set_state("ready", activity="assembly-complete")

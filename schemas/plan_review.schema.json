@@ -8,22 +8,23 @@
   "additionalProperties": false,
   "properties": {
     "verdict": { "enum": ["pass", "fail"] },
-    "round_no": { "type": "integer", "minimum": 1 },
+    "round_no": { "type": "integer", "minimum": 1, "maximum": 2 },
     "issues": {
       "type": "array",
+      "maxItems": 32,
       "description": "verdict=fail 时逐条问题（回传计划会话修复的依据）；pass 时可为空",
       "items": {
         "type": "object",
         "required": ["item", "why"],
         "additionalProperties": false,
         "properties": {
-          "item": { "type": "string", "minLength": 1, "description": "违反可回答性清单的哪一条（对应 SKILL 评审任务 1–5）" },
-          "why": { "type": "string", "minLength": 1 },
-          "fix_hint": { "type": "string" }
+          "item": { "type": "string", "minLength": 1, "maxLength": 256, "description": "违反可回答性清单的哪一条（对应 SKILL 评审任务 1–5）" },
+          "why": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "fix_hint": { "type": "string", "maxLength": 2048 }
         }
       }
     },
-    "notes_md": { "type": "string" }
+    "notes_md": { "type": "string", "maxLength": 4096 }
   },
   "allOf": [
     {

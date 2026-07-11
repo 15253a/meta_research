@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 import conftest
@@ -22,6 +24,7 @@ TEST_POLICY = {
     "answer_review": {"max_reviews_per_cycle": 2},
     "goal_amend": {"max_spawn_from_goal_amend": 2, "max_closed_revalidate_per_cycle": 3},
 }
+_EMPTY_SNAPSHOT_HASH = "sha256:" + hashlib.sha256(b"{}").hexdigest()
 
 
 @pytest.fixture()
@@ -39,7 +42,8 @@ def _register_and_select(env, decision="allow"):
     imp, d = env["importer"], env["daemon"]
     cid = imp.register_candidate(question_id="q2", discovered_cycle="c1", trigger_kind="sota_reference",
                                  trigger_snapshot_hash="tsh", need_summary="need", source_kind="paper",
-                                 canonical_uri="uri", search_snapshot_json="{}", search_snapshot_hash="ssh",
+                                 canonical_uri="uri", search_snapshot_json="{}",
+                                 search_snapshot_hash=_EMPTY_SNAPSHOT_HASH,
                                  rank=0, retrieved_at="t")
     lic = imp.review_license(candidate_id=cid, decision=decision,
                              license_scope_json="{}" if decision == "allow" else None)
@@ -154,7 +158,7 @@ def test_select_deferred_replay_mismatched_candidate_fails_loud(env):
     cid2 = env["importer"].register_candidate(
         question_id="q2", discovered_cycle="c1", trigger_kind="sota_reference", trigger_snapshot_hash="tsh",
         need_summary="need", source_kind="paper", canonical_uri="uri-2", search_snapshot_json="{}",
-        search_snapshot_hash="ssh", rank=1, retrieved_at="t")
+        search_snapshot_hash=_EMPTY_SNAPSHOT_HASH, rank=1, retrieved_at="t")
     lic2 = env["importer"].review_license(candidate_id=cid2, decision="allow", license_scope_json="{}")
     with pytest.raises(ValueError, match="候选不符"):
         env["importer"].select_deferred(
@@ -264,12 +268,90 @@ def test_second_pending_file_request_per_goal_rejected(env):
 
 
 # ============ 输入校验（前缀化 id / both-or-neither，内审 SHOULD） ============
+def test_plan_snapshot_hashes_exclude_sqlite_surrogate_ids():
+    """I6 内容身份不得随恢复库里的自增 candidate/review id 漂移。"""
+    def snapshot(*, pad_ids):
+        daemon = WriteDaemon(db.connect(":memory:"))
+        conftest.seed_minimal(daemon.conn)
+        with daemon.transaction() as conn:
+            conn.execute(
+                "INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
+                "VALUES (2,1,1,1,'q2','open','agent')")
+        importer = DeferredImporter(daemon)
+        policy_hash = importer.policy_hash(TEST_POLICY)
+        if pad_ids:
+            padding = importer.register_candidate(
+                question_id="q1", discovered_cycle="c1", trigger_kind="stuck",
+                trigger_snapshot_hash="padding-trigger", need_summary="padding",
+                source_kind="paper", canonical_uri="padding-uri",
+                search_snapshot_json="{}", search_snapshot_hash=_EMPTY_SNAPSHOT_HASH,
+                rank=99, retrieved_at="audit")
+            importer.review_license(
+                candidate_id=padding, decision="review", decided_cycle="c1",
+                policy_hash=policy_hash)
+        candidate_id = importer.register_candidate(
+            question_id="q2", discovered_cycle="c1", trigger_kind="sota_reference",
+            trigger_snapshot_hash="trigger", need_summary="same frozen candidate",
+            source_kind="paper", canonical_uri="same-uri",
+            search_snapshot_json="{}", search_snapshot_hash=_EMPTY_SNAPSHOT_HASH,
+            rank=0, retrieved_at="different-audit-time")
+        review_id = importer.review_license(
+            candidate_id=candidate_id, decision="allow", decided_cycle="c1",
+            policy_hash=policy_hash,
+            license_scope_json=(
+                '{"allow_eval":true,"allow_modify":false,'
+                '"allow_publish_pool":true,"allow_redistribute":false}'))
+        result = importer.plan_snapshot(
+            daemon.conn, question_id=2, action_cycle=1, policy_hash=policy_hash)
+        daemon.conn.close()
+        return candidate_id, review_id, result
+
+    direct = snapshot(pad_ids=False)
+    shifted = snapshot(pad_ids=True)
+    assert direct[:2] != shifted[:2]  # 证明确实换了 surrogate ids
+    assert direct[2]["candidate_set_hash"] == shifted[2]["candidate_set_hash"]
+    assert (direct[2]["license_decision_snapshot_hash"]
+            == shifted[2]["license_decision_snapshot_hash"])
+
+
+def test_registration_requires_exact_strict_snapshot_hash(env):
+    importer = env["importer"]
+    with pytest.raises(ValueError, match="精确 UTF-8 字节"):
+        importer.register_candidate(
+            question_id="q2", discovered_cycle="c1", trigger_kind="stuck",
+            trigger_snapshot_hash="t", need_summary="n", source_kind="paper",
+            canonical_uri="bad-hash", search_snapshot_json="{}",
+            search_snapshot_hash="sha256:" + "0" * 64, rank=0, retrieved_at="audit")
+    duplicate = '{"x":1,"x":2}'
+    with pytest.raises(ValueError, match="严格 JSON"):
+        importer.register_candidate(
+            question_id="q2", discovered_cycle="c1", trigger_kind="stuck",
+            trigger_snapshot_hash="t2", need_summary="n", source_kind="paper",
+            canonical_uri="duplicate-json", search_snapshot_json=duplicate,
+            search_snapshot_hash=(
+                "sha256:" + hashlib.sha256(duplicate.encode("utf-8")).hexdigest()),
+            rank=0, retrieved_at="audit")
+
+
+def test_license_scope_is_closed_boolean_capability_object(env):
+    candidate_id, _ = _register_and_select(env)
+    with pytest.raises(ValueError, match="未知键"):
+        env["importer"].review_license(
+            candidate_id=candidate_id, decision="allow",
+            license_scope_json='{"allow_eval":true,"instruction":"run me"}')
+    with pytest.raises(ValueError, match="boolean"):
+        env["importer"].review_license(
+            candidate_id=candidate_id, decision="allow",
+            license_scope_json='{"allow_eval":"true"}')
+
+
 def test_typed_id_prefix_validated(env):
     """importer/interaction 的 id 解码校验前缀——类型错 id 干净拒（防静默命中别表同号行）。"""
     with pytest.raises(ValueError, match="前缀"):
         env["importer"].register_candidate(question_id="c9", discovered_cycle="c1", trigger_kind="stuck",
                                            trigger_snapshot_hash="t", need_summary="n", source_kind="paper",
-                                           canonical_uri="u", search_snapshot_json="{}", search_snapshot_hash="s",
+                                           canonical_uri="u", search_snapshot_json="{}",
+                                           search_snapshot_hash=_EMPTY_SNAPSHOT_HASH,
                                            rank=0, retrieved_at="t")   # 'c9' 处于 question 位
     with pytest.raises(ValueError, match="前缀"):
         env["interaction"].inbound(connector="qq", raw_text="x", idempotency_key="kx", cycle_id="q1")  # 'q1' 处于 cycle 位

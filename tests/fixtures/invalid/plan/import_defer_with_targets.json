@@ -16,6 +16,7 @@
   "import_defer": {
     "reason_md": "需引入外部 SOTA 参照家族",
     "candidate_set_hash": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+    "license_decision_snapshot_hash": "sha256:5656565656565656565656565656565656565656565656565656565656565656",
     "selection_key": "stars_desc",
     "policy_hash": "sha256:3434343434343434343434343434343434343434343434343434343434343434",
     "placeholder_baseline_identity": {

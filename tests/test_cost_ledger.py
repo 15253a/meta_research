@@ -370,7 +370,7 @@ def test_judge_records_rejected_artifact_and_atomically_records_final(daemon, tm
                  usage=_known_usage(tokens_total=2000)),
     ])
     _judge(daemon, tmp_path, runner, CostLedger(daemon, POLICY))(
-        "c1", 999, "bundle_code_review", "subject")
+        "c1", 2, "bundle_code_review", "subject")
     rows = daemon.query("SELECT rc.status,l.tokens_total FROM runner_call rc "
                         "JOIN ledger l ON l.runner_call_id=rc.id ORDER BY rc.id")
     assert rows == [("failed", 500), ("failed", 1000), ("success", 2000)]
@@ -387,7 +387,7 @@ def test_judge_final_cost_failure_rolls_back_runner_and_decision(daemon, tmp_pat
                                     files={"review_verdict.json": {"verdict": "pass", "issues": []}},
                                     usage=_known_usage(tokens_total=2000))])
     with pytest.raises(CostAccountingFailed, match="ledger write failed"):
-        _judge(daemon, tmp_path, runner, cl)("c1", 999, "bundle_code_review", "subject")
+        _judge(daemon, tmp_path, runner, cl)("c1", 2, "bundle_code_review", "subject")
     assert daemon.query_one("SELECT status,failure_kind FROM runner_call") == ("failed", "cost_accounting")
     assert daemon.query_one("SELECT COUNT(*) FROM decision WHERE actor='judge'")[0] == 0
     assert daemon.query_one("SELECT COUNT(*) FROM ledger WHERE runner_call_id IS NOT NULL")[0] == 0
@@ -425,7 +425,7 @@ def test_judge_budget_crossing_commits_verdict_then_raises(daemon, tmp_path):
                                     usage=_known_usage(tokens_total=1000))])
     with pytest.raises(BudgetExhausted):
         _judge(daemon, tmp_path, runner, CostLedger(daemon, pol), pol)(
-            "c1", 999, "bundle_code_review", "subject")
+            "c1", 2, "bundle_code_review", "subject")
     assert runner.calls == 1
     decision_rc = daemon.query_one("SELECT json_extract(payload_json,'$.runner_call_id') FROM decision "
                                    "WHERE actor='judge'")[0]

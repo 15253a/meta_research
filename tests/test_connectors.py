@@ -614,15 +614,43 @@ def test_research_notifier_covers_failure_block_summary_and_applicability(tmp_pa
         conn.execute(
             "INSERT INTO answer_applicability(answer_id,goal_id,goal_ver,audit_cycle,status,rationale_md) "
             "VALUES (1,1,1,2,'obsolete','新目标不再包含旧范围')")
+        candidate_id = conn.execute(
+            "INSERT INTO external_candidate(question_id,discovered_cycle,trigger_kind,"
+            "trigger_snapshot_hash,need_summary,source_kind,canonical_uri,search_snapshot_json,"
+            "search_snapshot_hash,rank,retrieved_at) "
+            "VALUES (1,1,'sota_reference','th','need','paper','paper:x','{}','sh',0,'t')"
+        ).lastrowid
+        license_id = conn.execute(
+            "INSERT INTO license_review(candidate_id,decision,actor,license_scope_json) "
+            "VALUES (?,'allow','auto','{\"allow_eval\":true,\"allow_publish_pool\":true}')",
+            (candidate_id,)).lastrowid
+        baseline_id = conn.execute(
+            "INSERT INTO baseline(slug,canonical_key,status,provenance,license_status,born_cycle) "
+            "VALUES ('notify-import','notify-import','planned','external_import','allow',1)"
+        ).lastrowid
+        common = (1, candidate_id, 1, "csh", "rank_asc", "ph", license_id)
+        conn.execute(
+            "INSERT INTO external_import(question_id,candidate_id,action,action_cycle,"
+            "candidate_set_hash,selection_key,policy_hash,license_decision_snapshot_hash,"
+            "license_review_id,baseline_id) "
+            "VALUES (?,?,'selected_for_materialization',?,?,?,?, 'lh',?,?)",
+            (*common, baseline_id))
+        failed_id = conn.execute(
+            "INSERT INTO external_import(question_id,candidate_id,action,action_cycle,"
+            "candidate_set_hash,selection_key,policy_hash,license_review_id,reason_json) "
+            "VALUES (?,?,'materialize_failed',?,?,?,?,?,?)",
+            (*common, json.dumps({"reason": "snapshot hash mismatch"}))).lastrowid
 
     outbox = Outbox(str(tmp_path))
     notifier = ResearchNotifier(daemon, outbox, audit_cadence_k=2)
     keys = notifier.scan()
     kinds = {event["kind"] for event in outbox._events()}
     assert {"cycle_failed", "build_target_failed", "engineering_blocked", "cycle_summary",
+            "external_import_failed",
             "answer_applicability_changed"} <= kinds
     assert "cycle:1:failed" in keys and "cycle:2:summary" in keys
     assert "build_target:4:failed" in keys
+    assert f"external_import:{failed_id}:materialize_failed" in keys
     assert notifier.scan() == []
 
     with daemon.transaction() as conn:

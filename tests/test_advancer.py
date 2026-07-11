@@ -77,6 +77,29 @@ def test_route_attack_unclassifiable_raises():
         derive_next_route(_sel("attack"), PlanOutcome())   # 全 False：empty_targets 也 False
 
 
+def test_durable_terminate_precedes_starting_new_import_work(env):
+    state, compiler = env
+    cyc = _prepared_bootstrap(state)
+
+    def terminate_provider(_cyc, _pack):
+        return {
+            "tree_ops.json": {"ops": [
+                {"op": "create_root", "text": "root", "local_key": "root"}]},
+            "selection.json": {
+                "next_question_id": None, "next_intent": "terminate", "scores": []},
+        }
+
+    SqliteAdvancer(state, compiler, terminate_provider).advance(cyc.cycle_id)
+
+    class QueueMustNotRun:
+        def materialize_pending(self, *, max_items=None):
+            pytest.fail("durable terminate 后不得启动新的 import worker")
+
+    adv = SqliteAdvancer(
+        state, compiler, terminate_provider, import_worker=QueueMustNotRun())
+    assert adv._resume_or_open() is None
+
+
 # ============ advance bootstrap 创世轮（真 SQLite）============
 @pytest.fixture()
 def env(tmp_path):
@@ -199,6 +222,42 @@ def test_advance_attack_not_implemented(env):
     adv = SqliteAdvancer(state, compiler, _bootstrap_provider)
     with pytest.raises(NotImplementedError, match="attack"):
         adv.advance(cyc.cycle_id)
+
+
+def _seed_dependency_wait(state, statuses):
+    with state.daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version) "
+            "VALUES (1,1,1,'done','dependency_wait','v0')")
+        conn.execute(
+            "INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
+            "VALUES (1,1,1,1,'等待题','open','agent')")
+        for dep_id, status in enumerate(statuses, start=2):
+            conn.execute(
+                "INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
+                "VALUES (?,1,1,1,?,'open','agent')", (dep_id, f"依赖{dep_id}"))
+            conn.execute(
+                "INSERT INTO question_dep(question_id,dep_type,depends_on_question_id,status,created_cycle) "
+                "VALUES (1,'question',?,?,1)", (dep_id, status))
+
+
+def test_dependency_wait_allows_multiple_same_question_deps_and_blocked_escape(env):
+    state, compiler = env
+    _seed_dependency_wait(state, ["satisfied", "blocked"])
+    adv = SqliteAdvancer(state, compiler, _bootstrap_provider, attack=object())
+
+    cyc = adv._resume_or_open()
+
+    assert cyc.route == "attack" and cyc.question_id == "q1"
+
+
+def test_dependency_wait_stays_blocked_while_any_dep_pending(env):
+    state, compiler = env
+    _seed_dependency_wait(state, ["satisfied", "pending"])
+    adv = SqliteAdvancer(state, compiler, _bootstrap_provider, attack=object())
+
+    assert adv._resume_or_open() is None
+    assert "1 个 pending dep" in adv.last_block_reason
 
 
 # ============ 外层驱动循环 + decompose（reasoning-only：bootstrap→decompose→terminate）============
