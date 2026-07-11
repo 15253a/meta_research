@@ -24,7 +24,8 @@
   `43dd99e`；CP11.4a.3 human/stuck/SOTA 可信来源、独立参照题与冻结激活已落 `a31658e`，CP11.4a 达成；
   CP11.4b fd-safe artifact capability、guardian capture 与 provider invocation 精确补账已落 `e236487`；
   CP11.4c.1 exact-pinned Docker 敌对执行边界、launcher rlimit+seccomp BPF、guardian container drain 与
-  quarantine 晋升/恢复已落 `a05584d`。当前进入 CP11.4c.2 通用 pinned repository 物化与部署信任边界，随后仍须
+  quarantine 晋升/恢复已落 `a05584d`；CP11.4c.2a exact GitHub repository snapshot、内容寻址发布与 file-backed
+  sandbox import bridge 已落 `50ba41f`。当前进入 CP11.4c.2b adapter/LFS/dependency/deployment contract，随后仍须
   CP11.4c.3 跨节点 VEPFS 与真实 100+ 轮故障注入验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
@@ -426,9 +427,11 @@
       - [ ] CP11.4c.2 通用 pinned repository 物化与部署信任：补 GitHub discovery → exact archive/tree/LFS/依赖
         闭包与 adapter 生成/评审的生产路径；明确独立 service account/VM、Docker socket、cgroup/device/GPU、
         hard byte+inode quota 与环境镜像供应链验收，不能把 bootstrap image/host 同 UID 信任域冒充完整隔离。
-        - [ ] CP11.4c.2a exact repository snapshot 与 worker bridge：非 recursive Git tree 对象+逐文件
+        - [x] CP11.4c.2a exact repository snapshot 与 worker bridge：非 recursive Git tree 对象+逐文件
           commit archive 双核，pinned 子模块/license、LFS/symlink 明示拒绝、内容寻址发布、
           adapter v2/pinned-image-only 供应链、稳定 protocol/metric 家族与 file-backed ImportWorker。
+          → commit `50ba41f`（build_log 0065；相关 170/156/41；外审第 2 轮成立项全修、误报以代码/回归核实；
+          唯一全量 1381）。
         - [ ] CP11.4c.2b 缺失 adapter 的受审生成、LFS OID/项目依赖 lock 验证与专用 image，
           并把 service account/VM、Docker socket、cgroup/device/GPU、hard byte+inode quota 落成 fail-closed
           部署合同/预检；未具备的能力只列验收，不伪造通过。

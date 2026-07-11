@@ -6,6 +6,7 @@
 
 ---
 
+- [0065](0065-cp114c2a-exact-repository-materialization.md) — CP11.4c.2a exact GitHub repository snapshot + file-backed sandbox import bridge · commit `50ba41f` · 验证: 通过（相关 170/156/41；外审成立项全修；唯一全量 1381）
 - [0064](0064-cp114c1-adversarial-execution-boundary.md) — CP11.4c.1 exact-pinned Docker + launcher rlimit/seccomp BPF + guardian drain/quarantine recovery · commit `a05584d` · 验证: 通过（相关 18/197/127；外审 3 BLOCKER 全修；最终有效全量 1354）
 - [0063](0063-cp114b-artifact-provider-accounting.md) — CP11.4b fd-safe artifact capability + guardian capture/provider invocation 精确补账 · commit `e236487` · 验证: 通过（相关验证；外审成立项全修；唯一全量 1332）
 - [0062](0062-cp114a3-trusted-import-trigger-sources.md) — CP11.4a.3 human/stuck/SOTA 可信来源 + 独立参照题 + 冻结激活/恢复 · commit `a31658e` · 验证: 通过（相关 217/392/130/17；外审反馈全修；唯一全量 1322）—— **CP11.4a 达成**
