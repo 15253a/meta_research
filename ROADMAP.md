@@ -19,7 +19,8 @@
   CP11.2b.1–2 鉴权耐久控制入口已落 `10215db`，CP11.2b.3a/b/c/d/e 动态预算、机械优先级、目标版本控制、只读查询旁路与真实 connector 双向闭环已落 `7f4fd73`/`2dfa653`/`92ecf18`/`6098a69`/`5056736`。步①–⑩已完成；步⑪ CP11.1、CP11.2 已完成，CP11.3/CP11.4 继续。
   CP11.3a 单实例 owner lease/heartbeat/lifecycle fencing 已落 `d79d3d0`；CP11.3b execution guardian 与
   owner-death 整树排空已落 `2f4a5d5`；CP11.3c current lineage、owner-first 外调、receipt→DB 对账与
-  120 轮状态稳定性已落 `a32629d`。当前进入 CP11.4a 默认 import/dependency_wait 与独立 plan 评审。
+  120 轮状态稳定性已落 `a32629d`。CP11.4a.1 冻结 import 消费/dependency_wait/worker 恢复与独立 plan 评审
+  已落 `43c4134`；当前进入 CP11.4a.2 生产 import_search/import_register 与 license 来源。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -390,6 +391,13 @@
     - [ ] CP11.4a 默认 import/dependency_wait + 独立 plan 评审：生产装配 `ImportWorker`，闭合
       `import_register → dependency_wait → materialize → release` 的幂等/崩溃恢复；plan answerability review
       独立于生成器、最多两轮且 verdict 耐久。
+      - [x] CP11.4a.1 冻结候选消费与恢复：exact candidate/license 内容哈希与四锚、plan phase 单事务
+        dependency_wait、默认 fenced worker/resumer、终败 dep blocked 回到重规划、独立 plan reviewer 两轮耐久；
+        默认不可信 adapter 在强沙箱前 fail-closed。→ commit `43c4134`（build_log 0060；相关 84/92/105/93；
+        唯一全量 1267 过/7 旧契约锚，修后 exact 7/7；外审第2轮上限后反馈处置）。
+      - [ ] CP11.4a.2 生产发现/登记与 license 来源：接通只读 `repo-search`/`import_search` → 编排器
+        `import_register` 的耐久、可回放入口；候选 pinned revision/search receipt 与 auto/human license provenance
+        必须可机械核验，禁止模型直接写 DB 或自报授权。
     - [ ] CP11.4b 内容寻址与精确调用补账：artifact capability/fd-safe 消费，消除 checkpoint hash/open TOCTOU；
       provider invocation ID、usage/billing receipt 与 runner_call exactly-once 对账。
     - [ ] CP11.4c 敌对隔离与最终长程验收：container/cgroup/VM 或等价强隔离、guardian/receipt 防篡改、跨节点

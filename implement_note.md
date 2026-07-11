@@ -1,47 +1,43 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4a 默认 import/dependency_wait + 独立 plan 评审
-- 检查点状态：CP11.3c 功能已提交 `a32629d`，build_log 0059 已写；CP11.4a 待开工
+- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4a.2 生产 import_search/import_register 与 license 来源
+- 检查点状态：CP11.4a.1 功能已提交 `43c4134`，build_log 0060 已写；CP11.4a.2 待开工
 
-## 正在做什么
+## 刚完成什么
 
-CP11.3c 已把 guardian 的 OS 事实接回 SQLite 业务状态面：plan target `critical/budget_estimate`、严格 current
-goal/cycle/question/target lineage、reasoning answer/evidence/tree/selection 原子提交；runner/model/train/eval/smoke
-均先建 durable owner 再外调；启动时按 exact receipt 对账，但 exit(0) 绝不伪造指标、评审或 Gate 成功。新增
-eval-only 复用既有合法 checkpoint，并用 120 个 attack-intent cycle + 重启证明控制面状态/投影不漂移。
+CP11.4a.1 已闭合“事先登记的 exact action-cycle 候选”消费链：candidate/license 内容哈希不含 SQLite 自增 ID；
+plan 必须回引 candidate/license/selection/policy 四锚，提交事务重算；import selection、baseline(planned)、
+question_dep(pending)、dependency_wait、释放问题与 cycle 收尾单事务。默认 Advancer 每轮最多处理一个 worker 项；
+成功满足 exact dep，终败原子写 failure/baseline build_failed/dep blocked/decision 后回到重规划，崩溃可续 suffix。
 
-下一检查点 CP11.4a 处理仍属根本缺口的默认 import 路径与 plan 独立评审：当前 `ImportWorker` 虽有显式组件和
-owner-first 物化逻辑，但 `run.py` 未装配/驱动，plan `import_defer` 仍被拒；StageProvider 也只有生成产物/schema
-重试，没有 reference 所要求的独立 answerability reviewer。
+独立 plan answerability reviewer 已与 generator 分会话，最多两轮，runner_call/cost/verdict 先耐久，draft/decision/
+sidecar exact hash 恢复；第二轮仍 fail 正常 inconclusive。默认 FrozenCandidateFetcher 会限额并校验内容寻址文件、
+argv 与供应链闭包，但其 adapter 标为 untrusted；当前没有 adversarial sandbox，所以正式装配必 fail-closed，绝不在
+host 裸跑。
 
-## 工作区状态
+## 验证 / Review
 
-- 分支：`fix/architecture-hardening-20260709`。
-- 已提交：CP11.3c 功能 `a32629d`；build_log 0059、ROADMAP 与本现场快照已随紧邻记账提交入库。
-- 唯一全量：`5 failed, 1235 passed in 277.44s`；五项均为有意契约收紧后的旧测试锚，更新后 exact
-  `5 passed in 1.59s`；按用户要求未二跑全量。相关批次 78/101/102/80/45/77/59/20/13 均通过。
-- 外审已达两轮上限且均无 verdict：第 1 轮独立账号 401；第 2 轮完整 staged diff 内联后耗尽 5/5 WebSocket
-  重连并降级 HTTPS 仍 idle。未伪报 APPROVE，详见 build_log 0059。
+- 相关：84/92/105/93 均通过；内部追加的 hash、TOCTOU、非有限 plan、review 身份与基础设施错误回归通过。
+- 唯一全量：`7 failed, 1267 passed in 294.51s`；七项均为旧契约锚，更新后 exact `7 passed in 2.96s`；按用户
+  要求未二跑全量。
+- 外审第 1 轮独立账号 401 无 verdict；第 2 轮 `REQUEST_CHANGES`（3 BLOCKER/2 SHOULD/1 NIT）。四项成立意见
+  全修；`plan` 未初始化为误报（try 前已置 None，补回归）；完全相同 candidate tie 已被 DDL 唯一索引排除。
 - 当前仍是 operational canary，不是 reference-complete 或 hostile-workload production-ready 系统。
+
+## 当前关键边界
+
+- CP11.4a 父项仍未完成：生产运行没有只读 `repo-search/import_search → import_register` 入口，也没有可回放的
+  auto/human license provenance。现在的 import 只对直接 API/受信服务预登记候选可达。
+- default adapter 会因缺强沙箱而终败并重规划；这保证不裸跑，但不等于“外部基线已可实用导入”。
+- large repo clone/LFS、fd-safe artifact capability、provider invocation/billing exactly-once、container/cgroup/VM、
+  跨节点 VEPFS 与含真实外调的 100+ 轮 soak 尚未完成。
+- 不得 push；后续仍按用户节奏：开发期相关验证，检查点末尾只一次全量，再提交与记账。
 
 ## 下一步动作
 
-1. 在默认 `build_system/run_system` 装配同 owner fenced `ImportWorker`，生产循环调用
-   `materialize_pending()`；先补 restart/idempotency/失败通知，禁止仅测试工厂可用。
-2. 接通 plan `import_defer`：候选经 `import_register` 落耐久身份，原子写 dependency_wait route、question dep 与
-   cycle 收尾；物化成功后只释放精确问题，崩溃重放不重复 fetch/eval/publish。
-3. 将 answerability review 与 plan generator 分离，最多两轮，runner_call/cost/verdict 全耐久；两轮不通过正常
-   终结本轮而非楔死。
-4. 仍按用户节奏：开发期只跑相关验证，CP11.4a 末尾仅一次全量、功能提交 + build_log 提交。
-
-## 关键上下文 / 坑
-
-- `reference/` 是设计权威，不是运行时自动加载的 skill；当前实现只是逐检查点把概念落实，尚不能称几乎完全
-  对应或 production-ready。
-- `ImportWorker` 默认未装配，`import_defer` 被拒，是当前最直接的生产链断口；fetch provider 若执行
-  git/subprocess 也必须进入 shared supervisor。
-- eval-only 当前要求恰一个 checkpoint；hash 校验后子进程仍按路径打开，存在 TOCTOU。content-addressed/fd-safe
-  capability、provider invocation/billing exactly-once 留 CP11.4b。
-- 当前 backend 不是 cgroup/container：要求 Linux `/proc`、prctl、signal 权限；同 UID hostile workload、
-  guardian/receipt 篡改与跨节点 VEPFS 验收留 CP11.4c。120 轮回归只证明控制面长程状态，不代表 120 次真实外调。
-- 不得 push；后续每检查点仍须内部审查、最多两轮 codex 外审、仅一次最终全量、功能提交 + build_log 提交。
+1. 先设计受限 import discovery artifact/receipt：触发三闸、query/provider/ranking/pinned revision/search bytes hash，
+   模型只能请求只读搜索，不能写 DB 或自报 candidate/license 权威事实。
+2. 接生产 `import_search` runner/MCP 或等价受信 connector，编排器短事务 `import_register`，并为零结果/崩溃/
+   重启建立 exactly-once marker；license 采用可回放 auto policy 或明确 human decision provenance。
+3. 用真实默认装配证明：发现→登记→plan 四锚→dependency_wait 可达；强沙箱仍未落地时物化应诚实 fail-closed，
+   不把“可发现/可调度”误报成“已安全执行外部代码”。
