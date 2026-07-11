@@ -623,6 +623,43 @@ def test_bundle_target_id_consumed(comp):
     assert p1.pack_hash != p2.pack_hash and "t1" in p1.anchor_md and "t2" in p2.anchor_md
 
 
+def test_bundle_inherits_external_import_environment(comp):
+    imported_env = "sha256:" + "d" * 64
+    plan_ref = {
+        "target_key": "imported-followup", "target_kind": "build", "seq": 2,
+        "protocol_id": 1, "protocol_ver": 1, "config_json": {},
+    }
+    comp.conn.execute(
+        "INSERT INTO baseline(id,slug,canonical_key,status) "
+        "VALUES (2,'imported','imported-key','legal')")
+    comp.conn.execute(
+        "INSERT INTO variant(id,baseline_id,variant_key,config_json,status) "
+        "VALUES (2,2,'imported-v1','{}','legal')")
+    comp.conn.execute(
+        "INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,variant_id) "
+        "VALUES (3,1,3,'import',3,'complete',2)")
+    comp.conn.execute(
+        "INSERT INTO run(id,cycle_id,variant_id,build_target_id,kind,status,env_hash) "
+        "VALUES (2,1,2,3,'import','success',?)", (imported_env,))
+    comp.conn.execute(
+        "INSERT INTO checkpoint(id,variant_id,ckpt_key,path,content_hash,hash_alg,"
+        "artifact_type,origin,manifest_hash,source_uri,revision,produced_by_run) "
+        "VALUES (2,2,'imported','/imported','hash','sha256','external_model',"
+        "'external_import','mh','https://github.com/acme/model',?,2)", ("a" * 40,))
+    comp.conn.execute(
+        "INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,"
+        "baseline_id,variant_id,eval_key,plan_ref) "
+        "VALUES (4,1,3,'build',4,'pending',2,2,'imported-followup',?)",
+        (json.dumps(plan_ref, sort_keys=True),))
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c1", stage="bundle", target_id="4")
+
+    assert imported_env in pack.anchor_md
+    assert "verified dependency image capability" in pack.anchor_md
+    assert "db:baseline:2:external-import-environment" in pack.sources
+
+
 # ============ applicability 徽标（编译器确定性规则）============
 def test_applicability_badge_rendered(comp):
     """已关闭结论处 join answer_applicability → 渲染徽标（此处 still_applicable）。"""

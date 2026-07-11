@@ -50,6 +50,7 @@ from .connectors import ConnectorConfigError, OutboundDelivery, load_connectors
 from .cost_ledger import CostLedger
 from .execution_reconcile import ExecutionReconciler
 from .execution_sandbox import DockerExecutionSandbox
+from .dependency_image import PythonWheelImageBuilder
 from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
@@ -1122,6 +1123,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     # so assembly fails closed before any new external capability can start.
     execution_supervisor.recover_previous_generation()
     execution_sandbox = None
+    dependency_image_builder = None
     repository_materializer = None
     if attack is True:
         execution_sandbox = DockerExecutionSandbox(
@@ -1131,14 +1133,22 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         # scientific failure.  Prove the exact local image/daemon/seccomp
         # before SQLite or any connector/provider side effect is exposed.
         execution_sandbox.preflight()
+        execution_sandbox.recover_terminal_sessions(execution_supervisor)
+        dependency_image_builder = PythonWheelImageBuilder(
+            work_root=work,
+            config=policy["import_materialization"]["dependency_image"],
+            compiler=policy["import_materialization"]["compiler"],
+            bootstrap_sandbox=execution_sandbox,
+            execution_supervisor=execution_supervisor,
+            owner_guard=owner_guard)
         repository_materializer = GitHubRepositoryMaterializer(
             work_root=work,
             config=policy["import_materialization"],
             sandbox_config=policy["execution"]["sandbox"],
             auto_license=policy["import_search"]["auto_license"],
             runtime_environment=execution_sandbox.image_environment,
-            owner_guard=owner_guard)
-        execution_sandbox.recover_terminal_sessions(execution_supervisor)
+            owner_guard=owner_guard,
+            dependency_image_builder=dependency_image_builder)
 
     expected_work_fd = open_directory_path(work, label="system work_root")
     try:
@@ -1380,7 +1390,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy,
             owner_guard=(owner_guard if instance_lease is not None else None),
             execution_supervisor=execution_supervisor,
-            execution_sandbox=execution_sandbox)
+            execution_sandbox=execution_sandbox,
+            execution_sandbox_resolver=dependency_image_builder)
         import_worker = ImportWorker(
             state=state, pool_gate=pool_gate,
             providers={
@@ -1392,7 +1403,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             obs_policy=policy["observation"], work_root=str(work),
             owner_guard=(owner_guard if instance_lease is not None else None),
             execution_supervisor=execution_supervisor,
-            execution_sandbox=execution_sandbox)
+            execution_sandbox=execution_sandbox,
+            execution_sandbox_resolver=dependency_image_builder)
 
     advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
                               status_publisher=publisher, precheck=precheck, stop_controller=stop,

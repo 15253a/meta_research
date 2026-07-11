@@ -23,7 +23,7 @@ reason_json 记因）+ 占位 baseline 连坐 build_failed + 同一事务写失�
 已开 worker 的 cycle 同时 failed；scope 在开工前拒绝则不造 worker cycle。
 
 **恢复**：结构续跑（同 attack：目标状态阶梯 + 幂等补登 + judge replay-safe）；imported 事件已在 → 幂等跳过。
-fetch provider 契约：旧 v1 内嵌快照仍返回 `files:{名:bytes…}`；production v2 返回经
+fetch provider 契约：旧 v1 内嵌快照仍返回 `files:{名:bytes…}`；production repository 返回经
 Git tree/archive 双核且内容寻址发布的 `source_tree + file_ledger + repository_snapshot_hash`，
 并携 declarative adapter 的 factory_protocol/metric_log_map。两者均共用 smoke_cmd/eval_cmd、
 protocol_id/ver、target_set_hash、required 和供应链 manifest；默认发现内容必须进 adversarial sandbox。
@@ -39,7 +39,7 @@ import secrets
 import shutil
 import stat
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from . import harness as H
 from . import obs_parser as OP
@@ -82,7 +82,8 @@ class ImportWorker:
                  obs_policy: Dict[str, Any], work_root: str,
                  owner_guard: Optional[Callable[[], None]] = None,
                  execution_supervisor=None,
-                 execution_sandbox=None):
+                 execution_sandbox=None,
+                 execution_sandbox_resolver=None):
         if owner_guard is not None:
             if (not isinstance(execution_supervisor, ExecutionSupervisor)
                     or not execution_supervisor.binds_fenced_owner(owner_guard)):
@@ -97,6 +98,16 @@ class ImportWorker:
         self.owner_guard = owner_guard or (lambda: None)
         self.execution_supervisor = execution_supervisor
         self.execution_sandbox = execution_sandbox
+        self.execution_sandbox_resolver = execution_sandbox_resolver
+
+    def _resolve_execution_sandbox(self, spec: Mapping[str, Any]):
+        capability = spec.get("execution_image")
+        if capability is None:
+            return self.execution_sandbox
+        if self.execution_sandbox_resolver is None:
+            raise RuntimeError(
+                "import spec 要求 dependency image capability，但未配置可信 resolver")
+        return self.execution_sandbox_resolver.resolve(capability)
 
     # ---------------------------------------------------------------- 入口 --
     def materialize_pending(self, *, max_items: Optional[int] = None) -> List[int]:
@@ -275,8 +286,9 @@ class ImportWorker:
                     (bid,))
                 self.state.mark_cycle_done(cyc_id, "failed")
             return
-        if (self.execution_sandbox is not None
-                and spec.get("env_hash") != self.execution_sandbox.environment_hash):
+        execution_sandbox = self._resolve_execution_sandbox(spec)
+        if (execution_sandbox is not None
+                and spec.get("env_hash") != execution_sandbox.environment_hash):
             self._record_failed(
                 ei_id, qi, cand_id,
                 reason="冻结候选 environment_hash 与 policy pinned sandbox runtime identity 不一致")
@@ -284,7 +296,7 @@ class ImportWorker:
                 self.state.mark_cycle_done(cyc_id, "failed")
             return
         if spec.get("requires_adversarial_sandbox") is True:
-            if self.execution_sandbox is None:
+            if execution_sandbox is None:
                 # ExecutionSupervisor fences ownership/descendants but explicitly is not an adversarial
                 # sandbox.  Default discovery content is untrusted, so a missing strong runner remains
                 # a durable candidate failure rather than silently falling back to host execution.
@@ -298,7 +310,8 @@ class ImportWorker:
         try:
             ok = self._drive_import_target(
                 cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
-                revision=cand[1], source_uri=cand[0])
+                revision=cand[1], source_uri=cand[0],
+                execution_sandbox=execution_sandbox)
         except SandboxOutputError as error:
             # The guardian has drained the exact container, but an unsafe output
             # quarantine must never become a checkpoint/metric artifact.  Settle
@@ -367,7 +380,7 @@ class ImportWorker:
         return _cid(ci)
 
     def _ensure_factory_protocol(self, cyc_id: str, spec: Dict[str, Any]) -> None:
-        """Register adapter v2 protocol once; exact semantic reuse is allowed."""
+        """Register a repository adapter protocol once; exact semantic reuse is allowed."""
         protocol = spec.get("factory_protocol")
         if protocol is None:  # legacy embedded materialization: pre-registered authority
             return
@@ -549,7 +562,7 @@ class ImportWorker:
         }
         for key in (
                 "factory_protocol", "metric_log_map",
-                "repository_snapshot_hash"):
+                "repository_snapshot_hash", "execution_image"):
             if key in spec:
                 result[key] = spec[key]
         return result
@@ -763,7 +776,7 @@ class ImportWorker:
 
     def _drive_import_target(self, cyc_id: str, ei_id: int, qi: int, cand_id: int, bid: int,
                              vid: int, bt_id: int, spec, *, revision: str,
-                             source_uri: str) -> bool:
+                             source_uri: str, execution_sandbox=None) -> bool:
         """物化目标阶梯（结构续跑）。返回是否成功（imported）。失败路径记 materialize_failed + 连坐。"""
         g, d = self.gate, self.state.daemon
         st = lambda: d.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0]
@@ -863,7 +876,7 @@ class ImportWorker:
                     staging_dir=str(smoke_dir), log_name=smoke_name,
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="import-smoke", execution_context=smoke_context,
-                    execution_sandbox=self.execution_sandbox)
+                    execution_sandbox=execution_sandbox)
                 if sm is None:
                     self.owner_guard()
                     sm = self._run_frozen_command(
@@ -871,7 +884,8 @@ class ImportWorker:
                         staging_dir=str(smoke_dir),
                         log_name=smoke_name, timeout_s=120,
                         execution_supervisor=self.execution_supervisor,
-                        execution_kind="import-smoke", execution_context=smoke_context)
+                        execution_kind="import-smoke", execution_context=smoke_context,
+                        execution_sandbox=execution_sandbox)
             if sm["exit_code"] != 0:
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._record_failed(ei_id, qi, cand_id, reason="沙箱 smoke 失败，不 target_ready")
@@ -912,11 +926,12 @@ class ImportWorker:
             self._ensure_factory_protocol(cyc_id, spec)
             self._ensure_target_required(bt_id, spec)
             return self._run_and_register_import(cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
-                                                 staging, clone_dir, manifest_hash, revision)
+                                                 staging, clone_dir, manifest_hash, revision,
+                                                 execution_sandbox=execution_sandbox)
         return st() == "complete"
 
     def _run_frozen_command(self, cmd, clone_dir: Path, spec: Dict[str, Any],
-                            **run_kwargs):
+                            *, execution_sandbox=None, **run_kwargs):
         """Run an adapter against stable dir/file capabilities, then re-verify bytes."""
         ledger = self._spec_ledger(spec)
         artifact = self._artifact_entry(spec)
@@ -939,13 +954,13 @@ class ImportWorker:
             artifact_fd = capability.detach()
             repo_proc = f"/proc/self/fd/{source_fd}"
             artifact_proc = (f"/proc/self/fd/{artifact_fd}"
-                             if self.execution_sandbox is None
+                             if execution_sandbox is None
                              else f"{repo_proc}/{rel}")
             resolved = [
                 arg.replace("{repo}", repo_proc).replace("{artifact}", artifact_proc)
                 for arg in cmd
             ]
-            if self.execution_sandbox is None:
+            if execution_sandbox is None:
                 result = H.run_staged(
                     resolved, pass_fds=(source_fd, artifact_fd), **run_kwargs)
             else:
@@ -955,7 +970,7 @@ class ImportWorker:
                         and sandbox_context["log_name"] != log_name):
                     raise RuntimeError("import sandbox context/log_name 冲突")
                 sandbox_context["log_name"] = log_name
-                invocation = self.execution_sandbox.prepare(
+                invocation = execution_sandbox.prepare(
                     resolved, staging_dir=run_kwargs["staging_dir"],
                     log_name=log_name, env=None,
                     timeout_s=run_kwargs.get("timeout_s", 600.0),
@@ -1053,7 +1068,8 @@ class ImportWorker:
         return output
 
     def _run_and_register_import(self, cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
-                                 staging: Path, clone_dir: Path, manifest_hash: str, revision: str) -> bool:
+                                 staging: Path, clone_dir: Path, manifest_hash: str, revision: str,
+                                 *, execution_sandbox=None) -> bool:
         """⚠️ 恢复关键阶梯与 attack_stages._run_and_register **同构**（eval-final+exit 侧车续跑 / artifact_ref
         锚 / 无条件补登 / judge replay-safe）——那边的崩溃缝隙修复（CP5.4 两层评审五 BLOCKER）必须同步到此，
         反之亦然（内审 SHOULD：双拷贝会漂移；共享骨架抽取 = M6 硬化项）。
@@ -1171,7 +1187,7 @@ class ImportWorker:
                     staging_dir=str(eval_dir), log_name="eval.log",
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="import-eval", execution_context=eval_context,
-                    execution_sandbox=self.execution_sandbox)
+                    execution_sandbox=execution_sandbox)
                 if ev is None:
                     self.owner_guard()
                     ev = self._run_frozen_command(
@@ -1179,7 +1195,8 @@ class ImportWorker:
                         staging_dir=str(eval_dir),
                         log_name="eval.log", timeout_s=600,
                         execution_supervisor=self.execution_supervisor,
-                        execution_kind="import-eval", execution_context=eval_context)
+                        execution_kind="import-eval", execution_context=eval_context,
+                        execution_sandbox=execution_sandbox)
                 eval_log = read_artifact_bytes(
                     ev["log_path"], expected_hash=ev["log_sha256"],
                     expected_size=ev.get("log_bytes"),

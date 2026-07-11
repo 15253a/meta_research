@@ -243,7 +243,8 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                execution_supervisor: Optional[ExecutionSupervisor] = None,
                execution_kind: str = "harness",
                execution_context: Optional[Dict[str, Any]] = None,
-               sandbox_invocation=None) -> Dict[str, Any]:
+               sandbox_invocation=None,
+               inherit_environment: bool = True) -> Dict[str, Any]:
     """跑真子进程，stdout+stderr 合流写 staging log（.partial → 原子改名）。返回
     {exit_code, log_path, log_sha256, log_bytes}。超时 → kill 并抛 subprocess.TimeoutExpired
     （.partial 留在 staging 供审计，不改名——半成品不冒充完整产物）。"""
@@ -277,7 +278,8 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                     # be copied into its guardian spec or container.  Ordinary
                     # trusted harness calls preserve the historical inherited
                     # environment behavior.
-                    env=(dict(env or {}) if sandbox_invocation is not None
+                    env=(dict(env or {}) if (sandbox_invocation is not None
+                                              or not inherit_environment)
                          else {**os.environ, **(env or {})}),
                     pass_fds=tuple(pass_fds), kind=execution_kind,
                     operation_context=context,

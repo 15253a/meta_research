@@ -13,6 +13,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 _PROTOCOL = "github-repository-snapshot-v1"
 _ADAPTER_VERSION = 2
+_ADAPTER_VERSIONS = frozenset({2, 3})
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _FULL_NAME_RE = re.compile(

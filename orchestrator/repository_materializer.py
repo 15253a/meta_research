@@ -9,7 +9,7 @@ does not clone or execute it.  This module closes the production hand-off:
   path/link semantics, and match every regular file to its Git blob SHA-1;
 * recursively materialize pinned GitHub submodules under an explicit license
   policy and replace Git LFS pointers only after Batch/OID/size verification;
-* validate the repository's declarative adapter v2, allocate stable numeric
+* validate the repository's declarative adapter v2/v3, allocate stable numeric
   protocol/metric identities, and generate the full supply-chain manifest; and
 * atomically publish a file-backed, read-only content-addressed snapshot plus
   a deterministic candidate index.  Database rows contain only bounded hashes.
@@ -59,7 +59,7 @@ from .repository_materializer_store import _RepositoryStoreMixin
 class GitHubRepositoryMaterializer(
         _RepositoryTransportMixin, _RepositoryTreeMixin, _RepositoryLfsMixin,
         _RepositoryArchiveMixin, _RepositoryAdapterMixin, _RepositoryStoreMixin):
-    """Materialize one exact GitHub commit and repository adapter v2."""
+    """Materialize one exact GitHub commit and repository adapter v2/v3."""
 
     name = "github_archive_v1"
 
@@ -76,6 +76,7 @@ class GitHubRepositoryMaterializer(
             lfs_object_fetcher: Optional[
                 Callable[[str, Mapping[str, str], Path, int],
                          Mapping[str, Any]]] = None,
+            dependency_image_builder=None,
             token_env: str = "METARESEARCH_GITHUB_TOKEN"):
         self.work_root = Path(os.path.abspath(os.fspath(work_root)))
         self.config = dict(config)
@@ -84,6 +85,7 @@ class GitHubRepositoryMaterializer(
         self.runtime_environment = dict(runtime_environment)
         self.owner_guard = owner_guard or (lambda: None)
         self.token_env = token_env
+        self.dependency_image_builder = dependency_image_builder
         self._validate_config()
         self.api_getter = api_getter
         self.archive_fetcher = archive_fetcher
@@ -103,12 +105,12 @@ class GitHubRepositoryMaterializer(
             "max_archive_bytes", "max_file_bytes", "max_total_bytes", "max_files",
             "max_tree_depth", "max_tree_objects", "max_submodules", "lfs_policy",
             "max_lfs_objects", "lfs_batch_size", "allowed_archive_hosts",
-            "allowed_lfs_hosts", "dependency_lock_names", "compiler",
+            "allowed_lfs_hosts", "dependency_lock_names", "dependency_image", "compiler",
         }
         if set(self.config) != required or self.config.get("provider") != self.name:
             raise ValueError("policy.import_materialization 字段闭包/provider 非法")
         if self.config.get("adapter_path") != ".meta-research/import-adapter.json":
-            raise ValueError("import adapter_path 非冻结 v2 路径")
+            raise ValueError("import adapter_path 非冻结 v2/v3 路径")
         bounds = {
             "max_api_response_bytes": (65536, 16777216),
             "max_archive_bytes": (1048576, 68719476736),
@@ -156,6 +158,10 @@ class GitHubRepositoryMaterializer(
                        or re.fullmatch(r"[A-Za-z0-9._-]{1,128}", name) is None
                        for name in locks)):
             raise ValueError("import_materialization dependency_lock_names 非法")
+        dependency_image = self.config["dependency_image"]
+        if (not isinstance(dependency_image, dict)
+                or dependency_image.get("provider") != "python-wheel-image-v1"):
+            raise ValueError("import_materialization dependency_image 非法")
         compiler = self.config["compiler"]
         if (not isinstance(compiler, dict)
                 or set(compiler) != {"implementation", "version", "artifact_sha256"}
@@ -182,6 +188,10 @@ class GitHubRepositoryMaterializer(
                        for key, value in expected_runtime.items())):
             raise ValueError(
                 "pinned sandbox image compiler environment 与 import policy 不一致")
+        if self.dependency_image_builder is not None:
+            if (getattr(self.dependency_image_builder, "config", None) != dependency_image
+                    or getattr(self.dependency_image_builder, "compiler", None) != compiler):
+                raise ValueError("dependency image builder 与 import policy identity 不一致")
 
     @property
     def environment_hash(self) -> str:

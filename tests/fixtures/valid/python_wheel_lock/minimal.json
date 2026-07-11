@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "python": {
+    "implementation": "CPython",
+    "version": "3.11.15",
+    "artifact_sha256": "sha256:272179ddd9a2e41a0fc8e42e33dfbdca0b3711aa5abf372d3f2d51543d09b625"
+  },
+  "platform": { "os": "linux", "architecture": "amd64" },
+  "distributions": [{
+    "name": "example",
+    "version": "1.0",
+    "filename": "example-1.0-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/example-1.0-py3-none-any.whl",
+    "sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "bytes": 1
+  }]
+}

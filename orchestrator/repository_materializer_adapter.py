@@ -7,7 +7,7 @@ from typing import Any, Dict, Mapping, Sequence
 
 from .artifact_capability import read_artifact_bytes
 from .repository_materialization_common import (
-    _ADAPTER_VERSION, _ARTIFACT_TYPES, _CONTROL_ENV_KEYS, _LOG_KEY_RE,
+    _ADAPTER_VERSIONS, _ARTIFACT_TYPES, _CONTROL_ENV_KEYS, _LOG_KEY_RE,
     _MAX_ADAPTER_BYTES, RepositoryMaterializationError, _bounded_string,
     _canonical, _positive_int, _safe_relpath, _sha256, _stable_id, _value_hash,
     _strict_json,
@@ -61,9 +61,10 @@ class _RepositoryAdapterMixin:
             "factory_protocol",
         }
         if (not isinstance(value, dict) or set(value) != required_keys
-                or value.get("version") != _ADAPTER_VERSION):
+                or value.get("version") not in _ADAPTER_VERSIONS):
             raise RepositoryMaterializationError(
-                "repository adapter v2 字段闭包/version 非法")
+                "repository adapter v2/v3 字段闭包/version 非法")
+        adapter_version = value["version"]
         artifact = _safe_relpath(
             value["artifact_relpath"], field="adapter.artifact_relpath",
             max_depth=int(self.config["max_tree_depth"]))
@@ -75,10 +76,15 @@ class _RepositoryAdapterMixin:
             raise RepositoryMaterializationError("adapter artifact_type 非法")
         dependency_mode = value["dependency_mode"]
         locks = value["dependency_locks"]
-        if dependency_mode != "pinned_image_only" or not isinstance(locks, list):
+        if not isinstance(locks, list):
             raise RepositoryMaterializationError(
-                "adapter dependency contract 非法；CP11.4c.2a 只允许 "
-                "pinned_image_only")
+                "adapter dependency_locks 须为数组")
+        if (adapter_version == 2 and dependency_mode != "pinned_image_only"):
+            raise RepositoryMaterializationError(
+                "adapter v2 dependency contract 只允许 pinned_image_only")
+        if (adapter_version == 3 and dependency_mode != "python_wheel_image_v1"):
+            raise RepositoryMaterializationError(
+                "adapter v3 dependency contract 只允许 python_wheel_image_v1")
         parsed_locks = []
         for index, path_value in enumerate(locks):
             path = _safe_relpath(
@@ -94,10 +100,16 @@ class _RepositoryAdapterMixin:
             })
         if len({item["path"] for item in parsed_locks}) != len(parsed_locks):
             raise RepositoryMaterializationError("adapter dependency lock 重复")
-        if parsed_locks:
+        if adapter_version == 2 and parsed_locks:
             raise RepositoryMaterializationError(
-                "CP11.4c.2a 只允许 pinned_image_only 且 dependency_locks 为空；"
+                "adapter v2 只允许 pinned_image_only 且 dependency_locks 为空；"
                 "未验证安装的 lock 不得冒充可复现环境")
+        if adapter_version == 3 and (
+                len(parsed_locks) != 1
+                or PurePosixPath(parsed_locks[0]["path"]).name
+                != self.config["dependency_image"]["lock_basename"]):
+            raise RepositoryMaterializationError(
+                "adapter v3 要求唯一 python-wheel-lock.json")
         protocol = value["factory_protocol"]
         if (not isinstance(protocol, dict) or set(protocol) != {
                 "name", "version", "scope_spec", "metrics", "required"}):
@@ -193,14 +205,6 @@ class _RepositoryAdapterMixin:
         })
         required = sorted(log_map[key] for key in required_log_keys)
         adapter_hash = _sha256(raw)
-        dependency_lock_hash = _value_hash(parsed_locks)
-        source_identity = [{
-            "repository": item["repository"], "revision": item["revision"],
-            "root_tree_sha1": item["root_tree_sha1"],
-            "archive_url": item["archive_url"],
-            "file_ledger_hash": item["file_ledger_hash"],
-            "license": item["license"],
-        } for item in sources]
         smoke_cmd = self._argv(value["smoke_argv"], field="smoke_argv")
         eval_cmd = self._argv(value["eval_argv"], field="eval_argv")
         allowed_programs = {
@@ -208,7 +212,50 @@ class _RepositoryAdapterMixin:
         }
         if smoke_cmd[0] not in allowed_programs or eval_cmd[0] not in allowed_programs:
             raise RepositoryMaterializationError(
-                "adapter v2 当前只允许 pinned Python 作为直接 launcher")
+                "repository adapter 当前只允许 pinned Python 作为直接 launcher")
+        execution_image = None
+        dependency_wheels = []
+        dependency_wheel_manifest_hash = _value_hash([])
+        image_receipt_hash = None
+        image_archive_sha256 = None
+        build_context_hash = _value_hash([])
+        environment_hash = self.environment_hash
+        container_digest = self.sandbox_config["image"]
+        container_image_id = self.sandbox_config["image_id"]
+        dependency_lock_hash = _value_hash(parsed_locks)
+        if adapter_version == 3:
+            if self.dependency_image_builder is None:
+                raise RepositoryMaterializationError(
+                    "adapter v3 dependency image builder 未配置，拒绝 host install/fallback")
+            image_result = self.dependency_image_builder.build(
+                tree_root=tree_root, lock_entry=parsed_locks[0],
+                repository=repository, revision=revision)
+            capability_keys = {
+                "version", "provider", "closure_hash", "receipt_hash",
+                "environment_hash", "image", "image_id",
+            }
+            if (not isinstance(image_result, Mapping)
+                    or not capability_keys.issubset(image_result)):
+                raise RepositoryMaterializationError(
+                    "dependency image builder 未返回完整 capability")
+            execution_image = {
+                key: image_result[key] for key in capability_keys}
+            environment_hash = image_result["environment_hash"]
+            container_digest = image_result["image"]
+            container_image_id = image_result["image_id"]
+            dependency_lock_hash = image_result["lock_canonical_hash"]
+            dependency_wheels = list(image_result["wheels"])
+            dependency_wheel_manifest_hash = image_result["wheel_manifest_hash"]
+            image_receipt_hash = image_result["receipt_hash"]
+            image_archive_sha256 = image_result["image_archive_sha256"]
+            build_context_hash = image_result["build_context_hash"]
+        source_identity = [{
+            "repository": item["repository"], "revision": item["revision"],
+            "root_tree_sha1": item["root_tree_sha1"],
+            "archive_url": item["archive_url"],
+            "file_ledger_hash": item["file_ledger_hash"],
+            "license": item["license"],
+        } for item in sources]
         lfs_objects = []
         for item in ledger:
             lfs = item.get("lfs")
@@ -232,15 +279,24 @@ class _RepositoryAdapterMixin:
             "dependency_locks": parsed_locks,
             "dependency_lock_hash": dependency_lock_hash,
             "harness_adapter_hash": adapter_hash,
-            "environment_hash": self.environment_hash,
+            "environment_hash": environment_hash,
             "network_isolation": True,
             "artifact_download_sources": source_identity,
+            "dependency_artifacts": dependency_wheels,
+            "dependency_artifact_manifest_hash": dependency_wheel_manifest_hash,
             "system_package_sources": [],
-            "container_digest": self.sandbox_config["image"],
-            "container_image_id": self.sandbox_config["image_id"],
+            "base_container_digest": self.sandbox_config["image"],
+            "base_container_image_id": self.sandbox_config["image_id"],
+            "container_digest": container_digest,
+            "container_image_id": container_image_id,
+            "image_receipt_hash": image_receipt_hash,
+            "image_archive_sha256": image_archive_sha256,
             "compiler": dict(self.config["compiler"]),
-            "generated_files_hash": _value_hash([]),
-            "environment_allowlist": list(_CONTROL_ENV_KEYS),
+            "generated_files_hash": build_context_hash,
+            "environment_allowlist": sorted({
+                *_CONTROL_ENV_KEYS,
+                *(["PYTHONPATH"] if adapter_version == 3 else []),
+            }),
             "commands": {
                 "smoke": smoke_cmd, "eval": eval_cmd},
         }
@@ -249,9 +305,11 @@ class _RepositoryAdapterMixin:
             "root_tree_sha1": root_tree_sha, "adapter_sha256": adapter_hash,
             "protocol_id": protocol_id, "protocol_version": protocol_version,
             "protocol_semantics_hash": _value_hash(protocol_identity),
+            "environment_hash": environment_hash,
+            "image_receipt_hash": image_receipt_hash,
             "required": required,
         }
-        return {
+        result = {
             "smoke_cmd": smoke_cmd,
             "eval_cmd": eval_cmd,
             "protocol_id": protocol_id, "protocol_ver": protocol_version,
@@ -266,6 +324,9 @@ class _RepositoryAdapterMixin:
             "eval_key": "import-" + _value_hash(target_identity).removeprefix("sha256:")[:32],
             "target_set_hash": _value_hash(target_identity),
             "required": required, "artifact_relpath": artifact,
-            "artifact_type": artifact_type, "env_hash": self.environment_hash,
+            "artifact_type": artifact_type, "env_hash": environment_hash,
             "supply_chain": supply_chain, "requires_adversarial_sandbox": True,
         }
+        if execution_image is not None:
+            result["execution_image"] = execution_image
+        return result
