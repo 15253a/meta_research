@@ -42,7 +42,13 @@ import re
 import sqlite3
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from .ids import cnum as _cnum
+from .ids import cnum as _cnum, qnum as _qnum
+from .import_authority import (
+    ImportAuthorityError,
+    build_human_named_authority,
+    validate_github_uri,
+    validate_optional_revision,
+)
 from .interaction import InteractionIngest
 from .resource_limits import MAX_REASONING_DIRECTIVES_PER_CYCLE
 from .runtime_control import apply_budget_patch, effective_budget_config
@@ -283,6 +289,82 @@ def _parse_goal_amend(text: str) -> Dict[str, Any]:
     return value
 
 
+def _parse_inject_question(text: str) -> Dict[str, Any]:
+    """Parse an injected question without inventing import authority.
+
+    The legacy shorthand remains a soft question injection.  A human-named
+    repository is accepted only in an explicit JSON object and is promoted to
+    a hard, confirmation-required directive by ``KeywordClassifier``.
+    """
+    match = re.search(r"(?i)(注入问题|加个问题|inject(?:\s+question)?)", text)
+    if match is None:
+        raise ValueError("inject_question 缺明确问题")
+    suffix = text[match.end():].strip()
+    suffix = re.sub(r"^(?:[：:，,\-]\s*)", "", suffix)
+    if not suffix:
+        raise ValueError("inject_question.question_text 须为非空字符串")
+    if not suffix.startswith("{"):
+        return {"question_text": suffix}
+
+    value = _load_bounded_control_json(suffix)
+    if not isinstance(value, dict):
+        raise ValueError("inject_question JSON 参数须为 object")
+    allowed = {
+        "question_text", "parent_question_id", "human_named_repo",
+        "need_summary",
+    }
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f"inject_question 不允许字段: {sorted(unknown)}")
+    question_text = value.get("question_text")
+    if not isinstance(question_text, str) or not question_text.strip():
+        raise ValueError("inject_question.question_text 须为非空字符串")
+    if len(question_text.encode("utf-8")) > 8192:
+        raise ValueError("inject_question.question_text 超过 8192 bytes")
+    if any((ord(ch) < 0x20 and ch not in "\n\r\t") or ord(ch) == 0x7F
+           for ch in question_text):
+        raise ValueError("inject_question.question_text 含非法控制字符")
+    result: Dict[str, Any] = {"question_text": question_text.strip()}
+    parent = value.get("parent_question_id")
+    if parent is not None:
+        if not isinstance(parent, str) or _QREF_RE.fullmatch(parent) is None:
+            raise ValueError("inject_question.parent_question_id 须为 q<正整数>")
+        try:
+            result["parent_question_id"] = f"q{_qnum(parent.lower())}"
+        except ValueError as error:
+            raise ValueError(str(error)) from error
+    repo = value.get("human_named_repo")
+    if repo is None:
+        if "need_summary" in value:
+            raise ValueError("need_summary 只允许与 human_named_repo 同时出现")
+        return result
+    if not isinstance(repo, dict) or not set(repo).issubset(
+            {"canonical_uri", "requested_revision"}) \
+            or "canonical_uri" not in repo:
+        raise ValueError(
+            "human_named_repo 须精确包含 canonical_uri 与可选 requested_revision")
+    try:
+        canonical_uri = validate_github_uri(repo["canonical_uri"])
+        requested_revision = validate_optional_revision(
+            repo.get("requested_revision"))
+    except ImportAuthorityError as error:
+        raise ValueError(str(error)) from error
+    need_summary = value.get("need_summary")
+    if not isinstance(need_summary, str) or not need_summary.strip():
+        raise ValueError("human_named_repo 必须带非空 need_summary")
+    if len(need_summary.encode("utf-8")) > 8192:
+        raise ValueError("human_named need_summary 超过 8192 bytes")
+    if any((ord(ch) < 0x20 and ch not in "\n\r\t") or ord(ch) == 0x7F
+           for ch in need_summary):
+        raise ValueError("human_named need_summary 含非法控制字符")
+    result["human_named_repo"] = {
+        "canonical_uri": canonical_uri,
+        "requested_revision": requested_revision,
+    }
+    result["need_summary"] = need_summary.strip()
+    return result
+
+
 class KeywordClassifier:
     """廉价关键词保守分类（确定性）。返回 {intent, kind?, hardness?, consume_at?, polished?}。"""
 
@@ -304,6 +386,8 @@ class KeywordClassifier:
                 try:
                     if kind == "set_budget":
                         structured["budget_patch"] = _parse_budget_patch(text)
+                    elif kind == "inject_question":
+                        structured.update(_parse_inject_question(text))
                     elif kind == "reprioritize":
                         structured.update(_parse_reprioritize(text))
                     elif kind == "goal_amend":
@@ -317,6 +401,11 @@ class KeywordClassifier:
                         word in low for word in ("提权", "降权", "boost", "suppress")))))
                 if pin_wording:
                     hardness = "hard"                  # reference: pin hard; boost/suppress soft
+                if kind == "inject_question" and structured.get("human_named_repo"):
+                    # Human-named repositories bypass the type/discovery gate,
+                    # so the structured meaning must pass the hard confirmation
+                    # boundary.  It still does not bypass license/materialize.
+                    hardness = "hard"
                 if structured and parse_error is None:
                     polished = f"[{kind}] " + json.dumps(
                         structured, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -848,12 +937,14 @@ class Console:
         with self.daemon.transaction() as conn:
             row = conn.execute(
                 "SELECT d.kind,d.hardness,d.status,d.consume_at,d.payload_json,"
-                "m.goal_id,m.goal_ver FROM directive d LEFT JOIN interaction_message m "
+                "m.goal_id,m.goal_ver,d.source_interaction_message_id "
+                "FROM directive d LEFT JOIN interaction_message m "
                 "ON m.id=d.source_interaction_message_id WHERE d.id=?",
                                (directive_id,)).fetchone()
             if row is None:
                 raise ValueError(f"directive 不存在: {directive_id}")
-            kind, hardness, status, consume_at, payload_raw, source_goal_id, source_goal_ver = row
+            (kind, hardness, status, consume_at, payload_raw, source_goal_id,
+             source_goal_ver, source_message_id) = row
             if status != "pending":
                 raise ValueError(f"directive {directive_id} 非 pending（{status}），不可消费")
             payload = json.loads(payload_raw)
@@ -994,13 +1085,106 @@ class Console:
                 })
             elif kind == "inject_question":
                 # goal_id=1 + MAX(version) = 全库单目标约定（statestore/advancer 同口径）；多目标=系统级改造
-                if conn.execute("SELECT 1 FROM goal WHERE id=1 LIMIT 1").fetchone() is None:
+                current_goal = conn.execute(
+                    "SELECT id,version FROM goal WHERE id=1 ORDER BY version DESC LIMIT 1").fetchone()
+                if current_goal is None:
                     raise DirectiveApplicationError("inject_question 时当前 goal 不存在")
+                repo = payload.get("human_named_repo")
+                if repo is not None:
+                    if hardness != "hard" or not payload.get("confirmed"):
+                        raise DirectiveApplicationError(
+                            "human_named repo 必须经 hard directive 明确确认")
+                    if ((source_goal_id, source_goal_ver) != tuple(current_goal)
+                            or source_message_id is None):
+                        raise DirectiveApplicationError(
+                            "human_named repo 来源须绑定当前 goal 的耐久 interaction message")
+                    if self.policy is None or not isinstance(
+                            self.policy.get("tree_guard"), dict):
+                        raise DirectiveApplicationError(
+                            "human_named repo 未装配 tree_guard policy，拒绝绕过树护栏")
+                question_text = payload.get("question_text", payload.get("polished", ""))
+                if not isinstance(question_text, str) or not question_text.strip():
+                    raise DirectiveApplicationError("inject_question 缺非空 question_text")
+                parent_ref = payload.get("parent_question_id")
+                parent_id = None
+                if parent_ref is not None:
+                    try:
+                        parent_id = (_qnum(parent_ref.lower())
+                                     if isinstance(parent_ref, str) else None)
+                    except ValueError:
+                        raise DirectiveApplicationError(
+                            "inject_question parent_question_id 非法") from None
+                    if parent_id is None:
+                        raise DirectiveApplicationError(
+                            "inject_question parent_question_id 须为 q<正整数>")
+                    parent_row = conn.execute(
+                        "SELECT 1 FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+                        (parent_id, current_goal[0], current_goal[1])).fetchone()
+                    if parent_id <= 0 or parent_row is None:
+                        raise DirectiveApplicationError(
+                            "inject_question parent 不属于当前 goal lineage")
+                if repo is not None:
+                    guard = self.policy["tree_guard"]
+                    open_count = conn.execute(
+                        "SELECT count(*) FROM question WHERE status IN ('open','inconclusive')"
+                    ).fetchone()[0]
+                    if open_count + 1 > int(guard["max_open_questions"]):
+                        raise DirectiveApplicationError(
+                            "human_named question 超出 max_open_questions")
+                    if parent_id is not None:
+                        child_count = conn.execute(
+                            "SELECT count(*) FROM question WHERE parent_id=?",
+                            (parent_id,)).fetchone()[0]
+                        if child_count + 1 > int(guard["max_children_per_node"]):
+                            raise DirectiveApplicationError(
+                                "human_named question 超出 max_children_per_node")
+                        depth = 1
+                        cursor = parent_id
+                        seen = set()
+                        while cursor is not None and cursor not in seen:
+                            seen.add(cursor)
+                            ancestor = conn.execute(
+                                "SELECT parent_id FROM question WHERE id=?",
+                                (cursor,)).fetchone()
+                            if ancestor is None:
+                                raise DirectiveApplicationError(
+                                    "human_named parent lineage 损坏")
+                            cursor = ancestor[0]
+                            if cursor is not None:
+                                depth += 1
+                        if depth > int(guard["max_decompose_depth"]):
+                            raise DirectiveApplicationError(
+                                "human_named question 超出 max_decompose_depth")
                 qid = conn.execute(
-                    "INSERT INTO question(goal_id,goal_ver,born_goal_ver,text,status,source) "
-                    "SELECT 1, MAX(version), MAX(version), ?, 'open', 'human' FROM goal WHERE id=1",
-                    (payload.get("polished", ""),)).lastrowid
+                    "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source) "
+                    "VALUES (?,?,?,?,?,'open','human')",
+                    (parent_id, current_goal[0], current_goal[1], current_goal[1],
+                     question_text.strip())).lastrowid
                 effect["question_id"] = f"q{qid}"
+                if repo is not None:
+                    try:
+                        authority = build_human_named_authority(
+                            directive_id=directive_id,
+                            source_message_id=source_message_id,
+                            goal_id=current_goal[0], goal_ver=current_goal[1],
+                            question_id=qid,
+                            canonical_uri=repo.get("canonical_uri"),
+                            requested_revision=repo.get("requested_revision"),
+                            need_summary=payload.get("need_summary"))
+                    except ImportAuthorityError as error:
+                        raise DirectiveApplicationError(str(error)) from error
+                    effect["human_named_authority"] = authority
+                    effect["source_authority_hash"] = authority["authority_hash"]
+                # Bind the consuming human decision directly to the newly
+                # created question; this is the authority join used later by
+                # the plan/import service and remains useful for ordinary
+                # injected questions too.
+                dec = conn.execute(
+                    "INSERT INTO decision(cycle_id,question_id,directive_id,actor,type,payload_json) "
+                    "VALUES (?,?,?,'human','directive_inject_question',?)",
+                    (ci, qid, directive_id,
+                     json.dumps({"effect": effect, "polished": payload.get("polished")},
+                                ensure_ascii=False, sort_keys=True))).lastrowid
             elif kind == "prune_branch":
                 qref = payload.get("question_id")
                 if not qref:
@@ -1021,6 +1205,9 @@ class Console:
                                     json.dumps({"effect": effect, "polished": payload.get("polished")},
                                                ensure_ascii=False))).lastrowid
                 conn.execute("UPDATE question SET status='dead_end' WHERE id=?", (qi,))   # trg_q_deadend 要求 decision 先行
+                conn.execute(
+                    "UPDATE question_dep SET status='blocked' WHERE dep_type='question' "
+                    "AND depends_on_question_id=? AND status='pending'", (qi,))
             elif kind == "abort_cycle":
                 # 单轮在途约定（Advancer 串行推进）：非终态轮至多一个，即"本轮"；多轮并发=系统级改造
                 cur = conn.execute("SELECT id,active_question_id FROM cycle "

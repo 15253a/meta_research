@@ -1,6 +1,6 @@
 # SKILL · plan —— 复用判定 + 锁评估协议
 
-> 版本：m4-cp114a2。按《第一部分》§3.3 与流程图 04-Plan；产物 schema =
+> 版本：m4-cp114a3。按《第一部分》§3.3 与流程图 04-Plan；产物 schema =
 > `schemas/plan.schema.json` 或受限控制 sidecar `schemas/import_search_request.schema.json`。
 > 本阶段 = 计划调用（phase=plan）+ **可回答性评审**独立调用（phase=audit，≤2 轮，本文件
 > 【评审任务】节）。评估协议在本阶段锁死，bundle 只照办、不再发明（I2 源头）。
@@ -36,18 +36,23 @@
    | 同协议@版本缺指标 | `eval` target（追加 attempt） | `append_attempt` | `metric_append` | `evaluation_id`（既有格子） |
    | env 失配 / 结果存疑 | `eval` target（identity 复现） | `append_attempt` | `repro_eval` | `evaluation_id` |
    | 池中无 + 自建角色（消融/替换/超参/评估） | `build` / `exec` / `eval`（身份按三问决策树 §1.2.2：前向逻辑变=新 baseline、要重训=新 variant、只改评估=新 evaluation） | （eval 时按上表） | （eval 时按上表） | **build ⇒ `claim{canonical_key, slug}`；exec ⇒ `claim{baseline_ref, variant_key, config_json}`**（I5 占坑输入） |
-   | 池中无 + 需引入独立外部 baseline 家族 | 先读固定锚的 external import 状态。`may_emit_import_defer=true` 时才产顶层 `import_defer`、`targets=[]`，逐字照抄四锚；候选/license 由编排器事务重算，**不得自造 URI、candidate id 或 hash**。若候选为空且 `may_request_import_search=true`，并且实验角色确属“引入独立 comparator 家族”，只产一次下方搜索 sidecar。`search_completed=true` 后无论零结果/无 allow 候选都不得再搜：能自建则 build，否则诚实产零 target 计划。 | — | — | — |
+   | 池中无 + 需引入独立外部 baseline 家族 | 先读固定锚的 external import 状态。`may_emit_import_defer=true` 时才产顶层 `import_defer`、`targets=[]`，逐字照抄四锚；候选/license 由编排器事务重算，**不得自造 URI、candidate id 或 hash**。候选为空时只能选择固定锚中值为 true 的一个 `may_request_*` / `may_activate_*` 分支，并只产一次下方对应 sidecar。`search_completed=true` 后无论零结果/无 allow 候选都不得再搜：能自建则 build，否则诚实产零 target 计划。 | — | — | — |
 
    ⚠️ **kind 前置条件（选错即整轮被拒）**：`exec` 的 `baseline_ref` 与 `eval` 的评估对象都**必须指向
    检索区已有的 legal 池资产**——检索区没有该家族的 legal baseline（含池空）时，`exec`/`eval` 语义非法，
    **必须走 `build` 先建 baseline**（首攻新家族恒为 build）。若上下文包给出「上轮 plan 被拒原因」，
    先修正该原因再产出本轮 plan。
 3. **import 三闸与搜索 sidecar 边界**：
-   - sidecar 当前只接受 `trigger_kind="new_structure"`（类型门）。它只可提交
-     搜索 query 与需求摘要；不得上报 repo URI/revision/rank/license/SPDX/授权范围。
-   - `stuck` 状态门只允许外部普查产新 idea/新 question，**不得在原问题上用本 sidecar 直达 import**。
-   - `human_named` 须有受信的结构化 directive 来源，`sota_reference` 须有冻结论文/榜单快照；
-     当前包未给出这类权威锚时不得借 `new_structure` 冒充直达。
+   - `may_request_import_search=true`：类型门 `new_structure`，只提交 query+需求摘要；当前题命中 stuck 时该位必为 false。
+   - `may_request_stuck_survey=true`：只读普查。该位由编排器同时核对 lifetime visit 与当前 goal version 的
+     append-only consecutive-inconclusive 账本，不得从文本自行推断。服务只会给**新参照问题**冻结来源并让原题
+     依赖它；原题绝不登记 candidate、绝不产 import_defer。只可用 `trigger_kind="stuck"` 的 query 骨架。
+   - `may_request_sota_reference=true`：须给出明确 paper/benchmark HTTPS URI + 实现检索词；受信 host 先下载并
+     内容寻址冻结来源，再派生独立 baseline-reference 问题。URI 不是权威，成功冻结的 blob/hash 才是。
+   - `may_activate_source_authority=true`：当前题已经有受信 authority。逐字照抄固定锚的 trigger_kind、
+     source_authority_hash、need_summary；不得再给 query/URI。`human_named` 只能走此分支，且 authority 必来自已确认
+     的结构化 `inject_question` directive；`stuck/sota_reference` 子题从父轮冻结 receipt 激活，不重新联网。
+   - 任一分支都不得上报 repo revision/rank/license/SPDX/授权范围；不得借 `new_structure` 冒充其他直达来源。
    - 候选数与检索强度由编排器按 question score/est_cost + B(t) + policy 机械决定，
      所以 sidecar 中没有也不得自造“搜几个”字段。
 4. **锁评估协议**（字段名按 schema 逐字写）：
@@ -77,7 +82,7 @@
 
 **输出骨架（键名逐字，封闭对象；`<>` 占位、`?` 表可省键）**：
 
-**import_search_request 专用骨架**（独占 files；产出后立即结束本次调用）：
+**import_search_request 专用骨架**（四选一，必须与固定锚的 true 分支精确对应；独占 files，产出后立即结束）：
 
 ```json
 { "version": 1,
@@ -86,7 +91,30 @@
   "need_summary": "为什么当前 verification need 需要独立外部 baseline 家族" }
 ```
 
-`文件名 = import_search_request.json`，不是 plan.json；不加 max_candidates/provider/license/repo URL 等键。
+```json
+{ "version": 1,
+  "trigger_kind": "stuck",
+  "query": "只读外部普查检索词",
+  "need_summary": "为什么应派生一个独立外部参照问题" }
+```
+
+```json
+{ "version": 1,
+  "trigger_kind": "sota_reference",
+  "query": "冻结参照所对应实现的 GitHub 检索词",
+  "need_summary": "为什么需要独立 SOTA baseline-reference 问题",
+  "reference": { "kind": "paper", "uri": "https://<固定来源>" } }
+```
+
+```json
+{ "version": 1,
+  "trigger_kind": "<human_named|stuck|sota_reference>",
+  "source_authority_hash": "<逐字照抄 source_authority.source_authority_hash>",
+  "need_summary": "<逐字照抄 source_authority.need_summary>" }
+```
+
+`文件名 = import_search_request.json`，不是 plan.json；除 SOTA 的 frozen-source 请求外不加 repo/reference URL；
+所有分支都不加 max_candidates/provider/license 等键。
 
 **普通 plan 骨架**：
 

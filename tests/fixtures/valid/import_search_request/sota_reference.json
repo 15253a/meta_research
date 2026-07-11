@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "trigger_kind": "sota_reference",
+  "query": "recognized sota implementation",
+  "need_summary": "冻结公认 SOTA 来源并派生独立 baseline-reference 问题",
+  "reference": {
+    "kind": "paper",
+    "uri": "https://arxiv.org/abs/2401.00001"
+  }
+}

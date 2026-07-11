@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "trigger_kind": "stuck",
+  "query": "external comparator for repeated inconclusive sequence modeling",
+  "need_summary": "原问题达到状态门，只允许派生独立参照问题"
+}

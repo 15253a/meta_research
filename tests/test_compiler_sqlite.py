@@ -14,6 +14,7 @@ import conftest
 from orchestrator import database as db
 from orchestrator.compiler_sqlite import SqliteCompiler
 from orchestrator.interfaces import StageBlockedOnResources
+from orchestrator.question_progress import INCONCLUSIVE_PROTOCOL
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
@@ -109,6 +110,50 @@ def test_consumed_note_is_present_in_same_cycle_reasoning_context(comp):
 def test_bundle_requires_target_id(comp):
     with pytest.raises(ValueError, match="target_id 不可为 None"):
         comp.render(cycle_id="c1", stage="bundle")
+
+
+def test_plan_import_trigger_flags_make_stuck_and_new_structure_mutually_exclusive(comp):
+    fresh = comp.render(cycle_id="c1", stage="plan")
+    assert '"may_request_stuck_survey":false' in fresh.anchor_md
+    assert '"may_request_import_search":true' in fresh.anchor_md
+
+    thresholds = POLICY["retrieval"]["gate2_stuck_threshold"]
+    visit_threshold = int(thresholds["visit_count"])
+    streak_threshold = int(thresholds["consecutive_inconclusive"])
+    comp.conn.execute(
+        "UPDATE question SET visit_count=? WHERE id=3", (visit_threshold,))
+    comp.conn.commit()
+    high_visit_without_streak = comp.render(cycle_id="c1", stage="plan")
+    assert '"may_request_stuck_survey":false' in high_visit_without_streak.anchor_md
+    assert '"may_request_import_search":true' in high_visit_without_streak.anchor_md
+
+    first_visit = visit_threshold - streak_threshold
+    for offset in range(streak_threshold):
+        cycle_id = 9001 + offset
+        comp.conn.execute(
+            "INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version,finished_at) "
+            "VALUES (?,1,1,'done','attack','test',CURRENT_TIMESTAMP)",
+            (cycle_id,))
+        payload = {
+            "protocol": INCONCLUSIVE_PROTOCOL,
+            "question_id": 3,
+            "cycle_id": cycle_id,
+            "goal_id": 1,
+            "goal_ver": 1,
+            "visit_count_after": first_visit + offset + 1,
+            "consecutive_inconclusive": offset + 1,
+        }
+        comp.conn.execute(
+            "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+            "VALUES (?,3,'orchestrator','question_inconclusive',?)",
+            (cycle_id, json.dumps(
+                payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"))))
+    comp.conn.commit()
+    stuck = comp.render(cycle_id="c1", stage="plan")
+    assert '"may_request_stuck_survey":true' in stuck.anchor_md
+    assert '"may_request_import_search":false' in stuck.anchor_md
+    assert '"may_request_sota_reference":true' in stuck.anchor_md
 
 
 def test_open_set_scoped_to_goal(comp):

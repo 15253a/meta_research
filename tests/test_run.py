@@ -423,6 +423,9 @@ def test_main_second_ctrl_c_during_fallback_drain_kills_groups(tmp_path, monkeyp
 def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
     from orchestrator.import_fetcher import FrozenCandidateFetcher
     from orchestrator.import_search import GitHubRepoSearchProvider, ImportSearchService
+    from orchestrator.import_triggers import (
+        BoundedReferenceSnapshotProvider, ImportTriggerRouter,
+        TrustedImportTriggerService)
     from orchestrator.import_worker import ImportWorker
     from orchestrator.stage_provider import PlanReviewProvider
 
@@ -434,8 +437,14 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         assert worker.execution_supervisor is system.execution_supervisor
         assert isinstance(system.advancer.attack.p["plan_review"], PlanReviewProvider)
         search = system.advancer.attack.p["import_search"]
-        assert isinstance(search, ImportSearchService)
-        assert isinstance(search.provider, GitHubRepoSearchProvider)
+        assert isinstance(search, ImportTriggerRouter)
+        assert isinstance(search.new_structure, ImportSearchService)
+        assert isinstance(search.new_structure.provider, GitHubRepoSearchProvider)
+        assert isinstance(search.trusted_triggers, TrustedImportTriggerService)
+        assert search.trusted_triggers.repo_provider is search.new_structure.provider
+        assert isinstance(
+            search.trusted_triggers.reference_provider,
+            BoundedReferenceSnapshotProvider)
     finally:
         system.close()
 
@@ -452,7 +461,9 @@ def test_attack_assembly_accepts_deterministic_readonly_search_provider(tmp_path
         SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]),
         import_search_provider=provider)
     try:
-        assert system.advancer.attack.p["import_search"].provider is provider
+        router = system.advancer.attack.p["import_search"]
+        assert router.new_structure.provider is provider
+        assert router.trusted_triggers.repo_provider is provider
         assert system.daemon.query_one(
             "SELECT count(*) FROM runner_call WHERE phase='import_search'")[0] == 0
     finally:

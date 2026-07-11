@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterator, List, Optional
 from .ids import decode as _bounded_decode, decode_optional as _bounded_decode_optional
 from .interfaces import InvalidSelectionError, Cycle, Route, Selection
 from .budgeting import compute_budget
+from .question_progress import QuestionProgressError, append_inconclusive_event
 from .writedaemon import WriteDaemon
 
 _TERMINAL_Q = {"answered", "refuted", "dead_end"}
@@ -441,7 +442,13 @@ class SQLiteStateStore:
         if r[1] is None:
             raise RuntimeError(f"active question {question_id} 缺 active_cycle 审计锚")
         with self._write() as conn:
-            conn.execute("UPDATE question SET status='inconclusive', visit_count=visit_count+1 WHERE id=?", (qi,))
+            try:
+                append_inconclusive_event(
+                    conn, question_id=qi, cycle_id=int(r[1]))
+            except QuestionProgressError as error:
+                raise RuntimeError(
+                    f"question {question_id} inconclusive 账本写入失败: {error}"
+                ) from error
             released = conn.execute(
                 "UPDATE cycle SET active_question_id=NULL WHERE id=? AND active_question_id=?",
                 (r[1], qi)).rowcount
@@ -498,10 +505,8 @@ class SQLiteStateStore:
             raise ValueError(f"dep_type 非法: {dep_type}")
 
     def resolve_deps(self) -> None:
-        # 依赖满足口径 = 目标问题 answered/refuted（与 InMemory 等价）。**dead_end 目标不解除依赖**——
-        # 与 M0 一致。⚠️ 已知悬案（codex 第2轮 SHOULD）：若父问题依赖的子问题被 propose_prune 成 dead_end，
-        # 父的 pending dep 将永久挂住、不回可调度集。规格未明「被剪子问题是否应满足父依赖」；本检查点保持
-        # M0 语义（真相侧不擅自改判），留待 M3 Advancer / M6 长跑跑通 decompose→prune→聚合全链时按规格定夺。
+        # 依赖满足口径 = 目标问题 answered/refuted（与 InMemory 等价）。dead_end 不是“满足”；
+        # propose_prune 的同一事务会把指向它的 pending dep 改为 blocked，让父问题回到重规划集合。
         with self._write() as conn:
             conn.execute("UPDATE question_dep SET status='satisfied' WHERE status='pending' AND dep_type='question' "
                          "AND depends_on_question_id IN (SELECT id FROM question WHERE status IN ('answered','refuted'))")
@@ -964,6 +969,9 @@ class SQLiteStateStore:
         conn.execute("INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
                      "VALUES (?,?,'agent','prune_branch',?)", (_cnum(cycle_id), _qnum(qid), json.dumps({"reason": op["reason_md"]})))
         conn.execute("UPDATE question SET status='dead_end' WHERE id=?", (_qnum(qid),))
+        conn.execute(
+            "UPDATE question_dep SET status='blocked' WHERE dep_type='question' "
+            "AND depends_on_question_id=? AND status='pending'", (_qnum(qid),))
 
     def _amend_goal(self, conn, cycle_id, route, op) -> None:
         if route != "goal_amend":

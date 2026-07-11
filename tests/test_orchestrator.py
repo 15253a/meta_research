@@ -248,6 +248,23 @@ def test_statestore_route_and_dep_rejections(store):
         store.record_question_dep(qid, dep_type="question", target=qid)
 
 
+def test_inmemory_pruned_child_blocks_dependency_and_releases_parent(store):
+    c = store.open_or_resume_cycle()
+    parent = bootstrap_root(store, c)
+    store.apply_tree_ops(c.cycle_id, [{
+        "op": "spawn_question", "kind": "import_reference",
+        "parent_question_id": parent, "text": "external reference",
+        "local_key": "ref"}])
+    child = max(store.questions, key=lambda qid: int(qid[1:]))
+    store.record_question_dep(parent, dep_type="question", target=child)
+    assert store.is_schedulable(parent, for_intent="attack") is False
+    store.apply_tree_ops(c.cycle_id, [{
+        "op": "propose_prune", "question_id": child, "reason_md": "unusable"}])
+    assert store.questions[child].status == "dead_end"
+    assert [d.status for d in store.deps if d.question_id == parent] == ["blocked"]
+    assert store.is_schedulable(parent, for_intent="attack") is True
+
+
 def test_statestore_goal_amend_route_guard(store):
     c = store.open_or_resume_cycle()
     store.set_route(c.cycle_id, "attack")

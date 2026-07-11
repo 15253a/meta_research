@@ -80,7 +80,7 @@ predicate_json: {
 | `METARESEARCH_CODEX_MODEL` | `gpt-5.5` | 模型 |
 | `METARESEARCH_CODEX_EFFORT` | `medium` | 推理力度 |
 | `METARESEARCH_RUNNER_TIMEOUT_S` | `900` | 单次 Codex 调用超时（工程超时；研究执行时限另见 policy.flow.watchdog） |
-| `METARESEARCH_GITHUB_TOKEN` | — | 可选的 GitHub 只读 API token；仅 plan 明确触发 `import_search_request` 时读取，不落 policy/DB/回执 |
+| `METARESEARCH_GITHUB_TOKEN` | — | 可选的 GitHub 只读 API token；仅 plan 明确触发 repo discovery/direct resolve 时读取，不落 policy/DB/回执 |
 | `HTTP_PROXY`/`HTTPS_PROXY` | — | 真 Codex 需要（本机 7890）；OS 级，由 codex 子进程继承（runner 不显式读） |
 
 冒烟自检（一条命令跑通至少一个完整 attack 轮）：
@@ -252,9 +252,16 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   在 DB 事务外做只读检索，回执完整后用一个短事务原子登记 pinned commit、搜索快照、冻结
   license evidence/SPDX、机械 auto/review 裁定和完成 marker，然后重渲染 plan 四锚。回执已落、DB 未提交的
   崩溃可不重搜直接续提交；无回执的中断只会重复幂等只读 GET，不会重复登记。
-- import 仍有明确安全边界：这个入口目前只开放 `new_structure` 类型门；`stuck` 普查不得在原问题直达
-  import，`human_named`/`sota_reference` 在结构化 directive 或冻结论文/榜单来源接线前继续 fail-closed。
-  另外，候选中的 adapter 仍属不可信代码，在 adversarial sandbox capability 落地前会记失败并释放问题
+- 三个非默认触发也已接入，但它们不能冒充 `new_structure`：`human_named` 只接受经 hard confirmation 的
+  结构化 `inject_question`（规范 GitHub URI + 可选精确 commit + need summary），plan 只能回引其 exact authority
+  hash，受信 connector 再固定 revision/license；自由文本 URL 不形成 authority。`stuck` 只有在 policy 的
+  visit/consecutive-inconclusive 双阈值命中时才做一次只读普查：visit 是终身防贪心计数，连续失败由
+  goal-version scoped append-only decision 独立记账（goal amend 后从零开始）。结果只派生新参照问题，原问题只挂 question
+  dependency，永不直接登记候选或 `import_defer`。`sota_reference` 先从 policy host allowlist 做有界 HTTPS
+  读取，把 paper/benchmark 原始 bytes 私有写入 SHA-256 内容寻址 blob，再派生独立 baseline-reference 问题；不是按
+  `latest` 取隐式事实。两个参照子题在自己的 action-cycle 从父轮 receipt 激活冻结候选，不重复联网。
+- import 仍有明确安全边界：上述来源只解决“能否可信发现/登记/调度”。候选中的 adapter 仍属不可信代码，
+  在 adversarial sandbox capability 落地前会记失败并释放问题
   重规划，绝不会拿普通 lifecycle supervisor 冒充强隔离后在 host 执行。所以当前已是可发现/可登记/
   可调度的 production path，但还不是可安全执行敌对外部代码的完整 production import。
 - 假执行标记（`source=fake` / `synthetic=true`）是 M0–M3 验收期语义，真执行起已移除。

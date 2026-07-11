@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "trigger_kind": "human_named",
+  "source_authority_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "need_summary": "人类明确点名的仓库应作为独立 comparator 候选"
+}
