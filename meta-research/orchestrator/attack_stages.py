@@ -169,7 +169,9 @@ def judge_once(daemon, judge_provider: Callable, cycle_id: str, bt_id: int,
 
 class AttackStages:
     def __init__(self, *, state, compiler, pool_gate: PoolGate, close_gate, providers: Dict[str, Callable],
-                 obs_policy: Dict[str, Any], work_root: str, schemas=None, policy: Optional[Dict[str, Any]] = None):
+                 obs_policy: Dict[str, Any], work_root: str, schemas=None,
+                 policy: Optional[Dict[str, Any]] = None,
+                 owner_guard: Optional[Callable[[], None]] = None):
         """state=SQLiteStateStore；compiler=SqliteCompiler；pool_gate=PoolGate(含 ExecGate 全家)；
         close_gate=SqliteGate（parser_suspect 已接真）；providers 见模块注释；work_root=staging 根目录。
         schemas=SchemaSet（步⑧：manifest 校验执法在编排器侧，不只靠 StageProvider）；
@@ -183,10 +185,24 @@ class AttackStages:
         self.work = Path(work_root)
         self.schemas = schemas
         self.policy = policy
+        self._configured_owner_guard = owner_guard or (lambda: None)
+        self.owner_guard = self._configured_owner_guard
+
+    def bind_owner_guard(self, owner_guard: Callable[[], None]) -> None:
+        if not callable(owner_guard):
+            raise TypeError("AttackStages owner_guard 须可调用")
+        configured = self._configured_owner_guard
+
+        def combined() -> None:
+            owner_guard()
+            configured()
+
+        self.owner_guard = combined
 
     # ---------------------------------------------------------------- 调度 --
     def advance_stage(self, cyc) -> str:
         """按 cycle.status 游标推进一格；返回下一 stage 或 'done'。"""
+        self.owner_guard()
         if cyc.status == "created":
             self._idea_stage(cyc)
             return "plan"
@@ -683,6 +699,7 @@ class AttackStages:
         if st() == "pending":
             g.gate_start_build_target(build_target_id=bt_id)
         if st() == "building":                    # 真 smoke（manifest.commands.smoke 子进程）→ 过了才进 smoke 态
+            self.owner_guard()                     # external spawn 的最后一道 owner fence
             sm = MF.run_manifest_command(manifest, "smoke", staging_dir=str(staging / "smoke"),
                                          log_name=f"smoke-{self._next_serial(staging, 'smoke')}.log",
                                          src_dir=src_dir, work_root=self.work, policy=self.policy,
@@ -729,6 +746,7 @@ class AttackStages:
             rid = g.gate_start_run(build_target_id=bt_id, cycle_id=ci, variant_id=vid,
                                    kind=slice_["target_kind"],   # exec 目标→run.kind='exec'（trg_run_target_consistent）
                                    env_hash=env_hash)
+            self.owner_guard()
             r = MF.run_manifest_command(manifest, "train", staging_dir=str(staging / f"run{rid}"),
                                         log_name="train.log", src_dir=src_dir, work_root=self.work,
                                         policy=self.policy, allowed_asset_refs=allowed_asset_refs,
@@ -766,6 +784,7 @@ class AttackStages:
                 ev = {"log_path": str(eval_final), "log_sha256": hashlib.sha256(eval_log).hexdigest(),
                       "log_bytes": len(eval_log), "exit_code": exit_code}
             else:
+                self.owner_guard()
                 ev = MF.run_manifest_command(manifest, "eval", staging_dir=str(staging / f"eval{rid}"),
                                              log_name="eval.log", src_dir=src_dir, work_root=self.work,
                                              policy=self.policy,

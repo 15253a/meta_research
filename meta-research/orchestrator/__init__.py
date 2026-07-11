@@ -5,6 +5,7 @@
 - schemas.py   — schema 加载 / $ref 注册表 / 产物文件名→schema 映射
 - database.py  — SQLite 唯一真相的建库与守卫（M1a：附录 A DDL + checksum/计数/版本三重锁）
 - writedaemon.py — WriteDaemon（M1b：资产层唯一写库执行者，单写连接 + 短事务）
+- instance_lease.py — 共享 work-root 的进程级唯一 owner flock + 原子活性 heartbeat（CP11.3a）
 - gate.py      — StubGate（三级校验：schema+引用真、业务放过）+ ArtifactIndex（M0）
 - gate_sqlite.py — SqliteGate（M1a-Gate：authorizer 隔离 + gate_input_* 视图 + gate_close_question；M0 并存不替换）
 - gate_exec.py  — ExecGate（M4：执行生命周期 gates——run/attempt/build_target/evaluation + 双评审机械判据 review_passed）

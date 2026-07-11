@@ -13,7 +13,8 @@ tmp→rename 覆盖 latest 文件；Mediator/应答器只读该发布快照，�
   - selection.latest_decision：**已接线（M5 CP6.2）**= 本 cycle 作用域最近 decision 摘要（{id,actor,type}）。
   - budget：B(t) 与全局上限投影最新已消费 set_budget；花费统一来自 append-only ledger，
     global_remaining = max(session_max-SUM(ledger), 0)，显式关闭上限时才为 None。
-  - heartbeat_ref：heartbeat/outbox 是实现层幂等队列、非核心 DDL（§4.6.2）→ None（CP6.3 outbox 落）。
+  - heartbeat_ref：当前 response/runner heartbeat 尚未建立机械 freshness 复验，故保持 None。CP11.3a 的
+    instance-owner heartbeat 是独立进程活性信号，只投影到 console；不能冒充当前 LLM response heartbeat。
 
 **纯函数 / 可测**：不调 wall-clock。pending 请求「已等待时长」= 展示时刻 − created_at，由控制台在展示时算；
 M2 只给锚点 created_at（不在卡内假造时长——精确换算需全系统时区/格式约定，M3 定）。
@@ -101,7 +102,7 @@ def build_status_card(conn, *, cycle_id: str, policy: Dict[str, Any]) -> Dict[st
             "selection": selection,
             "budget": budget,
             "counts": counts,
-            "heartbeat_ref": None,        # M2: heartbeat/outbox = 实现层队列、非核心 DDL（M3 落）
+            "heartbeat_ref": None,        # instance heartbeat 与 response heartbeat 分域；后者尚未闭合
             "pending_file_request": pending_file_request,
         }
     finally:

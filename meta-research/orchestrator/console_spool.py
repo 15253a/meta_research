@@ -582,13 +582,44 @@ class DurableInboxSpool:
                 info = os.fstat(inbox_fd)
                 if (info.st_dev, info.st_ino) != (batch.inbox_dev, batch.inbox_ino):
                     raise UnsafeConsolePath("console inbox inode 已替换，拒绝写入旧 cursor")
+                current_offset, legacy_migration = self._load_cursor_locked(
+                    state_fd, inbox_fd, info)
+                if legacy_migration:
+                    # Normalize the authoritative legacy value before applying
+                    # the compare-and-swap below.
+                    self._write_cursor_locked(
+                        state_fd, inbox_fd, info, current_offset)
+                batch_offsets = [batch.start_offset]
+                batch_offsets.extend(record.end_offset for record in batch.records)
+                offset_ordinals = {
+                    batch_offset: ordinal
+                    for ordinal, batch_offset in enumerate(batch_offsets)
+                }
+                if (len(offset_ordinals) != len(batch_offsets)
+                        or any(right <= left for left, right in zip(
+                            batch_offsets, batch_offsets[1:]))):
+                    raise UnsafeConsolePath(
+                        "console batch record 边界非严格递增，拒绝 cursor commit")
+                if current_offset not in offset_ordinals:
+                    raise UnsafeConsolePath(
+                        "console cursor 已被其他 consumer 推进到本批之外，拒绝旧 batch commit")
+                if offset not in offset_ordinals:
+                    raise UnsafeConsolePath("console cursor 不属于本批 committed record 边界")
                 if offset > info.st_size or (offset and os.pread(inbox_fd, 1, offset - 1) != b"\n"):
                     raise UnsafeConsolePath("console cursor 不在 committed record 边界")
-                expected_anchor = (batch.start_anchor if offset == batch.start_offset else
-                                   next(record.anchor for record in batch.records
-                                        if record.end_offset == offset))
-                if expected_anchor != self._cursor_anchor(inbox_fd, offset):
+                anchors = {batch.start_offset: batch.start_anchor}
+                anchors.update((record.end_offset, record.anchor) for record in batch.records)
+                # Verify both sides of the CAS against the generation that was
+                # read.  This rejects same-inode truncate/regrow ABA even for
+                # an otherwise idempotent duplicate commit.
+                if (anchors[current_offset] != self._cursor_anchor(inbox_fd, current_offset)
+                        or anchors[offset] != self._cursor_anchor(inbox_fd, offset)):
                     raise UnsafeConsolePath("console inbox 内容在读取后发生变化，拒绝推进 cursor")
+                if offset_ordinals[offset] < offset_ordinals[current_offset]:
+                    raise UnsafeConsolePath(
+                        "console cursor 已被其他 consumer 推进，拒绝旧 batch 回退 durable cursor")
+                if current_offset == offset:
+                    return                       # verified duplicate commit is idempotent
                 self._write_cursor_locked(state_fd, inbox_fd, info, offset)
             finally:
                 os.close(inbox_fd)

@@ -33,7 +33,7 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 from .console_spool import ConnectorSpool, SpoolBatch, UnsafeConsolePath
@@ -535,6 +535,34 @@ class InboundHTTPConnector:
         self._accepted_total = 0
         self._rejected_total = 0
         self._last_rejection: Optional[str] = None
+        self._owner_guard: Callable[[], None] = lambda: None
+
+    def bind_owner_guard(self, owner_guard: Callable[[], None]) -> None:
+        """Bind the process owner before prepare/listen; cleanup stays unguarded."""
+        if not callable(owner_guard):
+            raise TypeError("connector owner_guard 须可调用")
+        with self._accept_lock:
+            with self._lifecycle_lock:
+                if self._thread is not None or self._server is not None:
+                    raise InboundStateError("运行中的 connector listener 不得重绑 owner_guard")
+                # A prepared-but-stopped adapter is deliberately reusable after
+                # assembly rollback or normal System.close; secrets have already
+                # been erased from the environment and cannot be reconstructed.
+                # Drop every generation-local cache before publishing the new
+                # guard; prepare() must rescan durable spool/quarantine/retry
+                # authority rather than trusting the previous owner's snapshot.
+                self._accepted.clear()
+                self._index_loaded = False
+                self._prepared = False
+                with self._poll_lock:
+                    self._poll_batch = None
+                    self._poll_events = []
+                    self._poll_index = 0
+                self._fatal = None
+                self._accepted_total = 0
+                self._rejected_total = 0
+                self._last_rejection = None
+                self._owner_guard = owner_guard
 
     # ---------------------------------------------------------- envelope/index
     def validate_envelope(self, value: Mapping[str, Any]) -> Dict[str, Any]:
@@ -614,6 +642,7 @@ class InboundHTTPConnector:
 
     def prepare(self) -> None:
         """Load and validate durable authority after work_root exists, before DB/Runner work."""
+        self._owner_guard()
         with self._accept_lock:
             if self._prepared:
                 return
@@ -631,6 +660,7 @@ class InboundHTTPConnector:
             self._prepared = True
 
     def _accept_envelope(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        self._owner_guard()
         envelope = self.validate_envelope(envelope)
         canonical = _canonical_json(self._without_seq(envelope))
         key = envelope["idempotency_key"]
@@ -642,6 +672,7 @@ class InboundHTTPConnector:
                 if existing[0] != canonical:
                     collision = InboundStateError(
                         f"authenticated inbound identity collision: {key}")
+                    self._owner_guard()
                     self.spool.record_quarantine({
                         "version": 1,
                         "kind": "identity_collision",
@@ -653,12 +684,15 @@ class InboundHTTPConnector:
                     })
                     self.record_fatal(collision)
                     raise InboundProtocolError(409, "event identity 已绑定不同 envelope")
+                self._owner_guard()
                 return self._receipt(envelope, existing[1], duplicate=True)
             if len(self._accepted) >= _MAX_ACCEPTED_IDENTITIES:
                 raise InboundStateError("connector ingress identity 数达到上限，须停机归档")
+            self._owner_guard()
             self.spool.append(envelope)  # fsync happens before transport ACK
             self._accepted[key] = (canonical, receipt)
             self._accepted_total += 1
+            self._owner_guard()          # never ACK after losing the owner fence
             return self._receipt(envelope, receipt, duplicate=False)
 
     def _receipt(self, envelope: Mapping[str, Any], receipt: str, *, duplicate: bool) -> Dict[str, Any]:
@@ -673,6 +707,7 @@ class InboundHTTPConnector:
 
     # --------------------------------------------------------------- wire auth
     def accept_http(self, headers, body: bytes) -> Dict[str, Any]:  # noqa: ANN001
+        self._owner_guard()
         self.raise_if_failed()
         if self.binding.wire_type == "webhook_v1":
             envelope = self._accept_webhook(headers, body)
@@ -812,6 +847,7 @@ class InboundHTTPConnector:
     # --------------------------------------------------------------- poll/commit
     def poll(self) -> List[Dict[str, Any]]:
         """Non-destructively return one durable batch; commit is explicit."""
+        self._owner_guard()
         self.prepare()
         self.raise_if_failed()
         with self._poll_lock:
@@ -843,12 +879,14 @@ class InboundHTTPConnector:
             return [dict(event) for event in self._poll_events[self._poll_index:]]
 
     def commit_poll(self, token: Any) -> None:
+        self._owner_guard()
         with self._poll_lock:
             if self._poll_batch is None or self._poll_index >= len(self._poll_events):
                 raise InboundStateError("connector poll 没有待 commit event")
             expected = self._poll_events[self._poll_index]["_poll_token"]
             if isinstance(token, bool) or not isinstance(token, int) or token != expected:
                 raise InboundStateError("connector poll commit 非当前队首 receipt")
+            self._owner_guard()
             self.spool.write_cursor(self._poll_batch, token)
             self._poll_index += 1
             if self._poll_index >= len(self._poll_events):
@@ -860,9 +898,11 @@ class InboundHTTPConnector:
         return self.spool.load_retry_counts()
 
     def store_retry_counts(self, counts: Dict[str, int]) -> None:
+        self._owner_guard()
         self.spool.store_retry_counts(counts)
 
     def pending_status(self) -> Dict[str, Any]:
+        self._owner_guard()
         self.prepare()
         with self._poll_lock:
             if self._poll_batch is not None:
@@ -878,6 +918,7 @@ class InboundHTTPConnector:
         # Preserve accept->lifecycle lock order used by collision handling;
         # holding lifecycle while prepare waits on accept can deadlock a
         # concurrent authenticated collision recording its fatal state.
+        self._owner_guard()
         self.prepare()
         self.raise_if_failed()
         with self._lifecycle_lock:

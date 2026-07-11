@@ -701,7 +701,9 @@ def test_system_unknown_usage_durably_stops_without_retry(tmp_path):
 
 def test_resume_same_work_root_no_goal_recreate(tmp_path):
     """重启同 work_root 续跑：goal 不重建（幂等）、上轮 terminate → 本次 0 轮。"""
-    build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE])).run(5)
+    sys1 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE]))
+    sys1.run(5)
+    assert sys1.close() is None
     sys2 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))   # 无需再调 runner
     assert sys2.run(max_cycles=5) == []                        # 已 terminate，无新轮
     assert sys2.daemon.query_one("SELECT count(*) FROM goal")[0] == 1   # goal 唯一（未重建）
@@ -737,6 +739,7 @@ def test_goal_body_from_db_not_edited_brief(tmp_path, monkeypatch):
     sys1 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE]))
     sys1.run(5)
     db_goal = sys1.daemon.query_one("SELECT text FROM goal WHERE id=1")[0]
+    assert sys1.close() is None
     # 重启：即便 parse_goal_brief 返回被"编辑过"的 body，装配也用 DB 正文
     import orchestrator.run as R
     monkeypatch.setattr(R, "parse_goal_brief", lambda p: {"body_md": "【被篡改的目标】", "predicate_json": {},
@@ -926,6 +929,7 @@ def test_broken_inbound_state_blocks_due_directive_consumption(tmp_path):
         "reason": reason, "raw_text": directive_action_text("reject", did, reason=reason),
     })
     (tmp_path / "state" / ".console_inbox.retry.json").write_text("{broken", encoding="utf-8")
+    assert first.close() is None
 
     # 重启后加载到坏 sidecar；即使 pause 已确认且 immediate due，也必须停在入站顺序闸前。
     second = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=counting_factory)
@@ -1147,6 +1151,7 @@ def test_file_request_wait_loop_end_to_end(tmp_path):
     assert "文件请求" in sys1.advancer.last_block_reason
     rid = sys1.daemon.query_one("SELECT id FROM interaction_request WHERE status='pending'")[0]
     assert sys1.daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "created"
+    assert sys1.close() is None
 
     # 第二次 run（同 work root）：precheck 全局等待阻断（provider 一次都不调）
     sys2 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory([]))
@@ -1164,6 +1169,7 @@ def test_file_request_wait_loop_end_to_end(tmp_path):
     (up / "1" / "eeg-user-name.zip").write_bytes(b"EEG-USER-DATA")
     resolved = frs.resolve(request_id=rid, uploads_dir=str(up), resolved_message_id=mid)
     asset = resolved["resolution"][0]["provided"][0]
+    assert sys2.close() is None
 
     def finish_after_resource(pack):
         assert pack.refs == [f"user-file-request:r{rid}:item:1:asset:1"]

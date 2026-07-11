@@ -773,6 +773,37 @@ def test_torn_receipt_tail_is_repaired_before_replay_success(tmp_path):
     assert connector.calls == ["receipt-repair"]
 
 
+def test_delivery_owner_guard_fences_before_remote_send(tmp_path):
+    outbox = Outbox(str(tmp_path / "state"))
+    outbox.emit("guarded-send", "cycle_summary", {"cycle_id": "c1"})
+    connector = _FlakyConnector()
+    checks = []
+
+    def owner_guard() -> None:
+        checks.append(len(checks) + 1)
+        if len(checks) >= 2:
+            raise RuntimeError("owner fence lost")
+
+    delivery = OutboundDelivery(
+        outbox, {"qq": connector}, default_channels=["qq"],
+        owner_guard=owner_guard)
+    with pytest.raises(RuntimeError, match="owner fence lost"):
+        delivery.tick(1)
+    assert connector.calls == []
+    assert checks == [1, 2]
+
+
+def test_worker_liveness_probe_does_not_call_connector_diagnostics(tmp_path):
+    class BadDiagnostic(_FlakyConnector):
+        def status(self):
+            raise OSError("diagnostic authority corrupt")
+
+    delivery = OutboundDelivery(
+        Outbox(str(tmp_path / "state")), {"qq": BadDiagnostic()},
+        default_channels=["qq"])
+    assert delivery.worker_running() is False
+
+
 def test_receipt_fsync_uncertainty_does_not_resend_committed_ack(tmp_path, monkeypatch):
     state = tmp_path / "state"
     outbox = Outbox(str(state))

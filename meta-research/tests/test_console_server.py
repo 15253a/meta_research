@@ -18,6 +18,7 @@ import conftest
 from orchestrator import console_server as CS
 from orchestrator import console_spool as CSP
 from orchestrator import database as db
+from orchestrator.instance_lease import InstanceLease
 
 SYSTEM_ROOT = str(Path(__file__).resolve().parent.parent)
 TEST_CAPABILITY = "a" * 64
@@ -70,7 +71,9 @@ def test_assemble_db_shape(seeded):
     assert payload["tables"]["baseline"] and "canonical_key" in payload["tables"]["baseline"][0]
     # 派生对象在场
     assert payload["status_card"]["snapshot_cycle"] == "c1"
-    assert payload["live"]["mode"] in ("running", "idle", "awaiting_user")
+    assert payload["live"]["mode"] in ("running", "interrupted", "idle", "awaiting_user")
+    assert payload["live"]["orchestrator_active"] is False
+    assert payload["live"]["orchestrator_status"] in {"inactive", "invalid"}
     assert payload["notification"] == [{
         "event_key": "e1", "kind": "cycle_done", "payload": {"summary_md": "轮完成"},
     }]  # 撕裂行被弃
@@ -101,6 +104,25 @@ def test_live_mode_awaiting_user(seeded):
               "VALUES (1,1,'plan','pending','需数据','[]','rh')")
     d.commit(); d.close()
     assert CS.assemble_db(path, work, SYSTEM_ROOT)["live"]["mode"] == "awaiting_user"
+
+
+def test_live_running_requires_fresh_instance_owner(seeded):
+    path, work = seeded
+    without_owner = CS.assemble_db(path, work, SYSTEM_ROOT)["live"]
+    assert without_owner["mode"] == "interrupted"
+    assert without_owner["orchestrator_active"] is False
+
+    lease = InstanceLease.acquire(work, heartbeat_interval_s=0.02)
+    try:
+        lease.set_state("running", cycle_id="c1", activity="test")
+        live = CS.assemble_db(path, work, SYSTEM_ROOT)["live"]
+        assert live["mode"] == "running"
+        assert live["orchestrator_active"] is True
+        assert live["orchestrator_status"] == "active"
+        assert live["orchestrator_owner_id"] == lease.owner_id
+        assert live["orchestrator_heartbeat_age_s"] is not None
+    finally:
+        lease.close()
 
 
 # ============ 文件白名单读 ============
