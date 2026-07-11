@@ -370,6 +370,13 @@ class _HTTPJSONConnector:
             "configured": True,
         }
 
+    def transport_running(self) -> bool:
+        """Mechanical liveness of the bounded request thread, without IO."""
+        with self._request_guard:
+            attempt = self._inflight
+            thread = attempt.get("thread") if isinstance(attempt, dict) else None
+            return bool(thread is not None and thread.is_alive())
+
 
 class WebhookV1Connector(_HTTPJSONConnector):
     """Strict event webhook with receiver-side event-key idempotency."""
@@ -571,6 +578,9 @@ class BidirectionalConnector:
     def send(self, event: Dict[str, Any]) -> Dict[str, Any]:
         return self.outbound.send(event)
 
+    def bind_owner_guard(self, owner_guard: Callable[[], None]) -> None:
+        self.inbound.bind_owner_guard(owner_guard)
+
     @property
     def inbound_spool(self):  # noqa: ANN201 - concrete spool type stays transport-private
         return self.inbound.spool
@@ -615,6 +625,10 @@ class BidirectionalConnector:
         result = dict(self.outbound.status())
         result["inbound"] = self.inbound.status()
         return result
+
+    def transport_running(self) -> bool:
+        probe = getattr(self.outbound, "transport_running", None)
+        return bool(callable(probe) and probe())
 
 
 def _event_identity(event: Mapping[str, Any]) -> Tuple[str, str, str]:
@@ -759,7 +773,8 @@ class OutboundDelivery:
 
     def __init__(self, outbox, connectors: Mapping[str, Any], *, default_channels: List[str],
                  retry_initial_s: float = 1.0, retry_max_s: float = 300.0,
-                 batch_size: int = 32, clock=time.time):
+                 batch_size: int = 32, clock=time.time,
+                 owner_guard: Optional[Callable[[], None]] = None):
         self.outbox = outbox
         self.connectors = dict(connectors)
         self.default_channels = tuple(default_channels)
@@ -769,6 +784,7 @@ class OutboundDelivery:
             raise ValueError("outbound batch_size 须为 4..256 整数")
         self.batch_size = batch_size
         self.clock = clock
+        self._owner_guard = owner_guard or (lambda: None)
         self._lock = threading.Lock()
         self._worker_guard = threading.RLock()
         self._worker_thread: Optional[threading.Thread] = None
@@ -854,6 +870,7 @@ class OutboundDelivery:
         the entire channel.  Transport failures remain durable retry facts;
         local state corruption still raises and terminates the worker.
         """
+        self._owner_guard()
         now = self.clock() if now_ts is None else float(now_ts)
         if not math.isfinite(now):
             raise ValueError("delivery now_ts 须为有限数字")
@@ -901,6 +918,7 @@ class OutboundDelivery:
                     for event in group[start:stop_index]:
                         if attempted >= self.batch_size or should_stop():
                             break
+                        self._owner_guard()
                         current = now if now_ts is not None else float(self.clock())
                         if not math.isfinite(current):
                             raise ValueError("delivery clock 须返回有限数字")
@@ -928,6 +946,7 @@ class OutboundDelivery:
                                 # time cannot repair them and durable retry
                                 # would disguise a poisoned route as outage.
                                 raise
+                            self._owner_guard()
                             completed_at = current if now_ts is not None else float(self.clock())
                             if not math.isfinite(completed_at):
                                 raise ValueError("delivery clock 须返回有限数字")
@@ -942,6 +961,7 @@ class OutboundDelivery:
                                 channel, event["event_key"], attempts, kind)
                             blocked_groups.add(group_key)
                             break
+                        self._owner_guard()
                         completed_at = current if now_ts is not None else float(self.clock())
                         if not math.isfinite(completed_at):
                             raise ValueError("delivery clock 须返回有限数字")
@@ -956,11 +976,11 @@ class OutboundDelivery:
 
     def status(self) -> Dict[str, Any]:
         result = {channel: connector.status() for channel, connector in self.connectors.items()}
+        running = self.worker_running()
         with self._worker_guard:
-            thread = self._worker_thread
             error = self._worker_error or self._last_worker_error
             result["_worker"] = {
-                "running": bool(thread is not None and thread.is_alive()),
+                "running": running,
                 "healthy": error is None,
                 "error": (None if error is None else
                           f"{type(error).__name__}: {str(error)[:256]}"),
@@ -969,6 +989,7 @@ class OutboundDelivery:
 
     def pending_status(self) -> Dict[str, Any]:
         """Bounded operational summary; no network call and no future-retry wait."""
+        self._owner_guard()
         with self._lock:
             self.outbox.reconcile_delivery_state()
             total = 0
@@ -1002,6 +1023,7 @@ class OutboundDelivery:
 
     def start(self, poll_interval_s: float) -> bool:
         """Start one transport-only worker; return whether this call owns it."""
+        self._owner_guard()
         interval = float(poll_interval_s)
         if not math.isfinite(interval) or interval < 0.05:
             raise ValueError("outbound poll_interval_s 须为不小于 0.05 的有限数字")
@@ -1038,6 +1060,19 @@ class OutboundDelivery:
                 self._worker_error = None
                 raise
             return True
+
+    def worker_running(self) -> bool:
+        """Mechanical capability liveness; never calls connector diagnostics."""
+        with self._worker_guard:
+            thread = self._worker_thread
+            worker = bool(thread is not None and thread.is_alive())
+        transport = False
+        for connector in self.connectors.values():
+            probe = getattr(connector, "transport_running", None)
+            if callable(probe) and probe():
+                transport = True
+                break
+        return worker or transport
 
     def stop(self) -> Optional[BaseException]:
         with self._worker_guard:

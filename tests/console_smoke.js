@@ -45,10 +45,14 @@ const shapeOk = Array.isArray(D.question) && Array.isArray(D.baseline) && Array.
   && D.budget && typeof D.budget.B_t === 'number'                               // budget 派生就位（顶栏每拍必读）
   && (D.decision.length === 0 || typeof D.decision[0].summary === 'string');
 if (!shapeOk) { console.log('SMOKE_FAIL adapt shape'); process.exit(1); }
-for (const mode of ['running', 'awaiting_user', 'paused', 'idle']) {
-  const live = ctx.__buildLive({live: {mode}});
+for (const mode of ['running', 'awaiting_user', 'paused', 'interrupted', 'idle']) {
+  const active = mode !== 'interrupted' && mode !== 'idle';
+  const live = ctx.__buildLive({live: {mode, orchestrator_active: active}});
   if (live.idle !== (mode === 'idle')) {
     console.log('SMOKE_FAIL live mode mislabeled idle: ' + mode); process.exit(1);
+  }
+  if (live.alive !== active || live.interrupted !== (mode === 'interrupted')) {
+    console.log('SMOKE_FAIL live owner/interrupted semantics: ' + mode); process.exit(1);
   }
 }
 

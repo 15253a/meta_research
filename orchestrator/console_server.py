@@ -40,6 +40,7 @@ from .console import directive_action_text
 from .console_spool import (CAPABILITY_NAME, ConsoleSpool, normalize_upload_ref,
                             open_directory_path, read_regular_file_beneath,
                             stat_regular_file_beneath)
+from .instance_lease import read_instance_status
 
 
 _MAX_HTTP_BODY_BYTES = 64 * 1024
@@ -536,7 +537,8 @@ def _notifications(work_root: Path) -> List[Dict[str, Any]]:
 
 def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
     """「正在执行」活性信号（不经任何 LLM，§4.6.6 live strip）：在途轮 + 最新 runner_call + 心跳
-    （transcript 文件 mtime）+ 模式（running / idle / awaiting_user）。"""
+    （transcript 文件 mtime）+ 独立 instance owner heartbeat。DB 在途只表示耐久游标；没有经
+    flock+owner-id+freshness 复验的当前 owner 时必须显示 interrupted，不能伪称 running。"""
     inflight = conn.execute(
         "SELECT id, route, status, active_question_id FROM cycle "
         "WHERE status NOT IN ('done','aborted','failed') ORDER BY id DESC LIMIT 1").fetchone()
@@ -547,7 +549,12 @@ def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
     paused = bool(latest_pause_control) and latest_pause_control[0] == "pause"
     rc = conn.execute("SELECT id, cycle_id, phase, purpose, status, transcript_ref, started_at, finished_at "
                       "FROM runner_call ORDER BY id DESC LIMIT 1").fetchone()
-    mode = "paused" if paused else ("awaiting_user" if pending_req else ("running" if inflight else "idle"))
+    instance = read_instance_status(work_root)
+    mode = ("paused" if paused else
+            ("awaiting_user" if pending_req else
+             ("running" if inflight and instance["active"]
+              and instance["state"] == "running" else
+              ("interrupted" if inflight else "idle"))))
     live: Dict[str, Any] = {"mode": mode,
                             "paused": paused,
                             "block_kind": ("pause" if paused else ("file_request" if pending_req else None)),
@@ -555,7 +562,13 @@ def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
                             "inflight_route": (inflight[1] if inflight else None),
                             "inflight_status": (inflight[2] if inflight else None),
                             "pending_request_id": (pending_req[0] if pending_req else None),
-                            "runner_call": None, "heartbeat_age_s": None}
+                            "runner_call": None, "heartbeat_age_s": None,
+                            "orchestrator_active": bool(instance["active"]),
+                            "orchestrator_status": instance["status"],
+                            "orchestrator_owner_id": instance["owner_id"],
+                            "orchestrator_pid": instance["pid"],
+                            "orchestrator_state": instance["state"],
+                            "orchestrator_heartbeat_age_s": instance["heartbeat_age_s"]}
     if rc is not None:
         live["runner_call"] = {"id": rc[0], "cycle_id": rc[1], "phase": rc[2], "purpose": rc[3],
                                "status": rc[4], "transcript_ref": rc[5],

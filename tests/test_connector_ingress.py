@@ -14,6 +14,7 @@ import os
 import socket
 import threading
 import time
+from email.message import Message
 from pathlib import Path
 
 import pytest
@@ -94,6 +95,50 @@ def _onebot_connector(tmp_path: Path, *, target_kind: str = "private",
         },
         inbound_profile=inbound, secret=INBOUND_SECRET,
         outbound_secret=OUTBOUND_SECRET, work_root=str(tmp_path))
+
+
+def test_inbound_owner_guard_fences_prepare_accept_and_listener_start(tmp_path):
+    connector = _webhook_connector(tmp_path)
+    active = [True]
+
+    def owner_guard() -> None:
+        if not active[0]:
+            raise RuntimeError("owner fence lost")
+
+    connector.bind_owner_guard(owner_guard)
+    connector.prepare()
+    active[0] = False
+    with pytest.raises(RuntimeError, match="owner fence lost"):
+        connector.accept_http({}, b"{}")
+    with pytest.raises(RuntimeError, match="owner fence lost"):
+        connector.start()
+    assert connector.spool.scan_committed() == []
+
+
+def test_rebind_resets_previous_owner_cache_and_rescans_durable_authority(tmp_path):
+    connector = _webhook_connector(tmp_path)
+    connector.bind_owner_guard(lambda: None)
+    connector.prepare()
+
+    def envelope(text: str):
+        body = json.dumps({
+            "protocol_version": 1, "message_id": "same-event", "text": text,
+        }, separators=(",", ":")).encode("utf-8")
+        headers = _webhook_headers(
+            connector, body, event_id="same-event",
+            request_id=hashlib.md5(text.encode()).hexdigest())  # noqa: S324 - nonce only
+        message = Message()
+        for name, value in headers.items():
+            message[name] = value
+        return connector._accept_webhook(message, body)
+
+    # Simulate another owner/object appending while this stopped adapter's
+    # in-memory acceptance index remains stale.
+    connector.spool.append(envelope("first"))
+    connector.spool.append(envelope("different body, same transport identity"))
+    connector.bind_owner_guard(lambda: None)
+    with pytest.raises(InboundStateError, match="identity collision"):
+        connector.prepare()
 
 
 def _http(connector, method: str, path: str, body: bytes = b"",
@@ -687,7 +732,7 @@ def test_build_rejects_incomplete_inbound_adapter_before_work_or_database(tmp_pa
             return {}
 
     work = tmp_path / "must-not-exist"
-    with pytest.raises(ValueError, match="durable inbound 契约不完整"):
+    with pytest.raises(ValueError, match="durable inbound 契约不完整") as caught:
         build_system(
             str(Path(__file__).resolve().parent.parent), str(work),
             runner_factory=lambda _td, _pt: None, attack=False,
@@ -695,7 +740,38 @@ def test_build_rejects_incomplete_inbound_adapter_before_work_or_database(tmp_pa
                 "channels": {"qq": IncompleteInbound()},
                 "retry_initial_s": 1, "retry_max_s": 10, "batch_size": 8,
             })
+    assert "bind_owner_guard" in str(caught.value)
     assert not work.exists()
+
+
+def test_build_rejects_inbound_spool_from_foreign_work_root(tmp_path):
+    connector_root = tmp_path / "connector-owner-a"
+    connector_root.mkdir(mode=0o700)
+    inbound = _webhook_connector(connector_root)
+
+    class Outbound:
+        channel = "qq"
+        timeout_s = 1.0
+
+        @staticmethod
+        def send(_event):
+            return {}
+
+        @staticmethod
+        def status():
+            return {}
+
+    connector = BidirectionalConnector(Outbound(), inbound)
+    system_work = tmp_path / "system-owner-b"
+    with pytest.raises(ValueError, match="work_root 与本次 instance lease 不一致"):
+        build_system(
+            str(Path(__file__).resolve().parent.parent), str(system_work),
+            runner_factory=lambda _td, _pt: None, attack=False,
+            outbound_config={
+                "channels": {"qq": connector},
+                "retry_initial_s": 1, "retry_max_s": 10, "batch_size": 8,
+            })
+    assert not (system_work / "research.sqlite").exists()
 
 
 @pytest.mark.parametrize("mutation, message", [

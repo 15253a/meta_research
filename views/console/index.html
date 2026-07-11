@@ -894,11 +894,11 @@ interaction_request: [
 /* ---------- 模拟运行场景(仅影响 live strip 呈现) ---------- */
 const SCENARIOS = {
   running: { label:"训练执行中", heartbeat_age:"8 秒前", runner:"runner_call #812 · bundle · running · 始于 07-05 07:58(2.1h 前)",
-             cursor:"3 / 5", cursor_pct:52, watchdog:"剩余 21.9h / 24h", watchdog_pct:9, cost:"$13.7", idle:false, approval:false },
+             cursor:"3 / 5", cursor_pct:52, watchdog:"剩余 21.9h / 24h", watchdog_pct:9, cost:"$13.7", idle:false, alive:true, approval:false },
   awaiting_user:{ label:"等待用户供给", heartbeat_age:"41 分钟前(无活跃研究 runner)", runner:"(不开新研究 runner_call —— 文件请求 r2 pending,全局等待;问答/通知/上传校验照常)",
-             cursor:"3 / 5(等待用户供给)", cursor_pct:44, watchdog:"暂停计时(等待用户供给)", watchdog_pct:0, cost:"$11.6", idle:false, request:true },
+             cursor:"3 / 5(等待用户供给)", cursor_pct:44, watchdog:"暂停计时(等待用户供给)", watchdog_pct:0, cost:"$11.6", idle:false, alive:true, request:true },
   idle:    { label:"轮间空闲", heartbeat_age:"—(上一轮已收尾)", runner:"(advance 等待下次唤醒;cycle 19 done)",
-             cursor:"—", cursor_pct:0, watchdog:"—", watchdog_pct:0, cost:"$0.0", idle:true, approval:false },
+             cursor:"—", cursor_pct:0, watchdog:"—", watchdog_pct:0, cost:"$0.0", idle:true, alive:false, approval:false },
 };
 
 /* ==================== v2:落盘目录镜像(§6.3 / §5.2) ==================== */
@@ -1336,6 +1336,8 @@ function bandHTML(){
     ? chip("c-warn","人工 pause 生效中 · 等待 resume")
     : state.scenario==="idle"
     ? chip("c-dead","轮间空闲")
+    : state.scenario==="interrupted"
+    ? chip("c-dead","研究执行未运行 · owner="+(scen.alive?(scen.owner_state||"非 running"):"离线/失鲜"))
     : `<span class="dot acc pulse"></span><span class="num">心跳 ${esc(scen.heartbeat_age)}</span><span class="sep">·</span><span class="num">bundle ${esc(scen.cursor)}</span><span class="sep">·</span><span class="num">本轮 ${esc(scen.cost)}</span>`;
   return `<div class="band">
     <span class="eyebrow">status_card</span>
@@ -2148,7 +2150,7 @@ function renderTopbar(){
     `<span class="tchip">goal <b>${esc("v"+(sc.goal_ver!=null&&sc.goal_ver!==""?sc.goal_ver:"?"))}</b></span>
      <span class="tchip">cycle <b class="num">${esc(String(sc.snapshot_cycle!=null?sc.snapshot_cycle:"—"))}</b> · <span class="mono">${esc((sc.cycle_route||"—")+" · "+(sc.cycle_status||"—"))}</span></span>
      <span class="tchip">B(t) <b class="num">$${esc(DB.budget.B_t)}</b> · 已花 <b class="num">$${esc(DB.budget.cycle_spent)}</b></span>
-     <span class="tchip"><span class="dot ${scen.idle?"dead":"acc"} ${scen.idle?"":"pulse"}"></span>心跳 <b>${esc(scen.idle?"—":scen.heartbeat_age)}</b></span>`;
+     <span class="tchip"><span class="dot ${scen.alive?"acc":"dead"} ${scen.alive?"pulse":""}"></span>owner 心跳 <b>${esc(scen.alive?scen.heartbeat_age:"—")}</b></span>`;
   // 场景切换器是 mock 演示件（人手翻三态 live）；真数据模式只有一个真状态 → 显示真状态标签，不给切换按钮
   document.getElementById("scen").innerHTML = LIVE_MODE
     ? `<span class="mono" style="font-size:11px;opacity:.75">${esc(scen.label||scen.mode||"")}</span>`
@@ -2475,7 +2477,7 @@ function narratorRespond(t){
   }
   if(/在跑什么|进展|怎么样|状态|现在/.test(t)){                                  // 据真 DB.status_card / live 报现状（不焊死 c18/Q7/Q13 剧情）
     const sc=DB.status_card||{}, scen=SCENARIOS[state.scenario];
-    return { html:`<b>快照</b> c${esc(String(sc.snapshot_cycle!=null?sc.snapshot_cycle:"—"))} · goal v${esc(String(sc.goal_ver||"?"))} · 选题 ${mono("Q"+sc.active_question)} intent=${esc(sc.selection_intent||"—")} · open/incl ${esc(String(sc.open_count))}/${esc(String(sc.inconclusive_count))}。<b>正在执行</b>:${scen.idle?"无（轮间空闲）":scen.request?"暂停研究（等待用户供给）":(esc(sc.cycle_route||"—")+" · "+esc(sc.cycle_status||"—")+"，心跳 "+esc(scen.heartbeat_age))}。<a href="javascript:go('cycles')">→ 轮次详情</a>（讲解员据只读快照，不联机推理）` };
+    return { html:`<b>快照</b> c${esc(String(sc.snapshot_cycle!=null?sc.snapshot_cycle:"—"))} · goal v${esc(String(sc.goal_ver||"?"))} · 选题 ${mono("Q"+sc.active_question)} intent=${esc(sc.selection_intent||"—")} · open/incl ${esc(String(sc.open_count))}/${esc(String(sc.inconclusive_count))}。<b>运行状态</b>:${scen.interrupted?(scen.alive?"研究执行未运行（owner state="+esc(scen.owner_state||"非 running")+"）":"已中断（无新鲜 orchestrator owner）"):scen.idle?"无（轮间空闲）":scen.request?"暂停研究（等待用户供给）":(esc(sc.cycle_route||"—")+" · "+esc(sc.cycle_status||"—")+"，owner 心跳 "+esc(scen.heartbeat_age))}。<a href="javascript:go('cycles')">→ 轮次详情</a>（讲解员据只读快照，不联机推理）` };
   }
   return { html:"我可以:① <b>解释</b>系统概念(问「什么是适用性 / suspect / import 三闸 / B(t) / route / 快照 / directive」);② <b>讨论</b>进展与下一步权衡(问「该不该停 / 下一步建议」);③ <b>帮你组织命令</b>(说「预算调到 60 / 暂停 / 优先验证 32k / 批准」),我给草稿,[一键发送] 走命令行入账。我本身只读,绝不直接改状态。" };
 }
@@ -2645,11 +2647,13 @@ function adaptPayload(p){
 let LIVE_MODE=false;                                              // 接入真数据后置真 → 渲染码隐藏 mock 演示件（场景切换器 / 「模拟」按钮）
 function buildLive(p){                                            // payload.live + status_card → 原型 scen 形状；真值优先，未知诚实置「—」（不编造）
   const lv=(p&&p.live)||{}, bud=((p&&p.status_card&&p.status_card.budget)||{}), rc=lv.runner_call;
-  const allowedModes=new Set(["running","awaiting_user","paused","idle"]), mode=allowedModes.has(lv.mode)?lv.mode:"idle";
-  const LBL={running:"训练执行中",awaiting_user:"等待用户供给",paused:"人工暂停",idle:"轮间空闲"};
+  const allowedModes=new Set(["running","awaiting_user","paused","interrupted","idle"]), mode=allowedModes.has(lv.mode)?lv.mode:"idle";
+  const LBL={running:"训练执行中",awaiting_user:"等待用户供给",paused:"人工暂停",interrupted:"运行已中断",idle:"轮间空闲"};
   return { mode, label:LBL[mode], idle:mode==="idle", request:mode==="awaiting_user",
+    alive:lv.orchestrator_active===true, interrupted:mode==="interrupted",
+    owner_state:typeof lv.orchestrator_state==="string"?lv.orchestrator_state:null,
     paused:mode==="paused", approval:false,
-    heartbeat_age:(typeof lv.heartbeat_age_s==="number"&&Number.isFinite(lv.heartbeat_age_s))?(lv.heartbeat_age_s+" 秒前"):"—",
+    heartbeat_age:(typeof lv.orchestrator_heartbeat_age_s==="number"&&Number.isFinite(lv.orchestrator_heartbeat_age_s))?(lv.orchestrator_heartbeat_age_s+" 秒前"):"—",
     runner: rc?("runner_call #"+rc.id+" · "+(rc.phase||"")+" · "+(rc.status||"")):"（无活跃 runner）",
     cursor:"—", cursor_pct:0, watchdog:"—", watchdog_pct:0,      // bundle 游标 / watchdog 不在 live 载荷 → 诚实置空
     cost:"$"+_finiteNumber(bud.cycle_spent,0) };

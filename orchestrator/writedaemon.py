@@ -19,15 +19,17 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from typing import Any, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple
 
 
 class _LockedCursor:
     """Cursor facade that keeps every sqlite C call under the daemon lock."""
 
-    def __init__(self, cursor: sqlite3.Cursor, lock: threading.RLock):
+    def __init__(self, cursor: sqlite3.Cursor, lock: threading.RLock,
+                 owner_guard: Callable[[], None]):
         self._cursor = cursor
         self._lock = lock
+        self._owner_guard = owner_guard
 
     def __getattr__(self, name):
         attr = getattr(self._cursor, name)
@@ -36,6 +38,7 @@ class _LockedCursor:
 
         def guarded(*args, **kwargs):
             with self._lock:
+                self._owner_guard()
                 result = attr(*args, **kwargs)
                 return self if result is self._cursor else result
         return guarded
@@ -45,6 +48,7 @@ class _LockedCursor:
 
     def __next__(self):
         with self._lock:
+            self._owner_guard()
             return next(self._cursor)
 
 
@@ -57,32 +61,39 @@ class _LockedConnection:
     on the connection midway through another sqlite operation.
     """
 
-    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock,
+                 owner_guard: Callable[[], None]):
         object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "_lock", lock)
+        object.__setattr__(self, "_owner_guard", owner_guard)
 
     def __getattr__(self, name):
         attr = getattr(self._conn, name)
         if not callable(attr):
             with self._lock:
+                self._owner_guard()
                 return getattr(self._conn, name)
 
         def guarded(*args, **kwargs):
             with self._lock:
+                self._owner_guard()
                 result = attr(*args, **kwargs)
-                return _LockedCursor(result, self._lock) if isinstance(result, sqlite3.Cursor) else result
+                return (_LockedCursor(result, self._lock, self._owner_guard)
+                        if isinstance(result, sqlite3.Cursor) else result)
         return guarded
 
     def __setattr__(self, name, value):
-        if name in {"_conn", "_lock"}:
+        if name in {"_conn", "_lock", "_owner_guard"}:
             object.__setattr__(self, name, value)
             return
         with self._lock:
+            self._owner_guard()
             setattr(self._conn, name, value)
 
 
 class WriteDaemon:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection,
+                 owner_guard: Optional[Callable[[], None]] = None):
         """conn = database.connect(...) 建/开的写连接；本 daemon 独占它作唯一写连接。
 
         单进程 M1：读也走此连接（事务内读须见未提交写，如 decompose 先读父状态再写子问题；
@@ -92,7 +103,8 @@ class WriteDaemon:
         conn.isolation_level = None   # 显式掌控事务（关隐式 BEGIN）
         self._conn = conn
         self._lock = threading.RLock()
-        self._public_conn = _LockedConnection(conn, self._lock)
+        self._owner_guard = owner_guard or (lambda: None)
+        self._public_conn = _LockedConnection(conn, self._lock, self._owner_guard)
         self._in_txn = False
 
     @property
@@ -108,6 +120,7 @@ class WriteDaemon:
         `_in_txn` 不一致、堵死后续写入。
         """
         with self._lock:
+            self._owner_guard()
             if self._in_txn:
                 raise RuntimeError("WriteDaemon 事务不可嵌套（一个写命令一个短事务；长操作须在事务外）")
             self._in_txn = True
@@ -120,6 +133,11 @@ class WriteDaemon:
                     raise
                 else:
                     try:
+                        # Re-fence at the commit edge.  A heartbeat/path-owner
+                        # failure during the short body must roll back instead
+                        # of allowing an old capability to commit after a new
+                        # stable lock identity can be acquired.
+                        self._owner_guard()
                         self._conn.execute("COMMIT")
                     except BaseException:
                         try:
@@ -133,8 +151,10 @@ class WriteDaemon:
     def query(self, sql: str, params: Sequence[Any] = ()) -> List[Tuple]:
         """只读查询（同连接；事务内可见未提交写，事务外见已提交态）。"""
         with self._lock:
+            self._owner_guard()
             return self._conn.execute(sql, params).fetchall()
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> Optional[Tuple]:
         with self._lock:
+            self._owner_guard()
             return self._conn.execute(sql, params).fetchone()

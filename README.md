@@ -2,8 +2,8 @@
 
 自主研究编排器：一条命令让真 Codex 全自动跑「出题 → 分解 → 建基线/变体 → 训练 → 评估 → 双评审 →
 关问」的研究元循环。**确定性编排器从不推理**（Codex 是无状态阶段工人，只产合 schema 的产物，永不碰
-数据库）；SQLite 是唯一真相（36 表冻结 DDL + 三重锁）；真执行由 harness 跑真子进程；崩溃 kill-9 可
-从 DB 无半写恢复。
+数据库）；SQLite 是唯一真相（36 表冻结 DDL + 三重锁）；真执行由 harness 跑真子进程；事务边界崩溃可
+从 DB 无半写恢复（外部子孙进程的 owner-death 边界仍见 §7）。
 
 > 设计真相唯一在 `../reference/第一部分-系统架构设计.md`；本 README 是**操作面**（怎么跑、怎么配、怎么
 > 观测/干预、边界在哪）。构建历史见仓库根 `ROADMAP.md` / `build_log/`。
@@ -26,7 +26,8 @@ python -m orchestrator.run --system-root . --work-root /tmp/canary --max-cycles 
 
 - `--system-root`：含 `input/goal_brief.md`、`policies/`、`prompts/`、`schemas/` 的仓库根（一般就是 `.`）。
 - `--work-root`：本次运行的产物根（`research.sqlite` / `cycles/` / `state/` 落这里）。**重启用同一个
-  work-root 即从断点续跑**（DB 权威，非进程内记忆）。
+  work-root 即从断点续跑**（DB 权威，非进程内记忆）。同一时刻只能有一个 run owner：入口会先取得稳定
+  `.orchestrator-instance.lock` 的非阻塞进程级 lease；第二实例在 DB、listener、Runner 副作用前直接失败。
 - `--max-cycles`：本次最多推进轮数（安全上限，默认 100，与系统自终止并存）。
 - 生产入口默认读取 `<system-root>/connectors/outbound.json`；缺失、权限不安全、token 环境变量缺失或协议
   不合法都会在建库/调用 Codex 前失败。只有显式 `--no-outbound` 才允许离线运行。
@@ -35,6 +36,12 @@ python -m orchestrator.run --system-root . --work-root /tmp/canary --max-cycles 
   间隔（默认 1 秒，最小 0.01 秒）。
 
 停机时打印 `[run] dual_mode=… 推进 N 轮：[…]；停因=…`。停因见 §6。
+
+若在 Python 内直接调用 `build_system()`，默认同样强制 lease；必须用 `with build_system(...) as system:`，或在
+所有正常/异常分支调用可重试的 `system.close()`。关闭顺序是 listener/pump/delivery、在途 query、只读/写 DB
+连接、heartbeat，最后才释放 flock。close 返回错误必须按停机异常上报；只要仍有能力未结束，lease 就会保留
+供再次 close，不能直接另起同 work-root 实例；若所有能力已机械消失，历史 worker 错误可在 lease 释放后返回，
+仅作故障证据。`enforce_instance_lease=False` 仅供隔离组件测试，不是生产开关。
 
 ## 1. 启动输入：研究目标书
 
@@ -94,6 +101,9 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
 ## 4. 观测与人工干预（跑起来之后）
 
 - **状态卡**：`<work-root>/state/status_card.json`——每阶段边界原子发布的人可读快照（当前轮/问题/进度）。
+- **owner 活性**：`<work-root>/state/orchestrator_heartbeat.json`——原子发布 owner id/PID/状态/序号/时限；
+  console 会同时复核稳定 flock、lock metadata generation 与 heartbeat freshness。DB 有在途 cycle 但没有
+  `state=running` 的新鲜 owner 时显示 `interrupted`，绝不把耐久游标冒充当前进程正在执行。
 - **控制台指令**：通过 `interaction_message` 入站（连接器落库）→ 分类器保守三分类（可能改状态的一律当
   directive 并回显确认）。`pause`/`resume` 控制推进；`query` 走只读应答器（不改研究状态）。
 - **文件请求**：某阶段确实无法自取资料时会产 `resource_request` → 落 `interaction_request(pending)` →
@@ -196,10 +206,14 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 
 当前是**运维金丝雀态**，足以让真 Codex 端到端跑通并验证研究链路，但正式跑数百轮真研究前仍须硬化：
 
-- 同一 work-root 目前必须由运维保证只启动一个 `orchestrator.run`；SQLite 事务锁不能阻止两个进程在事务外
-  重复调用 Runner。进程级非阻塞 instance lease 属 CP11.3，在它完成前不得并行启动第二个 run 进程。
+- 同机同一 work-root 已由稳定非阻塞 flock、owner heartbeat、事务/Runner/manifest/connector fence 和
+  lease-last `System.close()` 机械排斥第二个 `orchestrator.run`；fork child 会立即丢弃继承的 lease FD，不能
+  解锁父 owner，也不会在父死亡后卡住 takeover。当前部署 work-root 位于共享 VEPFS；若生产会跨节点启动，
+  仍须在目标 VEPFS/挂载参数上做“两节点同时 acquire，仅一方成功”的部署验收，单机测试不能代替它。
 - 当前执行超时只可靠终止直接子进程，主动脱离/派生的孙进程可能继续存活；整组 session teardown 与 timeout
-  终态收敛属 CP11.3。完成前只能运行受信任、不会自行 daemonize 的 manifest 命令。
+  终态收敛属 CP11.3b。owner 被 SIGKILL 后，flock 虽可恢复，但旧的未受管执行子孙仍可能继续写 staging；完成
+  process-group/cgroup owner-death fence 前只能运行受信任、不会自行 daemonize 的 manifest 命令，不能把
+  instance lease 单独宣称为完整 crash-safe production recovery。
 - plan 的 `critical/budget_estimate` 权威落库/早退仍待 CP11.3；当前金丝雀运行不要依赖“非关键 target
   失败后继续”。动态 `goal_amend` 的专用路由、不可变升版、reasoning/status 按 cycle goal version 隔离与
   applicability 恢复已由 CP11.2b.3b 闭合。

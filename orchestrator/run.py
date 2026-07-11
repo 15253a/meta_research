@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -41,12 +42,14 @@ from .attack_stages import AttackStages
 from .compiler_sqlite import SqliteCompiler
 from .console import Console
 from .console_ingest import ConsoleInboxIngest
+from .console_spool import open_directory_path
 from .connector_ingest import ConnectorInboxIngest
 from .connectors import ConnectorConfigError, OutboundDelivery, load_connectors
 from .cost_ledger import CostLedger
 from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
+from .instance_lease import InstanceLease, InstanceLeaseError
 from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
                      InteractionNotifier, Outbox, ResearchNotifier,
@@ -106,6 +109,7 @@ def _validate_outbound_config(policy: Dict[str, Any], config: Optional[Dict[str,
                 "commit_poll", "load_inbound_retry_counts",
                 "store_inbound_retry_counts", "inbound_pending_status",
                 "validate_inbound_envelope", "record_inbound_fatal",
+                "bind_owner_guard",
                 "prepare_inbound", "start_inbound", "stop_inbound",
                 "inbound_stopped", "raise_if_inbound_failed",
             )
@@ -132,6 +136,53 @@ def _validate_outbound_config(policy: Dict[str, Any], config: Optional[Dict[str,
         raise ValueError("outbound batch_size 非法")
 
 
+class _GuardedRunner:
+    """Fence the last boundary before an injected Runner starts external work."""
+
+    def __init__(self, inner: Any, owner_guard: Callable[[], None]):
+        self.inner = inner
+        self.owner_guard = owner_guard
+
+    def run_task(self, *args, **kwargs):  # noqa: ANN002,ANN003,ANN201 - protocol passthrough
+        self.owner_guard()
+        return self.inner.run_task(*args, **kwargs)
+
+
+class _AssemblyCleanup:
+    """Retryable owner capability for a constructor that failed mid-assembly."""
+
+    def __init__(self, resource_closers: List[Callable[[], None]],
+                 lease: Optional[InstanceLease]):
+        self._resource_closers = list(resource_closers)
+        self._lease = lease
+        self._guard = threading.Lock()
+
+    @property
+    def closed(self) -> bool:
+        return not self._resource_closers and (
+            self._lease is None or self._lease.closed)
+
+    def close(self) -> Optional[BaseException]:
+        with self._guard:
+            first_error: Optional[BaseException] = None
+            remaining: List[Callable[[], None]] = []
+            for closer in reversed(self._resource_closers):
+                try:
+                    closer()
+                except BaseException as error:
+                    remaining.append(closer)
+                    if first_error is None:
+                        first_error = error
+            self._resource_closers = list(reversed(remaining))
+            if self._resource_closers:
+                return first_error or RuntimeError("system assembly resource close 未完成")
+            if self._lease is not None and not self._lease.closed:
+                lease_error = self._lease.close()
+                if first_error is None and lease_error is not None:
+                    first_error = lease_error
+            return first_error
+
+
 class System:
     """装配好的全系统句柄：run() 驱动到停机，last_stop_reason 说明为何停（观测）。"""
 
@@ -149,34 +200,46 @@ class System:
                  stop_inbound: Optional[Callable[[Any], Optional[BaseException]]] = None,
                  raise_inbound: Optional[Callable[[], None]] = None,
                  inbound_cleanup_pending: Optional[
-                     Callable[[Any, Optional[BaseException]], bool]] = None):
+                     Callable[[Any, Optional[BaseException]], bool]] = None,
+                 instance_lease: Optional[InstanceLease] = None,
+                 resource_closers: Optional[List[Callable[[], None]]] = None):
         self.advancer = advancer
         self.state = state
         self.daemon = daemon
         self.dual_mode = dual_mode
         self.work_root = work_root
-        self.sync_notifications = sync_notifications or (lambda: None)
-        self.sync_interactions = sync_interactions or (lambda: None)
-        self.interaction_pending = interaction_pending or (lambda: False)
-        self.sync_accepted_interactions = sync_accepted_interactions or self.sync_interactions
-        self.accepted_interaction_pending = (
-            accepted_interaction_pending or self.interaction_pending)
+        self._sync_notifications_cb = sync_notifications or (lambda: None)
+        self._sync_interactions_cb = sync_interactions or (lambda: None)
+        self._interaction_pending_cb = interaction_pending or (lambda: False)
+        self._sync_accepted_interactions_cb = (
+            sync_accepted_interactions or self._sync_interactions_cb)
+        self._accepted_interaction_pending_cb = (
+            accepted_interaction_pending or self._interaction_pending_cb)
         # A resident connector probe intentionally accepts only one event per
         # channel for fairness.  Once the owned listeners are closed, however,
         # their already-fsynced spool is a finite acceptance boundary and must
         # be consumed to EOF before process exit.  Keep this separate from the
         # console/general intake probe: an independently running console
         # producer must not be able to postpone shutdown forever.
-        self.sync_closed_inbound = sync_closed_inbound or (lambda: None)
-        self.closed_inbound_pending = closed_inbound_pending or (lambda: False)
-        self.sync_sideband = sync_sideband or (lambda: None)
+        self._sync_closed_inbound_cb = sync_closed_inbound or (lambda: None)
+        self._closed_inbound_pending_cb = closed_inbound_pending or (lambda: False)
+        self._sync_sideband_cb = sync_sideband or (lambda: None)
         self.outbound_delivery = outbound_delivery
-        self.start_inbound = start_inbound or (lambda: [])
-        self.stop_inbound = stop_inbound or (lambda _owned: None)
-        self.raise_inbound = raise_inbound or (lambda: None)
+        self._start_inbound_cb = start_inbound or (lambda: [])
+        self._stop_inbound_cb = stop_inbound or (lambda _owned: None)
+        self._raise_inbound_cb = raise_inbound or (lambda: None)
         self.inbound_cleanup_pending = (
             inbound_cleanup_pending
             or (lambda _owned, error: error is not None))
+        self.instance_lease = instance_lease
+        self._resource_closers = list(resource_closers or [])
+        self._lifecycle_guard = threading.RLock()
+        self._active_operations = 0
+        self._run_depth = 0
+        self._run_owner_thread: Optional[int] = None
+        self._closing = False
+        self._shutdown_started = False
+        self._closed = False
         self._pump_guard = threading.RLock()
         self._pump_thread: Optional[threading.Thread] = None
         self._pump_stop: Optional[threading.Event] = None
@@ -184,16 +247,133 @@ class System:
         self._pump_owns_delivery = False
         self._pump_inbound_owned: Any = []
         self._interaction_exit_drained = False
+        self._accepted_interactions_drained = False
         self._hard_stop_requested = False
+
+    def _assert_instance_owned(self) -> None:
+        with self._lifecycle_guard:
+            if self._closed:
+                raise RuntimeError("System 已关闭")
+            if self._closing:
+                raise RuntimeError("System 正在关闭")
+            if self._shutdown_started:
+                raise RuntimeError("System 已进入 shutdown，只允许重试 close")
+        if self.instance_lease is not None:
+            self.instance_lease.assert_owned()
+
+    @contextmanager
+    def _operation_scope(self):
+        self._assert_instance_owned()
+        with self._lifecycle_guard:
+            if self._closed:
+                raise RuntimeError("System 已关闭")
+            if self._closing:
+                raise RuntimeError("System 正在关闭")
+            if self._shutdown_started:
+                raise RuntimeError("System 已进入 shutdown，只允许重试 close")
+            self._active_operations += 1
+        try:
+            yield
+        finally:
+            with self._lifecycle_guard:
+                self._active_operations -= 1
+
+    def sync_notifications(self) -> None:
+        with self._operation_scope():
+            self._sync_notifications_cb()
+
+    def sync_interactions(self) -> None:
+        with self._operation_scope():
+            self._sync_interactions_cb()
+
+    def interaction_pending(self) -> bool:
+        with self._operation_scope():
+            return bool(self._interaction_pending_cb())
+
+    def sync_accepted_interactions(self) -> None:
+        with self._operation_scope():
+            self._sync_accepted_interactions_cb()
+
+    def accepted_interaction_pending(self) -> bool:
+        with self._operation_scope():
+            return bool(self._accepted_interaction_pending_cb())
+
+    def sync_closed_inbound(self) -> None:
+        with self._operation_scope():
+            self._sync_closed_inbound_cb()
+
+    def closed_inbound_pending(self) -> bool:
+        with self._operation_scope():
+            return bool(self._closed_inbound_pending_cb())
+
+    def sync_sideband(self) -> None:
+        with self._operation_scope():
+            self._sync_sideband_cb()
+
+    def raise_inbound(self) -> None:
+        with self._operation_scope():
+            self._raise_inbound_cb()
+
+    @contextmanager
+    def _run_scope(self, activity: str):
+        thread_id = threading.get_ident()
+        with self._operation_scope():
+            cleanup_error: Optional[BaseException] = None
+            with self._lifecycle_guard:
+                if self._run_depth and self._run_owner_thread != thread_id:
+                    raise RuntimeError("System 不允许并发 run；同一 owner 线程只能嵌套驱动")
+                if self._run_depth == 0:
+                    self._run_owner_thread = thread_id
+                self._run_depth += 1
+                outermost = self._run_depth == 1
+            primary: Optional[BaseException] = None
+            try:
+                if outermost and self.instance_lease is not None:
+                    self.instance_lease.set_state("running", activity=activity)
+                yield
+            except BaseException as error:
+                primary = error
+                raise
+            finally:
+                with self._lifecycle_guard:
+                    # Keep the run capability counted until the final heartbeat
+                    # transition completes.  Otherwise close() can set stopping
+                    # and release the lease between depth-- and set_state(ready).
+                    if (self._run_depth == 1 and not self._closing and not self._closed
+                            and self.instance_lease is not None):
+                        try:
+                            self.instance_lease.set_state(
+                                "ready", activity="resident-ready")
+                        except BaseException as error:
+                            cleanup_error = error
+                    self._run_depth -= 1
+                    if self._run_depth == 0:
+                        self._run_owner_thread = None
+                if cleanup_error is not None:
+                    if primary is None:
+                        raise cleanup_error
+                    add_note = getattr(primary, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "instance heartbeat 收尾失败: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}")
 
     def _start_interaction_pump(self, poll_interval_s: float) -> bool:
         """Start the one resident spool/completion pump; return whether this call owns it."""
+        self._assert_instance_owned()
         sideband_interval = max(0.05, min(0.25, float(poll_interval_s)))
         with self._pump_guard:
             # A dead-but-uncollected thread still owns its error and delivery
             # lifecycle.  Nested run_forever→run must not overwrite that
             # evidence by silently starting a replacement.
             if self._pump_thread is not None:
+                legitimate_nested = (
+                    self._run_depth == 2
+                    and self._run_owner_thread == threading.get_ident())
+                if (not legitimate_nested or self._pump_stop is None or self._pump_stop.is_set()
+                        or not self._pump_thread.is_alive()):
+                    raise RuntimeError(
+                        "前次 interaction pump 正在/等待清理；须先重试 System.close")
                 return False
             if self._pump_inbound_owned:
                 raise RuntimeError("前次 connector inbound listener 尚未完成清理")
@@ -201,12 +381,12 @@ class System:
             self._pump_stop = stop
             self._pump_error = None
             try:
-                inbound_owned = self.start_inbound()
+                inbound_owned = self._start_inbound_cb()
             except BaseException as primary:
                 inbound_owned = getattr(primary, "inbound_owned", [])
                 cleanup_error = None
                 if inbound_owned:
-                    cleanup_error = self.stop_inbound(inbound_owned)
+                    cleanup_error = self._stop_inbound_cb(inbound_owned)
                 pending_cleanup = self.inbound_cleanup_pending(
                     inbound_owned, cleanup_error)
                 self._pump_inbound_owned = inbound_owned if pending_cleanup else []
@@ -224,12 +404,12 @@ class System:
                 if self.outbound_delivery is not None:
                     delivery_owned = self.outbound_delivery.start(sideband_interval)
             except BaseException as primary:
-                cleanup_error = self.stop_inbound(inbound_owned)
+                cleanup_error = self._stop_inbound_cb(inbound_owned)
                 pending_cleanup = self.inbound_cleanup_pending(
                     inbound_owned, cleanup_error)
                 retry_error = None
                 if pending_cleanup:
-                    retry_error = self.stop_inbound(inbound_owned)
+                    retry_error = self._stop_inbound_cb(inbound_owned)
                     pending_cleanup = self.inbound_cleanup_pending(
                         inbound_owned, retry_error)
                 self._pump_inbound_owned = inbound_owned if pending_cleanup else []
@@ -249,11 +429,12 @@ class System:
             def pump() -> None:
                 while not stop.is_set():
                     try:
-                        self.sync_interactions()
+                        self._assert_instance_owned()
+                        self._sync_interactions_cb()
                         # Query completion may happen during a multi-hour research provider.  Derive and
                         # deliver its reply here instead of waiting for the next research stage boundary.
-                        self.sync_sideband()
-                        self.raise_inbound()
+                        self._sync_sideband_cb()
+                        self._raise_inbound_cb()
                         if self.outbound_delivery is not None:
                             self.outbound_delivery.raise_if_failed()
                     except sqlite3.OperationalError:
@@ -277,12 +458,12 @@ class System:
                 self._pump_stop = None
                 if delivery_owned:
                     self.outbound_delivery.stop()
-                cleanup_error = self.stop_inbound(inbound_owned)
+                cleanup_error = self._stop_inbound_cb(inbound_owned)
                 pending_cleanup = self.inbound_cleanup_pending(
                     inbound_owned, cleanup_error)
                 retry_error = None
                 if pending_cleanup:
-                    retry_error = self.stop_inbound(inbound_owned)
+                    retry_error = self._stop_inbound_cb(inbound_owned)
                     pending_cleanup = self.inbound_cleanup_pending(
                         inbound_owned, retry_error)
                 self._pump_inbound_owned = inbound_owned if pending_cleanup else []
@@ -302,6 +483,7 @@ class System:
 
     def _raise_resident_failure(self) -> None:
         """Surface a dead sideband/transport worker at the next safe supervisor poll."""
+        self._assert_instance_owned()
         with self._pump_guard:
             error = self._pump_error
         if error is not None:
@@ -310,31 +492,40 @@ class System:
             self.outbound_delivery.raise_if_failed()
         self.raise_inbound()
 
-    def _stop_interaction_pump(self) -> Optional[BaseException]:
+    def _interaction_pump_alive(self) -> bool:
+        with self._pump_guard:
+            thread = self._pump_thread
+            return bool(thread is not None and thread.is_alive())
+
+    def _stop_interaction_pump(self, *,
+                               join_timeout_s: Optional[float] = None) -> Optional[BaseException]:
         with self._pump_guard:
             thread, stop = self._pump_thread, self._pump_stop
             inbound_owned = self._pump_inbound_owned
             if thread is None:
                 if not inbound_owned:
                     return None
-                cleanup_error = self.stop_inbound(inbound_owned)
+                cleanup_error = self._stop_inbound_cb(inbound_owned)
                 if not self.inbound_cleanup_pending(inbound_owned, cleanup_error):
                     self._pump_inbound_owned = []
                 return cleanup_error
         # Close intake and wait for bounded in-flight handlers while the DB
         # pump is still alive; then stop the pump.  This closes the race where
         # a request could append+ACK after the one final drain probe.
-        inbound_error = self.stop_inbound(inbound_owned)
+        inbound_error = self._stop_inbound_cb(inbound_owned)
         if stop is not None:
             stop.set()
-        thread.join()
+        thread.join(timeout=join_timeout_s)
+        if thread.is_alive():
+            return TimeoutError(
+                "interaction pump 未在 System.close deadline 内停止；保留 instance lease 供重试")
         delivery_error = None
         if self._pump_owns_delivery and self.outbound_delivery is not None:
             delivery_error = self.outbound_delivery.stop()
         pending_inbound_cleanup = self.inbound_cleanup_pending(
             inbound_owned, inbound_error)
         if inbound_error is not None and pending_inbound_cleanup:
-            retry_error = self.stop_inbound(inbound_owned)
+            retry_error = self._stop_inbound_cb(inbound_owned)
             pending_inbound_cleanup = self.inbound_cleanup_pending(
                 inbound_owned, retry_error)
             if retry_error is not None:
@@ -363,6 +554,10 @@ class System:
 
     def flush_outbound(self) -> Dict[str, Any]:
         """Attempt one bounded priority batch, then report every item left durable."""
+        with self._operation_scope():
+            return self._flush_outbound_owned()
+
+    def _flush_outbound_owned(self) -> Dict[str, Any]:
         if self.outbound_delivery is not None:
             delivered = self.outbound_delivery.tick()
             status = self.outbound_delivery.pending_status()
@@ -390,6 +585,10 @@ class System:
                 time.sleep(0.02 * (attempt + 1))
 
     def run(self, max_cycles: int) -> List[str]:
+        with self._run_scope("run-once"):
+            return self._run_owned(max_cycles)
+
+    def _run_owned(self, max_cycles: int) -> List[str]:
         """驱动 run_cycles 到停机（terminate / τ 自终止 / 阻断 / max_cycles）。返回本次推进的 cycle_id。
         reasoning-only 下模式 A≡B（每轮一阶段）——故直接 run_cycles；attack 多阶段的 A/B 分驱 = CP7.4。"""
         pump_owner = self._start_interaction_pump(0.05)
@@ -400,7 +599,8 @@ class System:
             result = self.advancer.run_cycles(max_cycles)
         except BaseException as primary:
             try:
-                pump_error = self._stop_interaction_pump() if pump_owner else None
+                pump_error = self._stop_interaction_pump(
+                    join_timeout_s=5.0) if pump_owner else None
             except KeyboardInterrupt:
                 self._hard_stop_requested = True
                 raise
@@ -408,6 +608,8 @@ class System:
                 add_note = getattr(primary, "add_note", None)
                 if callable(add_note):
                     add_note(f"interaction pump 失败: {type(pump_error).__name__}: {pump_error}")
+            if self._interaction_pump_alive():
+                raise
             # provider 可在抛 StageBlockedOnResources 前刚创建请求；异常退出也尽力补扫。但 outbox 是 DB
             # 派生物，扫描失败绝不能覆盖研究主链的 primary（否则真正损坏因会被 finally 异常遮蔽）。
             try:
@@ -443,8 +645,11 @@ class System:
                 else:
                     self._interaction_exit_drained = True
             raise
-        pump_error = self._stop_interaction_pump() if pump_owner else None
+        pump_error = self._stop_interaction_pump(
+            join_timeout_s=5.0) if pump_owner else None
         if pump_error is not None:
+            if self._interaction_pump_alive():
+                raise pump_error
             try:
                 self.drain_interactions(
                     poll_interval_s=0.05, accept_final_spool=False)
@@ -476,6 +681,13 @@ class System:
     def drain_interactions(self, *, poll_interval_s: float = 0.1,
                            accept_final_spool: bool = True) -> None:
         """Accept the finite closed-listener boundary, then terminalize its work."""
+        with self._operation_scope():
+            self._drain_interactions_owned(
+                poll_interval_s=poll_interval_s,
+                accept_final_spool=accept_final_spool)
+
+    def _drain_interactions_owned(self, *, poll_interval_s: float = 0.1,
+                                  accept_final_spool: bool = True) -> None:
         if (isinstance(poll_interval_s, bool) or not isinstance(poll_interval_s, (int, float))
                 or not math.isfinite(float(poll_interval_s)) or poll_interval_s < 0.01):
             raise ValueError("poll_interval_s 须为不小于 0.01 的有限秒数（防交互排空热自旋）")
@@ -516,6 +728,14 @@ class System:
     def run_forever(self, max_cycles: int, *, poll_interval_s: float = 1.0,
                     linger_after_terminal: bool = True,
                     stop_event: Optional[threading.Event] = None) -> List[str]:
+        with self._run_scope("resident-run"):
+            return self._run_forever_owned(
+                max_cycles, poll_interval_s=poll_interval_s,
+                linger_after_terminal=linger_after_terminal, stop_event=stop_event)
+
+    def _run_forever_owned(self, max_cycles: int, *, poll_interval_s: float = 1.0,
+                           linger_after_terminal: bool = True,
+                           stop_event: Optional[threading.Event] = None) -> List[str]:
         """默认 CLI 常驻闭环：pause/file-request 阻断时保留唯一写进程并周期重跑 precheck。
 
         每次 poll 都会 ingest spool、消费可执行动作并扫描通知/reminder；解除阻断后从 DB 游标续同一阶段。
@@ -569,7 +789,7 @@ class System:
             pump_error = None
             if pump_owner:
                 try:
-                    pump_error = self._stop_interaction_pump()
+                    pump_error = self._stop_interaction_pump(join_timeout_s=5.0)
                 except KeyboardInterrupt:
                     self._hard_stop_requested = True
                     raise
@@ -578,6 +798,8 @@ class System:
                     if callable(add_note):
                         add_note(
                             f"interaction pump 失败: {type(pump_error).__name__}: {pump_error}")
+            if self._interaction_pump_alive():
+                raise
             try:
                 self.drain_interactions(
                     poll_interval_s=float(poll_interval_s),
@@ -596,11 +818,13 @@ class System:
             raise
         if pump_owner:
             try:
-                pump_error = self._stop_interaction_pump()
+                pump_error = self._stop_interaction_pump(join_timeout_s=5.0)
             except KeyboardInterrupt:
                 self._hard_stop_requested = True
                 raise
             if pump_error is not None:
+                if self._interaction_pump_alive():
+                    raise pump_error
                 try:
                     self.drain_interactions(
                         poll_interval_s=float(poll_interval_s), accept_final_spool=False)
@@ -626,18 +850,154 @@ class System:
         self.flush_outbound()
         return completed
 
+    def close(self) -> Optional[BaseException]:
+        """Release every shared capability, with the instance flock strictly last.
+
+        A live listener/pump/delivery worker keeps the lease held and makes the
+        method retryable.  Historical worker failure is still returned for
+        diagnosis, but it does not prevent release after all capabilities are
+        mechanically gone; callers can distinguish that case via
+        ``instance_lease.closed``.
+        """
+        with self._lifecycle_guard:
+            if self._closed:
+                return None
+            if self._closing:
+                return RuntimeError("System close 已在另一线程进行")
+            if self._active_operations or self._run_depth:
+                return RuntimeError("System 仍有 active operation，拒绝释放 instance lease")
+            self._shutdown_started = True
+            self._closing = True
+        first_error: Optional[BaseException] = None
+        try:
+            if self.instance_lease is not None and not self.instance_lease.closing:
+                try:
+                    self.instance_lease.set_state("stopping", activity="system-close")
+                except BaseException as error:
+                    first_error = error
+
+            try:
+                pump_error = self._stop_interaction_pump(join_timeout_s=5.0)
+            except BaseException as error:
+                pump_error = error
+            if first_error is None and pump_error is not None:
+                first_error = pump_error
+
+            with self._pump_guard:
+                pump_thread = self._pump_thread
+            if pump_thread is not None and pump_thread.is_alive():
+                return first_error or RuntimeError(
+                    "System interaction pump 尚未停止；instance lease 保留供重试")
+
+            # A timeout from the pump's first delivery stop must retain/retry
+            # the actual worker capability before the global owner lock moves.
+            if self.outbound_delivery is not None:
+                try:
+                    running = bool(self.outbound_delivery.worker_running())
+                except BaseException as error:
+                    running = True
+                    if first_error is None:
+                        first_error = error
+                if running:
+                    try:
+                        delivery_error = self.outbound_delivery.stop()
+                    except BaseException as error:
+                        delivery_error = error
+                    if first_error is None and delivery_error is not None:
+                        first_error = delivery_error
+
+            with self._pump_guard:
+                pump_thread = self._pump_thread
+                inbound_pending = bool(self._pump_inbound_owned)
+            delivery_running = False
+            if self.outbound_delivery is not None:
+                try:
+                    delivery_running = bool(self.outbound_delivery.worker_running())
+                except BaseException:
+                    delivery_running = True
+            if ((pump_thread is not None and pump_thread.is_alive())
+                    or inbound_pending or delivery_running):
+                return first_error or RuntimeError(
+                    "System shared worker 尚未停止；instance lease 保留供重试")
+
+            if not self._accepted_interactions_drained:
+                # Public wrappers deliberately reject once shutdown begins.
+                # These two private callbacks are the shutdown-only convergence
+                # capability: mediator.poll() only terminalizes work already
+                # accepted before listener/pump stop, and the predicate makes
+                # every close retry mechanically re-enter that exact step.
+                try:
+                    self._sync_accepted_interactions_cb()
+                    accepted_pending = bool(self._accepted_interaction_pending_cb())
+                except BaseException as error:
+                    accepted_pending = True
+                    if first_error is None:
+                        first_error = error
+                if accepted_pending:
+                    return first_error or RuntimeError(
+                        "System 仍有 accepted interaction/query capability；instance lease 保留供重试")
+                self._accepted_interactions_drained = True
+
+            remaining: List[Callable[[], None]] = []
+            for closer in reversed(self._resource_closers):
+                try:
+                    closer()
+                except BaseException as error:
+                    remaining.append(closer)
+                    if first_error is None:
+                        first_error = error
+            self._resource_closers = list(reversed(remaining))
+            if self._resource_closers:
+                return first_error or RuntimeError("System DB/resource close 未完成")
+
+            if self.instance_lease is not None:
+                lease_error = self.instance_lease.close()
+                if first_error is None and lease_error is not None:
+                    first_error = lease_error
+                if not self.instance_lease.closed:
+                    return first_error or RuntimeError("instance lease 尚未释放")
+            with self._lifecycle_guard:
+                self._closed = True
+            return first_error
+        finally:
+            with self._lifecycle_guard:
+                self._closing = False
+
+    def __enter__(self) -> "System":
+        self._assert_instance_owned()
+        return self
+
+    def __exit__(self, exc_type, _exc, _tb) -> None:  # noqa: ANN001
+        error = self.close()
+        if error is None:
+            return
+        if exc_type is None:
+            raise error
+        add_note = getattr(_exc, "add_note", None)
+        if callable(add_note):
+            add_note(f"System.close 失败: {type(error).__name__}: {error}")
+        if not self._closed:
+            try:
+                _exc.orchestrator_cleanup = self
+            except BaseException:
+                pass
+
     @property
     def last_stop_reason(self) -> Optional[str]:
         return self.advancer.last_stop_reason
 
 
 def build_system(system_root: str, work_root: str, *, runner_factory: Optional[Callable] = None,
-                 attack=True, outbound_config: Optional[Dict[str, Any]] = None) -> System:
+                 attack=True, outbound_config: Optional[Dict[str, Any]] = None,
+                 enforce_instance_lease: bool = True,
+                 heartbeat_interval_s: float = 1.0) -> System:
     """装配全系统。system_root=含 input/goal_brief.md · policies/ · prompts/ · schemas/ 的仓库根；
     work_root=运行产物根（research.sqlite / cycles / state 落此）。runner_factory=注入式 Runner 工厂
     （默认真 CodexRunner；测试传 mock）。attack：True=全装（默认）；False/None=退化 reasoning-only
-    （诊断用）；AttackStages 实例=注入自定装配。``outbound_config`` 来自受限 connector profile；None
-    仅用于单测/显式 ``--no-outbound``，绝不伪装成已投递。"""
+    （诊断用）；AttackStages 实例只允许配合 ``enforce_instance_lease=False`` 做隔离测试，生产须由本函数
+    在同一 DB/work capability 下装配。``outbound_config`` 来自受限 connector profile；None
+    仅用于单测/显式 ``--no-outbound``，绝不伪装成已投递。生产默认在任何 work/DB 副作用前取得
+    process-wide instance lease；``enforce_instance_lease=False`` 只供隔离组件单测。"""
     root = Path(system_root)
     work = Path(work_root)
     policy = yaml.safe_load((root / "policies" / "policy.yaml").read_text(encoding="utf-8"))
@@ -646,21 +1006,100 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     _reject_nonfinite_policy_numbers(policy)         # JSON Schema/Python 边界：显式拒 NaN/±Inf
     CostLedger.validate_policy(policy)               # 成本边界（float 溢出/布尔值等）也在创建 work/DB 前验完
     _validate_outbound_config(policy, outbound_config)
-    work.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(work, 0o700)                  # query service UID cannot traverse to DB/raw artifacts
+    if not isinstance(enforce_instance_lease, bool):
+        raise ValueError("enforce_instance_lease 须为 bool")
+    if enforce_instance_lease and isinstance(attack, AttackStages):
+        raise ValueError(
+            "生产 owner lease 下拒绝注入现成 AttackStages（其 DB/work capability 无法归属本次 lease）；"
+            "请用 attack=True 由 build_system 装配")
+    lease: Optional[InstanceLease] = None
+    resource_closers: List[Callable[[], None]] = []
+    try:
+        if enforce_instance_lease:
+            lease = InstanceLease.acquire(
+                work, heartbeat_interval_s=heartbeat_interval_s)
+        else:
+            work.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(work, 0o700)
+        return _assemble_system(
+            root=root, work=work, policy=policy, schemas=schemas,
+            runner_factory=runner_factory, attack=attack,
+            outbound_config=outbound_config, instance_lease=lease,
+            resource_closers=resource_closers)
+    except BaseException as primary:
+        cleanup = _AssemblyCleanup(resource_closers, lease)
+        cleanup_error = cleanup.close()
+        cleanup_errors = [cleanup_error] if cleanup_error is not None else []
+        if not cleanup.closed:
+            # Never free the global owner while a failed constructor still has
+            # a live DB/resource capability.  Expose a retry handle on the
+            # original exception; ignoring it remains fail-closed until process
+            # exit instead of permitting an overlapping replacement owner.
+            try:
+                primary.orchestrator_cleanup = cleanup
+            except BaseException as attach_error:
+                cleanup_errors.append(attach_error)
+            cleanup_errors.append(RuntimeError(
+                "system assembly cleanup 未完成；instance lease 已保留，"
+                "可调用 error.orchestrator_cleanup.close() 重试"))
+        add_note = getattr(primary, "add_note", None)
+        if callable(add_note):
+            for error in cleanup_errors:
+                add_note(
+                    "system assembly cleanup 失败: "
+                    f"{type(error).__name__}: {error}")
+        raise
+
+
+def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
+                     schemas: SchemaSet, runner_factory: Optional[Callable],
+                     attack: Any, outbound_config: Optional[Dict[str, Any]],
+                     instance_lease: Optional[InstanceLease],
+                     resource_closers: List[Callable[[], None]]) -> System:
+    """Assemble under an already-held owner lease; caller owns rollback."""
+    owner_guard = instance_lease.assert_owned if instance_lease is not None else (lambda: None)
+
+    expected_work_fd = open_directory_path(work, label="system work_root")
+    try:
+        expected_work_info = os.fstat(expected_work_fd)
+    finally:
+        os.close(expected_work_fd)
+
+    def track_connection(conn):  # noqa: ANN001, ANN202 - sqlite variants share close()
+        resource_closers.append(conn.close)
+        return conn
+
+    owner_guard()
     if outbound_config is not None:
         # Validate existing inbound spool/profile authority before opening or
         # creating SQLite.  A binding/config drift must not run research first
         # and discover the control plane is unusable later.
         for connector in outbound_config["channels"].values():
+            if bool(getattr(connector, "has_inbound", False)):
+                spool_root = getattr(connector.inbound_spool, "work_root", None)
+                if spool_root is None:
+                    raise ValueError("durable inbound spool 缺 work_root identity")
+                spool_fd = open_directory_path(
+                    spool_root, label="durable inbound connector work_root")
+                try:
+                    spool_info = os.fstat(spool_fd)
+                finally:
+                    os.close(spool_fd)
+                if ((spool_info.st_dev, spool_info.st_ino)
+                        != (expected_work_info.st_dev, expected_work_info.st_ino)):
+                    raise ValueError(
+                        "durable inbound connector work_root 与本次 instance lease 不一致")
+                connector.bind_owner_guard(owner_guard)
+            owner_guard()
             prepare = getattr(connector, "prepare_inbound", None)
             if callable(prepare):
                 prepare()
 
     db_path = str(work / "research.sqlite")
-    writer_conn = _db.connect(db_path)
+    writer_conn = track_connection(_db.connect(db_path))
     os.chmod(db_path, 0o600)
-    daemon = WriteDaemon(writer_conn)                      # 新库建 / 既有库续（checksum 三重锁）
+    daemon = WriteDaemon(
+        writer_conn, owner_guard=owner_guard)              # 新库建 / 既有库续（checksum 三重锁）
     state = SQLiteStateStore(daemon, policy)
     if daemon.query_one("SELECT 1 FROM goal LIMIT 1") is None:
         # **仅首次建 goal 才解析 brief**（外审 SHOULD）：重启时 DB goal 权威——若无条件解析，缺失/畸形
@@ -671,8 +1110,10 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     # compiler/publisher 各用**只读连接**（外审 BLOCKER：单写纪律——入口层就 enforce 只读边界，
     # 防 compiler 侧误写绕过 WriteDaemon/账本/authorizer）。open_responder_read_conn = mode=ro+全写拒
     # authorizer（放行 SELECT/TRANSACTION，render/publish 的 BEGIN…COMMIT 读快照可跑）。
-    compiler = SqliteCompiler(open_responder_read_conn(db_path), policy)
-    publisher = SqliteStatusPublisher(open_responder_read_conn(db_path), policy=policy,
+    compiler_conn = track_connection(open_responder_read_conn(db_path))
+    publisher_conn = track_connection(open_responder_read_conn(db_path))
+    compiler = SqliteCompiler(compiler_conn, policy)
+    publisher = SqliteStatusPublisher(publisher_conn, policy=policy,
                                       out_path=str(work / "state" / "status_card.json"))
     stop = StopController(daemon, policy)
     console = Console(daemon, policy=policy)
@@ -682,9 +1123,15 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     file_requests = FileRequestService(daemon, schemas, policy, input_root=str(work / "input"))
     system_prompt = (root / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
     skills = {s: (root / "prompts" / "skills" / s / "SKILL.md").read_text(encoding="utf-8") for s in _STAGES}
-    rf = runner_factory or (lambda transcripts_dir, purpose_tag:
-                            CodexRunner(transcripts_dir=transcripts_dir, purpose_tag=purpose_tag,
-                                        tool_free=purpose_tag == "interaction-query"))
+    base_rf = runner_factory or (lambda transcripts_dir, purpose_tag:
+                                 CodexRunner(transcripts_dir=transcripts_dir,
+                                             purpose_tag=purpose_tag,
+                                             tool_free=purpose_tag == "interaction-query"))
+
+    def rf(transcripts_dir, purpose_tag):  # noqa: ANN001, ANN202 - injection boundary
+        owner_guard()
+        runner = base_rf(transcripts_dir, purpose_tag)
+        return _GuardedRunner(runner, owner_guard)
     cost_ledger = CostLedger(daemon, policy)     # 所有真 LLM 调用共用同一预算/账本投影
     # 步⑨ CP9.3 入站闭环：控制台命令经 console_server 落 <work>/state/console_inbox.jsonl（连接器缓冲）→
     # precheck 边界 ingest 进权威入站链（handle_inbound 落 directive/note；query 经 mediator 应答）。
@@ -746,6 +1193,7 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
             retry_initial_s=outbound_config["retry_initial_s"],
             retry_max_s=outbound_config["retry_max_s"],
             batch_size=outbound_config["batch_size"],
+            owner_guard=owner_guard,
         )
     notification_lock = threading.RLock()
     sideband_notification_lock = threading.Lock()
@@ -794,13 +1242,17 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
                              file_request_bridge=file_request_bridge, cost_ledger=cost_ledger)
 
     attack_stages = attack if isinstance(attack, AttackStages) else None
+    if attack_stages is not None:
+        attack_stages.bind_owner_guard(owner_guard)
     if attack is True:
         # attack 全家（步⑧ CP8.4）：正式 gate 通道 + manifest 驱动真执行 + 真 Codex 双评审。
         # 判据读连接各司其职：gate 家族走 open_gate_read_conn（authorizer 拒观测 9 表——判据隔离）；
         # parser_suspect 须读 execution_observation → 走 open_responder_read_conn（mode=ro 全写拒，可读全表）。
-        pool_gate = PoolGate(daemon, open_gate_read_conn(db_path))
-        obs_conn = open_responder_read_conn(db_path)
-        close_gate = SqliteGate(daemon, open_gate_read_conn(db_path), schemas,
+        pool_conn = track_connection(open_gate_read_conn(db_path))
+        obs_conn = track_connection(open_responder_read_conn(db_path))
+        close_conn = track_connection(open_gate_read_conn(db_path))
+        pool_gate = PoolGate(daemon, pool_conn)
+        close_gate = SqliteGate(daemon, close_conn, schemas,
                                 parser_suspect=lambda aid: OP.suspect_for_attempt(
                                     obs_conn, aid, policy["observation"]))
         judge = JudgeProvider(
@@ -811,10 +1263,14 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
             state=state, compiler=compiler, pool_gate=pool_gate, close_gate=close_gate,
             providers={"idea": provider.idea, "plan": provider.plan, "bundle": provider.bundle,
                        "judge": judge, "reasoning": provider.reasoning},
-            obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy)
+            obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy,
+            owner_guard=owner_guard)
 
     advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
                               status_publisher=publisher, precheck=precheck, stop_controller=stop)
+    owner_guard()
+    if instance_lease is not None:
+        instance_lease.set_state("ready", activity="assembly-complete")
     return System(advancer=advancer, state=state, daemon=daemon,
                   dual_mode=policy.get("session", {}).get("dual_mode", "A"), work_root=work,
                   sync_notifications=sync_notifications,
@@ -829,7 +1285,9 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
                   start_inbound=connector_inbox.start,
                   stop_inbound=connector_inbox.stop,
                   raise_inbound=connector_inbox.raise_if_failed,
-                  inbound_cleanup_pending=lambda owned, _error: bool(owned))
+                  inbound_cleanup_pending=lambda owned, _error: bool(owned),
+                  instance_lease=instance_lease,
+                  resource_closers=resource_closers)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -859,63 +1317,84 @@ def main(argv: Optional[List[str]] = None) -> int:
         except (ConnectorConfigError, OSError) as error:
             print(f"[run] connector 配置失败：{error}；离线运行须显式加 --no-outbound", file=sys.stderr)
             return 2
-    system = build_system(args.system_root, args.work_root, outbound_config=outbound_config)
     try:
-        if args.once:
-            ids = system.run(args.max_cycles)
-        else:
-            ids = system.run_forever(args.max_cycles, poll_interval_s=args.poll_interval_s)
-    except KeyboardInterrupt:
-        shutdown_errors = []
-        hard_stop = bool(getattr(system, "_hard_stop_requested", False))
-        already_drained = bool(getattr(system, "_interaction_exit_drained", False))
-
-        def hard_stop_now() -> None:
-            nonlocal hard_stop
-            hard_stop = True
-            try:
-                terminate_active_process_groups()
-            except BaseException as e:
-                shutdown_errors.append(f"后台 query 进程组终止失败：{e}")
-
-        if hard_stop:
-            hard_stop_now()
-        if not hard_stop and not already_drained:
-            try:
-                # First SIGINT drains accepted work.  A SIGINT during that drain is not swallowed by
-                # run_forever: it sets _hard_stop_requested and reaches this handler as the escape hatch.
-                drain = getattr(system, "drain_interactions", None)
-                if callable(drain):
-                    drain(poll_interval_s=args.poll_interval_s)
-            except KeyboardInterrupt:
-                hard_stop_now()
-            except Exception as e:
-                shutdown_errors.append(f"interaction 排空失败：{e}")
-        if not hard_stop:
-            try:
-                system.sync_notifications()
-                flush = getattr(system, "flush_outbound", None)
-                if callable(flush):
-                    flush()
-            except KeyboardInterrupt:
-                hard_stop_now()
-            except Exception as e:
-                shutdown_errors.append(f"通知扫描失败：{e}")
-        if shutdown_errors:                  # 退出失败也不把 Ctrl-C 变 traceback
-            print("[run] Ctrl-C 退出前" + "；".join(shutdown_errors))
-        print("[run] 收到 Ctrl-C，已立即硬停" if hard_stop else "[run] 收到 Ctrl-C，已停止单写循环")
-        return 130
-    except NotImplementedError as e:
-        # 干净报（非裸 traceback）：具体缺哪个组件由异常文本自述（如 attack 退化装配缺 AttackStages、
-        # 在途 import 物化轮缺 ImportWorker[CP8.6]）——文案不预设单一来源（codex NIT）
-        print(f"[run] 停：续本轮需尚未装配的组件——{e}")
+        system = build_system(args.system_root, args.work_root, outbound_config=outbound_config)
+    except InstanceLeaseError as error:
+        print(f"[run] instance owner 取得失败：{error}", file=sys.stderr)
         return 2
-    # 停因优先级（外审 SHOULD）：τ 自终止 > precheck 阻断（pause/文件请求）> 正常收尾——阻断对运维判断
-    # 关键，不能被 idle 掩盖
-    reason = (system.last_stop_reason or system.advancer.last_block_reason
-              or ("prior-terminate/idle" if not ids else "max_cycles/terminate"))
-    print(f"[run] dual_mode={system.dual_mode} 推进 {len(ids)} 轮：{ids}；停因={reason}")
-    return 0
+    ids: List[str] = []
+    exit_code = 0
+    try:
+        try:
+            if args.once:
+                ids = system.run(args.max_cycles)
+            else:
+                ids = system.run_forever(args.max_cycles, poll_interval_s=args.poll_interval_s)
+        except KeyboardInterrupt:
+            shutdown_errors = []
+            hard_stop = bool(getattr(system, "_hard_stop_requested", False))
+            already_drained = bool(getattr(system, "_interaction_exit_drained", False))
+
+            def hard_stop_now() -> None:
+                nonlocal hard_stop
+                hard_stop = True
+                try:
+                    terminate_active_process_groups()
+                except BaseException as e:
+                    shutdown_errors.append(f"后台 query 进程组终止失败：{e}")
+
+            if hard_stop:
+                hard_stop_now()
+            if not hard_stop and not already_drained:
+                try:
+                    # First SIGINT drains accepted work.  A SIGINT during that drain is not swallowed by
+                    # run_forever: it sets _hard_stop_requested and reaches this handler as the escape hatch.
+                    drain = getattr(system, "drain_interactions", None)
+                    if callable(drain):
+                        drain(poll_interval_s=args.poll_interval_s)
+                except KeyboardInterrupt:
+                    hard_stop_now()
+                except Exception as e:
+                    shutdown_errors.append(f"interaction 排空失败：{e}")
+            if not hard_stop:
+                try:
+                    system.sync_notifications()
+                    flush = getattr(system, "flush_outbound", None)
+                    if callable(flush):
+                        flush()
+                except KeyboardInterrupt:
+                    hard_stop_now()
+                except Exception as e:
+                    shutdown_errors.append(f"通知扫描失败：{e}")
+            if shutdown_errors:                  # 退出失败也不把 Ctrl-C 变 traceback
+                print("[run] Ctrl-C 退出前" + "；".join(shutdown_errors))
+            print("[run] 收到 Ctrl-C，已立即硬停" if hard_stop else "[run] 收到 Ctrl-C，已停止单写循环")
+            exit_code = 130
+        except NotImplementedError as e:
+            # 干净报（非裸 traceback）：具体缺哪个组件由异常文本自述（如 attack 退化装配缺 AttackStages、
+            # 在途 import 物化轮缺 ImportWorker[CP8.6]）——文案不预设单一来源（codex NIT）
+            print(f"[run] 停：续本轮需尚未装配的组件——{e}")
+            exit_code = 2
+        else:
+            # 停因优先级（外审 SHOULD）：τ 自终止 > precheck 阻断（pause/文件请求）> 正常收尾——阻断对运维判断
+            # 关键，不能被 idle 掩盖
+            reason = (system.last_stop_reason or system.advancer.last_block_reason
+                      or ("prior-terminate/idle" if not ids else "max_cycles/terminate"))
+            print(f"[run] dual_mode={system.dual_mode} 推进 {len(ids)} 轮：{ids}；停因={reason}")
+            exit_code = 0
+    finally:
+        try:
+            close_error = system.close()
+        except BaseException as error:
+            close_error = error
+        if close_error is not None:
+            print(
+                "[run] System 关闭未完全成功，instance lease 可能仍被保留："
+                f"{type(close_error).__name__}: {close_error}",
+                file=sys.stderr)
+            if exit_code == 0:
+                exit_code = 2
+    return exit_code
 
 
 if __name__ == "__main__":

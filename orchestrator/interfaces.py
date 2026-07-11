@@ -14,7 +14,7 @@ resource_request.json，§3.1.1），故 Artifact 以「文件名 → JSON 对�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Protocol, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Protocol, Union
 
 # ---------------------------------------------------------------------------
 # 基础类型（对齐《第一部分》术语锁定 §0.2 / route 七形态 §2.3）
@@ -321,6 +321,8 @@ class DurableInboundConnector(Connector, Protocol):
     def validate_inbound_envelope(self, value: Dict[str, Any]) -> Dict[str, Any]: ...
 
     def record_inbound_fatal(self, error: BaseException) -> None: ...
+
+    def bind_owner_guard(self, owner_guard: Callable[[], None]) -> None: ...
 
     def prepare_inbound(self) -> None: ...
 
