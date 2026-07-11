@@ -73,6 +73,8 @@ class ResponderReply:
     text: str
     usage: Optional["CallUsage"] = None
     transcript_ref: Optional[str] = None
+    execution_receipt_ref: Optional[str] = None
+    provider_receipt_ref: Optional[str] = None
 
 
 @dataclass
@@ -89,6 +91,7 @@ class Artifact:
     usage: Optional["CallUsage"] = None
     transcript_ref: Optional[str] = None
     execution_receipt_ref: Optional[str] = None
+    provider_receipt_ref: Optional[str] = None
 
 
 @dataclass

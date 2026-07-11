@@ -364,7 +364,8 @@ class StageProvider:
             self.cost_ledger.finish_call(
                 runner_call_id=runner_call_id, usage=usage, status=status,
                 failure_kind=failure_kind,
-                transcript_ref=transcript_ref or str(heartbeat.path))
+                transcript_ref=transcript_ref or str(heartbeat.path),
+                execution_receipt_ref=execution_receipt_ref)
         except (BudgetExhausted, CostAccountingFailed):
             raise                               # ledger/global_stop 已提交；立即阻断，不当作写账故障吞掉
         except Exception:                      # noqa: BLE001 —— 预算开启时必须 fail-closed
@@ -562,7 +563,8 @@ class PlanReviewProvider:
         self.cost_ledger.finish_call(
             runner_call_id=runner_call_id, usage=usage, status="failed",
             failure_kind=failure_kind,
-            transcript_ref=transcript_ref or str(heartbeat.path))
+            transcript_ref=transcript_ref or str(heartbeat.path),
+            execution_receipt_ref=execution_receipt_ref)
         if heartbeat_error is not None:
             raise heartbeat_error
 
@@ -581,7 +583,8 @@ class PlanReviewProvider:
                 self.cost_ledger.finish_call(
                     runner_call_id=runner_call_id, status="failed", usage=usage,
                     failure_kind="heartbeat_failed",
-                    transcript_ref=transcript_ref or str(heartbeat.path))
+                    transcript_ref=transcript_ref or str(heartbeat.path),
+                    execution_receipt_ref=execution_receipt_ref)
                 raise error
         try:
             with self.daemon.transaction() as conn:
@@ -596,7 +599,8 @@ class PlanReviewProvider:
                 if self.cost_ledger is not None:
                     budget_hit = self.cost_ledger.finish_call_in_txn(
                         conn, runner_call_id=runner_call_id, status="success", usage=usage,
-                        transcript_ref=transcript_ref or str(heartbeat.path))
+                        transcript_ref=transcript_ref or str(heartbeat.path),
+                        execution_receipt_ref=execution_receipt_ref)
                 else:
                     runner_call_id = conn.execute(
                         "INSERT INTO runner_call(cycle_id,phase,purpose,status,transcript_ref,"
@@ -618,7 +622,8 @@ class PlanReviewProvider:
                 self.cost_ledger.finish_call(
                     runner_call_id=runner_call_id, status="failed", usage=usage,
                     failure_kind="postprocess_error",
-                    transcript_ref=transcript_ref or str(heartbeat.path))
+                    transcript_ref=transcript_ref or str(heartbeat.path),
+                    execution_receipt_ref=execution_receipt_ref)
             raise
         if budget_hit is not None:
             raise BudgetExhausted(**budget_hit)
@@ -778,7 +783,8 @@ class JudgeProvider:
             self.cost_ledger.finish_call(
                 runner_call_id=runner_call_id, usage=usage, status=status,
                 failure_kind=failure_kind,
-                transcript_ref=transcript_ref or str(heartbeat.path))
+                transcript_ref=transcript_ref or str(heartbeat.path),
+                execution_receipt_ref=execution_receipt_ref)
         except (BudgetExhausted, CostAccountingFailed):
             raise
         except Exception:                      # noqa: BLE001 —— 预算开启时必须 fail-closed
@@ -807,7 +813,8 @@ class JudgeProvider:
                 self.cost_ledger.finish_call(
                     runner_call_id=rc, status="failed", usage=usage,
                     failure_kind="heartbeat_failed",
-                    transcript_ref=transcript_ref or str(heartbeat.path))
+                    transcript_ref=transcript_ref or str(heartbeat.path),
+                    execution_receipt_ref=execution_receipt_ref)
                 raise error
         try:
             with self.daemon.transaction() as conn:
@@ -817,7 +824,8 @@ class JudgeProvider:
                 if self.cost_ledger is not None:
                     budget_hit = self.cost_ledger.finish_call_in_txn(
                         conn, runner_call_id=rc, status="success", usage=usage,
-                        transcript_ref=transcript_ref or str(heartbeat.path))
+                        transcript_ref=transcript_ref or str(heartbeat.path),
+                        execution_receipt_ref=execution_receipt_ref)
                 else:
                     rc = conn.execute(
                         "INSERT INTO runner_call(cycle_id,phase,purpose,status,transcript_ref,"
@@ -835,7 +843,8 @@ class JudgeProvider:
                 self.cost_ledger.finish_call(
                     runner_call_id=rc, status="failed", usage=usage,
                     failure_kind="postprocess_error",
-                    transcript_ref=transcript_ref or str(heartbeat.path))
+                    transcript_ref=transcript_ref or str(heartbeat.path),
+                    execution_receipt_ref=execution_receipt_ref)
             raise
         if budget_hit is not None:              # runner_call+ledger+DECISION+global_stop 已提交后才阻断后续调用
             raise BudgetExhausted(**budget_hit)

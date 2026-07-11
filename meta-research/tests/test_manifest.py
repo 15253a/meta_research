@@ -6,6 +6,7 @@ staging 物化（原子+哨兵+篡改核验）/ 命令解析围栏（占位符�
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import stat
@@ -456,9 +457,17 @@ def _rewrite_managed_asset_authority(work_root: Path, ref: str, asset: Path, bod
 def test_resolve_substitutes_src_and_ckpt(tmp_path):
     m = _manifest(_slice())
     src, ck = tmp_path / "src", tmp_path / "run1" / "ckpt.bin"
-    rc = MF.resolve_command(m, "eval", src_dir=src, work_root=tmp_path, policy=_pol(), ckpt_path=ck)
-    assert rc.argv == ["python", f"{src.resolve()}/eval.py", "--ckpt", str(ck.resolve())]
-    assert rc.pass_fds == ()                         # 无资产命令保持原执行路径，不要求额外资源生命周期
+    ck.parent.mkdir(parents=True)
+    ck.write_bytes(b"checkpoint")
+    digest = hashlib.sha256(b"checkpoint").hexdigest()
+    rc = MF.resolve_command(
+        m, "eval", src_dir=src, work_root=tmp_path, policy=_pol(),
+        ckpt_path=ck, ckpt_content_hash=digest)
+    assert rc.argv[:3] == ["python", f"{src.resolve()}/eval.py", "--ckpt"]
+    assert rc.argv[3] == f"/proc/self/fd/{rc.pass_fds[0]}"
+    assert len(rc.pass_fds) == 1
+    for fd in rc.pass_fds:
+        os.close(fd)
     assert rc.timeout_s == 5                          # 未声明 → default
     rc_t = MF.resolve_command(m, "train", src_dir=src, work_root=tmp_path, policy=_pol())
     assert rc_t.timeout_s == 10                       # 声明 60 → max 截断
@@ -807,13 +816,52 @@ def test_run_manifest_command_end_to_end(tmp_path):
              "eval.py": "import sys, pathlib; assert pathlib.Path(sys.argv[1]).read_text() == 'w1'; "
                         "print('metric_value: 1@1=0.93')"}
     src = tmp_path / "t1" / "src"
-    MF.stage_bundle_files(files, m, src)
+    ledger = MF.stage_bundle_files(files, m, src)
     run_dir = tmp_path / "t1" / "run1"
     r = MF.run_manifest_command(m, "train", staging_dir=str(run_dir), log_name="train.log",
-                                src_dir=src, work_root=tmp_path, policy=POLICY)
+                                src_dir=src, work_root=tmp_path, policy=POLICY,
+                                expected_source_hashes=ledger)
     assert r["exit_code"] == 0 and (run_dir / "ckpt.bin").read_text() == "w1"
     ev = MF.run_manifest_command(m, "eval", staging_dir=str(tmp_path / "t1" / "eval1"), log_name="eval.log",
                                  src_dir=src, work_root=tmp_path, policy=POLICY,
-                                 ckpt_path=run_dir / "ckpt.bin")
+                                 ckpt_path=run_dir / "ckpt.bin",
+                                 ckpt_content_hash=hashlib.sha256(b"w1").hexdigest(),
+                                 expected_source_hashes=ledger)
     assert ev["exit_code"] == 0
     assert "metric_value: 1@1=0.93" in Path(ev["log_path"]).read_text(encoding="utf-8")
+
+
+def test_checkpoint_and_source_path_swaps_cannot_change_consumed_fds(
+        tmp_path, monkeypatch):
+    m = _manifest(_slice())
+    m["commands"]["eval"]["argv"] = [sys.executable, "{src}/eval.py", "{ckpt}"]
+    src = tmp_path / "src"
+    ledger = MF.stage_bundle_files(
+        {"identity.md": "# trusted", "train.py": "", "eval.py": "print('trusted')"},
+        m, src)
+    ckpt = tmp_path / "ckpt.bin"
+    ckpt.write_bytes(b"trusted-checkpoint")
+    ckpt_hash = hashlib.sha256(b"trusted-checkpoint").hexdigest()
+
+    def fake_run(argv, **kwargs):
+        original_src = tmp_path / "original-src"
+        src.rename(original_src)
+        src.mkdir()
+        (src / "eval.py").write_text("print('swapped')", encoding="utf-8")
+        original_ckpt = tmp_path / "original-ckpt.bin"
+        ckpt.rename(original_ckpt)
+        ckpt.write_bytes(b"swapped-checkpoint")
+        assert Path(argv[1]).read_text(encoding="utf-8") == "print('trusted')"
+        assert Path(argv[2]).read_bytes() == b"trusted-checkpoint"
+        assert set(kwargs["pass_fds"]) == {
+            int(argv[1].split("/")[4]), int(argv[2].split("/")[4])}
+        return {"exit_code": 0, "log_path": "unused", "log_sha256": "0" * 64,
+                "log_bytes": 0}
+
+    monkeypatch.setattr(MF.H, "run_staged", fake_run)
+    result = MF.run_manifest_command(
+        m, "eval", staging_dir=str(tmp_path / "eval"), log_name="eval.log",
+        src_dir=src, work_root=tmp_path, policy=POLICY,
+        ckpt_path=ckpt, ckpt_content_hash=ckpt_hash,
+        expected_source_hashes=ledger)
+    assert result["exit_code"] == 0

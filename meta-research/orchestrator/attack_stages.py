@@ -45,6 +45,8 @@ from . import harness as H
 from . import manifest as MF
 from . import obs_parser as OP
 from . import subject_manifest as SM
+from .artifact_capability import (ArtifactCapabilityError, open_artifact,
+                                  read_artifact_bytes)
 from .budgeting import compute_budget
 from .gate_exec import ExecGate
 from .gate_pool import PoolGate
@@ -391,7 +393,8 @@ class AttackStages:
         legacy_plan = None
         if art.exists():
             try:
-                plan = json.loads(art.read_text(encoding="utf-8"))
+                plan = json.loads(read_artifact_bytes(
+                    art, label="persisted plan artifact").decode("utf-8"))
             except json.JSONDecodeError as e:
                 raise _PlanReject(f"持久 plan.json 解析失败（staging 损坏？）：{e}") from e
             # import_defer 在图 04 的 IMP→WAIT 分支于 protocol/review 之前机械收尾；它没有
@@ -442,7 +445,8 @@ class AttackStages:
             draft_path = cycle_dir / f"plan.draft-r{round_no}.json"
             if draft_path.exists():
                 try:
-                    plan = json.loads(draft_path.read_text(encoding="utf-8"))
+                    plan = json.loads(read_artifact_bytes(
+                        draft_path, label="plan draft artifact").decode("utf-8"))
                 except json.JSONDecodeError as error:
                     raise RuntimeError(f"持久 plan draft r{round_no} JSON 损坏") from error
                 if (round_no == 1 and legacy_plan is not None
@@ -649,7 +653,8 @@ class AttackStages:
         if not path.exists():
             raise RuntimeError("plan.json 存在但 plan.review-result.json 缺失")
         try:
-            result = json.loads(path.read_text(encoding="utf-8"))
+            result = json.loads(read_artifact_bytes(
+                path, label="stage artifact").decode("utf-8"))
         except json.JSONDecodeError as error:
             raise RuntimeError("plan.review-result.json 损坏") from error
         if (not isinstance(result, dict) or result.get("plan_hash") != _canon_hash(plan)
@@ -1141,7 +1146,10 @@ class AttackStages:
             frozen_refs = authorization.asset_refs if authorization is not None else frozenset()
             frozen_identities = authorization.identities if authorization is not None else {}
             return manifest, ledger, frozen_refs, frozen_identities
-        manifest = json.loads((src_dir / MF.MANIFEST_FILE).read_text(encoding="utf-8"))
+        manifest = json.loads(read_artifact_bytes(
+            src_dir / MF.MANIFEST_FILE,
+            expected_hash=ledger[MF.MANIFEST_FILE],
+            label="staged execution manifest").decode("utf-8"))
         self._check_manifest(manifest, slice_)    # resume 再校验（损坏→ManifestError 上抛，不吞）
         authorization = MF.load_asset_authorization(src_dir, manifest)
         frozen_refs = authorization.asset_refs if authorization is not None else frozenset()
@@ -1197,7 +1205,7 @@ class AttackStages:
         if slice_["target_kind"] == "eval":
             if st() == "running":
                 self._run_eval_target(
-                    cyc, bt_id, slice_, manifest, staging, src_dir,
+                    cyc, bt_id, slice_, manifest, ledger, staging, src_dir,
                     allowed_asset_refs, asset_identities)
             self._ensure_target_pc(cyc, bt_id)
             return
@@ -1219,8 +1227,11 @@ class AttackStages:
                 if not exit_file.exists():
                     raise RuntimeError(
                         f"staging 损毁：{existing_final} 在而 exit 侧车缺——须人工核")
-                smoke_bytes = existing_final.read_bytes()
-                sm = {"exit_code": int(exit_file.read_text()),
+                smoke_bytes = read_artifact_bytes(
+                    existing_final, label="persisted smoke log")
+                sm = {"exit_code": int(read_artifact_bytes(
+                          exit_file, max_bytes=32,
+                          label="smoke exit sidecar").decode("ascii")),
                       "log_path": str(existing_final),
                       "log_sha256": hashlib.sha256(smoke_bytes).hexdigest(),
                       "log_bytes": len(smoke_bytes)}
@@ -1234,6 +1245,7 @@ class AttackStages:
                     sm = MF.run_manifest_command(
                         manifest, "smoke", staging_dir=str(smoke_dir), log_name=smoke_name,
                         src_dir=src_dir, work_root=self.work, policy=self.policy,
+                        expected_source_hashes=ledger,
                         allowed_asset_refs=allowed_asset_refs,
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
@@ -1259,7 +1271,8 @@ class AttackStages:
                                    allowed_asset_refs, asset_identities)
         self._ensure_target_pc(cyc, bt_id)
 
-    def _run_eval_target(self, cyc, bt_id: int, slice_, manifest, staging: Path, src_dir: Path,
+    def _run_eval_target(self, cyc, bt_id: int, slice_, manifest, ledger,
+                         staging: Path, src_dir: Path,
                          allowed_asset_refs, asset_identities) -> None:
         """Execute a plan ``target_kind=eval`` against one existing legal checkpoint.
 
@@ -1379,8 +1392,12 @@ class AttackStages:
                 exit_file = eval_final.with_name("eval.log.exit")
                 if not exit_file.exists():
                     raise RuntimeError(f"staging 损毁：{eval_final} 在而 exit 侧车缺——须人工核")
-                eval_log = eval_final.read_bytes()
-                ev = {"exit_code": int(exit_file.read_text()), "log_path": str(eval_final),
+                eval_log = read_artifact_bytes(
+                    eval_final, label="persisted eval log")
+                ev = {"exit_code": int(read_artifact_bytes(
+                          exit_file, max_bytes=32,
+                          label="eval exit sidecar").decode("ascii")),
+                      "log_path": str(eval_final),
                       "log_sha256": hashlib.sha256(eval_log).hexdigest(),
                       "log_bytes": len(eval_log)}
             else:
@@ -1394,11 +1411,15 @@ class AttackStages:
                         manifest, "eval", staging_dir=str(eval_dir), log_name="eval.log",
                         src_dir=src_dir, work_root=self.work, policy=self.policy,
                         ckpt_path=Path(checkpoint_path),
+                        ckpt_content_hash=checkpoint_hash,
+                        expected_source_hashes=ledger,
                         allowed_asset_refs=allowed_asset_refs,
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
                         execution_context=eval_context)
-                eval_log = Path(ev["log_path"]).read_bytes()
+                eval_log = read_artifact_bytes(
+                    ev["log_path"], expected_hash=ev["log_sha256"],
+                    expected_size=ev["log_bytes"], label="eval log receipt")
 
             def finish_attempt_failure(failure_kind: str, target_failure: str) -> None:
                 g.gate_finish_attempt(
@@ -1490,9 +1511,13 @@ class AttackStages:
                 if not exit_file.exists():
                     raise RuntimeError(
                         f"staging 损毁：{train_final} 在而 exit 侧车缺——须人工核")
-                train_bytes = train_final.read_bytes()
+                train_bytes = read_artifact_bytes(
+                    train_final, label="persisted train log")
                 train_result = {
-                    "exit_code": int(exit_file.read_text()), "log_path": str(train_final),
+                    "exit_code": int(read_artifact_bytes(
+                        exit_file, max_bytes=32,
+                        label="train exit sidecar").decode("ascii")),
+                    "log_path": str(train_final),
                     "log_sha256": hashlib.sha256(train_bytes).hexdigest(),
                     "log_bytes": len(train_bytes),
                 }
@@ -1521,7 +1546,8 @@ class AttackStages:
             train_result = MF.run_manifest_command(
                 manifest, "train", staging_dir=str(staging / f"run{rid}"),
                 log_name="train.log", src_dir=src_dir, work_root=self.work,
-                policy=self.policy, allowed_asset_refs=allowed_asset_refs,
+                policy=self.policy, expected_source_hashes=ledger,
+                allowed_asset_refs=allowed_asset_refs,
                 expected_asset_identities=asset_identities,
                 execution_supervisor=self.execution_supervisor,
                 execution_context=train_context)
@@ -1534,20 +1560,28 @@ class AttackStages:
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
                 return                            # 训练失败入账不入树（§7.1 判例④；答题侧自然无证据）
             ck_path = MF.checkpoint_dest(manifest, staging / f"run{rid}")   # 围栏解析进 run 目录内
-            ck_hash = H.file_sha256(str(ck_path))
-            with d.transaction() as conn:         # checkpoint 登记（run 产物；finish_run success 的前置）
-                existing = conn.execute(
-                    "SELECT variant_id,ckpt_key,path,content_hash FROM checkpoint "
-                    "WHERE produced_by_run=?", (rid,)).fetchone()
-                expected = (vid, f"final-r{rid}", str(ck_path), ck_hash)
-                if existing is None:
-                    conn.execute(
-                        "INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,produced_by_run) "
-                        "VALUES (?,?,?,?,'sha256',?)", (*expected, rid))
-                elif tuple(existing) != expected:
-                    raise RuntimeError(
-                        f"run {rid} checkpoint durable identity 与 staging 不一致")
-            g.gate_finish_run(run_id=rid, status="success")
+            try:
+                with open_artifact(ck_path, label="run checkpoint publication") as checkpoint_cap:
+                    ck_hash = checkpoint_cap.identity.content_hash.removeprefix("sha256:")
+                    with d.transaction() as conn:  # checkpoint 登记（run 产物；finish_run success 的前置）
+                        existing = conn.execute(
+                            "SELECT variant_id,ckpt_key,path,content_hash FROM checkpoint "
+                            "WHERE produced_by_run=?", (rid,)).fetchone()
+                        expected = (vid, f"final-r{rid}", str(ck_path), ck_hash)
+                        if existing is None:
+                            conn.execute(
+                                "INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,produced_by_run) "
+                                "VALUES (?,?,?,?,'sha256',?)", (*expected, rid))
+                        elif tuple(existing) != expected:
+                            raise RuntimeError(
+                                f"run {rid} checkpoint durable identity 与 staging 不一致")
+                    checkpoint_cap.verify_unchanged()
+                    checkpoint_cap.verify_path_binding()
+                    g.gate_finish_run(run_id=rid, status="success")
+                    checkpoint_cap.verify_unchanged()
+                    checkpoint_cap.verify_path_binding()
+            except ArtifactCapabilityError as error:
+                raise RuntimeError(f"run {rid} checkpoint publication 身份漂移") from error
         # train log 入账 + 观测 ingest：**无条件、幂等**（不藏在 fresh 分支——崩在 finish_run 与 ingest 之间时，
         # 复用 run 的续跑须从 staging 存活文件补登，否则杀 vs 不杀终库不一致，内审 SHOULD）
         self._register_and_ingest_log(ci, staging / f"run{rid}" / "train.log", log_kind="train", run_id=rid)
@@ -1621,8 +1655,11 @@ class AttackStages:
                 exit_file = eval_final.with_name("eval.log.exit")
                 if not exit_file.exists():
                     raise RuntimeError(f"staging 损毁：{eval_final} 在而 exit 侧车缺——须人工核（不得臆判成功）")
-                exit_code = int(exit_file.read_text())
-                eval_log = eval_final.read_bytes()
+                exit_code = int(read_artifact_bytes(
+                    exit_file, max_bytes=32,
+                    label="eval exit sidecar").decode("ascii"))
+                eval_log = read_artifact_bytes(
+                    eval_final, label="persisted eval log")
                 ev = {"log_path": str(eval_final), "log_sha256": hashlib.sha256(eval_log).hexdigest(),
                       "log_bytes": len(eval_log), "exit_code": exit_code}
             else:
@@ -1632,16 +1669,25 @@ class AttackStages:
                     execution_kind="manifest-eval", execution_context=eval_context)
                 if ev is None:
                     self.owner_guard()
+                    checkpoint_identity = d.query_one(
+                        "SELECT path,content_hash FROM checkpoint "
+                        "WHERE produced_by_run=?", (rid,))
+                    if checkpoint_identity is None:
+                        raise RuntimeError(f"run {rid} 缺 checkpoint identity")
                     ev = MF.run_manifest_command(
                         manifest, "eval", staging_dir=str(eval_dir),
                         log_name="eval.log", src_dir=src_dir, work_root=self.work,
                         policy=self.policy,
-                        ckpt_path=MF.checkpoint_dest(manifest, staging / f"run{rid}"),
+                        ckpt_path=Path(checkpoint_identity[0]),
+                        ckpt_content_hash=checkpoint_identity[1],
+                        expected_source_hashes=ledger,
                         allowed_asset_refs=allowed_asset_refs,
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
                         execution_context=eval_context)
-                eval_log = Path(ev["log_path"]).read_bytes()
+                eval_log = read_artifact_bytes(
+                    ev["log_path"], expected_hash=ev["log_sha256"],
+                    expected_size=ev["log_bytes"], label="eval log receipt")
             if ev["exit_code"] != 0:              # fresh 与 resume 同一判定点（评估进程失败 → target failed）
                 g.gate_finish_attempt(
                     attempt_id=aid, status="failed", failure_kind="runtime",
@@ -1717,7 +1763,10 @@ class AttackStages:
                     cycle_id=ci, current_subject_hash=res_sh2, run_id=rid)
             else:
                 # build：终版身份 = bundle 产的 identity.md 全文（替换 plan 期占位草稿）；复现 = manifest.repro_cmd_md
-                identity_doc = (src_dir / MF.IDENTITY_FILE).read_text(encoding="utf-8")
+                identity_doc = read_artifact_bytes(
+                    src_dir / MF.IDENTITY_FILE,
+                    expected_hash=ledger[MF.IDENTITY_FILE],
+                    label="baseline identity artifact").decode("utf-8")
                 self.gate.gate_register_baseline(
                     baseline_id=bid, variant_id=vid, build_target_id=bt_id, evaluation_id=eid,
                     cycle_id=ci, current_subject_hash=res_sh2,
@@ -1738,8 +1787,7 @@ class AttackStages:
             return
         if not log_path.exists():
             return
-        data = log_path.read_bytes()
-        got = hashlib.sha256(data).hexdigest()
+        expected_hash = None
         if evaluation_attempt_id is not None:
             # 强校验（codex BLOCKER×2）：补登字节须等于注册时锚在 attempt.artifact_ref 的评估 log 哈希——
             # 崩后 staging 被改写不得把 suspect attempt 洗成 clean。**无锚不 ingest**（None 锚放行=同一洞的
@@ -1749,6 +1797,12 @@ class AttackStages:
             if not exp or not exp[0] or not exp[0].startswith("sha256:"):
                 raise RuntimeError(f"attempt {evaluation_attempt_id} 无 sha256: artifact_ref 锚——"
                                    "拒绝从 staging 补登（注册时须锚评估 log 哈希）")
+            expected_hash = exp[0]
+        data = read_artifact_bytes(
+            log_path, expected_hash=expected_hash,
+            label=f"{log_kind} execution log")
+        got = hashlib.sha256(data).hexdigest()
+        if evaluation_attempt_id is not None:
             if exp[0] != f"sha256:{got}":
                 raise RuntimeError(f"eval log 补登哈希不符（注册锚 {exp[0][:19]}…，实收 sha256:{got[:12]}…）"
                                    "——staging 被改写，拒绝入账（须人工核）")
@@ -1791,7 +1845,12 @@ class AttackStages:
         return SM.subject_hash(SM.result_review_manifest(
             metrics_artifact_hash=_canon_hash(metrics), checkpoint_hashes={ckrow[0]: ckrow[1]},
             run_log_hashes={ev["log_path"]: ev["log_sha256"]},
-            parser_obs_hash=_canon_hash(OP.parse_log(Path(ev["log_path"]).read_text(), self.obs_policy)),
+            parser_obs_hash=_canon_hash(OP.parse_log(
+                read_artifact_bytes(
+                    ev["log_path"], expected_hash=ev["log_sha256"],
+                    expected_size=ev["log_bytes"],
+                    label="result-review eval log").decode("utf-8"),
+                self.obs_policy)),
             identity_draft_hash=ledger[MF.IDENTITY_FILE]))
 
     @staticmethod
@@ -1903,7 +1962,8 @@ class AttackStages:
         SQLite/IO/GateInvariantError/RuntimeError 等内部或损毁错误仍 fail loud。"""
         art = self.work / f"c{_cnum(cyc.cycle_id)}" / "reasoning.json"
         if art.exists():
-            files = json.loads(art.read_text(encoding="utf-8"))
+            files = json.loads(read_artifact_bytes(
+                art, label="persisted reasoning artifact").decode("utf-8"))
         else:
             pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="reasoning")
             files = self.p["reasoning"](cyc, pack)

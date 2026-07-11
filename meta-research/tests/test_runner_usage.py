@@ -17,7 +17,10 @@ import pytest
 from orchestrator import runner as R
 from orchestrator import process_supervisor as PS
 from orchestrator.interfaces import ContextPack
-from orchestrator.runner import CodexRunner, parse_json_tokens_used, parse_tokens_used
+from orchestrator.process_supervisor import ExecutionSupervisor, atomic_write_receipt
+from orchestrator.provider_invocation import load_provider_invocation_receipt
+from orchestrator.runner import (CodexRunner, parse_json_tokens_used,
+                                 parse_provider_invocation_id, parse_tokens_used)
 
 
 # ---------------- 解析（核心逻辑，无需 codex）----------------
@@ -50,6 +53,19 @@ def test_parse_json_tokens_used_from_completed_turn():
         '{"type":"turn.completed","usage":{"input_tokens":true,"output_tokens":1}}') is None
 
 
+def test_provider_invocation_id_and_conflicting_usage_are_explicit():
+    trace = '{"type":"thread.started","thread_id":"thread-abc"}\n'
+    assert parse_provider_invocation_id("session id: session-xyz\n", trace) == (
+        "thread-abc", "thread_id")
+    assert parse_provider_invocation_id("session id: session-xyz\n") == (
+        "session-xyz", "session_id")
+    usage, source = CodexRunner._usage_with_source(
+        "tokens used\n10\n", 0.5,
+        '{"type":"turn.completed","usage":{"total_tokens":11}}')
+    assert usage.tokens_known is False and usage.tokens_total == 0
+    assert source == "conflict"
+
+
 # ---------------- _invoke 集成（mock 掉 codex 子进程）----------------
 def _pack() -> ContextPack:
     return ContextPack(cycle_id="c1", stage="idea", target_id=None,
@@ -73,6 +89,34 @@ class _FakeExecutionSupervisor:
         return self.fn(
             cmd, stdin=stdin, capture_output=capture_output,
             timeout=timeout_s, cwd=cwd)
+
+
+class _ReceiptExecutionSupervisor:
+    def __init__(self, receipt_dir):
+        self.authority = ExecutionSupervisor.standalone(receipt_dir)
+        self.receipt_dir = self.authority.receipt_dir
+
+    def run(self, cmd, *, stdin=None, capture_output=False, timeout_s=None,
+            cwd=None, kind=None, operation_context=None, **_kwargs):
+        out = Path(cmd[cmd.index("-o") + 1])
+        out.write_text(
+            '```json\n{"files":{"idea_set.json":{}},"md":"ok"}\n```',
+            encoding="utf-8")
+        operation_id = "exec-" + "8" * 32
+        path = self.receipt_dir / f"execution-{operation_id}.json"
+        receipt = self.authority._prepared_receipt(  # noqa: SLF001 - protocol fixture
+            operation_id=operation_id, kind=kind,
+            spec_sha256="sha256:" + "a" * 64, timeout_s=timeout_s,
+            operation_context=operation_context)
+        receipt.update({
+            "state": "terminal", "outcome": "exit", "returncode": 0,
+            "started_at_unix": time.time() - 0.1, "finished_at_unix": time.time(),
+            "group_drained": True, "term_sent": False, "kill_sent": False,
+        })
+        atomic_write_receipt(path, receipt)
+        return types.SimpleNamespace(
+            returncode=0, stdout=b"", stderr=b"session id: session-real-1\ntokens used\n25\n",
+            receipt_path=path)
 
 
 def _fake_runner(tmp_path, fn, **kwargs):
@@ -99,6 +143,25 @@ def test_runner_captures_usage(tmp_path, monkeypatch):
     assert art.usage.tokens_total == 1800                      # 真 token 从 stderr 抽到
     assert art.usage.tokens_known is True
     assert art.usage.wallclock_sec >= 0.0                      # 墙钟已计
+
+
+def test_bound_runner_publishes_provider_receipt_before_return(tmp_path):
+    supervisor = _ReceiptExecutionSupervisor(tmp_path / "executions")
+    runner = CodexRunner(
+        transcripts_dir=tmp_path / "transcripts", execution_supervisor=supervisor)
+    runner.bind_runner_call(
+        runner_call_id=7, reconcile_protocol="runner-call-v1",
+        phase="idea", purpose="idea-n1-a1")
+    art = runner.run_task(system_prompt="s", skill="k", context_pack=_pack())
+    assert art.provider_receipt_ref is not None
+    invocation = load_provider_invocation_receipt(
+        Path(art.provider_receipt_ref), expected_runner_call_id=7,
+        expected_cycle_id="c1", expected_phase="idea",
+        expected_purpose="idea-n1-a1",
+        expected_execution_receipt_ref=art.execution_receipt_ref)
+    assert invocation.provider_invocation_id == "session-real-1"
+    assert invocation.usage.tokens_total == 25
+    assert invocation.execution_outcome == "exit"
 
 
 def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch):

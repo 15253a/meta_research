@@ -42,6 +42,9 @@ from .resource_limits import (MAX_INFLIGHT_QUERY_CALLS, MAX_QUEUED_QUERY_CALLS,
                               MAX_QUERY_CURRENT_CHARS, MAX_QUERY_HISTORY_FIELD_CHARS,
                               MAX_QUERY_HISTORY_TURNS, MAX_QUERY_STATUS_CARD_BYTES)
 from .runner import RunnerError, TOOL_FREE_POLICY_VERSION
+from .provider_invocation import (RUNNER_RECONCILE_PROTOCOL,
+                                  load_provider_invocation_receipt,
+                                  provider_receipt_path, recovery_terminal)
 from .writedaemon import WriteDaemon
 
 # 写类 authorizer 动作码全集（sqlite3 模块常量名）：任何一个都 DENY —— mode=ro 已物理只读，
@@ -236,12 +239,15 @@ class CodexQueryResponder:
     kind = "codex"
 
     def __init__(self, *, runner_factory, validator, system_prompt: str,
-                 skill: str, work_root: str):
+                 skill: str, work_root: str,
+                 provider_receipt_dir: Optional[str] = None):
         self.runner_factory = runner_factory
         self.validator = validator
         self.system_prompt = system_prompt
         self.skill = skill
         self.work_root = Path(work_root)
+        self.provider_receipt_dir = (Path(provider_receipt_dir)
+                                     if provider_receipt_dir is not None else None)
         schema_contract = json.dumps(
             validator.schema, ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), allow_nan=False)
@@ -259,6 +265,20 @@ class CodexQueryResponder:
         ).hexdigest()
 
     def answer(self, sanitized_query: str, status_card: str) -> ResponderReply:
+        return self._answer(sanitized_query, status_card)
+
+    def answer_for_call(self, sanitized_query: str, status_card: str, *,
+                        runner_call_id: int, phase: str,
+                        purpose: str) -> ResponderReply:
+        """Bind the no-DB worker to the mediator's already-durable call intent."""
+        return self._answer(
+            sanitized_query, status_card, runner_call_id=runner_call_id,
+            phase=phase, purpose=purpose)
+
+    def _answer(self, sanitized_query: str, status_card: str, *,
+                runner_call_id: Optional[int] = None,
+                phase: Optional[str] = None,
+                purpose: Optional[str] = None) -> ResponderReply:
         card = json.loads(status_card)
         snapshot = card.get("snapshot_cycle")
         _cnum(snapshot)                    # fail loud on a non-canonical/missing published identity
@@ -267,6 +287,13 @@ class CodexQueryResponder:
         rel_dir = Path("interactions") / "transcripts" / identity
         transcripts = self.work_root / rel_dir
         runner = self.runner_factory(transcripts, "interaction-query")
+        if runner_call_id is not None:
+            bind = getattr(runner, "bind_runner_call", None)
+            if not callable(bind):
+                raise RuntimeError("interaction_query runner 缺 durable call binding capability")
+            bind(runner_call_id=runner_call_id,
+                 reconcile_protocol=RUNNER_RECONCILE_PROTOCOL,
+                 phase=phase, purpose=purpose)
         try:
             conversation = json.loads(sanitized_query)
         except json.JSONDecodeError as error:
@@ -299,12 +326,16 @@ class CodexQueryResponder:
         if artifact.stage != "reasoning":
             raise RunnerError(
                 f"interaction_query runner stage 漂移: {artifact.stage!r}", usage=artifact.usage,
-                transcript_ref=(transcript_ref if (self.work_root / transcript_ref).is_file() else None))
+                transcript_ref=(transcript_ref if (self.work_root / transcript_ref).is_file() else None),
+                execution_receipt_ref=artifact.execution_receipt_ref,
+                provider_receipt_ref=artifact.provider_receipt_ref)
         if set(artifact.files) != {"interaction_reply.json"} or artifact.md.strip():
             raise RunnerError(
                 "interaction_query 信封须只含 interaction_reply.json 且 md 为空",
                 usage=artifact.usage,
-                transcript_ref=(transcript_ref if (self.work_root / transcript_ref).is_file() else None))
+                transcript_ref=(transcript_ref if (self.work_root / transcript_ref).is_file() else None),
+                execution_receipt_ref=artifact.execution_receipt_ref,
+                provider_receipt_ref=artifact.provider_receipt_ref)
         candidate = artifact.files["interaction_reply.json"]
         errors = [f"{error.json_path} {error.message}"
                   for error in self.validator.iter_errors(candidate)]
@@ -312,15 +343,21 @@ class CodexQueryResponder:
             raise RunnerError(
                 "interaction_reply.json schema 校验失败:\n" + "\n".join(errors[:12]),
                 usage=artifact.usage,
-                transcript_ref=(transcript_ref if (self.work_root / transcript_ref).is_file() else None))
+                transcript_ref=(transcript_ref if (self.work_root / transcript_ref).is_file() else None),
+                execution_receipt_ref=artifact.execution_receipt_ref,
+                provider_receipt_ref=artifact.provider_receipt_ref)
         try:
             reply = _cross_check_candidate(candidate, card)
         except ValueError as error:
             raise RunnerError(
                 str(error), usage=artifact.usage,
-                transcript_ref=(transcript_ref if (self.work_root / transcript_ref).is_file() else None)) from error
+                transcript_ref=(transcript_ref if (self.work_root / transcript_ref).is_file() else None),
+                execution_receipt_ref=artifact.execution_receipt_ref,
+                provider_receipt_ref=artifact.provider_receipt_ref) from error
         return ResponderReply(
-            text=reply, usage=artifact.usage, transcript_ref=transcript_ref)
+            text=reply, usage=artifact.usage, transcript_ref=transcript_ref,
+            execution_receipt_ref=artifact.execution_receipt_ref,
+            provider_receipt_ref=artifact.provider_receipt_ref)
 
 
 # ---------------------------------------------------------------- responder --
@@ -440,6 +477,7 @@ class Mediator:
         self.ingest = InteractionIngest(daemon)
         self.cost_ledger = cost_ledger
         self.async_enabled = getattr(self.responder, "kind", None) == "codex"
+        self.provider_receipt_dir = getattr(self.responder, "provider_receipt_dir", None)
         if self.async_enabled and self.cost_ledger is None:
             raise ValueError("codex responder 必须注入 CostLedger，禁止产生未记账外部调用")
         self._completed: "queue.Queue[_QueryCompletion]" = queue.Queue()
@@ -974,7 +1012,14 @@ class Mediator:
         if task.cancelled.is_set():
             return
         try:
-            result = self.responder.answer(task.sanitized_input, task.card_json)
+            bound_answer = getattr(self.responder, "answer_for_call", None)
+            if callable(bound_answer):
+                result = bound_answer(
+                    task.sanitized_input, task.card_json,
+                    runner_call_id=task.runner_call_id,
+                    phase="interaction_query", purpose=f"message:{task.message_id}")
+            else:
+                result = self.responder.answer(task.sanitized_input, task.card_json)
             if not isinstance(result, ResponderReply):
                 raise TypeError("codex responder.answer 必须返回 ResponderReply")
             completion = _QueryCompletion(task=task, reply=result)
@@ -1051,6 +1096,8 @@ class Mediator:
             responder_kind = "codex" if status == "success" and reason is None else "template"
             usage = completion.reply.usage
             transcript_ref = completion.reply.transcript_ref
+            execution_receipt_ref = completion.reply.execution_receipt_ref
+            provider_receipt_ref = completion.reply.provider_receipt_ref
             fallback_reason = reason
         else:
             error = completion.error
@@ -1060,12 +1107,17 @@ class Mediator:
             responder_kind = "template"
             usage = getattr(error, "usage", None)
             transcript_ref = getattr(error, "transcript_ref", None)
+            execution_receipt_ref = getattr(error, "execution_receipt_ref", None)
+            provider_receipt_ref = getattr(error, "provider_receipt_ref", None)
             fallback_reason = f"{type(error).__name__}: {error}"[:500]
         try:
             return self._commit_external_completion(
                 task, answer=answer, responder_kind=responder_kind,
                 status=status, failure_kind=failure_kind, usage=usage,
-                transcript_ref=transcript_ref, fallback_reason=fallback_reason)
+                transcript_ref=transcript_ref,
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref,
+                fallback_reason=fallback_reason)
         except _QueryCostAccountingError as accounting_error:
             authoritative = self._existing_reply(
                 task.message_id, runner_call_id=task.runner_call_id)
@@ -1087,22 +1139,21 @@ class Mediator:
                                     responder_kind: str, status: str,
                                     failure_kind: Optional[str], usage,
                                     transcript_ref: Optional[str],
+                                    execution_receipt_ref: Optional[str],
+                                    provider_receipt_ref: Optional[str],
                                     fallback_reason: Optional[str]) -> Dict[str, Any]:
         with self.daemon.transaction() as conn:
             if conn.execute(
                     "SELECT 1 FROM interaction_reply WHERE message_id=? AND runner_call_id=? LIMIT 1",
                     (task.message_id, task.runner_call_id)).fetchone() is not None:
                 raise RuntimeError(f"query message {task.message_id} 已有 reply（并发终态）")
-            changed = conn.execute(
-                "UPDATE runner_call SET status=?,failure_kind=?,transcript_ref=COALESCE(?,transcript_ref),"
-                "finished_at=CURRENT_TIMESTAMP WHERE id=? AND status='running'",
-                (status, failure_kind, transcript_ref, task.runner_call_id)).rowcount
-            if changed != 1:
-                raise RuntimeError(
-                    f"interaction_query runner_call {task.runner_call_id} 非 active，拒绝重复收口")
             try:
-                self.cost_ledger.insert_ledger_for_runner(
-                    conn, runner_call_id=task.runner_call_id, usage=usage)
+                self.cost_ledger.finish_call_in_txn(
+                    conn, runner_call_id=task.runner_call_id,
+                    status=status, failure_kind=failure_kind, usage=usage,
+                    transcript_ref=transcript_ref,
+                    execution_receipt_ref=execution_receipt_ref,
+                    provider_receipt_ref=provider_receipt_ref)
             except sqlite3.OperationalError:
                 raise                           # transient/storage failure: poll retains completion for retry
             except Exception as error:
@@ -1179,30 +1230,65 @@ class Mediator:
     def _recover_orphan(self, runner_call_id: int, *, message_id: int,
                         cause: Exception, snapshot_cycle: Optional[str] = None) -> Dict[str, Any]:
         row = self.daemon.query_one(
-            "SELECT cycle_id FROM runner_call WHERE id=?", (runner_call_id,))
+            "SELECT cycle_id,phase,purpose,status FROM runner_call WHERE id=?", (runner_call_id,))
         if row is None or row[0] is None:
             raise RuntimeError(f"orphaned interaction_query runner_call {runner_call_id} 缺 cycle")
         snapshot = snapshot_cycle or f"c{row[0]}"
         card = {"snapshot_cycle": snapshot}
         answer = render_query_failure(card)
-        with self.daemon.transaction() as conn:
-            self.cost_ledger.fail_existing_unaccounted_call(
-                conn, runner_call_id=runner_call_id,
-                failure_kind="orphaned_query_intent", cause=cause)
-            existing = conn.execute(
-                "SELECT id,reply_text FROM interaction_reply WHERE message_id=? AND runner_call_id=? "
-                "ORDER BY id DESC LIMIT 1", (message_id, runner_call_id)).fetchone()
-            if existing is None:
+        invocation = None
+        if self.provider_receipt_dir is not None:
+            provider_path = provider_receipt_path(
+                Path(self.provider_receipt_dir), runner_call_id)
+            try:
+                invocation = load_provider_invocation_receipt(
+                    provider_path, expected_runner_call_id=runner_call_id,
+                    expected_cycle_id=snapshot, expected_phase=row[1],
+                    expected_purpose=row[2])
+            except FileNotFoundError:
+                invocation = None
+        try:
+            with self.daemon.transaction() as conn:
+                if invocation is not None:
+                    terminal_status, failure_kind = recovery_terminal(invocation)
+                    self.cost_ledger.finish_call_in_txn(
+                        conn, runner_call_id=runner_call_id,
+                        status=terminal_status, failure_kind=failure_kind,
+                        usage=invocation.usage,
+                        transcript_ref=invocation.execution_receipt_ref,
+                        execution_receipt_ref=invocation.execution_receipt_ref,
+                        provider_receipt_ref=invocation.receipt_ref)
+                else:
+                    self.cost_ledger.fail_existing_unaccounted_call(
+                        conn, runner_call_id=runner_call_id,
+                        failure_kind="orphaned_query_intent", cause=cause)
+                existing = conn.execute(
+                    "SELECT id,reply_text FROM interaction_reply WHERE message_id=? AND runner_call_id=? "
+                    "ORDER BY id DESC LIMIT 1", (message_id, runner_call_id)).fetchone()
+                if existing is None:
+                    reply_id = self._insert_reply(
+                        conn, message_id=message_id, text=answer,
+                        snapshot_cycle=snapshot, responder_kind="template",
+                        runner_call_id=runner_call_id)
+                else:
+                    reply_id, answer = existing
+        except ValueError as accounting_error:
+            if invocation is None:
+                raise
+            with self.daemon.transaction() as conn:
+                self.cost_ledger.fail_existing_unaccounted_call(
+                    conn, runner_call_id=runner_call_id,
+                    failure_kind="orphaned_query_intent", cause=accounting_error)
                 reply_id = self._insert_reply(
                     conn, message_id=message_id, text=answer,
                     snapshot_cycle=snapshot, responder_kind="template",
                     runner_call_id=runner_call_id)
-            else:
-                reply_id, answer = existing
         return {
             "reply_id": reply_id, "reply_text": answer, "grounded": False,
             "snapshot_cycle": snapshot,
-            "fallback_reason": "orphaned interaction_query 未重发",
+            "fallback_reason": ("orphaned interaction_query 已按 provider receipt 补账、未重发"
+                                if invocation is not None else
+                                "orphaned interaction_query 未重发且用量未知"),
             "runner_call_id": runner_call_id,
         }
 

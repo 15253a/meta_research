@@ -16,6 +16,7 @@ prompt = system_prompt + skill 节选 + 四区上下文包 + 信封提醒，全�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -35,6 +36,7 @@ from .process_supervisor import (
     ExecutionSupervisorError,
     terminate_all_supervised_executions,
 )
+from .provider_invocation import write_provider_invocation_receipt
 
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
 # codex CLI 在 stderr 打**汇总行**「tokens used」+ 总 token（实机：标签独占一行、数字在下一行；亦容「tokens used: N」单行）。
@@ -43,6 +45,10 @@ _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
 _TOKENS_RE = re.compile(
     # 标签与数字间须有**分隔符**（冒号 / 换行 / 空白之一）——不吃 `tokens used123` 这种粘连（codex NIT）。
     r"^[ \t]*tokens used(?:[ \t]*:[ \t]*|[ \t]*\n[ \t]*|[ \t]+)(\d{1,3}(?:,\d{3})+|\d+)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SESSION_ID_RE = re.compile(
+    r"^[ \t]*session id[ \t]*:[ \t]*([A-Za-z0-9][A-Za-z0-9._:-]{0,127})[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 TOOL_FREE_POLICY_VERSION = (
@@ -182,6 +188,56 @@ def parse_json_tokens_used(stdout_text: str) -> Optional[int]:
     return total
 
 
+def parse_json_usage(stdout_text: str) -> Optional[CallUsage]:
+    """Return the last complete JSON usage, preserving input/output when present."""
+    usage = None
+    for line in (stdout_text or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(event, dict) and event.get("type") == "turn.completed"
+                and isinstance(event.get("usage"), dict)):
+            usage = event["usage"]
+    if usage is None:
+        return None
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    for value in (input_tokens, output_tokens):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+    total = usage.get("total_tokens")
+    if total is None:
+        if "input_tokens" not in usage or "output_tokens" not in usage:
+            return None
+        total = input_tokens + output_tokens
+    if (isinstance(total, bool) or not isinstance(total, int) or total < 0
+            or total < input_tokens + output_tokens):
+        return None
+    return CallUsage(
+        tokens_total=total, tokens_input=input_tokens, tokens_output=output_tokens,
+        tokens_known=True)
+
+
+def parse_provider_invocation_id(stderr_text: str,
+                                 json_trace: str = "") -> "tuple[Optional[str], Optional[str]]":
+    """Extract the provider's own thread/session id when the CLI exposes one."""
+    thread_id = None
+    for line in (json_trace or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        candidate = event.get("thread_id") if isinstance(event, dict) and event.get("type") == "thread.started" else None
+        if (isinstance(candidate, str)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", candidate)):
+            thread_id = candidate
+    if thread_id is not None:
+        return thread_id, "thread_id"
+    sessions = _SESSION_ID_RE.findall(stderr_text or "")
+    return ((sessions[-1], "session_id") if sessions else (None, None))
+
+
 class RunnerError(RuntimeError):
     """一次 Runner 调用失败（进程失败 / 超时 / 信封不可解析）。
 
@@ -192,12 +248,14 @@ class RunnerError(RuntimeError):
 
     def __init__(self, message: str, *, usage=None, transcript_ref: Optional[str] = None,
                  failure_kind: str = "runner_error",
-                 execution_receipt_ref: Optional[str] = None):
+                 execution_receipt_ref: Optional[str] = None,
+                 provider_receipt_ref: Optional[str] = None):
         super().__init__(message)
         self.usage = usage
         self.transcript_ref = transcript_ref
         self.failure_kind = failure_kind
         self.execution_receipt_ref = execution_receipt_ref
+        self.provider_receipt_ref = provider_receipt_ref
 
 
 class CodexRunner:
@@ -254,6 +312,8 @@ class CodexRunner:
     def bind_runner_call(self, *, runner_call_id: int, reconcile_protocol: str,
                          phase: str, purpose: str) -> None:
         """Bind the next invocation receipt to its durable DB owner intent."""
+        if self._runner_call_id is not None:
+            raise ValueError("CodexRunner 已有未消费的 runner_call binding")
         if (isinstance(runner_call_id, bool) or not isinstance(runner_call_id, int)
                 or runner_call_id <= 0):
             raise ValueError("runner_call_id 须为正整数")
@@ -269,7 +329,8 @@ class CodexRunner:
     # -- Runner Protocol -----------------------------------------------------
     def run_task(self, *, system_prompt: str, skill: str, context_pack: ContextPack) -> Artifact:
         prompt = self._build_prompt(system_prompt, skill, context_pack)
-        raw, usage, transcript_ref, execution_receipt_ref = self._invoke(prompt, context_pack)
+        raw, usage, transcript_ref, execution_receipt_ref, provider_receipt_ref = self._invoke(
+            prompt, context_pack)
         try:
             files, md = self._parse_envelope(raw)
         except RunnerError as e:
@@ -280,11 +341,14 @@ class CodexRunner:
                 e.transcript_ref = transcript_ref
             if e.execution_receipt_ref is None:
                 e.execution_receipt_ref = execution_receipt_ref
+            if e.provider_receipt_ref is None:
+                e.provider_receipt_ref = provider_receipt_ref
             raise
         return Artifact(
             stage=context_pack.stage, files=files, md=md, usage=usage,
             transcript_ref=transcript_ref,
-            execution_receipt_ref=execution_receipt_ref)
+            execution_receipt_ref=execution_receipt_ref,
+            provider_receipt_ref=provider_receipt_ref)
 
     # -- 内部 ------------------------------------------------------------------
     def _build_prompt(self, system_prompt: str, skill: str, pack: ContextPack) -> str:
@@ -313,8 +377,11 @@ class CodexRunner:
         ]
         return "".join(parts)
 
-    def _invoke(self, prompt: str, pack: ContextPack) -> "tuple[str, CallUsage, str, Optional[str]]":
-        """跑一次 codex exec，返回 (信封文本, CallUsage)。用量：stderr 报的总 token + 墙钟秒（步⑩ 成本记账）。
+    def _invoke(self, prompt: str, pack: ContextPack) -> "tuple[str, CallUsage, str, Optional[str], Optional[str]]":
+        """跑一次 codex exec，返回信封、用量及 execution/provider 回执。
+
+        provider 回执在 guardian 已证明进程树 terminal 后、任何输出解析之前持久化；因此即使随后
+        信封解析或数据库收口前崩溃，startup reconciliation 仍能精确补 token 账。
         失败也把当下可见的 token/墙钟挂到 RunnerError.usage，供 provider 在重试前记账。"""
         self._call_no += 1
         runner_call_id = self._runner_call_id
@@ -351,7 +418,7 @@ class CodexRunner:
         command_bin = (os.environ.get("METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex")
                        if self.tool_free else self.bin)
         cmd = [
-            command_bin, "exec",
+            command_bin, "exec", "--json",
             "-s", "read-only", "--skip-git-repo-check", "--ignore-user-config", "--ephemeral",
             "-m", self.model,
             "-c", f"model_reasoning_effort={self.effort}",
@@ -364,7 +431,7 @@ class CodexRunner:
             # interaction_query 只能基于内联投影回答。关闭可读取宿主文件/外部状态或再委派的能力；
             # --strict-config 使未来 CLI 移除/改名能力开关时 fail loud，不静默退回带工具 agent。
             cmd[2:2] = [
-                "--json", "--strict-config", "--ignore-rules",
+                "--strict-config", "--ignore-rules",
                 "-c", 'web_search="disabled"',
                 "--disable", "shell_tool",
                 "--disable", "unified_exec",
@@ -399,6 +466,10 @@ class CodexRunner:
             cmd = ["/usr/bin/sudo", "-n", "-u", self.query_user, "-H", "env", *env_args, *cmd]
         t0 = time.monotonic()
         copy_error = None
+        provider_receipt_ref = None
+        execution_receipt_ref = None
+        usage = CallUsage(tokens_known=False)
+        stderr = stdout = ""
         try:
             with prompt_file.open("rb") as fh:
                 proc = self.execution_supervisor.run(
@@ -415,12 +486,39 @@ class CodexRunner:
                         "db_owner_id": runner_call_id,
                         "db_phase": runner_call_phase,
                         "db_purpose": runner_call_purpose,
-                        "reconcile_protocol": reconcile_protocol})
+                        "reconcile_protocol": reconcile_protocol,
+                        "provider": ("codex-cli" if runner_call_id is not None else None),
+                        "provider_model": (self.model if runner_call_id is not None else None),
+                        "provider_effort": (self.effort if runner_call_id is not None else None),
+                        "prompt_sha256": (
+                            "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                            if runner_call_id is not None else None)})
+            wallclock = round(time.monotonic() - t0, 3)
+            execution_receipt_ref = (
+                str(proc.receipt_path) if getattr(proc, "receipt_path", None) is not None else None)
+            stderr = self._stream_text(proc.stderr)
+            stdout = self._stream_text(proc.stdout)
+            usage, usage_source = self._usage_with_source(
+                stderr, wallclock, stdout)
+            provider_receipt_ref = self._publish_provider_receipt(
+                runner_call_id=runner_call_id, cycle_id=pack.cycle_id,
+                phase=runner_call_phase, purpose=runner_call_purpose,
+                prompt=prompt, usage=usage, usage_source=usage_source,
+                stderr=stderr, json_trace=stdout,
+                execution_receipt_ref=execution_receipt_ref, tag=tag)
         except subprocess.TimeoutExpired as e:
             wallclock = round(time.monotonic() - t0, 3)
             stderr = self._stream_text(getattr(e, "stderr", None))
             stdout = self._stream_text(getattr(e, "stdout", None))
-            usage = self._usage(stderr, wallclock, stdout)
+            usage, usage_source = self._usage_with_source(stderr, wallclock, stdout)
+            execution_receipt_ref = (
+                str(e.receipt_path) if hasattr(e, "receipt_path") else None)
+            provider_receipt_ref = self._publish_provider_receipt(
+                runner_call_id=runner_call_id, cycle_id=pack.cycle_id,
+                phase=runner_call_phase, purpose=runner_call_purpose,
+                prompt=prompt, usage=usage, usage_source=usage_source,
+                stderr=stderr, json_trace=stdout,
+                execution_receipt_ref=execution_receipt_ref, tag=tag)
             if self.tool_free and stdout:
                 try:
                     events_file.write_text(stdout, encoding="utf-8")
@@ -430,18 +528,53 @@ class CodexRunner:
             raise RunnerError(
                 f"runner 超时（{self.timeout_s}s）：{tag}", usage=usage,
                 failure_kind="timeout",
-                execution_receipt_ref=(str(e.receipt_path)
-                                       if hasattr(e, "receipt_path") else None)) from e
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref) from e
         except ExecutionCleanupError as e:
             wallclock = round(time.monotonic() - t0, 3)
-            usage = self._usage("", wallclock, "")
+            usage, usage_source = self._usage_with_source("", wallclock, "")
+            execution_receipt_ref = str(e.receipt_path)
+            provider_receipt_ref = self._publish_provider_receipt(
+                runner_call_id=runner_call_id, cycle_id=pack.cycle_id,
+                phase=runner_call_phase, purpose=runner_call_purpose,
+                prompt=prompt, usage=usage, usage_source=usage_source,
+                stderr="", json_trace="",
+                execution_receipt_ref=execution_receipt_ref, tag=tag)
             raise RunnerError(
                 f"runner descendant cleanup 拒绝结果：{tag}（{e.receipt.get('outcome')}）",
                 usage=usage, failure_kind=str(e.receipt.get("outcome") or "runtime"),
-                execution_receipt_ref=str(e.receipt_path)) from e
-        except ExecutionSupervisorError:
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref) from e
+        except ExecutionSupervisorError as error:
             # Cancellation/hard-stop and unsafe recovery are lifecycle control
-            # signals, not retryable model/artifact failures.
+            # signals, not retryable model/artifact failures.  A terminal
+            # receipt, when present, still gets an honest unknown-usage provider
+            # receipt before the control signal continues upward.
+            execution_path = (getattr(error, "receipt_path", None)
+                              or getattr(error, "execution_receipt_path", None))
+            wallclock = round(time.monotonic() - t0, 3)
+            usage, usage_source = self._usage_with_source("", wallclock, "")
+            if execution_path is not None:
+                execution_receipt_ref = str(execution_path)
+                try:
+                    provider_receipt_ref = self._publish_provider_receipt(
+                        runner_call_id=runner_call_id, cycle_id=pack.cycle_id,
+                        phase=runner_call_phase, purpose=runner_call_purpose,
+                        prompt=prompt, usage=usage, usage_source=usage_source,
+                        stderr="", json_trace="",
+                        execution_receipt_ref=execution_receipt_ref, tag=tag)
+                except BaseException as receipt_error:
+                    note = getattr(error, "add_note", None)
+                    if callable(note):
+                        note(f"provider invocation receipt 持久化失败: {receipt_error}")
+            for name, value in (
+                    ("usage", usage),
+                    ("execution_receipt_ref", execution_receipt_ref),
+                    ("provider_receipt_ref", provider_receipt_ref)):
+                try:
+                    setattr(error, name, value)
+                except BaseException:
+                    pass
             raise
         finally:
             if runtime_dir is not None:
@@ -453,16 +586,11 @@ class CodexRunner:
                 except (OSError, ValueError) as error:
                     copy_error = error
                 shutil.rmtree(runtime_dir, ignore_errors=True)
-        wallclock = round(time.monotonic() - t0, 3)
-        execution_receipt_ref = (
-            str(proc.receipt_path) if getattr(proc, "receipt_path", None) is not None else None)
-        stderr = self._stream_text(proc.stderr)
-        stdout = self._stream_text(proc.stdout)
-        usage = self._usage(stderr, wallclock, stdout if self.tool_free else "")
         if copy_error is not None:
             raise RunnerError(
                 f"tool-free runner 输出接收失败：{tag}（{copy_error}）", usage=usage,
-                transcript_ref=str(out_file), execution_receipt_ref=execution_receipt_ref)
+                transcript_ref=str(out_file), execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref)
         if self.tool_free:
             try:
                 events_file.write_text(stdout, encoding="utf-8")
@@ -471,14 +599,16 @@ class CodexRunner:
                 raise RunnerError(
                     f"tool-free runner 事件回执归档失败：{tag}（{error}）", usage=usage,
                     transcript_ref=str(out_file),
-                    execution_receipt_ref=execution_receipt_ref) from error
+                    execution_receipt_ref=execution_receipt_ref,
+                    provider_receipt_ref=provider_receipt_ref) from error
         if proc.returncode != 0 or not out_file.exists():
             tail = stderr[-500:]
             raise RunnerError(
                 f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}", usage=usage,
                 transcript_ref=str(out_file),
                 failure_kind="runtime",
-                execution_receipt_ref=execution_receipt_ref)
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref)
         if self.tool_free:
             try:
                 validate_tool_free_trace(stdout)
@@ -486,6 +616,7 @@ class CodexRunner:
                 error.usage = usage
                 error.transcript_ref = str(out_file)
                 error.execution_receipt_ref = execution_receipt_ref
+                error.provider_receipt_ref = provider_receipt_ref
                 raise
         try:
             raw = out_file.read_text(encoding="utf-8")
@@ -493,24 +624,72 @@ class CodexRunner:
             raise RunnerError(
                 f"runner 输出读取失败：{tag}（{e}）", usage=usage,
                 transcript_ref=str(out_file),
-                execution_receipt_ref=execution_receipt_ref) from e
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref) from e
         try:
             os.chmod(out_file, 0o600)
         except OSError as error:
             raise RunnerError(
                 f"runner 输出权限收紧失败：{tag}（{error}）", usage=usage,
                 transcript_ref=str(out_file),
-                execution_receipt_ref=execution_receipt_ref) from error
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref) from error
         return (raw, usage, str(out_file),
-                execution_receipt_ref)
+                execution_receipt_ref, provider_receipt_ref)
+
+    def _publish_provider_receipt(
+            self, *, runner_call_id: Optional[int], cycle_id: str,
+            phase: Optional[str], purpose: Optional[str], prompt: str,
+            usage: CallUsage, usage_source: str, stderr: str, json_trace: str,
+            execution_receipt_ref: Optional[str], tag: str) -> Optional[str]:
+        if runner_call_id is None:
+            return None
+        if execution_receipt_ref is None or phase is None or purpose is None:
+            raise RunnerError(
+                f"provider invocation 缺 durable execution/runner binding：{tag}",
+                usage=usage, failure_kind="provider_receipt_failed",
+                execution_receipt_ref=execution_receipt_ref)
+        provider_id, provider_id_kind = parse_provider_invocation_id(stderr, json_trace)
+        try:
+            return write_provider_invocation_receipt(
+                receipt_dir=Path(execution_receipt_ref).parent,
+                runner_call_id=runner_call_id, cycle_id=cycle_id,
+                phase=phase, purpose=purpose, provider="codex-cli",
+                model=self.model, effort=self.effort,
+                prompt_sha256="sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                usage=usage, usage_source=usage_source,
+                execution_receipt_ref=execution_receipt_ref,
+                provider_invocation_id=provider_id,
+                provider_invocation_id_kind=provider_id_kind)
+        except RunnerError:
+            raise
+        except BaseException as error:
+            raise RunnerError(
+                f"provider invocation receipt 持久化失败：{tag}（{error}）",
+                usage=usage, failure_kind="provider_receipt_failed",
+                execution_receipt_ref=execution_receipt_ref) from error
 
     @staticmethod
     def _usage(stderr: str, wallclock: float, json_trace: str = "") -> CallUsage:
-        tokens = parse_tokens_used(stderr)
-        if tokens is None and json_trace:
-            tokens = parse_json_tokens_used(json_trace)
-        return CallUsage(tokens_total=tokens or 0, wallclock_sec=wallclock,
-                         tokens_known=tokens is not None)
+        return CodexRunner._usage_with_source(stderr, wallclock, json_trace)[0]
+
+    @staticmethod
+    def _usage_with_source(stderr: str, wallclock: float,
+                           json_trace: str = "") -> "tuple[CallUsage, str]":
+        stderr_total = parse_tokens_used(stderr)
+        json_usage = parse_json_usage(json_trace) if json_trace else None
+        if stderr_total is not None and json_usage is not None:
+            if stderr_total != json_usage.tokens_total:
+                return (CallUsage(wallclock_sec=wallclock, tokens_known=False), "conflict")
+            json_usage.wallclock_sec = wallclock
+            return json_usage, "stderr_and_json"
+        if json_usage is not None:
+            json_usage.wallclock_sec = wallclock
+            return json_usage, "json_turn_completed"
+        if stderr_total is not None:
+            return (CallUsage(tokens_total=stderr_total, wallclock_sec=wallclock,
+                              tokens_known=True), "stderr_tokens_used")
+        return CallUsage(wallclock_sec=wallclock, tokens_known=False), "unavailable"
 
     @staticmethod
     def _stream_text(raw) -> str:

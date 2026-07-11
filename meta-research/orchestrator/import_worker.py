@@ -32,12 +32,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import harness as H
 from . import obs_parser as OP
 from . import subject_manifest as SM
+from .artifact_capability import (
+    ArtifactCapabilityError,
+    open_artifact,
+    open_directory,
+    read_artifact_bytes,
+    verify_open_fd,
+    verify_tree_fd,
+)
 from .attack_stages import AttackStages, _BundleReject, _canon_hash, judge_once
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
@@ -405,8 +414,17 @@ class ImportWorker:
                 if parent.exists() and parent.is_symlink():
                     raise RuntimeError(f"import clone parent 不得是 symlink: {parent}")
             payload = content if isinstance(content, bytes) else str(content).encode()
+            expected_file_hash = hashlib.sha256(payload).hexdigest()
             if f.exists():
-                if f.is_symlink() or not f.is_file() or f.read_bytes() != payload:
+                try:
+                    existing = read_artifact_bytes(
+                        f, expected_hash=expected_file_hash,
+                        expected_size=len(payload),
+                        label=f"import clone {name}")
+                except ArtifactCapabilityError as error:
+                    raise RuntimeError(
+                        f"import clone 既有文件与冻结 snapshot 不一致: {name}") from error
+                if existing != payload:
                     raise RuntimeError(f"import clone 既有文件与冻结 snapshot 不一致: {name}")
             else:
                 f.parent.mkdir(parents=True, exist_ok=True)
@@ -444,8 +462,11 @@ class ImportWorker:
                 if not exit_file.exists():
                     raise RuntimeError(
                         f"staging 损毁：{existing_final} 在而 exit 侧车缺——须人工核")
-                smoke_bytes = existing_final.read_bytes()
-                sm = {"exit_code": int(exit_file.read_text()),
+                smoke_bytes = read_artifact_bytes(
+                    existing_final, label="persisted import smoke log")
+                sm = {"exit_code": int(read_artifact_bytes(
+                          exit_file, max_bytes=32,
+                          label="import smoke exit sidecar").decode("ascii")),
                       "log_path": str(existing_final),
                       "log_sha256": hashlib.sha256(smoke_bytes).hexdigest(),
                       "log_bytes": len(smoke_bytes)}
@@ -456,8 +477,8 @@ class ImportWorker:
                     execution_kind="import-smoke", execution_context=smoke_context)
                 if sm is None:
                     self.owner_guard()
-                    sm = H.run_staged(
-                        self._resolved_cmd(spec["smoke_cmd"], clone_dir, spec),
+                    sm = self._run_frozen_command(
+                        spec["smoke_cmd"], clone_dir, spec,
                         staging_dir=str(smoke_dir),
                         log_name=smoke_name, timeout_s=120,
                         execution_supervisor=self.execution_supervisor,
@@ -487,15 +508,54 @@ class ImportWorker:
                                                  staging, clone_dir, manifest_hash, revision)
         return st() == "complete"
 
-    @staticmethod
-    def _resolved_cmd(cmd, clone_dir: Path, spec: Dict[str, Any]) -> List[str]:
-        """Expand the only two frozen adapter capabilities without invoking a shell."""
-        artifact = clone_dir / (spec.get("artifact_relpath") or sorted(spec["files"])[0])
-        resolved = []
-        for arg in cmd:
-            value = arg.replace("{repo}", str(clone_dir)).replace("{artifact}", str(artifact))
-            resolved.append(value)
-        return resolved
+    def _run_frozen_command(self, cmd, clone_dir: Path, spec: Dict[str, Any],
+                            **run_kwargs):
+        """Run an adapter against stable dir/file capabilities, then re-verify bytes."""
+        rel = spec.get("artifact_relpath") or sorted(spec["files"])[0]
+        payloads = {
+            name: payload if isinstance(payload, bytes) else str(payload).encode()
+            for name, payload in spec["files"].items()
+        }
+        hashes = {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in payloads.items()
+        }
+        source_fd = -1
+        artifact_fd = -1
+        try:
+            source_fd = open_directory(clone_dir, label="import frozen tree")
+            verify_tree_fd(
+                source_fd, hashes, label="import frozen tree", exact=True)
+            capability = open_artifact(
+                Path(f"/proc/self/fd/{source_fd}") / rel,
+                expected_hash=hashes[rel], expected_size=len(payloads[rel]),
+                label="import artifact capability")
+            identity = capability.identity
+            artifact_fd = capability.detach()
+            repo_proc = f"/proc/self/fd/{source_fd}"
+            artifact_proc = f"/proc/self/fd/{artifact_fd}"
+            resolved = [
+                arg.replace("{repo}", repo_proc).replace("{artifact}", artifact_proc)
+                for arg in cmd
+            ]
+            result = H.run_staged(
+                resolved, pass_fds=(source_fd, artifact_fd), **run_kwargs)
+            verify_open_fd(
+                artifact_fd, expected_hash=identity.content_hash,
+                expected_size=identity.size_bytes,
+                expected_device=identity.device, expected_inode=identity.inode)
+            verify_tree_fd(
+                source_fd, hashes, label="import frozen tree post-use", exact=True)
+            return result
+        except ArtifactCapabilityError as error:
+            raise RuntimeError(str(error)) from error
+        finally:
+            for fd in (artifact_fd, source_fd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def _run_and_register_import(self, cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
                                  staging: Path, clone_dir: Path, manifest_hash: str, revision: str) -> bool:
@@ -516,16 +576,30 @@ class ImportWorker:
             rid = g.gate_start_run(build_target_id=bt_id, cycle_id=cyc_id, variant_id=vid, kind="import",
                                    env_hash=spec.get("env_hash", "import-env"))
             main_file = spec.get("artifact_relpath") or sorted(spec["files"])[0]
+            main_payload = (spec["files"][main_file]
+                            if isinstance(spec["files"][main_file], bytes)
+                            else str(spec["files"][main_file]).encode())
             cand_row = d.query_one("SELECT canonical_uri FROM external_candidate WHERE id=?", (cand_id,))
-            with d.transaction() as conn:      # checkpoint = 外部可评 target（供应链溯源列 DDL CHECK 焊）
-                conn.execute("INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,artifact_type,"
-                             "origin,manifest_hash,source_uri,revision,produced_by_run) "
-                             "VALUES (?,?,?,?,'sha256',?,'external_import',?,?,?,?)",
-                             (vid, f"import-r{rid}", str(clone_dir / main_file),
-                              H.file_sha256(str(clone_dir / main_file)),
-                              spec.get("artifact_type", "external_model"),
-                              manifest_hash, cand_row[0], revision, rid))
-            g.gate_finish_run(run_id=rid, status="success")
+            with open_artifact(
+                    clone_dir / main_file,
+                    expected_hash=hashlib.sha256(main_payload).hexdigest(),
+                    expected_size=len(main_payload),
+                    label="import checkpoint artifact") as artifact_capability:
+                artifact_hash = artifact_capability.identity.content_hash.removeprefix(
+                    "sha256:")
+                with d.transaction() as conn:  # checkpoint = 外部可评 target（供应链溯源列 DDL CHECK 焊）
+                    conn.execute("INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,artifact_type,"
+                                 "origin,manifest_hash,source_uri,revision,produced_by_run) "
+                                 "VALUES (?,?,?,?,'sha256',?,'external_import',?,?,?,?)",
+                                 (vid, f"import-r{rid}", str(clone_dir / main_file),
+                                  artifact_hash,
+                                  spec.get("artifact_type", "external_model"),
+                                  manifest_hash, cand_row[0], revision, rid))
+                artifact_capability.verify_unchanged()
+                artifact_capability.verify_path_binding()
+                g.gate_finish_run(run_id=rid, status="success")
+                artifact_capability.verify_unchanged()
+                artifact_capability.verify_path_binding()
         # 出厂评估（源仍 factory——外部性只在 checkpoint.origin+manifest_hash，§3.6.3 证据归属）。
         # 与 attack lockstep：任何外部 eval 进程放行前，evaluation+attempt(running) 已耐久落库；
         # guardian receipt 因而能以 execution-owner-v1 精确回指 DB owner，禁止事后伪造成功 attempt。
@@ -591,8 +665,12 @@ class ImportWorker:
                 exit_file = eval_final.with_name("eval.log.exit")
                 if not exit_file.exists():
                     raise RuntimeError(f"staging 损毁：{eval_final} 在而 exit 侧车缺——须人工核")
-                ev = {"log_path": str(eval_final), "exit_code": int(exit_file.read_text())}
-                eval_log = eval_final.read_bytes()
+                ev = {"log_path": str(eval_final), "exit_code": int(
+                    read_artifact_bytes(
+                        exit_file, max_bytes=32,
+                        label="import eval exit sidecar").decode("ascii"))}
+                eval_log = read_artifact_bytes(
+                    eval_final, label="persisted import eval log")
                 ev["log_sha256"] = hashlib.sha256(eval_log).hexdigest()
             else:
                 ev = H.recover_staged_result(
@@ -601,13 +679,16 @@ class ImportWorker:
                     execution_kind="import-eval", execution_context=eval_context)
                 if ev is None:
                     self.owner_guard()
-                    ev = H.run_staged(
-                        self._resolved_cmd(spec["eval_cmd"], clone_dir, spec),
+                    ev = self._run_frozen_command(
+                        spec["eval_cmd"], clone_dir, spec,
                         staging_dir=str(eval_dir),
                         log_name="eval.log", timeout_s=600,
                         execution_supervisor=self.execution_supervisor,
                         execution_kind="import-eval", execution_context=eval_context)
-                eval_log = Path(ev["log_path"]).read_bytes()
+                eval_log = read_artifact_bytes(
+                    ev["log_path"], expected_hash=ev["log_sha256"],
+                    expected_size=ev.get("log_bytes"),
+                    label="import eval log receipt")
             if ev["exit_code"] != 0:               # factory eval 失败 → 不 pool_publish
                 g.gate_finish_attempt(
                     attempt_id=aid, status="failed", failure_kind="runtime",
@@ -815,11 +896,12 @@ class ImportWorker:
         """attempt-owned eval log 补登+ingest（幂等 + sha256 锚强校验——同 attack_stages 契约）。"""
         if aid is None or not log_path.exists():
             return
-        data = log_path.read_bytes()
-        got = hashlib.sha256(data).hexdigest()
         exp = self.state.daemon.query_one("SELECT artifact_ref FROM evaluation_attempt WHERE id=?", (aid,))
         if not exp or not exp[0] or not exp[0].startswith("sha256:"):
             raise RuntimeError(f"attempt {aid} 无 sha256: artifact_ref 锚——拒绝从 staging 补登")
+        data = read_artifact_bytes(
+            log_path, expected_hash=exp[0], label="import eval log backfill")
+        got = hashlib.sha256(data).hexdigest()
         if exp[0] != f"sha256:{got}":
             raise RuntimeError(f"eval log 补登哈希不符（锚 {exp[0][:19]}…，实收 sha256:{got[:12]}…）——staging 被改写")
         elid = H.register_execution_log(self.state.daemon, cycle_id=cyc_id, log_kind="eval", ref=str(log_path),

@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from .artifact_capability import open_artifact, read_artifact_bytes
 from .ids import cnum as _cnum
 from .process_supervisor import (ExecutionRecoveryError, ExecutionSupervisor,
                                  atomic_write_receipt, read_receipt)
@@ -185,7 +186,7 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
     })
     os.replace(partial, final)
     _fsync_dir(directory)
-    data = final.read_bytes()
+    data = read_artifact_bytes(final, label="recovered staged log")
     return {
         "exit_code": exit_code, "log_path": str(final),
         "log_sha256": hashlib.sha256(data).hexdigest(), "log_bytes": len(data),
@@ -283,7 +284,7 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
     _ensure_exit_sidecar(d, log_name, exit_code)
     os.replace(partial, final)          # 原子改名：只有完整跑完的 log 得正式名（P6 staging 纪律）
     _fsync_dir(d)
-    data = final.read_bytes()
+    data = read_artifact_bytes(final, label="completed staged log")
     return {"exit_code": exit_code, "log_path": str(final),
             "log_sha256": hashlib.sha256(data).hexdigest(), "log_bytes": len(data),
             "process_receipt_path": str(result.receipt_path),
@@ -293,7 +294,8 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
 
 def file_sha256(path: str) -> str:
     """产物文件 content_hash（checkpoint/指标值文件等入账用）。"""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    with open_artifact(path, label="content-hash artifact") as capability:
+        return capability.identity.content_hash.removeprefix("sha256:")
 
 
 def latest_smoke_log(smoke_dir: Path) -> Optional[Path]:
