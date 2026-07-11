@@ -8,7 +8,7 @@ does not clone or execute it.  This module closes the production hand-off:
 * download a commit-addressed source archive, extract it without ``tarfile``
   path/link semantics, and match every regular file to its Git blob SHA-1;
 * recursively materialize pinned GitHub submodules under an explicit license
-  policy; reject Git LFS pointers until an OID-verified transfer is available;
+  policy and replace Git LFS pointers only after Batch/OID/size verification;
 * validate the repository's declarative adapter v2, allocate stable numeric
   protocol/metric identities, and generate the full supply-chain manifest; and
 * atomically publish a file-backed, read-only content-addressed snapshot plus
@@ -46,6 +46,9 @@ from .repository_materialization_common import (
 )
 from .repository_materializer_adapter import _RepositoryAdapterMixin
 from .repository_materializer_archive import _RepositoryArchiveMixin
+from .repository_materializer_lfs import (
+    _LfsBatchRedirectHandler, _LfsObjectRedirectHandler, _RepositoryLfsMixin,
+)
 from .repository_materializer_transport import (
     _ApiRedirectHandler, _ArchiveRedirectHandler, _RepositoryTransportMixin,
 )
@@ -54,8 +57,8 @@ from .repository_materializer_store import _RepositoryStoreMixin
 
 
 class GitHubRepositoryMaterializer(
-        _RepositoryTransportMixin, _RepositoryTreeMixin, _RepositoryArchiveMixin,
-        _RepositoryAdapterMixin, _RepositoryStoreMixin):
+        _RepositoryTransportMixin, _RepositoryTreeMixin, _RepositoryLfsMixin,
+        _RepositoryArchiveMixin, _RepositoryAdapterMixin, _RepositoryStoreMixin):
     """Materialize one exact GitHub commit and repository adapter v2."""
 
     name = "github_archive_v1"
@@ -68,6 +71,11 @@ class GitHubRepositoryMaterializer(
             api_getter: Optional[Callable[[str, str], Any]] = None,
             archive_fetcher: Optional[
                 Callable[[str, str, Path, int], Mapping[str, Any]]] = None,
+            lfs_batch_getter: Optional[
+                Callable[[str, str, Mapping[str, Any]], Any]] = None,
+            lfs_object_fetcher: Optional[
+                Callable[[str, Mapping[str, str], Path, int],
+                         Mapping[str, Any]]] = None,
             token_env: str = "METARESEARCH_GITHUB_TOKEN"):
         self.work_root = Path(os.path.abspath(os.fspath(work_root)))
         self.config = dict(config)
@@ -79,16 +87,23 @@ class GitHubRepositoryMaterializer(
         self._validate_config()
         self.api_getter = api_getter
         self.archive_fetcher = archive_fetcher
+        self.lfs_batch_getter = lfs_batch_getter
+        self.lfs_object_fetcher = lfs_object_fetcher
         self._api_opener = urllib.request.build_opener(_ApiRedirectHandler()).open
         self._archive_opener = urllib.request.build_opener(
             _ArchiveRedirectHandler(self.config["allowed_archive_hosts"])).open
+        self._lfs_batch_opener = urllib.request.build_opener(
+            _LfsBatchRedirectHandler()).open
+        self._lfs_object_opener = urllib.request.build_opener(
+            _LfsObjectRedirectHandler(self.config["allowed_lfs_hosts"])).open
 
     def _validate_config(self) -> None:
         required = {
             "provider", "adapter_path", "timeout_s", "max_api_response_bytes",
             "max_archive_bytes", "max_file_bytes", "max_total_bytes", "max_files",
             "max_tree_depth", "max_tree_objects", "max_submodules", "lfs_policy",
-            "allowed_archive_hosts", "dependency_lock_names", "compiler",
+            "max_lfs_objects", "lfs_batch_size", "allowed_archive_hosts",
+            "allowed_lfs_hosts", "dependency_lock_names", "compiler",
         }
         if set(self.config) != required or self.config.get("provider") != self.name:
             raise ValueError("policy.import_materialization 字段闭包/provider 非法")
@@ -103,6 +118,8 @@ class GitHubRepositoryMaterializer(
             "max_tree_depth": (1, 128),
             "max_tree_objects": (1, 100000),
             "max_submodules": (0, 256),
+            "max_lfs_objects": (0, 100000),
+            "lfs_batch_size": (1, 100),
         }
         for key, (minimum, maximum) in bounds.items():
             value = self.config[key]
@@ -115,16 +132,23 @@ class GitHubRepositoryMaterializer(
                 or not math.isfinite(float(timeout))
                 or not 1 <= float(timeout) <= 300):
             raise ValueError("import_materialization.timeout_s 非正有限数")
-        if self.config["lfs_policy"] != "reject":
-            raise ValueError("CP11.4c.2a 只接受显式 lfs_policy=reject")
-        hosts = self.config["allowed_archive_hosts"]
-        if (not isinstance(hosts, list) or not 1 <= len(hosts) <= 8
-                or len(set(hosts)) != len(hosts)
-                or any(not isinstance(host, str) or host != host.lower()
-                       or re.fullmatch(
-                           r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host) is None
-                       for host in hosts)):
-            raise ValueError("import_materialization archive host allowlist 非法")
+        # The checked-in production schema requires ``fetch``.  Keep ``reject``
+        # as a fail-closed constructor compatibility mode for frozen older
+        # policies and isolated tests; it can never enable an unverified object.
+        if self.config["lfs_policy"] not in ("reject", "fetch"):
+            raise ValueError("import_materialization.lfs_policy 非封闭值")
+        for key, minimum, maximum in (
+                ("allowed_archive_hosts", 1, 8),
+                ("allowed_lfs_hosts", 1, 32)):
+            hosts = self.config[key]
+            if (not isinstance(hosts, list) or not minimum <= len(hosts) <= maximum
+                    or len(set(hosts)) != len(hosts)
+                    or any(not isinstance(host, str) or host != host.lower()
+                           or re.fullmatch(
+                               r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host) is None
+                           for host in hosts)):
+                raise ValueError(
+                    f"import_materialization {key} host allowlist 非法")
         locks = self.config["dependency_lock_names"]
         if (not isinstance(locks, list) or not 1 <= len(locks) <= 64
                 or len(set(locks)) != len(locks)
@@ -360,7 +384,7 @@ class GitHubRepositoryMaterializer(
                 tree_root=tree_root, downloads=downloads,
                 seen_repositories=set(), all_ledger=ledger,
                 sources=sources, submodule_records=submodules,
-                tree_counter=[0], is_root=True)
+                tree_counter=[0], global_lfs_objects={}, is_root=True)
             if not sources or sources[0].get("repository") != repository:
                 raise RepositoryMaterializationError(
                     "root repository source record 缺失")
@@ -371,6 +395,7 @@ class GitHubRepositoryMaterializer(
                         and item["repository"] == repository
                         and item["revision"] == revision)]
                 if (len(root_license_matches) != 1
+                        or "lfs" in root_license_matches[0]
                         or root_license_matches[0]["sha256"]
                         != root_license["content_sha256"]):
                     raise RepositoryMaterializationError(

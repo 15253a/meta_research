@@ -172,8 +172,8 @@
     },
     "import_materialization": {
       "type": "object",
-      "description": "pinned GitHub commit 的可信 host 物化：Git tree/archive 双核、内容寻址发布与 adapter v2；LFS 未实现时必须显式 reject",
-      "required": ["provider", "adapter_path", "timeout_s", "max_api_response_bytes", "max_archive_bytes", "max_file_bytes", "max_total_bytes", "max_files", "max_tree_depth", "max_tree_objects", "max_submodules", "lfs_policy", "allowed_archive_hosts", "dependency_lock_names", "compiler"],
+      "description": "pinned GitHub commit 的可信 host 物化：Git tree/archive、Git LFS OID/size 双核、内容寻址发布与 adapter v2",
+      "required": ["provider", "adapter_path", "timeout_s", "max_api_response_bytes", "max_archive_bytes", "max_file_bytes", "max_total_bytes", "max_files", "max_tree_depth", "max_tree_objects", "max_submodules", "lfs_policy", "max_lfs_objects", "lfs_batch_size", "allowed_archive_hosts", "allowed_lfs_hosts", "dependency_lock_names", "compiler"],
       "additionalProperties": false,
       "properties": {
         "provider": { "const": "github_archive_v1" },
@@ -187,9 +187,15 @@
         "max_tree_depth": { "type": "integer", "minimum": 1, "maximum": 128 },
         "max_tree_objects": { "type": "integer", "minimum": 1, "maximum": 100000 },
         "max_submodules": { "type": "integer", "minimum": 0, "maximum": 256 },
-        "lfs_policy": { "const": "reject" },
+        "lfs_policy": { "const": "fetch" },
+        "max_lfs_objects": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "lfs_batch_size": { "type": "integer", "minimum": 1, "maximum": 100 },
         "allowed_archive_hosts": {
           "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$" }
+        },
+        "allowed_lfs_hosts": {
+          "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true,
           "items": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$" }
         },
         "dependency_lock_names": {

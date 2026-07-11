@@ -154,7 +154,10 @@ class _RepositoryStoreMixin:
                 raise RepositoryMaterializationError(
                     "repository snapshot ledger 未 canonical 排序")
             for item in ledger:
-                if (not isinstance(item, dict) or set(item) != expected_ledger_keys
+                if (not isinstance(item, dict)
+                        or set(item) not in (
+                            expected_ledger_keys,
+                            expected_ledger_keys | {"lfs"})
                         or not isinstance(item.get("path"), str)
                         or _safe_relpath(
                             item["path"], field="published ledger path",
@@ -174,6 +177,20 @@ class _RepositoryStoreMixin:
                         or _COMMIT_RE.fullmatch(item["revision"]) is None):
                     raise RepositoryMaterializationError(
                         "repository snapshot ledger 非法")
+                lfs = item.get("lfs")
+                if lfs is not None and (
+                        not isinstance(lfs, dict)
+                        or set(lfs) != {
+                            "oid", "size", "pointer_sha256", "pointer_bytes"}
+                        or lfs.get("oid") != item["sha256"]
+                        or lfs.get("size") != item["bytes"]
+                        or not isinstance(lfs.get("pointer_sha256"), str)
+                        or _SHA256_RE.fullmatch(lfs["pointer_sha256"]) is None
+                        or isinstance(lfs.get("pointer_bytes"), bool)
+                        or not isinstance(lfs.get("pointer_bytes"), int)
+                        or not 0 < lfs["pointer_bytes"] < 1024):
+                    raise RepositoryMaterializationError(
+                        "repository snapshot LFS ledger 非法")
                 hashes[item["path"]] = item["sha256"]
             tree_fd = open_directory(
                 anchored / "tree", label="published repository tree")

@@ -442,6 +442,12 @@
             16/43；AST/compat 等价；外审第 2 轮 APPROVE；唯一全量 1382）。
           - [ ] CP11.4c.2b.2 repository closure：缺失 adapter 的有界生成/评审、Git LFS batch OID+size 下载核验、
             dependency lock 到专用 exact image 的可复现构建与启动验收。
+            - [ ] CP11.4c.2b.2a exact LFS objects：按官方 Batch API 只接受 basic/HTTPS allowlist，pointer Git blob、
+              OID、size、下载 bytes 与最终 ledger/manifest 交叉核；transport 临时授权不进入复现身份。
+            - [ ] CP11.4c.2b.2b dependency image closure：受支持 lock 类型的 canonical hash、离线/有界 build context、
+              exact base/result image ID 与 compiler/runtime smoke receipt，禁止隐式 tag/pull/host install。
+            - [ ] CP11.4c.2b.2c reviewed adapter generation：缺 adapter 时只从有界冻结源码生成 sidecar，schema/独立评审/
+              sandbox smoke 全过才进入 snapshot spec；生成调用、prompt、模型与产物 hash 可恢复审计。
           - [ ] CP11.4c.2b.3 deployment trust contract：service account/VM、Docker socket、cgroup/device/GPU、
             VEPFS hard byte+inode quota 启动前 fail-closed 预检与证据；开发模式不得冒充生产通过。
       - [ ] CP11.4c.3 最终实机验收：目标 VEPFS 两节点 owner/lease/fd 行为，100+ 轮含真实 Codex/import/训练、

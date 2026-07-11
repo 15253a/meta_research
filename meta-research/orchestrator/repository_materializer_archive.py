@@ -14,8 +14,7 @@ from typing import Any, Dict, Mapping, Sequence
 from .artifact_capability import read_artifact_bytes
 from .repository_materialization_common import (
     _FULL_NAME_RE, _MAX_GITMODULES_BYTES, RepositoryMaterializationError,
-    _bounded_string, _parse_lfs_pointer, _safe_component, _safe_relpath,
-    _sha256, _value_hash,
+    _bounded_string, _safe_component, _safe_relpath, _sha256, _value_hash,
 )
 
 
@@ -103,9 +102,17 @@ class _RepositoryArchiveMixin:
                 if expected_entry is None:
                     raise RepositoryMaterializationError(
                         f"archive 含 Git tree 外文件: {rel}")
+                embedded_lfs = None
                 if member.size != expected_entry["declared_bytes"]:
-                    raise RepositoryMaterializationError(
-                        f"archive {rel} size 与 Git tree 不一致")
+                    if expected_entry["declared_bytes"] < 1024:
+                        embedded_lfs = self._git_blob_lfs_pointer(
+                            expected_entry["repository"],
+                            expected_entry["git_blob_sha1"],
+                            expected_entry["declared_bytes"])
+                    if (embedded_lfs is None
+                            or member.size != embedded_lfs["size"]):
+                        raise RepositoryMaterializationError(
+                            f"archive {rel} size 与 Git tree/LFS pointer 不一致")
                 executable = expected_entry["git_mode"] == "100755"
                 if bool(member.mode & 0o111) != executable:
                     raise RepositoryMaterializationError(
@@ -151,16 +158,31 @@ class _RepositoryArchiveMixin:
                     os.close(fd)
                     source.close()
                 actual_git = sha1.hexdigest()
+                actual_sha256 = "sha256:" + sha256.hexdigest()
                 if actual_git != expected_entry["git_blob_sha1"]:
-                    raise RepositoryMaterializationError(
-                        f"archive {rel} Git blob SHA 不一致")
+                    if (embedded_lfs is None
+                            and expected_entry["declared_bytes"] < 1024):
+                        embedded_lfs = self._git_blob_lfs_pointer(
+                            expected_entry["repository"],
+                            expected_entry["git_blob_sha1"],
+                            expected_entry["declared_bytes"])
+                    if (embedded_lfs is None
+                            or member.size != embedded_lfs["size"]
+                            or actual_sha256 != embedded_lfs["oid"]):
+                        raise RepositoryMaterializationError(
+                            f"archive {rel} Git blob SHA/LFS OID 不一致")
                 seen.add(rel)
-                ledger.append({
-                    "path": rel, "sha256": "sha256:" + sha256.hexdigest(),
-                    "bytes": member.size, "git_blob_sha1": actual_git,
+                record = {
+                    "path": rel, "sha256": actual_sha256,
+                    "bytes": member.size,
+                    "git_blob_sha1": expected_entry["git_blob_sha1"],
                     "git_mode": expected_entry["git_mode"],
                     "repository": expected_entry["repository"],
-                })
+                }
+                if embedded_lfs is not None:
+                    record["lfs"] = embedded_lfs
+                    record["_lfs_transport"] = "archive"
+                ledger.append(record)
         missing = sorted(set(expected) - seen)
         if missing:
             raise RepositoryMaterializationError(
@@ -301,6 +323,7 @@ class _RepositoryArchiveMixin:
             tree_root: Path, downloads: Path, seen_repositories: set[tuple[str, str]],
             all_ledger: list[Dict[str, Any]], sources: list[Dict[str, Any]],
             submodule_records: list[Dict[str, Any]], tree_counter: list[int],
+            global_lfs_objects: Dict[str, int],
             is_root: bool) -> str:
         self.owner_guard()
         identity = (full_name.lower(), revision)
@@ -329,18 +352,13 @@ class _RepositoryArchiveMixin:
         local_ledger = self._extract_archive(
             archive=archive_path, destination=repo_destination, expected=files,
             allowed_empty_directories=[item["path"] for item in submodules])
+        lfs_transport = self._materialize_lfs_objects(
+            full_name=full_name, revision=revision,
+            repo_destination=repo_destination, downloads=downloads,
+            local_ledger=local_ledger,
+            prior_total=sum(item["bytes"] for item in all_ledger),
+            global_lfs_objects=global_lfs_objects)
         for item in local_ledger:
-            local_path = repo_destination / item["path"]
-            if item["bytes"] <= 1024:
-                pointer = _parse_lfs_pointer(read_artifact_bytes(
-                    local_path, expected_hash=item["sha256"],
-                    expected_size=item["bytes"], max_bytes=1024,
-                    label=f"LFS pointer probe:{item['path']}",
-                    progress_guard=self.owner_guard))
-                if pointer is not None:
-                    raise RepositoryMaterializationError(
-                        f"Git LFS pointer {full_name}:{item['path']} ({pointer['oid']}, "
-                        f"{pointer['size']} bytes) 被 lfs_policy=reject 拒绝")
             item = dict(item)
             combined_path = f"{prefix}/{item['path']}" if prefix else item["path"]
             item["path"] = _safe_relpath(
@@ -355,6 +373,7 @@ class _RepositoryArchiveMixin:
                 item for item in local_ledger
                 if item["path"] == license_record["repository_path"]]
             if (len(matches) != 1
+                    or "lfs" in matches[0]
                     or matches[0]["sha256"] != license_record["content_sha256"]):
                 raise RepositoryMaterializationError(
                     f"submodule {full_name} license evidence 与 commit 文件 ledger 不一致")
@@ -366,6 +385,7 @@ class _RepositoryArchiveMixin:
             # as evidence, never as the reproducible source identity.
             "archive_transport_sha256": archive_record["sha256"],
             "archive_transport_bytes": archive_record["bytes"],
+            "lfs_transport": lfs_transport,
             "file_ledger_hash": _value_hash(local_ledger),
             "license": license_record,
         }
@@ -387,7 +407,7 @@ class _RepositoryArchiveMixin:
                 tree_root=tree_root, downloads=downloads,
                 seen_repositories=seen_repositories, all_ledger=all_ledger,
                 sources=sources, submodule_records=submodule_records,
-                tree_counter=tree_counter,
+                tree_counter=tree_counter, global_lfs_objects=global_lfs_objects,
                 is_root=False)
             submodule_records.append({
                 "path": child_prefix, "repository": child_repo,

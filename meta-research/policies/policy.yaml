@@ -47,7 +47,7 @@ import_search:
 
 # selected_for_materialization 的默认 production fetcher。只接受 GitHub 40-hex commit，经 Git tree API
 # 取得对象闭包并用 commit tar archive 的逐文件 Git blob SHA 交叉核；archive 外层压缩字节不作复现身份。
-# CP11.4c.2a 对 LFS pointer 明确 fail-closed；CP11.4c.2b 接受前须实现 batch 下载+OID/size 复核。
+# LFS 只走 GitHub 固定 Batch endpoint + basic transfer；signed action URL/header 不落盘，下载后 OID/size 双核。
 import_materialization:
   provider: github_archive_v1
   adapter_path: .meta-research/import-adapter.json
@@ -60,8 +60,11 @@ import_materialization:
   max_tree_depth: 64
   max_tree_objects: 10000
   max_submodules: 64
-  lfs_policy: reject
+  lfs_policy: fetch
+  max_lfs_objects: 10000
+  lfs_batch_size: 100
   allowed_archive_hosts: [codeload.github.com]
+  allowed_lfs_hosts: [github.com, github-cloud.s3.amazonaws.com, github-cloud.githubusercontent.com, objects.githubusercontent.com, objects-origin.githubusercontent.com, media.githubusercontent.com]
   dependency_lock_names: [requirements.lock, requirements.txt, poetry.lock, uv.lock, conda-lock.yml, package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock]
   compiler:
     implementation: CPython
