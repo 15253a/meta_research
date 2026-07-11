@@ -18,11 +18,13 @@ source 仍 'factory'——外部性只在 checkpoint.origin+manifest_hash，§3.
 
 **失败路径全拒（§7.1 M4）**：scope 缺 → 不物化；smoke 失败 → 不 target_ready；factory eval 失败 → 不
 pool_publish——均记 external_import(materialize_failed)（DDL CHECK：该 action 不携 baseline/manifest，
-reason_json 记因）+ 占位 baseline 连坐 build_failed（scope 缺除外：未动工保持 planned）+ dep 保持 pending
-（问题继续不可调度）+ worker cycle failed。
+reason_json 记因）+ 占位 baseline 连坐 build_failed + 同一事务写失败裁决并把 exact dep 置 blocked；blocked
+不再隐藏问题（§4.2.1），故问题可在下一研究轮改走另一候选/自建/分解，不会因 terminal failure 永久 pending。
+已开 worker 的 cycle 同时 failed；scope 在开工前拒绝则不造 worker cycle。
 
 **恢复**：结构续跑（同 attack：目标状态阶梯 + 幂等补登 + judge replay-safe）；imported 事件已在 → 幂等跳过。
-fetch provider 契约（注入；生产=真 clone/pin，测试=确定性内容）：fetch(candidate) → {files:{名:bytes…},
+fetch provider 契约（注入；当前默认=已登记的内容寻址冻结文件快照，测试亦可注入确定性内容；
+大仓库 clone/LFS 是后续 capability）：fetch(candidate) → {files:{名:bytes…},
 smoke_cmd, eval_cmd, protocol_id, protocol_ver, eval_key, target_set_hash, required:[[mid,mver]…],
 artifact_type?, env_hash?}——candidate = {id, question_id, canonical_uri, revision}。
 """
@@ -69,9 +71,12 @@ class ImportWorker:
         self.execution_supervisor = execution_supervisor
 
     # ---------------------------------------------------------------- 入口 --
-    def materialize_pending(self) -> List[int]:
+    def materialize_pending(self, *, max_items: Optional[int] = None) -> List[int]:
         """扫 selected_for_materialization 工作队列（§3.6.3 物化由 Advancer 驱动、非等问题调度）；
         逐条物化。已 imported / 已 failed（worker cycle failed）→ 跳过（重试策略=后续）。返回处理的 ei ids。"""
+        if (max_items is not None and (isinstance(max_items, bool)
+                                       or not isinstance(max_items, int) or max_items <= 0)):
+            raise ValueError("max_items 须为正整数或 None")
         d = self.state.daemon
         rows = d.query(
             "SELECT s.id FROM external_import s WHERE s.action='selected_for_materialization' "
@@ -85,6 +90,8 @@ class ImportWorker:
                 continue
             self.materialize_one(ei_id)
             done.append(ei_id)
+            if max_items is not None and len(done) >= max_items:
+                break
         return done
 
     def _already_settled(self, ei_id: int) -> bool:
@@ -111,7 +118,75 @@ class ImportWorker:
             "WHERE actor='orchestrator' AND type='import_worker_cycle' AND cycle_id=? ORDER BY id DESC LIMIT 1", (int(cyc.cycle_id[1:]),))
         if row is None or row[0] is None:
             raise ValueError(f"worker 轮 {cyc.cycle_id} 无 import_worker_cycle 标记——不可恢复态，须人工核")
-        self.materialize_one(int(row[0]))
+        ei_id = int(row[0])
+        if self._already_settled(ei_id):
+            self._finish_settled_resume(cyc.cycle_id, ei_id)
+            return
+        self.materialize_one(ei_id)
+
+    def _finish_settled_resume(self, cycle_id: str, ei_id: int) -> None:
+        """Close the crash gap after an append-only outcome but before worker terminal commit.
+
+        ``imported`` may be written just before target completion/phase_commit; replay those mechanical
+        suffixes before resolving dependencies.  A failed outcome is only emitted after a started target
+        is terminal (or before any target exists on fetch failure), so a live target is corruption rather
+        than permission to invent a new failure transition.
+        """
+        d = self.state.daemon
+        imported = self._settled_ok(ei_id)
+        failed = self._has_selection_outcome(ei_id, ("materialize_failed",))
+        superseded = self._has_selection_outcome(ei_id, ("superseded",))
+        if sum((imported, failed, superseded)) != 1:
+            raise RuntimeError(
+                f"external_import {ei_id} settled outcome 非唯一（imported={imported}, "
+                f"failed={failed}, superseded={superseded}）")
+        targets = d.query(
+            "SELECT id,status FROM build_target WHERE cycle_id=? AND target_kind='import' ORDER BY id",
+            (int(cycle_id[1:]),))
+        if len(targets) > 1:
+            raise RuntimeError(f"import worker {cycle_id} 有多个 import target")
+        if imported:
+            if len(targets) != 1:
+                raise RuntimeError(f"imported external_import {ei_id} 缺 worker target")
+            bt_id, status = targets[0]
+            if status not in _TERMINAL_TARGET:
+                self.gate.gate_finish_build_target(
+                    build_target_id=bt_id, status="complete")
+            elif status != "complete":
+                raise RuntimeError(
+                    f"imported external_import {ei_id} 的 target {bt_id} 终态为 {status}")
+            self._target_pc(cycle_id, bt_id)
+        elif targets and targets[0][1] not in _TERMINAL_TARGET:
+            raise RuntimeError(
+                f"settled failed/superseded external_import {ei_id} 仍有非终态 target {targets[0]}")
+
+        if failed:
+            failure = d.query_one(
+                "SELECT s.question_id,s.candidate_id,json_extract(f.reason_json,'$.reason') "
+                "FROM external_import s JOIN external_import f ON f.question_id=s.question_id "
+                "AND f.candidate_id=s.candidate_id AND f.action_cycle=s.action_cycle "
+                "AND f.candidate_set_hash=s.candidate_set_hash AND f.selection_key=s.selection_key "
+                "AND f.policy_hash=s.policy_hash AND f.action='materialize_failed' "
+                "WHERE s.id=? AND s.action='selected_for_materialization' ORDER BY f.id", (ei_id,))
+            if failure is None:
+                raise RuntimeError(f"external_import {ei_id} failed outcome 无 durable reason event")
+            # Reconciles databases written before failure event + blocked dep became one transaction.
+            self._record_failed(
+                ei_id, failure[0], failure[1], reason=failure[2] or "legacy materialize_failed")
+
+        with self.state.atomic() as conn:
+            if failed:
+                baseline = conn.execute(
+                    "SELECT baseline_id FROM external_import WHERE id=?", (ei_id,)).fetchone()
+                if baseline is None or baseline[0] is None:
+                    raise RuntimeError(f"external_import {ei_id} 缺占位 baseline")
+                conn.execute(
+                    "UPDATE baseline SET status='build_failed' WHERE id=? AND status='planned'",
+                    (baseline[0],))
+            self.state.mark_cycle_done(
+                cycle_id, "done" if imported else ("aborted" if superseded else "failed"))
+            if imported:
+                self.state.resolve_deps()
 
     @staticmethod
     def is_worker_cycle(daemon, cycle_id: str) -> bool:
@@ -144,15 +219,48 @@ class ImportWorker:
         scope_row = d.query_one("SELECT license_scope_json FROM license_review WHERE id=?", (lic_id,))
         scope = json.loads(scope_row[0]) if scope_row and scope_row[0] else {}
         if not (scope.get("allow_eval") and scope.get("allow_publish_pool")):
-            # 未动工即拒：不开 worker、不动占位（保持 planned）、dep 保持 pending
+            # 未动工即拒：不开 worker；但 selection 已终败，故原子标 baseline=build_failed、dep=blocked，
+            # 让原问题回到重规划集合，不能留下一个永远无人消费的 pending 依赖。
             self._record_failed(ei_id, qi, cand_id, reason="license scope 缺 allow_eval/allow_publish_pool，不物化")
             return
         cyc_id = self._worker_cycle(ei_id, qi)
-        cand = d.query_one("SELECT canonical_uri, revision FROM external_candidate WHERE id=?", (cand_id,))
+        cand = d.query_one(
+            "SELECT canonical_uri,revision,source_kind,search_snapshot_json,search_snapshot_hash "
+            "FROM external_candidate WHERE id=?", (cand_id,))
         self.owner_guard()
-        spec = self.p["fetch"]({"id": cand_id, "question_id": qi, "canonical_uri": cand[0], "revision": cand[1]})
+        try:
+            spec = self.p["fetch"]({
+                "id": cand_id, "question_id": qi, "canonical_uri": cand[0],
+                "revision": cand[1], "source_kind": cand[2],
+                "search_snapshot_json": cand[3], "search_snapshot_hash": cand[4],
+            })
+        except ValueError as error:
+            # Frozen snapshot/spec rejection is a durable candidate failure.  Infrastructure/control
+            # exceptions (owner loss, supervisor failure, budget stop, provider bug) deliberately
+            # propagate so they cannot be mislabeled as a scientific/materialization outcome.
+            self._record_failed(
+                ei_id, qi, cand_id,
+                reason=f"冻结候选物化规格无效：{type(error).__name__}: {error}")
+            with self.state.atomic() as conn:
+                conn.execute(
+                    "UPDATE baseline SET status='build_failed' WHERE id=? AND status='planned'",
+                    (bid,))
+                self.state.mark_cycle_done(cyc_id, "failed")
+            return
+        if spec.get("requires_adversarial_sandbox") is True:
+            # ExecutionSupervisor fences ownership/descendants but explicitly is not an adversarial
+            # sandbox.  Default discovery content is untrusted, so fail closed until a later command
+            # runner capability can prove network/filesystem/process isolation.
+            self._record_failed(
+                ei_id, qi, cand_id,
+                reason="默认冻结候选要求 adversarial sandbox；当前仅有 lifecycle supervisor，拒绝在 host 执行")
+            with self.state.atomic():
+                self.state.mark_cycle_done(cyc_id, "failed")
+            return
         vid, bt_id = self._variant_and_target(cyc_id, qi, bid, spec)
-        ok = self._drive_import_target(cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec, revision=cand[1])
+        ok = self._drive_import_target(
+            cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
+            revision=cand[1], source_uri=cand[0])
         # worker 收尾与 dep 解锁**同一 atomic**（内审 BLOCKER 实证：分离时崩在两提交间 → worker done 但
         # dep 永 pending、问题永不可调度且无自愈路径）。mark_cycle_done 亦补 finished_at（审计一致）。
         with self.state.atomic():
@@ -211,20 +319,60 @@ class ImportWorker:
     def _variant_and_target(self, cyc_id: str, qi: int, bid: int, spec) -> tuple:
         d = self.state.daemon
         v = d.query_one("SELECT id FROM variant WHERE baseline_id=? AND variant_key='imported'", (bid,))
+        expected_ref = json.dumps(
+            self._spec_ref(spec), ensure_ascii=False, sort_keys=True)
         with d.transaction() as conn:
             vid = v[0] if v else conn.execute(
                 "INSERT INTO variant(baseline_id,variant_key,config_json,status) VALUES (?,'imported','{}','planned')",
                 (bid,)).lastrowid
-            bt = conn.execute("SELECT id FROM build_target WHERE cycle_id=? AND target_kind='import'",
-                              (int(cyc_id[1:]),)).fetchone()
-            bt_id = bt[0] if bt else conn.execute(
-                "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id,plan_ref) "
-                "VALUES (?,?,'import',1,'pending',?,?,?)",
-                (int(cyc_id[1:]), qi, bid, vid, json.dumps(spec, ensure_ascii=False, sort_keys=True, default=str))).lastrowid
+            targets = conn.execute(
+                "SELECT id,question_id,baseline_id,variant_id,plan_ref FROM build_target "
+                "WHERE cycle_id=? AND target_kind='import' ORDER BY id",
+                (int(cyc_id[1:]),)).fetchall()
+            if len(targets) > 1:
+                raise RuntimeError(f"import worker {cyc_id} 有多个 import target")
+            if targets:
+                bt = targets[0]
+                if tuple(bt[1:4]) != (qi, bid, vid) or bt[4] != expected_ref:
+                    raise RuntimeError(
+                        f"import worker {cyc_id} existing target {bt[0]} 与冻结 spec 身份漂移")
+                bt_id = bt[0]
+            else:
+                bt_id = conn.execute(
+                    "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id,plan_ref) "
+                    "VALUES (?,?,'import',1,'pending',?,?,?)",
+                    (int(cyc_id[1:]), qi, bid, vid, expected_ref)).lastrowid
         return vid, bt_id
 
+    @staticmethod
+    def _execution_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Everything affecting adapter execution, excluding file bytes (hashed separately)."""
+        return {
+            "smoke_cmd": list(spec["smoke_cmd"]), "eval_cmd": list(spec["eval_cmd"]),
+            "protocol_id": spec["protocol_id"], "protocol_ver": spec["protocol_ver"],
+            "eval_key": spec["eval_key"], "target_set_hash": spec["target_set_hash"],
+            "required": spec["required"], "artifact_relpath": spec.get("artifact_relpath"),
+            "artifact_type": spec.get("artifact_type", "external_model"),
+            "env_hash": spec.get("env_hash", "import-env"),
+            "supply_chain": spec.get("supply_chain") or {},
+        }
+
+    @classmethod
+    def _spec_ref(cls, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Bounded DB plan_ref: content identities, never the up-to-64MiB raw frozen files."""
+        return {
+            "materialization_contract": cls._execution_contract(spec),
+            "files": [{
+                "path": name,
+                "sha256": "sha256:" + hashlib.sha256(
+                    content if isinstance(content, bytes) else str(content).encode()).hexdigest(),
+                "bytes": len(content if isinstance(content, bytes) else str(content).encode()),
+            } for name, content in sorted(spec["files"].items())],
+        }
+
     def _drive_import_target(self, cyc_id: str, ei_id: int, qi: int, cand_id: int, bid: int,
-                             vid: int, bt_id: int, spec, *, revision: str) -> bool:
+                             vid: int, bt_id: int, spec, *, revision: str,
+                             source_uri: str) -> bool:
         """物化目标阶梯（结构续跑）。返回是否成功（imported）。失败路径记 materialize_failed + 连坐。"""
         g, d = self.gate, self.state.daemon
         st = lambda: d.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0]
@@ -251,14 +399,31 @@ class ImportWorker:
                 self._record_failed(ei_id, qi, cand_id, reason=f"clone 路径非法（越界/绝对）：{name!r}")
                 self._target_pc(cyc_id, bt_id)
                 return False
-            if not f.exists():
+            for parent in f.parents:
+                if parent == clone_dir.parent:
+                    break
+                if parent.exists() and parent.is_symlink():
+                    raise RuntimeError(f"import clone parent 不得是 symlink: {parent}")
+            payload = content if isinstance(content, bytes) else str(content).encode()
+            if f.exists():
+                if f.is_symlink() or not f.is_file() or f.read_bytes() != payload:
+                    raise RuntimeError(f"import clone 既有文件与冻结 snapshot 不一致: {name}")
+            else:
                 f.parent.mkdir(parents=True, exist_ok=True)
                 tmp = f.with_suffix(f.suffix + ".tmp")
-                tmp.write_bytes(content if isinstance(content, bytes) else str(content).encode())
+                tmp.write_bytes(payload)
                 tmp.replace(f)
         manifest_entries = [{"kind": "import_file", "ref": n, "content_hash": H.file_sha256(str(clone_dir / n))}
                             for n in sorted(spec["files"])] + \
-                           [{"kind": "revision", "ref": "revision", "content_hash": _canon_hash(revision)}]
+                           [{"kind": "revision", "ref": "revision", "content_hash": _canon_hash(revision)},
+                            {"kind": "source_uri", "ref": "source_uri", "content_hash": _canon_hash(source_uri)},
+                            {"kind": "materialization_contract", "ref": "execution_contract",
+                             "content_hash": _canon_hash(self._execution_contract(spec))}]
+        for key, value in sorted((spec.get("supply_chain") or {}).items()):
+            manifest_entries.append({
+                "kind": "supply_chain", "ref": key,
+                "content_hash": _canon_hash(value),
+            })
         manifest_hash = SM.subject_hash(manifest_entries)
         if st() == "building":                    # 沙箱 smoke（真子进程；失败 → 不 target_ready）
             smoke_dir = staging / "smoke"
@@ -292,7 +457,8 @@ class ImportWorker:
                 if sm is None:
                     self.owner_guard()
                     sm = H.run_staged(
-                        spec["smoke_cmd"], staging_dir=str(smoke_dir),
+                        self._resolved_cmd(spec["smoke_cmd"], clone_dir, spec),
+                        staging_dir=str(smoke_dir),
                         log_name=smoke_name, timeout_s=120,
                         execution_supervisor=self.execution_supervisor,
                         execution_kind="import-smoke", execution_context=smoke_context)
@@ -321,6 +487,16 @@ class ImportWorker:
                                                  staging, clone_dir, manifest_hash, revision)
         return st() == "complete"
 
+    @staticmethod
+    def _resolved_cmd(cmd, clone_dir: Path, spec: Dict[str, Any]) -> List[str]:
+        """Expand the only two frozen adapter capabilities without invoking a shell."""
+        artifact = clone_dir / (spec.get("artifact_relpath") or sorted(spec["files"])[0])
+        resolved = []
+        for arg in cmd:
+            value = arg.replace("{repo}", str(clone_dir)).replace("{artifact}", str(artifact))
+            resolved.append(value)
+        return resolved
+
     def _run_and_register_import(self, cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
                                  staging: Path, clone_dir: Path, manifest_hash: str, revision: str) -> bool:
         """⚠️ 恢复关键阶梯与 attack_stages._run_and_register **同构**（eval-final+exit 侧车续跑 / artifact_ref
@@ -339,7 +515,7 @@ class ImportWorker:
         else:
             rid = g.gate_start_run(build_target_id=bt_id, cycle_id=cyc_id, variant_id=vid, kind="import",
                                    env_hash=spec.get("env_hash", "import-env"))
-            main_file = sorted(spec["files"])[0]
+            main_file = spec.get("artifact_relpath") or sorted(spec["files"])[0]
             cand_row = d.query_one("SELECT canonical_uri FROM external_candidate WHERE id=?", (cand_id,))
             with d.transaction() as conn:      # checkpoint = 外部可评 target（供应链溯源列 DDL CHECK 焊）
                 conn.execute("INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,artifact_type,"
@@ -426,7 +602,8 @@ class ImportWorker:
                 if ev is None:
                     self.owner_guard()
                     ev = H.run_staged(
-                        spec["eval_cmd"], staging_dir=str(eval_dir),
+                        self._resolved_cmd(spec["eval_cmd"], clone_dir, spec),
+                        staging_dir=str(eval_dir),
                         log_name="eval.log", timeout_s=600,
                         execution_supervisor=self.execution_supervisor,
                         execution_kind="import-eval", execution_context=eval_context)
@@ -518,29 +695,118 @@ class ImportWorker:
         """external_import(action='imported')（幂等；DDL CHECK：须携 baseline+manifest+license 双 hash）。
         锚字段（candidate_set/selection_key/policy/license hash）复制自 selected 行——同一次选择的物化结局。"""
         d = self.state.daemon
-        if self._has_selection_outcome(ei_id, ("imported",)):
-            return
-        src = d.query_one("SELECT action_cycle, candidate_set_hash, selection_key, policy_hash, "
-                          "license_decision_snapshot_hash, license_review_id FROM external_import WHERE id=?", (ei_id,))
         with d.transaction() as conn:
+            src = conn.execute(
+                "SELECT question_id,candidate_id,action_cycle,candidate_set_hash,selection_key,policy_hash,"
+                "license_decision_snapshot_hash,license_review_id,baseline_id FROM external_import "
+                "WHERE id=? AND action='selected_for_materialization'", (ei_id,)).fetchone()
+            if (src is None or src[0] != qi or src[1] != cand_id or src[8] != bid
+                    or src[6] is None or src[7] is None):
+                raise RuntimeError(f"external_import {ei_id} imported selection 绑定损坏")
+            terminal = conn.execute(
+                "SELECT id,action,baseline_id,manifest_hash,license_review_id,"
+                "license_decision_snapshot_hash FROM external_import WHERE question_id=? "
+                "AND candidate_id=? AND action_cycle=? AND candidate_set_hash=? "
+                "AND selection_key=? AND policy_hash=? "
+                "AND action IN ('imported','materialize_failed','superseded') ORDER BY id",
+                src[:6]).fetchall()
+            if len(terminal) > 1 or (terminal and terminal[0][1] != "imported"):
+                raise RuntimeError(
+                    f"external_import {ei_id} 已有冲突/重复终局: "
+                    f"{[(row[0], row[1]) for row in terminal]}")
+            if terminal:
+                row = terminal[0]
+                if tuple(row[2:]) != (bid, manifest_hash, src[7], src[6]):
+                    raise RuntimeError(
+                        f"external_import {ei_id} imported replay 身份与 durable event 不一致")
+                return
             conn.execute("INSERT INTO external_import(question_id,candidate_id,action,action_cycle,"
                          "candidate_set_hash,selection_key,policy_hash,license_decision_snapshot_hash,"
                          "license_review_id,baseline_id,manifest_hash) VALUES (?,?,'imported',?,?,?,?,?,?,?,?)",
-                         (qi, cand_id, src[0], src[1], src[2], src[3], src[4], src[5], bid, manifest_hash))
+                         (qi, cand_id, src[2], src[3], src[4], src[5], src[6], src[7], bid,
+                          manifest_hash))
 
     def _record_failed(self, ei_id, qi, cand_id, *, reason: str) -> None:
-        """external_import(action='materialize_failed')（幂等；DDL CHECK：不携 baseline/manifest；reason_json 记因）。"""
+        """Atomically settle a failed selection and unblock the question for replanning.
+
+        The worker never retries a terminal ``materialize_failed`` event.  Leaving its dependency pending
+        would therefore be an unrecoverable scheduler deadlock, not a retry policy.  Reference §4.2.1
+        defines ``blocked`` as the adjudicated escape state, so failure event + decision + baseline failure
+        + exact dep transition are one short transaction and replay idempotently.
+        """
         d = self.state.daemon
-        if self._has_selection_outcome(ei_id, ("materialize_failed",)):
-            return
-        src = d.query_one("SELECT action_cycle, candidate_set_hash, selection_key, policy_hash, license_review_id "
-                          "FROM external_import WHERE id=?", (ei_id,))
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("materialize_failed reason 须为非空文本")
+        reason = reason.encode("utf-8", errors="replace").decode("utf-8")
+        reason_bytes = reason.encode("utf-8")
+        if len(reason_bytes) > 4096:
+            reason = reason_bytes[:4096].decode("utf-8", errors="ignore") + "…（已裁剪）"
         with d.transaction() as conn:
-            conn.execute("INSERT INTO external_import(question_id,candidate_id,action,action_cycle,"
-                         "candidate_set_hash,selection_key,policy_hash,license_review_id,reason_json) "
-                         "VALUES (?,?,'materialize_failed',?,?,?,?,?,?)",
-                         (qi, cand_id, src[0], src[1], src[2], src[3], src[4],
-                          json.dumps({"reason": reason}, ensure_ascii=False)))
+            src = conn.execute(
+                "SELECT question_id,candidate_id,action_cycle,candidate_set_hash,selection_key,"
+                "policy_hash,license_review_id,baseline_id FROM external_import "
+                "WHERE id=? AND action='selected_for_materialization'", (ei_id,)).fetchone()
+            if src is None or src[0] != qi or src[1] != cand_id or src[7] is None:
+                raise RuntimeError(f"external_import {ei_id} selection 绑定损坏")
+            identity = tuple(src[:7])
+            terminal = conn.execute(
+                "SELECT id,action,reason_json FROM external_import WHERE question_id=? AND candidate_id=? "
+                "AND action_cycle=? AND candidate_set_hash=? AND selection_key=? AND policy_hash=? "
+                "AND action IN ('imported','materialize_failed','superseded') ORDER BY id",
+                identity[:6]).fetchall()
+            if len(terminal) > 1 or (terminal and terminal[0][1] != "materialize_failed"):
+                raise RuntimeError(
+                    f"external_import {ei_id} 已有冲突/重复终局: "
+                    f"{[(row[0], row[1]) for row in terminal]}")
+            if terminal:
+                failed_event_id = terminal[0][0]
+                durable_payload = json.loads(terminal[0][2] or "{}")
+                if not isinstance(durable_payload, dict):
+                    raise RuntimeError(f"materialize_failed event {failed_event_id} reason_json 非 object")
+                durable_reason = durable_payload.get("reason") or reason
+            else:
+                failed_event_id = conn.execute(
+                    "INSERT INTO external_import(question_id,candidate_id,action,action_cycle,"
+                    "candidate_set_hash,selection_key,policy_hash,license_review_id,reason_json) "
+                    "VALUES (?,?,'materialize_failed',?,?,?,?,?,?)",
+                    (*identity, json.dumps({"reason": reason}, ensure_ascii=False))).lastrowid
+                durable_reason = reason
+            baseline_status = conn.execute(
+                "SELECT status FROM baseline WHERE id=?", (src[7],)).fetchone()
+            if baseline_status is None or baseline_status[0] not in (
+                    "planned", "building", "build_failed"):
+                raise RuntimeError(
+                    f"materialize_failed selection {ei_id} baseline {src[7]} 状态非法: "
+                    f"{baseline_status[0] if baseline_status else 'missing'}")
+            conn.execute(
+                "UPDATE baseline SET status='build_failed' WHERE id=? AND status IN ('planned','building')",
+                (src[7],))
+            deps = conn.execute(
+                "SELECT id,status FROM question_dep WHERE question_id=? AND dep_type='baseline' "
+                "AND depends_on_baseline_id=? ORDER BY id", (qi, src[7])).fetchall()
+            if len(deps) != 1 or deps[0][1] not in ("pending", "blocked"):
+                raise RuntimeError(
+                    f"materialize_failed selection {ei_id} exact dep 非 pending/blocked 唯一态: {deps}")
+            decision = conn.execute(
+                "SELECT id FROM decision WHERE actor='orchestrator' "
+                "AND type='import_materialization_blocked' AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.source_external_import_id')=? "
+                "AND json_extract(payload_json,'$.materialize_failed_event_id')=? ORDER BY id",
+                (ei_id, failed_event_id)).fetchall()
+            if len(decision) > 1:
+                raise RuntimeError(f"external_import {ei_id} 有重复 blocked decision")
+            if not decision:
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+                    "VALUES (?,?,'orchestrator','import_materialization_blocked',?)",
+                    (src[2], qi, json.dumps({
+                        "source_external_import_id": ei_id,
+                        "materialize_failed_event_id": failed_event_id,
+                        "baseline_id": src[7], "reason": durable_reason,
+                    }, ensure_ascii=False, sort_keys=True)))
+            conn.execute(
+                "UPDATE question_dep SET status='blocked' WHERE id=? AND status='pending'",
+                (deps[0][0],))
 
     def _settled_ok(self, ei_id) -> bool:
         return self._has_selection_outcome(ei_id, ("imported",))

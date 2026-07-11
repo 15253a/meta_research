@@ -95,17 +95,17 @@ def test_scenario1_main_chain_invariants(tmp_path):
 
 # ============ 剧本 2 · import 对照三失败路径（皆不入活跃池）============
 def test_scenario2_import_license_deny_not_materialized(tmp_path):
-    """license scope 越权（缺 allow_publish_pool）→ 不物化、baseline 未动、dep 仍锁。"""
+    """license scope 越权（缺 allow_publish_pool）→ 不物化并终败，dep blocked 后可改道。"""
     path = str(tmp_path / "r.sqlite")
     daemon, state, w = _mk_worker(path, tmp_path / "w")
     sel = _seed_deferred(daemon, state, scope='{"allow_eval": true}')       # 缺 allow_publish_pool = 越权
     w.materialize_pending()
-    assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "planned"
+    assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
     assert daemon.query_one("SELECT count(*) FROM run")[0] == 0             # 不物化：无 run
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0
-    assert daemon.query_one("SELECT status FROM question_dep WHERE question_id=1")[0] == "pending"  # dep 仍锁
-    assert state.is_schedulable("q1") is False                             # 问题不因失败物化被调度
+    assert daemon.query_one("SELECT status FROM question_dep WHERE question_id=1")[0] == "blocked"
+    assert state.is_schedulable("q1") is True                              # 回到下一研究轮重规划
 
 
 def test_scenario2_import_smoke_fail_no_target_ready(tmp_path):
@@ -119,7 +119,7 @@ def test_scenario2_import_smoke_fail_no_target_ready(tmp_path):
     assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
-    assert state.is_schedulable("q1") is False                             # 失败物化不解锁调度（dep 仍锁，外审 SHOULD）
+    assert state.is_schedulable("q1") is True                              # blocked dep → 可改候选/自建/分解
 
 
 def test_scenario2_import_eval_fail_no_pool_publish(tmp_path):
@@ -136,7 +136,7 @@ def test_scenario2_import_eval_fail_no_pool_publish(tmp_path):
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
     assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"  # 不入活跃池
-    assert state.is_schedulable("q1") is False                             # 失败物化不解锁调度（dep 仍锁，外审 SHOULD）
+    assert state.is_schedulable("q1") is True                              # blocked dep → 可改候选/自建/分解
 
 
 # ============ 剧本 3 · 运行日志分析（suspect **不作正向证据**，fail-closed 于消费侧）============

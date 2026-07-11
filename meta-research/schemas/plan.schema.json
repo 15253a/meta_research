@@ -53,7 +53,19 @@
     {
       "if": { "required": ["import_defer"] },
       "then": {
-        "properties": { "targets": { "maxItems": 0 } }
+        "properties": {
+          "needs": { "maxItems": 0 },
+          "reuse_evidence": { "maxItems": 0 },
+          "targets": { "maxItems": 0 },
+          "build_target_required_metric": { "maxItems": 0 }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["protocol"] },
+            { "required": ["metric_defs"] },
+            { "required": ["readout_rules"] }
+          ]
+        }
       }
     }
   ],
@@ -162,11 +174,12 @@
     "import_defer": {
       "type": "object",
       "description": "三闸命中的 deferred 决定（§6.11）：M1–M3 phase_commit 业务三写入（external_import + 占位 baseline(planned) + question_dep(pending)）的输入，故选择锚与占位 identity 必填；出现本区 ⇒ targets 必为 []（deferred 轮派生 dependency_wait、不进 bundle，路由矩阵无 attack+import_defer 组合）。M0 不产此区（M0 plan skill 指示引外部参照的 need 记为自建或搁置）",
-      "required": ["reason_md", "candidate_set_hash", "selection_key", "policy_hash", "placeholder_baseline_identity"],
+      "required": ["reason_md", "candidate_set_hash", "license_decision_snapshot_hash", "selection_key", "policy_hash", "placeholder_baseline_identity"],
       "additionalProperties": false,
       "properties": {
         "reason_md": { "type": "string", "minLength": 1 },
         "candidate_set_hash": { "type": "string", "minLength": 1 },
+        "license_decision_snapshot_hash": { "type": "string", "minLength": 1 },
         "selection_key": { "type": "string", "minLength": 1 },
         "policy_hash": { "type": "string", "minLength": 1 },
         "placeholder_baseline_identity": {

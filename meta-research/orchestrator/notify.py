@@ -1101,6 +1101,32 @@ class ResearchNotifier:
 
     def scan(self) -> List[str]:
         events: List[Dict[str, Any]] = []
+        for (event_id, question_id, candidate_id, action_cycle, goal_id, goal_ver,
+             reason, baseline_id) in self.daemon.query(
+                "SELECT f.id,f.question_id,f.candidate_id,f.action_cycle,c.goal_id,c.goal_ver,"
+                "json_extract(f.reason_json,'$.reason'),(SELECT s.baseline_id FROM external_import s "
+                "WHERE s.question_id=f.question_id AND s.candidate_id=f.candidate_id "
+                "AND s.action_cycle=f.action_cycle AND s.candidate_set_hash=f.candidate_set_hash "
+                "AND s.selection_key=f.selection_key AND s.policy_hash=f.policy_hash "
+                "AND s.action='selected_for_materialization' ORDER BY s.id LIMIT 1) "
+                "FROM external_import f JOIN cycle c ON c.id=f.action_cycle "
+                "WHERE f.action='materialize_failed' ORDER BY f.id"):
+            reason_preview, reason_hash = self._bounded_text(reason, 2048)
+            events.append({
+                "event_key": f"external_import:{event_id}:materialize_failed",
+                "kind": "external_import_failed",
+                "payload": {
+                    "external_import_event_id": event_id,
+                    "question_id": f"q{question_id}", "candidate_id": candidate_id,
+                    "action_cycle": f"c{action_cycle}", "goal_id": goal_id,
+                    "goal_ver": goal_ver, "baseline_id": baseline_id,
+                    "reason": reason_preview, "reason_hash": reason_hash,
+                    "summary_md": (
+                        f"外部候选 #{candidate_id} 物化失败；已解除问题 q{question_id} 的 pending "
+                        "依赖并交回后续研究轮重规划；"
+                        f"原因：{reason_preview or '未分类'}。"),
+                },
+            })
         for (cycle_id, goal_id, goal_ver, route, question_id, failure_kind) in self.daemon.query(
                 "SELECT id,goal_id,goal_ver,route,active_question_id,failure_kind "
                 "FROM cycle WHERE status='failed' ORDER BY id"):

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from orchestrator.compiler_sqlite import SqliteCompiler
 from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import open_gate_read_conn
 from orchestrator.import_worker import ImportWorker
+from orchestrator.import_fetcher import FrozenCandidateFetcher
 from orchestrator.importer import DeferredImporter
 from orchestrator.instance_lease import InstanceLease
 from orchestrator.process_supervisor import ExecutionSupervisor
@@ -42,6 +44,29 @@ def _fetch_ok(cand):
             "target_set_hash": "tsh-imp", "required": [[1, 1]], "env_hash": "imp-env"}
 
 
+def _frozen_snapshot(*, digest=None):
+    payload = b"frozen-weights"
+    return json.dumps({"materialization": {
+        "version": 1,
+        "files": [{
+            "path": "model.bin", "encoding": "utf-8", "data": payload.decode(),
+            "sha256": digest or "sha256:" + hashlib.sha256(payload).hexdigest(),
+        }],
+        "smoke_argv": [sys.executable, "-c", "print('smoke ok')"],
+        "eval_argv": [sys.executable, "-c", "print('metric_value: 1@1=0.88')"],
+        "protocol_id": 1, "protocol_ver": 1, "eval_key": "import-fac",
+        "target_set_hash": "tsh-imp", "required": [[1, 1]],
+        "artifact_relpath": "model.bin", "artifact_type": "external_model",
+        "env_hash": "sha256:" + "3" * 64,
+        "supply_chain": {
+            "dependency_lock_hash": "sha256:" + "1" * 64,
+            "harness_adapter_hash": "sha256:" + "2" * 64,
+            "environment_hash": "sha256:" + "3" * 64,
+            "network_isolation": True,
+        },
+    }}, sort_keys=True)
+
+
 def _judge(daemon):
     def judge(cycle_id, bt_id, kind, subject_hash):
         from orchestrator.ids import cnum
@@ -56,7 +81,8 @@ def _judge(daemon):
     return judge
 
 
-def _seed_deferred(daemon, state, *, scope='{"allow_eval": true, "allow_publish_pool": true}'):
+def _seed_deferred(daemon, state, *, scope='{"allow_eval": true, "allow_publish_pool": true}',
+                   search_snapshot_json="{}", search_snapshot_hash=None):
     """走 M1c DeferredImporter 真三写入：goal/协议/问题 + candidate + license(allow, scope) + select_deferred。"""
     state.create_goal(text="import 研究目标", predicate_json={})
     with daemon.transaction() as conn:
@@ -68,10 +94,15 @@ def _seed_deferred(daemon, state, *, scope='{"allow_eval": true, "allow_publish_
         conn.execute("INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
                      "VALUES (1,1,1,1,'需要外部 baseline','open','agent')")
     imp = DeferredImporter(daemon)
+    if search_snapshot_hash is None:
+        search_snapshot_hash = (
+            "sha256:" + hashlib.sha256(search_snapshot_json.encode("utf-8")).hexdigest())
     cid = imp.register_candidate(question_id="q1", discovered_cycle="c1", trigger_kind="sota_reference",
                                  trigger_snapshot_hash="tsh", need_summary="need", source_kind="repo",
-                                 canonical_uri="hub://model-x", search_snapshot_json="{}",
-                                 search_snapshot_hash="ssh", rank=0, retrieved_at="t", revision="rev-abc")
+                                 canonical_uri="hub://model-x",
+                                 search_snapshot_json=search_snapshot_json,
+                                 search_snapshot_hash=search_snapshot_hash,
+                                 rank=0, retrieved_at="t", revision="rev-abc")
     lic = imp.review_license(candidate_id=cid, decision="allow", license_scope_json=scope)
     r = imp.select_deferred(question_id="q1", candidate_id=cid, license_review_id=lic, action_cycle="c1",
                             candidate_set_hash="csh", selection_key="sk", policy_hash="ph",
@@ -152,6 +183,48 @@ def test_owner_guard_requires_shared_execution_supervisor(env):
 
 
 # ============ happy：全链 provenance + dep 解锁 ============
+def test_default_frozen_candidate_fetcher_validates_content_and_adapter():
+    snapshot = _frozen_snapshot()
+    spec = FrozenCandidateFetcher()({
+        "revision": "a" * 40, "search_snapshot_json": snapshot,
+        "search_snapshot_hash": "sha256:" + hashlib.sha256(snapshot.encode()).hexdigest()})
+    assert spec["files"] == {"model.bin": b"frozen-weights"}
+    assert spec["artifact_relpath"] == "model.bin"
+    assert spec["required"] == [[1, 1]]
+    assert spec["requires_adversarial_sandbox"] is True
+    with pytest.raises(ValueError, match="sha256"):
+        bad_snapshot = _frozen_snapshot(digest="sha256:" + "0" * 64)
+        FrozenCandidateFetcher()({
+            "revision": "a" * 40,
+            "search_snapshot_json": bad_snapshot,
+            "search_snapshot_hash": "sha256:" + hashlib.sha256(bad_snapshot.encode()).hexdigest()})
+    with pytest.raises(ValueError, match="search_snapshot_hash"):
+        FrozenCandidateFetcher()({
+            "revision": "a" * 40, "search_snapshot_json": snapshot,
+            "search_snapshot_hash": "sha256:" + "0" * 64})
+
+
+def test_default_frozen_materialization_refuses_host_execution_without_sandbox(tmp_path):
+    path = str(tmp_path / "r.sqlite")
+    snapshot = _frozen_snapshot()
+    snapshot_hash = "sha256:" + hashlib.sha256(snapshot.encode()).hexdigest()
+    daemon, state, worker = _mk_worker(
+        path, tmp_path / "w", fetch=FrozenCandidateFetcher())
+    _seed_deferred(
+        daemon, state, search_snapshot_json=snapshot,
+        search_snapshot_hash=snapshot_hash)
+
+    worker.materialize_pending(max_items=1)
+
+    assert daemon.query_one("SELECT count(*) FROM run")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0
+    reason = daemon.query_one(
+        "SELECT json_extract(reason_json,'$.reason') FROM external_import "
+        "WHERE action='materialize_failed'")[0]
+    assert "adversarial sandbox" in reason
+    assert daemon.query_one("SELECT status FROM question_dep")[0] == "blocked"
+
+
 def test_materialize_full_chain(env):
     d, s, w, sel = env["d"], env["s"], env["w"], env["sel"]
     assert s.is_schedulable("q1") is False                          # 物化前被 pending dep 挡
@@ -179,6 +252,24 @@ def test_materialize_full_chain(env):
     assert s.is_schedulable("q1") is True
     # 幂等：再扫不重物化
     assert w.materialize_pending() == []
+
+
+def test_advancer_materializes_queue_then_reopens_satisfied_dependency(env):
+    d, s, w = env["d"], env["s"], env["w"]
+    with d.transaction() as conn:
+        conn.execute(
+            "UPDATE cycle SET route='dependency_wait',next_intent=NULL,next_question_id=NULL WHERE id=1")
+    adv = SqliteAdvancer(
+        s, SqliteCompiler(db.connect(env["path"]), POLICY), lambda *_args: {},
+        attack=object(), import_worker=w)
+
+    resumed = adv._resume_or_open()
+
+    assert resumed is not None and resumed.route == "attack" and resumed.question_id == "q1"
+    assert d.query_one("SELECT status FROM baseline WHERE id=?", (env["sel"]["baseline_id"],))[0] == "legal"
+    assert d.query_one("SELECT status FROM question_dep WHERE question_id=1")[0] == "satisfied"
+    assert d.query_one(
+        "SELECT count(*) FROM decision WHERE type='import_worker_cycle'")[0] == 1
 
 
 def test_import_eval_attempt_exists_before_process_spawn(tmp_path, monkeypatch):
@@ -211,16 +302,150 @@ def test_import_eval_attempt_exists_before_process_spawn(tmp_path, monkeypatch):
 
 
 # ============ 失败路径负例全拒（§7.1 M4）============
+def test_fetch_infrastructure_error_is_not_recorded_as_candidate_failure(tmp_path):
+    path = str(tmp_path / "r.sqlite")
+
+    def infrastructure_failure(_candidate):
+        raise RuntimeError("search connector temporarily unavailable")
+
+    daemon, state, worker = _mk_worker(
+        path, tmp_path / "w", fetch=infrastructure_failure)
+    _seed_deferred(daemon, state)
+
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        worker.materialize_pending(max_items=1)
+
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 0
+    assert daemon.query_one("SELECT status FROM question_dep")[0] == "pending"
+    inflight = state.inflight_cycle()
+    assert inflight is not None and inflight.route is None
+
+
+def test_fetch_failure_outcome_recovery_does_not_refetch(tmp_path, monkeypatch):
+    path = str(tmp_path / "r.sqlite")
+    calls = []
+
+    def broken_fetch(_candidate):
+        calls.append(True)
+        raise ValueError("bad frozen snapshot")
+
+    daemon, state, worker = _mk_worker(path, tmp_path / "w", fetch=broken_fetch)
+    selected = _seed_deferred(daemon, state)
+    original_done = state.mark_cycle_done
+
+    def crash_before_worker_terminal(cycle_id, status="done"):
+        if cycle_id != "c1":
+            raise RuntimeError("crash-after-materialize-failed-event")
+        return original_done(cycle_id, status)
+
+    monkeypatch.setattr(state, "mark_cycle_done", crash_before_worker_terminal)
+    with pytest.raises(RuntimeError, match="crash-after-materialize-failed-event"):
+        worker.materialize_pending(max_items=1)
+    assert len(calls) == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
+    assert daemon.query_one(
+        "SELECT status FROM baseline WHERE id=?", (selected["baseline_id"],))[0] == "build_failed"
+    assert daemon.query_one("SELECT status FROM question_dep")[0] == "blocked"
+
+    monkeypatch.setattr(state, "mark_cycle_done", original_done)
+    worker.resume_cycle(state.inflight_cycle())
+    assert len(calls) == 1
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "failed"
+    assert daemon.query_one(
+        "SELECT status FROM baseline WHERE id=?", (selected["baseline_id"],))[0] == "build_failed"
+
+
+def test_advancer_reopens_question_after_terminal_import_failure(tmp_path):
+    path = str(tmp_path / "r.sqlite")
+
+    def broken_fetch(_candidate):
+        raise ValueError("frozen materialization unavailable")
+
+    daemon, state, worker = _mk_worker(path, tmp_path / "w", fetch=broken_fetch)
+    _seed_deferred(daemon, state)
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE cycle SET route='dependency_wait',next_intent=NULL,next_question_id=NULL WHERE id=1")
+    adv = SqliteAdvancer(
+        state, SqliteCompiler(db.connect(path), POLICY), lambda *_args: {},
+        attack=object(), import_worker=worker)
+
+    resumed = adv._resume_or_open()
+
+    assert resumed.route == "attack" and resumed.question_id == "q1"
+    assert daemon.query_one("SELECT status FROM question_dep")[0] == "blocked"
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='import_materialization_blocked'")[0] == 1
+    plan_pack = adv.compiler.render(cycle_id=resumed.cycle_id, stage="plan")
+    assert "external import 物化失败" in plan_pack.anchor_md
+    assert "frozen materialization unavailable" in plan_pack.anchor_md
+
+
+def test_imported_outcome_recovery_finishes_target_without_refetch(tmp_path, monkeypatch):
+    path = str(tmp_path / "r.sqlite")
+    calls = []
+
+    def counted_fetch(candidate):
+        calls.append(True)
+        return _fetch_ok(candidate)
+
+    daemon, state, worker = _mk_worker(path, tmp_path / "w", fetch=counted_fetch)
+    _seed_deferred(daemon, state)
+    original_record = worker._record_imported
+
+    def crash_after_imported(*args, **kwargs):
+        original_record(*args, **kwargs)
+        raise RuntimeError("crash-after-imported-event")
+
+    monkeypatch.setattr(worker, "_record_imported", crash_after_imported)
+    with pytest.raises(RuntimeError, match="crash-after-imported-event"):
+        worker.materialize_pending(max_items=1)
+    assert len(calls) == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_import WHERE action='imported'")[0] == 1
+    assert daemon.query_one("SELECT status FROM build_target")[0] == "running"
+
+    monkeypatch.setattr(worker, "_record_imported", original_record)
+    worker.resume_cycle(state.inflight_cycle())
+    assert len(calls) == 1
+    assert daemon.query_one("SELECT status FROM build_target")[0] == "complete"
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
+    assert daemon.query_one("SELECT status FROM question_dep")[0] == "satisfied"
+
+
+def test_worker_resume_rejects_fetch_spec_identity_drift(tmp_path, monkeypatch):
+    path = str(tmp_path / "r.sqlite")
+    daemon, state, worker = _mk_worker(path, tmp_path / "w")
+    _seed_deferred(daemon, state)
+    original_drive = worker._drive_import_target
+    monkeypatch.setattr(
+        worker, "_drive_import_target",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("crash-after-target")))
+    with pytest.raises(SystemExit, match="crash-after-target"):
+        worker.materialize_pending(max_items=1)
+    assert daemon.query_one("SELECT status FROM build_target")[0] == "pending"
+
+    monkeypatch.setattr(worker, "_drive_import_target", original_drive)
+    worker.p["fetch"] = lambda candidate: {
+        **_fetch_ok(candidate), "eval_key": "drifted-eval-key"}
+    with pytest.raises(RuntimeError, match="冻结 spec 身份漂移"):
+        worker.resume_cycle(state.inflight_cycle())
+
+
 def test_scope_missing_no_materialize(tmp_path):
     path = str(tmp_path / "r.sqlite")
     daemon, state, w = _mk_worker(path, tmp_path / "w")
     sel = _seed_deferred(daemon, state, scope='{"allow_eval": true}')   # 缺 allow_publish_pool
     w.materialize_pending()
-    assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "planned"  # 未动
+    assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
     assert daemon.query_one("SELECT count(*) FROM run")[0] == 0                      # 未物化
-    assert daemon.query_one("SELECT status FROM question_dep WHERE question_id=1")[0] == "pending"  # 仍锁
-    assert state.is_schedulable("q1") is False
+    assert daemon.query_one("SELECT status FROM question_dep WHERE question_id=1")[0] == "blocked"
+    assert state.is_schedulable("q1") is True
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='import_materialization_blocked'")[0] == 1
 
 
 def test_smoke_fail_no_target_ready(tmp_path):
@@ -234,7 +459,7 @@ def test_smoke_fail_no_target_ready(tmp_path):
     assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0
-    assert state.is_schedulable("q1") is False                                       # dep 仍 pending
+    assert state.is_schedulable("q1") is True                                        # blocked dep → 可重规划
     assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "failed"   # worker failed
 
 
@@ -251,7 +476,7 @@ def test_eval_fail_no_pool_publish(tmp_path):
     assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0   # 不 pool_publish
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
-    assert state.is_schedulable("q1") is False
+    assert state.is_schedulable("q1") is True
 
 
 def test_crash_before_resolve_deps_self_heals(tmp_path):

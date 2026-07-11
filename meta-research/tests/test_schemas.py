@@ -142,6 +142,14 @@ def test_policy_yaml_parses_and_validates():
     make_validator("policy").validate(policy)
 
 
+def test_policy_plan_review_semantic_rounds_are_capped_at_two():
+    with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
+        policy = yaml.safe_load(f)
+    policy["flow"]["retry"]["plan_review"] = 3
+    with pytest.raises(ValidationError):
+        make_validator("policy").validate(policy)
+
+
 def test_policy_budget_price_required_and_positive_when_session_limit_enabled():
     with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
         base = yaml.safe_load(f)

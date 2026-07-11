@@ -227,9 +227,9 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 - fork child 会丢弃非目标 lease FD；owner 死亡同时由 pipe EOF 与 `PR_SET_PDEATHSIG` 触发 guardian。当前
   work-root 位于共享 VEPFS，同机 owner-kill/fence 可做部署 canary；若生产会跨节点启动，仍须在目标
   VEPFS/挂载参数上做“两节点同时 acquire，仅一方成功”的部署验收，单机测试不能代替它。
-- plan 的 `critical/budget_estimate` 权威落库/早退仍待 CP11.3c；当前金丝雀运行不要依赖“非关键 target
-  失败后继续”。动态 `goal_amend` 的专用路由、不可变升版、reasoning/status 按 cycle goal version 隔离与
-  applicability 恢复已由 CP11.2b.3b 闭合。
+- plan 的 `critical/budget_estimate` 已权威落库，critical 失败会确定性早退、非 critical 失败可继续后继；
+  动态 `goal_amend` 的专用路由、不可变升版、reasoning/status 按 cycle goal version 隔离与 applicability
+  恢复也已闭合。
 - 代码物化在编排器管理的 staging（净土物化 + sha256 哈希对账 + argv-only 禁 shell + 路径/env 围栏），
   **但真 git worktree 隔离 + env lock 强校验属后续硬化步**。
 - 用户文件已有 DB 终态授权、ContextPack ref 白名单、hash/size 复验和稳定只读 fd；非 bundle 阶段只看
@@ -243,10 +243,14 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   receipt 前 SIGKILL”可能显示重复消息。不能接受重复时必须用严格 webhook 包住 OneBot，而不是直连。
 - **成本护栏已转活，但不是供应商账单**：`ledger.money` 用 Codex CLI 回报的总 token 与本地
   `price_per_1k_tokens` 折算，用于运行护栏和趋势观测。如果编排器在外部调用已完成、但用量落库前被
-  `SIGKILL`，执行 receipt 能证明进程树终态，但尚未与 `runner_call`/ledger 做权威补账；CP11.3c/CP11.4 仍需
-  「调用前意图 + 持久回执 + 幂等补账」协议，不能据此宣称精确供应商账单。
-- 已支持 build / exec target；ImportWorker 组件已实现外部基线物化并要求同 owner 的 fenced supervisor，
-  但默认 `build_system()` 尚未装配 import resumer；遇到在途 import worker 轮会 fail-loud 等待后续装配。
+  `SIGKILL`，启动对账会按 exact `runner_call` owner 收口已知失败，但 provider invocation ID 与供应商 usage/
+  billing receipt 尚未形成端到端 exactly-once 协议，不能据此宣称精确供应商账单。
+- 已支持 build / exec/eval target；默认 `build_system()` 已装配同 owner fenced `ImportWorker`、独立 plan
+  answerability reviewer 和 `dependency_wait` 恢复。这里仍有两条明确边界：当前没有把只读
+  `repo-search` 接成生产 `import_register` 入口，正式运行只能消费事先经受信服务登记到当前 action-cycle 的
+  候选；默认冻结快照中的 adapter 属不可信代码，在 adversarial sandbox capability 落地前会记失败并释放问题
+  重规划，绝不会拿普通 lifecycle supervisor 冒充隔离后在 host 执行。因此当前不是自治 external-import
+  production path，后续检查点才补发现/登记与强隔离。
 - 假执行标记（`source=fake` / `synthetic=true`）是 M0–M3 验收期语义，真执行起已移除。
 
 ## 8. 自验

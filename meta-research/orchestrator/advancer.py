@@ -69,7 +69,7 @@ def derive_next_route(prev_selection: Selection, outcome: PlanOutcome) -> Option
 class SqliteAdvancer:
     def __init__(self, state, compiler, reasoning_provider: ReasoningProvider,
                  gate=None, recall=None, attack=None, status_publisher=None, precheck=None,
-                 stop_controller=None):
+                 stop_controller=None, import_worker=None):
         """state = SQLiteStateStore；compiler = SqliteCompiler；reasoning_provider 见模块注释。
         attack = attack_stages.AttackStages（M4 CP5.4：idea/plan/bundle/reasoning 阶段推进；None = 拒 attack 轮）。
         status_publisher = status_card.SqliteStatusPublisher（M5 CP6.2：阶段边界原子发布人机快照；
@@ -89,7 +89,7 @@ class SqliteAdvancer:
         self.stop_controller = stop_controller   # M6 CP7.1：长跑自终止安全网（§4.4.6 τ）；None = 不装（只认 provider terminate）
         self.last_block_reason: Optional[str] = None   # 最近一次阻断拒因（观测用；None=未被阻断）
         self.last_stop_reason: Optional[str] = None    # 最近一次自终止停因（None=未自停）
-        self.import_worker = None    # M4 CP5.5：物化 worker（set 后 _resume_or_open 识别 worker 轮交其续跑）
+        self.import_worker = import_worker  # M4：物化队列 + 在途 worker cycle 恢复
 
     def derive_next_route(self, prev_selection: Selection, outcome: PlanOutcome) -> Optional[Route]:
         return derive_next_route(prev_selection, outcome)
@@ -189,21 +189,74 @@ class SqliteAdvancer:
             self.import_worker.resume_cycle(cyc)
             cyc = self.state.inflight_cycle()    # worker 已终态 → 落回常规研究轮取位
         if cyc is None:
+            # Human goal amendments and a durable research terminate outrank starting *new* import
+            # work.  An already-open worker was reconciled above, but a queued selection must not
+            # spring back to life after restart once the research loop has explicitly stopped.
+            prior_before_work = self.state.last_done_cycle()
+            pending_amend_before_work = self.state.pending_goal_amend_directive()
+            may_start_import = not (
+                pending_amend_before_work is not None
+                or (prior_before_work is not None
+                    and prior_before_work.next_intent == "terminate"))
+            if may_start_import and self.import_worker is not None:
+                # Worker 队列独立于等待问题调度；每个 outer round 最多物化一条，避免一个 backlog 绕过
+                # max_cycles/人类 precheck 形成无界长操作。materialize_one 自己起并终结 route=NULL worker cycle。
+                self.import_worker.materialize_pending(max_items=1)
+                cyc = self.state.inflight_cycle()
+                if cyc is not None:
+                    raise RuntimeError(
+                        f"import worker 返回后仍留在途 cycle {cyc.cycle_id}；须由恢复入口收口")
+        if cyc is None:
             prior = self.state.last_done_cycle()
             if prior is not None:
                 pending_amend = self.state.pending_goal_amend_directive()
                 if prior.next_intent == "terminate" and pending_amend is None:
                     return None              # 上轮选择停机（持久标志）
+                if pending_amend is None and prior.route == "dependency_wait":
+                    if self._dependency_wait_question(prior) is None:
+                        return None
                 # **开新轮前**拒不支持的续轮（免落 route=None 死轮）：attack 须已装配 AttackStages（M4 CP5.4）。
-                if pending_amend is None and prior.next_intent == "attack" and self.attack is None:
+                if (pending_amend is None
+                        and (prior.next_intent == "attack" or prior.route == "dependency_wait")
+                        and self.attack is None):
                     raise NotImplementedError("attack 续轮需装配 attack=AttackStages（M4 CP5.4）")
-                if pending_amend is None and prior.next_intent not in ("decompose", "attack"):
+                if (pending_amend is None and prior.route != "dependency_wait"
+                        and prior.next_intent not in ("decompose", "attack")):
                     raise NotImplementedError(f"未知续轮 intent: {prior.next_intent!r}")
             cyc = self.state.open_or_resume_cycle()   # 无在途轮 → 创建新轮（created, route=None）
         if cyc.route is None:                # 新轮/未 setup → 定 route + decompose 激活目标
             self._setup_cycle(cyc)
             cyc = self.state.cycle(cyc.cycle_id)
         return cyc
+
+    def _dependency_wait_question(self, prior) -> Optional[str]:
+        """Return the one waiting question once every dep created by that cycle is schedulable.
+
+        A plan may write more than one dependency, but all belong to the cycle's active question.
+        Per reference §4.2.1 only ``pending`` hides that question; a durably adjudicated ``blocked``
+        dependency is an escape hatch and therefore permits replanning just like ``satisfied``.
+        """
+        dep_rows = self.state.daemon.query(
+            "SELECT question_id,status FROM question_dep WHERE created_cycle=? ORDER BY id",
+            (_cnum(prior.cycle_id),))
+        if not dep_rows:
+            raise RuntimeError(f"dependency_wait {prior.cycle_id} 未创建 question_dep")
+        question_ids = {row[0] for row in dep_rows}
+        if len(question_ids) != 1:
+            raise RuntimeError(
+                f"dependency_wait {prior.cycle_id} 的 deps 跨多个问题: {sorted(question_ids)}")
+        pending = [status for _, status in dep_rows if status == "pending"]
+        if pending:
+            qid = next(iter(question_ids))
+            self.last_block_reason = (
+                f"dependency_wait {prior.cycle_id} 的 q{qid} 尚有 {len(pending)} 个 pending dep")
+            return None
+        statuses = {status for _, status in dep_rows}
+        if not statuses.issubset({"satisfied", "blocked"}):
+            raise RuntimeError(
+                f"dependency_wait {prior.cycle_id} dep 状态非法: {sorted(statuses)}")
+        self.last_block_reason = None
+        return f"q{next(iter(question_ids))}"
 
     def _setup_cycle(self, cyc) -> None:
         """据上一 done 轮 selection 定本轮 route（首轮 bootstrap）+ decompose 激活目标——**单一 atomic 事务**
@@ -233,6 +286,14 @@ class SqliteAdvancer:
                     "VALUES (?,'orchestrator','route_setup_cancelled',?)",
                     (_cnum(cyc.cycle_id), '{"reason":"goal_amend_no_longer_pending"}'))
                 self.state.mark_cycle_done(cyc.cycle_id, "aborted")
+                return
+            if prior.route == "dependency_wait":
+                qid = self._dependency_wait_question(prior)
+                if qid is None:
+                    raise RuntimeError(
+                        f"dependency_wait {prior.cycle_id} 未满足却进入 setup")
+                self.state.set_route(cyc.cycle_id, "attack")
+                self.state.activate_question(qid)
                 return
             if prior.next_intent == "attack":
                 # attack 起手 route='attack'（§2.3 规则5：route 在 plan 后特化——本实现 plan 只落 build 目标，

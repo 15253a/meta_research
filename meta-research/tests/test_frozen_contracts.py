@@ -18,9 +18,10 @@ def _sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-# CP11.3c 有意收紧 eval target 的既有 legal variant 身份声明后重锚；执行字段仍由下方语义锁禁止。
+# CP11.4a.1 有意把 license snapshot hash 加入 import_defer 冻结选择锚并封闭专用分支后重锚；
+# 执行字段仍由下方语义锁禁止。
 # 若再改 plan.schema（决策性），须更新此常量并走完整评审 + 记 build_log，绝不静默漂移。
-_PLAN_SCHEMA_SHA256 = "7ad2e38bf360df7a83ab0a72eef34f5c4affdcdd4ca104cee5c947e1410108aa"
+_PLAN_SCHEMA_SHA256 = "cb0454b0f6abc31aabfc8897515f7d1065acd16a474abb57efa95f6eb5ecb943"
 
 
 def test_plan_schema_frozen():

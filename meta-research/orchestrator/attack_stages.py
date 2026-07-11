@@ -50,6 +50,7 @@ from .gate_exec import ExecGate
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
 from .ids import cnum as _cnum, decode as _decode_id, qnum as _qnum, parse_positive_sqlite_int
+from .importer import DeferredImporter
 from .interfaces import InvalidSelectionError, Selection
 from .phase_commit import check_or_record
 from .process_supervisor import ExecutionSupervisor
@@ -60,6 +61,14 @@ _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
 class _PlanReject(Exception):
     """plan 派生期的业务拒（非法/不可满足的抽象 plan）——转 decision(plan_rejected)+零 target 终态，
     不 raise 到 advance（否则轮永不推进 = 全自动死循环）。与 GateReject 一并在 _plan_stage 捕获。"""
+
+
+class _PlanReviewReject(_PlanReject):
+    """Two independent answerability rounds were durably exhausted for this final draft."""
+
+    def __init__(self, message: str, plan: Dict[str, Any]):
+        super().__init__(message)
+        self.plan = plan
 
 
 class _BundleReject(Exception):
@@ -219,7 +228,8 @@ class AttackStages:
             return "plan"
         if cyc.status == "idea":
             self._plan_stage(cyc)
-            return "bundle"
+            return ("done" if self.state.cycle(cyc.cycle_id).status
+                    in ("done", "failed", "aborted") else "bundle")
         if cyc.status == "plan":
             self._bundle_stage(cyc)
             return "reasoning"
@@ -290,12 +300,8 @@ class AttackStages:
             plan = self._plan_artifact(cyc)     # persist-then-consume（原子落盘、恢复复用；失败转 _PlanReject）
             self._validate_plan_schema(plan)    # 结构闸（防裸 KeyError 逃逸）：非 schema-conform → _PlanReject
             if "import_defer" in plan:
-                # schema 允许（targets 必空）但 CP8.6 未接线（DeferredImporter+dependency_wait）——静默当
-                # 空 plan 会**丢外部导入意图**且无痕；显式业务拒并把 defer 对象**整体嵌入拒因**（codex
-                # SHOULD：decision 是恢复/检索面，只留 reason 字符串不够——意图全文随 payload 可查，
-                # 持久化的 plan.json 是制品级备份）
-                raise _PlanReject("plan 含 import_defer——外部导入延迟决定 CP8.6 接线，本轮拒收；defer="
-                                  + json.dumps(plan["import_defer"], ensure_ascii=False, sort_keys=True))
+                self._commit_import_defer(cyc, plan)
+                return
             targets = sorted(plan["targets"], key=lambda x: x["seq"])   # schema 保证 targets/seq 在场
             for t in targets:
                 if t["target_kind"] not in ("build", "exec", "eval"):
@@ -307,14 +313,51 @@ class AttackStages:
             self._register_protocol(cyc.cycle_id, derived)      # gate_new_protocol（幂等跳过）
             claims = self._claim_targets(ci, cyc.cycle_id, derived)   # build→claim_baseline / exec→claim_variant
         except (_PlanReject, GateReject) as e:                  # 非法 plan / gate 拒 → 业务拒收尾（不楔死）
-            self._commit_plan_terminal(cyc, plan, built=[], reject=str(e))
+            rejected_plan = getattr(e, "plan", plan)
+            self._commit_plan_terminal(cyc, rejected_plan, built=[], reject=str(e))
             return
         self._commit_plan_terminal(cyc, plan, built=[(d, claims[d["target_key"]]) for d in derived["targets"]],
                                    reject=None)
 
+    def _commit_import_defer(self, cyc, plan: Dict[str, Any]) -> None:
+        """reference §4.2.5 的 dependency_wait 单事务收尾。
+
+        ``selected_for_materialization + baseline(planned) + question_dep(pending) + phase_commit +
+        route + active Qn release + cycle done`` 恰一事务；任一步失败整体回滚。本轮不建 build_target、
+        不进 bundle/reasoning。候选/license 快照由 DeferredImporter 机械核验，模型不能直接指定 candidate id。
+        """
+        ah = _canon_hash(plan)
+        with self.state.atomic() as conn:
+            pc = check_or_record(
+                conn, cycle_id=cyc.cycle_id, stage="plan",
+                target_id=None, artifact_hash=ah)
+            if pc == "conflict":
+                raise ValueError(
+                    "import_defer plan phase_commit 冲突：同键异 artifact_hash")
+            if pc == "duplicate":
+                raise RuntimeError(
+                    "import_defer phase_commit 已存在但 cycle 仍进入 plan；原子终态不变量损坏")
+            try:
+                DeferredImporter.select_plan_deferred_in_txn(
+                    conn, question_id=cyc.question_id,
+                    action_cycle=cyc.cycle_id,
+                    import_defer=plan["import_defer"], policy=self.policy)
+            except ValueError as error:
+                raise _PlanReject(f"import_defer 确定性选择被拒：{error}") from error
+            self.state.set_route(cyc.cycle_id, "dependency_wait")
+            self.state.release_question(cyc.question_id)
+            self.state.mark_cycle_done(cyc.cycle_id)
+
     def _validate_plan_schema(self, plan: Dict[str, Any]) -> None:
         """plan.json 结构闸（编排器侧防御，不只靠 StageProvider——同 manifest 校验在 _obtain_manifest 侧）：
         非 schema-conform → _PlanReject（业务拒，不楔死）。schemas 未注入（老测试路径）则跳过。"""
+        try:
+            # jsonschema treats NaN/Infinity as Python numbers on some versions.  They are not JSON
+            # values and would otherwise fail later while hashing/rendering the independent review,
+            # turning one bad model artifact into a restart-stable poison cycle.
+            json.dumps(plan, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise _PlanReject(f"plan.json 含非有限或不可编码 JSON 值：{error}") from error
         if self.schemas is None:
             return
         errs = [f"{e.json_path} {e.message}" for e in self.schemas.validator("plan").iter_errors(plan)]
@@ -332,22 +375,205 @@ class AttackStages:
         会抛裸 KeyError/JSONDecodeError 逃出 _plan_stage 的 except → 楔死）。本方法在 _plan_stage 的 try 内调，
         故 _PlanReject 会被业务拒兜住。**注**：provider 进程级失败（RunnerError）不在此转——那是「未产出 plan」
         的另一失败类，与其他阶段（idea/reasoning）一致向上传播。"""
-        art = self.work / f"c{_cnum(cyc.cycle_id)}" / "plan.json"
+        cycle_dir = self.work / f"c{_cnum(cyc.cycle_id)}"
+        art = cycle_dir / "plan.json"
+        review_result_path = cycle_dir / "plan.review-result.json"
+        legacy_plan = None
         if art.exists():
             try:
-                return json.loads(art.read_text(encoding="utf-8"))
+                plan = json.loads(art.read_text(encoding="utf-8"))
             except json.JSONDecodeError as e:
                 raise _PlanReject(f"持久 plan.json 解析失败（staging 损坏？）：{e}") from e
+            # import_defer 在图 04 的 IMP→WAIT 分支于 protocol/review 之前机械收尾；它没有
+            # protocol/metrics/targets，不能拿普通实验计划的 answerability checklist 审。
+            if "plan_review" not in self.p or "import_defer" in plan:
+                return plan
+            if review_result_path.exists():
+                result = self._read_plan_review_result(
+                    review_result_path, plan, cyc.cycle_id)
+                if result["status"] == "exhausted":
+                    raise _PlanReviewReject(
+                        f"plan 可回答性评审 {result.get('round_no')} 轮未通过："
+                        f"{result.get('issues', [])}", plan)
+                if result["status"] != "pass":
+                    raise RuntimeError(
+                        f"持久 plan review result 状态非法: {result['status']!r}")
+                return plan
+            # 兼容升级前已经产出、尚未 phase_commit 的 plan：不把缺 sidecar 当永久楔死；
+            # 把同一字节身份作为 r1 draft 补做独立评审。DB verdict 仍是唯一权威。
+            legacy_plan = plan
+
         pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="plan")
-        files = self.p["plan"](cyc, pack)
+        if "plan_review" not in self.p:
+            files = self.p["plan"](cyc, pack)
+            plan = self._plan_from_provider(files)
+            self._validate_plan_schema(plan)
+            self._write_json_atomic(art, plan)
+            return plan
+
+        max_rounds = self.policy["flow"]["retry"]["plan_review"]
+        if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or not 1 <= max_rounds <= 2:
+            raise RuntimeError("policy.flow.retry.plan_review 必须在 1..2")
+        last_review = None
+        for round_no in range(1, max_rounds + 1):
+            draft_path = cycle_dir / f"plan.draft-r{round_no}.json"
+            if draft_path.exists():
+                try:
+                    plan = json.loads(draft_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(f"持久 plan draft r{round_no} JSON 损坏") from error
+                if (round_no == 1 and legacy_plan is not None
+                        and _canon_hash(plan) != _canon_hash(legacy_plan)):
+                    raise RuntimeError(
+                        "升级恢复发现 plan.json 与 plan.draft-r1.json 身份冲突")
+            elif round_no == 1 and legacy_plan is not None:
+                plan = legacy_plan
+                self._validate_plan_schema(plan)
+                self._write_json_atomic(draft_path, plan)
+            else:
+                files = self.p["plan"](cyc, pack)
+                plan = self._plan_from_provider(files)
+                self._validate_plan_schema(plan)
+                self._write_json_atomic(draft_path, plan)
+            self._validate_plan_schema(plan)
+            if "import_defer" in plan:
+                self._write_json_atomic(art, plan)
+                return plan
+            plan_hash = _canon_hash(plan)
+            existing = self._existing_plan_review(cyc.cycle_id, round_no, plan_hash)
+            if existing is None:
+                review, decision_id = self.p["plan_review"](
+                    cyc, plan, round_no,
+                    self.compiler.render_plan_review(
+                        cycle_id=cyc.cycle_id, plan=plan, round_no=round_no))
+                durable = self._existing_plan_review(
+                    cyc.cycle_id, round_no, plan_hash)
+                if durable is None or durable[1] != decision_id:
+                    raise RuntimeError(
+                        "plan reviewer 返回后缺 exact durable judge decision")
+                review, decision_id = durable
+            else:
+                review, decision_id = existing
+            self._validate_plan_review(review, round_no)
+            last_review = review
+            if review["verdict"] == "pass":
+                result = {
+                    "status": "pass", "round_no": round_no,
+                    "plan_hash": plan_hash, "decision_id": decision_id,
+                    "issues": review.get("issues", []),
+                }
+                self._write_json_atomic(review_result_path, result)
+                self._write_json_atomic(art, plan)
+                return plan
+            if round_no < max_rounds:
+                pack = self.compiler.amend_plan_review_feedback(
+                    pack, plan=plan, review=review, decision_id=decision_id)
+
+        assert last_review is not None
+        result = {
+            "status": "exhausted", "round_no": max_rounds,
+            "plan_hash": _canon_hash(plan), "decision_id": decision_id,
+            "issues": last_review.get("issues", []),
+        }
+        self._write_json_atomic(review_result_path, result)
+        self._write_json_atomic(art, plan)
+        raise _PlanReviewReject(
+            f"plan 可回答性评审 {max_rounds} 轮未通过：{last_review.get('issues', [])}", plan)
+
+    @staticmethod
+    def _plan_from_provider(files: Any) -> Dict[str, Any]:
         if not isinstance(files, dict) or "plan.json" not in files:
-            raise _PlanReject(f"plan provider 未产 plan.json（返回键: {list(files) if isinstance(files, dict) else type(files)}）")
-        plan = files["plan.json"]
-        art.parent.mkdir(parents=True, exist_ok=True)
-        tmp = art.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(plan, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-        tmp.replace(art)
-        return plan
+            raise _PlanReject(
+                f"plan provider 未产 plan.json（返回键: "
+                f"{list(files) if isinstance(files, dict) else type(files)}）")
+        if not isinstance(files["plan.json"], dict):
+            raise _PlanReject("plan provider 的 plan.json 须为 object")
+        return files["plan.json"]
+
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
+            encoding="utf-8")
+        tmp.replace(path)
+
+    def _validate_plan_review(self, review: Any, round_no: int) -> None:
+        if not isinstance(review, dict):
+            raise RuntimeError("plan reviewer 返回值须为 object")
+        if self.schemas is not None:
+            errors = [
+                f"{error.json_path} {error.message}"
+                for error in self.schemas.validator("plan_review").iter_errors(review)
+            ]
+            if errors:
+                raise RuntimeError("plan review verdict 结构损坏: " + "; ".join(errors[:5]))
+        elif review.get("verdict") not in ("pass", "fail"):
+            raise RuntimeError("plan review verdict 非 pass/fail")
+        if review.get("round_no") != round_no:
+            raise RuntimeError(
+                f"plan review round_no={review.get('round_no')!r}，期望 {round_no}")
+
+    def _read_plan_review_result(self, path: Path, plan: Dict[str, Any],
+                                 cycle_id: str) -> Dict[str, Any]:
+        if not path.exists():
+            raise RuntimeError("plan.json 存在但 plan.review-result.json 缺失")
+        try:
+            result = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise RuntimeError("plan.review-result.json 损坏") from error
+        if (not isinstance(result, dict) or result.get("plan_hash") != _canon_hash(plan)
+                or result.get("status") not in ("pass", "exhausted")):
+            raise RuntimeError("plan.review-result 与最终 plan 身份不一致")
+        round_no = result.get("round_no")
+        decision_id = result.get("decision_id")
+        if isinstance(round_no, bool) or not isinstance(round_no, int) or round_no <= 0:
+            raise RuntimeError("plan.review-result round_no 非法")
+        existing = self._existing_plan_review(cycle_id, round_no, result["plan_hash"])
+        if existing is None or existing[1] != decision_id:
+            raise RuntimeError("plan.review-result 未绑定唯一 durable judge decision")
+        review, _ = existing
+        expected_verdict = "pass" if result["status"] == "pass" else "fail"
+        if review["verdict"] != expected_verdict:
+            raise RuntimeError("plan.review-result 状态与 durable judge verdict 不一致")
+        if result.get("issues", []) != review.get("issues", []):
+            raise RuntimeError("plan.review-result issues 与 durable judge verdict 不一致")
+        if result["status"] == "exhausted" and round_no != self.policy["flow"]["retry"]["plan_review"]:
+            raise RuntimeError("plan.review-result exhausted 轮次与冻结 policy 不一致")
+        return result
+
+    def _existing_plan_review(self, cycle_id: str, round_no: int,
+                              plan_hash: str):
+        rows = self.state.daemon.query(
+            "SELECT d.id,d.payload_json,rc.status,rc.phase,rc.purpose,rc.cycle_id "
+            "FROM decision d LEFT JOIN runner_call rc ON rc.id="
+            "json_extract(d.payload_json,'$.runner_call_id') "
+            "WHERE d.cycle_id=? AND d.actor='judge' AND d.type='plan_review' "
+            "AND json_valid(d.payload_json) "
+            "AND json_extract(d.payload_json,'$.round_no')=? ORDER BY d.id",
+            (_cnum(cycle_id), round_no))
+        if len(rows) > 1:
+            raise RuntimeError(
+                f"plan review c{_cnum(cycle_id)} round {round_no} 有多个 verdict")
+        if not rows:
+            return None
+        decision_id, raw, status, phase, purpose, runner_cycle_id = rows[0]
+        if ((status, phase, purpose) != ("success", "audit", "plan_review")
+                or runner_cycle_id != _cnum(cycle_id)):
+            raise RuntimeError(
+                f"plan review decision {decision_id} 无 success audit runner_call")
+        payload = json.loads(raw)
+        if payload.get("plan_hash") != plan_hash:
+            raise RuntimeError(
+                f"plan review c{_cnum(cycle_id)} round {round_no} 的 durable plan 身份漂移")
+        review = {
+            "verdict": payload.get("verdict"), "round_no": payload.get("round_no"),
+            "issues": payload.get("issues", []), "notes_md": payload.get("notes_md", ""),
+        }
+        if review["verdict"] not in ("pass", "fail"):
+            raise RuntimeError(f"plan review decision {decision_id} verdict 损坏")
+        return review, decision_id
 
     def _derive_plan(self, ci: int, plan: Dict[str, Any], targets: List[Dict[str, Any]]) -> Dict[str, Any]:
         """纯读派生（编排器机械翻译，不推理；确定性 = 崩溃重放同结果）：抽象 plan → protocol int id / metric

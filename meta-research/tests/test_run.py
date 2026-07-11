@@ -420,6 +420,22 @@ def test_main_second_ctrl_c_during_fallback_drain_kills_groups(tmp_path, monkeyp
 
 
 # ============ 全装配端到端（reasoning-only 闭环）============
+def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
+    from orchestrator.import_fetcher import FrozenCandidateFetcher
+    from orchestrator.import_worker import ImportWorker
+    from orchestrator.stage_provider import PlanReviewProvider
+
+    system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))
+    try:
+        worker = system.advancer.import_worker
+        assert isinstance(worker, ImportWorker)
+        assert isinstance(worker.p["fetch"], FrozenCandidateFetcher)
+        assert worker.execution_supervisor is system.execution_supervisor
+        assert isinstance(system.advancer.attack.p["plan_review"], PlanReviewProvider)
+    finally:
+        system.close()
+
+
 def test_build_and_run_bootstrap_terminate(tmp_path):
     sys = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE]))
     ids = sys.run(max_cycles=5)
@@ -1019,9 +1035,12 @@ def test_full_attack_flow_end_to_end(tmp_path):
     boot_attack = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "toy 基线能到 0.9 吗",
                                               "local_key": "root"}]},
                    "selection.json": {"next_question_id": "root", "next_intent": "attack", "scores": []}}
+    plan_review_pass = {
+        "plan_review.json": {"verdict": "pass", "round_no": 1, "issues": []}}
     verdict_pass = {"review_verdict.json": {"verdict": "pass", "issues": []}}
     seq = [boot_attack,                          # c1 bootstrap（reasoning）
            TA._idea_set(), TA._plan_json(),      # c2 attack：idea → plan（冻结 schema 真形态）
+           plan_review_pass,                     # plan answerability 独立 reviewer
            bundle_env,                           # bundle 信封（manifest+代码）
            verdict_pass, verdict_pass,           # judge：code review → result review（经 JudgeProvider 落库）
            attack_reasoning]                     # 轮尾：真证据关问 + terminate
@@ -1034,8 +1053,12 @@ def test_full_attack_flow_end_to_end(tmp_path):
     assert d.query_one("SELECT status FROM baseline WHERE canonical_key='ck-attack'")[0] == "legal"
     assert d.query_one("SELECT status, eval_key FROM evaluation WHERE source='factory'")[0:2] == ("success", "t1")
     assert d.query_one("SELECT value FROM metric_result ORDER BY id DESC LIMIT 1")[0] == 0.93
-    assert d.query_one("SELECT count(*) FROM runner_call WHERE phase='audit' AND status='success'")[0] == 2
-    assert d.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 2
+    assert d.query_one("SELECT count(*) FROM runner_call WHERE phase='audit' AND status='success'")[0] == 3
+    assert d.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 3
+    assert d.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 1
+    assert d.query_one(
+        "SELECT count(*) FROM ledger l JOIN runner_call rc ON rc.id=l.runner_call_id "
+        "WHERE rc.phase='audit' AND rc.purpose='plan_review'")[0] == 1
     assert d.query_one("SELECT status FROM question WHERE text LIKE 'toy 基线%'")[0] == "answered"
     assert d.query_one("SELECT count(*) FROM build_target WHERE status='complete'")[0] == 1
     # 执行是真子进程：checkpoint 文件真实存在且被登记
