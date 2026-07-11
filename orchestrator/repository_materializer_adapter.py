@@ -209,12 +209,26 @@ class _RepositoryAdapterMixin:
         if smoke_cmd[0] not in allowed_programs or eval_cmd[0] not in allowed_programs:
             raise RepositoryMaterializationError(
                 "adapter v2 当前只允许 pinned Python 作为直接 launcher")
+        lfs_objects = []
+        for item in ledger:
+            lfs = item.get("lfs")
+            if lfs is None:
+                continue
+            lfs_objects.append({
+                "path": item["path"], "repository": item["repository"],
+                "revision": item["revision"], "oid": lfs["oid"],
+                "size": lfs["size"],
+                "pointer_sha256": lfs["pointer_sha256"],
+                "pointer_bytes": lfs["pointer_bytes"],
+                "pointer_git_blob_sha1": item["git_blob_sha1"],
+            })
+        lfs_objects.sort(key=lambda item: item["path"])
         supply_chain = {
             "revision": revision, "root_tree_sha1": root_tree_sha,
             "submodules": list(sorted(
                 submodules, key=lambda item: item["path"])),
             "patch_set_hash": _value_hash([]), "patch_apply_order": [],
-            "lfs_objects": [], "dependency_mode": dependency_mode,
+            "lfs_objects": lfs_objects, "dependency_mode": dependency_mode,
             "dependency_locks": parsed_locks,
             "dependency_lock_hash": dependency_lock_hash,
             "harness_adapter_hash": adapter_hash,

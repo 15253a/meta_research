@@ -108,8 +108,9 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
   memory/pids/nofile/日志轮转/单文件/输出/CPU/tmpfs 上限；bundle 锚区给出的 runtime `env_hash` 由这些声明机械派生，
   manifest 只能逐字回引。
 - `import_materialization`：GitHub commit 物化的 API/archive/file/tree/submodule 大小与数量上限、
-  archive redirect host allowlist、LFS 明示策略、adapter 路径和 pinned image 中 CPython 版本/源码
-  artifact SHA-256。当前 `lfs_policy=reject`，不会偷偷把 pointer 当模型。
+  archive/LFS object redirect host allowlist、LFS object/batch 上限、adapter 路径和 pinned image 中 CPython
+  版本/源码 artifact SHA-256。当前 `lfs_policy=fetch`；pointer Git blob、Batch response、下载 OID/size 与最终
+  ledger 必须闭合，signed action URL/header 不进入持久复现身份。
 - `session.dual_mode`：A=一 turn 一阶段（默认；A/B 实测定默认属运维）。
 
 > **改 policy.yaml 是决策性变更**（影响研究语义/门禁/预算）——生产改动应走评审。改后 `pytest
@@ -303,7 +304,11 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   与 tree 交叉核，再记 SHA-256 ledger。同一 commit 的 archive 压缩字节可被 GitHub 重生，因此
   transport SHA 只是审计证据，复现身份用 root tree + 文件 ledger，不会因 gzip 漂移换一个源。
   根仓库和固定 gitlink 子模块的 license evidence path/content SHA 都与同一 commit 文件 ledger 交叉核；
-  子模块还独立执行 allowlist 决策。symlink 和 Git LFS pointer 当前 fail-closed。
+  子模块还独立执行 allowlist 决策。symlink 仍 fail-closed；Git LFS pointer 只经固定 GitHub Batch endpoint 的
+  basic transfer 下载，action URL/header 受 HTTPS host/header 围栏，最终 bytes 重算 SHA-256 OID 与 size。GitHub
+  archive 若已展开 LFS object，还会回查 pointer Git blob 后再做同一 OID/size 双核。
+  协议口径固定为 Git LFS 官方 [pointer spec](https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md) 与
+  [Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md)；不从仓库内容推导 endpoint 或凭据。
 - 仓库须携 `.meta-research/import-adapter.json` v2：只允许 pinned Python 直接 argv、
   `pinned_image_only` 且无项目级 lock 安装，显式声明 artifact、smoke/eval 和 named factory metrics。
   adapter 通过 sandbox smoke + 代码评审后才能以 repository/name 稳定协议家族 ID 注册；同版本
@@ -312,13 +317,14 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   旧候选内嵌 `materialization` v1 仍可恢复。
 - 物化实现以 `repository_materializer.py` 作为兼容 facade 与单次编排入口；共享 identity primitives、HTTPS
   transport、Git tree、archive/submodule、adapter compiler、content store 分属
-  `repository_materialization_common.py` 与 `repository_materializer_{transport,tree,archive,adapter,store}.py`。
+  `repository_materialization_common.py` 与 `repository_materializer_{transport,tree,lfs,archive,adapter,store}.py`。
   扩展 LFS、依赖构建或 adapter 生成时应落入对应组件，不得把供应链职责重新堆回 facade。
 - 大仓库的 judge prompt 不会整仓读入内存：给出文件数/总 bytes、至多 256 条且合计 32KB 的路径，并按
   adapter/命令入口/Python 优先，在 160KB 总预算（单文件 20KB）内展示内容；其余文件仍受 exact
   manifest hash 闭包约束，但不会冒充已经过语义评审。关键执行路径因截断不可判断时，judge 应 fail-closed。
-- 这仍不是“自动复现任意 SOTA repo”：普通仓库缺 adapter 会被拒；LFS OID 下载、项目 lock
-  构建/验证的专用 image、adapter 生成+独立评审与部署级 quota/cgroup/device 合同属下一检查点。
+- 这仍不是“自动复现任意 SOTA repo”：普通仓库缺 adapter 会被拒；项目 lock 构建/验证的专用 image、adapter
+  生成+独立评审与部署级 quota/cgroup/device 合同属后续检查点。LFS 支持也只覆盖 GitHub 固定 Batch endpoint、
+  policy allowlist 内 basic HTTPS transfer，不接受仓库自定义 `.lfsconfig` endpoint/transfer adapter。
 - CP11.3c 的 120 轮是无真实 provider 工作负载的控制面/投影回归；尚未完成跨节点 VEPFS 双 owner 实机竞态，
   也尚未运行 100+ 轮含真实 Codex/import/训练与 owner-kill/daemon-loss/预算失败注入的 soak。这两项完成前，
   对“上百轮可用”的结论仍只能是机制上可推进、不是运营验收通过。

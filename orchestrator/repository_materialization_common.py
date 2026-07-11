@@ -222,7 +222,7 @@ def _git_tree_sha1(entries: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _parse_lfs_pointer(payload: bytes) -> Optional[Dict[str, Any]]:
-    if not payload or len(payload) > 1024:
+    if not payload or len(payload) >= 1024:
         return None
     try:
         text = payload.decode("utf-8")
