@@ -37,7 +37,7 @@
    - `target_ref`: `{target_key, target_kind, seq, plan_slice_hash}` —— 全部**照抄锚区切片与
      plan_slice_hash**（编排器重算核对，抄错即拒）。
    - `protocol_ref`: `{protocol_id, protocol_ver}` —— 照抄锚区（int）。
-   - `env_hash`: 环境指纹声明串（如 `"py311-torch21-cpu"`；同环境同串）。
+   - `env_hash`: **逐字照抄锚区给出的 pinned sandbox runtime sha256**；不得自造环境名、tag 或隐式 pull。
    - `config_json`: 代码实际使用的配置对象。**切片 claim.config_json 非空时须与之完全一致**
      （计划是配置的决定者）；切片未给则你自定（并让代码真用它）。
    - `code_files`: 信封中全部代码/配置文件名的清单（**不含**保留名 identity.md / execution_manifest.json /
@@ -46,6 +46,8 @@
      新变体，一样要 smoke/训练/评估）。每个 = `{"argv": [程序, 参数…], "timeout_s": 秒}`
      （timeout_s 可整键省略；**键名逐字，不要加 `?` 等多余字符**）：
      - **argv 数组、禁 shell**：不得用 `bash -c` / `sh` / `env` 作程序名；一个 token 一个参数。
+     - 程序名必须存在于锚区 pinned image；默认 bootstrap 镜像用 `python`，不得写 host 的
+       `/usr/bin/python`、虚拟环境绝对路径或假定未锁定的系统工具。
      - 占位符：`{src}` = 代码物化目录（如 `["python", "{src}/train.py"]`）；`{ckpt}` = 训练产
        checkpoint 路径（**仅 eval 命令可用**，如 `["python", "{src}/eval.py", "{ckpt}"]`）。
      - 命令的 cwd 是独立的 run 目录（不是代码目录）：读代码走 `{src}`，写产物写 cwd 相对路径。

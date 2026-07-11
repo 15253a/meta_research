@@ -261,6 +261,101 @@ class ExecGate:
                 if var is not None:
                     conn.execute("UPDATE variant SET status='abandoned' WHERE id=? AND status='planned'", (var,))
 
+    def gate_fail_sandbox_output(self, *, build_target_id: int,
+                                 owner_kind: str, owner_id: int,
+                                 transcript_ref: str) -> None:
+        """Atomically reject unsafe sandbox output and freeze its exact DB owner.
+
+        The guardian has already proved the container drained.  Publishing the
+        quarantine is nevertheless part of the execution fact, so a rejected
+        output must not leave a run/attempt active.  Owner + evaluation + target
+        and pool cascade are one transaction; a kill cannot expose a partially
+        classified recovery state.
+        """
+        if owner_kind not in ("build_target", "run", "evaluation_attempt"):
+            raise ValueError("sandbox output owner_kind 非法")
+        if (isinstance(owner_id, bool) or not isinstance(owner_id, int)
+                or owner_id <= 0):
+            raise ValueError("sandbox output owner_id 非法")
+        if not isinstance(transcript_ref, str) or not transcript_ref:
+            raise ValueError("sandbox output transcript_ref 非法")
+        with self.daemon.transaction() as conn:
+            bt = conn.execute(
+                "SELECT cycle_id,target_kind,status,baseline_id,variant_id,failure_kind "
+                "FROM build_target WHERE id=?", (build_target_id,)).fetchone()
+            if bt is None:
+                raise RuntimeError(f"sandbox output target {build_target_id} 不存在")
+            _cycle_id, kind, target_status, baseline_id, variant_id, target_failure = bt
+
+            if owner_kind == "build_target":
+                if owner_id != build_target_id:
+                    raise RuntimeError("sandbox output receipt 指向另一 build_target")
+            elif owner_kind == "run":
+                owner = conn.execute(
+                    "SELECT status,failure_kind,build_target_id FROM run WHERE id=?",
+                    (owner_id,)).fetchone()
+                if owner is None or owner[2] != build_target_id:
+                    raise RuntimeError("sandbox output receipt 指向不存在/异 target 的 run")
+                if owner[0] == "running":
+                    conn.execute(
+                        "UPDATE run SET status='failed',failure_kind='data_invalid' WHERE id=?",
+                        (owner_id,))
+                elif tuple(owner[:2]) != ("failed", "data_invalid"):
+                    raise RuntimeError(
+                        f"sandbox output run {owner_id} 已有矛盾终态 {owner[:2]}")
+            else:
+                owner = conn.execute(
+                    "SELECT ea.status,ea.failure_kind,ea.evaluation_id,ea.build_target_id,e.status "
+                    "FROM evaluation_attempt ea JOIN evaluation e ON e.id=ea.evaluation_id "
+                    "WHERE ea.id=?", (owner_id,)).fetchone()
+                if owner is None or owner[3] != build_target_id:
+                    raise RuntimeError(
+                        "sandbox output receipt 指向不存在/异 target 的 evaluation_attempt")
+                if owner[0] == "running":
+                    conn.execute(
+                        "UPDATE evaluation_attempt SET status='failed',"
+                        "failure_kind='artifact_invalid',transcript_ref=COALESCE(?,transcript_ref),"
+                        "completed_cycle=cycle_id WHERE id=?",
+                        (transcript_ref, owner_id))
+                elif tuple(owner[:2]) != ("failed", "artifact_invalid"):
+                    raise RuntimeError(
+                        f"sandbox output attempt {owner_id} 已有矛盾终态 {owner[:2]}")
+                evaluation_id = owner[2]
+                evaluation_status = conn.execute(
+                    "SELECT status FROM evaluation WHERE id=?", (evaluation_id,)).fetchone()[0]
+                if evaluation_status == "success":
+                    raise RuntimeError(
+                        f"sandbox output evaluation {evaluation_id} 已 success，事实矛盾")
+                active = conn.execute(
+                    "SELECT 1 FROM evaluation_attempt WHERE evaluation_id=? "
+                    "AND status IN ('created','running') LIMIT 1", (evaluation_id,)).fetchone()
+                successful = conn.execute(
+                    "SELECT 1 FROM evaluation_attempt WHERE evaluation_id=? "
+                    "AND status='success' LIMIT 1", (evaluation_id,)).fetchone()
+                if active is not None or successful is not None:
+                    raise RuntimeError(
+                        f"sandbox output evaluation {evaluation_id} 仍有其他 active/success attempt")
+                conn.execute(
+                    "UPDATE evaluation SET status='failed' WHERE id=?", (evaluation_id,))
+
+            if target_status not in _TERMINAL_TARGET:
+                conn.execute(
+                    "UPDATE build_target SET status='failed',failure_kind='artifact_invalid' "
+                    "WHERE id=?", (build_target_id,))
+                if kind in ("build", "exec", "import"):
+                    if kind in ("build", "import") and baseline_id is not None:
+                        conn.execute(
+                            "UPDATE baseline SET status='build_failed' WHERE id=? "
+                            "AND status IN ('planned','building')", (baseline_id,))
+                    if variant_id is not None:
+                        conn.execute(
+                            "UPDATE variant SET status='build_failed' WHERE id=? "
+                            "AND status IN ('planned','building')", (variant_id,))
+            elif (target_status, target_failure) != ("failed", "artifact_invalid"):
+                raise RuntimeError(
+                    f"sandbox output target {build_target_id} 已有矛盾终态 "
+                    f"{(target_status, target_failure)}")
+
     def gate_skip_remaining_targets(self, *, failed_target_id: int) -> List[int]:
         """在 critical failure / engineering_blocked 后原子跳过所有尚未执行的后继目标。
 

@@ -12,14 +12,18 @@ import stat
 from pathlib import Path
 
 import pytest
+import yaml
 from jsonschema.exceptions import ValidationError
 
 from orchestrator import database as db
 from orchestrator.interfaces import Artifact, CallUsage
+from orchestrator.execution_sandbox import sandbox_environment_hash
 from orchestrator.run import System, build_system
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = str(Path(__file__).resolve().parent.parent)
+_POLICY = yaml.safe_load((Path(SYSTEM_ROOT) / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+RUNTIME_ENV_HASH = sandbox_environment_hash(_POLICY["execution"]["sandbox"])
 
 _BOOT_TERMINATE = {
     "tree_ops.json": {"ops": [{"op": "create_root", "text": "根问题：EEG 有跨数据集通用规律吗？",
@@ -421,6 +425,7 @@ def test_main_second_ctrl_c_during_fallback_drain_kills_groups(tmp_path, monkeyp
 
 # ============ 全装配端到端（reasoning-only 闭环）============
 def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
+    from orchestrator.execution_sandbox import DockerExecutionSandbox
     from orchestrator.import_fetcher import FrozenCandidateFetcher
     from orchestrator.import_search import GitHubRepoSearchProvider, ImportSearchService
     from orchestrator.import_triggers import (
@@ -435,6 +440,10 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         assert isinstance(worker, ImportWorker)
         assert isinstance(worker.p["fetch"], FrozenCandidateFetcher)
         assert worker.execution_supervisor is system.execution_supervisor
+        assert isinstance(worker.execution_sandbox, DockerExecutionSandbox)
+        assert system.advancer.attack.execution_sandbox is worker.execution_sandbox
+        assert worker.execution_sandbox.resource_mode in {
+            "cgroup-v1", "cgroup-v2", "rlimit-fallback"}
         assert isinstance(system.advancer.attack.p["plan_review"], PlanReviewProvider)
         search = system.advancer.attack.p["import_search"]
         assert isinstance(search, ImportTriggerRouter)
@@ -1043,11 +1052,11 @@ def test_full_attack_flow_end_to_end(tmp_path):
                     "target_ref": {"target_key": slice_["target_key"], "target_kind": "build",
                                    "seq": slice_["seq"], "plan_slice_hash": canon_hash(slice_)},
                     "protocol_ref": {"protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"]},
-                    "env_hash": "toy-env", "config_json": {"lr": 0.1},
+                    "env_hash": RUNTIME_ENV_HASH, "config_json": {"lr": 0.1},
                     "code_files": ["train.py", "eval.py", "smoke.py"],
-                    "commands": {"smoke": {"argv": [_sys.executable, "{src}/smoke.py"]},
-                                 "train": {"argv": [_sys.executable, "{src}/train.py"]},
-                                 "eval": {"argv": [_sys.executable, "{src}/eval.py", "{ckpt}"]}},
+                    "commands": {"smoke": {"argv": ["python", "{src}/smoke.py"]},
+                                 "train": {"argv": ["python", "{src}/train.py"]},
+                                 "eval": {"argv": ["python", "{src}/eval.py", "{ckpt}"]}},
                     "expected_outputs": {"checkpoint": "ckpt.bin"},
                     "repro_cmd_md": "python train.py 后 python eval.py <ckpt>"},
                 "identity.md": "# toy 基线\n结构: 线性\n\n## 复现命令\npython train.py",

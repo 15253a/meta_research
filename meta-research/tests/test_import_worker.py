@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +23,11 @@ from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import open_gate_read_conn
 from orchestrator.import_worker import ImportWorker
 from orchestrator.import_fetcher import FrozenCandidateFetcher
+from orchestrator.execution_sandbox import (
+    DockerExecutionSandbox,
+    ExecutionSandboxError,
+    SandboxOutputError,
+)
 from orchestrator.importer import DeferredImporter
 from orchestrator.instance_lease import InstanceLease
 from orchestrator.process_supervisor import ExecutionSupervisor
@@ -44,24 +50,26 @@ def _fetch_ok(cand):
             "target_set_hash": "tsh-imp", "required": [[1, 1]], "env_hash": "imp-env"}
 
 
-def _frozen_snapshot(*, digest=None):
+def _frozen_snapshot(*, digest=None, env_hash=None, portable=False):
     payload = b"frozen-weights"
+    environment_hash = env_hash or "sha256:" + "3" * 64
+    interpreter = "python" if portable else sys.executable
     return json.dumps({"materialization": {
         "version": 1,
         "files": [{
             "path": "model.bin", "encoding": "utf-8", "data": payload.decode(),
             "sha256": digest or "sha256:" + hashlib.sha256(payload).hexdigest(),
         }],
-        "smoke_argv": [sys.executable, "-c", "print('smoke ok')"],
-        "eval_argv": [sys.executable, "-c", "print('metric_value: 1@1=0.88')"],
+        "smoke_argv": [interpreter, "-c", "print('smoke ok')"],
+        "eval_argv": [interpreter, "-c", "print('metric_value: 1@1=0.88')"],
         "protocol_id": 1, "protocol_ver": 1, "eval_key": "import-fac",
         "target_set_hash": "tsh-imp", "required": [[1, 1]],
         "artifact_relpath": "model.bin", "artifact_type": "external_model",
-        "env_hash": "sha256:" + "3" * 64,
+        "env_hash": environment_hash,
         "supply_chain": {
             "dependency_lock_hash": "sha256:" + "1" * 64,
             "harness_adapter_hash": "sha256:" + "2" * 64,
-            "environment_hash": "sha256:" + "3" * 64,
+            "environment_hash": environment_hash,
             "network_isolation": True,
         },
     }}, sort_keys=True)
@@ -223,6 +231,45 @@ def test_default_frozen_materialization_refuses_host_execution_without_sandbox(t
         "WHERE action='materialize_failed'")[0]
     assert "adversarial sandbox" in reason
     assert daemon.query_one("SELECT status FROM question_dep")[0] == "blocked"
+
+
+def test_default_frozen_materialization_runs_only_in_pinned_sandbox(tmp_path):
+    work = tmp_path / "w"
+    (work / "state").mkdir(parents=True)
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"])
+    try:
+        sandbox.preflight()
+    except (ExecutionSandboxError, OSError, subprocess.SubprocessError) as error:
+        pytest.skip(f"pinned local Docker sandbox unavailable: {error}")
+    supervisor = ExecutionSupervisor.standalone(work / "state" / "executions")
+    path = str(tmp_path / "r.sqlite")
+    daemon = WriteDaemon(db.connect(path))
+    state = SQLiteStateStore(daemon, POLICY)
+    pool = PoolGate(daemon, open_gate_read_conn(path))
+    worker = ImportWorker(
+        state=state, pool_gate=pool,
+        providers={"fetch": FrozenCandidateFetcher(), "judge": _judge(daemon)},
+        obs_policy=OBS, work_root=str(work),
+        execution_supervisor=supervisor, execution_sandbox=sandbox)
+    snapshot = _frozen_snapshot(
+        env_hash=sandbox.environment_hash, portable=True)
+    _seed_deferred(
+        daemon, state, search_snapshot_json=snapshot,
+        search_snapshot_hash="sha256:" + hashlib.sha256(snapshot.encode()).hexdigest())
+    try:
+        assert worker.materialize_pending(max_items=1)
+        assert daemon.query_one("SELECT status FROM baseline")[0] == "legal"
+        assert daemon.query_one("SELECT status FROM evaluation")[0] == "success"
+        receipts = [json.loads(path.read_text()) for path in
+                    (work / "state" / "executions").glob("execution-*.json")]
+        sandboxed = [receipt for receipt in receipts
+                     if receipt.get("containment") == "docker-container-v1"]
+        assert len(sandboxed) == 2                 # smoke + factory eval
+        assert all(receipt["sandbox"]["container_drained"] is True
+                   for receipt in sandboxed)
+    finally:
+        supervisor.close()
 
 
 def test_materialize_full_chain(env):
@@ -477,6 +524,50 @@ def test_eval_fail_no_pool_publish(tmp_path):
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0   # 不 pool_publish
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
     assert state.is_schedulable("q1") is True
+
+
+def test_import_sandbox_output_reject_settles_exact_eval_owner(tmp_path, monkeypatch):
+    """Unsafe eval output fails its exact attempt and worker without reopening the successful import run."""
+    path = str(tmp_path / "r.sqlite")
+    daemon, state, worker = _mk_worker(path, tmp_path / "w")
+    sel = _seed_deferred(daemon, state)
+    original = H.run_staged
+    receipt_path = tmp_path / "execution-import-eval-output-reject.json"
+
+    def reject_eval_output(cmd, **kwargs):
+        if kwargs.get("execution_kind") != "import-eval":
+            return original(cmd, **kwargs)
+        raise SandboxOutputError(
+            "quarantine contains hardlink",
+            receipt={
+                "state": "terminal", "outcome": "exit", "group_drained": True,
+                "containment": "docker-container-v1",
+                "sandbox": {"container_drained": True},
+                "context": dict(kwargs["execution_context"]),
+            },
+            receipt_path=receipt_path)
+
+    monkeypatch.setattr(H, "run_staged", reject_eval_output)
+    assert worker.materialize_pending(max_items=1) == [sel["external_import_id"]]
+
+    assert daemon.query_one("SELECT status,failure_kind FROM run") == ("success", None)
+    assert daemon.query_one(
+        "SELECT status,failure_kind,transcript_ref FROM evaluation_attempt") == (
+            "failed", "artifact_invalid", str(receipt_path))
+    assert daemon.query_one("SELECT status FROM evaluation")[0] == "failed"
+    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == (
+        "failed", "artifact_invalid")
+    assert daemon.query_one(
+        "SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
+    assert daemon.query_one("SELECT status FROM question_dep")[0] == "blocked"
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "failed"
+    assert daemon.query_one(
+        "SELECT count(*) FROM evaluation_attempt WHERE status='running'")[0] == 0
+    assert worker.materialize_pending(max_items=1) == []
 
 
 def test_crash_before_resolve_deps_self_heals(tmp_path):

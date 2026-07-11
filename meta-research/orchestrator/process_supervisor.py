@@ -12,10 +12,12 @@ small external guardian which:
 * terminates and reaps the complete trusted descendant tree, and
 * publishes a fsync'd terminal receipt before releasing the flock duplicate.
 
-This closes same-host overlap for trusted workloads, including ordinary
-``setsid``/double-fork daemons.  It is not an adversarial sandbox: code running
-as the same UID can kill the guardian or tamper with files.  A delegated cgroup
-v2/container boundary remains required for hostile code (CP11.4).
+For ordinary calls this closes same-host overlap for trusted workloads,
+including ``setsid``/double-fork daemons, but is not by itself an adversarial
+sandbox.  Sandboxed calls additionally delegate an exact random Docker
+name+label capability: terminal publication waits until both the local tree and
+daemon-owned container are proven absent.  Filesystem/network/privilege policy
+is enforced by :mod:`execution_sandbox`; the guardian owns lifecycle proof.
 """
 from __future__ import annotations
 
@@ -52,6 +54,11 @@ _ACTIVITY_SAMPLE_INTERVAL_S = 0.5
 _KIND_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _OPERATION_RE = re.compile(r"^exec-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_CONTAINER_NAME_RE = re.compile(r"^mr-[a-z0-9][a-z0-9_.-]{0,61}$")
+_SANDBOX_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_SANDBOX_LABEL = "meta-research.sandbox-token"
+_SANDBOX_BACKEND = "docker-container-v1"
+_SANDBOX_RESOURCE_MODES = frozenset({"cgroup-v1", "cgroup-v2", "rlimit-fallback"})
 _TERMINAL_OUTCOMES = frozenset({
     "exit", "timeout", "cancelled", "owner_lost", "spawn_failed",
     "lingering_descendant", "owner_lost_before_start",
@@ -200,6 +207,88 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
     return (json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         allow_nan=False) + "\n").encode("utf-8")
+
+
+def _executable_identity(path: str) -> str:
+    """Hash one trusted host executable without following its final component."""
+    if (not isinstance(path, str) or not path or "\x00" in path
+            or not os.path.isabs(path) or os.path.normpath(path) != path):
+        raise ValueError("sandbox engine_path 须为规范绝对路径")
+    flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & 0o022 or not info.st_mode & 0o111):
+            raise PermissionError("sandbox engine 须为 root/owner 持有、不可组/全局写的可执行常规文件")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return "sha256:" + digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _normalize_external_container(value: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Validate the narrow external-container cleanup capability passed to a guardian."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("external_container 须为 mapping 或 None")
+    expected_keys = {
+        "backend", "engine_path", "engine_host", "container_name", "token", "spec_sha256",
+        "network_mode", "rootfs_readonly", "no_new_privileges", "cap_drop_all",
+        "pid_namespace", "resource_mode",
+    }
+    if set(value) != expected_keys:
+        raise ValueError("external_container 字段闭包非法")
+    if value.get("backend") != _SANDBOX_BACKEND:
+        raise ValueError("external_container backend 非法")
+    engine_host = value.get("engine_host")
+    if (not isinstance(engine_host, str) or not engine_host.startswith("unix:///")
+            or "\x00" in engine_host
+            or os.path.normpath(engine_host.removeprefix("unix://"))
+            != engine_host.removeprefix("unix://")):
+        raise ValueError("external_container engine_host 只接受规范绝对 unix socket")
+    name, token = value.get("container_name"), value.get("token")
+    if (not isinstance(name, str) or _CONTAINER_NAME_RE.fullmatch(name) is None
+            or not isinstance(token, str) or _SANDBOX_TOKEN_RE.fullmatch(token) is None):
+        raise ValueError("external_container name/token 非法")
+    spec_sha256 = value.get("spec_sha256")
+    if not isinstance(spec_sha256, str) or _SHA256_RE.fullmatch(spec_sha256) is None:
+        raise ValueError("external_container spec_sha256 非法")
+    if value.get("network_mode") != "none":
+        raise ValueError("external_container 必须 network_mode=none")
+    for field in ("rootfs_readonly", "no_new_privileges", "cap_drop_all", "pid_namespace"):
+        if value.get(field) is not True:
+            raise ValueError(f"external_container {field} 必须为 true")
+    resource_mode = value.get("resource_mode")
+    if resource_mode not in _SANDBOX_RESOURCE_MODES:
+        raise ValueError("external_container resource_mode 非法")
+    raw_engine_path = value.get("engine_path")
+    if not isinstance(raw_engine_path, str) or not os.path.isabs(raw_engine_path):
+        raise ValueError("external_container engine_path 须为绝对路径")
+    engine_path = os.path.realpath(raw_engine_path)
+    engine_sha256 = _executable_identity(engine_path)
+    return {
+        "backend": _SANDBOX_BACKEND,
+        "engine_path": engine_path,
+        "engine_host": engine_host,
+        "engine_sha256": engine_sha256,
+        "container_name": name,
+        "token": token,
+        "spec_sha256": spec_sha256,
+        "network_mode": "none",
+        "rootfs_readonly": True,
+        "no_new_privileges": True,
+        "cap_drop_all": True,
+        "pid_namespace": True,
+        "resource_mode": resource_mode,
+    }
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -416,6 +505,48 @@ def _finite_number(value: Any, *, positive: bool = False) -> bool:
             and (not positive or float(value) > 0))
 
 
+def _validate_sandbox_receipt(
+        sandbox: Any, *, containment: Any, terminal: bool) -> None:
+    if containment == "trusted-descendant-tree":
+        if sandbox is not None:
+            raise ValueError("trusted execution 不得携 sandbox authority")
+        return
+    if containment != _SANDBOX_BACKEND or not isinstance(sandbox, dict):
+        raise ValueError("sandbox containment/authority 非法")
+    common = {
+        "backend", "engine_path", "engine_host", "engine_sha256", "container_name", "token",
+        "spec_sha256", "network_mode", "rootfs_readonly", "no_new_privileges",
+        "cap_drop_all", "pid_namespace", "resource_mode",
+    }
+    expected = common | ({"container_drained"} if terminal else set())
+    if set(sandbox) != expected:
+        raise ValueError("sandbox receipt 字段闭包非法")
+    if (sandbox.get("backend") != _SANDBOX_BACKEND
+            or not isinstance(sandbox.get("engine_path"), str)
+            or not os.path.isabs(sandbox["engine_path"])
+            or os.path.normpath(sandbox["engine_path"]) != sandbox["engine_path"]
+            or not isinstance(sandbox.get("engine_host"), str)
+            or not sandbox["engine_host"].startswith("unix:///")
+            or os.path.normpath(sandbox["engine_host"].removeprefix("unix://"))
+            != sandbox["engine_host"].removeprefix("unix://")
+            or not isinstance(sandbox.get("engine_sha256"), str)
+            or _SHA256_RE.fullmatch(sandbox["engine_sha256"]) is None
+            or not isinstance(sandbox.get("container_name"), str)
+            or _CONTAINER_NAME_RE.fullmatch(sandbox["container_name"]) is None
+            or not isinstance(sandbox.get("token"), str)
+            or _SANDBOX_TOKEN_RE.fullmatch(sandbox["token"]) is None
+            or not isinstance(sandbox.get("spec_sha256"), str)
+            or _SHA256_RE.fullmatch(sandbox["spec_sha256"]) is None
+            or sandbox.get("network_mode") != "none"
+            or sandbox.get("rootfs_readonly") is not True
+            or sandbox.get("no_new_privileges") is not True
+            or sandbox.get("cap_drop_all") is not True
+            or sandbox.get("pid_namespace") is not True
+            or sandbox.get("resource_mode") not in _SANDBOX_RESOURCE_MODES
+            or (terminal and sandbox.get("container_drained") is not True)):
+        raise ValueError("sandbox receipt authority 非法")
+
+
 def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
     operation_id = receipt.get("operation_id")
     context = receipt.get("context")
@@ -431,7 +562,8 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
             or not isinstance(receipt.get("kind"), str)
             or not _KIND_RE.match(receipt["kind"])
             or receipt.get("backend") != "linux-subreaper-session-v1"
-            or receipt.get("containment") != "trusted-descendant-tree"
+            or receipt.get("containment") not in {
+                "trusted-descendant-tree", _SANDBOX_BACKEND}
             or not _SHA256_RE.match(str(receipt.get("spec_sha256", "")))
             or not _finite_number(receipt.get("timeout_s"), positive=True)
             or not _finite_number(receipt.get("term_grace_s"), positive=True)
@@ -465,10 +597,14 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
             raise ValueError("execution capture ref 未按 operation_id 确定性命名")
     state = receipt.get("state")
     if state == "prepared":
+        _validate_sandbox_receipt(
+            receipt.get("sandbox"), containment=receipt.get("containment"), terminal=False)
         if receipt.get("outcome") is not None or receipt.get("capture_error") is not None:
             raise ValueError("prepared receipt 不得含 outcome")
         return
     if state == "running":
+        _validate_sandbox_receipt(
+            receipt.get("sandbox"), containment=receipt.get("containment"), terminal=False)
         if receipt.get("capture_error") is not None:
             raise ValueError("running receipt 不得含 capture_error")
         for key in ("helper_pid", "payload_pid", "initial_pgid"):
@@ -500,6 +636,8 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
         return
     if state != "terminal":
         raise ValueError("execution receipt state 非法")
+    _validate_sandbox_receipt(
+        receipt.get("sandbox"), containment=receipt.get("containment"), terminal=True)
     outcome = receipt.get("outcome")
     if (outcome not in _TERMINAL_OUTCOMES
             or receipt.get("group_drained") is not True
@@ -736,18 +874,11 @@ class ExecutionSupervisor:
                         raise ExecutionRecoveryError(
                             "旧 prepared receipt 无 instance fence，不能证明 guardian 已消失；"
                             f"拒绝启动: {path.name}")
-                    terminal = dict(receipt)
-                    terminal.update({
-                        "state": "terminal",
-                        "outcome": "owner_lost_before_start",
-                        "returncode": None,
-                        "started_at_unix": None,
-                        "finished_at_unix": time.time(),
-                        "group_drained": True,
-                        "term_sent": False,
-                        "kill_sent": False,
-                        "recovered_by_owner_id": self.owner_id,
-                    })
+                    terminal = _terminal_from(
+                        receipt, outcome="owner_lost_before_start",
+                        returncode=None, started_at_unix=None,
+                        term_sent=False, kill_sent=False,
+                        recovered_by_owner_id=self.owner_id)
                     if receipt.get("capture_stdout_ref") is not None:
                         try:
                             for stream in ("stdout", "stderr"):
@@ -772,9 +903,10 @@ class ExecutionSupervisor:
 
     def _prepared_receipt(self, *, operation_id: str, kind: str,
                           spec_sha256: str, timeout_s: float,
-                          operation_context: Mapping[str, Any]) -> Dict[str, Any]:
+                          operation_context: Mapping[str, Any],
+                          external_container: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         root_info = os.stat(self.receipt_dir)
-        return {
+        prepared = {
             "version": _RECEIPT_VERSION,
             "operation_id": operation_id,
             "kind": kind,
@@ -782,7 +914,8 @@ class ExecutionSupervisor:
             "state": "prepared",
             "outcome": None,
             "backend": "linux-subreaper-session-v1",
-            "containment": "trusted-descendant-tree",
+            "containment": (_SANDBOX_BACKEND if external_container is not None
+                            else "trusted-descendant-tree"),
             "boot_id": _boot_id(),
             "receipt_dir_dev": root_info.st_dev,
             "receipt_dir_ino": root_info.st_ino,
@@ -793,6 +926,9 @@ class ExecutionSupervisor:
             "prepared_at_unix": time.time(),
             "fenced_by_instance_lease": self.fence_context_factory is not None,
         }
+        if external_container is not None:
+            prepared["sandbox"] = dict(external_container)
+        return prepared
 
     def _poison(self, error: BaseException) -> None:
         """Irreversibly stop this authority after an unprovable guardian state."""
@@ -808,7 +944,8 @@ class ExecutionSupervisor:
             cwd: Optional[Path] = None,
             env: Optional[Mapping[str, str]] = None,
             pass_fds: Sequence[int] = (), kind: str = "external",
-            operation_context: Optional[Mapping[str, Any]] = None) -> ExecutionResult:
+            operation_context: Optional[Mapping[str, Any]] = None,
+            external_container: Optional[Mapping[str, Any]] = None) -> ExecutionResult:
         """Execute one command and return only after its descendant tree is empty."""
         if not isinstance(cmd, (list, tuple)) or not cmd:
             raise ValueError("cmd 须为非空 argv sequence")
@@ -853,12 +990,14 @@ class ExecutionSupervisor:
                         or "\x00" in key or "\x00" in value or "=" in key):
                     raise ValueError("env 须为无 NUL 字符串映射")
                 target_env[key] = value
+        sandbox = _normalize_external_container(external_container)
         spec_for_hash = {
             "argv": argv, "cwd": target_cwd, "timeout_s": timeout_s,
             "env": sorted(target_env.items()),
             "pass_fd_count": len(target_fds), "capture_output": capture_output,
             "kind": kind,
             "context": receipt_context,
+            "external_container": sandbox,
         }
         spec_sha256 = "sha256:" + hashlib.sha256(
             _canonical_json(spec_for_hash)).hexdigest()
@@ -867,7 +1006,8 @@ class ExecutionSupervisor:
         prepared = self._prepared_receipt(
             operation_id=operation_id, kind=kind,
             spec_sha256=spec_sha256, timeout_s=timeout_s,
-            operation_context=receipt_context)
+            operation_context=receipt_context,
+            external_container=sandbox)
         capture_stdout_path = _capture_path(receipt_path, operation_id, "stdout")
         capture_stderr_path = _capture_path(receipt_path, operation_id, "stderr")
         if capture_output:
@@ -988,6 +1128,7 @@ class ExecutionSupervisor:
                 "term_grace_s": self.term_grace_s,
                 "receipt_path": str(receipt_path),
                 "prepared": prepared,
+                "external_container": sandbox,
             }
             spec_payload = _canonical_json(spec)
             if len(spec_payload) > _MAX_SPEC_BYTES:
@@ -1099,6 +1240,12 @@ class ExecutionSupervisor:
                         _GLOBAL_CONDITION.notify_all()
             elif not spawn_attempted and isinstance(spawn_error, OSError):
                 terminal = dict(prepared)
+                if prepared.get("sandbox") is not None:
+                    sandbox_terminal = dict(prepared["sandbox"])
+                    # No guardian Popen was attempted, so no payload launcher
+                    # could have contacted the container daemon.
+                    sandbox_terminal["container_drained"] = True
+                    terminal["sandbox"] = sandbox_terminal
                 terminal.update({
                     "state": "terminal", "outcome": "spawn_failed",
                     "returncode": None, "started_at_unix": None,
@@ -1541,8 +1688,133 @@ def _release_fence(fence_fd: int) -> None:
             pass
 
 
+def _sandbox_engine_call(
+        sandbox: Mapping[str, Any], args: Sequence[str]) -> subprocess.CompletedProcess:
+    """Run one bounded trusted-engine control command from the guardian."""
+    if _executable_identity(sandbox["engine_path"]) != sandbox["engine_sha256"]:
+        raise ExecutionSupervisorError("sandbox engine bytes 与 prepared receipt 不一致")
+    return subprocess.run(
+        [sandbox["engine_path"], *args], stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0,
+        env={
+            "PATH": os.path.dirname(sandbox["engine_path"]) or os.defpath,
+            "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+            "DOCKER_HOST": sandbox["engine_host"],
+        }, check=False)
+
+
+def _sandbox_container_row(sandbox: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
+    result = _sandbox_engine_call(sandbox, [
+        "container", "ls", "--all",
+        "--filter", f"name=^/{sandbox['container_name']}$",
+        "--format", "{{.Names}}|{{.Label \"" + _SANDBOX_LABEL + "\"}}",
+    ])
+    if result.returncode != 0:
+        raise ExecutionSupervisorError(
+            "sandbox engine 无法枚举 exact container identity")
+    if len(result.stdout) > 4096 or len(result.stderr) > 4096:
+        raise ExecutionSupervisorError("sandbox engine 枚举输出越界")
+    try:
+        lines = [line for line in result.stdout.decode("utf-8").splitlines() if line]
+    except UnicodeDecodeError as error:
+        raise ExecutionSupervisorError("sandbox engine 枚举输出非 UTF-8") from error
+    if not lines:
+        return None
+    if len(lines) != 1 or "|" not in lines[0]:
+        raise ExecutionSupervisorError("sandbox engine exact filter 返回非唯一容器")
+    name, token = lines[0].split("|", 1)
+    return name, token
+
+
+def _drain_external_container(
+        prepared: Mapping[str, Any], *, capture_logs: bool = False) -> Optional[Dict[str, Any]]:
+    """Prove a Docker sandbox absent before publishing terminal authority.
+
+    Docker workloads are not descendants of the CLI process.  Killing the
+    local process group therefore is not an emptiness proof.  The guardian
+    holds the instance fence and repeatedly asks the trusted local daemon for
+    the exact random name+label identity, force-removing only a matching
+    container.  Daemon loss, engine drift, or an identity collision keeps the
+    fence alive just like an unkillable D-state descendant.
+    """
+    raw = prepared.get("sandbox")
+    if raw is None:
+        return None
+    sandbox = dict(raw)
+    while True:
+        try:
+            row = _sandbox_container_row(sandbox)
+            if row is None:
+                sandbox["container_drained"] = True
+                return sandbox
+            if row != (sandbox["container_name"], sandbox["token"]):
+                raise ExecutionSupervisorError(
+                    "sandbox container name/label identity 冲突；拒绝误杀")
+            if capture_logs:
+                try:
+                    logs = _sandbox_engine_call(sandbox, [
+                        "container", "logs", sandbox["container_name"]])
+                    if (logs.returncode == 0
+                            and len(logs.stdout) + len(logs.stderr) <= 4 * 1024 * 1024):
+                        marker = b"\n[sandbox guardian recovered pre-cleanup logs]\n"
+                        _write_all(1, marker + logs.stdout)
+                        if logs.stderr:
+                            _write_all(2, logs.stderr)
+                except BaseException:
+                    # Container absence is the authority.  Best-effort failure
+                    # logs must never prevent force-removal or release a false
+                    # containment receipt.
+                    pass
+            removed = _sandbox_engine_call(sandbox, [
+                "container", "rm", "--force", "--volumes",
+                sandbox["container_name"],
+            ])
+            if removed.returncode != 0:
+                raise ExecutionSupervisorError("sandbox container force-remove 失败")
+        except BaseException:
+            time.sleep(1.0)
+            continue
+        time.sleep(0.02)
+
+
+def _await_external_registration_or_runner_exit(
+        prepared: Mapping[str, Any], proc: subprocess.Popen) -> None:
+    """Close the daemon CREATE late-commit race before killing the trusted runner.
+
+    If cancellation lands while ``docker create`` is in flight, killing the CLI
+    and observing one absent name is not proof: the daemon could commit the
+    accepted request just afterwards.  The sandbox runner is trusted host
+    control code, so the guardian keeps its fence and lets registration either
+    become observable (then normal termination/drain owns it) or return/exit.
+    No bounded timeout is used here; uncertainty retains the fence rather than
+    publishing false containment.
+    """
+    sandbox = prepared.get("sandbox")
+    if not isinstance(sandbox, dict):
+        return
+    expected = (sandbox["container_name"], sandbox["token"])
+    while _poll_leader(proc) is None:
+        try:
+            row = _sandbox_container_row(sandbox)
+            if row == expected:
+                return
+            if row is not None:
+                # A name collision with a foreign label may never be killed.
+                # Keep the delegated fence until external intervention.
+                time.sleep(1.0)
+                continue
+        except BaseException:
+            time.sleep(1.0)
+            continue
+        time.sleep(0.02)
+
+
 def _terminal_from(prepared: Mapping[str, Any], **updates) -> Dict[str, Any]:  # noqa: ANN003
     terminal = dict(prepared)
+    sandbox = _drain_external_container(
+        prepared, capture_logs=updates.get("outcome") != "exit")
+    if sandbox is not None:
+        terminal["sandbox"] = sandbox
     terminal.update(updates)
     terminal["state"] = "terminal"
     terminal["group_drained"] = True
@@ -1755,6 +2027,7 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         max_descendants = 0
         signal_errors = 0
     else:
+        _await_external_registration_or_runner_exit(running, proc)
         term_sent, kill_sent, max_descendants, signal_errors = _terminate_tree(
             proc, leader_start=leader_start,
             grace_s=float(spec["term_grace_s"]))

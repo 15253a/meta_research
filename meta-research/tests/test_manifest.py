@@ -17,11 +17,13 @@ import pytest
 import yaml
 
 from orchestrator import manifest as MF
+from orchestrator.execution_sandbox import sandbox_environment_hash
 from orchestrator.schemas import SchemaSet
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 SCHEMAS = SchemaSet(SYSTEM_ROOT / "schemas")
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+RUNTIME_ENV_HASH = sandbox_environment_hash(POLICY["execution"]["sandbox"])
 
 
 def _slice(**over):
@@ -39,7 +41,7 @@ def _manifest(sl, **over):
          "target_ref": {"target_key": sl["target_key"], "target_kind": sl["target_kind"],
                         "seq": sl["seq"], "plan_slice_hash": MF.canon_hash(sl)},
          "protocol_ref": {"protocol_id": sl["protocol_id"], "protocol_ver": sl["protocol_ver"]},
-         "env_hash": "toy-env", "config_json": {"lr": 0.1},
+         "env_hash": RUNTIME_ENV_HASH, "config_json": {"lr": 0.1},
          "code_files": ["train.py", "eval.py"],
          "commands": {"smoke": {"argv": ["python", "{src}/train.py", "--smoke"]},
                       "train": {"argv": ["python", "{src}/train.py"], "timeout_s": 60},
@@ -59,6 +61,20 @@ def test_policy_yaml_conforms_schema():
     """policy.yaml ↔ policy.schema.json 同步（execution 节随本检查点新增，两侧须一致）。"""
     SCHEMAS.validator("policy").validate(POLICY)
     assert POLICY["execution"]["max_timeout_s"] >= POLICY["execution"]["default_timeout_s"]
+
+
+def test_production_sandbox_rejects_manifest_environment_claim_drift(tmp_path):
+    class _Sandbox:
+        environment_hash = "sha256:" + "f" * 64
+
+    manifest = _manifest(_slice())
+    assert manifest["env_hash"] != _Sandbox.environment_hash
+    with pytest.raises(MF.ManifestError, match="pinned sandbox runtime"):
+        MF.run_manifest_command(
+            manifest, "smoke", staging_dir=str(tmp_path / "run"),
+            log_name="smoke.log", src_dir=tmp_path / "src",
+            work_root=tmp_path, policy=POLICY,
+            execution_sandbox=_Sandbox())
 
 
 def test_build_missing_train_rejected():

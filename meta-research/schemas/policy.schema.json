@@ -293,12 +293,44 @@
     "execution": {
       "type": "object",
       "description": "execution_manifest 命令围栏（步⑧ CP8.1；执法点 orchestrator/manifest.py）：manifest 命令超时与路径边界唯一定义点",
-      "required": ["default_timeout_s", "max_timeout_s", "path_allowlist"],
+      "required": ["default_timeout_s", "max_timeout_s", "path_allowlist", "sandbox"],
       "additionalProperties": false,
       "properties": {
         "default_timeout_s": { "type": "number", "exclusiveMinimum": 0 },
         "max_timeout_s": { "type": "number", "exclusiveMinimum": 0 },
-        "path_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^/" }, "description": "允许 argv 引用的 work_root 以外绝对路径前缀（如真数据根）" }
+        "path_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^/" }, "description": "允许 argv 引用的 work_root 以外绝对路径前缀（如真数据根）" },
+        "sandbox": {
+          "type": "object",
+          "description": "bundle/import 敌对执行后端；exact image pin、network none、只读 rootfs 与资源边界由 execution_sandbox.py 执法",
+          "required": ["backend", "engine_path", "engine_host", "resource_mode", "seccomp_profile", "seccomp_sha256", "seccomp_bpf", "seccomp_bpf_sha256", "seccomp_bpf_arch", "image", "image_id", "python_path", "memory_mb", "pids", "nofile", "max_log_mb", "max_file_mb", "max_output_mb", "max_output_files", "cpus", "tmpfs_mb", "shm_mb", "input_max_mb", "readonly_mounts"],
+          "additionalProperties": false,
+          "properties": {
+            "backend": { "const": "docker" },
+            "engine_path": { "type": "string", "pattern": "^/" },
+            "engine_host": { "type": "string", "pattern": "^unix:///" },
+            "resource_mode": { "enum": ["cgroup-v1", "cgroup-v2", "rlimit-fallback"] },
+            "seccomp_profile": { "type": "string", "minLength": 1, "pattern": "^(?!/)" },
+            "seccomp_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "seccomp_bpf": { "type": "string", "minLength": 1, "pattern": "^(?!/)" },
+            "seccomp_bpf_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "seccomp_bpf_arch": { "const": "amd64" },
+            "image": { "type": "string", "pattern": "^[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}$" },
+            "image_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "python_path": { "type": "string", "pattern": "^/" },
+            "memory_mb": { "type": "integer", "minimum": 64 },
+            "pids": { "type": "integer", "minimum": 1, "maximum": 4096 },
+            "nofile": { "type": "integer", "minimum": 16, "maximum": 1048576 },
+            "max_log_mb": { "type": "integer", "minimum": 1, "maximum": 1024 },
+            "max_file_mb": { "type": "integer", "minimum": 1 },
+            "max_output_mb": { "type": "integer", "minimum": 1 },
+            "max_output_files": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "cpus": { "type": "number", "exclusiveMinimum": 0 },
+            "tmpfs_mb": { "type": "integer", "minimum": 1 },
+            "shm_mb": { "type": "integer", "minimum": 1 },
+            "input_max_mb": { "type": "integer", "minimum": 1 },
+            "readonly_mounts": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^/" } }
+          }
+        }
       }
     },
     "resources": {

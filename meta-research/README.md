@@ -2,8 +2,9 @@
 
 自主研究编排器：一条命令让真 Codex 全自动跑「出题 → 分解 → 建基线/变体 → 训练 → 评估 → 双评审 →
 关问」的研究元循环。**确定性编排器从不推理**（Codex 是无状态阶段工人，只产合 schema 的产物，永不碰
-数据库）；SQLite 是唯一真相（36 表冻结 DDL + 三重锁）；真执行统一交给外部 guardian 管理可信子孙树；
-事务边界可从 DB 无半写恢复，执行边界以耐久 receipt 证明整树排空（适用条件与残余边界见 §7）。
+数据库）；SQLite 是唯一真相（36 表冻结 DDL + 三重锁）；普通受信调用由外部 guardian 管理子孙树，
+bundle/import 的不可信代码只进入 exact-pinned Docker sandbox；事务边界可从 DB 无半写恢复，执行边界以耐久
+receipt 证明本机子树与 daemon container 均排空（适用条件与残余边界见 §7）。
 
 > 设计真相唯一在 `../reference/第一部分-系统架构设计.md`；本 README 是**操作面**（怎么跑、怎么配、怎么
 > 观测/干预、边界在哪）。构建历史见仓库根 `ROADMAP.md` / `build_log/`。
@@ -13,6 +14,7 @@
 ```bash
 cd meta-research
 python -m pip install -r requirements-dev.txt          # pytest / jsonschema / PyYAML（+真 Codex 见下）
+docker pull docker.io/library/python@sha256:f5cf0344c9886ff24d34797578d5d7dd6e8911ae0fe5962bb55d0f89603ec361
 python -m pytest tests/ -q                              # 自验：以当前测试输出为准
 
 # 全自动跑（需真 Codex CLI + 代理，见 §2）：
@@ -35,6 +37,12 @@ python -m orchestrator.run --system-root . --work-root /tmp/canary --max-cycles 
 - 默认入口在人工 pause 或文件请求阻断时**保持单写进程常驻**，周期消费控制台 spool、扫描提醒，解除阻断后
   自动从同一 DB 游标继续；批处理/调试若希望遇阻即返回，显式加 `--once`。`--poll-interval-s` 可调等待轮询
   间隔（默认 1 秒，最小 0.01 秒）。
+- 默认 attack 入口会在打开 SQLite/启动 connector 前核 `/usr/bin/docker`、本地 unix daemon、seccomp 与
+  policy 中 exact image digest/image ID；镜像只 inspect、**绝不隐式 pull**。上方 pull 是显式部署步骤。
+  syscall 边界不依赖 daemon/platform 默认值：可信 launcher 在 rlimit 后、payload env/代码前加载由 vendored
+  Moby profile 生成且 SHA-256 固定的 amd64 BPF；daemon 注入的 seccomp 只作为额外约束。
+  当前默认镜像是最小 CPU/Python 3.11 bootstrap runtime；真实项目应先构建含锁定依赖的镜像，再同时更新
+  `execution.sandbox.image`/`image_id`，不得改成可漂移 tag。
 
 停机时打印 `[run] dual_mode=… 推进 N 轮：[…]；停因=…`。停因见 §6。
 
@@ -95,8 +103,10 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
 - `budget`：`B0` 单轮预算、`B_max` 上限、`session_max` 全局成本安全网（ledger.money 求和上限）。
 - `flow.tau`：自终止判据①——`score_floor` 分数地板、`consecutive_rounds` 连续几轮低分即停。
 - `tree_guard`：`max_decompose_depth` / `max_children_per_node` / `max_open_questions`（问题树规模护栏）。
-- `execution`：manifest 命令围栏——`default_timeout_s` / `max_timeout_s` / `path_allowlist`（允许 argv
-  引用的 work_root 以外绝对路径前缀，如真数据根）。
+- `execution`：manifest 命令围栏——`default_timeout_s` / `max_timeout_s`；`path_allowlist` 必须与
+  `sandbox.readonly_mounts` 完全相同（外部数据根只读映射）。`sandbox` 还固定 engine unix socket、image digest+ID、
+  memory/pids/nofile/日志轮转/单文件/输出/CPU/tmpfs 上限；bundle 锚区给出的 runtime `env_hash` 由这些声明机械派生，
+  manifest 只能逐字回引。
 - `session.dual_mode`：A=一 turn 一阶段（默认；A/B 实测定默认属运维）。
 
 > **改 policy.yaml 是决策性变更**（影响研究语义/门禁/预算）——生产改动应走评审。改后 `pytest
@@ -109,8 +119,9 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
   console 会同时复核稳定 flock、lock metadata generation 与 heartbeat freshness。DB 有在途 cycle 但没有
   `state=running` 的新鲜 owner 时显示 `interrupted`，绝不把耐久游标冒充当前进程正在执行。
 - **执行 receipt**：`<work-root>/state/executions/execution-<operation-id>.json`——每次默认 Codex、manifest 或
-  harness 执行按 `prepared → running → terminal` 原子发布；只有 guardian 已用 `waitpid(...)=ECHILD` 证明
-  子孙树为空才允许 terminal 的 `group_drained=true`。harness 另在 staging 写 `<log>.process.json` 便利指针，
+  harness 执行按 `prepared → running → terminal` 原子发布；普通调用须由 `waitpid(...)=ECHILD` 证明子孙树为空，
+  sandbox 调用还须用随机 container name + 私有 label 向 exact unix daemon 证明容器不存在，才会同时写
+  `group_drained=true` / `sandbox.container_drained=true`。harness 另在 staging 写 `<log>.process.json` 便利指针，
   权威仍是中央 receipt；日志保持 `.partial → .exit → final` 的提升顺序。
 - **控制台指令**：通过 `interaction_message` 入站（连接器落库）→ 分类器保守三分类（可能改状态的一律当
   directive 并回显确认）。`pause`/`resume` 控制推进；`query` 走只读应答器（不改研究状态）。
@@ -212,19 +223,33 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 
 ## 7. 诚实边界（operational canary）
 
-当前是**运维金丝雀态**，足以让真 Codex 端到端跑通并验证研究链路，但正式跑数百轮真研究前仍须硬化：
+当前是**强隔离已接线、部署/长跑仍待验收的金丝雀态**，足以让真 Codex 端到端跑通并验证研究链路，但还不能
+把“能配置 100 轮”写成“已通过数百轮真实研究验收”：
 
 - 同机同一 work-root 已由稳定非阻塞 flock、owner heartbeat、事务/connector fence、execution guardian 和
   lease-last `System.close()` 机械排斥第二个 `orchestrator.run`。每个 guardian 持一份 delegated flock、作为
   Linux child subreaper 启动独立 session；timeout、取消、直接进程退出但仍有后代、或 owner SIGKILL 时执行
-  TERM→KILL 并持续 reap，fsync terminal receipt 后才释放最后一份 fence。普通 Codex、tool-free query、
-  manifest smoke/train/eval 与显式装配的 ImportWorker smoke/eval 共用这条路径。
-- 该边界是 `linux-subreaper-session-v1`，不是 cgroup/容器沙箱：要求 Linux `prctl`、可见且可信的 `/proc`，
-  guardian 必须有权限 signal 全部后代；orchestrator 作为 PID namespace PID 1 会被拒。不同 UID 的 tool-free
-  query 会经 sudo 降权，所以生产 guardian 当前要求 root 才能回收整树。当前没有挂载/委派 cgroup，故只承诺
-  **可信 workload 的同机 descendant-tree 生命周期**；同 UID 恶意代码可杀 guardian、篡改 receipt 或主动
-  逃逸，须等 CP11.4 的 cgroup/container/VM 边界。Import `fetch` provider 尚未纳入默认生产装配，未来若内部
-  调 git/subprocess 也必须显式走同一 supervisor，不能把 provider 约定当隔离。
+  TERM→KILL 并持续 reap，fsync terminal receipt 后才释放最后一份 fence。普通 Codex/tool-free query 仍走
+  `linux-subreaper-session-v1`（可信 host workload）；manifest smoke/train/eval 与 ImportWorker smoke/eval 额外走
+  `docker-container-v1`，daemon 容器不是 CLI 子孙，因此 guardian 会在发布 terminal 前独立 inspect exact
+  name+label 并 force-remove/复核为空。
+- sandbox 只给 host 持久写挂一个隔离 quarantine 输出目录；已验证 fd/tree 私有副本和显式数据根均只读，
+  另有有界易失 `/tmp`/`/dev/shm`；network=none、
+  rootfs=readonly、PID namespace、non-root uid、cap-drop=ALL、no-new-privileges 与 daemon additive seccomp 在
+  `docker create` 后 inspect 反核；launcher 的 pinned default-deny BPF 由 exact Cmd/spec hash 焊死，加载失败即不执行
+  payload。输出须在容器排空后通过无 symlink/单链接常规文件/bytes+file-count/hash 闭包，才幂等晋升到
+  staging；Docker `json-file` 两段轮转给 stdout/stderr 硬上限，检测到任何轮转会把执行判失败，绝不把截断日志
+  当完整测量证据；owner 恰死在 return→publish 缝隙时可从 guardian receipt 续晋升。
+- 当前节点 Docker 是 rootless 且明确报告 `CgroupDriver=none`，所以 receipt **只写**
+  `resource_mode=rlimit-fallback`，且启动时必须与 policy pin 相同：容器内可信 launcher 设置 hard
+  `RLIMIT_AS/NPROC/NOFILE/FSIZE/CORE`，guardian
+  另管 wall deadline；绝不声称 aggregate memory/CPU cgroup 已生效。`max_output_mb/max_output_files` 是
+  quarantine 后验闸，生产仍必须给 work-root/VEPFS 配硬 byte+inode quota。默认 bootstrap image 也未开放
+  GPU/device；GPU 真研究须换成已锁依赖的
+  exact image 并在具备受验 device/cgroup delegation 的部署后再宣称资源隔离完成。
+- 不可信容器看不到 guardian/provider receipt、SQLite、Codex 凭据或整个 work-root，但同一 host 信任域内的 root/
+  orchestrator UID 进程仍能控制 Docker socket 或改本地证据；要防该类 host 对手须独立 service account/VM/远端
+  attestation，不能靠 0600/HMAC 自我证明。不同 UID 的 tool-free query 仍要求 guardian 有权排空其树。
 - fork child 会丢弃非目标 lease FD；owner 死亡同时由 pipe EOF 与 `PR_SET_PDEATHSIG` 触发 guardian。当前
   work-root 位于共享 VEPFS，同机 owner-kill/fence 可做部署 canary；若生产会跨节点启动，仍须在目标
   VEPFS/挂载参数上做“两节点同时 acquire，仅一方成功”的部署验收，单机测试不能代替它。
@@ -235,13 +260,11 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   manifest/import 执行不再“先按路径 hash、再让子进程重开根路径”：源码树固定已核账的根 dirfd，并在执行
   前后逐 leaf 做 no-follow/hash 闭包复核；checkpoint、外部
   artifact 与用户资产用同一个 `O_NOFOLLOW` fd 经 `/proc/self/fd` + `pass_fds` 消费，并在子进程后重验
-  inode/size/hash；checkpoint 登记期间也保持该 capability 与 durable path 绑定。**这仍不是不可变文件系统**：
-  同 UID 敌对写者仍可替换嵌套目录或在运行中反复改回 inode，真 git worktree/env lock 与 container/VM 隔离
-  仍属下一检查点。
+  inode/size/hash；checkpoint 登记期间也保持该 capability 与 durable path 绑定。生产 sandbox 会把这些已开 fd/tree
+  再复制为私有只读输入快照，因此容器内敌对写者不能利用嵌套目录换位；host 信任域内并发篡改仍按上一条处理。
 - 用户文件已有 DB 终态授权、ContextPack ref 白名单、hash/size 复验和稳定只读 fd；非 bundle 阶段只看
-  有界 UTF-8 预览。**这不是机械 prompt-injection/恶意代码隔离**：当前 Codex 仍可使用只读工具，bundle
-  代码仍由主机 harness 执行。CP11.4 容器/VM 隔离完成前，只能接纳操作者信任的文件或人工审过的文本摘要，
-  不得把任意第三方附件当作对抗性安全输入。
+  有界 UTF-8 预览。bundle 代码虽已不在 host 裸跑，但这不消除 prompt injection 对研究方向/产物内容的影响；
+  schema、独立 judge 与 Gate 只能限制写回契约，不能证明任意第三方文本语义可信。
 - Web capability 用于隔离其他本机 OS 用户、跨站浏览器请求和无 token 的本机客户端；同 UID 恶意进程仍可
   读取 0600 token，同源 XSS 也可读取 sessionStorage。轮换时先停 console server，删除
   `<work-root>/state/.console-capability`，再重启并用新 fragment 打开；它不替代 loopback/SSH tunnel 边界。
@@ -272,10 +295,13 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   dependency，永不直接登记候选或 `import_defer`。`sota_reference` 先从 policy host allowlist 做有界 HTTPS
   读取，把 paper/benchmark 原始 bytes 私有写入 SHA-256 内容寻址 blob，再派生独立 baseline-reference 问题；不是按
   `latest` 取隐式事实。两个参照子题在自己的 action-cycle 从父轮 receipt 激活冻结候选，不重复联网。
-- import 仍有明确安全边界：上述来源只解决“能否可信发现/登记/调度”。候选中的 adapter 仍属不可信代码，
-  在 adversarial sandbox capability 落地前会记失败并释放问题
-  重规划，绝不会拿普通 lifecycle supervisor 冒充强隔离后在 host 执行。所以当前已是可发现/可登记/
-  可调度的 production path，但还不是可安全执行敌对外部代码的完整 production import。
+- import adapter 已能在 pinned sandbox 内执行；兼容的、已随候选冻结 `materialization` 文件/命令/供应链闭包的
+  snapshot 已有 smoke→双评审→factory eval→入池全链。**默认 GitHub REST discovery snapshot 目前只含 repo/
+  commit/license，不自动下载整仓、合成 harness adapter 或 LFS/依赖闭包**，所以任意搜索命中的普通仓库仍不能
+  直接物化；把这条窄兼容路径说成“自动复现任意 SOTA repo”仍是过度声明。
+- CP11.3c 的 120 轮是无真实 provider 工作负载的控制面/投影回归；尚未完成跨节点 VEPFS 双 owner 实机竞态，
+  也尚未运行 100+ 轮含真实 Codex/import/训练与 owner-kill/daemon-loss/预算失败注入的 soak。这两项完成前，
+  对“上百轮可用”的结论仍只能是机制上可推进、不是运营验收通过。
 - 假执行标记（`source=fake` / `synthetic=true`）是 M0–M3 验收期语义，真执行起已移除。
 
 ## 8. 自验

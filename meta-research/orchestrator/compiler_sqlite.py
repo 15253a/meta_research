@@ -23,6 +23,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .budgeting import compute_budget
+from .execution_sandbox import sandbox_environment_hash
 from .ids import cnum as _cnum
 from .import_authority import ImportAuthorityError, load_question_import_authority
 from .importer import DeferredImporter
@@ -1001,10 +1002,17 @@ class SqliteCompiler:
         reqs = self.conn.execute("SELECT metric_id, metric_ver FROM build_target_required_metric "
                                  "WHERE build_target_id=? ORDER BY metric_id, metric_ver", (bt,)).fetchall()
         req_md = "、".join(f"{m}@{v}" for m, v in reqs) or "（无）"
+        sandbox = self.policy["execution"]["sandbox"]
+        env_hash = sandbox_environment_hash(sandbox)
+        sources.append("policy:execution.sandbox")
         return ("## 本目标（bundle 编译执行契约）\n"
                 f"- build_target: {bt}（eval_key={row[3]}）\n"
                 f"- **plan_slice_hash（manifest.target_ref.plan_slice_hash 须回引此值）**: `{slice_hash}`\n"
                 f"- required 指标绑定（eval 命令 `metric_value: <id>@<ver>=<float>` 须用这些 int）: {req_md}\n"
+                f"- **env_hash（manifest.env_hash 须逐字照抄）**: `{env_hash}`\n"
+                f"- pinned sandbox image（只作复现身份，不得改写）: `{sandbox['image']}`\n"
+                "- 执行边界: network=none、rootfs=readonly、输入只读快照、输出 quarantine；"
+                "不得请求 host shell/动态 image pull。\n"
                 "- resolved 计划切片（manifest 须与之 target_key/target_kind/seq/protocol 绑定/config 一致）:\n"
                 "```json\n" + json.dumps(slice_, ensure_ascii=False, sort_keys=True, indent=2) + "\n```")
 

@@ -47,7 +47,14 @@ from .artifact_capability import (
     verify_open_fd,
     verify_tree_fd,
 )
-from .attack_stages import AttackStages, _BundleReject, _canon_hash, judge_once
+from .attack_stages import (
+    AttackStages,
+    _BundleReject,
+    _canon_hash,
+    judge_once,
+    settle_sandbox_output_failure,
+)
+from .execution_sandbox import SandboxOutputError
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
 from .phase_commit import check_or_record
@@ -64,7 +71,8 @@ class ImportWorker:
     def __init__(self, *, state, pool_gate: PoolGate, providers: Dict[str, Callable],
                  obs_policy: Dict[str, Any], work_root: str,
                  owner_guard: Optional[Callable[[], None]] = None,
-                 execution_supervisor=None):
+                 execution_supervisor=None,
+                 execution_sandbox=None):
         if owner_guard is not None:
             if (not isinstance(execution_supervisor, ExecutionSupervisor)
                     or not execution_supervisor.binds_fenced_owner(owner_guard)):
@@ -78,6 +86,7 @@ class ImportWorker:
         self.work = Path(work_root)
         self.owner_guard = owner_guard or (lambda: None)
         self.execution_supervisor = execution_supervisor
+        self.execution_sandbox = execution_sandbox
 
     # ---------------------------------------------------------------- 入口 --
     def materialize_pending(self, *, max_items: Optional[int] = None) -> List[int]:
@@ -256,20 +265,42 @@ class ImportWorker:
                     (bid,))
                 self.state.mark_cycle_done(cyc_id, "failed")
             return
-        if spec.get("requires_adversarial_sandbox") is True:
-            # ExecutionSupervisor fences ownership/descendants but explicitly is not an adversarial
-            # sandbox.  Default discovery content is untrusted, so fail closed until a later command
-            # runner capability can prove network/filesystem/process isolation.
+        if (self.execution_sandbox is not None
+                and spec.get("env_hash") != self.execution_sandbox.environment_hash):
             self._record_failed(
                 ei_id, qi, cand_id,
-                reason="默认冻结候选要求 adversarial sandbox；当前仅有 lifecycle supervisor，拒绝在 host 执行")
+                reason="冻结候选 environment_hash 与 policy pinned sandbox runtime identity 不一致")
             with self.state.atomic():
                 self.state.mark_cycle_done(cyc_id, "failed")
             return
+        if spec.get("requires_adversarial_sandbox") is True:
+            if self.execution_sandbox is None:
+                # ExecutionSupervisor fences ownership/descendants but explicitly is not an adversarial
+                # sandbox.  Default discovery content is untrusted, so a missing strong runner remains
+                # a durable candidate failure rather than silently falling back to host execution.
+                self._record_failed(
+                    ei_id, qi, cand_id,
+                    reason="默认冻结候选要求 adversarial sandbox；当前仅有 lifecycle supervisor，拒绝在 host 执行")
+                with self.state.atomic():
+                    self.state.mark_cycle_done(cyc_id, "failed")
+                return
         vid, bt_id = self._variant_and_target(cyc_id, qi, bid, spec)
-        ok = self._drive_import_target(
-            cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
-            revision=cand[1], source_uri=cand[0])
+        try:
+            ok = self._drive_import_target(
+                cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
+                revision=cand[1], source_uri=cand[0])
+        except SandboxOutputError as error:
+            # The guardian has drained the exact container, but an unsafe output
+            # quarantine must never become a checkpoint/metric artifact.  Settle
+            # its exact DB owner and the import failure so retries cannot wedge on
+            # a permanently-running run/attempt.
+            settle_sandbox_output_failure(self.gate, d, bt_id, error)
+            self._record_failed(
+                ei_id, qi, cand_id,
+                reason=("沙箱输出隔离区拒收，不发布、不 pool_publish；receipt="
+                        f"{error.receipt_path.name}: {error}"))
+            self._target_pc(cyc_id, bt_id)
+            ok = False
         # worker 收尾与 dep 解锁**同一 atomic**（内审 BLOCKER 实证：分离时崩在两提交间 → worker done 但
         # dep 永 pending、问题永不可调度且无自愈路径）。mark_cycle_done 亦补 finished_at（审计一致）。
         with self.state.atomic():
@@ -474,7 +505,8 @@ class ImportWorker:
                 sm = H.recover_staged_result(
                     staging_dir=str(smoke_dir), log_name=smoke_name,
                     execution_supervisor=self.execution_supervisor,
-                    execution_kind="import-smoke", execution_context=smoke_context)
+                    execution_kind="import-smoke", execution_context=smoke_context,
+                    execution_sandbox=self.execution_sandbox)
                 if sm is None:
                     self.owner_guard()
                     sm = self._run_frozen_command(
@@ -522,6 +554,7 @@ class ImportWorker:
         }
         source_fd = -1
         artifact_fd = -1
+        invocation = None
         try:
             source_fd = open_directory(clone_dir, label="import frozen tree")
             verify_tree_fd(
@@ -538,8 +571,33 @@ class ImportWorker:
                 arg.replace("{repo}", repo_proc).replace("{artifact}", artifact_proc)
                 for arg in cmd
             ]
-            result = H.run_staged(
-                resolved, pass_fds=(source_fd, artifact_fd), **run_kwargs)
+            if self.execution_sandbox is None:
+                result = H.run_staged(
+                    resolved, pass_fds=(source_fd, artifact_fd), **run_kwargs)
+            else:
+                sandbox_context = dict(run_kwargs.get("execution_context") or {})
+                log_name = run_kwargs["log_name"]
+                if ("log_name" in sandbox_context
+                        and sandbox_context["log_name"] != log_name):
+                    raise RuntimeError("import sandbox context/log_name 冲突")
+                sandbox_context["log_name"] = log_name
+                invocation = self.execution_sandbox.prepare(
+                    resolved, staging_dir=run_kwargs["staging_dir"],
+                    log_name=log_name, env=None,
+                    timeout_s=run_kwargs.get("timeout_s", 600.0),
+                    fd_expectations=((
+                        artifact_fd, identity.content_hash, identity.size_bytes,
+                        identity.device, identity.inode),),
+                    tree_expectations=((source_fd, hashes, ()),),
+                    execution_context=sandbox_context,
+                    execution_supervisor=self.execution_supervisor)
+                sandbox_kwargs = dict(run_kwargs)
+                sandbox_kwargs.update({
+                    "env": invocation.env,
+                    "pass_fds": invocation.pass_fds,
+                    "sandbox_invocation": invocation,
+                })
+                result = H.run_staged(invocation.argv, **sandbox_kwargs)
             verify_open_fd(
                 artifact_fd, expected_hash=identity.content_hash,
                 expected_size=identity.size_bytes,
@@ -550,6 +608,8 @@ class ImportWorker:
         except ArtifactCapabilityError as error:
             raise RuntimeError(str(error)) from error
         finally:
+            if invocation is not None:
+                invocation.close()
             for fd in (artifact_fd, source_fd):
                 if fd >= 0:
                     try:
@@ -676,7 +736,8 @@ class ImportWorker:
                 ev = H.recover_staged_result(
                     staging_dir=str(eval_dir), log_name="eval.log",
                     execution_supervisor=self.execution_supervisor,
-                    execution_kind="import-eval", execution_context=eval_context)
+                    execution_kind="import-eval", execution_context=eval_context,
+                    execution_sandbox=self.execution_sandbox)
                 if ev is None:
                     self.owner_guard()
                     ev = self._run_frozen_command(

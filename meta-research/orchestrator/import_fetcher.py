@@ -4,8 +4,9 @@ The discovery/search side must store a bounded, content-addressed ``materializat
 ``external_candidate.search_snapshot_json``.  This provider performs no network access and never guesses a moving
 repository ref: it reconstructs the exact frozen files and adapter commands whose hashes were already registered.
 It explicitly marks those commands as requiring an adversarial execution sandbox; the ordinary process guardian is
-only a lifecycle fence and must never be mistaken for that sandbox.  Large repository clone/LFS support belongs to
-the later content-addressed artifact capability checkpoint.
+only a lifecycle fence and must never be mistaken for that sandbox.  This provider intentionally handles bounded
+pre-frozen materialization snapshots; generic pinned repository archive/LFS acquisition and adapter synthesis remain
+a separate production connector path rather than being guessed here.
 """
 from __future__ import annotations
 
