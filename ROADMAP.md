@@ -25,9 +25,9 @@
   CP11.4b fd-safe artifact capability、guardian capture 与 provider invocation 精确补账已落 `e236487`；
   CP11.4c.1 exact-pinned Docker 敌对执行边界、launcher rlimit+seccomp BPF、guardian container drain 与
   quarantine 晋升/恢复已落 `a05584d`；CP11.4c.2a exact GitHub repository snapshot、内容寻址发布与 file-backed
-  sandbox import bridge 已落 `50ba41f`；CP11.4c.2b.1 materializer component boundaries 已落 `4e28698`。
-  当前进入 CP11.4c.2b.2 adapter/LFS/dependency image，随后是 2b.3 deployment contract 与 CP11.4c.3 跨节点
-  VEPFS/真实 100+ 轮故障注入验收。
+  sandbox import bridge 已落 `50ba41f`；CP11.4c.2b.1 materializer component boundaries 已落 `4e28698`，
+  CP11.4c.2b.2a exact Git LFS objects 已落 `ef30f1f`。当前进入 2b.2b dependency image closure，随后是
+  2b.2c adapter generation、2b.3 deployment contract 与 CP11.4c.3 跨节点 VEPFS/真实 100+ 轮故障注入验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -442,8 +442,10 @@
             16/43；AST/compat 等价；外审第 2 轮 APPROVE；唯一全量 1382）。
           - [ ] CP11.4c.2b.2 repository closure：缺失 adapter 的有界生成/评审、Git LFS batch OID+size 下载核验、
             dependency lock 到专用 exact image 的可复现构建与启动验收。
-            - [ ] CP11.4c.2b.2a exact LFS objects：按官方 Batch API 只接受 basic/HTTPS allowlist，pointer Git blob、
+            - [x] CP11.4c.2b.2a exact LFS objects：按官方 Batch API 只接受 basic/HTTPS allowlist，pointer Git blob、
               OID、size、下载 bytes 与最终 ledger/manifest 交叉核；transport 临时授权不进入复现身份。
+              → commit `ef30f1f`（build_log 0067；相关 149；真实 GitHub LFS canary；外审 2 BLOCKER/3 SHOULD
+              全修；唯一全量 1401）。
             - [ ] CP11.4c.2b.2b dependency image closure：受支持 lock 类型的 canonical hash、离线/有界 build context、
               exact base/result image ID 与 compiler/runtime smoke receipt，禁止隐式 tag/pull/host install。
             - [ ] CP11.4c.2b.2c reviewed adapter generation：缺 adapter 时只从有界冻结源码生成 sidecar，schema/独立评审/

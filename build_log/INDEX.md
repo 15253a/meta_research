@@ -6,6 +6,7 @@
 
 ---
 
+- [0067](0067-cp114c2b2a-exact-git-lfs-objects.md) — CP11.4c.2b.2a exact Git LFS Batch/OID/size closure · commit `ef30f1f` · 验证: 通过（相关 149；真实 GitHub LFS canary；外审 2 BLOCKER/3 SHOULD 全修；唯一全量 1401）
 - [0066](0066-cp114c2b1-materializer-component-boundaries.md) — CP11.4c.2b.1 exact repository materializer responsibility boundaries · commit `4e28698` · 验证: 通过（相关 16/43；AST/compat 等价；第2轮 APPROVE；唯一全量 1382）
 - [0065](0065-cp114c2a-exact-repository-materialization.md) — CP11.4c.2a exact GitHub repository snapshot + file-backed sandbox import bridge · commit `50ba41f` · 验证: 通过（相关 170/156/41；外审成立项全修；唯一全量 1381）
 - [0064](0064-cp114c1-adversarial-execution-boundary.md) — CP11.4c.1 exact-pinned Docker + launcher rlimit/seccomp BPF + guardian drain/quarantine recovery · commit `a05584d` · 验证: 通过（相关 18/197/127；外审 3 BLOCKER 全修；最终有效全量 1354）
