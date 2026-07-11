@@ -46,6 +46,7 @@ from .console_spool import open_directory_path
 from .connector_ingest import ConnectorInboxIngest
 from .connectors import ConnectorConfigError, OutboundDelivery, load_connectors
 from .cost_ledger import CostLedger
+from .execution_reconcile import ExecutionReconciler
 from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
@@ -147,6 +148,13 @@ class _GuardedRunner:
     def run_task(self, *args, **kwargs):  # noqa: ANN002,ANN003,ANN201 - protocol passthrough
         self.owner_guard()
         return self.inner.run_task(*args, **kwargs)
+
+    def bind_runner_call(self, **kwargs):  # noqa: ANN003,ANN201 - optional runner capability
+        self.owner_guard()
+        bind = getattr(self.inner, "bind_runner_call", None)
+        if callable(bind):
+            return bind(**kwargs)
+        return None
 
 
 class _AssemblyCleanup:
@@ -1126,6 +1134,11 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     os.chmod(db_path, 0o600)
     daemon = WriteDaemon(
         writer_conn, owner_guard=owner_guard)              # 新库建 / 既有库续（checksum 三重锁）
+    cost_ledger = CostLedger(daemon, policy)
+    # OS fence recovery above proves prior trees are drained.  Before exposing connectors,
+    # providers, or any new spawn, reconcile those receipts into their exact DB intents.
+    ExecutionReconciler(
+        daemon, cost_ledger, execution_supervisor.receipt_dir).reconcile_startup()
     state = SQLiteStateStore(daemon, policy)
     if daemon.query_one("SELECT 1 FROM goal LIMIT 1") is None:
         # **仅首次建 goal 才解析 brief**（外审 SHOULD）：重启时 DB goal 权威——若无条件解析，缺失/畸形
@@ -1159,7 +1172,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         owner_guard()
         runner = base_rf(transcripts_dir, purpose_tag)
         return _GuardedRunner(runner, owner_guard)
-    cost_ledger = CostLedger(daemon, policy)     # 所有真 LLM 调用共用同一预算/账本投影
+    # 所有真 LLM 调用共用上方已完成 startup reconciliation 的同一预算/账本投影。
     # 步⑨ CP9.3 入站闭环：控制台命令经 console_server 落 <work>/state/console_inbox.jsonl（连接器缓冲）→
     # precheck 边界 ingest 进权威入站链（handle_inbound 落 directive/note；query 经 mediator 应答）。
     # mediator 用同一 status_card.json（publisher 阶段边界原子发布的那份）做接地卡。

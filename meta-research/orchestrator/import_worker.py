@@ -36,8 +36,9 @@ from typing import Any, Callable, Dict, List, Optional
 from . import harness as H
 from . import obs_parser as OP
 from . import subject_manifest as SM
-from .attack_stages import _canon_hash, judge_once
+from .attack_stages import AttackStages, _BundleReject, _canon_hash, judge_once
 from .gate_pool import PoolGate
+from .gate_sqlite import GateReject
 from .phase_commit import check_or_record
 from .process_supervisor import ExecutionSupervisor
 
@@ -72,7 +73,12 @@ class ImportWorker:
         """扫 selected_for_materialization 工作队列（§3.6.3 物化由 Advancer 驱动、非等问题调度）；
         逐条物化。已 imported / 已 failed（worker cycle failed）→ 跳过（重试策略=后续）。返回处理的 ei ids。"""
         d = self.state.daemon
-        rows = d.query("SELECT id FROM external_import WHERE action='selected_for_materialization' ORDER BY id")
+        rows = d.query(
+            "SELECT s.id FROM external_import s WHERE s.action='selected_for_materialization' "
+            "AND NOT EXISTS (SELECT 1 FROM external_import x WHERE x.question_id=s.question_id "
+            "AND x.candidate_id=s.candidate_id AND x.action_cycle=s.action_cycle "
+            "AND x.candidate_set_hash=s.candidate_set_hash AND x.selection_key=s.selection_key "
+            "AND x.policy_hash=s.policy_hash AND x.action='superseded') ORDER BY s.id")
         done: List[int] = []
         for (ei_id,) in rows:
             if self._already_settled(ei_id):
@@ -82,12 +88,21 @@ class ImportWorker:
         return done
 
     def _already_settled(self, ei_id: int) -> bool:
+        return self._has_selection_outcome(
+            ei_id, ("imported", "materialize_failed", "superseded"))
+
+    def _has_selection_outcome(self, ei_id: int, actions) -> bool:
         d = self.state.daemon
-        sel = d.query_one("SELECT question_id, candidate_id, baseline_id FROM external_import WHERE id=?", (ei_id,))
-        settled = d.query_one(
-            "SELECT 1 FROM external_import WHERE candidate_id=? AND action IN ('imported','materialize_failed')",
-            (sel[1],))
-        return settled is not None
+        sel = d.query_one(
+            "SELECT question_id,candidate_id,action_cycle,candidate_set_hash,selection_key,policy_hash "
+            "FROM external_import WHERE id=? AND action='selected_for_materialization'", (ei_id,))
+        if sel is None:
+            raise ValueError(f"external_import {ei_id} 非 selected_for_materialization")
+        placeholders = ",".join("?" for _ in actions)
+        return d.query_one(
+            "SELECT 1 FROM external_import WHERE question_id=? AND candidate_id=? AND action_cycle=? "
+            "AND candidate_set_hash=? AND selection_key=? AND policy_hash=? "
+            f"AND action IN ({placeholders}) LIMIT 1", (*sel, *actions)) is not None
 
     def resume_cycle(self, cyc) -> None:
         """研究驱动循环递来的在途 worker 轮（route=NULL + 标记）：按标记回溯 external_import 续物化。"""
@@ -108,12 +123,23 @@ class ImportWorker:
     # ---------------------------------------------------------------- 单条物化 --
     def materialize_one(self, ei_id: int) -> None:
         d = self.state.daemon
+        if self._has_selection_outcome(ei_id, ("superseded",)):
+            return
         sel = d.query_one("SELECT question_id, candidate_id, baseline_id, license_review_id, "
                           "license_decision_snapshot_hash FROM external_import WHERE id=? "
                           "AND action='selected_for_materialization'", (ei_id,))
         if sel is None:
             raise ValueError(f"external_import {ei_id} 非 selected_for_materialization")
         qi, cand_id, bid, lic_id, ldsh = sel
+        lineage = d.query_one(
+            "SELECT q.goal_id,q.goal_ver,c.goal_id,c.goal_ver,"
+            "(SELECT MAX(version) FROM goal WHERE id=q.goal_id) "
+            "FROM external_import s JOIN question q ON q.id=s.question_id "
+            "JOIN cycle c ON c.id=s.action_cycle WHERE s.id=?", (ei_id,))
+        if (lineage is None or tuple(lineage[:2]) != tuple(lineage[2:4])
+                or lineage[1] != lineage[4]):
+            raise RuntimeError(
+                f"external_import {ei_id} 不属于 current goal lineage；须先 supersede，拒绝物化")
         # ① scope 消费点（license 表 gate 不可读——authorizer 拒；worker 用普通连接核，§3.6.3）
         scope_row = d.query_one("SELECT license_scope_json FROM license_review WHERE id=?", (lic_id,))
         scope = json.loads(scope_row[0]) if scope_row and scope_row[0] else {}
@@ -121,7 +147,7 @@ class ImportWorker:
             # 未动工即拒：不开 worker、不动占位（保持 planned）、dep 保持 pending
             self._record_failed(ei_id, qi, cand_id, reason="license scope 缺 allow_eval/allow_publish_pool，不物化")
             return
-        cyc_id = self._worker_cycle(ei_id)
+        cyc_id = self._worker_cycle(ei_id, qi)
         cand = d.query_one("SELECT canonical_uri, revision FROM external_candidate WHERE id=?", (cand_id,))
         self.owner_guard()
         spec = self.p["fetch"]({"id": cand_id, "question_id": qi, "canonical_uri": cand[0], "revision": cand[1]})
@@ -134,7 +160,7 @@ class ImportWorker:
             if ok:
                 self.state.resolve_deps()  # baseline→legal 机械 satisfied → 原问题回可调度（§4.2.1）
 
-    def _worker_cycle(self, ei_id: int) -> str:
+    def _worker_cycle(self, ei_id: int, question_id: int) -> str:
         """既有在途 worker 轮（标记匹配）→ 复用；否则开轮+标记（同一事务，OPEN #6 裁决②）。"""
         d = self.state.daemon
         row = d.query_one(
@@ -143,13 +169,43 @@ class ImportWorker:
             "AND json_extract(dd.payload_json,'$.external_import_id')=? "
             "AND c.status NOT IN ('done','failed','aborted') ORDER BY c.id DESC LIMIT 1", (ei_id,))
         if row:
+            marker = d.query_one(
+                "SELECT 1 FROM decision WHERE cycle_id=? AND actor='orchestrator' "
+                "AND type='import_worker_cycle' AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.external_import_id')=? "
+                "AND json_extract(payload_json,'$.question_id')=? LIMIT 1",
+                (row[0], ei_id, question_id))
+            if marker is None:
+                # 兼容迁移前已在途 marker：从权威 selection 重新核 question 后追加精确绑定，
+                # 不改写旧审计事实。
+                selected = d.query_one(
+                    "SELECT question_id FROM external_import "
+                    "WHERE id=? AND action='selected_for_materialization'", (ei_id,))
+                if selected is None or selected[0] != question_id:
+                    raise RuntimeError(f"worker cycle c{row[0]} 的 import/question 绑定损坏")
+                with d.transaction() as conn:
+                    conn.execute(
+                        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                        "VALUES (?,'orchestrator','import_worker_cycle',?)",
+                        (row[0], json.dumps({"external_import_id": ei_id,
+                                             "question_id": question_id}, sort_keys=True)))
             return _cid(row[0])
-        gver = d.query_one("SELECT MAX(version) FROM goal WHERE id=1")[0]
+        lineage = d.query_one(
+            "SELECT c.goal_id,c.goal_ver FROM external_import s "
+            "JOIN cycle c ON c.id=s.action_cycle WHERE s.id=?", (ei_id,))
+        if lineage is None:
+            raise RuntimeError(f"external_import {ei_id} action_cycle lineage 缺失")
+        goal_id, gver = lineage
+        current = d.query_one("SELECT MAX(version) FROM goal WHERE id=?", (goal_id,))
+        if current is None or current[0] != gver:
+            raise RuntimeError(f"external_import {ei_id} action_cycle 已非 current，拒绝开 worker")
         with d.transaction() as conn:
-            ci = conn.execute("INSERT INTO cycle(goal_id,goal_ver,status,policy_version) VALUES (1,?, 'created', ?)",
-                              (gver, str(self.state.policy.get("policy_version", "v0")))).lastrowid
+            ci = conn.execute("INSERT INTO cycle(goal_id,goal_ver,status,policy_version) VALUES (?,?, 'created', ?)",
+                              (goal_id, gver, str(self.state.policy.get("policy_version", "v0")))).lastrowid
             conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'orchestrator',"
-                         "'import_worker_cycle',?)", (ci, json.dumps({"external_import_id": ei_id})))
+                         "'import_worker_cycle',?)",
+                         (ci, json.dumps({"external_import_id": ei_id,
+                                          "question_id": question_id}, sort_keys=True)))
         return _cid(ci)
 
     def _variant_and_target(self, cyc_id: str, qi: int, bid: int, spec) -> tuple:
@@ -175,7 +231,7 @@ class ImportWorker:
         staging = self.work / f"import{ei_id}"
         clone_dir = staging / "clone"
         if st() in _TERMINAL_TARGET:
-            ok = st() == "complete" or self._settled_ok(cand_id)
+            ok = st() == "complete" or self._settled_ok(ei_id)
             if not ok:
                 # 崩在「finish failed → _record_failed」两提交之间的自愈（内审 SHOULD）：终败目标续跑到此
                 # 补记 materialize_failed（幂等）——否则 settled 判不到、materialize_pending 会对 build_failed
@@ -205,14 +261,41 @@ class ImportWorker:
                            [{"kind": "revision", "ref": "revision", "content_hash": _canon_hash(revision)}]
         manifest_hash = SM.subject_hash(manifest_entries)
         if st() == "building":                    # 沙箱 smoke（真子进程；失败 → 不 target_ready）
-            self.owner_guard()
-            sm = H.run_staged(spec["smoke_cmd"], staging_dir=str(staging / "smoke"),
-                              log_name=f"smoke-{len(list((staging / 'smoke').glob('smoke-*.log'))) + 1 if (staging / 'smoke').exists() else 1}.log",
-                              timeout_s=120, execution_supervisor=self.execution_supervisor,
-                              execution_kind="import-smoke",
-                              execution_context={
-                                  "cycle_id": cyc_id, "external_import_id": ei_id,
-                                  "build_target_id": bt_id, "phase": "smoke"})
+            smoke_dir = staging / "smoke"
+            existing_final = H.latest_smoke_log(smoke_dir)
+            partials = sorted(smoke_dir.glob("smoke-*.log.partial")) if smoke_dir.exists() else []
+            if len(partials) > 1:
+                raise RuntimeError(f"import target {bt_id} 有多个未发布 smoke partial")
+            smoke_name = (existing_final.name if existing_final is not None else
+                          (partials[0].name[:-len(".partial")] if partials else "smoke-1.log"))
+            smoke_context = {
+                "cycle_id": cyc_id, "external_import_id": ei_id,
+                "build_target_id": bt_id, "phase": "smoke",
+                "reconcile_protocol": "execution-owner-v1",
+                "db_owner_kind": "build_target", "db_owner_id": bt_id,
+            }
+            if existing_final is not None:
+                exit_file = existing_final.with_name(existing_final.name + ".exit")
+                if not exit_file.exists():
+                    raise RuntimeError(
+                        f"staging 损毁：{existing_final} 在而 exit 侧车缺——须人工核")
+                smoke_bytes = existing_final.read_bytes()
+                sm = {"exit_code": int(exit_file.read_text()),
+                      "log_path": str(existing_final),
+                      "log_sha256": hashlib.sha256(smoke_bytes).hexdigest(),
+                      "log_bytes": len(smoke_bytes)}
+            else:
+                sm = H.recover_staged_result(
+                    staging_dir=str(smoke_dir), log_name=smoke_name,
+                    execution_supervisor=self.execution_supervisor,
+                    execution_kind="import-smoke", execution_context=smoke_context)
+                if sm is None:
+                    self.owner_guard()
+                    sm = H.run_staged(
+                        spec["smoke_cmd"], staging_dir=str(smoke_dir),
+                        log_name=smoke_name, timeout_s=120,
+                        execution_supervisor=self.execution_supervisor,
+                        execution_kind="import-smoke", execution_context=smoke_context)
             if sm["exit_code"] != 0:
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._record_failed(ei_id, qi, cand_id, reason="沙箱 smoke 失败，不 target_ready")
@@ -267,10 +350,67 @@ class ImportWorker:
                               spec.get("artifact_type", "external_model"),
                               manifest_hash, cand_row[0], revision, rid))
             g.gate_finish_run(run_id=rid, status="success")
-        # 出厂评估（源仍 factory——外部性只在 checkpoint.origin+manifest_hash，§3.6.3 证据归属）
-        erow = d.query_one("SELECT id FROM evaluation WHERE build_target_id=?", (bt_id,))
-        if erow is None:
-            eval_final = staging / f"eval{rid}" / "eval.log"
+        # 出厂评估（源仍 factory——外部性只在 checkpoint.origin+manifest_hash，§3.6.3 证据归属）。
+        # 与 attack lockstep：任何外部 eval 进程放行前，evaluation+attempt(running) 已耐久落库；
+        # guardian receipt 因而能以 execution-owner-v1 精确回指 DB owner，禁止事后伪造成功 attempt。
+        erow = d.query_one(
+            "SELECT id,status,canonical_attempt_id FROM evaluation WHERE build_target_id=?", (bt_id,))
+        eval_final: Optional[Path] = None
+        if erow is None or erow[1] != "success":
+            if erow is None:
+                attempt_purpose = "factory"
+                started = g.gate_start_attempt(
+                    cycle_id=cyc_id, purpose=attempt_purpose, build_target_id=bt_id,
+                    create={"variant_id": vid, "protocol_id": spec["protocol_id"],
+                            "protocol_ver": spec["protocol_ver"], "eval_key": spec["eval_key"],
+                            "source": "factory", "target_set_hash": spec["target_set_hash"]},
+                    env_hash=spec.get("env_hash", "import-env"), watchdog_sec=600.0)
+            else:
+                latest = d.query_one(
+                    "SELECT id,status,attempt_no,purpose,failure_kind FROM evaluation_attempt "
+                    "WHERE evaluation_id=? ORDER BY attempt_no DESC LIMIT 1", (erow[0],))
+                if latest is None:
+                    raise RuntimeError(f"evaluation {erow[0]} 非 success 却无 attempt")
+                if latest[1] == "running":
+                    attempt_purpose = latest[3]
+                    started = {"evaluation_id": erow[0], "attempt_id": latest[0],
+                               "attempt_no": latest[2]}
+                elif latest[1] == "failed":
+                    # 已完成的失败执行是不可覆写事实。若此前崩在 target/settling 收口缝隙，只补收口，
+                    # 不把一次失败偷偷重跑成另一事实。
+                    target_failure = ("protocol_violation"
+                                      if latest[4] in ("protocol_violation", "metric_missing",
+                                                       "data_invalid", "artifact_invalid")
+                                      else latest[4] or "runtime")
+                    g.gate_finish_build_target(
+                        build_target_id=bt_id, status="failed", failure_kind=target_failure)
+                    self._record_failed(
+                        ei_id, qi, cand_id, reason=f"出厂评估已失败（{latest[4] or 'runtime'}），不 pool_publish")
+                    self._target_pc(cyc_id, bt_id)
+                    return False
+                elif latest[1] == "aborted":
+                    attempt_purpose = "retry"
+                    started = g.gate_start_attempt(
+                        cycle_id=cyc_id, purpose=attempt_purpose, build_target_id=bt_id,
+                        evaluation_id=erow[0], retry_of=latest[0],
+                        env_hash=spec.get("env_hash", "import-env"), watchdog_sec=600.0)
+                else:
+                    raise RuntimeError(
+                        f"evaluation {erow[0]} status={erow[1]} 与 latest attempt={latest[1]} 不一致")
+            eid, aid, attempt_no = (
+                started["evaluation_id"], started["attempt_id"], started["attempt_no"])
+            eval_dir = (staging / f"eval{rid}" if attempt_no == 1 else
+                        staging / f"eval{rid}" / f"retry-a{aid}")
+            eval_final = eval_dir / "eval.log"
+            eval_context = {
+                "cycle_id": cyc_id,
+                "external_import_id": ei_id,
+                "build_target_id": bt_id,
+                "run_id": rid, "phase": "eval",
+                "reconcile_protocol": "execution-owner-v1",
+                "db_owner_kind": "evaluation_attempt",
+                "db_owner_id": aid,
+            }
             if eval_final.exists():
                 exit_file = eval_final.with_name("eval.log.exit")
                 if not exit_file.exists():
@@ -279,24 +419,41 @@ class ImportWorker:
                 eval_log = eval_final.read_bytes()
                 ev["log_sha256"] = hashlib.sha256(eval_log).hexdigest()
             else:
-                self.owner_guard()
-                ev = H.run_staged(spec["eval_cmd"], staging_dir=str(staging / f"eval{rid}"),
-                                  log_name="eval.log", timeout_s=600,
-                                  execution_supervisor=self.execution_supervisor,
-                                  execution_kind="import-eval",
-                                  execution_context={
-                                      "cycle_id": cyc_id,
-                                      "external_import_id": ei_id,
-                                      "build_target_id": bt_id,
-                                      "run_id": rid, "phase": "eval"})
+                ev = H.recover_staged_result(
+                    staging_dir=str(eval_dir), log_name="eval.log",
+                    execution_supervisor=self.execution_supervisor,
+                    execution_kind="import-eval", execution_context=eval_context)
+                if ev is None:
+                    self.owner_guard()
+                    ev = H.run_staged(
+                        spec["eval_cmd"], staging_dir=str(eval_dir),
+                        log_name="eval.log", timeout_s=600,
+                        execution_supervisor=self.execution_supervisor,
+                        execution_kind="import-eval", execution_context=eval_context)
                 eval_log = Path(ev["log_path"]).read_bytes()
             if ev["exit_code"] != 0:               # factory eval 失败 → 不 pool_publish
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind="runtime",
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
                 self._record_failed(ei_id, qi, cand_id, reason="出厂评估失败，不 pool_publish")
                 self._target_pc(cyc_id, bt_id)
                 return False
-            from .attack_stages import AttackStages
-            metrics = AttackStages._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"))
+            try:
+                metrics = AttackStages._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"))
+            except _BundleReject as e:
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind=e.failure_kind,
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
+                g.gate_finish_build_target(
+                    build_target_id=bt_id, status="failed", failure_kind=e.failure_kind)
+                self._record_failed(ei_id, qi, cand_id, reason=f"出厂评估协议违规：{e}")
+                self._target_pc(cyc_id, bt_id)
+                return False
             ckrow = d.query_one("SELECT ckpt_key, content_hash FROM checkpoint WHERE produced_by_run=?", (rid,))
             res_sh = SM.subject_hash(SM.result_review_manifest(
                 metrics_artifact_hash=_canon_hash(metrics), checkpoint_hashes={ckrow[0]: ckrow[1]},
@@ -305,21 +462,40 @@ class ImportWorker:
             judge_once(d, self.p["judge"], cyc_id, bt_id, "bundle_result_review", res_sh)
             if not g.review_passed(build_target_id=bt_id, review_kind="bundle_result_review",
                                    current_subject_hash=res_sh):
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind="protocol_violation",
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="review_failed")
                 self._record_failed(ei_id, qi, cand_id, reason="结果评审 FAIL，不注册不 pool_publish")
                 self._target_pc(cyc_id, bt_id)
                 return False
-            reg = g.gate_register_evaluation(
-                cycle_id=cyc_id, build_target_id=bt_id, purpose="factory", current_subject_hash=res_sh,
-                metric_results=metrics,
-                create={"variant_id": vid, "protocol_id": spec["protocol_id"], "protocol_ver": spec["protocol_ver"],
-                        "eval_key": spec["eval_key"], "source": "factory", "target_set_hash": spec["target_set_hash"]},
-                env_hash=spec.get("env_hash", "import-env"), artifact_ref=f"sha256:{ev['log_sha256']}")
+            try:
+                reg = g.gate_register_evaluation(
+                    cycle_id=cyc_id, build_target_id=bt_id, purpose=attempt_purpose,
+                    current_subject_hash=res_sh, metric_results=metrics, attempt_id=aid,
+                    artifact_ref=f"sha256:{ev['log_sha256']}",
+                    transcript_ref=ev.get("process_receipt_path"))
+            except GateReject as e:
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind="protocol_violation",
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
+                g.gate_finish_build_target(
+                    build_target_id=bt_id, status="failed", failure_kind="protocol_violation")
+                self._record_failed(ei_id, qi, cand_id, reason=f"出厂评估注册被拒：{e}")
+                self._target_pc(cyc_id, bt_id)
+                return False
             eid, aid = reg["evaluation_id"], reg["attempt_id"]
         else:
-            eid = erow[0]
-            aid = d.query_one("SELECT canonical_attempt_id FROM evaluation WHERE id=?", (eid,))[0]
-        self._eval_log_backfill(cyc_id, staging / f"eval{rid}" / "eval.log", aid)
+            eid, aid = erow[0], erow[2]
+            attempt_no = d.query_one(
+                "SELECT attempt_no FROM evaluation_attempt WHERE id=?", (aid,))[0]
+            eval_final = (staging / f"eval{rid}" / "eval.log" if attempt_no == 1 else
+                          staging / f"eval{rid}" / f"retry-a{aid}" / "eval.log")
+        self._eval_log_backfill(cyc_id, eval_final, aid)
         if aid is None or not OP.suspect_attempt_has_current_obs(d.conn, aid, self.obs_policy):
             raise RuntimeError(f"import 管线约束：attempt {aid} 无当前口径 parser 观测——须先 ingest 再入池")
         if d.query_one("SELECT status FROM variant WHERE id=?", (vid,))[0] != "legal":
@@ -342,7 +518,7 @@ class ImportWorker:
         """external_import(action='imported')（幂等；DDL CHECK：须携 baseline+manifest+license 双 hash）。
         锚字段（candidate_set/selection_key/policy/license hash）复制自 selected 行——同一次选择的物化结局。"""
         d = self.state.daemon
-        if d.query_one("SELECT 1 FROM external_import WHERE candidate_id=? AND action='imported'", (cand_id,)):
+        if self._has_selection_outcome(ei_id, ("imported",)):
             return
         src = d.query_one("SELECT action_cycle, candidate_set_hash, selection_key, policy_hash, "
                           "license_decision_snapshot_hash, license_review_id FROM external_import WHERE id=?", (ei_id,))
@@ -355,7 +531,7 @@ class ImportWorker:
     def _record_failed(self, ei_id, qi, cand_id, *, reason: str) -> None:
         """external_import(action='materialize_failed')（幂等；DDL CHECK：不携 baseline/manifest；reason_json 记因）。"""
         d = self.state.daemon
-        if d.query_one("SELECT 1 FROM external_import WHERE candidate_id=? AND action='materialize_failed'", (cand_id,)):
+        if self._has_selection_outcome(ei_id, ("materialize_failed",)):
             return
         src = d.query_one("SELECT action_cycle, candidate_set_hash, selection_key, policy_hash, license_review_id "
                           "FROM external_import WHERE id=?", (ei_id,))
@@ -366,9 +542,8 @@ class ImportWorker:
                          (qi, cand_id, src[0], src[1], src[2], src[3], src[4],
                           json.dumps({"reason": reason}, ensure_ascii=False)))
 
-    def _settled_ok(self, cand_id) -> bool:
-        return self.state.daemon.query_one(
-            "SELECT 1 FROM external_import WHERE candidate_id=? AND action='imported'", (cand_id,)) is not None
+    def _settled_ok(self, ei_id) -> bool:
+        return self._has_selection_outcome(ei_id, ("imported",))
 
     def _eval_log_backfill(self, cyc_id: str, log_path: Path, aid: Optional[int]) -> None:
         """attempt-owned eval log 补登+ingest（幂等 + sha256 锚强校验——同 attack_stages 契约）。"""

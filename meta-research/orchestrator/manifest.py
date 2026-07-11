@@ -820,7 +820,13 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
         _check_no_shell(argv)                       # argv[0] 禁 shell 启动器（codex BLOCKER：先于路径豁免）
         allow = [str(Path(work_root).resolve())] + [
             os.path.normpath(p) for p in policy["execution"].get("path_allowlist", [])]
+        # ``ck`` is not a manifest-authored arbitrary path: the orchestrator
+        # resolved it from a committed checkpoint row and passes it explicitly.
+        # Permit that one exact path even when a legal pool target lives outside
+        # work_root; callers remain responsible for rechecking its content hash.
         allowed_fd_paths = {f"/proc/self/fd/{fd}" for fd in opened_fds}
+        if ck is not None:
+            allowed_fd_paths.add(os.path.normpath(ck))
         for i, token in enumerate(argv[1:], start=1):  # argv[0]=程序名豁免（解释器/工具允许绝对系统路径）
             _check_argv_token(token, allow, where=f"argv[{i}]", allowed_exact=allowed_fd_paths)
         env = dict(manifest.get("env", {}))

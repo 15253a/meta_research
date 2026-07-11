@@ -225,6 +225,7 @@ class SqliteCompiler:
             parts.append(self._reasoning_directives(ci, sources))
             parts.append(self._closed_conclusions(goal_id, goal_ver, sources))
             parts.append(self._open_set(aq, goal_id, goal_ver, sources))
+            parts.append(self._bundle_outcomes(ci, sources))
             parts.append(self._observation_summary(ci, sources))
             parts.append("## 采集打分参数\n```json\n" + json.dumps(
                 {"acquisition": self.policy["acquisition"], "B_t": self._budget(),
@@ -702,6 +703,32 @@ class SqliteCompiler:
             if a and a[1] == "active":
                 lines.append(f"- q{aq}（active·本轮 Qn，收尾后可重选，visit={a[2]}）: {a[0]}")
         return "## 可调度问题集（open/inconclusive 且无 pending dep；含本轮 Qn）\n" + ("\n".join(lines) or "（空）")
+
+    def _bundle_outcomes(self, ci: int, sources: List[str]) -> str:
+        """把本轮逐目标终态与成功测量引用机械送入 reasoning，闭合 critical 早退裁决回路。"""
+        targets = self.conn.execute(
+            "SELECT id,seq,target_kind,status,critical,budget_estimate,failure_kind "
+            "FROM build_target WHERE cycle_id=? ORDER BY seq,id", (ci,)).fetchall()
+        if not targets:
+            return "## 本轮 bundle 目标结果\n（本轮无 build_target）"
+        sources.append(f"db:build_target:cycle:{ci}")
+        lines = []
+        for target_id, seq, kind, status, critical, estimate, failure in targets:
+            measurements = self.conn.execute(
+                "SELECT mr.id,mr.metric_id,mr.metric_ver,mr.value,mr.scope "
+                "FROM metric_result mr JOIN evaluation_attempt ea ON ea.id=mr.evaluation_attempt_id "
+                "WHERE ea.build_target_id=? AND ea.status='success' ORDER BY mr.id",
+                (target_id,)).fetchall()
+            refs = ", ".join(
+                f"mr{mrid}:{mid}@{mver}={value}({scope})"
+                for mrid, mid, mver, value, scope in measurements) or "无成功测量"
+            lines.append(
+                f"- target={target_id} seq={seq} kind={kind} status={status} "
+                f"critical={bool(critical)} budget_estimate={estimate} "
+                f"failure_kind={failure or '无'}；measurement_refs={refs}")
+            if measurements:
+                sources.append(f"db:metric_result:target:{target_id}")
+        return "## 本轮 bundle 目标结果（失败目标保持 failed；skipped=从未执行）\n" + "\n".join(lines)
 
     def _observation_summary(self, ci, sources) -> str:
         """本轮运行观测摘要（§4.7）：从 `execution_observation` 渲机器事实进 reasoning 固定锚（不塞全量 log）。

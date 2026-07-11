@@ -84,7 +84,7 @@ class SQLiteStateStore:
         self._local_maps, self._bundle_cursor = snap
 
     @contextmanager
-    def atomic(self) -> Iterator[None]:
+    def atomic(self) -> Iterator[Any]:
         """把多个写方法裹进同一事务（M3 Advancer 用于答题收尾全序，§4.2.5(a)）。
 
         **契约**：块内任一写方法抛异常，调用方**不得吞掉**——必须让它传播以中止整个 atomic
@@ -95,7 +95,7 @@ class SQLiteStateStore:
         try:
             with self.daemon.transaction() as conn:
                 self._active_conn = conn
-                yield
+                yield conn
         except BaseException:
             self._projection_restore(snap)   # 随外层事务回滚复原投影
             raise
@@ -144,6 +144,37 @@ class SQLiteStateStore:
         row = self._q1("SELECT max(version) FROM goal WHERE id=1")
         return row[0] if row and row[0] is not None else 1
 
+    def current_goal_ref(self, goal_id: int = 1) -> tuple[int, int]:
+        """返回指定 goal lineage 的当前不可变版本；StateStore 的研究调度权威固定为 goal_id=1。"""
+        if goal_id != 1:
+            raise ValueError(f"SQLiteStateStore 只调度 active goal_id=1，实收 {goal_id}")
+        row = self._q1("SELECT MAX(version) FROM goal WHERE id=?", (goal_id,))
+        if row is None or row[0] is None:
+            raise RuntimeError(f"active goal {goal_id} 不存在")
+        return goal_id, int(row[0])
+
+    def assert_current_cycle(self, cycle_id: str, *, allow_terminal: bool = False) -> tuple[int, int]:
+        """Fail loud unless a cycle and its active question belong to the active current goal."""
+        ci = _cnum(cycle_id)
+        cycle = self._q1(
+            "SELECT goal_id,goal_ver,status,active_question_id FROM cycle WHERE id=?", (ci,))
+        if cycle is None:
+            raise RuntimeError(f"cycle 不存在: {cycle_id}")
+        goal_id, goal_ver, status, active_question_id = cycle
+        current = self.current_goal_ref(goal_id)
+        if (goal_id, goal_ver) != current:
+            raise RuntimeError(
+                f"cycle {cycle_id} lineage={goal_id}@v{goal_ver} 非 current {current[0]}@v{current[1]}")
+        if not allow_terminal and status in ("done", "failed", "aborted"):
+            raise RuntimeError(f"cycle {cycle_id} 已终态 {status}")
+        if active_question_id is not None:
+            question = self._q1(
+                "SELECT goal_id,goal_ver,status FROM question WHERE id=?", (active_question_id,))
+            if question is None or tuple(question[:2]) != current or question[2] != "active":
+                raise RuntimeError(
+                    f"cycle {cycle_id} active_question q{active_question_id} 与 current lineage/active 状态不一致")
+        return current
+
     def pending_goal_amend_directive(self) -> Optional[int]:
         """Return the one confirmed amendment for the current immutable goal.
 
@@ -181,6 +212,36 @@ class SQLiteStateStore:
             raise RuntimeError(f"cycle {cycle_id} 消费了多个 goal_amend")
         return int(rows[0][0]) if rows else None
 
+    def assert_goal_amend_quiescent(self, cycle_id: str) -> None:
+        """Goal version may advance only after every prior research execution has a durable terminal fact."""
+        self.assert_current_cycle(cycle_id)
+        ci = _cnum(cycle_id)
+        checks = (
+            ("build_target", "SELECT id FROM build_target WHERE cycle_id<>? AND status NOT IN "
+             "('complete','skipped','failed','engineering_blocked') LIMIT 1"),
+            ("run", "SELECT id FROM run WHERE cycle_id<>? AND status IN ('created','running') LIMIT 1"),
+            ("evaluation_attempt", "SELECT id FROM evaluation_attempt WHERE cycle_id<>? "
+             "AND status IN ('created','running') LIMIT 1"),
+            ("runner_call", "SELECT id FROM runner_call WHERE COALESCE(cycle_id,-1)<>? "
+             "AND phase NOT IN ('interaction_query') AND status IN ('created','running') LIMIT 1"),
+        )
+        for label, sql in checks:
+            row = self._q1(sql, (ci,))
+            if row is not None:
+                raise RuntimeError(
+                    f"goal_amend 前仍有 prior {label} {row[0]} 未对账终态；拒绝调用模型/升版")
+        unsettled_started_import = self._q1(
+            "SELECT s.id FROM external_import s JOIN baseline b ON b.id=s.baseline_id "
+            "WHERE s.action='selected_for_materialization' AND b.status<>'planned' AND NOT EXISTS ("
+            "SELECT 1 FROM external_import x WHERE x.question_id=s.question_id "
+            "AND x.candidate_id=s.candidate_id AND x.action_cycle=s.action_cycle "
+            "AND x.candidate_set_hash=s.candidate_set_hash AND x.selection_key=s.selection_key "
+            "AND x.policy_hash=s.policy_hash "
+            "AND x.action IN ('imported','materialize_failed','superseded')) LIMIT 1")
+        if unsettled_started_import is not None:
+            raise RuntimeError(
+                f"goal_amend 前 import selection {unsettled_started_import[0]} 已开工但未落 settling 事件")
+
     def set_goal_amend_route(self, cycle_id: str, directive_id: int) -> None:
         """Atomically bind route choice to the confirmed directive it observed."""
         with self._write() as conn:
@@ -200,9 +261,12 @@ class SQLiteStateStore:
                 "ORDER BY d.id").fetchall()
             if len(rows) != 1 or rows[0][0] != directive_id:
                 raise ValueError(f"goal_amend d{directive_id} 已不再是当前唯一有效修订")
-            status = conn.execute("SELECT status,route FROM cycle WHERE id=?",
-                                  (_cnum(cycle_id),)).fetchone()
-            if status is None or status[0] in ("done", "failed", "aborted") or status[1] is not None:
+            status = conn.execute(
+                "SELECT status,route,goal_id,goal_ver FROM cycle WHERE id=?",
+                (_cnum(cycle_id),)).fetchone()
+            current = conn.execute("SELECT MAX(version) FROM goal WHERE id=1").fetchone()
+            if (status is None or status[0] in ("done", "failed", "aborted")
+                    or status[1] is not None or tuple(status[2:]) != (1, current[0])):
                 raise ValueError(f"cycle {cycle_id} 不可绑定 goal_amend route")
             conn.execute("UPDATE cycle SET route='goal_amend' WHERE id=?", (_cnum(cycle_id),))
             conn.execute(
@@ -214,7 +278,14 @@ class SQLiteStateStore:
     def _inflight_row(self):
         """在途（非终态）轮的 id 行或 None——open_or_resume_cycle 与 inflight_cycle 共用一处口径（防漂移，内审 NIT）。
         单驱动器模型下至多一条。"""
-        return self._q1("SELECT id FROM cycle WHERE status NOT IN ('done','failed','aborted') ORDER BY id LIMIT 1")
+        rows = self._qall(
+            "SELECT id FROM cycle WHERE status NOT IN ('done','failed','aborted') ORDER BY id")
+        if len(rows) > 1:
+            raise RuntimeError(f"同时存在 {len(rows)} 条在途 cycle，单驱动器不变量已破")
+        if not rows:
+            return None
+        self.assert_current_cycle(_cid(rows[0][0]))
+        return rows[0]
 
     def open_or_resume_cycle(self) -> Cycle:
         row = self._inflight_row()
@@ -244,7 +315,10 @@ class SQLiteStateStore:
         """最近**成功收尾的研究轮**（status='done' 且 route 非 NULL）。M3 驱动循环用其 next_intent/
         next_question_id 定下一轮 route/目标（durable 交接）。failed/aborted 不算（selection 未落或无效）；
         **route=NULL 的物化 worker 轮不算**（非研究轮、无 selection——OPEN #6：混入会污染研究交接）。"""
-        r = self._q1("SELECT id FROM cycle WHERE status='done' AND route IS NOT NULL ORDER BY id DESC LIMIT 1")
+        goal_id, goal_ver = self.current_goal_ref()
+        r = self._q1(
+            "SELECT id FROM cycle WHERE status='done' AND route IS NOT NULL "
+            "AND goal_id=? AND goal_ver=? ORDER BY id DESC LIMIT 1", (goal_id, goal_ver))
         return self._load_cycle(r[0]) if r else None
 
     def _load_cycle(self, cid: int) -> Cycle:
@@ -257,6 +331,8 @@ class SQLiteStateStore:
 
     def set_route(self, cycle_id: str, route: Route) -> None:
         cid = _cnum(cycle_id)
+        # 保留该公开 API 原有的终态业务错误语义；current-lineage 仍由守卫验证。
+        self.assert_current_cycle(cycle_id, allow_terminal=True)
         st = self._q1("SELECT status FROM cycle WHERE id=?", (cid,))
         if st is None:
             raise ValueError(f"cycle 不存在: {cycle_id}")
@@ -270,8 +346,20 @@ class SQLiteStateStore:
     def mark_cycle_done(self, cycle_id: str, status: str = "done") -> None:
         if status not in ("done", "failed", "aborted"):
             raise ValueError(f"cycle 终态非法: {status}")
+        self.assert_current_cycle(cycle_id)
         with self._write() as conn:
-            conn.execute("UPDATE cycle SET status=?, finished_at=CURRENT_TIMESTAMP WHERE id=?", (status, _cnum(cycle_id)))
+            active = conn.execute(
+                "SELECT active_question_id FROM cycle WHERE id=?", (_cnum(cycle_id),)).fetchone()
+            if active is None or active[0] is not None:
+                raise RuntimeError(
+                    f"cycle {cycle_id} 仍持有 active_question_id="
+                    f"{active[0] if active else 'missing'}，拒绝终态提交")
+            changed = conn.execute(
+                "UPDATE cycle SET status=?, finished_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status NOT IN ('done','failed','aborted')",
+                (status, _cnum(cycle_id))).rowcount
+            if changed != 1:
+                raise RuntimeError(f"cycle {cycle_id} 终态迁移竞态")
         # 无条件清本轮进程内投影（防长跑无界增长）——二者均在 _projection_snapshot 内，故若在 atomic()
         # 中且外层回滚，会随投影一并复原（cycle 未真终态时投影不丢）。
         self._local_maps.pop(cycle_id, None)
@@ -282,7 +370,10 @@ class SQLiteStateStore:
         return self._q1("SELECT count(*) FROM question_dep WHERE question_id=? AND status='pending'", (qid_int,))[0]
 
     def is_schedulable(self, qid: str, *, for_intent: str = "attack") -> bool:
-        r = self._q1("SELECT status, visit_count FROM question WHERE id=?", (_qnum(qid),))
+        goal_id, goal_ver = self.current_goal_ref()
+        r = self._q1(
+            "SELECT status,visit_count FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+            (_qnum(qid), goal_id, goal_ver))
         if r is None:
             return False
         status, visit = r
@@ -298,7 +389,10 @@ class SQLiteStateStore:
     def list_schedulable_questions(self) -> List[Dict[str, Any]]:
         out = []
         # ORDER BY id：确定性候选序（= 插入序，等价 InMemory 的 dict 迭代序）——护 M3 恢复一致性
-        for r in self._qall("SELECT id,text,status,visit_count,score,est_cost,parent_id FROM question ORDER BY id"):
+        goal_id, goal_ver = self.current_goal_ref()
+        for r in self._qall(
+                "SELECT id,text,status,visit_count,score,est_cost,parent_id FROM question "
+                "WHERE goal_id=? AND goal_ver=? ORDER BY id", (goal_id, goal_ver)):
             qid = _qid(r[0])
             if self.is_schedulable(qid, for_intent="attack") or self.is_schedulable(qid, for_intent="decompose"):
                 out.append({"question_id": qid, "text": r[1], "status": r[2], "visit_count": r[3],
@@ -314,38 +408,81 @@ class SQLiteStateStore:
         with self._write() as conn:
             # active_question_id 须落到**当前轮**（护崩溃重启可恢复；InMemory 由 driver 在 Cycle 对象持之，
             # SQLite 须落库）。单驱动器模型下恰一非终态 cycle——显式核验，否则激活了却无处落 = 又制造不可恢复态。
-            cur = conn.execute("SELECT id FROM cycle WHERE status NOT IN ('done','failed','aborted') ORDER BY id").fetchall()
+            cur = conn.execute(
+                "SELECT id,active_question_id FROM cycle "
+                "WHERE status NOT IN ('done','failed','aborted') ORDER BY id").fetchall()
             if len(cur) != 1:
                 raise ValueError(f"activate_question 需恰一非终态 cycle（当前 {len(cur)}）")
-            conn.execute("UPDATE question SET status='active' WHERE id=?", (qi,))
-            conn.execute("UPDATE cycle SET active_question_id=? WHERE id=?", (qi, cur[0][0]))
+            if cur[0][1] is not None:
+                raise ValueError(
+                    f"cycle c{cur[0][0]} 已持有 active question q{cur[0][1]}，不得覆盖激活租约")
+            ci = cur[0][0]
+            cycle = conn.execute("SELECT goal_id,goal_ver FROM cycle WHERE id=?", (ci,)).fetchone()
+            current = conn.execute(
+                "SELECT MAX(version) FROM goal WHERE id=?", (cycle[0],)).fetchone()
+            question = conn.execute(
+                "SELECT goal_id,goal_ver,status FROM question WHERE id=?", (qi,)).fetchone()
+            if (cycle[0] != 1 or current is None or current[0] != cycle[1]
+                    or question is None or tuple(question[:2]) != tuple(cycle)
+                    or question[2] not in ("open", "inconclusive")):
+                raise ValueError(
+                    f"问题 {question_id} 与在途 cycle c{ci} 的 current lineage 不一致")
+            conn.execute("UPDATE question SET status='active',active_cycle=? WHERE id=?", (ci, qi))
+            conn.execute("UPDATE cycle SET active_question_id=? WHERE id=?", (qi, ci))
 
     def mark_inconclusive(self, question_id: str) -> None:
         qi = _qnum(question_id)
-        r = self._q1("SELECT status FROM question WHERE id=?", (qi,))
+        goal_id, goal_ver = self.current_goal_ref()
+        r = self._q1(
+            "SELECT status,active_cycle FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+            (qi, goal_id, goal_ver))
         if r is None or r[0] != "active":
             raise ValueError(f"仅 active 可置 inconclusive: {question_id}({r[0] if r else '缺'})")
+        if r[1] is None:
+            raise RuntimeError(f"active question {question_id} 缺 active_cycle 审计锚")
         with self._write() as conn:
             conn.execute("UPDATE question SET status='inconclusive', visit_count=visit_count+1 WHERE id=?", (qi,))
-            conn.execute("UPDATE cycle SET active_question_id=NULL WHERE active_question_id=?", (qi,))
+            released = conn.execute(
+                "UPDATE cycle SET active_question_id=NULL WHERE id=? AND active_question_id=?",
+                (r[1], qi)).rowcount
+            if released != 1:
+                raise RuntimeError(f"释放 inconclusive question {question_id} 的 active 租约失败")
 
     def release_question(self, question_id: str) -> None:
         """active→open（cycle failed/aborted / dependency_wait；不增 visit，§4.2.3）。"""
         qi = _qnum(question_id)
+        goal_id, goal_ver = self.current_goal_ref()
+        question = self._q1(
+            "SELECT status,active_cycle FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+            (qi, goal_id, goal_ver))
+        if question is None:
+            raise ValueError(f"问题 {question_id} 不属于 current goal")
+        if question[0] != "active" or question[1] is None:
+            raise ValueError(f"仅带 active_cycle 的 active 问题可释放: {question_id}")
         with self._write() as conn:
-            conn.execute("UPDATE question SET status='open' WHERE id=? AND status='active'", (qi,))
-            conn.execute("UPDATE cycle SET active_question_id=NULL WHERE active_question_id=?", (qi,))
+            changed = conn.execute(
+                "UPDATE question SET status='open' WHERE id=? AND status='active'", (qi,)).rowcount
+            released = conn.execute(
+                "UPDATE cycle SET active_question_id=NULL WHERE id=? AND active_question_id=?",
+                (question[1], qi)).rowcount
+            if changed != 1 or released != 1:
+                raise RuntimeError(f"释放 question {question_id} 的状态/active 租约不一致")
 
     # -- dep ------------------------------------------------------------------
     def record_question_dep(self, question_id: str, *, dep_type: str, target: str) -> None:
         qi = _qnum(question_id)
-        if self._q1("SELECT 1 FROM question WHERE id=?", (qi,)) is None:
+        goal_id, goal_ver = self.current_goal_ref()
+        if self._q1(
+                "SELECT 1 FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+                (qi, goal_id, goal_ver)) is None:
             raise ValueError(f"dep 主体问题不存在: {question_id}")
         if dep_type == "question":
             ti = _qnum(target)
             if ti == qi:
                 raise ValueError("禁自依赖")
-            if self._q1("SELECT 1 FROM question WHERE id=?", (ti,)) is None:
+            if self._q1(
+                    "SELECT 1 FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+                    (ti, goal_id, goal_ver)) is None:
                 raise ValueError(f"dep 目标不存在: {target}（§4.2.4 拒因；防静默不可满足依赖）")
             with self._write() as conn:
                 conn.execute("INSERT INTO question_dep(question_id,dep_type,depends_on_question_id,status) "
@@ -378,6 +515,7 @@ class SQLiteStateStore:
         return self._local_maps.get(cycle_id, {}).get(key, key)
 
     def persist_selection(self, cycle_id: str, sel: Selection) -> None:
+        current_goal = self.assert_current_cycle(cycle_id)
         if sel.next_intent not in ("attack", "decompose", "terminate"):
             raise InvalidSelectionError(f"next_intent 非法: {sel.next_intent}")
         next_qid = self._resolve_local(cycle_id, sel.next_question_id)
@@ -394,7 +532,9 @@ class SQLiteStateStore:
         for original in sel.scores:
             row = dict(original)
             ri = _qnum_opt(self._resolve_local(cycle_id, row.get("question_id")))
-            if ri is None or self._q1("SELECT 1 FROM question WHERE id=?", (ri,)) is None:
+            if ri is None or self._q1(
+                    "SELECT 1 FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+                    (ri, current_goal[0], current_goal[1])) is None:
                 raise InvalidSelectionError(f"scores 引用的问题不存在: {row.get('question_id')}（不静默丢弃）")
             if ri in seen_score_ids:
                 raise InvalidSelectionError(f"scores 重复引用问题 q{ri}")
@@ -437,7 +577,9 @@ class SQLiteStateStore:
             if next_qid is not None:
                 raise InvalidSelectionError("terminate 时 next_question_id 必须为 null")
         else:
-            if next_int is None or self._q1("SELECT 1 FROM question WHERE id=?", (next_int,)) is None:
+            if next_int is None or self._q1(
+                    "SELECT 1 FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+                    (next_int, current_goal[0], current_goal[1])) is None:
                 raise InvalidSelectionError(f"next_question_id 缺失或不存在: {sel.next_question_id}")
             if not self.is_schedulable(next_qid, for_intent=next_intent):
                 raise InvalidSelectionError(f"目标问题不可调度: {next_qid}")
@@ -648,7 +790,18 @@ class SQLiteStateStore:
             self._apply_ops(conn, cycle_id, ops)
 
     def _apply_ops(self, conn, cycle_id: str, ops: List[Dict[str, Any]]) -> None:
-        route = self._q1("SELECT route FROM cycle WHERE id=?", (_cnum(cycle_id),))[0]
+        ci = _cnum(cycle_id)
+        cycle_row = conn.execute(
+            "SELECT route,goal_id,goal_ver,status FROM cycle WHERE id=?", (ci,)).fetchone()
+        if cycle_row is None:
+            raise RuntimeError(f"cycle 不存在: {cycle_id}")
+        route, goal_id, cycle_goal_ver, cycle_status = cycle_row
+        current = conn.execute(
+            "SELECT MAX(version) FROM goal WHERE id=?", (goal_id,)).fetchone()
+        if (goal_id != 1 or current is None or current[0] != cycle_goal_ver
+                or cycle_status in ("done", "failed", "aborted")):
+            raise RuntimeError(
+                f"cycle {cycle_id} 不是 active current goal lineage，拒绝应用 tree_ops")
         if route == "goal_amend":
             amend_indexes = [i for i, op in enumerate(ops)
                              if isinstance(op, dict) and op.get("op") == "amend_goal"]
@@ -662,13 +815,14 @@ class SQLiteStateStore:
                     "同 cycle 已升版后不得再次 amend")
         local = self._local_maps.setdefault(cycle_id, {})
         guard = self.policy["tree_guard"]
-        gver = self._goal_ver()
+        gver = int(cycle_goal_ver)
         for op in ops:
             kind = op.get("op")
             if kind == "create_root":
                 if route != "bootstrap":
                     raise ValueError("create_root 仅限 bootstrap 轮（§4.2.4）")
-                qid = self._insert_question(conn, op["text"], None, "agent", gver)
+                qid = self._insert_question(
+                    conn, op["text"], None, "agent", gver, born_cycle=ci)
                 if op.get("local_key"):
                     local[op["local_key"]] = qid
                 conn.execute("INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
@@ -680,7 +834,7 @@ class SQLiteStateStore:
             elif kind == "mark_answer_applicability":
                 self._mark_applicability(conn, cycle_id, op, local, gver)
             elif kind == "propose_prune":
-                self._propose_prune(conn, cycle_id, op)
+                self._propose_prune(conn, cycle_id, op, gver)
             elif kind == "amend_goal":
                 self._amend_goal(conn, cycle_id, route, op)
                 gver = self._goal_ver()   # 版本已升，后续 op 用新版
@@ -690,11 +844,12 @@ class SQLiteStateStore:
                 raise ValueError(f"op 不在封闭词表: {kind}")
 
     def _insert_question(self, conn, text: str, parent_qid: Optional[str], source: str, gver: int,
-                         status: str = "open") -> str:
+                         status: str = "open", born_cycle: Optional[int] = None) -> str:
         cur = conn.execute(
-            "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source) "
-            "VALUES (?,1,?,?,?,?,?)",
-            (_qnum(parent_qid) if parent_qid else None, gver, gver, text, status, source))
+            "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source,born_cycle) "
+            "VALUES (?,1,?,?,?,?,?,?)",
+            (_qnum(parent_qid) if parent_qid else None, gver, gver, text, status, source,
+             born_cycle))
         return _qid(cur.lastrowid)
 
     def _open_count(self, conn) -> int:
@@ -715,11 +870,15 @@ class SQLiteStateStore:
         if route != "decompose":
             raise ValueError("add_children 仅限 decompose 轮（§4.2.4）")
         parent_qid = op["parent_question_id"]
-        pr = conn.execute("SELECT status FROM question WHERE id=?", (_qnum(parent_qid),)).fetchone()
+        pr = conn.execute(
+            "SELECT status,goal_id,goal_ver,active_cycle FROM question WHERE id=?",
+            (_qnum(parent_qid),)).fetchone()
         if pr is None:
             raise ValueError(f"decompose 父问题不存在: {parent_qid}")
         if pr[0] != "active":
             raise ValueError(f"decompose 父问题须为 active（当前 {pr[0]}；终态/未选中不可分解）")
+        if tuple(pr[1:3]) != (1, gver) or pr[3] != _cnum(cycle_id):
+            raise ValueError("decompose 父问题不属于本 cycle 的 current goal lineage")
         pqi = _qnum(parent_qid)
         if self._depth_of(conn, pqi) + 1 > guard["max_decompose_depth"]:
             raise ValueError("超出 max_decompose_depth")
@@ -734,13 +893,19 @@ class SQLiteStateStore:
             raise ValueError("超出 max_open_questions")
         child_qids = []
         for ch in children:                      # 同事务：写子问题 + 逐子 dep（父依赖每个子）
-            cq = self._insert_question(conn, ch["text"], parent_qid, "decompose", gver)
+            cq = self._insert_question(
+                conn, ch["text"], parent_qid, "decompose", gver,
+                born_cycle=_cnum(cycle_id))
             local[ch["local_key"]] = cq
             child_qids.append(cq)
             conn.execute("INSERT INTO question_dep(question_id,dep_type,depends_on_question_id,status,created_cycle) "
                          "VALUES (?,'question',?,'pending',?)", (pqi, _qnum(cq), _cnum(cycle_id)))
         conn.execute("UPDATE question SET decompose_count=decompose_count+1, status='open' WHERE id=?", (pqi,))
-        conn.execute("UPDATE cycle SET active_question_id=NULL WHERE active_question_id=?", (pqi,))  # 父已释放
+        released = conn.execute(
+            "UPDATE cycle SET active_question_id=NULL WHERE id=? AND active_question_id=?",
+            (_cnum(cycle_id), pqi)).rowcount
+        if released != 1:
+            raise RuntimeError(f"decompose 释放父问题 {parent_qid} 的 active 租约失败")
         conn.execute("INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) VALUES (?,?,'agent','decompose',?)",
                      (_cnum(cycle_id), _qnum(parent_qid), json.dumps({"parent": parent_qid, "children": child_qids})))
 
@@ -760,19 +925,39 @@ class SQLiteStateStore:
                 raise ValueError("goal_retarget 仅限 goal_amend 轮（§4.2.4）")
             if parent is not None:
                 raise ValueError("goal_retarget 必须 parent=null")
-        elif parent is None or conn.execute("SELECT 1 FROM question WHERE id=?", (_qnum(parent),)).fetchone() is None:
+        elif parent is None:
             raise ValueError(f"spawn parent 不存在: {parent}")
-        qid = self._insert_question(conn, op["text"], parent, _SPAWN_SOURCE[op["kind"]], gver)
+        elif op["kind"] == "revalidate":
+            # 回看题允许挂在旧 goal_ver 的 closed 问题下；closed 结论本身版本冻结，
+            # 新版 applicability 正是通过这条跨版本边完成复核。answer↔parent 的
+            # 精确绑定随后由 mark_answer_applicability 在同事务内校验。
+            if conn.execute(
+                    "SELECT 1 FROM question q WHERE q.id=? AND q.goal_id=1 "
+                    "AND q.status IN ('answered','refuted') AND EXISTS ("
+                    "SELECT 1 FROM answer a WHERE a.question_id=q.id "
+                    "AND a.goal_id=q.goal_id AND a.goal_ver=q.goal_ver AND a.verdict=q.status)",
+                    (_qnum(parent),)).fetchone() is None:
+                raise ValueError(f"revalidate parent 须为带 answer 的 answered/refuted 问题: {parent}")
+        elif conn.execute(
+                "SELECT 1 FROM question WHERE id=? AND goal_id=1 AND goal_ver=?",
+                (_qnum(parent), gver)).fetchone() is None:
+            raise ValueError(f"spawn parent 不存在: {parent}")
+        qid = self._insert_question(
+            conn, op["text"], parent, _SPAWN_SOURCE[op["kind"]], gver,
+            born_cycle=_cnum(cycle_id))
         if op.get("local_key"):
             local[op["local_key"]] = qid
         conn.execute("INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
                      "VALUES (?,?,'agent','spawn_question',?)", (_cnum(cycle_id), _qnum(qid), json.dumps({"qid": qid, "kind": op["kind"]})))
 
-    def _propose_prune(self, conn, cycle_id, op) -> None:
+    def _propose_prune(self, conn, cycle_id, op, gver: int) -> None:
         qid = op["question_id"]
-        r = conn.execute("SELECT status FROM question WHERE id=?", (_qnum(qid),)).fetchone()
+        r = conn.execute(
+            "SELECT status,goal_id,goal_ver FROM question WHERE id=?", (_qnum(qid),)).fetchone()
         if r is None:
             raise ValueError(f"propose_prune 目标不存在: {qid}")
+        if tuple(r[1:]) != (1, gver):
+            raise ValueError(f"propose_prune 目标不属于本 cycle 的 current lineage: {qid}")
         if r[0] not in ("open", "inconclusive"):
             raise ValueError(f"仅 open/inconclusive 可剪枝: {qid}({r[0]})")
         # decision(prune_branch) 先行（DB 触发器 trg_q_deadend 要求 dead_end 关闭须有此 decision），再置 dead_end
@@ -856,6 +1041,7 @@ class SQLiteStateStore:
             "UPDATE question SET goal_ver=?,score=NULL,est_cost=NULL "
             "WHERE goal_id=1 AND status IN ('open','inconclusive')", (newv,))
         conn.execute("UPDATE cycle SET goal_ver=? WHERE id=?", (newv, ci))
+        self._supersede_pending_imports(conn, cycle_id=ci, old_goal_ver=cur, new_goal_ver=newv)
         canonical_effect = {
             "new_goal_text": effect["new_goal_text"],
             "predicate_json": expected_predicate,
@@ -876,6 +1062,53 @@ class SQLiteStateStore:
                     "SELECT count(*) FROM question WHERE goal_id=1 AND goal_ver=? "
                     "AND status IN ('open','inconclusive')", (newv,)).fetchone()[0],
             }, ensure_ascii=False, sort_keys=True)))
+
+    @staticmethod
+    def _supersede_pending_imports(conn, *, cycle_id: int, old_goal_ver: int,
+                                   new_goal_ver: int) -> None:
+        """Append a superseded outcome for old-goal deferred imports that never started."""
+        rows = conn.execute(
+            "SELECT s.id,s.question_id,s.candidate_id,s.action_cycle,s.candidate_set_hash,"
+            "s.selection_key,s.policy_hash,s.license_decision_snapshot_hash,s.license_review_id,s.baseline_id "
+            "FROM external_import s JOIN cycle ac ON ac.id=s.action_cycle "
+            "JOIN baseline b ON b.id=s.baseline_id "
+            "WHERE s.action='selected_for_materialization' AND ac.goal_id=1 AND ac.goal_ver=? "
+            "AND b.status='planned' AND NOT EXISTS ("
+            "SELECT 1 FROM build_target bt WHERE bt.baseline_id=s.baseline_id) AND NOT EXISTS ("
+            "SELECT 1 FROM external_import x WHERE x.question_id=s.question_id "
+            "AND x.candidate_id=s.candidate_id AND x.action_cycle=s.action_cycle "
+            "AND x.candidate_set_hash=s.candidate_set_hash AND x.selection_key=s.selection_key "
+            "AND x.policy_hash=s.policy_hash "
+            "AND x.action IN ('imported','materialize_failed','superseded')) ORDER BY s.id",
+            (old_goal_ver,)).fetchall()
+        for (source_id, question_id, candidate_id, action_cycle, candidate_set_hash,
+             selection_key, policy_hash, license_hash, license_review_id, baseline_id) in rows:
+            reason = {
+                "reason": "goal_amend_superseded_before_materialization",
+                "source_external_import_id": source_id,
+                "superseded_cycle": cycle_id,
+                "source_goal_ver": old_goal_ver,
+                "target_goal_ver": new_goal_ver,
+            }
+            conn.execute(
+                "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+                "VALUES (?,?,'orchestrator','import_superseded_by_goal_amend',?)",
+                (cycle_id, question_id,
+                 json.dumps(reason, ensure_ascii=False, sort_keys=True)))
+            conn.execute(
+                "INSERT INTO external_import(question_id,candidate_id,action,action_cycle,"
+                "candidate_set_hash,selection_key,policy_hash,license_decision_snapshot_hash,"
+                "license_review_id,reason_json) VALUES (?,?,'superseded',?,?,?,?,?,?,?)",
+                (question_id, candidate_id, action_cycle, candidate_set_hash, selection_key,
+                 policy_hash, license_hash, license_review_id,
+                 json.dumps(reason, ensure_ascii=False, sort_keys=True)))
+            conn.execute(
+                "UPDATE baseline SET status='abandoned' WHERE id=? AND status='planned'",
+                (baseline_id,))
+            conn.execute(
+                "UPDATE question_dep SET status='blocked' WHERE question_id=? "
+                "AND dep_type='baseline' AND depends_on_baseline_id=? AND status='pending'",
+                (question_id, baseline_id))
 
     def _seed_applicability(self, conn, cycle_id, route, op) -> None:
         if route != "goal_amend":
@@ -928,12 +1161,14 @@ class SQLiteStateStore:
         spawned = op.get("spawned_question_ref")
         spawned_qid = local.get(spawned, spawned) if spawned else None
         if status in ("needs_revalidation", "contradicted"):
-            qr = conn.execute("SELECT source, parent_id FROM question WHERE id=?",
+            qr = conn.execute("SELECT source,parent_id,goal_id,goal_ver,status FROM question WHERE id=?",
                               (_qnum(spawned_qid),)).fetchone() if spawned_qid else None
             if qr is None or qr[0] != "revalidate":
                 raise ValueError("needs_revalidation/contradicted 须指向 source=revalidate 的回看题")
             if qr[1] != ar[0]:   # 回看题 parent 须为被回看 answer 所属问题
                 raise ValueError("回看题 parent 须为被回看 answer 所属问题（§4.2.4）")
+            if tuple(qr[2:4]) != (1, gver) or qr[4] in ("answered", "refuted", "dead_end"):
+                raise ValueError("回看题须属于本 cycle 的 current goal 且仍非终态")
         conn.execute(
             "INSERT INTO answer_applicability(answer_id,goal_id,goal_ver,audit_cycle,status,rationale_md,spawned_question_id) "
             "VALUES (?,1,?,?,?,?,?) "

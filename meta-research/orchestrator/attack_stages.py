@@ -45,10 +45,11 @@ from . import harness as H
 from . import manifest as MF
 from . import obs_parser as OP
 from . import subject_manifest as SM
+from .budgeting import compute_budget
 from .gate_exec import ExecGate
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
-from .ids import cnum as _cnum, parse_positive_sqlite_int
+from .ids import cnum as _cnum, decode as _decode_id, qnum as _qnum, parse_positive_sqlite_int
 from .interfaces import InvalidSelectionError, Selection
 from .phase_commit import check_or_record
 from .process_supervisor import ExecutionSupervisor
@@ -212,6 +213,7 @@ class AttackStages:
     def advance_stage(self, cyc) -> str:
         """按 cycle.status 游标推进一格；返回下一 stage 或 'done'。"""
         self.owner_guard()
+        self.state.assert_current_cycle(cyc.cycle_id)
         if cyc.status == "created":
             self._idea_stage(cyc)
             return "plan"
@@ -295,9 +297,9 @@ class AttackStages:
                 raise _PlanReject("plan 含 import_defer——外部导入延迟决定 CP8.6 接线，本轮拒收；defer="
                                   + json.dumps(plan["import_defer"], ensure_ascii=False, sort_keys=True))
             targets = sorted(plan["targets"], key=lambda x: x["seq"])   # schema 保证 targets/seq 在场
-            for t in targets:                   # eval/import target kind = 后续检查点（graceful 拒、不楔死）
-                if t["target_kind"] not in ("build", "exec"):
-                    raise _PlanReject(f"暂只支持 build/exec 目标（eval/import 后续接线）：{t['target_kind']}")
+            for t in targets:
+                if t["target_kind"] not in ("build", "exec", "eval"):
+                    raise _PlanReject(f"不支持的 plan target kind: {t['target_kind']}")
             if not targets:                     # 无 target（复用/聚合/idea 失败）：合法终态、零 target（非拒）
                 self._commit_plan_terminal(cyc, plan, built=[], reject=None)
                 return
@@ -353,6 +355,22 @@ class AttackStages:
         全部前置判失败一律 → _PlanReject（业务拒，不 raise 死循环）：I1 scope 冲突 / 复用协议缺 metric 绑定 /
         target_key·seq·metric_id 重复 / required 悬挂引用 / canonical_key 冲突（codex BLOCKER×3）。"""
         d = self.state.daemon
+        seqs = [t["seq"] for t in targets]
+        if seqs != list(range(1, len(targets) + 1)):
+            raise _PlanReject(f"targets.seq 须为从 1 起连续依赖序，实收 {seqs}")
+        estimates = []
+        for target in targets:
+            estimate = target.get("budget_estimate")
+            if (isinstance(estimate, bool) or not isinstance(estimate, (int, float))
+                    or not math.isfinite(float(estimate)) or float(estimate) < 0):
+                raise _PlanReject(
+                    f"target {target.get('target_key')!r} budget_estimate 须为有限非负数")
+            estimates.append(float(estimate))
+        estimate_total = math.fsum(estimates)
+        cycle_budget = compute_budget(d.conn, self.policy["budget"])
+        if estimate_total > cycle_budget:
+            raise _PlanReject(
+                f"targets budget_estimate 总和 {estimate_total} 超出本轮 B(t)={cycle_budget}")
         # target 平面唯一性（codex BLOCKER：target_key 重复 → claims dict 覆盖、build_target 错绑；seq 重复 →
         # 终局事务撞 UNIQUE(cycle_id,seq) IntegrityError 楔死）——派生期拦下转业务拒
         tkeys = [t["target_key"] for t in targets]
@@ -416,6 +434,7 @@ class AttackStages:
         # 占坑身份前置判（按 kind）：build 占 canonical_key（唯一 + 未被他轮占）；exec 占既有 legal baseline
         # 下的新 variant_key（baseline_ref 须解析到 legal baseline；variant_key 未占；config 非空）。
         seen_ck, seen_bv = set(), set()
+        resolved_eval: Dict[str, Dict[str, Any]] = {}
         for t in targets:
             tk = t["target_key"]
             claim = t.get("claim", {})
@@ -427,7 +446,7 @@ class AttackStages:
                 occ = d.query_one("SELECT born_cycle, slug FROM baseline WHERE canonical_key=?", (ck,))
                 if occ is not None and not (occ[0] == ci and occ[1] == slug):
                     raise _PlanReject(f"canonical_key 被他轮占（I5）: {ck!r}")   # 派生期拦下→claim 段不半途留孤儿
-            else:   # exec
+            elif t["target_kind"] == "exec":
                 bref, vkey = claim["baseline_ref"], claim["variant_key"]
                 brow = d.query_one("SELECT id, status FROM baseline WHERE canonical_key=?", (bref,))
                 if brow is None or brow[1] != "legal":
@@ -445,19 +464,88 @@ class AttackStages:
                     # 「本轮自占」严核（codex 第2轮 BLOCKER）：pending + plan_ref NULL + config 一致——防身份
                     # 漂移（重放 plan 若换 config/seq 会把新 plan_ref 写到旧 variant 上，破坏确定性）。
                     raise _PlanReject(f"exec variant_key {vkey!r} 已占（baseline {bref}）")
+            else:   # eval：只消费既有 legal target，不占新池身份。
+                action = t["eval_action"]
+                if action == "append_attempt":
+                    try:
+                        eid = _decode_id(t["evaluation_id"], "e")
+                    except ValueError as error:
+                        raise _PlanReject(
+                            f"eval target {tk} evaluation_id 非 e<正整数>: {t.get('evaluation_id')!r}") from error
+                    erow = d.query_one(
+                        "SELECT e.variant_id,e.protocol_id,e.protocol_ver,e.eval_key,e.status,"
+                        "v.baseline_id,v.status FROM evaluation e JOIN variant v ON v.id=e.variant_id "
+                        "WHERE e.id=?", (eid,))
+                    if erow is None or erow[4] == "abandoned" or erow[6] != "legal":
+                        raise _PlanReject(
+                            f"eval append 的 evaluation e{eid} 缺失/abandoned 或 variant 非 legal")
+                    if (erow[1], erow[2]) != (pid, pver):
+                        raise _PlanReject(
+                            f"eval append e{eid} 协议 p{erow[1]}@{erow[2]} 与 plan p{pid}@{pver} 不一致")
+                    vid, bid, eval_key = erow[0], erow[5], erow[3]
+                    target_set_hash = d.query_one(
+                        "SELECT target_set_hash FROM evaluation WHERE id=?", (eid,))[0]
+                else:
+                    bref, vkey = claim["baseline_ref"], claim["variant_key"]
+                    vrow = d.query_one(
+                        "SELECT v.id,v.baseline_id,v.status FROM variant v JOIN baseline b ON b.id=v.baseline_id "
+                        "WHERE b.canonical_key=? AND v.variant_key=? AND b.status='legal'",
+                        (bref, vkey))
+                    if vrow is None or vrow[2] != "legal":
+                        raise _PlanReject(
+                            f"eval create 的 {bref}/{vkey} 未解析到 legal variant")
+                    vid, bid, eid, eval_key = vrow[0], vrow[1], None, t["eval_key"]
+                    existing_eval = d.query_one(
+                        "SELECT id FROM evaluation WHERE variant_id=? AND protocol_id=? AND protocol_ver=?",
+                        (vid, pid, pver))
+                    if existing_eval is not None:
+                        raise _PlanReject(
+                            f"eval create 的格子 v{vid}/p{pid}@{pver} 已有 e{existing_eval[0]}——应走 append_attempt")
+                    checkpoints = d.query(
+                        "SELECT id,content_hash FROM checkpoint WHERE variant_id=? ORDER BY id", (vid,))
+                    if len(checkpoints) != 1:
+                        raise _PlanReject(
+                            f"eval create 当前实现要求 legal variant 恰一可评 checkpoint，v{vid} 实收 {len(checkpoints)}")
+                    target_set_hash = _canon_hash({
+                        "variant_id": vid,
+                        "checkpoints": [{"id": row[0], "content_hash": row[1]} for row in checkpoints],
+                        "protocol": [pid, pver],
+                    })
+                resolved_eval[tk] = {
+                    "baseline_id": bid, "variant_id": vid, "evaluation_id": eid,
+                    "eval_key": eval_key, "target_set_hash": target_set_hash,
+                }
         dts = []
         for t in targets:
             claim = t.get("claim", {})
             tk, kind = t["target_key"], t["target_kind"]
-            id_anchor = claim.get("canonical_key") if kind == "build" else \
-                f"{claim.get('baseline_ref')}/{claim.get('variant_key')}"
+            if kind == "build":
+                id_anchor = claim.get("canonical_key")
+                eval_key = tk
+                target_set_hash = _canon_hash({
+                    "factory_of": {"cycle": ci, "target_key": tk, "id_anchor": id_anchor}})
+            elif kind == "exec":
+                id_anchor = f"{claim.get('baseline_ref')}/{claim.get('variant_key')}"
+                eval_key = tk
+                target_set_hash = _canon_hash({
+                    "factory_of": {"cycle": ci, "target_key": tk, "id_anchor": id_anchor}})
+            else:
+                resolved = resolved_eval[tk]
+                id_anchor = f"v{resolved['variant_id']}"
+                eval_key = resolved["eval_key"]
+                target_set_hash = resolved["target_set_hash"]
             slice_ = dict(t)                    # 冻结 target 原样 + 绑定四件（plan_ref 权威；bundle manifest 交叉核锚）
-            slice_.update({"protocol_id": pid, "protocol_ver": pver, "eval_key": tk,
-                           "target_set_hash": _canon_hash({"factory_of": {"cycle": ci, "target_key": tk,
-                                                                          "id_anchor": id_anchor}})})
+            slice_.update({"protocol_id": pid, "protocol_ver": pver, "eval_key": eval_key,
+                           "target_set_hash": target_set_hash})
+            if kind == "eval":
+                slice_.update({
+                    "resolved_baseline_id": resolved_eval[tk]["baseline_id"],
+                    "resolved_variant_id": resolved_eval[tk]["variant_id"],
+                    "resolved_evaluation_id": resolved_eval[tk]["evaluation_id"],
+                })
             dts.append({"target_key": tk, "kind": kind, "seq": t["seq"], "slice": slice_,
                         "required": req_by_tk.get(tk, []), "identity_md": _synth_identity_md(t),
-                        "claim": claim})
+                        "claim": claim, **(resolved_eval.get(tk) or {})})
         return {"protocol": {"id": pid, "version": pver, "name": pname, "scope_json": scope_json,
                              "exists": proto_exists, "defs": defs,
                              "metrics": [(dd["id"], dd["version"]) for dd in defs]},
@@ -510,7 +598,7 @@ class AttackStages:
                         fresh_bl.append(r["baseline_id"])
                         claims[tk] = {"kind": "build", "baseline_id": r["baseline_id"],
                                       "variant_id": r["variant_id"], "build_target_id": None}
-                else:   # exec：gate_claim_variant 自建 exec build_target
+                elif dt["kind"] == "exec":   # gate_claim_variant 自建 exec build_target
                     bid = d.query_one("SELECT id FROM baseline WHERE canonical_key=?", (claim["baseline_ref"],))[0]
                     vkey = claim["variant_key"]
                     # 本 cycle **未终局**自占（重放）：pending+plan_ref NULL 的 exec bt → 复用。claim 侧
@@ -530,6 +618,12 @@ class AttackStages:
                         fresh_bt.append(r["build_target_id"])
                         claims[tk] = {"kind": "exec", "baseline_id": bid, "variant_id": r["variant_id"],
                                       "build_target_id": r["build_target_id"]}
+                else:   # eval：只引用既有 legal variant/evaluation，不占池身份。
+                    claims[tk] = {
+                        "kind": "eval", "baseline_id": dt["baseline_id"],
+                        "variant_id": dt["variant_id"], "evaluation_id": dt["evaluation_id"],
+                        "build_target_id": None,
+                    }
         except GateReject:
             if fresh_bl or fresh_bt:                         # 回滚孤儿（DELETE planned 无引用者，释放键）
                 with d.transaction() as conn:
@@ -565,19 +659,37 @@ class AttackStages:
                              (ci, json.dumps({"reason": reject, "question_id": qi}, ensure_ascii=False)))
             for dt, claim_info in built:
                 slice_json = json.dumps(dt["slice"], ensure_ascii=False, sort_keys=True)
-                if claim_info["build_target_id"] is None:       # build：终局 INSERT build_target
+                if dt["kind"] == "build":                       # build：终局 INSERT build_target
                     bt = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,"
-                                      "baseline_id,variant_id,eval_key,plan_ref) VALUES (?,?,'build',?,'pending',?,?,?,?)",
-                                      (ci, qi, dt["seq"], claim_info["baseline_id"], claim_info["variant_id"],
-                                       dt["slice"]["eval_key"], slice_json)).lastrowid
-                else:                                        # exec：gate_claim_variant 已建 bt → 补 plan_ref/eval_key
+                                      "critical,budget_estimate,baseline_id,variant_id,eval_key,plan_ref) "
+                                      "VALUES (?,?,'build',?,'pending',?,?,?,?,?,?)",
+                                      (ci, qi, dt["seq"], int(dt["slice"]["critical"]),
+                                       float(dt["slice"]["budget_estimate"]), claim_info["baseline_id"],
+                                       claim_info["variant_id"], dt["slice"]["eval_key"], slice_json)).lastrowid
+                elif dt["kind"] == "exec":                    # gate_claim_variant 已建 bt → 补 plan_ref/eval_key
                     bt = claim_info["build_target_id"]
-                    conn.execute("UPDATE build_target SET eval_key=?, plan_ref=? WHERE id=?",
-                                 (dt["slice"]["eval_key"], slice_json, bt))
+                    conn.execute("UPDATE build_target SET critical=?,budget_estimate=?,eval_key=?,plan_ref=? WHERE id=?",
+                                 (int(dt["slice"]["critical"]), float(dt["slice"]["budget_estimate"]),
+                                  dt["slice"]["eval_key"], slice_json, bt))
+                else:                                          # eval：引用既有 legal variant/evaluation
+                    bt = conn.execute(
+                        "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,critical,"
+                        "budget_estimate,baseline_id,variant_id,evaluation_id,eval_action,attempt_purpose,"
+                        "evaluation_source,eval_key,plan_ref) "
+                        "VALUES (?,?,'eval',?,'pending',?,?,?,?,?,?,?,?,?,?)",
+                        (ci, qi, dt["seq"], int(dt["slice"]["critical"]),
+                         float(dt["slice"]["budget_estimate"]), claim_info["baseline_id"],
+                         claim_info["variant_id"], claim_info["evaluation_id"],
+                         dt["slice"]["eval_action"], dt["slice"]["attempt_purpose"],
+                         dt["slice"].get("evaluation_source"), dt["slice"]["eval_key"],
+                         slice_json)).lastrowid
                 for (mid, mver) in dt["required"]:
                     conn.execute("INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) "
                                  "VALUES (?,?,?)", (bt, mid, mver))
-            conn.execute("UPDATE cycle SET status='plan' WHERE id=?", (ci,))
+            kinds = [dt["kind"] for dt, _claim in built]
+            route = ("attack" if reject is not None or any(k in ("build", "exec") for k in kinds)
+                     else "eval_only" if kinds else "reuse_only")
+            conn.execute("UPDATE cycle SET status='plan',route=? WHERE id=?", (route, ci))
 
     # ---------------------------------------------------------------- bundle --
     def _bundle_stage(self, cyc) -> None:
@@ -601,9 +713,28 @@ class AttackStages:
                                              ensure_ascii=False)))
         rows = d.query("SELECT id FROM build_target WHERE cycle_id=? AND plan_ref IS NOT NULL ORDER BY seq", (ci,))
         for (bt_id,) in rows:
+            prior = d.query_one(
+                "SELECT id FROM build_target WHERE cycle_id=? AND seq<(SELECT seq FROM build_target WHERE id=?) "
+                "AND critical=1 AND status IN ('failed','engineering_blocked') ORDER BY seq LIMIT 1",
+                (ci, bt_id))
+            if prior is not None:
+                self._skip_after_critical_failure(cyc, prior[0])
+                break
             self._drive_target(cyc, bt_id)
+            status, critical = d.query_one(
+                "SELECT status,critical FROM build_target WHERE id=?", (bt_id,))
+            if status == "engineering_blocked" or (
+                    critical and status == "failed"):
+                self._skip_after_critical_failure(cyc, bt_id)
+                break
         with d.transaction() as conn:
             conn.execute("UPDATE cycle SET status='bundle' WHERE id=?", (ci,))
+
+    def _skip_after_critical_failure(self, cyc, failed_target_id: int) -> None:
+        """收敛 critical/engineering_blocked 早退；可在任意一个 skip 后崩溃并幂等续扫。"""
+        skipped = self.gate.gate_skip_remaining_targets(failed_target_id=failed_target_id)
+        for target_id in skipped:
+            self._ensure_target_pc(cyc, target_id)
 
     def _slice(self, bt_id: int) -> Dict[str, Any]:
         """resolved plan 切片（plan_ref）：冻结 target 原样 + 编排器派生绑定四件（protocol_id/protocol_ver/
@@ -675,8 +806,9 @@ class AttackStages:
         if self.schemas is not None:
             MF.validate_manifest(self.schemas, manifest)
         MF.cross_check(manifest, slice_)          # 防「manifest 自立目标/换协议/改配置」
-        if manifest["target_ref"]["target_kind"] not in ("build", "exec"):
-            raise MF.ManifestError(f"bundle 只驱动 build/exec 目标（eval 后续接线）：{manifest['target_ref']['target_kind']}")
+        if manifest["target_ref"]["target_kind"] not in ("build", "exec", "eval"):
+            raise MF.ManifestError(
+                f"bundle target kind 不支持：{manifest['target_ref']['target_kind']}")
 
     def _drive_target(self, cyc, bt_id: int) -> None:
         """单目标推进（可重入）：按当前状态从断点续。执行命令由 manifest 承载（步⑧）。
@@ -707,18 +839,50 @@ class AttackStages:
             cyc, bt_id, slice_, src_dir)
         if st() == "pending":
             g.gate_start_build_target(build_target_id=bt_id)
+        if slice_["target_kind"] == "eval":
+            if st() == "running":
+                self._run_eval_target(
+                    cyc, bt_id, slice_, manifest, staging, src_dir,
+                    allowed_asset_refs, asset_identities)
+            self._ensure_target_pc(cyc, bt_id)
+            return
         if st() == "building":                    # 真 smoke（manifest.commands.smoke 子进程）→ 过了才进 smoke 态
-            self.owner_guard()                     # external spawn 的最后一道 owner fence
-            sm = MF.run_manifest_command(manifest, "smoke", staging_dir=str(staging / "smoke"),
-                                         log_name=f"smoke-{self._next_serial(staging, 'smoke')}.log",
-                                         src_dir=src_dir, work_root=self.work, policy=self.policy,
-                                         allowed_asset_refs=allowed_asset_refs,
-                                         expected_asset_identities=asset_identities,
-                                         execution_supervisor=self.execution_supervisor,
-                                         execution_context={
-                                             "cycle_id": cyc.cycle_id,
-                                             "build_target_id": bt_id,
-                                             "phase": "smoke"})
+            smoke_dir = staging / "smoke"
+            existing_final = H.latest_smoke_log(smoke_dir)
+            partials = sorted(smoke_dir.glob("smoke-*.log.partial")) if smoke_dir.exists() else []
+            if len(partials) > 1:
+                raise RuntimeError(f"target {bt_id} 有多个未发布 smoke partial")
+            smoke_name = (existing_final.name if existing_final is not None else
+                          (partials[0].name[:-len(".partial")] if partials else "smoke-1.log"))
+            smoke_context = {
+                "cycle_id": cyc.cycle_id, "build_target_id": bt_id,
+                "phase": "smoke", "reconcile_protocol": "execution-owner-v1",
+                "db_owner_kind": "build_target", "db_owner_id": bt_id,
+            }
+            if existing_final is not None:
+                exit_file = existing_final.with_name(existing_final.name + ".exit")
+                if not exit_file.exists():
+                    raise RuntimeError(
+                        f"staging 损毁：{existing_final} 在而 exit 侧车缺——须人工核")
+                smoke_bytes = existing_final.read_bytes()
+                sm = {"exit_code": int(exit_file.read_text()),
+                      "log_path": str(existing_final),
+                      "log_sha256": hashlib.sha256(smoke_bytes).hexdigest(),
+                      "log_bytes": len(smoke_bytes)}
+            else:
+                sm = H.recover_staged_result(
+                    staging_dir=str(smoke_dir), log_name=smoke_name,
+                    execution_supervisor=self.execution_supervisor,
+                    execution_kind="manifest-smoke", execution_context=smoke_context)
+                if sm is None:
+                    self.owner_guard()             # external spawn 的最后一道 owner fence
+                    sm = MF.run_manifest_command(
+                        manifest, "smoke", staging_dir=str(smoke_dir), log_name=smoke_name,
+                        src_dir=src_dir, work_root=self.work, policy=self.policy,
+                        allowed_asset_refs=allowed_asset_refs,
+                        expected_asset_identities=asset_identities,
+                        execution_supervisor=self.execution_supervisor,
+                        execution_context=smoke_context)
             if sm["exit_code"] != 0:              # smoke 失败 → target 失败连坐（codex SHOULD：exit code 不得忽略）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._ensure_target_pc(cyc, bt_id)   # 终态早退**也**落 pc（codex 第2轮 BLOCKER：漏落致杀/不杀分裂）
@@ -740,6 +904,197 @@ class AttackStages:
                                    allowed_asset_refs, asset_identities)
         self._ensure_target_pc(cyc, bt_id)
 
+    def _run_eval_target(self, cyc, bt_id: int, slice_, manifest, staging: Path, src_dir: Path,
+                         allowed_asset_refs, asset_identities) -> None:
+        """Execute a plan ``target_kind=eval`` against one existing legal checkpoint.
+
+        The target owns no training run and never mutates pool identity.  It
+        creates/appends a pre-call evaluation attempt, executes only the eval
+        command, result-reviews the measurement package, then atomically seals
+        attempt+metrics.  Recovery uses the same attempt-owned guardian receipt
+        contract as factory evaluation.
+        """
+        g, d, ci = self.gate, self.state.daemon, cyc.cycle_id
+        bt = d.query_one(
+            "SELECT variant_id,evaluation_id,eval_action,attempt_purpose FROM build_target WHERE id=?",
+            (bt_id,))
+        if bt is None or bt[0] is None or bt[2] not in ("create_evaluation", "append_attempt"):
+            raise RuntimeError(f"eval target {bt_id} 绑定损坏")
+        vid, bound_eid, eval_action, planned_purpose = bt
+        checkpoints = d.query(
+            "SELECT id,ckpt_key,path,content_hash FROM checkpoint WHERE variant_id=? ORDER BY id", (vid,))
+        if len(checkpoints) != 1:
+            raise RuntimeError(
+                f"eval target {bt_id} 的 v{vid} checkpoint 集从 plan 后漂移（实收 {len(checkpoints)}）")
+        checkpoint_id, checkpoint_key, checkpoint_path, checkpoint_hash = checkpoints[0]
+        if H.file_sha256(checkpoint_path) != checkpoint_hash:
+            raise RuntimeError(
+                f"eval target {bt_id} checkpoint ck{checkpoint_id} 内容与 DB hash 不一致")
+
+        if eval_action == "create_evaluation":
+            erow = d.query_one(
+                "SELECT id,status,canonical_attempt_id FROM evaluation WHERE build_target_id=?", (bt_id,))
+        else:
+            erow = d.query_one(
+                "SELECT id,status,canonical_attempt_id FROM evaluation WHERE id=?", (bound_eid,))
+            if erow is None:
+                raise RuntimeError(f"eval append target {bt_id} 指向不存在的 e{bound_eid}")
+        latest = (None if erow is None else d.query_one(
+            "SELECT id,status,attempt_no,purpose,failure_kind FROM evaluation_attempt "
+            "WHERE evaluation_id=? AND build_target_id=? ORDER BY attempt_no DESC LIMIT 1",
+            (erow[0], bt_id)))
+
+        if latest is not None and latest[1] == "failed":
+            target_failure = ("protocol_violation"
+                              if latest[4] in ("protocol_violation", "metric_missing",
+                                               "data_invalid", "artifact_invalid")
+                              else latest[4] or "runtime")
+            g.gate_finish_build_target(
+                build_target_id=bt_id, status="failed", failure_kind=target_failure)
+            return
+        if latest is not None and latest[1] == "success":
+            eid, aid, attempt_no, attempt_purpose = erow[0], latest[0], latest[2], latest[3]
+        elif latest is not None and latest[1] == "running":
+            eid, aid, attempt_no, attempt_purpose = erow[0], latest[0], latest[2], latest[3]
+        else:
+            if latest is not None and latest[1] != "aborted":
+                raise RuntimeError(
+                    f"eval target {bt_id} latest attempt 状态不可恢复: {latest[1]}")
+            if latest is not None:
+                attempt_purpose = "retry"
+                started = g.gate_start_attempt(
+                    cycle_id=ci, purpose="retry", build_target_id=bt_id,
+                    evaluation_id=erow[0], retry_of=latest[0],
+                    env_hash=manifest["env_hash"],
+                    watchdog_sec=min(
+                        float(manifest["commands"]["eval"].get(
+                            "timeout_s", self.policy["execution"]["default_timeout_s"])),
+                        float(self.policy["execution"]["max_timeout_s"])))
+            elif eval_action == "create_evaluation":
+                attempt_purpose = planned_purpose
+                if attempt_purpose == "retry":
+                    raise _BundleReject(
+                        "create_evaluation 首 attempt 不得声明 retry", failure_kind="protocol_violation")
+                started = g.gate_start_attempt(
+                    cycle_id=ci, purpose=attempt_purpose, build_target_id=bt_id,
+                    create={
+                        "variant_id": vid, "protocol_id": slice_["protocol_id"],
+                        "protocol_ver": slice_["protocol_ver"], "eval_key": slice_["eval_key"],
+                        "source": slice_["evaluation_source"],
+                        "target_set_hash": slice_["target_set_hash"],
+                    }, env_hash=manifest["env_hash"],
+                    watchdog_sec=min(
+                        float(manifest["commands"]["eval"].get(
+                            "timeout_s", self.policy["execution"]["default_timeout_s"])),
+                        float(self.policy["execution"]["max_timeout_s"])))
+            else:
+                attempt_purpose = planned_purpose
+                retry_of = None
+                if attempt_purpose == "retry":
+                    previous = d.query_one(
+                        "SELECT id,status FROM evaluation_attempt WHERE evaluation_id=? "
+                        "ORDER BY attempt_no DESC LIMIT 1", (erow[0],))
+                    if previous is None or previous[1] not in ("failed", "aborted"):
+                        raise _BundleReject(
+                            "plan retry target 无同 evaluation 的 failed/aborted 前序 attempt",
+                            failure_kind="protocol_violation")
+                    retry_of = previous[0]
+                started = g.gate_start_attempt(
+                    cycle_id=ci, purpose=attempt_purpose, build_target_id=bt_id,
+                    evaluation_id=erow[0], retry_of=retry_of,
+                    env_hash=manifest["env_hash"],
+                    watchdog_sec=min(
+                        float(manifest["commands"]["eval"].get(
+                            "timeout_s", self.policy["execution"]["default_timeout_s"])),
+                        float(self.policy["execution"]["max_timeout_s"])))
+            eid, aid, attempt_no = (
+                started["evaluation_id"], started["attempt_id"], started["attempt_no"])
+
+        eval_dir = staging / f"eval-a{aid}"
+        eval_final = eval_dir / "eval.log"
+        if latest is not None and latest[1] == "success":
+            ev = None
+        else:
+            eval_context = {
+                "cycle_id": ci, "build_target_id": bt_id, "phase": "eval",
+                "reconcile_protocol": "execution-owner-v1",
+                "db_owner_kind": "evaluation_attempt", "db_owner_id": aid,
+            }
+            if eval_final.exists():
+                exit_file = eval_final.with_name("eval.log.exit")
+                if not exit_file.exists():
+                    raise RuntimeError(f"staging 损毁：{eval_final} 在而 exit 侧车缺——须人工核")
+                eval_log = eval_final.read_bytes()
+                ev = {"exit_code": int(exit_file.read_text()), "log_path": str(eval_final),
+                      "log_sha256": hashlib.sha256(eval_log).hexdigest(),
+                      "log_bytes": len(eval_log)}
+            else:
+                ev = H.recover_staged_result(
+                    staging_dir=str(eval_dir), log_name="eval.log",
+                    execution_supervisor=self.execution_supervisor,
+                    execution_kind="manifest-eval", execution_context=eval_context)
+                if ev is None:
+                    self.owner_guard()
+                    ev = MF.run_manifest_command(
+                        manifest, "eval", staging_dir=str(eval_dir), log_name="eval.log",
+                        src_dir=src_dir, work_root=self.work, policy=self.policy,
+                        ckpt_path=Path(checkpoint_path),
+                        allowed_asset_refs=allowed_asset_refs,
+                        expected_asset_identities=asset_identities,
+                        execution_supervisor=self.execution_supervisor,
+                        execution_context=eval_context)
+                eval_log = Path(ev["log_path"]).read_bytes()
+
+            def finish_attempt_failure(failure_kind: str, target_failure: str) -> None:
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind=failure_kind,
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                if d.query_one("SELECT status FROM evaluation WHERE id=?", (eid,))[0] != "success":
+                    g.gate_finish_evaluation(evaluation_id=eid)
+                g.gate_finish_build_target(
+                    build_target_id=bt_id, status="failed", failure_kind=target_failure)
+
+            if ev["exit_code"] != 0:
+                finish_attempt_failure("runtime", "runtime")
+                return
+            try:
+                metrics = self._metrics_from_eval_log(
+                    eval_log.decode("utf-8", errors="replace"))
+            except _BundleReject as error:
+                finish_attempt_failure(error.failure_kind, error.failure_kind)
+                return
+            result_subject = SM.subject_hash(SM.result_review_manifest(
+                metrics_artifact_hash=_canon_hash(metrics),
+                checkpoint_hashes={f"ck{checkpoint_id}:{checkpoint_key}": checkpoint_hash},
+                run_log_hashes={ev["log_path"]: ev["log_sha256"]},
+                parser_obs_hash=_canon_hash(OP.parse_log(
+                    eval_log.decode("utf-8", errors="replace"), self.obs_policy))))
+            self._judge_once(ci, bt_id, "bundle_result_review", result_subject)
+            if not g.review_passed(
+                    build_target_id=bt_id, review_kind="bundle_result_review",
+                    current_subject_hash=result_subject):
+                finish_attempt_failure("protocol_violation", "review_failed")
+                return
+            try:
+                g.gate_register_evaluation(
+                    cycle_id=ci, build_target_id=bt_id, purpose=attempt_purpose,
+                    current_subject_hash=result_subject, metric_results=metrics,
+                    attempt_id=aid, artifact_ref=f"sha256:{ev['log_sha256']}",
+                    transcript_ref=ev.get("process_receipt_path"))
+            except GateReject as error:
+                finish_attempt_failure("protocol_violation", "protocol_violation")
+                raise _BundleReject(
+                    f"eval target 测量注册被拒: {error}",
+                    failure_kind="protocol_violation") from error
+
+        self._register_and_ingest_log(
+            ci, eval_final, log_kind="eval", evaluation_attempt_id=aid)
+        if not OP.suspect_attempt_has_current_obs(d.conn, aid, self.obs_policy):
+            raise RuntimeError(
+                f"eval target {bt_id} attempt {aid} 无当前口径 parser 观测")
+        g.gate_finish_build_target(build_target_id=bt_id, status="complete")
+
     def _run_and_register(self, cyc, bt_id: int, slice_, manifest, ledger, staging: Path, src_dir: Path,
                           allowed_asset_refs, asset_identities) -> None:
         """phase (i) 执行事实 + phase (ii) 注册段（结构可恢复的短事务序列）。命令由 manifest 驱动（步⑧）。
@@ -749,46 +1104,160 @@ class AttackStages:
         vid = d.query_one("SELECT variant_id FROM build_target WHERE id=?", (bt_id,))[0]
         bid = d.query_one("SELECT baseline_id FROM build_target WHERE id=?", (bt_id,))[0]
         env_hash = manifest["env_hash"]
-        # —— (i) 训练 run（结构续：残留 running run 先 abort；成功 run 直接复用）——
-        run_row = d.query_one("SELECT id,status FROM run WHERE build_target_id=? ORDER BY id DESC", (bt_id,))
-        if run_row and run_row[1] == "running":   # 崩溃残留：终结后重跑（run append-only，不复用半途 run）
-            g.gate_finish_run(run_id=run_row[0], status="failed", failure_kind="aborted")
-            run_row = None
+        # —— (i) 训练 run。DB intent 先于进程；drained exit 回执可补 harness 本地发布，绝不盲目重训。——
+        run_row = d.query_one(
+            "SELECT id,status,failure_kind FROM run WHERE build_target_id=? ORDER BY id DESC", (bt_id,))
+        rid: Optional[int] = None
+        train_result: Optional[Dict[str, Any]] = None
         if run_row and run_row[1] == "success":
             rid = run_row[0]
-        else:
+        elif run_row and run_row[1] == "failed":
+            if run_row[2] != "aborted":
+                # startup reconciler 已把 timeout/nonzero 等确证失败收口；这里只补 target，
+                # 不把一次耐久失败偷偷重跑。
+                g.gate_finish_build_target(
+                    build_target_id=bt_id, status="failed",
+                    failure_kind=run_row[2] or "runtime")
+                return
+            # owner_lost / 调用前崩溃是显式 aborted，可追加新 run 重试。
+        elif run_row and run_row[1] == "running":
+            rid = run_row[0]
+            train_dir = staging / f"run{rid}"
+            train_final = train_dir / "train.log"
+            train_context = {
+                "cycle_id": ci, "build_target_id": bt_id,
+                "run_id": rid, "phase": "train",
+                "reconcile_protocol": "execution-owner-v1",
+                "db_owner_kind": "run", "db_owner_id": rid,
+            }
+            if train_final.exists():
+                exit_file = train_final.with_name("train.log.exit")
+                if not exit_file.exists():
+                    raise RuntimeError(
+                        f"staging 损毁：{train_final} 在而 exit 侧车缺——须人工核")
+                train_bytes = train_final.read_bytes()
+                train_result = {
+                    "exit_code": int(exit_file.read_text()), "log_path": str(train_final),
+                    "log_sha256": hashlib.sha256(train_bytes).hexdigest(),
+                    "log_bytes": len(train_bytes),
+                }
+            else:
+                train_result = H.recover_staged_result(
+                    staging_dir=str(train_dir), log_name="train.log",
+                    execution_supervisor=self.execution_supervisor,
+                    execution_kind="manifest-train", execution_context=train_context)
+            if train_result is None:
+                # 没有 receipt/partial = gate_start_run 后、外部调用前死亡；确证未启动，
+                # 冻结旧 intent 为 aborted 后用新 run id 重试。
+                g.gate_finish_run(run_id=rid, status="failed", failure_kind="aborted")
+                rid = None
+
+        if rid is None:
             rid = g.gate_start_run(build_target_id=bt_id, cycle_id=ci, variant_id=vid,
                                    kind=slice_["target_kind"],   # exec 目标→run.kind='exec'（trg_run_target_consistent）
                                    env_hash=env_hash)
+            train_context = {
+                "cycle_id": ci, "build_target_id": bt_id,
+                "run_id": rid, "phase": "train",
+                "reconcile_protocol": "execution-owner-v1",
+                "db_owner_kind": "run", "db_owner_id": rid,
+            }
             self.owner_guard()
-            r = MF.run_manifest_command(manifest, "train", staging_dir=str(staging / f"run{rid}"),
-                                        log_name="train.log", src_dir=src_dir, work_root=self.work,
-                                        policy=self.policy, allowed_asset_refs=allowed_asset_refs,
-                                        expected_asset_identities=asset_identities,
-                                        execution_supervisor=self.execution_supervisor,
-                                        execution_context={
-                                            "cycle_id": ci, "build_target_id": bt_id,
-                                            "run_id": rid, "phase": "train"})
-            if r["exit_code"] != 0:
+            train_result = MF.run_manifest_command(
+                manifest, "train", staging_dir=str(staging / f"run{rid}"),
+                log_name="train.log", src_dir=src_dir, work_root=self.work,
+                policy=self.policy, allowed_asset_refs=allowed_asset_refs,
+                expected_asset_identities=asset_identities,
+                execution_supervisor=self.execution_supervisor,
+                execution_context=train_context)
+
+        if d.query_one("SELECT status FROM run WHERE id=?", (rid,))[0] != "success":
+            if train_result is None:
+                raise RuntimeError(f"run {rid} 非 success 且无可恢复执行结果")
+            if train_result["exit_code"] != 0:
                 g.gate_finish_run(run_id=rid, status="failed", failure_kind="runtime")
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
                 return                            # 训练失败入账不入树（§7.1 判例④；答题侧自然无证据）
             ck_path = MF.checkpoint_dest(manifest, staging / f"run{rid}")   # 围栏解析进 run 目录内
+            ck_hash = H.file_sha256(str(ck_path))
             with d.transaction() as conn:         # checkpoint 登记（run 产物；finish_run success 的前置）
-                # ckpt_key 带 run id（codex SHOULD）：UNIQUE(variant,ckpt_key) 下，崩在 ckpt 与 finish_run 之间
-                # → 旧 run 被 abort、新 run 重训——固定 'final' 会撞唯一键永久楔死；残留 ckpt 归属 aborted run
-                # 无害（消费方按 produced_by_run=成功 run 取）。
-                conn.execute("INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,produced_by_run) "
-                             "VALUES (?,?,?,?,'sha256',?)",
-                             (vid, f"final-r{rid}", str(ck_path), H.file_sha256(str(ck_path)), rid))
+                existing = conn.execute(
+                    "SELECT variant_id,ckpt_key,path,content_hash FROM checkpoint "
+                    "WHERE produced_by_run=?", (rid,)).fetchone()
+                expected = (vid, f"final-r{rid}", str(ck_path), ck_hash)
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,produced_by_run) "
+                        "VALUES (?,?,?,?,'sha256',?)", (*expected, rid))
+                elif tuple(existing) != expected:
+                    raise RuntimeError(
+                        f"run {rid} checkpoint durable identity 与 staging 不一致")
             g.gate_finish_run(run_id=rid, status="success")
         # train log 入账 + 观测 ingest：**无条件、幂等**（不藏在 fresh 分支——崩在 finish_run 与 ingest 之间时，
         # 复用 run 的续跑须从 staging 存活文件补登，否则杀 vs 不杀终库不一致，内审 SHOULD）
         self._register_and_ingest_log(ci, staging / f"run{rid}" / "train.log", log_kind="train", run_id=rid)
         # —— (ii) 出厂评估 + 注册段 ——
-        erow = d.query_one("SELECT id,status FROM evaluation WHERE build_target_id=?", (bt_id,))
-        if erow is None:
-            eval_final = staging / f"eval{rid}" / "eval.log"
+        erow = d.query_one(
+            "SELECT id,status,canonical_attempt_id FROM evaluation WHERE build_target_id=?", (bt_id,))
+        eval_final = None
+        if erow is None or erow[1] != "success":
+            if erow is None:
+                attempt_purpose = "factory"
+                started = g.gate_start_attempt(
+                    cycle_id=ci, purpose="factory", build_target_id=bt_id,
+                    create={"variant_id": vid, "protocol_id": slice_["protocol_id"],
+                            "protocol_ver": slice_["protocol_ver"], "eval_key": slice_["eval_key"],
+                            "source": "factory", "target_set_hash": slice_["target_set_hash"]},
+                    env_hash=env_hash,
+                    watchdog_sec=min(
+                        float(manifest["commands"]["eval"].get(
+                            "timeout_s", self.policy["execution"]["default_timeout_s"])),
+                        float(self.policy["execution"]["max_timeout_s"])))
+            else:
+                latest = d.query_one(
+                    "SELECT id,status,attempt_no,purpose,failure_kind FROM evaluation_attempt "
+                    "WHERE evaluation_id=? ORDER BY attempt_no DESC LIMIT 1", (erow[0],))
+                if latest is None:
+                    raise RuntimeError(f"evaluation {erow[0]} 非 success 却无 attempt")
+                if latest[1] == "running":
+                    attempt_purpose = latest[3]
+                    started = {"evaluation_id": erow[0], "attempt_id": latest[0],
+                               "attempt_no": latest[2]}
+                elif latest[1] == "failed":
+                    # 失败 attempt 已是耐久执行事实；若崩在 target 收口前，补同一失败，绝不偷偷重跑。
+                    target_failure = ("protocol_violation"
+                                      if latest[4] in ("protocol_violation", "metric_missing",
+                                                       "data_invalid", "artifact_invalid")
+                                      else latest[4] or "runtime")
+                    g.gate_finish_build_target(
+                        build_target_id=bt_id, status="failed", failure_kind=target_failure)
+                    return
+                elif latest[1] == "aborted":
+                    attempt_purpose = "retry"
+                    started = g.gate_start_attempt(
+                        cycle_id=ci, purpose="retry", build_target_id=bt_id,
+                        evaluation_id=erow[0], retry_of=latest[0], env_hash=env_hash,
+                        watchdog_sec=min(
+                            float(manifest["commands"]["eval"].get(
+                                "timeout_s", self.policy["execution"]["default_timeout_s"])),
+                            float(self.policy["execution"]["max_timeout_s"])))
+                else:
+                    raise RuntimeError(
+                        f"evaluation {erow[0]} status={erow[1]} 与 latest attempt={latest[1]} 不一致")
+            eid, aid, attempt_no = (
+                started["evaluation_id"], started["attempt_id"], started["attempt_no"])
+            eval_dir = (staging / f"eval{rid}" if attempt_no == 1 else
+                        staging / f"eval{rid}" / f"retry-a{aid}")
+            eval_final = eval_dir / "eval.log"
+            eval_context = {
+                "cycle_id": ci,
+                "build_target_id": bt_id,
+                "run_id": rid,
+                "phase": "eval",
+                "reconcile_protocol": "execution-owner-v1",
+                "db_owner_kind": "evaluation_attempt",
+                "db_owner_id": aid,
+            }
             if eval_final.exists():
                 # 崩在「eval 跑完（final 已原子改名）→ register 前」的缝隙：**从存活 final 续注册、不重跑**
                 # ——重跑会撞 run_staged 的同名 final 拒（codex BLOCKER：永久 FileExistsError 楔死）。
@@ -802,53 +1271,79 @@ class AttackStages:
                 ev = {"log_path": str(eval_final), "log_sha256": hashlib.sha256(eval_log).hexdigest(),
                       "log_bytes": len(eval_log), "exit_code": exit_code}
             else:
-                self.owner_guard()
-                ev = MF.run_manifest_command(manifest, "eval", staging_dir=str(staging / f"eval{rid}"),
-                                             log_name="eval.log", src_dir=src_dir, work_root=self.work,
-                                             policy=self.policy,
-                                             ckpt_path=MF.checkpoint_dest(manifest, staging / f"run{rid}"),
-                                             allowed_asset_refs=allowed_asset_refs,
-                                             expected_asset_identities=asset_identities,
-                                             execution_supervisor=self.execution_supervisor,
-                                             execution_context={
-                                                 "cycle_id": ci,
-                                                 "build_target_id": bt_id,
-                                                 "run_id": rid,
-                                                 "phase": "eval"})
+                ev = H.recover_staged_result(
+                    staging_dir=str(eval_dir), log_name="eval.log",
+                    execution_supervisor=self.execution_supervisor,
+                    execution_kind="manifest-eval", execution_context=eval_context)
+                if ev is None:
+                    self.owner_guard()
+                    ev = MF.run_manifest_command(
+                        manifest, "eval", staging_dir=str(eval_dir),
+                        log_name="eval.log", src_dir=src_dir, work_root=self.work,
+                        policy=self.policy,
+                        ckpt_path=MF.checkpoint_dest(manifest, staging / f"run{rid}"),
+                        allowed_asset_refs=allowed_asset_refs,
+                        expected_asset_identities=asset_identities,
+                        execution_supervisor=self.execution_supervisor,
+                        execution_context=eval_context)
                 eval_log = Path(ev["log_path"]).read_bytes()
             if ev["exit_code"] != 0:              # fresh 与 resume 同一判定点（评估进程失败 → target failed）
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind="runtime",
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
                 return
-            metrics = self._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"))
+            try:
+                metrics = self._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"))
+            except _BundleReject:
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind="protocol_violation",
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
+                raise
             res_sh = self._result_subject_hash(bt_id, slice_, ledger, rid, metrics, ev)
             self._judge_once(ci, bt_id, "bundle_result_review", res_sh)
             if not g.review_passed(build_target_id=bt_id, review_kind="bundle_result_review",
                                    current_subject_hash=res_sh):
                 # 结果评审 FAIL → review_failed：run(success)+checkpoint 保留（训练事实），测量整包不注册
                 # （§4.2.5：第(ii)段不发生）——lockstep：import_worker 同修
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind="protocol_violation",
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="review_failed")
                 return
             try:
                 reg = self.gate.gate_register_evaluation(
-                    cycle_id=ci, build_target_id=bt_id, purpose="factory", current_subject_hash=res_sh,
-                    metric_results=metrics,
-                    create={"variant_id": vid, "protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"],
-                            "eval_key": slice_["eval_key"], "source": "factory", "target_set_hash": slice_["target_set_hash"]},
-                    env_hash=env_hash,
-                    artifact_ref=f"sha256:{ev['log_sha256']}")   # 评估 log 哈希锚落 attempt（补登强校验用，codex BLOCKER）
+                    cycle_id=ci, build_target_id=bt_id, purpose=attempt_purpose, current_subject_hash=res_sh,
+                    metric_results=metrics, attempt_id=aid,
+                    artifact_ref=f"sha256:{ev['log_sha256']}",
+                    transcript_ref=ev.get("process_receipt_path"))
             except GateReject as e:
                 # **只在此调用点**把注册闸拒转业务失败（codex 第2轮 BLOCKER 收窄）：此处的拒 = 评估测量包
                 # 不满足协议/required 契约（Codex eval 产物层问题）→ 目标 failed(protocol_violation)、不楔死。
                 # 其余 gate（start/progress/finish/register_baseline）的拒仍 fail loud。
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed", failure_kind="protocol_violation",
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
                 raise _BundleReject(f"测量注册被拒: {e}", failure_kind="protocol_violation") from e
             eid, aid = reg["evaluation_id"], reg["attempt_id"]
         else:
-            eid = erow[0]
-            aid = d.query_one("SELECT canonical_attempt_id FROM evaluation WHERE id=?", (eid,))[0]
+            eid, aid = erow[0], erow[2]
+            attempt_no = d.query_one(
+                "SELECT attempt_no FROM evaluation_attempt WHERE id=?", (aid,))[0]
+            eval_final = (staging / f"eval{rid}" / "eval.log" if attempt_no == 1 else
+                          staging / f"eval{rid}" / f"retry-a{aid}" / "eval.log")
         # attempt-owned eval log 补登 + 观测 ingest（§4.2.5(ii)）：**无条件、幂等、从 staging 存活文件重导出**——
         # 崩在 register_evaluation 与 ingest 之间时，resume 走 else 分支若不补登，下方强制核将永远 raise、
         # target 永卡 running（内审 BLOCKER 实证复现：不可恢复楔死）。register/ingest 均幂等，重放零害。
-        self._register_and_ingest_log(ci, staging / f"eval{rid}" / "eval.log", log_kind="eval",
+        self._register_and_ingest_log(ci, eval_final, log_kind="eval",
                                       evaluation_attempt_id=aid)
         # 管线强制：complete 前 attempt 须已有**当前口径** parser 观测（否则 suspect 无据可依成绕过）。
         # aid 由 register_evaluation 单事务保证非空（eval 存在 ⟹ canonical 已封）——此判为防御。
@@ -997,18 +1492,60 @@ class AttackStages:
         d = staging / prefix
         return len(list(d.glob(f"{prefix}-*.log"))) + 1 if d.exists() else 1
 
+    def _durable_reasoning_answer_matches(self, cyc, ans: Dict[str, Any]) -> bool:
+        """Strictly recognize a pre-atomic-version close left by an interrupted older process."""
+        try:
+            qi = _qnum(ans.get("question_id"))
+        except ValueError:
+            return False
+        ci = _cnum(cyc.cycle_id)
+        row = self.state.daemon.query_one(
+            "SELECT a.id,a.goal_id,a.goal_ver,a.verdict,a.answer_md,q.status,q.closed_cycle,"
+            "c.goal_id,c.goal_ver,c.status,c.active_question_id "
+            "FROM answer a JOIN question q ON q.id=a.question_id "
+            "JOIN cycle c ON c.id=a.cycle_id "
+            "WHERE a.cycle_id=? AND a.question_id=?",
+            (ci, qi))
+        if row is None:
+            return False
+        aid, goal_id, goal_ver, verdict, answer_md, qstatus, closed_cycle, cgid, cgver, cstatus, active = row
+        if (verdict != ans.get("verdict") or answer_md != ans.get("answer_md")
+                or qstatus != verdict or closed_cycle != ci or (goal_id, goal_ver) != (cgid, cgver)
+                or cstatus in ("done", "failed", "aborted") or active is not None):
+            return False
+
+        actual_rows = self.state.daemon.query(
+            "SELECT e.kind,e.metric_result_id,e.literature_ref,ca.question_id,"
+            "e.human_decision_id,e.claim_md "
+            "FROM evidence e LEFT JOIN answer ca ON ca.id=e.child_answer_id "
+            "WHERE e.answer_id=? ORDER BY e.id", (aid,))
+        actual = []
+        for kind, metric_result_id, literature_ref, child_question_id, human_id, claim_md in actual_rows:
+            ref = (f"mr{metric_result_id}" if kind == "evaluation" else literature_ref
+                   if kind == "literature" else f"q{child_question_id}"
+                   if kind == "child_answer" else f"d{human_id}")
+            actual.append((kind, ref, claim_md))
+        expected = []
+        for evidence in ans.get("evidence", []):
+            kind = evidence.get("kind")
+            ref = (evidence.get("metric_result_id") if kind == "evaluation" else
+                   evidence.get("citation_md") if kind == "literature" else
+                   evidence.get("child_question_id") if kind == "child_answer" else
+                   evidence.get("human_ref") if kind == "human" else None)
+            expected.append((kind, ref, evidence.get("note_md") or "(见 answer 正文)"))
+        return actual == expected
+
     # ---------------------------------------------------------------- reasoning --
     def _reasoning_stage(self, cyc) -> None:
-        """attack 轮收尾：gate_close_question（真证据 + suspect 谓词）→ atomic(tree_ops+selection+mark_done)。
+        """attack 轮收尾：answer/evidence→tree_ops→selection→done 单事务。
         **产物先持久化再消费**（codex SHOULD）：reasoning files 先原子落 staging（tmp→replace），resume 时
-        复用持久产物、不重调 provider——否则崩在 close 与 atomic 之间时非确定 provider 会产生杀/不杀分歧
-        （close 用旧 answer、selection 用新产物的分裂）。可重入：问题已终态 → 跳过 close。
+        复用持久产物、不重调 provider。旧版本若曾崩在独立 Gate 提交后，只有 durable answer 的全部
+        身份/正文/证据与持久产物逐项一致时才允许恢复；新路径不存在 close 与轮末提交之间的窗口。
 
         schema 合法但语义非法的外部产物不能成为 poison pill：answer 的目标/证据引用被拒，或 tree_ops
         被 StateStore 以 ValueError 拒绝时，tree/selection 原子批整体回滚，再以 reasoning_rejected +
-        terminate 原子收尾。answer Gate 是独立、单调的事实接纳段：若 answer 已经 I3 门禁成功提交、
-        后续 tree 语义才被拒，保留已接纳 answer，只回滚 tree/selection 批并停机；不对有写操作做「预演+
-        再执行」。SQLite/IO/GateInvariantError/RuntimeError 等内部或损毁错误仍 fail loud。"""
+        terminate 原子收尾。后续 tree/selection 失败会连同本轮新 answer 一起回滚，再提交确定性失败收尾。
+        SQLite/IO/GateInvariantError/RuntimeError 等内部或损毁错误仍 fail loud。"""
         art = self.work / f"c{_cnum(cyc.cycle_id)}" / "reasoning.json"
         if art.exists():
             files = json.loads(art.read_text(encoding="utf-8"))
@@ -1023,41 +1560,52 @@ class AttackStages:
             self._finish_reasoning_rejected(cyc, files, "reasoning 必产 selection.json")
             return
         ans = files.get("answer.json")
+        round_question_id = cyc.question_id
+        if ans is not None and round_question_id is None:
+            if not self._durable_reasoning_answer_matches(cyc, ans):
+                raise RuntimeError(
+                    f"cycle {cyc.cycle_id} 已释放 active question，但无与 reasoning artifact 完全一致的 durable answer")
+            round_question_id = ans["question_id"]
+        if round_question_id is None:
+            raise RuntimeError(f"attack cycle {cyc.cycle_id} 缺 active question 锚")
         if ans is not None:
-            if ans.get("question_id") != cyc.question_id:
+            if ans.get("question_id") != round_question_id:
                 # 树契约（codex SHOULD）：attack 轮只许关**本轮 Qn**——关别的问题再把本 Qn 置 inconclusive
                 # 属状态破坏（对齐 M0 driver「不得关别的问题」判据）
                 self._finish_reasoning_rejected(
-                    cyc, files, f"answer.question_id（{ans.get('question_id')}）≠ 本轮 Qn（{cyc.question_id}）"
+                    cyc, files, f"answer.question_id（{ans.get('question_id')}）≠ 本轮 Qn（{round_question_id}）"
                     "——不得关别的问题")
                 return
-            qi = int(ans["question_id"][1:])
-            qrow = self.state.daemon.query_one("SELECT status FROM question WHERE id=?", (qi,))
-            if qrow is None:
-                # cyc 指向的活跃题在真库消失不是外部 answer 的错，而是 DB/状态损毁；不得洗成正常拒收。
-                raise RuntimeError(f"cycle {cyc.cycle_id} 的 active question {ans['question_id']} 在 DB 不存在")
-            qst = qrow[0]
-            if qst not in ("answered", "refuted", "dead_end"):
-                try:
-                    self.close_gate.gate_close_question(
-                        cycle_id=cyc.cycle_id, question_id=ans["question_id"], verdict=ans["verdict"],
-                        evidence=ans["evidence"], answer_md=ans["answer_md"])
-                except GateReject as e:
-                    # GateReject 仅表示 answer/evidence 业务门禁拒；未预期 SQLite 约束由
-                    # GateInvariantError 单独 fail loud，不会在此被洗成外部产物错。
-                    self._finish_reasoning_rejected(cyc, files, f"answer 语义被 gate 拒绝: {e}")
-                    return
         sel = files["selection.json"]
         try:
-            with self.state.atomic():
+            with self.state.atomic() as conn:
                 if self.state.cycle(cyc.cycle_id).status in ("done", "failed", "aborted"):
                     return
-                qi = int(cyc.question_id[1:]) if cyc.question_id else None
-                if qi is not None and self.state.daemon.query_one(
-                        "SELECT status FROM question WHERE id=?", (qi,))[0] == "active":
+                qi = _qnum(round_question_id)
+                qrow = conn.execute("SELECT status FROM question WHERE id=?", (qi,)).fetchone()
+                if qrow is None:
+                    raise RuntimeError(
+                        f"cycle {cyc.cycle_id} 的 active question {round_question_id} 在 DB 不存在")
+                if ans is not None and qrow[0] not in ("answered", "refuted", "dead_end"):
+                    try:
+                        self.close_gate.gate_close_question_in_txn(
+                            conn, cycle_id=cyc.cycle_id, question_id=ans["question_id"],
+                            verdict=ans["verdict"], evidence=ans["evidence"],
+                            answer_md=ans["answer_md"])
+                    except GateReject as error:
+                        # Gate 的 SAVEPOINT 已清掉 answer 半写，reject DECISION 留在外层事务；
+                        # 与 deterministic fallback 一起正常提交。
+                        self._finish_reasoning_rejected_body(
+                            conn, cyc, files, f"answer 语义被 gate 拒绝: {error}",
+                            question_id=round_question_id)
+                        return
+                elif ans is not None and not self._durable_reasoning_answer_matches(cyc, ans):
+                    raise RuntimeError("终态 question 与持久 reasoning answer 不一致，拒绝静默续跑")
+
+                if conn.execute("SELECT status FROM question WHERE id=?", (qi,)).fetchone()[0] == "active":
                     # 无 answer（或未关成）的攻坚轮：Qn 不得永卡 active——置 inconclusive（增 visit，§4.2.3
                     # 「阶段失败=轮正常收尾」口径，对齐 M0 driver；训练/评估失败路径由此收干净）
-                    self.state.mark_inconclusive(cyc.question_id)
+                    self.state.mark_inconclusive(round_question_id)
                 try:
                     self.state.apply_tree_ops(
                         cyc.cycle_id, files.get("tree_ops.json", {"ops": []}).get("ops", []))
@@ -1068,31 +1616,40 @@ class AttackStages:
                 persist_selection_safe(self.state, cyc.cycle_id, sel)
                 self.state.mark_cycle_done(cyc.cycle_id)
         except _ReasoningReject as e:
-            self._finish_reasoning_rejected(cyc, files, str(e))
+            self._finish_reasoning_rejected(
+                cyc, files, str(e), question_id=round_question_id)
 
-    def _finish_reasoning_rejected(self, cyc, files: Dict[str, Any], reason: str) -> None:
+    def _finish_reasoning_rejected(self, cyc, files: Dict[str, Any], reason: str,
+                                   *, question_id: Optional[str] = None) -> None:
         """把已持久化的坏 reasoning 收敛为可审计、可重启的业务终态。
 
         decision、当前活跃题 inconclusive、terminate selection 与 cycle done 同一事务；终态二次核保证重入
         不重复记拒。这里使用编排器自产的固定 Selection，不消费坏 selection 的 scores/local refs。
         """
-        with self.state.atomic():
-            if self.state.cycle(cyc.cycle_id).status in ("done", "failed", "aborted"):
-                return
-            qi = int(cyc.question_id[1:]) if cyc.question_id else None
-            if qi is not None:
-                qrow = self.state.daemon.query_one("SELECT status FROM question WHERE id=?", (qi,))
-                if qrow is None:
-                    raise RuntimeError(f"cycle {cyc.cycle_id} 的 active question {cyc.question_id} 在 DB 不存在")
-                if qrow[0] == "active":
-                    self.state.mark_inconclusive(cyc.question_id)
-            self.state.daemon.conn.execute(
-                "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
-                "VALUES (?,?,'orchestrator','reasoning_rejected',?)",
-                (_cnum(cyc.cycle_id), qi, json.dumps({
-                    "reason": reason, "question_id": cyc.question_id,
-                    "artifact_hash": _canon_hash(files), "fallback_next_intent": "terminate"},
-                    ensure_ascii=False, sort_keys=True)))
-            self.state.persist_selection(
-                cyc.cycle_id, Selection(next_question_id=None, next_intent="terminate", scores=[]))
-            self.state.mark_cycle_done(cyc.cycle_id)
+        with self.state.atomic() as conn:
+            self._finish_reasoning_rejected_body(
+                conn, cyc, files, reason, question_id=question_id or cyc.question_id)
+
+    def _finish_reasoning_rejected_body(self, conn, cyc, files: Dict[str, Any], reason: str,
+                                        *, question_id: Optional[str]) -> None:
+        """Failure terminalization body; caller already owns the reasoning atomic transaction."""
+        if self.state.cycle(cyc.cycle_id).status in ("done", "failed", "aborted"):
+            return
+        qi = _qnum(question_id) if question_id else None
+        if qi is not None:
+            qrow = conn.execute("SELECT status FROM question WHERE id=?", (qi,)).fetchone()
+            if qrow is None:
+                raise RuntimeError(
+                    f"cycle {cyc.cycle_id} 的 active question {question_id} 在 DB 不存在")
+            if qrow[0] == "active":
+                self.state.mark_inconclusive(question_id)
+        conn.execute(
+            "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+            "VALUES (?,?,'orchestrator','reasoning_rejected',?)",
+            (_cnum(cyc.cycle_id), qi, json.dumps({
+                "reason": reason, "question_id": question_id,
+                "artifact_hash": _canon_hash(files), "fallback_next_intent": "terminate"},
+                ensure_ascii=False, sort_keys=True)))
+        self.state.persist_selection(
+            cyc.cycle_id, Selection(next_question_id=None, next_intent="terminate", scores=[]))
+        self.state.mark_cycle_done(cyc.cycle_id)

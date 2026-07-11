@@ -1133,6 +1133,54 @@ class ResearchNotifier:
                         "需要人工检查环境后由后续轮建立新 target。"),
                 },
             })
+        for (target_id, cycle_id, question_id, target_kind, seq, failure_kind) in self.daemon.query(
+                "SELECT id,cycle_id,question_id,target_kind,seq,failure_kind FROM build_target "
+                "WHERE status='failed' ORDER BY id"):
+            failure_preview, failure_hash = self._bounded_text(failure_kind, 512)
+            run = self.daemon.query_one(
+                "SELECT id,status,failure_kind FROM run WHERE build_target_id=? "
+                "ORDER BY id DESC LIMIT 1", (target_id,))
+            attempt = self.daemon.query_one(
+                "SELECT id,status,failure_kind,transcript_ref FROM evaluation_attempt "
+                "WHERE build_target_id=? ORDER BY id DESC LIMIT 1", (target_id,))
+            reconciled = self.daemon.query_one(
+                "SELECT json_extract(d.payload_json,'$.operation_id'),"
+                "json_extract(d.payload_json,'$.outcome'),"
+                "json_extract(d.payload_json,'$.receipt_ref') FROM decision d "
+                "WHERE d.actor='orchestrator' AND d.type='execution_reconciled' "
+                "AND json_valid(d.payload_json) AND ("
+                "(json_extract(d.payload_json,'$.db_owner_kind')='build_target' "
+                " AND json_extract(d.payload_json,'$.db_owner_id')=?) OR "
+                "(json_extract(d.payload_json,'$.db_owner_kind')='run' "
+                " AND json_extract(d.payload_json,'$.db_owner_id') IN "
+                "   (SELECT id FROM run WHERE build_target_id=?)) OR "
+                "(json_extract(d.payload_json,'$.db_owner_kind')='evaluation_attempt' "
+                " AND json_extract(d.payload_json,'$.db_owner_id') IN "
+                "   (SELECT id FROM evaluation_attempt WHERE build_target_id=?))) "
+                "ORDER BY d.id DESC LIMIT 1", (target_id, target_id, target_id))
+            events.append({
+                "event_key": f"build_target:{target_id}:failed",
+                "kind": "build_target_failed",
+                "payload": {
+                    "build_target_id": target_id, "cycle_id": f"c{cycle_id}",
+                    "question_id": f"q{question_id}" if question_id is not None else None,
+                    "target_kind": target_kind, "seq": seq,
+                    "failure_kind": failure_preview, "failure_kind_hash": failure_hash,
+                    "run": ({"run_id": run[0], "status": run[1], "failure_kind": run[2]}
+                            if run is not None else None),
+                    "evaluation_attempt": ({
+                        "attempt_id": attempt[0], "status": attempt[1],
+                        "failure_kind": attempt[2], "transcript_ref": attempt[3],
+                    } if attempt is not None else None),
+                    "execution_receipt": ({
+                        "operation_id": reconciled[0], "outcome": reconciled[1],
+                        "receipt_ref": reconciled[2],
+                    } if reconciled is not None else None),
+                    "summary_md": (
+                        f"构建目标 #{target_id}（c{cycle_id} 第 {seq} 项）失败；"
+                        f"失败类型：{failure_preview or '未分类'}。"),
+                },
+            })
         for (cycle_id, goal_id, goal_ver, status, route, question_id,
              cost_total, next_intent) in self.daemon.query(
                 "SELECT id,goal_id,goal_ver,status,route,active_question_id,cost_total,next_intent "

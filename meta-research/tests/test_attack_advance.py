@@ -16,6 +16,8 @@ import pytest
 import yaml
 
 from orchestrator import database as db
+from orchestrator import harness as H
+from orchestrator import manifest as MF
 from orchestrator import obs_parser as OP
 from orchestrator import attack_stages as AS
 from orchestrator.advancer import SqliteAdvancer
@@ -213,6 +215,248 @@ def test_full_attack_cycle(env):
     assert d.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
     # cycle 终态 done
     assert env["state"].last_done_cycle().next_intent == "terminate"
+
+
+def test_eval_only_target_executes_existing_legal_checkpoint(tmp_path, monkeypatch):
+    """plan 的 create_evaluation eval target 真执行：不训练、不改池身份，route 特化 eval_only。"""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "w"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    checkpoint = tmp_path / "existing.ckpt"
+    checkpoint.write_text("existing-weights", encoding="utf-8")
+    with daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO baseline(id,slug,canonical_key,status) "
+            "VALUES (1,'existing','existing-family','legal')")
+        conn.execute(
+            "INSERT INTO variant(id,baseline_id,variant_key,config_json,status,born_question) "
+            "VALUES (1,1,'base','{}','legal',1)")
+        conn.execute(
+            "INSERT INTO checkpoint(id,variant_id,ckpt_key,path,content_hash,hash_alg,artifact_type,origin) "
+            "VALUES (1,1,'existing',?,?,'sha256','algorithm','none')",
+            (str(checkpoint), H.file_sha256(str(checkpoint))))
+
+    def plan(_cyc, _pack):
+        return {"plan.json": {
+            "needs": [{"need_id": "n1", "statement_md": "复测既有变体"}],
+            "reuse_evidence": [],
+            "targets": [{
+                "target_key": "eval-existing", "target_kind": "eval", "seq": 1,
+                "critical": True, "budget_estimate": 1.0, "spec_md": "独立复测既有 checkpoint",
+                "need_ids": ["n1"], "eval_action": "create_evaluation",
+                "attempt_purpose": "standalone_eval", "eval_key": "standalone-check",
+                "evaluation_source": "standalone_eval",
+                "claim": {"baseline_ref": "existing-family", "variant_key": "base"},
+            }],
+            "protocol": {"name": "existing-proto", "version": 1,
+                         "scope_spec": {"dataset": "toy", "split": "holdout"},
+                         "smoke_md": "eval-only 无 smoke"},
+            "metric_defs": [{"metric_id": "m_acc", "version": 1, "name": "acc",
+                             "direction": "higher", "compute_spec_md": "正确率"}],
+            "readout_rules": [{"metric_id": "m_acc", "metric_ver": 1,
+                               "rule_md": "越高越好"}],
+            "build_target_required_metric": [{"target_key": "eval-existing",
+                                              "metric_id": "m_acc", "metric_ver": 1}],
+        }}
+
+    def bundle(_cyc, pack):
+        bt_id = int(pack.target_id)
+        slice_ = json.loads(daemon.query_one(
+            "SELECT plan_ref FROM build_target WHERE id=?", (bt_id,))[0])
+        manifest = {
+            "manifest_version": 1,
+            "target_ref": {"target_key": slice_["target_key"], "target_kind": "eval",
+                           "seq": slice_["seq"], "plan_slice_hash": manifest_canon(slice_)},
+            "protocol_ref": {"protocol_id": slice_["protocol_id"],
+                             "protocol_ver": slice_["protocol_ver"]},
+            "env_hash": "eval-only-env", "config_json": {},
+            "code_files": ["eval_existing.py"],
+            "commands": {"eval": {"argv": [sys.executable, "{src}/eval_existing.py", "{ckpt}"]}},
+        }
+        body = ("import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_text() == 'existing-weights'; "
+                "print('loss: 0.1'); print('metric_value: 1@1=0.97')")
+        return {"execution_manifest.json": manifest, "identity.md": "# existing eval",
+                "eval_existing.py": body}
+
+    attack.p["plan"] = plan
+    attack.p["bundle"] = bundle
+    observed = []
+    original = MF.run_manifest_command
+
+    def wrapped(manifest, kind, **kwargs):
+        if kind == "eval" and manifest["target_ref"]["target_kind"] == "eval":
+            row = daemon.query_one(
+                "SELECT id,status FROM evaluation_attempt ORDER BY id DESC LIMIT 1")
+            assert row is not None and row[1] == "running"
+            context = kwargs["execution_context"]
+            assert context["db_owner_kind"] == "evaluation_attempt"
+            assert context["db_owner_id"] == row[0]
+            assert "run_id" not in context
+            observed.append(row[0])
+        return original(manifest, kind, **kwargs)
+
+    monkeypatch.setattr(MF, "run_manifest_command", wrapped)
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(observed) == 1
+    assert daemon.query_one("SELECT route FROM cycle ORDER BY id DESC LIMIT 1")[0] == "eval_only"
+    assert daemon.query_one("SELECT status FROM build_target")[0] == "complete"
+    assert daemon.query_one("SELECT count(*) FROM run")[0] == 0
+    assert daemon.query_one(
+        "SELECT status,purpose FROM evaluation_attempt") == ("success", "standalone_eval")
+    assert daemon.query_one("SELECT source,status FROM evaluation") == ("standalone_eval", "success")
+    assert daemon.query_one("SELECT value FROM metric_result")[0] == 0.97
+    assert daemon.query_one("SELECT status FROM baseline WHERE id=1")[0] == "legal"
+    assert daemon.query_one("SELECT status FROM variant WHERE id=1")[0] == "legal"
+
+
+def test_factory_eval_attempt_exists_before_process_spawn(tmp_path, monkeypatch):
+    """receipt owner 可对账：eval 外部进程放行前，DB 已有 exact running attempt。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    original = MF.run_manifest_command
+    observed = []
+
+    def wrapped(manifest, kind, **kwargs):
+        if kind == "eval":
+            row = daemon.query_one(
+                "SELECT id,status,build_target_id FROM evaluation_attempt ORDER BY id DESC LIMIT 1")
+            assert row is not None and row[1] == "running"
+            context = kwargs["execution_context"]
+            assert context["db_owner_kind"] == "evaluation_attempt"
+            assert context["db_owner_id"] == row[0]
+            assert context["build_target_id"] == row[2]
+            observed.append(row[0])
+        return original(manifest, kind, **kwargs)
+
+    monkeypatch.setattr(MF, "run_manifest_command", wrapped)
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(observed) == 1
+    assert daemon.query_one(
+        "SELECT status FROM evaluation_attempt WHERE id=?", (observed[0],))[0] == "success"
+
+
+def test_train_run_exists_before_process_spawn(tmp_path, monkeypatch):
+    """train guardian 的 receipt owner 在外部调用前已是 exact running run。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    original = MF.run_manifest_command
+    observed = []
+
+    def wrapped(manifest, kind, **kwargs):
+        if kind == "train":
+            row = daemon.query_one(
+                "SELECT id,status,build_target_id FROM run ORDER BY id DESC LIMIT 1")
+            assert row is not None and row[1] == "running"
+            context = kwargs["execution_context"]
+            assert context["reconcile_protocol"] == "execution-owner-v1"
+            assert context["db_owner_kind"] == "run"
+            assert context["db_owner_id"] == row[0] == context["run_id"]
+            assert context["build_target_id"] == row[2]
+            observed.append(row[0])
+        return original(manifest, kind, **kwargs)
+
+    monkeypatch.setattr(MF, "run_manifest_command", wrapped)
+    SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert len(observed) == 1
+    assert daemon.query_one("SELECT status FROM run WHERE id=?", (observed[0],))[0] == "success"
+
+
+def test_train_partial_recovered_without_second_execution(tmp_path, monkeypatch):
+    """guardian 已 drained exit(0)、owner 死在本地发布前：同一 run 恢复 partial，不重训。"""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "w"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    original_pointer_write = H.atomic_write_receipt
+
+    def crash_train_pointer(path_, receipt):
+        if str(path_).endswith("train.log.process.json"):
+            raise OSError("SIM-owner-died-before-train-publish")
+        return original_pointer_write(path_, receipt)
+
+    monkeypatch.setattr(H, "atomic_write_receipt", crash_train_pointer)
+    with pytest.raises(OSError, match="SIM-owner-died"):
+        SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert daemon.query_one("SELECT status FROM run")[0] == "running"
+    assert len(list(work.rglob("train.log.partial"))) == 1
+    daemon.conn.close()
+
+    monkeypatch.setattr(H, "atomic_write_receipt", original_pointer_write)
+    daemon2, state2, compiler2, attack2 = _mk_env(path, work)
+    calls = []
+    original_manifest_call = MF.run_manifest_command
+
+    def count_train(manifest, kind, **kwargs):
+        if kind == "train":
+            calls.append(kind)
+        return original_manifest_call(manifest, kind, **kwargs)
+
+    monkeypatch.setattr(MF, "run_manifest_command", count_train)
+    SqliteAdvancer(state2, compiler2, lambda c, p: None, attack=attack2).run_cycles(max_cycles=4)
+    assert calls == []
+    assert daemon2.query_one("SELECT count(*) FROM run")[0] == 1
+    assert daemon2.query_one("SELECT status FROM run")[0] == "success"
+    assert daemon2.query_one("SELECT status FROM build_target")[0] == "complete"
+    assert not list(work.rglob("train.log.partial"))
+
+
+def test_120_attack_rounds_no_state_or_projection_drift(tmp_path):
+    """真跑 120 个 attack 轮：每轮 durable 关停旧前沿并生一个 follow-up，终态无半轮/租约/投影漂移。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    attack.p["idea"] = lambda cyc, pack: _idea_set()
+    attack.p["plan"] = lambda cyc, pack: {"plan.json": {
+        "needs": [], "reuse_evidence": [], "targets": [],
+        "build_target_required_metric": [],
+    }}
+
+    def reasoning(cyc, pack):
+        round_no = daemon.query_one(
+            "SELECT count(*) FROM cycle WHERE id>1")[0]
+        ops = [{"op": "propose_prune", "question_id": cyc.question_id,
+                "reason_md": "本轮已完成边界检查，关闭旧前沿"}]
+        if round_no < 120:
+            # apply 顺序发生在 current question 由 active→inconclusive 之后；先 spawn 再 prune，
+            # 全程 open/inconclusive 前沿恒为 1，不靠扩大 tree_guard 偷跑长轮次。
+            ops.insert(0, {"op": "spawn_question", "kind": "followup",
+                           "parent_question_id": cyc.question_id,
+                           "text": f"长跑 follow-up {round_no + 1}", "local_key": "next"})
+            selection = {
+                "next_question_id": "next", "next_intent": "attack",
+                "scores": [{"question_id": "next", "score": 0.9, "est_cost": 1.0}],
+            }
+        else:
+            selection = {
+                "next_question_id": None, "next_intent": "terminate", "scores": [],
+                "terminate_reason_md": "120 轮生产长跑验收完成",
+            }
+        return {"tree_ops.json": {"ops": ops}, "selection.json": selection}
+
+    attack.p["reasoning"] = reasoning
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=150)
+    assert len(ids) == 120
+    assert daemon.query_one("SELECT count(*) FROM cycle WHERE route='reuse_only'")[0] == 120
+    assert daemon.query_one(
+        "SELECT count(*) FROM cycle WHERE status NOT IN ('done','failed','aborted')")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM cycle WHERE active_question_id IS NOT NULL")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM question")[0] == 120
+    assert daemon.query_one("SELECT count(*) FROM question WHERE status<>'dead_end'")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='idea'")[0] == 120
+    assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='plan'")[0] == 120
+    assert daemon.query_one("SELECT count(*) FROM run")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM evaluation_attempt")[0] == 0
+    assert state.last_done_cycle().next_intent == "terminate"
+    assert state._local_maps == {} and state._bundle_cursor == {}
+
+    daemon.conn.close()
+    daemon2, state2, compiler2, attack2 = _mk_env(path, tmp_path / "w")
+    assert SqliteAdvancer(
+        state2, compiler2, lambda c, p: None, attack=attack2).run_cycles(max_cycles=5) == []
+    assert daemon2.query_one("SELECT count(*) FROM cycle")[0] == 121  # bootstrap + 120 attack
 
 
 @pytest.mark.parametrize("resume_after_staging", [False, True])
@@ -504,7 +748,9 @@ def test_crash_after_eval_final_before_register_recovers(tmp_path):
     a1.p["judge"] = judge_crash_on_result
     with pytest.raises(SystemExit):
         SqliteAdvancer(s1, a1.compiler, lambda c, p: None, attack=a1).run_cycles(max_cycles=4)
-    assert d1.query_one("SELECT count(*) FROM evaluation")[0] == 0     # 未注册
+    assert d1.query_one("SELECT status FROM evaluation")[0] == "running"
+    assert d1.query_one("SELECT status FROM evaluation_attempt")[0] == "running"
+    assert d1.query_one("SELECT count(*) FROM metric_result")[0] == 0
     d1.conn.close()
 
     d2, s2, _, a2 = _mk_env(path, tmp_path / "w")          # 同 work_root：eval final 存活
@@ -567,7 +813,9 @@ def test_failed_eval_resume_not_registered(tmp_path):
     d0, s0, _, a0 = _mk(ref, tmp_path / "wref")
     _bootstrap_attack(s0)
     SqliteAdvancer(s0, a0.compiler, lambda c, p: None, attack=a0).run_cycles(max_cycles=4)
-    assert d0.query_one("SELECT count(*) FROM evaluation")[0] == 0
+    assert d0.query_one("SELECT status FROM evaluation")[0] == "failed"
+    assert d0.query_one("SELECT status,failure_kind FROM evaluation_attempt") == ("failed", "runtime")
+    assert d0.query_one("SELECT count(*) FROM metric_result")[0] == 0
     d0.conn.close()
 
     path = str(tmp_path / "research.sqlite")               # 断点：eval final 已落、finish-failed 前炸
@@ -587,7 +835,8 @@ def test_failed_eval_resume_not_registered(tmp_path):
 
     d2, s2, _, a2 = _mk(path, tmp_path / "w")              # 同 work_root 续跑：读 exit 侧车 → 同判失败
     SqliteAdvancer(s2, a2.compiler, lambda c, p: None, attack=a2).run_cycles(max_cycles=4)
-    assert d2.query_one("SELECT count(*) FROM evaluation")[0] == 0     # 绝未注册
+    assert d2.query_one("SELECT status FROM evaluation")[0] == "failed"
+    assert d2.query_one("SELECT count(*) FROM metric_result")[0] == 0  # 失败进程输出绝未注册
     d2.conn.close()
     assert _final_state(path) == _final_state(ref)
 
@@ -851,7 +1100,10 @@ def test_eval_metric_record_protocol_rejected_and_restart_safe(tmp_path, eval_bo
     assert len(ids) == 1
     assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == (
         "failed", "protocol_violation")
-    assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0
+    assert daemon.query_one("SELECT status FROM evaluation")[0] == "failed"
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM evaluation_attempt") == (
+            "failed", "protocol_violation")
     assert daemon.query_one("SELECT count(*) FROM metric_result")[0] == 0       # 尤其 inf 不得入库
     assert daemon.query_one(
         "SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
@@ -1193,8 +1445,8 @@ def test_tree_ops_late_reject_rolls_back_rows_and_local_projection(tmp_path):
     daemon.conn.close()
 
 
-def test_valid_answer_is_monotone_when_later_tree_batch_rejected(tmp_path):
-    """reasoning 是明确两段：I3 已接纳 answer 不回滚；后续非法 tree 批回滚并安全停机。"""
+def test_valid_answer_rolls_back_when_later_tree_batch_rejected(tmp_path):
+    """reasoning 全序单事务：后续 tree 非法时 answer/evidence 一并回滚，再安全失败收尾。"""
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
@@ -1210,9 +1462,9 @@ def test_valid_answer_is_monotone_when_later_tree_batch_rejected(tmp_path):
     attack.p["reasoning"] = answer_then_bad_tree
     ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
     assert len(ids) == 1
-    assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "answered"
-    assert daemon.query_one("SELECT count(*) FROM answer WHERE question_id=1")[0] == 1
-    assert daemon.query_one("SELECT count(*) FROM evidence WHERE question_id=1")[0] == 1
+    assert daemon.query_one("SELECT status,visit_count FROM question WHERE id=1") == ("inconclusive", 1)
+    assert daemon.query_one("SELECT count(*) FROM answer WHERE question_id=1")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM evidence WHERE question_id=1")[0] == 0
     assert daemon.query_one("SELECT count(*) FROM question")[0] == 1
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='reasoning_rejected'")[0] == 1
     assert daemon.query_one("SELECT status,next_intent FROM cycle ORDER BY id DESC LIMIT 1")[:2] == (
@@ -1226,16 +1478,51 @@ def test_reasoning_gate_invariant_corruption_still_fails_loud(tmp_path):
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
 
-    def corrupt_gate(**kwargs):
+    def corrupt_gate(*args, **kwargs):
         raise GateInvariantError("SIM gate invariant corruption")
 
-    attack.close_gate.gate_close_question = corrupt_gate
+    attack.close_gate.gate_close_question_in_txn = corrupt_gate
     with pytest.raises(GateInvariantError, match="invariant corruption"):
         SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='reasoning_rejected'")[0] == 0
     assert daemon.query_one("SELECT count(*) FROM answer")[0] == 0
     assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "bundle"
     daemon.conn.close()
+
+
+def test_reasoning_answer_and_tail_rollback_together_across_restart(tmp_path):
+    """在 Gate close 后注入进程退出：answer/pointer/轮末写全部回滚；真实重启复用产物后只提交一次。"""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "w"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    original = state.apply_tree_ops
+    crashed = {"done": False}
+
+    def crash_after_gate(*args, **kwargs):
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise SystemExit("SIM-KILL9-after-reasoning-close")
+        return original(*args, **kwargs)
+
+    state.apply_tree_ops = crash_after_gate
+    with pytest.raises(SystemExit, match="after-reasoning-close"):
+        SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert daemon.query_one("SELECT count(*) FROM answer WHERE question_id=1")[0] == 0
+    assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "active"
+    assert daemon.query_one(
+        "SELECT active_question_id,status FROM cycle ORDER BY id DESC LIMIT 1") == (1, "bundle")
+    compiler.conn.close(); daemon.conn.close()
+
+    d2, s2, c2, a2 = _mk_env(path, work)
+    ids = SqliteAdvancer(s2, c2, lambda c, p: None, attack=a2).run_cycles(max_cycles=4)
+    assert len(ids) == 1
+    assert d2.query_one("SELECT count(*) FROM answer WHERE question_id=1")[0] == 1
+    assert d2.query_one("SELECT status FROM question WHERE id=1")[0] == "answered"
+    assert d2.query_one("SELECT active_question_id,status FROM cycle WHERE id=?", (int(ids[0][1:]),)) == (
+        None, "done")
+    assert d2.query_one("SELECT count(*) FROM decision WHERE type='reasoning_rejected'")[0] == 0
+    d2.conn.close()
 
 
 def test_open_set_annotates_attack_ineligible(tmp_path):

@@ -238,7 +238,7 @@ def test_stage_provider_cost_failure_is_fatal_when_budget_enabled(daemon, tmp_pa
 
     def boom(**kw):
         raise RuntimeError("记账崩")
-    monkeypatch.setattr(cl, "record", boom)
+    monkeypatch.setattr(cl, "finish_call", boom)
     sp = _sp(daemon, tmp_path, _UsageRunner({"idea_set.json": _IDEA}, _known_usage(tokens_total=1000)), cl)
     with pytest.raises(RuntimeError, match="记账崩"):
         sp.idea(NS(cycle_id="c1"), _pack("idea"))              # 预算网启用 → 不许带病继续制造隐形成本
@@ -247,7 +247,7 @@ def test_stage_provider_cost_failure_is_fatal_when_budget_enabled(daemon, tmp_pa
 def test_stage_provider_cost_failure_best_effort_when_budget_disabled(daemon, tmp_path, monkeypatch):
     pol = {**POLICY, "budget": {**POLICY["budget"], "session_max": None}}
     cl = CostLedger(daemon, pol)
-    monkeypatch.setattr(cl, "record", lambda **kw: (_ for _ in ()).throw(RuntimeError("记账崩")))
+    monkeypatch.setattr(cl, "finish_call", lambda **kw: (_ for _ in ()).throw(RuntimeError("记账崩")))
     sp = _sp(daemon, tmp_path, _UsageRunner({"idea_set.json": _IDEA}, _known_usage(tokens_total=1000)), cl, pol)
     assert "idea_set.json" in sp.idea(NS(cycle_id="c1"), _pack("idea"))
 

@@ -882,6 +882,10 @@ def test_recovery_resolves_fenced_prepared_but_rejects_running_or_corrupt(tmp_pa
         "helper_pid": 100, "payload_pid": 101, "initial_pgid": 101,
         "helper_start_ticks": "1", "payload_start_ticks": "2",
         "started_at_unix": time.time(), "deadline_at_unix": time.time() + 10,
+        "heartbeat_ref": str(receipt_dir / f"heartbeat-{running_id}.json"),
+        "guardian_heartbeat_seq": 0, "guardian_heartbeat_at_unix": time.time(),
+        "last_activity_at_unix": time.time(), "activity_cpu_ticks": 0,
+        "activity_output_bytes": 0, "activity_descendant_count": 0,
     })
     with pytest.raises(ExecutionRecoveryError, match="prior running"):
         ExecutionSupervisor(

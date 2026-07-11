@@ -87,6 +87,8 @@ class Artifact:
     files: Dict[str, Any]
     md: str = ""
     usage: Optional["CallUsage"] = None
+    transcript_ref: Optional[str] = None
+    execution_receipt_ref: Optional[str] = None
 
 
 @dataclass

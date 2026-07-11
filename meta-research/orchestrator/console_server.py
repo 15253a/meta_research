@@ -41,6 +41,7 @@ from .console_spool import (CAPABILITY_NAME, ConsoleSpool, normalize_upload_ref,
                             open_directory_path, read_regular_file_beneath,
                             stat_regular_file_beneath)
 from .instance_lease import read_instance_status
+from .process_supervisor import read_receipt
 
 
 _MAX_HTTP_BODY_BYTES = 64 * 1024
@@ -535,6 +536,56 @@ def _notifications(work_root: Path) -> List[Dict[str, Any]]:
     return out
 
 
+def _runner_execution_live(work_root: Path, runner_call_id: int) -> Dict[str, Any]:
+    """Project guardian liveness, workload activity, and absolute deadline for one DB owner."""
+    matches = []
+    receipt_dir = work_root / "state" / "executions"
+    for path in sorted(receipt_dir.glob("execution-*.json"))[-512:]:
+        try:
+            receipt = read_receipt(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        context = receipt.get("context") or {}
+        if (context.get("reconcile_protocol") == "runner-call-v1"
+                and context.get("db_owner_kind") == "runner_call"
+                and context.get("db_owner_id") == runner_call_id):
+            matches.append(receipt)
+    if len(matches) != 1:
+        return {"execution_authority": "missing" if not matches else "duplicate"}
+    receipt = matches[0]
+    out = {
+        "execution_authority": "bound",
+        "execution_operation_id": receipt.get("operation_id"),
+        "watchdog_deadline_at_unix": receipt.get("deadline_at_unix"),
+        "guardian_heartbeat_age_s": None,
+        "activity_age_s": None,
+        "watchdog_remaining_s": None,
+    }
+    heartbeat_ref = receipt.get("heartbeat_ref")
+    heartbeat = receipt
+    if isinstance(heartbeat_ref, str):
+        try:
+            rel = os.path.relpath(heartbeat_ref, work_root)
+            if rel == ".." or rel.startswith(".." + os.sep):
+                raise ValueError("heartbeat 越出 work_root")
+            raw = read_regular_file_beneath(
+                work_root, rel, max_bytes=128 * 1024)
+            heartbeat = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError, RuntimeError, json.JSONDecodeError):
+            heartbeat = receipt
+    now = time.time()
+    guardian_at = heartbeat.get("guardian_heartbeat_at_unix")
+    activity_at = heartbeat.get("last_activity_at_unix")
+    deadline_at = receipt.get("deadline_at_unix")
+    if isinstance(guardian_at, (int, float)) and not isinstance(guardian_at, bool):
+        out["guardian_heartbeat_age_s"] = round(max(0.0, now - float(guardian_at)), 1)
+    if isinstance(activity_at, (int, float)) and not isinstance(activity_at, bool):
+        out["activity_age_s"] = round(max(0.0, now - float(activity_at)), 1)
+    if isinstance(deadline_at, (int, float)) and not isinstance(deadline_at, bool):
+        out["watchdog_remaining_s"] = round(max(0.0, float(deadline_at) - now), 1)
+    return out
+
+
 def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
     """「正在执行」活性信号（不经任何 LLM，§4.6.6 live strip）：在途轮 + 最新 runner_call + 心跳
     （transcript 文件 mtime）+ 独立 instance owner heartbeat。DB 在途只表示耐久游标；没有经
@@ -547,8 +598,11 @@ def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
         "SELECT kind FROM directive WHERE status='consumed' AND kind IN ('pause','resume') "
         "ORDER BY consumed_decision_id DESC LIMIT 1").fetchone()
     paused = bool(latest_pause_control) and latest_pause_control[0] == "pause"
-    rc = conn.execute("SELECT id, cycle_id, phase, purpose, status, transcript_ref, started_at, finished_at "
-                      "FROM runner_call ORDER BY id DESC LIMIT 1").fetchone()
+    rc = conn.execute(
+        "SELECT id,cycle_id,phase,purpose,status,transcript_ref,started_at,finished_at "
+        "FROM runner_call ORDER BY "
+        "CASE WHEN status IN ('created','running') THEN 0 ELSE 1 END,"
+        "CASE WHEN phase='interaction_query' THEN 1 ELSE 0 END,id DESC LIMIT 1").fetchone()
     instance = read_instance_status(work_root)
     mode = ("paused" if paused else
             ("awaiting_user" if pending_req else
@@ -563,6 +617,10 @@ def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
                             "inflight_status": (inflight[2] if inflight else None),
                             "pending_request_id": (pending_req[0] if pending_req else None),
                             "runner_call": None, "heartbeat_age_s": None,
+                            "guardian_heartbeat_age_s": None,
+                            "activity_age_s": None,
+                            "watchdog_remaining_s": None,
+                            "watchdog_deadline_at_unix": None,
                             "orchestrator_active": bool(instance["active"]),
                             "orchestrator_status": instance["status"],
                             "orchestrator_owner_id": instance["owner_id"],
@@ -579,6 +637,8 @@ def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
                 live["heartbeat_age_s"] = round(time.time() - info.st_mtime, 1)
             except (OSError, ValueError, RuntimeError):
                 pass
+        if rc[4] in ("created", "running"):
+            live.update(_runner_execution_live(work_root, int(rc[0])))
     return live
 
 

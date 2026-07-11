@@ -12,13 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import os
-import subprocess
 import secrets
+import stat
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .ids import cnum as _cnum
-from .process_supervisor import ExecutionSupervisor, atomic_write_receipt
+from .process_supervisor import (ExecutionRecoveryError, ExecutionSupervisor,
+                                 atomic_write_receipt, read_receipt)
 from .writedaemon import WriteDaemon
 
 
@@ -31,6 +33,168 @@ def _write_all(fd: int, payload: bytes) -> None:
         view = view[written:]
 
 
+def _read_exact(fd: int, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = os.read(fd, size - len(chunks))
+        if not chunk:
+            raise OSError("exit sidecar short read")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _validate_log_name(log_name: str) -> None:
+    if (not isinstance(log_name, str) or not log_name or len(log_name) > 128
+            or log_name in {".", ".."} or "/" in log_name or "\\" in log_name
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in log_name)):
+        raise ValueError("log_name 须为有界安全 basename")
+
+
+def _fsync_dir(path: Path) -> None:
+    dir_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                     | getattr(os, "O_CLOEXEC", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _ensure_exit_sidecar(directory: Path, log_name: str, exit_code: int) -> Path:
+    exit_path = directory / (log_name + ".exit")
+    if os.path.lexists(exit_path):
+        fd = -1
+        try:
+            fd = os.open(exit_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                         | getattr(os, "O_NOFOLLOW", 0))
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or not 1 <= info.st_size <= 32):
+                raise OSError("exit sidecar 身份/大小非法")
+            raw = _read_exact(fd, info.st_size)
+            text = raw.decode("ascii")
+            existing = int(text)
+            if text != str(existing):
+                raise ValueError("exit sidecar 非规范整数")
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ExecutionRecoveryError(f"staged exit 侧车损坏: {exit_path}") from error
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if existing != exit_code:
+            raise ExecutionRecoveryError(
+                f"staged exit 侧车与 guardian receipt 冲突: {existing} != {exit_code}")
+        return exit_path
+    exit_tmp = directory / (log_name + f".exit.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    exit_fd = os.open(
+        exit_tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        _write_all(exit_fd, str(exit_code).encode("ascii"))
+        os.fsync(exit_fd)
+    finally:
+        os.close(exit_fd)
+    os.replace(exit_tmp, exit_path)
+    _fsync_dir(directory)
+    return exit_path
+
+
+def recover_staged_result(*, staging_dir: str, log_name: str,
+                          execution_supervisor: Optional[ExecutionSupervisor],
+                          execution_kind: str,
+                          execution_context: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Promote an owner-orphaned complete ``.partial`` using its central receipt.
+
+    The guardian has already fsynced output and proved the descendant tree
+    drained.  This helper only reconstructs harness' local ``.exit``/final
+    publication after the former Python owner died between supervisor return
+    and ``.partial -> final``.  It never interprets exit(0) as DB success.
+
+    ``None`` means no prior operation exists and a fresh call is safe.  A
+    partial or matching non-exit receipt without a recoverable complete log is
+    fail-loud: reusing the same DB owner would create two operations and erase
+    the only audit artifact.
+    """
+    _validate_log_name(log_name)
+    expected = dict(execution_context)
+    if "log_name" in expected and expected["log_name"] != log_name:
+        raise ValueError("execution_context.log_name 与 harness log_name 冲突")
+    expected["log_name"] = log_name
+    owner_kind, owner_id = expected.get("db_owner_kind"), expected.get("db_owner_id")
+    if (not isinstance(owner_kind, str) or isinstance(owner_id, bool)
+            or not isinstance(owner_id, int) or owner_id <= 0):
+        raise ValueError("recover_staged_result 要求 exact DB owner context")
+
+    directory = Path(staging_dir)
+    partial = directory / (log_name + ".partial")
+    final = directory / log_name
+    if final.exists():
+        return None
+    receipt_dir = (execution_supervisor.receipt_dir if execution_supervisor is not None
+                   else directory / ".execution-receipts")
+    matches = []
+    for path in sorted(Path(receipt_dir).glob("execution-*.json")):
+        receipt = read_receipt(path)
+        context = receipt.get("context") or {}
+        if (context.get("db_owner_kind"), context.get("db_owner_id")) != (owner_kind, owner_id):
+            continue
+        if (receipt.get("kind") != execution_kind
+                or any(context.get(key) != value for key, value in expected.items())):
+            raise ExecutionRecoveryError(
+                f"{owner_kind} {owner_id} guardian receipt 与 staged recovery context 错配")
+        matches.append((path, receipt))
+    if len(matches) > 1:
+        raise ExecutionRecoveryError(
+            f"{owner_kind} {owner_id} 对应多个 guardian execution receipt")
+    partial_exists = os.path.lexists(partial)
+    if not matches:
+        if partial_exists:
+            raise ExecutionRecoveryError(
+                f"{partial} 存在但无 exact guardian receipt；拒绝截断重跑")
+        return None
+
+    receipt_path, receipt = matches[0]
+    if receipt.get("state") != "terminal" or receipt.get("group_drained") is not True:
+        raise ExecutionRecoveryError(
+            f"{owner_kind} {owner_id} guardian receipt 未 terminal+drained")
+    if receipt.get("outcome") != "exit":
+        raise ExecutionRecoveryError(
+            f"{owner_kind} {owner_id} prior outcome={receipt.get('outcome')} 不可提升为完整 log")
+    if not partial_exists:
+        raise ExecutionRecoveryError(
+            f"{owner_kind} {owner_id} 有 drained exit receipt 但 {partial} 缺失")
+    info = os.lstat(partial)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_uid != os.geteuid()):
+        raise ExecutionRecoveryError(f"staged partial 身份非法: {partial}")
+    fd = os.open(partial, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    exit_code = receipt.get("returncode")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise ExecutionRecoveryError("drained exit receipt 缺合法 returncode")
+    _ensure_exit_sidecar(directory, log_name, exit_code)
+    atomic_write_receipt(directory / (log_name + ".process.json"), {
+        "version": 1,
+        "operation_id": receipt["operation_id"],
+        "outcome": receipt["outcome"],
+        "group_drained": receipt["group_drained"],
+        "receipt_path": str(receipt_path),
+    })
+    os.replace(partial, final)
+    _fsync_dir(directory)
+    data = final.read_bytes()
+    return {
+        "exit_code": exit_code, "log_path": str(final),
+        "log_sha256": hashlib.sha256(data).hexdigest(), "log_bytes": len(data),
+        "process_receipt_path": str(receipt_path), "process_receipt": receipt,
+        "process_pointer_path": str(directory / (log_name + ".process.json")),
+        "recovered_after_owner_loss": True,
+    }
+
+
 def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: float = 600.0,
                env: Optional[Dict[str, str]] = None,
                pass_fds: Sequence[int] = (),
@@ -40,10 +204,7 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
     """跑真子进程，stdout+stderr 合流写 staging log（.partial → 原子改名）。返回
     {exit_code, log_path, log_sha256, log_bytes}。超时 → kill 并抛 subprocess.TimeoutExpired
     （.partial 留在 staging 供审计，不改名——半成品不冒充完整产物）。"""
-    if (not isinstance(log_name, str) or not log_name or len(log_name) > 128
-            or log_name in {".", ".."} or "/" in log_name or "\\" in log_name
-            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in log_name)):
-        raise ValueError("log_name 须为有界安全 basename")
+    _validate_log_name(log_name)
     context = dict(execution_context or {})
     if "log_name" in context and context["log_name"] != log_name:
         raise ValueError("execution_context.log_name 与 harness log_name 冲突")
@@ -119,29 +280,9 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
     exit_code = result.returncode
     # exit 侧车**先于** final 改名（原子 tmp→replace）：final 存在 ⟹ 退出码可读——崩后续跑须复用同一
     # exit 判定（非 0 的 eval 也会产 final，恢复方不得把失败进程的完整输出当成功续注册，codex BLOCKER）
-    exit_tmp = d / (log_name + f".exit.{os.getpid()}.{secrets.token_hex(6)}.tmp")
-    exit_fd = os.open(
-        exit_tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    try:
-        _write_all(exit_fd, str(exit_code).encode("ascii"))
-        os.fsync(exit_fd)
-    finally:
-        os.close(exit_fd)
-    os.replace(exit_tmp, d / (log_name + ".exit"))
-    dir_fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-                     | getattr(os, "O_CLOEXEC", 0))
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _ensure_exit_sidecar(d, log_name, exit_code)
     os.replace(partial, final)          # 原子改名：只有完整跑完的 log 得正式名（P6 staging 纪律）
-    dir_fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-                     | getattr(os, "O_CLOEXEC", 0))
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _fsync_dir(d)
     data = final.read_bytes()
     return {"exit_code": exit_code, "log_path": str(final),
             "log_sha256": hashlib.sha256(data).hexdigest(), "log_bytes": len(data),

@@ -49,7 +49,10 @@ def gate_authorizer(action, arg1, arg2, arg3, arg4):
 # （test_gate_isolation 的闭包测试 = §6.13(2)③）。建为 TEMP VIEW：per-连接、落 sqlite_temp_master，
 # 不进冻结主 schema 的 36/72/29/1 计数。形状按 gate_close_question 判据裁剪（非 SELECT-*，减少暴露面）。
 GATE_INPUT_VIEWS = """
-CREATE TEMP VIEW gate_input_cycle AS SELECT id, status FROM cycle;
+CREATE TEMP VIEW gate_input_cycle AS
+  SELECT id, status, goal_id, goal_ver, active_question_id FROM cycle;
+CREATE TEMP VIEW gate_input_goal_current AS
+  SELECT id AS goal_id, MAX(version) AS goal_ver FROM goal GROUP BY id;
 CREATE TEMP VIEW gate_input_question AS SELECT id, status, goal_id, goal_ver FROM question;
 CREATE TEMP VIEW gate_input_measurement AS
   SELECT mr.id AS metric_result_id, mr.evaluation_id, mr.evaluation_attempt_id, mr.metric_id, mr.metric_ver, mr.scope,
@@ -62,7 +65,7 @@ CREATE TEMP VIEW gate_input_child_answer AS SELECT id AS answer_id, question_id,
 CREATE TEMP VIEW gate_input_applicability AS SELECT answer_id, goal_id, goal_ver, status FROM answer_applicability;
 CREATE TEMP VIEW gate_input_decision_human AS SELECT id FROM decision WHERE actor = 'human';
 """
-GATE_INPUT_VIEW_NAMES = ("gate_input_cycle", "gate_input_question", "gate_input_measurement", "gate_input_build_target",
+GATE_INPUT_VIEW_NAMES = ("gate_input_cycle", "gate_input_goal_current", "gate_input_question", "gate_input_measurement", "gate_input_build_target",
                          "gate_input_child_answer", "gate_input_applicability", "gate_input_decision_human")
 
 
@@ -160,10 +163,41 @@ class SqliteGate:
         DB 触发器（trg_q_i3 / trg_evidence_* / trg_answer_goalver）是最终焊死层，本函数是可行动错误 + 触发器
         未覆盖的 gate 级判据（target_complete / applicability 同版负向）的前置门禁。
         """
+        rejected = None
+        aid = None
+        with self.daemon.transaction() as conn:
+            try:
+                aid = self.gate_close_question_in_txn(
+                    conn, cycle_id=cycle_id, question_id=question_id, verdict=verdict,
+                    evidence=evidence, answer_md=answer_md)
+            except GateReject as error:
+                # in-txn 入口已在同一事务写 gate reject；在 with 内吞到提交边，
+                # 提交审计后再向调用方抛业务拒绝。
+                rejected = error
+        if rejected is not None:
+            raise rejected
+        return aid
+
+    def gate_close_question_in_txn(
+            self, conn: sqlite3.Connection, *, cycle_id: str, question_id: str,
+            verdict: str, evidence: List[Dict[str, Any]], answer_md: str) -> str:
+        """在调用方现有 WriteDaemon 事务内提交关问，供 reasoning 全序原子提交。
+
+        业务拒绝会在同一外层事务写 ``decision(gate,reject)`` 后抛 ``GateReject``；调用方必须在
+        外层 ``with transaction`` **内部**接住它并完成失败收尾，才能让审计随失败终态一起提交。
+        Gate 自己的写段用 SAVEPOINT 隔离，已知 I3 触发器拒绝不会留下 answer/evidence 半写。
+        """
+        if not self.daemon.owns_active_transaction(conn):
+            raise GateInvariantError("gate_close_question_in_txn 须使用本 WriteDaemon 的 active transaction")
+
         qi = _num(question_id, "q")
         ci = _num(cycle_id, "c")
-        rej = lambda msg: self._reject(cycle_id, qi, msg, question_id_raw=question_id)   # 顶层拒统一带原始 question_id
-        if ci is None or self._q1("SELECT 1 FROM gate_input_cycle WHERE id=?", (ci,)) is None:
+        rej = lambda msg: self._reject(  # 顶层拒统一带原始 question_id
+            cycle_id, qi, msg, question_id_raw=question_id, conn=conn)
+        crow = self._q1(
+            "SELECT status,goal_id,goal_ver,active_question_id FROM gate_input_cycle WHERE id=?",
+            (ci,)) if ci is not None else None
+        if ci is None or crow is None:
             rej(f"cycle 不存在/非法: {cycle_id!r}")   # 预校验，避免 answer.cycle_id FK 撞裸约束错
         qrow = self._q1("SELECT status, goal_id, goal_ver FROM gate_input_question WHERE id=?", (qi,)) if qi else None
         if qrow is None:
@@ -171,6 +205,13 @@ class SqliteGate:
         status, goal_id, goal_ver = qrow
         if status in ("answered", "refuted", "dead_end"):
             rej(f"question 已终态（{status}），不可关")
+        current = self._q1(
+            "SELECT goal_ver FROM gate_input_goal_current WHERE goal_id=?", (goal_id,))
+        if (crow[0] in ("done", "failed", "aborted") or crow[3] != qi
+                or status != "active" or (crow[1], crow[2]) != (goal_id, goal_ver)
+                or current is None or current[0] != goal_ver):
+            rej(
+                "关问 lineage 非法：须 current 非终态 cycle 的 active Qn，且 cycle/question goal 完全一致")
         if verdict not in ("answered", "refuted"):
             rej(f"verdict 非法: {verdict}")
         if not evidence:
@@ -178,39 +219,77 @@ class SqliteGate:
 
         resolved = []   # 逐条证据形状/引用/非成功测量校验（触发器兜底项）通过后的落库参数
         for ev in evidence:
-            resolved.append(self._validate_evidence(cycle_id, qi, ev))
+            resolved.append(self._validate_evidence(cycle_id, qi, ev, reject_conn=conn))
 
         # 写：先在写锁内**重跑 gate-only 不变量**（target_complete / applicability 同版负向——无触发器兜底，
         # §4.1.3「提交在事务内重新跑校验」；BEGIN IMMEDIATE 持写锁 → 期间无并发提交 → self.read 见冻结的
         # 已提交态，杜绝校验↔写入间被别的写事务改状态的 TOCTOU）→ 再写 answer+evidence+迁移+resolve dep。
         # except IntegrityError：触发器/CHECK 焊死的 I3 分支（child 子树/子问题未关/跨版）撞 ABORT → 转干净拒
         # （只收约束类，database-locked / IO 等基础设施错原样抛，不误记为 gate reject）。
-        gate_err = None
-        aid = None
-        try:
-            with self.daemon.transaction() as conn:
-                gate_err = self._gate_only_violation(resolved, goal_id, goal_ver)
-                if gate_err is None:      # gate-only 过：落库（触发器兜底其余 I3）
-                    aid = conn.execute(
-                        "INSERT INTO answer(question_id,goal_id,goal_ver,cycle_id,verdict,answer_md) VALUES (?,?,?,?,?,?)",
-                        (qi, goal_id, goal_ver, ci, verdict, answer_md)).lastrowid
-                    for r in resolved:
-                        self._insert_evidence(conn, aid, qi, goal_id, goal_ver, r)
-                    conn.execute("UPDATE question SET status=?, closed_cycle=? WHERE id=?", (verdict, ci, qi))
-                    conn.execute("UPDATE question_dep SET status='satisfied' WHERE status='pending' AND dep_type='question' "
-                                 "AND depends_on_question_id=?", (qi,))
-                # gate_err 非空 → 不写、空事务照常提交（无半写），出块后 _reject
-        except sqlite3.IntegrityError as e:
-            detail = str(e)
-            if any(marker in detail for marker in _EXPECTED_I3_INTEGRITY_MARKERS):
-                gate_err = f"DB 不变量拒绝: {e}"
-            else:
-                raise GateInvariantError(f"gate_close_question 命中非预期 DB 约束: {e}") from e
+        gate_err = self._lineage_violation(conn, ci, qi)
+        if gate_err is None:
+            gate_err = self._gate_only_violation(resolved, goal_id, goal_ver, conn=conn)
         if gate_err is not None:
-            self._reject(cycle_id, qi, gate_err, question_id_raw=question_id)   # 事务已（空）提交/回滚，_reject 另开短事务记 DECISION
+            rej(gate_err)
+
+        savepoint = "gate_close_question_write"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            aid = conn.execute(
+                "INSERT INTO answer(question_id,goal_id,goal_ver,cycle_id,verdict,answer_md) VALUES (?,?,?,?,?,?)",
+                (qi, goal_id, goal_ver, ci, verdict, answer_md)).lastrowid
+            for r in resolved:
+                self._insert_evidence(conn, aid, qi, goal_id, goal_ver, r)
+            conn.execute("UPDATE question SET status=?, closed_cycle=? WHERE id=?", (verdict, ci, qi))
+            # 关问即释放本轮 active-question 租约；answer/cycle_id 保留历史锚。
+            released = conn.execute(
+                "UPDATE cycle SET active_question_id=NULL WHERE id=? AND active_question_id=?",
+                (ci, qi)).rowcount
+            if released != 1:
+                raise GateInvariantError(
+                    f"关问提交时 active_question 租约丢失: cycle={cycle_id}, question={question_id}")
+            conn.execute(
+                "UPDATE question_dep SET status='satisfied' WHERE status='pending' AND dep_type='question' "
+                "AND depends_on_question_id=?", (qi,))
+        except sqlite3.IntegrityError as error:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+            conn.execute(f"RELEASE {savepoint}")
+            detail = str(error)
+            if any(marker in detail for marker in _EXPECTED_I3_INTEGRITY_MARKERS):
+                self._reject(
+                    cycle_id, qi, f"DB 不变量拒绝: {error}",
+                    question_id_raw=question_id, conn=conn)
+            raise GateInvariantError(
+                f"gate_close_question 命中非预期 DB 约束: {error}") from error
+        except BaseException:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+            conn.execute(f"RELEASE {savepoint}")
+            raise
+        else:
+            conn.execute(f"RELEASE {savepoint}")
         return f"a{aid}"
 
-    def _gate_only_violation(self, resolved: List[Dict[str, Any]], goal_id: int, goal_ver: int) -> Optional[str]:
+    @staticmethod
+    def _lineage_violation(conn, cycle_id: int, question_id: int) -> Optional[str]:
+        """写锁内重核 current cycle↔active question lineage；旧 cycle 不得组合产生新版 answer。"""
+        cycle = conn.execute(
+            "SELECT status,goal_id,goal_ver,active_question_id FROM cycle WHERE id=?",
+            (cycle_id,)).fetchone()
+        question = conn.execute(
+            "SELECT status,goal_id,goal_ver FROM question WHERE id=?", (question_id,)).fetchone()
+        if cycle is None or question is None:
+            return "cycle/question 在提交前消失"
+        current = conn.execute(
+            "SELECT MAX(version) FROM goal WHERE id=?", (cycle[1],)).fetchone()
+        if (cycle[0] in ("done", "failed", "aborted") or cycle[3] != question_id
+                or question[0] != "active" or tuple(cycle[1:3]) != tuple(question[1:3])
+                or current is None or current[0] != cycle[2]):
+            return ("关问 lineage 非法：cycle 必须非终态并指向 active question，"
+                    "且二者绑定同一 current goal version")
+        return None
+
+    def _gate_only_violation(self, resolved: List[Dict[str, Any]], goal_id: int, goal_ver: int,
+                             *, conn: Optional[sqlite3.Connection] = None) -> Optional[str]:
         """无触发器兜底的 gate-only 不变量（写锁内重跑，TOCTOU-safe）：target_complete + applicability 同版负向。
         经 self.read（受限连接 + gate_input 视图）取数；返回首个违规拒因或 None。"""
         for r in resolved:
@@ -220,27 +299,46 @@ class SqliteGate:
                 # §4.1.4/§4.3.1：证据 attempt 被 parser 派生标存疑 → 拒（负向过滤：只挡引用、不支持结论）
                 return f"evidence attempt {r['evaluation_attempt_id']} 被 parser_result_suspect 标存疑，不可作证据"
             if r["kind"] == "evaluation" and r.get("build_target_id") is not None:
-                bt = self._q1("SELECT status FROM gate_input_build_target WHERE id=?", (r["build_target_id"],))
+                bt = (conn.execute("SELECT status FROM build_target WHERE id=?", (r["build_target_id"],)).fetchone()
+                      if conn is not None else
+                      self._q1("SELECT status FROM gate_input_build_target WHERE id=?", (r["build_target_id"],)))
                 if bt is None or bt[0] != "complete":
                     return f"evaluation 证据未过 target_complete（build_target={bt[0] if bt else '缺'}）"
             elif r["kind"] == "child_answer":
-                app = self._q1("SELECT status FROM gate_input_applicability WHERE answer_id=? AND goal_id=? AND goal_ver=?",
-                               (r["child_answer_id"], goal_id, goal_ver))
+                params = (r["child_answer_id"], goal_id, goal_ver)
+                app = (conn.execute(
+                    "SELECT status FROM answer_applicability WHERE answer_id=? AND goal_id=? AND goal_ver=?",
+                    params).fetchone() if conn is not None else self._q1(
+                    "SELECT status FROM gate_input_applicability WHERE answer_id=? AND goal_id=? AND goal_ver=?",
+                    params))
                 if app is not None and app[0] != "still_applicable":
                     return f"child_answer 所指 answer 在当前 goal_ver applicability={app[0]}（非 still_applicable）"
         return None
 
-    def _reject(self, cycle_id, qi, msg: str, question_id_raw=None):
+    def _reject(self, cycle_id, qi, msg: str, question_id_raw=None,
+                conn: Optional[sqlite3.Connection] = None):
         # cycle_id / question_id 都可能是不存在的引用（拒因正是「不存在」）——decision 的 FK 列写 NULL、
         # 原始 attempted 值入 payload，否则 _reject 自身 INSERT 会撞 FK、把「干净拒 + 记 DECISION」搞砸。
         # attempted_question 记**原始**入参串（顶层传 question_id_raw；内部校验期 qi 已确知存在→回编 q{qi}）。
         ci = _num(cycle_id, "c")
         att_q = question_id_raw if question_id_raw is not None else (f"q{qi}" if qi is not None else None)
-        with self.daemon.transaction() as conn:
-            cref = ci if ci is not None and conn.execute("SELECT 1 FROM cycle WHERE id=?", (ci,)).fetchone() else None
-            qref = qi if qi is not None and conn.execute("SELECT 1 FROM question WHERE id=?", (qi,)).fetchone() else None
-            conn.execute("INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) VALUES (?,?,'gate','reject',?)",
-                         (cref, qref, json.dumps({"reason": msg, "attempted_cycle": cycle_id, "attempted_question": att_q})))
+        def record(target_conn):
+            cref = ci if ci is not None and target_conn.execute(
+                "SELECT 1 FROM cycle WHERE id=?", (ci,)).fetchone() else None
+            qref = qi if qi is not None and target_conn.execute(
+                "SELECT 1 FROM question WHERE id=?", (qi,)).fetchone() else None
+            target_conn.execute(
+                "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+                "VALUES (?,?,'gate','reject',?)",
+                (cref, qref, json.dumps({"reason": msg, "attempted_cycle": cycle_id,
+                                        "attempted_question": att_q})))
+        if conn is None:
+            with self.daemon.transaction() as owned_conn:
+                record(owned_conn)
+        else:
+            if not self.daemon.owns_active_transaction(conn):
+                raise GateInvariantError("gate reject 审计须使用本 WriteDaemon 的 active transaction")
+            record(conn)
         raise GateReject(msg)
 
     def _evidence_ref_errors(self, ev: Dict[str, Any]) -> List[str]:
@@ -257,7 +355,8 @@ class SqliteGate:
                 return [f"evidence.human_ref 无 actor=human 的 decision: {ev.get('human_ref')}"]
         return []
 
-    def _validate_evidence(self, cycle_id, qi, ev: Dict[str, Any]) -> Dict[str, Any]:
+    def _validate_evidence(self, cycle_id, qi, ev: Dict[str, Any],
+                           *, reject_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
         """单条证据的形状 + 引用 + 触发器兜底项（非成功测量）预检；解析落库字段。
         target_complete / applicability 同版负向（无触发器兜底）在写锁内 _gate_only_violation 重跑，不在此。"""
         # 形状再校验（§4.1.3：commit 不信任上游预检）——kind 合法 + 该态必需键在（缺则干净拒、非 KeyError）
@@ -265,16 +364,16 @@ class SqliteGate:
                     "child_answer": "child_question_id", "human": "human_ref"}
         kind = ev.get("kind")
         if kind not in required:
-            self._reject(cycle_id, qi, f"evidence.kind 非法: {kind!r}")
+            self._reject(cycle_id, qi, f"evidence.kind 非法: {kind!r}", conn=reject_conn)
         if not ev.get(required[kind]):
-            self._reject(cycle_id, qi, f"evidence({kind}) 缺必需键 {required[kind]}")
+            self._reject(cycle_id, qi, f"evidence({kind}) 缺必需键 {required[kind]}", conn=reject_conn)
         referr = self._evidence_ref_errors(ev)
         if referr:
-            self._reject(cycle_id, qi, referr[0])
+            self._reject(cycle_id, qi, referr[0], conn=reject_conn)
         if kind == "evaluation":
-            r = self._validate_eval_evidence(cycle_id, qi, ev)
+            r = self._validate_eval_evidence(cycle_id, qi, ev, reject_conn=reject_conn)
         elif kind == "child_answer":
-            r = self._validate_child_evidence(cycle_id, qi, ev)
+            r = self._validate_child_evidence(cycle_id, qi, ev, reject_conn=reject_conn)
         elif kind == "literature":
             r = {"kind": "literature", "literature_ref": ev["citation_md"]}
         else:
@@ -282,21 +381,24 @@ class SqliteGate:
         r["claim_md"] = ev.get("note_md") or "(见 answer 正文)"   # 证据支持的论断（note 可选；evidence.claim_md NOT NULL）
         return r
 
-    def _validate_eval_evidence(self, cycle_id, qi, ev: Dict[str, Any]) -> Dict[str, Any]:
+    def _validate_eval_evidence(self, cycle_id, qi, ev: Dict[str, Any],
+                                *, reject_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
         mrid = _num(ev["metric_result_id"], "mr")
         row = self._q1(
             "SELECT evaluation_id, evaluation_attempt_id, metric_id, metric_ver, scope, "
             "eval_status, attempt_status, build_target_id FROM gate_input_measurement WHERE metric_result_id=?", (mrid,))
         eval_id, att_id, metric_id, metric_ver, scope, e_st, ea_st, bt_id = row
         if e_st != "success" or ea_st != "success":    # 触发器 trg_evidence_eval_valid 兜底；此处给可行动错误
-            self._reject(cycle_id, qi, f"evaluation 证据非成功测量（eval={e_st}, attempt={ea_st}）")
+            self._reject(cycle_id, qi, f"evaluation 证据非成功测量（eval={e_st}, attempt={ea_st}）",
+                         conn=reject_conn)
         # target_complete / parser_result_suspect(M4) 不在此——前者移到 _gate_only_violation（写锁内重跑，TOCTOU-safe）。
         # build_target_id 带回，供 _gate_only_violation 用（NULL 如 standalone_eval / M4 import 来源 → 无 target 可谈）。
         return {"kind": "evaluation", "evaluation_id": eval_id, "evaluation_attempt_id": att_id,
                 "metric_result_id": mrid, "metric_id": metric_id, "metric_ver": metric_ver, "scope": scope,
                 "build_target_id": bt_id}
 
-    def _validate_child_evidence(self, cycle_id, qi, ev: Dict[str, Any]) -> Dict[str, Any]:
+    def _validate_child_evidence(self, cycle_id, qi, ev: Dict[str, Any],
+                                 *, reject_conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
         cq = _num(ev["child_question_id"], "q")
         # 子问题的 answer（一问一 goal_ver 一 answer）；取最新版本的 answer。applicability 同版负向不在此——
         # 移到 _gate_only_violation（写锁内重跑，无触发器兜底、须 TOCTOU-safe）。
@@ -304,7 +406,8 @@ class SqliteGate:
         # 跨版分支要求 still_applicable；本轮单版本不触发，跨版则由写路径 except 兜底为干净拒（见 gate_close_question）。
         arow = self._q1("SELECT answer_id FROM gate_input_child_answer WHERE question_id=? ORDER BY goal_ver DESC LIMIT 1", (cq,))
         if arow is None:
-            self._reject(cycle_id, qi, f"child_answer 子问题无 answer: {ev['child_question_id']}")
+            self._reject(cycle_id, qi, f"child_answer 子问题无 answer: {ev['child_question_id']}",
+                         conn=reject_conn)
         return {"kind": "child_answer", "child_answer_id": arow[0]}
 
     def _insert_evidence(self, conn, aid, qi, goal_id, goal_ver, r: Dict[str, Any]) -> None:

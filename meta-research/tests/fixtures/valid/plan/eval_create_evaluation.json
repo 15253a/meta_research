@@ -15,7 +15,8 @@
       "eval_action": "create_evaluation",
       "attempt_purpose": "protocol_upgrade",
       "eval_key": "upgrade-v2-1",
-      "evaluation_source": "protocol_upgrade"
+      "evaluation_source": "protocol_upgrade",
+      "claim": { "baseline_ref": "existing-family", "variant_key": "base" }
     }
   ],
   "protocol": {

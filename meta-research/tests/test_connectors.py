@@ -609,6 +609,9 @@ def test_research_notifier_covers_failure_block_summary_and_applicability(tmp_pa
             "INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,failure_kind) "
             "VALUES (3,1,1,'exec',3,'engineering_blocked','environment')")
         conn.execute(
+            "INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,failure_kind) "
+            "VALUES (4,1,1,'build',4,'failed','timeout')")
+        conn.execute(
             "INSERT INTO answer_applicability(answer_id,goal_id,goal_ver,audit_cycle,status,rationale_md) "
             "VALUES (1,1,1,2,'obsolete','新目标不再包含旧范围')")
 
@@ -616,9 +619,10 @@ def test_research_notifier_covers_failure_block_summary_and_applicability(tmp_pa
     notifier = ResearchNotifier(daemon, outbox, audit_cadence_k=2)
     keys = notifier.scan()
     kinds = {event["kind"] for event in outbox._events()}
-    assert {"cycle_failed", "engineering_blocked", "cycle_summary",
+    assert {"cycle_failed", "build_target_failed", "engineering_blocked", "cycle_summary",
             "answer_applicability_changed"} <= kinds
     assert "cycle:1:failed" in keys and "cycle:2:summary" in keys
+    assert "build_target:4:failed" in keys
     assert notifier.scan() == []
 
     with daemon.transaction() as conn:

@@ -24,6 +24,7 @@ IntegrityError→干净拒兜其余。引入多写者（M5）时须升级为写�
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from typing import Any, Dict, List, Optional
 
@@ -75,13 +76,58 @@ class ExecGate:
         p = json.loads(row[1])   # json_valid 已保证可解析
         if p.get("verdict") != "pass" or p.get("subject_hash") != current_subject_hash:
             return False
-        rc = self._q1("SELECT status, phase, purpose FROM runner_call WHERE id=?", (p.get("runner_call_id"),))
-        return rc is not None and rc[0] == "success" and rc[1] == "audit" and rc[2] == review_kind
+        rc = self._q1(
+            "SELECT status,phase,purpose,cycle_id FROM runner_call WHERE id=?",
+            (p.get("runner_call_id"),))
+        target = self._q1("SELECT cycle_id FROM build_target WHERE id=?", (build_target_id,))
+        return (rc is not None and target is not None and rc[0] == "success"
+                and rc[1] == "audit" and rc[2] == review_kind and rc[3] == target[0])
 
     # -- build_target 生命周期 ---------------------------------------------------
     def _bt(self, build_target_id: int):
         return self._q1("SELECT id, cycle_id, target_kind, seq, status, baseline_id, variant_id, evaluation_id, "
                         "eval_action FROM build_target WHERE id=?", (build_target_id,))
+
+    def _assert_current_cycle(self, cycle_id: int, *, action: str) -> tuple[int, int]:
+        cycle = self._q1(
+            "SELECT goal_id,goal_ver,status FROM cycle WHERE id=?", (cycle_id,))
+        if cycle is None:
+            self._reject(None, f"{action}: cycle c{cycle_id} 不存在")
+        current = self._q1("SELECT MAX(version) FROM goal WHERE id=?", (cycle[0],))
+        if (current is None or current[0] != cycle[1]
+                or cycle[2] in ("done", "failed", "aborted")):
+            self._reject(
+                cycle_id, f"{action}: cycle c{cycle_id} 非 current writable lineage"
+                f"（绑定 {cycle[0]}@v{cycle[1]}，current={current[0] if current else None}，status={cycle[2]}）")
+        return int(cycle[0]), int(cycle[1])
+
+    def _assert_current_target(self, cycle_id: int, build_target_id: int, *, action: str) -> None:
+        goal_id, goal_ver = self._assert_current_cycle(cycle_id, action=action)
+        row = self._q1(
+            "SELECT bt.cycle_id,bt.question_id,c.active_question_id,q.goal_id,q.goal_ver,q.status,"
+            "bt.target_kind,c.route "
+            "FROM build_target bt JOIN cycle c ON c.id=bt.cycle_id "
+            "LEFT JOIN question q ON q.id=bt.question_id WHERE bt.id=?",
+            (build_target_id,))
+        lineage_ok = (row is not None and row[0] == cycle_id and row[1] is not None
+                      and (row[3], row[4]) == (goal_id, goal_ver))
+        research_owned = bool(
+            lineage_ok and row[1] == row[2] and row[5] == "active")
+        # import 物化轮不是七类研究轮，不会把被 baseline dependency 挡住的问题伪装成 active。
+        # 它以 durable import_worker_cycle marker 精确绑定 question；只允许唯一的 import target
+        # 消费该绑定。这样既不放宽普通研究 target，也不让 worker 劫持问题 active lease。
+        worker_owned = False
+        if (lineage_ok and row[2] is None and row[5] in ("open", "inconclusive")
+                and row[6] == "import" and row[7] is None):
+            worker_owned = self._q1(
+                "SELECT 1 FROM decision WHERE cycle_id=? AND actor='orchestrator' "
+                "AND type='import_worker_cycle' AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.question_id')=? "
+                "AND json_type(payload_json,'$.external_import_id')='integer' "
+                "ORDER BY id DESC LIMIT 1", (cycle_id, row[1])) is not None
+        if not (research_owned or worker_owned):
+            self._reject(
+                cycle_id, f"{action}: target {build_target_id} 未绑定 cycle 的 exact active current question")
 
     def gate_start_build_target(self, *, build_target_id: int) -> None:
         """pending → building（build/exec/import，池对象连动 building）/ running（eval，不动池）。
@@ -91,11 +137,20 @@ class ExecGate:
         if bt is None:
             self._reject(None, f"build_target 不存在: {build_target_id}", attempted_target=build_target_id)
         _, ci, kind, _seq, status, bl, var, _eid, _ea = bt
+        self._assert_current_target(ci, build_target_id, action="start_build_target")
         if status != "pending":
             self._reject(ci, f"build_target {build_target_id} 非 pending（当前 {status}），不可 start")
         inflight = self._q1("SELECT id FROM build_target WHERE cycle_id=? AND status IN ('building','smoke','running')", (ci,))
         if inflight:
             self._reject(ci, f"目标间串行（§4.2.5）：target {inflight[0]} 尚在途，不可并行 start {build_target_id}")
+        stopped = self._q1(
+            "SELECT id,status FROM build_target WHERE cycle_id=? AND seq<? AND "
+            "((critical=1 AND status='failed') OR status='engineering_blocked') "
+            "ORDER BY seq LIMIT 1", (ci, _seq))
+        if stopped is not None:
+            self._reject(
+                ci, f"target {stopped[0]}({stopped[1]}) 已触发 bundle 早退；"
+                f"后继 target {build_target_id} 只能置 skipped，不得启动")
         cur = self._q1("SELECT id FROM build_target WHERE cycle_id=? AND status NOT IN "
                        "('complete','skipped','failed','engineering_blocked') ORDER BY seq LIMIT 1", (ci,))
         if cur is None or cur[0] != build_target_id:
@@ -119,6 +174,7 @@ class ExecGate:
         if bt is None:
             self._reject(None, f"build_target 不存在: {build_target_id}", attempted_target=build_target_id)
         _, ci, _kind, _seq, status, *_ = bt
+        self._assert_current_target(ci, build_target_id, action="progress_build_target")
         legal = {("building", "smoke"), ("smoke", "running")}
         if (status, to) not in legal:
             self._reject(ci, f"build_target 非法迁移 {status}→{to}（只许 building→smoke→running）")
@@ -139,10 +195,25 @@ class ExecGate:
         if bt is None:
             self._reject(None, f"build_target 不存在: {build_target_id}", attempted_target=build_target_id)
         _, ci, kind, _seq, cur_status, bl, var, eid, eval_action = bt
+        if status == "complete":
+            self._assert_current_target(ci, build_target_id, action="complete_build_target")
         if status not in _TERMINAL_TARGET:
             self._reject(ci, f"build_target 终态非法: {status}")
         if cur_status in _TERMINAL_TARGET:
             self._reject(ci, f"build_target {build_target_id} 已终态（{cur_status}），不可再 finish")
+        if status == "skipped":
+            if cur_status != "pending":
+                self._reject(ci, f"skipped 只表示从未执行，只许 pending→skipped（当前 {cur_status}）")
+            if failure_kind is not None:
+                self._reject(ci, "skipped 不得携 failure_kind")
+            self._assert_current_target(ci, build_target_id, action="skip_build_target")
+            stopped = self._q1(
+                "SELECT id,status FROM build_target WHERE cycle_id=? AND seq<? AND "
+                "((critical=1 AND status='failed') OR status='engineering_blocked') "
+                "ORDER BY seq LIMIT 1", (ci, _seq))
+            if stopped is None:
+                self._reject(
+                    ci, "skipped 仅允许在此前 critical failure / engineering_blocked 触发 bundle 早退后写入")
         if status == "complete":
             if eval_action is not None:   # 承评目标：其 evaluation 须 success
                 if eval_action == "create_evaluation":
@@ -164,6 +235,14 @@ class ExecGate:
                 if vrow is None or vrow[0] != "legal":
                     self._reject(ci, f"complete 前置不满足：variant {var} 未注册 legal（当前 "
                                      f"{vrow[0] if vrow else '缺失'}）——先 gate_register_*")
+            if kind == "eval":
+                attempt = self._q1(
+                    "SELECT 1 FROM evaluation_attempt WHERE build_target_id=? AND status='success' LIMIT 1",
+                    (build_target_id,))
+                if attempt is None:
+                    self._reject(
+                        ci, f"complete 前置不满足：eval target {build_target_id} "
+                        "无本 target 的 success evaluation_attempt")
         with self.daemon.transaction() as conn:
             conn.execute("UPDATE build_target SET status=?, failure_kind=? WHERE id=?",
                          (status, failure_kind, build_target_id))
@@ -175,6 +254,63 @@ class ExecGate:
                     conn.execute("UPDATE baseline SET status='build_failed' WHERE id=? AND status IN ('planned','building')", (bl,))
                 if var is not None:
                     conn.execute("UPDATE variant SET status='build_failed' WHERE id=? AND status IN ('planned','building')", (var,))
+            elif status == "skipped" and kind in ("build", "exec", "import"):
+                # plan 已在 bundle 前占坑；未执行旁路必须释放身份键，否则后续轮永远撞 I5。
+                if kind in ("build", "import") and bl is not None:
+                    conn.execute("UPDATE baseline SET status='abandoned' WHERE id=? AND status='planned'", (bl,))
+                if var is not None:
+                    conn.execute("UPDATE variant SET status='abandoned' WHERE id=? AND status='planned'", (var,))
+
+    def gate_skip_remaining_targets(self, *, failed_target_id: int) -> List[int]:
+        """在 critical failure / engineering_blocked 后原子跳过所有尚未执行的后继目标。
+
+        返回本次或此前已收敛为 skipped 的后继 id，供编排器幂等补 phase_commit。池占坑与 target
+        同事务转 abandoned；任何后继已经开工都表示串行/恢复不变量损坏，必须 fail loud。
+        """
+        failed = self._bt(failed_target_id)
+        if failed is None:
+            self._reject(None, f"build_target 不存在: {failed_target_id}")
+        _, ci, _kind, seq, status, *_ = failed
+        self._assert_current_target(ci, failed_target_id, action="skip_remaining_targets")
+        critical = self._q1("SELECT critical FROM build_target WHERE id=?", (failed_target_id,))[0]
+        if not (status == "engineering_blocked" or (status == "failed" and critical == 1)):
+            self._reject(
+                ci, f"target {failed_target_id} 未触发早退（status={status}, critical={critical}）")
+        rows = self.read.execute(
+            "SELECT id,target_kind,status,baseline_id,variant_id FROM build_target "
+            "WHERE cycle_id=? AND seq>? ORDER BY seq", (ci, seq)).fetchall()
+        bad = [(row[0], row[2]) for row in rows if row[2] not in ("pending", "skipped")]
+        if bad:
+            self._reject(ci, f"早退后继目标已有执行/其他终态，拒绝掩盖串行损坏: {bad}")
+        with self.daemon.transaction() as conn:
+            for target_id, kind, target_status, baseline_id, variant_id in rows:
+                if target_status == "skipped":
+                    continue
+                conn.execute(
+                    "UPDATE build_target SET status='skipped',failure_kind=NULL WHERE id=? AND status='pending'",
+                    (target_id,))
+                if kind in ("build", "import") and baseline_id is not None:
+                    conn.execute(
+                        "UPDATE baseline SET status='abandoned' WHERE id=? AND status='planned'",
+                        (baseline_id,))
+                if kind in ("build", "exec", "import") and variant_id is not None:
+                    conn.execute(
+                        "UPDATE variant SET status='abandoned' WHERE id=? AND status='planned'",
+                        (variant_id,))
+            if conn.execute(
+                    "SELECT 1 FROM decision WHERE actor='orchestrator' "
+                    "AND type='bundle_critical_early_exit' "
+                    "AND json_extract(payload_json,'$.failed_target_id')=? LIMIT 1",
+                    (failed_target_id,)).fetchone() is None:
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'orchestrator','bundle_critical_early_exit',?)",
+                    (ci, json.dumps({
+                        "failed_target_id": failed_target_id,
+                        "failure_status": status,
+                        "skipped_target_ids": [row[0] for row in rows],
+                    }, ensure_ascii=False, sort_keys=True)))
+        return [row[0] for row in rows]
 
     # -- run --------------------------------------------------------------------
     def gate_start_run(self, *, build_target_id: int, cycle_id: str, variant_id: int, kind: str,
@@ -187,6 +323,7 @@ class ExecGate:
         if bt is None:
             self._reject(ci, f"build_target 不存在: {build_target_id}", attempted_target=build_target_id)
         _, bt_ci, bt_kind, _seq, bt_status, _bl, bt_var, _eid, _ea = bt
+        self._assert_current_target(ci, build_target_id, action="start_run")
         if bt_status != "running":
             self._reject(ci, f"target {build_target_id} 非 running（当前 {bt_status}）——训练须在代码评审通过后")
         if bt_kind != kind or bt_ci != ci or bt_var != variant_id:
@@ -223,7 +360,9 @@ class ExecGate:
     # -- evaluation / attempt -----------------------------------------------------
     def gate_start_attempt(self, *, cycle_id: str, purpose: str, build_target_id: Optional[int] = None,
                            evaluation_id: Optional[int] = None, create: Optional[Dict[str, Any]] = None,
-                           env_hash: Optional[str] = None, commit_hash: Optional[str] = None) -> Dict[str, int]:
+                           env_hash: Optional[str] = None, commit_hash: Optional[str] = None,
+                           retry_of: Optional[int] = None, transcript_ref: Optional[str] = None,
+                           watchdog_sec: Optional[float] = None) -> Dict[str, int]:
         """create 模式（create={variant_id,protocol_id,protocol_ver,eval_key,source,target_set_hash}）→
         新 evaluation(created→running) + attempt#1；append 模式（evaluation_id）→ 既有 evaluation 追加 attempt。
         拒：两模式参数不恰一；purpose 非法；create 撞既有格子（I6 一格子一 eval）/缺 target_set_hash；
@@ -233,6 +372,23 @@ class ExecGate:
             self._reject(ci, "gate_start_attempt 须恰一模式：create=… 或 evaluation_id=…")
         if purpose not in _ATTEMPT_PURPOSES:
             self._reject(ci, f"attempt purpose 非法: {purpose}")
+        if watchdog_sec is not None and (
+                isinstance(watchdog_sec, bool) or not isinstance(watchdog_sec, (int, float))
+                or not math.isfinite(float(watchdog_sec)) or float(watchdog_sec) <= 0):
+            self._reject(ci, "attempt watchdog_sec 须为正有限数")
+        if purpose == "retry":
+            if retry_of is None or evaluation_id is None or create is not None:
+                self._reject(ci, "purpose=retry 须 append 同 evaluation 并显式给 retry_of")
+        elif retry_of is not None:
+            self._reject(ci, "非 retry attempt 不得携 retry_of")
+        self._assert_current_cycle(ci, action="start_attempt")
+        if build_target_id is not None:
+            self._assert_current_target(ci, build_target_id, action="start_attempt")
+            target = self._bt(build_target_id)
+            if target is None or target[4] != "running":
+                self._reject(
+                    ci, f"start_attempt 要求 target {build_target_id} 已 running"
+                    f"（当前 {target[4] if target else 'missing'}）")
         if create is not None:
             missing = [k for k in ("variant_id", "protocol_id", "protocol_ver", "eval_key", "source", "target_set_hash")
                        if create.get(k) in (None, "")]   # 判缺失/空串（这些字段无合法 0/False 值）
@@ -254,8 +410,10 @@ class ExecGate:
                      create["source"], ci, build_target_id, create["target_set_hash"])).lastrowid
                 aid = conn.execute(
                     "INSERT INTO evaluation_attempt(evaluation_id,cycle_id,build_target_id,attempt_no,purpose,"
-                    "status,env_hash,commit_hash,started_cycle) VALUES (?,?,?,1,?,'running',?,?,?)",
-                    (eid, ci, build_target_id, purpose, env_hash, commit_hash, ci)).lastrowid
+                    "status,env_hash,commit_hash,transcript_ref,watchdog_sec,started_cycle) "
+                    "VALUES (?,?,?,1,?,'running',?,?,?,?,?)",
+                    (eid, ci, build_target_id, purpose, env_hash, commit_hash,
+                     transcript_ref, watchdog_sec, ci)).lastrowid
                 conn.execute("UPDATE evaluation SET status='running' WHERE id=?", (eid,))
             return {"evaluation_id": eid, "attempt_id": aid, "attempt_no": 1}
         erow = self._q1("SELECT status FROM evaluation WHERE id=?", (evaluation_id,))
@@ -263,20 +421,31 @@ class ExecGate:
             self._reject(ci, f"append_attempt 的 evaluation 不存在: {evaluation_id}")
         if erow[0] == "abandoned":
             self._reject(ci, f"evaluation {evaluation_id} 已 abandoned，不可追加 attempt")
+        if retry_of is not None:
+            previous = self._q1(
+                "SELECT evaluation_id,status FROM evaluation_attempt WHERE id=?", (retry_of,))
+            if (previous is None or previous[0] != evaluation_id
+                    or previous[1] not in ("failed", "aborted")):
+                self._reject(
+                    ci, "retry_of 须指向同 evaluation 的 failed/aborted attempt")
         with self.daemon.transaction() as conn:
             n = conn.execute("SELECT COALESCE(MAX(attempt_no),0)+1 FROM evaluation_attempt WHERE evaluation_id=?",
                              (evaluation_id,)).fetchone()[0]
             aid = conn.execute(
                 "INSERT INTO evaluation_attempt(evaluation_id,cycle_id,build_target_id,attempt_no,purpose,"
-                "status,env_hash,commit_hash,started_cycle) VALUES (?,?,?,?,?,'running',?,?,?)",
-                (evaluation_id, ci, build_target_id, n, purpose, env_hash, commit_hash, ci)).lastrowid
+                "status,env_hash,commit_hash,retry_of,transcript_ref,watchdog_sec,started_cycle) "
+                "VALUES (?,?,?,?,?,'running',?,?,?,?,?,?)",
+                (evaluation_id, ci, build_target_id, n, purpose, env_hash, commit_hash,
+                 retry_of, transcript_ref, watchdog_sec, ci)).lastrowid
             if erow[0] in ("created", "failed"):   # 重试显式 failed→running（§4.1.4；success 保持不回退）
                 conn.execute("UPDATE evaluation SET status='running' WHERE id=?", (evaluation_id,))
         return {"evaluation_id": evaluation_id, "attempt_id": aid, "attempt_no": n}
 
     def gate_finish_attempt(self, *, attempt_id: int, status: str, failure_kind: Optional[str] = None,
                             metric_results: Optional[List[Dict[str, Any]]] = None,
-                            cost: Optional[float] = None) -> None:
+                            cost: Optional[float] = None,
+                            transcript_ref: Optional[str] = None,
+                            artifact_ref: Optional[str] = None) -> None:
         """attempt → success/failed/aborted。success：单事务写 metric_result[]（I2 前置核 + required 逐项核
         aggregate 覆盖）+ attempt success + evaluation success/canonical（首个成功 attempt 封 canonical）。"""
         row = self._q1("SELECT ea.status, ea.evaluation_id, ea.build_target_id, ea.cycle_id, e.protocol_id, "
@@ -289,12 +458,19 @@ class ExecGate:
             self._reject(ci, f"attempt {attempt_id} 非 running（当前 {cur}），不可 finish")
         if status not in ("success", "failed", "aborted"):
             self._reject(ci, f"attempt 终态非法: {status}")
+        if status == "success":
+            self._assert_current_cycle(ci, action="finish_attempt_success")
+            if bt_id is not None:
+                self._assert_current_target(ci, bt_id, action="finish_attempt_success")
         if status == "failed" and failure_kind is None:
             self._reject(ci, "attempt failed 须给 failure_kind")
         if status != "success":
             with self.daemon.transaction() as conn:
-                conn.execute("UPDATE evaluation_attempt SET status=?, failure_kind=?, cost=COALESCE(?,cost), "
-                             "completed_cycle=? WHERE id=?", (status, failure_kind, cost, ci, attempt_id))
+                conn.execute(
+                    "UPDATE evaluation_attempt SET status=?,failure_kind=?,cost=COALESCE(?,cost),"
+                    "transcript_ref=COALESCE(?,transcript_ref),artifact_ref=COALESCE(?,artifact_ref),"
+                    "completed_cycle=? WHERE id=?",
+                    (status, failure_kind, cost, transcript_ref, artifact_ref, ci, attempt_id))
             return
         mrs = metric_results or []
         for m in mrs:   # I2 前置：metric ∈ 本协议声明（触发器兜底，此处干净拒）
@@ -315,7 +491,9 @@ class ExecGate:
         try:
             with self.daemon.transaction() as conn:
                 conn.execute("UPDATE evaluation_attempt SET status='success', cost=COALESCE(?,cost), completed_cycle=? "
-                             "WHERE id=?", (cost, ci, attempt_id))
+                             ",transcript_ref=COALESCE(?,transcript_ref),"
+                             "artifact_ref=COALESCE(?,artifact_ref) WHERE id=?",
+                             (cost, ci, transcript_ref, artifact_ref, attempt_id))
                 for m in mrs:
                     conn.execute("INSERT INTO metric_result(evaluation_id,evaluation_attempt_id,metric_id,metric_ver,"
                                  "value,scope,checkpoint_id) VALUES (?,?,?,?,?,?,?)",

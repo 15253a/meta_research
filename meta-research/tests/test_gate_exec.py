@@ -20,14 +20,17 @@ from orchestrator.writedaemon import WriteDaemon
 def _seed(conn):
     conftest.seed_minimal(conn)
     conn.executescript("""
-    INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version) VALUES (2,1,1,'bundle','attack','v0');
+    INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source)
+      VALUES (2,1,1,1,'current q2','active','agent');
+    INSERT INTO cycle(id,goal_id,goal_ver,status,route,active_question_id,policy_version)
+      VALUES (2,1,1,'bundle','attack',2,'v0');
     INSERT INTO baseline(id,slug,canonical_key,status) VALUES (2,'b2','bk2','planned');
     INSERT INTO variant(id,baseline_id,variant_key,config_json,status) VALUES (2,2,'v2','{}','planned');
     -- bt10：build 目标（cycle2 seq1，pending）；bt11：eval 目标（cycle2 seq2，pending，required metric (1,1)）
     INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id)
-      VALUES (10,2,1,'build',1,'pending',2,2);
+      VALUES (10,2,2,'build',1,'pending',2,2);
     INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,variant_id,eval_action,eval_key,evaluation_source)
-      VALUES (11,2,1,'eval',2,'pending',2,'create_evaluation','e10','factory');
+      VALUES (11,2,2,'eval',2,'pending',2,'create_evaluation','e10','factory');
     INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) VALUES (11,1,1);
     """)
     conn.commit()
@@ -251,6 +254,47 @@ def test_finish_engineering_blocked_cascades_pool(env):
     assert d.query_one("SELECT status FROM variant WHERE id=2")[0] == "build_failed"
 
 
+def test_pending_target_cannot_be_skipped_without_early_exit(env):
+    gate, d = env
+    with pytest.raises(GateReject, match="skipped 仅允许"):
+        gate.gate_finish_build_target(build_target_id=10, status="skipped")
+    assert d.query_one("SELECT status FROM build_target WHERE id=10")[0] == "pending"
+
+
+def test_target_must_bind_exact_active_question(env):
+    gate, d = env
+    with d.transaction() as conn:
+        conn.execute("UPDATE build_target SET question_id=1 WHERE id=10")
+    with pytest.raises(GateReject, match="exact active current question"):
+        gate.gate_start_build_target(build_target_id=10)
+
+
+def test_critical_failure_skips_successors_idempotently(env):
+    gate, d = env
+    with d.transaction() as conn:
+        conn.execute("UPDATE build_target SET critical=1 WHERE id=10")
+    gate.gate_start_build_target(build_target_id=10)
+    gate.gate_finish_build_target(build_target_id=10, status="failed", failure_kind="runtime")
+    assert gate.gate_skip_remaining_targets(failed_target_id=10) == [11]
+    assert gate.gate_skip_remaining_targets(failed_target_id=10) == [11]
+    assert d.query_one("SELECT status FROM build_target WHERE id=11")[0] == "skipped"
+    assert d.query_one(
+        "SELECT count(*) FROM decision WHERE type='bundle_critical_early_exit'")[0] == 1
+
+
+def test_noncritical_failure_does_not_authorize_skip(env):
+    gate, d = env
+    with d.transaction() as conn:
+        conn.execute("UPDATE build_target SET critical=0 WHERE id=10")
+    gate.gate_start_build_target(build_target_id=10)
+    gate.gate_finish_build_target(build_target_id=10, status="failed", failure_kind="runtime")
+    with pytest.raises(GateReject, match="未触发早退"):
+        gate.gate_skip_remaining_targets(failed_target_id=10)
+    with pytest.raises(GateReject, match="skipped 仅允许"):
+        gate.gate_finish_build_target(build_target_id=11, status="skipped")
+    assert d.query_one("SELECT status FROM build_target WHERE id=11")[0] == "pending"
+
+
 def test_finish_attempt_bad_payload_clean_reject(env):
     """内审 SHOULD 回归：aggregate 带 checkpoint_id（DDL CHECK 违）→ 干净 GateReject + 审计，非裸 IntegrityError。"""
     gate, d = env
@@ -290,7 +334,9 @@ def test_append_retry_resets_failed_evaluation_to_running(env):
                                         "eval_key": "e10", "source": "factory", "target_set_hash": "tsh"})
     gate.gate_finish_attempt(attempt_id=r["attempt_id"], status="failed", failure_kind="runtime")
     gate.gate_finish_evaluation(evaluation_id=r["evaluation_id"])       # → failed
-    r2 = gate.gate_start_attempt(cycle_id="c2", purpose="retry", evaluation_id=r["evaluation_id"])
+    r2 = gate.gate_start_attempt(
+        cycle_id="c2", purpose="retry", evaluation_id=r["evaluation_id"],
+        retry_of=r["attempt_id"])
     assert d.query_one("SELECT status FROM evaluation WHERE id=?", (r["evaluation_id"],))[0] == "running"
     assert r2["attempt_no"] == 2
 
@@ -355,8 +401,8 @@ def test_import_target_start_moves_pool(env):
         conn.execute("INSERT INTO baseline(id,slug,canonical_key,status,provenance,license_status) "
                      "VALUES (3,'imp','ck-imp','planned','external_import','allow')")
         conn.execute("INSERT INTO variant(id,baseline_id,variant_key,config_json,status) VALUES (5,3,'imported','{}','planned')")
-        conn.execute("INSERT INTO build_target(id,cycle_id,target_kind,seq,status,baseline_id,variant_id) "
-                     "VALUES (12,2,'import',3,'pending',3,5)")
+        conn.execute("INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id) "
+                     "VALUES (12,2,2,'import',3,'pending',3,5)")
         conn.execute("UPDATE build_target SET status='complete' WHERE id IN (10,11)")   # 让 12 成当前串行目标
     gate.gate_start_build_target(build_target_id=12)
     assert d.query_one("SELECT status FROM baseline WHERE id=3")[0] == "building"

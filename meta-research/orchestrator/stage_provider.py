@@ -31,6 +31,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,9 +41,78 @@ from .harness import latest_smoke_log as _latest_smoke_log
 from .ids import cnum as _cnum
 from .interfaces import ContextPack, StageBlockedOnResources
 from .notify import FileRequestReject
+from .process_supervisor import atomic_write_receipt
 from .runner import RunnerError
 
 logger = logging.getLogger(__name__)
+
+_RECONCILE_PROTOCOL = "runner-call-v1"
+
+
+class _RunnerCallHeartbeat:
+    """Structured per-call liveness record referenced by runner_call.transcript_ref."""
+
+    def __init__(self, path: Path, *, runner_call_id: int, cycle_id: str,
+                 phase: str, purpose: str, interval_s: float = 5.0):
+        self.path = path
+        self.runner_call_id = runner_call_id
+        self.cycle_id = cycle_id
+        self.phase = phase
+        self.purpose = purpose
+        self.interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._seq = 0
+        self._error: Optional[BaseException] = None
+
+    def _write(self, state: str, *, execution_receipt_ref: Optional[str] = None) -> None:
+        self._seq += 1
+        payload = {
+            "protocol": _RECONCILE_PROTOCOL,
+            "signal_kind": "owner_liveness",
+            "runner_call_id": self.runner_call_id,
+            "cycle_id": self.cycle_id,
+            "phase": self.phase,
+            "purpose": self.purpose,
+            "state": state,
+            "heartbeat_seq": self._seq,
+            "heartbeat_at_unix": time.time(),
+            "execution_receipt_ref": execution_receipt_ref,
+        }
+        atomic_write_receipt(self.path, payload)
+
+    def start(self) -> None:
+        self._write("running")
+
+        def loop() -> None:
+            while not self._stop.wait(self.interval_s):
+                try:
+                    self._write("running")
+                except BaseException as error:  # heartbeat failure is checked at the call boundary
+                    self._error = error
+                    return
+
+        self._thread = threading.Thread(
+            target=loop, daemon=True, name=f"runner-call-heartbeat-{self.runner_call_id}")
+        self._thread.start()
+
+    def finish(self, state: str, *, execution_receipt_ref: Optional[str] = None) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(2.0, self.interval_s * 2))
+            if self._thread.is_alive():
+                raise RuntimeError(f"runner_call {self.runner_call_id} heartbeat thread 未停止")
+        if self._error is not None:
+            raise RuntimeError(
+                f"runner_call {self.runner_call_id} heartbeat 写失败") from self._error
+        self._write(state, execution_receipt_ref=execution_receipt_ref)
+
+
+def _bind_runner_call(runner, runner_call_id: int, *, phase: str, purpose: str) -> None:
+    bind = getattr(runner, "bind_runner_call", None)
+    if callable(bind):
+        bind(runner_call_id=runner_call_id, reconcile_protocol=_RECONCILE_PROTOCOL,
+             phase=phase, purpose=purpose)
 
 # 阶段 → 产物契约：required=阶段必产（缺即重试）、optional=在场才校验；passthrough=返回信封全部文件
 # （bundle 的代码文件名任意、不可枚举——由 attack_stages 按 manifest.code_files 物化并交叉核）。
@@ -110,13 +181,25 @@ class StageProvider:
         for attempt in range(self.retries + 1):
             skill = base_skill if not last_err else (
                 base_skill + f"\n\n===== 上次产物被拒（第 {attempt} 次重试）=====\n{last_err}\n请修正后重出。")
+            call = self._begin_cost_call(cyc, stage, runner, attempt)
             try:
                 art = runner.run_task(system_prompt=self.system_prompt, skill=skill, context_pack=pack)
             except RunnerError as e:               # 进程失败/超时/信封不可解析 → 计入重试
-                self._record_cost(cyc, stage, e.usage, status="failed", failure_kind="runner_error",
-                                  attempt=attempt)
+                self._record_cost(
+                    cyc, stage, e.usage, status="failed", failure_kind=e.failure_kind,
+                    attempt=attempt, call=call, transcript_ref=e.transcript_ref,
+                    execution_receipt_ref=e.execution_receipt_ref)
                 last_err = str(e)
                 continue
+            except Exception as error:             # lifecycle/control failure：调用已放行，必须收口同一 intent
+                self._record_cost(
+                    cyc, stage, getattr(error, "usage", None), status="failed",
+                    failure_kind=getattr(error, "failure_kind", type(error).__name__.lower()),
+                    attempt=attempt, call=call,
+                    transcript_ref=getattr(error, "transcript_ref", None),
+                    execution_receipt_ref=(getattr(error, "execution_receipt_ref", None)
+                                           or str(getattr(error, "receipt_path", "") or "") or None))
+                raise
             # 步⑩ CP10.2：每次真 LLM 调用都记账，但 runner_call 还要诚实区分「有效产物」与
             # 「进程成功但产物被拒」。因此各分支在结论确定后各记恰好一次；基础设施异常也会先
             # 记本次已发生的调用再 fail loud。session_max 启用时写账失败 fail-closed。
@@ -132,42 +215,87 @@ class StageProvider:
                 # - 未接桥（诊断装配）→ 保持 fail loud，绝不静默丢弃。
                 if self.file_request_bridge is None:
                     self._record_cost(cyc, stage, art.usage, status="failed",
-                                      failure_kind="artifact_parse", attempt=attempt)
+                                      failure_kind="artifact_parse", attempt=attempt, call=call,
+                                      transcript_ref=art.transcript_ref,
+                                      execution_receipt_ref=art.execution_receipt_ref)
                     raise RunnerError(f"{stage} 产出 resource_request.json sidecar，但本装配未接文件请求桥"
                                       "——不静默丢弃")
                 try:
                     rid = self.file_request_bridge(stage, art.files["resource_request.json"], cyc)
                 except FileRequestReject as e:  # 只兜业务拒（sidecar 非法/quota 尽）→ 反馈重试（有界）；
                     self._record_cost(cyc, stage, art.usage, status="failed",
-                                      failure_kind="artifact_parse", attempt=attempt)
+                                      failure_kind="artifact_parse", attempt=attempt, call=call,
+                                      transcript_ref=art.transcript_ref,
+                                      execution_receipt_ref=art.execution_receipt_ref)
                     last_err = f"resource_request sidecar 被拒: {e}"   # 其余异常（DB 损坏等）fail loud（内审 NIT）
                     continue
                 except Exception:              # noqa: BLE001 —— 调用已发生，先记账再保留原异常
                     self._record_cost(cyc, stage, art.usage, status="failed",
-                                      failure_kind="postprocess_error", attempt=attempt)
+                                      failure_kind="postprocess_error", attempt=attempt, call=call,
+                                      transcript_ref=art.transcript_ref,
+                                      execution_receipt_ref=art.execution_receipt_ref)
                     raise
-                self._record_cost(cyc, stage, art.usage, status="success", attempt=attempt)
+                self._record_cost(
+                    cyc, stage, art.usage, status="success", attempt=attempt, call=call,
+                    transcript_ref=art.transcript_ref,
+                    execution_receipt_ref=art.execution_receipt_ref)
                 raise StageBlockedOnResources(rid, stage)
             if art.stage != stage:              # 阶段漂移（外审 SHOULD）：文件对但 envelope stage 错 → 计入重试
                 self._record_cost(cyc, stage, art.usage, status="failed",
-                                  failure_kind="artifact_parse", attempt=attempt)
+                                  failure_kind="artifact_parse", attempt=attempt, call=call,
+                                  transcript_ref=art.transcript_ref,
+                                  execution_receipt_ref=art.execution_receipt_ref)
                 last_err = f"产物 stage 漂移：envelope stage={art.stage!r} ≠ 期望 {stage!r}"
                 continue
             err = self._validate_files(art.files, spec)
             if err:
                 self._record_cost(cyc, stage, art.usage, status="failed",
-                                  failure_kind="artifact_parse", attempt=attempt)
+                                  failure_kind="artifact_parse", attempt=attempt, call=call,
+                                  transcript_ref=art.transcript_ref,
+                                  execution_receipt_ref=art.execution_receipt_ref)
                 last_err = err
                 continue
-            self._record_cost(cyc, stage, art.usage, status="success", attempt=attempt)
+            self._record_cost(
+                cyc, stage, art.usage, status="success", attempt=attempt, call=call,
+                transcript_ref=art.transcript_ref,
+                execution_receipt_ref=art.execution_receipt_ref)
             if spec.get("passthrough"):        # bundle：代码文件名任意 → 信封全量透传（物化/交叉核在组件侧）
                 return dict(art.files)
             return {k: art.files[k] for k in spec["required"] + [o for o in spec["optional"] if o in art.files]}
         # 完整 last_err（外审 NIT：不截断——这是 fail-fast 排障入口，schema oneOf 展开的字段路径不能丢）
         raise RunnerError(f"{stage} 产物结构非法，artifact_parse 重试（≤{self.retries}）用尽：{last_err}")
 
+    def _begin_cost_call(self, cyc, stage: str, runner, attempt: int):
+        if self.cost_ledger is None:
+            return None
+        purpose = f"{stage}-n{self._call_seq}-a{attempt + 1}"
+        heartbeat_path = (
+            self.work / f"cycles/{cyc.cycle_id}/transcripts" /
+            f"{purpose}.heartbeat.json")
+        rc = self.cost_ledger.begin_call(
+            cycle_id=cyc.cycle_id, phase=stage, purpose=purpose,
+            transcript_ref=str(heartbeat_path))
+        heartbeat = _RunnerCallHeartbeat(
+            heartbeat_path, runner_call_id=rc, cycle_id=cyc.cycle_id,
+            phase=stage, purpose=purpose)
+        try:
+            _bind_runner_call(runner, rc, phase=stage, purpose=purpose)
+            self.cost_ledger.mark_call_running(runner_call_id=rc)
+            heartbeat.start()
+        except BaseException:
+            try:
+                heartbeat.finish("aborted")
+            except BaseException:
+                pass
+            self.cost_ledger.abort_unstarted_call(
+                runner_call_id=rc, failure_kind="call_prepare_failed")
+            raise
+        return rc, heartbeat
+
     def _record_cost(self, cyc, stage: str, usage, *, status: str,
-                     attempt: int, failure_kind: Optional[str] = None) -> None:
+                     attempt: int, call=None, failure_kind: Optional[str] = None,
+                     transcript_ref: Optional[str] = None,
+                     execution_receipt_ref: Optional[str] = None) -> None:
         """本次调用记账。预算网开启时 fail-closed；只有 session_max=null 时才容忍记账故障。
 
         usage=None 也写 money=0 行；RunnerError 携带多少就记多少，保证失败重试不从调用历史消失。
@@ -175,10 +303,21 @@ class StageProvider:
         """
         if self.cost_ledger is None:
             return
+        if call is None:
+            raise RuntimeError("已启用 cost_ledger 但缺 runner_call lifecycle")
+        runner_call_id, heartbeat = call
+        heartbeat_error = None
         try:
-            self.cost_ledger.record(cycle_id=cyc.cycle_id, phase=stage,
-                                    purpose=f"{stage}-n{self._call_seq}-a{attempt + 1}", usage=usage,
-                                    status=status, failure_kind=failure_kind)
+            heartbeat.finish(status, execution_receipt_ref=execution_receipt_ref)
+        except Exception as error:              # 调用已完成；heartbeat 失败归 postprocess，不丢成本
+            heartbeat_error = error
+            status = "failed"
+            failure_kind = "heartbeat_failed"
+        try:
+            self.cost_ledger.finish_call(
+                runner_call_id=runner_call_id, usage=usage, status=status,
+                failure_kind=failure_kind,
+                transcript_ref=transcript_ref or str(heartbeat.path))
         except (BudgetExhausted, CostAccountingFailed):
             raise                               # ledger/global_stop 已提交；立即阻断，不当作写账故障吞掉
         except Exception:                      # noqa: BLE001 —— 预算开启时必须 fail-closed
@@ -186,6 +325,8 @@ class StageProvider:
                          exc_info=True)
             if self._cost_required:
                 raise
+        if heartbeat_error is not None:
+            raise heartbeat_error
 
     def _validate_files(self, files: Dict[str, Any], spec: Dict[str, Any]) -> Optional[str]:
         """校验：required 全在场 + required/在场 optional 各过 schema（.json 走对应 schema；.md 只须
@@ -269,45 +410,107 @@ class JudgeProvider:
         last_err = ""
         for attempt in range(self.retries + 1):
             sk = base if not last_err else base + f"\n\n===== 上次产物被拒（第 {attempt} 次重试）=====\n{last_err}\n请修正后重出。"
+            call = self._begin_cost_call(cycle_id, review_kind, runner, attempt)
             try:
                 art = runner.run_task(system_prompt=self.system_prompt, skill=sk, context_pack=pack)
             except RunnerError as e:
-                self._record_cost(cycle_id, review_kind, e.usage, status="failed",
-                                  failure_kind="runner_error", attempt=attempt)
+                self._record_cost(
+                    cycle_id, review_kind, e.usage, status="failed",
+                    failure_kind=e.failure_kind, attempt=attempt, call=call,
+                    transcript_ref=e.transcript_ref,
+                    execution_receipt_ref=e.execution_receipt_ref)
                 last_err = str(e)
                 continue
+            except Exception as error:
+                self._record_cost(
+                    cycle_id, review_kind, getattr(error, "usage", None), status="failed",
+                    failure_kind=getattr(error, "failure_kind", type(error).__name__.lower()),
+                    attempt=attempt, call=call,
+                    transcript_ref=getattr(error, "transcript_ref", None),
+                    execution_receipt_ref=(getattr(error, "execution_receipt_ref", None)
+                                           or str(getattr(error, "receipt_path", "") or "") or None))
+                raise
             if "resource_request.json" in art.files:
                 # 判官不许要文件（评审对象已全在材料里；sidecar 出现=越界）——反馈重试，不静默丢弃
                 self._record_cost(cycle_id, review_kind, art.usage, status="failed",
-                                  failure_kind="artifact_parse", attempt=attempt)
+                                  failure_kind="artifact_parse", attempt=attempt, call=call,
+                                  transcript_ref=art.transcript_ref,
+                                  execution_receipt_ref=art.execution_receipt_ref)
                 last_err = "judge 不受理 resource_request sidecar（评审材料已全量给出，产 review_verdict.json 即可）"
                 continue
             verdict = art.files.get("review_verdict.json")
             if verdict is None:
                 self._record_cost(cycle_id, review_kind, art.usage, status="failed",
-                                  failure_kind="artifact_parse", attempt=attempt)
+                                  failure_kind="artifact_parse", attempt=attempt, call=call,
+                                  transcript_ref=art.transcript_ref,
+                                  execution_receipt_ref=art.execution_receipt_ref)
                 last_err = f"缺 review_verdict.json（files 键: {list(art.files)}）"
                 continue
             errs = [f"{e.json_path} {e.message}"
                     for e in self.schemas.validator("review_verdict").iter_errors(verdict)]
             if errs:
                 self._record_cost(cycle_id, review_kind, art.usage, status="failed",
-                                  failure_kind="artifact_parse", attempt=attempt)
+                                  failure_kind="artifact_parse", attempt=attempt, call=call,
+                                  transcript_ref=art.transcript_ref,
+                                  execution_receipt_ref=art.execution_receipt_ref)
                 last_err = "review_verdict.json schema 校验失败:\n" + "\n".join(errs[:8])
                 continue
-            self._record(cycle_id, build_target_id, review_kind, subject_hash, verdict, art.usage)
+            self._record(
+                cycle_id, build_target_id, review_kind, subject_hash, verdict, art.usage,
+                call=call, transcript_ref=art.transcript_ref,
+                execution_receipt_ref=art.execution_receipt_ref)
             return
         raise RunnerError(f"judge {review_kind} 产物结构非法，artifact_parse 重试（≤{self.retries}）用尽：{last_err}")
 
+    def _begin_cost_call(self, cycle_id: str, review_kind: str, runner, attempt: int):
+        if self.cost_ledger is None:
+            return None
+        # Gate.review_passed mechanically requires runner_call.purpose == review_kind.
+        heartbeat_path = (
+            self.work / f"cycles/{cycle_id}/transcripts" /
+            f"{review_kind}-n{self._call_seq}-a{attempt + 1}.heartbeat.json")
+        rc = self.cost_ledger.begin_call(
+            cycle_id=cycle_id, phase="audit", purpose=review_kind,
+            transcript_ref=str(heartbeat_path))
+        heartbeat = _RunnerCallHeartbeat(
+            heartbeat_path, runner_call_id=rc, cycle_id=cycle_id,
+            phase="audit", purpose=review_kind)
+        try:
+            _bind_runner_call(runner, rc, phase="audit", purpose=review_kind)
+            self.cost_ledger.mark_call_running(runner_call_id=rc)
+            heartbeat.start()
+        except BaseException:
+            try:
+                heartbeat.finish("aborted")
+            except BaseException:
+                pass
+            self.cost_ledger.abort_unstarted_call(
+                runner_call_id=rc, failure_kind="call_prepare_failed")
+            raise
+        return rc, heartbeat
+
     def _record_cost(self, cycle_id: str, review_kind: str, usage, *, status: str,
-                     attempt: int, failure_kind: Optional[str] = None) -> None:
+                     attempt: int, call=None, failure_kind: Optional[str] = None,
+                     transcript_ref: Optional[str] = None,
+                     execution_receipt_ref: Optional[str] = None) -> None:
         """记录未形成最终裁决的 judge 调用（RunnerError 或 Artifact 被拒）。"""
         if self.cost_ledger is None:
             return
+        if call is None:
+            raise RuntimeError("已启用 cost_ledger 但缺 judge runner_call lifecycle")
+        runner_call_id, heartbeat = call
+        heartbeat_error = None
         try:
-            self.cost_ledger.record(cycle_id=cycle_id, phase="audit",
-                                    purpose=f"{review_kind}-n{self._call_seq}-a{attempt + 1}", usage=usage,
-                                    status=status, failure_kind=failure_kind)
+            heartbeat.finish(status, execution_receipt_ref=execution_receipt_ref)
+        except Exception as error:
+            heartbeat_error = error
+            status = "failed"
+            failure_kind = "heartbeat_failed"
+        try:
+            self.cost_ledger.finish_call(
+                runner_call_id=runner_call_id, usage=usage, status=status,
+                failure_kind=failure_kind,
+                transcript_ref=transcript_ref or str(heartbeat.path))
         except (BudgetExhausted, CostAccountingFailed):
             raise
         except Exception:                      # noqa: BLE001 —— 预算开启时必须 fail-closed
@@ -315,22 +518,43 @@ class JudgeProvider:
                          cycle_id, review_kind, attempt + 1, exc_info=True)
             if self._cost_required:
                 raise
+        if heartbeat_error is not None:
+            raise heartbeat_error
 
     # -- 落库（短事务；runner_call + ledger + DECISION 同生共死）-----------------
     def _record(self, cycle_id: str, bt_id: int, kind: str, subject_hash: str,
-                verdict: Dict[str, Any], usage) -> int:
-        """最终有效裁决原子落 runner_call(audit)+ledger+DECISION；任一步失败则整体回滚。"""
+                verdict: Dict[str, Any], usage, *, call=None,
+                transcript_ref: Optional[str] = None,
+                execution_receipt_ref: Optional[str] = None) -> int:
+        """最终裁决把预调用 intent + ledger + DECISION 原子收口；不另造 runner_call。"""
         ci = _cnum(cycle_id)
         budget_hit = None
+        if self.cost_ledger is not None and call is None:
+            raise RuntimeError("有效 judge verdict 缺预调用 runner_call")
+        if call is not None:
+            rc, heartbeat = call
+            try:
+                heartbeat.finish("success", execution_receipt_ref=execution_receipt_ref)
+            except Exception as error:
+                self.cost_ledger.finish_call(
+                    runner_call_id=rc, status="failed", usage=usage,
+                    failure_kind="heartbeat_failed",
+                    transcript_ref=transcript_ref or str(heartbeat.path))
+                raise error
         try:
             with self.daemon.transaction() as conn:
                 round_no = conn.execute(
                     "SELECT COUNT(*)+1 FROM decision WHERE actor='judge' AND type=? AND json_valid(payload_json) "
                     "AND json_extract(payload_json,'$.build_target_id')=?", (kind, bt_id)).fetchone()[0]
-                rc = conn.execute("INSERT INTO runner_call(cycle_id,phase,purpose,status) VALUES (?,'audit',?,'success')",
-                                  (ci, kind)).lastrowid
                 if self.cost_ledger is not None:
-                    budget_hit = self.cost_ledger.insert_ledger_for_runner(conn, runner_call_id=rc, usage=usage)
+                    budget_hit = self.cost_ledger.finish_call_in_txn(
+                        conn, runner_call_id=rc, status="success", usage=usage,
+                        transcript_ref=transcript_ref or str(heartbeat.path))
+                else:
+                    rc = conn.execute(
+                        "INSERT INTO runner_call(cycle_id,phase,purpose,status,transcript_ref,"
+                        "started_at,finished_at) VALUES (?,'audit',?,'success',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                        (ci, kind, transcript_ref)).lastrowid
                 conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (?,'judge',?,?)",
                              (ci, kind, json.dumps(
                                  {"build_target_id": bt_id, "review_kind": kind, "round_no": round_no,
@@ -339,8 +563,11 @@ class JudgeProvider:
                                   "runner_call_id": rc, "policy_hash": self.policy_hash}, ensure_ascii=False)))
         except Exception as e:
             if self.cost_ledger is not None:
-                self.cost_ledger.fail_closed(
-                    cycle_id=cycle_id, phase="audit", purpose=kind, cause=e)
+                # verdict/DECISION 后处理失败：原事务已回滚，复用同一真实调用 intent 记失败与成本。
+                self.cost_ledger.finish_call(
+                    runner_call_id=rc, status="failed", usage=usage,
+                    failure_kind="postprocess_error",
+                    transcript_ref=transcript_ref or str(heartbeat.path))
             raise
         if budget_hit is not None:              # runner_call+ledger+DECISION+global_stop 已提交后才阻断后续调用
             raise BudgetExhausted(**budget_hit)
@@ -373,14 +600,39 @@ class JudgeProvider:
                 ck = d.query_one("SELECT ckpt_key, content_hash FROM checkpoint WHERE produced_by_run=?", (rid,))
                 if ck:
                     parts.append(f"### checkpoint\n{ck[0]} sha256={ck[1]}")
-                ev = t_dir / f"eval{rid}" / "eval.log"
+                attempt = d.query_one(
+                    "SELECT id,attempt_no FROM evaluation_attempt WHERE build_target_id=? "
+                    "ORDER BY attempt_no DESC LIMIT 1", (bt_id,))
+                ev = (t_dir / f"eval{rid}" / "eval.log" if attempt is None or attempt[1] == 1 else
+                      t_dir / f"eval{rid}" / f"retry-a{attempt[0]}" / "eval.log")
                 if ev.exists():                 # metric 行全量显式列出（不受下方 tail 截断，codex BLOCKER）
                     mlines = [ln for ln in ev.read_text(encoding="utf-8", errors="replace").splitlines()
                               if ln.strip().startswith("metric_value:")]
                     parts.append("### metric_value 行（全量）\n```\n" + "\n".join(mlines) + "\n```")
-                for name, sub in (("train", f"run{rid}"), ("eval", f"eval{rid}")):
-                    p = t_dir / sub / f"{name}.log"
+                for name, p in (("train", t_dir / f"run{rid}" / "train.log"),
+                                ("eval", ev)):
                     if p.exists():
                         parts.append(f"### {name}.log（尾部）\n```\n"
                                      + _tail(p.read_text(encoding="utf-8", errors="replace")) + "\n```")
+            else:
+                target = d.query_one(
+                    "SELECT target_kind,variant_id FROM build_target WHERE id=?", (bt_id,))
+                if target is not None and target[0] == "eval":
+                    for ck_id, ck_key, ck_hash in d.query(
+                            "SELECT id,ckpt_key,content_hash FROM checkpoint "
+                            "WHERE variant_id=? ORDER BY id", (target[1],)):
+                        parts.append(f"### checkpoint ck{ck_id}\n{ck_key} sha256={ck_hash}")
+                    attempt = d.query_one(
+                        "SELECT id FROM evaluation_attempt WHERE build_target_id=? "
+                        "ORDER BY attempt_no DESC LIMIT 1", (bt_id,))
+                    if attempt is not None:
+                        ev = t_dir / f"eval-a{attempt[0]}" / "eval.log"
+                        if ev.exists():
+                            text = ev.read_text(encoding="utf-8", errors="replace")
+                            mlines = [line for line in text.splitlines()
+                                      if line.strip().startswith("metric_value:")]
+                            parts.append(
+                                "### metric_value 行（全量）\n```\n" + "\n".join(mlines) + "\n```")
+                            parts.append(
+                                "### eval.log（尾部）\n```\n" + _tail(text) + "\n```")
         return "\n\n".join(parts)

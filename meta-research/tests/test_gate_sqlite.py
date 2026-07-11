@@ -25,8 +25,9 @@ SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 def _gate_seed(conn):
     conftest.seed_minimal(conn)
     conn.executescript("""
-    -- 待关问 q2（open）
-    INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) VALUES (2,1,1,1,'q2','open','agent');
+    -- 待关问 q2（本轮 active；关问 Gate 严格核 cycle↔Qn↔current goal lineage）
+    INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) VALUES (2,1,1,1,'q2','active','agent');
+    UPDATE cycle SET active_question_id=2 WHERE id=1;
     -- 非成功 eval：eval2(created) + success attempt2 + mr2（用 variant2 避开一格子一 eval 唯一约束）
     INSERT INTO variant(id,baseline_id,variant_key,config_json,status) VALUES (2,1,'v2','{}','planned');
     INSERT INTO evaluation(id,variant_id,protocol_id,protocol_ver,eval_key,source,status,created_cycle,target_set_hash)
@@ -104,6 +105,7 @@ def test_close_with_evaluation_evidence(gate_env):
     aid = gate.gate_close_question(cycle_id="c1", question_id="q2", verdict="answered",
                                    evidence=[{"kind": "evaluation", "metric_result_id": "mr1"}], answer_md="因")
     assert daemon.query_one("SELECT status FROM question WHERE id=2")[0] == "answered"
+    assert daemon.query_one("SELECT active_question_id FROM cycle WHERE id=1")[0] is None
     row = daemon.query_one("SELECT kind,metric_result_id,evaluation_id FROM evidence WHERE answer_id=?", (int(aid[1:]),))
     assert row == ("evaluation", 1, 1)
 
@@ -115,6 +117,20 @@ def test_close_with_literature_and_human_evidence(gate_env):
                                              {"kind": "human", "human_ref": "d5"}], answer_md="因")
     kinds = {r[0] for r in daemon.query("SELECT kind FROM evidence WHERE answer_id=?", (int(aid[1:]),))}
     assert kinds == {"literature", "human"}
+
+
+def test_close_in_caller_transaction_rolls_back_as_one_unit(gate_env):
+    gate, daemon = gate_env
+    with pytest.raises(RuntimeError, match="after-close"):
+        with daemon.transaction() as conn:
+            gate.gate_close_question_in_txn(
+                conn, cycle_id="c1", question_id="q2", verdict="answered",
+                evidence=[{"kind": "evaluation", "metric_result_id": "mr1"}], answer_md="因")
+            raise RuntimeError("after-close")
+    assert daemon.query_one("SELECT status FROM question WHERE id=2")[0] == "active"
+    assert daemon.query_one("SELECT active_question_id FROM cycle WHERE id=1")[0] == 2
+    assert daemon.query_one("SELECT count(*) FROM answer WHERE question_id=2")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM evidence WHERE question_id=2")[0] == 0
 
 
 def test_close_with_child_answer_in_subtree(gate_env):
@@ -130,7 +146,10 @@ def test_close_resolves_parent_dep(gate_env):
     """关问会把「依赖本问题」的 pending question_dep 置 satisfied。"""
     gate, daemon = gate_env
     with daemon.transaction() as conn:   # q2 依赖 q7（pending）
-        conn.execute("INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) VALUES (7,1,1,1,'q7','open','agent')")
+        conn.execute("UPDATE question SET status='open',active_cycle=NULL WHERE id=2")
+        conn.execute("INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source,active_cycle) "
+                     "VALUES (7,1,1,1,'q7','active','agent',1)")
+        conn.execute("UPDATE cycle SET active_question_id=7 WHERE id=1")
         conn.execute("INSERT INTO question_dep(question_id,dep_type,depends_on_question_id,status) VALUES (2,'question',7,'pending')")
     gate.gate_close_question(cycle_id="c1", question_id="q7", verdict="answered",
                              evidence=[{"kind": "literature", "citation_md": "x"}], answer_md="因")
@@ -204,7 +223,7 @@ def test_trigger_abort_becomes_clean_reject(gate_env):
         gate.gate_close_question(cycle_id="c1", question_id="q2", verdict="answered",
                                  evidence=[{"kind": "child_answer", "child_question_id": "q1"}], answer_md="因")
     assert daemon.query_one("SELECT count(*) FROM decision WHERE actor='gate' AND type='reject'")[0] == before + 1
-    assert daemon.query_one("SELECT status FROM question WHERE id=2")[0] == "open"          # 未半写
+    assert daemon.query_one("SELECT status FROM question WHERE id=2")[0] == "active"        # 未半写
     assert daemon.query_one("SELECT count(*) FROM answer WHERE question_id=2")[0] == 0
 
 

@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from orchestrator import database as db
+from orchestrator import harness as H
 from orchestrator.advancer import SqliteAdvancer
 from orchestrator.compiler_sqlite import SqliteCompiler
 from orchestrator.gate_pool import PoolGate
@@ -180,6 +181,35 @@ def test_materialize_full_chain(env):
     assert w.materialize_pending() == []
 
 
+def test_import_eval_attempt_exists_before_process_spawn(tmp_path, monkeypatch):
+    """import eval 的 guardian owner 在放行子进程前已是 exact running attempt。"""
+    path = str(tmp_path / "r.sqlite")
+    daemon, _state, worker = _mk_worker(path, tmp_path / "w")
+    _seed_deferred(daemon, worker.state)
+    original = H.run_staged
+    observed = []
+
+    def wrapped(cmd, **kwargs):
+        if kwargs.get("execution_kind") == "import-eval":
+            row = daemon.query_one(
+                "SELECT id,status,build_target_id FROM evaluation_attempt "
+                "ORDER BY id DESC LIMIT 1")
+            assert row is not None and row[1] == "running"
+            context = kwargs["execution_context"]
+            assert context["reconcile_protocol"] == "execution-owner-v1"
+            assert context["db_owner_kind"] == "evaluation_attempt"
+            assert context["db_owner_id"] == row[0]
+            assert context["build_target_id"] == row[2]
+            observed.append(row[0])
+        return original(cmd, **kwargs)
+
+    monkeypatch.setattr(H, "run_staged", wrapped)
+    worker.materialize_pending()
+    assert len(observed) == 1
+    assert daemon.query_one(
+        "SELECT status FROM evaluation_attempt WHERE id=?", (observed[0],))[0] == "success"
+
+
 # ============ 失败路径负例全拒（§7.1 M4）============
 def test_scope_missing_no_materialize(tmp_path):
     path = str(tmp_path / "r.sqlite")
@@ -214,7 +244,10 @@ def test_eval_fail_no_pool_publish(tmp_path):
     daemon, state, w = _mk_worker(path, tmp_path / "w", fetch=fetch)
     sel = _seed_deferred(daemon, state)
     w.materialize_pending()
-    assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0               # 未注册测量
+    assert daemon.query_one("SELECT status FROM evaluation")[0] == "failed"
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM evaluation_attempt")[:2] == ("failed", "runtime")
+    assert daemon.query_one("SELECT count(*) FROM metric_result")[0] == 0
     assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0   # 不 pool_publish
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1

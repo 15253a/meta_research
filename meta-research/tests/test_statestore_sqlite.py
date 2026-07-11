@@ -69,6 +69,8 @@ def _force_answer(s, qid, cycle_id, verdict="answered"):
         conn.execute("INSERT INTO evidence(answer_id,question_id,goal_id,goal_ver,kind,literature_ref,claim_md) "
                      "VALUES (?,?,1,?,'literature','ref','c')", (aid, qi, gver))
         conn.execute("UPDATE question SET status=? WHERE id=?", (verdict, qi))
+        conn.execute("UPDATE cycle SET active_question_id=NULL WHERE id=? AND active_question_id=?",
+                     (_cnum(cycle_id), qi))
     return f"a{aid}"
 
 
@@ -143,6 +145,28 @@ def test_active_question_id_persisted_and_cleared(store):
     assert store.open_or_resume_cycle().question_id == root      # 落库 → resume（含崩溃重启）可见本轮攻坚目标
     store.mark_inconclusive(root)
     assert store.open_or_resume_cycle().question_id is None      # inconclusive 释放 → 清空
+
+
+def test_activate_question_cannot_overwrite_active_lease(store):
+    root = _bootstrap_root(store)
+    c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "attack")
+    store.activate_question(root)
+    with store.daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO question(goal_id,goal_ver,born_goal_ver,text,status,source) "
+            "VALUES (1,1,1,'other','open','agent')")
+    with pytest.raises(ValueError, match="不得覆盖激活租约"):
+        store.activate_question("q2")
+    assert store.cycle(c.cycle_id).question_id == root
+
+
+def test_mark_cycle_done_rejects_active_question(store):
+    root = _bootstrap_root(store)
+    c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "attack")
+    store.activate_question(root)
+    with pytest.raises(RuntimeError, match="仍持有 active_question_id"):
+        store.mark_cycle_done(c.cycle_id)
+    assert store.cycle(c.cycle_id).status != "done"
 
 
 def test_max_open_questions_accounts_for_released_parent():
@@ -229,6 +253,28 @@ def test_set_route_validation(store):
     store.mark_cycle_done(c.cycle_id)
     with pytest.raises(ValueError, match="已终态"):
         store.set_route(c.cycle_id, "attack")
+
+
+def test_persist_selection_stale_cycle_fails_loud(store):
+    c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "attack")
+    with store.daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO goal(id,version,text,predicate_json,previous_version) "
+            "VALUES (1,2,'v2','{}',1)")
+    from orchestrator.interfaces import Selection
+    with pytest.raises(RuntimeError, match="非 current"):
+        store.persist_selection(
+            c.cycle_id,
+            Selection(next_question_id=None, next_intent="terminate", scores=[]))
+
+
+def test_revalidate_parent_must_have_closed_answer(store):
+    root = _bootstrap_root(store)
+    c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "attack")
+    with pytest.raises(ValueError, match="带 answer"):
+        store.apply_tree_ops(c.cycle_id, [{
+            "op": "spawn_question", "kind": "revalidate",
+            "parent_question_id": root, "text": "invalid review"}])
 
 
 # ============ bootstrap / decompose ============
@@ -393,11 +439,17 @@ def test_mark_applicability_rejects_wrong_revalidate_parent(store):
     cid = _decompose(store, root, n=1)
     child = f"q{store.daemon.query_one('SELECT id FROM question WHERE parent_id=?', (_qnum(root),))[0]}"
     aid = _force_answer(store, child, cid)
+    with store.daemon.transaction() as conn:
+        wrong = conn.execute(
+            "INSERT INTO question(goal_id,goal_ver,born_goal_ver,text,status,source) "
+            "VALUES (1,1,1,'other closed question','open','agent')").lastrowid
+    wrong_qid = f"q{wrong}"
+    _force_answer(store, wrong_qid, cid)
     store.resolve_deps(); store.mark_cycle_done(cid)
     c, amend, _ = _start_goal_amend(store)
-    # 回看题 parent=root（≠ 被回看 answer 所属问题 child）→ 拒
+    # 回看题挂在另一个合法 closed answer 下（≠ 被回看 answer 所属问题 child）→ 绑定拒绝
     store.apply_tree_ops(c.cycle_id, [amend,
-        {"op": "spawn_question", "kind": "revalidate", "parent_question_id": root,
+        {"op": "spawn_question", "kind": "revalidate", "parent_question_id": wrong_qid,
          "text": "reval", "local_key": "rv"}])
     with pytest.raises(ValueError, match="回看题 parent"):
         store.apply_tree_ops(c.cycle_id, [{"op": "mark_answer_applicability", "answer_id": aid,
