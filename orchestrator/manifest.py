@@ -869,7 +869,9 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
                          src_dir: Path, work_root: Path, policy: Dict[str, Any],
                          ckpt_path: Optional[Path] = None,
                          allowed_asset_refs: Optional[Collection[str]] = None,
-                         expected_asset_identities: Optional[Mapping[str, AssetIdentity]] = None) -> Dict[str, Any]:
+                         expected_asset_identities: Optional[Mapping[str, AssetIdentity]] = None,
+                         execution_supervisor=None,
+                         execution_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """解析+围栏后委托 harness.run_staged（cwd=staging_dir、.partial→原子改名、.exit 侧车——纪律全继承）。
     返回 run_staged 结果 {exit_code, log_path, log_sha256, log_bytes}；log 入账仍归调用方。"""
     rc = resolve_command(manifest, kind, src_dir=src_dir, work_root=work_root, policy=policy,
@@ -877,7 +879,10 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
                          expected_asset_identities=expected_asset_identities)
     try:
         return H.run_staged(rc.argv, staging_dir=staging_dir, log_name=log_name,
-                            timeout_s=rc.timeout_s, env=rc.env or None, pass_fds=rc.pass_fds)
+                            timeout_s=rc.timeout_s, env=rc.env or None, pass_fds=rc.pass_fds,
+                            execution_supervisor=execution_supervisor,
+                            execution_kind=f"manifest-{kind}",
+                            execution_context=execution_context)
     finally:
         for fd in set(rc.pass_fds):
             try:

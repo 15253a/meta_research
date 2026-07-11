@@ -19,11 +19,13 @@ import json
 import math
 import os
 import secrets
+import signal
 import socket
 import stat
 import threading
 import time
 import weakref
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -52,6 +54,15 @@ _ACTIVE_LEASES: "weakref.WeakSet[InstanceLease]" = weakref.WeakSet()
 # retry handle finishes it or the process exits.
 _RETAINED_LEASES: set = set()
 _ACTIVE_LEASES_GUARD = threading.Lock()
+# A cleanup guardian must inherit one duplicate of the flock open-file
+# description, while every unrelated fork child must close such duplicates.
+# Serialize the short duplicate->spawn window with at-fork and identify the
+# one descriptor deliberately delegated to that spawn.  This is an RLock
+# because subprocess may call os.fork() in the same thread while the caller is
+# already inside ``delegate_owner_fence``.
+_DELEGATED_FENCE_GUARD = threading.RLock()
+_DELEGATED_FENCE_FDS: set = set()
+_INTENDED_FENCE_FD: Optional[int] = None
 
 
 class InstanceLeaseError(RuntimeError):
@@ -493,6 +504,119 @@ class InstanceLease:
                 or stat.S_IMODE(state_info.st_mode) != 0o700):
             raise InstanceLeaseError("instance state 目录已被替换")
 
+    @contextmanager
+    def delegate_owner_fence(self):
+        """Yield one spawn-only duplicate of the owner flock to a guardian.
+
+        The duplicate keeps the same Linux flock open-file description alive
+        after an orchestrator SIGKILL.  It is intentionally available only as
+        a context around the guardian spawn: unrelated fork children are
+        closed by the module at-fork hook, the workload is never given this
+        descriptor, and the parent copy is closed immediately after spawn.
+        ``close()`` is serialized until that hand-off has completed.
+        """
+        global _INTENDED_FENCE_FD
+        # Ctrl-C is the realistic async exception source in the parent.  Keep
+        # it pending only across this short duplicate->Popen->parent-close
+        # critical section; the guardian explicitly unblocks signals before it
+        # starts the payload.  Pending SIGINT is delivered after every lock and
+        # parent duplicate has been cleaned.
+        old_mask = None
+        if hasattr(signal, "pthread_sigmask"):
+            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        delegated_acquired = close_acquired = False
+        fence_fd = -1
+        primary: Optional[BaseException] = None
+        cleanup_errors = []
+        try:
+            _DELEGATED_FENCE_GUARD.acquire()
+            delegated_acquired = True
+            self._close_guard.acquire()
+            close_acquired = True
+            if _INTENDED_FENCE_FD is not None:
+                raise InstanceLeaseError("instance owner fence 不允许嵌套委托")
+            self.assert_owned()
+            fence_fd = os.dup(self._lock_fd)
+            os.set_inheritable(fence_fd, False)
+            if not _same_inode(os.fstat(fence_fd), self._lock_info):
+                raise InstanceLeaseError("instance owner fence duplicate 身份不一致")
+            _DELEGATED_FENCE_FDS.add(fence_fd)
+            _INTENDED_FENCE_FD = fence_fd
+            yield fence_fd
+        except BaseException as error:
+            # Setup failures (guard/acquire/assert/dup) are just as primary as
+            # an exception injected through the context body.  Cleanup or a
+            # pending signal delivered while restoring the mask must not erase
+            # the first cause.
+            primary = error
+            raise
+        finally:
+            # Keep converging through injected/repeated BaseException.  These
+            # assignments/discards are idempotent; close itself is attempted
+            # once because Linux close(EINTR) must not be retried.
+            while True:
+                try:
+                    _INTENDED_FENCE_FD = None
+                    break
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if fence_fd >= 0:
+                while True:
+                    try:
+                        _DELEGATED_FENCE_FDS.discard(fence_fd)
+                        break
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                try:
+                    os.close(fence_fd)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if close_acquired:
+                while True:
+                    try:
+                        self._close_guard.release()
+                        break
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+            if delegated_acquired:
+                while True:
+                    try:
+                        _DELEGATED_FENCE_GUARD.release()
+                        break
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+            restore_error: Optional[BaseException] = None
+            if old_mask is not None:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+                except BaseException as error:
+                    # A pending SIGINT may be raised by the restoration call
+                    # after the kernel has already restored the mask.  Preserve
+                    # that original signal exception once every FD/lock is safe.
+                    restore_error = error
+            if primary is not None:
+                add_note = getattr(primary, "add_note", None)
+                if callable(add_note):
+                    for error in [*cleanup_errors, *([restore_error] if restore_error else [])]:
+                        add_note(
+                            "owner fence cleanup 期间异常: "
+                            f"{type(error).__name__}: {error}")
+            elif restore_error is not None:
+                add_note = getattr(restore_error, "add_note", None)
+                if callable(add_note):
+                    for error in cleanup_errors:
+                        add_note(
+                            "owner fence cleanup 期间异常: "
+                            f"{type(error).__name__}: {error}")
+                raise restore_error
+            elif cleanup_errors:
+                error = InstanceLeaseError("instance owner fence cleanup 失败")
+                add_note = getattr(error, "add_note", None)
+                if callable(add_note):
+                    for item in cleanup_errors:
+                        add_note(f"{type(item).__name__}: {item}")
+                raise error
+
     @property
     def heartbeat_fatal(self) -> Optional[BaseException]:
         with self._state_guard:
@@ -677,11 +801,13 @@ class InstanceLease:
 
 
 def _before_fork() -> None:
+    _DELEGATED_FENCE_GUARD.acquire()
     _ACTIVE_LEASES_GUARD.acquire()
 
 
 def _after_fork_parent() -> None:
     _ACTIVE_LEASES_GUARD.release()
+    _DELEGATED_FENCE_GUARD.release()
 
 
 def _after_fork_child() -> None:
@@ -690,8 +816,20 @@ def _after_fork_child() -> None:
             lease._detach_after_fork_child()
         _ACTIVE_LEASES.clear()
         _RETAINED_LEASES.clear()
+        # Only the child being exec'd as the cleanup guardian may retain the
+        # deliberately delegated fence.  Every ordinary fork child drops all
+        # duplicates so it cannot invisibly prolong the global owner lock.
+        for fd in list(_DELEGATED_FENCE_FDS):
+            if fd == _INTENDED_FENCE_FD:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        _DELEGATED_FENCE_FDS.clear()
     finally:
         _ACTIVE_LEASES_GUARD.release()
+        _DELEGATED_FENCE_GUARD.release()
 
 
 if hasattr(os, "register_at_fork"):

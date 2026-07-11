@@ -13,44 +13,141 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import secrets
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .ids import cnum as _cnum
+from .process_supervisor import ExecutionSupervisor, atomic_write_receipt
 from .writedaemon import WriteDaemon
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("exit sidecar short write")
+        view = view[written:]
 
 
 def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: float = 600.0,
                env: Optional[Dict[str, str]] = None,
-               pass_fds: Sequence[int] = ()) -> Dict[str, Any]:
+               pass_fds: Sequence[int] = (),
+               execution_supervisor: Optional[ExecutionSupervisor] = None,
+               execution_kind: str = "harness",
+               execution_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """跑真子进程，stdout+stderr 合流写 staging log（.partial → 原子改名）。返回
     {exit_code, log_path, log_sha256, log_bytes}。超时 → kill 并抛 subprocess.TimeoutExpired
     （.partial 留在 staging 供审计，不改名——半成品不冒充完整产物）。"""
+    if (not isinstance(log_name, str) or not log_name or len(log_name) > 128
+            or log_name in {".", ".."} or "/" in log_name or "\\" in log_name
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in log_name)):
+        raise ValueError("log_name 须为有界安全 basename")
+    context = dict(execution_context or {})
+    if "log_name" in context and context["log_name"] != log_name:
+        raise ValueError("execution_context.log_name 与 harness log_name 冲突")
+    context["log_name"] = log_name
     d = Path(staging_dir)
     d.mkdir(parents=True, exist_ok=True)
     partial = d / (log_name + ".partial")
     final = d / log_name
     if final.exists():   # 防旧 final 冒充本次产物（重试须换名/清 staging——超时后旧 final+新 .partial 会混淆，codex NIT）
         raise FileExistsError(f"staging 已有同名 final {final}——log_name 须每次执行唯一（或先清 staging）")
-    with open(partial, "wb") as fh:
-        # cwd=staging：脚本的相对路径产物（checkpoint/指标文件）落 staging（半成品目录纪律的自然延伸）
-        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=str(d),
-                                env={**os.environ, **(env or {})}, pass_fds=tuple(pass_fds))
+    own_supervisor = execution_supervisor is None
+    supervisor = execution_supervisor or ExecutionSupervisor.standalone(
+        d / ".execution-receipts")
+    execution_error: Optional[BaseException] = None
+    result = None
+    try:
+        with open(partial, "wb") as fh:
+            # cwd=staging：脚本的相对路径产物（checkpoint/指标文件）落 staging（半成品目录纪律的自然延伸）。
+            # Guardian 在直接子进程结束后仍要清空/reap 整棵后代树；只有这个机械边界返回
+            # 后，.partial 才可能提升为不可变 final。
+            try:
+                result = supervisor.run(
+                    cmd, stdin=None, stdout=fh, stderr=subprocess.STDOUT,
+                    timeout_s=timeout_s, cwd=d,
+                    env={**os.environ, **(env or {})},
+                    pass_fds=tuple(pass_fds), kind=execution_kind,
+                    operation_context=context)
+            except BaseException as error:
+                execution_error = error
+            finally:
+                fh.flush()
+                os.fsync(fh.fileno())
+    finally:
+        if own_supervisor:
+            supervisor.close()
+    receipt = None
+    receipt_path = None
+    if execution_error is not None:
+        receipt = (getattr(execution_error, "receipt", None)
+                   or getattr(execution_error, "execution_receipt", None))
+        receipt_path = (getattr(execution_error, "receipt_path", None)
+                        or getattr(execution_error, "execution_receipt_path", None))
+    if result is not None:
+        receipt, receipt_path = result.receipt, result.receipt_path
+    if receipt is not None and receipt_path is not None:
         try:
-            exit_code = proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            raise
+            atomic_write_receipt(d / (log_name + ".process.json"), {
+                "version": 1,
+                "operation_id": receipt["operation_id"],
+                "outcome": receipt["outcome"],
+                "group_drained": receipt["group_drained"],
+                "receipt_path": str(receipt_path),
+            })
+        except BaseException as pointer_error:
+            # The guardian receipt is authoritative.  A convenience pointer
+            # failure on an already-failed execution must not erase timeout /
+            # owner-loss classification needed by later reconciliation.  A
+            # success-path pointer failure still fails loud before .partial
+            # can be promoted to final.
+            if execution_error is None:
+                raise
+            try:
+                execution_error.process_pointer_error = pointer_error
+            except BaseException:
+                pass
+            note = getattr(execution_error, "add_note", None)
+            if callable(note):
+                note("process pointer 写入失败: "
+                     f"{type(pointer_error).__name__}: {pointer_error}")
+    if execution_error is not None:
+        raise execution_error.with_traceback(execution_error.__traceback__)
+    assert result is not None
+    exit_code = result.returncode
     # exit 侧车**先于** final 改名（原子 tmp→replace）：final 存在 ⟹ 退出码可读——崩后续跑须复用同一
     # exit 判定（非 0 的 eval 也会产 final，恢复方不得把失败进程的完整输出当成功续注册，codex BLOCKER）
-    exit_tmp = d / (log_name + ".exit.tmp")
-    exit_tmp.write_text(str(exit_code), encoding="ascii")
+    exit_tmp = d / (log_name + f".exit.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    exit_fd = os.open(
+        exit_tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        _write_all(exit_fd, str(exit_code).encode("ascii"))
+        os.fsync(exit_fd)
+    finally:
+        os.close(exit_fd)
     os.replace(exit_tmp, d / (log_name + ".exit"))
+    dir_fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                     | getattr(os, "O_CLOEXEC", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     os.replace(partial, final)          # 原子改名：只有完整跑完的 log 得正式名（P6 staging 纪律）
+    dir_fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                     | getattr(os, "O_CLOEXEC", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     data = final.read_bytes()
     return {"exit_code": exit_code, "log_path": str(final),
-            "log_sha256": hashlib.sha256(data).hexdigest(), "log_bytes": len(data)}
+            "log_sha256": hashlib.sha256(data).hexdigest(), "log_bytes": len(data),
+            "process_receipt_path": str(result.receipt_path),
+            "process_receipt": result.receipt,
+            "process_pointer_path": str(d / (log_name + ".process.json"))}
 
 
 def file_sha256(path: str) -> str:

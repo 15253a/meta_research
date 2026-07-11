@@ -21,6 +21,7 @@ from typing import Callable, Tuple
 
 import pytest
 
+from orchestrator import instance_lease as IL
 from orchestrator.console_spool import ConsoleSpool, UnsafeConsolePath
 from orchestrator.attack_stages import AttackStages
 from orchestrator.instance_lease import (
@@ -33,6 +34,57 @@ from orchestrator.run import System, build_system
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_delegate_fence_restores_signal_mask_before_reporting_cleanup_error(
+        tmp_path, monkeypatch):
+    lease = InstanceLease.acquire(tmp_path / "mask-restore", heartbeat_interval_s=0.02)
+    original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR2})
+    expected_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    original_close = os.close
+    target_fd = {"value": -1, "injected": False}
+
+    def close_then_fail(fd):
+        original_close(fd)
+        if fd == target_fd["value"] and not target_fd["injected"]:
+            target_fd["injected"] = True
+            raise OSError("delegated-close")
+
+    monkeypatch.setattr(IL.os, "close", close_then_fail)
+    try:
+        with pytest.raises(InstanceLeaseError, match="owner fence cleanup"):
+            with lease.delegate_owner_fence() as fd:
+                target_fd["value"] = fd
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == expected_mask
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+        assert lease.close() is None
+
+
+def test_delegate_fence_setup_error_survives_mask_restore_interrupt(
+        tmp_path, monkeypatch):
+    lease = InstanceLease.acquire(tmp_path / "setup-primary", heartbeat_interval_s=0.02)
+    sentinel = RuntimeError("setup-primary")
+    original_sigmask = IL.signal.pthread_sigmask
+
+    def interrupt_after_mask_change(how, mask):
+        result = original_sigmask(how, mask)
+        if how == signal.SIG_SETMASK:
+            raise KeyboardInterrupt("restore-interrupt")
+        return result
+
+    def fail_owned():
+        raise sentinel
+
+    monkeypatch.setattr(lease, "assert_owned", fail_owned)
+    monkeypatch.setattr(IL.signal, "pthread_sigmask", interrupt_after_mask_change)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            with lease.delegate_owner_fence():
+                pytest.fail("setup failure should prevent context entry")
+        assert caught.value is sentinel
+    finally:
+        assert lease.close() is None
 LOCK_NAME = ".orchestrator-instance.lock"
 HEARTBEAT_REL = Path("state/orchestrator_heartbeat.json")
 

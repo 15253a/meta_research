@@ -848,7 +848,7 @@ def test_console_backlog_over_one_bounded_batch_blocks_before_later_pause(tmp_pa
     assert called["n"] == 0
     # Resident pump may drain both bounded batches before precheck; either way
     # research cannot pass the backlog, and the later pause is already durable.
-    assert ("控制台入站待处理" in system.advancer.last_block_reason
+    assert ("入站待处理" in system.advancer.last_block_reason
             or "pause 指令生效" in system.advancer.last_block_reason)
     first_confirmed = system.daemon.query_one(
         "SELECT json_extract(payload_json,'$.confirmed') FROM directive WHERE id=?",

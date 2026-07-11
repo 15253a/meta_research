@@ -51,6 +51,7 @@ from .gate_sqlite import GateReject
 from .ids import cnum as _cnum, parse_positive_sqlite_int
 from .interfaces import InvalidSelectionError, Selection
 from .phase_commit import check_or_record
+from .process_supervisor import ExecutionSupervisor
 
 _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
 
@@ -171,11 +172,18 @@ class AttackStages:
     def __init__(self, *, state, compiler, pool_gate: PoolGate, close_gate, providers: Dict[str, Callable],
                  obs_policy: Dict[str, Any], work_root: str, schemas=None,
                  policy: Optional[Dict[str, Any]] = None,
-                 owner_guard: Optional[Callable[[], None]] = None):
+                 owner_guard: Optional[Callable[[], None]] = None,
+                 execution_supervisor=None):
         """state=SQLiteStateStore；compiler=SqliteCompiler；pool_gate=PoolGate(含 ExecGate 全家)；
         close_gate=SqliteGate（parser_suspect 已接真）；providers 见模块注释；work_root=staging 根目录。
         schemas=SchemaSet（步⑧：manifest 校验执法在编排器侧，不只靠 StageProvider）；
         policy=policy.yaml dict（manifest 命令围栏 execution 节；缺省从既有 obs_policy 无法取，须显式传）。"""
+        if owner_guard is not None:
+            if (not isinstance(execution_supervisor, ExecutionSupervisor)
+                    or not execution_supervisor.binds_fenced_owner(owner_guard)):
+                raise ValueError(
+                    "AttackStages 绑定 owner_guard 时必须注入同一 owner guard 且持有"
+                    " delegated instance fence 的 ExecutionSupervisor")
         self.state = state
         self.compiler = compiler
         self.gate: PoolGate = pool_gate
@@ -187,6 +195,7 @@ class AttackStages:
         self.policy = policy
         self._configured_owner_guard = owner_guard or (lambda: None)
         self.owner_guard = self._configured_owner_guard
+        self.execution_supervisor = execution_supervisor
 
     def bind_owner_guard(self, owner_guard: Callable[[], None]) -> None:
         if not callable(owner_guard):
@@ -704,7 +713,12 @@ class AttackStages:
                                          log_name=f"smoke-{self._next_serial(staging, 'smoke')}.log",
                                          src_dir=src_dir, work_root=self.work, policy=self.policy,
                                          allowed_asset_refs=allowed_asset_refs,
-                                         expected_asset_identities=asset_identities)
+                                         expected_asset_identities=asset_identities,
+                                         execution_supervisor=self.execution_supervisor,
+                                         execution_context={
+                                             "cycle_id": cyc.cycle_id,
+                                             "build_target_id": bt_id,
+                                             "phase": "smoke"})
             if sm["exit_code"] != 0:              # smoke 失败 → target 失败连坐（codex SHOULD：exit code 不得忽略）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._ensure_target_pc(cyc, bt_id)   # 终态早退**也**落 pc（codex 第2轮 BLOCKER：漏落致杀/不杀分裂）
@@ -750,7 +764,11 @@ class AttackStages:
             r = MF.run_manifest_command(manifest, "train", staging_dir=str(staging / f"run{rid}"),
                                         log_name="train.log", src_dir=src_dir, work_root=self.work,
                                         policy=self.policy, allowed_asset_refs=allowed_asset_refs,
-                                        expected_asset_identities=asset_identities)
+                                        expected_asset_identities=asset_identities,
+                                        execution_supervisor=self.execution_supervisor,
+                                        execution_context={
+                                            "cycle_id": ci, "build_target_id": bt_id,
+                                            "run_id": rid, "phase": "train"})
             if r["exit_code"] != 0:
                 g.gate_finish_run(run_id=rid, status="failed", failure_kind="runtime")
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
@@ -790,7 +808,13 @@ class AttackStages:
                                              policy=self.policy,
                                              ckpt_path=MF.checkpoint_dest(manifest, staging / f"run{rid}"),
                                              allowed_asset_refs=allowed_asset_refs,
-                                             expected_asset_identities=asset_identities)
+                                             expected_asset_identities=asset_identities,
+                                             execution_supervisor=self.execution_supervisor,
+                                             execution_context={
+                                                 "cycle_id": ci,
+                                                 "build_target_id": bt_id,
+                                                 "run_id": rid,
+                                                 "phase": "eval"})
                 eval_log = Path(ev["log_path"]).read_bytes()
             if ev["exit_code"] != 0:              # fresh 与 resume 同一判定点（评估进程失败 → target failed）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")

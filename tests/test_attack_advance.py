@@ -42,6 +42,14 @@ EVAL_OK = ("import sys, pathlib; assert pathlib.Path(sys.argv[1]).read_text() ==
 SMOKE_OK = "print('loss: 0.9'); print('smoke ok')"
 
 
+def test_explicit_owner_guard_requires_same_fenced_supervisor(tmp_path):
+    with pytest.raises(ValueError, match="ExecutionSupervisor"):
+        AttackStages(
+            state=None, compiler=None, pool_gate=None, close_gate=None,
+            providers={}, obs_policy={}, work_root=str(tmp_path),
+            owner_guard=lambda: None)
+
+
 def _idea_set():
     """冻结 idea_set.schema 的确定性产物（cand-1 选中、cand-2 审计 fail——防重复造轮全量入账）。"""
     _am = {"source_domain": "线性模型", "target_domain": "toy 分类", "object_mapping": "权重→决策",

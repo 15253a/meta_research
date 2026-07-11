@@ -39,6 +39,7 @@ from . import subject_manifest as SM
 from .attack_stages import _canon_hash, judge_once
 from .gate_pool import PoolGate
 from .phase_commit import check_or_record
+from .process_supervisor import ExecutionSupervisor
 
 
 def _cid(n: int) -> str:
@@ -49,12 +50,22 @@ _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
 
 class ImportWorker:
     def __init__(self, *, state, pool_gate: PoolGate, providers: Dict[str, Callable],
-                 obs_policy: Dict[str, Any], work_root: str):
+                 obs_policy: Dict[str, Any], work_root: str,
+                 owner_guard: Optional[Callable[[], None]] = None,
+                 execution_supervisor=None):
+        if owner_guard is not None:
+            if (not isinstance(execution_supervisor, ExecutionSupervisor)
+                    or not execution_supervisor.binds_fenced_owner(owner_guard)):
+                raise ValueError(
+                    "ImportWorker 绑定 owner_guard 时必须注入同一 owner guard 且持有"
+                    " delegated instance fence 的 ExecutionSupervisor")
         self.state = state
         self.gate = pool_gate
         self.p = providers          # 需 fetch + judge
         self.obs_policy = obs_policy
         self.work = Path(work_root)
+        self.owner_guard = owner_guard or (lambda: None)
+        self.execution_supervisor = execution_supervisor
 
     # ---------------------------------------------------------------- 入口 --
     def materialize_pending(self) -> List[int]:
@@ -112,6 +123,7 @@ class ImportWorker:
             return
         cyc_id = self._worker_cycle(ei_id)
         cand = d.query_one("SELECT canonical_uri, revision FROM external_candidate WHERE id=?", (cand_id,))
+        self.owner_guard()
         spec = self.p["fetch"]({"id": cand_id, "question_id": qi, "canonical_uri": cand[0], "revision": cand[1]})
         vid, bt_id = self._variant_and_target(cyc_id, qi, bid, spec)
         ok = self._drive_import_target(cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec, revision=cand[1])
@@ -193,9 +205,14 @@ class ImportWorker:
                            [{"kind": "revision", "ref": "revision", "content_hash": _canon_hash(revision)}]
         manifest_hash = SM.subject_hash(manifest_entries)
         if st() == "building":                    # 沙箱 smoke（真子进程；失败 → 不 target_ready）
+            self.owner_guard()
             sm = H.run_staged(spec["smoke_cmd"], staging_dir=str(staging / "smoke"),
                               log_name=f"smoke-{len(list((staging / 'smoke').glob('smoke-*.log'))) + 1 if (staging / 'smoke').exists() else 1}.log",
-                              timeout_s=120)
+                              timeout_s=120, execution_supervisor=self.execution_supervisor,
+                              execution_kind="import-smoke",
+                              execution_context={
+                                  "cycle_id": cyc_id, "external_import_id": ei_id,
+                                  "build_target_id": bt_id, "phase": "smoke"})
             if sm["exit_code"] != 0:
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._record_failed(ei_id, qi, cand_id, reason="沙箱 smoke 失败，不 target_ready")
@@ -262,8 +279,16 @@ class ImportWorker:
                 eval_log = eval_final.read_bytes()
                 ev["log_sha256"] = hashlib.sha256(eval_log).hexdigest()
             else:
+                self.owner_guard()
                 ev = H.run_staged(spec["eval_cmd"], staging_dir=str(staging / f"eval{rid}"),
-                                  log_name="eval.log", timeout_s=600)
+                                  log_name="eval.log", timeout_s=600,
+                                  execution_supervisor=self.execution_supervisor,
+                                  execution_kind="import-eval",
+                                  execution_context={
+                                      "cycle_id": cyc_id,
+                                      "external_import_id": ei_id,
+                                      "build_target_id": bt_id,
+                                      "run_id": rid, "phase": "eval"})
                 eval_log = Path(ev["log_path"]).read_bytes()
             if ev["exit_code"] != 0:               # factory eval 失败 → 不 pool_publish
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="runtime")
