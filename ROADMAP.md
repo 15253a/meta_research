@@ -26,8 +26,9 @@
   CP11.4c.1 exact-pinned Docker 敌对执行边界、launcher rlimit+seccomp BPF、guardian container drain 与
   quarantine 晋升/恢复已落 `a05584d`；CP11.4c.2a exact GitHub repository snapshot、内容寻址发布与 file-backed
   sandbox import bridge 已落 `50ba41f`；CP11.4c.2b.1 materializer component boundaries 已落 `4e28698`，
-  CP11.4c.2b.2a exact Git LFS objects 已落 `ef30f1f`。当前进入 2b.2b dependency image closure，随后是
-  2b.2c adapter generation、2b.3 deployment contract 与 CP11.4c.3 跨节点 VEPFS/真实 100+ 轮故障注入验收。
+  CP11.4c.2b.2a exact Git LFS objects 已落 `ef30f1f`，2b.2b canonical wheel lock 到 exact/restorable dependency
+  image 与后续 runtime identity 继承已落 `1e57611`。当前进入 2b.2c reviewed adapter generation，随后是
+  2b.3 deployment contract 与 CP11.4c.3 跨节点 VEPFS/真实 100+ 轮故障注入验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -446,8 +447,9 @@
               OID、size、下载 bytes 与最终 ledger/manifest 交叉核；transport 临时授权不进入复现身份。
               → commit `ef30f1f`（build_log 0067；相关 149；真实 GitHub LFS canary；外审 2 BLOCKER/3 SHOULD
               全修；唯一全量 1401）。
-            - [ ] CP11.4c.2b.2b dependency image closure：受支持 lock 类型的 canonical hash、离线/有界 build context、
-              exact base/result image ID 与 compiler/runtime smoke receipt，禁止隐式 tag/pull/host install。
+            - [x] CP11.4c.2b.2b dependency image closure：canonical Python wheel lock、公网 exact artifact、离线/有界
+              generated context、exact base/result image/archive 与 compiler/runtime receipt，并把 project env 继承到后续实验。
+              → commit `1e57611`（build_log 0068；相关 346；真实 PyPI canary；外审两轮均无 verdict；唯一全量 1418）。
             - [ ] CP11.4c.2b.2c reviewed adapter generation：缺 adapter 时只从有界冻结源码生成 sidecar，schema/独立评审/
               sandbox smoke 全过才进入 snapshot spec；生成调用、prompt、模型与产物 hash 可恢复审计。
           - [ ] CP11.4c.2b.3 deployment trust contract：service account/VM、Docker socket、cgroup/device/GPU、
