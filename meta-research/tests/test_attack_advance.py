@@ -28,6 +28,12 @@ from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import GateInvariantError, SqliteGate, open_gate_read_conn
 from orchestrator.ids import SQLITE_INT_MAX
 from orchestrator.import_search import ImportSearchService
+from orchestrator.import_triggers import (
+    BoundedReferenceSnapshotProvider,
+    ImportTriggerRouter,
+    TrustedImportTriggerService,
+)
+from orchestrator.question_progress import INCONCLUSIVE_PROTOCOL
 from orchestrator.importer import DeferredImporter
 from orchestrator.manifest import canon_hash as manifest_canon
 from orchestrator.schemas import SchemaSet
@@ -1401,6 +1407,88 @@ def test_plan_search_register_rerender_then_import_defer_is_reachable(tmp_path):
     assert daemon.query_one(
         "SELECT count(*) FROM external_import WHERE action='selected_for_materialization'")[0] == 1
     assert (tmp_path / "w" / "c2" / "import_search_request.json").exists()
+
+
+def test_stuck_plan_sidecar_terminalizes_into_separate_reference_question(tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    thresholds = POLICY["retrieval"]["gate2_stuck_threshold"]
+    visit_threshold = int(thresholds["visit_count"])
+    streak_threshold = int(thresholds["consecutive_inconclusive"])
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE question SET status='inconclusive',visit_count=? WHERE id=1",
+            (visit_threshold,))
+        first_visit = visit_threshold - streak_threshold
+        for offset in range(streak_threshold):
+            history_cycle = 2 + offset
+            conn.execute(
+                "INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version,"
+                "next_question_id,next_intent,finished_at) "
+                "VALUES (?,1,1,'done','attack','test',1,'attack',CURRENT_TIMESTAMP)",
+                (history_cycle,))
+            payload = {
+                "protocol": INCONCLUSIVE_PROTOCOL,
+                "question_id": 1,
+                "cycle_id": history_cycle,
+                "goal_id": 1,
+                "goal_ver": 1,
+                "visit_count_after": first_visit + offset + 1,
+                "consecutive_inconclusive": offset + 1,
+            }
+            conn.execute(
+                "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+                "VALUES (?,1,'orchestrator','question_inconclusive',?)",
+                (history_cycle, json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"))))
+    repo_search = _RepoSearchProvider()
+    normal = ImportSearchService(
+        daemon=daemon, policy=POLICY, provider=repo_search,
+        work_root=str(tmp_path / "w"))
+    trusted = TrustedImportTriggerService(
+        daemon=daemon, policy=POLICY, repo_provider=repo_search,
+        reference_provider=BoundedReferenceSnapshotProvider(
+            POLICY["import_reference"]["reference_snapshot"]),
+        work_root=str(tmp_path / "w"))
+    attack.p["import_search"] = ImportTriggerRouter(
+        new_structure=normal, trusted_triggers=trusted)
+    plan_packs = []
+    request = {
+        "version": 1, "trigger_kind": "stuck",
+        "query": "external comparator after repeated inconclusive",
+        "need_summary": "只创建独立外部参照问题",
+    }
+
+    def plan(_cyc, pack):
+        plan_packs.append(pack)
+        assert '"may_request_stuck_survey":true' in pack.anchor_md
+        return {"import_search_request.json": request}
+
+    attack.p["plan"] = plan
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
+
+    active_cycle = 2 + streak_threshold
+    assert ids == [f"c{active_cycle}"] and len(plan_packs) == 1
+    child = daemon.query_one(
+        "SELECT id,parent_id,status,source FROM question WHERE id<>1")
+    assert child[1:] == (1, "open", "agent")
+    assert daemon.query_one(
+        "SELECT status,route,next_question_id,next_intent FROM cycle WHERE id=?",
+        (active_cycle,)) == (
+            "done", "attack", child[0], "attack")
+    assert daemon.query_one(
+        "SELECT question_id,depends_on_question_id,status FROM question_dep") == (
+            1, child[0], "pending")
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_candidate WHERE question_id=1")[0] == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit WHERE cycle_id=? AND stage='plan'",
+        (active_cycle,))[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='plan_rejected'")[0] == 0
 
 
 def test_plan_search_request_and_receipt_recover_without_reasking_or_refetching(

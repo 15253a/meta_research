@@ -128,7 +128,7 @@ _STAGE_FILES = {
 # skill 调用点说明（让工人聚焦本阶段；仿 driver._SKILL_SECTION）
 _CALL_NOTE = {
     "idea": "执行【生成任务】+【判官任务】，产 idea_set.json（候选全集 + selected_id）",
-    "plan": "执行【计划任务】：产 plan.json；若类型门确认需新外部 baseline 且本轮候选为空，则只产 import_search_request.json",
+    "plan": "执行【计划任务】：产 plan.json；若固定锚精确开放某个 import 三闸分支且本轮候选为空，则只产对应 import_search_request.json",
     "bundle": "按锚区「本目标」切片产可执行包：execution_manifest.json + identity.md + 代码文件（一信封装齐）",
     "reasoning": "执行【轮尾任务】，按 route 产 selection.json（必），酌情 tree_ops.json / answer.json",
 }

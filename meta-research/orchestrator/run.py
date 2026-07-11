@@ -54,6 +54,11 @@ from .goalbrief import parse_goal_brief
 from .instance_lease import InstanceLease, InstanceLeaseError
 from .import_fetcher import FrozenCandidateFetcher
 from .import_search import GitHubRepoSearchProvider, ImportSearchService
+from .import_triggers import (
+    BoundedReferenceSnapshotProvider,
+    ImportTriggerRouter,
+    TrustedImportTriggerService,
+)
 from .import_worker import ImportWorker
 from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
@@ -1016,6 +1021,7 @@ class System:
 def build_system(system_root: str, work_root: str, *, runner_factory: Optional[Callable] = None,
                  attack=True, outbound_config: Optional[Dict[str, Any]] = None,
                  import_search_provider=None,
+                 reference_snapshot_provider=None,
                  enforce_instance_lease: bool = True,
                  heartbeat_interval_s: float = 1.0) -> System:
     """装配全系统。system_root=含 input/goal_brief.md · policies/ · prompts/ · schemas/ 的仓库根；
@@ -1026,7 +1032,9 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     仅用于单测/显式 ``--no-outbound``，绝不伪装成已投递。生产默认在任何 work/DB 副作用前取得
     process-wide instance lease；``enforce_instance_lease=False`` 只供隔离组件单测。
     ``import_search_provider`` 是受信只读 repo connector 注入点；None 使用受 policy
-    限制的 GitHub REST provider（仅 plan 明确产搜索 sidecar 时才联网）。"""
+    限制的 GitHub REST provider（仅 plan 明确产搜索 sidecar 时才联网）。
+    ``reference_snapshot_provider`` 是 SOTA paper/benchmark 冻结注入点；None 使用 policy host
+    allowlist 内的 bounded HTTPS reader。"""
     root = Path(system_root)
     work = Path(work_root)
     policy = yaml.safe_load((root / "policies" / "policy.yaml").read_text(encoding="utf-8"))
@@ -1055,6 +1063,7 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
             runner_factory=runner_factory, attack=attack,
             outbound_config=outbound_config, instance_lease=lease,
             import_search_provider=import_search_provider,
+            reference_snapshot_provider=reference_snapshot_provider,
             resource_closers=resource_closers)
     except BaseException as primary:
         cleanup = _AssemblyCleanup(resource_closers, lease)
@@ -1084,7 +1093,7 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
 def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                      schemas: SchemaSet, runner_factory: Optional[Callable],
                      attack: Any, outbound_config: Optional[Dict[str, Any]],
-                     import_search_provider,
+                     import_search_provider, reference_snapshot_provider,
                      instance_lease: Optional[InstanceLease],
                      resource_closers: List[Callable[[], None]]) -> System:
     """Assemble under an already-held owner lease; caller owns rollback."""
@@ -1320,12 +1329,24 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             daemon=daemon, policy=policy, provider=repo_search,
             work_root=str(work), cost_ledger=cost_ledger,
             owner_guard=owner_guard)
+        reference_snapshot = (
+            reference_snapshot_provider
+            if reference_snapshot_provider is not None
+            else BoundedReferenceSnapshotProvider(
+                policy["import_reference"]["reference_snapshot"]))
+        trusted_import_triggers = TrustedImportTriggerService(
+            daemon=daemon, policy=policy, repo_provider=repo_search,
+            reference_provider=reference_snapshot, work_root=str(work),
+            cost_ledger=cost_ledger, owner_guard=owner_guard)
+        import_control = ImportTriggerRouter(
+            new_structure=import_search,
+            trusted_triggers=trusted_import_triggers)
         attack_stages = AttackStages(
             state=state, compiler=compiler, pool_gate=pool_gate, close_gate=close_gate,
             providers={"idea": provider.idea, "plan": provider.plan, "bundle": provider.bundle,
                        "plan_review": plan_reviewer, "judge": judge,
                        "reasoning": provider.reasoning,
-                       "import_search": import_search},
+                       "import_search": import_control},
             obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy,
             owner_guard=(owner_guard if instance_lease is not None else None),
             execution_supervisor=execution_supervisor)

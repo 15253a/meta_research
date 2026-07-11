@@ -72,6 +72,12 @@ class _PlanReviewReject(_PlanReject):
         self.plan = plan
 
 
+class _PlanTerminalized(Exception):
+    """A trusted control sidecar atomically ended this cycle by spawning a
+    separate reference question.  This is successful control flow, not a plan
+    rejection and must not be followed by plan/reviewer/bundle work."""
+
+
 class _BundleReject(Exception):
     """bundle 阶段的业务拒（Codex 产物层面站不住）——转目标 failed(failure_kind)+pc，不楔死。来源：
     ① fresh manifest/信封非法（artifact_invalid；resume 的已物化 manifest 校验不过 = 数据损毁，走
@@ -313,6 +319,8 @@ class AttackStages:
             derived = self._derive_plan(ci, plan, targets)      # 纯读派生（build/exec 占坑身份前置判）
             self._register_protocol(cyc.cycle_id, derived)      # gate_new_protocol（幂等跳过）
             claims = self._claim_targets(ci, cyc.cycle_id, derived)   # build→claim_baseline / exec→claim_variant
+        except _PlanTerminalized:
+            return
         except (_PlanReject, GateReject) as e:                  # 非法 plan / gate 拒 → 业务拒收尾（不楔死）
             rejected_plan = getattr(e, "plan", plan)
             self._commit_plan_terminal(cyc, rejected_plan, built=[], reject=str(e))
@@ -409,7 +417,10 @@ class AttackStages:
         search_requested = False
         if search_request_path.exists():
             request = self._read_import_search_request(search_request_path)
-            self._run_import_search(cyc, request, pack)
+            outcome = self._run_import_search(cyc, request, pack)
+            if outcome.get("terminalized") is True:
+                self._assert_import_control_terminalized(cyc, outcome)
+                raise _PlanTerminalized()
             # Registration is a short atomic DB commit.  The old pack was
             # rendered before it and must never be passed to the next plan
             # call, otherwise the model could not see the exact frozen anchors.
@@ -539,7 +550,10 @@ class AttackStages:
         # so unlike ordinary staging drafts it is fsync'd before the connector
         # is invoked and published as a private no-follow receipt.
         atomic_write_receipt(search_request_path, request)
-        self._run_import_search(cyc, request, pack)
+        outcome = self._run_import_search(cyc, request, pack)
+        if outcome.get("terminalized") is True:
+            self._assert_import_control_terminalized(cyc, outcome)
+            raise _PlanTerminalized()
         refreshed = self.compiler.render(cycle_id=cyc.cycle_id, stage="plan")
         final_files = self.p["plan"](cyc, refreshed)
         if (isinstance(final_files, dict)
@@ -555,6 +569,20 @@ class AttackStages:
             raise RuntimeError(
                 "plan 产出 import_search_request，但本装配缺 import_search 受信 connector")
         return provider(cyc, request, pack)
+
+    def _assert_import_control_terminalized(self, cyc, outcome: Dict[str, Any]) -> None:
+        child_id = outcome.get("child_question_id")
+        if isinstance(child_id, bool) or not isinstance(child_id, int) or child_id <= 0:
+            raise RuntimeError("import trigger 自报 terminalized 但缺合法 child_question_id")
+        cycle = self.state.daemon.query_one(
+            "SELECT status,active_question_id,next_question_id,next_intent FROM cycle WHERE id=?",
+            (_cnum(cyc.cycle_id),))
+        committed = self.state.daemon.query_one(
+            "SELECT 1 FROM phase_commit WHERE cycle_id=? AND stage='plan' "
+            "AND target_id IS NULL", (_cnum(cyc.cycle_id),))
+        if cycle != ("done", None, child_id, "attack") or committed is None:
+            raise RuntimeError(
+                "import trigger terminalized 回执与 cycle/plan phase_commit 不一致")
 
     def _read_import_search_request(self, path: Path) -> Dict[str, Any]:
         try:

@@ -2,27 +2,81 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/import_search_request.schema.json",
   "title": "import_search_request",
-  "description": "plan 阶段的只读外部 baseline 发现请求。它是编排器控制 sidecar，不是 Gate 事实产物；模型不能在此上报 candidate/license 事实。",
-  "type": "object",
-  "required": ["version", "trigger_kind", "query", "need_summary"],
-  "additionalProperties": false,
-  "properties": {
+  "description": "plan 阶段的受限 import 控制请求。new_structure 可只读发现；human_named 必须引用已确认指令 authority；stuck/sota 发现只能派生独立参照问题，随后由该问题引用 frozen authority。它不是 Gate 事实产物。",
+  "oneOf": [
+    { "$ref": "#/$defs/new_structure" },
+    { "$ref": "#/$defs/stuck_survey" },
+    { "$ref": "#/$defs/sota_survey" },
+    { "$ref": "#/$defs/activate_authority" }
+  ],
+  "$defs": {
     "version": { "type": "integer", "const": 1 },
-    "trigger_kind": {
-      "const": "new_structure",
-      "description": "仅开放类型门：引入独立外部 baseline 家族。stuck 不得直达 import；human_named/sota_reference 须先有受信冻结来源。"
-    },
     "query": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 512,
+      "type": "string", "minLength": 1, "maxLength": 512,
       "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
     },
     "need_summary": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 2048,
+      "type": "string", "minLength": 1, "maxLength": 2048,
       "pattern": "^[^\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]+$"
+    },
+    "authority_hash": {
+      "type": "string", "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "new_structure": {
+      "type": "object",
+      "required": ["version", "trigger_kind", "query", "need_summary"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/version" },
+        "trigger_kind": { "const": "new_structure" },
+        "query": { "$ref": "#/$defs/query" },
+        "need_summary": { "$ref": "#/$defs/need_summary" }
+      }
+    },
+    "stuck_survey": {
+      "type": "object",
+      "description": "只读普查；服务只能派生新参照问题，禁止在原问题登记候选/import_defer。",
+      "required": ["version", "trigger_kind", "query", "need_summary"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/version" },
+        "trigger_kind": { "const": "stuck" },
+        "query": { "$ref": "#/$defs/query" },
+        "need_summary": { "$ref": "#/$defs/need_summary" }
+      }
+    },
+    "sota_survey": {
+      "type": "object",
+      "description": "冻结 paper/benchmark 后派生独立 baseline-reference 问题。",
+      "required": ["version", "trigger_kind", "query", "need_summary", "reference"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/version" },
+        "trigger_kind": { "const": "sota_reference" },
+        "query": { "$ref": "#/$defs/query" },
+        "need_summary": { "$ref": "#/$defs/need_summary" },
+        "reference": {
+          "type": "object",
+          "required": ["kind", "uri"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "enum": ["paper", "benchmark"] },
+            "uri": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^https://" }
+          }
+        }
+      }
+    },
+    "activate_authority": {
+      "type": "object",
+      "description": "当前问题引用编排器投影的 exact frozen authority；human_named 只能走本分支。",
+      "required": ["version", "trigger_kind", "source_authority_hash", "need_summary"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/version" },
+        "trigger_kind": { "enum": ["human_named", "stuck", "sota_reference"] },
+        "source_authority_hash": { "$ref": "#/$defs/authority_hash" },
+        "need_summary": { "$ref": "#/$defs/need_summary" }
+      }
     }
   }
 }

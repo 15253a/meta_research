@@ -268,6 +268,10 @@ class InMemoryStateStore:
                     raise ValueError(f"仅 open/inconclusive 可剪枝: {q.qid}({q.status})")
                 self._record("agent", "prune_branch", {"qid": q.qid, "reason": op["reason_md"]})
                 q.status = "dead_end"              # decision 先行、再置 dead_end（§4.2.4）
+                for dep in self.deps:
+                    if (dep.dep_type == "question" and dep.target == q.qid
+                            and dep.status == "pending"):
+                        dep.status = "blocked"      # impossible child releases parent to replan
             elif kind == "amend_goal":
                 if cycle.route != "goal_amend":
                     raise ValueError("amend_goal 仅限 goal_amend 轮")

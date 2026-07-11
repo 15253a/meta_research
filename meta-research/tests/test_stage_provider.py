@@ -99,12 +99,20 @@ def test_plan_search_sidecar_cannot_coexist_with_plan(tmp_path):
     assert "独占 files" in runner.skills_seen[1]
 
 
-def test_plan_search_sidecar_rejects_stuck_direct_trigger(tmp_path):
-    bad = {**_IMPORT_SEARCH_REQUEST, "trigger_kind": "stuck"}
+def test_plan_search_sidecar_accepts_structural_stuck_survey_request(tmp_path):
+    request = {**_IMPORT_SEARCH_REQUEST, "trigger_kind": "stuck"}
+    sp, _ = _provider([
+        {"import_search_request.json": request}], tmp_path)
+    assert sp.plan(NS(cycle_id="c1"), _pack("plan")) == {
+        "import_search_request.json": request}
+
+
+def test_plan_search_sidecar_rejects_human_named_without_authority(tmp_path):
+    bad = {**_IMPORT_SEARCH_REQUEST, "trigger_kind": "human_named"}
     sp, runner = _provider([
         {"import_search_request.json": bad}, {"plan.json": _PLAN}], tmp_path)
     assert sp.plan(NS(cycle_id="c1"), _pack("plan")) == {"plan.json": _PLAN}
-    assert "new_structure" in runner.skills_seen[1]
+    assert "source_authority_hash" in runner.skills_seen[1]
 
 
 def test_reasoning_returns_validated_files(tmp_path):

@@ -330,3 +330,49 @@ def test_github_provider_pins_commit_and_hashes_license_without_leaking_token(
     assert "secret-must-not-persist" not in json.dumps(result)
     assert all(req.get_header("Authorization") == "Bearer secret-must-not-persist"
                for req, _timeout in seen)
+
+
+def test_github_provider_direct_resolve_verifies_human_requested_commit():
+    revision = "d" * 40
+    seen = []
+
+    def opener(request, timeout):
+        seen.append((request.full_url, timeout))
+        url = request.full_url
+        if url == "https://api.github.com/repos/owner/repo":
+            payload = {
+                "id": 9, "full_name": "owner/repo", "default_branch": "main",
+                "stargazers_count": 11, "updated_at": "2026-07-01T00:00:00Z",
+            }
+        elif url.endswith("/commits/" + revision):
+            payload = {"sha": revision}
+        else:
+            payload = {
+                "path": "LICENSE", "encoding": "base64",
+                "content": base64.b64encode(b"license").decode("ascii"),
+                "license": {"spdx_id": "Apache-2.0"},
+            }
+        return _Response(url, payload)
+
+    provider = GitHubRepoSearchProvider(POLICY["import_search"], opener=opener)
+    query = f"human_named:https://github.com/owner/repo@{revision}"
+    result = provider.resolve_repository(
+        canonical_uri="https://github.com/owner/repo",
+        requested_revision=revision, query=query)
+
+    assert result["query"] == query
+    assert result["candidates"][0]["revision"] == revision
+    assert result["candidates"][0]["license"]["spdx_id"] == "Apache-2.0"
+    assert any(url.endswith("/commits/" + revision) for url, _ in seen)
+
+
+def test_github_provider_direct_resolve_rejects_noncanonical_uri_without_network():
+    called = []
+    provider = GitHubRepoSearchProvider(
+        POLICY["import_search"],
+        opener=lambda *_args, **_kwargs: called.append(True))
+    with pytest.raises(ImportSearchProviderError, match="非规范"):
+        provider.resolve_repository(
+            canonical_uri="https://github.com/owner/repo/",
+            requested_revision=None, query="bad")
+    assert called == []

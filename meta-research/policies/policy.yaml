@@ -30,7 +30,8 @@ retrieval:
   scale_thresholds:                    # est_cost/B(t) 或 score 任一达线即进对应档；large 先判
     medium: { est_cost_ratio: 0.25, score: 0.40 }
     large: { est_cost_ratio: 0.75, score: 0.75 }
-  gate2_stuck_threshold: { visit_count: 3, consecutive_inconclusive: 2 }   # 闸2 外部普查触发
+  # 闸2：lifetime visit 与 current-goal append-only inconclusive streak 独立命中才触发
+  gate2_stuck_threshold: { visit_count: 3, consecutive_inconclusive: 2 }
 
 # import 发现是受信 host connector，不是模型工具。query 由 plan sidecar 提交；候选数由
 # retrieval 的 small/medium/large 档与本节硬上限共同决定。GitHub token 只从环境变量读，不入 policy/回执。
@@ -43,6 +44,16 @@ import_search:
   auto_license:
     allow_spdx: [Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC]
     scope: { allow_eval: true, allow_modify: true, allow_publish_pool: true, allow_redistribute: false }
+
+# 非默认三闸：stuck/sota 只派生独立参照问题；human_named 只消费已确认 directive authority。
+# SOTA 来源正文由受信 host 以私有内容寻址 blob 冻结；严格 host allowlist 防任意 URL/SSRF。
+import_reference:
+  max_child_questions_per_survey: 1
+  reference_snapshot:
+    provider: bounded_https_v1
+    allowed_hosts: [arxiv.org, export.arxiv.org, openreview.net, paperswithcode.com, proceedings.neurips.cc, openaccess.thecvf.com]
+    timeout_s: 20
+    max_response_bytes: 4194304
 
 # —— 会话 ——
 session: { dual_mode: A }             # A=一 turn 一阶段 [M6 实测后定默认]

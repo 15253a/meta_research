@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator import database as db
+from orchestrator.question_progress import load_inconclusive_streak
 from orchestrator.statestore_sqlite import SQLiteStateStore, _cnum, _qnum, _anum
 from orchestrator.writedaemon import WriteDaemon
 
@@ -368,9 +369,40 @@ def test_inconclusive_visit_and_attack_limit(store):
     c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "attack")
     store.activate_question(root); store.mark_inconclusive(root)
     assert store.daemon.query_one("SELECT status,visit_count FROM question WHERE id=?", (_qnum(root),)) == ("inconclusive", 1)
+    first = load_inconclusive_streak(
+        store.daemon.conn, question_id=_qnum(root))
+    assert first["consecutive_inconclusive"] == 1
+    assert len(first["decision_ids"]) == 1
+    store.mark_cycle_done(c.cycle_id)
+    c2 = store.open_or_resume_cycle(); store.set_route(c2.cycle_id, "attack")
     store.activate_question(root); store.mark_inconclusive(root)   # visit=2 → 到 attack 限
+    second = load_inconclusive_streak(
+        store.daemon.conn, question_id=_qnum(root))
+    assert second["consecutive_inconclusive"] == 2
+    assert len(second["decision_ids"]) == 2
     assert store.is_schedulable(root, for_intent="attack") is False
     assert store.is_schedulable(root, for_intent="decompose") is True   # 到限仍可 decompose
+
+
+def test_inconclusive_streak_resets_on_goal_version(store):
+    root = _bootstrap_root(store)
+    c = store.open_or_resume_cycle(); store.set_route(c.cycle_id, "attack")
+    store.activate_question(root); store.mark_inconclusive(root)
+    store.mark_cycle_done(c.cycle_id)
+    assert load_inconclusive_streak(
+        store.daemon.conn, question_id=_qnum(root))[
+            "consecutive_inconclusive"] == 1
+
+    with store.daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO goal(id,version,text,predicate_json) "
+            "VALUES (1,2,'amended','{}')")
+        conn.execute("UPDATE question SET goal_ver=2 WHERE id=?", (_qnum(root),))
+    progress = load_inconclusive_streak(
+        store.daemon.conn, question_id=_qnum(root))
+    assert progress["visit_count"] == 1
+    assert progress["consecutive_inconclusive"] == 0
+    assert progress["decision_ids"] == []
 
 
 # ============ spawn / prune / goal_amend / applicability ============
@@ -381,9 +413,15 @@ def test_spawn_and_prune(store):
                                        "text": "follow", "local_key": "f"}])
     spawned = store.daemon.query_one("SELECT id,source FROM question WHERE text='follow'")
     assert spawned[1] == "agent"
+    store.record_question_dep(root, dep_type="question", target=f"q{spawned[0]}")
+    assert store.is_schedulable(root, for_intent="attack") is False
     store.apply_tree_ops(c.cycle_id, [{"op": "propose_prune", "question_id": f"q{spawned[0]}", "reason_md": "no"}])
     assert store.daemon.query_one("SELECT status FROM question WHERE id=?", (spawned[0],))[0] == "dead_end"
     assert store.daemon.query_one("SELECT count(*) FROM decision WHERE type='prune_branch' AND question_id=?", (spawned[0],))[0] == 1
+    assert store.daemon.query_one(
+        "SELECT status FROM question_dep WHERE question_id=? AND depends_on_question_id=?",
+        (_qnum(root), spawned[0])) == ("blocked",)
+    assert store.is_schedulable(root, for_intent="attack") is True
 
 
 def test_goal_amend_spawn_cap_counts_only_goal_amend_route(store):

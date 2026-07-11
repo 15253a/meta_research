@@ -30,17 +30,26 @@ from typing import Any, Dict, Mapping, Optional
 
 from .budgeting import compute_budget
 from .ids import cnum as _cnum, qnum as _qnum
+from .import_authority import ImportAuthorityError, load_question_import_authority
 from .importer import DeferredImporter
 from .interfaces import CallUsage
 from .process_supervisor import atomic_write_receipt, read_receipt
+from .question_progress import QuestionProgressError, load_inconclusive_streak
 
 
 _PROTOCOL = "import-search-v1"
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _FULL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+_GITHUB_URI_RE = re.compile(
+    r"^https://github\.com/([A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100})$")
 _SPDX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]{0,127}$")
-_REQUEST_KEYS = frozenset({"version", "trigger_kind", "query", "need_summary"})
+_DISCOVERY_REQUEST_KEYS = frozenset(
+    {"version", "trigger_kind", "query", "need_summary"})
+_ACTIVATION_REQUEST_KEYS = frozenset(
+    {"version", "trigger_kind", "source_authority_hash", "need_summary"})
+_SOTA_REQUEST_KEYS = frozenset(
+    {"version", "trigger_kind", "query", "need_summary", "reference"})
 _COMPLETION_KEYS = frozenset({
     "protocol", "request", "request_hash", "trigger_snapshot_hash", "policy_hash",
     "provider", "runner_call_id", "receipt_ref", "result_hash", "retrieval",
@@ -107,31 +116,76 @@ def _bounded_text(value: Any, *, field: str, max_bytes: int,
 
 def validate_import_search_request(request: Any) -> Dict[str, Any]:
     """Validate the control sidecar independently of jsonschema injection."""
-    if not isinstance(request, dict) or set(request) != _REQUEST_KEYS:
-        raise ImportSearchError(
-            f"import_search_request 须精确包含 {sorted(_REQUEST_KEYS)}")
+    if not isinstance(request, dict):
+        raise ImportSearchError("import_search_request 须为 object")
     if isinstance(request.get("version"), bool) or request.get("version") != 1:
         raise ImportSearchError("import_search_request.version 只接受 1")
-    if request.get("trigger_kind") != "new_structure":
-        raise ImportSearchError(
-            "生产 import_search 只开放 new_structure 类型门；"
-            "stuck 不得直达，human_named/sota_reference 须有受信冻结来源")
-    query = _bounded_text(request.get("query"), field="import search query", max_bytes=2048)
+    trigger_kind = request.get("trigger_kind")
+    if trigger_kind not in (
+            "new_structure", "stuck", "human_named", "sota_reference"):
+        raise ImportSearchError("import_search_request.trigger_kind 非法")
     summary = _bounded_text(
         request.get("need_summary"), field="import need_summary", max_bytes=8192)
-    if len(query) > 512 or len(summary) > 2048:
+    if len(summary) > 2048:
         raise ImportSearchError("import_search_request 字符数超过 schema 上限")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in query):
-        raise ImportSearchError("import search query 不得含控制字符")
     if any((ord(char) < 0x20 and char not in "\n\r\t") or ord(char) == 0x7F
            for char in summary):
         raise ImportSearchError("import need_summary 不得含非文本控制字符")
-    # Return a detached canonical shape so a caller cannot mutate the request
-    # between request hashing and provider invocation.
-    return {
-        "version": 1, "trigger_kind": "new_structure",
+
+    keys = set(request)
+    if keys == _ACTIVATION_REQUEST_KEYS:
+        if trigger_kind == "new_structure":
+            raise ImportSearchError(
+                "new_structure 不接受 source authority，须走类型门发现")
+        digest = request.get("source_authority_hash")
+        if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+            raise ImportSearchError("source_authority_hash 非 sha256")
+        return {
+            "version": 1, "trigger_kind": trigger_kind,
+            "source_authority_hash": digest, "need_summary": summary,
+        }
+
+    expected = (_SOTA_REQUEST_KEYS if trigger_kind == "sota_reference"
+                else _DISCOVERY_REQUEST_KEYS)
+    if keys != expected:
+        raise ImportSearchError(
+            f"{trigger_kind} import_search_request 字段非法: "
+            f"expected={sorted(expected)}, got={sorted(keys)}")
+    if trigger_kind == "human_named":
+        raise ImportSearchError(
+            "human_named 必须引用已确认 directive 的 source_authority_hash")
+    query = _bounded_text(
+        request.get("query"), field="import search query", max_bytes=2048)
+    if len(query) > 512:
+        raise ImportSearchError("import search query 字符数超过 schema 上限")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in query):
+        raise ImportSearchError("import search query 不得含控制字符")
+    result = {
+        "version": 1, "trigger_kind": trigger_kind,
         "query": query, "need_summary": summary,
     }
+    if trigger_kind == "sota_reference":
+        reference = request.get("reference")
+        if (not isinstance(reference, dict)
+                or set(reference) != {"kind", "uri"}
+                or reference.get("kind") not in ("paper", "benchmark")):
+            raise ImportSearchError(
+                "sota_reference.reference 须精确含 kind=paper|benchmark 与 uri")
+        uri = _bounded_text(
+            reference.get("uri"), field="reference.uri", max_bytes=2048)
+        parsed = urllib.parse.urlsplit(uri)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ImportSearchError(
+                "sota_reference.reference.uri port 非法") from error
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or port not in (None, 443)
+                or parsed.fragment):
+            raise ImportSearchError(
+                "sota_reference.reference.uri 须为无凭据/fragment 的 HTTPS URL")
+        result["reference"] = {"kind": reference["kind"], "uri": uri}
+    return result
 
 
 def _strict_json(raw: bytes, *, label: str) -> Any:
@@ -239,6 +293,112 @@ class GitHubRepoSearchProvider:
             "updated_at": updated_at,
         }
 
+    def _license_snapshot(self, *, full_name: str, revision: str,
+                          result_id: str) -> Dict[str, Any]:
+        license_url = f"https://api.github.com/repos/{full_name}/license?ref={revision}"
+        license_payload = self._get_json(
+            license_url, label=f"license {result_id}", allow_404=True)
+        if license_payload is None:
+            return {
+                "spdx_id": "NOASSERTION", "lookup_status": "missing",
+                "evidence_ref": license_url, "content_sha256": None,
+            }
+        if not isinstance(license_payload, dict):
+            raise ImportSearchProviderError(
+                f"GitHub license {result_id} 非 object")
+        license_obj = license_payload.get("license")
+        spdx_id = (license_obj.get("spdx_id")
+                   if isinstance(license_obj, dict) else None)
+        if not isinstance(spdx_id, str) or not _SPDX_RE.fullmatch(spdx_id):
+            spdx_id = "NOASSERTION"
+        encoded = license_payload.get("content")
+        encoding = license_payload.get("encoding")
+        if not isinstance(encoded, str) or encoding != "base64":
+            raise ImportSearchProviderError(
+                f"GitHub license {result_id} 缺 base64 content")
+        try:
+            content = base64.b64decode("".join(encoded.split()), validate=True)
+        except (ValueError, base64.binascii.Error) as error:
+            raise ImportSearchProviderError(
+                f"GitHub license {result_id} base64 损坏") from error
+        if len(content) > self.max_response_bytes:
+            raise ImportSearchProviderError(
+                f"GitHub license {result_id} 解码后超限")
+        path = license_payload.get("path")
+        if not isinstance(path, str) or not path or len(path.encode("utf-8")) > 2048:
+            raise ImportSearchProviderError(
+                f"GitHub license {result_id} path 非法")
+        evidence_ref = (
+            f"https://api.github.com/repos/{full_name}/contents/"
+            f"{urllib.parse.quote(path, safe='/')}?ref={revision}")
+        return {
+            "spdx_id": spdx_id, "lookup_status": "found",
+            "evidence_ref": evidence_ref,
+            "content_sha256": _bytes_hash(content),
+        }
+
+    def resolve_repository(self, *, canonical_uri: str,
+                           requested_revision: Optional[str],
+                           query: str) -> Dict[str, Any]:
+        """Resolve one human-named repository to an immutable candidate.
+
+        The human may name a repository and optionally a commit.  The trusted
+        connector, not the plan model, resolves/verifies the final 40-hex
+        revision and pinned license content.
+        """
+        match = (_GITHUB_URI_RE.fullmatch(canonical_uri)
+                 if isinstance(canonical_uri, str) else None)
+        if match is None:
+            raise ImportSearchProviderError(
+                "human_named repository URI 非规范 GitHub URI")
+        if requested_revision is not None and (
+                not isinstance(requested_revision, str)
+                or not _COMMIT_RE.fullmatch(requested_revision)):
+            raise ImportSearchProviderError(
+                "human_named requested_revision 非 40 位小写 commit")
+        full_name = match.group(1)
+        repository_payload = self._get_json(
+            f"https://api.github.com/repos/{full_name}",
+            label=f"repository {full_name}")
+        item = self._repository_item(repository_payload)
+        if item is None or item["full_name"].lower() != full_name.lower():
+            raise ImportSearchProviderError(
+                "human_named repository metadata/identity 非法")
+        commit_ref = requested_revision or item["default_branch"]
+        commit_url = (
+            f"https://api.github.com/repos/{item['full_name']}/commits/"
+            f"{urllib.parse.quote(commit_ref, safe='')}")
+        commit = self._get_json(
+            commit_url, label=f"commit {item['provider_result_id']}",
+            allow_404=True)
+        revision = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(revision, str) or not _COMMIT_RE.fullmatch(revision):
+            raise ImportSearchProviderError(
+                "human_named repository revision 无法固定")
+        if requested_revision is not None and revision != requested_revision:
+            raise ImportSearchProviderError(
+                "human_named requested_revision 解析结果不一致")
+        license_info = self._license_snapshot(
+            full_name=item["full_name"], revision=revision,
+            result_id=item["provider_result_id"])
+        retrieved_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        return {
+            "provider": self.name, "query": query,
+            "retrieved_at": retrieved_at,
+            "candidates": [{
+                "provider_result_id": item["provider_result_id"],
+                "canonical_uri": f"https://github.com/{item['full_name']}",
+                "revision": revision,
+                "repository": {
+                    "full_name": item["full_name"],
+                    "default_branch": item["default_branch"],
+                    "stars": item["stars"], "updated_at": item["updated_at"],
+                },
+                "license": license_info,
+            }],
+            "skipped": [],
+        }
+
     def search(self, *, query: str, max_candidates: int) -> Dict[str, Any]:
         if (isinstance(max_candidates, bool) or not isinstance(max_candidates, int)
                 or not 1 <= max_candidates <= self.max_candidates):
@@ -277,48 +437,9 @@ class GitHubRepoSearchProvider:
                     "reason": "revision_invalid",
                 })
                 continue
-            license_url = f"https://api.github.com/repos/{full_name}/license?ref={revision}"
-            license_payload = self._get_json(
-                license_url, label=f"license {item['provider_result_id']}", allow_404=True)
-            if license_payload is None:
-                license_info = {
-                    "spdx_id": "NOASSERTION", "lookup_status": "missing",
-                    "evidence_ref": license_url, "content_sha256": None,
-                }
-            else:
-                if not isinstance(license_payload, dict):
-                    raise ImportSearchProviderError(
-                        f"GitHub license {item['provider_result_id']} 非 object")
-                license_obj = license_payload.get("license")
-                spdx_id = (license_obj.get("spdx_id")
-                           if isinstance(license_obj, dict) else None)
-                if not isinstance(spdx_id, str) or not _SPDX_RE.fullmatch(spdx_id):
-                    spdx_id = "NOASSERTION"
-                encoded = license_payload.get("content")
-                encoding = license_payload.get("encoding")
-                if not isinstance(encoded, str) or encoding != "base64":
-                    raise ImportSearchProviderError(
-                        f"GitHub license {item['provider_result_id']} 缺 base64 content")
-                try:
-                    content = base64.b64decode("".join(encoded.split()), validate=True)
-                except (ValueError, base64.binascii.Error) as error:
-                    raise ImportSearchProviderError(
-                        f"GitHub license {item['provider_result_id']} base64 损坏") from error
-                if len(content) > self.max_response_bytes:
-                    raise ImportSearchProviderError(
-                        f"GitHub license {item['provider_result_id']} 解码后超限")
-                path = license_payload.get("path")
-                if not isinstance(path, str) or not path or len(path.encode("utf-8")) > 2048:
-                    raise ImportSearchProviderError(
-                        f"GitHub license {item['provider_result_id']} path 非法")
-                evidence_ref = (
-                    f"https://api.github.com/repos/{full_name}/contents/"
-                    f"{urllib.parse.quote(path, safe='/')}?ref={revision}")
-                license_info = {
-                    "spdx_id": spdx_id, "lookup_status": "found",
-                    "evidence_ref": evidence_ref,
-                    "content_sha256": _bytes_hash(content),
-                }
+            license_info = self._license_snapshot(
+                full_name=full_name, revision=revision,
+                result_id=item["provider_result_id"])
             candidates.append({
                 "provider_result_id": item["provider_result_id"],
                 "canonical_uri": f"https://github.com/{full_name}",
@@ -461,12 +582,16 @@ class ImportSearchService:
         return payload
 
     def _trigger_context_in_txn(self, conn, cyc, request: Dict[str, Any]) -> Dict[str, Any]:
+        if request.get("trigger_kind") != "new_structure":
+            raise ImportSearchError(
+                "ImportSearchService 只消费 new_structure；其他三闸须经 trusted trigger router")
         cycle_id = _cnum(cyc.cycle_id)
         question_id = _qnum(cyc.question_id)
         row = conn.execute(
             "SELECT c.goal_id,c.goal_ver,c.status,c.route,c.active_question_id,"
             "q.goal_id,q.goal_ver,q.status,q.active_cycle,q.text,q.score,q.est_cost,"
-            "g.text,g.predicate_json,(SELECT MAX(version) FROM goal WHERE id=c.goal_id) "
+            "g.text,g.predicate_json,(SELECT MAX(version) FROM goal WHERE id=c.goal_id),"
+            "q.visit_count "
             "FROM cycle c JOIN question q ON q.id=? "
             "JOIN goal g ON g.id=c.goal_id AND g.version=c.goal_ver WHERE c.id=?",
             (question_id, cycle_id)).fetchone()
@@ -482,6 +607,28 @@ class ImportSearchService:
         if len(ideas) != 1:
             raise _TriggerChanged(
                 f"import_search 要求当前 cycle 恰一 selected idea，实收 {len(ideas)}")
+        try:
+            source_authority = load_question_import_authority(
+                conn, question_id=question_id)
+        except ImportAuthorityError as error:
+            raise ImportSearchError(str(error)) from error
+        if source_authority is not None:
+            raise ImportSearchError(
+                "当前问题已有 human/stuck/SOTA source authority；不得借 new_structure 改写来源")
+        stuck_threshold = self.policy["retrieval"]["gate2_stuck_threshold"]
+        try:
+            progress = load_inconclusive_streak(
+                conn, question_id=question_id)
+        except QuestionProgressError as error:
+            raise ImportSearchError(
+                f"question q{question_id} inconclusive 账本损坏: {error}"
+            ) from error
+        if (progress["visit_count"] >= int(stuck_threshold["visit_count"])
+                and progress["consecutive_inconclusive"] >= int(
+                    stuck_threshold["consecutive_inconclusive"])):
+            raise ImportSearchError(
+                "当前问题已命中 stuck 状态门；不得借 new_structure 在原问题直达 import，"
+                "须只读普查并派生新参照问题")
         if conn.execute(
                 "SELECT 1 FROM external_candidate WHERE question_id=? AND discovered_cycle=? LIMIT 1",
                 (question_id, cycle_id)).fetchone() is not None:
@@ -861,6 +1008,9 @@ class ImportSearchService:
 
     def __call__(self, cyc, request: Dict[str, Any], _pack=None) -> Dict[str, Any]:
         request = validate_import_search_request(request)
+        if request["trigger_kind"] != "new_structure":
+            raise ImportSearchError(
+                "非 new_structure 请求不得进入默认 import search service")
         request_hash = _hash(request)
         purpose = f"import_search:{request_hash}"
         with self._lock:

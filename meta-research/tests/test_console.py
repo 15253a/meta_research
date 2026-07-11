@@ -359,11 +359,76 @@ def test_inject_question_effect(env):
     assert q[1] == "open" and q[2] == "human" and "CNN" in q[0]
 
 
+def test_human_named_repo_requires_structured_hard_confirmation_and_binds_question(env):
+    d, c = env["d"], env["c"]
+    c.policy = {"tree_guard": {
+        "max_open_questions": 30, "max_children_per_node": 6,
+        "max_decompose_depth": 4}}
+    raw = (
+        '注入问题 {"question_text":"复现人类点名仓库作为 comparator",'
+        '"parent_question_id":"q1",'
+        '"human_named_repo":{"canonical_uri":"https://github.com/owner/repo",'
+        '"requested_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},'
+        '"need_summary":"人类明确要求把该仓库作为独立外部对照"}')
+    result = c.handle_inbound(
+        connector="qq", raw_text=raw, idempotency_key="human-repo-1",
+        goal_id=1, goal_ver=1)
+    assert result["needs_confirmation"] is True
+    assert d.query_one(
+        "SELECT kind,hardness,status FROM directive WHERE id=?",
+        (result["directive_id"],)) == ("inject_question", "hard", "pending")
+    with pytest.raises(ValueError, match="未经回显确认"):
+        c.consume_directive(directive_id=result["directive_id"], cycle_id="c1")
+    c.confirm_directive(
+        directive_id=result["directive_id"],
+        confirm_message_id=_action_message(d, c, result, "confirm"))
+    effect = c.consume_directive(
+        directive_id=result["directive_id"], cycle_id="c1")
+
+    qid = int(effect["question_id"][1:])
+    assert d.query_one(
+        "SELECT parent_id,text,status,source FROM question WHERE id=?", (qid,)) == (
+            1, "复现人类点名仓库作为 comparator", "open", "human")
+    authority = effect["human_named_authority"]
+    assert authority["authority_hash"] == effect["source_authority_hash"]
+    assert authority["directive_id"] == result["directive_id"]
+    assert authority["source_message_id"] == result["message_id"]
+    assert d.query_one(
+        "SELECT question_id,actor,type FROM decision WHERE id=("
+        "SELECT consumed_decision_id FROM directive WHERE id=?)",
+        (result["directive_id"],)) == (
+            qid, "human", "directive_inject_question")
+
+
+def test_human_named_repo_rejects_free_text_or_unpinned_authority_shape(env):
+    _d, c = env["d"], env["c"]
+    # A URL in free text remains an ordinary soft question: text alone is not
+    # trusted human_named authority.
+    ordinary = c.handle_inbound(
+        connector="qq", raw_text="注入问题：看看 https://github.com/owner/repo",
+        idempotency_key="human-repo-free", goal_id=1, goal_ver=1)
+    assert ordinary["needs_confirmation"] is False
+
+    malformed = c.handle_inbound(
+        connector="qq",
+        raw_text=('注入问题 {"question_text":"x","human_named_repo":'
+                  '{"canonical_uri":"http://127.0.0.1/repo"},'
+                  '"need_summary":"x"}'),
+        idempotency_key="human-repo-bad", goal_id=1, goal_ver=1)
+    payload = json.loads(_d.query_one(
+        "SELECT payload_json FROM directive WHERE id=?",
+        (malformed["directive_id"],))[0])
+    assert "parse_error" in payload
+
+
 def test_prune_branch_effect_and_deadend_decision(env):
     d, c = env["d"], env["c"]
     with d.transaction() as conn:
         conn.execute("INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
                      "VALUES (2,1,1,1,'q2 可剪','open','agent')")
+        conn.execute(
+            "INSERT INTO question_dep(question_id,dep_type,depends_on_question_id,status,created_cycle) "
+            "VALUES (1,'question',2,'pending',1)")
     r = c.handle_inbound(connector="qq", raw_text="剪枝这条", idempotency_key="k-pr", goal_id=1, goal_ver=1)
     c.confirm_directive(directive_id=r["directive_id"],
                         confirm_message_id=_action_message(d, c, r, "confirm"))
@@ -373,6 +438,8 @@ def test_prune_branch_effect_and_deadend_decision(env):
         conn.execute("UPDATE directive SET payload_json=? WHERE id=?", (json.dumps(p), r["directive_id"]))
     c.consume_directive(directive_id=r["directive_id"], cycle_id="c1")
     assert d.query_one("SELECT status FROM question WHERE id=2")[0] == "dead_end"
+    assert d.query_one(
+        "SELECT status FROM question_dep WHERE question_id=1") == ("blocked",)
     assert d.query_one("SELECT count(*) FROM decision WHERE type='prune_branch' AND question_id=2")[0] == 1
     # 外审 SHOULD 回归：一次消费恰一条人类决策——prune 决策即消费决策，无重复 directive_prune_branch 行
     assert d.query_one("SELECT count(*) FROM decision WHERE directive_id=?", (r["directive_id"],))[0] == 1
