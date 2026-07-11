@@ -20,7 +20,8 @@
   CP11.3a 单实例 owner lease/heartbeat/lifecycle fencing 已落 `d79d3d0`；CP11.3b execution guardian 与
   owner-death 整树排空已落 `2f4a5d5`；CP11.3c current lineage、owner-first 外调、receipt→DB 对账与
   120 轮状态稳定性已落 `a32629d`。CP11.4a.1 冻结 import 消费/dependency_wait/worker 恢复与独立 plan 评审
-  已落 `43c4134`；当前进入 CP11.4a.2 生产 import_search/import_register 与 license 来源。
+  已落 `43c4134`；CP11.4a.2 `new_structure` 生产 import_search/import_register 与 license provenance 已落
+  `43dd99e`；当前进入 CP11.4a.3 三闸直接/状态来源契约。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -395,9 +396,13 @@
         dependency_wait、默认 fenced worker/resumer、终败 dep blocked 回到重规划、独立 plan reviewer 两轮耐久；
         默认不可信 adapter 在强沙箱前 fail-closed。→ commit `43c4134`（build_log 0060；相关 84/92/105/93；
         唯一全量 1267 过/7 旧契约锚，修后 exact 7/7；外审第2轮上限后反馈处置）。
-      - [ ] CP11.4a.2 生产发现/登记与 license 来源：接通只读 `repo-search`/`import_search` → 编排器
-        `import_register` 的耐久、可回放入口；候选 pinned revision/search receipt 与 auto/human license provenance
-        必须可机械核验，禁止模型直接写 DB 或自报授权。
+      - [x] CP11.4a.2 `new_structure` 生产发现/登记与 license 来源：受限 plan sidecar → 受信 GitHub REST
+        `import_search` → 短事务 `import_register`；请求/零结果/runner receipt 可恢复，候选 pinned revision、license
+        content evidence、auto/human provenance 可机械核验，历史 v2 hash 可续。→ commit `43dd99e`（build_log 0061；
+        相关 358/158/20/91；唯一全量 1297；外审第2轮上限后反馈处置）。
+      - [ ] CP11.4a.3 三闸直接/状态来源契约：`human_named` 只接受结构化 directive provenance；
+        `sota_reference` 只接受冻结 paper/benchmark snapshot；`stuck` 普查只能新建 idea/question，再由新问题按
+        `new_structure` 触发发现，禁止原问题直接 `import_defer`。三路都需重启可回放、与 candidate/license 四锚闭合。
     - [ ] CP11.4b 内容寻址与精确调用补账：artifact capability/fd-safe 消费，消除 checkpoint hash/open TOCTOU；
       provider invocation ID、usage/billing receipt 与 runner_call exactly-once 对账。
     - [ ] CP11.4c 敌对隔离与最终长程验收：container/cgroup/VM 或等价强隔离、guardian/receipt 防篡改、跨节点

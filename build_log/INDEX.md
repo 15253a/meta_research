@@ -6,6 +6,7 @@
 
 ---
 
+- [0061](0061-cp114a2-durable-import-discovery.md) — CP11.4a.2 `new_structure` 耐久只读发现 + pinned candidate/license provenance + 原子登记/恢复 · commit `43dd99e` · 验证: 通过（相关 358/158/20/91；唯一全量 1297；外审第2轮上限后反馈处置）
 - [0060](0060-cp114a1-deferred-import-plan-review.md) — CP11.4a.1 冻结 import 选择/dependency_wait/worker 恢复 + 独立 plan 评审 · commit `43c4134` · 验证: 通过（相关 84/92/105/93；唯一全量 1267 过/7 旧契约锚，修后 exact 7/7；外审第2轮上限后反馈处置）
 - [0059](0059-cp113c-durable-state-semantics.md) — CP11.3c current lineage + owner-first 外调 + receipt→DB 对账 + eval-only + 120 轮状态稳定性 · commit `a32629d` · 验证: 通过（相关 78/101/102/80/45/77/59/20/13；唯一全量 1235 过/5 旧契约锚，修后 exact 5/5；外审两轮均无 verdict）—— **CP11.3 状态与执行边界达成**
 - [0058](0058-cp113b-execution-owner-death.md) — CP11.3b 统一 owner-death execution guardian + delegated fence + 可信子孙树整组排空 + 耐久 receipt · commit `2f4a5d5` · 验证: 通过（相关 21/32/30/75/53/62/45；VEPFS canary 1；唯一全量 1209 过/1 时序断言假阳性，修后定向 1；外审第2轮上限后反馈处置）

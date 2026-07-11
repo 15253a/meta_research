@@ -1,43 +1,40 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4a.2 生产 import_search/import_register 与 license 来源
-- 检查点状态：CP11.4a.1 功能已提交 `43c4134`，build_log 0060 已写；CP11.4a.2 待开工
+- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4a.3 三闸直接/状态来源契约
+- 检查点状态：CP11.4a.2 功能已提交 `43dd99e`；唯一全量 1297 passed；build_log 0061 已记账
 
 ## 刚完成什么
 
-CP11.4a.1 已闭合“事先登记的 exact action-cycle 候选”消费链：candidate/license 内容哈希不含 SQLite 自增 ID；
-plan 必须回引 candidate/license/selection/policy 四锚，提交事务重算；import selection、baseline(planned)、
-question_dep(pending)、dependency_wait、释放问题与 cycle 收尾单事务。默认 Advancer 每轮最多处理一个 worker 项；
-成功满足 exact dep，终败原子写 failure/baseline build_failed/dep blocked/decision 后回到重规划，崩溃可续 suffix。
+CP11.4a.2 已把 `new_structure` 的生产发现链接通：plan 只能在本 action-cycle 无候选时单独发一个受限
+`import_search_request`；编排器先耐久请求/runner receipt，再做有界 GitHub REST 只读检索，固定 40 位 commit 与
+license 内容证据，最后以短事务原子登记 candidate、license、runner/ledger 和 completion decision。重启时有 receipt
+只 finalize、不重复 GET；零结果也耐久，重渲染 pack 后换新 plan session。模型不能直接写 DB 或自报 license。
 
-独立 plan answerability reviewer 已与 generator 分会话，最多两轮，runner_call/cost/verdict 先耐久，draft/decision/
-sidecar exact hash 恢复；第二轮仍 fail 正常 inconclusive。默认 FrozenCandidateFetcher 会限额并校验内容寻址文件、
-argv 与供应链闭包，但其 adapter 标为 untrusted；当前没有 adversarial sandbox，所以正式装配必 fail-closed，绝不在
-host 裸跑。
+auto license 仅机械允许 Apache-2.0/MIT/BSD-2-Clause/BSD-3-Clause/ISC 的冻结 scope；其他进入 review。新来源使用
+v3 snapshot hash，旧 NULL provenance 行保持精确 v2，旧 work-root 可恢复。默认 materializer 仍因没有敌对沙箱而
+fail-closed，所以当前是“可发现、可登记、可调度”，不是“可安全执行任意外部代码”。
 
 ## 验证 / Review
 
-- 相关：84/92/105/93 均通过；内部追加的 hash、TOCTOU、非有限 plan、review 身份与基础设施错误回归通过。
-- 唯一全量：`7 failed, 1267 passed in 294.51s`；七项均为旧契约锚，更新后 exact `7 passed in 2.96s`；按用户
-  要求未二跑全量。
-- 外审第 1 轮独立账号 401 无 verdict；第 2 轮 `REQUEST_CHANGES`（3 BLOCKER/2 SHOULD/1 NIT）。四项成立意见
-  全修；`plan` 未初始化为误报（try 前已置 None，补回归）；完全相同 candidate tie 已被 DDL 唯一索引排除。
-- 当前仍是 operational canary，不是 reference-complete 或 hostile-workload production-ready 系统。
+- 开发期相关组：358、158、20、91 均通过；skills/frozen 8 项通过；compile/check 通过。
+- 检查点末唯一一次全量：`pytest -q` → `1297 passed in 301.64s`，无失败、无第二次全量。
+- 外审第 1 轮独立账号 401，无 verdict；第 2 轮 `REQUEST_CHANGES`（1 BLOCKER/2 SHOULD/1 NIT）。成立的旧 v2
+  hash 兼容和 bool receipt version 已修；DDL 缺失为冻结 migration 事实误报；腐化 finalize 应 fail-loud，未改成
+  掩盖审计损坏的普通重规划。两轮上限后不再复审，详见 build_log 0061。
+- 功能提交：`43dd99efcdc2469e8f96124695381a6287b19b6f`；尚未 push。
 
 ## 当前关键边界
 
-- CP11.4a 父项仍未完成：生产运行没有只读 `repo-search/import_search → import_register` 入口，也没有可回放的
-  auto/human license provenance。现在的 import 只对直接 API/受信服务预登记候选可达。
-- default adapter 会因缺强沙箱而终败并重规划；这保证不裸跑，但不等于“外部基线已可实用导入”。
-- large repo clone/LFS、fd-safe artifact capability、provider invocation/billing exactly-once、container/cgroup/VM、
-  跨节点 VEPFS 与含真实外调的 100+ 轮 soak 尚未完成。
-- 不得 push；后续仍按用户节奏：开发期相关验证，检查点末尾只一次全量，再提交与记账。
+- CP11.4a 父项未完成：`human_named` 尚无结构化 directive 来源，`sota_reference` 尚无冻结 paper/benchmark
+  snapshot；`stuck` 目前被正确拒绝直接 search，但“普查→新 idea/question”的耐久来源链还未实现。
+- 默认不可信 adapter 仍 fail-closed；large repo/LFS、artifact capability/fd-safe、provider billing exactly-once、
+  container/cgroup/VM、跨节点 VEPFS 与含真实外调/失败注入的 100+ 轮 soak 尚未完成。
+- 不得 push；继续按用户节奏：开发期只跑相关验证，检查点末只跑一次全量，再提交功能和记账。
 
 ## 下一步动作
 
-1. 先设计受限 import discovery artifact/receipt：触发三闸、query/provider/ranking/pinned revision/search bytes hash，
-   模型只能请求只读搜索，不能写 DB 或自报 candidate/license 权威事实。
-2. 接生产 `import_search` runner/MCP 或等价受信 connector，编排器短事务 `import_register`，并为零结果/崩溃/
-   重启建立 exactly-once marker；license 采用可回放 auto policy 或明确 human decision provenance。
-3. 用真实默认装配证明：发现→登记→plan 四锚→dependency_wait 可达；强沙箱仍未落地时物化应诚实 fail-closed，
-   不把“可发现/可调度”误报成“已安全执行外部代码”。
+1. 冻结 `human_named` 的 directive id/version/actor/evidence 与 exact action-cycle 绑定，禁止自由文本暗示直接变权威来源。
+2. 为 `sota_reference` 建立内容寻址的 paper/benchmark snapshot 与可回放提取证据，提交时重算。
+3. 实现 `stuck` 普查只产新 idea/question 的状态转换；原问题不得直接 search/import，新问题再走既有
+   `new_structure` 链，覆盖崩溃恢复与重复消费。
+4. 完成相关验证和最多两轮独立外审后，在检查点末只跑一次全量，再提交和记账。
