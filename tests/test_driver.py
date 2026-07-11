@@ -181,6 +181,7 @@ PLAN_EVAL_ONLY = {
         "budget_estimate": 0.5, "spec_md": "免训练补测",
         "eval_action": "create_evaluation", "attempt_purpose": "protocol_upgrade",
         "eval_key": "up-1", "evaluation_source": "protocol_upgrade",
+        "claim": {"baseline_ref": "existing-family", "variant_key": "base"},
     }],
     "protocol": {"name": "toy-gauss-cls", "version": 2, "scope_spec": {"data": "升版场景"}},
     "metric_defs": [{"metric_id": "accuracy", "version": 1, "name": "准确率",

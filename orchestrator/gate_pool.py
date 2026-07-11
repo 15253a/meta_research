@@ -6,8 +6,9 @@ gate_register_variant / gate_new_protocol。
 
 **「入池」语义**：冻结 DDL 无独立池表——baseline/variant `status='legal'` 即入池（§4.1「复制入池」的
 非剪切语义体现在 legal 状态 + 卡片/索引侧写，卡片物化 = 编译器/召回已读 legal 池）。
-**§4.2.5(ii) 单事务**：gate_register_evaluation 把 evaluation+attempt(success)+metric_result 一次事务写入
-（成功 attempt 在此之前**不存在**——执行期只有 staging；失败 attempt 才走 gate_start/finish_attempt 入账）。
+**§4.2.5(ii) 单事务**：生产执行先由 gate_start_attempt 耐久创建 running intent；
+gate_register_evaluation 再把该 attempt(success)+metric_result+evaluation canonical 一次事务收口。
+兼容 create/append 模式只保留给旧调用与迁移测试，不得用于真实外部执行后补造 attempt。
 register_baseline/variant 是其后的池迁移短事务；CP5.4 attack advance 以**可恢复短事务序列 + 结构续跑**组合
 注册段（每步幂等或可从状态跳过）；整段合一事务（需 WriteDaemon 可嵌套/组合式 gate）= M5/M6 硬化项。
 
@@ -38,6 +39,10 @@ class PoolGate(ExecGate):
                             config_json: str = "{}") -> Dict[str, int]:
         """占位声明：baseline(planned) + 初始 claim variant(planned)。拒：canonical_key 已占（I5）；identity 草稿空。"""
         ci = _cnum(cycle_id)
+        self._assert_current_cycle(ci, action="claim_baseline")
+        active = self._q1("SELECT active_question_id FROM cycle WHERE id=?", (ci,))
+        if active is None or active[0] is None:
+            self._reject(ci, "claim_baseline 要求 current cycle 有 active question")
         if not identity_draft_md or not identity_draft_md.strip():
             self._reject(ci, "claim_baseline identity 草稿为空（模板缺字段）")
         if self._q1("SELECT id FROM baseline WHERE canonical_key=?", (canonical_key,)):
@@ -50,8 +55,9 @@ class PoolGate(ExecGate):
                     "INSERT INTO baseline(slug,canonical_key,parent_id,identity_doc,born_cycle,status) "
                     "VALUES (?,?,?,?,?,'planned')", (slug, canonical_key, parent_id, identity_draft_md, ci)).lastrowid
                 vid = conn.execute(
-                    "INSERT INTO variant(baseline_id,variant_key,config_json,status) VALUES (?,?,?,'planned')",
-                    (bid, initial_variant_key, config_json)).lastrowid
+                    "INSERT INTO variant(baseline_id,variant_key,config_json,status,born_question) "
+                    "VALUES (?,?,?,'planned',?)",
+                    (bid, initial_variant_key, config_json, active[0])).lastrowid
         except sqlite3.IntegrityError as e:   # 未被前置覆盖的约束（干净拒契约统一，内审 SHOULD）
             self._reject(ci, f"claim_baseline 写入被 DB 约束拒绝：{e}")
         return {"baseline_id": bid, "variant_id": vid}
@@ -61,6 +67,15 @@ class PoolGate(ExecGate):
         """exec 声明：legal baseline 下新 variant(planned) + build_target(exec, pending)。
         拒：baseline 非 legal；variant_key 已占；config 空。"""
         ci = _cnum(cycle_id)
+        self._assert_current_cycle(ci, action="claim_variant")
+        crow = self._q1("SELECT goal_id,goal_ver,active_question_id FROM cycle WHERE id=?", (ci,))
+        if question_id is None:
+            question_id = crow[2]
+        if question_id is None:
+            self._reject(ci, "claim_variant 要求 current cycle 有 active question")
+        qrow = self._q1("SELECT goal_id,goal_ver FROM question WHERE id=?", (question_id,))
+        if qrow is None or tuple(qrow) != tuple(crow[:2]) or crow[2] != question_id:
+            self._reject(ci, "claim_variant 的 question/cycle/current lineage 不一致")
         brow = self._q1("SELECT status FROM baseline WHERE id=?", (baseline_id,))
         if brow is None or brow[0] != "legal":
             self._reject(ci, f"claim_variant 须 legal baseline（{baseline_id} 当前 {brow[0] if brow else '缺失'}）")
@@ -70,8 +85,9 @@ class PoolGate(ExecGate):
             self._reject(ci, "claim_variant config_json 空（变体须有配置增量）")
         try:
             with self.daemon.transaction() as conn:
-                vid = conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status) "
-                                   "VALUES (?,?,?,'planned')", (baseline_id, variant_key, config_json)).lastrowid
+                vid = conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status,born_question) "
+                                   "VALUES (?,?,?,'planned',?)",
+                                   (baseline_id, variant_key, config_json, question_id)).lastrowid
                 bt = conn.execute(
                     "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id) "
                     "VALUES (?,?,'exec',?,'pending',?,?)", (ci, question_id, seq, baseline_id, vid)).lastrowid
@@ -83,15 +99,22 @@ class PoolGate(ExecGate):
     def gate_register_evaluation(self, *, cycle_id: str, build_target_id: int, purpose: str,
                                  current_subject_hash: str, metric_results: List[Dict[str, Any]],
                                  evaluation_id: Optional[int] = None, create: Optional[Dict[str, Any]] = None,
+                                 attempt_id: Optional[int] = None,
                                  env_hash: Optional[str] = None, commit_hash: Optional[str] = None,
-                                 cost: float = 0.0, artifact_ref: Optional[str] = None) -> Dict[str, int]:
-        """§4.2.5(ii) 测量注册入口（**单事务**）：结果评审通过后，一次写 evaluation(create)/复用(append) +
-        attempt(**success**) + metric_result[] + eval success/canonical。成功 attempt 此前不存在（执行期只有
-        staging）。拒：无通过结果评审；create 撞格子/缺 target_set_hash；append 无既有；I2；ckpt 跨 variant；
-        required 未覆盖；target 绑定不符。"""
+                                 cost: float = 0.0, artifact_ref: Optional[str] = None,
+                                 transcript_ref: Optional[str] = None) -> Dict[str, int]:
+        """§4.2.5(ii) 结果注册：优先收口执行前已创建的 running attempt。
+
+        ``attempt_id`` 模式把该 attempt→success、metric_result、evaluation canonical 在一个事务提交；
+        旧 create/append 模式保留给兼容调用，生产 factory 路径不得再事后伪造 attempt。
+        """
         ci = _cnum(cycle_id)
-        if (create is None) == (evaluation_id is None):
-            self._reject(ci, "gate_register_evaluation 须恰一模式：create=… 或 evaluation_id=…")
+        self._assert_current_target(ci, build_target_id, action="register_evaluation")
+        if attempt_id is not None:
+            if create is not None or evaluation_id is not None:
+                self._reject(ci, "attempt_id 模式不得同时给 create/evaluation_id")
+        elif (create is None) == (evaluation_id is None):
+            self._reject(ci, "gate_register_evaluation 须恰一模式：attempt_id / create / evaluation_id")
         if purpose not in _ATTEMPT_PURPOSES:
             self._reject(ci, f"attempt purpose 非法: {purpose}")
         if not self.review_passed(build_target_id=build_target_id, review_kind="bundle_result_review",
@@ -101,7 +124,22 @@ class PoolGate(ExecGate):
         bt = self._bt(build_target_id)
         if bt is None:
             self._reject(ci, f"build_target 不存在: {build_target_id}")
-        if create is not None:
+        if attempt_id is not None:
+            attempt = self._q1(
+                "SELECT ea.evaluation_id,ea.status,ea.purpose,ea.cycle_id,ea.build_target_id,"
+                "e.variant_id,e.protocol_id,e.protocol_ver,e.status "
+                "FROM evaluation_attempt ea JOIN evaluation e ON e.id=ea.evaluation_id "
+                "WHERE ea.id=?", (attempt_id,))
+            if attempt is None:
+                self._reject(ci, f"attempt 不存在: {attempt_id}")
+            if (attempt[1] != "running" or attempt[2] != purpose or attempt[3] != ci
+                    or attempt[4] != build_target_id):
+                self._reject(
+                    ci, f"attempt {attempt_id} 非本 cycle/target/purpose 的 running intent")
+            eid, var_id, pid, pver = attempt[0], attempt[5], attempt[6], attempt[7]
+            if attempt[8] not in ("created", "running", "failed"):
+                self._reject(ci, f"evaluation {eid} 状态 {attempt[8]} 不可由 running attempt 注册")
+        elif create is not None:
             missing = [k for k in ("variant_id", "protocol_id", "protocol_ver", "eval_key", "source", "target_set_hash")
                        if create.get(k) in (None, "")]
             if missing:
@@ -113,12 +151,12 @@ class PoolGate(ExecGate):
         else:
             var_id = pid = pver = None   # append：从既有 evaluation 读（下）
         # import 目标（M4 CP5.5 物化 worker）的出厂 eval 走同一注册口——绑定核/评审闸与 build 完全同判据面
-        if create is not None and bt[6] != var_id:
+        if (create is not None or attempt_id is not None) and bt[6] != var_id:
             # target↔variant 绑定（codex BLOCKER×2）：不许拿 variant A 的评审/target 注册 variant B 的测量；
             # **NULL 不作通配**——未绑 variant 的 build/exec/eval 目标是非法态，同样拒（第2轮 BLOCKER）。
             self._reject(ci, f"target 绑定不符：target {build_target_id} 绑 variant {bt[6]}（NULL=未绑，非法），"
                              f"注册的是 variant {var_id}")
-        if create is None:
+        if attempt_id is None and create is None:
             erow = self._q1("SELECT variant_id, protocol_id, protocol_ver, status, build_target_id "
                             "FROM evaluation WHERE id=?", (evaluation_id,))
             if erow is None:
@@ -157,21 +195,34 @@ class PoolGate(ExecGate):
             self._reject(ci, f"required metric 未覆盖（aggregate）: {missing_req}")
         try:
             with self.daemon.transaction() as conn:   # ——§4.2.5(ii) 单事务——
-                if create is not None:
+                if attempt_id is not None:
+                    aid = attempt_id
+                    changed = conn.execute(
+                        "UPDATE evaluation_attempt SET status='success',failure_kind=NULL,"
+                        "completed_cycle=?,cost=?,artifact_ref=COALESCE(?,artifact_ref),"
+                        "transcript_ref=COALESCE(?,transcript_ref) "
+                        "WHERE id=? AND status='running'",
+                        (ci, cost, artifact_ref, transcript_ref, aid)).rowcount
+                    if changed != 1:
+                        raise RuntimeError(f"attempt {aid} success 收口竞态")
+                elif create is not None:
                     eid = conn.execute(
                         "INSERT INTO evaluation(variant_id,protocol_id,protocol_ver,eval_key,source,status,"
                         "created_cycle,build_target_id,target_set_hash) VALUES (?,?,?,?,?,'created',?,?,?)",
                         (var_id, pid, pver, create["eval_key"], create["source"], ci,
                          build_target_id, create["target_set_hash"])).lastrowid
-                else:
+                elif attempt_id is None:
                     eid = evaluation_id
-                n = conn.execute("SELECT COALESCE(MAX(attempt_no),0)+1 FROM evaluation_attempt WHERE evaluation_id=?",
-                                 (eid,)).fetchone()[0]
-                aid = conn.execute(
-                    "INSERT INTO evaluation_attempt(evaluation_id,cycle_id,build_target_id,attempt_no,purpose,"
-                    "status,env_hash,commit_hash,started_cycle,completed_cycle,cost,artifact_ref) "
-                    "VALUES (?,?,?,?,?,'success',?,?,?,?,?,?)",
-                    (eid, ci, build_target_id, n, purpose, env_hash, commit_hash, ci, ci, cost, artifact_ref)).lastrowid
+                if attempt_id is None:
+                    n = conn.execute(
+                        "SELECT COALESCE(MAX(attempt_no),0)+1 FROM evaluation_attempt WHERE evaluation_id=?",
+                        (eid,)).fetchone()[0]
+                    aid = conn.execute(
+                        "INSERT INTO evaluation_attempt(evaluation_id,cycle_id,build_target_id,attempt_no,purpose,"
+                        "status,env_hash,commit_hash,started_cycle,completed_cycle,cost,artifact_ref,transcript_ref) "
+                        "VALUES (?,?,?,?,?,'success',?,?,?,?,?,?,?)",
+                        (eid, ci, build_target_id, n, purpose, env_hash, commit_hash,
+                         ci, ci, cost, artifact_ref, transcript_ref)).lastrowid
                 for m in metric_results:
                     conn.execute("INSERT INTO metric_result(evaluation_id,evaluation_attempt_id,metric_id,"
                                  "metric_ver,value,scope,checkpoint_id) VALUES (?,?,?,?,?,?,?)",
@@ -195,6 +246,7 @@ class PoolGate(ExecGate):
         bt0 = self._bt(build_target_id)
         if bt0 is None:
             self._reject(ci, f"register：build_target {build_target_id} 不存在")
+        self._assert_current_target(ci, build_target_id, action=f"register_{expect_kind}")
         if bt0[2] != expect_kind:
             self._reject(ci, f"register：target {build_target_id} kind={bt0[2]}，须 {expect_kind}")
         if bt0[6] != variant_id:   # NULL 不作通配（未绑=非法态，codex 第2轮 BLOCKER）
@@ -304,6 +356,10 @@ class PoolGate(ExecGate):
         拒：(id,version) 已存在（同号重复提交 = 未升版）；metric_def (id,version) 已存在且口径不同；
         protocol_metric 指向不存在 metric_def。"""
         ci = _cnum(cycle_id)
+        self._assert_current_cycle(ci, action="new_protocol")
+        active = self._q1("SELECT active_question_id FROM cycle WHERE id=?", (ci,))
+        if active is None or active[0] is None:
+            self._reject(ci, "new_protocol 要求 current cycle 有 active question")
         if self._q1("SELECT 1 FROM protocol WHERE id=? AND version=?", (protocol_id, version)):
             self._reject(ci, f"I1：protocol ({protocol_id}@{version}) 已存在——改场景须升 version 提交新版")
         seen_defs = set()
@@ -326,8 +382,10 @@ class PoolGate(ExecGate):
                 self._reject(ci, f"protocol_metric 指向不存在的 metric_def ({mid}@{mver})")
         try:
             with self.daemon.transaction() as conn:
-                conn.execute("INSERT INTO protocol(id,version,name,scope_spec_json) VALUES (?,?,?,?)",
-                             (protocol_id, version, name, scope_spec_json))
+                conn.execute(
+                    "INSERT INTO protocol(id,version,name,scope_spec_json,derived_from_question) "
+                    "VALUES (?,?,?,?,?)",
+                    (protocol_id, version, name, scope_spec_json, active[0]))
                 for md in (metric_defs or []):
                     # self.read 只见已提交态（对既有 def 去重正确）；批内重复已在上前置拒
                     if self._q1("SELECT 1 FROM metric_def WHERE id=? AND version=?", (md["id"], md["version"])) is None:

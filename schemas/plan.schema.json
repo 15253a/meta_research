@@ -132,6 +132,19 @@
         },
         {
           "if": {
+            "properties": {
+              "target_kind": { "const": "eval" },
+              "eval_action": { "const": "create_evaluation" }
+            },
+            "required": ["target_kind", "eval_action"]
+          },
+          "then": {
+            "required": ["claim"],
+            "properties": { "claim": { "required": ["baseline_ref", "variant_key"] } }
+          }
+        },
+        {
+          "if": {
             "properties": { "eval_action": { "const": "append_attempt" } },
             "required": ["eval_action"]
           },

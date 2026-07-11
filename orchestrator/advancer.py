@@ -255,9 +255,10 @@ class SqliteAdvancer:
         cyc = self.state.cycle(cycle_id)
         if cyc.status in ("done", "failed", "aborted"):
             return "done"                # 幂等 / 恢复：已提交轮跳过（不重复写；权威判定在写事务内二次核，见 _reasoning_cycle）
-        if cyc.route == "attack":
+        self.state.assert_current_cycle(cycle_id)
+        if cyc.route in ("attack", "eval_only", "reuse_only"):
             if self.attack is None:
-                raise NotImplementedError("attack 轮需装配 attack=AttackStages（M4 CP5.4）")
+                raise NotImplementedError(f"{cyc.route} 轮需装配 attack=AttackStages（多阶段计划执行器）")
             return self.attack.advance_stage(cyc)   # 按 cycle.status 游标推进一格（多格轮，run_cycles 内循环驱动）
         if cyc.route not in ("bootstrap", "decompose", "goal_amend"):
             raise NotImplementedError(f"未支持的 route={cyc.route!r}（reuse_only/eval_only/dependency_wait 特化随对应 plan 形态接入）")
@@ -288,6 +289,9 @@ class SqliteAdvancer:
                          '{"reason":"no_consumed_goal_amend_directive"}'))
                     self.state.mark_cycle_done(cyc.cycle_id, "aborted")
             return
+
+        if cyc.route == "goal_amend":
+            self.state.assert_goal_amend_quiescent(cyc.cycle_id)
 
         pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="reasoning")
         files = self._reasoning(cyc, pack)   # 长操作（render / provider=Codex）在事务外（§6.13 铁律）

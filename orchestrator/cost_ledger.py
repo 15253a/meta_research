@@ -188,21 +188,119 @@ class CostLedger:
     def record(self, *, cycle_id: str, phase: str, purpose: str,
                usage: Optional[CallUsage], status: str = "success",
                failure_kind: Optional[str] = None) -> int:
-        """自开短 txn：INSERT runner_call + INSERT ledger。返回 runner_call_id。
-        （StageProvider 各阶段原本不写 runner_call，由此补建——ledger.runner_call_id FK 有真行可指。）"""
+        """兼容入口：以 created→running→terminal 三步记录一次已发生调用。"""
+        rc = self.begin_call(cycle_id=cycle_id, phase=phase, purpose=purpose)
+        self.mark_call_running(runner_call_id=rc)
+        self.finish_call(
+            runner_call_id=rc, status=status, usage=usage,
+            failure_kind=failure_kind)
+        return rc
+
+    def begin_call(self, *, cycle_id: str, phase: str, purpose: str,
+                   transcript_ref: Optional[str] = None) -> int:
+        """在外部调用前耐久化 created intent，并在同一事务执行成本停止闸。"""
         ci = _cnum(cycle_id)
+        with self.daemon.transaction() as conn:
+            blocked = self.new_external_call_block_reason(conn)
+            if blocked == "budget_exhausted":
+                effective = effective_budget_config(
+                    conn, self._base_budget, require_schedule=False)
+                spent = float(conn.execute(
+                    "SELECT COALESCE(SUM(money),0) FROM ledger").fetchone()[0])
+                raise BudgetExhausted(spent=spent, session_max=float(effective["session_max"]))
+            if blocked is not None:
+                raise CostAccountingFailed(f"新外部调用被 durable 成本闸阻断: {blocked}")
+            return conn.execute(
+                "INSERT INTO runner_call(cycle_id,phase,purpose,status,transcript_ref) "
+                "VALUES (?,?,?,'created',?)",
+                (ci, phase, purpose, transcript_ref)).lastrowid
+
+    def mark_call_running(self, *, runner_call_id: int) -> None:
+        """created intent 在最后外部调用边界前迁入 running。"""
+        with self.daemon.transaction() as conn:
+            changed = conn.execute(
+                "UPDATE runner_call SET status='running',started_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status='created'", (runner_call_id,)).rowcount
+            if changed != 1:
+                row = conn.execute(
+                    "SELECT status FROM runner_call WHERE id=?", (runner_call_id,)).fetchone()
+                raise RuntimeError(
+                    f"runner_call {runner_call_id} 不可 start（status={row[0] if row else 'missing'}）")
+
+    def abort_created_call(self, *, runner_call_id: int, failure_kind: str) -> None:
+        """外部调用尚未开始时终结 intent；不写 ledger，因为没有调用成本。"""
+        self.abort_unstarted_call(
+            runner_call_id=runner_call_id, failure_kind=failure_kind,
+            allowed_statuses=("created",))
+
+    def abort_unstarted_call(self, *, runner_call_id: int, failure_kind: str,
+                             allowed_statuses=("created", "running")) -> None:
+        """由调用边界证明尚未执行时终结 created/running intent，不伪造成本。"""
+        if not isinstance(failure_kind, str) or not failure_kind.strip():
+            raise ValueError("failure_kind 须为非空字符串")
+        if not allowed_statuses or any(status not in ("created", "running") for status in allowed_statuses):
+            raise ValueError("allowed_statuses 只接受 created/running")
+        placeholders = ",".join("?" for _ in allowed_statuses)
+        with self.daemon.transaction() as conn:
+            changed = conn.execute(
+                "UPDATE runner_call SET status='aborted',failure_kind=?,finished_at=CURRENT_TIMESTAMP "
+                f"WHERE id=? AND status IN ({placeholders})",
+                (failure_kind.strip()[:200], runner_call_id, *allowed_statuses)).rowcount
+            if changed != 1:
+                raise RuntimeError(f"runner_call {runner_call_id} 不在可证明未启动状态 {allowed_statuses}")
+
+    def finish_call_in_txn(self, conn: Any, *, runner_call_id: int, status: str,
+                           usage: Optional[CallUsage], failure_kind: Optional[str] = None,
+                           transcript_ref: Optional[str] = None) -> Optional[dict]:
+        """在调用方事务内把既有 running intent 与 ledger 原子收口。"""
+        if status not in ("success", "failed", "aborted"):
+            raise ValueError(f"runner_call 终态非法: {status}")
+        if status != "success" and not (isinstance(failure_kind, str) and failure_kind.strip()):
+            raise ValueError(f"runner_call {status} 须给 failure_kind")
+        row = conn.execute(
+            "SELECT status FROM runner_call WHERE id=?", (runner_call_id,)).fetchone()
+        if row is None or row[0] != "running":
+            raise RuntimeError(
+                f"runner_call {runner_call_id} 非 running（{row[0] if row else 'missing'}），不可 finish")
+        changed = conn.execute(
+            "UPDATE runner_call SET status=?,failure_kind=?,"
+            "transcript_ref=COALESCE(?,transcript_ref),finished_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status='running'",
+            (status, failure_kind, transcript_ref, runner_call_id)).rowcount
+        if changed != 1:
+            raise RuntimeError(f"runner_call {runner_call_id} 终态迁移竞态")
+        return self.insert_ledger_for_runner(
+            conn, runner_call_id=runner_call_id, usage=usage)
+
+    def finish_call(self, *, runner_call_id: int, status: str,
+                    usage: Optional[CallUsage], failure_kind: Optional[str] = None,
+                    transcript_ref: Optional[str] = None) -> None:
+        """自开短事务收口既有 intent；成本不可验证时复用同一 intent fail-closed。"""
         budget_hit = None
         try:
             with self.daemon.transaction() as conn:
-                rc = conn.execute(
-                    "INSERT INTO runner_call(cycle_id,phase,purpose,status,failure_kind) VALUES (?,?,?,?,?)",
-                    (ci, phase, purpose, status, failure_kind)).lastrowid
-                budget_hit = self.insert_ledger_for_runner(conn, runner_call_id=rc, usage=usage)
-        except Exception as e:                  # 未知用量/校验/落账失败：已发生的外部调用不得重发
-            self.fail_closed(cycle_id=cycle_id, phase=phase, purpose=purpose, cause=e)
-        if budget_hit is not None:              # 必须在 COMMIT 之后抛；事务内抛会把账和 global_stop 一起回滚
+                budget_hit = self.finish_call_in_txn(
+                    conn, runner_call_id=runner_call_id, status=status, usage=usage,
+                    failure_kind=failure_kind, transcript_ref=transcript_ref)
+        except Exception as error:
+            row = self.daemon.query_one(
+                "SELECT cycle_id,phase,purpose,status FROM runner_call WHERE id=?",
+                (runner_call_id,))
+            if row is None or row[3] != "running":
+                raise
+            with self.daemon.transaction() as conn:
+                self.fail_existing_unaccounted_call(
+                    conn, runner_call_id=runner_call_id,
+                    failure_kind="cost_accounting", cause=error)
+                if transcript_ref is not None:
+                    conn.execute(
+                        "UPDATE runner_call SET transcript_ref=? WHERE id=?",
+                        (transcript_ref, runner_call_id))
+            raise CostAccountingFailed(
+                f"cost_accounting_failed: {row[1]}/{row[2]}: {error}",
+                runner_call_id=runner_call_id) from error
+        if budget_hit is not None:
             raise BudgetExhausted(**budget_hit)
-        return rc
 
     def record_ledger_only(self, *, runner_call_id: int, usage: Optional[CallUsage]) -> None:
         """自开短 txn：只 INSERT ledger，引用**既有** runner_call。
@@ -288,7 +386,8 @@ class CostLedger:
         return self._record_budget_stop_if_needed(conn, effective)
 
     def fail_existing_unaccounted_call(self, conn: Any, *, runner_call_id: int,
-                                       failure_kind: str, cause: Exception) -> Optional[dict]:
+                                       failure_kind: str, cause: Exception,
+                                       terminal_status: str = "failed") -> Optional[dict]:
         """把已有调用意图终态化为“成本未知”；调用方须在同一事务内补其业务失败回执。
 
         interaction_query 在外部调用**之前**先落 ``created``，主线程提交 ``running`` 后才放行 worker；
@@ -298,6 +397,8 @@ class CostLedger:
         """
         if not isinstance(failure_kind, str) or not failure_kind.strip():
             raise ValueError("failure_kind 须为非空字符串")
+        if terminal_status not in ("failed", "aborted"):
+            raise ValueError("未知成本调用只可收口为 failed/aborted")
         row = conn.execute(
             "SELECT cycle_id,phase,purpose,status FROM runner_call WHERE id=?",
             (runner_call_id,)).fetchone()
@@ -308,9 +409,9 @@ class CostLedger:
             raise RuntimeError(
                 f"runner_call {runner_call_id} 已是终态 {status}，拒绝改写为未知成本失败")
         changed = conn.execute(
-            "UPDATE runner_call SET status='failed',failure_kind=?,finished_at=CURRENT_TIMESTAMP "
+            "UPDATE runner_call SET status=?,failure_kind=?,finished_at=CURRENT_TIMESTAMP "
             "WHERE id=? AND status IN ('created','running')",
-            (failure_kind.strip()[:200], runner_call_id)).rowcount
+            (terminal_status, failure_kind.strip()[:200], runner_call_id)).rowcount
         if changed != 1:
             raise RuntimeError(f"runner_call {runner_call_id} 未知成本终态迁移竞态")
 

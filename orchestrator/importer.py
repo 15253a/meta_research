@@ -76,7 +76,13 @@ class DeferredImporter:
             # 引入多写者/写队列（M5）时须补 DB 级约束或队内去重。
             existing_rows = conn.execute(
                 "SELECT id, baseline_id, candidate_id, license_review_id FROM external_import "
-                "WHERE question_id=? AND selection_key=? AND action='selected_for_materialization'",
+                "WHERE question_id=? AND selection_key=? AND action='selected_for_materialization' "
+                "AND NOT EXISTS (SELECT 1 FROM external_import x WHERE "
+                "x.question_id=external_import.question_id AND x.candidate_id=external_import.candidate_id "
+                "AND x.action_cycle=external_import.action_cycle "
+                "AND x.candidate_set_hash=external_import.candidate_set_hash "
+                "AND x.selection_key=external_import.selection_key AND x.policy_hash=external_import.policy_hash "
+                "AND x.action='superseded')",
                 (qi, selection_key)).fetchall()
             if len(existing_rows) > 1:   # 无 DB 唯一约束兜底 → 主动探测重复（守卫失效/旁路写入即 fail loud，勿任取一条）
                 raise ValueError(

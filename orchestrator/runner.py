@@ -246,19 +246,45 @@ class CodexRunner:
             self.query_uid = account.pw_uid
             self.query_gid = account.pw_gid
         self._call_no = 0
+        self._runner_call_id: Optional[int] = None
+        self._reconcile_protocol: Optional[str] = None
+        self._runner_call_phase: Optional[str] = None
+        self._runner_call_purpose: Optional[str] = None
+
+    def bind_runner_call(self, *, runner_call_id: int, reconcile_protocol: str,
+                         phase: str, purpose: str) -> None:
+        """Bind the next invocation receipt to its durable DB owner intent."""
+        if (isinstance(runner_call_id, bool) or not isinstance(runner_call_id, int)
+                or runner_call_id <= 0):
+            raise ValueError("runner_call_id 须为正整数")
+        if not isinstance(reconcile_protocol, str) or not reconcile_protocol:
+            raise ValueError("reconcile_protocol 须为非空字符串")
+        if not isinstance(phase, str) or not phase or not isinstance(purpose, str) or not purpose:
+            raise ValueError("runner_call phase/purpose 须为非空字符串")
+        self._runner_call_id = runner_call_id
+        self._reconcile_protocol = reconcile_protocol
+        self._runner_call_phase = phase
+        self._runner_call_purpose = purpose
 
     # -- Runner Protocol -----------------------------------------------------
     def run_task(self, *, system_prompt: str, skill: str, context_pack: ContextPack) -> Artifact:
         prompt = self._build_prompt(system_prompt, skill, context_pack)
-        raw, usage = self._invoke(prompt, context_pack)
+        raw, usage, transcript_ref, execution_receipt_ref = self._invoke(prompt, context_pack)
         try:
             files, md = self._parse_envelope(raw)
         except RunnerError as e:
             # 子进程已经成功结束、stderr 用量也已捕获；不能因信封坏而把这次真调用从 ledger 漏掉。
             if e.usage is None:
                 e.usage = usage
+            if e.transcript_ref is None:
+                e.transcript_ref = transcript_ref
+            if e.execution_receipt_ref is None:
+                e.execution_receipt_ref = execution_receipt_ref
             raise
-        return Artifact(stage=context_pack.stage, files=files, md=md, usage=usage)
+        return Artifact(
+            stage=context_pack.stage, files=files, md=md, usage=usage,
+            transcript_ref=transcript_ref,
+            execution_receipt_ref=execution_receipt_ref)
 
     # -- 内部 ------------------------------------------------------------------
     def _build_prompt(self, system_prompt: str, skill: str, pack: ContextPack) -> str:
@@ -287,10 +313,19 @@ class CodexRunner:
         ]
         return "".join(parts)
 
-    def _invoke(self, prompt: str, pack: ContextPack) -> "tuple[str, CallUsage]":
+    def _invoke(self, prompt: str, pack: ContextPack) -> "tuple[str, CallUsage, str, Optional[str]]":
         """跑一次 codex exec，返回 (信封文本, CallUsage)。用量：stderr 报的总 token + 墙钟秒（步⑩ 成本记账）。
         失败也把当下可见的 token/墙钟挂到 RunnerError.usage，供 provider 在重试前记账。"""
         self._call_no += 1
+        runner_call_id = self._runner_call_id
+        reconcile_protocol = self._reconcile_protocol
+        runner_call_phase = self._runner_call_phase
+        runner_call_purpose = self._runner_call_purpose
+        # Binding is a one-invocation capability; retry must explicitly bind a new durable intent.
+        self._runner_call_id = None
+        self._reconcile_protocol = None
+        self._runner_call_phase = None
+        self._runner_call_purpose = None
         tag = f"{pack.stage}-{self.purpose_tag or 'call'}-{self._call_no}"
         self.transcripts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.transcripts_dir, 0o700)
@@ -375,7 +410,12 @@ class CodexRunner:
                         "cycle_id": pack.cycle_id,
                         "stage": pack.stage,
                         "target_id": pack.target_id,
-                        "call_tag": tag})
+                        "call_tag": tag,
+                        "db_owner_kind": ("runner_call" if runner_call_id is not None else None),
+                        "db_owner_id": runner_call_id,
+                        "db_phase": runner_call_phase,
+                        "db_purpose": runner_call_purpose,
+                        "reconcile_protocol": reconcile_protocol})
         except subprocess.TimeoutExpired as e:
             wallclock = round(time.monotonic() - t0, 3)
             stderr = self._stream_text(getattr(e, "stderr", None))
@@ -414,41 +454,55 @@ class CodexRunner:
                     copy_error = error
                 shutil.rmtree(runtime_dir, ignore_errors=True)
         wallclock = round(time.monotonic() - t0, 3)
+        execution_receipt_ref = (
+            str(proc.receipt_path) if getattr(proc, "receipt_path", None) is not None else None)
         stderr = self._stream_text(proc.stderr)
         stdout = self._stream_text(proc.stdout)
         usage = self._usage(stderr, wallclock, stdout if self.tool_free else "")
         if copy_error is not None:
             raise RunnerError(
-                f"tool-free runner 输出接收失败：{tag}（{copy_error}）", usage=usage)
+                f"tool-free runner 输出接收失败：{tag}（{copy_error}）", usage=usage,
+                transcript_ref=str(out_file), execution_receipt_ref=execution_receipt_ref)
         if self.tool_free:
             try:
                 events_file.write_text(stdout, encoding="utf-8")
                 os.chmod(events_file, 0o600)
             except OSError as error:
                 raise RunnerError(
-                    f"tool-free runner 事件回执归档失败：{tag}（{error}）", usage=usage) from error
+                    f"tool-free runner 事件回执归档失败：{tag}（{error}）", usage=usage,
+                    transcript_ref=str(out_file),
+                    execution_receipt_ref=execution_receipt_ref) from error
         if proc.returncode != 0 or not out_file.exists():
             tail = stderr[-500:]
             raise RunnerError(
                 f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}", usage=usage,
+                transcript_ref=str(out_file),
                 failure_kind="runtime",
-                execution_receipt_ref=(str(proc.receipt_path)
-                                       if hasattr(proc, "receipt_path") else None))
+                execution_receipt_ref=execution_receipt_ref)
         if self.tool_free:
             try:
                 validate_tool_free_trace(stdout)
             except RunnerError as error:
                 error.usage = usage
+                error.transcript_ref = str(out_file)
+                error.execution_receipt_ref = execution_receipt_ref
                 raise
         try:
             raw = out_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as e:
-            raise RunnerError(f"runner 输出读取失败：{tag}（{e}）", usage=usage) from e
+            raise RunnerError(
+                f"runner 输出读取失败：{tag}（{e}）", usage=usage,
+                transcript_ref=str(out_file),
+                execution_receipt_ref=execution_receipt_ref) from e
         try:
             os.chmod(out_file, 0o600)
         except OSError as error:
-            raise RunnerError(f"runner 输出权限收紧失败：{tag}（{error}）", usage=usage) from error
-        return raw, usage
+            raise RunnerError(
+                f"runner 输出权限收紧失败：{tag}（{error}）", usage=usage,
+                transcript_ref=str(out_file),
+                execution_receipt_ref=execution_receipt_ref) from error
+        return (raw, usage, str(out_file),
+                execution_receipt_ref)
 
     @staticmethod
     def _usage(stderr: str, wallclock: float, json_trace: str = "") -> CallUsage:

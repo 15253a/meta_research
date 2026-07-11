@@ -127,6 +127,8 @@ def test_harness_pointer_failure_preserves_timeout_authority(tmp_path, monkeypat
 
 
 def test_harness_success_pointer_failure_does_not_promote_partial(tmp_path, monkeypatch):
+    original = H.atomic_write_receipt
+
     def fail_process_pointer(_path, _receipt):
         raise OSError("pointer-fsync")
 
@@ -138,6 +140,58 @@ def test_harness_success_pointer_failure_does_not_promote_partial(tmp_path, monk
     assert (tmp_path / "train.log.partial").exists()
     assert not (tmp_path / "train.log").exists()
     assert not (tmp_path / "train.log.exit").exists()
+
+    # 模拟新 owner：中央 guardian receipt 已 terminal+drained，恢复 helper 只补 harness
+    # 本地发布，不把 exit(0) 解释成 DB success。
+    monkeypatch.setattr(H, "atomic_write_receipt", original)
+    context = {
+        "reconcile_protocol": "execution-owner-v1",
+        "db_owner_kind": "evaluation_attempt",
+        "db_owner_id": 42,
+        "cycle_id": "c1",
+        "build_target_id": 7,
+        "phase": "eval",
+    }
+    # 前一次调用未带 owner context，故不得把那只 partial 猜配给 owner 42。
+    with pytest.raises(H.ExecutionRecoveryError, match="无 exact guardian receipt"):
+        H.recover_staged_result(
+            staging_dir=str(tmp_path), log_name="train.log", execution_supervisor=None,
+            execution_kind="harness", execution_context=context)
+
+
+def test_harness_recovers_drained_exit_partial_for_exact_owner(tmp_path, monkeypatch):
+    original = H.atomic_write_receipt
+    context = {
+        "reconcile_protocol": "execution-owner-v1",
+        "db_owner_kind": "evaluation_attempt",
+        "db_owner_id": 42,
+        "cycle_id": "c1",
+        "build_target_id": 7,
+        "phase": "eval",
+    }
+
+    def fail_process_pointer(path, receipt):
+        if str(path).endswith(".process.json"):
+            raise OSError("owner-died-before-local-publish")
+        return original(path, receipt)
+
+    monkeypatch.setattr(H, "atomic_write_receipt", fail_process_pointer)
+    with pytest.raises(OSError, match="owner-died-before-local-publish"):
+        H.run_staged(
+            [sys.executable, "-c", "print('metric_value: 1@1=0.9')"],
+            staging_dir=str(tmp_path), log_name="eval.log", timeout_s=2,
+            execution_kind="harness", execution_context=context)
+    assert (tmp_path / "eval.log.partial").exists()
+
+    monkeypatch.setattr(H, "atomic_write_receipt", original)
+    recovered = H.recover_staged_result(
+        staging_dir=str(tmp_path), log_name="eval.log", execution_supervisor=None,
+        execution_kind="harness", execution_context=context)
+    assert recovered is not None and recovered["exit_code"] == 0
+    assert recovered["recovered_after_owner_loss"] is True
+    assert (tmp_path / "eval.log").read_text().strip() == "metric_value: 1@1=0.9"
+    assert (tmp_path / "eval.log.exit").read_text() == "0"
+    assert not (tmp_path / "eval.log.partial").exists()
 
 
 def test_harness_exit_sidecar_write_all_handles_short_writes(tmp_path, monkeypatch):
@@ -277,8 +331,9 @@ def test_real_suspect_blocks_close_question(tmp_path):
     path = str(tmp_path / "research.sqlite")
     seed = db.connect(path)
     conftest.seed_minimal(seed)
-    seed.executescript("INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
-                       "VALUES (2,1,1,1,'q2','open','agent')")
+    seed.executescript("INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source,active_cycle) "
+                       "VALUES (2,1,1,1,'q2','active','agent',1); "
+                       "UPDATE cycle SET active_question_id=2 WHERE id=1")
     seed.commit(); seed.close()
     daemon = WriteDaemon(db.connect(path))
     obs_conn = db.connect(path)                                    # 独立普通只读用连接（观测豁免仅经谓词）

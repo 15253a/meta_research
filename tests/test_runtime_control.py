@@ -276,7 +276,7 @@ def test_reprioritize_accepts_current_active_question_for_post_stage_selection(e
     daemon, console = env
     _seed_priority_questions(daemon)
     with daemon.transaction() as conn:
-        conn.execute("UPDATE question SET status='active' WHERE id=2")
+        conn.execute("UPDATE question SET status='active',active_cycle=1 WHERE id=2")
         conn.execute("UPDATE cycle SET route='attack',active_question_id=2 WHERE id=1")
     pin = _inbound(console, "pin q2", "pin-current-active")
     _confirm(daemon, console, pin)

@@ -18,9 +18,9 @@ def _sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-# 步⑧开工时 plan.schema.json 的字面 sha256（冻结锚）。若确需改 plan.schema（决策性），更新此常量并
-# 走完整评审 + 记 build_log 说明为何——绝不为「让测试过」而顺手改锚。
-_PLAN_SCHEMA_SHA256 = "84ac7f86b8b0f032a0b255d13671dbf547f21f1d01fc53948e5343f203e1531e"
+# CP11.3c 有意收紧 eval target 的既有 legal variant 身份声明后重锚；执行字段仍由下方语义锁禁止。
+# 若再改 plan.schema（决策性），须更新此常量并走完整评审 + 记 build_log，绝不静默漂移。
+_PLAN_SCHEMA_SHA256 = "7ad2e38bf360df7a83ab0a72eef34f5c4affdcdd4ca104cee5c947e1410108aa"
 
 
 def test_plan_schema_frozen():

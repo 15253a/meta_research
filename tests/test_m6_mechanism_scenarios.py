@@ -123,13 +123,16 @@ def test_scenario2_import_smoke_fail_no_target_ready(tmp_path):
 
 
 def test_scenario2_import_eval_fail_no_pool_publish(tmp_path):
-    """factory eval 失败（smoke 过）→ 无 evaluation 注册、不 imported（不 pool_publish）。"""
+    """factory eval 失败（smoke 过）→ 失败 attempt 有预调用审计，不 imported（不 pool_publish）。"""
     path = str(tmp_path / "r.sqlite")
     fetch = lambda c: {**_fetch_ok(c), "eval_cmd": [sys.executable, "-c", "import sys; sys.exit(1)"]}
     daemon, state, w = _mk_worker(path, tmp_path / "w", fetch=fetch)
     sel = _seed_deferred(daemon, state)
     w.materialize_pending()
-    assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0     # 未注册测量
+    assert daemon.query_one("SELECT status FROM evaluation")[0] == "failed"
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM evaluation_attempt")[:2] == ("failed", "runtime")
+    assert daemon.query_one("SELECT count(*) FROM metric_result")[0] == 0
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='imported'")[0] == 0
     assert daemon.query_one("SELECT count(*) FROM external_import WHERE action='materialize_failed'")[0] == 1
     assert daemon.query_one("SELECT status FROM baseline WHERE id=?", (sel["baseline_id"],))[0] == "build_failed"  # 不入活跃池
@@ -148,8 +151,10 @@ def test_scenario3_suspect_evidence_rejected_by_gate(tmp_path):
     daemon.conn.commit()
     mr = daemon.query_one("SELECT id FROM metric_result ORDER BY id LIMIT 1")[0]
     with daemon.transaction() as conn:                             # 新开一个待关问题（复用同证据链）
-        conn.execute("INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
-                     "VALUES (2,1,1,1,'suspect 证据能关吗','active','agent')")
+        conn.execute(
+            "INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source,active_cycle) "
+            "VALUES (2,1,1,1,'suspect 证据能关吗','active','agent',1)")
+        conn.execute("UPDATE cycle SET active_question_id=2 WHERE id=1")
     # 训练 log 含 nan → attempt1 当前口径 suspect
     elid = H.register_execution_log(daemon, cycle_id="c1", log_kind="eval", ref="st/nan.log",
                                     content_hash=_hash(NAN_LOG), n_bytes=len(NAN_LOG), evaluation_attempt_id=1)

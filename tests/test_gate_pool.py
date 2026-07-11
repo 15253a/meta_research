@@ -20,7 +20,10 @@ from orchestrator.writedaemon import WriteDaemon
 def _seed(conn):
     conftest.seed_minimal(conn)
     conn.executescript("""
-    INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version) VALUES (2,1,1,'bundle','attack','v0');
+    INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source)
+      VALUES (2,1,1,1,'current q2','active','agent');
+    INSERT INTO cycle(id,goal_id,goal_ver,status,route,active_question_id,policy_version)
+      VALUES (2,1,1,'bundle','attack',2,'v0');
     """)
     conn.commit()
 
@@ -102,7 +105,7 @@ def _build_chain(gate, d):
     bid, vid = r["baseline_id"], r["variant_id"]
     with d.transaction() as conn:   # plan 落 build 目标 + required metric（(1,1) 已在 seed protocol 声明）
         bt = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id) "
-                          "VALUES (2,1,'build',1,'pending',?,?)", (bid, vid)).lastrowid
+                          "VALUES (2,2,'build',1,'pending',?,?)", (bid, vid)).lastrowid
         conn.execute("INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) VALUES (?,1,1)", (bt,))
     gate.gate_start_build_target(build_target_id=bt)
     gate.gate_progress_build_target(build_target_id=bt, to="smoke")
@@ -135,6 +138,29 @@ def test_full_registration_chain(env):
     assert d.query_one("SELECT status FROM variant WHERE id=?", (ids["variant_id"],))[0] == "legal"
     gate.gate_finish_build_target(build_target_id=ids["bt"], status="complete")   # CP5.1 complete 前置现可满足
     assert d.query_one("SELECT status FROM build_target WHERE id=?", (ids["bt"],))[0] == "complete"
+
+
+def test_register_existing_running_attempt(env):
+    """生产 factory 时序：评估执行前 attempt 已 running，结果评审后原子收口同一 ID。"""
+    gate, d = env
+    ids = _build_chain(gate, d)
+    started = gate.gate_start_attempt(
+        cycle_id="c2", purpose="factory", build_target_id=ids["bt"],
+        create={"variant_id": ids["variant_id"], "protocol_id": 1, "protocol_ver": 1,
+                "eval_key": "prestarted", "source": "factory", "target_set_hash": "tsh"})
+    assert d.query_one(
+        "SELECT status FROM evaluation_attempt WHERE id=?", (started["attempt_id"],))[0] == "running"
+    reg = gate.gate_register_evaluation(
+        cycle_id="c2", build_target_id=ids["bt"], purpose="factory",
+        current_subject_hash="res-sh", attempt_id=started["attempt_id"],
+        metric_results=[{"metric_id": 1, "metric_ver": 1, "value": 0.91}],
+        artifact_ref="sha256:abc", transcript_ref="receipt.json")
+    assert reg == {"evaluation_id": started["evaluation_id"], "attempt_id": started["attempt_id"]}
+    assert d.query_one(
+        "SELECT status,artifact_ref,transcript_ref FROM evaluation_attempt WHERE id=?",
+        (started["attempt_id"],)) == ("success", "sha256:abc", "receipt.json")
+    assert d.query_one(
+        "SELECT canonical_attempt_id FROM evaluation WHERE id=?", (started["evaluation_id"],))[0] == started["attempt_id"]
 
 
 def test_register_evaluation_requires_result_review(env):
@@ -248,8 +274,8 @@ def test_register_evaluation_rejects_null_variant_target(env):
     防 NULL 目标成为任意 variant 的入池跳板）。"""
     gate, d = env
     with d.transaction() as conn:   # variant_id=NULL 的 build 目标 + 直推 running + 评审 pass
-        btn = conn.execute("INSERT INTO build_target(cycle_id,target_kind,seq,status) "
-                           "VALUES (2,'build',70,'running')").lastrowid
+        btn = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status) "
+                           "VALUES (2,2,'build',70,'running')").lastrowid
         vb = conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status) "
                           "VALUES (1,'v-null','{}','planned')").lastrowid
     _judge_pass(d, btn, "bundle_result_review", "sh-null")
@@ -293,10 +319,10 @@ def test_register_evaluation_append_mode(env):
                            "VALUES ('b2','ck-b2','id2',2,'legal')").lastrowid
         vid2 = conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status) "
                             "VALUES (?,'base','{}','legal')", (bl2,)).lastrowid
-        bt_bad = conn.execute("INSERT INTO build_target(cycle_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
-                              "VALUES (2,'eval',89,'running',?,'append_attempt',?)", (vid2, eid)).lastrowid
-        bt2 = conn.execute("INSERT INTO build_target(cycle_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
-                           "VALUES (2,'eval',90,'running',?,'append_attempt',?)", (ids["variant_id"], eid)).lastrowid
+        bt_bad = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
+                              "VALUES (2,2,'eval',89,'running',?,'append_attempt',?)", (vid2, eid)).lastrowid
+        bt2 = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
+                           "VALUES (2,2,'eval',90,'running',?,'append_attempt',?)", (ids["variant_id"], eid)).lastrowid
     _judge_pass(d, bt_bad, "bundle_result_review", "res-sh-bad")
     with pytest.raises(GateReject, match="target 绑定不符"):    # bt_bad 绑 variant2，eval 属 variant1 → 拒
         gate.gate_register_evaluation(cycle_id="c2", build_target_id=bt_bad, purpose="metric_append",
@@ -364,7 +390,8 @@ def test_claim_variant_seq_collision_clean_reject(env):
     gate, d = env
     with d.transaction() as conn:
         conn.execute("UPDATE baseline SET status='legal' WHERE id=1")
-        conn.execute("INSERT INTO build_target(cycle_id,target_kind,seq,status,variant_id) VALUES (2,'build',60,'pending',1)")
+        conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,variant_id) "
+                     "VALUES (2,2,'build',60,'pending',1)")
     with pytest.raises(GateReject, match="约束拒绝"):
         gate.gate_claim_variant(baseline_id=1, variant_key="vz", config_json='{"a":1}', cycle_id="c2", seq=60)
 
@@ -418,8 +445,8 @@ def test_register_evaluation_append_wrong_cell_rejected(env):
         eid2 = conn.execute("INSERT INTO evaluation(variant_id,protocol_id,protocol_ver,eval_key,source,status,"
                             "created_cycle,target_set_hash) VALUES (?,1,2,'e2','factory','created',2,'t2')",
                             (ids["variant_id"],)).lastrowid
-        bt_wrong = conn.execute("INSERT INTO build_target(cycle_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
-                                "VALUES (2,'eval',91,'running',?,'append_attempt',?)", (ids["variant_id"], eid2)).lastrowid
+        bt_wrong = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,variant_id,eval_action,evaluation_id) "
+                                "VALUES (2,2,'eval',91,'running',?,'append_attempt',?)", (ids["variant_id"], eid2)).lastrowid
     _judge_pass(d, bt_wrong, "bundle_result_review", "sh-w")
     with pytest.raises(GateReject, match="未显式绑定"):   # bt_wrong 绑 eid2，却往 eid 追加 → 拒
         gate.gate_register_evaluation(cycle_id="c2", build_target_id=bt_wrong, purpose="metric_append",

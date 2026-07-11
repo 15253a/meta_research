@@ -129,8 +129,10 @@ def test_case5_suspect_not_evidence(tmp_path):
     path = str(tmp_path / "research.sqlite")
     seed = db.connect(path)
     conftest.seed_minimal(seed)
-    seed.executescript("INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source) "
-                       "VALUES (2,1,1,1,'q2','open','agent')")
+    seed.executescript(
+        "INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source,active_cycle) "
+        "VALUES (2,1,1,1,'q2','active','agent',1); "
+        "UPDATE cycle SET active_question_id=2 WHERE id=1")
     seed.commit(); seed.close()
     daemon = WriteDaemon(db.connect(path))
     conn = daemon.conn

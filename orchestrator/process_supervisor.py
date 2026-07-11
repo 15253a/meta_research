@@ -47,6 +47,8 @@ _PAYLOAD_FLAG = "execution-payload"
 _RECEIPT_VERSION = 1
 _MAX_SPEC_BYTES = 2 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 128 * 1024
+_HEARTBEAT_INTERVAL_S = 2.0
+_ACTIVITY_SAMPLE_INTERVAL_S = 0.5
 _KIND_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _OPERATION_RE = re.compile(r"^exec-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -94,6 +96,7 @@ class ExecutionResult:
     stderr: Optional[bytes]
     receipt: Dict[str, Any]
     receipt_path: Path
+    heartbeat_path: Optional[Path] = None
 
 
 @dataclass
@@ -249,6 +252,43 @@ def atomic_write_receipt(path: Path, value: Mapping[str, Any]) -> None:
         os.close(dir_fd)
 
 
+def _atomic_write_heartbeat(path: Path, value: Mapping[str, Any]) -> None:
+    """Publish a non-authoritative heartbeat snapshot without per-tick directory fsync."""
+    path = Path(path)
+    parent = path.parent
+    payload = _canonical_json(value)
+    if len(payload) > _MAX_RECEIPT_BYTES:
+        raise ValueError("execution heartbeat 超过大小上限")
+    tmp_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                     | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    tmp_fd = -1
+    try:
+        info = os.fstat(dir_fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError("execution heartbeat 目录身份非法")
+        tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+        _write_all(tmp_fd, payload)
+        os.close(tmp_fd)
+        tmp_fd = -1
+        os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        if tmp_fd >= 0:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(dir_fd)
+
+
 def read_receipt(path: Path) -> Dict[str, Any]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     dir_fd = os.open(
@@ -343,6 +383,21 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
         if (not _finite_number(receipt.get("started_at_unix"), positive=True)
                 or not _finite_number(receipt.get("deadline_at_unix"), positive=True)):
             raise ValueError("running receipt deadline 非法")
+        heartbeat_ref = receipt.get("heartbeat_ref")
+        if (not isinstance(heartbeat_ref, str)
+                or heartbeat_ref != str(Path(path).with_name(f"heartbeat-{operation_id}.json"))
+                or not isinstance(receipt.get("guardian_heartbeat_seq"), int)
+                or isinstance(receipt.get("guardian_heartbeat_seq"), bool)
+                or receipt["guardian_heartbeat_seq"] < 0
+                or not _finite_number(receipt.get("guardian_heartbeat_at_unix"), positive=True)
+                or not _finite_number(receipt.get("last_activity_at_unix"), positive=True)
+                or not isinstance(receipt.get("activity_cpu_ticks"), int)
+                or receipt["activity_cpu_ticks"] < 0
+                or not isinstance(receipt.get("activity_output_bytes"), int)
+                or receipt["activity_output_bytes"] < 0
+                or not isinstance(receipt.get("activity_descendant_count"), int)
+                or receipt["activity_descendant_count"] < 0):
+            raise ValueError("running receipt heartbeat/activity 非法")
         return
     if state != "terminal":
         raise ValueError("execution receipt state 非法")
@@ -378,6 +433,42 @@ def _proc_info(pid: int) -> Optional[Tuple[str, int, int, int, str]]:
         return None
     except (OSError, UnicodeError, ValueError, IndexError) as error:
         raise ExecutionSupervisorError(f"/proc/{pid}/stat 不可靠读取") from error
+
+
+def _proc_cpu_ticks(pid: int) -> int:
+    """Best-effort utime+stime for activity sampling; vanished processes contribute zero."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        closing = raw.rfind(")")
+        rest = raw[closing + 2:].split()
+        return int(rest[11]) + int(rest[12])
+    except (FileNotFoundError, ProcessLookupError):
+        return 0
+    except (OSError, UnicodeError, ValueError, IndexError) as error:
+        raise ExecutionSupervisorError(f"/proc/{pid}/stat CPU 采样失败") from error
+
+
+def _execution_activity_sample(proc: subprocess.Popen) -> Dict[str, int]:
+    descendants = _descendants(os.getpid())
+    pids = {proc.pid, *descendants.keys()}
+    cpu_ticks = sum(_proc_cpu_ticks(pid) for pid in pids)
+    output_bytes = 0
+    seen = set()
+    for fd in (1, 2):
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            continue
+        identity = (info.st_dev, info.st_ino)
+        if identity in seen or not stat.S_ISREG(info.st_mode):
+            continue
+        seen.add(identity)
+        output_bytes += max(0, int(info.st_size))
+    return {
+        "activity_cpu_ticks": max(0, cpu_ticks),
+        "activity_output_bytes": output_bytes,
+        "activity_descendant_count": len(descendants),
+    }
 
 
 def _children(pid: int) -> List[int]:
@@ -1037,7 +1128,9 @@ class ExecutionSupervisor:
         return ExecutionResult(
             args=argv, returncode=int(receipt["returncode"]),
             stdout=stdout_bytes, stderr=stderr_bytes,
-            receipt=receipt, receipt_path=receipt_path)
+            receipt=receipt, receipt_path=receipt_path,
+            heartbeat_path=Path(receipt["heartbeat_ref"])
+            if receipt.get("heartbeat_ref") else None)
 
     def close(self, *, timeout_s: float = 10.0) -> None:
         """Reject new work, cancel active guardians and wait for exact emptiness."""
@@ -1305,6 +1398,8 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
     spec = _read_spec_fd(spec_fd)
     prepared = spec["prepared"]
     receipt_path = Path(spec["receipt_path"])
+    heartbeat_path = receipt_path.with_name(
+        f"heartbeat-{prepared['operation_id']}.json")
     try:
         pdeath_event = _arm_parent_death_signal(owner_pid)
     except BaseException as error:
@@ -1371,6 +1466,7 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         started_at = time.time()
         deadline_monotonic = float(spec["deadline_monotonic_s"])
         deadline_at_unix = started_at + max(0.0, deadline_monotonic - time.monotonic())
+        activity = _execution_activity_sample(proc)
         running = dict(prepared)
         running.update({
             "state": "running", "helper_pid": os.getpid(),
@@ -1378,8 +1474,14 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
             "payload_pid": proc.pid, "payload_start_ticks": info[0],
             "initial_pgid": proc.pid, "started_at_unix": started_at,
             "deadline_at_unix": deadline_at_unix,
+            "heartbeat_ref": str(heartbeat_path),
+            "guardian_heartbeat_seq": 0,
+            "guardian_heartbeat_at_unix": started_at,
+            "last_activity_at_unix": started_at,
+            **activity,
         })
         _write_receipt_until_durable(receipt_path, running)
+        _atomic_write_heartbeat(heartbeat_path, running)
         event = _owner_event(owner_fd, 0.0)
         if event is None and time.monotonic() >= deadline_monotonic:
             outcome = "timeout"
@@ -1432,6 +1534,11 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
 
     leader_start = running["payload_start_ticks"]
     deadline = float(spec["deadline_monotonic_s"])
+    last_sample = (
+        running["activity_cpu_ticks"], running["activity_output_bytes"],
+        running["activity_descendant_count"])
+    next_sample = time.monotonic() + _ACTIVITY_SAMPLE_INTERVAL_S
+    next_heartbeat = time.monotonic() + _HEARTBEAT_INTERVAL_S
     if outcome is None:
         while True:
             event = _owner_event(owner_fd, min(0.05, max(0.0, deadline - time.monotonic())))
@@ -1443,7 +1550,23 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
                 outcome = ("exit" if _all_children_drained(proc)
                            else "lingering_descendant")
                 break
-            if time.monotonic() >= deadline:
+            now_monotonic = time.monotonic()
+            if now_monotonic >= next_sample:
+                sample = _execution_activity_sample(proc)
+                sample_key = (
+                    sample["activity_cpu_ticks"], sample["activity_output_bytes"],
+                    sample["activity_descendant_count"])
+                if sample_key != last_sample:
+                    running["last_activity_at_unix"] = time.time()
+                    last_sample = sample_key
+                running.update(sample)
+                next_sample = now_monotonic + _ACTIVITY_SAMPLE_INTERVAL_S
+            if now_monotonic >= next_heartbeat:
+                running["guardian_heartbeat_seq"] += 1
+                running["guardian_heartbeat_at_unix"] = time.time()
+                _atomic_write_heartbeat(heartbeat_path, running)
+                next_heartbeat = now_monotonic + _HEARTBEAT_INTERVAL_S
+            if now_monotonic >= deadline:
                 outcome = "timeout"
                 break
 
@@ -1462,11 +1585,28 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         while True:
             time.sleep(1.0)
     _fsync_output_fds()
+    try:
+        final_sample = _execution_activity_sample(proc)
+    except ExecutionSupervisorError:
+        final_sample = {
+            "activity_cpu_ticks": running["activity_cpu_ticks"],
+            "activity_output_bytes": running["activity_output_bytes"],
+            "activity_descendant_count": 0,
+        }
+    final_key = (
+        final_sample["activity_cpu_ticks"], final_sample["activity_output_bytes"],
+        final_sample["activity_descendant_count"])
+    if final_key != last_sample:
+        running["last_activity_at_unix"] = time.time()
+    running.update(final_sample)
+    running["guardian_heartbeat_seq"] += 1
+    running["guardian_heartbeat_at_unix"] = time.time()
     terminal = _terminal_from(
         running, outcome=outcome, returncode=proc.returncode,
         term_sent=term_sent, kill_sent=kill_sent,
         max_descendants=max_descendants,
         signal_error_count=signal_errors)
+    _atomic_write_heartbeat(heartbeat_path, terminal)
     _write_receipt_until_durable(receipt_path, terminal)
     _release_fence(fence_fd)
     return 0

@@ -332,6 +332,27 @@ def test_judge_result_review_subject_includes_logs(tmp_path):
     assert "loss: 0.2" in md and "metric_value: 1@1=0.93" in md and "ab12" in md and "toy 身份" in md
 
 
+def test_judge_eval_only_subject_includes_existing_checkpoint_and_attempt_log(tmp_path):
+    """eval-only 无 run：结果评审仍必须看到既有 checkpoint hash 与本 target attempt log。"""
+    daemon, _bt_id, work = _judge_env(tmp_path)
+    with daemon.transaction() as conn:
+        bt_id = conn.execute(
+            "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,variant_id,"
+            "evaluation_id,eval_action,attempt_purpose,plan_ref) "
+            "VALUES (1,1,'eval',4,'running',1,1,'append_attempt','repro_eval','{}')").lastrowid
+        aid = conn.execute(
+            "INSERT INTO evaluation_attempt(evaluation_id,cycle_id,build_target_id,attempt_no,purpose,status) "
+            "VALUES (1,1,?,2,'repro_eval','running')", (bt_id,)).lastrowid
+    eval_dir = work / "c1" / f"t{bt_id}" / f"eval-a{aid}"
+    eval_dir.mkdir(parents=True)
+    (eval_dir / "eval.log").write_text(
+        "loss: 0.1\nmetric_value: 1@1=0.95\n", encoding="utf-8")
+    jp, _ = _judge(daemon, work, [])
+    md = jp._subject_md("c1", bt_id, "bundle_result_review")
+    assert "checkpoint ck1" in md and "h" in md
+    assert "metric_value: 1@1=0.95" in md and "loss: 0.1" in md
+
+
 def test_judge_unknown_kind_fails_loud(tmp_path):
     """codex SHOULD 回归：拼错的 review_kind 当场拒（否则写任意 decision.type，下游永远看不到期望评审）。"""
     daemon, bt_id, work = _judge_env(tmp_path)

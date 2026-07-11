@@ -111,6 +111,10 @@ class WriteDaemon:
     def conn(self):
         return self._public_conn
 
+    def owns_active_transaction(self, conn: sqlite3.Connection) -> bool:
+        """Return whether ``conn`` is this daemon's raw connection inside its current transaction."""
+        return self._in_txn and conn is self._conn and self._conn.in_transaction
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """一个短写事务：整体提交或整体回滚（无半写）。不可嵌套（一个写命令一个短事务）。

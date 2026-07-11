@@ -132,6 +132,22 @@ def _provider_for(answer_id: str, *, text="新的生产目标", complete_scores=
     return provider
 
 
+def test_stale_cycle_cannot_bind_goal_amend_route(tmp_path):
+    path = str(tmp_path / "stale-route.sqlite")
+    daemon, state, compiler = _components(path)
+    state.create_goal(text="v1", predicate_json={})
+    stale = state.open_or_resume_cycle()
+    with daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO goal(id,version,text,predicate_json,previous_version) "
+            "VALUES (1,2,'v2','{}',1)")
+    _, did = _submit_amend(daemon, text="v3")
+    with pytest.raises(ValueError, match="不可绑定"):
+        state.set_goal_amend_route(stale.cycle_id, did)
+    assert daemon.query_one("SELECT route FROM cycle WHERE id=?", (int(stale.cycle_id[1:]),))[0] is None
+    compiler.conn.close(); daemon.conn.close()
+
+
 def test_goal_amend_route_restart_versioning_and_notifications(tmp_path):
     path = str(tmp_path / "research.sqlite")
     d1, state1, compiler1 = _components(path)
