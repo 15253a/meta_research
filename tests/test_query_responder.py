@@ -16,6 +16,7 @@ from orchestrator import database as db
 from orchestrator import mediator as M
 from orchestrator import status_card as SC
 from orchestrator.cost_ledger import CostLedger
+from orchestrator.execution_reconcile import ExecutionReconciler
 from orchestrator.interfaces import Artifact, CallUsage, ResponderReply
 from orchestrator.interaction import InteractionIngest
 from orchestrator.mediator import (CodexQueryResponder, Mediator, QuerySnapshotMismatch,
@@ -23,6 +24,8 @@ from orchestrator.mediator import (CodexQueryResponder, Mediator, QuerySnapshotM
 from orchestrator.resource_limits import (MAX_INFLIGHT_QUERY_CALLS,
                                           MAX_QUERY_STATUS_CARD_BYTES)
 from orchestrator.runner import RunnerError
+from orchestrator.process_supervisor import ExecutionSupervisor, atomic_write_receipt
+from orchestrator.provider_invocation import write_provider_invocation_receipt
 from orchestrator.schemas import SchemaSet
 from orchestrator.writedaemon import WriteDaemon
 
@@ -466,6 +469,78 @@ def test_restart_recovers_orphan_without_reissuing_external_call(query_env):
             "template", runner_call_id)
     assert query_env["daemon"].query_one(
         "SELECT COUNT(*) FROM runner_call WHERE phase='interaction_query'")[0] == 1
+
+
+def test_restart_accounts_query_provider_receipt_once_without_reissuing(query_env):
+    class NeverCalled:
+        kind = "codex"
+        prompt_version = "never-provider-recovery"
+        calls = 0
+
+        def __init__(self, receipt_dir):
+            self.provider_receipt_dir = receipt_dir
+
+        def answer(self, sanitized_query, status_card):
+            self.calls += 1
+            raise AssertionError("有 provider receipt 的 orphan 绝不能重发")
+
+    mid = _classified_query(query_env["daemon"], key="provider-orphan")
+    purpose = f"message:{mid}"
+    with query_env["daemon"].transaction() as conn:
+        runner_call_id = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+            "VALUES (1,'interaction_query',?,'running')", (purpose,)).lastrowid
+    supervisor = ExecutionSupervisor.standalone(query_env["tmp_path"] / "state" / "executions")
+    operation_id = "exec-" + "7" * 32
+    execution = supervisor.receipt_dir / f"execution-{operation_id}.json"
+    terminal = supervisor._prepared_receipt(  # noqa: SLF001 - deterministic recovery fixture
+        operation_id=operation_id, kind="codex-query",
+        spec_sha256="sha256:" + "e" * 64, timeout_s=10,
+        operation_context={
+            "reconcile_protocol": "runner-call-v1",
+            "db_owner_kind": "runner_call", "db_owner_id": runner_call_id,
+            "cycle_id": "c1", "db_phase": "interaction_query",
+            "db_purpose": purpose,
+        })
+    terminal.update({
+        "state": "terminal", "outcome": "exit", "returncode": 0,
+        "started_at_unix": time.time() - 1, "finished_at_unix": time.time(),
+        "group_drained": True, "term_sent": False, "kill_sent": False,
+    })
+    atomic_write_receipt(execution, terminal)
+    write_provider_invocation_receipt(
+        receipt_dir=supervisor.receipt_dir, runner_call_id=runner_call_id,
+        cycle_id="c1", phase="interaction_query", purpose=purpose,
+        provider="codex-cli", model="gpt-test", effort="medium",
+        prompt_sha256="sha256:" + "f" * 64,
+        usage=CallUsage(tokens_total=77, wallclock_sec=0.75, tokens_known=True),
+        usage_source="json_turn_completed", execution_receipt_ref=str(execution),
+        provider_invocation_id="thread-query-1", provider_invocation_id_kind="thread_id")
+
+    # Generic startup reconciliation validates but leaves this specialized
+    # owner for Mediator, which must atomically add its failure reply.
+    ledger = CostLedger(query_env["daemon"], POLICY)
+    assert ExecutionReconciler(
+        query_env["daemon"], ledger, supervisor.receipt_dir).reconcile_startup() == 0
+    responder = NeverCalled(supervisor.receipt_dir)
+    mediator = Mediator(
+        query_env["daemon"], str(query_env["card_path"]), responder=responder,
+        cost_ledger=ledger, rebuild_last_n=3)
+    mediator.poll()
+    assert responder.calls == 0
+    assert query_env["daemon"].query_one(
+        "SELECT status,failure_kind FROM runner_call WHERE id=?", (runner_call_id,)) == (
+            "failed", "orphaned_after_provider_receipt")
+    assert query_env["daemon"].query_one(
+        "SELECT tokens_total FROM ledger WHERE runner_call_id=?", (runner_call_id,)) == (77,)
+    assert query_env["daemon"].query_one(
+        "SELECT responder_kind,runner_call_id FROM interaction_reply WHERE message_id=?", (mid,)) == (
+            "template", runner_call_id)
+    assert query_env["daemon"].query_one(
+        "SELECT COUNT(*) FROM decision WHERE type='provider_invocation_accounted' "
+        "AND json_extract(payload_json,'$.runner_call_id')=?", (runner_call_id,))[0] == 1
+    assert ExecutionReconciler(
+        query_env["daemon"], ledger, supervisor.receipt_dir).reconcile_startup() == 0
 
 
 def test_restart_aborts_created_intent_without_cost_stop(query_env):

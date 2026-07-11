@@ -34,6 +34,14 @@ from typing import Any, Collection, Dict, List, Mapping, NamedTuple, Optional
 from urllib.parse import quote
 
 from . import harness as H
+from .artifact_capability import (
+    ArtifactCapabilityError,
+    open_artifact,
+    open_directory,
+    read_artifact_bytes,
+    verify_open_fd,
+    verify_tree_fd,
+)
 from .ids import parse_positive_sqlite_int
 
 # 保留文件名：manifest 本体与 identity 由本模块按固定名物化；哨兵是物化完成标志——均不得出现在 code_files
@@ -71,6 +79,8 @@ class ResolvedCommand(NamedTuple):
     timeout_s: float
     # 已校验输入资产须一直存活到 Popen；子进程只见 /proc/self/fd/N，避免校验后按路径二次打开的 TOCTOU。
     pass_fds: tuple[int, ...] = ()
+    fd_expectations: tuple[tuple[int, str, int, Optional[int], Optional[int]], ...] = ()
+    tree_expectations: tuple[tuple[int, Dict[str, str], tuple[str, ...]], ...] = ()
 
 
 class AssetIdentity(NamedTuple):
@@ -371,7 +381,9 @@ def staged_hashes(dest_dir: Path) -> Optional[Dict[str, str]]:
     if not sent.exists():
         return None
     try:                                       # 哨兵损坏须统一报 ManifestError（codex SHOULD：调用方按契约只捕
-        raw = json.loads(sent.read_text(encoding="utf-8"))   # 获 ManifestError，裸 JSONDecodeError/KeyError 会变
+        raw = json.loads(read_artifact_bytes(
+            sent, max_bytes=1024 * 1024,
+            label="staging sentinel").decode("utf-8"))
         ledger = raw["files"]                  # 成非受控崩溃）
         if not isinstance(ledger, dict):
             raise ValueError("files 非对象")
@@ -384,9 +396,13 @@ def staged_hashes(dest_dir: Path) -> Optional[Dict[str, str]]:
         if not (isinstance(want, str) and _HASH_RE.match(want)):
             raise ManifestError(f"staging 损毁：哨兵 ledger[{rel!r}] 哈希非法（{want!r}）——须人工核")
         p = dest_dir / rel
-        if p.is_symlink() or not p.is_file():  # symlink 指向外部内容可绕哈希/可被 import（codex SHOULD）；须实体文件
-            raise ManifestError(f"staging 损毁：{rel} 缺失或非实体文件（symlink/目录）——须人工核")
-        got = hashlib.sha256(p.read_bytes()).hexdigest()
+        try:
+            got = hashlib.sha256(read_artifact_bytes(
+                p, expected_hash=want,
+                label=f"staging payload {rel}")).hexdigest()
+        except ArtifactCapabilityError as error:
+            raise ManifestError(
+                f"staging 损毁：{rel} 缺失/非实体或身份不符——须人工核") from error
         if got != want:
             raise ManifestError(f"staging 损毁：{rel} 哈希不符（记账 {want[:12]}… ≠ 实收 {got[:12]}…）——被改写，拒绝续跑")
     # 反向对账 + symlink 审计（codex SHOULD）：followlinks=False 下 symlink-dir 落在 dirs 不被下潜——须显式
@@ -761,7 +777,8 @@ def verify_asset_authorization(authorization: Optional[AssetAuthorization], *, w
 
 def _expand_asset_placeholders(
         token: str, *, work_root: Path, allowed_asset_refs: Optional[Collection[str]],
-        expected_asset_identities: Optional[Mapping[str, AssetIdentity]], opened_fds: List[int]) -> str:
+        expected_asset_identities: Optional[Mapping[str, AssetIdentity]], opened_fds: List[int],
+        fd_expectations: List[tuple[int, str, int, Optional[int], Optional[int]]]) -> str:
     def replace(match: re.Match) -> str:
         ref = match.group(1)
         if allowed_asset_refs is None or ref not in allowed_asset_refs:
@@ -778,6 +795,9 @@ def _expand_asset_placeholders(
             raise ManifestError(
                 f"输入资产与 bundle 生成时冻结身份不一致: {ref}——拒绝同 ref 消费不同字节")
         opened_fds.append(asset.fd)
+        fd_expectations.append((
+            asset.fd, asset.identity.sha256, asset.identity.size_bytes,
+            None, None))
         return asset.proc_path
 
     expanded = _ASSET_PLACEHOLDER_RE.sub(replace, token)
@@ -789,6 +809,8 @@ def _expand_asset_placeholders(
 # ---------------------------------------------------------------- 命令解析 / 围栏 --
 def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_root: Path,
                     policy: Dict[str, Any], ckpt_path: Optional[Path] = None,
+                    ckpt_content_hash: Optional[str] = None,
+                    expected_source_hashes: Optional[Mapping[str, str]] = None,
                     allowed_asset_refs: Optional[Collection[str]] = None,
                     expected_asset_identities: Optional[Mapping[str, AssetIdentity]] = None) -> ResolvedCommand:
     """取 manifest.commands[kind]，做占位符替换（{src}=代码物化目录；{ckpt}=训练产 checkpoint，仅
@@ -798,11 +820,45 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
     cmd = manifest.get("commands", {}).get(kind)
     if cmd is None:
         raise ManifestError(f"manifest 无 commands.{kind}（目标 kind 与命令集不成套）")
-    src = str(Path(src_dir).resolve())
-    ck = str(Path(ckpt_path).resolve()) if ckpt_path is not None else None
     argv: List[str] = []
     opened_fds: List[int] = []
+    fd_expectations: List[tuple[int, str, int, Optional[int], Optional[int]]] = []
+    tree_expectations: List[tuple[int, Dict[str, str], tuple[str, ...]]] = []
     try:
+        if expected_source_hashes is not None:
+            source_hashes = dict(expected_source_hashes)
+            if not source_hashes:
+                raise ManifestError("expected_source_hashes 不得为空")
+            try:
+                source_fd = open_directory(src_dir, label="bundle source tree")
+                verify_tree_fd(
+                    source_fd, source_hashes, label="bundle source tree",
+                    exact=True, allowed_extra=(_SENTINEL,))
+            except ArtifactCapabilityError as error:
+                raise ManifestError(str(error)) from error
+            opened_fds.append(source_fd)
+            tree_expectations.append((source_fd, source_hashes, (_SENTINEL,)))
+            src = f"/proc/self/fd/{source_fd}"
+        else:
+            src = str(Path(src_dir).resolve())
+        if (ckpt_path is None) != (ckpt_content_hash is None):
+            raise ManifestError(
+                "checkpoint capability 须同时提供 path 与 content_hash")
+        ck = None
+        if ckpt_path is not None:
+            try:
+                capability = open_artifact(
+                    ckpt_path, expected_hash=ckpt_content_hash,
+                    label="checkpoint capability")
+            except ArtifactCapabilityError as error:
+                raise ManifestError(str(error)) from error
+            ck = capability.proc_path
+            identity = capability.identity
+            fd = capability.detach()
+            opened_fds.append(fd)
+            fd_expectations.append((
+                fd, identity.content_hash, identity.size_bytes,
+                identity.device, identity.inode))
         for i, token in enumerate(cmd["argv"]):
             if i == 0 and "{asset:" in token:
                 raise ManifestError("输入资产占位符不得作为 argv[0] 可执行程序")
@@ -815,7 +871,8 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
             token = token.replace("{src}", src)
             token = _expand_asset_placeholders(
                 token, work_root=Path(work_root), allowed_asset_refs=allowed_asset_refs,
-                expected_asset_identities=expected_asset_identities, opened_fds=opened_fds)
+                expected_asset_identities=expected_asset_identities,
+                opened_fds=opened_fds, fd_expectations=fd_expectations)
             argv.append(token)
         _check_no_shell(argv)                       # argv[0] 禁 shell 启动器（codex BLOCKER：先于路径豁免）
         allow = [str(Path(work_root).resolve())] + [
@@ -825,6 +882,8 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
         # Permit that one exact path even when a legal pool target lives outside
         # work_root; callers remain responsible for rechecking its content hash.
         allowed_fd_paths = {f"/proc/self/fd/{fd}" for fd in opened_fds}
+        allow.extend(
+            f"/proc/self/fd/{fd}" for fd, _hashes, _extra in tree_expectations)
         if ck is not None:
             allowed_fd_paths.add(os.path.normpath(ck))
         for i, token in enumerate(argv[1:], start=1):  # argv[0]=程序名豁免（解释器/工具允许绝对系统路径）
@@ -837,7 +896,11 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
                 raise ManifestError(f"env 禁改 {k}（解释器/装载器语境不可由 manifest 改写）")
         ex = policy["execution"]
         timeout = min(float(cmd.get("timeout_s", ex["default_timeout_s"])), float(ex["max_timeout_s"]))
-        return ResolvedCommand(argv=argv, env=env, timeout_s=timeout, pass_fds=tuple(opened_fds))
+        return ResolvedCommand(
+            argv=argv, env=env, timeout_s=timeout,
+            pass_fds=tuple(opened_fds),
+            fd_expectations=tuple(fd_expectations),
+            tree_expectations=tuple(tree_expectations))
     except BaseException:
         for fd in set(opened_fds):
             try:
@@ -874,6 +937,8 @@ def _check_argv_token(token: str, allow_prefixes: List[str], *, where: str,
 def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: str, log_name: str,
                          src_dir: Path, work_root: Path, policy: Dict[str, Any],
                          ckpt_path: Optional[Path] = None,
+                         ckpt_content_hash: Optional[str] = None,
+                         expected_source_hashes: Optional[Mapping[str, str]] = None,
                          allowed_asset_refs: Optional[Collection[str]] = None,
                          expected_asset_identities: Optional[Mapping[str, AssetIdentity]] = None,
                          execution_supervisor=None,
@@ -881,14 +946,29 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
     """解析+围栏后委托 harness.run_staged（cwd=staging_dir、.partial→原子改名、.exit 侧车——纪律全继承）。
     返回 run_staged 结果 {exit_code, log_path, log_sha256, log_bytes}；log 入账仍归调用方。"""
     rc = resolve_command(manifest, kind, src_dir=src_dir, work_root=work_root, policy=policy,
-                         ckpt_path=ckpt_path, allowed_asset_refs=allowed_asset_refs,
+                         ckpt_path=ckpt_path, ckpt_content_hash=ckpt_content_hash,
+                         expected_source_hashes=expected_source_hashes,
+                         allowed_asset_refs=allowed_asset_refs,
                          expected_asset_identities=expected_asset_identities)
     try:
-        return H.run_staged(rc.argv, staging_dir=staging_dir, log_name=log_name,
-                            timeout_s=rc.timeout_s, env=rc.env or None, pass_fds=rc.pass_fds,
-                            execution_supervisor=execution_supervisor,
-                            execution_kind=f"manifest-{kind}",
-                            execution_context=execution_context)
+        result = H.run_staged(
+            rc.argv, staging_dir=staging_dir, log_name=log_name,
+            timeout_s=rc.timeout_s, env=rc.env or None, pass_fds=rc.pass_fds,
+            execution_supervisor=execution_supervisor,
+            execution_kind=f"manifest-{kind}",
+            execution_context=execution_context)
+        try:
+            for fd, content_hash, size, device, inode in rc.fd_expectations:
+                verify_open_fd(
+                    fd, expected_hash=content_hash, expected_size=size,
+                    expected_device=device, expected_inode=inode)
+            for fd, hashes, allowed_extra in rc.tree_expectations:
+                verify_tree_fd(
+                    fd, hashes, label="bundle source tree post-use",
+                    exact=True, allowed_extra=allowed_extra)
+        except ArtifactCapabilityError as error:
+            raise ManifestError(str(error)) from error
+        return result
     finally:
         for fd in set(rc.pass_fds):
             try:

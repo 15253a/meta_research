@@ -25,6 +25,8 @@ from typing import Any, Optional
 
 from .ids import cnum as _cnum
 from .interfaces import CallUsage
+from .provider_invocation import (ProviderInvocation, load_provider_invocation_receipt,
+                                  provider_receipt_for_execution)
 from .runtime_control import (effective_budget_config, policy_with_effective_budget,
                               validate_budget_config)
 
@@ -251,17 +253,26 @@ class CostLedger:
 
     def finish_call_in_txn(self, conn: Any, *, runner_call_id: int, status: str,
                            usage: Optional[CallUsage], failure_kind: Optional[str] = None,
-                           transcript_ref: Optional[str] = None) -> Optional[dict]:
-        """在调用方事务内把既有 running intent 与 ledger 原子收口。"""
+                           transcript_ref: Optional[str] = None,
+                           execution_receipt_ref: Optional[str] = None,
+                           provider_receipt_ref: Optional[str] = None) -> Optional[dict]:
+        """在调用方事务内把既有 running intent、provider 回执与 ledger 原子收口。"""
+        if not self.daemon.owns_active_transaction(conn):
+            raise RuntimeError("finish_call_in_txn 必须运行在唯一 WriteDaemon 的 active transaction 内")
         if status not in ("success", "failed", "aborted"):
             raise ValueError(f"runner_call 终态非法: {status}")
         if status != "success" and not (isinstance(failure_kind, str) and failure_kind.strip()):
             raise ValueError(f"runner_call {status} 须给 failure_kind")
         row = conn.execute(
-            "SELECT status FROM runner_call WHERE id=?", (runner_call_id,)).fetchone()
-        if row is None or row[0] != "running":
+            "SELECT cycle_id,phase,purpose,status FROM runner_call WHERE id=?",
+            (runner_call_id,)).fetchone()
+        if row is None or row[3] != "running":
             raise RuntimeError(
-                f"runner_call {runner_call_id} 非 running（{row[0] if row else 'missing'}），不可 finish")
+                f"runner_call {runner_call_id} 非 running（{row[3] if row else 'missing'}），不可 finish")
+        invocation = self._load_provider_invocation(
+            runner_call_id=runner_call_id, row=row, usage=usage,
+            execution_receipt_ref=execution_receipt_ref,
+            provider_receipt_ref=provider_receipt_ref)
         changed = conn.execute(
             "UPDATE runner_call SET status=?,failure_kind=?,"
             "transcript_ref=COALESCE(?,transcript_ref),finished_at=CURRENT_TIMESTAMP "
@@ -269,19 +280,27 @@ class CostLedger:
             (status, failure_kind, transcript_ref, runner_call_id)).rowcount
         if changed != 1:
             raise RuntimeError(f"runner_call {runner_call_id} 终态迁移竞态")
-        return self.insert_ledger_for_runner(
+        budget_hit = self.insert_ledger_for_runner(
             conn, runner_call_id=runner_call_id, usage=usage)
+        if invocation is not None:
+            self._record_provider_accounting(
+                conn, invocation=invocation, terminal_status=status)
+        return budget_hit
 
     def finish_call(self, *, runner_call_id: int, status: str,
                     usage: Optional[CallUsage], failure_kind: Optional[str] = None,
-                    transcript_ref: Optional[str] = None) -> None:
+                    transcript_ref: Optional[str] = None,
+                    execution_receipt_ref: Optional[str] = None,
+                    provider_receipt_ref: Optional[str] = None) -> None:
         """自开短事务收口既有 intent；成本不可验证时复用同一 intent fail-closed。"""
         budget_hit = None
         try:
             with self.daemon.transaction() as conn:
                 budget_hit = self.finish_call_in_txn(
                     conn, runner_call_id=runner_call_id, status=status, usage=usage,
-                    failure_kind=failure_kind, transcript_ref=transcript_ref)
+                    failure_kind=failure_kind, transcript_ref=transcript_ref,
+                    execution_receipt_ref=execution_receipt_ref,
+                    provider_receipt_ref=provider_receipt_ref)
         except Exception as error:
             row = self.daemon.query_one(
                 "SELECT cycle_id,phase,purpose,status FROM runner_call WHERE id=?",
@@ -301,6 +320,78 @@ class CostLedger:
                 runner_call_id=runner_call_id) from error
         if budget_hit is not None:
             raise BudgetExhausted(**budget_hit)
+
+    def _load_provider_invocation(
+            self, *, runner_call_id: int, row, usage: Optional[CallUsage],
+            execution_receipt_ref: Optional[str],
+            provider_receipt_ref: Optional[str]) -> Optional[ProviderInvocation]:
+        """Load the durable provider fact and reject any caller/receipt usage split-brain."""
+        if execution_receipt_ref is None and provider_receipt_ref is None:
+            return None
+        if execution_receipt_ref is None:
+            raise RuntimeError("provider receipt 入账必须同时给 execution receipt ref")
+        expected = provider_receipt_for_execution(execution_receipt_ref, runner_call_id)
+        if provider_receipt_ref is not None and str(expected) != str(provider_receipt_ref):
+            raise RuntimeError("provider receipt ref 与 execution/runner_call 确定性路径不一致")
+        cycle_id, phase, purpose, _status = row
+        invocation = load_provider_invocation_receipt(
+            expected, expected_runner_call_id=runner_call_id,
+            expected_cycle_id=(f"c{cycle_id}" if cycle_id is not None else ""),
+            expected_phase=phase, expected_purpose=purpose,
+            expected_execution_receipt_ref=execution_receipt_ref)
+        if self._validated_usage(usage) != self._validated_usage(invocation.usage):
+            raise RuntimeError(
+                f"runner_call {runner_call_id} 调用方 usage 与 durable provider receipt 不一致")
+        return invocation
+
+    def _record_provider_accounting(self, conn: Any, *, invocation: ProviderInvocation,
+                                    terminal_status: str) -> None:
+        """Bind the exact usage receipt to the local policy billing projection once."""
+        duplicate = conn.execute(
+            "SELECT id FROM decision WHERE actor='orchestrator' "
+            "AND type='provider_invocation_accounted' AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.runner_call_id')=? ORDER BY id",
+            (invocation.runner_call_id,)).fetchall()
+        if duplicate:
+            raise RuntimeError(
+                f"runner_call {invocation.runner_call_id} 已有 provider accounting decision {duplicate}")
+        ledger = conn.execute(
+            "SELECT id,tokens_input,tokens_output,tokens_total,wallclock_sec,money,policy_version "
+            "FROM ledger WHERE runner_call_id=?",
+            (invocation.runner_call_id,)).fetchone()
+        if ledger is None:
+            raise RuntimeError("provider accounting 缺同事务 ledger 行")
+        payload = {
+            "protocol": "provider-accounting-v1",
+            "runner_call_id": invocation.runner_call_id,
+            "provider_receipt_ref": invocation.receipt_ref,
+            "provider_receipt_sha256": invocation.receipt_sha256,
+            "provider": invocation.provider,
+            "model": invocation.model,
+            "effort": invocation.effort,
+            "local_invocation_id": invocation.local_invocation_id,
+            "provider_invocation_id": invocation.provider_invocation_id,
+            "provider_invocation_id_kind": invocation.provider_invocation_id_kind,
+            "usage_source": invocation.usage_source,
+            "execution_receipt_ref": invocation.execution_receipt_ref,
+            "execution_receipt_sha256": invocation.execution_receipt_sha256,
+            "execution_operation_id": invocation.execution_operation_id,
+            "ledger_id": ledger[0],
+            "tokens_input": ledger[1],
+            "tokens_output": ledger[2],
+            "tokens_total": ledger[3],
+            "wallclock_sec": ledger[4],
+            "money": ledger[5],
+            "policy_version": ledger[6],
+            "runner_terminal_status": terminal_status,
+            "billing_basis": "local_policy_projection",
+            "external_invoice_available": False,
+        }
+        conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (?,'orchestrator','provider_invocation_accounted',?)",
+            (_cnum(invocation.cycle_id), json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))))
 
     def record_ledger_only(self, *, runner_call_id: int, usage: Optional[CallUsage]) -> None:
         """自开短 txn：只 INSERT ledger，引用**既有** runner_call。
@@ -361,6 +452,12 @@ class CostLedger:
         cycle_id/phase 从 runner_call 派生，且 runner_call 不存在时 fail loud，避免 INSERT…SELECT 空写后
         调用方误以为已经记账。此方法不开事务，必须传 WriteDaemon.transaction() 给出的连接。
         """
+        if not self.daemon.owns_active_transaction(conn):
+            raise RuntimeError("ledger INSERT 必须运行在唯一 WriteDaemon 的 active transaction 内")
+        # WriteDaemon owns the sole writer connection and holds one RLock over
+        # BEGIN IMMEDIATE..COMMIT.  Consequently this precheck+INSERT and the
+        # provider-accounting decision are one serialized critical section;
+        # the frozen Appendix-A schema need not be mutated with a new index.
         if conn.execute("SELECT 1 FROM ledger WHERE runner_call_id=? LIMIT 1",
                         (runner_call_id,)).fetchone() is not None:
             raise RuntimeError(f"runner_call {runner_call_id} 已有 ledger，拒绝重复记账")

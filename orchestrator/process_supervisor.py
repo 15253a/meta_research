@@ -320,6 +320,96 @@ def read_receipt(path: Path) -> Dict[str, Any]:
     return _strict_json_bytes(b"".join(chunks), limit=_MAX_RECEIPT_BYTES)
 
 
+def _capture_path(path: Path, operation_id: str, stream: str) -> Path:
+    return Path(path).parent / f"capture-{operation_id}.{stream}.bin"
+
+
+def _open_capture_file(path: Path):  # noqa: ANN201 - binary file object
+    flags = (os.O_RDWR | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "w+b")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _capture_identity(path: Path, fd: int) -> Dict[str, Any]:
+    """Hash one already-open guardian output without disturbing its file offset."""
+    os.fsync(fd)
+    info = os.fstat(fd)
+    current = os.lstat(path)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600
+            or (current.st_dev, current.st_ino, current.st_size)
+            != (info.st_dev, info.st_ino, info.st_size)):
+        raise ExecutionSupervisorError(f"durable capture 身份非法: {path.name}")
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < info.st_size:
+        chunk = os.pread(fd, min(1024 * 1024, info.st_size - offset), offset)
+        if not chunk:
+            raise ExecutionSupervisorError(f"durable capture 被截断: {path.name}")
+        digest.update(chunk)
+        offset += len(chunk)
+    return {
+        "sha256": "sha256:" + digest.hexdigest(),
+        "bytes": info.st_size,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+    }
+
+
+def _capture_identity_from_path(path: Path) -> Dict[str, Any]:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        return _capture_identity(path, fd)
+    finally:
+        os.close(fd)
+
+
+def _verified_capture_fd(receipt: Mapping[str, Any], *, stream: str) -> Tuple[int, Dict[str, Any]]:
+    if stream not in ("stdout", "stderr"):
+        raise ValueError("capture stream 只接受 stdout/stderr")
+    ref = receipt.get(f"capture_{stream}_ref")
+    if not isinstance(ref, str) or not ref:
+        raise ValueError(f"execution receipt 缺 capture_{stream}_ref")
+    path = Path(ref)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        identity = _capture_identity(path, fd)
+        for field in ("sha256", "bytes", "device", "inode"):
+            if receipt.get(f"capture_{stream}_{field}") != identity[field]:
+                raise ValueError(f"execution {stream} capture 与 receipt 身份不一致")
+        return fd, identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_execution_capture(receipt: Mapping[str, Any], *, stream: str) -> bytes:
+    """Read a terminal guardian capture from one no-follow descriptor and verify its receipt identity."""
+    if receipt.get("capture_error") is not None:
+        raise ValueError("execution receipt 已声明 capture_error，输出不可作为 usage authority")
+    fd, identity = _verified_capture_fd(receipt, stream=stream)
+    try:
+        remaining = identity["bytes"]
+        chunks = []
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError(f"execution {stream} capture 读取被截断")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def _finite_number(value: Any, *, positive: bool = False) -> bool:
     return (not isinstance(value, bool) and isinstance(value, (int, float))
             and math.isfinite(float(value))
@@ -366,12 +456,21 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
                     and (not value or len(value) > 128
                          or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value)))):
             raise ValueError("execution receipt context 非法")
+    capture_refs = (receipt.get("capture_stdout_ref"), receipt.get("capture_stderr_ref"))
+    if any(value is not None for value in capture_refs):
+        if not all(isinstance(value, str) and value for value in capture_refs):
+            raise ValueError("execution capture refs 须成对")
+        if (capture_refs[0] != str(_capture_path(path, operation_id, "stdout"))
+                or capture_refs[1] != str(_capture_path(path, operation_id, "stderr"))):
+            raise ValueError("execution capture ref 未按 operation_id 确定性命名")
     state = receipt.get("state")
     if state == "prepared":
-        if receipt.get("outcome") is not None:
+        if receipt.get("outcome") is not None or receipt.get("capture_error") is not None:
             raise ValueError("prepared receipt 不得含 outcome")
         return
     if state == "running":
+        if receipt.get("capture_error") is not None:
+            raise ValueError("running receipt 不得含 capture_error")
         for key in ("helper_pid", "payload_pid", "initial_pgid"):
             if (not isinstance(receipt.get(key), int)
                     or isinstance(receipt[key], bool) or receipt[key] <= 0):
@@ -412,6 +511,20 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
                      or isinstance(receipt["returncode"], bool)))
             or (outcome == "exit" and not isinstance(receipt.get("returncode"), int))):
         raise ValueError("terminal execution receipt 非法")
+    capture_error = receipt.get("capture_error")
+    if capture_error is not None:
+        if (capture_refs[0] is None or not isinstance(capture_error, str)
+                or not capture_error or len(capture_error) > 500):
+            raise ValueError("terminal capture_error 非法")
+    elif capture_refs[0] is not None:
+        for stream in ("stdout", "stderr"):
+            fd, _identity = _verified_capture_fd(receipt, stream=stream)
+            os.close(fd)
+
+
+def validate_execution_receipt(receipt: Mapping[str, Any], path: Path) -> None:
+    """Public strict validator for components that consume guardian authority."""
+    _validate_receipt(receipt, Path(path))
 
 
 def _boot_id() -> Optional[str]:
@@ -635,6 +748,18 @@ class ExecutionSupervisor:
                         "kill_sent": False,
                         "recovered_by_owner_id": self.owner_id,
                     })
+                    if receipt.get("capture_stdout_ref") is not None:
+                        try:
+                            for stream in ("stdout", "stderr"):
+                                identity = _capture_identity_from_path(
+                                    Path(receipt[f"capture_{stream}_ref"]))
+                                for field, value in identity.items():
+                                    terminal[f"capture_{stream}_{field}"] = value
+                        except Exception as error:
+                            for stream in ("stdout", "stderr"):
+                                for field in ("sha256", "bytes", "device", "inode"):
+                                    terminal.pop(f"capture_{stream}_{field}", None)
+                            terminal["capture_error"] = f"{type(error).__name__}: {error}"[:500]
                     atomic_write_receipt(path, terminal)
                     continue
                 if state == "running":
@@ -731,7 +856,8 @@ class ExecutionSupervisor:
         spec_for_hash = {
             "argv": argv, "cwd": target_cwd, "timeout_s": timeout_s,
             "env": sorted(target_env.items()),
-            "pass_fd_count": len(target_fds), "kind": kind,
+            "pass_fd_count": len(target_fds), "capture_output": capture_output,
+            "kind": kind,
             "context": receipt_context,
         }
         spec_sha256 = "sha256:" + hashlib.sha256(
@@ -742,6 +868,13 @@ class ExecutionSupervisor:
             operation_id=operation_id, kind=kind,
             spec_sha256=spec_sha256, timeout_s=timeout_s,
             operation_context=receipt_context)
+        capture_stdout_path = _capture_path(receipt_path, operation_id, "stdout")
+        capture_stderr_path = _capture_path(receipt_path, operation_id, "stderr")
+        if capture_output:
+            prepared.update({
+                "capture_stdout_ref": str(capture_stdout_path),
+                "capture_stderr_ref": str(capture_stderr_path),
+            })
 
         old_sigint_handler = None
         manage_sigint = threading.current_thread() is threading.main_thread()
@@ -753,8 +886,24 @@ class ExecutionSupervisor:
                 raise ExecutionSupervisorError(
                     f"不支持的 SIGINT handler: {old_sigint_handler!r}")
 
-        out_tmp = tempfile.TemporaryFile() if capture_output else None
-        err_tmp = tempfile.TemporaryFile() if capture_output else None
+        out_tmp = err_tmp = None
+        if capture_output:
+            try:
+                out_tmp = _open_capture_file(capture_stdout_path)
+                err_tmp = _open_capture_file(capture_stderr_path)
+            except BaseException:
+                for stream in (out_tmp, err_tmp):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except BaseException:
+                            pass
+                for capture_path in (capture_stdout_path, capture_stderr_path):
+                    try:
+                        capture_path.unlink()
+                    except OSError:
+                        pass
+                raise
         helper_stdout = out_tmp if capture_output else stdout
         helper_stderr = err_tmp if capture_output else stderr
         spec_file = tempfile.TemporaryFile()
@@ -957,6 +1106,21 @@ class ExecutionSupervisor:
                     "term_sent": False, "kill_sent": False,
                     "spawn_error": type(spawn_error).__name__,
                 })
+                if capture_output:
+                    assert out_tmp is not None and err_tmp is not None
+                    try:
+                        for stream, capture_path, capture_file in (
+                                ("stdout", capture_stdout_path, out_tmp),
+                                ("stderr", capture_stderr_path, err_tmp)):
+                            identity = _capture_identity(capture_path, capture_file.fileno())
+                            for field, value in identity.items():
+                                terminal[f"capture_{stream}_{field}"] = value
+                    except Exception as capture_error:
+                        for stream in ("stdout", "stderr"):
+                            for field in ("sha256", "bytes", "device", "inode"):
+                                terminal.pop(f"capture_{stream}_{field}", None)
+                        terminal["capture_error"] = (
+                            f"{type(capture_error).__name__}: {capture_error}"[:500])
                 try:
                     atomic_write_receipt(receipt_path, terminal)
                 except BaseException as receipt_error:
@@ -1383,6 +1547,22 @@ def _terminal_from(prepared: Mapping[str, Any], **updates) -> Dict[str, Any]:  #
     terminal["state"] = "terminal"
     terminal["group_drained"] = True
     terminal["finished_at_unix"] = time.time()
+    if prepared.get("capture_stdout_ref") is not None:
+        try:
+            for stream, fd in (("stdout", 1), ("stderr", 2)):
+                identity = _capture_identity(
+                    Path(prepared[f"capture_{stream}_ref"]), fd)
+                for field, value in identity.items():
+                    terminal[f"capture_{stream}_{field}"] = value
+        except Exception as error:
+            for stream in ("stdout", "stderr"):
+                for field in ("sha256", "bytes", "device", "inode"):
+                    terminal.pop(f"capture_{stream}_{field}", None)
+            # Process-tree terminal authority remains publishable even when
+            # output identity is not.  Recovery will keep the exact runner_call
+            # but take the unknown-usage fail-closed path.
+            terminal["capture_error"] = (
+                f"{type(error).__name__}: {error}"[:500] or "capture identity failed")
     return terminal
 
 

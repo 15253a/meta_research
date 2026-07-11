@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import sys
 import time
 
 import pytest
@@ -10,8 +12,10 @@ import conftest
 from orchestrator import database as db
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.execution_reconcile import ExecutionReconciler
+from orchestrator.interfaces import CallUsage
 from orchestrator.process_supervisor import (ExecutionRecoveryError, ExecutionSupervisor,
                                              atomic_write_receipt)
+from orchestrator.provider_invocation import write_provider_invocation_receipt
 from orchestrator.writedaemon import WriteDaemon
 
 
@@ -125,6 +129,132 @@ def test_exit_zero_never_synthesizes_runner_success(tmp_path):
     assert payload == 0
     assert reconciler.reconcile_startup() == 0
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='execution_reconciled'")[0] == 1
+
+
+def test_provider_receipt_recovers_exact_usage_once_without_synthesizing_success(tmp_path):
+    daemon, ledger, supervisor = _env(tmp_path)
+    with daemon.transaction() as conn:
+        rc = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status,started_at) "
+            "VALUES (1,'idea','idea-n1-a1','running',CURRENT_TIMESTAMP)").lastrowid
+    execution = _receipt(supervisor, runner_call_id=rc, outcome="exit", returncode=0)
+    provider = write_provider_invocation_receipt(
+        receipt_dir=supervisor.receipt_dir, runner_call_id=rc,
+        cycle_id="c1", phase="idea", purpose="idea-n1-a1",
+        provider="codex-cli", model="gpt-test", effort="medium",
+        prompt_sha256="sha256:" + "c" * 64,
+        usage=CallUsage(tokens_total=4321, wallclock_sec=1.25, tokens_known=True),
+        usage_source="stderr_tokens_used", execution_receipt_ref=str(execution),
+        provider_invocation_id="session-123", provider_invocation_id_kind="session_id")
+
+    reconciler = ExecutionReconciler(daemon, ledger, supervisor.receipt_dir)
+    assert reconciler.reconcile_startup() == 1
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM runner_call WHERE id=?", (rc,)) == (
+            "failed", "orphaned_after_provider_receipt")
+    assert daemon.query_one(
+        "SELECT tokens_total,wallclock_sec FROM ledger WHERE runner_call_id=?", (rc,)) == (
+            4321, 1.25)
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE type='provider_invocation_accounted' "
+        "AND json_extract(payload_json,'$.runner_call_id')=?", (rc,))[0])
+    assert payload["provider_receipt_ref"] == provider
+    assert payload["provider_invocation_id"] == "session-123"
+    assert payload["billing_basis"] == "local_policy_projection"
+    assert payload["external_invoice_available"] is False
+    assert reconciler.reconcile_startup() == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM ledger WHERE runner_call_id=?", (rc,))[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='provider_invocation_accounted' "
+        "AND json_extract(payload_json,'$.runner_call_id')=?", (rc,))[0] == 1
+
+
+def test_guardian_capture_rebuilds_usage_if_owner_dies_before_provider_receipt(tmp_path):
+    daemon, ledger, supervisor = _env(tmp_path)
+    with daemon.transaction() as conn:
+        rc = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status,started_at) "
+            "VALUES (1,'idea','idea-n1-a1','running',CURRENT_TIMESTAMP)").lastrowid
+    result = supervisor.run(
+        [sys.executable, "-c",
+         "import sys; print('session id: guardian-session', file=sys.stderr); "
+         "print('tokens used', file=sys.stderr); print('222', file=sys.stderr)"],
+        capture_output=True, timeout_s=5, kind="codex-runner",
+        operation_context={
+            "reconcile_protocol": "runner-call-v1",
+            "db_owner_kind": "runner_call", "db_owner_id": rc,
+            "cycle_id": "c1", "db_phase": "idea", "db_purpose": "idea-n1-a1",
+            "provider": "codex-cli", "provider_model": "gpt-test",
+            "provider_effort": "medium", "prompt_sha256": "sha256:" + "9" * 64,
+        })
+    provider_path = supervisor.receipt_dir / f"provider-invocation-rc{rc}.json"
+    assert result.returncode == 0 and not provider_path.exists()
+
+    assert ExecutionReconciler(
+        daemon, ledger, supervisor.receipt_dir).reconcile_startup() == 1
+    assert provider_path.is_file()
+    assert daemon.query_one(
+        "SELECT tokens_total FROM ledger WHERE runner_call_id=?", (rc,)) == (222,)
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE type='provider_invocation_accounted' "
+        "AND json_extract(payload_json,'$.runner_call_id')=?", (rc,))[0])
+    assert payload["provider_invocation_id"] == "guardian-session"
+    assert payload["usage_source"] == "stderr_tokens_used"
+
+
+def test_capture_error_terminalizes_runner_with_unknown_usage_fail_closed(tmp_path):
+    daemon, ledger, supervisor = _env(tmp_path)
+    with daemon.transaction() as conn:
+        rc = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+            "VALUES (1,'idea','idea-n1-a1','running')").lastrowid
+    execution = _receipt(supervisor, runner_call_id=rc, outcome="exit", returncode=0)
+    receipt = json.loads(execution.read_text(encoding="utf-8"))
+    operation_id = receipt["operation_id"]
+    receipt["context"].update({
+        "provider": "codex-cli", "provider_model": "gpt-test",
+        "provider_effort": "medium", "prompt_sha256": "sha256:" + "6" * 64,
+    })
+    receipt["capture_stdout_ref"] = str(
+        supervisor.receipt_dir / f"capture-{operation_id}.stdout.bin")
+    receipt["capture_stderr_ref"] = str(
+        supervisor.receipt_dir / f"capture-{operation_id}.stderr.bin")
+    receipt["capture_error"] = "OSError: simulated capture identity failure"
+    atomic_write_receipt(execution, receipt)
+
+    assert ExecutionReconciler(
+        daemon, ledger, supervisor.receipt_dir).reconcile_startup() == 1
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM runner_call WHERE id=?", (rc,)) == (
+            "failed", "orphaned_after_exit")
+    assert daemon.query_one(
+        "SELECT COUNT(*) FROM ledger WHERE runner_call_id=?", (rc,)) == (0,)
+    assert daemon.query_one(
+        "SELECT json_extract(payload_json,'$.reason') FROM decision "
+        "WHERE type='global_stop'") == ("cost_accounting_failed",)
+
+
+def test_provider_receipt_execution_anchor_tamper_fails_startup(tmp_path):
+    daemon, ledger, supervisor = _env(tmp_path)
+    with daemon.transaction() as conn:
+        rc = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+            "VALUES (1,'idea','idea-n1-a1','running')").lastrowid
+    execution = _receipt(supervisor, runner_call_id=rc, outcome="exit", returncode=0)
+    provider = Path(write_provider_invocation_receipt(
+        receipt_dir=supervisor.receipt_dir, runner_call_id=rc,
+        cycle_id="c1", phase="idea", purpose="idea-n1-a1",
+        provider="codex-cli", model="gpt-test", effort="medium",
+        prompt_sha256="sha256:" + "d" * 64,
+        usage=CallUsage(tokens_total=9, tokens_known=True),
+        usage_source="stderr_tokens_used", execution_receipt_ref=str(execution)))
+    value = json.loads(provider.read_text(encoding="utf-8"))
+    value["execution"]["receipt_sha256"] = "sha256:" + "0" * 64
+    atomic_write_receipt(provider, value)
+    with pytest.raises(RuntimeError, match="内容锚"):
+        ExecutionReconciler(daemon, ledger, supervisor.receipt_dir).reconcile_startup()
+    assert daemon.query_one("SELECT status FROM runner_call WHERE id=?", (rc,)) == ("running",)
 
 
 def test_owner_lost_before_start_aborts_without_cost_stop(tmp_path):

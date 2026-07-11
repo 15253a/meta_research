@@ -12,7 +12,12 @@ import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from .process_supervisor import ExecutionRecoveryError, read_receipt
+from .process_supervisor import (ExecutionRecoveryError, read_receipt,
+                                 validate_execution_receipt)
+from .provider_invocation import (ProviderInvocation, load_provider_invocation_receipt,
+                                  receipt_runner_call_id,
+                                  reconstruct_provider_invocation_receipt,
+                                  recovery_terminal)
 
 
 _RUNNER_PROTOCOL = "runner-call-v1"
@@ -20,6 +25,7 @@ _OWNER_PROTOCOL = "execution-owner-v1"
 _OWNER_KINDS = ("run", "evaluation_attempt", "build_target")
 _ACTIVE_RUNNER = ("created", "running")
 _ACTIVE_ATTEMPT = ("created", "running")
+_SPECIALIZED_RUNNER_PHASES = ("interaction_query", "import_search")
 
 
 def _require_terminal(owner: str, receipt: dict) -> None:
@@ -85,13 +91,20 @@ class ExecutionReconciler:
         self.receipt_dir = Path(receipt_dir)
 
     @staticmethod
-    def _receipt_hash(path: Path) -> str:
-        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    def _receipt_hash(receipt: dict) -> str:
+        # ``read_receipt`` already consumed one no-follow descriptor.  Hash its
+        # canonical value instead of reopening the path and recreating the
+        # exact hash/open race this reconciliation layer is meant to remove.
+        payload = (json.dumps(
+            receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False) + "\n").encode("utf-8")
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
 
     def _receipts(self) -> Dict[Tuple[str, int], Tuple[Path, dict]]:
         owners: Dict[Tuple[str, int], Tuple[Path, dict]] = {}
         for path in sorted(self.receipt_dir.glob("execution-*.json")):
             receipt = read_receipt(path)
+            validate_execution_receipt(receipt, path)
             context = receipt.get("context") or {}
             protocol = context.get("reconcile_protocol")
             if protocol not in (_RUNNER_PROTOCOL, _OWNER_PROTOCOL):
@@ -112,6 +125,26 @@ class ExecutionReconciler:
                     f"{owner_kind} {owner_id} 对应多个 execution operation")
             owners[key] = (path, receipt)
         return owners
+
+    def _provider_receipts(self) -> Dict[int, Path]:
+        receipts: Dict[int, Path] = {}
+        for path in sorted(self.receipt_dir.glob("provider-invocation-rc*.json")):
+            runner_call_id = receipt_runner_call_id(path)
+            if runner_call_id in receipts:
+                raise ExecutionRecoveryError(
+                    f"runner_call {runner_call_id} 对应多个 provider receipt")
+            receipts[runner_call_id] = path
+        return receipts
+
+    @staticmethod
+    def _load_provider(path: Path, runner_call_id: int, row,
+                       execution_entry) -> ProviderInvocation:
+        execution_ref = str(execution_entry[0]) if execution_entry is not None else None
+        return load_provider_invocation_receipt(
+            path, expected_runner_call_id=runner_call_id,
+            expected_cycle_id=(f"c{row[0]}" if row[0] is not None else ""),
+            expected_phase=row[1], expected_purpose=row[2],
+            expected_execution_receipt_ref=execution_ref)
 
     @staticmethod
     def _runner_context_matches(row, context: dict) -> bool:
@@ -185,7 +218,8 @@ class ExecutionReconciler:
                          cycle_id: Optional[int], receipt_path: Optional[Path],
                          receipt: Optional[dict], terminal_status: str,
                          failure_kind: str, db_failure_kind: Optional[str] = None,
-                         recovery_action: str = "terminalized") -> None:
+                         recovery_action: str = "terminalized",
+                         provider_invocation: Optional[ProviderInvocation] = None) -> None:
         if self._already_decided(conn, owner_kind, owner_id):
             return
         payload = {
@@ -193,8 +227,8 @@ class ExecutionReconciler:
             "db_owner_kind": owner_kind,
             "db_owner_id": owner_id,
             "receipt_ref": str(receipt_path) if receipt_path is not None else None,
-            "receipt_sha256": (self._receipt_hash(receipt_path)
-                               if receipt_path is not None else None),
+            "receipt_sha256": (self._receipt_hash(receipt)
+                               if receipt is not None else None),
             "operation_id": receipt.get("operation_id") if receipt is not None else None,
             "outcome": receipt.get("outcome") if receipt is not None else None,
             "returncode": receipt.get("returncode") if receipt is not None else None,
@@ -203,16 +237,27 @@ class ExecutionReconciler:
             "db_failure_kind": db_failure_kind,
             "recovery_action": recovery_action,
             "success_synthesized": False,
+            "provider_receipt_ref": (provider_invocation.receipt_ref
+                                     if provider_invocation is not None else None),
+            "provider_receipt_sha256": (provider_invocation.receipt_sha256
+                                        if provider_invocation is not None else None),
+            "provider_invocation_id": (provider_invocation.provider_invocation_id
+                                       if provider_invocation is not None else None),
         }
         conn.execute(
             "INSERT INTO decision(cycle_id,actor,type,payload_json) "
             "VALUES (?,'orchestrator','execution_reconciled',?)",
             (cycle_id, json.dumps(payload, ensure_ascii=False, sort_keys=True)))
 
-    def _reconcile_runner(self, runner_call_id: int, row, receipt_entry) -> bool:
+    def _reconcile_runner(self, runner_call_id: int, row, receipt_entry,
+                          provider_path: Optional[Path] = None) -> bool:
         _cycle_id, _phase, _purpose, status = row
         path, receipt = receipt_entry if receipt_entry is not None else (None, None)
-        if receipt is not None:
+        invocation = (self._load_provider(provider_path, runner_call_id, row, receipt_entry)
+                      if provider_path is not None else None)
+        if invocation is not None:
+            terminal_status, failure_kind = recovery_terminal(invocation)
+        elif receipt is not None:
             _require_terminal(f"runner_call {runner_call_id}", receipt)
             if not self._runner_context_matches(row, receipt.get("context") or {}):
                 raise ExecutionRecoveryError(
@@ -226,44 +271,79 @@ class ExecutionReconciler:
         proved_unstarted = (
             status == "created" and receipt is None
         ) or (receipt is not None and receipt.get("outcome") == "owner_lost_before_start")
-        with self.daemon.transaction() as conn:
-            if self._already_decided(conn, "runner_call", runner_call_id):
-                return False
-            current = conn.execute(
-                "SELECT status FROM runner_call WHERE id=?", (runner_call_id,)).fetchone()
-            if current is None:
-                raise ExecutionRecoveryError(f"runner_call {runner_call_id} 在对账中消失")
-            if current[0] not in _ACTIVE_RUNNER:
-                return False
-            if proved_unstarted:
-                changed = conn.execute(
-                    "UPDATE runner_call SET status='aborted',failure_kind=?,"
-                    "transcript_ref=COALESCE(?,transcript_ref),finished_at=CURRENT_TIMESTAMP "
-                    "WHERE id=? AND status IN ('created','running')",
-                    (failure_kind, str(path) if path is not None else None,
-                     runner_call_id)).rowcount
-                if changed != 1:
+        try:
+            with self.daemon.transaction() as conn:
+                if self._already_decided(conn, "runner_call", runner_call_id):
+                    return False
+                current = conn.execute(
+                    "SELECT status FROM runner_call WHERE id=?", (runner_call_id,)).fetchone()
+                if current is None:
+                    raise ExecutionRecoveryError(f"runner_call {runner_call_id} 在对账中消失")
+                if current[0] not in _ACTIVE_RUNNER:
+                    return False
+                if invocation is not None:
+                    self.cost_ledger.finish_call_in_txn(
+                        conn, runner_call_id=runner_call_id,
+                        status=terminal_status, failure_kind=failure_kind,
+                        usage=invocation.usage, transcript_ref=str(path),
+                        execution_receipt_ref=invocation.execution_receipt_ref,
+                        provider_receipt_ref=invocation.receipt_ref)
+                elif proved_unstarted:
+                    changed = conn.execute(
+                        "UPDATE runner_call SET status='aborted',failure_kind=?,"
+                        "transcript_ref=COALESCE(?,transcript_ref),finished_at=CURRENT_TIMESTAMP "
+                        "WHERE id=? AND status IN ('created','running')",
+                        (failure_kind, str(path) if path is not None else None,
+                         runner_call_id)).rowcount
+                    if changed != 1:
+                        raise ExecutionRecoveryError(
+                            f"runner_call {runner_call_id} unstarted 收口竞态")
+                    terminal_status = "aborted"
+                else:
+                    self.cost_ledger.fail_existing_unaccounted_call(
+                        conn, runner_call_id=runner_call_id,
+                        failure_kind=failure_kind,
+                        terminal_status=terminal_status,
+                        cause=RuntimeError(
+                            f"startup reconcile: receipt={path} outcome="
+                            f"{receipt.get('outcome') if receipt else 'missing'}"))
+                    if path is not None:
+                        conn.execute(
+                            "UPDATE runner_call SET transcript_ref=? WHERE id=?",
+                            (str(path), runner_call_id))
+                self._record_decision(
+                    conn, protocol=_RUNNER_PROTOCOL, owner_kind="runner_call",
+                    owner_id=runner_call_id, cycle_id=row[0], receipt_path=path,
+                    receipt=receipt, terminal_status=terminal_status,
+                    failure_kind=failure_kind,
+                    recovery_action=("accounted_provider_invocation"
+                                     if invocation is not None else "terminalized"),
+                    provider_invocation=invocation)
+            return True
+        except ValueError as error:
+            if invocation is None:
+                raise
+            # The receipt honestly says usage is unavailable/conflicting (or
+            # cannot be represented under the live billing policy).  Preserve
+            # that fact and take the existing durable fail-closed path.
+            with self.daemon.transaction() as conn:
+                current = conn.execute(
+                    "SELECT status FROM runner_call WHERE id=?", (runner_call_id,)).fetchone()
+                if current is None or current[0] not in _ACTIVE_RUNNER:
                     raise ExecutionRecoveryError(
-                        f"runner_call {runner_call_id} unstarted 收口竞态")
-                terminal_status = "aborted"
-            else:
+                        f"runner_call {runner_call_id} provider usage 失败后状态漂移")
                 self.cost_ledger.fail_existing_unaccounted_call(
                     conn, runner_call_id=runner_call_id,
-                    failure_kind=failure_kind,
-                    terminal_status=terminal_status,
-                    cause=RuntimeError(
-                        f"startup reconcile: receipt={path} outcome="
-                        f"{receipt.get('outcome') if receipt else 'missing'}"))
-                if path is not None:
-                    conn.execute(
-                        "UPDATE runner_call SET transcript_ref=? WHERE id=?",
-                        (str(path), runner_call_id))
-            self._record_decision(
-                conn, protocol=_RUNNER_PROTOCOL, owner_kind="runner_call",
-                owner_id=runner_call_id, cycle_id=row[0], receipt_path=path,
-                receipt=receipt, terminal_status=terminal_status,
-                failure_kind=failure_kind)
-        return True
+                    failure_kind="cost_accounting", cause=error,
+                    terminal_status="failed")
+                self._record_decision(
+                    conn, protocol=_RUNNER_PROTOCOL, owner_kind="runner_call",
+                    owner_id=runner_call_id, cycle_id=row[0], receipt_path=path,
+                    receipt=receipt, terminal_status="failed",
+                    failure_kind="cost_accounting",
+                    recovery_action="provider_usage_unaccounted",
+                    provider_invocation=invocation)
+            return True
 
     def _reconcile_owner(self, owner_kind: str, owner_id: int, row: dict,
                          receipt_entry) -> bool:
@@ -370,8 +450,47 @@ class ExecutionReconciler:
             raise ExecutionRecoveryError(
                 f"success {owner_kind} {owner_id} 无 drained exit(0) receipt")
 
+    def _validate_terminal_provider(self, invocation: ProviderInvocation) -> None:
+        """A terminal call with a provider receipt is either accounted once or visibly fail-closed."""
+        row = self.daemon.query_one(
+            "SELECT status,failure_kind FROM runner_call WHERE id=?",
+            (invocation.runner_call_id,))
+        if row is None or row[0] in _ACTIVE_RUNNER:
+            raise ExecutionRecoveryError(
+                f"runner_call {invocation.runner_call_id} 尚未终态，不能验证 provider accounting")
+        ledger_rows = self.daemon.query(
+            "SELECT tokens_input,tokens_output,tokens_total,wallclock_sec FROM ledger "
+            "WHERE runner_call_id=?", (invocation.runner_call_id,))
+        decisions = self.daemon.query(
+            "SELECT payload_json FROM decision WHERE actor='orchestrator' "
+            "AND type='provider_invocation_accounted' AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.runner_call_id')=? ORDER BY id",
+            (invocation.runner_call_id,))
+        if len(ledger_rows) == 1 and len(decisions) == 1:
+            payload = json.loads(decisions[0][0])
+            usage = invocation.usage
+            if (payload.get("provider_receipt_ref") != invocation.receipt_ref
+                    or payload.get("provider_receipt_sha256") != invocation.receipt_sha256
+                    or payload.get("local_invocation_id") != invocation.local_invocation_id
+                    or tuple(ledger_rows[0]) != (
+                        usage.tokens_input, usage.tokens_output, usage.tokens_total,
+                        usage.wallclock_sec)):
+                raise ExecutionRecoveryError(
+                    f"runner_call {invocation.runner_call_id} provider accounting 锚不一致")
+            return
+        if ledger_rows or decisions:
+            raise ExecutionRecoveryError(
+                f"runner_call {invocation.runner_call_id} provider accounting 非 exactly-once")
+        stopped = self.daemon.query_one(
+            "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' "
+            "AND json_extract(payload_json,'$.reason')='cost_accounting_failed' LIMIT 1")
+        if row[1] not in ("cost_accounting", "orphaned_query_intent") or stopped is None:
+            raise ExecutionRecoveryError(
+                f"runner_call {invocation.runner_call_id} 有 provider receipt 却既未入账也未 fail-closed")
+
     def reconcile_startup(self) -> int:
         owners = self._receipts()
+        provider_paths = self._provider_receipts()
         reconciled = 0
         seen = set()
         for (owner_kind, owner_id), entry in owners.items():
@@ -384,14 +503,45 @@ class ExecutionReconciler:
                 if not self._runner_context_matches(row, entry[1].get("context") or {}):
                     raise ExecutionRecoveryError(
                         f"runner_call {owner_id} receipt context 错配")
-                if row[3] in _ACTIVE_RUNNER:
-                    reconciled += int(self._reconcile_runner(owner_id, row, entry))
+                provider_path = provider_paths.get(owner_id)
+                context = entry[1].get("context") or {}
+                if (provider_path is None and row[3] in _ACTIVE_RUNNER
+                        and context.get("provider") == "codex-cli"
+                        and entry[1].get("capture_stdout_ref") is not None
+                        and entry[1].get("capture_error") is None):
+                    recovered_provider = reconstruct_provider_invocation_receipt(
+                        entry[0], expected_runner_call_id=owner_id,
+                        expected_cycle_id=(f"c{row[0]}" if row[0] is not None else ""),
+                        expected_phase=row[1], expected_purpose=row[2])
+                    provider_path = Path(recovered_provider.receipt_ref)
+                    provider_paths[owner_id] = provider_path
+                if row[1] in _SPECIALIZED_RUNNER_PHASES:
+                    # Deliberate ownership handoff, not a lost ``seen`` row:
+                    # Mediator._recover_orphans_once scans active
+                    # interaction_query intents directly from DB and atomically
+                    # adds its required interaction_reply; ImportSearchService
+                    # likewise scans/finalizes its own content receipt.  The
+                    # local ``seen`` set never crosses into either service.
+                    invocation = (self._load_provider(
+                        provider_path, owner_id, row, entry)
+                        if provider_path is not None else None)
+                    if row[3] not in _ACTIVE_RUNNER and invocation is not None:
+                        self._validate_terminal_provider(invocation)
+                elif row[3] in _ACTIVE_RUNNER:
+                    reconciled += int(self._reconcile_runner(
+                        owner_id, row, entry, provider_path))
                 elif row[3] == "success":
                     receipt = entry[1]
                     _require_terminal(f"runner_call {owner_id}", receipt)
                     if not (receipt.get("outcome") == "exit" and receipt.get("returncode") == 0):
                         raise ExecutionRecoveryError(
                             f"success runner_call {owner_id} 无 drained exit(0) receipt")
+                    if provider_path is not None:
+                        self._validate_terminal_provider(self._load_provider(
+                            provider_path, owner_id, row, entry))
+                elif provider_path is not None:
+                    self._validate_terminal_provider(self._load_provider(
+                        provider_path, owner_id, row, entry))
             else:
                 row = self._owner_row(owner_kind, owner_id)
                 if row is None:
@@ -410,6 +560,11 @@ class ExecutionReconciler:
                     self._validate_terminal_owner(owner_kind, owner_id, row, entry[1])
             seen.add((owner_kind, owner_id))
 
+        for runner_call_id, provider_path in provider_paths.items():
+            if ("runner_call", runner_call_id) not in seen:
+                raise ExecutionRecoveryError(
+                    f"{provider_path.name} 缺可枚举的 execution receipt owner")
+
         rows = self.daemon.query(
             "SELECT id,cycle_id,phase,purpose,status FROM runner_call "
             "WHERE status IN ('created','running') "
@@ -419,7 +574,8 @@ class ExecutionReconciler:
             if key in seen:
                 continue
             reconciled += int(self._reconcile_runner(
-                runner_call_id, (cycle_id, phase, purpose, status), None))
+                runner_call_id, (cycle_id, phase, purpose, status), None,
+                provider_paths.get(runner_call_id)))
 
         for owner_kind, sql in (
                 ("run", "SELECT id FROM run WHERE status='running' ORDER BY id"),

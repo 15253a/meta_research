@@ -1201,6 +1201,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         skill=(root / "prompts" / "skills" / "interaction_query" / "SKILL.md").read_text(
             encoding="utf-8"),
         work_root=str(work),
+        provider_receipt_dir=str(execution_supervisor.receipt_dir),
     )
     mediator = Mediator(
         daemon, str(work / "state" / "status_card.json"),

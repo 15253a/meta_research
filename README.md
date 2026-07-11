@@ -231,8 +231,13 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 - plan 的 `critical/budget_estimate` 已权威落库，critical 失败会确定性早退、非 critical 失败可继续后继；
   动态 `goal_amend` 的专用路由、不可变升版、reasoning/status 按 cycle goal version 隔离与 applicability
   恢复也已闭合。
-- 代码物化在编排器管理的 staging（净土物化 + sha256 哈希对账 + argv-only 禁 shell + 路径/env 围栏），
-  **但真 git worktree 隔离 + env lock 强校验属后续硬化步**。
+- 代码物化在编排器管理的 staging（净土物化 + sha256 哈希对账 + argv-only 禁 shell + 路径/env 围栏）。
+  manifest/import 执行不再“先按路径 hash、再让子进程重开根路径”：源码树固定已核账的根 dirfd，并在执行
+  前后逐 leaf 做 no-follow/hash 闭包复核；checkpoint、外部
+  artifact 与用户资产用同一个 `O_NOFOLLOW` fd 经 `/proc/self/fd` + `pass_fds` 消费，并在子进程后重验
+  inode/size/hash；checkpoint 登记期间也保持该 capability 与 durable path 绑定。**这仍不是不可变文件系统**：
+  同 UID 敌对写者仍可替换嵌套目录或在运行中反复改回 inode，真 git worktree/env lock 与 container/VM 隔离
+  仍属下一检查点。
 - 用户文件已有 DB 终态授权、ContextPack ref 白名单、hash/size 复验和稳定只读 fd；非 bundle 阶段只看
   有界 UTF-8 预览。**这不是机械 prompt-injection/恶意代码隔离**：当前 Codex 仍可使用只读工具，bundle
   代码仍由主机 harness 执行。CP11.4 容器/VM 隔离完成前，只能接纳操作者信任的文件或人工审过的文本摘要，
@@ -242,10 +247,17 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   `<work-root>/state/.console-capability`，再重启并用新 fragment 打开；它不替代 loopback/SSH tunnel 边界。
 - 严格 webhook 能让接收网关按 `(producer_id,event_key)` 去重；OneBot v11 标准 API 没有幂等写语义，所以“QQ 已发送但本地
   receipt 前 SIGKILL”可能显示重复消息。不能接受重复时必须用严格 webhook 包住 OneBot，而不是直连。
-- **成本护栏已转活，但不是供应商账单**：`ledger.money` 用 Codex CLI 回报的总 token 与本地
-  `price_per_1k_tokens` 折算，用于运行护栏和趋势观测。如果编排器在外部调用已完成、但用量落库前被
-  `SIGKILL`，启动对账会按 exact `runner_call` owner 收口已知失败，但 provider invocation ID 与供应商 usage/
-  billing receipt 尚未形成端到端 exactly-once 协议，不能据此宣称精确供应商账单。
+- **provider 调用与本地成本已可 exactly-once 对账，但仍不是供应商账单**：每个真实 Codex 调用先绑定
+  durable `runner_call`；guardian 将 JSON event/stdout 与 stderr 写入 0600 捕获文件，终态回执正常时锚定其
+  inode/size/sha256，捕获身份本身失败则显式 `capture_error` 并走未知用量停机。owner 正常返回时立即写
+  `provider-invocation-v1`（guardian operation ID、Codex
+  thread/session ID〔CLI 有回报时〕、prompt/model/effort、usage 与 execution hash）；若恰在 provider 返回后、
+  DB 落账前 `SIGKILL`，启动对账会从 guardian 捕获重建同一回执。ledger 与
+  `provider_invocation_accounted` 在一个事务写入，重复恢复只保留一份；token 缺失/两种来源冲突则沿原
+  `runner_call` fail-closed，不冒充 0。`ledger.money` 仍只是 CLI 可观测 token × 本地
+  `price_per_1k_tokens` 的 policy projection，用于护栏/趋势；receipt 明示无 external invoice，不能宣称与供应商
+  最终账单逐分一致。这里保证的是“每个实际 invocation 恰记一次”；若已入账后、阶段业务 phase-commit 前崩溃，
+  恢复可能以新的 runner_call 再调用一次，两次会分别留痕计账，并不虚构 provider 侧 exactly-once execution。
 - 已支持 build / exec/eval target；默认 `build_system()` 已装配同 owner fenced `ImportWorker`、独立 plan
   answerability reviewer 和 `dependency_wait` 恢复。plan 在类型门确认需引入新外部 baseline 家族且当轮无
   候选时，可产一次受 schema 限制的 `import_search_request.json`；受信 host GitHub REST connector
