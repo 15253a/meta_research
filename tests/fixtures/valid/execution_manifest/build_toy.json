@@ -7,7 +7,7 @@
     "plan_slice_hash": "0f2a1c9d8b7e6f5a4c3b2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a"
   },
   "protocol_ref": { "protocol_id": 1, "protocol_ver": 1 },
-  "env_hash": "toy-env",
+  "env_hash": "sha256:2b66eedc455152f3df9a601aa1a8b2b348de86f6d87f32100b7a72f4bb3bb03f",
   "config_json": { "lr": 0.1, "epochs": 3 },
   "code_files": ["train.py", "eval.py", "cfg.json"],
   "commands": {

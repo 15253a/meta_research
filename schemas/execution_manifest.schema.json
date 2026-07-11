@@ -30,7 +30,7 @@
         "protocol_ver": { "type": "integer", "minimum": 1 }
       }
     },
-    "env_hash": { "type": "string", "minLength": 1, "description": "环境指纹声明值（进 run/attempt.env_hash；canary 期为声明、后续硬化步接真 env lock）" },
+    "env_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "锚区给出的 pinned sandbox runtime identity；manifest.py 在生产执行前逐字交叉核，进 run/attempt.env_hash" },
     "config_json": {
       "type": "object",
       "description": "本目标代码实际使用的变体配置。一致性规则（manifest.py 执法）：plan 切片 claim.config_json 非空 ⇒ 须与之相等（计划切片是配置的决定者，bundle 只照办）"

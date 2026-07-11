@@ -102,7 +102,8 @@ def _ensure_exit_sidecar(directory: Path, log_name: str, exit_code: int) -> Path
 def recover_staged_result(*, staging_dir: str, log_name: str,
                           execution_supervisor: Optional[ExecutionSupervisor],
                           execution_kind: str,
-                          execution_context: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+                          execution_context: Mapping[str, Any],
+                          execution_sandbox=None) -> Optional[Dict[str, Any]]:
     """Promote an owner-orphaned complete ``.partial`` using its central receipt.
 
     The guardian has already fsynced output and proved the descendant tree
@@ -148,6 +149,12 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
             f"{owner_kind} {owner_id} 对应多个 guardian execution receipt")
     partial_exists = os.path.lexists(partial)
     if not matches:
+        if execution_sandbox is not None and execution_sandbox.recover_unstarted_session(
+                staging_dir=directory, log_name=log_name,
+                execution_context=expected,
+                execution_supervisor=execution_supervisor,
+                partial_path=partial):
+            return None
         if partial_exists:
             raise ExecutionRecoveryError(
                 f"{partial} 存在但无 exact guardian receipt；拒绝截断重跑")
@@ -158,6 +165,16 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
         raise ExecutionRecoveryError(
             f"{owner_kind} {owner_id} guardian receipt 未 terminal+drained")
     if receipt.get("outcome") != "exit":
+        if receipt.get("containment") == "docker-container-v1":
+            try:
+                from .execution_sandbox import finalize_sandbox_output
+                finalize_sandbox_output(
+                    staging_dir=directory, log_name=log_name,
+                    context=expected, execution_receipt=receipt,
+                    exit_code=125)
+            except BaseException as cleanup_error:
+                raise ExecutionRecoveryError(
+                    f"{owner_kind} {owner_id} non-exit sandbox session 清理失败") from cleanup_error
         raise ExecutionRecoveryError(
             f"{owner_kind} {owner_id} prior outcome={receipt.get('outcome')} 不可提升为完整 log")
     if not partial_exists:
@@ -176,6 +193,30 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
     exit_code = receipt.get("returncode")
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
         raise ExecutionRecoveryError("drained exit receipt 缺合法 returncode")
+    if receipt.get("containment") == "docker-container-v1":
+        from .execution_sandbox import (
+            discard_rejected_sandbox_output,
+            ExecutionSandboxError, SandboxOutputError,
+            finalize_sandbox_output,
+        )
+        try:
+            finalize_sandbox_output(
+                staging_dir=directory, log_name=log_name,
+                context=expected, execution_receipt=receipt,
+                exit_code=exit_code)
+        except ExecutionSandboxError as error:
+            try:
+                discard_rejected_sandbox_output(
+                    staging_dir=directory, log_name=log_name,
+                    context=expected, execution_receipt=receipt,
+                    reason=str(error))
+            except BaseException as cleanup_error:
+                note = getattr(error, "add_note", None)
+                if callable(note):
+                    note("sandbox rejected quarantine 清理失败: "
+                         f"{type(cleanup_error).__name__}: {cleanup_error}")
+            raise SandboxOutputError(
+                str(error), receipt=receipt, receipt_path=receipt_path) from error
     _ensure_exit_sidecar(directory, log_name, exit_code)
     atomic_write_receipt(directory / (log_name + ".process.json"), {
         "version": 1,
@@ -201,7 +242,8 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                pass_fds: Sequence[int] = (),
                execution_supervisor: Optional[ExecutionSupervisor] = None,
                execution_kind: str = "harness",
-               execution_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+               execution_context: Optional[Dict[str, Any]] = None,
+               sandbox_invocation=None) -> Dict[str, Any]:
     """跑真子进程，stdout+stderr 合流写 staging log（.partial → 原子改名）。返回
     {exit_code, log_path, log_sha256, log_bytes}。超时 → kill 并抛 subprocess.TimeoutExpired
     （.partial 留在 staging 供审计，不改名——半成品不冒充完整产物）。"""
@@ -230,9 +272,18 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                 result = supervisor.run(
                     cmd, stdin=None, stdout=fh, stderr=subprocess.STDOUT,
                     timeout_s=timeout_s, cwd=d,
-                    env={**os.environ, **(env or {})},
+                    # A sandbox wrapper is trusted host control code and gets
+                    # a deliberately minimal env; host credentials must never
+                    # be copied into its guardian spec or container.  Ordinary
+                    # trusted harness calls preserve the historical inherited
+                    # environment behavior.
+                    env=(dict(env or {}) if sandbox_invocation is not None
+                         else {**os.environ, **(env or {})}),
                     pass_fds=tuple(pass_fds), kind=execution_kind,
-                    operation_context=context)
+                    operation_context=context,
+                    external_container=(
+                        sandbox_invocation.external_container
+                        if sandbox_invocation is not None else None))
             except BaseException as error:
                 execution_error = error
             finally:
@@ -276,9 +327,49 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                 note("process pointer 写入失败: "
                      f"{type(pointer_error).__name__}: {pointer_error}")
     if execution_error is not None:
+        if (sandbox_invocation is not None and receipt is not None
+                and receipt.get("containment") == "docker-container-v1"):
+            try:
+                from .execution_sandbox import finalize_sandbox_output
+                finalize_sandbox_output(
+                    staging_dir=d, log_name=log_name, context=context,
+                    execution_receipt=receipt, exit_code=125)
+            except BaseException as sandbox_cleanup_error:
+                note = getattr(execution_error, "add_note", None)
+                if callable(note):
+                    note("sandbox quarantine 清理同时失败: "
+                         f"{type(sandbox_cleanup_error).__name__}: {sandbox_cleanup_error}")
+        if sandbox_invocation is not None:
+            sandbox_invocation.close()
         raise execution_error.with_traceback(execution_error.__traceback__)
     assert result is not None
     exit_code = result.returncode
+    if sandbox_invocation is not None:
+        try:
+            from .execution_sandbox import (
+                discard_rejected_sandbox_output,
+                ExecutionSandboxError, SandboxOutputError,
+                finalize_sandbox_output,
+            )
+            try:
+                finalize_sandbox_output(
+                    staging_dir=d, log_name=log_name, context=context,
+                    execution_receipt=result.receipt, exit_code=exit_code)
+            except ExecutionSandboxError as error:
+                try:
+                    discard_rejected_sandbox_output(
+                        staging_dir=d, log_name=log_name, context=context,
+                        execution_receipt=result.receipt, reason=str(error))
+                except BaseException as cleanup_error:
+                    note = getattr(error, "add_note", None)
+                    if callable(note):
+                        note("sandbox rejected quarantine 清理失败: "
+                             f"{type(cleanup_error).__name__}: {cleanup_error}")
+                raise SandboxOutputError(
+                    str(error), receipt=result.receipt,
+                    receipt_path=result.receipt_path) from error
+        finally:
+            sandbox_invocation.close()
     # exit 侧车**先于** final 改名（原子 tmp→replace）：final 存在 ⟹ 退出码可读——崩后续跑须复用同一
     # exit 判定（非 0 的 eval 也会产 final，恢复方不得把失败进程的完整输出当成功续注册，codex BLOCKER）
     _ensure_exit_sidecar(d, log_name, exit_code)

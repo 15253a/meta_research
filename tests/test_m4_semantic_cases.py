@@ -85,10 +85,14 @@ def test_case3_reuse_hit_zero_retrain(tmp_path):
     path, d, s = _run_full_attack(tmp_path)
     before = {t: d.query_one(f"SELECT count(*) FROM {t}")[0] for t in ("run", "evaluation", "evaluation_attempt")}
     mr_registered = d.query_one("SELECT id FROM metric_result WHERE scope='aggregate' ORDER BY id DESC LIMIT 1")[0]
-    vid = d.query_one("SELECT variant_id FROM evaluation WHERE source='factory'")[0]
+    vid, recorded_env_hash = d.query_one(
+        "SELECT ev.variant_id,ea.env_hash FROM evaluation ev "
+        "JOIN evaluation_attempt ea ON ea.evaluation_id=ev.id "
+        "WHERE ev.source='factory' AND ea.status='success'")
+    assert recorded_env_hash.startswith("sha256:")
     OP.register_parser_suspect_real(d.conn, d.conn, OBS)             # 真谓词（真执行数据上复用判定的前提）
     r = R.reuse_selector(d.conn, variant_id=vid, protocol_id=1, protocol_ver=1,
-                         env_hash="toy-env", required=[(1, 1)])
+                         env_hash=recorded_env_hash, required=[(1, 1)])
     assert r["hit"] is True                                          # 命中：同格子成功测量 + env 精确 + 非存疑
     assert r["results"][0]["value"] == 0.93
     assert r["results"][0]["metric_result_id"] == mr_registered      # 命中即**既有**测量（零执行引用历史，§4.1.5）

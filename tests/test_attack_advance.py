@@ -24,6 +24,7 @@ from orchestrator import attack_stages as AS
 from orchestrator.advancer import SqliteAdvancer
 from orchestrator.attack_stages import AttackStages
 from orchestrator.compiler_sqlite import SqliteCompiler
+from orchestrator.execution_sandbox import SandboxOutputError, sandbox_environment_hash
 from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import GateInvariantError, SqliteGate, open_gate_read_conn
 from orchestrator.ids import SQLITE_INT_MAX
@@ -43,6 +44,7 @@ from orchestrator.writedaemon import WriteDaemon
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
 OBS = POLICY["observation"]
+RUNTIME_ENV_HASH = sandbox_environment_hash(POLICY["execution"]["sandbox"])
 
 # 步⑧ CP8.2：命令由 bundle 产的 manifest 承载、跑物化的代码文件（cwd=run/eval staging；train.py 写 ckpt.bin、
 # eval.py 读 {ckpt} 打印 int 绑定 metric_value）。行为参数化以复用各恢复剧本（bad train/smoke、lying eval）。
@@ -114,7 +116,7 @@ def _bundle_provider(daemon, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_bo
             "target_ref": {"target_key": slice_["target_key"], "target_kind": slice_["target_kind"],
                            "seq": slice_["seq"], "plan_slice_hash": manifest_canon(slice_)},
             "protocol_ref": {"protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"]},
-            "env_hash": "toy-env", "config_json": cfg,
+            "env_hash": RUNTIME_ENV_HASH, "config_json": cfg,
             "code_files": ["train.py", "eval.py", "smoke.py"],
             "commands": {"smoke": {"argv": [sys.executable, "{src}/smoke.py"]},
                          "train": {"argv": [sys.executable, "{src}/train.py"]},
@@ -315,7 +317,7 @@ def test_eval_only_target_executes_existing_legal_checkpoint(tmp_path, monkeypat
                            "seq": slice_["seq"], "plan_slice_hash": manifest_canon(slice_)},
             "protocol_ref": {"protocol_id": slice_["protocol_id"],
                              "protocol_ver": slice_["protocol_ver"]},
-            "env_hash": "eval-only-env", "config_json": {},
+            "env_hash": RUNTIME_ENV_HASH, "config_json": {},
             "code_files": ["eval_existing.py"],
             "commands": {"eval": {"argv": [sys.executable, "{src}/eval_existing.py", "{ckpt}"]}},
         }
@@ -1704,6 +1706,47 @@ def test_bad_manifest_target_failed_not_wedge(tmp_path):
     assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == ("failed", "artifact_invalid")
     assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0          # 未注册
     assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
+    daemon.conn.close()
+
+
+def test_sandbox_output_reject_settles_exact_train_owner(tmp_path, monkeypatch):
+    """Drained container + unsafe quarantine is a durable artifact failure, not a running-run wedge."""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": []}}
+    original = MF.run_manifest_command
+    receipt_path = tmp_path / "execution-train-output-reject.json"
+
+    def reject_train_output(manifest, kind, **kwargs):
+        if kind != "train":
+            return original(manifest, kind, **kwargs)
+        raise SandboxOutputError(
+            "quarantine contains symlink",
+            receipt={
+                "state": "terminal", "outcome": "exit", "group_drained": True,
+                "containment": "docker-container-v1",
+                "sandbox": {"container_drained": True},
+                "context": dict(kwargs["execution_context"]),
+            },
+            receipt_path=receipt_path)
+
+    monkeypatch.setattr(MF, "run_manifest_command", reject_train_output)
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+
+    assert len(ids) == 1
+    assert daemon.query_one("SELECT status,failure_kind FROM run") == (
+        "failed", "data_invalid")
+    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == (
+        "failed", "artifact_invalid")
+    assert daemon.query_one(
+        "SELECT count(*) FROM run WHERE status='running'")[0] == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
     assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
     daemon.conn.close()
 

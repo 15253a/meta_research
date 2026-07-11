@@ -14,7 +14,8 @@ StopController + Console + make_advancer_precheck → StageProvider(CodexRunner)
 StageProvider 四阶段（idea/plan/bundle/reasoning）+ PlanReviewProvider（plan 独审）+
 JudgeProvider（bundle 双评审写库）+ AttackStages
 （消费冻结 schema + manifest 驱动真执行）+ ImportWorker（冻结候选 snapshot 解码、worker-cycle 恢复；
-默认 untrusted adapter 在 adversarial sandbox capability 落地前 fail closed，绝不在 host 裸跑）。
+默认 untrusted adapter 与全部生产 manifest 命令只经 exact-pinned Docker sandbox 执行；后端/镜像/隔离
+能力在打开 SQLite 前预检，缺失即 fail closed，绝不回退到 host 裸跑）。
 
 **双模式 A/B**（policy.session.dual_mode）：模式 A=一 turn 一阶段、模式 B=一 turn 跨多阶段。run_cycles
 的内循环按阶段推进（格间过 precheck + 发布卡片），对两模式都成立；A/B 的会话粒度实测定默认 = 运维执行
@@ -48,6 +49,7 @@ from .connector_ingest import ConnectorInboxIngest
 from .connectors import ConnectorConfigError, OutboundDelivery, load_connectors
 from .cost_ledger import CostLedger
 from .execution_reconcile import ExecutionReconciler
+from .execution_sandbox import DockerExecutionSandbox
 from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
 from .goalbrief import parse_goal_brief
@@ -1042,6 +1044,11 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     schemas.validator("policy").validate(policy)    # 启动前机械校验；不能只靠 tests 校验仓库默认文件
     _reject_nonfinite_policy_numbers(policy)         # JSON Schema/Python 边界：显式拒 NaN/±Inf
     CostLedger.validate_policy(policy)               # 成本边界（float 溢出/布尔值等）也在创建 work/DB 前验完
+    if set(policy["execution"]["path_allowlist"]) != set(
+            policy["execution"]["sandbox"]["readonly_mounts"]):
+        raise ValueError(
+            "policy.execution.path_allowlist 与 sandbox.readonly_mounts 须完全一致；"
+            "host 命令围栏允许的外部路径必须在容器内只读映射")
     _validate_outbound_config(policy, outbound_config)
     if not isinstance(enforce_instance_lease, bool):
         raise ValueError("enforce_instance_lease 须为 bool")
@@ -1110,6 +1117,16 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     # A prior running receipt without its guardian fence is an unsafe recovery,
     # so assembly fails closed before any new external capability can start.
     execution_supervisor.recover_previous_generation()
+    execution_sandbox = None
+    if attack is True:
+        execution_sandbox = DockerExecutionSandbox(
+            work_root=work, config=policy["execution"]["sandbox"],
+            owner_guard=owner_guard, system_root=root)
+        # Strong-execution prerequisites are startup capabilities, not a late
+        # scientific failure.  Prove the exact local image/daemon/seccomp
+        # before SQLite or any connector/provider side effect is exposed.
+        execution_sandbox.preflight()
+        execution_sandbox.recover_terminal_sessions(execution_supervisor)
 
     expected_work_fd = open_directory_path(work, label="system work_root")
     try:
@@ -1350,13 +1367,15 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                        "import_search": import_control},
             obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy,
             owner_guard=(owner_guard if instance_lease is not None else None),
-            execution_supervisor=execution_supervisor)
+            execution_supervisor=execution_supervisor,
+            execution_sandbox=execution_sandbox)
         import_worker = ImportWorker(
             state=state, pool_gate=pool_gate,
             providers={"fetch": FrozenCandidateFetcher(), "judge": judge},
             obs_policy=policy["observation"], work_root=str(work),
             owner_guard=(owner_guard if instance_lease is not None else None),
-            execution_supervisor=execution_supervisor)
+            execution_supervisor=execution_supervisor,
+            execution_sandbox=execution_sandbox)
 
     advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
                               status_publisher=publisher, precheck=precheck, stop_controller=stop,

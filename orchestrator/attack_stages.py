@@ -48,6 +48,7 @@ from . import subject_manifest as SM
 from .artifact_capability import (ArtifactCapabilityError, open_artifact,
                                   read_artifact_bytes)
 from .budgeting import compute_budget
+from .execution_sandbox import SandboxOutputError
 from .gate_exec import ExecGate
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
@@ -59,6 +60,44 @@ from .phase_commit import check_or_record
 from .process_supervisor import ExecutionSupervisor, atomic_write_receipt, read_receipt
 
 _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
+
+
+def settle_sandbox_output_failure(gate, daemon, build_target_id: int,
+                                  error: SandboxOutputError) -> None:
+    """Fail the exact durable owner named by a drained sandbox receipt.
+
+    Output quarantine rejection happens *after* the guardian has proved that the
+    container is gone, but before the harness can publish its log/artifacts.  It
+    is therefore an artifact failure, not an infrastructure exception that may
+    leave a run/attempt forever ``running``.  The receipt is the authority for
+    which one owner may be settled; scanning and failing every owner below a
+    target would be an unsafe overreach.
+
+    The transitions deliberately tolerate their own crash gaps (owner failed,
+    evaluation not yet failed, target not yet failed), while contradictory
+    terminal facts still fail loud.
+    """
+    receipt = error.receipt
+    context = receipt.get("context")
+    sandbox = receipt.get("sandbox")
+    if (receipt.get("state") != "terminal" or receipt.get("outcome") != "exit"
+            or receipt.get("group_drained") is not True
+            or receipt.get("containment") != "docker-container-v1"
+            or not isinstance(sandbox, dict)
+            or sandbox.get("container_drained") is not True
+            or not isinstance(context, dict)
+            or context.get("reconcile_protocol") != "execution-owner-v1"
+            or context.get("build_target_id") != build_target_id):
+        raise RuntimeError(
+            "sandbox output reject 缺 exact terminal+drained execution owner authority")
+    owner_kind = context.get("db_owner_kind")
+    owner_id = context.get("db_owner_id")
+    if isinstance(owner_id, bool) or not isinstance(owner_id, int) or owner_id <= 0:
+        raise RuntimeError("sandbox output reject receipt 的 db_owner_id 非法")
+
+    gate.gate_fail_sandbox_output(
+        build_target_id=build_target_id, owner_kind=owner_kind,
+        owner_id=owner_id, transcript_ref=str(error.receipt_path))
 
 
 class _PlanReject(Exception):
@@ -192,7 +231,8 @@ class AttackStages:
                  obs_policy: Dict[str, Any], work_root: str, schemas=None,
                  policy: Optional[Dict[str, Any]] = None,
                  owner_guard: Optional[Callable[[], None]] = None,
-                 execution_supervisor=None):
+                 execution_supervisor=None,
+                 execution_sandbox=None):
         """state=SQLiteStateStore；compiler=SqliteCompiler；pool_gate=PoolGate(含 ExecGate 全家)；
         close_gate=SqliteGate（parser_suspect 已接真）；providers 见模块注释；work_root=staging 根目录。
         schemas=SchemaSet（步⑧：manifest 校验执法在编排器侧，不只靠 StageProvider）；
@@ -215,6 +255,7 @@ class AttackStages:
         self._configured_owner_guard = owner_guard or (lambda: None)
         self.owner_guard = self._configured_owner_guard
         self.execution_supervisor = execution_supervisor
+        self.execution_sandbox = execution_sandbox
 
     def bind_owner_guard(self, owner_guard: Callable[[], None]) -> None:
         if not callable(owner_guard):
@@ -1175,13 +1216,18 @@ class AttackStages:
 
     def _drive_target(self, cyc, bt_id: int) -> None:
         """单目标推进（可重入）：按当前状态从断点续。执行命令由 manifest 承载（步⑧）。
-        **契约违规不楔死、损毁必楔**（codex 第2轮 BLOCKER 收窄）：只捕 _BundleReject（Codex 产物层业务拒：
+        **契约违规不楔死、损毁必楔**（codex 第2轮 BLOCKER 收窄）：捕 _BundleReject（Codex 产物层业务拒：
         非法 manifest = artifact_invalid / 测量包违约 = protocol_violation，见 _BundleReject 注）→ 目标
-        failed(failure_kind) + 落 pc、续下一目标。**GateReject 不在此捕**——状态机/库损毁类拒绝（start/
-        progress/finish/register_baseline）必须 fail loud，误终态化会把恢复/篡改问题永久掩埋。"""
+        failed(failure_kind) + 落 pc、续下一目标；另捕已 terminal+drained 且 exact owner 可核的
+        SandboxOutputError，将不安全 quarantine 结算为 artifact_invalid。**GateReject 不在此捕**——状态机/
+        库损毁类拒绝（start/progress/finish/register_baseline）必须 fail loud，误终态化会把恢复/篡改问题
+        永久掩埋。"""
         st = lambda: self.state.daemon.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0]
         try:
             self._drive_target_inner(cyc, bt_id)
+        except SandboxOutputError as error:
+            settle_sandbox_output_failure(self.gate, self.state.daemon, bt_id, error)
+            self._ensure_target_pc(cyc, bt_id)
         except _BundleReject as e:
             if st() not in _TERMINAL_TARGET:      # 产物层业务拒 → 目标 failed（携 failure_kind）+ pc
                 self.gate.gate_finish_build_target(build_target_id=bt_id, status="failed",
@@ -1239,7 +1285,8 @@ class AttackStages:
                 sm = H.recover_staged_result(
                     staging_dir=str(smoke_dir), log_name=smoke_name,
                     execution_supervisor=self.execution_supervisor,
-                    execution_kind="manifest-smoke", execution_context=smoke_context)
+                    execution_kind="manifest-smoke", execution_context=smoke_context,
+                    execution_sandbox=self.execution_sandbox)
                 if sm is None:
                     self.owner_guard()             # external spawn 的最后一道 owner fence
                     sm = MF.run_manifest_command(
@@ -1249,7 +1296,8 @@ class AttackStages:
                         allowed_asset_refs=allowed_asset_refs,
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
-                        execution_context=smoke_context)
+                        execution_context=smoke_context,
+                        execution_sandbox=self.execution_sandbox)
             if sm["exit_code"] != 0:              # smoke 失败 → target 失败连坐（codex SHOULD：exit code 不得忽略）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._ensure_target_pc(cyc, bt_id)   # 终态早退**也**落 pc（codex 第2轮 BLOCKER：漏落致杀/不杀分裂）
@@ -1404,7 +1452,8 @@ class AttackStages:
                 ev = H.recover_staged_result(
                     staging_dir=str(eval_dir), log_name="eval.log",
                     execution_supervisor=self.execution_supervisor,
-                    execution_kind="manifest-eval", execution_context=eval_context)
+                    execution_kind="manifest-eval", execution_context=eval_context,
+                    execution_sandbox=self.execution_sandbox)
                 if ev is None:
                     self.owner_guard()
                     ev = MF.run_manifest_command(
@@ -1416,7 +1465,8 @@ class AttackStages:
                         allowed_asset_refs=allowed_asset_refs,
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
-                        execution_context=eval_context)
+                        execution_context=eval_context,
+                        execution_sandbox=self.execution_sandbox)
                 eval_log = read_artifact_bytes(
                     ev["log_path"], expected_hash=ev["log_sha256"],
                     expected_size=ev["log_bytes"], label="eval log receipt")
@@ -1525,7 +1575,8 @@ class AttackStages:
                 train_result = H.recover_staged_result(
                     staging_dir=str(train_dir), log_name="train.log",
                     execution_supervisor=self.execution_supervisor,
-                    execution_kind="manifest-train", execution_context=train_context)
+                    execution_kind="manifest-train", execution_context=train_context,
+                    execution_sandbox=self.execution_sandbox)
             if train_result is None:
                 # 没有 receipt/partial = gate_start_run 后、外部调用前死亡；确证未启动，
                 # 冻结旧 intent 为 aborted 后用新 run id 重试。
@@ -1550,7 +1601,8 @@ class AttackStages:
                 allowed_asset_refs=allowed_asset_refs,
                 expected_asset_identities=asset_identities,
                 execution_supervisor=self.execution_supervisor,
-                execution_context=train_context)
+                execution_context=train_context,
+                execution_sandbox=self.execution_sandbox)
 
         if d.query_one("SELECT status FROM run WHERE id=?", (rid,))[0] != "success":
             if train_result is None:
@@ -1666,7 +1718,8 @@ class AttackStages:
                 ev = H.recover_staged_result(
                     staging_dir=str(eval_dir), log_name="eval.log",
                     execution_supervisor=self.execution_supervisor,
-                    execution_kind="manifest-eval", execution_context=eval_context)
+                    execution_kind="manifest-eval", execution_context=eval_context,
+                    execution_sandbox=self.execution_sandbox)
                 if ev is None:
                     self.owner_guard()
                     checkpoint_identity = d.query_one(
@@ -1684,7 +1737,8 @@ class AttackStages:
                         allowed_asset_refs=allowed_asset_refs,
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
-                        execution_context=eval_context)
+                        execution_context=eval_context,
+                        execution_sandbox=self.execution_sandbox)
                 eval_log = read_artifact_bytes(
                     ev["log_path"], expected_hash=ev["log_sha256"],
                     expected_size=ev["log_bytes"], label="eval log receipt")

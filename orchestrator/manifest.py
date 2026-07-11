@@ -942,21 +942,47 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
                          allowed_asset_refs: Optional[Collection[str]] = None,
                          expected_asset_identities: Optional[Mapping[str, AssetIdentity]] = None,
                          execution_supervisor=None,
-                         execution_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                         execution_context: Optional[Dict[str, Any]] = None,
+                         execution_sandbox=None) -> Dict[str, Any]:
     """解析+围栏后委托 harness.run_staged（cwd=staging_dir、.partial→原子改名、.exit 侧车——纪律全继承）。
     返回 run_staged 结果 {exit_code, log_path, log_sha256, log_bytes}；log 入账仍归调用方。"""
+    if (execution_sandbox is not None
+            and manifest.get("env_hash") != execution_sandbox.environment_hash):
+        raise ManifestError(
+            "manifest.env_hash 与 policy pinned sandbox runtime identity 不一致")
     rc = resolve_command(manifest, kind, src_dir=src_dir, work_root=work_root, policy=policy,
                          ckpt_path=ckpt_path, ckpt_content_hash=ckpt_content_hash,
                          expected_source_hashes=expected_source_hashes,
                          allowed_asset_refs=allowed_asset_refs,
                          expected_asset_identities=expected_asset_identities)
+    sandbox_invocation = None
     try:
+        run_argv = rc.argv
+        run_env = rc.env or None
+        run_pass_fds = rc.pass_fds
+        if execution_sandbox is not None:
+            sandbox_context = dict(execution_context or {})
+            if ("log_name" in sandbox_context
+                    and sandbox_context["log_name"] != log_name):
+                raise ManifestError("execution_context.log_name 与 manifest log_name 冲突")
+            sandbox_context["log_name"] = log_name
+            sandbox_invocation = execution_sandbox.prepare(
+                rc.argv, staging_dir=staging_dir, log_name=log_name,
+                env=rc.env or None, timeout_s=rc.timeout_s,
+                fd_expectations=rc.fd_expectations,
+                tree_expectations=rc.tree_expectations,
+                execution_context=sandbox_context,
+                execution_supervisor=execution_supervisor)
+            run_argv = sandbox_invocation.argv
+            run_env = sandbox_invocation.env
+            run_pass_fds = sandbox_invocation.pass_fds
         result = H.run_staged(
-            rc.argv, staging_dir=staging_dir, log_name=log_name,
-            timeout_s=rc.timeout_s, env=rc.env or None, pass_fds=rc.pass_fds,
+            run_argv, staging_dir=staging_dir, log_name=log_name,
+            timeout_s=rc.timeout_s, env=run_env, pass_fds=run_pass_fds,
             execution_supervisor=execution_supervisor,
             execution_kind=f"manifest-{kind}",
-            execution_context=execution_context)
+            execution_context=execution_context,
+            sandbox_invocation=sandbox_invocation)
         try:
             for fd, content_hash, size, device, inode in rc.fd_expectations:
                 verify_open_fd(
@@ -970,6 +996,11 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
             raise ManifestError(str(error)) from error
         return result
     finally:
+        if sandbox_invocation is not None:
+            # run_staged closes it on every ordinary execution path; this
+            # idempotent close also covers validation/pointer failures that
+            # occur before run_staged reaches its lifecycle cleanup block.
+            sandbox_invocation.close()
         for fd in set(rc.pass_fds):
             try:
                 os.close(fd)

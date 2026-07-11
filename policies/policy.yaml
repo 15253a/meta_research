@@ -93,6 +93,31 @@ execution:
   default_timeout_s: 600              # manifest 命令未声明 timeout_s 时的默认
   max_timeout_s: 86400                # 声明值上限截断（真训练需长时；与 flow.watchdog.full_h=24h 对齐）
   path_allowlist: []                  # argv 允许出现的 work_root 以外绝对路径前缀（如真数据根）；默认空 = 只许 work_root 内
+  sandbox:                            # adversarial bundle/import 唯一生产执行后端；镜像须已在本地，绝不隐式 pull
+    backend: docker
+    engine_path: /usr/bin/docker
+    engine_host: unix:///var/run/docker.sock
+    resource_mode: rlimit-fallback    # 必须与 daemon preflight 实测一致；换 cgroup 节点须显式改 policy/env_hash
+    seccomp_profile: policies/seccomp/moby-default-v0.2.1.json
+    seccomp_sha256: sha256:ea7ba4298390d31a9d52354cf4319e4fe6cbd717ff6b47f23a496ca169727c76
+    seccomp_bpf: policies/seccomp/moby-default-v0.2.1-linux-5.4-amd64.bpf.b64
+    seccomp_bpf_sha256: sha256:4fb43ea7bb76d9462eb73270fb52e473fb4423bfe09040bfa16c255a7eb133f2
+    seccomp_bpf_arch: amd64
+    image: docker.io/library/python@sha256:f5cf0344c9886ff24d34797578d5d7dd6e8911ae0fe5962bb55d0f89603ec361
+    image_id: sha256:eeeca161459e242a142661623fed2320f84e810603a42ffc4a5cdbc8694b3bb3
+    python_path: /usr/local/bin/python3
+    memory_mb: 16384                  # cgroup 可用时为 aggregate；否则 launcher 的每进程 RLIMIT_AS（receipt 明示 fallback）
+    pids: 64                          # cgroup pids.max + 非 root payload RLIMIT_NPROC 双层请求
+    nofile: 1024
+    max_log_mb: 64                    # Docker json-file 两段总上限；一旦轮转即将该执行判失败，防截断证据被接纳
+    max_file_mb: 8192                 # RLIMIT_FSIZE（单文件）
+    max_output_mb: 32768              # quarantine 后验总量；部署仍须给 work-root/VEPFS 做硬 quota
+    max_output_files: 100000
+    cpus: 4
+    tmpfs_mb: 1024
+    shm_mb: 64                         # 显式固定易失 /dev/shm；按项目数据加载需求随 env_hash 调整
+    input_max_mb: 65536               # fd/tree 可信快照总量；更大数据须走下方显式只读 mount
+    readonly_mounts: []               # 与 path_allowlist 配对的部署数据根；只读 bind，不暴露 work-root
 
 # —— resources（启动输入③：只放硬件事实，§4.6.7；时限唯一归 flow.watchdog）——
 resources: { gpus: 4, gpu_mem_gb: 80, disk_quota_gb: 500 }
