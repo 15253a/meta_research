@@ -25,8 +25,9 @@
   CP11.4b fd-safe artifact capability、guardian capture 与 provider invocation 精确补账已落 `e236487`；
   CP11.4c.1 exact-pinned Docker 敌对执行边界、launcher rlimit+seccomp BPF、guardian container drain 与
   quarantine 晋升/恢复已落 `a05584d`；CP11.4c.2a exact GitHub repository snapshot、内容寻址发布与 file-backed
-  sandbox import bridge 已落 `50ba41f`。当前进入 CP11.4c.2b adapter/LFS/dependency/deployment contract，随后仍须
-  CP11.4c.3 跨节点 VEPFS 与真实 100+ 轮故障注入验收。
+  sandbox import bridge 已落 `50ba41f`；CP11.4c.2b.1 materializer component boundaries 已落 `4e28698`。
+  当前进入 CP11.4c.2b.2 adapter/LFS/dependency image，随后是 2b.3 deployment contract 与 CP11.4c.3 跨节点
+  VEPFS/真实 100+ 轮故障注入验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -435,9 +436,10 @@
         - [ ] CP11.4c.2b 缺失 adapter 的受审生成、LFS OID/项目依赖 lock 验证与专用 image，
           并把 service account/VM、Docker socket、cgroup/device/GPU、hard byte+inode quota 落成 fail-closed
           部署合同/预检；未具备的能力只列验收，不伪造通过。
-          - [ ] CP11.4c.2b.1 repository materializer component boundaries：把单体物化器按 shared identity、
+          - [x] CP11.4c.2b.1 repository materializer component boundaries：把单体物化器按 shared identity、
             transport、Git tree、archive/submodule、adapter、content store 拆成可独立演进的组件，保持 snapshot
-            protocol/hash/cache layout 与 facade compatibility 不变。
+            protocol/hash/cache layout 与 facade compatibility 不变。→ commit `4e28698`（build_log 0066；相关
+            16/43；AST/compat 等价；外审第 2 轮 APPROVE；唯一全量 1382）。
           - [ ] CP11.4c.2b.2 repository closure：缺失 adapter 的有界生成/评审、Git LFS batch OID+size 下载核验、
             dependency lock 到专用 exact image 的可复现构建与启动验收。
           - [ ] CP11.4c.2b.3 deployment trust contract：service account/VM、Docker socket、cgroup/device/GPU、

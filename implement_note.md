@@ -1,35 +1,32 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4c.2b adapter/LFS/dependency/deployment contract
-- 检查点状态：CP11.4c.2a 功能已提交 `50ba41f4dadd45183bf201edda0f800c972dac00`；最终全量
-  `1381 passed`；build_log 0065 已记账；CP11.4c.2 父项仍未达成
+- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4c.2b.2 adapter/LFS/dependency image closure
+- 检查点状态：CP11.4c.2b.1 功能已提交 `4e2869822123b002ced3443dfe4cc1f898e14a11`；唯一全量
+  `1382 passed`，build_log 0066 已记账；CP11.4c.2 父项仍未达成
 
 ## 刚完成什么
 
-CP11.4c.2a 已把默认 GitHub discovery 的 40-hex commit 接到真实 production materializer：non-recursive Git tree
-对象重算 SHA-1，commit archive 逐文件核 path/type/size/mode/blob SHA，根仓库/固定子模块的 license evidence 与
-同 commit 文件 ledger 对账；symlink、LFS pointer、歧义 `.gitmodules` 与未验证依赖 fail-closed。verified tree/spec/
-transport/receipt 以 SHA-256 内容寻址发布，本地 cache 损坏不会永久归罪候选，gzip transport 漂移不改变源身份。
-
-仓库自带 adapter v2 现在可经 file-backed clone → pinned Docker smoke → 有界独立代码评审 → 延迟稳定 protocol/metric
-注册 → named factory eval → result review → pool。compute/readout 与 metric family/version 不可漂移，ID 保持 JSON safe；
-大仓库 judge prompt 有 path/content 总预算并优先 adapter/入口，未展示 bytes 不冒充已语义评审。旧 embedded v1 可恢复。
+CP11.4c.2b.1 已把 CP11.4c.2a 的单体物化器拆成 common identity primitives、HTTPS transport、exact Git tree、
+archive/submodule/license、adapter compiler、content-addressed store 六个职责组件；`repository_materializer.py` 只保留兼容
+facade、配置/搜索快照校验、单次物化编排与 production/legacy 路由。snapshot protocol/hash/cache layout、错误类型与原模块
+36 个可见符号保持不变，后续 LFS/dependency/adapter generator 有明确落点，不再继续膨胀 facade。
 
 ## 验证 / Review
 
-- 相关验证：核心契约 `170 passed`；sandbox/gate/run/manifest 集成 `156 passed`；外审修复 `41 passed`；compile 与
-  `git diff --check` 通过。
-- 按用户要求，冻结前只跑相关验证；冻结后唯一一次全量固定 VEPFS `TMPDIR/basetemp`：
-  `1381 passed in 1024.62s (0:17:04)`。
-- 外审第 1 轮独立账号 401、无 verdict；第 2 轮 `REQUEST_CHANGES`。并发 object publication 与 worker 空 metric
-  语义两个成立 SHOULD 已修；metric drift BLOCKER 原 Gate 已覆盖，仍加 worker 前置核；candidate 字段和
-  `attack=False` 为大 diff 漏读误报，新增生产 bridge 回归/构造 fail-fast。两轮上限后未发第 3 轮。
+- 相关验证：materializer/boundary `16 passed`；repository/import/run 装配 `43 passed in 50.41s`；compile/diff check 通过。
+- 机械等价：拆分前后 AST `24 methods + 15 helpers`、`14 constants + 6 exact classes` 一致；compat exports
+  `36, missing=[]`。
+- 按用户要求，冻结前只跑相关验证；外审后唯一一次全量固定 VEPFS `TMPDIR/basetemp`：
+  `1382 passed in 1038.17s (0:17:18)`。
+- 外审第 1 轮独立账号 401、无 verdict；第 2 轮 `APPROVE`，无 BLOCKER。精确固定 mixin 顺序的 SHOULD 成立，改成
+  组件属于 MRO/方法归属/facade 不重复实现；私有组件 NIT 不采纳，避免把内部实现扩成 public API。两轮上限后未发第 3 轮。
 - 尚未 push。
 
 ## 当前关键边界
 
+- materializer 组件边界现已落库；后续 source closure 改动须进入对应 transport/archive/adapter/store 组件，facade 只编排。
 - 当前只消费仓库自带 `.meta-research/import-adapter.json` v2；普通仓库缺 adapter 会被拒，不能声称任意 SOTA repo
-  自动复现。materializer 目前 1800+ 行，CP11.4c.2b 扩展前应按 transport/tree/archive/adapter/cache 边界拆分。
+  自动复现。
 - LFS OID 下载、项目 lock 构建/验证、项目专用 image 尚未实现；当前只允许 pinned bootstrap image 自带依赖。
 - rootless daemon 仍是 `rlimit-fallback`；同 host root/orchestrator UID 与 Docker socket 属信任域。service account/VM、
   cgroup/device/GPU、VEPFS hard byte+inode quota 必须成为启动 fail-closed 部署合同。
@@ -39,8 +36,8 @@ transport/receipt 以 SHA-256 内容寻址发布，本地 cache 损坏不会永�
 
 ## 下一步动作
 
-1. CP11.4c.2b 先拆分 `repository_materializer.py` 的 transport/tree/archive/adapter/cache 组件，保持 0065 回归不变。
-2. 实现缺 adapter 的受审生成、Git LFS batch OID+size 核验、项目 lock→专用 image 的可复现构建/验收。
-3. 把 service account/VM、Docker socket、cgroup v2/device/GPU 与 VEPFS byte+inode quota 写成可启动 fail-closed
+1. CP11.4c.2b.2 先冻结 adapter-generation/LFS/dependency-image receipt/schema 与失败分类，再按组件逐段实现和相关验证。
+2. 实现缺 adapter 的有界受审生成、Git LFS batch OID+size 核验、项目 lock→专用 exact image 的可复现构建/验收。
+3. CP11.4c.2b.3 把 service account/VM、Docker socket、cgroup v2/device/GPU 与 VEPFS byte+inode quota 写成可启动 fail-closed
    deployment contract；当前节点缺能力时只给明确阻断证据，不伪造通过。
 4. CP11.4c.3 准备两节点 owner canary 与 100+ 轮真实 workload/owner-kill/daemon-loss/资源失败 soak 证据包。
