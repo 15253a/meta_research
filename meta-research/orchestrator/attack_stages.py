@@ -39,7 +39,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from . import harness as H
 from . import manifest as MF
@@ -48,7 +48,7 @@ from . import subject_manifest as SM
 from .artifact_capability import (ArtifactCapabilityError, open_artifact,
                                   read_artifact_bytes)
 from .budgeting import compute_budget
-from .execution_sandbox import SandboxOutputError
+from .execution_sandbox import SandboxOutputError, sandbox_environment_hash
 from .gate_exec import ExecGate
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
@@ -232,7 +232,8 @@ class AttackStages:
                  policy: Optional[Dict[str, Any]] = None,
                  owner_guard: Optional[Callable[[], None]] = None,
                  execution_supervisor=None,
-                 execution_sandbox=None):
+                 execution_sandbox=None,
+                 execution_sandbox_resolver=None):
         """state=SQLiteStateStore；compiler=SqliteCompiler；pool_gate=PoolGate(含 ExecGate 全家)；
         close_gate=SqliteGate（parser_suspect 已接真）；providers 见模块注释；work_root=staging 根目录。
         schemas=SchemaSet（步⑧：manifest 校验执法在编排器侧，不只靠 StageProvider）；
@@ -256,6 +257,48 @@ class AttackStages:
         self.owner_guard = self._configured_owner_guard
         self.execution_supervisor = execution_supervisor
         self.execution_sandbox = execution_sandbox
+        self.execution_sandbox_resolver = execution_sandbox_resolver
+
+    def _target_environment_hash(self, build_target_id: int) -> str:
+        row = self.state.daemon.query_one(
+            "SELECT baseline_id FROM build_target WHERE id=?", (build_target_id,))
+        if row is None:
+            raise RuntimeError(f"build_target {build_target_id} 不存在")
+        imported = self.state.daemon.query(
+            "SELECT DISTINCT r.env_hash FROM variant v "
+            "JOIN checkpoint c ON c.variant_id=v.id "
+            "JOIN run r ON r.id=c.produced_by_run "
+            "WHERE v.baseline_id=? AND c.origin='external_import' "
+            "AND r.status='success' ORDER BY r.env_hash", (row[0],))
+        if len(imported) > 1:
+            raise RuntimeError(
+                f"baseline {row[0]} 绑定多个 external-import execution environment")
+        if imported:
+            value = imported[0][0]
+            if (not isinstance(value, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None):
+                raise RuntimeError(f"baseline {row[0]} imported env_hash 非法")
+            return value
+        if self.execution_sandbox is None:
+            return sandbox_environment_hash(self.policy["execution"]["sandbox"])
+        return self.execution_sandbox.environment_hash
+
+    def _execution_sandbox_for(self, manifest: Mapping[str, Any], build_target_id: int):
+        expected = self._target_environment_hash(build_target_id)
+        if manifest.get("env_hash") != expected:
+            raise _BundleReject(
+                "manifest.env_hash 未继承 build_target baseline 的可信 runtime identity",
+                failure_kind="artifact_invalid")
+        if self.execution_sandbox is None or expected == self.execution_sandbox.environment_hash:
+            return self.execution_sandbox
+        if self.execution_sandbox_resolver is None:
+            raise RuntimeError(
+                "imported baseline 要求 dependency image，但系统未配置可信 resolver")
+        resolved = self.execution_sandbox_resolver.resolve_environment_hash(expected)
+        if getattr(resolved, "environment_hash", None) != expected:
+            raise RuntimeError(
+                "dependency image resolver 返回了不同的 runtime identity")
+        return resolved
 
     def bind_owner_guard(self, owner_guard: Callable[[], None]) -> None:
         if not callable(owner_guard):
@@ -1246,13 +1289,15 @@ class AttackStages:
         src_dir = staging / "src"                 # 代码物化目录（每目标唯一；净土物化，与 run/eval 产物分离）
         manifest, ledger, allowed_asset_refs, asset_identities = self._obtain_manifest(
             cyc, bt_id, slice_, src_dir)
+        execution_sandbox = self._execution_sandbox_for(manifest, bt_id)
         if st() == "pending":
             g.gate_start_build_target(build_target_id=bt_id)
         if slice_["target_kind"] == "eval":
             if st() == "running":
                 self._run_eval_target(
                     cyc, bt_id, slice_, manifest, ledger, staging, src_dir,
-                    allowed_asset_refs, asset_identities)
+                    allowed_asset_refs, asset_identities,
+                    execution_sandbox=execution_sandbox)
             self._ensure_target_pc(cyc, bt_id)
             return
         if st() == "building":                    # 真 smoke（manifest.commands.smoke 子进程）→ 过了才进 smoke 态
@@ -1286,7 +1331,7 @@ class AttackStages:
                     staging_dir=str(smoke_dir), log_name=smoke_name,
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="manifest-smoke", execution_context=smoke_context,
-                    execution_sandbox=self.execution_sandbox)
+                    execution_sandbox=execution_sandbox)
                 if sm is None:
                     self.owner_guard()             # external spawn 的最后一道 owner fence
                     sm = MF.run_manifest_command(
@@ -1297,7 +1342,7 @@ class AttackStages:
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
                         execution_context=smoke_context,
-                        execution_sandbox=self.execution_sandbox)
+                        execution_sandbox=execution_sandbox)
             if sm["exit_code"] != 0:              # smoke 失败 → target 失败连坐（codex SHOULD：exit code 不得忽略）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="smoke")
                 self._ensure_target_pc(cyc, bt_id)   # 终态早退**也**落 pc（codex 第2轮 BLOCKER：漏落致杀/不杀分裂）
@@ -1316,12 +1361,14 @@ class AttackStages:
             g.gate_progress_build_target(build_target_id=bt_id, to="running", current_subject_hash=code_sh)
         if st() == "running":
             self._run_and_register(cyc, bt_id, slice_, manifest, ledger, staging, src_dir,
-                                   allowed_asset_refs, asset_identities)
+                                   allowed_asset_refs, asset_identities,
+                                   execution_sandbox=execution_sandbox)
         self._ensure_target_pc(cyc, bt_id)
 
     def _run_eval_target(self, cyc, bt_id: int, slice_, manifest, ledger,
                          staging: Path, src_dir: Path,
-                         allowed_asset_refs, asset_identities) -> None:
+                         allowed_asset_refs, asset_identities, *,
+                         execution_sandbox=None) -> None:
         """Execute a plan ``target_kind=eval`` against one existing legal checkpoint.
 
         The target owns no training run and never mutates pool identity.  It
@@ -1453,7 +1500,7 @@ class AttackStages:
                     staging_dir=str(eval_dir), log_name="eval.log",
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="manifest-eval", execution_context=eval_context,
-                    execution_sandbox=self.execution_sandbox)
+                    execution_sandbox=execution_sandbox)
                 if ev is None:
                     self.owner_guard()
                     ev = MF.run_manifest_command(
@@ -1466,7 +1513,7 @@ class AttackStages:
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
                         execution_context=eval_context,
-                        execution_sandbox=self.execution_sandbox)
+                        execution_sandbox=execution_sandbox)
                 eval_log = read_artifact_bytes(
                     ev["log_path"], expected_hash=ev["log_sha256"],
                     expected_size=ev["log_bytes"], label="eval log receipt")
@@ -1522,7 +1569,8 @@ class AttackStages:
         g.gate_finish_build_target(build_target_id=bt_id, status="complete")
 
     def _run_and_register(self, cyc, bt_id: int, slice_, manifest, ledger, staging: Path, src_dir: Path,
-                          allowed_asset_refs, asset_identities) -> None:
+                          allowed_asset_refs, asset_identities, *,
+                          execution_sandbox=None) -> None:
         """phase (i) 执行事实 + phase (ii) 注册段（结构可恢复的短事务序列）。命令由 manifest 驱动（步⑧）。
         ⚠️ 与 import_worker._run_and_register_import **同构**（恢复缝隙修复须双向同步；共享骨架=M6 硬化）。"""
         g, d = self.gate, self.state.daemon
@@ -1576,7 +1624,7 @@ class AttackStages:
                     staging_dir=str(train_dir), log_name="train.log",
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="manifest-train", execution_context=train_context,
-                    execution_sandbox=self.execution_sandbox)
+                    execution_sandbox=execution_sandbox)
             if train_result is None:
                 # 没有 receipt/partial = gate_start_run 后、外部调用前死亡；确证未启动，
                 # 冻结旧 intent 为 aborted 后用新 run id 重试。
@@ -1602,7 +1650,7 @@ class AttackStages:
                 expected_asset_identities=asset_identities,
                 execution_supervisor=self.execution_supervisor,
                 execution_context=train_context,
-                execution_sandbox=self.execution_sandbox)
+                execution_sandbox=execution_sandbox)
 
         if d.query_one("SELECT status FROM run WHERE id=?", (rid,))[0] != "success":
             if train_result is None:
@@ -1719,7 +1767,7 @@ class AttackStages:
                     staging_dir=str(eval_dir), log_name="eval.log",
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="manifest-eval", execution_context=eval_context,
-                    execution_sandbox=self.execution_sandbox)
+                    execution_sandbox=execution_sandbox)
                 if ev is None:
                     self.owner_guard()
                     checkpoint_identity = d.query_one(
@@ -1738,7 +1786,7 @@ class AttackStages:
                         expected_asset_identities=asset_identities,
                         execution_supervisor=self.execution_supervisor,
                         execution_context=eval_context,
-                        execution_sandbox=self.execution_sandbox)
+                        execution_sandbox=execution_sandbox)
                 eval_log = read_artifact_bytes(
                     ev["log_path"], expected_hash=ev["log_sha256"],
                     expected_size=ev["log_bytes"], label="eval log receipt")

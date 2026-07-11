@@ -65,7 +65,8 @@ else:  # trusted isolated helper launched by the guardian
 
 _BACKEND = "docker-container-v1"
 _LABEL = "meta-research.sandbox-token"
-_IMAGE_RE = re.compile(r"^[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}$")
+_IMAGE_RE = re.compile(
+    r"(?:^[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}$|^sha256:[0-9a-f]{64}$)")
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -512,7 +513,7 @@ class DockerExecutionSandbox:
             "seccomp_bpf_sha256", "seccomp_bpf_arch", "image", "image_id",
             "python_path", "memory_mb", "pids", "nofile", "max_log_mb", "max_file_mb",
             "max_output_mb", "max_output_files", "cpus", "tmpfs_mb",
-            "shm_mb", "input_max_mb", "readonly_mounts",
+            "shm_mb", "input_max_mb", "readonly_mounts", "payload_environment",
         }
         if set(self.config) != required or self.config.get("backend") != "docker":
             raise ValueError("policy.execution.sandbox 字段闭包/backend 非法")
@@ -621,6 +622,15 @@ class DockerExecutionSandbox:
             if common in {raw, str(self.work_root)}:
                 raise ValueError(
                     "sandbox.readonly_mounts 不得是 work_root 的祖先、同目录或子树")
+        payload_environment = self.config["payload_environment"]
+        if (not isinstance(payload_environment, dict)
+                or len(payload_environment) > 32
+                or any(not isinstance(key, str) or not key or "=" in key
+                       or "\x00" in key or len(key.encode("utf-8")) > 256
+                       or not isinstance(value, str) or "\x00" in value
+                       or len(value.encode("utf-8")) > 65536
+                       for key, value in payload_environment.items())):
+            raise ValueError("sandbox.payload_environment 须为有界字符串映射")
 
     @property
     def resource_mode(self) -> str:
@@ -1115,6 +1125,14 @@ class DockerExecutionSandbox:
                 raise ExecutionSandboxError("sandbox env 须为字符串映射")
             if str(self.work_root) in value:
                 raise ExecutionSandboxError("sandbox env 不得暴露 host work_root path")
+            payload_env[key] = value
+        for key, value in self.config["payload_environment"].items():
+            if str(self.work_root) in value:
+                raise ExecutionSandboxError(
+                    "sandbox trusted payload_environment 不得暴露 host work_root path")
+            if key in payload_env and payload_env[key] != value:
+                raise ExecutionSandboxError(
+                    f"sandbox env 不得覆盖 trusted payload_environment: {key}")
             payload_env[key] = value
         readonly_mounts = []
         for index, raw in enumerate(self.config["readonly_mounts"]):

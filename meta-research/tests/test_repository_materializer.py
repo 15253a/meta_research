@@ -1,4 +1,4 @@
-"""CP11.4c.2a: exact GitHub repository materialization and adapter v2."""
+"""Exact GitHub repository materialization, LFS, and adapter v2/v3."""
 from __future__ import annotations
 
 import base64
@@ -37,9 +37,9 @@ POLICY = yaml.safe_load(
     (SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
 
 
-def _adapter(*, dependency_mode="pinned_image_only", dependency_locks=None):
+def _adapter(*, version=2, dependency_mode="pinned_image_only", dependency_locks=None):
     return {
-        "version": 2,
+        "version": version,
         "artifact_relpath": "artifact.bin",
         "artifact_type": "external_model",
         "smoke_argv": ["python", "{repo}/smoke.py"],
@@ -287,7 +287,7 @@ def _runtime_environment():
     }
 
 
-def _materializer(tmp_path, provider, *, config=None):
+def _materializer(tmp_path, provider, *, config=None, dependency_image_builder=None):
     work = tmp_path / "work"
     work.mkdir(parents=True)
     return GitHubRepositoryMaterializer(
@@ -296,10 +296,54 @@ def _materializer(tmp_path, provider, *, config=None):
         sandbox_config=POLICY["execution"]["sandbox"],
         auto_license=POLICY["import_search"]["auto_license"],
         runtime_environment=_runtime_environment(),
+        dependency_image_builder=dependency_image_builder,
         api_getter=provider.api_getter,
         archive_fetcher=provider.archive_fetcher,
         lfs_batch_getter=provider.lfs_batch_getter,
         lfs_object_fetcher=provider.lfs_object_fetcher), work
+
+
+class _FakeDependencyImageBuilder:
+    def __init__(self):
+        self.config = POLICY["import_materialization"]["dependency_image"]
+        self.compiler = POLICY["import_materialization"]["compiler"]
+        self.calls = []
+        self.result = {
+            "version": 1,
+            "provider": "python-wheel-image-v1",
+            "closure_hash": "sha256:" + "3" * 64,
+            "receipt_hash": "sha256:" + "4" * 64,
+            "environment_hash": "sha256:" + "5" * 64,
+            "image": "sha256:" + "6" * 64,
+            "image_id": "sha256:" + "6" * 64,
+            "lock_canonical_hash": "sha256:" + "7" * 64,
+            "wheel_manifest_hash": "sha256:" + "8" * 64,
+            "build_context_hash": "sha256:" + "9" * 64,
+            "runtime_receipt_hash": "sha256:" + "a" * 64,
+            "image_archive_sha256": "sha256:" + "b" * 64,
+            "wheels": [{
+                "name": "example", "version": "1.0",
+                "filename": "example-1.0-py3-none-any.whl",
+                "url": "https://files.pythonhosted.org/example-1.0-py3-none-any.whl",
+                "sha256": "sha256:" + "c" * 64, "bytes": 10,
+            }],
+        }
+
+    def build(self, **kwargs):
+        self.calls.append(kwargs)
+        return dict(self.result)
+
+    def resolve(self, capability):
+        expected = {key: self.result[key] for key in {
+            "version", "provider", "closure_hash", "receipt_hash",
+            "environment_hash", "image", "image_id",
+        }}
+        assert capability == expected
+
+        class _Sandbox:
+            environment_hash = self.result["environment_hash"]
+
+        return _Sandbox()
 
 
 def _candidate(repo, *, candidate_id=1):
@@ -419,6 +463,31 @@ def test_unimplemented_dependency_inputs_fail_closed(tmp_path):
     materialize, _work = _materializer(tmp_path, provider)
     with pytest.raises(RepositoryMaterializationError, match="pinned_image_only"):
         materialize(_candidate(repo))
+
+
+def test_adapter_v3_binds_trusted_dependency_image_capability(tmp_path):
+    adapter = _adapter(
+        version=3, dependency_mode="python_wheel_image_v1",
+        dependency_locks=[".meta-research/python-wheel-lock.json"])
+    files = _repo_files(adapter=adapter)
+    files[".meta-research/python-wheel-lock.json"] = b"{}\n"
+    repo = _FrozenRepo("acme/model", "a" * 40, files)
+    provider = _Provider([repo])
+    builder = _FakeDependencyImageBuilder()
+    materialize, _work = _materializer(
+        tmp_path, provider, dependency_image_builder=builder)
+
+    result = materialize(_candidate(repo))
+
+    assert len(builder.calls) == 1
+    assert builder.calls[0]["lock_entry"]["path"] == (
+        ".meta-research/python-wheel-lock.json")
+    assert result["execution_image"]["receipt_hash"] == builder.result["receipt_hash"]
+    assert result["env_hash"] == builder.result["environment_hash"]
+    supply = result["supply_chain"]
+    assert supply["dependency_lock_hash"] == builder.result["lock_canonical_hash"]
+    assert supply["container_image_id"] == builder.result["image_id"]
+    assert supply["image_archive_sha256"] == builder.result["image_archive_sha256"]
 
 
 @pytest.mark.parametrize("line_end", [b"\n", b"\r\n"])

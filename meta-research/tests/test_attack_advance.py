@@ -232,6 +232,40 @@ def env(tmp_path):
     return {"path": path, "daemon": daemon, "state": state, "adv": adv, "tmp": tmp_path}
 
 
+def test_manifest_runtime_uses_only_baseline_bound_resolver(env, monkeypatch):
+    attack = env["adv"].attack
+    base_hash = RUNTIME_ENV_HASH
+    project_hash = "sha256:" + "d" * 64
+
+    class BaseSandbox:
+        environment_hash = base_hash
+
+    class ProjectSandbox:
+        environment_hash = project_hash
+
+    class Resolver:
+        def __init__(self):
+            self.seen = []
+
+        def resolve_environment_hash(self, value):
+            self.seen.append(value)
+            return ProjectSandbox()
+
+    resolver = Resolver()
+    attack.execution_sandbox = BaseSandbox()
+    attack.execution_sandbox_resolver = resolver
+    monkeypatch.setattr(attack, "_target_environment_hash", lambda _bt: project_hash)
+
+    assert attack._execution_sandbox_for(
+        {"env_hash": project_hash}, 1).environment_hash == project_hash
+    assert resolver.seen == [project_hash]
+    with pytest.raises(AS._BundleReject, match="未继承"):
+        attack._execution_sandbox_for({"env_hash": base_hash}, 1)
+    ProjectSandbox.environment_hash = "sha256:" + "e" * 64
+    with pytest.raises(RuntimeError, match="不同的 runtime identity"):
+        attack._execution_sandbox_for({"env_hash": project_hash}, 1)
+
+
 # ============ 全链 e2e ============
 def test_full_attack_cycle(env):
     d = env["daemon"]

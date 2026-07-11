@@ -192,6 +192,50 @@ def test_owner_guard_requires_shared_execution_supervisor(env):
         assert lease_b.close() is None
 
 
+def test_dependency_image_capability_requires_trusted_resolver(env):
+    capability = {
+        "version": 1, "provider": "python-wheel-image-v1",
+        "closure_hash": "sha256:" + "1" * 64,
+        "receipt_hash": "sha256:" + "2" * 64,
+        "environment_hash": "sha256:" + "3" * 64,
+        "image": "sha256:" + "4" * 64,
+        "image_id": "sha256:" + "4" * 64,
+    }
+    spec = {"execution_image": capability}
+    with pytest.raises(RuntimeError, match="可信 resolver"):
+        env["w"]._resolve_execution_sandbox(spec)
+
+    class Resolver:
+        def __init__(self):
+            self.seen = None
+
+        def resolve(self, value):
+            self.seen = value
+
+            class Sandbox:
+                environment_hash = capability["environment_hash"]
+
+            return Sandbox()
+
+    resolver = Resolver()
+    worker = ImportWorker(
+        state=env["s"], pool_gate=env["w"].gate,
+        providers=env["w"].p, obs_policy=OBS,
+        work_root=str(env["tmp"] / "resolved-import"),
+        execution_sandbox_resolver=resolver)
+    resolved = worker._resolve_execution_sandbox(spec)
+    assert resolver.seen == capability
+    assert resolved.environment_hash == capability["environment_hash"]
+    contract = worker._execution_contract({
+        "smoke_cmd": ["python"], "eval_cmd": ["python"],
+        "protocol_id": 1, "protocol_ver": 1, "eval_key": "e",
+        "target_set_hash": "t", "required": [[1, 1]],
+        "env_hash": capability["environment_hash"],
+        "execution_image": capability,
+    })
+    assert contract["execution_image"] == capability
+
+
 # ============ happy：全链 provenance + dep 解锁 ============
 def test_default_frozen_candidate_fetcher_validates_content_and_adapter():
     snapshot = _frozen_snapshot()

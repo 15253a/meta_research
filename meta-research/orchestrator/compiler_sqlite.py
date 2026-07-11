@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from .budgeting import compute_budget
@@ -983,6 +984,26 @@ class SqliteCompiler:
             "> 这是研究失败事实，reasoning 应按证据不足正常收尾；不得把它冒充实验结果。\n"
             + reason + suffix)
 
+    def _baseline_environment_hash(self, baseline_id: int) -> tuple[str, bool]:
+        """Inherit the exact imported runtime; ordinary baselines use policy bootstrap."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT r.env_hash FROM variant v "
+            "JOIN checkpoint c ON c.variant_id=v.id "
+            "JOIN run r ON r.id=c.produced_by_run "
+            "WHERE v.baseline_id=? AND c.origin='external_import' "
+            "AND r.status='success' ORDER BY r.env_hash",
+            (baseline_id,)).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError(
+                f"baseline {baseline_id} 绑定多个 external-import execution environment")
+        if rows:
+            value = rows[0][0]
+            if (not isinstance(value, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None):
+                raise RuntimeError(f"baseline {baseline_id} imported env_hash 非法")
+            return value, True
+        return sandbox_environment_hash(self.policy["execution"]["sandbox"]), False
+
     def _bundle_target(self, target_id, sources) -> str:
         """bundle 目标锚区（步⑧）：resolved 切片全文 + plan_slice_hash（manifest.target_ref 须回引）+ required
         指标 int 绑定。target_id = build_target.id 的字符串（attack_stages 传 str(bt_id)）。"""
@@ -1003,14 +1024,19 @@ class SqliteCompiler:
                                  "WHERE build_target_id=? ORDER BY metric_id, metric_ver", (bt,)).fetchall()
         req_md = "、".join(f"{m}@{v}" for m, v in reqs) or "（无）"
         sandbox = self.policy["execution"]["sandbox"]
-        env_hash = sandbox_environment_hash(sandbox)
-        sources.append("policy:execution.sandbox")
+        env_hash, inherited = self._baseline_environment_hash(row[1])
+        sources.append(
+            f"db:baseline:{row[1]}:external-import-environment"
+            if inherited else "policy:execution.sandbox")
+        image_line = (
+            "verified dependency image capability（编排器按 env_hash 从内容寻址 receipt 解析）"
+            if inherited else sandbox["image"])
         return ("## 本目标（bundle 编译执行契约）\n"
                 f"- build_target: {bt}（eval_key={row[3]}）\n"
                 f"- **plan_slice_hash（manifest.target_ref.plan_slice_hash 须回引此值）**: `{slice_hash}`\n"
                 f"- required 指标绑定（eval 命令 `metric_value: <id>@<ver>=<float>` 须用这些 int）: {req_md}\n"
                 f"- **env_hash（manifest.env_hash 须逐字照抄）**: `{env_hash}`\n"
-                f"- pinned sandbox image（只作复现身份，不得改写）: `{sandbox['image']}`\n"
+                f"- pinned sandbox image（只作复现身份，不得改写）: `{image_line}`\n"
                 "- 执行边界: network=none、rootfs=readonly、输入只读快照、输出 quarantine；"
                 "不得请求 host shell/动态 image pull。\n"
                 "- resolved 计划切片（manifest 须与之 target_key/target_kind/seq/protocol 绑定/config 一致）:\n"

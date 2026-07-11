@@ -128,6 +128,35 @@ class _RepositoryStoreMixin:
                     or not isinstance(transport, list)):
                 raise RepositoryMaterializationError(
                     "repository snapshot component hash/type 不一致")
+            supply_chain = spec.get("supply_chain")
+            if (not isinstance(supply_chain, dict)
+                    or spec.get("env_hash") != supply_chain.get("environment_hash")):
+                raise RepositoryMaterializationError(
+                    "repository snapshot execution environment identity 不一致")
+            execution_image = spec.get("execution_image")
+            if execution_image is None:
+                if (spec.get("env_hash") != self.environment_hash
+                        or supply_chain.get("container_digest")
+                        != self.sandbox_config["image"]
+                        or supply_chain.get("container_image_id")
+                        != self.sandbox_config["image_id"]):
+                    raise RepositoryMaterializationError(
+                        "pinned-image repository snapshot runtime identity 漂移")
+            else:
+                if self.dependency_image_builder is None:
+                    raise RepositoryMaterializationError(
+                        "repository snapshot 要求 dependency image builder")
+                sandbox = self.dependency_image_builder.resolve(execution_image)
+                if (sandbox.environment_hash != spec.get("env_hash")
+                        or execution_image.get("environment_hash") != spec.get("env_hash")
+                        or execution_image.get("image")
+                        != supply_chain.get("container_digest")
+                        or execution_image.get("image_id")
+                        != supply_chain.get("container_image_id")
+                        or execution_image.get("receipt_hash")
+                        != supply_chain.get("image_receipt_hash")):
+                    raise RepositoryMaterializationError(
+                        "dependency-image repository snapshot runtime identity 漂移")
             object_identity = {
                 "protocol": _PROTOCOL, "repository": repository,
                 "revision": revision,

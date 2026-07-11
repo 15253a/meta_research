@@ -1,18 +1,21 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/import_adapter.schema.json",
-  "title": "Pinned repository import adapter v2",
+  "title": "Pinned repository import adapter v2/v3",
   "type": "object",
   "required": ["version", "artifact_relpath", "artifact_type", "smoke_argv", "eval_argv", "dependency_mode", "dependency_locks", "factory_protocol"],
   "additionalProperties": false,
   "properties": {
-    "version": { "const": 2 },
+    "version": { "enum": [2, 3] },
     "artifact_relpath": { "$ref": "#/$defs/relpath" },
     "artifact_type": { "enum": ["checkpoint", "external_model", "prompt_only", "algorithm", "retrieval_index"] },
     "smoke_argv": { "$ref": "#/$defs/argv" },
     "eval_argv": { "$ref": "#/$defs/argv" },
-    "dependency_mode": { "const": "pinned_image_only" },
-    "dependency_locks": { "type": "array", "maxItems": 0 },
+    "dependency_mode": { "enum": ["pinned_image_only", "python_wheel_image_v1"] },
+    "dependency_locks": {
+      "type": "array", "maxItems": 1, "uniqueItems": true,
+      "items": { "$ref": "#/$defs/relpath" }
+    },
     "factory_protocol": {
       "type": "object",
       "required": ["name", "version", "scope_spec", "metrics", "required"],
@@ -46,6 +49,29 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "version": { "const": 2 } }, "required": ["version"] },
+      "then": {
+        "properties": {
+          "dependency_mode": { "const": "pinned_image_only" },
+          "dependency_locks": { "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "version": { "const": 3 } }, "required": ["version"] },
+      "then": {
+        "properties": {
+          "dependency_mode": { "const": "python_wheel_image_v1" },
+          "dependency_locks": {
+            "minItems": 1, "maxItems": 1,
+            "items": { "type": "string", "pattern": "(^|/)python-wheel-lock\\.json$" }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "relpath": {
       "type": "string", "minLength": 1, "maxLength": 4096,

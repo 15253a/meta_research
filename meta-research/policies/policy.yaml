@@ -65,7 +65,26 @@ import_materialization:
   lfs_batch_size: 100
   allowed_archive_hosts: [codeload.github.com]
   allowed_lfs_hosts: [github.com, github-cloud.s3.amazonaws.com, github-cloud.githubusercontent.com, objects.githubusercontent.com, objects-origin.githubusercontent.com, media.githubusercontent.com]
-  dependency_lock_names: [requirements.lock, requirements.txt, poetry.lock, uv.lock, conda-lock.yml, package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock]
+  dependency_lock_names: [python-wheel-lock.json, requirements.lock, requirements.txt, poetry.lock, uv.lock, conda-lock.yml, package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock]
+  dependency_image:
+    provider: python-wheel-image-v1
+    lock_basename: python-wheel-lock.json
+    allowed_hosts: [files.pythonhosted.org]
+    timeout_s: 60
+    max_lock_bytes: 16777216
+    max_wheels: 1024
+    max_wheel_bytes: 17179869184
+    max_total_wheel_bytes: 34359738368
+    max_unpacked_wheel_bytes: 68719476736
+    max_wheel_entries: 1000000
+    max_installed_bytes: 34359738368
+    max_installed_files: 100000
+    install_timeout_s: 3600
+    build_timeout_s: 7200
+    load_timeout_s: 7200
+    max_image_archive_bytes: 68719476736
+    max_cached_images: 64
+    site_packages_path: /opt/meta-research/site-packages
   compiler:
     implementation: CPython
     version: 3.11.15
@@ -144,6 +163,7 @@ execution:
     shm_mb: 64                         # 显式固定易失 /dev/shm；按项目数据加载需求随 env_hash 调整
     input_max_mb: 65536               # fd/tree 可信快照总量；更大数据须走下方显式只读 mount
     readonly_mounts: []               # 与 path_allowlist 配对的部署数据根；只读 bind，不暴露 work-root
+    payload_environment: {}            # 可信镜像 capability 可派生 PYTHONPATH；任务 env 不得覆盖
 
 # —— resources（启动输入③：只放硬件事实，§4.6.7；时限唯一归 flow.watchdog）——
 resources: { gpus: 4, gpu_mem_gb: 80, disk_quota_gb: 500 }

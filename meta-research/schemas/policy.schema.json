@@ -172,8 +172,8 @@
     },
     "import_materialization": {
       "type": "object",
-      "description": "pinned GitHub commit 的可信 host 物化：Git tree/archive、Git LFS OID/size 双核、内容寻址发布与 adapter v2",
-      "required": ["provider", "adapter_path", "timeout_s", "max_api_response_bytes", "max_archive_bytes", "max_file_bytes", "max_total_bytes", "max_files", "max_tree_depth", "max_tree_objects", "max_submodules", "lfs_policy", "max_lfs_objects", "lfs_batch_size", "allowed_archive_hosts", "allowed_lfs_hosts", "dependency_lock_names", "compiler"],
+      "description": "pinned GitHub commit 的可信 host 物化：Git tree/archive、Git LFS OID/size 双核、wheel dependency image、内容寻址发布与 adapter v2/v3",
+      "required": ["provider", "adapter_path", "timeout_s", "max_api_response_bytes", "max_archive_bytes", "max_file_bytes", "max_total_bytes", "max_files", "max_tree_depth", "max_tree_objects", "max_submodules", "lfs_policy", "max_lfs_objects", "lfs_batch_size", "allowed_archive_hosts", "allowed_lfs_hosts", "dependency_lock_names", "dependency_image", "compiler"],
       "additionalProperties": false,
       "properties": {
         "provider": { "const": "github_archive_v1" },
@@ -201,6 +201,34 @@
         "dependency_lock_names": {
           "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true,
           "items": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" }
+        },
+        "dependency_image": {
+          "type": "object",
+          "required": ["provider", "lock_basename", "allowed_hosts", "timeout_s", "max_lock_bytes", "max_wheels", "max_wheel_bytes", "max_total_wheel_bytes", "max_unpacked_wheel_bytes", "max_wheel_entries", "max_installed_bytes", "max_installed_files", "install_timeout_s", "build_timeout_s", "load_timeout_s", "max_image_archive_bytes", "max_cached_images", "site_packages_path"],
+          "additionalProperties": false,
+          "properties": {
+            "provider": { "const": "python-wheel-image-v1" },
+            "lock_basename": { "const": "python-wheel-lock.json" },
+            "allowed_hosts": {
+              "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true,
+              "items": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$" }
+            },
+            "timeout_s": { "type": "number", "minimum": 1, "maximum": 86400 },
+            "max_lock_bytes": { "type": "integer", "minimum": 1024, "maximum": 16777216 },
+            "max_wheels": { "type": "integer", "minimum": 1, "maximum": 1024 },
+            "max_wheel_bytes": { "type": "integer", "minimum": 1, "maximum": 17179869184 },
+            "max_total_wheel_bytes": { "type": "integer", "minimum": 1, "maximum": 68719476736 },
+            "max_unpacked_wheel_bytes": { "type": "integer", "minimum": 1, "maximum": 137438953472 },
+            "max_wheel_entries": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "max_installed_bytes": { "type": "integer", "minimum": 1, "maximum": 137438953472 },
+            "max_installed_files": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "install_timeout_s": { "type": "number", "minimum": 1, "maximum": 86400 },
+            "build_timeout_s": { "type": "number", "minimum": 1, "maximum": 86400 },
+            "load_timeout_s": { "type": "number", "minimum": 1, "maximum": 86400 },
+            "max_image_archive_bytes": { "type": "integer", "minimum": 1, "maximum": 274877906944 },
+            "max_cached_images": { "type": "integer", "minimum": 1, "maximum": 4096 },
+            "site_packages_path": { "const": "/opt/meta-research/site-packages" }
+          }
         },
         "compiler": {
           "type": "object",
@@ -346,7 +374,7 @@
         "sandbox": {
           "type": "object",
           "description": "bundle/import 敌对执行后端；exact image pin、network none、只读 rootfs 与资源边界由 execution_sandbox.py 执法",
-          "required": ["backend", "engine_path", "engine_host", "resource_mode", "seccomp_profile", "seccomp_sha256", "seccomp_bpf", "seccomp_bpf_sha256", "seccomp_bpf_arch", "image", "image_id", "python_path", "memory_mb", "pids", "nofile", "max_log_mb", "max_file_mb", "max_output_mb", "max_output_files", "cpus", "tmpfs_mb", "shm_mb", "input_max_mb", "readonly_mounts"],
+          "required": ["backend", "engine_path", "engine_host", "resource_mode", "seccomp_profile", "seccomp_sha256", "seccomp_bpf", "seccomp_bpf_sha256", "seccomp_bpf_arch", "image", "image_id", "python_path", "memory_mb", "pids", "nofile", "max_log_mb", "max_file_mb", "max_output_mb", "max_output_files", "cpus", "tmpfs_mb", "shm_mb", "input_max_mb", "readonly_mounts", "payload_environment"],
           "additionalProperties": false,
           "properties": {
             "backend": { "const": "docker" },
@@ -372,7 +400,12 @@
             "tmpfs_mb": { "type": "integer", "minimum": 1 },
             "shm_mb": { "type": "integer", "minimum": 1 },
             "input_max_mb": { "type": "integer", "minimum": 1 },
-            "readonly_mounts": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^/" } }
+            "readonly_mounts": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^/" } },
+            "payload_environment": {
+              "type": "object", "maxProperties": 32,
+              "propertyNames": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^=\\u0000]+$" },
+              "additionalProperties": { "type": "string", "maxLength": 65536 }
+            }
           }
         }
       }

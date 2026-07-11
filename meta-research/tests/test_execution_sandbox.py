@@ -60,6 +60,40 @@ def test_environment_identity_is_exact_policy_projection():
     assert sandbox_environment_hash(changed) != value
 
 
+def test_trusted_payload_environment_is_identity_bound_and_not_overridable(tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    config = {
+        **POLICY["execution"]["sandbox"],
+        "image": POLICY["execution"]["sandbox"]["image_id"],
+        "payload_environment": {"PYTHONPATH": "/opt/meta-research/site-packages"},
+    }
+    sandbox = DockerExecutionSandbox(work_root=work, config=config)
+    try:
+        sandbox.preflight()
+    except (ExecutionSandboxError, OSError, subprocess.SubprocessError) as error:
+        pytest.skip(f"pinned local Docker sandbox unavailable: {error}")
+    supervisor = ExecutionSupervisor.standalone(work / "state" / "executions")
+    context = {"phase": "payload-env", "db_owner_kind": "build_target", "db_owner_id": 91}
+    try:
+        result = _run(
+            work, sandbox, supervisor,
+            ["python", "-c", "import os; print(os.environ['PYTHONPATH'])"],
+            name="payload-env.log", context=context)
+        assert "/opt/meta-research/site-packages" in Path(result["log_path"]).read_text()
+        with pytest.raises(ExecutionSandboxError, match="不得覆盖"):
+            sandbox.prepare(
+                ["python", "-c", "pass"], staging_dir=work / "override",
+                log_name="override.log",
+                env={"PYTHONPATH": "/tmp/attacker"}, timeout_s=10,
+                execution_context={
+                    "phase": "override", "db_owner_kind": "build_target",
+                    "db_owner_id": 92, "log_name": "override.log"},
+                execution_supervisor=supervisor)
+    finally:
+        supervisor.close()
+
+
 def test_rootless_bindfs_sources_are_derived_from_deepest_mount():
     mountinfo = (
         "1 0 0:1 / / rw - overlay overlay rw\n"
