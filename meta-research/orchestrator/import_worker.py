@@ -23,17 +23,22 @@ reason_json 记因）+ 占位 baseline 连坐 build_failed + 同一事务写失�
 已开 worker 的 cycle 同时 failed；scope 在开工前拒绝则不造 worker cycle。
 
 **恢复**：结构续跑（同 attack：目标状态阶梯 + 幂等补登 + judge replay-safe）；imported 事件已在 → 幂等跳过。
-fetch provider 契约（注入；当前默认=已登记的内容寻址冻结文件快照，测试亦可注入确定性内容；
-大仓库 clone/LFS 是后续 capability）：fetch(candidate) → {files:{名:bytes…},
-smoke_cmd, eval_cmd, protocol_id, protocol_ver, eval_key, target_set_hash, required:[[mid,mver]…],
-artifact_type?, env_hash?}——candidate = {id, question_id, canonical_uri, revision}。
+fetch provider 契约：旧 v1 内嵌快照仍返回 `files:{名:bytes…}`；production v2 返回经
+Git tree/archive 双核且内容寻址发布的 `source_tree + file_ledger + repository_snapshot_hash`，
+并携 declarative adapter 的 factory_protocol/metric_log_map。两者均共用 smoke_cmd/eval_cmd、
+protocol_id/ver、target_set_hash、required 和供应链 manifest；默认发现内容必须进 adversarial sandbox。
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
-from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional
 
 from . import harness as H
@@ -65,6 +70,11 @@ def _cid(n: int) -> str:
     return f"c{n}"
 
 _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
+_NAMED_METRIC_RE = re.compile(
+    r"metric_value:\s*([A-Za-z][A-Za-z0-9_.-]{0,127})="
+    r"([+-]?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+    r"(?:[eE][+-]?[0-9]+)?|inf|nan))",
+    re.IGNORECASE)
 
 
 class ImportWorker:
@@ -356,6 +366,117 @@ class ImportWorker:
                                           "question_id": question_id}, sort_keys=True)))
         return _cid(ci)
 
+    def _ensure_factory_protocol(self, cyc_id: str, spec: Dict[str, Any]) -> None:
+        """Register adapter v2 protocol once; exact semantic reuse is allowed."""
+        protocol = spec.get("factory_protocol")
+        if protocol is None:  # legacy embedded materialization: pre-registered authority
+            return
+        required = {
+            "id", "version", "name", "scope_spec_json", "metric_defs", "metrics",
+        }
+        if (not isinstance(protocol, dict) or set(protocol) != required
+                or protocol.get("id") != spec.get("protocol_id")
+                or protocol.get("version") != spec.get("protocol_ver")
+                or not isinstance(protocol.get("name"), str)
+                or not isinstance(protocol.get("scope_spec_json"), str)
+                or not isinstance(protocol.get("metric_defs"), list)
+                or not isinstance(protocol.get("metrics"), list)):
+            raise ValueError("factory_protocol 字段闭包/绑定非法")
+        metric_defs = []
+        for item in protocol["metric_defs"]:
+            if (not isinstance(item, dict)
+                    or set(item) != {
+                        "id", "version", "name", "direction", "unit",
+                        "compute_spec", "readout_rule", "log_key"}
+                    or any(isinstance(item.get(key), bool)
+                           or not isinstance(item.get(key), int)
+                           or item[key] <= 0 for key in ("id", "version"))
+                    or not isinstance(item.get("name"), str)
+                    or not item["name"]
+                    or item.get("direction") not in ("higher", "lower")
+                    or (item.get("unit") is not None
+                        and (not isinstance(item["unit"], str) or not item["unit"]))
+                    or any(not isinstance(item.get(field), str) or not item[field]
+                           for field in ("compute_spec", "readout_rule"))
+                    or not isinstance(item.get("log_key"), str)
+                    or _NAMED_METRIC_RE.fullmatch(
+                        f"metric_value: {item.get('log_key')}=0") is None):
+                raise ValueError("factory_protocol.metric_defs 字段闭包非法")
+            # metric_def is the append-only semantic authority but its schema
+            # predates an explicit readout_rule column.  Persist a canonical
+            # pair in compute_spec so changing either computation or readout
+            # under the same stable metric@version deterministically collides.
+            registry_compute_spec = json.dumps(
+                {"compute_spec": item["compute_spec"],
+                 "readout_rule": item["readout_rule"]},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                allow_nan=False)
+            metric_defs.append({
+                "id": item["id"], "version": item["version"],
+                "name": item["name"], "direction": item["direction"],
+                "unit": item["unit"], "compute_spec": registry_compute_spec,
+            })
+        try:
+            metrics = [tuple(pair) for pair in protocol["metrics"]]
+        except TypeError as error:
+            raise ValueError("factory_protocol.metrics 非 pair list") from error
+        if (any(len(pair) != 2 or any(isinstance(value, bool)
+                                     or not isinstance(value, int) or value <= 0
+                                     for value in pair)
+                for pair in metrics)
+                or len(set(metrics)) != len(metrics)
+                or set(metrics) != {(item["id"], item["version"])
+                                    for item in metric_defs}):
+            raise ValueError("factory_protocol metrics/defs 闭包不一致")
+        d = self.state.daemon
+        family_names = d.query(
+            "SELECT DISTINCT name FROM protocol WHERE id=? ORDER BY name",
+            (protocol["id"],))
+        if family_names and family_names != [(protocol["name"],)]:
+            raise ValueError("stable protocol family id collision")
+        for item in metric_defs:
+            metric_family_names = d.query(
+                "SELECT DISTINCT name FROM metric_def WHERE id=? ORDER BY name",
+                (item["id"],))
+            if metric_family_names and metric_family_names != [(item["name"],)]:
+                raise ValueError("stable metric family id collision")
+            existing_metric = d.query_one(
+                "SELECT name,direction,unit,compute_spec FROM metric_def "
+                "WHERE id=? AND version=?", (item["id"], item["version"]))
+            if existing_metric is not None and existing_metric != (
+                    item["name"], item["direction"], item["unit"],
+                    item["compute_spec"]):
+                # PoolGate enforces the same I1 rule transactionally.  Keep an
+                # independent worker-side comparison so a new protocol version
+                # cannot even reach registration while reusing a drifted
+                # metric family@version.
+                raise ValueError("stable metric id collision/semantic drift")
+        existing = d.query_one(
+            "SELECT name,scope_spec_json FROM protocol WHERE id=? AND version=?",
+            (protocol["id"], protocol["version"]))
+        if existing is None:
+            self.gate.gate_new_protocol(
+                protocol_id=protocol["id"], version=protocol["version"],
+                name=protocol["name"],
+                scope_spec_json=protocol["scope_spec_json"],
+                cycle_id=cyc_id, metric_defs=metric_defs, metrics=metrics)
+            return
+        if existing != (protocol["name"], protocol["scope_spec_json"]):
+            raise ValueError("stable protocol id collision/semantic drift")
+        registered = d.query(
+            "SELECT metric_id,metric_ver FROM protocol_metric "
+            "WHERE protocol_id=? AND protocol_ver=? ORDER BY metric_id,metric_ver",
+            (protocol["id"], protocol["version"]))
+        if [tuple(row) for row in registered] != sorted(metrics):
+            raise ValueError("existing protocol_metric 与 adapter 闭包不一致")
+        for item in metric_defs:
+            row = d.query_one(
+                "SELECT name,direction,unit,compute_spec FROM metric_def "
+                "WHERE id=? AND version=?", (item["id"], item["version"]))
+            if row != (item["name"], item["direction"],
+                       item["unit"], item["compute_spec"]):
+                raise ValueError("stable metric id collision/semantic drift")
+
     def _variant_and_target(self, cyc_id: str, qi: int, bid: int, spec) -> tuple:
         d = self.state.daemon
         v = d.query_one("SELECT id FROM variant WHERE baseline_id=? AND variant_key='imported'", (bid,))
@@ -382,12 +503,42 @@ class ImportWorker:
                     "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id,plan_ref) "
                     "VALUES (?,?,'import',1,'pending',?,?,?)",
                     (int(cyc_id[1:]), qi, bid, vid, expected_ref)).lastrowid
+        # Legacy snapshots reference an already-registered protocol.  Adapter
+        # v2 is intentionally delayed until smoke+code review passes so an
+        # untrusted/broken repository cannot pollute the append-only registry.
+        if spec.get("factory_protocol") is None:
+            self._ensure_target_required(bt_id, spec)
         return vid, bt_id
+
+    def _ensure_target_required(
+            self, build_target_id: int, spec: Dict[str, Any]) -> None:
+        expected = sorted(tuple(pair) for pair in spec["required"])
+        if (not expected or len(set(expected)) != len(expected)
+                or any(len(pair) != 2 or any(isinstance(value, bool)
+                                            or not isinstance(value, int)
+                                            or value <= 0 for value in pair)
+                       for pair in expected)):
+            raise ValueError("import required metric 闭包非法")
+        with self.state.daemon.transaction() as conn:
+            rows = conn.execute(
+                "SELECT metric_id,metric_ver FROM build_target_required_metric "
+                "WHERE build_target_id=? ORDER BY metric_id,metric_ver",
+                (build_target_id,)).fetchall()
+            if rows:
+                if [tuple(row) for row in rows] != expected:
+                    raise ValueError(
+                        f"import target {build_target_id} required metric 身份漂移")
+                return
+            for metric_id, metric_ver in expected:
+                conn.execute(
+                    "INSERT INTO build_target_required_metric"
+                    "(build_target_id,metric_id,metric_ver) VALUES (?,?,?)",
+                    (build_target_id, metric_id, metric_ver))
 
     @staticmethod
     def _execution_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
         """Everything affecting adapter execution, excluding file bytes (hashed separately)."""
-        return {
+        result = {
             "smoke_cmd": list(spec["smoke_cmd"]), "eval_cmd": list(spec["eval_cmd"]),
             "protocol_id": spec["protocol_id"], "protocol_ver": spec["protocol_ver"],
             "eval_key": spec["eval_key"], "target_set_hash": spec["target_set_hash"],
@@ -396,19 +547,219 @@ class ImportWorker:
             "env_hash": spec.get("env_hash", "import-env"),
             "supply_chain": spec.get("supply_chain") or {},
         }
+        for key in (
+                "factory_protocol", "metric_log_map",
+                "repository_snapshot_hash"):
+            if key in spec:
+                result[key] = spec[key]
+        return result
+
+    @staticmethod
+    def _spec_ledger(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Normalize legacy in-memory files and repository file ledgers."""
+        if "file_ledger" not in spec:
+            files = spec.get("files")
+            if not isinstance(files, dict) or not files:
+                raise RuntimeError("import materialization 缺 files/file_ledger")
+            ledger = []
+            for name, content in sorted(files.items()):
+                payload = content if isinstance(content, bytes) else str(content).encode()
+                ledger.append({
+                    "path": name,
+                    "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                    "bytes": len(payload), "git_mode": "100644",
+                })
+        else:
+            raw = spec["file_ledger"]
+            if not isinstance(raw, list) or not raw:
+                raise RuntimeError("import file_ledger 须为非空 list")
+            ledger = [{
+                "path": item.get("path") if isinstance(item, dict) else None,
+                "sha256": item.get("sha256") if isinstance(item, dict) else None,
+                "bytes": item.get("bytes") if isinstance(item, dict) else None,
+                "git_mode": item.get("git_mode", "100644")
+                if isinstance(item, dict) else None,
+            } for item in raw]
+        seen = set()
+        normalized = []
+        for item in ledger:
+            path = item["path"]
+            if (not isinstance(path, str) or not path or "\\" in path
+                    or PurePosixPath(path).is_absolute()
+                    or any(part in ("", ".", "..") for part in path.split("/"))
+                    or path in seen
+                    or not isinstance(item["sha256"], str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", item["sha256"]) is None
+                    or isinstance(item["bytes"], bool)
+                    or not isinstance(item["bytes"], int) or item["bytes"] < 0
+                    or item["git_mode"] not in ("100644", "100755")):
+                raise RuntimeError("import materialization file ledger 非法")
+            seen.add(path)
+            normalized.append(dict(item))
+        return sorted(normalized, key=lambda item: item["path"])
+
+    @classmethod
+    def _artifact_entry(cls, spec: Dict[str, Any]) -> Dict[str, Any]:
+        ledger = cls._spec_ledger(spec)
+        rel = spec.get("artifact_relpath") or ledger[0]["path"]
+        matches = [item for item in ledger if item["path"] == rel]
+        if len(matches) != 1:
+            raise RuntimeError("import artifact_relpath 未绑定唯一文件")
+        return matches[0]
 
     @classmethod
     def _spec_ref(cls, spec: Dict[str, Any]) -> Dict[str, Any]:
         """Bounded DB plan_ref: content identities, never the up-to-64MiB raw frozen files."""
+        ledger = cls._spec_ledger(spec)
+        if "source_tree" not in spec:
+            # Preserve the legacy plan_ref shape so in-flight v1 imports remain
+            # structurally resumable across this checkpoint.
+            return {
+                "materialization_contract": cls._execution_contract(spec),
+                "files": [{
+                    "path": item["path"], "sha256": item["sha256"],
+                    "bytes": item["bytes"],
+                } for item in ledger],
+            }
         return {
             "materialization_contract": cls._execution_contract(spec),
-            "files": [{
-                "path": name,
-                "sha256": "sha256:" + hashlib.sha256(
-                    content if isinstance(content, bytes) else str(content).encode()).hexdigest(),
-                "bytes": len(content if isinstance(content, bytes) else str(content).encode()),
-            } for name, content in sorted(spec["files"].items())],
+            "file_ledger_hash": _canon_hash(ledger),
+            "file_count": len(ledger),
+            "total_bytes": sum(item["bytes"] for item in ledger),
+            "repository_snapshot_hash": spec.get("repository_snapshot_hash"),
         }
+
+    @staticmethod
+    def _clone_target(root: Path, rel: str) -> Path:
+        current = root
+        parts = PurePosixPath(rel).parts
+        for part in parts[:-1]:
+            current = current / part
+            if not os.path.lexists(current):
+                current.mkdir(mode=0o700)
+            info = os.lstat(current)
+            if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != os.geteuid()):
+                raise RuntimeError("import clone parent authority 非法")
+        return current / parts[-1]
+
+    @staticmethod
+    def _fsync_clone_directory(path: Path) -> None:
+        fd = os.open(
+            path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _copy_repository_tree(
+            self, clone_dir: Path, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+        ledger = self._spec_ledger(spec)
+        hashes = {item["path"]: item["sha256"] for item in ledger}
+        source_tree = spec.get("source_tree")
+        if not isinstance(source_tree, str) or not os.path.isabs(source_tree):
+            raise RuntimeError("repository materialization source_tree 非规范绝对路径")
+        clone_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        clone_info = os.lstat(clone_dir)
+        if (not stat.S_ISDIR(clone_info.st_mode) or stat.S_ISLNK(clone_info.st_mode)
+                or clone_info.st_uid != os.geteuid()):
+            raise RuntimeError("import clone root authority 非法")
+        temporary_root = clone_dir.parent / ".clone-materializing"
+        if os.path.lexists(temporary_root):
+            info = os.lstat(temporary_root)
+            if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != os.geteuid()):
+                raise RuntimeError("import clone temporary authority 非法")
+            shutil.rmtree(temporary_root)
+        temporary_root.mkdir(mode=0o700)
+        source_fd = open_directory(source_tree, label="repository source snapshot")
+        try:
+            verify_tree_fd(
+                source_fd, hashes, label="repository source snapshot", exact=True,
+                progress_guard=self.owner_guard)
+            for index, item in enumerate(ledger):
+                target = self._clone_target(clone_dir, item["path"])
+                expected_mode = 0o555 if item["git_mode"] == "100755" else 0o444
+                if os.path.lexists(target):
+                    try:
+                        with open_artifact(
+                                target, expected_hash=item["sha256"],
+                                expected_size=item["bytes"],
+                                label=f"import clone {item['path']}",
+                                progress_guard=self.owner_guard) as capability:
+                            if stat.S_IMODE(os.fstat(capability.fd).st_mode) != expected_mode:
+                                raise RuntimeError(
+                                    f"import clone mode 与冻结 snapshot 不一致: {item['path']}")
+                    except ArtifactCapabilityError as error:
+                        raise RuntimeError(
+                            f"import clone 既有文件与冻结 snapshot 不一致: "
+                            f"{item['path']}") from error
+                    continue
+                with open_artifact(
+                        Path(f"/proc/self/fd/{source_fd}") / item["path"],
+                        expected_hash=item["sha256"], expected_size=item["bytes"],
+                        label=f"repository source:{item['path']}",
+                        progress_guard=self.owner_guard) as source:
+                    temporary = temporary_root / f"{index:08d}-{secrets.token_hex(8)}"
+                    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | getattr(os, "O_CLOEXEC", 0)
+                             | getattr(os, "O_NOFOLLOW", 0))
+                    output_fd = os.open(temporary, flags, 0o400)
+                    digest = hashlib.sha256()
+                    copied = 0
+                    try:
+                        os.lseek(source.fd, 0, os.SEEK_SET)
+                        while copied < item["bytes"]:
+                            self.owner_guard()
+                            chunk = os.read(
+                                source.fd, min(1024 * 1024, item["bytes"] - copied))
+                            if not chunk:
+                                raise RuntimeError(
+                                    f"repository source copy 截断: {item['path']}")
+                            copied += len(chunk)
+                            digest.update(chunk)
+                            view = memoryview(chunk)
+                            while view:
+                                written = os.write(output_fd, view)
+                                if written <= 0:
+                                    raise OSError("import clone short write")
+                                view = view[written:]
+                        if os.read(source.fd, 1):
+                            raise RuntimeError(
+                                f"repository source copy size 漂移: {item['path']}")
+                        if ("sha256:" + digest.hexdigest()) != item["sha256"]:
+                            raise RuntimeError(
+                                f"repository source copy hash 漂移: {item['path']}")
+                        os.fchmod(output_fd, expected_mode)
+                        os.fsync(output_fd)
+                    finally:
+                        os.close(output_fd)
+                    os.replace(temporary, target)
+                    self._fsync_clone_directory(target.parent)
+                    source.verify_unchanged(self.owner_guard)
+            destination_fd = open_directory(clone_dir, label="import frozen clone")
+            try:
+                verify_tree_fd(
+                    destination_fd, hashes, label="import frozen clone", exact=True,
+                    progress_guard=self.owner_guard)
+            finally:
+                os.close(destination_fd)
+            verify_tree_fd(
+                source_fd, hashes, label="repository source snapshot post-copy",
+                exact=True, progress_guard=self.owner_guard)
+            for current, dirs, _files in os.walk(
+                    clone_dir, topdown=False, followlinks=False):
+                for name in dirs:
+                    os.chmod(Path(current) / name, 0o555)
+                os.chmod(Path(current), 0o555)
+                self._fsync_clone_directory(Path(current))
+            return ledger
+        except ArtifactCapabilityError as error:
+            raise RuntimeError(str(error)) from error
+        finally:
+            os.close(source_fd)
+            shutil.rmtree(temporary_root, ignore_errors=True)
 
     def _drive_import_target(self, cyc_id: str, ei_id: int, qi: int, cand_id: int, bid: int,
                              vid: int, bt_id: int, spec, *, revision: str,
@@ -430,40 +781,46 @@ class ImportWorker:
         if st() == "pending":
             g.gate_start_build_target(build_target_id=bt_id)
         # clone（幂等：文件已在即跳过）+ 供应链 manifest
-        clone_dir.mkdir(parents=True, exist_ok=True)
-        for name, content in spec["files"].items():
+        if "source_tree" in spec:
+            ledger = self._copy_repository_tree(clone_dir, spec)
+        else:
+            clone_dir.mkdir(parents=True, exist_ok=True)
+            for name, content in spec["files"].items():
             # 路径卫生（codex SHOULD）：拒绝绝对路径/越界（../），并建父目录（src/model.py 类正常仓库路径）
-            f = (clone_dir / name)
-            if Path(name).is_absolute() or ".." in Path(name).parts:
-                g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="clone_path")
-                self._record_failed(ei_id, qi, cand_id, reason=f"clone 路径非法（越界/绝对）：{name!r}")
-                self._target_pc(cyc_id, bt_id)
-                return False
-            for parent in f.parents:
-                if parent == clone_dir.parent:
-                    break
-                if parent.exists() and parent.is_symlink():
-                    raise RuntimeError(f"import clone parent 不得是 symlink: {parent}")
-            payload = content if isinstance(content, bytes) else str(content).encode()
-            expected_file_hash = hashlib.sha256(payload).hexdigest()
-            if f.exists():
-                try:
-                    existing = read_artifact_bytes(
-                        f, expected_hash=expected_file_hash,
-                        expected_size=len(payload),
-                        label=f"import clone {name}")
-                except ArtifactCapabilityError as error:
-                    raise RuntimeError(
-                        f"import clone 既有文件与冻结 snapshot 不一致: {name}") from error
-                if existing != payload:
-                    raise RuntimeError(f"import clone 既有文件与冻结 snapshot 不一致: {name}")
-            else:
-                f.parent.mkdir(parents=True, exist_ok=True)
-                tmp = f.with_suffix(f.suffix + ".tmp")
-                tmp.write_bytes(payload)
-                tmp.replace(f)
-        manifest_entries = [{"kind": "import_file", "ref": n, "content_hash": H.file_sha256(str(clone_dir / n))}
-                            for n in sorted(spec["files"])] + \
+                f = (clone_dir / name)
+                if Path(name).is_absolute() or ".." in Path(name).parts:
+                    g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="clone_path")
+                    self._record_failed(ei_id, qi, cand_id, reason=f"clone 路径非法（越界/绝对）：{name!r}")
+                    self._target_pc(cyc_id, bt_id)
+                    return False
+                for parent in f.parents:
+                    if parent == clone_dir.parent:
+                        break
+                    if parent.exists() and parent.is_symlink():
+                        raise RuntimeError(f"import clone parent 不得是 symlink: {parent}")
+                payload = content if isinstance(content, bytes) else str(content).encode()
+                expected_file_hash = hashlib.sha256(payload).hexdigest()
+                if f.exists():
+                    try:
+                        existing = read_artifact_bytes(
+                            f, expected_hash=expected_file_hash,
+                            expected_size=len(payload),
+                            label=f"import clone {name}")
+                    except ArtifactCapabilityError as error:
+                        raise RuntimeError(
+                            f"import clone 既有文件与冻结 snapshot 不一致: {name}") from error
+                    if existing != payload:
+                        raise RuntimeError(f"import clone 既有文件与冻结 snapshot 不一致: {name}")
+                else:
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = f.with_suffix(f.suffix + ".tmp")
+                    tmp.write_bytes(payload)
+                    tmp.replace(f)
+            ledger = self._spec_ledger(spec)
+        manifest_entries = [{
+                                "kind": "import_file", "ref": item["path"],
+                                "content_hash": item["sha256"],
+                            } for item in ledger] + \
                            [{"kind": "revision", "ref": "revision", "content_hash": _canon_hash(revision)},
                             {"kind": "source_uri", "ref": "source_uri", "content_hash": _canon_hash(source_uri)},
                             {"kind": "materialization_contract", "ref": "execution_contract",
@@ -534,8 +891,26 @@ class ImportWorker:
                 self._record_failed(ei_id, qi, cand_id, reason="适配评审 FAIL，不 target_ready")
                 self._target_pc(cyc_id, bt_id)
                 return False
+            try:
+                self._ensure_factory_protocol(cyc_id, spec)
+                self._ensure_target_required(bt_id, spec)
+            except (ValueError, GateReject) as error:
+                g.gate_finish_build_target(
+                    build_target_id=bt_id, status="failed",
+                    failure_kind="protocol_violation")
+                self._record_failed(
+                    ei_id, qi, cand_id,
+                    reason=("已通过 smoke/代码评审的 adapter factory protocol "
+                            f"无法注册/复用: {error}"))
+                self._target_pc(cyc_id, bt_id)
+                return False
             g.gate_progress_build_target(build_target_id=bt_id, to="running", current_subject_hash=code_sh)
         if st() == "running":
+            # Crash recovery for the short protocol/required/progress suffix.
+            # Normally both authorities were committed before the state became
+            # running; exact revalidation makes a partial/corrupt suffix loud.
+            self._ensure_factory_protocol(cyc_id, spec)
+            self._ensure_target_required(bt_id, spec)
             return self._run_and_register_import(cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
                                                  staging, clone_dir, manifest_hash, revision)
         return st() == "complete"
@@ -543,30 +918,29 @@ class ImportWorker:
     def _run_frozen_command(self, cmd, clone_dir: Path, spec: Dict[str, Any],
                             **run_kwargs):
         """Run an adapter against stable dir/file capabilities, then re-verify bytes."""
-        rel = spec.get("artifact_relpath") or sorted(spec["files"])[0]
-        payloads = {
-            name: payload if isinstance(payload, bytes) else str(payload).encode()
-            for name, payload in spec["files"].items()
-        }
-        hashes = {
-            name: hashlib.sha256(payload).hexdigest()
-            for name, payload in payloads.items()
-        }
+        ledger = self._spec_ledger(spec)
+        artifact = self._artifact_entry(spec)
+        rel = artifact["path"]
+        hashes = {item["path"]: item["sha256"] for item in ledger}
         source_fd = -1
         artifact_fd = -1
         invocation = None
         try:
             source_fd = open_directory(clone_dir, label="import frozen tree")
             verify_tree_fd(
-                source_fd, hashes, label="import frozen tree", exact=True)
+                source_fd, hashes, label="import frozen tree", exact=True,
+                progress_guard=self.owner_guard)
             capability = open_artifact(
                 Path(f"/proc/self/fd/{source_fd}") / rel,
-                expected_hash=hashes[rel], expected_size=len(payloads[rel]),
-                label="import artifact capability")
+                expected_hash=hashes[rel], expected_size=artifact["bytes"],
+                label="import artifact capability",
+                progress_guard=self.owner_guard)
             identity = capability.identity
             artifact_fd = capability.detach()
             repo_proc = f"/proc/self/fd/{source_fd}"
-            artifact_proc = f"/proc/self/fd/{artifact_fd}"
+            artifact_proc = (f"/proc/self/fd/{artifact_fd}"
+                             if self.execution_sandbox is None
+                             else f"{repo_proc}/{rel}")
             resolved = [
                 arg.replace("{repo}", repo_proc).replace("{artifact}", artifact_proc)
                 for arg in cmd
@@ -585,9 +959,10 @@ class ImportWorker:
                     resolved, staging_dir=run_kwargs["staging_dir"],
                     log_name=log_name, env=None,
                     timeout_s=run_kwargs.get("timeout_s", 600.0),
-                    fd_expectations=((
-                        artifact_fd, identity.content_hash, identity.size_bytes,
-                        identity.device, identity.inode),),
+                    # artifact is already a member of the exact tree snapshot;
+                    # copying its separate fd would double-count large models
+                    # against input_max_mb without strengthening the sandbox.
+                    fd_expectations=(),
                     tree_expectations=((source_fd, hashes, ()),),
                     execution_context=sandbox_context,
                     execution_supervisor=self.execution_supervisor)
@@ -601,9 +976,11 @@ class ImportWorker:
             verify_open_fd(
                 artifact_fd, expected_hash=identity.content_hash,
                 expected_size=identity.size_bytes,
-                expected_device=identity.device, expected_inode=identity.inode)
+                expected_device=identity.device, expected_inode=identity.inode,
+                progress_guard=self.owner_guard)
             verify_tree_fd(
-                source_fd, hashes, label="import frozen tree post-use", exact=True)
+                source_fd, hashes, label="import frozen tree post-use", exact=True,
+                progress_guard=self.owner_guard)
             return result
         except ArtifactCapabilityError as error:
             raise RuntimeError(str(error)) from error
@@ -616,6 +993,64 @@ class ImportWorker:
                         os.close(fd)
                     except OSError:
                         pass
+
+    @staticmethod
+    def _import_metrics_from_eval_log(
+            spec: Dict[str, Any], text: str) -> List[Dict[str, Any]]:
+        mapping = spec.get("metric_log_map")
+        if mapping is None:
+            return AttackStages._metrics_from_eval_log(text)
+        if (not isinstance(mapping, dict) or not mapping
+                or any(not isinstance(key, str)
+                       or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", key) is None
+                       or not isinstance(pair, list) or len(pair) != 2
+                       or any(isinstance(value, bool) or not isinstance(value, int)
+                              or value <= 0 for value in pair)
+                       for key, pair in mapping.items())):
+            raise _BundleReject(
+                "adapter metric_log_map 非法",
+                failure_kind="protocol_violation")
+        if len({tuple(pair) for pair in mapping.values()}) != len(mapping):
+            raise _BundleReject(
+                "adapter metric_log_map 含重复 metric id/version",
+                failure_kind="protocol_violation")
+        output = []
+        seen = set()
+        for line_number, raw in enumerate(text.splitlines(), start=1):
+            line = raw.strip()
+            if not line.startswith("metric_value"):
+                continue
+            match = _NAMED_METRIC_RE.fullmatch(line)
+            if match is None:
+                raise _BundleReject(
+                    f"eval.log 第 {line_number} 行 named metric_value 格式非法: "
+                    f"{line!r}", failure_kind="protocol_violation")
+            key = match.group(1)
+            if key not in mapping:
+                raise _BundleReject(
+                    f"eval.log 第 {line_number} 行输出未声明 metric key: {key}",
+                    failure_kind="protocol_violation")
+            if key in seen:
+                raise _BundleReject(
+                    f"eval.log 第 {line_number} 行重复 metric key: {key}",
+                    failure_kind="protocol_violation")
+            try:
+                value = float(match.group(2))
+            except (ValueError, OverflowError) as error:
+                raise _BundleReject(
+                    f"eval.log 第 {line_number} 行 metric 数值非法",
+                    failure_kind="protocol_violation") from error
+            if not math.isfinite(value):
+                raise _BundleReject(
+                    f"eval.log 第 {line_number} 行 metric 非有限值",
+                    failure_kind="protocol_violation")
+            metric_id, metric_ver = mapping[key]
+            output.append({
+                "metric_id": metric_id, "metric_ver": metric_ver,
+                "value": value,
+            })
+            seen.add(key)
+        return output
 
     def _run_and_register_import(self, cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
                                  staging: Path, clone_dir: Path, manifest_hash: str, revision: str) -> bool:
@@ -635,16 +1070,15 @@ class ImportWorker:
         else:
             rid = g.gate_start_run(build_target_id=bt_id, cycle_id=cyc_id, variant_id=vid, kind="import",
                                    env_hash=spec.get("env_hash", "import-env"))
-            main_file = spec.get("artifact_relpath") or sorted(spec["files"])[0]
-            main_payload = (spec["files"][main_file]
-                            if isinstance(spec["files"][main_file], bytes)
-                            else str(spec["files"][main_file]).encode())
+            artifact_entry = self._artifact_entry(spec)
+            main_file = artifact_entry["path"]
             cand_row = d.query_one("SELECT canonical_uri FROM external_candidate WHERE id=?", (cand_id,))
             with open_artifact(
                     clone_dir / main_file,
-                    expected_hash=hashlib.sha256(main_payload).hexdigest(),
-                    expected_size=len(main_payload),
-                    label="import checkpoint artifact") as artifact_capability:
+                    expected_hash=artifact_entry["sha256"],
+                    expected_size=artifact_entry["bytes"],
+                    label="import checkpoint artifact",
+                    progress_guard=self.owner_guard) as artifact_capability:
                 artifact_hash = artifact_capability.identity.content_hash.removeprefix(
                     "sha256:")
                 with d.transaction() as conn:  # checkpoint = 外部可评 target（供应链溯源列 DDL CHECK 焊）
@@ -655,10 +1089,10 @@ class ImportWorker:
                                   artifact_hash,
                                   spec.get("artifact_type", "external_model"),
                                   manifest_hash, cand_row[0], revision, rid))
-                artifact_capability.verify_unchanged()
+                artifact_capability.verify_unchanged(self.owner_guard)
                 artifact_capability.verify_path_binding()
                 g.gate_finish_run(run_id=rid, status="success")
-                artifact_capability.verify_unchanged()
+                artifact_capability.verify_unchanged(self.owner_guard)
                 artifact_capability.verify_path_binding()
         # 出厂评估（源仍 factory——外部性只在 checkpoint.origin+manifest_hash，§3.6.3 证据归属）。
         # 与 attack lockstep：任何外部 eval 进程放行前，evaluation+attempt(running) 已耐久落库；
@@ -761,7 +1195,8 @@ class ImportWorker:
                 self._target_pc(cyc_id, bt_id)
                 return False
             try:
-                metrics = AttackStages._metrics_from_eval_log(eval_log.decode("utf-8", errors="replace"))
+                metrics = self._import_metrics_from_eval_log(
+                    spec, eval_log.decode("utf-8", errors="replace"))
             except _BundleReject as e:
                 g.gate_finish_attempt(
                     attempt_id=aid, status="failed", failure_kind=e.failure_kind,

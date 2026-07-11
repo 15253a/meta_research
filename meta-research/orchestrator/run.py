@@ -62,6 +62,10 @@ from .import_triggers import (
     TrustedImportTriggerService,
 )
 from .import_worker import ImportWorker
+from .repository_materializer import (
+    GitHubRepositoryMaterializer,
+    ProductionCandidateFetcher,
+)
 from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
                      InteractionNotifier, Outbox, ResearchNotifier,
@@ -1118,6 +1122,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     # so assembly fails closed before any new external capability can start.
     execution_supervisor.recover_previous_generation()
     execution_sandbox = None
+    repository_materializer = None
     if attack is True:
         execution_sandbox = DockerExecutionSandbox(
             work_root=work, config=policy["execution"]["sandbox"],
@@ -1126,6 +1131,13 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         # scientific failure.  Prove the exact local image/daemon/seccomp
         # before SQLite or any connector/provider side effect is exposed.
         execution_sandbox.preflight()
+        repository_materializer = GitHubRepositoryMaterializer(
+            work_root=work,
+            config=policy["import_materialization"],
+            sandbox_config=policy["execution"]["sandbox"],
+            auto_license=policy["import_search"]["auto_license"],
+            runtime_environment=execution_sandbox.image_environment,
+            owner_guard=owner_guard)
         execution_sandbox.recover_terminal_sessions(execution_supervisor)
 
     expected_work_fd = open_directory_path(work, label="system work_root")
@@ -1371,7 +1383,12 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             execution_sandbox=execution_sandbox)
         import_worker = ImportWorker(
             state=state, pool_gate=pool_gate,
-            providers={"fetch": FrozenCandidateFetcher(), "judge": judge},
+            providers={
+                "fetch": ProductionCandidateFetcher(
+                    legacy_fetcher=FrozenCandidateFetcher(),
+                    repository_fetcher=repository_materializer),
+                "judge": judge,
+            },
             obs_policy=policy["observation"], work_root=str(work),
             owner_guard=(owner_guard if instance_lease is not None else None),
             execution_supervisor=execution_supervisor,

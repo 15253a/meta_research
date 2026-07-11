@@ -358,8 +358,38 @@ class PoolGate(ExecGate):
         ci = _cnum(cycle_id)
         self._assert_current_cycle(ci, action="new_protocol")
         active = self._q1("SELECT active_question_id FROM cycle WHERE id=?", (ci,))
-        if active is None or active[0] is None:
-            self._reject(ci, "new_protocol 要求 current cycle 有 active question")
+        derived_question = active[0] if active is not None else None
+        if derived_question is None:
+            # Import workers deliberately do not seize question.active_cycle or
+            # cycle.active_question_id.  Their append-only marker is the exact
+            # authority used by the rest of the import gate path.
+            worker = self._q1(
+                """
+                SELECT COUNT(*),
+                  MIN(json_extract(d.payload_json,'$.question_id')),
+                  MAX(json_extract(d.payload_json,'$.question_id')),
+                  MIN(json_extract(d.payload_json,'$.external_import_id')),
+                  MAX(json_extract(d.payload_json,'$.external_import_id'))
+                FROM cycle c JOIN decision d ON d.cycle_id=c.id
+                WHERE c.id=? AND c.active_question_id IS NULL AND c.route IS NULL
+                  AND d.actor='orchestrator' AND d.type='import_worker_cycle'
+                  AND json_valid(d.payload_json)
+                  AND json_type(d.payload_json,'$.question_id')='integer'
+                  AND json_type(d.payload_json,'$.external_import_id')='integer'
+                """,
+                (ci,))
+            derived_question = (
+                worker[1] if worker is not None and worker[0] == 1
+                and worker[1] == worker[2] and worker[3] == worker[4]
+                else None)
+            qrow = (self._q1(
+                "SELECT q.goal_id,q.goal_ver,q.status,c.goal_id,c.goal_ver "
+                "FROM question q JOIN cycle c ON c.id=? WHERE q.id=?",
+                (ci, derived_question)) if derived_question is not None else None)
+            if (qrow is None or tuple(qrow[:2]) != tuple(qrow[3:])
+                    or qrow[2] not in ("open", "inconclusive")):
+                self._reject(
+                    ci, "new_protocol 要求 active question 或 exact import worker marker")
         if self._q1("SELECT 1 FROM protocol WHERE id=? AND version=?", (protocol_id, version)):
             self._reject(ci, f"I1：protocol ({protocol_id}@{version}) 已存在——改场景须升 version 提交新版")
         seen_defs = set()
@@ -385,7 +415,7 @@ class PoolGate(ExecGate):
                 conn.execute(
                     "INSERT INTO protocol(id,version,name,scope_spec_json,derived_from_question) "
                     "VALUES (?,?,?,?,?)",
-                    (protocol_id, version, name, scope_spec_json, active[0]))
+                    (protocol_id, version, name, scope_spec_json, derived_question))
                 for md in (metric_defs or []):
                     # self.read 只见已提交态（对既有 def 去重正确）；批内重复已在上前置拒
                     if self._q1("SELECT 1 FROM metric_def WHERE id=? AND version=?", (md["id"], md["version"])) is None:

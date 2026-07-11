@@ -426,5 +426,11 @@
       - [ ] CP11.4c.2 通用 pinned repository 物化与部署信任：补 GitHub discovery → exact archive/tree/LFS/依赖
         闭包与 adapter 生成/评审的生产路径；明确独立 service account/VM、Docker socket、cgroup/device/GPU、
         hard byte+inode quota 与环境镜像供应链验收，不能把 bootstrap image/host 同 UID 信任域冒充完整隔离。
+        - [ ] CP11.4c.2a exact repository snapshot 与 worker bridge：非 recursive Git tree 对象+逐文件
+          commit archive 双核，pinned 子模块/license、LFS/symlink 明示拒绝、内容寻址发布、
+          adapter v2/pinned-image-only 供应链、稳定 protocol/metric 家族与 file-backed ImportWorker。
+        - [ ] CP11.4c.2b 缺失 adapter 的受审生成、LFS OID/项目依赖 lock 验证与专用 image，
+          并把 service account/VM、Docker socket、cgroup/device/GPU、hard byte+inode quota 落成 fail-closed
+          部署合同/预检；未具备的能力只列验收，不伪造通过。
       - [ ] CP11.4c.3 最终实机验收：目标 VEPFS 两节点 owner/lease/fd 行为，100+ 轮含真实 Codex/import/训练、
         owner-kill/daemon-loss/预算与资源失败注入的 soak，并发布可重放证据包。
