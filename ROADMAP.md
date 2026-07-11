@@ -435,5 +435,12 @@
         - [ ] CP11.4c.2b 缺失 adapter 的受审生成、LFS OID/项目依赖 lock 验证与专用 image，
           并把 service account/VM、Docker socket、cgroup/device/GPU、hard byte+inode quota 落成 fail-closed
           部署合同/预检；未具备的能力只列验收，不伪造通过。
+          - [ ] CP11.4c.2b.1 repository materializer component boundaries：把单体物化器按 shared identity、
+            transport、Git tree、archive/submodule、adapter、content store 拆成可独立演进的组件，保持 snapshot
+            protocol/hash/cache layout 与 facade compatibility 不变。
+          - [ ] CP11.4c.2b.2 repository closure：缺失 adapter 的有界生成/评审、Git LFS batch OID+size 下载核验、
+            dependency lock 到专用 exact image 的可复现构建与启动验收。
+          - [ ] CP11.4c.2b.3 deployment trust contract：service account/VM、Docker socket、cgroup/device/GPU、
+            VEPFS hard byte+inode quota 启动前 fail-closed 预检与证据；开发模式不得冒充生产通过。
       - [ ] CP11.4c.3 最终实机验收：目标 VEPFS 两节点 owner/lease/fd 行为，100+ 轮含真实 Codex/import/训练、
         owner-kill/daemon-loss/预算与资源失败注入的 soak，并发布可重放证据包。
