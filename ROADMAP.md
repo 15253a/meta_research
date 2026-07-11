@@ -21,7 +21,8 @@
   owner-death 整树排空已落 `2f4a5d5`；CP11.3c current lineage、owner-first 外调、receipt→DB 对账与
   120 轮状态稳定性已落 `a32629d`。CP11.4a.1 冻结 import 消费/dependency_wait/worker 恢复与独立 plan 评审
   已落 `43c4134`；CP11.4a.2 `new_structure` 生产 import_search/import_register 与 license provenance 已落
-  `43dd99e`；当前进入 CP11.4a.3 三闸直接/状态来源契约。
+  `43dd99e`；CP11.4a.3 human/stuck/SOTA 可信来源、独立参照题与冻结激活已落 `a31658e`，CP11.4a 达成；
+  当前进入 CP11.4b artifact capability/fd-safe 与 provider 精确补账。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -389,7 +390,7 @@
       （build_log 0059；相关 78/101/102/80/45/77/59/20/13；唯一全量 1235 过/5 旧契约锚，修后 exact 5/5；
       外审两轮均因基础设施失败无 verdict）。
   - [ ] CP11.4 残余架构边界（子检查点全完成后勾选）：
-    - [ ] CP11.4a 默认 import/dependency_wait + 独立 plan 评审：生产装配 `ImportWorker`，闭合
+    - [x] CP11.4a 默认 import/dependency_wait + 独立 plan 评审：生产装配 `ImportWorker`，闭合
       `import_register → dependency_wait → materialize → release` 的幂等/崩溃恢复；plan answerability review
       独立于生成器、最多两轮且 verdict 耐久。
       - [x] CP11.4a.1 冻结候选消费与恢复：exact candidate/license 内容哈希与四锚、plan phase 单事务
@@ -400,9 +401,11 @@
         `import_search` → 短事务 `import_register`；请求/零结果/runner receipt 可恢复，候选 pinned revision、license
         content evidence、auto/human provenance 可机械核验，历史 v2 hash 可续。→ commit `43dd99e`（build_log 0061；
         相关 358/158/20/91；唯一全量 1297；外审第2轮上限后反馈处置）。
-      - [ ] CP11.4a.3 三闸直接/状态来源契约：`human_named` 只接受结构化 directive provenance；
-        `sota_reference` 只接受冻结 paper/benchmark snapshot；`stuck` 普查只能新建 idea/question，再由新问题按
-        `new_structure` 触发发现，禁止原问题直接 `import_defer`。三路都需重启可回放、与 candidate/license 四锚闭合。
+      - [x] CP11.4a.3 三闸直接/状态来源契约：`human_named` 只接受结构化 directive provenance；
+        `sota_reference` 只接受冻结 paper/benchmark snapshot；`stuck` 普查只新建独立参照 question，子题在自己的
+        action-cycle 按冻结 authority 激活，禁止原问题直接登记候选/`import_defer`。三路均可重启回放并与
+        candidate/license 四锚闭合。→ commit `a31658e`（build_log 0062；相关 217/392/130/17；外审反馈全修；
+        唯一全量 1322）—— **CP11.4a 达成**。
     - [ ] CP11.4b 内容寻址与精确调用补账：artifact capability/fd-safe 消费，消除 checkpoint hash/open TOCTOU；
       provider invocation ID、usage/billing receipt 与 runner_call exactly-once 对账。
     - [ ] CP11.4c 敌对隔离与最终长程验收：container/cgroup/VM 或等价强隔离、guardian/receipt 防篡改、跨节点
