@@ -92,16 +92,31 @@ class DeferredImporter:
     def __init__(self, daemon: WriteDaemon):
         self.daemon = daemon
 
-    def register_candidate(self, *, question_id: str, discovered_cycle: str, trigger_kind: str,
-                           trigger_snapshot_hash: str, need_summary: str, source_kind: str,
-                           canonical_uri: str, search_snapshot_json: str, search_snapshot_hash: str,
-                           rank: int, retrieved_at: str, revision: Optional[str] = None) -> int:
-        """发现登记：写不可变 external_candidate 发现快照（append-only，护 I6）。返回 candidate id。"""
+    @classmethod
+    def register_candidate_in_txn(
+            cls, conn, *, question_id: str, discovered_cycle: str, trigger_kind: str,
+            trigger_snapshot_hash: str, need_summary: str, source_kind: str,
+            canonical_uri: str, search_snapshot_json: str, search_snapshot_hash: str,
+            rank: int, retrieved_at: str, revision: Optional[str] = None,
+            license_id_seen: Optional[str] = None,
+            search_provider: Optional[str] = None,
+            search_query: Optional[str] = None) -> int:
+        """Register one immutable discovery snapshot inside the caller's short transaction."""
+        if not getattr(conn, "in_transaction", False):
+            raise RuntimeError("register_candidate_in_txn 必须在 WriteDaemon 短事务内调用")
         _bounded_text(trigger_snapshot_hash, field="trigger_snapshot_hash", max_bytes=256)
         _bounded_text(need_summary, field="need_summary", max_bytes=4096)
         _bounded_text(canonical_uri, field="canonical_uri", max_bytes=4096)
         _bounded_text(revision, field="revision", max_bytes=512, optional=True)
+        _bounded_text(
+            license_id_seen, field="license_id_seen", max_bytes=256, optional=True)
+        _bounded_text(
+            search_provider, field="search_provider", max_bytes=256, optional=True)
+        _bounded_text(search_query, field="search_query", max_bytes=4096, optional=True)
         _bounded_text(search_snapshot_hash, field="search_snapshot_hash", max_bytes=256)
+        _bounded_text(retrieved_at, field="retrieved_at", max_bytes=256)
+        if (isinstance(rank, bool) or not isinstance(rank, int) or rank < 0):
+            raise ValueError("external_candidate.rank 须为非负整数")
         _bounded_text(
             search_snapshot_json, field="search_snapshot_json",
             max_bytes=_MAX_DISCOVERY_SNAPSHOT_BYTES)
@@ -111,19 +126,49 @@ class DeferredImporter:
         if search_snapshot_hash != actual_snapshot_hash:
             raise ValueError(
                 "search_snapshot_hash 与 search_snapshot_json 的精确 UTF-8 字节不一致")
-        with self.daemon.transaction() as conn:
-            return conn.execute(
-                "INSERT INTO external_candidate(question_id,discovered_cycle,trigger_kind,trigger_snapshot_hash,"
-                "need_summary,source_kind,canonical_uri,revision,search_snapshot_json,search_snapshot_hash,rank,retrieved_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (_qnum(question_id), _cnum(discovered_cycle), trigger_kind, trigger_snapshot_hash, need_summary,
-                 source_kind, canonical_uri, revision, search_snapshot_json, search_snapshot_hash, rank, retrieved_at)
-            ).lastrowid
+        return conn.execute(
+            "INSERT INTO external_candidate(question_id,discovered_cycle,trigger_kind,trigger_snapshot_hash,"
+            "need_summary,source_kind,canonical_uri,revision,license_id_seen,search_provider,search_query,"
+            "search_snapshot_json,search_snapshot_hash,rank,retrieved_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (_qnum(question_id), _cnum(discovered_cycle), trigger_kind, trigger_snapshot_hash,
+             need_summary, source_kind, canonical_uri, revision, license_id_seen,
+             search_provider, search_query, search_snapshot_json, search_snapshot_hash,
+             rank, retrieved_at)).lastrowid
 
-    def review_license(self, *, candidate_id: int, decision: str, actor: str = "auto",
-                       license_scope_json: Optional[str] = None, decided_cycle: Optional[str] = None,
-                       policy_hash: Optional[str] = None) -> int:
-        """license 裁定（append-only 事件；allow 须带 scope，DDL CHECK 焊）。返回 license_review id。"""
+    def register_candidate(self, *, question_id: str, discovered_cycle: str, trigger_kind: str,
+                           trigger_snapshot_hash: str, need_summary: str, source_kind: str,
+                           canonical_uri: str, search_snapshot_json: str, search_snapshot_hash: str,
+                           rank: int, retrieved_at: str, revision: Optional[str] = None,
+                           license_id_seen: Optional[str] = None,
+                           search_provider: Optional[str] = None,
+                           search_query: Optional[str] = None) -> int:
+        """发现登记：写不可变 external_candidate 发现快照（append-only，护 I6）。返回 candidate id。"""
+        with self.daemon.transaction() as conn:
+            return self.register_candidate_in_txn(
+                conn, question_id=question_id, discovered_cycle=discovered_cycle,
+                trigger_kind=trigger_kind, trigger_snapshot_hash=trigger_snapshot_hash,
+                need_summary=need_summary, source_kind=source_kind,
+                canonical_uri=canonical_uri, revision=revision,
+                license_id_seen=license_id_seen, search_provider=search_provider,
+                search_query=search_query, search_snapshot_json=search_snapshot_json,
+                search_snapshot_hash=search_snapshot_hash, rank=rank,
+                retrieved_at=retrieved_at)
+
+    @classmethod
+    def review_license_in_txn(
+            cls, conn, *, candidate_id: int, decision: str, actor: str = "auto",
+            license_scope_json: Optional[str] = None, decided_cycle: Optional[str] = None,
+            policy_hash: Optional[str] = None, license_id: Optional[str] = None,
+            evidence_ref: Optional[str] = None) -> int:
+        """Append one license decision inside the caller's short transaction."""
+        if not getattr(conn, "in_transaction", False):
+            raise RuntimeError("review_license_in_txn 必须在 WriteDaemon 短事务内调用")
+        if (isinstance(candidate_id, bool) or not isinstance(candidate_id, int)
+                or candidate_id <= 0):
+            raise ValueError("license candidate_id 须为正整数")
+        _bounded_text(license_id, field="license_id", max_bytes=256, optional=True)
+        _bounded_text(evidence_ref, field="license evidence_ref", max_bytes=4096, optional=True)
         if license_scope_json is not None:
             _bounded_text(
                 license_scope_json, field="license_scope_json",
@@ -140,13 +185,24 @@ class DeferredImporter:
                 raise ValueError("license_scope_json 的 capability 值必须为 boolean")
         if policy_hash is not None:
             _bounded_text(policy_hash, field="license policy_hash", max_bytes=256)
+        return conn.execute(
+            "INSERT INTO license_review(candidate_id,decision,license_id,evidence_ref,actor,"
+            "license_scope_json,decided_cycle,policy_hash) VALUES (?,?,?,?,?,?,?,?)",
+            (candidate_id, decision, license_id, evidence_ref, actor,
+             license_scope_json, _cnum(decided_cycle) if decided_cycle else None,
+             policy_hash)).lastrowid
+
+    def review_license(self, *, candidate_id: int, decision: str, actor: str = "auto",
+                       license_scope_json: Optional[str] = None, decided_cycle: Optional[str] = None,
+                       policy_hash: Optional[str] = None, license_id: Optional[str] = None,
+                       evidence_ref: Optional[str] = None) -> int:
+        """license 裁定（append-only 事件；allow 须带 scope，DDL CHECK 焊）。返回 license_review id。"""
         with self.daemon.transaction() as conn:
-            return conn.execute(
-                "INSERT INTO license_review(candidate_id,decision,actor,license_scope_json,decided_cycle,policy_hash) "
-                "VALUES (?,?,?,?,?,?)",
-                (candidate_id, decision, actor, license_scope_json,
-                 _cnum(decided_cycle) if decided_cycle else None, policy_hash)
-            ).lastrowid
+            return self.review_license_in_txn(
+                conn, candidate_id=candidate_id, decision=decision, actor=actor,
+                license_scope_json=license_scope_json, decided_cycle=decided_cycle,
+                policy_hash=policy_hash, license_id=license_id,
+                evidence_ref=evidence_ref)
 
     @staticmethod
     def policy_hash(policy: Dict[str, Any]) -> str:
@@ -170,7 +226,8 @@ class DeferredImporter:
         _bounded_text(policy_hash, field="plan import policy_hash", max_bytes=256)
         rows = conn.execute(
             "SELECT id,trigger_kind,trigger_snapshot_hash,need_summary,source_kind,"
-            "canonical_uri,revision,search_snapshot_hash,rank "
+            "canonical_uri,revision,license_id_seen,search_provider,search_query,"
+            "search_snapshot_hash,rank "
             "FROM external_candidate WHERE question_id=? AND discovered_cycle=? "
             "ORDER BY rank,canonical_uri,COALESCE(revision,''),source_kind,"
             "trigger_snapshot_hash,search_snapshot_hash",
@@ -196,21 +253,43 @@ class DeferredImporter:
                 "revision": _bounded_text(
                     row[6], field=f"external_candidate {row[0]} revision",
                     max_bytes=512, optional=True),
+                "license_id_seen": _bounded_text(
+                    row[7], field=f"external_candidate {row[0]} license_id_seen",
+                    max_bytes=256, optional=True),
+                "search_provider": _bounded_text(
+                    row[8], field=f"external_candidate {row[0]} search_provider",
+                    max_bytes=256, optional=True),
+                "search_query": _bounded_text(
+                    row[9], field=f"external_candidate {row[0]} search_query",
+                    max_bytes=4096, optional=True),
                 "search_snapshot_hash": _bounded_text(
-                    row[7], field=f"external_candidate {row[0]} search_snapshot_hash",
+                    row[10], field=f"external_candidate {row[0]} search_snapshot_hash",
                     max_bytes=256),
-                "rank": row[8],
+                "rank": row[11],
             })
         # SQLite surrogate ids are local references, not discovery content.  They must never enter
         # the I6 hash: restoring the same immutable snapshots into a fresh DB may allocate different
         # row ids but must reproduce the same candidate-set identity and deterministic choice.
+        legacy_candidate_keys = (
+            "trigger_kind", "trigger_snapshot_hash", "need_summary", "source_kind",
+            "canonical_uri", "revision", "search_snapshot_hash", "rank")
+        provenance_candidate_keys = legacy_candidate_keys[:-2] + (
+            "license_id_seen", "search_provider", "search_query") + legacy_candidate_keys[-2:]
+        # CP11.4a.1 already persisted v2 hashes for candidates registered before the production
+        # connector existed.  Those rows have all three additive provenance columns NULL.  Keep the
+        # exact v2 formula for them so a crash-staged import_defer remains commit-compatible across
+        # upgrade; only connector-backed rows opt into v3.
+        candidate_hash_version = (3 if any(
+            candidate[key] is not None
+            for candidate in candidates
+            for key in ("license_id_seen", "search_provider", "search_query")) else 2)
+        candidate_hash_keys = (provenance_candidate_keys
+                               if candidate_hash_version == 3 else legacy_candidate_keys)
         candidate_hash_records = [{
-            key: candidate[key] for key in (
-                "trigger_kind", "trigger_snapshot_hash", "need_summary", "source_kind",
-                "canonical_uri", "revision", "search_snapshot_hash", "rank")
+            key: candidate[key] for key in candidate_hash_keys
         } for candidate in candidates]
         candidate_set_hash = _snapshot_hash({
-            "version": 2, "selection_key": "rank_asc",
+            "version": candidate_hash_version, "selection_key": "rank_asc",
             "candidates": candidate_hash_records,
         })
         candidate_ids = [item["candidate_id"] for item in candidates]
@@ -218,36 +297,43 @@ class DeferredImporter:
         if candidate_ids:
             placeholders = ",".join("?" for _ in candidate_ids)
             review_rows = conn.execute(
-                "SELECT id,candidate_id,decision,license_scope_json,actor,policy_hash "
+                "SELECT id,candidate_id,decision,license_id,evidence_ref,license_scope_json,actor,policy_hash "
                 f"FROM license_review WHERE candidate_id IN ({placeholders}) AND decided_cycle=? "
                 "ORDER BY candidate_id,id", (*candidate_ids, action_cycle)).fetchall()
         reviews = []
         terminal_by_candidate: Dict[int, list] = {}
         for row in review_rows:
-            if row[3] is not None:
-                _bounded_text(
-                    row[3], field=f"license_review {row[0]} scope",
-                    max_bytes=_MAX_LICENSE_SCOPE_BYTES)
             if row[5] is not None:
                 _bounded_text(
-                    row[5], field=f"license_review {row[0]} policy_hash",
+                    row[5], field=f"license_review {row[0]} scope",
+                    max_bytes=_MAX_LICENSE_SCOPE_BYTES)
+            if row[7] is not None:
+                _bounded_text(
+                    row[7], field=f"license_review {row[0]} policy_hash",
                     max_bytes=256)
+            _bounded_text(
+                row[3], field=f"license_review {row[0]} license_id",
+                max_bytes=256, optional=True)
+            _bounded_text(
+                row[4], field=f"license_review {row[0]} evidence_ref",
+                max_bytes=4096, optional=True)
             try:
                 scope = (json.loads(
-                    row[3], parse_constant=lambda token: (_ for _ in ()).throw(
+                    row[5], parse_constant=lambda token: (_ for _ in ()).throw(
                         ValueError(f"非有限 JSON number: {token}")))
-                         if row[3] is not None else None)
+                         if row[5] is not None else None)
             except (json.JSONDecodeError, ValueError) as error:
                 raise ValueError(f"license_review {row[0]} scope JSON 损坏") from error
             if scope is not None and not isinstance(scope, dict):
                 raise ValueError(f"license_review {row[0]} scope 须为 JSON object")
             item = {
                 "license_review_id": row[0], "candidate_id": row[1],
-                "decision": row[2], "license_scope": scope,
-                "actor": row[4], "policy_hash": row[5],
+                "decision": row[2], "license_id": row[3],
+                "evidence_ref": row[4], "license_scope": scope,
+                "actor": row[6], "policy_hash": row[7],
             }
             reviews.append(item)
-            if row[2] in ("allow", "deny") and row[5] == policy_hash:
+            if row[2] in ("allow", "deny") and row[7] == policy_hash:
                 terminal_by_candidate.setdefault(row[1], []).append(item)
         for candidate_id, events in terminal_by_candidate.items():
             if len(events) > 1:
@@ -258,17 +344,28 @@ class DeferredImporter:
             candidate["candidate_id"]: content
             for candidate, content in zip(candidates, candidate_hash_records)
         }
-        review_hash_records = [{
-            "candidate": candidate_content_by_id[review["candidate_id"]],
-            "decision": review["decision"],
-            "license_scope": review["license_scope"],
-            "actor": review["actor"],
-            "policy_hash": review["policy_hash"],
-        } for review in reviews]
+        review_hash_version = (3 if candidate_hash_version == 3 or any(
+            review["license_id"] is not None or review["evidence_ref"] is not None
+            for review in reviews) else 2)
+        review_hash_records = []
+        for review in reviews:
+            record = {
+                "candidate": candidate_content_by_id[review["candidate_id"]],
+                "decision": review["decision"],
+                "license_scope": review["license_scope"],
+                "actor": review["actor"],
+                "policy_hash": review["policy_hash"],
+            }
+            if review_hash_version == 3:
+                record.update({
+                    "license_id": review["license_id"],
+                    "evidence_ref": review["evidence_ref"],
+                })
+            review_hash_records.append(record)
         review_hash_records.sort(key=lambda item: json.dumps(
             item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
         license_hash = _snapshot_hash({
-            "version": 2, "candidate_set_hash": candidate_set_hash,
+            "version": review_hash_version, "candidate_set_hash": candidate_set_hash,
             "reviews": review_hash_records,
         })
         rejected = []

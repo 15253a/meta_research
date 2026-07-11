@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "trigger_kind": "stuck",
+  "query": "find anything better",
+  "need_summary": "原问题连续无结论，试图直接 import"
+}

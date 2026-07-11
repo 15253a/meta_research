@@ -112,7 +112,7 @@ def test_gate_level2_rejects_dangling_refs(gate, store):
 
 
 def test_artifact_map_covers_all_process_files():
-    """Gate 校验对象清单；resource_request.json（sidecar）故意不在其中（§6.11 非 Gate 产物）。"""
+    """Gate 事实产物清单；resource/import_search control sidecar 故意不在其中。"""
     expected = {
         "idea_set.json", "idea_set.draft.json", "idea_audit.json",
         "plan.json", "plan_review.json", "bundle_target.json",
@@ -129,6 +129,16 @@ def test_gate_rejects_sidecar_as_artifact(gate, store):
     cycle = store.open_or_resume_cycle()
     res = gate.commit(Artifact(stage="plan", files={"resource_request.json": sidecar}, md=""),
                       cycle_id=cycle.cycle_id, stage="plan")
+    assert not res.ok and any("sidecar 非 Gate 产物" in e for e in res.errors)
+
+
+def test_gate_rejects_import_search_control_sidecar_as_artifact(gate, store):
+    sidecar = load_json(
+        FIXTURES_DIR / "valid/import_search_request/new_structure.json")
+    cycle = store.open_or_resume_cycle()
+    res = gate.commit(
+        Artifact(stage="plan", files={"import_search_request.json": sidecar}, md=""),
+        cycle_id=cycle.cycle_id, stage="plan")
     assert not res.ok and any("sidecar 非 Gate 产物" in e for e in res.errors)
 
 

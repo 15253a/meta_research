@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "trigger_kind": "new_structure",
+  "query": "long context sequence model benchmark implementation",
+  "need_summary": "当前问题需要一个独立的外部 comparator baseline 家族"
+}

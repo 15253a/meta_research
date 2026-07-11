@@ -422,6 +422,7 @@ def test_main_second_ctrl_c_during_fallback_drain_kills_groups(tmp_path, monkeyp
 # ============ 全装配端到端（reasoning-only 闭环）============
 def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
     from orchestrator.import_fetcher import FrozenCandidateFetcher
+    from orchestrator.import_search import GitHubRepoSearchProvider, ImportSearchService
     from orchestrator.import_worker import ImportWorker
     from orchestrator.stage_provider import PlanReviewProvider
 
@@ -432,6 +433,28 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         assert isinstance(worker.p["fetch"], FrozenCandidateFetcher)
         assert worker.execution_supervisor is system.execution_supervisor
         assert isinstance(system.advancer.attack.p["plan_review"], PlanReviewProvider)
+        search = system.advancer.attack.p["import_search"]
+        assert isinstance(search, ImportSearchService)
+        assert isinstance(search.provider, GitHubRepoSearchProvider)
+    finally:
+        system.close()
+
+
+def test_attack_assembly_accepts_deterministic_readonly_search_provider(tmp_path):
+    class RepoSearch:
+        name = "github_rest_v1"
+
+        def search(self, *, query, max_candidates):
+            raise AssertionError("assembly must not search eagerly")
+
+    provider = RepoSearch()
+    system = build_system(
+        SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]),
+        import_search_provider=provider)
+    try:
+        assert system.advancer.attack.p["import_search"].provider is provider
+        assert system.daemon.query_one(
+            "SELECT count(*) FROM runner_call WHERE phase='import_search'")[0] == 0
     finally:
         system.close()
 

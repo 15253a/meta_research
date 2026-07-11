@@ -66,6 +66,8 @@ def _pack(stage):
 _FIX = SYSTEM_ROOT / "tests" / "fixtures" / "valid"
 _IDEA = json.loads((_FIX / "idea_set" / "wildidea.json").read_text(encoding="utf-8"))
 _PLAN = json.loads((_FIX / "plan" / "attack.json").read_text(encoding="utf-8"))
+_IMPORT_SEARCH_REQUEST = json.loads(
+    (_FIX / "import_search_request" / "new_structure.json").read_text(encoding="utf-8"))
 
 
 # ============ 正常产出（三阶段各直测 schema 校验路径）============
@@ -79,6 +81,30 @@ def test_plan_returns_validated_files(tmp_path):
     sp, _ = _provider([{"plan.json": _PLAN}], tmp_path)
     out = sp.plan(NS(cycle_id="c1"), _pack("plan"))
     assert out == {"plan.json": _PLAN}
+
+
+def test_plan_may_return_import_search_control_sidecar_alone(tmp_path):
+    sp, _ = _provider(
+        [{"import_search_request.json": _IMPORT_SEARCH_REQUEST}], tmp_path)
+    out = sp.plan(NS(cycle_id="c1"), _pack("plan"))
+    assert out == {"import_search_request.json": _IMPORT_SEARCH_REQUEST}
+
+
+def test_plan_search_sidecar_cannot_coexist_with_plan(tmp_path):
+    sp, runner = _provider([
+        {"import_search_request.json": _IMPORT_SEARCH_REQUEST, "plan.json": _PLAN},
+        {"plan.json": _PLAN},
+    ], tmp_path)
+    assert sp.plan(NS(cycle_id="c1"), _pack("plan")) == {"plan.json": _PLAN}
+    assert "独占 files" in runner.skills_seen[1]
+
+
+def test_plan_search_sidecar_rejects_stuck_direct_trigger(tmp_path):
+    bad = {**_IMPORT_SEARCH_REQUEST, "trigger_kind": "stuck"}
+    sp, runner = _provider([
+        {"import_search_request.json": bad}, {"plan.json": _PLAN}], tmp_path)
+    assert sp.plan(NS(cycle_id="c1"), _pack("plan")) == {"plan.json": _PLAN}
+    assert "new_structure" in runner.skills_seen[1]
 
 
 def test_reasoning_returns_validated_files(tmp_path):

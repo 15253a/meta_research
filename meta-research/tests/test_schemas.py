@@ -30,6 +30,8 @@ STAGE_SCHEMAS = [
     "interaction_reply_candidate",
     # 过程产物（runner_call 级契约：生成草稿 / 判官 / 评审输出，驱动器消费）
     "idea_set_draft", "idea_audit", "plan_review",
+    # plan 只读发现控制 sidecar（编排器消费，不入 Gate）
+    "import_search_request",
 ]
 
 
@@ -180,7 +182,20 @@ def test_policy_defaults_match_appendix_c_spotchecks():
     assert p["tree_guard"] == {
         "max_decompose_depth": 4, "max_children_per_node": 6, "max_open_questions": 30,
     }
+    assert p["retrieval"]["scale_thresholds"] == {
+        "medium": {"est_cost_ratio": 0.25, "score": 0.40},
+        "large": {"est_cost_ratio": 0.75, "score": 0.75},
+    }
     assert p["interaction_request"]["max_items_per_request"] == 10
+    assert p["import_search"] == {
+        "provider": "github_rest_v1", "max_candidates": 10,
+        "timeout_s": 20, "max_response_bytes": 2097152,
+        "auto_license": {
+            "allow_spdx": ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC"],
+            "scope": {"allow_eval": True, "allow_modify": True,
+                      "allow_publish_pool": True, "allow_redistribute": False},
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

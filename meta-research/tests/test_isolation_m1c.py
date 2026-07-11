@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 
@@ -312,6 +313,38 @@ def test_plan_snapshot_hashes_exclude_sqlite_surrogate_ids():
     assert direct[2]["candidate_set_hash"] == shifted[2]["candidate_set_hash"]
     assert (direct[2]["license_decision_snapshot_hash"]
             == shifted[2]["license_decision_snapshot_hash"])
+
+    # Upgrade compatibility: rows created before CP11.4a.2 have NULL
+    # license_id_seen/search_provider/search_query and license evidence fields.
+    # Their exact CP11.4a.1 v2 hashes must remain unchanged so a persisted
+    # pre-commit import_defer can still pass commit-time revalidation.
+    legacy = direct[2]
+    candidate = legacy["candidates"][0]
+    candidate_record = {key: candidate[key] for key in (
+        "trigger_kind", "trigger_snapshot_hash", "need_summary", "source_kind",
+        "canonical_uri", "revision", "search_snapshot_hash", "rank")}
+
+    def content_hash(value):
+        raw = json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+    expected_candidate_hash = content_hash({
+        "version": 2, "selection_key": "rank_asc",
+        "candidates": [candidate_record],
+    })
+    review = legacy["reviews"][0]
+    expected_license_hash = content_hash({
+        "version": 2, "candidate_set_hash": expected_candidate_hash,
+        "reviews": [{
+            "candidate": candidate_record, "decision": review["decision"],
+            "license_scope": review["license_scope"], "actor": review["actor"],
+            "policy_hash": review["policy_hash"],
+        }],
+    })
+    assert legacy["candidate_set_hash"] == expected_candidate_hash
+    assert legacy["license_decision_snapshot_hash"] == expected_license_hash
 
 
 def test_registration_requires_exact_strict_snapshot_hash(env):

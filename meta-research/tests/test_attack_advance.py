@@ -27,6 +27,7 @@ from orchestrator.compiler_sqlite import SqliteCompiler
 from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import GateInvariantError, SqliteGate, open_gate_read_conn
 from orchestrator.ids import SQLITE_INT_MAX
+from orchestrator.import_search import ImportSearchService
 from orchestrator.importer import DeferredImporter
 from orchestrator.manifest import canon_hash as manifest_canon
 from orchestrator.schemas import SchemaSet
@@ -1301,6 +1302,174 @@ def _deferred_plan_for_current_cycle(daemon, cyc):
             },
         },
     }}
+
+
+class _RepoSearchProvider:
+    name = "github_rest_v1"
+
+    def __init__(self, *, with_candidate=True):
+        self.with_candidate = with_candidate
+        self.calls = []
+
+    def search(self, *, query, max_candidates):
+        self.calls.append((query, max_candidates))
+        revision = "d" * 40
+        candidates = ([{
+            "provider_result_id": "repo-1",
+            "canonical_uri": "https://github.com/example/comparator",
+            "revision": revision,
+            "repository": {
+                "full_name": "example/comparator", "default_branch": "main",
+                "stars": 100, "updated_at": "2026-07-01T00:00:00Z",
+            },
+            "license": {
+                "spdx_id": "MIT", "lookup_status": "found",
+                "evidence_ref": (
+                    "https://api.github.com/repos/example/comparator/contents/"
+                    f"LICENSE?ref={revision}"),
+                "content_sha256": "sha256:" + "e" * 64,
+            },
+        }] if self.with_candidate else [])
+        return {
+            "provider": self.name, "query": query,
+            "retrieved_at": "2026-07-11T00:00:00+00:00",
+            "candidates": candidates, "skipped": [],
+        }
+
+
+_SEARCH_REQUEST = {
+    "version": 1, "trigger_kind": "new_structure",
+    "query": "external comparator implementation",
+    "need_summary": "当前问题需要独立外部 comparator baseline 家族",
+}
+
+
+def _plan_defer_from_registered_search(daemon, cyc):
+    policy_hash = DeferredImporter.policy_hash(POLICY)
+    snapshot = DeferredImporter.plan_snapshot(
+        daemon.conn, question_id=int(cyc.question_id[1:]),
+        action_cycle=int(cyc.cycle_id[1:]), policy_hash=policy_hash)
+    assert snapshot["selected"] is not None
+    return {"plan.json": {
+        "needs": [], "reuse_evidence": [], "targets": [],
+        "build_target_required_metric": [],
+        "import_defer": {
+            "reason_md": "需将受信搜索登记的冻结 comparator 进入物化队列",
+            "candidate_set_hash": snapshot["candidate_set_hash"],
+            "license_decision_snapshot_hash": snapshot["license_decision_snapshot_hash"],
+            "selection_key": snapshot["selection_key"],
+            "policy_hash": snapshot["policy_hash"],
+            "placeholder_baseline_identity": {
+                "canonical_key_draft": "searched-comparator",
+                "slug_draft": "searched-comparator",
+                "identity_md": "# 搜索登记的外部 comparator\n尚待强隔离物化",
+            },
+        },
+    }}
+
+
+def test_plan_search_register_rerender_then_import_defer_is_reachable(tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    repo_search = _RepoSearchProvider()
+    attack.p["import_search"] = ImportSearchService(
+        daemon=daemon, policy=POLICY, provider=repo_search,
+        work_root=str(tmp_path / "w"))
+    plan_packs = []
+
+    def plan(cyc, pack):
+        plan_packs.append(pack)
+        if len(plan_packs) == 1:
+            assert '"may_request_import_search":true' in pack.anchor_md
+            return {"import_search_request.json": dict(_SEARCH_REQUEST)}
+        assert '"may_emit_import_defer":true' in pack.anchor_md
+        return _plan_defer_from_registered_search(daemon, cyc)
+
+    attack.p["plan"] = plan
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
+
+    assert ids == ["c2"]
+    assert len(plan_packs) == 2 and len(repo_search.calls) == 1
+    assert daemon.query_one(
+        "SELECT status,route FROM cycle WHERE id=2") == ("done", "dependency_wait")
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_candidate WHERE discovered_cycle=2")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='import_search_completed'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_import WHERE action='selected_for_materialization'")[0] == 1
+    assert (tmp_path / "w" / "c2" / "import_search_request.json").exists()
+
+
+def test_plan_search_request_and_receipt_recover_without_reasking_or_refetching(
+        tmp_path, monkeypatch):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    repo_search = _RepoSearchProvider()
+    search = ImportSearchService(
+        daemon=daemon, policy=POLICY, provider=repo_search,
+        work_root=str(tmp_path / "w"))
+    attack.p["import_search"] = search
+    calls = []
+
+    def plan(cyc, pack):
+        calls.append(pack)
+        if len(calls) == 1:
+            return {"import_search_request.json": dict(_SEARCH_REQUEST)}
+        return _plan_defer_from_registered_search(daemon, cyc)
+
+    attack.p["plan"] = plan
+    adv = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack)
+    monkeypatch.setattr(
+        search, "_after_receipt",
+        lambda: (_ for _ in ()).throw(RuntimeError("crash-after-search-receipt")))
+    with pytest.raises(RuntimeError, match="crash-after-search-receipt"):
+        adv.run_cycles(max_cycles=1)
+    assert len(calls) == 1 and len(repo_search.calls) == 1
+    assert daemon.query_one("SELECT status FROM runner_call WHERE phase='import_search'")[0] == "running"
+
+    monkeypatch.setattr(search, "_after_receipt", lambda: None)
+    assert adv.run_cycles(max_cycles=1) == ["c2"]
+    assert len(calls) == 2 and len(repo_search.calls) == 1
+    assert daemon.query_one("SELECT count(*) FROM external_candidate")[0] == 1
+
+
+def test_plan_second_search_request_is_rejected_after_durable_zero_result(tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    repo_search = _RepoSearchProvider(with_candidate=False)
+    attack.p["import_search"] = ImportSearchService(
+        daemon=daemon, policy=POLICY, provider=repo_search,
+        work_root=str(tmp_path / "w"))
+    seen_packs = []
+
+    def repeat_request(_cyc, pack):
+        seen_packs.append(pack)
+        return {"import_search_request.json": dict(_SEARCH_REQUEST)}
+
+    attack.p["plan"] = repeat_request
+    attack.p["reasoning"] = lambda _cyc, _pack: {
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": [],
+        }}
+
+    assert SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(
+            max_cycles=1) == ["c2"]
+    assert len(repo_search.calls) == 1
+    assert len(seen_packs) == 2
+    assert '"search_completed":true' in seen_packs[1].anchor_md
+    assert '"may_request_import_search":false' in seen_packs[1].anchor_md
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='import_search_completed'")[0] == 1
+    rejection = daemon.query_one(
+        "SELECT payload_json FROM decision WHERE type='plan_rejected'")[0]
+    assert "第二次搜索" in rejection
+    assert daemon.query_one("SELECT count(*) FROM external_candidate")[0] == 0
 
 
 def test_import_defer_commits_dependency_wait_as_one_unit(tmp_path):

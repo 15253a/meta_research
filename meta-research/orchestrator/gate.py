@@ -87,9 +87,13 @@ class StubGate:
         if not artifact.files:
             return ["产物为空（files 无内容）"]
         for filename, payload in artifact.files.items():
-            if filename == "resource_request.json":
-                errors.append("resource_request.json: sidecar 非 Gate 产物（§6.11）——经 "
-                              "interaction_request_create 落请求单，不入研究库；驱动器须在 commit 前摘出")
+            if filename in ("resource_request.json", "import_search_request.json"):
+                route = ("interaction_request_create"
+                         if filename == "resource_request.json"
+                         else "trusted import_search connector")
+                errors.append(
+                    f"{filename}: sidecar 非 Gate 产物——经 {route} 消费，"
+                    "不入研究库；驱动器须在 commit 前摘出")
                 continue
             if filename not in ARTIFACT_SCHEMA_MAP:
                 errors.append(f"{filename}: 未知产物文件名")

@@ -342,8 +342,49 @@ class SqliteCompiler:
         snapshot = DeferredImporter.plan_snapshot(
             self.conn, question_id=question_id, action_cycle=cycle_id,
             policy_hash=expected_policy_hash)
+        completed_rows = self.conn.execute(
+            "SELECT id,payload_json FROM decision WHERE cycle_id=? "
+            "AND actor='orchestrator' AND type='import_search_completed' ORDER BY id",
+            (cycle_id,)).fetchall()
+        if len(completed_rows) > 1:
+            raise ValueError(
+                f"cycle c{cycle_id} 存在多个 import_search_completed，拒绝任取")
+        completion = None
+        if completed_rows:
+            try:
+                completion = json.loads(
+                    completed_rows[0][1],
+                    parse_constant=lambda token: (_ for _ in ()).throw(
+                        ValueError(f"非有限 JSON number: {token}")))
+            except (json.JSONDecodeError, ValueError) as error:
+                raise ValueError(
+                    f"import_search_completed decision {completed_rows[0][0]} payload 损坏") from error
+            if (not isinstance(completion, dict)
+                    or completion.get("protocol") != "import-search-v1"
+                    or completion.get("candidate_count") != len(snapshot["candidates"])):
+                raise ValueError(
+                    f"import_search_completed decision {completed_rows[0][0]} 与候选集不一致")
+            sources.append(f"db:decision:{completed_rows[0][0]}")
         if not snapshot["candidates"]:
-            return "## 本轮已登记 external import 候选\n（无；不得产 import_defer）"
+            status = {
+                "search_completed": completion is not None,
+                "may_request_import_search": completion is None,
+                "may_emit_import_defer": False,
+                "candidate_count": 0,
+            }
+            if completion is not None:
+                status.update({
+                    "provider": completion.get("provider"),
+                    "request_hash": completion.get("request_hash"),
+                    "result_hash": completion.get("result_hash"),
+                    "skipped_count": completion.get("skipped_count"),
+                })
+            return (
+                "## 本轮 external import 发现状态\n"
+                "只有 may_request_import_search=true 时才可产一次搜索 sidecar；"
+                "候选为空时不得产 import_defer。\n```json\n"
+                + json.dumps(status, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")) + "\n```")
         reviews_by_candidate: Dict[int, List[Dict[str, Any]]] = {}
         for review in snapshot["reviews"]:
             # Scope/evidence strings are untrusted discovery data.  The planner needs only the exact
@@ -394,6 +435,8 @@ class SqliteCompiler:
             "selected_candidate_id": (
                 selected["candidate"]["candidate_id"] if selected is not None else None),
             "may_emit_import_defer": selected is not None,
+            "search_completed": completion is not None,
+            "may_request_import_search": False,
         }
         return (
             "## 本轮已登记 external import 候选（只读冻结摘要；正文不内联）\n"

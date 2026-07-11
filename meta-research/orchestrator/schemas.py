@@ -13,8 +13,9 @@ from referencing import Registry
 from referencing.jsonschema import DRAFT202012
 
 # 产物文件名 → schema 短名（信封 files 的键按此校验；不在表内的文件名 = 未知产物、当场拒）。
-# 注意：resource_request.json（sidecar）不在此表——它非 Gate 产物（§6.11：schema 校验后经
-# interaction_request_create 落请求单、不入研究库）；其 schema 经 validator("resource_request") 取。
+# 注意：resource_request.json / import_search_request.json 两类 control sidecar 不在此表——
+# 它们非 Gate 产物，分别经 interaction_request_create / trusted import_search connector
+# 消费且不入研究库；schema 按短名经 SchemaSet.validator(...) 取。
 ARTIFACT_SCHEMA_MAP: Dict[str, str] = {
     "idea_set.json": "idea_set",
     "idea_set.draft.json": "idea_set_draft",

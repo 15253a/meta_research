@@ -42,6 +42,7 @@ from .cost_ledger import BudgetExhausted, CostAccountingFailed
 from .harness import latest_smoke_log as _latest_smoke_log
 from .ids import cnum as _cnum
 from .interfaces import ContextPack, StageBlockedOnResources
+from .import_search import ImportSearchError, validate_import_search_request
 from .notify import FileRequestReject
 from .process_supervisor import atomic_write_receipt
 from .runner import RunnerError
@@ -127,7 +128,7 @@ _STAGE_FILES = {
 # skill 调用点说明（让工人聚焦本阶段；仿 driver._SKILL_SECTION）
 _CALL_NOTE = {
     "idea": "执行【生成任务】+【判官任务】，产 idea_set.json（候选全集 + selected_id）",
-    "plan": "执行【计划任务】，产 plan.json（冻结 plan.schema：抽象 targets + protocol + metric_defs；命令不在 plan）",
+    "plan": "执行【计划任务】：产 plan.json；若类型门确认需新外部 baseline 且本轮候选为空，则只产 import_search_request.json",
     "bundle": "按锚区「本目标」切片产可执行包：execution_manifest.json + identity.md + 代码文件（一信封装齐）",
     "reasoning": "执行【轮尾任务】，按 route 产 selection.json（必），酌情 tree_ops.json / answer.json",
 }
@@ -249,6 +250,50 @@ class StageProvider:
                                   execution_receipt_ref=art.execution_receipt_ref)
                 last_err = f"产物 stage 漂移：envelope stage={art.stage!r} ≠ 期望 {stage!r}"
                 continue
+            if "import_search_request.json" in art.files:
+                # plan 的只读发现控制 sidecar：须独占信封，编排器消费后
+                # 重渲染 ContextPack 并在新会话里重做 plan。它不是 Gate 事实产物，
+                # 也不能与 plan.json 共存（否则模型可在搜索前偷塞决策）。
+                if stage != "plan" or set(art.files) != {"import_search_request.json"}:
+                    self._record_cost(
+                        cyc, stage, art.usage, status="failed",
+                        failure_kind="artifact_parse", attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    last_err = (
+                        "import_search_request.json 只允许 plan 阶段独占 files；"
+                        f"实收键 {sorted(art.files)}")
+                    continue
+                errors = self._schema_errors_by_name(
+                    "import_search_request", art.files["import_search_request.json"])
+                try:
+                    request = validate_import_search_request(
+                        art.files["import_search_request.json"])
+                except ImportSearchError as error:
+                    errors.append(str(error))
+                if errors:
+                    self._record_cost(
+                        cyc, stage, art.usage, status="failed",
+                        failure_kind="artifact_parse", attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    last_err = "import_search_request.json schema/边界校验失败:\n" + "\n".join(errors[:8])
+                    continue
+                self._record_cost(
+                    cyc, stage, art.usage, status="success", attempt=attempt, call=call,
+                    transcript_ref=art.transcript_ref,
+                    execution_receipt_ref=art.execution_receipt_ref)
+                return {"import_search_request.json": request}
+            if stage == "plan" and set(art.files) != {"plan.json"}:
+                self._record_cost(
+                    cyc, stage, art.usage, status="failed",
+                    failure_kind="artifact_parse", attempt=attempt, call=call,
+                    transcript_ref=art.transcript_ref,
+                    execution_receipt_ref=art.execution_receipt_ref)
+                last_err = (
+                    "plan 普通产物须恰为 plan.json 一个文件；"
+                    f"实收键 {sorted(art.files)}")
+                continue
             err = self._validate_files(art.files, spec)
             if err:
                 self._record_cost(cyc, stage, art.usage, status="failed",
@@ -348,6 +393,13 @@ class StageProvider:
     def _schema_errors(self, filename: str, payload: Any) -> List[str]:
         """逐产物 schema 校验，展平 oneOf 子错误（反馈才有具体键名；同 driver._run_with_retry）。"""
         v = self.schemas.validator_for_artifact(filename)
+        return self._validator_errors(v, payload)
+
+    def _schema_errors_by_name(self, name: str, payload: Any) -> List[str]:
+        return self._validator_errors(self.schemas.validator(name), payload)
+
+    @staticmethod
+    def _validator_errors(v, payload: Any) -> List[str]:  # noqa: ANN001
         errors: List[str] = []
         for e in v.iter_errors(payload):
             errors.append(f"{e.json_path} {e.message}")

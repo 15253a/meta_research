@@ -80,6 +80,7 @@ predicate_json: {
 | `METARESEARCH_CODEX_MODEL` | `gpt-5.5` | 模型 |
 | `METARESEARCH_CODEX_EFFORT` | `medium` | 推理力度 |
 | `METARESEARCH_RUNNER_TIMEOUT_S` | `900` | 单次 Codex 调用超时（工程超时；研究执行时限另见 policy.flow.watchdog） |
+| `METARESEARCH_GITHUB_TOKEN` | — | 可选的 GitHub 只读 API token；仅 plan 明确触发 `import_search_request` 时读取，不落 policy/DB/回执 |
 | `HTTP_PROXY`/`HTTPS_PROXY` | — | 真 Codex 需要（本机 7890）；OS 级，由 codex 子进程继承（runner 不显式读） |
 
 冒烟自检（一条命令跑通至少一个完整 attack 轮）：
@@ -246,11 +247,16 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   `SIGKILL`，启动对账会按 exact `runner_call` owner 收口已知失败，但 provider invocation ID 与供应商 usage/
   billing receipt 尚未形成端到端 exactly-once 协议，不能据此宣称精确供应商账单。
 - 已支持 build / exec/eval target；默认 `build_system()` 已装配同 owner fenced `ImportWorker`、独立 plan
-  answerability reviewer 和 `dependency_wait` 恢复。这里仍有两条明确边界：当前没有把只读
-  `repo-search` 接成生产 `import_register` 入口，正式运行只能消费事先经受信服务登记到当前 action-cycle 的
-  候选；默认冻结快照中的 adapter 属不可信代码，在 adversarial sandbox capability 落地前会记失败并释放问题
-  重规划，绝不会拿普通 lifecycle supervisor 冒充隔离后在 host 执行。因此当前不是自治 external-import
-  production path，后续检查点才补发现/登记与强隔离。
+  answerability reviewer 和 `dependency_wait` 恢复。plan 在类型门确认需引入新外部 baseline 家族且当轮无
+  候选时，可产一次受 schema 限制的 `import_search_request.json`；受信 host GitHub REST connector
+  在 DB 事务外做只读检索，回执完整后用一个短事务原子登记 pinned commit、搜索快照、冻结
+  license evidence/SPDX、机械 auto/review 裁定和完成 marker，然后重渲染 plan 四锚。回执已落、DB 未提交的
+  崩溃可不重搜直接续提交；无回执的中断只会重复幂等只读 GET，不会重复登记。
+- import 仍有明确安全边界：这个入口目前只开放 `new_structure` 类型门；`stuck` 普查不得在原问题直达
+  import，`human_named`/`sota_reference` 在结构化 directive 或冻结论文/榜单来源接线前继续 fail-closed。
+  另外，候选中的 adapter 仍属不可信代码，在 adversarial sandbox capability 落地前会记失败并释放问题
+  重规划，绝不会拿普通 lifecycle supervisor 冒充强隔离后在 host 执行。所以当前已是可发现/可登记/
+  可调度的 production path，但还不是可安全执行敌对外部代码的完整 production import。
 - 假执行标记（`source=fake` / `synthetic=true`）是 M0–M3 验收期语义，真执行起已移除。
 
 ## 8. 自验
