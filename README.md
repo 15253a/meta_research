@@ -450,6 +450,76 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   contract 不可互相升级。two-node 默认给 guardian fence observation 5 秒窗口；若目标 GPFS 的 durable
   receipt 可见性更慢，两个角色须显式传入相同且小于总 timeout 一半的更大 `--guardian-grace-s`，超窗会
   fail closed，不会把未观测到的 fence 写成通过。
+- 故障 soak 使用另一个同机前台 sidecar；它不启动、不重启也不调度 `orchestrator.run`。v1 只在全历史唯一的
+  running execution receipt 上执行预声明的 `kill_owner` 或 `kill_execution_payload`，不接受 shell、任意 signal、
+  DAG、随机动作或远程 kill。Terminal A 仍由操作者或 systemd 启动现有 resident owner；下面是**离线演练**
+  命令，真实 soak 应去掉 `--no-outbound` 并沿用部署原本的 connector 参数。selector 已知时先不要执行它：
+
+  ```bash
+  export SYSTEM_ROOT=/absolute/meta-research
+  export WORK_ROOT=/absolute/research-work
+  python -m orchestrator.run \
+    --system-root "$SYSTEM_ROOT" --work-root "$WORK_ROOT" --no-outbound
+  ```
+
+  在启动目标 execution 前准备一个**新的** 32 位小写十六进制 `schedule_id`。下面的 `execution_kind` 与
+  `(db_owner_kind, db_owner_id)` 必须和将出现的 receipt 精确一致；示例在 run row 41 的 manifest train 上杀
+  payload。生成器保证 sorted compact JSON、单个结尾换行和 0600 权限：
+
+  ```bash
+  export FAULT_SCHEDULE=/absolute/fault-schedule.json
+  python - <<'PY'
+  import json, os, secrets
+  from pathlib import Path
+
+  value = {
+      "version": 1,
+      "protocol": "meta-research-fault-schedule/v1",
+      "schedule_id": secrets.token_hex(16),
+      "work_root": os.environ["WORK_ROOT"],
+      "event_timeout_s": 3600,
+      "events": [{
+          "event_id": "kill_train_41",
+          "action": "kill_execution_payload",
+          "execution_kind": "manifest-train",
+          "db_owner_kind": "run",
+          "db_owner_id": 41,
+      }],
+  }
+  path = Path(os.environ["FAULT_SCHEDULE"])
+  path.write_bytes((json.dumps(
+      value, ensure_ascii=False, sort_keys=True,
+      separators=(",", ":"), allow_nan=False) + "\n").encode())
+  path.chmod(0o600)
+  PY
+  ```
+
+  selector 已预知时，Terminal B 先执行 `validate` 和 `run`（runner 会等待），再放行 Terminal A 进入目标
+  外调；`run` 返回后执行 `verify`：
+
+  ```bash
+  python -m orchestrator.fault_schedule validate --schedule "$FAULT_SCHEDULE"
+  python -m orchestrator.fault_schedule run --schedule "$FAULT_SCHEDULE"
+  python -m orchestrator.fault_schedule verify --schedule "$FAULT_SCHEDULE"
+  ```
+
+  若 DB owner ID 只能在外调开始时分配，则先启动 Terminal A，从新出现的 durable running receipt 读取
+  `kind` 与 `context.db_owner_kind/db_owner_id`，立即冻结 schedule 并启动 Terminal B；这种方式只适用于足够长的
+  调用，短调用可能在 spend 前已 terminal。running receipt 在 guardian 放开 exec gate 前已经耐久发布，故
+  `kill_execution_payload` 只证明杀死了该 supervised payload identity，不机械证明科学程序已经开始有效工作。
+
+  schedule 路径与 `work_root` 都须为当前 UID 持有的规范绝对路径；sidecar 必须和 owner 位于同一 host、boot、
+  PID namespace 与 UID，且内核支持 pidfd。selector 三元组在 `state/executions/` 全历史必须唯一。`kill_owner`
+  后的重启由 Terminal A/systemd 负责；多事件 schedule 不应依赖 `--once`。全 work-root 同时只允许一个 runner，
+  状态位于 `state/fault-schedules/<schedule_id>/`；新实验不得复用旧 ID。
+
+  `event_timeout_s` 分别约束 trigger、target exit 与 guardian aftermath 等等待段，不是整个 event 的总 wall-clock
+  deadline；目标 GPFS 较慢时应为各段保留余量。
+
+  `spent` 已发布就绝不重发 signal；`applied` 仅表示内核接受了对 pinned task 的 SIGKILL。退出码 0 表示
+  valid/complete，2 表示 incomplete/inconclusive，3 表示 failed/unsafe，130 表示操作者中断。即使 complete，
+  receipt 仍明确写 `signal_exactly_once=false` 与 `recovery_verified=false`：该 runner 验故障后果，不代替下一
+  检查点的 restore/续跑验收，也不证明基础设施 STONITH。
 - plan 的 `critical/budget_estimate` 已权威落库，critical 失败会确定性早退、非 critical 失败可继续后继；
   动态 `goal_amend` 的专用路由、不可变升版、reasoning/status 按 cycle goal version 隔离与 applicability
   恢复也已闭合。
