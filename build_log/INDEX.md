@@ -6,6 +6,7 @@
 
 ---
 
+- [0072](0072-cp114c3a-truthful-session-mode.md) — CP11.4c.3a 生产会话契约冻结为真实 A、虚假 B 全入口 fail-closed · commit `b2081a3` · 验证: 相关 165；内部双审/外审最终轮 APPROVE；唯一全量被当前 20G overlay ENOSPC 污染，依约未重跑
 - [0071](0071-cp114c2b3b-fixed-gpu-device-bridge.md) — CP11.4c.2b.3b exact GPU allocation → Docker DeviceRequest/inventory/guardian identity bridge · commit `563a496` · 验证: 相关 427/外审后定向 48；真实 negative GPU canary fail-closed；唯一全量 1494 过/1 跳过/1 个 Docker archive ENOSPC
 - [0070](0070-cp114c2b3a-honest-deployment-preflight.md) — CP11.4c.2b.3a development/production fail-closed deployment preflight + owner receipt · commit `16d5270` · 验证: 相关 167/81；真实 collector canary；唯一全量 1466 过/1 跳过/1 个无关 Docker `/ebs` 空间失败
 - [0069](0069-cp114c2b2c-reviewed-adapter-generation.md) — CP11.4c.2b.2c bounded repository projection → independently reviewed adapter sidecar · commit `c0ba5ed` · 验证: 相关通过；真实 canary 被失效 token 阻断；唯一全量 1443 过/1 跳过/1 个无关 Docker `/ebs` 空间失败

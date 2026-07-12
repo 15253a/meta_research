@@ -476,8 +476,10 @@
               ENOSPC）。当前节点正向 GPU canary 与目标部署验收留给 CP11.4c.3。
       - [ ] CP11.4c.3 最终生产验收：目标 VEPFS 两节点 owner/lease/fd 行为，≥200 轮含真实 Codex/import/训练、
         owner-kill/daemon-loss/预算与资源失败注入的 soak，发布可重放证据包，并完成 §7.4 T1/T2 qualification。
-        - [ ] CP11.4c.3a 会话契约诚实化：生产只开放已实现的 A（一 turn 一阶段）；schema/`System` 拒绝
-          未实现 turn 内跨阶段提交的 B，不为可选吞吐模式新造第二套状态机。
+        - [x] CP11.4c.3a 会话契约诚实化：生产只开放已实现的 A（一 turn 一阶段）；schema/`System` 拒绝
+          未实现 turn 内跨阶段提交的 B，不为可选吞吐模式新造第二套状态机。→ commit `b2081a3`
+          （build_log 0072；相关 165 通过；内部代码/文档与外审最终轮 APPROVE；唯一全量受当前 20G
+          overlay 仅余 175MB 并在运行中 ENOSPC 污染，依约未重跑）。
         - [ ] CP11.4c.3b 存储治理：每轮 SQLite online 滚动备份 + views 独立 Git 提交 + immutable/CAS 资产
           manifest/hash；原始日志分级归档、恢复演练、容量阈值与安全 GC。不每轮复制大 checkpoint/content store。
         - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
