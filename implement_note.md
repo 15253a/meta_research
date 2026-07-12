@@ -1,40 +1,45 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4c.2b.2c reviewed adapter generation
-- 检查点状态：CP11.4c.2b.2b 功能已提交 `1e5761156a6075c48b9822f7e4ffe00e6e2a488b`；唯一全量
-  `1418 passed, 1 skipped`，build_log 0068 已记账；CP11.4c.2 父项仍未达成
+- 更新：2026-07-11 ｜ 位置：步⑪ CP11.4c.2b.3 deployment trust contract
+- 检查点状态：CP11.4c.2b.2c 功能提交 `c0ba5ed` 已完成，CP11.4c.2b.2 repository closure 收口；
+  当前转入最小部署可用性，CP11.4c.2/CP11.4c 父项仍未达成
 
 ## 刚完成什么
 
-CP11.4c.2b.2b 已把 adapter v3 的唯一 canonical Python wheel lock 转为 exact/restorable project image：公网 URL/
-SHA-256/bytes 与 wheel 结构/tag 受界，pinned sandbox 离线 pip install，generated-only Dockerfile，base/result image、
-context metadata、compiler/runtime/pip-check 和 Docker engine receipt 交叉核。legacy builder 不伪称重建同 ID；首个 exact
-image 以有界 hashed archive 保存，丢失后恢复同一 ID。stale/owner-loss 会排空 guardian/container 并清理未发布
-closure image。ImportWorker 和后续 compiler/AttackStages 只能从 verified receipt 继承 exact `env_hash`。
+缺 adapter 时，系统从已验证 repository ledger/tree 构造有界投影，只做一次 tool-free 生成和一次独立 tool-free
+评审；通过后仍由既有 schema、机械 adapter 编译器、exact dependency image 和 adversarial sandbox smoke 决定能否入
+snapshot。sidecar 不修改 Git tree；生成调用、成本、decision、prompt/model/config、projection/candidate/adapter/verdict hash
+复用现有审计链。科学 target identity 不含 DB-local ID 或自由文本，显式 adapter 和 legacy import 路径保持兼容。
+
+CP11.4c.2b.2 的三部分现已齐备：exact Git LFS objects、canonical wheel lock → exact/restorable dependency image、
+以及缺 adapter 的受审生成。没有加入隐式在线 pip、仓库脚本执行、多轮 agent 状态机或第二套 receipt store。
 
 ## 验证 / Review
 
-- 相关回归 `346 passed, 1 skipped`；去重核验/restore 最终真 Docker 定向 `1 passed`；真实公网
-  `idna 3.15` exact wheel canary `1 passed`；compile/schema/diff check 通过。
-- 检查点末唯一全量：`1418 passed, 1 skipped in 1036.44s`；跳过项是已单独通过的默认关闭公网 canary。
-- 外审第 1 轮 codexro 401；第 2 轮完整内联 diff 后服务连接 5/5 重试耗尽，两轮均无 verdict。依两轮
-  上限不再重试；本地审计成立项已全修并在提交前验证。
-- 尚未 push。
+- 相关验证：`325 passed`；修复后 focused `185 passed`；projection/service/schema/SKILL `115 passed`；最终
+  service `12 passed`；materializer identity/provenance、compile 和 diff check 通过。
+- 外审按两轮上限：第 1 轮隔离 codexro token 失效返回 401；第 2 轮服务 reconnect、无输出；均无 verdict。
+  内部并行审计的 provenance/identity、错误分类和预算问题均已在功能提交前修复。
+- 检查点末唯一全量：`1443 passed, 1 skipped, 1 failed in 1051.15s`。唯一失败是无关 dependency image
+  `docker save` 写 `/ebs/docker/tmp` 时 `no space left on device`；已清精确测试 image，未重跑第二次全量。
+- 真实 missing-adapter Codex canary 在生成首调用被隔离 `/home/codexro/.codex` 的 revoked refresh token 阻断；系统正确
+  fail-closed 并记录未知成本失败，未伪造通过。恢复认证需用户/运维授权。
+- 功能提交：`c0ba5ed`；本记录随独立文档提交收口；未 push。
 
-## 当前关键边界
+## 当前可用边界
 
-- 只有仓库显式 adapter v3 + canonical wheel lock 能进 dependency image；v2 仍只用 bootstrap pinned image。缺 adapter 的
-  普通仓库仍会被拒，2b.2c 才实现有界受审生成，不能声称任意 SOTA repo 自动复现。
-- dependency image object 有数量/单对象边界，但生产级 VEPFS byte+inode hard quota、Docker store quota/回收属
-  CP11.4c.2b.3；当前不得冒充部署验收。
-- rootless daemon 仍是 `rlimit-fallback`；service account/VM、Docker socket、cgroup/device/GPU 与跨节点目标环境未验收。
-- 两节点 exact archive/owner/lease/fd 行为与含真实 Codex/import/训练/故障注入的 100+ 轮 soak 属
-  CP11.4c.3；CP11.3c 的控制面 120 轮不能替代。
-- 不得 push；开发期继续只跑相关验证，下一检查点冻结后再做一次全量。
+- 显式 adapter v2/v3 路径可用；缺 adapter 生成路径代码闭环已具备，但此机器必须先恢复隔离 Codex 凭证才能实际启用。
+- canonical Python wheel lock 项目可获得 exact/restorable project image；普通 requirements/Poetry/uv lock 只作证据，
+  不会隐式在线安装。因而并非任意 ML/SOTA repository 都能自动运行。
+- 当前已有 pinned Docker、guardian、quarantine、seccomp/rlimit，但生产 service account/VM、Docker socket、
+  cgroup/device/GPU 与 VEPFS hard byte+inode quota 尚未通过目标环境预检，开发模式不得冒充生产通过。
+- 两节点 exact archive/owner/lease/fd 与真实 100+ 轮 soak 属 CP11.4c.3；CP11.3c 的控制面 120 轮不能替代。
+- 不得 push；开发期只跑相关验证，下一个检查点冻结后再做一次全量。
 
 ## 下一步动作
 
-1. CP11.4c.2b.2c 冻结“缺 adapter”的有界输入/输出、模型/prompt、独立评审和可恢复 receipt 合同。
-2. 只从已冻结 repository tree/ledger 生成 sidecar；schema + deterministic cross-check + adversarial sandbox smoke 全过才允许
-   进 snapshot spec，不改写 repository tree，不将模型输出直接当 authority。
-3. CP11.4c.2b.3 落生产部署信任/quota 启动合同；CP11.4c.3 准备两节点和真实 100+ 轮故障注入证据包。
+1. 先恢复隔离 Codex 凭证，并只跑一条真实 generation→independent review→Docker smoke canary，确认新路径可操作。
+2. CP11.4c.2b.3 只实现一个薄的 fail-closed deployment preflight/receipt：核对 service identity、Docker daemon/socket、
+   cgroup/device/GPU 与配置的 VEPFS hard byte+inode quota；不建设新的部署编排器。
+3. 常见科学运行时覆盖优先采用 pinned scientific bootstrap image 或 verified-hash 标准 lock 转换，绝不退回无 hash 在线 pip。
+4. 部署合同完成后，再准备 CP11.4c.3 两节点、真实 100+ 轮和故障注入证据包。

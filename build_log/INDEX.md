@@ -6,6 +6,7 @@
 
 ---
 
+- [0069](0069-cp114c2b2c-reviewed-adapter-generation.md) — CP11.4c.2b.2c bounded repository projection → independently reviewed adapter sidecar · commit `c0ba5ed` · 验证: 相关通过；真实 canary 被失效 token 阻断；唯一全量 1443 过/1 跳过/1 个无关 Docker `/ebs` 空间失败
 - [0068](0068-cp114c2b2b-dependency-image-closure.md) — CP11.4c.2b.2b canonical wheel lock → exact/restorable dependency image + inherited runtime identity · commit `1e57611` · 验证: 通过（相关 346；真实 PyPI canary；外审两轮均无 verdict；唯一全量 1418）
 - [0067](0067-cp114c2b2a-exact-git-lfs-objects.md) — CP11.4c.2b.2a exact Git LFS Batch/OID/size closure · commit `ef30f1f` · 验证: 通过（相关 149；真实 GitHub LFS canary；外审 2 BLOCKER/3 SHOULD 全修；唯一全量 1401）
 - [0066](0066-cp114c2b1-materializer-component-boundaries.md) — CP11.4c.2b.1 exact repository materializer responsibility boundaries · commit `4e28698` · 验证: 通过（相关 16/43；AST/compat 等价；第2轮 APPROVE；唯一全量 1382）
