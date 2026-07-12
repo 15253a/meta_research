@@ -8,12 +8,13 @@ receipt 证明本机子树与 daemon container 均排空（适用条件与残余
 
 > 设计真相唯一在 `../reference/第一部分-系统架构设计.md`；本 README 是**操作面**（怎么跑、怎么配、怎么
 > 观测/干预、边界在哪）。构建历史见仓库根 `ROADMAP.md` / `build_log/`。
+> T1/T2 sealed-holdout/one-shot 使用独立的 [qualification runbook](QUALIFICATION.md)。
 
 ## 0. 一分钟跑起来
 
 ```bash
 cd meta-research
-python -m pip install -r requirements-dev.txt          # pytest / jsonschema / PyYAML（+真 Codex 见下）
+python -m pip install -r requirements-dev.txt          # pytest / schema / YAML / qualification NumPy+SciPy
 docker pull docker.io/library/python@sha256:f5cf0344c9886ff24d34797578d5d7dd6e8911ae0fe5962bb55d0f89603ec361
 python -m pytest tests/ -q                              # 自验：以当前测试输出为准
 

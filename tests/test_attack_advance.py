@@ -1339,6 +1339,60 @@ def test_import_defer_rejected_not_silently_dropped(tmp_path):
     daemon.conn.close()
 
 
+def test_qualification_profile_mechanically_rejects_executable_code_import(tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    attack.qualification_firewall = object()
+
+    def defer_plan(cyc, pack):
+        p = _plan_json()["plan.json"]
+        p["targets"] = []
+        del p["protocol"], p["metric_defs"], p["readout_rules"]
+        p["needs"], p["build_target_required_metric"] = [], []
+        p["import_defer"] = {
+            "reason_md": "复制外部 SOTA repo 代码", "candidate_set_hash": "csh",
+            "license_decision_snapshot_hash": "lsh", "selection_key": "sel",
+            "policy_hash": "ph", "placeholder_baseline_identity": {
+                "canonical_key_draft": "ext-b", "slug_draft": "ext",
+                "identity_md": "外部代码基线"},
+        }
+        return {"plan.json": p}
+
+    attack.p["plan"] = defer_plan
+    attack.p["reasoning"] = lambda c, pk: {
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": []}}
+    SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    rejection = daemon.query_one(
+        "SELECT payload_json FROM decision WHERE type='plan_rejected'")[0]
+    assert "qualification 从头约束禁止物化" in rejection
+    assert daemon.query_one("SELECT count(*) FROM external_import")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0
+    daemon.conn.close()
+
+
+def test_qualification_bundle_rejects_any_uploaded_asset_ref(tmp_path, monkeypatch):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    attack.qualification_firewall = object()
+    monkeypatch.setattr(
+        AS.MF, "extract_manifest_asset_refs",
+        lambda _manifest: frozenset({"request:1:file:external.py"}))
+    attack.p["reasoning"] = lambda _cyc, _pack: {
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": []}}
+
+    SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    assert daemon.query_one("SELECT status FROM build_target")[0] == "failed"
+    assert daemon.query_one("SELECT count(*) FROM run")[0] == 0
+    assert not list((tmp_path / "w").glob("c*/t*/src/.asset-authorization.json"))
+    daemon.conn.close()
+
+
 def _deferred_plan_for_current_cycle(daemon, cyc):
     """Register the immutable discovery/license inputs that a real import-search command produced."""
     importer = DeferredImporter(daemon)

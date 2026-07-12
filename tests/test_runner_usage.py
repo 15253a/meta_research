@@ -198,6 +198,58 @@ def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch
     assert len(events) == 1 and (events[0].stat().st_mode & 0o777) == 0o600
 
 
+def test_qualification_no_host_tools_needs_no_sudo_and_keeps_trace_gate(tmp_path):
+    """Qualification research workers run under the service UID but receive no host tools."""
+    captured = {}
+
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        out = Path(cmd[cmd.index("-o") + 1])
+        out.write_text(
+            '```json\n{"files":{"idea_set.json":{}},"md":""}\n```',
+            encoding="utf-8")
+        trace = (b'{"type":"thread.started","thread_id":"t"}\n'
+                 b'{"type":"turn.started"}\n'
+                 b'{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n'
+                 b'{"type":"turn.completed","usage":{}}\n')
+        return types.SimpleNamespace(
+            returncode=0, stdout=trace, stderr=b"tokens used\n1\n")
+
+    _fake_runner(tmp_path, fake_run, no_host_tools=True).run_task(
+        system_prompt="s", skill="k", context_pack=_pack())
+    cmd = captured["cmd"]
+    assert cmd[0] != "/usr/bin/sudo"
+    assert "--strict-config" in cmd and "--ignore-rules" in cmd
+    disabled = {cmd[i + 1] for i, value in enumerate(cmd[:-1]) if value == "--disable"}
+    assert {
+        "shell_tool", "unified_exec", "apps", "browser_use", "multi_agent",
+        "auth_elicitation", "tool_call_mcp_elicitation",
+        "skill_mcp_dependency_install", "shell_snapshot",
+        "request_permissions_tool", "network_proxy", "code_mode",
+    } <= disabled
+    runtime_cwd = Path(cmd[cmd.index("-C") + 1])
+    assert captured["cwd"] == runtime_cwd and not runtime_cwd.exists()
+    assert len(list(tmp_path.glob("*.events.jsonl"))) == 1
+
+
+def test_qualification_no_host_tools_rejects_observed_tool_item(tmp_path):
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
+        out = Path(cmd[cmd.index("-o") + 1])
+        out.write_text(
+            '```json\n{"files":{"idea_set.json":{}},"md":""}\n```',
+            encoding="utf-8")
+        trace = (b'{"type":"turn.started"}\n'
+                 b'{"type":"item.completed","item":{"type":"todo_list","items":[]}}\n'
+                 b'{"type":"turn.completed","usage":{}}\n')
+        return types.SimpleNamespace(
+            returncode=0, stdout=trace, stderr=b"tokens used\n1\n")
+
+    with pytest.raises(R.RunnerError, match="禁止工具"):
+        _fake_runner(tmp_path, fake_run, no_host_tools=True).run_task(
+            system_prompt="s", skill="k", context_pack=_pack())
+
+
 def test_tool_free_runner_rejects_any_observed_tool_item(tmp_path, monkeypatch):
     def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
         out = Path(cmd[cmd.index("-o") + 1])

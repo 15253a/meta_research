@@ -194,6 +194,56 @@ def test_harness_recovers_drained_exit_partial_for_exact_owner(tmp_path, monkeyp
     assert not (tmp_path / "eval.log.partial").exists()
 
 
+def test_harness_opt_in_revalidates_already_published_completed_log(tmp_path):
+    context = {
+        "reconcile_protocol": "qualification-final-v1",
+        "db_owner_kind": "qualification_final_unit",
+        "db_owner_id": 1,
+        "phase": "qualification-final",
+        "unit_id": "dreamer",
+    }
+    first = H.run_staged(
+        [sys.executable, "-c", "print('complete')"],
+        staging_dir=str(tmp_path), log_name="final.log", timeout_s=2,
+        execution_kind="qualification-final", execution_context=context)
+    assert H.recover_staged_result(
+        staging_dir=str(tmp_path), log_name="final.log",
+        execution_supervisor=None, execution_kind="qualification-final",
+        execution_context=context) is None
+
+    recovered = H.recover_staged_result(
+        staging_dir=str(tmp_path), log_name="final.log",
+        execution_supervisor=None, execution_kind="qualification-final",
+        execution_context=context, recover_completed=True)
+    assert recovered is not None and recovered["exit_code"] == 0
+    assert recovered["log_sha256"] == first["log_sha256"]
+    assert (tmp_path / "final.log").read_text().strip() == "complete"
+
+
+def test_harness_opt_in_returns_exact_terminal_failure_without_retry(tmp_path):
+    context = {
+        "reconcile_protocol": "qualification-final-v1",
+        "db_owner_kind": "qualification_final_unit",
+        "db_owner_id": 1,
+        "phase": "qualification-final",
+        "unit_id": "dreamer",
+    }
+    with pytest.raises(subprocess.TimeoutExpired):
+        H.run_staged(
+            [sys.executable, "-c", "import time; time.sleep(2)"],
+            staging_dir=str(tmp_path), log_name="final.log", timeout_s=0.05,
+            execution_kind="qualification-final", execution_context=context)
+
+    recovered = H.recover_staged_result(
+        staging_dir=str(tmp_path), log_name="final.log",
+        execution_supervisor=None, execution_kind="qualification-final",
+        execution_context=context, recover_completed=True,
+        return_terminal_failure=True)
+    assert recovered is not None and recovered["terminal_failure"] is True
+    assert recovered["failure_outcome"] == "timeout"
+    assert recovered["exit_code"] == 125
+
+
 def test_harness_exit_sidecar_write_all_handles_short_writes(tmp_path, monkeypatch):
     original_write = H.os.write
 

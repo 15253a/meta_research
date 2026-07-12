@@ -103,7 +103,9 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
                           execution_supervisor: Optional[ExecutionSupervisor],
                           execution_kind: str,
                           execution_context: Mapping[str, Any],
-                          execution_sandbox=None) -> Optional[Dict[str, Any]]:
+                          execution_sandbox=None,
+                          recover_completed: bool = False,
+                          return_terminal_failure: bool = False) -> Optional[Dict[str, Any]]:
     """Promote an owner-orphaned complete ``.partial`` using its central receipt.
 
     The guardian has already fsynced output and proved the descendant tree
@@ -129,7 +131,8 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
     directory = Path(staging_dir)
     partial = directory / (log_name + ".partial")
     final = directory / log_name
-    if final.exists():
+    final_exists = os.path.lexists(final)
+    if final_exists and not recover_completed:
         return None
     receipt_dir = (execution_supervisor.receipt_dir if execution_supervisor is not None
                    else directory / ".execution-receipts")
@@ -149,6 +152,9 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
             f"{owner_kind} {owner_id} 对应多个 guardian execution receipt")
     partial_exists = os.path.lexists(partial)
     if not matches:
+        if final_exists:
+            raise ExecutionRecoveryError(
+                f"{final} 存在但无 exact guardian receipt；拒绝把旧 final 当作恢复结果")
         if execution_sandbox is not None and execution_sandbox.recover_unstarted_session(
                 staging_dir=directory, log_name=log_name,
                 execution_context=expected,
@@ -175,16 +181,29 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
             except BaseException as cleanup_error:
                 raise ExecutionRecoveryError(
                     f"{owner_kind} {owner_id} non-exit sandbox session 清理失败") from cleanup_error
+        if return_terminal_failure:
+            return {
+                "exit_code": 125, "log_path": None, "log_sha256": None,
+                "log_bytes": None, "process_receipt_path": str(receipt_path),
+                "process_receipt": receipt,
+                "recovered_after_owner_loss": True,
+                "terminal_failure": True,
+                "failure_outcome": receipt.get("outcome"),
+            }
         raise ExecutionRecoveryError(
             f"{owner_kind} {owner_id} prior outcome={receipt.get('outcome')} 不可提升为完整 log")
-    if not partial_exists:
+    if final_exists and partial_exists:
+        raise ExecutionRecoveryError(
+            f"{owner_kind} {owner_id} 同时存在 final 与 partial，拒绝恢复")
+    if not final_exists and not partial_exists:
         raise ExecutionRecoveryError(
             f"{owner_kind} {owner_id} 有 drained exit receipt 但 {partial} 缺失")
-    info = os.lstat(partial)
+    completed_path = final if final_exists else partial
+    info = os.lstat(completed_path)
     if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
             or info.st_uid != os.geteuid()):
-        raise ExecutionRecoveryError(f"staged partial 身份非法: {partial}")
-    fd = os.open(partial, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        raise ExecutionRecoveryError(f"staged log 身份非法: {completed_path}")
+    fd = os.open(completed_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                  | getattr(os, "O_NOFOLLOW", 0))
     try:
         os.fsync(fd)
@@ -225,8 +244,9 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
         "group_drained": receipt["group_drained"],
         "receipt_path": str(receipt_path),
     })
-    os.replace(partial, final)
-    _fsync_dir(directory)
+    if not final_exists:
+        os.replace(partial, final)
+        _fsync_dir(directory)
     data = read_artifact_bytes(final, label="recovered staged log")
     return {
         "exit_code": exit_code, "log_path": str(final),
