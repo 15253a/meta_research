@@ -6,6 +6,7 @@
 
 ---
 
+- [0079](0079-cp114c3c2b1-shared-fs-canary.md) — CP11.4c.3c.2b.1 fixed five-phase local/two-node lease + guardian + hot-journal + FD canary · commit `fb65955` · 验证: canary 17 + related 85 + real local WAL；内部终审无 BLOCKER/Major；外审两轮均 401 无 verdict；全量留最终检查点
 - [0078](0078-cp114c3c2a-shared-sqlite-boundary.md) — CP11.4c.3c.2a local WAL / GPFS rollback + legacy WAL pre-read migration + console reader admission · commit `75f8009` · 验证: database 20 + runtime 134 + final targeted 65；内部双终审 APPROVE；外审两轮均 401 无 verdict；全量留最终检查点
 - [0077](0077-cp114c3c1-qualification-firewall.md) — CP11.4c.3c.1 real SEED/DREAMER sealed-holdout + one-shot/non-feedback qualification firewall · commit `2a98e4b` · 验证: qualification/deployment 132 + affected 13；sandbox/entry 164；真实 SEED/DREAMER；内部三路无 BLOCKER；外审两轮均 401 无 verdict；全量依用户要求留到最终检查点
 - [0076](0076-cp114c3b2b2-import-cas-recovery.md) — CP11.4c.3b.2b.2 SQLite-rooted exact repository/dependency CAS closure + replay-safe combined restore · commit `d72da35` · 验证: 相关 31；内部三路终审 APPROVE；外审第 1 轮 401、第 2 轮约 5 分钟/49k tokens 无 verdict；全量依用户要求留到最终检查点

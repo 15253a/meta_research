@@ -1,36 +1,39 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-12 ｜ 位置：步⑪ CP11.4c.3c.2b 目标 VEPFS 薄 canary / 预声明 fault runner
-- 检查点状态：空闲；CP11.4c.3c.2a 功能 `75f8009` 已提交，记账完成
+- 更新：2026-07-12 ｜ 位置：步⑪ CP11.4c.3c.2b.2 预声明 fault schedule runner
+- 检查点状态：空闲；CP11.4c.3c.2b.1 功能 `fb65955` 已提交，记账完成
 
 ## 上一检查点结果
 
-- 已修正 production GPFS/VEPFS 与 SQLite WAL 上游合同的根本冲突：已知本地文件系统用 WAL，
-  GPFS/未知文件系统用 `DELETE` rollback + `synchronous=FULL`。
-- 旧 WAL 在任何 schema/data 读前以 EXCLUSIVE 唯一 owner 模式迁移；SQL trace 锁定顺序，损坏的
-  stale shm 不被接管进程使用。
-- 共享盘 console 准入复用 lease boot identity；invalid/stale/remote 在 SQLite open 前拒绝并返回 503。
-  它明确不是接管 fence，不消除外部 STONITH 要求。
-- 相关验证：database **20 passed**，runtime **134 passed**，终审修正后 **65 passed**；
-  内部双终审 APPROVE。外审两轮均因独立凭证 HTTP 401 无 verdict，已到上限。
+- 已增加一个固定五阶段、前台 one-shot shared-fs canary；没有新增 daemon、DB、scheduler、SSH 编排
+  或通用 workflow engine。
+- local/two-node scope 不可互相升级；exact owner SIGKILL/reap、wrapper 父死清理、post-kill guardian
+  Busy、hot rollback、FD path replacement 和 cleanup terminal receipt 已机械闭合。
+- GPFS 定向实跑证明 DB dirty/hash 与 hot-journal magic 后再 crash，恢复 hash 精确回 baseline；`/tmp`
+  WAL local CLI 也 exit 0，但诚实保持 `two_node_verified=false`。
+- 相关验证：canary **17 passed**，database/lease/guardian/FD **85 passed**；内部终审无 BLOCKER/Major。
+  外审两轮均因独立凭证 HTTP 401 无 verdict，已到上限；全量留最终检查点。
 
 ## 当前可用边界
 
-- 单机 reference 路径仍支持 WAL；当前 GPFS 路径不再依赖不受支持的跨 host WAL。
-- 只支持旧节点已被基础设施 fence 后的 crash-stop 串行接管；网络分区但旧主存活仍不安全。
+- 单机 reference 路径仍支持 WAL；GPFS 路径使用 `DELETE/FULL`，canary 可由操作者在目标两节点运行。
+- 当前只完成 process-crash canary；网络分区但旧主存活仍不安全，基础设施 STONITH 仍是外部要求。
 - 当前只看到一个节点，无 NVIDIA container runtime；两节点/正向 GPU/真实 ≥200 轮/最终全量均未完成。
 
 ## 下一步动作
 
-1. 只做 CP11.4c.3c.2b：在现有 `InstanceLease`、guardian、artifact capability 和 storage ops 上组一个
-   薄的 one-shot node/verify canary；不加常驻服务、第二 DB、scheduler 或通用 workflow engine。
-2. fault schedule 用 canonical JSON 预先冻结 hash/事件 ID/触发点，只调用现有 run/storage 入口；每个事件
-   恰执行一次，缺失/重复/冲突均 fail closed。
-3. 当前环境无第二节点：先完成 CLI/schema/单节点负向与崩溃回归；不把模拟结果写成两节点通过。
+1. 只做 CP11.4c.3c.2b.2：一个前台 one-shot fault schedule CLI，输入为预先冻结的线性 canonical JSON；
+   不做 DAG、plugin、arbitrary shell、远程调度或常驻进程。
+2. v1 只支持能绑定现有 durable authority 的 `kill_owner` / `kill_execution_payload`；spent 必须先于 signal，
+   signal delivery 无法证明的 crash gap 写 inconclusive，不盲目重杀、不声称 signal exactly-once。
+3. schedule/spent/applied/result/final 全部 no-clobber，触发点只读现有 execution receipt/cycle snapshot；
+   status card/heartbeat 不作为触发权威。
 4. 中间仍只跑相关验证；全量只在最终验收提交前跑一次。
 
 ## 关键坑
 
 - `reference/` 原始是单机 embedded SQLite WAL；两节点 VEPFS 是后续生产加固，不得倒称原始要求。
+- canary 代码外围 receipt 校验仍偏 verbose；本轮已将状态图压到五阶段。后续不再增加 phase，若精简须
+  作为行为不变维护，不能与 fault 语义一起重写。
 - root overlay 仍接近/处于满额；pytest basetemp 必须继续放 VEPFS 并清理。
 - 外审独立凭证当前 401；后续检查点仍每次最多两轮，不得因鉴权失败循环重试。

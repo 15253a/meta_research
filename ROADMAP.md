@@ -533,6 +533,13 @@
               → commit `75f8009`（build_log 0078；database 20 + runtime 134 + final targeted 65；全量留最终）。
             - [ ] CP11.4c.3c.2b 薄的一次性两节点 canary + 预声明 fault schedule runner；复用
               InstanceLease/guardian/storage ops，不新增 daemon、DB、scheduler 或分布式状态机。
+              - [x] CP11.4c.3c.2b.1 fixed five-phase shared-fs canary：同一协议支持 honest local prerequisite
+                与 operator-launched two-node role；exact SIGKILL/reap、post-kill guardian Busy、真 hot rollback、
+                FD rename/path-binding 和 cleanup terminal receipt 全闭合，local scope 不可升级；始终不冒充
+                infrastructure STONITH。→ commit `fb65955`（build_log 0079；canary 17 + related 85 + real
+                local WAL；当前仅单节点，two-node 正向与全量留最终）。
+              - [ ] CP11.4c.3c.2b.2 固定线性 canonical fault schedule runner；只支持预声明故障动作，
+                不引入 DAG/plugin/arbitrary shell/常驻进程。
           - [ ] CP11.4c.3c.3 canonical evidence packer + 离线 verifier，在干净节点 restore 后至少续跑一轮。
         - [ ] CP11.4c.3d 目标运行：dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector 就位后，
           跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。
