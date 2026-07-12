@@ -35,6 +35,8 @@ STAGE_SCHEMAS = [
     # 外部 repository 声明式适配合同（物化器还会叠加路径/命令/稳定 ID 业务核）
     "import_adapter", "adapter_generation_failure", "import_adapter_review",
     "python_wheel_lock",
+    # 外部运维签发的生产部署能力证明；运行时仍须逐项与本机观测交叉核
+    "deployment_attestation",
 ]
 
 
@@ -174,6 +176,30 @@ def test_policy_adapter_generation_projection_is_minimal_and_bounded():
     invalid["import_materialization"]["adapter_generation"]["max_review_rounds"] = 2
     with pytest.raises(ValidationError):
         validator.validate(invalid)
+
+
+def test_policy_deployment_mode_requires_honest_attestation_shape():
+    with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
+        base = yaml.safe_load(f)
+    validator = make_validator("policy")
+
+    production = yaml.safe_load(yaml.safe_dump(base))
+    production["deployment"] = {
+        "mode": "production",
+        "attestation_path": "/etc/meta-research/deployment.json",
+        "max_attestation_age_s": 300,
+    }
+    validator.validate(production)
+
+    for deployment in (
+            {"mode": "development", "attestation_path": "/tmp/fake.json",
+             "max_attestation_age_s": 86400},
+            {"mode": "production", "attestation_path": None,
+             "max_attestation_age_s": 300}):
+        invalid = yaml.safe_load(yaml.safe_dump(base))
+        invalid["deployment"] = deployment
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
 
 
 def test_policy_budget_price_required_and_positive_when_session_limit_enabled():

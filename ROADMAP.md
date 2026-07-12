@@ -456,5 +456,11 @@
               隔离 Codex token 失效而 fail-closed；唯一全量 1443 通过/1 跳过/1 个无关 Docker `/ebs` 空间失败）。
           - [ ] CP11.4c.2b.3 deployment trust contract：service account/VM、Docker socket、cgroup/device/GPU、
             VEPFS hard byte+inode quota 启动前 fail-closed 预检与证据；开发模式不得冒充生产通过。
+            - [ ] CP11.4c.2b.3a honest deployment preflight：单一 development/production 预检与 owner-bound canonical
+              receipt；production 在 DB/provider 前交叉核只读部署 attestation、service identity、Docker socket/daemon/
+              cgroup、GPU 可达性、exact VEPFS mount、≤300 秒 root-signed GPFS byte+inode quota snapshot 与 Docker
+              storage headroom，任一缺口 fail-closed。
+            - [ ] CP11.4c.2b.3b fixed GPU device bridge：按部署分配的 exact GPU UUID 生成 Docker DeviceRequests，create 后
+              inspect 与容器内 inventory 双核，并把 GPU capability 纳入 runtime identity；不做调度器/MIG/动态租约。
       - [ ] CP11.4c.3 最终实机验收：目标 VEPFS 两节点 owner/lease/fd 行为，100+ 轮含真实 Codex/import/训练、
         owner-kill/daemon-loss/预算与资源失败注入的 soak，并发布可重放证据包。

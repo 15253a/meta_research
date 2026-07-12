@@ -48,6 +48,7 @@ from .console_spool import open_directory_path
 from .connector_ingest import ConnectorInboxIngest
 from .connectors import ConnectorConfigError, OutboundDelivery, load_connectors
 from .cost_ledger import CostLedger
+from .deployment_preflight import DeploymentPreflight, DeploymentPreflightError
 from .execution_reconcile import ExecutionReconciler
 from .execution_sandbox import DockerExecutionSandbox
 from .dependency_image import PythonWheelImageBuilder
@@ -229,6 +230,7 @@ class System:
                      Callable[[Any, Optional[BaseException]], bool]] = None,
                  instance_lease: Optional[InstanceLease] = None,
                  execution_supervisor: Optional[ExecutionSupervisor] = None,
+                 deployment_receipt: Optional[Dict[str, Any]] = None,
                  resource_closers: Optional[List[Callable[[], None]]] = None):
         self.advancer = advancer
         self.state = state
@@ -260,6 +262,7 @@ class System:
             or (lambda _owned, error: error is not None))
         self.instance_lease = instance_lease
         self.execution_supervisor = execution_supervisor
+        self.deployment_receipt = deployment_receipt
         self._resource_closers = list(resource_closers or [])
         self._lifecycle_guard = threading.RLock()
         self._active_operations = 0
@@ -1062,6 +1065,10 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
         raise ValueError(
             "生产 owner lease 下拒绝注入现成 AttackStages（其 DB/work capability 无法归属本次 lease）；"
             "请用 attack=True 由 build_system 装配")
+    if policy["deployment"]["mode"] == "production" and attack is not True:
+        raise ValueError("production deployment 必须启用完整 attack/sandbox 装配")
+    if policy["deployment"]["mode"] == "production" and not enforce_instance_lease:
+        raise ValueError("production deployment 不得关闭 instance owner lease")
     lease: Optional[InstanceLease] = None
     resource_closers: List[Callable[[], None]] = []
     try:
@@ -1112,18 +1119,17 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     """Assemble under an already-held owner lease; caller owns rollback."""
     owner_guard = instance_lease.assert_owned if instance_lease is not None else (lambda: None)
 
+    execution_owner_id = (
+        instance_lease.owner_id if instance_lease is not None
+        else f"unleased-{os.getpid()}-{time.time_ns()}")
     execution_supervisor = ExecutionSupervisor(
         receipt_dir=work / "state" / "executions",
-        owner_id=(instance_lease.owner_id if instance_lease is not None
-                  else f"unleased-{os.getpid()}-{time.time_ns()}"),
+        owner_id=execution_owner_id,
         owner_guard=owner_guard,
         fence_context_factory=(instance_lease.delegate_owner_fence
                                if instance_lease is not None else None))
-    # This happens before connector preparation and before SQLite is opened.
-    # A prior running receipt without its guardian fence is an unsafe recovery,
-    # so assembly fails closed before any new external capability can start.
-    execution_supervisor.recover_previous_generation()
     execution_sandbox = None
+    deployment_receipt = None
     dependency_image_builder = None
     repository_materializer = None
     if attack is True:
@@ -1134,6 +1140,19 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         # scientific failure.  Prove the exact local image/daemon/seccomp
         # before SQLite or any connector/provider side effect is exposed.
         execution_sandbox.preflight()
+        deployment_receipt = DeploymentPreflight(
+            work_root=work,
+            policy=policy,
+            sandbox=execution_sandbox,
+            owner_id=execution_owner_id,
+            attestation_validator=schemas.validator("deployment_attestation"),
+            sandbox_gpu_access=False,
+            owner_guard=owner_guard,
+        ).run()
+        # Only a deployment identity that passed the read-only trust check may
+        # mutate prior-generation/session recovery state.  Both recoveries are
+        # still before SQLite, connectors, providers, or new external work.
+        execution_supervisor.recover_previous_generation()
         execution_sandbox.recover_terminal_sessions(execution_supervisor)
         dependency_image_builder = PythonWheelImageBuilder(
             work_root=work,
@@ -1150,6 +1169,10 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             runtime_environment=execution_sandbox.image_environment,
             owner_guard=owner_guard,
             dependency_image_builder=dependency_image_builder)
+    else:
+        # Trusted reasoning-only diagnostics have no Docker deployment
+        # contract, but retain the existing descendant-tree recovery fence.
+        execution_supervisor.recover_previous_generation()
 
     expected_work_fd = open_directory_path(work, label="system work_root")
     try:
@@ -1447,6 +1470,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                   inbound_cleanup_pending=lambda owned, _error: bool(owned),
                   instance_lease=instance_lease,
                   execution_supervisor=execution_supervisor,
+                  deployment_receipt=deployment_receipt,
                   resource_closers=resource_closers)
 
 
@@ -1479,9 +1503,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
     try:
         system = build_system(args.system_root, args.work_root, outbound_config=outbound_config)
-    except InstanceLeaseError as error:
-        print(f"[run] instance owner 取得失败：{error}", file=sys.stderr)
+    except (InstanceLeaseError, DeploymentPreflightError) as error:
+        print(f"[run] 启动预检失败：{error}", file=sys.stderr)
         return 2
+    deployment_receipt = getattr(system, "deployment_receipt", None)
+    if (deployment_receipt is not None
+            and not deployment_receipt.get("production_ready", False)):
+        print(
+            "[run] development deployment：已写非生产回执；"
+            "当前运行不得视为 production-ready",
+            file=sys.stderr,
+        )
     ids: List[str] = []
     exit_code = 0
     try:

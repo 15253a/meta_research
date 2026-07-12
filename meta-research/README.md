@@ -19,7 +19,8 @@ python -m pytest tests/ -q                              # 自验：以当前测�
 
 # 全自动跑（需真 Codex CLI + 代理，见 §2）：
 export HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890
-# 生产还须先配置 connectors/outbound.json + 对应 token 环境变量（见 §4.2）
+# 默认 policy.deployment.mode=development；这能真跑研究链，但不会产生 production-ready 声明。
+# production 还须配置只读 deployment attestation、connectors 与对应 token（见 §3.1 / §4.2）。
 python -m orchestrator.run --system-root . --work-root /path/to/run_dir --max-cycles 50
 
 # 仅离线/测试（明确承认外部通知不会交付）：
@@ -43,6 +44,9 @@ python -m orchestrator.run --system-root . --work-root /tmp/canary --max-cycles 
   Moby profile 生成且 SHA-256 固定的 amd64 BPF；daemon 注入的 seccomp 只作为额外约束。
   当前默认镜像是最小 CPU/Python 3.11 bootstrap runtime；真实项目应先构建含锁定依赖的镜像，再同时更新
   `execution.sandbox.image`/`image_id`，不得改成可漂移 tag。
+- 同一启动边界还会把 service、mount、Docker/cgroup/storage 与 GPU 可达性写入
+  `<work-root>/state/deployment/deployment-<owner-id>.json`。默认 development 回执永远是
+  `production_ready=false`，入口也会打印警告；它是可用的开发/可信主机模式，不是生产验收。
 
 停机时打印 `[run] dual_mode=… 推进 N 轮：[…]；停因=…`。停因见 §6。
 
@@ -112,9 +116,29 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
   版本/源码 artifact SHA-256。当前 `lfs_policy=fetch`；pointer Git blob、Batch response、下载 OID/size 与最终
   ledger 必须闭合，signed action URL/header 不进入持久复现身份。
 - `session.dual_mode`：A=一 turn 一阶段（默认；A/B 实测定默认属运维）。
+- `deployment`：`development` 只记录诚实的非生产回执；`production` 还须给出部署者持有、service account
+  不可写的 canonical attestation 路径，并在任何 DB/provider 调用前与 live facts 交叉核。
 
 > **改 policy.yaml 是决策性变更**（影响研究语义/门禁/预算）——生产改动应走评审。改后 `pytest
 > tests/test_schemas.py` 会校验它仍合 `schemas/policy.schema.json`。
+
+### 3.1 development / production 部署合同
+
+这套代码不负责创建 VM、service account、Docker daemon 或 GPFS quota；它只在启动时验证这些部署事实。建议先以
+默认 development 跑一次，查看 `state/deployment/deployment-*.json` 中的逐项 check，再由运维补齐隔离与 quota。
+切到 production 时，把 `deployment.mode` 改为 `production`，并让 `attestation_path` 指向符合
+`schemas/deployment_attestation.schema.json` 的 root/部署者只读 canonical JSON。production 最长只接受 300 秒内
+签发的 attestation，并把完整内容嵌入 owner receipt 以便重放审计。它必须绑定：
+
+- 非 root service UID/GID、私有 work-root 和 Codex home；
+- dedicated VM 的部署证据、实测 hypervisor，以及当前 boot/machine identity；
+- service 私有 Codex home/auth、直接 rootless unix Docker socket、daemon ID/root dir、非 fallback cgroup 与资源 limit capability；
+- exact work-root/GPFS mount，以及部署 root 从 `gpfs-fileset-v1` 权威 probe 签发的 hard byte+inode quota
+  snapshot（进程实时核 mount，不自行调用 GPFS；`df`/`statvfs` 不能代替 quota）；
+- GPU inventory 与容器 device 可达性，以及 Docker backing store 的实际 headroom。
+
+任一项缺失、过期或漂移都会在 SQLite、connector 和 Runner 启动前失败。当前检查点仍不开放容器 GPU devices：
+因此 `resources.gpus>0` 的 production 会明确拒绝；development 可跑 CPU 链路，但不得把主机可见 GPU 写成容器可用。
 
 ## 4. 观测与人工干预（跑起来之后）
 
@@ -227,7 +251,7 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 
 ## 7. 诚实边界（operational canary）
 
-当前是**强隔离已接线、部署/长跑仍待验收的金丝雀态**，足以让真 Codex 端到端跑通并验证研究链路，但还不能
+当前是**强隔离已接线、部署/长跑仍待验收的 development 金丝雀态**，足以让真 Codex 端到端跑通并验证研究链路，但还不能
 把“能配置 100 轮”写成“已通过数百轮真实研究验收”：
 
 - 同机同一 work-root 已由稳定非阻塞 flock、owner heartbeat、事务/connector fence、execution guardian 和
@@ -251,6 +275,9 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   quarantine 后验闸，生产仍必须给 work-root/VEPFS 配硬 byte+inode quota。默认 bootstrap image 也未开放
   GPU/device；GPU 真研究须换成已锁依赖的
   exact image 并在具备受验 device/cgroup delegation 的部署后再宣称资源隔离完成。
+- deployment preflight 会把上述差距机械写成 `production_ready=false`。当前节点还以 root 运行、Docker socket
+  经 symlink 进入共享 rootless daemon、容器无 NVIDIA runtime、GPFS hard byte+inode quota 无权威 probe，且
+  Docker backing store 已接近/达到空间上限；这些都不是代码内的“允许降级”，切 production 会 fail-closed。
 - 不可信容器看不到 guardian/provider receipt、SQLite、Codex 凭据或整个 work-root，但同一 host 信任域内的 root/
   orchestrator UID 进程仍能控制 Docker socket 或改本地证据；要防该类 host 对手须独立 service account/VM/远端
   attestation，不能靠 0600/HMAC 自我证明。不同 UID 的 tool-free query 仍要求 guardian 有权排空其树。
