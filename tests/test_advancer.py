@@ -12,6 +12,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -293,6 +294,207 @@ def test_run_cycles_bootstrap_decompose_terminate(env, tmp_path):
     assert "根问题：EEG 有跨数据集通用规律吗？" in {q[2] for q in qs.values()}
     assert "子问题1" in qs and "子问题2" in qs             # decompose 挂了两子
     assert state.last_done_cycle().next_intent == "terminate"
+
+
+def test_storage_reconcile_failure_never_replays_committed_cycle(env):
+    state, compiler = env
+    provider_calls = {"n": 0}
+    storage_calls = {"n": 0}
+
+    def provider(cyc, pack):
+        provider_calls["n"] += 1
+        return _seq_provider(cyc, pack)
+
+    def fail_after_first_cycle():
+        storage_calls["n"] += 1
+        if state.last_done_cycle() is not None:
+            raise RuntimeError("snapshot unavailable")
+
+    advancer = SqliteAdvancer(
+        state, compiler, provider, storage_reconciler=fail_after_first_cycle)
+    with pytest.raises(RuntimeError, match="snapshot unavailable"):
+        advancer.run_cycles(max_cycles=1)
+    assert state.last_done_cycle().cycle_id == "c1"
+    assert provider_calls["n"] == 1
+
+    # 同一进程重入先补 snapshot，随后据已提交 selection 开 c2；绝不重发 c1 provider。
+    advancer.storage_reconciler = lambda: None
+    advancer.run_cycles(max_cycles=1)
+    assert provider_calls["n"] == 2
+    assert state.last_done_cycle().cycle_id == "c2"
+
+
+def test_immediate_abort_is_snapshotted_before_opening_next_cycle(env):
+    state, compiler = env
+    cycle = _prepared_bootstrap(state)
+    storage_calls = {"n": 0}
+    aborted = {"done": False}
+
+    def precheck(_cycle):
+        if not aborted["done"]:
+            state.mark_cycle_done(cycle.cycle_id, "aborted")
+            aborted["done"] = True
+        return None
+
+    def storage():
+        storage_calls["n"] += 1
+        if storage_calls["n"] == 2:  # entry no-op 后，abort terminal cut 必须先于 c2 open
+            raise RuntimeError("snapshot boundary reached")
+
+    advancer = SqliteAdvancer(
+        state, compiler, _seq_provider, precheck=precheck,
+        storage_reconciler=storage)
+    with pytest.raises(RuntimeError, match="snapshot boundary"):
+        advancer.run_cycles(max_cycles=1)
+    assert state.daemon.query_one("SELECT count(*) FROM cycle") == (1,)
+    assert state.cycle(cycle.cycle_id).status == "aborted"
+
+
+def test_stage_boundary_abort_plus_pause_is_snapshotted_before_return(env):
+    state, compiler = env
+    observed = []
+    aborted = {"done": False}
+
+    def precheck(cycle):
+        if cycle is not None and not aborted["done"]:
+            state.mark_cycle_done(cycle.cycle_id, "aborted")
+            aborted["done"] = True
+            return "pause 指令生效中"
+        return None
+
+    def storage():
+        terminal = state.daemon.query_one(
+            "SELECT id,status FROM cycle WHERE status IN ('done','failed','aborted') "
+            "ORDER BY id DESC LIMIT 1")
+        observed.append(terminal)
+
+    advancer = SqliteAdvancer(
+        state, compiler, _seq_provider, precheck=precheck,
+        storage_reconciler=storage)
+    assert advancer.run_cycles(max_cycles=1) == []
+    assert state.cycle("c1").status == "aborted"
+    assert observed[-1] == (1, "aborted")
+
+
+def test_storage_reconcile_runs_after_durable_round_stop(env):
+    state, compiler = env
+    events = []
+
+    class StopAfterRound:
+        def already_stopped(self):
+            return None
+
+        def check_before_round(self):
+            return None
+
+        def check_after_round(self):
+            events.append("stop")
+            return {"reason": "test-stop"}
+
+    def reconcile():
+        events.append("snapshot")
+
+    ids = SqliteAdvancer(
+        state, compiler, _seq_provider, stop_controller=StopAfterRound(),
+        storage_reconciler=reconcile).run_cycles(max_cycles=8)
+    assert ids == ["c1"]
+    assert events == ["snapshot", "snapshot", "stop", "snapshot"]
+
+
+def test_reentry_recovers_budget_stop_before_storage_snapshot(env):
+    state, compiler = env
+    events = []
+
+    class RecoveredStop:
+        stopped = False
+
+        def check_before_round(self):
+            events.append("stop")
+            self.stopped = True
+            return {"reason": "budget_exhausted"}
+
+        def already_stopped(self):
+            return "budget_exhausted" if self.stopped else None
+
+    def reconcile():
+        assert events == ["stop"]
+        events.append("snapshot")
+
+    advancer = SqliteAdvancer(
+        state, compiler, _seq_provider, stop_controller=RecoveredStop(),
+        storage_reconciler=reconcile)
+    assert advancer.run_cycles(max_cycles=1) == []
+    assert advancer.last_stop_reason == "budget_exhausted"
+    assert events == ["stop", "snapshot"]
+
+
+def test_resumed_import_worker_cycle_is_snapshotted_before_next_research_cycle():
+    events = []
+    worker_cycle = SimpleNamespace(cycle_id="c7", route=None)
+    terminal = SimpleNamespace(cycle_id="c7", route=None, next_intent="terminate")
+
+    class Daemon:
+        @staticmethod
+        def query_one(_sql, _params=()):
+            return (1,)
+
+    class State:
+        daemon = Daemon()
+        current = worker_cycle
+
+        def inflight_cycle(self):
+            return self.current
+
+        @staticmethod
+        def pending_goal_amend_directive():
+            return None
+
+        @staticmethod
+        def last_done_cycle():
+            return terminal
+
+    state = State()
+
+    class Worker:
+        @staticmethod
+        def resume_cycle(cycle):
+            assert cycle is worker_cycle
+            events.append("worker-terminal")
+            state.current = None
+
+    advancer = SqliteAdvancer(
+        state, compiler=None, reasoning_provider=lambda _c, _p: None,
+        import_worker=Worker(), storage_reconciler=lambda: events.append("snapshot"))
+    assert advancer._resume_or_open() is None
+    assert events == ["worker-terminal", "snapshot"]
+
+
+def test_open_boundary_reconciles_after_observing_no_inflight_cycle():
+    events = []
+
+    class State:
+        @staticmethod
+        def inflight_cycle():
+            return None
+
+        @staticmethod
+        def last_done_cycle():
+            return None
+
+        @staticmethod
+        def pending_goal_amend_directive():
+            return None
+
+        @staticmethod
+        def open_or_resume_cycle():
+            assert events == ["snapshot"]
+            raise RuntimeError("open reached")
+
+    advancer = SqliteAdvancer(
+        State(), compiler=None, reasoning_provider=lambda _c, _p: None,
+        storage_reconciler=lambda: events.append("snapshot"))
+    with pytest.raises(RuntimeError, match="open reached"):
+        advancer._resume_or_open()
 
 
 def test_run_cycles_resume_after_restart(tmp_path):

@@ -8,6 +8,7 @@ work_root 续跑（goal 不重建）；durable 停机与全局等待端到端生
 from __future__ import annotations
 
 import json
+import sqlite3
 import stat
 from pathlib import Path
 
@@ -42,6 +43,13 @@ def _mock_factory(files_seq):
             return Artifact(stage=context_pack.stage, files=box["seq"].pop(0), md="",
                             usage=CallUsage(tokens_known=True))
     return lambda td, pt: MockRunner()
+
+
+def _storage_manifest(work: Path, cycle_id: str):
+    pointer = json.loads(
+        (work / "state" / "storage" / "cycles" / f"{cycle_id}.json").read_text(
+            encoding="utf-8"))
+    return json.loads((work / pointer["manifest_path"]).read_text(encoding="utf-8"))
 
 
 def test_system_rejects_unimplemented_multi_stage_session_mode(tmp_path):
@@ -723,6 +731,12 @@ def test_build_and_run_bootstrap_terminate(tmp_path):
     assert (tmp_path / "research.sqlite").exists()             # 真冻结库落盘
     assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
     assert stat.S_IMODE((tmp_path / "research.sqlite").stat().st_mode) == 0o600
+    # 生产装配端到端：同一 terminal cycle 恰一 SQLite backup + runtime views Git + manifest。
+    manifest = _storage_manifest(tmp_path, ids[0])
+    assert manifest["cycle_id"] == ids[0] and manifest["cycle_status"] == "done"
+    assert {path.name for path in (tmp_path / "views").iterdir()} == {
+        ".git", "goal.md", "tree.md", "pool.md", "digest.md"}
+    assert (tmp_path / manifest["backup"]["path"]).is_file()
 
 
 def test_production_assembly_uses_codex_query_responder_and_drains_on_exit(tmp_path):
@@ -991,11 +1005,47 @@ def test_system_unknown_usage_durably_stops_without_retry(tmp_path):
 def test_resume_same_work_root_no_goal_recreate(tmp_path):
     """重启同 work_root 续跑：goal 不重建（幂等）、上轮 terminate → 本次 0 轮。"""
     sys1 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE]))
-    sys1.run(5)
+    cycle_id = sys1.run(5)[0]
+    first_manifest = _storage_manifest(tmp_path, cycle_id)
     assert sys1.close() is None
     sys2 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))   # 无需再调 runner
     assert sys2.run(max_cycles=5) == []                        # 已 terminate，无新轮
     assert sys2.daemon.query_one("SELECT count(*) FROM goal")[0] == 1   # goal 唯一（未重建）
+    assert _storage_manifest(tmp_path, cycle_id) == first_manifest       # 0 新 backup / 0 新 commit
+
+
+def test_startup_recovers_budget_stop_before_missing_terminal_snapshot(tmp_path):
+    """terminal commit 后、轮后 stop/snapshot 前崩溃：重启恢复的 stop 必须进同一 recovery point。"""
+    sys1 = build_system(
+        SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE]))
+    sys1.advancer.storage_reconciler = None       # 模拟 terminal commit 后未及发布
+    assert sys1.run(1) == ["c1"]
+    assert not (tmp_path / "state" / "storage" / "cycles" / "c1.json").exists()
+    runner_call_id = sys1.daemon.query_one(
+        "SELECT id FROM runner_call WHERE cycle_id=1 ORDER BY id DESC LIMIT 1")[0]
+    with sys1.daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO ledger(cycle_id,phase,runner_call_id,money,policy_version) "
+            "VALUES (1,'reasoning',?,100000,'v0')", (runner_call_id,))
+    assert sys1.daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='global_stop'") == (0,)
+    assert sys1.close() is None
+
+    sys2 = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))
+    assert sys2.daemon.query_one(
+        "SELECT json_extract(payload_json,'$.reason') FROM decision "
+        "WHERE type='global_stop'") == ("budget_exhausted",)
+    manifest = _storage_manifest(tmp_path, "c1")
+    backup = sqlite3.connect(
+        f"file:{tmp_path / manifest['backup']['path']}?mode=ro", uri=True)
+    try:
+        assert backup.execute(
+            "SELECT json_extract(payload_json,'$.reason') FROM decision "
+            "WHERE type='global_stop'").fetchone() == ("budget_exhausted",)
+    finally:
+        backup.close()
+    assert sys2.run(max_cycles=1) == []
+    assert sys2.close() is None
 
 
 # ============ 注入组件端到端接线 ============
@@ -1021,6 +1071,15 @@ def test_tau_score_floor_self_stop_end_to_end(tmp_path):
     ids = sys.run(max_cycles=5)
     assert len(ids) == 1 and sys.last_stop_reason == "score_floor"   # 第 1 轮后自停、decompose 轮不开
     assert sys.daemon.query_one("SELECT count(*) FROM decision WHERE type='global_stop'")[0] == 1
+    # snapshot 必须排在 check_after_round 后，故恢复点已包含本轮写下的 durable global_stop。
+    manifest = _storage_manifest(tmp_path, ids[0])
+    backup = sqlite3.connect(
+        f"file:{tmp_path / manifest['backup']['path']}?mode=ro", uri=True)
+    try:
+        assert backup.execute(
+            "SELECT count(*) FROM decision WHERE type='global_stop'").fetchone() == (1,)
+    finally:
+        backup.close()
 
 
 def test_goal_body_from_db_not_edited_brief(tmp_path, monkeypatch):

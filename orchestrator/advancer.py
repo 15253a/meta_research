@@ -69,7 +69,7 @@ def derive_next_route(prev_selection: Selection, outcome: PlanOutcome) -> Option
 class SqliteAdvancer:
     def __init__(self, state, compiler, reasoning_provider: ReasoningProvider,
                  gate=None, recall=None, attack=None, status_publisher=None, precheck=None,
-                 stop_controller=None, import_worker=None):
+                 stop_controller=None, import_worker=None, storage_reconciler=None):
         """state = SQLiteStateStore；compiler = SqliteCompiler；reasoning_provider 见模块注释。
         attack = attack_stages.AttackStages（M4 CP5.4：idea/plan/bundle/reasoning 阶段推进；None = 拒 attack 轮）。
         status_publisher = status_card.SqliteStatusPublisher（M5 CP6.2：阶段边界原子发布人机快照；
@@ -90,6 +90,9 @@ class SqliteAdvancer:
         self.last_block_reason: Optional[str] = None   # 最近一次阻断拒因（观测用；None=未被阻断）
         self.last_stop_reason: Optional[str] = None    # 最近一次自终止停因（None=未自停）
         self.import_worker = import_worker  # M4：物化队列 + 在途 worker cycle 恢复
+        # DB 事务后的幂等存储副作用（online backup / views Git / manifest）。失败向上抛，
+        # 已提交 cycle 不回滚；重启或重入会先补齐，再允许开下一轮。
+        self.storage_reconciler = storage_reconciler
 
     def derive_next_route(self, prev_selection: Selection, outcome: PlanOutcome) -> Optional[Route]:
         return derive_next_route(prev_selection, outcome)
@@ -101,6 +104,13 @@ class SqliteAdvancer:
         每轮：取在途轮（续跑）或据上轮 selection 开新轮 + setup（route + decompose 激活目标）→ advance 到 done。
         上轮 selection.next_intent=terminate → 停机。返回本次推进的 cycle_id 序列。"""
         ids: List[str] = []
+        # 同 System 重入也可能恢复于 terminal commit 之后、轮后 stop 落库之前。先补恢复安全的
+        # 预算 global_stop，再冻结 snapshot；否则会永久发布一份少停机事实的 recovery point。
+        if self.stop_controller is not None:
+            hit = self.stop_controller.check_before_round()
+            if hit is not None:
+                self.last_stop_reason = hit["reason"]
+        self._reconcile_storage()
         if self.stop_controller is not None:     # durable 停机（§4.4.6）：已落 global_stop 决策 → 拒推进
             self.last_stop_reason = self.stop_controller.already_stopped()
             if self.last_stop_reason is not None:
@@ -111,13 +121,26 @@ class SqliteAdvancer:
                 if hit is not None:
                     self.last_stop_reason = hit["reason"]
                     break
-            if self._blocked(None):
+            inflight_before_precheck = self.state.inflight_cycle()
+            blocked = self._blocked(None)
+            # 同一 precheck 批次可先 abort 再 pause；即使本轮随后阻断退出，也立即保存 abort 切面。
+            # `_resume_or_open` 内还有真正 open 前的第二道闸，负责覆盖两次读取之间的并发窗口。
+            if (inflight_before_precheck is not None
+                    and self.state.inflight_cycle() is None):
+                self._reconcile_storage()
+            if blocked:
                 break                        # 全局等待（§4.4.1）：开新轮前被阻断（pause / pending 文件请求）
             cyc = self._resume_or_open()
             if cyc is None:
                 break                        # 停机（上轮 terminate）
             for _step in range(8):               # attack 轮多阶段：逐格推进到 done（每格独立提交）
+                inflight_before_stage_precheck = self.state.inflight_cycle()
                 if self._blocked(cyc):
+                    # 同一 stage-boundary 批次可先 abort 再 pause；被阻断直接返回前仍须发布
+                    # aborted 终态切面，不能把补偿推给「下次重入」（调用方可能正常退出）。
+                    if (inflight_before_stage_precheck is not None
+                            and self.state.inflight_cycle() is None):
+                        self._reconcile_storage()
                     return ids               # 格间阻断：不推阶段（在途轮保持游标，解除后续跑）
                 try:
                     done = self.advance(cyc.cycle_id) == "done"
@@ -142,11 +165,15 @@ class SqliteAdvancer:
             else:   # 进度护栏（codex NIT）：>8 格未到 done = 游标损坏（如 pc duplicate 而 status 未推进），fail loud
                 raise RuntimeError(f"cycle {cyc.cycle_id} 推进 8 格未达 done——游标疑似损坏（status 未随阶段推进）")
             ids.append(cyc.cycle_id)
+            round_stop = None
             if self.stop_controller is not None:  # §4.4.6 安全网：本轮完成后评估 τ 判据①②（每轮恰一次）
-                hit = self.stop_controller.check_after_round()
-                if hit is not None:
-                    self.last_stop_reason = hit["reason"]
-                    break                    # 自终止：落了 durable global_stop，下次 run_cycles 亦拒推进
+                round_stop = self.stop_controller.check_after_round()
+                if round_stop is not None:
+                    self.last_stop_reason = round_stop["reason"]
+            # 必须在 check_after_round 之后：本轮触发的 durable global_stop 也属于该 recovery point。
+            self._reconcile_storage()
+            if round_stop is not None:
+                break                        # 自终止：snapshot 已含停机事实，下次亦拒推进
         return ids
 
     def _blocked(self, cyc) -> bool:
@@ -173,10 +200,19 @@ class SqliteAdvancer:
         if self.status_publisher is not None:
             self.status_publisher.publish(cycle_id)
 
+    def _reconcile_storage(self) -> None:
+        if self.storage_reconciler is not None:
+            self.storage_reconciler()
+
     def _resume_or_open(self):
         """取本轮要推进的（已 setup 的）cycle；None = 应停机。恢复安全：先看在途轮（续跑其未竟阶段），
         无在途轮再据上轮 selection 决定开新轮还是停机。"""
         cyc = self.state.inflight_cycle()
+        if cyc is None:
+            # precheck/interaction 可在上一读与开轮之间把旧在途轮终结为 aborted。把闸放在真正
+            # open/worker 入口：先 reconcile，再重读；没有 snapshot 时绝不创造下一轮。
+            self._reconcile_storage()
+            cyc = self.state.inflight_cycle()
         if cyc is not None and cyc.route is None and self.state.daemon.query_one(
                 # 标记探测**无条件**（内联 ImportWorker.is_worker_cycle 同口径查询——不依赖 worker 已装配，
                 # 内审 SHOULD：否则未装配时在途 worker 轮会被 _setup_cycle 误派研究 route = 静默损坏）
@@ -188,6 +224,7 @@ class SqliteAdvancer:
             # 在途物化 worker 轮（OPEN #6 裁决④：route=NULL + 标记）→ 交物化 resumer 续跑
             self.import_worker.resume_cycle(cyc)
             cyc = self.state.inflight_cycle()    # worker 已终态 → 落回常规研究轮取位
+            self._reconcile_storage()            # worker cycle 也须先存档，不能混入随后研究轮 backup
         if cyc is None:
             # Human goal amendments and a durable research terminate outrank starting *new* import
             # work.  An already-open worker was reconciled above, but a queued selection must not
@@ -206,6 +243,7 @@ class SqliteAdvancer:
                 if cyc is not None:
                     raise RuntimeError(
                         f"import worker 返回后仍留在途 cycle {cyc.cycle_id}；须由恢复入口收口")
+                self._reconcile_storage()        # 新 worker 已终态；下一行才可能打开新研究轮
         if cyc is None:
             prior = self.state.last_done_cycle()
             if prior is not None:
