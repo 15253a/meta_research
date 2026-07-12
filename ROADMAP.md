@@ -497,9 +497,19 @@
               继承已证明的 preflight envelope，但不把 `statvfs` 冒充持续 hard-quota 证明。
               → commit `011c98b`（build_log 0074；相关 118；内部双终审 APPROVE；外审第 1 轮 401、
               第 2 轮 5 分钟无 verdict；全量依用户要求留到最终检查点）。
-            - [ ] CP11.4c.3b.2b registered asset closure：验证 import-materialization indexes/objects 的可达
-              闭包可盘点、可恢复；如仍需 staging GC，只删无 DB/manifest/active-session 引用的对象；raw log
-              只建确定性压缩镜像并保留冻结 ref/hash 原件。完成前 b.2/b 整体不勾选。
+            - [ ] CP11.4c.3b.2b registered asset closure：不加 daemon/第二 DB，只在现有 snapshot/CAS 上
+              补已登记资产的离线副本、校验与恢复闭包。
+              - [x] CP11.4c.3b.2b.1 registered execution-log mirror：从最新已深验 SQLite snapshot 的
+                `execution_log` 行枚举冻结原件，建 deterministic gzip CAS + immutable per-row index；
+                有界解压与 exact inode/hash/bytes/mode 复验，崩溃重放补齐 object/index 耐久窗口。
+                scope 只是 DB-registered logs，不 glob guardian/session/transcript，原件不移动/删除/改权。
+                同时为 VEPFS 不支持 `renameat2` flags 的 SQLite restore 补 no-clobber 目标名 +
+                parent claim + instance lease + ready marker fallback，中途退出的部分目标不可启动。
+              - [ ] CP11.4c.3b.2b.2 import materialization closure：从所选 SQLite backup 根到
+                `state/import-materializations/{indexes,objects}` 可达闭包，并传递绑定 v3
+                dependency-image object；离线盘点/恢复不调 Docker/网络/当前 policy。如仍需
+                staging GC，只删无 DB/manifest/active-session 引用的对象。
+              完成 b.2b.2 前 b.2/b 整体不勾选。
         - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
           - [ ] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 全部 sealed-holdout/one-shot/non-feedback 约束；
             T1 的 DREAMER 在 A/B/C/HPO/claim 不可见，T2 的 target_y 与 trial/stimulus 身份对 train/HPO 不可见，独立 evaluator 出分。

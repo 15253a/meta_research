@@ -205,17 +205,49 @@ commit/tree 与 applied-plan authority，并对默认受保护的最近 3 代做
 objects 的可达闭包。`gc-plan` 自身不改 storage/views，也不在源 work-root 保存计划；CLI 为互斥而产生的 lease
 metadata/heartbeat 是唯一控制面写入，shell 重定向也应指向源目录之外。
 
-`restore` 只接受源 work-root 外、尚不存在的目标，并以 no-clobber 原子目录发布 `research.sqlite + restore.json`。
-其 receipt 明示 `scope=sqlite_truth_only`；新 work-root 首次启动会诚实建立 adoption baseline，不带回原 views Git、
-snapshot timeline、checkpoint/log/import 原件，因此不是完整 work-root 或跨站灾备。GC 默认至少保留最近 3 代；
+`restore` 只接受源 work-root 外、尚不存在的目标，并以 no-clobber 方式发布
+`research.sqlite + restore.json`。文件系统支持 `renameat2(RENAME_NOREPLACE)` 时是原子目录提升；
+当 VEPFS 不支持 rename flags 时，改用目标出现前已耐久的 sibling parent claim + 排他创建目标目录 +
+同一 instance lease + `.restore-in-progress` ready marker。后者只在 DB/receipt 已各自耐久落位后，
+先解除 parent claim、再删 inner marker；中途退出会
+保留不可启动的部分目标供人工检查，不冒充恢复成功；若在目标目录创建前退出，则保留
+`.restore-in-progress-<sha256(abs-target)>` sibling claim，操作员检查后再清理。成功的 fallback 目标会多出正常的
+`.orchestrator-instance.lock` / `state/orchestrator_heartbeat.json` 控制元数据。receipt 明示
+`scope=sqlite_truth_only` 与 `publication_contract=atomic_noreplace_or_lease_fenced_ready`；新 work-root 首次
+启动会诚实建立 adoption baseline，不带回原 views Git、snapshot timeline、checkpoint/log/import 原件，
+因此不是完整 work-root 或跨站灾备。GC 默认至少保留最近 3 代；
 apply 必须同时给 canonical plan 和显式 hash，先持久化不可变 authority，再仅删除 backup CAS 中计划列明的
 expired/orphan 文件。即使进程在 authority 与 unlink 之间退出，该代也已逻辑退役且不能恢复，重放只补物理删除；
 pointer、manifest、genesis 与 views Git 永不由该 GC 删除。
 
 每次 cycle backup 在创建 temp/pending/Git 前检查 `本次 SQLite bytes/inodes + reserve` 的实时物理 headroom。
 production reserve 来自启动时已验证的部署 envelope；`statvfs` 只是此刻的物理余量，不是持续 GPFS hard-quota
-监控。raw-log 确定性压缩镜像、import-materialization indexes/objects 与 registered asset 恢复闭包仍属
-CP11.4c.3b.2b；完成前不能声称 b.2 或存储治理整体验收。
+监控。
+
+#### 已登记执行日志镜像（CP11.4c.3b.2b.1）
+
+先停止该 work-root 的 run 进程；这是离线检查点操作，不自动挂到每轮终态路径：
+
+```bash
+python -m orchestrator.storage_ops --work-root <work-root> mirror-logs
+python -m orchestrator.storage_ops --work-root <work-root> verify-log-mirrors
+```
+
+`mirror-logs` 只从最新不可变 SQLite snapshot 中枚举身份完整的 `execution_log` 行，在
+`state/storage/log-mirrors/objects/sha256/` 发布 level-9、mtime=0、空 filename、OS=255 的确定性
+gzip CAS，并在 `indexes/execution-log-<id>.json` 嚻结 DB 行与镜像身份。源文件须仍与登记的
+ref/hash/bytes 一致；命令不移动、删除、chmod 或原地压缩它。object/index 均先耐久化再建下游
+引用，kill 后重放会补齐 rename→fsync 窗口；验证按登记 raw bytes 上限有界解压，拒绝尾随数据、
+多 gzip member、类型/link/mode/hash 漂移。额外 CAS 只会报为 orphan，本命令不删除它。
+
+机器可读 scope 是 `db_registered_execution_logs_only`：它不 glob 未入库失败日志、runner transcript、
+guardian capture 或 sandbox session，也不声称覆盖“所有 raw log”。镜像是已登记冷数据的内容副本/
+离线校验面，原件仍是冻结 ref 指向的正本，它尚未进入 `restore` 恢复闭包。单次离线扫描随
+cycle/log 数和日志总字节线性增长；若每轮全量自动执行，跨轮累计会趋近二次方，因此本设计明确只用于
+人工/最终检查点。
+
+import-materialization indexes/objects 及其 dependency-image 传递闭包、registered asset 恢复仍属
+CP11.4c.3b.2b.2；完成前不能声称 b.2 或存储治理整体验收。
 
 ### 4.1 人类控制台（web 查看 + 交互，步⑨）
 
