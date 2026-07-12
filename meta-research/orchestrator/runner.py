@@ -5,6 +5,8 @@ prompt = system_prompt + skill 节选 + 四区上下文包 + 信封提醒，全�
 ``tool_free=True`` 的交互 responder 还会以不同 UID 在临时 cwd 运行（writer work/DB =
 0700/0600，该 UID 无法 traverse），关闭 web/shell/apps/browser/computer/multi-agent，并对 JSON 事件流
 拒绝任何工具项；不是仅靠 prompt 自律。产物 = 最后一个 ```json 代码块。
+``no_host_tools=True`` 复用同一严格 capability/trace 闭包但保持当前 UID；它供 qualification
+研究工人使用：工人只接内联 ContextPack 并产 JSON 信封，不能用模型工具绕过实验容器读数据。
 
 工程配置走环境变量（非 policy.yaml——模型/二进制是工程事实，不在附录 C 旋钮注册表内）：
   METARESEARCH_CODEX_BIN     默认 codex-chatgpt（本机已认证包装）
@@ -260,7 +262,10 @@ class RunnerError(RuntimeError):
 
 class CodexRunner:
     def __init__(self, *, transcripts_dir: Path, purpose_tag: str = "", tool_free: bool = False,
+                 no_host_tools: bool = False,
                  execution_supervisor: Optional[ExecutionSupervisor] = None):
+        if not isinstance(tool_free, bool) or not isinstance(no_host_tools, bool):
+            raise ValueError("runner tool_free/no_host_tools 须为 bool")
         self.bin = os.environ.get("METARESEARCH_CODEX_BIN", "codex-chatgpt")
         self.model = os.environ.get("METARESEARCH_CODEX_MODEL", "gpt-5.5")
         self.effort = os.environ.get("METARESEARCH_CODEX_EFFORT", "medium")
@@ -270,6 +275,8 @@ class CodexRunner:
         os.chmod(self.transcripts_dir, 0o700)
         self.purpose_tag = purpose_tag
         self.tool_free = tool_free
+        self.no_host_tools = tool_free or no_host_tools
+        self.output_uid = os.geteuid()
         self.execution_supervisor = execution_supervisor or ExecutionSupervisor.standalone(
             self.transcripts_dir / ".execution-receipts")
         self.query_user = None
@@ -303,6 +310,7 @@ class CodexRunner:
             self.query_user_home = account.pw_dir
             self.query_uid = account.pw_uid
             self.query_gid = account.pw_gid
+            self.output_uid = account.pw_uid
         self._call_no = 0
         self._runner_call_id: Optional[int] = None
         self._reconcile_protocol: Optional[str] = None
@@ -408,10 +416,11 @@ class CodexRunner:
         os.chmod(prompt_file, 0o600)
         runtime_dir = None
         runtime_cwd = self.transcripts_dir
-        if self.tool_free:
+        if self.no_host_tools:
             runtime_dir = Path(tempfile.mkdtemp(prefix="meta-research-query-"))
             os.chmod(runtime_dir, 0o700)
-            os.chown(runtime_dir, self.query_uid, self.query_gid)
+            if self.tool_free:
+                os.chown(runtime_dir, self.query_uid, self.query_gid)
             runtime_cwd = runtime_dir
         runtime_out_file = (runtime_dir / f"{tag}.out.md"
                             if runtime_dir is not None else out_file)
@@ -427,7 +436,7 @@ class CodexRunner:
             "-o", str(runtime_out_file),
             "-",
         ]
-        if self.tool_free:
+        if self.no_host_tools:
             # interaction_query 只能基于内联投影回答。关闭可读取宿主文件/外部状态或再委派的能力；
             # --strict-config 使未来 CLI 移除/改名能力开关时 fail loud，不静默退回带工具 agent。
             cmd[2:2] = [
@@ -452,18 +461,29 @@ class CodexRunner:
                 "--disable", "goals",
                 "--disable", "tool_suggest",
                 "--disable", "code_mode_host",
+                "--disable", "code_mode",
                 "--disable", "in_app_browser",
+                "--disable", "auth_elicitation",
+                "--disable", "tool_call_mcp_elicitation",
+                "--disable", "skill_mcp_dependency_install",
+                "--disable", "shell_snapshot",
+                "--disable", "request_permissions_tool",
+                "--disable", "network_proxy",
             ]
-            query_home = os.environ.get(
-                "METARESEARCH_QUERY_CODEX_HOME", str(Path(self.query_user_home) / ".codex"))
-            if not (Path(query_home) / "auth.json").is_file():
-                raise ValueError("interaction_query 隔离账户缺 Codex auth.json")
-            env_args = [f"CODEX_HOME={query_home}", f"HOME={self.query_user_home}"]
-            for name in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-                         "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE"):
-                if name in os.environ:
-                    env_args.append(f"{name}={os.environ[name]}")
-            cmd = ["/usr/bin/sudo", "-n", "-u", self.query_user, "-H", "env", *env_args, *cmd]
+            if self.tool_free:
+                query_home = os.environ.get(
+                    "METARESEARCH_QUERY_CODEX_HOME", str(Path(self.query_user_home) / ".codex"))
+                if not (Path(query_home) / "auth.json").is_file():
+                    raise ValueError("interaction_query 隔离账户缺 Codex auth.json")
+                env_args = [f"CODEX_HOME={query_home}", f"HOME={self.query_user_home}"]
+                for name in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                             "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE"):
+                    if name in os.environ:
+                        env_args.append(f"{name}={os.environ[name]}")
+                cmd = [
+                    "/usr/bin/sudo", "-n", "-u", self.query_user, "-H", "env",
+                    *env_args, *cmd,
+                ]
         t0 = time.monotonic()
         copy_error = None
         provider_receipt_ref = None
@@ -475,8 +495,9 @@ class CodexRunner:
                 proc = self.execution_supervisor.run(
                     cmd, stdin=fh, capture_output=True,
                     timeout_s=self.timeout_s,
-                    cwd=runtime_cwd if self.tool_free else None,
-                    kind="codex-query" if self.tool_free else "codex-runner",
+                    cwd=runtime_cwd if self.no_host_tools else None,
+                    kind=("codex-query" if self.tool_free else
+                          "codex-no-host-tools" if self.no_host_tools else "codex-runner"),
                     operation_context={
                         "cycle_id": pack.cycle_id,
                         "stage": pack.stage,
@@ -519,7 +540,7 @@ class CodexRunner:
                 prompt=prompt, usage=usage, usage_source=usage_source,
                 stderr=stderr, json_trace=stdout,
                 execution_receipt_ref=execution_receipt_ref, tag=tag)
-            if self.tool_free and stdout:
+            if self.no_host_tools and stdout:
                 try:
                     events_file.write_text(stdout, encoding="utf-8")
                     os.chmod(events_file, 0o600)
@@ -580,7 +601,7 @@ class CodexRunner:
             if runtime_dir is not None:
                 try:
                     _copy_isolated_output(
-                        runtime_out_file, out_file, expected_uid=int(self.query_uid))
+                        runtime_out_file, out_file, expected_uid=int(self.output_uid))
                 except FileNotFoundError:
                     pass
                 except (OSError, ValueError) as error:
@@ -591,7 +612,7 @@ class CodexRunner:
                 f"tool-free runner 输出接收失败：{tag}（{copy_error}）", usage=usage,
                 transcript_ref=str(out_file), execution_receipt_ref=execution_receipt_ref,
                 provider_receipt_ref=provider_receipt_ref)
-        if self.tool_free:
+        if self.no_host_tools:
             try:
                 events_file.write_text(stdout, encoding="utf-8")
                 os.chmod(events_file, 0o600)
@@ -609,7 +630,7 @@ class CodexRunner:
                 failure_kind="runtime",
                 execution_receipt_ref=execution_receipt_ref,
                 provider_receipt_ref=provider_receipt_ref)
-        if self.tool_free:
+        if self.no_host_tools:
             try:
                 validate_tool_free_trace(stdout)
             except RunnerError as error:

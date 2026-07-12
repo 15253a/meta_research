@@ -237,7 +237,8 @@ class AttackStages:
                  owner_guard: Optional[Callable[[], None]] = None,
                  execution_supervisor=None,
                  execution_sandbox=None,
-                 execution_sandbox_resolver=None):
+                 execution_sandbox_resolver=None,
+                 qualification_firewall=None):
         """state=SQLiteStateStore；compiler=SqliteCompiler；pool_gate=PoolGate(含 ExecGate 全家)；
         close_gate=SqliteGate（parser_suspect 已接真）；providers 见模块注释；work_root=staging 根目录。
         schemas=SchemaSet（步⑧：manifest 校验执法在编排器侧，不只靠 StageProvider）；
@@ -262,6 +263,7 @@ class AttackStages:
         self.execution_supervisor = execution_supervisor
         self.execution_sandbox = execution_sandbox
         self.execution_sandbox_resolver = execution_sandbox_resolver
+        self.qualification_firewall = qualification_firewall
 
     def _target_environment_hash(self, build_target_id: int) -> str:
         row = self.state.daemon.query_one(
@@ -411,6 +413,10 @@ class AttackStages:
             plan = self._plan_artifact(cyc)     # persist-then-consume（原子落盘、恢复复用；失败转 _PlanReject）
             self._validate_plan_schema(plan)    # 结构闸（防裸 KeyError 逃逸）：非 schema-conform → _PlanReject
             if "import_defer" in plan:
+                if self.qualification_firewall is not None:
+                    raise _PlanReject(
+                        "T1/T2 qualification 从头约束禁止物化既有 repo/code/baseline；"
+                        "外部仓库只能作为文献线索")
                 self._commit_import_defer(cyc, plan)
                 return
             targets = sorted(plan["targets"], key=lambda x: x["seq"])   # schema 保证 targets/seq 在场
@@ -1231,6 +1237,9 @@ class AttackStages:
                 manifest = files["execution_manifest.json"]
                 self._check_manifest(manifest, slice_)
                 actual_refs = MF.extract_manifest_asset_refs(manifest)
+                if self.qualification_firewall is not None and actual_refs:
+                    raise MF.ManifestError(
+                        "qualification bundle 禁止消费 uploaded/external asset refs")
                 unauthorized = sorted(set(actual_refs) - set(pack.refs))
                 if unauthorized:
                     raise MF.ManifestError(
@@ -1255,6 +1264,9 @@ class AttackStages:
         self._check_manifest(manifest, slice_)    # resume 再校验（损坏→ManifestError 上抛，不吞）
         authorization = MF.load_asset_authorization(src_dir, manifest)
         frozen_refs = authorization.asset_refs if authorization is not None else frozenset()
+        if self.qualification_firewall is not None and frozen_refs:
+            raise MF.ManifestError(
+                "qualification 已物化 bundle 含外部 asset refs，拒绝恢复")
         missing_now = sorted(set(frozen_refs) - set(pack.refs))
         if missing_now:
             raise MF.ManifestError(

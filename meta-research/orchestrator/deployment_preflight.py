@@ -846,6 +846,84 @@ def _gpu_evidence_ok(evidence: Optional[Mapping[str, Any]], *,
         and _SHA256_RE.fullmatch(execution["sandbox_spec_sha256"]) is not None)
 
 
+def validate_gpu_canary_evidence(
+        evidence: Mapping[str, Any], *, work_root: Path | str,
+        owner_id: Optional[str], sandbox_config: Mapping[str, Any],
+        contract: Mapping[str, Any], candidate_hash: str, now: float,
+        require_fence: bool = True) -> Dict[str, Any]:
+    """Validate one canary against its exact log and durable guardian receipt."""
+    if not _gpu_evidence_ok(
+            evidence, contract=contract, sandbox_config=sandbox_config,
+            candidate_hash=candidate_hash, now=now):
+        raise ValueError("GPU canary evidence schema/runtime/freshness 非法")
+    root = Path(os.path.abspath(os.fspath(work_root)))
+    execution = evidence["execution"]
+    token = candidate_hash.removeprefix("sha256:")[:32]
+    expected_log = (
+        root / "state" / "deployment" / "gpu-canary"
+        / token / "gpu-canary.log")
+    log_path = execution.get("log_path")
+    if (not isinstance(log_path, str)
+            or Path(os.path.abspath(log_path)) != expected_log):
+        raise ValueError("GPU canary log path 未绑定当前 candidate")
+    raw = read_artifact_bytes(
+        expected_log, max_bytes=1024 * 1024, label="deployment GPU canary log")
+    if execution.get("log_sha256") != _hash_bytes(raw):
+        raise ValueError("GPU canary log hash 漂移")
+    driver, inventory = _parse_gpu_canary_log(raw)
+    if (driver != contract.get("driver_version")
+            or inventory != contract.get("devices")
+            or evidence.get("inventory") != inventory):
+        raise ValueError("GPU canary log inventory 未绑定 exact contract")
+
+    operation_id = execution.get("operation_id")
+    if (not isinstance(operation_id, str)
+            or re.fullmatch(r"exec-[0-9a-f]{32}", operation_id) is None):
+        raise ValueError("GPU canary operation_id 非法")
+    expected_receipt = (
+        root / "state" / "executions" / f"execution-{operation_id}.json")
+    receipt_path = execution.get("process_receipt_path")
+    if (not isinstance(receipt_path, str)
+            or Path(os.path.abspath(receipt_path)) != expected_receipt):
+        raise ValueError("GPU canary guardian receipt path 非法")
+    receipt = read_receipt(expected_receipt)
+    validate_execution_receipt(receipt, expected_receipt)
+    receipt_owner = receipt.get("owner_id")
+    if (not isinstance(receipt_owner, str) or not receipt_owner
+            or len(receipt_owner) > 128
+            or (owner_id is not None and receipt_owner != owner_id)
+            or receipt.get("kind") != "deployment-gpu-canary"
+            or (require_fence
+                and receipt.get("fenced_by_instance_lease") is not True)):
+        raise ValueError("GPU canary guardian receipt owner/kind/fence 非法")
+    sandbox = receipt.get("sandbox")
+    if not isinstance(sandbox, Mapping):
+        raise ValueError("GPU canary guardian receipt 缺 sandbox authority")
+    if (sandbox.get("engine_path")
+            != os.path.realpath(sandbox_config["engine_path"])
+            or sandbox.get("engine_host") != sandbox_config["engine_host"]
+            or sandbox.get("resource_mode") != sandbox_config["resource_mode"]):
+        raise ValueError("GPU canary guardian receipt 未绑定 exact Docker authority")
+    guardian_projection = {
+        "operation_id": receipt.get("operation_id"),
+        "state": receipt.get("state"), "outcome": receipt.get("outcome"),
+        "returncode": receipt.get("returncode"),
+        "group_drained": receipt.get("group_drained"),
+        "containment": receipt.get("containment"),
+        "context": dict(receipt.get("context") or {}),
+        "sandbox": {
+            "backend": sandbox.get("backend"),
+            "spec_sha256": sandbox.get("spec_sha256"),
+            "container_drained": sandbox.get("container_drained"),
+        },
+    }
+    if (guardian_projection != evidence.get("guardian")
+            or sandbox.get("spec_sha256")
+            != execution.get("sandbox_spec_sha256")):
+        raise ValueError("GPU canary evidence 与 durable guardian receipt 不一致")
+    return dict(receipt)
+
+
 def evaluate_deployment(*, facts: Mapping[str, Any], attestation: Optional[Mapping[str, Any]],
                         now: float, max_attestation_age_s: int,
                         deployment_mode: str,
@@ -1080,74 +1158,14 @@ class DeploymentPreflight:
 
     def _validate_gpu_evidence_authority(
             self, evidence: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
-        execution = evidence.get("execution")
-        if not isinstance(execution, Mapping):
-            raise ValueError("GPU canary evidence 缺 execution authority")
-        candidate_hash = candidate["candidate_hash"]
-        token = candidate_hash.removeprefix("sha256:")[:32]
-        expected_log = (
-            self.work_root / "state" / "deployment" / "gpu-canary"
-            / token / "gpu-canary.log")
-        log_path = execution.get("log_path")
-        if (not isinstance(log_path, str)
-                or Path(os.path.abspath(log_path)) != expected_log):
-            raise ValueError("GPU canary log path 未绑定当前 candidate")
-        raw = read_artifact_bytes(
-            expected_log, max_bytes=1024 * 1024, label="deployment GPU canary log")
-        if execution.get("log_sha256") != _hash_bytes(raw):
-            raise ValueError("GPU canary log hash 漂移")
-        driver, inventory = _parse_gpu_canary_log(raw)
         contract = candidate.get("gpu_contract")
-        if (not isinstance(contract, Mapping)
-                or driver != contract.get("driver_version")
-                or inventory != contract.get("devices")
-                or evidence.get("inventory") != inventory):
-            raise ValueError("GPU canary log inventory 未绑定 exact contract")
-
-        operation_id = execution.get("operation_id")
-        if (not isinstance(operation_id, str)
-                or re.fullmatch(r"exec-[0-9a-f]{32}", operation_id) is None):
-            raise ValueError("GPU canary operation_id 非法")
-        expected_receipt = (
-            self.work_root / "state" / "executions"
-            / f"execution-{operation_id}.json")
-        receipt_path = execution.get("process_receipt_path")
-        if (not isinstance(receipt_path, str)
-                or Path(os.path.abspath(receipt_path)) != expected_receipt):
-            raise ValueError("GPU canary guardian receipt path 非法")
-        receipt = read_receipt(expected_receipt)
-        validate_execution_receipt(receipt, expected_receipt)
-        if (receipt.get("owner_id") != self.owner_id
-                or receipt.get("kind") != "deployment-gpu-canary"
-                or (self.deployment["mode"] == "production"
-                    and receipt.get("fenced_by_instance_lease") is not True)):
-            raise ValueError("GPU canary guardian receipt owner/kind/fence 非法")
-        sandbox = receipt.get("sandbox")
-        if not isinstance(sandbox, Mapping):
-            raise ValueError("GPU canary guardian receipt 缺 sandbox authority")
-        if (sandbox.get("engine_path")
-                != os.path.realpath(self.sandbox_config["engine_path"])
-                or sandbox.get("engine_host") != self.sandbox_config["engine_host"]
-                or sandbox.get("resource_mode")
-                != self.sandbox_config["resource_mode"]):
-            raise ValueError("GPU canary guardian receipt 未绑定 exact Docker authority")
-        guardian_projection = {
-            "operation_id": receipt.get("operation_id"),
-            "state": receipt.get("state"), "outcome": receipt.get("outcome"),
-            "returncode": receipt.get("returncode"),
-            "group_drained": receipt.get("group_drained"),
-            "containment": receipt.get("containment"),
-            "context": dict(receipt.get("context") or {}),
-            "sandbox": {
-                "backend": sandbox.get("backend"),
-                "spec_sha256": sandbox.get("spec_sha256"),
-                "container_drained": sandbox.get("container_drained"),
-            },
-        }
-        if (guardian_projection != evidence.get("guardian")
-                or sandbox.get("spec_sha256")
-                != execution.get("sandbox_spec_sha256")):
-            raise ValueError("GPU canary evidence 与 durable guardian receipt 不一致")
+        if not isinstance(contract, Mapping):
+            raise ValueError("GPU canary candidate 缺 exact contract")
+        validate_gpu_canary_evidence(
+            evidence, work_root=self.work_root, owner_id=self.owner_id,
+            sandbox_config=self.sandbox_config, contract=contract,
+            candidate_hash=candidate["candidate_hash"], now=self.clock(),
+            require_fence=self.deployment["mode"] == "production")
 
     def prepare(self) -> Dict[str, Any]:
         """Read-only identity gate; success authorizes recovery, not production."""
@@ -1284,5 +1302,5 @@ class DeploymentPreflight:
 
 __all__ = [
     "DeploymentPreflight", "DeploymentPreflightError", "SystemProbeBackend",
-    "evaluate_deployment", "longest_mount",
+    "evaluate_deployment", "longest_mount", "validate_gpu_canary_evidence",
 ]

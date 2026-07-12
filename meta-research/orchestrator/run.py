@@ -70,10 +70,11 @@ from .repository_materializer import (
 )
 from .repository_adapter_generation import AdapterGenerationService
 from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
-from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
+from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestReject, FileRequestService,
                      InteractionNotifier, Outbox, ResearchNotifier,
                      make_advancer_precheck)
 from .process_supervisor import ExecutionSupervisor
+from .qualification_firewall import load_qualification_firewall
 from .runner import CodexRunner, terminate_active_process_groups
 from .schemas import SchemaSet
 from .stage_provider import JudgeProvider, PlanReviewProvider, StageProvider
@@ -1127,6 +1128,19 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                      resource_closers: List[Callable[[], None]]) -> System:
     """Assemble under an already-held owner lease; caller owns rollback."""
     owner_guard = instance_lease.assert_owned if instance_lease is not None else (lambda: None)
+    # This check precedes Docker, SQLite, connectors and providers.  Once a
+    # sealed target has been consumed, even read-only exposure of its metric to
+    # a fresh research turn would violate the non-feedback contract.
+    qualification = load_qualification_firewall(
+        work, policy=policy, require_research_uid=True)
+    if qualification is not None:
+        if runner_factory is not None:
+            raise ValueError(
+                "qualification 禁止注入自定义 runner_factory；所有研究 LLM 必须使用无 host tools runner")
+        if isinstance(attack, AttackStages):
+            raise ValueError(
+                "qualification 禁止注入预装配 AttackStages；必须由当前 contract 装配完整边界")
+        qualification.assert_research_open()
 
     execution_owner_id = (
         instance_lease.owner_id if instance_lease is not None
@@ -1144,7 +1158,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     if attack is True:
         base_execution_sandbox = DockerExecutionSandbox(
             work_root=work, config=policy["execution"]["sandbox"],
-            owner_guard=owner_guard, system_root=root)
+            owner_guard=owner_guard, system_root=root,
+            qualification_firewall=qualification)
         # Strong-execution prerequisites are startup capabilities, not a late
         # scientific failure.  Prove the exact local image/daemon/seccomp
         # before SQLite or any connector/provider side effect is exposed.
@@ -1176,7 +1191,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                 canary_sandbox = DockerExecutionSandbox(
                     work_root=work, config=policy["execution"]["sandbox"],
                     owner_guard=owner_guard, system_root=root,
-                    gpu_contract=gpu_contract)
+                    gpu_contract=gpu_contract,
+                    qualification_firewall=qualification)
                 canary_sandbox.preflight()
                 runtimes = (
                     deployment_candidate.get("facts", {}).get("docker", {})
@@ -1327,14 +1343,20 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     system_prompt = (root / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
     skills = {s: (root / "prompts" / "skills" / s / "SKILL.md").read_text(encoding="utf-8") for s in _STAGES}
     base_rf = runner_factory or (lambda transcripts_dir, purpose_tag:
-                                 CodexRunner(transcripts_dir=transcripts_dir,
-                                             purpose_tag=purpose_tag,
-                                             tool_free=purpose_tag in {
-                                                 "interaction-query",
-                                                 "adapter-generation",
-                                                 "adapter-review",
-                                             },
-                                             execution_supervisor=execution_supervisor))
+                                 CodexRunner(
+                                     transcripts_dir=transcripts_dir,
+                                     purpose_tag=purpose_tag,
+                                     # Qualification workers of every stage get
+                                     # only inline ContextPacks.  The existing
+                                     # cross-UID query mode remains unchanged
+                                     # for ordinary work roots.
+                                     tool_free=(qualification is None and purpose_tag in {
+                                         "interaction-query",
+                                         "adapter-generation",
+                                         "adapter-review",
+                                     }),
+                                     no_host_tools=qualification is not None,
+                                     execution_supervisor=execution_supervisor))
 
     def rf(transcripts_dir, purpose_tag):  # noqa: ANN001, ANN202 - injection boundary
         owner_guard()
@@ -1454,6 +1476,9 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     # StageBlockedOnResources → run_cycles 干净停 → precheck 全局等待；用户 resolve 到 input/user_provided/
     # 后续跑重做该阶段。goal 版本按当下最新（goal_amend 后新请求挂新版）。
     def file_request_bridge(stage: str, request: Dict[str, Any], cyc) -> int:
+        if qualification is not None:
+            raise FileRequestReject(
+                "qualification 从头约束禁止文件上传/外部代码资产；仅允许内联文献线索")
         gid, gver = daemon.query_one("SELECT id, version FROM goal ORDER BY version DESC LIMIT 1")
         return file_requests.create_checked(
             goal_id=gid, goal_ver=gver, stage=stage, request=request,
@@ -1515,7 +1540,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             owner_guard=(owner_guard if instance_lease is not None else None),
             execution_supervisor=execution_supervisor,
             execution_sandbox=execution_sandbox,
-            execution_sandbox_resolver=dependency_image_builder)
+            execution_sandbox_resolver=dependency_image_builder,
+            qualification_firewall=qualification)
         import_worker = ImportWorker(
             state=state, pool_gate=pool_gate,
             providers={

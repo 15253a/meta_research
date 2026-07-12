@@ -637,7 +637,8 @@ class DockerExecutionSandbox:
 
     def __init__(self, *, work_root: Path | str, config: Mapping[str, Any],
                  owner_guard=None, system_root: Path | str | None = None,
-                 gpu_contract: Optional[Mapping[str, Any]] = None):
+                 gpu_contract: Optional[Mapping[str, Any]] = None,
+                 qualification_firewall=None):
         self.work_root = Path(os.path.abspath(os.fspath(work_root)))
         self.system_root = Path(os.path.abspath(os.fspath(
             system_root if system_root is not None else Path(__file__).resolve().parent.parent)))
@@ -662,6 +663,35 @@ class DockerExecutionSandbox:
         self.seccomp_spec_hash = ""
         self.seccomp_bpf_b64 = ""
         self._validate_config()
+        # Qualification is an optional, immutable work-root capability.  Load
+        # it in every derived dependency-image sandbox as well as the bootstrap
+        # sandbox, so an alternate image cannot regain the globally configured
+        # data mounts.
+        from .qualification_firewall import (
+            QualificationFirewall, _hash_bytes, _read_regular,
+            load_qualification_firewall,
+        )
+        if qualification_firewall is not None:
+            if (not isinstance(qualification_firewall, QualificationFirewall)
+                    or qualification_firewall.work_root != self.work_root):
+                raise ValueError("qualification firewall/work_root 错配")
+            contract_raw = _read_regular(
+                qualification_firewall.contract_path,
+                label="qualification contract",
+                expected_owner=qualification_firewall.research_uid,
+                expected_mode=0o400)
+            if _hash_bytes(contract_raw) != qualification_firewall.contract_sha256:
+                raise ValueError("injected qualification firewall contract hash 漂移")
+            self.qualification_firewall = qualification_firewall
+        else:
+            self.qualification_firewall = load_qualification_firewall(
+                self.work_root, require_research_uid=True)
+        if self.qualification_firewall is not None:
+            expected = {str(item.path) for item in self.qualification_firewall.mounts}
+            configured = self.config["readonly_mounts"]
+            if set(configured) != expected or len(configured) != len(expected):
+                raise ValueError(
+                    "qualification sandbox readonly_mounts 必须精确等于 contract mounts")
 
     def _validate_config(self) -> None:
         required = {
@@ -1486,15 +1516,30 @@ class DockerExecutionSandbox:
                     f"sandbox env 不得覆盖 trusted payload_environment: {key}")
             payload_env[key] = value
         readonly_mounts = []
+        selected_mounts = []
         for index, raw in enumerate(self.config["readonly_mounts"]):
             path = Path(raw)
             info = os.lstat(path)
             if stat.S_ISLNK(info.st_mode) or os.path.realpath(raw) != raw:
                 raise ExecutionSandboxError("sandbox readonly_mount 不得是 symlink")
-            readonly_mounts.append({"source": raw, "target": f"/mr/readonly/{index}"})
+            rewritten = []
+            selected = False
             for arg_index, arg in enumerate(resolved):
-                resolved[arg_index] = _replace_path_prefix(
-                    arg, raw, f"/mr/readonly/{index}")
+                replaced = _replace_path_prefix(arg, raw, f"/mr/readonly/{index}")
+                selected = selected or replaced != arg
+                rewritten.append(replaced)
+            # Ordinary workloads retain the historical static-mount contract.
+            # Qualification workloads instead receive only roots explicitly
+            # referenced by this invocation's already-validated argv.
+            if self.qualification_firewall is None or selected:
+                readonly_mounts.append({
+                    "source": raw, "target": f"/mr/readonly/{index}"})
+                resolved = rewritten
+                if selected:
+                    selected_mounts.append(raw)
+        if self.qualification_firewall is not None:
+            self.qualification_firewall.authorize_mounts(
+                selected_mounts, execution_context=context)
         memory_bytes = self.config["memory_mb"] * 1024 * 1024
         max_file_bytes = self.config["max_file_mb"] * 1024 * 1024
         payload_env_json = json.dumps(
