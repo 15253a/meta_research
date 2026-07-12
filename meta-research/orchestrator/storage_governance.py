@@ -33,6 +33,13 @@ _ATOMIC_TEMP = re.compile(
 _BACKUP_TEMP = re.compile(r"^c[1-9][0-9]*-[0-9a-f]{32}\.sqlite$")
 _GENESIS_TEMP = re.compile(r"^\.genesis\.json\.tmp-[0-9a-f]{32}$")
 _MAX_JSON_BYTES = 64 * 1024 * 1024
+# development 只保留本次原子发布的小工程余量；production 由 run.py 传入
+# 已经 hard-quota preflight 证明的完整 work_free envelope。
+_BACKUP_CAPACITY_MARGIN_BYTES = 1 * 1024 * 1024
+_BACKUP_CAPACITY_MIN_INODES = 8
+# 首个 cycle 还可能初始化 views Git（对象/refs/logs/index + 四份投影）；用保守常数
+# 让极低 inode 节点在任何 temp/pending/Git 写入前失败。
+_BACKUP_OPERATION_INODES = 128
 
 
 class StorageGovernanceError(RuntimeError):
@@ -196,10 +203,22 @@ class CycleSnapshotPublisher:
 
     def __init__(self, *, db_path: Path | str, work_root: Path | str,
                  owner_guard: Optional[Callable[[], None]] = None,
-                 git_binary: Optional[str] = None):
+                 git_binary: Optional[str] = None, read_only: bool = False,
+                 capacity_reserve_bytes: int = _BACKUP_CAPACITY_MARGIN_BYTES,
+                 capacity_reserve_inodes: int = _BACKUP_CAPACITY_MIN_INODES):
         self.db_path = Path(os.path.abspath(os.fspath(db_path)))
         self.work_root = Path(os.path.abspath(os.fspath(work_root)))
         self.owner_guard = owner_guard or (lambda: None)
+        if (isinstance(capacity_reserve_bytes, bool)
+                or not isinstance(capacity_reserve_bytes, int)
+                or capacity_reserve_bytes < 0
+                or isinstance(capacity_reserve_inodes, bool)
+                or not isinstance(capacity_reserve_inodes, int)
+                or capacity_reserve_inodes < 0):
+            raise ValueError("storage capacity reserve 须为非负整数")
+        self.capacity_reserve_bytes = capacity_reserve_bytes
+        self.capacity_reserve_inodes = capacity_reserve_inodes
+        self.read_only = read_only
         candidate = git_binary or shutil.which("git", path=os.defpath)
         if candidate is None:
             raise StorageGovernanceError("views timeline 需要 git 可执行文件")
@@ -224,7 +243,34 @@ class CycleSnapshotPublisher:
         self._verified_latest: Optional[Dict[str, Any]] = None
         self._coverage_start: Optional[int] = None
         self._genesis_identity: Optional[Tuple[int, bool, Optional[int]]] = None
-        self._ensure_layout()
+        if read_only:
+            self._require_layout()
+        else:
+            self._ensure_layout()
+
+    def _require_layout(self) -> None:
+        """只读运维入口只验现有布局，不创建/改权/清理任何路径。"""
+        if not self.work_root.is_dir() or self.work_root.is_symlink():
+            raise StorageGovernanceError("work_root 须为已固定的非 symlink 目录")
+        required = (
+            self.work_root / "state", self.storage_root,
+            self.storage_root / "backups", self.backups,
+            self.storage_root / "manifests", self.manifests,
+            self.cycles, self.pending, self.temporary, self.views,
+        )
+        for path in required:
+            try:
+                info = path.lstat()
+            except FileNotFoundError as error:
+                raise StorageGovernanceError(f"存储布局缺失: {path}") from error
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise StorageGovernanceError(f"治理目录类型非法: {path}")
+        try:
+            genesis = self.genesis_path.lstat()
+        except FileNotFoundError as error:
+            raise StorageGovernanceError("storage genesis 缺失") from error
+        if not stat.S_ISREG(genesis.st_mode) or stat.S_ISLNK(genesis.st_mode):
+            raise StorageGovernanceError("storage genesis 类型非法")
 
     def _ensure_layout(self) -> None:
         self.owner_guard()
@@ -249,6 +295,8 @@ class CycleSnapshotPublisher:
         adoption 基线；尚无终态时从 c1 原生覆盖。这样首个 terminal 在 pending 前崩溃也不会在重启后
         被误判成旧库接管。runtime 首次调用默认按原生覆盖处理。
         """
+        if self.read_only:
+            raise StorageGovernanceError("只读 snapshot validator 禁止 reconcile/发布")
         self.owner_guard()
         terminal = self._terminal_cycles()
         refs = self._refs()
@@ -460,6 +508,22 @@ class CycleSnapshotPublisher:
             source = sqlite3.connect(
                 f"file:{quote(str(self.db_path))}?mode=ro", uri=True,
                 check_same_thread=False)
+            page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
+            page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
+            operation_bytes = max(1, page_count * page_size)
+            fs = os.statvfs(self.storage_root)
+            free_bytes = int(fs.f_bavail) * int(fs.f_frsize)
+            free_inodes = int(fs.f_favail)
+            required_bytes = operation_bytes + self.capacity_reserve_bytes
+            required_inodes = _BACKUP_OPERATION_INODES + self.capacity_reserve_inodes
+            if (free_bytes < required_bytes
+                    or free_inodes < required_inodes):
+                raise StorageGovernanceError(
+                    "cycle backup 容量门拒绝: "
+                    f"free_bytes={free_bytes} required_bytes={required_bytes} "
+                    f"free_inodes={free_inodes} "
+                    f"required_inodes={required_inodes}")
+            self.owner_guard()
             target = sqlite3.connect(str(temporary))
             source.backup(target)
             # Recovery object must be one immutable file.  Inheriting WAL mode would let later
@@ -676,6 +740,9 @@ class CycleSnapshotPublisher:
             "GIT_AUTHOR_NAME": "meta-research", "GIT_AUTHOR_EMAIL": "meta-research@localhost",
             "GIT_COMMITTER_NAME": "meta-research", "GIT_COMMITTER_EMAIL": "meta-research@localhost",
         }
+        if self.read_only:
+            # `git status` otherwise may refresh the index even on a verify/dry-run path.
+            env["GIT_OPTIONAL_LOCKS"] = "0"
         command = [self.git_binary, "-c", "core.hooksPath=/dev/null",
                    "-c", "commit.gpgSign=false", "-C", str(self.views), *args]
         result = subprocess.run(command, text=True, capture_output=True, timeout=30, env=env)

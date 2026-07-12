@@ -1290,8 +1290,21 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
 
     # 再补 DB terminal commit → storage receipt 的崩溃缝，之后才暴露 interaction pump、provider 或新 Runner。
     # 新库此时没有终态 cycle，但会先落原生 genesis；旧库接管会留下明确 adoption 基线而不伪造历史逐轮快照。
+    # development 不把默认 production envelope（可达数十 GiB）强加给小型诊断节点；
+    # 它只做「本次 backup + engineering margin」headroom 门。production 则已由新鲜
+    # hard-quota attestation 证明 envelope，此处再用 statvfs 检当前物理 headroom，不把后者冒充 quota。
+    capacity_source = (
+        deployment_receipt.get("prerequisite", deployment_receipt)
+        if (isinstance(deployment_receipt, dict)
+            and deployment_receipt.get("production_ready") is True)
+        else {})
+    capacity_reserves = capacity_source.get("required_reserves", {})
+    reserve_bytes = capacity_reserves.get("work_free_bytes", 16 * 1024 * 1024)
+    reserve_inodes = capacity_reserves.get("work_free_inodes", 8)
     cycle_snapshots = CycleSnapshotPublisher(
-        db_path=db_path, work_root=work, owner_guard=owner_guard)
+        db_path=db_path, work_root=work, owner_guard=owner_guard,
+        capacity_reserve_bytes=reserve_bytes,
+        capacity_reserve_inodes=reserve_inodes)
     cycle_snapshots.reconcile(startup=True)
 
     # compiler/publisher 各用**只读连接**（外审 BLOCKER：单写纪律——入口层就 enforce 只读边界，
