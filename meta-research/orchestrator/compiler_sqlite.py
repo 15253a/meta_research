@@ -162,7 +162,8 @@ class SqliteCompiler:
     def __init__(self, conn, policy: Dict[str, Any], *,
                  runtime_environment_hash: Optional[str] = None):
         # conn = 本类**独占**的只读用连接（isolation_level=None 交本类掌控事务，供 render 钉单一读快照）。
-        # 「只读」是架构约定：调用方（M3 Advancer）应传一条专用读连接（宜 mode=ro，§6.2 WAL 读写分离）；
+        # 「只读」是架构约定：调用方（M3 Advancer）应传一条专用 mode=ro 连接；
+        # 本地 WAL 可并发读写，GPFS rollback mode 则由 SQLite 锁等待短写事务。
         # 本类只读不写，不在此强制 mode=ro（编译器不该越俎给连接改物理模式）。
         conn.isolation_level = None
         self.conn = conn
@@ -176,7 +177,7 @@ class SqliteCompiler:
 
     # -- Compiler Protocol ------------------------------------------------------
     def render(self, *, cycle_id: str, stage: Stage, target_id: Optional[str] = None) -> ContextPack:
-        """确定性四区包。**钉单一读快照**：整个 render 在一个读事务内（BEGIN…COMMIT）——WAL 下这一致快照
+        """确定性四区包。**钉单一读快照**：整个 render 在一个读事务内（BEGIN…COMMIT）——SQLite 一致快照
         不被并发 WriteDaemon 提交撬动，杜绝「cycle 取自 A 态、answers 取自 B 态」的混态包（护「同快照」）。
 
         「同快照」= 同行 + **同 id**：id 是快照身份的一部分，故 ORDER BY id 定序确定；不同插入序 = 不同快照

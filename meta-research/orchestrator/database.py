@@ -6,15 +6,18 @@
 - 目标计数锁定：36 表 / 72 触发器 / 29 索引（12 显式 + 17 UNIQUE 自动）/ 1 视图。
 - PRAGMA user_version = schema 版本（=1）；不建额外元数据表（36 表计数是验收对象）。
 
-连接纪律：foreign_keys 每连接显式开启（SQLite 默认关）；文件库开 WAL（§6.2）。
-写连接唯一性由上层（WriteDaemon/驱动器单进程）保证，本模块只管建库与校验。
+连接纪律：foreign_keys 每连接显式开启（SQLite 默认关）。本地文件系统用 WAL（§6.2）；
+GPFS/未知共享文件系统用 rollback journal。SQLite 官方要求 WAL 的全部进程位于同一 host，
+一次共享盘 canary 不能把不受支持的跨 host WAL 变成可靠合同。写连接唯一性仍由上层
+InstanceLease + WriteDaemon 保证，本模块只管建库、存储模式与 schema 校验。
 """
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 MIGRATION_FILE = Path(__file__).resolve().parent.parent / "db" / "migrations" / "0001_appendix_a.sql"
 
@@ -29,6 +32,125 @@ EXPECTED_COUNTS: Dict[str, int] = {"table": 36, "trigger": 72, "index": 29, "vie
 
 class SchemaDriftError(RuntimeError):
     """migration 文件或库内 schema 与冻结锚不符（M1a 验收：checksum/计数锁定）。"""
+
+
+class SQLiteStorageModeError(RuntimeError):
+    """The live filesystem cannot establish the required SQLite journal mode."""
+
+
+_LOCAL_WAL_FILESYSTEMS = frozenset({
+    "btrfs", "ext2", "ext3", "ext4", "f2fs", "overlay", "overlayfs",
+    "ramfs", "tmpfs", "xfs", "zfs",
+})
+_MOUNTINFO_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _mountinfo_unescape(value: str) -> str:
+    return (value.replace("\\040", " ").replace("\\011", "\t")
+            .replace("\\012", "\n").replace("\\134", "\\"))
+
+
+def _read_mountinfo() -> Optional[bytes]:
+    try:
+        with open("/proc/self/mountinfo", "rb") as stream:
+            raw = stream.read(_MOUNTINFO_MAX_BYTES + 1)
+    except OSError:
+        return None
+    return raw if len(raw) <= _MOUNTINFO_MAX_BYTES else None
+
+
+def _filesystem_type_from_mountinfo(target: str, raw: bytes) -> Optional[str]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    candidates = []
+    for line in text.splitlines():
+        try:
+            left, right = line.split(" - ", 1)
+            fields = left.split()
+            trailing = right.split()
+            mount_point = os.path.normpath(_mountinfo_unescape(fields[4]))
+            fstype = trailing[0]
+        except (IndexError, ValueError):
+            return None
+        if (target == mount_point
+                or target.startswith(mount_point.rstrip("/") + "/")):
+            candidates.append((len(mount_point), fstype))
+    if not candidates:
+        return None
+    deepest = max(depth for depth, _fstype in candidates)
+    matches = {fstype for depth, fstype in candidates if depth == deepest}
+    return matches.pop() if len(matches) == 1 else None
+
+
+def filesystem_type_for_path(path: Union[str, Path]) -> Optional[str]:
+    """Return the deepest Linux mount fstype, or ``None`` to fail safe.
+
+    The path need not exist yet. Existing symlink components are resolved before
+    mount containment so a local-looking alias cannot select WAL for a shared
+    target. Linux is already a runtime requirement for the lease/capability layer.
+    """
+    try:
+        target = os.path.normpath(os.path.realpath(os.path.abspath(os.fspath(path))))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    raw = _read_mountinfo()
+    if raw is None:
+        return None
+    return _filesystem_type_from_mountinfo(target, raw)
+
+
+def journal_mode_for_filesystem(fstype: Optional[str]) -> str:
+    """Choose WAL only for a known local filesystem; unknown is fail-safe."""
+    normalized = str(fstype or "").strip().lower()
+    return "wal" if normalized in _LOCAL_WAL_FILESYSTEMS else "delete"
+
+
+def journal_mode_for_path(path: Union[str, Path]) -> str:
+    if str(path) == ":memory:":
+        return "memory"
+    return journal_mode_for_filesystem(filesystem_type_for_path(path))
+
+
+def _establish_file_storage_mode(
+        conn: sqlite3.Connection, *, required_mode: str) -> None:
+    """Establish journal mode before any schema/data read.
+
+    A previous release may have left a WAL on the shared path.  Entering
+    EXCLUSIVE locking mode as the connection's first statement lets the sole
+    lease-fenced process recover/switch that WAL without opening a wal-index
+    shared-memory file on a takeover host.  Normal locking resumes immediately
+    after the rollback journal is established.
+    """
+    try:
+        if required_mode == "delete":
+            locking = conn.execute("PRAGMA locking_mode = EXCLUSIVE").fetchone()[0].lower()
+            if locking != "exclusive":
+                raise SQLiteStorageModeError(
+                    f"SQLite 无法进入共享盘迁移锁模式: {locking}")
+            conn.execute("PRAGMA synchronous = FULL")
+            synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+            actual_mode = conn.execute("PRAGMA journal_mode = DELETE").fetchone()[0].lower()
+            normal = conn.execute("PRAGMA locking_mode = NORMAL").fetchone()[0].lower()
+            if normal != "normal":
+                raise SQLiteStorageModeError(
+                    f"SQLite 无法恢复 normal locking mode: {normal}")
+        else:
+            actual_mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0].lower()
+            conn.execute("PRAGMA synchronous = FULL")
+            synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+    except SQLiteStorageModeError:
+        raise
+    except (sqlite3.Error, IndexError, AttributeError, TypeError) as error:
+        raise SQLiteStorageModeError(
+            f"无法在当前文件系统建立 SQLite {required_mode} journal") from error
+    if actual_mode != required_mode:
+        raise SQLiteStorageModeError(
+            f"SQLite journal mode 未按文件系统收口: {actual_mode} != {required_mode}")
+    if synchronous != 2:
+        raise SQLiteStorageModeError(
+            f"SQLite synchronous 未按存储合同收口: {synchronous} != 2")
 
 
 def _read_migration() -> str:
@@ -75,19 +197,27 @@ def connect(path: Union[str, Path] = ":memory:") -> sqlite3.Connection:
     冻结形同虚设。故这里先无条件校验文件、再决定建库还是仅开库。
     """
     is_memory = str(path) == ":memory:"
+    required_mode = "memory" if is_memory else journal_mode_for_path(path)
     migration_sql = _read_migration()   # 无条件校验文件 checksum（漂移即在此抛 SchemaDriftError）
     # The run process has one writer connection, but the interaction pump and
     # research driver use it from different threads.  WriteDaemon serializes
     # every access; disabling sqlite's thread-affinity check is therefore safe
     # and avoids opening a second writer connection.
     conn = sqlite3.connect(str(path), check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON")
-    fresh = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
-    if fresh:
-        conn.executescript(migration_sql)
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        conn.commit()
-    if not is_memory:
-        conn.execute("PRAGMA journal_mode = WAL")   # 只读连接与单写互不阻塞（§6.2）
-    verify_schema(conn)
+    try:
+        if not is_memory:
+            _establish_file_storage_mode(conn, required_mode=required_mode)
+        conn.execute("PRAGMA foreign_keys = ON")
+        fresh = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+        if fresh:
+            conn.executescript(migration_sql)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.commit()
+        verify_schema(conn)
+    except BaseException:
+        try:
+            conn.close()
+        except BaseException:
+            pass
+        raise
     return conn

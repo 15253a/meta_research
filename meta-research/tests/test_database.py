@@ -1,12 +1,14 @@
 """CP2.1 · 建库与三重锁的否定/正向用例（M1a：schema 落地并证明冻结锁生效）。
 
 覆盖 database.connect / verify_schema 的守卫：
-- 正向：新建 :memory: → 36/72/29/1、foreign_keys ON、file 库 WAL、重开幂等（不重跑 migration）。
+- 正向：新建 :memory: → 36/72/29/1、foreign_keys ON；本地 file 库 WAL、共享库 rollback、重开幂等。
 - 否定：checksum 漂移 / 计数漂移 / 版本不符 → SchemaDriftError；FK 实际生效（悬空引用被拒）。
 - 保真：migration body 与 reference 附录 A（行 918–1614）字节一致——护「逐字摘自」claim。
 """
 from __future__ import annotations
 
+import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -42,8 +44,9 @@ def test_foreign_key_actually_enforced():
             "VALUES (1,999,1,'created','v0')")
 
 
-def test_file_db_uses_wal_and_reopen_is_idempotent(tmp_path):
+def test_local_file_db_uses_wal_and_reopen_is_idempotent(tmp_path, monkeypatch):
     path = tmp_path / "research.sqlite"
+    monkeypatch.setattr(db, "filesystem_type_for_path", lambda _path: "ext4")
     conn = db.connect(path)
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     # 落一行可辨识数据，关闭后重开——不得重跑 migration（会撞 UNIQUE / 覆盖）、须过校验
@@ -55,6 +58,115 @@ def test_file_db_uses_wal_and_reopen_is_idempotent(tmp_path):
     db.verify_schema(reopened)
     assert reopened.execute("SELECT text FROM goal WHERE id=1").fetchone()[0] == "g"
     assert db.live_counts(reopened) == db.EXPECTED_COUNTS
+
+
+@pytest.mark.parametrize("fstype", ["gpfs", "nfs4", "cifs", None, "futurefs"])
+def test_shared_or_unknown_filesystem_uses_rollback_journal(tmp_path, monkeypatch, fstype):
+    path = tmp_path / "research.sqlite"
+    monkeypatch.setattr(db, "filesystem_type_for_path", lambda _path: fstype)
+    conn = db.connect(path)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+    assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+    conn.close()
+
+
+def test_mountinfo_parser_prefers_deepest_boundary_and_decodes_escape():
+    raw = (
+        "1 0 0:1 / / rw - ext4 root rw\n"
+        "2 1 0:2 / /share rw - xfs local rw\n"
+        "3 1 0:3 / /shared rw - gpfs vepfs rw\n"
+        "4 1 0:4 / /mnt/data\\040set rw - gpfs escaped rw\n"
+    ).encode("utf-8")
+    assert db._filesystem_type_from_mountinfo("/shared/db.sqlite", raw) == "gpfs"
+    assert db._filesystem_type_from_mountinfo("/share/db.sqlite", raw) == "xfs"
+    assert db._filesystem_type_from_mountinfo("/share-other/db.sqlite", raw) == "ext4"
+    assert db._filesystem_type_from_mountinfo("/mnt/data set/db.sqlite", raw) == "gpfs"
+
+
+def test_mountinfo_conflicting_stacked_mount_fails_safe():
+    raw = (
+        "1 0 0:1 / / rw - ext4 root rw\n"
+        "2 1 0:2 / /shared rw - ext4 lower rw\n"
+        "3 1 0:3 / /shared rw - gpfs upper rw\n"
+    ).encode("utf-8")
+    assert db._filesystem_type_from_mountinfo("/shared/db.sqlite", raw) is None
+    assert db.journal_mode_for_filesystem(None) == "delete"
+
+
+def test_filesystem_detection_resolves_alias_before_mount_lookup(monkeypatch):
+    raw = (
+        "1 0 0:1 / / rw - ext4 root rw\n"
+        "2 1 0:2 / /shared rw - gpfs vepfs rw\n"
+    ).encode("utf-8")
+    monkeypatch.setattr(db.os.path, "realpath", lambda _path: "/shared/research.sqlite")
+    monkeypatch.setattr(db, "_read_mountinfo", lambda: raw)
+    assert db.filesystem_type_for_path("/local-looking/alias.sqlite") == "gpfs"
+
+
+def test_gpfs_reopen_recovers_committed_wal_then_switches_to_delete(
+        tmp_path, monkeypatch):
+    """Crash residue from the old WAL contract must be adopted without data loss."""
+    path = tmp_path / "research.sqlite"
+    monkeypatch.setattr(db, "filesystem_type_for_path", lambda _path: "ext4")
+    conn = db.connect(path)
+    conn.close()
+
+    child = os.fork()
+    if child == 0:  # pragma: no cover - parent verifies the durable outcome
+        try:
+            writer = sqlite3.connect(path)
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO goal(id,version,text,predicate_json) VALUES (1,1,'wal-crash','{}')")
+            writer.commit()
+            os._exit(0)
+        except BaseException:
+            os._exit(3)
+    _pid, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert Path(str(path) + "-wal").exists()
+    stale_shm = Path(str(path) + "-shm")
+    assert stale_shm.exists()
+    stale_marker = b"STALE-SHM-MUST-NOT-BE-USED"
+    stale_shm.write_bytes(stale_marker)
+
+    monkeypatch.setattr(db, "filesystem_type_for_path", lambda _path: "gpfs")
+    statements = []
+    real_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        traced = real_connect(*args, **kwargs)
+        traced.set_trace_callback(statements.append)
+        return traced
+
+    monkeypatch.setattr(db.sqlite3, "connect", traced_connect)
+    recovered = db.connect(path)
+    assert recovered.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    assert recovered.execute("SELECT text FROM goal WHERE id=1").fetchone()[0] == "wal-crash"
+    recovered.close()
+    assert not Path(str(path) + "-wal").exists()
+    assert not stale_shm.exists() or stale_shm.read_bytes() == stale_marker
+    normalized = [re.sub(r"\s+", " ", statement.strip()).upper()
+                  for statement in statements]
+    exclusive = next(i for i, statement in enumerate(normalized)
+                     if statement == "PRAGMA LOCKING_MODE = EXCLUSIVE")
+    switch = next(i for i, statement in enumerate(normalized)
+                  if statement == "PRAGMA JOURNAL_MODE = DELETE")
+    normal = next(i for i, statement in enumerate(normalized)
+                  if statement == "PRAGMA LOCKING_MODE = NORMAL")
+    schema_read = next(i for i, statement in enumerate(normalized)
+                       if statement.startswith("SELECT COUNT(*) FROM SQLITE_MASTER"))
+    assert exclusive == 0
+    assert exclusive < switch < normal < schema_read
+
+
+def test_live_repo_path_is_detected_as_gpfs():
+    mount_path = Path(__file__).resolve()
+    if "/vepfs-" not in str(mount_path):
+        pytest.skip("workspace is not on the target VEPFS mount")
+    assert db.filesystem_type_for_path(mount_path) == "gpfs"
+    assert db.journal_mode_for_path(mount_path) == "delete"
 
 
 # ---- 否定：三重锁 ----------------------------------------------------------

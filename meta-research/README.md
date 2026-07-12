@@ -409,9 +409,13 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 - 不可信容器看不到 guardian/provider receipt、SQLite、Codex 凭据或整个 work-root，但同一 host 信任域内的 root/
   orchestrator UID 进程仍能控制 Docker socket 或改本地证据；要防该类 host 对手须独立 service account/VM/远端
   attestation，不能靠 0600/HMAC 自我证明。不同 UID 的 tool-free query 仍要求 guardian 有权排空其树。
-- fork child 会丢弃非目标 lease FD；owner 死亡同时由 pipe EOF 与 `PR_SET_PDEATHSIG` 触发 guardian。当前
-  work-root 位于共享 VEPFS，同机 owner-kill/fence 可做部署 canary；若生产会跨节点启动，仍须在目标
-  VEPFS/挂载参数上做“两节点同时 acquire，仅一方成功”的部署验收，单机测试不能代替它。
+- fork child 会丢弃非目标 lease FD；owner 死亡同时由 pipe EOF 与 `PR_SET_PDEATHSIG` 触发 guardian。SQLite
+  journal mode 按 live mount 机械选择：已知本地文件系统用 WAL，GPFS/未知共享文件系统用 `DELETE` rollback
+  journal + `synchronous=FULL`。这是因为 [SQLite WAL 官方契约](https://www.sqlite.org/wal.html) 要求全部进程
+  位于同一 host，不能用一次共享盘 canary 把跨 host WAL 变成受支持合同。当前 work-root 位于共享 VEPFS，
+  同机 owner-kill/fence 可做部署 canary；跨节点只允许 crash-stop 后串行接管，仍须在目标 VEPFS/挂载参数上做
+  “A 持锁时 B 必拒、A 被基础设施真正 fence 后 B 才接管”的验收。网络分区但旧主仍存活不由 heartbeat/flock
+  自证安全，必须由 VM/基础设施 STONITH；单机测试不能代替它。
 - plan 的 `critical/budget_estimate` 已权威落库，critical 失败会确定性早退、非 critical 失败可继续后继；
   动态 `goal_amend` 的专用路由、不可变升版、reasoning/status 按 cycle goal version 隔离与 applicability
   恢复也已闭合。
@@ -486,7 +490,7 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   lock 只作证据展示，不会被生成器安装或冒充可复现环境。部署级 quota/cgroup/device 合同仍属后续检查点。
   LFS 支持也只覆盖 GitHub 固定 Batch endpoint、
   policy allowlist 内 basic HTTPS transfer，不接受仓库自定义 `.lfsconfig` endpoint/transfer adapter。
-- CP11.3c 的 120 轮是无真实 provider 工作负载的控制面/投影回归；尚未完成跨节点 VEPFS 双 owner 实机竞态，
+- CP11.3c 的 120 轮是无真实 provider 工作负载的控制面/投影回归；尚未完成跨节点 VEPFS crash-stop 接管实机竞态，
   也尚未运行数百轮（最终验收下限 ≥200）含真实 Codex/import/训练与 owner-kill/daemon-loss/预算失败注入的 soak。这两项完成前，
   对“上百轮可用”的结论仍只能是机制上可推进、不是运营验收通过。
 - 假执行标记（`source=fake` / `synthetic=true`）是 M0–M3 验收期语义，真执行起已移除。

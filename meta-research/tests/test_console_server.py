@@ -86,7 +86,7 @@ def test_assemble_db_shape(seeded):
 def test_assemble_db_no_db_write(seeded):
     """单写纪律：组装用 mode=ro 连接——即便组装出错也绝不写库（本测证 mode=ro 物理只读）。"""
     path, work = seeded
-    ro = CS._open_ro(path)
+    ro = CS._open_ro(path, work_root=work)
     with pytest.raises(Exception):                            # mode=ro 写必失败
         ro.execute("INSERT INTO decision(actor,type,payload_json) VALUES ('x','y','{}')")
     ro.close()
@@ -94,6 +94,33 @@ def test_assemble_db_no_db_write(seeded):
     n = db.connect(path).execute("SELECT count(*) FROM decision").fetchone()[0]
     CS.assemble_db(path, work, SYSTEM_ROOT)
     assert db.connect(path).execute("SELECT count(*) FROM decision").fetchone()[0] == n   # 组装前后 DB 不变
+
+
+@pytest.mark.parametrize("instance", [
+    {"status": "invalid", "lock_held": False, "local_active_owner": False},
+    {"status": "stale", "lock_held": True, "local_active_owner": False},
+])
+def test_shared_db_reader_rejects_unverified_owner_before_sqlite_open(
+        seeded, monkeypatch, instance):
+    path, work = seeded
+    monkeypatch.setattr(CS, "journal_mode_for_path", lambda _path: "delete")
+    monkeypatch.setattr(CS, "read_instance_status", lambda _root: instance)
+    monkeypatch.setattr(
+        CS.sqlite3, "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("denied reader must not open SQLite")))
+    with pytest.raises(RuntimeError, match="未证实本机 active owner"):
+        CS._open_ro(path, work_root=work)
+
+
+def test_shared_db_reader_accepts_verified_owner_on_same_host(seeded, monkeypatch):
+    path, work = seeded
+    monkeypatch.setattr(CS, "journal_mode_for_path", lambda _path: "delete")
+    monkeypatch.setattr(CS, "read_instance_status", lambda _root: {
+        "status": "active", "lock_held": True, "local_active_owner": True,
+    })
+    conn = CS._open_ro(path, work_root=work)
+    conn.close()
 
 
 def test_live_mode_awaiting_user(seeded):
@@ -1007,7 +1034,7 @@ def test_projected_db_rows_and_text_are_bounded_before_json(seeded):
         (oversized, oversized)).lastrowid
     conn.commit(); conn.close()
 
-    ro = CS._open_ro(path)
+    ro = CS._open_ro(path, work_root=_work)
     try:
         rows = CS._rows(ro, "decision")
     finally:
@@ -1220,3 +1247,29 @@ def test_api_db_error_generic(seeded, monkeypatch):
             assert e.code == 500 and "secret path" not in body and "组装失败" in body
     finally:
         httpd.shutdown()
+
+
+def test_api_db_shared_reader_admission_failure_is_retryable_503(seeded, monkeypatch):
+    import threading, urllib.request
+    path, work = seeded
+    monkeypatch.setattr(
+        CS, "assemble_db",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            CS.SharedSQLiteReaderUnavailable("internal owner identity")))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+    httpd = CS.serve(path, work, SYSTEM_ROOT, host="127.0.0.1", port=0,
+                     capability_token=TEST_CAPABILITY)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            opener.open(base + "/api/db", timeout=5)
+        body = denied.value.read().decode("utf-8")
+        assert denied.value.code == 503
+        assert "internal owner identity" not in body
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        worker.join(timeout=5)
