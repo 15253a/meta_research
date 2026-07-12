@@ -27,8 +27,10 @@
   quarantine 晋升/恢复已落 `a05584d`；CP11.4c.2a exact GitHub repository snapshot、内容寻址发布与 file-backed
   sandbox import bridge 已落 `50ba41f`；CP11.4c.2b.1 materializer component boundaries 已落 `4e28698`，
   CP11.4c.2b.2a exact Git LFS objects 已落 `ef30f1f`，2b.2b canonical wheel lock 到 exact/restorable dependency
-  image 与后续 runtime identity 继承已落 `1e57611`。当前进入 2b.2c reviewed adapter generation，随后是
-  2b.3 deployment contract 与 CP11.4c.3 跨节点 VEPFS/真实 100+ 轮故障注入验收。
+  image 与后续 runtime identity 继承已落 `1e57611`，2b.2c reviewed adapter generation 已落 `c0ba5ed`。
+  CP11.4c.2b.3a honest deployment preflight 已落 `16d5270`，2b.3b fixed GPU device bridge 已落 `563a496`；
+  至此 CP11.4c.2 的代码与 fail-closed 部署合同收口。当前进入 CP11.4c.3 目标 VEPFS 两节点/真实
+  100+ 轮故障注入验收；当前节点无 NVIDIA container runtime，尚未完成正向 GPU canary 或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -426,7 +428,7 @@
         container 均 drained；prepare→guardian、return→publish 与非 exit 恢复窗口由中央 session index/receipt
         幂等收口。→ commit `a05584d`（build_log 0064；外审第 2 轮 3 BLOCKER 全修，seccomp SHOULD 以更强
         launcher BPF 解决；最终有效全量 1354）。
-      - [ ] CP11.4c.2 通用 pinned repository 物化与部署信任：补 GitHub discovery → exact archive/tree/LFS/依赖
+      - [x] CP11.4c.2 通用 pinned repository 物化与部署信任：补 GitHub discovery → exact archive/tree/LFS/依赖
         闭包与 adapter 生成/评审的生产路径；明确独立 service account/VM、Docker socket、cgroup/device/GPU、
         hard byte+inode quota 与环境镜像供应链验收，不能把 bootstrap image/host 同 UID 信任域冒充完整隔离。
         - [x] CP11.4c.2a exact repository snapshot 与 worker bridge：非 recursive Git tree 对象+逐文件
@@ -434,7 +436,7 @@
           adapter v2/pinned-image-only 供应链、稳定 protocol/metric 家族与 file-backed ImportWorker。
           → commit `50ba41f`（build_log 0065；相关 170/156/41；外审第 2 轮成立项全修、误报以代码/回归核实；
           唯一全量 1381）。
-        - [ ] CP11.4c.2b 缺失 adapter 的受审生成、LFS OID/项目依赖 lock 验证与专用 image，
+        - [x] CP11.4c.2b 缺失 adapter 的受审生成、LFS OID/项目依赖 lock 验证与专用 image，
           并把 service account/VM、Docker socket、cgroup/device/GPU、hard byte+inode quota 落成 fail-closed
           部署合同/预检；未具备的能力只列验收，不伪造通过。
           - [x] CP11.4c.2b.1 repository materializer component boundaries：把单体物化器按 shared identity、
@@ -454,7 +456,7 @@
               sandbox smoke 全过才进入 snapshot spec；生成调用、prompt、模型与产物 hash 可恢复审计。
               → commit `c0ba5ed`（build_log 0069；相关 325/185/115/12；外审两轮均无 verdict；真实 canary 因
               隔离 Codex token 失效而 fail-closed；唯一全量 1443 通过/1 跳过/1 个无关 Docker `/ebs` 空间失败）。
-          - [ ] CP11.4c.2b.3 deployment trust contract：service account/VM、Docker socket、cgroup/device/GPU、
+          - [x] CP11.4c.2b.3 deployment trust contract：service account/VM、Docker socket、cgroup/device/GPU、
             VEPFS hard byte+inode quota 启动前 fail-closed 预检与证据；开发模式不得冒充生产通过。
             - [x] CP11.4c.2b.3a honest deployment preflight：单一 development/production 预检与 owner-bound canonical
               receipt；production 在 DB/provider 前交叉核只读部署 attestation、service identity、Docker socket/daemon/
@@ -462,7 +464,11 @@
               storage headroom，任一缺口 fail-closed。
               → commit `16d5270`（build_log 0070；相关 167/81；真实 development collector canary；内部双 APPROVE；
               外审两轮均无 verdict；唯一全量 1466 通过/1 跳过/1 个无关 Docker `/ebs` 空间失败）。
-            - [ ] CP11.4c.2b.3b fixed GPU device bridge：按部署分配的 exact GPU UUID 生成 Docker DeviceRequests，create 后
-              inspect 与容器内 inventory 双核，并把 GPU capability 纳入 runtime identity；不做调度器/MIG/动态租约。
+            - [x] CP11.4c.2b.3b fixed GPU device bridge：按部署分配的 exact GPU UUID 生成 Docker DeviceRequests，create 后
+              inspect 与容器内 inventory 双核；GPU capability projection 进入可复用 workload/runtime identity，exact UUID
+              只保留在 invocation/runtime evidence。GPU 缺失时 fail-closed 并收敛为 `env_invalid`，不做调度器/
+              MIG/动态租约。→ commit `563a496`（build_log 0071；相关 427 通过/3 deselected，外审后定向 48 通过；
+              真实 negative GPU canary 证明缺 runtime 时拒绝；唯一全量 1494 通过/1 跳过/1 个 Docker archive
+              ENOSPC）。当前节点正向 GPU canary 与目标部署验收留给 CP11.4c.3。
       - [ ] CP11.4c.3 最终实机验收：目标 VEPFS 两节点 owner/lease/fd 行为，100+ 轮含真实 Codex/import/训练、
         owner-kill/daemon-loss/预算与资源失败注入的 soak，并发布可重放证据包。
