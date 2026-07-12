@@ -416,6 +416,40 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   同机 owner-kill/fence 可做部署 canary；跨节点只允许 crash-stop 后串行接管，仍须在目标 VEPFS/挂载参数上做
   “A 持锁时 B 必拒、A 被基础设施真正 fence 后 B 才接管”的验收。网络分区但旧主仍存活不由 heartbeat/flock
   自证安全，必须由 VM/基础设施 STONITH；单机测试不能代替它。
+- 薄 canary 已提供一个固定、前台、无 daemon 的操作入口。先在新的绝对空目录跑同机先决检查（结果固定
+  `two_node_verified=false`）：
+
+  ```bash
+  python -m orchestrator.shared_fs_canary local \
+    --canary-root /absolute/new-canary-root \
+    --run-id 0123456789abcdef0123456789abcdef
+  ```
+
+  真两节点检查需在两个节点上并发执行下面两个 `node` 命令；二者必须使用目标 GPFS 上**相同绝对目录**、
+  相同 run ID 和 timing 参数。holder 可创建该空目录，contender 会等待 immutable contract：
+
+  ```bash
+  # node A
+  python -m orchestrator.shared_fs_canary node --role holder \
+    --canary-root /gpfs/meta-research-canary/RUN_ID \
+    --run-id 0123456789abcdef0123456789abcdef
+
+  # node B（与 node A 并发）
+  python -m orchestrator.shared_fs_canary node --role contender \
+    --canary-root /gpfs/meta-research-canary/RUN_ID \
+    --run-id 0123456789abcdef0123456789abcdef
+
+  python -m orchestrator.shared_fs_canary verify \
+    --canary-root /gpfs/meta-research-canary/RUN_ID \
+    --run-id 0123456789abcdef0123456789abcdef
+  ```
+
+  verifier 只在 machine/boot 均不同、挂载为 GPFS、SQLite 为 `DELETE` 且 lease/guardian/rollback/FD
+  全部 receipt 闭合时写 `shared_fs_ready=true`。该结果只验证 owner 进程 `SIGKILL`，始终写
+  `infrastructure_fence_verified=false`，不能替代 STONITH 或网络分区验收。local contract 与 two-node
+  contract 不可互相升级。two-node 默认给 guardian fence observation 5 秒窗口；若目标 GPFS 的 durable
+  receipt 可见性更慢，两个角色须显式传入相同且小于总 timeout 一半的更大 `--guardian-grace-s`，超窗会
+  fail closed，不会把未观测到的 fence 写成通过。
 - plan 的 `critical/budget_estimate` 已权威落库，critical 失败会确定性早退、非 critical 失败可继续后继；
   动态 `goal_amend` 的专用路由、不可变升版、reasoning/status 按 cycle goal version 隔离与 applicability
   恢复也已闭合。
