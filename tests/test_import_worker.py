@@ -261,9 +261,11 @@ def test_default_frozen_candidate_fetcher_validates_content_and_adapter():
 def test_worker_passes_complete_candidate_contract_to_production_fetcher(tmp_path):
     """ImportWorker 的 DB 查询/组装必须覆盖 repository materializer 的封闭输入字段。"""
     captured = {}
+    captured_context = {}
 
-    def repository_fetcher(candidate):
+    def repository_fetcher(candidate, *, adapter_generation_context):
         captured.update(candidate)
+        captured_context.update(adapter_generation_context)
         return _fetch_ok(candidate)
 
     def unexpected_legacy(_candidate):
@@ -289,6 +291,15 @@ def test_worker_passes_complete_candidate_contract_to_production_fetcher(tmp_pat
         "source_kind": "repo", "search_snapshot_json": "{}",
         "search_snapshot_hash": (
             "sha256:" + hashlib.sha256(b"{}").hexdigest()),
+    }
+    worker_cycle_id = daemon.query_one(
+        "SELECT cycle_id FROM decision WHERE actor='orchestrator' "
+        "AND type='import_worker_cycle'")[0]
+    assert captured_context == {
+        "cycle_id": f"c{worker_cycle_id}",
+        "external_import_id": selection["external_import_id"],
+        "question_id": 1,
+        "candidate_id": selection["cid"],
     }
 
 

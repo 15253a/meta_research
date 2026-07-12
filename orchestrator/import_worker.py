@@ -268,11 +268,21 @@ class ImportWorker:
             "FROM external_candidate WHERE id=?", (cand_id,))
         self.owner_guard()
         try:
-            spec = self.p["fetch"]({
+            candidate = {
                 "id": cand_id, "question_id": qi, "canonical_uri": cand[0],
                 "revision": cand[1], "source_kind": cand[2],
                 "search_snapshot_json": cand[3], "search_snapshot_hash": cand[4],
-            })
+            }
+            fetcher = self.p["fetch"]
+            materialize_for_import = getattr(
+                fetcher, "materialize_for_import", None)
+            if callable(materialize_for_import):
+                spec = materialize_for_import(candidate, {
+                    "cycle_id": cyc_id, "external_import_id": ei_id,
+                    "question_id": qi, "candidate_id": cand_id,
+                })
+            else:
+                spec = fetcher(candidate)
         except ValueError as error:
             # Frozen snapshot/spec rejection is a durable candidate failure.  Infrastructure/control
             # exceptions (owner loss, supervisor failure, budget stop, provider bug) deliberately

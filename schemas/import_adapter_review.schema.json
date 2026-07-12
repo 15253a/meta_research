@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/import_adapter_review.schema.json",
+  "title": "Independent generated import-adapter review",
+  "type": "object",
+  "required": ["verdict", "round_no", "identity_hash", "projection_hash", "adapter_sha256", "issues"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": { "enum": ["pass", "fail"] },
+    "round_no": { "type": "integer", "minimum": 1, "maximum": 3 },
+    "identity_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "projection_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "adapter_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "issues": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object",
+        "required": ["item", "why"],
+        "additionalProperties": false,
+        "properties": {
+          "item": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "why": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "fix_hint": { "type": "string", "maxLength": 2048 }
+        }
+      }
+    },
+    "notes_md": { "type": "string", "maxLength": 4096 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "verdict": { "const": "fail" } }, "required": ["verdict"] },
+      "then": { "properties": { "issues": { "minItems": 1 } } }
+    }
+  ]
+}

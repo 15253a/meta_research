@@ -429,6 +429,7 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
     from orchestrator.import_fetcher import FrozenCandidateFetcher
     from orchestrator.repository_materializer import (
         GitHubRepositoryMaterializer, ProductionCandidateFetcher)
+    from orchestrator.repository_adapter_generation import AdapterGenerationService
     from orchestrator.import_search import GitHubRepoSearchProvider, ImportSearchService
     from orchestrator.import_triggers import (
         BoundedReferenceSnapshotProvider, ImportTriggerRouter,
@@ -445,6 +446,9 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         assert isinstance(
             worker.p["fetch"].repository_fetcher,
             GitHubRepositoryMaterializer)
+        assert isinstance(
+            worker.p["fetch"].repository_fetcher.adapter_generator,
+            AdapterGenerationService)
         assert worker.execution_supervisor is system.execution_supervisor
         assert isinstance(worker.execution_sandbox, DockerExecutionSandbox)
         assert system.advancer.attack.execution_sandbox is worker.execution_sandbox

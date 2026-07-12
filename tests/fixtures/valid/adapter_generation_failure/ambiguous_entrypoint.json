@@ -1,0 +1,4 @@
+{
+  "reason_code": "ambiguous_entrypoint",
+  "details_md": "The bounded source projection exposes multiple entrypoints and does not prove which one is production-safe."
+}

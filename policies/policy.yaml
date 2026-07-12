@@ -66,6 +66,15 @@ import_materialization:
   allowed_archive_hosts: [codeload.github.com]
   allowed_lfs_hosts: [github.com, github-cloud.s3.amazonaws.com, github-cloud.githubusercontent.com, objects.githubusercontent.com, objects-origin.githubusercontent.com, media.githubusercontent.com]
   dependency_lock_names: [python-wheel-lock.json, requirements.lock, requirements.txt, poetry.lock, uv.lock, conda-lock.yml, package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock]
+  adapter_generation:
+    provider: codex-reviewed-sidecar-v1
+    prompt_version: 1
+    max_inventory_paths: 1024
+    max_inventory_bytes: 131072
+    max_preview_files: 32
+    max_preview_file_bytes: 32768
+    max_preview_total_bytes: 262144
+    max_projection_bytes: 524288
   dependency_image:
     provider: python-wheel-image-v1
     lock_basename: python-wheel-lock.json

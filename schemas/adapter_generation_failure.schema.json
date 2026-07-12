@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/adapter_generation_failure.schema.json",
+  "title": "Bounded repository adapter generation failure",
+  "type": "object",
+  "required": ["reason_code", "details_md"],
+  "additionalProperties": false,
+  "properties": {
+    "reason_code": {
+      "enum": [
+        "insufficient_source", "missing_artifact", "missing_evaluation_contract",
+        "unsupported_runtime", "ambiguous_entrypoint"
+      ]
+    },
+    "details_md": { "type": "string", "minLength": 1, "maxLength": 4096 }
+  }
+}

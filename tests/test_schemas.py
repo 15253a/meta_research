@@ -33,7 +33,8 @@ STAGE_SCHEMAS = [
     # plan 只读发现控制 sidecar（编排器消费，不入 Gate）
     "import_search_request",
     # 外部 repository 声明式适配合同（物化器还会叠加路径/命令/稳定 ID 业务核）
-    "import_adapter", "python_wheel_lock",
+    "import_adapter", "adapter_generation_failure", "import_adapter_review",
+    "python_wheel_lock",
 ]
 
 
@@ -152,6 +153,27 @@ def test_policy_plan_review_semantic_rounds_are_capped_at_two():
     policy["flow"]["retry"]["plan_review"] = 3
     with pytest.raises(ValidationError):
         make_validator("policy").validate(policy)
+
+
+def test_policy_adapter_generation_projection_is_minimal_and_bounded():
+    with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
+        policy = yaml.safe_load(f)
+    config = policy["import_materialization"]["adapter_generation"]
+    assert config == {
+        "provider": "codex-reviewed-sidecar-v1",
+        "prompt_version": 1,
+        "max_inventory_paths": 1024,
+        "max_inventory_bytes": 131072,
+        "max_preview_files": 32,
+        "max_preview_file_bytes": 32768,
+        "max_preview_total_bytes": 262144,
+        "max_projection_bytes": 524288,
+    }
+    validator = make_validator("policy")
+    invalid = yaml.safe_load(yaml.safe_dump(policy))
+    invalid["import_materialization"]["adapter_generation"]["max_review_rounds"] = 2
+    with pytest.raises(ValidationError):
+        validator.validate(invalid)
 
 
 def test_policy_budget_price_required_and_positive_when_session_limit_enabled():
