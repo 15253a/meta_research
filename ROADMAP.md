@@ -489,12 +489,14 @@
             外审误读已增补回归证伪，最终轮 CLI 挂起无 verdict；容量不足未启动全量）。
           - [ ] CP11.4c.3b.2 运维闭环：离线 verify/restore、至少 3 代已验证 DB backup、现有资源 envelope
             派生的容量门、dry-run-first 的有界 apply GC；registered checkpoint/content-store/log 原件不 GC。
-            - [ ] CP11.4c.3b.2a snapshot offline ops：独占既有 instance lease，逐轮验证 immutable
+            - [x] CP11.4c.3b.2a snapshot offline ops：独占既有 instance lease，逐轮验证 immutable
               pointer/manifest/views 链并深验最近 3 代 SQLite；只向不存在的新 work-root 恢复 SQLite 真相，
               首启留下 adoption；GC 由外部保存的 canonical plan + 显式 hash 授权，先持久化 applied-plan
               authority 再只删 backup CAS 中的 expired/orphan 对象，pointer/manifest/views 永不删。cycle backup
               在创建 temp/pending/Git 前核本次 DB bytes/inodes + reserve 的物理 headroom，production reserve
               继承已证明的 preflight envelope，但不把 `statvfs` 冒充持续 hard-quota 证明。
+              → commit `011c98b`（build_log 0074；相关 118；内部双终审 APPROVE；外审第 1 轮 401、
+              第 2 轮 5 分钟无 verdict；全量依用户要求留到最终检查点）。
             - [ ] CP11.4c.3b.2b registered asset closure：验证 import-materialization indexes/objects 的可达
               闭包可盘点、可恢复；如仍需 staging GC，只删无 DB/manifest/active-session 引用的对象；raw log
               只建确定性压缩镜像并保留冻结 ref/hash 原件。完成前 b.2/b 整体不勾选。

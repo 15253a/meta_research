@@ -6,6 +6,7 @@
 
 ---
 
+- [0074](0074-cp114c3b2a-offline-snapshot-ops.md) — CP11.4c.3b.2a lease-fenced offline verify + SQLite restore + last-3/applied-plan backup GC + capacity headroom · commit `011c98b` · 验证: 相关 118；内部双终审 APPROVE；外审第 1 轮 401、第 2 轮 5 分钟无 verdict；全量依用户要求留到最终检查点
 - [0073](0073-cp114c3b1-cycle-snapshot-spine.md) — CP11.4c.3b.1 exact terminal-cycle backup → Chinese views Git → immutable manifest/pointer spine · commit `83ace54` · 验证: 相关 105；内部代码/参考文档双审 APPROVE；外审第 1 轮误读已增补回归证伪、第 2 轮 CLI 挂起无 verdict；全量因根盘容量不足未启动
 - [0072](0072-cp114c3a-truthful-session-mode.md) — CP11.4c.3a 生产会话契约冻结为真实 A、虚假 B 全入口 fail-closed · commit `b2081a3` · 验证: 相关 165；内部双审/外审最终轮 APPROVE；唯一全量被当前 20G overlay ENOSPC 污染，依约未重跑
 - [0071](0071-cp114c2b3b-fixed-gpu-device-bridge.md) — CP11.4c.2b.3b exact GPU allocation → Docker DeviceRequest/inventory/guardian identity bridge · commit `563a496` · 验证: 相关 427/外审后定向 48；真实 negative GPU canary fail-closed；唯一全量 1494 过/1 跳过/1 个 Docker archive ENOSPC

@@ -1,33 +1,26 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-12 ｜ 位置：步⑪ CP11.4c.3b.2 存储运维闭环
-- 检查点状态：CP11.4c.3b.1 已提交；转入 b.2 最小 verify/restore/retention/capacity/GC
+- 更新：2026-07-12 ｜ 位置：步⑪ CP11.4c.3b.2b registered asset closure
+- 检查点状态：CP11.4c.3b.2a 已提交；转入 b.2b 最小 raw-log/import-object 闭包
 
 ## 上一检查点结果
 
-- 功能提交 `83ace54`：每个终态 cycle 同步发布 exact SQLite backup → 中文 views Git →
-  CAS manifest → immutable pointer；genesis/pending/owner/Git 父链和 startup/reentry/worker/abort 边界均 fail-closed。
-- 相关 **105 passed**；内部代码和参考/文档审查 APPROVE。外审首轮 Git orphan 误读已用新增回归证伪，
-  最终轮 CLI 挂起 5 分钟无 verdict。根盘只余约 155MB，低于已知全量 191MB basetemp，未启动必然 ENOSPC 的全量。
+- 功能提交 `011c98b`：exact lease 下离线验证 snapshot chain、默认深验/保护最近 3 代、SQLite-only
+  no-clobber restore、canonical plan + 显式 hash 的 applied-plan backup GC，以及 cycle backup 前 bytes/inodes
+  headroom 门；没有 daemon、第二 DB 或自动删除器。
+- 相关 **118 passed**；内部两路最终 APPROVE。外审第 1 轮凭证 401、第 2 轮接收完整 diff 后 5 分钟无
+  verdict，按两轮上限终止。全量依用户要求只在最终检查点做；当前 overlay 余量也不足已知 191MB basetemp。
 
-## 本检查点目标
+## 当前可用边界
 
-不改 b.1 同步主干，只补薄运维闭环：离线 verify/restore、至少 3 代已验证 DB backup、由既有资源
-envelope 派生的容量门、dry-run-first 有界 GC、raw-log 压缩镜像，以及 import-materialization
-indexes/objects 可达闭包的盘点/恢复。registered checkpoint/content-store/log 原件不 GC。
-
-## 完成性审计新发现
-
-- 当前容器不满足 production：嵌套 Docker/kubepods、root、共享 0775 socket、cgroup driver none、无 NVIDIA runtime，
-  Docker 总盘仅约 21GB；无第二节点与 GPFS hard quota 证明。不放宽 preflight。
-- reference 要求的每轮 backup/snapshot 主干已由 b.1 实现；离线 restore/verify、retention、容量门和
-  有界 GC 仍缺，是 b.2 生产 blocker。
-- T1/T2 还缺 §7.4 sealed-holdout/label/trial/one-shot/non-feedback 输入域防火墙；两节点 canary、
-  ≥200 轮 fault soak、evidence pack/restore verifier 尚未实现。
-- CP11.3c 的 120 轮仍只是无真实 provider/训练的控制面回归，不作生产验收证据。
+- 百轮运行已有同步逐轮 recovery-point 主干；离线 verify 的昂贵 SQLite 深验固定在最近 3 代，GC 触及时
+  才单次读取旧 backup。restore 能在 storage subtree 尚存时恢复 SQLite 真相并诚实 adoption。
+- 当前不是完整 DR：不复制原 views/storage timeline，不恢复 checkpoint/log/import objects；同一 VEPFS
+  failure domain 也不防 fileset/站点丢失。GC 目前只作用于 backup CAS。
+- production preflight、T1/T2 firewall、两节点 canary、≥200 轮真实 fault soak 与 evidence pack 仍未完成。
 
 ## 当前动作
 
-1. 先固定 offline verifier/restore 的最小 CLI 契约，复用 b.1 manifest/backup/Git 链，不建第二套真相。
-2. 在同一组操作里加 retention/capacity/GC；GC 先 dry-run，apply 只作用于已验证超额 backup 和无引用 staging。
-3. 最后补 raw-log 压缩镜像和 import-materialization 可达闭包核验，全程保留 registered 原件。
+1. 复用现有 `execution_log`/checkpoint/import-materialization receipt 与 CAS，不加新数据库或后台服务。
+2. 只补两件事：raw log 的确定性压缩镜像（冻结原件保留）与 import indexes/objects 的离线可达闭包校验/恢复。
+3. 先跑各自相关测试；b.2b 收口后再做一次检查点提交，全量仍留到最终验收边界。
