@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "protocol": "deployment-attestation-v1",
+  "issued_at_unix": 1783814400,
+  "service": {"uid": 1000, "gid": 1000, "groups": [1000], "username": "meta-research", "codex_home": "/home/meta-research/.codex"},
+  "isolation": {"kind": "dedicated-vm", "deployment_id": "prod-cnbj2-v1", "machine_id": "0123456789abcdef0123456789abcdef", "boot_id": "5b97b294-cc1d-4dd9-8e36-8a66f05b561e", "hostname": "meta-research-prod-01", "vm_kind": "kvm"},
+  "docker": {"socket_path": "/run/user/1000/docker.sock", "socket_uid": 1000, "socket_gid": 1000, "socket_mode": 384, "daemon_id": "daemon-prod", "daemon_name": "mr-vm-01", "rootless": true, "security_options": ["name=rootless", "name=seccomp,profile=builtin"], "cgroup_version": "2", "cgroup_driver": "systemd", "resource_mode": "cgroup-v2", "root_dir": "/var/lib/meta-research-docker", "runtimes": ["nvidia", "runc"], "min_free_bytes": 137438953472, "min_free_inodes": 1100000},
+  "work_root": {"path": "/vepfs-mlp2/c20250511/250806010/meta-research-run", "mount_point": "/vepfs-mlp2/c20250511/250806010", "mount_source": "fs_vepfs-cnbj2c98dea54433", "mount_fstype": "gpfs", "quota_provider": "gpfs-fileset-v1", "quota_scope": "fileset:meta-research", "hard_bytes": 536870912000, "used_bytes": 107374182400, "hard_inodes": 10000000, "used_inodes": 250000},
+  "gpu": {"memory_bytes_by_uuid": {"GPU-cfca2d57-c53b-81ce-1813-5c5cd68f8503": 85899345920}}
+}

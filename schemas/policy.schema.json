@@ -4,7 +4,7 @@
   "title": "policy",
   "description": "policies/policy.yaml 的机械校验 schema（启动前提 §7.5 #4）。旋钮注册表唯一权威 = 第一部分附录 C（全量、每旋钮带默认值）；本 schema 与之逐节对齐、封闭（additionalProperties=false）。observation 节（parser 阈值）已随 M4 CP5.3 真 parser 落地（OPEN #5 已闭；extraction_policy_hash = 该节规范化 JSON 的 sha256，见 obs_parser）。",
   "type": "object",
-  "required": ["acquisition", "budget", "flow", "retrieval", "import_search", "import_materialization", "import_reference", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "execution", "resources", "interaction_request", "observation"],
+  "required": ["acquisition", "budget", "flow", "retrieval", "import_search", "import_materialization", "import_reference", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "execution", "resources", "deployment", "interaction_request", "observation"],
   "additionalProperties": false,
   "properties": {
     "acquisition": {
@@ -434,6 +434,27 @@
         "gpus": { "type": "integer", "minimum": 0 },
         "gpu_mem_gb": { "type": "number", "minimum": 0 },
         "disk_quota_gb": { "type": "number", "minimum": 0 }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "description": "启动部署信任合同。development 只发布 production_ready=false 的诚实回执；production 实时核 service/Docker/cgroup/GPU/mount，并只接受部署 root 在 300 秒内签发的 GPFS hard-quota snapshot。",
+      "required": ["mode", "attestation_path", "max_attestation_age_s"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "development" } }, "required": ["mode"] },
+          "then": { "properties": { "attestation_path": { "type": "null" } } },
+          "else": { "properties": {
+            "attestation_path": { "type": "string", "pattern": "^/[^\\u0000]*$", "maxLength": 4096 },
+            "max_attestation_age_s": { "maximum": 300 }
+          } }
+        }
+      ],
+      "properties": {
+        "mode": { "enum": ["development", "production"] },
+        "attestation_path": { "type": ["string", "null"] },
+        "max_attestation_age_s": { "type": "integer", "minimum": 60, "maximum": 604800 }
       }
     },
     "interaction_request": {

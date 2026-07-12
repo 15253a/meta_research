@@ -177,6 +177,12 @@ execution:
 # —— resources（启动输入③：只放硬件事实，§4.6.7；时限唯一归 flow.watchdog）——
 resources: { gpus: 4, gpu_mem_gb: 80, disk_quota_gb: 500 }
 
+# —— deployment（运行信任事实；development 永不产生 production-ready 语义）——
+# production 必须把 attestation_path 指向部署者持有、service account 不可写的 canonical JSON；
+# 进程实时核 service/隔离/Docker/mount；GPFS quota 数值取部署 root 在 300 秒内签发的权威 snapshot。
+# 代码只验合同，不负责创建 VM/quota，也不把 df/statvfs 冒充 hard quota。
+deployment: { mode: development, attestation_path: null, max_attestation_age_s: 300 }
+
 # —— interaction_request（文件请求，§4.6.8；执行点 = interaction_request_create 创建拒绝判据）——
 # 无自动超时放弃：全局等待 + 周期提醒，用户可 cancel
 interaction_request: { enabled: true, max_items_per_request: 10, max_requests_per_goal: 5, remind_interval_h: 24 }

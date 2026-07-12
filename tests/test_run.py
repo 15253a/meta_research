@@ -451,6 +451,10 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
             AdapterGenerationService)
         assert worker.execution_supervisor is system.execution_supervisor
         assert isinstance(worker.execution_sandbox, DockerExecutionSandbox)
+        assert system.deployment_receipt["mode"] == "development"
+        assert system.deployment_receipt["production_ready"] is False
+        deployment_receipts = list((tmp_path / "state" / "deployment").glob("deployment-*.json"))
+        assert len(deployment_receipts) == 1
         assert system.advancer.attack.execution_sandbox is worker.execution_sandbox
         assert worker.execution_sandbox.resource_mode in {
             "cgroup-v1", "cgroup-v2", "rlimit-fallback"}
@@ -466,6 +470,66 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
             BoundedReferenceSnapshotProvider)
     finally:
         system.close()
+
+
+def test_production_deployment_cannot_bypass_full_sandbox(tmp_path, monkeypatch):
+    """Production 的 trust contract 不能借 reasoning-only/诊断装配绕过。"""
+    import copy
+    import types
+    import orchestrator.run as R
+
+    policy = copy.deepcopy(_POLICY)
+    policy["deployment"] = {
+        "mode": "production",
+        "attestation_path": "/etc/meta-research/deployment.json",
+        "max_attestation_age_s": 300,
+    }
+    monkeypatch.setattr(R, "yaml", types.SimpleNamespace(safe_load=lambda _text: policy))
+    with pytest.raises(ValueError, match="production deployment.*attack/sandbox"):
+        R.build_system(
+            SYSTEM_ROOT, str(tmp_path / "work"),
+            runner_factory=_mock_factory([]), attack=False)
+    assert not (tmp_path / "work").exists()
+    with pytest.raises(ValueError, match="不得关闭 instance owner lease"):
+        R.build_system(
+            SYSTEM_ROOT, str(tmp_path / "unleased"),
+            runner_factory=_mock_factory([]), attack=True,
+            enforce_instance_lease=False)
+    assert not (tmp_path / "unleased").exists()
+
+
+def test_deployment_preflight_rejects_before_database_and_releases_lease(tmp_path, monkeypatch):
+    import orchestrator.run as R
+    from orchestrator.deployment_preflight import DeploymentPreflightError
+    from orchestrator.instance_lease import InstanceLease
+
+    work = tmp_path / "work"
+    calls = []
+
+    class RejectDeployment:
+        def __init__(self, **_kwargs):
+            calls.append("init")
+
+        def run(self):
+            calls.append("run")
+            raise DeploymentPreflightError("deployment rejected")
+
+    monkeypatch.setattr(R, "DeploymentPreflight", RejectDeployment)
+    monkeypatch.setattr(
+        R.ExecutionSupervisor, "recover_previous_generation",
+        lambda _self: calls.append("forbidden-recovery"))
+    monkeypatch.setattr(
+        R.DockerExecutionSandbox, "recover_terminal_sessions",
+        lambda _self, _supervisor: calls.append("forbidden-sandbox-recovery"))
+    monkeypatch.setattr(
+        R._db, "connect",
+        lambda _path: (_ for _ in ()).throw(AssertionError("DB must not open")))
+    with pytest.raises(DeploymentPreflightError, match="deployment rejected"):
+        R.build_system(SYSTEM_ROOT, str(work), runner_factory=_mock_factory([]))
+    assert calls == ["init", "run"]
+
+    replacement = InstanceLease.acquire(work, heartbeat_interval_s=0.02)
+    assert replacement.close() is None
 
 
 def test_attack_assembly_accepts_deterministic_readonly_search_provider(tmp_path):
