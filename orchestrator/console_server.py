@@ -41,6 +41,7 @@ from .console_spool import (CAPABILITY_NAME, ConsoleSpool, normalize_upload_ref,
                             open_directory_path, read_regular_file_beneath,
                             stat_regular_file_beneath)
 from .instance_lease import read_instance_status
+from .database import journal_mode_for_path
 from .process_supervisor import read_receipt
 
 
@@ -118,6 +119,10 @@ class JsonResponseTooLarge(ValueError):
     """Incremental JSON encoding crossed the configured response budget."""
 
 
+class SharedSQLiteReaderUnavailable(RuntimeError):
+    """The shared database cannot prove this request is on a safe reader host."""
+
+
 def _bounded_json_bytes(value: Any, *, max_bytes: int = _MAX_JSON_RESPONSE_BYTES) -> bytes:
     """Encode without first materializing an unbounded string; reject non-finite JSON numbers."""
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
@@ -132,10 +137,23 @@ def _bounded_json_bytes(value: Any, *, max_bytes: int = _MAX_JSON_RESPONSE_BYTES
     return bytes(body)
 
 
-def _open_ro(db_path: str) -> sqlite3.Connection:
+def _open_ro(db_path: str, *, work_root: Union[str, Path]) -> sqlite3.Connection:
     """控制台专用只读连接：**mode=ro**（物理只读，写操作被 SQLite 拒——单写者纪律的硬保证）。
     不用 mediator.open_responder_read_conn（其 authorizer 为 grounding 应答器裁剪、连 PRAGMA/观测表都拒），
-    因控制台是**人类全量观测面**、须读得到所有表 + PRAGMA 取列名；mode=ro 已足够保证零写。"""
+    因控制台是**人类全量观测面**、须读得到所有表 + PRAGMA 取列名；mode=ro 已足够保证零写。
+
+    共享文件系统的 rollback journal 额外做请求级准入检查：有 owner 持锁时，
+    必须由 lease 状态机械证明它是本次 boot 的 fresh active owner。这不是接管 fence；
+    部署仍必须在跨节点接管前停止/fence 旧节点及其独立控制台。"""
+    if journal_mode_for_path(db_path) == "delete":
+        instance = read_instance_status(work_root)
+        local_owner = instance.get("local_active_owner") is True
+        proven_inactive = (
+            instance.get("status") == "inactive"
+            and instance.get("lock_held") is False)
+        if not (local_owner or proven_inactive):
+            raise SharedSQLiteReaderUnavailable(
+                "共享文件系统 SQLite 准入拒绝：未证实本机 active owner")
     conn = sqlite3.connect(f"file:{quote(db_path)}?mode=ro", uri=True)
     conn.isolation_level = None
     return conn
@@ -827,7 +845,7 @@ def _fs_tree(work_root: Path, system_root: Path) -> Dict[str, Any]:
 
 def assemble_db(db_path: str, work_root: str, system_root: str) -> Dict[str, Any]:
     """组装控制台 /api/db 载荷（纯函数、只读连接、可单测）：真表投影 + 派生对象。"""
-    conn = _open_ro(db_path)
+    conn = _open_ro(db_path, work_root=work_root)
     try:
         projected: Dict[str, List[Dict[str, Any]]] = {}
         remaining = _MAX_DB_PROJECTION_BYTES
@@ -975,7 +993,7 @@ class ConsoleData:
         if action not in ("resolve", "cancel"):
             raise ValueError("action 须为 resolve 或 cancel")
         rid = _canonical_positive_id(request_id, label="request_id")
-        conn = _open_ro(self.db_path)
+        conn = _open_ro(self.db_path, work_root=self.work_root)
         try:
             row = conn.execute("SELECT 1 FROM interaction_request WHERE id=?", (rid,)).fetchone()
         finally:
@@ -1125,6 +1143,8 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
             if u.path == "/api/db":
                 try:
                     self._json(200, data.db())
+                except SharedSQLiteReaderUnavailable:
+                    self._json(503, {"error": "研究库暂不可在本节点读取，请稍后重试"})
                 except Exception:                     # 只读观测面：组装失败向客户端**泛化报**（不泄内部细节/路径，
                     import traceback                   # codex SHOULD）；真实细节写 stderr 供运维排障（codex 第2轮
                     traceback.print_exc()              # NIT：文案承诺「详见服务端日志」须真有日志，否则线上排障盲）
@@ -1201,7 +1221,7 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                     self._json(200, {"ok": True, "queued": rec})
                 except (ValueError, json.JSONDecodeError) as e:
                     self._json(400, {"error": str(e)})
-                except sqlite3.Error:
+                except (sqlite3.Error, SharedSQLiteReaderUnavailable):
                     self._json(503, {"error": "研究库暂不可读，请稍后重试"})
                 except OSError:
                     self._json(503, {"error": "console spool/上传目录暂不可用，请稍后重试"})

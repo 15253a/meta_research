@@ -1039,7 +1039,8 @@ def read_instance_status(work_root: Union[str, Path], *,
         raise ValueError("instance max_age_s 非法")
     result: Dict[str, Any] = {
         "status": "inactive", "active": False, "lock_held": False,
-        "owner_id": None, "pid": None, "state": None,
+        "owner_id": None, "hostname": None, "boot_id": None,
+        "local_active_owner": False, "pid": None, "state": None,
         "heartbeat_age_s": None, "sequence": None,
     }
     work_fd = lock_fd = state_fd = heartbeat_fd = -1
@@ -1075,6 +1076,8 @@ def read_instance_status(work_root: Union[str, Path], *,
         if not _valid_owner_metadata(owner):
             raise ValueError("instance owner metadata schema 非法")
         result["owner_id"] = owner["owner_id"]
+        result["hostname"] = owner["hostname"]
+        result["boot_id"] = owner["boot_id"]
         result["pid"] = owner["pid"]
 
         state_fd = os.open(
@@ -1118,6 +1121,9 @@ def read_instance_status(work_root: Union[str, Path], *,
         generation_stable = _read_fd_bounded(lock_fd) == lock_raw
         result["active"] = bool(
             generation_stable and matching and fresh and heartbeat["state"] != "stopped")
+        result["local_active_owner"] = bool(
+            result["active"] and current_boot is not None
+            and owner["boot_id"] == current_boot)
         if not generation_stable or not matching:
             result["status"] = "invalid"
         elif heartbeat["state"] == "stopped":

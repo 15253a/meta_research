@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from .artifact_capability import read_artifact_bytes
+from .database import journal_mode_for_filesystem
 from .execution_sandbox import gpu_capability_projection, sandbox_environment_hash
 from .process_supervisor import (
     atomic_write_receipt,
@@ -998,6 +999,13 @@ def evaluate_deployment(*, facts: Mapping[str, Any], attestation: Optional[Mappi
     ))
     add("work_root_mount", work_mount,
         f"source={_get(mount, 'source')!r} fstype={_get(mount, 'fstype')!r}")
+    sqlite_journal_mode = journal_mode_for_filesystem(_get(mount, "fstype"))
+    sqlite_storage_ok = bool(
+        work_mount and sqlite_journal_mode in {"wal", "delete"}
+        and (_get(mount, "fstype") != "gpfs" or sqlite_journal_mode == "delete"))
+    add("sqlite_storage_mode", sqlite_storage_ok,
+        f"fstype={_get(mount, 'fstype')!r} required_journal_mode={sqlite_journal_mode!r} "
+        "single-active-host-required=true")
     reserves = dict(reserves or _deployment_reserves({}, resources, sandbox_config))
     required_bytes = reserves["work_free_bytes"]
     hard_bytes = _get(expected_work, "hard_bytes")

@@ -3,7 +3,7 @@
 全栈真跑一遍（真 HTTP + 真 DB + 真 spool + 入站闭环），落步⑨步级验证的③②证据：
 - ① 真视图（数据层）：CS.serve 起真服务 → GET / 出真控制台页 + GET /api/db 出真 DB 数据 + GET /api/file 白名单读（含负例拒）；
 - ③ 单写纪律：console_server 处理 GET/POST 前后 DB 的**逻辑内容快照不变**（观测面零 DB 写；用逻辑 dump 而非主库 sha256，
-  因文件库开 WAL——真写可能只落 -wal、主库字节不变，主库 sha 会假绿）；
+  因本地文件库可开 WAL——真写可能只落 -wal、主库字节不变，主库 sha 会假绿）；
 - ② 入站闭环：POST /api/message 写 spool → ConsoleInboxIngest 消费 server 写的那份 spool → pause directive →
   （确认消息也经 HTTP/spool/ingest）确认 → precheck 阻断；query → grounded 应答（据卡）+ 重放不重复（no-dup）。
 
@@ -138,7 +138,7 @@ def test_console_e2e_view_zero_write_and_inbound_loop(running):
 
     # ③ 单写纪律【强证】：console_server 全部 DB 访问经 _open_ro（mode=ro）→ 任何写被 SQLite 物理拒——
     # 这覆盖每个 GET/POST（不依赖逐请求快照）；逻辑快照仅作补充行为证。
-    ro = CS._open_ro(env["db_path"])
+    ro = CS._open_ro(env["db_path"], work_root=env["work"])
     try:
         with pytest.raises(sqlite3.OperationalError):
             ro.execute("INSERT INTO directive(kind,hardness,status,consume_at,payload_json) "

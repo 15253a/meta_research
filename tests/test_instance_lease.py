@@ -205,6 +205,8 @@ def test_real_process_same_root_is_busy_but_different_root_can_run(tmp_path):
             status = read_instance_status(other)
             assert status["active"] is True
             assert status["owner_id"] != owner_id
+            assert status["hostname"] == independent.owner["hostname"]
+            assert status["local_active_owner"] is True
         finally:
             independent.close()
     finally:
@@ -214,6 +216,22 @@ def test_real_process_same_root_is_busy_but_different_root_can_run(tmp_path):
     # needed and the same stable lock entry remains reusable.
     resumed = InstanceLease.acquire(shared, heartbeat_interval_s=0.02)
     resumed.close()
+
+
+def test_status_does_not_treat_matching_hostname_on_another_boot_as_local(
+        tmp_path, monkeypatch):
+    work = tmp_path / "boot-bound-status"
+    lease = InstanceLease.acquire(work, heartbeat_interval_s=0.02)
+    try:
+        assert lease.owner["boot_id"] is not None
+        monkeypatch.setattr(IL, "_boot_id", lambda: "00000000-0000-0000-0000-000000000000")
+        status = read_instance_status(work)
+        assert status["active"] is True
+        assert status["hostname"] == lease.owner["hostname"]
+        assert status["boot_id"] == lease.owner["boot_id"]
+        assert status["local_active_owner"] is False
+    finally:
+        lease.close()
 
 
 def test_sigkill_releases_kernel_lease_and_new_owner_replaces_heartbeat(tmp_path):

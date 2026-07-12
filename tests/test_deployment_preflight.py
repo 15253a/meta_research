@@ -263,6 +263,10 @@ def test_production_positive_with_zero_requested_gpus(tmp_path):
     receipt = preflight.run()
     assert receipt["production_ready"] is True
     assert all(item["ok"] for item in receipt["checks"])
+    sqlite_check = next(
+        item for item in receipt["checks"] if item["name"] == "sqlite_storage_mode")
+    assert "fstype='gpfs'" in sqlite_check["detail"]
+    assert "required_journal_mode='delete'" in sqlite_check["detail"]
     assert receipt["prerequisite"]["attestation"]["sha256"].startswith("sha256:")
     assert probe.calls == 1
 
