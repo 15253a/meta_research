@@ -12,9 +12,10 @@ from .artifact_capability import (
     ArtifactCapabilityError, open_directory, read_artifact_bytes, verify_tree_fd,
 )
 from .repository_materialization_common import (
-    _COMMIT_RE, _FULL_NAME_RE, _MAX_RECEIPT_BYTES, _PROTOCOL, _SHA256_RE,
-    RepositoryCacheError, RepositoryMaterializationError, _safe_relpath,
-    _strict_json, _value_hash,
+    _COMMIT_RE, _FULL_NAME_RE, _MAX_ADAPTER_BYTES, _MAX_RECEIPT_BYTES,
+    _PROTOCOL, _SHA256_RE,
+    RepositoryCacheError, RepositoryMaterializationError, _canonical, _safe_relpath,
+    _sha256, _strict_json, _value_hash,
 )
 
 
@@ -133,6 +134,26 @@ class _RepositoryStoreMixin:
                     or spec.get("env_hash") != supply_chain.get("environment_hash")):
                 raise RepositoryMaterializationError(
                     "repository snapshot execution environment identity 不一致")
+            adapter_control = spec.get("adapter_control")
+            if (not isinstance(adapter_control, dict)
+                    or set(adapter_control) != {
+                        "version", "origin", "path", "sha256", "bytes",
+                        "value", "generation"}
+                    or adapter_control.get("version") != 1
+                    or adapter_control.get("origin") not in {
+                        "repository", "generated_reviewed"}
+                    or not isinstance(adapter_control.get("sha256"), str)
+                    or _SHA256_RE.fullmatch(adapter_control["sha256"]) is None
+                    or isinstance(adapter_control.get("bytes"), bool)
+                    or not isinstance(adapter_control.get("bytes"), int)
+                    or not 1 <= adapter_control["bytes"] <= _MAX_ADAPTER_BYTES
+                    or supply_chain.get("adapter_origin") != adapter_control["origin"]
+                    or supply_chain.get("adapter_control_hash")
+                    != _value_hash(adapter_control)
+                    or supply_chain.get("harness_adapter_hash")
+                    != adapter_control["sha256"]):
+                raise RepositoryMaterializationError(
+                    "repository snapshot adapter control 闭包非法")
             execution_image = spec.get("execution_image")
             if execution_image is None:
                 if (spec.get("env_hash") != self.environment_hash
@@ -221,6 +242,72 @@ class _RepositoryStoreMixin:
                     raise RepositoryMaterializationError(
                         "repository snapshot LFS ledger 非法")
                 hashes[item["path"]] = item["sha256"]
+            if adapter_control["origin"] == "repository":
+                path = adapter_control["path"]
+                entry = next(
+                    (item for item in ledger if item["path"] == path), None)
+                if (path != self.config["adapter_path"]
+                        or adapter_control["value"] is not None
+                        or adapter_control["generation"] is not None
+                        or entry is None
+                        or entry["sha256"] != adapter_control["sha256"]
+                        or entry["bytes"] != adapter_control["bytes"]):
+                    raise RepositoryMaterializationError(
+                        "repository adapter control 与 Git ledger 不一致")
+                expected_adapter_execution_identity = {
+                    "origin": "repository",
+                    "adapter_sha256": adapter_control["sha256"],
+                    "projection_hash": None,
+                    "generation_policy_hash": None,
+                }
+            else:
+                value = adapter_control["value"]
+                generation = adapter_control["generation"]
+                provenance_keys = {
+                    "version", "provider", "identity_hash", "projection_hash",
+                    "policy_hash", "adapter_sha256", "generation_decision_id",
+                    "review_decision_id", "generation_runner_call_id",
+                    "review_runner_call_id", "review_hash",
+                }
+                if (adapter_control["path"] is not None
+                        or self.config["adapter_path"] in hashes
+                        or not isinstance(value, dict)
+                        or not isinstance(generation, dict)
+                        or set(generation) != provenance_keys
+                        or generation.get("version") != 1
+                        or generation.get("provider")
+                        != self.config["adapter_generation"]["provider"]
+                        or generation.get("policy_hash")
+                        != getattr(getattr(self, "adapter_generator", None),
+                                   "policy_hash", None)
+                        or any(not isinstance(generation.get(key), str)
+                               or _SHA256_RE.fullmatch(generation[key]) is None
+                               for key in (
+                                   "identity_hash", "projection_hash", "policy_hash",
+                                   "adapter_sha256", "review_hash"))
+                        or any(isinstance(generation.get(key), bool)
+                               or not isinstance(generation.get(key), int)
+                               or generation[key] <= 0 for key in (
+                                   "generation_decision_id", "review_decision_id",
+                                   "generation_runner_call_id", "review_runner_call_id"))):
+                    raise RepositoryMaterializationError(
+                        "generated adapter provenance 闭包非法")
+                raw = _canonical(value)
+                if (_sha256(raw) != adapter_control["sha256"]
+                        or len(raw) != adapter_control["bytes"]
+                        or generation["adapter_sha256"] != adapter_control["sha256"]):
+                    raise RepositoryMaterializationError(
+                        "generated adapter value/hash 不一致")
+                expected_adapter_execution_identity = {
+                    "origin": "generated_reviewed",
+                    "adapter_sha256": adapter_control["sha256"],
+                    "projection_hash": generation["projection_hash"],
+                    "generation_policy_hash": generation["policy_hash"],
+                }
+            if supply_chain.get("adapter_execution_identity_hash") != _value_hash(
+                    expected_adapter_execution_identity):
+                raise RepositoryMaterializationError(
+                    "repository adapter execution identity 漂移")
             tree_fd = open_directory(
                 anchored / "tree", label="published repository tree")
             try:

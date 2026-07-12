@@ -309,8 +309,12 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   archive 若已展开 LFS object，还会回查 pointer Git blob 后再做同一 OID/size 双核。
   协议口径固定为 Git LFS 官方 [pointer spec](https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md) 与
   [Batch API](https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md)；不从仓库内容推导 endpoint 或凭据。
-- 仓库须携 `.meta-research/import-adapter.json` v2：只允许 pinned Python 直接 argv、
-  `pinned_image_only` 且无项目级 lock 安装，显式声明 artifact、smoke/eval 和 named factory metrics。
+- 仓库可携 `.meta-research/import-adapter.json` v2/v3：只允许 pinned Python 直接 argv，v2 使用
+  `pinned_image_only` 且不安装项目依赖，v3 只接受唯一 canonical `python-wheel-lock.json`，将精确
+  wheel bytes 离线安装进可恢复的专用 image。两者都须显式声明 artifact、smoke/eval 和 named factory metrics。
+  若 adapter 缺失，系统只把已验 Git ledger 的有界 UTF-8 projection 交给无工具生成会话，再由另一无工具
+  会话独立复核；schema、hash echo、dependency contract 和原 adapter compiler 都通过后，sidecar 才内嵌进
+  snapshot spec，不写回 Git tree。
   adapter 通过 sandbox smoke + 代码评审后才能以 repository/name 稳定协议家族 ID 注册；同版本
   scope/指标变了会碰撞并拒绝，不能用换 ID 逃避升版。发布快照在
   `<work-root>/state/import-materializations/{objects,indexes}` 内内容寻址，worker DB 只存有界身份。
@@ -322,8 +326,10 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 - 大仓库的 judge prompt 不会整仓读入内存：给出文件数/总 bytes、至多 256 条且合计 32KB 的路径，并按
   adapter/命令入口/Python 优先，在 160KB 总预算（单文件 20KB）内展示内容；其余文件仍受 exact
   manifest hash 闭包约束，但不会冒充已经过语义评审。关键执行路径因截断不可判断时，judge 应 fail-closed。
-- 这仍不是“自动复现任意 SOTA repo”：普通仓库缺 adapter 会被拒；项目 lock 构建/验证的专用 image、adapter
-  生成+独立评审与部署级 quota/cgroup/device 合同属后续检查点。LFS 支持也只覆盖 GitHub 固定 Batch endpoint、
+- 这仍不是“自动复现任意 SOTA repo”：源码投影无法证明唯一 artifact/入口/评估语义、独立复核拒绝或
+  sandbox smoke 失败都不会入池；除 canonical Python wheel lock 外的 `requirements.txt`/Poetry/Conda/Node/Rust
+  lock 只作证据展示，不会被生成器安装或冒充可复现环境。部署级 quota/cgroup/device 合同仍属后续检查点。
+  LFS 支持也只覆盖 GitHub 固定 Batch endpoint、
   policy allowlist 内 basic HTTPS transfer，不接受仓库自定义 `.lfsconfig` endpoint/transfer adapter。
 - CP11.3c 的 120 轮是无真实 provider 工作负载的控制面/投影回归；尚未完成跨节点 VEPFS 双 owner 实机竞态，
   也尚未运行 100+ 轮含真实 Codex/import/训练与 owner-kill/daemon-loss/预算失败注入的 soak。这两项完成前，

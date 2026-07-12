@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from .artifact_capability import read_artifact_bytes
 from .repository_materialization_common import (
@@ -12,6 +12,7 @@ from .repository_materialization_common import (
     _canonical, _positive_int, _safe_relpath, _sha256, _stable_id, _value_hash,
     _strict_json,
 )
+from .repository_adapter_projection import build_adapter_source_projection
 
 
 class _RepositoryAdapterMixin:
@@ -42,19 +43,79 @@ class _RepositoryAdapterMixin:
             self, *, tree_root: Path, ledger: Sequence[Mapping[str, Any]],
             repository: str, revision: str, root_tree_sha: str,
             sources: Sequence[Mapping[str, Any]],
-            submodules: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+            submodules: Sequence[Mapping[str, Any]],
+            adapter_generation_context: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         adapter_path = self.config["adapter_path"]
         adapter_file = tree_root / adapter_path
         ledger_by_path = {item["path"]: item for item in ledger}
-        if adapter_path not in ledger_by_path:
-            raise RepositoryMaterializationError(
-                f"repository 缺 production adapter {adapter_path}")
-        raw = read_artifact_bytes(
-            adapter_file, expected_hash=ledger_by_path[adapter_path]["sha256"],
-            expected_size=ledger_by_path[adapter_path]["bytes"],
-            max_bytes=_MAX_ADAPTER_BYTES, label="repository import adapter",
-            progress_guard=self.owner_guard)
-        value = _strict_json(raw, label="repository import adapter")
+        generation = None
+        if adapter_path in ledger_by_path:
+            adapter_origin = "repository"
+            raw = read_artifact_bytes(
+                adapter_file, expected_hash=ledger_by_path[adapter_path]["sha256"],
+                expected_size=ledger_by_path[adapter_path]["bytes"],
+                max_bytes=_MAX_ADAPTER_BYTES, label="repository import adapter",
+                progress_guard=self.owner_guard)
+            value = _strict_json(raw, label="repository import adapter")
+        else:
+            adapter_origin = "generated_reviewed"
+            generator = getattr(self, "adapter_generator", None)
+            if generator is None:
+                raise RuntimeError(
+                    f"repository 缺 production adapter {adapter_path}，且未配置 reviewed generator")
+            if not isinstance(adapter_generation_context, Mapping):
+                raise RuntimeError(
+                    "repository 缺 adapter 时必须绑定 import worker generation context")
+            projection = build_adapter_source_projection(
+                tree_root=tree_root, ledger=ledger, repository=repository,
+                revision=revision, root_tree_sha=root_tree_sha,
+                adapter_path=adapter_path,
+                dependency_lock_names=self.config["dependency_lock_names"],
+                dependency_lock_basename=self.config["dependency_image"]["lock_basename"],
+                config=self.config["adapter_generation"],
+                owner_guard=self.owner_guard)
+            try:
+                generated = generator.generate(
+                    projection=projection,
+                    generation_context=dict(adapter_generation_context))
+            except RepositoryMaterializationError:
+                raise
+            except ValueError as error:
+                # ImportWorker treats ValueError as a durable candidate
+                # rejection.  Runner auth/config/provider ValueError is an
+                # infrastructure failure and must remain retryable instead.
+                raise RuntimeError(
+                    "reviewed adapter generator infrastructure/config failure") from error
+            if (not isinstance(generated, Mapping)
+                    or set(generated) != {"adapter", "raw", "provenance"}
+                    or not isinstance(generated.get("adapter"), dict)
+                    or not isinstance(generated.get("raw"), bytes)
+                    or not isinstance(generated.get("provenance"), dict)):
+                raise RuntimeError("adapter generator 返回契约非法")
+            value = generated["adapter"]
+            raw = generated["raw"]
+            generation = generated["provenance"]
+            if raw != _canonical(value):
+                raise RuntimeError("adapter generator raw 非 canonical adapter bytes")
+            if len(raw) > _MAX_ADAPTER_BYTES:
+                raise RepositoryMaterializationError("generated repository adapter 超 bytes 上限")
+            expected_generation_identity = _value_hash({
+                "protocol": self.config["adapter_generation"]["provider"],
+                "candidate_id": adapter_generation_context.get("candidate_id"),
+                "projection_hash": projection["projection_hash"],
+                "policy_hash": generator.policy_hash,
+            })
+            if (generation.get("version") != 1
+                    or generation.get("provider")
+                    != self.config["adapter_generation"]["provider"]
+                    or generation.get("projection_hash")
+                    != projection["projection_hash"]
+                    or generation.get("policy_hash") != generator.policy_hash
+                    or generation.get("adapter_sha256") != _sha256(raw)
+                    or generation.get("identity_hash")
+                    != expected_generation_identity):
+                raise RuntimeError(
+                    "adapter generator provenance 未绑定本次 projection/policy/artifact")
         required_keys = {
             "version", "artifact_relpath", "artifact_type", "smoke_argv",
             "eval_argv", "dependency_mode", "dependency_locks",
@@ -309,6 +370,30 @@ class _RepositoryAdapterMixin:
             "image_receipt_hash": image_receipt_hash,
             "required": required,
         }
+        adapter_control = {
+            "version": 1, "origin": adapter_origin,
+            "path": adapter_path if adapter_origin == "repository" else None,
+            "sha256": adapter_hash, "bytes": len(raw),
+            "value": value if adapter_origin == "generated_reviewed" else None,
+            "generation": generation,
+        }
+        adapter_control_hash = _value_hash(adapter_control)
+        adapter_execution_identity_hash = _value_hash({
+            "origin": adapter_origin,
+            "adapter_sha256": adapter_hash,
+            "projection_hash": (
+                generation["projection_hash"] if generation is not None else None),
+            "generation_policy_hash": (
+                generation["policy_hash"] if generation is not None else None),
+        })
+        supply_chain["adapter_origin"] = adapter_origin
+        supply_chain["adapter_control_hash"] = adapter_control_hash
+        supply_chain["adapter_execution_identity_hash"] = (
+            adapter_execution_identity_hash)
+        # DB-local runner/decision ids and free-form review notes remain audit
+        # provenance only.  They must not fork the scientific target identity.
+        target_identity["adapter_execution_identity_hash"] = (
+            adapter_execution_identity_hash)
         result = {
             "smoke_cmd": smoke_cmd,
             "eval_cmd": eval_cmd,
@@ -326,6 +411,7 @@ class _RepositoryAdapterMixin:
             "required": required, "artifact_relpath": artifact,
             "artifact_type": artifact_type, "env_hash": environment_hash,
             "supply_chain": supply_chain, "requires_adversarial_sandbox": True,
+            "adapter_control": adapter_control,
         }
         if execution_image is not None:
             result["execution_image"] = execution_image

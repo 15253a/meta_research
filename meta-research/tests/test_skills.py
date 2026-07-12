@@ -14,6 +14,10 @@ SKILLS = {
     name: (PROMPTS / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
     for name in ("idea", "plan", "bundle", "reasoning")
 }
+CONTROL_SKILLS = {
+    name: (PROMPTS / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
+    for name in ("adapter_generation", "adapter_review")
+}
 SYSTEM_PROMPT = (PROMPTS / "system_prompt.md").read_text(encoding="utf-8")
 
 # 通用骨架六要素（《二》§6.4）：触发/读取/Codex 任务/产物 schema 指向/门禁写入/失败语义。
@@ -107,11 +111,27 @@ def test_skill_stage_anchors():
 def test_skill_schema_references_exist():
     """skill 里出现的 schemas/xxx.schema.json 必须真实存在。"""
     pattern = re.compile(r"schemas/([a-z_]+)\.schema\.json")
-    for name, text in list(SKILLS.items()) + [("system_prompt", SYSTEM_PROMPT)]:
+    for name, text in (list(SKILLS.items()) + list(CONTROL_SKILLS.items())
+                       + [("system_prompt", SYSTEM_PROMPT)]):
         for ref in set(pattern.findall(text)):
             assert (SCHEMAS_DIR / f"{ref}.schema.json").exists(), (
                 f"{name} 引用了不存在的 schema: {ref}"
             )
+
+
+def test_adapter_control_skills_keep_isolation_and_fail_closed_contracts():
+    generation = CONTROL_SKILLS["adapter_generation"]
+    review = CONTROL_SKILLS["adapter_review"]
+    for anchor in (
+            "untrusted data", "no tools", "import-adapter.json",
+            "adapter-generation-failure.json", "dependency_contract",
+            "instead of guessing"):
+        assert anchor in generation, f"adapter_generation/SKILL.md 缺边界锚词: {anchor}"
+    for anchor in (
+            "independent reviewer", "do not receive the generator transcript",
+            "no tools", "import-adapter-review.json", "identity_hash",
+            "projection_hash", "adapter_sha256"):
+        assert anchor in review, f"adapter_review/SKILL.md 缺边界锚词: {anchor}"
 
 
 def test_skills_are_chinese():

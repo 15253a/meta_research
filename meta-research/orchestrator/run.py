@@ -67,6 +67,7 @@ from .repository_materializer import (
     GitHubRepositoryMaterializer,
     ProductionCandidateFetcher,
 )
+from .repository_adapter_generation import AdapterGenerationService
 from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestService,
                      InteractionNotifier, Outbox, ResearchNotifier,
@@ -1222,13 +1223,30 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     base_rf = runner_factory or (lambda transcripts_dir, purpose_tag:
                                  CodexRunner(transcripts_dir=transcripts_dir,
                                              purpose_tag=purpose_tag,
-                                             tool_free=purpose_tag == "interaction-query",
+                                             tool_free=purpose_tag in {
+                                                 "interaction-query",
+                                                 "adapter-generation",
+                                                 "adapter-review",
+                                             },
                                              execution_supervisor=execution_supervisor))
 
     def rf(transcripts_dir, purpose_tag):  # noqa: ANN001, ANN202 - injection boundary
         owner_guard()
         runner = base_rf(transcripts_dir, purpose_tag)
         return _GuardedRunner(runner, owner_guard)
+    if repository_materializer is not None:
+        repository_materializer.bind_adapter_generator(
+            AdapterGenerationService(
+                runner_factory=rf, schemas=schemas, policy=policy,
+                system_prompt=system_prompt,
+                generation_skill=(
+                    root / "prompts" / "skills" / "adapter_generation" / "SKILL.md"
+                ).read_text(encoding="utf-8"),
+                review_skill=(
+                    root / "prompts" / "skills" / "adapter_review" / "SKILL.md"
+                ).read_text(encoding="utf-8"),
+                daemon=daemon, work_root=str(work), cost_ledger=cost_ledger,
+                owner_guard=owner_guard))
     # 所有真 LLM 调用共用上方已完成 startup reconciliation 的同一预算/账本投影。
     # 步⑨ CP9.3 入站闭环：控制台命令经 console_server 落 <work>/state/console_inbox.jsonl（连接器缓冲）→
     # precheck 边界 ingest 进权威入站链（handle_inbound 落 directive/note；query 经 mediator 应答）。

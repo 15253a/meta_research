@@ -28,6 +28,7 @@ from orchestrator.repository_materializer import (
     _git_blob_sha1,
     _git_tree_sha1,
     _sha256,
+    _value_hash,
 )
 from orchestrator.repository_materializer_lfs import _LfsObjectRedirectHandler
 
@@ -346,6 +347,56 @@ class _FakeDependencyImageBuilder:
         return _Sandbox()
 
 
+class _FakeAdapterGenerator:
+    def __init__(self, adapter=None, *, audit_offset=0):
+        self.config = copy.deepcopy(
+            POLICY["import_materialization"]["adapter_generation"])
+        self.policy_hash = "sha256:" + "d" * 64
+        self.adapter = adapter or _adapter()
+        self.audit_offset = audit_offset
+        self.calls = []
+
+    def generate(self, *, projection, generation_context):
+        self.calls.append((projection, generation_context))
+        raw = _canonical(self.adapter)
+        adapter_hash = _sha256(raw)
+        identity_hash = _value_hash({
+            "protocol": self.config["provider"],
+            "candidate_id": generation_context["candidate_id"],
+            "projection_hash": projection["projection_hash"],
+            "policy_hash": self.policy_hash,
+        })
+        return {
+            "adapter": copy.deepcopy(self.adapter), "raw": raw,
+            "provenance": {
+                "version": 1, "provider": self.config["provider"],
+                "identity_hash": identity_hash,
+                "projection_hash": projection["projection_hash"],
+                "policy_hash": self.policy_hash,
+                "adapter_sha256": adapter_hash,
+                "generation_decision_id": 1 + self.audit_offset,
+                "review_decision_id": 2 + self.audit_offset,
+                "generation_runner_call_id": 3 + self.audit_offset,
+                "review_runner_call_id": 4 + self.audit_offset,
+                "review_hash": (
+                    "sha256:" + ("2" if self.audit_offset == 0 else "3") * 64),
+            },
+        }
+
+
+class _BrokenAdapterGenerator(_FakeAdapterGenerator):
+    def generate(self, *, projection, generation_context):
+        raise ValueError("tool-free auth unavailable")
+
+
+class _MisboundAdapterGenerator(_FakeAdapterGenerator):
+    def generate(self, *, projection, generation_context):
+        result = super().generate(
+            projection=projection, generation_context=generation_context)
+        result["provenance"]["projection_hash"] = "sha256:" + "0" * 64
+        return result
+
+
 def _candidate(repo, *, candidate_id=1):
     license_hash = _sha256(b"MIT license evidence\n")
     snapshot = {
@@ -400,6 +451,120 @@ def test_exact_commit_materializes_once_and_reuses_content_identity(tmp_path):
     assert provider.archive_calls == calls[1] + 1
     assert third["repository_snapshot_hash"] == first["repository_snapshot_hash"]
     assert len(list((work / "state" / "import-materializations" / "objects").iterdir())) == 1
+
+
+def test_missing_adapter_uses_reviewed_sidecar_without_mutating_git_tree(tmp_path):
+    files = _repo_files()
+    files.pop(".meta-research/import-adapter.json")
+    repo = _FrozenRepo("acme/model", "a" * 40, files)
+    provider = _Provider([repo])
+    materialize, _work = _materializer(tmp_path, provider)
+    generator = _FakeAdapterGenerator()
+    materialize.bind_adapter_generator(generator)
+    context = {
+        "cycle_id": "c9", "external_import_id": 10,
+        "question_id": 7, "candidate_id": 1,
+    }
+
+    first = materialize(
+        _candidate(repo), adapter_generation_context=context)
+    assert len(generator.calls) == 1
+    projection, captured_context = generator.calls[0]
+    assert captured_context == context
+    assert projection["repository"] == repo.full_name
+    assert projection["revision"] == repo.revision
+    assert first["adapter_control"]["origin"] == "generated_reviewed"
+    assert first["adapter_control"]["value"] == _adapter()
+    assert first["supply_chain"]["adapter_control_hash"] == _value_hash(
+        first["adapter_control"])
+    assert ".meta-research/import-adapter.json" not in {
+        item["path"] for item in first["file_ledger"]}
+    assert not (Path(first["source_tree"]) /
+                ".meta-research/import-adapter.json").exists()
+
+    second = materialize(
+        _candidate(repo), adapter_generation_context=context)
+    assert second["repository_snapshot_hash"] == first["repository_snapshot_hash"]
+    assert len(generator.calls) == 1
+
+
+def test_explicit_adapter_never_calls_bound_generator(tmp_path):
+    repo = _FrozenRepo("acme/model", "a" * 40, _repo_files())
+    provider = _Provider([repo])
+    materialize, _work = _materializer(tmp_path, provider)
+    generator = _FakeAdapterGenerator()
+    materialize.bind_adapter_generator(generator)
+
+    result = materialize(_candidate(repo))
+
+    assert result["adapter_control"]["origin"] == "repository"
+    assert generator.calls == []
+
+
+def test_generated_target_identity_ignores_local_audit_row_ids(tmp_path):
+    files = _repo_files()
+    files.pop(".meta-research/import-adapter.json")
+    repo = _FrozenRepo("acme/model", "a" * 40, files)
+    context = {
+        "cycle_id": "c9", "external_import_id": 10,
+        "question_id": 7, "candidate_id": 1,
+    }
+    first, _ = _materializer(tmp_path / "first", _Provider([repo]))
+    second, _ = _materializer(tmp_path / "second", _Provider([repo]))
+    first.bind_adapter_generator(_FakeAdapterGenerator(audit_offset=0))
+    second.bind_adapter_generator(_FakeAdapterGenerator(audit_offset=100))
+
+    left = first(_candidate(repo), adapter_generation_context=context)
+    right = second(_candidate(repo), adapter_generation_context=context)
+
+    assert left["adapter_control"] != right["adapter_control"]
+    assert left["supply_chain"]["adapter_control_hash"] != (
+        right["supply_chain"]["adapter_control_hash"])
+    assert left["target_set_hash"] == right["target_set_hash"]
+    assert left["eval_key"] == right["eval_key"]
+
+
+def test_missing_adapter_without_reviewed_generator_fails_closed(tmp_path):
+    files = _repo_files()
+    files.pop(".meta-research/import-adapter.json")
+    repo = _FrozenRepo("acme/model", "a" * 40, files)
+    provider = _Provider([repo])
+    materialize, _work = _materializer(tmp_path, provider)
+
+    with pytest.raises(RuntimeError, match="reviewed generator"):
+        materialize(_candidate(repo))
+
+
+def test_adapter_generator_value_error_is_not_blamed_on_candidate(tmp_path):
+    files = _repo_files()
+    files.pop(".meta-research/import-adapter.json")
+    repo = _FrozenRepo("acme/model", "a" * 40, files)
+    provider = _Provider([repo])
+    materialize, _work = _materializer(tmp_path, provider)
+    materialize.bind_adapter_generator(_BrokenAdapterGenerator())
+
+    with pytest.raises(RuntimeError, match="infrastructure/config"):
+        materialize(
+            _candidate(repo), adapter_generation_context={
+                "cycle_id": "c1", "external_import_id": 1,
+                "question_id": 7, "candidate_id": 1,
+            })
+
+
+def test_adapter_generator_provenance_must_bind_current_projection(tmp_path):
+    files = _repo_files()
+    files.pop(".meta-research/import-adapter.json")
+    repo = _FrozenRepo("acme/model", "a" * 40, files)
+    provider = _Provider([repo])
+    materialize, _work = _materializer(tmp_path, provider)
+    materialize.bind_adapter_generator(_MisboundAdapterGenerator())
+
+    with pytest.raises(RuntimeError, match="provenance"):
+        materialize(
+            _candidate(repo), adapter_generation_context={
+                "cycle_id": "c1", "external_import_id": 1,
+                "question_id": 7, "candidate_id": 1,
+            })
 
 
 def test_publish_race_reuses_only_the_verified_winning_object(tmp_path, monkeypatch):

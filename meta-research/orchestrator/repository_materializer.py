@@ -54,6 +54,7 @@ from .repository_materializer_transport import (
 )
 from .repository_materializer_tree import _RepositoryTreeMixin
 from .repository_materializer_store import _RepositoryStoreMixin
+from .repository_adapter_projection import validate_adapter_generation_config
 
 
 class GitHubRepositoryMaterializer(
@@ -86,6 +87,7 @@ class GitHubRepositoryMaterializer(
         self.owner_guard = owner_guard or (lambda: None)
         self.token_env = token_env
         self.dependency_image_builder = dependency_image_builder
+        self.adapter_generator = None
         self._validate_config()
         self.api_getter = api_getter
         self.archive_fetcher = archive_fetcher
@@ -106,6 +108,7 @@ class GitHubRepositoryMaterializer(
             "max_tree_depth", "max_tree_objects", "max_submodules", "lfs_policy",
             "max_lfs_objects", "lfs_batch_size", "allowed_archive_hosts",
             "allowed_lfs_hosts", "dependency_lock_names", "dependency_image", "compiler",
+            "adapter_generation",
         }
         if set(self.config) != required or self.config.get("provider") != self.name:
             raise ValueError("policy.import_materialization 字段闭包/provider 非法")
@@ -162,6 +165,7 @@ class GitHubRepositoryMaterializer(
         if (not isinstance(dependency_image, dict)
                 or dependency_image.get("provider") != "python-wheel-image-v1"):
             raise ValueError("import_materialization dependency_image 非法")
+        validate_adapter_generation_config(self.config["adapter_generation"])
         compiler = self.config["compiler"]
         if (not isinstance(compiler, dict)
                 or set(compiler) != {"implementation", "version", "artifact_sha256"}
@@ -203,7 +207,19 @@ class GitHubRepositoryMaterializer(
             "materialization": self.config,
             "sandbox": self.sandbox_config,
             "auto_license": self.auto_license,
+            "adapter_generation_policy_hash": (
+                getattr(self.adapter_generator, "policy_hash", None)),
         })
+
+    def bind_adapter_generator(self, generator) -> None:  # noqa: ANN001
+        """Bind the LLM boundary after DB/cost/runner assembly is available."""
+        if self.adapter_generator is not None:
+            raise ValueError("repository adapter generator 已绑定")
+        if (not callable(getattr(generator, "generate", None))
+                or getattr(generator, "config", None) != self.config["adapter_generation"]
+                or not isinstance(getattr(generator, "policy_hash", None), str)):
+            raise ValueError("repository adapter generator 与 materialization policy 不一致")
+        self.adapter_generator = generator
 
     def _validate_search_snapshot(
             self, snapshot: Any, *, repository: str, revision: str,
@@ -317,7 +333,8 @@ class GitHubRepositoryMaterializer(
             normalized_license["repository_path"] = None
         return normalized_license
 
-    def __call__(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    def __call__(self, candidate: Dict[str, Any], *,
+                 adapter_generation_context: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         self.owner_guard()
         required_candidate = {
             "id", "question_id", "canonical_uri", "revision", "source_kind",
@@ -423,7 +440,8 @@ class GitHubRepositoryMaterializer(
             spec = self._adapter_spec(
                 tree_root=tree_root, ledger=ledger, repository=repository,
                 revision=revision, root_tree_sha=root_tree_sha,
-                sources=sources, submodules=submodules)
+                sources=sources, submodules=submodules,
+                adapter_generation_context=adapter_generation_context)
             file_ledger_hash = _value_hash(ledger)
             spec_hash = _value_hash(spec)
             transport_evidence_hash = _value_hash(sources)
@@ -529,3 +547,17 @@ class ProductionCandidateFetcher:
             if isinstance(snapshot, dict) and "materialization" in snapshot:
                 return self.legacy_fetcher(candidate)
         return self.repository_fetcher(candidate)
+
+    def materialize_for_import(
+            self, candidate: Dict[str, Any],
+            context: Dict[str, Any]) -> Dict[str, Any]:
+        raw = candidate.get("search_snapshot_json")
+        if isinstance(raw, str):
+            try:
+                snapshot = json.loads(raw)
+            except json.JSONDecodeError:
+                snapshot = None
+            if isinstance(snapshot, dict) and "materialization" in snapshot:
+                return self.legacy_fetcher(candidate)
+        return self.repository_fetcher(
+            candidate, adapter_generation_context=context)
