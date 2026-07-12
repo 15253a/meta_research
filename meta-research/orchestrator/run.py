@@ -79,6 +79,7 @@ from .schemas import SchemaSet
 from .stage_provider import JudgeProvider, PlanReviewProvider, StageProvider
 from .statestore_sqlite import SQLiteStateStore
 from .status_card import SqliteStatusPublisher
+from .storage_governance import CycleSnapshotPublisher
 from .stopcontroller import StopController
 from .writedaemon import WriteDaemon
 
@@ -1282,6 +1283,17 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         brief = parse_goal_brief(root / "input" / "goal_brief.md")
         state.create_goal(text=brief["body_md"], predicate_json=brief["predicate_json"])
 
+    # 若上次崩在 terminal commit / ledger 越线之后、轮后 stop 落库之前，先用恢复安全的预算门补写
+    # durable global_stop；随后冻结的 recovery point 才完整包含该轮应有的停机事实。
+    stop = StopController(daemon, policy)
+    stop.check_before_round()
+
+    # 再补 DB terminal commit → storage receipt 的崩溃缝，之后才暴露 interaction pump、provider 或新 Runner。
+    # 新库此时没有终态 cycle，但会先落原生 genesis；旧库接管会留下明确 adoption 基线而不伪造历史逐轮快照。
+    cycle_snapshots = CycleSnapshotPublisher(
+        db_path=db_path, work_root=work, owner_guard=owner_guard)
+    cycle_snapshots.reconcile(startup=True)
+
     # compiler/publisher 各用**只读连接**（外审 BLOCKER：单写纪律——入口层就 enforce 只读边界，
     # 防 compiler 侧误写绕过 WriteDaemon/账本/authorizer）。open_responder_read_conn = mode=ro+全写拒
     # authorizer（放行 SELECT/TRANSACTION，render/publish 的 BEGIN…COMMIT 读快照可跑）。
@@ -1294,7 +1306,6 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             if execution_sandbox is not None else None))
     publisher = SqliteStatusPublisher(publisher_conn, policy=policy,
                                       out_path=str(work / "state" / "status_card.json"))
-    stop = StopController(daemon, policy)
     console = Console(daemon, policy=policy)
     # sidecar 创建与控制台 resolve/cancel 共用同一服务实例；托管文件必须落在**本次 work_root** 内：
     # ①不同运行的 request_id 不会在仓库 input/ 互相覆盖；②manifest 默认 work_root 路径围栏可真实消费；
@@ -1508,7 +1519,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
 
     advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
                               status_publisher=publisher, precheck=precheck, stop_controller=stop,
-                              import_worker=import_worker)
+                              import_worker=import_worker,
+                              storage_reconciler=cycle_snapshots.reconcile)
     owner_guard()
     if instance_lease is not None:
         instance_lease.set_state("ready", activity="assembly-complete")

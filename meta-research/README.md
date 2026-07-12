@@ -172,6 +172,20 @@ fail-closed。development 仍永不产生 production-ready 声明；它可继续
   **禁止人工直接写入**。无法提供时可在控制台取消请求并留下理由。
 - **审计链**：一切决策/执行/测量都在 DB（`decision` / `run` / `evaluation` / `execution_log` /
   `runner_call` / `ledger`）；产物 transcript 归档在 `<work-root>/cycles/<id>/transcripts/`。
+- **轮次恢复点（CP11.4c.3b.1）**：research done cycle 在当轮 τ/global-stop 检查后，import worker、
+  failed/aborted cycle 在各自终态边界，用 SQLite online-backup API 发布到
+  `<work-root>/state/storage/backups/sha256/`；再从**同一备份**机械渲染 runtime
+  `<work-root>/views/{goal,tree,pool,digest}.md` 并提交其独立 Git 仓，最后发布内容寻址 asset manifest 与
+  `state/storage/cycles/cN.json` 完成指针。启动会在 connector/Runner 开放前补齐 DB 已终态但 pointer 未发布的
+  崩溃缝；同一 cycle 重放不会重复 commit。不可变 `state/storage/genesis.json` 先冻结覆盖起点：
+  新系统从 c1 原生覆盖，旧 work-root 首次接入若已有终态历史，只为最新状态建立带
+  `bootstrap_before_cycle` 的 adoption baseline，不伪造不存在的历史快照。
+  这些 views 是 DB-derived 中文投影，不冒充当前尚未持久化的模型 `cycle_report.md`。manifest 只盘点
+  DB 已登记的 checkpoint 与 `execution_log.ref` path+hash，`external_import` 只记 provenance manifest hash；
+  本子检查点不声称已盘点 import-materialization CAS/content store。已登记原件不按轮复制、移动或原地压缩。离线 restore/verify、
+  backup retention、容量门和安全 GC 属紧随的 CP11.4c.3b.2；在其完成前不能声称存储治理整体已验收。
+  backup 与原库同在一个 VEPFS failure domain 时只提供进程/节点以及活库文件误删或损坏
+  （storage subtree 仍存）的恢复点，不等同 work-root/fileset 或跨站灾备。
 
 ### 4.1 人类控制台（web 查看 + 交互，步⑨）
 

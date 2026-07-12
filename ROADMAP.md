@@ -482,6 +482,14 @@
           overlay 仅余 175MB 并在运行中 ENOSPC 污染，依约未重跑）。
         - [ ] CP11.4c.3b 存储治理：每轮 SQLite online 滚动备份 + views 独立 Git 提交 + immutable/CAS 资产
           manifest/hash；原始日志分级归档、恢复演练、容量阈值与安全 GC。不每轮复制大 checkpoint/content store。
+          - [ ] CP11.4c.3b.1 cycle snapshot 主干：research done 在当轮 τ/global-stop 检查后，其余
+            import-worker/failed/aborted 在终态边界，以 SQLite online backup → 同快照 DB-derived views Git →
+            immutable manifest 顺序发布；启动先幂等补缝，旧库只建诚实 adoption baseline，不伪造历史逐轮快照。
+          - [ ] CP11.4c.3b.2 运维闭环：离线 verify/restore、至少 3 代已验证 DB backup、现有资源 envelope
+            派生的容量门、dry-run-first 的有界 apply GC；只删已被新验证 backup 覆盖的超额 backup
+            与无 DB/manifest/active-session 引用的 staging，registered checkpoint/content-store/log 原件不 GC；
+            验证 import-materialization indexes/objects 的可达闭包可盘点、可恢复；raw log 只建压缩镜像
+            并保留冻结 ref/hash 原件。
         - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
           - [ ] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 全部 sealed-holdout/one-shot/non-feedback 约束；
             T1 的 DREAMER 在 A/B/C/HPO/claim 不可见，T2 的 target_y 与 trial/stimulus 身份对 train/HPO 不可见，独立 evaluator 出分。
