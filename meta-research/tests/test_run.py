@@ -44,6 +44,34 @@ def _mock_factory(files_seq):
     return lambda td, pt: MockRunner()
 
 
+def test_system_rejects_unimplemented_multi_stage_session_mode(tmp_path):
+    class IdleAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+    with pytest.raises(ValueError, match="dual_mode.*只支持 A"):
+        System(
+            advancer=IdleAdvancer(), state=None, daemon=None,
+            dual_mode="B", work_root=tmp_path)
+
+    system = System(
+        advancer=IdleAdvancer(), state=None, daemon=None,
+        dual_mode="A", work_root=tmp_path)
+    with pytest.raises(AttributeError):
+        system.dual_mode = "B"
+    assert system.dual_mode == "A"
+
+
+def test_build_system_rejects_mode_b_before_work_root_side_effect(tmp_path, monkeypatch):
+    policy = yaml.safe_load(yaml.safe_dump(_POLICY))
+    policy["session"]["dual_mode"] = "B"
+    monkeypatch.setattr("orchestrator.run.yaml.safe_load", lambda _raw: policy)
+    work = tmp_path / "must-not-exist"
+    with pytest.raises(ValidationError):
+        build_system(SYSTEM_ROOT, str(work))
+    assert not work.exists()
+
+
 def test_system_run_keeps_primary_when_exit_notification_scan_also_fails(tmp_path):
     class PrimaryFailure(RuntimeError):
         pass

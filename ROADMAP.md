@@ -30,7 +30,7 @@
   image 与后续 runtime identity 继承已落 `1e57611`，2b.2c reviewed adapter generation 已落 `c0ba5ed`。
   CP11.4c.2b.3a honest deployment preflight 已落 `16d5270`，2b.3b fixed GPU device bridge 已落 `563a496`；
   至此 CP11.4c.2 的代码与 fail-closed 部署合同收口。当前进入 CP11.4c.3 目标 VEPFS 两节点/真实
-  100+ 轮故障注入验收；当前节点无 NVIDIA container runtime，尚未完成正向 GPU canary 或生产验收。
+  数百轮（明确下限 ≥200）故障注入验收；当前节点无 NVIDIA container runtime，尚未完成正向 GPU canary 或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -158,11 +158,16 @@
 
 ### 步⑦（M6）长跑 + 验收剧本
 - 验证方法（§7.1 M6 行 + §7.3/§7.4）：数百轮无人值守不漂移；双模式 A/B 实测定默认；§7.3 机制剧本（happy+失败路径）与 §7.4 研究能力任务（T1/T2）全通。开工前确认 OPEN #4。
-- 状态：**建造面已完成**（2026-07-08；CP7.1–7.5，535 测绿；系统 reasoning-only 真 Codex 全自动跑通）。
-  剩余 = 运维执行（§7.4 T1/T2 真跑、双模式 A/B 实测）+ 一处待用户裁的设计缺口（plan 制品契约→real-Codex
-  attack）。
+- **受控偏离（CP11.4c.3a，2026-07-12）**：reference §4.4.2/§7.1 的 A/B 判据保留为原始权威要求，
+  但 B 从未实现；为了不增加第二套跨阶段会话状态机，实现显式选择 A-only。因此**不声称 A/B 实测已通过**；
+  替代验收 = B 配置在 schema/`System` 双层 fail-closed + A 的逐阶段耐久提交/kill-restart 等价 + ≥200 轮真实长跑。
+- 状态：**建造主链已完成，reference M6 最终验收未完成**（2026-07-08；CP7.1–7.5，535 测绿；
+  系统 reasoning-only 真 Codex 全自动跑通）。
+  剩余 = §7.4 T1/T2 真跑与生产长程验收。2026-07-12 完成性审计确认，原记录的“A/B 双模式实测”
+  不是一个待运维项：B 从未实现，此前配置 B 也只会静默走 A。CP11.4c.3a 将生产契约诚实冻结为 A，
+  不新造第二套跨阶段会话状态机。
 - **建造 / 执行边界（全自动裁量，2026-07-08）**：M6 建造面 = 让系统「完整运行、进入全自动」的机器
-  （自终止安全网 + 真 Codex 装配入口 + 双模式 + §7.3 机制集成验收）；§7.4 T1/T2 是**真算力多日运维执行**
+  （自终止安全网 + 真 Codex 装配入口 + 会话模式 A + §7.3 机制集成验收）；§7.4 T1/T2 是**真算力多日运维执行**
   （数百轮×24h 真 EEG），非本轮建造可完成——建造交付 = 系统可全自动启动 T1/T2 且机制验收过，跑到科学
   结论属运维。理由：§7.4「从头」任务本质是长跑执行，代码就绪后由运维发起。
 - **OPEN #4 裁决（全自动，2026-07-08）**：paper-gap **不引入独立谓词机制**——「论文可写/缺口闭合」已被
@@ -187,8 +192,8 @@
   - [x] CP7.3 全系统装配入口 run.py（goal_brief→DB init→装配真组件+StageProvider(真 Codex)+StopController
     +precheck+publish→run_cycles；一条命令全自动 reasoning-only 闭环）—— commit ce11d00（build_log 0031；
     **真 Codex CLI 冒烟通过**：一轮 bootstrap Codex 建真根问题+cycle done+决策落账+卡发布；只读连接单写
-    边界、DB 权威 goal_body、τ/阻断/exit-2 端到端）。双模式 A/B：reasoning-only 下 A≡B，真 stage-granular
-    分驱随 attack 落 CP7.4。
+    边界、DB 权威 goal_body、τ/阻断/exit-2 端到端）。当时记为“reasoning-only 下 A≡B，真 stage-granular
+    分驱随 attack 落 CP7.4”，但 CP7.4 及后续实际未落 B；CP11.4c.3a 负责消除这个静默假能力。
   - [x] CP7.4 §7.3 机制验收剧本集成测试（主链路对照 I1/I2/I3 因果链 / import 三失败路径 / 日志 suspect→
     gate 消费侧 fail-closed / 人机 §7.3-item4 三向负例）——**mock provider 驱动真组件**端到端串联断言
     —— commit 6be7566（build_log 0032；剧本 3 验消费侧 gate 拒 suspect 证据；I2 绑 run.status、I3 绑
@@ -200,9 +205,8 @@
   StageProvider / CP7.3 run.py 全系统入口[**真 Codex CLI 冒烟跑通 reasoning-only 全自动闭环**] / CP7.4
   §7.3 机制验收[主链路 I1/I2/I3+import 三失败+日志 suspect fail-closed+人机负例] / CP7.5 长跑不漂移+
   可恢复+τ 自停）。**系统「完整运行、进入全自动」达成**（reasoning-only 真 Codex 端到端；535 测绿）。
-  **未落（属运维执行 / 待用户裁 plan 契约）**：§7.4 T1/T2 真跑（真 Codex+真 EEG 数百轮×24h）+ 双模式
-  A/B 实测定默认 + real-Codex attack（judge provider + idea/plan↔schema 校准 + sidecar 桥，须先裁 plan
-  制品契约缺口方向）。这些是**运维执行 + 一处待用户定向的设计裁决**，非本轮建造可完成（见上「设计发现」）。
+  **未落**：§7.4 T1/T2 真跑（真 Codex+真 EEG 数百轮×24h）。real-Codex attack 的制品契约已在后续
+  CP8 检查点落地；A/B 项经 CP11.4c.3a 改为只开放可恢复、可审计的 A，不再冒充尚有 B 可供实测。
 
 - **⚠ 设计发现（2026-07-08，CP7.4 勘查）· plan 制品契约二分 → real-Codex attack 阻塞**：
   冻结 `plan.schema` 的 target 字段（**抽象层**：target_key/spec_md/claim/eval_action/…）与
@@ -294,7 +298,7 @@
 - 遗留（诚实边界，非阻塞交付；README §7 载）：①全局成本安全网休眠（ledger 成本落账未接，真长跑前须接）；
   ②真 git worktree 隔离 + env lock 强校验（canary→硬化）；③**CP8.6b** = eval target（frozen schema
   create_evaluation 缺 variant 引用，需设计）+ import_defer/ImportWorker 装配 + route dependency_wait
-  特化；④§7.4 T1/T2 数百轮真跑 + 双模式 A/B 实测 = 运维执行。
+  特化；④§7.4 T1/T2 数百轮真跑 = 运维执行。原列“A/B 实测”经 CP11.4c.3a 审计收口为生产只支持 A。
 
 ### 步⑨（M8）人类控制台接入——系统在控制台上可查看/可交互
 
@@ -351,7 +355,7 @@
     `SUM(ledger)` 两套 dormant 成本面互不对账。ledger append-only（触发器）→ 累计靠新 INSERT。
 - **设计（自主决定，"遇到问题先自行处理"）**：① runner 解析 stderr token + 计 wallclock → `Artifact.usage`；
   ② `CostLedger` 服务：每次 LLM 调用写 `runner_call`(补全各 phase) + `ledger`(tokens/wallclock/money)；money =
-  tokens/1000 × `budget.price_per_1k_tokens`（notional/provisional，缺省使 cycle≈B_max 量级、session_max 为失控兜底，A/B 细化）；
+  tokens/1000 × `budget.price_per_1k_tokens`（notional/provisional，缺省使 cycle≈B_max 量级、session_max 为失控兜底，目标长跑后细化）；
   ③ status_card `cycle_spent` 改读 `SUM(ledger per cycle)` 统一口径。
 - 验证方法（步级）：真跑（或 mock usage 注入）积累 `ledger.money` → `SUM ≥ session_max` → `budget_exhausted` 干净停
   + durable global_stop 落库（恢复也拒推进）；ledger append-only 不破；测试基线全绿。
@@ -420,7 +424,7 @@
       exactly-once 只指每个 invocation 在本地记账一次，不声称 provider 侧执行或供应商 invoice。→ commit `e236487`
       （build_log 0063；相关验证；外审第 2 轮成立项全修/架构误判留据；唯一全量 1332）。
     - [ ] CP11.4c 敌对隔离与最终长程验收：container/cgroup/VM 或等价强隔离、guardian/receipt 防篡改、跨节点
-      VEPFS owner 验收，并运行 100+ 轮含真实外调/失败注入的 soak（区别于 CP11.3c 控制面 120 轮回归）。
+      VEPFS owner 验收，并运行数百轮（明确下限 ≥200）含真实外调/失败注入的 soak（区别于 CP11.3c 控制面 120 轮回归）。
       - [x] CP11.4c.1 pinned 敌对执行边界：默认生产 manifest/import adapter 只进入 exact image Docker；输入为
         已验证私有只读快照、输出先入 quarantine，network/rootfs/cap/user/PID/resource 请求经 create 后 inspect
         反核；trusted launcher 在 payload env/代码前设置 hard rlimit 并加载 hash-pinned amd64 seccomp BPF。
@@ -470,5 +474,16 @@
               MIG/动态租约。→ commit `563a496`（build_log 0071；相关 427 通过/3 deselected，外审后定向 48 通过；
               真实 negative GPU canary 证明缺 runtime 时拒绝；唯一全量 1494 通过/1 跳过/1 个 Docker archive
               ENOSPC）。当前节点正向 GPU canary 与目标部署验收留给 CP11.4c.3。
-      - [ ] CP11.4c.3 最终实机验收：目标 VEPFS 两节点 owner/lease/fd 行为，100+ 轮含真实 Codex/import/训练、
-        owner-kill/daemon-loss/预算与资源失败注入的 soak，并发布可重放证据包。
+      - [ ] CP11.4c.3 最终生产验收：目标 VEPFS 两节点 owner/lease/fd 行为，≥200 轮含真实 Codex/import/训练、
+        owner-kill/daemon-loss/预算与资源失败注入的 soak，发布可重放证据包，并完成 §7.4 T1/T2 qualification。
+        - [ ] CP11.4c.3a 会话契约诚实化：生产只开放已实现的 A（一 turn 一阶段）；schema/`System` 拒绝
+          未实现 turn 内跨阶段提交的 B，不为可选吞吐模式新造第二套状态机。
+        - [ ] CP11.4c.3b 存储治理：每轮 SQLite online 滚动备份 + views 独立 Git 提交 + immutable/CAS 资产
+          manifest/hash；原始日志分级归档、恢复演练、容量阈值与安全 GC。不每轮复制大 checkpoint/content store。
+        - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
+          - [ ] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 全部 sealed-holdout/one-shot/non-feedback 约束；
+            T1 的 DREAMER 在 A/B/C/HPO/claim 不可见，T2 的 target_y 与 trial/stimulus 身份对 train/HPO 不可见，独立 evaluator 出分。
+          - [ ] CP11.4c.3c.2 目标 VEPFS 两节点 lease/fd/WAL canary + 预声明 fault schedule soak runner。
+          - [ ] CP11.4c.3c.3 canonical evidence packer + 离线 verifier，在干净节点 restore 后至少续跑一轮。
+        - [ ] CP11.4c.3d 目标运行：dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector 就位后，
+          跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。
