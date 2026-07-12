@@ -30,7 +30,9 @@
   image 与后续 runtime identity 继承已落 `1e57611`，2b.2c reviewed adapter generation 已落 `c0ba5ed`。
   CP11.4c.2b.3a honest deployment preflight 已落 `16d5270`，2b.3b fixed GPU device bridge 已落 `563a496`；
   至此 CP11.4c.2 的代码与 fail-closed 部署合同收口。当前进入 CP11.4c.3 目标 VEPFS 两节点/真实
-  数百轮（明确下限 ≥200）故障注入验收；当前节点无 NVIDIA container runtime，尚未完成正向 GPU canary 或生产验收。
+  数百轮（明确下限 ≥200）故障注入验收；3a 会话诚实化及 3b.1/b.2a/b.2b.1/b.2b.2 snapshot、日志镜像与
+  import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。下一检查点进入
+  CP11.4c.3c 薄验收/科学隔离工具；当前节点无 NVIDIA container runtime，尚未完成正向 GPU canary 或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -507,11 +509,15 @@
                 parent claim + instance lease + ready marker fallback，中途退出的部分目标不可启动。
                 → commit `f59c72c`（build_log 0075；相关 70；内部双终审 APPROVE；外审第 1 轮 401、
                 第 2 轮 240 秒无 verdict；全量依用户要求留到最终检查点）。
-              - [ ] CP11.4c.3b.2b.2 import materialization closure：从所选 SQLite backup 根到
+              - [x] CP11.4c.3b.2b.2 import materialization closure：从所选 SQLite backup 根到
                 `state/import-materializations/{indexes,objects}` 可达闭包，并传递绑定 v3
                 dependency-image object；离线盘点/恢复不调 Docker/网络/当前 policy。如仍需
                 staging GC，只删无 DB/manifest/active-session 引用的对象。
-              完成 b.2b.2 前 b.2/b 整体不勾选。
+                → commit `d72da35`（build_log 0076；相关 storage/import/inspector **31 passed** +
+                既有 restore **4 passed**；内部三路终审 APPROVE；外审第 1 轮 401、第 2 轮约 5 分钟/49k tokens
+                无 verdict；全量依用户要求留到最终检查点）。
+              b.2b.2 的 import CAS scope 已完成；execution-log 正本、checkpoint/content store 与完整 work-root DR
+              仍明确不在该 scope，故 b.2b/b.2/b 父项暂不勾选，不虚报完整灾备。
         - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
           - [ ] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 全部 sealed-holdout/one-shot/non-feedback 约束；
             T1 的 DREAMER 在 A/B/C/HPO/claim 不可见，T2 的 target_y 与 trial/stimulus 身份对 train/HPO 不可见，独立 evaluator 出分。
