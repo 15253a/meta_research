@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -41,6 +42,8 @@ from .console_spool import (
 LOCK_NAME = ".orchestrator-instance.lock"
 HEARTBEAT_NAME = "orchestrator_heartbeat.json"
 HEARTBEAT_REF = "state/" + HEARTBEAT_NAME
+RESTORE_IN_PROGRESS_NAME = ".restore-in-progress"
+RESTORE_PARENT_CLAIM_PREFIX = ".restore-in-progress-"
 _LOCK_MAX_BYTES = 16 * 1024
 _HEARTBEAT_MAX_AGE_S = 5.0
 _LOCK_FLAGS = (os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
@@ -63,6 +66,18 @@ _ACTIVE_LEASES_GUARD = threading.Lock()
 _DELEGATED_FENCE_GUARD = threading.RLock()
 _DELEGATED_FENCE_FDS: set = set()
 _INTENDED_FENCE_FD: Optional[int] = None
+
+
+def restore_parent_claim_name(work_root: Union[str, Path]) -> str:
+    root = Path(os.path.abspath(os.fspath(work_root)))
+    return RESTORE_PARENT_CLAIM_PREFIX + hashlib.sha256(os.fsencode(root)).hexdigest()
+
+
+def restore_claim_bytes(token: str) -> bytes:
+    if (not isinstance(token, str) or len(token) != 32
+            or any(ch not in "0123456789abcdef" for ch in token)):
+        raise ValueError("restore claim token 须为 32 位小写 hex")
+    return f"meta-research-restore-parent-claim/v1:{token}\n".encode("ascii")
 
 
 class InstanceLeaseError(RuntimeError):
@@ -198,11 +213,15 @@ class InstanceLease:
 
     @classmethod
     def acquire(cls, work_root: Union[str, Path], *,
-                heartbeat_interval_s: float = 1.0) -> "InstanceLease":
+                heartbeat_interval_s: float = 1.0,
+                restore_claim_token: Optional[str] = None) -> "InstanceLease":
         if (isinstance(heartbeat_interval_s, bool)
                 or not isinstance(heartbeat_interval_s, (int, float))
                 or not 0.02 <= float(heartbeat_interval_s) <= 60.0):
             raise ValueError("heartbeat_interval_s 须在 [0.02,60] 内")
+        expected_restore_claim = (
+            None if restore_claim_token is None
+            else restore_claim_bytes(restore_claim_token))
         # Lexical absolute path preserves the acquired pathname identity across
         # later chdir() without resolving/following a symlink component.
         root = Path(os.path.abspath(os.fspath(work_root)))
@@ -278,6 +297,44 @@ class InstanceLease:
             lock_info = _verify_entry_matches_fd(
                 work_fd, LOCK_NAME, lock_fd,
                 label="orchestrator instance lock", regular=True)
+            try:
+                os.stat(
+                    RESTORE_IN_PROGRESS_NAME, dir_fd=work_fd,
+                    follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise InstanceLeaseError(
+                    "work_root 存在未完成离线 restore；拒绝启动并保留现场")
+            parent_fd = open_directory_path(
+                root.parent, label="orchestrator work_root parent")
+            claim_fd = -1
+            try:
+                claim_name = restore_parent_claim_name(root)
+                try:
+                    claim_fd = os.open(claim_name, _READ_FLAGS, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    if expected_restore_claim is not None:
+                        raise InstanceLeaseError("restore parent claim 缺失")
+                else:
+                    claim_info = _verify_entry_matches_fd(
+                        parent_fd, claim_name, claim_fd,
+                        label="restore parent claim", regular=True)
+                    raw = _read_fd_bounded(claim_fd)
+                    if (claim_info.st_uid != os.geteuid()
+                            or claim_info.st_nlink != 1
+                            or stat.S_IMODE(claim_info.st_mode) != 0o400):
+                        raise InstanceLeaseError("restore parent claim 身份非法")
+                    if expected_restore_claim is None:
+                        raise InstanceLeaseError(
+                            "work_root 存在未完成离线 restore parent claim；"
+                            "拒绝启动并保留现场")
+                    if raw != expected_restore_claim:
+                        raise InstanceLeaseError("restore parent claim token 不匹配")
+            finally:
+                if claim_fd >= 0:
+                    os.close(claim_fd)
+                os.close(parent_fd)
             # Invalidate the previous generation immediately after claiming
             # flock.  Until the new owner metadata and heartbeat are both
             # published, observers must degrade to invalid—not report a fresh

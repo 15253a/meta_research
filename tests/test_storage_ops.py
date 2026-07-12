@@ -1,6 +1,8 @@
-"""CP11.4c.3b.2a · offline snapshot verify/restore/retention/GC 与容量门。"""
+"""CP11.4c.3b.2a/b.1 · offline snapshot ops 与 registered-log mirror。"""
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,10 +12,21 @@ from types import SimpleNamespace
 
 import pytest
 
+import conftest
 from orchestrator import database as db
-from orchestrator.instance_lease import InstanceBusyError, InstanceLease
+from orchestrator.instance_lease import (
+    HEARTBEAT_REF,
+    LOCK_NAME,
+    RESTORE_IN_PROGRESS_NAME,
+    InstanceBusyError,
+    InstanceLease,
+    InstanceLeaseError,
+    restore_parent_claim_name,
+)
 import orchestrator.storage_governance as storage_module
 import orchestrator.storage_ops as storage_ops_module
+import orchestrator.storage_assets as storage_assets_module
+from orchestrator.storage_assets import RegisteredAssetArchive, StorageAssetError
 from orchestrator.storage_governance import (
     CycleSnapshotPublisher,
     StorageGovernanceError,
@@ -42,6 +55,33 @@ def _new_chain(work: Path, count: int = 5):
         writer.commit()
         assert publisher.reconcile() == [f"c{cycle_id}"]
     return path, writer, publisher
+
+
+def _new_log_chain(work: Path, payload: bytes = b"raw\x00log\xff\n"):
+    work.mkdir(mode=0o700)
+    path = work / "research.sqlite"
+    writer = db.connect(path)
+    conftest.seed_minimal(writer)
+    logs = work / "registered-logs"
+    logs.mkdir(mode=0o700)
+    first = logs / "train.bin"
+    second = logs / "eval.bin"
+    first.write_bytes(payload)
+    second.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    writer.execute(
+        "INSERT INTO execution_log(id,run_id,cycle_id,log_kind,ref,content_hash,bytes) "
+        "VALUES (1,1,1,'train',?,?,?)", (str(first), digest, len(payload)))
+    writer.execute(
+        "INSERT INTO execution_log(id,evaluation_attempt_id,cycle_id,log_kind,ref,content_hash,bytes) "
+        "VALUES (2,1,1,'eval',?,?,?)",
+        (second.relative_to(work).as_posix(), "sha256:" + digest, len(payload)))
+    writer.execute(
+        "UPDATE cycle SET status='done',finished_at='2026-07-12T00:00:00Z' WHERE id=1")
+    writer.commit()
+    publisher = CycleSnapshotPublisher(db_path=path, work_root=work)
+    assert publisher.reconcile(startup=True) == ["c1"]
+    return path, writer, publisher, (first, second), payload
 
 
 def _backup_files(publisher: CycleSnapshotPublisher):
@@ -151,7 +191,10 @@ def test_restore_selected_generation_to_new_atomic_workroot(tmp_path, monkeypatc
         receipt = archive.restore(target=target, cycle="c4")
         assert receipt["scope"] == "sqlite_truth_only"
         assert receipt["continuation_mode"] == "legacy_adoption_on_first_start"
-        assert set(path.name for path in target.iterdir()) == {"research.sqlite", "restore.json"}
+        names = {path.name for path in target.iterdir()}
+        assert {"research.sqlite", "restore.json"} <= names
+        assert names <= {"research.sqlite", "restore.json", LOCK_NAME, "state"}
+        assert not (target / RESTORE_IN_PROGRESS_NAME).exists()
         restored = sqlite3.connect(f"file:{target / 'research.sqlite'}?mode=ro", uri=True)
         try:
             assert restored.execute("PRAGMA quick_check").fetchone() == ("ok",)
@@ -181,6 +224,89 @@ def test_restore_selected_generation_to_new_atomic_workroot(tmp_path, monkeypatc
         with pytest.raises(StorageOperationError, match="并发创建"):
             archive.restore(target=raced, cycle="c5")
         assert raced.is_dir() and not any(raced.iterdir())
+
+
+def test_restore_lease_fenced_fallback_is_ready_and_reacquirable(
+        tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher = _new_chain(work, 3)
+    writer.close()
+    target = tmp_path / "fallback-restored"
+    monkeypatch.setattr(
+        storage_ops_module, "_try_rename_noreplace",
+        lambda _source, _destination: False)
+
+    with _archive(work) as archive:
+        receipt = archive.restore(target=target)
+    assert receipt["publication_contract"] == (
+        "atomic_noreplace_or_lease_fenced_ready")
+    assert not (target / RESTORE_IN_PROGRESS_NAME).exists()
+    assert (target / "research.sqlite").is_file()
+    assert (target / "restore.json").is_file()
+    assert (target / LOCK_NAME).is_file()
+    assert (target / HEARTBEAT_REF).is_file()
+    assert not (target.parent / restore_parent_claim_name(target)).exists()
+    lease = InstanceLease.acquire(target, heartbeat_interval_s=0.02)
+    assert lease.close() is None
+
+
+def test_restore_parent_claim_blocks_before_inner_marker_is_durable(
+        tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher = _new_chain(work, 3)
+    writer.close()
+    target = tmp_path / "early-partial-restored"
+    monkeypatch.setattr(
+        storage_ops_module, "_try_rename_noreplace",
+        lambda _source, _destination: False)
+    real_atomic_write = storage_ops_module.sg._atomic_write
+
+    def fail_inner_marker(path, raw, *, mode=0o600):
+        if Path(path).name == RESTORE_IN_PROGRESS_NAME:
+            raise RuntimeError("kill before inner marker")
+        return real_atomic_write(path, raw, mode=mode)
+
+    monkeypatch.setattr(storage_ops_module.sg, "_atomic_write", fail_inner_marker)
+    with _archive(work) as archive:
+        with pytest.raises(RuntimeError, match="before inner marker"):
+            archive.restore(target=target)
+    claim = target.parent / restore_parent_claim_name(target)
+    assert target.is_dir() and claim.is_file()
+    assert not (target / RESTORE_IN_PROGRESS_NAME).exists()
+    monkeypatch.setattr(storage_ops_module.sg, "_atomic_write", real_atomic_write)
+    with pytest.raises(InstanceLeaseError, match="token 不匹配"):
+        InstanceLease.acquire(
+            target, heartbeat_interval_s=0.02,
+            restore_claim_token="0" * 32)
+    with pytest.raises(InstanceLeaseError, match="parent claim"):
+        InstanceLease.acquire(target, heartbeat_interval_s=0.02)
+
+
+def test_restore_fallback_crash_marker_blocks_partial_target_start(
+        tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher = _new_chain(work, 3)
+    writer.close()
+    target = tmp_path / "partial-restored"
+    monkeypatch.setattr(
+        storage_ops_module, "_try_rename_noreplace",
+        lambda _source, _destination: False)
+    real_rename = os.rename
+
+    def fail_before_receipt(source, destination):
+        if Path(source).name == "restore.json":
+            raise RuntimeError("kill during fallback publish")
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(storage_ops_module.os, "rename", fail_before_receipt)
+    with _archive(work) as archive:
+        with pytest.raises(RuntimeError, match="fallback publish"):
+            archive.restore(target=target)
+    assert (target / "research.sqlite").is_file()
+    assert (target / RESTORE_IN_PROGRESS_NAME).is_file()
+    assert (target.parent / restore_parent_claim_name(target)).is_file()
+    with pytest.raises(InstanceLeaseError, match="未完成离线 restore"):
+        InstanceLease.acquire(target, heartbeat_interval_s=0.02)
 
 
 def test_gc_dry_run_writes_nothing_then_apply_keeps_last_three(tmp_path):
@@ -414,3 +540,285 @@ def test_cli_refuses_missing_source_and_active_owner(tmp_path):
             main(["--work-root", str(work), "verify"])
     finally:
         assert lease.close() is None
+
+
+@pytest.mark.parametrize("payload", [b"raw\x00log\xff\n", b""])
+def test_registered_log_mirrors_are_deterministic_and_keep_originals(
+        tmp_path, payload):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher, originals, payload = _new_log_chain(
+        work, payload=payload)
+    writer.close()
+    before = [(path.lstat().st_mode, path.lstat().st_size, path.lstat().st_mtime_ns,
+               path.lstat().st_ctime_ns) for path in originals]
+
+    with _archive(work) as archive:
+        assets = RegisteredAssetArchive(archive)
+        result = assets.mirror_logs()
+        assert result["scope"] == "db_registered_execution_logs_only"
+        assert result["published"] == [1, 2]
+        objects = list(assets.objects.glob("*.gz"))
+        assert len(objects) == 1                 # 相同 raw bytes → 相同确定性 CAS
+        assert objects[0].read_bytes()[:10] == bytes.fromhex(
+            "1f8b08000000000002ff")
+        assert gzip.decompress(objects[0].read_bytes()) == payload
+        assert assets.verify_log_mirrors()["mirrors_verified"] == 2
+        replay = assets.mirror_logs()
+        assert replay["published"] == [] and replay["reused"] == [1, 2]
+
+    after = [(path.lstat().st_mode, path.lstat().st_size, path.lstat().st_mtime_ns,
+              path.lstat().st_ctime_ns) for path in originals]
+    assert after == before                         # 不移动、不 chmod、不改 mtime/ctime
+
+
+@pytest.mark.parametrize("drift", ["content", "missing", "symlink", "hardlink"])
+def test_registered_log_mirror_rejects_original_identity_drift(tmp_path, drift):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher, originals, payload = _new_log_chain(work)
+    writer.close()
+    first, second = originals
+    if drift == "content":
+        first.write_bytes(b"X" + payload[1:])
+    elif drift == "missing":
+        first.unlink()
+    elif drift == "symlink":
+        second.unlink()
+        second.symlink_to(first)
+    else:
+        second.unlink()
+        os.link(first, second)
+
+    with _archive(work) as archive:
+        with pytest.raises(StorageAssetError, match="original"):
+            RegisteredAssetArchive(archive).mirror_logs()
+
+
+def test_registered_log_mirror_requires_complete_db_identity(tmp_path):
+    work = tmp_path / "work"
+    db_path, writer, _publisher, _originals, _payload = _new_log_chain(work)
+    writer.close()
+    # Build a fresh immutable snapshot whose append-only row was born incomplete.
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    broken_db = broken / "research.sqlite"
+    conn = db.connect(broken_db)
+    conftest.seed_minimal(conn)
+    source = broken / "log.bin"
+    source.write_bytes(b"x")
+    conn.execute(
+        "INSERT INTO execution_log(id,run_id,cycle_id,log_kind,ref,content_hash,bytes) "
+        "VALUES (1,1,1,'train',?,'not-a-hash',NULL)", (str(source),))
+    conn.execute("UPDATE cycle SET status='done' WHERE id=1")
+    conn.commit()
+    publisher = CycleSnapshotPublisher(db_path=broken_db, work_root=broken)
+    assert publisher.reconcile(startup=True) == ["c1"]
+    conn.close()
+
+    with _archive(broken) as archive:
+        with pytest.raises(StorageAssetError, match="身份/bytes|SHA256"):
+            RegisteredAssetArchive(archive).mirror_logs()
+    assert db_path.exists()                         # unrelated valid source untouched
+
+
+def test_registered_log_enumeration_rechecks_exact_snapshot_query_fd(
+        tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    _db_path, writer, publisher = _new_chain(work, count=2)
+    writer.close()
+    with _archive(work) as archive:
+        assets = RegisteredAssetArchive(archive)
+        latest = assets._latest
+
+        def replace_after_chain_verification():
+            snapshot, backup, expected = latest()
+            older = next(
+                path for path in publisher.backups.glob("*.sqlite") if path != backup)
+            replacement = backup.with_name("replacement.sqlite")
+            replacement.write_bytes(older.read_bytes())
+            os.replace(replacement, backup)
+            return snapshot, backup, expected
+
+        monkeypatch.setattr(assets, "_latest", replace_after_chain_verification)
+        with pytest.raises(StorageAssetError, match="query fd.*manifest backup"):
+            assets.mirror_logs()
+
+
+def test_log_mirror_object_before_index_replays_and_cleans_index_temp(
+        tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher, _originals, _payload = _new_log_chain(work)
+    writer.close()
+    with _archive(work) as archive:
+        assets = RegisteredAssetArchive(archive)
+        publish_once = storage_assets_module.sg._publish_once
+
+        def fail_index(_path, _raw):
+            raise RuntimeError("kill before mirror index")
+
+        monkeypatch.setattr(storage_assets_module.sg, "_publish_once", fail_index)
+        with pytest.raises(RuntimeError, match="before mirror index"):
+            assets.mirror_logs()
+        assert len(list(assets.objects.glob("*.gz"))) == 1
+        assert list(assets.indexes.glob("execution-log-*.json")) == []
+        stale = assets.indexes / f".execution-log-1.json.tmp-{'a' * 32}"
+        stale.write_bytes(b"unpublished")
+
+        monkeypatch.setattr(storage_assets_module.sg, "_publish_once", publish_once)
+        result = assets.mirror_logs()
+        assert result["published"] == [1, 2]
+        assert not stale.exists()
+        assert assets.verify_log_mirrors()["orphan_mirror_objects"] == []
+
+
+def test_log_mirror_replay_closes_object_rename_fsync_window(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher, _originals, _payload = _new_log_chain(work)
+    writer.close()
+    with _archive(work) as archive:
+        assets = RegisteredAssetArchive(archive)
+        real_sync = storage_assets_module.sg._sync_dir
+        failed = False
+
+        def fail_after_object_rename(path):
+            nonlocal failed
+            if path == assets.objects and not failed:
+                failed = True
+                raise RuntimeError("kill before object parent fsync")
+            return real_sync(path)
+
+        monkeypatch.setattr(storage_assets_module.sg, "_sync_dir", fail_after_object_rename)
+        with pytest.raises(RuntimeError, match="object parent fsync"):
+            assets.mirror_logs()
+        assert len(list(assets.objects.glob("*.gz"))) == 1
+        assert list(assets.indexes.glob("execution-log-*.json")) == []
+
+        synced = []
+
+        def record_sync(path):
+            synced.append(path)
+            return real_sync(path)
+
+        real_publish = storage_assets_module.sg._publish_once
+
+        def require_durable_object(path, raw):
+            assert assets.objects in synced
+            return real_publish(path, raw)
+
+        monkeypatch.setattr(storage_assets_module.sg, "_sync_dir", record_sync)
+        monkeypatch.setattr(storage_assets_module.sg, "_publish_once", require_durable_object)
+        assert assets.mirror_logs()["published"] == [1, 2]
+
+
+def test_log_mirror_replay_closes_index_rename_fsync_window(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher, _originals, _payload = _new_log_chain(work)
+    writer.close()
+    with _archive(work) as archive:
+        assets = RegisteredAssetArchive(archive)
+        real_sync = storage_assets_module.sg._sync_dir
+        failed = False
+
+        def fail_after_index_rename(path):
+            nonlocal failed
+            if path == assets.indexes and not failed:
+                failed = True
+                raise RuntimeError("kill before index parent fsync")
+            return real_sync(path)
+
+        monkeypatch.setattr(storage_assets_module.sg, "_sync_dir", fail_after_index_rename)
+        with pytest.raises(RuntimeError, match="index parent fsync"):
+            assets.mirror_logs()
+        assert (assets.indexes / "execution-log-1.json").exists()
+
+        synced = []
+
+        def record_sync(path):
+            synced.append(path)
+            return real_sync(path)
+
+        real_compress = assets._compress
+
+        def require_durable_index(log, temporary):
+            assert assets.indexes in synced
+            return real_compress(log, temporary)
+
+        monkeypatch.setattr(storage_assets_module.sg, "_sync_dir", record_sync)
+        monkeypatch.setattr(assets, "_compress", require_durable_index)
+        result = assets.mirror_logs()
+        assert result["reused"] == [1] and result["published"] == [2]
+
+
+def test_log_mirror_capacity_and_mirror_tamper_fail_closed(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher, _originals, _payload = _new_log_chain(work)
+    writer.close()
+    with _archive(work) as archive:
+        assets = RegisteredAssetArchive(archive)
+        real_statvfs = storage_assets_module.os.statvfs
+        monkeypatch.setattr(
+            storage_assets_module.os, "statvfs",
+            lambda _path: SimpleNamespace(f_bavail=0, f_frsize=4096, f_favail=1000))
+        with pytest.raises(StorageAssetError, match="容量门拒绝"):
+            assets.mirror_logs()
+        assert list(assets.objects.glob("*.gz")) == []
+        assert list(assets.indexes.glob("*.json")) == []
+
+        monkeypatch.setattr(storage_assets_module.os, "statvfs", real_statvfs)
+        assets.mirror_logs()
+        mirror = next(assets.objects.glob("*.gz"))
+        mirror.chmod(0o600)
+        mirror.write_bytes(mirror.read_bytes() + b"trailing")
+        with pytest.raises(StorageAssetError, match="mirror|CAS"):
+            assets.verify_log_mirrors()
+
+
+def test_log_mirror_rejects_correlated_second_gzip_member(tmp_path):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher, _originals, _payload = _new_log_chain(work)
+    writer.close()
+    with _archive(work) as archive:
+        assets = RegisteredAssetArchive(archive)
+        assets.mirror_logs()
+        original = next(assets.objects.glob("*.gz"))
+        raw = original.read_bytes() + gzip.compress(b"second-member", mtime=0)
+        digest = hashlib.sha256(raw).hexdigest()
+        correlated = assets.objects / f"{digest}.gz"
+        correlated.write_bytes(raw)
+        correlated.chmod(0o400)
+        index_path = assets.indexes / "execution-log-1.json"
+        index = json.loads(index_path.read_text())
+        index["mirror"].update({
+            "path": f"state/storage/log-mirrors/objects/sha256/{digest}.gz",
+            "sha256": digest,
+            "bytes": len(raw),
+        })
+        index_path.chmod(0o600)
+        index_path.write_bytes(storage_module._canonical(index))
+        index_path.chmod(0o400)
+
+        with pytest.raises(StorageAssetError, match="多 member|尾随"):
+            assets.verify_log_mirrors()
+
+
+def test_zero_registered_logs_still_reject_corrupt_existing_layout(tmp_path):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher = _new_chain(work, count=1)
+    writer.close()
+    with _archive(work) as archive:
+        assets = RegisteredAssetArchive(archive)
+        assets._ensure_layout()
+        (assets.indexes / "foreign.json").write_text("{}")
+        with pytest.raises(StorageAssetError, match="非法条目"):
+            assets.mirror_logs()
+
+
+def test_log_mirror_cli_uses_offline_lease(tmp_path, capsys):
+    work = tmp_path / "work"
+    _db_path, writer, _publisher, _originals, _payload = _new_log_chain(work)
+    writer.close()
+    assert main(["--work-root", str(work), "mirror-logs"]) == 0
+    mirrored = json.loads(capsys.readouterr().out)
+    assert mirrored["published"] == [1, 2]
+    assert main(["--work-root", str(work), "verify-log-mirrors"]) == 0
+    verified = json.loads(capsys.readouterr().out)
+    assert verified["mirrors_verified"] == 2

@@ -20,7 +20,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from .instance_lease import InstanceLease
+from .instance_lease import (
+    RESTORE_IN_PROGRESS_NAME,
+    InstanceLease,
+    restore_claim_bytes,
+    restore_parent_claim_name,
+)
 from . import storage_governance as sg
 
 
@@ -110,12 +115,12 @@ def _copy_regular(source: Path, destination: Path, *, mode: int,
         os.close(source_fd)
 
 
-def _rename_noreplace(source: Path, destination: Path) -> None:
-    """Linux atomic directory publish that cannot clobber a concurrently created target."""
+def _try_rename_noreplace(source: Path, destination: Path) -> bool:
+    """Return false only when this filesystem lacks renameat2 flag support."""
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
-        raise StorageOperationError("当前 Linux libc 不支持 renameat2 no-replace")
+        return False
     renameat2.argtypes = [
         ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
         ctypes.c_uint,
@@ -123,11 +128,87 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
     renameat2.restype = ctypes.c_int
     if renameat2(
             -100, os.fsencode(source), -100, os.fsencode(destination), 1) == 0:
-        return
+        return True
     error_number = ctypes.get_errno()
     if error_number == errno.EEXIST:
         raise StorageOperationError("restore target 在发布前被并发创建")
+    if error_number in {
+            errno.EINVAL, errno.ENOSYS, errno.ENOTSUP,
+            getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+        return False
     raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
+
+
+def _publish_lease_fenced_directory(source: Path, destination: Path) -> None:
+    """VEPFS fallback: exclusive name claim + target lease + durable ready marker."""
+    token = uuid.uuid4().hex
+    claim = destination.parent / restore_parent_claim_name(destination)
+    claim_raw = restore_claim_bytes(token)
+    try:
+        claim_fd = os.open(
+            claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o400)
+    except FileExistsError as error:
+        raise StorageOperationError(
+            "restore target 存在未完成 parent claim；拒绝覆盖") from error
+    try:
+        offset = 0
+        while offset < len(claim_raw):
+            offset += os.write(claim_fd, claim_raw[offset:])
+        os.fchmod(claim_fd, 0o400)
+        os.fsync(claim_fd)
+    finally:
+        os.close(claim_fd)
+    sg._sync_dir(destination.parent)
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise StorageOperationError(
+            "restore target 在发布前被并发创建") from error
+    sg._sync_dir(destination.parent)
+    marker = destination / RESTORE_IN_PROGRESS_NAME
+    lease = InstanceLease.acquire(destination, restore_claim_token=token)
+    primary_error: Optional[BaseException] = None
+    try:
+        lease.assert_owned()
+        sg._atomic_write(
+            marker, b"meta-research-restore-in-progress/v1\n", mode=0o400)
+        sg._sync_dir(destination)
+        for name in ("research.sqlite", "restore.json"):
+            target = destination / name
+            if os.path.lexists(target):
+                raise StorageOperationError(f"restore fallback 目标条目已存在: {name}")
+            lease.assert_owned()
+            os.rename(source / name, target)
+            sg._sync_dir(source)
+            sg._sync_dir(destination)
+        lease.assert_owned()
+        claim.unlink()
+        sg._sync_dir(destination.parent)
+        lease.assert_owned()
+        marker.unlink()
+        sg._sync_dir(destination)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        close_error = lease.close()
+        if close_error is not None:
+            if primary_error is None:
+                raise close_error
+            add_note = getattr(primary_error, "add_note", None)
+            if callable(add_note):
+                add_note(
+                    "restore target lease close 失败；flock 保留供重试: "
+                    f"{type(close_error).__name__}: {close_error}")
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Publish without clobber; use a fail-closed lease fence when flags are absent."""
+    if _try_rename_noreplace(source, destination):
+        return
+    _publish_lease_fenced_directory(source, destination)
 
 
 class SnapshotArchive:
@@ -525,6 +606,7 @@ class SnapshotArchive:
                 "schema": RESTORE_SCHEMA,
                 "scope": "sqlite_truth_only",
                 "continuation_mode": "legacy_adoption_on_first_start",
+                "publication_contract": "atomic_noreplace_or_lease_fenced_ready",
                 "source_work_root": str(self.work_root),
                 "source_cycle": f"c{selected}",
                 "source_manifest_sha256": manifest["manifest_sha256"],
@@ -726,6 +808,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply = sub.add_parser("gc-apply")
     apply.add_argument("--plan-file", required=True)
     apply.add_argument("--expect-sha256", required=True)
+    sub.add_parser("mirror-logs")
+    sub.add_parser("verify-log-mirrors")
     args = parser.parse_args(argv)
     work_root = Path(os.path.abspath(args.work_root))
 
@@ -739,7 +823,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif args.command == "gc-plan":
         result = _run_with_lease(
             work_root, lambda archive: archive.plan_gc(retain=args.retain))
-    else:
+    elif args.command == "gc-apply":
         plan_path = Path(args.plan_file)
         wrapper = sg._parse_json(sg._read(plan_path), plan_path)
         if (set(wrapper) != {"plan", "plan_sha256"}
@@ -749,6 +833,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = _run_with_lease(
             work_root, lambda archive: archive.apply_gc(
                 plan=wrapper["plan"], expected_sha256=args.expect_sha256))
+    else:
+        from .storage_assets import RegisteredAssetArchive
+        operation = (
+            (lambda archive: RegisteredAssetArchive(archive).mirror_logs())
+            if args.command == "mirror-logs" else
+            (lambda archive: RegisteredAssetArchive(archive).verify_log_mirrors()))
+        result = _run_with_lease(work_root, operation)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return 0
 
