@@ -33,9 +33,10 @@
   数百轮（明确下限 ≥200）故障注入验收；3a 会话诚实化及 3b.1/b.2a/b.2b.1/b.2b.2 snapshot、日志镜像与
   import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。CP11.4c.3c.1
   real SEED/DREAMER sealed-holdout、one-shot final 与独立 scorer 已落 `2a98e4b`；CP11.4c.3c.2a
-  本地 WAL / GPFS rollback、旧 WAL 预读前迁移与 console 准入已落 `75f8009`。下一检查点进入
-  CP11.4c.3c.2b 目标 VEPFS 两节点 lease/fd/journal canary 与预声明 fault soak。当前节点无 NVIDIA container runtime，
-  尚未完成正向 GPU canary 或生产验收。
+  本地 WAL / GPFS rollback、旧 WAL 预读前迁移与 console 准入已落 `75f8009`；2b.1 五阶段 shared-fs
+  canary 与 2b.2 fixed-linear fault sidecar 已落 `fb65955`/`aa03a01`，CP11.4c.3c.2 工具闭合。下一检查点进入
+  CP11.4c.3c.3 canonical evidence packer/offline verifier。当前节点无 NVIDIA container runtime，尚未完成
+  两节点正向、GPU、真实 ≥200 轮或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -526,20 +527,23 @@
             T1 的 DREAMER 在 A/B/C/HPO/claim 不可见；T2 的全部 final folds 在 final 前不可见、final 每 unit 只挂
             一个 X-only fold；独立 root evaluator 从 sealed truth 出分。→ commit `2a98e4b`（build_log 0077；
             qualification/deployment 相关 132 + affected 13、sandbox/entry 164、真实 SEED/DREAMER；全量留最终检查点）。
-          - [ ] CP11.4c.3c.2 目标 VEPFS 两节点 lease/fd/journal canary + 预声明 fault schedule soak runner。
+          - [x] CP11.4c.3c.2 目标 VEPFS 两节点 lease/fd/journal canary + 预声明 fault schedule soak runner。
             - [x] CP11.4c.3c.2a SQLite storage boundary：已知本地盘用 WAL，GPFS/未知盘用
               `DELETE` + `synchronous=FULL`；旧 WAL 在任何 schema/data 读前以 EXCLUSIVE 唯一 owner 迁移；
               共享盘 console 仅作本 boot active-owner/offline 准入，不冒充 partition fence。
               → commit `75f8009`（build_log 0078；database 20 + runtime 134 + final targeted 65；全量留最终）。
-            - [ ] CP11.4c.3c.2b 薄的一次性两节点 canary + 预声明 fault schedule runner；复用
+            - [x] CP11.4c.3c.2b 薄的一次性两节点 canary + 预声明 fault schedule runner；复用
               InstanceLease/guardian/storage ops，不新增 daemon、DB、scheduler 或分布式状态机。
               - [x] CP11.4c.3c.2b.1 fixed five-phase shared-fs canary：同一协议支持 honest local prerequisite
                 与 operator-launched two-node role；exact SIGKILL/reap、post-kill guardian Busy、真 hot rollback、
                 FD rename/path-binding 和 cleanup terminal receipt 全闭合，local scope 不可升级；始终不冒充
                 infrastructure STONITH。→ commit `fb65955`（build_log 0079；canary 17 + related 85 + real
                 local WAL；当前仅单节点，two-node 正向与全量留最终）。
-              - [ ] CP11.4c.3c.2b.2 固定线性 canonical fault schedule runner；只支持预声明故障动作，
-                不引入 DAG/plugin/arbitrary shell/常驻进程。
+              - [x] CP11.4c.3c.2b.2 固定线性 canonical fault schedule runner；只以全历史唯一
+                execution receipt 触发 owner/payload pidfd SIGKILL，spent gap 不重放、applied gap 只观察，
+                严核 authority/aftermath/线性 evidence；不引入 DAG/plugin/arbitrary shell/常驻进程。
+                → commit `aa03a01`（build_log 0080；fault 16 + related 86；内部双终审无 BLOCKER/Major；
+                外审两轮均 401 无 verdict；全量留最终检查点）。
           - [ ] CP11.4c.3c.3 canonical evidence packer + 离线 verifier，在干净节点 restore 后至少续跑一轮。
         - [ ] CP11.4c.3d 目标运行：dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector 就位后，
           跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。
