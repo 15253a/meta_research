@@ -17,7 +17,10 @@ import pytest
 import yaml
 
 from orchestrator import manifest as MF
-from orchestrator.execution_sandbox import sandbox_environment_hash
+from orchestrator.execution_sandbox import (
+    sandbox_environment_hash,
+    sandbox_workload_environment_hash,
+)
 from orchestrator.schemas import SchemaSet
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
@@ -37,11 +40,14 @@ def _slice(**over):
 
 
 def _manifest(sl, **over):
+    gpu_required = over.get("gpu_required", sl.get("gpu_required", False))
     m = {"manifest_version": 1,
          "target_ref": {"target_key": sl["target_key"], "target_kind": sl["target_kind"],
                         "seq": sl["seq"], "plan_slice_hash": MF.canon_hash(sl)},
          "protocol_ref": {"protocol_id": sl["protocol_id"], "protocol_ver": sl["protocol_ver"]},
-         "env_hash": RUNTIME_ENV_HASH, "config_json": {"lr": 0.1},
+         "env_hash": sandbox_workload_environment_hash(
+             RUNTIME_ENV_HASH, gpu_required),
+         "gpu_required": gpu_required, "config_json": {"lr": 0.1},
          "code_files": ["train.py", "eval.py"],
          "commands": {"smoke": {"argv": ["python", "{src}/train.py", "--smoke"]},
                       "train": {"argv": ["python", "{src}/train.py"], "timeout_s": 60},
@@ -57,6 +63,58 @@ def test_valid_build_manifest_passes():
     MF.validate_manifest(SCHEMAS, _manifest(_slice()))
 
 
+def test_legacy_manifest_without_gpu_required_remains_cpu_compatible():
+    plan_slice = _slice()
+    manifest = _manifest(plan_slice)
+    manifest.pop("gpu_required")
+    MF.validate_manifest(SCHEMAS, manifest)
+    MF.cross_check(manifest, plan_slice)
+    assert manifest["env_hash"] == RUNTIME_ENV_HASH
+
+
+def test_gpu_required_is_explicit_workload_request_not_host_inventory(tmp_path):
+    class _Sandbox:
+        environment_hash = RUNTIME_ENV_HASH
+
+    gpu_manifest = _manifest(_slice(), gpu_required=True)
+    MF.validate_manifest(SCHEMAS, gpu_manifest)
+    raw_runtime_claim = {**gpu_manifest, "env_hash": RUNTIME_ENV_HASH}
+    with pytest.raises(MF.ManifestError, match="CPU/GPU workload sandbox identity"):
+        MF.run_manifest_command(
+            raw_runtime_claim, "smoke", staging_dir=str(tmp_path / "raw"),
+            log_name="smoke.log", src_dir=tmp_path / "src",
+            work_root=tmp_path, policy=POLICY,
+            execution_sandbox=_Sandbox())
+    policy = json.loads(json.dumps(POLICY))
+    policy["resources"].update({"gpus": 0, "gpu_mem_gb": 0})
+    with pytest.raises(MF.ManifestError, match="manifest 要求 GPU"):
+        MF.run_manifest_command(
+            gpu_manifest, "smoke", staging_dir=str(tmp_path / "run"),
+            log_name="smoke.log", src_dir=tmp_path / "src",
+            work_root=tmp_path, policy=policy,
+            execution_sandbox=_Sandbox())
+    with pytest.raises(MF.ManifestError, match="启动 canary 未证明"):
+        MF.run_manifest_command(
+            gpu_manifest, "smoke", staging_dir=str(tmp_path / "run"),
+            log_name="smoke.log", src_dir=tmp_path / "src",
+            work_root=tmp_path, policy=POLICY,
+            execution_sandbox=_Sandbox())
+
+
+def test_cross_check_rejects_gpu_access_mode_drift_from_plan():
+    planned = _slice(gpu_required=True)
+    manifest = _manifest(planned)
+    MF.cross_check(manifest, planned)
+    manifest["gpu_required"] = False
+    with pytest.raises(MF.ManifestError, match="GPU access mode"):
+        MF.cross_check(manifest, planned)
+    planned_cpu = _slice()
+    manifest = _manifest(planned_cpu)
+    manifest["gpu_required"] = True
+    with pytest.raises(MF.ManifestError, match="GPU access mode"):
+        MF.cross_check(manifest, planned_cpu)
+
+
 def test_policy_yaml_conforms_schema():
     """policy.yaml ↔ policy.schema.json 同步（execution 节随本检查点新增，两侧须一致）。"""
     SCHEMAS.validator("policy").validate(POLICY)
@@ -69,7 +127,7 @@ def test_production_sandbox_rejects_manifest_environment_claim_drift(tmp_path):
 
     manifest = _manifest(_slice())
     assert manifest["env_hash"] != _Sandbox.environment_hash
-    with pytest.raises(MF.ManifestError, match="pinned sandbox runtime"):
+    with pytest.raises(MF.ManifestError, match="CPU/GPU workload sandbox identity"):
         MF.run_manifest_command(
             manifest, "smoke", staging_dir=str(tmp_path / "run"),
             log_name="smoke.log", src_dir=tmp_path / "src",

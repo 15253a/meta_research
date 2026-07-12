@@ -1,6 +1,6 @@
 """execution_manifest —— bundle 编译产物的机器执行契约：校验/交叉核/物化/围栏/执行（步⑧ CP8.1）。
 
-**分层定位**（设计记录见 ROADMAP 步⑧）：plan 保持抽象（冻结 plan.schema，命令永不入 plan）；
+**分层定位**（设计记录见 ROADMAP 步⑧）：plan 保持抽象（含 CPU/GPU 资源意图，命令永不入 plan）；
 bundle 阶段 Codex 产「代码文件 + identity.md + execution_manifest.json」；本模块是该契约的**唯一执法点**：
 - `validate_manifest`：schema 校验（结构合法）；
 - `cross_check`：manifest ↔ resolved plan 切片交叉核（防「新 plan 旁路」——manifest 不能自立目标/协议）；
@@ -10,12 +10,13 @@ bundle 阶段 Codex 产「代码文件 + identity.md + execution_manifest.json�
 **resolved plan 切片契约**（attack_stages 在 plan 阶段落进 build_target.plan_ref 的 JSON；两侧共同依赖，
 字段名以此为准）：= 冻结 plan.schema 的 target 对象 **原样** + 编排器机械派生的绑定四件
 `protocol_id`(int)/`protocol_ver`(int)/`eval_key`(str)/`target_set_hash`(str)。cross_check 消费其中
-target_key/target_kind/seq/protocol_id/protocol_ver/claim.config_json；`plan_slice_hash` = canon_hash(切片)。
+target_key/target_kind/seq/protocol_id/protocol_ver/gpu_required/claim.config_json；
+`plan_slice_hash` = canon_hash(切片)。
 
-**围栏 = 防呆非防敌**（诚实边界）：argv 数组禁 shell、cwd 限 run staging、绝对路径 token 须落
+**命令围栏 = 纵深防御**：argv 数组禁 shell、cwd 限 run staging、绝对路径 token 须落
 work_root 或 policy.execution.path_allowlist 前缀、相对 token 禁 `..` 组件、env 白名单键+禁改装载器
-变量、超时上限截断。argv[0]（程序名）豁免路径围栏——解释器/工具允许绝对系统路径。对抗性隔离
-（Codex 产的代码本身可任意行事）不在本层——真 worktree/沙箱 = 后续硬化步。
+变量、超时上限截断。argv[0]（程序名）豁免路径围栏——解释器/工具允许绝对系统路径。对抗性隔离由
+调用方注入的 pinned DockerExecutionSandbox 承担；本层把核验后的命令、输入 fd 与 CPU/GPU mode 交给它。
 
 **纪律**：本模块不写 DB、不持事务；输入资产启动前只用 ``mode=ro`` 连接复核终态授权，
 事务与状态机仍归调用方（attack_stages）。
@@ -42,6 +43,7 @@ from .artifact_capability import (
     verify_open_fd,
     verify_tree_fd,
 )
+from .execution_sandbox import sandbox_workload_environment_hash
 from .ids import parse_positive_sqlite_int
 
 # 保留文件名：manifest 本体与 identity 由本模块按固定名物化；哨兵是物化完成标志——均不得出现在 code_files
@@ -126,7 +128,8 @@ def validate_manifest(schemas, manifest: Any) -> None:
 
 def cross_check(manifest: Dict[str, Any], plan_slice: Dict[str, Any]) -> None:
     """manifest ↔ resolved plan 切片交叉核（防旁路）：目标三元组一致、切片哈希一致（内容寻址回引，
-    覆盖 eval_key/claim/spec 等全部切片字段）、协议绑定一致、配置服从计划（claim.config_json 非空时相等）。"""
+    覆盖 eval_key/claim/spec 等全部切片字段）、协议/GPU access mode 绑定一致、配置服从计划
+    （claim.config_json 非空时相等）。"""
     ref = manifest["target_ref"]
     for k in ("target_key", "target_kind", "seq"):
         if ref[k] != plan_slice.get(k):
@@ -139,6 +142,12 @@ def cross_check(manifest: Dict[str, Any], plan_slice: Dict[str, Any]) -> None:
     if (pr["protocol_id"], pr["protocol_ver"]) != (plan_slice.get("protocol_id"), plan_slice.get("protocol_ver")):
         raise ManifestError(f"protocol_ref ({pr['protocol_id']}@{pr['protocol_ver']}) ≠ plan 切片绑定 "
                             f"({plan_slice.get('protocol_id')}@{plan_slice.get('protocol_ver')})——bundle 不得换协议（I1/I2）")
+    planned_gpu = plan_slice.get("gpu_required", False)
+    if not isinstance(planned_gpu, bool):
+        raise ManifestError("plan 切片 gpu_required 须为 bool")
+    if manifest.get("gpu_required", False) is not planned_gpu:
+        raise ManifestError(
+            "manifest.gpu_required 与 plan 切片不一致——GPU access mode 由 plan 冻结")
     claim_cfg = (plan_slice.get("claim") or {}).get("config_json")
     if claim_cfg:   # 计划声明了配置 ⇒ bundle 只照办；计划未声明/空 {} ⇒ bundle 自由细化
         if canon_hash(manifest["config_json"]) != canon_hash(claim_cfg):
@@ -946,10 +955,22 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
                          execution_sandbox=None) -> Dict[str, Any]:
     """解析+围栏后委托 harness.run_staged（cwd=staging_dir、.partial→原子改名、.exit 侧车——纪律全继承）。
     返回 run_staged 结果 {exit_code, log_path, log_sha256, log_bytes}；log 入账仍归调用方。"""
+    gpu_required = manifest.get("gpu_required", False)
+    if (gpu_required is not False and gpu_required is not True):
+        raise ManifestError("manifest.gpu_required 须为 bool")
     if (execution_sandbox is not None
-            and manifest.get("env_hash") != execution_sandbox.environment_hash):
+            and manifest.get("env_hash") != sandbox_workload_environment_hash(
+                execution_sandbox.environment_hash, gpu_required)):
         raise ManifestError(
-            "manifest.env_hash 与 policy pinned sandbox runtime identity 不一致")
+            "manifest.env_hash 与本次 CPU/GPU workload sandbox identity 不一致")
+    if (gpu_required
+            and int(policy.get("resources", {}).get("gpus", 0)) <= 0):
+        raise ManifestError(
+            "manifest 要求 GPU，但 policy.resources.gpus 未声明可用 allocation")
+    if (gpu_required and (execution_sandbox is None
+                          or getattr(execution_sandbox, "gpu_contract", None) is None)):
+        raise ManifestError(
+            "manifest 要求 GPU，但启动 canary 未证明 fixed sandbox allocation")
     rc = resolve_command(manifest, kind, src_dir=src_dir, work_root=work_root, policy=policy,
                          ckpt_path=ckpt_path, ckpt_content_hash=ckpt_content_hash,
                          expected_source_hashes=expected_source_hashes,
@@ -972,7 +993,8 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
                 fd_expectations=rc.fd_expectations,
                 tree_expectations=rc.tree_expectations,
                 execution_context=sandbox_context,
-                execution_supervisor=execution_supervisor)
+                execution_supervisor=execution_supervisor,
+                gpu_required=gpu_required)
             run_argv = sandbox_invocation.argv
             run_env = sandbox_invocation.env
             run_pass_fds = sandbox_invocation.pass_fds

@@ -33,6 +33,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
@@ -70,19 +71,47 @@ _IMAGE_RE = re.compile(
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_GPU_UUID_RE = re.compile(r"^GPU-[A-Za-z0-9-]{1,128}$")
+_GPU_VERSION_RE = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
+_GPU_COMPUTE_RE = re.compile(r"^[0-9]{1,3}\.[0-9]{1,3}$")
 _MAX_SPEC_BYTES = 2 * 1024 * 1024
 _MAX_ENGINE_OUTPUT = 4 * 1024 * 1024
 _SESSION_VERSION = 1
 _SAFE_PATH = re.compile(r"^[^\x00-\x1f\x7f\\]+$")
 
 _RLIMIT_LAUNCHER = r"""
-import base64,ctypes,json,os,resource,sys
+import base64,ctypes,json,os,resource,subprocess,sys
 memory,nproc,nofile,fsize=map(int,sys.argv[1:5])
-resource.setrlimit(resource.RLIMIT_AS,(memory,memory))
+if memory < 0:
+    resource.setrlimit(resource.RLIMIT_AS,(resource.RLIM_INFINITY,resource.RLIM_INFINITY))
+else:
+    resource.setrlimit(resource.RLIMIT_AS,(memory,memory))
 resource.setrlimit(resource.RLIMIT_NPROC,(nproc,nproc))
 resource.setrlimit(resource.RLIMIT_NOFILE,(nofile,nofile))
 resource.setrlimit(resource.RLIMIT_FSIZE,(fsize,fsize))
 resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+gpu=json.loads(sys.argv[7])
+if gpu is not None:
+    try:
+        result=subprocess.run([
+            '/usr/bin/nvidia-smi','--query-gpu=uuid,name,memory.total,compute_cap,driver_version',
+            '--format=csv,noheader,nounits'],stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=15,check=False,
+            env={'PATH':'/usr/local/bin:/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8'})
+        if result.returncode or len(result.stdout)+len(result.stderr)>1048576: raise ValueError()
+        actual=[]
+        for raw in result.stdout.decode('utf-8').splitlines():
+            if not raw.strip(): continue
+            parts=[part.strip() for part in raw.split(',')]
+            if len(parts)!=5: raise ValueError()
+            uuid,model,memory_mib,compute,driver=parts
+            actual.append({'uuid':uuid,'model':model,'memory_bytes':int(memory_mib)*1048576,
+                           'compute_capability':compute,'driver_version':driver})
+        expected=[{**item,'driver_version':gpu['driver_version']} for item in gpu['devices']]
+        if sorted(actual,key=lambda item:item['uuid'])!=sorted(expected,key=lambda item:item['uuid']):
+            raise ValueError()
+    except Exception:
+        raise SystemExit(126)
 class _Filter(ctypes.Structure):
     _fields_=[('code',ctypes.c_ushort),('jt',ctypes.c_ubyte),('jf',ctypes.c_ubyte),('k',ctypes.c_uint)]
 class _Program(ctypes.Structure):
@@ -101,7 +130,7 @@ os.umask(0o077)
 os.chdir('/mr/output')
 os.environ.clear()
 os.environ.update(payload_env)
-argv=sys.argv[8:]
+argv=sys.argv[9:]
 if not argv: raise SystemExit(126)
 os.execvp(argv[0],argv)
 """.strip()
@@ -146,9 +175,125 @@ def _sha(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def normalize_gpu_contract(value: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return one canonical fixed NVIDIA allocation or reject it.
+
+    UUIDs are execution-allocation identity.  The derived capability projection
+    deliberately omits UUIDs so an equivalent replacement card does not poison
+    dependency-image caches, while every invocation spec still binds the exact
+    physical allocation.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+            "version", "provider", "driver_version", "request", "devices"}:
+        raise ValueError("sandbox GPU contract 字段闭包非法")
+    if (value.get("version") != 1 or value.get("provider") != "nvidia"
+            or not isinstance(value.get("driver_version"), str)
+            or _GPU_VERSION_RE.fullmatch(value["driver_version"]) is None):
+        raise ValueError("sandbox GPU contract provider/driver 非法")
+    request = value.get("request")
+    if (not isinstance(request, Mapping)
+            or set(request) != {"driver", "capabilities", "options"}
+            or request.get("driver") != "nvidia"
+            or request.get("capabilities") != ["compute", "utility", "gpu"]
+            or request.get("options") != {}):
+        raise ValueError("sandbox GPU DeviceRequest contract 非法")
+    devices = value.get("devices")
+    if not isinstance(devices, list) or not 1 <= len(devices) <= 64:
+        raise ValueError("sandbox GPU devices 须为有界非空数组")
+    normalized = []
+    uuids = set()
+    for item in devices:
+        if not isinstance(item, Mapping) or set(item) != {
+                "uuid", "model", "memory_bytes", "compute_capability"}:
+            raise ValueError("sandbox GPU device 字段闭包非法")
+        uuid = item.get("uuid")
+        model = item.get("model")
+        memory = item.get("memory_bytes")
+        compute = item.get("compute_capability")
+        if (not isinstance(uuid, str) or _GPU_UUID_RE.fullmatch(uuid) is None
+                or uuid in uuids or not isinstance(model, str) or not model
+                or len(model.encode("utf-8")) > 256
+                or any(ord(char) < 0x20 or ord(char) == 0x7f for char in model)
+                or isinstance(memory, bool) or not isinstance(memory, int)
+                or not 1 <= memory <= 9007199254740991
+                or not isinstance(compute, str)
+                or _GPU_COMPUTE_RE.fullmatch(compute) is None):
+            raise ValueError("sandbox GPU device identity 非法")
+        uuids.add(uuid)
+        normalized.append({
+            "uuid": uuid, "model": model, "memory_bytes": memory,
+            "compute_capability": compute,
+        })
+    normalized.sort(key=lambda item: item["uuid"])
+    return {
+        "version": 1, "provider": "nvidia",
+        "driver_version": value["driver_version"],
+        "request": {
+            "driver": "nvidia",
+            "capabilities": ["compute", "utility", "gpu"],
+            "options": {},
+        },
+        "devices": normalized,
+    }
+
+
+def gpu_capability_projection(contract: Mapping[str, Any]) -> Dict[str, Any]:
+    value = normalize_gpu_contract(contract)
+    assert value is not None
+    devices = [{
+        "model": item["model"], "memory_bytes": item["memory_bytes"],
+        "compute_capability": item["compute_capability"],
+    } for item in value["devices"]]
+    devices.sort(key=lambda item: _canonical(item))
+    return {
+        "version": 1, "provider": value["provider"],
+        "driver_version": value["driver_version"],
+        "request": value["request"], "devices": devices,
+    }
+
+
+def gpu_contract_hash(contract: Mapping[str, Any]) -> str:
+    value = normalize_gpu_contract(contract)
+    assert value is not None
+    return _sha(_canonical(value))
+
+
+def gpu_cli_argument(contract: Mapping[str, Any]) -> str:
+    value = normalize_gpu_contract(contract)
+    assert value is not None
+    uuids = ",".join(item["uuid"] for item in value["devices"])
+    return f'"driver=nvidia","device={uuids}","capabilities=compute,utility"'
+
+
 def sandbox_environment_hash(config: Mapping[str, Any]) -> str:
     """Deterministic declared runtime identity exposed to bundle workers/DB."""
     return _sha(_canonical(dict(config)))
+
+
+def sandbox_workload_environment_hash(
+        runtime_environment_hash: str, gpu_required: bool) -> str:
+    """Bind scientific reuse identity to the invocation's GPU access mode.
+
+    CPU keeps the historical runtime hash.  GPU adds a stable mode tag to the
+    capability-level runtime hash, so CPU and GPU measurements can never
+    satisfy each other's exact ``env_hash`` reuse query.  Physical UUIDs stay
+    in invocation identity rather than this reusable environment identity.
+    """
+    if (not isinstance(runtime_environment_hash, str)
+            or _SHA256_RE.fullmatch(runtime_environment_hash) is None):
+        raise ValueError("sandbox runtime_environment_hash 非法")
+    if not isinstance(gpu_required, bool):
+        raise ValueError("sandbox gpu_required 须为 bool")
+    if not gpu_required:
+        return runtime_environment_hash
+    return _sha(_canonical({
+        "version": 1,
+        "protocol": "sandbox-workload-environment-v1",
+        "runtime_environment_hash": runtime_environment_hash,
+        "gpu_required": True,
+    }))
 
 
 def _strict_json(raw: bytes) -> Dict[str, Any]:
@@ -491,11 +636,23 @@ class DockerExecutionSandbox:
     """Create one pinned, no-network Docker invocation and trusted snapshots."""
 
     def __init__(self, *, work_root: Path | str, config: Mapping[str, Any],
-                 owner_guard=None, system_root: Path | str | None = None):
+                 owner_guard=None, system_root: Path | str | None = None,
+                 gpu_contract: Optional[Mapping[str, Any]] = None):
         self.work_root = Path(os.path.abspath(os.fspath(work_root)))
         self.system_root = Path(os.path.abspath(os.fspath(
             system_root if system_root is not None else Path(__file__).resolve().parent.parent)))
         self.config = dict(config)
+        self.gpu_contract = normalize_gpu_contract(gpu_contract)
+        supplied_capability = self.config.get("gpu_capability")
+        if self.gpu_contract is None:
+            if supplied_capability is not None:
+                raise ValueError(
+                    "sandbox.gpu_capability 不得脱离 exact GPU contract 单独注入")
+        else:
+            capability = gpu_capability_projection(self.gpu_contract)
+            if supplied_capability is not None and supplied_capability != capability:
+                raise ValueError("sandbox.gpu_capability 与 exact GPU contract 不一致")
+            self.config["gpu_capability"] = capability
         self.owner_guard = owner_guard or (lambda: None)
         self._preflight_done = False
         self._resource_mode: Optional[str] = None
@@ -515,7 +672,8 @@ class DockerExecutionSandbox:
             "max_output_mb", "max_output_files", "cpus", "tmpfs_mb",
             "shm_mb", "input_max_mb", "readonly_mounts", "payload_environment",
         }
-        if set(self.config) != required or self.config.get("backend") != "docker":
+        allowed = required | ({"gpu_capability"} if self.gpu_contract is not None else set())
+        if set(self.config) != allowed or self.config.get("backend") != "docker":
             raise ValueError("policy.execution.sandbox 字段闭包/backend 非法")
         engine = self.config["engine_path"]
         host = self.config["engine_host"]
@@ -642,6 +800,22 @@ class DockerExecutionSandbox:
     def environment_hash(self) -> str:
         return sandbox_environment_hash(self.config)
 
+    def workload_environment_hash(self, gpu_required: bool) -> str:
+        return sandbox_workload_environment_hash(
+            self.environment_hash, gpu_required)
+
+    @property
+    def gpu_contract_hash(self) -> Optional[str]:
+        return (None if self.gpu_contract is None
+                else gpu_contract_hash(self.gpu_contract))
+
+    @property
+    def runtime_identity_hash(self) -> str:
+        return _sha(_canonical({
+            "environment_hash": self.environment_hash,
+            "gpu_contract": self.gpu_contract,
+        }))
+
     def preflight(self) -> None:
         if self._preflight_done:
             return
@@ -708,6 +882,129 @@ class DockerExecutionSandbox:
             raise ExecutionSandboxError(
                 "host kernel 无法加载 policy pinned seccomp BPF，拒绝 adversarial sandbox")
         self._preflight_done = True
+
+    def run_gpu_canary(self, *, execution_supervisor, candidate_hash: str,
+                       clock: Optional[Callable[[], float]] = None) -> Dict[str, Any]:
+        """Run one guardian-owned exact DeviceRequest + in-container inventory probe."""
+        if self.gpu_contract is None:
+            raise ExecutionSandboxError("GPU canary 缺 exact allocation contract")
+        if (not isinstance(candidate_hash, str)
+                or _SHA256_RE.fullmatch(candidate_hash) is None):
+            raise ValueError("GPU canary candidate_hash 非法")
+        from . import harness as H
+
+        token = candidate_hash.removeprefix("sha256:")[:32]
+        staging = self.work_root / "state" / "deployment" / "gpu-canary" / token
+        log_name = "gpu-canary.log"
+        canary_context = {
+            "phase": "deployment-gpu-canary",
+            "candidate_hash": candidate_hash,
+            "runtime_identity_hash": self.runtime_identity_hash,
+            "log_name": log_name,
+        }
+        invocation = self.prepare(
+            ["/usr/bin/nvidia-smi",
+             "--query-gpu=uuid,name,memory.total,compute_cap,driver_version",
+             "--format=csv,noheader,nounits"],
+            staging_dir=staging, log_name=log_name, env=None, timeout_s=30.0,
+            execution_context=canary_context,
+            execution_supervisor=execution_supervisor, gpu_required=True)
+        sandbox_spec_hash = invocation.external_container["spec_sha256"]
+        result = H.run_staged(
+            invocation.argv, staging_dir=str(staging), log_name=log_name,
+            timeout_s=30.0, env=invocation.env, pass_fds=invocation.pass_fds,
+            execution_supervisor=execution_supervisor,
+            execution_kind="deployment-gpu-canary",
+            execution_context=canary_context,
+            sandbox_invocation=invocation)
+        inventory: list[Dict[str, Any]] = []
+        error = None
+        driver = None
+        try:
+            raw = read_artifact_bytes(
+                Path(result["log_path"]), max_bytes=1024 * 1024,
+                label="GPU canary inventory")
+            if result["exit_code"] != 0:
+                detail = raw.decode("utf-8", errors="replace").strip()[:500]
+                raise ValueError(
+                    f"GPU canary runner exit_code={result['exit_code']}: {detail}")
+            drivers = set()
+            for raw_line in raw.decode("utf-8").splitlines():
+                if not raw_line.strip():
+                    continue
+                parts = [part.strip() for part in raw_line.split(",")]
+                if len(parts) != 5:
+                    raise ValueError("GPU canary inventory 行字段数非法")
+                uuid, model, memory_mib, compute, row_driver = parts
+                memory = int(memory_mib) * 1024 * 1024
+                item = normalize_gpu_contract({
+                    "version": 1, "provider": "nvidia",
+                    "driver_version": row_driver,
+                    "request": {
+                        "driver": "nvidia",
+                        "capabilities": ["compute", "utility", "gpu"],
+                        "options": {},
+                    },
+                    "devices": [{
+                        "uuid": uuid, "model": model, "memory_bytes": memory,
+                        "compute_capability": compute,
+                    }],
+                })
+                assert item is not None
+                inventory.append(item["devices"][0])
+                drivers.add(row_driver)
+            if len(drivers) != 1:
+                raise ValueError("GPU canary driver version 非唯一")
+            driver = next(iter(drivers))
+            inventory.sort(key=lambda item: item["uuid"])
+            if (driver != self.gpu_contract["driver_version"]
+                    or inventory != self.gpu_contract["devices"]):
+                raise ValueError("GPU canary container inventory 与 exact contract 不一致")
+        except Exception as caught:
+            error = str(caught).replace("\x00", "?").replace("\n", " ")[:1000]
+        receipt = result["process_receipt"]
+        sandbox_receipt = receipt.get("sandbox") if isinstance(receipt, Mapping) else None
+        if (not isinstance(sandbox_receipt, Mapping)
+                or sandbox_receipt.get("spec_sha256") != sandbox_spec_hash
+                or sandbox_receipt.get("container_drained") is not True):
+            raise ExecutionSandboxError(
+                "GPU canary guardian receipt 未绑定并清空 exact container")
+        checked = (clock or time.time)()
+        if (isinstance(checked, bool) or not isinstance(checked, (int, float))
+                or not math.isfinite(float(checked)) or checked <= 0):
+            raise ValueError("GPU canary clock 须为正有限 Unix time")
+        ok = error is None
+        guardian_projection = {
+            "operation_id": receipt.get("operation_id"),
+            "state": receipt.get("state"), "outcome": receipt.get("outcome"),
+            "returncode": receipt.get("returncode"),
+            "group_drained": receipt.get("group_drained"),
+            "containment": receipt.get("containment"),
+            "context": dict(receipt.get("context") or {}),
+            "sandbox": {
+                "backend": sandbox_receipt.get("backend"),
+                "spec_sha256": sandbox_receipt.get("spec_sha256"),
+                "container_drained": sandbox_receipt.get("container_drained"),
+            },
+        }
+        return {
+            "version": 1, "protocol": "sandbox-gpu-canary-v1", "ok": ok,
+            "checked_at_unix": float(checked),
+            "candidate_hash": candidate_hash,
+            "contract_hash": self.gpu_contract_hash,
+            "environment_hash": self.environment_hash,
+            "runtime_identity_hash": self.runtime_identity_hash,
+            "inventory": inventory,
+            "guardian": guardian_projection,
+            "execution": {
+                "log_path": result["log_path"],
+                "log_sha256": "sha256:" + result["log_sha256"],
+                "process_receipt_path": result["process_receipt_path"],
+                "operation_id": receipt["operation_id"],
+                "sandbox_spec_sha256": sandbox_spec_hash,
+            },
+            "error": error,
+        }
 
     def _snapshot_inputs(
             self, *, token: str,
@@ -917,8 +1214,9 @@ class DockerExecutionSandbox:
         Startup DB reconciliation may terminalize the DB owner before its stage
         runs again, so cleanup cannot rely only on ``recover_staged_result``.
         Session metadata is matched to the central receipt by context hash and
-        exact random container authority; exit receipts remain for normal
-        artifact recovery.
+        exact random container authority; ordinary exit receipts remain for
+        DB-stage artifact replay, while the DB-less deployment GPU canary is
+        completed here because a new owner will never revisit its candidate path.
         """
         self.owner_guard()
         execution_supervisor.recover_previous_generation()
@@ -1011,6 +1309,53 @@ class DockerExecutionSandbox:
                 recovered += 1
                 continue
             if candidate.get("outcome") == "exit":
+                context = candidate.get("context") or {}
+                if context.get("phase") == "deployment-gpu-canary":
+                    partial = staging / (index["log_name"] + ".partial")
+                    final = staging / index["log_name"]
+                    if os.path.lexists(final):
+                        continue
+                    if not os.path.lexists(partial):
+                        raise ExecutionSandboxError(
+                            "GPU canary exit receipt 存在但 partial log 缺失")
+                    info = os.lstat(partial)
+                    exit_code = candidate.get("returncode")
+                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                            or info.st_uid != os.geteuid()
+                            or isinstance(exit_code, bool)
+                            or not isinstance(exit_code, int)):
+                        raise ExecutionSandboxError(
+                            "GPU canary recovered log/exit identity 非法")
+                    # This publishes/cleans only the sandbox output quarantine;
+                    # harness log sidecars and partial->final promotion remain
+                    # separate steps below, mirroring run_staged recovery.
+                    finalize_sandbox_output(
+                        staging_dir=staging, log_name=index["log_name"],
+                        context=context, execution_receipt=candidate,
+                        exit_code=exit_code)
+                    exit_path = staging / (index["log_name"] + ".exit")
+                    exit_payload = str(exit_code).encode("ascii")
+                    if os.path.lexists(exit_path):
+                        if read_artifact_bytes(
+                                exit_path, max_bytes=32,
+                                label="GPU canary recovered exit") != exit_payload:
+                            raise ExecutionSandboxError(
+                                "GPU canary recovered exit sidecar 冲突")
+                    else:
+                        _write_private(exit_path, exit_payload)
+                    atomic_write_receipt(
+                        staging / (index["log_name"] + ".process.json"), {
+                            "version": 1,
+                            "operation_id": candidate["operation_id"],
+                            "outcome": candidate["outcome"],
+                            "group_drained": candidate["group_drained"],
+                            "receipt_path": str(
+                                execution_supervisor.receipt_dir
+                                / f"execution-{candidate['operation_id']}.json"),
+                        })
+                    os.replace(partial, final)
+                    _fsync_dir(staging)
+                    recovered += 1
                 continue
             finalize_sandbox_output(
                 staging_dir=staging, log_name=index["log_name"],
@@ -1025,8 +1370,13 @@ class DockerExecutionSandbox:
             fd_expectations: Sequence[tuple[int, str, int, Optional[int], Optional[int]]] = (),
             tree_expectations: Sequence[tuple[int, Dict[str, str], tuple[str, ...]]] = (),
             execution_context: Optional[Mapping[str, Any]] = None,
-            execution_supervisor=None) -> SandboxInvocation:
+            execution_supervisor=None, gpu_required: bool = False) -> SandboxInvocation:
         """Prepare one invocation and roll back only paths created by a failed prepare."""
+        if not isinstance(gpu_required, bool):
+            raise ValueError("sandbox gpu_required 须为 bool")
+        if gpu_required and self.gpu_contract is None:
+            raise ExecutionSandboxError(
+                "本次实验要求 GPU，但部署未建立 exact GPU allocation contract")
         _validate_log_name(log_name)
         context = dict(execution_context or {})
         if "log_name" in context and context["log_name"] != log_name:
@@ -1057,7 +1407,7 @@ class DockerExecutionSandbox:
                 cmd, staging_dir=staging, log_name=log_name, env=env,
                 timeout_s=timeout_s, fd_expectations=fd_expectations,
                 tree_expectations=tree_expectations,
-                execution_context=context)
+                execution_context=context, gpu_required=gpu_required)
         except BaseException:
             for path, was_present in zip(paths, existed):
                 if was_present or not os.path.lexists(path):
@@ -1074,7 +1424,8 @@ class DockerExecutionSandbox:
             env: Optional[Mapping[str, str]], timeout_s: float,
             fd_expectations: Sequence[tuple[int, str, int, Optional[int], Optional[int]]] = (),
             tree_expectations: Sequence[tuple[int, Dict[str, str], tuple[str, ...]]] = (),
-            execution_context: Optional[Mapping[str, Any]] = None) -> SandboxInvocation:
+            execution_context: Optional[Mapping[str, Any]] = None,
+            gpu_required: bool = False) -> SandboxInvocation:
         self.preflight()
         self.owner_guard()
         context = dict(execution_context or {})
@@ -1148,16 +1499,29 @@ class DockerExecutionSandbox:
         max_file_bytes = self.config["max_file_mb"] * 1024 * 1024
         payload_env_json = json.dumps(
             payload_env, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        invocation_gpu = self.gpu_contract if gpu_required else None
+        # CUDA reserves large virtual address ranges unrelated to resident host
+        # RAM.  On the production cgroup path, memory.max remains the aggregate
+        # hard boundary, so RLIMIT_AS must not reject a valid CUDA context.  The
+        # weaker rlimit-fallback keeps the historical finite per-process cap.
+        address_space_bytes = (
+            -1 if invocation_gpu is not None
+            and self.resource_mode in {"cgroup-v1", "cgroup-v2"}
+            else memory_bytes)
+        gpu_json = json.dumps(
+            invocation_gpu, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         container_argv = [
             self.config["python_path"], "-I", "-B", "-c", _RLIMIT_LAUNCHER,
-            str(memory_bytes), str(self.config["pids"]), str(self.config["nofile"]),
+            str(address_space_bytes), str(self.config["pids"]), str(self.config["nofile"]),
             str(max_file_bytes), self.seccomp_bpf_b64,
-            payload_env_json, "--", *resolved,
+            payload_env_json, gpu_json, "--", *resolved,
         ]
         control_env = {
             "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent",
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
         }
+        if invocation_gpu is not None:
+            control_env["NVIDIA_DRIVER_CAPABILITIES"] = "compute,utility"
         spec = {
             "version": 1, "backend": _BACKEND,
             "engine_path": self.engine_path,
@@ -1173,8 +1537,9 @@ class DockerExecutionSandbox:
             "input_manifest_hash": input_manifest_hash,
             "readonly_mounts": readonly_mounts, "env": control_env,
             "payload_env": payload_env,
-            "argv": container_argv, "limits": {
+            "argv": container_argv, "gpu": invocation_gpu, "limits": {
                 "memory_bytes": memory_bytes, "pids": self.config["pids"],
+                "address_space_bytes": address_space_bytes,
                 "nofile": self.config["nofile"], "max_file_bytes": max_file_bytes,
                 "max_log_bytes": self.config["max_log_mb"] * 1024 * 1024,
                 "max_output_bytes": self.config["max_output_mb"] * 1024 * 1024,
@@ -1472,7 +1837,8 @@ def _verify_runner_spec(spec: Dict[str, Any]) -> None:
         "seccomp_path", "seccomp_sha256", "seccomp_spec_hash",
         "seccomp_bpf_b64", "seccomp_bpf_sha256", "image", "image_id",
         "name", "token", "resource_mode", "input_root", "output_root",
-        "input_manifest_hash", "readonly_mounts", "env", "payload_env", "argv", "limits",
+        "input_manifest_hash", "readonly_mounts", "env", "payload_env", "argv", "gpu",
+        "limits",
     }
     if (set(spec) != required or spec.get("version") != 1
             or spec.get("backend") != _BACKEND
@@ -1495,6 +1861,12 @@ def _verify_runner_spec(spec: Dict[str, Any]) -> None:
             or not isinstance(spec.get("payload_env"), dict)
             or not isinstance(spec.get("limits"), dict)):
         raise ExecutionSandboxError("docker runner spec 字段闭包/类型非法")
+    try:
+        gpu = normalize_gpu_contract(spec.get("gpu"))
+    except ValueError as error:
+        raise ExecutionSandboxError("docker runner GPU contract 非法") from error
+    if gpu != spec.get("gpu"):
+        raise ExecutionSandboxError("docker runner GPU contract 非 canonical")
 
 
 def _verify_created_container(spec: Mapping[str, Any], payload: Any) -> None:
@@ -1514,6 +1886,14 @@ def _verify_created_container(spec: Mapping[str, Any], payload: Any) -> None:
         raise ExecutionSandboxError("sandbox daemon additive seccomp profile 非唯一")
     if seccomp_entries[0] == "unconfined":
         raise ExecutionSandboxError("sandbox daemon additive seccomp 不得 unconfined")
+    gpu = spec.get("gpu")
+    expected_device_requests = []
+    if gpu is not None:
+        expected_device_requests = [{
+            "Driver": "nvidia", "Count": 0,
+            "DeviceIDs": [item["uuid"] for item in gpu["devices"]],
+            "Capabilities": [["compute", "utility", "gpu"]], "Options": {},
+        }]
     if (value.get("Name") != "/" + spec["name"]
             or value.get("Image") != spec["image_id"]
             or not isinstance(labels, dict) or labels.get(_LABEL) != spec["token"]
@@ -1529,7 +1909,7 @@ def _verify_created_container(spec: Mapping[str, Any], payload: Any) -> None:
             or "ALL" not in (host.get("CapDrop") or [])
             or not any(item == "no-new-privileges:true" for item in security)
             or bool(host.get("Devices"))
-            or bool(host.get("DeviceRequests"))
+            or (host.get("DeviceRequests") or []) != expected_device_requests
             or host.get("PidsLimit") != spec["limits"]["pids"]
             or host.get("Memory") != spec["limits"]["memory_bytes"]
             or host.get("MemorySwap") != spec["limits"]["memory_bytes"]
@@ -1647,6 +2027,10 @@ def _docker_runner(spec: Dict[str, Any]) -> int:
         "--mount", f"type=bind,src={spec['input_root']},dst=/mr/input,readonly",
         "--mount", f"type=bind,src={spec['output_root']},dst=/mr/output",
     ]
+    if spec["gpu"] is not None:
+        # Docker's --gpus grammar requires the literal quote characters when
+        # multiple comma-separated sub-fields are passed as one argv token.
+        args.extend(["--gpus", gpu_cli_argument(spec["gpu"])])
     for mount in spec["readonly_mounts"]:
         args.extend(["--mount", f"type=bind,src={mount['source']},dst={mount['target']},readonly"])
     for key, value in sorted(spec["env"].items()):

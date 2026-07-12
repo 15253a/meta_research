@@ -456,6 +456,12 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         deployment_receipts = list((tmp_path / "state" / "deployment").glob("deployment-*.json"))
         assert len(deployment_receipts) == 1
         assert system.advancer.attack.execution_sandbox is worker.execution_sandbox
+        runtime_hash = worker.execution_sandbox.environment_hash
+        assert system.advancer.compiler.runtime_environment_hash == runtime_hash
+        assert "gpu_capability" not in system.advancer.attack.policy["execution"]["sandbox"]
+        assert worker.p["fetch"].repository_fetcher.environment_hash == runtime_hash
+        assert (system.advancer.attack.execution_sandbox_resolver.bootstrap_sandbox
+                is worker.execution_sandbox)
         assert worker.execution_sandbox.resource_mode in {
             "cgroup-v1", "cgroup-v2", "rlimit-fallback"}
         assert isinstance(system.advancer.attack.p["plan_review"], PlanReviewProvider)
@@ -510,9 +516,12 @@ def test_deployment_preflight_rejects_before_database_and_releases_lease(tmp_pat
         def __init__(self, **_kwargs):
             calls.append("init")
 
-        def run(self):
-            calls.append("run")
+        def prepare(self):
+            calls.append("prepare")
             raise DeploymentPreflightError("deployment rejected")
+
+        def finalize(self, _evidence=None):
+            calls.append("forbidden-finalize")
 
     monkeypatch.setattr(R, "DeploymentPreflight", RejectDeployment)
     monkeypatch.setattr(
@@ -526,10 +535,129 @@ def test_deployment_preflight_rejects_before_database_and_releases_lease(tmp_pat
         lambda _path: (_ for _ in ()).throw(AssertionError("DB must not open")))
     with pytest.raises(DeploymentPreflightError, match="deployment rejected"):
         R.build_system(SYSTEM_ROOT, str(work), runner_factory=_mock_factory([]))
-    assert calls == ["init", "run"]
+    assert calls == ["init", "prepare"]
 
     replacement = InstanceLease.acquire(work, heartbeat_interval_s=0.02)
     assert replacement.close() is None
+
+
+@pytest.mark.parametrize(
+    ("gpu_ready", "resource_mode", "limits_ready", "promoted", "canary_raises"), [
+        (False, "cgroup-v2", True, False, False),
+        (True, "cgroup-v2", True, True, False),
+        (True, "rlimit-fallback", False, False, False),
+        (True, "cgroup-v2", False, False, False),
+        (True, "cgroup-v2", True, False, True),
+    ])
+def test_gpu_canary_runs_only_after_identity_gate_and_recovery(
+        tmp_path, monkeypatch, gpu_ready, resource_mode, limits_ready,
+        promoted, canary_raises):
+    import copy
+    import types
+    import orchestrator.run as R
+
+    calls = []
+    contract = {
+        "version": 1, "provider": "nvidia", "driver_version": "535.129.03",
+        "request": {
+            "driver": "nvidia",
+            "capabilities": ["compute", "utility", "gpu"], "options": {},
+        },
+        "devices": [{
+            "uuid": "GPU-a", "model": "NVIDIA A100",
+            "memory_bytes": 80 * 1024 ** 3, "compute_capability": "8.0",
+        }],
+    }
+    candidate = {
+        "gpu_contract": contract, "candidate_hash": "sha256:" + "a" * 64,
+        "facts": {"docker": {"daemon": {
+            "runtimes": (["nvidia", "runc"] if gpu_ready else ["runc"])}}},
+    }
+
+    class CanaryFailed(RuntimeError):
+        pass
+
+    class FakeSandbox:
+        def __init__(self, *, config, gpu_contract=None, system_root=None, **_kwargs):
+            calls.append("gpu-sandbox-init" if gpu_contract else "base-sandbox-init")
+            self.config = dict(config)
+            self.gpu_contract = gpu_contract
+            self.system_root = system_root
+            self.resource_mode = resource_mode
+            self.image_environment = {
+                "PYTHON_VERSION": _POLICY["import_materialization"]["compiler"]["version"],
+                "PYTHON_SHA256": _POLICY["import_materialization"]["compiler"][
+                    "artifact_sha256"].removeprefix("sha256:"),
+            }
+
+        def preflight(self):
+            calls.append("gpu-sandbox-preflight" if self.gpu_contract else "base-preflight")
+
+        def recover_terminal_sessions(self, _supervisor):
+            calls.append("sandbox-recovery")
+
+        def run_gpu_canary(self, **_kwargs):
+            calls.append("gpu-canary")
+            if canary_raises:
+                raise CanaryFailed("mechanical canary failed")
+            return {"mechanical": "evidence"}
+
+    class FakeDeployment:
+        def __init__(self, **_kwargs):
+            calls.append("identity-init")
+
+        def prepare(self):
+            calls.append("identity-prepare")
+            return candidate
+
+        def finalize(self, evidence):
+            assert evidence == (
+                {"mechanical": "evidence"}
+                if gpu_ready and not canary_raises else None)
+            calls.append("deployment-finalize")
+            return {
+                "mode": "development", "production_ready": False,
+                "checks": [
+                    {"name": "sandbox_gpu_access", "ok": gpu_ready},
+                    {"name": "docker_cgroup",
+                     "ok": resource_mode in {"cgroup-v1", "cgroup-v2"}},
+                    {"name": "docker_resource_limits", "ok": limits_ready},
+                ],
+            }
+
+    class DownstreamReached(RuntimeError):
+        pass
+
+    def stop_downstream(**_kwargs):
+        bootstrap = _kwargs["bootstrap_sandbox"]
+        calls.append("downstream-gpu" if bootstrap.gpu_contract else "downstream-cpu")
+        raise DownstreamReached()
+
+    policy = copy.deepcopy(_POLICY)
+    policy["resources"].update({"gpus": 1, "gpu_mem_gb": 80})
+    monkeypatch.setattr(
+        R, "yaml", types.SimpleNamespace(safe_load=lambda _text: policy))
+    monkeypatch.setattr(R, "DockerExecutionSandbox", FakeSandbox)
+    monkeypatch.setattr(R, "DeploymentPreflight", FakeDeployment)
+    monkeypatch.setattr(R, "PythonWheelImageBuilder", stop_downstream)
+    monkeypatch.setattr(
+        R.ExecutionSupervisor, "recover_previous_generation",
+        lambda _self: calls.append("supervisor-recovery"))
+
+    with pytest.raises(CanaryFailed if canary_raises else DownstreamReached):
+        R.build_system(
+            SYSTEM_ROOT, str(tmp_path / "work"), runner_factory=_mock_factory([]))
+    expected = [
+        "base-sandbox-init", "base-preflight", "identity-init", "identity-prepare",
+        "supervisor-recovery", "sandbox-recovery", "gpu-sandbox-init",
+        "gpu-sandbox-preflight",
+    ]
+    if gpu_ready:
+        expected.append("gpu-canary")
+    expected.append("deployment-finalize")
+    if not canary_raises:
+        expected.append("downstream-gpu" if promoted else "downstream-cpu")
+    assert calls == expected
 
 
 def test_attack_assembly_accepts_deterministic_readonly_search_provider(tmp_path):
@@ -1115,6 +1243,7 @@ def test_full_attack_flow_end_to_end(tmp_path):
     from orchestrator.manifest import canon_hash
 
     db_path = str(tmp_path / "research.sqlite")
+    runtime_env_hash = [RUNTIME_ENV_HASH]
 
     def bundle_env(pack):                       # 按 pack.target_id 读切片、回引 hash、产真 toy 代码
         conn = db.connect(db_path)
@@ -1126,7 +1255,7 @@ def test_full_attack_flow_end_to_end(tmp_path):
                     "target_ref": {"target_key": slice_["target_key"], "target_kind": "build",
                                    "seq": slice_["seq"], "plan_slice_hash": canon_hash(slice_)},
                     "protocol_ref": {"protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"]},
-                    "env_hash": RUNTIME_ENV_HASH, "config_json": {"lr": 0.1},
+                    "env_hash": runtime_env_hash[0], "config_json": {"lr": 0.1},
                     "code_files": ["train.py", "eval.py", "smoke.py"],
                     "commands": {"smoke": {"argv": ["python", "{src}/smoke.py"]},
                                  "train": {"argv": ["python", "{src}/train.py"]},
@@ -1162,6 +1291,7 @@ def test_full_attack_flow_end_to_end(tmp_path):
            verdict_pass, verdict_pass,           # judge：code review → result review（经 JudgeProvider 落库）
            attack_reasoning]                     # 轮尾：真证据关问 + terminate
     sys_ = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory(seq))
+    runtime_env_hash[0] = sys_.advancer.attack.execution_sandbox.environment_hash
     ids = sys_.run(max_cycles=6)
     assert len(ids) == 2                                         # bootstrap + attack 两轮后 terminate
     d = sys_.daemon

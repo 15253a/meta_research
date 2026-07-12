@@ -16,7 +16,12 @@ import yaml
 
 from orchestrator.dependency_image import PythonWheelImageBuilder
 from orchestrator.dependency_image_common import _wheel_url_is_allowed
-from orchestrator.execution_sandbox import DockerExecutionSandbox, ExecutionSandboxError
+from orchestrator.execution_sandbox import (
+    DockerExecutionSandbox,
+    ExecutionSandboxError,
+    sandbox_environment_hash,
+    sandbox_workload_environment_hash,
+)
 from orchestrator.process_supervisor import ExecutionSupervisor
 from orchestrator.repository_materialization_common import (
     RepositoryCacheError,
@@ -95,6 +100,43 @@ def _builder(tmp_path, fetcher):
         bootstrap_sandbox=sandbox, execution_supervisor=supervisor,
         wheel_fetcher=fetcher)
     return work, builder, supervisor
+
+
+def test_derived_image_sandbox_inherits_exact_gpu_contract(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    gpu_contract = {
+        "version": 1, "provider": "nvidia", "driver_version": "535.129.03",
+        "request": {
+            "driver": "nvidia",
+            "capabilities": ["compute", "utility", "gpu"], "options": {},
+        },
+        "devices": [{
+            "uuid": "GPU-test", "model": "NVIDIA A100-SXM4-80GB",
+            "memory_bytes": 80 * 1024 ** 3, "compute_capability": "8.0",
+        }],
+    }
+    bootstrap = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"],
+        gpu_contract=gpu_contract)
+    supervisor = ExecutionSupervisor.standalone(work / "state" / "executions")
+    builder = PythonWheelImageBuilder(
+        work_root=work,
+        config=POLICY["import_materialization"]["dependency_image"],
+        compiler=POLICY["import_materialization"]["compiler"],
+        bootstrap_sandbox=bootstrap, execution_supervisor=supervisor)
+    monkeypatch.setattr(DockerExecutionSandbox, "preflight", lambda _self: None)
+    try:
+        derived = builder._derived_sandbox("sha256:" + "a" * 64)
+        assert derived.gpu_contract == bootstrap.gpu_contract
+        assert derived.config["gpu_capability"] == bootstrap.config["gpu_capability"]
+        assert derived.environment_hash == sandbox_environment_hash(derived.config)
+        assert derived.environment_hash != derived.workload_environment_hash(True)
+        assert derived.workload_environment_hash(True) == (
+            sandbox_workload_environment_hash(derived.environment_hash, True))
+        assert derived.runtime_identity_hash != bootstrap.runtime_identity_hash
+    finally:
+        supervisor.close()
 
 
 @pytest.mark.parametrize("url", [

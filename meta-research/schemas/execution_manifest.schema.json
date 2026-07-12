@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/execution_manifest.schema.json",
   "title": "execution_manifest",
-  "description": "bundle 阶段的编译产物：机器可验证执行契约（步⑧）。分层定位：plan 保持抽象（冻结 plan.schema 不动，命令永不入 plan）；本清单由 bundle 阶段 Codex 与代码/identity.md 一同产出，经编排器交叉核对（orchestrator/manifest.py：target_ref 回引 plan 切片、protocol 绑定一致、路径/env/超时围栏）后，harness 只机械执行它——不推理、不猜命令、不读 plan 找命令。防「新 plan 旁路」：manifest 不得引入 plan 未声明的目标/协议（plan_slice_hash 由编排器按库中切片重算核对）。命令 = argv 数组（禁 shell 字符串）；占位符 {src}=代码物化目录、{ckpt}=训练产 checkpoint 路径（仅 eval 命令可用）、{asset:<ContextPack opaque ref>}=用户托管输入（启动前受信解析并复验 sha256）。指标契约：eval 命令须向 stdout 打印 `metric_value: <metric_id>@<metric_ver>=<float>` 行（int id 以 bundle 上下文包给出的协议绑定为准）。诚实边界（canary）：env_hash 为声明值，真 env lock / git worktree 隔离 / 产物集 hash 强校验 = 后续硬化步。",
+  "description": "bundle 阶段的编译产物：机器可验证执行契约（步⑧）。plan 只冻结抽象科学/资源意图（含 gpu_required，命令永不入 plan）；本清单由 bundle 阶段 Codex 与代码/identity.md 一同产出，经编排器交叉核对 target_ref、protocol、GPU access mode、workload env_hash、路径与超时后，由 harness 机械执行。manifest 不得引入 plan 未声明的目标/协议/资源模式（plan_slice_hash 由编排器按库中切片重算）。命令为 argv 数组（禁 shell 字符串）；{src}=受 hash 核验的代码树，{ckpt}=训练 checkpoint（仅 eval），{asset:<opaque ref>}=启动前复验 sha256 的用户资产。eval 须输出 `metric_value: <metric_id>@<metric_ver>=<float>`。生产执行绑定 exact image、无网络只读根 Docker sandbox、受验 CPU/GPU workload identity 与 guardian receipt；本 schema 只声明 bundle 契约，机械隔离由 execution_sandbox 执法。",
   "type": "object",
   "required": ["manifest_version", "target_ref", "protocol_ref", "env_hash", "config_json", "code_files", "commands"],
   "additionalProperties": false,
@@ -30,7 +30,8 @@
         "protocol_ver": { "type": "integer", "minimum": 1 }
       }
     },
-    "env_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "锚区给出的 pinned sandbox runtime identity；manifest.py 在生产执行前逐字交叉核，进 run/attempt.env_hash" },
+    "env_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "锚区按 plan.gpu_required 派生的 pinned CPU/GPU workload identity；manifest.py 在生产执行前逐字交叉核，进 run/attempt.env_hash" },
+    "gpu_required": { "type": "boolean", "default": false, "description": "本目标的 smoke/train/eval 是否需要部署固定 GPU allocation；省略/false 始终走 CPU sandbox，不能从主机 resources.gpus 库存推断" },
     "config_json": {
       "type": "object",
       "description": "本目标代码实际使用的变体配置。一致性规则（manifest.py 执法）：plan 切片 claim.config_json 非空 ⇒ 须与之相等（计划切片是配置的决定者，bundle 只照办）"

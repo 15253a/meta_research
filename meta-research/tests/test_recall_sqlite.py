@@ -10,6 +10,7 @@ import pytest
 import conftest
 from orchestrator import database as db
 from orchestrator import recall_sqlite as R
+from orchestrator.execution_sandbox import sandbox_workload_environment_hash
 from orchestrator.interfaces import RecallSpec
 
 
@@ -60,6 +61,43 @@ def test_reuse_hit(conn):
 
 def test_reuse_miss_env_hash(conn):
     assert R.reuse_selector(conn, variant_id=2, protocol_id=1, protocol_ver=1, env_hash="wrong", required=[(1, 1)])["hit"] is False
+
+
+def test_cpu_and_gpu_workload_hashes_cannot_cross_reuse(conn):
+    runtime_hash = "sha256:" + "a" * 64
+    gpu_hash = sandbox_workload_environment_hash(runtime_hash, True)
+    for identity, env_hash in ((5, runtime_hash), (6, gpu_hash)):
+        conn.execute(
+            "INSERT INTO variant(id,baseline_id,variant_key,config_json,status) "
+            "VALUES (?,1,?,'{}','legal')", (identity, f"v{identity}"))
+        conn.execute(
+            "INSERT INTO evaluation(id,variant_id,protocol_id,protocol_ver,eval_key,"
+            "source,status,created_cycle,target_set_hash) "
+            "VALUES (?,?,1,1,?,'factory','created',1,?)",
+            (identity, identity, f"e{identity}", f"h{identity}"))
+        conn.execute(
+            "INSERT INTO evaluation_attempt(id,evaluation_id,cycle_id,attempt_no,"
+            "purpose,status,env_hash) VALUES (?,?,1,1,'factory','success',?)",
+            (identity, identity, env_hash))
+        conn.execute(
+            "INSERT INTO metric_result(id,evaluation_id,evaluation_attempt_id,metric_id,"
+            "metric_ver,value,scope) VALUES (?,?,?,1,1,0.9,'aggregate')",
+            (identity, identity, identity))
+        conn.execute(
+            "UPDATE evaluation SET status='success',canonical_attempt_id=? WHERE id=?",
+            (identity, identity))
+    assert R.reuse_selector(
+        conn, variant_id=5, protocol_id=1, protocol_ver=1,
+        env_hash=runtime_hash, required=[(1, 1)])["hit"] is True
+    assert R.reuse_selector(
+        conn, variant_id=5, protocol_id=1, protocol_ver=1,
+        env_hash=gpu_hash, required=[(1, 1)])["hit"] is False
+    assert R.reuse_selector(
+        conn, variant_id=6, protocol_id=1, protocol_ver=1,
+        env_hash=runtime_hash, required=[(1, 1)])["hit"] is False
+    assert R.reuse_selector(
+        conn, variant_id=6, protocol_id=1, protocol_ver=1,
+        env_hash=gpu_hash, required=[(1, 1)])["hit"] is True
 
 
 def test_reuse_miss_required_metric_absent(conn):

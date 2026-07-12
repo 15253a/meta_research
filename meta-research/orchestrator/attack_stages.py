@@ -19,7 +19,7 @@ attempt 已有当前口径 parser 观测（防「无据不疑」默认成绕过�
 
 **长操作零事务**（§6.13）：providers（Codex/judge）与 harness 子进程全部在事务外。
 
-**契约分层（步⑧ CP8.2）**：plan 保持**抽象**（消费冻结 `plan.schema`——命令永不入 plan）；执行命令由 bundle
+**契约分层（步⑧ CP8.2）**：plan 保持**抽象**（含 CPU/GPU 资源意图，命令永不入 plan）；执行命令由 bundle
 阶段 Codex 产的 `execution_manifest.json`（+ 代码文件 + identity.md）承载，经 `orchestrator/manifest.py`
 校验/交叉核/围栏后由 harness 机械执行。plan 阶段走**正式 gate 通道**（gate_new_protocol I1 + gate_claim_baseline
 I5），不再内联建 baseline、不再把命令塞进 plan_ref——plan_ref 存**resolved 切片**（冻结 target 原样 +
@@ -48,7 +48,11 @@ from . import subject_manifest as SM
 from .artifact_capability import (ArtifactCapabilityError, open_artifact,
                                   read_artifact_bytes)
 from .budgeting import compute_budget
-from .execution_sandbox import SandboxOutputError, sandbox_environment_hash
+from .execution_sandbox import (
+    SandboxOutputError,
+    sandbox_environment_hash,
+    sandbox_workload_environment_hash,
+)
 from .gate_exec import ExecGate
 from .gate_pool import PoolGate
 from .gate_sqlite import GateReject
@@ -284,21 +288,35 @@ class AttackStages:
         return self.execution_sandbox.environment_hash
 
     def _execution_sandbox_for(self, manifest: Mapping[str, Any], build_target_id: int):
-        expected = self._target_environment_hash(build_target_id)
+        runtime_environment_hash = self._target_environment_hash(build_target_id)
+        gpu_required = manifest.get("gpu_required", False)
+        if not isinstance(gpu_required, bool):
+            raise _BundleReject(
+                "manifest.gpu_required 须为 bool", failure_kind="artifact_invalid")
+        expected = sandbox_workload_environment_hash(
+            runtime_environment_hash, gpu_required)
         if manifest.get("env_hash") != expected:
             raise _BundleReject(
-                "manifest.env_hash 未继承 build_target baseline 的可信 runtime identity",
+                "manifest.env_hash 未继承 build_target baseline 的可信 CPU/GPU workload identity",
                 failure_kind="artifact_invalid")
-        if self.execution_sandbox is None or expected == self.execution_sandbox.environment_hash:
-            return self.execution_sandbox
-        if self.execution_sandbox_resolver is None:
-            raise RuntimeError(
-                "imported baseline 要求 dependency image，但系统未配置可信 resolver")
-        resolved = self.execution_sandbox_resolver.resolve_environment_hash(expected)
-        if getattr(resolved, "environment_hash", None) != expected:
-            raise RuntimeError(
-                "dependency image resolver 返回了不同的 runtime identity")
-        return resolved
+        if (self.execution_sandbox is None
+                or runtime_environment_hash == self.execution_sandbox.environment_hash):
+            selected = self.execution_sandbox
+        else:
+            if self.execution_sandbox_resolver is None:
+                raise RuntimeError(
+                    "imported baseline 要求 dependency image，但系统未配置可信 resolver")
+            selected = self.execution_sandbox_resolver.resolve_environment_hash(
+                runtime_environment_hash)
+            if (getattr(selected, "environment_hash", None)
+                    != runtime_environment_hash):
+                raise RuntimeError(
+                    "dependency image resolver 返回了不同的 runtime identity")
+        if gpu_required and getattr(selected, "gpu_contract", None) is None:
+            raise _BundleReject(
+                "plan 要求 GPU，但部署未建立可执行的 fixed GPU allocation",
+                failure_kind="env_invalid")
+        return selected
 
     def bind_owner_guard(self, owner_guard: Callable[[], None]) -> None:
         if not callable(owner_guard):

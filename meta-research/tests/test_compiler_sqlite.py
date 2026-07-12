@@ -624,10 +624,13 @@ def test_bundle_target_id_consumed(comp):
 
 
 def test_bundle_inherits_external_import_environment(comp):
+    from orchestrator.execution_sandbox import sandbox_workload_environment_hash
+
     imported_env = "sha256:" + "d" * 64
     plan_ref = {
         "target_key": "imported-followup", "target_kind": "build", "seq": 2,
         "protocol_id": 1, "protocol_ver": 1, "config_json": {},
+        "gpu_required": True,
     }
     comp.conn.execute(
         "INSERT INTO baseline(id,slug,canonical_key,status) "
@@ -655,7 +658,8 @@ def test_bundle_inherits_external_import_environment(comp):
 
     pack = comp.render(cycle_id="c1", stage="bundle", target_id="4")
 
-    assert imported_env in pack.anchor_md
+    assert sandbox_workload_environment_hash(imported_env, True) in pack.anchor_md
+    assert "gpu_required（manifest 须逐字照抄）**: `true`" in pack.anchor_md
     assert "verified dependency image capability" in pack.anchor_md
     assert "db:baseline:2:external-import-environment" in pack.sources
 

@@ -103,6 +103,7 @@
         "seq": { "type": "integer", "minimum": 1, "description": "依赖序（bundle 严格串行按此执行）" },
         "critical": { "type": "boolean", "description": "关键目标失败 → 早退（剩余未执行 pending 置 skipped）；非关键失败 → 本目标 failed、继续取下一个（RFAIL 口径对齐 06f 状态机）" },
         "budget_estimate": { "type": "number", "minimum": 0 },
+        "gpu_required": { "type": "boolean", "default": false, "description": "本 target 的 smoke/train/eval 是否需要 CUDA/GPU；新 plan 必须显式决定，旧 plan 省略时按 false" },
         "spec_md": { "type": "string", "minLength": 1, "description": "本目标做什么（构建/训练/评估内容，bundle 只照办）" },
         "need_ids": { "type": "array", "items": { "type": "string" } },
         "claim": {

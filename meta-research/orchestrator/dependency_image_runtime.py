@@ -280,7 +280,8 @@ class _DependencyImageRuntimeMixin:
             return cached
         sandbox = DockerExecutionSandbox(
             work_root=self.work_root, config=config, owner_guard=self.owner_guard,
-            system_root=self.bootstrap_sandbox.system_root)
+            system_root=self.bootstrap_sandbox.system_root,
+            gpu_contract=self.bootstrap_sandbox.gpu_contract)
         sandbox.preflight()
         self._sandboxes[environment_hash] = sandbox
         return sandbox

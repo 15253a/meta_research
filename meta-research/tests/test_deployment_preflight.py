@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import stat
@@ -12,6 +13,10 @@ from orchestrator.deployment_preflight import (
     DeploymentPreflight,
     DeploymentPreflightError,
     longest_mount,
+)
+from orchestrator.execution_sandbox import (
+    gpu_capability_projection,
+    sandbox_environment_hash,
 )
 
 
@@ -91,19 +96,19 @@ def _facts(work: Path):
                 "security_options": ["name=rootless", "name=seccomp,profile=builtin"],
                 "cgroup_version": "2", "cgroup_driver": "systemd",
                 "resource_mode": "cgroup-v2", "root_dir": "/var/lib/mr-docker",
-                "runtimes": ["runc"],
+                "runtimes": ["nvidia", "runc"],
                 "limits": {"memory": True, "cpu": True, "pids": True},
             },
             "storage": {"free_bytes": 20 * 1024 ** 3, "free_inodes": 200_000},
             "error": None,
         },
-        "gpu": {"inventory": [], "error": None},
+        "gpu": {"driver_version": "535.129.03", "inventory": [], "error": None},
     }
 
 
 def _attestation(*, gpu=None):
     return {
-        "version": 1, "protocol": "deployment-attestation-v1",
+        "version": 2, "protocol": "deployment-attestation-v2",
         "issued_at_unix": NOW - 10,
         "service": {
             "uid": 1234, "gid": 2345, "groups": [2345],
@@ -122,7 +127,7 @@ def _attestation(*, gpu=None):
             "security_options": ["name=rootless", "name=seccomp,profile=builtin"],
             "cgroup_version": "2", "cgroup_driver": "systemd",
             "resource_mode": "cgroup-v2", "root_dir": "/var/lib/mr-docker",
-            "runtimes": ["runc"], "min_free_bytes": 10 * 1024 ** 3,
+            "runtimes": ["nvidia", "runc"], "min_free_bytes": 10 * 1024 ** 3,
             "min_free_inodes": 100_000,
         },
         "work_root": {
@@ -155,14 +160,61 @@ class FakeProbe:
         return copy.deepcopy(self.facts)
 
 
-def _run(tmp_path, policy, facts, *, owner="owner-test", gpu_access=False):
+def _run(tmp_path, policy, facts, *, owner="owner-test"):
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
     probe = facts if isinstance(facts, FakeProbe) else FakeProbe(facts)
     preflight = DeploymentPreflight(
-        work, policy, _sandbox(), owner, sandbox_gpu_access=gpu_access,
+        work, policy, _sandbox(), owner,
         probe_backend=probe, clock=lambda: NOW)
     return preflight, probe
+
+
+def _hash(value):
+    raw = (json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")) + "\n").encode()
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _gpu_evidence(contract, candidate_hash):
+    runtime_config = {
+        **_sandbox(), "gpu_capability": gpu_capability_projection(contract)}
+    environment_hash = sandbox_environment_hash(runtime_config)
+    runtime_identity_hash = _hash({
+        "environment_hash": environment_hash, "gpu_contract": contract})
+    return {
+        "version": 1, "protocol": "sandbox-gpu-canary-v1", "ok": True,
+        "checked_at_unix": NOW,
+        "candidate_hash": candidate_hash,
+        "contract_hash": _hash(contract),
+        "environment_hash": environment_hash,
+        "runtime_identity_hash": runtime_identity_hash,
+        "inventory": contract["devices"],
+        "guardian": {
+            "operation_id": "exec-" + "5" * 32,
+            "state": "terminal", "outcome": "exit", "returncode": 0,
+            "group_drained": True, "containment": "docker-container-v1",
+            "context": {
+                "phase": "deployment-gpu-canary",
+                "candidate_hash": candidate_hash,
+                "runtime_identity_hash": runtime_identity_hash,
+                "log_name": "gpu-canary.log",
+            },
+            "sandbox": {
+                "backend": "docker-container-v1",
+                "spec_sha256": "sha256:" + "4" * 64,
+                "container_drained": True,
+            },
+        },
+        "execution": {
+            "log_path": "/work/gpu-canary.log",
+            "log_sha256": "sha256:" + "3" * 64,
+            "process_receipt_path": "/work/execution.json",
+            "operation_id": "exec-" + "5" * 32,
+            "sandbox_spec_sha256": "sha256:" + "4" * 64,
+        },
+        "error": None,
+    }
 
 
 def test_development_always_writes_private_nonproduction_receipt(tmp_path):
@@ -176,11 +228,29 @@ def test_development_always_writes_private_nonproduction_receipt(tmp_path):
     receipt = preflight.run()
     assert receipt["production_ready"] is False
     assert receipt["mode"] == "development"
-    assert receipt["facts"]["docker"]["error"] == "daemon unavailable"
+    assert receipt["prerequisite"]["facts"]["docker"]["error"] == "daemon unavailable"
     raw = preflight.receipt_path.read_bytes()
     assert stat.S_IMODE(preflight.receipt_path.stat().st_mode) == 0o600
     assert raw == (json.dumps(receipt, ensure_ascii=False, sort_keys=True,
                               separators=(",", ":")) + "\n").encode()
+
+
+def test_prerequisite_candidate_is_deep_frozen_and_replayable(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    preflight = DeploymentPreflight(
+        work, _policy("development"), _sandbox(), "owner-frozen",
+        probe_backend=FakeProbe(_facts(work)), clock=lambda: NOW)
+    returned = preflight.prepare()
+    original_uid = returned["facts"]["service"]["uid"]
+    returned["facts"]["service"]["uid"] = 999999
+    returned["checks"][0]["ok"] = not returned["checks"][0]["ok"]
+    receipt = preflight.finalize(None)
+    prerequisite = receipt["prerequisite"]
+    assert prerequisite["facts"]["service"]["uid"] == original_uid
+    projection = {
+        key: value for key, value in prerequisite.items() if key != "candidate_hash"}
+    assert receipt["candidate_hash"] == prerequisite["candidate_hash"] == _hash(projection)
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
@@ -193,7 +263,7 @@ def test_production_positive_with_zero_requested_gpus(tmp_path):
     receipt = preflight.run()
     assert receipt["production_ready"] is True
     assert all(item["ok"] for item in receipt["checks"])
-    assert receipt["attestation"]["sha256"].startswith("sha256:")
+    assert receipt["prerequisite"]["attestation"]["sha256"].startswith("sha256:")
     assert probe.calls == 1
 
 
@@ -244,18 +314,188 @@ def test_production_rejects_core_trust_failures(tmp_path, failure):
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
-def test_requested_gpu_fails_until_sandbox_device_bridge_exists(tmp_path):
+def test_requested_gpu_requires_guardian_canary_then_becomes_ready(tmp_path, monkeypatch):
     memory = 80 * 1024 ** 3
     value = _attestation(gpu={"GPU-test-0001": memory})
     facts = _facts(tmp_path / "work")
     facts["gpu"]["inventory"] = [
-        {"index": 0, "uuid": "GPU-test-0001", "memory_bytes": memory}]
+        {"index": 0, "uuid": "GPU-test-0001", "model": "NVIDIA A100",
+         "memory_bytes": memory, "compute_capability": "8.0"},
+        {"index": 1, "uuid": "GPU-unallocated", "model": "NVIDIA A100",
+         "memory_bytes": memory, "compute_capability": "8.0"},
+    ]
     path = tmp_path / "deployment.json"
     _write_attestation(path, value)
     preflight, _probe = _run(
         tmp_path, _policy(attestation_path=path, gpus=1), facts)
+    candidate = preflight.prepare()
+    assert [item["uuid"] for item in candidate["gpu_contract"]["devices"]] == [
+        "GPU-test-0001"]
     with pytest.raises(DeploymentPreflightError, match="sandbox_gpu_access"):
-        preflight.run()
+        preflight.finalize(None)
+
+    # A fresh two-phase attempt accepts only evidence bound to that exact map.
+    preflight, _probe = _run(
+        tmp_path, _policy(attestation_path=path, gpus=1), facts,
+        owner="owner-gpu-ready")
+    candidate = preflight.prepare()
+    # The durable log/guardian authority replay is covered separately; this
+    # unit isolates the pure final evaluator with an already-validated result.
+    monkeypatch.setattr(
+        preflight, "_validate_gpu_evidence_authority",
+        lambda _evidence, _candidate: None)
+    receipt = preflight.finalize(_gpu_evidence(
+        candidate["gpu_contract"], candidate["candidate_hash"]))
+    assert receipt["production_ready"] is True
+    assert receipt["phase"] == "final"
+    assert receipt["gpu_canary"]["contract_hash"] == candidate["gpu_contract_hash"]
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
+def test_gpu_attestation_is_exact_service_allocation_not_host_inventory(tmp_path):
+    memory = 80 * 1024 ** 3
+    path = tmp_path / "deployment.json"
+    _write_attestation(path, _attestation(gpu={
+        "GPU-a": memory, "GPU-c": memory,
+    }))
+    facts = _facts(tmp_path / "work")
+    facts["gpu"]["inventory"] = [
+        {"index": index, "uuid": uuid, "model": "NVIDIA A100",
+         "memory_bytes": memory, "compute_capability": "8.0"}
+        for index, uuid in enumerate(("GPU-a", "GPU-b", "GPU-c", "GPU-d"))
+    ]
+    preflight, _probe = _run(
+        tmp_path, _policy(attestation_path=path, gpus=2), facts)
+    candidate = preflight.prepare()
+    assert [item["uuid"] for item in candidate["gpu_contract"]["devices"]] == [
+        "GPU-a", "GPU-c"]
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
+def test_gpu_attestation_count_must_equal_policy_request(tmp_path):
+    memory = 80 * 1024 ** 3
+    path = tmp_path / "deployment.json"
+    _write_attestation(path, _attestation(gpu={"GPU-a": memory, "GPU-b": memory}))
+    facts = _facts(tmp_path / "work")
+    facts["gpu"]["inventory"] = [
+        {"index": index, "uuid": uuid, "model": "NVIDIA A100",
+         "memory_bytes": memory, "compute_capability": "8.0"}
+        for index, uuid in enumerate(("GPU-a", "GPU-b"))
+    ]
+    preflight, _probe = _run(
+        tmp_path, _policy(attestation_path=path, gpus=1), facts)
+    with pytest.raises(DeploymentPreflightError) as caught:
+        preflight.prepare()
+    assert "gpu_inventory" in str(caught.value)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
+def test_gpu_canary_evidence_must_bind_guardian_spec_and_candidate(tmp_path):
+    memory = 80 * 1024 ** 3
+    path = tmp_path / "deployment.json"
+    _write_attestation(path, _attestation(gpu={"GPU-a": memory}))
+    facts = _facts(tmp_path / "work")
+    facts["gpu"]["inventory"] = [{
+        "index": 0, "uuid": "GPU-a", "model": "NVIDIA A100",
+        "memory_bytes": memory, "compute_capability": "8.0",
+    }]
+    preflight, _probe = _run(
+        tmp_path, _policy(attestation_path=path, gpus=1), facts,
+        owner="owner-gpu-forged")
+    candidate = preflight.prepare()
+    evidence = _gpu_evidence(
+        candidate["gpu_contract"], candidate["candidate_hash"])
+    evidence["guardian"]["sandbox"]["spec_sha256"] = "sha256:" + "9" * 64
+    with pytest.raises(DeploymentPreflightError, match="sandbox_gpu_access") as caught:
+        preflight.finalize(evidence)
+    assert caught.value.receipt["gpu_canary"] is None
+    assert caught.value.receipt["gpu_canary_validation_error"]
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
+def test_v1_attestation_is_rejected_after_exact_allocation_protocol_upgrade(tmp_path):
+    path = tmp_path / "deployment.json"
+    value = _attestation()
+    value.update({"version": 1, "protocol": "deployment-attestation-v1"})
+    _write_attestation(path, value)
+    preflight, _probe = _run(
+        tmp_path, _policy(attestation_path=path), _facts(tmp_path / "work"))
+    with pytest.raises(DeploymentPreflightError) as caught:
+        preflight.prepare()
+    assert "attestation_loaded" in str(caught.value)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
+@pytest.mark.parametrize(
+    "drift", [None, "owner", "kind", "fence", "engine", "spec", "log_hash"])
+def test_gpu_canary_authority_replays_exact_log_and_guardian(
+        tmp_path, monkeypatch, drift):
+    import orchestrator.deployment_preflight as DP
+
+    memory = 80 * 1024 ** 3
+    path = tmp_path / "deployment.json"
+    _write_attestation(path, _attestation(gpu={"GPU-a": memory}))
+    facts = _facts(tmp_path / "work")
+    facts["gpu"]["inventory"] = [{
+        "index": 0, "uuid": "GPU-a", "model": "NVIDIA A100",
+        "memory_bytes": memory, "compute_capability": "8.0",
+    }]
+    preflight, _probe = _run(
+        tmp_path, _policy(attestation_path=path, gpus=1), facts,
+        owner="owner-gpu-authority")
+    candidate = preflight.prepare()
+    evidence = _gpu_evidence(
+        candidate["gpu_contract"], candidate["candidate_hash"])
+    token = candidate["candidate_hash"].removeprefix("sha256:")[:32]
+    log_path = (tmp_path / "work" / "state" / "deployment" / "gpu-canary"
+                / token / "gpu-canary.log")
+    log_path.parent.mkdir(parents=True)
+    raw = b"GPU-a, NVIDIA A100, 81920, 8.0, 535.129.03\n"
+    log_path.write_bytes(raw)
+    operation_id = evidence["execution"]["operation_id"]
+    receipt_path = (tmp_path / "work" / "state" / "executions"
+                    / f"execution-{operation_id}.json")
+    evidence["execution"].update({
+        "log_path": str(log_path),
+        "log_sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        "process_receipt_path": str(receipt_path),
+    })
+    guardian = evidence["guardian"]
+    receipt = {
+        "owner_id": "owner-gpu-authority", "kind": "deployment-gpu-canary",
+        "fenced_by_instance_lease": True,
+        "operation_id": operation_id, "state": "terminal", "outcome": "exit",
+        "returncode": 0, "group_drained": True,
+        "containment": "docker-container-v1", "context": guardian["context"],
+        "sandbox": {
+            "backend": "docker-container-v1",
+            "engine_path": os.path.realpath("/usr/bin/docker"),
+            "engine_host": _sandbox()["engine_host"],
+            "resource_mode": _sandbox()["resource_mode"],
+            "spec_sha256": guardian["sandbox"]["spec_sha256"],
+            "container_drained": True,
+        },
+    }
+    if drift == "owner":
+        receipt["owner_id"] = "other-owner"
+    elif drift == "kind":
+        receipt["kind"] = "other-kind"
+    elif drift == "fence":
+        receipt["fenced_by_instance_lease"] = False
+    elif drift == "engine":
+        receipt["sandbox"]["engine_path"] = "/usr/bin/true"
+    elif drift == "spec":
+        receipt["sandbox"]["spec_sha256"] = "sha256:" + "9" * 64
+    elif drift == "log_hash":
+        evidence["execution"]["log_sha256"] = "sha256:" + "8" * 64
+    monkeypatch.setattr(DP, "read_receipt", lambda checked: (
+        receipt if checked == receipt_path else pytest.fail("wrong receipt path")))
+    monkeypatch.setattr(DP, "validate_execution_receipt", lambda _r, _p: None)
+    if drift is None:
+        preflight._validate_gpu_evidence_authority(evidence, candidate)
+    else:
+        with pytest.raises(ValueError):
+            preflight._validate_gpu_evidence_authority(evidence, candidate)
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
@@ -282,7 +522,7 @@ def test_reprobe_overwrites_stale_success_after_attestation_tamper(tmp_path):
     preflight, _ = _run(
         tmp_path, _policy(attestation_path=path), probe, owner="owner-reprobe")
     success = preflight.run()
-    old_hash = success["attestation"]["sha256"]
+    old_hash = success["prerequisite"]["attestation"]["sha256"]
 
     value["service"]["username"] = "tampered-service"
     _write_attestation(path, value)

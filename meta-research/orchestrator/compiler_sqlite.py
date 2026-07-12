@@ -24,7 +24,10 @@ import re
 from typing import Any, Dict, List, Optional
 
 from .budgeting import compute_budget
-from .execution_sandbox import sandbox_environment_hash
+from .execution_sandbox import (
+    sandbox_environment_hash,
+    sandbox_workload_environment_hash,
+)
 from .ids import cnum as _cnum
 from .import_authority import ImportAuthorityError, load_question_import_authority
 from .importer import DeferredImporter
@@ -156,13 +159,20 @@ def _normalized_requested_item(item: Any, *, request_id: int, item_no: int) -> D
 
 
 class SqliteCompiler:
-    def __init__(self, conn, policy: Dict[str, Any]):
+    def __init__(self, conn, policy: Dict[str, Any], *,
+                 runtime_environment_hash: Optional[str] = None):
         # conn = 本类**独占**的只读用连接（isolation_level=None 交本类掌控事务，供 render 钉单一读快照）。
         # 「只读」是架构约定：调用方（M3 Advancer）应传一条专用读连接（宜 mode=ro，§6.2 WAL 读写分离）；
         # 本类只读不写，不在此强制 mode=ro（编译器不该越俎给连接改物理模式）。
         conn.isolation_level = None
         self.conn = conn
         self.policy = policy
+        if (runtime_environment_hash is not None
+                and (not isinstance(runtime_environment_hash, str)
+                     or re.fullmatch(
+                         r"sha256:[0-9a-f]{64}", runtime_environment_hash) is None)):
+            raise ValueError("compiler runtime_environment_hash 非法")
+        self.runtime_environment_hash = runtime_environment_hash
 
     # -- Compiler Protocol ------------------------------------------------------
     def render(self, *, cycle_id: str, stage: Stage, target_id: Optional[str] = None) -> ContextPack:
@@ -985,7 +995,7 @@ class SqliteCompiler:
             + reason + suffix)
 
     def _baseline_environment_hash(self, baseline_id: int) -> tuple[str, bool]:
-        """Inherit the exact imported runtime; ordinary baselines use policy bootstrap."""
+        """Return raw runtime identity; bundle later derives CPU/GPU workload identity."""
         rows = self.conn.execute(
             "SELECT DISTINCT r.env_hash FROM variant v "
             "JOIN checkpoint c ON c.variant_id=v.id "
@@ -1002,7 +1012,8 @@ class SqliteCompiler:
                     or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None):
                 raise RuntimeError(f"baseline {baseline_id} imported env_hash 非法")
             return value, True
-        return sandbox_environment_hash(self.policy["execution"]["sandbox"]), False
+        return (self.runtime_environment_hash
+                or sandbox_environment_hash(self.policy["execution"]["sandbox"])), False
 
     def _bundle_target(self, target_id, sources) -> str:
         """bundle 目标锚区（步⑧）：resolved 切片全文 + plan_slice_hash（manifest.target_ref 须回引）+ required
@@ -1024,17 +1035,26 @@ class SqliteCompiler:
                                  "WHERE build_target_id=? ORDER BY metric_id, metric_ver", (bt,)).fetchall()
         req_md = "、".join(f"{m}@{v}" for m, v in reqs) or "（无）"
         sandbox = self.policy["execution"]["sandbox"]
-        env_hash, inherited = self._baseline_environment_hash(row[1])
+        runtime_env_hash, inherited = self._baseline_environment_hash(row[1])
+        gpu_required = slice_.get("gpu_required", False)
+        if not isinstance(gpu_required, bool):
+            raise RuntimeError(f"build_target {bt} plan_slice.gpu_required 非 bool")
+        env_hash = sandbox_workload_environment_hash(
+            runtime_env_hash, gpu_required)
         sources.append(
             f"db:baseline:{row[1]}:external-import-environment"
-            if inherited else "policy:execution.sandbox")
+            if inherited else (
+                "runtime:execution-sandbox"
+                if self.runtime_environment_hash is not None
+                else "policy:execution.sandbox"))
         image_line = (
-            "verified dependency image capability（编排器按 env_hash 从内容寻址 receipt 解析）"
+            "verified dependency image capability（编排器按 baseline runtime identity 解析）"
             if inherited else sandbox["image"])
         return ("## 本目标（bundle 编译执行契约）\n"
                 f"- build_target: {bt}（eval_key={row[3]}）\n"
                 f"- **plan_slice_hash（manifest.target_ref.plan_slice_hash 须回引此值）**: `{slice_hash}`\n"
                 f"- required 指标绑定（eval 命令 `metric_value: <id>@<ver>=<float>` 须用这些 int）: {req_md}\n"
+                f"- **gpu_required（manifest 须逐字照抄）**: `{str(gpu_required).lower()}`\n"
                 f"- **env_hash（manifest.env_hash 须逐字照抄）**: `{env_hash}`\n"
                 f"- pinned sandbox image（只作复现身份，不得改写）: `{image_line}`\n"
                 "- 执行边界: network=none、rootfs=readonly、输入只读快照、输出 quarantine；"

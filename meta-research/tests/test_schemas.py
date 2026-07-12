@@ -149,6 +149,19 @@ def test_policy_yaml_parses_and_validates():
     make_validator("policy").validate(policy)
 
 
+def test_plan_gpu_requirement_is_additive_abstract_resource_intent():
+    path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
+    legacy = load_json(path)
+    validator = make_validator("plan")
+    validator.validate(legacy)  # old frozen slices default to CPU
+    with_gpu = load_json(path)
+    with_gpu["targets"][0]["gpu_required"] = True
+    validator.validate(with_gpu)
+    with_gpu["targets"][0]["gpu_required"] = "true"
+    with pytest.raises(ValidationError):
+        validator.validate(with_gpu)
+
+
 def test_policy_plan_review_semantic_rounds_are_capped_at_two():
     with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
         policy = yaml.safe_load(f)

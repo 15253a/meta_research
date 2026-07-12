@@ -11,17 +11,40 @@ import pytest
 import yaml
 
 from orchestrator.execution_sandbox import (
+    _verify_created_container,
     _daemon_bind_source_candidates,
     DockerExecutionSandbox,
     ExecutionSandboxError,
+    gpu_capability_projection,
+    gpu_cli_argument,
+    gpu_contract_hash,
     sandbox_environment_hash,
+    sandbox_workload_environment_hash,
 )
 from orchestrator.harness import ExecutionRecoveryError, recover_staged_result, run_staged
-from orchestrator.process_supervisor import ExecutionSupervisor, SupervisedTimeoutExpired
+from orchestrator.process_supervisor import (
+    ExecutionSupervisor,
+    SupervisedTimeoutExpired,
+    atomic_write_receipt,
+)
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+
+
+def _gpu_contract(*uuids):
+    return {
+        "version": 1, "provider": "nvidia", "driver_version": "535.129.03",
+        "request": {
+            "driver": "nvidia",
+            "capabilities": ["compute", "utility", "gpu"], "options": {},
+        },
+        "devices": [{
+            "uuid": uuid, "model": "NVIDIA A100-SXM4-80GB",
+            "memory_bytes": 80 * 1024 ** 3, "compute_capability": "8.0",
+        } for uuid in uuids],
+    }
 
 
 def _runtime(tmp_path):
@@ -58,6 +81,190 @@ def test_environment_identity_is_exact_policy_projection():
     assert value.startswith("sha256:") and len(value) == 71
     changed = {**POLICY["execution"]["sandbox"], "memory_mb": 8192}
     assert sandbox_environment_hash(changed) != value
+
+
+def test_gpu_capability_hash_is_stable_but_allocation_identity_is_exact():
+    first = _gpu_contract("GPU-b", "GPU-a")
+    replacement = _gpu_contract("GPU-d", "GPU-c")
+    assert gpu_capability_projection(first) == gpu_capability_projection(replacement)
+    first_config = {
+        **POLICY["execution"]["sandbox"],
+        "gpu_capability": gpu_capability_projection(first),
+    }
+    replacement_config = {
+        **POLICY["execution"]["sandbox"],
+        "gpu_capability": gpu_capability_projection(replacement),
+    }
+    first_runtime = sandbox_environment_hash(first_config)
+    replacement_runtime = sandbox_environment_hash(replacement_config)
+    assert first_runtime == replacement_runtime
+    assert sandbox_workload_environment_hash(first_runtime, False) == first_runtime
+    assert sandbox_workload_environment_hash(
+        first_runtime, True) == sandbox_workload_environment_hash(
+            replacement_runtime, True)
+    assert sandbox_workload_environment_hash(
+        first_runtime, True) != sandbox_workload_environment_hash(
+            first_runtime, False)
+    with pytest.raises(ValueError, match="gpu_required"):
+        sandbox_workload_environment_hash(first_runtime, 1)
+    with pytest.raises(ValueError, match="runtime_environment_hash"):
+        sandbox_workload_environment_hash("not-a-hash", False)
+    assert gpu_contract_hash(first) != gpu_contract_hash(replacement)
+    assert gpu_cli_argument(first) == (
+        '"driver=nvidia","device=GPU-a,GPU-b",'
+        '"capabilities=compute,utility"')
+
+
+def test_gpu_prepare_binds_exact_request_and_inspect_rejects_drift(tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    contract = _gpu_contract("GPU-b", "GPU-a")
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"],
+        gpu_contract=contract)
+    sandbox._preflight_done = True
+    sandbox._resource_mode = POLICY["execution"]["sandbox"]["resource_mode"]
+    context = {"phase": "gpu-unit", "log_name": "gpu.log"}
+    invocation = sandbox.prepare(
+        ["python", "-c", "pass"], staging_dir=work / "run",
+        log_name="gpu.log", env=None, timeout_s=10,
+        execution_context=context, gpu_required=True)
+    try:
+        invocation.spec_file.seek(0)
+        spec = json.loads(invocation.spec_file.read())
+        assert [item["uuid"] for item in spec["gpu"]["devices"]] == [
+            "GPU-a", "GPU-b"]
+        assert spec["env"]["NVIDIA_DRIVER_CAPABILITIES"] == "compute,utility"
+        expected_request = [{
+            "Driver": "nvidia", "Count": 0,
+            "DeviceIDs": ["GPU-a", "GPU-b"],
+            "Capabilities": [["compute", "utility", "gpu"]], "Options": {},
+        }]
+        host_mounts = [
+            {"Type": "bind", "Source": spec["input_root"],
+             "Target": "/mr/input", "ReadOnly": True},
+            {"Type": "bind", "Source": spec["output_root"],
+             "Target": "/mr/output", "ReadOnly": False},
+        ]
+        payload = [{
+            "Name": "/" + spec["name"], "Image": spec["image_id"],
+            "Config": {
+                "Labels": {"meta-research.sandbox-token": spec["token"]},
+                "User": "65534:65534", "Entrypoint": None,
+                "Cmd": spec["argv"], "WorkingDir": "/mr/output",
+                "Env": [f"{key}={value}" for key, value in spec["env"].items()],
+            },
+            "HostConfig": {
+                "SecurityOpt": ["no-new-privileges:true", "seccomp=/pinned.json"],
+                "NetworkMode": "none", "ReadonlyRootfs": True,
+                "Privileged": False, "IpcMode": "none", "PidMode": "",
+                "CapDrop": ["ALL"], "Devices": [],
+                "DeviceRequests": expected_request,
+                "PidsLimit": spec["limits"]["pids"],
+                "Memory": spec["limits"]["memory_bytes"],
+                "MemorySwap": spec["limits"]["memory_bytes"],
+                "NanoCpus": int(spec["limits"]["cpus"] * 1_000_000_000),
+                "Tmpfs": {"/tmp": (
+                    "rw,nosuid,nodev,noexec,size="
+                    f"{spec['limits']['tmpfs_bytes']}")},
+                "ShmSize": spec["limits"]["shm_bytes"],
+                "LogConfig": {"Type": "json-file", "Config": {
+                    "max-file": "2", "max-size":
+                    f"{max(1, spec['limits']['max_log_bytes'] // 2)}b"}},
+                "AutoRemove": False, "Mounts": host_mounts,
+            },
+            "Mounts": [
+                {"Type": "bind", "Destination": "/mr/input", "RW": False},
+                {"Type": "bind", "Destination": "/mr/output", "RW": True},
+            ],
+        }]
+        _verify_created_container(spec, payload)
+        payload[0]["HostConfig"]["DeviceRequests"][0]["DeviceIDs"].append("GPU-extra")
+        with pytest.raises(ExecutionSandboxError, match="安全/资源配置"):
+            _verify_created_container(spec, payload)
+    finally:
+        invocation.close()
+
+
+def test_gpu_required_fails_before_session_creation_without_contract(tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"])
+    with pytest.raises(ExecutionSandboxError, match="exact GPU allocation"):
+        sandbox.prepare(
+            ["python", "-c", "pass"], staging_dir=work / "run",
+            log_name="gpu.log", env=None, timeout_s=10, gpu_required=True)
+    assert not (work / "run").exists()
+
+
+def test_cgroup_gpu_keeps_resident_memory_limit_without_cuda_rlimit_as_trap(tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    config = {**POLICY["execution"]["sandbox"], "resource_mode": "cgroup-v2"}
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=config, gpu_contract=_gpu_contract("GPU-a"))
+    sandbox._preflight_done = True
+    sandbox._resource_mode = "cgroup-v2"
+    invocation = sandbox.prepare(
+        ["python", "-c", "pass"], staging_dir=work / "run",
+        log_name="gpu.log", env=None, timeout_s=10,
+        execution_context={"phase": "gpu-cgroup", "log_name": "gpu.log"},
+        gpu_required=True)
+    try:
+        invocation.spec_file.seek(0)
+        spec = json.loads(invocation.spec_file.read())
+        assert spec["limits"]["memory_bytes"] == config["memory_mb"] * 1024 ** 2
+        assert spec["limits"]["address_space_bytes"] == -1
+        assert spec["argv"][5] == "-1"
+    finally:
+        invocation.close()
+
+
+def test_startup_recovers_db_less_gpu_canary_exit_publish_gap(tmp_path):
+    work = tmp_path / "work"
+    (work / "state" / "executions").mkdir(parents=True)
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"])
+    sandbox._preflight_done = True
+    sandbox._resource_mode = POLICY["execution"]["sandbox"]["resource_mode"]
+    context = {
+        "phase": "deployment-gpu-canary", "candidate_hash": "sha256:" + "a" * 64,
+        "runtime_identity_hash": sandbox.runtime_identity_hash,
+        "log_name": "gpu-canary.log",
+    }
+    invocation = sandbox.prepare(
+        ["python", "-c", "pass"], staging_dir=work / "canary",
+        log_name="gpu-canary.log", env=None, timeout_s=10,
+        execution_context=context)
+    try:
+        partial = work / "canary" / "gpu-canary.log.partial"
+        partial.write_bytes(b"GPU canary complete\n")
+        operation_id = "exec-" + "b" * 32
+        receipt = {
+            "operation_id": operation_id, "containment": "docker-container-v1",
+            "state": "terminal", "outcome": "exit", "returncode": 0,
+            "group_drained": True, "context": context,
+            "sandbox": {**invocation.external_container, "container_drained": True},
+        }
+        atomic_write_receipt(
+            work / "state" / "executions" / f"execution-{operation_id}.json",
+            receipt)
+
+        class _Supervisor:
+            receipt_dir = work / "state" / "executions"
+
+            @staticmethod
+            def recover_previous_generation():
+                return None
+
+        assert sandbox.recover_terminal_sessions(_Supervisor()) == 1
+        assert (work / "canary" / "gpu-canary.log").read_bytes() == b"GPU canary complete\n"
+        assert (work / "canary" / "gpu-canary.log.exit").read_bytes() == b"0"
+        assert list((work / "canary" / ".sandbox-meta").glob("*.promoted.json"))
+        assert not partial.exists()
+    finally:
+        invocation.close()
 
 
 def test_trusted_payload_environment_is_identity_bound_and_not_overridable(tmp_path):

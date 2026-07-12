@@ -135,10 +135,20 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
 - service 私有 Codex home/auth、直接 rootless unix Docker socket、daemon ID/root dir、非 fallback cgroup 与资源 limit capability；
 - exact work-root/GPFS mount，以及部署 root 从 `gpfs-fileset-v1` 权威 probe 签发的 hard byte+inode quota
   snapshot（进程实时核 mount，不自行调用 GPFS；`df`/`statvfs` 不能代替 quota）；
-- GPU inventory 与容器 device 可达性，以及 Docker backing store 的实际 headroom。
+- `gpu.memory_bytes_by_uuid` 给本 service 分配的 exact UUID 子集（不是整机 inventory）、对应型号/显存/
+  compute capability/driver 的 live identity、NVIDIA runtime 与容器 device 可达性，以及 Docker backing store 的实际 headroom。
 
-任一项缺失、过期或漂移都会在 SQLite、connector 和 Runner 启动前失败。当前检查点仍不开放容器 GPU devices：
-因此 `resources.gpus>0` 的 production 会明确拒绝；development 可跑 CPU 链路，但不得把主机可见 GPU 写成容器可用。
+启动分两段且不新增部署状态机：先只读验证除容器 canary 外的全部静态身份/能力（含 GPU inventory/runtime），
+只有 production 的这些检查全部通过后才允许既有
+guardian/session recovery；随后用同一 guardian 对 exact UUID 跑一次真实 Docker DeviceRequest canary，严格反核
+create 后 inspect 与容器内 `nvidia-smi` inventory，最后才写 final receipt 并开放 SQLite、connector 和 Runner。
+v2 receipt 的静态失败形状为 `phase=prerequisite`；完成第二段后为 `phase=final`，其冻结 facts/attestation 位于
+嵌套的 `prerequisite` 中，GPU canary 与最终 checks 位于顶层，旧 v1 顶层消费者必须显式迁移。
+型号/显存/compute capability/driver 进入可复现 runtime hash，plan 冻结的 CPU/GPU access mode 再派生 workload
+env hash；物理 UUID 另进入每次 invocation spec/runtime identity。因此 CPU/GPU 结果不会互相复用，等能力换卡仍可
+复用依赖镜像，但任何 GPU invocation 都绑定当次 exact allocation。任一项缺失、过期或漂移都会
+fail-closed。development 仍永不产生 production-ready 声明；它可继续 CPU 链路，但 GPU 实验在缺 contract 时会在
+创建 session 前明确拒绝。
 
 ## 4. 观测与人工干预（跑起来之后）
 
@@ -273,8 +283,10 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   `RLIMIT_AS/NPROC/NOFILE/FSIZE/CORE`，guardian
   另管 wall deadline；绝不声称 aggregate memory/CPU cgroup 已生效。`max_output_mb/max_output_files` 是
   quarantine 后验闸，生产仍必须给 work-root/VEPFS 配硬 byte+inode quota。默认 bootstrap image 也未开放
-  GPU/device；GPU 真研究须换成已锁依赖的
-  exact image 并在具备受验 device/cgroup delegation 的部署后再宣称资源隔离完成。
+  CUDA 用户态库；GPU 真研究须通过 dependency image 锁定所需 CUDA/framework。具备受验 cgroup 的 GPU
+  invocation 继续由 memory.max 限 resident host memory，但不设置会误杀 CUDA 大虚拟地址预留的有限
+  `RLIMIT_AS`；只有 GPU canary、cgroup 与 memory/CPU/PID limit 三者都通过才推广 GPU sandbox，fallback
+  节点仍保留有限 RLIMIT、只运行 CPU workload 且不能成为 production。
 - deployment preflight 会把上述差距机械写成 `production_ready=false`。当前节点还以 root 运行、Docker socket
   经 symlink 进入共享 rootless daemon、容器无 NVIDIA runtime、GPFS hard byte+inode quota 无权威 probe，且
   Docker backing store 已接近/达到空间上限；这些都不是代码内的“允许降级”，切 production 会 fail-closed。
