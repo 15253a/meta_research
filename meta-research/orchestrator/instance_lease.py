@@ -214,7 +214,8 @@ class InstanceLease:
     @classmethod
     def acquire(cls, work_root: Union[str, Path], *,
                 heartbeat_interval_s: float = 1.0,
-                restore_claim_token: Optional[str] = None) -> "InstanceLease":
+                restore_claim_token: Optional[str] = None,
+                expected_restore_marker: Optional[bytes] = None) -> "InstanceLease":
         if (isinstance(heartbeat_interval_s, bool)
                 or not isinstance(heartbeat_interval_s, (int, float))
                 or not 0.02 <= float(heartbeat_interval_s) <= 60.0):
@@ -222,6 +223,12 @@ class InstanceLease:
         expected_restore_claim = (
             None if restore_claim_token is None
             else restore_claim_bytes(restore_claim_token))
+        if (expected_restore_marker is not None
+                and (not isinstance(expected_restore_marker, bytes)
+                     or not expected_restore_marker
+                     or len(expected_restore_marker) > 1024)):
+            raise ValueError(
+                "expected_restore_marker 须为非空有界 bytes")
         # Lexical absolute path preserves the acquired pathname identity across
         # later chdir() without resolving/following a symlink component.
         root = Path(os.path.abspath(os.fspath(work_root)))
@@ -297,15 +304,32 @@ class InstanceLease:
             lock_info = _verify_entry_matches_fd(
                 work_fd, LOCK_NAME, lock_fd,
                 label="orchestrator instance lock", regular=True)
+            marker_fd = -1
+            marker_present = False
             try:
-                os.stat(
-                    RESTORE_IN_PROGRESS_NAME, dir_fd=work_fd,
-                    follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise InstanceLeaseError(
-                    "work_root 存在未完成离线 restore；拒绝启动并保留现场")
+                try:
+                    marker_fd = os.open(
+                        RESTORE_IN_PROGRESS_NAME, _READ_FLAGS, dir_fd=work_fd)
+                except FileNotFoundError:
+                    pass
+                else:
+                    marker_present = True
+                    marker_info = _verify_entry_matches_fd(
+                        work_fd, RESTORE_IN_PROGRESS_NAME, marker_fd,
+                        label="restore in-progress marker", regular=True)
+                    marker_raw = _read_fd_bounded(marker_fd)
+                    if (expected_restore_marker is None
+                            or marker_info.st_uid != os.geteuid()
+                            or marker_info.st_nlink != 1
+                            or stat.S_IMODE(marker_info.st_mode) != 0o400
+                            or marker_raw != expected_restore_marker):
+                        raise InstanceLeaseError(
+                            "work_root 存在未完成离线 restore；拒绝启动并保留现场")
+            finally:
+                if marker_fd >= 0:
+                    os.close(marker_fd)
+            if expected_restore_marker is not None and not marker_present:
+                raise InstanceLeaseError("预期的 restore continuation marker 缺失")
             parent_fd = open_directory_path(
                 root.parent, label="orchestrator work_root parent")
             claim_fd = -1

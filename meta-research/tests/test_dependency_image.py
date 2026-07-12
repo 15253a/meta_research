@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import subprocess
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -16,6 +17,8 @@ import yaml
 
 from orchestrator.dependency_image import PythonWheelImageBuilder
 from orchestrator.dependency_image_common import _wheel_url_is_allowed
+from orchestrator.dependency_image_inspector import inspect_dependency_image_object
+import orchestrator.dependency_image_runtime as dependency_image_runtime
 from orchestrator.execution_sandbox import (
     DockerExecutionSandbox,
     ExecutionSandboxError,
@@ -81,6 +84,253 @@ def _lock(filename: str, payload: bytes) -> dict:
             "bytes": len(payload),
         }],
     }
+
+
+def _pure_dependency_image_object(
+        tmp_path, *, wheel_host="files.pythonhosted.org"):
+    """Build the immutable on-disk provider contract without Docker or network."""
+    dependency_config = POLICY["import_materialization"]["dependency_image"]
+    compiler = POLICY["import_materialization"]["compiler"]
+    bootstrap = POLICY["execution"]["sandbox"]
+    base_environment_hash = sandbox_environment_hash(bootstrap)
+    builder_config_hash = _value_hash({
+        "builder": dependency_config,
+        "compiler": compiler,
+        "bootstrap_environment_hash": base_environment_hash,
+    })
+    wheel_name = "mr_demo-1.0-py3-none-any.whl"
+    wheel_payload = b"fixture wheel bytes\n"
+    wheel = {
+        "name": "mr-demo", "version": "1.0", "filename": wheel_name,
+        "url": f"https://{wheel_host}/packages/{wheel_name}",
+        "sha256": "sha256:" + hashlib.sha256(wheel_payload).hexdigest(),
+        "bytes": len(wheel_payload),
+    }
+    lock = {
+        "version": 1,
+        "python": compiler,
+        "platform": {"os": "linux", "architecture": "amd64"},
+        "distributions": [wheel],
+    }
+    lock_raw = _canonical(lock)
+    lock_sha256 = "sha256:" + hashlib.sha256(lock_raw).hexdigest()
+    lock_canonical_hash = _value_hash(lock)
+    closure_hash = _value_hash({
+        "provider": "python-wheel-image-v1",
+        "lock_sha256": lock_sha256,
+        "canonical_lock_hash": lock_canonical_hash,
+        "base_image": bootstrap["image"],
+        "base_image_id": bootstrap["image_id"],
+        "builder_config_hash": builder_config_hash,
+    })
+    result_image_id = "sha256:" + "c" * 64
+    payload_environment = {
+        **bootstrap["payload_environment"],
+        "PYTHONPATH": dependency_config["site_packages_path"],
+    }
+    derived_config = dict(bootstrap)
+    derived_config.update({
+        "image": result_image_id,
+        "image_id": result_image_id,
+        "payload_environment": payload_environment,
+    })
+
+    installed_payload = b"VALUE = 42\n"
+    installed_files = [{
+        "path": "mr_demo/__init__.py",
+        "sha256": "sha256:" + hashlib.sha256(installed_payload).hexdigest(),
+        "bytes": len(installed_payload),
+    }]
+    install_manifest_hash = _value_hash(installed_files)
+    installed_manifest = {
+        "version": 1, "files": installed_files,
+        "manifest_hash": install_manifest_hash,
+    }
+    runtime_identity = {
+        "implementation": "cpython", "version": compiler["version"],
+        "executable": "/usr/local/bin/python",
+        "installed_manifest_hash": install_manifest_hash,
+    }
+    runtime_payload = _canonical(runtime_identity)
+    runtime_log = b"runtime verified\n"
+    check_log = b"No broken requirements found.\n"
+    dockerfile = (
+        f"FROM {bootstrap['image_id']}\n"
+        f"COPY site-packages/ {dependency_config['site_packages_path']}/\n"
+        f"LABEL org.meta-research.dependency-closure=\"{closure_hash}\"\n"
+    ).encode("ascii")
+    context_files = sorted([{
+        "path": "Dockerfile",
+        "sha256": "sha256:" + hashlib.sha256(dockerfile).hexdigest(),
+        "bytes": len(dockerfile), "mode": "0444", "mtime_ns": 0,
+    }, {
+        "path": "site-packages/mr_demo/__init__.py",
+        "sha256": installed_files[0]["sha256"],
+        "bytes": len(installed_payload), "mode": "0444", "mtime_ns": 0,
+    }], key=lambda item: item["path"])
+    context_identity = {
+        "version": 1,
+        "root": {"mode": "0555", "mtime_ns": 0},
+        "directories": [
+            {"path": value, "mode": "0555", "mtime_ns": 0}
+            for value in ["site-packages", "site-packages/mr_demo"]],
+        "files": context_files,
+    }
+    archive_payload = b"fixture exact image archive\n"
+    receipt = {
+        "version": 1, "provider": "python-wheel-image-v1",
+        "closure_hash": closure_hash,
+        "builder_config_hash": builder_config_hash,
+        "base_environment_hash": base_environment_hash,
+        "base_image": bootstrap["image"], "base_image_id": bootstrap["image_id"],
+        "result_image_id": result_image_id,
+        "environment_hash": sandbox_environment_hash(derived_config),
+        "payload_environment": payload_environment,
+        "lock": {
+            "path": "python-wheel-lock.json", "sha256": lock_sha256,
+            "bytes": len(lock_raw), "canonical_hash": lock_canonical_hash,
+        },
+        "wheels": [wheel], "wheel_manifest_hash": _value_hash([wheel]),
+        "install_manifest_hash": install_manifest_hash,
+        "build_context_hash": _value_hash(context_identity),
+        "dockerfile_sha256": "sha256:" + hashlib.sha256(dockerfile).hexdigest(),
+        "runtime": {
+            "identity": runtime_identity,
+            "runtime_log_sha256": "sha256:" + hashlib.sha256(runtime_log).hexdigest(),
+            "runtime_output_sha256": "sha256:" + hashlib.sha256(runtime_payload).hexdigest(),
+            "pip_check_log_sha256": "sha256:" + hashlib.sha256(check_log).hexdigest(),
+        },
+        "image_archive": {
+            "sha256": "sha256:" + hashlib.sha256(archive_payload).hexdigest(),
+            "bytes": len(archive_payload),
+        },
+        "compiler": compiler,
+        "engine": {
+            "client_version": "24.0.9", "server_version": "24.0.9",
+            "os": "linux", "architecture": "amd64",
+        },
+    }
+    object_path = tmp_path / closure_hash.removeprefix("sha256:")
+
+    payloads = {
+        "python-wheel-lock.json": lock_raw,
+        f"wheelhouse/{wheel_name}": wheel_payload,
+        "install/site-packages/mr_demo/__init__.py": installed_payload,
+        "installed-manifest.json": _canonical(installed_manifest),
+        "runtime/runtime.json": runtime_payload,
+        "runtime/runtime.log": runtime_log,
+        "runtime/runtime.log.exit": b"0",
+        "check/pip-check.log": check_log,
+        "check/pip-check.log.exit": b"0",
+        "context/Dockerfile": dockerfile,
+        "context/site-packages/mr_demo/__init__.py": installed_payload,
+        "image.tar": archive_payload,
+        "receipt.json": _canonical(receipt),
+    }
+    for relative, payload in payloads.items():
+        destination = object_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+    context_root = object_path / "context"
+    for current, dirs, files in os.walk(object_path, topdown=False):
+        current_path = Path(current)
+        for name in files:
+            file_path = current_path / name
+            in_context = context_root in file_path.parents
+            os.chmod(file_path, 0o444 if in_context else 0o400)
+            if in_context:
+                os.utime(file_path, ns=(0, 0), follow_symlinks=False)
+        for name in dirs:
+            directory = current_path / name
+            in_context = directory == context_root or context_root in directory.parents
+            os.chmod(directory, 0o555 if in_context else 0o500)
+            if in_context:
+                os.utime(directory, ns=(0, 0), follow_symlinks=False)
+        in_context = current_path == context_root or context_root in current_path.parents
+        os.chmod(current_path, 0o555 if in_context else 0o500)
+        if in_context:
+            os.utime(current_path, ns=(0, 0), follow_symlinks=False)
+    capability = {
+        "version": 1, "provider": "python-wheel-image-v1",
+        "closure_hash": closure_hash, "receipt_hash": _value_hash(receipt),
+        "environment_hash": receipt["environment_hash"],
+        "image": result_image_id, "image_id": result_image_id,
+    }
+    return object_path, capability, {
+        "wheel": object_path / "wheelhouse" / wheel_name,
+        "installed": object_path / "install" / "site-packages" / "mr_demo" / "__init__.py",
+        "runtime": object_path / "runtime" / "runtime.log",
+        "archive": object_path / "image.tar",
+    }
+
+
+def test_dependency_image_file_inspector_is_policy_independent_and_never_uses_docker(
+        tmp_path, monkeypatch):
+    object_path, capability, _artifacts = _pure_dependency_image_object(tmp_path)
+    calls = 0
+
+    def owner_guard():
+        nonlocal calls
+        calls += 1
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("pure dependency-image inspection entered Docker/network")
+
+    monkeypatch.setattr(dependency_image_runtime, "_engine", forbidden)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    receipt, actual = inspect_dependency_image_object(
+        object_path, expected_capability=capability, owner_guard=owner_guard)
+    assert actual == capability
+    assert receipt["closure_hash"] == capability["closure_hash"]
+    assert calls > 0
+
+    work = tmp_path / "runtime-work"
+    (work / "state").mkdir(parents=True)
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"])
+    supervisor = ExecutionSupervisor.standalone(work / "state" / "executions")
+    builder = PythonWheelImageBuilder(
+        work_root=work,
+        config=POLICY["import_materialization"]["dependency_image"],
+        compiler=POLICY["import_materialization"]["compiler"],
+        bootstrap_sandbox=sandbox, execution_supervisor=supervisor)
+    try:
+        assert builder._verify_object(object_path) == (receipt, capability)
+        foreign_path, foreign_capability, _foreign_artifacts = (
+            _pure_dependency_image_object(
+                tmp_path / "foreign-host", wheel_host="example.com"))
+        inspect_dependency_image_object(
+            foreign_path, expected_capability=foreign_capability)
+        with pytest.raises(
+                RepositoryCacheError, match="核验失败") as rejected:
+            builder._verify_object(foreign_path)
+        assert "exact HTTPS" in str(rejected.value.__cause__)
+        linked = tmp_path / "linked-object"
+        linked.symlink_to(object_path, target_is_directory=True)
+        with monkeypatch.context() as guarded:
+            guarded.setattr(
+                dependency_image_runtime.os, "walk",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "symlink object root was traversed before rejection"))
+            with pytest.raises(RepositoryCacheError, match="root authority"):
+                builder._verify_object(linked)
+    finally:
+        supervisor.close()
+
+
+@pytest.mark.parametrize("artifact", ["wheel", "installed", "runtime", "archive"])
+def test_dependency_image_file_inspector_rejects_correlated_object_tamper(
+        tmp_path, artifact):
+    object_path, capability, artifacts = _pure_dependency_image_object(tmp_path)
+    target = artifacts[artifact]
+    raw = target.read_bytes()
+    os.chmod(target, 0o600)
+    target.write_bytes(b"X" + raw[1:])
+    os.chmod(target, 0o400)
+    with pytest.raises(RepositoryCacheError, match="dependency"):
+        inspect_dependency_image_object(
+            object_path, expected_capability=capability)
 
 
 def _builder(tmp_path, fetcher):

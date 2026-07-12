@@ -246,8 +246,46 @@ guardian capture 或 sandbox session，也不声称覆盖“所有 raw log”。
 cycle/log 数和日志总字节线性增长；若每轮全量自动执行，跨轮累计会趋近二次方，因此本设计明确只用于
 人工/最终检查点。
 
-import-materialization indexes/objects 及其 dependency-image 传递闭包、registered asset 恢复仍属
-CP11.4c.3b.2b.2；完成前不能声称 b.2 或存储治理整体验收。
+#### Import materialization 离线闭包与恢复（CP11.4c.3b.2b.2）
+
+先停止源 work-root；核验命令从所选 retained SQLite snapshot 出发，不读取活库：
+
+```bash
+python -m orchestrator.storage_ops --work-root <source-work-root> \
+  verify-import-materializations
+python -m orchestrator.storage_ops --work-root <source-work-root> \
+  verify-import-materializations --cycle c4
+
+# 推荐的一步恢复；target 必须不存在：
+python -m orchestrator.storage_ops --work-root <source-work-root> \
+  restore-with-import-materializations --target <new-work-root> --cycle c4
+
+# 仅用于续完已经存在、且 restore.json 绑定同一 source/cycle 的 SQLite target：
+python -m orchestrator.storage_ops --work-root <source-work-root> \
+  restore-import-materializations --target <existing-restored-root> --cycle c4
+```
+
+`verify-import-materializations` 的 scope 是
+`sqlite_registered_repository_and_dependency_cas`。它沿 immutable DB 中的
+`build_target → import_worker_cycle → selected_for_materialization → external_candidate` 精确重建每个
+candidate index，再把 `plan_ref.repository_snapshot_hash` 闭合到 repository object；v3 继续闭合到 exact
+dependency-image receipt/archive。repository、index 与 dependency inspector 只读取冻结文件和 provider
+协议硬上限，不调用 Docker、网络或当前运行策略。legacy embedded target 与尚无 plan_ref 的 target 会分别计数，
+不能伪装成 repository root；新式 plan_ref 缺字段、内外 hash 不一致或 exact index 缺失会 fail-closed。
+无 DB 根的 object/index 只报告为 orphan，不删除。
+
+`restore-with-import-materializations` 在 SQLite target 第一次可见前就放入 root
+`.restore-in-progress` continuation marker，并在同一源 lease 内续完 import CAS；不存在“两条命令之间可启动半恢复
+target”的窗口。VEPFS fallback claim 绑定 exact source snapshot/cycle/resolved target，claim、marker、SQLite 或
+receipt 任一早期窗口退出后均按既有 exact bytes 续接；已有 marker 的现场由 exact marker + target flock 特权接管，
+不另建恢复状态机。
+`restore-import-materializations` 只接受同一 source snapshot 的现有 target，用于续完/重放，不是新灾备恢复的推荐入口。
+发布顺序为 dependency object → repository object → exact canonical index → completion receipt；复用条目也重新
+fsync。进程在任一窗口退出时，普通启动仍会拒绝 target，同一命令可重放。容量门按 target filesystem block size
+为文件内容、每个目录和每个目录项保守预算，再加临时 inode/余量。完成 receipt 的 scope 明示
+`repository_and_dependency_cas_only`：本命令不运行 image、
+不删除源/孤儿，也不恢复 execution-log 正本、checkpoint、content store、views Git 或完整 work-root；日志冷副本仍由
+上节 mirror 命令独立核验。因此本项闭合的是 import CAS 灾备，不外推为 CP11.4c.3 的两节点/≥200 轮生产验收。
 
 ### 4.1 人类控制台（web 查看 + 交互，步⑨）
 
