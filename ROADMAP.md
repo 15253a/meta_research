@@ -482,9 +482,11 @@
           overlay 仅余 175MB 并在运行中 ENOSPC 污染，依约未重跑）。
         - [ ] CP11.4c.3b 存储治理：每轮 SQLite online 滚动备份 + views 独立 Git 提交 + immutable/CAS 资产
           manifest/hash；原始日志分级归档、恢复演练、容量阈值与安全 GC。不每轮复制大 checkpoint/content store。
-          - [ ] CP11.4c.3b.1 cycle snapshot 主干：research done 在当轮 τ/global-stop 检查后，其余
+          - [x] CP11.4c.3b.1 cycle snapshot 主干：research done 在当轮 τ/global-stop 检查后，其余
             import-worker/failed/aborted 在终态边界，以 SQLite online backup → 同快照 DB-derived views Git →
             immutable manifest 顺序发布；启动先幂等补缝，旧库只建诚实 adoption baseline，不伪造历史逐轮快照。
+            → commit `83ace54`（build_log 0073；相关 105；内部代码/参考文档双审 APPROVE；
+            外审误读已增补回归证伪，最终轮 CLI 挂起无 verdict；容量不足未启动全量）。
           - [ ] CP11.4c.3b.2 运维闭环：离线 verify/restore、至少 3 代已验证 DB backup、现有资源 envelope
             派生的容量门、dry-run-first 的有界 apply GC；只删已被新验证 backup 覆盖的超额 backup
             与无 DB/manifest/active-session 引用的 staging，registered checkpoint/content-store/log 原件不 GC；
