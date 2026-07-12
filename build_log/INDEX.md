@@ -6,6 +6,7 @@
 
 ---
 
+- [0075](0075-cp114c3b2b1-registered-log-mirrors.md) — CP11.4c.3b.2b.1 deterministic registered-log mirror + VEPFS lease-fenced restore fallback · commit `f59c72c` · 验证: 相关 70；内部双终审 APPROVE；外审第 1 轮 401、第 2 轮 240 秒无 verdict；全量依用户要求留到最终检查点
 - [0074](0074-cp114c3b2a-offline-snapshot-ops.md) — CP11.4c.3b.2a lease-fenced offline verify + SQLite restore + last-3/applied-plan backup GC + capacity headroom · commit `011c98b` · 验证: 相关 118；内部双终审 APPROVE；外审第 1 轮 401、第 2 轮 5 分钟无 verdict；全量依用户要求留到最终检查点
 - [0073](0073-cp114c3b1-cycle-snapshot-spine.md) — CP11.4c.3b.1 exact terminal-cycle backup → Chinese views Git → immutable manifest/pointer spine · commit `83ace54` · 验证: 相关 105；内部代码/参考文档双审 APPROVE；外审第 1 轮误读已增补回归证伪、第 2 轮 CLI 挂起无 verdict；全量因根盘容量不足未启动
 - [0072](0072-cp114c3a-truthful-session-mode.md) — CP11.4c.3a 生产会话契约冻结为真实 A、虚假 B 全入口 fail-closed · commit `b2081a3` · 验证: 相关 165；内部双审/外审最终轮 APPROVE；唯一全量被当前 20G overlay ENOSPC 污染，依约未重跑

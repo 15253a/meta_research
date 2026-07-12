@@ -505,6 +505,8 @@
                 scope 只是 DB-registered logs，不 glob guardian/session/transcript，原件不移动/删除/改权。
                 同时为 VEPFS 不支持 `renameat2` flags 的 SQLite restore 补 no-clobber 目标名 +
                 parent claim + instance lease + ready marker fallback，中途退出的部分目标不可启动。
+                → commit `f59c72c`（build_log 0075；相关 70；内部双终审 APPROVE；外审第 1 轮 401、
+                第 2 轮 240 秒无 verdict；全量依用户要求留到最终检查点）。
               - [ ] CP11.4c.3b.2b.2 import materialization closure：从所选 SQLite backup 根到
                 `state/import-materializations/{indexes,objects}` 可达闭包，并传递绑定 v3
                 dependency-image object；离线盘点/恢复不调 Docker/网络/当前 policy。如仍需

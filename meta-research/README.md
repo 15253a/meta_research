@@ -235,7 +235,7 @@ python -m orchestrator.storage_ops --work-root <work-root> verify-log-mirrors
 
 `mirror-logs` 只从最新不可变 SQLite snapshot 中枚举身份完整的 `execution_log` 行，在
 `state/storage/log-mirrors/objects/sha256/` 发布 level-9、mtime=0、空 filename、OS=255 的确定性
-gzip CAS，并在 `indexes/execution-log-<id>.json` 嚻结 DB 行与镜像身份。源文件须仍与登记的
+gzip CAS，并在 `indexes/execution-log-<id>.json` 冻结 DB 行与镜像身份。源文件须仍与登记的
 ref/hash/bytes 一致；命令不移动、删除、chmod 或原地压缩它。object/index 均先耐久化再建下游
 引用，kill 后重放会补齐 rename→fsync 窗口；验证按登记 raw bytes 上限有界解压，拒绝尾随数据、
 多 gzip member、类型/link/mode/hash 漂移。额外 CAS 只会报为 orphan，本命令不删除它。
