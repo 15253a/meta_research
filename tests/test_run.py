@@ -18,8 +18,10 @@ from jsonschema.exceptions import ValidationError
 
 from orchestrator import database as db
 from orchestrator.interfaces import Artifact, CallUsage
+from orchestrator.instance_lease import InstanceLease
 from orchestrator.execution_sandbox import sandbox_environment_hash
 from orchestrator.run import System, build_system
+from orchestrator.storage_ops import SnapshotArchive
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -1012,6 +1014,30 @@ def test_resume_same_work_root_no_goal_recreate(tmp_path):
     assert sys2.run(max_cycles=5) == []                        # 已 terminate，无新轮
     assert sys2.daemon.query_one("SELECT count(*) FROM goal")[0] == 1   # goal 唯一（未重建）
     assert _storage_manifest(tmp_path, cycle_id) == first_manifest       # 0 新 backup / 0 新 commit
+
+
+def test_offline_restored_db_starts_as_honest_adoption_workroot(tmp_path):
+    source = tmp_path / "source"
+    restored = tmp_path / "restored"
+    sys1 = build_system(
+        SYSTEM_ROOT, str(source), runner_factory=_mock_factory([_BOOT_TERMINATE]))
+    assert sys1.run(1) == ["c1"]
+    assert sys1.close() is None
+
+    lease = InstanceLease.acquire(source)
+    try:
+        receipt = SnapshotArchive(
+            work_root=source, lease=lease).restore(target=restored)
+    finally:
+        assert lease.close() is None
+    assert receipt["source_cycle"] == "c1"
+    sys2 = build_system(
+        SYSTEM_ROOT, str(restored), runner_factory=_mock_factory([]))
+    assert sys2.run(1) == []
+    adopted = _storage_manifest(restored, "c1")
+    assert adopted["adoption_baseline"] is True
+    assert adopted["bootstrap_before_cycle"] == 0
+    assert sys2.close() is None
 
 
 def test_startup_recovers_budget_stop_before_missing_terminal_snapshot(tmp_path):

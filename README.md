@@ -182,10 +182,40 @@ fail-closed。development 仍永不产生 production-ready 声明；它可继续
   `bootstrap_before_cycle` 的 adoption baseline，不伪造不存在的历史快照。
   这些 views 是 DB-derived 中文投影，不冒充当前尚未持久化的模型 `cycle_report.md`。manifest 只盘点
   DB 已登记的 checkpoint 与 `execution_log.ref` path+hash，`external_import` 只记 provenance manifest hash；
-  本子检查点不声称已盘点 import-materialization CAS/content store。已登记原件不按轮复制、移动或原地压缩。离线 restore/verify、
-  backup retention、容量门和安全 GC 属紧随的 CP11.4c.3b.2；在其完成前不能声称存储治理整体已验收。
+  本子检查点不声称已盘点 import-materialization CAS/content store。已登记原件不按轮复制、移动或原地压缩。
   backup 与原库同在一个 VEPFS failure domain 时只提供进程/节点以及活库文件误删或损坏
   （storage subtree 仍存）的恢复点，不等同 work-root/fileset 或跨站灾备。
+
+#### 离线快照运维（CP11.4c.3b.2a）
+
+先停止该 work-root 的 run 进程；以下 CLI 会取得同一个 exact instance lease，检测到活跃 owner 会拒绝执行：
+
+```bash
+python -m orchestrator.storage_ops --work-root <work-root> verify
+python -m orchestrator.storage_ops --work-root <work-root> restore --target <new-work-root>
+python -m orchestrator.storage_ops --work-root <work-root> restore --target <new-work-root> --cycle c4
+python -m orchestrator.storage_ops --work-root <work-root> gc-plan > /private/outside-work-root/gc-plan.json
+python -m orchestrator.storage_ops --work-root <work-root> gc-apply \
+  --plan-file /private/outside-work-root/gc-plan.json --expect-sha256 <plan_sha256>
+```
+
+`verify` 的机器可读 scope 是 `snapshot_chain_and_retained_sqlite`：它逐轮核 pointer/manifest 父链、views Git
+commit/tree 与 applied-plan authority，并对默认受保护的最近 3 代做 hash、SQLite quick/FK/schema 深验；更老但尚未
+退役的代只核对象类型/bytes，选中 restore 或进入 GC plan 时才读完整对象。它**不**证明 checkpoint/log/import
+objects 的可达闭包。`gc-plan` 自身不改 storage/views，也不在源 work-root 保存计划；CLI 为互斥而产生的 lease
+metadata/heartbeat 是唯一控制面写入，shell 重定向也应指向源目录之外。
+
+`restore` 只接受源 work-root 外、尚不存在的目标，并以 no-clobber 原子目录发布 `research.sqlite + restore.json`。
+其 receipt 明示 `scope=sqlite_truth_only`；新 work-root 首次启动会诚实建立 adoption baseline，不带回原 views Git、
+snapshot timeline、checkpoint/log/import 原件，因此不是完整 work-root 或跨站灾备。GC 默认至少保留最近 3 代；
+apply 必须同时给 canonical plan 和显式 hash，先持久化不可变 authority，再仅删除 backup CAS 中计划列明的
+expired/orphan 文件。即使进程在 authority 与 unlink 之间退出，该代也已逻辑退役且不能恢复，重放只补物理删除；
+pointer、manifest、genesis 与 views Git 永不由该 GC 删除。
+
+每次 cycle backup 在创建 temp/pending/Git 前检查 `本次 SQLite bytes/inodes + reserve` 的实时物理 headroom。
+production reserve 来自启动时已验证的部署 envelope；`statvfs` 只是此刻的物理余量，不是持续 GPFS hard-quota
+监控。raw-log 确定性压缩镜像、import-materialization indexes/objects 与 registered asset 恢复闭包仍属
+CP11.4c.3b.2b；完成前不能声称 b.2 或存储治理整体验收。
 
 ### 4.1 人类控制台（web 查看 + 交互，步⑨）
 
