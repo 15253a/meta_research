@@ -7,8 +7,8 @@
   "required": ["version", "protocol", "issued_at_unix", "service", "isolation", "docker", "work_root", "gpu"],
   "additionalProperties": false,
   "properties": {
-    "version": { "const": 1 },
-    "protocol": { "const": "deployment-attestation-v1" },
+    "version": { "const": 2 },
+    "protocol": { "const": "deployment-attestation-v2" },
     "issued_at_unix": { "type": "number", "exclusiveMinimum": 0, "maximum": 253402300799 },
     "service": {
       "type": "object",
@@ -81,6 +81,7 @@
       "properties": {
         "memory_bytes_by_uuid": {
           "type": "object",
+          "description": "Exact GPU UUID allocation for this service (not whole-host inventory); key count must equal policy.resources.gpus and every live/container device must match.",
           "maxProperties": 64,
           "propertyNames": { "pattern": "^GPU-[A-Za-z0-9-]{1,128}$" },
           "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }

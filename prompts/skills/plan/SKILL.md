@@ -1,6 +1,6 @@
 # SKILL · plan —— 复用判定 + 锁评估协议
 
-> 版本：m4-cp114a3。按《第一部分》§3.3 与流程图 04-Plan；产物 schema =
+> 版本：m4-cp114c2b3b。按《第一部分》§3.3 与流程图 04-Plan；产物 schema =
 > `schemas/plan.schema.json` 或受限控制 sidecar `schemas/import_search_request.schema.json`。
 > 本阶段 = 计划调用（phase=plan）+ **可回答性评审**独立调用（phase=audit，≤2 轮，本文件
 > 【评审任务】节）。评估协议在本阶段锁死，bundle 只照办、不再发明（I2 源头）。
@@ -65,7 +65,8 @@
 5. **写 targets 队列**——每个 target 的完整必填字段（schema 硬性要求）：
    `target_key`（plan 内稳定键，如 "t1"，bundle 产物与 required_metric 以此关联）·
    `target_kind ∈ {build,exec,eval}` · `seq`（依赖序，从 1 起）· `critical`（true=失败即早退）·
-   `budget_estimate`（数值，总和 ≤ B(t)）· `spec_md`（本目标做什么，bundle 只照办）·
+   `budget_estimate`（数值，总和 ≤ B(t)）· `gpu_required`（bool；只有代码/评估确需 CUDA 时为 true）·
+   `spec_md`（本目标做什么，bundle 只照办）·
    按 kind 另加上表"另须携带"列（build/exec 的 `claim`、eval 的三件套）。
    `build_target_required_metric` 逐 target 声明 required 指标集
    （`{target_key, metric_id, metric_ver}`，I2 核覆盖依据）。
@@ -124,7 +125,8 @@
                         "evaluation_id?": "<>", "metric_result_id?": "<>", "answer_id?": "<>" } ],
   "targets": [
     { "target_key": "t1", "target_kind": "<build|exec|eval>", "seq": 1, "critical": <true|false>,
-      "budget_estimate": <数值>, "spec_md": "<bundle 只照办的执行说明>", "need_ids?": ["n1"],
+      "budget_estimate": <数值>, "gpu_required": <true|false>,
+      "spec_md": "<bundle 只照办的执行说明>", "need_ids?": ["n1"],
       "claim?": { "canonical_key?": "<build 必>", "slug?": "<build 必>",
                   "baseline_ref?": "<exec 必>", "variant_key?": "<exec 必>", "config_json?": {} },
       "eval_action?": "<create_evaluation|append_attempt>", "attempt_purpose?": "<按情形表>",
@@ -170,7 +172,8 @@
 
 1. 每个 need ≥1 个声明指标覆盖（对照 build_target_required_metric 与 reuse_evidence）；
 2. 每个指标有判读规则（readout_rules 齐）；
-3. 每个 build/exec target 有 smoke 定义与预算；
+3. 每个 build/exec target 有 smoke 定义与预算；每个 target 显式写 `gpu_required`，且与执行说明是否使用
+   CUDA/GPU 一致；
 4. 指标全部由协议声明（metric_defs ⊆ 协议范围；I2 源头）；
 5. targets 依赖序自洽（seq、eval 引用的对象在此前产生或已在池中）。
 

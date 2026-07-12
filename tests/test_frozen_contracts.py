@@ -1,8 +1,8 @@
 """步⑧ CP8.2 回归锁：证「补齐 plan 契约缺口」未偷改任何冻结件。
 
-核心承诺（与用户 + codex-chatgpt 联合设计）：**不解冻 plan.schema、不改 DDL/MIGRATION 锁**——命令改由
-新增 additive 的 execution_manifest 承载。本套把冻结锚钉成字面值，任何对 plan.schema / DDL 的改动都会
-在此炸出（防未来 session 无意漂移冻结契约）。
+核心承诺（与用户 + codex-chatgpt 联合设计）：plan 只承载抽象科学/资源意图，命令与具体执行身份由
+execution_manifest 承载；DDL/MIGRATION 锁不动。本套把冻结锚钉成字面值，任何对 plan.schema / DDL 的改动
+都会在此炸出（防未来 session 无意漂移冻结契约）。
 """
 from __future__ import annotations
 
@@ -18,16 +18,16 @@ def _sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-# CP11.4a.1 有意把 license snapshot hash 加入 import_defer 冻结选择锚并封闭专用分支后重锚；
-# 执行字段仍由下方语义锁禁止。
+# CP11.4c.2b.3b 有意新增抽象 gpu_required 资源意图，使 plan 冻结 CPU/GPU workload identity；
+# 命令、env_hash 与具体 device identity 仍由下方语义锁禁止。
 # 若再改 plan.schema（决策性），须更新此常量并走完整评审 + 记 build_log，绝不静默漂移。
-_PLAN_SCHEMA_SHA256 = "cb0454b0f6abc31aabfc8897515f7d1065acd16a474abb57efa95f6eb5ecb943"
+_PLAN_SCHEMA_SHA256 = "646076b0811383d8c34bcac217f0fc013ddf9e0cf7e99f09713c8908b54895c9"
 
 
 def test_plan_schema_frozen():
-    """plan.schema.json 未被塞入执行字段（train_cmd 等）——字面 sha256 锚。"""
+    """plan.schema.json 未被塞入命令/具体身份字段——字面 sha256 锚。"""
     assert _sha256(SYSTEM_ROOT / "schemas" / "plan.schema.json") == _PLAN_SCHEMA_SHA256, (
-        "plan.schema.json 变了——步⑧承诺不解冻 plan.schema（命令应在 execution_manifest）；"
+        "plan.schema.json 变了——抽象 plan 契约漂移（命令/具体身份应在 execution_manifest）；"
         "若确为有意改动，更新 _PLAN_SCHEMA_SHA256 并走评审 + 记 build_log")
 
 

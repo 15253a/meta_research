@@ -1,10 +1,11 @@
 """Fail-closed deployment facts and one owner-bound startup receipt.
 
 This module deliberately does not deploy, schedule, or recover anything.  It
-performs one fresh probe, evaluates that immutable snapshot against one short-
-lived operator attestation, and writes one private receipt for the current run
-owner.  Development mode records the same facts but can never claim production
-readiness.
+first evaluates one immutable host snapshot against a short-lived operator
+attestation.  The caller may perform already-existing recovery only after that
+identity gate, then returns one guardian-owned GPU canary result for final
+evaluation.  Development mode records the same facts but can never claim
+production readiness.
 
 The default probe treats a hard filesystem quota as operator-attested evidence:
 ``statvfs`` reports capacity, not a byte/inode quota.  Production evaluation
@@ -27,16 +28,23 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from .process_supervisor import atomic_write_receipt
+from .artifact_capability import read_artifact_bytes
+from .execution_sandbox import gpu_capability_projection, sandbox_environment_hash
+from .process_supervisor import (
+    atomic_write_receipt,
+    read_receipt,
+    validate_execution_receipt,
+)
 
 
-_PROTOCOL = "deployment-preflight-v1"
-_ATTESTATION_PROTOCOL = "deployment-attestation-v1"
+_PROTOCOL = "deployment-preflight-v2"
+_ATTESTATION_PROTOCOL = "deployment-attestation-v2"
 _MAX_ATTESTATION_BYTES = 32 * 1024
 _MAX_PROBE_OUTPUT = 4 * 1024 * 1024
 _MAX_ERROR_CHARS = 1000
 _OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _GPU_UUID_RE = re.compile(r"^GPU-[A-Za-z0-9-]{1,128}$")
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class DeploymentPreflightError(RuntimeError):
@@ -61,6 +69,10 @@ def _hash_bytes(payload: bytes) -> str:
 
 def _value_hash(value: Mapping[str, Any]) -> str:
     return _hash_bytes(_canonical(value))
+
+
+def _json_clone(value: Mapping[str, Any]) -> Dict[str, Any]:
+    return json.loads(_canonical(value).decode("utf-8"))
 
 
 def _bounded_error(error: BaseException | str) -> str:
@@ -240,7 +252,7 @@ def _empty_facts(error: str) -> Dict[str, Any]:
                       "mount": None, "error": error},
         "docker": {"engine_path": None, "engine_host": None, "socket": None,
                    "daemon": None, "storage": None, "error": error},
-        "gpu": {"inventory": [], "error": error},
+        "gpu": {"driver_version": None, "inventory": [], "error": error},
     }
 
 
@@ -455,10 +467,11 @@ class SystemProbeBackend:
     def _gpus() -> Dict[str, Any]:
         binary = shutil.which("nvidia-smi", path=os.defpath)
         if binary is None:
-            return {"inventory": [], "error": "nvidia-smi 不可用"}
+            return {"driver_version": None, "inventory": [],
+                    "error": "nvidia-smi 不可用"}
         try:
             result = subprocess.run(
-                [binary, "--query-gpu=index,uuid,memory.total",
+                [binary, "--query-gpu=index,uuid,name,memory.total,compute_cap,driver_version",
                  "--format=csv,noheader,nounits"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=15.0, check=False,
@@ -469,27 +482,39 @@ class SystemProbeBackend:
                 raise RuntimeError(
                     "nvidia-smi 失败: "
                     + result.stderr.decode("utf-8", errors="replace")[:500])
-            inventory, indexes, uuids = [], set(), set()
+            inventory, indexes, uuids, drivers = [], set(), set(), set()
             for raw_line in result.stdout.decode("utf-8").splitlines():
                 if not raw_line.strip():
                     continue
                 parts = [part.strip() for part in raw_line.split(",")]
-                if len(parts) != 3:
+                if len(parts) != 6:
                     raise ValueError("nvidia-smi inventory 行字段数非法")
-                index, uuid, memory_mib = int(parts[0]), parts[1], int(parts[2])
+                index, uuid, model = int(parts[0]), parts[1], parts[2]
+                memory_mib, compute, driver = int(parts[3]), parts[4], parts[5]
                 if (index < 0 or index in indexes or uuid in uuids
-                        or _GPU_UUID_RE.fullmatch(uuid) is None or memory_mib <= 0):
+                        or _GPU_UUID_RE.fullmatch(uuid) is None or memory_mib <= 0
+                        or not _text(model, maximum=256)
+                        or re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}", compute) is None
+                        or re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", driver) is None):
                     raise ValueError("nvidia-smi inventory 身份/数值非法")
                 indexes.add(index)
                 uuids.add(uuid)
+                drivers.add(driver)
                 inventory.append({
-                    "index": index, "uuid": uuid,
+                    "index": index, "uuid": uuid, "model": model,
                     "memory_bytes": memory_mib * 1024 * 1024,
+                    "compute_capability": compute,
                 })
-            return {"inventory": sorted(inventory, key=lambda item: item["index"]),
-                    "error": None}
+            if len(drivers) != 1:
+                raise ValueError("nvidia-smi driver version 非唯一")
+            return {
+                "driver_version": next(iter(drivers)),
+                "inventory": sorted(inventory, key=lambda item: item["index"]),
+                "error": None,
+            }
         except Exception as error:
-            return {"inventory": [], "error": _bounded_error(error)}
+            return {"driver_version": None, "inventory": [],
+                    "error": _bounded_error(error)}
 
 
 def _read_attestation(path: Path, validator: Any = None) -> tuple[Dict[str, Any], str]:
@@ -542,7 +567,7 @@ def _validate_attestation_profile(value: Mapping[str, Any]) -> None:
             "version", "protocol", "issued_at_unix", "service", "isolation",
             "docker", "work_root", "gpu"}:
         raise ValueError("deployment attestation 顶层字段闭包非法")
-    if (value.get("version") != 1 or value.get("protocol") != _ATTESTATION_PROTOCOL
+    if (value.get("version") != 2 or value.get("protocol") != _ATTESTATION_PROTOCOL
             or not _number(value.get("issued_at_unix"), minimum=1.0)):
         raise ValueError("deployment attestation version/protocol/time 非法")
     service = value.get("service")
@@ -636,11 +661,198 @@ def _get(value: Any, *path: str) -> Any:
     return current
 
 
+def _live_gpu_inventory(facts: Mapping[str, Any]) -> tuple[Dict[str, Dict[str, Any]], bool]:
+    gpu = _get(facts, "gpu") or {}
+    inventory = _get(gpu, "inventory") or []
+    driver = _get(gpu, "driver_version")
+    valid = (isinstance(inventory, list) and _get(gpu, "error") is None
+             and isinstance(driver, str)
+             and re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", driver) is not None)
+    live: Dict[str, Dict[str, Any]] = {}
+    indexes = set()
+    if valid:
+        for item in inventory:
+            index = _get(item, "index")
+            uuid = _get(item, "uuid")
+            model = _get(item, "model")
+            memory = _get(item, "memory_bytes")
+            compute = _get(item, "compute_capability")
+            if (not _int(index, minimum=0) or index in indexes
+                    or not isinstance(uuid, str) or _GPU_UUID_RE.fullmatch(uuid) is None
+                    or uuid in live or not _text(model, maximum=256)
+                    or not _int(memory, minimum=1)
+                    or not isinstance(compute, str)
+                    or re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}", compute) is None):
+                valid = False
+                break
+            indexes.add(index)
+            live[uuid] = {
+                "index": index, "uuid": uuid, "model": model,
+                "memory_bytes": memory, "compute_capability": compute,
+            }
+    return live, valid
+
+
+def derive_gpu_contract(*, mode: str, facts: Mapping[str, Any],
+                        attestation: Optional[Mapping[str, Any]],
+                        resources: Mapping[str, Any]) -> tuple[Optional[Dict[str, Any]], str]:
+    """Derive one fixed allocation; production keys come only from attestation.
+
+    ``memory_bytes_by_uuid`` is intentionally the service allocation, not the
+    whole host inventory.  A dedicated 8-GPU VM can therefore assign exactly 4
+    GPUs without adding a scheduler or trusting an ambient visibility variable.
+    """
+    required = int(resources["gpus"])
+    if required == 0:
+        return None, "GPU not required"
+    live, valid = _live_gpu_inventory(facts)
+    driver = _get(facts, "gpu", "driver_version")
+    required_memory = math.ceil(float(resources["gpu_mem_gb"]) * (1024 ** 3))
+    selected: list[Dict[str, Any]] = []
+    if valid and mode == "production":
+        expected = _get(attestation, "gpu", "memory_bytes_by_uuid")
+        if isinstance(expected, Mapping) and len(expected) == required:
+            for uuid in sorted(expected):
+                item = live.get(uuid)
+                memory = expected.get(uuid)
+                if (item is None or not _int(memory, minimum=1)
+                        or item["memory_bytes"] != memory
+                        or memory < required_memory):
+                    selected = []
+                    break
+                selected.append(item)
+    elif valid:
+        capable = sorted(
+            (item for item in live.values()
+             if item["memory_bytes"] >= required_memory),
+            key=lambda item: (item["index"], item["uuid"]))
+        selected = capable[:required]
+    if len(selected) != required:
+        return None, (
+            f"exact allocation unavailable: visible={len(live)} "
+            f"selected={len(selected)} required={required}")
+    devices = [{
+        "uuid": item["uuid"], "model": item["model"],
+        "memory_bytes": item["memory_bytes"],
+        "compute_capability": item["compute_capability"],
+    } for item in sorted(selected, key=lambda item: item["uuid"])]
+    return {
+        "version": 1, "provider": "nvidia", "driver_version": driver,
+        "request": {
+            "driver": "nvidia",
+            "capabilities": ["compute", "utility", "gpu"], "options": {},
+        },
+        "devices": devices,
+    }, f"allocated={len(devices)} required={required}"
+
+
+def _parse_gpu_canary_log(raw: bytes) -> tuple[str, list[Dict[str, Any]]]:
+    drivers = set()
+    devices = []
+    uuids = set()
+    for raw_line in raw.decode("utf-8").splitlines():
+        if not raw_line.strip():
+            continue
+        parts = [part.strip() for part in raw_line.split(",")]
+        if len(parts) != 5:
+            raise ValueError("GPU canary log 行字段数非法")
+        uuid, model, memory_mib_text, compute, driver = parts
+        try:
+            memory_mib = int(memory_mib_text)
+        except ValueError as error:
+            raise ValueError("GPU canary log memory 非整数") from error
+        if (uuid in uuids or _GPU_UUID_RE.fullmatch(uuid) is None
+                or not _text(model, maximum=256) or memory_mib <= 0
+                or re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}", compute) is None
+                or re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", driver) is None):
+            raise ValueError("GPU canary log device identity 非法")
+        uuids.add(uuid)
+        drivers.add(driver)
+        devices.append({
+            "uuid": uuid, "model": model,
+            "memory_bytes": memory_mib * 1024 * 1024,
+            "compute_capability": compute,
+        })
+    if len(drivers) != 1 or not devices:
+        raise ValueError("GPU canary log driver/device 闭包非法")
+    devices.sort(key=lambda item: item["uuid"])
+    return next(iter(drivers)), devices
+
+
+def _gpu_evidence_ok(evidence: Optional[Mapping[str, Any]], *,
+                     contract: Optional[Mapping[str, Any]],
+                     sandbox_config: Mapping[str, Any], candidate_hash: Optional[str],
+                     now: float) -> bool:
+    if contract is None or not isinstance(evidence, Mapping):
+        return False
+    runtime_config = {
+        **dict(sandbox_config),
+        "gpu_capability": gpu_capability_projection(contract),
+    }
+    environment_hash = sandbox_environment_hash(runtime_config)
+    runtime_identity_hash = _value_hash({
+        "environment_hash": environment_hash, "gpu_contract": contract})
+    expected = {
+        "version", "protocol", "ok", "checked_at_unix", "candidate_hash", "contract_hash",
+        "environment_hash", "runtime_identity_hash", "inventory", "guardian", "execution",
+        "error",
+    }
+    checked = evidence.get("checked_at_unix")
+    guardian = evidence.get("guardian")
+    execution = evidence.get("execution")
+    return bool(
+        set(evidence) == expected
+        and evidence.get("version") == 1
+        and evidence.get("protocol") == "sandbox-gpu-canary-v1"
+        and evidence.get("ok") is True and evidence.get("error") is None
+        and _number(checked, minimum=1.0) and 0 <= now - float(checked) <= 60
+        and isinstance(candidate_hash, str)
+        and _SHA256_RE.fullmatch(candidate_hash) is not None
+        and evidence.get("candidate_hash") == candidate_hash
+        and evidence.get("contract_hash") == _value_hash(contract)
+        and evidence.get("inventory") == contract.get("devices")
+        and evidence.get("environment_hash") == environment_hash
+        and evidence.get("runtime_identity_hash") == runtime_identity_hash
+        and isinstance(execution, Mapping)
+        and isinstance(guardian, Mapping)
+        and set(guardian) == {
+            "operation_id", "state", "outcome", "returncode", "group_drained",
+            "containment", "context", "sandbox"}
+        and guardian.get("operation_id") == execution.get("operation_id")
+        and guardian.get("state") == "terminal" and guardian.get("outcome") == "exit"
+        and guardian.get("returncode") == 0 and guardian.get("group_drained") is True
+        and guardian.get("containment") == "docker-container-v1"
+        and isinstance(guardian.get("context"), Mapping)
+        and guardian["context"].get("phase") == "deployment-gpu-canary"
+        and guardian["context"].get("candidate_hash") == candidate_hash
+        and guardian["context"].get("runtime_identity_hash") == runtime_identity_hash
+        and guardian["context"].get("log_name") == "gpu-canary.log"
+        and isinstance(guardian.get("sandbox"), Mapping)
+        and set(guardian["sandbox"]) == {
+            "backend", "spec_sha256", "container_drained"}
+        and guardian["sandbox"].get("backend") == "docker-container-v1"
+        and guardian["sandbox"].get("container_drained") is True
+        and guardian["sandbox"].get("spec_sha256")
+        == execution.get("sandbox_spec_sha256")
+        and set(execution) == {
+            "log_path", "log_sha256", "process_receipt_path", "operation_id",
+            "sandbox_spec_sha256"}
+        and all(isinstance(execution.get(key), str) and execution[key]
+                for key in execution)
+        and _absolute(execution["log_path"])
+        and _absolute(execution["process_receipt_path"])
+        and re.fullmatch(r"exec-[0-9a-f]{32}", execution["operation_id"]) is not None
+        and _SHA256_RE.fullmatch(execution["log_sha256"]) is not None
+        and _SHA256_RE.fullmatch(execution["sandbox_spec_sha256"]) is not None)
+
+
 def evaluate_deployment(*, facts: Mapping[str, Any], attestation: Optional[Mapping[str, Any]],
                         now: float, max_attestation_age_s: int,
+                        deployment_mode: str,
                         resources: Mapping[str, Any], sandbox_config: Mapping[str, Any],
                         reserves: Optional[Mapping[str, int]] = None,
-                        sandbox_gpu_access: bool,
+                        sandbox_gpu_evidence: Optional[Mapping[str, Any]] = None,
+                        deployment_candidate_hash: Optional[str] = None,
                         attestation_error: Optional[str] = None) -> list[Dict[str, Any]]:
     """Pure comparison of one facts snapshot and one validated attestation."""
     checks: list[Dict[str, Any]] = []
@@ -786,46 +998,45 @@ def evaluate_deployment(*, facts: Mapping[str, Any], attestation: Optional[Mappi
         f"free_bytes={_get(storage, 'free_bytes')!r} "
         f"free_inodes={_get(storage, 'free_inodes')!r}")
 
-    inventory = _get(facts, "gpu", "inventory") or []
-    live_gpu = {}
-    gpu_shape_ok = isinstance(inventory, list) and _get(facts, "gpu", "error") is None
-    if gpu_shape_ok:
-        for item in inventory:
-            uuid, memory = _get(item, "uuid"), _get(item, "memory_bytes")
-            if (not isinstance(uuid, str) or _GPU_UUID_RE.fullmatch(uuid) is None
-                    or uuid in live_gpu or not _int(memory, minimum=1)):
-                gpu_shape_ok = False
-                break
-            live_gpu[uuid] = memory
-    expected_gpu = _get(attestation, "gpu", "memory_bytes_by_uuid") or {}
-    gpu_inventory = loaded and gpu_shape_ok and live_gpu == dict(expected_gpu)
     required_gpus = int(resources["gpus"])
-    required_memory = math.ceil(float(resources["gpu_mem_gb"]) * (1024 ** 3))
-    capable = sum(1 for memory in live_gpu.values() if memory >= required_memory)
-    gpu_policy = gpu_inventory and capable >= required_gpus
-    add("gpu_inventory", gpu_policy,
-        f"visible={len(live_gpu)} capable={capable} required={required_gpus}")
-    gpu_access_ok = required_gpus == 0 or sandbox_gpu_access is True
+    contract, contract_detail = derive_gpu_contract(
+        mode=deployment_mode, facts=facts, attestation=attestation,
+        resources=resources)
+    expected_allocation = _get(attestation, "gpu", "memory_bytes_by_uuid")
+    if deployment_mode == "production":
+        gpu_policy = (loaded and isinstance(expected_allocation, Mapping)
+                      and len(expected_allocation) == required_gpus
+                      and (required_gpus == 0 or contract is not None))
+    else:
+        gpu_policy = required_gpus == 0 or contract is not None
+    add("gpu_inventory", gpu_policy, contract_detail)
+    runtimes = _get(daemon, "runtimes") or []
+    runtime_ok = required_gpus == 0 or (
+        isinstance(runtimes, list) and "nvidia" in runtimes)
+    add("gpu_device_runtime", runtime_ok,
+        f"runtimes={runtimes!r} required_gpus={required_gpus}")
+    gpu_access_ok = required_gpus == 0 or _gpu_evidence_ok(
+        sandbox_gpu_evidence, contract=contract,
+        sandbox_config=sandbox_config,
+        candidate_hash=deployment_candidate_hash, now=now)
     add("sandbox_gpu_access", gpu_access_ok,
-        f"sandbox_gpu_access={sandbox_gpu_access!r} required_gpus={required_gpus}")
+        ("guardian canary verified exact allocation" if gpu_access_ok
+         else f"mechanical canary unavailable/invalid required_gpus={required_gpus}"))
     return checks
 
 
 class DeploymentPreflight:
-    """Probe, evaluate and publish one deployment receipt for ``owner_id``."""
+    """Two-phase startup gate: read-only identity first, GPU canary last."""
 
     def __init__(self, work_root: Path | str, policy: Mapping[str, Any], sandbox: Any,
                  owner_id: str, attestation_validator: Any = None,
-                 sandbox_gpu_access: bool = False, owner_guard: Optional[Callable[[], None]] = None,
+                 owner_guard: Optional[Callable[[], None]] = None,
                  probe_backend: Any = None, clock: Optional[Callable[[], float]] = None):
         self.work_root = Path(os.path.abspath(os.fspath(work_root)))
         self.policy = policy
         self.sandbox = sandbox
         self.owner_id = owner_id
         self.attestation_validator = attestation_validator
-        if not isinstance(sandbox_gpu_access, bool):
-            raise ValueError("sandbox_gpu_access 须为 bool")
-        self.sandbox_gpu_access = sandbox_gpu_access
         self.owner_guard = owner_guard or (lambda: None)
         self.probe_backend = probe_backend or SystemProbeBackend()
         self.clock = clock or time.time
@@ -834,6 +1045,7 @@ class DeploymentPreflight:
         self.receipt_path = (
             self.work_root / "state" / "deployment"
             / f"deployment-{owner_id}.json")
+        self._candidate_bytes: Optional[bytes] = None
 
     def _collect(self) -> Dict[str, Any]:
         try:
@@ -852,7 +1064,93 @@ class DeploymentPreflight:
         except Exception as error:
             return _empty_facts("probe backend: " + _bounded_error(error))
 
-    def run(self) -> Dict[str, Any]:
+    def _publish(self, receipt: Mapping[str, Any]) -> None:
+        self.owner_guard()
+        atomic_write_receipt(self.receipt_path, receipt)
+        self.owner_guard()
+
+    def _raise_failed(self, receipt: Mapping[str, Any]) -> None:
+        pending = ({"sandbox_gpu_access"}
+                   if receipt.get("phase") == "prerequisite" else set())
+        failed = [item["name"] for item in receipt["checks"]
+                  if not item["ok"] and item["name"] not in pending]
+        raise DeploymentPreflightError(
+            "production deployment preflight 失败: " + ",".join(failed),
+            receipt=receipt, receipt_path=self.receipt_path)
+
+    def _validate_gpu_evidence_authority(
+            self, evidence: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
+        execution = evidence.get("execution")
+        if not isinstance(execution, Mapping):
+            raise ValueError("GPU canary evidence 缺 execution authority")
+        candidate_hash = candidate["candidate_hash"]
+        token = candidate_hash.removeprefix("sha256:")[:32]
+        expected_log = (
+            self.work_root / "state" / "deployment" / "gpu-canary"
+            / token / "gpu-canary.log")
+        log_path = execution.get("log_path")
+        if (not isinstance(log_path, str)
+                or Path(os.path.abspath(log_path)) != expected_log):
+            raise ValueError("GPU canary log path 未绑定当前 candidate")
+        raw = read_artifact_bytes(
+            expected_log, max_bytes=1024 * 1024, label="deployment GPU canary log")
+        if execution.get("log_sha256") != _hash_bytes(raw):
+            raise ValueError("GPU canary log hash 漂移")
+        driver, inventory = _parse_gpu_canary_log(raw)
+        contract = candidate.get("gpu_contract")
+        if (not isinstance(contract, Mapping)
+                or driver != contract.get("driver_version")
+                or inventory != contract.get("devices")
+                or evidence.get("inventory") != inventory):
+            raise ValueError("GPU canary log inventory 未绑定 exact contract")
+
+        operation_id = execution.get("operation_id")
+        if (not isinstance(operation_id, str)
+                or re.fullmatch(r"exec-[0-9a-f]{32}", operation_id) is None):
+            raise ValueError("GPU canary operation_id 非法")
+        expected_receipt = (
+            self.work_root / "state" / "executions"
+            / f"execution-{operation_id}.json")
+        receipt_path = execution.get("process_receipt_path")
+        if (not isinstance(receipt_path, str)
+                or Path(os.path.abspath(receipt_path)) != expected_receipt):
+            raise ValueError("GPU canary guardian receipt path 非法")
+        receipt = read_receipt(expected_receipt)
+        validate_execution_receipt(receipt, expected_receipt)
+        if (receipt.get("owner_id") != self.owner_id
+                or receipt.get("kind") != "deployment-gpu-canary"
+                or (self.deployment["mode"] == "production"
+                    and receipt.get("fenced_by_instance_lease") is not True)):
+            raise ValueError("GPU canary guardian receipt owner/kind/fence 非法")
+        sandbox = receipt.get("sandbox")
+        if not isinstance(sandbox, Mapping):
+            raise ValueError("GPU canary guardian receipt 缺 sandbox authority")
+        if (sandbox.get("engine_path")
+                != os.path.realpath(self.sandbox_config["engine_path"])
+                or sandbox.get("engine_host") != self.sandbox_config["engine_host"]
+                or sandbox.get("resource_mode")
+                != self.sandbox_config["resource_mode"]):
+            raise ValueError("GPU canary guardian receipt 未绑定 exact Docker authority")
+        guardian_projection = {
+            "operation_id": receipt.get("operation_id"),
+            "state": receipt.get("state"), "outcome": receipt.get("outcome"),
+            "returncode": receipt.get("returncode"),
+            "group_drained": receipt.get("group_drained"),
+            "containment": receipt.get("containment"),
+            "context": dict(receipt.get("context") or {}),
+            "sandbox": {
+                "backend": sandbox.get("backend"),
+                "spec_sha256": sandbox.get("spec_sha256"),
+                "container_drained": sandbox.get("container_drained"),
+            },
+        }
+        if (guardian_projection != evidence.get("guardian")
+                or sandbox.get("spec_sha256")
+                != execution.get("sandbox_spec_sha256")):
+            raise ValueError("GPU canary evidence 与 durable guardian receipt 不一致")
+
+    def prepare(self) -> Dict[str, Any]:
+        """Read-only identity gate; success authorizes recovery, not production."""
         self.owner_guard()
         facts = self._collect()
         self.owner_guard()
@@ -878,22 +1176,25 @@ class DeploymentPreflight:
         checks = evaluate_deployment(
             facts=facts, attestation=attestation, now=now,
             max_attestation_age_s=self.deployment["max_attestation_age_s"],
+            deployment_mode=self.deployment["mode"],
             resources=self.resources, sandbox_config=self.sandbox_config,
             reserves=self.reserves,
-            sandbox_gpu_access=self.sandbox_gpu_access,
+            sandbox_gpu_evidence=None,
+            deployment_candidate_hash=None,
             attestation_error=attestation_error)
-        all_checks = all(item["ok"] for item in checks)
-        production_ready = self.deployment["mode"] == "production" and all_checks
+        gpu_contract, gpu_detail = derive_gpu_contract(
+            mode=self.deployment["mode"], facts=facts, attestation=attestation,
+            resources=self.resources)
         policy_projection = {
             "deployment": self.deployment, "resources": self.resources,
             "sandbox": self.sandbox_config,
             "reserves": self.reserves,
-            "sandbox_gpu_access": self.sandbox_gpu_access,
         }
-        receipt = {
-            "version": 1, "protocol": _PROTOCOL, "owner_id": self.owner_id,
-            "mode": self.deployment["mode"], "checked_at_unix": now,
-            "production_ready": production_ready,
+        candidate = {
+            "version": 2, "protocol": _PROTOCOL, "owner_id": self.owner_id,
+            "phase": "prerequisite", "mode": self.deployment["mode"],
+            "prepared_at_unix": now, "checked_at_unix": now,
+            "production_ready": False,
             "policy_hash": _value_hash(policy_projection),
             "required_reserves": self.reserves,
             "facts_hash": _value_hash(facts), "facts": facts,
@@ -901,17 +1202,84 @@ class DeploymentPreflight:
                 "path": path_value, "sha256": attestation_hash,
                 "error": attestation_error, "value": attestation,
             },
+            "gpu_contract": gpu_contract,
+            "gpu_contract_hash": (
+                _value_hash(gpu_contract) if gpu_contract is not None else None),
+            "gpu_contract_detail": gpu_detail,
+            "gpu_canary": None,
+            "gpu_canary_validation_error": None,
             "checks": checks,
         }
+        candidate["candidate_hash"] = _value_hash(candidate)
+        self._candidate_bytes = _canonical(candidate)
+        frozen_candidate = _json_clone(candidate)
+        static_ok = all(
+            item["ok"] for item in checks if item["name"] != "sandbox_gpu_access")
+        if self.deployment["mode"] == "production" and not static_ok:
+            self._publish(frozen_candidate)
+            self._raise_failed(frozen_candidate)
+        return _json_clone(frozen_candidate)
+
+    def finalize(self, sandbox_gpu_evidence: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """Publish the sole final readiness claim after guarded GPU canary."""
+        if self._candidate_bytes is None:
+            raise RuntimeError("deployment finalize 前须先 prepare")
         self.owner_guard()
-        atomic_write_receipt(self.receipt_path, receipt)
-        self.owner_guard()
+        candidate = json.loads(self._candidate_bytes.decode("utf-8"))
+        candidate_projection = {
+            key: value for key, value in candidate.items() if key != "candidate_hash"}
+        if candidate.get("candidate_hash") != _value_hash(candidate_projection):
+            raise RuntimeError("deployment prerequisite candidate hash 漂移")
+        now = self.clock()
+        if not _number(now, minimum=1.0):
+            raise ValueError("deployment preflight clock 须返回有限 Unix time")
+        now = float(now)
+        attestation_record = candidate["attestation"]
+        evidence_error = None
+        evidence = None
+        if isinstance(sandbox_gpu_evidence, Mapping):
+            try:
+                evidence = _json_clone(sandbox_gpu_evidence)
+                self._validate_gpu_evidence_authority(evidence, candidate)
+            except Exception as error:
+                evidence_error = _bounded_error(error)
+                evidence = None
+        if (evidence is None and evidence_error is None
+                and int(self.resources["gpus"]) > 0):
+            evidence_error = "GPU canary evidence missing"
+        verified_evidence = evidence if evidence_error is None else None
+        checks = evaluate_deployment(
+            facts=candidate["facts"], attestation=attestation_record["value"],
+            now=now,
+            max_attestation_age_s=self.deployment["max_attestation_age_s"],
+            deployment_mode=self.deployment["mode"], resources=self.resources,
+            sandbox_config=self.sandbox_config, reserves=self.reserves,
+            sandbox_gpu_evidence=verified_evidence,
+            deployment_candidate_hash=candidate["candidate_hash"],
+            attestation_error=attestation_record["error"])
+        all_checks = all(item["ok"] for item in checks)
+        production_ready = self.deployment["mode"] == "production" and all_checks
+        receipt = {
+            "version": 2, "protocol": _PROTOCOL, "owner_id": self.owner_id,
+            "phase": "final", "mode": self.deployment["mode"],
+            "prepared_at_unix": candidate["prepared_at_unix"],
+            "checked_at_unix": now,
+            "production_ready": production_ready,
+            "candidate_hash": candidate["candidate_hash"],
+            "prerequisite": candidate,
+            "gpu_canary": evidence,
+            "gpu_canary_validation_error": evidence_error,
+            "checks": checks,
+        }
+        self._publish(receipt)
         if self.deployment["mode"] == "production" and not production_ready:
-            failed = [item["name"] for item in checks if not item["ok"]]
-            raise DeploymentPreflightError(
-                "production deployment preflight 失败: " + ",".join(failed),
-                receipt=receipt, receipt_path=self.receipt_path)
+            self._raise_failed(receipt)
         return receipt
+
+    def run(self) -> Dict[str, Any]:
+        """Compatibility one-shot; GPU production still requires two-phase evidence."""
+        self.prepare()
+        return self.finalize(None)
 
 
 __all__ = [

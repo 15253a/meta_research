@@ -24,7 +24,11 @@ from orchestrator import attack_stages as AS
 from orchestrator.advancer import SqliteAdvancer
 from orchestrator.attack_stages import AttackStages
 from orchestrator.compiler_sqlite import SqliteCompiler
-from orchestrator.execution_sandbox import SandboxOutputError, sandbox_environment_hash
+from orchestrator.execution_sandbox import (
+    SandboxOutputError,
+    sandbox_environment_hash,
+    sandbox_workload_environment_hash,
+)
 from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import GateInvariantError, SqliteGate, open_gate_read_conn
 from orchestrator.ids import SQLITE_INT_MAX
@@ -239,9 +243,11 @@ def test_manifest_runtime_uses_only_baseline_bound_resolver(env, monkeypatch):
 
     class BaseSandbox:
         environment_hash = base_hash
+        gpu_contract = {"verified": True}
 
     class ProjectSandbox:
         environment_hash = project_hash
+        gpu_contract = {"verified": True}
 
     class Resolver:
         def __init__(self):
@@ -254,11 +260,38 @@ def test_manifest_runtime_uses_only_baseline_bound_resolver(env, monkeypatch):
     resolver = Resolver()
     attack.execution_sandbox = BaseSandbox()
     attack.execution_sandbox_resolver = resolver
+    monkeypatch.setattr(attack, "_target_environment_hash", lambda _bt: base_hash)
+    assert attack._execution_sandbox_for({
+        "env_hash": sandbox_workload_environment_hash(base_hash, True),
+        "gpu_required": True,
+    }, 1) is attack.execution_sandbox
+    assert resolver.seen == []
+    BaseSandbox.gpu_contract = None
+    with pytest.raises(AS._BundleReject) as current_missing:
+        attack._execution_sandbox_for({
+            "env_hash": sandbox_workload_environment_hash(base_hash, True),
+            "gpu_required": True,
+        }, 1)
+    assert current_missing.value.failure_kind == "env_invalid"
+    BaseSandbox.gpu_contract = {"verified": True}
     monkeypatch.setattr(attack, "_target_environment_hash", lambda _bt: project_hash)
 
     assert attack._execution_sandbox_for(
         {"env_hash": project_hash}, 1).environment_hash == project_hash
     assert resolver.seen == [project_hash]
+    assert attack._execution_sandbox_for({
+        "env_hash": sandbox_workload_environment_hash(project_hash, True),
+        "gpu_required": True,
+    }, 1).environment_hash == project_hash
+    assert resolver.seen == [project_hash, project_hash]
+    ProjectSandbox.gpu_contract = None
+    with pytest.raises(AS._BundleReject) as imported_missing:
+        attack._execution_sandbox_for({
+            "env_hash": sandbox_workload_environment_hash(project_hash, True),
+            "gpu_required": True,
+        }, 1)
+    assert imported_missing.value.failure_kind == "env_invalid"
+    ProjectSandbox.gpu_contract = {"verified": True}
     with pytest.raises(AS._BundleReject, match="未继承"):
         attack._execution_sandbox_for({"env_hash": base_hash}, 1)
     ProjectSandbox.environment_hash = "sha256:" + "e" * 64

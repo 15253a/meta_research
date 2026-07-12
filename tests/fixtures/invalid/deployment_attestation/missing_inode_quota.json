@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "protocol": "deployment-attestation-v1",
+  "version": 2,
+  "protocol": "deployment-attestation-v2",
   "issued_at_unix": 1783814400,
   "service": {"uid": 1000, "gid": 1000, "groups": [1000], "username": "meta-research", "codex_home": "/home/meta-research/.codex"},
   "isolation": {"kind": "dedicated-vm", "deployment_id": "prod-cnbj2-v1", "machine_id": "0123456789abcdef0123456789abcdef", "boot_id": "5b97b294-cc1d-4dd9-8e36-8a66f05b561e", "hostname": "meta-research-prod-01", "vm_kind": "kvm"},

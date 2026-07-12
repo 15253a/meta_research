@@ -33,7 +33,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import yaml
 
@@ -1133,27 +1133,74 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     dependency_image_builder = None
     repository_materializer = None
     if attack is True:
-        execution_sandbox = DockerExecutionSandbox(
+        base_execution_sandbox = DockerExecutionSandbox(
             work_root=work, config=policy["execution"]["sandbox"],
             owner_guard=owner_guard, system_root=root)
         # Strong-execution prerequisites are startup capabilities, not a late
         # scientific failure.  Prove the exact local image/daemon/seccomp
         # before SQLite or any connector/provider side effect is exposed.
-        execution_sandbox.preflight()
-        deployment_receipt = DeploymentPreflight(
+        base_execution_sandbox.preflight()
+        deployment_preflight = DeploymentPreflight(
             work_root=work,
             policy=policy,
-            sandbox=execution_sandbox,
+            sandbox=base_execution_sandbox,
             owner_id=execution_owner_id,
             attestation_validator=schemas.validator("deployment_attestation"),
-            sandbox_gpu_access=False,
             owner_guard=owner_guard,
-        ).run()
+        )
+        deployment_candidate = deployment_preflight.prepare()
         # Only a deployment identity that passed the read-only trust check may
         # mutate prior-generation/session recovery state.  Both recoveries are
         # still before SQLite, connectors, providers, or new external work.
         execution_supervisor.recover_previous_generation()
-        execution_sandbox.recover_terminal_sessions(execution_supervisor)
+        base_execution_sandbox.recover_terminal_sessions(execution_supervisor)
+
+        gpu_contract = deployment_candidate["gpu_contract"]
+        execution_sandbox = base_execution_sandbox
+        canary_sandbox = None
+        gpu_evidence = None
+        try:
+            if gpu_contract is not None:
+                # Freeze a candidate rather than mutating the CPU sandbox that
+                # authorized recovery.  It is promoted only after the final
+                # gate replays durable guardian+inventory evidence.
+                canary_sandbox = DockerExecutionSandbox(
+                    work_root=work, config=policy["execution"]["sandbox"],
+                    owner_guard=owner_guard, system_root=root,
+                    gpu_contract=gpu_contract)
+                canary_sandbox.preflight()
+                runtimes = (
+                    deployment_candidate.get("facts", {}).get("docker", {})
+                    .get("daemon", {}) or {}).get("runtimes", [])
+                if isinstance(runtimes, list) and "nvidia" in runtimes:
+                    gpu_evidence = canary_sandbox.run_gpu_canary(
+                        execution_supervisor=execution_supervisor,
+                        candidate_hash=deployment_candidate["candidate_hash"])
+        except BaseException as canary_error:
+            # Even a preflight/timeout/guardian exception must attempt to leave
+            # an honest final false receipt before assembly aborts.  Owner loss
+            # can prevent that write; it remains fail-closed and is re-raised.
+            try:
+                deployment_preflight.finalize(None)
+            except BaseException as finalize_error:
+                add_note = getattr(finalize_error, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        "GPU canary 原始异常: "
+                        f"{type(canary_error).__name__}: {canary_error}")
+                raise finalize_error from canary_error
+            raise
+        deployment_receipt = deployment_preflight.finalize(gpu_evidence)
+        check_status = {
+            item.get("name"): item.get("ok") is True
+            for item in deployment_receipt["checks"]
+            if isinstance(item, Mapping)
+        }
+        gpu_access_ready = all(check_status.get(name) is True for name in (
+            "sandbox_gpu_access", "docker_cgroup", "docker_resource_limits"))
+        if (canary_sandbox is not None and gpu_access_ready
+                and canary_sandbox.resource_mode in {"cgroup-v1", "cgroup-v2"}):
+            execution_sandbox = canary_sandbox
         dependency_image_builder = PythonWheelImageBuilder(
             work_root=work,
             config=policy["import_materialization"]["dependency_image"],
@@ -1164,7 +1211,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         repository_materializer = GitHubRepositoryMaterializer(
             work_root=work,
             config=policy["import_materialization"],
-            sandbox_config=policy["execution"]["sandbox"],
+            sandbox_config=execution_sandbox.config,
             auto_license=policy["import_search"]["auto_license"],
             runtime_environment=execution_sandbox.image_environment,
             owner_guard=owner_guard,
@@ -1232,7 +1279,11 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     # authorizer（放行 SELECT/TRANSACTION，render/publish 的 BEGIN…COMMIT 读快照可跑）。
     compiler_conn = track_connection(open_responder_read_conn(db_path))
     publisher_conn = track_connection(open_responder_read_conn(db_path))
-    compiler = SqliteCompiler(compiler_conn, policy)
+    compiler = SqliteCompiler(
+        compiler_conn, policy,
+        runtime_environment_hash=(
+            execution_sandbox.environment_hash
+            if execution_sandbox is not None else None))
     publisher = SqliteStatusPublisher(publisher_conn, policy=policy,
                                       out_path=str(work / "state" / "status_card.json"))
     stop = StopController(daemon, policy)

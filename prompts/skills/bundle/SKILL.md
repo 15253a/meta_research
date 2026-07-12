@@ -1,6 +1,6 @@
 # SKILL · bundle —— 产可执行包：代码 + identity + execution_manifest（一目标一调用）
 
-> 版本：m7-1（步⑧：真执行契约，替换 M0 造假桩说明）。按《第一部分》§3.4 与流程图 05-Bundle。
+> 版本：m7-2（步⑧：真执行契约 + plan-frozen GPU access mode）。按《第一部分》§3.4 与流程图 05-Bundle。
 > 产物 schema = `schemas/execution_manifest.schema.json`（manifest）；代码/identity 为自由文件。
 > **分层铁律**：计划（做什么）在上游 plan 已锁死并以「resolved 计划切片」给你（上下文包①固定锚）；
 > 你产「怎么做」的**可执行包**；编排器交叉核对切片后由 harness **机械执行** manifest 命令——
@@ -37,7 +37,10 @@
    - `target_ref`: `{target_key, target_kind, seq, plan_slice_hash}` —— 全部**照抄锚区切片与
      plan_slice_hash**（编排器重算核对，抄错即拒）。
    - `protocol_ref`: `{protocol_id, protocol_ver}` —— 照抄锚区（int）。
-   - `env_hash`: **逐字照抄锚区给出的 pinned sandbox runtime sha256**；不得自造环境名、tag 或隐式 pull。
+   - `gpu_required`: **逐字照抄锚区从 plan target 冻结的 bool**；bundle 不得根据部署库存或自己生成的代码改写。
+   - `env_hash`: **逐字照抄锚区按 gpu_required 给出的 pinned workload sha256**；不得自造环境名、tag 或隐式
+     pull。CPU/GPU hash 不同，防止两种执行模式互相复用；GPU 为 true 但启动 canary 未证明 fixed allocation
+     时，编排器会在创建执行 session 前拒绝。
    - `config_json`: 代码实际使用的配置对象。**切片 claim.config_json 非空时须与之完全一致**
      （计划是配置的决定者）；切片未给则你自定（并让代码真用它）。
    - `code_files`: 信封中全部代码/配置文件名的清单（**不含**保留名 identity.md / execution_manifest.json /
