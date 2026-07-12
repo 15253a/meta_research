@@ -10,7 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from .repository_materialization_common import (
     RepositoryCacheError,
@@ -120,7 +120,9 @@ def _normalized_name(value: str) -> str:
     return re.sub(r"[-_.]+", "-", value).lower()
 
 
-def _hash_file(path: Path, *, maximum: Optional[int] = None) -> tuple[str, int]:
+def _hash_file(
+        path: Path, *, maximum: Optional[int] = None,
+        progress_guard: Optional[Callable[[], None]] = None) -> tuple[str, int]:
     digest = hashlib.sha256()
     total = 0
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -132,6 +134,8 @@ def _hash_file(path: Path, *, maximum: Optional[int] = None) -> tuple[str, int]:
         if maximum is not None and info.st_size > maximum:
             raise RepositoryCacheError(f"dependency artifact 超过上限: {path.name}")
         while total < info.st_size:
+            if progress_guard is not None:
+                progress_guard()
             chunk = os.read(fd, min(1024 * 1024, info.st_size - total))
             if not chunk:
                 raise RepositoryCacheError(f"dependency artifact 读取截断: {path.name}")

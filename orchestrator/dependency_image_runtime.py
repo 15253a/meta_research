@@ -33,6 +33,12 @@ class _DependencyImageRuntimeMixin:
     """Host contract: builder config, bootstrap sandbox, supervisor, locks and guards."""
 
     def _verify_object_authority(self, object_path: Path) -> None:
+        root = os.lstat(object_path)
+        if (not stat.S_ISDIR(root.st_mode) or stat.S_ISLNK(root.st_mode)
+                or root.st_uid != os.geteuid()
+                or stat.S_IMODE(root.st_mode) != 0o500):
+            raise RepositoryCacheError(
+                "dependency image object root authority 非法")
         context_root = object_path / "context"
         entries = 0
         total = 0

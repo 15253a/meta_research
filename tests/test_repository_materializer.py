@@ -31,6 +31,10 @@ from orchestrator.repository_materializer import (
     _value_hash,
 )
 from orchestrator.repository_materializer_lfs import _LfsObjectRedirectHandler
+from orchestrator.repository_materializer_store import (
+    inspect_repository_materialization_index,
+    inspect_repository_snapshot_object,
+)
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
@@ -653,6 +657,76 @@ def test_adapter_v3_binds_trusted_dependency_image_capability(tmp_path):
     assert supply["dependency_lock_hash"] == builder.result["lock_canonical_hash"]
     assert supply["container_image_id"] == builder.result["image_id"]
     assert supply["image_archive_sha256"] == builder.result["image_archive_sha256"]
+
+
+def test_offline_repository_inspectors_do_not_resolve_dependency_image(tmp_path):
+    adapter = _adapter(
+        version=3, dependency_mode="python_wheel_image_v1",
+        dependency_locks=[".meta-research/python-wheel-lock.json"])
+    files = _repo_files(adapter=adapter)
+    files[".meta-research/python-wheel-lock.json"] = b"{}\n"
+    repo = _FrozenRepo("acme/model", "a" * 40, files)
+    provider = _Provider([repo])
+    builder = _FakeDependencyImageBuilder()
+    materialize, work = _materializer(
+        tmp_path, provider, dependency_image_builder=builder)
+    result = materialize(_candidate(repo))
+
+    def forbidden_resolve(_capability):
+        raise AssertionError("offline inspector must not resolve dependency image")
+
+    builder.resolve = forbidden_resolve
+    object_path = Path(result["source_tree"]).parent
+    inspected = inspect_repository_snapshot_object(object_path)
+    index_path = next(
+        (work / "state" / "import-materializations" / "indexes").glob("*.json"))
+    index = inspect_repository_materialization_index(index_path)
+
+    assert inspected["receipt"]["object_hash"] == result["repository_snapshot_hash"]
+    assert inspected["result"]["execution_image"] == result["execution_image"]
+    assert index["object_hash"] == result["repository_snapshot_hash"]
+
+
+def test_offline_repository_inspectors_reject_component_and_index_tamper(
+        tmp_path):
+    repo = _FrozenRepo("acme/model", "a" * 40, _repo_files())
+    provider = _Provider([repo])
+    materialize, work = _materializer(tmp_path, provider)
+    result = materialize(_candidate(repo))
+    object_path = Path(result["source_tree"]).parent
+    spec_path = object_path / "spec.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec["env_hash"] = "sha256:" + "0" * 64
+    spec_path.write_bytes(_canonical(spec))
+
+    with pytest.raises(
+            RepositoryMaterializationError, match="component hash"):
+        inspect_repository_snapshot_object(object_path)
+
+    index_path = next(
+        (work / "state" / "import-materializations" / "indexes").glob("*.json"))
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["config_hash"] = "sha256:" + "0" * 64
+    index_path.write_bytes(_canonical(index))
+
+    with pytest.raises(
+            RepositoryMaterializationError, match="path identity"):
+        inspect_repository_materialization_index(index_path)
+
+
+def test_offline_repository_inspector_binds_pinned_base_environment(tmp_path):
+    repo = _FrozenRepo("acme/model", "a" * 40, _repo_files())
+    materialize, _work = _materializer(tmp_path, _Provider([repo]))
+    result = materialize(_candidate(repo))
+    object_path = Path(result["source_tree"]).parent
+    receipt_path = object_path / "receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["environment_hash"] = "sha256:" + "0" * 64
+    receipt_path.write_bytes(_canonical(receipt))
+
+    with pytest.raises(
+            RepositoryMaterializationError, match="environment identity"):
+        inspect_repository_snapshot_object(object_path)
 
 
 @pytest.mark.parametrize("line_end", [b"\n", b"\r\n"])

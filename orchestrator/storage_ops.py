@@ -139,56 +139,172 @@ def _try_rename_noreplace(source: Path, destination: Path) -> bool:
     raise OSError(error_number, os.strerror(error_number), os.fspath(destination))
 
 
-def _publish_lease_fenced_directory(source: Path, destination: Path) -> None:
-    """VEPFS fallback: exclusive name claim + target lease + durable ready marker."""
-    token = uuid.uuid4().hex
+def _read_parent_claim(destination: Path, *, token: str) -> Path:
     claim = destination.parent / restore_parent_claim_name(destination)
-    claim_raw = restore_claim_bytes(token)
+    info = claim.lstat()
+    raw = sg._read(claim, maximum=256)
+    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o400
+            or raw != restore_claim_bytes(token)):
+        raise StorageOperationError(
+            "restore parent claim 与 source/cycle/target identity 不匹配")
+    if info.st_nlink == 2:
+        temporary = claim.parent / f".{claim.name}.{token}.tmp"
+        try:
+            temporary_info = temporary.lstat()
+        except FileNotFoundError as error:
+            raise StorageOperationError(
+                "restore parent claim 多余 hardlink 无法归因") from error
+        if ((temporary_info.st_dev, temporary_info.st_ino)
+                != (info.st_dev, info.st_ino)):
+            raise StorageOperationError(
+                "restore parent claim hardlink identity 漂移")
+        temporary.unlink()
+        sg._sync_dir(claim.parent)
+        info = claim.lstat()
+    if info.st_nlink != 1:
+        raise StorageOperationError("restore parent claim link count 非法")
+    fd = os.open(
+        claim, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0))
     try:
-        claim_fd = os.open(
-            claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    sg._sync_dir(claim.parent)
+    return claim
+
+
+def _publish_parent_claim(destination: Path, *, token: str) -> Path:
+    """Publish a complete no-clobber claim; never expose partially written bytes."""
+    raw = restore_claim_bytes(token)
+    parent = destination.parent
+    claim = parent / restore_parent_claim_name(destination)
+    if os.path.lexists(claim):
+        return _read_parent_claim(destination, token=token)
+    anonymous_fd = -1
+    try:
+        anonymous_fd = os.open(
+            parent,
+            os.O_RDWR | getattr(os, "O_TMPFILE", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o400)
+    except OSError as error:
+        if error.errno not in {
+                errno.EINVAL, errno.EISDIR, errno.ENOSYS, errno.ENOTSUP,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}:
+            raise
+    if anonymous_fd >= 0:
+        try:
+            offset = 0
+            while offset < len(raw):
+                offset += os.write(anonymous_fd, raw[offset:])
+            os.fchmod(anonymous_fd, 0o400)
+            os.fsync(anonymous_fd)
+            libc = ctypes.CDLL(None, use_errno=True)
+            linkat = getattr(libc, "linkat", None)
+            if linkat is None:
+                raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+            linkat.argtypes = [
+                ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+            ]
+            linkat.restype = ctypes.c_int
+            result = linkat(
+                -100, os.fsencode(f"/proc/self/fd/{anonymous_fd}"),
+                -100, os.fsencode(claim), 0x400)
+            if result != 0:
+                error_number = ctypes.get_errno()
+                if error_number == errno.EEXIST:
+                    raise StorageOperationError(
+                        "restore target 存在未完成 parent claim；拒绝覆盖")
+                raise OSError(
+                    error_number, os.strerror(error_number), os.fspath(claim))
+        finally:
+            os.close(anonymous_fd)
+    else:
+        temporary = parent / f".{claim.name}.{token}.tmp"
+        fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
             | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
             0o400)
-    except FileExistsError as error:
-        raise StorageOperationError(
-            "restore target 存在未完成 parent claim；拒绝覆盖") from error
-    try:
-        offset = 0
-        while offset < len(claim_raw):
-            offset += os.write(claim_fd, claim_raw[offset:])
-        os.fchmod(claim_fd, 0o400)
-        os.fsync(claim_fd)
-    finally:
-        os.close(claim_fd)
-    sg._sync_dir(destination.parent)
-    try:
-        destination.mkdir(mode=0o700)
-    except FileExistsError as error:
-        raise StorageOperationError(
-            "restore target 在发布前被并发创建") from error
+        try:
+            offset = 0
+            while offset < len(raw):
+                offset += os.write(fd, raw[offset:])
+            os.fchmod(fd, 0o400)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(temporary, claim, follow_symlinks=False)
+        except FileExistsError as error:
+            raise StorageOperationError(
+                "restore target 存在未完成 parent claim；拒绝覆盖") from error
+        finally:
+            temporary.unlink(missing_ok=True)
+    sg._sync_dir(parent)
+    return _read_parent_claim(destination, token=token)
+
+
+def _publish_lease_fenced_directory(
+        source: Path, destination: Path, *,
+        continuation_marker: Optional[bytes] = None) -> None:
+    """VEPFS fallback: exclusive name claim + target lease + durable ready marker."""
+    receipt_raw = sg._read(source / "restore.json")
+    token = hashlib.sha256(
+        b"meta-research-restore-claim/v2\0"
+        + os.fsencode(Path(os.path.abspath(destination))) + b"\0"
+        + receipt_raw).hexdigest()[:32]
+    claim = _publish_parent_claim(destination, token=token)
+    if not os.path.lexists(destination):
+        try:
+            destination.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    destination_info = destination.lstat()
+    if (not stat.S_ISDIR(destination_info.st_mode)
+            or stat.S_ISLNK(destination_info.st_mode)
+            or destination_info.st_uid != os.geteuid()
+            or destination_info.st_mode & 0o077):
+        raise StorageOperationError("restore fallback target authority 非法")
     sg._sync_dir(destination.parent)
     marker = destination / RESTORE_IN_PROGRESS_NAME
-    lease = InstanceLease.acquire(destination, restore_claim_token=token)
+    marker_exists = os.path.lexists(marker)
+    lease = InstanceLease.acquire(
+        destination, restore_claim_token=token,
+        expected_restore_marker=(
+            continuation_marker if marker_exists else None))
     primary_error: Optional[BaseException] = None
     try:
         lease.assert_owned()
-        sg._atomic_write(
-            marker, b"meta-research-restore-in-progress/v1\n", mode=0o400)
+        sg._publish_once(
+            marker,
+            continuation_marker or b"meta-research-restore-in-progress/v1\n")
         sg._sync_dir(destination)
         for name in ("research.sqlite", "restore.json"):
             target = destination / name
-            if os.path.lexists(target):
-                raise StorageOperationError(f"restore fallback 目标条目已存在: {name}")
             lease.assert_owned()
-            os.rename(source / name, target)
+            source_file = source / name
+            if os.path.lexists(target):
+                if (sg._hash_file(source_file) != sg._hash_file(target)
+                        or (name == "restore.json"
+                            and sg._read(target) != receipt_raw)):
+                    raise StorageOperationError(
+                        f"restore fallback 既有目标条目漂移: {name}")
+                source_file.unlink()
+            else:
+                os.rename(source_file, target)
             sg._sync_dir(source)
             sg._sync_dir(destination)
         lease.assert_owned()
         claim.unlink()
         sg._sync_dir(destination.parent)
-        lease.assert_owned()
-        marker.unlink()
-        sg._sync_dir(destination)
+        if continuation_marker is None:
+            lease.assert_owned()
+            marker.unlink()
+            sg._sync_dir(destination)
     except BaseException as error:
         primary_error = error
         raise
@@ -204,11 +320,19 @@ def _publish_lease_fenced_directory(source: Path, destination: Path) -> None:
                     f"{type(close_error).__name__}: {close_error}")
 
 
-def _rename_noreplace(source: Path, destination: Path) -> None:
+def _rename_noreplace(
+        source: Path, destination: Path, *,
+        continuation_marker: Optional[bytes] = None) -> None:
     """Publish without clobber; use a fail-closed lease fence when flags are absent."""
+    claim = destination.parent / restore_parent_claim_name(destination)
+    if continuation_marker is not None and os.path.lexists(claim):
+        _publish_lease_fenced_directory(
+            source, destination, continuation_marker=continuation_marker)
+        return
     if _try_rename_noreplace(source, destination):
         return
-    _publish_lease_fenced_directory(source, destination)
+    _publish_lease_fenced_directory(
+        source, destination, continuation_marker=continuation_marker)
 
 
 class SnapshotArchive:
@@ -557,7 +681,13 @@ class SnapshotArchive:
         }
 
     def restore(self, *, target: Path | str, cycle: Optional[str | int] = None,
-                retain: int = MIN_RETAINED_GENERATIONS) -> Dict[str, Any]:
+                retain: int = MIN_RETAINED_GENERATIONS,
+                continuation_marker: Optional[bytes] = None) -> Dict[str, Any]:
+        if (continuation_marker is not None
+                and (not isinstance(continuation_marker, bytes)
+                     or not continuation_marker
+                     or len(continuation_marker) > 1024)):
+            raise ValueError("restore continuation_marker 须为非空有界 bytes")
         chain = self._chain(retain=retain)
         selected = chain["ordered"][-1] if cycle is None else _cycle_number(cycle)
         if selected not in chain["ordered"]:
@@ -574,8 +704,6 @@ class SnapshotArchive:
         destination = Path(os.path.abspath(os.fspath(target)))
         if destination == self.work_root or self.work_root in destination.parents:
             raise StorageOperationError("restore target 不得位于源 work_root 内")
-        if os.path.lexists(destination):
-            raise StorageOperationError("restore target 必须不存在")
         try:
             parent = destination.parent.resolve(strict=True)
         except OSError as error:
@@ -585,6 +713,14 @@ class SnapshotArchive:
         source_root = self.work_root.resolve(strict=True)
         if destination == source_root or source_root in destination.parents:
             raise StorageOperationError("restore target 解析后不得位于源 work_root 内")
+        claim = destination.parent / restore_parent_claim_name(destination)
+        resumable_fallback = (
+            continuation_marker is not None and os.path.lexists(claim))
+        if os.path.lexists(claim) and not resumable_fallback:
+            raise StorageOperationError(
+                "restore target 存在未完成 parent claim；拒绝覆盖")
+        if os.path.lexists(destination) and not resumable_fallback:
+            raise StorageOperationError("restore target 必须不存在")
         temporary = parent / f".{destination.name}.restore-{uuid.uuid4().hex}"
         temporary.mkdir(mode=0o700)
         temporary_identity = temporary.lstat()
@@ -605,7 +741,10 @@ class SnapshotArchive:
             receipt = {
                 "schema": RESTORE_SCHEMA,
                 "scope": "sqlite_truth_only",
-                "continuation_mode": "legacy_adoption_on_first_start",
+                "continuation_mode": (
+                    "import_materialization_restore_required"
+                    if continuation_marker is not None
+                    else "legacy_adoption_on_first_start"),
                 "publication_contract": "atomic_noreplace_or_lease_fenced_ready",
                 "source_work_root": str(self.work_root),
                 "source_cycle": f"c{selected}",
@@ -614,9 +753,18 @@ class SnapshotArchive:
             }
             sg._atomic_write(
                 temporary / "restore.json", sg._canonical(receipt), mode=0o400)
+            if continuation_marker is not None:
+                sg._atomic_write(
+                    temporary / RESTORE_IN_PROGRESS_NAME,
+                    continuation_marker, mode=0o400)
             sg._sync_dir(temporary)
             self.owner_guard()
-            _rename_noreplace(temporary, destination)
+            if continuation_marker is None:
+                _rename_noreplace(temporary, destination)
+            else:
+                _rename_noreplace(
+                    temporary, destination,
+                    continuation_marker=continuation_marker)
             sg._sync_dir(parent)
             self.publisher._verify_backup_object(
                 destination / "research.sqlite",
@@ -637,6 +785,7 @@ class SnapshotArchive:
                 # 不使用 pathname recursive delete。
                 (temporary / "restore.json").unlink(missing_ok=True)
                 (temporary / "research.sqlite").unlink(missing_ok=True)
+                (temporary / RESTORE_IN_PROGRESS_NAME).unlink(missing_ok=True)
                 temporary.rmdir()
 
     def _plan_value(self, *, retain: int) -> Dict[str, Any]:
@@ -810,6 +959,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply.add_argument("--expect-sha256", required=True)
     sub.add_parser("mirror-logs")
     sub.add_parser("verify-log-mirrors")
+    verify_imports = sub.add_parser("verify-import-materializations")
+    verify_imports.add_argument("--cycle")
+    restore_imports = sub.add_parser("restore-import-materializations")
+    restore_imports.add_argument("--target", required=True)
+    restore_imports.add_argument("--cycle")
+    restore_complete = sub.add_parser("restore-with-import-materializations")
+    restore_complete.add_argument("--target", required=True)
+    restore_complete.add_argument("--cycle")
     args = parser.parse_args(argv)
     work_root = Path(os.path.abspath(args.work_root))
 
@@ -833,12 +990,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = _run_with_lease(
             work_root, lambda archive: archive.apply_gc(
                 plan=wrapper["plan"], expected_sha256=args.expect_sha256))
-    else:
+    elif args.command in {"mirror-logs", "verify-log-mirrors"}:
         from .storage_assets import RegisteredAssetArchive
         operation = (
             (lambda archive: RegisteredAssetArchive(archive).mirror_logs())
             if args.command == "mirror-logs" else
             (lambda archive: RegisteredAssetArchive(archive).verify_log_mirrors()))
+        result = _run_with_lease(work_root, operation)
+    else:
+        from .storage_imports import (
+            IMPORT_RESTORE_MARKER,
+            ImportMaterializationArchive,
+        )
+        if args.command == "verify-import-materializations":
+            operation = lambda archive: ImportMaterializationArchive(
+                archive).verify(cycle=args.cycle)
+        elif args.command == "restore-import-materializations":
+            operation = lambda archive: ImportMaterializationArchive(
+                archive).restore(target=args.target, cycle=args.cycle)
+        else:
+            def operation(archive):  # noqa: ANN001
+                requested = Path(os.path.abspath(os.fspath(args.target)))
+                resolved = requested.parent.resolve(strict=True) / requested.name
+                claim = resolved.parent / restore_parent_claim_name(resolved)
+                if (not os.path.lexists(resolved)
+                        or os.path.lexists(claim)):
+                    archive.restore(
+                        target=args.target, cycle=args.cycle,
+                        continuation_marker=IMPORT_RESTORE_MARKER)
+                return ImportMaterializationArchive(archive).restore(
+                    target=args.target, cycle=args.cycle)
         result = _run_with_lease(work_root, operation)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return 0

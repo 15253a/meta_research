@@ -272,6 +272,7 @@ def test_restore_parent_claim_blocks_before_inner_marker_is_durable(
             archive.restore(target=target)
     claim = target.parent / restore_parent_claim_name(target)
     assert target.is_dir() and claim.is_file()
+    assert claim.stat().st_nlink == 1
     assert not (target / RESTORE_IN_PROGRESS_NAME).exists()
     monkeypatch.setattr(storage_ops_module.sg, "_atomic_write", real_atomic_write)
     with pytest.raises(InstanceLeaseError, match="token 不匹配"):
