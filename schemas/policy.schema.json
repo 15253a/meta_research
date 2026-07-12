@@ -288,7 +288,7 @@
       "required": ["dual_mode"],
       "additionalProperties": false,
       "properties": {
-        "dual_mode": { "enum": ["A", "B"], "description": "A=一 turn 一阶段（M6 实测后定默认）" }
+        "dual_mode": { "const": "A", "description": "生产只接受 A=一 turn 一阶段；未实现真正 turn 内跨阶段提交的 B 必须 fail-closed" }
       }
     },
     "tree_guard": {

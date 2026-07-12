@@ -149,6 +149,14 @@ def test_policy_yaml_parses_and_validates():
     make_validator("policy").validate(policy)
 
 
+def test_policy_rejects_unimplemented_multi_stage_session_mode():
+    with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
+        policy = yaml.safe_load(f)
+    policy["session"]["dual_mode"] = "B"
+    with pytest.raises(ValidationError):
+        make_validator("policy").validate(policy)
+
+
 def test_plan_gpu_requirement_is_additive_abstract_resource_intent():
     path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
     legacy = load_json(path)

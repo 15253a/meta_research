@@ -17,9 +17,9 @@ JudgeProvider（bundle 双评审写库）+ AttackStages
 默认 untrusted adapter 与全部生产 manifest 命令只经 exact-pinned Docker sandbox 执行；后端/镜像/隔离
 能力在打开 SQLite 前预检，缺失即 fail closed，绝不回退到 host 裸跑）。
 
-**双模式 A/B**（policy.session.dual_mode）：模式 A=一 turn 一阶段、模式 B=一 turn 跨多阶段。run_cycles
-的内循环按阶段推进（格间过 precheck + 发布卡片），对两模式都成立；A/B 的会话粒度实测定默认 = 运维执行
-（§7.4）。本入口读并记录 dual_mode。
+**会话模式 A**（policy.session.dual_mode）：一 turn 只推进一个阶段，每个阶段都由编排器耐久提交后再进入下一格。
+reference 曾设想“一 turn 跨多阶段且 turn 内即时提交”的 B，但当前无状态 `run_task` 窄接口没有中途回调/提交能力。
+为避免把 B 静默当 A 运行，policy schema 与 `System` 都 fail-closed 只接受 A；若未来真实引入 turn-checkpoint 协议，须另走受审契约。
 """
 from __future__ import annotations
 
@@ -232,10 +232,13 @@ class System:
                  execution_supervisor: Optional[ExecutionSupervisor] = None,
                  deployment_receipt: Optional[Dict[str, Any]] = None,
                  resource_closers: Optional[List[Callable[[], None]]] = None):
+        if dual_mode != "A":
+            raise ValueError(
+                "session.dual_mode 当前只支持 A（一 turn 一阶段）；"
+                "B 缺 turn 内跨阶段耐久提交协议，拒绝静默按 A 运行")
         self.advancer = advancer
         self.state = state
         self.daemon = daemon
-        self.dual_mode = dual_mode
         self.work_root = work_root
         self._sync_notifications_cb = sync_notifications or (lambda: None)
         self._sync_interactions_cb = sync_interactions or (lambda: None)
@@ -280,6 +283,11 @@ class System:
         self._interaction_exit_drained = False
         self._accepted_interactions_drained = False
         self._hard_stop_requested = False
+
+    @property
+    def dual_mode(self) -> str:
+        """The sole implemented turn mapping; intentionally immutable."""
+        return "A"
 
     def _assert_instance_owned(self) -> None:
         with self._lifecycle_guard:
@@ -620,8 +628,8 @@ class System:
             return self._run_owned(max_cycles)
 
     def _run_owned(self, max_cycles: int) -> List[str]:
-        """驱动 run_cycles 到停机（terminate / τ 自终止 / 阻断 / max_cycles）。返回本次推进的 cycle_id。
-        reasoning-only 下模式 A≡B（每轮一阶段）——故直接 run_cycles；attack 多阶段的 A/B 分驱 = CP7.4。"""
+        """以生产唯一的模式 A 驱动 run_cycles 到停机：每次 Runner 调用只对应一个阶段，
+        阶段结果提交后才进入下一格。返回本次推进的 cycle_id。"""
         pump_owner = self._start_interaction_pump(0.05)
         if pump_owner:
             self._interaction_exit_drained = False
@@ -1505,7 +1513,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     if instance_lease is not None:
         instance_lease.set_state("ready", activity="assembly-complete")
     return System(advancer=advancer, state=state, daemon=daemon,
-                  dual_mode=policy.get("session", {}).get("dual_mode", "A"), work_root=work,
+                  dual_mode=policy["session"]["dual_mode"], work_root=work,
                   sync_notifications=sync_notifications,
                   sync_interactions=lambda: sync_interactions(None),
                   interaction_pending=interactions_pending,

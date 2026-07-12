@@ -852,7 +852,7 @@ policy: {
   budget: { B0:4, doubling_period_m:4, B_max:"40(d1 生效前 32)" },
   flow: { decompose_threshold:"est_cost > B(t)", tau:{ score_floor:0.25, consecutive_rounds:5 }, audit_cadence_K:7, retry:{ artifact_parse:2, plan_review:2, bundle_code_review:3, bundle_result_review:3 }, watchdog:{ probe_h:2, full_h:24 } },
   retrieval: { gate2_stuck_threshold:"visit≥3 或 连续 inconclusive≥2", budget_by_question_scale:"随 est_cost/score 与 B(t) 缩放" },
-  session: { dual_mode:"A(M6 实测后定默认)" },
+  session: { dual_mode:"A(唯一生产模式)" },
   tree_guard: { max_decompose_depth:4, max_children_per_node:6, max_open_questions:24 },
   question_guard: { max_inconclusive_per_question:3 },
   answer_review: { max_reviews_per_cycle:4, spawn_counts_toward_max_open:true },

@@ -48,7 +48,8 @@ python -m orchestrator.run --system-root . --work-root /tmp/canary --max-cycles 
   `<work-root>/state/deployment/deployment-<owner-id>.json`。默认 development 回执永远是
   `production_ready=false`，入口也会打印警告；它是可用的开发/可信主机模式，不是生产验收。
 
-停机时打印 `[run] dual_mode=… 推进 N 轮：[…]；停因=…`。停因见 §6。
+停机时打印 `[run] dual_mode=A 推进 N 轮：[…]；停因=…`。生产只支持每个 Runner turn 推进一个阶段的 A；
+未实现 turn 内跨阶段即时提交协议的 B 会在 policy/schema 与 `System` 边界直接拒绝，不会静默按 A 运行。停因见 §6。
 
 若在 Python 内直接调用 `build_system()`，默认同样强制 lease；必须用 `with build_system(...) as system:`，或在
 所有正常/异常分支调用可重试的 `system.close()`。关闭顺序是 listener/pump/delivery、已接纳 query、共享 execution
@@ -100,9 +101,9 @@ predicate_json: {
 python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
 ```
 
-## 3. 可调旋钮：policy.yaml
+## 3. 策略与运行契约：policy.yaml
 
-`policies/policy.yaml` 是全部可调旋钮的唯一权威（机制代码零硬编码；全量注册表 = 第一部分附录 C）。常改的：
+`policies/policy.yaml` 是策略与运行契约的唯一权威（机制代码零硬编码；全量注册表 = 第一部分附录 C）。常见字段：
 
 - `budget`：`B0` 单轮预算、`B_max` 上限、`session_max` 全局成本安全网（ledger.money 求和上限）。
 - `flow.tau`：自终止判据①——`score_floor` 分数地板、`consecutive_rounds` 连续几轮低分即停。
@@ -115,7 +116,7 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
   archive/LFS object redirect host allowlist、LFS object/batch 上限、adapter 路径和 pinned image 中 CPython
   版本/源码 artifact SHA-256。当前 `lfs_policy=fetch`；pointer Git blob、Batch response、下载 OID/size 与最终
   ledger 必须闭合，signed action URL/header 不进入持久复现身份。
-- `session.dual_mode`：A=一 turn 一阶段（默认；A/B 实测定默认属运维）。
+- `session.dual_mode`：固定 `A`（一 turn 一阶段）。这是故障恢复/审计边界，不是可调吞吐开关。
 - `deployment`：`development` 只记录诚实的非生产回执；`production` 还须给出部署者持有、service account
   不可写的 canonical attestation 路径，并在任何 DB/provider 调用前与 live facts 交叉核。
 
@@ -371,7 +372,7 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   LFS 支持也只覆盖 GitHub 固定 Batch endpoint、
   policy allowlist 内 basic HTTPS transfer，不接受仓库自定义 `.lfsconfig` endpoint/transfer adapter。
 - CP11.3c 的 120 轮是无真实 provider 工作负载的控制面/投影回归；尚未完成跨节点 VEPFS 双 owner 实机竞态，
-  也尚未运行 100+ 轮含真实 Codex/import/训练与 owner-kill/daemon-loss/预算失败注入的 soak。这两项完成前，
+  也尚未运行数百轮（最终验收下限 ≥200）含真实 Codex/import/训练与 owner-kill/daemon-loss/预算失败注入的 soak。这两项完成前，
   对“上百轮可用”的结论仍只能是机制上可推进、不是运营验收通过。
 - 假执行标记（`source=fake` / `synthetic=true`）是 M0–M3 验收期语义，真执行起已移除。
 
