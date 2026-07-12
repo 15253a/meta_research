@@ -6,6 +6,7 @@
 
 ---
 
+- [0077](0077-cp114c3c1-qualification-firewall.md) — CP11.4c.3c.1 real SEED/DREAMER sealed-holdout + one-shot/non-feedback qualification firewall · commit `2a98e4b` · 验证: qualification/deployment 132 + affected 13；sandbox/entry 164；真实 SEED/DREAMER；内部三路无 BLOCKER；外审两轮均 401 无 verdict；全量依用户要求留到最终检查点
 - [0076](0076-cp114c3b2b2-import-cas-recovery.md) — CP11.4c.3b.2b.2 SQLite-rooted exact repository/dependency CAS closure + replay-safe combined restore · commit `d72da35` · 验证: 相关 31；内部三路终审 APPROVE；外审第 1 轮 401、第 2 轮约 5 分钟/49k tokens 无 verdict；全量依用户要求留到最终检查点
 - [0075](0075-cp114c3b2b1-registered-log-mirrors.md) — CP11.4c.3b.2b.1 deterministic registered-log mirror + VEPFS lease-fenced restore fallback · commit `f59c72c` · 验证: 相关 70；内部双终审 APPROVE；外审第 1 轮 401、第 2 轮 240 秒无 verdict；全量依用户要求留到最终检查点
 - [0074](0074-cp114c3b2a-offline-snapshot-ops.md) — CP11.4c.3b.2a lease-fenced offline verify + SQLite restore + last-3/applied-plan backup GC + capacity headroom · commit `011c98b` · 验证: 相关 118；内部双终审 APPROVE；外审第 1 轮 401、第 2 轮 5 分钟无 verdict；全量依用户要求留到最终检查点

@@ -31,8 +31,10 @@
   CP11.4c.2b.3a honest deployment preflight 已落 `16d5270`，2b.3b fixed GPU device bridge 已落 `563a496`；
   至此 CP11.4c.2 的代码与 fail-closed 部署合同收口。当前进入 CP11.4c.3 目标 VEPFS 两节点/真实
   数百轮（明确下限 ≥200）故障注入验收；3a 会话诚实化及 3b.1/b.2a/b.2b.1/b.2b.2 snapshot、日志镜像与
-  import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。下一检查点进入
-  CP11.4c.3c 薄验收/科学隔离工具；当前节点无 NVIDIA container runtime，尚未完成正向 GPU canary 或生产验收。
+  import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。CP11.4c.3c.1
+  real SEED/DREAMER sealed-holdout、one-shot final 与独立 scorer 已落 `2a98e4b`；下一检查点进入
+  CP11.4c.3c.2 目标 VEPFS 两节点 lease/fd/WAL canary 与预声明 fault soak。当前节点无 NVIDIA container runtime，
+  尚未完成正向 GPU canary 或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
 ## 步与检查点
@@ -519,8 +521,10 @@
               b.2b.2 的 import CAS scope 已完成；execution-log 正本、checkpoint/content store 与完整 work-root DR
               仍明确不在该 scope，故 b.2b/b.2/b 父项暂不勾选，不虚报完整灾备。
         - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
-          - [ ] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 全部 sealed-holdout/one-shot/non-feedback 约束；
-            T1 的 DREAMER 在 A/B/C/HPO/claim 不可见，T2 的 target_y 与 trial/stimulus 身份对 train/HPO 不可见，独立 evaluator 出分。
+          - [x] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 全部 sealed-holdout/one-shot/non-feedback 约束；
+            T1 的 DREAMER 在 A/B/C/HPO/claim 不可见；T2 的全部 final folds 在 final 前不可见、final 每 unit 只挂
+            一个 X-only fold；独立 root evaluator 从 sealed truth 出分。→ commit `2a98e4b`（build_log 0077；
+            qualification/deployment 相关 132 + affected 13、sandbox/entry 164、真实 SEED/DREAMER；全量留最终检查点）。
           - [ ] CP11.4c.3c.2 目标 VEPFS 两节点 lease/fd/WAL canary + 预声明 fault schedule soak runner。
           - [ ] CP11.4c.3c.3 canonical evidence packer + 离线 verifier，在干净节点 restore 后至少续跑一轮。
         - [ ] CP11.4c.3d 目标运行：dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector 就位后，

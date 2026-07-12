@@ -1,31 +1,32 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
-- 更新：2026-07-12 ｜ 位置：步⑪ CP11.4c.3c.1 T1/T2 输入防火墙（下一检查点）
-- 检查点状态：空闲；b.2b.2 功能已提交 `d72da35`，正在完成记账
+- 更新：2026-07-12 ｜ 位置：步⑪ CP11.4c.3c.2 VEPFS 两节点 canary / fault soak（下一检查点）
+- 检查点状态：空闲；CP11.4c.3c.1 功能 `2a98e4b` 已提交，记账完成
 
 ## 上一检查点结果
 
-- 已从 repository/dependency-image runtime verifier 抽出纯文件 inspector；runtime current policy、
-  allowlist 与 Docker resolve 仍在薄包装中，离线核不调网络/Docker/当前 policy。
-- selected SQLite backup 通过 worker selection lineage 精确绑定 candidate index，再闭合 repository object
-  与 v3 dependency-image；100 targets 去重核验，legacy/new plan shape 不可互相降级。
-- 一步 restore 在 SQLite target 初次可见前即带 exact root marker，随后以 target flock 接管，不新造状态机；
-  object/index/receipt 三个 crash window 均保持目标不可启动并可重放，复用条目重新 fsync，容量按目标 block/目录项预算。
-- 相关验证：storage import **14 passed**、dependency inspector **5 passed**、repository inspector/
-  runtime **5 passed**、ImportWorker 投影 **3 passed**、既有 SQLite restore **4 passed**；未跑全量。
-- 内部三路最终 `APPROVE`；外审第 1 轮凭证 401、第 2 轮约 5 分钟/49k tokens 无 verdict，已到两轮上限。
+- 已用真实 SEED/DREAMER archive 制备 canonical public X-only / root-sealed truth views，并冻结 exact
+  view ledger、contract 与 claim；T1 DREAMER 和 T2 全部 final folds 在 final 前均不可挂载。
+- final source/runtime 冻结后一次性消费 capability，T1 1 unit、T2 3×15 units 均 spent-before-spawn；
+  candidate 只交 canonical probabilities，root scorer 独立重算，score replay 不直接信任已有 metrics。
+- qualification 复用现有 sandbox/guardian/lease/GPU canary，不增加数据库、daemon、scheduler 或研究状态机；
+  host tools、custom runner、repo import、asset refs 与 extra mounts 全部 fail-closed。
+- 相关验证：qualification/deployment **132 + affected 13 passed**，sandbox/entry **164 passed**；真实
+  DREAMER 324 records、SEED 15×10,182 IDs 与跨 UID contract/claim/verify 通过；未跑全量。
+- 内部三路无 BLOCKER；外审两轮均因独立凭证 HTTP 401 无 verdict，已到上限。
 
 ## 当前可用边界
 
-- 百轮级 snapshot 主干、last-3 深验/GC、已登记日志镜像及 import/dependency CAS 离线核验/恢复
-  已具备检查点命令；均不每轮自动全量扫描。
-- 当前仍不是完整 DR：SQLite 与 import CAS 分两条显式 restore；log 正本、checkpoint/content store、views Git
-  不在恢复闭包；同一 VEPFS failure domain 不防 fileset/站点丢失。
-- production preflight、T1/T2 firewall、两节点 canary、≥200 轮真实 fault soak 与 evidence pack 仍未完成。
+- CP11.4c.3c.1 已达到可用的 CPU T1/T2 机械隔离与独立出分级别；operator/source provenance、novelty 与
+  统计优越性仍不由该工具自动证明。
+- 当前节点无 NVIDIA container runtime，GPU 只有 exact fail-closed 负向证据，尚无正向 qualification。
+- 目标 VEPFS 两节点 fault canary、canonical evidence pack、真实 ≥200 轮与最终唯一一次全量仍未完成。
 
 ## 下一步动作
 
-1. 下一检查点只做 CP11.4c.3c.1 的 sealed-holdout/one-shot/non-feedback 机械输入防火墙；先读 reference §7.4，
-   优先复用现有 artifact capability、sandbox 与 evaluation gate，不加第二套实验调度器。
-2. 中间只跑 firewall/qualification 相关验证；全量仍只在最终检查点执行。
-3. c.2 两节点 canary/soak runner、c.3 evidence packer 后再进入目标 ≥200 轮运行。
+1. 只做 CP11.4c.3c.2：在现有 lease/guardian/storage_ops 上加薄的两节点 canary 与预声明 fault schedule；
+   不加常驻服务、第二 DB、通用 workflow engine 或新状态机。
+2. 优先验证 lease takeover、fd identity、SQLite WAL/restore continuation 与已有 failure receipts；中间只跑
+   canary/storage/lease 相关测试，全量继续留到最终检查点。
+3. 若当前环境拿不到第二节点，先把可执行 runner/receipt 做到 fail-closed，并如实保留外部环境阻塞，
+   不把单节点模拟写成两节点通过。
