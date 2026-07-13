@@ -8,8 +8,9 @@ receipt 证明本机子树与 daemon container 均排空（适用条件与残余
 
 > 设计真相唯一在 `../reference/第一部分-系统架构设计.md`；本 README 是**操作面**（怎么跑、怎么配、怎么
 > 观测/干预、边界在哪）。构建历史见仓库根 `ROADMAP.md` / `build_log/`。
-> T1/T2 sealed-holdout/one-shot 使用独立的 [qualification runbook](QUALIFICATION.md)；其中明确列出当前
-> 已机械闭合的 final 边界与尚缺的 T1 confirmatory LODO，不把部分结果冒充完整 §7.4 验收。
+> T1/T2 sealed-holdout/one-shot 使用独立的 [qualification runbook](QUALIFICATION.md)；T1 已机械闭合
+> A→B→一次性 C（exact sandbox promotion）→root audit/immutable verdict ledger→D 准入链，但科学审核与
+> 真实生产环境的人类终验仍须独立完成，不能由机器回执代签。
 
 ## 0. 一分钟跑起来
 

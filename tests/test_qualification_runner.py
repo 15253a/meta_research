@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from orchestrator import qualification_runner as QR
+from orchestrator.process_supervisor import atomic_write_receipt
 from orchestrator.qualification_firewall import (
     CLAIM_BOUNDARY_PROTOCOL,
     CLAIM_PROTOCOL,
@@ -70,15 +71,181 @@ def _publish_fixture_claim(work: Path, claim, source: Path):
             "cycle_id": "c1",
             "storage_manifest_sha256": "sha256:" + "b" * 64,
         },
-        "explore_views": [
-            {"dataset": mount.dataset,
-             "tree_sha256": _sha(mount.dataset.encode("utf-8"))}
-            for mount in explores
-        ],
+        "explore_views": QR._explore_view_identities(firewall),
         "confirmatory_command": command,
     }
     _publish_once(firewall.claim_boundary_path, _canonical(boundary))
     publish_claim_lock(work, claim)
+
+
+def _confirmatory_output(claim):
+    datasets = sorted(
+        claim["datasets"]["confirmatory_lodo"],
+        key=lambda item: (item.casefold(), item))
+    return {
+        "version": 1, "protocol": QR.CONFIRMATORY_OUTPUT_PROTOCOL,
+        "folds": [
+            {
+                "held_out_dataset": dataset, "status": "success",
+                "metrics": {"effect": 0.1, "ci95": [0.01, 0.2]},
+                "failure": None,
+            }
+            for dataset in datasets
+        ],
+        "aggregate": {"direction_consistent": True, "meta_effect": 0.1},
+        "audit_material": {
+            "controls": "frozen-control-ledger",
+            "novelty": "post-lock-query-ledger",
+        },
+    }
+
+
+def _write_confirmatory_promotion(
+        firewall, output_raw: bytes) -> dict[str, str]:
+    path = QR._confirmatory_promotion_path(firewall)
+    files = [{
+        "path": "confirmatory.json", "sha256": _sha(output_raw),
+        "bytes": len(output_raw),
+    }]
+    context = {**QR._confirmatory_context(), "log_name": "confirmatory.log"}
+    receipt = {
+        "version": 1,
+        "session_id": QR.sandbox_session_id("confirmatory.log", context),
+        "exit_code": 0,
+        "promoted": True,
+        "container_drained": True,
+        "output_manifest_hash": _sha(_canonical({"files": files})),
+        "files": files,
+    }
+    atomic_write_receipt(path, receipt)
+    raw = path.read_bytes()
+    return {"path": str(path), "sha256": _sha(raw)}
+
+
+def _seed_confirmatory_admission(work: Path):
+    """Seed a root-authorized C receipt for tests whose subject is stage D."""
+    firewall = load_qualification_firewall(work)
+    claim, claim_raw = firewall.read_claim_lock()
+    _boundary, boundary_raw = firewall.read_claim_boundary()
+    claim_hash = _sha(claim_raw)
+    boundary_hash = _sha(boundary_raw)
+    spent_path, result_path, run_root, _audit_ref_path, _audit_input_path = (
+        QR._confirmatory_paths(firewall))
+    run_root.mkdir(parents=True)
+    output_raw = _canonical(_confirmatory_output(claim))
+    output_path = run_root / "confirmatory.json"
+    output_path.write_bytes(output_raw)
+    output_path.chmod(0o400)
+    promotion = _write_confirmatory_promotion(firewall, output_raw)
+    receipt_dir = work / "state" / "executions"
+    receipt_dir.mkdir(parents=True, mode=0o700)
+    receipt_dir.chmod(0o700)
+    receipt_info = receipt_dir.stat()
+    operation_id = "exec-" + "8" * 32
+    receipt_path = receipt_dir / f"execution-{operation_id}.json"
+    receipt = {
+        "version": 1,
+        "operation_id": operation_id,
+        "owner_id": "fixture-confirmatory-owner",
+        "kind": "qualification-confirmatory",
+        "backend": "linux-subreaper-session-v1",
+        "containment": "docker-container-v1",
+        "spec_sha256": "sha256:" + "8" * 64,
+        "timeout_s": 10.0,
+        "term_grace_s": 1.0,
+        "prepared_at_unix": 0.25,
+        "receipt_dir_dev": receipt_info.st_dev,
+        "receipt_dir_ino": receipt_info.st_ino,
+        "fenced_by_instance_lease": True,
+        "context": {
+            **QR._confirmatory_context(), "log_name": "confirmatory.log",
+        },
+        "state": "terminal",
+        "outcome": "exit",
+        "returncode": 0,
+        "group_drained": True,
+        "term_sent": False,
+        "kill_sent": False,
+        "finished_at_unix": 0.75,
+        "sandbox": {
+            "backend": "docker-container-v1",
+            "engine_path": "/usr/bin/docker",
+            "engine_host": "unix:///var/run/docker.sock",
+            "engine_sha256": "sha256:" + "7" * 64,
+            "container_name": "mr-confirmatory-fixture",
+            "token": "7" * 32,
+            "spec_sha256": "sha256:" + "8" * 64,
+            "network_mode": "none",
+            "rootfs_readonly": True,
+            "no_new_privileges": True,
+            "cap_drop_all": True,
+            "pid_namespace": True,
+            "resource_mode": "rlimit-fallback",
+            "container_drained": True,
+        },
+    }
+    atomic_write_receipt(receipt_path, receipt)
+    receipt_raw = receipt_path.read_bytes()
+    QR.validate_execution_receipt(receipt, receipt_path)
+    result = {
+        "version": 1, "protocol": QR.CONFIRMATORY_RESULT_PROTOCOL,
+        "task": "T1", "status": "success",
+        "contract_sha256": firewall.contract_sha256,
+        "claim_sha256": claim_hash,
+        "claim_boundary_sha256": boundary_hash,
+        "source_tree_sha256": _boundary["source_tree_sha256"],
+        "runtime_identity_sha256": _FakeSandbox.runtime_identity_hash,
+        "gpu_canary_sha256": (
+            "sha256:" + "9" * 64 if firewall.final["gpu_required"] else None),
+        "mechanical_scope": dict(QR._CONFIRMATORY_MECHANICAL_SCOPE),
+        "output": {
+            "path": str(output_path), "sha256": _sha(output_raw),
+            "bytes": len(output_raw),
+        },
+        "execution": {
+            "path": str(receipt_path), "sha256": _sha(receipt_raw),
+        },
+        "promotion": promotion,
+        "failure": None, "finished_at_unix": 1.0,
+    }
+    result_raw = _canonical(result)
+    _publish_once(spent_path, _canonical({
+        "version": 1, "protocol": QR.CONFIRMATORY_SPENT_PROTOCOL,
+        "task": "T1", "contract_sha256": firewall.contract_sha256,
+        "claim_sha256": claim_hash,
+        "claim_boundary_sha256": boundary_hash,
+        "source_tree_sha256": result["source_tree_sha256"],
+        "runtime_identity_sha256": result["runtime_identity_sha256"],
+        "gpu_canary_sha256": result["gpu_canary_sha256"],
+        "execution_context": QR._confirmatory_context(),
+        "spent_at_unix": 0.5,
+    }))
+    _publish_once(result_path, result_raw)
+    checks = {name: True for name in QR._CONFIRMATORY_AUDIT_CHECKS}
+    audit_input = {
+        "version": 1, "protocol": QR.CONFIRMATORY_AUDIT_INPUT_PROTOCOL,
+        "task": "T1", "claim_boundary_sha256": boundary_hash,
+        "confirmatory_result_sha256": _sha(result_raw),
+        "auditor": "fixture root evaluator", "checks": checks,
+        "evidence": [
+            {"check": name, "ref": f"fixture://{name}",
+             "sha256": "sha256:" + hashlib.sha256(name.encode()).hexdigest()}
+            for name in sorted(checks)
+        ],
+        "notes": "fixture admission for final-boundary tests",
+        "reviewed_at_unix": 1.0,
+    }
+    audit_input_raw = _canonical(audit_input)
+    operator_input = work.parent / "fixture-confirmatory-audit-input.json"
+    operator_input.write_bytes(audit_input_raw)
+    operator_input.chmod(0o400)
+    authority = work.parent / "confirmatory-audit-authority.json"
+    lease = QR.InstanceLease.acquire(work)
+    assert lease.close() is None
+    checked = QR.audit_confirmatory(
+        work_root=work, audit_input_path=operator_input,
+        authority_path=authority)
+    assert checked["status"] == "passed"
 
 
 def _view(path):
@@ -114,7 +281,9 @@ def _view(path):
     return _sha(raw)
 
 
-def _setup(tmp_path, *, truth_threshold=3.0, gpu_required=False):
+def _setup(
+        tmp_path, *, truth_threshold=3.0, gpu_required=False,
+        confirmatory_admitted=True):
     mounts = []
     for dataset in ("SEED", "SEED-IV", "FACED"):
         path = tmp_path / dataset
@@ -164,6 +333,8 @@ def _setup(tmp_path, *, truth_threshold=3.0, gpu_required=False):
     source.mkdir(mode=0o755)
     (source / "predict.py").write_text("# frozen predictor\n", encoding="utf-8")
     (source / "predict.py").chmod(0o444)
+    (source / "confirm.py").write_text("# frozen confirmatory batch\n", encoding="utf-8")
+    (source / "confirm.py").chmod(0o444)
     claim = {
         "version": 1, "protocol": CLAIM_PROTOCOL, "task": "T1",
         "claims": [{"id": "c1"}], "feature_operator": {"name": "f"},
@@ -193,6 +364,8 @@ def _setup(tmp_path, *, truth_threshold=3.0, gpu_required=False):
         },
     }
     _publish_fixture_claim(work, claim, source)
+    if confirmatory_admitted:
+        _seed_confirmatory_admission(work)
     policy = json.loads(json.dumps(BASE_POLICY))
     paths = [item["path"] for item in mounts]
     policy["execution"]["path_allowlist"] = paths
@@ -399,6 +572,630 @@ def _fake_successful_predictor(_argv, *, staging_dir, **_kwargs):
     }
 
 
+class _ConfirmatoryFakeSandbox(_FakeSandbox):
+    def prepare(self, command, **kwargs):
+        context = kwargs["execution_context"]
+        if context["phase"] == "qualification-confirmatory":
+            assert context == {
+                **QR._confirmatory_context(), "log_name": "confirmatory.log",
+            }
+            assert kwargs["gpu_required"] is False
+            assert command.count("--data") == 3
+            assert not any("dreamer-x" in token.casefold() for token in command)
+            return _FakeInvocation()
+        return super().prepare(command, **kwargs)
+
+
+def _stub_confirmatory_execution_receipt(monkeypatch, work: Path):
+    reference = {
+        "path": str(
+            work / "state" / "executions" / "execution-confirmatory.json"),
+        "sha256": "sha256:" + "7" * 64,
+    }
+    monkeypatch.setattr(
+        QR, "_confirmatory_execution_reference",
+        lambda *_args, **_kwargs: dict(reference))
+    monkeypatch.setattr(
+        QR, "_read_confirmatory_execution_receipt",
+        lambda *_args, **_kwargs: {
+            "kind": "qualification-confirmatory", "state": "terminal",
+            "outcome": "exit", "returncode": 0,
+        })
+
+
+def _stage_run(claim, calls, *, confirmatory_output=None):
+    output = (
+        _confirmatory_output(claim)
+        if confirmatory_output is None else confirmatory_output)
+
+    def fake_run(argv, *, staging_dir, **kwargs):
+        phase = kwargs["execution_context"]["phase"]
+        calls.append(phase)
+        if phase == "qualification-confirmatory":
+            root = Path(staging_dir)
+            root.mkdir(parents=True, exist_ok=True)
+            output_raw = _canonical(output)
+            (root / "confirmatory.json").write_bytes(output_raw)
+            firewall = load_qualification_firewall(root.parents[3])
+            _write_confirmatory_promotion(firewall, output_raw)
+            (root / "confirmatory.log").write_text(
+                "confirmatory batch complete\n", encoding="utf-8")
+            return {
+                "exit_code": 0,
+                "log_path": str(root / "confirmatory.log"),
+                "log_sha256": "0" * 64,
+                "process_receipt_path": "fixture-receipt.json",
+            }
+        return _fake_successful_predictor(
+            argv, staging_dir=staging_dir, **kwargs)
+
+    return fake_run
+
+
+def _write_audit_review(
+        tmp_path: Path, work: Path, *, passed: bool = True,
+        suffix: str = "review"):
+    firewall = load_qualification_firewall(work)
+    _boundary, boundary_raw = firewall.read_claim_boundary()
+    _spent, result_path, _run, _ref, _copy = QR._confirmatory_paths(firewall)
+    result_raw = result_path.read_bytes()
+    result = json.loads(result_raw)
+    checks = {name: True for name in QR._CONFIRMATORY_AUDIT_CHECKS}
+    if not passed:
+        checks["heldout_label_isolation_verified"] = False
+    review = {
+        "version": 1, "protocol": QR.CONFIRMATORY_AUDIT_INPUT_PROTOCOL,
+        "task": "T1", "claim_boundary_sha256": _sha(boundary_raw),
+        "confirmatory_result_sha256": _sha(result_raw),
+        "auditor": "root scientific evaluator", "checks": checks,
+        "evidence": [
+            {
+                "check": name, "ref": f"evidence://{suffix}/{name}",
+                "sha256": "sha256:" + hashlib.sha256(
+                    f"{suffix}:{name}".encode()).hexdigest(),
+            }
+            for name in sorted(checks)
+        ],
+        "notes": "pre-D scientific audit fixture",
+        "reviewed_at_unix": float(result["finished_at_unix"]) + 0.001,
+    }
+    input_path = tmp_path / f"audit-input-{suffix}.json"
+    input_path.write_bytes(_canonical(review))
+    input_path.chmod(0o400)
+    return input_path, tmp_path / f"audit-authority-{suffix}.json"
+
+
+def test_t1_confirmatory_runs_once_audits_then_admits_sealed_final(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    calls = []
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", _stage_run(claim, calls))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+
+    first = QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+    replayed = QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+    assert first["status"] == "success"
+    assert replayed == first
+    assert calls == ["qualification-confirmatory"]
+
+    audit_input, authority = _write_audit_review(tmp_path, work)
+    audit = QR.audit_confirmatory(
+        work_root=work, audit_input_path=audit_input,
+        authority_path=authority)
+    assert audit["status"] == "passed"
+
+    final = QR.run_final(
+        system_root=system, work_root=work, source_root=source)
+    assert final["success_count"] == 1
+    assert calls == ["qualification-confirmatory", "qualification-final"]
+    marker = firewall.read_final_marker()
+    assert marker["confirmatory_audit_sha256"] == _sha(authority.read_bytes())
+
+
+def test_t1_successful_confirmatory_without_audit_rejects_final_before_sandbox(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    calls = []
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", _stage_run(claim, calls))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+    assert QR.run_confirmatory(
+        system_root=system, work_root=work,
+        source_root=source)["status"] == "success"
+
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("stage D sandbox constructed before audit"))
+    with pytest.raises(QR.QualificationRunnerError, match="audit"):
+        QR.run_final(system_root=system, work_root=work, source_root=source)
+    assert calls == ["qualification-confirmatory"]
+
+
+def test_confirmatory_rejects_explore_view_drift_before_sandbox(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    payload = tmp_path / "SEED" / "data.bin"
+    payload.chmod(0o600)
+    payload.write_bytes(b"drifted after B\n")
+    payload.chmod(0o400)
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("sandbox constructed after explore drift"))
+
+    with pytest.raises(QR.QualificationRunnerError, match="explore views.*漂移"):
+        QR.run_confirmatory(
+            system_root=system, work_root=work, source_root=source)
+
+
+def test_confirmatory_rejects_preseeded_candidate_output_before_spend(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    spent_path, _result, run_root, _ref, _copy = (
+        QR._confirmatory_paths(firewall))
+    run_root.mkdir(parents=True)
+    (run_root / "confirmatory.json").write_bytes(
+        _canonical(_confirmatory_output(claim)))
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(
+        QR.H, "run_staged",
+        lambda *_args, **_kwargs: pytest.fail("preseeded C reached spawn"))
+
+    with pytest.raises(QR.QualificationRunnerError, match="预置 candidate-output"):
+        QR.run_confirmatory(
+            system_root=system, work_root=work, source_root=source)
+    assert not spent_path.exists()
+
+
+def test_confirmatory_requires_exact_sandbox_promotion_ledger(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    calls = []
+
+    def fake_run(_argv, *, staging_dir, **kwargs):
+        calls.append(kwargs["execution_context"]["phase"])
+        root = Path(staging_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "confirmatory.json").write_bytes(
+            _canonical(_confirmatory_output(claim)))
+        (root / "confirmatory.log").write_text("no promotion receipt\n")
+        return {
+            "exit_code": 0, "log_path": str(root / "confirmatory.log"),
+            "log_sha256": "0" * 64,
+            "process_receipt_path": "fixture-receipt.json",
+        }
+
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", fake_run)
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+    result = QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+    assert result["status"] == "failed"
+    assert "promoted receipt" in result["failure"]
+    assert QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source) == result
+    assert calls == ["qualification-confirmatory"]
+
+
+def test_failed_confirmatory_audit_is_immutable_and_rejects_final(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    calls = []
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", _stage_run(claim, calls))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+    QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+    audit_input, authority = _write_audit_review(
+        tmp_path, work, passed=False, suffix="failed")
+    audit = QR.audit_confirmatory(
+        work_root=work, audit_input_path=audit_input,
+        authority_path=authority)
+    assert audit["status"] == "failed"
+
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("failed audit reached stage D sandbox"))
+    with pytest.raises(QR.QualificationRunnerError, match="永久拒绝"):
+        QR.run_final(system_root=system, work_root=work, source_root=source)
+
+    passed_input, replacement_authority = _write_audit_review(
+        tmp_path, work, passed=True, suffix="replacement")
+    _spent, _result, _run, audit_ref_path, audit_copy_path = (
+        QR._confirmatory_paths(firewall))
+    audit_ref_path.unlink()
+    audit_copy_path.unlink()
+    decision_path = QR._confirmatory_decision_path(
+        firewall, create_directory=False)
+    assert json.loads(decision_path.read_text(encoding="utf-8"))["status"] == "failed"
+
+    with pytest.raises(
+            QR.QualificationRunnerError,
+            match="root decision ledger 已存在且内容冲突"):
+        QR.audit_confirmatory(
+            work_root=work, audit_input_path=passed_input,
+            authority_path=replacement_authority)
+    assert not replacement_authority.exists()
+    assert not audit_ref_path.exists()
+    assert not audit_copy_path.exists()
+    assert json.loads(decision_path.read_text(encoding="utf-8"))["status"] == "failed"
+
+
+def test_confirmatory_audit_rejects_pre_result_time_and_relative_authority(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    calls = []
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", _stage_run(claim, calls))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+    QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+
+    early_input, _authority = _write_audit_review(
+        tmp_path, work, suffix="early")
+    early = json.loads(early_input.read_text(encoding="utf-8"))
+    early["reviewed_at_unix"] = 1.0
+    early_input.chmod(0o600)
+    early_input.write_bytes(_canonical(early))
+    early_input.chmod(0o400)
+    with pytest.raises(QR.QualificationRunnerError, match="早于 terminal result"):
+        QR.audit_confirmatory(
+            work_root=work, audit_input_path=early_input,
+            authority_path=tmp_path / "unused-authority.json")
+
+    valid_input, _authority = _write_audit_review(
+        tmp_path, work, suffix="relative")
+    with pytest.raises(QR.QualificationRunnerError, match="canonical absolute"):
+        QR.audit_confirmatory(
+            work_root=work, audit_input_path=valid_input,
+            authority_path=Path("relative-audit-authority.json"))
+    _spent, _result, _run, audit_ref_path, audit_copy_path = (
+        QR._confirmatory_paths(firewall))
+    assert not audit_ref_path.exists()
+    assert not audit_copy_path.exists()
+    decision_directory = QR._confirmatory_decision_directory(
+        firewall, create=False)
+    assert not decision_directory.exists()
+
+
+def test_confirmatory_audit_conflicting_authority_leaves_no_local_chain(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", _stage_run(claim, []))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+    QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+
+    audit_input, authority = _write_audit_review(
+        tmp_path, work, suffix="authority-conflict")
+    authority.write_bytes(_canonical({"unrelated": "root authority"}))
+    authority.chmod(0o444)
+    with pytest.raises(QR.QualificationRunnerError, match="内容冲突"):
+        QR.audit_confirmatory(
+            work_root=work, audit_input_path=audit_input,
+            authority_path=authority)
+
+    _spent, _result, _run, audit_ref_path, audit_copy_path = (
+        QR._confirmatory_paths(firewall))
+    assert not audit_ref_path.exists()
+    assert not audit_copy_path.exists()
+    assert not QR._confirmatory_decision_directory(
+        firewall, create=False).exists()
+
+
+def test_failed_audit_decision_precedes_authority_and_survives_crash(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", _stage_run(claim, []))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+    QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+
+    failed_input, failed_authority = _write_audit_review(
+        tmp_path, work, passed=False, suffix="failed-before-crash")
+    original_publish = QR._publish_root_authority
+
+    def crash_before_external(path, payload, *, firewall, label=(
+            "confirmatory audit authority")):
+        if label == "confirmatory audit authority":
+            raise RuntimeError("fixture crash before external authority")
+        return original_publish(
+            path, payload, firewall=firewall, label=label)
+
+    monkeypatch.setattr(QR, "_publish_root_authority", crash_before_external)
+    with pytest.raises(RuntimeError, match="fixture crash"):
+        QR.audit_confirmatory(
+            work_root=work, audit_input_path=failed_input,
+            authority_path=failed_authority)
+
+    decision_path = QR._confirmatory_decision_path(
+        firewall, create_directory=False)
+    assert json.loads(decision_path.read_text(encoding="utf-8"))["status"] == "failed"
+    assert not failed_authority.exists()
+    _spent, _result, _run, audit_ref_path, audit_copy_path = (
+        QR._confirmatory_paths(firewall))
+    assert not audit_ref_path.exists()
+    assert not audit_copy_path.exists()
+
+    monkeypatch.setattr(QR, "_publish_root_authority", original_publish)
+    passed_input, replacement_authority = _write_audit_review(
+        tmp_path, work, passed=True, suffix="passed-after-crash")
+    with pytest.raises(
+            QR.QualificationRunnerError,
+            match="root decision ledger 已存在且内容冲突"):
+        QR.audit_confirmatory(
+            work_root=work, audit_input_path=passed_input,
+            authority_path=replacement_authority)
+    assert not replacement_authority.exists()
+
+    repaired = QR.audit_confirmatory(
+        work_root=work, audit_input_path=failed_input,
+        authority_path=failed_authority)
+    assert repaired["status"] == "failed"
+    assert failed_authority.exists()
+    assert audit_ref_path.exists()
+    assert audit_copy_path.exists()
+
+
+def test_confirmatory_audit_rejects_oversized_derived_authority_before_publish(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, claim_raw = firewall.read_claim_lock()
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", _stage_run(claim, []))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+    result = QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+
+    audit_input, authority = _write_audit_review(
+        tmp_path, work, suffix="near-limit")
+    review = json.loads(audit_input.read_text(encoding="utf-8"))
+    checks = sorted(review["checks"])
+
+    def evidence(index, length):
+        prefix = f"evidence://near-limit/{index:03d}/"
+        assert len(prefix) <= length <= QR._MAX_AUDIT_TEXT_BYTES
+        ref = prefix + "x" * (length - len(prefix))
+        return {
+            "check": checks[index % len(checks)], "ref": ref,
+            "sha256": _sha(ref.encode("utf-8")),
+        }
+
+    fixed = [evidence(index, 15_800) for index in range(15)]
+    review["notes"] = "n" * QR._MAX_AUDIT_TEXT_BYTES
+    limit = QR._MAX_EVALUATOR_ARTIFACT_BYTES
+    low, high = len("evidence://near-limit/015/"), QR._MAX_AUDIT_TEXT_BYTES
+    input_raw = None
+    while low <= high:
+        middle = (low + high) // 2
+        review["evidence"] = fixed + [evidence(15, middle)]
+        candidate = _canonical(review)
+        if len(candidate) <= limit:
+            input_raw = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    assert input_raw is not None and limit - 64 <= len(input_raw) <= limit
+    review = json.loads(input_raw)
+
+    _boundary, boundary_raw = firewall.read_claim_boundary()
+    _spent, result_path, _run, audit_ref_path, audit_copy_path = (
+        QR._confirmatory_paths(firewall))
+    result_raw = result_path.read_bytes()
+    expected_authority = {
+        "version": 1, "protocol": QR.CONFIRMATORY_AUDIT_PROTOCOL,
+        "task": "T1", "status": "passed",
+        "contract_sha256": firewall.contract_sha256,
+        "claim_sha256": _sha(claim_raw),
+        "claim_boundary_sha256": _sha(boundary_raw),
+        "confirmatory_result_sha256": _sha(result_raw),
+        "confirmatory_output_sha256": result["output"]["sha256"],
+        "audit_input_sha256": _sha(input_raw),
+        "auditor": review["auditor"], "checks": review["checks"],
+        "evidence": review["evidence"], "notes": review["notes"],
+        "reviewed_at_unix": review["reviewed_at_unix"],
+    }
+    assert len(_canonical(expected_authority)) > limit
+    audit_input.chmod(0o600)
+    audit_input.write_bytes(input_raw)
+    audit_input.chmod(0o400)
+
+    with pytest.raises(QR.QualificationRunnerError, match="派生 authority 大小"):
+        QR.audit_confirmatory(
+            work_root=work, audit_input_path=audit_input,
+            authority_path=authority)
+    assert not authority.exists()
+    assert not audit_ref_path.exists()
+    assert not audit_copy_path.exists()
+
+
+def test_confirmatory_spent_before_spawn_is_failed_and_never_reexecuted(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    calls = []
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+
+    def interrupted(*_args, **_kwargs):
+        calls.append("spawn")
+        raise QR.ExecutionSupervisorError("fixture interruption")
+
+    monkeypatch.setattr(QR.H, "run_staged", interrupted)
+    with pytest.raises(QR.ExecutionSupervisorError, match="fixture interruption"):
+        QR.run_confirmatory(
+            system_root=system, work_root=work, source_root=source)
+    firewall = load_qualification_firewall(work)
+    spent_path, result_path, _run, _ref, _copy = QR._confirmatory_paths(firewall)
+    assert spent_path.exists() and not result_path.exists()
+
+    monkeypatch.setattr(
+        QR.H, "recover_staged_result", lambda **_kwargs: None)
+    result = QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+    assert result["status"] == "failed"
+    assert "spent before" in result["failure"]
+    assert calls == ["spawn"]
+
+
+def test_confirmatory_malformed_fold_coverage_is_terminal_failure(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    malformed = _confirmatory_output(claim)
+    malformed["folds"] = malformed["folds"][:-1]
+    calls = []
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(
+        QR.H, "run_staged",
+        _stage_run(claim, calls, confirmatory_output=malformed))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+
+    result = QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+    assert result["status"] == "failed"
+    assert "fold" in result["failure"]
+    assert QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source) == result
+    assert calls == ["qualification-confirmatory"]
+
+
+def test_confirmatory_reported_fold_failure_is_terminal(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(
+        tmp_path, confirmatory_admitted=False)
+    firewall = load_qualification_firewall(work)
+    claim, _claim_raw = firewall.read_claim_lock()
+    output = _confirmatory_output(claim)
+    output["folds"][0].update({
+        "status": "failed", "metrics": None, "failure": "fold failed",
+    })
+    calls = []
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _ConfirmatoryFakeSandbox)
+    monkeypatch.setattr(
+        QR.H, "run_staged",
+        _stage_run(claim, calls, confirmatory_output=output))
+    _stub_confirmatory_execution_receipt(monkeypatch, work)
+
+    result = QR.run_confirmatory(
+        system_root=system, work_root=work, source_root=source)
+    assert result["status"] == "failed"
+    assert "reported failure" in result["failure"]
+    assert calls == ["qualification-confirmatory"]
+
+
+def test_tampered_external_confirmatory_audit_rejects_final_before_sandbox(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(tmp_path)
+    firewall = load_qualification_firewall(work)
+    _spent, _result, _run, audit_ref_path, _copy = (
+        QR._confirmatory_paths(firewall))
+    ref = json.loads(audit_ref_path.read_text(encoding="utf-8"))
+    authority = Path(ref["path"])
+    audit = json.loads(authority.read_text(encoding="utf-8"))
+    audit["notes"] = "tampered"
+    authority.chmod(0o600)
+    authority.write_bytes(_canonical(audit))
+    authority.chmod(0o444)
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("tampered audit reached sandbox"))
+
+    with pytest.raises(QR.QualificationRunnerError, match="hash 漂移"):
+        QR.run_final(system_root=system, work_root=work, source_root=source)
+
+
+def test_t1_d_revalidates_guardian_receipt_after_root_audit(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(tmp_path)
+    firewall = load_qualification_firewall(work)
+    _spent, result_path, _run, _ref, _copy = QR._confirmatory_paths(firewall)
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    Path(result["execution"]["path"]).unlink()
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("missing C receipt reached D sandbox"))
+
+    with pytest.raises(QR.QualificationFirewallError, match="guardian receipt"):
+        QR.run_final(system_root=system, work_root=work, source_root=source)
+    assert not os.path.lexists(firewall.final_path)
+
+
+def test_t1_d_revalidates_sandbox_promotion_after_root_audit(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(tmp_path)
+    firewall = load_qualification_firewall(work)
+    QR._confirmatory_promotion_path(firewall).unlink()
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("missing C promotion reached D sandbox"))
+
+    with pytest.raises(QR.QualificationFirewallError, match="promoted receipt"):
+        QR.run_final(system_root=system, work_root=work, source_root=source)
+    assert not os.path.lexists(firewall.final_path)
+
+
+def test_t1_d_requires_immutable_root_decision_ledger(tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(tmp_path)
+    firewall = load_qualification_firewall(work)
+    QR._confirmatory_decision_path(
+        firewall, create_directory=False).unlink()
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("missing root decision reached D sandbox"))
+
+    with pytest.raises(QR.QualificationFirewallError, match="root decision ledger"):
+        QR.run_final(system_root=system, work_root=work, source_root=source)
+    assert not os.path.lexists(firewall.final_path)
+
+
+def test_t2_rejects_confirmatory_run_and_audit_before_execution(
+        tmp_path, monkeypatch):
+    system, work, source, _folds, _sample_ids = _setup_t2(tmp_path)
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("T2 constructed confirmatory sandbox"))
+    with pytest.raises(QR.QualificationRunnerError, match="T2 不存在"):
+        QR.run_confirmatory(
+            system_root=system, work_root=work, source_root=source)
+    with pytest.raises(QR.QualificationRunnerError, match="T2 不存在"):
+        QR.audit_confirmatory(
+            work_root=work, audit_input_path=tmp_path / "unused.json",
+            authority_path=tmp_path / "unused-authority.json")
+
+
 def test_gpu_final_uses_full_authority_validator_and_owner_bound_candidate(
         tmp_path, monkeypatch):
     system, work, source, _holdout = _setup(tmp_path, gpu_required=True)
@@ -449,8 +1246,9 @@ def test_gpu_final_uses_full_authority_validator_and_owner_bound_candidate(
     firewall = load_qualification_firewall(work)
     marker = firewall.read_final_marker()
     _boundary, boundary_raw = firewall.read_claim_boundary()
-    assert marker["version"] == 2
+    assert marker["version"] == 3
     assert marker["claim_boundary_sha256"] == _sha(boundary_raw)
+    assert marker["confirmatory_audit_sha256"].startswith("sha256:")
     assert marker["gpu_canary_sha256"] is not None
     evidence = validations[0][0]
     assert evidence["candidate_hash"] == QR._gpu_canary_candidate_hash(
@@ -459,6 +1257,13 @@ def test_gpu_final_uses_full_authority_validator_and_owner_bound_candidate(
         runtime_identity_sha256=marker["runtime_identity_sha256"],
         gpu_contract_sha256=_sha(_canonical(gpu_contract)),
         owner_id=candidate_owners[evidence["candidate_hash"]])
+
+    canary_path = work / "state" / "qualification" / "final" / "gpu-canary.json"
+    canary_path.unlink()
+    with pytest.raises(QR.QualificationRunnerError, match="缺原始 canary"):
+        QR.run_final(
+            system_root=system, work_root=work, source_root=source,
+            gpu_contract_path=gpu_path)
 
 
 def test_gpu_final_rejects_preseed_without_frozen_owner_binding(tmp_path, monkeypatch):
@@ -587,10 +1392,15 @@ def test_spent_before_spawn_is_counted_failed_and_never_reexecuted(tmp_path, mon
     system, work, source, _holdout = _setup(tmp_path)
     firewall = load_qualification_firewall(work)
     _ledger, source_hash = QR.freeze_source_tree(source)
+    _claim, claim_raw = firewall.read_claim_lock()
+    _boundary, boundary_raw = firewall.read_claim_boundary()
+    admission_hash = QR._require_confirmatory_admission(
+        firewall=firewall, claim_sha256=_sha(claim_raw),
+        boundary_sha256=_sha(boundary_raw))
     marker = consume_final(
         work, source_tree_sha256=source_hash,
-        runtime_identity_sha256=_FakeSandbox.runtime_identity_hash, now=1.0)
-    _claim, claim_raw = firewall.read_claim_lock()
+        runtime_identity_sha256=_FakeSandbox.runtime_identity_hash,
+        confirmatory_audit_sha256=admission_hash, now=1.0)
     unit = final_units(firewall)[0]
     spent_path, _result_path, _run_root = QR._unit_paths(firewall, unit["unit_id"])
     _publish_once(spent_path, firewall_canonical({
@@ -754,6 +1564,10 @@ def test_t2_final_runs_exactly_45_single_fold_units_and_does_not_retry_failure(
 @pytest.mark.parametrize(
     ("command", "result", "expected"),
     [
+        ("run-confirmatory", {"status": "success"}, 0),
+        ("run-confirmatory", {"status": "failed"}, 3),
+        ("audit-confirmatory", {"status": "passed"}, 0),
+        ("audit-confirmatory", {"status": "failed"}, 3),
         ("run-final", {"failure_count": 0}, 0),
         ("run-final", {"failure_count": 1}, 3),
         ("score-final", {"status": "success"}, 0),
@@ -762,7 +1576,21 @@ def test_t2_final_runs_exactly_45_single_fold_units_and_does_not_retry_failure(
 )
 def test_cli_exit_code_reflects_scientific_outcome(
         tmp_path, monkeypatch, capsys, command, result, expected):
-    if command == "run-final":
+    if command == "run-confirmatory":
+        monkeypatch.setattr(QR, "run_confirmatory", lambda **_kwargs: result)
+        argv = [
+            "--work-root", str(tmp_path / "work"), "run-confirmatory",
+            "--system-root", str(tmp_path / "system"),
+            "--source-root", str(tmp_path / "source"),
+        ]
+    elif command == "audit-confirmatory":
+        monkeypatch.setattr(QR, "audit_confirmatory", lambda **_kwargs: result)
+        argv = [
+            "--work-root", str(tmp_path / "work"), "audit-confirmatory",
+            "--audit-input", str(tmp_path / "audit-input.json"),
+            "--authority-output", str(tmp_path / "audit-authority.json"),
+        ]
+    elif command == "run-final":
         monkeypatch.setattr(QR, "run_final", lambda **_kwargs: result)
         argv = [
             "--work-root", str(tmp_path / "work"), "run-final",
