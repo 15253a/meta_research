@@ -10,19 +10,25 @@ import pytest
 import yaml
 
 from orchestrator import run as run_module
+from orchestrator import database as database_module
 from orchestrator.execution_sandbox import DockerExecutionSandbox
+from orchestrator.instance_lease import InstanceBusyError, InstanceLease
 from orchestrator.qualification_firewall import (
+    CLAIM_BOUNDARY_PROTOCOL,
     CLAIM_PROTOCOL,
     CONTRACT_PROTOCOL,
     QualificationClaimLockedError,
     QualificationFinalizedError,
     QualificationFirewallError,
+    _publish_once,
     _read_regular,
     consume_final,
     install_contract,
     load_qualification_firewall,
+    publish_claim_boundary,
     publish_claim_lock,
 )
+from orchestrator.storage_governance import CycleSnapshotPublisher
 
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
@@ -196,6 +202,99 @@ def _claim(task: str):
     }
 
 
+def _terminal_snapshot(
+        work: Path, *, add_inflight: bool = False,
+        add_unsnapshotted_terminal: bool = False, drift_status: bool = False,
+        add_active_runner: bool = False):
+    writer = database_module.connect(work / "research.sqlite")
+    writer.execute(
+        "INSERT INTO goal(id,version,text,predicate_json) VALUES (1,1,'g','{}')")
+    writer.execute(
+        "INSERT INTO cycle(id,goal_id,goal_ver,status,policy_version,finished_at) "
+        "VALUES (1,1,1,'done','v0','2026-07-13T00:00:00Z')")
+    writer.commit()
+    publisher = CycleSnapshotPublisher(
+        db_path=work / "research.sqlite", work_root=work)
+    assert publisher.reconcile(startup=True) == ["c1"]
+    if add_inflight:
+        writer.execute(
+            "INSERT INTO cycle(id,goal_id,goal_ver,status,policy_version) "
+            "VALUES (2,1,1,'idea','v0')")
+        writer.commit()
+    if add_unsnapshotted_terminal:
+        writer.execute(
+            "INSERT INTO cycle(id,goal_id,goal_ver,status,policy_version,finished_at) "
+            "VALUES (2,1,1,'done','v0','2026-07-13T00:01:00Z')")
+        writer.commit()
+    if drift_status:
+        writer.execute("UPDATE cycle SET status='failed' WHERE id=1")
+        writer.commit()
+    if add_active_runner:
+        writer.execute(
+            "INSERT INTO runner_call(id,cycle_id,phase,purpose,status) "
+            "VALUES (1,1,'reasoning','qualification-test','running')")
+        writer.commit()
+    writer.close()
+
+
+def _boundary_inputs(tmp_path: Path, contract):
+    source = tmp_path / "frozen-source"
+    source.mkdir()
+    script = source / "confirm.py"
+    script.write_text("# frozen confirmatory batch\n", encoding="utf-8")
+    script.chmod(0o444)
+    command = {
+        "argv": [
+            "python", "{src}/confirm.py",
+            *[token for mount in contract["mounts"] if mount["role"] == "explore"
+              for token in ("--data", mount["path"])],
+        ],
+        "output": "confirmatory.json",
+        "gpu_required": False,
+    }
+    return source, command
+
+
+def _publish_fixture_boundary(work: Path, claim, *, source_hash=None):
+    firewall = load_qualification_firewall(work)
+    source_hash = source_hash or "sha256:" + "a" * 64
+    explores = sorted(
+        (mount for mount in firewall.mounts if mount.role == "explore"),
+        key=lambda mount: (mount.dataset.casefold(), mount.dataset),
+    )
+    command = None
+    if firewall.task == "T1":
+        command = {
+            "argv": [
+                "python", "{src}/confirm.py",
+                *[token for mount in explores
+                  for token in ("--data", str(mount.path))],
+            ],
+            "output": "confirmatory.json",
+            "gpu_required": firewall.final["gpu_required"],
+        }
+    boundary = {
+        "version": 1,
+        "protocol": CLAIM_BOUNDARY_PROTOCOL,
+        "task": firewall.task,
+        "contract_sha256": firewall.contract_sha256,
+        "claim_sha256": _sha(_canonical(claim)),
+        "source_tree_sha256": source_hash,
+        "a_high_water": {
+            "cycle_id": "c1",
+            "storage_manifest_sha256": "sha256:" + "b" * 64,
+        },
+        "explore_views": [
+            {"dataset": mount.dataset,
+             "tree_sha256": _sha(mount.dataset.encode("utf-8"))}
+            for mount in explores
+        ],
+        "confirmatory_command": command,
+    }
+    _publish_once(firewall.claim_boundary_path, _canonical(boundary))
+    return publish_claim_lock(work, claim)
+
+
 def test_t1_holdout_is_invisible_until_irreversible_final(tmp_path):
     work = tmp_path / "work"
     contract = _t1_contract(tmp_path)
@@ -209,9 +308,9 @@ def test_t1_holdout_is_invisible_until_irreversible_final(tmp_path):
         firewall.authorize_mounts([holdout], execution_context={"phase": "train"})
 
     claim = _claim("T1")
-    locked = publish_claim_lock(work, claim)
+    locked = _publish_fixture_boundary(work, claim)
     assert locked["claim_sha256"].startswith("sha256:")
-    with pytest.raises(QualificationClaimLockedError, match="claim 已锁定"):
+    with pytest.raises(QualificationClaimLockedError, match="claim boundary"):
         firewall.assert_research_open()
     marker = consume_final(
         work, source_tree_sha256="sha256:" + "a" * 64,
@@ -223,7 +322,7 @@ def test_t1_holdout_is_invisible_until_irreversible_final(tmp_path):
         firewall.assert_research_open()
     with pytest.raises(QualificationFinalizedError, match="只允许"):
         firewall.authorize_mounts([holdout], execution_context={"phase": "eval"})
-    with pytest.raises(QualificationFinalizedError, match="另一冻结输入"):
+    with pytest.raises(QualificationFirewallError, match="claim boundary"):
         consume_final(
             work, source_tree_sha256="sha256:" + "b" * 64,
             runtime_identity_sha256="sha256:" + "c" * 64, now=2.0)
@@ -237,7 +336,7 @@ def test_t2_only_one_fold_view_can_enter_any_candidate_container(tmp_path):
     folds = [item["path"] for item in contract["mounts"]]
     with pytest.raises(QualificationFirewallError, match="final folds"):
         firewall.authorize_mounts([folds[0]], execution_context={"phase": "train"})
-    publish_claim_lock(work, _claim("T2"))
+    _publish_fixture_boundary(work, _claim("T2"))
     consume_final(
         work, source_tree_sha256="sha256:" + "a" * 64,
         runtime_identity_sha256="sha256:" + "c" * 64, now=1.0)
@@ -264,6 +363,156 @@ def test_claim_lock_rejects_fourth_claim_missing_control_and_protocol_drift(tmp_
     claim["datasets"]["sealed_holdout"]["dataset"] = "DEAP"
     with pytest.raises(QualificationFirewallError, match="DREAMER"):
         publish_claim_lock(work, claim)
+
+
+def test_claim_boundary_binds_source_snapshot_views_and_is_replay_safe(tmp_path):
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    install_contract(work, contract)
+    _terminal_snapshot(work)
+    source, command = _boundary_inputs(tmp_path, contract)
+    claim = _claim("T1")
+    held = InstanceLease.acquire(work)
+    try:
+        with pytest.raises(InstanceBusyError):
+            publish_claim_boundary(
+                work, claim, source_root=source, confirmatory_command=command)
+    finally:
+        assert held.close() is None
+    first = publish_claim_boundary(
+        work, claim, source_root=source, confirmatory_command=command)
+    replayed = publish_claim_boundary(
+        work, claim, source_root=source, confirmatory_command=command)
+
+    assert replayed == first
+    assert first["a_high_water"]["cycle_id"] == "c1"
+    firewall = load_qualification_firewall(work)
+    boundary, raw = firewall.read_claim_boundary()
+    assert boundary["protocol"] == CLAIM_BOUNDARY_PROTOCOL
+    assert boundary["claim_sha256"] == first["claim_sha256"]
+    assert boundary["source_tree_sha256"] == first["source_tree_sha256"]
+    assert len(boundary["explore_views"]) == 3
+    assert len({item["tree_sha256"] for item in boundary["explore_views"]}) == 3
+    assert first["claim_boundary_sha256"] == _sha(raw)
+    with pytest.raises(QualificationClaimLockedError, match="boundary"):
+        firewall.assert_research_open()
+
+    source_file = source / "confirm.py"
+    source_file.chmod(0o644)
+    source_file.write_text("# drift\n", encoding="utf-8")
+    source_file.chmod(0o444)
+    with pytest.raises(QualificationFirewallError, match="冻结输入发生漂移"):
+        publish_claim_boundary(
+            work, claim, source_root=source, confirmatory_command=command)
+
+
+def test_claim_boundary_rejects_inflight_a_before_publication(tmp_path):
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    install_contract(work, contract)
+    _terminal_snapshot(work, add_inflight=True)
+    source, command = _boundary_inputs(tmp_path, contract)
+    with pytest.raises(QualificationFirewallError, match="在途 cycle"):
+        publish_claim_boundary(
+            work, _claim("T1"), source_root=source,
+            confirmatory_command=command)
+    firewall = load_qualification_firewall(work)
+    assert not os.path.lexists(firewall.claim_boundary_path)
+    assert not os.path.lexists(firewall.claim_path)
+
+
+def test_claim_boundary_rejects_active_execution_after_terminal_cycle(tmp_path):
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    install_contract(work, contract)
+    _terminal_snapshot(work, add_active_runner=True)
+    source, command = _boundary_inputs(tmp_path, contract)
+    with pytest.raises(QualificationFirewallError, match="在途 runner_call"):
+        publish_claim_boundary(
+            work, _claim("T1"), source_root=source,
+            confirmatory_command=command)
+
+
+@pytest.mark.parametrize(
+    ("snapshot_kwargs", "message"),
+    [
+        ({"add_unsnapshotted_terminal": True}, "high-water 不一致"),
+        ({"drift_status": True}, "status 与 durable snapshot"),
+    ],
+)
+def test_claim_boundary_rejects_live_db_snapshot_drift(
+        tmp_path, snapshot_kwargs, message):
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    install_contract(work, contract)
+    _terminal_snapshot(work, **snapshot_kwargs)
+    source, command = _boundary_inputs(tmp_path, contract)
+    with pytest.raises(QualificationFirewallError, match=message):
+        publish_claim_boundary(
+            work, _claim("T1"), source_root=source,
+            confirmatory_command=command)
+    firewall = load_qualification_firewall(work)
+    assert not os.path.lexists(firewall.claim_boundary_path)
+
+
+def test_unbound_claim_and_final_are_rejected(tmp_path):
+    import orchestrator.qualification_firewall as qualification_module
+
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    firewall = install_contract(work, contract)
+    claim = _claim("T1")
+    with pytest.raises(QualificationFirewallError, match="必须由已验证的 claim boundary"):
+        publish_claim_lock(work, claim)
+
+    _publish_once(firewall.claim_path, _canonical(claim))
+    with pytest.raises(QualificationFirewallError, match="缺 claim boundary"):
+        qualification_module.main(["--work-root", str(work), "verify"])
+    with pytest.raises(QualificationFirewallError, match="claim boundary"):
+        consume_final(
+            work, source_tree_sha256="sha256:" + "a" * 64,
+            runtime_identity_sha256="sha256:" + "c" * 64, now=1.0)
+    assert not os.path.lexists(firewall.final_path)
+
+
+def test_boundary_first_crash_closes_research_and_exact_replay_completes_claim(
+        tmp_path, monkeypatch):
+    import orchestrator.qualification_firewall as qualification_module
+
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    install_contract(work, contract)
+    _terminal_snapshot(work)
+    source, command = _boundary_inputs(tmp_path, contract)
+    claim = _claim("T1")
+    original_publish = qualification_module._publish_once
+    fail_claim_once = {"armed": True}
+
+    def crash_after_boundary(path, payload, **kwargs):
+        if path.name == "claim-lock.json" and fail_claim_once["armed"]:
+            fail_claim_once["armed"] = False
+            raise RuntimeError("simulated crash after boundary")
+        return original_publish(path, payload, **kwargs)
+
+    monkeypatch.setattr(qualification_module, "_publish_once", crash_after_boundary)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        publish_claim_boundary(
+            work, claim, source_root=source, confirmatory_command=command)
+    firewall = load_qualification_firewall(work)
+    assert os.path.lexists(firewall.claim_boundary_path)
+    assert not os.path.lexists(firewall.claim_path)
+    with pytest.raises(QualificationClaimLockedError, match="boundary"):
+        firewall.assert_research_open()
+
+    changed = _claim("T1")
+    changed["claims"] = [{"id": "different", "text": "frozen claim"}]
+    with pytest.raises(QualificationFirewallError, match="boundary hash"):
+        publish_claim_lock(work, changed)
+
+    result = publish_claim_boundary(
+        work, claim, source_root=source, confirmatory_command=command)
+    assert result["claim_sha256"].startswith("sha256:")
+    firewall.read_claim_lock()
 
 
 def test_contract_refuses_whole_root_overlap_policy_drift_and_view_tamper(tmp_path):
@@ -302,7 +551,7 @@ def test_sandbox_spec_contains_only_referenced_fold_not_all_fifteen(tmp_path):
     work = tmp_path / "work"
     contract = _t2_contract(tmp_path)
     install_contract(work, contract)
-    publish_claim_lock(work, _claim("T2"))
+    _publish_fixture_boundary(work, _claim("T2"))
     consume_final(
         work, source_tree_sha256="sha256:" + "a" * 64,
         runtime_identity_sha256="sha256:" + "c" * 64, now=1.0)
@@ -364,10 +613,32 @@ def test_qualification_rejects_custom_runner_and_post_claim_startup_before_docke
         run_module._assemble_system(
             **assembly, runner_factory=lambda *_args: object())
 
-    publish_claim_lock(work, _claim("T1"))
+    _publish_fixture_boundary(work, _claim("T1"))
     monkeypatch.setattr(
         run_module, "DockerExecutionSandbox",
         lambda **_kwargs: pytest.fail("Docker constructed after claim lock"))
     assembly["attack"] = True
-    with pytest.raises(QualificationClaimLockedError, match="claim 已锁定"):
+    with pytest.raises(QualificationClaimLockedError, match="claim boundary"):
         run_module._assemble_system(**assembly, runner_factory=None)
+
+
+def test_already_assembled_system_rechecks_boundary_before_advancing(tmp_path):
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    firewall = install_contract(work, contract)
+
+    class NeverAdvance:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            pytest.fail("advancer ran after claim boundary publication")
+
+    system = run_module.System(
+        advancer=NeverAdvance(), state=object(), daemon=object(),
+        dual_mode="A", work_root=work,
+        research_open_guard=firewall.assert_research_open)
+    _publish_fixture_boundary(work, _claim("T1"))
+
+    with pytest.raises(QualificationClaimLockedError, match="claim boundary"):
+        system.run(1)

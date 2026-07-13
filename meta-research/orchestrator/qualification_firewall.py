@@ -11,8 +11,9 @@ optionally contains one immutable contract which narrows that generic runtime:
   later research cycle.
 
 This module intentionally adds neither a database nor a scheduler.  The only
-state is a contract, one claim lock and one final-consumed marker, all canonical
-JSON published with no-clobber semantics and directory fsync.
+state is a contract, one A→B boundary, one claim lock and one final-consumed
+marker, all canonical JSON published with no-clobber semantics and directory
+fsync.
 """
 from __future__ import annotations
 
@@ -34,9 +35,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 CONTRACT_PROTOCOL = "meta-research-qualification-firewall/v1"
 CLAIM_PROTOCOL = "meta-research-qualification-claim-lock/v1"
-FINAL_PROTOCOL = "meta-research-qualification-final-consumed/v1"
+CLAIM_BOUNDARY_PROTOCOL = "meta-research-qualification-claim-boundary/v1"
+FINAL_PROTOCOL = "meta-research-qualification-final-consumed/v2"
 CONTRACT_RELATIVE_PATH = Path("state/qualification/contract.json")
 CLAIM_RELATIVE_PATH = Path("state/qualification/claim-lock.json")
+CLAIM_BOUNDARY_RELATIVE_PATH = Path("state/qualification/claim-boundary.json")
 FINAL_RELATIVE_PATH = Path("state/qualification/final-consumed.json")
 VIEW_RECEIPT_NAME = "qualification-view.json"
 VIEW_RECEIPT_PROTOCOL = "meta-research-qualification-view/v1"
@@ -483,6 +486,10 @@ class QualificationFirewall:
         return self.work_root / CLAIM_RELATIVE_PATH
 
     @property
+    def claim_boundary_path(self) -> Path:
+        return self.work_root / CLAIM_BOUNDARY_RELATIVE_PATH
+
+    @property
     def final_path(self) -> Path:
         return self.work_root / FINAL_RELATIVE_PATH
 
@@ -658,6 +665,10 @@ class QualificationFirewall:
             self.read_final_marker()
             raise QualificationFinalizedError(
                 "qualification final 已消费；禁止恢复研究循环或让 target 指标反馈下一轮")
+        if os.path.lexists(self.claim_boundary_path):
+            self.read_claim_boundary()
+            raise QualificationClaimLockedError(
+                "qualification claim boundary 已发布；普通研究循环已关闭，请进入资格执行阶段")
         if os.path.lexists(self.claim_path):
             self.read_claim_lock()
             raise QualificationClaimLockedError(
@@ -715,6 +726,16 @@ class QualificationFirewall:
         _validate_claim(value, self)
         return value, raw
 
+    def read_claim_boundary(self) -> tuple[Dict[str, Any], bytes]:
+        raw = _read_regular(
+            self.claim_boundary_path, label="qualification claim boundary",
+            expected_owner=self.research_uid, expected_mode=0o400)
+        value = _strict_json(raw, label="qualification claim boundary")
+        if raw != _canonical(value):
+            raise QualificationFirewallError("qualification claim boundary 非 canonical")
+        _validate_claim_boundary(value, self)
+        return value, raw
+
     def read_final_marker(self) -> Dict[str, Any]:
         raw = _read_regular(
             self.final_path, label="qualification final marker",
@@ -724,13 +745,15 @@ class QualificationFirewall:
             raise QualificationFirewallError("qualification final marker 非 canonical")
         if (set(value) != {
                 "version", "protocol", "task", "contract_sha256", "claim_sha256",
-                "source_tree_sha256", "runtime_identity_sha256",
+                "claim_boundary_sha256", "source_tree_sha256", "runtime_identity_sha256",
                 "gpu_canary_sha256", "units", "consumed_at_unix"}
-                or value.get("version") != 1 or value.get("protocol") != FINAL_PROTOCOL
+                or value.get("version") != 2 or value.get("protocol") != FINAL_PROTOCOL
                 or value.get("task") != self.task
                 or value.get("contract_sha256") != self.contract_sha256
                 or not isinstance(value.get("claim_sha256"), str)
                 or _SHA256_RE.fullmatch(value["claim_sha256"]) is None
+                or not isinstance(value.get("claim_boundary_sha256"), str)
+                or _SHA256_RE.fullmatch(value["claim_boundary_sha256"]) is None
                 or not isinstance(value.get("source_tree_sha256"), str)
                 or _SHA256_RE.fullmatch(value["source_tree_sha256"]) is None
                 or not isinstance(value.get("runtime_identity_sha256"), str)
@@ -873,6 +896,290 @@ def _validate_claim(value: Mapping[str, Any], firewall: QualificationFirewall) -
     _validate_command(value["final_command"], firewall)
 
 
+def _validate_confirmatory_command(
+        value: Any, firewall: QualificationFirewall) -> None:
+    if firewall.task != "T1":
+        if value is not None:
+            raise QualificationFirewallError("T2 不接受 confirmatory_command")
+        return
+    if not isinstance(value, dict) or set(value) != {"argv", "output", "gpu_required"}:
+        raise QualificationFirewallError("confirmatory_command 字段闭包非法")
+    argv = value["argv"]
+    if (not isinstance(argv, list) or not 1 <= len(argv) <= 128
+            or any(not isinstance(token, str) or not token or "\x00" in token
+                   or len(token.encode("utf-8")) > 8192 for token in argv)):
+        raise QualificationFirewallError("confirmatory_command.argv 非法")
+    if argv[0].rsplit("/", 1)[-1] in _SHELLS:
+        raise QualificationFirewallError("confirmatory_command 不得以 shell/env 启动")
+    joined = "\n".join(argv)
+    if "{src}" not in joined or not any(
+            token == "{src}" or token.startswith("{src}/") for token in argv):
+        raise QualificationFirewallError("confirmatory_command 缺可识别 {src} placeholder")
+    if set(re.findall(r"\{[a-z_]+\}", joined)) != {"{src}"}:
+        raise QualificationFirewallError("confirmatory_command 含未知 placeholder")
+    explores = [mount for mount in firewall.mounts if mount.role == "explore"]
+    for mount in explores:
+        root = str(mount.path)
+        if not any(token == root or token.startswith(root + "/") for token in argv):
+            raise QualificationFirewallError(
+                f"confirmatory_command 未直接绑定 explore root: {mount.dataset}")
+    for mount in firewall.mounts:
+        if mount.role == "sealed_holdout":
+            root = str(mount.path)
+            if any(token == root or token.startswith(root + "/") for token in argv):
+                raise QualificationFirewallError(
+                    "confirmatory_command 不得引用 DREAMER sealed holdout")
+    if value["output"] != "confirmatory.json":
+        raise QualificationFirewallError(
+            "confirmatory_command.output 固定为 confirmatory.json")
+    if value["gpu_required"] is not firewall.final["gpu_required"]:
+        raise QualificationFirewallError(
+            "confirmatory GPU 模式与 qualification contract 不一致")
+
+
+def _validate_claim_boundary(
+        value: Mapping[str, Any], firewall: QualificationFirewall) -> None:
+    if (set(value) != {
+            "version", "protocol", "task", "contract_sha256", "claim_sha256",
+            "source_tree_sha256", "a_high_water", "explore_views",
+            "confirmatory_command"}
+            or value.get("version") != 1
+            or value.get("protocol") != CLAIM_BOUNDARY_PROTOCOL
+            or value.get("task") != firewall.task
+            or value.get("contract_sha256") != firewall.contract_sha256
+            or not isinstance(value.get("claim_sha256"), str)
+            or _SHA256_RE.fullmatch(value["claim_sha256"]) is None
+            or not isinstance(value.get("source_tree_sha256"), str)
+            or _SHA256_RE.fullmatch(value["source_tree_sha256"]) is None):
+        raise QualificationFirewallError("qualification claim boundary 字段/绑定非法")
+    anchor = value["a_high_water"]
+    if (not isinstance(anchor, dict)
+            or set(anchor) != {"cycle_id", "storage_manifest_sha256"}
+            or not isinstance(anchor.get("cycle_id"), str)
+            or re.fullmatch(r"c[1-9][0-9]*", anchor["cycle_id"]) is None
+            or not isinstance(anchor.get("storage_manifest_sha256"), str)
+            or _SHA256_RE.fullmatch(anchor["storage_manifest_sha256"]) is None):
+        raise QualificationFirewallError("qualification A high-water 绑定非法")
+    views = value["explore_views"]
+    expected = sorted(
+        (mount.dataset for mount in firewall.mounts if mount.role == "explore"),
+        key=lambda item: (item.casefold(), item),
+    )
+    if not isinstance(views, list) or len(views) != len(expected):
+        raise QualificationFirewallError("qualification explore view 绑定数量非法")
+    identities = []
+    for item in views:
+        if (not isinstance(item, dict)
+                or set(item) != {"dataset", "tree_sha256"}
+                or not isinstance(item.get("tree_sha256"), str)
+                or _SHA256_RE.fullmatch(item["tree_sha256"]) is None):
+            raise QualificationFirewallError("qualification explore view 绑定非法")
+        identities.append(item.get("dataset"))
+    if identities != expected:
+        raise QualificationFirewallError("qualification explore view 身份与 contract 不一致")
+    _validate_confirmatory_command(value["confirmatory_command"], firewall)
+
+
+def _explore_view_identities(firewall: QualificationFirewall) -> list[Dict[str, Any]]:
+    result = []
+    mounts = sorted(
+        (mount for mount in firewall.mounts if mount.role == "explore"),
+        key=lambda item: (item.dataset.casefold(), item.dataset, str(item.path)),
+    )
+    for mount in mounts:
+        actual = _walk_view(
+            mount.path, expected_owner=firewall.research_uid, hash_cache={})
+        ledger = [
+            {"path": path, "sha256": identity[0], "bytes": identity[1]}
+            for path, identity in sorted(actual.items())
+        ]
+        result.append({
+            "dataset": mount.dataset,
+            "tree_sha256": _hash_bytes(_canonical({"files": ledger})),
+        })
+    return result
+
+
+def _a_high_water(
+        work_root: Path, storage_report: Mapping[str, Any]) -> Dict[str, Any]:
+    try:
+        report_cycle = storage_report["high_water_cycle"]
+        manifest_hash = storage_report["high_water_manifest_sha256"]
+        manifest_status = storage_report["high_water_cycle_status"]
+    except (KeyError, TypeError) as error:
+        raise QualificationFirewallError("storage verify 缺 A high-water") from error
+    if (not isinstance(report_cycle, str)
+            or re.fullmatch(r"c[1-9][0-9]*", report_cycle) is None
+            or not isinstance(manifest_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None
+            or manifest_status not in {"done", "failed", "aborted"}):
+        raise QualificationFirewallError("storage verify A high-water 身份非法")
+    database_path = work_root / "research.sqlite"
+    try:
+        info = os.lstat(database_path)
+    except OSError as error:
+        raise QualificationFirewallError("A high-water 缺 research.sqlite") from error
+    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()):
+        raise QualificationFirewallError("A high-water research.sqlite 身份非法")
+    import sqlite3
+    from . import database as qualification_database
+    try:
+        connection = sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
+        connection.execute("PRAGMA query_only=ON")
+        qualification_database.verify_schema(connection)
+        inflight_cycle = connection.execute(
+            "SELECT id,status FROM cycle "
+            "WHERE status NOT IN ('done','failed','aborted') ORDER BY id LIMIT 1").fetchone()
+        if inflight_cycle is not None:
+            raise QualificationFirewallError(
+                f"A 阶段仍有在途 cycle: c{inflight_cycle[0]}={inflight_cycle[1]}")
+        active_queries = (
+            ("run", "SELECT id FROM run WHERE status IN ('created','running') LIMIT 1"),
+            ("evaluation", "SELECT id FROM evaluation WHERE status IN ('created','running') LIMIT 1"),
+            ("evaluation_attempt", "SELECT id FROM evaluation_attempt "
+             "WHERE status IN ('created','running') LIMIT 1"),
+            ("runner_call", "SELECT id FROM runner_call "
+             "WHERE status IN ('created','running') LIMIT 1"),
+            ("build_target", "SELECT id FROM build_target "
+             "WHERE status IN ('building','smoke','running') LIMIT 1"),
+        )
+        for label, query in active_queries:
+            active = connection.execute(query).fetchone()
+            if active is not None:
+                raise QualificationFirewallError(
+                    f"A 阶段仍有在途 {label}: {active[0]}")
+        latest = connection.execute(
+            "SELECT id,status FROM cycle ORDER BY id DESC LIMIT 1").fetchone()
+    except QualificationFirewallError:
+        raise
+    except (sqlite3.Error, qualification_database.SchemaDriftError) as error:
+        raise QualificationFirewallError("A high-water SQLite 校验失败") from error
+    finally:
+        if "connection" in locals():
+            connection.close()
+    if latest is None:
+        raise QualificationFirewallError("A 阶段至少需要一个终态 research cycle")
+    cycle_id = f"c{latest[0]}"
+    if cycle_id != report_cycle:
+        raise QualificationFirewallError(
+            "A 最新终态 cycle 与 durable snapshot high-water 不一致")
+    if latest[1] != manifest_status:
+        raise QualificationFirewallError(
+            "A 最新终态 cycle status 与 durable snapshot manifest 不一致")
+    return {
+        "cycle_id": cycle_id,
+        "storage_manifest_sha256": "sha256:" + manifest_hash,
+    }
+
+
+def _publish_claim_boundary_owned(
+        work_root: Path | str, value: Mapping[str, Any], *, source_root: Path | str,
+        lease: Any,
+        confirmatory_command: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Freeze A→B identities, publish the boundary first, then the exact claim."""
+    root = Path(os.path.abspath(os.fspath(work_root)))
+    firewall = load_qualification_firewall(root, require_research_uid=True)
+    if firewall is None:
+        raise QualificationFirewallError("work_root 未安装 qualification contract")
+    if os.path.lexists(firewall.final_path):
+        firewall.read_final_marker()
+        raise QualificationFinalizedError("final 已消费，不能再锁定 claim boundary")
+    try:
+        lease_root = Path(os.path.abspath(os.fspath(lease.work_root)))
+        lease.assert_owned()
+    except (AttributeError, OSError) as error:
+        raise QualificationFirewallError("claim boundary 需要 exact work-root lease") from error
+    if lease_root != root:
+        raise QualificationFirewallError("claim boundary lease/work-root 错配")
+    claim = dict(value)
+    _validate_claim(claim, firewall)
+    claim_raw = _canonical(claim)
+    claim_hash = _hash_bytes(claim_raw)
+    command = None if confirmatory_command is None else dict(confirmatory_command)
+    _validate_confirmatory_command(command, firewall)
+    if (os.path.lexists(firewall.claim_path)
+            and not os.path.lexists(firewall.claim_boundary_path)):
+        raise QualificationFirewallError(
+            "已有 legacy claim-lock 但无 claim boundary；不能事后伪造 A→B 冻结")
+
+    # Lazy imports avoid moving the already-audited final runner hashing code or
+    # creating a second snapshot implementation merely for this one checkpoint.
+    from .qualification_runner import freeze_source_tree
+    from .storage_ops import SnapshotArchive
+    _ledger, source_hash = freeze_source_tree(source_root)
+    lease.assert_owned()
+    archive = SnapshotArchive(work_root=root, lease=lease)
+    storage_report = archive.verify()
+    high_water_number = int(storage_report["high_water_cycle"][1:])
+    high_water_manifest = archive.publisher._validate_pointer(  # noqa: SLF001
+        high_water_number, verify_backup=False, verify_git=False)
+    if high_water_manifest["manifest_sha256"] != storage_report[
+            "high_water_manifest_sha256"]:
+        raise QualificationFirewallError(
+            "A high-water manifest 与 storage verify report 不一致")
+    storage_report = dict(storage_report)
+    storage_report["high_water_cycle_status"] = high_water_manifest["cycle_status"]
+    anchor = _a_high_water(root, storage_report)
+    explore_views = _explore_view_identities(firewall)
+    boundary = {
+        "version": 1,
+        "protocol": CLAIM_BOUNDARY_PROTOCOL,
+        "task": firewall.task,
+        "contract_sha256": firewall.contract_sha256,
+        "claim_sha256": claim_hash,
+        "source_tree_sha256": source_hash,
+        "a_high_water": anchor,
+        "explore_views": explore_views,
+        "confirmatory_command": command,
+    }
+    _validate_claim_boundary(boundary, firewall)
+    lease.assert_owned()
+    if os.path.lexists(firewall.claim_boundary_path):
+        existing, boundary_raw = firewall.read_claim_boundary()
+        if existing != boundary:
+            raise QualificationFirewallError(
+                "claim boundary 已存在且冻结输入发生漂移")
+    else:
+        boundary_raw = _canonical(boundary)
+        _publish_once(firewall.claim_boundary_path, boundary_raw)
+    lease.assert_owned()
+    _publish_once(firewall.claim_path, claim_raw)
+    return {
+        "claim_sha256": claim_hash,
+        "claim_path": str(firewall.claim_path),
+        "claim_boundary_sha256": _hash_bytes(boundary_raw),
+        "claim_boundary_path": str(firewall.claim_boundary_path),
+        "source_tree_sha256": source_hash,
+        "a_high_water": anchor,
+    }
+
+
+def publish_claim_boundary(
+        work_root: Path | str, value: Mapping[str, Any], *, source_root: Path | str,
+        confirmatory_command: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Acquire the offline owner lease and atomically freeze the A→B boundary."""
+    from .instance_lease import InstanceLease
+    root = Path(os.path.abspath(os.fspath(work_root)))
+    lease = InstanceLease.acquire(root)
+    primary: Optional[BaseException] = None
+    try:
+        return _publish_claim_boundary_owned(
+            root, value, source_root=source_root, lease=lease,
+            confirmatory_command=confirmatory_command)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_error = lease.close()
+        if close_error is not None:
+            if primary is None:
+                raise close_error
+            note = getattr(primary, "add_note", None)
+            if callable(note):
+                note(f"claim boundary lease close 失败: {close_error}")
+
+
 def final_units(firewall: QualificationFirewall) -> list[Dict[str, Any]]:
     if firewall.task == "T1":
         return [{"unit_id": "dreamer", "seed": None, "fold": None}]
@@ -938,6 +1245,13 @@ def publish_claim_lock(
     claim = dict(value)
     _validate_claim(claim, firewall)
     raw = _canonical(claim)
+    if not os.path.lexists(firewall.claim_boundary_path):
+        raise QualificationFirewallError(
+            "claim-lock 必须由已验证的 claim boundary 完成；请使用 lock-claim CLI")
+    boundary, _boundary_raw = firewall.read_claim_boundary()
+    if boundary["claim_sha256"] != _hash_bytes(raw):
+        raise QualificationFirewallError(
+            "claim-lock 与已发布 claim boundary hash 不一致")
     _publish_once(firewall.claim_path, raw)
     return {"claim_sha256": _hash_bytes(raw), "path": str(firewall.claim_path)}
 
@@ -976,14 +1290,20 @@ def consume_final(
     if not firewall.final["gpu_required"] and gpu_canary_sha256 is not None:
         raise QualificationFirewallError("CPU final 不接受 GPU canary hash")
     _claim, claim_raw = firewall.read_claim_lock()
+    boundary, boundary_raw = firewall.read_claim_boundary()
+    if (boundary["claim_sha256"] != _hash_bytes(claim_raw)
+            or boundary["source_tree_sha256"] != source_tree_sha256):
+        raise QualificationFirewallError(
+            "final 输入与 claim boundary 冻结的 claim/source 不一致")
     timestamp = time.time() if now is None else now
     if (isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
             or not math.isfinite(float(timestamp)) or float(timestamp) <= 0):
         raise QualificationFirewallError("final consumed timestamp 非法")
     marker = {
-        "version": 1, "protocol": FINAL_PROTOCOL, "task": firewall.task,
+        "version": 2, "protocol": FINAL_PROTOCOL, "task": firewall.task,
         "contract_sha256": firewall.contract_sha256,
         "claim_sha256": _hash_bytes(claim_raw),
+        "claim_boundary_sha256": _hash_bytes(boundary_raw),
         "source_tree_sha256": source_tree_sha256,
         "runtime_identity_sha256": runtime_identity_sha256,
         "gpu_canary_sha256": gpu_canary_sha256,
@@ -1018,11 +1338,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     install.add_argument("--contract", required=True)
     claim = sub.add_parser("lock-claim")
     claim.add_argument("--claim", required=True)
+    claim.add_argument("--source-root", required=True)
+    claim.add_argument("--confirmatory-command")
     sub.add_parser("verify")
     args = parser.parse_args(argv)
     root = Path(os.path.abspath(args.work_root))
     from .instance_lease import InstanceLease
-    lease = InstanceLease.acquire(root)
+    lease = None if args.command == "lock-claim" else InstanceLease.acquire(root)
     primary: Optional[BaseException] = None
     try:
         if args.command == "install-contract":
@@ -1031,27 +1353,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     Path(args.contract), label="qualification contract input"))
             output = {"task": result.task, "contract_sha256": result.contract_sha256}
         elif args.command == "lock-claim":
-            output = publish_claim_lock(
-                root, _load_json_file(Path(args.claim), label="qualification claim input"))
+            output = publish_claim_boundary(
+                root,
+                _load_json_file(Path(args.claim), label="qualification claim input"),
+                source_root=args.source_root,
+                confirmatory_command=(
+                    None if args.confirmatory_command is None else _load_json_file(
+                        Path(args.confirmatory_command),
+                        label="qualification confirmatory command input")),
+            )
         else:
             firewall = load_qualification_firewall(root, require_research_uid=True)
             if firewall is None:
                 raise QualificationFirewallError("work_root 未安装 qualification contract")
             output = {
                 "task": firewall.task, "contract_sha256": firewall.contract_sha256,
+                "claim_boundary_locked": os.path.lexists(firewall.claim_boundary_path),
                 "claim_locked": os.path.lexists(firewall.claim_path),
                 "final_consumed": os.path.lexists(firewall.final_path),
                 "research_mounts": [str(item.path) for item in firewall.mounts],
             }
+            boundary = boundary_raw = claim_raw = marker = None
+            if output["claim_boundary_locked"]:
+                boundary, boundary_raw = firewall.read_claim_boundary()
             if output["claim_locked"]:
-                firewall.read_claim_lock()
+                _claim, claim_raw = firewall.read_claim_lock()
             if output["final_consumed"]:
-                firewall.read_final_marker()
+                marker = firewall.read_final_marker()
+            if claim_raw is not None and boundary is None:
+                raise QualificationFirewallError(
+                    "qualification claim-lock 缺 claim boundary authority")
+            if (boundary is not None and claim_raw is not None
+                    and boundary["claim_sha256"] != _hash_bytes(claim_raw)):
+                raise QualificationFirewallError(
+                    "qualification claim-lock 与 claim boundary hash 错配")
+            if marker is not None and (
+                    boundary is None or boundary_raw is None or claim_raw is None
+                    or marker["claim_sha256"] != _hash_bytes(claim_raw)
+                    or marker["claim_boundary_sha256"] != _hash_bytes(boundary_raw)
+                    or marker["source_tree_sha256"] != boundary["source_tree_sha256"]):
+                raise QualificationFirewallError(
+                    "qualification final marker authority 链不完整或错配")
     except BaseException as error:
         primary = error
         raise
     finally:
-        close_error = lease.close()
+        close_error = None if lease is None else lease.close()
         if close_error is not None:
             if primary is not None:
                 note = getattr(primary, "add_note", None)
@@ -1068,9 +1415,9 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "CLAIM_PROTOCOL", "CONTRACT_PROTOCOL", "FINAL_PROTOCOL",
+    "CLAIM_BOUNDARY_PROTOCOL", "CLAIM_PROTOCOL", "CONTRACT_PROTOCOL", "FINAL_PROTOCOL",
     "QualificationClaimLockedError", "QualificationFinalizedError", "QualificationFirewall",
     "QualificationFirewallError", "QualificationMount", "consume_final",
     "final_units", "install_contract", "load_qualification_firewall",
-    "publish_claim_lock",
+    "publish_claim_boundary", "publish_claim_lock",
 ]

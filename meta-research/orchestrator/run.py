@@ -240,7 +240,8 @@ class System:
                  instance_lease: Optional[InstanceLease] = None,
                  execution_supervisor: Optional[ExecutionSupervisor] = None,
                  deployment_receipt: Optional[Dict[str, Any]] = None,
-                 resource_closers: Optional[List[Callable[[], None]]] = None):
+                 resource_closers: Optional[List[Callable[[], None]]] = None,
+                 research_open_guard: Optional[Callable[[], None]] = None):
         if dual_mode != "A":
             raise ValueError(
                 "session.dual_mode 当前只支持 A（一 turn 一阶段）；"
@@ -276,6 +277,7 @@ class System:
         self.execution_supervisor = execution_supervisor
         self.deployment_receipt = deployment_receipt
         self._resource_closers = list(resource_closers or [])
+        self._research_open_guard = research_open_guard or (lambda: None)
         self._lifecycle_guard = threading.RLock()
         self._active_operations = 0
         self._run_depth = 0
@@ -308,6 +310,10 @@ class System:
                 raise RuntimeError("System 已进入 shutdown，只允许重试 close")
         if self.instance_lease is not None:
             self.instance_lease.assert_owned()
+
+    def _assert_research_open(self) -> None:
+        self._assert_instance_owned()
+        self._research_open_guard()
 
     @contextmanager
     def _operation_scope(self):
@@ -633,6 +639,7 @@ class System:
                 time.sleep(0.02 * (attempt + 1))
 
     def run(self, max_cycles: int) -> List[str]:
+        self._assert_research_open()
         with self._run_scope("run-once"):
             return self._run_owned(max_cycles)
 
@@ -776,6 +783,7 @@ class System:
     def run_forever(self, max_cycles: int, *, poll_interval_s: float = 1.0,
                     linger_after_terminal: bool = True,
                     stop_event: Optional[threading.Event] = None) -> List[str]:
+        self._assert_research_open()
         with self._run_scope("resident-run"):
             return self._run_forever_owned(
                 max_cycles, poll_interval_s=poll_interval_s,
@@ -1469,6 +1477,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         sync_notifications()
 
     def precheck(cyc=None) -> Optional[str]:
+        if qualification is not None:
+            qualification.assert_research_open()
         sync_interactions(cyc)                # 两个信任域独立 cursor；console 始终先推进
         if inbox_ingest.has_pending or connector_inbox.has_pending:
             # Spool 是人类动作的到达顺序。队首 retry/sidecar 损坏/下一批 backlog 未排空时，不能先消费
@@ -1588,7 +1598,9 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                   instance_lease=instance_lease,
                   execution_supervisor=execution_supervisor,
                   deployment_receipt=deployment_receipt,
-                  resource_closers=resource_closers)
+                  resource_closers=resource_closers,
+                  research_open_guard=(
+                      None if qualification is None else qualification.assert_research_open))
 
 
 def main(argv: Optional[List[str]] = None) -> int:

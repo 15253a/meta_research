@@ -155,12 +155,18 @@ unmountable until the irreversible final marker; consequently the present A
 phase is literature/method/source construction, not iterative tuning on the
 sealed SEED folds.
 
-When exploration is complete, stop the owner cleanly and verify the latest
-storage snapshot before creating the claim lock:
+When exploration is complete, stop the owner cleanly. This is a useful preview,
+but it is not the locking authority:
 
 ```bash
 python -m orchestrator.storage_ops --work-root "$WORK" verify
 ```
+
+`lock-claim` repeats that complete verification under the exact work-root
+instance lease, checks that live SQLite is quiescent, and requires its latest
+terminal cycle/status to equal the immutable snapshot manifest. It never calls
+`reconcile`; a missing terminal snapshot must be repaired by the ordinary owner
+before B can be locked.
 
 ## 4. Lock stage B exactly once
 
@@ -250,21 +256,36 @@ PY
 ```
 
 The firewall still performs the authoritative closed-field, filesystem,
-ownership, receipt, and cross-field validation.
+ownership, receipt, and cross-field validation. T1 also needs one direct-argv
+confirmatory batch command. It must contain `{src}`, directly name every exact
+explore root from the contract, must not name DREAMER, and must write
+`confirmatory.json`. For example:
+
+```json
+{"argv":["python","{src}/confirm.py","--data","/absolute/SEED","--data","/absolute/SEED-IV","--data","/absolute/FACED"],"gpu_required":false,"output":"confirmatory.json"}
+```
 
 Publish the canonical claim as the research UID while the owner is stopped:
 
 ```bash
 python -m orchestrator.qualification_firewall --work-root "$WORK" \
-  lock-claim --claim /absolute/claim.json
+  lock-claim --claim /absolute/claim.json \
+  --source-root /absolute/frozen-source \
+  --confirmatory-command /absolute/confirmatory-command.json
 python -m orchestrator.qualification_firewall --work-root "$WORK" verify
 ```
 
-The output must now show `claim_locked:true`. A second or changed claim is
-rejected by no-clobber publication. Until the missing T1-C boundary described
-above is implemented, do not resume the generic T1 research loop and call the
-result a confirmatory run: the current code does not prevent result-driven
-adaptation after B.
+For T2, omit `--confirmatory-command`; `--source-root` is still required. The
+output must show both `claim_boundary_locked:true` and `claim_locked:true`. The
+boundary binds the claim hash, frozen source, verified A high-water, and exact
+explore-tree hashes. It is published before the claim, so a crash in between
+already closes ordinary research and exact replay only completes the same
+claim. A claim-only legacy work root is rejected rather than backfilled.
+
+After either boundary or claim appears, `orchestrator.run` fails before Docker,
+SQLite, connectors, or providers. Do not resume the generic loop. The separate
+T1-C execution/audit receipt is still not implemented, so this B receipt alone
+must not be described as an independently scored confirmatory result.
 
 ## 5. Run the implemented irreversible final batch
 
