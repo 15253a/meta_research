@@ -34,6 +34,14 @@ from .repository_materializer_store import (
     inspect_repository_materialization_index,
     inspect_repository_snapshot_object,
 )
+from .storage_paths import registered_path_roots
+from .storage_restore_contract import (
+    IMPORT_RESTORE_MARKER,
+    REGISTERED_RESTORE_MARKER,
+    StorageRestoreContractError,
+    read_marker,
+    validate_registered_completion,
+)
 
 
 VERIFY_SCHEMA = "meta-research-import-materialization-verify/v1"
@@ -48,9 +56,6 @@ _MAX_PLAN_REF_BYTES = 16 * 1024 * 1024
 _MAX_INDEXES = 100_000
 _CAPACITY_MARGIN_BYTES = 1 * 1024 * 1024
 _CAPACITY_MARGIN_INODES = 32
-IMPORT_RESTORE_MARKER = b"meta-research-import-materialization-restore/v1\n"
-
-
 class StorageImportError(sg.StorageGovernanceError):
     """Registered repository/dependency closure is incomplete or corrupt."""
 
@@ -575,19 +580,11 @@ class ImportMaterializationArchive:
                 _remove_private_tree(temporary_root)
 
     @staticmethod
-    def _restore_marker_present(target: Path) -> bool:
-        marker = target / RESTORE_IN_PROGRESS_NAME
-        if not os.path.lexists(marker):
-            return False
-        info = marker.lstat()
-        if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != os.geteuid() or info.st_nlink != 1
-                or stat.S_IMODE(info.st_mode) != 0o400
-                or sg._read(marker, maximum=1024)
-                != IMPORT_RESTORE_MARKER):
-            raise StorageImportError(
-                "target restore marker 不是 import continuation")
-        return True
+    def _restore_marker_present(target: Path) -> Optional[bytes]:
+        try:
+            return read_marker(target)
+        except StorageRestoreContractError as error:
+            raise StorageImportError("target restore marker 非法") from error
 
     @staticmethod
     def _sync_file(path: Path, owner_guard: Callable[[], None]) -> None:
@@ -616,13 +613,19 @@ class ImportMaterializationArchive:
             "schema", "scope", "continuation_mode", "source_work_root",
             "source_cycle", "source_manifest_sha256", "backup",
         }
-        allowed_shapes = (required, required | {"publication_contract"})
+        allowed_shapes = (
+            required,
+            required | {"publication_contract"},
+            required | {"registered_path_roots"},
+            required | {"publication_contract", "registered_path_roots"},
+        )
         if (set(receipt) not in allowed_shapes
                 or receipt.get("schema") != "meta-research-storage-restore/v1"
                 or receipt.get("scope") != "sqlite_truth_only"
                 or receipt.get("continuation_mode") not in {
                     "legacy_adoption_on_first_start",
                     "import_materialization_restore_required",
+                    "registered_asset_restore_required",
                 }
                 or ("publication_contract" in receipt
                     and receipt["publication_contract"]
@@ -632,7 +635,9 @@ class ImportMaterializationArchive:
                 != selection["snapshot"]["source_cycle"]
                 or receipt.get("source_manifest_sha256")
                 != selection["manifest"]["manifest_sha256"]
-                or receipt.get("backup") != selection["manifest"]["backup"]):
+                or receipt.get("backup") != selection["manifest"]["backup"]
+                or receipt.get("registered_path_roots", [str(self.work_root)])
+                != [str(path) for path in registered_path_roots(self.work_root)]):
             raise StorageImportError("target SQLite restore receipt 与 source snapshot 漂移")
         manifest = selection["manifest"]
         self.snapshot_archive.publisher._verify_backup_object(
@@ -663,17 +668,24 @@ class ImportMaterializationArchive:
         resume_marker = self._restore_marker_present(target_path)
         target_lease = InstanceLease.acquire(
             target_path,
-            expected_restore_marker=(
-                IMPORT_RESTORE_MARKER if resume_marker else None))
+            expected_restore_marker=resume_marker)
         primary: Optional[BaseException] = None
         try:
             target_guard = target_lease.assert_owned
             target_guard()
             sg._sync_dir(target_path.parent)
             closure = self._closure(cycle)
-            self._validate_restore_target(target_path, closure)
+            sqlite_receipt = self._validate_restore_target(target_path, closure)
             marker_path = target_path / RESTORE_IN_PROGRESS_NAME
-            sg._publish_once(marker_path, IMPORT_RESTORE_MARKER)
+            desired_marker = (
+                REGISTERED_RESTORE_MARKER
+                if sqlite_receipt["continuation_mode"]
+                == "registered_asset_restore_required"
+                else IMPORT_RESTORE_MARKER)
+            if resume_marker is not None and resume_marker != desired_marker:
+                raise StorageImportError(
+                    "target restore marker 与 SQLite continuation_mode 漂移")
+            sg._publish_once(marker_path, desired_marker)
             sg._sync_dir(target_path)
             target_guard()
             repository_base = target_path / "state" / "import-materializations"
@@ -842,8 +854,35 @@ class ImportMaterializationArchive:
                     or marker_info.st_nlink != 1
                     or stat.S_IMODE(marker_info.st_mode) != 0o400
                     or sg._read(marker_path, maximum=1024)
-                    != IMPORT_RESTORE_MARKER):
+                    != desired_marker):
                 raise StorageImportError("import restore completion marker 漂移")
+            if desired_marker == REGISTERED_RESTORE_MARKER:
+                try:
+                    completion, _identities = validate_registered_completion(
+                        target_path,
+                        source_work_root=str(self.work_root),
+                        source_cycle=receipt["source_cycle"],
+                        source_manifest_sha256=receipt[
+                            "source_manifest_sha256"])
+                    # Lazy import avoids a module cycle while still making the
+                    # marker release compare the target receipt against the
+                    # exact immutable DB/mirror closure, not a self-asserted or
+                    # empty files list.
+                    from .storage_assets import RegisteredAssetArchive
+                    expected_completion = RegisteredAssetArchive(
+                        self.snapshot_archive).registered_restore_authority(
+                            cycle=receipt["source_cycle"])
+                    if completion != expected_completion:
+                        raise StorageRestoreContractError(
+                            "registered completion 与 source DB/mirror closure 漂移")
+                except (StorageRestoreContractError, sg.StorageGovernanceError) as error:
+                    raise StorageImportError(
+                        "registered asset completion 未闭合；拒绝解除 restore marker") from error
+            self.owner_guard()
+            target_guard()
+            if sg._read(marker_path, maximum=1024) != desired_marker:
+                raise StorageImportError(
+                    "restore marker 在最终解除前漂移")
             marker_path.unlink()
             sg._sync_dir(target_path)
             target_guard()

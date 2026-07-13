@@ -62,6 +62,7 @@ from .importer import DeferredImporter
 from .interfaces import InvalidSelectionError, Selection
 from .phase_commit import check_or_record
 from .process_supervisor import ExecutionSupervisor, atomic_write_receipt, read_receipt
+from .storage_paths import RegisteredPathError, resolve_registered_path
 
 _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
 
@@ -1420,7 +1421,12 @@ class AttackStages:
             raise RuntimeError(
                 f"eval target {bt_id} 的 v{vid} checkpoint 集从 plan 后漂移（实收 {len(checkpoints)}）")
         checkpoint_id, checkpoint_key, checkpoint_path, checkpoint_hash = checkpoints[0]
-        if H.file_sha256(checkpoint_path) != checkpoint_hash:
+        try:
+            checkpoint_file = resolve_registered_path(self.work, checkpoint_path)
+        except RegisteredPathError as error:
+            raise RuntimeError(
+                f"eval target {bt_id} checkpoint ck{checkpoint_id} path-lineage 非法") from error
+        if H.file_sha256(checkpoint_file) != checkpoint_hash:
             raise RuntimeError(
                 f"eval target {bt_id} checkpoint ck{checkpoint_id} 内容与 DB hash 不一致")
 
@@ -1536,7 +1542,7 @@ class AttackStages:
                     ev = MF.run_manifest_command(
                         manifest, "eval", staging_dir=str(eval_dir), log_name="eval.log",
                         src_dir=src_dir, work_root=self.work, policy=self.policy,
-                        ckpt_path=Path(checkpoint_path),
+                        ckpt_path=checkpoint_file,
                         ckpt_content_hash=checkpoint_hash,
                         expected_source_hashes=ledger,
                         allowed_asset_refs=allowed_asset_refs,
@@ -1805,11 +1811,17 @@ class AttackStages:
                         "WHERE produced_by_run=?", (rid,))
                     if checkpoint_identity is None:
                         raise RuntimeError(f"run {rid} 缺 checkpoint identity")
+                    try:
+                        checkpoint_file = resolve_registered_path(
+                            self.work, checkpoint_identity[0])
+                    except RegisteredPathError as error:
+                        raise RuntimeError(
+                            f"run {rid} checkpoint path-lineage 非法") from error
                     ev = MF.run_manifest_command(
                         manifest, "eval", staging_dir=str(eval_dir),
                         log_name="eval.log", src_dir=src_dir, work_root=self.work,
                         policy=self.policy,
-                        ckpt_path=Path(checkpoint_identity[0]),
+                        ckpt_path=checkpoint_file,
                         ckpt_content_hash=checkpoint_identity[1],
                         expected_source_hashes=ledger,
                         allowed_asset_refs=allowed_asset_refs,

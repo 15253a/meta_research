@@ -48,6 +48,7 @@ from .storage_assets import (
 )
 from .storage_imports import ImportMaterializationArchive
 from .storage_ops import SnapshotArchive
+from .storage_paths import registered_path_roots
 
 
 PACK_PROTOCOL = "meta-research-evidence-pack/v1"
@@ -767,6 +768,7 @@ def _validate_resume(
     expected_restore_fields = {
         "schema", "scope", "continuation_mode", "publication_contract",
         "source_work_root", "source_cycle", "source_manifest_sha256", "backup",
+        "registered_path_roots",
     }
     if (set(restore) != expected_restore_fields
             or restore.get("schema") != "meta-research-storage-restore/v1"
@@ -774,7 +776,9 @@ def _validate_resume(
             or restore.get("source_work_root") != str(source_root)
             or restore.get("source_cycle") != f"c{source_cycle}"
             or restore.get("source_manifest_sha256") != source_manifest_hash
-            or restore.get("backup") != source_manifest.get("backup")):
+            or restore.get("backup") != source_manifest.get("backup")
+            or restore.get("registered_path_roots")
+            != [str(path) for path in registered_path_roots(source_root)]):
         raise EvidencePackError("resume restore receipt 未绑定 exact source snapshot")
     if (os.path.lexists(target_root / RESTORE_IN_PROGRESS_NAME)
             or os.path.lexists(target_root.parent / restore_parent_claim_name(target_root))):
@@ -847,7 +851,10 @@ def _validate_resume(
 
     builder.add_bytes(
         kind="restore_receipt", logical_id="resume/restore.json", raw=restore_raw)
-    if restore.get("continuation_mode") == "import_materialization_restore_required":
+    if restore.get("continuation_mode") in {
+            "import_materialization_restore_required",
+            "registered_asset_restore_required",
+    }:
         completion = target_root / "state" / "import-materializations" / "storage-restore.json"
         completion_raw = _read_regular(
             completion, label="resume import materialization completion")
@@ -907,6 +914,8 @@ def create_evidence_pack(
         builder = _Builder(temporary, max_files=max_files, max_bytes=max_bytes)
         source_lease = InstanceLease.acquire(source_root)
         source_archive = SnapshotArchive(work_root=source_root, lease=source_lease)
+        source_registered_roots = [
+            str(path) for path in registered_path_roots(source_root)]
         source = _storage_items(builder, source_archive, prefix="source")
         log_report = _log_items(builder, source_archive)
         import_report = _import_items(builder, source_archive)
@@ -935,6 +944,7 @@ def create_evidence_pack(
         manifest = {
             "version": 1, "protocol": PACK_PROTOCOL,
             "source_work_root": str(source_root),
+            "source_registered_path_roots": source_registered_roots,
             "resume_probe": resume_probe,
             "items": builder.items,
         }
@@ -1142,6 +1152,7 @@ def _validate_storage_object(
 def _validate_resume_offline(
         pack: Path, probe: Any, items: Mapping[str, Mapping[str, Any]], *,
         source_cycle: int, source_work_root: str,
+        source_registered_roots: Sequence[Path],
         source_storage: Mapping[str, Any]) -> bool:
     """Derive the optional exact-one-cycle claim from packed facts only."""
     resume_ids = {
@@ -1206,7 +1217,8 @@ def _validate_resume_offline(
         label="packed restore receipt")
     if (set(restore) != {
             "schema", "scope", "continuation_mode", "publication_contract",
-            "source_work_root", "source_cycle", "source_manifest_sha256", "backup"}
+            "source_work_root", "source_cycle", "source_manifest_sha256", "backup",
+            "registered_path_roots"}
             or restore.get("schema") != "meta-research-storage-restore/v1"
             or restore.get("scope") != "sqlite_truth_only"
             or restore.get("publication_contract")
@@ -1215,12 +1227,18 @@ def _validate_resume_offline(
             or restore.get("source_cycle") != source_cycle_name
             or restore.get("source_manifest_sha256")
             != source_storage["pointer"]["manifest_sha256"]
-            or restore.get("backup") != source_storage["manifest"]["backup"]):
-        raise EvidencePackError("packed restore receipt 与 probe 漂移")
+            or restore.get("backup") != source_storage["manifest"]["backup"]
+            or restore.get("registered_path_roots")
+            != [str(path) for path in source_registered_roots]):
+        raise EvidencePackError(
+            "packed restore receipt path-lineage 未绑定 exact source/probe")
 
     completion_id = "resume/import-materializations/storage-restore.json"
     completion_item = items.get(completion_id)
-    if restore.get("continuation_mode") == "import_materialization_restore_required":
+    if restore.get("continuation_mode") in {
+            "import_materialization_restore_required",
+            "registered_asset_restore_required",
+    }:
         if completion_item is None or completion_item.get("kind") != "restore_receipt":
             raise EvidencePackError("resume import completion receipt 缺失")
         completion = _strict_json(
@@ -1314,11 +1332,77 @@ def _validate_resume_offline(
     return True
 
 
+def _packed_registered_path_roots(
+        value: Any, *, source_work_root: str) -> tuple[Path, ...]:
+    current = Path(source_work_root)
+    if value is None:
+        return (current,)
+    if (not isinstance(value, list) or not value or len(value) > 1024
+            or value[0] != source_work_root):
+        raise EvidencePackError("packed registered path-lineage 顶层身份非法")
+    roots: List[Path] = []
+    for raw in value:
+        if (not isinstance(raw, str) or not raw or "\x00" in raw
+                or len(raw.encode("utf-8", errors="ignore")) > 8192
+                or not Path(raw).is_absolute()
+                or str(Path(os.path.abspath(raw))) != raw):
+            raise EvidencePackError("packed registered path-lineage root 非 canonical")
+        root = Path(raw)
+        for prior in roots:
+            if (root == prior or root in prior.parents or prior in root.parents):
+                raise EvidencePackError(
+                    "packed registered path-lineage roots 重复/嵌套")
+        roots.append(root)
+    return tuple(roots)
+
+
+def _packed_registered_relative(
+        value: Any, *, roots: Sequence[Path]) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise EvidencePackError("packed source execution_log ref 非法")
+    current = roots[0]
+    ref = Path(value)
+    if not ref.is_absolute():
+        normalized = Path(os.path.abspath(os.fspath(current / ref)))
+        try:
+            relative = normalized.relative_to(current)
+        except ValueError as error:
+            raise EvidencePackError(
+                "packed source execution_log relative ref 越出 source") from error
+        if not relative.parts:
+            raise EvidencePackError(
+                "packed source execution_log ref 不得指向 source root")
+        return relative.as_posix()
+    normalized = Path(os.path.abspath(value))
+    if str(normalized) != value:
+        raise EvidencePackError(
+            "packed source execution_log absolute ref 非 canonical")
+    matches = []
+    for root in roots:
+        try:
+            relative = normalized.relative_to(root)
+        except ValueError:
+            continue
+        if not relative.parts:
+            raise EvidencePackError(
+                "packed source execution_log ref 不得指向 lineage root")
+        matches.append(relative)
+    if len(matches) != 1:
+        raise EvidencePackError(
+            "packed source execution_log ref 越出/歧义于 path-lineage")
+    return matches[0].as_posix()
+
+
 def _validate_log_mirrors_offline(
         pack: Path, items: Mapping[str, Mapping[str, Any]], *, source_cycle: int,
-        source_work_root: str, source_assets: Sequence[Mapping[str, Any]],
+        source_work_root: str, source_registered_roots: Sequence[Path],
+        source_assets: Sequence[Mapping[str, Any]],
         import_report: Mapping[str, Any],
         ) -> tuple[int, Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    if (not source_registered_roots
+            or source_registered_roots[0] != Path(source_work_root)):
+        raise EvidencePackError(
+            "packed registered path-lineage 未绑定 source_work_root")
     snapshot_item = items[f"source/storage/c{source_cycle}.sqlite"]
     fd = os.open(
         _object_path(pack, snapshot_item),
@@ -1346,16 +1430,8 @@ def _validate_log_mirrors_offline(
                     or isinstance(row[7], bool) or not isinstance(row[7], int)
                     or row[7] < 0):
                 raise EvidencePackError("packed source execution_log identity 非法")
-            ref_path = Path(row[5])
-            try:
-                normalized = Path(os.path.abspath(os.fspath(
-                    ref_path if ref_path.is_absolute()
-                    else Path(source_work_root) / ref_path)))
-                relative_path = normalized.relative_to(
-                    Path(source_work_root)).as_posix()
-            except ValueError as error:
-                raise EvidencePackError(
-                    "packed source execution_log ref 越出 source") from error
+            relative_path = _packed_registered_relative(
+                row[5], roots=source_registered_roots)
             registered[row[0]] = {
                 "id": row[0], "run_id": row[1], "evaluation_attempt_id": row[2],
                 "cycle_id": f"c{row[3]}", "log_kind": row[4], "ref": row[5],
@@ -2124,8 +2200,11 @@ def _verify_evidence_pack_anchored(
             pack / "READY.json", label="evidence READY",
             expected_hash=_hash(ready_raw), expected_bytes=len(ready_raw)),
     }
-    if set(manifest) != {
-            "version", "protocol", "source_work_root", "resume_probe", "items"}:
+    base_manifest_fields = {
+        "version", "protocol", "source_work_root", "resume_probe", "items"}
+    if set(manifest) not in (
+            base_manifest_fields,
+            base_manifest_fields | {"source_registered_path_roots"}):
         raise EvidencePackError("evidence manifest 顶层字段闭包漂移")
     source_work_root = manifest.get("source_work_root")
     if (manifest.get("version") != 1
@@ -2138,6 +2217,9 @@ def _verify_evidence_pack_anchored(
             or not os.path.isabs(source_work_root)
             or str(Path(os.path.abspath(source_work_root))) != source_work_root):
         raise EvidencePackError("evidence manifest 协议/source_work_root 非法")
+    source_registered_roots = _packed_registered_path_roots(
+        manifest.get("source_registered_path_roots"),
+        source_work_root=source_work_root)
 
     items = _item_map(manifest)
     _validate_item_domains(items)
@@ -2185,11 +2267,13 @@ def _verify_evidence_pack_anchored(
     resume_verified = _validate_resume_offline(
         pack, manifest.get("resume_probe"), items,
         source_cycle=source_cycle, source_work_root=source_work_root,
+        source_registered_roots=source_registered_roots,
         source_storage=source_storage)
     log_count, repository_roots, dependency_capabilities = (
         _validate_log_mirrors_offline(
         pack, items, source_cycle=source_cycle,
         source_work_root=source_work_root,
+        source_registered_roots=source_registered_roots,
         source_assets=source_storage["manifest"]["assets"],
         import_report=import_report))
     _validate_import_file_closure(

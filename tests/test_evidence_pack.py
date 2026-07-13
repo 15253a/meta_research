@@ -83,7 +83,8 @@ def _factory(values):
 
 def _source_and_restored(
         tmp_path: Path, *, advance: bool = True,
-        mutate_before_start: bool = False):
+        mutate_before_start: bool = False,
+        registered_restore: bool = False):
     source = tmp_path / "source"
     first = build_system(
         SYSTEM_ROOT, str(source), runner_factory=_factory([BOOT]), attack=False)
@@ -93,10 +94,19 @@ def _source_and_restored(
         assert first.close() is None
 
     target = tmp_path / "clean-target"
-    assert storage_main([
-        "--work-root", str(source),
-        "restore-with-import-materializations", "--target", str(target),
-    ]) == 0
+    if registered_restore:
+        assert storage_main([
+            "--work-root", str(source), "mirror-registered-assets",
+        ]) == 0
+        assert storage_main([
+            "--work-root", str(source),
+            "restore-with-registered-assets", "--target", str(target),
+        ]) == 0
+    else:
+        assert storage_main([
+            "--work-root", str(source),
+            "restore-with-import-materializations", "--target", str(target),
+        ]) == 0
     if mutate_before_start:
         changed = db.connect(target / "research.sqlite")
         changed.execute("UPDATE question SET text='restore 后带外篡改' WHERE id=1")
@@ -177,7 +187,9 @@ def test_pack_proves_exact_one_cycle_and_verifies_without_original_roots(tmp_pat
 
     manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
     assert set(manifest) == {
-        "version", "protocol", "source_work_root", "resume_probe", "items"}
+        "version", "protocol", "source_work_root", "source_registered_path_roots",
+        "resume_probe", "items"}
+    assert manifest["source_registered_path_roots"] == [str(source)]
     assert manifest["resume_probe"] == {
         "protocol": "meta-research-one-cycle-resume-probe/v1"}
     assert result["unresolved_registered_assets"] == 0
@@ -189,6 +201,38 @@ def test_pack_proves_exact_one_cycle_and_verifies_without_original_roots(tmp_pat
     again = verify_evidence_pack(pack)
     assert again["manifest_sha256"] == result["manifest_sha256"]
     assert again["one_cycle_resume_probe_verified"] is True
+
+
+def test_offline_manifest_rejects_nested_registered_path_roots(tmp_path):
+    source, _target, pack, _result = _pack(tmp_path)
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    manifest["source_registered_path_roots"] = [
+        str(source), str(source / "nested-history")]
+    rewritten = _rewrite_pack_manifest(pack, manifest)
+    with pytest.raises(EvidencePackError, match="path-lineage roots 重复/嵌套"):
+        verify_evidence_pack(rewritten)
+
+
+def test_registered_restore_target_can_supply_narrow_resume_probe(tmp_path):
+    source, target = _source_and_restored(
+        tmp_path, registered_restore=True)
+    output = tmp_path / "registered-resume-packs"
+    output.mkdir(mode=0o700)
+    result = create_evidence_pack(
+        source_work_root=source, resume_work_root=target,
+        output_parent=output)
+    assert result["one_cycle_resume_probe_verified"] is True
+    pack = Path(result["pack_path"])
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    logical_ids = {item["logical_id"] for item in manifest["items"]}
+    assert "resume/import-materializations/storage-restore.json" in logical_ids
+    assert "resume/registered-assets/storage-restore.json" not in logical_ids
+    restore_item = next(
+        item for item in manifest["items"]
+        if item["logical_id"] == "resume/restore.json")
+    restore = json.loads(
+        (pack / "objects" / "sha256" / restore_item["sha256"]).read_text())
+    assert restore["continuation_mode"] == "registered_asset_restore_required"
 
 
 def test_same_evidence_is_content_addressed_and_idempotent(tmp_path):
@@ -547,6 +591,22 @@ def test_resume_import_completion_is_bound_to_source_closure(tmp_path):
         verify_evidence_pack(rewritten)
 
 
+def test_resume_restore_lineage_must_equal_source_manifest_lineage(tmp_path):
+    source, _target, pack, _result = _pack(tmp_path)
+    manifest = json.loads((pack / "manifest.json").read_text(encoding="utf-8"))
+    logical_id = "resume/restore.json"
+    item = next(
+        value for value in manifest["items"] if value["logical_id"] == logical_id)
+    restore = json.loads(
+        (pack / "objects" / "sha256" / item["sha256"]).read_text())
+    restore["registered_path_roots"] = [
+        str(source), str(source / "nested-history")]
+    _replace_json_item(pack, manifest, logical_id, restore)
+    rewritten = _rewrite_pack_manifest(pack, manifest)
+    with pytest.raises(EvidencePackError, match="path-lineage|exact source"):
+        verify_evidence_pack(rewritten)
+
+
 def test_cli_verify_and_unsafe_exit_codes(tmp_path, capsys):
     source, target, pack, result = _pack(tmp_path)
     capsys.readouterr()  # discard the existing storage restore CLI receipt
@@ -684,6 +744,76 @@ def test_log_mirror_bytes_are_verified_offline_without_original_path(tmp_path):
     rewritten = _rewrite_pack_manifest(pack, manifest)
     with pytest.raises(EvidencePackError, match="id 重复/未登记"):
         verify_evidence_pack(rewritten)
+
+
+def test_log_mirror_offline_verifier_maps_restored_source_lineage(tmp_path):
+    source = tmp_path / "lineage-source"
+    source.mkdir(mode=0o700)
+    connection = db.connect(source / "research.sqlite")
+    connection.executescript("""
+    INSERT INTO goal(id,version,text,predicate_json) VALUES (1,1,'g','{}');
+    INSERT INTO cycle(id,goal_id,goal_ver,status,policy_version,route)
+      VALUES (1,1,1,'bundle','v0','attack');
+    INSERT INTO baseline(id,slug,canonical_key,status)
+      VALUES (1,'b','bk1','planned');
+    INSERT INTO variant(id,baseline_id,variant_key,config_json,status)
+      VALUES (1,1,'v1','{}','planned');
+    INSERT INTO build_target(id,cycle_id,target_kind,seq,status,variant_id)
+      VALUES (1,1,'build',1,'complete',1);
+    INSERT INTO run(id,cycle_id,variant_id,build_target_id,kind,status)
+      VALUES (1,1,1,1,'build','success');
+    """)
+    checkpoint_raw = b"lineage checkpoint\x00"
+    checkpoint = source / "artifacts" / "model.bin"
+    checkpoint.parent.mkdir(mode=0o700)
+    checkpoint.write_bytes(checkpoint_raw)
+    checkpoint_digest = hashlib.sha256(checkpoint_raw).hexdigest()
+    connection.execute(
+        "INSERT INTO checkpoint(id,variant_id,ckpt_key,path,content_hash,hash_alg,"
+        "artifact_type,origin,produced_by_run) "
+        "VALUES (1,1,'final',?,?,'sha256','checkpoint','run_produced',1)",
+        (str(checkpoint), checkpoint_digest))
+    log_raw = b"lineage log\x00\xff\n"
+    log = source / "registered-logs" / "train.log"
+    log.parent.mkdir(mode=0o700)
+    log.write_bytes(log_raw)
+    log_digest = hashlib.sha256(log_raw).hexdigest()
+    connection.execute(
+        "INSERT INTO execution_log(id,run_id,cycle_id,log_kind,ref,content_hash,bytes) "
+        "VALUES (1,1,1,'train',?,?,?)",
+        (str(log), log_digest, len(log_raw)))
+    connection.execute(
+        "UPDATE cycle SET status='done',route='attack',"
+        "finished_at='2026-07-12T00:00:00Z' WHERE id=1")
+    connection.commit()
+    publisher = CycleSnapshotPublisher(
+        db_path=source / "research.sqlite", work_root=source)
+    assert publisher.reconcile(startup=True) == ["c1"]
+    connection.close()
+
+    restored = tmp_path / "lineage-restored"
+    assert storage_main([
+        "--work-root", str(source), "mirror-registered-assets",
+    ]) == 0
+    assert storage_main([
+        "--work-root", str(source), "restore-with-registered-assets",
+        "--target", str(restored),
+    ]) == 0
+    restored_publisher = CycleSnapshotPublisher(
+        db_path=restored / "research.sqlite", work_root=restored)
+    assert restored_publisher.reconcile(startup=True) == ["c1"]
+    assert storage_main([
+        "--work-root", str(restored), "mirror-registered-assets",
+    ]) == 0
+
+    output = tmp_path / "lineage-packs"
+    output.mkdir(mode=0o700)
+    result = create_evidence_pack(
+        source_work_root=restored, output_parent=output)
+    pack = Path(result["pack_path"])
+    restored.rename(tmp_path / "lineage-restored-offline")
+    verified = verify_evidence_pack(pack)
+    assert verified["log_mirrors_verified"] == 1
 
 
 def test_storage_asset_inventory_is_cross_checked_against_packed_sqlite(tmp_path):
