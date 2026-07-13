@@ -6,6 +6,7 @@
 
 ---
 
+- [0087](0087-cp114c3d15-durable-runner-evidence.md) — CP11.4c.3d.1.5 binds production transcripts/heartbeats/query events to durable runner_call IDs across restart · commit `b208233` · 验证: related 179 + fresh-provider/fresh-runner/bound-query exact regressions；内部终审 APPROVE；全量留最终检查点
 - [0086](0086-cp114c3d14-plan-review-envelope-retry.md) — CP11.4c.3d.1.4 classifies malformed envelopes and retries only plan-review artifact_parse · commit `43c0b38` · 验证: Runner/Provider 81 + exact 7 + fresh c3 Docker/reviews/reasoning/Gate/storage/query；内部终审 APPROVE；全量留最终检查点
 - [0085](0085-cp114c3d13-exact-measurement-ref.md) — CP11.4c.3d.1.3 exact evidence_ref=mrN + provenance-only fake labeling · commit `c83e34f` · 验证: related 56 + real c3 reasoning/Gate a1 + same-snapshot Codex query；内部终审 APPROVE；全量留最终检查点
 - [0084](0084-cp114c3d12-real-plan-recovery.md) — CP11.4c.3d.1.2 locks synthetic protocol design, exact resource-request skeleton, and pre-bridge aggregated schema feedback · commit `ad6a303` · 验证: related 153 + real c3 plan/review/bundle/Docker run/double review；内外审 APPROVE；全量留最终检查点

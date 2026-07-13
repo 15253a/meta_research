@@ -1,18 +1,17 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
 - 更新：2026-07-13 ｜ 位置：步⑪ CP11.4c.3d.2 目标生产环境 / 最终验收
-- 检查点状态：代码级基本可用；CP11.4c.3d.1.4 功能 `43c0b38` 已提交，等待外部基础设施
+- 检查点状态：代码级基本可用；CP11.4c.3d.1.5 功能 `b208233` 已提交，等待外部基础设施
 
 ## 上一检查点结果
 
-- 全新三轮 smoke 在 c3 plan review 遇真实 Codex envelope `Extra data`；Runner 过去把 parse 失败统称
-  `runner_error`，PlanReview 又对全部 RunnerError 直接 fail-loud，导致可修的格式错误炸穿整次入口。
-- 现在无 fenced JSON、JSON decode 失败、顶层/files 形状非法统一标 `artifact_parse`；PlanReview 先完整记录
-  本次失败成本/heartbeat，再仅对此类走 policy 的有界重试。transport/timeout/runtime 等仍不重试。
-- 从同一 c3 持久 plan checkpoint 恢复后，plan review PASS，bundle、CPU Docker build/run、code/result review、
-  reasoning 与 Gate 全完成；q2 answered，evidence 精确指向 `mr1/mr2`，storage verify 深验 c1-c3 全通过。
-- 同一成功 c3 snapshot 的 console query 经真实 Codex rc11 success 并返回 grounded reply；相关 Runner/Provider
-  **81 passed**、精确 7 passed。内部终审 APPROVE；依用户要求未跑仓库全量。
+- 复核真实 c3 恢复证据时发现：Stage/PlanReview/Judge 过去以实例内 `_call_seq` 命名 transcript/heartbeat；
+  checkpoint 重启后计数归零，新 `runner_call` 会复用路径，而 Runner 又会主动删除同名 out/events、覆写 prompt。
+- 现在生产调用先持久取得 `runner_call_id`，再以 `rc<ID>` 命名 heartbeat 和 Codex prompt/output/events；
+  created→running 与 heartbeat 路径绑定仍在同一 DB 事务完成，成本、execution/provider receipt 语义未变。
+- 同步修复 query responder 原先硬编码的 `...-1.events.jsonl`，bound query 现在返回真实存在的
+  `...-rc<ID>.events.jsonl`。两个全新 Provider/Runner 实例的旧、新证据均保留。
+- cost/stage/runner/query/reconcile 相关 **179 passed**，内部终审 APPROVE；依用户要求未跑仓库全量。
 
 ## 当前可用边界
 
@@ -25,6 +24,8 @@
   canary 协议、fixed-linear fault runner 与 evidence pack 可组合使用。
 - evidence v1 证明包内 bytes 闭包和一轮续跑，不是 restore engine，不声称完整 work-root DR、
   来源签名、真 Codex/GPU/two-node 或 qualification 已验收。
+- clean-node restore 仍是 `sqlite_truth_only`：历史宿主 transcript 不随 SQLite restore 复制；本检查点只保证
+  原 work-root 内跨 checkpoint 不覆盖，不能把它外推成完整 transcript DR。
 - 当前节点仍只有单机且无 NVIDIA container runtime；目标 GPFS 两节点正向、真实 ≥200 轮、
   T1/T2、故障注入组合验收和最终全量均未执行。
 

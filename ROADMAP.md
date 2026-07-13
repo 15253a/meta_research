@@ -38,8 +38,9 @@
   CP11.4c.3c.3 canonical evidence packer/offline verifier 及 exact-one-cycle restore/resume proof 已落
   `6c05666`，CP11.4c.3c 工具闭合。CP11.4c.3d.1 已以 `423dd78` 修通 production non-root service
   的 tool-free query/adapter 工人，同时保留 root 开发跨 UID 与严格能力边界；d.1.1 以 `6aec828`
-  修复白名单 PATH 对默认 Codex launcher 的 Node 解析回归，真实 reasoning/query smoke 已通过。下一检查点进入
-  CP11.4c.3d.2 目标运行。当前节点无 NVIDIA container runtime，尚未完成
+  修复白名单 PATH 对默认 Codex launcher 的 Node 解析回归；d.1.2–d.1.4 已闭合真实 plan、精确测量引用与
+  malformed review 恢复，d.1.5 以 `b208233` 将 transcript/heartbeat 文件身份绑定 durable runner_call，
+  跨 checkpoint 不再覆盖旧调用证据。下一检查点进入 CP11.4c.3d.2 目标运行。当前节点无 NVIDIA container runtime，尚未完成
   两节点正向、GPU、真实 ≥200 轮或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
@@ -580,5 +581,10 @@
             仍 fail-loud。→ commit `43c0b38`（build_log 0086；Runner/Provider 81 + exact 7；同一新鲜 c3
             checkpoint 恢复后完成 plan-review/bundle/Docker run/双 review/reasoning/Gate，q2 answered，
             storage c1-c3 与同 snapshot Codex query 通过；内部终审 APPROVE；全量留最终检查点）。
+          - [x] CP11.4c.3d.1.5 durable runner-call evidence identity：生产 Stage/PlanReview/Judge 的 heartbeat
+            与 CodexRunner prompt/output/events 统一以数据库 `runner_call_id` 命名；checkpoint 重启后即使实例内
+            计数归零，也不会覆盖旧调用证据。query responder 同步返回真实存在的 rc events 路径。
+            → commit `b208233`（build_log 0087；相关 179；跨新实例 rc transcript/heartbeat 与 bound query
+            精确回归；内部终审 APPROVE；全量留最终检查点）。
           - [ ] CP11.4c.3d.2 dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector
             就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。
