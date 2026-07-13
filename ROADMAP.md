@@ -565,5 +565,12 @@
             exact PATH 进入 runtime contract，tool policy 升 v6。→ commit `6aec828`（build_log 0083；
             Runner/Query 71 + exact 3 + 真实 default query Codex success/9347 tokens；内部与外审 APPROVE；
             全量留最终检查点）。
+          - [x] CP11.4c.3d.1.2 real plan recovery：plan 对自建 synthetic protocol 的精确参数承担
+            本阶段设计/锁定责任，不把可自行决定的 seeds/sample/distribution 冒充外部资料缺口；确需用户文件时
+            `resource_request` 必须使用内联的 exact schema skeleton；StageProvider 在调用 bridge 前聚合 schema
+            错误并有界反馈。→ commit `ad6a303`（build_log 0084；相关 153；真实 c3 从原 checkpoint 一次越过
+            plan/review/bundle/Docker run/双 review；内部与外审 APPROVE；全量留最终检查点）。
+          - [ ] CP11.4c.3d.1.3 exact measurement reference：compiler 给 reasoning 的指标锚必须清楚区分合法
+            `metric_result_id=mrN` 与 metric/version 展示信息，且 reasoning 不再把真实 bundle 执行误称 M0 fake。
           - [ ] CP11.4c.3d.2 dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector
             就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。
