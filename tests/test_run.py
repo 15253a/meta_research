@@ -383,6 +383,57 @@ def test_main_ctrl_c_exits_cleanly(tmp_path, monkeypatch, capsys):
     assert "Ctrl-C" in capsys.readouterr().out
 
 
+def test_main_exit_after_research_disables_terminal_linger(tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    class FiniteSystem:
+        dual_mode = "A"
+        last_stop_reason = None
+
+        class advancer:
+            last_block_reason = None
+
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+
+        def run_forever(self, max_cycles, *, poll_interval_s, linger_after_terminal=True):
+            self.calls.append((max_cycles, poll_interval_s, linger_after_terminal))
+            return ["c1"]
+
+        def close(self):
+            self.closed = True
+            return None
+
+    system = FiniteSystem()
+    monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: system)
+    rc = R.main([
+        "--system-root", SYSTEM_ROOT,
+        "--work-root", str(tmp_path),
+        "--max-cycles", "200",
+        "--poll-interval-s", "0.25",
+        "--exit-after-research",
+        "--no-outbound",
+    ])
+    assert rc == 0
+    assert system.calls == [(200, 0.25, False)]
+    assert system.closed is True
+    assert "推进 1 轮" in capsys.readouterr().out
+
+
+def test_main_rejects_once_with_exit_after_research(tmp_path, capsys):
+    import orchestrator.run as R
+
+    with pytest.raises(SystemExit) as caught:
+        R.main([
+            "--system-root", SYSTEM_ROOT,
+            "--work-root", str(tmp_path),
+            "--once", "--exit-after-research", "--no-outbound",
+        ])
+    assert caught.value.code == 2
+    assert "not allowed with argument --once" in capsys.readouterr().err
+
+
 def test_second_ctrl_c_during_run_forever_drain_is_hard_stop(tmp_path):
     class InterruptAdvancer:
         last_stop_reason = None

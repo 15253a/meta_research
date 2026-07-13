@@ -11,6 +11,8 @@ receipt 证明本机子树与 daemon container 均排空（适用条件与残余
 > T1/T2 sealed-holdout/one-shot 使用独立的 [qualification runbook](QUALIFICATION.md)；T1 已机械闭合
 > A→B→一次性 C（exact sandbox promotion）→root audit/immutable verdict ledger→D 准入链，但科学审核与
 > 真实生产环境的人类终验仍须独立完成，不能由机器回执代签。
+> 目标环境的完整串联、原始证据命名及 `fixed_and_test` 交接见
+> [production acceptance runbook](PRODUCTION_ACCEPTANCE.md)；该 runbook 不是通过证明。
 
 ## 0. 一分钟跑起来
 

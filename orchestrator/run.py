@@ -1608,8 +1608,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--system-root", required=True, help="仓库根（含 input/policies/prompts/schemas）")
     ap.add_argument("--work-root", required=True, help="运行产物根（research.sqlite 落此，重启同目录即续跑）")
     ap.add_argument("--max-cycles", type=int, default=100, help="本次最多推进轮数（安全上限，与 τ 自终止并存）")
-    ap.add_argument("--once", action="store_true",
-                    help="一次性模式：遇 pause/文件请求即返回；默认保持 run 单写进程常驻等待并自动续跑")
+    lifetime = ap.add_mutually_exclusive_group()
+    lifetime.add_argument(
+        "--once", action="store_true",
+        help="一次性模式：遇 pause/文件请求即返回；默认保持 run 单写进程常驻等待并自动续跑")
+    lifetime.add_argument(
+        "--exit-after-research", action="store_true",
+        help=("有界常驻模式：pause/文件请求期间继续等待；研究 terminate 或达到 max-cycles 后，"
+              "排空已接纳交互并正常退出"))
     ap.add_argument("--poll-interval-s", type=float, default=1.0,
                     help="常驻等待时 ingest spool / 扫描 reminder 的轮询秒数（默认 1.0）")
     outbound = ap.add_mutually_exclusive_group()
@@ -1651,6 +1657,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             if args.once:
                 ids = system.run(args.max_cycles)
+            elif args.exit_after_research:
+                ids = system.run_forever(
+                    args.max_cycles,
+                    poll_interval_s=args.poll_interval_s,
+                    linger_after_terminal=False,
+                )
             else:
                 ids = system.run_forever(args.max_cycles, poll_interval_s=args.poll_interval_s)
         except KeyboardInterrupt:
