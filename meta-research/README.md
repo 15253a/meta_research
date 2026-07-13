@@ -288,6 +288,67 @@ fsync。进程在任一窗口退出时，普通启动仍会拒绝 target，同�
 不删除源/孤儿，也不恢复 execution-log 正本、checkpoint、content store、views Git 或完整 work-root；日志冷副本仍由
 上节 mirror 命令独立核验。因此本项闭合的是 import CAS 灾备，不外推为 CP11.4c.3 的两节点/≥200 轮生产验收。
 
+#### Canonical evidence pack 与单轮续跑探针（CP11.4c.3c.3）
+
+证据包是现有运维原语之上的**只读汇总层**，不是第二套 restore/launcher。恢复仍只走上一节的
+`restore-with-import-materializations`，研究仍只走既有 `orchestrator.run`。推荐对最新 high-water 做下面的
+完整顺序；旧 cycle 不能和“最新日志镜像”形成同一个精确闭包，因此 v1 不提供历史 cycle 选择器：
+
+```bash
+# 1. 停止 source owner；先创建并验证冷日志镜像。
+python -m orchestrator.storage_ops --work-root "$SOURCE" mirror-logs
+
+# 2. target 的父目录须存在，target 自身须不存在。
+python -m orchestrator.storage_ops --work-root "$SOURCE" \
+  restore-with-import-materializations --target "$TARGET"
+
+# 3. 用唯一的现有入口精确尝试一轮。生产验收不要使用 --no-outbound。
+python -m orchestrator.run --system-root "$SYSTEM_ROOT" --work-root "$TARGET" \
+  --max-cycles 1 --once
+
+# 4. source/target owner 都停止后打包；output-parent 必须在二者之外。
+python -m orchestrator.evidence_pack pack \
+  --source-work-root "$SOURCE" --resume-work-root "$TARGET" \
+  --output-parent "$EVIDENCE_DIR"
+
+# 5. 可在 source/target 都不可用的环境中只读复验。
+python -m orchestrator.evidence_pack verify \
+  --pack "$EVIDENCE_DIR/<manifest-sha256>.evidence"
+```
+
+包是未压缩的 owner-only 内容寻址目录：`manifest.json + READY.json + objects/sha256/<digest>`。manifest
+严格列举每个 object，目录名等于 canonical manifest SHA256；verifier 拒绝缺失/多余对象、未知根条目、
+symlink/hardlink、权限/owner/bytes/hash 漂移，并以流式 hash 和显式文件/总字节硬上限处理大对象，不把整份
+SQLite/image archive 读入内存。SQLite backup 仍走既有 quick/FK/schema/terminal 深验；日志镜像在包内直接做
+有界单-member gzip→登记 raw hash/bytes 复验，不会回开 receipt 中的 source 绝对路径。reachable repository
+CAS 和 dependency CAS 中由 receipt 绑定的恢复语义文件闭包与原 verifier report 一并冻结；其 provider
+语义是 pack 时已由现有 inspector 验证，离线包不联网、不调 Docker。builder 的 install/build/save
+诊断日志、process pointer 和动态 sandbox metadata 没有被 dependency receipt 内容绑定，因此不冒充恢复闭包、
+不进入 evidence pack。离线 verifier 会把 asset inventory、repository root/target、repository ledger 投影/
+count/bytes 与包内 SQLite 精确对账，并由 DB-bound execution-image capability 加 dependency receipt/
+installed manifest 重建其精确语义文件集合；这验证冻结 bytes 的闭包，但不重复 provider 的联网/
+运行时语义检查。目录 hash 是内容身份而非来源签名，生产
+留证时须把 `<manifest-sha256>` 另存到变更单/不可变审计系统。
+
+`one_cycle_resume_probe_verified=true` 不是根据 exit code 推断。packer 要求 `restore.json` 精确绑定 source 最新
+cycle/manifest/backup，target 无 marker/parent claim，target snapshot chain 从 source cycle 建立
+`adoption_baseline`，并且**恰好**新增一个 `status=done AND route IS NOT NULL` 的研究 cycle 及其深验 snapshot。
+该轮还须至少有一条 `status=success` 的研究阶段 `runner_call` 及同 cycle 的关联 ledger；restore 后 0 轮、
+failed/aborted、pause/file-request/global-stop 都不会通过。此结论与 fault final 分开；packer
+永不把 fault receipt 原有的 `signal_exactly_once=false` / `recovery_verified=false` 改成 true。
+
+v1 始终明示 `real_codex_resume_verified=false`、`qualification_receipts_verified=false` 和
+`full_restore_verified=false`。仓库回归用注入式确定性 worker 证明的是原状态机/恢复组合，不冒充真实 Codex、
+connector 交付或生产部署。若 source 带 qualification contract，普通 resume probe 会 fail closed：现有 restore
+不会带回 firewall，而 final-consumed contract 即使安全带回也应禁止继续研究。无 resume 时可把 qualification
+内部 receipt 作为 `receipt_only` 冻结，但不声称 sealed truth/source/runtime/GPU 闭包完成。
+
+同理，registered checkpoint、执行日志正本、用户上传资产与绝对 path relocation 仍列入
+`unresolved_registered_assets`；日志 gzip 是冷审计副本，没有 hydration API。故一次成功续跑只证明所选下一轮在
+该恢复切面上可推进，不等于完整 work-root/跨站 DR。source 下已完成的 fixed-linear fault schedule 会自动进入包；
+可选的 shared-fs canary 用 `--canary-root/--canary-run-id` 同时指定，local receipt 仍保持
+`two_node_verified=false`，任何 canary 都保持 `infrastructure_fence_verified=false`。
+
 ### 4.1 人类控制台（web 查看 + 交互，步⑨）
 
 系统跑起来后，另起一个**独立只读进程**在浏览器里看实时状态、下指令。**单写纪律**：控制台进程 `mode=ro` 读库、
