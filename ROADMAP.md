@@ -44,7 +44,9 @@
   的 tool-free query/adapter 工人，同时保留 root 开发跨 UID 与严格能力边界；d.1.1 以 `6aec828`
   修复白名单 PATH 对默认 Codex launcher 的 Node 解析回归；d.1.2–d.1.4 已闭合真实 plan、精确测量引用与
   malformed review 恢复，d.1.5 以 `b208233` 将 transcript/heartbeat 文件身份绑定 durable runner_call，
-  跨 checkpoint 不再覆盖旧调用证据。下一检查点进入 CP11.4c.3d.2 目标运行。当前节点无 NVIDIA container runtime，尚未完成
+  跨 checkpoint 不再覆盖旧调用证据。d.2a 以 `acb0684` 增加有界常驻退出模式，并将目标 preflight、两节点
+  canary、真实 connector、≥200 轮/fault、restore、T1/T2 与 `fixed_and_test` 证据交接串成单一 fail-closed
+  runbook。下一动作仍是 CP11.4c.3d.2 目标设施真实执行；当前节点无 NVIDIA container runtime，尚未完成
   两节点正向、GPU、真实 ≥200 轮或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
@@ -612,3 +614,8 @@
           - [ ] CP11.4c.3d.2 目标环境真实验收：dedicated VM/private cgroup+NVIDIA Docker、GPFS
             quota/second node/connector 就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，
             再勾 CP11.4c。
+            - [x] CP11.4c.3d.2a 目标运行与出口证据交接：新增 `--exit-after-research` 有界常驻模式；
+              冻结 production preflight/two-node canary/connector/≥200 轮与 fault/restore/T1/T2 的执行顺序，
+              以 per-run no-clobber + 双 SHA manifest 向 `fixed_and_test` 交付机器矩阵和可披露原始证据，
+              敏感原件与用户裁决保持分离。→ commit `acb0684`（build_log 0091；run **61**；唯一有效全量
+              **1843 passed, 1 skipped**；两轮外审的终态 linger、owner-kill restart 与 symlink 泄露等反馈全修）。
