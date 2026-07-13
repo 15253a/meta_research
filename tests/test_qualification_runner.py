@@ -12,6 +12,7 @@ import yaml
 
 from orchestrator import qualification_runner as QR
 from orchestrator.qualification_firewall import (
+    CLAIM_BOUNDARY_PROTOCOL,
     CLAIM_PROTOCOL,
     CONTRACT_PROTOCOL,
     QualificationFinalizedError,
@@ -38,6 +39,46 @@ def _canonical(value):
 
 def _sha(raw):
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _publish_fixture_claim(work: Path, claim, source: Path):
+    firewall = load_qualification_firewall(work)
+    _ledger, source_hash = QR.freeze_source_tree(source)
+    explores = sorted(
+        (mount for mount in firewall.mounts if mount.role == "explore"),
+        key=lambda mount: (mount.dataset.casefold(), mount.dataset),
+    )
+    command = None
+    if firewall.task == "T1":
+        command = {
+            "argv": [
+                "python", "{src}/confirm.py",
+                *[token for mount in explores
+                  for token in ("--data", str(mount.path))],
+            ],
+            "output": "confirmatory.json",
+            "gpu_required": firewall.final["gpu_required"],
+        }
+    boundary = {
+        "version": 1,
+        "protocol": CLAIM_BOUNDARY_PROTOCOL,
+        "task": firewall.task,
+        "contract_sha256": firewall.contract_sha256,
+        "claim_sha256": _sha(_canonical(claim)),
+        "source_tree_sha256": source_hash,
+        "a_high_water": {
+            "cycle_id": "c1",
+            "storage_manifest_sha256": "sha256:" + "b" * 64,
+        },
+        "explore_views": [
+            {"dataset": mount.dataset,
+             "tree_sha256": _sha(mount.dataset.encode("utf-8"))}
+            for mount in explores
+        ],
+        "confirmatory_command": command,
+    }
+    _publish_once(firewall.claim_boundary_path, _canonical(boundary))
+    publish_claim_lock(work, claim)
 
 
 def _view(path):
@@ -119,6 +160,10 @@ def _setup(tmp_path, *, truth_threshold=3.0, gpu_required=False):
     }
     work = tmp_path / "work"
     install_contract(work, contract)
+    source = tmp_path / "source"
+    source.mkdir(mode=0o755)
+    (source / "predict.py").write_text("# frozen predictor\n", encoding="utf-8")
+    (source / "predict.py").chmod(0o444)
     claim = {
         "version": 1, "protocol": CLAIM_PROTOCOL, "task": "T1",
         "claims": [{"id": "c1"}], "feature_operator": {"name": "f"},
@@ -147,11 +192,7 @@ def _setup(tmp_path, *, truth_threshold=3.0, gpu_required=False):
             "output": "predictions.json", "gpu_required": gpu_required,
         },
     }
-    publish_claim_lock(work, claim)
-    source = tmp_path / "source"
-    source.mkdir(mode=0o755)
-    (source / "predict.py").write_text("# frozen predictor\n", encoding="utf-8")
-    (source / "predict.py").chmod(0o444)
+    _publish_fixture_claim(work, claim, source)
     policy = json.loads(json.dumps(BASE_POLICY))
     paths = [item["path"] for item in mounts]
     policy["execution"]["path_allowlist"] = paths
@@ -252,7 +293,11 @@ def _setup_t2(tmp_path):
     }
     work = tmp_path / "work"
     install_contract(work, contract)
-    publish_claim_lock(work, {
+    source = tmp_path / "source"
+    source.mkdir(mode=0o755)
+    (source / "predict.py").write_text("# frozen T2 predictor\n", encoding="utf-8")
+    (source / "predict.py").chmod(0o444)
+    claim = {
         "version": 1, "protocol": CLAIM_PROTOCOL, "task": "T2",
         "claims": [{"id": "c1", "text": "frozen T2 claim"}],
         "feature_operator": {"name": "frozen"},
@@ -283,11 +328,8 @@ def _setup_t2(tmp_path):
             ],
             "output": "predictions.json", "gpu_required": False,
         },
-    })
-    source = tmp_path / "source"
-    source.mkdir(mode=0o755)
-    (source / "predict.py").write_text("# frozen T2 predictor\n", encoding="utf-8")
-    (source / "predict.py").chmod(0o444)
+    }
+    _publish_fixture_claim(work, claim, source)
     policy = json.loads(json.dumps(BASE_POLICY))
     paths = [item["path"] for item in mounts]
     policy["execution"]["path_allowlist"] = paths
@@ -406,6 +448,9 @@ def test_gpu_final_uses_full_authority_validator_and_owner_bound_candidate(
     assert len(validations) == 2
     firewall = load_qualification_firewall(work)
     marker = firewall.read_final_marker()
+    _boundary, boundary_raw = firewall.read_claim_boundary()
+    assert marker["version"] == 2
+    assert marker["claim_boundary_sha256"] == _sha(boundary_raw)
     assert marker["gpu_canary_sha256"] is not None
     evidence = validations[0][0]
     assert evidence["candidate_hash"] == QR._gpu_canary_candidate_hash(
@@ -526,6 +571,18 @@ def test_freeze_source_rejects_git_symlink_and_mutable_group_file(tmp_path):
         QR.freeze_source_tree(source)
 
 
+def test_final_rejects_missing_boundary_before_sandbox(tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(tmp_path)
+    firewall = load_qualification_firewall(work)
+    firewall.claim_boundary_path.unlink()
+    monkeypatch.setattr(
+        QR, "DockerExecutionSandbox",
+        lambda **_kwargs: pytest.fail("sandbox constructed before boundary validation"))
+
+    with pytest.raises(QR.QualificationFirewallError, match="claim boundary"):
+        QR.run_final(system_root=system, work_root=work, source_root=source)
+
+
 def test_spent_before_spawn_is_counted_failed_and_never_reexecuted(tmp_path, monkeypatch):
     system, work, source, _holdout = _setup(tmp_path)
     firewall = load_qualification_firewall(work)
@@ -578,6 +635,29 @@ def test_score_validation_failure_is_terminal_and_replay_safe(tmp_path, monkeypa
     assert first["status"] == "failed" and first["metrics"] is None
     assert "label_rule" in first["evaluation_error"]
     assert QR.score_final(work_root=work) == first
+
+
+def test_score_rejects_missing_boundary_before_reading_sealed_truth(
+        tmp_path, monkeypatch):
+    system, work, source, _holdout = _setup(tmp_path)
+
+    monkeypatch.setattr(QR, "DockerExecutionSandbox", _FakeSandbox)
+    monkeypatch.setattr(QR.H, "run_staged", _fake_successful_predictor)
+    QR.run_final(system_root=system, work_root=work, source_root=source)
+    firewall = load_qualification_firewall(work)
+    boundary, _boundary_raw = firewall.read_claim_boundary()
+    firewall.claim_boundary_path.unlink()
+    monkeypatch.setattr(
+        QR, "read_artifact_bytes",
+        lambda *_args, **_kwargs: pytest.fail("sealed truth read before boundary validation"))
+
+    with pytest.raises(QR.QualificationFirewallError, match="claim boundary"):
+        QR.score_final(work_root=work)
+
+    boundary["a_high_water"]["storage_manifest_sha256"] = "sha256:" + "d" * 64
+    _publish_once(firewall.claim_boundary_path, _canonical(boundary))
+    with pytest.raises(QR.QualificationRunnerError, match="claim boundary"):
+        QR.score_final(work_root=work)
 
 
 def test_t2_final_runs_exactly_45_single_fold_units_and_does_not_retry_failure(

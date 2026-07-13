@@ -515,6 +515,11 @@ def run_final(
         claim, claim_raw = firewall.read_claim_lock()
         claim_hash = _hash_bytes(claim_raw)
         ledger, source_hash = freeze_source_tree(source_root)
+        boundary, _boundary_raw = firewall.read_claim_boundary()
+        if (boundary["claim_sha256"] != claim_hash
+                or boundary["source_tree_sha256"] != source_hash):
+            raise QualificationRunnerError(
+                "final claim/source 与 claim boundary 冻结输入不一致")
         gpu_contract = _load_gpu_contract(gpu_contract_path)
         gpu_required = claim["final_command"]["gpu_required"]
         if gpu_required is not (gpu_contract is not None):
@@ -910,6 +915,12 @@ def score_final(*, work_root: Path | str) -> Dict[str, Any]:
         claim_hash = _hash_bytes(claim_raw)
         if marker["claim_sha256"] != claim_hash:
             raise QualificationRunnerError("final marker 与当前 claim-lock hash 错配")
+        boundary, boundary_raw = firewall.read_claim_boundary()
+        if (boundary["claim_sha256"] != claim_hash
+                or boundary["source_tree_sha256"] != marker["source_tree_sha256"]
+                or _hash_bytes(boundary_raw) != marker["claim_boundary_sha256"]):
+            raise QualificationRunnerError(
+                "final marker/claim 与 claim boundary 冻结输入不一致")
         batch_path = work / "state" / "qualification" / "final" / "batch.json"
         batch = _load_canonical(
             batch_path, label="qualification final batch", max_bytes=2 * 1024 * 1024)
