@@ -176,6 +176,10 @@ class _GuardedRunner:
             return bind(**kwargs)
         return None
 
+    @property
+    def tool_free_contract(self):  # noqa: ANN201 - optional runner capability
+        return getattr(self.inner, "tool_free_contract", None)
+
 
 class _AssemblyCleanup:
     """Retryable owner capability for a constructor that failed mid-assembly."""

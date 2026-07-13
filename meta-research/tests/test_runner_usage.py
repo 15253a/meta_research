@@ -83,9 +83,11 @@ def _fake_run_factory(stderr: bytes, rc: int = 0):
 class _FakeExecutionSupervisor:
     def __init__(self, fn):
         self.fn = fn
+        self.last_kwargs = None
 
     def run(self, cmd, *, stdin=None, capture_output=False, timeout_s=None,
             cwd=None, **_kwargs):
+        self.last_kwargs = dict(_kwargs)
         return self.fn(
             cmd, stdin=stdin, capture_output=capture_output,
             timeout=timeout_s, cwd=cwd)
@@ -166,6 +168,8 @@ def test_bound_runner_publishes_provider_receipt_before_return(tmp_path):
 
 def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch):
     """interaction_query 的“只读”是能力边界：命令行必须关 shell/浏览器/apps/再委派，不只靠 prompt。"""
+    monkeypatch.setenv("METARESEARCH_GITHUB_TOKEN", "must-not-reach-worker")
+    monkeypatch.setenv("METARESEARCH_QQ_TOKEN", "must-not-reach-worker")
     captured = {}
 
     def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
@@ -185,6 +189,12 @@ def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch
         system_prompt="s", skill="k", context_pack=_pack())
     cmd = captured["cmd"]
     assert cmd[:2] == ["/usr/bin/sudo", "-n"] and "-u" in cmd
+    env_index = cmd.index("env")
+    assert cmd[env_index + 1] == "-i"
+    inherited_names = {part.split("=", 1)[0] for part in cmd[env_index + 2:]
+                       if "=" in part}
+    assert "METARESEARCH_GITHUB_TOKEN" not in inherited_names
+    assert "METARESEARCH_QQ_TOKEN" not in inherited_names
     runtime_cwd = Path(cmd[cmd.index("-C") + 1])
     assert runtime_cwd != tmp_path and not runtime_cwd.exists()  # ephemeral isolated cwd was removed
     assert captured["cwd"] == runtime_cwd
@@ -196,6 +206,88 @@ def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch
             "image_generation", "multi_agent"} <= disabled
     events = list(tmp_path.glob("*.events.jsonl"))
     assert len(events) == 1 and (events[0].stat().st_mode & 0o777) == 0o600
+
+
+def test_tool_free_runner_supports_non_root_production_service(
+        tmp_path, monkeypatch):
+    """Production service is deliberately non-root and cannot sudo to another UID."""
+    service = pwd.getpwnam("nobody")
+    monkeypatch.delenv("METARESEARCH_QUERY_RUN_AS_USER", raising=False)
+    monkeypatch.setattr(R.os, "geteuid", lambda: service.pw_uid)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(mode=0o700)
+    (codex_home / "auth.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("METARESEARCH_GITHUB_TOKEN", "must-not-reach-worker")
+    monkeypatch.setenv("METARESEARCH_QQ_TOKEN", "must-not-reach-worker")
+    captured = {}
+
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        out = Path(cmd[cmd.index("-o") + 1])
+        out.write_text(
+            '```json\n{"files":{"idea_set.json":{}},"md":""}\n```',
+            encoding="utf-8")
+        os.chown(out, service.pw_uid, service.pw_gid)
+        trace = (b'{"type":"thread.started","thread_id":"t"}\n'
+                 b'{"type":"turn.started"}\n'
+                 b'{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n'
+                 b'{"type":"turn.completed","usage":{}}\n')
+        return types.SimpleNamespace(
+            returncode=0, stdout=trace, stderr=b"tokens used\n1\n")
+
+    runner = _fake_runner(tmp_path, fake_run, tool_free=True)
+    assert runner.tool_free_isolation == "service-uid"
+    runner.run_task(system_prompt="s", skill="k", context_pack=_pack())
+    cmd = captured["cmd"]
+    assert cmd[0] != "/usr/bin/sudo"
+    assert cmd[0] == os.environ.get(
+        "METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex")
+    runtime_cwd = Path(cmd[cmd.index("-C") + 1])
+    assert captured["cwd"] == runtime_cwd and not runtime_cwd.exists()
+    assert "--strict-config" in cmd and "--ignore-rules" in cmd
+    process_env = runner.execution_supervisor.last_kwargs["env"]
+    allowed_optional = {
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy",
+        "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    }
+    assert set(process_env) == {
+        "PATH", "LANG", "LC_ALL", "CODEX_HOME", "HOME", "TMPDIR",
+    } | (allowed_optional & set(os.environ))
+    assert process_env["CODEX_HOME"] == str(codex_home)
+    assert "METARESEARCH_GITHUB_TOKEN" not in process_env
+    assert "METARESEARCH_QQ_TOKEN" not in process_env
+
+
+def test_non_root_tool_free_runner_rejects_cross_uid_request(tmp_path, monkeypatch):
+    service = pwd.getpwnam("nobody")
+    monkeypatch.setattr(R.os, "geteuid", lambda: service.pw_uid)
+    monkeypatch.setenv("METARESEARCH_QUERY_RUN_AS_USER", "codexro")
+    with pytest.raises(ValueError, match="non-root production service"):
+        CodexRunner(transcripts_dir=tmp_path, tool_free=True)
+
+
+def test_root_tool_free_runner_never_falls_back_to_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(R.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("METARESEARCH_QUERY_RUN_AS_USER", "root")
+    with pytest.raises(ValueError, match="必须与 writer UID 不同"):
+        CodexRunner(transcripts_dir=tmp_path, tool_free=True)
+
+
+def test_root_tool_free_runner_requires_separate_account(tmp_path, monkeypatch):
+    original = R.pwd.getpwnam
+
+    def without_codexro(name):
+        if name == "codexro":
+            raise KeyError(name)
+        return original(name)
+
+    monkeypatch.setattr(R.os, "geteuid", lambda: 0)
+    monkeypatch.delenv("METARESEARCH_QUERY_RUN_AS_USER", raising=False)
+    monkeypatch.setattr(R.pwd, "getpwnam", without_codexro)
+    with pytest.raises(ValueError, match="不同 UID"):
+        CodexRunner(transcripts_dir=tmp_path, tool_free=True)
 
 
 def test_qualification_no_host_tools_needs_no_sudo_and_keeps_trace_gate(tmp_path):

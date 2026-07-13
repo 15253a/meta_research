@@ -30,7 +30,7 @@ import stat
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import quote
 
 from .console import sanitize
@@ -41,7 +41,7 @@ from .resource_limits import (MAX_INFLIGHT_QUERY_CALLS, MAX_QUEUED_QUERY_CALLS,
                               MAX_QUERY_CONTEXT_CHARS,
                               MAX_QUERY_CURRENT_CHARS, MAX_QUERY_HISTORY_FIELD_CHARS,
                               MAX_QUERY_HISTORY_TURNS, MAX_QUERY_STATUS_CARD_BYTES)
-from .runner import RunnerError, TOOL_FREE_POLICY_VERSION
+from .runner import RunnerError, tool_free_runtime_contract
 from .provider_invocation import (RUNNER_RECONCILE_PROTOCOL,
                                   load_provider_invocation_receipt,
                                   provider_receipt_path, recovery_terminal)
@@ -252,13 +252,14 @@ class CodexQueryResponder:
             validator.schema, ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), allow_nan=False)
         self.schema_contract = schema_contract
-        runtime_contract = json.dumps({
-            "tool_policy": TOOL_FREE_POLICY_VERSION,
+        self.runtime_contract = {
+            **tool_free_runtime_contract(),
             "bin": os.environ.get("METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex"),
-            "run_as": os.environ.get("METARESEARCH_QUERY_RUN_AS_USER", "codexro"),
             "model": os.environ.get("METARESEARCH_CODEX_MODEL", "gpt-5.5"),
             "effort": os.environ.get("METARESEARCH_CODEX_EFFORT", "medium"),
-        }, sort_keys=True, separators=(",", ":"))
+        }
+        runtime_contract = json.dumps(
+            self.runtime_contract, sort_keys=True, separators=(",", ":"))
         self.prompt_version = hashlib.sha256(
             (system_prompt + "\x00" + skill + "\x00" + schema_contract +
              "\x00" + runtime_contract).encode("utf-8")
@@ -287,6 +288,11 @@ class CodexQueryResponder:
         rel_dir = Path("interactions") / "transcripts" / identity
         transcripts = self.work_root / rel_dir
         runner = self.runner_factory(transcripts, "interaction-query")
+        runner_contract = getattr(runner, "tool_free_contract", None)
+        if (not isinstance(runner_contract, Mapping)
+                or dict(runner_contract) != self.runtime_contract):
+            raise RuntimeError(
+                "interaction_query tool-free runtime identity 缺失或在装配后漂移")
         if runner_call_id is not None:
             bind = getattr(runner, "bind_runner_call", None)
             if not callable(bind):

@@ -94,6 +94,9 @@ predicate_json: {
 | `METARESEARCH_CODEX_MODEL` | `gpt-5.5` | 模型 |
 | `METARESEARCH_CODEX_EFFORT` | `medium` | 推理力度 |
 | `METARESEARCH_RUNNER_TIMEOUT_S` | `900` | 单次 Codex 调用超时（工程超时；研究执行时限另见 policy.flow.watchdog） |
+| `METARESEARCH_QUERY_CODEX_BIN` | `/usr/local/bin/codex` | query/adapter generation/review 的 tool-free CLI |
+| `METARESEARCH_QUERY_RUN_AS_USER` | root 运行时默认 `codexro`；non-root 默认当前账户 | 可选 UID 隔离；production non-root service 无特权切换 UID，不设置或填当前 service account |
+| `METARESEARCH_QUERY_CODEX_HOME` | 专用账户的 `~/.codex` | 仅 root 显式/默认降权到独立 UID 时使用；同 UID production 使用已验证的 `CODEX_HOME` |
 | `METARESEARCH_GITHUB_TOKEN` | — | 可选的 GitHub 只读 API token；仅 plan 明确触发 repo discovery/direct resolve 时读取，不落 policy/DB/回执 |
 | `HTTP_PROXY`/`HTTPS_PROXY` | — | 真 Codex 需要（本机 7890）；OS 级，由 codex 子进程继承（runner 不显式读） |
 
@@ -469,7 +472,10 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   Docker backing store 已接近/达到空间上限；这些都不是代码内的“允许降级”，切 production 会 fail-closed。
 - 不可信容器看不到 guardian/provider receipt、SQLite、Codex 凭据或整个 work-root，但同一 host 信任域内的 root/
   orchestrator UID 进程仍能控制 Docker socket 或改本地证据；要防该类 host 对手须独立 service account/VM/远端
-  attestation，不能靠 0600/HMAC 自我证明。不同 UID 的 tool-free query 仍要求 guardian 有权排空其树。
+  attestation，不能靠 0600/HMAC 自我证明。tool-free query/adapter 工人始终使用空临时 cwd、关闭全部
+  host/web/plugin 工具、只传 `CODEX_HOME`/HOME/TMPDIR/代理/TLS 的显式环境白名单并严核 trace；production
+  的 non-root 工人与 service 同 UID，由同 UID guardian
+  排空整树。root 开发环境默认另用 `codexro`，跨 UID 时 guardian 必须以 root 运行才能完整终止。
 - fork child 会丢弃非目标 lease FD；owner 死亡同时由 pipe EOF 与 `PR_SET_PDEATHSIG` 触发 guardian。SQLite
   journal mode 按 live mount 机械选择：已知本地文件系统用 WAL，GPFS/未知共享文件系统用 `DELETE` rollback
   journal + `synchronous=FULL`。这是因为 [SQLite WAL 官方契约](https://www.sqlite.org/wal.html) 要求全部进程
