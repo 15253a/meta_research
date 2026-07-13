@@ -55,14 +55,15 @@ _SESSION_ID_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 TOOL_FREE_POLICY_VERSION = (
-    "interaction-query-tools-v5:web-disabled:no-host-tools:ephemeral-cwd:"
-    "sanitized-env:trace-allowlist:guardian-subtree")
+    "interaction-query-tools-v6:web-disabled:no-host-tools:ephemeral-cwd:"
+    "sanitized-env:trusted-exec-path:trace-allowlist:guardian-subtree")
 _TOOL_FREE_ALLOWED_ITEMS = frozenset({"agent_message", "reasoning"})
 _TOOL_FREE_ALLOWED_EVENTS = frozenset({
     "thread.started", "turn.started", "item.started", "item.updated",
     "item.completed", "turn.completed",
 })
 _MAX_TOOL_FREE_OUTPUT_BYTES = 1024 * 1024
+_TOOL_FREE_EXEC_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 
 def tool_free_runtime_identity() -> tuple[str, pwd.struct_passwd]:
@@ -104,6 +105,7 @@ def tool_free_runtime_contract() -> dict[str, str]:
         "tool_policy": TOOL_FREE_POLICY_VERSION,
         "uid_isolation": isolation,
         "run_as": account.pw_name,
+        "exec_path": _TOOL_FREE_EXEC_PATH,
     }
 
 
@@ -346,6 +348,7 @@ class CodexRunner:
                 "tool_policy": TOOL_FREE_POLICY_VERSION,
                 "uid_isolation": self.tool_free_isolation,
                 "run_as": account.pw_name,
+                "exec_path": _TOOL_FREE_EXEC_PATH,
                 "bin": self.query_bin, "model": self.model, "effort": self.effort,
             }
         self.execution_supervisor = execution_supervisor or ExecutionSupervisor.standalone(
@@ -514,7 +517,8 @@ class CodexRunner:
                 if not (Path(query_home) / "auth.json").is_file():
                     raise ValueError("tool-free Runner 运行账户缺 Codex auth.json")
                 safe_env = {
-                    "PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                    "PATH": _TOOL_FREE_EXEC_PATH,
+                    "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
                     "CODEX_HOME": query_home, "HOME": self.query_user_home,
                     "TMPDIR": str(runtime_dir),
                 }
@@ -530,7 +534,8 @@ class CodexRunner:
                         *(f"{name}={value}" for name, value in safe_env.items()), *cmd,
                     ]
                     process_env = {
-                        "PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+                        "PATH": _TOOL_FREE_EXEC_PATH,
+                        "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
                 else:
                     process_env = safe_env
         t0 = time.monotonic()
