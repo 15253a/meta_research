@@ -34,8 +34,10 @@
   import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。CP11.4c.3c.1
   real SEED/DREAMER sealed-holdout、one-shot final 与独立 scorer 已落 `2a98e4b`；CP11.4c.3c.2a
   本地 WAL / GPFS rollback、旧 WAL 预读前迁移与 console 准入已落 `75f8009`；2b.1 五阶段 shared-fs
-  canary 与 2b.2 fixed-linear fault sidecar 已落 `fb65955`/`aa03a01`，CP11.4c.3c.2 工具闭合。下一检查点进入
-  CP11.4c.3c.3 canonical evidence packer/offline verifier。当前节点无 NVIDIA container runtime，尚未完成
+  canary 与 2b.2 fixed-linear fault sidecar 已落 `fb65955`/`aa03a01`，CP11.4c.3c.2 工具闭合；
+  CP11.4c.3c.3 canonical evidence packer/offline verifier 及 exact-one-cycle restore/resume proof 已落
+  `6c05666`，CP11.4c.3c 工具闭合。下一检查点进入 CP11.4c.3d 目标运行。当前节点无
+  NVIDIA container runtime，尚未完成
   两节点正向、GPU、真实 ≥200 轮或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
@@ -522,7 +524,7 @@
                 无 verdict；全量依用户要求留到最终检查点）。
               b.2b.2 的 import CAS scope 已完成；execution-log 正本、checkpoint/content store 与完整 work-root DR
               仍明确不在该 scope，故 b.2b/b.2/b 父项暂不勾选，不虚报完整灾备。
-        - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
+        - [x] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
           - [x] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 全部 sealed-holdout/one-shot/non-feedback 约束；
             T1 的 DREAMER 在 A/B/C/HPO/claim 不可见；T2 的全部 final folds 在 final 前不可见、final 每 unit 只挂
             一个 X-only fold；独立 root evaluator 从 sealed truth 出分。→ commit `2a98e4b`（build_log 0077；
@@ -544,6 +546,9 @@
                 严核 authority/aftermath/线性 evidence；不引入 DAG/plugin/arbitrary shell/常驻进程。
                 → commit `aa03a01`（build_log 0080；fault 16 + related 86；内部双终审无 BLOCKER/Major；
                 外审两轮均 401 无 verdict；全量留最终检查点）。
-          - [ ] CP11.4c.3c.3 canonical evidence packer + 离线 verifier，在干净节点 restore 后至少续跑一轮。
+          - [x] CP11.4c.3c.3 canonical evidence packer + 离线 verifier，在干净节点 restore 后至少续跑一轮。
+            → commit `6c05666`（build_log 0081；evidence 26 + import/dependency/repository related 22；
+            内部终审 APPROVE；外审第 1 轮 401，第 2 轮 REQUEST_CHANGES 的闭包/streaming limit/
+            publish cleanup 成立项均在两轮上限后修毕；全量依用户要求留最终检查点）。
         - [ ] CP11.4c.3d 目标运行：dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector 就位后，
           跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。

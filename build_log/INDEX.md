@@ -6,6 +6,7 @@
 
 ---
 
+- [0081](0081-cp114c3c3-canonical-evidence-pack.md) — CP11.4c.3c.3 receipt-bound canonical evidence pack + offline exact-one-cycle restore/resume proof · commit `6c05666` · 验证: evidence 26 + import/dependency/repository related 22；内部终审 APPROVE；外审第 1 轮 401、第 2 轮 REQUEST_CHANGES 成立项修毕；全量留最终检查点
 - [0080](0080-cp114c3c2b2-fault-schedule-runner.md) — CP11.4c.3c.2b.2 execution-receipt-only fixed-linear pidfd fault sidecar + strict no-replay evidence chain · commit `aa03a01` · 验证: fault 16 + related 86；内部双终审无 BLOCKER/Major；外审两轮均 401 无 verdict；全量留最终检查点
 - [0079](0079-cp114c3c2b1-shared-fs-canary.md) — CP11.4c.3c.2b.1 fixed five-phase local/two-node lease + guardian + hot-journal + FD canary · commit `fb65955` · 验证: canary 17 + related 85 + real local WAL；内部终审无 BLOCKER/Major；外审两轮均 401 无 verdict；全量留最终检查点
 - [0078](0078-cp114c3c2a-shared-sqlite-boundary.md) — CP11.4c.3c.2a local WAL / GPFS rollback + legacy WAL pre-read migration + console reader admission · commit `75f8009` · 验证: database 20 + runtime 134 + final targeted 65；内部双终审 APPROVE；外审两轮均 401 无 verdict；全量留最终检查点
