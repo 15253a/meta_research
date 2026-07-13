@@ -94,7 +94,7 @@ predicate_json: {
 | `METARESEARCH_CODEX_MODEL` | `gpt-5.5` | 模型 |
 | `METARESEARCH_CODEX_EFFORT` | `medium` | 推理力度 |
 | `METARESEARCH_RUNNER_TIMEOUT_S` | `900` | 单次 Codex 调用超时（工程超时；研究执行时限另见 policy.flow.watchdog） |
-| `METARESEARCH_QUERY_CODEX_BIN` | `/usr/local/bin/codex` | query/adapter generation/review 的 tool-free CLI |
+| `METARESEARCH_QUERY_CODEX_BIN` | `/usr/local/bin/codex` | query/adapter generation/review 的 tool-free CLI；工人 PATH 固定为 `/usr/local/bin:/usr/bin:/bin`，兼容该入口的 `env node` shebang |
 | `METARESEARCH_QUERY_RUN_AS_USER` | root 运行时默认 `codexro`；non-root 默认当前账户 | 可选 UID 隔离；production non-root service 无特权切换 UID，不设置或填当前 service account |
 | `METARESEARCH_QUERY_CODEX_HOME` | 专用账户的 `~/.codex` | 仅 root 显式/默认降权到独立 UID 时使用；同 UID production 使用已验证的 `CODEX_HOME` |
 | `METARESEARCH_GITHUB_TOKEN` | — | 可选的 GitHub 只读 API token；仅 plan 明确触发 repo discovery/direct resolve 时读取，不落 policy/DB/回执 |

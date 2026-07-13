@@ -193,6 +193,7 @@ def test_tool_free_runner_disables_host_and_external_tools(tmp_path, monkeypatch
     assert cmd[env_index + 1] == "-i"
     inherited_names = {part.split("=", 1)[0] for part in cmd[env_index + 2:]
                        if "=" in part}
+    assert "PATH=/usr/local/bin:/usr/bin:/bin" in cmd[env_index + 2:]
     assert "METARESEARCH_GITHUB_TOKEN" not in inherited_names
     assert "METARESEARCH_QQ_TOKEN" not in inherited_names
     runtime_cwd = Path(cmd[cmd.index("-C") + 1])
@@ -239,6 +240,7 @@ def test_tool_free_runner_supports_non_root_production_service(
 
     runner = _fake_runner(tmp_path, fake_run, tool_free=True)
     assert runner.tool_free_isolation == "service-uid"
+    assert runner.tool_free_contract["exec_path"] == "/usr/local/bin:/usr/bin:/bin"
     runner.run_task(system_prompt="s", skill="k", context_pack=_pack())
     cmd = captured["cmd"]
     assert cmd[0] != "/usr/bin/sudo"
@@ -256,6 +258,7 @@ def test_tool_free_runner_supports_non_root_production_service(
         "PATH", "LANG", "LC_ALL", "CODEX_HOME", "HOME", "TMPDIR",
     } | (allowed_optional & set(os.environ))
     assert process_env["CODEX_HOME"] == str(codex_home)
+    assert process_env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
     assert "METARESEARCH_GITHUB_TOKEN" not in process_env
     assert "METARESEARCH_QQ_TOKEN" not in process_env
 
