@@ -6,6 +6,7 @@
 
 ---
 
+- [0085](0085-cp114c3d13-exact-measurement-ref.md) — CP11.4c.3d.1.3 exact evidence_ref=mrN + provenance-only fake labeling · commit `c83e34f` · 验证: related 56 + real c3 reasoning/Gate a1 + same-snapshot Codex query；内部终审 APPROVE；全量留最终检查点
 - [0084](0084-cp114c3d12-real-plan-recovery.md) — CP11.4c.3d.1.2 locks synthetic protocol design, exact resource-request skeleton, and pre-bridge aggregated schema feedback · commit `ad6a303` · 验证: related 153 + real c3 plan/review/bundle/Docker run/double review；内外审 APPROVE；全量留最终检查点
 - [0083](0083-cp114c3d11-tool-free-cli-path.md) — CP11.4c.3d.1.1 fixed trusted PATH + v6 runtime contract for default tool-free Codex launcher · commit `6aec828` · 验证: Runner/Query 71 + exact 3 + real default query 9347 tokens；内部/外审 APPROVE；全量留最终检查点
 - [0082](0082-cp114c3d1-production-tool-free-runner.md) — CP11.4c.3d.1 production non-root tool-free query/adapter Runner + frozen fail-closed runtime contract · commit `423dd78` · 验证: Runner/Query 71 + boundary 8 + assembly 3 + adapter/preflight 41；内部终审 APPROVE；外审第 1 轮 401、第 2 轮 REQUEST_CHANGES 全修；全量留最终检查点

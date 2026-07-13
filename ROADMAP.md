@@ -570,7 +570,10 @@
             `resource_request` 必须使用内联的 exact schema skeleton；StageProvider 在调用 bridge 前聚合 schema
             错误并有界反馈。→ commit `ad6a303`（build_log 0084；相关 153；真实 c3 从原 checkpoint 一次越过
             plan/review/bundle/Docker run/双 review；内部与外审 APPROVE；全量留最终检查点）。
-          - [ ] CP11.4c.3d.1.3 exact measurement reference：compiler 给 reasoning 的指标锚必须清楚区分合法
-            `metric_result_id=mrN` 与 metric/version 展示信息，且 reasoning 不再把真实 bundle 执行误称 M0 fake。
+          - [x] CP11.4c.3d.1.3 exact measurement reference：compiler 给 reasoning 的指标锚清楚区分合法
+            `evidence_ref=mrN` 与 metric/version/value/scope 展示信息；fake 只按同一测量显式 provenance 判定，
+            兼容 M0 桩与 production。→ commit `c83e34f`（build_log 0085；相关 56；真实 c3 metric replay
+            输出 exact `mr1`、无 fake、Gate `a1`；同原 c3 snapshot 的 console query/Codex reply 成功；
+            内部终审 APPROVE；全量留最终检查点）。
           - [ ] CP11.4c.3d.2 dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector
             就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。
