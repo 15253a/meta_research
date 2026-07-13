@@ -57,6 +57,10 @@ class QualificationFinalizedError(QualificationFirewallError):
     """A final target was consumed; the research loop must never resume."""
 
 
+class QualificationClaimLockedError(QualificationFirewallError):
+    """The claim is frozen; ordinary research must not resume after phase B."""
+
+
 def _canonical(value: Any) -> bytes:
     try:
         return (json.dumps(
@@ -654,6 +658,10 @@ class QualificationFirewall:
             self.read_final_marker()
             raise QualificationFinalizedError(
                 "qualification final 已消费；禁止恢复研究循环或让 target 指标反馈下一轮")
+        if os.path.lexists(self.claim_path):
+            self.read_claim_lock()
+            raise QualificationClaimLockedError(
+                "qualification claim 已锁定；普通研究循环已关闭，请进入资格执行阶段")
 
     def authorize_mounts(
             self, selected_paths: Sequence[str], *, execution_context: Mapping[str, Any]) -> None:
@@ -924,7 +932,9 @@ def publish_claim_lock(
     firewall = load_qualification_firewall(work_root, require_research_uid=True)
     if firewall is None:
         raise QualificationFirewallError("work_root 未安装 qualification contract")
-    firewall.assert_research_open()
+    if os.path.lexists(firewall.final_path):
+        firewall.read_final_marker()
+        raise QualificationFinalizedError("final 已消费，不能再锁定 claim")
     claim = dict(value)
     _validate_claim(claim, firewall)
     raw = _canonical(claim)
@@ -1059,7 +1069,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "CLAIM_PROTOCOL", "CONTRACT_PROTOCOL", "FINAL_PROTOCOL",
-    "QualificationFinalizedError", "QualificationFirewall",
+    "QualificationClaimLockedError", "QualificationFinalizedError", "QualificationFirewall",
     "QualificationFirewallError", "QualificationMount", "consume_final",
     "final_units", "install_contract", "load_qualification_firewall",
     "publish_claim_lock",

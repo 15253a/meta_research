@@ -14,6 +14,7 @@ from orchestrator.execution_sandbox import DockerExecutionSandbox
 from orchestrator.qualification_firewall import (
     CLAIM_PROTOCOL,
     CONTRACT_PROTOCOL,
+    QualificationClaimLockedError,
     QualificationFinalizedError,
     QualificationFirewallError,
     _read_regular,
@@ -210,6 +211,8 @@ def test_t1_holdout_is_invisible_until_irreversible_final(tmp_path):
     claim = _claim("T1")
     locked = publish_claim_lock(work, claim)
     assert locked["claim_sha256"].startswith("sha256:")
+    with pytest.raises(QualificationClaimLockedError, match="claim 已锁定"):
+        firewall.assert_research_open()
     marker = consume_final(
         work, source_tree_sha256="sha256:" + "a" * 64,
         runtime_identity_sha256="sha256:" + "c" * 64, now=1.0)
@@ -345,7 +348,7 @@ def test_publish_fallback_reconciles_exact_crash_left_hardlink(tmp_path):
     assert not temp.exists() and os.lstat(final).st_nlink == 1
 
 
-def test_qualification_rejects_custom_runner_and_finalized_startup_before_docker(
+def test_qualification_rejects_custom_runner_and_post_claim_startup_before_docker(
         tmp_path, monkeypatch):
     work = tmp_path / "work"
     contract = _t1_contract(tmp_path)
@@ -362,12 +365,9 @@ def test_qualification_rejects_custom_runner_and_finalized_startup_before_docker
             **assembly, runner_factory=lambda *_args: object())
 
     publish_claim_lock(work, _claim("T1"))
-    consume_final(
-        work, source_tree_sha256="sha256:" + "a" * 64,
-        runtime_identity_sha256="sha256:" + "c" * 64, now=1.0)
     monkeypatch.setattr(
         run_module, "DockerExecutionSandbox",
-        lambda **_kwargs: pytest.fail("Docker constructed after final consumption"))
+        lambda **_kwargs: pytest.fail("Docker constructed after claim lock"))
     assembly["attack"] = True
-    with pytest.raises(QualificationFinalizedError, match="禁止恢复"):
+    with pytest.raises(QualificationClaimLockedError, match="claim 已锁定"):
         run_module._assemble_system(**assembly, runner_factory=None)
