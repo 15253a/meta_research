@@ -1057,7 +1057,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         result = score_final(work_root=args.work_root)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-    return 0
+    # Library callers need the immutable failure receipt for audit/replay, but
+    # an operator pipeline must not confuse "failure was recorded" with a
+    # successful qualification.
+    if args.command == "run-final":
+        return 0 if result["failure_count"] == 0 else 3
+    return 0 if result["status"] == "success" else 3
 
 
 if __name__ == "__main__":
