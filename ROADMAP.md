@@ -37,7 +37,8 @@
   canary 与 2b.2 fixed-linear fault sidecar 已落 `fb65955`/`aa03a01`，CP11.4c.3c.2 工具闭合；
   CP11.4c.3c.3 canonical evidence packer/offline verifier 及 exact-one-cycle restore/resume proof 已落
   `6c05666`，CP11.4c.3c 工具闭合。CP11.4c.3d.1 已以 `423dd78` 修通 production non-root service
-  的 tool-free query/adapter 工人，同时保留 root 开发跨 UID 与严格能力边界。下一检查点进入
+  的 tool-free query/adapter 工人，同时保留 root 开发跨 UID 与严格能力边界；d.1.1 以 `6aec828`
+  修复白名单 PATH 对默认 Codex launcher 的 Node 解析回归，真实 reasoning/query smoke 已通过。下一检查点进入
   CP11.4c.3d.2 目标运行。当前节点无 NVIDIA container runtime，尚未完成
   两节点正向、GPU、真实 ≥200 轮或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
@@ -559,5 +560,10 @@
             显式环境白名单。→ commit `423dd78`（build_log 0082；Runner/Query 71 + exact boundary 8 +
             assembly 3 + adapter/preflight 41；内部终审 APPROVE；外审第 1 轮 401、第 2 轮两个 BLOCKER
             与一个 SHOULD 均修毕；全量留最终检查点）。
+          - [x] CP11.4c.3d.1.1 tool-free CLI 启动兼容：环境仍为精确白名单，但固定加入 root-owned
+            `/usr/local/bin`，使默认 `/usr/local/bin/codex` 的 `env node` shebang 不会误落系统旧 Node；
+            exact PATH 进入 runtime contract，tool policy 升 v6。→ commit `6aec828`（build_log 0083；
+            Runner/Query 71 + exact 3 + 真实 default query Codex success/9347 tokens；内部与外审 APPROVE；
+            全量留最终检查点）。
           - [ ] CP11.4c.3d.2 dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector
             就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。

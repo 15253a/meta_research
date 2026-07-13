@@ -1,25 +1,26 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
 - 更新：2026-07-13 ｜ 位置：步⑪ CP11.4c.3d.2 目标生产运行 / 最终验收
-- 检查点状态：空闲；CP11.4c.3d.1 功能 `423dd78` 已提交，记账完成
+- 检查点状态：空闲；CP11.4c.3d.1.1 功能 `6aec828` 已提交，记账完成
 
 ## 上一检查点结果
 
-- 已解除一个真实生产装配矛盾：deployment preflight 要求主 service non-root，但旧 tool-free
-  query/adapter Runner 又只允许 root guardian。现在 non-root service 以当前 UID 在空 0700 临时
-  cwd 执行；root 开发仍必须降到独立 `codexro`/显式非 root UID。
-- 两路仍关闭 host/web/plugin/multi-agent 工具并严核 JSON trace、输出 owner/type/link/size；worker
-  环境只含固定运行字段和代理/TLS 白名单，跨 UID 明确使用 `env -i`。responder 冻结
-  policy/UID/bin/model/effort，Runner 不声明或发生漂移都会在执行前 fail-closed。
-- Runner/Query **71 passed**、外审边界 **8 passed**、装配修正 **3 passed**、adapter/preflight
-  **41 passed**；内部终审 APPROVE。外审第 1 轮 401；第 2 轮 REQUEST_CHANGES 的两个 BLOCKER
-  与一个 SHOULD 均已修复，依两轮上限未发第 3 轮。依用户要求未跑仓库全量。
+- 真实 smoke 发现 d.1 的白名单 PATH 使用 Python `os.defpath=/bin:/usr/bin`，使默认
+  `/usr/local/bin/codex` 的 `#!/usr/bin/env node` 误用 `/usr/bin/node` 12，Codex 0.144.0 启动即
+  `SyntaxError`。现固定为 `/usr/local/bin:/usr/bin:/bin`，仍不继承用户 PATH。
+- exact PATH 已进入 responder/Runner runtime contract，tool policy 升 v6；root 跨 UID 仍是
+  `sudo ... env -i`，non-root same UID 仍只得到显式 safe env，没有扩大模型工具能力。
+- 真实 bootstrap reasoning 完成 c1（success、16100 tokens）；从其已验证 snapshot 恢复干净诊断 target
+  后，修复后的默认 query（未覆盖 binary/home）返回 `codex/success` 并记账 **9347 tokens**。
+- Runner/Query **71 passed**、exact **3 passed**；内部审查 APPROVE。外审第 1 次因 wrapper 参数重复
+  在启动前退出、无 verdict；第 2 次完整审查 APPROVE，未发现 BLOCKER/SHOULD/NIT。未跑仓库全量。
 
 ## 当前可用边界
 
-- 默认 production 装配的 query/import adapter sideband 现在与 non-root preflight 契约兼容，不再是
-  “preflight 能启动、首次 query 必失败”。修复没有增加第二 DB、daemon、scheduler、SSH
-  orchestration 或通用 workflow。
+- 默认 production 装配的 query/import adapter sideband 现在与 non-root preflight 契约兼容，且默认
+  `/usr/local/bin/codex` 已有真实启动/应答证据，不再是“preflight 能启动、首次 query 必失败”。
+- 单节点 development 的真实 Codex bootstrap reasoning + snapshot-grounded query 已达到基本可用；
+  修复没有增加第二 DB、daemon、scheduler、SSH orchestration 或通用 workflow。
 - CP11.4c.3c 薄工具已闭合：qualification firewall、shared SQLite boundary、local/two-node
   canary 协议、fixed-linear fault runner 与 evidence pack 可组合使用。
 - evidence v1 证明包内 bytes 闭包和一轮续跑，不是 restore engine，不声称完整 work-root DR、
@@ -43,4 +44,5 @@
   不得用注入式 worker 的一轮续跑替代生产验收。
 - 当前 host 能看到 8×A100-80GB，但 Docker 没有 NVIDIA runtime/cgroup/resource limit，且 `/ebs`
   backing store 已满；full-attack E2E 在 container create 阶段因此 ENOSPC，不得归因于本次 Runner 代码。
-- root overlay 仍接近/处于满额；pytest basetemp 必须放 VEPFS 并及时清理。
+- root overlay 清理本轮 `/tmp/pytest-of-root` 后仅约 9MB 可用，仍处危险水位；`codexro` 本地 auth 已从
+  root 主认证副本恢复为 owner 0600，诊断期间的 VEPFS 凭据副本已删除。pytest basetemp 必须放 VEPFS。
