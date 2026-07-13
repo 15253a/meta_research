@@ -2,9 +2,10 @@
 
 一任务一会话：每次 run_task 起一个全新 `codex exec --ephemeral` 进程，无跨调用状态（P3）。
 prompt = system_prompt + skill 节选 + 四区上下文包 + 信封提醒，全部内联。普通研究 runner 保留只读 shell；
-``tool_free=True`` 的交互 responder 还会以不同 UID 在临时 cwd 运行（writer work/DB =
-0700/0600，该 UID 无法 traverse），关闭 web/shell/apps/browser/computer/multi-agent，并对 JSON 事件流
-拒绝任何工具项；不是仅靠 prompt 自律。产物 = 最后一个 ```json 代码块。
+``tool_free=True`` 的工人在空临时 cwd 运行，关闭 web/shell/apps/browser/computer/multi-agent，
+并对 JSON 事件流拒绝任何工具项；不是仅靠 prompt 自律。production 的 non-root service
+以同一 service UID 执行（无特权切 UID）；root 开发环境可以独立 ``codexro`` UID 运行，
+使 writer work/DB 不可 traverse。产物 = 最后一个 ```json 代码块。
 ``no_host_tools=True`` 复用同一严格 capability/trace 闭包但保持当前 UID；它供 qualification
 研究工人使用：工人只接内联 ContextPack 并产 JSON 信封，不能用模型工具绕过实验容器读数据。
 
@@ -13,8 +14,8 @@ prompt = system_prompt + skill 节选 + 四区上下文包 + 信封提醒，全�
   METARESEARCH_CODEX_MODEL   默认 gpt-5.5
   METARESEARCH_CODEX_EFFORT  默认 medium
   METARESEARCH_RUNNER_TIMEOUT_S 默认 900（M0 工程超时；真 watchdog 见 M3/policy flow.watchdog）
-  METARESEARCH_QUERY_RUN_AS_USER interaction query 专用低权用户（root 本机默认 codexro）
-  METARESEARCH_QUERY_CODEX_BIN / METARESEARCH_QUERY_CODEX_HOME 专用用户的 CLI 与认证目录
+  METARESEARCH_QUERY_RUN_AS_USER 可选专用低权用户（root 默认 codexro；non-root 只能填自身）
+  METARESEARCH_QUERY_CODEX_BIN / METARESEARCH_QUERY_CODEX_HOME 工具禁用工人 CLI，及跨 UID 时的认证目录
 """
 from __future__ import annotations
 
@@ -54,14 +55,58 @@ _SESSION_ID_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 TOOL_FREE_POLICY_VERSION = (
-    "interaction-query-tools-v4:web-disabled:no-host-tools:uid-isolated:"
-    "trace-allowlist:guardian-subtree")
+    "interaction-query-tools-v5:web-disabled:no-host-tools:ephemeral-cwd:"
+    "sanitized-env:trace-allowlist:guardian-subtree")
 _TOOL_FREE_ALLOWED_ITEMS = frozenset({"agent_message", "reasoning"})
 _TOOL_FREE_ALLOWED_EVENTS = frozenset({
     "thread.started", "turn.started", "item.started", "item.updated",
     "item.completed", "turn.completed",
 })
 _MAX_TOOL_FREE_OUTPUT_BYTES = 1024 * 1024
+
+
+def tool_free_runtime_identity() -> tuple[str, pwd.struct_passwd]:
+    """Resolve the honest UID boundary shared by Runner and responder receipts."""
+    current_uid = os.geteuid()
+    requested = os.environ.get("METARESEARCH_QUERY_RUN_AS_USER")
+    if requested is None and current_uid == 0:
+        try:
+            pwd.getpwnam("codexro")
+        except KeyError as error:
+            raise ValueError(
+                "root tool-free Runner 须配置与 writer 不同 UID 的 "
+                "METARESEARCH_QUERY_RUN_AS_USER（或安装 codexro）") from error
+        else:
+            requested = "codexro"
+    try:
+        if requested is None:
+            account = pwd.getpwuid(current_uid)
+        else:
+            if not requested:
+                raise ValueError("METARESEARCH_QUERY_RUN_AS_USER 不得为空")
+            account = pwd.getpwnam(requested)
+    except KeyError as error:
+        raise ValueError("tool-free Runner 运行账户不存在") from error
+    if current_uid == 0:
+        if account.pw_uid == 0:
+            raise ValueError("root tool-free Runner 运行账户必须与 writer UID 不同")
+        return "separate-uid", account
+    if account.pw_uid != current_uid:
+        raise ValueError(
+            "non-root production service 不得通过 tool-free Runner 切换 UID；"
+            "METARESEARCH_QUERY_RUN_AS_USER 须缺省或等于当前 service account")
+    return "service-uid", account
+
+
+def tool_free_runtime_contract() -> dict[str, str]:
+    isolation, account = tool_free_runtime_identity()
+    return {
+        "tool_policy": TOOL_FREE_POLICY_VERSION,
+        "uid_isolation": isolation,
+        "run_as": account.pw_name,
+    }
+
+
 def _run_process_group(cmd, *, stdin, timeout, cwd=None):
     """Compatibility entry routed through the same guardian as production."""
     receipt_dir = Path(tempfile.mkdtemp(prefix="meta-research-execution-"))
@@ -277,40 +322,34 @@ class CodexRunner:
         self.tool_free = tool_free
         self.no_host_tools = tool_free or no_host_tools
         self.output_uid = os.geteuid()
-        self.execution_supervisor = execution_supervisor or ExecutionSupervisor.standalone(
-            self.transcripts_dir / ".execution-receipts")
         self.query_user = None
         self.query_user_home = None
         self.query_uid = None
         self.query_gid = None
+        self.tool_free_isolation = None
+        self.tool_free_contract = None
+        self.query_bin = os.environ.get(
+            "METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex")
+        self.query_codex_home = None
         if tool_free:
-            if os.geteuid() != 0:
-                raise ValueError(
-                    "interaction_query guardian 须以 root 运行，才能对 sudo 降权后的"
-                    "完整子树执行 TERM/KILL；非 root 装配拒绝启动")
-            requested = os.environ.get("METARESEARCH_QUERY_RUN_AS_USER")
-            if requested is None and os.geteuid() == 0:
-                try:
-                    pwd.getpwnam("codexro")
-                except KeyError:
-                    pass
-                else:
-                    requested = "codexro"
-            if not requested:
-                raise ValueError(
-                    "interaction_query 须配置与 writer 不同 UID 的 "
-                    "METARESEARCH_QUERY_RUN_AS_USER")
-            try:
-                account = pwd.getpwnam(requested)
-            except KeyError as error:
-                raise ValueError(f"interaction_query 隔离账户不存在: {requested}") from error
-            if account.pw_uid == os.geteuid():
-                raise ValueError("interaction_query 隔离账户不得与 writer 同 UID")
+            self.tool_free_isolation, account = tool_free_runtime_identity()
             self.query_user = account.pw_name
             self.query_user_home = account.pw_dir
             self.query_uid = account.pw_uid
             self.query_gid = account.pw_gid
             self.output_uid = account.pw_uid
+            self.query_codex_home = os.environ.get(
+                "METARESEARCH_QUERY_CODEX_HOME", str(Path(account.pw_dir) / ".codex")
+            ) if self.tool_free_isolation == "separate-uid" else os.environ.get(
+                "CODEX_HOME", str(Path(account.pw_dir) / ".codex"))
+            self.tool_free_contract = {
+                "tool_policy": TOOL_FREE_POLICY_VERSION,
+                "uid_isolation": self.tool_free_isolation,
+                "run_as": account.pw_name,
+                "bin": self.query_bin, "model": self.model, "effort": self.effort,
+            }
+        self.execution_supervisor = execution_supervisor or ExecutionSupervisor.standalone(
+            self.transcripts_dir / ".execution-receipts")
         self._call_no = 0
         self._runner_call_id: Optional[int] = None
         self._reconcile_protocol: Optional[str] = None
@@ -419,13 +458,13 @@ class CodexRunner:
         if self.no_host_tools:
             runtime_dir = Path(tempfile.mkdtemp(prefix="meta-research-query-"))
             os.chmod(runtime_dir, 0o700)
-            if self.tool_free:
+            if self.tool_free_isolation == "separate-uid":
                 os.chown(runtime_dir, self.query_uid, self.query_gid)
             runtime_cwd = runtime_dir
         runtime_out_file = (runtime_dir / f"{tag}.out.md"
                             if runtime_dir is not None else out_file)
-        command_bin = (os.environ.get("METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex")
-                       if self.tool_free else self.bin)
+        process_env = None
+        command_bin = self.query_bin if self.tool_free else self.bin
         cmd = [
             command_bin, "exec", "--json",
             "-s", "read-only", "--skip-git-repo-check", "--ignore-user-config", "--ephemeral",
@@ -471,19 +510,29 @@ class CodexRunner:
                 "--disable", "network_proxy",
             ]
             if self.tool_free:
-                query_home = os.environ.get(
-                    "METARESEARCH_QUERY_CODEX_HOME", str(Path(self.query_user_home) / ".codex"))
+                query_home = self.query_codex_home
                 if not (Path(query_home) / "auth.json").is_file():
-                    raise ValueError("interaction_query 隔离账户缺 Codex auth.json")
-                env_args = [f"CODEX_HOME={query_home}", f"HOME={self.query_user_home}"]
+                    raise ValueError("tool-free Runner 运行账户缺 Codex auth.json")
+                safe_env = {
+                    "PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                    "CODEX_HOME": query_home, "HOME": self.query_user_home,
+                    "TMPDIR": str(runtime_dir),
+                }
                 for name in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-                             "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE"):
+                             "http_proxy", "https_proxy", "no_proxy",
+                             "SSL_CERT_FILE", "SSL_CERT_DIR"):
                     if name in os.environ:
-                        env_args.append(f"{name}={os.environ[name]}")
-                cmd = [
-                    "/usr/bin/sudo", "-n", "-u", self.query_user, "-H", "env",
-                    *env_args, *cmd,
-                ]
+                        safe_env[name] = os.environ[name]
+                if self.tool_free_isolation == "separate-uid":
+                    cmd = [
+                        "/usr/bin/sudo", "-n", "-u", self.query_user, "-H", "env",
+                        "-i",
+                        *(f"{name}={value}" for name, value in safe_env.items()), *cmd,
+                    ]
+                    process_env = {
+                        "PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+                else:
+                    process_env = safe_env
         t0 = time.monotonic()
         copy_error = None
         provider_receipt_ref = None
@@ -496,6 +545,7 @@ class CodexRunner:
                     cmd, stdin=fh, capture_output=True,
                     timeout_s=self.timeout_s,
                     cwd=runtime_cwd if self.no_host_tools else None,
+                    env=process_env,
                     kind=("codex-query" if self.tool_free else
                           "codex-no-host-tools" if self.no_host_tools else "codex-runner"),
                     operation_context={

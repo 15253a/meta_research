@@ -8,6 +8,7 @@ work_root 续跑（goal 不重建）；durable 停机与全局等待端到端生
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
 from pathlib import Path
@@ -21,6 +22,7 @@ from orchestrator.interfaces import Artifact, CallUsage
 from orchestrator.instance_lease import InstanceLease
 from orchestrator.execution_sandbox import sandbox_environment_hash
 from orchestrator.run import System, build_system
+from orchestrator.runner import tool_free_runtime_contract
 from orchestrator.storage_ops import SnapshotArchive
 from orchestrator.writedaemon import WriteDaemon
 
@@ -34,6 +36,16 @@ _BOOT_TERMINATE = {
     "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
                        "terminate_reason_md": "创世即达成（测试固定）"},
 }
+
+
+def _query_tool_free_contract():
+    """Contract an injected interaction-query runner must explicitly promise."""
+    return {
+        **tool_free_runtime_contract(),
+        "bin": os.environ.get("METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex"),
+        "model": os.environ.get("METARESEARCH_CODEX_MODEL", "gpt-5.5"),
+        "effort": os.environ.get("METARESEARCH_CODEX_EFFORT", "medium"),
+    }
 
 
 def _mock_factory(files_seq):
@@ -770,6 +782,8 @@ def test_production_assembly_uses_codex_query_responder_and_drains_on_exit(tmp_p
 
     def factory(_transcripts, purpose):
         class Runner:
+            tool_free_contract = _query_tool_free_contract()
+
             def run_task(self, *, system_prompt, skill, context_pack):
                 calls.append(purpose)
                 if purpose == "interaction-query":
@@ -831,6 +845,8 @@ def test_interaction_pump_answers_query_while_research_runner_is_blocked(tmp_pat
 
     def factory(_transcripts, purpose):
         class Runner:
+            tool_free_contract = _query_tool_free_contract()
+
             def run_task(self, *, system_prompt, skill, context_pack):
                 if purpose == "interaction-query":
                     return Artifact(
@@ -890,6 +906,8 @@ def test_global_stop_keeps_query_sideband_available(tmp_path):
 
     def factory(_transcripts, purpose):
         class Runner:
+            tool_free_contract = _query_tool_free_contract()
+
             def run_task(self, *, system_prompt, skill, context_pack):
                 calls.append(purpose)
                 if purpose == "interaction-query":
