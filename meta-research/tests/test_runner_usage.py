@@ -525,6 +525,35 @@ def test_runner_never_reuses_stale_output_for_same_deterministic_tag(tmp_path, m
             system_prompt="s", skill="k", context_pack=_pack())
 
 
+def test_bound_runner_uses_durable_call_id_across_fresh_instances(tmp_path, monkeypatch):
+    """Checkpoint restart resets local counters, but must not overwrite an earlier call transcript."""
+    def successful(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
+        Path(cmd[cmd.index("-o") + 1]).write_text(
+            '```json\n{"files":{"idea_set.json":{}},"md":"ok"}\n```',
+            encoding="utf-8")
+        return types.SimpleNamespace(
+            returncode=0, stdout=b"", stderr=b"tokens used\n1\n")
+
+    refs = []
+    for runner_call_id in (41, 42):
+        runner = _fake_runner(
+            tmp_path / "transcripts", successful, purpose_tag="idea-n1")
+        runner.bind_runner_call(
+            runner_call_id=runner_call_id,
+            reconcile_protocol="runner-call-v1", phase="idea",
+            purpose="idea-n1-a1")
+        monkeypatch.setattr(
+            runner, "_publish_provider_receipt", lambda **_kwargs: None)
+        refs.append(Path(runner.run_task(
+            system_prompt="s", skill="k", context_pack=_pack()).transcript_ref))
+
+    assert [path.name for path in refs] == [
+        "idea-idea-n1-rc41.out.md", "idea-idea-n1-rc42.out.md"]
+    assert refs[0] != refs[1] and all(path.is_file() for path in refs)
+    assert (refs[0].with_name("idea-idea-n1-rc41.prompt.md").is_file()
+            and refs[1].with_name("idea-idea-n1-rc42.prompt.md").is_file())
+
+
 def test_runner_bad_envelope_preserves_usage(tmp_path, monkeypatch):
     """子进程成功但信封坏：_invoke 已取得的 usage 必须随 RunnerError 上浮，供 provider 记账。"""
     def bad_envelope(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):

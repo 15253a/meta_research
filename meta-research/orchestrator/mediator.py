@@ -321,7 +321,9 @@ class CodexQueryResponder:
             cycle_id=snapshot, stage="reasoning", target_id=None,
             anchor_md=anchor, neighborhood_md="", retrieval_md="", refs=[],
             sources=["published:status_card", "interaction:sanitized-history"])
-        transcript_ref = str(rel_dir / "reasoning-interaction-query-1.events.jsonl")
+        invocation_key = (f"rc{runner_call_id}" if runner_call_id is not None else "1")
+        transcript_ref = str(
+            rel_dir / f"reasoning-interaction-query-{invocation_key}.events.jsonl")
         try:
             artifact = runner.run_task(
                 system_prompt=self.system_prompt, skill=self.skill, context_pack=pack)

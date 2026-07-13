@@ -233,6 +233,48 @@ def test_stage_provider_records_cost(daemon, tmp_path):
     assert daemon.query_one("SELECT phase,tokens_total,money FROM ledger ORDER BY id DESC LIMIT 1") == ("idea", 15000, 4.5)
 
 
+def test_fresh_stage_providers_keep_distinct_durable_heartbeats(daemon, tmp_path):
+    """Two post-restart n1 calls retain both heartbeat files instead of reusing one local-seq path."""
+    purposes = []
+
+    class BoundRunner(_UsageRunner):
+        def __init__(self):
+            super().__init__(
+                {"idea_set.json": _IDEA}, _known_usage(tokens_total=1))
+            self.runner_call_ids = []
+
+        def bind_runner_call(self, **kwargs):
+            self.runner_call_ids.append(kwargs["runner_call_id"])
+
+    runners = []
+    for _restart in range(2):
+        runner = BoundRunner()
+        runners.append(runner)
+
+        def factory(_transcripts, purpose, *, current=runner):
+            purposes.append(purpose)
+            return current
+
+        StageProvider(
+            runner_factory=factory, schemas=SCHEMAS, policy=POLICY,
+            system_prompt="S", skills=_SKILLS, work_root=str(tmp_path),
+            cost_ledger=CostLedger(daemon, POLICY),
+        ).idea(NS(cycle_id="c1"), _pack("idea"))
+
+    rows = daemon.query(
+        "SELECT id,transcript_ref FROM runner_call ORDER BY id")
+    assert purposes == ["idea-n1", "idea-n1"]
+    assert [runner.runner_call_ids for runner in runners] == [
+        [rows[0][0]], [rows[1][0]]]
+    refs = [Path(row[1]) for row in rows]
+    assert [path.name for path in refs] == [
+        f"idea-rc{rows[0][0]}.heartbeat.json",
+        f"idea-rc{rows[1][0]}.heartbeat.json"]
+    assert refs[0] != refs[1] and all(path.is_file() for path in refs)
+    assert [json.loads(path.read_text(encoding="utf-8"))["runner_call_id"]
+            for path in refs] == [rows[0][0], rows[1][0]]
+
+
 def test_stage_provider_cost_failure_is_fatal_when_budget_enabled(daemon, tmp_path, monkeypatch):
     cl = CostLedger(daemon, POLICY)
 

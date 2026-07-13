@@ -180,7 +180,7 @@ def test_stage_drift_retries(tmp_path):
 
 
 def test_transcript_purpose_unique_per_call(tmp_path):
-    """调用序号递增（transcript 文件名唯一，P6 回放防覆盖）。"""
+    """实例内 purpose 标签递增；生产 transcript 的跨重启唯一性另由 runner_call_id 保证。"""
     seen = []
     sp = StageProvider(runner_factory=lambda td, pt: (seen.append(pt), MockRunner(
         [{"selection.json": _GOOD_SELECTION}]))[1], schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
