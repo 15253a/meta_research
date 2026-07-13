@@ -8,7 +8,8 @@ receipt 证明本机子树与 daemon container 均排空（适用条件与残余
 
 > 设计真相唯一在 `../reference/第一部分-系统架构设计.md`；本 README 是**操作面**（怎么跑、怎么配、怎么
 > 观测/干预、边界在哪）。构建历史见仓库根 `ROADMAP.md` / `build_log/`。
-> T1/T2 sealed-holdout/one-shot 使用独立的 [qualification runbook](QUALIFICATION.md)。
+> T1/T2 sealed-holdout/one-shot 使用独立的 [qualification runbook](QUALIFICATION.md)；其中明确列出当前
+> 已机械闭合的 final 边界与尚缺的 T1 confirmatory LODO，不把部分结果冒充完整 §7.4 验收。
 
 ## 0. 一分钟跑起来
 
@@ -305,19 +306,26 @@ python -m orchestrator.storage_ops --work-root "$SOURCE" mirror-logs
 python -m orchestrator.storage_ops --work-root "$SOURCE" \
   restore-with-import-materializations --target "$TARGET"
 
-# 3. 用唯一的现有入口精确尝试一轮。生产验收不要使用 --no-outbound。
+# 3. SQLite-only restore 不含 connector producer/cursor authority；必须禁用出站，避免历史通知重投。
 python -m orchestrator.run --system-root "$SYSTEM_ROOT" --work-root "$TARGET" \
-  --max-cycles 1 --once
+  --max-cycles 1 --once --no-outbound
 
 # 4. source/target owner 都停止后打包；output-parent 必须在二者之外。
 python -m orchestrator.evidence_pack pack \
   --source-work-root "$SOURCE" --resume-work-root "$TARGET" \
-  --output-parent "$EVIDENCE_DIR"
+  --output-parent "$EVIDENCE_DIR" \
+  --canary-root "$CANARY_ROOT" --canary-run-id "$CANARY_RUN_ID" \
+  --canary-scope two-node-process-crash
 
 # 5. 可在 source/target 都不可用的环境中只读复验。
 python -m orchestrator.evidence_pack verify \
   --pack "$EVIDENCE_DIR/<manifest-sha256>.evidence"
 ```
+
+`$TARGET` 与 `$SOURCE` 是不同绝对路径。若步骤 3 使用 production policy，部署者必须为 `$TARGET` 另签一份
+仍在有效期内、精确绑定 target work-root 的 attestation；源目录 attestation 不能复用。若只验证 v1 的
+SQLite/CAS 单轮恢复能力，可改用其余执行配置相同但 `deployment.mode=development` 的
+`$SYSTEM_ROOT`，并保留 `production_ready=false`：该 probe 本来也不证明 production connector 或完整生产恢复。
 
 包是未压缩的 owner-only 内容寻址目录：`manifest.json + READY.json + objects/sha256/<digest>`。manifest
 严格列举每个 object，目录名等于 canonical manifest SHA256；verifier 拒绝缺失/多余对象、未知根条目、
@@ -349,7 +357,10 @@ connector 交付或生产部署。若 source 带 qualification contract，普通
 同理，registered checkpoint、执行日志正本、用户上传资产与绝对 path relocation 仍列入
 `unresolved_registered_assets`；日志 gzip 是冷审计副本，没有 hydration API。故一次成功续跑只证明所选下一轮在
 该恢复切面上可推进，不等于完整 work-root/跨站 DR。source 下已完成的 fixed-linear fault schedule 会自动进入包；
-可选的 shared-fs canary 用 `--canary-root/--canary-run-id` 同时指定，local receipt 仍保持
+生产 two-node shared-fs canary 必须像上方命令同时指定
+`--canary-root/--canary-run-id/--canary-scope two-node-process-crash`。只给前两个参数会因默认
+`single-node-prerequisite` scope 与冻结的
+two-node contract 冲突。local receipt 仍保持
 `two_node_verified=false`，任何 canary 都保持 `infrastructure_fence_verified=false`。
 
 ### 4.1 人类控制台（web 查看 + 交互，步⑨）
@@ -523,11 +534,56 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   命令，真实 soak 应去掉 `--no-outbound` 并沿用部署原本的 connector 参数。selector 已知时先不要执行它：
 
   ```bash
+  set -eu
+  export SYSTEM_ROOT=/absolute/meta-research
+  export WORK_ROOT=/absolute/research-work
+  export SOAK_BASELINE_FILE=/private/outside-work-root/soak-baseline.txt
+  DB="$WORK_ROOT/research.sqlite"
+  if [ -e "$DB" ]; then
+    if ! SOAK_BEFORE="$(sqlite3 -readonly "$DB" \
+      "SELECT count(*) FROM cycle WHERE status='done' AND route IS NOT NULL;")"; then
+      echo "soak baseline query failed" >&2
+      exit 2
+    fi
+  else
+    SOAK_BEFORE=0
+  fi
+  case "$SOAK_BEFORE" in ''|*[!0-9]*) echo "invalid soak baseline" >&2; exit 2;; esac
+  (umask 077; set -o noclobber; printf '%s\n' "$SOAK_BEFORE" > "$SOAK_BASELINE_FILE")
+  ```
+
+  Terminal A/systemd 再启动 resident owner；研究达到 max-cycles 后它会有意继续提供 query。fault sidecar 可以
+  杀死它，由 service manager 以同一 work-root 重启：
+
+  ```bash
   export SYSTEM_ROOT=/absolute/meta-research
   export WORK_ROOT=/absolute/research-work
   python -m orchestrator.run \
-    --system-root "$SYSTEM_ROOT" --work-root "$WORK_ROOT" --no-outbound
+    --system-root "$SYSTEM_ROOT" --work-root "$WORK_ROOT" \
+    --max-cycles 200 --no-outbound
   ```
+
+  全部预声明故障/重启完成且 resident owner 已干净停止后，operator 在独立 shell 做最终计数门：
+
+  ```bash
+  set -eu
+  export WORK_ROOT=/absolute/research-work
+  export SOAK_BASELINE_FILE=/private/outside-work-root/soak-baseline.txt
+  DB="$WORK_ROOT/research.sqlite"
+  IFS= read -r SOAK_BEFORE < "$SOAK_BASELINE_FILE"
+  case "$SOAK_BEFORE" in ''|*[!0-9]*) echo "invalid soak baseline" >&2; exit 2;; esac
+  if ! SOAK_AFTER="$(sqlite3 -readonly "$DB" \
+    "SELECT count(*) FROM cycle WHERE status='done' AND route IS NOT NULL;")"; then
+    echo "soak final query failed" >&2
+    exit 2
+  fi
+  case "$SOAK_AFTER" in ''|*[!0-9]*) echo "invalid soak final count" >&2; exit 2;; esac
+  test "$((SOAK_AFTER - SOAK_BEFORE))" -ge 200
+  ```
+
+  `--max-cycles 200` 只是本次调用上限，不是通过证明：τ、pause、文件请求、global stop 或既有 terminate 都可能让
+  入口以 0 退出但不足 200 轮。真实 soak 必须记录启动前后 `cycle.status='done' AND route IS NOT NULL` 的差值并
+  要求 `>=200`，同时保留真实 provider/import/train/fault 回执；不能只看进程退出码或 `MAX(cycle.id)`。
 
   在启动目标 execution 前准备一个**新的** 32 位小写十六进制 `schedule_id`。下面的 `execution_kind` 与
   `(db_owner_kind, db_owner_id)` 必须和将出现的 receipt 精确一致；示例在 run row 41 的 manifest train 上杀

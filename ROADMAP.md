@@ -527,11 +527,17 @@
                 无 verdict；全量依用户要求留到最终检查点）。
               b.2b.2 的 import CAS scope 已完成；execution-log 正本、checkpoint/content store 与完整 work-root DR
               仍明确不在该 scope，故 b.2b/b.2/b 父项暂不勾选，不虚报完整灾备。
-        - [x] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer。
-          - [x] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 全部 sealed-holdout/one-shot/non-feedback 约束；
-            T1 的 DREAMER 在 A/B/C/HPO/claim 不可见；T2 的全部 final folds 在 final 前不可见、final 每 unit 只挂
-            一个 X-only fold；独立 root evaluator 从 sealed truth 出分。→ commit `2a98e4b`（build_log 0077；
-            qualification/deployment 相关 132 + affected 13、sandbox/entry 164、真实 SEED/DREAMER；全量留最终检查点）。
+        - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer；
+          c.1b 未完成前父项不勾选。
+          - [ ] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 sealed-holdout/one-shot/non-feedback 约束。
+            - [x] CP11.4c.3c.1a final sealed boundary：T1 DREAMER 在 final 前不可见；T2 全部 final folds 在 final
+              前不可见、final 每 unit 只挂一个 X-only fold；独立 root evaluator 从 sealed truth 出分。
+              → commit `2a98e4b`（build_log 0077；qualification/deployment 相关 132 + affected 13、
+              sandbox/entry 164、真实 SEED/DREAMER；全量留最终检查点）。
+            - [ ] CP11.4c.3c.1b T1 confirmatory lifecycle：2026-07-13 可执行性复审发现，claim-lock 尚未绑定
+              A high-water/exact source，B 后普通研究仍可反复消费 explore mounts，且无独立 C LODO batch/scorer
+              receipt；因此当前只闭合 D，不能把 DREAMER result 冒充完整 A→B→C→D。以不增加第二 DB/daemon/
+              scheduler 为前提，补最薄的 B boundary、一次性 C 结果和 D admission gate 后再勾父项。
           - [x] CP11.4c.3c.2 目标 VEPFS 两节点 lease/fd/journal canary + 预声明 fault schedule soak runner。
             - [x] CP11.4c.3c.2a SQLite storage boundary：已知本地盘用 WAL，GPFS/未知盘用
               `DELETE` + `synchronous=FULL`；旧 WAL 在任何 schema/data 读前以 EXCLUSIVE 唯一 owner 迁移；
@@ -586,5 +592,6 @@
             计数归零，也不会覆盖旧调用证据。query responder 同步返回真实存在的 rc events 路径。
             → commit `b208233`（build_log 0087；相关 179；跨新实例 rc transcript/heartbeat 与 bound query
             精确回归；内部终审 APPROVE；全量留最终检查点）。
-          - [ ] CP11.4c.3d.2 dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector
-            就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。
+          - [ ] CP11.4c.3d.2 先闭合 CP11.4c.3c.1b；dedicated VM/private cgroup+NVIDIA Docker、GPFS
+            quota/second node/connector 就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，
+            再勾 CP11.4c。
