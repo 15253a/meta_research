@@ -27,6 +27,16 @@ from .instance_lease import (
     restore_parent_claim_name,
 )
 from . import storage_governance as sg
+from .storage_paths import (
+    RegisteredPathError,
+    registered_path_roots,
+    validate_restore_target_lineage,
+)
+from .storage_restore_contract import (
+    REGISTERED_RESTORE_MARKER,
+    StorageRestoreContractError,
+    continuation_mode,
+)
 
 
 VERIFY_SCHEMA = "meta-research-storage-verify/v1"
@@ -688,6 +698,10 @@ class SnapshotArchive:
                      or not continuation_marker
                      or len(continuation_marker) > 1024)):
             raise ValueError("restore continuation_marker 须为非空有界 bytes")
+        try:
+            restore_continuation_mode = continuation_mode(continuation_marker)
+        except StorageRestoreContractError as error:
+            raise StorageOperationError("restore continuation_marker protocol 非法") from error
         chain = self._chain(retain=retain)
         selected = chain["ordered"][-1] if cycle is None else _cycle_number(cycle)
         if selected not in chain["ordered"]:
@@ -710,9 +724,12 @@ class SnapshotArchive:
             raise StorageOperationError("restore target parent 不可解析") from error
         _regular_directory(parent, label="restore target parent")
         destination = parent / destination.name
-        source_root = self.work_root.resolve(strict=True)
-        if destination == source_root or source_root in destination.parents:
-            raise StorageOperationError("restore target 解析后不得位于源 work_root 内")
+        try:
+            validate_restore_target_lineage(self.work_root, destination)
+        except RegisteredPathError as error:
+            raise StorageOperationError(
+                "restore target 解析后不得位于/包含 registered path-lineage "
+                "root（不得相等/嵌套）") from error
         claim = destination.parent / restore_parent_claim_name(destination)
         resumable_fallback = (
             continuation_marker is not None and os.path.lexists(claim))
@@ -741,15 +758,14 @@ class SnapshotArchive:
             receipt = {
                 "schema": RESTORE_SCHEMA,
                 "scope": "sqlite_truth_only",
-                "continuation_mode": (
-                    "import_materialization_restore_required"
-                    if continuation_marker is not None
-                    else "legacy_adoption_on_first_start"),
+                "continuation_mode": restore_continuation_mode,
                 "publication_contract": "atomic_noreplace_or_lease_fenced_ready",
                 "source_work_root": str(self.work_root),
                 "source_cycle": f"c{selected}",
                 "source_manifest_sha256": manifest["manifest_sha256"],
                 "backup": manifest["backup"],
+                "registered_path_roots": [
+                    str(path) for path in registered_path_roots(self.work_root)],
             }
             sg._atomic_write(
                 temporary / "restore.json", sg._canonical(receipt), mode=0o400)
@@ -959,6 +975,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply.add_argument("--expect-sha256", required=True)
     sub.add_parser("mirror-logs")
     sub.add_parser("verify-log-mirrors")
+    sub.add_parser("mirror-registered-assets")
+    sub.add_parser("verify-registered-assets")
     verify_imports = sub.add_parser("verify-import-materializations")
     verify_imports.add_argument("--cycle")
     restore_imports = sub.add_parser("restore-import-materializations")
@@ -967,6 +985,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     restore_complete = sub.add_parser("restore-with-import-materializations")
     restore_complete.add_argument("--target", required=True)
     restore_complete.add_argument("--cycle")
+    restore_registered = sub.add_parser("restore-registered-assets")
+    restore_registered.add_argument("--target", required=True)
+    restore_registered.add_argument("--cycle")
+    restore_all = sub.add_parser("restore-with-registered-assets")
+    restore_all.add_argument("--target", required=True)
+    restore_all.add_argument("--cycle")
     args = parser.parse_args(argv)
     work_root = Path(os.path.abspath(args.work_root))
 
@@ -990,12 +1014,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = _run_with_lease(
             work_root, lambda archive: archive.apply_gc(
                 plan=wrapper["plan"], expected_sha256=args.expect_sha256))
-    elif args.command in {"mirror-logs", "verify-log-mirrors"}:
+    elif args.command in {
+            "mirror-logs", "verify-log-mirrors",
+            "mirror-registered-assets", "verify-registered-assets"}:
         from .storage_assets import RegisteredAssetArchive
-        operation = (
-            (lambda archive: RegisteredAssetArchive(archive).mirror_logs())
-            if args.command == "mirror-logs" else
-            (lambda archive: RegisteredAssetArchive(archive).verify_log_mirrors()))
+        operations = {
+            "mirror-logs": lambda archive: RegisteredAssetArchive(
+                archive).mirror_logs(),
+            "verify-log-mirrors": lambda archive: RegisteredAssetArchive(
+                archive).verify_log_mirrors(),
+            "mirror-registered-assets": lambda archive: RegisteredAssetArchive(
+                archive).mirror_registered_assets(),
+            "verify-registered-assets": lambda archive: RegisteredAssetArchive(
+                archive).verify_registered_assets(),
+        }
+        operation = operations[args.command]
         result = _run_with_lease(work_root, operation)
     else:
         from .storage_imports import (
@@ -1008,6 +1041,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "restore-import-materializations":
             operation = lambda archive: ImportMaterializationArchive(
                 archive).restore(target=args.target, cycle=args.cycle)
+        elif args.command == "restore-registered-assets":
+            from .storage_assets import RegisteredAssetArchive
+            operation = lambda archive: RegisteredAssetArchive(
+                archive).restore_registered_assets(
+                    target=args.target, cycle=args.cycle)
+        elif args.command == "restore-with-registered-assets":
+            from .storage_assets import RegisteredAssetArchive
+
+            def operation(archive):  # noqa: ANN001
+                registered_archive = RegisteredAssetArchive(archive)
+                # Reject a historical/non-mirrored selector before publishing any
+                # partial target or parent claim.
+                registered_archive.verify_registered_restore_source(
+                    cycle=args.cycle)
+                requested = Path(os.path.abspath(os.fspath(args.target)))
+                resolved = requested.parent.resolve(strict=True) / requested.name
+                claim = resolved.parent / restore_parent_claim_name(resolved)
+                if (not os.path.lexists(resolved)
+                        or os.path.lexists(claim)):
+                    sqlite_receipt = archive.restore(
+                        target=args.target, cycle=args.cycle,
+                        continuation_marker=REGISTERED_RESTORE_MARKER)
+                else:
+                    receipt_path = resolved / "restore.json"
+                    sqlite_receipt = sg._parse_json(
+                        sg._read(receipt_path), receipt_path)
+                registered = registered_archive.restore_registered_assets(
+                    target=args.target, cycle=args.cycle)
+                imports = ImportMaterializationArchive(archive).restore(
+                    target=args.target, cycle=args.cycle)
+                return {
+                    "schema": "meta-research-complete-registered-restore/v1",
+                    "scope": (
+                        "sqlite_registered_checkpoints_logs_and_import_cas"),
+                    "sqlite": sqlite_receipt,
+                    "registered_assets": registered,
+                    "import_materializations": imports,
+                }
         else:
             def operation(archive):  # noqa: ANN001
                 requested = Path(os.path.abspath(os.fspath(args.target)))

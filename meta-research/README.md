@@ -220,7 +220,9 @@ metadata/heartbeat 是唯一控制面写入，shell 重定向也应指向源目�
 `.restore-in-progress-<sha256(abs-target)>` sibling claim，操作员检查后再清理。成功的 fallback 目标会多出正常的
 `.orchestrator-instance.lock` / `state/orchestrator_heartbeat.json` 控制元数据。receipt 明示
 `scope=sqlite_truth_only` 与 `publication_contract=atomic_noreplace_or_lease_fenced_ready`；新 work-root 首次
-启动会诚实建立 adoption baseline，不带回原 views Git、snapshot timeline、checkpoint/log/import 原件，
+启动会诚实建立 adoption baseline；`registered_path_roots` 只为 append-only DB 中的旧绝对 ref 保存受审路径
+lineage，不改写 checkpoint 行。target 不得等于、位于或包含当前/任一历史 lineage root；该检查在创建 target 或
+parent claim 前完成，避免发布一个随后无法解析自身旧 ref 的二次恢复根。基础 `restore` 不带回原 views Git、snapshot timeline、checkpoint/log/import 原件，
 因此不是完整 work-root 或跨站灾备。GC 默认至少保留最近 3 代；
 apply 必须同时给 canonical plan 和显式 hash，先持久化不可变 authority，再仅删除 backup CAS 中计划列明的
 expired/orphan 文件。即使进程在 authority 与 unlink 之间退出，该代也已逻辑退役且不能恢复，重放只补物理删除；
@@ -248,7 +250,8 @@ ref/hash/bytes 一致；命令不移动、删除、chmod 或原地压缩它。ob
 
 机器可读 scope 是 `db_registered_execution_logs_only`：它不 glob 未入库失败日志、runner transcript、
 guardian capture 或 sandbox session，也不声称覆盖“所有 raw log”。镜像是已登记冷数据的内容副本/
-离线校验面，原件仍是冻结 ref 指向的正本，它尚未进入 `restore` 恢复闭包。单次离线扫描随
+离线校验面，原件仍是冻结 ref 指向的正本；只有下文 `restore-with-registered-assets` 会从该镜像 hydration
+日志原件，基础 `restore` / import-only 恢复仍不做。单次离线扫描随
 cycle/log 数和日志总字节线性增长；若每轮全量自动执行，跨轮累计会趋近二次方，因此本设计明确只用于
 人工/最终检查点。
 
@@ -293,10 +296,57 @@ fsync。进程在任一窗口退出时，普通启动仍会拒绝 target，同�
 不删除源/孤儿，也不恢复 execution-log 正本、checkpoint、content store、views Git 或完整 work-root；日志冷副本仍由
 上节 mirror 命令独立核验。因此本项闭合的是 import CAS 灾备，不外推为 CP11.4c.3 的两节点/≥200 轮生产验收。
 
+#### Registered checkpoint/log 原件恢复闭包（CP11.4c.3b.2b.3）
+
+最终检查点先停源 owner，一次性冻结并核验最新 high-water 的全部 DB-registered checkpoint 与 execution log：
+
+```bash
+python -m orchestrator.storage_ops --work-root <source-work-root> \
+  mirror-registered-assets
+python -m orchestrator.storage_ops --work-root <source-work-root> \
+  verify-registered-assets
+
+# 推荐完整组合：SQLite + checkpoint/log 原件 + import repository/dependency CAS
+python -m orchestrator.storage_ops --work-root <source-work-root> \
+  restore-with-registered-assets --target <new-work-root>
+
+# 只用于续完同一 source/latest high-water 已经留下的 fenced target：
+python -m orchestrator.storage_ops --work-root <source-work-root> \
+  restore-registered-assets --target <existing-restored-root>
+```
+
+checkpoint 镜像从最新已深验 SQLite backup 的 `checkpoint` 行枚举，只接受 source path 可映射到当前
+work-root/path-lineage 的单链接常规文件；raw bytes 以登记 SHA256 直接进入
+`state/storage/checkpoint-mirrors/objects/sha256/`，per-row immutable index 另绑 variant/key/ref、artifact type、
+origin/provenance 与相对 hydration path。同内容 checkpoint 只存一个 CAS object，命令不改原件；它与日志镜像一样
+是离线/最终检查点操作，不挂每轮终态，避免大 checkpoint 的跨轮重复复制。`state/`、`views/`、SQLite/restore/lease
+控制文件名是运行时可写或派生的保留 namespace，不能登记成 hydration 目标；合法 checkpoint/log 应位于研究产物/
+staging namespace，避免恢复后被 heartbeat、console、snapshot publisher 等控制面改写。
+
+`restore-with-registered-assets` 只接受最新 mirrored high-water；历史 selector 会在创建 target/parent claim 前拒绝。
+SQLite target 第一次可见前放入独立 `registered_asset_restore_required` marker，随后按已冻结相对路径以 no-clobber
+方式 hydration checkpoint 与日志 raw 原件，再续 import CAS。checkpoint/log 同路径但不同 hash/bytes 会在写 target
+前拒绝；已存在文件只能 exact hash/bytes/mode 复用，绝不覆盖。每个文件和 completion receipt 都先 fsync；kill 后
+可在同 marker + target lease 下重放。独立 `restore-registered-assets` 也只接受该 registered continuation receipt/marker；
+import-only target 会 fail-closed，不能事后用一个较窄 marker 绕过最终 registered completion 复验。
+
+最后的 import 步骤不能凭自报空 receipt 解除 marker：它会从源 snapshot/mirror **重新构造 exact files authority**，
+与 target immutable completion receipt 逐字段对比，并逐个重读 hydrated 文件的 owner/type/link/mode/hash/bytes；
+任一缺失、篡改或尚未 hydration 都保留 `.restore-in-progress`，普通启动继续 fail-closed。旧
+`restore-with-import-materializations` 仍是明确的 import-only 较窄合同，不能冒充本组合恢复。
+
+该闭包覆盖 SQLite 登记的 checkpoint、execution-log 原件以及 DB 可达 repository/dependency import CAS；旧绝对 ref 通过
+`restore.json.registered_path_roots` 映射到当前根，二次恢复仍保留完整 lineage，不修改 append-only schema。
+它仍**不** glob runner/guardian/sandbox/qualification authority、未登记失败产物、用户 uploads/input、views Git 或
+connector cursor，也不把 source 内同一 VEPFS storage subtree 冒充完整 work-root/fileset/跨站 DR。整根或站点丢失
+仍须目标环境提供独立故障域归档位置并另做演练。
+
 #### Canonical evidence pack 与单轮续跑探针（CP11.4c.3c.3）
 
-证据包是现有运维原语之上的**只读汇总层**，不是第二套 restore/launcher。恢复仍只走上一节的
-`restore-with-import-materializations`，研究仍只走既有 `orchestrator.run`。推荐对最新 high-water 做下面的
+证据包是现有运维原语之上的**只读汇总层**，不是第二套 restore/launcher。下面的窄口径示例仍走
+`restore-with-import-materializations`，研究仍只走既有 `orchestrator.run`；已经成功完成
+`restore-with-registered-assets` 的 target 也可作为同一 SQLite/import-CAS 单轮 resume probe，但 v1 不因此代证
+registered hydration。推荐对最新 high-water 做下面的
 完整顺序；旧 cycle 不能和“最新日志镜像”形成同一个精确闭包，因此 v1 不提供历史 cycle 选择器：
 
 ```bash
@@ -332,7 +382,9 @@ SQLite/CAS 单轮恢复能力，可改用其余执行配置相同但 `deployment
 严格列举每个 object，目录名等于 canonical manifest SHA256；verifier 拒绝缺失/多余对象、未知根条目、
 symlink/hardlink、权限/owner/bytes/hash 漂移，并以流式 hash 和显式文件/总字节硬上限处理大对象，不把整份
 SQLite/image archive 读入内存。SQLite backup 仍走既有 quick/FK/schema/terminal 深验；日志镜像在包内直接做
-有界单-member gzip→登记 raw hash/bytes 复验，不会回开 receipt 中的 source 绝对路径。reachable repository
+有界单-member gzip→登记 raw hash/bytes 复验，不会回开 receipt 中的 source 绝对路径。manifest 冻结经 source
+`restore.json` 校验得到的 `source_registered_path_roots`；离线 verifier 只用它把合法旧绝对 log ref 映射为镜像
+index 的当前相对路径，并拒绝非 canonical、重复、嵌套或歧义 roots。reachable repository
 CAS 和 dependency CAS 中由 receipt 绑定的恢复语义文件闭包与原 verifier report 一并冻结；其 provider
 语义是 pack 时已由现有 inspector 验证，离线包不联网、不调 Docker。builder 的 install/build/save
 诊断日志、process pointer 和动态 sandbox metadata 没有被 dependency receipt 内容绑定，因此不冒充恢复闭包、
@@ -343,7 +395,8 @@ installed manifest 重建其精确语义文件集合；这验证冻结 bytes 的
 留证时须把 `<manifest-sha256>` 另存到变更单/不可变审计系统。
 
 `one_cycle_resume_probe_verified=true` 不是根据 exit code 推断。packer 要求 `restore.json` 精确绑定 source 最新
-cycle/manifest/backup，target 无 marker/parent claim，target snapshot chain 从 source cycle 建立
+cycle/manifest/backup/path-lineage，offline verifier 再要求 receipt roots 与 manifest
+`source_registered_path_roots` exact equality。target 无 marker/parent claim，target snapshot chain 从 source cycle 建立
 `adoption_baseline`，并且**恰好**新增一个 `status=done AND route IS NOT NULL` 的研究 cycle 及其深验 snapshot。
 该轮还须至少有一条 `status=success` 的研究阶段 `runner_call` 及同 cycle 的关联 ledger；restore 后 0 轮、
 failed/aborted、pause/file-request/global-stop 都不会通过。此结论与 fault final 分开；packer
@@ -355,9 +408,11 @@ connector 交付或生产部署。若 source 带 qualification contract，普通
 不会带回 firewall，而 final-consumed contract 即使安全带回也应禁止继续研究。无 resume 时可把 qualification
 内部 receipt 作为 `receipt_only` 冻结，但不声称 sealed truth/source/runtime/GPU 闭包完成。
 
-同理，registered checkpoint、执行日志正本、用户上传资产与绝对 path relocation 仍列入
-`unresolved_registered_assets`；日志 gzip 是冷审计副本，没有 hydration API。故一次成功续跑只证明所选下一轮在
-该恢复切面上可推进，不等于完整 work-root/跨站 DR。source 下已完成的 fixed-linear fault schedule 会自动进入包；
+evidence-pack v1 本身仍不打包 checkpoint mirror、registered hydration completion、用户上传资产或完整
+restore/path-lineage receipt 证明；`source_registered_path_roots` 只闭合包内 log-mirror identity，不能升级恢复
+scope。因此这些仍按该包的窄口径列入 `unresolved_registered_assets`；即使另行成功执行了上节组合恢复，
+也必须把其原始 CLI/receipt 作为 building 终验证据单独保存，不能让 v1 pack 越权代证。故一次成功续跑只证明所选
+下一轮在 SQLite/import-CAS 切面可推进，不等于完整 work-root/跨站 DR。source 下已完成的 fixed-linear fault schedule 会自动进入包；
 生产 two-node shared-fs canary 必须像上方命令同时指定
 `--canary-root/--canary-run-id/--canary-scope two-node-process-crash`。只给前两个参数会因默认
 `single-node-prerequisite` scope 与冻结的
