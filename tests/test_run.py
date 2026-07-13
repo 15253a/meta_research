@@ -1171,6 +1171,25 @@ def test_main_cli_attack_clean_error(tmp_path, monkeypatch, capsys):
     assert rc == 2 and "尚未装配的组件" in capsys.readouterr().out
 
 
+def test_main_cli_reports_post_claim_fence_without_traceback(tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+    from orchestrator.qualification_firewall import QualificationClaimLockedError
+
+    monkeypatch.setattr(
+        R, "build_system",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            QualificationClaimLockedError("qualification claim 已锁定")))
+
+    rc = R.main([
+        "--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+        "--once", "--no-outbound",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "启动预检失败" in captured.err
+    assert "claim 已锁定" in captured.err
+
+
 def test_stop_reason_print_prefers_block(tmp_path, monkeypatch, capsys):
     """外审 SHOULD 回归：全局等待时 CLI 停因输出阻断原因（不被 prior-terminate/idle 掩盖）。"""
     import orchestrator.run as R

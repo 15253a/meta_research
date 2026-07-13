@@ -74,7 +74,10 @@ from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestReject, 
                      InteractionNotifier, Outbox, ResearchNotifier,
                      make_advancer_precheck)
 from .process_supervisor import ExecutionSupervisor
-from .qualification_firewall import load_qualification_firewall
+from .qualification_firewall import (
+    QualificationFirewallError,
+    load_qualification_firewall,
+)
 from .runner import CodexRunner, terminate_active_process_groups
 from .schemas import SchemaSet
 from .stage_provider import JudgeProvider, PlanReviewProvider, StageProvider
@@ -1617,7 +1620,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
     try:
         system = build_system(args.system_root, args.work_root, outbound_config=outbound_config)
-    except (InstanceLeaseError, DeploymentPreflightError) as error:
+    except (
+            InstanceLeaseError, DeploymentPreflightError,
+            QualificationFirewallError) as error:
         print(f"[run] 启动预检失败：{error}", file=sys.stderr)
         return 2
     deployment_receipt = getattr(system, "deployment_receipt", None)
