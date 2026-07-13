@@ -198,6 +198,27 @@ def test_resource_request_sidecar_fails_loud(tmp_path):
         sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning"))
 
 
+def test_resource_request_schema_feedback_aggregates_all_root_errors(tmp_path):
+    """One expensive retry receives every root schema defect, not one oscillating key."""
+    bad = {"version": 1, "reason_md": "need file"}
+    runner = MockRunner([
+        {"resource_request.json": bad},
+        {"selection.json": _GOOD_SELECTION},
+    ])
+    bridge_calls = []
+    sp = StageProvider(
+        runner_factory=lambda td, pt: runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="S", skills=SKILLS,
+        work_root=str(tmp_path),
+        file_request_bridge=lambda stage, request, cyc: bridge_calls.append(request))
+    assert sp.reasoning(NS(cycle_id="c1", question_id=None), _pack("reasoning")) == {
+        "selection.json": _GOOD_SELECTION}
+    feedback = runner.skills_seen[1]
+    assert "summary_md" in feedback and "items" in feedback
+    assert "version" in feedback and "reason_md" in feedback
+    assert bridge_calls == []
+
+
 # ============ answer.json 语义边界（内审 #2：reasoning-only 轮不因幻觉 answer 误关问）============
 def test_spurious_answer_in_bootstrap_does_not_close(tmp_path):
     """StageProvider 只保证 answer.json 结构合法、透传；语义由组件把关——advancer 的 reasoning-only 轮

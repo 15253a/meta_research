@@ -225,6 +225,18 @@ class StageProvider:
                                       execution_receipt_ref=art.execution_receipt_ref)
                     raise RunnerError(f"{stage} 产出 resource_request.json sidecar，但本装配未接文件请求桥"
                                       "——不静默丢弃")
+                sidecar_errors = self._schema_errors_by_name(
+                    "resource_request", art.files["resource_request.json"])
+                if sidecar_errors:
+                    self._record_cost(
+                        cyc, stage, art.usage, status="failed",
+                        failure_kind="artifact_parse", attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    last_err = (
+                        "resource_request.json schema 校验失败（请一次修完全部列出的字段）:\n"
+                        + "\n".join(sidecar_errors[:8]))
+                    continue
                 try:
                     rid = self.file_request_bridge(stage, art.files["resource_request.json"], cyc)
                 except FileRequestReject as e:  # 只兜业务拒（sidecar 非法/quota 尽）→ 反馈重试（有界）；

@@ -1,6 +1,6 @@
 # SKILL · plan —— 复用判定 + 锁评估协议
 
-> 版本：m4-cp114c2b3b。按《第一部分》§3.3 与流程图 04-Plan；产物 schema =
+> 版本：m4-cp114c3d12。按《第一部分》§3.3 与流程图 04-Plan；产物 schema =
 > `schemas/plan.schema.json` 或受限控制 sidecar `schemas/import_search_request.schema.json`。
 > 本阶段 = 计划调用（phase=plan）+ **可回答性评审**独立调用（phase=audit，≤2 轮，本文件
 > 【评审任务】节）。评估协议在本阶段锁死，bundle 只照办、不再发明（I2 源头）。
@@ -32,7 +32,7 @@
    | 情形 | 处置 | eval_action | attempt_purpose | 另须携带 |
    |---|---|---|---|---|
    | 同协议@版本+指标已测+env 兼容 | 引历史 evaluation 进 `reuse_evidence`，**不产 target** | — | — | — |
-   | 协议场景升版 | `eval` target（新 evaluation） | `create_evaluation` | `protocol_upgrade` | `eval_key` + `evaluation_source="protocol_upgrade"` |
+   | 协议场景升版 | `eval` target（新 evaluation） | `create_evaluation` | `protocol_upgrade` | `claim{baseline_ref, variant_key}` + `eval_key` + `evaluation_source="protocol_upgrade"` |
    | 同协议@版本缺指标 | `eval` target（追加 attempt） | `append_attempt` | `metric_append` | `evaluation_id`（既有格子） |
    | env 失配 / 结果存疑 | `eval` target（identity 复现） | `append_attempt` | `repro_eval` | `evaluation_id` |
    | 池中无 + 自建角色（消融/替换/超参/评估） | `build` / `exec` / `eval`（身份按三问决策树 §1.2.2：前向逻辑变=新 baseline、要重训=新 variant、只改评估=新 evaluation） | （eval 时按上表） | （eval 时按上表） | **build ⇒ `claim{canonical_key, slug}`；exec ⇒ `claim{baseline_ref, variant_key, config_json}`**（I5 占坑输入） |
@@ -56,6 +56,13 @@
    - 候选数与检索强度由编排器按 question score/est_cost + B(t) + policy 机械决定，
      所以 sidecar 中没有也不得自造“搜几个”字段。
 4. **锁评估协议**（字段名按 schema 逐字写）：
+   - 协议参数是本阶段的**规范性设计决定**，不是历史/测量事实。新建**运行时合成**协议时，plan
+     必须自行选择并在 `scope_spec` 显式冻结可复现的 seed 列表、各 split 样本量、类别先验、生成分布
+     参数（或精确数据资产选择规则）、标签规则与预处理。`ContextPack 未预先给值不构成`
+     资料缺失；必须把选值诚实标为“本 plan 设计”，不得伪称是历史事实，也**不得为此发 resource_request**。
+     问题/idea 文本中的“已锁定”只表达最终可比性要求，不等于存在一份未提供的外部协议卡；若检索区
+     没有已提交 protocol，本阶段就是锁定点。只有上游明确要求复现既有外部 benchmark/protocol/用户资产，
+     且必要内容经允许路径确实无法获得时，才按 system prompt 的 exact skeleton 请求文件。
    - `protocol`：`{name, version（整数≥1）, scope_spec（对象：评估数据/分割/checkpoint 选择/
      流程——一字一句都是 I1 冻结对象）, smoke_md?（smoke 定义）}`；
    - `metric_defs[]`：每项 `{metric_id, version（整数）, name, direction ∈ {higher,lower},
@@ -68,6 +75,8 @@
    `budget_estimate`（数值，总和 ≤ B(t)）· `gpu_required`（bool；只有代码/评估确需 CUDA 时为 true）·
    `spec_md`（本目标做什么，bundle 只照办）·
    按 kind 另加上表"另须携带"列（build/exec 的 `claim`、eval 的三件套）。
+   `eval_action=create_evaluation` 还必须带 `claim{baseline_ref, variant_key}`；这是新 evaluation
+   所属既有变体的身份，不得省略。`append_attempt` 则只用 `evaluation_id` 定位既有格子。
    `build_target_required_metric` 逐 target 声明 required 指标集
    （`{target_key, metric_id, metric_ver}`，I2 核覆盖依据）。
 6. **依赖等待分支**（图 04 DEP 判断）：所需 baseline 正被他轮 building（占坑互斥 I5，
@@ -128,7 +137,9 @@
       "budget_estimate": <数值>, "gpu_required": <true|false>,
       "spec_md": "<bundle 只照办的执行说明>", "need_ids?": ["n1"],
       "claim?": { "canonical_key?": "<build 必>", "slug?": "<build 必>",
-                  "baseline_ref?": "<exec 必>", "variant_key?": "<exec 必>", "config_json?": {} },
+                  "baseline_ref?": "<exec/create_evaluation 必>",
+                  "variant_key?": "<exec/create_evaluation 必>",
+                  "config_json?": { "<exec 训练配置键>": "<值>" } },
       "eval_action?": "<create_evaluation|append_attempt>", "attempt_purpose?": "<按情形表>",
       "eval_key?": "<create 必>", "evaluation_source?": "<create 必>", "evaluation_id?": "<append 必>" } ],
   "protocol": { "name": "<>", "version": 1, "scope_spec": { "<场景字段自定>": "<>" }, "smoke_md?": "<>" },
@@ -176,5 +187,8 @@
    CUDA/GPU 一致；
 4. 指标全部由协议声明（metric_defs ⊆ 协议范围；I2 源头）；
 5. targets 依赖序自洽（seq、eval 引用的对象在此前产生或已在池中）。
+6. 对新建运行时合成协议，`scope_spec` 必须含可复现的具体 seeds/样本量/先验/生成规则；若缺失，
+   `fix_hint` 必须要求 plan **自行选值并锁定**，不得建议向用户索取“既有协议摘要”。只有上下文明确绑定
+   外部既有协议且内容确实不可得，才允许建议 `resource_request`。
 
 fail → 编排器把 issues 回传计划会话修一轮再评；第 2 轮仍 fail → 阶段失败（见通用·失败语义）。
