@@ -11,15 +11,21 @@ import yaml
 
 from orchestrator import run as run_module
 from orchestrator import database as database_module
+from orchestrator import qualification_runner as QR
 from orchestrator.execution_sandbox import DockerExecutionSandbox
 from orchestrator.instance_lease import InstanceBusyError, InstanceLease
 from orchestrator.qualification_firewall import (
     CLAIM_BOUNDARY_PROTOCOL,
     CLAIM_PROTOCOL,
+    CONFIRMATORY_AUDIT_CHECKS,
+    CONFIRMATORY_AUDIT_PROTOCOL,
+    CONFIRMATORY_AUDIT_REF_PROTOCOL,
     CONTRACT_PROTOCOL,
+    FINAL_PROTOCOL,
     QualificationClaimLockedError,
     QualificationFinalizedError,
     QualificationFirewallError,
+    _explore_view_identities,
     _publish_once,
     _read_regular,
     consume_final,
@@ -284,18 +290,52 @@ def _publish_fixture_boundary(work: Path, claim, *, source_hash=None):
             "cycle_id": "c1",
             "storage_manifest_sha256": "sha256:" + "b" * 64,
         },
-        "explore_views": [
-            {"dataset": mount.dataset,
-             "tree_sha256": _sha(mount.dataset.encode("utf-8"))}
-            for mount in explores
-        ],
+        "explore_views": _explore_view_identities(firewall),
         "confirmatory_command": command,
     }
     _publish_once(firewall.claim_boundary_path, _canonical(boundary))
     return publish_claim_lock(work, claim)
 
 
-def test_t1_holdout_is_invisible_until_irreversible_final(tmp_path):
+def _seed_firewall_confirmatory_audit(work: Path) -> str:
+    firewall = load_qualification_firewall(work)
+    _claim_value, claim_raw = firewall.read_claim_lock()
+    _boundary, boundary_raw = firewall.read_claim_boundary()
+    checks = {name: True for name in CONFIRMATORY_AUDIT_CHECKS}
+    audit = {
+        "version": 1, "protocol": CONFIRMATORY_AUDIT_PROTOCOL,
+        "task": "T1", "status": "passed",
+        "contract_sha256": firewall.contract_sha256,
+        "claim_sha256": _sha(claim_raw),
+        "claim_boundary_sha256": _sha(boundary_raw),
+        "confirmatory_result_sha256": "sha256:" + "1" * 64,
+        "confirmatory_output_sha256": "sha256:" + "2" * 64,
+        "audit_input_sha256": "sha256:" + "3" * 64,
+        "auditor": "root firewall fixture", "checks": checks,
+        "evidence": [
+            {
+                "check": name, "ref": f"fixture://{name}",
+                "sha256": "sha256:" + hashlib.sha256(name.encode()).hexdigest(),
+            }
+            for name in sorted(checks)
+        ],
+        "notes": "minimal root authority for firewall boundary test",
+        "reviewed_at_unix": 1.0,
+    }
+    raw = _canonical(audit)
+    authority = work.parent / f"{work.name}-confirmatory-audit.json"
+    authority.write_bytes(raw)
+    authority.chmod(0o444)
+    ref_path = (
+        work / "state" / "qualification" / "confirmatory" / "audit-ref.json")
+    _publish_once(ref_path, _canonical({
+        "version": 1, "protocol": CONFIRMATORY_AUDIT_REF_PROTOCOL,
+        "task": "T1", "path": str(authority), "sha256": _sha(raw),
+    }))
+    return _sha(raw)
+
+
+def test_t1_holdout_is_invisible_until_irreversible_final(tmp_path, monkeypatch):
     work = tmp_path / "work"
     contract = _t1_contract(tmp_path)
     firewall = install_contract(work, contract)
@@ -312,9 +352,38 @@ def test_t1_holdout_is_invisible_until_irreversible_final(tmp_path):
     assert locked["claim_sha256"].startswith("sha256:")
     with pytest.raises(QualificationClaimLockedError, match="claim boundary"):
         firewall.assert_research_open()
+    with pytest.raises(QualificationClaimLockedError, match="confirmatory"):
+        firewall.authorize_mounts(
+            explores, execution_context={"phase": "train"})
+    firewall.authorize_mounts(
+        explores, execution_context={"phase": "qualification-confirmatory"})
+    with pytest.raises(
+            QualificationFirewallError,
+            match="confirmatory/audit authorities"):
+        consume_final(
+            work, source_tree_sha256="sha256:" + "a" * 64,
+            runtime_identity_sha256="sha256:" + "c" * 64,
+            confirmatory_audit_sha256="sha256:" + "d" * 64, now=1.0)
+    audit_hash = _seed_firewall_confirmatory_audit(work)
+    with pytest.raises(
+            QualificationFirewallError,
+            match="confirmatory/audit authorities"):
+        consume_final(
+            work, source_tree_sha256="sha256:" + "a" * 64,
+            runtime_identity_sha256="sha256:" + "c" * 64,
+            confirmatory_audit_sha256=audit_hash, now=1.0)
+    assert not os.path.lexists(firewall.final_path)
+
+    # The runner suite covers the real lifecycle.  This firewall-focused test
+    # now explicitly proves that its former standalone-audit shortcut fails;
+    # patch only the already-tested admission verifier for the remaining
+    # irreversible marker/mount assertions below.
+    monkeypatch.setattr(
+        QR, "verify_confirmatory_admission", lambda **_kwargs: audit_hash)
     marker = consume_final(
         work, source_tree_sha256="sha256:" + "a" * 64,
-        runtime_identity_sha256="sha256:" + "c" * 64, now=1.0)
+        runtime_identity_sha256="sha256:" + "c" * 64,
+        confirmatory_audit_sha256=audit_hash, now=1.0)
     assert marker["units"] == [{"fold": None, "seed": None, "unit_id": "dreamer"}]
     firewall.authorize_mounts(
         [holdout], execution_context={"phase": "qualification-final"})
@@ -325,7 +394,38 @@ def test_t1_holdout_is_invisible_until_irreversible_final(tmp_path):
     with pytest.raises(QualificationFirewallError, match="claim boundary"):
         consume_final(
             work, source_tree_sha256="sha256:" + "b" * 64,
-            runtime_identity_sha256="sha256:" + "c" * 64, now=2.0)
+            runtime_identity_sha256="sha256:" + "c" * 64,
+            confirmatory_audit_sha256=audit_hash, now=2.0)
+
+
+def test_forged_t1_final_marker_cannot_unlock_holdout_without_root_audit(tmp_path):
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    firewall = install_contract(work, contract)
+    claim = _claim("T1")
+    _publish_fixture_boundary(work, claim)
+    _claim_value, claim_raw = firewall.read_claim_lock()
+    boundary, boundary_raw = firewall.read_claim_boundary()
+    _publish_once(firewall.final_path, _canonical({
+        "version": 3, "protocol": FINAL_PROTOCOL, "task": "T1",
+        "contract_sha256": firewall.contract_sha256,
+        "claim_sha256": _sha(claim_raw),
+        "claim_boundary_sha256": _sha(boundary_raw),
+        "source_tree_sha256": boundary["source_tree_sha256"],
+        "runtime_identity_sha256": "sha256:" + "c" * 64,
+        "gpu_canary_sha256": None,
+        "confirmatory_audit_sha256": "sha256:" + "d" * 64,
+        "units": [{"unit_id": "dreamer", "seed": None, "fold": None}],
+        "consumed_at_unix": 1.0,
+    }))
+    holdout = [
+        item["path"] for item in contract["mounts"]
+        if item["role"] == "sealed_holdout"]
+    with pytest.raises(
+            QualificationFirewallError,
+            match="confirmatory/audit authorities"):
+        firewall.authorize_mounts(
+            holdout, execution_context={"phase": "qualification-final"})
 
 
 def test_t2_only_one_fold_view_can_enter_any_candidate_container(tmp_path):
@@ -471,7 +571,8 @@ def test_unbound_claim_and_final_are_rejected(tmp_path):
     with pytest.raises(QualificationFirewallError, match="claim boundary"):
         consume_final(
             work, source_tree_sha256="sha256:" + "a" * 64,
-            runtime_identity_sha256="sha256:" + "c" * 64, now=1.0)
+            runtime_identity_sha256="sha256:" + "c" * 64,
+            confirmatory_audit_sha256="sha256:" + "d" * 64, now=1.0)
     assert not os.path.lexists(firewall.final_path)
 
 
@@ -578,6 +679,42 @@ def test_sandbox_spec_contains_only_referenced_fold_not_all_fifteen(tmp_path):
             ["python", "-c", "pass", first, second], staging_dir=work / "bad",
             log_name="bad.log", env=None, timeout_s=10,
             execution_context={"phase": "qualification-final", "log_name": "bad.log"})
+
+
+def test_t1_confirmatory_sandbox_mounts_exact_frozen_explore_set(tmp_path):
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    firewall = install_contract(work, contract)
+    _publish_fixture_boundary(work, _claim("T1"))
+    explores = [
+        item["path"] for item in contract["mounts"] if item["role"] == "explore"]
+    holdout = [
+        item["path"] for item in contract["mounts"]
+        if item["role"] == "sealed_holdout"][0]
+    config = _policy(contract)["execution"]["sandbox"]
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=config, system_root=SYSTEM_ROOT,
+        qualification_firewall=firewall)
+    sandbox._preflight_done = True
+    sandbox._resource_mode = config["resource_mode"]
+    invocation = sandbox.prepare(
+        ["python", "-c", "pass", *explores],
+        staging_dir=work / "confirm-run", log_name="confirmatory.log",
+        env=None, timeout_s=10,
+        execution_context={
+            "phase": "qualification-confirmatory",
+            "qualification_task": "t1", "unit_id": "confirmatory-lodo",
+            "db_owner_kind": "qualification_confirmatory", "db_owner_id": 1,
+            "log_name": "confirmatory.log",
+        })
+    try:
+        invocation.spec_file.seek(0)
+        spec = json.loads(invocation.spec_file.read())
+        assert [item["source"] for item in spec["readonly_mounts"]] == explores
+        assert holdout not in {item["source"] for item in spec["readonly_mounts"]}
+        assert all(path not in spec["argv"] for path in explores)
+    finally:
+        invocation.close()
 
 
 def test_publish_fallback_reconciles_exact_crash_left_hardlink(tmp_path):

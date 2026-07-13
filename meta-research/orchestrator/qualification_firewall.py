@@ -36,7 +36,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 CONTRACT_PROTOCOL = "meta-research-qualification-firewall/v1"
 CLAIM_PROTOCOL = "meta-research-qualification-claim-lock/v1"
 CLAIM_BOUNDARY_PROTOCOL = "meta-research-qualification-claim-boundary/v1"
-FINAL_PROTOCOL = "meta-research-qualification-final-consumed/v2"
+FINAL_PROTOCOL = "meta-research-qualification-final-consumed/v3"
+CONFIRMATORY_AUDIT_PROTOCOL = (
+    "meta-research-qualification-confirmatory-audit/v1")
+CONFIRMATORY_AUDIT_REF_PROTOCOL = (
+    "meta-research-qualification-confirmatory-audit-ref/v1")
 CONTRACT_RELATIVE_PATH = Path("state/qualification/contract.json")
 CLAIM_RELATIVE_PATH = Path("state/qualification/claim-lock.json")
 CLAIM_BOUNDARY_RELATIVE_PATH = Path("state/qualification/claim-boundary.json")
@@ -48,6 +52,13 @@ _MAX_VIEW_ENTRIES = 100_000
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _UNIT_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish", "env"})
+CONFIRMATORY_AUDIT_CHECKS = frozenset({
+    "lodo_protocol_verified",
+    "heldout_label_isolation_verified",
+    "metric_and_statistics_verified",
+    "claim_and_controls_reviewed",
+    "novelty_audit_completed",
+})
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 
@@ -686,6 +697,7 @@ class QualificationFirewall:
         except KeyError as error:
             raise QualificationFirewallError("执行请求了 contract 外 research mount") from error
         final_consumed = os.path.lexists(self.final_path)
+        marker = self.read_final_marker() if final_consumed else None
         for mount in selected:
             if mount.view_receipt_sha256 is None:
                 _walk_view(mount.path, expected_owner=self.research_uid)
@@ -697,16 +709,45 @@ class QualificationFirewall:
                     hash_cache=self._view_hash_cache)
         phase = execution_context.get("phase")
         if final_consumed:
-            self.read_final_marker()
             if phase != "qualification-final":
                 raise QualificationFinalizedError("final consumed 后只允许 qualification-final 续接")
         if self.task == "T1":
             holdout = [item for item in selected if item.role == "sealed_holdout"]
+            explores = [item for item in selected if item.role == "explore"]
             if holdout and not final_consumed:
                 raise QualificationFirewallError(
                     "DREAMER sealed holdout 在 A/B/C/HPO/claim 阶段不可挂载")
+            boundary_locked = os.path.lexists(self.claim_boundary_path)
+            if (boundary_locked and not final_consumed and explores
+                    and phase != "qualification-confirmatory"):
+                raise QualificationClaimLockedError(
+                    "claim boundary 后 explore mounts 只允许一次性 confirmatory batch")
+            if phase == "qualification-confirmatory":
+                if final_consumed:
+                    raise QualificationFinalizedError(
+                        "final consumed 后不得补跑 confirmatory")
+                boundary, _boundary_raw = self.read_claim_boundary()
+                expected_paths = {
+                    str(item.path) for item in self.mounts if item.role == "explore"}
+                if ({str(item.path) for item in explores} != expected_paths
+                        or len(selected) != len(expected_paths)
+                        or boundary["explore_views"]
+                        != _explore_view_identities(self)):
+                    raise QualificationFirewallError(
+                        "confirmatory 必须精确挂载 B boundary 冻结的全部 explore views")
             if final_consumed and (len(holdout) != 1 or len(selected) != 1):
                 raise QualificationFirewallError("T1 final 只允许精确 DREAMER X-only view")
+            if final_consumed:
+                claim, claim_raw = self.read_claim_lock()
+                boundary, boundary_raw = self.read_claim_boundary()
+                audit_hash = _confirmatory_audit_authority_hash(
+                    self, claim_sha256=_hash_bytes(claim_raw),
+                    boundary_sha256=_hash_bytes(boundary_raw))
+                if (boundary["claim_sha256"] != _hash_bytes(claim_raw)
+                        or marker is None
+                        or marker["confirmatory_audit_sha256"] != audit_hash):
+                    raise QualificationFirewallError(
+                        "T1 final 缺有效 confirmatory audit authority")
         else:
             if selected and not final_consumed:
                 raise QualificationFirewallError(
@@ -746,8 +787,10 @@ class QualificationFirewall:
         if (set(value) != {
                 "version", "protocol", "task", "contract_sha256", "claim_sha256",
                 "claim_boundary_sha256", "source_tree_sha256", "runtime_identity_sha256",
-                "gpu_canary_sha256", "units", "consumed_at_unix"}
-                or value.get("version") != 2 or value.get("protocol") != FINAL_PROTOCOL
+                "gpu_canary_sha256", "confirmatory_audit_sha256", "units",
+                "consumed_at_unix"}
+                or type(value.get("version")) is not int
+                or value.get("version") != 3 or value.get("protocol") != FINAL_PROTOCOL
                 or value.get("task") != self.task
                 or value.get("contract_sha256") != self.contract_sha256
                 or not isinstance(value.get("claim_sha256"), str)
@@ -763,6 +806,11 @@ class QualificationFirewall:
                     or _SHA256_RE.fullmatch(value["gpu_canary_sha256"]) is None))
                 or (not self.final["gpu_required"]
                     and value.get("gpu_canary_sha256") is not None)
+                or (self.task == "T1" and (
+                    not isinstance(value.get("confirmatory_audit_sha256"), str)
+                    or _SHA256_RE.fullmatch(value["confirmatory_audit_sha256"]) is None))
+                or (self.task == "T2"
+                    and value.get("confirmatory_audit_sha256") is not None)
                 or not isinstance(value.get("consumed_at_unix"), (int, float))
                 or isinstance(value.get("consumed_at_unix"), bool)
                 or not math.isfinite(float(value["consumed_at_unix"]))
@@ -998,6 +1046,24 @@ def _explore_view_identities(firewall: QualificationFirewall) -> list[Dict[str, 
             "tree_sha256": _hash_bytes(_canonical({"files": ledger})),
         })
     return result
+
+
+def _confirmatory_audit_authority_hash(
+        firewall: QualificationFirewall, *, claim_sha256: str,
+        boundary_sha256: str) -> str:
+    """Replay the complete local C lifecycle and external root audit chain.
+
+    ``qualification_runner`` imports this module for the shared firewall
+    schemas, so the reverse dependency is intentionally deferred until a T1
+    authority is actually consumed.  Keeping the deep verifier on this path
+    prevents direct callers of :func:`consume_final` (and forged marker
+    readers) from treating a standalone audit JSON as proof that C ran.
+    """
+    from .qualification_runner import verify_confirmatory_admission
+
+    return verify_confirmatory_admission(
+        firewall=firewall, claim_sha256=claim_sha256,
+        boundary_sha256=boundary_sha256)
 
 
 def _a_high_water(
@@ -1259,6 +1325,7 @@ def publish_claim_lock(
 def consume_final(
         work_root: Path | str, *, source_tree_sha256: str,
         runtime_identity_sha256: str, gpu_canary_sha256: Optional[str] = None,
+        confirmatory_audit_sha256: Optional[str] = None,
         now: Optional[float] = None,
         validated_firewall: Optional[QualificationFirewall] = None) -> Dict[str, Any]:
     root = Path(os.path.abspath(os.fspath(work_root)))
@@ -1289,24 +1356,40 @@ def consume_final(
         raise QualificationFirewallError("GPU final 缺可信 canary hash")
     if not firewall.final["gpu_required"] and gpu_canary_sha256 is not None:
         raise QualificationFirewallError("CPU final 不接受 GPU canary hash")
+    if firewall.task == "T1":
+        if (not isinstance(confirmatory_audit_sha256, str)
+                or _SHA256_RE.fullmatch(confirmatory_audit_sha256) is None):
+            raise QualificationFirewallError(
+                "T1 final 缺成功 confirmatory audit authority hash")
+    elif confirmatory_audit_sha256 is not None:
+        raise QualificationFirewallError("T2 final 不接受 confirmatory audit authority")
     _claim, claim_raw = firewall.read_claim_lock()
     boundary, boundary_raw = firewall.read_claim_boundary()
     if (boundary["claim_sha256"] != _hash_bytes(claim_raw)
             or boundary["source_tree_sha256"] != source_tree_sha256):
         raise QualificationFirewallError(
             "final 输入与 claim boundary 冻结的 claim/source 不一致")
+    if firewall.task == "T1":
+        actual_audit_sha256 = _confirmatory_audit_authority_hash(
+            firewall, claim_sha256=_hash_bytes(claim_raw),
+            boundary_sha256=_hash_bytes(boundary_raw))
+        if confirmatory_audit_sha256 != actual_audit_sha256:
+            raise QualificationFirewallError(
+                "T1 final confirmatory audit hash 与 root authority 不一致")
+        confirmatory_audit_sha256 = actual_audit_sha256
     timestamp = time.time() if now is None else now
     if (isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
             or not math.isfinite(float(timestamp)) or float(timestamp) <= 0):
         raise QualificationFirewallError("final consumed timestamp 非法")
     marker = {
-        "version": 2, "protocol": FINAL_PROTOCOL, "task": firewall.task,
+        "version": 3, "protocol": FINAL_PROTOCOL, "task": firewall.task,
         "contract_sha256": firewall.contract_sha256,
         "claim_sha256": _hash_bytes(claim_raw),
         "claim_boundary_sha256": _hash_bytes(boundary_raw),
         "source_tree_sha256": source_tree_sha256,
         "runtime_identity_sha256": runtime_identity_sha256,
         "gpu_canary_sha256": gpu_canary_sha256,
+        "confirmatory_audit_sha256": confirmatory_audit_sha256,
         "units": final_units(firewall),
         "consumed_at_unix": float(timestamp),
     }
@@ -1394,6 +1477,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     or marker["source_tree_sha256"] != boundary["source_tree_sha256"]):
                 raise QualificationFirewallError(
                     "qualification final marker authority 链不完整或错配")
+            if marker is not None and firewall.task == "T1":
+                audit_hash = _confirmatory_audit_authority_hash(
+                    firewall, claim_sha256=_hash_bytes(claim_raw),
+                    boundary_sha256=_hash_bytes(boundary_raw))
+                if marker["confirmatory_audit_sha256"] != audit_hash:
+                    raise QualificationFirewallError(
+                        "qualification final marker/audit authority 错配")
     except BaseException as error:
         primary = error
         raise
@@ -1415,7 +1505,9 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "CLAIM_BOUNDARY_PROTOCOL", "CLAIM_PROTOCOL", "CONTRACT_PROTOCOL", "FINAL_PROTOCOL",
+    "CLAIM_BOUNDARY_PROTOCOL", "CLAIM_PROTOCOL",
+    "CONFIRMATORY_AUDIT_CHECKS", "CONFIRMATORY_AUDIT_PROTOCOL",
+    "CONFIRMATORY_AUDIT_REF_PROTOCOL", "CONTRACT_PROTOCOL", "FINAL_PROTOCOL",
     "QualificationClaimLockedError", "QualificationFinalizedError", "QualificationFirewall",
     "QualificationFirewallError", "QualificationMount", "consume_final",
     "final_units", "install_contract", "load_qualification_firewall",
