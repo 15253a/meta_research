@@ -201,6 +201,14 @@ def test_reasoning_four_regions(comp):
     assert "采集打分参数" in p.anchor_md
 
 
+def test_reasoning_measurement_refs_expose_exact_gate_id_without_composite_alias(comp):
+    """The evidence reference must be copyable as exact mrN, not a composite display token."""
+    p = comp.render(cycle_id="c1", stage="reasoning")
+    assert "successful_measurements=[evidence_ref=mr1; metric=1@1; value=0.9; scope=aggregate]" in p.anchor_md
+    assert "mr1:1@1" not in p.anchor_md
+    assert "db:metric_result:target:1" in p.sources
+
+
 def test_pack_hash_covers_all_regions(comp):
     import hashlib, json
     p = comp.render(cycle_id="c1", stage="reasoning")

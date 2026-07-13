@@ -1168,13 +1168,14 @@ class SqliteCompiler:
                 "FROM metric_result mr JOIN evaluation_attempt ea ON ea.id=mr.evaluation_attempt_id "
                 "WHERE ea.build_target_id=? AND ea.status='success' ORDER BY mr.id",
                 (target_id,)).fetchall()
-            refs = ", ".join(
-                f"mr{mrid}:{mid}@{mver}={value}({scope})"
-                for mrid, mid, mver, value, scope in measurements) or "无成功测量"
+            refs = " | ".join(
+                f"evidence_ref=mr{mrid}; metric={mid}@{mver}; value={value}; scope={scope}"
+                for mrid, mid, mver, value, scope in measurements)
+            measurement_summary = f"[{refs}]" if refs else "none"
             lines.append(
                 f"- target={target_id} seq={seq} kind={kind} status={status} "
                 f"critical={bool(critical)} budget_estimate={estimate} "
-                f"failure_kind={failure or '无'}；measurement_refs={refs}")
+                f"failure_kind={failure or '无'}；successful_measurements={measurement_summary}")
             if measurements:
                 sources.append(f"db:metric_result:target:{target_id}")
         return "## 本轮 bundle 目标结果（失败目标保持 failed；skipped=从未执行）\n" + "\n".join(lines)

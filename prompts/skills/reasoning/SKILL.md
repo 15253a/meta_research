@@ -1,6 +1,6 @@
 # SKILL · reasoning —— 轮尾收口：答题 · 树维护 · 选题 · 收尾
 
-> 版本：m0-1。按《第一部分》§3.5 与流程图 02-Reasoning；产物 schema =
+> 版本：m4-cp114c3d13。按《第一部分》§3.5 与流程图 02-Reasoning；产物 schema =
 > `schemas/answer.schema.json` / `schemas/tree_ops.schema.json` / `schemas/selection.schema.json`。
 > reasoning 是裁决与作答的**唯一收口**（轮尾一次调用；dependency_wait 轮不经此、由 plan 机械收尾）。
 
@@ -51,10 +51,15 @@
 **永不作为结论证据、不得据 log 判 novelty/success**）。据证据对 Qn 下 verdict：
 - answered / refuted → 产 answer.json：`question_id` + `verdict` + `answer_md` +
   `evidence[]`。**evidence 四分支的精确键**（每分支只带自己的键 + 可选 `note_md`，
-  混带即被 schema 拒）：`{"kind":"evaluation","metric_result_id":…}`（指向**成功测量**）·
+  混带即被 schema 拒）：`{"kind":"evaluation","metric_result_id":"mrN"}`（指向**成功测量**；
+  必须从固定锚 `evidence_ref=mrN` **只复制 `mrN`**，旁边的 metric/version/value/scope 是展示元数据，
+  绝不是 id 的一部分）·
   `{"kind":"literature","citation_md":…}` · `{"kind":"child_answer","child_question_id":…,
   "child_answer_ref"?:…}` · `{"kind":"human","human_ref":…}`。
-  M0 假执行的测量可作流程性证据（结论正文须注明 fake）。
+  是否注明 fake **只看该测量在固定锚中的显式 provenance**：仅当锚明确给出
+  `evaluation.source=fake`、`source=fake` 或 `synthetic=true`（布尔大小写不敏感）时才注明 fake。
+  SQLite production 的 `successful_measurements` 未带上述标记时不得称为 fake；也不得从目标里的
+  M0/M6 文案、skill 版本名或旧说明自行推断。
 - 证据不足 / 本轮失败（idea 全不合格、plan 评审不过、关键目标失败、engineering_blocked）→
   **不产 answer.json**，md 写明缺什么证据；编排器将置 Qn inconclusive（visit+1）。
 

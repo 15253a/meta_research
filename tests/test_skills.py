@@ -118,6 +118,16 @@ def test_plan_owns_synthetic_protocol_design_and_eval_create_claim_contract():
         assert anchor in plan, f"plan/SKILL.md 缺 production plan 语义: {anchor}"
 
 
+def test_reasoning_copies_exact_measurement_ref_and_labels_fake_only_from_provenance():
+    reasoning = SKILLS["reasoning"]
+    for anchor in (
+            "evidence_ref=mrN", "只复制 `mrN`", "evaluation.source=fake",
+            "source=fake", "synthetic=true", "successful_measurements",
+            "不得称为 fake"):
+        assert anchor in reasoning, f"reasoning/SKILL.md 缺 measurement 引用语义: {anchor}"
+    assert "M0 假执行的测量可作流程性证据" not in reasoning
+
+
 def test_skill_common_skeleton():
     for name, text in SKILLS.items():
         for anchor in COMMON_ANCHORS:

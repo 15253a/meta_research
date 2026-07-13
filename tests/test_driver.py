@@ -19,11 +19,13 @@ class ScriptedRunner:
     def __init__(self, script):
         self.script = list(script)   # [(files, md), ...]
         self.calls = []
+        self.context_packs = []
 
     def run_task(self, *, system_prompt, skill, context_pack):
         assert self.script, f"脚本耗尽（stage={context_pack.stage}）"
         files, md = self.script.pop(0)
         self.calls.append(context_pack.stage)
+        self.context_packs.append(context_pack)
         return Artifact(stage=context_pack.stage,
                         files=json.loads(json.dumps(files)), md=md)
 
@@ -119,6 +121,11 @@ def test_driver_happy_path_two_cycles(tmp_path):
     assert payload["evaluation"]["source"] == "fake"       # M0 假执行显式标记
     assert all(log["synthetic"] for log in payload["execution_logs"])
     assert payload["execution_observation"]["source"] == "fake"
+    runner = d._runner_factory(None, None)
+    reasoning_pack = next(
+        pack for pack in runner.context_packs
+        if pack.cycle_id == "c2" and pack.stage == "reasoning")
+    assert "synthetic=True" in reasoning_pack.anchor_md
 
 
 def test_driver_plan_review_exhausted_is_normal_close(tmp_path):
