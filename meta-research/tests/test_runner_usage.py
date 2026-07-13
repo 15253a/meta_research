@@ -536,6 +536,19 @@ def test_runner_bad_envelope_preserves_usage(tmp_path, monkeypatch):
         _fake_runner(tmp_path, bad_envelope).run_task(
             system_prompt="s", skill="k", context_pack=_pack())
     assert ei.value.usage is not None and ei.value.usage.tokens_total == 3200
+    assert ei.value.failure_kind == "artifact_parse"
+
+
+@pytest.mark.parametrize("raw", [
+    "no fenced json",
+    '```json\n{"files":{}} {"extra":1}\n```',
+    "```json\n[]\n```",
+    '```json\n{"files":[]}\n```',
+])
+def test_envelope_parse_and_shape_failures_are_artifact_parse(raw):
+    with pytest.raises(R.RunnerError) as error:
+        R.CodexRunner._parse_envelope(raw)
+    assert error.value.failure_kind == "artifact_parse"
 
 
 def test_runner_timeout_preserves_partial_usage(tmp_path, monkeypatch):
