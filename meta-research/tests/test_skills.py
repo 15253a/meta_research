@@ -5,9 +5,11 @@
 2. 每阶段关键流程锚词（对齐流程图 02–05 与本阶段设计要点）；
 3. skill 引用的 schemas/ 文件必须真实存在（防提示词指向不存在的契约）。
 """
+import json
 import re
 
 from conftest import SCHEMAS_DIR, SYSTEM_ROOT
+from orchestrator.schemas import SchemaSet
 
 PROMPTS = SYSTEM_ROOT / "prompts"
 SKILLS = {
@@ -90,6 +92,30 @@ SYSTEM_PROMPT_ANCHORS = [
 def test_system_prompt_anchors():
     for anchor in SYSTEM_PROMPT_ANCHORS:
         assert anchor in SYSTEM_PROMPT, f"system_prompt 缺要素锚词: {anchor}"
+
+
+def test_system_prompt_inlines_schema_valid_resource_request_skeleton():
+    """No-shell workers must receive the exact optional sidecar contract inline."""
+    match = re.search(
+        r"resource_request\.json 精确骨架.*?```json\n(.*?)\n```",
+        SYSTEM_PROMPT, re.DOTALL)
+    assert match is not None, "system_prompt 未内联 resource_request exact skeleton"
+    payload = json.loads(match.group(1))
+    SchemaSet(SCHEMAS_DIR).validator("resource_request").validate(payload)
+    assert set(payload) == {"summary_md", "items"}
+    assert set(payload["items"][0]) == {
+        "kind", "desc", "expected_files", "attempted_paths",
+        "failure_reason", "dest_hint",
+    }
+
+
+def test_plan_owns_synthetic_protocol_design_and_eval_create_claim_contract():
+    plan = SKILLS["plan"]
+    for anchor in (
+            "规范性设计决定", "运行时合成", "ContextPack 未预先给值不构成",
+            "不得为此发 resource_request", "问题/idea 文本中的“已锁定”",
+            "claim{baseline_ref, variant_key}"):
+        assert anchor in plan, f"plan/SKILL.md 缺 production plan 语义: {anchor}"
 
 
 def test_skill_common_skeleton():
