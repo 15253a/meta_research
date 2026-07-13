@@ -217,12 +217,22 @@ class CostLedger:
                 "VALUES (?,?,?,'created',?)",
                 (ci, phase, purpose, transcript_ref)).lastrowid
 
-    def mark_call_running(self, *, runner_call_id: int) -> None:
-        """created intent 在最后外部调用边界前迁入 running。"""
+    def mark_call_running(self, *, runner_call_id: int,
+                          transcript_ref: Optional[str] = None) -> None:
+        """created intent 在最后外部调用边界前迁入 running。
+
+        ``transcript_ref`` 可在拿到数据库分配的 ``runner_call_id`` 后一并写入，
+        让调用方用该耐久 ID 命名 heartbeat，且在任何外部进程启动前完成绑定。
+        """
+        if transcript_ref is not None and (
+                not isinstance(transcript_ref, str) or not transcript_ref.strip()):
+            raise ValueError("runner_call transcript_ref 须为非空字符串或 null")
         with self.daemon.transaction() as conn:
             changed = conn.execute(
-                "UPDATE runner_call SET status='running',started_at=CURRENT_TIMESTAMP "
-                "WHERE id=? AND status='created'", (runner_call_id,)).rowcount
+                "UPDATE runner_call SET status='running',started_at=CURRENT_TIMESTAMP,"
+                "transcript_ref=COALESCE(?,transcript_ref) "
+                "WHERE id=? AND status='created'",
+                (transcript_ref, runner_call_id)).rowcount
             if changed != 1:
                 row = conn.execute(
                     "SELECT status FROM runner_call WHERE id=?", (runner_call_id,)).fetchone()

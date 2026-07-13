@@ -6,6 +6,7 @@ import hashlib
 import sqlite3
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ from orchestrator.mediator import (CodexQueryResponder, Mediator, QuerySnapshotM
                                    open_responder_read_conn, render_fallback)
 from orchestrator.resource_limits import (MAX_INFLIGHT_QUERY_CALLS,
                                           MAX_QUERY_STATUS_CARD_BYTES)
-from orchestrator.runner import RunnerError
+from orchestrator.runner import CodexRunner, RunnerError
 from orchestrator.process_supervisor import ExecutionSupervisor, atomic_write_receipt
 from orchestrator.provider_invocation import write_provider_invocation_receipt
 from orchestrator.schemas import SchemaSet
@@ -860,6 +861,54 @@ def test_codex_candidate_cross_checks_exact_published_scalars(query_env):
     with pytest.raises(RunnerError, match="发布卡不一致") as error:
         responder.answer('{"current":{"intent":"query","query":"状态？"}}', card_json)
     assert error.value.usage.tokens_total == 9
+
+
+def test_bound_codex_responder_returns_existing_rc_event_transcript(
+        query_env, monkeypatch):
+    """The real bound Runner and responder must agree on the post-restart rc-id event name."""
+    class Supervisor:
+        def run(self, cmd, **_kwargs):
+            Path(cmd[cmd.index("-o") + 1]).write_text(
+                '```json\n{"files":{"interaction_reply.json":{"facts":['
+                '{"path":"snapshot_cycle","value":"c1"}]}},"md":""}\n```',
+                encoding="utf-8")
+            trace = (
+                b'{"type":"thread.started","thread_id":"query-test"}\n'
+                b'{"type":"turn.started"}\n'
+                b'{"type":"item.completed","item":{"type":"agent_message",'
+                b'"text":"ok"}}\n'
+                b'{"type":"turn.completed","usage":{}}\n')
+            return types.SimpleNamespace(
+                returncode=0, stdout=trace, stderr=b"tokens used\n9\n")
+
+    holder = {}
+
+    def factory(transcripts, purpose):
+        runner = CodexRunner(
+            transcripts_dir=transcripts, purpose_tag=purpose,
+            no_host_tools=True, execution_supervisor=Supervisor())
+        runner.tool_free_contract = dict(holder["responder"].runtime_contract)
+        monkeypatch.setattr(
+            runner, "_publish_provider_receipt", lambda **_kwargs: None)
+        return runner
+
+    responder = CodexQueryResponder(
+        runner_factory=factory,
+        validator=SCHEMAS.validator("interaction_reply_candidate"),
+        system_prompt="system", skill="query skill",
+        work_root=str(query_env["tmp_path"]))
+    holder["responder"] = responder
+    card_json = json.dumps(
+        json.loads(query_env["card_path"].read_text(encoding="utf-8")),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    result = responder.answer_for_call(
+        '{"current":{"intent":"query","query":"状态？"}}', card_json,
+        runner_call_id=77, phase="interaction_query", purpose="message:1")
+
+    assert result.transcript_ref.endswith(
+        "/reasoning-interaction-query-rc77.events.jsonl")
+    assert (query_env["tmp_path"] / result.transcript_ref).is_file()
 
 
 def test_codex_responder_freezes_tool_free_runtime_identity(query_env, monkeypatch):

@@ -158,7 +158,7 @@ class StageProvider:
         if self._cost_required and self.cost_ledger is None:
             raise ValueError("budget.session_max 已启用，StageProvider 必须注入 cost_ledger；"
                              "测试/诊断须显式设 session_max=null")
-        self._call_seq = 0                     # 全局调用序（transcript 文件名唯一，P6 回放防覆盖）
+        self._call_seq = 0                     # 实例内可读 purpose；耐久文件身份由 runner_call_id 提供
 
     # -- provider 回调（绑定阶段）------------------------------------------------
     def idea(self, cyc, pack) -> Dict[str, Any]:
@@ -330,18 +330,18 @@ class StageProvider:
         if self.cost_ledger is None:
             return None
         purpose = f"{stage}-n{self._call_seq}-a{attempt + 1}"
+        rc = self.cost_ledger.begin_call(
+            cycle_id=cyc.cycle_id, phase=stage, purpose=purpose)
         heartbeat_path = (
             self.work / f"cycles/{cyc.cycle_id}/transcripts" /
-            f"{purpose}.heartbeat.json")
-        rc = self.cost_ledger.begin_call(
-            cycle_id=cyc.cycle_id, phase=stage, purpose=purpose,
-            transcript_ref=str(heartbeat_path))
+            f"{stage}-rc{rc}.heartbeat.json")
         heartbeat = _RunnerCallHeartbeat(
             heartbeat_path, runner_call_id=rc, cycle_id=cyc.cycle_id,
             phase=stage, purpose=purpose)
         try:
             _bind_runner_call(runner, rc, phase=stage, purpose=purpose)
-            self.cost_ledger.mark_call_running(runner_call_id=rc)
+            self.cost_ledger.mark_call_running(
+                runner_call_id=rc, transcript_ref=str(heartbeat_path))
             heartbeat.start()
         except BaseException:
             try:
@@ -541,19 +541,19 @@ class PlanReviewProvider:
     def _begin_call(self, cycle_id: str, runner, round_no: int, attempt: int):
         if self.cost_ledger is None:
             return None
+        runner_call_id = self.cost_ledger.begin_call(
+            cycle_id=cycle_id, phase="audit", purpose="plan_review")
         heartbeat_path = (
             self.work / f"cycles/{cycle_id}/transcripts" /
-            f"plan-review-r{round_no}-n{self._call_seq}-a{attempt + 1}.heartbeat.json")
-        runner_call_id = self.cost_ledger.begin_call(
-            cycle_id=cycle_id, phase="audit", purpose="plan_review",
-            transcript_ref=str(heartbeat_path))
+            f"plan-review-rc{runner_call_id}.heartbeat.json")
         heartbeat = _RunnerCallHeartbeat(
             heartbeat_path, runner_call_id=runner_call_id, cycle_id=cycle_id,
             phase="audit", purpose="plan_review")
         try:
             _bind_runner_call(
                 runner, runner_call_id, phase="audit", purpose="plan_review")
-            self.cost_ledger.mark_call_running(runner_call_id=runner_call_id)
+            self.cost_ledger.mark_call_running(
+                runner_call_id=runner_call_id, transcript_ref=str(heartbeat_path))
             heartbeat.start()
         except BaseException:
             try:
@@ -822,18 +822,18 @@ class JudgeProvider:
         if self.cost_ledger is None:
             return None
         # Gate.review_passed mechanically requires runner_call.purpose == review_kind.
+        rc = self.cost_ledger.begin_call(
+            cycle_id=cycle_id, phase="audit", purpose=review_kind)
         heartbeat_path = (
             self.work / f"cycles/{cycle_id}/transcripts" /
-            f"{review_kind}-n{self._call_seq}-a{attempt + 1}.heartbeat.json")
-        rc = self.cost_ledger.begin_call(
-            cycle_id=cycle_id, phase="audit", purpose=review_kind,
-            transcript_ref=str(heartbeat_path))
+            f"{review_kind}-rc{rc}.heartbeat.json")
         heartbeat = _RunnerCallHeartbeat(
             heartbeat_path, runner_call_id=rc, cycle_id=cycle_id,
             phase="audit", purpose=review_kind)
         try:
             _bind_runner_call(runner, rc, phase="audit", purpose=review_kind)
-            self.cost_ledger.mark_call_running(runner_call_id=rc)
+            self.cost_ledger.mark_call_running(
+                runner_call_id=rc, transcript_ref=str(heartbeat_path))
             heartbeat.start()
         except BaseException:
             try:

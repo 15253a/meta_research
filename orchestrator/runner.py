@@ -443,7 +443,13 @@ class CodexRunner:
         self._reconcile_protocol = None
         self._runner_call_phase = None
         self._runner_call_purpose = None
-        tag = f"{pack.stage}-{self.purpose_tag or 'call'}-{self._call_no}"
+        # A process-local counter is sufficient only for unbound diagnostic/M0 calls.  Production
+        # providers bind every external invocation to a durable runner_call first; use that database
+        # identity in all transcript names so a checkpoint restart cannot reset a counter and overwrite
+        # an earlier prompt/output/events triplet.
+        invocation_key = (f"rc{runner_call_id}" if runner_call_id is not None
+                          else str(self._call_no))
+        tag = f"{pack.stage}-{self.purpose_tag or 'call'}-{invocation_key}"
         self.transcripts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.transcripts_dir, 0o700)
         prompt_file = self.transcripts_dir / f"{tag}.prompt.md"
