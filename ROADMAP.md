@@ -575,5 +575,10 @@
             兼容 M0 桩与 production。→ commit `c83e34f`（build_log 0085；相关 56；真实 c3 metric replay
             输出 exact `mr1`、无 fake、Gate `a1`；同原 c3 snapshot 的 console query/Codex reply 成功；
             内部终审 APPROVE；全量留最终检查点）。
+          - [x] CP11.4c.3d.1.4 plan-review malformed-envelope recovery：Runner 将成功返回但无法解析的
+            envelope 精确分类为 `artifact_parse`；PlanReview 仅对此走既有有界重试，transport/timeout/runtime
+            仍 fail-loud。→ commit `43c0b38`（build_log 0086；Runner/Provider 81 + exact 7；同一新鲜 c3
+            checkpoint 恢复后完成 plan-review/bundle/Docker run/双 review/reasoning/Gate，q2 answered，
+            storage c1-c3 与同 snapshot Codex query 通过；内部终审 APPROVE；全量留最终检查点）。
           - [ ] CP11.4c.3d.2 dedicated VM/private cgroup+NVIDIA Docker、GPFS quota/second node/connector
             就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，再勾 CP11.4c。

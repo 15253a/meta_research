@@ -1,26 +1,25 @@
 # implement_note.md · 施工现场（活文档，只写当下）
 
 - 更新：2026-07-13 ｜ 位置：步⑪ CP11.4c.3d.2 目标生产环境 / 最终验收
-- 检查点状态：代码级基本可用；CP11.4c.3d.1.3 功能 `c83e34f` 已提交，等待外部基础设施
+- 检查点状态：代码级基本可用；CP11.4c.3d.1.4 功能 `43c0b38` 已提交，等待外部基础设施
 
 ## 上一检查点结果
 
-- compiler 原先把合法 `mr1` 与 metric definition/version 拼成 `mr1:1@1=...`，模型合理地复制了
-  `mr1:1@1`，而 Gate 只接受 exact `mrN`，导致已有成功测量却无法关题。
-- 现在固定锚以 `successful_measurements=[evidence_ref=mrN; metric=...; value=...; scope=...]` 明示引用；
-  reasoning 只复制 `mrN`。fake/real 不再按“当前/历史”猜，而只看该测量显式 `source/synthetic` provenance，
-  因而 production 真执行不被降格，同时共享 M0Driver 的当前假执行仍诚实标 fake。
-- 对旧 c3 四项真实 metric 的隔离 reasoning+Gate 探针输出 `metric_result_id=mr1`、正文不含 M0/fake，带
-  parser-suspect 过滤的 Gate 成功写 `a1`；同原始 c3 snapshot 的 console query 经真实 Codex rc16 成功回复。
-- compiler/skill/M0 driver 相关 **56 passed**；内部首审发现 M0 provenance Major，修毕后终审 APPROVE。
-  依用户要求未跑仓库全量。
+- 全新三轮 smoke 在 c3 plan review 遇真实 Codex envelope `Extra data`；Runner 过去把 parse 失败统称
+  `runner_error`，PlanReview 又对全部 RunnerError 直接 fail-loud，导致可修的格式错误炸穿整次入口。
+- 现在无 fenced JSON、JSON decode 失败、顶层/files 形状非法统一标 `artifact_parse`；PlanReview 先完整记录
+  本次失败成本/heartbeat，再仅对此类走 policy 的有界重试。transport/timeout/runtime 等仍不重试。
+- 从同一 c3 持久 plan checkpoint 恢复后，plan review PASS，bundle、CPU Docker build/run、code/result review、
+  reasoning 与 Gate 全完成；q2 answered，evidence 精确指向 `mr1/mr2`，storage verify 深验 c1-c3 全通过。
+- 同一成功 c3 snapshot 的 console query 经真实 Codex rc11 success 并返回 grounded reply；相关 Runner/Provider
+  **81 passed**、精确 7 passed。内部终审 APPROVE；依用户要求未跑仓库全量。
 
 ## 当前可用边界
 
 - 默认 production 装配的 query/import adapter sideband 现在与 non-root preflight 契约兼容，且默认
   `/usr/local/bin/codex` 已有真实启动/应答证据，不再是“preflight 能启动、首次 query 必失败”。
 - 单节点 development 已真实跑通 bootstrap、decompose、idea、plan/review、bundle、Docker execution 与双 review；
-  后续隔离 replay 又证明 reasoning→Gate 关题；同一原始 snapshot 的 tool-free query sideband 也成功。
+  **同一个新鲜 work-root** 又继续跑通 reasoning→Gate 关题、c1-c3 snapshot 深验和 tool-free query sideband。
   修复没有增加第二 DB、daemon、scheduler、SSH orchestration 或通用 workflow。
 - CP11.4c.3c 薄工具已闭合：qualification firewall、shared SQLite boundary、local/two-node
   canary 协议、fixed-linear fault runner 与 evidence pack 可组合使用。
@@ -44,7 +43,7 @@
 - `real_codex_resume_verified` / `qualification_receipts_verified` / `full_restore_verified` 仍必须为 false；
   不得用注入式 worker 的一轮续跑替代生产验收。
 - 当前 host 能看到 8×A100-80GB，但 Docker 没有 NVIDIA runtime/cgroup/resource limit。清理本轮旧临时目录后
-  pinned CPU image 曾完成真实 build/run；本轮新三轮 smoke 又在 container create 遇 `/ebs` ENOSPC，说明当前
-  20G 节点不具持续运行 headroom。pytest basetemp 必须放 VEPFS，生产长跑不得使用该节点。
-- 隔离 reasoning+Gate 是对真实 c3 metric 的定向 replay，不是官方 restore/resume 或全新 attack 轮；它只证明
-  本次引用修复越过原 Gate 阻断。完整新鲜 ≥200 轮仍必须在 d.2 目标环境完成。
+  本轮曾在 container create 遇 `/ebs` ENOSPC；清理临时 canary 后虽恢复并完成一个新鲜 CPU attack 轮，20G
+  节点仍不具长跑 headroom。pytest basetemp 必须放工作根，生产长跑不得使用该节点。
+- 当前新鲜 smoke 只有 3 轮/单节点/CPU/development/no-outbound；不能外推为 ≥200 轮、GPU、双节点、connector
+  交付或 T1/T2 qualification 已通过。
