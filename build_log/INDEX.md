@@ -6,6 +6,7 @@
 
 ---
 
+- [0090](0090-cp114c3b2b3-registered-asset-recovery.md) — CP11.4c.3b.2b.3 registered checkpoint/log CAS hydration + relocation-safe exact combined restore · commit `866afda` · 验证: storage 63 + evidence 30 + adjacent 198 + full 1841 passed/1 skipped；外审最终 APPROVE
 - [0089](0089-cp114c3c1b-t1-confirmatory-admission.md) — CP11.4c.3c.1b spent-before-spawn T1 confirmatory LODO + exact sandbox promotion + immutable root audit verdict · commit `e1654fa` · 验证: qualification 142 + adjacent 148 + full 1818 passed/1 skipped
 - [0088](0088-cp114c3d2-production-runbook-audit.md) — CP11.4c.3d.2 executable audit fixes qualification exit semantics and production runbook safety while reopening missing T1-C · commit `7a32e97` · 验证: qualification 108 + JSON/shell/CLI checks；全量留最终检查点
 - [0087](0087-cp114c3d15-durable-runner-evidence.md) — CP11.4c.3d.1.5 binds production transcripts/heartbeats/query events to durable runner_call IDs across restart · commit `b208233` · 验证: related 179 + fresh-provider/fresh-runner/bound-query exact regressions；内部终审 APPROVE；全量留最终检查点

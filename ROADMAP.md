@@ -30,8 +30,10 @@
   image 与后续 runtime identity 继承已落 `1e57611`，2b.2c reviewed adapter generation 已落 `c0ba5ed`。
   CP11.4c.2b.3a honest deployment preflight 已落 `16d5270`，2b.3b fixed GPU device bridge 已落 `563a496`；
   至此 CP11.4c.2 的代码与 fail-closed 部署合同收口。当前进入 CP11.4c.3 目标 VEPFS 两节点/真实
-  数百轮（明确下限 ≥200）故障注入验收；3a 会话诚实化及 3b.1/b.2a/b.2b.1/b.2b.2 snapshot、日志镜像与
-  import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。CP11.4c.3c.1a
+  数百轮（明确下限 ≥200）故障注入验收；3a 会话诚实化及 3b.1/b.2a/b.2b.1/b.2b.2/b.2b.3 snapshot、
+  日志镜像、import/dependency CAS 与 registered checkpoint/log 原路径恢复已分别落
+  `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`/`866afda`，CP11.4c.3b 的代码与运维工具闭合；
+  独立故障域归档和真实恢复演练仍归 d.2。CP11.4c.3c.1a
   real SEED/DREAMER sealed-holdout、one-shot final 与独立 scorer 已落 `2a98e4b`；c.1b 以 `e1654fa`
   补齐 T1 spent-before-spawn confirmatory LODO、exact sandbox promotion、root immutable audit verdict 与全准入路径回放，
   CP11.4c.3c.1 闭合。CP11.4c.3c.2a
@@ -493,14 +495,15 @@
           未实现 turn 内跨阶段提交的 B，不为可选吞吐模式新造第二套状态机。→ commit `b2081a3`
           （build_log 0072；相关 165 通过；内部代码/文档与外审最终轮 APPROVE；唯一全量受当前 20G
           overlay 仅余 175MB 并在运行中 ENOSPC 污染，依约未重跑）。
-        - [ ] CP11.4c.3b 存储治理：每轮 SQLite online 滚动备份 + views 独立 Git 提交 + immutable/CAS 资产
-          manifest/hash；原始日志分级归档、恢复演练、容量阈值与安全 GC。不每轮复制大 checkpoint/content store。
+        - [x] CP11.4c.3b 存储治理代码与运维工具：每轮 SQLite online 滚动备份 + views 独立 Git 提交 +
+          immutable/CAS 资产 manifest/hash；registered checkpoint/log 分级镜像、恢复闭包、容量阈值与安全 GC。
+          本项勾选不代表独立故障域归档或目标环境恢复演练通过，真实演练仍归 CP11.4c.3d.2。
           - [x] CP11.4c.3b.1 cycle snapshot 主干：research done 在当轮 τ/global-stop 检查后，其余
             import-worker/failed/aborted 在终态边界，以 SQLite online backup → 同快照 DB-derived views Git →
             immutable manifest 顺序发布；启动先幂等补缝，旧库只建诚实 adoption baseline，不伪造历史逐轮快照。
             → commit `83ace54`（build_log 0073；相关 105；内部代码/参考文档双审 APPROVE；
             外审误读已增补回归证伪，最终轮 CLI 挂起无 verdict；容量不足未启动全量）。
-          - [ ] CP11.4c.3b.2 运维闭环：离线 verify/restore、至少 3 代已验证 DB backup、现有资源 envelope
+          - [x] CP11.4c.3b.2 运维闭环：离线 verify/restore、至少 3 代已验证 DB backup、现有资源 envelope
             派生的容量门、dry-run-first 的有界 apply GC；registered checkpoint/content-store/log 原件不 GC。
             - [x] CP11.4c.3b.2a snapshot offline ops：独占既有 instance lease，逐轮验证 immutable
               pointer/manifest/views 链并深验最近 3 代 SQLite；只向不存在的新 work-root 恢复 SQLite 真相，
@@ -510,7 +513,7 @@
               继承已证明的 preflight envelope，但不把 `statvfs` 冒充持续 hard-quota 证明。
               → commit `011c98b`（build_log 0074；相关 118；内部双终审 APPROVE；外审第 1 轮 401、
               第 2 轮 5 分钟无 verdict；全量依用户要求留到最终检查点）。
-            - [ ] CP11.4c.3b.2b registered asset closure：不加 daemon/第二 DB，只在现有 snapshot/CAS 上
+            - [x] CP11.4c.3b.2b registered asset closure：不加 daemon/第二 DB，只在现有 snapshot/CAS 上
               补已登记资产的离线副本、校验与恢复闭包。
               - [x] CP11.4c.3b.2b.1 registered execution-log mirror：从最新已深验 SQLite snapshot 的
                 `execution_log` 行枚举冻结原件，建 deterministic gzip CAS + immutable per-row index；
@@ -527,8 +530,17 @@
                 → commit `d72da35`（build_log 0076；相关 storage/import/inspector **31 passed** +
                 既有 restore **4 passed**；内部三路终审 APPROVE；外审第 1 轮 401、第 2 轮约 5 分钟/49k tokens
                 无 verdict；全量依用户要求留到最终检查点）。
-              b.2b.2 的 import CAS scope 已完成；execution-log 正本、checkpoint/content store 与完整 work-root DR
-              仍明确不在该 scope，故 b.2b/b.2/b 父项暂不勾选，不虚报完整灾备。
+              - [x] CP11.4c.3b.2b.3 registered checkpoint/log recovery：从最新 retained SQLite high-water
+                枚举 checkpoint 与 execution-log exact authority；checkpoint 进入 raw SHA256 CAS + immutable
+                per-row index，日志复用 deterministic gzip mirror，并按原相对路径 no-clobber hydration。
+                组合恢复严格按 SQLite → registered assets → import CAS，独立 marker 在 exact source authority、
+                completion receipt、逐文件复验和 import CAS 全闭合前不解除；append-only refs 通过完整 path lineage
+                多跳 relocation，不改写 DB，且 target 在 claim 前拒绝与任一历史根相等或互嵌。
+                → commit `866afda`（build_log 0090；storage **63** + evidence **30** + 相邻 **198**；唯一有效
+                全量 **1841 passed, 1 skipped**；外审最终 `APPROVE`）。
+              DB-registered checkpoint/log 与 DB 可达 import CAS 的代码闭包已完成。完整 work-root/fileset、
+              runner/guardian/qualification/uploads/views/connector authority、跨站独立故障域归档及目标环境演练
+              不在本父项的机器声明内，继续由各自 authority 与 CP11.4c.3d.2 验收，不能虚报完整灾备。
         - [x] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer；
           c.1/c.2/c.3 均已闭合，真实目标环境验收仍归 c.3d.2。
           - [x] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 sealed-holdout/one-shot/non-feedback 约束。
