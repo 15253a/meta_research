@@ -669,3 +669,29 @@ def test_t2_final_runs_exactly_45_single_fold_units_and_does_not_retry_failure(
     assert replayed == first
     assert calls == expected_ids
     assert [unit_id for unit_id, _data_root in prepared] == expected_ids
+
+
+@pytest.mark.parametrize(
+    ("command", "result", "expected"),
+    [
+        ("run-final", {"failure_count": 0}, 0),
+        ("run-final", {"failure_count": 1}, 3),
+        ("score-final", {"status": "success"}, 0),
+        ("score-final", {"status": "failed"}, 3),
+    ],
+)
+def test_cli_exit_code_reflects_scientific_outcome(
+        tmp_path, monkeypatch, capsys, command, result, expected):
+    if command == "run-final":
+        monkeypatch.setattr(QR, "run_final", lambda **_kwargs: result)
+        argv = [
+            "--work-root", str(tmp_path / "work"), "run-final",
+            "--system-root", str(tmp_path / "system"),
+            "--source-root", str(tmp_path / "source"),
+        ]
+    else:
+        monkeypatch.setattr(QR, "score_final", lambda **_kwargs: result)
+        argv = ["--work-root", str(tmp_path / "work"), "score-final"]
+
+    assert QR.main(argv) == expected
+    assert json.loads(capsys.readouterr().out) == result
