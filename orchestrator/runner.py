@@ -778,11 +778,15 @@ class CodexRunner:
     def _parse_envelope(raw: str) -> tuple:
         blocks = _JSON_BLOCK.findall(raw)
         if not blocks:
-            raise RunnerError("信封不可解析：无 ```json 代码块")
+            raise RunnerError(
+                "信封不可解析：无 ```json 代码块", failure_kind="artifact_parse")
         try:
             payload = json.loads(blocks[-1])
         except json.JSONDecodeError as e:
-            raise RunnerError(f"信封 JSON 非法：{e}") from e
+            raise RunnerError(
+                f"信封 JSON 非法：{e}", failure_kind="artifact_parse") from e
         if not isinstance(payload, dict) or "files" not in payload or not isinstance(payload["files"], dict):
-            raise RunnerError("信封结构非法：须为 {\"files\": {...}, \"md\": \"...\"}")
+            raise RunnerError(
+                "信封结构非法：须为 {\"files\": {...}, \"md\": \"...\"}",
+                failure_kind="artifact_parse")
         return payload["files"], str(payload.get("md", ""))

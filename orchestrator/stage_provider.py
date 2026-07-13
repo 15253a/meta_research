@@ -490,10 +490,12 @@ class PlanReviewProvider:
                     call, error.usage, failure_kind=error.failure_kind,
                     transcript_ref=error.transcript_ref,
                     execution_receipt_ref=error.execution_receipt_ref)
-                # flow.retry.artifact_parse only repairs a returned but structurally invalid verdict.
-                # Process/transport/timeout/envelope RunnerError is an infrastructure call failure:
-                # retrying it here would spend again and later misreport it as artifact_parse exhaustion.
-                raise
+                # Only a successfully returned but malformed envelope belongs to the configured
+                # artifact_parse retry budget.  Transport/timeout/runtime failures stay fail-loud.
+                if error.failure_kind != "artifact_parse":
+                    raise
+                last_err = str(error)
+                continue
             except Exception as error:
                 self._finish_failed(
                     call, getattr(error, "usage", None),
@@ -534,7 +536,7 @@ class PlanReviewProvider:
             return review, decision_id
         raise RunnerError(
             f"plan_review 第 {round_no} 轮产物结构非法，artifact_parse 重试"
-            f"（≤{self.retries}）用尽：{last_err}")
+            f"（≤{self.retries}）用尽：{last_err}", failure_kind="artifact_parse")
 
     def _begin_call(self, cycle_id: str, runner, round_no: int, attempt: int):
         if self.cost_ledger is None:

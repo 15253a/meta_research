@@ -344,6 +344,24 @@ def test_plan_review_provider_retries_bad_round_envelope(tmp_path):
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 1
 
 
+def test_plan_review_provider_retries_runner_artifact_parse_with_feedback(tmp_path):
+    daemon, _bt_id, work = _judge_env(tmp_path)
+    runner = MockRunner([
+        RunnerError("信封 JSON 非法：Extra data", failure_kind="artifact_parse"),
+        {"plan_review.json": {"verdict": "pass", "round_no": 1, "issues": []}},
+    ])
+    provider = PlanReviewProvider(
+        runner_factory=lambda _td, _purpose: runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="SYS", skill="[skill:plan]",
+        daemon=daemon, work_root=str(work))
+
+    review, _decision_id = provider(NS(cycle_id="c1"), _PLAN, 1, _pack("plan"))
+
+    assert review["verdict"] == "pass"
+    assert len(runner.skills_seen) == 2
+    assert "信封 JSON 非法" in runner.skills_seen[1]
+
+
 def test_plan_review_provider_rejects_pack_for_different_plan(tmp_path):
     daemon, _bt_id, work = _judge_env(tmp_path)
     runner = MockRunner([{
