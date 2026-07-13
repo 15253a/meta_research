@@ -31,8 +31,10 @@
   CP11.4c.2b.3a honest deployment preflight 已落 `16d5270`，2b.3b fixed GPU device bridge 已落 `563a496`；
   至此 CP11.4c.2 的代码与 fail-closed 部署合同收口。当前进入 CP11.4c.3 目标 VEPFS 两节点/真实
   数百轮（明确下限 ≥200）故障注入验收；3a 会话诚实化及 3b.1/b.2a/b.2b.1/b.2b.2 snapshot、日志镜像与
-  import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。CP11.4c.3c.1
-  real SEED/DREAMER sealed-holdout、one-shot final 与独立 scorer 已落 `2a98e4b`；CP11.4c.3c.2a
+  import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。CP11.4c.3c.1a
+  real SEED/DREAMER sealed-holdout、one-shot final 与独立 scorer 已落 `2a98e4b`；c.1b 以 `e1654fa`
+  补齐 T1 spent-before-spawn confirmatory LODO、exact sandbox promotion、root immutable audit verdict 与全准入路径回放，
+  CP11.4c.3c.1 闭合。CP11.4c.3c.2a
   本地 WAL / GPFS rollback、旧 WAL 预读前迁移与 console 准入已落 `75f8009`；2b.1 五阶段 shared-fs
   canary 与 2b.2 fixed-linear fault sidecar 已落 `fb65955`/`aa03a01`，CP11.4c.3c.2 工具闭合；
   CP11.4c.3c.3 canonical evidence packer/offline verifier 及 exact-one-cycle restore/resume proof 已落
@@ -527,17 +529,20 @@
                 无 verdict；全量依用户要求留到最终检查点）。
               b.2b.2 的 import CAS scope 已完成；execution-log 正本、checkpoint/content store 与完整 work-root DR
               仍明确不在该 scope，故 b.2b/b.2/b 父项暂不勾选，不虚报完整灾备。
-        - [ ] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer；
-          c.1b 未完成前父项不勾选。
-          - [ ] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 sealed-holdout/one-shot/non-feedback 约束。
+        - [x] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer；
+          c.1/c.2/c.3 均已闭合，真实目标环境验收仍归 c.3d.2。
+          - [x] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 sealed-holdout/one-shot/non-feedback 约束。
             - [x] CP11.4c.3c.1a final sealed boundary：T1 DREAMER 在 final 前不可见；T2 全部 final folds 在 final
               前不可见、final 每 unit 只挂一个 X-only fold；独立 root evaluator 从 sealed truth 出分。
               → commit `2a98e4b`（build_log 0077；qualification/deployment 相关 132 + affected 13、
               sandbox/entry 164、真实 SEED/DREAMER；全量留最终检查点）。
-            - [ ] CP11.4c.3c.1b T1 confirmatory lifecycle：2026-07-13 可执行性复审发现，claim-lock 尚未绑定
-              A high-water/exact source，B 后普通研究仍可反复消费 explore mounts，且无独立 C LODO batch/scorer
-              receipt；因此当前只闭合 D，不能把 DREAMER result 冒充完整 A→B→C→D。以不增加第二 DB/daemon/
-              scheduler 为前提，补最薄的 B boundary、一次性 C 结果和 D admission gate 后再勾父项。
+            - [x] CP11.4c.3c.1b T1 confirmatory lifecycle：B boundary 冻结 A high-water/exact source/
+              explore trees/C command，B 后普通 explore 永久关闭；C 只许 exact explore mounts、排除 DREAMER、
+              spent-before-spawn，只从 guardian + exact sandbox promotion 恢复且永不重跑。root evaluator 将
+              科学审核结果写入 sealed truth 旁的 immutable verdict ledger，所有 T1-D/final-marker/score/mount
+              准入均回放完整 C/audit authority 链；T2 明确无 C。
+              → commit `e1654fa`（build_log 0089；qualification **142** + 相邻 **148**；唯一有效全量
+              **1818 passed, 1 skipped**；外审两轮 `REQUEST_CHANGES` 成立项在上限后全修）。
           - [x] CP11.4c.3c.2 目标 VEPFS 两节点 lease/fd/journal canary + 预声明 fault schedule soak runner。
             - [x] CP11.4c.3c.2a SQLite storage boundary：已知本地盘用 WAL，GPFS/未知盘用
               `DELETE` + `synchronous=FULL`；旧 WAL 在任何 schema/data 读前以 EXCLUSIVE 唯一 owner 迁移；
@@ -592,6 +597,6 @@
             计数归零，也不会覆盖旧调用证据。query responder 同步返回真实存在的 rc events 路径。
             → commit `b208233`（build_log 0087；相关 179；跨新实例 rc transcript/heartbeat 与 bound query
             精确回归；内部终审 APPROVE；全量留最终检查点）。
-          - [ ] CP11.4c.3d.2 先闭合 CP11.4c.3c.1b；dedicated VM/private cgroup+NVIDIA Docker、GPFS
+          - [ ] CP11.4c.3d.2 目标环境真实验收：dedicated VM/private cgroup+NVIDIA Docker、GPFS
             quota/second node/connector 就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，
             再勾 CP11.4c。
