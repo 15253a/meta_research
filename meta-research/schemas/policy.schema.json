@@ -6,6 +6,87 @@
   "type": "object",
   "required": ["acquisition", "budget", "flow", "retrieval", "import_search", "import_materialization", "import_reference", "session", "tree_guard", "question_guard", "answer_review", "goal_amend", "cards", "idea", "interaction", "execution", "resources", "deployment", "interaction_request", "observation"],
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "required": ["execution"],
+        "properties": {
+          "execution": {
+            "required": ["sandbox"],
+            "properties": {
+              "sandbox": {
+                "required": ["local_environment"],
+                "properties": { "local_environment": { "type": "object" } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "deployment": {
+            "required": ["mode"],
+            "properties": { "mode": { "const": "development" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["execution"],
+        "properties": {
+          "execution": {
+            "required": ["sandbox"],
+            "properties": {
+              "sandbox": {
+                "required": ["network_mode"],
+                "properties": { "network_mode": { "const": "bridge" } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "deployment": {
+            "required": ["mode"],
+            "properties": { "mode": { "const": "development" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["execution"],
+        "properties": {
+          "execution": {
+            "required": ["sandbox"],
+            "properties": {
+              "sandbox": {
+                "required": ["development_gpu_thread_limit"],
+                "properties": { "development_gpu_thread_limit": { "type": "integer" } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "deployment": {
+            "required": ["mode"],
+            "properties": { "mode": { "const": "development" } }
+          },
+          "execution": {
+            "properties": {
+              "sandbox": {
+                "properties": { "local_environment": { "type": "object" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "acquisition": {
       "type": "object",
@@ -60,13 +141,14 @@
         "audit_cadence_K": { "type": "integer", "minimum": 1 },
         "retry": {
           "type": "object",
-          "required": ["artifact_parse", "plan_review", "bundle_code_review", "bundle_result_review"],
+          "required": ["artifact_parse", "bundle_repair", "plan_review", "bundle_code_review", "bundle_result_review"],
           "additionalProperties": false,
           "properties": {
             "artifact_parse": { "type": "integer", "minimum": 0 },
-            "plan_review": { "type": "integer", "minimum": 1, "maximum": 2 },
-            "bundle_code_review": { "type": "integer", "minimum": 1 },
-            "bundle_result_review": { "type": "integer", "minimum": 1 }
+            "bundle_repair": { "type": ["integer", "null"], "minimum": 0, "maximum": 3, "description": "同一 build_target 在冻结 plan 内可请求的实施自愈次数；null 表示工程修复不限轮次，直到成功或 Bundle Codex 明确判定为 plan 缺陷并回 Reasoning" },
+            "plan_review": { "type": "integer", "minimum": 0, "maximum": 1 },
+            "bundle_code_review": { "type": "integer", "minimum": 0, "maximum": 1 },
+            "bundle_result_review": { "type": "integer", "minimum": 0, "maximum": 1 }
           }
         },
         "watchdog": {
@@ -338,11 +420,78 @@
     },
     "idea": {
       "type": "object",
-      "required": ["sd_threshold", "candidate_top_k", "dedup_budget", "forbid_proto_term_source", "cross_phase"],
+      "required": ["engine", "problem_type", "slot_count", "candidate_top_k", "max_attempts", "thresholds", "novelty_check", "sd_threshold", "dedup_budget", "forbid_proto_term_source", "cross_phase"],
       "additionalProperties": false,
       "properties": {
+        "engine": {
+          "type": "object",
+          "required": ["name", "version", "adapter_version", "profile"],
+          "additionalProperties": false,
+          "properties": {
+            "name": { "const": "wildidea" },
+            "version": { "const": "wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598" },
+            "adapter_version": { "const": "meta-research-wildidea-adapter-v1" },
+            "profile": { "const": "research" }
+          }
+        },
+        "problem_type": { "const": "research" },
+        "slot_count": { "const": 9 },
         "sd_threshold": { "type": "number", "minimum": 0, "maximum": 10 },
-        "candidate_top_k": { "type": "integer", "minimum": 1 },
+        "candidate_top_k": { "const": 3 },
+        "max_attempts": { "const": 3 },
+        "thresholds": {
+          "type": "object",
+          "required": ["research"],
+          "additionalProperties": false,
+          "properties": {
+            "research": {
+              "type": "object",
+              "required": ["structural_depth", "domain_distance", "applicability", "novelty"],
+              "additionalProperties": false,
+              "properties": {
+                "structural_depth": { "const": 6 },
+                "domain_distance": { "const": 7 },
+                "applicability": { "const": 6 },
+                "novelty": { "const": 8 }
+              }
+            }
+          }
+        },
+        "novelty_check": {
+          "type": "object",
+          "required": ["enabled", "status"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "status": { "enum": ["pending_controlled_backend", "controlled_backend_enabled"] },
+            "provider": { "const": "arxiv_api_v1" },
+            "endpoint": { "const": "https://export.arxiv.org/api/query" },
+            "queries_per_candidate": { "const": 1 },
+            "max_results_per_query": { "type": "integer", "minimum": 1, "maximum": 50 },
+            "timeout_s": { "type": "number", "exclusiveMinimum": 0, "maximum": 600 },
+            "max_response_bytes": { "type": "integer", "minimum": 1024, "maximum": 16777216 },
+            "min_interval_s": { "type": "number", "minimum": 0, "maximum": 60 },
+            "retry_attempts": { "type": "integer", "minimum": 1, "maximum": 20 },
+            "retry_initial_delay_s": { "type": "number", "minimum": 0, "maximum": 120 },
+            "retry_max_delay_s": { "type": "number", "minimum": 0, "maximum": 600 }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "enabled": { "const": false } }, "required": ["enabled"] },
+              "then": { "properties": { "status": { "const": "pending_controlled_backend" } } }
+            },
+            {
+              "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+              "then": {
+                "required": [
+                  "provider", "endpoint", "queries_per_candidate", "max_results_per_query",
+                  "timeout_s", "max_response_bytes", "min_interval_s"
+                ],
+                "properties": { "status": { "const": "controlled_backend_enabled" } }
+              }
+            }
+          ]
+        },
         "dedup_budget": { "type": "integer", "minimum": 0 },
         "forbid_proto_term_source": { "type": "string", "minLength": 1 },
         "cross_phase": {
@@ -388,14 +537,15 @@
         "path_allowlist": { "type": "array", "items": { "type": "string", "pattern": "^/" }, "description": "允许 argv 引用的 work_root 以外绝对路径前缀（如真数据根）" },
         "sandbox": {
           "type": "object",
-          "description": "bundle/import 敌对执行后端；exact image pin、network none、只读 rootfs 与资源边界由 execution_sandbox.py 执法",
-          "required": ["backend", "engine_path", "engine_host", "resource_mode", "seccomp_profile", "seccomp_sha256", "seccomp_bpf", "seccomp_bpf_sha256", "seccomp_bpf_arch", "image", "image_id", "python_path", "memory_mb", "pids", "nofile", "max_log_mb", "max_file_mb", "max_output_mb", "max_output_files", "cpus", "tmpfs_mb", "shm_mb", "input_max_mb", "readonly_mounts", "payload_environment"],
+          "description": "bundle/import 敌对执行后端；exact image pin、policy-selected network（production=none，development 可显式 bridge）、只读 rootfs 与资源边界由 execution_sandbox.py 执法",
+          "required": ["backend", "engine_path", "engine_host", "resource_mode", "network_mode", "seccomp_profile", "seccomp_sha256", "seccomp_bpf", "seccomp_bpf_sha256", "seccomp_bpf_arch", "image", "image_id", "python_path", "memory_mb", "pids", "nofile", "max_log_mb", "max_file_mb", "max_output_mb", "max_output_files", "cpus", "development_gpu_thread_limit", "tmpfs_mb", "shm_mb", "input_max_mb", "readonly_mounts", "payload_environment", "local_environment"],
           "additionalProperties": false,
           "properties": {
             "backend": { "const": "docker" },
             "engine_path": { "type": "string", "pattern": "^/" },
             "engine_host": { "type": "string", "pattern": "^unix:///" },
             "resource_mode": { "enum": ["cgroup-v1", "cgroup-v2", "rlimit-fallback"] },
+            "network_mode": { "enum": ["none", "bridge"] },
             "seccomp_profile": { "type": "string", "minLength": 1, "pattern": "^(?!/)" },
             "seccomp_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
             "seccomp_bpf": { "type": "string", "minLength": 1, "pattern": "^(?!/)" },
@@ -412,6 +562,10 @@
             "max_output_mb": { "type": "integer", "minimum": 1 },
             "max_output_files": { "type": "integer", "minimum": 1, "maximum": 1000000 },
             "cpus": { "type": "number", "exclusiveMinimum": 0 },
+            "development_gpu_thread_limit": {
+              "description": "仅 development local-environment GPU invocation 注入的 BLAS/OMP 线程上限；null 为禁用。安全硬边界仍由 pids/cgroup/RLIMIT 执法。",
+              "type": ["integer", "null"], "minimum": 1, "maximum": 4096
+            },
             "tmpfs_mb": { "type": "integer", "minimum": 1 },
             "shm_mb": { "type": "integer", "minimum": 1 },
             "input_max_mb": { "type": "integer", "minimum": 1 },
@@ -420,6 +574,25 @@
               "type": "object", "maxProperties": 32,
               "propertyNames": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^=\\u0000]+$" },
               "additionalProperties": { "type": "string", "maxLength": 65536 }
+            },
+            "local_environment": {
+              "description": "仅 development 可启用的本机 Conda prefix 只读 bind；null 表示禁用。不得并入 qualification readonly_mounts/path_allowlist。",
+              "oneOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "required": ["enabled", "development_only", "source", "target", "python_path", "identity_sha256"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "const": true },
+                    "development_only": { "const": true },
+                    "source": { "type": "string", "pattern": "^/[^,:\\u0000\\r\\n]*$", "maxLength": 4096 },
+                    "target": { "const": "/opt/host-conda" },
+                    "python_path": { "const": "/opt/host-conda/bin/python" },
+                    "identity_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                  }
+                }
+              ]
             }
           }
         }
@@ -427,13 +600,37 @@
     },
     "resources": {
       "type": "object",
-      "description": "启动输入③：只放硬件事实（时限唯一归 flow.watchdog，§4.6.7）",
-      "required": ["gpus", "gpu_mem_gb", "disk_quota_gb"],
+      "description": "启动输入③：硬件请求与显式 target GPU 计划合同（时限唯一归 flow.watchdog，§4.6.7）。gpus 不得暗推 target mode；gpu_target_policy 由编排器独立执法。",
+      "required": ["gpus", "gpu_mem_gb", "disk_quota_gb", "gpu_target_policy", "allowed_device_indices"],
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "gpus": { "const": 0 } }, "required": ["gpus"] },
+          "then": { "properties": { "gpu_mem_gb": { "const": 0 }, "allowed_device_indices": { "maxItems": 0 } } },
+          "else": { "properties": { "gpu_mem_gb": { "exclusiveMinimum": 0 }, "allowed_device_indices": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "gpu_target_policy": { "const": "required" } }, "required": ["gpu_target_policy"] },
+          "then": { "properties": { "gpus": { "minimum": 1 }, "gpu_mem_gb": { "exclusiveMinimum": 0 }, "allowed_device_indices": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "gpu_target_policy": { "const": "forbidden" } }, "required": ["gpu_target_policy"] },
+          "then": { "properties": { "gpus": { "const": 0 }, "gpu_mem_gb": { "const": 0 }, "allowed_device_indices": { "maxItems": 0 } } }
+        }
+      ],
       "properties": {
         "gpus": { "type": "integer", "minimum": 0 },
         "gpu_mem_gb": { "type": "number", "minimum": 0 },
-        "disk_quota_gb": { "type": "number", "minimum": 0 }
+        "disk_quota_gb": { "type": "number", "minimum": 0 },
+        "gpu_target_policy": {
+          "enum": ["planner_select", "required", "forbidden"],
+          "description": "planner_select=计划者逐 target 显式决定；required=所有新执行 target 及 evaluation 复用必须 gpu_required=true；forbidden=必须 false。"
+        },
+        "allowed_device_indices": {
+          "type": "array", "maxItems": 64, "uniqueItems": true,
+          "description": "部署可从 live NVIDIA inventory 选取的 index 窄化集；须升序且数量不少于 gpus，运行时再机械执法。",
+          "items": { "type": "integer", "minimum": 0, "maximum": 4095 }
+        }
       }
     },
     "deployment": {

@@ -8,7 +8,8 @@
       "kind": "evaluation",
       "ref_md": "复用 logreg-gauss2d 变体 v1 在 toy-gauss-cls@1 的既有成功 evaluation",
       "evaluation_id": "eval:logreg-gauss2d/v1@toy-gauss-cls@1",
-      "metric_result_id": "mr:logreg-gauss2d/v1@toy-gauss-cls@1#accuracy@1:aggregate"
+      "metric_result_id": "mr:logreg-gauss2d/v1@toy-gauss-cls@1#accuracy@1:aggregate",
+      "gpu_required": false
     }
   ],
   "targets": [],

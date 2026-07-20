@@ -77,11 +77,27 @@ class ResponderReply:
     provider_receipt_ref: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ManagedArtifactRef:
+    """Trusted file-manager reference for a stage artifact.
+
+    The model can name a file in its disposable submission directory, but only
+    the Runner may construct this object after promoting and hashing that file.
+    Large payload bytes stay on the file side of the DB+filesystem boundary;
+    downstream code consumes this path+hash identity without serialising the
+    body into SQLite or another model message.
+    """
+    path: str
+    size_bytes: int
+    sha256: str
+
+
 @dataclass
 class Artifact:
     """一次阶段执行的全部产物：文件名 → 合 schema 的 JSON 对象，外加中文 md 正文。
 
     files 的键 = 产物文件名（如 "idea_set.json" / "answer.json"），值 = 待校验 JSON；
+    Bundle 的大代码文件可为 Runner 已核验的 ManagedArtifactRef（正文留在文件管理层）；
     Gate 逐文件按 schemas/ 对应 schema 校验。md 为该阶段的中文正文（可空）。
     usage = 本次调用用量（真 runner 填；stub / 无用量时 None）——CP10.2 成本记账消费，不影响产物校验。
     """
@@ -92,6 +108,22 @@ class Artifact:
     transcript_ref: Optional[str] = None
     execution_receipt_ref: Optional[str] = None
     provider_receipt_ref: Optional[str] = None
+    # Exact hash of the complete provider prompt after system/skill/context/
+    # retry wrapping. Real Runner fills it; deterministic test doubles may
+    # leave it unset.
+    prompt_sha256: Optional[str] = None
+    # Present only when the resident main worker already validated and staged
+    # this artifact through the quest-scoped runtime MCP.  The provider may
+    # then consume the receipt without repeating transport/schema parsing;
+    # semantic/core gates still run at their normal transaction boundary.
+    stage_submission_ref: Optional[str] = None
+    stage_submission_hash: Optional[str] = None
+    # Bundle's one cycle-wide main turn may finish on a later target than the
+    # initial ContextPack.  These identities come from the already hash-checked
+    # MCP receipt so replay archives the actual submitted target/pack rather
+    # than incorrectly reusing the first target's envelope identity.
+    stage_submission_target_id: Optional[str] = None
+    stage_submission_pack_hash: Optional[str] = None
 
 
 @dataclass
@@ -164,7 +196,12 @@ class Hit:
 # ---------------------------------------------------------------------------
 
 class Runner(Protocol):
-    """智能运行时窄接口（M0 起即真：codex exec 一次性调用，无状态工人，§6.2）。"""
+    """智能运行时窄接口。
+
+    生产阶段 runner 绑定 Idea/Plan/Bundle/Reasoning 的 resident 主会话；一次
+    ``run_task`` 是一个完整阶段 turn。只有显式 qualification/legacy 适配器可保持
+    隔离的一次性调用语义。
+    """
 
     def run_task(self, *, system_prompt: str, skill: str, context_pack: ContextPack) -> Artifact: ...
 
@@ -411,3 +448,19 @@ class StageBlockedOnResources(RuntimeError):
         super().__init__(f"阶段 {stage} 等待文件请求 #{request_id}（全局等待：用户提供后续跑）")
         self.request_id = request_id
         self.stage = stage
+
+
+class BundleReplanRequired(RuntimeError):
+    """Bundle found that the frozen plan cannot be executed as specified.
+
+    This is an internal research outcome, not a request for the user to upload
+    files.  AttackStages closes any exact execution owner, marks the target as
+    a plan/protocol failure, and always lets the normal Reasoning phase summarize
+    the cycle and choose a smaller or different plan.
+    """
+
+    def __init__(self, request: Dict[str, Any], *, request_id: Optional[int] = None):
+        summary = str(request.get("summary_md") or "冻结计划与执行环境不兼容")
+        super().__init__(summary)
+        self.request = request
+        self.request_id = request_id

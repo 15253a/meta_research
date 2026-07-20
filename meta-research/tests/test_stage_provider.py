@@ -11,15 +11,22 @@ from types import SimpleNamespace as NS
 
 import hashlib
 import json
+import sqlite3
 
 import pytest
 import yaml
 
 from orchestrator import database as db
-from orchestrator.interfaces import Artifact
+from orchestrator.interfaces import Artifact, ContextPack
 from orchestrator.runner import RunnerError
 from orchestrator.schemas import SchemaSet
-from orchestrator.stage_provider import PlanReviewProvider, StageProvider
+from orchestrator.stage_provider import (
+    BUNDLE_OPERATOR_SESSION_CONTRACT,
+    PlanReviewProvider,
+    STAGE_MAIN_SESSION_CONTRACT,
+    StageProvider,
+)
+from orchestrator.wildidea_adapter import WildIdeaAdapter
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
@@ -45,6 +52,58 @@ class MockRunner:
         return Artifact(stage=context_pack.stage, files=item, md="")
 
 
+class _FakeNoveltyProvider:
+    """Deterministic trusted-host stand-in; unit tests never use the network."""
+    name = "arxiv_api_v1"
+
+    def search(self, query, *, policy_hash):
+        result_hash = "sha256:" + hashlib.sha256(
+            query.encode("utf-8")).hexdigest()
+        snapshot_hash = "sha256:" + hashlib.sha256(
+            ("snapshot\x00" + query).encode("utf-8")).hexdigest()
+        return {
+            "final_ref": {
+                "query": query,
+                "provider": self.name,
+                "snapshot_hash": snapshot_hash,
+                "snapshot_ref": (
+                    "state/novelty/snapshots/sha256/"
+                    + snapshot_hash.removeprefix("sha256:") + ".json"),
+                "raw_content_hash": "sha256:" + "a" * 64,
+                "result_content_hashes": [result_hash],
+                "ranking": [result_hash],
+                "policy_hash": policy_hash,
+            },
+            "results": [{
+                "rank": 1,
+                "result_content_hash": result_hash,
+                "id": "https://arxiv.org/abs/fixture",
+                "title": "Fixture result",
+            }],
+        }
+
+
+def _operator_factory(factory):
+    """Explicitly declare the exact injected-runner persistence contract."""
+    factory.bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
+    return factory
+
+
+def _operator_runner(runner):
+    runner.bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
+    return runner
+
+
+def _resident_factory(factory):
+    factory.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+    return factory
+
+
+def _resident_runner(runner):
+    runner.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+    return runner
+
+
 def _provider(scripted, work):
     runner = MockRunner(scripted)
     sp = StageProvider(runner_factory=lambda td, pt: runner, schemas=SCHEMAS,
@@ -59,15 +118,62 @@ def _pack(stage):
             _PLAN, ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
         sources.append(f"staging:plan-draft:{plan_hash}")
-    return NS(cycle_id="c1", stage=stage, target_id=None, anchor_md="", neighborhood_md="",
+    return NS(cycle_id="c1", stage=stage,
+              # Bundle calls are target-scoped in production so their durable
+              # runner purpose cannot collapse across parallel build targets.
+              target_id=(7 if stage == "bundle" else None),
+              anchor_md="", neighborhood_md="",
               retrieval_md="", refs=[], sources=sources)
 
 
 _FIX = SYSTEM_ROOT / "tests" / "fixtures" / "valid"
 _IDEA = json.loads((_FIX / "idea_set" / "wildidea.json").read_text(encoding="utf-8"))
+_BYPASS_IDEA = json.loads(
+    (_FIX / "idea_set" / "bypass.json").read_text(encoding="utf-8"))
 _PLAN = json.loads((_FIX / "plan" / "attack.json").read_text(encoding="utf-8"))
 _IMPORT_SEARCH_REQUEST = json.loads(
     (_FIX / "import_search_request" / "new_structure.json").read_text(encoding="utf-8"))
+
+
+def _real_pack(cycle_id="c1", *, anchor="GENERATOR SECRET CONTEXT"):
+    pack = ContextPack(
+        cycle_id=cycle_id, stage="idea", target_id=None,
+        anchor_md=anchor, neighborhood_md="PRIOR IDEA SECRET",
+        retrieval_md="PRIVATE RETRIEVAL", refs=[], sources=["db:question:1"])
+    pack.pack_hash = hashlib.sha256(
+        ("\x00".join((pack.anchor_md, pack.neighborhood_md,
+                       pack.retrieval_md, "[]"))).encode("utf-8")
+    ).hexdigest()
+    return pack
+
+
+def _audit_source(cycle_id):
+    return _real_pack(cycle_id, anchor="QUESTION ONLY").__class__(
+        cycle_id=cycle_id, stage="idea", target_id=None,
+        anchor_md="QUESTION ONLY", neighborhood_md="", retrieval_md="",
+        refs=[], sources=["db:question:1"],
+        pack_hash=hashlib.sha256(
+            ("\x00".join(("QUESTION ONLY", "", "", "[]"))).encode("utf-8")
+        ).hexdigest())
+
+
+def _bypass_draft():
+    draft = {
+        "need_innovation": False,
+        "candidates": json.loads(json.dumps(_BYPASS_IDEA["candidates"], ensure_ascii=False)),
+        "novelty_refs": [],
+    }
+    draft["candidates"][0]["novelty_queries"] = [
+        "cross dataset EEG representation generalization"]
+    return draft
+
+
+def _bypass_audit():
+    return {
+        "audit_scores": json.loads(json.dumps(
+            _BYPASS_IDEA["audit_scores"], ensure_ascii=False)),
+        "selected_id": "c1",
+    }
 
 
 # ============ 正常产出（三阶段各直测 schema 校验路径）============
@@ -75,6 +181,142 @@ def test_idea_returns_validated_files(tmp_path):
     sp, _ = _provider([{"idea_set.json": _IDEA}], tmp_path)
     out = sp.idea(NS(cycle_id="c1"), _pack("idea"))
     assert out == {"idea_set.json": _IDEA}                     # 真 idea_set fixture 过 schema
+
+
+class _RecordingLedger:
+    def __init__(self):
+        self.next_id = 1
+        self.begun = []
+        self.finished = []
+
+    def begin_call(self, *, cycle_id, phase, purpose):
+        runner_call_id = self.next_id
+        self.next_id += 1
+        self.begun.append((runner_call_id, cycle_id, phase, purpose))
+        return runner_call_id
+
+    def mark_call_running(self, **_kwargs):
+        return None
+
+    def abort_unstarted_call(self, **_kwargs):
+        return None
+
+    def finish_call(self, **kwargs):
+        self.finished.append(kwargs)
+
+
+def _wildidea_provider(scripted, tmp_path, *, bridge=None, adapter=None):
+    purposes = []
+    packs = []
+    runner = MockRunner(scripted)
+    original_run = runner.run_task
+
+    def capture_run(*, system_prompt, skill, context_pack):
+        packs.append(context_pack)
+        return original_run(
+            system_prompt=system_prompt, skill=skill, context_pack=context_pack)
+
+    runner.run_task = capture_run
+    ledger = _RecordingLedger()
+
+    def factory(transcripts, purpose):
+        Path(transcripts).mkdir(parents=True, exist_ok=True)
+        purposes.append(purpose)
+        return runner
+
+    adapter = adapter or WildIdeaAdapter(
+        SYSTEM_ROOT, NO_BUDGET_POLICY,
+        novelty_provider=_FakeNoveltyProvider())
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        file_request_bridge=bridge, cost_ledger=ledger,
+        wildidea_adapter=adapter, idea_audit_pack_builder=_audit_source)
+    return provider, runner, purposes, packs, ledger
+
+
+def test_wildidea_two_sessions_are_blind_accounted_and_repeatable(tmp_path):
+    scripted = [
+        {"idea_set.draft.json": _bypass_draft()},
+        {"idea_audit.json": _bypass_audit()},
+        {"idea_set.draft.json": _bypass_draft()},
+        {"idea_audit.json": _bypass_audit()},
+    ]
+    sp, _runner, purposes, packs, ledger = _wildidea_provider(scripted, tmp_path)
+
+    first = sp.idea(NS(cycle_id="c1"), _real_pack("c1"))["idea_set.json"]
+    second = sp.idea(NS(cycle_id="c2"), _real_pack("c2"))["idea_set.json"]
+
+    assert first["selected_id"] == second["selected_id"] == "c1"
+    assert first["provenance"]["engine_version"].startswith("wildidea@6ff66ada")
+    assert purposes == [
+        "idea-generate-n1", "idea-audit-n2",
+        "idea-generate-n3", "idea-audit-n4",
+    ]
+    assert [(row[2], row[3]) for row in ledger.begun] == [
+        ("idea", "idea-generate-n1-a1"),
+        ("audit", "idea-audit-n2-a1"),
+        ("idea", "idea-generate-n3-a1"),
+        ("audit", "idea-audit-n4-a1"),
+    ]
+    assert all(item["status"] == "success" for item in ledger.finished)
+    # Generator sees its sampled pack; judge gets a separate question-only pack
+    # plus candidate_id/audit_mapping, never generator secrets or sampled anchors.
+    assert "WildIdea adapter sampled slots" in packs[0].retrieval_md
+    assert packs[1].anchor_md == "QUESTION ONLY"
+    audit_bytes = "\n".join((
+        packs[1].anchor_md, packs[1].neighborhood_md, packs[1].retrieval_md))
+    assert "GENERATOR SECRET CONTEXT" not in audit_bytes
+    assert "PRIOR IDEA SECRET" not in audit_bytes
+    assert "WildIdea adapter sampled slots" not in audit_bytes
+
+
+def test_wildidea_exact_files_semantic_retry_and_audit_sidecar_forbidden(tmp_path):
+    bridge_calls = []
+    scripted = [
+        # Required draft plus an invented file is rejected, not silently ignored.
+        {"idea_set.draft.json": _bypass_draft(), "idea_audit.json": _bypass_audit()},
+        # Schema-valid but adapter-invalid model provenance is an artifact retry.
+        {"idea_set.draft.json": {
+            **_bypass_draft(), "provenance": {"model": "forged"}}},
+        {"idea_set.draft.json": _bypass_draft()},
+        # A judge can never turn its complete blind pack into a user file request.
+        {"idea_audit.json": _bypass_audit(), "resource_request.json": {"bad": True}},
+        {"idea_audit.json": _bypass_audit(), "extra.json": {}},
+        {"idea_audit.json": _bypass_audit()},
+    ]
+    sp, runner, purposes, _packs, ledger = _wildidea_provider(
+        scripted, tmp_path,
+        bridge=lambda *args: bridge_calls.append(args))
+
+    final = sp.idea(NS(cycle_id="c1"), _real_pack("c1"))["idea_set.json"]
+
+    assert final["selected_id"] == "c1"
+    assert bridge_calls == []
+    assert purposes == ["idea-generate-n1", "idea-audit-n2"]
+    assert "files 必须恰为" in runner.skills_seen[1]
+    assert "provenance" in runner.skills_seen[2]
+    assert "禁止产出 resource_request.json" in runner.skills_seen[4]
+    assert "files 必须恰为" in runner.skills_seen[5]
+    assert [item["status"] for item in ledger.finished] == [
+        "failed", "failed", "success", "failed", "failed", "success"]
+
+
+def test_wildidea_post_validate_exception_closes_cost_intent(tmp_path):
+    class ExplodingAdapter(WildIdeaAdapter):
+        def validate_draft(self, draft):
+            raise RuntimeError("validator exploded")
+
+    adapter = ExplodingAdapter(
+        SYSTEM_ROOT, NO_BUDGET_POLICY,
+        novelty_provider=_FakeNoveltyProvider())
+    sp, _runner, _purposes, _packs, ledger = _wildidea_provider(
+        [{"idea_set.draft.json": _bypass_draft()}], tmp_path, adapter=adapter)
+
+    with pytest.raises(RuntimeError, match="validator exploded"):
+        sp.idea(NS(cycle_id="c1"), _real_pack("c1"))
+    assert ledger.finished[-1]["status"] == "failed"
+    assert ledger.finished[-1]["failure_kind"] == "postprocess_error"
 
 
 def test_plan_returns_validated_files(tmp_path):
@@ -274,11 +516,499 @@ def _bundle_envelope():
             "train.py": "print('t')", "eval.py": "print('e')", "cfg.json": {"lr": 0.1}}
 
 
+def _bundle_operator_control(*, event="start", subject_char="a"):
+    return {
+        "protocol": "bundle-operator-control-v1",
+        "build_target_id": 7,
+        "phase": "train",
+        "event": event,
+        "execution_owner": {"kind": "run", "id": 19},
+        "plan_slice_hash": "1" * 64,
+        "source_tree_hash": "sha256:" + "2" * 64,
+        "subject_hash": "sha256:" + subject_char * 64,
+        "repair_round": 0,
+        "log": {
+            "state": "not_started" if event == "start" else "partial",
+            "size_bytes": 0,
+            "tail_sha256": "sha256:" + "3" * 64,
+            "tail_text": "",
+            "content_hash": None,
+            "exit_code": None,
+        },
+    }
+
+
+def _bundle_operator_action(control, action):
+    return {
+        "version": 1,
+        "build_target_id": control["build_target_id"],
+        "phase": control["phase"],
+        "event": control["event"],
+        "action": action,
+        "execution_owner": dict(control["execution_owner"]),
+        "plan_slice_hash": control["plan_slice_hash"],
+        "source_tree_hash": control["source_tree_hash"],
+        "subject_hash": control["subject_hash"],
+        "diagnosis_md": "checked exact manifest capability",
+    }
+
+
 def test_bundle_passthrough_all_files(tmp_path):
     """bundle 信封全量透传（代码文件名任意、不可枚举）——required 校验后原样返回，物化归组件。"""
     sp, _ = _provider([_bundle_envelope()], tmp_path)
     out = sp.bundle(NS(cycle_id="c1"), _pack("bundle"))
     assert out == _bundle_envelope()                            # 含代码文件与 cfg.json（未被丢弃）
+
+
+def test_bundle_operator_mode_rejects_undeclared_injected_factory(tmp_path):
+    ledger = _RecordingLedger()
+    with pytest.raises(ValueError, match="runner_factory 未明确声明"):
+        StageProvider(
+            runner_factory=lambda _td, _pt: MockRunner([]),
+            schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+            system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+            cost_ledger=ledger, bundle_operator_mode=True)
+
+
+def test_bundle_operator_rejects_declared_factory_instance_capability_drift(tmp_path):
+    class EmptyDaemon:
+        def query(self, _sql, _params):
+            return []
+
+    ledger = _RecordingLedger()
+    ledger.daemon = EmptyDaemon()
+    factory = _operator_factory(lambda _td, _pt: MockRunner([_bundle_envelope()]))
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, bundle_operator_mode=True)
+
+    with pytest.raises(RuntimeError, match="runner 实例.*漂移"):
+        provider.bundle(NS(cycle_id="c1"), _pack("bundle"))
+
+
+def test_bundle_operator_guard_blocks_turn_before_runner_or_session_resume(tmp_path):
+    class SealClosed(RuntimeError):
+        pass
+
+    class EmptyDaemon:
+        def query(self, _sql, _params):
+            return []
+
+    class OperatorRunner(MockRunner):
+        def __init__(self):
+            super().__init__([_bundle_envelope()])
+            self.bound = []
+
+        def bind_persistent_session(self, *, session_id, role="narrator"):
+            self.bound.append((session_id, role))
+
+    runner = _operator_runner(OperatorRunner())
+    factory_calls = []
+
+    @_operator_factory
+    def factory(_td, _pt):
+        factory_calls.append(True)
+        return runner
+    ledger = _RecordingLedger()
+    ledger.daemon = EmptyDaemon()
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, bundle_operator_mode=True,
+        bundle_operator_guard=lambda: (_ for _ in ()).throw(
+            SealClosed("qualification claim boundary closed")))
+
+    with pytest.raises(SealClosed, match="claim boundary"):
+        provider.bundle(NS(cycle_id="c1"), _pack("bundle"))
+    assert factory_calls == []
+    assert runner.bound == []
+    assert runner.skills_seen == []
+
+
+def test_retired_bundle_operator_does_not_outer_retry_invalid_action(tmp_path):
+    control = _bundle_operator_control()
+    valid = _bundle_operator_action(control, "start")
+    wrong_identity = {**valid, "build_target_id": 8}
+    extra_field = {**valid, "argv": ["python", "train.py"]}
+
+    class OperatorRunner(MockRunner):
+        def __init__(self):
+            super().__init__([
+                {"bundle_operator_action.json": wrong_identity},
+                {"bundle_operator_action.json": extra_field},
+                {"bundle_operator_action.json": valid},
+            ])
+            self.bound = []
+
+        def bind_persistent_session(self, *, session_id, role="narrator"):
+            self.bound.append((session_id, role))
+
+    class EmptyDaemon:
+        def query(self, _sql, _params):
+            return []
+
+    runner = _operator_runner(OperatorRunner())
+    ledger = _RecordingLedger()
+    ledger.daemon = EmptyDaemon()
+    factory = _operator_factory(lambda _td, _pt: runner)
+    provider = StageProvider(
+        runner_factory=factory,
+        schemas=SCHEMAS, policy=NO_BUDGET_POLICY, system_prompt="SYS",
+        skills=SKILLS, work_root=str(tmp_path), cost_ledger=ledger,
+        bundle_operator_mode=True)
+
+    with pytest.raises(RunnerError, match="不执行外层 artifact 重试"):
+        provider.bundle_operator(NS(cycle_id="c1"), _pack("bundle"), control)
+
+    assert runner.bound == [(None, "bundle_operator")]
+    assert len(runner.skills_seen) == 1
+    assert [item["status"] for item in ledger.finished] == ["failed"]
+
+
+def test_bundle_operator_actions_resume_same_cycle_provider_thread(tmp_path, monkeypatch):
+    start_control = _bundle_operator_control(event="start", subject_char="a")
+    progress_control = _bundle_operator_control(event="progress", subject_char="b")
+    scripted = [
+        {"bundle_operator_action.json": _bundle_operator_action(start_control, "start")},
+        {"bundle_operator_action.json": _bundle_operator_action(progress_control, "continue")},
+    ]
+
+    class Daemon:
+        rows = []
+
+        def query(self, _sql, _params):
+            return list(self.rows)
+
+    class OperatorRunner(MockRunner):
+        def __init__(self, item):
+            super().__init__([item])
+            self.bound = []
+            self.packs = []
+
+        def bind_persistent_session(self, *, session_id, role="narrator"):
+            self.bound.append((session_id, role))
+
+        def run_task(self, *, system_prompt, skill, context_pack):
+            self.packs.append(context_pack)
+            return super().run_task(
+                system_prompt=system_prompt, skill=skill,
+                context_pack=context_pack)
+
+    daemon = Daemon()
+    ledger = _RecordingLedger()
+    ledger.daemon = daemon
+    runners = []
+    purposes = []
+
+    @_operator_factory
+    def factory(_transcripts, purpose):
+        purposes.append(purpose)
+        runner = _operator_runner(OperatorRunner(scripted[len(runners)]))
+        runners.append(runner)
+        return runner
+
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda _path, **_kwargs: NS(provider_invocation_id="thread-7"))
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, bundle_operator_mode=True)
+    pack = _pack("bundle")
+
+    first = provider.bundle_operator(NS(cycle_id="c1"), pack, start_control)
+    daemon.rows = [(
+        11, "bundle", "bundle-c1-t7-operator-train-start-aaaaaaaaaaaa-n1-a1",
+        "/provider/11", "/exec/11")]
+    second = provider.bundle_operator(NS(cycle_id="c1"), pack, progress_control)
+
+    assert first["bundle_operator_action.json"]["action"] == "start"
+    assert second["bundle_operator_action.json"]["action"] == "continue"
+    assert runners[0].bound == [(None, "bundle_operator")]
+    assert runners[1].bound == [("thread-7", "bundle_operator")]
+    assert purposes == [
+        "bundle-c1-t7-operator-train-start-aaaaaaaaaaaa-n1",
+        "bundle-c1-t7-operator-train-progress-bbbbbbbbbbbb-n2",
+    ]
+    assert start_control["subject_hash"] in runners[0].packs[0].anchor_md
+    assert progress_control["subject_hash"] in runners[1].packs[0].anchor_md
+
+
+def test_plan_main_resumes_one_stage_thread_across_provider_turns(tmp_path, monkeypatch):
+    class Daemon:
+        rows = []
+
+        def query(self, _sql, _params):
+            return list(self.rows)
+
+    class ResidentRunner(MockRunner):
+        def __init__(self):
+            super().__init__([{"plan.json": _PLAN}])
+            self.bound = []
+
+        def bind_persistent_session(self, *, session_id, role="narrator"):
+            self.bound.append((session_id, role))
+
+    daemon = Daemon()
+    ledger = _RecordingLedger()
+    ledger.daemon = daemon
+    runners = []
+    purposes = []
+
+    @_resident_factory
+    def factory(_transcripts, purpose):
+        purposes.append(purpose)
+        runner = _resident_runner(ResidentRunner())
+        runners.append(runner)
+        return runner
+
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda _path, **_kwargs: NS(provider_invocation_id="thread-plan-1"))
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, resident_stage_sessions=True)
+
+    provider.plan(NS(cycle_id="c1"), _pack("plan"))
+    daemon.rows = [(
+        11, "plan", "plan-main-c1-n1-a1", "/provider/11", "/exec/11")]
+    provider.plan(NS(cycle_id="c1"), _pack("plan"))
+
+    assert purposes == ["plan-main-c1-n1", "plan-main-c1-n2"]
+    assert runners[0].bound == [(None, "stage_main")]
+    assert runners[1].bound == [("thread-plan-1", "stage_main")]
+
+
+def test_resident_plan_schema_reject_never_starts_outer_retry(tmp_path):
+    class EmptyDaemon:
+        def query(self, _sql, _params):
+            return []
+
+    class ResidentRunner(MockRunner):
+        def __init__(self):
+            super().__init__([
+                {"plan.json": {"bad": True}},
+                {"plan.json": _PLAN},
+            ])
+            self.bound = []
+
+        def bind_persistent_session(self, *, session_id, role="narrator"):
+            self.bound.append((session_id, role))
+
+    runner = _resident_runner(ResidentRunner())
+    ledger = _RecordingLedger()
+    ledger.daemon = EmptyDaemon()
+
+    @_resident_factory
+    def factory(_transcripts, _purpose):
+        return runner
+
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, resident_stage_sessions=True)
+
+    with pytest.raises(RunnerError, match="不执行外层 artifact 重试"):
+        provider.plan(NS(cycle_id="c1"), _pack("plan"))
+    assert runner.bound == [(None, "stage_main")]
+    assert len(runner.skills_seen) == 1
+    assert len(runner.scripted) == 1
+    assert [item["status"] for item in ledger.finished] == ["failed"]
+
+
+def test_historical_empty_receipt_does_not_poison_later_unique_session(
+        tmp_path, monkeypatch):
+    class Daemon:
+        def query(self, _sql, _params):
+            return [
+                (11, "plan", "plan-main-c1-n1-a1", "/provider/empty", "/exec/11"),
+                (12, "plan", "plan-main-c1-n2-a1", "/provider/good", "/exec/12"),
+            ]
+
+    ledger = _RecordingLedger()
+    ledger.daemon = Daemon()
+    factory = _resident_factory(lambda _td, _pt: None)
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, resident_stage_sessions=True)
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda path, **_kwargs: NS(
+            provider_invocation_id=(
+                None if str(path).endswith("empty") else "thread-plan")))
+
+    assert provider._stage_main_session_id(
+        NS(cycle_id="c1"), "plan") == "thread-plan"
+
+
+def test_all_empty_receipts_block_fresh_resident_session(tmp_path, monkeypatch):
+    class Daemon:
+        def query(self, _sql, _params):
+            return [
+                (11, "plan", "plan-main-c1-n1-a1", "/provider/empty", "/exec/11"),
+            ]
+
+    ledger = _RecordingLedger()
+    ledger.daemon = Daemon()
+    factory = _resident_factory(lambda _td, _pt: None)
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, resident_stage_sessions=True)
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda _path, **_kwargs: NS(provider_invocation_id=None))
+
+    with pytest.raises(RuntimeError, match="拒绝新建会话"):
+        provider._stage_main_session_id(NS(cycle_id="c1"), "plan")
+
+
+def test_bundle_operator_recovers_receipts_from_frozen_decision_schema(
+        tmp_path, monkeypatch):
+    conn = sqlite3.connect(tmp_path / "operator.sqlite")
+    conn.executescript("""
+        CREATE TABLE runner_call (
+          id INTEGER PRIMARY KEY, cycle_id INTEGER, phase TEXT NOT NULL,
+          purpose TEXT NOT NULL, status TEXT NOT NULL,
+          prompt_version TEXT, policy_version TEXT, transcript_ref TEXT,
+          failure_kind TEXT, started_at TEXT, finished_at TEXT
+        );
+        CREATE TABLE decision (
+          id INTEGER PRIMARY KEY, cycle_id INTEGER, question_id INTEGER,
+          directive_id INTEGER, actor TEXT NOT NULL, type TEXT NOT NULL,
+          prompt_version TEXT, policy_version TEXT,
+          payload_json TEXT NOT NULL, created_at TEXT
+        );
+    """)
+    conn.execute(
+        "INSERT INTO runner_call(id,cycle_id,phase,purpose,status) "
+        "VALUES (11,1,'bundle','bundle-c1-t7-n1-a1','success')")
+    conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (1,'orchestrator','provider_invocation_accounted',?)",
+        (json.dumps({
+            "protocol": "provider-accounting-v1",
+            "runner_call_id": 11,
+            "provider_receipt_ref": "/provider/11",
+            "execution_receipt_ref": "/exec/11",
+        }),))
+    conn.commit()
+
+    class Daemon:
+        def query(self, sql, params):
+            return conn.execute(sql, params).fetchall()
+
+    ledger = _RecordingLedger()
+    ledger.daemon = Daemon()
+    factory = _operator_factory(lambda _td, _pt: None)
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, bundle_operator_mode=True)
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda path, **kwargs: NS(provider_invocation_id="thread-7"))
+
+    assert provider._bundle_operator_session_id(
+        NS(cycle_id="c1"), _pack("bundle")) == "thread-7"
+    assert "provider_receipt_ref" not in {
+        row[1] for row in conn.execute("PRAGMA table_info(runner_call)")}
+    conn.close()
+
+
+def test_bundle_operator_resumes_target_session_from_durable_provider_receipts(
+        tmp_path, monkeypatch):
+    class Daemon:
+        rows = []
+
+        def query(self, _sql, _params):
+            return list(self.rows)
+
+    class OperatorRunner(MockRunner):
+        def __init__(self):
+            super().__init__([_bundle_envelope()])
+            self.bound = []
+            self.packs = []
+
+        def bind_persistent_session(self, *, session_id, role="narrator"):
+            self.bound.append((session_id, role))
+
+        def run_task(self, *, system_prompt, skill, context_pack):
+            self.packs.append(context_pack)
+            return super().run_task(
+                system_prompt=system_prompt, skill=skill,
+                context_pack=context_pack)
+
+    daemon = Daemon()
+    ledger = _RecordingLedger()
+    ledger.daemon = daemon
+    runners = []
+
+    @_operator_factory
+    def factory(transcripts, _purpose):
+        Path(transcripts).mkdir(parents=True, exist_ok=True)
+        runner = _operator_runner(OperatorRunner())
+        runners.append(runner)
+        return runner
+
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda path, **_kwargs: NS(
+            provider_invocation_id=("thread-7" if str(path).endswith("11")
+                                    else "unexpected")))
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, bundle_operator_mode=True)
+
+    provider.bundle(NS(cycle_id="c1"), _pack("bundle"))
+    daemon.rows = [(11, "bundle", "bundle-c1-t7-n1-a1", "/provider/11", "/exec/11")]
+    repair_pack = _pack("bundle")
+    repair_pack.anchor_md = (
+        "上一次 bundle 实施失败: phase=train; 真实日志: CUDA out of memory")
+    provider.bundle(NS(cycle_id="c1"), repair_pack)
+
+    assert runners[0].bound == [(None, "bundle_operator")]
+    assert runners[1].bound == [("thread-7", "bundle_operator")]
+    assert "CUDA out of memory" in runners[1].packs[0].anchor_md
+
+
+def test_bundle_operator_rejects_provider_thread_fork(tmp_path, monkeypatch):
+    class Daemon:
+        def query(self, _sql, _params):
+            return [
+                (11, "bundle", "bundle-c1-t7-n1-a1", "/provider/a", "/exec/a"),
+                (12, "bundle", "bundle-c1-t8-n2-a1", "/provider/b", "/exec/b"),
+            ]
+
+    ledger = _RecordingLedger()
+    ledger.daemon = Daemon()
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda path, **_kwargs: NS(
+            provider_invocation_id=("thread-a" if str(path).endswith("a")
+                                    else "thread-b")))
+    runner = _operator_runner(MockRunner([]))
+    factory = _operator_factory(lambda _td, _pt: runner)
+    provider = StageProvider(
+        runner_factory=factory,
+        schemas=SCHEMAS, policy=NO_BUDGET_POLICY, system_prompt="SYS",
+        skills=SKILLS, work_root=str(tmp_path), cost_ledger=ledger,
+        bundle_operator_mode=True)
+
+    with pytest.raises(RuntimeError, match="provider session 漂移"):
+        provider.bundle(NS(cycle_id="c1"), _pack("bundle"))
+
+
+def test_bundle_requires_target_identity(tmp_path):
+    sp, _ = _provider([_bundle_envelope()], tmp_path)
+    pack = _pack("bundle")
+    pack.target_id = None
+    with pytest.raises(ValueError, match="target_id"):
+        sp.bundle(NS(cycle_id="c1"), pack)
 
 
 def test_bundle_missing_identity_retried_then_ok(tmp_path):
@@ -342,6 +1072,30 @@ def test_plan_review_provider_retries_bad_round_envelope(tmp_path):
     assert review["round_no"] == 1
     assert "期望 1" in runner.skills_seen[1]
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 1
+
+
+def test_plan_review_artifact_retry_cannot_flip_first_valid_verdict(tmp_path):
+    daemon, _bt_id, work = _judge_env(tmp_path)
+    runner = MockRunner([
+        # The semantic judgment is already explicit; only issues is malformed.
+        {"plan_review.json": {"verdict": "fail", "round_no": 1}},
+        {"plan_review.json": {"verdict": "pass", "round_no": 1, "issues": []}},
+        {"plan_review.json": {
+            "verdict": "fail", "round_no": 1,
+            "issues": [{"item": "statistics", "why": "crossed resampling unspecified"}],
+        }},
+    ])
+    provider = PlanReviewProvider(
+        runner_factory=lambda _td, _purpose: runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="SYS", skill="[skill:plan]",
+        daemon=daemon, work_root=str(work))
+
+    review, _decision_id = provider(
+        NS(cycle_id="c1"), _PLAN, 1, _pack("plan"))
+
+    assert review["verdict"] == "fail"
+    assert "verdict 已冻结为 fail" in runner.skills_seen[1]
+    assert "不得改变首次有效 verdict" in runner.skills_seen[2]
 
 
 def test_plan_review_provider_retries_runner_artifact_parse_with_feedback(tmp_path):
@@ -671,6 +1425,58 @@ def test_sidecar_bridged_to_file_request(tmp_path):
         sp.reasoning(cyc, _pack("reasoning"))
     assert ei.value.request_id == 42 and ei.value.stage == "reasoning"
     assert seen["stage"] == "reasoning" and seen["request"] == _SIDECAR and seen["cyc"] is cyc
+
+
+def test_bundle_material_request_becomes_internal_replan_but_permission_stays_user_actionable(
+        tmp_path):
+    from orchestrator.interfaces import BundleReplanRequired, StageBlockedOnResources
+    bridged = []
+
+    def bridge(stage, request, cyc):
+        bridged.append((stage, request, cyc))
+        return 9
+
+    material_runner = MockRunner([{"resource_request.json": _SIDECAR}])
+    material = StageProvider(
+        runner_factory=lambda _td, _pt: material_runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="S", skills=SKILLS,
+        work_root=str(tmp_path / "material"), file_request_bridge=bridge)
+    cyc = NS(cycle_id="c1", question_id="q1")
+    with pytest.raises(BundleReplanRequired):
+        material.bundle(cyc, _pack("bundle"))
+    assert bridged == []
+
+    permission = {"summary_md": "需要用户授权读取既知目录", "items": [{
+        "kind": "permission", "desc": "只读访问已登记目录"}]}
+    permission_runner = MockRunner([{"resource_request.json": permission}])
+    permission_provider = StageProvider(
+        runner_factory=lambda _td, _pt: permission_runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="S", skills=SKILLS,
+        work_root=str(tmp_path / "permission"), file_request_bridge=bridge)
+    with pytest.raises(StageBlockedOnResources) as blocked:
+        permission_provider.bundle(cyc, _pack("bundle"))
+    assert blocked.value.request_id == 9 and bridged[-1][1] == permission
+
+
+def test_bundle_replan_survives_replay_outbox_failure(tmp_path):
+    """Replay integration is repairable; a frozen-plan outcome still reaches Reasoning."""
+    from orchestrator.interfaces import BundleReplanRequired
+
+    class FailingReplay:
+        def persist_context_pack(self, *_args, **_kwargs):
+            return None
+
+        def persist_stage_artifact(self, *_args, **_kwargs):
+            raise RuntimeError("injected replay outbox failure")
+
+    runner = MockRunner([{"resource_request.json": _SIDECAR}])
+    provider = StageProvider(
+        runner_factory=lambda _td, _pt: runner, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="S", skills=SKILLS,
+        work_root=str(tmp_path), replay_archive=FailingReplay())
+
+    with pytest.raises(BundleReplanRequired, match="需要 EEG 数据集"):
+        provider.bundle(NS(cycle_id="c1"), _pack("bundle"))
 
 
 def test_sidecar_bridge_reject_feeds_retry(tmp_path):

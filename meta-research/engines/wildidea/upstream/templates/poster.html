@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WildIdea · {TITLE}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh;
+    background: #f3eee4;
+    color: #211f1c;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 18px;
+  }
+  .slide {
+    max-width: 1600px;
+    margin: 0 auto;
+    background: #fbf7ef;
+    border: 1px solid #ded4c5;
+    border-radius: 12px;
+    padding: 26px 28px 22px;
+    box-shadow: 0 24px 70px #6f5f4a2b;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+    align-items: flex-start;
+    margin-bottom: 12px;
+  }
+  .kicker {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: #7c4a2d;
+    border: 1px solid #d7b99f;
+    background: #f1e3d4;
+    border-radius: 999px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+  }
+  h1 {
+    margin-top: 9px;
+    font-size: clamp(22px, 3vw, 48px);
+    line-height: 1.08;
+    font-weight: 900;
+    letter-spacing: 0;
+    color: #2b211b;
+  }
+  .subtitle {
+    margin-top: 8px;
+    color: #6f655b;
+    font-size: clamp(12px, 1vw, 16px);
+  }
+  .stats {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    max-width: 520px;
+    flex-shrink: 0;
+  }
+  .stat {
+    min-width: 100px;
+    background: #f4eadc;
+    border: 1px solid #dfcfbd;
+    border-radius: 8px;
+    padding: 8px 10px;
+    text-align: right;
+  }
+  .stat b { display: block; color: #8a4f32; font-size: 17px; line-height: 1; margin-bottom: 3px; }
+  .stat span { color: #766b60; font-size: 11px; }
+  .ban {
+    background: #f6efe5;
+    border: 1px dashed #d9c7b6;
+    border-radius: 9px;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: #766b60;
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+  .ban strong { color: #463a31; white-space: nowrap; }
+  .ban .tags { display: flex; flex-wrap: wrap; gap: 5px; }
+  .ban span {
+    background: #efe2d4;
+    border-radius: 5px;
+    padding: 2px 7px;
+    text-decoration: line-through;
+    color: #8a7d70;
+    white-space: nowrap;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-auto-rows: auto;
+    align-items: start;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  .card {
+    background: #fffaf2;
+    border: 1px solid #dfd1c2;
+    border-radius: 9px;
+    padding: 11px 13px 10px;
+    position: relative;
+    overflow: visible;
+    height: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .card::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, #b46b45, #d7a86e);
+  }
+  .id {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    color: #8b7f73;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.4px;
+    margin-bottom: 3px;
+  }
+  .id em { color: #8a4f32; font-style: normal; }
+  .slot {
+    color: #3b271c;
+    background: #ead1ba;
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-size: 10px;
+    font-weight: 900;
+    white-space: nowrap;
+    letter-spacing: 0;
+  }
+  .source {
+    color: #817569;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    margin-bottom: 4px;
+  }
+  .source strong { color: #8a4f32; font-weight: 900; }
+  .proto {
+    color: #5c5148;
+    background: #f6efe5;
+    border: 1px solid #eadbc9;
+    border-radius: 7px;
+    padding: 5px 7px;
+    font-size: clamp(11px, 0.78vw, 12px);
+    line-height: 1.38;
+    margin-bottom: 4px;
+    overflow: visible;
+    word-break: break-word;
+    overflow-wrap: break-word;
+  }
+  .proto strong { color: #8a4f32; }
+  .name {
+    color: #7c4a2d;
+    font-size: clamp(14px, 1.05vw, 17px);
+    font-weight: 900;
+    line-height: 1.2;
+    margin-bottom: 5px;
+    overflow: visible;
+    word-break: break-word;
+  }
+  .desc {
+    color: #38322d;
+    font-size: clamp(13px, 0.95vw, 15px);
+    line-height: 1.42;
+    margin-bottom: 7px;
+    overflow: visible;
+    word-break: break-word;
+    overflow-wrap: break-word;
+  }
+  .fail {
+    color: #766b60;
+    font-size: clamp(10px, 0.72vw, 11.5px);
+    line-height: 1.35;
+    border-top: 1px solid #e1d2c2;
+    padding-top: 6px;
+    overflow: visible;
+    word-break: break-word;
+    overflow-wrap: break-word;
+  }
+  .rejected {
+    margin-top: -4px;
+  }
+  .rejected span {
+    text-decoration: none;
+    color: #7e6f62;
+  }
+  .bottom {
+    display: flex;
+    justify-content: space-between;
+    gap: 18px;
+    align-items: center;
+    color: #665d55;
+    font-size: 12px;
+    flex-wrap: wrap;
+  }
+  .bottom strong { color: #7c4a2d; }
+  .footer { color: #9a8f83; font-size: 10px; letter-spacing: 1px; white-space: nowrap; }
+
+  /* 平板：3列 */
+  @media (max-width: 1200px) {
+    .cards { grid-template-columns: repeat(3, 1fr); }
+    header { flex-direction: column; }
+    .stats { max-width: none; justify-content: flex-start; }
+  }
+  /* 窄屏/大手机横屏：2列 */
+  @media (max-width: 780px) {
+    .cards { grid-template-columns: repeat(2, 1fr); }
+    .slide { padding: 16px 14px 14px; }
+    h1 { font-size: 20px; }
+    .name { font-size: 14px; }
+    .proto { font-size: 11px; }
+    .desc { font-size: 13px; }
+    .fail { font-size: 11px; }
+  }
+  /* 手机竖屏：1列 */
+  @media (max-width: 500px) {
+    .cards { grid-template-columns: 1fr; }
+    body { padding: 8px; }
+    .slide { padding: 12px 10px 10px; border-radius: 8px; }
+    .ban { font-size: 10px; }
+  }
+</style>
+</head>
+<body>
+<main class="slide">
+  <header>
+    <div>
+      <div class="kicker">{BADGE_TEXT}</div>
+      <h1>{TITLE}</h1>
+      <div class="subtitle">{FOCUS}</div>
+    </div>
+    {META_HTML}
+  </header>
+
+  {QUARANTINE_HTML}
+  {REJECTED_HTML}
+  {CARD_ROWS}
+  {SUMMARY}
+</main>
+</body>
+</html>

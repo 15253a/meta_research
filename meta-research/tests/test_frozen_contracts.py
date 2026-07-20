@@ -7,6 +7,7 @@ execution_manifest 承载；DDL/MIGRATION 锁不动。本套把冻结锚钉成�
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 from orchestrator import database as db
@@ -18,10 +19,11 @@ def _sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-# CP11.4c.2b.3b 有意新增抽象 gpu_required 资源意图，使 plan 冻结 CPU/GPU workload identity；
-# 命令、env_hash 与具体 device identity 仍由下方语义锁禁止。
+# CP12 有意收紧 reuse-only 抽象契约：零 target 必须带结构化 reuse_evidence，
+# evaluation/child-answer 复用必须指明可机械回溯的精确 ID。命令、env_hash 与具体
+# device identity 仍由下方语义锁禁止。
 # 若再改 plan.schema（决策性），须更新此常量并走完整评审 + 记 build_log，绝不静默漂移。
-_PLAN_SCHEMA_SHA256 = "646076b0811383d8c34bcac217f0fc013ddf9e0cf7e99f09713c8908b54895c9"
+_PLAN_SCHEMA_SHA256 = "a21fa414754b7375a11e761c1d629df99d205fc9ae1e279a6b0c47c2eb3db021"
 
 
 def test_plan_schema_frozen():
@@ -33,10 +35,26 @@ def test_plan_schema_frozen():
 
 def test_plan_schema_has_no_execution_fields():
     """plan.schema 语义锁（比字面 sha 更抗无害排版漂移）：抽象 target 不得含执行/身份具体字段。"""
-    text = (SYSTEM_ROOT / "schemas" / "plan.schema.json").read_text(encoding="utf-8")
+    schema = json.loads(
+        (SYSTEM_ROOT / "schemas" / "plan.schema.json").read_text(encoding="utf-8"))
+
+    def property_names(node):
+        if isinstance(node, dict):
+            props = node.get("properties")
+            if isinstance(props, dict):
+                yield from props
+            for value in node.values():
+                yield from property_names(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from property_names(value)
+
+    names = set(property_names(schema))
     for forbidden in ("train_cmd", "smoke_cmd", "eval_cmd", "ckpt_path", "ckpt_name",
                       "identity_draft_md", "repro_cmd", "target_set_hash", "env_hash"):
-        assert forbidden not in text, f"plan.schema 出现执行/身份具体字段 {forbidden!r}——契约分层被破坏（命令应在 execution_manifest）"
+        assert forbidden not in names, (
+            f"plan.schema 出现执行/身份具体字段 {forbidden!r}——契约分层被破坏"
+            "（命令应在 execution_manifest）")
 
 
 def test_migration_checksum_unchanged():

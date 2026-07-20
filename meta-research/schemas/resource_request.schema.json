@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/resource_request.schema.json",
   "title": "resource_request",
-  "description": "统一可选 sidecar（四阶段皆适用，§3.1.1 / §4.6.8）：系统确实无法自行获取资料时的文件请求单。非 Gate 产物：schema 校验后经 WriteDaemon interaction_request_create 落请求单，不入研究库。attempted_paths / failure_reason 必填 = 「能自己获取的不得请求」的自证落点（缺失即 schema 拒）。",
+  "description": "统一可选 sidecar（四阶段皆适用，§3.1.1 / §4.6.8）：系统确实无法自行获取资料时，面向用户的最小请求。它只表达缺什么及用途；请求状态、托管落位和运行审计由编排器维护，不要求模型重复填写。",
   "type": "object",
   "required": ["summary_md", "items"],
   "additionalProperties": false,
@@ -20,10 +20,13 @@
       "maxItems": 10,
       "items": {
         "type": "object",
-        "required": ["kind", "desc", "expected_files", "attempted_paths", "failure_reason", "dest_hint"],
+        "required": ["kind", "desc"],
         "additionalProperties": false,
         "properties": {
-          "kind": { "enum": ["dataset", "paper", "wet_lab", "other"] },
+          "kind": {
+            "enum": ["dataset", "paper", "wet_lab", "other", "permission"],
+            "description": "permission 只表示用户可二选一授权的既知能力；不得附上传文件。其余类型表示需要用户补充真实资料或信息。"
+          },
           "desc": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" },
           "expected_files": {
             "type": "array",
@@ -35,11 +38,11 @@
             "type": "array",
             "minItems": 1,
             "maxItems": 8,
-            "description": "已尝试的获取路径（必填，防「能自己获取还请求」）",
+            "description": "可选诊断提示；仅在确有助于用户理解时填写，不是模型自证表",
             "items": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" }
           },
-          "failure_reason": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001F\\u007F]*$" },
-          "dest_hint": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000-\\u001F\\u007F]*$", "description": "期望落位提示（恢复后从托管区引用/复制到消费位置）" }
+          "failure_reason": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001F\\u007F]*$", "description": "可选的具体阻塞原因；summary_md 已说明时省略" },
+          "dest_hint": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000-\\u001F\\u007F]*$", "description": "向后兼容的可选提示；真实托管位置始终由服务端决定" }
         }
       }
     }

@@ -1,0 +1,7 @@
+{
+  "schema": "meta-research-wildidea-dependency-lock/v1",
+  "entrypoint": "upstream/scripts/pick_domain_slots.py",
+  "python_requires": ">=3.9",
+  "third_party_runtime_dependencies": [],
+  "execution_contract": "isolated-stdlib-source-v1"
+}

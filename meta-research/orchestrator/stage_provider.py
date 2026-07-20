@@ -1,29 +1,36 @@
-"""StageProvider / JudgeProvider —— 真 CodexRunner 的生产装配（M6 CP7.2；步⑧ CP8.3 扩 bundle+judge）。
+"""StageProvider / JudgeProvider —— 真 CodexRunner 的生产装配。
 
 **为什么要它**：M0 driver（driver.py）用真 Codex 但跑在**桩栈**（StubGate/StubStateStore/StubCompiler +
 造假 bundle）——那是 M0 验收栈。M3+ 的真组件（SqliteAdvancer/AttackStages）消费**注入式** provider
-回调（生产=真 Codex 会话、测试=确定性替身）。本模块提供生产回调：把 CodexRunner 的一次会话 +
-信封解析 + 逐产物 schema 校验 + artifact_parse 重试（§4.2.3）封成组件期望的签名，
-从而真组件 + 真 Codex 端到端跑起来（run.py 装配，CP7.3/CP8.4）。
+回调（生产=真 Codex 会话、测试=确定性替身）。生产研究路径中，每个 cycle 的 Idea、Plan、Reasoning
+各有一个逻辑常驻主 Codex thread；Bundle 由一个 cycle-wide 主 thread 在一个连续 turn/process 中严格
+串行全部 target 的产包、smoke/train/eval、日志观察和工程修复。耐久 provider id 只用于进程灾难后找回原 thread，
+不是正常事件间轮询或新建替代上下文的机制。
 
 **provider 契约**（attack_stages 模块注释 / advancer reasoning_provider）：
 - StageProvider（产文件四阶段）：
   - idea(cyc, pack) → {"idea_set.json": …}
   - plan(cyc, pack) → {"plan.json": …}（冻结 plan.schema 抽象形态；命令不在 plan）
   - bundle(cyc, pack) → {"execution_manifest.json": …, "identity.md": str, <代码文件passthrough…>}
+  - bundle 主 turn 在提交包后继续通过 runtime MCP 的
+    bundle_execute/bundle_status/bundle_replan 执行、观察、修复或收口；旧
+    bundle_operator(cyc, pack, control) 仅保留给显式隔离资格测试
   - reasoning(cyc, pack) → {"selection.json": …, "tree_ops.json"?: …, "answer.json"?: …}
-- PlanReviewProvider（写库形态）：独立会话审 plan answerability →
-  runner_call(audit/plan_review)+DECISION(judge/plan_review)。
-- JudgeProvider（写库形态）：judge(cycle_id, bt_id, review_kind, subject_hash) →
-  真 Codex 产 review_verdict.json → 本模块落 runner_call(audit)+DECISION(judge)（Codex 永不碰 DB）。
+- 正常研究路径的 reviewer 由阶段主智能体在当前 turn 内启动干净子智能体，主智能体等待意见、修订并
+  继续提交；PlanReviewProvider/JudgeProvider 仅保留给隔离资格测试和兼容装配。
 
-**职责边界**：本类只保证「产出**结构合法**（过 schema）的 files」；**语义**由组件把关——reasoning-only
+**阶段提交**：正常研究路径通过 runtime MCP 的 ``submit_stage_artifact`` 在主 turn 内完成文件闭包、
+schema、cycle/target 身份与 Bundle 冻结计划校验。错误直接返回给同一主智能体修正；成功后大产物留在
+file manager，SQLite 只保存路径/哈希索引。核心 question/baseline/阶段事务仍由原 gate 提交。
+
+**职责边界**：本类通常只保证「产出**结构合法**（过 schema）的 files」；**语义**由组件把关——reasoning-only
 轮的 create_root/add_children 必产、answer 时序、manifest↔plan 切片交叉核等由 advancer/attack_stages 校验
 （§4.2.3/§4.2.5；attack_stages._check_manifest）。故本类不判 answer_allowed 等轮型语义，只校验**在场**
 产物的 schema + 阶段必产文件在场。
 
-**pack 已由调用方渲染**：attack_stages/advancer 先 compiler.render 再传入 pack；本类**不重渲**，只在
-重试时把上次的结构错误**追加进 skill**（自足反馈，不依赖 SqliteCompiler.amend——它没有该方法）。
+**pack 已由调用方渲染**：attack_stages/advancer 先 compiler.render 再传入 pack；本类**不重渲**。
+MCP 可修错误和 Bundle 运行反馈都在同一个 turn 内闭环；只有宿主进程灾难才按原
+provider id 恢复，没有 id 时 fail closed，绝不新建主 thread 当重试。
 
 **长操作零事务（§6.13）**：Codex 子进程 + 纯计算不持写事务；JudgeProvider 仅在产物过校验后以一个
 **短事务**落 runner_call+DECISION（评审裁决入账）。
@@ -38,20 +45,37 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .cost_ledger import BudgetExhausted, CostAccountingFailed
 from .harness import latest_smoke_log as _latest_smoke_log
 from .ids import cnum as _cnum
-from .interfaces import ContextPack, StageBlockedOnResources
+from .interfaces import BundleReplanRequired, ContextPack, StageBlockedOnResources
 from .import_search import ImportSearchError, validate_import_search_request
 from .notify import FileRequestReject
 from .process_supervisor import atomic_write_receipt
+from .provider_invocation import load_provider_invocation_receipt
 from .runner import RunnerError
 
 logger = logging.getLogger(__name__)
 
 _RECONCILE_PROTOCOL = "runner-call-v1"
+# An injected runner is trusted code, but cycle-scoped Bundle persistence still has to
+# be an explicit, exact capability rather than something inferred from a method
+# name.  Tool availability follows the runtime profile; official execution and
+# state authority remain orchestrator-only, and continuation is recovered only
+# from a durable provider invocation id.
+BUNDLE_OPERATOR_SESSION_CONTRACT = (
+    "bundle-operator-persistent-session-v2:"
+    "runtime-tools:orchestrator-execution-only:durable-provider-id")
+
+# Idea/Plan/Reasoning are also logical resident workers.  MCP submission
+# correction, import-search refresh and semantic feedback happen before the one
+# normal provider turn exits.  Only process-disaster recovery may resume the same
+# top-level Codex thread; it must never silently create a replacement worker.
+STAGE_MAIN_SESSION_CONTRACT = (
+    "stage-main-persistent-session-v1:"
+    "one-cycle-one-stage-one-provider-thread:durable-provider-id")
 
 
 class _RunnerCallHeartbeat:
@@ -127,10 +151,16 @@ _STAGE_FILES = {
     "bundle": {"required": ["execution_manifest.json", "identity.md"], "optional": [], "passthrough": True},
     "reasoning": {"required": ["selection.json"], "optional": ["tree_ops.json", "answer.json"]},
 }
+_IDEA_GENERATION_FILES = {
+    "required": ["idea_set.draft.json"], "optional": [], "exact": True}
+_IDEA_AUDIT_FILES = {
+    "required": ["idea_audit.json"], "optional": [], "exact": True}
+_BUNDLE_OPERATOR_FILES = {
+    "required": ["bundle_operator_action.json"], "optional": [], "exact": True}
 # skill 调用点说明（让工人聚焦本阶段；仿 driver._SKILL_SECTION）
 _CALL_NOTE = {
     "idea": "执行【生成任务】+【判官任务】，产 idea_set.json（候选全集 + selected_id）",
-    "plan": "执行【计划任务】：产 plan.json；若固定锚精确开放某个 import 三闸分支且本轮候选为空，则只产对应 import_search_request.json",
+    "plan": "执行【计划任务】：必要时在本 turn 调用 plan_import_search 刷新候选，最终只提交 plan.json",
     "bundle": "按锚区「本目标」切片产可执行包：execution_manifest.json + identity.md + 代码文件（一信封装齐）",
     "reasoning": "执行【轮尾任务】，按 route 产 selection.json（必），酌情 tree_ops.json / answer.json",
 }
@@ -139,7 +169,13 @@ _CALL_NOTE = {
 class StageProvider:
     def __init__(self, *, runner_factory, schemas, policy: Dict[str, Any],
                  system_prompt: str, skills: Dict[str, str], work_root: str,
-                 file_request_bridge=None, cost_ledger=None):
+                 file_request_bridge=None, cost_ledger=None,
+                 wildidea_adapter=None, idea_audit_pack_builder=None,
+                 require_wildidea_provider_binding: bool = False,
+                 replay_archive=None, bundle_operator_mode: bool = False,
+                 bundle_operator_guard=None,
+                 inline_subagent_review: bool = False,
+                 resident_stage_sessions: bool = False):
         """runner_factory(transcripts_dir, purpose_tag)→Runner（默认真 CodexRunner，见 run.py 装配）；
         schemas=SchemaSet（产物校验）；skills={stage: SKILL.md 文本}；work_root=cycles/<id>/transcripts 的根。
         不持 compiler——pack 由调用方（advancer/attack_stages）渲染后传入，本类不 render。
@@ -153,6 +189,61 @@ class StageProvider:
         self.skills = skills
         self.work = Path(work_root)
         self.file_request_bridge = file_request_bridge
+        if not isinstance(inline_subagent_review, bool):
+            raise ValueError("inline_subagent_review 须为 bool")
+        self.inline_subagent_review = inline_subagent_review
+        if not isinstance(resident_stage_sessions, bool):
+            raise ValueError("resident_stage_sessions 须为 bool")
+        if resident_stage_sessions and cost_ledger is None:
+            raise ValueError("常驻阶段主会话须依赖耐久 runner_call/provider receipt 账本")
+        resident_contract = getattr(
+            runner_factory, "stage_main_session_contract", None)
+        if (resident_stage_sessions
+                and resident_contract != STAGE_MAIN_SESSION_CONTRACT):
+            raise ValueError("resident runner_factory 未声明精确阶段主会话合同")
+        self.resident_stage_sessions = resident_stage_sessions
+        retry_policy = policy["flow"]["retry"]
+        self.review_rounds = {
+            "idea": int(retry_policy.get("plan_review", 0)),
+            "plan": int(retry_policy.get("plan_review", 0)),
+            "bundle_code": int(retry_policy.get("bundle_code_review", 0)),
+            "bundle_result": int(retry_policy.get("bundle_result_review", 0)),
+        }
+        self.gpu_target_policy = policy.get("resources", {}).get(
+            "gpu_target_policy", "planner_select")
+        # Optional file-side outbox for exact ContextPack/artifact/handoff replay.
+        # It never writes SQLite and therefore stays outside stage DB transactions.
+        self.replay_archive = replay_archive
+        if not isinstance(bundle_operator_mode, bool):
+            raise ValueError("bundle_operator_mode 须为 bool")
+        if bundle_operator_mode and cost_ledger is None:
+            raise ValueError(
+                "bundle operator 须依赖耐久 runner_call/provider receipt 成本账本")
+        factory_contract = getattr(
+            runner_factory, "bundle_operator_session_contract", None)
+        if (bundle_operator_mode
+                and factory_contract != BUNDLE_OPERATOR_SESSION_CONTRACT):
+            raise ValueError(
+                "bundle operator runner_factory 未明确声明精确持久会话/"
+                "runtime-tools 合同")
+        if bundle_operator_guard is not None and not callable(bundle_operator_guard):
+            raise ValueError("bundle_operator_guard 须为 callable 或 None")
+        self.bundle_operator_mode = bundle_operator_mode
+        self.bundle_operator_guard = bundle_operator_guard or (lambda: None)
+        # The adapter path remains for explicit compatibility/qualification
+        # assembly. Normal research uses the resident Idea main-agent branch
+        # above, with a clean child reviewer inside that main turn.
+        self.wildidea_adapter = wildidea_adapter
+        self.idea_audit_pack_builder = idea_audit_pack_builder
+        self.require_wildidea_provider_binding = require_wildidea_provider_binding
+        if not isinstance(require_wildidea_provider_binding, bool):
+            raise ValueError("require_wildidea_provider_binding 须为 bool")
+        if require_wildidea_provider_binding and wildidea_adapter is None:
+            raise ValueError("缺 WildIdea adapter 时不能要求 provider binding")
+        if ((self.wildidea_adapter is None)
+                != (self.idea_audit_pack_builder is None)):
+            raise ValueError(
+                "WildIdea adapter 与 question-only idea audit pack builder 必须成对注入")
         self.cost_ledger = cost_ledger         # None 仅允许 session_max=null 的显式诊断/测试装配
         self._cost_required = policy.get("budget", {}).get("session_max") is not None
         if self._cost_required and self.cost_ledger is None:
@@ -162,53 +253,443 @@ class StageProvider:
 
     # -- provider 回调（绑定阶段）------------------------------------------------
     def idea(self, cyc, pack) -> Dict[str, Any]:
-        return self._produce(cyc, pack, stage="idea")
+        if self.inline_subagent_review:
+            # One live main Codex owns the whole Idea stage.  Its reviewer is a
+            # clean child context inside the same turn, so feedback can be
+            # applied without a second top-level session or adapter handoff.
+            return self._produce(
+                cyc, pack, stage="idea",
+                purpose_tag=(
+                    f"idea-main-c{_cnum(cyc.cycle_id)}"
+                    if self.resident_stage_sessions else None),
+                skill=self._main_stage_review_skill(
+                    "idea", self.skills["idea"], "idea",
+                    self.review_rounds["idea"]))
+        if self.wildidea_adapter is None:
+            return self._produce(cyc, pack, stage="idea")
+
+        generation_pack, generation_skill = self.wildidea_adapter.prepare_generation(
+            pack, self.skills["idea"])
+        def validate_draft(files: Dict[str, Any]) -> Optional[str]:
+            errors = self.wildidea_adapter.validate_draft(
+                files["idea_set.draft.json"])
+            return ("idea_set.draft.json adapter 闭包校验失败:\n" + "\n".join(errors)
+                    if errors else None)
+
+        def bind_generation_invocation(artifact, runner_call_id) -> None:  # noqa: ANN001
+            if (artifact.prompt_sha256 is None
+                    and artifact.provider_receipt_ref is None):
+                return
+            self.wildidea_adapter.bind_accepted_invocation(
+                generation_pack, role="generation",
+                runner_call_id=runner_call_id,
+                prompt_sha256=artifact.prompt_sha256,
+                provider_receipt_ref=artifact.provider_receipt_ref,
+                execution_receipt_ref=artifact.execution_receipt_ref)
+
+        draft_files = self._produce(
+            cyc, generation_pack, stage="idea", phase="idea",
+            purpose_tag="idea-generate", spec=_IDEA_GENERATION_FILES,
+            skill=generation_skill,
+            append_call_note=False,
+            post_validate=validate_draft,
+            on_accept=bind_generation_invocation)
+        draft = draft_files["idea_set.draft.json"]
+
+        audit_source_pack = self.idea_audit_pack_builder(cyc.cycle_id)
+        audit_pack, audit_skill = self.wildidea_adapter.prepare_audit(
+            audit_source_pack, draft, self.skills["idea"],
+            generation_pack=generation_pack)
+
+        def validate_audit(files: Dict[str, Any]) -> Optional[str]:
+            errors = self.wildidea_adapter.validate_audit(
+                draft, files["idea_audit.json"])
+            return ("idea_audit.json 候选闭包校验失败:\n" + "\n".join(errors)
+                    if errors else None)
+
+        def bind_judge_invocation(artifact, runner_call_id) -> None:  # noqa: ANN001
+            if (artifact.prompt_sha256 is None
+                    and artifact.provider_receipt_ref is None):
+                return
+            self.wildidea_adapter.bind_accepted_invocation(
+                generation_pack, role="judge",
+                runner_call_id=runner_call_id,
+                prompt_sha256=artifact.prompt_sha256,
+                provider_receipt_ref=artifact.provider_receipt_ref,
+                execution_receipt_ref=artifact.execution_receipt_ref)
+
+        audit_files = self._produce(
+            cyc, audit_pack, stage="idea", phase="audit",
+            purpose_tag="idea-audit", spec=_IDEA_AUDIT_FILES,
+            skill=audit_skill,
+            append_call_note=False,
+            post_validate=validate_audit,
+            on_accept=bind_judge_invocation,
+            allow_resource_request=False)
+        merged = self.wildidea_adapter.merge(
+            draft, audit_files["idea_audit.json"],
+            generation_pack=generation_pack,
+            base_skill=self.skills["idea"],
+            require_invocation_binding=self.require_wildidea_provider_binding)
+        final_errors = self._schema_errors("idea_set.json", merged)
+        if final_errors:
+            # Adapter merge is deterministic local code.  A failure here cannot
+            # be repaired by spending another model call and indicates a release
+            # contract bug or corrupted vendored assets.
+            raise RunnerError(
+                "WildIdea adapter 合并后的 idea_set.json 非法:\n"
+                + "\n".join(final_errors[:8]),
+                failure_kind="adapter_contract")
+        if self.replay_archive is not None:
+            # The two model turns were archived by _produce.  The merge is a
+            # deterministic adapter projection, so publish the canonical idea
+            # artifact without inventing a third conversational handoff.
+            self.replay_archive.persist_stage_output(
+                cycle_id=cyc.cycle_id, stage="idea",
+                files={"idea_set.json": merged}, md="", purpose="idea",
+                pack_hash=generation_pack.pack_hash, handoff=False,
+                provenance={"derived_by": "wildidea_adapter.merge"})
+        return {"idea_set.json": merged}
 
     def plan(self, cyc, pack) -> Dict[str, Any]:
-        return self._produce(cyc, pack, stage="plan")
+        return self._produce(
+            cyc, pack, stage="plan",
+            purpose_tag=(
+                f"plan-main-c{_cnum(cyc.cycle_id)}"
+                if self.resident_stage_sessions else None),
+            skill=self._main_stage_review_skill(
+                "plan", self.skills["plan"], "plan",
+                self.review_rounds["plan"]))
 
     def bundle(self, cyc, pack) -> Dict[str, Any]:
-        return self._produce(cyc, pack, stage="bundle")
+        if pack.target_id is None:
+            raise ValueError("bundle ContextPack 缺 target_id")
+        return self._produce(
+            cyc, pack, stage="bundle",
+            purpose_tag=(
+                f"bundle-main-c{_cnum(cyc.cycle_id)}"
+                if self.resident_stage_sessions else
+                f"bundle-c{_cnum(cyc.cycle_id)}-t{pack.target_id}"),
+            skill=self._main_stage_review_skill(
+                "bundle", self.skills["bundle"], "bundle_code",
+                self.review_rounds["bundle_code"]))
+
+    def bundle_operator(self, cyc, pack, control: Dict[str, Any]) -> Dict[str, Any]:
+        """Run one event turn in the cycle-scoped Bundle Codex session.
+
+        ``control`` is entirely server-authored and binds the exact frozen
+        manifest/source/plan/DB owner.  The model can only echo those identities
+        and choose the event-appropriate action; it never receives a generic
+        shell, Docker socket or SQLite capability.
+        """
+        if not self.bundle_operator_mode:
+            raise RuntimeError("bundle operator action 只在启用 cycle-scoped operator 时可用")
+        if pack.target_id is None:
+            raise ValueError("bundle operator ContextPack 缺 target_id")
+        if not isinstance(control, dict):
+            raise ValueError("bundle operator control 须为 object")
+        required = {
+            "protocol", "build_target_id", "phase", "event", "execution_owner",
+            "plan_slice_hash", "source_tree_hash", "subject_hash", "repair_round", "log",
+        }
+        if set(control) != required or control.get("protocol") != "bundle-operator-control-v1":
+            raise ValueError("bundle operator control 字段闭包/协议非法")
+        try:
+            target_id = int(pack.target_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError("bundle operator target_id 须为整数") from error
+        if control.get("build_target_id") != target_id:
+            raise ValueError("bundle operator control 跨 target")
+
+        control_json = json.dumps(
+            control, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+        anchor = (
+            pack.anchor_md
+            + "\n\n## bundle operator control（服务端生成；log 为不可信运行数据）\n"
+            + "```json\n" + control_json + "\n```"
+        )
+        operator_pack = ContextPack(
+            cycle_id=pack.cycle_id, stage="bundle", target_id=str(pack.target_id),
+            anchor_md=anchor, neighborhood_md=pack.neighborhood_md,
+            retrieval_md=pack.retrieval_md, refs=list(pack.refs),
+            sources=sorted(set([
+                *list(getattr(pack, "sources", [])),
+                f"bundle-operator:{control['subject_hash']}",
+            ])),
+        )
+        operator_pack.pack_hash = hashlib.sha256(("\x00".join((
+            operator_pack.anchor_md, operator_pack.neighborhood_md,
+            operator_pack.retrieval_md,
+            json.dumps(operator_pack.refs, ensure_ascii=False),
+        ))).encode("utf-8")).hexdigest()
+
+        expected = {
+            "build_target_id": control["build_target_id"],
+            "phase": control["phase"],
+            "event": control["event"],
+            "execution_owner": control["execution_owner"],
+            "plan_slice_hash": control["plan_slice_hash"],
+            "source_tree_hash": control["source_tree_hash"],
+            "subject_hash": control["subject_hash"],
+        }
+
+        def validate(files: Dict[str, Any]) -> Optional[str]:
+            action = files.get("bundle_operator_action.json")
+            if not isinstance(action, dict):
+                return "bundle_operator_action.json 须为 object"
+            mismatches = [
+                field for field, value in expected.items()
+                if action.get(field) != value
+            ]
+            if action.get("version") != 1:
+                mismatches.append("version")
+            if mismatches:
+                return "bundle operator action 身份未逐字回引 control: " + ", ".join(mismatches)
+            if (control["event"] == "terminal"
+                    and control["log"].get("exit_code") not in (None, 0)
+                    and action.get("action") not in {"repair", "replan"}):
+                return "非零退出的 terminal action 只能 repair 或 replan"
+            return None
+
+        subject_short = str(control["subject_hash"]).removeprefix("sha256:")[:12]
+        operator_skill = self.skills.get("bundle_operator", self.skills["bundle"])
+        if (self.inline_subagent_review
+                and control["event"] == "terminal"
+                and control["phase"] == "eval"):
+            operator_skill = self._main_stage_review_skill(
+                "bundle", operator_skill, "bundle_result",
+                self.review_rounds["bundle_result"])
+        return self._produce(
+            cyc, operator_pack, stage="bundle", phase="bundle",
+            purpose_tag=(f"bundle-c{_cnum(cyc.cycle_id)}-t{pack.target_id}-operator-"
+                         f"{control['phase']}-{control['event']}-{subject_short}"),
+            spec=_BUNDLE_OPERATOR_FILES,
+            skill=operator_skill,
+            call_note=("只产 bundle_operator_action.json；逐字回引服务端 control 身份，"
+                       "选择当前 event 允许的 start/continue/accept/repair/replan"),
+            post_validate=validate, allow_resource_request=False,
+        )
 
     def reasoning(self, cyc, pack) -> Dict[str, Any]:
-        return self._produce(cyc, pack, stage="reasoning")
+        skill = self.skills["reasoning"] + (
+            "\n\n===== 本轮必须收口 =====\n"
+            "Reasoning 是每个 cycle 的必经阶段，包括全部成功、工程失败、plan 不可执行、"
+            "无候选和 dependency_wait。先总结本 cycle 的证据、失败与限制，再做结论和下一 cycle 决策；"
+            "不得把任何分支直接终态化而跳过本阶段。若注入 meta_research_runtime MCP，"
+            "在最终信封前调用 record_cycle_summary，记录 conclusion_md、decision、next_step_md"
+            "及真实 evidence_refs；该索引调用不替代 selection/tree_ops/answer 的核心事务。"
+        )
+        return self._produce(
+            cyc, pack, stage="reasoning", skill=skill,
+            purpose_tag=(
+                f"reasoning-main-c{_cnum(cyc.cycle_id)}"
+                if self.resident_stage_sessions else None))
 
-    # -- 重试核心 --------------------------------------------------------------
-    def _produce(self, cyc, pack, *, stage: str) -> Dict[str, Any]:
-        """一次阶段 Codex 会话 + 信封解析 + 逐产物 schema 校验（artifact_parse ≤N 重试，附错误反馈）。
-        返回 files dict（含 required + 在场的 optional，均已过 schema）。用尽重试仍非法 → RunnerError。"""
-        spec = _STAGE_FILES[stage]
+    def _main_stage_review_skill(
+            self, stage: str, skill: str, review_kind: str, rounds: int) -> str:
+        """Keep the main stage agent alive while clean child contexts review.
+
+        This is intentionally a prompt-level autonomy contract.  The runtime
+        MCP gives the main agent immediate durable feedback; the orchestrator
+        no longer performs a second reviewer call or interprets/re-writes the
+        review.  Core artifact schemas and question/baseline gates remain.
+        """
+        if not self.inline_subagent_review or rounds <= 0:
+            return skill
+        stage_specific = ""
+        if stage == "idea":
+            stage_specific = (
+                "本运行模式覆盖本文档中旧的‘生成 Runner + audit Runner + adapter merge’调用说明："
+                "本次主智能体直接生成最终 idea_set.json。先形成候选草稿，再把问题、候选草稿、"
+                "评分阈值与必要文献依据交给独立 reviewer；reviewer 返回六维 audit_scores、selected_id"
+                "和问题清单。主智能体吸收实质意见后形成最终 candidates/audit_scores/selected_id。"
+                "live Web 搜索可用于判断近邻，但不是可回放快照，因此没有受控内容哈希时必须令 "
+                "novelty_refs=[]，novelty_status=联网查重未启用·文献级待验证，绝不伪造 provenance。"
+            )
+        elif stage == "plan":
+            stage_specific = (
+                "先完成 plan 草稿，再让 reviewer 只检查 selected idea、该草稿与固定研究/资源约束；"
+                "reviewer 不读取主智能体推理，不编辑文件。主智能体收到意见后立即修订同一份计划，"
+                "外部发现必须在当前主 turn 调用 plan_import_search 并继续工作；最终只输出 plan.json。"
+                "最终确定普通 plan 后调用 runtime MCP 的 submit_stage_artifact；该工具会同时检查 plan "
+                "schema、固定 GPU 选择、协议/指标/预算/依赖与 baseline 身份冲突。若返回错误，直接在当前"
+                "主上下文修订 plan 后重试；不要预先逐项 register_baseline，也不要等 turn 结束后才反馈。"
+                "核心 baseline claim 在成功阶段回执被消费时短事务提交；exec/eval 不伪造新 baseline。"
+            )
+        elif review_kind == "bundle_code":
+            stage_specific = (
+                "Bundle 的 reviewer 必须恰好是同一个干净子智能体：创建后保留它的可定址会话，"
+                "不得在结果阶段再启动第二个子智能体。提交实现包前，让它独立检查冻结 plan 对齐、"
+                "代码/manifest、依赖、GPU 使用、smoke 可启动性与输出协议；修复后用 "
+                "record_review(review_kind=bundle_code) 留索引。提交成功后立即在当前 turn 调用 "
+                "bundle_execute 异步启动，并用 bundle_status 轮询部分日志/终态；中间反馈由主智能体"
+                "就地修复。得到 eval terminal 后，只把服务端给出的"
+                "权威退出码、日志、测量和产物回执发给这一个 reviewer 做 bundle_result 审查，然后用 "
+                "record_review(review_kind=bundle_result) 记录。当前 target 终态后调用 bundle_next_target，"
+                "复用这一 reviewer 处理下一 target，直到 cycle_complete=true。"
+            )
+        elif review_kind == "bundle_result":
+            stage_specific = (
+                "只有 terminal 事件执行本审查：让 reviewer 独立检查真实退出码、日志与产物可信度。"
+                "工程问题必须选择 repair；只有研究计划/协议本身不可执行、继续改代码或环境也无法解决时"
+                "才选择 replan 交 Reasoning。"
+            )
+        return skill + (
+            "\n\n===== 同一主智能体内的独立子智能体评审（当前配置）=====\n"
+            f"主智能体在本 stage turn 内保持在线。完成草稿后，使用 Codex multi-agent 能力依次启动 "
+            f"{rounds} 个独立、干净上下文 reviewer（review_kind={review_kind}）；每个 reviewer 只审查"
+            "你显式传给它的草稿和约束，不共享你的隐藏推理，也不得直接提交最终产物。等待 reviewer 返回，"
+            "逐条判断并在当前主上下文中立即修订；不要再开启顶层 Codex 会话。"
+            + stage_specific
+            + "若注入 meta_research_runtime MCP，主智能体在吸收每次 reviewer 结果后调用 "
+              "record_review，原样记录 reviewer 的 pass/fail、摘要和字符串 issues；MCP 返回错误时在"
+              "当前 turn 修正参数并重试。最终信封不得夹带 review sidecar。\n"
+        )
+
+    # -- 阶段主 turn -----------------------------------------------------------
+    def _produce(self, cyc, pack, *, stage: str, phase: Optional[str] = None,
+                 purpose_tag: Optional[str] = None,
+                 spec: Optional[Dict[str, Any]] = None,
+                 skill: Optional[str] = None,
+                 call_note: Optional[str] = None,
+                 append_call_note: bool = True,
+                 post_validate: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+                 on_accept: Optional[Callable[[Any, Optional[int]], None]] = None,
+                 allow_resource_request: bool = True,
+                 ) -> Dict[str, Any]:
+        """Run one resident Codex turn and validate its accepted artifact.
+
+        ``stage`` 是信封与文件所属的流程阶段；``phase`` 是成本账/runner_call 的审计阶段。
+        idea 独立判官因此仍返回 envelope stage=idea，但耐久记账 phase=audit。
+        Resident stages never turn a schema/precheck rejection into another
+        top-level provider call: the live main agent must repair through MCP in
+        this turn.  The bounded loop remains only for explicit legacy/
+        qualification adapters that do not declare the resident contract.
+        """
+        spec = spec or _STAGE_FILES[stage]
+        accounting_phase = phase or stage
+        purpose_tag = purpose_tag or stage
+        if self.replay_archive is not None:
+            # Compiler-produced packs are already archived; this also covers
+            # adapter/auditor and feedback-amended packs.  Exact duplicates are
+            # byte no-ops in the archive.
+            self.replay_archive.persist_context_pack(pack, label=purpose_tag)
         self._call_seq += 1
+        if stage == "bundle" and self.bundle_operator_mode:
+            # Qualification passes assert_research_open here.  Check it before
+            # even constructing a Runner, so a published claim/final seal cannot
+            # create a fresh provider session or any model-facing side effect.
+            self.bundle_operator_guard()
         runner = self.runner_factory(self.work / f"cycles/{cyc.cycle_id}/transcripts",
-                                     f"{stage}-n{self._call_seq}")
-        base_skill = self.skills[stage] + f"\n\n===== 调用点 =====\n本次调用：{_CALL_NOTE[stage]}。"
+                                     f"{purpose_tag}-n{self._call_seq}")
+        if stage == "bundle" and self.bundle_operator_mode:
+            if (getattr(runner, "bundle_operator_session_contract", None)
+                    != BUNDLE_OPERATOR_SESSION_CONTRACT):
+                raise RuntimeError(
+                    "bundle operator runner 实例持久会话能力未声明或装配后漂移")
+            session_id = self._bundle_operator_session_id(cyc, pack)
+            bind_session = getattr(runner, "bind_persistent_session", None)
+            if not callable(bind_session):
+                raise RuntimeError(
+                    "bundle operator runner 缺 persistent session capability")
+            bind_session(
+                session_id=session_id, role="bundle_operator")
+        elif self.resident_stage_sessions:
+            if (getattr(runner, "stage_main_session_contract", None)
+                    != STAGE_MAIN_SESSION_CONTRACT):
+                raise RuntimeError(
+                    "resident runner 实例阶段主会话能力未声明或装配后漂移")
+            bind_session = getattr(runner, "bind_persistent_session", None)
+            if not callable(bind_session):
+                raise RuntimeError("resident runner 缺 persistent session capability")
+            bind_session(
+                session_id=self._stage_main_session_id(cyc, stage),
+                role="stage_main")
+        base_skill = skill or self.skills[stage]
+        if append_call_note:
+            base_skill += (
+                f"\n\n===== 调用点 =====\n本次调用：{call_note or _CALL_NOTE[stage]}。")
+        resident_turn = self.resident_stage_sessions or (
+            stage == "bundle" and self.bundle_operator_mode)
+        max_attempts = 1 if resident_turn else self.retries + 1
         last_err = ""
-        for attempt in range(self.retries + 1):
+        for attempt in range(max_attempts):
             skill = base_skill if not last_err else (
                 base_skill + f"\n\n===== 上次产物被拒（第 {attempt} 次重试）=====\n{last_err}\n请修正后重出。")
-            call = self._begin_cost_call(cyc, stage, runner, attempt)
+            call = self._begin_cost_call(
+                cyc, accounting_phase, runner, attempt,
+                purpose_tag=purpose_tag)
             try:
                 art = runner.run_task(system_prompt=self.system_prompt, skill=skill, context_pack=pack)
-            except RunnerError as e:               # 进程失败/超时/信封不可解析 → 计入重试
+            except RunnerError as e:               # resident: close accounting, recover only above us
                 self._record_cost(
-                    cyc, stage, e.usage, status="failed", failure_kind=e.failure_kind,
+                    cyc, accounting_phase, e.usage, status="failed", failure_kind=e.failure_kind,
                     attempt=attempt, call=call, transcript_ref=e.transcript_ref,
-                    execution_receipt_ref=e.execution_receipt_ref)
+                    execution_receipt_ref=e.execution_receipt_ref,
+                    provider_receipt_ref=e.provider_receipt_ref)
                 last_err = str(e)
+                if resident_turn:
+                    raise
                 continue
             except Exception as error:             # lifecycle/control failure：调用已放行，必须收口同一 intent
                 self._record_cost(
-                    cyc, stage, getattr(error, "usage", None), status="failed",
+                    cyc, accounting_phase, getattr(error, "usage", None), status="failed",
                     failure_kind=getattr(error, "failure_kind", type(error).__name__.lower()),
                     attempt=attempt, call=call,
                     transcript_ref=getattr(error, "transcript_ref", None),
                     execution_receipt_ref=(getattr(error, "execution_receipt_ref", None)
-                                           or str(getattr(error, "receipt_path", "") or "") or None))
+                                           or str(getattr(error, "receipt_path", "") or "") or None),
+                    provider_receipt_ref=getattr(error, "provider_receipt_ref", None))
                 raise
+            mcp_submitted = getattr(art, "stage_submission_ref", None) is not None
             # 步⑩ CP10.2：每次真 LLM 调用都记账，但 runner_call 还要诚实区分「有效产物」与
             # 「进程成功但产物被拒」。因此各分支在结论确定后各记恰好一次；基础设施异常也会先
             # 记本次已发生的调用再 fail loud。session_max 启用时写账失败 fail-closed。
             if "resource_request.json" in art.files:
+                # bundle 已消费冻结 plan；此时发现环境、依赖或规模不兼容，责任在系统内部重规划，
+                # 不能伪装成“请用户上传文件”并让整个产品进入 awaiting_user。合法 sidecar 在这里
+                # 作为结构化内部阻塞信号收口；AttackStages 会把目标记 engineering_blocked 后进入
+                # reasoning。非法 sidecar 仍反馈给同一调用的有界产物重试。
+                request_items = art.files["resource_request.json"].get("items")
+                permission_request = (
+                    isinstance(request_items, list) and bool(request_items)
+                    and all(isinstance(item, dict) and item.get("kind") == "permission"
+                            for item in request_items))
+                if stage == "bundle" and not permission_request:
+                    sidecar_errors = self._schema_errors_by_name(
+                        "resource_request", art.files["resource_request.json"])
+                    if sidecar_errors:
+                        self._record_cost(
+                            cyc, accounting_phase, art.usage, status="failed",
+                            failure_kind="artifact_parse", attempt=attempt, call=call,
+                            transcript_ref=art.transcript_ref,
+                            execution_receipt_ref=art.execution_receipt_ref)
+                        last_err = (
+                            "bundle 内部重规划说明 schema 校验失败：\n"
+                            + "\n".join(sidecar_errors[:8]))
+                        continue
+                    self._archive_accepted(
+                        cyc, pack, art, stage=stage, purpose=purpose_tag,
+                        call=call, attempt=attempt,
+                        accounting_phase=accounting_phase,
+                        defer_on_error=True)
+                    self._record_cost(
+                        cyc, accounting_phase, art.usage, status="success",
+                        attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref,
+                        provider_receipt_ref=art.provider_receipt_ref)
+                    raise BundleReplanRequired(art.files["resource_request.json"])
+                if not allow_resource_request:
+                    self._record_cost(
+                        cyc, accounting_phase, art.usage, status="failed",
+                        failure_kind="artifact_parse", attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    last_err = (
+                        f"{purpose_tag} 上下文由编排器完整投影，禁止产出 "
+                        "resource_request.json")
+                    continue
                 # 阶段发资源请求 sidecar（§3.1.1「需用户提供文件」，步⑧ CP8.5 接桥）。
                 # **有意置于 stage 漂移/schema 校验之前**（codex NIT 注记）：sidecar 是「无法工作」的控制
                 # 信号，优先于产物质量判定——信封哪怕 stage 漂移/产物残缺，资源诉求也须落单，不得因产物
@@ -219,7 +700,7 @@ class StageProvider:
                 # - 桥拒（sidecar 非法/quota 尽）→ 计入重试反馈（工人可修正或放弃 sidecar）；
                 # - 未接桥（诊断装配）→ 保持 fail loud，绝不静默丢弃。
                 if self.file_request_bridge is None:
-                    self._record_cost(cyc, stage, art.usage, status="failed",
+                    self._record_cost(cyc, accounting_phase, art.usage, status="failed",
                                       failure_kind="artifact_parse", attempt=attempt, call=call,
                                       transcript_ref=art.transcript_ref,
                                       execution_receipt_ref=art.execution_receipt_ref)
@@ -229,7 +710,7 @@ class StageProvider:
                     "resource_request", art.files["resource_request.json"])
                 if sidecar_errors:
                     self._record_cost(
-                        cyc, stage, art.usage, status="failed",
+                        cyc, accounting_phase, art.usage, status="failed",
                         failure_kind="artifact_parse", attempt=attempt, call=call,
                         transcript_ref=art.transcript_ref,
                         execution_receipt_ref=art.execution_receipt_ref)
@@ -240,37 +721,50 @@ class StageProvider:
                 try:
                     rid = self.file_request_bridge(stage, art.files["resource_request.json"], cyc)
                 except FileRequestReject as e:  # 只兜业务拒（sidecar 非法/quota 尽）→ 反馈重试（有界）；
-                    self._record_cost(cyc, stage, art.usage, status="failed",
+                    self._record_cost(cyc, accounting_phase, art.usage, status="failed",
                                       failure_kind="artifact_parse", attempt=attempt, call=call,
                                       transcript_ref=art.transcript_ref,
                                       execution_receipt_ref=art.execution_receipt_ref)
                     last_err = f"resource_request sidecar 被拒: {e}"   # 其余异常（DB 损坏等）fail loud（内审 NIT）
                     continue
                 except Exception:              # noqa: BLE001 —— 调用已发生，先记账再保留原异常
-                    self._record_cost(cyc, stage, art.usage, status="failed",
+                    self._record_cost(cyc, accounting_phase, art.usage, status="failed",
                                       failure_kind="postprocess_error", attempt=attempt, call=call,
                                       transcript_ref=art.transcript_ref,
                                       execution_receipt_ref=art.execution_receipt_ref)
                     raise
+                self._archive_accepted(
+                    cyc, pack, art, stage=stage, purpose=purpose_tag,
+                    call=call, attempt=attempt, accounting_phase=accounting_phase)
                 self._record_cost(
-                    cyc, stage, art.usage, status="success", attempt=attempt, call=call,
+                    cyc, accounting_phase, art.usage, status="success", attempt=attempt, call=call,
                     transcript_ref=art.transcript_ref,
                     execution_receipt_ref=art.execution_receipt_ref)
                 raise StageBlockedOnResources(rid, stage)
             if art.stage != stage:              # 阶段漂移（外审 SHOULD）：文件对但 envelope stage 错 → 计入重试
-                self._record_cost(cyc, stage, art.usage, status="failed",
+                self._record_cost(cyc, accounting_phase, art.usage, status="failed",
                                   failure_kind="artifact_parse", attempt=attempt, call=call,
                                   transcript_ref=art.transcript_ref,
                                   execution_receipt_ref=art.execution_receipt_ref)
                 last_err = f"产物 stage 漂移：envelope stage={art.stage!r} ≠ 期望 {stage!r}"
                 continue
             if "import_search_request.json" in art.files:
-                # plan 的只读发现控制 sidecar：须独占信封，编排器消费后
-                # 重渲染 ContextPack 并在新会话里重做 plan。它不是 Gate 事实产物，
-                # 也不能与 plan.json 共存（否则模型可在搜索前偷塞决策）。
+                # Compatibility-only protocol for non-resident qualification or
+                # old injected runners.  A resident Plan main must use the MCP
+                # tool and continue in the same top-level thread.
+                if self.resident_stage_sessions:
+                    self._record_cost(
+                        cyc, accounting_phase, art.usage, status="failed",
+                        failure_kind="artifact_parse", attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    raise RunnerError(
+                        "resident Plan 不接受 import_search_request sidecar；"
+                        "须在同一主 turn 调用 plan_import_search 后最终提交 plan.json",
+                        failure_kind="artifact_parse")
                 if stage != "plan" or set(art.files) != {"import_search_request.json"}:
                     self._record_cost(
-                        cyc, stage, art.usage, status="failed",
+                        cyc, accounting_phase, art.usage, status="failed",
                         failure_kind="artifact_parse", attempt=attempt, call=call,
                         transcript_ref=art.transcript_ref,
                         execution_receipt_ref=art.execution_receipt_ref)
@@ -287,20 +781,24 @@ class StageProvider:
                     errors.append(str(error))
                 if errors:
                     self._record_cost(
-                        cyc, stage, art.usage, status="failed",
+                        cyc, accounting_phase, art.usage, status="failed",
                         failure_kind="artifact_parse", attempt=attempt, call=call,
                         transcript_ref=art.transcript_ref,
                         execution_receipt_ref=art.execution_receipt_ref)
                     last_err = "import_search_request.json schema/边界校验失败:\n" + "\n".join(errors[:8])
                     continue
+                self._archive_accepted(
+                    cyc, pack, art, stage=stage, purpose=purpose_tag,
+                    call=call, attempt=attempt, accounting_phase=accounting_phase)
                 self._record_cost(
-                    cyc, stage, art.usage, status="success", attempt=attempt, call=call,
+                    cyc, accounting_phase, art.usage, status="success", attempt=attempt, call=call,
                     transcript_ref=art.transcript_ref,
                     execution_receipt_ref=art.execution_receipt_ref)
                 return {"import_search_request.json": request}
-            if stage == "plan" and set(art.files) != {"plan.json"}:
+            if (not mcp_submitted and stage == "plan"
+                    and set(art.files) != {"plan.json"}):
                 self._record_cost(
-                    cyc, stage, art.usage, status="failed",
+                    cyc, accounting_phase, art.usage, status="failed",
                     failure_kind="artifact_parse", attempt=attempt, call=call,
                     transcript_ref=art.transcript_ref,
                     execution_receipt_ref=art.execution_receipt_ref)
@@ -308,28 +806,267 @@ class StageProvider:
                     "plan 普通产物须恰为 plan.json 一个文件；"
                     f"实收键 {sorted(art.files)}")
                 continue
-            err = self._validate_files(art.files, spec)
+            if (not mcp_submitted and spec.get("exact")
+                    and set(art.files) != set(spec["required"])):
+                self._record_cost(
+                    cyc, accounting_phase, art.usage, status="failed",
+                    failure_kind="artifact_parse", attempt=attempt, call=call,
+                    transcript_ref=art.transcript_ref,
+                    execution_receipt_ref=art.execution_receipt_ref)
+                last_err = (
+                    f"{purpose_tag} files 必须恰为 {sorted(spec['required'])}；"
+                    f"实收 {sorted(art.files)}")
+                continue
+            if (not mcp_submitted and stage == "plan"
+                    and isinstance(art.files.get("plan.json"), dict)):
+                self._normalize_plan_target_gpu_mode(art.files["plan.json"])
+            # submit_stage_artifact already performed the complete transport,
+            # file-closure and JSON-schema check inside the live main turn.
+            # Test/legacy runners without that receipt retain this compatibility
+            # validator. Semantic post_validate and downstream core gates remain.
+            err = None if mcp_submitted else self._validate_files(art.files, spec)
             if err:
-                self._record_cost(cyc, stage, art.usage, status="failed",
+                self._record_cost(cyc, accounting_phase, art.usage, status="failed",
                                   failure_kind="artifact_parse", attempt=attempt, call=call,
                                   transcript_ref=art.transcript_ref,
                                   execution_receipt_ref=art.execution_receipt_ref)
                 last_err = err
                 continue
+            if post_validate is not None:
+                try:
+                    semantic_error = post_validate(art.files)
+                except Exception:
+                    self._record_cost(
+                        cyc, accounting_phase, art.usage, status="failed",
+                        failure_kind="postprocess_error", attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    raise
+                if semantic_error:
+                    self._record_cost(
+                        cyc, accounting_phase, art.usage, status="failed",
+                        failure_kind="artifact_parse", attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    last_err = semantic_error
+                    continue
+            self._archive_accepted(
+                cyc, pack, art, stage=stage, purpose=purpose_tag,
+                call=call, attempt=attempt, accounting_phase=accounting_phase)
             self._record_cost(
-                cyc, stage, art.usage, status="success", attempt=attempt, call=call,
+                cyc, accounting_phase, art.usage, status="success", attempt=attempt, call=call,
                 transcript_ref=art.transcript_ref,
-                execution_receipt_ref=art.execution_receipt_ref)
+                execution_receipt_ref=art.execution_receipt_ref,
+                provider_receipt_ref=art.provider_receipt_ref)
+            if on_accept is not None:
+                on_accept(art, call[0] if call is not None else None)
             if spec.get("passthrough"):        # bundle：代码文件名任意 → 信封全量透传（物化/交叉核在组件侧）
                 return dict(art.files)
             return {k: art.files[k] for k in spec["required"] + [o for o in spec["optional"] if o in art.files]}
         # 完整 last_err（外审 NIT：不截断——这是 fail-fast 排障入口，schema oneOf 展开的字段路径不能丢）
-        raise RunnerError(f"{stage} 产物结构非法，artifact_parse 重试（≤{self.retries}）用尽：{last_err}")
+        if resident_turn:
+            raise RunnerError(
+                f"{purpose_tag} 产物结构非法；resident 主 turn 不执行外层 artifact 重试："
+                f"{last_err}", failure_kind="artifact_parse")
+        raise RunnerError(
+            f"{purpose_tag} 产物结构非法，artifact_parse 重试（≤{self.retries}）用尽：{last_err}",
+            failure_kind="artifact_parse")
 
-    def _begin_cost_call(self, cyc, stage: str, runner, attempt: int):
+    def _normalize_plan_target_gpu_mode(self, plan: Dict[str, Any]) -> None:
+        """Apply the user's fixed compute choice without another model retry."""
+        if self.gpu_target_policy not in {"required", "forbidden"}:
+            return
+        targets = plan.get("targets")
+        if not isinstance(targets, list):
+            return
+        expected = self.gpu_target_policy == "required"
+        for target in targets:
+            if isinstance(target, dict):
+                target["gpu_required"] = expected
+
+    def _bundle_operator_session_id(self, cyc, pack) -> Optional[str]:
+        """Recover one cycle-scoped Bundle Codex thread from call receipts.
+
+        The durable identity already exists in provider invocation receipts;
+        no second session database or model-authored success marker is needed.
+        Reading every prior receipt (rather than trusting only the newest one)
+        also fails closed if a provider ever forked sequential targets in the
+        same cycle onto different threads.  Each target's immutable ``plan_ref``
+        remains enforced by the manifest cross-check and core gates.
+        """
+        if pack.target_id is None:
+            raise ValueError("bundle operator ContextPack 缺 target_id")
+        try:
+            target_id = int(pack.target_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError("bundle operator target_id 须为 build_target 整数") from error
+        if target_id <= 0:
+            raise ValueError("bundle operator target_id 须为正整数")
+        return self._recover_persistent_session_id(
+            cyc, phase="bundle",
+            purpose_glob=f"bundle-c{_cnum(cyc.cycle_id)}-*",
+            label=f"bundle cycle {cyc.cycle_id}")
+
+    def _stage_main_session_id(self, cyc, stage: str) -> Optional[str]:
+        """Recover the one durable top-level Codex thread for a stage.
+
+        The purpose namespace is new and resident-only, so an in-flight quest
+        created by an older ephemeral release cannot be mistaken for a thread
+        that is safe to resume.  Retries, semantic corrections and process
+        restarts all resolve through the same provider receipts.
+        """
+        if stage not in {"idea", "plan", "bundle", "reasoning"}:
+            raise ValueError(f"普通常驻阶段非法: {stage!r}")
+        ci = _cnum(cyc.cycle_id)
+        purpose_glob = f"{stage}-main-c{ci}*"
+        return self._recover_persistent_session_id(
+            cyc, phase=stage, purpose_glob=purpose_glob,
+            label=f"{stage} main {cyc.cycle_id}")
+
+    def _recover_persistent_session_id(
+            self, cyc, *, phase: str, purpose_glob: str,
+            label: str) -> Optional[str]:
+        """Resolve exactly one provider thread from accounted call receipts."""
+        daemon = getattr(self.cost_ledger, "daemon", None)
+        if daemon is None:
+            raise RuntimeError(f"{label} 缺 runner_call 权威库")
+        # The frozen runner_call table intentionally contains only lifecycle
+        # columns. Provider/execution receipt refs live in the append-only
+        # provider_invocation_accounted decision written in the same terminal
+        # cost transaction; recover through that established authority instead
+        # of extending or bypassing the core SQL schema.
+        rows = daemon.query(
+            "SELECT rc.id,rc.phase,rc.purpose,"
+            "json_extract(d.payload_json,'$.provider_receipt_ref'),"
+            "json_extract(d.payload_json,'$.execution_receipt_ref') "
+            "FROM runner_call AS rc JOIN decision AS d "
+            "ON d.cycle_id=rc.cycle_id AND d.actor='orchestrator' "
+            "AND d.type='provider_invocation_accounted' "
+            "AND json_valid(d.payload_json) "
+            "AND json_extract(d.payload_json,'$.protocol')='provider-accounting-v1' "
+            "AND json_extract(d.payload_json,'$.runner_call_id')=rc.id "
+            "WHERE rc.cycle_id=? AND rc.phase=? "
+            "AND rc.purpose GLOB ? AND rc.status IN ('success','failed') "
+            "AND json_type(d.payload_json,'$.provider_receipt_ref')='text' "
+            "AND json_type(d.payload_json,'$.execution_receipt_ref')='text' "
+            "ORDER BY rc.id,d.id",
+            (_cnum(cyc.cycle_id), phase, purpose_glob))
+        session_id: Optional[str] = None
+        missing_provider_ids = 0
+        seen_runner_calls: set[int] = set()
+        for runner_call_id, phase, purpose, provider_ref, execution_ref in rows:
+            if runner_call_id in seen_runner_calls:
+                raise RuntimeError(
+                    f"{label} runner_call {runner_call_id} provider accounting 重复")
+            seen_runner_calls.add(runner_call_id)
+            invocation = load_provider_invocation_receipt(
+                Path(provider_ref), expected_runner_call_id=runner_call_id,
+                expected_cycle_id=cyc.cycle_id, expected_phase=phase,
+                expected_purpose=purpose,
+                expected_execution_receipt_ref=execution_ref)
+            candidate = invocation.provider_invocation_id
+            if candidate is None:
+                # An early crash may have produced an accounted receipt before
+                # the provider exposed its id.  It must block a *fresh* retry,
+                # but must not poison a later, uniquely established session
+                # (for example a subsequent receipt imported by reconciliation).
+                missing_provider_ids += 1
+                continue
+            if session_id is not None and candidate != session_id:
+                raise RuntimeError(
+                    f"{label} provider session 漂移")
+            session_id = candidate
+        if rows and session_id is None:
+            raise RuntimeError(
+                f"{label} 历史调用均缺可续接 provider id；拒绝新建会话"
+                f"（receipts={missing_provider_ids}）")
+        return session_id
+
+    def _archive_accepted(self, cyc, pack, art, *, stage: str, purpose: str,
+                          call, attempt: int, accounting_phase: str,
+                          defer_on_error: bool = False) -> None:  # noqa: ANN001
+        """Persist one validated/control envelope and close cost intent on IO failure."""
+        if self.replay_archive is None:
+            return
+        try:
+            submitted = getattr(art, "stage_submission_ref", None) is not None
+            submitted_target = getattr(
+                art, "stage_submission_target_id", None)
+            archive_target = (
+                submitted_target
+                if submitted and stage == "bundle" and submitted_target is not None
+                else getattr(pack, "target_id", None))
+            archive_pack_hash = (
+                getattr(art, "stage_submission_pack_hash", None)
+                if submitted
+                else None) or (getattr(pack, "pack_hash", None) or None)
+            self.replay_archive.persist_stage_artifact(
+                cycle_id=cyc.cycle_id, stage=stage, artifact=art,
+                target_id=archive_target, purpose=purpose,
+                pack_hash=archive_pack_hash,
+                runner_call_id=(call[0] if call is not None else None))
+        except Exception as error:
+            if defer_on_error:
+                # A Bundle replan/protocol diagnosis is a research outcome
+                # whose next mandatory state is Reasoning.  Replay is a
+                # repairable file outbox, not a second semantic gate: retain a
+                # durable pointer to the already MCP-indexed submission and let
+                # BundleReplanRequired continue upward.  Other accepted stage
+                # artifacts keep the stricter fail-loud archive contract.
+                daemon = getattr(self.cost_ledger, "daemon", None)
+                if daemon is not None:
+                    try:
+                        runner_call_id = call[0] if call is not None else None
+                        payload = json.dumps({
+                            "protocol": "replay-archive-deferred-v1",
+                            "stage": stage,
+                            "purpose": purpose,
+                            "runner_call_id": runner_call_id,
+                            "submission_ref": getattr(
+                                art, "stage_submission_ref", None),
+                            "artifact_hash": getattr(
+                                art, "stage_submission_hash", None),
+                            "error_kind": type(error).__name__,
+                            "error_md": str(error)[:2048],
+                        }, ensure_ascii=False, sort_keys=True)
+                        with daemon.transaction() as conn:
+                            duplicate = conn.execute(
+                                "SELECT 1 FROM decision WHERE cycle_id=? "
+                                "AND actor='orchestrator' "
+                                "AND type='replay_archive_deferred' "
+                                "AND json_extract(payload_json,'$.runner_call_id') "
+                                "IS ? LIMIT 1",
+                                (_cnum(cyc.cycle_id), runner_call_id)).fetchone()
+                            if duplicate is None:
+                                conn.execute(
+                                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                                    "VALUES (?,'orchestrator',"
+                                    "'replay_archive_deferred',?)",
+                                    (_cnum(cyc.cycle_id), payload))
+                    except Exception:
+                        logger.exception(
+                            "Bundle replan replay deferred 诊断入库失败 "
+                            "(cycle=%s)", cyc.cycle_id)
+                logger.exception(
+                    "Bundle replan replay archive 延后修复，继续进入 Reasoning "
+                    "(cycle=%s purpose=%s)", cyc.cycle_id, purpose)
+                return
+            # The model call happened but its required replay output did not
+            # publish.  Close that exact runner_call as failed; never leave a
+            # running heartbeat or pretend the turn was accepted.
+            self._record_cost(
+                cyc, accounting_phase, art.usage, status="failed",
+                failure_kind="replay_archive_failed", attempt=attempt, call=call,
+                transcript_ref=art.transcript_ref,
+                execution_receipt_ref=art.execution_receipt_ref,
+                provider_receipt_ref=art.provider_receipt_ref)
+            raise
+
+    def _begin_cost_call(self, cyc, stage: str, runner, attempt: int, *,
+                         purpose_tag: Optional[str] = None):
         if self.cost_ledger is None:
             return None
-        purpose = f"{stage}-n{self._call_seq}-a{attempt + 1}"
+        purpose = f"{purpose_tag or stage}-n{self._call_seq}-a{attempt + 1}"
         rc = self.cost_ledger.begin_call(
             cycle_id=cyc.cycle_id, phase=stage, purpose=purpose)
         heartbeat_path = (
@@ -356,7 +1093,8 @@ class StageProvider:
     def _record_cost(self, cyc, stage: str, usage, *, status: str,
                      attempt: int, call=None, failure_kind: Optional[str] = None,
                      transcript_ref: Optional[str] = None,
-                     execution_receipt_ref: Optional[str] = None) -> None:
+                     execution_receipt_ref: Optional[str] = None,
+                     provider_receipt_ref: Optional[str] = None) -> None:
         """本次调用记账。预算网开启时 fail-closed；只有 session_max=null 时才容忍记账故障。
 
         usage=None 也写 money=0 行；RunnerError 携带多少就记多少，保证失败重试不从调用历史消失。
@@ -379,7 +1117,8 @@ class StageProvider:
                 runner_call_id=runner_call_id, usage=usage, status=status,
                 failure_kind=failure_kind,
                 transcript_ref=transcript_ref or str(heartbeat.path),
-                execution_receipt_ref=execution_receipt_ref)
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref)
         except (BudgetExhausted, CostAccountingFailed):
             raise                               # ledger/global_stop 已提交；立即阻断，不当作写账故障吞掉
         except Exception:                      # noqa: BLE001 —— 预算开启时必须 fail-closed
@@ -431,7 +1170,7 @@ class PlanReviewProvider:
 
     def __init__(self, *, runner_factory, schemas, policy: Dict[str, Any],
                  system_prompt: str, skill: str, daemon, work_root: str,
-                 cost_ledger=None):
+                 cost_ledger=None, replay_archive=None):
         self.runner_factory = runner_factory
         self.schemas = schemas
         self.retries = policy["flow"]["retry"]["artifact_parse"]
@@ -439,6 +1178,7 @@ class PlanReviewProvider:
         self.skill = skill
         self.daemon = daemon
         self.work = Path(work_root)
+        self.replay_archive = replay_archive
         self.cost_ledger = cost_ledger
         self._cost_required = policy.get("budget", {}).get("session_max") is not None
         if self._cost_required and cost_ledger is None:
@@ -455,6 +1195,9 @@ class PlanReviewProvider:
         if (pack.cycle_id != cyc.cycle_id or pack.stage != "plan"
                 or getattr(pack, "target_id", None) is not None):
             raise ValueError("plan review ContextPack cycle/stage/target 身份漂移")
+        if self.replay_archive is not None:
+            self.replay_archive.persist_context_pack(
+                pack, label=f"plan-review-{round_no}")
         self._call_seq += 1
         runner = self.runner_factory(
             self.work / f"cycles/{cyc.cycle_id}/transcripts",
@@ -477,6 +1220,7 @@ class PlanReviewProvider:
             "\n\n===== 调用点 =====\n只执行【评审任务】；这是与 plan generator 独立的新会话。"
             f"产 plan_review.json，round_no 必须为 {round_no}。")
         last_err = ""
+        frozen_verdict: Optional[str] = None
         for attempt in range(self.retries + 1):
             skill = base if not last_err else (
                 base + f"\n\n===== 上次评审产物被拒（第 {attempt} 次重试）=====\n"
@@ -519,7 +1263,23 @@ class PlanReviewProvider:
                 errors.extend(
                     f"{error.json_path} {error.message}"
                     for error in self.schemas.validator("plan_review").iter_errors(review))
-                if review.get("round_no") != round_no:
+                # One configured review round means one semantic judgment.
+                # If the first returned artifact already expresses a valid
+                # verdict but misses a required structural field, an
+                # artifact_parse retry may repair only the envelope; it must
+                # not silently turn the same review from fail into pass (or
+                # vice versa) in a fresh provider invocation.
+                candidate_verdict = (
+                    review.get("verdict") if isinstance(review, dict) else None)
+                if candidate_verdict in {"pass", "fail"}:
+                    if frozen_verdict is None:
+                        frozen_verdict = candidate_verdict
+                    elif candidate_verdict != frozen_verdict:
+                        errors.append(
+                            "artifact retry 不得改变首次有效 verdict："
+                            f"{frozen_verdict!r} -> {candidate_verdict!r}")
+                if (isinstance(review, dict)
+                        and review.get("round_no") != round_no):
                     errors.append(
                         f"plan_review.round_no={review.get('round_no')!r}，期望 {round_no}")
             if errors:
@@ -528,7 +1288,24 @@ class PlanReviewProvider:
                     transcript_ref=art.transcript_ref,
                     execution_receipt_ref=art.execution_receipt_ref)
                 last_err = "\n".join(errors[:8])
+                if frozen_verdict is not None:
+                    last_err += (
+                        "\n首次有效 verdict 已冻结为 " + frozen_verdict
+                        + "；只补齐/修正 JSON 结构，不得重新评审或改变结论。")
                 continue
+            if self.replay_archive is not None:
+                try:
+                    self.replay_archive.persist_stage_artifact(
+                        cycle_id=cyc.cycle_id, stage="plan", artifact=art,
+                        purpose=f"plan-review-{round_no}",
+                        pack_hash=getattr(pack, "pack_hash", None) or None,
+                        runner_call_id=(call[0] if call is not None else None))
+                except Exception:
+                    self._finish_failed(
+                        call, art.usage, failure_kind="replay_archive_failed",
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    raise
             decision_id = self._record(
                 cyc.cycle_id, round_no, plan_hash, review, art.usage, call=call,
                 transcript_ref=art.transcript_ref,
@@ -732,7 +1509,8 @@ class JudgeProvider:
     policy_hash = judge SKILL 文本 sha256（prompt 版本指纹：措辞即行为，换 prompt 即换裁决口径）。"""
 
     def __init__(self, *, runner_factory, schemas, policy: Dict[str, Any], system_prompt: str,
-                 skill: str, daemon, work_root: str, cost_ledger=None):
+                 skill: str, daemon, work_root: str, cost_ledger=None,
+                 replay_archive=None):
         self.runner_factory = runner_factory
         self.schemas = schemas
         self.retries = policy["flow"]["retry"]["artifact_parse"]
@@ -740,6 +1518,7 @@ class JudgeProvider:
         self.skill = skill
         self.daemon = daemon
         self.work = Path(work_root)
+        self.replay_archive = replay_archive
         self.policy_hash = hashlib.sha256(skill.encode("utf-8")).hexdigest()
         self.cost_ledger = cost_ledger         # 步⑩ CP10.2：judge(audit) 调用记账（复用 _record 建的 runner_call）
         self._cost_required = policy.get("budget", {}).get("session_max") is not None
@@ -756,6 +1535,8 @@ class JudgeProvider:
         pack = ContextPack(cycle_id=cycle_id, stage="bundle", target_id=str(build_target_id),
                            anchor_md=self._subject_md(cycle_id, build_target_id, review_kind),
                            neighborhood_md="", retrieval_md="", refs=[])
+        if self.replay_archive is not None:
+            self.replay_archive.persist_context_pack(pack, label=review_kind)
         self._call_seq += 1
         runner = self.runner_factory(self.work / f"cycles/{cycle_id}/transcripts",
                                      f"judge-{review_kind}-n{self._call_seq}")
@@ -811,12 +1592,28 @@ class JudgeProvider:
                                   execution_receipt_ref=art.execution_receipt_ref)
                 last_err = "review_verdict.json schema 校验失败:\n" + "\n".join(errs[:8])
                 continue
+            if self.replay_archive is not None:
+                try:
+                    self.replay_archive.persist_stage_artifact(
+                        cycle_id=cycle_id, stage="bundle", artifact=art,
+                        target_id=str(build_target_id), purpose=review_kind,
+                        pack_hash=getattr(pack, "pack_hash", None) or None,
+                        runner_call_id=(call[0] if call is not None else None))
+                except Exception:
+                    self._record_cost(
+                        cycle_id, review_kind, art.usage, status="failed",
+                        failure_kind="replay_archive_failed", attempt=attempt, call=call,
+                        transcript_ref=art.transcript_ref,
+                        execution_receipt_ref=art.execution_receipt_ref)
+                    raise
             self._record(
                 cycle_id, build_target_id, review_kind, subject_hash, verdict, art.usage,
                 call=call, transcript_ref=art.transcript_ref,
                 execution_receipt_ref=art.execution_receipt_ref)
             return
-        raise RunnerError(f"judge {review_kind} 产物结构非法，artifact_parse 重试（≤{self.retries}）用尽：{last_err}")
+        raise RunnerError(
+            f"judge {review_kind} 产物结构非法，artifact_parse 重试（≤{self.retries}）用尽：{last_err}",
+            failure_kind="artifact_parse")
 
     def _begin_cost_call(self, cycle_id: str, review_kind: str, runner, attempt: int):
         if self.cost_ledger is None:

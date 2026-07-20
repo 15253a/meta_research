@@ -33,26 +33,22 @@ STAGE_ANCHORS = {
     "idea": [
         "需要全新创新",              # NEED 分支（图 03）
         "wildidea", "旁路",
-        "phase=idea", "phase=audit",  # 两次独立 runner_call
+        "wildidea_expand", "wildidea_search",  # Idea-only MCP，无第二个顶层模型
         "判官", "Structural Depth",
         "防重复造轮",
-        "联网粗查已启用",             # novelty 诚实纪律固定文本
-        "idea_set", "idea_audit",
+        "联网粗查已启用",             # 受控后端启用态仍须保留的诚实文案
+        "idea_set.json", "record_review",
         "全部候选不合格",             # 失败语义：阶段失败=轮正常收尾
         "inconclusive",
     ],
     "plan": [
-        "verification needs", "复用判定",
-        "锁死", "I1", "I2",           # 协议锁死（bundle 只照办）
-        "可回答性",                   # 独立评审 ≤2 轮
-        "eval_action", "evaluation_id", "eval_key", "evaluation_source",
-        "attempt_purpose",
-        "target_key", "spec_md", "claim",   # target 必填字段必须教给工人（内审 Critical#1）
-        "canonical_key", "variant_key", "config_json",
-        "聚合轮",                     # needs=[] 特例
-        "import_defer",               # M0 不产的显式声明
-        "plan.json", "plan_review",
-        "dependency_wait",
+        "最小可执行计划", "Codex 自主决定",
+        "Web 已登记", "ContextPack",
+        "targets", "target_kind", "spec_md",
+        "protocol", "scope_spec", "metric_defs",
+        "三问决策树", "机械复用判定", "规范 selector", "gpu_required",
+        "不得替模型补研究语义",
+        "targets=[]", "reuse_evidence", "import_defer", "plan.json",
     ],
     "bundle": [
         "串行", "target_kind",
@@ -69,7 +65,7 @@ STAGE_ANCHORS = {
         "R1", "R2", "R3", "R4",
         "bootstrap", "decompose", "goal_amend",
         "verdict", "evidence",
-        "四元打分", "B(t)",
+        "最小键", "B(t)",
         "不写 route",                     # selection 与 route 分离
         "terminate", "inconclusive",
         "answer.json", "tree_ops.json", "selection.json",
@@ -78,9 +74,9 @@ STAGE_ANCHORS = {
 }
 
 SYSTEM_PROMPT_ANCHORS = [
-    "无状态",                # 角色锁定
+    "当前事实包权威",          # 常驻工作上下文不扩大事实面
     "不得臆造",
-    "三级校验",
+    "当前 turn 修正并重提",
     "```json",              # 输出信封
     "\"files\"",
     "resource_request.json",  # sidecar 出口
@@ -94,28 +90,28 @@ def test_system_prompt_anchors():
         assert anchor in SYSTEM_PROMPT, f"system_prompt 缺要素锚词: {anchor}"
 
 
-def test_system_prompt_inlines_schema_valid_resource_request_skeleton():
-    """No-shell workers must receive the exact optional sidecar contract inline."""
+def test_system_prompt_inlines_minimal_schema_valid_resource_request_skeleton():
+    """Workers receive the user-facing minimum, not an audit worksheet."""
     match = re.search(
-        r"resource_request\.json 精确骨架.*?```json\n(.*?)\n```",
+        r"resource_request\.json`? 最小骨架.*?```json\n(.*?)\n```",
         SYSTEM_PROMPT, re.DOTALL)
     assert match is not None, "system_prompt 未内联 resource_request exact skeleton"
     payload = json.loads(match.group(1))
     SchemaSet(SCHEMAS_DIR).validator("resource_request").validate(payload)
     assert set(payload) == {"summary_md", "items"}
-    assert set(payload["items"][0]) == {
-        "kind", "desc", "expected_files", "attempted_paths",
-        "failure_reason", "dest_hint",
-    }
+    assert set(payload["items"][0]) == {"kind", "desc"}
 
 
-def test_plan_owns_synthetic_protocol_design_and_eval_create_claim_contract():
+def test_plan_keeps_science_and_delegates_bookkeeping():
     plan = SKILLS["plan"]
     for anchor in (
-            "规范性设计决定", "运行时合成", "ContextPack 未预先给值不构成",
-            "不得为此发 resource_request", "问题/idea 文本中的“已锁定”",
-            "claim{baseline_ref, variant_key}"):
-        assert anchor in plan, f"plan/SKILL.md 缺 production plan 语义: {anchor}"
+            "前向逻辑或算法结构是否变化", "必须重新训练或产生新的可评对象",
+            "只改变评估数据、协议、指标或重测", "target_key", "budget_estimate",
+            "required metrics", "规范 selector", "不得替你生成",
+            "禁止 `auto-cN-tN`"):
+        assert anchor in plan, f"plan/SKILL.md 缺自主计划语义: {anchor}"
+    assert "独立 plan reviewer" in plan
+    assert "编排器会用保守默认值确定性补齐" not in plan
 
 
 def test_reasoning_copies_exact_measurement_ref_and_labels_fake_only_from_provenance():
@@ -142,6 +138,23 @@ def test_skill_stage_anchors():
         text = SKILLS[name]
         missing = [a for a in anchors if a not in text]
         assert not missing, f"{name}/SKILL.md 缺流程锚词: {missing}"
+
+
+def test_idea_skill_uses_pinned_adapter_contract_not_m0_simulation():
+    idea = SKILLS["idea"]
+    assert "M0 骨架说明" not in idea
+    assert "在会话内执行" not in idea
+    for anchor in (
+            "wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598",
+            "problem_card", "source-first", "claimed_method", "systematicity",
+            "repair", "reangle", "batch diversity", "严禁生成 HTML",
+            "联网查重未启用·文献级待验证", "绝不猜 engine/hash/model/sampling",
+            "wildidea_expand", "wildidea_search", 'files={"idea_set.json": ...}'):
+        assert anchor in idea, f"idea/SKILL.md 缺 pinned adapter 契约: {anchor}"
+    assert "phase=idea" not in idea
+    assert "phase=audit" not in idea
+    assert 'files["idea_set.draft.json"]' not in idea
+    assert 'files["idea_audit.json"]' not in idea
 
 
 def test_skill_schema_references_exist():

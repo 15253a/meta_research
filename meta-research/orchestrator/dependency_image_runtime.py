@@ -29,6 +29,14 @@ from .repository_materialization_common import (
 )
 
 
+# ``python_path`` on the bootstrap sandbox may intentionally point at a
+# development-only host Conda prefix.  A dependency-derived image is a child
+# of the policy-pinned CPython image, however, and must execute with that
+# image's interpreter.  Keep this provider-v1 runtime path local to the
+# dependency-image adapter instead of weakening the generic sandbox contract.
+_DEPENDENCY_IMAGE_PYTHON_PATH = "/usr/local/bin/python3"
+
+
 class _DependencyImageRuntimeMixin:
     """Host contract: builder config, bootstrap sandbox, supervisor, locks and guards."""
 
@@ -270,16 +278,30 @@ class _DependencyImageRuntimeMixin:
             raise RepositoryCacheError(
                 "dependency uncommitted image 无法精确清理")
 
-    def _derived_sandbox(self, image_id: str) -> DockerExecutionSandbox:
+    def _derived_sandbox_config(self, image_id: str) -> Dict[str, Any]:
+        """Project the bootstrap policy onto one dependency-derived image.
+
+        Network, resource, GPU capability, and qualification data mounts stay
+        inherited.  The live local Conda prefix and its GPU-only thread tuning
+        are bootstrap development capabilities, not contents of the immutable
+        derived image, so neither may leak into its runtime identity.
+        """
         config = dict(self.bootstrap_sandbox.config)
         config.update({
             "image": image_id,
             "image_id": image_id,
+            "python_path": _DEPENDENCY_IMAGE_PYTHON_PATH,
+            "local_environment": None,
+            "development_gpu_thread_limit": None,
             "payload_environment": {
                 **config["payload_environment"],
                 "PYTHONPATH": self.config["site_packages_path"],
             },
         })
+        return config
+
+    def _derived_sandbox(self, image_id: str) -> DockerExecutionSandbox:
+        config = self._derived_sandbox_config(image_id)
         environment_hash = sandbox_environment_hash(config)
         cached = self._sandboxes.get(environment_hash)
         if cached is not None:

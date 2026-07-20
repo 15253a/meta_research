@@ -16,8 +16,8 @@ applied（consumed_cycle+效果摘要）/ rejected（附理由）/ superseded。
 **文件请求 3 事件**：request_pending / reminder（每 remind_interval_h 一档；时间由调用方注入 now_ts
 ——本模块不调 wall-clock，保确定性可测）/ resolved（含 cancelled，附 resolution 摘要）。
 
-**文件请求全流水（§4.6.8）**：create_checked = schema 校验（resource_request.schema.json：items 必带
-attempted_paths/failure_reason——"能自己获取的不得请求"的自证）+ 创建拒绝三判据（enabled=false /
+**文件请求全流水（§4.6.8）**：create_checked = 最小 resource_request schema 校验（items 只需表达
+缺少的资料与用途；可选诊断字段不承担模型自证）+ 创建拒绝三判据（enabled=false /
 len(items)>max_items_per_request / 同 goal (pending+resolved)≥max_requests_per_goal）→ 落单。
 resolve = uploads/<req_id>/<item_no>/ 逐文件 sha256 入账 → 复制并入 input/user_provided/<req_id>/ →
 resolution_json + resolved_message_id **一次性迁终态**（DDL trg_ireq_identity_frozen 只许这一跳）。
@@ -1207,13 +1207,24 @@ class ResearchNotifier:
                         f"失败类型：{failure_preview or '未分类'}。"),
                 },
             })
+        # ``cycle.cost_total`` is a legacy partial accumulator and omits
+        # reasoning/query calls.  Aggregate the append-only ledger once per
+        # scan so the human-facing summary shares the status-card truth source.
         for (cycle_id, goal_id, goal_ver, status, route, question_id,
              cost_total, next_intent) in self.daemon.query(
-                "SELECT id,goal_id,goal_ver,status,route,active_question_id,cost_total,next_intent "
-                "FROM cycle WHERE status IN ('done','failed','aborted') AND (id % ?)=0 ORDER BY id",
+                "SELECT c.id,c.goal_id,c.goal_ver,c.status,c.route,c.active_question_id,"
+                "COALESCE(lc.money,0.0),c.next_intent FROM cycle c "
+                "LEFT JOIN (SELECT cycle_id,SUM(money) AS money FROM ledger GROUP BY cycle_id) lc "
+                "ON lc.cycle_id=c.id "
+                "WHERE c.status IN ('done','failed','aborted') AND (c.id % ?)=0 ORDER BY c.id",
                 (self.audit_cadence_k,)):
             events.append({
-                "event_key": f"cycle:{cycle_id}:summary",
+                # v1 was bound to the legacy cycle.cost_total projection.  A
+                # new key is required because Outbox correctly treats a
+                # different payload under an existing key as corruption; this
+                # also lets upgraded work roots retain/deliver their immutable
+                # v1 event while enqueueing the ledger-corrected summary once.
+                "event_key": f"cycle:{cycle_id}:summary:v2",
                 "kind": "cycle_summary",
                 "payload": {
                     "cycle_id": f"c{cycle_id}", "goal_id": goal_id, "goal_ver": goal_ver,
@@ -1735,6 +1746,12 @@ def _count_resolved_assets_for_goal(daemon: WriteDaemon, goal_id: int) -> int:
             resolution = json.loads(resolution_json)
         except (TypeError, json.JSONDecodeError) as e:
             raise ValueError(f"interaction_request {request_id} resolved 回执 JSON 损坏") from e
+        permission_only = (
+            isinstance(items, list) and bool(items)
+            and all(isinstance(item, dict) and item.get("kind") == "permission"
+                    for item in items))
+        if permission_only and resolution == {"approved": True}:
+            continue
         if (not isinstance(items, list) or not items or any(not isinstance(item, dict) for item in items)
                 or not isinstance(resolution, list)
                 or len(resolution) != len(items)):
@@ -1916,6 +1933,12 @@ class FileRequestService:
         except ValidationError as e:
             raise FileRequestReject(f"schema 拒: {e.message}") from e
         items = request["items"]
+        permission_items = [item for item in items if item.get("kind") == "permission"]
+        if permission_items and len(permission_items) != len(items):
+            raise FileRequestReject("权限确认与资料上传不得混在同一请求")
+        if permission_items and any(
+                "expected_files" in item or "dest_hint" in item for item in items):
+            raise FileRequestReject("权限确认只能同意或不同意，不得要求上传文件或填写落位")
         items_json = json.dumps(items, ensure_ascii=False, sort_keys=True)
         request_hash = hashlib.sha256(items_json.encode()).hexdigest()
         existing = self.daemon.query_one(
@@ -2051,6 +2074,8 @@ class FileRequestService:
         with _claim_file_request_operation(managed_paths[0]):
             # 初检到 claim 之间可能等待另一个进程；锁内完整校验才有权触碰 final/staging。
             items, goal_id = self._validate_pending_request(request_id, resolved_message_id)
+            if items and all(item.get("kind") == "permission" for item in items):
+                raise ValueError("权限请求只能同意或不同意，不接受文件上传")
             return self._resolve_claimed(
                 request_id=request_id, uploads_dir=uploads_dir,
                 resolved_message_id=resolved_message_id, items=items,
@@ -2219,6 +2244,29 @@ class FileRequestService:
                 if n != 1:            # 兜底同 resolve（同事务已校验，理论不可达）
                     raise RuntimeError(f"request {request_id} cancel 竞态：迁移失败")
 
+    def approve(self, *, request_id: int, resolved_message_id: int) -> None:
+        """Approve a permission-only request without accepting any uploaded asset."""
+        status, _, _goal_id = self._check_provenance(request_id, resolved_message_id)
+        if status != "pending":
+            raise ValueError(f"request {request_id} 非 pending（{status}），不可 approve")
+        managed_paths = self._managed_paths(request_id)
+        with _claim_file_request_operation(managed_paths[0]):
+            items, _goal_id = self._validate_pending_request(
+                request_id, resolved_message_id)
+            if not items or any(item.get("kind") != "permission" for item in items):
+                raise ValueError("approve 只适用于纯权限确认；资料请求必须通过 Web 上传")
+            managed_root, stage_root, dest_root = managed_paths
+            _remove_attempt_durable(managed_root, stage_root, dest_root)
+            resolution_json = json.dumps({"approved": True}, ensure_ascii=False)
+            with self.daemon.transaction() as conn:
+                n = conn.execute(
+                    "UPDATE interaction_request SET status='resolved', resolution_json=?, "
+                    "resolved_at=CURRENT_TIMESTAMP, resolved_message_id=? "
+                    "WHERE id=? AND status='pending'",
+                    (resolution_json, resolved_message_id, request_id)).rowcount
+                if n != 1:
+                    raise RuntimeError(f"request {request_id} approve 竞态：迁移失败")
+
 
 class FileRequestNotifier:
     """文件请求 3 事件（§4.6.6）：request_pending / reminder（分档）/ resolved（含 cancelled）。
@@ -2237,6 +2285,9 @@ class FileRequestNotifier:
         value = _load_state_json(raw)
         if isinstance(value, dict) and value.get("cancelled") is True:
             return {"cancelled": True, "item_count": 0,
+                    "provided_file_count": 0, "unavailable_item_count": 0}
+        if isinstance(value, dict) and value == {"approved": True}:
+            return {"approved": True, "item_count": 0,
                     "provided_file_count": 0, "unavailable_item_count": 0}
         if not isinstance(value, list):
             raise ValueError("interaction_request resolution_json 结构损坏")

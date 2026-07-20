@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from .ids import cnum as _cnum
 from .interfaces import CallUsage
+from .durable_stop import active_global_stop, has_active_global_stop
 from .provider_invocation import (ProviderInvocation, load_provider_invocation_receipt,
                                   provider_receipt_for_execution)
 from .runtime_control import (effective_budget_config, policy_with_effective_budget,
@@ -139,13 +140,11 @@ class CostLedger:
             conn, self._base_budget, require_schedule=False)
         if effective["session_max"] is None:
             return None
-        explicit = conn.execute(
-            "SELECT json_extract(payload_json,'$.reason') FROM decision "
-            "WHERE actor='orchestrator' AND type='global_stop' "
-            "AND json_extract(payload_json,'$.reason') IN ('budget_exhausted','cost_accounting_failed') "
-            "ORDER BY id LIMIT 1").fetchone()
-        if explicit is not None:
-            return str(explicit[0])
+        explicit = active_global_stop(conn)
+        if (explicit is not None
+                and explicit[1]["reason"] in {
+                    "budget_exhausted", "cost_accounting_failed"}):
+            return explicit[1]["reason"]
         unaccounted = conn.execute(
             "SELECT 1 FROM runner_call rc WHERE rc.status='failed' "
             "AND rc.failure_kind IN ('cost_accounting','orphaned_query_intent') "
@@ -443,9 +442,7 @@ class CostLedger:
                 payload = {"reason": "cost_accounting_failed", "phase": phase, "purpose": purpose,
                            "runner_call_id": rc, "error_type": type(cause).__name__,
                            "error": str(cause)[:500]}
-                if conn.execute(
-                        "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' LIMIT 1"
-                ).fetchone() is None:
+                if not has_active_global_stop(conn):
                     conn.execute(
                         "INSERT INTO decision(cycle_id,actor,type,payload_json) "
                         "VALUES (?,'orchestrator','global_stop',?)",
@@ -533,9 +530,7 @@ class CostLedger:
             "error_type": type(cause).__name__,
             "error": str(cause)[:500],
         }
-        if conn.execute(
-                "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' LIMIT 1"
-        ).fetchone() is None:
+        if not has_active_global_stop(conn):
             conn.execute(
                 "INSERT INTO decision(cycle_id,actor,type,payload_json) "
                 "VALUES (?,'orchestrator','global_stop',?)",
@@ -553,8 +548,7 @@ class CostLedger:
         if spent < session_max:
             return None
         hit = {"spent": spent, "session_max": session_max}
-        if conn.execute("SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' "
-                        "LIMIT 1").fetchone() is None:
+        if not has_active_global_stop(conn):
             conn.execute(
                 "INSERT INTO decision(actor,type,payload_json) VALUES ('orchestrator','global_stop',?)",
                 (json.dumps({"reason": "budget_exhausted", **hit}, ensure_ascii=False),))

@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from .durable_stop import active_global_stop
 from .process_supervisor import (ExecutionRecoveryError, read_receipt,
                                  validate_execution_receipt)
 from .provider_invocation import (ProviderInvocation, load_provider_invocation_receipt,
@@ -31,6 +32,14 @@ _SPECIALIZED_RUNNER_PHASES = ("interaction_query", "import_search")
 def _require_terminal(owner: str, receipt: dict) -> None:
     if receipt.get("state") != "terminal" or receipt.get("group_drained") is not True:
         raise ExecutionRecoveryError(f"{owner} receipt 未证明 terminal+drained")
+
+
+def _receipt_execution_attempt(context: dict) -> int:
+    """Normalize pre-attempt smoke receipts to the initial generation."""
+    value = context.get("execution_attempt", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ExecutionRecoveryError("build_target receipt execution_attempt 非法")
+    return value
 
 
 def _runner_failure(receipt: dict) -> Tuple[str, str]:
@@ -100,8 +109,30 @@ class ExecutionReconciler:
             allow_nan=False) + "\n").encode("utf-8")
         return "sha256:" + hashlib.sha256(payload).hexdigest()
 
+    def _build_target_execution_attempt(self, owner_id: int) -> int:
+        rows = self.daemon.query(
+            "SELECT id,payload_json FROM decision WHERE actor='orchestrator' "
+            "AND type='bundle_repair_requested' AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.build_target_id')=? ORDER BY id",
+            (owner_id,))
+        next_attempt = 1
+        for decision_id, raw in rows:
+            try:
+                payload = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise ExecutionRecoveryError(
+                    f"bundle repair decision d{decision_id} 损坏") from error
+            if (not isinstance(payload, dict)
+                    or payload.get("protocol") != "bundle-self-heal-v1"
+                    or payload.get("build_target_id") != owner_id
+                    or payload.get("round_no") != next_attempt):
+                raise ExecutionRecoveryError(
+                    f"build_target {owner_id} bundle repair attempt 链损坏")
+            next_attempt += 1
+        return next_attempt
+
     def _receipts(self) -> Dict[Tuple[str, int], Tuple[Path, dict]]:
-        owners: Dict[Tuple[str, int], Tuple[Path, dict]] = {}
+        receipt_sets: Dict[Tuple[str, int], list[Tuple[Path, dict]]] = {}
         for path in sorted(self.receipt_dir.glob("execution-*.json")):
             receipt = read_receipt(path)
             validate_execution_receipt(receipt, path)
@@ -120,10 +151,46 @@ class ExecutionReconciler:
             if isinstance(owner_id, bool) or not isinstance(owner_id, int) or owner_id <= 0:
                 raise ExecutionRecoveryError(f"{path.name} 缺合法 DB owner id")
             key = (str(owner_kind), owner_id)
-            if key in owners:
+            receipt_sets.setdefault(key, []).append((path, receipt))
+
+        owners: Dict[Tuple[str, int], Tuple[Path, dict]] = {}
+        for (owner_kind, owner_id), entries in receipt_sets.items():
+            if owner_kind != "build_target":
+                if len(entries) != 1:
+                    raise ExecutionRecoveryError(
+                        f"{owner_kind} {owner_id} 对应多个 execution operation")
+                owners[(owner_kind, owner_id)] = entries[0]
+                continue
+
+            row = self._owner_row(owner_kind, owner_id)
+            if row is None:
                 raise ExecutionRecoveryError(
-                    f"{owner_kind} {owner_id} 对应多个 execution operation")
-            owners[key] = (path, receipt)
+                    f"receipt 指向不存在的 build_target {owner_id}")
+            expected_attempt = self._build_target_execution_attempt(owner_id)
+            by_attempt: Dict[int, Tuple[Path, dict]] = {}
+            for path, receipt in entries:
+                context = receipt.get("context") or {}
+                self._validate_owner_context(owner_kind, owner_id, row, context)
+                attempt = _receipt_execution_attempt(context)
+                if attempt in by_attempt:
+                    raise ExecutionRecoveryError(
+                        f"build_target {owner_id} execution attempt {attempt} "
+                        "对应多个 execution operation")
+                if attempt > expected_attempt:
+                    raise ExecutionRecoveryError(
+                        f"build_target {owner_id} receipt attempt {attempt} "
+                        f"超过耐久 repair attempt {expected_attempt}")
+                by_attempt[attempt] = (path, receipt)
+                if attempt < expected_attempt:
+                    _require_terminal(
+                        f"build_target {owner_id} superseded attempt {attempt}", receipt)
+            current = by_attempt.get(expected_attempt)
+            if current is not None:
+                owners[(owner_kind, owner_id)] = current
+            elif row["status"] in ("complete", "skipped"):
+                raise ExecutionRecoveryError(
+                    f"{row['status']} build_target {owner_id} 缺当前 execution attempt "
+                    f"{expected_attempt} receipt")
         return owners
 
     def _provider_receipts(self) -> Dict[int, Path]:
@@ -206,21 +273,31 @@ class ExecutionReconciler:
                     f"evaluation_attempt {owner_id} receipt run_id 与 target 错配")
 
     @staticmethod
-    def _already_decided(conn, owner_kind: str, owner_id: int) -> bool:
-        return conn.execute(
-            "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='execution_reconciled' "
-            "AND json_valid(payload_json) "
+    def _already_decided(conn, owner_kind: str, owner_id: int,
+                         execution_attempt: Optional[int] = None) -> bool:
+        sql = (
+            "SELECT 1 FROM decision WHERE actor='orchestrator' "
+            "AND type='execution_reconciled' AND json_valid(payload_json) "
             "AND json_extract(payload_json,'$.db_owner_kind')=? "
-            "AND json_extract(payload_json,'$.db_owner_id')=? LIMIT 1",
-            (owner_kind, owner_id)).fetchone() is not None
+            "AND json_extract(payload_json,'$.db_owner_id')=? ")
+        params: tuple = (owner_kind, owner_id)
+        if execution_attempt is not None:
+            # Reconciliation decisions written before this field are the
+            # initial implementation generation, never a wildcard over all
+            # future bundle repair attempts.
+            sql += "AND COALESCE(json_extract(payload_json,'$.execution_attempt'),1)=? "
+            params += (execution_attempt,)
+        return conn.execute(sql + "LIMIT 1", params).fetchone() is not None
 
     def _record_decision(self, conn, *, protocol: str, owner_kind: str, owner_id: int,
                          cycle_id: Optional[int], receipt_path: Optional[Path],
                          receipt: Optional[dict], terminal_status: str,
                          failure_kind: str, db_failure_kind: Optional[str] = None,
                          recovery_action: str = "terminalized",
-                         provider_invocation: Optional[ProviderInvocation] = None) -> None:
-        if self._already_decided(conn, owner_kind, owner_id):
+                         provider_invocation: Optional[ProviderInvocation] = None,
+                         execution_attempt: Optional[int] = None) -> None:
+        if self._already_decided(
+                conn, owner_kind, owner_id, execution_attempt=execution_attempt):
             return
         payload = {
             "reconcile_protocol": protocol,
@@ -244,6 +321,8 @@ class ExecutionReconciler:
             "provider_invocation_id": (provider_invocation.provider_invocation_id
                                        if provider_invocation is not None else None),
         }
+        if execution_attempt is not None:
+            payload["execution_attempt"] = execution_attempt
         conn.execute(
             "INSERT INTO decision(cycle_id,actor,type,payload_json) "
             "VALUES (?,'orchestrator','execution_reconciled',?)",
@@ -348,13 +427,20 @@ class ExecutionReconciler:
     def _reconcile_owner(self, owner_kind: str, owner_id: int, row: dict,
                          receipt_entry) -> bool:
         path, receipt = receipt_entry if receipt_entry is not None else (None, None)
+        execution_attempt = (
+            _receipt_execution_attempt(receipt.get("context") or {})
+            if owner_kind == "build_target" and receipt is not None else
+            self._build_target_execution_attempt(owner_id)
+            if owner_kind == "build_target" else None)
         if receipt is not None:
             _require_terminal(f"{owner_kind} {owner_id}", receipt)
             self._validate_owner_context(
                 owner_kind, owner_id, row, receipt.get("context") or {})
 
         with self.daemon.transaction() as conn:
-            if self._already_decided(conn, owner_kind, owner_id):
+            if self._already_decided(
+                    conn, owner_kind, owner_id,
+                    execution_attempt=execution_attempt):
                 return False
             owner_table = {"run": "run", "evaluation_attempt": "evaluation_attempt",
                            "build_target": "build_target"}[owner_kind]
@@ -384,7 +470,8 @@ class ExecutionReconciler:
                     owner_id=owner_id, cycle_id=row["cycle_id"], receipt_path=path,
                     receipt=receipt, terminal_status=current[0],
                     failure_kind="orphaned_after_exit", db_failure_kind=None,
-                    recovery_action="await_owner_artifact_recovery")
+                    recovery_action="await_owner_artifact_recovery",
+                    execution_attempt=execution_attempt)
                 return True
 
             terminal_status, db_failure, exact_failure = _execution_failure(
@@ -433,7 +520,8 @@ class ExecutionReconciler:
                 conn, protocol=_OWNER_PROTOCOL, owner_kind=owner_kind,
                 owner_id=owner_id, cycle_id=row["cycle_id"], receipt_path=path,
                 receipt=receipt, terminal_status=terminal_status,
-                failure_kind=exact_failure, db_failure_kind=db_failure)
+                failure_kind=exact_failure, db_failure_kind=db_failure,
+                execution_attempt=execution_attempt)
         return True
 
     def _validate_terminal_owner(self, owner_kind: str, owner_id: int,
@@ -478,6 +566,61 @@ class ExecutionReconciler:
                 raise ExecutionRecoveryError(
                     f"runner_call {invocation.runner_call_id} provider accounting 锚不一致")
             return
+        # A failed call with unavailable token usage may be explicitly waived
+        # by the local operator.  This is an append-only recovery, not a fake
+        # provider accounting receipt: the exact stop, release, provider
+        # receipt and zero-charge ledger disposition must all be cross-linked.
+        # Ordinary calls still require the exactly-once branch above.
+        waivers = self.daemon.query(
+            "SELECT id,payload_json FROM decision WHERE actor='orchestrator' "
+            "AND type='cost_accounting_waiver_correction' AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.runner_call_id')=? ORDER BY id",
+            (invocation.runner_call_id,))
+        if len(decisions) == 0 and len(waivers) == 1 and len(ledger_rows) == 1:
+            waiver = json.loads(waivers[0][1])
+            ledger = self.daemon.query_one(
+                "SELECT id,tokens_input,tokens_output,tokens_total,wallclock_sec,money "
+                "FROM ledger WHERE runner_call_id=?",
+                (invocation.runner_call_id,))
+            stop = self.daemon.query_one(
+                "SELECT payload_json FROM decision WHERE id=? AND actor='orchestrator' "
+                "AND type='global_stop'",
+                (waiver.get("global_stop_id"),))
+            release = self.daemon.query_one(
+                "SELECT payload_json FROM decision WHERE id=? AND actor='orchestrator' "
+                "AND type='global_stop_release'",
+                (waiver.get("release_decision_id"),))
+            stop_payload = json.loads(stop[0]) if stop is not None else None
+            release_payload = json.loads(release[0]) if release is not None else None
+            valid = (
+                waiver.get("protocol") == "cost-accounting-waiver-v2"
+                and row[1] == "cost_accounting"
+                and invocation.usage.tokens_known is False
+                and invocation.execution_outcome != "exit"
+                and waiver.get("provider_receipt_ref") == invocation.receipt_ref
+                and waiver.get("provider_receipt_sha256") == invocation.receipt_sha256
+                and waiver.get("execution_receipt_ref") == invocation.execution_receipt_ref
+                and waiver.get("execution_receipt_sha256") == invocation.execution_receipt_sha256
+                and waiver.get("execution_outcome") == invocation.execution_outcome
+                and waiver.get("tokens_known") is False
+                and ledger is not None
+                and waiver.get("ledger_id") == ledger[0]
+                and tuple(ledger[1:4]) == (0, 0, 0)
+                and float(ledger[5]) == 0.0
+                and isinstance(stop_payload, dict)
+                and stop_payload.get("reason") == "cost_accounting_failed"
+                and stop_payload.get("runner_call_id") == invocation.runner_call_id
+                and isinstance(release_payload, dict)
+                and release_payload.get("global_stop_id") == waiver.get("global_stop_id")
+                and release_payload.get("runner_call_id") == invocation.runner_call_id
+            )
+            if valid:
+                return
+            raise ExecutionRecoveryError(
+                f"runner_call {invocation.runner_call_id} cost accounting waiver 锚不一致")
+        if waivers:
+            raise ExecutionRecoveryError(
+                f"runner_call {invocation.runner_call_id} cost accounting waiver 非 exactly-once")
         if ledger_rows or decisions:
             raise ExecutionRecoveryError(
                 f"runner_call {invocation.runner_call_id} provider accounting 非 exactly-once")
@@ -487,6 +630,151 @@ class ExecutionReconciler:
         if row[1] not in ("cost_accounting", "orphaned_query_intent") or stopped is None:
             raise ExecutionRecoveryError(
                 f"runner_call {invocation.runner_call_id} 有 provider receipt 却既未入账也未 fail-closed")
+
+    def waive_unavailable_provider_usage(self, runner_call_id: int) -> Dict[str, int]:
+        """Append an operator-authorized zero-charge disposition and release.
+
+        This is deliberately narrower than a generic stop override.  It accepts
+        only an already reconciled failed runner whose immutable provider
+        receipt says token usage is unknown and whose guardian outcome is not
+        ``exit``.  The original failure/global stop remain append-only facts;
+        one zero-token ledger row, one exact stop release and one correction
+        record are committed together.  Startup validation already understands
+        and re-verifies this v2 correction on every later owner generation.
+        """
+        if (isinstance(runner_call_id, bool) or not isinstance(runner_call_id, int)
+                or runner_call_id <= 0):
+            raise ValueError("runner_call_id 须为正整数")
+        row = self.daemon.query_one(
+            "SELECT cycle_id,phase,purpose,status,failure_kind FROM runner_call WHERE id=?",
+            (runner_call_id,))
+        if row is None:
+            raise ExecutionRecoveryError(
+                f"runner_call {runner_call_id} 不存在，不能执行成本 waiver")
+        cycle_id, phase, purpose, status, failure_kind = row
+        provider_path = self.receipt_dir / f"provider-invocation-rc{runner_call_id}.json"
+        invocation = load_provider_invocation_receipt(
+            provider_path, expected_runner_call_id=runner_call_id,
+            expected_cycle_id=f"c{cycle_id}", expected_phase=phase,
+            expected_purpose=purpose)
+        if invocation.usage.tokens_known is not False:
+            raise ExecutionRecoveryError(
+                f"runner_call {runner_call_id} token usage 已知，不得 waiver")
+        if invocation.execution_outcome == "exit":
+            raise ExecutionRecoveryError(
+                f"runner_call {runner_call_id} execution=exit，不得按中断 waiver")
+
+        existing = self.daemon.query(
+            "SELECT id,payload_json FROM decision WHERE actor='orchestrator' "
+            "AND type='cost_accounting_waiver_correction' AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.runner_call_id')=? ORDER BY id",
+            (runner_call_id,))
+        if existing:
+            if len(existing) != 1:
+                raise ExecutionRecoveryError(
+                    f"runner_call {runner_call_id} 已有多个成本 waiver")
+            self._validate_terminal_provider(invocation)
+            payload = json.loads(existing[0][1])
+            return {
+                "waiver_decision_id": int(existing[0][0]),
+                "release_decision_id": int(payload["release_decision_id"]),
+                "ledger_id": int(payload["ledger_id"]),
+            }
+
+        if status != "failed" or failure_kind != "cost_accounting":
+            raise ExecutionRecoveryError(
+                f"runner_call {runner_call_id} 不是 failed/cost_accounting")
+        with self.daemon.transaction() as conn:
+            current = conn.execute(
+                "SELECT cycle_id,phase,purpose,status,failure_kind FROM runner_call WHERE id=?",
+                (runner_call_id,)).fetchone()
+            if current != row:
+                raise ExecutionRecoveryError(
+                    f"runner_call {runner_call_id} waiver 前状态漂移")
+            stop = active_global_stop(conn)
+            if stop is None:
+                raise ExecutionRecoveryError("没有可释放的 active global_stop")
+            stop_id, stop_payload = stop
+            if (stop_payload.get("reason") != "cost_accounting_failed"
+                    or stop_payload.get("runner_call_id") != runner_call_id):
+                raise ExecutionRecoveryError(
+                    "active global_stop 不属于本次未知成本调用")
+            if conn.execute(
+                    "SELECT 1 FROM ledger WHERE runner_call_id=? LIMIT 1",
+                    (runner_call_id,)).fetchone() is not None:
+                raise ExecutionRecoveryError(
+                    f"runner_call {runner_call_id} 已有 ledger，不得 waiver")
+            if conn.execute(
+                    "SELECT 1 FROM decision WHERE actor='orchestrator' "
+                    "AND type='provider_invocation_accounted' AND json_valid(payload_json) "
+                    "AND json_extract(payload_json,'$.runner_call_id')=? LIMIT 1",
+                    (runner_call_id,)).fetchone() is not None:
+                raise ExecutionRecoveryError(
+                    f"runner_call {runner_call_id} 已有 provider accounting")
+            reconciled = conn.execute(
+                "SELECT payload_json FROM decision WHERE actor='orchestrator' "
+                "AND type='execution_reconciled' AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.db_owner_kind')='runner_call' "
+                "AND json_extract(payload_json,'$.db_owner_id')=? ORDER BY id",
+                (runner_call_id,)).fetchall()
+            if len(reconciled) != 1:
+                raise ExecutionRecoveryError(
+                    f"runner_call {runner_call_id} 缺唯一 execution reconciliation")
+            reconciliation = json.loads(reconciled[0][0])
+            if (reconciliation.get("recovery_action") != "provider_usage_unaccounted"
+                    or reconciliation.get("failure_kind") != "cost_accounting"
+                    or reconciliation.get("provider_receipt_ref") != invocation.receipt_ref
+                    or reconciliation.get("provider_receipt_sha256") != invocation.receipt_sha256
+                    or reconciliation.get("receipt_ref") != invocation.execution_receipt_ref
+                    or reconciliation.get("receipt_sha256") != invocation.execution_receipt_sha256
+                    or reconciliation.get("outcome") != invocation.execution_outcome):
+                raise ExecutionRecoveryError(
+                    f"runner_call {runner_call_id} reconciliation 与 provider receipt 锚不一致")
+
+            ledger_id = conn.execute(
+                "INSERT INTO ledger(cycle_id,phase,runner_call_id,tokens_input,tokens_output,"
+                "tokens_total,wallclock_sec,money,policy_version) "
+                "VALUES (?,?,?,0,0,0,?,0,?)",
+                (cycle_id, phase, runner_call_id,
+                 float(invocation.usage.wallclock_sec),
+                 self.cost_ledger.policy_version)).lastrowid
+            release_payload = {
+                "protocol": "global-stop-release-v1",
+                "global_stop_id": stop_id,
+                "runner_call_id": runner_call_id,
+                "reason": "operator_waived_unavailable_usage",
+                "provider_receipt_sha256": invocation.receipt_sha256,
+            }
+            release_id = conn.execute(
+                "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                "VALUES (?,'orchestrator','global_stop_release',?)",
+                (cycle_id, json.dumps(
+                    release_payload, ensure_ascii=False, sort_keys=True))).lastrowid
+            waiver_payload = {
+                "protocol": "cost-accounting-waiver-v2",
+                "runner_call_id": runner_call_id,
+                "global_stop_id": stop_id,
+                "release_decision_id": release_id,
+                "ledger_id": ledger_id,
+                "provider_receipt_ref": invocation.receipt_ref,
+                "provider_receipt_sha256": invocation.receipt_sha256,
+                "execution_receipt_ref": invocation.execution_receipt_ref,
+                "execution_receipt_sha256": invocation.execution_receipt_sha256,
+                "execution_outcome": invocation.execution_outcome,
+                "tokens_known": False,
+                "disposition": "zero_charge_unknown_usage",
+            }
+            waiver_id = conn.execute(
+                "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                "VALUES (?,'orchestrator','cost_accounting_waiver_correction',?)",
+                (cycle_id, json.dumps(
+                    waiver_payload, ensure_ascii=False, sort_keys=True))).lastrowid
+        self._validate_terminal_provider(invocation)
+        return {
+            "waiver_decision_id": int(waiver_id),
+            "release_decision_id": int(release_id),
+            "ledger_id": int(ledger_id),
+        }
 
     def reconcile_startup(self) -> int:
         owners = self._receipts()

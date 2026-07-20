@@ -83,6 +83,26 @@ def test_progress_illegal_transition(env):
         gate.gate_progress_build_target(build_target_id=10, to="running", current_subject_hash="x")  # 跳过 smoke
 
 
+def test_code_review_can_be_disabled_without_weakening_lifecycle(env):
+    default_gate, d = env
+    gate = ExecGate(d, default_gate.read, require_code_review=False)
+    gate.gate_start_build_target(build_target_id=10)
+    with pytest.raises(GateReject, match="非法迁移"):                 # 关闭评审也不能跳过 smoke
+        gate.gate_progress_build_target(build_target_id=10, to="running")
+    gate.gate_progress_build_target(build_target_id=10, to="smoke")
+    assert gate.review_passed(                                      # 关闭不伪造 durable review
+        build_target_id=10, review_kind="bundle_code_review",
+        current_subject_hash="absent") is False
+    gate.gate_progress_build_target(build_target_id=10, to="running")
+    assert d.query_one("SELECT status FROM build_target WHERE id=10")[0] == "running"
+
+
+def test_review_policy_requires_explicit_booleans(env):
+    gate, d = env
+    with pytest.raises(TypeError, match="显式 bool"):
+        ExecGate(d, gate.read, require_code_review=0)
+
+
 def test_start_non_pending_and_wrong_order(env):
     gate, d = env
     with d.transaction() as conn:   # 直接把 bt10 置 complete → bt11 成为当前目标

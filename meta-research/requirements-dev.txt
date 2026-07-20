@@ -1,7 +1,4 @@
-# 自验测试依赖（M0）。运行：python -m pip install -r requirements-dev.txt
+# 开发与部署自验依赖。运行：python -m pip install -r requirements-dev.txt
 # 本机注：pip 走 ivolces 镜像源须不带代理（与 codex 需代理相反）。
+-r requirements-runtime.txt
 pytest>=7
-jsonschema>=4.18   # draft 2020-12 校验（$ref 注册表 M1 起用 referencing.Registry）
-PyYAML>=6
-numpy>=1.24       # qualification SEED/DREAMER safe-array adapters
-scipy>=1.10       # trusted MAT reader used only by qualification data preparation

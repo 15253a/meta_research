@@ -473,10 +473,7 @@ class PythonWheelImageBuilder(
             if self._engine_identity() != engine_identity:
                 raise RepositoryTransportError(
                     "dependency image Docker engine identity 在 build/save 期间漂移")
-            payload_environment = {
-                **self.bootstrap_sandbox.config["payload_environment"],
-                "PYTHONPATH": self.config["site_packages_path"],
-            }
+            payload_environment = dict(derived.config["payload_environment"])
             runtime_receipt = {
                 "identity": runtime_value,
                 "runtime_log_sha256": "sha256:" + runtime_result["log_sha256"],

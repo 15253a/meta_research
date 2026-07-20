@@ -7,7 +7,7 @@
 ④ 驱动器造假的 evaluation/log/观测 必须标 source=fake / synthetic=true；
 ⑤ 只验流程契约、不验不变量（本脚本不做 I1–I6 断言——那是 M1 验收）。
 
-用法：/root/miniconda3/bin/python scripts/run_m0_acceptance.py [--cycles 4] [--work DIR]
+用法：<项目根>/runtime/environments/meta-research/bin/python scripts/run_m0_acceptance.py [--cycles 4] [--work DIR]
 产出：<work>/m0_acceptance_report.md（验收证据，供 build_log 引用）。退出码 0=全过。
 """
 from __future__ import annotations
@@ -49,16 +49,17 @@ def check(cond: bool, msg: str, failures: list) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cycles", type=int, default=4, help="轮数（M0 验收要求 3–5）")
-    ap.add_argument("--work", type=Path, default=SYSTEM_ROOT / "questions" / "toy")
+    self_test_root = SYSTEM_ROOT / "runtime" / "self-test"
+    ap.add_argument("--work", type=Path, default=self_test_root / "m0")
     ap.add_argument("--keep", action="store_true", help="保留已有 work 目录（默认清空重跑）")
     args = ap.parse_args()
     assert 3 <= args.cycles <= 5, "M0 验收要求 3–5 轮"
 
     work = args.work.resolve()
-    questions_root = (SYSTEM_ROOT / "questions").resolve()
+    allowed_root = self_test_root.resolve()
     # 破坏性操作护栏：不得用 assert（python -O 会剥掉），显式拒绝
-    if not str(work).startswith(str(questions_root) + "/"):
-        raise SystemExit(f"--work 必须位于 {questions_root} 之下（防误删任意目录）: {work}")
+    if not str(work).startswith(str(allowed_root) + "/"):
+        raise SystemExit(f"--work 必须位于 {allowed_root} 之下（防误删任意目录）: {work}")
     if work.exists() and not args.keep:
         shutil.rmtree(work)
     args.work = work

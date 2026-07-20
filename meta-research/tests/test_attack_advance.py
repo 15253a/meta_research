@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -41,12 +44,27 @@ from orchestrator.import_triggers import (
 from orchestrator.question_progress import INCONCLUSIVE_PROTOCOL
 from orchestrator.importer import DeferredImporter
 from orchestrator.manifest import canon_hash as manifest_canon
+from orchestrator.pool_publication import PoolPublisher, is_formally_published
 from orchestrator.schemas import SchemaSet
 from orchestrator.statestore_sqlite import SQLiteStateStore
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+# Most attack state-machine fixtures intentionally exercise the historical CPU
+# path with a host runner.  Keep that unit-test deployment in planner-select
+# mode; dedicated tests below exercise the production policy's required-GPU
+# artifact boundary without turning every unrelated crash-recovery fixture into
+# a CUDA integration test.
+POLICY["resources"] = {
+    **POLICY["resources"], "gpus": 0, "gpu_mem_gb": 0,
+    "gpu_target_policy": "planner_select", "allowed_device_indices": [],
+}
+# The production/default profile deliberately leaves Bundle engineering repair
+# unbounded.  Most fixtures in this file inject permanently broken programs to
+# exercise the historical terminal path, so retain an explicit bounded profile
+# for those fixtures and cover the new ``null`` behavior in a dedicated test.
+POLICY["flow"]["retry"]["bundle_repair"] = 2
 OBS = POLICY["observation"]
 RUNTIME_ENV_HASH = sandbox_environment_hash(POLICY["execution"]["sandbox"])
 
@@ -75,20 +93,35 @@ def _idea_set():
             "unexpectedness": 6, "non_obviousness": 7}
     _low = {"structural_depth": 3, "domain_distance": 3, "applicability": 3, "novelty": 2,
             "unexpectedness": 2, "non_obviousness": 3}
-    _NS = "联网粗查已启用·文献级待人工验证"
+    _NS = "联网查重未启用·文献级待验证"
+    _PROVENANCE = {
+        "engine_version": "wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598",
+        "adapter_version": "meta-research-wildidea-adapter-v1",
+        "prompt_hash": "sha256:" + "1" * 64,
+        "judge_prompt_hash": "sha256:" + "2" * 64,
+        "model": "gpt-5.6",
+        "sampling": {"seed": 7, "temperature": 1.0},
+    }
     return {"idea_set.json": {
         "candidates": [
             {"candidate_id": "cand-1", "generation_path": "bypass", "audit_mapping": _am,
              "core_claim": "线性基线可达 0.9", "mechanism": "最小二乘拟合", "assumptions": ["数据近似线性可分"],
              "min_falsifiable_experiment": "训练线性模型，acc<0.9 即否证", "novelty_type": "训练目标",
              "novelty_status": _NS},
-            {"candidate_id": "cand-2", "generation_path": "bypass", "audit_mapping": _am,
+            {"candidate_id": "cand-2", "generation_path": "wildidea", "audit_mapping": _am,
              "core_claim": "弱想法", "mechanism": "随机猜", "assumptions": ["无"],
-             "min_falsifiable_experiment": "无对照", "novelty_type": "训练目标", "novelty_status": _NS}],
+             "min_falsifiable_experiment": "无对照", "novelty_type": "训练目标", "novelty_status": _NS,
+             "wildidea_extra": {
+                 "source_isof": "输入=种子；状态=随机态；输出=猜测；反馈=无",
+                 "source_prototype": "P02 无反馈随机选择",
+                 "deanchor_level": "成立", "degenerate_form": "随机猜测",
+                 "nearest_neighbor_diff": "与随机基线没有实质差异",
+                 "strongest_rebuttal": "只是随机基线换名",
+             }}],
         "audit_scores": [
             {"candidate_id": "cand-1", "scores": _six, "decision": "pass", "rationale": "结构深"},
             {"candidate_id": "cand-2", "scores": _low, "decision": "fail", "rationale": "太浅"}],
-        "selected_id": "cand-1", "novelty_refs": []}}
+        "selected_id": "cand-1", "novelty_refs": [], "provenance": _PROVENANCE}}
 
 
 def _plan_json(ck="ck-attack", slug="toy-b"):
@@ -97,7 +130,8 @@ def _plan_json(ck="ck-attack", slug="toy-b"):
         "needs": [{"need_id": "n1", "statement_md": "toy 基线可达 0.9"}],
         "reuse_evidence": [],
         "targets": [{"target_key": "t1", "target_kind": "build", "seq": 1, "critical": True,
-                     "budget_estimate": 1.0, "spec_md": "训练线性 toy 基线并出厂评估", "need_ids": ["n1"],
+                     "budget_estimate": 1.0, "gpu_required": False,
+                     "spec_md": "训练线性 toy 基线并出厂评估", "need_ids": ["n1"],
                      "claim": {"canonical_key": ck, "slug": slug}}],
         "protocol": {"name": "toy-proto", "version": 1,
                      "scope_spec": {"dataset": "toy", "split": "holdout"}, "smoke_md": "快速跑一步"},
@@ -199,18 +233,26 @@ def _plan_review_provider(daemon, verdicts, calls):
     return review
 
 
-def _mk_env(path, work, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_body=SMOKE_OK):
+def _mk_env(path, work, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_body=SMOKE_OK,
+            formal_pool=False):
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY)
     compiler = SqliteCompiler(db.connect(path), POLICY)
-    pool = PoolGate(daemon, open_gate_read_conn(path))
+    publisher = None
+    if formal_pool:
+        Path(work).mkdir(parents=True, exist_ok=True)
+        publisher = PoolPublisher(work)
+    pool = PoolGate(
+        daemon, open_gate_read_conn(path), pool_publisher=publisher,
+        require_formal_publication=formal_pool)
     obs_conn = db.connect(path)
     close_gate = SqliteGate(daemon, open_gate_read_conn(path), SchemaSet(SYSTEM_ROOT / "schemas"),
                             parser_suspect=lambda aid: OP.suspect_for_attempt(obs_conn, aid, OBS))
     bundle = _bundle_provider(daemon, train_body=train_body, eval_body=eval_body, smoke_body=smoke_body)
     attack = AttackStages(state=state, compiler=compiler, pool_gate=pool, close_gate=close_gate,
                           providers=_providers(daemon, bundle=bundle), obs_policy=OBS, work_root=str(work),
-                          schemas=SchemaSet(SYSTEM_ROOT / "schemas"), policy=POLICY)
+                          schemas=SchemaSet(SYSTEM_ROOT / "schemas"), policy=POLICY,
+                          pool_publisher=publisher)
     return daemon, state, compiler, attack
 
 
@@ -225,6 +267,24 @@ def _bootstrap_attack(state):
         state.persist_selection(c0.cycle_id, __import__("orchestrator.interfaces", fromlist=["Selection"]).Selection(
             next_question_id="r", next_intent="attack", scores=[]))
         state.mark_cycle_done(c0.cycle_id)
+
+
+def _assert_bundle_repair_exhausted(daemon, failure_kind):
+    """Zero-cost test providers must still consume the real, non-zero repair policy."""
+    limit = POLICY["flow"]["retry"]["bundle_repair"]
+    payloads = [json.loads(row[0]) for row in daemon.query(
+        "SELECT payload_json FROM decision "
+        "WHERE actor='orchestrator' AND type='bundle_repair_requested' ORDER BY id")]
+    assert len(payloads) == limit
+    assert [payload["round_no"] for payload in payloads] == list(range(1, limit + 1))
+    assert all(payload["repair_limit"] == limit for payload in payloads)
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM build_target")[:2] == (
+            "engineering_blocked", failure_kind)
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit "
+        "WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    return payloads
 
 
 @pytest.fixture()
@@ -300,6 +360,78 @@ def test_manifest_runtime_uses_only_baseline_bound_resolver(env, monkeypatch):
 
 
 # ============ 全链 e2e ============
+def test_plan_cannot_delegate_research_identity_or_readout_to_orchestrator(env):
+    """A short target is not a plan: research identity/protocol/readout stay with Codex."""
+    raw = {
+        "targets": [
+            {"target_kind": "build", "spec_md": "运行基线"},
+            {"target_kind": "build", "spec_md": "运行随机子空间", "gpu_required": True},
+        ],
+        "protocol": {
+            "name": "eeg-lodo",
+            "scope_spec": {"split": "subject-disjoint", "seeds": [1, 2, 3]},
+        },
+        "metric_defs": [{"name": "macro-F1", "direction": "higher"}],
+    }
+    errors = list(SchemaSet(SYSTEM_ROOT / "schemas").validator("plan").iter_errors(raw))
+    rendered = "\n".join(error.message for error in errors)
+    assert "needs" in rendered
+    assert "target_key" in rendered
+    assert "claim" in rendered
+    assert "version" in rendered
+    assert "readout_rules" in rendered
+
+
+def _plan_contract_validator(tmp_path, target_policy):
+    policy = json.loads(json.dumps(POLICY))
+    policy["resources"]["gpu_target_policy"] = target_policy
+    if target_policy == "forbidden":
+        policy["resources"].update({
+            "gpus": 0, "gpu_mem_gb": 0, "allowed_device_indices": []})
+    elif target_policy == "required":
+        policy["resources"].update({
+            "gpus": 1, "gpu_mem_gb": 80, "allowed_device_indices": [0]})
+    return AttackStages(
+        state=None, compiler=None, pool_gate=None, close_gate=None,
+        providers={}, obs_policy={}, work_root=str(tmp_path),
+        schemas=SchemaSet(SYSTEM_ROOT / "schemas"), policy=policy)
+
+
+def test_plan_gpu_target_policy_normalizes_new_targets_without_model_retry(tmp_path):
+    cpu_plan = _plan_json()["plan.json"]
+    required = _plan_contract_validator(tmp_path / "required", "required")
+    required._validate_plan_schema(cpu_plan)
+    assert cpu_plan["targets"][0]["gpu_required"] is True
+    gpu_plan = json.loads(json.dumps(cpu_plan))
+    gpu_plan["targets"][0]["gpu_required"] = True
+    required._validate_plan_schema(gpu_plan)
+
+    forbidden = _plan_contract_validator(tmp_path / "forbidden", "forbidden")
+    forbidden._validate_plan_schema(gpu_plan)
+    assert gpu_plan["targets"][0]["gpu_required"] is False
+
+    planner_select = _plan_contract_validator(
+        tmp_path / "planner-select", "planner_select")
+    cpu_select = _plan_json()["plan.json"]
+    gpu_select = json.loads(json.dumps(cpu_select))
+    gpu_select["targets"][0]["gpu_required"] = True
+    planner_select._validate_plan_schema(cpu_select)
+    planner_select._validate_plan_schema(gpu_select)
+    assert cpu_select["targets"][0]["gpu_required"] is False
+    assert gpu_select["targets"][0]["gpu_required"] is True
+
+
+def test_required_gpu_policy_applies_to_reuse_only_evaluations(tmp_path):
+    plan = json.loads((
+        SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan"
+        / "reuse_only.json").read_text(encoding="utf-8"))
+    required = _plan_contract_validator(tmp_path, "required")
+    with pytest.raises(AS._PlanReject, match="evaluations"):
+        required._validate_plan_schema(plan)
+    plan["reuse_evidence"][0]["gpu_required"] = True
+    required._validate_plan_schema(plan)
+
+
 def test_full_attack_cycle(env):
     d = env["daemon"]
     ids = env["adv"].run_cycles(max_cycles=4)
@@ -307,6 +439,23 @@ def test_full_attack_cycle(env):
     # idea 入表（含 failed 候选——防重复造轮全量入账）
     assert d.query_one("SELECT count(*) FROM idea")[0] == 2
     assert d.query_one("SELECT count(*) FROM idea WHERE status='selected'")[0] == 1
+    # 每候选 audit_json 保持旧 audit 字段在顶层，同时带 pinned engine provenance；
+    # wildidea 专属元数据只落到对应候选，bypass 不污染。
+    idea_audits = [json.loads(r[0]) for r in d.query(
+        "SELECT audit_json FROM idea ORDER BY id")]
+    assert idea_audits[0]["candidate_id"] == "cand-1"
+    assert idea_audits[0]["scores"]["structural_depth"] == 8
+    assert idea_audits[0]["provenance"]["engine_version"] == (
+        "wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598")
+    assert "wildidea_extra" not in idea_audits[0]
+    assert idea_audits[1]["candidate_id"] == "cand-2"
+    assert idea_audits[1]["wildidea_extra"]["source_prototype"].startswith("P02")
+    audit_decision = json.loads(d.query_one(
+        "SELECT payload_json FROM decision WHERE actor='judge' AND type='idea_audit'")[0])
+    assert audit_decision["protocol"] == "idea-audit-v1"
+    assert audit_decision["candidate_ids"] == ["cand-1", "cand-2"]
+    assert audit_decision["selected_id"] == "cand-1"
+    assert audit_decision["provenance_hash"].startswith("sha256:")
     # plan 落 target + 池占位 → bundle 全链后 complete + legal
     assert d.query_one("SELECT status FROM build_target WHERE target_kind='build'")[0] == "complete"
     assert d.query_one("SELECT status FROM baseline WHERE canonical_key='ck-attack'")[0] == "legal"
@@ -329,6 +478,596 @@ def test_full_attack_cycle(env):
     assert d.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
     # cycle 终态 done
     assert env["state"].last_done_cycle().next_intent == "terminate"
+
+
+def test_resident_bundle_uses_one_cycle_wide_provider_turn_and_async_worker(
+        tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+    assert cyc.status == "plan"
+
+    materialize = attack.p["bundle"]
+    provider_calls = []
+
+    def resident_bundle(main_cyc, initial_pack):
+        provider_calls.append(initial_pack.target_id)
+        cycle_scope = SimpleNamespace(
+            cycle_id=main_cyc.cycle_id, stage="bundle", target_id=None)
+        bound = attack.bind_next_bundle_target(cycle_scope)
+        assert bound["cycle_complete"] is False
+        assert "anchor_md" not in bound["context_pack"]
+        index_path = Path(bound["context_pack"]["index_ref"])
+        assert index_path.is_file()
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        assert index["pack_hash"] == bound["context_pack"]["pack_hash"]
+        assert index["target_id"] == str(bound["build_target_id"])
+
+        target_scope = SimpleNamespace(
+            cycle_id=main_cyc.cycle_id, stage="bundle",
+            target_id=str(bound["build_target_id"]))
+        files = materialize(main_cyc, initial_pack)
+        started = attack.execute_bundle_session(target_scope, files)
+        assert "worker_running" in started
+        with attack._bundle_session_lock:  # noqa: SLF001 - lifecycle contract
+            ci = int(main_cyc.cycle_id[1:])
+            assert attack._bundle_cycle_sessions[ci]["worker"].daemon is False
+        deadline = time.monotonic() + 20
+        while True:
+            status = attack.bundle_session_status(target_scope)
+            if not status["worker_running"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert status["controller_error"] is None
+        assert status["terminal"] is True
+        complete = attack.bind_next_bundle_target(cycle_scope)
+        assert complete["cycle_complete"] is True
+        # The return envelope is compatibility noise; the resident outer stage
+        # consumes only MCP/DB state and never treats it as another target.
+        return files
+
+    attack.p["bundle"] = resident_bundle
+    attack.enable_resident_bundle_session()
+    assert attack.advance_stage(cyc) == "reasoning"
+    assert provider_calls == ["1"]
+    assert state.cycle(cyc.cycle_id).status == "bundle"
+    assert daemon.query_one(
+        "SELECT status FROM build_target ORDER BY id LIMIT 1") == ("complete",)
+    attack.close()
+
+
+def test_resident_bundle_top_level_replan_continues_through_reasoning(tmp_path):
+    """A main-turn protocol diagnosis is a Bundle outcome, never an owner crash."""
+    from orchestrator.interfaces import BundleReplanRequired
+
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "work")
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+
+    def replan(_cyc, _pack):
+        raise BundleReplanRequired({
+            "summary_md": "冻结量表缺少 score 上下界，工程代码无法补足"})
+
+    reasoning_calls = []
+
+    def reasoning(_cyc, _pack):
+        reasoning_calls.append(_cyc.cycle_id)
+        return {"selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": [],
+            "terminate_reason_md": "本轮协议信息不足，Reasoning 收口",
+        }}
+
+    attack.p["bundle"] = replan
+    attack.p["reasoning"] = reasoning
+    attack.enable_resident_bundle_session()
+
+    assert attack.advance_stage(cyc) == "reasoning"
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM build_target")[:2] == (
+            "engineering_blocked", "protocol_violation")
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_replan_required'") == (1,)
+    assert state.cycle(cyc.cycle_id).status == "bundle"
+
+    assert attack.advance_stage(state.cycle(cyc.cycle_id)) == "done"
+    assert reasoning_calls == [cyc.cycle_id]
+    assert state.cycle(cyc.cycle_id).status == "done"
+    attack.close()
+    daemon.conn.close()
+
+
+def test_bundle_close_is_retryable_until_post_execution_worker_joins(tmp_path):
+    attack = _plan_contract_validator(tmp_path, "planner_select")
+    release = threading.Event()
+    worker = threading.Thread(
+        target=lambda: release.wait(5), name="bundle-close-test", daemon=False)
+    with attack._bundle_session_lock:  # noqa: SLF001 - lifecycle fixture
+        attack._bundle_worker_threads.add(worker)
+    worker.start()
+    with pytest.raises(RuntimeError, match="close deadline"):
+        attack.close(timeout_s=0.01)
+    assert attack._bundle_closed is False  # noqa: SLF001
+    assert attack._bundle_accepting is False  # noqa: SLF001
+    release.set()
+    attack.close(timeout_s=2)
+    assert attack._bundle_closed is True  # noqa: SLF001
+    assert not worker.is_alive()
+
+
+def test_resident_plan_preflight_and_import_search_stay_in_current_cycle(
+        tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    _daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert cyc.status == "idea"
+    attack.enable_resident_plan_session()
+    scope = SimpleNamespace(
+        cycle_id=cyc.cycle_id, stage="plan", target_id=None)
+
+    plan = _plan_json()["plan.json"]
+    checked = attack.preflight_plan_session(scope, plan)
+    assert checked == {"kind": "execution", "target_count": 1}
+    bad = json.loads(json.dumps(plan))
+    bad["targets"][0]["seq"] = 2
+    with pytest.raises(AS._PlanReject, match="连续依赖序"):
+        attack.preflight_plan_session(scope, bad)
+
+    seen = []
+
+    def import_search(search_cyc, request, pack):
+        seen.append((search_cyc.cycle_id, request, pack.pack_hash))
+        return {
+            "request_hash": "sha256:" + "1" * 64,
+            "result_hash": "sha256:" + "2" * 64,
+            "candidate_count": 0, "skipped_count": 0,
+            "candidate_ids": [], "license_review_ids": [],
+        }
+
+    attack.p["import_search"] = import_search
+    request = {
+        "version": 1, "trigger_kind": "new_structure",
+        "query": "reproducible toy linear baseline",
+        "need_summary": "find an external implementation candidate",
+    }
+    result = attack.run_plan_import_search(scope, request)
+    assert len(seen) == 1 and seen[0][0] == cyc.cycle_id
+    assert result["search"]["candidate_count"] == 0
+    index = Path(result["context_pack"]["index_ref"])
+    assert index.is_file()
+    assert json.loads(index.read_text(encoding="utf-8"))["stage"] == "plan"
+    assert state.cycle(cyc.cycle_id).status == "idea"
+
+
+def test_resident_reasoning_semantic_preflight_is_exact_and_read_only(tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "work")
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert cyc is not None and cyc.route == "attack"
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE cycle SET status='bundle' WHERE id=?", (int(cyc.cycle_id[1:]),))
+    attack.enable_resident_reasoning_session()
+    scope = SimpleNamespace(
+        cycle_id=cyc.cycle_id, stage="reasoning", target_id=None)
+    valid = {
+        "tree_ops.json": {"ops": []},
+        "selection.json": {
+            "next_question_id": "q1", "next_intent": "attack", "scores": [],
+        },
+    }
+
+    assert attack.preflight_reasoning_session(scope, valid) == {
+        "kind": "attack", "writes_performed": 0,
+    }
+    # The dry-run momentarily marks Qn inconclusive before checking selection,
+    # exactly like the final transaction, but its sentinel rolls every write and
+    # in-memory local-key projection back.
+    assert daemon.query_one(
+        "SELECT status,visit_count FROM question WHERE id=1") == ("active", 0)
+    assert daemon.query_one(
+        "SELECT status,next_question_id,next_intent FROM cycle WHERE id=?",
+        (int(cyc.cycle_id[1:]),)) == ("bundle", None, None)
+
+    invalid = json.loads(json.dumps(valid))
+    invalid["selection.json"]["next_question_id"] = "q999"
+    with pytest.raises(Exception, match="不存在|不可调度"):
+        attack.preflight_reasoning_session(scope, invalid)
+    assert daemon.query_one(
+        "SELECT status,visit_count FROM question WHERE id=1") == ("active", 0)
+
+
+def _bundle_operator_action(control, action):
+    """Echo one server-authored control identity with only the permitted choice."""
+    return {"bundle_operator_action.json": {
+        "version": 1,
+        "build_target_id": control["build_target_id"],
+        "phase": control["phase"],
+        "event": control["event"],
+        "action": action,
+        "execution_owner": control["execution_owner"],
+        "plan_slice_hash": control["plan_slice_hash"],
+        "source_tree_hash": control["source_tree_hash"],
+        "subject_hash": control["subject_hash"],
+        "diagnosis_md": f"test operator {action}",
+    }}
+
+
+def test_bundle_operator_starts_and_accepts_all_phases_without_bypassing_gates_or_sql(
+        tmp_path):
+    """Operator owns start/terminal choices; original reviews and SQL legality still decide success."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(path, work, formal_pool=True)
+    _bootstrap_attack(state)
+    calls = []
+
+    def operator(_cyc, _pack, control):
+        calls.append(json.loads(json.dumps(control)))
+        phase, event = control["phase"], control["event"]
+        owner = control["execution_owner"]
+        if event == "start":
+            target_status = daemon.query_one(
+                "SELECT status FROM build_target WHERE id=?",
+                (control["build_target_id"],))[0]
+            if phase == "smoke":
+                assert owner == {
+                    "kind": "build_target", "id": control["build_target_id"]}
+                assert target_status == "building"
+            elif phase == "train":
+                assert owner["kind"] == "run" and target_status == "running"
+                assert daemon.query_one(
+                    "SELECT status FROM run WHERE id=?", (owner["id"],))[0] == "running"
+                assert daemon.query_one(
+                    "SELECT count(*) FROM decision WHERE actor='judge' "
+                    "AND type='bundle_code_review'")[0] == 1
+            else:
+                assert owner["kind"] == "evaluation_attempt" and target_status == "running"
+                assert daemon.query_one(
+                    "SELECT status FROM evaluation_attempt WHERE id=?",
+                    (owner["id"],))[0] == "running"
+                assert daemon.query_one(
+                    "SELECT status FROM run ORDER BY id DESC LIMIT 1")[0] == "success"
+                assert daemon.query_one(
+                    "SELECT count(*) FROM decision WHERE actor='judge' "
+                    "AND type='bundle_result_review'")[0] == 0
+        return _bundle_operator_action(
+            control, {"start": "start", "progress": "continue",
+                      "terminal": "accept"}[event])
+
+    attack.p["bundle_operator"] = operator
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+
+    assert len(ids) == 1
+    assert [(item["phase"], item["event"]) for item in calls] == [
+        ("smoke", "start"), ("smoke", "terminal"),
+        ("train", "start"), ("train", "terminal"),
+        ("eval", "start"), ("eval", "terminal"),
+    ]
+    assert all(item["log"]["state"] == "not_started" for item in calls[::2])
+    assert all(item["log"]["state"] == "final" for item in calls[1::2])
+    assert all(item["log"]["exit_code"] == 0 for item in calls[1::2])
+
+    decisions = daemon.query(
+        "SELECT id,actor,type,payload_json FROM decision "
+        "WHERE type IN ('bundle_operator_action','bundle_code_review',"
+        "'bundle_result_review') ORDER BY id")
+    operator_rows = [
+        (row[0], json.loads(row[3])) for row in decisions
+        if row[1:3] == ("agent", "bundle_operator_action")]
+    assert [(payload["phase"], payload["event"], payload["model_action"]["action"])
+            for _decision_id, payload in operator_rows] == [
+        ("smoke", "start", "start"), ("smoke", "terminal", "accept"),
+        ("train", "start", "start"), ("train", "terminal", "accept"),
+        ("eval", "start", "start"), ("eval", "terminal", "accept"),
+    ]
+    review_rows = {
+        row[2]: (row[0], json.loads(row[3])) for row in decisions if row[1] == "judge"}
+    assert set(review_rows) == {"bundle_code_review", "bundle_result_review"}
+    assert all(payload["verdict"] == "pass" for _decision_id, payload in review_rows.values())
+    operator_ids = {(payload["phase"], payload["event"]): decision_id
+                    for decision_id, payload in operator_rows}
+    assert operator_ids[("smoke", "terminal")] < review_rows["bundle_code_review"][0]
+    assert review_rows["bundle_code_review"][0] < operator_ids[("train", "start")]
+    assert operator_ids[("eval", "terminal")] < review_rows["bundle_result_review"][0]
+
+    assert daemon.query_one("SELECT status FROM build_target") == ("complete",)
+    assert daemon.query_one("SELECT status FROM run") == ("success",)
+    assert daemon.query_one("SELECT status FROM evaluation") == ("success",)
+    assert daemon.query_one("SELECT status FROM evaluation_attempt") == ("success",)
+    assert daemon.query_one("SELECT value FROM metric_result") == (0.93,)
+    baseline_id, baseline_status = daemon.query_one("SELECT id,status FROM baseline")
+    variant_id, variant_status = daemon.query_one("SELECT id,status FROM variant")
+    assert baseline_status == variant_status == "legal"
+    assert is_formally_published(daemon.conn, variant_id=variant_id)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE actor='gate' "
+        "AND type='pool_publication'") == (1,)
+    daemon.conn.close()
+
+
+def test_bundle_operator_smoke_terminal_repair_reuses_existing_repair_loop_then_succeeds(
+        tmp_path):
+    """A zero-exit smoke rejected by the operator repairs once, reruns, and reaches legal SQL state."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    calls = []
+
+    def operator(_cyc, _pack, control):
+        calls.append(json.loads(json.dumps(control)))
+        if (control["phase"], control["event"], control["repair_round"]) == (
+                "smoke", "terminal", 0):
+            action = "repair"
+        else:
+            action = {"start": "start", "progress": "continue",
+                      "terminal": "accept"}[control["event"]]
+        return _bundle_operator_action(control, action)
+
+    attack.p["bundle_operator"] = operator
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+
+    assert len(ids) == 1
+    smoke_calls = [item for item in calls if item["phase"] == "smoke"]
+    assert [(item["event"], item["repair_round"]) for item in smoke_calls] == [
+        ("start", 0), ("terminal", 0), ("start", 1), ("terminal", 1)]
+    smoke_actions = [json.loads(row[0]) for row in daemon.query(
+        "SELECT payload_json FROM decision WHERE actor='agent' "
+        "AND type='bundle_operator_action' "
+        "AND json_extract(payload_json,'$.phase')='smoke' ORDER BY id")]
+    assert [item["model_action"]["action"] for item in smoke_actions] == [
+        "start", "repair", "start", "accept"]
+    request = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE actor='orchestrator' "
+        "AND type='bundle_repair_requested'")[0])
+    assert request["round_no"] == 1 and request["failure_kind"] == "smoke"
+    smoke_receipts = [json.loads(path.read_text()) for path in
+                      work.rglob("execution-*.json")]
+    assert sorted(
+        receipt["context"]["execution_attempt"] for receipt in smoke_receipts
+        if receipt.get("kind") == "manifest-smoke") == [1, 2]
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE actor='orchestrator' "
+        "AND type='bundle_repair_validated'") == (1,)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE actor='judge' "
+        "AND type='bundle_code_review'") == (1,)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE actor='judge' "
+        "AND type='bundle_result_review'") == (1,)
+    assert daemon.query_one("SELECT count(*) FROM run") == (1,)
+    assert daemon.query_one("SELECT count(*) FROM evaluation_attempt") == (1,)
+    assert daemon.query_one("SELECT value FROM metric_result") == (0.93,)
+    assert daemon.query_one("SELECT status FROM build_target") == ("complete",)
+    assert daemon.query_one("SELECT status FROM baseline") == ("legal",)
+    assert daemon.query_one("SELECT status FROM variant") == ("legal",)
+    daemon.conn.close()
+
+
+def test_default_unbounded_bundle_repair_survives_more_than_legacy_limit(tmp_path):
+    """Engineering failures keep returning to the same Bundle owner until code runs."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    bad_bundle = _bundle_provider(
+        daemon, smoke_body="import sys; print('repair me'); sys.exit(2)")
+    good_bundle = _bundle_provider(daemon)
+    calls = []
+
+    def repairing_bundle(cyc, pack):
+        calls.append(pack.target_id)
+        provider = bad_bundle if len(calls) <= 4 else good_bundle
+        return provider(cyc, pack)
+
+    attack.p["bundle"] = repairing_bundle
+    attack.policy = json.loads(json.dumps(attack.policy))
+    attack.policy["flow"]["retry"]["bundle_repair"] = None
+
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+
+    assert len(ids) == 1
+    assert len(calls) == 5
+    repairs = [json.loads(row[0]) for row in daemon.query(
+        "SELECT payload_json FROM decision WHERE actor='orchestrator' "
+        "AND type='bundle_repair_requested' ORDER BY id")]
+    assert [item["round_no"] for item in repairs] == [1, 2, 3, 4]
+    assert all(item["repair_limit"] is None for item in repairs)
+    assert daemon.query_one("SELECT status FROM build_target") == ("complete",)
+    assert daemon.query_one("SELECT status FROM baseline") == ("legal",)
+    assert daemon.query_one("SELECT value FROM metric_result") == (0.93,)
+    daemon.conn.close()
+
+
+def test_bundle_operator_repairs_from_live_smoke_log_then_guardian_drains_and_reruns(
+        tmp_path):
+    """A suspicious partial log is inspected live, cancelled safely, and repaired from smoke."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    bad_bundle = _bundle_provider(
+        daemon,
+        smoke_body=(
+            "import time; print('ERROR injected live smoke bug', flush=True); "
+            "time.sleep(30)"))
+    good_bundle = _bundle_provider(daemon)
+    bundle_calls = [0]
+
+    def repairing_bundle(cyc, pack):
+        bundle_calls[0] += 1
+        return (bad_bundle if bundle_calls[0] == 1 else good_bundle)(cyc, pack)
+
+    operator_calls = []
+
+    def operator(_cyc, _pack, control):
+        operator_calls.append(json.loads(json.dumps(control)))
+        action = {"start": "start", "progress": "continue",
+                  "terminal": "accept"}[control["event"]]
+        if (control["phase"], control["event"], control["repair_round"]) == (
+                "smoke", "progress", 0):
+            assert "ERROR injected live smoke bug" in control["log"]["tail_text"]
+            action = "repair"
+        return _bundle_operator_action(control, action)
+
+    attack.p["bundle"] = repairing_bundle
+    attack.p["bundle_operator"] = operator
+    attack.bundle_operator_poll_s = 0.05
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+
+    assert len(ids) == 1 and bundle_calls[0] == 2
+    assert [(item["event"], item["repair_round"])
+            for item in operator_calls if item["phase"] == "smoke"] == [
+        ("start", 0), ("progress", 0), ("start", 1), ("terminal", 1)]
+    progress = next(item for item in operator_calls
+                    if item["phase"] == "smoke" and item["event"] == "progress")
+    assert progress["log"]["state"] == "partial"
+    assert progress["log"]["size_bytes"] > 0
+    repair = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE actor='orchestrator' "
+        "AND type='bundle_repair_requested'")[0])
+    assert repair["round_no"] == 1 and repair["phase"] == "smoke"
+    receipts = [json.loads(receipt.read_text())
+                for receipt in work.rglob("execution-*.json")]
+    cancelled = [receipt for receipt in receipts
+                 if receipt.get("outcome") == "cancelled"]
+    assert len(cancelled) == 1
+    assert cancelled[0]["state"] == "terminal"
+    assert cancelled[0]["group_drained"] is True
+    assert daemon.query_one("SELECT status FROM build_target") == ("complete",)
+    assert daemon.query_one("SELECT status FROM baseline") == ("legal",)
+    assert daemon.query_one("SELECT status FROM variant") == ("legal",)
+    assert daemon.query_one("SELECT value FROM metric_result") == (0.93,)
+    daemon.conn.close()
+
+
+def test_formal_pool_publication_survives_eval_register_to_legal_crash(tmp_path, monkeypatch):
+    """Production copies first, binds formal refs, and resumes legalisation without eval staging."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(
+        path, work, formal_pool=True)
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    adv.advance(cyc.cycle_id)  # idea
+    adv.advance(cyc.cycle_id)  # plan
+
+    original = attack.gate.gate_register_baseline
+    crashed = {"done": False}
+
+    def crash_after_evaluation(**kwargs):
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("injected post-evaluation crash")
+        return original(**kwargs)
+
+    monkeypatch.setattr(attack.gate, "gate_register_baseline", crash_after_evaluation)
+    with pytest.raises(RuntimeError, match="post-evaluation crash"):
+        adv.advance(cyc.cycle_id)
+    attempt = daemon.query_one(
+        "SELECT id,status,transcript_ref FROM evaluation_attempt")
+    assert attempt[1] == "success"
+    assert attempt[2].startswith("pool/manifests/")
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 1
+    # The source bundle is still needed to resume the target, but the successful
+    # evaluation transcript is now owned by the formal pool, not cN/tN staging.
+    shutil.rmtree(work / "c2" / "t1" / "eval1")
+    adv.advance(cyc.cycle_id)
+
+    variant_id, variant_status = daemon.query_one(
+        "SELECT id,status FROM variant")
+    assert variant_status == "legal"
+    assert is_formally_published(daemon.conn, variant_id=variant_id)
+    baseline = daemon.query_one(
+        "SELECT status,code_ref,commit_hash FROM baseline")
+    assert baseline[0] == "legal"
+    assert baseline[1].startswith("baselines/")
+    assert baseline[2].startswith("sha256-tree-v1:")
+    checkpoint_ref = daemon.query_one("SELECT path FROM checkpoint")[0]
+    assert checkpoint_ref.startswith("baselines/")
+    assert (work / checkpoint_ref).is_file()
+    execution_ref = daemon.query_one(
+        "SELECT ref FROM execution_log WHERE log_kind='eval'")[0]
+    assert execution_ref.startswith("baselines/")
+    assert (work / execution_ref).is_file()
+    assert attack._formal_variant_usable(variant_id) is True
+    # The DB closure remains append-only, but production selection must re-hash
+    # the referenced bytes and fail closed after an out-of-band pool mutation.
+    (work / checkpoint_ref).write_bytes(b"tampered-after-legal")
+    assert is_formally_published(daemon.conn, variant_id=variant_id) is True
+    assert attack._formal_variant_usable(variant_id) is False
+
+
+def test_formal_evaluation_publication_replays_before_registration(tmp_path, monkeypatch):
+    """A crash after atomic file publish adopts the same transcript-bearing attempt tree."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(
+        path, work, formal_pool=True)
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    adv.advance(cyc.cycle_id)
+    adv.advance(cyc.cycle_id)
+
+    original = attack.gate.gate_register_evaluation
+    crashed = {"done": False}
+
+    def crash_before_registration(**kwargs):
+        assert kwargs["publication"] is not None
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("injected pre-registration crash")
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        attack.gate, "gate_register_evaluation", crash_before_registration)
+    with pytest.raises(RuntimeError, match="pre-registration crash"):
+        adv.advance(cyc.cycle_id)
+    assert daemon.query_one(
+        "SELECT status FROM evaluation_attempt")[0] == "running"
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 0
+    attempt_dirs = list((work / "baselines").glob(
+        "*/variants/*/evaluations/*/attempts/1"))
+    assert len(attempt_dirs) == 1
+    assert (attempt_dirs[0] / "transcript.receipt").is_file()
+
+    adv.advance(cyc.cycle_id)
+    variant_id = daemon.query_one("SELECT id FROM variant")[0]
+    assert is_formally_published(daemon.conn, variant_id=variant_id)
+    assert daemon.query_one(
+        "SELECT status FROM evaluation_attempt")[0] == "success"
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 1
 
 
 def test_eval_only_target_executes_existing_legal_checkpoint(tmp_path, monkeypatch):
@@ -357,7 +1096,8 @@ def test_eval_only_target_executes_existing_legal_checkpoint(tmp_path, monkeypat
             "reuse_evidence": [],
             "targets": [{
                 "target_key": "eval-existing", "target_kind": "eval", "seq": 1,
-                "critical": True, "budget_estimate": 1.0, "spec_md": "独立复测既有 checkpoint",
+                "critical": True, "budget_estimate": 1.0, "gpu_required": False,
+                "spec_md": "独立复测既有 checkpoint",
                 "need_ids": ["n1"], "eval_action": "create_evaluation",
                 "attempt_purpose": "standalone_eval", "eval_key": "standalone-check",
                 "evaluation_source": "standalone_eval",
@@ -518,7 +1258,8 @@ def test_train_partial_recovered_without_second_execution(tmp_path, monkeypatch)
 
 
 def test_120_attack_rounds_no_state_or_projection_drift(tmp_path):
-    """真跑 120 个 attack 轮：每轮 durable 关停旧前沿并生一个 follow-up，终态无半轮/租约/投影漂移。"""
+    """真跑 120 个 attack 轮：空证据 reuse 每轮被拒但仍能 durable 关停旧前沿并生
+    follow-up，终态无半轮/租约/投影漂移。这同时防止 ``targets=[]`` 凭空冒充 reuse 成功。"""
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
@@ -553,7 +1294,11 @@ def test_120_attack_rounds_no_state_or_projection_drift(tmp_path):
     attack.p["reasoning"] = reasoning
     ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=150)
     assert len(ids) == 120
-    assert daemon.query_one("SELECT count(*) FROM cycle WHERE route='reuse_only'")[0] == 120
+    assert daemon.query_one("SELECT count(*) FROM cycle WHERE route='attack'")[0] == 120
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='plan_rejected'")[0] == 120
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='plan_reuse_validated'")[0] == 0
     assert daemon.query_one(
         "SELECT count(*) FROM cycle WHERE status NOT IN ('done','failed','aborted')")[0] == 0
     assert daemon.query_one("SELECT count(*) FROM cycle WHERE active_question_id IS NOT NULL")[0] == 0
@@ -571,6 +1316,78 @@ def test_120_attack_rounds_no_state_or_projection_drift(tmp_path):
     assert SqliteAdvancer(
         state2, compiler2, lambda c, p: None, attack=attack2).run_cycles(max_cycles=5) == []
     assert daemon2.query_one("SELECT count(*) FROM cycle")[0] == 121  # bootstrap + 120 attack
+
+
+def test_zero_target_reuse_requires_and_exposes_canonical_measurement(tmp_path):
+    """A structured e/mr pair is rechecked against canonical success truth before reuse_only."""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    with daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO baseline(id,slug,canonical_key,status) "
+            "VALUES (1,'reusable','reusable','legal')")
+        conn.execute(
+            "INSERT INTO variant(id,baseline_id,variant_key,config_json,status) "
+            "VALUES (1,1,'base','{}','legal')")
+        conn.execute(
+            "INSERT INTO protocol(id,version,name,scope_spec_json) "
+            "VALUES (1,1,'reuse-proto','{\"split\":\"fixed\"}')")
+        conn.execute(
+            "INSERT INTO metric_def(id,version,name,direction,compute_spec) "
+            "VALUES (1,1,'reuse-accuracy','higher','fixed accuracy')")
+        conn.execute(
+            "INSERT INTO protocol_metric(protocol_id,protocol_ver,metric_id,metric_ver) "
+            "VALUES (1,1,1,1)")
+        conn.execute(
+            "INSERT INTO evaluation(id,variant_id,protocol_id,protocol_ver,eval_key,source,status,"
+            "created_cycle,target_set_hash) VALUES (1,1,1,1,'reuse-eval','standalone_eval',"
+            "'created',1,'reuse-target-set')")
+        conn.execute(
+            "INSERT INTO evaluation_attempt(id,evaluation_id,cycle_id,attempt_no,purpose,status,env_hash) "
+            "VALUES (1,1,1,1,'standalone_eval','success',?)", (RUNTIME_ENV_HASH,))
+        conn.execute(
+            "INSERT INTO metric_result(id,evaluation_id,evaluation_attempt_id,metric_id,metric_ver,"
+            "value,scope) VALUES (1,1,1,1,1,0.93,'aggregate')")
+        conn.execute(
+            "UPDATE evaluation SET status='success',canonical_attempt_id=1 WHERE id=1")
+
+    attack.p["plan"] = lambda cyc, pack: {"plan.json": {
+        "needs": [{"need_id": "n1", "statement_md": "reuse exact fixed result"}],
+        "reuse_evidence": [{
+            "need_id": "n1", "kind": "evaluation",
+            "ref_md": "canonical reusable measurement",
+            "evaluation_id": "e1", "metric_result_id": "mr1",
+            "gpu_required": False,
+        }],
+        "targets": [], "build_target_required_metric": [],
+    }}
+    seen = []
+
+    def reasoning(cyc, pack):
+        seen.append(pack.anchor_md)
+        return {"selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": [],
+            "terminate_reason_md": "reuse selector regression complete",
+        }}
+
+    attack.p["reasoning"] = reasoning
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=3)
+    assert len(ids) == 1
+    ci = int(ids[0][1:])
+    assert daemon.query_one("SELECT route FROM cycle WHERE id=?", (ci,))[0] == "reuse_only"
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE cycle_id=? AND type='plan_reuse_validated'",
+        (ci,))[0])
+    assert payload["evidence"] == [{
+        "kind": "evaluation", "need_id": "n1", "evaluation_id": "e1",
+        "metric_result_id": "mr1", "metric_id": "m1", "metric_ver": 1,
+        "scope": "aggregate", "value": 0.93,
+    }]
+    assert "plan-reuse-validation-v1" in seen[0]
+    assert '"metric_result_id": "mr1"' in seen[0]
+    daemon.conn.close()
 
 
 @pytest.mark.parametrize("resume_after_staging", [False, True])
@@ -688,14 +1505,17 @@ def test_attack_bundle_consumes_context_authorized_user_asset(tmp_path, resume_a
 
 
 def test_bundle_cannot_predeclare_future_predictable_asset_ref(tmp_path):
-    """生成 pack 未授权的可预测 ref 在 staging 前即拒，不能靠 kill→后续 resolve→resume 获权。"""
+    """未授权的可预测 ref 在 staging 前即拒；有界修复也不能扩权。"""
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "work")
     _bootstrap_attack(state)
     base_bundle = _bundle_provider(daemon)
     predicted = "user-file-request:r1:item:1:asset:1"
 
+    bundle_calls = []
+
     def bundle_with_future_ref(cyc, pack):
+        bundle_calls.append(pack)
         assert predicted not in pack.refs
         files = base_bundle(cyc, pack)
         files["execution_manifest.json"]["commands"]["train"]["argv"].append(
@@ -706,8 +1526,8 @@ def test_bundle_cannot_predeclare_future_predictable_asset_ref(tmp_path):
     attack.p["reasoning"] = lambda cyc, pack: {
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
-    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == (
-        "failed", "artifact_invalid")
+    _assert_bundle_repair_exhausted(daemon, "artifact_invalid")
+    assert len(bundle_calls) == POLICY["flow"]["retry"]["bundle_repair"] + 1
     assert not list((tmp_path / "work").glob("c*/t*/src/_staged.ok"))
     daemon.conn.close()
 
@@ -825,8 +1645,7 @@ def test_crash_between_register_and_ingest_recovers(tmp_path):
 
 
 def test_failed_train_target_cycle_closes_clean(tmp_path):
-    """§7.1 判例④ 雏形：训练失败 → run(failed)+target(failed) 入账；无证据不关问、Qn 置 inconclusive、
-    轮正常收尾（不楔死、不入树）。"""
+    """零成本训练持续失败仍只修复 policy 规定次数，然后 blocked 收尾。"""
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
                                               train_body="import sys; print('loss: 1.0'); sys.exit(1)")
@@ -834,8 +1653,12 @@ def test_failed_train_target_cycle_closes_clean(tmp_path):
     attack.p["reasoning"] = lambda cyc, pack: {   # 无 answer（无测量可证）；只 selection
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
-    assert daemon.query_one("SELECT status,failure_kind FROM run")[:2] == ("failed", "runtime")   # 入账
-    assert daemon.query_one("SELECT status FROM build_target")[0] == "failed"
+    runs = daemon.query("SELECT status,failure_kind FROM run ORDER BY id")
+    assert runs == [("failed", "runtime")] * (
+        POLICY["flow"]["retry"]["bundle_repair"] + 1)
+    payloads = _assert_bundle_repair_exhausted(daemon, "runtime")
+    assert all(payload["spent"] == 0 and not payload["fresh_session_extension"]
+               for payload in payloads)
     assert daemon.query_one("SELECT count(*) FROM evidence")[0] == 0                              # 不入树
     assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "inconclusive"        # Qn 收干净
     assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
@@ -898,23 +1721,95 @@ def test_eval_log_tamper_fails_loud(tmp_path):
 
 
 def test_smoke_failure_fails_target(tmp_path):
-    """codex SHOULD 回归：smoke 子进程非 0 → target failed(smoke)（exit code 不得忽略）；
-    codex 第2轮 BLOCKER 回归：终态早退也落 phase_commit(bundle,target)（否则杀/不杀分裂）。"""
+    """smoke 非 0 触发真实有界修复；用尽后 blocked 且落 target phase commit。"""
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w", smoke_body="import sys; sys.exit(2)")
     _bootstrap_attack(state)
     attack.p["reasoning"] = lambda cyc, pack: {
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
-    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == ("failed", "smoke")
+    _assert_bundle_repair_exhausted(daemon, "smoke")
     assert daemon.query_one("SELECT count(*) FROM run")[0] == 0        # 未开训
-    assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    daemon.conn.close()
+
+
+def test_bundle_repair_keeps_one_fresh_session_budget_extension(tmp_path):
+    """Production budget exhaustion still allows exactly one fresh extension."""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(
+        path, tmp_path / "w", smoke_body="import sys; sys.exit(2)")
+    attack.policy = json.loads(json.dumps(attack.policy))
+    attack.policy["deployment"]["mode"] = "production"
+    _bootstrap_attack(state)
+    attack.p["reasoning"] = lambda cyc, pack: {
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": []}}
+    adv = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert adv.advance(cyc.cycle_id) == "plan"
+    assert adv.advance(cyc.cycle_id) == "bundle"
+    with daemon.transaction() as conn:
+        conn.execute("UPDATE build_target SET budget_estimate=0")
+
+    assert adv.advance(cyc.cycle_id) == "bundle"
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision "
+        "WHERE type='bundle_repair_requested'")[0])
+    assert payload["round_no"] == 1
+    assert payload["repair_limit"] == POLICY["flow"]["retry"]["bundle_repair"]
+    assert payload["fresh_session_extension"] is True
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='bundle_budget_extension'")[0] == 1
+
+    assert adv.advance(cyc.cycle_id) == "reasoning"
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='bundle_repair_requested'")[0] == 1
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM build_target")[:2] == (
+            "engineering_blocked", "smoke")
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit "
+        "WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    daemon.conn.close()
+
+
+def test_development_bundle_repair_uses_count_limit_after_budget_extension(tmp_path):
+    """Development records a budget override but still consumes configured retries."""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(
+        path, tmp_path / "w", smoke_body="import sys; sys.exit(2)")
+    _bootstrap_attack(state)
+    attack.p["reasoning"] = lambda cyc, pack: {
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": []}}
+    adv = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert adv.advance(cyc.cycle_id) == "plan"
+    assert adv.advance(cyc.cycle_id) == "bundle"
+    with daemon.transaction() as conn:
+        conn.execute("UPDATE build_target SET budget_estimate=0")
+
+    assert adv.advance(cyc.cycle_id) == "bundle"
+    assert adv.advance(cyc.cycle_id) == "bundle"
+    payloads = [json.loads(row[0]) for row in daemon.query(
+        "SELECT payload_json FROM decision "
+        "WHERE type='bundle_repair_requested' ORDER BY id")]
+    assert [payload["round_no"] for payload in payloads] == [1, 2]
+    assert [payload["development_budget_override"] for payload in payloads] == [
+        False, True]
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_development_budget_override'") == (1,)
+
+    assert adv.advance(cyc.cycle_id) == "reasoning"
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM build_target")[:2] == (
+            "engineering_blocked", "smoke")
     daemon.conn.close()
 
 
 def test_failed_eval_resume_not_registered(tmp_path):
-    """codex 第2轮 BLOCKER 回归：eval 进程输出合法 metrics 但 exit≠0——崩在 final 改名后（finish-failed 前）
-    → resume 读 exit 侧车、同一判定 → target failed，**不得**把失败进程续注册成成功。终库与不杀一致。"""
+    """eval exit≠0 后、repair request 前崩溃；恢复仍执行同样的有界修复且绝不注册坏测量。"""
     lying_eval = "import sys; print('metric_value: 1@1=0.99'); sys.exit(1)"
 
     def _mk(path, work):
@@ -923,26 +1818,32 @@ def test_failed_eval_resume_not_registered(tmp_path):
             "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
         return d, s, c, a
 
-    ref = str(tmp_path / "ref.sqlite")                     # 参照：不杀跑完（target failed(runtime)）
+    ref = str(tmp_path / "ref.sqlite")                     # 参照：不杀跑完（repair 用尽）
     d0, s0, _, a0 = _mk(ref, tmp_path / "wref")
     _bootstrap_attack(s0)
     SqliteAdvancer(s0, a0.compiler, lambda c, p: None, attack=a0).run_cycles(max_cycles=4)
+    _assert_bundle_repair_exhausted(d0, "runtime")
     assert d0.query_one("SELECT status FROM evaluation")[0] == "failed"
-    assert d0.query_one("SELECT status,failure_kind FROM evaluation_attempt") == ("failed", "runtime")
+    assert d0.query(
+        "SELECT status,failure_kind FROM evaluation_attempt ORDER BY id") == [
+            ("failed", "runtime")
+        ] * (POLICY["flow"]["retry"]["bundle_repair"] + 1)
     assert d0.query_one("SELECT count(*) FROM metric_result")[0] == 0
     d0.conn.close()
 
     path = str(tmp_path / "research.sqlite")               # 断点：eval final 已落、finish-failed 前炸
     d1, s1, _, a1 = _mk(path, tmp_path / "w")
     _bootstrap_attack(s1)
-    orig_finish = a1.gate.gate_finish_build_target
+    orig_schedule = a1._schedule_bundle_repair
     state_box = {"crashed": False}
-    def crash_first_fail(**kw):
-        if kw.get("status") == "failed" and not state_box["crashed"]:
+
+    def crash_before_first_repair(cyc, bt_id, error):
+        if not state_box["crashed"]:
             state_box["crashed"] = True
-            raise SystemExit("SIM-KILL9-after-eval-final")
-        return orig_finish(**kw)
-    a1.gate.gate_finish_build_target = crash_first_fail
+            raise SystemExit("SIM-KILL9-after-eval-final-before-repair")
+        return orig_schedule(cyc, bt_id, error)
+
+    a1._schedule_bundle_repair = crash_before_first_repair
     with pytest.raises(SystemExit):
         SqliteAdvancer(s1, a1.compiler, lambda c, p: None, attack=a1).run_cycles(max_cycles=4)
     d1.conn.close()
@@ -1063,7 +1964,7 @@ def test_plan_review_pass_is_durable_before_plan_commit(tmp_path):
     assert sidecar["status"] == "pass" and sidecar["decision_id"] == calls[0]["decision_id"]
 
 
-def test_plan_review_fail_feedback_replans_once_then_passes(tmp_path):
+def test_single_plan_review_failure_repairs_once_in_same_cycle(tmp_path):
     path = str(tmp_path / "research.sqlite")
     work = tmp_path / "w"
     daemon, state, compiler, attack = _mk_env(path, work)
@@ -1077,21 +1978,65 @@ def test_plan_review_fail_feedback_replans_once_then_passes(tmp_path):
 
     attack.p["plan"] = plan
     attack.p["plan_review"] = _plan_review_provider(
-        daemon, ["fail", "pass"], review_calls)
+        daemon, ["fail"], review_calls)
     adv = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack)
     cyc = adv._resume_or_open()
-    attack.advance_stage(cyc)
-    attack.advance_stage(state.cycle(cyc.cycle_id))
+    assert attack.advance_stage(cyc) == "plan"
+    assert attack.advance_stage(state.cycle(cyc.cycle_id)) == "bundle"
 
-    assert len(plan_packs) == 2 and len(review_calls) == 2
-    assert "上一版 plan.json" in plan_packs[1].anchor_md
-    assert "durable reviewer feedback" in plan_packs[1].anchor_md
-    assert any(source.startswith("db:decision:") for source in plan_packs[1].sources)
-    assert daemon.query_one(
-        "SELECT canonical_key FROM baseline WHERE canonical_key='reviewed-2'")[0] == "reviewed-2"
+    assert len(plan_packs) == 2 and len(review_calls) == 1
+    assert daemon.query_one("SELECT count(*) FROM baseline")[0] == 1
     assert (work / "c2" / "plan.draft-r1.json").exists()
-    assert (work / "c2" / "plan.draft-r2.json").exists()
-    assert json.loads((work / "c2" / "plan.review-result.json").read_text())["round_no"] == 2
+    assert not (work / "c2" / "plan.draft-r2.json").exists()
+    assert (work / "c2" / "plan.repair-after-r1.json").exists()
+    assert "durable reviewer feedback" in plan_packs[1].anchor_md
+    assert f"db:decision:{review_calls[0]['decision_id']}" in plan_packs[1].sources
+    result = json.loads((work / "c2" / "plan.review-result.json").read_text())
+    assert result["status"] == "repaired_after_single_review"
+    assert result["round_no"] == 1
+    assert result["reviewed_plan_hash"] != result["plan_hash"]
+    repair = daemon.query_one(
+        "SELECT id,payload_json FROM decision WHERE type='plan_review_repair'")
+    assert repair is not None and repair[0] == result["repair_decision_id"]
+    assert json.loads(repair[1])["review_decision_id"] == review_calls[0]["decision_id"]
+
+
+def test_single_review_repair_completes_bundle_and_registers_sql(tmp_path):
+    """Regression for c4: reviewer fail must not skip Bundle or lose SQL facts."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "w"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    plan_calls = []
+    review_calls = []
+
+    def plan(_cyc, pack):
+        plan_calls.append(pack)
+        suffix = len(plan_calls)
+        return _plan_json(
+            ck=f"review-repaired-{suffix}",
+            slug=f"review-repaired-{suffix}")
+
+    attack.p["plan"] = plan
+    attack.p["plan_review"] = _plan_review_provider(
+        daemon, ["fail"], review_calls)
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+
+    assert ids == ["c2"]
+    assert len(plan_calls) == 2 and len(review_calls) == 1
+    assert daemon.query_one("SELECT status FROM build_target") == ("complete",)
+    assert daemon.query_one(
+        "SELECT canonical_key,status FROM baseline") == (
+            "review-repaired-2", "legal")
+    assert daemon.query_one("SELECT status FROM run") == ("success",)
+    assert daemon.query_one("SELECT status FROM evaluation_attempt") == ("success",)
+    assert daemon.query_one("SELECT value FROM metric_result") == (0.93,)
+    assert daemon.query_one("SELECT status FROM question WHERE id=1") == ("answered",)
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit WHERE stage='bundle'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='plan_review_repair'")[0] == 1
 
 
 def test_plan_review_restart_reuses_durable_verdict_without_recalling_judge(tmp_path):
@@ -1154,7 +2099,7 @@ def test_plan_review_restart_rejects_mutated_draft_identity(tmp_path):
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 1
 
 
-def test_plan_review_two_failures_become_normal_inconclusive_cycle(tmp_path):
+def test_plan_review_single_failure_becomes_normal_inconclusive_cycle(tmp_path):
     path = str(tmp_path / "research.sqlite")
     work = tmp_path / "w"
     daemon, state, compiler, attack = _mk_env(path, work)
@@ -1162,7 +2107,7 @@ def test_plan_review_two_failures_become_normal_inconclusive_cycle(tmp_path):
     calls = []
     reasoning_packs = []
     attack.p["plan_review"] = _plan_review_provider(
-        daemon, ["fail", "fail"], calls)
+        daemon, ["fail"], calls)
     attack.p["reasoning"] = lambda _cyc, pack: reasoning_packs.append(pack) or {
         "selection.json": {
             "next_question_id": None, "next_intent": "terminate", "scores": []}}
@@ -1170,15 +2115,65 @@ def test_plan_review_two_failures_become_normal_inconclusive_cycle(tmp_path):
     ids = SqliteAdvancer(
         state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
 
-    assert ids == ["c2"] and len(calls) == 2
+    assert ids == ["c2"] and len(calls) == 1
     assert daemon.query_one(
         "SELECT status,visit_count FROM question WHERE id=1") == ("inconclusive", 1)
     assert daemon.query_one("SELECT status FROM cycle WHERE id=2")[0] == "done"
     assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0
-    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 2
+    assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 1
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='plan_rejected'")[0] == 1
     assert "本轮 plan 阶段失败摘要" in reasoning_packs[0].anchor_md
     assert json.loads((work / "c2" / "plan.review-result.json").read_text())["status"] == "exhausted"
+
+
+def test_idea_without_selected_candidate_skips_plan_and_closes_inconclusive(tmp_path):
+    """selected_id=null is a normal research failure, not a restart-stable plan-review wedge."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "w"
+    daemon, state, compiler, attack = _mk_env(path, work)
+    _bootstrap_attack(state)
+    failed_ideas = json.loads(json.dumps(_idea_set()))
+    failed_ideas["idea_set.json"]["selected_id"] = None
+    for audit in failed_ideas["idea_set.json"]["audit_scores"]:
+        audit["decision"] = "fail"
+        audit["rationale"] = "未达到选择门槛"
+    reasoning_packs = []
+    attack.p["idea"] = lambda _cyc, _pack: failed_ideas
+    attack.p["plan"] = lambda *_args: pytest.fail("无 selected idea 不得调用 plan")
+    attack.p["plan_review"] = lambda *_args: pytest.fail("无 selected idea 不得调用 plan reviewer")
+    attack.p["bundle"] = lambda *_args: pytest.fail("idea 失败轮不得调用 bundle provider")
+    attack.p["reasoning"] = lambda _cyc, pack: reasoning_packs.append(pack) or {
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate", "scores": []}}
+
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
+
+    assert ids == ["c2"]
+    assert daemon.query_one(
+        "SELECT status,visit_count FROM question WHERE id=1") == ("inconclusive", 1)
+    assert daemon.query_one(
+        "SELECT status,route FROM cycle WHERE id=2") == ("done", "attack")
+    assert daemon.query_one(
+        "SELECT count(*) FROM idea WHERE cycle_id=2 AND status='selected'")[0] == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM idea WHERE cycle_id=2 AND status='failed'")[0] == 2
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE cycle_id=2 AND type='idea_stage_failed'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE cycle_id=2 AND actor='judge' "
+        "AND type='idea_audit'")[0] == 1
+    assert json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE cycle_id=2 AND actor='judge' "
+        "AND type='idea_audit'")[0])["selected_id"] is None
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit WHERE cycle_id=2 AND stage='idea'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit WHERE cycle_id=2 AND stage='plan'")[0] == 0
+    assert daemon.query_one("SELECT count(*) FROM build_target WHERE cycle_id=2")[0] == 0
+    assert len(reasoning_packs) == 1
+    assert "本轮 idea 阶段失败摘要" in reasoning_packs[0].anchor_md
+    assert "no_selected_candidate" in reasoning_packs[0].anchor_md
 
 
 # ============ phase_commit conflict ============
@@ -1186,8 +2181,7 @@ def test_plan_review_two_failures_become_normal_inconclusive_cycle(tmp_path):
 
 # ============ phase_commit conflict ============
 def test_attack_judge_fail_settles_target(tmp_path):
-    """lockstep 回归（codex CP5.5 BLOCKER 的 attack 侧）：judge FAIL → target failed(review_failed)、
-    轮正常收尾（Qn inconclusive），不确定性重试死循环。"""
+    """judge FAIL 意见真正回传修复，但最多只消耗 bundle_repair 限额。"""
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
@@ -1204,7 +2198,10 @@ def test_attack_judge_fail_settles_target(tmp_path):
     attack.p["reasoning"] = lambda cyc, pack: {
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
-    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == ("failed", "review_failed")
+    _assert_bundle_repair_exhausted(daemon, "review_failed")
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='bundle_code_review'")[0] == (
+            POLICY["flow"]["retry"]["bundle_repair"] + 1)
     assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0            # 测量整包不注册
     assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "inconclusive"
     assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
@@ -1387,7 +2384,7 @@ def test_qualification_bundle_rejects_any_uploaded_asset_ref(tmp_path, monkeypat
 
     SqliteAdvancer(
         state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
-    assert daemon.query_one("SELECT status FROM build_target")[0] == "failed"
+    _assert_bundle_repair_exhausted(daemon, "artifact_invalid")
     assert daemon.query_one("SELECT count(*) FROM run")[0] == 0
     assert not list((tmp_path / "w").glob("c*/t*/src/.asset-authorization.json"))
     daemon.conn.close()
@@ -1497,6 +2494,16 @@ def _plan_defer_from_registered_search(daemon, cyc):
     }}
 
 
+def _dependency_wait_reasoning(_cyc, _pack):
+    """Reasoning artifact for a plan that only queued an external dependency."""
+    return {
+        "tree_ops.json": {"ops": []},
+        "selection.json": {
+            "next_question_id": "q1", "next_intent": "attack", "scores": [],
+        },
+    }
+
+
 def test_plan_search_register_rerender_then_import_defer_is_reachable(tmp_path):
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
@@ -1516,6 +2523,7 @@ def test_plan_search_register_rerender_then_import_defer_is_reachable(tmp_path):
         return _plan_defer_from_registered_search(daemon, cyc)
 
     attack.p["plan"] = plan
+    attack.p["reasoning"] = _dependency_wait_reasoning
     ids = SqliteAdvancer(
         state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
 
@@ -1532,7 +2540,7 @@ def test_plan_search_register_rerender_then_import_defer_is_reachable(tmp_path):
     assert (tmp_path / "w" / "c2" / "import_search_request.json").exists()
 
 
-def test_stuck_plan_sidecar_terminalizes_into_separate_reference_question(tmp_path):
+def test_stuck_plan_sidecar_hands_reference_question_to_reasoning_tree_ops(tmp_path):
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
@@ -1586,15 +2594,45 @@ def test_stuck_plan_sidecar_terminalizes_into_separate_reference_question(tmp_pa
 
     def plan(_cyc, pack):
         plan_packs.append(pack)
-        assert '"may_request_stuck_survey":true' in pack.anchor_md
-        return {"import_search_request.json": request}
+        if len(plan_packs) == 1:
+            assert '"may_request_stuck_survey":true' in pack.anchor_md
+            return {"import_search_request.json": request}
+        assert '"reasoning_question_request_pending":true' in pack.anchor_md
+        assert '"question_creation_owner":"reasoning/tree_ops"' in pack.anchor_md
+        return _plan_json()
+
+    reasoning_packs = []
+
+    def reasoning(_cyc, pack):
+        reasoning_packs.append(pack)
+        assert "待 reasoning/tree_ops 裁决的 import reference 建题请求" in pack.anchor_md
+        assert '"parent_question_id": "q1"' in pack.anchor_md
+        return {
+            "tree_ops.json": {"ops": [{
+                "op": "spawn_question", "kind": "import_reference",
+                "parent_question_id": "q1", "local_key": "survey-ref",
+                "text": "冻结外部普查参照在同一预注册协议下是否达到对照性能？",
+                "predicate_json": {
+                    "kind": "evidence_closure_v1",
+                    "allowed_evidence": ["evaluation", "literature"],
+                    "answer_criterion_md": "成功测量或冻结文献显示参照达到预注册对照标准。",
+                    "refute_criterion_md": "成功测量或冻结文献显示参照未达到预注册对照标准。",
+                },
+            }]},
+            "selection.json": {
+                "next_question_id": "survey-ref", "next_intent": "attack",
+                "scores": [],
+            },
+        }
 
     attack.p["plan"] = plan
+    attack.p["reasoning"] = reasoning
     ids = SqliteAdvancer(
         state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
 
     active_cycle = 2 + streak_threshold
-    assert ids == [f"c{active_cycle}"] and len(plan_packs) == 1
+    assert ids == [f"c{active_cycle}"] and len(plan_packs) == 2
+    assert len(reasoning_packs) == 1
     child = daemon.query_one(
         "SELECT id,parent_id,status,source FROM question WHERE id<>1")
     assert child[1:] == (1, "open", "agent")
@@ -1602,9 +2640,11 @@ def test_stuck_plan_sidecar_terminalizes_into_separate_reference_question(tmp_pa
         "SELECT status,route,next_question_id,next_intent FROM cycle WHERE id=?",
         (active_cycle,)) == (
             "done", "attack", child[0], "attack")
+    assert daemon.query_one("SELECT count(*) FROM question_dep") == (0,)
     assert daemon.query_one(
-        "SELECT question_id,depends_on_question_id,status FROM question_dep") == (
-            1, child[0], "pending")
+        "SELECT actor,type FROM decision WHERE question_id=? "
+        "AND type='question_admission'", (child[0],)) == (
+            "agent", "question_admission")
     assert daemon.query_one(
         "SELECT count(*) FROM external_candidate WHERE question_id=1")[0] == 0
     assert daemon.query_one(
@@ -1633,6 +2673,7 @@ def test_plan_search_request_and_receipt_recover_without_reasking_or_refetching(
         return _plan_defer_from_registered_search(daemon, cyc)
 
     attack.p["plan"] = plan
+    attack.p["reasoning"] = _dependency_wait_reasoning
     adv = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack)
     monkeypatch.setattr(
         search, "_after_receipt",
@@ -1691,7 +2732,11 @@ def test_import_defer_commits_dependency_wait_as_one_unit(tmp_path):
     attack.p["plan"] = lambda cyc, _pack: _deferred_plan_for_current_cycle(daemon, cyc)
     attack.p["plan_review"] = lambda *_args: pytest.fail(
         "import_defer 在图 04 IMP→WAIT 分支，不应进入普通 plan answerability review")
-    attack.p["reasoning"] = lambda *_args: reasoning_calls.append(True) or {}
+    attack.p["reasoning"] = lambda *_args: reasoning_calls.append(True) or {
+        "tree_ops.json": {"ops": []},
+        "selection.json": {
+            "next_question_id": "q1", "next_intent": "attack", "scores": []},
+    }
 
     ids = SqliteAdvancer(
         state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
@@ -1717,7 +2762,9 @@ def test_import_defer_commits_dependency_wait_as_one_unit(tmp_path):
     assert daemon.query_one("SELECT count(*) FROM build_target")[0] == 0
     assert daemon.query_one(
         "SELECT count(*) FROM phase_commit WHERE cycle_id=2 AND stage='plan'")[0] == 1
-    assert reasoning_calls == []
+    assert reasoning_calls == [True]
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='dependency_wait_reasoning'") == (1,)
 
 
 def test_import_defer_terminal_crash_rolls_back_and_replays(tmp_path, monkeypatch):
@@ -1725,30 +2772,36 @@ def test_import_defer_terminal_crash_rolls_back_and_replays(tmp_path, monkeypatc
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
     attack.p["plan"] = lambda cyc, _pack: _deferred_plan_for_current_cycle(daemon, cyc)
+    attack.p["reasoning"] = _dependency_wait_reasoning
     adv = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack)
     original = state.mark_cycle_done
 
     def fail_terminal(cycle_id, status="done"):
         if cycle_id == "c2":
-            raise RuntimeError("crash-before-plan-commit")
+            raise RuntimeError("crash-before-reasoning-commit")
         return original(cycle_id, status)
 
     monkeypatch.setattr(state, "mark_cycle_done", fail_terminal)
-    with pytest.raises(RuntimeError, match="crash-before-plan-commit"):
+    with pytest.raises(RuntimeError, match="crash-before-reasoning-commit"):
         adv.run_cycles(max_cycles=1)
+    # Plan's dependency selection is already its own durable short transaction;
+    # the crash rolls back only the mandatory Reasoning tail.  Recovery must
+    # consume the same dependency state without re-running Plan or duplicating it.
     for table in ("baseline", "external_import", "question_dep"):
-        assert daemon.query_one(f"SELECT count(*) FROM {table}")[0] == 0
+        assert daemon.query_one(f"SELECT count(*) FROM {table}")[0] == 1
     assert daemon.query_one(
-        "SELECT count(*) FROM phase_commit WHERE cycle_id=2 AND stage='plan'")[0] == 0
+        "SELECT count(*) FROM phase_commit WHERE cycle_id=2 AND stage='plan'")[0] == 1
     assert daemon.query_one(
         "SELECT status,route,active_question_id FROM cycle WHERE id=2") == (
-            "idea", "attack", 1)
+            "bundle", "dependency_wait", 1)
     assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "active"
 
     monkeypatch.setattr(state, "mark_cycle_done", original)
     assert adv.run_cycles(max_cycles=1) == ["c2"]
     assert daemon.query_one(
         "SELECT count(*) FROM external_import WHERE action='selected_for_materialization'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='dependency_wait_reasoning'")[0] == 1
 
 
 def test_import_defer_rejects_license_snapshot_changed_after_render(tmp_path):
@@ -1808,14 +2861,16 @@ def test_plan_context_exposes_frozen_import_anchors_not_search_body(tmp_path):
 
 
 def test_bad_manifest_target_failed_not_wedge(tmp_path):
-    """codex SHOULD-2 回归：Codex 产的 manifest 交叉核不过（换协议=旁路）→ 目标 failed(artifact_invalid)
-    + 落 pc，轮正常收尾（不楔死）。resume 语义：已物化 manifest 校验不过属损毁 fail-loud（不在此测）。"""
+    """fresh manifest 越界会有界重出；限额用尽后 blocked+pc，不楔死。"""
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
     real_bundle = attack.p["bundle"]
 
+    bundle_calls = []
+
     def evil_bundle(cyc, pack):
+        bundle_calls.append(pack)
         files = real_bundle(cyc, pack)
         files["execution_manifest.json"]["protocol_ref"]["protocol_ver"] = 99   # 换协议 → cross_check 拒
         return files
@@ -1824,9 +2879,9 @@ def test_bad_manifest_target_failed_not_wedge(tmp_path):
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
     assert len(ids) == 1                                                        # 未楔死
-    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == ("failed", "artifact_invalid")
+    _assert_bundle_repair_exhausted(daemon, "artifact_invalid")
+    assert len(bundle_calls) == POLICY["flow"]["retry"]["bundle_repair"] + 1
     assert daemon.query_one("SELECT count(*) FROM evaluation")[0] == 0          # 未注册
-    assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
     assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC LIMIT 1")[0] == "done"
     daemon.conn.close()
 
@@ -1873,8 +2928,7 @@ def test_sandbox_output_reject_settles_exact_train_owner(tmp_path, monkeypatch):
 
 
 def test_eval_missing_required_metric_target_failed(tmp_path):
-    """codex SHOULD-2/第2轮 BLOCKER 回归：eval 打印的 metric 不覆盖 required（gate_register_evaluation
-    GateReject，**唯一**被转业务失败的 gate 调用点）→ 目标 failed(protocol_violation) + pc，不楔死。"""
+    """required metric 缺失会重出测量实现，到 bundle_repair 上限才 blocked。"""
     path = str(tmp_path / "research.sqlite")
     # eval 打印一个不在 required(1@1) 的 metric → required 未覆盖 → register GateReject
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
@@ -1884,8 +2938,9 @@ def test_eval_missing_required_metric_target_failed(tmp_path):
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
     assert len(ids) == 1
-    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == ("failed", "protocol_violation")
-    assert daemon.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    _assert_bundle_repair_exhausted(daemon, "protocol_violation")
+    assert daemon.query_one("SELECT count(*) FROM evaluation_attempt")[0] == (
+        POLICY["flow"]["retry"]["bundle_repair"] + 1)
     daemon.conn.close()
 
 
@@ -1902,8 +2957,8 @@ def test_eval_missing_required_metric_target_failed(tmp_path):
 def test_eval_metric_record_protocol_rejected_and_restart_safe(tmp_path, eval_body):
     """CP11.1：eval 的保留 metric_value 记录只接受严格、唯一、有限的 `<id>@<ver>=<float>`。
 
-    畸形、重复和非有限值都应成为 target 的 protocol_violation 业务失败，不得抛裸 ValueError，也不得
-    让 inf/部分 metrics 进入 DB；reasoning 正常收尾后，全新实例复读同 work_root 也不会再次撞坏 log。
+    畸形、重复和非有限值均有界修复，不得抛裸 ValueError，也不得让
+    inf/部分 metrics 进入 DB；reasoning 正常收尾后重启不再撞坏 log。
     """
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w", eval_body=eval_body)
@@ -1914,15 +2969,13 @@ def test_eval_metric_record_protocol_rejected_and_restart_safe(tmp_path, eval_bo
 
     ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
     assert len(ids) == 1
-    assert daemon.query_one("SELECT status,failure_kind FROM build_target")[:2] == (
-        "failed", "protocol_violation")
+    _assert_bundle_repair_exhausted(daemon, "protocol_violation")
     assert daemon.query_one("SELECT status FROM evaluation")[0] == "failed"
-    assert daemon.query_one(
-        "SELECT status,failure_kind FROM evaluation_attempt") == (
-            "failed", "protocol_violation")
+    assert daemon.query(
+        "SELECT status,failure_kind FROM evaluation_attempt ORDER BY id") == [
+            ("failed", "protocol_violation")
+        ] * (POLICY["flow"]["retry"]["bundle_repair"] + 1)
     assert daemon.query_one("SELECT count(*) FROM metric_result")[0] == 0       # 尤其 inf 不得入库
-    assert daemon.query_one(
-        "SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
     assert daemon.query_one("SELECT status,next_intent FROM cycle ORDER BY id DESC LIMIT 1")[:2] == (
         "done", "terminate")
     daemon.conn.close()
@@ -1938,7 +2991,8 @@ def test_metric_parser_sqlite_integer_boundaries_are_prechecked():
     """max 可解；max+1/超长/前导零/NaN 均只抛可收敛的 protocol reject。"""
     got = AttackStages._metrics_from_eval_log(
         f"metric_value: {SQLITE_INT_MAX}@{SQLITE_INT_MAX}=1.25")
-    assert got == [{"metric_id": SQLITE_INT_MAX, "metric_ver": SQLITE_INT_MAX, "value": 1.25}]
+    assert got == [{"metric_id": SQLITE_INT_MAX, "metric_ver": SQLITE_INT_MAX,
+                    "value": 1.25, "scope": "aggregate"}]
     for text in (
             f"metric_value: {SQLITE_INT_MAX + 1}@1=1",
             f"metric_value: {'9' * 5000}@1=1",
@@ -2126,10 +3180,8 @@ def test_exec_replay_config_drift_rejected(tmp_path):
     daemon.conn.close()
 
 
-def test_reasoning_selection_ineligible_question_no_wedge(tmp_path):
-    """步⑧ CP8.8 回归（部署首跑实录）：attack 轮反复攻同一题、visit 达 max_inconclusive_per_question 上限后，
-    Codex 仍选 next=该题 intent=attack（现对 attack 不可调度）→ **不楔死**：记 decision(selection_invalid) +
-    改持久 terminate 干净收尾（否则持久化 reasoning 重启确定性重崩=永久楔死）。"""
+def test_reasoning_selection_ineligible_question_falls_forward_without_retry(tmp_path):
+    """调度建议越界不是研究失败：不重问相同 Codex，不停全局，直接前进到其他合法前沿。"""
     path = str(tmp_path / "research.sqlite")
     # 坏 train：attack 轮不产 answer → Qn 置 inconclusive、visit 增（本轮把 root 从 limit-1 顶到 limit）
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
@@ -2138,22 +3190,65 @@ def test_reasoning_selection_ineligible_question_no_wedge(tmp_path):
     limit = POLICY["question_guard"]["max_inconclusive_per_question"]
     with daemon.transaction() as conn:   # 预置 root：再 attack 一轮即达上限
         conn.execute("UPDATE question SET status='inconclusive', visit_count=? WHERE id=1", (limit - 1,))
-    # reasoning 选回本题 attack——达上限后对 attack 不可调度（Codex 路由错误，编排器不代其重选）
-    attack.p["reasoning"] = lambda cyc, pack: {
-        "selection.json": {"next_question_id": "q1", "next_intent": "attack",
-                           "scores": [{"question_id": "q1", "score": 0.5, "est_cost": 1.0}]}}
-    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=3)
+        conn.execute(
+            "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source,born_cycle) "
+            "VALUES (1,1,1,1,'验证另一条 EEG 前沿','open','agent',1)")
+    # reasoning 选回本题 attack——达上限后对 attack 不可调度，由确定性回退选其他前沿。
+    calls = [0]
+
+    def invalid_selection(cyc, pack):
+        calls[0] += 1
+        return {"selection.json": {
+            "next_question_id": "q1", "next_intent": "attack",
+            "scores": [{"question_id": "q1", "score": 0.5, "est_cost": 1.0}]}}
+
+    attack.p["reasoning"] = invalid_selection
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
     assert len(ids) == 1                                        # 轮跑完（未楔死、无 traceback）
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='selection_invalid'")[0] == 1
-    assert daemon.query_one("SELECT next_intent FROM cycle WHERE id=?", (int(ids[0][1:]),))[0] == "terminate"
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='reasoning_semantic_retry'")[0] == 0
+    assert calls[0] == 1                         # selection 不可修复状态，不做相同语义重试
+    assert daemon.query_one(
+        "SELECT next_question_id,next_intent FROM cycle WHERE id=?", (int(ids[0][1:]),)) == (2, "attack")
     assert daemon.query_one("SELECT visit_count FROM question WHERE id=1")[0] == limit   # 达上限
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE type='selection_invalid'")[0])
+    assert payload["fallback_question_id"] == "q2"
+    assert payload["fallback_next_intent"] == "attack"
+    assert payload["semantic_retries"] == 0
     daemon.conn.close()
-    # **真实重启**（全新进程/连接/组件，同 DB + 同 work_root：reasoning.json 仍在盘）：原生 bug 的永久楔死点
-    # ——terminate 已持久 → 干净停、不重崩（内审 NIT：用全新实例更忠实复现跨进程楔死）
-    d2, s2, c2, a2 = _mk_env(path, tmp_path / "w",
-                             train_body="import sys; print('loss:1.0'); sys.exit(1)")
-    assert SqliteAdvancer(s2, c2, lambda c, p: None, attack=a2).run_cycles(max_cycles=3) == []
-    d2.conn.close()
+
+
+def test_reasoning_selection_fallback_decomposes_exhausted_only_frontier(tmp_path):
+    """唯一前沿已达 attack visit 上限时仍不 terminate；依权威 guard 降级为 decompose。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(
+        path, tmp_path / "w",
+        train_body="import sys; print('loss:1.0'); sys.exit(1)")
+    _bootstrap_attack(state)
+    limit = POLICY["question_guard"]["max_inconclusive_per_question"]
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE question SET status='inconclusive',visit_count=? WHERE id=1",
+            (limit - 1,))
+    calls = [0]
+
+    def invalid_selection(cyc, pack):
+        calls[0] += 1
+        return {"selection.json": {
+            "next_question_id": "q1", "next_intent": "attack", "scores": []}}
+
+    attack.p["reasoning"] = invalid_selection
+    ids = SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
+    assert len(ids) == 1 and calls[0] == 1
+    assert daemon.query_one(
+        "SELECT next_question_id,next_intent FROM cycle WHERE id=?",
+        (int(ids[0][1:]),)) == (1, "decompose")
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='reasoning_semantic_retry'")[0] == 0
+    daemon.conn.close()
 
 
 @pytest.mark.parametrize("bad_kind", ["tree_ops", "tree_ref_oversize", "answer_ref", "answer_ref_oversize"])
@@ -2161,13 +3256,16 @@ def test_reasoning_semantic_reject_is_durable_terminal(tmp_path, bad_kind):
     """CP11.1：schema 合法、语义非法的持久 reasoning 不得成为跨重启 poison pill。
 
     覆盖 attack 轮非法 add_children（route 语义错）和悬挂 answer evidence 引用（gate 业务拒）；首次消费
-    统一落 reasoning_rejected + terminate，树批次无半写，全新实例面对仍在盘的 reasoning.json 干净停机。
+    统一落 reasoning_rejected + terminate，树批次无半写，且不递归重问 resident Reasoning provider。
     """
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
 
+    calls = [0]
+
     def bad_reasoning(cyc, pack):
+        calls[0] += 1
         files = {
             "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": [],
                                "terminate_reason_md": "语义拒收后的安全停机"}}
@@ -2200,6 +3298,11 @@ def test_reasoning_semantic_reject_is_durable_terminal(tmp_path, bad_kind):
     assert daemon.query_one("SELECT count(*) FROM question")[0] == 1             # tree_ops 批次无半写
     assert daemon.query_one("SELECT count(*) FROM answer")[0] == 0
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='reasoning_rejected'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='reasoning_semantic_retry'")[0] == 0
+    assert calls[0] == 1
+    assert len(list((tmp_path / "w" / f"c{int(ids[0][1:])}").glob(
+        "reasoning.rejected-*.json"))) == 0
     payload = json.loads(daemon.query_one(
         "SELECT payload_json FROM decision WHERE type='reasoning_rejected'")[0])
     assert payload["fallback_next_intent"] == "terminate" and len(payload["artifact_hash"]) == 64
@@ -2213,8 +3316,8 @@ def test_reasoning_semantic_reject_is_durable_terminal(tmp_path, bad_kind):
     d2.conn.close()
 
 
-def test_reasoning_oversize_selection_score_is_terminal_without_partial_score_write(tmp_path):
-    """selection 的越界 next/score ref 转 selection_invalid；整批 score 预检，不留「前一项已写」半批。"""
+def test_reasoning_oversize_selection_score_falls_forward_without_partial_score_write(tmp_path):
+    """selection 的越界 score ref 不留半批写，也不因调度产物失手停掉研究。"""
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
                                               train_body="import sys; print('loss:1.0'); sys.exit(1)")
@@ -2226,19 +3329,16 @@ def test_reasoning_oversize_selection_score_is_terminal_without_partial_score_wr
                            "scores": [
                                {"question_id": "q1", "score": 0.8, "est_cost": 1.0},
                                {"question_id": huge, "score": 0.7, "est_cost": 1.0}]}}
-    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
+    ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=1)
     assert len(ids) == 1
-    assert daemon.query_one("SELECT status,next_intent FROM cycle ORDER BY id DESC LIMIT 1")[:2] == (
-        "done", "terminate")
+    assert daemon.query_one(
+        "SELECT status,next_question_id,next_intent FROM cycle ORDER BY id DESC LIMIT 1") == (
+        "done", 1, "attack")
     assert daemon.query_one("SELECT score,est_cost FROM question WHERE id=1") == (None, None)
     assert daemon.query_one("SELECT count(*) FROM decision WHERE type='selection_invalid'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='reasoning_semantic_retry'")[0] == 0
     daemon.conn.close()
-
-    d2, s2, c2, a2 = _mk_env(path, tmp_path / "w",
-                             train_body="import sys; print('loss:1.0'); sys.exit(1)")
-    assert SqliteAdvancer(s2, c2, lambda c, p: None, attack=a2).run_cycles(max_cycles=4) == []
-    assert d2.query_one("SELECT count(*) FROM decision WHERE type='selection_invalid'")[0] == 1
-    d2.conn.close()
 
 
 def test_tree_ops_late_reject_rolls_back_rows_and_local_projection(tmp_path):
@@ -2356,4 +3456,23 @@ def test_open_set_annotates_attack_ineligible(tmp_path):
         conn.execute("UPDATE cycle SET active_question_id=1 WHERE id=?", (int(c.cycle_id[1:]),))
     pack = compiler.render(cycle_id=c.cycle_id, stage="reasoning")
     assert "attack 已达上限" in pack.anchor_md and "只可 decompose" in pack.anchor_md
+    daemon.conn.close()
+
+
+def test_open_set_projects_active_question_visit_guard(tmp_path):
+    """编译时显式告知 Codex：active 题如本轮无 answer，selection 面对的是增量后 visit。"""
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, _attack = _mk_env(path, tmp_path / "w")
+    _bootstrap_attack(state)
+    limit = POLICY["question_guard"]["max_inconclusive_per_question"]
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE question SET status='inconclusive',visit_count=? WHERE id=1",
+            (limit - 1,))
+    cyc = state.open_or_resume_cycle()
+    state.set_route(cyc.cycle_id, "attack")
+    state.activate_question("q1")
+    pack = compiler.render(cycle_id=cyc.cycle_id, stage="reasoning")
+    assert f"收尾后 visit={limit}" in pack.anchor_md
+    assert "届时本题只可 decompose、不可再 attack" in pack.anchor_md
     daemon.conn.close()

@@ -116,6 +116,7 @@ def test_artifact_map_covers_all_process_files():
     expected = {
         "idea_set.json", "idea_set.draft.json", "idea_audit.json",
         "plan.json", "plan_review.json", "bundle_target.json",
+        "bundle_operator_action.json",
         "execution_manifest.json",   # bundle 编译产物：机器执行契约（步⑧ CP8.1）
         "review_verdict.json",       # bundle 双评审裁决（步⑧ CP8.3）
         "answer.json", "tree_ops.json", "selection.json",

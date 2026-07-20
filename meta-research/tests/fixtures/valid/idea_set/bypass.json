@@ -15,7 +15,7 @@
       "assumptions": ["两类协方差近似相等", "训练集规模足以估计二维权重"],
       "min_falsifiable_experiment": "固定数据种子与划分，训练逻辑回归并在留出集测 accuracy；若 aggregate < 0.90 则证伪（对照：多数类基线）",
       "novelty_type": "表征结构",
-      "novelty_status": "联网粗查已启用·文献级待人工验证"
+      "novelty_status": "联网查重未启用·文献级待验证"
     }
   ],
   "audit_scores": [
@@ -36,9 +36,10 @@
   "selected_id": "c1",
   "novelty_refs": [],
   "provenance": {
-    "adapter_version": "m0-skeleton",
+    "engine_version": "wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598",
+    "adapter_version": "meta-research-wildidea-adapter-v1",
     "prompt_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "model": "gpt-5.5",
+    "model": "gpt-5.6",
     "sampling": { "seed": null, "temperature": null }
   }
 }

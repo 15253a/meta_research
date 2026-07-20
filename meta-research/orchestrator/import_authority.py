@@ -20,9 +20,12 @@ from typing import Any, Dict, Optional
 
 HUMAN_NAMED_PROTOCOL = "human-named-import-v1"
 REFERENCE_AUTHORITY_PROTOCOL = "import-reference-authority-v1"
+QUESTION_REQUEST_BINDING_PROTOCOL = "question-request-binding-v1"
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_QREF_RE = re.compile(r"^q[1-9][0-9]*$")
+_REQUEST_REF_RE = re.compile(r"^db:(directive|decision):([1-9][0-9]*)$")
 _GITHUB_URI_RE = re.compile(
     r"^https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 
@@ -76,6 +79,87 @@ def validate_optional_revision(value: Any) -> Optional[str]:
     if not isinstance(value, str) or not _COMMIT_RE.fullmatch(value):
         raise ImportAuthorityError("requested_revision 须为空或 40 位小写 commit")
     return value
+
+
+def build_question_request_binding(
+        *, source_kind: str, request_ref: str, request_decision_id: int,
+        reasoning_request_hash: str, question_id: int, goal_id: int,
+        goal_ver: int, spawn_kind: str, parent_question_id: Optional[str],
+        requested_text: str,
+        source_authority_hash: Optional[str]) -> Dict[str, Any]:
+    """Build the append-only join between a frozen request and its question.
+
+    The request itself lives in an immutable consumed human decision or an
+    ``import_trigger_completed`` decision.  This record is written only after
+    StateStore has admitted the question, in the same transaction as that
+    INSERT.  Keeping the join separate preserves ``decision`` append-only
+    semantics: the earlier consuming/completion decision is never patched.
+    """
+    if source_kind not in ("console_directive", "import_trigger_completed"):
+        raise ImportAuthorityError("question request binding source_kind 非法")
+    if not isinstance(request_ref, str):
+        raise ImportAuthorityError("question request binding request_ref 非法")
+    match = _REQUEST_REF_RE.fullmatch(request_ref)
+    expected_domain = (
+        "directive" if source_kind == "console_directive" else "decision")
+    if match is None or match.group(1) != expected_domain:
+        raise ImportAuthorityError("question request binding request_ref/source 不一致")
+    if spawn_kind not in ("followup", "import_reference"):
+        raise ImportAuthorityError("question request binding spawn_kind 非法")
+    if (parent_question_id is not None
+            and (not isinstance(parent_question_id, str)
+                 or _QREF_RE.fullmatch(parent_question_id) is None)):
+        raise ImportAuthorityError(
+            "question request binding parent_question_id 非法")
+    if (not isinstance(reasoning_request_hash, str)
+            or _SHA256_RE.fullmatch(reasoning_request_hash) is None):
+        raise ImportAuthorityError(
+            "question request binding reasoning_request_hash 非 sha256")
+    if (source_authority_hash is not None
+            and (not isinstance(source_authority_hash, str)
+                 or _SHA256_RE.fullmatch(source_authority_hash) is None)):
+        raise ImportAuthorityError(
+            "question request binding source_authority_hash 非 sha256/null")
+    core = {
+        "protocol": QUESTION_REQUEST_BINDING_PROTOCOL,
+        "source_kind": source_kind,
+        "request_ref": request_ref,
+        "request_decision_id": _positive_int(
+            request_decision_id, field="request_decision_id"),
+        "reasoning_request_hash": reasoning_request_hash,
+        "question_id": _positive_int(question_id, field="question_id"),
+        "goal_id": _positive_int(goal_id, field="goal_id"),
+        "goal_ver": _positive_int(goal_ver, field="goal_ver"),
+        "spawn_kind": spawn_kind,
+        "parent_question_id": parent_question_id,
+        "requested_text": _bounded_text(
+            requested_text, field="requested_text", max_bytes=16_384),
+        "source_authority_hash": source_authority_hash,
+    }
+    return {**core, "binding_hash": authority_hash(core)}
+
+
+def validate_question_request_binding(value: Any) -> Dict[str, Any]:
+    keys = {
+        "protocol", "source_kind", "request_ref", "request_decision_id",
+        "reasoning_request_hash", "question_id", "goal_id", "goal_ver",
+        "spawn_kind", "parent_question_id", "requested_text",
+        "source_authority_hash", "binding_hash",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ImportAuthorityError("question request binding 结构非法")
+    expected = build_question_request_binding(
+        source_kind=value["source_kind"], request_ref=value["request_ref"],
+        request_decision_id=value["request_decision_id"],
+        reasoning_request_hash=value["reasoning_request_hash"],
+        question_id=value["question_id"], goal_id=value["goal_id"],
+        goal_ver=value["goal_ver"], spawn_kind=value["spawn_kind"],
+        parent_question_id=value["parent_question_id"],
+        requested_text=value["requested_text"],
+        source_authority_hash=value["source_authority_hash"])
+    if value != expected:
+        raise ImportAuthorityError("question request binding hash/身份不一致")
+    return expected
 
 
 def build_human_named_authority(*, directive_id: int, source_message_id: int,
@@ -198,6 +282,35 @@ def validate_reference_authority(value: Any) -> Dict[str, Any]:
     return expected
 
 
+def _question_request_bindings(conn, question_id: int):
+    rows = conn.execute(
+        "SELECT id,cycle_id,directive_id,payload_json FROM decision "
+        "WHERE question_id=? AND actor='orchestrator' "
+        "AND type='question_request_bound' ORDER BY id",
+        (question_id,)).fetchall()
+    result = []
+    for decision_id, cycle_id, directive_id, payload_raw in rows:
+        try:
+            binding = validate_question_request_binding(json.loads(payload_raw))
+        except (json.JSONDecodeError, ImportAuthorityError) as error:
+            if isinstance(error, ImportAuthorityError):
+                raise
+            raise ImportAuthorityError(
+                f"q{question_id} question_request_bound payload 损坏") from error
+        if binding["question_id"] != question_id:
+            raise ImportAuthorityError(
+                f"q{question_id} question request binding 指向其他问题")
+        if ((binding["source_kind"] == "console_directive")
+                != (directive_id is not None)):
+            raise ImportAuthorityError(
+                f"q{question_id} question request binding directive provenance 非法")
+        result.append((decision_id, cycle_id, directive_id, binding))
+    if len(result) > 1:
+        raise ImportAuthorityError(
+            f"q{question_id} 存在多个 question request binding")
+    return result
+
+
 def load_question_import_authority(conn, *, question_id: int) -> Optional[Dict[str, Any]]:
     """Return the one exact trigger authority for a question, or fail loud.
 
@@ -207,6 +320,7 @@ def load_question_import_authority(conn, *, question_id: int) -> Optional[Dict[s
     """
     _positive_int(question_id, field="question_id")
     found = []
+    bindings = _question_request_bindings(conn, question_id)
     human_rows = conn.execute(
         "SELECT x.id,x.directive_id,x.payload_json,d.status,d.kind,"
         "d.source_interaction_message_id,d.consumed_decision_id,m.goal_id,m.goal_ver "
@@ -250,6 +364,101 @@ def load_question_import_authority(conn, *, question_id: int) -> Optional[Dict[s
                 f"q{question_id} human_named authority 与出生 lineage 不一致")
         found.append(authority)
 
+    # Two-phase question ownership cannot mutate the earlier consumed human
+    # decision (``decision`` is append-only).  StateStore therefore writes a
+    # separate binding plus this authority after admitting the question.  The
+    # joins below still prove the exact consumed directive/message provenance.
+    bound_human_rows = conn.execute(
+        "SELECT id,cycle_id,directive_id,payload_json FROM decision "
+        "WHERE question_id=? AND actor='orchestrator' "
+        "AND type='human_named_import_authority' ORDER BY id",
+        (question_id,)).fetchall()
+    for authority_decision_id, authority_cycle_id, directive_id, payload_raw in bound_human_rows:
+        try:
+            authority = validate_human_named_authority(json.loads(payload_raw))
+        except (json.JSONDecodeError, ImportAuthorityError) as error:
+            if isinstance(error, ImportAuthorityError):
+                raise
+            raise ImportAuthorityError(
+                f"q{question_id} human_named_import_authority payload 损坏") from error
+        if len(bindings) != 1:
+            raise ImportAuthorityError(
+                f"q{question_id} human_named authority 缺唯一 request binding")
+        _binding_decision_id, binding_cycle_id, binding_directive_id, binding = bindings[0]
+        if (binding["source_kind"] != "console_directive"
+                or binding["spawn_kind"] != "import_reference"
+                or binding["request_ref"] != f"db:directive:{directive_id}"
+                or binding["source_authority_hash"] != authority["authority_hash"]
+                or binding_directive_id != directive_id
+                or binding_cycle_id != authority_cycle_id
+                or authority["directive_id"] != directive_id
+                or authority["question_id"] != question_id):
+            raise ImportAuthorityError(
+                f"q{question_id} human_named authority/request binding 不一致")
+        source = conn.execute(
+            "SELECT d.status,d.kind,d.hardness,d.consumed_cycle,"
+            "d.consumed_decision_id,d.source_interaction_message_id,"
+            "x.cycle_id,x.question_id,x.directive_id,x.actor,x.type,x.payload_json,"
+            "m.goal_id,m.goal_ver "
+            "FROM directive d JOIN decision x ON x.id=d.consumed_decision_id "
+            "JOIN interaction_message m ON m.id=d.source_interaction_message_id "
+            "WHERE d.id=?", (directive_id,)).fetchone()
+        if (source is None
+                or source[:5] != (
+                    "consumed", "inject_question", "hard", authority_cycle_id,
+                    binding["request_decision_id"])
+                or source[5] != authority["source_message_id"]
+                or source[6:11] != (
+                    authority_cycle_id, None, directive_id, "human",
+                    "directive_inject_question")
+                or source[12:14] != (
+                    authority["goal_id"], authority["goal_ver"])):
+            raise ImportAuthorityError(
+                f"q{question_id} human_named consumed directive provenance 不一致")
+        classified = conn.execute(
+            "SELECT intent,directive_id FROM interaction_classification "
+            "WHERE message_id=?", (authority["source_message_id"],)).fetchone()
+        if classified != ("directive", directive_id):
+            raise ImportAuthorityError(
+                f"q{question_id} human_named classification provenance 不一致")
+        try:
+            consumed_payload = json.loads(source[11])
+            effect = consumed_payload["effect"]
+            request = effect["reasoning_question_request"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ImportAuthorityError(
+                f"q{question_id} human_named consumed request 损坏") from error
+        repo = request.get("human_named_repo") if isinstance(request, dict) else None
+        if (not isinstance(effect, dict) or not isinstance(request, dict)
+                or effect.get("applies_to_reasoning_cycle")
+                != f"c{authority_cycle_id}"
+                or authority_hash(request) != binding["reasoning_request_hash"]
+                or request.get("request_ref") != binding["request_ref"]
+                or request.get("requested_text") != binding["requested_text"]
+                or request.get("parent_question_id")
+                != binding["parent_question_id"]
+                or request.get("suggested_kind") != "import_reference"
+                or request.get("requires_reasoning_predicate") is not True
+                or not isinstance(repo, dict)
+                or repo.get("canonical_uri") != authority["canonical_uri"]
+                or repo.get("requested_revision")
+                != authority["requested_revision"]
+                or request.get("need_summary") != authority["need_summary"]):
+            raise ImportAuthorityError(
+                f"q{question_id} human_named frozen request/authority 不一致")
+        qlineage = conn.execute(
+            "SELECT parent_id,goal_id,born_goal_ver,text,source,born_cycle "
+            "FROM question WHERE id=?", (question_id,)).fetchone()
+        expected_parent = (int(binding["parent_question_id"][1:])
+                           if binding["parent_question_id"] is not None else None)
+        if (qlineage is None
+                or qlineage != (
+                    expected_parent, authority["goal_id"], authority["goal_ver"],
+                    binding["requested_text"], "human", authority_cycle_id)):
+            raise ImportAuthorityError(
+                f"q{question_id} human_named authority 与出生 lineage 不一致")
+        found.append(authority)
+
     reference_rows = conn.execute(
         "SELECT id,payload_json,cycle_id FROM decision WHERE question_id=? "
         "AND actor='orchestrator' AND type='import_reference_authority' ORDER BY id",
@@ -273,6 +482,43 @@ def load_question_import_authority(conn, *, question_id: int) -> Optional[Dict[s
                 or authority["origin_cycle_id"] != cycle_id):
             raise ImportAuthorityError(
                 f"q{question_id} reference authority 与 question lineage 不一致")
+        if bindings:
+            _binding_decision_id, binding_cycle_id, binding_directive_id, binding = bindings[0]
+            completion = conn.execute(
+                "SELECT cycle_id,question_id,actor,type,payload_json FROM decision "
+                "WHERE id=?", (binding["request_decision_id"],)).fetchone()
+            try:
+                completion_payload = (
+                    json.loads(completion[4]) if completion is not None else None)
+            except json.JSONDecodeError as error:
+                raise ImportAuthorityError(
+                    f"q{question_id} import trigger completion payload 损坏") from error
+            frozen_request = (completion_payload.get("reasoning_question_request")
+                              if isinstance(completion_payload, dict) else None)
+            if (binding["source_kind"] != "import_trigger_completed"
+                    or binding["spawn_kind"] != "import_reference"
+                    or binding["request_ref"]
+                    != f"db:decision:{binding['request_decision_id']}"
+                    or binding["source_authority_hash"] != authority["authority_hash"]
+                    or binding_cycle_id != cycle_id
+                    or binding_directive_id is not None
+                    or completion is None
+                    or completion[:4] != (
+                        cycle_id, authority["origin_question_id"],
+                        "orchestrator", "import_trigger_completed")
+                    or not isinstance(frozen_request, dict)
+                    or authority_hash(frozen_request)
+                    != binding["reasoning_request_hash"]
+                    or frozen_request.get("requested_text")
+                    != binding["requested_text"]
+                    or frozen_request.get("parent_question_id")
+                    != binding["parent_question_id"]
+                    or completion_payload.get("request_hash")
+                    != authority["request_hash"]
+                    or completion_payload.get("result_hash")
+                    != authority["result_hash"]):
+                raise ImportAuthorityError(
+                    f"q{question_id} reference authority/request binding 不一致")
         found.append(authority)
 
     if len(found) > 1:

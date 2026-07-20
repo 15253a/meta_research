@@ -10,6 +10,7 @@
       "seq": 1,
       "critical": true,
       "budget_estimate": 0.5,
+      "gpu_required": false,
       "spec_md": "以升版协议 toy-gauss-cls@2 对既有 legal 变体 checkpoint 免训练重评",
       "need_ids": ["n1"],
       "eval_action": "create_evaluation",

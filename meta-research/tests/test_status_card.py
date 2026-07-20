@@ -90,7 +90,12 @@ def test_budget_fields(conn):
     b = _card(conn)["budget"]
     assert set(b.keys()) == {"B_t", "cycle_spent", "global_remaining"}   # §4.6.6 预算三元（不多不少）
     assert b["B_t"] == 5.0 and b["cycle_spent"] == 3.5   # 无 done cycle → B0=5；花费只认 ledger
-    assert b["global_remaining"] == 99996.5              # session_max - 全局 ledger
+    assert b["global_remaining"] is None                  # 当前 development policy 显式关闭累计成本网
+
+    budgeted = json.loads(json.dumps(POLICY))
+    budgeted["budget"]["session_max"] = 100000
+    enabled = SC.build_status_card(conn, cycle_id="c1", policy=budgeted)["budget"]
+    assert enabled["global_remaining"] == 99996.5         # 启用时仍为 session_max - 全局 ledger
 
 
 def test_counts_open_inconclusive(conn):

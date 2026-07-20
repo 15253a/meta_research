@@ -244,7 +244,17 @@ def _normalize_external_container(value: Optional[Mapping[str, Any]]) -> Optiona
         "network_mode", "rootfs_readonly", "no_new_privileges", "cap_drop_all",
         "pid_namespace", "resource_mode",
     }
-    if set(value) != expected_keys:
+    local_keys = {
+        "local_environment_identity_sha256",
+        "local_environment_development_only",
+    }
+    network_keys = {"network_development_only"}
+    allowed = set(expected_keys)
+    if local_keys & set(value):
+        allowed |= local_keys
+    if network_keys & set(value):
+        allowed |= network_keys
+    if set(value) != allowed:
         raise ValueError("external_container 字段闭包非法")
     if value.get("backend") != _SANDBOX_BACKEND:
         raise ValueError("external_container backend 非法")
@@ -261,20 +271,30 @@ def _normalize_external_container(value: Optional[Mapping[str, Any]]) -> Optiona
     spec_sha256 = value.get("spec_sha256")
     if not isinstance(spec_sha256, str) or _SHA256_RE.fullmatch(spec_sha256) is None:
         raise ValueError("external_container spec_sha256 非法")
-    if value.get("network_mode") != "none":
-        raise ValueError("external_container 必须 network_mode=none")
+    network_mode = value.get("network_mode")
+    if network_mode not in {"none", "bridge"}:
+        raise ValueError("external_container network_mode 非法")
+    if ((network_mode == "bridge" and value.get("network_development_only") is not True)
+            or (network_mode == "none" and network_keys & set(value))):
+        raise ValueError("external_container bridge 必须显式 development-only")
     for field in ("rootfs_readonly", "no_new_privileges", "cap_drop_all", "pid_namespace"):
         if value.get(field) is not True:
             raise ValueError(f"external_container {field} 必须为 true")
     resource_mode = value.get("resource_mode")
     if resource_mode not in _SANDBOX_RESOURCE_MODES:
         raise ValueError("external_container resource_mode 非法")
+    local_identity = value.get("local_environment_identity_sha256")
+    if local_keys <= set(value) and (
+            not isinstance(local_identity, str)
+            or _SHA256_RE.fullmatch(local_identity) is None
+            or value.get("local_environment_development_only") is not True):
+        raise ValueError("external_container local environment identity 非法")
     raw_engine_path = value.get("engine_path")
     if not isinstance(raw_engine_path, str) or not os.path.isabs(raw_engine_path):
         raise ValueError("external_container engine_path 须为绝对路径")
     engine_path = os.path.realpath(raw_engine_path)
     engine_sha256 = _executable_identity(engine_path)
-    return {
+    normalized = {
         "backend": _SANDBOX_BACKEND,
         "engine_path": engine_path,
         "engine_host": engine_host,
@@ -282,13 +302,21 @@ def _normalize_external_container(value: Optional[Mapping[str, Any]]) -> Optiona
         "container_name": name,
         "token": token,
         "spec_sha256": spec_sha256,
-        "network_mode": "none",
+        "network_mode": network_mode,
         "rootfs_readonly": True,
         "no_new_privileges": True,
         "cap_drop_all": True,
         "pid_namespace": True,
         "resource_mode": resource_mode,
     }
+    if local_keys <= set(value):
+        normalized.update({
+            "local_environment_identity_sha256": local_identity,
+            "local_environment_development_only": True,
+        })
+    if network_mode == "bridge":
+        normalized["network_development_only"] = True
+    return normalized
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -518,7 +546,16 @@ def _validate_sandbox_receipt(
         "spec_sha256", "network_mode", "rootfs_readonly", "no_new_privileges",
         "cap_drop_all", "pid_namespace", "resource_mode",
     }
-    expected = common | ({"container_drained"} if terminal else set())
+    local_keys = {
+        "local_environment_identity_sha256",
+        "local_environment_development_only",
+    }
+    network_keys = {"network_development_only"}
+    has_local = bool(local_keys & set(sandbox))
+    has_network_development = bool(network_keys & set(sandbox))
+    expected = (common | (local_keys if has_local else set())
+                | (network_keys if has_network_development else set())
+                | ({"container_drained"} if terminal else set()))
     if set(sandbox) != expected:
         raise ValueError("sandbox receipt 字段闭包非法")
     if (sandbox.get("backend") != _SANDBOX_BACKEND
@@ -537,12 +574,20 @@ def _validate_sandbox_receipt(
             or _SANDBOX_TOKEN_RE.fullmatch(sandbox["token"]) is None
             or not isinstance(sandbox.get("spec_sha256"), str)
             or _SHA256_RE.fullmatch(sandbox["spec_sha256"]) is None
-            or sandbox.get("network_mode") != "none"
+            or sandbox.get("network_mode") not in {"none", "bridge"}
+            or (sandbox.get("network_mode") == "bridge"
+                and sandbox.get("network_development_only") is not True)
+            or (sandbox.get("network_mode") == "none" and has_network_development)
             or sandbox.get("rootfs_readonly") is not True
             or sandbox.get("no_new_privileges") is not True
             or sandbox.get("cap_drop_all") is not True
             or sandbox.get("pid_namespace") is not True
             or sandbox.get("resource_mode") not in _SANDBOX_RESOURCE_MODES
+            or (has_local and (
+                not isinstance(sandbox.get("local_environment_identity_sha256"), str)
+                or _SHA256_RE.fullmatch(
+                    sandbox["local_environment_identity_sha256"]) is None
+                or sandbox.get("local_environment_development_only") is not True))
             or (terminal and sandbox.get("container_drained") is not True)):
         raise ValueError("sandbox receipt authority 非法")
 
@@ -550,6 +595,8 @@ def _validate_sandbox_receipt(
 def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
     operation_id = receipt.get("operation_id")
     context = receipt.get("context")
+    timeout_value = receipt.get("timeout_s")
+    lifecycle_bound = receipt.get("kind") == "codex-resident-stage"
     current_dir = os.stat(Path(path).parent, follow_symlinks=False)
     if (not isinstance(receipt.get("version"), int)
             or isinstance(receipt.get("version"), bool)
@@ -565,7 +612,14 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
             or receipt.get("containment") not in {
                 "trusted-descendant-tree", _SANDBOX_BACKEND}
             or not _SHA256_RE.match(str(receipt.get("spec_sha256", "")))
-            or not _finite_number(receipt.get("timeout_s"), positive=True)
+            # Only the resident stage-main Codex may be bound to its owner's
+            # lifecycle instead of a wall-clock deadline.  Every experiment
+            # command and every other external process retains a finite
+            # watchdog.  Encoding the mode in ``kind`` keeps a corrupted null
+            # timeout from silently widening an ordinary receipt.
+            or ((timeout_value is None) != lifecycle_bound)
+            or (timeout_value is not None
+                and not _finite_number(timeout_value, positive=True))
             or not _finite_number(receipt.get("term_grace_s"), positive=True)
             or not _finite_number(receipt.get("prepared_at_unix"), positive=True)
             or not isinstance(receipt.get("receipt_dir_dev"), int)
@@ -615,8 +669,11 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
             value = receipt.get(key)
             if not isinstance(value, str) or not value.isascii() or not value.isdigit():
                 raise ValueError("running receipt start_ticks 非法")
+        deadline_value = receipt.get("deadline_at_unix")
         if (not _finite_number(receipt.get("started_at_unix"), positive=True)
-                or not _finite_number(receipt.get("deadline_at_unix"), positive=True)):
+                or ((deadline_value is None) != lifecycle_bound)
+                or (deadline_value is not None
+                    and not _finite_number(deadline_value, positive=True))):
             raise ValueError("running receipt deadline 非法")
         heartbeat_ref = receipt.get("heartbeat_ref")
         if (not isinstance(heartbeat_ref, str)
@@ -640,6 +697,7 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
         receipt.get("sandbox"), containment=receipt.get("containment"), terminal=True)
     outcome = receipt.get("outcome")
     if (outcome not in _TERMINAL_OUTCOMES
+            or (lifecycle_bound and outcome == "timeout")
             or receipt.get("group_drained") is not True
             or not isinstance(receipt.get("term_sent"), bool)
             or not isinstance(receipt.get("kill_sent"), bool)
@@ -902,7 +960,7 @@ class ExecutionSupervisor:
             self._recovered = True
 
     def _prepared_receipt(self, *, operation_id: str, kind: str,
-                          spec_sha256: str, timeout_s: float,
+                          spec_sha256: str, timeout_s: Optional[float],
                           operation_context: Mapping[str, Any],
                           external_container: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         root_info = os.stat(self.receipt_dir)
@@ -940,13 +998,22 @@ class ExecutionSupervisor:
                 active.cancel()
 
     def run(self, cmd: Sequence[str], *, stdin=None, capture_output: bool = False,
-            stdout=None, stderr=None, timeout_s: float,
+            stdout=None, stderr=None, timeout_s: Optional[float],
             cwd: Optional[Path] = None,
             env: Optional[Mapping[str, str]] = None,
             pass_fds: Sequence[int] = (), kind: str = "external",
             operation_context: Optional[Mapping[str, Any]] = None,
-            external_container: Optional[Mapping[str, Any]] = None) -> ExecutionResult:
-        """Execute one command and return only after its descendant tree is empty."""
+            external_container: Optional[Mapping[str, Any]] = None,
+            progress_observer: Optional[Callable[[], bool]] = None,
+            progress_interval_s: float = 5.0) -> ExecutionResult:
+        """Execute one command and return only after its descendant tree is empty.
+
+        ``progress_observer`` is a trusted parent-side, read-only observation
+        hook.  It never receives argv, process handles or lifecycle authority;
+        returning ``True`` asks the already-registered guardian to cancel this
+        exact execution.  The hook may itself perform a bounded Codex operator
+        turn while the guardian continues supervising the workload.
+        """
         if not isinstance(cmd, (list, tuple)) or not cmd:
             raise ValueError("cmd 须为非空 argv sequence")
         argv = []
@@ -967,10 +1034,28 @@ class ExecutionSupervisor:
                          or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value))):
                 raise ValueError("operation_context 字符串非法")
             receipt_context[key] = value
-        if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
-                or not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0):
-            raise ValueError("timeout_s 须为正有限数")
-        timeout_s = float(timeout_s)
+        lifecycle_bound = timeout_s is None
+        if lifecycle_bound:
+            if kind != "codex-resident-stage":
+                raise ValueError(
+                    "仅 codex-resident-stage 允许 timeout_s=None 的 owner 生命周期")
+        elif kind == "codex-resident-stage":
+            raise ValueError(
+                "codex-resident-stage 必须使用 timeout_s=None 的 owner 生命周期")
+        elif (isinstance(timeout_s, bool)
+              or not isinstance(timeout_s, (int, float))
+              or not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0):
+            raise ValueError("timeout_s 须为正有限数或 resident stage 的 None")
+        else:
+            timeout_s = float(timeout_s)
+        if progress_observer is not None and not callable(progress_observer):
+            raise ValueError("progress_observer 须为 callable 或 None")
+        if (isinstance(progress_interval_s, bool)
+                or not isinstance(progress_interval_s, (int, float))
+                or not math.isfinite(float(progress_interval_s))
+                or not 0.05 <= float(progress_interval_s) <= 3600.0):
+            raise ValueError("progress_interval_s 须在 [0.05,3600] 内")
+        progress_interval_s = float(progress_interval_s)
         if capture_output and (stdout is not None or stderr is not None):
             raise ValueError("capture_output 不得与 stdout/stderr 同时使用")
         if stdin == subprocess.PIPE:
@@ -999,6 +1084,14 @@ class ExecutionSupervisor:
             "context": receipt_context,
             "external_container": sandbox,
         }
+        # Preserve the historical identity for every existing caller.  The
+        # observation cadence participates only when that optional control is
+        # actually enabled.
+        if progress_observer is not None:
+            spec_for_hash.update({
+                "progress_observer": True,
+                "progress_interval_s": progress_interval_s,
+            })
         spec_sha256 = "sha256:" + hashlib.sha256(
             _canonical_json(spec_for_hash)).hexdigest()
         operation_id = f"exec-{secrets.token_hex(16)}"
@@ -1124,7 +1217,8 @@ class ExecutionSupervisor:
                 "target_pass_fds": list(target_fds),
                 "env": target_env,
                 "timeout_s": timeout_s,
-                "deadline_monotonic_s": time.monotonic() + timeout_s,
+                "deadline_monotonic_s": (
+                    None if timeout_s is None else time.monotonic() + timeout_s),
                 "term_grace_s": self.term_grace_s,
                 "receipt_path": str(receipt_path),
                 "prepared": prepared,
@@ -1318,6 +1412,7 @@ class ExecutionSupervisor:
                 wait_notes.append(secondary)
 
         primary_wait_error: Optional[BaseException] = pre_wait_error
+        observer_cancelled = False
         while True:
             try:
                 if primary_wait_error is not None:
@@ -1325,8 +1420,24 @@ class ExecutionSupervisor:
                     # spawn for this supervisor, then keeps converging.
                     self._shutdown = True
                     active.cancel()
-                helper.wait()
-                break
+                    helper.wait()
+                    break
+                if progress_observer is None or observer_cancelled:
+                    helper.wait()
+                    break
+                try:
+                    helper.wait(timeout=progress_interval_s)
+                    break
+                except subprocess.TimeoutExpired:
+                    # Timeout here is only the observation cadence.  The
+                    # guardian independently enforces the execution deadline.
+                    request_cancel = progress_observer()
+                    if request_cancel is not False and request_cancel is not True:
+                        raise ValueError(
+                            "progress_observer 返回值须为 bool")
+                    if request_cancel:
+                        active.cancel()
+                        observer_cancelled = True
             except BaseException as error:
                 self._shutdown = True
                 if primary_wait_error is None:
@@ -1423,6 +1534,9 @@ class ExecutionSupervisor:
         assert receipt is not None
         outcome = receipt.get("outcome")
         if outcome == "timeout":
+            if timeout_s is None:
+                raise ExecutionSupervisorError(
+                    "owner-lifecycle execution 不得产生 timeout receipt")
             raise SupervisedTimeoutExpired(
                 argv, timeout_s, output=stdout_bytes, stderr=stderr_bytes,
                 receipt=receipt, receipt_path=receipt_path)
@@ -1916,8 +2030,12 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         if info is None:
             raise RuntimeError("payload launcher identity 不可读")
         started_at = time.time()
-        deadline_monotonic = float(spec["deadline_monotonic_s"])
-        deadline_at_unix = started_at + max(0.0, deadline_monotonic - time.monotonic())
+        raw_deadline = spec["deadline_monotonic_s"]
+        deadline_monotonic = (
+            None if raw_deadline is None else float(raw_deadline))
+        deadline_at_unix = (
+            None if deadline_monotonic is None else
+            started_at + max(0.0, deadline_monotonic - time.monotonic()))
         activity = _execution_activity_sample(proc)
         running = dict(prepared)
         running.update({
@@ -1935,7 +2053,8 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         _write_receipt_until_durable(receipt_path, running)
         _atomic_write_heartbeat(heartbeat_path, running)
         event = _owner_event(owner_fd, 0.0)
-        if event is None and time.monotonic() >= deadline_monotonic:
+        if (event is None and deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic):
             outcome = "timeout"
         elif event is None:
             _write_all(gate_write, b"G")
@@ -1985,7 +2104,8 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
                 pass
 
     leader_start = running["payload_start_ticks"]
-    deadline = float(spec["deadline_monotonic_s"])
+    raw_deadline = spec["deadline_monotonic_s"]
+    deadline = None if raw_deadline is None else float(raw_deadline)
     last_sample = (
         running["activity_cpu_ticks"], running["activity_output_bytes"],
         running["activity_descendant_count"])
@@ -1993,7 +2113,9 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
     next_heartbeat = time.monotonic() + _HEARTBEAT_INTERVAL_S
     if outcome is None:
         while True:
-            event = _owner_event(owner_fd, min(0.05, max(0.0, deadline - time.monotonic())))
+            wait_s = (0.05 if deadline is None else
+                      min(0.05, max(0.0, deadline - time.monotonic())))
+            event = _owner_event(owner_fd, wait_s)
             if event is not None:
                 outcome = event
                 break
@@ -2018,7 +2140,7 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
                 running["guardian_heartbeat_at_unix"] = time.time()
                 _atomic_write_heartbeat(heartbeat_path, running)
                 next_heartbeat = now_monotonic + _HEARTBEAT_INTERVAL_S
-            if now_monotonic >= deadline:
+            if deadline is not None and now_monotonic >= deadline:
                 outcome = "timeout"
                 break
 

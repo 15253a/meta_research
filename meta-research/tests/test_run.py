@@ -7,10 +7,14 @@ work_root 续跑（goal 不重建）；durable 停机与全局等待端到端生
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -20,15 +24,224 @@ from jsonschema.exceptions import ValidationError
 from orchestrator import database as db
 from orchestrator.interfaces import Artifact, CallUsage
 from orchestrator.instance_lease import InstanceLease
-from orchestrator.execution_sandbox import sandbox_environment_hash
-from orchestrator.run import System, build_system
-from orchestrator.runner import tool_free_runtime_contract
+from orchestrator.execution_sandbox import (
+    sandbox_environment_hash,
+    sandbox_workload_environment_hash,
+)
+from orchestrator.process_supervisor import ExecutionSupervisor, atomic_write_receipt
+from orchestrator.provider_invocation import write_provider_invocation_receipt
+from orchestrator.run import (
+    System, _GuardedRunner, _bundle_operator_mode_for_runtime,
+    _default_stage_runner, _is_tool_free_purpose, build_system,
+)
+from orchestrator.runner import (
+    DEFAULT_CODEX_EFFORT,
+    DEFAULT_CODEX_MODEL,
+    RunnerError,
+    tool_free_runtime_contract,
+)
 from orchestrator.storage_ops import SnapshotArchive
+from orchestrator.stage_provider import (
+    BUNDLE_OPERATOR_SESSION_CONTRACT,
+    STAGE_MAIN_SESSION_CONTRACT,
+)
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = str(Path(__file__).resolve().parent.parent)
 _POLICY = yaml.safe_load((Path(SYSTEM_ROOT) / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+
+
+def _use_budgeted_policy(monkeypatch, *, session_max=100000):
+    """Enable the optional cumulative accounting guard for tests devoted to it."""
+    import orchestrator.run as run_module
+
+    policy = json.loads(json.dumps(_POLICY))
+    policy["budget"]["session_max"] = session_max
+    monkeypatch.setattr(
+        run_module, "yaml",
+        types.SimpleNamespace(safe_load=lambda _text: policy))
+    return policy
 RUNTIME_ENV_HASH = sandbox_environment_hash(_POLICY["execution"]["sandbox"])
+
+
+def test_default_runner_isolates_both_wildidea_sessions():
+    assert _is_tool_free_purpose("idea-generate-n1") is True
+    assert _is_tool_free_purpose("idea-audit-n2") is True
+    assert _is_tool_free_purpose("plan-review-r1-n3") is True
+    assert _is_tool_free_purpose("interaction-query") is True
+    assert _is_tool_free_purpose("plan-n3") is False
+
+
+def test_plan_review_runner_has_clean_inline_only_context(tmp_path):
+    runner = _default_stage_runner(
+        tmp_path / "transcripts", "plan-review-r1-n3", work=tmp_path,
+        qualification=None, execution_supervisor=object())
+
+    assert runner.workspace_dir == tmp_path.resolve()
+    assert runner.no_host_tools is True
+    assert runner.tool_free is True
+    assert runner.isolated_host_tools is False
+    assert runner.sandbox_mode == "read-only"
+
+
+def test_default_stage_runner_uses_current_local_environment_with_broad_tools(tmp_path):
+    runner = _default_stage_runner(
+        tmp_path / "transcripts", "bundle-t1-n1", work=tmp_path,
+        qualification=None, execution_supervisor=object())
+    assert runner.workspace_dir == tmp_path.resolve()
+    assert runner.no_host_tools is False
+    assert runner.tool_free is False
+    assert runner.isolated_host_tools is False
+    assert runner.sandbox_mode == "danger-full-access"
+    assert runner.query_user is None
+    assert runner.output_uid == os.geteuid()
+    assert (runner.bundle_operator_session_contract
+            == BUNDLE_OPERATOR_SESSION_CONTRACT)
+
+
+def test_default_cycle_wide_bundle_main_is_owner_lifecycle_bound(tmp_path):
+    bundle = _default_stage_runner(
+        tmp_path / "bundle-transcripts", "bundle-main-c1-n1",
+        work=tmp_path, qualification=None, execution_supervisor=object())
+    plan = _default_stage_runner(
+        tmp_path / "plan-transcripts", "plan-main-c1-n2",
+        work=tmp_path, qualification=None, execution_supervisor=object())
+    assert bundle.lifecycle_bound is True and bundle.timeout_s is None
+    assert plan.lifecycle_bound is False
+    assert plan.timeout_s is not None and plan.timeout_s > 0
+
+
+def test_qualification_default_bundle_runner_keeps_no_host_tools_and_persistence(tmp_path):
+    """Qualification persistence retains context, never host execution authority."""
+    runner = _default_stage_runner(
+        tmp_path / "transcripts", "bundle-c1-t1-n1", work=tmp_path,
+        qualification=object(), execution_supervisor=object())
+
+    assert runner.no_host_tools is True
+    assert runner.sandbox_mode == "read-only"
+    assert runner.require_stage_submission is False
+    assert (runner.bundle_operator_session_contract
+            == BUNDLE_OPERATOR_SESSION_CONTRACT)
+    runner.bind_persistent_session(session_id=None, role="bundle_operator")
+    assert runner._persistent_session_bound is True
+    assert runner._persistent_session_role == "bundle_operator"
+
+
+@pytest.mark.parametrize("deployment_mode", ["development", "production"])
+@pytest.mark.parametrize("qualification_active", [False, True])
+def test_event_bundle_operator_is_retired_in_every_runtime_tier(
+        deployment_mode, qualification_active):
+    assert _bundle_operator_mode_for_runtime(
+        None, deployment_mode=deployment_mode,
+        qualification_active=qualification_active) is False
+
+
+def test_injected_bundle_operator_requires_exact_explicit_contract():
+    def undeclared(_transcripts, _purpose):
+        raise AssertionError("activation check must not instantiate runner")
+
+    assert _bundle_operator_mode_for_runtime(
+        undeclared, deployment_mode="development",
+        qualification_active=False) is False
+
+    def compatible(_transcripts, _purpose):
+        raise AssertionError("activation check must not instantiate runner")
+
+    compatible.bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
+    assert _bundle_operator_mode_for_runtime(
+        compatible, deployment_mode="production",
+        qualification_active=False) is False
+
+    compatible.bundle_operator_session_contract = "unknown-v99"
+    with pytest.raises(ValueError, match="持久会话合同"):
+        _bundle_operator_mode_for_runtime(
+            compatible, deployment_mode="development",
+            qualification_active=False)
+
+
+def test_qualification_keeps_stronger_no_injected_runner_boundary():
+    def compatible(_transcripts, _purpose):
+        raise AssertionError("qualification must reject before runner creation")
+
+    compatible.bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
+    with pytest.raises(ValueError, match="qualification 禁止注入"):
+        _bundle_operator_mode_for_runtime(
+            compatible, deployment_mode="development",
+            qualification_active=True)
+
+
+def test_injected_resident_factory_gets_same_turn_clean_child_review(tmp_path):
+    factory = _mock_factory([])
+    factory.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+    system = build_system(
+        SYSTEM_ROOT, str(tmp_path), runner_factory=factory, attack=False)
+    try:
+        provider = system.advancer._reasoning.__self__
+        assert provider.resident_stage_sessions is True
+        assert provider.inline_subagent_review is True
+        assert provider.review_rounds == {
+            "idea": 1, "plan": 1,
+            "bundle_code": 1, "bundle_result": 1,
+        }
+    finally:
+        system.close()
+
+
+@pytest.mark.parametrize(
+    "missing", ["run_task", "bind_persistent_session", "bind_runner_call"])
+def test_guarded_runner_rejects_declared_persistent_runner_missing_callable(
+        missing):
+    class DeclaredRunner:
+        bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
+
+        def run_task(self):
+            return "ran"
+
+        def bind_persistent_session(self, **_kwargs):
+            return "session-bound"
+
+        def bind_runner_call(self, **_kwargs):
+            return "call-bound"
+
+    inner = DeclaredRunner()
+    setattr(inner, missing, None)
+
+    with pytest.raises(RuntimeError, match=missing):
+        _GuardedRunner(inner, lambda: None)
+
+
+def test_guarded_runner_required_binding_never_degrades_to_noop():
+    class DeclaredRunner:
+        stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+
+        def run_task(self):
+            return "ran"
+
+        def bind_persistent_session(self, **_kwargs):
+            return "session-bound"
+
+        def bind_runner_call(self, **_kwargs):
+            return "call-bound"
+
+    inner = DeclaredRunner()
+    guarded = _GuardedRunner(inner, lambda: None)
+    inner.bind_persistent_session = None
+
+    with pytest.raises(RuntimeError, match="bind_persistent_session.*漂移"):
+        guarded.bind_persistent_session(session_id="thread-1", role="stage_main")
+
+
+def test_guarded_runner_keeps_optional_bindings_for_undeclared_compat_runner():
+    class CompatRunner:
+        def run_task(self):
+            return "ran"
+
+    guarded = _GuardedRunner(CompatRunner(), lambda: None)
+
+    assert guarded.bind_persistent_session(session_id=None) is None
+    assert guarded.bind_runner_call(runner_call_id=1) is None
+    assert guarded.run_task() == "ran"
+
 
 _BOOT_TERMINATE = {
     "tree_ops.json": {"ops": [{"op": "create_root", "text": "根问题：EEG 有跨数据集通用规律吗？",
@@ -43,9 +256,81 @@ def _query_tool_free_contract():
     return {
         **tool_free_runtime_contract(),
         "bin": os.environ.get("METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex"),
-        "model": os.environ.get("METARESEARCH_CODEX_MODEL", "gpt-5.5"),
-        "effort": os.environ.get("METARESEARCH_CODEX_EFFORT", "medium"),
+        "model": os.environ.get("METARESEARCH_CODEX_MODEL", DEFAULT_CODEX_MODEL),
+        "effort": os.environ.get("METARESEARCH_CODEX_EFFORT", DEFAULT_CODEX_EFFORT),
     }
+
+
+class _PersistentQueryTestRunner:
+    """Give injected query doubles the same durable session evidence as CodexRunner.
+
+    Production query assembly requires an execution receipt, a provider receipt, and
+    a provider thread/session id before it will admit a natural-language reply.  The
+    ordinary stage doubles in this module intentionally do not need that capability;
+    query-specific doubles subclass this helper and call ``query_artifact``.
+    """
+
+    tool_free_contract = _query_tool_free_contract()
+
+    def __init__(self, work_root: Path):
+        self._query_work_root = Path(work_root)
+        self._query_call = None
+        self._query_session_id = None
+
+    def bind_runner_call(self, *, runner_call_id, reconcile_protocol, phase, purpose):
+        self._query_call = {
+            "runner_call_id": runner_call_id,
+            "reconcile_protocol": reconcile_protocol,
+            "phase": phase,
+            "purpose": purpose,
+        }
+
+    def bind_persistent_session(self, *, session_id):
+        self._query_session_id = session_id
+
+    def query_artifact(self, *, context_pack, answer: str, usage: CallUsage) -> Artifact:
+        call = self._query_call
+        assert call is not None
+        operation_id = "exec-" + hashlib.sha256(
+            f"{self._query_work_root}:{call['runner_call_id']}".encode("utf-8")
+        ).hexdigest()[:32]
+        supervisor = ExecutionSupervisor.standalone(
+            self._query_work_root / "state" / "executions")
+        execution_path = supervisor.receipt_dir / f"execution-{operation_id}.json"
+        execution = supervisor._prepared_receipt(  # noqa: SLF001 - deterministic fixture
+            operation_id=operation_id, kind="codex-query-test",
+            spec_sha256="sha256:" + "e" * 64, timeout_s=10,
+            operation_context={
+                "reconcile_protocol": call["reconcile_protocol"],
+                "db_owner_kind": "runner_call",
+                "db_owner_id": call["runner_call_id"],
+                "cycle_id": context_pack.cycle_id,
+                "db_phase": call["phase"],
+                "db_purpose": call["purpose"],
+            })
+        now = time.time()
+        execution.update({
+            "state": "terminal", "outcome": "exit", "returncode": 0,
+            "started_at_unix": now - 0.01, "finished_at_unix": now,
+            "group_drained": True, "term_sent": False, "kill_sent": False,
+        })
+        atomic_write_receipt(execution_path, execution)
+        provider_path = write_provider_invocation_receipt(
+            receipt_dir=supervisor.receipt_dir,
+            runner_call_id=call["runner_call_id"],
+            cycle_id=context_pack.cycle_id, phase=call["phase"],
+            purpose=call["purpose"], provider="codex-cli",
+            model=DEFAULT_CODEX_MODEL, effort=DEFAULT_CODEX_EFFORT,
+            prompt_sha256="sha256:" + "f" * 64,
+            usage=usage, usage_source="json_turn_completed",
+            execution_receipt_ref=str(execution_path),
+            provider_invocation_id=(self._query_session_id or "thread-run-test"),
+            provider_invocation_id_kind="thread_id")
+        return Artifact(
+            stage="reasoning", md="", usage=usage,
+            files={"interaction_reply.json": {"answer": answer}},
+            execution_receipt_ref=str(execution_path),
+            provider_receipt_ref=provider_path)
 
 
 def _mock_factory(files_seq):
@@ -84,6 +369,21 @@ def test_system_rejects_unimplemented_multi_stage_session_mode(tmp_path):
     assert system.dual_mode == "A"
 
 
+def test_system_run_rejects_negative_cycle_limit_before_advancer(tmp_path):
+    class NeverAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            raise AssertionError("negative limit must not reach advancer")
+
+    system = System(
+        advancer=NeverAdvancer(), state=None, daemon=None,
+        dual_mode="A", work_root=tmp_path)
+    with pytest.raises(ValueError, match="max_cycles 须为非负整数"):
+        system.run(-1)
+
+
 def test_build_system_rejects_mode_b_before_work_root_side_effect(tmp_path, monkeypatch):
     policy = yaml.safe_load(yaml.safe_dump(_POLICY))
     policy["session"]["dual_mode"] = "B"
@@ -92,6 +392,460 @@ def test_build_system_rejects_mode_b_before_work_root_side_effect(tmp_path, monk
     with pytest.raises(ValidationError):
         build_system(SYSTEM_ROOT, str(work))
     assert not work.exists()
+
+
+def test_build_system_keeps_one_lexical_absolute_work_root(tmp_path, monkeypatch):
+    import orchestrator.run as R
+
+    captured = {}
+    lease = object()
+    assembled = object()
+
+    class FakeInstanceLease:
+        @staticmethod
+        def acquire(work_root, *, heartbeat_interval_s):
+            captured["lease_work"] = work_root
+            captured["heartbeat_interval_s"] = heartbeat_interval_s
+            return lease
+
+    def fake_assemble_system(**kwargs):
+        captured["assembly_work"] = kwargs["work"]
+        captured["instance_lease"] = kwargs["instance_lease"]
+        return assembled
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(R, "InstanceLease", FakeInstanceLease)
+    monkeypatch.setattr(R, "_assemble_system", fake_assemble_system)
+
+    assert R.build_system(
+        SYSTEM_ROOT, "relative-work", attack=False,
+        heartbeat_interval_s=0.5) is assembled
+    expected = tmp_path / "relative-work"
+    assert captured == {
+        "lease_work": expected,
+        "heartbeat_interval_s": 0.5,
+        "assembly_work": expected,
+        "instance_lease": lease,
+    }
+
+
+def test_runtime_profile_projection_is_private_and_closes_compute_review_choices():
+    import copy
+    import orchestrator.run as R
+
+    base = copy.deepcopy(_POLICY)
+    original = copy.deepcopy(base)
+    gpu = R._project_quest_runtime_policy(base, {
+        "profile": {
+            "version": 1,
+            "compute_profile_id": "local-gpu",
+            "review_intensity": "once",
+        },
+    })
+    assert base == original
+    assert gpu is not base
+    # local-gpu never gets device/memory authority from the mutable ledger.
+    assert gpu["resources"] == original["resources"]
+    assert gpu["resources"] == {
+        "gpus": 8,
+        "gpu_mem_gb": 80,
+        "disk_quota_gb": 10240,
+        "gpu_target_policy": "required",
+        "allowed_device_indices": list(range(8)),
+    }
+    assert [gpu["flow"]["retry"][field] for field in (
+        "plan_review", "bundle_code_review", "bundle_result_review",
+    )] == [1, 1, 1]
+
+    selected_indices = [1, 4, 6]
+    selected_profile = {
+        "version": 3,
+        "compute_profile_id": "local-gpu",
+        "review_intensity": "once",
+        "gpu_device_indices": selected_indices,
+    }
+    narrowed = R._project_quest_runtime_policy(base, {
+        "profile": selected_profile,
+    })
+    expected_narrowed = copy.deepcopy(original)
+    expected_narrowed["resources"]["gpus"] = len(selected_indices)
+    expected_narrowed["resources"]["allowed_device_indices"] = selected_indices
+    for field in (
+            "plan_review", "bundle_code_review", "bundle_result_review"):
+        expected_narrowed["flow"]["retry"][field] = 1
+    assert narrowed == expected_narrowed
+    assert narrowed["resources"]["gpus"] == len(selected_indices)
+    assert original["resources"]["gpus"] == 8
+    assert (narrowed["resources"]["gpu_mem_gb"]
+            == original["resources"]["gpu_mem_gb"] == 80)
+    assert narrowed["resources"]["disk_quota_gb"] == (
+        original["resources"]["disk_quota_gb"])
+    assert narrowed["resources"]["gpu_target_policy"] == (
+        original["resources"]["gpu_target_policy"])
+    assert base == original
+    assert selected_profile["gpu_device_indices"] == [1, 4, 6]
+
+    with pytest.raises(ValueError, match="runtime GPU"):
+        R._project_quest_runtime_policy(base, {
+            "profile": {
+                **selected_profile,
+                "gpu_device_indices": [8],
+            },
+        })
+    two_gpu_base = copy.deepcopy(base)
+    two_gpu_base["resources"]["gpus"] = 2
+    with pytest.raises(ValueError, match="runtime GPU"):
+        R._project_quest_runtime_policy(two_gpu_base, {
+            "profile": {
+                **selected_profile,
+                "version": 2,
+                "gpu_device_indices": [0],
+            },
+        })
+    assert base == original
+
+    exact_indices = [1, 4, 7]
+    exact = R._project_quest_runtime_policy(base, {
+        "profile": {
+            "version": 3,
+            "compute_profile_id": "local-gpu",
+            "review_intensity": "once",
+            "gpu_device_indices": exact_indices,
+        },
+    })
+    assert exact["resources"]["gpus"] == 3
+    assert exact["resources"]["allowed_device_indices"] == exact_indices
+    assert exact["resources"]["gpu_mem_gb"] == 80
+    assert exact["resources"]["gpu_target_policy"] == "required"
+    assert exact["execution"]["sandbox"] == original["execution"]["sandbox"]
+    assert base == original
+
+    cpu = R._project_quest_runtime_policy(base, {
+        "profile": {
+            "version": 1,
+            "compute_profile_id": "local-cpu",
+            "review_intensity": "off",
+        },
+    })
+    assert {field: cpu["resources"][field] for field in (
+        "gpus", "gpu_mem_gb", "allowed_device_indices", "gpu_target_policy",
+    )} == {
+        "gpus": 0,
+        "gpu_mem_gb": 0,
+        "allowed_device_indices": [],
+        "gpu_target_policy": "forbidden",
+    }
+    assert [cpu["flow"]["retry"][field] for field in (
+        "plan_review", "bundle_code_review", "bundle_result_review",
+    )] == [0, 0, 0]
+    # Compute/review selection must not widen host env or Docker networking.
+    assert cpu["execution"]["sandbox"]["network_mode"] == (
+        original["execution"]["sandbox"]["network_mode"])
+    assert cpu["execution"]["sandbox"]["local_environment"] == (
+        original["execution"]["sandbox"]["local_environment"])
+    assert base == original
+
+
+def test_runtime_profile_monitor_waits_for_durable_cycle_boundary():
+    import copy
+    import threading
+    import orchestrator.run as R
+
+    applied = {
+        "quest_id": "alpha",
+        "revision": 1,
+        "profile": {
+            "version": 1, "compute_profile_id": "local-gpu",
+            "review_intensity": "once",
+        },
+        "record_sha256": "sha256:" + "1" * 64,
+        "source": "ledger",
+    }
+    latest = {
+        **applied,
+        "revision": 2,
+        "record_sha256": "sha256:" + "2" * 64,
+    }
+
+    class Settings:
+        def current(self):
+            return copy.deepcopy(latest)
+
+    stop = threading.Event()
+    monitor = R._RuntimeProfileMonitor(Settings(), applied, stop)
+    # A stage precheck may observe the update, but an old-policy cycle must
+    # continue through its remaining stages and gates without interruption.
+    assert monitor.probe(safe_cycle_boundary=False) is None
+    assert stop.is_set() is False
+    assert monitor.pending_revision == 2
+    reason = monitor.probe(safe_cycle_boundary=True)
+    assert "durable cycle" in reason
+    assert stop.is_set() is True
+
+
+def test_runtime_cycle_binding_clears_only_after_success_without_inflight(tmp_path):
+    events = []
+
+    class State:
+        inflight = None
+
+        def inflight_cycle(self):
+            return self.inflight
+
+    class Advancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def __init__(self, state, *, failure=None):
+            self.state = state
+            self.failure = failure
+
+        def run_cycles(self, _max_cycles):
+            if self.failure is not None:
+                raise self.failure
+            return []
+
+    state = State()
+    system = System(
+        advancer=Advancer(state), state=state, daemon=None,
+        dual_mode="A", work_root=tmp_path,
+        runtime_profile_cycle_bind=lambda: events.append("bind"),
+        runtime_profile_cycle_clear=lambda: events.append("clear"))
+    assert system.run(1) == []
+    assert events == ["bind", "clear"]
+
+    events.clear()
+    state.inflight = object()
+    blocked = System(
+        advancer=Advancer(state), state=state, daemon=None,
+        dual_mode="A", work_root=tmp_path,
+        runtime_profile_cycle_bind=lambda: events.append("bind"),
+        runtime_profile_cycle_clear=lambda: events.append("clear"))
+    assert blocked.run(1) == []
+    assert events == ["bind"]
+
+    events.clear()
+    state.inflight = None
+    failed = System(
+        advancer=Advancer(state, failure=RuntimeError("provider crash")),
+        state=state, daemon=None, dual_mode="A", work_root=tmp_path,
+        runtime_profile_cycle_bind=lambda: events.append("bind"),
+        runtime_profile_cycle_clear=lambda: events.append("clear"))
+    with pytest.raises(RuntimeError, match="provider crash"):
+        failed.run(1)
+    assert events == ["bind"]
+
+
+def test_stale_cycle_binding_without_inflight_clears_then_exits_to_latest(tmp_path):
+    import orchestrator.run as R
+    from orchestrator.quest_runtime_profiles import QuestRuntimeSettings
+
+    work = tmp_path / "alpha"
+    work.mkdir(mode=0o700)
+    (work / "state").mkdir(mode=0o700)
+    settings = QuestRuntimeSettings(work, "alpha")
+    old = settings.initialize({
+        "version": 1, "compute_profile_id": "local-gpu",
+        "review_intensity": "once",
+    }, "1" * 32)
+    initial = build_system(
+        SYSTEM_ROOT, str(work), runner_factory=_mock_factory([]),
+        attack=False, quest_id="alpha",
+        expected_runtime_profile_revision=old["revision"],
+        expected_runtime_profile_record_sha256=old["record_sha256"])
+    assert initial.close() is None
+    settings.bind_cycle_profile(old)
+    latest = settings.update({
+        "version": 1, "compute_profile_id": "local-cpu",
+        "review_intensity": "off",
+    }, "2" * 32)
+    with pytest.raises(R.RuntimeProfileRestartRequired, match="no-inflight DB"):
+        build_system(
+            SYSTEM_ROOT, str(work), runner_factory=_mock_factory([]),
+            attack=False, quest_id="alpha",
+            expected_runtime_profile_revision=old["revision"],
+            expected_runtime_profile_record_sha256=old["record_sha256"])
+    assert latest["revision"] != old["revision"]
+    # The old owner exits before entering run(1), so it cannot recreate the
+    # stale marker and cause a restart loop.
+    assert settings.bound_cycle_profile() is None
+
+    replacement = build_system(
+        SYSTEM_ROOT, str(work), runner_factory=_mock_factory([]),
+        attack=False, quest_id="alpha",
+        expected_runtime_profile_revision=latest["revision"],
+        expected_runtime_profile_record_sha256=latest["record_sha256"])
+    try:
+        assert replacement.runtime_profile_revision == latest["revision"]
+    finally:
+        assert replacement.close() is None
+
+
+def test_stale_gpu_binding_is_cleared_before_attack_gpu_preflight(
+        tmp_path, monkeypatch):
+    import orchestrator.run as R
+    from orchestrator.quest_runtime_profiles import QuestRuntimeSettings
+
+    work = tmp_path / "alpha"
+    work.mkdir(mode=0o700)
+    (work / "state").mkdir(mode=0o700)
+    settings = QuestRuntimeSettings(work, "alpha")
+    old = settings.initialize({
+        "version": 1, "compute_profile_id": "local-gpu",
+        "review_intensity": "once",
+    }, "1" * 32)
+    initial = build_system(
+        SYSTEM_ROOT, str(work), runner_factory=_mock_factory([]),
+        attack=False, quest_id="alpha",
+        expected_runtime_profile_revision=old["revision"],
+        expected_runtime_profile_record_sha256=old["record_sha256"])
+    assert initial.close() is None
+    settings.bind_cycle_profile(old)
+    settings.update({
+        "version": 1, "compute_profile_id": "local-cpu",
+        "review_intensity": "off",
+    }, "2" * 32)
+
+    preflight_calls = []
+
+    def forbidden_old_gpu_preflight(*_args, **_kwargs):
+        preflight_calls.append(True)
+        raise AssertionError("obsolete GPU/Docker preflight was reached")
+
+    monkeypatch.setattr(R, "DockerExecutionSandbox", forbidden_old_gpu_preflight)
+    with pytest.raises(R.RuntimeProfileRestartRequired, match="no-inflight DB"):
+        R.build_system(
+            SYSTEM_ROOT, str(work), runner_factory=_mock_factory([]),
+            attack=True, quest_id="alpha",
+            expected_runtime_profile_revision=old["revision"],
+            expected_runtime_profile_record_sha256=old["record_sha256"])
+    assert preflight_calls == []
+    assert settings.bound_cycle_profile() is None
+
+
+def test_midcycle_crash_reopens_with_bound_profile_not_latest(tmp_path, monkeypatch):
+    from orchestrator.quest_runtime_profiles import QuestRuntimeSettings
+
+    _use_budgeted_policy(monkeypatch)
+
+    work = tmp_path / "alpha"
+    work.mkdir(mode=0o700)
+    (work / "state").mkdir(mode=0o700)
+    settings = QuestRuntimeSettings(work, "alpha")
+    old = settings.initialize({
+        "version": 1, "compute_profile_id": "local-gpu",
+        "review_intensity": "once",
+    }, "1" * 32)
+
+    class SimulatedOwnerCrash(BaseException):
+        pass
+
+    class CrashRunner:
+        def run_task(self, **_kwargs):
+            raise SimulatedOwnerCrash("simulated owner crash during cycle")
+
+    first = build_system(
+        SYSTEM_ROOT, str(work),
+        runner_factory=lambda *_args: CrashRunner(), attack=False,
+        quest_id="alpha",
+        expected_runtime_profile_revision=old["revision"],
+        expected_runtime_profile_record_sha256=old["record_sha256"])
+    with pytest.raises(SimulatedOwnerCrash, match="simulated owner crash"):
+        first.run(1)
+    assert first.state.inflight_cycle() is not None
+    assert settings.bound_cycle_profile()["revision"] == old["revision"]
+    assert first.close() is None
+
+    latest = settings.update({
+        "version": 1, "compute_profile_id": "local-cpu",
+        "review_intensity": "off",
+    }, "2" * 32)
+    recovered = build_system(
+        SYSTEM_ROOT, str(work),
+        runner_factory=_mock_factory([_BOOT_TERMINATE]), attack=False,
+        quest_id="alpha",
+        expected_runtime_profile_revision=old["revision"],
+        expected_runtime_profile_record_sha256=old["record_sha256"])
+    try:
+        assert recovered.runtime_profile_revision == old["revision"]
+        assert latest["revision"] != recovered.runtime_profile_revision
+        assert recovered.state.inflight_cycle() is not None
+        # Core cost-accounting reconciliation conservatively terminalizes the
+        # interrupted provider instead of retrying unknown usage.  The runtime
+        # boundary must still retain the old binding; it may never reinterpret
+        # this inflight cycle under latest CPU/review-off policy.
+        assert recovered.run(1) == []
+        assert recovered.last_stop_reason == "cost_accounting_failed"
+        assert recovered.state.inflight_cycle() is not None
+        assert settings.bound_cycle_profile()["revision"] == old["revision"]
+    finally:
+        assert recovered.close() is None
+
+
+def test_build_system_runtime_profile_fences_expected_hash_and_legacy_is_opt_in(
+        tmp_path, monkeypatch):
+    import orchestrator.run as R
+    from orchestrator.quest_runtime_profiles import QuestRuntimeSettings
+
+    work = tmp_path / "alpha-work"
+    work.mkdir(mode=0o700)
+    (work / "state").mkdir(mode=0o700)
+    settings = QuestRuntimeSettings(work, "alpha")
+    current = settings.initialize({
+        "version": 1,
+        "compute_profile_id": "local-cpu",
+        "review_intensity": "off",
+    }, "a" * 32)
+    captured = {}
+    assembled = object()
+
+    def fake_assemble(**kwargs):
+        captured.update(kwargs)
+        return assembled
+
+    monkeypatch.setattr(R, "_assemble_system", fake_assemble)
+    assert R.build_system(
+        SYSTEM_ROOT, str(work), attack=False,
+        enforce_instance_lease=False, quest_id="alpha",
+        expected_runtime_profile_revision=current["revision"],
+        expected_runtime_profile_record_sha256=current["record_sha256"],
+    ) is assembled
+    assert captured["policy"]["resources"]["gpus"] == 0
+    assert captured["runtime_settings"].quest_id == "alpha"
+    assert captured["applied_runtime_profile"]["record_sha256"] == (
+        current["record_sha256"])
+
+    called = []
+    monkeypatch.setattr(
+        R, "_assemble_system", lambda **_kwargs: called.append(True))
+    with pytest.raises(ValueError, match="manager 捕获后发生漂移"):
+        R.build_system(
+            SYSTEM_ROOT, str(work), attack=False,
+            enforce_instance_lease=False, quest_id="alpha",
+            expected_runtime_profile_revision=current["revision"],
+            expected_runtime_profile_record_sha256="sha256:" + "0" * 64,
+        )
+    assert called == []
+
+    # Ordinary CLI/tests with no proven quest identity retain the exact legacy
+    # base-policy path and must not even instantiate the mutable settings API.
+    legacy_work = tmp_path / "plain_tmp_path_with_underscores"
+    monkeypatch.setattr(
+        R, "QuestRuntimeSettings",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy build must not read quest runtime settings")))
+    seen = {}
+
+    def fake_legacy_assemble(**kwargs):
+        seen["policy"] = kwargs["policy"]
+        return assembled
+
+    monkeypatch.setattr(R, "_assemble_system", fake_legacy_assemble)
+    result = R.build_system(
+        SYSTEM_ROOT, str(legacy_work), attack=False,
+        enforce_instance_lease=False)
+    assert result is assembled
+    assert seen["policy"] == _POLICY
 
 
 def test_system_run_keeps_primary_when_exit_notification_scan_also_fails(tmp_path):
@@ -142,6 +896,49 @@ def test_run_forever_waits_and_counts_max_cycles_across_reentry(tmp_path, monkey
                               linger_after_terminal=False) == ["c1", "c2", "c3"]
     assert advancer.budgets == [1, 1, 1, 1]                 # 每轮归还控制；阻断不重置累计上限
     assert len(scans) == 5                                  # 四次推进边界 + 受控退出排空扫描
+
+
+def test_run_forever_never_outer_retries_resident_artifact_rejection(tmp_path):
+    class RetryAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def run_cycles(self, _max_cycles):
+            self.calls += 1
+            if self.calls == 1:
+                raise RunnerError(
+                    "plan schema repair exhausted", failure_kind="artifact_parse")
+            return ["c1"]
+
+    advancer = RetryAdvancer()
+    system = System(
+        advancer=advancer, state=None, daemon=None,
+        dual_mode="A", work_root=tmp_path)
+
+    with pytest.raises(RunnerError, match="schema repair exhausted"):
+        system.run_forever(
+            1, poll_interval_s=0.01, linger_after_terminal=False)
+    assert advancer.calls == 1
+
+
+def test_run_forever_does_not_retry_runner_integrity_failure(tmp_path):
+    class BrokenAdvancer:
+        last_stop_reason = None
+        last_block_reason = None
+
+        def run_cycles(self, _max_cycles):
+            raise RunnerError(
+                "provider thread changed", failure_kind="provider_session_drift")
+
+    system = System(
+        advancer=BrokenAdvancer(), state=None, daemon=None,
+        dual_mode="A", work_root=tmp_path)
+
+    with pytest.raises(RunnerError, match="provider thread changed"):
+        system.run_forever(1, poll_interval_s=0.01, linger_after_terminal=False)
 
 
 @pytest.mark.parametrize("interval", [0, -1, float("nan"), float("inf"), True])
@@ -434,6 +1231,73 @@ def test_main_rejects_once_with_exit_after_research(tmp_path, capsys):
     assert "not allowed with argument --once" in capsys.readouterr().err
 
 
+def test_main_rejects_negative_max_cycles_before_assembly(tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    assembled = []
+    monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: assembled.append(True))
+    with pytest.raises(SystemExit) as caught:
+        R.main([
+            "--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+            "--max-cycles", "-1", "--once", "--no-outbound",
+        ])
+    assert caught.value.code == 2
+    assert assembled == []
+    assert "max-cycles 须为非负整数" in capsys.readouterr().err
+
+
+def test_main_zero_cycle_reports_preflight_not_idle(tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    class ZeroCycleSystem:
+        dual_mode = "A"
+        last_stop_reason = None
+
+        class advancer:
+            last_block_reason = None
+
+        def run(self, max_cycles):
+            assert max_cycles == 0
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: ZeroCycleSystem())
+    assert R.main([
+        "--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+        "--max-cycles", "0", "--once", "--no-outbound",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "停因=zero-cycle-preflight" in output
+    assert "prior-terminate/idle" not in output
+
+
+def test_main_reports_positive_cycle_cap_separately_from_terminate(tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    class CappedSystem:
+        dual_mode = "A"
+        last_stop_reason = None
+
+        class advancer:
+            last_block_reason = None
+
+        def run(self, max_cycles):
+            assert max_cycles == 1
+            return ["c1"]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(R, "build_system", lambda *_a, **_kw: CappedSystem())
+    assert R.main([
+        "--system-root", SYSTEM_ROOT, "--work-root", str(tmp_path),
+        "--max-cycles", "1", "--once", "--no-outbound",
+    ]) == 0
+    assert "停因=max_cycles_reached" in capsys.readouterr().out
+
+
 def test_second_ctrl_c_during_run_forever_drain_is_hard_stop(tmp_path):
     class InterruptAdvancer:
         last_stop_reason = None
@@ -525,8 +1389,53 @@ def test_main_second_ctrl_c_during_fallback_drain_kills_groups(tmp_path, monkeyp
 
 
 # ============ 全装配端到端（reasoning-only 闭环）============
+@pytest.mark.parametrize("contract_attr,contract_value", [
+    ("bundle_operator_session_contract", BUNDLE_OPERATOR_SESSION_CONTRACT),
+    ("stage_main_session_contract", STAGE_MAIN_SESSION_CONTRACT),
+])
+def test_build_system_persistent_contract_checks_inner_runner_capabilities_on_creation(
+        tmp_path, contract_attr, contract_value):
+    class MissingRunnerCallBinding:
+        def run_task(self, **_kwargs):
+            raise AssertionError("capability check must fail before run_task")
+
+        def bind_persistent_session(self, **_kwargs):
+            raise AssertionError("capability check must fail before session binding")
+
+    setattr(MissingRunnerCallBinding, contract_attr, contract_value)
+
+    def declared_factory(_transcripts, _purpose):
+        return MissingRunnerCallBinding()
+
+    setattr(declared_factory, contract_attr, contract_value)
+    system = build_system(
+        SYSTEM_ROOT, str(tmp_path), runner_factory=declared_factory)
+    try:
+        stage_provider = system.advancer._reasoning.__self__
+        with pytest.raises(RuntimeError, match="bind_runner_call"):
+            stage_provider.runner_factory(
+                tmp_path / "capability-probe", "capability-probe")
+    finally:
+        system.close()
+
+
+def test_default_attack_assembly_shares_owner_fenced_pool_publisher(tmp_path):
+    from orchestrator.pool_publication import PoolPublisher
+
+    system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))
+    try:
+        attack = system.advancer.attack
+        assert attack.gate.require_formal_publication is True
+        assert isinstance(attack.pool_publisher, PoolPublisher)
+        assert attack.gate.pool_publisher is attack.pool_publisher
+        assert attack.pool_publisher.work_root == tmp_path.absolute()
+        assert attack.pool_publisher.owner_guard == system.instance_lease.assert_owned
+    finally:
+        system.close()
+
+
 def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
-    from orchestrator.execution_sandbox import DockerExecutionSandbox
+    from orchestrator.execution_sandbox import LocalExecutionSandbox
     from orchestrator.import_fetcher import FrozenCandidateFetcher
     from orchestrator.repository_materializer import (
         GitHubRepositoryMaterializer, ProductionCandidateFetcher)
@@ -536,7 +1445,7 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         BoundedReferenceSnapshotProvider, ImportTriggerRouter,
         TrustedImportTriggerService)
     from orchestrator.import_worker import ImportWorker
-    from orchestrator.stage_provider import PlanReviewProvider
+    from orchestrator.stage_provider import JudgeProvider, PlanReviewProvider
 
     system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))
     try:
@@ -551,7 +1460,8 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
             worker.p["fetch"].repository_fetcher.adapter_generator,
             AdapterGenerationService)
         assert worker.execution_supervisor is system.execution_supervisor
-        assert isinstance(worker.execution_sandbox, DockerExecutionSandbox)
+        assert isinstance(worker.execution_sandbox, LocalExecutionSandbox)
+        assert worker.execution_sandbox.backend_name == "local-conda"
         assert system.deployment_receipt["mode"] == "development"
         assert system.deployment_receipt["production_ready"] is False
         deployment_receipts = list((tmp_path / "state" / "deployment").glob("deployment-*.json"))
@@ -561,11 +1471,13 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         assert system.advancer.compiler.runtime_environment_hash == runtime_hash
         assert "gpu_capability" not in system.advancer.attack.policy["execution"]["sandbox"]
         assert worker.p["fetch"].repository_fetcher.environment_hash == runtime_hash
-        assert (system.advancer.attack.execution_sandbox_resolver.bootstrap_sandbox
-                is worker.execution_sandbox)
-        assert worker.execution_sandbox.resource_mode in {
-            "cgroup-v1", "cgroup-v2", "rlimit-fallback"}
-        assert isinstance(system.advancer.attack.p["plan_review"], PlanReviewProvider)
+        assert system.advancer.attack.execution_sandbox_resolver is None
+        assert worker.execution_sandbox.resource_mode == "unrestricted-local"
+        assert "plan_review" not in system.advancer.attack.p
+        assert "judge" not in system.advancer.attack.p
+        assert isinstance(worker.p["judge"], JudgeProvider)
+        assert system.advancer.attack.gate.require_code_review is False
+        assert system.advancer.attack.gate.require_result_review is False
         search = system.advancer.attack.p["import_search"]
         assert isinstance(search, ImportTriggerRouter)
         assert isinstance(search.new_structure, ImportSearchService)
@@ -591,6 +1503,11 @@ def test_production_deployment_cannot_bypass_full_sandbox(tmp_path, monkeypatch)
         "attestation_path": "/etc/meta-research/deployment.json",
         "max_attestation_age_s": 300,
     }
+    policy["execution"]["sandbox"].update({
+        "development_gpu_thread_limit": None,
+        "local_environment": None,
+        "network_mode": "none",
+    })
     monkeypatch.setattr(R, "yaml", types.SimpleNamespace(safe_load=lambda _text: policy))
     with pytest.raises(ValueError, match="production deployment.*attack/sandbox"):
         R.build_system(
@@ -643,16 +1560,23 @@ def test_deployment_preflight_rejects_before_database_and_releases_lease(tmp_pat
 
 
 @pytest.mark.parametrize(
-    ("gpu_ready", "resource_mode", "limits_ready", "promoted", "canary_raises"), [
-        (False, "cgroup-v2", True, False, False),
-        (True, "cgroup-v2", True, True, False),
-        (True, "rlimit-fallback", False, False, False),
-        (True, "cgroup-v2", False, False, False),
-        (True, "cgroup-v2", True, False, True),
+    ("deployment_mode", "gpu_ready", "resource_mode", "limits_ready",
+     "promoted", "canary_raises"), [
+        ("development", False, "cgroup-v2", True, False, False),
+        ("development", True, "cgroup-v2", True, True, False),
+        # Development may use the exact canary-proved allocation while the
+        # existing CPU sandbox remains on its explicit RLIMIT fallback.
+        ("development", True, "rlimit-fallback", False, True, False),
+        ("development", True, "cgroup-v2", False, True, False),
+        ("development", True, "cgroup-v2", True, False, True),
+        # Production retains its aggregate cgroup/resource-limit boundary.
+        ("production", True, "cgroup-v2", True, True, False),
+        ("production", True, "rlimit-fallback", False, False, False),
+        ("production", True, "cgroup-v2", False, False, False),
     ])
 def test_gpu_canary_runs_only_after_identity_gate_and_recovery(
-        tmp_path, monkeypatch, gpu_ready, resource_mode, limits_ready,
-        promoted, canary_raises):
+        tmp_path, monkeypatch, deployment_mode, gpu_ready, resource_mode,
+        limits_ready, promoted, canary_raises):
     import copy
     import types
     import orchestrator.run as R
@@ -672,7 +1596,10 @@ def test_gpu_canary_runs_only_after_identity_gate_and_recovery(
     candidate = {
         "gpu_contract": contract, "candidate_hash": "sha256:" + "a" * 64,
         "facts": {"docker": {"daemon": {
-            "runtimes": (["nvidia", "runc"] if gpu_ready else ["runc"])}}},
+            # A proxy can honour the exact DeviceRequest without advertising a
+            # separately named nvidia runtime.  The canary, not this list, is
+            # the execution proof.
+            "runtimes": ["runc"]}}},
     }
 
     class CanaryFailed(RuntimeError):
@@ -685,6 +1612,9 @@ def test_gpu_canary_runs_only_after_identity_gate_and_recovery(
             self.gpu_contract = gpu_contract
             self.system_root = system_root
             self.resource_mode = resource_mode
+            self.environment_hash = sandbox_environment_hash(self.config)
+            self.backend_name = (
+                "local-conda" if deployment_mode == "development" else "docker")
             self.image_environment = {
                 "PYTHON_VERSION": _POLICY["import_materialization"]["compiler"]["version"],
                 "PYTHON_SHA256": _POLICY["import_materialization"]["compiler"][
@@ -713,12 +1643,15 @@ def test_gpu_canary_runs_only_after_identity_gate_and_recovery(
 
         def finalize(self, evidence):
             assert evidence == (
-                {"mechanical": "evidence"}
-                if gpu_ready and not canary_raises else None)
+                None if deployment_mode == "development" or canary_raises
+                else {"mechanical": "evidence"})
             calls.append("deployment-finalize")
             return {
-                "mode": "development", "production_ready": False,
+                "mode": deployment_mode,
+                "production_ready": deployment_mode == "production" and promoted,
                 "checks": [
+                    {"name": "gpu_inventory", "ok": gpu_ready},
+                    {"name": "gpu_device_runtime", "ok": gpu_ready},
                     {"name": "sandbox_gpu_access", "ok": gpu_ready},
                     {"name": "docker_cgroup",
                      "ok": resource_mode in {"cgroup-v1", "cgroup-v2"}},
@@ -734,18 +1667,41 @@ def test_gpu_canary_runs_only_after_identity_gate_and_recovery(
         calls.append("downstream-gpu" if bootstrap.gpu_contract else "downstream-cpu")
         raise DownstreamReached()
 
+    def stop_repository(**_kwargs):
+        # Local development intentionally skips the Docker wheel-image builder;
+        # repository materialization is the first shared downstream boundary.
+        calls.append("downstream-gpu")
+        raise DownstreamReached()
+
     policy = copy.deepcopy(_POLICY)
     policy["resources"].update({"gpus": 1, "gpu_mem_gb": 80})
+    policy["deployment"]["mode"] = deployment_mode
+    if deployment_mode == "production":
+        # FakeDeployment owns this unit's identity boundary; the path only
+        # keeps the complete policy profile schema-valid.
+        policy["deployment"]["attestation_path"] = str(
+            tmp_path / "deployment-attestation.json")
+        policy["execution"]["sandbox"].update({
+            "development_gpu_thread_limit": None,
+            "local_environment": None,
+            "network_mode": "none",
+        })
     monkeypatch.setattr(
         R, "yaml", types.SimpleNamespace(safe_load=lambda _text: policy))
     monkeypatch.setattr(R, "DockerExecutionSandbox", FakeSandbox)
+    monkeypatch.setattr(R, "LocalExecutionSandbox", FakeSandbox)
     monkeypatch.setattr(R, "DeploymentPreflight", FakeDeployment)
     monkeypatch.setattr(R, "PythonWheelImageBuilder", stop_downstream)
+    monkeypatch.setattr(R, "GitHubRepositoryMaterializer", stop_repository)
     monkeypatch.setattr(
         R.ExecutionSupervisor, "recover_previous_generation",
         lambda _self: calls.append("supervisor-recovery"))
 
-    with pytest.raises(CanaryFailed if canary_raises else DownstreamReached):
+    expected_error = (
+        CanaryFailed
+        if deployment_mode == "production" and canary_raises
+        else DownstreamReached)
+    with pytest.raises(expected_error):
         R.build_system(
             SYSTEM_ROOT, str(tmp_path / "work"), runner_factory=_mock_factory([]))
     expected = [
@@ -753,11 +1709,13 @@ def test_gpu_canary_runs_only_after_identity_gate_and_recovery(
         "supervisor-recovery", "sandbox-recovery", "gpu-sandbox-init",
         "gpu-sandbox-preflight",
     ]
-    if gpu_ready:
+    if deployment_mode == "development":
+        expected.extend(["deployment-finalize", "downstream-gpu"])
+    else:
         expected.append("gpu-canary")
-    expected.append("deployment-finalize")
-    if not canary_raises:
-        expected.append("downstream-gpu" if promoted else "downstream-cpu")
+        expected.append("deployment-finalize")
+        if not canary_raises:
+            expected.append("downstream-gpu" if promoted else "downstream-cpu")
     assert calls == expected
 
 
@@ -832,18 +1790,18 @@ def test_production_assembly_uses_codex_query_responder_and_drains_on_exit(tmp_p
     calls = []
 
     def factory(_transcripts, purpose):
-        class Runner:
-            tool_free_contract = _query_tool_free_contract()
+        class Runner(_PersistentQueryTestRunner):
+
+            def __init__(self):
+                super().__init__(tmp_path)
 
             def run_task(self, *, system_prompt, skill, context_pack):
                 calls.append(purpose)
                 if purpose == "interaction-query":
-                    return Artifact(
-                        stage="reasoning", md="", usage=CallUsage(
-                            tokens_total=17, tokens_known=True),
-                        files={"interaction_reply.json": {
-                            "facts": [{"path": "snapshot_cycle", "value": "c1"}],
-                        }})
+                    return self.query_artifact(
+                        context_pack=context_pack,
+                        answer="当前已发布到快照 c1。",
+                        usage=CallUsage(tokens_total=17, tokens_known=True))
                 return Artifact(
                     stage=context_pack.stage, files=next(research), md="",
                     usage=CallUsage(tokens_known=True))
@@ -895,16 +1853,17 @@ def test_interaction_pump_answers_query_while_research_runner_is_blocked(tmp_pat
     research_calls = {"n": 0}
 
     def factory(_transcripts, purpose):
-        class Runner:
-            tool_free_contract = _query_tool_free_contract()
+        class Runner(_PersistentQueryTestRunner):
+
+            def __init__(self):
+                super().__init__(tmp_path)
 
             def run_task(self, *, system_prompt, skill, context_pack):
                 if purpose == "interaction-query":
-                    return Artifact(
-                        stage="reasoning", md="", usage=CallUsage(tokens_total=7, tokens_known=True),
-                        files={"interaction_reply.json": {
-                            "facts": [{"path": "snapshot_cycle", "value": "c1"}],
-                        }})
+                    return self.query_artifact(
+                        context_pack=context_pack,
+                        answer="长调用仍在进行，当前可见快照为 c1。",
+                        usage=CallUsage(tokens_total=7, tokens_known=True))
                 research_calls["n"] += 1
                 if research_calls["n"] == 1:
                     files = boot
@@ -956,18 +1915,18 @@ def test_global_stop_keeps_query_sideband_available(tmp_path):
     calls = []
 
     def factory(_transcripts, purpose):
-        class Runner:
-            tool_free_contract = _query_tool_free_contract()
+        class Runner(_PersistentQueryTestRunner):
+
+            def __init__(self):
+                super().__init__(tmp_path)
 
             def run_task(self, *, system_prompt, skill, context_pack):
                 calls.append(purpose)
                 if purpose == "interaction-query":
-                    return Artifact(
-                        stage="reasoning", md="", usage=CallUsage(
-                            tokens_total=5, tokens_known=True),
-                        files={"interaction_reply.json": {
-                            "facts": [{"path": "snapshot_cycle", "value": "c1"}],
-                        }})
+                    return self.query_artifact(
+                        context_pack=context_pack,
+                        answer="研究已停止，最后可见快照为 c1。",
+                        usage=CallUsage(tokens_total=5, tokens_known=True))
                 return Artifact(
                     stage=context_pack.stage, files=next(research), md="",
                     usage=CallUsage(tokens_known=True))
@@ -1008,21 +1967,32 @@ def test_build_system_validates_policy_before_opening_database(tmp_path, monkeyp
     raw = (Path(SYSTEM_ROOT) / "policies" / "policy.yaml").read_text(encoding="utf-8")
     base = R.yaml.safe_load(raw)
 
-    missing = {**base, "budget": {k: v for k, v in base["budget"].items()
-                                    if k != "price_per_1k_tokens"}}
-    monkeypatch.setattr(R.yaml, "safe_load", lambda text: missing)
+    missing = {
+        **base,
+        "budget": {
+            **{k: v for k, v in base["budget"].items()
+               if k != "price_per_1k_tokens"},
+            # price is deliberately optional only while the cumulative budget
+            # safety net is disabled.  Exercise its conditional requirement.
+            "session_max": 100000,
+        },
+    }
+    monkeypatch.setattr(
+        R, "yaml", types.SimpleNamespace(safe_load=lambda _text: missing))
     with pytest.raises(ValidationError, match="price_per_1k_tokens"):
         R.build_system(SYSTEM_ROOT, str(tmp_path / "missing"), runner_factory=_mock_factory([]))
     assert not (tmp_path / "missing").exists()
 
     nonfinite = {**base, "budget": {**base["budget"], "price_per_1k_tokens": float("nan")}}
-    monkeypatch.setattr(R.yaml, "safe_load", lambda text: nonfinite)
+    monkeypatch.setattr(
+        R, "yaml", types.SimpleNamespace(safe_load=lambda _text: nonfinite))
     with pytest.raises(ValueError, match="非有限数字"):
         R.build_system(SYSTEM_ROOT, str(tmp_path / "nan"), runner_factory=_mock_factory([]))
     assert not (tmp_path / "nan").exists()
 
     overflow = {**base, "budget": {**base["budget"], "session_max": 10 ** 10000}}
-    monkeypatch.setattr(R.yaml, "safe_load", lambda text: overflow)
+    monkeypatch.setattr(
+        R, "yaml", types.SimpleNamespace(safe_load=lambda _text: overflow))
     with pytest.raises(ValueError, match="session_max"):
         R.build_system(SYSTEM_ROOT, str(tmp_path / "overflow"), runner_factory=_mock_factory([]))
     assert not (tmp_path / "overflow").exists()
@@ -1053,8 +2023,9 @@ def test_system_budget_crossing_stops_cleanly_without_committing_inflight_cycle(
     assert sys.daemon.query_one("SELECT COUNT(*) FROM decision WHERE type='global_stop'")[0] == 1
 
 
-def test_system_unknown_usage_durably_stops_without_retry(tmp_path):
+def test_system_unknown_usage_durably_stops_without_retry(tmp_path, monkeypatch):
     """CLI 用量汇总未知时不得冒充真 0：落 durable stop，当前游标不提交/不重调。"""
+    _use_budgeted_policy(monkeypatch)
     calls = {"n": 0}
 
     class UnknownUsageRunner:
@@ -1109,8 +2080,9 @@ def test_offline_restored_db_starts_as_honest_adoption_workroot(tmp_path):
     assert sys2.close() is None
 
 
-def test_startup_recovers_budget_stop_before_missing_terminal_snapshot(tmp_path):
+def test_startup_recovers_budget_stop_before_missing_terminal_snapshot(tmp_path, monkeypatch):
     """terminal commit 后、轮后 stop/snapshot 前崩溃：重启恢复的 stop 必须进同一 recovery point。"""
+    _use_budgeted_policy(monkeypatch)
     sys1 = build_system(
         SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([_BOOT_TERMINATE]))
     sys1.advancer.storage_reconciler = None       # 模拟 terminal commit 后未及发布
@@ -1420,7 +2392,7 @@ def test_production_system_scans_directive_and_file_notifications_on_exit(tmp_pa
     assert f"filereq:{rid}:pending" in keys
 
 
-# ============ CP8.4 · attack 全装配端到端（真子进程执行 + 真 judge 落库链）============
+# ============ CP8.4 · attack 全装配端到端（真子进程执行 + 机械安全门）============
 def _lazy_factory(items):
     """runner 工厂：items 元素为 dict（原样吐）或 callable(context_pack)→dict（吐前按当下 DB/staging 现算
     ——bundle 须回引 plan_slice_hash、attack reasoning 须引用真 metric_result id，均只在调用时可知）。"""
@@ -1435,13 +2407,28 @@ def _lazy_factory(items):
     return lambda td, pt: MockRunner()
 
 
-def test_full_attack_flow_end_to_end(tmp_path):
+def test_full_attack_flow_end_to_end(tmp_path, request):
     """步⑧步级验证①：run.py 装配的**全系统**跑通完整流程——bootstrap→attack（idea→plan[真 gate 注册
-    协议/占坑]→bundle[manifest→harness 真子进程 smoke/train/eval]→双评审[JudgeProvider 真落库链]→
+    协议/占坑]→bundle[manifest→harness 真子进程 smoke/train/eval]→机械门禁→
     注册入池→真证据关问）→terminate。runner 为脚本化 mock（Codex 替身），其余全为真组件。"""
     import sys as _sys
     import test_attack_advance as TA
     from orchestrator.manifest import canon_hash
+
+    # This is a real nested-Docker test, not a mocked sandbox test.  The
+    # deployment's rootless daemon sees GPFS/VEPFS through an exact bindfs
+    # mapping, while pytest's default /tmp lives on the outer overlay.  After a
+    # long full-suite run that overlay mapping can lag a freshly populated
+    # input snapshot and expose an empty bind to the daemon.  Production quest
+    # work roots live on VEPFS, so exercise the same mount domain here instead
+    # of making an overlay propagation race look like a bundle failure.
+    docker_tmp_parent = Path(SYSTEM_ROOT) / "runtime" / "pytest-docker"
+    docker_tmp_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(docker_tmp_parent, 0o700)
+    docker_tmp = docker_tmp_parent / f"full-attack-{os.getpid()}-{time.time_ns()}"
+    docker_tmp.mkdir(mode=0o700)
+    request.addfinalizer(lambda: shutil.rmtree(docker_tmp, ignore_errors=True))
+    tmp_path = docker_tmp
 
     db_path = str(tmp_path / "research.sqlite")
     runtime_env_hash = [RUNTIME_ENV_HASH]
@@ -1456,7 +2443,10 @@ def test_full_attack_flow_end_to_end(tmp_path):
                     "target_ref": {"target_key": slice_["target_key"], "target_kind": "build",
                                    "seq": slice_["seq"], "plan_slice_hash": canon_hash(slice_)},
                     "protocol_ref": {"protocol_id": slice_["protocol_id"], "protocol_ver": slice_["protocol_ver"]},
-                    "env_hash": runtime_env_hash[0], "config_json": {"lr": 0.1},
+                    "env_hash": sandbox_workload_environment_hash(
+                        runtime_env_hash[0], True),
+                    "gpu_required": True,
+                    "config_json": {"lr": 0.1},
                     "code_files": ["train.py", "eval.py", "smoke.py"],
                     "commands": {"smoke": {"argv": ["python", "{src}/smoke.py"]},
                                  "train": {"argv": ["python", "{src}/train.py"]},
@@ -1482,36 +2472,109 @@ def test_full_attack_flow_end_to_end(tmp_path):
     boot_attack = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "toy 基线能到 0.9 吗",
                                               "local_key": "root"}]},
                    "selection.json": {"next_question_id": "root", "next_intent": "attack", "scores": []}}
-    plan_review_pass = {
-        "plan_review.json": {"verdict": "pass", "round_no": 1, "issues": []}}
-    verdict_pass = {"review_verdict.json": {"verdict": "pass", "issues": []}}
+    predicate_plan = TA._plan_json()
+    predicate_plan["plan.json"]["targets"][0]["gpu_required"] = True
+    # 此端到端用例使用固定 goal_brief.md；其 root success predicate 精确要求
+    # toy-gauss-cls@1 / accuracy@1 / aggregate >= 0.9。使计划注册与该谓词同一身份，
+    # 才能证明真 metric_result 关问，避免用仅数值相同但协议/指标不同的测量伪闭环。
+    predicate_plan["plan.json"]["protocol"]["name"] = "toy-gauss-cls"
+    predicate_plan["plan.json"]["metric_defs"][0]["name"] = "accuracy"
+    # Production idea now uses the pinned adapter's two-session contract.  Give
+    # the generator exactly three WildIdea candidates (9 anchors are internal
+    # to the prompt) and the blind judge a separate mapping-only result.
+    template = TA._idea_set()["idea_set.json"]["candidates"][1]
+    wild_candidates = []
+    for index in range(3):
+        candidate = json.loads(json.dumps(template))
+        candidate["candidate_id"] = f"wild-{index + 1}"
+        candidate["novelty_queries"] = [
+            f"toy Gaussian classification novelty candidate {index + 1}"]
+        candidate["audit_mapping"]["source_domain"] += f"-{index + 1}"
+        candidate["wildidea_extra"]["source_prototype"] = f"P0{index + 1} " + (
+            candidate["wildidea_extra"]["source_prototype"])
+        wild_candidates.append(candidate)
+    idea_draft = {"idea_set.draft.json": {
+        "need_innovation": True,
+        "candidates": wild_candidates,
+        "novelty_refs": [],
+    }}
+    idea_audit = {"idea_audit.json": {
+        "audit_scores": [{
+            "candidate_id": candidate["candidate_id"],
+            "scores": {
+                "structural_depth": 8, "domain_distance": 8,
+                "applicability": 8, "novelty": 8,
+                "unexpectedness": 8 - index, "non_obviousness": 8,
+            },
+            "decision": "pass", "rationale": "映射系统性与 research 门槛均成立",
+        } for index, candidate in enumerate(wild_candidates)],
+        "selected_id": "wild-1",
+    }}
     seq = [boot_attack,                          # c1 bootstrap（reasoning）
-           TA._idea_set(), TA._plan_json(),      # c2 attack：idea → plan（冻结 schema 真形态）
-           plan_review_pass,                     # plan answerability 独立 reviewer
+           idea_draft, idea_audit, predicate_plan,  # c2 attack：生成 → 独立盲审 → plan
            bundle_env,                           # bundle 信封（manifest+代码）
-           verdict_pass, verdict_pass,           # judge：code review → result review（经 JudgeProvider 落库）
            attack_reasoning]                     # 轮尾：真证据关问 + terminate
-    sys_ = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory(seq))
+
+    class FakeNoveltyProvider:
+        name = "arxiv_api_v1"
+
+        def search(self, query, *, policy_hash):
+            result_hash = "sha256:" + hashlib.sha256(query.encode()).hexdigest()
+            snapshot_hash = "sha256:" + hashlib.sha256(
+                ("snapshot\x00" + query).encode()).hexdigest()
+            return {
+                "final_ref": {
+                    "query": query,
+                    "provider": self.name,
+                    "snapshot_hash": snapshot_hash,
+                    "snapshot_ref": (
+                        "state/novelty/snapshots/sha256/"
+                        + snapshot_hash.removeprefix("sha256:") + ".json"),
+                    "raw_content_hash": "sha256:" + "a" * 64,
+                    "result_content_hashes": [result_hash],
+                    "ranking": [result_hash],
+                    "policy_hash": policy_hash,
+                },
+                "results": [{
+                    "rank": 1,
+                    "result_content_hash": result_hash,
+                    "id": "https://arxiv.org/abs/fixture",
+                    "title": "Frozen E2E novelty fixture",
+                }],
+            }
+
+    sys_ = build_system(
+        SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory(seq),
+        novelty_search_provider=FakeNoveltyProvider())
     runtime_env_hash[0] = sys_.advancer.attack.execution_sandbox.environment_hash
     ids = sys_.run(max_cycles=6)
     assert len(ids) == 2                                         # bootstrap + attack 两轮后 terminate
     d = sys_.daemon
-    # 全链断言：协议真注册 / 池 legal / 真测量 / 双评审真落库（JudgeProvider 链）/ 真证据关问
-    assert d.query_one("SELECT count(*) FROM protocol WHERE name='toy-proto'")[0] == 1
+    # 全链断言：协议真注册 / 池 legal / 真测量 / 真证据关问。注入式测试
+    # runner 保留 legacy Idea adapter 的一个 audit turn；默认 Codex 装配则在
+    # 主阶段 turn 内启动 child reviewer，并经 runtime MCP 记录。
+    assert d.query_one("SELECT count(*) FROM protocol WHERE name='toy-gauss-cls'")[0] == 1
+    assert d.query_one("SELECT count(*) FROM metric_def WHERE name='accuracy'")[0] == 1
     assert d.query_one("SELECT status FROM baseline WHERE canonical_key='ck-attack'")[0] == "legal"
     assert d.query_one("SELECT status, eval_key FROM evaluation WHERE source='factory'")[0:2] == ("success", "t1")
     assert d.query_one("SELECT value FROM metric_result ORDER BY id DESC LIMIT 1")[0] == 0.93
-    assert d.query_one("SELECT count(*) FROM runner_call WHERE phase='audit' AND status='success'")[0] == 3
-    assert d.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 3
-    assert d.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 1
-    assert d.query_one(
-        "SELECT count(*) FROM ledger l JOIN runner_call rc ON rc.id=l.runner_call_id "
-        "WHERE rc.phase='audit' AND rc.purpose='plan_review'")[0] == 1
+    assert d.query_one("SELECT count(*) FROM runner_call WHERE phase='audit' AND status='success'")[0] == 1
+    assert d.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 1
+    assert d.query_one("SELECT count(*) FROM decision WHERE type='idea_audit'")[0] == 1
+    persisted_idea_audit = json.loads(d.query_one(
+        "SELECT audit_json FROM idea WHERE status='selected'")[0])
+    assert persisted_idea_audit["candidate_id"] == "wild-1"
+    assert persisted_idea_audit["provenance"]["engine_version"] == (
+        "wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598")
+    assert persisted_idea_audit["wildidea_extra"]["source_prototype"].startswith("P01")
+    assert d.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 0
+    assert d.query_one("SELECT count(*) FROM decision WHERE type IN "
+                       "('bundle_code_review','bundle_result_review')")[0] == 0
     assert d.query_one("SELECT status FROM question WHERE text LIKE 'toy 基线%'")[0] == "answered"
     assert d.query_one("SELECT count(*) FROM build_target WHERE status='complete'")[0] == 1
-    # 执行是真子进程：checkpoint 文件真实存在且被登记
+    # 执行是真子进程：checkpoint 以 work-root-relative 正式池路径登记且文件真实存在。
     ck = d.query_one("SELECT path, content_hash FROM checkpoint")
-    assert Path(ck[0]).exists() and len(ck[1]) == 64
+    assert (tmp_path / ck[0]).exists() and len(ck[1]) == 64
     assert sys_.last_stop_reason is None                         # 正常 terminate（非 τ/阻断）
 
 
@@ -1657,9 +2720,13 @@ def test_file_request_wait_loop_end_to_end(tmp_path):
 
 
 def test_resident_build_system_ingests_spooled_file_action_and_resumes(tmp_path):
-    """真实常驻拓扑：阶段阻断→HTTP 只入 spool→run 单写 resolve→自动续同阶段。"""
+    """真实常驻拓扑：阶段阻断→受管发布入 spool→单写 resolve→自动续同阶段。
+
+    ``source_ref`` is a private server capability.  Browser HTTP cannot
+    submit it; the managed-upload publisher calls the internal spool method
+    only after publication verification.
+    """
     import threading
-    import urllib.request
     from orchestrator import console_server as CS
 
     boot = {"tree_ops.json": {"ops": [{"op": "create_root", "text": "根", "local_key": "root"}]},
@@ -1673,14 +2740,9 @@ def test_resident_build_system_ingests_spooled_file_action_and_resumes(tmp_path)
     token = "d" * 64
 
     def enqueue_resolve():
-        request = urllib.request.Request(
-            base + "/api/file-request", method="POST",
-            data=json.dumps({"action": "resolve", "request_id": 1,
-                             "source_ref": "work/uploads/r1"}).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}",
-                     "Idempotency-Key": "e" * 32})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        response.update(json.loads(opener.open(request, timeout=5).read()))
+        response["queued"] = console_data.enqueue_file_request_action(
+            action="resolve", request_id=1, source_ref="work/uploads/r1",
+            client_idempotency_key="e" * 32)
         appended.set()
 
     def request_resource(_pack):
@@ -1700,7 +2762,9 @@ def test_resident_build_system_ingests_spooled_file_action_and_resumes(tmp_path)
                      host="127.0.0.1", port=0, capability_token=token)
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    console_data = CS.ConsoleData(
+        db_path=str(tmp_path / "research.sqlite"), work_root=str(tmp_path),
+        system_root=SYSTEM_ROOT)
 
     try:
         assert system.run_forever(max_cycles=1, poll_interval_s=0.01,

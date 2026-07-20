@@ -4,8 +4,9 @@
 覆盖：gate_claim_baseline / gate_register_baseline / gate_register_evaluation / gate_claim_variant /
 gate_register_variant / gate_new_protocol。
 
-**「入池」语义**：冻结 DDL 无独立池表——baseline/variant `status='legal'` 即入池（§4.1「复制入池」的
-非剪切语义体现在 legal 状态 + 卡片/索引侧写，卡片物化 = 编译器/召回已读 legal 池）。
+**「入池」语义**：冻结 DDL 无独立池表，但 `status='legal'` 只是最后状态，不是池资产本身。
+生产注册必须先复验 content-addressed publication，然后在同一短事务内绑定正式路径/hash、
+publication decision 和卡片，最后才可把 baseline/variant 转为 legal。
 **§4.2.5(ii) 单事务**：生产执行先由 gate_start_attempt 耐久创建 running intent；
 gate_register_evaluation 再把该 attempt(success)+metric_result+evaluation canonical 一次事务收口。
 兼容 create/append 模式只保留给旧调用与迁移测试，不得用于真实外部执行后补造 attempt。
@@ -22,9 +23,74 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .gate_exec import _ATTEMPT_PURPOSES, ExecGate
 from .ids import cnum as _cnum
+from .pool_publication import (
+    PoolPublicationError,
+    PoolPublisher,
+    VerifiedPoolPublication,
+    bind_database,
+    is_formally_published,
+)
 
 
 class PoolGate(ExecGate):
+
+    def __init__(self, *args, pool_publisher: Optional[PoolPublisher] = None,
+                 require_formal_publication: bool = False, **kwargs):
+        """Create the registration gate.
+
+        ``require_formal_publication=False`` exists only for old migration/unit-test
+        callers.  Production assembly sets it to true and injects the publisher that
+        owns the work root; a caller-provided dataclass is then re-read and re-hashed
+        immediately before the registration transaction.
+        """
+        if type(require_formal_publication) is not bool:
+            raise TypeError("formal publication gate 策略必须是显式 bool")
+        if require_formal_publication and pool_publisher is None:
+            raise ValueError("生产池注册必须注入 PoolPublisher")
+        super().__init__(*args, **kwargs)
+        self.pool_publisher = pool_publisher
+        self.require_formal_publication = require_formal_publication
+
+    def _verified_publication(
+            self, ci: int, publication: Optional[VerifiedPoolPublication], *,
+            baseline_id: int, variant_id: int,
+            evaluation_id: int,
+            attempt_id: Optional[int] = None) -> Optional[VerifiedPoolPublication]:
+        """Re-hash a publication and bind it to the exact registration identities."""
+        if publication is None:
+            if self.require_formal_publication:
+                self._reject(ci, "正式入池缺 verified pool publication")
+            return None
+        if not isinstance(publication, VerifiedPoolPublication):
+            self._reject(ci, "pool publication 非 VerifiedPoolPublication")
+        if self.pool_publisher is None:
+            self._reject(ci, "未注入 PoolPublisher，无法复验正式池文件")
+        try:
+            verified = self.pool_publisher.verify_publication(
+                publication.manifest_ref, expected_hash=publication.manifest_hash)
+        except (PoolPublicationError, OSError, KeyError, TypeError, ValueError) as error:
+            self._reject(ci, f"pool publication 文件复验失败: {error}")
+        if publication != verified:
+            self._reject(ci, "pool publication receipt 与文件复验结果不一致")
+        objects = verified.payload.get("objects", {})
+        baseline = objects.get("baseline", {})
+        variant = objects.get("variant", {})
+        evaluation = objects.get("evaluation", {})
+        binding = verified.database_bindings.get("evaluation_attempt", {})
+        published_attempt = evaluation.get("attempt_id")
+        if (binding.get("evaluation_id"), binding.get("attempt_id")) != (
+                evaluation.get("evaluation_id"), published_attempt):
+            self._reject(ci, "pool publication 内部 evaluation/attempt 绑定不一致")
+        actual = [baseline.get("baseline_id"), variant.get("variant_id"),
+                  evaluation.get("evaluation_id")]
+        expected = [baseline_id, variant_id, evaluation_id]
+        if attempt_id is not None:
+            actual.append(published_attempt)
+            expected.append(attempt_id)
+        if actual != expected:
+            self._reject(
+                ci, f"pool publication 对象身份与注册不符: {actual} != {expected}")
+        return verified
 
     def _require_keys(self, ci, item: Dict[str, Any], keys: Tuple[str, ...], what: str) -> None:
         """输入结构完整性 → 干净拒（缺键不许裸 KeyError，契约同 _reject 审计，codex SHOULD）。"""
@@ -102,11 +168,13 @@ class PoolGate(ExecGate):
                                  attempt_id: Optional[int] = None,
                                  env_hash: Optional[str] = None, commit_hash: Optional[str] = None,
                                  cost: float = 0.0, artifact_ref: Optional[str] = None,
-                                 transcript_ref: Optional[str] = None) -> Dict[str, int]:
+                                 transcript_ref: Optional[str] = None,
+                                 publication: Optional[VerifiedPoolPublication] = None) -> Dict[str, int]:
         """§4.2.5(ii) 结果注册：优先收口执行前已创建的 running attempt。
 
         ``attempt_id`` 模式把该 attempt→success、metric_result、evaluation canonical 在一个事务提交；
-        旧 create/append 模式保留给兼容调用，生产 factory 路径不得再事后伪造 attempt。
+        启用正式发布时还在同一事务绑定 publication decision/cards。旧 create/append
+        模式保留给兼容调用，生产路径必须使用执行前已创建的 attempt。
         """
         ci = _cnum(cycle_id)
         self._assert_current_target(ci, build_target_id, action="register_evaluation")
@@ -115,10 +183,15 @@ class PoolGate(ExecGate):
                 self._reject(ci, "attempt_id 模式不得同时给 create/evaluation_id")
         elif (create is None) == (evaluation_id is None):
             self._reject(ci, "gate_register_evaluation 须恰一模式：attempt_id / create / evaluation_id")
+        if self.require_formal_publication and attempt_id is None:
+            self._reject(ci, "正式评估注册须使用执行前已创建的 attempt_id")
+        if publication is not None and attempt_id is None:
+            self._reject(ci, "pool publication 只能绑定执行前已创建的 attempt_id")
         if purpose not in _ATTEMPT_PURPOSES:
             self._reject(ci, f"attempt purpose 非法: {purpose}")
-        if not self.review_passed(build_target_id=build_target_id, review_kind="bundle_result_review",
-                                  current_subject_hash=current_subject_hash):
+        if self.require_result_review and not self.review_passed(
+                build_target_id=build_target_id, review_kind="bundle_result_review",
+                current_subject_hash=current_subject_hash):
             self._reject(ci, f"target {build_target_id} 无通过的结果评审"
                              "（需 verdict=pass 且 subject_hash 与当下重算一致 + audit runner_call success）")
         bt = self._bt(build_target_id)
@@ -137,7 +210,7 @@ class PoolGate(ExecGate):
                 self._reject(
                     ci, f"attempt {attempt_id} 非本 cycle/target/purpose 的 running intent")
             eid, var_id, pid, pver = attempt[0], attempt[5], attempt[6], attempt[7]
-            if attempt[8] not in ("created", "running", "failed"):
+            if attempt[8] not in ("created", "running", "failed", "success"):
                 self._reject(ci, f"evaluation {eid} 状态 {attempt[8]} 不可由 running attempt 注册")
         elif create is not None:
             missing = [k for k in ("variant_id", "protocol_id", "protocol_ver", "eval_key", "source", "target_set_hash")
@@ -193,6 +266,23 @@ class PoolGate(ExecGate):
         missing_req = [rm for rm in required if tuple(rm) not in got]
         if missing_req:
             self._reject(ci, f"required metric 未覆盖（aggregate）: {missing_req}")
+        verified = None
+        if attempt_id is not None:
+            baseline = self._q1(
+                "SELECT baseline_id FROM variant WHERE id=?", (var_id,))
+            if baseline is None:
+                self._reject(ci, f"evaluation 属于不存在的 variant {var_id}")
+            verified = self._verified_publication(
+                ci, publication, baseline_id=baseline[0], variant_id=var_id,
+                evaluation_id=eid, attempt_id=attempt_id)
+            if verified is not None:
+                formal_attempt = verified.database_bindings["evaluation_attempt"]
+                if artifact_ref not in (None, formal_attempt["artifact_ref"]):
+                    self._reject(ci, "register_evaluation：artifact_ref 与 formal publication 不一致")
+                if transcript_ref not in (None, verified.manifest_ref):
+                    self._reject(ci, "register_evaluation：transcript_ref 与 formal publication 不一致")
+                artifact_ref = formal_attempt["artifact_ref"]
+                transcript_ref = verified.manifest_ref
         try:
             with self.daemon.transaction() as conn:   # ——§4.2.5(ii) 单事务——
                 if attempt_id is not None:
@@ -232,6 +322,20 @@ class PoolGate(ExecGate):
                 if cur != "success":   # 首成功封 canonical；append 到已 success 的保留原 canonical
                     conn.execute("UPDATE evaluation SET status='success', canonical_attempt_id=? WHERE id=?",
                                  (aid, eid))
+                if verified is not None:
+                    # A new build/import baseline still carries its planning draft here.
+                    # Promote the re-hashed formal identity in this same transaction so
+                    # bind_database can compare the DB row byte-for-byte.  Existing legal
+                    # baselines (exec/eval) are never rewritten and must already match.
+                    if bt[2] in ("build", "import"):
+                        conn.execute(
+                            "UPDATE baseline SET identity_doc=? WHERE id=? "
+                            "AND status IN ('planned','building')",
+                            (verified.payload["objects"]["baseline"]["identity_doc"],
+                             baseline[0]))
+                    bind_database(conn, verified, updated_cycle=ci)
+        except PoolPublicationError as e:
+            self._reject(ci, f"register_evaluation 正式发布绑定被拒绝：{e}")
         except sqlite3.IntegrityError as e:
             self._reject(ci, f"register_evaluation 写入被 DB 约束拒绝：{e}")
         return {"evaluation_id": eid, "attempt_id": aid}
@@ -288,8 +392,9 @@ class PoolGate(ExecGate):
         if bt is None or bt[4] not in ("running",):
             self._reject(ci, f"register：target {build_target_id} 未处 running（smoke/代码评审结构性未过，当前 "
                              f"{bt[4] if bt else '缺失'}）")
-        if not self.review_passed(build_target_id=build_target_id, review_kind="bundle_result_review",
-                                  current_subject_hash=current_subject_hash):
+        if self.require_result_review and not self.review_passed(
+                build_target_id=build_target_id, review_kind="bundle_result_review",
+                current_subject_hash=current_subject_hash):
             self._reject(ci, f"target {build_target_id} 无通过的结果评审")
 
     def gate_register_baseline(self, *, baseline_id: int, variant_id: int, build_target_id: int,
@@ -298,8 +403,9 @@ class PoolGate(ExecGate):
                                run_id: Optional[int] = None,
                                capability_summary: Optional[str] = None,
                                code_ref: Optional[str] = None,
-                               commit_hash: Optional[str] = None) -> None:
-        """自建 baseline 注册入池（I4）：全判据过 → baseline+初变体 → legal + 落 identity。
+                               commit_hash: Optional[str] = None,
+                               publication: Optional[VerifiedPoolPublication] = None) -> None:
+        """自建 baseline 注册入池（I4）：全判据过 + 正式发布绑定 → legal。
         拒面 = _register_common_checks + identity/复现命令缺 + baseline 态非法。"""
         ci = _cnum(cycle_id)
         brow = self._q1("SELECT status FROM baseline WHERE id=?", (baseline_id,))
@@ -318,23 +424,46 @@ class PoolGate(ExecGate):
                                      run_id=run_id, evaluation_id=evaluation_id,
                                      current_subject_hash=current_subject_hash,
                                      expect_kind="import" if prov == "external_import" else "build")
+        verified = self._verified_publication(
+            ci, publication, baseline_id=baseline_id, variant_id=variant_id,
+            evaluation_id=evaluation_id)
+        final_identity = identity_doc + "\n\n## 复现命令\n" + repro_cmd
+        if verified is not None:
+            published_baseline = verified.payload["objects"]["baseline"]
+            if published_baseline.get("identity_doc") != final_identity:
+                self._reject(ci, "register_baseline：identity/repro 与 formal identity.md 不一致")
+            formal_binding = verified.database_bindings["baseline"]
+            if code_ref not in (None, formal_binding.get("code_ref")):
+                self._reject(ci, "register_baseline：code_ref 与 formal publication 不一致")
+            if commit_hash not in (None, formal_binding.get("commit_hash")):
+                self._reject(ci, "register_baseline：commit_hash 与 formal publication 不一致")
         try:
             with self.daemon.transaction() as conn:
-                # repro_cmd 进 identity_doc（自由 markdown）；code_ref/commit_hash 是**仓库引用**语义（喂卡片/召回），
-                # 只写调用方显式给的真引用、绝不塞命令串（内审 SHOULD：污染池资产字段）。
-                conn.execute("UPDATE baseline SET status='legal', identity_doc=?, "
+                # 先在未 legal 态落权威 identity，使 bind_database 能做逐字节核对；
+                # 之后绑定失败会连同该更新一起回滚。
+                conn.execute("UPDATE baseline SET identity_doc=?, "
                              "capability_summary=COALESCE(?,capability_summary), "
                              "code_ref=COALESCE(?,code_ref), commit_hash=COALESCE(?,commit_hash) "
-                             "WHERE id=?", (identity_doc + "\n\n## 复现命令\n" + repro_cmd, capability_summary,
+                             "WHERE id=?", (final_identity, capability_summary,
                                             code_ref, commit_hash, baseline_id))
+                if verified is not None:
+                    bind_database(conn, verified, updated_cycle=ci)
+                conn.execute("UPDATE baseline SET status='legal' WHERE id=?", (baseline_id,))
                 conn.execute("UPDATE variant SET status='legal' WHERE id=?", (variant_id,))
+                if verified is not None and not is_formally_published(
+                        conn, variant_id=variant_id):
+                    raise PoolPublicationError(
+                        "formal publication 绑定后入池闭包仍不完整")
+        except PoolPublicationError as e:
+            self._reject(ci, f"register_baseline 正式发布绑定被拒绝：{e}")
         except sqlite3.IntegrityError as e:
             self._reject(ci, f"register_baseline 写入被 DB 约束拒绝：{e}")
 
     def gate_register_variant(self, *, variant_id: int, build_target_id: int, evaluation_id: int,
                               cycle_id: str, current_subject_hash: str,
-                              run_id: Optional[int] = None) -> None:
-        """exec variant 注册入池：全判据过 → 仅该 variant → legal（baseline 保持 legal；身份字段触发器冻结）。"""
+                              run_id: Optional[int] = None,
+                              publication: Optional[VerifiedPoolPublication] = None) -> None:
+        """exec variant 注册入池：全判据过 + 正式发布绑定 → legal。"""
         ci = _cnum(cycle_id)
         vrow = self._q1("SELECT status FROM variant WHERE id=?", (variant_id,))
         if vrow is None or vrow[0] not in ("planned", "building"):
@@ -342,9 +471,22 @@ class PoolGate(ExecGate):
         self._register_common_checks(ci, variant_id=variant_id, build_target_id=build_target_id,
                                      run_id=run_id, evaluation_id=evaluation_id,
                                      current_subject_hash=current_subject_hash, expect_kind="exec")
+        baseline_id = self._q1(
+            "SELECT baseline_id FROM variant WHERE id=?", (variant_id,))[0]
+        verified = self._verified_publication(
+            ci, publication, baseline_id=baseline_id, variant_id=variant_id,
+            evaluation_id=evaluation_id)
         try:
             with self.daemon.transaction() as conn:
+                if verified is not None:
+                    bind_database(conn, verified, updated_cycle=ci)
                 conn.execute("UPDATE variant SET status='legal' WHERE id=?", (variant_id,))
+                if verified is not None and not is_formally_published(
+                        conn, variant_id=variant_id):
+                    raise PoolPublicationError(
+                        "formal publication 绑定后入池闭包仍不完整")
+        except PoolPublicationError as e:
+            self._reject(ci, f"register_variant 正式发布绑定被拒绝：{e}")
         except sqlite3.IntegrityError as e:
             self._reject(ci, f"register_variant 写入被 DB 约束拒绝：{e}")
 

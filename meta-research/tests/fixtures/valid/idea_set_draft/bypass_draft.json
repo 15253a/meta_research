@@ -15,7 +15,7 @@
       "assumptions": ["两类协方差近似相等"],
       "min_falsifiable_experiment": "固定种子与划分训练并测留出集 accuracy；aggregate < 0.90 即证伪",
       "novelty_type": "表征结构",
-      "novelty_status": "联网粗查已启用·文献级待人工验证"
+      "novelty_status": "联网查重未启用·文献级待验证"
     }
   ],
   "novelty_refs": [],

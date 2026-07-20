@@ -125,10 +125,19 @@ def _validate_destinations(
             raise QualificationDataError(f"{label} parent 不是可信不可写目录")
         for ancestor in (target.parent, *target.parent.parents):
             ancestor_info = os.lstat(ancestor)
+            # A canonical root-owned sticky temporary directory (for example
+            # /tmp or /var/tmp) is a safe boundary for an already-created,
+            # evaluator-owned child: the sticky bit prevents other users from
+            # replacing or unlinking that child.  Keep this exception exact;
+            # sticky directories owned by an ordinary user, and every other
+            # group/world-writable ancestor, remain untrusted.
+            mode = stat.S_IMODE(ancestor_info.st_mode)
+            trusted_shared_tmp = (
+                ancestor_info.st_uid == 0 and mode == 0o1777)
             if (not stat.S_ISDIR(ancestor_info.st_mode)
                     or stat.S_ISLNK(ancestor_info.st_mode)
                     or ancestor_info.st_uid not in {0, os.geteuid()}
-                    or ancestor_info.st_mode & 0o022):
+                    or (mode & 0o022 and not trusted_shared_tmp)):
                 raise QualificationDataError(
                     f"{label} ancestor 不是 root/evaluator-owned trusted path: {ancestor}")
     public_parent = os.lstat(public.parent)

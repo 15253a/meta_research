@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .interfaces import Cycle, Route, Selection
+from .question_admission import (
+    ALLOWED_QUESTION_EVIDENCE,
+    admission_payload,
+    normalize_question_contract,
+)
 
 _TERMINAL_Q = {"answered", "refuted", "dead_end"}
 _SPAWN_SOURCE = {  # §4.2.4 spawn_question kind → question.source 映射
@@ -39,6 +44,7 @@ class Question:
     decompose_count: int = 0
     score: Optional[float] = None
     est_cost: Optional[float] = None
+    predicate_json: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -206,11 +212,17 @@ class InMemoryStateStore:
                 if cycle.route != "bootstrap":
                     # goal 改版下的新 root 走 spawn_question(kind=goal_retarget)，不走 create_root
                     raise ValueError("create_root 仅限 bootstrap 轮（§4.2.4）")
+                text, contract, contract_source = normalize_question_contract(
+                    op.get("text"), op.get("predicate_json"))
                 qid = self._next_qid()
-                self.questions[qid] = Question(qid, op["text"], None, "agent",
-                                               goal_ver=self.goal["ver"])
+                self.questions[qid] = Question(
+                    qid, text, None, "agent", goal_ver=self.goal["ver"],
+                    predicate_json=contract)
                 if op.get("local_key"):
                     local[op["local_key"]] = qid
+                self._record("agent", "question_admission", admission_payload(
+                    qid=qid, operation="create_root", text=text, contract=contract,
+                    contract_source=contract_source))
                 self._record("agent", "create_root", {"qid": qid})
             elif kind == "add_children":
                 if cycle.route != "decompose":
@@ -228,16 +240,28 @@ class InMemoryStateStore:
                 if self._open_count() + len(children) > guard["max_open_questions"]:
                     raise ValueError("超出 max_open_questions")
                 for ch in children:
+                    text, contract, contract_source = normalize_question_contract(
+                        ch.get("text"), ch.get("predicate_json"))
                     qid = self._next_qid()
-                    self.questions[qid] = Question(qid, ch["text"], parent.qid, "decompose",
-                                                   goal_ver=self.goal["ver"])   # source 对齐 DDL 枚举
+                    self.questions[qid] = Question(
+                        qid, text, parent.qid, "decompose", goal_ver=self.goal["ver"],
+                        predicate_json=contract)   # source 对齐 DDL 枚举
                     local[ch["local_key"]] = qid
                     self.deps.append(Dep(parent.qid, "question", qid))
+                    self._record("agent", "question_admission", admission_payload(
+                        qid=qid, operation="add_children", text=text, contract=contract,
+                        contract_source=contract_source))
                 parent.decompose_count += 1
                 parent.status = "open"             # 同事务释放（等待非尝试、不增 visit）
                 self._record("agent", "decompose", {"parent": parent.qid,
                                                     "children": [local[c_["local_key"]] for c_ in children]})
             elif kind == "spawn_question":
+                if op.get("request_ref") is not None:
+                    # Trusted request refs are DB append-only identities.  The
+                    # M0 in-memory store has no directive/completion ledger and
+                    # must fail closed instead of pretending it bound one.
+                    raise ValueError(
+                        "request_ref 建题需要 SQLiteStateStore 的 durable provenance")
                 if self._open_count() >= guard["max_open_questions"]:
                     raise ValueError("超出 max_open_questions")
                 if cycle.route == "goal_amend":
@@ -253,12 +277,17 @@ class InMemoryStateStore:
                         raise ValueError("goal_retarget 必须 parent=null")
                 elif parent not in self.questions:
                     raise ValueError(f"spawn parent 不存在: {parent}")
+                text, contract, contract_source = normalize_question_contract(
+                    op.get("text"), op.get("predicate_json"))
                 qid = self._next_qid()
-                self.questions[qid] = Question(qid, op["text"], parent,
-                                               _SPAWN_SOURCE[op["kind"]],
-                                               goal_ver=self.goal["ver"])
+                self.questions[qid] = Question(
+                    qid, text, parent, _SPAWN_SOURCE[op["kind"]],
+                    goal_ver=self.goal["ver"], predicate_json=contract)
                 if op.get("local_key"):
                     local[op["local_key"]] = qid
+                self._record("agent", "question_admission", admission_payload(
+                    qid=qid, operation="spawn_question", text=text, contract=contract,
+                    contract_source=contract_source))
                 self._record("agent", "spawn_question", {"qid": qid, "kind": op["kind"]})
             elif kind == "mark_answer_applicability":
                 self._mark_applicability(cycle_id, op, local)
@@ -337,6 +366,13 @@ class InMemoryStateStore:
             raise ValueError(f"终态问题不可重关: {question_id}")
         if not evidence:
             raise ValueError("I3：关问需 ≥1 条证据")
+        allowed = set(q.predicate_json.get("allowed_evidence", ALLOWED_QUESTION_EVIDENCE))
+        disallowed = sorted({ev.get("kind") for ev in evidence if ev.get("kind") not in allowed},
+                            key=lambda value: str(value))
+        if disallowed:
+            raise ValueError(
+                f"I3：证据类型不在 question closure contract 中: {disallowed}；"
+                f"allowed={sorted(allowed)}")
         self._a_no += 1
         aid = f"a{self._a_no}"
         self.answers[aid] = Answer(aid, question_id, verdict, self.goal["ver"], evidence)

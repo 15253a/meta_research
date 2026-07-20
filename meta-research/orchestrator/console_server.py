@@ -18,20 +18,24 @@ list[dict]——不硬编码列名，DDL 不变则形状稳定；前端（原型
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import ipaddress
 import json
 import math
 import os
+import pwd
 import re
 import sqlite3
 import stat
+import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
-from urllib.parse import quote, urlparse
+from typing import Any, Dict, List, Mapping, Optional, Union
+from urllib.parse import parse_qs, quote, urlparse
 
 import yaml
 
@@ -41,11 +45,32 @@ from .console_spool import (CAPABILITY_NAME, ConsoleSpool, normalize_upload_ref,
                             open_directory_path, read_regular_file_beneath,
                             stat_regular_file_beneath)
 from .instance_lease import read_instance_status
+from .narrator_session import public_narrator_session_status
 from .database import journal_mode_for_path
 from .process_supervisor import read_receipt
+from .dataset_preflight import DatasetPreflightError
+from .qualification_profiles import QualificationProfileRegistry
+from .local_sources import (
+    LocalSourceChangedError, LocalSourceConflictError,
+    LocalSourceCorruptError, LocalSourceError, LocalSourceRegistry,
+)
+from .quest_drafts import (
+    DraftConflictError, DraftCorruptError, QuestDraftRegistry,
+)
+from .quest_process_manager import (
+    QuestProcessManager, QuestProcessManagerError,
+    QuestProcessUnavailableError,
+)
+from .quest_registry import QuestConflictError, QuestCorruptError, QuestRegistry
+from .web_quest_service import (
+    WebQuestConflictError, WebQuestNotReadyError, WebQuestService,
+    WebQuestRetryableError, WebQuestServiceError,
+)
 
 
 _MAX_HTTP_BODY_BYTES = 64 * 1024
+_MAX_DRAFT_HTTP_BODY_BYTES = 512 * 1024
+_MAX_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
 _MAX_MESSAGE_CHARS = 20_000
 _MAX_REASON_CHARS = 2_000
 _MAX_FILE_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -61,16 +86,35 @@ _MAX_DB_PROJECTION_BYTES = 6 * 1024 * 1024
 _MAX_DB_TABLE_BYTES = 512 * 1024
 _MAX_LEDGER_CYCLES = 500
 _MAX_LEDGER_RECORDS = 10_000
+_MAX_RUNNER_OUTPUT_CALLS = 32
+_MAX_RUNNER_TRANSCRIPT_BYTES = 512 * 1024
+_MAX_RUNNER_LIVE_CAPTURE_BYTES = 128 * 1024
+_MAX_RUNNER_OUTPUT_CHARS = 24 * 1024
+_MAX_RUNNER_LIVE_ITEMS = 18
+_MAX_RUNNER_LIVE_ITEM_CHARS = 6 * 1024
+_MAX_RUNNER_ACTIVITY_ITEMS = 28
+_MAX_RUNNER_ACTIVITY_TEXT_CHARS = 720
+_MAX_TRAINING_LIVE_LOGS = 6
+_MAX_TRAINING_LOG_TAIL_BYTES = 64 * 1024
+_MAX_TRAINING_LOG_SCAN_DIRS = 256
+_MAX_TRAINING_LOG_SCAN_FILES = 4096
+_TRAINING_LIVE_CONTRACT_VERSION = 1
 _MAX_POLICY_NODES = 10_000
 _MAX_POLICY_DEPTH = 32
 _MAX_POLICY_STRING_CHARS = 64 * 1024
 _MAX_FS_NODES = 2_000
 _MAX_FS_ENTRIES_PER_DIRECTORY = 200
 _HTTP_SOCKET_TIMEOUT_S = 10.0
+_UPLOAD_SOCKET_TIMEOUT_S = 120.0
 _MAX_HTTP_WORKERS = 16
 _FS_DIRECTORY_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
                        | getattr(os, "O_NONBLOCK", 0))
+_PUBLIC_WORK_DIRECTORIES = frozenset({
+    "baselines", "cycles", "evaluations", "input", "questions", "views",
+})
+_PUBLIC_WORK_FILES = frozenset({"goal_brief.md"})
+_PRIVATE_WORK_INPUT_FILES = frozenset({"local-sources.json"})
 
 # 控制台投影的表清单（真 DDL 表名；import/license 等当前无数据则投影空数组，前端照渲染）。
 _PROJECT_TABLES = [
@@ -96,6 +140,8 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, *args, max_workers: int = _MAX_HTTP_WORKERS, **kwargs):
         self._worker_slots = threading.BoundedSemaphore(max_workers)
+        self._close_callbacks = []
+        self._callbacks_closed = False
         super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
@@ -113,6 +159,23 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._worker_slots.release()
+
+    def add_close_callback(self, callback) -> None:  # noqa: ANN001 - small lifecycle hook
+        self._close_callbacks.append(callback)
+
+    def server_close(self):
+        errors = []
+        if not self._callbacks_closed:
+            self._callbacks_closed = True
+            for callback in reversed(self._close_callbacks):
+                try:
+                    callback()
+                except BaseException as error:  # close every owned capability before surfacing one
+                    errors.append(error)
+        super().server_close()
+        if errors:
+            raise RuntimeError(
+                f"console server close 失败（{len(errors)} 个 owned service）") from errors[0]
 
 
 class JsonResponseTooLarge(ValueError):
@@ -207,6 +270,19 @@ def _is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(candidate).is_loopback
     except ValueError:
         return False
+
+
+def _authenticated_console_url(host: str, port: int, token: str) -> str:
+    """Build the local browser bootstrap URL without putting the bearer in a query.
+
+    The fragment is consumed by the console page and removed from the address
+    bar before any API request.  Keeping this in one helper also prevents the
+    browser-open and terminal-recovery paths from drifting apart.
+    """
+    display_host = str(host).strip()
+    if ":" in display_host and not display_host.startswith("["):
+        display_host = f"[{display_host}]"
+    return f"http://{display_host}:{int(port)}/#token={token}"
 
 
 def _host_header_is_loopback(value: Optional[str]) -> bool:
@@ -554,7 +630,9 @@ def _notifications(work_root: Path) -> List[Dict[str, Any]]:
     return out
 
 
-def _runner_execution_live(work_root: Path, runner_call_id: int) -> Dict[str, Any]:
+def _runner_execution_live(
+        work_root: Path, runner_call_id: int, *,
+        authority_out: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Project guardian liveness, workload activity, and absolute deadline for one DB owner."""
     matches = []
     receipt_dir = work_root / "state" / "executions"
@@ -571,6 +649,9 @@ def _runner_execution_live(work_root: Path, runner_call_id: int) -> Dict[str, An
     if len(matches) != 1:
         return {"execution_authority": "missing" if not matches else "duplicate"}
     receipt = matches[0]
+    if authority_out is not None:
+        authority_out.clear()
+        authority_out.update({"runner_call_id": runner_call_id, "receipt": receipt})
     out = {
         "execution_authority": "bound",
         "execution_operation_id": receipt.get("operation_id"),
@@ -604,7 +685,9 @@ def _runner_execution_live(work_root: Path, runner_call_id: int) -> Dict[str, An
     return out
 
 
-def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
+def _live(
+        conn: sqlite3.Connection, work_root: Path, *,
+        runner_execution: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """「正在执行」活性信号（不经任何 LLM，§4.6.6 live strip）：在途轮 + 最新 runner_call + 心跳
     （transcript 文件 mtime）+ 独立 instance owner heartbeat。DB 在途只表示耐久游标；没有经
     flock+owner-id+freshness 复验的当前 owner 时必须显示 interrupted，不能伪称 running。"""
@@ -656,8 +739,353 @@ def _live(conn: sqlite3.Connection, work_root: Path) -> Dict[str, Any]:
             except (OSError, ValueError, RuntimeError):
                 pass
         if rc[4] in ("created", "running"):
-            live.update(_runner_execution_live(work_root, int(rc[0])))
+            live.update(_runner_execution_live(
+                work_root, int(rc[0]), authority_out=runner_execution))
     return live
+
+
+_BUNDLE_PACK_TARGET_RE = re.compile(
+    r"^bundle\.([1-9][0-9]*)(?:\.[A-Za-z0-9._-]+)?\.pack\.json$")
+_TERMINAL_BUILD_TARGET_STATUSES = frozenset({
+    "complete", "skipped", "failed", "engineering_blocked",
+})
+
+
+def _latest_bundle_context_target(
+        work_root: Path, cycle_id: int, target_ids: set[int]) -> Optional[int]:
+    """Infer the target currently bound to the long-lived Bundle turn.
+
+    ``bundle_next_target`` durably publishes a target-specific ContextPack
+    before the operator starts smoke/train/eval.  Reading only the filename and
+    mtime keeps the Web projection independent from the in-memory operator
+    session while avoiding a second orchestration authority.
+    """
+    directory = work_root / "cycles" / f"c{cycle_id}" / "context_pack"
+    fd = -1
+    try:
+        fd = open_directory_path(directory, label="bundle context-pack directory")
+        newest: Optional[tuple[int, int]] = None
+        for name in os.listdir(fd)[:512]:
+            match = _BUNDLE_PACK_TARGET_RE.fullmatch(name)
+            if match is None:
+                continue
+            target_id = int(match.group(1))
+            if target_id not in target_ids:
+                continue
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                continue
+            candidate = (info.st_mtime_ns, target_id)
+            if newest is None or candidate > newest:
+                newest = candidate
+        return newest[1] if newest is not None else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _training_log_kind(relative: str) -> str:
+    lowered = relative.lower()
+    if "smoke" in lowered:
+        return "smoke"
+    if "eval" in lowered or "evaluation" in lowered:
+        return "eval"
+    if "train" in lowered or re.search(r"(^|/)run[0-9]+/", lowered):
+        return "train"
+    return "execution"
+
+
+def _training_log_candidates(
+        work_root: Path, cycle_id: int, target_id: int
+        ) -> List[tuple[int, Path, int]]:
+    """List a bounded set of mutable experiment logs without following links."""
+    root = work_root / f"c{cycle_id}" / f"t{target_id}"
+    try:
+        root_info = root.lstat()
+    except OSError:
+        return []
+    if not stat.S_ISDIR(root_info.st_mode) or root.is_symlink():
+        return []
+    candidates: List[tuple[int, Path, int]] = []
+    visited_dirs = 0
+    visited_files = 0
+    try:
+        for current, dirs, files in os.walk(root, followlinks=False):
+            visited_dirs += 1
+            if (visited_dirs > _MAX_TRAINING_LOG_SCAN_DIRS
+                    or visited_files >= _MAX_TRAINING_LOG_SCAN_FILES):
+                break
+            current_path = Path(current)
+            safe_dirs = []
+            for name in sorted(dirs)[:_MAX_TRAINING_LOG_SCAN_DIRS]:
+                try:
+                    info = (current_path / name).lstat()
+                except OSError:
+                    continue
+                if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                    safe_dirs.append(name)
+            dirs[:] = safe_dirs
+            for name in sorted(files):
+                visited_files += 1
+                if visited_files > _MAX_TRAINING_LOG_SCAN_FILES:
+                    break
+                lowered = name.lower()
+                if (not (lowered.endswith(".log") or lowered.endswith(".log.partial"))
+                        or lowered.endswith(".exit")
+                        or "/" in name or "\\" in name):
+                    continue
+                path = current_path / name
+                try:
+                    info = path.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    candidates.append((info.st_mtime_ns, path, info.st_size))
+    except OSError:
+        return []
+    return sorted(candidates, reverse=True)[:_MAX_TRAINING_LIVE_LOGS]
+
+
+def _training_log_snapshots(
+        work_root: Path, cycle_id: int, target_id: int,
+        candidates: List[tuple[int, Path, int]]) -> List[Dict[str, Any]]:
+    root = work_root / f"c{cycle_id}" / f"t{target_id}"
+    snapshots: List[Dict[str, Any]] = []
+    for mtime_ns, path, size in candidates:
+        try:
+            relative_to_target = path.relative_to(root).as_posix()
+            relative_to_work = path.relative_to(work_root).as_posix()
+            raw = read_regular_file_beneath(
+                work_root, relative_to_work,
+                max_bytes=_MAX_TRAINING_LOG_TAIL_BYTES, tail=True)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        # This remains the subprocess's real line-oriented output; only bearer
+        # credentials and the private quest root are replaced for the browser.
+        visible = _redact_runner_text(raw.decode("utf-8", errors="replace"))
+        for private_root in sorted(
+                {str(work_root), str(work_root.absolute())}, key=len, reverse=True):
+            if private_root:
+                visible = visible.replace(private_root, "<quest>")
+        snapshots.append({
+            "key": f"t{target_id}:{relative_to_target}",
+            "target_id": target_id,
+            "path": relative_to_target,
+            "kind": _training_log_kind(relative_to_target),
+            "state": "partial" if path.name.endswith(".partial") else "final",
+            "size_bytes": size,
+            "mtime_unix": round(mtime_ns / 1_000_000_000, 3),
+            "age_s": round(max(0.0, time.time() - mtime_ns / 1_000_000_000), 1),
+            "tail_text": visible,
+            "tail_sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "truncated": size > len(raw),
+        })
+    return snapshots
+
+
+def _training_progress(logs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract only progress explicitly present in logs; never invent a total."""
+    texts = [str(log.get("tail_text") or "") for log in logs]
+    combined = "\n".join(reversed(texts))
+    completed = list(re.finditer(
+        r"(?im)^train_complete\s*:\s*checkpoints\s*=\s*([0-9]+)\s*$",
+        combined))
+    if completed:
+        count = int(completed[-1].group(1))
+        return {"current": count, "total": count, "unit": "checkpoint",
+                "pct": 100.0, "label": f"训练完成 · {count} 个 checkpoint"}
+
+    explicit = list(re.finditer(
+        r"(?i)\b(epoch|step|fold|cell|checkpoint|trial|subject)\b\s*"
+        r"(?:[=: #]|进度)*\s*([0-9]+)\s*(?:/|\bof\b)\s*([0-9]+)",
+        combined))
+    if explicit:
+        unit, current_text, total_text = explicit[-1].groups()
+        current, total = int(current_text), int(total_text)
+        if total > 0 and current <= total:
+            return {"current": current, "total": total, "unit": unit.lower(),
+                    "pct": round(current * 100.0 / total, 1),
+                    "label": f"{unit.lower()} {current} / {total}"}
+
+    percentages = list(re.finditer(
+        r"(?<![0-9.])([0-9]{1,2}(?:\.[0-9]+)?|100(?:\.0+)?)%", combined))
+    if percentages:
+        pct = float(percentages[-1].group(1))
+        if 0 <= pct <= 100:
+            return {"current": None, "total": None, "unit": "percent",
+                    "pct": round(pct, 1), "label": f"日志进度 {pct:g}%"}
+
+    cells = list(re.finditer(
+        r"(?im)^cell=([^\s]+).*?\bstep=([0-9]+)\b", combined))
+    if cells:
+        cell, step = cells[-1].groups()
+        return {"current": int(step), "total": None, "unit": "step",
+                "pct": None, "label": f"{cell} · step {step}（日志未声明总步数）"}
+
+    checkpoints = set(re.findall(
+        r"(?im)^checkpoint_written\s*:\s*key=([^\s]+)", combined))
+    if checkpoints:
+        count = len(checkpoints)
+        return {"current": count, "total": None, "unit": "checkpoint",
+                "pct": None,
+                "label": f"日志尾部可见 {count} 个 checkpoint（总数未声明）"}
+    return {"current": None, "total": None, "unit": None,
+            "pct": None, "label": "当前日志未声明可计算的细粒度总进度"}
+
+
+def _training_live(
+        conn: sqlite3.Connection, work_root: Path, *,
+        orchestrator_live: Optional[Mapping[str, Any]] = None,
+        running_authority: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Read-only Bundle experiment monitor backed by DB state and real log tails."""
+    empty: Dict[str, Any] = {
+        "available": True,
+        "contract_version": _TRAINING_LIVE_CONTRACT_VERSION,
+        "active": False, "cycle_id": None, "runner_call_id": None,
+        "runner_status": None, "current_target": None, "targets": [],
+        "settled_targets": 0, "successful_targets": 0, "total_targets": 0,
+        "target_progress_pct": None, "substage": "idle",
+        "substage_label": "当前没有 Bundle 实验运行", "logs_target_id": None,
+        "logs": [], "progress": _training_progress([]), "gpu_used": None,
+        "gpu_indices": [], "snapshot_at_unix": round(time.time(), 3),
+        "agent_live_text": "", "agent_activities": [],
+    }
+    try:
+        runner = conn.execute(
+            "SELECT id,cycle_id,status,started_at,finished_at FROM runner_call "
+            "WHERE phase='bundle' ORDER BY id DESC LIMIT 1").fetchone()
+    except sqlite3.DatabaseError:
+        return empty
+    if runner is None or runner[1] is None:
+        return empty
+    runner_call_id, cycle_id, runner_status, started_at, finished_at = runner
+    rows = conn.execute(
+        "SELECT bt.id,bt.seq,bt.target_kind,bt.status,bt.failure_kind,"
+        "b.canonical_key,v.variant_key "
+        "FROM build_target bt "
+        "LEFT JOIN baseline b ON b.id=bt.baseline_id "
+        "LEFT JOIN variant v ON v.id=bt.variant_id "
+        "WHERE bt.cycle_id=? ORDER BY bt.seq,bt.id", (cycle_id,)).fetchall()
+    targets: List[Dict[str, Any]] = []
+    for (target_id, seq, target_kind, status_value, failure_kind,
+         canonical_key, variant_key) in rows:
+        parts = [str(value) for value in (canonical_key, variant_key) if value]
+        targets.append({
+            "id": int(target_id), "seq": int(seq), "kind": target_kind,
+            "status": status_value, "failure_kind": failure_kind,
+            "label": " / ".join(parts) if parts else f"{target_kind} target",
+        })
+    target_ids = {target["id"] for target in targets}
+    current_target_id = _latest_bundle_context_target(
+        work_root, int(cycle_id), target_ids)
+    if current_target_id is None:
+        pending = next((target for target in targets
+                        if target["status"] not in _TERMINAL_BUILD_TARGET_STATUSES), None)
+        fallback = pending or (targets[-1] if targets else None)
+        current_target_id = fallback["id"] if fallback is not None else None
+    current_target = next(
+        (target for target in targets if target["id"] == current_target_id), None)
+
+    logs: List[Dict[str, Any]] = []
+    logs_target_id: Optional[int] = None
+    search_order: List[int] = []
+    if current_target_id is not None:
+        search_order.append(current_target_id)
+    # During reviewer/target hand-off the new target may have no log yet.  Keep
+    # the immediately preceding real output visible and label its owner.
+    for target in sorted(targets, key=lambda item: item["seq"], reverse=True):
+        if target["id"] not in search_order:
+            search_order.append(target["id"])
+        if len(search_order) >= 4:
+            break
+    for target_id in search_order:
+        candidates = _training_log_candidates(work_root, int(cycle_id), target_id)
+        if not candidates:
+            continue
+        logs = _training_log_snapshots(
+            work_root, int(cycle_id), target_id, candidates)
+        if logs:
+            logs_target_id = target_id
+            break
+
+    runner_active = runner_status in ("created", "running")
+    owner_active = True
+    if orchestrator_live is not None:
+        owner_active = bool(
+            orchestrator_live.get("orchestrator_active") is True
+            and orchestrator_live.get("mode") == "running")
+    active = bool(runner_active and owner_active)
+    settled = sum(target["status"] in _TERMINAL_BUILD_TARGET_STATUSES
+                  for target in targets)
+    successful = sum(target["status"] in ("complete", "skipped")
+                     for target in targets)
+    total = len(targets)
+
+    # Before smoke/train/eval starts, the long-lived Bundle agent may spend a
+    # substantial amount of time inspecting data and editing the experiment.
+    # Project that same bounded, public Codex stream into the monitor so an
+    # empty experiment-log list never looks like a hung Bundle run.
+    agent_live_text = ""
+    agent_activities: List[Dict[str, str]] = []
+    if (active and running_authority is not None
+            and running_authority.get("runner_call_id") == runner_call_id
+            and isinstance(running_authority.get("receipt"), Mapping)):
+        agent_live_text, agent_activities = _running_codex_capture_projection(
+            work_root, running_authority["receipt"])
+
+    if not active:
+        substage, substage_label = "idle", "当前没有 Bundle 实验运行"
+    elif current_target is None:
+        substage, substage_label = "prepare", "Bundle 正在准备实验 target"
+    elif current_target["status"] in _TERMINAL_BUILD_TARGET_STATUSES:
+        substage, substage_label = "review", "Codex 正在审查结果或切换下一 target"
+    elif logs_target_id != current_target_id or not logs:
+        substage, substage_label = "prepare", "Codex 正在构建或准备实验命令"
+    else:
+        substage = str(logs[0].get("kind") or "execution")
+        substage_label = {
+            "smoke": "Smoke 测试输出",
+            "train": "训练输出",
+            "eval": "评估输出",
+            "execution": "实验命令输出",
+        }.get(substage, "实验命令输出")
+
+    newest_kind = logs[0].get("kind") if logs else None
+    # Do not carry a smoke-only GPU count into a newer train/eval command.  A
+    # missing count is more truthful than claiming the previous subprocess's
+    # allocation for the process currently shown.
+    all_text = "\n".join(
+        str(log.get("tail_text") or "") for log in logs
+        if log.get("kind") == newest_kind)
+    gpu_counts = [int(value) for value in re.findall(
+        r"(?im)^gpu_used\s*:\s*([0-9]+)\s*$", all_text)]
+    gpu_indices = sorted({int(value) for value in re.findall(
+        r"\blogical_cuda_index=([0-9]+)\b", all_text)})
+    return {
+        "available": True,
+        "contract_version": _TRAINING_LIVE_CONTRACT_VERSION,
+        "active": active, "cycle_id": int(cycle_id),
+        "runner_call_id": int(runner_call_id), "runner_status": runner_status,
+        "runner_started_at": started_at, "runner_finished_at": finished_at,
+        "current_target": current_target, "targets": targets,
+        "settled_targets": settled, "successful_targets": successful,
+        "total_targets": total,
+        "target_progress_pct": round(settled * 100.0 / total, 1) if total else None,
+        "substage": substage, "substage_label": substage_label,
+        "logs_target_id": logs_target_id, "logs": logs,
+        "progress": _training_progress(logs),
+        "gpu_used": gpu_counts[0] if gpu_counts else (
+            len(gpu_indices) if gpu_indices else None),
+        "gpu_indices": gpu_indices,
+        "agent_live_text": agent_live_text,
+        "agent_activities": agent_activities,
+        "snapshot_at_unix": round(time.time(), 3),
+    }
 
 
 def _ledger_by_cycle(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -688,6 +1116,541 @@ def _ledger_by_cycle(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         money = totals[cycle_id]
         clean_money = None if cycle_id in invalid or not math.isfinite(money) else money
         out.append({"cycle": f"c{cycle_id}", "money": clean_money})
+    return out
+
+
+def _runner_transcript_relative(
+        work_root: Path, transcript_ref: Any, *, runner_call_id: int,
+        cycle_id: int) -> Optional[str]:
+    """Map one DB-authored transcript ref to a narrowly allowed work-root path.
+
+    Runner refs predate the Web product and may be absolute or relative.  The
+    browser must never receive a generic host-path read capability, so only the
+    deterministic final-output/event files owned by this runner_call are
+    accepted here.  Prompt files, heartbeats and state/ execution captures are
+    deliberately excluded.
+    """
+    if not isinstance(transcript_ref, str) or not transcript_ref or "\x00" in transcript_ref:
+        return None
+    ref = Path(transcript_ref)
+    try:
+        relative = ref.relative_to(work_root) if ref.is_absolute() else ref
+    except ValueError:
+        return None
+    parts = relative.parts
+    if (not parts or relative.is_absolute()
+            or any(part in ("", ".", "..") or "\\" in part for part in parts)):
+        return None
+    filename = parts[-1]
+    suffixes = (f"-rc{runner_call_id}.out.md", f"-rc{runner_call_id}.events.jsonl")
+    if not filename.endswith(suffixes):
+        return None
+    cycle_path = (
+        len(parts) == 4 and parts[0] == "cycles"
+        and parts[1] == f"c{cycle_id}" and parts[2] == "transcripts")
+    interaction_path = (
+        len(parts) == 4 and parts[0] == "interactions"
+        and parts[1] == "transcripts"
+        and re.fullmatch(r"[0-9a-f]{16,64}", parts[2]) is not None)
+    if not (cycle_path or interaction_path):
+        return None
+    return "/".join(parts)
+
+
+def _compact_runner_text(text: str) -> str:
+    text = text.strip()
+    if len(text) <= _MAX_RUNNER_OUTPUT_CHARS:
+        return text
+    tail_chars = min(4096, _MAX_RUNNER_OUTPUT_CHARS // 4)
+    head_chars = _MAX_RUNNER_OUTPUT_CHARS - tail_chars
+    return (text[:head_chars]
+            + "\n\n…（Codex 输出过长，Web 视图已限长；研究产物仍保留完整内容）…\n\n"
+            + text[-tail_chars:])
+
+
+def _codex_event_transcript_text(raw: str) -> str:
+    """Project public CLI events without exposing hidden reasoning records."""
+    messages: List[str] = []
+    usage: Optional[Mapping[str, Any]] = None
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "item.completed" and isinstance(event.get("item"), dict):
+            item = event["item"]
+            item_kind = item.get("type")
+            # agent_message is the user-visible Codex response.  Deliberately
+            # do not project any `reasoning` item even if a future CLI emits it.
+            if item_kind == "agent_message" and isinstance(item.get("text"), str):
+                messages.append(item["text"])
+            elif item_kind == "error" and isinstance(item.get("message"), str):
+                messages.append("Codex 错误：" + item["message"])
+        elif kind == "error" and isinstance(event.get("message"), str):
+            messages.append("Codex 错误：" + event["message"])
+        elif kind == "turn.failed":
+            error = event.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                messages.append("Codex turn 失败：" + error["message"])
+        elif kind == "turn.completed" and isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+    if usage is not None:
+        fields = []
+        for key, label in (("input_tokens", "input"),
+                           ("cached_input_tokens", "cached"),
+                           ("output_tokens", "output"),
+                           ("reasoning_output_tokens", "reasoning")):
+            value = usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                fields.append(f"{label}={value}")
+        if fields:
+            messages.append("usage · " + " · ".join(fields))
+    return _compact_runner_text("\n\n".join(messages))
+
+
+_RUNNER_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s\"']+"),
+    re.compile(
+        r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret|"
+        r"capability)\b\s*[:=]\s*[\"']?)[^\s\"',;}]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+)
+
+
+def _redact_runner_text(value: Any) -> str:
+    """Best-effort redaction for authenticated Web display of CLI-visible activity."""
+    text = str(value or "")
+    for pattern in _RUNNER_SECRET_PATTERNS:
+        if pattern.pattern.startswith("\\bsk-"):
+            text = pattern.sub("[已遮蔽凭据]", text)
+        else:
+            text = pattern.sub(r"\1[已遮蔽]", text)
+    return text
+
+
+def _clip_runner_activity(value: Any, *, limit: int = _MAX_RUNNER_LIVE_ITEM_CHARS) -> str:
+    text = _redact_runner_text(value).strip()
+    if len(text) <= limit:
+        return text
+    tail = min(2048, limit // 3)
+    return text[:limit - tail] + "\n…（本条输出已限长）…\n" + text[-tail:]
+
+
+def _runner_activity_one_line(value: Any, *, limit: int) -> str:
+    text = re.sub(r"\s+", " ", _redact_runner_text(value)).strip()
+    if len(text) <= limit:
+        return text
+    return text[:max(1, limit - 1)].rstrip() + "…"
+
+
+def _structured_codex_output_label(value: Any) -> Optional[str]:
+    """Recognise a runner envelope without dumping its large JSON into the feed."""
+    text = str(value or "").strip()
+    candidate = text
+    fenced = re.fullmatch(r"```(?:json)?\s*\n([\s\S]*?)\n```", text, re.IGNORECASE)
+    if fenced is not None:
+        candidate = fenced.group(1).strip()
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("files"), Mapping):
+        return None
+    names = [
+        _runner_activity_one_line(name, limit=80)
+        for name in payload["files"]
+        if isinstance(name, str) and name
+    ][:6]
+    if not names:
+        return "Codex 已生成本阶段结构化产物"
+    suffix = "" if len(payload["files"]) <= len(names) else " 等"
+    return "Codex 已生成本阶段结构化产物 · " + "、".join(names) + suffix
+
+
+def _codex_activity_key(event: Mapping[str, Any], text: str) -> str:
+    item = event.get("item")
+    if isinstance(item, Mapping) and isinstance(item.get("id"), str) and item["id"]:
+        identity: Mapping[str, Any] = {
+            "event": event.get("type"),
+            "item_type": item.get("type"),
+            "item_id": item["id"],
+        }
+    else:
+        identity = {"event": event.get("type"), "text": text}
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:20]
+
+
+def _codex_live_activity_events(raw: str) -> List[Dict[str, str]]:
+    """Project committed CLI JSONL records into short, stable public activities.
+
+    This is a display projection only.  It deliberately ignores reasoning
+    items, redacts CLI-visible secrets and never treats an unterminated final
+    line as committed output.  Stable keys let the browser append each real
+    action exactly once while the aggregate live transcript can still refresh
+    in place inside the detailed question view.
+    """
+    rows: List[Dict[str, str]] = []
+    for raw_line in raw.splitlines(keepends=True):
+        if not raw_line.endswith(("\n", "\r")):
+            continue
+        line = raw_line.rstrip("\r\n")
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_kind = event.get("type")
+        item = event.get("item")
+        text = ""
+        activity_kind = "lifecycle"
+        state = "completed"
+
+        if event_kind == "thread.started":
+            text = "Codex 执行会话已建立"
+            state = "running"
+        elif event_kind == "turn.started":
+            text = "Codex 已接收本阶段任务，正在分析上下文"
+            state = "running"
+        elif event_kind in ("item.started", "item.completed") and isinstance(item, dict):
+            item_kind = item.get("type")
+            state = "running" if event_kind == "item.started" else "completed"
+            if item_kind == "reasoning":
+                continue
+            if item_kind == "agent_message":
+                if event_kind != "item.completed" or not isinstance(item.get("text"), str):
+                    continue
+                activity_kind = "message"
+                structured = _structured_codex_output_label(item["text"])
+                text = structured or (
+                    "Codex 回复 · " + _runner_activity_one_line(
+                        item["text"], limit=_MAX_RUNNER_ACTIVITY_TEXT_CHARS))
+            elif item_kind == "error":
+                activity_kind = "error"
+                message = item.get("message")
+                if not isinstance(message, str):
+                    continue
+                text = "Codex 错误 · " + _runner_activity_one_line(
+                    message, limit=_MAX_RUNNER_ACTIVITY_TEXT_CHARS)
+            elif item_kind == "command_execution":
+                activity_kind = "command"
+                command = _runner_activity_one_line(item.get("command"), limit=300)
+                if state == "running":
+                    text = "开始执行命令" + (" · " + command if command else "")
+                else:
+                    exit_code = item.get("exit_code")
+                    exit_label = f"exit {exit_code}" if isinstance(exit_code, int) else "已结束"
+                    text = "命令完成（" + exit_label + "）" + (
+                        " · " + command if command else "")
+                    output = _runner_activity_one_line(
+                        item.get("aggregated_output"), limit=320)
+                    if output:
+                        text += "\n结果 · " + output
+            elif item_kind == "web_search":
+                activity_kind = "search"
+                query = _runner_activity_one_line(item.get("query"), limit=420)
+                text = ("正在联网检索" if state == "running" else "联网检索完成")
+                if query:
+                    text += " · " + query
+            elif item_kind == "mcp_tool_call":
+                activity_kind = "tool"
+                server = _runner_activity_one_line(item.get("server"), limit=100)
+                tool = _runner_activity_one_line(item.get("tool"), limit=140)
+                target = "/".join(part for part in (server, tool) if part)
+                text = ("正在调用工具" if state == "running" else "工具调用完成")
+                if target:
+                    text += " · " + target
+            elif item_kind == "file_change":
+                activity_kind = "file"
+                changes = item.get("changes")
+                names: List[str] = []
+                if isinstance(changes, list):
+                    for change in changes[:4]:
+                        if not isinstance(change, Mapping):
+                            continue
+                        path = change.get("path")
+                        name = os.path.basename(path) if isinstance(path, str) else ""
+                        action = _runner_activity_one_line(change.get("kind"), limit=40)
+                        label = " ".join(part for part in (action, name) if part)
+                        if label:
+                            names.append(_runner_activity_one_line(label, limit=120))
+                text = ("正在修改文件" if state == "running" else "文件修改完成")
+                if names:
+                    text += " · " + "、".join(names)
+            else:
+                activity_kind = "activity"
+                label = _runner_activity_one_line(item_kind or "unknown", limit=100)
+                text = ("开始 Codex 活动" if state == "running" else "Codex 活动完成")
+                text += " · " + label
+        elif event_kind == "error" and isinstance(event.get("message"), str):
+            activity_kind = "error"
+            state = "failed"
+            text = "Codex 错误 · " + _runner_activity_one_line(
+                event["message"], limit=_MAX_RUNNER_ACTIVITY_TEXT_CHARS)
+        elif event_kind == "turn.failed":
+            error = event.get("error")
+            if not isinstance(error, Mapping) or not isinstance(error.get("message"), str):
+                continue
+            activity_kind = "error"
+            state = "failed"
+            text = "Codex 执行失败 · " + _runner_activity_one_line(
+                error["message"], limit=_MAX_RUNNER_ACTIVITY_TEXT_CHARS)
+        elif event_kind == "turn.completed":
+            activity_kind = "usage"
+            fields = []
+            usage = event.get("usage")
+            if isinstance(usage, Mapping):
+                for key, label in (("input_tokens", "input"),
+                                   ("cached_input_tokens", "cached"),
+                                   ("output_tokens", "output"),
+                                   ("reasoning_output_tokens", "reasoning")):
+                    value = usage.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        fields.append(f"{label}={value}")
+            text = "Codex 本次执行完成" + (" · " + " · ".join(fields) if fields else "")
+        else:
+            continue
+
+        text = _clip_runner_activity(text, limit=_MAX_RUNNER_ACTIVITY_TEXT_CHARS)
+        rows.append({
+            "key": _codex_activity_key(event, text),
+            "activity_kind": activity_kind,
+            "activity_state": state,
+            "text": text,
+        })
+    return rows[-_MAX_RUNNER_ACTIVITY_ITEMS:]
+
+
+def _codex_live_event_transcript_text(raw: str) -> str:
+    """Render the public part of a running ``codex exec --json`` stream.
+
+    Commands, their captured output, errors and user-visible agent messages are
+    the same operational surface a local CLI user can observe.  Reasoning items
+    are intentionally ignored.  Each item is kept only in its latest state so
+    the Web card refreshes in place instead of replaying start/completion pairs.
+    """
+    activities: Dict[str, str] = {}
+    order: List[str] = []
+    notices: List[str] = []
+    usage: Optional[Mapping[str, Any]] = None
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        item = event.get("item")
+        if kind in ("item.started", "item.completed") and isinstance(item, dict):
+            item_kind = item.get("type")
+            if item_kind == "reasoning":
+                continue
+            if item_kind == "agent_message" and isinstance(item.get("text"), str):
+                notices.append("Codex 回复\n" + _clip_runner_activity(item["text"]))
+                continue
+            if item_kind == "error" and isinstance(item.get("message"), str):
+                notices.append("Codex 错误\n" + _clip_runner_activity(item["message"]))
+                continue
+            item_id = str(item.get("id") or f"event-{len(order) + 1}")
+            if item_id not in activities:
+                order.append(item_id)
+            status = str(item.get("status") or (
+                "completed" if kind == "item.completed" else "in_progress"))
+            if item_kind == "command_execution":
+                title = "正在执行命令" if status == "in_progress" else "命令执行完成"
+                exit_code = item.get("exit_code")
+                if exit_code is not None:
+                    title += f"（exit {exit_code}）"
+                parts = [title]
+                command = _clip_runner_activity(item.get("command"), limit=4096)
+                output = _clip_runner_activity(item.get("aggregated_output"))
+                if command:
+                    parts.append("$ " + command)
+                if output:
+                    parts.append(output)
+                activities[item_id] = "\n".join(parts)
+            elif item_kind in ("mcp_tool_call", "web_search", "file_change"):
+                labels = {
+                    "mcp_tool_call": "工具调用", "web_search": "联网检索",
+                    "file_change": "文件修改",
+                }
+                public = {
+                    key: item[key] for key in (
+                        "server", "tool", "query", "status", "result", "changes")
+                    if key in item
+                }
+                details = _clip_runner_activity(
+                    json.dumps(public, ensure_ascii=False, sort_keys=True))
+                activities[item_id] = labels[item_kind] + ("\n" + details if details else "")
+            else:
+                # Unknown future item types stay observable without dumping
+                # their arbitrary payload (which could include hidden state).
+                activities[item_id] = f"Codex 活动 · {item_kind or 'unknown'} · {status}"
+        elif kind == "error" and isinstance(event.get("message"), str):
+            notices.append("Codex 错误\n" + _clip_runner_activity(event["message"]))
+        elif kind == "turn.failed":
+            error = event.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                notices.append("Codex turn 失败\n" + _clip_runner_activity(error["message"]))
+        elif kind == "turn.completed" and isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+    blocks = [activities[item_id] for item_id in order[-_MAX_RUNNER_LIVE_ITEMS:]]
+    blocks.extend(notices[-4:])
+    if usage is not None:
+        fields = []
+        for key, label in (("input_tokens", "input"),
+                           ("cached_input_tokens", "cached"),
+                           ("output_tokens", "output"),
+                           ("reasoning_output_tokens", "reasoning")):
+            value = usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                fields.append(f"{label}={value}")
+        if fields:
+            blocks.append("usage · " + " · ".join(fields))
+    return _compact_runner_text("\n\n".join(blocks))
+
+
+def _running_codex_capture_projection(
+        work_root: Path, receipt: Mapping[str, Any]
+        ) -> tuple[str, List[Dict[str, str]]]:
+    operation_id = receipt.get("operation_id")
+    capture_ref = receipt.get("capture_stdout_ref")
+    if (not isinstance(operation_id, str)
+            or re.fullmatch(r"exec-[0-9a-f]{32}", operation_id) is None
+            or not isinstance(capture_ref, str)):
+        return "", []
+    expected = work_root / "state" / "executions" / f"capture-{operation_id}.stdout.bin"
+    if capture_ref != str(expected):
+        return "", []
+    relative = expected.relative_to(work_root).as_posix()
+    try:
+        raw = read_regular_file_beneath(
+            work_root, relative, max_bytes=_MAX_RUNNER_LIVE_CAPTURE_BYTES, tail=True)
+        decoded = raw.decode("utf-8")
+        return (_codex_live_event_transcript_text(decoded),
+                _codex_live_activity_events(decoded))
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+        return "", []
+
+
+def _running_codex_capture_text(
+        work_root: Path, receipt: Mapping[str, Any]) -> str:
+    """Compatibility wrapper for callers which only need the aggregate view."""
+    return _running_codex_capture_projection(work_root, receipt)[0]
+
+
+def _runner_output(
+        conn: sqlite3.Connection, work_root: Path, *,
+        running_authority: Optional[Mapping[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Bounded, read-only projection of recent user-visible Codex output."""
+    rows = conn.execute(
+        "SELECT id,cycle_id,phase,purpose,status,transcript_ref,started_at,finished_at "
+        "FROM runner_call ORDER BY id DESC LIMIT ?",
+        (_MAX_RUNNER_OUTPUT_CALLS,)).fetchall()
+    out: List[Dict[str, Any]] = []
+    for (runner_call_id, cycle_id, phase, purpose, status, transcript_ref,
+         started_at, finished_at) in reversed(rows):
+        label = f"runner_call #{runner_call_id} · {phase or 'unknown'} · {purpose or '—'}"
+        out.append({
+            "key": f"rc{runner_call_id}:start",
+            "at": started_at,
+            "runner_call_id": runner_call_id,
+            "cycle_id": cycle_id,
+            "phase": phase,
+            "purpose": purpose,
+            "call_status": status,
+            "kind": "status",
+            "text": label + " · Codex 已启动",
+        })
+        if status in ("created", "running"):
+            out.append({
+                "key": f"rc{runner_call_id}:running",
+                "at": started_at,
+                "runner_call_id": runner_call_id,
+                "cycle_id": cycle_id,
+                "phase": phase,
+                "purpose": purpose,
+                "call_status": status,
+                "kind": "status",
+                "text": label + " · Codex 正在执行，后续活动会逐条显示",
+            })
+            if (running_authority is not None
+                    and running_authority.get("runner_call_id") == runner_call_id
+                    and isinstance(running_authority.get("receipt"), Mapping)):
+                display, activities = _running_codex_capture_projection(
+                    work_root, running_authority["receipt"])
+                if display:
+                    out.append({
+                        "key": f"rc{runner_call_id}:live",
+                        "at": started_at,
+                        "runner_call_id": runner_call_id,
+                        "cycle_id": cycle_id,
+                        "phase": phase,
+                        "purpose": purpose,
+                        "call_status": status,
+                        "kind": "live",
+                        "text": display,
+                    })
+                for activity in activities:
+                    out.append({
+                        "key": f"rc{runner_call_id}:activity:{activity['key']}",
+                        "at": started_at,
+                        "runner_call_id": runner_call_id,
+                        "cycle_id": cycle_id,
+                        "phase": phase,
+                        "purpose": purpose,
+                        "call_status": status,
+                        "kind": "activity",
+                        "activity_kind": activity["activity_kind"],
+                        "activity_state": activity["activity_state"],
+                        "text": activity["text"],
+                    })
+            continue
+        relative = _runner_transcript_relative(
+            work_root, transcript_ref, runner_call_id=int(runner_call_id),
+            cycle_id=int(cycle_id))
+        if relative is not None:
+            try:
+                raw = read_regular_file_beneath(
+                    work_root, relative, max_bytes=_MAX_RUNNER_TRANSCRIPT_BYTES)
+                decoded = raw.decode("utf-8")
+                display = (_codex_event_transcript_text(decoded)
+                           if relative.endswith(".events.jsonl")
+                           else _compact_runner_text(decoded))
+                if display:
+                    out.append({
+                        "key": f"rc{runner_call_id}:output",
+                        "at": finished_at or started_at,
+                        "runner_call_id": runner_call_id,
+                        "cycle_id": cycle_id,
+                        "phase": phase,
+                        "purpose": purpose,
+                        "call_status": status,
+                        "kind": "output",
+                        "text": display,
+                    })
+            except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+                # Status remains authoritative even if an old/oversized
+                # transcript cannot be projected into the browser.
+                pass
+        out.append({
+            "key": f"rc{runner_call_id}:finish:{status}",
+            "at": finished_at or started_at,
+            "runner_call_id": runner_call_id,
+            "cycle_id": cycle_id,
+            "phase": phase,
+            "purpose": purpose,
+            "call_status": status,
+            "kind": "status",
+            "text": label + f" · Codex 已结束（{status}）",
+        })
     return out
 
 
@@ -738,8 +1701,36 @@ def _load_bounded_policy(raw: bytes) -> Dict[str, Any]:
     return value
 
 
-def _fs_tree(work_root: Path, system_root: Path) -> Dict[str, Any]:
-    """真文件树（控制台文件浏览器）：work_root 运行产物 + system_root 的 schemas/prompts/policies（只读展示）。
+def _public_work_path(parts: List[str]) -> bool:
+    """Whether a work-root path is a browser-readable research artifact.
+
+    ``state/`` contains process receipts, raw logs, qualification capabilities
+    and server-authored host-path manifests.  Those objects have dedicated
+    redacted API projections and must never become a generic file-browser
+    capability.  The browser may inspect only research inputs/outputs.
+    """
+    if not parts or any(not part or part in {".", ".."} for part in parts):
+        return False
+    if parts[0] in _PUBLIC_WORK_FILES:
+        return len(parts) == 1
+    if parts[0] not in _PUBLIC_WORK_DIRECTORIES:
+        return False
+    if (parts[0] == "input" and len(parts) >= 2
+            and parts[1] in _PRIVATE_WORK_INPUT_FILES):
+        return False
+    return True
+
+
+def _fs_tree(
+        work_root: Path, system_root: Path, *,
+        include_system_documents: bool = True) -> Dict[str, Any]:
+    """真文件树：仅投影 browser-safe research artifacts。
+
+    The legacy single-work-root operations console may additionally project
+    system documents.  The installed multi-quest Web product deliberately
+    disables that projection: a researcher sees task inputs/outputs, never a
+    navigable view of backend policy, prompts or schemas.
+
     深度/条目有界（防超大树拖垮前端）；每节点 {p: 相对名, dir: bool, size: 字节}。
 
     递归只从已经固定的目录 fd 走 ``openat(O_NOFOLLOW)``；pathname/symlink 预检与随后 ``iterdir``
@@ -779,7 +1770,8 @@ def _fs_tree(work_root: Path, system_root: Path) -> Dict[str, Any]:
                 os.close(child_fd)
             return None
 
-    def walk(directory_fd: int, depth: int) -> List[Dict[str, Any]]:
+    def walk(directory_fd: int, depth: int, *, relative: tuple[str, ...] = (),
+             work_projection: bool = False) -> List[Dict[str, Any]]:
         if depth > 6 or remaining[0] <= 0:
             return []
         entries = []
@@ -801,6 +1793,9 @@ def _fs_tree(work_root: Path, system_root: Path) -> Dict[str, Any]:
                         continue
                     if stat.S_ISLNK(info.st_mode):
                         continue
+                    if (work_projection
+                            and not _public_work_path(list(relative + (entry.name,)))):
+                        continue
                     entries.append((entry.name, info))
             entries.sort(key=lambda pair: (not stat.S_ISDIR(pair[1].st_mode), pair[0]))
         except OSError:
@@ -818,7 +1813,10 @@ def _fs_tree(work_root: Path, system_root: Path) -> Dict[str, Any]:
                     node["children"] = []
                 else:
                     try:
-                        node["children"] = walk(child_fd, depth + 1)
+                        node["children"] = walk(
+                            child_fd, depth + 1,
+                            relative=relative + (name,),
+                            work_projection=work_projection)
                     finally:
                         os.close(child_fd)
             else:
@@ -826,24 +1824,30 @@ def _fs_tree(work_root: Path, system_root: Path) -> Dict[str, Any]:
             nodes.append(node)
         return nodes
 
-    def root_node(label: str, path: Path, *, required: bool) -> Optional[Dict[str, Any]]:
+    def root_node(label: str, path: Path, *, required: bool,
+                  work_projection: bool = False) -> Optional[Dict[str, Any]]:
         fd = open_root(path)
         if fd is None:
             return {"p": label, "dir": True, "children": []} if required else None
         try:
-            return {"p": label, "dir": True, "children": walk(fd, 0)}
+            return {"p": label, "dir": True, "children": walk(
+                fd, 0, work_projection=work_projection)}
         finally:
             os.close(fd)
 
-    roots = [root_node("work", work_root, required=True)]
-    for sub in ("schemas", "prompts", "policies", "input"):
-        node = root_node(sub, system_root / sub, required=False)
-        if node is not None:
-            roots.append(node)
+    roots = [root_node(
+        "work", work_root, required=True, work_projection=True)]
+    if include_system_documents:
+        for sub in ("schemas", "prompts", "policies", "input"):
+            node = root_node(sub, system_root / sub, required=False)
+            if node is not None:
+                roots.append(node)
     return {"roots": roots}
 
 
-def assemble_db(db_path: str, work_root: str, system_root: str) -> Dict[str, Any]:
+def assemble_db(
+        db_path: str, work_root: str, system_root: str, *,
+        product_mode: bool = False) -> Dict[str, Any]:
     """组装控制台 /api/db 载荷（纯函数、只读连接、可单测）：真表投影 + 派生对象。"""
     conn = _open_ro(db_path, work_root=work_root)
     try:
@@ -862,9 +1866,17 @@ def assemble_db(db_path: str, work_root: str, system_root: str) -> Dict[str, Any
         tables = {table: projected.get(table, []) for table in _PROJECT_TABLES}
         payload: Dict[str, Any] = {"tables": tables}
         payload["status_card"] = _load_status_card(Path(work_root))
-        payload["live"] = _live(conn, Path(work_root))
+        runner_execution: Dict[str, Any] = {}
+        payload["live"] = _live(
+            conn, Path(work_root), runner_execution=runner_execution)
+        payload["training_live"] = _training_live(
+            conn, Path(work_root), orchestrator_live=payload["live"],
+            running_authority=runner_execution or None)
         payload["notification"] = _notifications(Path(work_root))
         payload["ledger_by_cycle"] = _ledger_by_cycle(conn)
+        payload["runner_output"] = _runner_output(
+            conn, Path(work_root), running_authority=runner_execution or None)
+        payload["narrator_session"] = public_narrator_session_status(Path(work_root))
     finally:
         conn.close()
     try:                                   # policy 解析失败**不拖垮整个仪表盘**
@@ -873,7 +1885,9 @@ def assemble_db(db_path: str, work_root: str, system_root: str) -> Dict[str, Any
         payload["policy"] = _load_bounded_policy(raw_policy)
     except (UnicodeDecodeError, yaml.YAMLError, OSError, ValueError, RuntimeError):
         payload["policy"] = {}
-    payload["fs"] = _fs_tree(Path(work_root), Path(system_root))
+    payload["fs"] = _fs_tree(
+        Path(work_root), Path(system_root),
+        include_system_documents=not product_mode)
     return payload
 
 
@@ -882,22 +1896,28 @@ class ConsoleData:
 
     def __init__(self, *, db_path: str, work_root: str, system_root: str,
                  spool: Optional[ConsoleSpool] = None,
-                 capability_token: Optional[str] = None):
+                 capability_token: Optional[str] = None,
+                 product_mode: bool = False):
         self.db_path = db_path
         self.work_root = Path(work_root)
         self.system_root = Path(system_root)
         self.spool = spool or ConsoleSpool(self.work_root)
         self.inbox = self.spool.inbox_path
         self.capability_token = capability_token
+        self.product_mode = bool(product_mode)
 
     def db(self) -> Dict[str, Any]:
-        return assemble_db(self.db_path, str(self.work_root), str(self.system_root))
+        return assemble_db(
+            self.db_path, str(self.work_root), str(self.system_root),
+            product_mode=self.product_mode)
 
     def _virtual_root(self, seg: str) -> Optional[Path]:
         """FS 树暴露的虚拟根 → 真目录（显式映射，不靠 base.parent 猜——codex SHOULD：--work-root 叫任意名
         时 base.parent/rel 拼法会 404）。work→work_root；schemas/prompts/policies/input→system_root/<seg>。"""
         if seg == "work":
             return self.work_root
+        if self.product_mode:
+            return None
         if seg in ("schemas", "prompts", "policies", "input"):
             return self.system_root / seg
         return None
@@ -909,6 +1929,8 @@ class ConsoleData:
         if base is None:
             return None
         sub = parts[1] if len(parts) > 1 else ""
+        if parts[0] == "work" and not _public_work_path(sub.split("/")):
+            return None
         if CAPABILITY_NAME in sub.split("/"):
             return None
         try:
@@ -947,6 +1969,31 @@ class ConsoleData:
         return self._enqueue(record,
                              client_idempotency_key=client_idempotency_key)
 
+    def enqueue_query(self, text: str, connector: str = "console", *,
+                      conversation_id: Optional[str] = None,
+                      client_idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+        """讲解员只读提问 → 明确标记 transport intent 后追加 inbox；不写 DB。
+
+        ``action_target=query`` 由 run 单写者消费为强制 query 分类。这样即便问题正文包含“暂停”或
+        “改预算”等控制词，也只能得到解释，不可能借讲解员入口生成 directive。
+        """
+        if not isinstance(text, str):
+            raise ValueError("查询 text 须为字符串")
+        text = text.strip()
+        if not text:
+            raise ValueError("空查询")
+        if len(text) > _MAX_MESSAGE_CHARS:
+            raise ValueError(f"查询过长（最多 {_MAX_MESSAGE_CHARS} 字符）")
+        conversation_id = _console_conversation_id(conversation_id)
+        record: Dict[str, Any] = {
+            "connector": connector,
+            "action_target": "query",
+            "raw_text": text,
+        }
+        if conversation_id is not None:
+            record["conversation_id"] = conversation_id
+        return self._enqueue(record, client_idempotency_key=client_idempotency_key)
+
     def enqueue_directive_action(self, *, action: str, directive_id: Any,
                                  reason: str = "", connector: str = "console",
                                  conversation_id: Optional[str] = None,
@@ -982,7 +2029,7 @@ class ConsoleData:
                                     source_ref: Any = None, reason: str = "",
                                     connector: str = "console",
                                     client_idempotency_key: Optional[str] = None) -> Dict[str, Any]:
-        """把文件请求 resolve/cancel 控件动作追加到 spool；研究库仍只读。
+        """把资料上传/权限确认控件动作追加到 spool；研究库仍只读。
 
         HTTP 层用 mode=ro 只核请求身份存在；状态迁移完全由 run 进程在单写域重核。不能用可变的
         pending/terminal 状态拦 append：首次动作可能已经入 spool 并迁终态、但 HTTP ACK 丢失，客户端
@@ -990,8 +2037,8 @@ class ConsoleData:
         虚拟目录引用，不把任意绝对路径送入 spool。
         """
         action = str(action or "").strip().lower()
-        if action not in ("resolve", "cancel"):
-            raise ValueError("action 须为 resolve 或 cancel")
+        if action not in ("resolve", "approve", "cancel"):
+            raise ValueError("action 须为 resolve、approve 或 cancel")
         rid = _canonical_positive_id(request_id, label="request_id")
         conn = _open_ro(self.db_path, work_root=self.work_root)
         try:
@@ -1008,6 +2055,8 @@ class ConsoleData:
                                             system_root=self.system_root)
             rec["source_ref"] = normalized
             rec["raw_text"] = f"解决文件请求 r{rid}，来源 {normalized}"
+        elif action == "approve":
+            rec["raw_text"] = f"同意权限请求 r{rid}"
         else:
             if not isinstance(reason, str):
                 raise ValueError("取消理由须为字符串")
@@ -1019,11 +2068,89 @@ class ConsoleData:
         return self._enqueue(rec, client_idempotency_key=client_idempotency_key)
 
 
-def make_handler(data: ConsoleData, static_dir: Optional[Path]):
+class QuestConsoleData:
+    """Multi-quest facade.  Every selected quest gets its own read DB + inbox spool."""
+
+    def __init__(self, *, registry: QuestRegistry, system_root: str,
+                 capability_token: Optional[str] = None,
+                 web_service: Optional[WebQuestService] = None):
+        self.registry = registry
+        self.system_root = Path(system_root)
+        self.capability_token = capability_token
+        self.web_service = web_service
+        # The installed, loopback-only, single-user Web product may bootstrap a
+        # browser opened at the bare local URL.  Single-quest/admin ``serve``
+        # keeps the stricter explicit-fragment flow.
+        self.local_browser_bootstrap = True
+
+    def list_quests(self, *, selector_only: bool = False) -> List[Dict[str, Any]]:
+        """Return quest identities, optionally without expensive setup detail.
+
+        The browser selector only consumes ``quest_id`` and ``title``.  Reading
+        every quest's dataset preflight/runtime profile while transitioning
+        into a freshly published task made that transition look frozen, so the
+        selector view deliberately avoids those per-quest filesystem reads.
+        The existing full response remains the default API contract.
+        """
+        if not isinstance(selector_only, bool):
+            raise ValueError("selector_only 须为 bool")
+        result = []
+        for quest in self.registry.list():
+            row = quest.public_dict()
+            if self.web_service is not None and not selector_only:
+                row["setup"] = self.web_service.ready(quest.quest_id)
+                row["runtime"] = self.web_service.runtime(quest.quest_id)
+                row["runtime_profile"] = self.web_service.runtime_profile(
+                    quest.quest_id)
+            result.append(row)
+        return result
+
+    def quest_data(self, quest_id: Any) -> ConsoleData:
+        if not isinstance(quest_id, str) or not quest_id:
+            raise ValueError("multi-quest API 必须提供 quest_id")
+        quest = self.registry.get(quest_id)
+        return ConsoleData(
+            db_path=str(quest.db_path), work_root=str(quest.work_root),
+            system_root=str(self.system_root), capability_token=self.capability_token,
+            product_mode=True)
+
+    def create_quest(self, body: Dict[str, Any], *, idempotency_key: str):
+        unexpected = set(body) - {"quest_id", "title", "template_id", "goal_brief_md"}
+        if unexpected:
+            raise ValueError(f"quest 创建请求含未知字段: {sorted(unexpected)}")
+        template_id = body.get("template_id")
+        custom = body.get("goal_brief_md")
+        if template_id is not None and custom is not None:
+            raise ValueError("template_id 与 goal_brief_md 只能提供一个")
+        if template_id == "t1-eeg-universal":
+            raise ValueError(
+                "T1 必须通过 Web 数据向导自动预检并安装内部 qualification contract，"
+                "不得用普通 quest 创建接口绕过")
+        # Bind before any filesystem publication.  Replaying the same key/body
+        # after a crash is safe; reusing one key for a different body is 409.
+        self.registry.bind_create_request(idempotency_key, body)
+        if template_id is not None:
+            return self.registry.create_from_template(
+                quest_id=body.get("quest_id"), title=body.get("title"),
+                template_id=template_id)
+        if custom is None:
+            raise ValueError("须提供 template_id 或 goal_brief_md")
+        return self.registry.create(
+            quest_id=body.get("quest_id"), title=body.get("title"),
+            goal_brief_md=custom)
+
+    def require_web_service(self) -> WebQuestService:
+        if self.web_service is None:
+            raise ValueError("当前多 quest 服务未启用 Web-first setup")
+        return self.web_service
+
+
+def make_handler(data: Union[ConsoleData, QuestConsoleData], static_dir: Optional[Path]):
     """构造 HTTP handler 类（闭包持 data + 静态目录）。路由：
-    GET /api/db · GET /api/file?p=… · POST /api/message{text} ·
+    GET /api/db · GET /api/file?p=… · POST /api/message{text} · POST /api/query{text} ·
     POST /api/directive{action,directive_id,reason?} ·
-    POST /api/file-request{action,request_id,source_ref?|reason?} · GET /（静态控制台页）。"""
+    POST /api/file-request{action,request_id,source_ref?|reason?} · GET /（静态控制台页）。
+    多 quest 模式另提供 GET/POST /api/quests，其他 API 必须显式携 quest 身份。"""
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
             super().setup()
@@ -1100,9 +2227,7 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                        extra_headers={"WWW-Authenticate": "Bearer"})
             return False
 
-        def _read_json_object(self) -> Dict[str, Any]:
-            if self.headers.get_content_type().lower() != "application/json":
-                raise ValueError("Content-Type 必须为 application/json")
+        def _content_length(self, *, maximum: int) -> int:
             if self.headers.get_all("Transfer-Encoding"):
                 raise ValueError("不支持 Transfer-Encoding；须使用唯一 Content-Length")
             lengths = self.headers.get_all("Content-Length") or []
@@ -1113,8 +2238,14 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                 length = int(raw_length)
             except ValueError:
                 raise ValueError("Content-Length 非法") from None
-            if length < 0 or length > _MAX_HTTP_BODY_BYTES:
-                raise ValueError(f"请求体大小须在 0..{_MAX_HTTP_BODY_BYTES} 字节")
+            if length < 0 or length > maximum:
+                raise ValueError(f"请求体大小须在 0..{maximum} 字节")
+            return length
+
+        def _read_json_object(self, *, maximum: int = _MAX_HTTP_BODY_BYTES) -> Dict[str, Any]:
+            if self.headers.get_content_type().lower() != "application/json":
+                raise ValueError("Content-Type 必须为 application/json")
+            length = self._content_length(maximum=maximum)
             try:
                 raw = self.rfile.read(length)
             except OSError as error:
@@ -1126,6 +2257,42 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                 raise ValueError("请求体须为 JSON object")
             return body
 
+        def _read_upload_chunk(self) -> bytes:
+            if self.headers.get_content_type().lower() != "application/octet-stream":
+                raise ValueError("上传 chunk Content-Type 必须为 application/octet-stream")
+            length = self._content_length(maximum=_MAX_UPLOAD_CHUNK_BYTES)
+            if length <= 0:
+                raise ValueError("上传 chunk 不得为空")
+            self.connection.settimeout(_UPLOAD_SOCKET_TIMEOUT_S)
+            try:
+                raw = self.rfile.read(length)
+            except OSError as error:
+                raise ValueError("上传 chunk 读取失败或超时") from error
+            finally:
+                self.connection.settimeout(_HTTP_SOCKET_TIMEOUT_S)
+            if len(raw) != length:
+                raise ValueError(
+                    f"上传 chunk 提前结束（声明 {length} 字节，实际 {len(raw)} 字节）")
+            return raw
+
+        @staticmethod
+        def _one_query(params: Mapping[str, List[str]], name: str) -> str:
+            values = params.get(name) or []
+            if len(values) != 1 or not values[0]:
+                raise ValueError(f"须提供唯一 query 参数 {name}")
+            return values[0]
+
+        @classmethod
+        def _query_int(cls, params: Mapping[str, List[str]], name: str,
+                       *, positive: bool = False) -> int:
+            raw = cls._one_query(params, name)
+            if re.fullmatch(r"0|[1-9][0-9]*", raw) is None:
+                raise ValueError(f"query 参数 {name} 须为规范整数")
+            value = int(raw)
+            if positive and value <= 0:
+                raise ValueError(f"query 参数 {name} 须为正整数")
+            return value
+
         def _request_idempotency_key(self) -> str:
             values = self.headers.get_all("Idempotency-Key") or []
             if len(values) != 1:
@@ -1133,16 +2300,178 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
             _stored_idempotency_key(values[0])                 # canonical shape validation
             return values[0]
 
+        @staticmethod
+        def _is_multi_quest() -> bool:
+            return isinstance(data, QuestConsoleData)
+
+        def _get_data(self, query: str) -> ConsoleData:
+            if not self._is_multi_quest():
+                return data  # type: ignore[return-value]
+            values = parse_qs(query, keep_blank_values=True).get("quest") or []
+            if len(values) != 1 or not values[0]:
+                raise ValueError("multi-quest API 须提供唯一 ?quest=<quest_id>")
+            return data.quest_data(values[0])
+
+        def _post_data(self, body: Dict[str, Any]) -> ConsoleData:
+            if not self._is_multi_quest():
+                if "quest_id" in body:
+                    raise ValueError("单 quest 控制台不接受 quest_id")
+                return data  # type: ignore[return-value]
+            return data.quest_data(body.get("quest_id"))
+
         def do_GET(self):
             if not self._request_host_ok():
                 self._json(421, {"error": "Host 必须是 loopback 地址（防 DNS rebinding）"})
                 return
             u = urlparse(self.path)
+            if (isinstance(data, QuestConsoleData)
+                    and data.local_browser_bootstrap
+                    and u.path == "/" and not u.query
+                    and data.capability_token is not None):
+                # Product-mode convenience under the v1 single-user/local-host
+                # deployment assumption.  The bearer remains in a fragment: it
+                # is never sent back in the HTTP request, query, cookie or
+                # Referer, and the page immediately removes it from history.
+                location = "/?console-bootstrap=1#token=" + data.capability_token
+                self.send_response(303)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.end_headers()
+                return
             if not self._require_api_authorization(u.path):
+                return
+            if u.path == "/api/quests":
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用多 quest 模式"})
+                    return
+                try:
+                    params = parse_qs(u.query, keep_blank_values=True)
+                    if set(params) - {"view"}:
+                        raise ValueError("quest list query 含未知参数")
+                    views = params.get("view", [])
+                    if views not in ([], ["selector"]):
+                        raise ValueError("quest list view 仅允许 selector")
+                    self._json(200, {"quests": data.list_quests(
+                        selector_only=views == ["selector"])})
+                except ValueError as error:
+                    self._json(400, {"error": str(error)})
+                except QuestCorruptError:
+                    self._json(503, {"error": "quest registry 损坏或暂不可读"})
+                return
+            if u.path == "/api/setup":
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用 Web-first 多任务模式"})
+                    return
+                try:
+                    self._json(200, data.require_web_service().setup_public())
+                except (ValueError, WebQuestServiceError):
+                    self._json(503, {"error": "Web setup 配置损坏或暂不可读"})
+                return
+            if u.path == "/api/quest-publish-status":
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用 Web-first 多任务模式"})
+                    return
+                try:
+                    params = parse_qs(u.query, keep_blank_values=True)
+                    job_id = self._one_query(params, "job")
+                    self._json(200, {
+                        "job": data.require_web_service().publish_job_status(job_id)})
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                except WebQuestServiceError:
+                    self._json(503, {"error": "任务发布状态暂不可读"})
+                return
+            if u.path == "/api/quest-drafts":
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用 Web-first 多任务模式"})
+                    return
+                try:
+                    web = data.require_web_service()
+                    params = parse_qs(u.query, keep_blank_values=True)
+                    draft_values = params.get("draft_id") or []
+                    if draft_values:
+                        if len(draft_values) != 1 or not draft_values[0]:
+                            raise ValueError("须提供唯一 draft_id")
+                        result = web.drafts.get(draft_values[0])
+                        result["local_sources"] = web.local_sources.list(
+                            draft_values[0])
+                        self._json(200, {"draft": result})
+                    else:
+                        self._json(200, {"drafts": web.drafts.list()})
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                except (DraftCorruptError, WebQuestServiceError):
+                    self._json(503, {"error": "quest draft 损坏或暂不可读"})
+                return
+            if u.path == "/api/quest-runtime-profile":
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用 Web-first 多任务模式"})
+                    return
+                try:
+                    params = parse_qs(u.query, keep_blank_values=True)
+                    quest_values = params.get("quest_id") or []
+                    alias_values = params.get("quest") or []
+                    if quest_values and alias_values:
+                        raise ValueError("quest_id 与 quest query alias 只能提供一个")
+                    values = quest_values or alias_values
+                    if len(values) != 1 or not values[0]:
+                        raise ValueError("须提供唯一 query 参数 quest_id")
+                    self._json(200, {
+                        "runtime_profile": data.require_web_service().runtime_profile(
+                            values[0])})
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                except (QuestCorruptError, WebQuestServiceError):
+                    self._json(503, {"error": "quest runtime profile 暂不可读"})
+                return
+            if u.path == "/api/quest-runtime":
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用 Web owner"})
+                    return
+                try:
+                    params = parse_qs(u.query, keep_blank_values=True)
+                    quest_id = self._one_query(params, "quest")
+                    self._json(200, {"runtime": data.require_web_service().runtime(quest_id),
+                                     "setup": data.require_web_service().ready(quest_id)})
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                except (QuestCorruptError, WebQuestServiceError,
+                        QuestProcessManagerError):
+                    self._json(503, {"error": "quest runtime 状态暂不可读"})
+                return
+            if u.path == "/api/quest-runtime-log":
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用 Web owner"})
+                    return
+                try:
+                    params = parse_qs(u.query, keep_blank_values=True)
+                    quest_id = self._one_query(params, "quest")
+                    self._json(200, {
+                        "diagnostic": data.require_web_service().runtime_log(quest_id)})
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                except (QuestCorruptError, WebQuestServiceError,
+                        QuestProcessManagerError, OSError):
+                    self._json(503, {"error": "quest 运行诊断暂不可读"})
                 return
             if u.path == "/api/db":
                 try:
-                    self._json(200, data.db())
+                    selected = self._get_data(u.query)
+                    self._json(200, selected.db())
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                except QuestCorruptError:
+                    self._json(503, {"error": "quest registry 损坏或暂不可读"})
                 except SharedSQLiteReaderUnavailable:
                     self._json(503, {"error": "研究库暂不可在本节点读取，请稍后重试"})
                 except Exception:                     # 只读观测面：组装失败向客户端**泛化报**（不泄内部细节/路径，
@@ -1151,9 +2480,22 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                     self._json(500, {"error": "内部错误：/api/db 组装失败（详见服务端日志）"})
                 return
             if u.path == "/api/file":
-                from urllib.parse import parse_qs
-                rel = (parse_qs(u.query).get("p") or [""])[0]
-                content = data.read_file(rel)
+                params = parse_qs(u.query, keep_blank_values=True)
+                paths = params.get("p") or []
+                if len(paths) != 1:
+                    self._json(400, {"error": "须提供唯一文件参数 p"})
+                    return
+                try:
+                    selected = self._get_data(u.query)
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                    return
+                except QuestCorruptError:
+                    self._json(503, {"error": "quest registry 损坏或暂不可读"})
+                    return
+                rel = paths[0]
+                content = selected.read_file(rel)
                 if content is None:
                     self._json(404, {"error": f"文件不可读/不在白名单: {rel}"})
                     return
@@ -1183,11 +2525,312 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
             except ValueError as e:
                 self._json(400, {"error": str(e)})
                 return
+
+            chunk_routes = {
+                "/api/quest-drafts/file/chunk",
+                "/api/file-request-uploads/file/chunk",
+            }
+            if u.path in chunk_routes:
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用 Web-first 上传"})
+                    return
+                try:
+                    params = parse_qs(u.query, keep_blank_values=True)
+                    path = self._one_query(params, "path")
+                    offset = self._query_int(params, "offset")
+                    digest = self._one_query(params, "sha256")
+                    chunk = self._read_upload_chunk()
+                    web = data.require_web_service()
+                    if u.path == "/api/quest-drafts/file/chunk":
+                        draft_id = self._one_query(params, "draft_id")
+                        identity = {
+                            "draft_id": draft_id, "path": path,
+                            "offset": offset, "sha256": digest,
+                            "bytes": len(chunk),
+                        }
+                        web.bind_operation(client_key, u.path, identity)
+                        result = web.drafts.append_chunk(
+                            draft_id, path, offset, chunk, digest)
+                    else:
+                        quest_id = self._one_query(params, "quest_id")
+                        request_id = self._query_int(params, "request_id", positive=True)
+                        upload_id = self._one_query(params, "upload_id")
+                        identity = {
+                            "quest_id": quest_id, "request_id": request_id,
+                            "upload_id": upload_id, "path": path,
+                            "offset": offset, "sha256": digest,
+                            "bytes": len(chunk),
+                        }
+                        web.bind_operation(client_key, u.path, identity)
+                        result = web.request_append_chunk(
+                            quest_id, request_id, upload_id, path, offset,
+                            chunk, digest)
+                    self._json(200, {
+                        "ok": True, "file": result,
+                        "idempotency_key": _stored_idempotency_key(client_key),
+                    })
+                except (DraftConflictError, WebQuestConflictError) as error:
+                    self._json(409, {"error": str(error)})
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                except (DraftCorruptError, WebQuestServiceError, OSError):
+                    self._json(503, {"error": "受管上传暂不可写，请稍后用同一 chunk 重试"})
+                return
+
+            try:
+                maximum = (
+                    _MAX_DRAFT_HTTP_BODY_BYTES
+                    if u.path == "/api/quest-drafts" else _MAX_HTTP_BODY_BYTES)
+                body = self._read_json_object(maximum=maximum)
+            except (ValueError, json.JSONDecodeError) as error:
+                self._json(400, {"error": str(error)})
+                return
+
+            web_routes = {
+                "/api/quest-drafts",
+                "/api/quest-drafts/file/begin",
+                "/api/quest-drafts/file/finalize",
+                "/api/quest-drafts/local-sources",
+                "/api/quest-drafts/preflight",
+                "/api/quest-drafts/publish",
+                "/api/quest-runtime-profile",
+                "/api/quest-control",
+                "/api/file-request-uploads",
+                "/api/file-request-uploads/file/begin",
+                "/api/file-request-uploads/file/finalize",
+                "/api/file-request-uploads/publish",
+            }
+            if u.path in web_routes:
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用 Web-first 多任务模式"})
+                    return
+                try:
+                    web = data.require_web_service()
+                    stored_key = _stored_idempotency_key(client_key)
+                    if u.path == "/api/quest-drafts":
+                        if "runtime_profile" in body:
+                            web.validate_runtime_profile(body["runtime_profile"])
+                        web.bind_operation(client_key, u.path, body)
+                        result = web.drafts.create(body, client_key)
+                        self._json(201 if result.get("created") else 200, {
+                            "ok": True, "draft": result,
+                            "idempotency_key": stored_key,
+                        })
+                        return
+                    if u.path == "/api/quest-drafts/file/begin":
+                        expected = {"draft_id", "path", "size"}
+                        if set(body) != expected:
+                            raise ValueError("file begin 字段须恰为 draft_id/path/size")
+                        web.bind_operation(client_key, u.path, body)
+                        result = web.drafts.begin_file(
+                            body["draft_id"], body["path"], body["size"])
+                        self._json(200, {"ok": True, "file": result,
+                                         "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/quest-drafts/file/finalize":
+                        expected = {"draft_id", "path", "sha256"}
+                        if set(body) != expected:
+                            raise ValueError("file finalize 字段须恰为 draft_id/path/sha256")
+                        web.bind_operation(client_key, u.path, body)
+                        result = web.drafts.finalize_file(
+                            body["draft_id"], body["path"], body["sha256"])
+                        self._json(200, {"ok": True, "file": result,
+                                         "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/quest-drafts/local-sources":
+                        if set(body) != {"draft_id", "kind", "path"}:
+                            raise ValueError(
+                                "local source 字段须恰为 draft_id/kind/path")
+                        result = web.attach_local_source(
+                            body["draft_id"], body["kind"], body["path"],
+                            client_key)
+                        self._json(201, {"ok": True, "source": result,
+                                         "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/quest-drafts/preflight":
+                        if set(body) != {"draft_id"}:
+                            raise ValueError("preflight 字段须恰为 draft_id")
+                        web.bind_operation(client_key, u.path, body)
+                        result = web.preflight(body["draft_id"])
+                        self._json(200, {"ok": True, "preflight": result,
+                                         "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/quest-drafts/publish":
+                        if set(body) != {"draft_id", "start"}:
+                            raise ValueError("publish 字段须恰为 draft_id/start")
+                        if web.publish_needs_background(body["draft_id"]):
+                            job = web.submit_publish(
+                                body["draft_id"], start=body["start"],
+                                idempotency_key=client_key)
+                            self._json(202, {
+                                "ok": True, "job": job,
+                                "idempotency_key": stored_key})
+                        else:
+                            result = web.publish(
+                                body["draft_id"], start=body["start"],
+                                idempotency_key=client_key)
+                            self._json(201, {"ok": True, **result,
+                                             "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/quest-control":
+                        if set(body) != {"quest_id", "action"}:
+                            raise ValueError("quest control 字段须恰为 quest_id/action")
+                        action = body["action"]
+                        if action == "start":
+                            runtime = web.start(body["quest_id"], client_key)
+                        elif action == "terminate":
+                            runtime = web.terminate(body["quest_id"], client_key)
+                        else:
+                            raise ValueError("quest control action 须为 start 或 terminate")
+                        self._json(200, {"ok": True, "runtime": runtime,
+                                         "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/quest-runtime-profile":
+                        if set(body) != {"quest_id", "runtime_profile"}:
+                            raise ValueError(
+                                "runtime profile 字段须恰为 quest_id/runtime_profile")
+                        result = web.update_runtime_profile(
+                            body["quest_id"], body["runtime_profile"], client_key)
+                        self._json(200, {
+                            "ok": True, **result,
+                            "idempotency_key": stored_key,
+                        })
+                        return
+
+                    if u.path == "/api/file-request-uploads":
+                        if set(body) != {"quest_id", "request_id"}:
+                            raise ValueError("request upload 字段须恰为 quest_id/request_id")
+                        result = web.create_request_upload(
+                            body["quest_id"], body["request_id"], client_key)
+                        self._json(201, {"ok": True, **result,
+                                         "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/file-request-uploads/file/begin":
+                        expected = {"quest_id", "request_id", "upload_id", "path", "size"}
+                        if set(body) != expected:
+                            raise ValueError(
+                                "request file begin 字段须恰为 quest_id/request_id/upload_id/path/size")
+                        web.bind_operation(client_key, u.path, body)
+                        result = web.request_begin_file(
+                            body["quest_id"], body["request_id"], body["upload_id"],
+                            body["path"], body["size"])
+                        self._json(200, {"ok": True, "file": result,
+                                         "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/file-request-uploads/file/finalize":
+                        expected = {
+                            "quest_id", "request_id", "upload_id", "path", "sha256"}
+                        if set(body) != expected:
+                            raise ValueError(
+                                "request file finalize 字段须恰为 quest_id/request_id/upload_id/path/sha256")
+                        web.bind_operation(client_key, u.path, body)
+                        result = web.request_finalize_file(
+                            body["quest_id"], body["request_id"], body["upload_id"],
+                            body["path"], body["sha256"])
+                        self._json(200, {"ok": True, "file": result,
+                                         "idempotency_key": stored_key})
+                        return
+                    if u.path == "/api/file-request-uploads/publish":
+                        expected = {"quest_id", "request_id", "upload_id"}
+                        if set(body) != expected:
+                            raise ValueError(
+                                "request upload publish 字段须恰为 quest_id/request_id/upload_id")
+                        publication = web.publish_request_upload(
+                            body["quest_id"], body["request_id"], body["upload_id"],
+                            client_key)
+                        selected = data.quest_data(publication.quest_id)
+                        rec = selected.enqueue_file_request_action(
+                            action="resolve", request_id=publication.request_id,
+                            source_ref=publication.source_ref, reason="",
+                            client_idempotency_key=client_key)
+                        self._json(200, {"ok": True, "queued": rec,
+                                         "upload_id": publication.upload_id,
+                                         "idempotency_key": stored_key})
+                        return
+                except WebQuestRetryableError as error:
+                    # The mutation is already durable, but its cycle-boundary
+                    # restart side effect is not settled.  This is explicitly
+                    # non-definitive: echo the exact HTTP operation key so the
+                    # browser can prove which pending request must be retried.
+                    if (error.operation_state != "saved_pending_restart"
+                            or error.idempotency_key != client_key):
+                        self._json(503, {
+                            "error": "运行配置已保存但恢复凭据不一致；请保留原请求并重试",
+                        })
+                    else:
+                        self._json(503, {
+                            "error": str(error),
+                            "retryable": True,
+                            "operation_state": error.operation_state,
+                            "idempotency_key": stored_key,
+                        })
+                except (DraftConflictError, QuestConflictError,
+                        LocalSourceConflictError,
+                        WebQuestConflictError) as error:
+                    self._json(409, {"error": str(error)})
+                except (WebQuestNotReadyError,
+                        QuestProcessUnavailableError) as error:
+                    self._json(409, {"error": str(error)})
+                except LocalSourceChangedError as error:
+                    self._json(409, {"error": str(error)})
+                except LocalSourceCorruptError:
+                    self._json(503, {"error": "本机目录附件账本损坏或暂不可读"})
+                except (ValueError, DatasetPreflightError, LocalSourceError,
+                        json.JSONDecodeError) as error:
+                    self._json(400, {"error": str(error)})
+                except KeyError as error:
+                    self._json(404, {"error": str(error)})
+                except (DraftCorruptError, QuestCorruptError,
+                        WebQuestServiceError, QuestProcessManagerError,
+                        sqlite3.Error, SharedSQLiteReaderUnavailable, OSError):
+                    self._json(503, {"error": "Web setup/上传服务暂不可用，请稍后重试"})
+                return
+
+            if u.path == "/api/quests":
+                if not self._is_multi_quest():
+                    self._json(404, {"error": "当前服务未启用多 quest 模式"})
+                    return
+                try:
+                    quest = data.create_quest(body, idempotency_key=client_key)
+                    self._json(201 if quest.created else 200,
+                               {"ok": True, "quest": quest.public_dict(),
+                                "idempotency_key": _stored_idempotency_key(client_key)})
+                except QuestConflictError as error:
+                    self._json(409, {"error": str(error)})
+                except (ValueError, json.JSONDecodeError) as error:
+                    self._json(400, {"error": str(error)})
+                except OSError:
+                    self._json(503, {"error": "quest registry 暂不可写，请稍后重试"})
+                return
+            if u.path in ("/api/message", "/api/query", "/api/directive", "/api/file-request"):
+                try:
+                    selected = self._post_data(body)
+                except (ValueError, KeyError) as error:
+                    self._json(404 if isinstance(error, KeyError) else 400,
+                               {"error": str(error)})
+                    return
+                except QuestCorruptError:
+                    self._json(503, {"error": "quest registry 损坏或暂不可读"})
+                    return
+            else:
+                self._json(404, {"error": "未知路由"})
+                return
             if u.path == "/api/message":
                 try:
-                    body = self._read_json_object()
                     # connector 固定 "console"（codex NIT：不许客户端伪造成其他来源；控制台入口即 console）
-                    rec = data.enqueue_message(
+                    rec = selected.enqueue_message(
+                        body.get("text", ""), conversation_id=body.get("conversation_id"),
+                        client_idempotency_key=client_key)
+                    self._json(200, {"ok": True, "queued": rec})
+                except (ValueError, json.JSONDecodeError) as e:
+                    self._json(400, {"error": str(e)})
+                except OSError:
+                    self._json(503, {"error": "console spool 暂不可写，请稍后重试"})
+                return
+            if u.path == "/api/query":
+                try:
+                    rec = selected.enqueue_query(
                         body.get("text", ""), conversation_id=body.get("conversation_id"),
                         client_idempotency_key=client_key)
                     self._json(200, {"ok": True, "queued": rec})
@@ -1198,13 +2841,12 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                 return
             if u.path == "/api/directive":
                 try:
-                    body = self._read_json_object()
                     # connector 同样固定为 console；server 只追加 spool，不查 directive 表。
-                    rec = data.enqueue_directive_action(action=body.get("action"),
-                                                        directive_id=body.get("directive_id"),
-                                                        reason=body.get("reason", ""),
-                                                        conversation_id=body.get("conversation_id"),
-                                                        client_idempotency_key=client_key)
+                    rec = selected.enqueue_directive_action(
+                        action=body.get("action"), directive_id=body.get("directive_id"),
+                        reason=body.get("reason", ""),
+                        conversation_id=body.get("conversation_id"),
+                        client_idempotency_key=client_key)
                     self._json(200, {"ok": True, "queued": rec})
                 except (ValueError, json.JSONDecodeError) as e:
                     self._json(400, {"error": str(e)})
@@ -1213,10 +2855,19 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                 return
             if u.path == "/api/file-request":
                 try:
-                    body = self._read_json_object()
-                    rec = data.enqueue_file_request_action(
+                    # File resolution is created internally by the managed-upload
+                    # publication route.  This route only accepts binary permission
+                    # approval or rejection/cancellation; it never accepts a path.
+                    allowed = {"action", "request_id", "reason"}
+                    if self._is_multi_quest():
+                        allowed.add("quest_id")
+                    if body.get("action") not in ("approve", "cancel") or set(body) != allowed:
+                        raise ValueError(
+                            "文件请求解决须使用 Web 的‘选择并上传’流程；"
+                            "该接口只接受权限 approve 或请求 cancel")
+                    rec = selected.enqueue_file_request_action(
                         action=body.get("action"), request_id=body.get("request_id"),
-                        source_ref=body.get("source_ref"), reason=body.get("reason", ""),
+                        reason=body.get("reason", ""),
                         client_idempotency_key=client_key)
                     self._json(200, {"ok": True, "queued": rec})
                 except (ValueError, json.JSONDecodeError) as e:
@@ -1226,7 +2877,7 @@ def make_handler(data: ConsoleData, static_dir: Optional[Path]):
                 except OSError:
                     self._json(503, {"error": "console spool/上传目录暂不可用，请稍后重试"})
                 return
-            self._json(404, {"error": "未知路由"})
+            self._json(500, {"error": "内部路由未收敛"})
 
         def _unsupported_method(self):
             if not self._request_host_ok():
@@ -1290,29 +2941,300 @@ def serve(db_path: str, work_root: str, system_root: str, *, host: str = "127.0.
     data = ConsoleData(db_path=db_path, work_root=work_root, system_root=system_root,
                        spool=spool, capability_token=bearer)
     httpd = BoundedThreadingHTTPServer((host, port), make_handler(data, sd if sd.exists() else None))
-    # Read-only test/embedding introspection; production clients load the 0600
-    # capability file rather than scraping stdout or server internals.
+    # Read-only test/embedding introspection and the local browser bootstrap.
+    # The server-owned 0600 backing file is never part of the user workflow.
     httpd.console_capability_token = bearer
     return httpd
+
+
+def serve_quests(quests_root: Union[str, Path], system_root: Union[str, Path], *,
+                 host: str = "127.0.0.1", port: int = 8765,
+                 static_dir: Optional[str] = None,
+                 capability_token: Optional[str] = None,
+                 qualification_profiles_root: Optional[Union[str, Path]] = None,
+                 connector_profile: Optional[Union[str, Path]] = None,
+                 no_outbound: bool = True,
+                 max_cycles: int = 100,
+                 poll_interval_s: float = 1.0,
+                 local_import_roots: Optional[List[Union[str, Path]]] = None,
+                 ) -> ThreadingHTTPServer:
+    """Serve the local Web product over physically isolated quests.
+
+    This constructor owns the complete post-deployment path: draft uploads,
+    dataset preflight, immutable quest publication and the local research
+    process capability.  Qualification profiles remain deployment-owned
+    inputs and are projected to the browser only through redacted metadata.
+    """
+    if not _is_loopback_host(host):
+        raise ValueError("console_server 只允许 loopback host；远程访问请使用 SSH tunnel")
+    registry = QuestRegistry(Path(quests_root), Path(system_root))
+    sd = Path(static_dir) if static_dir else (Path(system_root) / "views" / "console")
+    spool = ConsoleSpool(registry.root)
+    bearer = spool.load_or_create_capability(capability_token)
+    drafts = QuestDraftRegistry(registry.state_dir / "quest-drafts")
+    profile_root = (
+        Path(qualification_profiles_root)
+        if qualification_profiles_root is not None
+        else registry.root / "qualification-profiles")
+    profiles = QualificationProfileRegistry(profile_root)
+    local_sources = LocalSourceRegistry(
+        registry.state_dir / "local-sources",
+        allowed_roots=(
+            [Path("/")] if local_import_roots is None else local_import_roots))
+    processes = QuestProcessManager(
+        registry, system_root,
+        connector_profile=connector_profile,
+        no_outbound=no_outbound,
+        max_cycles=max_cycles,
+        poll_interval_s=poll_interval_s,
+    )
+    web = WebQuestService(
+        registry=registry, drafts=drafts, profiles=profiles,
+        processes=processes, local_sources=local_sources)
+    data = QuestConsoleData(
+        registry=registry, system_root=str(system_root), capability_token=bearer,
+        web_service=web)
+    httpd = BoundedThreadingHTTPServer(
+        (host, port), make_handler(data, sd if sd.exists() else None))
+    httpd.add_close_callback(web.close)
+    httpd.console_capability_token = bearer
+    return httpd
+
+
+def _configure_process_storage(root: Union[str, Path]) -> Dict[str, str]:
+    """Keep every mutable host/Codex runtime path beneath the data root."""
+    # The console is also responsible for creating a new data root.  Resolve
+    # the prospective path first, then create and re-resolve it before placing
+    # any process scratch beneath it.
+    base = Path(root).expanduser().resolve(strict=False)
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    base = base.resolve(strict=True)
+    if stat.S_ISLNK(base.lstat().st_mode):
+        raise ValueError("运行时数据根不得是 symlink")
+
+    service_uid, service_gid = os.geteuid(), os.getegid()
+    requested_query_user = os.environ.get("METARESEARCH_QUERY_RUN_AS_USER")
+    if requested_query_user is None:
+        requested_query_user = (
+            "codexro" if service_uid == 0 else pwd.getpwuid(service_uid).pw_name
+        )
+    query_account = pwd.getpwnam(requested_query_user)
+    if service_uid != 0 and query_account.pw_uid != service_uid:
+        raise ValueError("non-root 服务不得把 Codex 运行目录交给其他 UID")
+
+    def ensure_directory(path: Path, *, uid: int, gid: int, mode: int) -> Path:
+        if path.exists() and path.is_symlink():
+            raise ValueError("运行时目录不得是 symlink")
+        path.mkdir(parents=True, exist_ok=True, mode=mode)
+        info = os.lstat(path)
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or os.path.realpath(path) != str(path)):
+            raise ValueError("运行时目录身份非法")
+        if service_uid == 0:
+            os.chown(path, uid, gid)
+        elif (info.st_uid, info.st_gid) != (uid, gid):
+            raise ValueError("运行时目录 owner 非当前服务 UID")
+        os.chmod(path, mode)
+        return path
+
+    # Execute-only shared parents let the dedicated codexro UID reach only its
+    # private children; quests/ and state/ retain their existing 0700 boundary.
+    os.chmod(base, 0o711)
+    process_tmp = ensure_directory(
+        base / ".process-tmp", uid=service_uid, gid=service_gid, mode=0o711)
+    cache_root = ensure_directory(
+        base / ".process-cache", uid=service_uid, gid=service_gid, mode=0o711)
+    home_root = ensure_directory(
+        base / ".process-home", uid=service_uid, gid=service_gid, mode=0o711)
+    codex_root = ensure_directory(
+        base / ".codex-runtime", uid=service_uid, gid=service_gid, mode=0o711)
+
+    service_cache = ensure_directory(
+        cache_root / "service", uid=service_uid, gid=service_gid, mode=0o700)
+    query_cache = ensure_directory(
+        cache_root / "query", uid=query_account.pw_uid,
+        gid=query_account.pw_gid, mode=0o700)
+    service_home = ensure_directory(
+        home_root / "service", uid=service_uid, gid=service_gid, mode=0o700)
+    query_home = ensure_directory(
+        home_root / "query", uid=query_account.pw_uid,
+        gid=query_account.pw_gid, mode=0o700)
+
+    prior_service_codex_home = os.environ.get("CODEX_HOME")
+    prior_query_codex_home = os.environ.get("METARESEARCH_QUERY_CODEX_HOME")
+    if prior_query_codex_home is None:
+        prior_query_codex_home = str(Path(query_account.pw_dir) / ".codex")
+    service_codex_home = ensure_directory(
+        codex_root / "service", uid=service_uid, gid=service_gid, mode=0o700)
+    query_codex_home = ensure_directory(
+        codex_root / "query", uid=query_account.pw_uid,
+        gid=query_account.pw_gid, mode=0o700)
+
+    def seed_codex_identity(destination: Path, source: Optional[str], *,
+                            uid: int, gid: int) -> None:
+        source_root = Path(source).expanduser() if source else None
+        for name in ("auth.json", "config.toml"):
+            target = destination / name
+            if target.exists() or target.is_symlink():
+                info = os.lstat(target)
+                if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                        or info.st_uid != uid or info.st_gid != gid
+                        or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise ValueError(f"项目 Codex {name} 身份/权限非法")
+                continue
+            if source_root is None:
+                continue
+            source_path = source_root / name
+            try:
+                source_info = os.lstat(source_path)
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISREG(source_info.st_mode)
+                    or stat.S_ISLNK(source_info.st_mode)
+                    or source_info.st_size > 1024 * 1024):
+                raise ValueError(f"Codex bootstrap {name} 非有界普通文件")
+            payload = source_path.read_bytes()
+            if len(payload) != source_info.st_size:
+                raise ValueError(f"Codex bootstrap {name} 读取漂移")
+            flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(target, flags, 0o600)
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+                os.fchmod(fd, 0o600)
+                if service_uid == 0:
+                    os.fchown(fd, uid, gid)
+                os.fsync(fd)
+            except BaseException:
+                os.close(fd)
+                target.unlink(missing_ok=True)
+                raise
+            else:
+                os.close(fd)
+
+    seed_codex_identity(
+        service_codex_home, prior_service_codex_home,
+        uid=service_uid, gid=service_gid)
+    seed_codex_identity(
+        query_codex_home, prior_query_codex_home,
+        uid=query_account.pw_uid, gid=query_account.pw_gid)
+
+    paths = {
+        "TMPDIR": process_tmp,
+        "XDG_CACHE_HOME": service_cache,
+        "PIP_CACHE_DIR": service_cache / "pip",
+    }
+    ensure_directory(
+        paths["PIP_CACHE_DIR"], uid=service_uid, gid=service_gid, mode=0o700)
+    for key, path in paths.items():
+        os.environ[key] = str(path)
+    os.environ["TMP"] = str(paths["TMPDIR"])
+    os.environ["TEMP"] = str(paths["TMPDIR"])
+    os.environ["HOME"] = str(service_home)
+    os.environ["CODEX_HOME"] = str(service_codex_home)
+    os.environ["HF_HOME"] = str(service_cache / "huggingface")
+    os.environ["TORCH_HOME"] = str(service_cache / "torch")
+    # Package managers and compute libraries otherwise fall back to the
+    # service account's installation prefix (often /root on a small cloud
+    # root disk).  Bind their mutable state to the same VEPFS data tree.  HOME
+    # already catches most tools; these explicit variables cover tools whose
+    # cache location ignores HOME or follows the executable's base prefix.
+    extra_service_storage = {
+        "XDG_CONFIG_HOME": service_home / ".config",
+        "XDG_DATA_HOME": service_home / ".local" / "share",
+        "XDG_STATE_HOME": service_home / ".local" / "state",
+        "CONDA_PKGS_DIRS": service_cache / "conda-pkgs",
+        "CONDA_ENVS_PATH": base / "environments",
+        "UV_CACHE_DIR": service_cache / "uv",
+        "CUDA_CACHE_PATH": service_cache / "cuda",
+        "MPLCONFIGDIR": service_cache / "matplotlib",
+        "NUMBA_CACHE_DIR": service_cache / "numba",
+    }
+    for key, path in extra_service_storage.items():
+        ensure_directory(path, uid=service_uid, gid=service_gid, mode=0o700)
+        os.environ[key] = str(path)
+    os.environ["METARESEARCH_QUERY_HOME"] = str(query_home)
+    os.environ["METARESEARCH_QUERY_CODEX_HOME"] = str(query_codex_home)
+    os.environ["METARESEARCH_QUERY_CACHE_HOME"] = str(query_cache)
+    if "SSL_CERT_FILE" not in os.environ:
+        prefix = Path(sys.prefix).resolve(strict=True)
+        certificate = prefix / "ssl" / "cert.pem"
+        if (certificate.is_file()
+                and os.path.commonpath(
+                    (str(prefix), str(certificate.resolve(strict=True)))) == str(prefix)):
+            os.environ["SSL_CERT_FILE"] = str(certificate)
+    tempfile.tempdir = str(paths["TMPDIR"])
+    return {key: str(path) for key, path in paths.items()}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="meta-research 人类控制台数据面服务（只读 + spool 入站；步⑨）")
     ap.add_argument("--system-root", required=True, help="仓库根（含 policies/schemas/prompts/views）")
-    ap.add_argument("--work-root", required=True, help="运行产物根（research.sqlite / state 落此，同 run.py）")
+    roots = ap.add_mutually_exclusive_group(required=True)
+    roots.add_argument("--work-root", help="单 quest 运行产物根（research.sqlite / state 落此，同 run.py）")
+    roots.add_argument("--quests-root", help="多 quest registry 根；每个 quest 拥有独立 work-root/SQLite")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument(
+        "--no-open-browser", action="store_true",
+        help="不自动打开浏览器；在本机启动终端显示可复制的授权链接")
+    ap.add_argument(
+        "--qualification-profiles-root",
+        help="部署方生成的 qualification profile 目录；内容不会暴露给 Web")
+    ap.add_argument(
+        "--local-import-root", action="append", default=None,
+        help="Web 可附加的本机目录根（可重复；单机默认使用当前 UID 可读范围）")
+    ap.add_argument("--max-cycles", type=int, default=100)
+    ap.add_argument("--poll-interval-s", type=float, default=1.0)
+    outbound = ap.add_mutually_exclusive_group()
+    outbound.add_argument("--connector-profile")
+    outbound.add_argument(
+        "--no-outbound", action="store_true",
+        help="本机运行不对外投递通知（多 quest Web owner 的默认值）")
     args = ap.parse_args(argv)
-    db_path = str(Path(args.work_root) / "research.sqlite")
-    httpd = serve(db_path, args.work_root, args.system_root, host=args.host, port=args.port)
-    capability_path = Path(args.work_root) / "state" / CAPABILITY_NAME
-    print(f"[console] 数据面 http://{args.host}:{args.port}  （只读库 {db_path}；Ctrl-C 停）\n"
-          f"[console] Bearer capability: {capability_path}（0600；勿复制到日志/网页）")
+    _configure_process_storage(args.quests_root or args.work_root)
+    if args.quests_root:
+        httpd = serve_quests(
+            args.quests_root, args.system_root, host=args.host, port=args.port,
+            qualification_profiles_root=args.qualification_profiles_root,
+            connector_profile=args.connector_profile,
+            no_outbound=(args.no_outbound or args.connector_profile is None),
+            max_cycles=args.max_cycles,
+            poll_interval_s=args.poll_interval_s,
+            local_import_roots=args.local_import_root)
+        scope = f"多 quest registry {Path(args.quests_root).resolve()}"
+    else:
+        db_path = str(Path(args.work_root) / "research.sqlite")
+        httpd = serve(
+            db_path, args.work_root, args.system_root, host=args.host, port=args.port)
+        scope = f"只读库 {db_path}"
+    bound_port = int(httpd.server_address[1])
+    browser_url = _authenticated_console_url(
+        args.host, bound_port, httpd.console_capability_token)
+    opened = False
+    if not args.no_open_browser:
+        try:
+            import webbrowser
+            opened = bool(webbrowser.open_new_tab(browser_url))
+        except (OSError, RuntimeError, webbrowser.Error):
+            opened = False
+    print(f"[console] Web 产品已监听 http://{args.host}:{bound_port}  （{scope}；Ctrl-C 停）")
+    if opened:
+        print("[console] 已在默认浏览器打开；部署后的任务与文件操作均在 Web 内完成。")
+    else:
+        print("[console] 浏览器未自动打开；请在这台机器的浏览器中打开下面的授权链接：")
+        print(browser_url)
+        print("[console] 此链接等同本机会话凭证，请勿转发、公开或粘贴到工单/聊天记录。")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         httpd.shutdown()
+    finally:
+        httpd.server_close()
     return 0
 
 

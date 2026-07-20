@@ -119,7 +119,8 @@ def test_handle_query_grounded_and_fallback(env):
     m1 = ing.inbound(connector="qq", raw_text="现在进展如何？", idempotency_key="q-1", goal_id=1, goal_ver=1)
     r = med.handle_query(message_id=m1)          # 查询文本按 message_id 从持久层取（审计链）
     assert r["grounded"] is True and r["snapshot_cycle"] == "c1"
-    assert "c1" in r["reply_text"]                                              # 模板应答含卡内快照
+    assert "正在整理结果并决定下一步" in r["reply_text"]
+    assert "c1" not in r["reply_text"]                                           # 快照身份单独入库，不污染正文
     # 幻觉应答器 → grounding 拒 → 模板回退
     class Hallucinator:
         kind = "template"
@@ -129,7 +130,8 @@ def test_handle_query_grounded_and_fallback(env):
     m2 = ing.inbound(connector="qq", raw_text="状态？", idempotency_key="q-2", goal_id=1, goal_ver=1)
     r2 = med2.handle_query(message_id=m2)
     assert r2["grounded"] is False and r2["fallback_reason"]
-    assert r2["reply_text"] == render_fallback(json.loads(env["card_path"].read_text(encoding="utf-8")))
+    assert "正在整理结果并决定下一步" in r2["reply_text"]
+    assert "没能可靠地核对" in r2["reply_text"]
     # 回复全部 append-only 入库、不写 decision（P1）
     d = env["daemon"]
     assert d.query_one("SELECT count(*) FROM interaction_reply")[0] == 2
@@ -149,19 +151,19 @@ def test_handle_query_requires_declared_kind_and_known_message(env):
         env["med"].handle_query(message_id=99999)
 
 
-def test_query_reads_published_snapshot_not_live_db(env):
-    """应答器读**发布快照**：DB 已变、未再发布 → 回答仍基于旧卡（非半完成态）。"""
+def test_query_uses_fresh_committed_db_context(env):
+    """讲解员使用 query 开始时的已提交 DB 投影，不把旧发布卡冒充当前进度。"""
     med, d = env["med"], env["daemon"]
     d.conn.execute("UPDATE cycle SET status='bundle' WHERE id=1")
     d.conn.commit()                                # DB 变了，但没到阶段边界（未 publish）
     ing = InteractionIngest(d)
     mid = ing.inbound(connector="qq", raw_text="轮状态？", idempotency_key="q-s", goal_id=1, goal_ver=1)
     r = med.handle_query(message_id=mid)
-    assert "reasoning" in r["reply_text"] and "bundle" not in r["reply_text"]   # 旧快照
+    assert "准备实验代码和运行配置" in r["reply_text"]
     env["pub"].publish("c1")                       # 阶段边界发布后新快照可见
     mid2 = ing.inbound(connector="qq", raw_text="轮状态？？", idempotency_key="q-s2", goal_id=1, goal_ver=1)
     r2 = med.handle_query(message_id=mid2)
-    assert "bundle" in r2["reply_text"]
+    assert "准备实验代码和运行配置" in r2["reply_text"]
 
 
 # ============ 发布原子性 ============

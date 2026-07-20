@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
+from .durable_stop import active_global_stop, has_active_global_stop
 from .runtime_control import effective_budget_config
 from .writedaemon import WriteDaemon
 
@@ -50,17 +51,14 @@ class StopController:
 
     # ---------------------------------------------------------------- durable --
     def already_stopped(self) -> Optional[str]:
-        """已落 global_stop 决策 → 返回原因（run_cycles 启动即拒推进）；否则 None。"""
-        r = self.daemon.query_one(
-            "SELECT payload_json FROM decision WHERE actor='orchestrator' AND type='global_stop' "
-            "ORDER BY id DESC LIMIT 1")
-        return json.loads(r[0]).get("reason") if r else None
+        """存在尚未被 exact release 匹配的 global_stop 时返回原因。"""
+        row = active_global_stop(self.daemon.conn)
+        return row[1]["reason"] if row is not None else None
 
     def record_stop(self, reason: str, detail: Optional[Dict[str, Any]] = None) -> None:
         """落 durable 停机决策（原子幂等：存在检查与插入同事务，单活 orchestrator 下不重复写）。"""
         with self.daemon.transaction() as conn:
-            if conn.execute("SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' "
-                            "LIMIT 1").fetchone() is not None:
+            if has_active_global_stop(conn):
                 return
             # {**detail, reason} 序：入参 reason 权威，不被 detail 里同名键覆盖（防未来调用点传 detail.reason）
             conn.execute("INSERT INTO decision(actor,type,payload_json) VALUES ('orchestrator','global_stop',?)",

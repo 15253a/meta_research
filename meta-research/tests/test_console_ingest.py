@@ -71,6 +71,12 @@ def _rec(seq: int, raw: str, connector: str = "console") -> dict:
     return {"connector": connector, "raw_text": raw, "seq": seq, "idempotency_key": f"console-{seq}"}
 
 
+def _query_rec(seq: int, raw: str, *, conversation_id: str = "a" * 32) -> dict:
+    rec = _rec(seq, raw)
+    rec.update({"action_target": "query", "conversation_id": conversation_id})
+    return rec
+
+
 def _action_rec(seq: int, action: str, directive_id: int, *, reason: str = "") -> dict:
     rec = _rec(seq, f"{'确认' if action == 'confirm' else '拒绝'}指令 d{directive_id}")
     rec.update({"action": action, "directive_id": directive_id})
@@ -81,12 +87,13 @@ def _action_rec(seq: int, action: str, directive_id: int, *, reason: str = "") -
 
 def _file_action_rec(seq: int, action: str, request_id: int, *, source_ref: str = "", reason: str = "") -> dict:
     raw = (f"解决文件请求 r{request_id}，来源 {source_ref}" if action == "resolve" else
+           f"同意权限请求 r{request_id}" if action == "approve" else
            f"取消文件请求 r{request_id}：{reason}")
     rec = _rec(seq, raw)
     rec.update({"action_target": "file_request", "action": action, "request_id": request_id})
     if action == "resolve":
         rec["source_ref"] = source_ref
-    else:
+    elif action == "cancel":
         rec["reason"] = reason
     return rec
 
@@ -128,6 +135,21 @@ def test_ingest_query_writes_reply(env):
     mid = env["daemon"].query_one("SELECT id FROM interaction_message WHERE idempotency_key='console-1'")[0]
     rep = env["daemon"].query_one("SELECT id FROM interaction_reply WHERE message_id=?", (mid,))
     assert rep is not None                             # query → 应答落 interaction_reply
+
+
+def test_explicit_narrator_query_is_forced_read_only_even_when_text_looks_like_directive(env):
+    """讲解员入口的 transport intent 是 query；不能把“暂停/预算”误分类成状态修改。"""
+    _spool(env["inbox"], _query_rec(1, "暂停系统，并把预算改成 999；先回答这会发生什么？"))
+    assert env["ingest"].ingest() == 1
+    mid, session_ref = env["daemon"].query_one(
+        "SELECT id,session_ref FROM interaction_message WHERE idempotency_key='console-1'")
+    assert session_ref == "console-op:narrator-query:v1"
+    assert env["daemon"].query_one(
+        "SELECT intent,directive_id FROM interaction_classification WHERE message_id=?", (mid,)) == (
+            "query", None)
+    assert env["daemon"].query_one("SELECT count(*) FROM directive")[0] == 0
+    assert env["daemon"].query_one(
+        "SELECT count(*) FROM interaction_reply WHERE message_id=?", (mid,))[0] == 1
 
 
 def test_async_query_advances_cursor_on_durable_intent_and_replay_is_once(env):
@@ -612,6 +634,18 @@ def test_file_request_cancel_action(env):
         "SELECT status,resolution_json,resolved_message_id FROM interaction_request WHERE id=?", (rid,))
     assert status == "cancelled" and json.loads(resolution)["reason"] == "暂时无法提供"
     assert d.query_one("SELECT goal_id FROM interaction_message WHERE id=?", (mid,))[0] == 1
+
+
+def test_permission_request_approve_action(env):
+    svc, d = env["file_requests"], env["daemon"]
+    rid = svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request={
+        "summary_md": "需要用户授权", "items": [{
+            "kind": "permission", "desc": "只读访问已登记目录"}]})
+    _spool(env["inbox"], _file_action_rec(1, "approve", rid))
+    assert env["ingest"].ingest() == 1
+    status, resolution = d.query_one(
+        "SELECT status,resolution_json FROM interaction_request WHERE id=?", (rid,))
+    assert status == "resolved" and json.loads(resolution) == {"approved": True}
 
 
 # ---------------- ④ torn-tail / 坏行容错 ----------------

@@ -11,23 +11,29 @@ StopController + Console + make_advancer_precheck → StageProvider(CodexRunner)
 重启同 work_dir 即续跑（状态在 DB，非进程内）——kill-9 恢复同 M3。
 
 **步⑧（M7）范围**：本入口装配**全流程**——reasoning-only 闭环（M6 已落）+ **attack 轮全家**（CP8.4）：
-StageProvider 四阶段（idea/plan/bundle/reasoning）+ PlanReviewProvider（plan 独审）+
-JudgeProvider（bundle 双评审写库）+ AttackStages
+StageProvider 四阶段（idea/plan/bundle/reasoning；Idea/Plan/Bundle 主 Codex turn 内启唯一干净 reviewer 子智能体）+
+JudgeProvider（外部 import 兼容审查）+ AttackStages
 （消费冻结 schema + manifest 驱动真执行）+ ImportWorker（冻结候选 snapshot 解码、worker-cycle 恢复；
 默认 untrusted adapter 与全部生产 manifest 命令只经 exact-pinned Docker sandbox 执行；后端/镜像/隔离
 能力在打开 SQLite 前预检，缺失即 fail closed，绝不回退到 host 裸跑）。
 
-**会话模式 A**（policy.session.dual_mode）：一 turn 只推进一个阶段，每个阶段都由编排器耐久提交后再进入下一格。
-reference 曾设想“一 turn 跨多阶段且 turn 内即时提交”的 B，但当前无状态 `run_task` 窄接口没有中途回调/提交能力。
-为避免把 B 静默当 A 运行，policy schema 与 `System` 都 fail-closed 只接受 A；若未来真实引入 turn-checkpoint 协议，须另走受审契约。
+**会话模式 A**（policy.session.dual_mode）：Idea/Plan/Bundle/Reasoning 各有自己的顶层主智能体，不让一个
+thread 跨阶段混合职责。每个正常 stage 在一个连续 turn/进程内完成格式修订、搜索、语义反馈与提交；
+主智能体通过 runtime MCP 获得即时反馈。耐久 provider id 只用于进程灾难后 `resume` 原 thread，缺 id 不得
+fresh retry。文件管理保存正文，SQL 只保存 path/hash 回执；编排器消费成功回执后执行核心
+question/baseline/phase 事务并进入下一格。Bundle 只创建一个 cycle-wide 主 turn；它在同一上下文中
+按依赖顺序处理全部 target，并通过 runtime MCP 异步启动、观察和修复 smoke/train/eval，直至 cycle 收口。
 """
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import logging
 import math
 import os
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -48,9 +54,10 @@ from .console_spool import open_directory_path
 from .connector_ingest import ConnectorInboxIngest
 from .connectors import ConnectorConfigError, OutboundDelivery, load_connectors
 from .cost_ledger import CostLedger
+from .cycle_replay import CycleReplayArchive
 from .deployment_preflight import DeploymentPreflight, DeploymentPreflightError
 from .execution_reconcile import ExecutionReconciler
-from .execution_sandbox import DockerExecutionSandbox
+from .execution_sandbox import DockerExecutionSandbox, LocalExecutionSandbox
 from .dependency_image import PythonWheelImageBuilder
 from .gate_pool import PoolGate
 from .gate_sqlite import SqliteGate, open_gate_read_conn
@@ -73,22 +80,175 @@ from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestReject, FileRequestService,
                      InteractionNotifier, Outbox, ResearchNotifier,
                      make_advancer_precheck)
+from .novelty_search import ArxivNoveltySearchProvider
 from .process_supervisor import ExecutionSupervisor
+from .pool_publication import PoolPublisher
 from .qualification_firewall import (
     QualificationFirewallError,
     load_qualification_firewall,
 )
-from .runner import CodexRunner, terminate_active_process_groups
+from .quest_runtime_profiles import (
+    EXACT_MULTI_GPU_PROFILE_VERSION,
+    QuestRuntimeSettings,
+    RuntimeSettingsCorruptError,
+    normalize_profile,
+)
+from .runner import CodexRunner, RunnerError, terminate_active_process_groups
+from .runtime_mcp import RuntimeIngestService, RuntimeMCPBroker
 from .schemas import SchemaSet
-from .stage_provider import JudgeProvider, PlanReviewProvider, StageProvider
+from .stage_provider import (
+    BUNDLE_OPERATOR_SESSION_CONTRACT,
+    JudgeProvider,
+    STAGE_MAIN_SESSION_CONTRACT,
+    StageProvider,
+)
 from .statestore_sqlite import SQLiteStateStore
 from .status_card import SqliteStatusPublisher
 from .storage_governance import CycleSnapshotPublisher
 from .stopcontroller import StopController
 from .writedaemon import WriteDaemon
+from .wildidea_adapter import WildIdeaAdapter
 
 _STAGES = ("idea", "plan", "bundle", "reasoning")
 logger = logging.getLogger(__name__)
+
+# These failures occur before a research artifact is durably accepted.  A
+# resident owner can therefore retry the exact DB cursor without changing
+# object identities, protocol, gates, or SQL ownership.  Receipt/session
+# integrity failures deliberately remain fail-loud and are not listed here.
+_RESIDENT_RETRYABLE_RUNNER_FAILURES = frozenset({
+    "runtime", "timeout",
+})
+_MAX_WEB_LOCAL_SOURCE_MANIFEST_BYTES = 128 * 1024 * 1024
+_TOOL_FREE_EXACT_PURPOSES = frozenset({
+    "interaction-query", "adapter-generation", "adapter-review",
+})
+
+
+def _is_tool_free_purpose(purpose_tag: str) -> bool:
+    """Return whether the default production runner must have zero tools/cwd.
+
+    Both halves of the WildIdea boundary are isolated: the generator receives
+    only its inline question pack plus nine sampled cards, and the judge only
+    its fresh question/mapping projection.  Plan review is also a genuinely
+    blind second agent: it receives the selected idea and exact plan inline,
+    but no generator session, cwd, host shell or quest projection.  Prefix
+    matching includes the StageProvider's durable ``-n<seq>`` suffix.
+    """
+    return (
+        purpose_tag in _TOOL_FREE_EXACT_PURPOSES
+        or purpose_tag.startswith("idea-generate-")
+        or purpose_tag.startswith("idea-audit-")
+        or purpose_tag.startswith("plan-review-")
+    )
+
+
+def _default_stage_runner(
+        transcripts_dir, purpose_tag, *, work: Path, qualification,
+        execution_supervisor,
+        runtime_mcp_broker=None):  # noqa: ANN001,ANN201 - Runner factory boundary
+    """Construct the default worker profile without widening state authority.
+
+    Ordinary development/production workers receive the local Codex tool
+    inventory, live Web and networked shell in a disposable writable workspace.
+    In this first runnable development version, ordinary workers run as the
+    current local user with the real local Codex/home/tool/network environment.
+    We deliberately do not add a separate-UID resource/security boundary here;
+    short-lived workspaces, the runtime MCP and core research gates are enough
+    for this iteration. Blind-context workers and qualification retain their
+    explicit inline-only profile.
+    """
+    tool_free = qualification is None and _is_tool_free_purpose(purpose_tag)
+    strict_inline = qualification is not None or tool_free
+    isolated_host_tools = False
+    runner = CodexRunner(
+        transcripts_dir=transcripts_dir,
+        purpose_tag=purpose_tag,
+        workspace_dir=work,
+        tool_free=tool_free,
+        no_host_tools=strict_inline,
+        sandbox_mode=(None if strict_inline else "danger-full-access"),
+        isolated_host_tools=isolated_host_tools,
+        # Bundle owns a whole cycle, potentially including multiple 24-hour
+        # commands and unbounded engineering repairs.  Its resident main turn
+        # ends by explicit stage completion/owner shutdown, never by the
+        # ordinary one-call wall-clock limit.
+        lifecycle_bound=purpose_tag.startswith("bundle-main-c"),
+        execution_supervisor=execution_supervisor,
+        runtime_mcp_broker=(None if strict_inline else runtime_mcp_broker))
+    runner.require_stage_submission = (
+        runtime_mcp_broker is not None
+        and purpose_tag.startswith((
+            "idea-main-c", "plan-main-c", "reasoning-main-c", "bundle-main-c",
+        )))
+    # Persistence changes only provider conversation continuity.  The ordinary
+    # operator may inspect with broad local/network tools, but official
+    # smoke/train/eval launch and all state writes remain with the orchestrator.
+    runner.bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
+    runner.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+    return runner
+
+
+def _bundle_operator_mode_for_runtime(
+        runner_factory: Optional[Callable], *, deployment_mode: str,
+        qualification_active: bool) -> bool:
+    """Keep the retired event-by-event Bundle operator disabled.
+
+    Bundle control now lives in the resident stage-main turn through runtime
+    MCP ``bundle_execute/status/replan``.  The old capability declaration is
+    still validated so a typo cannot silently mean a different protocol, but
+    it never re-enables top-level event resumes.
+    """
+    if deployment_mode not in {"development", "production"}:
+        raise ValueError("bundle operator deployment mode 非法")
+    if not isinstance(qualification_active, bool):
+        raise ValueError("bundle operator qualification_active 须为 bool")
+    if runner_factory is None:
+        return False
+    if qualification_active:
+        raise ValueError(
+            "qualification 禁止注入自定义 runner_factory；"
+            "持久 bundle operator 只能使用默认 qualification Runner")
+    if not callable(runner_factory):
+        raise ValueError("runner_factory 须为 callable")
+    declaration = getattr(
+        runner_factory, "bundle_operator_session_contract", None)
+    if declaration is None:
+        return False
+    if declaration != BUNDLE_OPERATOR_SESSION_CONTRACT:
+        raise ValueError("runner_factory bundle operator 持久会话合同非法")
+    return False
+
+
+def _resident_stage_sessions_for_runtime(
+        runner_factory: Optional[Callable], *,
+        qualification_active: bool) -> bool:
+    """Enable stage persistence only for the default worker or an exact opt-in."""
+    if not isinstance(qualification_active, bool):
+        raise ValueError("resident stage qualification_active 须为 bool")
+    if runner_factory is None:
+        return not qualification_active
+    declaration = getattr(runner_factory, "stage_main_session_contract", None)
+    if declaration is None:
+        return False
+    if qualification_active:
+        raise ValueError(
+            "qualification 禁止注入自定义 runner_factory；"
+            "阶段主会话只能使用默认 qualification Runner")
+    if declaration != STAGE_MAIN_SESSION_CONTRACT:
+        raise ValueError("runner_factory 阶段主持久会话合同非法")
+    return True
+
+
+def _nonnegative_cycle_limit(value: str) -> int:
+    """Argparse type for a cycle cap that may be zero only for preflight."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("max-cycles 须为非负整数") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("max-cycles 须为非负整数")
+    return parsed
 
 
 def _reject_nonfinite_policy_numbers(value: Any, path: str = "$") -> None:
@@ -104,6 +264,189 @@ def _reject_nonfinite_policy_numbers(value: Any, path: str = "$") -> None:
     elif isinstance(value, list):
         for idx, item in enumerate(value):
             _reject_nonfinite_policy_numbers(item, f"{path}[{idx}]")
+
+
+def _validate_startup_policy(policy: Dict[str, Any], schemas: SchemaSet) -> None:
+    """Validate one complete policy before it can authorize runtime resources."""
+    schemas.validator("policy").validate(policy)
+    _reject_nonfinite_policy_numbers(policy)
+    CostLedger.validate_policy(policy)
+    if set(policy["execution"]["path_allowlist"]) != set(
+            policy["execution"]["sandbox"]["readonly_mounts"]):
+        raise ValueError(
+            "policy.execution.path_allowlist 与 sandbox.readonly_mounts 须完全一致；"
+            "host 命令围栏允许的外部路径必须在容器内只读映射")
+
+
+def _project_quest_runtime_policy(
+        base_policy: Mapping[str, Any], runtime_record: Mapping[str, Any]) -> Dict[str, Any]:
+    """Project one server-authored quest profile onto a private base policy.
+
+    The mutable quest ledger selects named profiles.  Legacy v2 may only narrow
+    the trusted candidate pool while retaining the policy's fixed GPU count;
+    v3 binds the exact selected set and therefore sets the count to that set's
+    size.  Even v3 cannot add an index outside the repository policy or change
+    memory, image/local-environment identity, or network authority.
+    """
+    if not isinstance(base_policy, Mapping):
+        raise ValueError("base policy 须为 object")
+    if not isinstance(runtime_record, Mapping):
+        raise ValueError("runtime profile current record 须为 object")
+    profile = normalize_profile(runtime_record.get("profile"))
+    projected = copy.deepcopy(dict(base_policy))
+    resources = projected.get("resources")
+    retry = projected.get("flow", {}).get("retry")
+    if not isinstance(resources, dict) or not isinstance(retry, dict):
+        raise ValueError("base policy 缺 resources/flow.retry")
+
+    compute = profile["compute_profile_id"]
+    if compute == "local-cpu":
+        resources["gpus"] = 0
+        resources["gpu_mem_gb"] = 0
+        resources["allowed_device_indices"] = []
+        resources["gpu_target_policy"] = "forbidden"
+    elif compute == "local-gpu":
+        selected = profile.get("gpu_device_indices")
+        if selected is not None:
+            trusted = resources.get("allowed_device_indices")
+            requested = resources.get("gpus")
+            common_invalid = (
+                not isinstance(trusted, list)
+                or not isinstance(requested, int)
+                or isinstance(requested, bool)
+                or any(index not in trusted for index in selected))
+            if common_invalid:
+                raise ValueError(
+                    "runtime GPU 选择必须位于 trusted allowlist 内")
+            if profile["version"] == 2 and len(selected) < requested:
+                raise ValueError(
+                    "runtime GPU 候选数量不得少于 legacy 固定请求数量")
+            if profile["version"] == EXACT_MULTI_GPU_PROFILE_VERSION:
+                # v3 is an exact multi-GPU contract.  normalize_profile has
+                # already required a non-empty canonical set; the trusted
+                # policy allowlist remains the hard upper authority.
+                resources["gpus"] = len(selected)
+            resources["allowed_device_indices"] = list(selected)
+    else:  # normalize_profile already closes this enum.
+        raise ValueError(f"不支持的 compute_profile_id: {compute!r}")
+
+    review_count = 1 if profile["review_intensity"] == "once" else 0
+    for field in (
+            "plan_review", "bundle_code_review", "bundle_result_review"):
+        retry[field] = review_count
+    return projected
+
+
+def _runtime_profile_identity(record: Mapping[str, Any]) -> tuple[int, Optional[str]]:
+    """Return the revision/hash identity promised by ``current()``."""
+    if not isinstance(record, Mapping) or set(record) != {
+            "quest_id", "revision", "profile", "record_sha256", "source"}:
+        raise ValueError("runtime profile current record 字段闭包非法")
+    revision = record.get("revision")
+    digest = record.get("record_sha256")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("runtime profile revision 非法")
+    if digest is not None and (
+            not isinstance(digest, str) or len(digest) != 71
+            or not digest.startswith("sha256:")
+            or any(char not in "0123456789abcdef" for char in digest[7:])):
+        raise ValueError("runtime profile record_sha256 非法")
+    if (revision == 0) != (digest is None):
+        raise ValueError("runtime profile legacy revision/hash 组合非法")
+    normalize_profile(record.get("profile"))
+    return revision, digest
+
+
+class _RuntimeProfileMonitor:
+    """Read-only probe which requests replacement only at a cycle boundary."""
+
+    def __init__(self, settings: QuestRuntimeSettings,
+                 applied_record: Mapping[str, Any], stop_event: threading.Event):
+        if not isinstance(stop_event, threading.Event):
+            raise ValueError("runtime profile stop_event 须为 threading.Event")
+        self.settings = settings
+        self.applied_revision, self.applied_record_sha256 = (
+            _runtime_profile_identity(applied_record))
+        self.stop_event = stop_event
+
+        self.pending_revision: Optional[int] = None
+        self.pending_record_sha256: Optional[str] = None
+
+    def probe(self, *, safe_cycle_boundary: bool) -> Optional[str]:
+        latest = self.settings.current()  # Strict ledger validation; fail closed on drift.
+        revision, digest = _runtime_profile_identity(latest)
+        if (revision, digest) == (
+                self.applied_revision, self.applied_record_sha256):
+            return None
+        # A GPU/CPU switch changes the plan resource contract/environment
+        # identity; review switches change the gates.  Remember the newest
+        # revision while an old-policy cycle is inflight, but let that complete
+        # under one coherent policy before requesting owner replacement.
+        self.pending_revision = revision
+        self.pending_record_sha256 = digest
+        if not safe_cycle_boundary:
+            return None
+        self.stop_event.set()
+        return (
+            "runtime profile 已更新，当前 durable cycle 已完成；"
+            f"在下一 cycle 前协作退出（applied={self.applied_revision}, latest={revision}）"
+        )
+
+
+class RuntimeProfileRestartRequired(RuntimeError):
+    """A stale old-profile owner must exit before desired can be assembled."""
+
+
+def _reconcile_stale_runtime_binding_before_preflight(
+        work: Path, settings: QuestRuntimeSettings,
+        applied_record: Mapping[str, Any]) -> bool:
+    """Clear a stale binding under the instance lease, before Docker/GPU.
+
+    Returns ``True`` only when the cleared binding is older than current and
+    this owner must exit so its manager can capture/restart the desired
+    generation.  A real inflight cycle retains the binding and old policy.
+
+    This deliberately uses the canonical writable database opener after the
+    process-wide lease is held: it verifies the frozen schema and safely
+    recovers the configured SQLite journal mode.  The semantic query remains
+    read-only.  A missing/untrusted database can never justify clearing a
+    binding.
+    """
+    bound = settings.bound_cycle_profile()
+    if bound is None:
+        return False
+    if _runtime_profile_identity(bound) != _runtime_profile_identity(applied_record):
+        raise ValueError(
+            "durable cycle binding 与 early-reconcile applied profile 不一致")
+    db_path = work / "research.sqlite"
+    try:
+        info = db_path.lstat()
+    except OSError as error:
+        raise ValueError(
+            "durable cycle binding 存在但 research.sqlite 不可核验") from error
+    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1 or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        raise ValueError(
+            "durable cycle binding 的 research.sqlite owner/type/link/mode 非法")
+    conn = _db.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM cycle "
+            "WHERE status NOT IN ('done','failed','aborted') ORDER BY id"
+        ).fetchall()
+        if len(rows) > 1:
+            raise ValueError(
+                f"同时存在 {len(rows)} 条在途 cycle，拒绝清理 runtime binding")
+    finally:
+        conn.close()
+    if rows:
+        return False
+    if not settings.clear_cycle_profile(applied_record):
+        raise ValueError("stale runtime cycle binding 在 exact clear 前消失")
+    current = settings.current()
+    return _runtime_profile_identity(current) != _runtime_profile_identity(
+        applied_record)
 
 
 def _validate_outbound_config(policy: Dict[str, Any], config: Optional[Dict[str, Any]]) -> None:
@@ -161,15 +504,160 @@ def _validate_outbound_config(policy: Dict[str, Any], config: Optional[Dict[str,
         raise ValueError("outbound batch_size 非法")
 
 
+def _web_local_source_mounts(work: Path) -> List[Dict[str, str]]:
+    """Load the Web-published, server-authored local-directory capabilities.
+
+    Browser paths never reach this function directly.  Publication has
+    already enumerated and hashed every file; startup rechecks the immutable
+    manifest identity and derives the coupled host/sandbox read-only lists.
+    """
+    path = work / "input" / "local-sources.json"
+    if not os.path.lexists(path):
+        return []
+    try:
+        work_info = work.lstat()
+        info = path.lstat()
+    except OSError as error:
+        raise ValueError("Web 本机目录清单不可读") from error
+    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1 or info.st_uid != work_info.st_uid
+            or stat.S_IMODE(info.st_mode) != 0o400
+            or not 2 <= info.st_size <= _MAX_WEB_LOCAL_SOURCE_MANIFEST_BYTES):
+        raise ValueError("Web 本机目录清单 owner/type/link/mode/size 非法")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("Web 本机目录清单被截断")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(fd)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+            value.st_uid, value.st_gid, value.st_size, value.st_mtime_ns,
+            value.st_ctime_ns)
+        if identity(before) != identity(after):
+            raise ValueError("Web 本机目录清单读取期间身份漂移")
+    finally:
+        os.close(fd)
+
+    def unique(pairs):  # noqa: ANN001 - JSON hook
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("Web 本机目录清单含重复 key")
+            value[key] = item
+        return value
+
+    try:
+        manifest = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=unique,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"Web 本机目录清单含非有限数: {token}")))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Web 本机目录清单不是严格 JSON") from error
+    canonical = (json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False) + "\n").encode("utf-8")
+    if raw != canonical or not isinstance(manifest, dict):
+        raise ValueError("Web 本机目录清单不是 canonical JSON object")
+    if (set(manifest) != {
+            "version", "draft_id", "status", "generated_at", "file_count",
+            "total_bytes", "sources"}
+            or manifest.get("version") != 1
+            or manifest.get("status") != "verified"
+            or not isinstance(manifest.get("sources"), list)):
+        raise ValueError("Web 本机目录清单字段闭包非法")
+
+    capabilities: List[Dict[str, str]] = []
+    seen = set()
+    work_abs = os.path.abspath(work)
+    for source in manifest["sources"]:
+        if (not isinstance(source, dict)
+                or set(source) != {
+                    "source_id", "label", "kind", "status", "source_type",
+                    "source_path", "source_root", "root_identity", "file_count",
+                    "total_bytes", "files"}
+                or source.get("kind") not in {"dataset", "references"}
+                or source.get("status") != "verified"
+                or source.get("source_type") != "directory"):
+            raise ValueError("Web 本机目录 source 字段闭包/类型非法")
+        root = source.get("source_root")
+        if (not isinstance(root, str) or not os.path.isabs(root)
+                or os.path.normpath(root) != root
+                or source.get("source_path") != root):
+            raise ValueError("Web 本机目录 root 非规范绝对目录")
+        try:
+            common = os.path.commonpath((root, work_abs))
+        except ValueError as error:
+            raise ValueError("Web 本机目录与 work-root 不在同一路径域") from error
+        if common in {root, work_abs}:
+            raise ValueError("Web 本机目录不得包含 work-root 或位于其内部")
+        try:
+            root_info = os.lstat(root)
+        except OSError as error:
+            raise ValueError("Web 本机目录在 owner 启动时不可读") from error
+        expected_identity = source.get("root_identity")
+        if (not isinstance(expected_identity, dict)
+                or not stat.S_ISDIR(root_info.st_mode)
+                or stat.S_ISLNK(root_info.st_mode)
+                or expected_identity.get("device") != root_info.st_dev
+                or expected_identity.get("inode") != root_info.st_ino
+                or expected_identity.get("mode") != stat.S_IMODE(root_info.st_mode)
+                or expected_identity.get("uid") != root_info.st_uid
+                or expected_identity.get("gid") != root_info.st_gid):
+            raise ValueError("Web 本机目录身份自发布后漂移")
+        for existing in seen:
+            if os.path.commonpath((existing, root)) in {existing, root}:
+                raise ValueError("Web 本机目录只读挂载不得重复或互相嵌套")
+        seen.add(root)
+        capabilities.append({"path": root, "kind": source["kind"]})
+    return capabilities
+
+
 class _GuardedRunner:
     """Fence the last boundary before an injected Runner starts external work."""
 
-    def __init__(self, inner: Any, owner_guard: Callable[[], None]):
+    _PERSISTENT_CAPABILITIES = (
+        "run_task", "bind_persistent_session", "bind_runner_call")
+
+    def __init__(
+            self, inner: Any, owner_guard: Callable[[], None], *,
+            require_persistent_session_capabilities: bool = False):
+        if not isinstance(require_persistent_session_capabilities, bool):
+            raise ValueError("require_persistent_session_capabilities 须为 bool")
         self.inner = inner
         self.owner_guard = owner_guard
+        declared_persistent_contract = (
+            getattr(inner, "bundle_operator_session_contract", None)
+            == BUNDLE_OPERATOR_SESSION_CONTRACT
+            or getattr(inner, "stage_main_session_contract", None)
+            == STAGE_MAIN_SESSION_CONTRACT)
+        self._persistent_session_capabilities_required = (
+            require_persistent_session_capabilities
+            or declared_persistent_contract)
+        if self._persistent_session_capabilities_required:
+            self._require_persistent_capabilities()
+
+    def _require_persistent_capabilities(self) -> None:
+        missing = [
+            name for name in self._PERSISTENT_CAPABILITIES
+            if not callable(getattr(self.inner, name, None))]
+        if missing:
+            raise RuntimeError(
+                "持久会话 runner 缺 callable 能力: " + ", ".join(missing))
 
     def run_task(self, *args, **kwargs):  # noqa: ANN002,ANN003,ANN201 - protocol passthrough
         self.owner_guard()
+        if (self._persistent_session_capabilities_required
+                and not callable(getattr(self.inner, "run_task", None))):
+            raise RuntimeError("持久会话 runner 的 run_task 能力已漂移")
         return self.inner.run_task(*args, **kwargs)
 
     def bind_runner_call(self, **kwargs):  # noqa: ANN003,ANN201 - optional runner capability
@@ -177,11 +665,32 @@ class _GuardedRunner:
         bind = getattr(self.inner, "bind_runner_call", None)
         if callable(bind):
             return bind(**kwargs)
+        if self._persistent_session_capabilities_required:
+            raise RuntimeError(
+                "持久会话 runner 的 bind_runner_call 能力已漂移")
+        return None
+
+    def bind_persistent_session(self, **kwargs):  # noqa: ANN003,ANN201 - narrator capability
+        self.owner_guard()
+        bind = getattr(self.inner, "bind_persistent_session", None)
+        if callable(bind):
+            return bind(**kwargs)
+        if self._persistent_session_capabilities_required:
+            raise RuntimeError(
+                "持久会话 runner 的 bind_persistent_session 能力已漂移")
         return None
 
     @property
     def tool_free_contract(self):  # noqa: ANN201 - optional runner capability
         return getattr(self.inner, "tool_free_contract", None)
+
+    @property
+    def bundle_operator_session_contract(self):  # noqa: ANN201 - exact optional capability
+        return getattr(self.inner, "bundle_operator_session_contract", None)
+
+    @property
+    def stage_main_session_contract(self):  # noqa: ANN201 - exact optional capability
+        return getattr(self.inner, "stage_main_session_contract", None)
 
 
 class _AssemblyCleanup:
@@ -241,7 +750,15 @@ class System:
                  execution_supervisor: Optional[ExecutionSupervisor] = None,
                  deployment_receipt: Optional[Dict[str, Any]] = None,
                  resource_closers: Optional[List[Callable[[], None]]] = None,
-                 research_open_guard: Optional[Callable[[], None]] = None):
+                 research_open_guard: Optional[Callable[[], None]] = None,
+                 runtime_profile_boundary_probe: Optional[
+                     Callable[[], Optional[str]]] = None,
+                 runtime_profile_revision: Optional[int] = None,
+                 runtime_profile_record_sha256: Optional[str] = None,
+                 runtime_profile_stop_event: Optional[threading.Event] = None,
+                 runtime_profile_cycle_bind: Optional[Callable[[], None]] = None,
+                 runtime_profile_cycle_clear: Optional[Callable[[], None]] = None,
+                 stage_shutdown_fence: Optional[Callable[[], None]] = None):
         if dual_mode != "A":
             raise ValueError(
                 "session.dual_mode 当前只支持 A（一 turn 一阶段）；"
@@ -278,6 +795,17 @@ class System:
         self.deployment_receipt = deployment_receipt
         self._resource_closers = list(resource_closers or [])
         self._research_open_guard = research_open_guard or (lambda: None)
+        self._runtime_profile_boundary_probe = (
+            runtime_profile_boundary_probe or (lambda: None))
+        self.runtime_profile_revision = runtime_profile_revision
+        self.runtime_profile_record_sha256 = runtime_profile_record_sha256
+        self.runtime_profile_stop_event = runtime_profile_stop_event
+        if ((runtime_profile_cycle_bind is None)
+                != (runtime_profile_cycle_clear is None)):
+            raise ValueError("runtime profile cycle bind/clear 必须成对装配")
+        self._runtime_profile_cycle_bind = runtime_profile_cycle_bind
+        self._runtime_profile_cycle_clear = runtime_profile_cycle_clear
+        self._stage_shutdown_fence = stage_shutdown_fence or (lambda: None)
         self._lifecycle_guard = threading.RLock()
         self._active_operations = 0
         self._run_depth = 0
@@ -646,6 +1174,13 @@ class System:
     def _run_owned(self, max_cycles: int) -> List[str]:
         """以生产唯一的模式 A 驱动 run_cycles 到停机：每次 Runner 调用只对应一个阶段，
         阶段结果提交后才进入下一格。返回本次推进的 cycle_id。"""
+        if isinstance(max_cycles, bool) or not isinstance(max_cycles, int) or max_cycles < 0:
+            raise ValueError("max_cycles 须为非负整数")
+        # Bind before any research/interaction worker for this run call.  A
+        # crash, parent death or explicit terminate then leaves durable proof
+        # of the exact policy which must resume an inflight cycle.
+        if self._runtime_profile_cycle_bind is not None:
+            self._runtime_profile_cycle_bind()
         pump_owner = self._start_interaction_pump(0.05)
         if pump_owner:
             self._interaction_exit_drained = False
@@ -731,6 +1266,12 @@ class System:
         self.sync_notifications()
         if pump_owner:                         # nested run_forever already owns the non-blocking delivery thread
             self.flush_outbound()
+        # Clear only on the successful return path and only after the durable
+        # cycle disappeared.  Exceptions and mid-cycle resource blocks retain
+        # the binding for crash-safe recovery under the same policy.
+        if (self._runtime_profile_cycle_clear is not None
+                and self.state.inflight_cycle() is None):
+            self._runtime_profile_cycle_clear()
         return result
 
     def drain_interactions(self, *, poll_interval_s: float = 0.1,
@@ -814,6 +1355,14 @@ class System:
         pump_owner = self._start_interaction_pump(float(poll_interval_s))
         try:
             while not external_stop.is_set():
+                # This callback may observe a new quest profile at any time,
+                # but returns a stop reason only when no durable cycle is
+                # inflight.  It therefore cannot split one plan/resource/gate
+                # contract across two runtime policies.
+                runtime_stop_reason = self._runtime_profile_boundary_probe()
+                if runtime_stop_reason is not None:
+                    self.advancer.last_block_reason = runtime_stop_reason
+                    break
                 self._raise_resident_failure()
                 batch: List[str] = []
                 ran_research = False
@@ -825,7 +1374,21 @@ class System:
                         ran_research = True
                         # Return control after every durable cycle so a resident stop_event cannot be hidden
                         # inside one run_cycles(100+) call.  Stage-level work still obeys normal safe boundaries.
-                        batch = self.run(1)
+                        try:
+                            batch = self.run(1)
+                        except RunnerError as error:
+                            if error.failure_kind not in _RESIDENT_RETRYABLE_RUNNER_FAILURES:
+                                raise
+                            self.advancer.last_block_reason = (
+                                "可恢复 Codex 调用失败，保留当前 cycle 自动重试："
+                                f"{error.failure_kind}: {error}")
+                            logger.warning(
+                                "resident owner 保留 durable cursor 并重试 Codex 调用 "
+                                "failure_kind=%s error=%s",
+                                error.failure_kind, error)
+                            external_stop.wait(float(poll_interval_s))
+                            self._raise_resident_failure()
+                            continue
                         completed.extend(batch)
                         if (len(completed) >= max_cycles or self.last_stop_reason is not None
                                 or (not batch and self.advancer.last_block_reason is None)):
@@ -994,6 +1557,16 @@ class System:
                         "System 仍有 accepted interaction/query capability；instance lease 保留供重试")
                 self._accepted_interactions_drained = True
 
+            # Stop MCP/controller admission before cancelling any shared
+            # guardian.  Otherwise a last concurrent Bundle tool call could
+            # create a Python worker after the supervisor had entered shutdown.
+            try:
+                self._stage_shutdown_fence()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                return first_error
+
             # External guardians are a shared capability just like DB workers.
             # They must be terminal, reaped and receipt-durable before any DB
             # handle closes or the instance flock can move to a new owner.
@@ -1005,17 +1578,21 @@ class System:
                         first_error = error
                     return first_error
 
-            remaining: List[Callable[[], None]] = []
-            for closer in reversed(self._resource_closers):
+            # Resource order is a dependency order, not a best-effort bag.
+            # In particular AttackStages.close is last-added/first-run and
+            # must join Bundle's post-command worker before broker/readers/
+            # writer are touched.  On the first failure retain that closer and
+            # every dependency behind it for the next close retry.
+            while self._resource_closers:
+                closer = self._resource_closers[-1]
                 try:
                     closer()
                 except BaseException as error:
-                    remaining.append(closer)
                     if first_error is None:
                         first_error = error
-            self._resource_closers = list(reversed(remaining))
-            if self._resource_closers:
-                return first_error or RuntimeError("System DB/resource close 未完成")
+                    return first_error
+                else:
+                    self._resource_closers.pop()
 
             if self.instance_lease is not None:
                 lease_error = self.instance_lease.close()
@@ -1058,8 +1635,13 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
                  attack=True, outbound_config: Optional[Dict[str, Any]] = None,
                  import_search_provider=None,
                  reference_snapshot_provider=None,
+                 novelty_search_provider=None,
                  enforce_instance_lease: bool = True,
-                 heartbeat_interval_s: float = 1.0) -> System:
+                 heartbeat_interval_s: float = 1.0,
+                 quest_id: Optional[str] = None,
+                 expected_runtime_profile_revision: Optional[int] = None,
+                 expected_runtime_profile_record_sha256: Optional[str] = None,
+                 runtime_profile_stop_event: Optional[threading.Event] = None) -> System:
     """装配全系统。system_root=含 input/goal_brief.md · policies/ · prompts/ · schemas/ 的仓库根；
     work_root=运行产物根（research.sqlite / cycles / state 落此）。runner_factory=注入式 Runner 工厂
     （默认真 CodexRunner；测试传 mock）。attack：True=全装（默认）；False/None=退化 reasoning-only
@@ -1070,19 +1652,73 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
     ``import_search_provider`` 是受信只读 repo connector 注入点；None 使用受 policy
     限制的 GitHub REST provider（仅 plan 明确产搜索 sidecar 时才联网）。
     ``reference_snapshot_provider`` 是 SOTA paper/benchmark 冻结注入点；None 使用 policy host
-    allowlist 内的 bounded HTTPS reader。"""
+    allowlist 内的 bounded HTTPS reader。``novelty_search_provider`` 是 WildIdea 文献查重的
+    受信、只读、可回放 provider 注入点；None 使用 policy 固定的 arXiv API provider。"""
     root = Path(system_root)
-    work = Path(work_root)
+    # Match InstanceLease's lexical-absolute pathname identity without
+    # resolving/following a symlink component.  Every component assembled
+    # under the lease (including PoolPublisher and AttackStages) then retains
+    # the same stable work-root meaning even if process cwd later changes.
+    work = Path(os.path.abspath(os.fspath(work_root)))
     policy = yaml.safe_load((root / "policies" / "policy.yaml").read_text(encoding="utf-8"))
     schemas = SchemaSet(root / "schemas")
-    schemas.validator("policy").validate(policy)    # 启动前机械校验；不能只靠 tests 校验仓库默认文件
-    _reject_nonfinite_policy_numbers(policy)         # JSON Schema/Python 边界：显式拒 NaN/±Inf
-    CostLedger.validate_policy(policy)               # 成本边界（float 溢出/布尔值等）也在创建 work/DB 前验完
-    if set(policy["execution"]["path_allowlist"]) != set(
-            policy["execution"]["sandbox"]["readonly_mounts"]):
-        raise ValueError(
-            "policy.execution.path_allowlist 与 sandbox.readonly_mounts 须完全一致；"
-            "host 命令围栏允许的外部路径必须在容器内只读映射")
+    # Base policy remains a pre-lease/pre-work trust boundary.  An installed
+    # qualification contract may only narrow its mount capabilities later.
+    _validate_startup_policy(policy, schemas)
+    runtime_settings: Optional[QuestRuntimeSettings] = None
+    applied_runtime_profile: Optional[Dict[str, Any]] = None
+    if quest_id is None:
+        if (expected_runtime_profile_revision is not None
+                or expected_runtime_profile_record_sha256 is not None
+                or runtime_profile_stop_event is not None):
+            raise ValueError("runtime profile 参数要求显式 quest_id")
+    else:
+        runtime_settings = QuestRuntimeSettings(work, quest_id)
+        current_runtime_profile = runtime_settings.current()
+        current_identity = _runtime_profile_identity(current_runtime_profile)
+        bound_runtime_profile = runtime_settings.bound_cycle_profile()
+        bound_identity = (
+            None if bound_runtime_profile is None
+            else _runtime_profile_identity(bound_runtime_profile))
+        if (current_runtime_profile["quest_id"] != quest_id
+                or (bound_runtime_profile is not None
+                    and bound_runtime_profile["quest_id"] != quest_id)):
+            raise ValueError("runtime profile quest_id 与启动 quest 不一致")
+        if expected_runtime_profile_revision is not None:
+            if (isinstance(expected_runtime_profile_revision, bool)
+                    or not isinstance(expected_runtime_profile_revision, int)
+                    or expected_runtime_profile_revision < 0):
+                raise ValueError("expected runtime profile revision 非法")
+            expected_identity = (
+                expected_runtime_profile_revision,
+                expected_runtime_profile_record_sha256)
+            required_identity = (
+                bound_identity if bound_identity is not None
+                else current_identity)
+            if expected_identity != required_identity:
+                raise ValueError(
+                    "runtime profile 在 manager 捕获后发生漂移，或不匹配 durable cycle binding")
+            # Resolve historical bytes through the ledger API; never rebuild
+            # an old profile from current/default assumptions.
+            applied_runtime_profile = runtime_settings.record(
+                expected_runtime_profile_revision,
+                expected_runtime_profile_record_sha256)
+            if _runtime_profile_identity(applied_runtime_profile) != expected_identity:
+                raise ValueError("runtime profile historical record identity 漂移")
+        elif expected_runtime_profile_record_sha256 is not None:
+            raise ValueError("expected runtime profile hash 缺 revision")
+        else:
+            applied_runtime_profile = (
+                bound_runtime_profile
+                if bound_runtime_profile is not None
+                else current_runtime_profile)
+        if runtime_profile_stop_event is None:
+            runtime_profile_stop_event = threading.Event()
+        elif not isinstance(runtime_profile_stop_event, threading.Event):
+            raise ValueError("runtime_profile_stop_event 须为 threading.Event")
+        policy = _project_quest_runtime_policy(policy, applied_runtime_profile)
+        # Validate the effective private copy before lease, Docker or SQLite.
+        _validate_startup_policy(policy, schemas)
     _validate_outbound_config(policy, outbound_config)
     if not isinstance(enforce_instance_lease, bool):
         raise ValueError("enforce_instance_lease 须为 bool")
@@ -1103,13 +1739,32 @@ def build_system(system_root: str, work_root: str, *, runner_factory: Optional[C
         else:
             work.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(work, 0o700)
+        # A durable binding is allowed to outlive its owner only while the DB
+        # still proves that exact cycle is inflight.  Reconcile after the
+        # process-wide lease (never in lease-disabled component tests), but
+        # before Docker/deployment/GPU preflight: an obsolete GPU profile must
+        # not prevent the manager from replacing it with the desired CPU
+        # generation.  If desired changed, this process still owns the old
+        # captured identity and therefore exits instead of silently assembling
+        # a mixed-generation System.
+        if (lease is not None and runtime_settings is not None
+                and applied_runtime_profile is not None
+                and _reconcile_stale_runtime_binding_before_preflight(
+                    work, runtime_settings, applied_runtime_profile)):
+            raise RuntimeProfileRestartRequired(
+                "stale runtime cycle binding 已在可信 no-inflight DB 边界清理；"
+                "由 quest manager 按 desired profile 重启")
         return _assemble_system(
             root=root, work=work, policy=policy, schemas=schemas,
             runner_factory=runner_factory, attack=attack,
             outbound_config=outbound_config, instance_lease=lease,
             import_search_provider=import_search_provider,
             reference_snapshot_provider=reference_snapshot_provider,
-            resource_closers=resource_closers)
+            novelty_search_provider=novelty_search_provider,
+            resource_closers=resource_closers,
+            runtime_settings=runtime_settings,
+            applied_runtime_profile=applied_runtime_profile,
+            runtime_profile_stop_event=runtime_profile_stop_event)
     except BaseException as primary:
         cleanup = _AssemblyCleanup(resource_closers, lease)
         cleanup_error = cleanup.close()
@@ -1140,15 +1795,31 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                      attack: Any, outbound_config: Optional[Dict[str, Any]],
                      import_search_provider, reference_snapshot_provider,
                      instance_lease: Optional[InstanceLease],
-                     resource_closers: List[Callable[[], None]]) -> System:
+                     resource_closers: List[Callable[[], None]],
+                     runtime_settings: Optional[QuestRuntimeSettings] = None,
+                     applied_runtime_profile: Optional[Mapping[str, Any]] = None,
+                     runtime_profile_stop_event: Optional[threading.Event] = None,
+                     novelty_search_provider=None) -> System:
     """Assemble under an already-held owner lease; caller owns rollback."""
     owner_guard = instance_lease.assert_owned if instance_lease is not None else (lambda: None)
+    owner_guard()
     # This check precedes Docker, SQLite, connectors and providers.  Once a
     # sealed target has been consumed, even read-only exposure of its metric to
     # a fresh research turn would violate the non-feedback contract.
     qualification = load_qualification_firewall(
-        work, policy=policy, require_research_uid=True)
+        work, policy=None, require_research_uid=True)
+    web_local_sources = _web_local_source_mounts(work)
     if qualification is not None:
+        # The immutable contract, not a mutable deployment YAML edit, is the
+        # sole authority for qualification data mounts.  Preserve the already
+        # validated base policy and replace only the two coupled capability
+        # lists in a private copy used throughout this assembled System.
+        policy = copy.deepcopy(policy)
+        exact_mounts = [str(item.path) for item in qualification.mounts]
+        policy["execution"]["path_allowlist"] = list(exact_mounts)
+        policy["execution"]["sandbox"]["readonly_mounts"] = list(exact_mounts)
+        _validate_startup_policy(policy, schemas)
+        qualification.validate_policy(policy)
         if runner_factory is not None:
             raise ValueError(
                 "qualification 禁止注入自定义 runner_factory；所有研究 LLM 必须使用无 host tools runner")
@@ -1156,6 +1827,37 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             raise ValueError(
                 "qualification 禁止注入预装配 AttackStages；必须由当前 contract 装配完整边界")
         qualification.assert_research_open()
+    elif web_local_sources:
+        # A local Web attachment is explicit user-granted read authority.  It
+        # remains outside the quest work-root and is therefore coupled into
+        # both the host argv fence and the Docker read-only mount list.  No
+        # global policy file or browser-supplied contract is edited.
+        policy = copy.deepcopy(policy)
+        existing = list(policy["execution"]["path_allowlist"])
+        exact_mounts = list(dict.fromkeys(
+            existing + [item["path"] for item in web_local_sources]))
+        policy["execution"]["path_allowlist"] = exact_mounts
+        policy["execution"]["sandbox"]["readonly_mounts"] = list(exact_mounts)
+        _validate_startup_policy(policy, schemas)
+
+    # Verify every vendored byte and the exact engine/policy identity before
+    # Docker, SQLite, connectors or a model process is exposed.  Runtime never
+    # follows upstream main; an upgrade is an explicit reviewed release edit.
+    wildidea_adapter = None
+    if attack is True:
+        novelty_policy = policy["idea"]["novelty_check"]
+        controlled_novelty = None
+        if novelty_policy["enabled"]:
+            controlled_novelty = (
+                novelty_search_provider
+                if novelty_search_provider is not None
+                else ArxivNoveltySearchProvider(
+                    novelty_policy, work_root=work, owner_guard=owner_guard))
+        elif novelty_search_provider is not None:
+            raise ValueError(
+                "novelty_check=false 时拒绝装配联网 novelty provider")
+        wildidea_adapter = WildIdeaAdapter(
+            root, policy, novelty_provider=controlled_novelty)
 
     execution_owner_id = (
         instance_lease.owner_id if instance_lease is not None
@@ -1171,13 +1873,24 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     dependency_image_builder = None
     repository_materializer = None
     if attack is True:
-        base_execution_sandbox = DockerExecutionSandbox(
+        # First runnable development profile: execute directly in the user's
+        # project-local Conda environment and selected GPUs.  Production and
+        # qualification retain the pinned Docker boundary until explicitly
+        # migrated; the two paths share manifests, guardian receipts and DB
+        # gates, so this does not fork the scientific state machine.
+        local_development = (
+            policy["deployment"]["mode"] == "development"
+            and qualification is None)
+        sandbox_class = (
+            LocalExecutionSandbox if local_development
+            else DockerExecutionSandbox)
+        base_execution_sandbox = sandbox_class(
             work_root=work, config=policy["execution"]["sandbox"],
             owner_guard=owner_guard, system_root=root,
             qualification_firewall=qualification)
-        # Strong-execution prerequisites are startup capabilities, not a late
-        # scientific failure.  Prove the exact local image/daemon/seccomp
-        # before SQLite or any connector/provider side effect is exposed.
+        # Check the chosen runtime before SQLite or a provider is exposed.
+        # Local development checks the pinned Conda prefix; Docker profiles
+        # retain exact image/daemon/seccomp preflight.
         base_execution_sandbox.preflight()
         deployment_preflight = DeploymentPreflight(
             work_root=work,
@@ -1195,59 +1908,81 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         base_execution_sandbox.recover_terminal_sessions(execution_supervisor)
 
         gpu_contract = deployment_candidate["gpu_contract"]
-        execution_sandbox = base_execution_sandbox
-        canary_sandbox = None
-        gpu_evidence = None
-        try:
-            if gpu_contract is not None:
-                # Freeze a candidate rather than mutating the CPU sandbox that
-                # authorized recovery.  It is promoted only after the final
-                # gate replays durable guardian+inventory evidence.
-                canary_sandbox = DockerExecutionSandbox(
-                    work_root=work, config=policy["execution"]["sandbox"],
-                    owner_guard=owner_guard, system_root=root,
-                    gpu_contract=gpu_contract,
-                    qualification_firewall=qualification)
-                canary_sandbox.preflight()
-                runtimes = (
-                    deployment_candidate.get("facts", {}).get("docker", {})
-                    .get("daemon", {}) or {}).get("runtimes", [])
-                if isinstance(runtimes, list) and "nvidia" in runtimes:
+        if local_development:
+            # The selected UUID set comes from the same live inventory used by
+            # task creation.  Local preflight rechecks it immediately; runtime
+            # then exports the whole set through CUDA_VISIBLE_DEVICES so a
+            # multi-GPU task can use every user-authorized card.
+            execution_sandbox = LocalExecutionSandbox(
+                work_root=work, config=policy["execution"]["sandbox"],
+                owner_guard=owner_guard, system_root=root,
+                gpu_contract=gpu_contract)
+            execution_sandbox.preflight()
+            # Keep an honest development receipt.  Its old Docker-canary check
+            # may remain false, but it is observational and no longer gates
+            # this deliberately unrestricted local profile.
+            deployment_receipt = deployment_preflight.finalize(None)
+        else:
+            execution_sandbox = base_execution_sandbox
+            canary_sandbox = None
+            gpu_evidence = None
+            try:
+                if gpu_contract is not None:
+                    canary_sandbox = DockerExecutionSandbox(
+                        work_root=work, config=policy["execution"]["sandbox"],
+                        owner_guard=owner_guard, system_root=root,
+                        gpu_contract=gpu_contract,
+                        qualification_firewall=qualification)
+                    canary_sandbox.preflight()
                     gpu_evidence = canary_sandbox.run_gpu_canary(
                         execution_supervisor=execution_supervisor,
                         candidate_hash=deployment_candidate["candidate_hash"])
-        except BaseException as canary_error:
-            # Even a preflight/timeout/guardian exception must attempt to leave
-            # an honest final false receipt before assembly aborts.  Owner loss
-            # can prevent that write; it remains fail-closed and is re-raised.
-            try:
-                deployment_preflight.finalize(None)
-            except BaseException as finalize_error:
-                add_note = getattr(finalize_error, "add_note", None)
-                if callable(add_note):
-                    add_note(
-                        "GPU canary 原始异常: "
-                        f"{type(canary_error).__name__}: {canary_error}")
-                raise finalize_error from canary_error
-            raise
-        deployment_receipt = deployment_preflight.finalize(gpu_evidence)
-        check_status = {
-            item.get("name"): item.get("ok") is True
-            for item in deployment_receipt["checks"]
-            if isinstance(item, Mapping)
-        }
-        gpu_access_ready = all(check_status.get(name) is True for name in (
-            "sandbox_gpu_access", "docker_cgroup", "docker_resource_limits"))
-        if (canary_sandbox is not None and gpu_access_ready
-                and canary_sandbox.resource_mode in {"cgroup-v1", "cgroup-v2"}):
-            execution_sandbox = canary_sandbox
-        dependency_image_builder = PythonWheelImageBuilder(
-            work_root=work,
-            config=policy["import_materialization"]["dependency_image"],
-            compiler=policy["import_materialization"]["compiler"],
-            bootstrap_sandbox=execution_sandbox,
-            execution_supervisor=execution_supervisor,
-            owner_guard=owner_guard)
+            except BaseException as canary_error:
+                try:
+                    deployment_preflight.finalize(None)
+                except BaseException as finalize_error:
+                    add_note = getattr(finalize_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "GPU canary 原始异常: "
+                            f"{type(canary_error).__name__}: {canary_error}")
+                    raise finalize_error from canary_error
+                raise
+            deployment_receipt = deployment_preflight.finalize(gpu_evidence)
+            check_status = {
+                item.get("name"): item.get("ok") is True
+                for item in deployment_receipt["checks"]
+                if isinstance(item, Mapping)
+            }
+            exact_gpu_ready = all(check_status.get(name) is True for name in (
+                "gpu_inventory", "gpu_device_runtime", "sandbox_gpu_access"))
+            production_resources_ready = all(
+                check_status.get(name) is True for name in (
+                    "docker_cgroup", "docker_resource_limits"))
+            deployment_mode = policy["deployment"]["mode"]
+            promote_gpu_sandbox = (
+                exact_gpu_ready
+                and canary_sandbox is not None
+                and (
+                    # Explicit qualification profiles may still exercise the
+                    # legacy development Docker backend.  Its truthful GPU
+                    # canary is sufficient; production additionally requires
+                    # the full cgroup/resource attestation.
+                    deployment_mode == "development"
+                    or (
+                        deployment_receipt.get("production_ready") is True
+                        and production_resources_ready
+                        and canary_sandbox.resource_mode in {
+                            "cgroup-v1", "cgroup-v2"})))
+            if canary_sandbox is not None and promote_gpu_sandbox:
+                execution_sandbox = canary_sandbox
+            dependency_image_builder = PythonWheelImageBuilder(
+                work_root=work,
+                config=policy["import_materialization"]["dependency_image"],
+                compiler=policy["import_materialization"]["compiler"],
+                bootstrap_sandbox=execution_sandbox,
+                execution_supervisor=execution_supervisor,
+                owner_guard=owner_guard)
         repository_materializer = GitHubRepositoryMaterializer(
             work_root=work,
             config=policy["import_materialization"],
@@ -1302,22 +2037,93 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     os.chmod(db_path, 0o600)
     daemon = WriteDaemon(
         writer_conn, owner_guard=owner_guard)              # 新库建 / 既有库续（checksum 三重锁）
+    # The live stage Codex gets a tiny quest-scoped MCP, backed by this same
+    # owner process and WriteDaemon.  It receives immediate SQL/domain errors
+    # without a second orchestration/model pass, while SQLite remains single
+    # writer.  Qualification and injected test runners keep their explicit
+    # capability profiles unchanged.
+    runtime_mcp_broker = None
+    runtime_ingest_service = None
+    if runner_factory is None and qualification is None:
+        runtime_ingest_service = RuntimeIngestService(
+            daemon, schemas=schemas, policy=policy, work_root=work,
+            owner_guard=owner_guard,
+            wildidea_adapter=wildidea_adapter)
+        runtime_mcp_broker = RuntimeMCPBroker(
+            runtime_ingest_service,
+            runtime_root=work / "runtime" / "mcp").start()
+        resource_closers.append(runtime_mcp_broker.close)
     cost_ledger = CostLedger(daemon, policy)
     # OS fence recovery above proves prior trees are drained.  Before exposing connectors,
     # providers, or any new spawn, reconcile those receipts into their exact DB intents.
     ExecutionReconciler(
         daemon, cost_ledger, execution_supervisor.receipt_dir).reconcile_startup()
     state = SQLiteStateStore(daemon, policy)
+    runtime_profile_monitor: Optional[_RuntimeProfileMonitor] = None
+    applied_runtime_revision: Optional[int] = None
+    applied_runtime_digest: Optional[str] = None
+    runtime_profile_cycle_bind: Optional[Callable[[], None]] = None
+    runtime_profile_cycle_clear: Optional[Callable[[], None]] = None
+    if runtime_settings is not None:
+        if applied_runtime_profile is None or runtime_profile_stop_event is None:
+            raise ValueError("runtime profile monitor 装配参数不完整")
+        runtime_profile_monitor = _RuntimeProfileMonitor(
+            runtime_settings, applied_runtime_profile,
+            runtime_profile_stop_event)
+        (applied_runtime_revision, applied_runtime_digest) = (
+            _runtime_profile_identity(applied_runtime_profile))
+        bound_profile = runtime_settings.bound_cycle_profile()
+        inflight_at_startup = state.inflight_cycle()
+        if bound_profile is not None:
+            if (_runtime_profile_identity(bound_profile) !=
+                    (applied_runtime_revision, applied_runtime_digest)):
+                raise ValueError(
+                    "durable cycle binding 与 owner applied runtime profile 不一致")
+            if inflight_at_startup is None:
+                # Crash after a successful cycle return but before clear is a
+                # stale outbox marker, not authority to start another cycle
+                # under the old profile.  Exact clear is idempotent/fenced.
+                runtime_settings.clear_cycle_profile(applied_runtime_profile)
+        elif inflight_at_startup is not None:
+            # New-profile recovery cannot guess which resource/review contract
+            # created an existing cycle.  Fail closed instead of recreating
+            # the original blocker by silently resuming under latest.
+            raise ValueError(
+                "inflight cycle 缺 durable runtime profile binding，拒绝跨配置恢复")
+
+        def bind_runtime_profile_cycle() -> None:
+            runtime_settings.bind_cycle_profile(applied_runtime_profile)
+
+        def clear_runtime_profile_cycle() -> None:
+            runtime_settings.clear_cycle_profile(applied_runtime_profile)
+
+        runtime_profile_cycle_bind = bind_runtime_profile_cycle
+        runtime_profile_cycle_clear = clear_runtime_profile_cycle
+    elif (applied_runtime_profile is not None
+          or runtime_profile_stop_event is not None):
+        raise ValueError("runtime profile monitor 缺 QuestRuntimeSettings")
     if daemon.query_one("SELECT 1 FROM goal LIMIT 1") is None:
         # **仅首次建 goal 才解析 brief**（外审 SHOULD）：重启时 DB goal 权威——若无条件解析，缺失/畸形
         # 的 goal_brief.md 会卡死本可续跑的既有库（与「DB 权威、同 work_root 可恢复」相悖）。
         brief = parse_goal_brief(root / "input" / "goal_brief.md")
         state.create_goal(text=brief["body_md"], predicate_json=brief["predicate_json"])
 
+    # File-side Codex replay assets are a post-DB outbox, not a second truth.
+    # Construct it under the same exact owner fence and repair any previous
+    # terminal-commit -> report/manifest crash gap before publishing a DB/view
+    # recovery pointer or exposing a new Runner.
+    cycle_replay = CycleReplayArchive(
+        work, owner_guard=owner_guard, submission_registry=daemon)
+
     # 若上次崩在 terminal commit / ledger 越线之后、轮后 stop 落库之前，先用恢复安全的预算门补写
     # durable global_stop；随后冻结的 recovery point 才完整包含该轮应有的停机事实。
     stop = StopController(daemon, policy)
     stop.check_before_round()
+
+    # The recovered budget/global-stop decision belongs to the same round-end
+    # recovery point.  Seal the human/replay assets only after that durable
+    # check and still before the SQLite/views snapshot publisher below.
+    cycle_replay.reconcile_sqlite(daemon)
 
     # 再补 DB terminal commit → storage receipt 的崩溃缝，之后才暴露 interaction pump、provider 或新 Runner。
     # 新库此时没有终态 cycle，但会先落原生 genesis；旧库接管会留下明确 adoption 基线而不伪造历史逐轮快照。
@@ -1347,7 +2153,11 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         compiler_conn, policy,
         runtime_environment_hash=(
             execution_sandbox.environment_hash
-            if execution_sandbox is not None else None))
+            if execution_sandbox is not None else None),
+        runtime_execution_backend=(
+            getattr(execution_sandbox, "backend_name", "docker")
+            if execution_sandbox is not None else None),
+        replay_archive=cycle_replay)
     publisher = SqliteStatusPublisher(publisher_conn, policy=policy,
                                       out_path=str(work / "state" / "status_card.json"))
     console = Console(daemon, policy=policy)
@@ -1357,26 +2167,38 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     file_requests = FileRequestService(daemon, schemas, policy, input_root=str(work / "input"))
     system_prompt = (root / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
     skills = {s: (root / "prompts" / "skills" / s / "SKILL.md").read_text(encoding="utf-8") for s in _STAGES}
+    skills["bundle_operator"] = (
+        root / "prompts" / "skills" / "bundle_operator" / "SKILL.md"
+    ).read_text(encoding="utf-8")
     base_rf = runner_factory or (lambda transcripts_dir, purpose_tag:
-                                 CodexRunner(
-                                     transcripts_dir=transcripts_dir,
-                                     purpose_tag=purpose_tag,
-                                     # Qualification workers of every stage get
-                                     # only inline ContextPacks.  The existing
-                                     # cross-UID query mode remains unchanged
-                                     # for ordinary work roots.
-                                     tool_free=(qualification is None and purpose_tag in {
-                                         "interaction-query",
-                                         "adapter-generation",
-                                         "adapter-review",
-                                     }),
-                                     no_host_tools=qualification is not None,
-                                     execution_supervisor=execution_supervisor))
+                                 _default_stage_runner(
+                                     transcripts_dir, purpose_tag, work=work,
+                                     qualification=qualification,
+                                     execution_supervisor=execution_supervisor,
+                                     runtime_mcp_broker=runtime_mcp_broker))
+    bundle_operator_mode = _bundle_operator_mode_for_runtime(
+        runner_factory,
+        deployment_mode=policy["deployment"]["mode"],
+        qualification_active=qualification is not None)
+    resident_stage_sessions = _resident_stage_sessions_for_runtime(
+        runner_factory, qualification_active=qualification is not None)
+    require_persistent_session_capabilities = (
+        bundle_operator_mode or resident_stage_sessions)
 
     def rf(transcripts_dir, purpose_tag):  # noqa: ANN001, ANN202 - injection boundary
         owner_guard()
         runner = base_rf(transcripts_dir, purpose_tag)
-        return _GuardedRunner(runner, owner_guard)
+        return _GuardedRunner(
+            runner, owner_guard,
+            require_persistent_session_capabilities=(
+                require_persistent_session_capabilities))
+    if bundle_operator_mode:
+        # StageProvider validates both this factory declaration and every
+        # returned runner instance, catching an injected factory which changes
+        # capability after assembly.
+        rf.bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
+    if resident_stage_sessions:
+        rf.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
     if repository_materializer is not None:
         repository_materializer.bind_adapter_generator(
             AdapterGenerationService(
@@ -1397,7 +2219,10 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     query_responder = CodexQueryResponder(
         runner_factory=rf,
         validator=schemas.validator("interaction_reply_candidate"),
-        system_prompt=system_prompt,
+        # 讲解员不复用研究 worker 的长系统提示；权限边界由
+        # tool-free Runner 机械保证，此处只保留面向用户的回答职责。
+        system_prompt=(root / "prompts" / "narrator_system_prompt.md").read_text(
+            encoding="utf-8"),
         skill=(root / "prompts" / "skills" / "interaction_query" / "SKILL.md").read_text(
             encoding="utf-8"),
         work_root=str(work),
@@ -1479,6 +2304,11 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     def precheck(cyc=None) -> Optional[str]:
         if qualification is not None:
             qualification.assert_research_open()
+        if runtime_profile_monitor is not None:
+            runtime_reason = runtime_profile_monitor.probe(
+                safe_cycle_boundary=state.inflight_cycle() is None)
+            if runtime_reason is not None:
+                return runtime_reason
         sync_interactions(cyc)                # 两个信任域独立 cursor；console 始终先推进
         if inbox_ingest.has_pending or connector_inbox.has_pending:
             # Spool 是人类动作的到达顺序。队首 retry/sidecar 损坏/下一批 backlog 未排空时，不能先消费
@@ -1488,6 +2318,12 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         reason = base_precheck(cyc)            # 再消费到期 directive + 查阻断（pause / 文件请求全局等待）
         sync_notifications()                   # 动作/消费后的真实状态立即派生通知（emit 幂等）
         return reason
+
+    def runtime_profile_boundary_probe() -> Optional[str]:
+        if runtime_profile_monitor is None:
+            return None
+        return runtime_profile_monitor.probe(
+            safe_cycle_boundary=state.inflight_cycle() is None)
 
     # sidecar→文件请求桥（步⑧ CP8.5）：阶段产 resource_request.json → interaction_request(pending) →
     # StageBlockedOnResources → run_cycles 干净停 → precheck 全局等待；用户 resolve 到 input/user_provided/
@@ -1503,31 +2339,66 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
 
     provider = StageProvider(runner_factory=rf, schemas=schemas, policy=policy,
                              system_prompt=system_prompt, skills=skills, work_root=str(work),
-                             file_request_bridge=file_request_bridge, cost_ledger=cost_ledger)
+                             file_request_bridge=file_request_bridge, cost_ledger=cost_ledger,
+                             replay_archive=cycle_replay,
+                             wildidea_adapter=wildidea_adapter,
+                             require_wildidea_provider_binding=(
+                                 wildidea_adapter is not None and runner_factory is None),
+                             # One cycle-scoped engineering thread now spans
+                             # bundle/smoke/train/eval in every deployment for
+                             # the active runtime tool profile. Qualification
+                             # remains inline-only and rechecks its research-open
+                             # seal on every turn; injected runners require the
+                             # exact contract above.
+                             # Manifest execution, guardian supervision, gates
+                             # and single-writer SQL ownership are unchanged.
+                             bundle_operator_mode=bundle_operator_mode,
+                             bundle_operator_guard=(
+                                 None if qualification is None
+                                 else qualification.assert_research_open),
+                             inline_subagent_review=(
+                                 resident_stage_sessions and qualification is None),
+                             resident_stage_sessions=resident_stage_sessions,
+                             idea_audit_pack_builder=(
+                                 (lambda cycle_id: compiler.render_idea_audit_source(
+                                     cycle_id=cycle_id))
+                                 if wildidea_adapter is not None else None))
 
     attack_stages = attack if isinstance(attack, AttackStages) else None
     import_worker = None
     if attack_stages is not None:
         attack_stages.bind_owner_guard(owner_guard)
     if attack is True:
-        # attack 全家（步⑧ CP8.4）：正式 gate 通道 + manifest 驱动真执行 + 真 Codex 双评审。
+        # attack 全家：正式核心 gate + manifest 真执行。Idea/Plan/Bundle 的评审
+        # 已由各阶段主 Codex 在同一 turn/session 内启动独立子智能体完成；
+        # 编排器不再额外调用 reviewer 或解释/搬运 reviewer 反馈。
         # 判据读连接各司其职：gate 家族走 open_gate_read_conn（authorizer 拒观测 9 表——判据隔离）；
         # parser_suspect 须读 execution_observation → 走 open_responder_read_conn（mode=ro 全写拒，可读全表）。
         pool_conn = track_connection(open_gate_read_conn(db_path))
         obs_conn = track_connection(open_responder_read_conn(db_path))
         close_conn = track_connection(open_gate_read_conn(db_path))
-        pool_gate = PoolGate(daemon, pool_conn)
+        reuse_conn = track_connection(open_responder_read_conn(db_path))
+        OP.register_parser_suspect_real(
+            reuse_conn, obs_conn, policy["observation"])
+        # One owner-fenced publisher is the filesystem authority for this exact
+        # work root.  Gate re-verification and AttackStages publication must use
+        # the same object; constructing an unfenced second publisher would split
+        # the publication/registration capability across owner lifetimes.
+        pool_publisher = PoolPublisher(work, owner_guard=owner_guard)
+        pool_gate = PoolGate(
+            daemon, pool_conn,
+            pool_publisher=pool_publisher,
+            require_formal_publication=True,
+            require_code_review=False,
+            require_result_review=False)
         close_gate = SqliteGate(daemon, close_conn, schemas,
                                 parser_suspect=lambda aid: OP.suspect_for_attempt(
                                     obs_conn, aid, policy["observation"]))
         judge = JudgeProvider(
             runner_factory=rf, schemas=schemas, policy=policy, system_prompt=system_prompt,
             skill=(root / "prompts" / "skills" / "judge" / "SKILL.md").read_text(encoding="utf-8"),
-            daemon=daemon, work_root=str(work), cost_ledger=cost_ledger)
-        plan_reviewer = PlanReviewProvider(
-            runner_factory=rf, schemas=schemas, policy=policy,
-            system_prompt=system_prompt, skill=skills["plan"], daemon=daemon,
-            work_root=str(work), cost_ledger=cost_ledger)
+            daemon=daemon, work_root=str(work), cost_ledger=cost_ledger,
+            replay_archive=cycle_replay)
         repo_search = (import_search_provider
                        if import_search_provider is not None
                        else GitHubRepoSearchProvider(policy["import_search"]))
@@ -1547,18 +2418,36 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         import_control = ImportTriggerRouter(
             new_structure=import_search,
             trusted_triggers=trusted_import_triggers)
+        attack_providers = {
+            "idea": provider.idea,
+            "plan": provider.plan,
+            "bundle": provider.bundle,
+            "reasoning": provider.reasoning,
+            "import_search": import_control,
+        }
         attack_stages = AttackStages(
             state=state, compiler=compiler, pool_gate=pool_gate, close_gate=close_gate,
-            providers={"idea": provider.idea, "plan": provider.plan, "bundle": provider.bundle,
-                       "plan_review": plan_reviewer, "judge": judge,
-                       "reasoning": provider.reasoning,
-                       "import_search": import_control},
+            providers=attack_providers,
             obs_policy=policy["observation"], work_root=str(work), schemas=schemas, policy=policy,
             owner_guard=(owner_guard if instance_lease is not None else None),
             execution_supervisor=execution_supervisor,
             execution_sandbox=execution_sandbox,
             execution_sandbox_resolver=dependency_image_builder,
-            qualification_firewall=qualification)
+            qualification_firewall=qualification,
+            reuse_conn=reuse_conn,
+            pool_publisher=pool_publisher)
+        if runtime_ingest_service is not None:
+            attack_stages.enable_resident_plan_session()
+            runtime_ingest_service.bind_plan_controller(attack_stages)
+            attack_stages.enable_resident_reasoning_session()
+            runtime_ingest_service.bind_reasoning_controller(attack_stages)
+            attack_stages.enable_resident_bundle_session()
+            runtime_ingest_service.bind_bundle_controller(attack_stages)
+        # Appended after broker/SQLite connections so reverse-order shutdown
+        # joins Bundle's post-command gate/publication thread before either
+        # capability is closed.  A failed join keeps this closer and therefore
+        # the instance lease available for a retry.
+        resource_closers.append(attack_stages.close)
         import_worker = ImportWorker(
             state=state, pool_gate=pool_gate,
             providers={
@@ -1572,11 +2461,22 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             execution_supervisor=execution_supervisor,
             execution_sandbox=execution_sandbox,
             execution_sandbox_resolver=dependency_image_builder)
+    elif attack_stages is not None:
+        # Trusted diagnostic assemblies that inject an already constructed
+        # AttackStages still transfer its worker lifecycle to System.
+        resource_closers.append(attack_stages.close)
+
+    def reconcile_cycle_storage() -> None:
+        # Report/handoff closure must exist before the DB backup/views pointer
+        # for that terminal cycle is published.  Both calls are idempotent and
+        # startup invokes the same ordering after a crash.
+        cycle_replay.reconcile_sqlite(daemon)
+        cycle_snapshots.reconcile()
 
     advancer = SqliteAdvancer(state, compiler, provider.reasoning, attack=attack_stages,
                               status_publisher=publisher, precheck=precheck, stop_controller=stop,
                               import_worker=import_worker,
-                              storage_reconciler=cycle_snapshots.reconcile)
+                              storage_reconciler=reconcile_cycle_storage)
     owner_guard()
     if instance_lease is not None:
         instance_lease.set_state("ready", activity="assembly-complete")
@@ -1599,6 +2499,14 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                   execution_supervisor=execution_supervisor,
                   deployment_receipt=deployment_receipt,
                   resource_closers=resource_closers,
+                  runtime_profile_boundary_probe=runtime_profile_boundary_probe,
+                  runtime_profile_revision=applied_runtime_revision,
+                  runtime_profile_record_sha256=applied_runtime_digest,
+                  runtime_profile_stop_event=runtime_profile_stop_event,
+                  runtime_profile_cycle_bind=runtime_profile_cycle_bind,
+                  runtime_profile_cycle_clear=runtime_profile_cycle_clear,
+                  stage_shutdown_fence=(
+                      None if attack_stages is None else attack_stages.begin_close),
                   research_open_guard=(
                       None if qualification is None else qualification.assert_research_open))
 
@@ -1607,7 +2515,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="meta-research 全自动元循环入口（M6 CP7.3；reasoning-only 闭环）")
     ap.add_argument("--system-root", required=True, help="仓库根（含 input/policies/prompts/schemas）")
     ap.add_argument("--work-root", required=True, help="运行产物根（research.sqlite 落此，重启同目录即续跑）")
-    ap.add_argument("--max-cycles", type=int, default=100, help="本次最多推进轮数（安全上限，与 τ 自终止并存）")
+    ap.add_argument(
+        "--max-cycles", type=_nonnegative_cycle_limit, default=100,
+        help="本次最多推进轮数（非负安全上限；0 仅作零轮预检，与 τ 自终止并存）")
     lifetime = ap.add_mutually_exclusive_group()
     lifetime.add_argument(
         "--once", action="store_true",
@@ -1618,6 +2528,15 @@ def main(argv: Optional[List[str]] = None) -> int:
               "排空已接纳交互并正常退出"))
     ap.add_argument("--poll-interval-s", type=float, default=1.0,
                     help="常驻等待时 ingest spool / 扫描 reminder 的轮询秒数（默认 1.0）")
+    ap.add_argument(
+        "--quest-id",
+        help="Web registry 已核验的 quest identity；省略时保持 legacy/base-policy 运行")
+    ap.add_argument(
+        "--runtime-profile-revision", type=int,
+        help="manager 在 spawn 前捕获的 task runtime revision")
+    ap.add_argument(
+        "--runtime-profile-record-sha256",
+        help="manager 在 spawn 前捕获的 task runtime record hash")
     outbound = ap.add_mutually_exclusive_group()
     outbound.add_argument(
         "--connector-profile",
@@ -1636,11 +2555,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         except (ConnectorConfigError, OSError) as error:
             print(f"[run] connector 配置失败：{error}；离线运行须显式加 --no-outbound", file=sys.stderr)
             return 2
+    runtime_profile_stop_event = (
+        threading.Event() if args.quest_id is not None else None)
+    profile_kwargs: Dict[str, Any] = {}
+    if args.quest_id is not None:
+        profile_kwargs = {
+            "quest_id": args.quest_id,
+            "expected_runtime_profile_revision": args.runtime_profile_revision,
+            "expected_runtime_profile_record_sha256": (
+                args.runtime_profile_record_sha256),
+            "runtime_profile_stop_event": runtime_profile_stop_event,
+        }
+    elif (args.runtime_profile_revision is not None
+          or args.runtime_profile_record_sha256 is not None):
+        ap.error("runtime profile revision/hash 要求 --quest-id")
     try:
-        system = build_system(args.system_root, args.work_root, outbound_config=outbound_config)
+        system = build_system(
+            args.system_root, args.work_root,
+            outbound_config=outbound_config, **profile_kwargs)
+    except RuntimeProfileRestartRequired as error:
+        print(f"[run] runtime profile 受控换代：{error}", file=sys.stderr)
+        return 75
     except (
             InstanceLeaseError, DeploymentPreflightError,
-            QualificationFirewallError) as error:
+            QualificationFirewallError, RuntimeSettingsCorruptError,
+            ValueError) as error:
         print(f"[run] 启动预检失败：{error}", file=sys.stderr)
         return 2
     deployment_receipt = getattr(system, "deployment_receipt", None)
@@ -1658,13 +2597,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.once:
                 ids = system.run(args.max_cycles)
             elif args.exit_after_research:
-                ids = system.run_forever(
-                    args.max_cycles,
-                    poll_interval_s=args.poll_interval_s,
-                    linger_after_terminal=False,
-                )
+                resident_kwargs: Dict[str, Any] = {
+                    "poll_interval_s": args.poll_interval_s,
+                    "linger_after_terminal": False,
+                }
+                if runtime_profile_stop_event is not None:
+                    resident_kwargs["stop_event"] = runtime_profile_stop_event
+                ids = system.run_forever(args.max_cycles, **resident_kwargs)
             else:
-                ids = system.run_forever(args.max_cycles, poll_interval_s=args.poll_interval_s)
+                resident_kwargs = {"poll_interval_s": args.poll_interval_s}
+                if runtime_profile_stop_event is not None:
+                    resident_kwargs["stop_event"] = runtime_profile_stop_event
+                ids = system.run_forever(args.max_cycles, **resident_kwargs)
         except KeyboardInterrupt:
             shutdown_errors = []
             hard_stop = bool(getattr(system, "_hard_stop_requested", False))
@@ -1713,8 +2657,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             # 停因优先级（外审 SHOULD）：τ 自终止 > precheck 阻断（pause/文件请求）> 正常收尾——阻断对运维判断
             # 关键，不能被 idle 掩盖
-            reason = (system.last_stop_reason or system.advancer.last_block_reason
-                      or ("prior-terminate/idle" if not ids else "max_cycles/terminate"))
+            if args.max_cycles == 0:
+                # Production acceptance deliberately uses a zero-round owner to
+                # prove deployment prerequisites.  It says nothing about the
+                # persisted research intent, so never label it terminate/idle.
+                reason = "zero-cycle-preflight"
+            else:
+                reason = system.last_stop_reason or system.advancer.last_block_reason
+                if reason is None:
+                    reason = (
+                        "max_cycles_reached"
+                        if len(ids) >= args.max_cycles
+                        else "prior-terminate/idle")
             print(f"[run] dual_mode={system.dual_mode} 推进 {len(ids)} 轮：{ids}；停因={reason}")
             exit_code = 0
     finally:

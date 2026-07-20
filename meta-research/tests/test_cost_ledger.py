@@ -25,7 +25,11 @@ from orchestrator.stopcontroller import StopController
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
-POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))   # price_per_1k_tokens=0.3
+_BASE_POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+# Production currently runs with the global cost guard disabled.  This suite
+# exercises the enabled/fail-closed contract explicitly instead of inheriting
+# that deployment choice.
+POLICY = {**_BASE_POLICY, "budget": {**_BASE_POLICY["budget"], "session_max": 100000}}
 SCHEMAS = SchemaSet(SYSTEM_ROOT / "schemas")
 _IDEA = json.loads((SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "idea_set" / "wildidea.json").read_text(encoding="utf-8"))
 _SKILLS = {s: f"[{s}]" for s in ("idea", "plan", "bundle", "reasoning")}

@@ -20,6 +20,20 @@ SYSTEM_ROOT = Path(__file__).resolve().parent.parent            # meta-research/
 REFERENCE = SYSTEM_ROOT.parent / "reference" / "第一部分-系统架构设计.md"
 
 
+def test_migration_locator_supports_wheel_share_layout(tmp_path, monkeypatch):
+    package = tmp_path / "site" / "orchestrator"
+    package.mkdir(parents=True)
+    installed = (
+        tmp_path / "site" / "share" / "meta-research"
+        / "db" / "migrations" / "0001_appendix_a.sql")
+    installed.parent.mkdir(parents=True)
+    installed.write_text("-- installed migration\n", encoding="utf-8")
+    monkeypatch.delenv("META_RESEARCH_SYSTEM_ROOT", raising=False)
+    monkeypatch.setattr(db, "__file__", str(package / "database.py"))
+    monkeypatch.setattr(db.sysconfig, "get_path", lambda _name: str(tmp_path / "other"))
+    assert db._resolve_migration_file() == installed.resolve()
+
+
 # ---- 正向：建库与计数 ------------------------------------------------------
 def test_fresh_build_counts_and_version():
     conn = db.connect(":memory:")

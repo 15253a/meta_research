@@ -25,7 +25,10 @@ from orchestrator.stopcontroller import StopController
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
-POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+_BASE_POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+# Runtime ceiling mutation is tested in the armed mode even though the current
+# production policy deliberately starts with the global cost guard disabled.
+POLICY = {**_BASE_POLICY, "budget": {**_BASE_POLICY["budget"], "session_max": 100000}}
 
 
 @pytest.fixture()

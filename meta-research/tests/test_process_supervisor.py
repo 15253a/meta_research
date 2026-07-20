@@ -78,6 +78,43 @@ def test_success_nonzero_env_stdin_cwd_pass_fd_and_private_receipt(tmp_path):
     supervisor.close()
 
 
+def test_resident_stage_is_owner_lifecycle_bound_and_close_cancels_it(tmp_path):
+    supervisor = _supervisor(tmp_path, grace=0.08)
+    with pytest.raises(ValueError, match="仅 codex-resident-stage"):
+        supervisor.run(
+            [sys.executable, "-c", "pass"], capture_output=True,
+            timeout_s=None, kind="probe")
+
+    caught = []
+
+    def invoke() -> None:
+        try:
+            supervisor.run(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                capture_output=True, timeout_s=None,
+                kind="codex-resident-stage")
+        except BaseException as error:
+            caught.append(error)
+
+    thread = threading.Thread(target=invoke, name="resident-stage-test")
+    thread.start()
+    deadline = time.monotonic() + 3
+    while supervisor.active_count == 0:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    supervisor.close(timeout_s=3)
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert len(caught) == 1 and isinstance(caught[0], ExecutionCancelled)
+    receipt = caught[0].receipt
+    assert receipt["kind"] == "codex-resident-stage"
+    assert receipt["timeout_s"] is None
+    # Cancellation may win before the guardian publishes its running receipt;
+    # in either state no wall-clock deadline may appear.
+    assert receipt.get("deadline_at_unix") is None
+    assert receipt["outcome"] == "cancelled"
+
+
 def test_timeout_kills_double_fork_setsid_descendant_that_ignores_term(tmp_path):
     marker = tmp_path / "late-marker"
     ready = tmp_path / "daemon-ready"
@@ -177,6 +214,48 @@ def test_hard_stop_cancels_registered_guardian_and_rejects_future_spawn(tmp_path
     finally:
         supervisor.close()
         _reset_global_hard_stop_for_tests()
+
+
+def test_progress_observer_cancel_drains_guardian_and_keeps_supervisor_reusable(
+        tmp_path):
+    supervisor = _supervisor(tmp_path, grace=0.08)
+    ready = tmp_path / "observer-cancel-ready"
+    observations = []
+
+    def observer():
+        observations.append(time.monotonic())
+        return ready.exists()
+
+    try:
+        with pytest.raises(ExecutionCancelled) as caught:
+            supervisor.run(
+                [sys.executable, "-c",
+                 "import signal,sys,time; "
+                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                 "open(sys.argv[1],'wb').close(); time.sleep(30)",
+                 str(ready)],
+                capture_output=True, timeout_s=30, kind="probe",
+                progress_observer=observer, progress_interval_s=0.05)
+
+        receipt = caught.value.receipt
+        persisted = json.loads(caught.value.receipt_path.read_text())
+        assert observations and ready.exists()
+        assert receipt["state"] == "terminal"
+        assert receipt["outcome"] == "cancelled"
+        assert receipt["group_drained"] is True
+        assert receipt["term_sent"] is True and receipt["kill_sent"] is True
+        assert persisted == receipt
+        assert supervisor.active_count == 0
+
+        successor = supervisor.run(
+            [sys.executable, "-c", "print('successor-ran')"],
+            capture_output=True, timeout_s=2, kind="probe")
+        assert successor.returncode == 0
+        assert successor.stdout == b"successor-ran\n"
+        assert successor.receipt["state"] == "terminal"
+        assert successor.receipt["group_drained"] is True
+    finally:
+        supervisor.close()
 
 
 @pytest.mark.parametrize("ignored", [True, False])

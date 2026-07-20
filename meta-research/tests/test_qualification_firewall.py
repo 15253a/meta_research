@@ -1,6 +1,7 @@
 """CP11.4c.3c.1 sealed-holdout / fold / one-shot firewall attacks."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ from orchestrator.qualification_firewall import (
     publish_claim_boundary,
     publish_claim_lock,
 )
+from orchestrator.schemas import SchemaSet
 from orchestrator.storage_governance import CycleSnapshotPublisher
 
 
@@ -739,9 +741,10 @@ def test_qualification_rejects_custom_runner_and_post_claim_startup_before_docke
     work = tmp_path / "work"
     contract = _t1_contract(tmp_path)
     install_contract(work, contract)
-    policy = _policy(contract)
+    policy = copy.deepcopy(POLICY)
     assembly = {
-        "root": SYSTEM_ROOT, "work": work, "policy": policy, "schemas": None,
+        "root": SYSTEM_ROOT, "work": work, "policy": policy,
+        "schemas": SchemaSet(SYSTEM_ROOT / "schemas"),
         "attack": False, "outbound_config": None,
         "import_search_provider": None, "reference_snapshot_provider": None,
         "instance_lease": None, "resource_closers": [],
@@ -757,6 +760,58 @@ def test_qualification_rejects_custom_runner_and_post_claim_startup_before_docke
     assembly["attack"] = True
     with pytest.raises(QualificationClaimLockedError, match="claim boundary"):
         run_module._assemble_system(**assembly, runner_factory=None)
+
+
+def test_qualification_contract_narrows_arbitrary_base_mount_policy(
+        tmp_path, monkeypatch):
+    work = tmp_path / "work-derived-policy"
+    contract_root = tmp_path / "contract-data"
+    contract_root.mkdir()
+    contract = _t1_contract(contract_root)
+    install_contract(work, contract)
+    arbitrary = str(tmp_path / "base-policy-wide-path")
+    base_policy = copy.deepcopy(POLICY)
+    base_policy["execution"]["path_allowlist"] = [arbitrary]
+    base_policy["execution"]["sandbox"]["readonly_mounts"] = [arbitrary]
+    expected = [item["path"] for item in contract["mounts"]]
+    observed = {}
+    load_calls = []
+    real_load = run_module.load_qualification_firewall
+
+    def counted_load(root, *, policy, require_research_uid):
+        load_calls.append((Path(root), policy, require_research_uid))
+        return real_load(
+            root, policy=policy,
+            require_research_uid=require_research_uid)
+
+    class PolicyObserved(Exception):
+        pass
+
+    class CaptureSandbox:
+        def __init__(self, *, config, qualification_firewall, **_kwargs):
+            observed["readonly_mounts"] = list(config["readonly_mounts"])
+            observed["firewall"] = qualification_firewall
+
+        def preflight(self):
+            raise PolicyObserved
+
+    monkeypatch.setattr(
+        run_module, "load_qualification_firewall", counted_load)
+    monkeypatch.setattr(run_module, "DockerExecutionSandbox", CaptureSandbox)
+    with pytest.raises(PolicyObserved):
+        run_module._assemble_system(
+            root=SYSTEM_ROOT, work=work, policy=base_policy,
+            schemas=SchemaSet(SYSTEM_ROOT / "schemas"),
+            runner_factory=None, attack=True, outbound_config=None,
+            import_search_provider=None, reference_snapshot_provider=None,
+            instance_lease=None, resource_closers=[])
+
+    assert observed["readonly_mounts"] == expected
+    assert arbitrary not in observed["readonly_mounts"]
+    assert observed["firewall"].contract_sha256.startswith("sha256:")
+    assert base_policy["execution"]["path_allowlist"] == [arbitrary]
+    assert base_policy["execution"]["sandbox"]["readonly_mounts"] == [arbitrary]
+    assert load_calls == [(work, None, True)]
 
 
 def test_already_assembled_system_rechecks_boundary_before_advancing(tmp_path):

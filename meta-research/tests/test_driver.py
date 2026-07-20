@@ -1,7 +1,7 @@
 """CP1.4 驱动器单测：用 ScriptedRunner（照本宣科的假 Runner）测元循环接线，不花 token。
 
 覆盖：bootstrap→attack happy path（route 特化/假执行标记/收口/terminate）、
-plan 评审两轮不过（阶段失败=轮正常收尾）、sidecar 摘出（M0 桩语义）。
+plan 评审单轮不过（阶段失败=轮正常收尾）、sidecar 摘出（M0 桩语义）。
 真 codex 端到端属 M0 验收（scripts/run_m0_acceptance.py），不在单测内。
 """
 import json
@@ -52,7 +52,7 @@ IDEA_DRAFT = {
         "assumptions": ["协方差近似相等"],
         "min_falsifiable_experiment": "固定划分训练并测 accuracy，<0.90 证伪",
         "novelty_type": "表征结构",
-        "novelty_status": "联网粗查已启用·文献级待人工验证",
+        "novelty_status": "联网查重未启用·文献级待验证",
     }],
     "novelty_refs": [],
 }
@@ -72,7 +72,8 @@ PLAN_BUILD = {
     "reuse_evidence": [],
     "targets": [{
         "target_key": "t1", "target_kind": "build", "seq": 1, "critical": True,
-        "budget_estimate": 1.0, "spec_md": "构建逻辑回归基线并出厂评估",
+        "budget_estimate": 1.0, "gpu_required": False,
+        "spec_md": "构建逻辑回归基线并出厂评估",
         "claim": {"canonical_key": "logreg-gauss2d", "slug": "logreg-gauss2d"},
     }],
     "protocol": {"name": "toy-gauss-cls", "version": 1,
@@ -128,15 +129,20 @@ def test_driver_happy_path_two_cycles(tmp_path):
     assert "synthetic=True" in reasoning_pack.anchor_md
 
 
-def test_driver_plan_review_exhausted_is_normal_close(tmp_path):
+def test_driver_single_plan_review_failure_repairs_once_then_continues(tmp_path):
     script = [
         (BOOTSTRAP_FILES, ""),
         ({"idea_set.draft.json": IDEA_DRAFT}, ""),
         ({"idea_audit.json": IDEA_AUDIT}, ""),
         ({"plan.json": PLAN_BUILD}, ""),
         (REVIEW_FAIL, ""),
-        ({"plan.json": PLAN_BUILD}, ""),
-        (REVIEW_FAIL, ""),                                  # 两轮上限
+        ({"plan.json": {
+            **PLAN_BUILD,
+            "targets": [{
+                **PLAN_BUILD["targets"][0],
+                "spec_md": "按独立评审意见补齐 required metric 映射后训练线性 toy 基线",
+            }],
+        }}, ""),
         ({"tree_ops.json": {"ops": []},
           "selection.json": {"next_question_id": "q1", "next_intent": "attack", "scores": []}}, "无证据收尾"),
     ]
@@ -145,7 +151,8 @@ def test_driver_plan_review_exhausted_is_normal_close(tmp_path):
     assert d.state.cycles["c2"].status == "done"            # 阶段失败 = 研究轮正常收尾（§4.2.3）
     assert d.state.questions["q1"].status == "inconclusive"
     assert d.state.questions["q1"].visit_count == 1
-    assert not (tmp_path / "cycles/c2/artifacts/plan.json").exists()   # 评审未过不入库
+    assert (tmp_path / "cycles/c2/artifacts/plan.json").exists()
+    assert any(item["type"] == "plan_review_repair" for item in d.state.decisions)
 
 
 def test_driver_decompose_round(tmp_path):
@@ -185,7 +192,7 @@ PLAN_EVAL_ONLY = {
     "reuse_evidence": [],
     "targets": [{
         "target_key": "t1", "target_kind": "eval", "seq": 1, "critical": True,
-        "budget_estimate": 0.5, "spec_md": "免训练补测",
+        "budget_estimate": 0.5, "gpu_required": False, "spec_md": "免训练补测",
         "eval_action": "create_evaluation", "attempt_purpose": "protocol_upgrade",
         "eval_key": "up-1", "evaluation_source": "protocol_upgrade",
         "claim": {"baseline_ref": "existing-family", "variant_key": "base"},

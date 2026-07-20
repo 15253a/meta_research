@@ -194,6 +194,52 @@ def test_harness_recovers_drained_exit_partial_for_exact_owner(tmp_path, monkeyp
     assert not (tmp_path / "eval.log.partial").exists()
 
 
+def test_harness_repair_attempt_ignores_archived_legacy_smoke_receipt(tmp_path):
+    receipt_dir = tmp_path / "state" / "executions"
+    supervisor = H.ExecutionSupervisor.standalone(receipt_dir)
+    smoke = tmp_path / "target" / "smoke"
+    legacy_context = {
+        "reconcile_protocol": "execution-owner-v1",
+        "db_owner_kind": "build_target",
+        "db_owner_id": 7,
+        "cycle_id": "c1",
+        "build_target_id": 7,
+        "phase": "smoke",
+    }
+    try:
+        H.run_staged(
+            [sys.executable, "-c", "print('rejected implementation')"],
+            staging_dir=str(smoke), log_name="smoke-1.log", timeout_s=2,
+            execution_supervisor=supervisor, execution_kind="manifest-smoke",
+            execution_context=legacy_context)
+        archive = tmp_path / "target" / "repairs" / "r1" / "smoke"
+        archive.parent.mkdir(parents=True)
+        smoke.rename(archive)
+        smoke.mkdir()
+
+        replacement_context = {**legacy_context, "execution_attempt": 2}
+        assert H.recover_staged_result(
+            staging_dir=str(smoke), log_name="smoke-1.log",
+            execution_supervisor=supervisor, execution_kind="manifest-smoke",
+            execution_context=replacement_context) is None
+
+        second = H.run_staged(
+            [sys.executable, "-c", "print('replacement implementation')"],
+            staging_dir=str(smoke), log_name="smoke-1.log", timeout_s=2,
+            execution_supervisor=supervisor, execution_kind="manifest-smoke",
+            execution_context=replacement_context)
+        recovered = H.recover_staged_result(
+            staging_dir=str(smoke), log_name="smoke-1.log",
+            execution_supervisor=supervisor, execution_kind="manifest-smoke",
+            execution_context=replacement_context, recover_completed=True)
+        assert recovered is not None
+        assert recovered["process_receipt"]["context"]["execution_attempt"] == 2
+        assert recovered["log_sha256"] == second["log_sha256"]
+        assert archive.joinpath("smoke-1.log").is_file()
+    finally:
+        supervisor.close()
+
+
 def test_harness_opt_in_revalidates_already_published_completed_log(tmp_path):
     context = {
         "reconcile_protocol": "qualification-final-v1",

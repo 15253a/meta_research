@@ -40,3 +40,5 @@
 - goalbrief.py — 启动输入①解析（§4.6.7 机械校验唯一实现）
 - run.py       — 全系统装配入口（M6：goal_brief→真组件全装配+StageProvider(真 Codex)+StopController+precheck→run_cycles；一条命令全自动，reasoning-only 闭环，attack=CP7.4）
 """
+
+__version__ = "0.1.0"

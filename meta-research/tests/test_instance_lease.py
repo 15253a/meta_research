@@ -872,6 +872,57 @@ def test_system_close_keeps_lease_until_failed_resource_cleanup_is_retried(tmp_p
     replacement.close()
 
 
+def test_system_close_does_not_close_db_behind_live_worker_closer(tmp_path):
+    work = tmp_path / "ordered-close"
+    lease = InstanceLease.acquire(work, heartbeat_interval_s=0.02)
+    calls = []
+
+    def close_db() -> None:
+        calls.append("db")
+
+    def join_bundle_worker() -> None:
+        calls.append("worker")
+        if calls.count("worker") == 1:
+            raise RuntimeError("worker still settling")
+
+    class IdleAdvancer:
+        last_stop_reason = None
+
+    system = System(
+        advancer=IdleAdvancer(), state=None, daemon=None, dual_mode="A",
+        work_root=work, instance_lease=lease,
+        # Reverse shutdown must run worker first, then DB.
+        resource_closers=[close_db, join_bundle_worker])
+    first = system.close()
+    assert isinstance(first, RuntimeError)
+    assert calls == ["worker"]
+    assert lease.closed is False
+
+    assert system.close() is None
+    assert calls == ["worker", "worker", "db"]
+    assert lease.closed is True
+
+
+def test_system_fences_stage_admission_before_guardian_and_db_close(tmp_path):
+    calls = []
+
+    class IdleAdvancer:
+        last_stop_reason = None
+
+    class FakeSupervisor:
+        def close(self, *, timeout_s):
+            assert timeout_s == 10.0
+            calls.append("supervisor")
+
+    system = System(
+        advancer=IdleAdvancer(), state=None, daemon=None, dual_mode="A",
+        work_root=tmp_path, execution_supervisor=FakeSupervisor(),
+        stage_shutdown_fence=lambda: calls.append("stage-fence"),
+        resource_closers=[lambda: calls.append("db")])
+    assert system.close() is None
+    assert calls == ["stage-fence", "supervisor", "db"]
+
+
 def test_build_failure_after_lease_acquisition_releases_owner(tmp_path, monkeypatch):
     work = tmp_path / "failed-build"
     observed_active = []

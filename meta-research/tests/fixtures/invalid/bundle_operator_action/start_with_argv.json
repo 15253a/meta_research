@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "build_target_id": 7,
+  "phase": "train",
+  "event": "start",
+  "action": "start",
+  "execution_owner": {"kind": "run", "id": 11},
+  "plan_slice_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "source_tree_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "subject_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "diagnosis_md": "试图改命令。",
+  "argv": ["python", "train.py"]
+}

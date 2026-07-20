@@ -13,8 +13,11 @@ import yaml
 import conftest
 from orchestrator import database as db
 from orchestrator.compiler_sqlite import SqliteCompiler
+from orchestrator.console import Console
 from orchestrator.interfaces import StageBlockedOnResources
+from orchestrator.question_admission import admission_payload, normalize_question_contract
 from orchestrator.question_progress import INCONCLUSIVE_PROTOCOL
+from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
@@ -27,7 +30,10 @@ def _seed(conn):
       INSERT INTO question(id,parent_id,goal_id,goal_ver,born_goal_ver,text,status,source) VALUES (3,2,1,1,1,'q3 子','active','decompose');
       UPDATE cycle SET active_question_id=3, route='attack' WHERE id=1;
       INSERT INTO answer_applicability(answer_id,goal_id,goal_ver,status,rationale_md) VALUES (1,1,1,'still_applicable','ok');
-      INSERT INTO idea(id,question_id,cycle_id,content_md,status) VALUES (1,3,1,'idea A','candidate');
+      INSERT INTO idea(id,question_id,cycle_id,content_md,novelty_refs_json,audit_score,audit_json,status)
+        VALUES (1,3,1,'idea A','[]',8.0,'{"decision":"pass"}','selected');
+      INSERT INTO card(card_type,ref_id,card_md,src_hash)
+        VALUES ('baseline',1,'q3 子相关 baseline 卡','card-hash');
     """)
     conn.commit()
 
@@ -107,9 +113,98 @@ def test_consumed_note_is_present_in_same_cycle_reasoning_context(comp):
     assert f"db:directive:{directive_id}" in pack.sources
 
 
+def test_reasoning_context_exposes_current_question_predicate_and_admission_audit(comp):
+    contract = {
+        "kind": "evidence_closure_v1",
+        "allowed_evidence": ["evaluation", "child_answer"],
+        "answer_criterion_md": "至少一条预注册成功测量或已回答子题支持肯定结论。",
+        "refute_criterion_md": "预注册成功测量或已回答子题支持否定结论。",
+    }
+    comp.conn.execute(
+        "UPDATE question SET predicate_json=? WHERE id=3",
+        (json.dumps(contract, ensure_ascii=False, sort_keys=True),))
+    payload = admission_payload(
+        qid="q3", operation="add_children", text="q3 子", contract=contract,
+        contract_source="explicit")
+    decision_id = comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (1,3,'agent','question_admission',?)",
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True),)).lastrowid
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c1", stage="reasoning")
+
+    assert "Question 关闭谓词与建题准入合同" in pack.anchor_md
+    assert '"question_id": "q3"' in pack.anchor_md
+    assert '"allowed_evidence": [\n        "evaluation",\n        "child_answer"' in pack.anchor_md
+    assert contract["answer_criterion_md"] in pack.anchor_md
+    assert '"owner": "reasoning/tree_ops -> StateStore question admission"' in pack.anchor_md
+    assert f"db:decision:{decision_id}" in pack.sources
+
+
+def test_reasoning_context_preserves_legacy_default_admission_provenance(comp):
+    normalized_text, contract, source = normalize_question_contract("q3 子", None)
+    assert source == "legacy_default"
+    # StateStore materialises the default into question.predicate_json.  Its
+    # stored shape now looks explicit, so provenance must come from DECISION.
+    comp.conn.execute(
+        "UPDATE question SET predicate_json=? WHERE id=3",
+        (json.dumps(contract, ensure_ascii=False, sort_keys=True),))
+    payload = admission_payload(
+        qid="q3", operation="add_children", text=normalized_text,
+        contract=contract, contract_source="legacy_default")
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (1,3,'agent','question_admission',?)",
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c1", stage="reasoning")
+    assert '"contract_source": "legacy_default"' in pack.anchor_md
+    assert contract["answer_criterion_md"] in pack.anchor_md
+
+
+def test_consumed_question_directive_is_rendered_without_creating_question(comp):
+    daemon = WriteDaemon(comp.conn)
+    console = Console(daemon)
+    inbound = console.handle_inbound(
+        connector="qq", raw_text="注入问题：新假设 H 是否成立？",
+        idempotency_key="compiler-question-request", goal_id=1, goal_ver=1)
+    before = daemon.query_one("SELECT count(*) FROM question")[0]
+    effect = console.consume_directive(
+        directive_id=inbound["directive_id"], cycle_id="c1")
+    assert daemon.query_one("SELECT count(*) FROM question")[0] == before
+
+    pack = comp.render(cycle_id="c1", stage="reasoning")
+    assert "新假设 H 是否成立？" in pack.anchor_md
+    assert '"protocol":"directive-question-request-v1"' in pack.anchor_md
+    assert '"requires_reasoning_predicate":true' in pack.anchor_md
+    assert effect["reasoning_question_request"]["suggested_kind"] == "followup"
+    consumed_decision_id = daemon.query_one(
+        "SELECT consumed_decision_id FROM directive WHERE id=?",
+        (inbound["directive_id"],))[0]
+    assert f"db:decision:{consumed_decision_id}" in pack.sources
+
+
 def test_bundle_requires_target_id(comp):
     with pytest.raises(ValueError, match="target_id 不可为 None"):
         comp.render(cycle_id="c1", stage="bundle")
+
+
+def test_idea_audit_source_contains_only_current_question(comp):
+    """独立判官不能复用含 prior idea/祖先/检索信息的生成包。"""
+    generation = comp.render(cycle_id="c1", stage="idea")
+    assert "idea A" in generation.anchor_md
+    assert "q2 开放" in generation.neighborhood_md
+
+    audit = comp.render_idea_audit_source(cycle_id="c1")
+    assert '"question": "q3 子"' in audit.anchor_md
+    assert "idea A" not in audit.anchor_md
+    assert "q2 开放" not in audit.anchor_md
+    assert audit.neighborhood_md == audit.retrieval_md == ""
+    assert audit.refs == []
+    assert audit.sources == ["db:question:3"]
+    assert len(audit.pack_hash) == 64
 
 
 def test_plan_import_trigger_flags_make_stuck_and_new_structure_mutually_exclusive(comp):
@@ -199,6 +294,32 @@ def test_reasoning_four_regions(comp):
     assert "祖先链" in p.neighborhood_md and "q2" in p.neighborhood_md  # q3 的父 q2
     assert p.retrieval_md == "" and p.refs == []                        # 检索/引用区 CP3.2 填
     assert "采集打分参数" in p.anchor_md
+
+
+def test_plan_context_contains_selected_idea_resources_and_pool_retrieval(comp):
+    """plan cannot derive needs/reuse from an empty pack: expose exact idea + bounded DB pool facts."""
+    p1 = comp.render(cycle_id="c1", stage="plan")
+    p2 = comp.render(cycle_id="c1", stage="plan")
+
+    assert p1.pack_hash == p2.pack_hash and p1.anchor_md == p2.anchor_md
+    assert "本轮 selected idea（plan 的权威科学输入）" in p1.anchor_md
+    assert '"idea_id": "i1"' in p1.anchor_md and '"content_md": "idea A"' in p1.anchor_md
+    assert "计算资源与执行身份（库存不等于授权）" in p1.anchor_md
+    assert f'"gpus": {POLICY["resources"]["gpus"]}' in p1.anchor_md
+    assert "fixed GPU allocation" in p1.anchor_md
+    assert '"policy": "required"' in p1.anchor_md
+    assert '"required_value": true' in p1.anchor_md
+    assert '"allowed_device_indices": [' in p1.anchor_md
+    assert '"planner_selects_physical_device": false' in p1.anchor_md
+
+    assert "检索区：池 / 协议 / 历史测量候选" in p1.retrieval_md
+    assert '"baseline_id": "b1"' in p1.retrieval_md
+    assert '"protocol_id": "p1"' in p1.retrieval_md
+    assert '"metric_result_id": "mr1"' in p1.retrieval_md
+    assert "q3 子相关 baseline 卡" in p1.retrieval_md
+    assert "candidate_only" in p1.retrieval_md
+    assert {"db:idea:1", "db:baseline:1", "db:protocol:1:v1", "db:metric_result:1",
+            "policy:resources", "policy:retrieval"}.issubset(set(p1.sources))
 
 
 def test_reasoning_measurement_refs_expose_exact_gate_id_without_composite_alias(comp):
@@ -670,6 +791,38 @@ def test_bundle_inherits_external_import_environment(comp):
     assert "gpu_required（manifest 须逐字照抄）**: `true`" in pack.anchor_md
     assert "verified dependency image capability" in pack.anchor_md
     assert "db:baseline:2:external-import-environment" in pack.sources
+
+
+def test_bundle_context_network_matches_effective_execution_policy(comp):
+    """Bundle sees the same policy-owned network profile the sandbox runner enforces."""
+    plan_ref = {
+        "target_key": "network-profile", "target_kind": "build", "seq": 3,
+        "protocol_id": 1, "protocol_ver": 1, "config_json": {},
+        "gpu_required": False,
+    }
+    comp.conn.execute(
+        "INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,"
+        "baseline_id,variant_id,eval_key,plan_ref) "
+        "VALUES (5,1,3,'build',3,'pending',1,1,'network-profile',?)",
+        (json.dumps(plan_ref, sort_keys=True),))
+    comp.conn.commit()
+
+    packs = {}
+    for network_mode in ("none", "bridge"):
+        policy = json.loads(json.dumps(POLICY))
+        policy["execution"]["sandbox"]["network_mode"] = network_mode
+        pack = SqliteCompiler(comp.conn, policy).render(
+            cycle_id="c1", stage="bundle", target_id="5")
+        expected_network = (
+            "network=bridge（development-only）"
+            if network_mode == "bridge" else "network=none")
+        assert f"{expected_network}、rootfs=readonly" in pack.anchor_md
+        other = "bridge" if network_mode == "none" else "none"
+        assert f"network={other}" not in pack.anchor_md
+        assert "policy:execution.sandbox.network_mode" in pack.sources
+        packs[network_mode] = pack
+
+    assert packs["none"].pack_hash != packs["bridge"].pack_hash
 
 
 # ============ applicability 徽标（编译器确定性规则）============

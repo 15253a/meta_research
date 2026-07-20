@@ -1,36 +1,80 @@
-# meta-research 元循环系统 —— 运维操作手册
+# meta-research 元循环系统 —— 本机 Web 产品与运维手册
 
 自主研究编排器：一条命令让真 Codex 全自动跑「出题 → 分解 → 建基线/变体 → 训练 → 评估 → 双评审 →
-关问」的研究元循环。**确定性编排器从不推理**（Codex 是无状态阶段工人，只产合 schema 的产物，永不碰
-数据库）；SQLite 是唯一真相（36 表冻结 DDL + 三重锁）；普通受信调用由外部 guardian 管理子孙树，
+关问」的研究元循环。**确定性编排器从不推理**：Idea/Plan/Bundle/Reasoning 由各自的常驻主
+Codex 在一个连续 stage turn 内思考、获取 MCP 即时反馈并修订；模型不直接写数据库，核心状态只由
+编排器消费精确阶段回执后在短事务中提交。SQLite 是唯一真相（36 表冻结 DDL + 三重锁）；普通受信调用由外部 guardian 管理子孙树，
 bundle/import 的不可信代码只进入 exact-pinned Docker sandbox；事务边界可从 DB 无半写恢复，执行边界以耐久
 receipt 证明本机子树与 daemon container 均排空（适用条件与残余边界见 §7）。
 
 > 设计真相唯一在 `../reference/第一部分-系统架构设计.md`；本 README 是**操作面**（怎么跑、怎么配、怎么
 > 观测/干预、边界在哪）。构建历史见仓库根 `ROADMAP.md` / `build_log/`。
-> T1/T2 sealed-holdout/one-shot 使用独立的 [qualification runbook](QUALIFICATION.md)；T1 已机械闭合
+> T1/T2 sealed-holdout/one-shot 的部署方内部边界见 [qualification runbook](QUALIFICATION.md)；它不是
+> 部署后要求研究用户手写数据合同或操作后端路径的使用步骤。T1 已机械闭合
 > A→B→一次性 C（exact sandbox promotion）→root audit/immutable verdict ledger→D 准入链，但科学审核与
 > 真实生产环境的人类终验仍须独立完成，不能由机器回执代签。
 > 目标环境的完整串联、原始证据命名及 `fixed_and_test` 交接见
 > [production acceptance runbook](PRODUCTION_ACCEPTANCE.md)；该 runbook 不是通过证明。
 
+Idea 发散已换为替换时 WildIdea `main` 的最新上游提交
+`6ff66ada15b0047b2e03d229f2e9543c542df598`，并按该 commit 固定；安装和运行不会临时 `git pull`。
+上游 Skill 正文自标的 “v1.3” 只是仓库内文本版本，不作为本系统的版本身份。系统只复用其
+source-first/9 槽/repair→reangle/批次多样性机制。正常 Idea 只有一个顶层主 turn：它调用 Idea-only
+`wildidea_expand` 取 pinned 槽位/阈值，按需调用 `wildidea_search` 取冻结检索回执，然后让一个干净子
+reviewer 评分并直接提交 `idea_set.json`。这两个工具都不启动额外模型；普通路径不再使用两个顶层
+generate/audit 会话或外部 merge。它不生成 WildIdea HTML，也不运行上游联网 helper。
+普通 development/production 阶段会加载本机
+Codex 配置，不批量禁用 shell/apps/plugins/MCP/browser/computer/image/multi-agent，并同时开放 live Web 与
+命令联网；其可写区是一次性 workspace，quest/SQLite/gate/receipt 仍只读，耐久修改继续走信封与门禁。
+adapter/交互应答和 qualification 的显式隔离会话仍只保留 live Web，关闭宿主工具。
+WildIdea 的白名单 provider 会把原始响应与规范化结果写成 quest 内内容寻址快照，并将同一冻结证据回给
+Idea 主 turn 的干净 reviewer、最终 artifact 和 SQLite。
+Codex 的 live Web 仍只作生成侧易失辅助，不能自行提供 P6 hash；受控检索只标记
+“联网粗查已启用·文献级待人工验证”，零命中或模型判断都不会冒充“查重通过”。
+
 ## 0. 一分钟跑起来
 
 ```bash
 cd meta-research
-python -m pip install -r requirements-dev.txt          # pytest / schema / YAML / qualification NumPy+SciPy
+python -m pip install .
 docker pull docker.io/library/python@sha256:f5cf0344c9886ff24d34797578d5d7dd6e8911ae0fe5962bb55d0f89603ec361
-python -m pytest tests/ -q                              # 自验：以当前测试输出为准
-
-# 全自动跑（需真 Codex CLI + 代理，见 §2）：
-export HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890
-# 默认 policy.deployment.mode=development；这能真跑研究链，但不会产生 production-ready 声明。
-# production 还须配置只读 deployment attestation、connectors 与对应 token（见 §3.1 / §4.2）。
-python -m orchestrator.run --system-root . --work-root /path/to/run_dir --max-cycles 50
-
-# 仅离线/测试（明确承认外部通知不会交付）：
-python -m orchestrator.run --system-root . --work-root /tmp/canary --max-cycles 5 --no-outbound
+meta-research
 ```
+
+安装完成后，无论当前目录在哪里都可运行 `meta-research`；源码环境仍可用
+`python -m orchestrator.web_app`。服务会自动打开已认证的 `127.0.0.1` 页面；若桌面环境未能自动打开，启动终端会
+直接显示可复制到本机浏览器的授权链接，不要求用户查找任何后端 capability 文件。该链接等同本机会话凭证，
+不要转发、公开或粘贴到工单/聊天记录。此后用户只在 Web 中完成：新建/切换研究任务、填写目标或选模板、
+提供初始文件、选择本机已有数据集/参考资料目录、查看预检、启动/停止任务、讲解员问答、pause/resume，以及
+运行期文件补交。用户不需要回到后端创建 quest、填写 `source_ref`、编辑 JSON 数据合同或查看日志文件。
+
+初始资料有两种并存入口：小文件可在浏览器选择文件/文件夹，由系统分块校验并托管到只读 corpus；本机已有的
+大数据可在向导填写绝对目录（数据集与参考资料分开），服务以当前本机 UID 做 no-follow 只读枚举，在发布边界
+逐文件 SHA-256，并为普通任务自动派生 host argv 围栏与 Docker 只读挂载。API 只回显目录名称/数量/容量，
+内部绝对路径和清单不会作为浏览器能力返回。目录在发布后发生变化时，下一次启动会在 Web 明确拒绝并显示原因。
+
+默认数据落在当前 Meta-Research 安装目录的 `runtime/`：每个任务独占
+`runtime/quests/<quest-id>/`，跨任务的 Web/创建状态位于 `runtime/state/`。这样代码、任务数据库、cycle、实验产物
+和执行记录跟随同一套本机部署，不会隐式散落到用户主目录。原始大数据仍只按用户选择的原路径只读引用，不复制到
+`runtime/`。只读安装或确需搬迁时可显式使用 `--data-root`（或 `META_RESEARCH_HOME`）改位置。离线本机模式默认
+不投递外部通知；需要 connector 时传 `--connector-profile`。`t1-eeg-universal` 只有在 Web 的部署检查显示“安全评测已就绪”时可选；
+合同、research/evaluator UID、sealed truth 和一次性边界由部署组件内部生成/选择，不能从浏览器提交。科学审核和
+真实目标环境终验仍需独立完成，机器预检不会冒充资格通过。
+
+普通真实 EEG 研究不需要 qualification 合同：选择 Web 中的“本机多数据集 EEG 研究（LODO）”，填写 SEED、
+DREAMER 等数据目录和参考资料目录即可。该模式可真实训练、评估和做 LODO，但会诚实地把 DREAMER 视为普通
+研究数据；只有要声称“整个研究过程从未见过 DREAMER 标签、且只评一次”时，才需要可选的 sealed 评测服务。
+这一区分不会把运维步骤转嫁给研究用户。
+
+当前本机验收部署的资源合同是单卡 80 GiB：`gpus=1`、`gpu_mem_gb=80`、
+`gpu_target_policy=required`，development 选卡面收窄为 `allowed_device_indices=[0..6]`（GPU 7
+不授权）。因此新 plan 的每个 target 必须显式 `gpu_required=true`；编排器不会从
+`gpus` 数字暗推或改写 plan，而是拒绝与显式三态合同冲突的产物。物理 index/UUID 由部署
+从允许集中选取并经 exact DeviceRequest canary 核验，模型不指定卡。`disk_quota_gb=1`
+仍是 quest 工作区/浏览器托管输入的保守基线；Web 选择的本机数据目录原地只读使用，不复制进该额度。
+
+开发者自验可另装 `requirements-dev.txt` 后运行 `python -m pytest tests/ -q`。底层
+`orchestrator.run` / `quest_run` CLI 保留给运维、恢复与隔离测试，不是部署后的普通用户流程。其参数语义如下：
 
 - `--system-root`：含 `input/goal_brief.md`、`policies/`、`prompts/`、`schemas/` 的仓库根（一般就是 `.`）。
 - `--work-root`：本次运行的产物根（`research.sqlite` / `cycles/` / `state/` 落这里）。**重启用同一个
@@ -58,7 +102,8 @@ python -m orchestrator.run --system-root . --work-root /tmp/canary --max-cycles 
 
 若在 Python 内直接调用 `build_system()`，默认同样强制 lease；必须用 `with build_system(...) as system:`，或在
 所有正常/异常分支调用可重试的 `system.close()`。关闭顺序是 listener/pump/delivery、已接纳 query、共享 execution
-supervisor（整树排空 + terminal receipt）、只读/写 DB 连接、heartbeat，最后才释放 flock。close 返回错误必须按
+supervisor（整树排空 + terminal receipt）、Bundle 非 daemon 的 gate/publication 收尾线程、只读/写 DB 连接、
+heartbeat，最后才释放 flock。close 返回错误必须按
 停机异常上报；只要仍有能力或无法证明状态的 guardian 未结束，lease 就会保留供再次 close，不能直接另起同
 work-root 实例；若所有能力已机械消失，历史 worker 错误可在 lease 释放后返回，仅作故障证据。
 `enforce_instance_lease=False` 与自定义 `runner_factory` 只供受信任的隔离测试；后者自行启动的进程不受默认
@@ -89,20 +134,39 @@ predicate_json: {
 
 ## 2. 真 Codex 运行时（工程配置）
 
-真执行走本机 `codex exec` 一次性无状态调用。工程配置走**环境变量**（模型/二进制是工程事实，不进
+真执行走本机 `codex exec`。每个正常 stage 只启动一个连续进程/turn；runtime MCP 在该 turn 内做只读预检、
+阶段提交和 Bundle 执行反馈。耐久 provider id 只用于宿主进程灾难恢复；超时且未观测到 id 时 fail closed，
+不会新建会话重试。工程配置走**环境变量**（模型/二进制是工程事实，不进
 `policy.yaml` 旋钮注册表）：
+
+常驻阶段与 runtime MCP 的关键边界是：
+
+- Idea 的 WildIdea 扩展/检索是 Idea-only 数据工具，不启动额外模型；Idea/Plan/Bundle 各在主 turn 内
+  启动恰好一个干净 reviewer，强度为 1。Bundle 的 code/result 审查复用同一子会话。
+- review 强度非零时，`submit_stage_artifact` 会机械要求当前 live stage/target/purpose 已有对应
+  `record_review` 回执；缺失错误直接回到同一个主 turn。该门只核评审确已记录，不启动另一个模型、也不替
+  主智能体解释或改写 reviewer 意见。
+- Plan 在最终提交前调用只读 `preflight_plan`；它不写 DB，也不预占 baseline。旧
+  `register_baseline` 能力已移除；真正 claim 只在编排器消费已提交 Plan 回执的核心 gate 事务中发生。
+- Bundle 提交完整包后把 exact submission receipt 交给 `bundle_execute`，用 `bundle_status` 读权威进度，并在
+  当前 turn 内修包重跑；只有冻结计划本身不可执行才调用 `bundle_replan`。旧 event/operator action 不在正常路径。
+- Reasoning 汇总所有成功、失败、dependency wait 与 replan 分支；只有消费其最终回执的 Reasoning 核心事务
+  能终态化 cycle/question 与 selection。
+- MCP 提交在最终短事务中重查 cycle/stage/target/plan 绑定；已 commit 的 submission receipt 不会被随后 TTL
+  反向过期，而 revoke/过期先线性化时会拒绝提交。历史空 provider receipt 不会覆盖后续唯一有效 id；
+  若从未观测到 id，恢复必须 fail closed。
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `METARESEARCH_CODEX_BIN` | `codex-chatgpt` | 本机已认证的 codex 包装 |
-| `METARESEARCH_CODEX_MODEL` | `gpt-5.5` | 模型 |
-| `METARESEARCH_CODEX_EFFORT` | `medium` | 推理力度 |
-| `METARESEARCH_RUNNER_TIMEOUT_S` | `900` | 单次 Codex 调用超时（工程超时；研究执行时限另见 policy.flow.watchdog） |
+| `METARESEARCH_CODEX_MODEL` | `gpt-5.6-sol` | 当前 ChatGPT Codex 可用模型名 |
+| `METARESEARCH_CODEX_EFFORT` | `max` | 推理力度 |
+| `METARESEARCH_RUNNER_TIMEOUT_S` | `3600` | 普通 Codex 调用超时。跨整个 cycle 的 Bundle 常驻主 turn 绑定 owner 生命周期，不受该墙钟截止；官方 smoke/train/eval 仍各自使用 manifest watchdog。 |
 | `METARESEARCH_QUERY_CODEX_BIN` | `/usr/local/bin/codex` | query/adapter generation/review 的 tool-free CLI；工人 PATH 固定为 `/usr/local/bin:/usr/bin:/bin`，兼容该入口的 `env node` shebang |
 | `METARESEARCH_QUERY_RUN_AS_USER` | root 运行时默认 `codexro`；non-root 默认当前账户 | 可选 UID 隔离；production non-root service 无特权切换 UID，不设置或填当前 service account |
 | `METARESEARCH_QUERY_CODEX_HOME` | 专用账户的 `~/.codex` | 仅 root 显式/默认降权到独立 UID 时使用；同 UID production 使用已验证的 `CODEX_HOME` |
 | `METARESEARCH_GITHUB_TOKEN` | — | 可选的 GitHub 只读 API token；仅 plan 明确触发 repo discovery/direct resolve 时读取，不落 policy/DB/回执 |
-| `HTTP_PROXY`/`HTTPS_PROXY` | — | 真 Codex 需要（本机 7890）；OS 级，由 codex 子进程继承（runner 不显式读） |
+| `HTTP_PROXY`/`HTTPS_PROXY` | — | 真 Codex 需要（本机 7890）；Runner 仅从显式白名单转发代理/TLS 环境，不整包继承宿主环境 |
 
 冒烟自检（一条命令跑通至少一个完整 attack 轮）：
 ```bash
@@ -115,11 +179,17 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
 
 - `budget`：`B0` 单轮预算、`B_max` 上限、`session_max` 全局成本安全网（ledger.money 求和上限）。
 - `flow.tau`：自终止判据①——`score_floor` 分数地板、`consecutive_rounds` 连续几轮低分即停。
+- `flow.retry.bundle_repair`：同一冻结 plan 内每个 target 的实施自愈上限；当前默认为 `null`，
+  表示同一 Bundle 主 turn 内的工程修复不按轮次截断。只有主 Codex 依权威日志判定冻结 plan 本身不可执行时
+  才请求 replan 并交必经 Reasoning；用户停止、target 预算或 full watchdog 仍是独立安全界。
 - `tree_guard`：`max_decompose_depth` / `max_children_per_node` / `max_open_questions`（问题树规模护栏）。
 - `execution`：manifest 命令围栏——`default_timeout_s` / `max_timeout_s`；`path_allowlist` 必须与
   `sandbox.readonly_mounts` 完全相同（外部数据根只读映射）。`sandbox` 还固定 engine unix socket、image digest+ID、
   memory/pids/nofile/日志轮转/单文件/输出/CPU/tmpfs 上限；bundle 锚区给出的 runtime `env_hash` 由这些声明机械派生，
   manifest 只能逐字回引。
+- `resources`：`gpus` / `gpu_mem_gb` 是部署 allocation 请求；`gpu_target_policy`
+  用 `planner_select|required|forbidden` 独立冻结 plan 中的 GPU mode，
+  `allowed_device_indices` 只窄化部署选卡面。库存数量不会被当成 target 授权。
 - `import_materialization`：GitHub commit 物化的 API/archive/file/tree/submodule 大小与数量上限、
   archive/LFS object redirect host allowlist、LFS object/batch 上限、adapter 路径和 pinned image 中 CPython
   版本/源码 artifact SHA-256。当前 `lfs_policy=fetch`；pointer Git blob、Batch response、下载 OID/size 与最终
@@ -173,11 +243,10 @@ fail-closed。development 仍永不产生 production-ready 声明；它可继续
 - **控制台指令**：通过 `interaction_message` 入站（连接器落库）→ 分类器保守三分类（可能改状态的一律当
   directive 并回显确认）。`pause`/`resume` 控制推进；`query` 走只读应答器（不改研究状态）。
 - **文件请求**：某阶段确实无法自取资料时会产 `resource_request` → 落 `interaction_request(pending)` →
-  **系统停在该轮游标处等待**（全局等待，无自动超时，但默认 run 进程仍在消费控制动作）。上传源只允许两类：
-  `<work-root>/uploads/<目录>/<item_no>/...`（控制台填 `work/uploads/<目录>`），或
-  `<system-root>/input/uploads/<目录>/<item_no>/...`（填 `input/uploads/<目录>`）。解决后 daemon 会校验
-  schema/hash/size 并原子接纳到 `<work-root>/input/user_provided/<request_id>/`；该目录是 daemon 托管输出，
-  **禁止人工直接写入**。无法提供时可在控制台取消请求并留下理由。
+  **系统停在该轮游标处等待**（全局等待，无自动超时，但 owner 仍消费控制动作）。用户在 Web 请求卡上选择
+  文件/文件夹并点“上传并提交”；页面做 4 MiB 顺序分块与增量 SHA-256，服务端以持久幂等发布回执把资料接纳到
+  quest 私有上传区，再由 daemon 原子迁入 `<work-root>/input/user_provided/<request_id>/`。浏览器不提交
+  `source_ref`，用户也不应人工写 `work/uploads` 或托管输出。无法提供时在 Web 取消并留下理由。
 - **审计链**：一切决策/执行/测量都在 DB（`decision` / `run` / `evaluation` / `execution_log` /
   `runner_call` / `ledger`）；产物 transcript 归档在 `<work-root>/cycles/<id>/transcripts/`。
 - **轮次恢复点（CP11.4c.3b.1）**：research done cycle 在当轮 τ/global-stop 检查后，import worker、
@@ -421,28 +490,37 @@ scope。因此这些仍按该包的窄口径列入 `unresolved_registered_assets
 two-node contract 冲突。local receipt 仍保持
 `two_node_verified=false`，任何 canary 都保持 `infrastructure_fence_verified=false`。
 
-### 4.1 人类控制台（web 查看 + 交互，步⑨）
+### 4.1 本机 Web 产品（任务设置 + 运行 + 观测与交互）
 
-系统跑起来后，另起一个**独立只读进程**在浏览器里看实时状态、下指令。**单写纪律**：控制台进程 `mode=ro` 读库、
-只写入站 spool 文件，**绝不写 DB**——研究真相始终只有 run 进程一个写者。
+`web_app` 是部署后的主入口。它管理 quest 草稿/输入发布和本机 owner 进程，但对已运行研究库仍以 `mode=ro`
+读取；人工动作只写入站 spool，研究真相始终只有对应 quest 的 `run` owner 一个写者。Web server 只会停止它在
+本次进程内亲自创建并仍持有能力的进程组；重启后观察到的外部 owner 不会仅凭 PID 被误杀。
 
 ```bash
-# 与 run 并行（同一 work-root）：
-python -m orchestrator.console_server --system-root . --work-root <同 run 的 work-root> --port 8765
-# 服务会创建 <work-root>/state/.console-capability（0600）并打印其路径。
-# 读取其中 64 位 token，在浏览器打开 http://127.0.0.1:8765/#token=<token>
+python -m orchestrator.web_app
+# 默认任务根：<当前 Meta-Research 安装目录>/runtime
+# 可选搬迁：--data-root /path/to/product-data --port 8765
 ```
 
-页面读取 fragment 后立即清掉地址栏，并只把 capability 留在本标签页的 `sessionStorage`；它不会进入 query、
-cookie 或 `localStorage`。全部 `/api/*` 请求都要求 `Authorization: Bearer <token>`。远程使用仍只允许 SSH
+页面顶栏可新建、切换、启动和停止 quest；每个 quest 都拥有独立目录、SQLite、baseline 池、问题树和 inbox。
+发布操作先验证 corpus/本机目录并写 ready receipt，之后才允许 owner 启动；同一 quest 的第二 owner 仍会被
+instance lease 拒绝。运行失败的限长脱敏诊断可在顶栏直接查看，不需要打开 `state/web-owner.log`。
+
+入口会自动用 capability fragment 打开默认浏览器。在默认的多任务本机产品模式下，用户直接打开裸的 loopback
+地址时也会由服务执行一次本地 fragment 引导，不需要回终端查找 token；这是第一版单用户、本机安装假设下的
+产品入口。页面读取后立即清掉 fragment 和引导标记，并只把 capability 留在本标签页的 `sessionStorage`；它不会
+进入 query、cookie 或 `localStorage`，服务也不会提示普通用户读取内部 token 文件。单 quest 管理服务仍要求显式
+授权链接，不启用裸地址引导。
+全部 `/api/*` 请求都要求 `Authorization: Bearer <token>`。远程使用仍只允许 SSH
 tunnel（例如 `ssh -L 8765:127.0.0.1:8765 <host>`），不得把服务直接绑定到局域网地址。
 正常模式下，缺 capability、尚未成功取得第一份 `/api/db` 真快照、网络中断、401 或 5xx 都会持续显示
 全屏连接保护层并禁用所有 live 控件；只有后续 `/api/db` 成功才解锁。内嵌演示数据只在显式打开
 `http://127.0.0.1:8765/?demo=1` 时可操作；demo 模式不发送任何控制 API，不是断线降级模式。
 
-所有控制类 POST（`/api/message`、`/api/directive`、`/api/file-request`）还必须带恰一个
+所有 POST（`/api/message`、`/api/query`、`/api/directive`、`/api/file-request`，以及多任务的
+`/api/quests`）还必须带恰一个
 `Idempotency-Key: <32 位小写十六进制>`。浏览器会在 fetch 前先将键写入 `sessionStorage`；网络结果不明或
-5xx 时保留并为同一 operation 重用，只有 2xx 回显完全匹配的 `console-<key>` 或确定性 4xx 才清除。
+5xx 时保留并为同一 operation 重用，只有 2xx 回显完全匹配的幂等键或确定性 4xx 才清除。
 手写 API 客户端必须遵守同样规则，且不得用同一键发送不同 body。
 
 `sessionStorage` 是单标签页/单会话恢复边界：同一标签页并发的完全相同 operation 共用一个键，但多标签页之间
@@ -457,7 +535,7 @@ tunnel（例如 `ssh -L 8765:127.0.0.1:8765 <host>`），不得把服务直接�
   run 进程在 **precheck 边界** ingest → 保守分类：`pause`/`resume`（硬指令，回显确认后生效，停/续推进）、
   `query`（只读 grounded 应答，不改研究状态）、`note`（软注解）。**恰一语义**：入站幂等、query 只答一次
   （no-loss/no-dup）。控制台自身不联机推理、绝不直接改状态。
-- **显式控件**：待确认硬指令可直接点确认/拒绝；pending 文件请求可在上传后点 resolve，或点 cancel。
+- **显式控件**：待确认硬指令可直接点确认/拒绝；pending 文件请求直接从页面选择并上传，或点 cancel。
   HTTP 进程只把结构化动作耐久追加到 spool；常驻 run 进程校验目标/provenance/文件身份后才迁移权威 DB，
   成功或终态失败都有可审计回执。终态请求的同一 request hash 不会原样重开：阶段重做须消费既有回执，
   或明确改变请求条件。
@@ -493,7 +571,7 @@ conversation_id 与固定 target 绑定；directive 生命周期也回原 source
 - **reasoning-only**：bootstrap 创世根问题 / decompose 分解 / terminate 收口。
 - **人机**：query 应答、directive（pause/resume）、文件请求全等待环。
 - **安全网**：τ 自终止（价值衰退 / 预算耗尽）；kill-9 崩溃恢复；全自动**不楔死**（任何站不住的 Codex
-  产物 → 业务拒/目标 failed + 记账，绝不死循环）。
+  产物 → 有界修复后目标 `engineering_blocked`/`failed` + 记账，绝不死循环）。
 
 ## 6. 停机语义（停因）
 
@@ -541,8 +619,10 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   Docker backing store 已接近/达到空间上限；这些都不是代码内的“允许降级”，切 production 会 fail-closed。
 - 不可信容器看不到 guardian/provider receipt、SQLite、Codex 凭据或整个 work-root，但同一 host 信任域内的 root/
   orchestrator UID 进程仍能控制 Docker socket 或改本地证据；要防该类 host 对手须独立 service account/VM/远端
-  attestation，不能靠 0600/HMAC 自我证明。tool-free query/adapter 工人始终使用空临时 cwd、关闭全部
-  host/web/plugin 工具、只传 `CODEX_HOME`/HOME/TMPDIR/代理/TLS 的显式环境白名单并严核 trace；production
+  attestation，不能靠 0600/HMAC 自我证明。普通受信 Runner 也只传 PATH、locale、`CODEX_HOME`/HOME/TMPDIR
+  与代理/TLS 的显式环境白名单，不向 shell-capable 模型进程转发 connector/GitHub/cloud secrets；tool-free
+  query/repository-adapter 与 qualification 隔离工人还始终使用空临时 cwd、关闭全部 host/web/plugin 工具并严核
+  trace；production
   的 non-root 工人与 service 同 UID，由同 UID guardian
   排空整树。root 开发环境默认另用 `codexro`，跨 UID 时 guardian 必须以 root 运行才能完整终止。
 - fork child 会丢弃非目标 lease FD；owner 死亡同时由 pipe EOF 与 `PR_SET_PDEATHSIG` 触发 guardian。SQLite
@@ -713,9 +793,12 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
 - 用户文件已有 DB 终态授权、ContextPack ref 白名单、hash/size 复验和稳定只读 fd；非 bundle 阶段只看
   有界 UTF-8 预览。bundle 代码虽已不在 host 裸跑，但这不消除 prompt injection 对研究方向/产物内容的影响；
   schema、独立 judge 与 Gate 只能限制写回契约，不能证明任意第三方文本语义可信。
-- Web capability 用于隔离其他本机 OS 用户、跨站浏览器请求和无 token 的本机客户端；同 UID 恶意进程仍可
-  读取 0600 token，同源 XSS 也可读取 sessionStorage。轮换时先停 console server，删除
-  `<work-root>/state/.console-capability`，再重启并用新 fragment 打开；它不替代 loopback/SSH tunnel 边界。
+- strict 单 quest/admin 模式的 Web capability 用于隔离其他本机 OS 用户、跨站浏览器请求和无 token 的本机
+  客户端；同 UID 恶意进程仍可能取得进程私有凭证，同源 XSS 也可读取 sessionStorage。默认多任务产品模式则按
+  第一版单用户本机安装假设，把同机 OS 用户/本机客户端纳入信任边界，以支持裸 loopback 地址自动引导；它仍用
+  Bearer、同源检查和 sessionStorage 抵御跨站控制，但不能声称隔离同机其他用户。普通用户日常重开直接访问 Web，
+  不读取或修改后端状态文件；凭证疑似泄漏时应停止服务并由部署维护入口轮换。两种模式都不替代 loopback/SSH
+  tunnel 边界。
 - 严格 webhook 能让接收网关按 `(producer_id,event_key)` 去重；OneBot v11 标准 API 没有幂等写语义，所以“QQ 已发送但本地
   receipt 前 SIGKILL”可能显示重复消息。不能接受重复时必须用严格 webhook 包住 OneBot，而不是直连。
 - **provider 调用与本地成本已可 exactly-once 对账，但仍不是供应商账单**：每个真实 Codex 调用先绑定
@@ -729,18 +812,33 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   `price_per_1k_tokens` 的 policy projection，用于护栏/趋势；receipt 明示无 external invoice，不能宣称与供应商
   最终账单逐分一致。这里保证的是“每个实际 invocation 恰记一次”；若已入账后、阶段业务 phase-commit 前崩溃，
   恢复可能以新的 runner_call 再调用一次，两次会分别留痕计账，并不虚构 provider 侧 exactly-once execution。
-- 已支持 build / exec/eval target；默认 `build_system()` 已装配同 owner fenced `ImportWorker`、独立 plan
-  answerability reviewer 和 `dependency_wait` 恢复。plan 在类型门确认需引入新外部 baseline 家族且当轮无
-  候选时，可产一次受 schema 限制的 `import_search_request.json`；受信 host GitHub REST connector
-  在 DB 事务外做只读检索，回执完整后用一个短事务原子登记 pinned commit、搜索快照、冻结
+- 已支持 build / exec/eval target；默认 `build_system()` 已装配同 owner fenced `ImportWorker` 和
+  `dependency_wait` 恢复。正常 Plan 由一个 resident 主 Codex 在当前 turn 内启动干净子智能体审查；当类型门
+  确认需引入新外部 baseline 家族且当轮无候选时，主 Codex 调用受 schema 限制的 `plan_import_search` MCP，
+  读取返回的托管 ContextPack 索引后继续形成最终 `plan.json`，不会交 sidecar 或重开顶层上下文。受信 host
+  GitHub REST connector 在 DB 事务外做只读检索，回执完整后用一个短事务原子登记 pinned commit、搜索快照、冻结
   license evidence/SPDX、机械 auto/review 裁定和完成 marker，然后重渲染 plan 四锚。回执已落、DB 未提交的
   崩溃可不重搜直接续提交；无回执的中断只会重复幂等只读 GET，不会重复登记。
+- production 的 build/exec/import/eval 共用同一个 owner-fenced `PoolPublisher`：checkpoint、代码、配置、
+  protocol 与评估 attempt 先复制到 `baselines/`、`protocols/`，再发布 `pool/manifests/<sha256>.json`；DB
+  checkpoint 只登记相对正式路径/hash。训练 decision 与 checkpoint 同事务绑定，评估 attempt、metrics、
+  execution log、完整 publication decision 与 cards 同一 gate 事务闭合后，baseline/variant 才能进入
+  `legal`。崩溃最多留下可由同 hash 重放收养的未引用正式文件，不会留下指向 cycle staging 的 legal 身份；
+  selector 还会拒绝只有 `status=legal`、没有完整 publication closure 的旧行。
+- Bundle 每个 cycle 只有一个 resident 主 Codex turn。它通过 `bundle_next_target` 串行绑定目标，通过
+  `bundle_execute` 异步启动官方 smoke/train/eval，并用 `bundle_status` 持续读取部分日志；工程错误经
+  `bundle_repair` 在原上下文内修复重跑。当前 `flow.retry.bundle_repair=null`，不创建 fresh session 或按轮次
+  截断；只有权威反馈证明冻结 plan 本身不可执行时才调用 `bundle_replan`，随后仍必须进入 Reasoning。
 - 三个非默认触发也已接入，但它们不能冒充 `new_structure`：`human_named` 只接受经 hard confirmation 的
   结构化 `inject_question`（规范 GitHub URI + 可选精确 commit + need summary），plan 只能回引其 exact authority
-  hash，受信 connector 再固定 revision/license；自由文本 URL 不形成 authority。`stuck` 只有在 policy 的
+  hash，受信 connector 再固定 revision/license；自由文本 URL 不形成 authority。控制台消费和外部普查完成都
+  只冻结 `request_ref`，不旁路写 question；reasoning 必须逐字段复制 ref/text/parent/kind 并给出显式证据关闭
+  predicate，随后由唯一的 SQLite StateStore 在建题同一事务里核 request provenance、写 admission/binding，且仅在
+  对应路径生成 human/reference authority。`stuck` 只有在 policy 的
   visit/consecutive-inconclusive 双阈值命中时才做一次只读普查：visit 是终身防贪心计数，连续失败由
   goal-version scoped append-only decision 独立记账（goal amend 后从零开始）。结果只派生新参照问题，原问题只挂 question
-  dependency，永不直接登记候选或 `import_defer`。`sota_reference` 先从 policy host allowlist 做有界 HTTPS
+  dependency，且 authority 与 origin→child pending dependency 随 question INSERT 原子落库，永不直接登记候选或
+  `import_defer`。`sota_reference` 先从 policy host allowlist 做有界 HTTPS
   读取，把 paper/benchmark 原始 bytes 私有写入 SHA-256 内容寻址 blob，再派生独立 baseline-reference 问题；不是按
   `latest` 取隐式事实。两个参照子题在自己的 action-cycle 从父轮 receipt 激活冻结候选，不重复联网。
 - 默认 GitHub discovery 候选已能从 40-hex commit 进入真实物化：逐个非 recursive Git tree
@@ -799,5 +897,8 @@ meta-research/
 │                            #   harness / stage_provider / compiler / recall / notify / console / mediator …
 ├── db/migrations/           # 冻结 DDL（0001_appendix_a.sql；三重锁 = checksum + count + user_version）
 ├── tests/                   # pytest 自验
-└── <work-root>/             # 运行期产物（research.sqlite / cycles / state；--work-root 指定，不在仓库内）
+└── runtime/                 # 本机部署的持久数据根（整体不进入 Git）
+    ├── quests/<quest-id>/   # 每个任务独立的 DB、cycles、实验、日志、input 与 state
+    ├── state/               # 跨任务创建、Web、本机来源与发布状态
+    └── self-test/           # 本机验收脚本的隔离产物
 ```

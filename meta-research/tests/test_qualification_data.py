@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -18,6 +19,21 @@ from orchestrator import qualification_data as qd
 
 
 SECRET = b"qualification-test-secret-32-bytes!!"
+
+
+@pytest.fixture
+def tmp_path():
+    """Run publisher tests below a trusted ancestor.
+
+    The publisher intentionally rejects a non-sticky world-writable /tmp.  Some
+    minimal containers (including the CI image used here) expose /tmp as 0777,
+    so pytest's built-in tmp_path would violate the production precondition and
+    prevent the adapter behavior from being exercised at all.
+    """
+    trusted_parent = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory(
+            prefix=".qualification-test-", dir=trusted_parent) as value:
+        yield Path(value)
 
 
 def _mat_bytes(payload) -> bytes:
@@ -397,6 +413,40 @@ def test_prepare_rejects_untrusted_publication_ancestor(tmp_path):
                 "score": "valence", "threshold": 3,
                 "comparison": "higher_is_positive", "neutral_policy": "drop",
             }, research_uid=65534, evaluator_uid=0)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="root-owned ancestor boundary requires root")
+def test_destination_allows_only_canonical_root_owned_sticky_shared_ancestor(tmp_path):
+    sticky_ancestor = tmp_path / "sticky-shared"
+    sticky_ancestor.mkdir()
+    sticky_ancestor.chmod(0o1777)
+    trusted_parent = sticky_ancestor / "operator-parent"
+    trusted_parent.mkdir(mode=0o755)
+
+    public, sealed = qd._validate_destinations(
+        trusted_parent / "public", trusted_parent / "sealed",
+        research_uid=0, evaluator_uid=0)
+    assert public == trusted_parent / "public"
+    assert sealed == trusted_parent / "sealed"
+
+    # World-writable without sticky remains unsafe even when root owns it.
+    writable_ancestor = tmp_path / "world-writable"
+    writable_ancestor.mkdir()
+    writable_ancestor.chmod(0o777)
+    writable_parent = writable_ancestor / "operator-parent"
+    writable_parent.mkdir(mode=0o755)
+    with pytest.raises(qd.QualificationDataError, match="ancestor"):
+        qd._validate_destinations(
+            writable_parent / "public", writable_parent / "sealed",
+            research_uid=0, evaluator_uid=0)
+
+    # Sticky alone is not a broad escape hatch: non-canonical permissions are
+    # rejected rather than silently expanding the trusted shared-dir policy.
+    writable_ancestor.chmod(0o1770)
+    with pytest.raises(qd.QualificationDataError, match="ancestor"):
+        qd._validate_destinations(
+            writable_parent / "public", writable_parent / "sealed",
+            research_uid=0, evaluator_uid=0)
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="production prepare CLI requires root")

@@ -25,6 +25,58 @@ TEST_CAPABILITY = "a" * 64
 TEST_IDEMPOTENCY = "1" * 32
 
 
+def test_configure_process_storage_stays_beneath_data_root(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    service_source = tmp_path / "service-source"
+    query_source = tmp_path / "query-source"
+    service_source.mkdir()
+    query_source.mkdir()
+    (service_source / "auth.json").write_text('{"service":true}\n')
+    (service_source / "config.toml").write_text("service = true\n")
+    (query_source / "auth.json").write_text('{"query":true}\n')
+    (query_source / "config.toml").write_text("query = true\n")
+    monkeypatch.setenv("CODEX_HOME", str(service_source))
+    monkeypatch.setenv("METARESEARCH_QUERY_CODEX_HOME", str(query_source))
+    for key in ("TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "PIP_CACHE_DIR"):
+        monkeypatch.setenv(key, "/outside-before-test")
+    monkeypatch.setattr(CS.tempfile, "tempdir", CS.tempfile.tempdir)
+
+    configured = CS._configure_process_storage(root)
+
+    expected_tmp = root / ".process-tmp"
+    expected_cache = root / ".process-cache" / "service"
+    assert configured == {
+        "TMPDIR": str(expected_tmp),
+        "XDG_CACHE_HOME": str(expected_cache),
+        "PIP_CACHE_DIR": str(expected_cache / "pip"),
+    }
+    assert os.environ["TMP"] == os.environ["TEMP"] == str(expected_tmp)
+    assert CS.tempfile.tempdir == str(expected_tmp)
+    assert os.environ["HOME"] == str(root / ".process-home" / "service")
+    assert os.environ["CODEX_HOME"] == str(root / ".codex-runtime" / "service")
+    assert os.environ["METARESEARCH_QUERY_HOME"] == str(
+        root / ".process-home" / "query")
+    assert os.environ["METARESEARCH_QUERY_CODEX_HOME"] == str(
+        root / ".codex-runtime" / "query")
+    for key in (
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+            "CONDA_PKGS_DIRS", "CONDA_ENVS_PATH", "UV_CACHE_DIR",
+            "CUDA_CACHE_PATH", "MPLCONFIGDIR", "NUMBA_CACHE_DIR"):
+        assert os.path.commonpath((str(root), os.environ[key])) == str(root)
+        assert Path(os.environ[key]).is_dir()
+    assert (Path(os.environ["CODEX_HOME"]) / "auth.json").read_text() == (
+        '{"service":true}\n')
+    assert (Path(os.environ["METARESEARCH_QUERY_CODEX_HOME"]) /
+            "auth.json").read_text() == '{"query":true}\n'
+    assert stat.S_IMODE(root.stat().st_mode) == 0o711
+    assert stat.S_IMODE(expected_tmp.stat().st_mode) == 0o711
+    for path in (expected_cache, expected_cache / "pip",
+                 root / ".process-home" / "service",
+                 root / ".codex-runtime" / "service"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+
 def _assert_random_idempotency_key(rec):
     assert re.fullmatch(r"console-[0-9a-f]{32}", rec["idempotency_key"])
 
@@ -38,6 +90,22 @@ def _process_append(work: str, count: int, prefix: str, result_queue) -> None:
                           for i in range(count)])
     except BaseException as error:
         result_queue.put((type(error).__name__, str(error)))
+
+
+class _StoppedConsoleServer:
+    """Minimal main()-level server double that exits without a live socket."""
+
+    console_capability_token = TEST_CAPABILITY
+    server_address = ("127.0.0.1", 43123)
+
+    def serve_forever(self):
+        raise KeyboardInterrupt
+
+    def shutdown(self):
+        pass
+
+    def server_close(self):
+        pass
 
 
 @pytest.fixture()
@@ -74,6 +142,13 @@ def test_assemble_db_shape(seeded):
     assert payload["live"]["mode"] in ("running", "interrupted", "idle", "awaiting_user")
     assert payload["live"]["orchestrator_active"] is False
     assert payload["live"]["orchestrator_status"] in {"inactive", "invalid"}
+    assert "training_live" in payload
+    assert payload["training_live"]["available"] is True
+    assert payload["training_live"]["contract_version"] == 1
+    assert payload["training_live"]["total_targets"] == 0  # 没有 Bundle runner 时不伪造监控轮
+    assert isinstance(payload["training_live"]["logs"], list)
+    assert payload["training_live"]["agent_live_text"] == ""
+    assert payload["training_live"]["agent_activities"] == []
     assert payload["notification"] == [{
         "event_key": "e1", "kind": "cycle_done", "payload": {"summary_md": "轮完成"},
     }]  # 撕裂行被弃
@@ -81,6 +156,108 @@ def test_assemble_db_shape(seeded):
     assert payload["fs"]["roots"][0]["p"] == "work"            # FS 树含 work 根
     # ledger 当前空 → 空数组（不炸）
     assert payload["ledger_by_cycle"] == [] or isinstance(payload["ledger_by_cycle"], list)
+
+
+def test_training_live_projects_real_bounded_log_tail_and_progress(seeded, tmp_path):
+    path, work = seeded
+    connection = db.connect(path)
+    connection.execute("UPDATE cycle SET status='bundle' WHERE id=1")
+    connection.execute(
+        "INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,variant_id) "
+        "VALUES (3,1,1,'build',3,'running',1)")
+    connection.execute(
+        "INSERT INTO runner_call(id,cycle_id,phase,purpose,status,started_at) "
+        "VALUES (10,1,'bundle','bundle-main-c1','running','now')")
+    connection.commit()
+    connection.close()
+
+    work_path = Path(work)
+    context = work_path / "cycles" / "c1" / "context_pack"
+    context.mkdir(parents=True)
+    (context / "bundle.3.pack.json").write_text("{}\n", encoding="utf-8")
+    log_dir = work_path / "c1" / "t3" / "run7"
+    log_dir.mkdir(parents=True)
+    secret = "super-secret-value"
+    train_log = log_dir / "train.log.partial"
+    train_log.write_text(
+        "x" * (CS._MAX_TRAINING_LOG_TAIL_BYTES + 256) + "\n"
+        + "gpu_used: 7\n"
+        + "cell_gpu: key=a logical_cuda_index=0\n"
+        + "cell_gpu: key=b logical_cuda_index=6\n"
+        + "Authorization: Bearer " + secret + "\n"
+        + "artifact=" + work + "/c1/t3/run7/checkpoints/a.pt\n"
+        + "step=12/20 loss=0.5\n",
+        encoding="utf-8")
+    (log_dir / "train.log.process.json").write_text(
+        '{"metadata":true}\n', encoding="utf-8")
+    outside = tmp_path / "outside.log"
+    outside.write_text("OUTSIDE-SENTINEL\n", encoding="utf-8")
+    (log_dir / "linked.log").symlink_to(outside)
+
+    connection = CS._open_ro(path, work_root=work)
+    try:
+        live = CS._training_live(
+            connection, work_path,
+            orchestrator_live={"orchestrator_active": True, "mode": "running"})
+    finally:
+        connection.close()
+
+    assert live["active"] is True
+    assert live["available"] is True and live["contract_version"] == 1
+    assert live["cycle_id"] == 1 and live["runner_call_id"] == 10
+    assert live["current_target"]["id"] == 3
+    assert live["settled_targets"] == 2 and live["total_targets"] == 3
+    assert live["target_progress_pct"] == pytest.approx(66.7)
+    assert live["substage"] == "train" and live["logs_target_id"] == 3
+    assert [entry["path"] for entry in live["logs"]] == ["run7/train.log.partial"]
+    visible = live["logs"][0]["tail_text"]
+    assert "step=12/20" in visible and "[已遮蔽]" in visible
+    assert secret not in visible and work not in visible and "OUTSIDE-SENTINEL" not in visible
+    assert live["logs"][0]["truncated"] is True
+    assert live["progress"] == {
+        "current": 12, "total": 20, "unit": "step",
+        "pct": 60.0, "label": "step 12 / 20",
+    }
+    assert live["gpu_used"] == 7 and live["gpu_indices"] == [0, 6]
+
+
+def test_training_live_projects_bundle_agent_before_experiment_logs(seeded, monkeypatch):
+    path, work = seeded
+    connection = db.connect(path)
+    connection.execute("UPDATE cycle SET status='bundle' WHERE id=1")
+    connection.execute(
+        "INSERT INTO runner_call(id,cycle_id,phase,purpose,status,started_at) "
+        "VALUES (10,1,'bundle','bundle-main-c1','running','now')")
+    connection.commit()
+    connection.close()
+
+    activities = [{"key": "a1", "activity_kind": "file",
+                   "activity_state": "completed", "text": "文件修改完成"}]
+    monkeypatch.setattr(
+        CS, "_running_codex_capture_projection",
+        lambda _root, _receipt: ("正在构建实验代码", activities))
+    connection = CS._open_ro(path, work_root=work)
+    try:
+        live = CS._training_live(
+            connection, Path(work),
+            orchestrator_live={"orchestrator_active": True, "mode": "running"},
+            running_authority={"runner_call_id": 10, "receipt": {}})
+    finally:
+        connection.close()
+
+    assert live["active"] is True and live["logs"] == []
+    assert live["agent_live_text"] == "正在构建实验代码"
+    assert live["agent_activities"] == activities
+
+
+def test_training_progress_reports_completed_checkpoint_count():
+    progress = CS._training_progress([{
+        "tail_text": "checkpoint_written: key=a path=x\ntrain_complete: checkpoints=50\n",
+    }])
+    assert progress == {
+        "current": 50, "total": 50, "unit": "checkpoint",
+        "pct": 100.0, "label": "训练完成 · 50 个 checkpoint",
+    }
 
 
 def test_assemble_db_no_db_write(seeded):
@@ -159,8 +336,15 @@ def test_read_file_whitelist_and_escape(seeded):
     assert b"budget" in data.read_file("policies/policy.yaml")           # system schemas/prompts/policies 可读
     assert data.read_file("../../../etc/passwd") is None                 # 逃逸拒
     assert data.read_file("nonexist.txt") is None
-    (Path(work) / "state" / "note.txt").write_text("hi", encoding="utf-8")
-    assert data.read_file("work/state/note.txt") == b"hi"                # work 下可读
+    (Path(work) / "cycles").mkdir()
+    (Path(work) / "cycles" / "note.txt").write_text("hi", encoding="utf-8")
+    assert data.read_file("work/cycles/note.txt") == b"hi"
+    (Path(work) / "state" / "internal.txt").write_text("secret", encoding="utf-8")
+    assert data.read_file("work/state/internal.txt") is None
+    (Path(work) / "input").mkdir()
+    (Path(work) / "input" / "local-sources.json").write_text(
+        '{"source_root":"/private/dataset"}', encoding="utf-8")
+    assert data.read_file("work/input/local-sources.json") is None
 
 
 # ============ 入站 spool（只写文件、不碰 DB）============
@@ -183,6 +367,20 @@ def test_enqueue_message_spool_only(seeded):
         data.enqueue_message({})                                         # JSON object 不得打穿 handler
     with pytest.raises(ValueError, match="conversation_id"):
         data.enqueue_message("bad conversation", conversation_id="shared")
+
+
+def test_enqueue_narrator_query_marks_transport_intent_and_stays_spool_only(seeded):
+    path, work = seeded
+    data = CS.ConsoleData(db_path=path, work_root=work, system_root=SYSTEM_ROOT)
+    before = db.connect(path).execute("SELECT count(*) FROM directive").fetchone()[0]
+    rec = data.enqueue_query(
+        "暂停并改预算——请解释这句话会触发什么",
+        conversation_id="b" * 32,
+        client_idempotency_key="9" * 32)
+    assert rec["action_target"] == "query"
+    assert rec["conversation_id"] == "b" * 32
+    assert rec["idempotency_key"] == "console-" + "9" * 32
+    assert db.connect(path).execute("SELECT count(*) FROM directive").fetchone()[0] == before
 
 
 def test_enqueue_fences_torn_tail_before_acknowledging_next_record(seeded):
@@ -309,6 +507,13 @@ def test_http_endpoints(seeded):
                                      data=json.dumps({"text": "pause"}).encode(),
                                      headers={"Content-Type": "application/json", "Idempotency-Key": "1" * 32})
         first_queued = json.loads(opener.open(req, timeout=5).read())["queued"]
+        req = urllib.request.Request(base + "/api/query", method="POST",
+                                     data=json.dumps({"text": "暂停系统会怎样？",
+                                                      "conversation_id": "b" * 32}).encode(),
+                                     headers={"Content-Type": "application/json",
+                                              "Idempotency-Key": "9" * 32})
+        query_queued = json.loads(opener.open(req, timeout=5).read())["queued"]
+        assert query_queued["action_target"] == "query"
         req = urllib.request.Request(base + "/api/directive", method="POST",
                                      data=json.dumps({"action": "confirm", "directive_id": 99}).encode(),
                                      headers={"Content-Type": "application/json", "Idempotency-Key": "2" * 32})
@@ -320,6 +525,14 @@ def test_http_endpoints(seeded):
                                      data=json.dumps({"action": "resolve", "request_id": rid,
                                                       "source_ref": f"work/uploads/r{rid}"}).encode(),
                                      headers={"Content-Type": "application/json", "Idempotency-Key": "3" * 32})
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            opener.open(req, timeout=5)
+        assert ei.value.code == 400
+        req = urllib.request.Request(base + "/api/file-request", method="POST",
+                                     data=json.dumps({"action": "cancel", "request_id": rid,
+                                                      "reason": "暂时无法提供"}).encode(),
+                                     headers={"Content-Type": "application/json",
+                                              "Idempotency-Key": "8" * 32})
         queued = json.loads(opener.open(req, timeout=5).read())["queued"]
         assert queued["action_target"] == "file_request" and queued["request_id"] == rid
         assert queued["seq"] > directive_seq
@@ -341,6 +554,397 @@ def test_http_endpoints(seeded):
         assert (Path(work) / "state" / "console_inbox.jsonl").exists()
     finally:
         httpd.shutdown()
+
+
+def test_multi_quest_http_lists_routes_and_never_crosses_work_roots(tmp_path):
+    import http.client
+    import threading
+    import urllib.error
+    import urllib.request
+
+    registry = CS.QuestRegistry(tmp_path / "registry", Path(SYSTEM_ROOT))
+    brief = lambda name: ("---\npredicate_json: {kind: test}\n---\n\n# " + name + "\n")
+    qa = registry.create(quest_id="alpha", title="Alpha", goal_brief_md=brief("alpha"))
+    qb = registry.create(quest_id="beta", title="Beta", goal_brief_md=brief("beta"))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+    httpd = CS.serve_quests(
+        registry.root, SYSTEM_ROOT, host="127.0.0.1", port=0,
+        capability_token=TEST_CAPABILITY)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", httpd.server_address[1], timeout=5)
+        conn.request("GET", "/")
+        bootstrap = conn.getresponse()
+        assert bootstrap.status == 303
+        assert bootstrap.getheader("Location") == (
+            "/?console-bootstrap=1#token=" + TEST_CAPABILITY)
+        assert bootstrap.getheader("Cache-Control") == "no-store"
+        assert bootstrap.getheader("Referrer-Policy") == "no-referrer"
+        bootstrap.read(); conn.close()
+        page = opener.open(base + "/?console-bootstrap=1", timeout=5).read()
+        assert b"<!doctype html>" in page[:100].lower()
+        assert TEST_CAPABILITY.encode() not in page
+
+        listing = json.loads(opener.open(base + "/api/quests", timeout=5).read())
+        assert [q["quest_id"] for q in listing["quests"]] == ["alpha", "beta"]
+        selector = json.loads(opener.open(
+            base + "/api/quests?view=selector", timeout=5).read())
+        assert [q["quest_id"] for q in selector["quests"]] == ["alpha", "beta"]
+        assert all("setup" not in q and "runtime" not in q
+                   and "runtime_profile" not in q for q in selector["quests"])
+        alpha = json.loads(opener.open(base + "/api/db?quest=alpha", timeout=5).read())
+        beta = json.loads(opener.open(base + "/api/db?quest=beta", timeout=5).read())
+        assert alpha["tables"]["goal"][0]["text"] == "# alpha"
+        assert beta["tables"]["goal"][0]["text"] == "# beta"
+        assert [root["p"] for root in alpha["fs"]["roots"]] == ["work"]
+        with pytest.raises(urllib.error.HTTPError) as backend_file:
+            opener.open(
+                base + "/api/file?p=policies/policy.yaml&quest=alpha",
+                timeout=5)
+        assert backend_file.value.code == 404
+        diagnostic = json.loads(opener.open(
+            base + "/api/quest-runtime-log?quest=alpha", timeout=5).read())
+        assert diagnostic == {"diagnostic": {
+            "quest_id": "alpha", "available": False, "text": ""}}
+
+        request = urllib.request.Request(
+            base + "/api/query", method="POST",
+            data=json.dumps({"quest_id": "alpha", "text": "解释当前任务",
+                             "conversation_id": "c" * 32}).encode(),
+            headers={"Content-Type": "application/json", "Idempotency-Key": "8" * 32})
+        queued = json.loads(opener.open(request, timeout=5).read())["queued"]
+        assert queued["action_target"] == "query"
+        alpha_lines = qa.work_root.joinpath("state/console_inbox.jsonl").read_text().splitlines()
+        assert json.loads(alpha_lines[-1])["raw_text"] == "解释当前任务"
+        assert not qb.work_root.joinpath("state/console_inbox.jsonl").exists()
+
+        missing = urllib.request.Request(
+            base + "/api/message", method="POST", data=json.dumps({"text": "暂停"}).encode(),
+            headers={"Content-Type": "application/json", "Idempotency-Key": "7" * 32})
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            opener.open(missing, timeout=5)
+        assert denied.value.code == 400
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        worker.join(timeout=5)
+
+
+def test_multi_quest_create_key_cannot_be_reused_for_different_body(tmp_path):
+    import threading
+    import urllib.error
+    import urllib.request
+
+    root = tmp_path / "registry"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+    httpd = CS.serve_quests(
+        root, SYSTEM_ROOT, host="127.0.0.1", port=0,
+        capability_token=TEST_CAPABILITY)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    key = "6" * 32
+
+    def request(quest_id):
+        return urllib.request.Request(
+            base + "/api/quests", method="POST",
+            data=json.dumps({
+                "quest_id": quest_id, "title": quest_id,
+                "goal_brief_md": "---\npredicate_json: {kind: test}\n---\n\n# test\n",
+            }).encode(),
+            headers={"Content-Type": "application/json", "Idempotency-Key": key})
+
+    try:
+        assert json.loads(opener.open(request("alpha"), timeout=5).read())["quest"]["quest_id"] == "alpha"
+        # Exact retry converges to the existing quest.
+        assert json.loads(opener.open(request("alpha"), timeout=5).read())["quest"]["quest_id"] == "alpha"
+        with pytest.raises(urllib.error.HTTPError) as conflict:
+            opener.open(request("beta"), timeout=5)
+        assert conflict.value.code == 409
+        assert [quest.quest_id for quest in CS.QuestRegistry(root, Path(SYSTEM_ROOT)).list()] == ["alpha"]
+    finally:
+        httpd.shutdown(); httpd.server_close(); worker.join(timeout=5)
+
+
+def test_web_http_draft_attaches_local_folders_without_path_echo(tmp_path):
+    import threading
+    import time
+    import urllib.parse
+    import urllib.request
+
+    root = tmp_path / "registry"
+    dataset = tmp_path / "existing-data" / "SEED"
+    dataset.mkdir(parents=True)
+    (dataset / "subject-01.mat").write_bytes(b"eeg")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+    httpd = CS.serve_quests(
+        root, SYSTEM_ROOT, host="127.0.0.1", port=0,
+        capability_token=TEST_CAPABILITY,
+        local_import_roots=[tmp_path])
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def post(path, body, key):
+        request = urllib.request.Request(
+            base + path, method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Idempotency-Key": key})
+        return json.loads(opener.open(request, timeout=10).read())
+
+    try:
+        setup = json.loads(opener.open(base + "/api/setup", timeout=5).read())
+        assert setup["upload"]["local_directory_attachment"] is True
+        created = post("/api/quest-drafts", {
+            "quest_id": "web-local", "title": "Web local",
+            "goal_brief_md": "---\npredicate_json: {kind: test}\n---\n\n# local\n",
+        }, "1" * 32)
+        draft_id = created["draft"]["draft_id"]
+        attached = post("/api/quest-drafts/local-sources", {
+            "draft_id": draft_id, "kind": "dataset", "path": str(dataset),
+        }, "2" * 32)
+        serialized = json.dumps(attached, ensure_ascii=False)
+        assert str(tmp_path) not in serialized
+        assert attached["source"]["label"] == "SEED"
+        detail = json.loads(opener.open(
+            base + "/api/quest-drafts?draft_id="
+            + urllib.parse.quote(draft_id), timeout=5).read())
+        assert str(tmp_path) not in json.dumps(detail, ensure_ascii=False)
+        assert detail["draft"]["local_sources"][0]["file_count"] == 1
+        preflight = post("/api/quest-drafts/preflight", {
+            "draft_id": draft_id,
+        }, "3" * 32)
+        assert {item["dataset"] for item in preflight["preflight"]["candidates"]} >= {
+            "SEED"}
+        assert str(tmp_path) not in json.dumps(preflight, ensure_ascii=False)
+        submitted = post("/api/quest-drafts/publish", {
+            "draft_id": draft_id, "start": False,
+        }, "4" * 32)
+        assert submitted["job"]["status"] in {"running", "succeeded"}
+        job_id = submitted["job"]["job_id"]
+        deadline = time.monotonic() + 10
+        while True:
+            polled = json.loads(opener.open(
+                base + "/api/quest-publish-status?job="
+                + urllib.parse.quote(job_id), timeout=5).read())
+            if polled["job"]["status"] in {"succeeded", "failed"}:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert polled["job"]["status"] == "succeeded", polled["job"].get("error")
+        assert polled["job"]["result"]["quest"]["quest_id"] == "web-local"
+        assert str(tmp_path) not in json.dumps(polled, ensure_ascii=False)
+    finally:
+        httpd.shutdown(); httpd.server_close(); worker.join(timeout=5)
+
+
+def test_runtime_profile_http_get_post_and_quest_list(tmp_path, monkeypatch):
+    import threading
+    import urllib.parse
+    import urllib.error
+    import urllib.request
+    import orchestrator.quest_process_manager as QPM
+
+    memory_bytes = 80 * 1024 ** 3
+    detected = [
+        {"index": index, "model": "NVIDIA A100-SXM4-80GB",
+         "memory_bytes": memory_bytes}
+        for index in range(8)
+    ]
+    monkeypatch.setattr(QPM, "_local_gpu_devices", lambda: detected)
+
+    root = tmp_path / "registry"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+    httpd = CS.serve_quests(
+        root, SYSTEM_ROOT, host="127.0.0.1", port=0,
+        capability_token=TEST_CAPABILITY)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def post(path, body, key):
+        request = urllib.request.Request(
+            base + path, method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Idempotency-Key": key})
+        return json.loads(opener.open(request, timeout=10).read())
+
+    default = {
+        "version": 3, "compute_profile_id": "local-gpu",
+        "review_intensity": "once",
+        "gpu_device_indices": list(range(8)),
+    }
+    cpu_off = {
+        "version": 1, "compute_profile_id": "local-cpu",
+        "review_intensity": "off",
+    }
+    try:
+        setup = json.loads(opener.open(base + "/api/setup", timeout=5).read())
+        options = setup["runtime_profile_options"]
+        assert options["version"] == 3
+        assert options["default_profile"] == default
+        assert options["gpu_devices"] == [
+            {"index": index,
+             "label": f"GPU {index} · NVIDIA A100-SXM4-80GB · 80 GiB",
+             "model": "NVIDIA A100-SXM4-80GB",
+             "memory_bytes": memory_bytes}
+            for index in range(8)
+        ]
+        assert options["gpu_selection"] == {
+            "mode": "exact", "default_count": 8,
+            "min_count": 1, "max_count": 8,
+        }
+        assert "allowed_device_indices" not in json.dumps(options)
+        assert "GPU-" not in json.dumps(options)
+
+        outside = urllib.request.Request(
+            base + "/api/quest-drafts", method="POST",
+            data=json.dumps({
+                "quest_id": "runtime-outside", "title": "Runtime outside",
+                "goal_brief_md": (
+                    "---\npredicate_json: {kind: test}\n---\n\n# outside\n"),
+                "runtime_profile": {
+                    "version": 3,
+                    "compute_profile_id": "local-gpu",
+                    "review_intensity": "once",
+                    "gpu_device_indices": [8],
+                },
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Idempotency-Key": "0" * 32})
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            opener.open(outside, timeout=5)
+        assert rejected.value.code == 400
+        error = json.loads(rejected.value.read())
+        assert "当前探测可信列表" in error["error"]
+        assert json.loads(opener.open(
+            base + "/api/quest-drafts", timeout=5).read())["drafts"] == []
+
+        created = post("/api/quest-drafts", {
+            "quest_id": "runtime-http", "title": "Runtime HTTP",
+            "goal_brief_md": (
+                "---\npredicate_json: {kind: test}\n---\n\n# runtime\n"),
+            "runtime_profile": default,
+        }, "1" * 32)
+        draft_id = created["draft"]["draft_id"]
+        assert created["draft"]["runtime_profile"] == default
+        published = post("/api/quest-drafts/publish", {
+            "draft_id": draft_id, "start": False,
+        }, "2" * 32)
+        assert published["quest"]["runtime_profile"]["revision"] == 1
+
+        current = json.loads(opener.open(
+            base + "/api/quest-runtime-profile?quest_id=runtime-http",
+            timeout=5).read())["runtime_profile"]
+        assert current["profile"] == default
+        alias = json.loads(opener.open(
+            base + "/api/quest-runtime-profile?quest=runtime-http",
+            timeout=5).read())["runtime_profile"]
+        assert alias == current
+
+        updated = post("/api/quest-runtime-profile", {
+            "quest_id": "runtime-http", "runtime_profile": cpu_off,
+        }, "3" * 32)
+        assert updated["runtime_profile"]["revision"] == 2
+        assert updated["runtime_profile"]["profile"] == cpu_off
+        assert updated["apply_boundary"] == "cycle"
+        assert updated["restart_pending"] is False
+        assert set(updated) == {
+            "ok", "idempotency_key", "runtime_profile", "runtime",
+            "restart_pending", "apply_boundary",
+        }
+        assert post("/api/quest-runtime-profile", {
+            "quest_id": "runtime-http", "runtime_profile": cpu_off,
+        }, "3" * 32)["runtime_profile"] == updated["runtime_profile"]
+
+        listing = json.loads(opener.open(base + "/api/quests", timeout=5).read())
+        row = next(item for item in listing["quests"]
+                   if item["quest_id"] == "runtime-http")
+        assert row["runtime_profile"] == updated["runtime_profile"]
+        assert row["setup"]["runtime_profile"] == updated["runtime_profile"]
+
+        both = urllib.request.Request(
+            base + "/api/quest-runtime-profile?quest_id=runtime-http&quest=runtime-http")
+        with pytest.raises(urllib.error.HTTPError) as invalid_alias:
+            opener.open(both, timeout=5)
+        assert invalid_alias.value.code == 400
+
+        quest = CS.QuestRegistry(root, Path(SYSTEM_ROOT)).get("runtime-http")
+        assert "runtime_profile" not in json.loads(
+            (quest.work_root / "quest.json").read_text(encoding="utf-8"))
+    finally:
+        httpd.shutdown(); httpd.server_close(); worker.join(timeout=5)
+
+
+def test_runtime_profile_postcommit_retry_is_503_with_exact_key_echo(
+        tmp_path, monkeypatch):
+    """A saved mutation is non-definitive; only pre-commit conflicts use 409."""
+    import threading
+    import urllib.error
+    import urllib.request
+
+    key = "e" * 32
+    calls = []
+
+    def update_runtime_profile(_self, quest_id, profile, idempotency_key):
+        calls.append((quest_id, profile, idempotency_key))
+        if quest_id == "precommit-conflict":
+            raise CS.WebQuestConflictError("different operation")
+        raise CS.WebQuestRetryableError(
+            "runtime profile 已保存，但 restart 调度待恢复", idempotency_key)
+
+    monkeypatch.setattr(
+        CS.WebQuestService, "update_runtime_profile", update_runtime_profile)
+    httpd = CS.serve_quests(
+        tmp_path / "registry", SYSTEM_ROOT, host="127.0.0.1", port=0,
+        capability_token=TEST_CAPABILITY)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener.addheaders = [("Authorization", f"Bearer {TEST_CAPABILITY}")]
+
+    def rejected(quest_id):
+        request = urllib.request.Request(
+            base + "/api/quest-runtime-profile", method="POST",
+            data=json.dumps({
+                "quest_id": quest_id,
+                "runtime_profile": {
+                    "version": 1,
+                    "compute_profile_id": "local-gpu",
+                    "review_intensity": "once",
+                },
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Idempotency-Key": key})
+        with pytest.raises(urllib.error.HTTPError) as captured:
+            opener.open(request, timeout=5)
+        return captured.value.code, json.loads(captured.value.read())
+
+    try:
+        status, body = rejected("saved-pending")
+        assert status == 503
+        assert body == {
+            "error": "runtime profile 已保存，但 restart 调度待恢复",
+            "retryable": True,
+            "operation_state": "saved_pending_restart",
+            "idempotency_key": "console-" + key,
+        }
+        conflict_status, conflict_body = rejected("precommit-conflict")
+        assert conflict_status == 409
+        assert conflict_body == {"error": "different operation"}
+        assert [call[2] for call in calls] == [key, key]
+    finally:
+        httpd.shutdown(); httpd.server_close(); worker.join(timeout=5)
 
 
 def test_http_post_requires_one_canonical_idempotency_key_before_spooling(seeded):
@@ -641,6 +1245,77 @@ def test_heartbeat_transcript_symlink_is_not_followed(seeded, tmp_path):
     assert CS.assemble_db(path, work, SYSTEM_ROOT)["live"]["heartbeat_age_s"] is None
 
 
+def test_runner_output_projects_running_codex_cli_activity_without_reasoning(seeded):
+    path, work = seeded
+    d = db.connect(path)
+    runner_call_id = d.execute(
+        "INSERT INTO runner_call(cycle_id,phase,purpose,status,transcript_ref) "
+        "VALUES (1,'bundle','bundle-live','running',NULL)").lastrowid
+    d.commit()
+    operation_id = "exec-" + "1" * 32
+    capture = Path(work) / "state" / "executions" / f"capture-{operation_id}.stdout.bin"
+    capture.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {"type": "item.completed", "item": {
+            "id": "hidden", "type": "reasoning", "text": "hidden-chain"}},
+        {"type": "item.started", "item": {
+            "id": "cmd-1", "type": "command_execution",
+            "command": "curl -H 'Authorization: Bearer top-secret' /status",
+            "aggregated_output": "", "status": "in_progress"}},
+        {"type": "item.completed", "item": {
+            "id": "cmd-1", "type": "command_execution",
+            "command": "curl -H 'Authorization: Bearer top-secret' /status",
+            "aggregated_output": "step 12/100", "exit_code": 0,
+            "status": "completed"}},
+    ]
+    capture.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+    receipt = {
+        "operation_id": operation_id,
+        "capture_stdout_ref": str(capture),
+    }
+    projected = CS._runner_output(
+        d, Path(work), running_authority={
+            "runner_call_id": runner_call_id, "receipt": receipt})
+    d.close()
+    live = next(item for item in projected if item["kind"] == "live")
+    assert live["runner_call_id"] == runner_call_id
+    assert live["cycle_id"] == 1 and live["phase"] == "bundle"
+    assert "step 12/100" in live["text"] and "命令执行完成" in live["text"]
+    assert "top-secret" not in live["text"] and "[已遮蔽]" in live["text"]
+    assert "hidden-chain" not in live["text"]
+    activities = [item for item in projected if item["kind"] == "activity"]
+    assert [item["activity_state"] for item in activities] == ["running", "completed"]
+    assert len({item["key"] for item in activities}) == 2
+    assert "开始执行命令" in activities[0]["text"]
+    assert "命令完成（exit 0）" in activities[1]["text"]
+    assert "step 12/100" in activities[1]["text"]
+    assert all("top-secret" not in item["text"] for item in activities)
+
+
+def test_codex_live_activity_uses_only_committed_public_short_events():
+    envelope = {"files": {"plan.json": {"large": "x" * 5_000}}}
+    lines = [
+        {"type": "thread.started", "thread_id": "private-thread"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {
+            "id": "hidden", "type": "reasoning", "text": "hidden-chain"}},
+        {"type": "item.completed", "item": {
+            "id": "answer", "type": "agent_message",
+            "text": "```json\n" + json.dumps(envelope) + "\n```"}},
+    ]
+    raw = "\n".join(json.dumps(line) for line in lines) + "\n"
+    raw += '{"type":"error","message":"unterminated-secret"}'
+    activities = CS._codex_live_activity_events(raw)
+    assert [item["activity_kind"] for item in activities] == [
+        "lifecycle", "lifecycle", "message"]
+    text = "\n".join(item["text"] for item in activities)
+    assert "执行会话已建立" in text and "正在分析上下文" in text
+    assert "plan.json" in text and "结构化产物" in text
+    assert "hidden-chain" not in text and "private-thread" not in text
+    assert "unterminated-secret" not in text and len(text) < 1_000
+
+
 def test_concurrent_enqueue_unique_seq(seeded):
     """内审 SHOULD 回归：ThreadingHTTPServer 并发 POST 下 seq 分配串行——100 并发提交得 100 个唯一 seq。"""
     import threading
@@ -902,6 +1577,55 @@ def test_capability_is_persistent_private_and_fail_closed(seeded):
                  capability_token=TEST_CAPABILITY)
 
 
+def test_browser_open_failure_prints_fragment_url_not_backend_capability_path(
+        tmp_path, monkeypatch, capsys):
+    import webbrowser
+
+    opened = []
+    monkeypatch.setattr(CS, "_configure_process_storage", lambda _root: {})
+    monkeypatch.setattr(CS, "serve_quests", lambda *_args, **_kwargs: _StoppedConsoleServer())
+    monkeypatch.setattr(webbrowser, "open_new_tab", lambda url: opened.append(url) or False)
+
+    assert CS.main([
+        "--system-root", SYSTEM_ROOT,
+        "--quests-root", str(tmp_path / "product-data"),
+        "--host", "127.0.0.1", "--port", "0",
+    ]) == 0
+
+    expected = f"http://127.0.0.1:43123/#token={TEST_CAPABILITY}"
+    output = capsys.readouterr().out
+    assert opened == [expected]
+    assert expected in output
+    assert CSP.CAPABILITY_NAME not in output
+    assert "工单/聊天记录" in output
+
+
+def test_successful_browser_open_does_not_echo_bearer_to_terminal(
+        tmp_path, monkeypatch, capsys):
+    import webbrowser
+
+    opened = []
+    monkeypatch.setattr(CS, "_configure_process_storage", lambda _root: {})
+    monkeypatch.setattr(CS, "serve_quests", lambda *_args, **_kwargs: _StoppedConsoleServer())
+    monkeypatch.setattr(webbrowser, "open_new_tab", lambda url: opened.append(url) or True)
+
+    assert CS.main([
+        "--system-root", SYSTEM_ROOT,
+        "--quests-root", str(tmp_path / "product-data"),
+    ]) == 0
+
+    output = capsys.readouterr().out
+    assert opened == [f"http://127.0.0.1:43123/#token={TEST_CAPABILITY}"]
+    assert TEST_CAPABILITY not in output
+    assert "已在默认浏览器打开" in output
+
+
+def test_authenticated_console_url_keeps_token_in_fragment_and_brackets_ipv6():
+    url = CS._authenticated_console_url("::1", 8765, TEST_CAPABILITY)
+    assert url == f"http://[::1]:8765/#token={TEST_CAPABILITY}"
+    assert "?" not in url
+
+
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
 def test_capability_rejects_nonexclusive_nonregular_entry(tmp_path, kind):
     work = tmp_path / "work"
@@ -943,7 +1667,8 @@ def test_pinned_upload_capability_survives_parent_swap(tmp_path):
 def test_fd_read_is_bounded_and_not_retargeted_after_check(seeded, tmp_path, monkeypatch):
     path, work_raw = seeded
     work = Path(work_raw)
-    victim = work / "state" / "shown.txt"
+    (work / "cycles").mkdir()
+    victim = work / "cycles" / "shown.txt"
     victim.write_bytes(b"SAFE")
     secret = tmp_path / "secret"
     secret.write_bytes(b"SECRET")
@@ -961,12 +1686,12 @@ def test_fd_read_is_bounded_and_not_retargeted_after_check(seeded, tmp_path, mon
         return info
 
     monkeypatch.setattr(CSP, "_verify_entry_matches_fd", swap_after_fd_check)
-    assert data.read_file("work/state/shown.txt") == b"SAFE"
+    assert data.read_file("work/cycles/shown.txt") == b"SAFE"
     assert swapped
 
-    large = work / "state" / "large"
+    large = work / "cycles" / "large"
     large.write_bytes(b"x" * (CS._MAX_FILE_RESPONSE_BYTES + 1))
-    assert data.read_file("work/state/large") is None
+    assert data.read_file("work/cycles/large") is None
 
 
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
@@ -975,7 +1700,8 @@ def test_fd_read_rejects_symlink_hardlink_and_fifo(seeded, tmp_path, kind):
     work = Path(work_raw)
     target = tmp_path / "read-target"
     target.write_bytes(b"SECRET")
-    entry = work / "state" / "entry"
+    (work / "cycles").mkdir()
+    entry = work / "cycles" / "entry"
     if kind == "symlink":
         entry.symlink_to(target)
     elif kind == "hardlink":
@@ -983,31 +1709,31 @@ def test_fd_read_rejects_symlink_hardlink_and_fifo(seeded, tmp_path, kind):
     else:
         os.mkfifo(entry)
     data = CS.ConsoleData(db_path=path, work_root=str(work), system_root=SYSTEM_ROOT)
-    assert data.read_file("work/state/entry") is None
+    assert data.read_file("work/cycles/entry") is None
 
 
 def test_read_file_virtual_root_any_work_name(tmp_path):
     """codex SHOULD 回归：虚拟根 'work' 显式映射到 work_root（不管其真实目录叫什么名）——
     --work-root 叫 run123/scratch 等，前端按 FS 树根 'work/...' 拼的路径照样命中（非靠 base.parent 猜）。"""
     work = tmp_path / "run-abc-123"                    # work_root 目录名 != "work"
-    (work / "state").mkdir(parents=True)
-    (work / "state" / "x.txt").write_text("hi", encoding="utf-8")
+    (work / "cycles").mkdir(parents=True)
+    (work / "cycles" / "x.txt").write_text("hi", encoding="utf-8")
     path = str(work / "research.sqlite")
     conn = db.connect(path); conn.commit(); conn.close()
     data = CS.ConsoleData(db_path=path, work_root=str(work), system_root=SYSTEM_ROOT)
-    assert data.read_file("work/state/x.txt") == b"hi"     # 虚拟根 work → work_root，不管真名
-    assert data.read_file("run-abc-123/state/x.txt") is None  # 真目录名不是虚拟根 → 拒
+    assert data.read_file("work/cycles/x.txt") == b"hi"     # 虚拟根 work → work_root，不管真名
+    assert data.read_file("run-abc-123/cycles/x.txt") is None  # 真目录名不是虚拟根 → 拒
     assert data.read_file("unknownroot/x") is None            # 非白名单虚拟根 → 拒
 
 
 def test_read_file_symlink_escape_blocked(tmp_path):
     """codex 关切：白名单目录内 symlink 指向外部 → resolve+containment 拒（不跟出根）。"""
-    work = tmp_path / "work"; (work / "state").mkdir(parents=True)
+    work = tmp_path / "work"; (work / "cycles").mkdir(parents=True)
     (tmp_path / "secret.txt").write_text("SECRET", encoding="utf-8")
-    (work / "state" / "leak").symlink_to(tmp_path / "secret.txt")
+    (work / "cycles" / "leak").symlink_to(tmp_path / "secret.txt")
     path = str(work / "research.sqlite"); db.connect(path).close()
     data = CS.ConsoleData(db_path=path, work_root=str(work), system_root=SYSTEM_ROOT)
-    assert data.read_file("work/state/leak") is None      # symlink 解析后越界 → 拒
+    assert data.read_file("work/cycles/leak") is None      # symlink 解析后越界 → 拒
 
 
 def test_notifications_drops_unterminated_tail(seeded):
@@ -1166,6 +1892,9 @@ def test_fs_tree_stops_directory_iteration_at_per_directory_cap(tmp_path, monkey
         return CountedScandir(original_scandir(path))
 
     monkeypatch.setattr(CS.os, "scandir", counted_scandir)
+    monkeypatch.setattr(
+        CS, "_PUBLIC_WORK_FILES",
+        frozenset(f"entry-{index:03d}" for index in range(50)))
     monkeypatch.setattr(CS, "_MAX_FS_ENTRIES_PER_DIRECTORY", 4)
     monkeypatch.setattr(CS, "_MAX_FS_NODES", 100)
     tree = CS._fs_tree(work, empty_system)
@@ -1177,7 +1906,7 @@ def test_fs_tree_stops_directory_iteration_at_per_directory_cap(tmp_path, monkey
 def test_fs_tree_does_not_follow_directory_swapped_to_symlink(tmp_path, monkeypatch):
     """symlink 检查之后的 rename 也不能让只读树递归到 work_root 之外。"""
     work = tmp_path / "work"
-    victim = work / "victim"
+    victim = work / "cycles"
     victim.mkdir(parents=True)
     (victim / "safe.txt").write_text("SAFE", encoding="utf-8")
     outside = tmp_path / "outside"
@@ -1193,7 +1922,7 @@ def test_fs_tree_does_not_follow_directory_swapped_to_symlink(tmp_path, monkeypa
         nonlocal swapped
         if path == victim.name and dir_fd is not None and not swapped:
             swapped = True
-            victim.rename(work / "victim-safe-old")
+            victim.rename(work / "cycles-safe-old")
             victim.symlink_to(outside, target_is_directory=True)
         return original_open(path, flags, mode, dir_fd=dir_fd)
 

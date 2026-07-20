@@ -18,6 +18,7 @@ authorizer 对「日志 / 人机 / 外部检索」9 表的 SELECT 一律 DENY（
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -53,7 +54,8 @@ CREATE TEMP VIEW gate_input_cycle AS
   SELECT id, status, goal_id, goal_ver, active_question_id FROM cycle;
 CREATE TEMP VIEW gate_input_goal_current AS
   SELECT id AS goal_id, MAX(version) AS goal_ver FROM goal GROUP BY id;
-CREATE TEMP VIEW gate_input_question AS SELECT id, status, goal_id, goal_ver FROM question;
+CREATE TEMP VIEW gate_input_question AS
+  SELECT id, status, goal_id, goal_ver, predicate_json FROM question;
 CREATE TEMP VIEW gate_input_measurement AS
   SELECT mr.id AS metric_result_id, mr.evaluation_id, mr.evaluation_attempt_id, mr.metric_id, mr.metric_ver, mr.scope,
          e.status AS eval_status, ea.status AS attempt_status,
@@ -77,7 +79,13 @@ def open_gate_read_conn(path: str) -> sqlite3.Connection:
     须与写连接指向同一**已建**文件库（:memory: 每连接独立库，故门禁读连接测试须用文件库）。
     顺序：authorizer 在建视图后装（视图创建需读 schema）；此后本连接自始至终禁读 9 表、且物理不可写。
     """
-    conn = sqlite3.connect(f"file:{quote(path)}?mode=ro", uri=True)   # quote 护含 ?/#/% 的路径
+    # Resident Bundle runs the long official execution pipeline in one owner
+    # background thread while the main Codex turn polls status through MCP.
+    # This connection is physically read-only and is used serially by its gate
+    # object, so permit that owner-controlled thread handoff.  The only writable
+    # connection remains serialized by WriteDaemon.
+    conn = sqlite3.connect(
+        f"file:{quote(path)}?mode=ro", uri=True, check_same_thread=False)
     conn.executescript(GATE_INPUT_VIEWS)
     conn.set_authorizer(gate_authorizer)
     return conn
@@ -200,10 +208,12 @@ class SqliteGate:
             (ci,)) if ci is not None else None
         if ci is None or crow is None:
             rej(f"cycle 不存在/非法: {cycle_id!r}")   # 预校验，避免 answer.cycle_id FK 撞裸约束错
-        qrow = self._q1("SELECT status, goal_id, goal_ver FROM gate_input_question WHERE id=?", (qi,)) if qi else None
+        qrow = self._q1(
+            "SELECT status, goal_id, goal_ver, predicate_json "
+            "FROM gate_input_question WHERE id=?", (qi,)) if qi else None
         if qrow is None:
             rej(f"question 不存在: {question_id}")
-        status, goal_id, goal_ver = qrow
+        status, goal_id, goal_ver, question_predicate_raw = qrow
         if status in ("answered", "refuted", "dead_end"):
             rej(f"question 已终态（{status}），不可关")
         current = self._q1(
@@ -217,6 +227,10 @@ class SqliteGate:
             rej(f"verdict 非法: {verdict}")
         if not evidence:
             rej("I3：关问需 ≥1 条证据")
+        contract_error = self._question_closure_contract_error(
+            question_predicate_raw, evidence)
+        if contract_error is not None:
+            rej(contract_error)
 
         resolved = []   # 逐条证据形状/引用/非成功测量校验（触发器兜底项）通过后的落库参数
         for ev in evidence:
@@ -229,7 +243,9 @@ class SqliteGate:
         # （只收约束类，database-locked / IO 等基础设施错原样抛，不误记为 gate reject）。
         gate_err = self._lineage_violation(conn, ci, qi)
         if gate_err is None:
-            gate_err = self._gate_only_violation(resolved, goal_id, goal_ver, conn=conn)
+            gate_err = self._gate_only_violation(
+                resolved, goal_id, goal_ver, question_id=qi,
+                verdict=verdict, conn=conn)
         if gate_err is not None:
             rej(gate_err)
 
@@ -271,6 +287,51 @@ class SqliteGate:
         return f"a{aid}"
 
     @staticmethod
+    def _question_closure_contract_error(
+            predicate_raw: Optional[str], evidence: List[Dict[str, Any]]) -> Optional[str]:
+        """Keep question admission and I3 evidence vocabularies on one contract.
+
+        ``NULL`` is the upgrade-compatible legacy state and means the historical four-way
+        I3 vocabulary.  StateStore-created questions are never NULL after question-admission
+        v1.  A present but malformed contract fails closed instead of silently broadening the
+        evidence that may close the node.
+        """
+        if predicate_raw is None:
+            return None
+        try:
+            predicate = json.loads(
+                predicate_raw,
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"非有限 JSON number: {token}")),
+            )
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return "question.predicate_json 损坏，不得关闭 question"
+        if not isinstance(predicate, dict) or predicate.get("kind") != "evidence_closure_v1":
+            return "question.predicate_json 不是 evidence_closure_v1，不得关闭 question"
+        required = {
+            "kind", "allowed_evidence", "answer_criterion_md", "refute_criterion_md"}
+        if set(predicate) != required:
+            return "question.predicate_json evidence closure 字段不完整，不得关闭 question"
+        if any(not isinstance(predicate.get(field), str) or not predicate[field].strip()
+               for field in ("answer_criterion_md", "refute_criterion_md")):
+            return "question.predicate_json closure criterion 非空字符串要求不满足，不得关闭 question"
+        allowed = predicate.get("allowed_evidence")
+        global_allowed = {"evaluation", "literature", "child_answer", "human"}
+        if (not isinstance(allowed, list) or not allowed
+                or any(not isinstance(kind, str) or kind not in global_allowed for kind in allowed)
+                or len(set(allowed)) != len(allowed)):
+            return "question.predicate_json.allowed_evidence 非法，不得关闭 question"
+        disallowed = sorted(
+            {item.get("kind") for item in evidence if item.get("kind") not in set(allowed)},
+            key=lambda value: str(value),
+        )
+        if disallowed:
+            return (
+                "I3：证据类型不在 question closure contract 中："
+                f"{disallowed}；allowed={sorted(allowed)}")
+        return None
+
+    @staticmethod
     def _lineage_violation(conn, cycle_id: int, question_id: int) -> Optional[str]:
         """写锁内重核 current cycle↔active question lineage；旧 cycle 不得组合产生新版 answer。"""
         cycle = conn.execute(
@@ -290,7 +351,8 @@ class SqliteGate:
         return None
 
     def _gate_only_violation(self, resolved: List[Dict[str, Any]], goal_id: int, goal_ver: int,
-                             *, conn: Optional[sqlite3.Connection] = None) -> Optional[str]:
+                             *, question_id: int, verdict: str,
+                             conn: Optional[sqlite3.Connection] = None) -> Optional[str]:
         """无触发器兜底的 gate-only 不变量（写锁内重跑，TOCTOU-safe）：target_complete + applicability 同版负向。
         经 self.read（受限连接 + gate_input 视图）取数；返回首个违规拒因或 None。"""
         for r in resolved:
@@ -314,7 +376,128 @@ class SqliteGate:
                     params))
                 if app is not None and app[0] != "still_applicable":
                     return f"child_answer 所指 answer 在当前 goal_ver applicability={app[0]}（非 still_applicable）"
+        predicate_error = self._metric_goal_predicate_violation(
+            resolved, goal_id, goal_ver, question_id=question_id,
+            verdict=verdict, conn=conn)
+        if predicate_error is not None:
+            return predicate_error
         return None
+
+    @staticmethod
+    def _metric_goal_predicate_violation(
+            resolved: List[Dict[str, Any]], goal_id: int, goal_ver: int, *,
+            question_id: int, verdict: str,
+            conn: Optional[sqlite3.Connection]) -> Optional[str]:
+        """Require supported root success claims to be true measurements, not prose.
+
+        ``refuted`` remains a valid evidence-backed negative conclusion.  Custom qualification
+        predicates are enforced by their dedicated firewall; this generic gate only evaluates the
+        frozen ``metric_comparison`` contract used by ordinary goals.
+        """
+        if verdict != "answered" or conn is None:
+            return None
+        question = conn.execute(
+            "SELECT parent_id FROM question WHERE id=?", (question_id,)).fetchone()
+        if question is None or question[0] is not None:
+            return None
+        goal = conn.execute(
+            "SELECT predicate_json FROM goal WHERE id=? AND version=?",
+            (goal_id, goal_ver)).fetchone()
+        if goal is None:
+            return "goal predicate 所属 goal 不存在"
+        try:
+            predicate = json.loads(
+                goal[0], parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"非有限 JSON number: {token}")))
+        except (json.JSONDecodeError, ValueError):
+            return "goal.predicate_json 损坏，不得关闭 root"
+        if not isinstance(predicate, dict) or predicate.get("kind") != "metric_comparison":
+            return None
+
+        protocol_name = predicate.get("protocol")
+        protocol_ver = predicate.get("protocol_ver")
+        metric_name = predicate.get("metric_id")
+        metric_ver = predicate.get("metric_ver")
+        scope = predicate.get("scope")
+        success = predicate.get("success")
+        if (not isinstance(protocol_name, str) or not protocol_name
+                or isinstance(protocol_ver, bool) or not isinstance(protocol_ver, int)
+                or protocol_ver <= 0 or not isinstance(metric_name, str) or not metric_name
+                or isinstance(metric_ver, bool) or not isinstance(metric_ver, int)
+                or metric_ver <= 0 or scope not in ("fold", "aggregate")
+                or not isinstance(success, dict)):
+            return "metric_comparison goal predicate 结构非法，不得关闭 root"
+        op = success.get("op")
+        threshold = success.get("value")
+        if (op not in (">", ">=", "<", "<=", "==", "!=")
+                or isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or not math.isfinite(float(threshold))):
+            return "metric_comparison success 比较式非法，不得关闭 root"
+
+        metric_result_ids = {
+            int(item["metric_result_id"])
+            for item in resolved
+            if item.get("kind") == "evaluation"
+            and isinstance(item.get("metric_result_id"), int)
+        }
+        child_answer_ids = {
+            int(item["child_answer_id"])
+            for item in resolved
+            if item.get("kind") == "child_answer"
+            and isinstance(item.get("child_answer_id"), int)
+        }
+        # Root aggregation normally cites child answers.  Walk their evidence DAG with UNION
+        # deduplication and inherit only valid metric_result references.
+        if child_answer_ids:
+            placeholders = ",".join("(?)" for _ in child_answer_ids)
+            rows = conn.execute(
+                "WITH RECURSIVE answer_tree(id) AS (VALUES " + placeholders + " "
+                "UNION SELECT e.child_answer_id FROM evidence e JOIN answer_tree t "
+                "ON e.answer_id=t.id WHERE e.kind='child_answer' AND e.valid=1) "
+                "SELECT DISTINCT e.metric_result_id FROM evidence e JOIN answer_tree t "
+                "ON e.answer_id=t.id WHERE e.kind='evaluation' AND e.valid=1 "
+                "AND e.metric_result_id IS NOT NULL",
+                tuple(sorted(child_answer_ids))).fetchall()
+            metric_result_ids.update(int(row[0]) for row in rows)
+
+        matched = []
+        for metric_result_id in sorted(metric_result_ids):
+            row = conn.execute(
+                "SELECT p.name,e.protocol_ver,md.name,mr.metric_ver,mr.scope,mr.value,"
+                "e.status,ea.status,e.canonical_attempt_id,mr.evaluation_attempt_id "
+                "FROM metric_result mr JOIN evaluation e ON e.id=mr.evaluation_id "
+                "JOIN evaluation_attempt ea ON ea.id=mr.evaluation_attempt_id "
+                "JOIN protocol p ON p.id=e.protocol_id AND p.version=e.protocol_ver "
+                "JOIN metric_def md ON md.id=mr.metric_id AND md.version=mr.metric_ver "
+                "WHERE mr.id=?", (metric_result_id,)).fetchone()
+            if row is None:
+                continue
+            (actual_protocol, actual_pver, actual_metric, actual_mver, actual_scope,
+             value, eval_status, attempt_status, canonical_attempt, attempt_id) = row
+            if ((actual_protocol, actual_pver, actual_metric, actual_mver, actual_scope)
+                    != (protocol_name, protocol_ver, metric_name, metric_ver, scope)
+                    or eval_status != "success" or attempt_status != "success"
+                    or canonical_attempt != attempt_id or not math.isfinite(float(value))):
+                continue
+            matched.append((metric_result_id, float(value)))
+
+        threshold_value = float(threshold)
+        comparators = {
+            ">": lambda value: value > threshold_value,
+            ">=": lambda value: value >= threshold_value,
+            "<": lambda value: value < threshold_value,
+            "<=": lambda value: value <= threshold_value,
+            "==": lambda value: value == threshold_value,
+            "!=": lambda value: value != threshold_value,
+        }
+        if any(comparators[op](value) for _mrid, value in matched):
+            return None
+        shown = ", ".join(f"mr{mrid}={value}" for mrid, value in matched) or "无精确匹配测量"
+        return (
+            "root answered 未满足 goal metric_comparison："
+            f"{protocol_name}@{protocol_ver} {metric_name}@{metric_ver} "
+            f"scope={scope} {op} {threshold_value}；{shown}")
 
     def _reject(self, cycle_id, qi, msg: str, question_id_raw=None,
                 conn: Optional[sqlite3.Connection] = None):

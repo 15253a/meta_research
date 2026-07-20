@@ -16,10 +16,45 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import sysconfig
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-MIGRATION_FILE = Path(__file__).resolve().parent.parent / "db" / "migrations" / "0001_appendix_a.sql"
+
+_MIGRATION_RELATIVE = Path("db/migrations/0001_appendix_a.sql")
+
+
+def _resolve_migration_file() -> Path:
+    """Locate the frozen DDL in a checkout or an installed wheel.
+
+    Runtime assets are installed under ``<data>/share/meta-research`` while a
+    source checkout keeps them beside the Python package.  Database import
+    happens before ``web_app.main`` can pass its resolved system root, so the
+    migration locator must independently support the same layouts.
+    """
+    package_parent = Path(__file__).resolve().parent.parent
+    configured = os.environ.get("META_RESEARCH_SYSTEM_ROOT")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend([
+        package_parent,
+        package_parent / "share" / "meta-research",
+        Path(sysconfig.get_path("data")) / "share" / "meta-research",
+    ])
+    for root in candidates:
+        try:
+            candidate = (root / _MIGRATION_RELATIVE).resolve(strict=True)
+        except OSError:
+            continue
+        if candidate.is_file():
+            return candidate
+    # Keep import side-effect free and let the existing schema-drift/opening
+    # boundary report the missing frozen migration when it is actually used.
+    return package_parent / _MIGRATION_RELATIVE
+
+
+MIGRATION_FILE = _resolve_migration_file()
 
 # 字节冻结锚：附录 A 提取文件的 SHA256。任何改动=决策性改动，须走检查点评审并同步更新此常量。
 MIGRATION_SHA256 = "c56df2db0434877b5b3dcba17302e8967ed256a337988d0dd58cd5c7e5cfffd4"

@@ -132,6 +132,9 @@ def _pure_dependency_image_object(
     derived_config.update({
         "image": result_image_id,
         "image_id": result_image_id,
+        "python_path": "/usr/local/bin/python3",
+        "local_environment": None,
+        "development_gpu_thread_limit": None,
         "payload_environment": payload_environment,
     })
 
@@ -380,6 +383,12 @@ def test_derived_image_sandbox_inherits_exact_gpu_contract(tmp_path, monkeypatch
         derived = builder._derived_sandbox("sha256:" + "a" * 64)
         assert derived.gpu_contract == bootstrap.gpu_contract
         assert derived.config["gpu_capability"] == bootstrap.config["gpu_capability"]
+        assert bootstrap.config["local_environment"] is not None
+        assert derived.config["local_environment"] is None
+        assert derived.config["development_gpu_thread_limit"] is None
+        assert derived.config["python_path"] == "/usr/local/bin/python3"
+        assert derived.config["network_mode"] == bootstrap.config["network_mode"]
+        assert derived.config["readonly_mounts"] == bootstrap.config["readonly_mounts"]
         assert derived.environment_hash == sandbox_environment_hash(derived.config)
         assert derived.environment_hash != derived.workload_environment_hash(True)
         assert derived.workload_environment_hash(True) == (
@@ -507,7 +516,9 @@ def test_lock_rejects_ssrf_and_download_identity_drift(tmp_path):
         supervisor.close()
 
 
-def test_exact_image_build_reuse_and_archive_restore(tmp_path, monkeypatch):
+def test_exact_image_build_reuse_and_archive_restore(
+        docker_workspace_tmp_path, monkeypatch):
+    tmp_path = docker_workspace_tmp_path
     filename, wheel = _wheel()
     lock = _lock(filename, wheel)
     calls = 0

@@ -191,8 +191,10 @@ def test_console_e2e_query_grounded_and_no_dup(running):
         (queued["idempotency_key"],))[0]
     rep = daemon.query_one("SELECT reply_text FROM interaction_reply WHERE message_id=?", (mid,))
     assert rep is not None
-    # grounded：回复据真卡渲染，含快照 c1 / 活跃问题 q1 / 「当前问题」段（非固定串 "ok"）
-    assert "快照 c1" in rep[0] and "当前问题" in rep[0] and "q1" in rep[0]
+    # grounded：模板只投影真卡里的可读进展，不再向普通用户泄露 DB 快照/问题主键词汇。
+    assert "正在整理结果并决定下一步" in rep[0]
+    assert "已形成 1 个回答" in rep[0] and "1 次成功评测" in rep[0]
+    assert "q1" not in rep[0] and rep[0] != "ok"
     # no-dup：游标丢/重放既不重复 message 也不重复 reply（按 idempotency key 断言，堵「另建同 key message+reply」假绿口）
     (env["work"] / "state" / "console_inbox.cursor").unlink()
     ingest.ingest()
@@ -242,8 +244,13 @@ def test_console_e2e_late_503_retry_converges_on_one_authoritative_message(runni
         "WHERE m.connector='console' AND m.idempotency_key=?", (stored_key,))[0] == 1
 
 
-def test_console_file_request_http_spool_ingest_precheck_loop(running):
-    """CP11.2 真闭环：HTTP 只入 spool → run 单写 ingest resolve + provenance → precheck 同拍解阻断。"""
+def test_console_file_request_publication_spool_ingest_precheck_loop(running):
+    """CP11.2 真闭环：服务端发布能力 → spool → 单写 ingest/provenance → 同拍解阻断。
+
+    Browser HTTP is intentionally unable to submit ``source_ref``.  The Web
+    upload publisher owns that private capability and invokes the same spool
+    method after it has verified the managed upload tree.
+    """
     env, daemon = running, running["daemon"]
     managed_input = env["work"] / "managed-input"
     service = FileRequestService(daemon, SchemaSet(SYSTEM_ROOT / "schemas"), POLICY, str(managed_input))
@@ -259,9 +266,16 @@ def test_console_file_request_http_spool_ingest_precheck_loop(running):
     src.mkdir(parents=True); (src / "data.bin").write_bytes(b"HTTP-DATA")
     before = _db_snapshot(daemon.conn)
     client_key = "d" * 32
-    queued = _post_file_request(
-        env, "resolve", rid, source_ref=f"work/uploads/r{rid}",
-        idempotency_key=client_key)["queued"]
+    with pytest.raises(urllib.error.HTTPError) as denied:
+        _post_file_request(
+            env, "resolve", rid, source_ref=f"work/uploads/r{rid}",
+            idempotency_key=client_key)
+    assert denied.value.code == 400
+    queued = CS.ConsoleData(
+        db_path=env["db_path"], work_root=str(env["work"]),
+        system_root=str(SYSTEM_ROOT)).enqueue_file_request_action(
+            action="resolve", request_id=rid, source_ref=f"work/uploads/r{rid}",
+            client_idempotency_key=client_key)
     assert queued["action_target"] == "file_request" and queued["request_id"] == rid
     assert _db_snapshot(daemon.conn) == before                  # console_server 仍零 DB 写
 
@@ -288,9 +302,11 @@ def test_console_file_request_http_spool_ingest_precheck_loop(running):
     assert precheck() is None
     assert daemon.query_one("SELECT resolved_message_id FROM interaction_request WHERE id=?", (rid,))[0] == mid
     shutil.rmtree(env["work"] / "uploads" / f"r{rid}")         # 成功后清理上传源是正常运维动作
-    retried = _post_file_request(
-        env, "resolve", rid, source_ref=f"work/uploads/r{rid}",
-        idempotency_key=client_key)["queued"]
+    retried = CS.ConsoleData(
+        db_path=env["db_path"], work_root=str(env["work"]),
+        system_root=str(SYSTEM_ROOT)).enqueue_file_request_action(
+            action="resolve", request_id=rid, source_ref=f"work/uploads/r{rid}",
+            client_idempotency_key=client_key)
     assert retried["idempotency_key"] == queued["idempotency_key"]
     assert precheck() is None
     assert daemon.query_one(

@@ -668,6 +668,38 @@ class CycleSnapshotPublisher:
                     "provenance_manifest_hash": row[1], "cycle_id": f"c{row[2]}",
                     "retention": "db_provenance_only",
                 })
+            # Formal source trees use the frozen baseline columns.  Legacy Git refs remain valid
+            # metadata, but only the explicit tree-hash form is a registered filesystem asset.
+            for row in conn.execute(
+                    "SELECT id,code_ref,commit_hash FROM baseline "
+                    "WHERE code_ref IS NOT NULL AND commit_hash LIKE 'sha256-tree-v1:%' ORDER BY id"):
+                content_hash = row[2].removeprefix("sha256-tree-v1:")
+                if re.fullmatch(r"[0-9a-f]{64}", content_hash) is None:
+                    raise StorageGovernanceError(
+                        f"baseline {row[0]} formal code hash 非法")
+                assets.append({
+                    "owner": "baseline_code", "owner_id": int(row[0]), "ref": row[1],
+                    "hash_alg": "sha256-tree-v1", "content_hash": content_hash,
+                    "retention": "registered_forever",
+                })
+            # The immutable pool manifest is the path+hash index for identity/config/protocol and
+            # the evaluation attempt tree, whose frozen tables intentionally have no generic path
+            # columns.  The append-only gate decision is their DB anchor.
+            for row in conn.execute(
+                    "SELECT id,cycle_id,type,json_extract(payload_json,'$.manifest_ref'),"
+                    "json_extract(payload_json,'$.manifest_hash') FROM decision "
+                    "WHERE actor='gate' AND type IN "
+                    "('pool_training_publication','pool_publication') ORDER BY id"):
+                if (not isinstance(row[3], str) or not row[3]
+                        or not isinstance(row[4], str)
+                        or re.fullmatch(r"[0-9a-f]{64}", row[4]) is None):
+                    raise StorageGovernanceError(
+                        f"pool_publication decision {row[0]} manifest ref/hash 非法")
+                assets.append({
+                    "owner": row[2], "owner_id": int(row[0]),
+                    "ref": row[3], "hash_alg": "sha256", "content_hash": row[4],
+                    "cycle_id": f"c{row[1]}", "retention": "registered_forever",
+                })
             return assets
         finally:
             conn.close()
@@ -800,15 +832,29 @@ class CycleSnapshotPublisher:
                              "FROM question ORDER BY id"))
             pool = [prefix]
             for title, columns, sql in (
-                ("基线", ("编号", "短名", "规范键", "状态"),
-                 "SELECT id,slug,canonical_key,status FROM baseline ORDER BY id"),
+                ("基线", ("编号", "短名", "规范键", "状态", "正式代码路径", "代码/提交哈希"),
+                 "SELECT id,slug,canonical_key,status,code_ref,commit_hash FROM baseline ORDER BY id"),
                 ("变体", ("编号", "基线", "变体键", "状态", "环境哈希"),
                  "SELECT id,baseline_id,variant_key,status,env_hash FROM variant ORDER BY id"),
                 ("检查点", ("编号", "变体", "检查点键", "路径", "内容哈希", "算法", "来源"),
                  "SELECT id,variant_id,ckpt_key,path,content_hash,hash_alg,origin FROM checkpoint ORDER BY id"),
-                ("评测", ("编号", "变体", "协议", "协议版本", "评测键", "状态", "规范尝试"),
-                 "SELECT id,variant_id,protocol_id,protocol_ver,eval_key,status,canonical_attempt_id "
-                 "FROM evaluation ORDER BY id"),
+                ("协议", ("编号", "版本", "名称", "冻结规格"),
+                 "SELECT id,version,name,scope_spec_json FROM protocol ORDER BY id,version"),
+                ("评测", ("编号", "变体", "协议", "协议版本", "评测键", "状态", "规范尝试",
+                         "产物哈希锚", "正式池 manifest"),
+                 "SELECT e.id,e.variant_id,e.protocol_id,e.protocol_ver,e.eval_key,e.status,"
+                 "e.canonical_attempt_id,ea.artifact_ref,ea.transcript_ref FROM evaluation e "
+                 "LEFT JOIN evaluation_attempt ea ON ea.id=e.canonical_attempt_id ORDER BY e.id"),
+                ("正式池发布", ("决策", "轮次", "阶段", "manifest 路径", "manifest 哈希", "基线", "变体", "评测", "尝试"),
+                 "SELECT id,cycle_id,type,json_extract(payload_json,'$.manifest_ref'),"
+                 "json_extract(payload_json,'$.manifest_hash'),json_extract(payload_json,'$.baseline_id'),"
+                 "json_extract(payload_json,'$.variant_id'),json_extract(payload_json,'$.evaluation_id'),"
+                 "json_extract(payload_json,'$.attempt_id') FROM decision "
+                 "WHERE actor='gate' AND type IN ('pool_training_publication','pool_publication') "
+                 "ORDER BY id"),
+                ("资产卡片", ("编号", "类型", "对象", "源哈希", "更新轮次", "过期"),
+                 "SELECT id,card_type,ref_id,src_hash,updated_cycle,stale FROM card "
+                 "WHERE card_type IN ('baseline','variant','protocol') ORDER BY id"),
             ):
                 pool.extend((_section(title, columns, conn.execute(sql)), "\n"))
             digest = [prefix, _section(

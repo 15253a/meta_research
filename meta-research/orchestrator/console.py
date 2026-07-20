@@ -22,7 +22,8 @@ has_blocking_pause = 最近一次被消费的 pause/resume 是 pause**（按消�
 先消费到期 directive 再查阻断（Advancer 前置检查顺序，CP6.3 接线）。resume 消费顺带把**早于它的**
 pending pause 置 superseded（队列清理；晚到的 pause 保留、到时机再生效）。
 
-其余效果：abort_cycle（在途轮 aborted，并原子释放 active 问题）、inject_question（open 问题，source='human'）、
+其余效果：abort_cycle（在途轮 aborted，并原子释放 active 问题）、inject_question（只冻结带 request_ref 的
+reasoning 建题请求；question/source/authority 由 StateStore 同轮事务准入）、
 prune_branch（decision(type=prune_branch) 先行再 dead_end，且**该决策即消费决策**——一次消费一条
 人类决策，不重复记账）、note（按 consumed_cycle 真正编入下一次 reasoning ContextPack）。
 `set_budget` 以消费 DECISION 的完整预算投影为耐久权威，所有预算消费者重启后同源读取；
@@ -43,9 +44,9 @@ import sqlite3
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from .ids import cnum as _cnum, qnum as _qnum
+from .durable_stop import has_active_global_stop
 from .import_authority import (
     ImportAuthorityError,
-    build_human_named_authority,
     validate_github_uri,
     validate_optional_revision,
 )
@@ -86,8 +87,10 @@ _BUDGET_FIELD_PATTERNS = (
 # console HTTP/spool 的 operation domain 必须进入权威 append-only message；只留在 JSONL 会在 cursor
 # 丢失/跨端点 nonce 复用时失去判别力。复用冻结 DDL 的 session_ref，不新增 migration。
 CONSOLE_MESSAGE_SESSION_REF = "console-op:message:v1"
+NARRATOR_QUERY_SESSION_REF = "console-op:narrator-query:v1"
 DIRECTIVE_ACTION_SESSION_REF = "console-op:directive-action:v1"
 FILE_REQUEST_ACTION_SESSION_REF = "console-op:file-request-action:v1"
+_QUESTION_REQUEST_PROTOCOL = "directive-question-request-v1"
 
 
 class IdempotencyCollisionError(ValueError):
@@ -507,6 +510,50 @@ class Console:
             return ex
         return {"message_id": mid, "intent": c["intent"], "directive_id": did,
                 "needs_confirmation": bool(did) and c.get("hardness") == "hard" and c["intent"] == "directive"}
+
+    def handle_query_inbound(self, *, connector: str, raw_text: str,
+                             idempotency_key: str,
+                             goal_id: Optional[int] = None,
+                             goal_ver: Optional[int] = None,
+                             cycle_id: Optional[str] = None,
+                             session_ref: str = NARRATOR_QUERY_SESSION_REF,
+                             conversation_id: Optional[str] = None) -> Dict[str, Any]:
+        """Persist an authenticated narrator request as an unconditionally read-only query.
+
+        The narrator transport is a different authority from the command box.  Its text may
+        mention words such as ``pause`` or ``budget`` while asking for an explanation; running
+        that text through the directive classifier would let a read-only UI accidentally create
+        state-changing intent.  The explicit transport marker therefore owns classification,
+        while the immutable message/replay checks remain identical to ``handle_inbound``.
+        """
+        if session_ref != NARRATOR_QUERY_SESSION_REF:
+            raise ValueError("讲解员 query session_ref 不合法")
+        mid = self.ingest.inbound(
+            connector=connector, raw_text=raw_text,
+            idempotency_key=idempotency_key, goal_id=goal_id,
+            goal_ver=goal_ver, cycle_id=cycle_id, session_ref=session_ref,
+            conversation_id=conversation_id)
+        expected_hash = "sha256:" + hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        stored = self.daemon.query_one(
+            "SELECT connector,raw_text,raw_hash,goal_id,goal_ver,session_ref,conversation_id "
+            "FROM interaction_message WHERE id=?", (mid,))
+        if stored != (connector, raw_text, expected_hash, goal_id, goal_ver,
+                      session_ref, conversation_id):
+            raise IdempotencyCollisionError(
+                f"{connector} idempotency_key 已绑定其他不可变消息: {idempotency_key}")
+        with self.daemon.transaction() as conn:
+            existing = conn.execute(
+                "SELECT intent,directive_id FROM interaction_classification WHERE message_id=?",
+                (mid,)).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO interaction_classification(message_id,intent,directive_id) "
+                    "VALUES (?,'query',NULL)", (mid,))
+            elif tuple(existing) != ("query", None):
+                raise IdempotencyCollisionError(
+                    f"讲解员 query 已绑定非 query 分类: message_id={mid}")
+        return {"message_id": mid, "intent": "query", "directive_id": None,
+                "needs_confirmation": False}
 
     def _handle_continue_atomic(self, *, connector: str, raw_text: str,
                                 idempotency_key: str, goal_id: Optional[int],
@@ -970,9 +1017,7 @@ class Console:
                     raise DirectiveApplicationError("set_budget 未装配启动 policy，不能构造耐久有效预算")
                 if payload.get("parse_error"):
                     raise DirectiveApplicationError(f"set_budget 参数未解析: {payload['parse_error']}")
-                if conn.execute(
-                        "SELECT 1 FROM decision WHERE actor='orchestrator' AND type='global_stop' LIMIT 1"
-                ).fetchone() is not None:
+                if has_active_global_stop(conn):
                     raise DirectiveApplicationError("系统已有 durable global_stop；set_budget 不具备撤销停机语义")
                 try:
                     previous = effective_budget_config(conn, self.policy["budget"])
@@ -1084,24 +1129,28 @@ class Console:
                     "applies_to_reasoning_cycle": cycle_id,
                 })
             elif kind == "inject_question":
+                # inject_question 只是 reasoning 输入，不是旁路建题权限。真正的 question
+                # 必须由同轮 reasoning 产 tree_ops，再经 StateStore 的 predicate/admission
+                # 与 tree_guard 统一落库。这里只冻结人类请求及其 provenance。
+                if ci is None:
+                    raise DirectiveApplicationError(
+                        "inject_question 必须绑定将消费它的 reasoning cycle")
                 # goal_id=1 + MAX(version) = 全库单目标约定（statestore/advancer 同口径）；多目标=系统级改造
                 current_goal = conn.execute(
                     "SELECT id,version FROM goal WHERE id=1 ORDER BY version DESC LIMIT 1").fetchone()
                 if current_goal is None:
                     raise DirectiveApplicationError("inject_question 时当前 goal 不存在")
+                if (source_goal_id, source_goal_ver) != tuple(current_goal):
+                    raise DirectiveApplicationError(
+                        "inject_question source goal 已过期；请基于当前目标重新提交")
                 repo = payload.get("human_named_repo")
                 if repo is not None:
                     if hardness != "hard" or not payload.get("confirmed"):
                         raise DirectiveApplicationError(
                             "human_named repo 必须经 hard directive 明确确认")
-                    if ((source_goal_id, source_goal_ver) != tuple(current_goal)
-                            or source_message_id is None):
+                    if source_message_id is None:
                         raise DirectiveApplicationError(
                             "human_named repo 来源须绑定当前 goal 的耐久 interaction message")
-                    if self.policy is None or not isinstance(
-                            self.policy.get("tree_guard"), dict):
-                        raise DirectiveApplicationError(
-                            "human_named repo 未装配 tree_guard policy，拒绝绕过树护栏")
                 question_text = payload.get("question_text", payload.get("polished", ""))
                 if not isinstance(question_text, str) or not question_text.strip():
                     raise DirectiveApplicationError("inject_question 缺非空 question_text")
@@ -1123,68 +1172,28 @@ class Console:
                     if parent_id <= 0 or parent_row is None:
                         raise DirectiveApplicationError(
                             "inject_question parent 不属于当前 goal lineage")
+                request = {
+                    "protocol": _QUESTION_REQUEST_PROTOCOL,
+                    # StateStore question admission uses the same whitespace
+                    # canonical form.  Freezing it here lets request_ref bind
+                    # the eventual row by exact text instead of a fuzzy match.
+                    "requested_text": " ".join(question_text.split()),
+                    "parent_question_id": (
+                        f"q{parent_id}" if parent_id is not None else None),
+                    "suggested_kind": (
+                        "import_reference" if repo is not None else "followup"),
+                    "request_ref": f"db:directive:{directive_id}",
+                    # reasoning 必须自行给出 evidence_closure_v1 predicate_json；
+                    # 不把控制台文本伪装成已准入的 tree op。
+                    "requires_reasoning_predicate": True,
+                }
                 if repo is not None:
-                    guard = self.policy["tree_guard"]
-                    open_count = conn.execute(
-                        "SELECT count(*) FROM question WHERE status IN ('open','inconclusive')"
-                    ).fetchone()[0]
-                    if open_count + 1 > int(guard["max_open_questions"]):
-                        raise DirectiveApplicationError(
-                            "human_named question 超出 max_open_questions")
-                    if parent_id is not None:
-                        child_count = conn.execute(
-                            "SELECT count(*) FROM question WHERE parent_id=?",
-                            (parent_id,)).fetchone()[0]
-                        if child_count + 1 > int(guard["max_children_per_node"]):
-                            raise DirectiveApplicationError(
-                                "human_named question 超出 max_children_per_node")
-                        depth = 1
-                        cursor = parent_id
-                        seen = set()
-                        while cursor is not None and cursor not in seen:
-                            seen.add(cursor)
-                            ancestor = conn.execute(
-                                "SELECT parent_id FROM question WHERE id=?",
-                                (cursor,)).fetchone()
-                            if ancestor is None:
-                                raise DirectiveApplicationError(
-                                    "human_named parent lineage 损坏")
-                            cursor = ancestor[0]
-                            if cursor is not None:
-                                depth += 1
-                        if depth > int(guard["max_decompose_depth"]):
-                            raise DirectiveApplicationError(
-                                "human_named question 超出 max_decompose_depth")
-                qid = conn.execute(
-                    "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source) "
-                    "VALUES (?,?,?,?,?,'open','human')",
-                    (parent_id, current_goal[0], current_goal[1], current_goal[1],
-                     question_text.strip())).lastrowid
-                effect["question_id"] = f"q{qid}"
-                if repo is not None:
-                    try:
-                        authority = build_human_named_authority(
-                            directive_id=directive_id,
-                            source_message_id=source_message_id,
-                            goal_id=current_goal[0], goal_ver=current_goal[1],
-                            question_id=qid,
-                            canonical_uri=repo.get("canonical_uri"),
-                            requested_revision=repo.get("requested_revision"),
-                            need_summary=payload.get("need_summary"))
-                    except ImportAuthorityError as error:
-                        raise DirectiveApplicationError(str(error)) from error
-                    effect["human_named_authority"] = authority
-                    effect["source_authority_hash"] = authority["authority_hash"]
-                # Bind the consuming human decision directly to the newly
-                # created question; this is the authority join used later by
-                # the plan/import service and remains useful for ordinary
-                # injected questions too.
-                dec = conn.execute(
-                    "INSERT INTO decision(cycle_id,question_id,directive_id,actor,type,payload_json) "
-                    "VALUES (?,?,?,'human','directive_inject_question',?)",
-                    (ci, qid, directive_id,
-                     json.dumps({"effect": effect, "polished": payload.get("polished")},
-                                ensure_ascii=False, sort_keys=True))).lastrowid
+                    request["human_named_repo"] = dict(repo)
+                    request["need_summary"] = payload.get("need_summary")
+                effect.update({
+                    "applies_to_reasoning_cycle": cycle_id,
+                    "reasoning_question_request": request,
+                })
             elif kind == "prune_branch":
                 qref = payload.get("question_id")
                 if not qref:

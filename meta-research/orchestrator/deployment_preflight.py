@@ -184,16 +184,51 @@ def _validate_inputs(policy: Mapping[str, Any], sandbox: Any, owner_id: str) -> 
         raise ValueError("policy.deployment.max_attestation_age_s 须在 [1,604800]")
     if deployment.get("mode") == "production" and age > 300:
         raise ValueError("production deployment attestation 最长只接受 300 秒")
-    if not isinstance(resources, Mapping) or not {"gpus", "gpu_mem_gb", "disk_quota_gb"} <= set(resources):
-        raise ValueError("policy.resources 缺 gpus/gpu_mem_gb/disk_quota_gb")
+    resource_fields = {
+        "gpus", "gpu_mem_gb", "disk_quota_gb", "gpu_target_policy",
+        "allowed_device_indices",
+    }
+    if not isinstance(resources, Mapping) or set(resources) != resource_fields:
+        raise ValueError("policy.resources 字段闭包非法")
     if (not _int(resources.get("gpus"), minimum=0)
             or not _number(resources.get("gpu_mem_gb"), minimum=0)
             or not _number(resources.get("disk_quota_gb"), minimum=0)):
         raise ValueError("policy.resources 类型/范围非法")
+    target_policy = resources.get("gpu_target_policy")
+    allowed_indices = resources.get("allowed_device_indices")
+    if target_policy not in {"planner_select", "required", "forbidden"}:
+        raise ValueError("policy.resources.gpu_target_policy 非法")
+    if (not isinstance(allowed_indices, list)
+            or any(not _int(item, minimum=0) or item > 4095
+                   for item in allowed_indices)
+            or allowed_indices != sorted(set(allowed_indices))):
+        raise ValueError(
+            "policy.resources.allowed_device_indices 须为升序唯一非负整数数组")
+    requested_gpus = int(resources["gpus"])
+    if requested_gpus == 0:
+        if allowed_indices or float(resources["gpu_mem_gb"]) != 0:
+            raise ValueError("gpus=0 时显存请求/device index 能力面必须为空")
+    elif (len(allowed_indices) < requested_gpus
+          or float(resources["gpu_mem_gb"]) <= 0):
+        raise ValueError("GPU 请求缺足够 allowed index 或正显存下限")
+    if target_policy == "required" and requested_gpus == 0:
+        raise ValueError("gpu_target_policy=required 必须请求至少一张 GPU")
+    if target_policy == "forbidden" and requested_gpus != 0:
+        raise ValueError("gpu_target_policy=forbidden 不得请求 GPU allocation")
     if (not isinstance(owner_id, str) or _OWNER_RE.fullmatch(owner_id) is None
             or ".." in owner_id):
         raise ValueError("deployment owner_id 非安全文件名")
     config = _sandbox_config(sandbox)
+    local_environment = config.get("local_environment")
+    if (deployment.get("mode") == "production"
+            and isinstance(local_environment, Mapping)
+            and local_environment.get("enabled") is True):
+        raise ValueError(
+            "production deployment 禁止 development-only local_environment")
+    if (deployment.get("mode") == "production"
+            and config.get("network_mode") != "none"):
+        raise ValueError(
+            "production deployment sandbox.network_mode 必须为 none")
     engine_path, engine_host = config.get("engine_path"), config.get("engine_host")
     if not _absolute(engine_path):
         raise ValueError("sandbox.engine_path 须为规范绝对路径")
@@ -706,6 +741,13 @@ def derive_gpu_contract(*, mode: str, facts: Mapping[str, Any],
     required = int(resources["gpus"])
     if required == 0:
         return None, "GPU not required"
+    allowed_indices = resources.get("allowed_device_indices")
+    if (not isinstance(allowed_indices, list)
+            or any(not _int(item, minimum=0) for item in allowed_indices)
+            or allowed_indices != sorted(set(allowed_indices))
+            or len(allowed_indices) < required):
+        return None, "allowed device index contract invalid/insufficient"
+    allowed = set(allowed_indices)
     live, valid = _live_gpu_inventory(facts)
     driver = _get(facts, "gpu", "driver_version")
     required_memory = math.ceil(float(resources["gpu_mem_gb"]) * (1024 ** 3))
@@ -716,7 +758,8 @@ def derive_gpu_contract(*, mode: str, facts: Mapping[str, Any],
             for uuid in sorted(expected):
                 item = live.get(uuid)
                 memory = expected.get(uuid)
-                if (item is None or not _int(memory, minimum=1)
+                if (item is None or item["index"] not in allowed
+                        or not _int(memory, minimum=1)
                         or item["memory_bytes"] != memory
                         or memory < required_memory):
                     selected = []
@@ -725,12 +768,14 @@ def derive_gpu_contract(*, mode: str, facts: Mapping[str, Any],
     elif valid:
         capable = sorted(
             (item for item in live.values()
-             if item["memory_bytes"] >= required_memory),
+             if item["index"] in allowed
+             and item["memory_bytes"] >= required_memory),
             key=lambda item: (item["index"], item["uuid"]))
         selected = capable[:required]
     if len(selected) != required:
         return None, (
             f"exact allocation unavailable: visible={len(live)} "
+            f"allowed_indices={allowed_indices!r} "
             f"selected={len(selected)} required={required}")
     devices = [{
         "uuid": item["uuid"], "model": item["model"],
@@ -744,7 +789,8 @@ def derive_gpu_contract(*, mode: str, facts: Mapping[str, Any],
             "capabilities": ["compute", "utility", "gpu"], "options": {},
         },
         "devices": devices,
-    }, f"allocated={len(devices)} required={required}"
+    }, (f"allocated={len(devices)} required={required} "
+        f"allowed_indices={allowed_indices!r}")
 
 
 def _parse_gpu_canary_log(raw: bytes) -> tuple[str, list[Dict[str, Any]]]:
@@ -1097,14 +1143,21 @@ def evaluate_deployment(*, facts: Mapping[str, Any], attestation: Optional[Mappi
         gpu_policy = required_gpus == 0 or contract is not None
     add("gpu_inventory", gpu_policy, contract_detail)
     runtimes = _get(daemon, "runtimes") or []
-    runtime_ok = required_gpus == 0 or (
-        isinstance(runtimes, list) and "nvidia" in runtimes)
-    add("gpu_device_runtime", runtime_ok,
-        f"runtimes={runtimes!r} required_gpus={required_gpus}")
+    # A named Docker runtime is neither necessary nor sufficient evidence that
+    # the exact requested devices reached this container.  Bind both the
+    # device-runtime and access checks to the already validated guardian
+    # canary.  During the prerequisite phase this intentionally remains false
+    # (and pending); production can become ready only after finalization with
+    # exact, drained-container evidence.
     gpu_access_ok = required_gpus == 0 or _gpu_evidence_ok(
         sandbox_gpu_evidence, contract=contract,
         sandbox_config=sandbox_config,
         candidate_hash=deployment_candidate_hash, now=now)
+    add("gpu_device_runtime", gpu_access_ok,
+        ("guardian canary verified exact DeviceRequest"
+         if gpu_access_ok else
+         f"exact DeviceRequest canary unavailable/invalid; advertised_runtimes={runtimes!r} "
+         f"required_gpus={required_gpus}"))
     add("sandbox_gpu_access", gpu_access_ok,
         ("guardian canary verified exact allocation" if gpu_access_ok
          else f"mechanical canary unavailable/invalid required_gpus={required_gpus}"))
@@ -1156,7 +1209,7 @@ class DeploymentPreflight:
         self.owner_guard()
 
     def _raise_failed(self, receipt: Mapping[str, Any]) -> None:
-        pending = ({"sandbox_gpu_access"}
+        pending = ({"gpu_device_runtime", "sandbox_gpu_access"}
                    if receipt.get("phase") == "prerequisite" else set())
         failed = [item["name"] for item in receipt["checks"]
                   if not item["ok"] and item["name"] not in pending]
@@ -1239,8 +1292,10 @@ class DeploymentPreflight:
         candidate["candidate_hash"] = _value_hash(candidate)
         self._candidate_bytes = _canonical(candidate)
         frozen_candidate = _json_clone(candidate)
+        pending_gpu_canary = {"gpu_device_runtime", "sandbox_gpu_access"}
         static_ok = all(
-            item["ok"] for item in checks if item["name"] != "sandbox_gpu_access")
+            item["ok"] for item in checks
+            if item["name"] not in pending_gpu_canary)
         if self.deployment["mode"] == "production" and not static_ok:
             self._publish(frozen_candidate)
             self._raise_failed(frozen_candidate)

@@ -52,8 +52,8 @@ from typing import Any, Optional
 from .console_spool import ConsoleSpool, SpoolBatch, open_pinned_upload_ref
 from .ids import parse_positive_sqlite_int
 from .console import (CONSOLE_MESSAGE_SESSION_REF, DIRECTIVE_ACTION_SESSION_REF,
-                      FILE_REQUEST_ACTION_SESSION_REF, IdempotencyCollisionError,
-                      directive_action_text)
+                      FILE_REQUEST_ACTION_SESSION_REF, NARRATOR_QUERY_SESSION_REF,
+                      IdempotencyCollisionError, directive_action_text)
 
 logger = logging.getLogger(__name__)
 _MAX_REASON_CHARS = 2_000
@@ -250,8 +250,13 @@ class ConsoleInboxIngest:
             logger.warning("console_inbox connector 非固定 console，跳过: %r", connector)
             self._clear_attempt(idem)
             return "poison"
-        if rec.get("action_target") == "file_request":
+        action_target = rec.get("action_target")
+        if action_target == "file_request":
             return self._process_file_request_action(rec, connector=connector, idem=idem)
+        if action_target not in (None, "query"):
+            logger.warning("console_inbox action_target 非法，跳过: %r", action_target)
+            self._clear_attempt(idem)
+            return "poison"
         if "action" in rec:
             return self._process_directive_action(rec, connector=connector, idem=idem, cycle_id=cycle_id)
         if (conversation_id is not None
@@ -264,14 +269,18 @@ class ConsoleInboxIngest:
             logger.warning("console_inbox 普通消息 raw_text 非法，跳过: idem=%s", idem)
             self._clear_attempt(idem)
             return "poison"
+        forced_query = action_target == "query"
         return self._process_text(
             connector=connector, raw=raw, idem=idem, cycle_id=cycle_id,
             conversation_id=conversation_id,
-            session_ref=CONSOLE_MESSAGE_SESSION_REF)
+            session_ref=(NARRATOR_QUERY_SESSION_REF if forced_query
+                         else CONSOLE_MESSAGE_SESSION_REF),
+            force_query=forced_query)
 
     def _process_text(self, *, connector: str, raw: str, idem: str,
                       cycle_id: Optional[str], conversation_id: Optional[str],
-                      session_ref: str, strict_failures: bool = False) -> str:
+                      session_ref: str, strict_failures: bool = False,
+                      force_query: bool = False) -> str:
         """Process one already authenticated/shape-checked natural-language record."""
         if self._attempts.get(idem, 0) >= self._MAX_ATTEMPTS:
             if strict_failures:
@@ -286,11 +295,13 @@ class ConsoleInboxIngest:
         goal_ver: Optional[int] = None
         try:
             goal_id, goal_ver = self._message_goal_binding(connector, idem)
-            res = self.console.handle_inbound(connector=connector, raw_text=raw,
-                                              idempotency_key=idem, cycle_id=cycle_id,
-                                              goal_id=goal_id, goal_ver=goal_ver,
-                                              session_ref=session_ref,
-                                              conversation_id=conversation_id)
+            handler = (self.console.handle_query_inbound
+                       if force_query else self.console.handle_inbound)
+            res = handler(connector=connector, raw_text=raw,
+                          idempotency_key=idem, cycle_id=cycle_id,
+                          goal_id=goal_id, goal_ver=goal_ver,
+                          session_ref=session_ref,
+                          conversation_id=conversation_id)
             self._verify_inbound_message(
                 res["message_id"], raw=raw, idem=idem,
                 goal_id=goal_id, goal_ver=goal_ver,
@@ -588,7 +599,7 @@ class ConsoleInboxIngest:
     def _process_file_request_action(self, rec: dict, *, connector: str, idem: str) -> str:
         """处理文件请求控件动作；只有 run 进程会走到这里，故权威迁移保持单写者纪律。"""
         action, rid = rec.get("action"), rec.get("request_id")
-        if action not in ("resolve", "cancel"):
+        if action not in ("resolve", "approve", "cancel"):
             logger.warning("console_inbox file_request action 形状非法，跳过: %r", str(rec)[:200])
             self._clear_attempt(idem)
             return "poison"
@@ -612,6 +623,8 @@ class ConsoleInboxIngest:
             return "poison"
         if action == "resolve":
             raw = f"解决文件请求 r{rid}，来源 {source_ref}"
+        elif action == "approve":
+            raw = f"同意权限请求 r{rid}"
         else:
             raw = f"取消文件请求 r{rid}：{reason}"
         mid: Optional[int] = None
@@ -636,7 +649,7 @@ class ConsoleInboxIngest:
                 self._clear_attempt(idem)
                 return "poison"
 
-            expected_terminal = "resolved" if action == "resolve" else "cancelled"
+            expected_terminal = "resolved" if action in ("resolve", "approve") else "cancelled"
             if status != "pending":
                 if status == expected_terminal and resolved_mid == mid:
                     self._clear_attempt(idem)            # 游标丢失/终态提交后崩溃：同 provenance 重放 no-op
@@ -662,6 +675,9 @@ class ConsoleInboxIngest:
                     self.file_requests.resolve(
                         request_id=rid, uploads_dir=uploads.proc_path,
                         resolved_message_id=mid)
+            elif action == "approve":
+                self.file_requests.approve(
+                    request_id=rid, resolved_message_id=mid)
             else:
                 self.file_requests.cancel(request_id=rid, reason=reason, resolved_message_id=mid)
         except IdempotencyCollisionError:

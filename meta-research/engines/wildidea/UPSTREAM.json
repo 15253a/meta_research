@@ -1,0 +1,11 @@
+{
+  "schema": "meta-research-wildidea-upstream/v1",
+  "repository": "https://github.com/liwenyu2002/wildidea.git",
+  "ref": "main",
+  "commit": "6ff66ada15b0047b2e03d229f2e9543c542df598",
+  "commit_time": "2026-07-12T15:08:35+08:00",
+  "tree": "3bf8299953dd316cd7086cc627dbe71cef66fe23",
+  "archive_sha256": "sha256:54de73ce7d8f0d1442fb62b9ff08415dd23fea54519e3b35e257602bf2330453",
+  "vendored_path": "upstream",
+  "license": "MIT"
+}
