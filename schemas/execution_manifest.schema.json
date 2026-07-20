@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/execution_manifest.schema.json",
   "title": "execution_manifest",
-  "description": "bundle 阶段的编译产物：机器可验证执行契约（步⑧）。plan 只冻结抽象科学/资源意图（含 gpu_required，命令永不入 plan）；本清单由 bundle 阶段 Codex 与代码/identity.md 一同产出，经编排器交叉核对 target_ref、protocol、GPU access mode、workload env_hash、路径与超时后，由 harness 机械执行。manifest 不得引入 plan 未声明的目标/协议/资源模式（plan_slice_hash 由编排器按库中切片重算）。命令为 argv 数组（禁 shell 字符串）；{src}=受 hash 核验的代码树，{ckpt}=训练 checkpoint（仅 eval），{asset:<opaque ref>}=启动前复验 sha256 的用户资产。eval 须输出 `metric_value: <metric_id>@<metric_ver>=<float>`。生产执行绑定 exact image、无网络只读根 Docker sandbox、受验 CPU/GPU workload identity 与 guardian receipt；本 schema 只声明 bundle 契约，机械隔离由 execution_sandbox 执法。",
+  "description": "bundle 阶段的编译产物：机器可验证执行契约（步⑧）。plan 只冻结抽象科学/资源意图（含 gpu_required，命令永不入 plan）；本清单由 bundle 阶段 Codex 与代码/identity.md 一同产出，经编排器交叉核对 target_ref、protocol、GPU access mode、workload env_hash、路径与超时后，由 harness 机械执行。manifest 不得引入 plan 未声明的目标/协议/资源模式（plan_slice_hash 由编排器按库中切片重算）。命令为 argv 数组（禁 shell 字符串）；{src}=受 hash 核验的代码树，单 checkpoint eval 可用 {ckpt}，多 checkpoint eval 用 {ckpt:<ckpt_key>}，{asset:<完整 user-file-request ref>}=启动前复验 sha256 的上传资产，{local_source:<32位 source_id>}=Web 已登记且只读挂载的本机目录根（不复制数据、不接受任意路径）。执行绑定 exact image、policy-selected network（production=none，development 可显式 bridge）、只读根 Docker sandbox、受验 CPU/GPU workload identity 与 guardian receipt；network 由编排器 policy/guardian profile 强制，本 manifest 无权请求或覆盖。本 schema 只声明 bundle 契约，机械隔离由 execution_sandbox 执法。",
   "type": "object",
   "required": ["manifest_version", "target_ref", "protocol_ref", "env_hash", "config_json", "code_files", "commands"],
   "additionalProperties": false,
@@ -32,6 +32,18 @@
     },
     "env_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "锚区按 plan.gpu_required 派生的 pinned CPU/GPU workload identity；manifest.py 在生产执行前逐字交叉核，进 run/attempt.env_hash" },
     "gpu_required": { "type": "boolean", "default": false, "description": "本目标的 smoke/train/eval 是否需要部署固定 GPU allocation；省略/false 始终走 CPU sandbox，不能从主机 resources.gpus 库存推断" },
+    "python_requirements": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "description": "development Bundle 可选的 Python 依赖声明。每个 smoke/train/eval capability 启动后，由可信 launcher 以 argv 方式（非 shell）安装到该 phase cwd 的 .mr-python-deps/，安装输出进入同一正式日志；不修改宿主 Conda、只读源码或数据目录。应只列基础环境确实缺失的包，优先精确版本。production network=none 时不得假定可下载。",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": "^(?!-)[^\\u0000-\\u001f\\u007f]+$"
+      }
+    },
     "config_json": {
       "type": "object",
       "description": "本目标代码实际使用的变体配置。一致性规则（manifest.py 执法）：plan 切片 claim.config_json 非空 ⇒ 须与之相等（计划切片是配置的决定者，bundle 只照办）"
@@ -55,11 +67,30 @@
     },
     "expected_outputs": {
       "type": "object",
-      "description": "命令预期产物（编排器核在场性/入账）",
+      "description": "train 命令预期产物（编排器逐项核在场性/入账）。旧 checkpoint 单路径格式只为向后兼容；新 bundle 使用 checkpoints 数组。两种格式不得混用。",
       "additionalProperties": false,
       "properties": {
-        "checkpoint": { "type": "string", "minLength": 1, "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\].*$", "description": "train 命令产出的 checkpoint 相对路径（相对 train run staging 目录，禁 .. 段/绝对/反斜杠；build/exec 必填；运行期 checkpoint_dest 再兜底解析进 run 目录内）" }
-      }
+        "checkpoint": { "type": "string", "minLength": 1, "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\].*$", "description": "旧版单 checkpoint 相对路径；读取时规范化为 ckpt_key=final。" },
+        "checkpoints": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "规范 checkpoint 清单；ckpt_key 还由 manifest.py 跨数组逐项校验唯一。path 相对 train run staging 目录。",
+          "items": {
+            "type": "object",
+            "required": ["ckpt_key", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "ckpt_key": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+              "path": { "type": "string", "minLength": 1, "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\].*$" }
+            }
+          }
+        }
+      },
+      "oneOf": [
+        { "required": ["checkpoint"] },
+        { "required": ["checkpoints"] }
+      ]
     },
     "env": {
       "type": "object",
@@ -76,8 +107,7 @@
       "then": {
         "required": ["expected_outputs", "repro_cmd_md"],
         "properties": {
-          "commands": { "required": ["smoke", "train", "eval"] },
-          "expected_outputs": { "required": ["checkpoint"] }
+          "commands": { "required": ["smoke", "train", "eval"] }
         }
       }
     },
@@ -104,7 +134,7 @@
           "type": "array",
           "minItems": 1,
           "items": { "type": "string", "minLength": 1 },
-          "description": "argv 数组（禁 shell 字符串/管道/重定向）；可用 {asset:<ContextPack opaque ref>} 引用用户托管输入，启动前由 manifest.py 做 containment+sha256 复验；绝对路径 token 须落 work_root 或 policy.execution.path_allowlist 前缀内，相对 token 不得含 .. 组件"
+          "description": "argv 数组（禁 shell 字符串/管道/重定向）；checkpoint 占位符仅 eval 可用：调用方恰好提供一个 checkpoint 时可用 {ckpt}，多个时按 key 使用一个或多个 {ckpt:<ckpt_key>}。上传单文件只用 {asset:<完整 ContextPack user-file-request ref>}，Web 本机目录只用 {local_source:<清单中的32位 source_id>}（可追加 /相对路径）；后者只解析到服务端冻结且已进入只读 allowlist 的 exact root，不复制目录。不得把 source_id 写成 asset ref，也不得直接猜宿主绝对路径；相对 token 不得含 .. 组件"
         },
         "timeout_s": { "type": "number", "exclusiveMinimum": 0, "description": "本命令超时（缺省 policy.execution.default_timeout_s；上限 max_timeout_s 截断）" }
       }

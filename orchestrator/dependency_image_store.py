@@ -50,10 +50,9 @@ class _DependencyImageStoreMixin(_DependencyImageRuntimeMixin):
             receipt, contract = inspect_dependency_image_object(
                 object_path, owner_guard=self.owner_guard)
             lock = receipt["lock"]
-            expected_payload_environment = {
-                **self.bootstrap_sandbox.config["payload_environment"],
-                "PYTHONPATH": self.config["site_packages_path"],
-            }
+            derived_config = self._derived_sandbox_config(
+                receipt["result_image_id"])
+            expected_payload_environment = derived_config["payload_environment"]
             if (receipt["builder_config_hash"] != self.config_hash
                     or receipt["base_environment_hash"]
                     != self.bootstrap_sandbox.environment_hash
@@ -105,12 +104,6 @@ class _DependencyImageStoreMixin(_DependencyImageRuntimeMixin):
                 raise RepositoryCacheError(
                     "dependency installed manifest 超当前 policy")
 
-            derived_config = dict(self.bootstrap_sandbox.config)
-            derived_config.update({
-                "image": receipt["result_image_id"],
-                "image_id": receipt["result_image_id"],
-                "payload_environment": receipt["payload_environment"],
-            })
             archive = receipt["image_archive"]
             if (receipt["environment_hash"]
                     != sandbox_environment_hash(derived_config)

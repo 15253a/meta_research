@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "build_target_id": 7,
+  "phase": "train",
+  "event": "start",
+  "action": "start",
+  "execution_owner": {"kind": "run", "id": 11},
+  "plan_slice_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "source_tree_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "subject_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "diagnosis_md": "冻结身份一致，启动精确绑定的训练命令。"
+}

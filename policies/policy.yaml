@@ -9,7 +9,7 @@ acquisition: { w1: 0.35, w2: 0.25, w3: 0.30, c: 0.10 }
 
 # —— 预算 ——
 # 单位与 ledger 一致（USD 等效）；初值≈廉价探针
-budget: { B0: 5, doubling_period_m: 8, B_max: 40, session_max: 100000, price_per_1k_tokens: 0.3 }   # session_max=全局成本(ledger.money 求和)安全网上限（§4.4.6 判据②，M6；null 关闭）；100000 为失控兜底、远高于合法长跑（B_max=40×数百轮），目标长跑后细化。price_per_1k_tokens=步⑩ tokens→money 汇率（ledger.money=tokens/1000×本值），notional/USD-等效、provisional（缺省使 cycle≈B_max 量级、session_max 为失控兜底）；session_max 启用时本值必须有限且>0，只有 session_max=null 关闭预算网时才允许 0。目标长跑后细化。ledger 写入=M6 硬化（步⑩ CP10.2 接线）
+budget: { B0: 5, doubling_period_m: 8, B_max: 40, session_max: null, price_per_1k_tokens: 0.3 }   # session_max=全局成本(ledger.money 求和)安全网上限（§4.4.6 判据②，M6）；null 暂时关闭该安全网。price_per_1k_tokens 仍保留用于可观测账本，但不再因累计 money 阻断任务。重新启用时须改回有限正数并重启。
 
 # —— 流程阈值 ——
 flow:
@@ -17,10 +17,13 @@ flow:
   tau: { score_floor: 0.25, consecutive_rounds: 3 }   # 终止判据①：open 最高分连续 3 轮 < 0.25
   audit_cadence_K: 5                  # 每 5 轮推送摘要
   retry:
-    artifact_parse: 2                 # 产物解析重试 ≤2（三级校验统一口径）
-    plan_review: 2                    # plan 可回答性评审 ≤2（§3.1.3 审计契约）
-    bundle_code_review: 3             # bundle 代码适配评审 ≤3（§3.4.3 / §4.1.4 附注）
-    bundle_result_review: 3           # bundle 结果评审 ≤3
+    artifact_parse: 5                 # 仅兼容/资格测试的外层重试上限；正常常驻阶段在同一 turn 内用 MCP 修正，外层不重调模型
+    bundle_repair: null               # null=工程自愈不限轮次；只有 Codex 判定 plan 本身不可执行才回 Reasoning
+    # 研究语义评审各最多一轮。尤其 code↔plan reviewer 必须在 smoke 后、训练前执行；
+    # “最多一轮”不是“关闭”。fail 意见回给原阶段修订，编排器不替代研究判断。
+    plan_review: 1
+    bundle_code_review: 1
+    bundle_result_review: 1
   watchdog: { probe_h: 2, full_h: 24 }   # 单次执行时限唯一定义点（资源硬件在 resources）
 
 # —— 检索 / import ——
@@ -119,7 +122,7 @@ tree_guard: { max_decompose_depth: 4, max_children_per_node: 6, max_open_questio
 
 # —— 问题重访 / 回看护栏 ——
 question_guard: { max_inconclusive_per_question: 3 }   # 到限后对 attack 不可选，仅可作 decompose/propose_prune 对象（执行点 §4.2.1）
-answer_review: { max_reviews_per_cycle: 5, spawn_counts_toward_max_open: true }   # 每轮回看判定上限（执行点 §4.2.4 apply_tree_ops）
+answer_review: { max_reviews_per_cycle: 1, spawn_counts_toward_max_open: true }   # 当前每个研究轮最多回看 1 个答案（执行点 §4.2.4 apply_tree_ops）
 
 # —— goal_amend 护栏 ——
 goal_amend: { max_closed_revalidate_per_cycle: 10, max_spawn_from_goal_amend: 5 }
@@ -129,8 +132,31 @@ cards: { subtree_card_depth: 1, tag_policy: free_v1 }   # subtree 默认深度 1
 
 # —— idea / wildidea ——
 idea:
-  sd_threshold: 6                     # Structural Depth 淘汰阈值（SD<6 淘汰，§3.1.3）
-  candidate_top_k: 3                  # 自评筛选前 3
+  engine:
+    name: wildidea
+    version: wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598
+    adapter_version: meta-research-wildidea-adapter-v1
+    profile: research                 # auto-research：放宽即时可行性、提高新颖性/跨域距离门槛
+  problem_type: research
+  slot_count: 9                       # 先完成 9 个 source-first 锚点，再做批次多样性与 top-k 自筛
+  candidate_top_k: 3                  # 生成侧只交付自筛前 3；不在生成会话伪造独立判官分
+  max_attempts: 3                     # 每槽 initial → repair → reangle，禁止无限盲抽
+  thresholds:
+    research: { structural_depth: 6, domain_distance: 7, applicability: 6, novelty: 8 }
+  novelty_check:
+    enabled: true
+    status: controlled_backend_enabled
+    provider: arxiv_api_v1            # 编排器白名单 API；Codex 只提交有界普通文本 query
+    endpoint: https://export.arxiv.org/api/query
+    queries_per_candidate: 1          # 当前最小闭环：每候选恰一条可回放查询
+    max_results_per_query: 10
+    timeout_s: 60                    # 单次网络抖动不立即打断研究 owner
+    max_response_bytes: 4194304
+    min_interval_s: 3                 # 遵守 arXiv 连续 API 请求间隔建议
+    retry_attempts: 8                 # timeout、429、408 与 5xx 自动恢复
+    retry_initial_delay_s: 3
+    retry_max_delay_s: 120            # 同时优先遵守服务端 Retry-After（在此宽松上限内）
+  sd_threshold: 6                     # 兼容统一独立判官/旁路门口径（SD<6 淘汰，§3.1.3）
   dedup_budget: 10                    # 查重预算 = 每候选联网查重调用上限
   forbid_proto_term_source: question_task_terms   # 禁词取自本问题任务词
   cross_phase: { decompose_assist: true, spawn_assist: true, budget: 5 }   # 跨阶段调用开关与预算（§3.2.5）；附录 C 原文写 on，YAML1.1 下 on ≡ true，此处取 true 防解析歧义
@@ -154,6 +180,7 @@ execution:
     engine_path: /usr/bin/docker
     engine_host: unix:///var/run/docker.sock
     resource_mode: rlimit-fallback    # 必须与 daemon preflight 实测一致；换 cgroup 节点须显式改 policy/env_hash
+    network_mode: bridge              # 用户明确授权 development bundle 联网；production schema 只接受 none
     seccomp_profile: policies/seccomp/moby-default-v0.2.1.json
     seccomp_sha256: sha256:ea7ba4298390d31a9d52354cf4319e4fe6cbd717ff6b47f23a496ca169727c76
     seccomp_bpf: policies/seccomp/moby-default-v0.2.1-linux-5.4-amd64.bpf.b64
@@ -161,23 +188,50 @@ execution:
     seccomp_bpf_arch: amd64
     image: docker.io/library/python@sha256:f5cf0344c9886ff24d34797578d5d7dd6e8911ae0fe5962bb55d0f89603ec361
     image_id: sha256:eeeca161459e242a142661623fed2320f84e810603a42ffc4a5cdbc8694b3bb3
-    python_path: /usr/local/bin/python3
-    memory_mb: 16384                  # cgroup 可用时为 aggregate；否则 launcher 的每进程 RLIMIT_AS（receipt 明示 fallback）
-    pids: 64                          # cgroup pids.max + 非 root payload RLIMIT_NPROC 双层请求
-    nofile: 1024
-    max_log_mb: 64                    # Docker json-file 两段总上限；一旦轮转即将该执行判失败，防截断证据被接纳
-    max_file_mb: 8192                 # RLIMIT_FSIZE（单文件）
-    max_output_mb: 32768              # quarantine 后验总量；部署仍须给 work-root/VEPFS 做硬 quota
-    max_output_files: 100000
-    cpus: 4
-    tmpfs_mb: 1024
-    shm_mb: 64                         # 显式固定易失 /dev/shm；按项目数据加载需求随 env_hash 调整
-    input_max_mb: 65536               # fd/tree 可信快照总量；更大数据须走下方显式只读 mount
+    python_path: /opt/host-conda/bin/python
+    # development 第一阶段按用户指令优先跑通并充分使用本机资源；Docker daemon
+    # 无 cgroup，代码同时令 local-environment CPU/GPU 的 RLIMIT_AS 为 unlimited。
+    # 这些大值只保留 receipt/daemon 参数的可审计结构，不作为当前开发限流工具。
+    memory_mb: 1800000
+    pids: 4096
+    nofile: 1048576
+    max_log_mb: 1024
+    max_file_mb: 1048576
+    max_output_mb: 10485760
+    max_output_files: 1000000
+    cpus: 112
+    development_gpu_thread_limit: null
+    tmpfs_mb: 524288
+    shm_mb: 524288
+    input_max_mb: 10485760
     readonly_mounts: []               # 与 path_allowlist 配对的部署数据根；只读 bind，不暴露 work-root
     payload_environment: {}            # 可信镜像 capability 可派生 PYTHONPATH；任务 env 不得覆盖
+    # development-only：本机 Conda prefix 和所有可变缓存一起放在
+    # <system-root>/runtime，不占用 /root 根盘。local-conda backend 直接执行；
+    # Docker 兼容路径仍可将同一 prefix 只读 bind 到 target。identity 同时绑定
+    # Python bytes、全部 conda-meta JSON 与 conda history；每次 prepare/CREATE 前复核。
+    local_environment:
+      enabled: true
+      development_only: true
+      source: /vepfs-mlp2/c20250511/250806010/mxm/paper_agent/meta-research/meta_research_buiding/meta-research/runtime/environments/meta-research
+      target: /opt/host-conda
+      python_path: /opt/host-conda/bin/python
+      identity_sha256: sha256:413a99bafb7d247df0b5d8899dd260bca1d85eddae50707fe545ac11064fc0a1
 
-# —— resources（启动输入③：只放硬件事实，§4.6.7；时限唯一归 flow.watchdog）——
-resources: { gpus: 4, gpu_mem_gb: 80, disk_quota_gb: 500 }
+# —— resources（启动输入③：仓库兼容基线，§4.6.7；时限唯一归 flow.watchdog）——
+# 本部署允许任务按 Web 运行配置精确选择一张或多张 GPU；legacy/default 仍从
+# resources.gpus=1 起步。development 最大能力面为本机 GPU 0..7，实际 v3 任务只会
+# 绑定用户所选且由 nvidia-smi 实时探测到的子集。gpu_target_policy 是计划
+# 约束，不从 gpus 库存暗推：required 会机械要求新 plan 的每个 target 显式 gpu_required=true。
+# 1 GiB 是 quest 工作区/浏览器托管输入的保守请求；Web 选择的本机只读目录原地使用，不复制进该额度。
+resources:
+  gpus: 8
+  gpu_mem_gb: 80
+  # 第一版不以人工 quota 阻断本机研究；该值只给托管上传/容量回执一个
+  # 宽松上界，实际数据与实验产物仍统一留在项目 work_root。
+  disk_quota_gb: 10240
+  gpu_target_policy: required
+  allowed_device_indices: [0, 1, 2, 3, 4, 5, 6, 7]
 
 # —— deployment（运行信任事实；development 永不产生 production-ready 语义）——
 # production 必须把 attestation_path 指向部署者持有、service account 不可写的 canonical JSON；

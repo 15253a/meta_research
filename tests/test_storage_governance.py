@@ -66,6 +66,9 @@ def test_terminal_cycle_publishes_consistent_backup_views_and_manifest(tmp_path)
         ".git", "goal.md", "tree.md", "pool.md", "digest.md"}
     assert "# 轮次 c1 存储投影" in (work / "views" / "goal.md").read_text(encoding="utf-8")
     assert "## 问题树" in (work / "views" / "tree.md").read_text(encoding="utf-8")
+    pool_view = (work / "views" / "pool.md").read_text(encoding="utf-8")
+    assert all(section in pool_view for section in (
+        "正式代码路径", "## 协议", "产物哈希锚", "## 正式池发布", "## 资产卡片"))
     assert "## 模型调用" in (work / "views" / "digest.md").read_text(encoding="utf-8")
     assert _git(work, "rev-list", "--count", "HEAD") == "1"
     message = _git(work, "show", "-s", "--format=%B", "HEAD")
@@ -85,6 +88,34 @@ def test_terminal_cycle_publishes_consistent_backup_views_and_manifest(tmp_path)
     assert publisher.reconcile() == []
     assert _git(work, "rev-list", "--count", "HEAD") == "1"
     assert len(list((work / "state" / "storage" / "backups" / "sha256").iterdir())) == 1
+    writer.close()
+
+
+def test_formal_pool_manifest_and_code_tree_are_in_snapshot_inventory_and_view(tmp_path):
+    work = tmp_path / "work"
+    db_path, writer = _seed_done(work)
+    code_hash = "a" * 64
+    manifest_hash = "b" * 64
+    manifest_ref = f"pool/manifests/{manifest_hash}.json"
+    writer.execute(
+        "UPDATE baseline SET code_ref='baselines/b-deadbeef/src',commit_hash=? WHERE id=1",
+        ("sha256-tree-v1:" + code_hash,))
+    writer.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (1,'gate','pool_publication',?)",
+        (json.dumps({
+            "manifest_ref": manifest_ref, "manifest_hash": manifest_hash,
+            "baseline_id": 1, "variant_id": 1, "evaluation_id": 1, "attempt_id": 1,
+        }, sort_keys=True, separators=(",", ":")),))
+    writer.commit()
+
+    publisher = CycleSnapshotPublisher(db_path=db_path, work_root=work)
+    assert publisher.reconcile() == ["c1"]
+    _pointer_doc, manifest = _pointer(work)
+    assets = {(item["owner"], item["owner_id"]): item for item in manifest["assets"]}
+    assert assets[("baseline_code", 1)]["content_hash"] == code_hash
+    assert assets[("pool_publication", 2)]["ref"] == manifest_ref
+    pool_view = (work / "views" / "pool.md").read_text(encoding="utf-8")
+    assert manifest_ref in pool_view and manifest_hash in pool_view
     writer.close()
 
 

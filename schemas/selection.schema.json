@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/selection.schema.json",
   "title": "selection",
-  "description": "reasoning R3 产物（第二部分 §6.11）。只选下一步、不写 route（route 由编排器 derive_next_route 派生，§2.3）。terminate ⇒ next_question_id 必为 null（持久停机标志，§4.2.4）；attack/decompose ⇒ 非空。scores[] 经 persist_selection 写回 question.score / est_cost（唯一维护点）。",
+  "description": "reasoning R3 的最小状态交接。核心只有下一问题与意图；route 由编排器派生。scores 仅在本轮确实形成了新的排序估计时携带，不要求模型为完整前沿填写评分工作表。",
   "type": "object",
-  "required": ["next_question_id", "next_intent", "scores"],
+  "required": ["next_question_id", "next_intent"],
   "additionalProperties": false,
   "properties": {
     "next_question_id": {
@@ -14,7 +14,7 @@
     "next_intent": { "enum": ["attack", "decompose", "terminate"] },
     "scores": {
       "type": "array",
-      "description": "对 open（含 inconclusive）集逐问题四元打分留痕；bootstrap 首轮可为空",
+      "description": "可选的增量评分更新；省略表示沿用已有状态，bootstrap 通常省略",
       "items": {
         "type": "object",
         "required": ["question_id", "score", "est_cost"],

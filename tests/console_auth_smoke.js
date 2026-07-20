@@ -10,8 +10,9 @@ const storage = new Map();
 const replacements = [];
 const notices = [];
 const guard = { style: {}, textContent: '' };
+const emptyState = { hidden: true };
 global.window = {
-  location: { hash: '#token=' + token, pathname: '/console/', search: '?view=live' },
+  location: { hash: '#token=' + token, pathname: '/console/', search: '?console-bootstrap=1&view=live' },
   history: { replaceState(_state, _title, url) { replacements.push(url); window.location.hash = ''; } },
   sessionStorage: {
     getItem(k) { return storage.has(k) ? storage.get(k) : null; },
@@ -20,7 +21,7 @@ global.window = {
   },
   crypto: require('crypto').webcrypto,
 };
-global.document = { title: 'console', getElementById() { return guard; }, createElement() { return guard; },
+global.document = { title: 'console', getElementById(id) { return id === 'console-empty-state' ? emptyState : guard; }, createElement() { return guard; },
   body: { appendChild() {} } };
 global.toast = m => notices.push(m);
 global.emitEvent = e => notices.push(e.text);
@@ -32,7 +33,14 @@ try {
   new Function(source + '\nthis.apiFetch=apiFetch; this.apiPost=apiPost; this.clearCapability=clearConsoleCapability;'
     + ' this.showGuard=showConnectionGuard; this.clearGuard=clearConnectionGuard;'
     + ' this.markFresh=markConsoleSnapshotFresh;'
+    + ' this.showEmpty=showEmptyRegistryState; this.enforceFresh=enforceSnapshotFreshness;'
+    + ' this.snapshotFresh=snapshotIsFresh; this.emptyFresh=emptyRegistrySnapshotIsFresh;'
+    + ' this.Hash=IncrementalSHA256; this.sha256Bytes=sha256Bytes; this.binaryPost=_reliableBinaryPost;'
+    + ' this.jsonPost=_reliableJsonPost;'
+    + ' this.browserPath=browserRelativePath; this.buildBrief=buildCustomGoalBrief;'
+    + ' this.parseLocal=_parseLocalSourceText; this.localSummary=_localSourceSummary; this.formatPreflight=_formatPreflight;'
     + ' this.expireSnapshot=()=>{_lastDbSuccessAt=Date.now()-SNAPSHOT_MAX_AGE_MS-1;};'
+    + ' this.expireEmpty=()=>{_emptyRegistrySuccessAt=Date.now()-SNAPSHOT_MAX_AGE_MS-1;};'
     + ' this.isReady=()=>_consoleReady;').call(ctx);
 } catch (e) {
   console.log('AUTH_SMOKE_FAIL load: ' + e.message); process.exit(1);
@@ -44,10 +52,126 @@ function check(ok, message) { if (!ok) throw new Error(message); }
   check([...storage.values()][0] === token, 'token not stored in sessionStorage');
   check(!ctx.isReady(), 'capability alone incorrectly enabled live controls before a real DB snapshot');
 
+  // 真实空 registry 有自己的 onboarding 遮罩：允许从 Web 新建首个任务，
+  // 但不得冒充 /api/db 快照、解锁普通研究控制或露出内嵌 mock。
+  ctx.showEmpty();
+  check(emptyState.hidden === false && guard.style.display === 'none',
+    'empty registry onboarding did not cover the mock console');
+  check(!ctx.isReady() && !ctx.snapshotFresh() && ctx.emptyFresh(),
+    'empty registry incorrectly became a live DB snapshot');
+  ctx.enforceFresh();
+  check(emptyState.hidden === false && guard.style.display === 'none',
+    'fresh empty registry was overwritten by the stale DB guard');
+  ctx.expireEmpty(); ctx.enforceFresh();
+  check(emptyState.hidden === true && guard.style.display === 'flex'
+    && guard.textContent.includes('任务列表快照已过期'),
+    'stale empty registry did not fail closed');
+  ctx.markFresh();
+
   await ctx.apiFetch('/api/db');
   check(calls.length === 1, 'api request not issued');
   check(calls[0].options.headers.get('Authorization') === 'Bearer ' + token, 'Bearer missing');
   check(calls[0].options.credentials === 'omit' && calls[0].options.redirect === 'error', 'safe fetch flags missing');
+
+  // Whole-file hashing is genuinely incremental; browser path selection uses
+  // only webkitRelativePath || name and never an Electron/host path field.
+  const encoder = new TextEncoder();
+  check(new ctx.Hash().digestHex() === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    'stream SHA-256 empty vector mismatch');
+  const hash = new ctx.Hash(); hash.update(encoder.encode('a')); hash.update(encoder.encode('bc'));
+  check(hash.digestHex() === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+    'stream SHA-256 split vector mismatch');
+  check(ctx.browserPath({webkitRelativePath:'folder/data.bin', name:'ignored.bin', path:'/secret'}) === 'folder/data.bin',
+    'browser relative path did not prefer webkitRelativePath');
+  let badPath = false; try { ctx.browserPath({webkitRelativePath:'', name:'C:\\secret\\data.bin'}); } catch (_e) { badPath = true; }
+  check(badPath, 'host path-like browser filename was accepted');
+  const brief = ctx.buildBrief('Title', 'Objective', 'Criterion', 'Constraint');
+  check(brief.startsWith('---\npredicate_json: {') && brief.includes('\n---\n\n# Title'),
+    'custom form did not construct valid goal brief envelope');
+  const local = ctx.parseLocal('/srv/datasets/eeg\n/srv/datasets/eeg/\n', 'dataset');
+  check(local.length === 1 && local[0].kind === 'dataset' && local[0].path === '/srv/datasets/eeg',
+    'local source parser did not normalize/deduplicate absolute directories');
+  let relativeAccepted = false;
+  try { ctx.parseLocal('../private', 'references'); relativeAccepted = true; } catch (_e) {}
+  check(!relativeAccepted, 'relative local source path was accepted');
+  const localSummary = ctx.localSummary({source:{label:'/private/dataset', count:7, bytes:99, path:'/private/dataset'}}, 'dataset');
+  const localText = ctx.formatPreflight({}, [localSummary]);
+  check(localSummary.label === '数据集目录' && localSummary.count === 7 && localSummary.bytes === 99
+    && !Object.prototype.hasOwnProperty.call(localSummary, 'path') && !localText.includes('/private'),
+    'local source response leaked an echoed host path');
+
+  // Ambiguous first attempt retries the exact URL/body/offset/hash with one
+  // durable key.  Success echo clears that key.
+  const binaryCalls = [];
+  global.fetch = async (url, options) => {
+    binaryCalls.push({url, options});
+    if (binaryCalls.length === 1) throw new Error('connection reset');
+    const key = options.headers.get('Idempotency-Key');
+    return {status:200, ok:true, async json(){return {idempotency_key:'console-' + key};}};
+  };
+  const chunk = new Uint8Array([1,2,3,4]);
+  await ctx.binaryPost('/api/quest-drafts/file/chunk?draft_id=' + '1'.repeat(32)
+    + '&path=data.bin&offset=0&sha256=sha256%3Aabcd', chunk, 2);
+  check(binaryCalls.length === 2, 'ambiguous binary POST was not retried');
+  const firstBinaryKey = binaryCalls[0].options.headers.get('Idempotency-Key');
+  check(/^[0-9a-f]{32}$/.test(firstBinaryKey)
+    && binaryCalls[1].options.headers.get('Idempotency-Key') === firstBinaryKey,
+    'binary retry did not preserve Idempotency-Key');
+  check(binaryCalls[0].url === binaryCalls[1].url
+    && binaryCalls[0].options.body === chunk && binaryCalls[1].options.body === chunk,
+    'binary retry changed offset/hash URL or bytes');
+
+  // Runtime settings may already be durable while restart scheduling still
+  // needs recovery.  The precise 503 contract is non-definitive: retain the
+  // operation key, then reuse and clear it only after a matching success echo.
+  const runtimePayload = {quest_id:'retry-key', runtime_profile:{
+    version:1, compute_profile_id:'local-gpu', review_intensity:'once'}};
+  const savedPendingCalls = [];
+  global.fetch = async (url, options) => {
+    savedPendingCalls.push({url, options});
+    const key = options.headers.get('Idempotency-Key');
+    return {status:503, ok:false, async json(){return {
+      error:'saved; restart pending', retryable:true,
+      operation_state:'saved_pending_restart', idempotency_key:'console-' + key,
+    };}};
+  };
+  const pendingResult = await ctx.jsonPost('/api/quest-runtime-profile', runtimePayload, 1);
+  check(pendingResult.response.status === 503 && savedPendingCalls.length === 1,
+    'saved-pending restart response was not returned as retryable 503');
+  const savedPendingKey = savedPendingCalls[0].options.headers.get('Idempotency-Key');
+  const savedPendingEntry = [...storage.entries()].find(([k]) => k.includes('pending_posts'));
+  let savedPendingMap = JSON.parse(storage.get(savedPendingEntry[0]));
+  check(Object.values(savedPendingMap).includes(savedPendingKey),
+    'saved-pending restart response cleared its operation key');
+  global.fetch = async (url, options) => {
+    savedPendingCalls.push({url, options});
+    const key = options.headers.get('Idempotency-Key');
+    return {status:200, ok:true, async json(){return {
+      ok:true, idempotency_key:'console-' + key, runtime_profile:{profile:runtimePayload.runtime_profile},
+    };}};
+  };
+  await ctx.jsonPost('/api/quest-runtime-profile', runtimePayload, 1);
+  check(savedPendingCalls[1].options.headers.get('Idempotency-Key') === savedPendingKey,
+    'saved-pending restart retry did not reuse the original operation key');
+  savedPendingMap = JSON.parse(storage.get(savedPendingEntry[0]));
+  check(Object.keys(savedPendingMap).length === 0,
+    'matching success did not clear the recovered runtime operation key');
+
+  // A 409 remains a definitive pre-commit conflict even if a malformed body
+  // copies retryable-looking fields; only the exact 503 contract keeps a key.
+  global.fetch = async (url, options) => {
+    const key = options.headers.get('Idempotency-Key');
+    return {status:409, ok:false, async json(){return {
+      error:'conflict', retryable:true,
+      operation_state:'saved_pending_restart', idempotency_key:'console-' + key,
+    };}};
+  };
+  await ctx.jsonPost('/api/quest-runtime-profile', {quest_id:'definitive-conflict',
+    runtime_profile:runtimePayload.runtime_profile}, 1);
+  savedPendingMap = JSON.parse(storage.get(savedPendingEntry[0]));
+  check(Object.keys(savedPendingMap).length === 0,
+    'definitive 409 incorrectly retained a pending operation key');
+  ctx.markFresh();
 
   // 网络失败必须立即恢复全屏遮罩；只有后续真 /api/db 成功才会由 refreshDB 清除。
   ctx.markFresh();
@@ -175,7 +299,7 @@ function check(ok, message) { if (!ok) throw new Error(message); }
   rejected = false;
   try { await ctx.apiFetch('/api/db'); } catch (_e) { rejected = true; }
   check(rejected && calls.length === before, 'request without capability reached fetch');
-  check(notices.some(x => String(x).includes('需要 capability')), 'missing explicit capability error');
+  check(notices.some(x => String(x).includes('本机控制台授权尚未建立')), 'missing explicit capability error');
   check(guard.style.display === 'flex' && guard.textContent.includes('控制动作已禁用'), 'missing persistent auth guard');
   console.log('AUTH_SMOKE_OK');
 })().catch(e => { console.log('AUTH_SMOKE_FAIL ' + e.message); process.exit(1); });

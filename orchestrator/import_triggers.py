@@ -37,7 +37,6 @@ from .ids import cnum as _cnum, qnum as _qnum
 from .import_authority import (
     ImportAuthorityError,
     authority_hash,
-    build_reference_authority,
     canonical_bytes,
     load_question_import_authority,
 )
@@ -49,14 +48,15 @@ from .import_search import (
 )
 from .importer import DeferredImporter
 from .interfaces import CallUsage
-from .phase_commit import check_or_record
 from .process_supervisor import atomic_write_receipt, read_receipt
 from .question_progress import QuestionProgressError, load_inconclusive_streak
 
 
 _PROTOCOL = "import-trigger-v1"
 _ACTIVATION_PROTOCOL = "import-source-activation-v1"
+_REASONING_QUESTION_REQUEST_PROTOCOL = "import-trigger-question-request-v1"
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_QREF_RE = re.compile(r"^q[1-9][0-9]*$")
 
 
 def _canonical_text(value: Any) -> str:
@@ -84,6 +84,74 @@ def _bounded_text(value: Any, *, field: str, max_bytes: int) -> str:
            for ch in value):
         raise ImportSearchError(f"{field} 含非法控制字符")
     return value
+
+
+def _reasoning_question_request(
+        *, trigger_kind: str, parent_question_id: str, requested_text: str,
+        need_summary: str, survey_candidate_count: int, request_hash: str,
+        result_hash: str) -> Dict[str, Any]:
+    """Build the frozen handoff consumed by reasoning, never a question row.
+
+    The external connector may establish that a separate reference question is
+    warranted, but it cannot author that research object's evidence predicate.
+    Reasoning must turn this bounded request into a schema-valid ``tree_ops``
+    ``spawn_question`` (or explain why a soft request is not followed), after
+    which StateStore remains the sole admission/write authority.
+    """
+    if trigger_kind not in ("stuck", "sota_reference"):
+        raise ImportSearchError("reasoning question request trigger_kind 非法")
+    if not isinstance(parent_question_id, str) or _QREF_RE.fullmatch(
+            parent_question_id) is None:
+        raise ImportSearchError("reasoning question request parent_question_id 非法")
+    requested_text = _bounded_text(
+        requested_text, field="reasoning question request text", max_bytes=8192)
+    need_summary = _bounded_text(
+        need_summary, field="reasoning question request need_summary", max_bytes=8192)
+    if (isinstance(survey_candidate_count, bool)
+            or not isinstance(survey_candidate_count, int)
+            or survey_candidate_count < 0
+            or (trigger_kind == "stuck" and survey_candidate_count == 0)):
+        raise ImportSearchError(
+            "reasoning question request survey_candidate_count 非法")
+    for field, digest in (("request_hash", request_hash), ("result_hash", result_hash)):
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            raise ImportSearchError(f"reasoning question request {field} 非 sha256")
+    return {
+        "protocol": _REASONING_QUESTION_REQUEST_PROTOCOL,
+        "op": "spawn_question",
+        "kind": "import_reference",
+        "parent_question_id": parent_question_id,
+        "requested_text": requested_text,
+        "need_summary": need_summary,
+        "trigger_kind": trigger_kind,
+        "survey_candidate_count": survey_candidate_count,
+        "request_hash": request_hash,
+        "result_hash": result_hash,
+        "requires_reasoning_predicate": True,
+    }
+
+
+def _validated_reasoning_question_request(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+            "protocol", "op", "kind", "parent_question_id", "requested_text",
+            "need_summary", "trigger_kind", "survey_candidate_count",
+            "request_hash", "result_hash", "requires_reasoning_predicate"}:
+        raise ImportSearchError("reasoning question request 结构非法")
+    expected = _reasoning_question_request(
+        trigger_kind=value.get("trigger_kind"),
+        parent_question_id=value.get("parent_question_id"),
+        requested_text=value.get("requested_text"),
+        need_summary=value.get("need_summary"),
+        survey_candidate_count=value.get("survey_candidate_count"),
+        request_hash=value.get("request_hash"), result_hash=value.get("result_hash"))
+    if (value != expected or value.get("protocol") != _REASONING_QUESTION_REQUEST_PROTOCOL
+            or value.get("op") != "spawn_question"
+            or value.get("kind") != "import_reference"
+            or value.get("requires_reasoning_predicate") is not True):
+        raise ImportSearchError("reasoning question request 身份/内容非法")
+    return expected
 
 
 class _AllowedReferenceRedirect(urllib.request.HTTPRedirectHandler):
@@ -509,7 +577,11 @@ class TrustedImportTriggerService:
             "candidate_ids", "license_review_ids", "child_question_id",
             "source_authority_hash", "terminalized", "reference_snapshot",
         }
-        if (not isinstance(payload, dict) or set(payload) != required
+        # Legacy terminalized completions remain readable for durable-run
+        # recovery.  New completions add a request for reasoning and never
+        # create/bind a child question in this connector transaction.
+        allowed_keys = (required, required | {"reasoning_question_request"})
+        if (not isinstance(payload, dict) or set(payload) not in allowed_keys
                 or payload.get("protocol") != _PROTOCOL
                 or payload.get("trigger_kind") not in (
                     "human_named", "stuck", "sota_reference")
@@ -561,6 +633,18 @@ class TrustedImportTriggerService:
                 or ((payload["trigger_kind"] == "sota_reference")
                     != (payload["reference_snapshot"] is not None))):
             raise ImportSearchError("import_trigger_completed 协议非法")
+        reasoning_request = _validated_reasoning_question_request(
+            payload.get("reasoning_question_request"))
+        if reasoning_request is not None and (
+                payload["terminalized"]
+                or payload["child_question_id"] is not None
+                or payload["source_authority_hash"] is not None
+                or payload["trigger_kind"] not in ("stuck", "sota_reference")
+                or reasoning_request["trigger_kind"] != payload["trigger_kind"]
+                or reasoning_request["request_hash"] != payload["request_hash"]
+                or reasoning_request["result_hash"] != payload["result_hash"]):
+            raise ImportSearchError(
+                "import_trigger_completed reasoning question request 与 completion 不一致")
         return payload
 
     def _validate_reference_snapshot(
@@ -819,6 +903,7 @@ class TrustedImportTriggerService:
             child_question_id = None
             source_authority_hash = None
             terminalized = False
+            reasoning_question_request = None
             authority = context["authority"]
             if trigger_kind == "human_named":
                 if len(result["candidates"]) != 1 or result["skipped"]:
@@ -845,62 +930,27 @@ class TrustedImportTriggerService:
                                 or bool(result["candidates"]))
                 if should_spawn:
                     qi, ci = _qnum(cyc.question_id), _cnum(cyc.cycle_id)
+                    # This remains a useful preflight, but it grants no write
+                    # authority: StateStore repeats the authoritative guard
+                    # when reasoning eventually submits tree_ops.
                     self._tree_capacity(conn, parent_id=qi)
                     cycle_row = conn.execute(
                         "SELECT goal_id,goal_ver,status,active_question_id FROM cycle WHERE id=?",
                         (ci,)).fetchone()
-                    if cycle_row is None:
+                    if (cycle_row is None or cycle_row[2] != "idea"
+                            or cycle_row[3] != qi):
                         raise ImportSearchError("import reference origin cycle 不存在")
                     child_text = (
                         f"复现冻结的{('公认 SOTA' if trigger_kind == 'sota_reference' else '外部普查')}"
                         f"参照作为独立 baseline：{request['need_summary']}")
-                    child_question_id = conn.execute(
-                        "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source,born_cycle) "
-                        "VALUES (?,?,?,?,?,'open','agent',?)",
-                        (qi, cycle_row[0], cycle_row[1], cycle_row[1],
-                         child_text, ci)).lastrowid
-                    authority = build_reference_authority(
+                    reasoning_question_request = _reasoning_question_request(
                         trigger_kind=trigger_kind,
-                        origin_cycle_id=ci, origin_question_id=qi,
-                        child_question_id=child_question_id,
-                        goal_id=cycle_row[0], goal_ver=cycle_row[1],
-                        request_hash=request_hash,
-                        trigger_context_hash=context["trigger_context_hash"],
-                        policy_hash=context["policy_hash"],
-                        runner_call_id=runner_call_id,
-                        receipt_ref=str(receipt_path),
-                        result_hash=receipt["result_hash"],
+                        parent_question_id=f"q{qi}", requested_text=child_text,
                         need_summary=request["need_summary"],
-                        reference_snapshot=receipt["reference_snapshot"])
-                    source_authority_hash = authority["authority_hash"]
-                    conn.execute(
-                        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
-                        "VALUES (?,?,'orchestrator','import_reference_authority',?)",
-                        (ci, child_question_id, _canonical_text(authority)))
-                    conn.execute(
-                        "INSERT INTO question_dep(question_id,dep_type,depends_on_question_id,status,created_cycle) "
-                        "VALUES (?,'question',?,'pending',?)",
-                        (qi, child_question_id, ci))
-                    pc = check_or_record(
-                        conn, cycle_id=cyc.cycle_id, stage="plan",
-                        target_id=None, artifact_hash=request_hash)
-                    if pc != "new":
-                        raise ImportSearchError(
-                            f"import reference plan phase_commit 非 new: {pc}")
-                    released = conn.execute(
-                        "UPDATE question SET status='open',active_cycle=NULL "
-                        "WHERE id=? AND status='active' AND active_cycle=?",
-                        (qi, ci)).rowcount
-                    if released != 1:
-                        raise ImportSearchError("import reference origin question 无法释放")
-                    finished = conn.execute(
-                        "UPDATE cycle SET active_question_id=NULL,next_question_id=?,"
-                        "next_intent='attack',status='done',finished_at=CURRENT_TIMESTAMP "
-                        "WHERE id=? AND status='idea' AND active_question_id=?",
-                        (child_question_id, ci, qi)).rowcount
-                    if finished != 1:
-                        raise ImportSearchError("import reference origin cycle 无法原子收尾")
-                    terminalized = True
+                        survey_candidate_count=len(result["candidates"]),
+                        request_hash=request_hash,
+                        result_hash=receipt["result_hash"],
+                    )
             else:                              # defensive; validator is closed
                 raise ImportSearchError(f"trusted trigger_kind 非法: {trigger_kind}")
 
@@ -924,6 +974,7 @@ class TrustedImportTriggerService:
                 "source_authority_hash": source_authority_hash,
                 "terminalized": terminalized,
                 "reference_snapshot": receipt["reference_snapshot"],
+                "reasoning_question_request": reasoning_question_request,
             }
             conn.execute(
                 "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
@@ -942,6 +993,12 @@ class TrustedImportTriggerService:
                 or completion["request_hash"] != request_hash):
             raise ImportSearchError(
                 f"cycle {cyc.cycle_id} 只允许一个 trusted import trigger")
+        reasoning_request = _validated_reasoning_question_request(
+            completion.get("reasoning_question_request"))
+        if (reasoning_request is not None
+                and reasoning_request["parent_question_id"] != cyc.question_id):
+            raise ImportSearchError(
+                "import trigger completion reasoning request parent 与 origin question 不一致")
         receipt_path = self._receipt_path(
             cyc.cycle_id, request_hash, completion["runner_call_id"])
         if completion["receipt_ref"] != str(receipt_path):

@@ -19,6 +19,7 @@ from orchestrator.execution_sandbox import (
     gpu_cli_argument,
     gpu_contract_hash,
     sandbox_environment_hash,
+    sandbox_manifest_profile,
     sandbox_workload_environment_hash,
 )
 from orchestrator.harness import ExecutionRecoveryError, recover_staged_result, run_staged
@@ -45,6 +46,23 @@ def _gpu_contract(*uuids):
             "memory_bytes": 80 * 1024 ** 3, "compute_capability": "8.0",
         } for uuid in uuids],
     }
+
+
+@pytest.mark.parametrize("network_mode", ["none", "bridge"])
+def test_sandbox_manifest_profile_projects_policy_network(network_mode):
+    profile = sandbox_manifest_profile({"network_mode": network_mode})
+    expected = {
+        "network_mode": network_mode,
+        "rootfs_readonly": True,
+    }
+    if network_mode == "bridge":
+        expected["network_development_only"] = True
+    assert profile == expected
+
+
+def test_sandbox_manifest_profile_rejects_unknown_network():
+    with pytest.raises(ValueError, match="network_mode"):
+        sandbox_manifest_profile({"network_mode": "host"})
 
 
 def _runtime(tmp_path):
@@ -81,6 +99,98 @@ def test_environment_identity_is_exact_policy_projection():
     assert value.startswith("sha256:") and len(value) == 71
     changed = {**POLICY["execution"]["sandbox"], "memory_mb": 8192}
     assert sandbox_environment_hash(changed) != value
+    changed = {
+        **POLICY["execution"]["sandbox"],
+        "development_gpu_thread_limit": 3,
+    }
+    assert sandbox_environment_hash(changed) != value
+
+
+def test_development_local_environment_is_pinned_and_not_a_data_mount(tmp_path):
+    config = POLICY["execution"]["sandbox"]
+    local = config["local_environment"]
+    assert local["source"] not in config["readonly_mounts"]
+    work = tmp_path / "work"
+    work.mkdir()
+    sandbox = DockerExecutionSandbox(work_root=work, config=config)
+    assert sandbox.local_environment_identity["identity_sha256"] == (
+        local["identity_sha256"])
+    assert sandbox.local_environment_identity["conda_package_count"] > 0
+
+    drifted = json.loads(json.dumps(config))
+    drifted["local_environment"]["identity_sha256"] = "sha256:" + "0" * 64
+    with pytest.raises(ExecutionSandboxError, match="identity 漂移"):
+        DockerExecutionSandbox(work_root=work, config=drifted)
+
+
+def test_development_local_environment_injects_mapped_trusted_ca(tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"])
+    sandbox._preflight_done = True
+    sandbox._resource_mode = POLICY["execution"]["sandbox"]["resource_mode"]
+    invocation = sandbox.prepare(
+        [sandbox.config["python_path"], "-c", "pass"],
+        staging_dir=work / "run", log_name="ca.log", env=None, timeout_s=10,
+        execution_context={"phase": "ca-unit", "log_name": "ca.log"})
+    try:
+        invocation.spec_file.seek(0)
+        spec = json.loads(invocation.spec_file.read())
+        expected = "/opt/host-conda/ssl/cert.pem"
+        for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+            assert spec["env"][key] == expected
+            assert spec["payload_env"][key] == expected
+            assert sandbox.local_environment["source"] not in spec["payload_env"][key]
+        assert spec["payload_env"]["HOME"] == "/mr/output"
+        assert spec["payload_env"]["XDG_CACHE_HOME"] == "/mr/output/.cache"
+        assert spec["payload_env"]["PIP_CACHE_DIR"] == "/mr/output/.cache/pip"
+        assert spec["payload_env"]["HF_HOME"] == "/mr/output/.cache/huggingface"
+        assert spec["payload_env"]["TORCH_HOME"] == "/mr/output/.cache/torch"
+        assert all("/root/" not in value for value in spec["payload_env"].values())
+    finally:
+        invocation.close()
+
+    with pytest.raises(ExecutionSandboxError, match="trusted payload_environment"):
+        sandbox.prepare(
+            [sandbox.config["python_path"], "-c", "pass"],
+            staging_dir=work / "override", log_name="override.log",
+            env={"SSL_CERT_FILE": "/tmp/disable-verification.pem"}, timeout_s=10,
+            execution_context={"phase": "ca-override", "log_name": "override.log"})
+
+    invalid = json.loads(json.dumps(POLICY["execution"]["sandbox"]))
+    invalid["payload_environment"]["REQUESTS_CA_BUNDLE"] = "/tmp/policy-ca.pem"
+    with pytest.raises(ValueError, match="CA env"):
+        DockerExecutionSandbox(work_root=work, config=invalid)
+
+
+def test_python_requirements_are_bound_into_trusted_launcher_argv(tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"])
+    sandbox._preflight_done = True
+    sandbox._resource_mode = POLICY["execution"]["sandbox"]["resource_mode"]
+    invocation = sandbox.prepare(
+        [sandbox.config["python_path"], "-c", "print('ok')"],
+        staging_dir=work / "run", log_name="deps.log", env=None, timeout_s=60,
+        execution_context={"phase": "deps-unit", "log_name": "deps.log"},
+        python_requirements=["einops==0.8.0", "mne>=1.6"])
+    try:
+        invocation.spec_file.seek(0)
+        spec = json.loads(invocation.spec_file.read())
+        assert json.loads(spec["argv"][12]) == ["einops==0.8.0", "mne>=1.6"]
+        assert ".mr-python-deps" in spec["argv"][4]
+        assert "pip','install'" in spec["argv"][4]
+    finally:
+        invocation.close()
+
+    with pytest.raises(ValueError, match="python_requirements"):
+        sandbox.prepare(
+            ["python", "-c", "pass"], staging_dir=work / "bad",
+            log_name="bad.log", env=None, timeout_s=10,
+            execution_context={"phase": "deps-unit", "log_name": "bad.log"},
+            python_requirements=["--index-url=https://example.invalid"])
 
 
 def test_gpu_capability_hash_is_stable_but_allocation_identity_is_exact():
@@ -119,11 +229,15 @@ def test_gpu_prepare_binds_exact_request_and_inspect_rejects_drift(tmp_path):
     work = tmp_path / "work"
     (work / "state").mkdir(parents=True)
     contract = _gpu_contract("GPU-b", "GPU-a")
+    config = {
+        **POLICY["execution"]["sandbox"],
+        "development_gpu_thread_limit": 4,
+    }
     sandbox = DockerExecutionSandbox(
-        work_root=work, config=POLICY["execution"]["sandbox"],
+        work_root=work, config=config,
         gpu_contract=contract)
     sandbox._preflight_done = True
-    sandbox._resource_mode = POLICY["execution"]["sandbox"]["resource_mode"]
+    sandbox._resource_mode = config["resource_mode"]
     context = {"phase": "gpu-unit", "log_name": "gpu.log"}
     invocation = sandbox.prepare(
         ["python", "-c", "pass"], staging_dir=work / "run",
@@ -135,6 +249,14 @@ def test_gpu_prepare_binds_exact_request_and_inspect_rejects_drift(tmp_path):
         assert [item["uuid"] for item in spec["gpu"]["devices"]] == [
             "GPU-a", "GPU-b"]
         assert spec["env"]["NVIDIA_DRIVER_CAPABILITIES"] == "compute,utility"
+        assert {
+            key: spec["payload_env"][key]
+            for key in ("MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                        "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS")
+        } == {
+            "MKL_NUM_THREADS": "4", "NUMEXPR_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "4", "OPENBLAS_NUM_THREADS": "4",
+        }
         expected_request = [{
             "Driver": "nvidia", "Count": 0,
             "DeviceIDs": ["GPU-a", "GPU-b"],
@@ -145,6 +267,8 @@ def test_gpu_prepare_binds_exact_request_and_inspect_rejects_drift(tmp_path):
              "Target": "/mr/input", "ReadOnly": True},
             {"Type": "bind", "Source": spec["output_root"],
              "Target": "/mr/output", "ReadOnly": False},
+            {"Type": "bind", "Source": spec["local_environment"]["source"],
+             "Target": spec["local_environment"]["target"], "ReadOnly": True},
         ]
         payload = [{
             "Name": "/" + spec["name"], "Image": spec["image_id"],
@@ -156,8 +280,8 @@ def test_gpu_prepare_binds_exact_request_and_inspect_rejects_drift(tmp_path):
             },
             "HostConfig": {
                 "SecurityOpt": ["no-new-privileges:true", "seccomp=/pinned.json"],
-                "NetworkMode": "none", "ReadonlyRootfs": True,
-                "Privileged": False, "IpcMode": "none", "PidMode": "",
+                "NetworkMode": spec["network_mode"], "ReadonlyRootfs": True,
+                "Privileged": False, "IpcMode": "private", "PidMode": "",
                 "CapDrop": ["ALL"], "Devices": [],
                 "DeviceRequests": expected_request,
                 "PidsLimit": spec["limits"]["pids"],
@@ -176,14 +300,64 @@ def test_gpu_prepare_binds_exact_request_and_inspect_rejects_drift(tmp_path):
             "Mounts": [
                 {"Type": "bind", "Destination": "/mr/input", "RW": False},
                 {"Type": "bind", "Destination": "/mr/output", "RW": True},
+                {"Type": "bind",
+                 "Destination": spec["local_environment"]["target"], "RW": False},
             ],
         }]
         _verify_created_container(spec, payload)
+        payload[0]["HostConfig"]["IpcMode"] = "none"
+        with pytest.raises(ExecutionSandboxError, match="安全/资源配置"):
+            _verify_created_container(spec, payload)
+        payload[0]["HostConfig"]["IpcMode"] = "private"
         payload[0]["HostConfig"]["DeviceRequests"][0]["DeviceIDs"].append("GPU-extra")
         with pytest.raises(ExecutionSandboxError, match="安全/资源配置"):
             _verify_created_container(spec, payload)
     finally:
         invocation.close()
+
+
+def test_development_gpu_thread_limit_is_gpu_only_and_not_overridable(tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    config = {
+        **POLICY["execution"]["sandbox"],
+        "development_gpu_thread_limit": 4,
+    }
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=config,
+        gpu_contract=_gpu_contract("GPU-a"))
+    sandbox._preflight_done = True
+    sandbox._resource_mode = config["resource_mode"]
+    thread_keys = {
+        "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+        "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+    }
+    cpu = sandbox.prepare(
+        ["python", "-c", "pass"], staging_dir=work / "cpu",
+        log_name="cpu.log", env=None, timeout_s=10,
+        execution_context={"phase": "cpu", "log_name": "cpu.log"},
+        gpu_required=False)
+    try:
+        cpu.spec_file.seek(0)
+        cpu_spec = json.loads(cpu.spec_file.read())
+        assert thread_keys.isdisjoint(cpu_spec["payload_env"])
+    finally:
+        cpu.close()
+    with pytest.raises(ExecutionSandboxError, match="trusted payload_environment"):
+        sandbox.prepare(
+            ["python", "-c", "pass"], staging_dir=work / "gpu-override",
+            log_name="gpu.log", env={"OPENBLAS_NUM_THREADS": "64"}, timeout_s=10,
+            execution_context={"phase": "gpu", "log_name": "gpu.log"},
+            gpu_required=True)
+
+    invalid = json.loads(json.dumps(config))
+    invalid["local_environment"] = None
+    with pytest.raises(ValueError, match="local environment"):
+        DockerExecutionSandbox(work_root=work, config=invalid)
+    invalid = json.loads(json.dumps(config))
+    invalid["pids"] = invalid["development_gpu_thread_limit"] + 7
+    with pytest.raises(ValueError, match="保留足够 pids"):
+        DockerExecutionSandbox(work_root=work, config=invalid)
 
 
 def test_gpu_required_fails_before_session_creation_without_contract(tmp_path):
@@ -217,6 +391,69 @@ def test_cgroup_gpu_keeps_resident_memory_limit_without_cuda_rlimit_as_trap(tmp_
         assert spec["limits"]["memory_bytes"] == config["memory_mb"] * 1024 ** 2
         assert spec["limits"]["address_space_bytes"] == -1
         assert spec["argv"][5] == "-1"
+    finally:
+        invocation.close()
+
+
+def test_development_rlimit_fallback_does_not_cap_workload_address_space(
+        tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    config = {**POLICY["execution"]["sandbox"], "resource_mode": "rlimit-fallback"}
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=config, gpu_contract=_gpu_contract("GPU-a"))
+    sandbox._preflight_done = True
+    sandbox._resource_mode = "rlimit-fallback"
+
+    gpu = sandbox.prepare(
+        ["python", "-c", "pass"], staging_dir=work / "gpu",
+        log_name="gpu.log", env=None, timeout_s=10,
+        execution_context={"phase": "gpu-development", "log_name": "gpu.log"},
+        gpu_required=True)
+    try:
+        gpu.spec_file.seek(0)
+        spec = json.loads(gpu.spec_file.read())
+        assert spec["limits"]["memory_bytes"] == config["memory_mb"] * 1024 ** 2
+        assert spec["limits"]["address_space_bytes"] == -1
+        assert spec["argv"][5] == "-1"
+    finally:
+        gpu.close()
+
+    cpu = sandbox.prepare(
+        ["python", "-c", "pass"], staging_dir=work / "cpu",
+        log_name="cpu.log", env=None, timeout_s=10,
+        execution_context={"phase": "cpu-development", "log_name": "cpu.log"},
+        gpu_required=False)
+    try:
+        cpu.spec_file.seek(0)
+        spec = json.loads(cpu.spec_file.read())
+        assert spec["limits"]["address_space_bytes"] == -1
+        assert spec["argv"][5] == "-1"
+    finally:
+        cpu.close()
+
+    production_config = {
+        **config,
+        "python_path": "/usr/local/bin/python",
+        "local_environment": None,
+        "development_gpu_thread_limit": None,
+    }
+    production = DockerExecutionSandbox(
+        work_root=work, config=production_config,
+        gpu_contract=_gpu_contract("GPU-a"))
+    production._preflight_done = True
+    production._resource_mode = "rlimit-fallback"
+    invocation = production.prepare(
+        ["python", "-c", "pass"], staging_dir=work / "production-gpu",
+        log_name="gpu.log", env=None, timeout_s=10,
+        execution_context={"phase": "gpu-production", "log_name": "gpu.log"},
+        gpu_required=True)
+    try:
+        invocation.spec_file.seek(0)
+        spec = json.loads(invocation.spec_file.read())
+        expected = production_config["memory_mb"] * 1024 ** 2
+        assert spec["limits"]["address_space_bytes"] == expected
+        assert spec["argv"][5] == str(expected)
     finally:
         invocation.close()
 
@@ -411,6 +648,93 @@ def test_prepare_to_guardian_kill_window_recovers_without_wedge(tmp_path):
         supervisor.close()
 
 
+def test_prepare_recovery_ignores_drained_receipt_from_prior_repair_attempt(tmp_path):
+    work = tmp_path / "work"
+    (work / "state" / "executions").mkdir(parents=True)
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"])
+    receipt_dir = work / "state" / "executions"
+    old_context = {
+        "phase": "smoke", "db_owner_kind": "build_target", "db_owner_id": 7,
+        "build_target_id": 7, "reconcile_protocol": "execution-owner-v1",
+        "execution_attempt": 1, "log_name": "smoke-1.log",
+    }
+    atomic_write_receipt(receipt_dir / ("execution-exec-" + "a" * 32 + ".json"), {
+        "state": "terminal", "group_drained": True, "context": old_context,
+    })
+
+    class _Supervisor:
+        @staticmethod
+        def recover_previous_generation():
+            return None
+
+    _Supervisor.receipt_dir = receipt_dir
+    replacement = {**old_context, "execution_attempt": 2}
+    assert sandbox.recover_unstarted_session(
+        staging_dir=work / "smoke", log_name="smoke-1.log",
+        execution_context=replacement, execution_supervisor=_Supervisor()) is False
+
+    future = {**old_context, "execution_attempt": 3}
+    atomic_write_receipt(receipt_dir / ("execution-exec-" + "b" * 32 + ".json"), {
+        "state": "terminal", "group_drained": True, "context": future,
+    })
+    with pytest.raises(ExecutionSandboxError, match="错配 guardian receipt"):
+        sandbox.recover_unstarted_session(
+            staging_dir=work / "smoke", log_name="smoke-1.log",
+            execution_context=replacement, execution_supervisor=_Supervisor())
+
+
+def test_terminal_session_index_is_retired_before_bundle_archive(tmp_path):
+    work = tmp_path / "work"
+    (work / "state" / "executions").mkdir(parents=True)
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=POLICY["execution"]["sandbox"])
+    sandbox._preflight_done = True
+    sandbox._resource_mode = POLICY["execution"]["sandbox"]["resource_mode"]
+    receipt_dir = work / "state" / "executions"
+
+    class _Supervisor:
+        @staticmethod
+        def recover_previous_generation():
+            return None
+
+    _Supervisor.receipt_dir = receipt_dir
+    context = {
+        "phase": "smoke", "db_owner_kind": "build_target", "db_owner_id": 8,
+        "build_target_id": 8, "reconcile_protocol": "execution-owner-v1",
+        "execution_attempt": 1, "log_name": "smoke-1.log",
+    }
+    invocation = sandbox.prepare(
+        [sandbox.config["python_path"], "-c", "pass"],
+        staging_dir=work / "smoke", log_name="smoke-1.log", env=None,
+        timeout_s=10, execution_context=context,
+        execution_supervisor=_Supervisor())
+    try:
+        receipt = {
+            "operation_id": "exec-" + "c" * 32,
+            "containment": "docker-container-v1", "state": "terminal",
+            "outcome": "exit", "returncode": 1, "group_drained": True,
+            "context": context,
+            "sandbox": {**invocation.external_container, "container_drained": True},
+        }
+        atomic_write_receipt(
+            receipt_dir / f"execution-{receipt['operation_id']}.json", receipt)
+        from orchestrator.execution_sandbox import finalize_sandbox_output
+        finalize_sandbox_output(
+            staging_dir=work / "smoke", log_name="smoke-1.log",
+            context=context, execution_receipt=receipt, exit_code=1)
+        indexes = list((work / "state" / "sandbox" / "sessions").glob("*.json"))
+        assert len(indexes) == 1
+        assert sandbox.retire_terminal_sessions_for_archive(
+            staging_dir=work / "smoke", execution_supervisor=_Supervisor()) == 1
+        assert not indexes[0].exists()
+        assert list((work / "smoke" / ".sandbox-meta").glob("*.json"))
+        assert sandbox.retire_terminal_sessions_for_archive(
+            staging_dir=work / "smoke", execution_supervisor=_Supervisor()) == 0
+    finally:
+        invocation.close()
+
+
 def test_startup_recovery_discards_prepare_only_session(tmp_path):
     work, sandbox, supervisor = _runtime(tmp_path)
     context = {
@@ -546,7 +870,7 @@ def test_pinned_launcher_seccomp_blocks_syscall_platform_profile_allows(tmp_path
         supervisor.close()
 
 
-def test_real_sandbox_blocks_network_and_rootfs_then_promotes_output(tmp_path):
+def test_real_development_sandbox_allows_bridge_but_blocks_rootfs_write(tmp_path):
     work, sandbox, supervisor = _runtime(tmp_path)
     code = """from pathlib import Path
 import socket
@@ -558,7 +882,7 @@ except OSError:
     print('rootfs_write=blocked')
 try:
     socket.create_connection(('1.1.1.1', 53), 0.2)
-    print('network=BAD')
+    print('network=allowed')
 except OSError:
     print('network=blocked')
 print('metric_value: 1@1=0.9')
@@ -573,13 +897,45 @@ print('metric_value: 1@1=0.9')
             "cgroup-v1", "cgroup-v2", "rlimit-fallback"}
         assert (work / "run" / "result.txt").read_text() == "sandbox-ok"
         log = (work / "run" / "probe.log").read_text()
-        assert "rootfs_write=blocked" in log and "network=blocked" in log
+        assert receipt["sandbox"]["network_mode"] == "bridge"
+        assert receipt["sandbox"]["network_development_only"] is True
+        assert receipt["sandbox"]["local_environment_identity_sha256"] == (
+            POLICY["execution"]["sandbox"]["local_environment"]["identity_sha256"])
+        assert "rootfs_write=blocked" in log and "network=allowed" in log
         assert "=BAD" not in log
     finally:
         supervisor.close()
 
 
-def test_verified_fd_is_copied_before_host_path_swap(tmp_path):
+def test_real_development_sandbox_https_uses_mapped_conda_ca(tmp_path):
+    if POLICY["execution"]["sandbox"]["network_mode"] != "bridge":
+        pytest.skip("HTTPS integration probe requires the development bridge contract")
+    work, sandbox, supervisor = _runtime(tmp_path)
+    expected_ca = "/opt/host-conda/ssl/cert.pem"
+    code = f"""import os
+import urllib.request
+assert os.environ['SSL_CERT_FILE'] == {expected_ca!r}
+assert os.environ['REQUESTS_CA_BUNDLE'] == {expected_ca!r}
+with urllib.request.urlopen('https://pypi.org/simple/pip/', timeout=15) as response:
+    print(f'https_status={{response.status}}')
+    assert response.status == 200
+"""
+    try:
+        result = _run(
+            work, sandbox, supervisor,
+            [sandbox.config["python_path"], "-c", code],
+            name="https-ca.log", timeout=30,
+            context={"phase": "https-ca", "db_owner_kind": "build_target",
+                     "db_owner_id": 1})
+        assert result["exit_code"] == 0
+        assert "https_status=200" in (
+            work / "run" / "https-ca.log").read_text(encoding="utf-8")
+    finally:
+        supervisor.close()
+
+
+def test_verified_fd_is_copied_before_host_path_swap(docker_workspace_tmp_path):
+    tmp_path = docker_workspace_tmp_path
     work, sandbox, supervisor = _runtime(tmp_path)
     source = work / "authority.bin"
     source.write_bytes(b"trusted-before-swap")
@@ -630,7 +986,9 @@ def test_timeout_guardian_force_removes_daemon_container(tmp_path):
         supervisor.close()
 
 
-def test_drained_exit_recovers_output_after_owner_publish_gap(tmp_path):
+def test_drained_exit_recovers_output_after_owner_publish_gap(
+        docker_workspace_tmp_path):
+    tmp_path = docker_workspace_tmp_path
     work, sandbox, supervisor = _runtime(tmp_path)
     context = {
         "phase": "probe", "db_owner_kind": "build_target", "db_owner_id": 4,
@@ -669,7 +1027,8 @@ def test_drained_exit_recovers_output_after_owner_publish_gap(tmp_path):
         supervisor.close()
 
 
-def test_symlink_output_never_crosses_quarantine(tmp_path):
+def test_symlink_output_never_crosses_quarantine(docker_workspace_tmp_path):
+    tmp_path = docker_workspace_tmp_path
     work, sandbox, supervisor = _runtime(tmp_path)
     code = "import os; os.symlink('/etc/passwd', 'escaped.txt'); print('done')"
     try:
@@ -682,7 +1041,9 @@ def test_symlink_output_never_crosses_quarantine(tmp_path):
         supervisor.close()
 
 
-def test_promotion_never_traverses_preexisting_staging_symlink(tmp_path):
+def test_promotion_never_traverses_preexisting_staging_symlink(
+        docker_workspace_tmp_path):
+    tmp_path = docker_workspace_tmp_path
     work, sandbox, supervisor = _runtime(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()

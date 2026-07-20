@@ -28,7 +28,7 @@
     },
     "novelty_refs": {
       "type": "array",
-      "description": "联网查重的内容寻址快照（§3.2.3(7)）；M0 无检索工具时可为空数组",
+      "description": "受控联网查重的内容寻址快照（§3.2.3(7)）；policy 禁用或尚无受控后端时为空数组",
       "items": { "$ref": "#/$defs/novelty_ref" }
     },
     "provenance": { "$ref": "#/$defs/provenance" }
@@ -73,9 +73,17 @@
           "enum": ["评估协议", "训练目标", "表征结构", "推理机制", "部署策略", "数据准入", "采样", "校准", "路由", "损失"],
           "description": "novelty 类型封闭词表（§3.2.3(5)）"
         },
+        "novelty_queries": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "uniqueItems": true,
+          "description": "候选提交的普通文本检索词；只能由编排器受控后端执行，模型不得自行填回执/hash",
+          "items": { "type": "string", "minLength": 5, "maxLength": 512 }
+        },
         "novelty_status": {
-          "const": "联网粗查已启用·文献级待人工验证",
-          "description": "新颖性诚实纪律固定文本（P4，§3.2.3(4)）：绝不写「查重通过」"
+          "enum": ["联网查重未启用·文献级待验证", "联网粗查已启用·文献级待人工验证"],
+          "description": "新颖性诚实纪律（P4，§3.2.3(4)）：无受控检索证据只能写“未启用”；有内容寻址快照才可写“已启用”；绝不写「查重通过」"
         },
         "wildidea_extra": { "$ref": "#/$defs/wildidea_extra" }
       },
@@ -128,31 +136,50 @@
     },
     "novelty_ref": {
       "type": "object",
-      "description": "内容寻址快照（非仅外部 ref，护 P6 可回放）",
-      "required": ["query", "provider", "result_content_hashes"],
+      "description": "编排器受控文献检索的内容寻址快照（非模型自报 ref，护 P6 可回放）",
+      "required": [
+        "candidate_id", "query", "provider", "snapshot_hash", "snapshot_ref",
+        "raw_content_hash", "result_content_hashes", "ranking", "policy_hash"
+      ],
       "additionalProperties": false,
       "properties": {
-        "query": { "type": "string", "minLength": 1 },
-        "provider": { "type": "string", "minLength": 1 },
-        "result_content_hashes": { "type": "array", "items": { "type": "string" } },
-        "ranking": { "type": "array", "items": { "type": "string" } },
-        "policy_hash": { "type": "string" }
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "query": { "type": "string", "minLength": 5, "maxLength": 512 },
+        "provider": { "const": "arxiv_api_v1" },
+        "snapshot_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "snapshot_ref": { "type": "string", "pattern": "^state/novelty/[A-Za-z0-9_./-]+\\.json$" },
+        "raw_content_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "result_content_hashes": {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        },
+        "ranking": {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        },
+        "policy_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
       }
     },
     "provenance": {
       "type": "object",
-      "description": "vendored 引擎隐藏上下文入账（§3.2.3(7) 全清单；M0 adapter 骨架期填已知项）",
+      "description": "pinned vendored 引擎与 adapter 的隐藏上下文入账（§3.2.3(7) 全清单）",
       "additionalProperties": false,
       "properties": {
         "engine_version": { "type": "string" },
         "adapter_version": { "type": "string" },
-        "prompt_hash": { "type": "string" },
-        "judge_prompt_hash": { "type": "string" },
+        "prompt_hash": { "type": "string", "description": "生产态为生成侧最终成功 provider invocation 的完整 prompt SHA-256（无 sha256: 前缀）" },
+        "judge_prompt_hash": { "type": "string", "description": "生产态为盲审侧最终成功 provider invocation 的完整 prompt SHA-256（无 sha256: 前缀）" },
         "anchor_pack_hash": { "type": "string" },
         "input_card_hash": { "type": "string" },
-        "policy_yaml_hash": { "type": "string" },
-        "dependency_lock_hash": { "type": "string" },
+        "policy_yaml_hash": { "type": "string", "description": "历史 ABI 名；实际为解析并收窄后的 effective policy canonical-JSON SHA-256，不依赖 YAML 排版" },
+        "dependency_lock_hash": { "type": "string", "description": "engines/wildidea/DEPENDENCY_LOCK.json 的 SHA-256；当前引擎运行依赖为零第三方包" },
         "model": { "type": "string" },
+        "generation_runner_call_id": { "type": "integer", "minimum": 1 },
+        "judge_runner_call_id": { "type": "integer", "minimum": 1 },
+        "generation_provider_receipt_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "judge_provider_receipt_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
         "sampling": {
           "type": "object",
           "additionalProperties": false,

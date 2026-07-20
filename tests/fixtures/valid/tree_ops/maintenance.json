@@ -6,6 +6,12 @@
       "kind": "revalidate",
       "parent_question_id": "q2",
       "text": "复核：q2 的结论在协议升版（新增 macro-F1 指标）后是否仍然成立？",
+      "predicate_json": {
+        "kind": "evidence_closure_v1",
+        "allowed_evidence": ["evaluation", "child_answer"],
+        "answer_criterion_md": "新版协议下的成功测量或可适用子答案仍支持 q2 原结论。",
+        "refute_criterion_md": "新版协议下的成功测量或可适用子答案推翻 q2 原结论。"
+      },
       "rationale_md": "回看题：applicability 判定要求"
     },
     {

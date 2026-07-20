@@ -20,3 +20,14 @@ The trusted pinned-image launcher installs this BPF after hard rlimits and
 before parsing payload environment or executing payload code. This is the
 authoritative syscall boundary because the deployment platform replaces
 Docker's requested/default profile with an additive host policy.
+
+## Development GPU compatibility
+
+The pinned BPF is also used unchanged for development GPU invocations.  A
+PyTorch CUDA initialization failure with runtime error 304 was traced to
+OpenBLAS consuming the 64-task sandbox allowance before CUDA created its
+worker threads: `pthread_create` returned `EAGAIN`, not seccomp `EPERM`.
+`execution.sandbox.development_gpu_thread_limit` therefore pins the BLAS/OMP
+thread-pool environment only for development GPU workloads and reserves tasks
+for the CUDA runtime.  Do not widen this profile to address task exhaustion;
+the BPF hash above remains the GPU-tested syscall identity.

@@ -806,22 +806,11 @@ def _validate_resume(
     genesis = _strict_json(genesis_raw, label="resume storage genesis")
     adoption = target["cycles"][source_cycle]
     post = target["cycles"][source_cycle + 1]
-    if (genesis.get("adoption_baseline") is not True
-            or genesis.get("coverage_start_cycle") != source_cycle
-            or genesis.get("bootstrap_before_cycle") != source_cycle - 1
-            or adoption["manifest"].get("adoption_baseline") is not True
-            or adoption["manifest"].get("bootstrap_before_cycle") != source_cycle - 1
-            or adoption["manifest"].get("cycle_status")
-            != source_manifest.get("cycle_status")
-            or adoption["manifest"].get("backup") != source_manifest.get("backup")
-            or adoption["manifest"].get("previous_manifest_sha256") is not None
-            or post["manifest"].get("adoption_baseline") is not False
-            or post["manifest"].get("bootstrap_before_cycle") is not None
-            or post["manifest"].get("previous_manifest_sha256")
-            != adoption["pointer"].get("manifest_sha256")
-            or post["manifest"].get("cycle_status") != "done"):
-        raise EvidencePackError("resume adoption/post-cycle chain 不满足单轮续跑合同")
 
+    # Establish that the post-restore row came from a real runner invocation
+    # before reporting secondary snapshot-chain drift.  A manually inserted
+    # ``done`` row may also change the adoption backup bytes, but it must never
+    # be mistaken for (or diagnosed as) a valid one-cycle resume probe.
     post_snapshot = target_root / post["manifest"]["backup"]["path"]
     fd = os.open(
         post_snapshot, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -848,6 +837,22 @@ def _validate_resume(
         if connection is not None:
             connection.close()
         os.close(fd)
+
+    if (genesis.get("adoption_baseline") is not True
+            or genesis.get("coverage_start_cycle") != source_cycle
+            or genesis.get("bootstrap_before_cycle") != source_cycle - 1
+            or adoption["manifest"].get("adoption_baseline") is not True
+            or adoption["manifest"].get("bootstrap_before_cycle") != source_cycle - 1
+            or adoption["manifest"].get("cycle_status")
+            != source_manifest.get("cycle_status")
+            or adoption["manifest"].get("backup") != source_manifest.get("backup")
+            or adoption["manifest"].get("previous_manifest_sha256") is not None
+            or post["manifest"].get("adoption_baseline") is not False
+            or post["manifest"].get("bootstrap_before_cycle") is not None
+            or post["manifest"].get("previous_manifest_sha256")
+            != adoption["pointer"].get("manifest_sha256")
+            or post["manifest"].get("cycle_status") != "done"):
+        raise EvidencePackError("resume adoption/post-cycle chain 不满足单轮续跑合同")
 
     builder.add_bytes(
         kind="restore_receipt", logical_id="resume/restore.json", raw=restore_raw)
@@ -1451,6 +1456,33 @@ def _validate_log_mirrors_offline(
                 "owner": "external_import", "owner_id": int(row[0]),
                 "provenance_manifest_hash": row[1], "cycle_id": f"c{row[2]}",
                 "retention": "db_provenance_only",
+            })
+        for row in connection.execute(
+                "SELECT id,code_ref,commit_hash FROM baseline "
+                "WHERE code_ref IS NOT NULL AND commit_hash LIKE 'sha256-tree-v1:%' ORDER BY id"):
+            digest = str(row[2]).removeprefix("sha256-tree-v1:")
+            if _HASH_RE.fullmatch(digest) is None:
+                raise EvidencePackError(
+                    f"packed source baseline {row[0]} formal code hash 非法")
+            database_assets.append({
+                "owner": "baseline_code", "owner_id": int(row[0]), "ref": row[1],
+                "hash_alg": "sha256-tree-v1", "content_hash": digest,
+                "retention": "registered_forever",
+            })
+        for row in connection.execute(
+                "SELECT id,cycle_id,type,json_extract(payload_json,'$.manifest_ref'),"
+                "json_extract(payload_json,'$.manifest_hash') FROM decision "
+                "WHERE actor='gate' AND type IN "
+                "('pool_training_publication','pool_publication') ORDER BY id"):
+            if (not isinstance(row[3], str) or not row[3]
+                    or not isinstance(row[4], str)
+                    or _HASH_RE.fullmatch(row[4]) is None):
+                raise EvidencePackError(
+                    f"packed pool_publication decision {row[0]} ref/hash 非法")
+            database_assets.append({
+                "owner": row[2], "owner_id": int(row[0]), "ref": row[3],
+                "hash_alg": "sha256", "content_hash": row[4],
+                "cycle_id": f"c{row[1]}", "retention": "registered_forever",
             })
         if database_assets != list(source_assets):
             raise EvidencePackError(
@@ -2281,7 +2313,9 @@ def _verify_evidence_pack_anchored(
         dependency_capabilities=dependency_capabilities)
     unresolved = [asset for asset in source_storage["manifest"].get("assets", [])
                   if isinstance(asset, dict)
-                  and asset.get("owner") in {"checkpoint", "execution_log"}]
+                  and asset.get("owner") in {
+                      "checkpoint", "execution_log", "baseline_code",
+                      "pool_training_publication", "pool_publication"}]
 
     _assert_pack_unchanged(pack, file_identities, root_fd=root_fd)
     result = {

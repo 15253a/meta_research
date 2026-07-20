@@ -19,7 +19,9 @@ from orchestrator.connectors import (ConnectorConfigError, ConnectorDeliveryErro
                                      WebhookV1Connector, load_connectors,
                                      render_event_text)
 from orchestrator.console import Console, DIRECTIVE_ACTION_SESSION_REF
+from orchestrator.cost_ledger import CostLedger
 from orchestrator.interaction import InteractionIngest
+from orchestrator.interfaces import CallUsage
 from orchestrator.notify import (DirectiveNotifier, InteractionNotifier, Outbox,
                                  ResearchNotifier)
 from orchestrator.console_server import assemble_db
@@ -648,7 +650,7 @@ def test_research_notifier_covers_failure_block_summary_and_applicability(tmp_pa
     assert {"cycle_failed", "build_target_failed", "engineering_blocked", "cycle_summary",
             "external_import_failed",
             "answer_applicability_changed"} <= kinds
-    assert "cycle:1:failed" in keys and "cycle:2:summary" in keys
+    assert "cycle:1:failed" in keys and "cycle:2:summary:v2" in keys
     assert "build_target:4:failed" in keys
     assert f"external_import:{failed_id}:materialize_failed" in keys
     assert notifier.scan() == []
@@ -666,6 +668,37 @@ def test_research_notifier_covers_failure_block_summary_and_applicability(tmp_pa
               if event["kind"] == "answer_applicability_changed"][-1]
     assert len(latest["payload"]["rationale_md"]) < 5000
     assert latest["payload"]["rationale_hash"].startswith("sha256:")
+
+
+def test_cycle_summary_v2_upgrades_existing_v1_and_uses_ledger_cost(tmp_path):
+    daemon = WriteDaemon(db.connect(":memory:"))
+    conftest.seed_minimal(daemon.conn)
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE cycle SET status='done',cost_total=999,next_intent='terminate' WHERE id=1")
+
+    policy = {"budget": {"session_max": None, "price_per_1k_tokens": 0.3}}
+    CostLedger(daemon, policy).record(
+        cycle_id="c1", phase="reasoning", purpose="real-ledger-cost",
+        usage=CallUsage(tokens_total=2000, tokens_known=True))
+
+    outbox = Outbox(str(tmp_path))
+    legacy_payload = {
+        "cycle_id": "c1", "cost_total": 999,
+        "summary_md": "legacy cycle.cost_total projection",
+    }
+    assert outbox.emit("cycle:1:summary", "cycle_summary", legacy_payload)
+
+    notifier = ResearchNotifier(daemon, outbox, audit_cadence_k=1)
+    assert "cycle:1:summary:v2" in notifier.scan()
+    assert notifier.scan() == []
+
+    summaries = {event["event_key"]: event for event in outbox._events()
+                 if event["kind"] == "cycle_summary"}
+    assert summaries["cycle:1:summary"]["payload"] == legacy_payload
+    summary = summaries["cycle:1:summary:v2"]
+    assert summary["payload"]["cost_total"] == pytest.approx(0.6)
+    assert summary["payload"]["cost_total"] != 999
 
 
 def test_outbox_rejects_symlink_state_and_corrupt_delivery_authority(tmp_path):

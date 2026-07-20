@@ -109,7 +109,11 @@ def _source_and_restored(
         ]) == 0
     if mutate_before_start:
         changed = db.connect(target / "research.sqlite")
-        changed.execute("UPDATE question SET text='restore 后带外篡改' WHERE id=1")
+        # Keep the admitted question text/predicate envelope internally valid so
+        # the resumed cycle can run.  The score mutation still changes the
+        # restored DB bytes before adoption and must therefore be caught by the
+        # evidence-pack snapshot-chain check this fixture is exercising.
+        changed.execute("UPDATE question SET score=0.123456 WHERE id=1")
         changed.commit()
         changed.close()
     if advance:

@@ -22,6 +22,7 @@ STAGE_SCHEMAS = [
     "policy",
     # bundle 编译产物：机器执行契约（步⑧ CP8.1；plan 保持抽象，命令只在此，executor=orchestrator/manifest.py）
     "execution_manifest",
+    "bundle_operator_action",
     # bundle 双评审裁决（步⑧ CP8.3；judge 产，JudgeProvider 落 runner_call+DECISION）
     "review_verdict",
     # sidecar（非 Gate 产物：schema 校验后经 interaction_request_create，不入研究库，§6.11）
@@ -105,6 +106,30 @@ def test_invalid_fixture_rejected(name, case):
     )
 
 
+def test_execution_manifest_schema_accepts_checkpoint_array_not_mixed_forms():
+    path = (SYSTEM_ROOT / "tests" / "fixtures" / "valid" /
+            "execution_manifest" / "build_toy.json")
+    manifest = load_json(path)
+    validator = make_validator("execution_manifest")
+    manifest["expected_outputs"] = {"checkpoints": [
+        {"ckpt_key": "fold0", "path": "checkpoints/fold0.pt"},
+        {"ckpt_key": "fold1", "path": "checkpoints/fold1.pt"},
+    ]}
+    validator.validate(manifest)
+
+    mixed = load_json(path)
+    mixed["expected_outputs"]["checkpoints"] = [
+        {"ckpt_key": "fold0", "path": "fold0.pt"}]
+    with pytest.raises(ValidationError):
+        validator.validate(mixed)
+
+    bad_key = load_json(path)
+    bad_key["expected_outputs"] = {"checkpoints": [
+        {"ckpt_key": "fold/0", "path": "fold0.pt"}]}
+    with pytest.raises(ValidationError):
+        validator.validate(bad_key)
+
+
 def test_resource_request_metadata_bounds_match_runtime_quota():
     """请求 schema 自身限制 prompt 元数据；items 上限须与 policy 默认的 10 对齐。"""
     schema = load_schema("resource_request")
@@ -115,6 +140,10 @@ def test_resource_request_metadata_bounds_match_runtime_quota():
     assert item_props["attempted_paths"]["maxItems"] == 8
 
     validator = make_validator("resource_request")
+    validator.validate({
+        "summary_md": "需要用户补充许可证文本",
+        "items": [{"kind": "paper", "desc": "用于确认数据使用范围"}],
+    })
     max_item = {
         "kind": "dataset",
         "desc": "D" * 1024,
@@ -157,17 +186,47 @@ def test_policy_rejects_unimplemented_multi_stage_session_mode():
         make_validator("policy").validate(policy)
 
 
-def test_plan_gpu_requirement_is_additive_abstract_resource_intent():
+def test_plan_gpu_requirement_is_explicit_abstract_resource_intent():
     path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
-    legacy = load_json(path)
+    cpu_plan = load_json(path)
     validator = make_validator("plan")
-    validator.validate(legacy)  # old frozen slices default to CPU
+    validator.validate(cpu_plan)
     with_gpu = load_json(path)
     with_gpu["targets"][0]["gpu_required"] = True
     validator.validate(with_gpu)
     with_gpu["targets"][0]["gpu_required"] = "true"
     with pytest.raises(ValidationError):
         validator.validate(with_gpu)
+    omitted = load_json(path)
+    del omitted["targets"][0]["gpu_required"]
+    with pytest.raises(ValidationError):
+        validator.validate(omitted)
+
+
+def test_policy_gpu_target_and_device_index_contract_is_explicit():
+    with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
+        base = yaml.safe_load(f)
+    validator = make_validator("policy")
+    validator.validate(base)
+
+    cpu = yaml.safe_load(yaml.safe_dump(base))
+    cpu["resources"] = {
+        "gpus": 0, "gpu_mem_gb": 0, "disk_quota_gb": 1,
+        "gpu_target_policy": "forbidden", "allowed_device_indices": [],
+    }
+    validator.validate(cpu)
+
+    for resources in (
+        {**base["resources"], "gpu_target_policy": "forbidden"},
+        {**base["resources"], "gpu_target_policy": "required", "gpus": 0,
+         "gpu_mem_gb": 0, "allowed_device_indices": []},
+        {**base["resources"], "allowed_device_indices": [0, 0]},
+        {**base["resources"], "allowed_device_indices": []},
+    ):
+        invalid = yaml.safe_load(yaml.safe_dump(base))
+        invalid["resources"] = resources
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
 
 
 def test_policy_plan_review_semantic_rounds_are_capped_at_two():
@@ -176,6 +235,28 @@ def test_policy_plan_review_semantic_rounds_are_capped_at_two():
     policy["flow"]["retry"]["plan_review"] = 3
     with pytest.raises(ValidationError):
         make_validator("policy").validate(policy)
+
+
+def test_policy_bundle_repair_defaults_unlimited_and_accepts_legacy_bounds():
+    with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
+        base = yaml.safe_load(f)
+    validator = make_validator("policy")
+    retry = base["flow"]["retry"]
+    assert retry["bundle_repair"] is None
+    validator.validate(base)
+    for legacy in (0, 1, 2, 3):
+        policy = yaml.safe_load(yaml.safe_dump(base))
+        policy["flow"]["retry"]["bundle_repair"] = legacy
+        validator.validate(policy)
+    for invalid in (-1, 4, True):
+        policy = yaml.safe_load(yaml.safe_dump(base))
+        policy["flow"]["retry"]["bundle_repair"] = invalid
+        with pytest.raises(ValidationError):
+            validator.validate(policy)
+    policy = yaml.safe_load(yaml.safe_dump(base))
+    del policy["flow"]["retry"]["bundle_repair"]
+    with pytest.raises(ValidationError):
+        validator.validate(policy)
 
 
 def test_policy_adapter_generation_projection_is_minimal_and_bounded():
@@ -205,12 +286,32 @@ def test_policy_deployment_mode_requires_honest_attestation_shape():
     validator = make_validator("policy")
 
     production = yaml.safe_load(yaml.safe_dump(base))
+    production["execution"]["sandbox"]["local_environment"] = None
+    production["execution"]["sandbox"]["development_gpu_thread_limit"] = None
+    production["execution"]["sandbox"]["python_path"] = "/usr/local/bin/python3"
+    production["execution"]["sandbox"]["network_mode"] = "none"
     production["deployment"] = {
         "mode": "production",
         "attestation_path": "/etc/meta-research/deployment.json",
         "max_attestation_age_s": 300,
     }
     validator.validate(production)
+
+    production_with_live_host_prefix = yaml.safe_load(yaml.safe_dump(base))
+    production_with_live_host_prefix["deployment"] = production["deployment"]
+    with pytest.raises(ValidationError):
+        validator.validate(production_with_live_host_prefix)
+
+    production_with_bridge = yaml.safe_load(yaml.safe_dump(production))
+    production_with_bridge["execution"]["sandbox"]["network_mode"] = "bridge"
+    with pytest.raises(ValidationError):
+        validator.validate(production_with_bridge)
+
+    production_with_gpu_thread_limit = yaml.safe_load(yaml.safe_dump(production))
+    production_with_gpu_thread_limit["execution"]["sandbox"][
+        "development_gpu_thread_limit"] = 4
+    with pytest.raises(ValidationError):
+        validator.validate(production_with_gpu_thread_limit)
 
     for deployment in (
             {"mode": "development", "attestation_path": "/tmp/fake.json",
@@ -229,8 +330,9 @@ def test_policy_budget_price_required_and_positive_when_session_limit_enabled():
     validator = make_validator("policy")
     for budget in (
             {k: v for k, v in base["budget"].items() if k != "session_max"},
-            {k: v for k, v in base["budget"].items() if k != "price_per_1k_tokens"},
-            {**base["budget"], "price_per_1k_tokens": 0}):
+            {**{k: v for k, v in base["budget"].items()
+                if k != "price_per_1k_tokens"}, "session_max": 100000},
+            {**base["budget"], "session_max": 100000, "price_per_1k_tokens": 0}):
         with pytest.raises(ValidationError):
             validator.validate({**base, "budget": budget})
     # 明确关闭 session 网时允许零价（仍可保留零成本审计行）。
@@ -243,19 +345,56 @@ def test_policy_defaults_match_appendix_c_spotchecks():
     with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
         p = yaml.safe_load(f)
     assert p["acquisition"] == {"w1": 0.35, "w2": 0.25, "w3": 0.30, "c": 0.10}
-    assert p["budget"] == {"B0": 5, "doubling_period_m": 8, "B_max": 40, "session_max": 100000,
-                           "price_per_1k_tokens": 0.3}  # session_max: M6 CP7.1 全局安全网；price: 步⑩ CP10.2 记账汇率
+    assert p["budget"] == {"B0": 5, "doubling_period_m": 8, "B_max": 40, "session_max": None,
+                           "price_per_1k_tokens": 0.3}  # session_max 暂时关闭；price 仍用于可观测账本
     assert p["flow"]["retry"] == {
-        "artifact_parse": 2, "plan_review": 2,
-        "bundle_code_review": 3, "bundle_result_review": 3,
+        "artifact_parse": 5, "bundle_repair": None, "plan_review": 1,
+        "bundle_code_review": 1, "bundle_result_review": 1,
     }
-    assert p["idea"]["sd_threshold"] == 6
+    assert p["answer_review"]["max_reviews_per_cycle"] == 1
+    assert p["idea"] == {
+        "engine": {
+            "name": "wildidea",
+            "version": "wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598",
+            "adapter_version": "meta-research-wildidea-adapter-v1",
+            "profile": "research",
+        },
+        "problem_type": "research", "slot_count": 9,
+        "candidate_top_k": 3, "max_attempts": 3,
+        "thresholds": {"research": {
+            "structural_depth": 6, "domain_distance": 7,
+            "applicability": 6, "novelty": 8,
+        }},
+        "novelty_check": {
+            "enabled": True, "status": "controlled_backend_enabled",
+            "provider": "arxiv_api_v1",
+            "endpoint": "https://export.arxiv.org/api/query",
+            "queries_per_candidate": 1,
+            "max_results_per_query": 10,
+            "timeout_s": 60,
+            "max_response_bytes": 4194304,
+            "min_interval_s": 3,
+            "retry_attempts": 8,
+            "retry_initial_delay_s": 3,
+            "retry_max_delay_s": 120,
+        },
+        "sd_threshold": 6, "dedup_budget": 10,
+        "forbid_proto_term_source": "question_task_terms",
+        "cross_phase": {
+            "decompose_assist": True, "spawn_assist": True, "budget": 5,
+        },
+    }
     assert p["tree_guard"] == {
         "max_decompose_depth": 4, "max_children_per_node": 6, "max_open_questions": 30,
     }
     assert p["retrieval"]["scale_thresholds"] == {
         "medium": {"est_cost_ratio": 0.25, "score": 0.40},
         "large": {"est_cost_ratio": 0.75, "score": 0.75},
+    }
+    assert p["resources"] == {
+        "gpus": 8, "gpu_mem_gb": 80, "disk_quota_gb": 10240,
+        "gpu_target_policy": "required",
+        "allowed_device_indices": [0, 1, 2, 3, 4, 5, 6, 7],
     }
     assert p["interaction_request"]["max_items_per_request"] == 10
     assert p["import_search"] == {
@@ -267,6 +406,32 @@ def test_policy_defaults_match_appendix_c_spotchecks():
                       "allow_publish_pool": True, "allow_redistribute": False},
         },
     }
+
+
+def test_policy_idea_novelty_status_cannot_claim_an_unconfigured_backend():
+    """The boolean and the human-readable state are one fail-closed contract."""
+    with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
+        base = yaml.safe_load(f)
+    validator = make_validator("policy")
+    validator.validate(base)
+    disabled = yaml.safe_load(yaml.safe_dump(base))
+    disabled["idea"]["novelty_check"] = {
+        "enabled": False, "status": "pending_controlled_backend",
+    }
+    validator.validate(disabled)
+    missing_backend = yaml.safe_load(yaml.safe_dump(base))
+    missing_backend["idea"]["novelty_check"] = {
+        "enabled": True, "status": "controlled_backend_enabled",
+    }
+    with pytest.raises(ValidationError):
+        validator.validate(missing_backend)
+    for novelty_check in (
+            {"enabled": False, "status": "controlled_backend_enabled"},
+            {"enabled": True, "status": "pending_controlled_backend"}):
+        invalid = yaml.safe_load(yaml.safe_dump(base))
+        invalid["idea"]["novelty_check"] = novelty_check
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
 
 
 # ---------------------------------------------------------------------------

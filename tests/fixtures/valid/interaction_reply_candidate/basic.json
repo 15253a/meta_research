@@ -1,6 +1,3 @@
 {
-  "facts": [
-    {"path": "snapshot_cycle", "value": "c1"},
-    {"path": "cycle_status", "value": "reasoning"}
-  ]
+  "answer": "系统正在整理结果并决定下一步。"
 }

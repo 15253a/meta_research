@@ -33,6 +33,7 @@ from orchestrator.execution_sandbox import (
 from orchestrator.importer import DeferredImporter
 from orchestrator.instance_lease import InstanceLease
 from orchestrator.process_supervisor import ExecutionSupervisor
+from orchestrator.pool_publication import PoolPublisher, is_formally_published
 from orchestrator.statestore_sqlite import SQLiteStateStore
 from orchestrator.writedaemon import WriteDaemon
 
@@ -120,12 +121,18 @@ def _seed_deferred(daemon, state, *, scope='{"allow_eval": true, "allow_publish_
     return {"cid": cid, "lic": lic, **r}
 
 
-def _mk_worker(path, work, fetch=_fetch_ok):
+def _mk_worker(path, work, fetch=_fetch_ok, *, formal_pool=False):
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY)
-    pool = PoolGate(daemon, open_gate_read_conn(path))
+    publisher = None
+    if formal_pool:
+        Path(work).mkdir(parents=True, exist_ok=True)
+        publisher = PoolPublisher(work)
+    pool = PoolGate(
+        daemon, open_gate_read_conn(path), pool_publisher=publisher,
+        require_formal_publication=formal_pool)
     w = ImportWorker(state=state, pool_gate=pool, providers={"fetch": fetch, "judge": _judge(daemon)},
-                     obs_policy=OBS, work_root=str(work))
+                     obs_policy=OBS, work_root=str(work), pool_publisher=publisher)
     return daemon, state, w
 
 
@@ -390,6 +397,78 @@ def test_materialize_full_chain(env):
     assert s.is_schedulable("q1") is True
     # 幂等：再扫不重物化
     assert w.materialize_pending() == []
+
+
+def test_import_materialization_publishes_and_binds_formal_pool(tmp_path):
+    work = tmp_path / "work"
+    daemon, state, worker = _mk_worker(
+        str(tmp_path / "formal.sqlite"), work, formal_pool=True)
+    selection = _seed_deferred(daemon, state)
+
+    assert worker.materialize_pending(max_items=1)
+    variant_id, status = daemon.query_one(
+        "SELECT id,status FROM variant WHERE baseline_id=?",
+        (selection["baseline_id"],))
+    assert status == "legal"
+    assert is_formally_published(daemon.conn, variant_id=variant_id)
+    checkpoint = daemon.query_one(
+        "SELECT path,origin,source_uri,revision FROM checkpoint")
+    assert checkpoint[0].startswith("baselines/")
+    assert (work / checkpoint[0]).is_file()
+    assert checkpoint[1:] == ("external_import", "hub://model-x", "rev-abc")
+    baseline = daemon.query_one(
+        "SELECT code_ref,commit_hash FROM baseline WHERE id=?",
+        (selection["baseline_id"],))
+    assert baseline[0].startswith("baselines/")
+    assert baseline[1].startswith("sha256-tree-v1:")
+    attempt = daemon.query_one(
+        "SELECT artifact_ref,transcript_ref FROM evaluation_attempt")
+    assert attempt[0].startswith("sha256:")
+    assert attempt[1].startswith("pool/manifests/")
+    log_ref = daemon.query_one(
+        "SELECT ref FROM execution_log WHERE log_kind='eval'")[0]
+    assert log_ref.startswith("baselines/")
+    assert (work / log_ref).is_file()
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_training_publication'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 1
+    assert daemon.query_one(
+        "SELECT count(*) FROM card WHERE card_type IN ('baseline','variant','protocol')")[0] == 3
+
+
+def test_import_formal_eval_publish_replays_before_gate_registration(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    daemon, state, worker = _mk_worker(
+        str(tmp_path / "formal-crash.sqlite"), work, formal_pool=True)
+    _seed_deferred(daemon, state)
+    original = worker.gate.gate_register_evaluation
+    crashed = {"done": False}
+
+    def crash_once(**kwargs):
+        assert kwargs["publication"] is not None
+        if not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("injected import pre-register crash")
+        return original(**kwargs)
+
+    monkeypatch.setattr(worker.gate, "gate_register_evaluation", crash_once)
+    with pytest.raises(RuntimeError, match="pre-register crash"):
+        worker.materialize_pending(max_items=1)
+    assert daemon.query_one(
+        "SELECT status FROM evaluation_attempt")[0] == "running"
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 0
+    attempts = list((work / "baselines").glob(
+        "*/variants/*/evaluations/*/attempts/1"))
+    assert len(attempts) == 1
+    assert (attempts[0] / "transcript.receipt").is_file()
+
+    assert worker.materialize_pending(max_items=1)
+    variant_id = daemon.query_one("SELECT id FROM variant")[0]
+    assert is_formally_published(daemon.conn, variant_id=variant_id)
+    assert daemon.query_one(
+        "SELECT status FROM evaluation_attempt")[0] == "success"
 
 
 def test_file_backed_repository_spec_registers_protocol_and_named_metrics(tmp_path):

@@ -7,7 +7,8 @@ name+label cleanup capability to that guardian.  The container sees only:
 
 * a verified, copied input snapshot mounted read-only;
 * one quarantine output directory mounted read-write;
-* a read-only root filesystem and private PID/network namespaces; and
+* a read-only root filesystem, private PID namespace, and a policy-pinned
+  network mode (``bridge`` is explicitly development-only); and
 * a pinned image, no capabilities, no-new-privileges, an additive daemon
   filter, and a hash-pinned launcher-installed default-deny seccomp BPF.
 
@@ -78,6 +79,45 @@ _MAX_SPEC_BYTES = 2 * 1024 * 1024
 _MAX_ENGINE_OUTPUT = 4 * 1024 * 1024
 _SESSION_VERSION = 1
 _SAFE_PATH = re.compile(r"^[^\x00-\x1f\x7f\\]+$")
+_LOCAL_ENV_TARGET = "/opt/host-conda"
+_LOCAL_ENV_CA_RELATIVE = "ssl/cert.pem"
+_LOCAL_ENV_CA_ENV_KEYS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+_LOCAL_ENV_MAX_METADATA_FILES = 4096
+_LOCAL_ENV_MAX_METADATA_BYTES = 32 * 1024 * 1024
+_DEVELOPMENT_GPU_THREAD_ENV = (
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+)
+_GPU_RUNTIME_PID_RESERVE = 8
+
+_DEVELOPMENT_GPU_RUNTIME_CANARY = r"""
+import os,resource,sys
+import torch
+
+expected=int(sys.argv[1])
+if resource.getrlimit(resource.RLIMIT_AS)[0] != resource.RLIM_INFINITY:
+    raise RuntimeError('development GPU canary requires unlimited RLIMIT_AS')
+if not torch.cuda.is_available() or torch.cuda.device_count()!=expected:
+    raise RuntimeError(
+        f'CUDA device count mismatch: expected={expected} actual={torch.cuda.device_count()}')
+for index in range(expected):
+    device=torch.device('cuda',index)
+    with torch.cuda.device(device):
+        layer=torch.nn.Conv1d(2,2,3,padding=1).to(device)
+        sample=torch.ones((1,2,16),device=device,requires_grad=True)
+        layer(sample).sum().backward()
+        torch.cuda.synchronize(device)
+if expected>1:
+    copies=torch.nn.parallel.comm.broadcast(
+        torch.ones(1,device='cuda:0'),devices=list(range(expected)))
+    if len(copies)!=expected or any(float(item.item())!=1.0 for item in copies):
+        raise RuntimeError('NCCL broadcast verification failed')
+    for index in range(expected):
+        torch.cuda.synchronize(index)
+os.execv(sys.argv[2],sys.argv[2:])
+""".strip()
 
 _RLIMIT_LAUNCHER = r"""
 import base64,ctypes,json,os,resource,subprocess,sys
@@ -130,9 +170,55 @@ os.umask(0o077)
 os.chdir('/mr/output')
 os.environ.clear()
 os.environ.update(payload_env)
+requirements=json.loads(sys.argv[8])
+if (not isinstance(requirements,list) or len(requirements)>64 or
+        not all(isinstance(item,str) and item and len(item.encode('utf-8'))<=512 and
+                item==item.strip() and not item.startswith('-') and
+                not any(ord(ch)<32 or ord(ch)==127 for ch in item) for item in requirements)):
+    raise SystemExit(126)
 argv=sys.argv[9:]
 if not argv: raise SystemExit(126)
+if requirements:
+    dependency_root=os.path.join(os.getcwd(),'.mr-python-deps')
+    os.makedirs(dependency_root,mode=0o700,exist_ok=True)
+    print('dependency_install_start: '+json.dumps(requirements,ensure_ascii=False),flush=True)
+    install=subprocess.run([
+        sys.executable,'-m','pip','install','--disable-pip-version-check','--no-input',
+        '--no-cache-dir','--target',dependency_root,*requirements],
+        stdin=subprocess.DEVNULL,check=False)
+    if install.returncode:
+        print('dependency_install_failed: '+str(install.returncode),flush=True)
+        raise SystemExit(install.returncode)
+    prior=os.environ.get('PYTHONPATH')
+    os.environ['PYTHONPATH']=(dependency_root if not prior else dependency_root+os.pathsep+prior)
+    print('dependency_install_complete: '+dependency_root,flush=True)
 os.execvp(argv[0],argv)
+""".strip()
+
+_LOCAL_LAUNCHER = r"""
+import json,os,subprocess,sys
+
+requirements=json.loads(sys.argv[1])
+dependency_root=sys.argv[2]
+argv=sys.argv[3:]
+if (not isinstance(requirements,list) or not argv or
+        not all(isinstance(item,str) and item for item in requirements)):
+    raise SystemExit(126)
+if requirements:
+    os.makedirs(dependency_root,mode=0o700,exist_ok=True)
+    print('dependency_install_start: '+json.dumps(requirements,ensure_ascii=False),flush=True)
+    result=subprocess.run([
+        sys.executable,'-m','pip','install','--disable-pip-version-check',
+        '--no-input','--target',dependency_root,*requirements],
+        stdin=subprocess.DEVNULL,check=False)
+    if result.returncode:
+        print('dependency_install_failed: '+str(result.returncode),flush=True)
+        raise SystemExit(result.returncode)
+    prior=os.environ.get('PYTHONPATH')
+    os.environ['PYTHONPATH']=(dependency_root if not prior
+                              else dependency_root+os.pathsep+prior)
+    print('dependency_install_complete: '+dependency_root,flush=True)
+os.execvpe(argv[0],argv,os.environ)
 """.strip()
 
 _SECCOMP_PROBE = r"""
@@ -165,6 +251,24 @@ class SandboxOutputError(ExecutionSandboxError):
         self.receipt_path = Path(receipt_path)
 
 
+def normalize_python_requirements(value: Any) -> tuple[str, ...]:
+    """Validate the manifest's shell-free, bounded pip requirement vector."""
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or len(value) > 64:
+        raise ValueError("python_requirements 须为最多 64 项的数组")
+    normalized = []
+    for item in value:
+        if (not isinstance(item, str) or not item or item != item.strip()
+                or item.startswith("-") or len(item.encode("utf-8")) > 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in item)):
+            raise ValueError(f"python_requirements 项非法: {item!r}")
+        normalized.append(item)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("python_requirements 不得重复")
+    return tuple(normalized)
+
+
 def _canonical(value: Mapping[str, Any]) -> bytes:
     return (json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -173,6 +277,190 @@ def _canonical(value: Mapping[str, Any]) -> bytes:
 
 def _sha(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _identity_file(path: Path, *, max_bytes: int, label: str) -> Dict[str, Any]:
+    """Hash one trusted local-environment identity file without following its leaf."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise ExecutionSandboxError(f"{label} 不可按 no-follow 打开") from error
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_uid not in {0, os.geteuid()}
+                or before.st_mode & stat.S_IWOTH
+                or before.st_size < 0 or before.st_size > max_bytes):
+            raise ExecutionSandboxError(f"{label} 身份/权限/大小非法")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - size))
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+            if size > max_bytes:
+                raise ExecutionSandboxError(f"{label} 超过身份清单大小上限")
+        after = os.fstat(fd)
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or size != before.st_size):
+            raise ExecutionSandboxError(f"{label} 在身份读取期间漂移")
+        return {
+            "sha256": "sha256:" + digest.hexdigest(),
+            "bytes": size,
+            "mode": stat.S_IMODE(before.st_mode),
+        }
+    finally:
+        os.close(fd)
+
+
+def local_environment_identity(
+        config: Mapping[str, Any], *, verify_pin: bool = True) -> Dict[str, Any]:
+    """Return a reviewable identity for one development-only local Conda prefix.
+
+    The prefix remains a live host directory, not an immutable production
+    artifact.  We therefore bind the interpreter plus the complete Conda
+    metadata ledger and re-evaluate this identity for every prepare and again
+    in the trusted Docker runner immediately before CREATE.
+    """
+    if not isinstance(verify_pin, bool):
+        raise ValueError("sandbox local environment verify_pin 须为 bool")
+    required = {
+        "enabled", "development_only", "source", "target", "python_path",
+        "identity_sha256",
+    }
+    if not isinstance(config, Mapping) or set(config) != required:
+        raise ValueError("sandbox.local_environment 字段闭包非法")
+    if config.get("enabled") is not True or config.get("development_only") is not True:
+        raise ValueError("sandbox.local_environment 只接受显式启用的 development-only 合同")
+    source_raw = config.get("source")
+    target = config.get("target")
+    python_path = config.get("python_path")
+    expected = config.get("identity_sha256")
+    if (not isinstance(source_raw, str) or not os.path.isabs(source_raw)
+            or os.path.normpath(source_raw) != source_raw
+            or any(char in source_raw for char in (",", ":", "\n", "\r"))
+            or not isinstance(target, str) or target != _LOCAL_ENV_TARGET
+            or not isinstance(python_path, str)
+            or not python_path.startswith(target + "/")
+            or os.path.normpath(python_path) != python_path
+            or not isinstance(expected, str) or _SHA256_RE.fullmatch(expected) is None):
+        raise ValueError("sandbox.local_environment path/identity pin 非法")
+    source = Path(source_raw)
+    if os.path.realpath(source) != source_raw:
+        raise ExecutionSandboxError("sandbox local environment source 路径不得含 symlink")
+    current = Path("/")
+    for part in source.parts[1:]:
+        current /= part
+        info = os.lstat(current)
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & stat.S_IWOTH):
+            raise ExecutionSandboxError(
+                "sandbox local environment source 祖先须为 trusted 非 symlink 目录")
+    python_relative = Path(python_path).relative_to(target)
+    requested_python = source / python_relative
+    resolved_python = Path(os.path.realpath(requested_python))
+    try:
+        resolved_relative = resolved_python.relative_to(source)
+    except ValueError as error:
+        raise ExecutionSandboxError(
+            "sandbox local environment Python symlink 越出 prefix") from error
+    interpreter = _identity_file(
+        resolved_python, max_bytes=256 * 1024 * 1024,
+        label="sandbox local environment Python")
+    metadata_root = source / "conda-meta"
+    metadata_info = os.lstat(metadata_root)
+    if (not stat.S_ISDIR(metadata_info.st_mode) or stat.S_ISLNK(metadata_info.st_mode)
+            or os.path.realpath(metadata_root) != str(metadata_root)
+            or metadata_info.st_uid not in {0, os.geteuid()}
+            or metadata_info.st_mode & stat.S_IWOTH):
+        raise ExecutionSandboxError("sandbox local environment conda-meta 身份非法")
+    before_names = sorted(
+        entry.name for entry in os.scandir(metadata_root)
+        if entry.name.endswith(".json"))
+    if (not before_names or len(before_names) > _LOCAL_ENV_MAX_METADATA_FILES
+            or any(_SAFE_PATH.fullmatch(name) is None or "/" in name
+                   for name in before_names)):
+        raise ExecutionSandboxError("sandbox local environment Conda metadata 清单非法")
+    packages = []
+    total = 0
+    for name in before_names:
+        item = _identity_file(
+            metadata_root / name, max_bytes=4 * 1024 * 1024,
+            label=f"sandbox local environment metadata:{name}")
+        total += item["bytes"]
+        if total > _LOCAL_ENV_MAX_METADATA_BYTES:
+            raise ExecutionSandboxError("sandbox local environment metadata 总量越界")
+        packages.append({"name": name, **item})
+    history = _identity_file(
+        metadata_root / "history", max_bytes=4 * 1024 * 1024,
+        label="sandbox local environment Conda history")
+    after_names = sorted(
+        entry.name for entry in os.scandir(metadata_root)
+        if entry.name.endswith(".json"))
+    if before_names != after_names:
+        raise ExecutionSandboxError("sandbox local environment metadata 清单读取期间漂移")
+    package_ledger_hash = _sha(_canonical({"packages": packages}))
+    identity = {
+        "version": 1,
+        "protocol": "development-local-conda-prefix-v1",
+        "development_only": True,
+        "source": source_raw,
+        "target": target,
+        "python_path": python_path,
+        "python_resolved_relative": str(resolved_relative),
+        "python_sha256": interpreter["sha256"],
+        "python_bytes": interpreter["bytes"],
+        "conda_package_count": len(packages),
+        "conda_metadata_sha256": package_ledger_hash,
+        "conda_history_sha256": history["sha256"],
+    }
+    actual = _sha(_canonical(identity))
+    if verify_pin and actual != expected:
+        raise ExecutionSandboxError(
+            "sandbox local environment identity 漂移；须重新审查并更新 policy pin")
+    return {**identity, "identity_sha256": actual}
+
+
+def _local_environment_ca_environment(config: Mapping[str, Any]) -> Dict[str, str]:
+    """Derive the in-container CA path for a read-only local Conda prefix.
+
+    Conda's Python/OpenSSL build records the host prefix in its default verify
+    paths.  That path is intentionally absent inside the sandbox because the
+    same prefix is mounted at ``/opt/host-conda``.  Keep TLS verification on by
+    pointing both stdlib/OpenSSL and Requests at the CA file through the
+    container-side mount path.  The path is derived here rather than accepted
+    from a workload-controlled environment mapping.
+    """
+    source = Path(config["source"])
+    source_ca = source / _LOCAL_ENV_CA_RELATIVE
+    try:
+        leaf = os.lstat(source_ca)
+        resolved = Path(os.path.realpath(source_ca))
+        resolved.relative_to(source)
+        flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(resolved, flags)
+    except (OSError, ValueError) as error:
+        raise ExecutionSandboxError(
+            "sandbox local environment CA 须解析到 prefix 内可信常规文件") from error
+    try:
+        info = os.fstat(fd)
+        if (not (stat.S_ISREG(leaf.st_mode) or stat.S_ISLNK(leaf.st_mode))
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & stat.S_IWOTH
+                or not 1 <= info.st_size <= 16 * 1024 * 1024):
+            raise ExecutionSandboxError(
+                "sandbox local environment CA 身份/权限/大小非法")
+    finally:
+        os.close(fd)
+    target_ca = str(Path(config["target"]) / _LOCAL_ENV_CA_RELATIVE)
+    return {key: target_ca for key in _LOCAL_ENV_CA_ENV_KEYS}
 
 
 def normalize_gpu_contract(value: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -265,6 +553,29 @@ def gpu_cli_argument(contract: Mapping[str, Any]) -> str:
     assert value is not None
     uuids = ",".join(item["uuid"] for item in value["devices"])
     return f'"driver=nvidia","device={uuids}","capabilities=compute,utility"'
+
+
+def sandbox_manifest_profile(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Project the policy-owned execution boundary exposed to bundle/guardian manifests.
+
+    Network authority belongs to ``policy.execution.sandbox`` rather than the
+    model-authored execution manifest.  Keeping this small projection shared by
+    the ContextPack compiler and the Docker invocation builder prevents the
+    prompt from advertising a boundary different from the one the guardian
+    actually enforces.
+    """
+    if not isinstance(config, Mapping):
+        raise ValueError("sandbox config 须为 object")
+    network_mode = config.get("network_mode")
+    if network_mode not in {"none", "bridge"}:
+        raise ValueError("sandbox.network_mode 非法")
+    profile = {
+        "network_mode": network_mode,
+        "rootfs_readonly": True,
+    }
+    if network_mode == "bridge":
+        profile["network_development_only"] = True
+    return profile
 
 
 def sandbox_environment_hash(config: Mapping[str, Any]) -> str:
@@ -620,7 +931,7 @@ class SandboxInvocation:
     argv: list[str]
     env: Dict[str, str]
     pass_fds: tuple[int, ...]
-    external_container: Dict[str, Any]
+    external_container: Optional[Dict[str, Any]]
     spec_file: Any
     staging_dir: Path
     log_name: str
@@ -632,8 +943,229 @@ class SandboxInvocation:
             self.spec_file = None
 
 
+class LocalExecutionSandbox:
+    """Development execution in the user's selected local Conda/GPU runtime.
+
+    This backend deliberately favors getting the research loop running.  The
+    existing guardian still owns and drains the complete local process tree,
+    logs and receipts remain durable, and all files stay under ``work_root``;
+    Docker image, seccomp, cgroup and artificial memory ceilings are not part
+    of this development profile.  Production/qualification continue to use
+    :class:`DockerExecutionSandbox` explicitly.
+    """
+
+    backend_name = "local-conda"
+
+    def __init__(self, *, work_root: Path | str, config: Mapping[str, Any],
+                 owner_guard=None, system_root: Path | str | None = None,
+                 gpu_contract: Optional[Mapping[str, Any]] = None,
+                 qualification_firewall=None):
+        if qualification_firewall is not None:
+            raise ValueError("qualification 不允许 development local execution backend")
+        self.work_root = Path(os.path.abspath(os.fspath(work_root)))
+        self.system_root = Path(os.path.abspath(os.fspath(
+            system_root if system_root is not None else Path(__file__).resolve().parent.parent)))
+        self.owner_guard = owner_guard or (lambda: None)
+        self.gpu_contract = normalize_gpu_contract(gpu_contract)
+        base = dict(config)
+        local = base.get("local_environment")
+        if not isinstance(local, Mapping) or local.get("enabled") is not True:
+            raise ValueError("development local backend 要求 sandbox.local_environment")
+        self.local_environment = dict(local)
+        self.local_environment_identity = local_environment_identity(local)
+        target = Path(str(local["target"]))
+        relative_python = Path(str(local["python_path"])).relative_to(target)
+        self.python_path = Path(str(local["source"])) / relative_python
+        if not self.python_path.exists():
+            raise ExecutionSandboxError(
+                f"本机 Conda Python 不存在: {self.python_path}")
+        self.config = {
+            **base,
+            "backend": "local",
+            "python_path": str(self.python_path),
+            "local_backend_version": "development-local-conda-v1",
+        }
+        supplied_capability = self.config.get("gpu_capability")
+        if self.gpu_contract is None:
+            if supplied_capability is not None:
+                raise ValueError("local gpu_capability 不得脱离 exact GPU contract")
+        else:
+            capability = gpu_capability_projection(self.gpu_contract)
+            if supplied_capability is not None and supplied_capability != capability:
+                raise ValueError("local gpu_capability 与 exact GPU contract 不一致")
+            self.config["gpu_capability"] = capability
+        # Reuse the existing identity check, but translate its container-side
+        # target back to the real host prefix for direct local execution.
+        _local_environment_ca_environment(local)
+        local_ca = str(Path(str(local["source"])) / _LOCAL_ENV_CA_RELATIVE)
+        self.local_environment_ca_environment = {
+            key: local_ca for key in _LOCAL_ENV_CA_ENV_KEYS}
+        self._preflight_done = False
+        self.image_environment = self._python_environment_identity()
+
+    def _python_environment_identity(self) -> Dict[str, str]:
+        result = subprocess.run(
+            [str(self.python_path), "-I", "-c",
+             "import platform; print(platform.python_version())"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=15.0, check=False,
+            env={"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+        if result.returncode != 0 or len(result.stdout) + len(result.stderr) > 4096:
+            raise ExecutionSandboxError("本机 Conda Python 版本探测失败")
+        version = result.stdout.decode("utf-8", errors="strict").strip()
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+            raise ExecutionSandboxError("本机 Conda Python 版本输出非法")
+        return {
+            "PYTHON_VERSION": version,
+            "PYTHON_SHA256": self.local_environment_identity[
+                "python_sha256"].removeprefix("sha256:"),
+        }
+
+    @property
+    def resource_mode(self) -> str:
+        return "unrestricted-local"
+
+    @property
+    def environment_hash(self) -> str:
+        return sandbox_environment_hash(self.config)
+
+    def workload_environment_hash(self, gpu_required: bool) -> str:
+        return sandbox_workload_environment_hash(self.environment_hash, gpu_required)
+
+    @property
+    def gpu_contract_hash(self) -> Optional[str]:
+        return (None if self.gpu_contract is None
+                else gpu_contract_hash(self.gpu_contract))
+
+    @property
+    def runtime_identity_hash(self) -> str:
+        return _sha(_canonical({
+            "environment_hash": self.environment_hash,
+            "gpu_contract": self.gpu_contract,
+        }))
+
+    def preflight(self) -> None:
+        if self._preflight_done:
+            return
+        self.owner_guard()
+        current = local_environment_identity(self.local_environment)
+        if current != self.local_environment_identity:
+            raise ExecutionSandboxError("本机 Conda environment identity 漂移")
+        if self.gpu_contract is not None:
+            result = subprocess.run([
+                "/usr/bin/nvidia-smi",
+                "--query-gpu=uuid,name,memory.total,compute_cap,driver_version",
+                "--format=csv,noheader,nounits",
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=15.0, check=False,
+                env={"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+            if result.returncode != 0 or len(result.stdout) + len(result.stderr) > 1024 * 1024:
+                raise ExecutionSandboxError("本机 GPU inventory 探测失败")
+            actual = {}
+            for line in result.stdout.decode("utf-8", errors="strict").splitlines():
+                if not line.strip():
+                    continue
+                parts = [item.strip() for item in line.split(",")]
+                if len(parts) != 5:
+                    raise ExecutionSandboxError("本机 GPU inventory 格式非法")
+                uuid, model, memory_mib, compute, driver = parts
+                actual[uuid] = {
+                    "uuid": uuid, "model": model,
+                    "memory_bytes": int(memory_mib) * 1024 * 1024,
+                    "compute_capability": compute,
+                    "driver_version": driver,
+                }
+            for expected in self.gpu_contract["devices"]:
+                observed = actual.get(expected["uuid"])
+                if observed is None or {
+                        key: observed[key] for key in (
+                            "uuid", "model", "memory_bytes", "compute_capability")
+                        } != expected or observed["driver_version"] != self.gpu_contract["driver_version"]:
+                    raise ExecutionSandboxError(
+                        f"所选 GPU 已不可用或身份漂移: {expected['uuid']}")
+        self._preflight_done = True
+
+    def prepare(
+            self, cmd: Sequence[str], *, staging_dir: Path | str, log_name: str,
+            env: Optional[Mapping[str, str]], timeout_s: float,
+            fd_expectations: Sequence[tuple[int, str, int, Optional[int], Optional[int]]] = (),
+            tree_expectations: Sequence[tuple[int, Dict[str, str], tuple[str, ...]]] = (),
+            execution_context: Optional[Mapping[str, Any]] = None,
+            execution_supervisor=None, gpu_required: bool = False,
+            python_requirements: Sequence[str] = ()) -> SandboxInvocation:
+        del timeout_s, execution_supervisor
+        self.preflight()
+        self.owner_guard()
+        _validate_log_name(log_name)
+        if not isinstance(gpu_required, bool):
+            raise ValueError("local sandbox gpu_required 须为 bool")
+        if gpu_required and self.gpu_contract is None:
+            raise ExecutionSandboxError("本次实验要求 GPU，但未分配本机 GPU")
+        requirements = normalize_python_requirements(python_requirements)
+        staging = _path_under(
+            Path(staging_dir), self.work_root, label="local execution staging")
+        staging.mkdir(parents=True, exist_ok=True)
+        runtime_root = self.work_root / "runtime" / "local-execution"
+        cache = runtime_root / "cache"
+        tmp = runtime_root / "tmp"
+        home = runtime_root / "home"
+        for path in (runtime_root, cache, tmp, home):
+            path.mkdir(parents=True, exist_ok=True)
+        process_env = dict(os.environ)
+        process_env.update({
+            "PATH": str(self.python_path.parent) + os.pathsep + process_env.get("PATH", os.defpath),
+            "HOME": str(home), "TMPDIR": str(tmp),
+            "XDG_CACHE_HOME": str(cache),
+            "PIP_CACHE_DIR": str(cache / "pip"),
+            "HF_HOME": str(cache / "huggingface"),
+            "TORCH_HOME": str(cache / "torch"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            **self.local_environment_ca_environment,
+        })
+        for key, value in (env or {}).items():
+            if (not isinstance(key, str) or not key or "=" in key or "\x00" in key
+                    or not isinstance(value, str) or "\x00" in value):
+                raise ExecutionSandboxError("local execution env 须为字符串映射")
+            process_env[key] = value
+        if gpu_required:
+            visible = ",".join(
+                item["uuid"] for item in self.gpu_contract["devices"])
+            process_env["CUDA_VISIBLE_DEVICES"] = visible
+            process_env["NVIDIA_VISIBLE_DEVICES"] = visible
+        else:
+            process_env["CUDA_VISIBLE_DEVICES"] = ""
+            process_env["NVIDIA_VISIBLE_DEVICES"] = "none"
+        pass_fds = tuple(dict.fromkeys(
+            [item[0] for item in fd_expectations]
+            + [item[0] for item in tree_expectations]))
+        argv = list(cmd)
+        if any(not isinstance(item, str) or not item or "\x00" in item for item in argv):
+            raise ExecutionSandboxError("local execution argv 非法")
+        if requirements:
+            dependency_root = staging / ".mr-python-deps"
+            argv = [
+                str(self.python_path), "-I", "-B", "-c", _LOCAL_LAUNCHER,
+                json.dumps(list(requirements), ensure_ascii=False),
+                str(dependency_root), *argv,
+            ]
+        return SandboxInvocation(
+            argv=argv, env=process_env, pass_fds=pass_fds,
+            external_container=None, spec_file=None,
+            staging_dir=staging, log_name=log_name,
+            context=dict(execution_context or {}))
+
+    def recover_unstarted_session(self, **_kwargs) -> bool:
+        return False
+
+    def recover_terminal_sessions(self, _execution_supervisor) -> int:
+        return 0
+
+    def retire_terminal_sessions_for_archive(self, **_kwargs) -> int:
+        return 0
+
+
 class DockerExecutionSandbox:
-    """Create one pinned, no-network Docker invocation and trusted snapshots."""
+    """Create one pinned, policy-networked Docker invocation and trusted snapshots."""
 
     def __init__(self, *, work_root: Path | str, config: Mapping[str, Any],
                  owner_guard=None, system_root: Path | str | None = None,
@@ -662,6 +1194,9 @@ class DockerExecutionSandbox:
         self.seccomp_path = Path()
         self.seccomp_spec_hash = ""
         self.seccomp_bpf_b64 = ""
+        self.local_environment: Optional[Dict[str, Any]] = None
+        self.local_environment_identity: Optional[Dict[str, Any]] = None
+        self.local_environment_ca_environment: Dict[str, str] = {}
         self._validate_config()
         # Qualification is an optional, immutable work-root capability.  Load
         # it in every derived dependency-image sandbox as well as the bootstrap
@@ -696,11 +1231,13 @@ class DockerExecutionSandbox:
     def _validate_config(self) -> None:
         required = {
             "backend", "engine_path", "engine_host", "resource_mode",
+            "network_mode",
             "seccomp_profile", "seccomp_sha256", "seccomp_bpf",
             "seccomp_bpf_sha256", "seccomp_bpf_arch", "image", "image_id",
             "python_path", "memory_mb", "pids", "nofile", "max_log_mb", "max_file_mb",
             "max_output_mb", "max_output_files", "cpus", "tmpfs_mb",
             "shm_mb", "input_max_mb", "readonly_mounts", "payload_environment",
+            "local_environment", "development_gpu_thread_limit",
         }
         allowed = required | ({"gpu_capability"} if self.gpu_contract is not None else set())
         if set(self.config) != allowed or self.config.get("backend") != "docker":
@@ -718,6 +1255,7 @@ class DockerExecutionSandbox:
         if self.config["resource_mode"] not in {
                 "cgroup-v1", "cgroup-v2", "rlimit-fallback"}:
             raise ValueError("sandbox.resource_mode 非法")
+        sandbox_manifest_profile(self.config)
         profile_rel = self.config["seccomp_profile"]
         if (not isinstance(profile_rel, str) or Path(profile_rel).is_absolute()
                 or _safe_relpath(profile_rel) != profile_rel):
@@ -796,6 +1334,17 @@ class DockerExecutionSandbox:
         if (isinstance(cpus, bool) or not isinstance(cpus, (int, float))
                 or not math.isfinite(float(cpus)) or cpus <= 0):
             raise ValueError("sandbox.cpus 须为正有限数")
+        gpu_thread_limit = self.config["development_gpu_thread_limit"]
+        if gpu_thread_limit is not None:
+            if (isinstance(gpu_thread_limit, bool)
+                    or not isinstance(gpu_thread_limit, int)
+                    or gpu_thread_limit <= 0
+                    or gpu_thread_limit > max(1, math.ceil(float(cpus)))):
+                raise ValueError(
+                    "sandbox.development_gpu_thread_limit 须为不超过 cpus 配额的正整数")
+            if self.config["pids"] - gpu_thread_limit < _GPU_RUNTIME_PID_RESERVE:
+                raise ValueError(
+                    "sandbox development GPU thread limit 未给 CUDA runtime 保留足够 pids")
         mounts = self.config["readonly_mounts"]
         if not isinstance(mounts, list) or any(
                 not isinstance(item, str) or not item.startswith("/")
@@ -819,6 +1368,25 @@ class DockerExecutionSandbox:
                        or len(value.encode("utf-8")) > 65536
                        for key, value in payload_environment.items())):
             raise ValueError("sandbox.payload_environment 须为有界字符串映射")
+        local_config = self.config["local_environment"]
+        if local_config is not None:
+            self.local_environment_identity = local_environment_identity(local_config)
+            self.local_environment = dict(local_config)
+            self.local_environment_ca_environment = (
+                _local_environment_ca_environment(local_config))
+            if self.config["python_path"] != local_config["python_path"]:
+                raise ValueError(
+                    "sandbox.python_path 必须等于 development local environment python_path")
+            if any(key in payload_environment for key in _LOCAL_ENV_CA_ENV_KEYS):
+                raise ValueError(
+                    "sandbox local environment CA env 须由只读 prefix 映射单一派生")
+        if gpu_thread_limit is not None:
+            if local_config is None:
+                raise ValueError(
+                    "sandbox.development_gpu_thread_limit 只能与 development local environment 同时启用")
+            if any(key in payload_environment for key in _DEVELOPMENT_GPU_THREAD_ENV):
+                raise ValueError(
+                    "sandbox development GPU thread env 须由专用 limit 单一授权")
 
     @property
     def resource_mode(self) -> str:
@@ -829,6 +1397,11 @@ class DockerExecutionSandbox:
     @property
     def environment_hash(self) -> str:
         return sandbox_environment_hash(self.config)
+
+    @property
+    def manifest_profile(self) -> Dict[str, Any]:
+        """Policy-owned fields copied into every external-container claim."""
+        return sandbox_manifest_profile(self.config)
 
     def workload_environment_hash(self, gpu_required: bool) -> str:
         return sandbox_workload_environment_hash(
@@ -915,7 +1488,14 @@ class DockerExecutionSandbox:
 
     def run_gpu_canary(self, *, execution_supervisor, candidate_hash: str,
                        clock: Optional[Callable[[], float]] = None) -> Dict[str, Any]:
-        """Run one guardian-owned exact DeviceRequest + in-container inventory probe."""
+        """Run one guardian-owned exact DeviceRequest and runtime probe.
+
+        Development local-environment deployments exercise every selected GPU
+        through PyTorch/cuDNN and one cross-device NCCL broadcast before
+        publishing the existing exact ``nvidia-smi`` inventory.  Production
+        images retain the inventory-only probe because their workload runtime
+        is supplied by a separately attested dependency image.
+        """
         if self.gpu_contract is None:
             raise ExecutionSandboxError("GPU canary 缺 exact allocation contract")
         if (not isinstance(candidate_hash, str)
@@ -932,17 +1512,30 @@ class DockerExecutionSandbox:
             "runtime_identity_hash": self.runtime_identity_hash,
             "log_name": log_name,
         }
+        inventory_argv = [
+            "/usr/bin/nvidia-smi",
+            "--query-gpu=uuid,name,memory.total,compute_cap,driver_version",
+            "--format=csv,noheader,nounits",
+        ]
+        canary_timeout_s = 90.0 if self.local_environment is not None else 30.0
+        canary_argv = inventory_argv
+        if self.local_environment is not None:
+            canary_argv = [
+                self.config["python_path"], "-I", "-B", "-c",
+                _DEVELOPMENT_GPU_RUNTIME_CANARY,
+                str(len(self.gpu_contract["devices"])), *inventory_argv,
+            ]
         invocation = self.prepare(
-            ["/usr/bin/nvidia-smi",
-             "--query-gpu=uuid,name,memory.total,compute_cap,driver_version",
-             "--format=csv,noheader,nounits"],
-            staging_dir=staging, log_name=log_name, env=None, timeout_s=30.0,
+            canary_argv,
+            staging_dir=staging, log_name=log_name, env=None,
+            timeout_s=canary_timeout_s,
             execution_context=canary_context,
             execution_supervisor=execution_supervisor, gpu_required=True)
         sandbox_spec_hash = invocation.external_container["spec_sha256"]
         result = H.run_staged(
             invocation.argv, staging_dir=str(staging), log_name=log_name,
-            timeout_s=30.0, env=invocation.env, pass_fds=invocation.pass_fds,
+            timeout_s=canary_timeout_s, env=invocation.env,
+            pass_fds=invocation.pass_fds,
             execution_supervisor=execution_supervisor,
             execution_kind="deployment-gpu-canary",
             execution_context=canary_context,
@@ -1143,12 +1736,50 @@ class DockerExecutionSandbox:
                 or not isinstance(owner_id, int) or owner_id <= 0):
             raise ExecutionSandboxError(
                 "sandbox prepare recovery 要求 exact DB owner context")
+        attempt_bound = "execution_attempt" in context
+        expected_attempt = context.get("execution_attempt", 1)
+        if (attempt_bound and (isinstance(expected_attempt, bool)
+                               or not isinstance(expected_attempt, int)
+                               or expected_attempt <= 0)):
+            raise ExecutionSandboxError(
+                "sandbox prepare recovery execution_attempt 须为正整数")
+        seen_attempts = set()
         for receipt_path in sorted(execution_supervisor.receipt_dir.glob("execution-*.json")):
             receipt = read_receipt(receipt_path)
             receipt_context = receipt.get("context") or {}
             if (receipt_context.get("db_owner_kind"), receipt_context.get("db_owner_id")) != (
                     owner_kind, owner_id):
                 continue
+            if attempt_bound:
+                # A durable bundle repair intentionally reuses one DB owner and
+                # log name with a new implementation generation.  Older
+                # terminal+drained receipts remain audit evidence, but cannot
+                # own (or block cleanup of) the new attempt's prepare-only
+                # namespace.  Keep the same ordering/fail-closed semantics as
+                # harness.recover_staged_result.
+                receipt_attempt = receipt_context.get("execution_attempt", 1)
+                if (isinstance(receipt_attempt, bool)
+                        or not isinstance(receipt_attempt, int)
+                        or receipt_attempt <= 0):
+                    raise ExecutionSandboxError(
+                        "sandbox prepare recovery guardian execution_attempt 非法")
+                if receipt_attempt in seen_attempts:
+                    raise ExecutionSandboxError(
+                        "sandbox prepare recovery 同 execution_attempt 有多个 guardian receipt")
+                seen_attempts.add(receipt_attempt)
+                base_mismatch = any(
+                    receipt_context.get(key) != value
+                    for key, value in context.items()
+                    if key != "execution_attempt")
+                if base_mismatch or receipt_attempt > expected_attempt:
+                    raise ExecutionSandboxError(
+                        "sandbox prepare recovery 发现同 owner 的错配 guardian receipt")
+                if receipt_attempt < expected_attempt:
+                    if (receipt.get("state") != "terminal"
+                            or receipt.get("group_drained") is not True):
+                        raise ExecutionSandboxError(
+                            "sandbox prepare recovery 发现未 terminal+drained 的旧 attempt")
+                    continue
             if receipt_context != context:
                 raise ExecutionSandboxError(
                     "sandbox prepare recovery 发现同 owner 的错配 guardian receipt")
@@ -1237,6 +1868,106 @@ class DockerExecutionSandbox:
             index_path.unlink()
             _fsync_dir(index_path.parent)
         return True
+
+    def retire_terminal_sessions_for_archive(
+            self, *, staging_dir: Path | str, execution_supervisor) -> int:
+        """Detach drained terminal sessions before an orchestrator archive move.
+
+        Session indexes are live recovery authorities and contain absolute
+        staging/meta paths.  Bundle self-heal archives the rejected smoke tree
+        with an atomic directory rename; leaving those indexes active would
+        make the next owner treat the intentionally moved metadata as damage.
+        Once the exact guardian receipt and promotion/rejection authority prove
+        a session terminal and drained, the central execution receipt plus the
+        archived local metadata remain the audit record and the live index can
+        be retired safely.
+        """
+        if execution_supervisor is None:
+            return 0
+        self.owner_guard()
+        execution_supervisor.recover_previous_generation()
+        staging = _path_under(Path(staging_dir), self.work_root,
+                              label="sandbox archive staging")
+        meta_dir = staging / ".sandbox-meta"
+        if not os.path.lexists(meta_dir):
+            return 0
+        meta_info = os.lstat(meta_dir)
+        if not stat.S_ISDIR(meta_info.st_mode) or stat.S_ISLNK(meta_info.st_mode):
+            raise ExecutionSandboxError("sandbox archive metadata 目录身份非法")
+
+        receipts_by_identity: Dict[tuple[Any, Any, Any], list[Dict[str, Any]]] = {}
+        for receipt_path in sorted(execution_supervisor.receipt_dir.glob("execution-*.json")):
+            receipt = read_receipt(receipt_path)
+            sandbox = receipt.get("sandbox")
+            if not isinstance(sandbox, dict):
+                continue
+            identity = (
+                sandbox.get("container_name"), sandbox.get("token"),
+                sandbox.get("spec_sha256"))
+            receipts_by_identity.setdefault(identity, []).append(receipt)
+
+        retired = 0
+        candidates = sorted(
+            path for path in meta_dir.glob("*.json")
+            if _TOKEN_RE.fullmatch(path.stem) is not None)
+        for meta_path in candidates:
+            meta = _strict_json(read_artifact_bytes(
+                meta_path, max_bytes=128 * 1024,
+                label="sandbox archive session metadata"))
+            session_id = meta.get("session_id")
+            index_raw = meta.get("index_path")
+            if (not isinstance(session_id, str)
+                    or _TOKEN_RE.fullmatch(session_id) is None
+                    or meta_path.name != f"{session_id}.json"
+                    or not isinstance(index_raw, str)):
+                raise ExecutionSandboxError("sandbox archive metadata identity 非法")
+            index_path = _path_under(
+                Path(index_raw), self.work_root / "state" / "sandbox" / "sessions",
+                label="sandbox archive session index")
+            if index_path.name != f"{session_id}.json":
+                raise ExecutionSandboxError("sandbox archive index identity 非法")
+            if not os.path.lexists(index_path):
+                continue  # crash-safe replay after the durable unlink
+            index, indexed_staging, indexed_meta = _load_session_index(
+                index_path, self.work_root)
+            if (indexed_staging != staging or indexed_meta != meta_path
+                    or any(meta.get(key) != index.get(key) for key in (
+                        "session_id", "log_name", "context_hash", "name", "token",
+                        "spec_sha256"))):
+                raise ExecutionSandboxError(
+                    "sandbox archive index/metadata authority 不一致")
+            output_root = staging / ".sandbox-output" / session_id
+            input_root = self.work_root / "state" / "sandbox" / "inputs" / session_id
+            if (meta.get("output_root"), meta.get("input_root")) != (
+                    str(output_root), str(input_root)):
+                raise ExecutionSandboxError("sandbox archive session path authority 非法")
+            identity = (meta.get("name"), meta.get("token"), meta.get("spec_sha256"))
+            receipts = receipts_by_identity.get(identity, [])
+            if len(receipts) != 1:
+                raise ExecutionSandboxError(
+                    "sandbox archive session 须对应唯一 guardian receipt")
+            receipt = receipts[0]
+            sandbox = receipt.get("sandbox") or {}
+            if (receipt.get("containment") != _BACKEND
+                    or receipt.get("state") != "terminal"
+                    or receipt.get("group_drained") is not True
+                    or sandbox.get("container_drained") is not True
+                    or index["context_hash"] != _sha(
+                        _canonical(receipt.get("context") or {}))):
+                raise ExecutionSandboxError(
+                    "sandbox archive session 未证明 exact terminal+drained")
+            promoted = meta_path.with_suffix(".promoted.json")
+            rejected = meta_path.with_suffix(".rejected.json")
+            if os.path.lexists(promoted) == os.path.lexists(rejected):
+                raise ExecutionSandboxError(
+                    "sandbox archive session 缺唯一 promotion/rejection authority")
+            if os.path.lexists(output_root) or os.path.lexists(input_root):
+                raise ExecutionSandboxError(
+                    "sandbox archive session 仍有未清理 quarantine/input")
+            index_path.unlink()
+            _fsync_dir(index_path.parent)
+            retired += 1
+        return retired
 
     def recover_terminal_sessions(self, execution_supervisor) -> int:
         """Discard private inputs/quarantines for every drained non-exit receipt.
@@ -1400,10 +2131,12 @@ class DockerExecutionSandbox:
             fd_expectations: Sequence[tuple[int, str, int, Optional[int], Optional[int]]] = (),
             tree_expectations: Sequence[tuple[int, Dict[str, str], tuple[str, ...]]] = (),
             execution_context: Optional[Mapping[str, Any]] = None,
-            execution_supervisor=None, gpu_required: bool = False) -> SandboxInvocation:
+            execution_supervisor=None, gpu_required: bool = False,
+            python_requirements: Sequence[str] = ()) -> SandboxInvocation:
         """Prepare one invocation and roll back only paths created by a failed prepare."""
         if not isinstance(gpu_required, bool):
             raise ValueError("sandbox gpu_required 须为 bool")
+        requirements = normalize_python_requirements(python_requirements)
         if gpu_required and self.gpu_contract is None:
             raise ExecutionSandboxError(
                 "本次实验要求 GPU，但部署未建立 exact GPU allocation contract")
@@ -1437,7 +2170,8 @@ class DockerExecutionSandbox:
                 cmd, staging_dir=staging, log_name=log_name, env=env,
                 timeout_s=timeout_s, fd_expectations=fd_expectations,
                 tree_expectations=tree_expectations,
-                execution_context=context, gpu_required=gpu_required)
+                execution_context=context, gpu_required=gpu_required,
+                python_requirements=requirements)
         except BaseException:
             for path, was_present in zip(paths, existed):
                 if was_present or not os.path.lexists(path):
@@ -1455,9 +2189,19 @@ class DockerExecutionSandbox:
             fd_expectations: Sequence[tuple[int, str, int, Optional[int], Optional[int]]] = (),
             tree_expectations: Sequence[tuple[int, Dict[str, str], tuple[str, ...]]] = (),
             execution_context: Optional[Mapping[str, Any]] = None,
-            gpu_required: bool = False) -> SandboxInvocation:
+            gpu_required: bool = False,
+            python_requirements: Sequence[str] = ()) -> SandboxInvocation:
         self.preflight()
         self.owner_guard()
+        manifest_profile = self.manifest_profile
+        current_local_identity = None
+        if self.local_environment is not None:
+            current_local_identity = local_environment_identity(self.local_environment)
+            if current_local_identity != self.local_environment_identity:
+                raise ExecutionSandboxError("sandbox local environment prepare identity 漂移")
+            if (_local_environment_ca_environment(self.local_environment)
+                    != self.local_environment_ca_environment):
+                raise ExecutionSandboxError("sandbox local environment CA 映射漂移")
         context = dict(execution_context or {})
         session_id = sandbox_session_id(log_name, context)
         staging = _path_under(Path(staging_dir), self.work_root, label="sandbox staging")
@@ -1495,9 +2239,29 @@ class DockerExecutionSandbox:
             if str(self.work_root) in arg:
                 raise ExecutionSandboxError("sandbox argv 不得暴露 host work_root path")
             resolved.append(arg)
-        payload_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent",
+        local_target = (
+            self.local_environment["target"]
+            if self.local_environment is not None else None)
+        local_path = (
+            f"{local_target}/bin:/usr/local/bin:/usr/bin:/bin"
+            if local_target is not None else "/usr/local/bin:/usr/bin:/bin")
+        local_library_path = (
+            f"{local_target}/lib" if local_target is not None else None)
+        invocation_gpu = self.gpu_contract if gpu_required else None
+        payload_home = (
+            "/mr/output" if self.local_environment is not None else "/nonexistent")
+        payload_env = {"PATH": local_path, "HOME": payload_home,
                        "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
                        "PYTHONDONTWRITEBYTECODE": "1"}
+        if self.local_environment is not None:
+            payload_env.update({
+                "XDG_CACHE_HOME": "/mr/output/.cache",
+                "PIP_CACHE_DIR": "/mr/output/.cache/pip",
+                "HF_HOME": "/mr/output/.cache/huggingface",
+                "TORCH_HOME": "/mr/output/.cache/torch",
+            })
+        if local_library_path is not None:
+            payload_env["LD_LIBRARY_PATH"] = local_library_path
         for key, value in (env or {}).items():
             if (not isinstance(key, str) or not key or "=" in key or "\x00" in key
                     or not isinstance(value, str) or "\x00" in value
@@ -1506,8 +2270,19 @@ class DockerExecutionSandbox:
                 raise ExecutionSandboxError("sandbox env 须为字符串映射")
             if str(self.work_root) in value:
                 raise ExecutionSandboxError("sandbox env 不得暴露 host work_root path")
+            if (self.local_environment is not None
+                    and key in {"PATH", "LD_LIBRARY_PATH"}
+                    and payload_env[key] != value):
+                raise ExecutionSandboxError(
+                    f"sandbox env 不得覆盖 local environment {key}")
             payload_env[key] = value
-        for key, value in self.config["payload_environment"].items():
+        trusted_payload_environment = dict(self.local_environment_ca_environment)
+        trusted_payload_environment.update(self.config["payload_environment"])
+        gpu_thread_limit = self.config["development_gpu_thread_limit"]
+        if invocation_gpu is not None and gpu_thread_limit is not None:
+            trusted_payload_environment.update({
+                key: str(gpu_thread_limit) for key in _DEVELOPMENT_GPU_THREAD_ENV})
+        for key, value in trusted_payload_environment.items():
             if str(self.work_root) in value:
                 raise ExecutionSandboxError(
                     "sandbox trusted payload_environment 不得暴露 host work_root path")
@@ -1544,33 +2319,44 @@ class DockerExecutionSandbox:
         max_file_bytes = self.config["max_file_mb"] * 1024 * 1024
         payload_env_json = json.dumps(
             payload_env, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        invocation_gpu = self.gpu_contract if gpu_required else None
         # CUDA reserves large virtual address ranges unrelated to resident host
-        # RAM.  On the production cgroup path, memory.max remains the aggregate
-        # hard boundary, so RLIMIT_AS must not reject a valid CUDA context.  The
-        # weaker rlimit-fallback keeps the historical finite per-process cap.
+        # RAM.  Seven A100 contexts alone reserve roughly 40 GiB on this
+        # development deployment, so a 16 GiB RLIMIT_AS presents as unrelated
+        # CUDA OOM, NCCL, cuDNN dlopen, and mmap ENOMEM failures.  This first
+        # development deployment intentionally leaves address space unlimited
+        # for both CPU and GPU workloads.  Production without the local
+        # environment retains the historical fallback boundary, while a real
+        # cgroup remains the aggregate resident-memory authority for GPU work.
         address_space_bytes = (
-            -1 if invocation_gpu is not None
-            and self.resource_mode in {"cgroup-v1", "cgroup-v2"}
+            -1 if self.local_environment is not None
+            or (invocation_gpu is not None
+                and self.resource_mode in {"cgroup-v1", "cgroup-v2"})
             else memory_bytes)
         gpu_json = json.dumps(
             invocation_gpu, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        requirements_json = json.dumps(
+            list(normalize_python_requirements(python_requirements)),
+            ensure_ascii=False, separators=(",", ":"))
         container_argv = [
             self.config["python_path"], "-I", "-B", "-c", _RLIMIT_LAUNCHER,
             str(address_space_bytes), str(self.config["pids"]), str(self.config["nofile"]),
             str(max_file_bytes), self.seccomp_bpf_b64,
-            payload_env_json, gpu_json, "--", *resolved,
+            payload_env_json, gpu_json, requirements_json, *resolved,
         ]
         control_env = {
-            "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent",
+            "PATH": local_path, "HOME": "/nonexistent",
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
         }
+        if local_library_path is not None:
+            control_env["LD_LIBRARY_PATH"] = local_library_path
+            control_env.update(self.local_environment_ca_environment)
         if invocation_gpu is not None:
             control_env["NVIDIA_DRIVER_CAPABILITIES"] = "compute,utility"
         spec = {
             "version": 1, "backend": _BACKEND,
             "engine_path": self.engine_path,
             "engine_host": self.config["engine_host"],
+            "network_mode": manifest_profile["network_mode"],
             "seccomp_path": str(self.seccomp_path),
             "seccomp_sha256": self.config["seccomp_sha256"],
             "seccomp_spec_hash": self.seccomp_spec_hash,
@@ -1580,6 +2366,12 @@ class DockerExecutionSandbox:
             "name": name, "token": token, "resource_mode": self.resource_mode,
             "input_root": str(input_root), "output_root": str(output_root),
             "input_manifest_hash": input_manifest_hash,
+            "local_environment": (None if self.local_environment is None else {
+                "source": self.local_environment["source"],
+                "target": self.local_environment["target"],
+                "python_path": self.local_environment["python_path"],
+                "identity": current_local_identity,
+            }),
             "readonly_mounts": readonly_mounts, "env": control_env,
             "payload_env": payload_env,
             "argv": container_argv, "gpu": invocation_gpu, "limits": {
@@ -1607,6 +2399,9 @@ class DockerExecutionSandbox:
             "input_root": str(input_root), "output_root": str(output_root),
             "index_path": str(index_path),
             "input_manifest_hash": input_manifest_hash,
+            "local_environment_identity_sha256": (
+                None if current_local_identity is None
+                else current_local_identity["identity_sha256"]),
             "max_output_bytes": spec["limits"]["max_output_bytes"],
             "max_output_files": spec["limits"]["max_output_files"],
         }
@@ -1630,10 +2425,16 @@ class DockerExecutionSandbox:
             "backend": _BACKEND, "engine_path": self.engine_path,
             "engine_host": self.config["engine_host"], "container_name": name,
             "token": token, "spec_sha256": spec_sha256,
-            "network_mode": "none", "rootfs_readonly": True,
+            **manifest_profile,
             "no_new_privileges": True, "cap_drop_all": True,
             "pid_namespace": True, "resource_mode": self.resource_mode,
         }
+        if current_local_identity is not None:
+            external.update({
+                "local_environment_identity_sha256":
+                    current_local_identity["identity_sha256"],
+                "local_environment_development_only": True,
+            })
         wrapper = [
             sys.executable, "-I", os.path.abspath(__file__), "docker-runner",
             "--spec-fd", str(spec_file.fileno()), "--spec-sha256", spec_sha256,
@@ -1879,14 +2680,17 @@ def discard_rejected_sandbox_output(
 def _verify_runner_spec(spec: Dict[str, Any]) -> None:
     required = {
         "version", "backend", "engine_path", "engine_host",
+        "network_mode",
         "seccomp_path", "seccomp_sha256", "seccomp_spec_hash",
         "seccomp_bpf_b64", "seccomp_bpf_sha256", "image", "image_id",
         "name", "token", "resource_mode", "input_root", "output_root",
-        "input_manifest_hash", "readonly_mounts", "env", "payload_env", "argv", "gpu",
+        "input_manifest_hash", "local_environment", "readonly_mounts", "env",
+        "payload_env", "argv", "gpu",
         "limits",
     }
     if (set(spec) != required or spec.get("version") != 1
             or spec.get("backend") != _BACKEND
+            or spec.get("network_mode") not in {"none", "bridge"}
             or not isinstance(spec.get("name"), str) or not spec["name"].startswith("mr-")
             or not isinstance(spec.get("token"), str) or _TOKEN_RE.fullmatch(spec["token"]) is None
             or not isinstance(spec.get("image"), str) or _IMAGE_RE.fullmatch(spec["image"]) is None
@@ -1904,6 +2708,8 @@ def _verify_runner_spec(spec: Dict[str, Any]) -> None:
             or not isinstance(spec.get("argv"), list) or not spec["argv"]
             or not isinstance(spec.get("env"), dict)
             or not isinstance(spec.get("payload_env"), dict)
+            or spec.get("local_environment") is not None
+            and not isinstance(spec.get("local_environment"), dict)
             or not isinstance(spec.get("limits"), dict)):
         raise ExecutionSandboxError("docker runner spec 字段闭包/类型非法")
     try:
@@ -1946,10 +2752,10 @@ def _verify_created_container(spec: Mapping[str, Any], payload: Any) -> None:
             or config.get("Entrypoint") not in (None, [])
             or config.get("Cmd") != spec["argv"]
             or config.get("WorkingDir") != "/mr/output"
-            or host.get("NetworkMode") != "none"
+            or host.get("NetworkMode") != spec["network_mode"]
             or host.get("ReadonlyRootfs") is not True
             or host.get("Privileged") is not False
-            or host.get("IpcMode") != "none"
+            or host.get("IpcMode") != "private"
             or host.get("PidMode") not in ("", None)
             or "ALL" not in (host.get("CapDrop") or [])
             or not any(item == "no-new-privileges:true" for item in security)
@@ -1979,6 +2785,10 @@ def _verify_created_container(spec: Mapping[str, Any], payload: Any) -> None:
         *((item["source"], item["target"], False)
           for item in spec["readonly_mounts"]),
     }
+    if spec["local_environment"] is not None:
+        expected_mounts.add((
+            spec["local_environment"]["source"],
+            spec["local_environment"]["target"], False))
     requested_mounts = set()
     for mount in host.get("Mounts") or []:
         if not isinstance(mount, dict) or mount.get("Type") != "bind":
@@ -2054,12 +2864,25 @@ def _docker_runner(spec: Dict[str, Any]) -> int:
         what="sandbox runner image inspect")
     if image != spec["image_id"]:
         raise ExecutionSandboxError("sandbox runner image pin 漂移")
+    local_spec = spec["local_environment"]
+    if local_spec is not None:
+        local_config = {
+            "enabled": True,
+            "development_only": True,
+            "source": local_spec.get("source"),
+            "target": local_spec.get("target"),
+            "python_path": local_spec.get("python_path"),
+            "identity_sha256": (local_spec.get("identity") or {}).get(
+                "identity_sha256"),
+        }
+        if local_environment_identity(local_config) != local_spec.get("identity"):
+            raise ExecutionSandboxError("sandbox runner local environment identity 漂移")
     limits = spec["limits"]
     args = [
         "container", "create", "--name", spec["name"],
         "--label", f"{_LABEL}={spec['token']}",
-        "--network", "none", "--read-only", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges:true", "--ipc", "none",
+        "--network", spec["network_mode"], "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true", "--ipc", "private",
         "--pids-limit", str(limits["pids"]),
         "--memory", str(limits["memory_bytes"]),
         "--memory-swap", str(limits["memory_bytes"]),
@@ -2072,6 +2895,10 @@ def _docker_runner(spec: Dict[str, Any]) -> int:
         "--mount", f"type=bind,src={spec['input_root']},dst=/mr/input,readonly",
         "--mount", f"type=bind,src={spec['output_root']},dst=/mr/output",
     ]
+    if local_spec is not None:
+        args.extend([
+            "--mount", ("type=bind,src="
+                        f"{local_spec['source']},dst={local_spec['target']},readonly")])
     if spec["gpu"] is not None:
         # Docker's --gpus grammar requires the literal quote characters when
         # multiple comma-separated sub-fields are passed as one argv token.

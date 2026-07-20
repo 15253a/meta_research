@@ -21,6 +21,7 @@ from orchestrator.execution_sandbox import (
     sandbox_environment_hash,
     sandbox_workload_environment_hash,
 )
+from orchestrator.interfaces import ManagedArtifactRef
 from orchestrator.schemas import SchemaSet
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
@@ -63,6 +64,75 @@ def test_valid_build_manifest_passes():
     MF.validate_manifest(SCHEMAS, _manifest(_slice()))
 
 
+def test_manifest_accepts_bounded_python_requirements_and_rejects_pip_flags():
+    manifest = _manifest(_slice())
+    manifest["python_requirements"] = [
+        "einops==0.8.0", "mne>=1.6; python_version >= '3.10'"]
+    MF.validate_manifest(SCHEMAS, manifest)
+
+    manifest["python_requirements"] = ["--extra-index-url=https://example.invalid"]
+    with pytest.raises(MF.ManifestError, match="schema"):
+        MF.validate_manifest(SCHEMAS, manifest)
+
+    manifest["python_requirements"] = ["einops==0.8.0", "einops==0.8.0"]
+    with pytest.raises(MF.ManifestError, match="schema"):
+        MF.validate_manifest(SCHEMAS, manifest)
+
+
+def test_python_requirements_never_install_into_unsandboxed_host(tmp_path):
+    manifest = _manifest(_slice())
+    manifest["python_requirements"] = ["einops==0.8.0"]
+    with pytest.raises(MF.ManifestError, match="正式 execution sandbox"):
+        MF.run_manifest_command(
+            manifest, "smoke", staging_dir=str(tmp_path / "run"),
+            log_name="smoke.log", src_dir=tmp_path / "src",
+            work_root=tmp_path, policy=POLICY)
+
+
+def test_canonical_multi_checkpoint_manifest_and_destination_apis(tmp_path):
+    manifest = _manifest(_slice())
+    manifest["expected_outputs"] = {"checkpoints": [
+        {"ckpt_key": "fold0", "path": "checkpoints/fold0.pt"},
+        {"ckpt_key": "fold1", "path": "checkpoints/fold1.pt"},
+    ]}
+    manifest["commands"]["eval"]["argv"] = [
+        "python", "{src}/eval.py", "{ckpt:fold0}", "{ckpt:fold1}"]
+    MF.validate_manifest(SCHEMAS, manifest)
+    assert MF.checkpoint_specs(manifest) == [
+        MF.CheckpointSpec("fold0", "checkpoints/fold0.pt"),
+        MF.CheckpointSpec("fold1", "checkpoints/fold1.pt"),
+    ]
+    assert MF.checkpoint_destinations(manifest, tmp_path / "run") == {
+        "fold0": tmp_path / "run" / "checkpoints" / "fold0.pt",
+        "fold1": tmp_path / "run" / "checkpoints" / "fold1.pt",
+    }
+    with pytest.raises(MF.ManifestError, match="checkpoint_destinations"):
+        MF.checkpoint_dest(manifest, tmp_path / "run")
+
+
+def test_legacy_checkpoint_normalizes_to_final_key(tmp_path):
+    manifest = _manifest(_slice())
+    assert MF.checkpoint_specs(manifest) == [MF.CheckpointSpec("final", "ckpt.bin")]
+    assert MF.checkpoint_destinations(manifest, tmp_path) == {
+        "final": tmp_path / "ckpt.bin"}
+
+
+def test_checkpoint_output_forms_are_exclusive_and_keys_unique():
+    both = _manifest(_slice())
+    both["expected_outputs"]["checkpoints"] = [
+        {"ckpt_key": "fold0", "path": "fold0.pt"}]
+    with pytest.raises(MF.ManifestError, match="schema"):
+        MF.validate_manifest(SCHEMAS, both)
+
+    duplicate = _manifest(_slice())
+    duplicate["expected_outputs"] = {"checkpoints": [
+        {"ckpt_key": "fold0", "path": "fold0.pt"},
+        {"ckpt_key": "fold0", "path": "other.pt"},
+    ]}
+    with pytest.raises(MF.ManifestError, match="ckpt_key 重复"):
+        MF.validate_manifest(SCHEMAS, duplicate)
+
+
 def test_legacy_manifest_without_gpu_required_remains_cpu_compatible():
     plan_slice = _slice()
     manifest = _manifest(plan_slice)
@@ -93,11 +163,13 @@ def test_gpu_required_is_explicit_workload_request_not_host_inventory(tmp_path):
             log_name="smoke.log", src_dir=tmp_path / "src",
             work_root=tmp_path, policy=policy,
             execution_sandbox=_Sandbox())
+    gpu_policy = json.loads(json.dumps(POLICY))
+    gpu_policy["resources"].update({"gpus": 1, "gpu_mem_gb": 80})
     with pytest.raises(MF.ManifestError, match="启动 canary 未证明"):
         MF.run_manifest_command(
             gpu_manifest, "smoke", staging_dir=str(tmp_path / "run"),
             log_name="smoke.log", src_dir=tmp_path / "src",
-            work_root=tmp_path, policy=POLICY,
+            work_root=tmp_path, policy=gpu_policy,
             execution_sandbox=_Sandbox())
 
 
@@ -229,6 +301,25 @@ def test_stage_and_resume_roundtrip(tmp_path):
     assert (dest / "pkg" / "util.py").read_text(encoding="utf-8") == "X = 1"
     assert json.loads((dest / "cfg.json").read_text(encoding="utf-8")) == {"lr": 0.1}
     assert MF.staged_hashes(dest) == ledger          # 恢复路径：哨兵在 + 哈希全对 → 返回记账
+
+
+def test_stage_streams_managed_bundle_ref_without_inline_body(tmp_path):
+    source = tmp_path / "managed" / "train.py"
+    source.parent.mkdir()
+    source.write_text("print('managed')\n" * 20_000, encoding="utf-8")
+    raw = source.read_bytes()
+    ref = ManagedArtifactRef(
+        path=str(source), size_bytes=len(raw),
+        sha256="sha256:" + hashlib.sha256(raw).hexdigest())
+    files = {**_envelope(), "train.py": ref}
+    manifest = _manifest(_slice(), code_files=["train.py", "eval.py"])
+    dest = tmp_path / "staged"
+
+    ledger = MF.stage_bundle_files(files, manifest, dest)
+
+    assert (dest / "train.py").read_bytes() == raw
+    assert ledger["train.py"] == hashlib.sha256(raw).hexdigest()
+    assert MF.staged_hashes(dest) == ledger
 
 
 def test_staged_tamper_detected(tmp_path):
@@ -477,6 +568,49 @@ def _pol(allow=()):
     return {"execution": {"default_timeout_s": 5, "max_timeout_s": 10, "path_allowlist": list(allow)}}
 
 
+def _registered_local_source(work_root: Path, source_root: Path, *, source_id: str = "e" * 32):
+    """写入与 Web 发布格式一致的最小服务端冻结清单；不复制 source_root 内容。"""
+    work_root.mkdir()
+    source_root.mkdir()
+    root_info = os.lstat(source_root)
+    source = {
+        "source_id": source_id,
+        "label": "EEG data",
+        "kind": "dataset",
+        "status": "verified",
+        "source_type": "directory",
+        "source_path": str(source_root),
+        "source_root": str(source_root),
+        "root_identity": {
+            "device": root_info.st_dev,
+            "inode": root_info.st_ino,
+            "mode": stat.S_IMODE(root_info.st_mode),
+            "uid": root_info.st_uid,
+            "gid": root_info.st_gid,
+        },
+        "file_count": 0,
+        "total_bytes": 0,
+        "files": [],
+    }
+    payload = {
+        "version": 1,
+        "draft_id": "d" * 32,
+        "status": "verified",
+        "generated_at": "2026-07-16T00:00:00Z",
+        "file_count": 0,
+        "total_bytes": 0,
+        "sources": [source],
+    }
+    input_root = work_root / "input"
+    input_root.mkdir()
+    manifest_path = input_root / "local-sources.json"
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8")
+    manifest_path.chmod(0o400)
+    return source_id
+
+
 def _managed_asset(work_root: Path, body: bytes = b"USER-DATA", *, request_id: int = 7,
                    status: str = "resolved"):
     import hashlib
@@ -545,6 +679,65 @@ def test_resolve_substitutes_src_and_ckpt(tmp_path):
     assert rc.timeout_s == 5                          # 未声明 → default
     rc_t = MF.resolve_command(m, "train", src_dir=src, work_root=tmp_path, policy=_pol())
     assert rc_t.timeout_s == 10                       # 声明 60 → max 截断
+
+
+def test_resolve_named_checkpoint_placeholders_validates_every_capability(tmp_path):
+    manifest = _manifest(_slice())
+    manifest["commands"]["eval"]["argv"] = [
+        "python", "{src}/eval.py", "--a={ckpt:fold0}", "{ckpt:fold1}"]
+    paths = {"fold0": tmp_path / "fold0.pt", "fold1": tmp_path / "fold1.pt"}
+    paths["fold0"].write_bytes(b"zero")
+    paths["fold1"].write_bytes(b"one")
+    hashes = {
+        key: hashlib.sha256(path.read_bytes()).hexdigest()
+        for key, path in paths.items()}
+
+    resolved = MF.resolve_command(
+        manifest, "eval", src_dir=tmp_path / "src", work_root=tmp_path,
+        policy=_pol(), checkpoint_paths=paths,
+        checkpoint_content_hashes=hashes)
+    try:
+        assert len(resolved.pass_fds) == 2
+        assert Path(resolved.argv[2].removeprefix("--a=")).read_bytes() == b"zero"
+        assert Path(resolved.argv[3]).read_bytes() == b"one"
+    finally:
+        for fd in resolved.pass_fds:
+            os.close(fd)
+
+    bad_hashes = {**hashes, "fold1": "0" * 64}
+    with pytest.raises(MF.ManifestError, match="fold1.*哈希不符"):
+        MF.resolve_command(
+            manifest, "eval", src_dir=tmp_path / "src", work_root=tmp_path,
+            policy=_pol(), checkpoint_paths=paths,
+            checkpoint_content_hashes=bad_hashes)
+
+
+def test_singular_checkpoint_placeholder_requires_exactly_one_mapping(tmp_path):
+    manifest = _manifest(_slice())
+    paths = {"fold0": tmp_path / "fold0.pt", "fold1": tmp_path / "fold1.pt"}
+    for key, path in paths.items():
+        path.write_bytes(key.encode("ascii"))
+    hashes = {
+        key: hashlib.sha256(path.read_bytes()).hexdigest()
+        for key, path in paths.items()}
+    with pytest.raises(MF.ManifestError, match="恰好提供一个"):
+        MF.resolve_command(
+            manifest, "eval", src_dir=tmp_path / "src", work_root=tmp_path,
+            policy=_pol(), checkpoint_paths=paths,
+            checkpoint_content_hashes=hashes)
+
+
+def test_checkpoint_capability_mappings_must_be_paired_and_key_aligned(tmp_path):
+    manifest = _manifest(_slice())
+    with pytest.raises(MF.ManifestError, match="同时提供"):
+        MF.resolve_command(
+            manifest, "eval", src_dir=tmp_path, work_root=tmp_path,
+            policy=_pol(), checkpoint_paths={"final": tmp_path / "x"})
+    with pytest.raises(MF.ManifestError, match="集合不一致"):
+        MF.resolve_command(
+            manifest, "eval", src_dir=tmp_path, work_root=tmp_path,
+            policy=_pol(), checkpoint_paths={"fold0": tmp_path / "x"},
+            checkpoint_content_hashes={"fold1": "0" * 64})
 
 
 def test_asset_placeholder_resolves_hash_checks_and_runs(tmp_path, monkeypatch):
@@ -648,6 +841,79 @@ def test_asset_placeholder_rejects_malformed_duplicate_and_symlink(tmp_path):
                            allowed_asset_refs={ref}, expected_asset_identities=frozen_identities)
 
 
+def test_local_source_placeholder_resolves_registered_readonly_root_without_copy(tmp_path):
+    work = tmp_path / "work"
+    source = tmp_path / "EEG_Data"
+    source_id = _registered_local_source(work, source)
+    (source / "DREAMER").mkdir()
+    manifest = _manifest(_slice())
+    manifest["commands"]["train"]["argv"] = [
+        "python", "{local_source:" + source_id + "}/DREAMER",
+        "--data={local_source:" + source_id + "}",
+    ]
+
+    assert MF.extract_manifest_local_source_ids(manifest) == [source_id]
+    # 本机目录引用不冒充上传 asset，因此无需 ContextPack asset 授权快照即可物化 bundle。
+    MF.stage_bundle_files(_envelope(), manifest, work / "staged")
+    resolved = MF.resolve_command(
+        manifest, "train", src_dir=work / "src", work_root=work,
+        policy=_pol(allow=[str(source)]))
+    assert resolved.argv[1] == str(source / "DREAMER")
+    assert resolved.argv[2] == "--data=" + str(source)
+    assert not (work / "EEG_Data").exists()  # 引用原只读根，没有复制一份数据
+
+
+def test_local_source_placeholder_requires_registered_id_and_exact_allowlist(tmp_path):
+    work = tmp_path / "work"
+    source = tmp_path / "EEG_Data"
+    source_id = _registered_local_source(work, source)
+    manifest = _manifest(_slice())
+    manifest["commands"]["train"]["argv"] = [
+        "python", "{local_source:" + ("a" * 32) + "}"]
+    with pytest.raises(MF.ManifestError, match="未在 Web 冻结清单登记"):
+        MF.resolve_command(
+            manifest, "train", src_dir=work / "src", work_root=work,
+            policy=_pol(allow=[str(source)]))
+
+    manifest["commands"]["train"]["argv"][-1] = "{local_source:" + source_id + "}"
+    with pytest.raises(MF.ManifestError, match="path_allowlist exact"):
+        MF.resolve_command(
+            manifest, "train", src_dir=work / "src", work_root=work,
+            policy=_pol(allow=[str(tmp_path)]))
+
+
+@pytest.mark.parametrize("placeholder", [
+    "{local_source:e06eaa405c6047b685ef6e1ec0d4eef}",
+    "{local_source:e06eaa405c6047b685ef6e1ec0d4eef2",
+    "{local_source:/tmp/EEG_Data}",
+    "{asset:e06eaa405c6047b685ef6e1ec0d4eef2}",
+])
+def test_local_source_placeholder_rejects_malformed_or_asset_alias(tmp_path, placeholder):
+    work = tmp_path / "work"
+    source = tmp_path / "EEG_Data"
+    _registered_local_source(work, source)
+    manifest = _manifest(_slice())
+    manifest["commands"]["train"]["argv"] = ["python", placeholder]
+    with pytest.raises(MF.ManifestError, match="占位符"):
+        MF.resolve_command(
+            manifest, "train", src_dir=work / "src", work_root=work,
+            policy=_pol(allow=[str(source)]))
+
+
+def test_local_source_placeholder_rejects_root_identity_replacement(tmp_path):
+    work = tmp_path / "work"
+    source = tmp_path / "EEG_Data"
+    source_id = _registered_local_source(work, source)
+    source.rename(tmp_path / "old-EEG_Data")
+    source.mkdir()
+    manifest = _manifest(_slice())
+    manifest["commands"]["train"]["argv"] = [
+        "python", "{local_source:" + source_id + "}"]
+    with pytest.raises(MF.ManifestError, match="身份.*漂移"):
+        MF.resolve_command(
+            manifest, "train", src_dir=work / "src", work_root=work,
+            policy=_pol(allow=[str(source)]))
+
 @pytest.mark.parametrize("identity_field", ["version", "request_id"])
 def test_asset_manifest_identity_rejects_bool(tmp_path, identity_field):
     """True 不得利用 bool 是 int 子类冒充 manifest version/request_id 的整数 1。"""
@@ -742,8 +1008,20 @@ def test_ckpt_placeholder_only_in_eval(tmp_path):
     m["commands"]["train"]["argv"] = ["python", "{ckpt}"]
     with pytest.raises(MF.ManifestError, match="ckpt"):
         MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol())
+    m["commands"]["train"]["argv"] = ["python", "{ckpt:fold0}"]
+    with pytest.raises(MF.ManifestError, match="checkpoint"):
+        MF.resolve_command(m, "train", src_dir=tmp_path, work_root=tmp_path, policy=_pol())
     with pytest.raises(MF.ManifestError, match="checkpoint"):
         MF.resolve_command(_manifest(_slice()), "eval", src_dir=tmp_path, work_root=tmp_path, policy=_pol())
+
+
+@pytest.mark.parametrize("placeholder", ["{ckpt:}", "{ckpt:fold/0}", "{ckpt:fold 0}", "{ckpt:fold0"])
+def test_malformed_named_checkpoint_placeholder_rejected(tmp_path, placeholder):
+    manifest = _manifest(_slice())
+    manifest["commands"]["eval"]["argv"] = ["python", placeholder]
+    with pytest.raises(MF.ManifestError, match="非法 checkpoint 占位符"):
+        MF.resolve_command(
+            manifest, "eval", src_dir=tmp_path, work_root=tmp_path, policy=_pol())
 
 
 def test_path_fence(tmp_path):
@@ -903,6 +1181,34 @@ def test_run_manifest_command_end_to_end(tmp_path):
                                  expected_source_hashes=ledger)
     assert ev["exit_code"] == 0
     assert "metric_value: 1@1=0.93" in Path(ev["log_path"]).read_text(encoding="utf-8")
+
+
+def test_run_manifest_command_with_multiple_named_checkpoints(tmp_path):
+    manifest = _manifest(_slice())
+    manifest["commands"]["eval"]["argv"] = [
+        sys.executable, "-c",
+        "import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes()==b'f0'; "
+        "assert pathlib.Path(sys.argv[2]).read_bytes()==b'f1'; "
+        "print('metric_value: 1@1[checkpoint=fold0]=0.8'); "
+        "print('metric_value: 1@1[checkpoint=fold1]=0.9'); "
+        "print('metric_value: 1@1=0.85')",
+        "{ckpt:fold0}", "{ckpt:fold1}",
+    ]
+    paths = {"fold0": tmp_path / "fold0.pt", "fold1": tmp_path / "fold1.pt"}
+    paths["fold0"].write_bytes(b"f0")
+    paths["fold1"].write_bytes(b"f1")
+    hashes = {
+        key: hashlib.sha256(path.read_bytes()).hexdigest()
+        for key, path in paths.items()}
+    result = MF.run_manifest_command(
+        manifest, "eval", staging_dir=str(tmp_path / "eval-multi"),
+        log_name="eval.log", src_dir=tmp_path / "src", work_root=tmp_path,
+        policy=POLICY, checkpoint_paths=paths,
+        checkpoint_content_hashes=hashes)
+    assert result["exit_code"] == 0
+    log = Path(result["log_path"]).read_text(encoding="utf-8")
+    assert "metric_value: 1@1[checkpoint=fold0]=0.8" in log
+    assert "metric_value: 1@1=0.85" in log
 
 
 def test_checkpoint_and_source_path_swaps_cannot_change_consumed_fds(

@@ -69,7 +69,20 @@ from .import_materialization_contract import (
     spec_ref as materialization_spec_ref,
 )
 from .phase_commit import check_or_record
+from .pool_publication import (
+    BaselinePublication,
+    CheckpointPublication,
+    EvaluationPublicationSpec,
+    PoolPublisher,
+    ProtocolPublication,
+    TrainingPublicationSpec,
+    VariantPublication,
+    VerifiedPoolPublication,
+    VerifiedTrainingPublication,
+    bind_training_database,
+)
 from .process_supervisor import ExecutionSupervisor
+from .storage_paths import resolve_registered_path
 
 
 def _cid(n: int) -> str:
@@ -89,7 +102,8 @@ class ImportWorker:
                  owner_guard: Optional[Callable[[], None]] = None,
                  execution_supervisor=None,
                  execution_sandbox=None,
-                 execution_sandbox_resolver=None):
+                 execution_sandbox_resolver=None,
+                 pool_publisher: Optional[PoolPublisher] = None):
         if owner_guard is not None:
             if (not isinstance(execution_supervisor, ExecutionSupervisor)
                     or not execution_supervisor.binds_fenced_owner(owner_guard)):
@@ -105,6 +119,14 @@ class ImportWorker:
         self.execution_supervisor = execution_supervisor
         self.execution_sandbox = execution_sandbox
         self.execution_sandbox_resolver = execution_sandbox_resolver
+        gate_publisher = getattr(pool_gate, "pool_publisher", None)
+        if (pool_publisher is not None and gate_publisher is not None
+                and pool_publisher is not gate_publisher):
+            raise ValueError("ImportWorker 与 PoolGate 必须共享同一 PoolPublisher")
+        self.pool_publisher = pool_publisher or gate_publisher
+        if (getattr(pool_gate, "require_formal_publication", False)
+                and self.pool_publisher is None):
+            raise ValueError("生产 ImportWorker 必须注入正式 PoolPublisher")
 
     def _resolve_execution_sandbox(self, spec: Mapping[str, Any]):
         capability = spec.get("execution_image")
@@ -834,9 +856,13 @@ class ImportWorker:
             logs = sorted((staging / "smoke").glob("smoke-*.log"))
             code_sh = SM.subject_hash(manifest_entries + [
                 {"kind": "smoke_transcript", "ref": str(logs[-1]), "content_hash": H.file_sha256(str(logs[-1]))}])
-            judge_once(d, self.p["judge"], cyc_id, bt_id, "bundle_code_review", code_sh)
-            if not g.review_passed(build_target_id=bt_id, review_kind="bundle_code_review",
-                                   current_subject_hash=code_sh):
+            if g.require_code_review:
+                if "judge" not in self.p:
+                    raise RuntimeError("代码评审已启用但 import worker 未装配 judge provider")
+                judge_once(d, self.p["judge"], cyc_id, bt_id, "bundle_code_review", code_sh)
+            if g.require_code_review and not g.review_passed(
+                    build_target_id=bt_id, review_kind="bundle_code_review",
+                    current_subject_hash=code_sh):
                 # judge FAIL → 全拒收尾（codex BLOCKER：直接闯 gate 会拒 → 重启 judge_once 复用同 fail 裁决
                 # → 确定性重试死循环、worker 永悬置）
                 g.gate_finish_build_target(build_target_id=bt_id, status="failed", failure_kind="review_failed")
@@ -1005,6 +1031,235 @@ class ImportWorker:
             seen.add(key)
         return output
 
+    @staticmethod
+    def _identity_text(revision: str) -> str:
+        """Return the pre-repro identity bytes consumed by PoolGate.
+
+        ``PoolPublisher`` appends the reproduction section when materializing
+        ``identity.md``; ``gate_register_baseline`` performs the identical
+        append before comparing it with the verified publication.
+        """
+        return ("# imported baseline\n"
+                "- uri 见 checkpoint.source_uri\n"
+                f"- revision: {revision}")
+
+    def _identity_source(self, staging: Path, revision: str) -> Path:
+        """Materialize a deterministic identity source, rejecting drift on replay."""
+        path = staging / "formal-identity.md"
+        raw = self._identity_text(revision).encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            current = read_artifact_bytes(
+                path, expected_hash=digest, expected_size=len(raw),
+                label="import formal identity source")
+            if current != raw:
+                raise RuntimeError("import formal identity source 与冻结 revision 漂移")
+            return path
+        temporary = path.with_name(path.name + ".tmp")
+        if temporary.exists():
+            partial = read_artifact_bytes(
+                temporary, expected_hash=digest, expected_size=len(raw),
+                label="import formal identity partial")
+            if partial != raw:
+                raise RuntimeError("import formal identity partial 与冻结 revision 漂移")
+        else:
+            temporary.write_bytes(raw)
+        temporary.replace(path)
+        return path
+
+    def _publish_training_assets(
+            self, *, external_import_id: int, run_id: int,
+            variant_id: int, baseline_id: int, revision: str,
+            staging: Path, clone_dir: Path, checkpoint_source: Path,
+            checkpoint_hash: str) -> Optional[VerifiedTrainingPublication]:
+        """Publish imported identity/source/config/checkpoint before DB insertion."""
+        if self.pool_publisher is None:
+            return None
+        baseline = self.state.daemon.query_one(
+            "SELECT slug,canonical_key FROM baseline WHERE id=?", (baseline_id,))
+        variant = self.state.daemon.query_one(
+            "SELECT variant_key,config_json FROM variant WHERE id=? AND baseline_id=?",
+            (variant_id, baseline_id))
+        if baseline is None or variant is None:
+            raise RuntimeError("formal import publication 的 baseline/variant 身份缺失")
+        identity_source = self._identity_source(staging, revision)
+        return self.pool_publisher.publish_training(TrainingPublicationSpec(
+            baseline=BaselinePublication(
+                baseline_id=baseline_id, slug=baseline[0],
+                canonical_key=baseline[1], identity_source=identity_source,
+                code_source=clone_dir,
+                repro_cmd_md=f"materialize external_import {external_import_id}"),
+            variant=VariantPublication(
+                variant_id=variant_id, variant_key=variant[0], config=variant[1]),
+            checkpoints=[CheckpointPublication(
+                ckpt_key=f"import-r{run_id}", source=checkpoint_source,
+                expected_sha256=checkpoint_hash,
+                file_name="artifact.bin")]))
+
+    def _training_checkpoint_ids(
+            self, training: VerifiedTrainingPublication, *,
+            variant_id: int) -> Dict[str, int]:
+        """Resolve a verified training receipt to its exact formal DB rows."""
+        objects = training.payload.get("objects", {})
+        if objects.get("variant", {}).get("variant_id") != variant_id:
+            raise RuntimeError("training publication 与 import variant 不一致")
+        mapping: Dict[str, int] = {}
+        for item in training.checkpoint_bindings:
+            row = self.state.daemon.query_one(
+                "SELECT id FROM checkpoint WHERE variant_id=? AND ckpt_key=? AND path=? "
+                "AND content_hash=? AND hash_alg=?",
+                (variant_id, item["ckpt_key"], item["path"],
+                 item["content_hash"], item["hash_alg"]))
+            if row is None:
+                raise RuntimeError(
+                    f"formal checkpoint {item['ckpt_key']!r} 未按 publication 入账")
+            mapping[item["ckpt_key"]] = row[0]
+        current = self.state.daemon.query(
+            "SELECT id FROM checkpoint WHERE variant_id=? ORDER BY id", (variant_id,))
+        if {row[0] for row in current} != set(mapping.values()):
+            raise RuntimeError("import variant checkpoint 集合超出 formal training publication")
+        return mapping
+
+    def _recover_training_publication(
+            self, *, variant_id: int,
+            run_id: int) -> Optional[VerifiedTrainingPublication]:
+        """Recover an immutable training receipt from its DB decision anchor."""
+        if self.pool_publisher is None:
+            return None
+        rows = self.state.daemon.query(
+            "SELECT payload_json FROM decision WHERE actor='gate' "
+            "AND type='pool_training_publication' "
+            "AND json_extract(payload_json,'$.variant_id')=? "
+            "AND json_extract(payload_json,'$.run_id')=? ORDER BY id DESC",
+            (variant_id, run_id))
+        if not rows:
+            raise RuntimeError(
+                f"variant {variant_id}/run {run_id} 缺 formal training publication")
+        identities = set()
+        training = None
+        anchored_ids = None
+        for (raw,) in rows:
+            try:
+                event = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise RuntimeError("pool_training_publication decision JSON 损坏") from error
+            identity = (event.get("manifest_ref"), event.get("manifest_hash"))
+            identities.add(identity)
+            event_ids = event.get("checkpoint_ids")
+            if anchored_ids is None:
+                anchored_ids = event_ids
+            elif anchored_ids != event_ids:
+                raise RuntimeError("同一 import run 有冲突的 formal checkpoint id 锚")
+            if training is None:
+                training = self.pool_publisher.verify_training(
+                    identity[0], expected_hash=identity[1])
+        if len(identities) != 1 or training is None:
+            raise RuntimeError("同一 import run 有冲突的 formal training publication")
+        ids = self._training_checkpoint_ids(training, variant_id=variant_id)
+        if anchored_ids != [
+                ids[item["ckpt_key"]] for item in training.checkpoint_bindings]:
+            raise RuntimeError("pool_training_publication checkpoint id 锚损坏")
+        produced = self.state.daemon.query(
+            "SELECT id FROM checkpoint WHERE produced_by_run=? ORDER BY id", (run_id,))
+        if [row[0] for row in produced] != sorted(ids.values()):
+            raise RuntimeError("formal import checkpoint 与 run 回指不一致")
+        return training
+
+    def _publish_evaluation_assets(
+            self, *, training: VerifiedTrainingPublication, evaluation_id: int,
+            attempt_id: int, attempt_no: int, metrics: List[Dict[str, Any]],
+            eval_log: Path, transcript_ref: Optional[str]) -> VerifiedPoolPublication:
+        """Publish protocol and evaluation attempt before sealing DB success."""
+        if self.pool_publisher is None:
+            raise RuntimeError("formal import evaluation publication 未装配")
+        evaluation = self.state.daemon.query_one(
+            "SELECT variant_id,protocol_id,protocol_ver,eval_key FROM evaluation WHERE id=?",
+            (evaluation_id,))
+        if evaluation is None:
+            raise RuntimeError(f"evaluation {evaluation_id} 不存在")
+        variant_id, protocol_id, protocol_ver, eval_key = evaluation
+        protocol = self.state.daemon.query_one(
+            "SELECT name,scope_spec_json FROM protocol WHERE id=? AND version=?",
+            (protocol_id, protocol_ver))
+        if protocol is None:
+            raise RuntimeError(f"protocol p{protocol_id}@{protocol_ver} 不存在")
+        checkpoint_ids = self._training_checkpoint_ids(
+            training, variant_id=variant_id)
+        transcript_source = AttackStages._evaluation_transcript_source(
+            eval_log, transcript_ref)
+        return self.pool_publisher.publish_evaluation(EvaluationPublicationSpec(
+            training=training, evaluation_id=evaluation_id, eval_key=eval_key,
+            attempt_id=attempt_id, attempt_no=attempt_no,
+            results_source=eval_log.parent, primary_artifact=eval_log.name,
+            metrics=metrics,
+            protocol=ProtocolPublication(
+                protocol_id=protocol_id, version=protocol_ver,
+                name=protocol[0], scope_spec=protocol[1]),
+            transcript_source=transcript_source,
+            checkpoint_ids=checkpoint_ids))
+
+    def _recover_evaluation_publication(
+            self, *, evaluation_id: int,
+            attempt_id: int) -> Optional[VerifiedPoolPublication]:
+        """Recover the complete content-addressed receipt after registration."""
+        if self.pool_publisher is None:
+            return None
+        rows = self.state.daemon.query(
+            "SELECT payload_json FROM decision WHERE actor='gate' AND type='pool_publication' "
+            "AND json_extract(payload_json,'$.evaluation_id')=? "
+            "AND json_extract(payload_json,'$.attempt_id')=? ORDER BY id DESC",
+            (evaluation_id, attempt_id))
+        if not rows:
+            raise RuntimeError(
+                f"evaluation {evaluation_id}/attempt {attempt_id} 缺 formal pool publication")
+        identities = set()
+        publication = None
+        for (raw,) in rows:
+            try:
+                event = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise RuntimeError("pool_publication decision JSON 损坏") from error
+            identity = (event.get("manifest_ref"), event.get("manifest_hash"))
+            identities.add(identity)
+            if publication is None:
+                publication = self.pool_publisher.verify_publication(
+                    identity[0], expected_hash=identity[1])
+        if len(identities) != 1 or publication is None:
+            raise RuntimeError("同一 canonical attempt 有冲突的 formal pool publication")
+        evaluation = publication.payload["objects"]["evaluation"]
+        if (evaluation.get("evaluation_id"), evaluation.get("attempt_id")) != (
+                evaluation_id, attempt_id):
+            raise RuntimeError("pool publication attempt 身份漂移")
+        return publication
+
+    def _register_published_evaluation_log(
+            self, cycle_id: str, publication: VerifiedPoolPublication,
+            attempt_id: int) -> None:
+        """Register and ingest the exact formal eval log on a running attempt."""
+        if self.pool_publisher is None:
+            raise RuntimeError("formal evaluation log registration 未装配")
+        binding = publication.database_bindings["evaluation_attempt"]
+        if binding.get("attempt_id") != attempt_id:
+            raise RuntimeError("formal eval log attempt 绑定不一致")
+        reference = binding["execution_log_ref"]
+        digest = binding["execution_log_hash"]
+        path = resolve_registered_path(self.pool_publisher.work_root, reference)
+        data = read_artifact_bytes(
+            path, expected_hash=digest, label="formal import evaluation execution log")
+        elid = H.register_execution_log(
+            self.state.daemon, cycle_id=cycle_id, log_kind="eval",
+            ref=reference, content_hash=digest, n_bytes=len(data),
+            evaluation_attempt_id=attempt_id)
+        row = self.state.daemon.query_one(
+            "SELECT ref,content_hash,bytes FROM execution_log WHERE id=?", (elid,))
+        if row != (reference, digest, len(data)):
+            raise RuntimeError(
+                "attempt 已有同 hash 的非正式 execution_log，无法建立 formal DB 绑定")
+        OP.ingest_observation(
+            self.state.daemon, execution_log_id=elid, log_bytes=data,
+            obs_policy=self.obs_policy)
+
     def _run_and_register_import(self, cyc_id, ei_id, qi, cand_id, bid, vid, bt_id, spec,
                                  staging: Path, clone_dir: Path, manifest_hash: str, revision: str,
                                  *, execution_sandbox=None) -> bool:
@@ -1016,17 +1271,23 @@ class ImportWorker:
         （eval_action=NULL、kind∉build/exec），完成纪律由本 worker 序列保证（单生产者模型）。"""
         g, d = self.gate, self.state.daemon
         run_row = d.query_one("SELECT id,status FROM run WHERE build_target_id=? ORDER BY id DESC", (bt_id,))
-        if run_row and run_row[1] == "running":
-            g.gate_finish_run(run_id=run_row[0], status="failed", failure_kind="aborted")
-            run_row = None
+        training_publication: Optional[VerifiedTrainingPublication] = None
         if run_row and run_row[1] == "success":
             rid = run_row[0]
         else:
-            rid = g.gate_start_run(build_target_id=bt_id, cycle_id=cyc_id, variant_id=vid, kind="import",
-                                   env_hash=spec.get("env_hash", "import-env"))
+            # Import does not launch a train process: the running intent owns a
+            # short publish+checkpoint transaction.  Reuse it across a crash
+            # instead of aborting it and inventing a second ckpt_key/run.
+            rid = (run_row[0] if run_row and run_row[1] == "running" else
+                   g.gate_start_run(
+                       build_target_id=bt_id, cycle_id=cyc_id,
+                       variant_id=vid, kind="import",
+                       env_hash=spec.get("env_hash", "import-env")))
             artifact_entry = self._artifact_entry(spec)
             main_file = artifact_entry["path"]
             cand_row = d.query_one("SELECT canonical_uri FROM external_candidate WHERE id=?", (cand_id,))
+            if cand_row is None:
+                raise RuntimeError(f"external candidate {cand_id} 不存在")
             with open_artifact(
                     clone_dir / main_file,
                     expected_hash=artifact_entry["sha256"],
@@ -1035,25 +1296,77 @@ class ImportWorker:
                     progress_guard=self.owner_guard) as artifact_capability:
                 artifact_hash = artifact_capability.identity.content_hash.removeprefix(
                     "sha256:")
-                with d.transaction() as conn:  # checkpoint = 外部可评 target（供应链溯源列 DDL CHECK 焊）
-                    conn.execute("INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,artifact_type,"
-                                 "origin,manifest_hash,source_uri,revision,produced_by_run) "
-                                 "VALUES (?,?,?,?,'sha256',?,'external_import',?,?,?,?)",
-                                 (vid, f"import-r{rid}", str(clone_dir / main_file),
-                                  artifact_hash,
-                                  spec.get("artifact_type", "external_model"),
-                                  manifest_hash, cand_row[0], revision, rid))
+                anchored = d.query_one(
+                    "SELECT 1 FROM decision WHERE actor='gate' "
+                    "AND type='pool_training_publication' "
+                    "AND json_extract(payload_json,'$.variant_id')=? "
+                    "AND json_extract(payload_json,'$.run_id')=?",
+                    (vid, rid))
+                if self.pool_publisher is not None and anchored is not None:
+                    training_publication = self._recover_training_publication(
+                        variant_id=vid, run_id=rid)
+                else:
+                    training_publication = self._publish_training_assets(
+                        external_import_id=ei_id, run_id=rid,
+                        variant_id=vid, baseline_id=bid, revision=revision,
+                        staging=staging, clone_dir=clone_dir,
+                        checkpoint_source=clone_dir / main_file,
+                        checkpoint_hash=artifact_hash)
+                ckpt_key = f"import-r{rid}"
+                checkpoint_path = str(clone_dir / main_file)
+                checkpoint_hash = artifact_hash
+                if training_publication is not None:
+                    bindings = training_publication.checkpoint_bindings
+                    if len(bindings) != 1 or bindings[0]["ckpt_key"] != ckpt_key:
+                        raise RuntimeError("formal import training publication checkpoint 闭包非法")
+                    checkpoint_path = bindings[0]["path"]
+                    checkpoint_hash = bindings[0]["content_hash"]
+                artifact_type = spec.get("artifact_type", "external_model")
+                expected = (
+                    vid, ckpt_key, checkpoint_path, checkpoint_hash, "sha256",
+                    artifact_type, "external_import", manifest_hash,
+                    cand_row[0], revision, rid)
+                # Formal files are published first.  The checkpoint row and
+                # training decision are then committed together so no DB row
+                # can reference a partial/staging-only pool asset.
+                with d.transaction() as conn:
+                    existing = conn.execute(
+                        "SELECT id,variant_id,ckpt_key,path,content_hash,hash_alg,"
+                        "artifact_type,origin,manifest_hash,source_uri,revision,produced_by_run "
+                        "FROM checkpoint WHERE produced_by_run=? ORDER BY id", (rid,)).fetchall()
+                    if len(existing) > 1:
+                        raise RuntimeError(f"import run {rid} 有多个 checkpoint")
+                    if not existing:
+                        checkpoint_id = conn.execute(
+                            "INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,"
+                            "artifact_type,origin,manifest_hash,source_uri,revision,produced_by_run) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", expected).lastrowid
+                    else:
+                        checkpoint_id = existing[0][0]
+                        if tuple(existing[0][1:]) != expected:
+                            raise RuntimeError(
+                                f"import run {rid} checkpoint durable identity 与正式发布不一致")
+                    if training_publication is not None:
+                        bind_training_database(
+                            conn, training_publication,
+                            updated_cycle=int(cyc_id[1:]),
+                            checkpoint_ids={ckpt_key: checkpoint_id},
+                            run_id=rid)
                 artifact_capability.verify_unchanged(self.owner_guard)
                 artifact_capability.verify_path_binding()
                 g.gate_finish_run(run_id=rid, status="success")
                 artifact_capability.verify_unchanged(self.owner_guard)
                 artifact_capability.verify_path_binding()
+        if self.pool_publisher is not None and training_publication is None:
+            training_publication = self._recover_training_publication(
+                variant_id=vid, run_id=rid)
         # 出厂评估（源仍 factory——外部性只在 checkpoint.origin+manifest_hash，§3.6.3 证据归属）。
         # 与 attack lockstep：任何外部 eval 进程放行前，evaluation+attempt(running) 已耐久落库；
         # guardian receipt 因而能以 execution-owner-v1 精确回指 DB owner，禁止事后伪造成功 attempt。
         erow = d.query_one(
             "SELECT id,status,canonical_attempt_id FROM evaluation WHERE build_target_id=?", (bt_id,))
         eval_final: Optional[Path] = None
+        pool_publication: Optional[VerifiedPoolPublication] = None
         if erow is None or erow[1] != "success":
             if erow is None:
                 attempt_purpose = "factory"
@@ -1168,9 +1481,13 @@ class ImportWorker:
                 metrics_artifact_hash=_canon_hash(metrics), checkpoint_hashes={ckrow[0]: ckrow[1]},
                 run_log_hashes={ev["log_path"]: ev["log_sha256"]},
                 parser_obs_hash=_canon_hash(OP.parse_log(eval_log.decode("utf-8", errors="replace"), self.obs_policy))))
-            judge_once(d, self.p["judge"], cyc_id, bt_id, "bundle_result_review", res_sh)
-            if not g.review_passed(build_target_id=bt_id, review_kind="bundle_result_review",
-                                   current_subject_hash=res_sh):
+            if g.require_result_review:
+                if "judge" not in self.p:
+                    raise RuntimeError("结果评审已启用但 import worker 未装配 judge provider")
+                judge_once(d, self.p["judge"], cyc_id, bt_id, "bundle_result_review", res_sh)
+            if g.require_result_review and not g.review_passed(
+                    build_target_id=bt_id, review_kind="bundle_result_review",
+                    current_subject_hash=res_sh):
                 g.gate_finish_attempt(
                     attempt_id=aid, status="failed", failure_kind="protocol_violation",
                     transcript_ref=ev.get("process_receipt_path"),
@@ -1180,12 +1497,32 @@ class ImportWorker:
                 self._record_failed(ei_id, qi, cand_id, reason="结果评审 FAIL，不注册不 pool_publish")
                 self._target_pc(cyc_id, bt_id)
                 return False
+            registration_artifact_ref = f"sha256:{ev['log_sha256']}"
+            registration_transcript_ref = ev.get("process_receipt_path")
+            if self.pool_publisher is not None:
+                if training_publication is None:
+                    raise RuntimeError("import factory evaluation 缺 formal training publication")
+                pool_publication = self._publish_evaluation_assets(
+                    training=training_publication, evaluation_id=eid,
+                    attempt_id=aid, attempt_no=attempt_no, metrics=metrics,
+                    eval_log=eval_final,
+                    transcript_ref=ev.get("process_receipt_path"))
+                # bind_database (inside gate_register_evaluation) requires the
+                # exact formal log to exist while the durable attempt is still
+                # running.  Observation ingestion is likewise completed before
+                # success can be sealed.
+                self._register_published_evaluation_log(
+                    cyc_id, pool_publication, aid)
+                binding = pool_publication.database_bindings["evaluation_attempt"]
+                registration_artifact_ref = binding["artifact_ref"]
+                registration_transcript_ref = pool_publication.manifest_ref
             try:
                 reg = g.gate_register_evaluation(
                     cycle_id=cyc_id, build_target_id=bt_id, purpose=attempt_purpose,
                     current_subject_hash=res_sh, metric_results=metrics, attempt_id=aid,
-                    artifact_ref=f"sha256:{ev['log_sha256']}",
-                    transcript_ref=ev.get("process_receipt_path"))
+                    artifact_ref=registration_artifact_ref,
+                    transcript_ref=registration_transcript_ref,
+                    publication=pool_publication)
             except GateReject as e:
                 g.gate_finish_attempt(
                     attempt_id=aid, status="failed", failure_kind="protocol_violation",
@@ -1204,18 +1541,33 @@ class ImportWorker:
                 "SELECT attempt_no FROM evaluation_attempt WHERE id=?", (aid,))[0]
             eval_final = (staging / f"eval{rid}" / "eval.log" if attempt_no == 1 else
                           staging / f"eval{rid}" / f"retry-a{aid}" / "eval.log")
-        self._eval_log_backfill(cyc_id, eval_final, aid)
+            pool_publication = self._recover_evaluation_publication(
+                evaluation_id=eid, attempt_id=aid)
+        if pool_publication is not None:
+            self._register_published_evaluation_log(
+                cyc_id, pool_publication, aid)
+        else:
+            self._eval_log_backfill(cyc_id, eval_final, aid)
         if aid is None or not OP.suspect_attempt_has_current_obs(d.conn, aid, self.obs_policy):
             raise RuntimeError(f"import 管线约束：attempt {aid} 无当前口径 parser 观测——须先 ingest 再入池")
         if d.query_one("SELECT status FROM variant WHERE id=?", (vid,))[0] != "legal":
-            res_sh2 = d.query_one(
-                "SELECT json_extract(payload_json,'$.subject_hash') FROM decision WHERE actor='judge' "
-                "AND type='bundle_result_review' AND json_extract(payload_json,'$.build_target_id')=? "
-                "ORDER BY id DESC LIMIT 1", (bt_id,))[0]
-            g.gate_register_baseline(baseline_id=bid, variant_id=vid, build_target_id=bt_id,
-                                     evaluation_id=eid, cycle_id=cyc_id, current_subject_hash=res_sh2,
-                                     identity_doc=f"# imported baseline\n- uri 见 checkpoint.source_uri\n- revision: {revision}",
-                                     repro_cmd=f"materialize external_import {ei_id}", run_id=rid)
+            if g.require_result_review:
+                review_row = d.query_one(
+                    "SELECT json_extract(payload_json,'$.subject_hash') FROM decision WHERE actor='judge' "
+                    "AND type='bundle_result_review' AND json_extract(payload_json,'$.build_target_id')=? "
+                    "ORDER BY id DESC LIMIT 1", (bt_id,))
+                if review_row is None or not review_row[0]:
+                    raise RuntimeError(f"import target {bt_id} 已注册 evaluation 但缺 result review")
+                res_sh2 = review_row[0]
+            else:
+                res_sh2 = "review-disabled"
+            g.gate_register_baseline(
+                baseline_id=bid, variant_id=vid, build_target_id=bt_id,
+                evaluation_id=eid, cycle_id=cyc_id,
+                current_subject_hash=res_sh2,
+                identity_doc=self._identity_text(revision),
+                repro_cmd=f"materialize external_import {ei_id}", run_id=rid,
+                publication=pool_publication)
         self._record_imported(ei_id, qi, cand_id, bid, manifest_hash)
         if d.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0] not in _TERMINAL_TARGET:
             g.gate_finish_build_target(build_target_id=bt_id, status="complete")

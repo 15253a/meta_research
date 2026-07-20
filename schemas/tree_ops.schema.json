@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://meta-research.local/schemas/tree_ops.schema.json",
   "title": "tree_ops",
-  "description": "reasoning 写树产物（第二部分 §6.11）。op 封闭七词表，与 §4.2.4 apply_tree_ops 一字一致：create_root / add_children / spawn_question / mark_answer_applicability / propose_prune / amend_goal / seed_applicability_audit。同批引用：spawn_question 可带 local_key，mark_answer_applicability.spawned_question_ref 可为既有 question_id 或同批 local_key。",
+  "description": "reasoning 写树产物（第二部分 §6.11）。op 封闭七词表，与 §4.2.4 apply_tree_ops 一字一致：create_root / add_children / spawn_question / mark_answer_applicability / propose_prune / amend_goal / seed_applicability_audit。同批引用：spawn_question 可带 local_key，mark_answer_applicability.spawned_question_ref 可为既有 question_id 或同批 local_key。所有新 question 应显式携 evidence_closure_v1 predicate_json；StateStore 对旧版无该字段的耐久产物补写可审计 legacy_default 合同，但工程任务无条件拒绝。",
   "type": "object",
   "required": ["ops"],
   "additionalProperties": false,
@@ -31,7 +31,8 @@
       "properties": {
         "op": { "const": "create_root" },
         "local_key": { "type": "string", "minLength": 1, "description": "同批引用键（bootstrap 轮 selection.next_question_id 以此回指新 root，与 add_children/spawn_question 对称）" },
-        "text": { "type": "string", "minLength": 1, "description": "问题语义身份（中文）" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 4096, "description": "问题语义身份（中文）；必须是可由允许证据回答或反驳的研究问题，不得是目录盘点、修代码/报错、部署或环境任务" },
+        "predicate_json": { "$ref": "#/$defs/question_predicate" },
         "rationale_md": { "type": "string" }
       }
     },
@@ -52,7 +53,8 @@
             "additionalProperties": false,
             "properties": {
               "local_key": { "type": "string", "minLength": 1, "description": "同批引用键（selection 选子题用）" },
-              "text": { "type": "string", "minLength": 1 },
+              "text": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "predicate_json": { "$ref": "#/$defs/question_predicate" },
               "rationale_md": { "type": "string" }
             }
           }
@@ -67,12 +69,18 @@
       "properties": {
         "op": { "const": "spawn_question" },
         "local_key": { "type": "string", "description": "同批引用键（mark_answer_applicability.spawned_question_ref 可回指）" },
+        "request_ref": {
+          "type": "string",
+          "pattern": "^db:(directive|decision):[1-9][0-9]*$",
+          "description": "接受固定锚中的 console/import-trigger 建题请求时必须逐字复制；StateStore 在同一事务内校验并绑定，普通自主派生题省略"
+        },
         "kind": { "enum": ["diagnosis", "followup", "revalidate", "import_reference", "goal_retarget"] },
         "parent_question_id": {
           "type": ["string", "null"],
           "description": "挂点：诊断/后续 = 触发它的问题；revalidate = 被回看问题；goal_retarget = null（新 root，goal_amend 轮专用）"
         },
-        "text": { "type": "string", "minLength": 1 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "predicate_json": { "$ref": "#/$defs/question_predicate" },
         "dep_note_md": { "type": "string", "description": "依赖声明（可读；结构化 dep 由 StateStore 落）" },
         "rationale_md": { "type": "string" }
       },
@@ -80,9 +88,35 @@
         {
           "if": { "properties": { "kind": { "const": "goal_retarget" } } },
           "then": { "properties": { "parent_question_id": { "const": null } } },
-          "else": { "required": ["parent_question_id"], "properties": { "parent_question_id": { "type": "string" } } }
+          "else": {
+            "required": ["parent_question_id"],
+            "anyOf": [
+              { "properties": { "parent_question_id": { "type": "string" } } },
+              {
+                "required": ["request_ref"],
+                "properties": { "parent_question_id": { "const": null } }
+              }
+            ]
+          }
         }
       ]
+    },
+    "question_predicate": {
+      "type": "object",
+      "description": "question 的证据关闭合同，持久化到既有 question.predicate_json；allowed_evidence 与 answer.schema.json 的四态一字一致",
+      "required": ["kind", "allowed_evidence", "answer_criterion_md", "refute_criterion_md"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "evidence_closure_v1" },
+        "allowed_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["evaluation", "literature", "child_answer", "human"] }
+        },
+        "answer_criterion_md": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "refute_criterion_md": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      }
     },
     "mark_answer_applicability": {
       "type": "object",

@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -27,6 +28,14 @@ from .ids import decode as _bounded_decode, decode_optional as _bounded_decode_o
 from .interfaces import InvalidSelectionError, Cycle, Route, Selection
 from .budgeting import compute_budget
 from .question_progress import QuestionProgressError, append_inconclusive_event
+from .question_admission import admission_payload, normalize_question_contract
+from .import_authority import (
+    authority_hash,
+    build_human_named_authority,
+    build_question_request_binding,
+    build_reference_authority,
+    canonical_bytes,
+)
 from .writedaemon import WriteDaemon
 
 _TERMINAL_Q = {"answered", "refuted", "dead_end"}
@@ -35,6 +44,9 @@ _SPAWN_SOURCE = {  # §4.2.4 spawn_question kind → question.source（对齐 DD
     "diagnosis": "agent", "followup": "agent", "revalidate": "revalidate",
     "import_reference": "agent", "goal_retarget": "goal_amend",
 }
+_REQUEST_REF_RE = re.compile(r"^db:(directive|decision):([1-9][0-9]*)$")
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_QREF_RE = re.compile(r"^q[1-9][0-9]*$")
 
 
 def _cid(n: int) -> str: return f"c{n}"
@@ -826,10 +838,15 @@ class SQLiteStateStore:
             if kind == "create_root":
                 if route != "bootstrap":
                     raise ValueError("create_root 仅限 bootstrap 轮（§4.2.4）")
+                text, contract, contract_source = normalize_question_contract(
+                    op.get("text"), op.get("predicate_json"))
                 qid = self._insert_question(
-                    conn, op["text"], None, "agent", gver, born_cycle=ci)
+                    conn, text, contract, None, "agent", gver, born_cycle=ci)
                 if op.get("local_key"):
                     local[op["local_key"]] = qid
+                self._record_question_admission(
+                    conn, cycle_id, qid, operation="create_root", text=text,
+                    contract=contract, contract_source=contract_source)
                 conn.execute("INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
                              "VALUES (?,?,'agent','create_root',?)", (_cnum(cycle_id), _qnum(qid), json.dumps({"qid": qid})))
             elif kind == "add_children":
@@ -848,14 +865,29 @@ class SQLiteStateStore:
             else:
                 raise ValueError(f"op 不在封闭词表: {kind}")
 
-    def _insert_question(self, conn, text: str, parent_qid: Optional[str], source: str, gver: int,
+    def _insert_question(self, conn, text: str, predicate_json: Dict[str, Any],
+                         parent_qid: Optional[str], source: str, gver: int,
                          status: str = "open", born_cycle: Optional[int] = None) -> str:
         cur = conn.execute(
-            "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source,born_cycle) "
-            "VALUES (?,1,?,?,?,?,?,?)",
-            (_qnum(parent_qid) if parent_qid else None, gver, gver, text, status, source,
-             born_cycle))
+            "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,predicate_json,"
+            "status,source,born_cycle) VALUES (?,1,?,?,?,?,?,?,?)",
+            (_qnum(parent_qid) if parent_qid else None, gver, gver, text,
+             json.dumps(predicate_json, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+             status, source, born_cycle))
         return _qid(cur.lastrowid)
+
+    @staticmethod
+    def _record_question_admission(
+            conn, cycle_id: str, qid: str, *, operation: str, text: str,
+            contract: Dict[str, Any], contract_source: str) -> None:
+        payload = admission_payload(
+            qid=qid, operation=operation, text=text, contract=contract,
+            contract_source=contract_source)
+        conn.execute(
+            "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+            "VALUES (?,?,'agent','question_admission',?)",
+            (_cnum(cycle_id), _qnum(qid), json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))))
 
     def _open_count(self, conn) -> int:
         return conn.execute("SELECT count(*) FROM question WHERE status IN ('open','inconclusive')").fetchone()[0]
@@ -898,11 +930,16 @@ class SQLiteStateStore:
             raise ValueError("超出 max_open_questions")
         child_qids = []
         for ch in children:                      # 同事务：写子问题 + 逐子 dep（父依赖每个子）
+            text, contract, contract_source = normalize_question_contract(
+                ch.get("text"), ch.get("predicate_json"))
             cq = self._insert_question(
-                conn, ch["text"], parent_qid, "decompose", gver,
+                conn, text, contract, parent_qid, "decompose", gver,
                 born_cycle=_cnum(cycle_id))
             local[ch["local_key"]] = cq
             child_qids.append(cq)
+            self._record_question_admission(
+                conn, cycle_id, cq, operation="add_children", text=text,
+                contract=contract, contract_source=contract_source)
             conn.execute("INSERT INTO question_dep(question_id,dep_type,depends_on_question_id,status,created_cycle) "
                          "VALUES (?,'question',?,'pending',?)", (pqi, _qnum(cq), _cnum(cycle_id)))
         conn.execute("UPDATE question SET decompose_count=decompose_count+1, status='open' WHERE id=?", (pqi,))
@@ -914,9 +951,386 @@ class SQLiteStateStore:
         conn.execute("INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) VALUES (?,?,'agent','decompose',?)",
                      (_cnum(cycle_id), _qnum(parent_qid), json.dumps({"parent": parent_qid, "children": child_qids})))
 
+    @staticmethod
+    def _strict_json_object(raw: Any, *, label: str) -> Dict[str, Any]:
+        try:
+            value = json.loads(
+                raw, parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"非有限 JSON number: {token}")))
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            raise RuntimeError(f"{label} payload 损坏") from error
+        if not isinstance(value, dict):
+            raise RuntimeError(f"{label} payload 须为 object")
+        return value
+
+    @staticmethod
+    def _request_ref(value: Any) -> tuple[str, int]:
+        if not isinstance(value, str):
+            raise ValueError("spawn_question.request_ref 须为 db:directive:<id> 或 db:decision:<id>")
+        match = _REQUEST_REF_RE.fullmatch(value)
+        if match is None:
+            raise ValueError("spawn_question.request_ref 须为 db:directive:<id> 或 db:decision:<id>")
+        return match.group(1), int(match.group(2))
+
+    @staticmethod
+    def _assert_sha256(value: Any, *, field: str) -> str:
+        if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+            raise RuntimeError(f"{field} 非 sha256")
+        return value
+
+    def _assert_request_ref_unused(
+            self, conn, *, request_ref: str,
+            directive_id: Optional[int] = None) -> None:
+        if directive_id is not None:
+            rows = conn.execute(
+                "SELECT id,question_id FROM decision WHERE actor='orchestrator' "
+                "AND type='question_request_bound' AND directive_id=? ORDER BY id",
+                (directive_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id,question_id FROM decision WHERE actor='orchestrator' "
+                "AND type='question_request_bound' AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.request_ref')=? ORDER BY id",
+                (request_ref,)).fetchall()
+        if rows:
+            raise ValueError(
+                f"spawn_question.request_ref 已被 q{rows[0][1]} 消费: {request_ref}")
+
+    def _console_spawn_request(
+            self, conn, *, cycle_id: str, directive_id: int,
+            request_ref: str, op: Dict[str, Any], gver: int) -> Dict[str, Any]:
+        ci = _cnum(cycle_id)
+        row = conn.execute(
+            "SELECT d.status,d.kind,d.hardness,d.consumed_cycle,"
+            "d.consumed_decision_id,d.source_interaction_message_id,d.payload_json,"
+            "x.cycle_id,x.question_id,x.directive_id,x.actor,x.type,x.payload_json,"
+            "m.goal_id,m.goal_ver "
+            "FROM directive d JOIN decision x ON x.id=d.consumed_decision_id "
+            "JOIN interaction_message m ON m.id=d.source_interaction_message_id "
+            "WHERE d.id=?", (directive_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"spawn_question.request_ref 不存在: {request_ref}")
+        (status, directive_kind, hardness, consumed_cycle,
+         consumed_decision_id, source_message_id, directive_raw,
+         decision_cycle, decision_question, decision_directive, decision_actor,
+         decision_type, decision_raw, message_goal_id, message_goal_ver) = row
+        if (status != "consumed" or directive_kind != "inject_question"
+                or consumed_cycle != ci or decision_cycle != ci
+                or decision_question is not None
+                or decision_directive != directive_id
+                or decision_actor != "human"
+                or decision_type != "directive_inject_question"
+                or (message_goal_id, message_goal_ver) != (1, gver)):
+            raise ValueError(
+                f"spawn_question.request_ref 未指向本轮 current-goal 已消费 inject_question: {request_ref}")
+        classified = conn.execute(
+            "SELECT intent,directive_id FROM interaction_classification "
+            "WHERE message_id=?", (source_message_id,)).fetchone()
+        if classified != ("directive", directive_id):
+            raise RuntimeError(
+                f"inject_question d{directive_id} classification provenance 损坏")
+        decision_payload = self._strict_json_object(
+            decision_raw, label=f"directive_inject_question d{directive_id}")
+        effect = decision_payload.get("effect")
+        request = (effect.get("reasoning_question_request")
+                   if isinstance(effect, dict) else None)
+        base_keys = {
+            "protocol", "request_ref", "requested_text",
+            "parent_question_id", "suggested_kind",
+            "requires_reasoning_predicate",
+        }
+        if (not isinstance(effect, dict) or not isinstance(request, dict)
+                or set(request) not in (
+                    base_keys,
+                    base_keys | {"human_named_repo", "need_summary"})
+                or effect.get("applies_to_reasoning_cycle") != cycle_id
+                or request.get("protocol") != "directive-question-request-v1"
+                or request.get("request_ref") != request_ref
+                or request.get("suggested_kind") not in (
+                    "followup", "import_reference")
+                or request.get("requires_reasoning_predicate") is not True
+                or not isinstance(request.get("requested_text"), str)
+                or not request["requested_text"].strip()
+                or (request.get("parent_question_id") is not None
+                    and (not isinstance(request["parent_question_id"], str)
+                         or _QREF_RE.fullmatch(
+                             request["parent_question_id"]) is None))
+                or (("human_named_repo" in request)
+                    != (request.get("suggested_kind") == "import_reference"))):
+            raise RuntimeError(
+                f"inject_question d{directive_id} frozen reasoning request 损坏")
+        if (op.get("kind") != request["suggested_kind"]
+                or op.get("text") != request["requested_text"]
+                or op.get("parent_question_id")
+                != request["parent_question_id"]):
+            raise ValueError(
+                "spawn_question 与 request_ref 的 exact text/parent/kind 不一致")
+        if not isinstance(op.get("predicate_json"), dict):
+            raise ValueError(
+                "request_ref 建题必须由 reasoning 显式给出 predicate_json")
+        self._assert_request_ref_unused(
+            conn, request_ref=request_ref, directive_id=directive_id)
+        directive_payload = self._strict_json_object(
+            directive_raw, label=f"inject_question directive d{directive_id}")
+        repo = request.get("human_named_repo")
+        authority_spec = None
+        if repo is not None:
+            if (hardness != "hard" or directive_payload.get("confirmed") is not True
+                    or not isinstance(repo, dict)
+                    or set(repo) != {"canonical_uri", "requested_revision"}
+                    or not isinstance(request.get("need_summary"), str)
+                    or not request["need_summary"].strip()
+                    or directive_payload.get("human_named_repo") != repo
+                    or directive_payload.get("need_summary")
+                    != request["need_summary"]):
+                raise RuntimeError(
+                    f"human_named inject_question d{directive_id} confirmation/provenance 损坏")
+            authority_spec = {
+                "directive_id": directive_id,
+                "source_message_id": source_message_id,
+                "goal_id": 1, "goal_ver": gver,
+                "canonical_uri": repo.get("canonical_uri"),
+                "requested_revision": repo.get("requested_revision"),
+                "need_summary": request["need_summary"],
+            }
+        elif request["suggested_kind"] != "followup":
+            raise RuntimeError(
+                f"ordinary inject_question d{directive_id} suggested_kind 非 followup")
+        return {
+            "source_kind": "console_directive",
+            "request_ref": request_ref,
+            "request_decision_id": consumed_decision_id,
+            "reasoning_request_hash": authority_hash(request),
+            "requested_text": request["requested_text"],
+            "parent_question_id": request["parent_question_id"],
+            "spawn_kind": request["suggested_kind"],
+            "question_source": "human",
+            "directive_id": directive_id,
+            "human_authority_spec": authority_spec,
+            "reference_authority_spec": None,
+            "dependency_origin_id": None,
+        }
+
+    def _import_trigger_spawn_request(
+            self, conn, *, cycle_id: str, decision_id: int,
+            request_ref: str, op: Dict[str, Any], gver: int) -> Dict[str, Any]:
+        ci = _cnum(cycle_id)
+        row = conn.execute(
+            "SELECT cycle_id,question_id,actor,type,payload_json FROM decision "
+            "WHERE id=?", (decision_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"spawn_question.request_ref 不存在: {request_ref}")
+        decision_cycle, origin_id, actor, decision_type, payload_raw = row
+        if (decision_cycle != ci or actor != "orchestrator"
+                or decision_type != "import_trigger_completed"
+                or origin_id is None):
+            raise ValueError(
+                f"spawn_question.request_ref 未指向本轮 import_trigger_completed: {request_ref}")
+        payload = self._strict_json_object(
+            payload_raw, label=f"import_trigger_completed d{decision_id}")
+        required = {
+            "protocol", "trigger_kind", "request", "request_hash",
+            "trigger_context_hash", "policy_hash", "runner_call_id",
+            "receipt_ref", "result_hash", "candidate_count", "skipped_count",
+            "candidate_ids", "license_review_ids", "child_question_id",
+            "source_authority_hash", "terminalized", "reference_snapshot",
+            "reasoning_question_request",
+        }
+        reasoning = payload.get("reasoning_question_request")
+        reasoning_keys = {
+            "protocol", "op", "kind", "parent_question_id",
+            "requested_text", "need_summary", "trigger_kind",
+            "survey_candidate_count", "request_hash", "result_hash",
+            "requires_reasoning_predicate",
+        }
+        external_request = payload.get("request")
+        trigger_kind = payload.get("trigger_kind")
+        if (set(payload) != required
+                or payload.get("protocol") != "import-trigger-v1"
+                or trigger_kind not in ("stuck", "sota_reference")
+                or not isinstance(external_request, dict)
+                or payload.get("request_hash")
+                != authority_hash(external_request)
+                or external_request.get("trigger_kind") != trigger_kind
+                or not isinstance(reasoning, dict)
+                or set(reasoning) != reasoning_keys
+                or reasoning.get("protocol")
+                != "import-trigger-question-request-v1"
+                or reasoning.get("op") != "spawn_question"
+                or reasoning.get("kind") != "import_reference"
+                or reasoning.get("trigger_kind") != trigger_kind
+                or reasoning.get("requires_reasoning_predicate") is not True
+                or reasoning.get("request_hash") != payload.get("request_hash")
+                or reasoning.get("result_hash") != payload.get("result_hash")
+                or reasoning.get("need_summary")
+                != external_request.get("need_summary")
+                or not isinstance(reasoning.get("requested_text"), str)
+                or not reasoning["requested_text"].strip()
+                or reasoning.get("parent_question_id") != f"q{origin_id}"
+                or isinstance(reasoning.get("survey_candidate_count"), bool)
+                or not isinstance(reasoning.get("survey_candidate_count"), int)
+                or reasoning["survey_candidate_count"] < 0
+                or (trigger_kind == "stuck"
+                    and reasoning["survey_candidate_count"] == 0)
+                or payload.get("candidate_count") != 0
+                or payload.get("candidate_ids") != []
+                or payload.get("license_review_ids") != []
+                or payload.get("child_question_id") is not None
+                or payload.get("source_authority_hash") is not None
+                or payload.get("terminalized") is not False
+                or isinstance(payload.get("skipped_count"), bool)
+                or not isinstance(payload.get("skipped_count"), int)
+                or payload["skipped_count"] < 0
+                or ((trigger_kind == "sota_reference")
+                    != isinstance(payload.get("reference_snapshot"), dict))):
+            raise RuntimeError(
+                f"import_trigger_completed d{decision_id} frozen request 损坏")
+        for field in (
+                "request_hash", "trigger_context_hash", "policy_hash",
+                "result_hash"):
+            self._assert_sha256(payload.get(field), field=f"completion.{field}")
+        if (op.get("kind") != "import_reference"
+                or op.get("text") != reasoning["requested_text"]
+                or op.get("parent_question_id")
+                != reasoning["parent_question_id"]):
+            raise ValueError(
+                "spawn_question 与 request_ref 的 exact text/parent/kind 不一致")
+        if not isinstance(op.get("predicate_json"), dict):
+            raise ValueError(
+                "request_ref 建题必须由 reasoning 显式给出 predicate_json")
+        origin = conn.execute(
+            "SELECT goal_id,goal_ver,status FROM question WHERE id=?",
+            (origin_id,)).fetchone()
+        if (origin is None or origin[:2] != (1, gver)
+                or origin[2] != "inconclusive"):
+            raise ValueError(
+                "import trigger request parent 须先按本轮证据不足收为 current-goal inconclusive")
+        runner_call_id = payload.get("runner_call_id")
+        if (isinstance(runner_call_id, bool)
+                or not isinstance(runner_call_id, int) or runner_call_id <= 0
+                or not isinstance(payload.get("receipt_ref"), str)
+                or not payload["receipt_ref"]):
+            raise RuntimeError(
+                f"import_trigger_completed d{decision_id} runner/receipt 身份损坏")
+        runner = conn.execute(
+            "SELECT cycle_id,phase,purpose,status,transcript_ref FROM runner_call "
+            "WHERE id=?", (runner_call_id,)).fetchone()
+        if runner != (
+                ci, "import_search",
+                f"import_trigger:{payload['request_hash']}", "success",
+                payload["receipt_ref"]):
+            raise RuntimeError(
+                f"import_trigger_completed d{decision_id} runner provenance 不一致")
+        self._assert_request_ref_unused(conn, request_ref=request_ref)
+        return {
+            "source_kind": "import_trigger_completed",
+            "request_ref": request_ref,
+            "request_decision_id": decision_id,
+            "reasoning_request_hash": authority_hash(reasoning),
+            "requested_text": reasoning["requested_text"],
+            "parent_question_id": reasoning["parent_question_id"],
+            "spawn_kind": "import_reference",
+            "question_source": "agent",
+            "directive_id": None,
+            "human_authority_spec": None,
+            "reference_authority_spec": {
+                "trigger_kind": trigger_kind,
+                "origin_cycle_id": ci,
+                "origin_question_id": origin_id,
+                "goal_id": 1, "goal_ver": gver,
+                "request_hash": payload["request_hash"],
+                "trigger_context_hash": payload["trigger_context_hash"],
+                "policy_hash": payload["policy_hash"],
+                "runner_call_id": runner_call_id,
+                "receipt_ref": payload["receipt_ref"],
+                "result_hash": payload["result_hash"],
+                "need_summary": reasoning["need_summary"],
+                "reference_snapshot": payload["reference_snapshot"],
+            },
+            "dependency_origin_id": origin_id,
+        }
+
+    def _spawn_request(
+            self, conn, *, cycle_id: str, op: Dict[str, Any],
+            gver: int) -> Optional[Dict[str, Any]]:
+        request_ref = op.get("request_ref")
+        if request_ref is None:
+            return None
+        domain, source_id = self._request_ref(request_ref)
+        if domain == "directive":
+            return self._console_spawn_request(
+                conn, cycle_id=cycle_id, directive_id=source_id,
+                request_ref=request_ref, op=op, gver=gver)
+        return self._import_trigger_spawn_request(
+            conn, cycle_id=cycle_id, decision_id=source_id,
+            request_ref=request_ref, op=op, gver=gver)
+
+    def _request_child_capacity(
+            self, conn, *, parent_qid: str, guard: Dict[str, Any]) -> None:
+        parent_id = _qnum(parent_qid)
+        children = conn.execute(
+            "SELECT count(*) FROM question WHERE parent_id=?",
+            (parent_id,)).fetchone()[0]
+        if children + 1 > int(guard["max_children_per_node"]):
+            raise ValueError("request_ref child 超出 max_children_per_node")
+        if self._depth_of(conn, parent_id) + 1 > int(
+                guard["max_decompose_depth"]):
+            raise ValueError("request_ref child 超出 max_decompose_depth")
+
+    def _bind_spawn_request(
+            self, conn, *, cycle_id: str, qid: str, text: str,
+            op: Dict[str, Any], request: Dict[str, Any], gver: int) -> str:
+        qi, ci = _qnum(qid), _cnum(cycle_id)
+        human_authority = None
+        reference_authority = None
+        if request["human_authority_spec"] is not None:
+            human_authority = build_human_named_authority(
+                **request["human_authority_spec"], question_id=qi)
+            source_authority_hash = human_authority["authority_hash"]
+        elif request["reference_authority_spec"] is not None:
+            reference_authority = build_reference_authority(
+                **request["reference_authority_spec"], child_question_id=qi)
+            source_authority_hash = reference_authority["authority_hash"]
+        else:
+            source_authority_hash = None
+        binding = build_question_request_binding(
+            source_kind=request["source_kind"],
+            request_ref=request["request_ref"],
+            request_decision_id=request["request_decision_id"],
+            reasoning_request_hash=request["reasoning_request_hash"],
+            question_id=qi, goal_id=1, goal_ver=gver,
+            spawn_kind=op["kind"],
+            parent_question_id=op.get("parent_question_id"),
+            requested_text=text,
+            source_authority_hash=source_authority_hash)
+        conn.execute(
+            "INSERT INTO decision(cycle_id,question_id,directive_id,actor,type,payload_json) "
+            "VALUES (?,?,?,'orchestrator','question_request_bound',?)",
+            (ci, qi, request["directive_id"],
+             canonical_bytes(binding).decode("utf-8")))
+        if human_authority is not None:
+            conn.execute(
+                "INSERT INTO decision(cycle_id,question_id,directive_id,actor,type,payload_json) "
+                "VALUES (?,?,?,'orchestrator','human_named_import_authority',?)",
+                (ci, qi, request["directive_id"],
+                 canonical_bytes(human_authority).decode("utf-8")))
+        if reference_authority is not None:
+            conn.execute(
+                "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+                "VALUES (?,?,'orchestrator','import_reference_authority',?)",
+                (ci, qi, canonical_bytes(reference_authority).decode("utf-8")))
+            origin_id = request["dependency_origin_id"]
+            conn.execute(
+                "INSERT INTO question_dep(question_id,dep_type,depends_on_question_id,status,created_cycle) "
+                "VALUES (?,'question',?,'pending',?)",
+                (origin_id, qi, ci))
+        return source_authority_hash
+
     def _spawn_question(self, conn, cycle_id, route, op, local, guard, gver) -> None:
         if self._open_count(conn) >= guard["max_open_questions"]:
             raise ValueError("超出 max_open_questions")
+        request = self._spawn_request(
+            conn, cycle_id=cycle_id, op=op, gver=gver)
         if route == "goal_amend":   # 只数 goal_amend 路由下的 spawn（对齐 InMemory；非「本轮全部 spawn」）
             cap = self.policy["goal_amend"]["max_spawn_from_goal_amend"]
             already = conn.execute(
@@ -926,12 +1340,16 @@ class SQLiteStateStore:
                 raise ValueError("超出 max_spawn_from_goal_amend（goal_amend 护栏）")
         parent = op.get("parent_question_id")
         if op["kind"] == "goal_retarget":
+            if request is not None:
+                raise ValueError("goal_retarget 不得消费 question request_ref")
             if route != "goal_amend":
                 raise ValueError("goal_retarget 仅限 goal_amend 轮（§4.2.4）")
             if parent is not None:
                 raise ValueError("goal_retarget 必须 parent=null")
-        elif parent is None:
+        elif parent is None and request is None:
             raise ValueError(f"spawn parent 不存在: {parent}")
+        elif parent is None and request["source_kind"] != "console_directive":
+            raise ValueError("只有 exact console request_ref 可派生 parent=null 问题")
         elif op["kind"] == "revalidate":
             # 回看题允许挂在旧 goal_ver 的 closed 问题下；closed 结论本身版本冻结，
             # 新版 applicability 正是通过这条跨版本边完成复核。answer↔parent 的
@@ -947,13 +1365,43 @@ class SQLiteStateStore:
                 "SELECT 1 FROM question WHERE id=? AND goal_id=1 AND goal_ver=?",
                 (_qnum(parent), gver)).fetchone() is None:
             raise ValueError(f"spawn parent 不存在: {parent}")
+        if request is not None and parent is not None:
+            self._request_child_capacity(
+                conn, parent_qid=parent, guard=guard)
+        text, contract, contract_source = normalize_question_contract(
+            op.get("text"), op.get("predicate_json"))
+        if request is not None and text != request["requested_text"]:
+            raise ValueError(
+                "request_ref.requested_text 不是 question admission 的规范 text；拒绝隐式改写")
         qid = self._insert_question(
-            conn, op["text"], parent, _SPAWN_SOURCE[op["kind"]], gver,
+            conn, text, contract, parent,
+            (request["question_source"] if request is not None
+             else _SPAWN_SOURCE[op["kind"]]), gver,
             born_cycle=_cnum(cycle_id))
         if op.get("local_key"):
             local[op["local_key"]] = qid
+        self._record_question_admission(
+            conn, cycle_id, qid, operation="spawn_question", text=text,
+            contract=contract, contract_source=contract_source)
+        source_authority_hash = None
+        if request is not None:
+            source_authority_hash = self._bind_spawn_request(
+                conn, cycle_id=cycle_id, qid=qid, text=text, op=op,
+                request=request, gver=gver)
+        spawn_payload = {"qid": qid, "kind": op["kind"]}
+        if request is not None:
+            spawn_payload.update({
+                "request_ref": op["request_ref"],
+                "source_authority_hash": source_authority_hash,
+            })
+        spawn_payload_json = (
+            json.dumps(spawn_payload)
+            if request is None else json.dumps(
+                spawn_payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")))
         conn.execute("INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
-                     "VALUES (?,?,'agent','spawn_question',?)", (_cnum(cycle_id), _qnum(qid), json.dumps({"qid": qid, "kind": op["kind"]})))
+                     "VALUES (?,?,'agent','spawn_question',?)", (
+                         _cnum(cycle_id), _qnum(qid), spawn_payload_json))
 
     def _propose_prune(self, conn, cycle_id, op, gver: int) -> None:
         qid = op["question_id"]

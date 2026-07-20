@@ -21,6 +21,8 @@ from orchestrator.writedaemon import WriteDaemon
 
 POLICY = yaml.safe_load(
     (conftest.SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+BUDGETED_POLICY = json.loads(json.dumps(POLICY))
+BUDGETED_POLICY["budget"]["session_max"] = 100000
 
 
 def _env(tmp_path):
@@ -29,7 +31,10 @@ def _env(tmp_path):
     conftest.seed_minimal(daemon.conn); daemon.conn.commit()
     receipt_dir = tmp_path / "executions"
     supervisor = ExecutionSupervisor.standalone(receipt_dir)
-    return daemon, CostLedger(daemon, POLICY), supervisor
+    # These reconciliation tests exercise the optional fail-closed accounting
+    # contract explicitly.  The shipped development policy currently disables
+    # its cumulative stop with session_max=null.
+    return daemon, CostLedger(daemon, BUDGETED_POLICY), supervisor
 
 
 def _receipt(supervisor, *, runner_call_id: int, outcome: str, returncode=None,
@@ -61,7 +66,7 @@ def _receipt(supervisor, *, runner_call_id: int, outcome: str, returncode=None,
 
 def _owner_receipt(supervisor, *, owner_kind: str, owner_id: int,
                    build_target_id: int, outcome: str, returncode=None,
-                   cycle_id="c1", suffix="10"):
+                   cycle_id="c1", suffix="10", execution_attempt=None):
     operation_id = "exec-" + suffix.rjust(32, "0")
     path = supervisor.receipt_dir / f"execution-{operation_id}.json"
     context = {
@@ -75,6 +80,8 @@ def _owner_receipt(supervisor, *, owner_kind: str, owner_id: int,
     }
     if owner_kind == "run":
         context["run_id"] = owner_id
+    if execution_attempt is not None:
+        context["execution_attempt"] = execution_attempt
     prepared = supervisor._prepared_receipt(
         operation_id=operation_id, kind="harness",
         spec_sha256="sha256:" + "b" * 64, timeout_s=10,
@@ -233,6 +240,41 @@ def test_capture_error_terminalizes_runner_with_unknown_usage_fail_closed(tmp_pa
     assert daemon.query_one(
         "SELECT json_extract(payload_json,'$.reason') FROM decision "
         "WHERE type='global_stop'") == ("cost_accounting_failed",)
+
+
+def test_operator_can_append_only_waive_owner_lost_unknown_usage(tmp_path):
+    daemon, ledger, supervisor = _env(tmp_path)
+    with daemon.transaction() as conn:
+        rc = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+            "VALUES (1,'idea','idea-n1-a1','running')").lastrowid
+    execution = _receipt(
+        supervisor, runner_call_id=rc, outcome="owner_lost")
+    write_provider_invocation_receipt(
+        receipt_dir=supervisor.receipt_dir, runner_call_id=rc,
+        cycle_id="c1", phase="idea", purpose="idea-n1-a1",
+        provider="codex-cli", model="gpt-test", effort="medium",
+        prompt_sha256="sha256:" + "e" * 64,
+        usage=CallUsage(tokens_known=False, wallclock_sec=1.25),
+        usage_source="unavailable", execution_receipt_ref=str(execution))
+    reconciler = ExecutionReconciler(daemon, ledger, supervisor.receipt_dir)
+    assert reconciler.reconcile_startup() == 1
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM runner_call WHERE id=?", (rc,)) == (
+            "failed", "cost_accounting")
+
+    result = reconciler.waive_unavailable_provider_usage(rc)
+    assert set(result) == {
+        "waiver_decision_id", "release_decision_id", "ledger_id"}
+    assert daemon.query_one(
+        "SELECT tokens_input,tokens_output,tokens_total,wallclock_sec,money "
+        "FROM ledger WHERE runner_call_id=?", (rc,)) == (0, 0, 0, 1.25, 0.0)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision s WHERE s.type='global_stop' AND NOT EXISTS ("
+        "SELECT 1 FROM decision r WHERE r.type='global_stop_release' "
+        "AND json_extract(r.payload_json,'$.global_stop_id')=s.id)") == (0,)
+    assert reconciler.reconcile_startup() == 0
+    assert reconciler.waive_unavailable_provider_usage(rc) == result
 
 
 def test_provider_receipt_execution_anchor_tamper_fails_startup(tmp_path):
@@ -408,6 +450,62 @@ def test_smoke_exit_zero_waits_for_stage_and_nonzero_cascades(tmp_path):
         "SELECT status,failure_kind FROM build_target WHERE id=3") == ("failed", "smoke")
     assert daemon2.query_one("SELECT status FROM baseline WHERE id=2")[0] == "build_failed"
     assert daemon2.query_one("SELECT status FROM variant WHERE id=2")[0] == "build_failed"
+
+
+def _request_bundle_repair(daemon, bt_id: int, round_no: int) -> None:
+    with daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (1,'orchestrator','bundle_repair_requested',?)",
+            (json.dumps({
+                "protocol": "bundle-self-heal-v1",
+                "build_target_id": bt_id,
+                "round_no": round_no,
+            }, sort_keys=True),))
+
+
+def test_repair_intent_supersedes_old_smoke_receipt_before_new_attempt(tmp_path):
+    daemon, ledger, supervisor = _env(tmp_path)
+    bt_id = _active_smoke_target(daemon)
+    _owner_receipt(
+        supervisor, owner_kind="build_target", owner_id=bt_id,
+        build_target_id=bt_id, outcome="exit", returncode=3, suffix="30")
+    _request_bundle_repair(daemon, bt_id, 1)
+
+    # The committed repair intent now owns attempt 2.  Attempt 1 remains
+    # auditable but must not fail the still-active replacement target.
+    assert ExecutionReconciler(
+        daemon, ledger, supervisor.receipt_dir).reconcile_startup() == 0
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM build_target WHERE id=?", (bt_id,)) == (
+            "building", None)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='execution_reconciled'") == (0,)
+
+
+def test_each_repair_attempt_has_independent_reconciliation_decision(tmp_path):
+    daemon, ledger, supervisor = _env(tmp_path)
+    bt_id = _active_smoke_target(daemon)
+    _owner_receipt(
+        supervisor, owner_kind="build_target", owner_id=bt_id,
+        build_target_id=bt_id, outcome="exit", returncode=0, suffix="31")
+    reconciler = ExecutionReconciler(daemon, ledger, supervisor.receipt_dir)
+    assert reconciler.reconcile_startup() == 1
+    _request_bundle_repair(daemon, bt_id, 1)
+    _owner_receipt(
+        supervisor, owner_kind="build_target", owner_id=bt_id,
+        build_target_id=bt_id, outcome="timeout", suffix="32",
+        execution_attempt=2)
+
+    assert reconciler.reconcile_startup() == 1
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM build_target WHERE id=?", (bt_id,)) == (
+            "failed", "timeout")
+    attempts = daemon.query(
+        "SELECT COALESCE(json_extract(payload_json,'$.execution_attempt'),1) "
+        "FROM decision WHERE type='execution_reconciled' "
+        "AND json_extract(payload_json,'$.db_owner_kind')='build_target' ORDER BY id")
+    assert attempts == [(1,), (2,)]
 
 
 def test_skipped_target_with_execution_receipt_fails_startup(tmp_path):

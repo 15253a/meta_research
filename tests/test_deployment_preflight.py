@@ -25,7 +25,10 @@ MACHINE_ID = "0123456789abcdef0123456789abcdef"
 BOOT_ID = "01234567-89ab-cdef-0123-456789abcdef"
 
 
-def _policy(mode="production", attestation_path=None, *, gpus=0, disk_gb=1):
+def _policy(mode="production", attestation_path=None, *, gpus=0, disk_gb=1,
+            allowed_device_indices=None, gpu_target_policy=None):
+    allowed = (list(range(gpus)) if allowed_device_indices is None
+               else list(allowed_device_indices))
     return {
         "deployment": {
             "mode": mode,
@@ -36,6 +39,9 @@ def _policy(mode="production", attestation_path=None, *, gpus=0, disk_gb=1):
         "resources": {
             "gpus": gpus, "gpu_mem_gb": 80 if gpus else 0,
             "disk_quota_gb": disk_gb,
+            "gpu_target_policy": (gpu_target_policy or (
+                "required" if gpus else "forbidden")),
+            "allowed_device_indices": allowed,
         },
     }
 
@@ -45,6 +51,7 @@ def _sandbox():
         "engine_path": "/usr/bin/docker",
         "engine_host": "unix:///run/meta-research/docker.sock",
         "resource_mode": "cgroup-v2",
+        "network_mode": "none",
         "max_output_mb": 1024,
         "max_output_files": 100,
     }
@@ -235,6 +242,86 @@ def test_development_always_writes_private_nonproduction_receipt(tmp_path):
                               separators=(",", ":")) + "\n").encode()
 
 
+def test_development_gpu_allocation_is_narrowed_by_allowed_indices(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    facts = _facts(work)
+    memory = 80 * 1024 ** 3
+    facts["gpu"] = {
+        "driver_version": "535.129.03", "error": None,
+        "inventory": [
+            {"index": index, "uuid": f"GPU-test-{index}",
+             "model": "NVIDIA A100", "memory_bytes": memory,
+             "compute_capability": "8.0"}
+            for index in range(8)
+        ],
+    }
+    preflight, _probe = _run(
+        tmp_path,
+        _policy("development", gpus=1,
+                allowed_device_indices=list(range(7))),
+        facts, owner="owner-development-allowlist")
+    candidate = preflight.prepare()
+    assert [item["uuid"] for item in candidate["gpu_contract"]["devices"]] == [
+        "GPU-test-0"]
+    assert "allowed_indices=[0, 1, 2, 3, 4, 5, 6]" in (
+        candidate["gpu_contract_detail"])
+
+    # Even when it is the only otherwise capable device, index 7 is outside
+    # this quest's frozen allocation surface and must not be silently adopted.
+    only_seven = copy.deepcopy(facts)
+    only_seven["gpu"]["inventory"] = [only_seven["gpu"]["inventory"][7]]
+    rejected, _probe = _run(
+        tmp_path,
+        _policy("development", gpus=1,
+                allowed_device_indices=list(range(7))),
+        only_seven, owner="owner-development-index-seven")
+    candidate = rejected.prepare()
+    assert candidate["gpu_contract"] is None
+    assert "selected=0 required=1" in candidate["gpu_contract_detail"]
+
+
+@pytest.mark.parametrize("indices", [[1, 0], [0, 0], [], [4096]])
+def test_gpu_allowed_indices_contract_is_canonical_and_sufficient(tmp_path, indices):
+    work = tmp_path / "work"
+    work.mkdir()
+    policy = _policy(
+        "development", gpus=1, allowed_device_indices=indices)
+    with pytest.raises(ValueError, match="allowed_device_indices|allowed index"):
+        DeploymentPreflight(
+            work, policy, _sandbox(), "owner-bad-gpu-indices",
+            probe_backend=FakeProbe(_facts(work)), clock=lambda: NOW)
+
+
+def test_production_rejects_development_only_local_environment(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    sandbox = _sandbox()
+    sandbox["local_environment"] = {
+        "enabled": True, "development_only": True,
+        "source": "/opt/host-env", "target": "/opt/local-env",
+        "python_path": "/opt/local-env/bin/python",
+        "identity_sha256": "sha256:" + "a" * 64,
+    }
+    with pytest.raises(ValueError, match="production.*local_environment"):
+        DeploymentPreflight(
+            work, _policy("production"), sandbox,
+            "owner-production-local-env",
+            probe_backend=FakeProbe(_facts(work)), clock=lambda: NOW)
+
+
+def test_production_rejects_development_bridge_network(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    sandbox = _sandbox()
+    sandbox["network_mode"] = "bridge"
+    with pytest.raises(ValueError, match="production.*network_mode"):
+        DeploymentPreflight(
+            work, _policy("production"), sandbox,
+            "owner-production-bridge",
+            probe_backend=FakeProbe(_facts(work)), clock=lambda: NOW)
+
+
 def test_prerequisite_candidate_is_deep_frozen_and_replayable(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
@@ -321,7 +408,9 @@ def test_production_rejects_core_trust_failures(tmp_path, failure):
 def test_requested_gpu_requires_guardian_canary_then_becomes_ready(tmp_path, monkeypatch):
     memory = 80 * 1024 ** 3
     value = _attestation(gpu={"GPU-test-0001": memory})
+    value["docker"]["runtimes"] = ["runc"]
     facts = _facts(tmp_path / "work")
+    facts["docker"]["daemon"]["runtimes"] = ["runc"]
     facts["gpu"]["inventory"] = [
         {"index": 0, "uuid": "GPU-test-0001", "model": "NVIDIA A100",
          "memory_bytes": memory, "compute_capability": "8.0"},
@@ -335,6 +424,11 @@ def test_requested_gpu_requires_guardian_canary_then_becomes_ready(tmp_path, mon
     candidate = preflight.prepare()
     assert [item["uuid"] for item in candidate["gpu_contract"]["devices"]] == [
         "GPU-test-0001"]
+    prerequisite_checks = {
+        item["name"]: item["ok"] for item in candidate["checks"]}
+    assert prerequisite_checks["gpu_inventory"] is True
+    assert prerequisite_checks["gpu_device_runtime"] is False
+    assert prerequisite_checks["sandbox_gpu_access"] is False
     with pytest.raises(DeploymentPreflightError, match="sandbox_gpu_access"):
         preflight.finalize(None)
 
@@ -353,6 +447,9 @@ def test_requested_gpu_requires_guardian_canary_then_becomes_ready(tmp_path, mon
     assert receipt["production_ready"] is True
     assert receipt["phase"] == "final"
     assert receipt["gpu_canary"]["contract_hash"] == candidate["gpu_contract_hash"]
+    final_checks = {item["name"]: item["ok"] for item in receipt["checks"]}
+    assert final_checks["gpu_device_runtime"] is True
+    assert final_checks["sandbox_gpu_access"] is True
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="root-owned attestation profile test")
@@ -369,7 +466,9 @@ def test_gpu_attestation_is_exact_service_allocation_not_host_inventory(tmp_path
         for index, uuid in enumerate(("GPU-a", "GPU-b", "GPU-c", "GPU-d"))
     ]
     preflight, _probe = _run(
-        tmp_path, _policy(attestation_path=path, gpus=2), facts)
+        tmp_path, _policy(
+            attestation_path=path, gpus=2,
+            allowed_device_indices=[0, 2]), facts)
     candidate = preflight.prepare()
     assert [item["uuid"] for item in candidate["gpu_contract"]["devices"]] == [
         "GPU-a", "GPU-c"]

@@ -30,6 +30,7 @@ import re
 import shutil
 import sqlite3
 import stat
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Mapping, NamedTuple, Optional
 from urllib.parse import quote
@@ -43,8 +44,12 @@ from .artifact_capability import (
     verify_open_fd,
     verify_tree_fd,
 )
-from .execution_sandbox import sandbox_workload_environment_hash
+from .execution_sandbox import (
+    normalize_python_requirements,
+    sandbox_workload_environment_hash,
+)
 from .ids import parse_positive_sqlite_int
+from .interfaces import ManagedArtifactRef
 
 # 保留文件名：manifest 本体与 identity 由本模块按固定名物化；哨兵是物化完成标志——均不得出现在 code_files
 MANIFEST_FILE = "execution_manifest.json"
@@ -61,9 +66,16 @@ _ASSET_REF_RE = re.compile(
     r"^user-file-request:r([1-9][0-9]*):item:([1-9][0-9]*):asset:([1-9][0-9]*)$")
 _ASSET_PLACEHOLDER_RE = re.compile(
     r"\{asset:(user-file-request:r[1-9][0-9]*:item:[1-9][0-9]*:asset:[1-9][0-9]*)\}")
+_LOCAL_SOURCE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_LOCAL_SOURCE_PLACEHOLDER_RE = re.compile(r"\{local_source:([0-9a-f]{32})\}")
+_CHECKPOINT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CHECKPOINT_PLACEHOLDER_RE = re.compile(
+    r"\{ckpt:([A-Za-z0-9][A-Za-z0-9._-]{0,127})\}")
+_LEGACY_CHECKPOINT_KEY = "final"
 _ASSET_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 _ASSET_AUTHORIZATION_MAX_BYTES = 1024 * 1024
 _ASSET_AUTHORIZATION_MAX_REFS = 10_000
+_LOCAL_SOURCE_MANIFEST_MAX_BYTES = 128 * 1024 * 1024
 
 # shell 启动器：argv[0] 是它们 = 把「argv 数组」偷换回「shell 字符串解释」（bash -c "…" 重开 shell 通道，
 # 绕过禁 shell 契约，codex BLOCKER）。env(1) 同拒——想设环境变量走 manifest 的 env 字段，不是 env 命令
@@ -111,6 +123,13 @@ class AssetAuthorization(NamedTuple):
     identities: Dict[str, AssetIdentity]
 
 
+class CheckpointSpec(NamedTuple):
+    """One train output identity declared by ``expected_outputs``."""
+
+    ckpt_key: str
+    path: str
+
+
 def canon_hash(obj: Any) -> str:
     """规范 JSON 哈希（与 attack_stages 同口径：compact + sort_keys + utf-8）——plan_slice_hash 的定义。"""
     return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True,
@@ -124,6 +143,10 @@ def validate_manifest(schemas, manifest: Any) -> None:
     errs = [f"{e.json_path} {e.message}" for e in v.iter_errors(manifest)]
     if errs:
         raise ManifestError("execution_manifest schema 校验失败:\n" + "\n".join(errs))
+    # JSON Schema 的 uniqueItems 只能拒绝整项重复，不能表达“对象数组中的 ckpt_key 唯一”。
+    # 在唯一 manifest 执法点补上语义唯一性与运行期同口径的路径围栏。
+    if isinstance(manifest, dict) and "expected_outputs" in manifest:
+        checkpoint_specs(manifest)
 
 
 def cross_check(manifest: Dict[str, Any], plan_slice: Dict[str, Any]) -> None:
@@ -189,6 +212,10 @@ def extract_manifest_asset_refs(manifest: Dict[str, Any]) -> List[str]:
             if "{asset:" in remainder:
                 raise ManifestError(
                     f"manifest.commands.{kind}.argv[{index}] 含非法输入资产占位符: {token!r}")
+            local_remainder = _LOCAL_SOURCE_PLACEHOLDER_RE.sub("", token)
+            if "{local_source:" in local_remainder:
+                raise ManifestError(
+                    f"manifest.commands.{kind}.argv[{index}] 含非法本机来源占位符: {token!r}")
             for match in matches:
                 ref = match.group(1)
                 _parse_canonical_asset_ref(ref)
@@ -196,6 +223,35 @@ def extract_manifest_asset_refs(manifest: Dict[str, Any]) -> List[str]:
     if len(refs) > _ASSET_AUTHORIZATION_MAX_REFS:
         raise ManifestError(f"manifest 实际输入资产引用超过上限 {_ASSET_AUTHORIZATION_MAX_REFS}")
     return sorted(refs)
+
+
+def extract_manifest_local_source_ids(manifest: Dict[str, Any]) -> List[str]:
+    """提取 ``{local_source:<source_id>}``，并拒绝任何近似/未闭合写法。
+
+    ``source_id`` 只是 Web 服务端登记能力的索引，不携带路径，也不会触发数据复制。实际根目录只在
+    :func:`resolve_command` 启动命令前由冻结的 ``input/local-sources.json`` 与执行 allowlist 共同解析。
+    """
+    commands = manifest.get("commands") if isinstance(manifest, dict) else None
+    if not isinstance(commands, dict):
+        raise ManifestError("manifest.commands 须为对象，无法提取本机来源引用")
+    if any(not isinstance(kind, str) for kind in commands):
+        raise ManifestError("manifest.commands 键须为字符串")
+    source_ids = set()
+    for kind in sorted(commands):
+        command = commands[kind]
+        argv = command.get("argv") if isinstance(command, dict) else None
+        if not isinstance(argv, list):
+            raise ManifestError(f"manifest.commands.{kind}.argv 须为数组")
+        for index, token in enumerate(argv):
+            if not isinstance(token, str):
+                raise ManifestError(f"manifest.commands.{kind}.argv[{index}] 须为字符串")
+            matches = list(_LOCAL_SOURCE_PLACEHOLDER_RE.finditer(token))
+            remainder = _LOCAL_SOURCE_PLACEHOLDER_RE.sub("", token)
+            if "{local_source:" in remainder:
+                raise ManifestError(
+                    f"manifest.commands.{kind}.argv[{index}] 含非法本机来源占位符: {token!r}")
+            source_ids.update(match.group(1) for match in matches)
+    return sorted(source_ids)
 
 
 def _validated_asset_identity(identity: AssetIdentity, *, label: str) -> AssetIdentity:
@@ -316,12 +372,16 @@ def stage_bundle_files(files: Dict[str, Any], manifest: Dict[str, Any], dest_dir
     names = list(manifest["code_files"])
     if len(set(names)) != len(names):
         raise ManifestError(f"code_files 有重复项: {names}")
-    plan: List[tuple] = []                     # (relpath, bytes) —— 先全量组装校验，再落盘（半途发现非法不留残料）
+    plan: List[tuple] = []                     # (relpath, bytes|managed-ref) —— 先全量组装校验，再落盘
     for name in names:
         _check_rel_path(name)
         if name not in files:
             raise ManifestError(f"code_files 声明的 {name!r} 不在信封 files 中——manifest 与产物不成套")
-        plan.append((name, _to_bytes(name, files[name])))
+        payload = files[name]
+        if isinstance(payload, ManagedArtifactRef):
+            plan.append((name, payload))
+        else:
+            plan.append((name, _to_bytes(name, payload)))
     plan.append((IDENTITY_FILE, idmd.encode("utf-8")))
     plan.append((MANIFEST_FILE, json.dumps(manifest, ensure_ascii=False, sort_keys=True,
                                            separators=(",", ":")).encode("utf-8")))
@@ -335,17 +395,42 @@ def stage_bundle_files(files: Dict[str, Any], manifest: Dict[str, Any], dest_dir
         if first_existing == first_existing.parent:
             raise ManifestError(f"bundle staging 找不到已存在祖先目录: {dest_dir}")
         first_existing = first_existing.parent
-    if dest_dir.exists():          # 全量校验通过后才清（半途发现非法不动现场）；目录专属物化产物，清空安全
-        shutil.rmtree(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    ledger: Dict[str, str] = {}
-    for rel, data in plan:
-        target = dest_dir / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(target.name + ".partial")
-        _write_fsync(tmp, data)
-        os.replace(tmp, target)
-        ledger[rel] = hashlib.sha256(data).hexdigest()
+    try:
+        with ExitStack() as stack:
+            managed = {
+                rel: stack.enter_context(open_artifact(
+                    payload.path, expected_hash=payload.sha256,
+                    expected_size=payload.size_bytes,
+                    label=f"managed Bundle source {rel}"))
+                for rel, payload in plan if isinstance(payload, ManagedArtifactRef)
+            }
+            if dest_dir.exists():  # 全量 ref/hash 校验通过后才清；目录专属物化产物，清空安全
+                shutil.rmtree(dest_dir)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            ledger: Dict[str, str] = {}
+            for rel, data in plan:
+                target = dest_dir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_name(target.name + ".partial")
+                if isinstance(data, ManagedArtifactRef):
+                    cap = managed[rel]
+                    with tmp.open("xb") as output:
+                        while True:
+                            chunk = os.read(cap.fd, 1024 * 1024)
+                            if not chunk:
+                                break
+                            output.write(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    ledger[rel] = cap.identity.content_hash.removeprefix("sha256:")
+                    cap.verify_unchanged()
+                    cap.verify_path_binding()
+                else:
+                    _write_fsync(tmp, data)
+                    ledger[rel] = hashlib.sha256(data).hexdigest()
+                os.replace(tmp, target)
+    except ArtifactCapabilityError as error:
+        raise ManifestError(f"托管 Bundle 文件 path+hash 校验失败: {error}") from error
 
     # 先持久化 payload 的全部 rename 与逐层目录创建。os.walk 的深度逆序保证 child 在 parent 之前；
     # 再沿 dest.parent→first_existing 刷新 mkdir(parents=True) 可能创建的 staging 祖先。
@@ -545,10 +630,10 @@ def _check_rel_path(rel: str, *, what: str = "code_files", allow_reserved: bool 
     绝对 / 反斜杠 / 空段 / . / .. 组件——保证解析到 base_dir 内、不逃逸 staging。
     allow_reserved=True 用于 ledger 键校验：ledger 合法含保留名（identity.md / execution_manifest.json），
     只须查路径安全（不拿 ../x 拼路径），不查保留名。"""
-    if not allow_reserved and rel in _RESERVED:
-        raise ManifestError(f"{what} 不得使用保留名 {rel!r}")
     if not isinstance(rel, str) or rel.startswith("/") or "\\" in rel:
         raise ManifestError(f"{what} 路径须为相对 POSIX 路径: {rel!r}")
+    if not allow_reserved and rel in _RESERVED:
+        raise ManifestError(f"{what} 不得使用保留名 {rel!r}")
     parts = rel.split("/")
     # 拒空段 / `.` / `..`（codex 第2轮 SHOULD）：`.` 段（`./x`、`pkg/./y`、裸 `.`）落盘会被 OS 归一化，
     # 与 ledger 非规范键不符→恢复误判损毁；`./identity.md` 还能绕保留名成别名。`.hidden` 等 dotfile 不受影响。
@@ -556,15 +641,74 @@ def _check_rel_path(rel: str, *, what: str = "code_files", allow_reserved: bool 
         raise ManifestError(f"{what} 路径含空段或 . / ..（非规范/逃逸 staging）: {rel!r}")
 
 
+def checkpoint_specs(manifest: Dict[str, Any]) -> List[CheckpointSpec]:
+    """把旧/新 train 输出格式规范化为有序 checkpoint specs。
+
+    旧 ``expected_outputs.checkpoint`` 继续可读，并赋稳定键 ``final``；新 bundle 使用
+    ``expected_outputs.checkpoints=[{ckpt_key,path}, ...]``。即使调用方漏过 schema 校验，本入口也拒绝
+    混用两种格式、重复/不安全 key 与逃逸 train staging 的路径。
+    """
+    if not isinstance(manifest, dict):
+        raise ManifestError("manifest 须为对象")
+    outputs = manifest.get("expected_outputs")
+    if not isinstance(outputs, dict):
+        raise ManifestError(
+            "manifest 无 expected_outputs.checkpoint(s)（build/exec 目标须声明训练产物）")
+    has_legacy = "checkpoint" in outputs
+    has_canonical = "checkpoints" in outputs
+    if has_legacy == has_canonical:
+        raise ManifestError(
+            "expected_outputs 须且只能声明 checkpoint（兼容旧格式）或 checkpoints（规范格式）之一")
+    expected_field = "checkpoint" if has_legacy else "checkpoints"
+    if set(outputs) != {expected_field}:
+        extra_fields = list(set(outputs) - {expected_field})
+        raise ManifestError(
+            f"expected_outputs 除 {expected_field} 外含额外字段: {extra_fields!r}")
+
+    if has_legacy:
+        rel = outputs["checkpoint"]
+        _check_rel_path(rel, what="expected_outputs.checkpoint")
+        return [CheckpointSpec(_LEGACY_CHECKPOINT_KEY, rel)]
+
+    raw_specs = outputs["checkpoints"]
+    if not isinstance(raw_specs, list) or not raw_specs:
+        raise ManifestError("expected_outputs.checkpoints 须为非空数组")
+    specs: List[CheckpointSpec] = []
+    seen_keys = set()
+    for index, raw in enumerate(raw_specs):
+        label = f"expected_outputs.checkpoints[{index}]"
+        if not isinstance(raw, dict) or set(raw) != {"ckpt_key", "path"}:
+            raise ManifestError(f"{label} 须且只能含 ckpt_key/path")
+        key, rel = raw["ckpt_key"], raw["path"]
+        if not isinstance(key, str) or _CHECKPOINT_KEY_RE.fullmatch(key) is None:
+            raise ManifestError(
+                f"{label}.ckpt_key 非法（仅 ASCII 字母数字及 ._-，最长 128）: {key!r}")
+        if key in seen_keys:
+            raise ManifestError(f"expected_outputs.checkpoints ckpt_key 重复: {key!r}")
+        _check_rel_path(rel, what=f"{label}.path")
+        seen_keys.add(key)
+        specs.append(CheckpointSpec(key, rel))
+    return specs
+
+
+def checkpoint_destinations(
+        manifest: Dict[str, Any], train_run_dir: Path) -> Dict[str, Path]:
+    """把每个声明的 checkpoint 解析到 train-run staging 内，按 ckpt_key 返回。"""
+    base = Path(train_run_dir)
+    return {spec.ckpt_key: base / spec.path for spec in checkpoint_specs(manifest)}
+
+
 def checkpoint_dest(manifest: Dict[str, Any], train_run_dir: Path) -> Path:
-    """expected_outputs.checkpoint 的唯一解析入口（codex BLOCKER：schema `^[^/]` 仍放行 `../x`）——
-    先过 _check_rel_path（禁 .. / 绝对 / 保留名）再解析到 train_run_dir 内，供 CP8.2 做在场性核验 +
-    {ckpt} 传参。保证 checkpoint 只能是「本次 train run 产出的 staging 内文件」。"""
-    rel = manifest.get("expected_outputs", {}).get("checkpoint")
-    if not rel:
-        raise ManifestError("manifest 无 expected_outputs.checkpoint（build/exec 目标须声明训练产物）")
-    _check_rel_path(rel, what="expected_outputs.checkpoint")
-    return Path(train_run_dir) / rel
+    """向后兼容的单 checkpoint 目的路径 API。
+
+    兼容旧格式与仅一项的规范 ``checkpoints`` 数组；多折调用方必须改用
+    :func:`checkpoint_destinations`。
+    """
+    destinations = checkpoint_destinations(manifest, train_run_dir)
+    if len(destinations) != 1:
+        raise ManifestError(
+            "manifest 声明多个 checkpoint；调用方须使用 checkpoint_destinations")
+    return next(iter(destinations.values()))
 
 
 def _read_asset_manifest(path: Path, *, request_id: int) -> Dict[str, Any]:
@@ -815,17 +959,250 @@ def _expand_asset_placeholders(
     return expanded
 
 
+def _registered_local_source_roots(
+        *, work_root: Path, policy: Mapping[str, Any]) -> Dict[str, str]:
+    """读取 Web 发布的冻结清单，返回 ``source_id -> exact source_root``。
+
+    这里不会遍历或复制数据目录。清单必须仍是服务端发布时的 canonical、owner-only 常规文件；目录根
+    仍须保持发布时的 inode/owner/mode 身份，并且 **exact root** 必须已由启动装配加入
+    ``execution.path_allowlist``。因此模型只能选择已有能力，不能借占位符新增宿主路径权限。
+    """
+    work = Path(os.path.abspath(os.fspath(work_root)))
+    manifest_path = work / "input" / "local-sources.json"
+    try:
+        work_info = os.lstat(work)
+        info = os.lstat(manifest_path)
+    except OSError as error:
+        raise ManifestError("本机来源占位符需要 Web 已发布的 input/local-sources.json") from error
+    if (not stat.S_ISDIR(work_info.st_mode) or stat.S_ISLNK(work_info.st_mode)
+            or not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1 or info.st_uid != work_info.st_uid
+            or stat.S_IMODE(info.st_mode) != 0o400
+            or not 2 <= info.st_size <= _LOCAL_SOURCE_MANIFEST_MAX_BYTES):
+        raise ManifestError("Web 本机来源清单 owner/type/link/mode/size 非法")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(manifest_path, flags)
+    except OSError as error:
+        raise ManifestError("Web 本机来源清单不可安全打开") from error
+    try:
+        before = os.fstat(fd)
+        chunks: List[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ManifestError("Web 本机来源清单读取被截断")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(fd)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+            value.st_uid, value.st_gid, value.st_size, value.st_mtime_ns,
+            value.st_ctime_ns)
+        if identity(before) != identity(after):
+            raise ManifestError("Web 本机来源清单读取期间身份漂移")
+    finally:
+        os.close(fd)
+
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ManifestError("Web 本机来源清单含重复 key")
+            value[key] = item
+        return value
+
+    try:
+        manifest = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=unique,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ManifestError(f"Web 本机来源清单含非有限数: {token}")))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ManifestError("Web 本机来源清单不是严格 UTF-8 JSON") from error
+    try:
+        canonical = (json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise ManifestError("Web 本机来源清单不能规范化") from error
+    if raw != canonical or not isinstance(manifest, dict):
+        raise ManifestError("Web 本机来源清单不是 canonical JSON object")
+    if (set(manifest) != {
+            "version", "draft_id", "status", "generated_at", "file_count",
+            "total_bytes", "sources"}
+            or type(manifest.get("version")) is not int or manifest["version"] != 1
+            or manifest.get("status") != "verified"
+            or not isinstance(manifest.get("sources"), list)):
+        raise ManifestError("Web 本机来源清单字段闭包非法")
+
+    execution = policy.get("execution") if isinstance(policy, Mapping) else None
+    raw_allowlist = execution.get("path_allowlist") if isinstance(execution, Mapping) else None
+    if not isinstance(raw_allowlist, list):
+        raise ManifestError("policy.execution.path_allowlist 非法")
+    allowlist = set()
+    for raw_path in raw_allowlist:
+        if (not isinstance(raw_path, str) or not os.path.isabs(raw_path)
+                or os.path.normpath(raw_path) != raw_path):
+            raise ManifestError("policy.execution.path_allowlist 须为规范绝对路径数组")
+        allowlist.add(raw_path)
+
+    roots: Dict[str, str] = {}
+    seen_roots = set()
+    work_abs = str(work)
+    source_fields = {
+        "source_id", "label", "kind", "status", "source_type",
+        "source_path", "source_root", "root_identity", "file_count",
+        "total_bytes", "files",
+    }
+    for source in manifest["sources"]:
+        if (not isinstance(source, dict) or set(source) != source_fields
+                or not isinstance(source.get("source_id"), str)
+                or _LOCAL_SOURCE_ID_RE.fullmatch(source["source_id"]) is None
+                or source.get("kind") not in {"dataset", "references"}
+                or source.get("status") != "verified"
+                or source.get("source_type") != "directory"):
+            raise ManifestError("Web 本机来源 source 字段闭包/类型非法")
+        source_id = source["source_id"]
+        root = source.get("source_root")
+        if (source_id in roots or not isinstance(root, str)
+                or not os.path.isabs(root) or os.path.normpath(root) != root
+                or os.path.realpath(root) != root or source.get("source_path") != root):
+            raise ManifestError("Web 本机来源 ID/root 非唯一规范绝对目录")
+        try:
+            common = os.path.commonpath((root, work_abs))
+        except ValueError as error:
+            raise ManifestError("Web 本机来源与 work_root 不在同一路径域") from error
+        if common in {root, work_abs}:
+            raise ManifestError("Web 本机来源不得包含 work_root 或位于其内部")
+        try:
+            root_info = os.lstat(root)
+        except OSError as error:
+            raise ManifestError(f"Web 本机来源根不可读: {source_id}") from error
+        expected = source.get("root_identity")
+        if (not isinstance(expected, dict)
+                or not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode)
+                or expected.get("device") != root_info.st_dev
+                or expected.get("inode") != root_info.st_ino
+                or expected.get("mode") != stat.S_IMODE(root_info.st_mode)
+                or expected.get("uid") != root_info.st_uid
+                or expected.get("gid") != root_info.st_gid):
+            raise ManifestError(f"Web 本机来源根身份自发布后漂移: {source_id}")
+        for existing in seen_roots:
+            if os.path.commonpath((existing, root)) in {existing, root}:
+                raise ManifestError("Web 本机来源根不得重复或互相嵌套")
+        if root not in allowlist:
+            raise ManifestError(
+                f"Web 本机来源根未被 execution.path_allowlist exact 授权: {source_id}")
+        seen_roots.add(root)
+        roots[source_id] = root
+    return roots
+
+
+def _expand_local_source_placeholders(token: str, *, roots: Mapping[str, str]) -> str:
+    def replace(match: re.Match) -> str:
+        source_id = match.group(1)
+        try:
+            return roots[source_id]
+        except KeyError as error:
+            raise ManifestError(f"本机来源 source_id 未在 Web 冻结清单登记: {source_id}") from error
+
+    expanded = _LOCAL_SOURCE_PLACEHOLDER_RE.sub(replace, token)
+    if "{local_source:" in expanded:
+        raise ManifestError(f"argv 含非法/未闭合本机来源占位符: {token!r}")
+    return expanded
+
+
+def _checkpoint_capability_inputs(
+        *, ckpt_path: Optional[Path], ckpt_content_hash: Optional[str],
+        checkpoint_paths: Optional[Mapping[str, Path]],
+        checkpoint_content_hashes: Optional[Mapping[str, str]],
+) -> Dict[str, tuple[Path, str]]:
+    """把旧标量参数与规范 path/hash mappings 归一为逐 key capability 输入。"""
+    legacy_supplied = ckpt_path is not None or ckpt_content_hash is not None
+    mappings_supplied = (
+        checkpoint_paths is not None or checkpoint_content_hashes is not None)
+    if legacy_supplied and mappings_supplied:
+        raise ManifestError(
+            "checkpoint capability 不得混用旧 ckpt_path/hash 与新 checkpoint path/hash 映射")
+    if legacy_supplied:
+        if ckpt_path is None or ckpt_content_hash is None:
+            raise ManifestError("checkpoint capability 须同时提供 path 与 content_hash")
+        return {_LEGACY_CHECKPOINT_KEY: (ckpt_path, ckpt_content_hash)}
+    if not mappings_supplied:
+        return {}
+    if checkpoint_paths is None or checkpoint_content_hashes is None:
+        raise ManifestError(
+            "checkpoint capability 映射须同时提供 checkpoint_paths 与 checkpoint_content_hashes")
+    if (not isinstance(checkpoint_paths, Mapping)
+            or not isinstance(checkpoint_content_hashes, Mapping)):
+        raise ManifestError("checkpoint path/hash 映射须为 mapping")
+    paths = dict(checkpoint_paths)
+    hashes = dict(checkpoint_content_hashes)
+    if set(paths) != set(hashes):
+        raise ManifestError("checkpoint path/hash 映射的 ckpt_key 集合不一致")
+    result: Dict[str, tuple[Path, str]] = {}
+    for key in paths:
+        if not isinstance(key, str) or _CHECKPOINT_KEY_RE.fullmatch(key) is None:
+            raise ManifestError(f"checkpoint capability ckpt_key 非法: {key!r}")
+        result[key] = (paths[key], hashes[key])
+    return result
+
+
+def _expand_checkpoint_placeholders(
+        token: str, *, kind: str, index: int,
+        checkpoint_proc_paths: Mapping[str, str]) -> str:
+    """展开单一/具名 checkpoint 占位符，并拒绝所有近似写法。"""
+    named = list(_CHECKPOINT_PLACEHOLDER_RE.finditer(token))
+    has_singular = "{ckpt}" in token
+    remainder = _CHECKPOINT_PLACEHOLDER_RE.sub("", token).replace("{ckpt}", "")
+    if "{ckpt" in remainder:
+        raise ManifestError(
+            f"{kind} argv[{index}] 含非法 checkpoint 占位符: {token!r}")
+    if not named and not has_singular:
+        return token
+    if kind != "eval":
+        raise ManifestError(
+            f"checkpoint 占位符只允许出现在 eval 命令（{kind} argv[{index}]={token!r}）"
+            "——checkpoint 由 train 产出")
+    if index == 0:
+        raise ManifestError("checkpoint 占位符不得作为 argv[0] 可执行程序")
+    if has_singular:
+        if len(checkpoint_proc_paths) != 1:
+            raise ManifestError(
+                f"eval argv[{index}] 使用 {{ckpt}} 时调用方须恰好提供一个 checkpoint；"
+                f"实收 {len(checkpoint_proc_paths)}")
+        token = token.replace("{ckpt}", next(iter(checkpoint_proc_paths.values())))
+
+    def replace_named(match: re.Match) -> str:
+        key = match.group(1)
+        try:
+            return checkpoint_proc_paths[key]
+        except KeyError as error:
+            raise ManifestError(
+                f"eval argv[{index}] 引用 checkpoint {key!r}，但调用方未提供该 path+hash capability") from error
+
+    return _CHECKPOINT_PLACEHOLDER_RE.sub(replace_named, token)
+
+
 # ---------------------------------------------------------------- 命令解析 / 围栏 --
 def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_root: Path,
                     policy: Dict[str, Any], ckpt_path: Optional[Path] = None,
                     ckpt_content_hash: Optional[str] = None,
+                    checkpoint_paths: Optional[Mapping[str, Path]] = None,
+                    checkpoint_content_hashes: Optional[Mapping[str, str]] = None,
                     expected_source_hashes: Optional[Mapping[str, str]] = None,
                     allowed_asset_refs: Optional[Collection[str]] = None,
                     expected_asset_identities: Optional[Mapping[str, AssetIdentity]] = None) -> ResolvedCommand:
-    """取 manifest.commands[kind]，做占位符替换（{src}=代码物化目录；{ckpt}=训练产 checkpoint，仅
-    eval 命令可用；{asset:ref}=当前 ContextPack 明确授权的用户资产）+ 围栏（见模块注释），返回可直接交
-    harness 的 ResolvedCommand。生产调用同时传入生成时 ``expected_asset_identities``，同 ref 重写
-    会在启动前被拒绝。含资产时调用方必须把 ``pass_fds`` 传给子进程并最终关闭。"""
+    """取 manifest.commands[kind]，解析受控占位符并执行命令围栏。
+
+    ``checkpoint_paths`` 与 ``checkpoint_content_hashes`` 以相同 ckpt_key 集合逐项提供能力；每项都在
+    argv 展开前通过 ``open_artifact`` 校验并只以 ``/proc/self/fd`` 交给子进程。旧单项
+    ``ckpt_path``/``ckpt_content_hash`` 参数继续兼容。
+    ``{asset:ref}`` 是 ContextPack 单文件能力；``{local_source:source_id}`` 是 Web 已登记本机目录能力，
+    只解析到服务端冻结且已只读 allowlist 的 exact root，不接受任意路径，也不复制目录内容。
+    """
     cmd = manifest.get("commands", {}).get(kind)
     if cmd is None:
         raise ManifestError(f"manifest 无 commands.{kind}（目标 kind 与命令集不成套）")
@@ -834,6 +1211,14 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
     fd_expectations: List[tuple[int, str, int, Optional[int], Optional[int]]] = []
     tree_expectations: List[tuple[int, Dict[str, str], tuple[str, ...]]] = []
     try:
+        local_source_ids = extract_manifest_local_source_ids(manifest)
+        local_source_roots = (
+            _registered_local_source_roots(work_root=Path(work_root), policy=policy)
+            if local_source_ids else {})
+        missing_local_sources = sorted(set(local_source_ids) - set(local_source_roots))
+        if missing_local_sources:
+            raise ManifestError(
+                f"manifest 引用未在 Web 冻结清单登记的本机来源: {missing_local_sources}")
         if expected_source_hashes is not None:
             source_hashes = dict(expected_source_hashes)
             if not source_hashes:
@@ -850,18 +1235,20 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
             src = f"/proc/self/fd/{source_fd}"
         else:
             src = str(Path(src_dir).resolve())
-        if (ckpt_path is None) != (ckpt_content_hash is None):
-            raise ManifestError(
-                "checkpoint capability 须同时提供 path 与 content_hash")
-        ck = None
-        if ckpt_path is not None:
+        checkpoint_inputs = _checkpoint_capability_inputs(
+            ckpt_path=ckpt_path, ckpt_content_hash=ckpt_content_hash,
+            checkpoint_paths=checkpoint_paths,
+            checkpoint_content_hashes=checkpoint_content_hashes)
+        checkpoint_proc_paths: Dict[str, str] = {}
+        for checkpoint_key in sorted(checkpoint_inputs):
+            checkpoint_path, checkpoint_hash = checkpoint_inputs[checkpoint_key]
             try:
                 capability = open_artifact(
-                    ckpt_path, expected_hash=ckpt_content_hash,
-                    label="checkpoint capability")
+                    checkpoint_path, expected_hash=checkpoint_hash,
+                    label=f"checkpoint capability {checkpoint_key!r}")
             except ArtifactCapabilityError as error:
                 raise ManifestError(str(error)) from error
-            ck = capability.proc_path
+            checkpoint_proc_paths[checkpoint_key] = capability.proc_path
             identity = capability.identity
             fd = capability.detach()
             opened_fds.append(fd)
@@ -869,19 +1256,18 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
                 fd, identity.content_hash, identity.size_bytes,
                 identity.device, identity.inode))
         for i, token in enumerate(cmd["argv"]):
-            if i == 0 and "{asset:" in token:
-                raise ManifestError("输入资产占位符不得作为 argv[0] 可执行程序")
-            if "{ckpt}" in token:
-                if kind != "eval":
-                    raise ManifestError(f"{{ckpt}} 只允许出现在 eval 命令（{kind} argv[{i}]={token!r}）——checkpoint 由 train 产出")
-                if ck is None:
-                    raise ManifestError(f"eval argv 用了 {{ckpt}} 但调用方未提供 checkpoint 路径（argv[{i}]={token!r}）")
-                token = token.replace("{ckpt}", ck)
+            if i == 0 and ("{asset:" in token or "{local_source:" in token):
+                raise ManifestError("输入资产/本机来源占位符不得作为 argv[0] 可执行程序")
+            token = _expand_checkpoint_placeholders(
+                token, kind=kind, index=i,
+                checkpoint_proc_paths=checkpoint_proc_paths)
             token = token.replace("{src}", src)
             token = _expand_asset_placeholders(
                 token, work_root=Path(work_root), allowed_asset_refs=allowed_asset_refs,
                 expected_asset_identities=expected_asset_identities,
                 opened_fds=opened_fds, fd_expectations=fd_expectations)
+            token = _expand_local_source_placeholders(
+                token, roots=local_source_roots)
             argv.append(token)
         _check_no_shell(argv)                       # argv[0] 禁 shell 启动器（codex BLOCKER：先于路径豁免）
         allow = [str(Path(work_root).resolve())] + [
@@ -893,8 +1279,6 @@ def resolve_command(manifest: Dict[str, Any], kind: str, *, src_dir: Path, work_
         allowed_fd_paths = {f"/proc/self/fd/{fd}" for fd in opened_fds}
         allow.extend(
             f"/proc/self/fd/{fd}" for fd, _hashes, _extra in tree_expectations)
-        if ck is not None:
-            allowed_fd_paths.add(os.path.normpath(ck))
         for i, token in enumerate(argv[1:], start=1):  # argv[0]=程序名豁免（解释器/工具允许绝对系统路径）
             _check_argv_token(token, allow, where=f"argv[{i}]", allowed_exact=allowed_fd_paths)
         env = dict(manifest.get("env", {}))
@@ -947,17 +1331,30 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
                          src_dir: Path, work_root: Path, policy: Dict[str, Any],
                          ckpt_path: Optional[Path] = None,
                          ckpt_content_hash: Optional[str] = None,
+                         checkpoint_paths: Optional[Mapping[str, Path]] = None,
+                         checkpoint_content_hashes: Optional[Mapping[str, str]] = None,
                          expected_source_hashes: Optional[Mapping[str, str]] = None,
                          allowed_asset_refs: Optional[Collection[str]] = None,
                          expected_asset_identities: Optional[Mapping[str, AssetIdentity]] = None,
                          execution_supervisor=None,
                          execution_context: Optional[Dict[str, Any]] = None,
-                         execution_sandbox=None) -> Dict[str, Any]:
+                         execution_sandbox=None,
+                         progress_observer=None,
+                         progress_interval_s: float = 5.0) -> Dict[str, Any]:
     """解析+围栏后委托 harness.run_staged（cwd=staging_dir、.partial→原子改名、.exit 侧车——纪律全继承）。
     返回 run_staged 结果 {exit_code, log_path, log_sha256, log_bytes}；log 入账仍归调用方。"""
     gpu_required = manifest.get("gpu_required", False)
     if (gpu_required is not False and gpu_required is not True):
         raise ManifestError("manifest.gpu_required 须为 bool")
+    try:
+        python_requirements = normalize_python_requirements(
+            manifest.get("python_requirements", ()))
+    except ValueError as error:
+        raise ManifestError(str(error)) from error
+    if python_requirements and execution_sandbox is None:
+        raise ManifestError(
+            "python_requirements 只能经正式 execution sandbox 安装；"
+            "禁止直接修改宿主 Python 环境")
     if (execution_sandbox is not None
             and manifest.get("env_hash") != sandbox_workload_environment_hash(
                 execution_sandbox.environment_hash, gpu_required)):
@@ -973,6 +1370,8 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
             "manifest 要求 GPU，但启动 canary 未证明 fixed sandbox allocation")
     rc = resolve_command(manifest, kind, src_dir=src_dir, work_root=work_root, policy=policy,
                          ckpt_path=ckpt_path, ckpt_content_hash=ckpt_content_hash,
+                         checkpoint_paths=checkpoint_paths,
+                         checkpoint_content_hashes=checkpoint_content_hashes,
                          expected_source_hashes=expected_source_hashes,
                          allowed_asset_refs=allowed_asset_refs,
                          expected_asset_identities=expected_asset_identities)
@@ -994,17 +1393,26 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
                 tree_expectations=rc.tree_expectations,
                 execution_context=sandbox_context,
                 execution_supervisor=execution_supervisor,
-                gpu_required=gpu_required)
+                gpu_required=gpu_required,
+                python_requirements=python_requirements)
             run_argv = sandbox_invocation.argv
             run_env = sandbox_invocation.env
             run_pass_fds = sandbox_invocation.pass_fds
-        result = H.run_staged(
-            run_argv, staging_dir=staging_dir, log_name=log_name,
-            timeout_s=rc.timeout_s, env=run_env, pass_fds=run_pass_fds,
-            execution_supervisor=execution_supervisor,
-            execution_kind=f"manifest-{kind}",
-            execution_context=execution_context,
-            sandbox_invocation=sandbox_invocation)
+        staged_kwargs = {
+            "staging_dir": staging_dir, "log_name": log_name,
+            "timeout_s": rc.timeout_s, "env": run_env,
+            "pass_fds": run_pass_fds,
+            "execution_supervisor": execution_supervisor,
+            "execution_kind": f"manifest-{kind}",
+            "execution_context": execution_context,
+            "sandbox_invocation": sandbox_invocation,
+        }
+        if progress_observer is not None:
+            staged_kwargs.update({
+                "progress_observer": progress_observer,
+                "progress_interval_s": progress_interval_s,
+            })
+        result = H.run_staged(run_argv, **staged_kwargs)
         try:
             for fd, content_hash, size, device, inode in rc.fd_expectations:
                 verify_open_fd(

@@ -110,6 +110,125 @@ def test_close_with_evaluation_evidence(gate_env):
     assert row == ("evaluation", 1, 1)
 
 
+def test_close_enforces_question_evidence_closure_contract(gate_env):
+    gate, daemon = gate_env
+    contract = {
+        "kind": "evidence_closure_v1",
+        "allowed_evidence": ["literature"],
+        "answer_criterion_md": "文献证据支持命题。",
+        "refute_criterion_md": "文献证据否定命题。",
+    }
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE question SET predicate_json=? WHERE id=2",
+            (json.dumps(contract, ensure_ascii=False),))
+
+    assert "closure contract" in _reject(
+        gate, question_id="q2", verdict="answered",
+        evidence=[{"kind": "evaluation", "metric_result_id": "mr1"}])
+    aid = gate.gate_close_question(
+        cycle_id="c1", question_id="q2", verdict="answered",
+        evidence=[{"kind": "literature", "citation_md": "systematic-review"}],
+        answer_md="文献结论")
+    assert aid.startswith("a")
+
+
+def test_close_fails_closed_on_corrupt_question_contract(gate_env):
+    gate, daemon = gate_env
+    with daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE question SET predicate_json=? WHERE id=2",
+            (json.dumps({
+                "kind": "evidence_closure_v1",
+                "allowed_evidence": ["literature"],
+                "answer_criterion_md": "",
+                "refute_criterion_md": "有否定证据。",
+            }, ensure_ascii=False),))
+    assert "criterion" in _reject(
+        gate, question_id="q2", verdict="answered",
+        evidence=[{"kind": "literature", "citation_md": "review"}])
+
+
+def _predicate_gate(tmp_path, *, op, value):
+    predicate = {
+        "kind": "metric_comparison", "protocol": "proto", "protocol_ver": 1,
+        "metric_id": "acc", "metric_ver": 1, "scope": "aggregate",
+        "success": {"op": op, "value": value},
+    }
+    path = str(tmp_path / f"predicate-{op.replace('>', 'gt').replace('=', 'eq')}.sqlite")
+    seed = db.connect(path)
+    seed.execute(
+        "INSERT INTO goal(id,version,text,predicate_json) VALUES (1,1,'g',?)",
+        (json.dumps(predicate),))
+    seed.executescript("""
+    INSERT INTO cycle(id,goal_id,goal_ver,status,policy_version) VALUES (1,1,1,'reasoning','v0');
+    INSERT INTO question(id,goal_id,goal_ver,born_goal_ver,text,status,source,active_cycle)
+      VALUES (1,1,1,1,'root','active','agent',1);
+    UPDATE cycle SET active_question_id=1 WHERE id=1;
+    INSERT INTO baseline(id,slug,canonical_key,status) VALUES (1,'b','bk','planned');
+    INSERT INTO variant(id,baseline_id,variant_key,config_json,status) VALUES (1,1,'v','{}','planned');
+    INSERT INTO protocol(id,version,name,scope_spec_json) VALUES (1,1,'proto','{}');
+    INSERT INTO metric_def(id,version,name,direction) VALUES (1,1,'acc','higher');
+    INSERT INTO protocol_metric(protocol_id,protocol_ver,metric_id,metric_ver) VALUES (1,1,1,1);
+    INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,variant_id,
+                             eval_action,eval_key,evaluation_source)
+      VALUES (1,1,1,'eval',1,'complete',1,'create_evaluation','e1','factory');
+    INSERT INTO evaluation(id,variant_id,protocol_id,protocol_ver,eval_key,source,status,
+                           created_cycle,build_target_id,target_set_hash)
+      VALUES (1,1,1,1,'e1','factory','created',1,1,'h');
+    INSERT INTO evaluation_attempt(id,evaluation_id,cycle_id,build_target_id,attempt_no,purpose,status)
+      VALUES (1,1,1,1,1,'factory','success');
+    INSERT INTO metric_result(id,evaluation_id,evaluation_attempt_id,metric_id,metric_ver,value,scope)
+      VALUES (1,1,1,1,1,0.9,'aggregate');
+    UPDATE evaluation SET status='success',canonical_attempt_id=1 WHERE id=1;
+    """)
+    seed.commit(); seed.close()
+    daemon = WriteDaemon(db.connect(path))
+    gate = SqliteGate(
+        daemon, open_gate_read_conn(path), SchemaSet(SYSTEM_ROOT / "schemas"))
+    return gate, daemon
+
+
+def test_root_answer_must_satisfy_metric_comparison_goal_predicate(tmp_path):
+    gate, daemon = _predicate_gate(tmp_path, op=">=", value=0.9)
+    aid = gate.gate_close_question(
+        cycle_id="c1", question_id="q1", verdict="answered",
+        evidence=[{"kind": "evaluation", "metric_result_id": "mr1"}],
+        answer_md="predicate is measured")
+    assert aid.startswith("a")
+
+
+def test_root_answer_rejects_metric_below_goal_predicate(tmp_path):
+    gate, daemon = _predicate_gate(tmp_path, op=">", value=0.9)
+    with pytest.raises(GateReject, match="metric_comparison"):
+        gate.gate_close_question(
+            cycle_id="c1", question_id="q1", verdict="answered",
+            evidence=[{"kind": "evaluation", "metric_result_id": "mr1"}],
+            answer_md="must not round 0.9 upward")
+    assert daemon.query_one("SELECT status FROM question WHERE id=1")[0] == "active"
+
+
+def test_root_metric_predicate_follows_valid_child_answer_evidence(tmp_path):
+    gate, daemon = _predicate_gate(tmp_path, op=">=", value=0.9)
+    with daemon.transaction() as conn:
+        conn.execute(
+            "INSERT INTO question(id,parent_id,goal_id,goal_ver,born_goal_ver,text,status,source) "
+            "VALUES (2,1,1,1,1,'child','active','decompose')")
+        conn.execute(
+            "INSERT INTO answer(id,question_id,goal_id,goal_ver,cycle_id,verdict,answer_md) "
+            "VALUES (1,2,1,1,1,'answered','child measured answer')")
+        conn.execute(
+            "INSERT INTO evidence(answer_id,question_id,goal_id,goal_ver,kind,evaluation_id,"
+            "evaluation_attempt_id,metric_result_id,metric_id,metric_ver,scope,claim_md,valid) "
+            "VALUES (1,2,1,1,'evaluation',1,1,1,1,1,'aggregate','measured',1)")
+        conn.execute("UPDATE question SET status='answered' WHERE id=2")
+    aid = gate.gate_close_question(
+        cycle_id="c1", question_id="q1", verdict="answered",
+        evidence=[{"kind": "child_answer", "child_question_id": "q2"}],
+        answer_md="aggregate direct child")
+    assert aid == "a2"
+
+
 def test_close_with_literature_and_human_evidence(gate_env):
     gate, daemon = gate_env
     aid = gate.gate_close_question(cycle_id="c1", question_id="q2", verdict="answered",

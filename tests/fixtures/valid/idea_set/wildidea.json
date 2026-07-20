@@ -15,7 +15,7 @@
       "assumptions": ["边界样本误分类具有时间局部性", "重加权不破坏收敛"],
       "min_falsifiable_experiment": "同一划分下对照均匀权重训练；若加权组 aggregate accuracy 不高于对照 ≥0.02 则证伪",
       "novelty_type": "训练目标",
-      "novelty_status": "联网粗查已启用·文献级待人工验证",
+      "novelty_status": "联网查重未启用·文献级待验证",
       "wildidea_extra": {
         "source_isof": "输入=局部信息素浓度；状态=路径上浓度分布；输出=转移概率；反馈=成功路径追加信息素、全场按速率挥发",
         "source_prototype": "P01 带挥发的正反馈富集回路（冻结时不含分类任务词）",
@@ -33,31 +33,22 @@
         "structural_depth": 6,
         "domain_distance": 8,
         "applicability": 6,
-        "novelty": 5,
+        "novelty": 8,
         "unexpectedness": 6,
         "non_obviousness": 5
       },
       "decision": "pass",
-      "rationale": "SD 过线（≥6）；机制迁移完整、退化物已识别，最近邻差异明确",
-      "ref": "novelty_refs[0]"
+      "rationale": "research 门槛过线；机制迁移完整、退化物已识别，最近邻差异明确"
     }
   ],
   "selected_id": "w1",
-  "novelty_refs": [
-    {
-      "query": "decayed sample reweighting curriculum classification",
-      "provider": "lit-search-stub",
-      "result_content_hashes": ["sha256:1111111111111111111111111111111111111111111111111111111111111111"],
-      "ranking": ["r1"],
-      "policy_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
-    }
-  ],
+  "novelty_refs": [],
   "provenance": {
-    "engine_version": "wildidea-vendored-0",
-    "adapter_version": "m0-skeleton",
+    "engine_version": "wildidea@6ff66ada15b0047b2e03d229f2e9543c542df598",
+    "adapter_version": "meta-research-wildidea-adapter-v1",
     "prompt_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "judge_prompt_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-    "model": "gpt-5.5",
+    "model": "gpt-5.6",
     "sampling": { "seed": 7, "temperature": 1.0 }
   }
 }

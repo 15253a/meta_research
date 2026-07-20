@@ -1,0 +1,11 @@
+{
+  "ops": [
+    {
+      "op": "spawn_question",
+      "request_ref": "decision:7",
+      "kind": "import_reference",
+      "parent_question_id": "q1",
+      "text": "冻结参照是否达到预注册标准？"
+    }
+  ]
+}

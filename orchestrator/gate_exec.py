@@ -37,9 +37,16 @@ _ATTEMPT_PURPOSES = ("factory", "retry", "metric_append", "repro_eval", "standal
 
 
 class ExecGate:
-    def __init__(self, daemon: WriteDaemon, read_conn: sqlite3.Connection):
+    def __init__(self, daemon: WriteDaemon, read_conn: sqlite3.Connection, *,
+                 require_code_review: bool = True,
+                 require_result_review: bool = True):
+        if type(require_code_review) is not bool or type(require_result_review) is not bool:
+            raise TypeError("review gate 策略必须是显式 bool")
         self.daemon = daemon        # 写路径（无 authorizer）
         self.read = read_conn       # 判据读路径（authorizer 拒 9 表）
+        # 评审是可选的模型策略；生命周期、运行、指标、证据和 DB 约束不受此开关影响。
+        self.require_code_review = require_code_review
+        self.require_result_review = require_result_review
 
     # -- 基础设施 ---------------------------------------------------------------
     def _q1(self, sql: str, params=()):
@@ -168,8 +175,8 @@ class ExecGate:
 
     def gate_progress_build_target(self, *, build_target_id: int, to: str,
                                    current_subject_hash: Optional[str] = None) -> None:
-        """building→smoke→running。to='running' 须通过 bundle_code_review（subject_hash 当下重算相符 +
-        runner_call(success/audit)，§4.1.4 附注）——current_subject_hash 由编排器重算后传入。"""
+        """building→smoke→running。启用代码评审时，to='running' 须通过 bundle_code_review
+        （subject_hash 当下重算相符 + runner_call(success/audit)，§4.1.4 附注）；关闭时仍不得跳过 smoke。"""
         bt = self._bt(build_target_id)
         if bt is None:
             self._reject(None, f"build_target 不存在: {build_target_id}", attempted_target=build_target_id)
@@ -178,7 +185,7 @@ class ExecGate:
         legal = {("building", "smoke"), ("smoke", "running")}
         if (status, to) not in legal:
             self._reject(ci, f"build_target 非法迁移 {status}→{to}（只许 building→smoke→running）")
-        if to == "running":
+        if to == "running" and self.require_code_review:
             if current_subject_hash is None or not self.review_passed(
                     build_target_id=build_target_id, review_kind="bundle_code_review",
                     current_subject_hash=current_subject_hash):

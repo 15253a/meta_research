@@ -11,6 +11,7 @@
       "seq": 1,
       "critical": true,
       "budget_estimate": 2.0,
+      "gpu_required": false,
       "spec_md": "构建逻辑回归基线（新 baseline）：合成双高斯数据生成 + 训练脚本 + 出厂评估",
       "need_ids": ["n1"],
       "claim": { "canonical_key": "logreg-gauss2d", "slug": "logreg-gauss2d" }
@@ -21,6 +22,7 @@
       "seq": 2,
       "critical": false,
       "budget_estimate": 0.5,
+      "gpu_required": false,
       "spec_md": "对既有多数类基线 checkpoint 免训练补测 accuracy（对照）",
       "need_ids": ["n2"],
       "eval_action": "append_attempt",

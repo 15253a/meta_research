@@ -1,0 +1,18 @@
+{
+  "ops": [
+    {
+      "op": "spawn_question",
+      "local_key": "human-root",
+      "request_ref": "db:directive:7",
+      "kind": "followup",
+      "parent_question_id": null,
+      "text": "人类请求的独立研究问题是否被允许证据支持？",
+      "predicate_json": {
+        "kind": "evidence_closure_v1",
+        "allowed_evidence": ["evaluation", "literature"],
+        "answer_criterion_md": "成功测量或冻结文献支持肯定回答。",
+        "refute_criterion_md": "成功测量或冻结文献支持否定回答。"
+      }
+    }
+  ]
+}

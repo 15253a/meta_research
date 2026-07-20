@@ -349,17 +349,46 @@ def test_soft_directive_declined_with_decision(env):
 
 
 # ============ 消费效果（按时机 + 最小效果）============
-def test_inject_question_effect(env):
+def test_inject_question_is_persisted_for_reasoning_without_direct_question_write(env):
     d, c = env["d"], env["c"]
     r = c.handle_inbound(connector="qq", raw_text="注入问题：CNN 能到 0.95 吗", idempotency_key="k-q",
                          goal_id=1, goal_ver=1)
     assert r["directive_id"] in c.pending_directives("reasoning_start")              # 时机=下一轮 reasoning 始
+    before = d.query_one("SELECT count(*) FROM question")[0]
     eff = c.consume_directive(directive_id=r["directive_id"], cycle_id="c1")
-    q = d.query_one("SELECT text, status, source FROM question WHERE id=?", (int(eff["question_id"][1:]),))
-    assert q[1] == "open" and q[2] == "human" and "CNN" in q[0]
+    assert d.query_one("SELECT count(*) FROM question")[0] == before
+    assert "question_id" not in eff
+    assert eff["applies_to_reasoning_cycle"] == "c1"
+    request = eff["reasoning_question_request"]
+    assert request == {
+        "protocol": "directive-question-request-v1",
+        "request_ref": f"db:directive:{r['directive_id']}",
+        "requested_text": "CNN 能到 0.95 吗",
+        "parent_question_id": None,
+        "suggested_kind": "followup",
+        "requires_reasoning_predicate": True,
+    }
+    assert d.query_one(
+        "SELECT question_id,actor,type FROM decision WHERE id=("
+        "SELECT consumed_decision_id FROM directive WHERE id=?)",
+        (r["directive_id"],)) == (None, "human", "directive_inject_question")
 
 
-def test_human_named_repo_requires_structured_hard_confirmation_and_binds_question(env):
+def test_inject_question_cannot_be_consumed_without_reasoning_cycle(env):
+    d, c = env["d"], env["c"]
+    inbound = c.handle_inbound(
+        connector="qq", raw_text="注入问题：假设 H 是否成立？",
+        idempotency_key="inject-without-cycle", goal_id=1, goal_ver=1)
+    before = d.query_one("SELECT count(*) FROM question")[0]
+    with pytest.raises(ValueError, match="reasoning cycle"):
+        c.consume_directive(directive_id=inbound["directive_id"], cycle_id=None)
+    assert d.query_one("SELECT count(*) FROM question")[0] == before
+    assert d.query_one(
+        "SELECT status FROM directive WHERE id=?",
+        (inbound["directive_id"],)) == ("pending",)
+
+
+def test_human_named_repo_requires_confirmation_then_hands_request_to_reasoning(env):
     d, c = env["d"], env["c"]
     c.policy = {"tree_guard": {
         "max_open_questions": 30, "max_children_per_node": 6,
@@ -385,19 +414,24 @@ def test_human_named_repo_requires_structured_hard_confirmation_and_binds_questi
     effect = c.consume_directive(
         directive_id=result["directive_id"], cycle_id="c1")
 
-    qid = int(effect["question_id"][1:])
-    assert d.query_one(
-        "SELECT parent_id,text,status,source FROM question WHERE id=?", (qid,)) == (
-            1, "复现人类点名仓库作为 comparator", "open", "human")
-    authority = effect["human_named_authority"]
-    assert authority["authority_hash"] == effect["source_authority_hash"]
-    assert authority["directive_id"] == result["directive_id"]
-    assert authority["source_message_id"] == result["message_id"]
+    assert d.query_one("SELECT count(*) FROM question")[0] == 1
+    assert "question_id" not in effect and "source_authority_hash" not in effect
+    request = effect["reasoning_question_request"]
+    assert request["protocol"] == "directive-question-request-v1"
+    assert request["request_ref"] == f"db:directive:{result['directive_id']}"
+    assert request["requested_text"] == "复现人类点名仓库作为 comparator"
+    assert request["parent_question_id"] == "q1"
+    assert request["suggested_kind"] == "import_reference"
+    assert request["human_named_repo"] == {
+        "canonical_uri": "https://github.com/owner/repo",
+        "requested_revision": "a" * 40,
+    }
+    assert request["need_summary"] == "人类明确要求把该仓库作为独立外部对照"
     assert d.query_one(
         "SELECT question_id,actor,type FROM decision WHERE id=("
         "SELECT consumed_decision_id FROM directive WHERE id=?)",
         (result["directive_id"],)) == (
-            qid, "human", "directive_inject_question")
+            None, "human", "directive_inject_question")
 
 
 def test_human_named_repo_rejects_free_text_or_unpinned_authority_shape(env):

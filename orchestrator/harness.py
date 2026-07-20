@@ -127,6 +127,12 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
     if (not isinstance(owner_kind, str) or isinstance(owner_id, bool)
             or not isinstance(owner_id, int) or owner_id <= 0):
         raise ValueError("recover_staged_result 要求 exact DB owner context")
+    attempt_bound = "execution_attempt" in expected
+    expected_attempt = expected.get("execution_attempt", 1)
+    if (attempt_bound and (isinstance(expected_attempt, bool)
+                           or not isinstance(expected_attempt, int)
+                           or expected_attempt <= 0)):
+        raise ValueError("execution_context.execution_attempt 须为正整数")
 
     directory = Path(staging_dir)
     partial = directory / (log_name + ".partial")
@@ -137,13 +143,47 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
     receipt_dir = (execution_supervisor.receipt_dir if execution_supervisor is not None
                    else directory / ".execution-receipts")
     matches = []
+    seen_attempts = set()
     for path in sorted(Path(receipt_dir).glob("execution-*.json")):
         receipt = read_receipt(path)
         context = receipt.get("context") or {}
         if (context.get("db_owner_kind"), context.get("db_owner_id")) != (owner_kind, owner_id):
             continue
-        if (receipt.get("kind") != execution_kind
-                or any(context.get(key) != value for key, value in expected.items())):
+        if receipt.get("kind") != execution_kind:
+            raise ExecutionRecoveryError(
+                f"{owner_kind} {owner_id} guardian receipt 与 staged recovery context 错配")
+        if attempt_bound:
+            # Legacy receipts predate the explicit field and are exactly
+            # attempt 1.  A durable bundle_repair_requested decision advances
+            # the caller's expected attempt before the rejected staging tree
+            # is archived.  Older terminal receipts therefore remain audit
+            # evidence but no longer own the replacement staging namespace.
+            receipt_attempt = context.get("execution_attempt", 1)
+            if (isinstance(receipt_attempt, bool)
+                    or not isinstance(receipt_attempt, int)
+                    or receipt_attempt <= 0):
+                raise ExecutionRecoveryError(
+                    f"{owner_kind} {owner_id} guardian receipt execution_attempt 非法")
+            if receipt_attempt in seen_attempts:
+                raise ExecutionRecoveryError(
+                    f"{owner_kind} {owner_id} execution attempt {receipt_attempt} "
+                    "对应多个 guardian receipt")
+            seen_attempts.add(receipt_attempt)
+            base_mismatch = any(
+                context.get(key) != value for key, value in expected.items()
+                if key != "execution_attempt")
+            if base_mismatch or receipt_attempt > expected_attempt:
+                raise ExecutionRecoveryError(
+                    f"{owner_kind} {owner_id} guardian receipt 与 staged recovery context 错配")
+            if receipt_attempt < expected_attempt:
+                if (receipt.get("state") != "terminal"
+                        or receipt.get("group_drained") is not True):
+                    raise ExecutionRecoveryError(
+                        f"{owner_kind} {owner_id} 旧 execution attempt "
+                        f"{receipt_attempt} 未 terminal+drained，不得越过")
+                continue
+        if any(context.get(key) != value for key, value in expected.items()
+               if not (attempt_bound and key == "execution_attempt")):
             raise ExecutionRecoveryError(
                 f"{owner_kind} {owner_id} guardian receipt 与 staged recovery context 错配")
         matches.append((path, receipt))
@@ -264,7 +304,9 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                execution_kind: str = "harness",
                execution_context: Optional[Dict[str, Any]] = None,
                sandbox_invocation=None,
-               inherit_environment: bool = True) -> Dict[str, Any]:
+               inherit_environment: bool = True,
+               progress_observer=None,
+               progress_interval_s: float = 5.0) -> Dict[str, Any]:
     """跑真子进程，stdout+stderr 合流写 staging log（.partial → 原子改名）。返回
     {exit_code, log_path, log_sha256, log_bytes}。超时 → kill 并抛 subprocess.TimeoutExpired
     （.partial 留在 staging 供审计，不改名——半成品不冒充完整产物）。"""
@@ -290,22 +332,31 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
             # Guardian 在直接子进程结束后仍要清空/reap 整棵后代树；只有这个机械边界返回
             # 后，.partial 才可能提升为不可变 final。
             try:
-                result = supervisor.run(
-                    cmd, stdin=None, stdout=fh, stderr=subprocess.STDOUT,
-                    timeout_s=timeout_s, cwd=d,
+                run_kwargs = {
+                    "stdin": None, "stdout": fh, "stderr": subprocess.STDOUT,
+                    "timeout_s": timeout_s, "cwd": d,
                     # A sandbox wrapper is trusted host control code and gets
                     # a deliberately minimal env; host credentials must never
                     # be copied into its guardian spec or container.  Ordinary
                     # trusted harness calls preserve the historical inherited
                     # environment behavior.
-                    env=(dict(env or {}) if (sandbox_invocation is not None
-                                              or not inherit_environment)
-                         else {**os.environ, **(env or {})}),
-                    pass_fds=tuple(pass_fds), kind=execution_kind,
-                    operation_context=context,
-                    external_container=(
+                    "env": (dict(env or {}) if (sandbox_invocation is not None
+                                                  or not inherit_environment)
+                            else {**os.environ, **(env or {})}),
+                    "pass_fds": tuple(pass_fds), "kind": execution_kind,
+                    "operation_context": context,
+                    "external_container": (
                         sandbox_invocation.external_container
-                        if sandbox_invocation is not None else None))
+                        if sandbox_invocation is not None else None),
+                }
+                # Do not pass the optional keywords to legacy/injected test
+                # supervisors unless observation is actually enabled.
+                if progress_observer is not None:
+                    run_kwargs.update({
+                        "progress_observer": progress_observer,
+                        "progress_interval_s": progress_interval_s,
+                    })
+                result = supervisor.run(cmd, **run_kwargs)
             except BaseException as error:
                 execution_error = error
             finally:
@@ -366,7 +417,8 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
         raise execution_error.with_traceback(execution_error.__traceback__)
     assert result is not None
     exit_code = result.returncode
-    if sandbox_invocation is not None:
+    if (sandbox_invocation is not None
+            and sandbox_invocation.external_container is not None):
         try:
             from .execution_sandbox import (
                 discard_rejected_sandbox_output,
@@ -392,6 +444,12 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                     receipt_path=result.receipt_path) from error
         finally:
             sandbox_invocation.close()
+    elif sandbox_invocation is not None:
+        # Development local execution is still a SandboxInvocation so it can
+        # supply the selected Conda/GPU environment, but it has no Docker
+        # quarantine to promote.  The guardian receipt/process-tree drain and
+        # ordinary staging publication remain authoritative.
+        sandbox_invocation.close()
     # exit 侧车**先于** final 改名（原子 tmp→replace）：final 存在 ⟹ 退出码可读——崩后续跑须复用同一
     # exit 判定（非 0 的 eval 也会产 final，恢复方不得把失败进程的完整输出当成功续注册，codex BLOCKER）
     _ensure_exit_sidecar(d, log_name, exit_code)

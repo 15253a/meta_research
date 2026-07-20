@@ -1,0 +1,6 @@
+# 生产运行依赖。运行：python -m pip install -r requirements-runtime.txt
+jsonschema>=4.18,<5   # draft 2020-12 校验
+referencing>=0.30,<1 # 直接使用 Registry/DRAFT202012，不依赖传递安装偶然存在
+PyYAML>=6,<7
+numpy>=1.24,<3       # qualification SEED/DREAMER safe-array adapters
+scipy>=1.10,<2       # trusted MAT reader used only by qualification data preparation

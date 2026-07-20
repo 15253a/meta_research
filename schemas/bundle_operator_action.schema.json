@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meta-research.local/schemas/bundle_operator_action.schema.json",
+  "title": "bundle_operator_action",
+  "description": "Cycle-scoped Codex Bundle operator action. The orchestrator pre-binds the exact manifest command, GPU/environment contract and durable execution owner; the model may start it, continue observing it, accept a terminal execution package, request engineering repair, or identify a research-plan flaw that must return through Reasoning. It cannot supply argv or mark success.",
+  "type": "object",
+  "required": [
+    "version", "build_target_id", "phase", "event", "action",
+    "execution_owner", "plan_slice_hash", "source_tree_hash",
+    "subject_hash", "diagnosis_md"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "build_target_id": { "type": "integer", "minimum": 1 },
+    "phase": { "enum": ["smoke", "train", "eval"] },
+    "event": { "enum": ["start", "progress", "terminal"] },
+    "action": { "enum": ["start", "continue", "accept", "repair", "replan"] },
+    "execution_owner": {
+      "type": "object",
+      "required": ["kind", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["build_target", "run", "evaluation_attempt"] },
+        "id": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "plan_slice_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "source_tree_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "subject_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "diagnosis_md": { "type": "string", "maxLength": 4096 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "event": { "const": "start" } }, "required": ["event"] },
+      "then": { "properties": { "action": { "enum": ["start", "repair", "replan"] } } }
+    },
+    {
+      "if": { "properties": { "event": { "const": "progress" } }, "required": ["event"] },
+      "then": { "properties": { "action": { "enum": ["continue", "repair", "replan"] } } }
+    },
+    {
+      "if": { "properties": { "event": { "const": "terminal" } }, "required": ["event"] },
+      "then": { "properties": { "action": { "enum": ["accept", "repair", "replan"] } } }
+    }
+  ]
+}

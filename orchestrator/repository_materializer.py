@@ -186,10 +186,26 @@ class GitHubRepositoryMaterializer(
             "PYTHON_VERSION": compiler["version"],
             "PYTHON_SHA256": compiler["artifact_sha256"].removeprefix("sha256:"),
         }
-        if (not all(isinstance(key, str) and isinstance(value, str)
-                    for key, value in self.runtime_environment.items())
-                or any(self.runtime_environment.get(key) != value
-                       for key, value in expected_runtime.items())):
+        runtime_strings = all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in self.runtime_environment.items())
+        if self.sandbox_config.get("backend") == "local":
+            # Development local execution intentionally follows the user's
+            # project Conda interpreter instead of pretending it is the frozen
+            # Docker compiler.  Its exact version/interpreter hash are already
+            # bound into sandbox_config/environment_hash and remain visible in
+            # the materialization receipt.
+            if (not runtime_strings
+                    or re.fullmatch(
+                        r"[0-9]+\.[0-9]+\.[0-9]+",
+                        self.runtime_environment.get("PYTHON_VERSION", "")) is None
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        self.runtime_environment.get("PYTHON_SHA256", "")) is None):
+                raise ValueError("local runtime Python identity 非法")
+        elif (not runtime_strings
+              or any(self.runtime_environment.get(key) != value
+                     for key, value in expected_runtime.items())):
             raise ValueError(
                 "pinned sandbox image compiler environment 与 import policy 不一致")
         if self.dependency_image_builder is not None:

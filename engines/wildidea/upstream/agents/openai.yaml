@@ -1,0 +1,5 @@
+interface:
+  display_name: "WildIdea"
+  version: "1.3"
+  short_description: "Generate 9 far-domain idea cards with independent quality gates"
+  default_prompt: "Use $wildidea with the Web v1.4-aligned 9-slot workflow: draw distant sources first, allow at most 2 rerolls per slot, keep the best labeled fallback when the gate is missed, then run live novelty search, independent judging, and validated HTML output."

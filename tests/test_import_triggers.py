@@ -19,7 +19,7 @@ from orchestrator.import_search import (
     ImportSearchError, ImportSearchProviderError, ImportSearchService)
 from orchestrator.import_triggers import (
     BoundedReferenceSnapshotProvider, TrustedImportTriggerService)
-from orchestrator.importer import DeferredImporter
+from orchestrator.interfaces import Selection
 from orchestrator.question_progress import INCONCLUSIVE_PROTOCOL
 from orchestrator.statestore_sqlite import SQLiteStateStore
 from orchestrator.writedaemon import WriteDaemon
@@ -190,8 +190,8 @@ def _human_plan_env(tmp_path):
     state.create_goal(text="人类点名外部实现", predicate_json={})
     with daemon.transaction() as conn:
         conn.execute(
-            "INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version,finished_at) "
-            "VALUES (1,1,1,'done','bootstrap','test',CURRENT_TIMESTAMP)")
+            "INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version) "
+            "VALUES (1,1,1,'reasoning','bootstrap','test')")
     console = Console(daemon, policy=POLICY)
     raw = (
         '注入问题 {"question_text":"复现点名 repo",'
@@ -204,97 +204,47 @@ def _human_plan_env(tmp_path):
     _confirm(console, daemon, inbound)
     effect = console.consume_directive(
         directive_id=inbound["directive_id"], cycle_id="c1")
-    qid = int(effect["question_id"][1:])
-    with daemon.transaction() as conn:
-        conn.execute(
-            "INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version,active_question_id) "
-            "VALUES (2,1,1,'idea','attack','test',?)", (qid,))
-        conn.execute(
-            "UPDATE question SET status='active',active_cycle=2,born_cycle=COALESCE(born_cycle,1) "
-            "WHERE id=?", (qid,))
-        conn.execute(
-            "INSERT INTO idea(question_id,cycle_id,content_md,audit_json,status) "
-            "VALUES (?,2,'# selected\n人类外部参照','{}','selected')", (qid,))
-    return daemon, NS(cycle_id="c2", question_id=f"q{qid}"), effect
+    return daemon, inbound, effect
 
 
-def _activate_child(daemon, *, child_id):
-    with daemon.transaction() as conn:
-        conn.execute(
-            "INSERT INTO cycle(id,goal_id,goal_ver,status,route,policy_version,active_question_id) "
-            "VALUES (2,1,1,'idea','attack','test',?)", (child_id,))
-        conn.execute(
-            "UPDATE question SET status='active',active_cycle=2 WHERE id=?", (child_id,))
-        conn.execute(
-            "INSERT INTO idea(question_id,cycle_id,content_md,audit_json,status) "
-            "VALUES (?,2,'# selected\n冻结外部参照','{}','selected')", (child_id,))
-    return NS(cycle_id="c2", question_id=f"q{child_id}")
-
-
-def test_human_named_uses_exact_confirmed_authority_and_direct_resolve(tmp_path):
-    daemon, cyc, effect = _human_plan_env(tmp_path)
-    query = "human_named:https://github.com/owner/repo@" + "a" * 40
-    repo = RepoProvider(resolves=[_result(query, candidates=[_candidate(repo="owner/repo")])])
-    service = _service(tmp_path, daemon, repo, ReferenceProvider())
-    request = {
-        "version": 1, "trigger_kind": "human_named",
-        "source_authority_hash": effect["source_authority_hash"],
-        "need_summary": "人类明确点名该仓库作为 comparator",
+def test_human_named_directive_is_a_reasoning_request_not_direct_question_authority(tmp_path):
+    daemon, inbound, effect = _human_plan_env(tmp_path)
+    assert daemon.query_one("SELECT count(*) FROM question") == (0,)
+    assert "question_id" not in effect and "source_authority_hash" not in effect
+    request = effect["reasoning_question_request"]
+    assert request["suggested_kind"] == "import_reference"
+    assert request["human_named_repo"] == {
+        "canonical_uri": "https://github.com/owner/repo",
+        "requested_revision": "a" * 40,
     }
+    assert daemon.query_one(
+        "SELECT question_id,actor,type FROM decision WHERE id=("
+        "SELECT consumed_decision_id FROM directive WHERE id=?)",
+        (inbound["directive_id"],)) == (
+            None, "human", "directive_inject_question")
 
     compiler = SqliteCompiler(
         db.connect(str(tmp_path / "research.sqlite")), POLICY)
-    before = compiler.render(cycle_id="c2", stage="plan")
-    assert '"may_activate_source_authority":true' in before.anchor_md
-    assert effect["source_authority_hash"] in before.anchor_md
-    assert '"may_request_import_search":false' in before.anchor_md
+    pack = compiler.render(cycle_id="c1", stage="reasoning")
+    assert '"protocol":"directive-question-request-v1"' in pack.anchor_md
+    assert '"suggested_kind":"import_reference"' in pack.anchor_md
+    assert "https://github.com/owner/repo" in pack.anchor_md
 
-    first = service(cyc, request)
-    second = service(cyc, dict(request))
 
-    assert first == second and first["candidate_count"] == 1
-    assert repo.resolve_calls == [(
-        "https://github.com/owner/repo", "a" * 40, query)]
+def test_human_named_request_has_no_authority_until_reasoning_admits_a_question(tmp_path):
+    daemon, _inbound, _effect = _human_plan_env(tmp_path)
+    assert load_question_import_authority(daemon.conn, question_id=1) is None
     assert daemon.query_one(
-        "SELECT trigger_kind,canonical_uri,revision FROM external_candidate") == (
-            "human_named", "https://github.com/owner/repo", "a" * 40)
-    assert daemon.query_one(
-        "SELECT status FROM cycle WHERE id=2") == ("idea",)
-    pack = compiler.render(cycle_id="c2", stage="plan")
-    assert '"may_activate_source_authority":false' in pack.anchor_md
-    assert '"trigger_kind":"human_named"' in pack.anchor_md
+        "SELECT count(*) FROM decision WHERE type='import_reference_authority'") == (0,)
 
 
-def test_human_named_rejects_mismatched_or_absent_authority(tmp_path):
-    daemon, cyc, effect = _human_plan_env(tmp_path)
-    repo = RepoProvider()
-    service = _service(tmp_path, daemon, repo, ReferenceProvider())
-    with pytest.raises(ImportSearchError, match="authority"):
-        service(cyc, {
-            "version": 1, "trigger_kind": "human_named",
-            "source_authority_hash": "sha256:" + "f" * 64,
-            "need_summary": "人类明确点名该仓库作为 comparator",
-        })
-    assert repo.resolve_calls == []
-    assert effect["source_authority_hash"] != "sha256:" + "f" * 64
+def test_human_named_request_does_not_create_candidate_or_import_rows(tmp_path):
+    daemon, _inbound, _effect = _human_plan_env(tmp_path)
+    assert daemon.query_one("SELECT count(*) FROM external_candidate") == (0,)
+    assert daemon.query_one("SELECT count(*) FROM external_import") == (0,)
 
 
-def test_human_named_question_cannot_masquerade_as_new_structure(tmp_path):
-    daemon, cyc, _effect = _human_plan_env(tmp_path)
-    repo = RepoProvider(searches=[])
-    ordinary = ImportSearchService(
-        daemon=daemon, policy=POLICY, provider=repo,
-        work_root=str(tmp_path), cost_ledger=CostLedger(daemon, POLICY))
-    with pytest.raises(ImportSearchError, match="不得借 new_structure"):
-        ordinary(cyc, {
-            "version": 1, "trigger_kind": "new_structure",
-            "query": "substitute a different repo",
-            "need_summary": "attempt to bypass human authority",
-        })
-    assert repo.search_calls == []
-
-
-def test_stuck_survey_spawns_child_and_child_activation_never_imports_original(tmp_path):
+def test_stuck_survey_persists_reasoning_request_without_direct_question_write(tmp_path):
     visit_threshold, streak_threshold = _stuck_counts()
     daemon, _state, cyc = _base(
         tmp_path, visit_count=visit_threshold,
@@ -309,48 +259,44 @@ def test_stuck_survey_spawns_child_and_child_activation_never_imports_original(t
     service = _service(tmp_path, daemon, repo, ReferenceProvider())
 
     outcome = service(cyc, request)
-    child_id = outcome["child_question_id"]
-    assert outcome["terminalized"] is True and child_id > 1
+    assert outcome["terminalized"] is False
+    assert outcome["child_question_id"] is None
+    assert outcome["source_authority_hash"] is None
+    handoff = outcome["reasoning_question_request"]
+    assert handoff["protocol"] == "import-trigger-question-request-v1"
+    assert handoff["op"] == "spawn_question"
+    assert handoff["kind"] == "import_reference"
+    assert handoff["parent_question_id"] == "q1"
+    assert handoff["trigger_kind"] == "stuck"
+    assert handoff["survey_candidate_count"] == 1
+    assert handoff["requires_reasoning_predicate"] is True
     assert daemon.query_one(
         "SELECT status,active_question_id,next_question_id,next_intent FROM cycle WHERE id=1") == (
-            "done", None, child_id, "attack")
+            "idea", 1, None, None)
     assert daemon.query_one(
-        "SELECT status,active_cycle FROM question WHERE id=1") == ("open", None)
-    assert daemon.query_one(
-        "SELECT question_id,depends_on_question_id,status FROM question_dep") == (
-            1, child_id, "pending")
+        "SELECT status,active_cycle FROM question WHERE id=1") == ("active", 1)
+    # Critically, the connector has not inserted or linked another row.
+    assert daemon.query_one("SELECT count(*) FROM question") == (1,)
+    assert daemon.query_one("SELECT count(*) FROM question_dep") == (0,)
     assert daemon.query_one(
         "SELECT count(*) FROM external_candidate WHERE question_id=1")[0] == 0
     assert daemon.query_one(
         "SELECT count(*) FROM external_import WHERE question_id=1")[0] == 0
-    diagnostic = SqliteCompiler(
-        db.connect(str(tmp_path / "research.sqlite")), POLICY).render(
-            cycle_id="c1", stage="plan")
-    assert '"terminalized":true' in diagnostic.anchor_md
-    assert f'"child_question_id":{child_id}' in diagnostic.anchor_md
+    compiler = SqliteCompiler(
+        db.connect(str(tmp_path / "research.sqlite")), POLICY)
+    plan_pack = compiler.render(cycle_id="c1", stage="plan")
+    assert '"reasoning_question_request_pending":true' in plan_pack.anchor_md
+    assert '"question_creation_owner":"reasoning/tree_ops"' in plan_pack.anchor_md
+    reasoning_pack = compiler.render(cycle_id="c1", stage="reasoning")
+    assert "待 reasoning/tree_ops 裁决的 import reference 建题请求" in reasoning_pack.anchor_md
+    assert '"parent_question_id": "q1"' in reasoning_pack.anchor_md
+    assert handoff["requested_text"] in reasoning_pack.anchor_md
+    decision_id = daemon.query_one(
+        "SELECT id FROM decision WHERE type='import_trigger_completed'")[0]
+    assert f"db:decision:{decision_id}" in reasoning_pack.sources
 
-    authority = load_question_import_authority(daemon.conn, question_id=child_id)
-    child_cyc = _activate_child(daemon, child_id=child_id)
-    activated = service(child_cyc, {
-        "version": 1, "trigger_kind": "stuck",
-        "source_authority_hash": authority["authority_hash"],
-        "need_summary": authority["need_summary"],
-    })
-    assert activated["candidate_count"] == 1
-    assert activated["policy_hash"] == DeferredImporter.policy_hash(POLICY)
+    assert service(cyc, dict(request)) == outcome
     assert repo.search_calls == [(request["query"], 2)]
-    assert daemon.query_one(
-        "SELECT question_id,discovered_cycle,trigger_kind FROM external_candidate") == (
-            child_id, 2, "stuck")
-    snapshot = DeferredImporter.plan_snapshot(
-        daemon.conn, question_id=child_id, action_cycle=2,
-        policy_hash=DeferredImporter.policy_hash(POLICY))
-    assert snapshot["selected"] is not None
-    corrupted = {**activated, "policy_hash": "sha256:" + "f" * 64}
-    with pytest.raises(ImportSearchError, match="license review"):
-        service._verify_activation_payload(
-            cyc=child_cyc, request_hash=activated["request_hash"],
-            payload=corrupted)
 
 
 def test_stuck_requires_independent_consecutive_inconclusive_threshold(tmp_path):
@@ -387,7 +333,7 @@ def test_stuck_zero_result_is_durable_without_child_or_repeat(tmp_path):
         "idea", 1)
 
 
-def test_sota_freezes_allowlisted_body_then_spawns_reference_question(
+def test_sota_freezes_allowlisted_body_then_requests_reasoning_reference_question(
         tmp_path, monkeypatch):
     daemon, _state, cyc = _base(tmp_path)
     request = {
@@ -404,7 +350,14 @@ def test_sota_freezes_allowlisted_body_then_spawns_reference_question(
 
     outcome = service(cyc, request)
 
-    assert outcome["terminalized"] is True
+    assert outcome["terminalized"] is False
+    assert outcome["child_question_id"] is None
+    assert daemon.query_one("SELECT count(*) FROM question") == (1,)
+    assert daemon.query_one("SELECT count(*) FROM question_dep") == (0,)
+    handoff = outcome["reasoning_question_request"]
+    assert handoff["trigger_kind"] == "sota_reference"
+    assert handoff["parent_question_id"] == "q1"
+    assert handoff["survey_candidate_count"] == 1
     snapshot = outcome["reference_snapshot"]
     assert Path(snapshot["blob_ref"]).read_bytes() == b"immutable-paper"
     assert snapshot["content_sha256"].startswith("sha256:")
@@ -413,35 +366,26 @@ def test_sota_freezes_allowlisted_body_then_spawns_reference_question(
     assert Path(snapshot["blob_ref"]).parts[-4:-2] == (
         "source-blobs", "sha256")
     assert reference.calls == [request["reference"]]
-    child = daemon.query_one(
-        "SELECT id,parent_id,source,born_cycle FROM question WHERE id<>1")
-    assert child == (outcome["child_question_id"], 1, "agent", 1)
     assert daemon.query_one(
         "SELECT count(*) FROM external_candidate WHERE question_id=1")[0] == 0
-    authority = load_question_import_authority(
-        daemon.conn, question_id=outcome["child_question_id"])
-    child_cyc = _activate_child(
-        daemon, child_id=outcome["child_question_id"])
-    activated = service(child_cyc, {
-        "version": 1, "trigger_kind": "sota_reference",
-        "source_authority_hash": authority["authority_hash"],
-        "need_summary": authority["need_summary"],
-    })
-    assert activated["candidate_count"] == 1
-    assert len(reference.calls) == 1 and len(repo.search_calls) == 1
-    assert daemon.query_one(
-        "SELECT question_id,discovered_cycle,trigger_kind FROM external_candidate") == (
-            outcome["child_question_id"], 2, "sota_reference")
-    bad_authority = {**authority, "receipt_ref": "/etc/passwd"}
+    reasoning = SqliteCompiler(
+        db.connect(str(tmp_path / "research.sqlite")), POLICY).render(
+            cycle_id="c1", stage="reasoning")
+    assert handoff["requested_text"] in reasoning.anchor_md
+    assert '"requires_reasoning_predicate": true' in reasoning.anchor_md
+
+    bad_completion = {**outcome, "receipt_ref": "/etc/passwd"}
     monkeypatch.setattr(
         import_triggers_module, "read_receipt",
         lambda _path: (_ for _ in ()).throw(
             AssertionError("receipt path was read before validation")))
     with pytest.raises(ImportSearchError, match="receipt_ref 非规范路径"):
-        service._read_authority_receipt(bad_authority)
+        service._verify_existing_completion(
+            cyc=cyc, request=request, request_hash=outcome["request_hash"],
+            completion=bad_completion)
 
 
-def test_trigger_receipt_recovers_without_refetch_or_duplicate_child(tmp_path, monkeypatch):
+def test_trigger_receipt_recovers_without_refetch_or_direct_question_write(tmp_path, monkeypatch):
     visit_threshold, streak_threshold = _stuck_counts()
     daemon, _state, cyc = _base(
         tmp_path, visit_count=visit_threshold,
@@ -464,12 +408,15 @@ def test_trigger_receipt_recovers_without_refetch_or_duplicate_child(tmp_path, m
 
     recovered = _service(tmp_path, daemon, repo, reference)
     outcome = recovered(cyc, request)
-    assert outcome["terminalized"] is True
+    assert outcome["terminalized"] is False
+    assert outcome["child_question_id"] is None
+    assert outcome["reasoning_question_request"]["parent_question_id"] == "q1"
     assert repo.search_calls == [(request["query"], 2)]
-    assert daemon.query_one("SELECT count(*) FROM question") == (2,)
+    assert daemon.query_one("SELECT count(*) FROM question") == (1,)
+    assert recovered(cyc, dict(request)) == outcome
 
 
-def test_sota_child_activation_rejects_tampered_frozen_source_blob(tmp_path):
+def test_sota_handoff_binds_frozen_source_hash_without_creating_child(tmp_path):
     daemon, _state, cyc = _base(tmp_path)
     request = {
         "version": 1, "trigger_kind": "sota_reference",
@@ -481,17 +428,15 @@ def test_sota_child_activation_rejects_tampered_frozen_source_blob(tmp_path):
         _result(request["query"], candidates=[_candidate()])])
     service = _service(tmp_path, daemon, repo, ReferenceProvider(b"original"))
     outcome = service(cyc, request)
-    authority = load_question_import_authority(
-        daemon.conn, question_id=outcome["child_question_id"])
-    Path(authority["reference_snapshot"]["blob_ref"]).write_bytes(b"tampered")
-    child_cyc = _activate_child(
-        daemon, child_id=outcome["child_question_id"])
-    with pytest.raises(ImportSearchError, match="blob"):
-        service(child_cyc, {
-            "version": 1, "trigger_kind": "sota_reference",
-            "source_authority_hash": authority["authority_hash"],
-            "need_summary": authority["need_summary"],
-        })
+    snapshot = outcome["reference_snapshot"]
+    original_hash = snapshot["content_sha256"]
+    assert Path(snapshot["blob_ref"]).read_bytes() == b"original"
+    stored = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE type='import_trigger_completed'")[0])
+    assert stored["reference_snapshot"]["content_sha256"] == original_hash
+    assert stored["reasoning_question_request"] == outcome["reasoning_question_request"]
+    assert outcome["child_question_id"] is None
+    assert daemon.query_one("SELECT count(*) FROM question") == (1,)
     assert daemon.query_one(
         "SELECT count(*) FROM external_candidate") == (0,)
 
@@ -549,6 +494,256 @@ def test_stuck_survey_tree_capacity_rejects_before_runner_or_network(tmp_path):
         })
     assert repo.search_calls == []
     assert daemon.query_one("SELECT count(*) FROM runner_call") == (0,)
+
+
+_REQUEST_PREDICATE = {
+    "kind": "evidence_closure_v1",
+    "allowed_evidence": ["evaluation", "literature"],
+    "answer_criterion_md": "预注册测量或冻结文献支持肯定回答。",
+    "refute_criterion_md": "预注册测量或冻结文献支持否定回答。",
+}
+
+
+def _console_request_env(tmp_path, *, human_named=False):
+    daemon = WriteDaemon(db.connect(str(tmp_path / "research.sqlite")))
+    state = SQLiteStateStore(daemon, POLICY)
+    state.create_goal(text="绑定 console 建题请求", predicate_json={})
+    bootstrap = state.open_or_resume_cycle()
+    state.set_route(bootstrap.cycle_id, "bootstrap")
+    state.apply_tree_ops(bootstrap.cycle_id, [{
+        "op": "create_root", "local_key": "root", "text": "原始研究问题",
+        "predicate_json": _REQUEST_PREDICATE,
+    }])
+    state.mark_cycle_done(bootstrap.cycle_id)
+    cycle = state.open_or_resume_cycle()
+    state.set_route(cycle.cycle_id, "attack")
+    console = Console(daemon, policy=POLICY)
+    if human_named:
+        raw = (
+            '注入问题 {"question_text":"点名仓库在预注册协议下是否达到对照性能？",'
+            '"parent_question_id":"q1",'
+            '"human_named_repo":{"canonical_uri":"https://github.com/owner/repo",'
+            '"requested_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},'
+            '"need_summary":"人类点名仓库的独立对照"}')
+    else:
+        raw = (
+            '注入问题 {"question_text":"新增对照在预注册协议下是否提高性能？",'
+            '"parent_question_id":"q1"}')
+    inbound = console.handle_inbound(
+        connector="qq", raw_text=raw,
+        idempotency_key=("human-bound" if human_named else "ordinary-bound"),
+        goal_id=1, goal_ver=1)
+    if human_named:
+        _confirm(console, daemon, inbound)
+    effect = console.consume_directive(
+        directive_id=inbound["directive_id"], cycle_id=cycle.cycle_id)
+    return daemon, state, cycle, console, inbound, effect
+
+
+def _admit_console_request(state, cycle, request):
+    op = {
+        "op": "spawn_question", "local_key": "requested",
+        "request_ref": request["request_ref"],
+        "kind": request["suggested_kind"],
+        "parent_question_id": request["parent_question_id"],
+        "text": request["requested_text"],
+        "predicate_json": _REQUEST_PREDICATE,
+    }
+    with state.atomic():
+        state.apply_tree_ops(cycle.cycle_id, [op])
+        state.persist_selection(cycle.cycle_id, Selection(
+            next_question_id="requested", next_intent="attack", scores=[]))
+        state.mark_cycle_done(cycle.cycle_id)
+    return state.daemon.query_one(
+        "SELECT id FROM question WHERE born_cycle=?",
+        (int(cycle.cycle_id[1:]),))[0]
+
+
+def _activate_question_for_import(state, question_id):
+    cycle = state.open_or_resume_cycle()
+    state.set_route(cycle.cycle_id, "attack")
+    state.activate_question(f"q{question_id}")
+    with state.daemon.transaction() as conn:
+        conn.execute(
+            "UPDATE cycle SET status='idea' WHERE id=?",
+            (int(cycle.cycle_id[1:]),))
+        conn.execute(
+            "INSERT INTO idea(question_id,cycle_id,content_md,audit_json,status) "
+            "VALUES (?,?,'# selected\\n冻结外部参照','{}','selected')",
+            (question_id, int(cycle.cycle_id[1:])))
+    return NS(cycle_id=cycle.cycle_id, question_id=f"q{question_id}")
+
+
+def test_console_ordinary_request_ref_is_bound_by_statestore_only(tmp_path):
+    daemon, state, cycle, _console, inbound, effect = _console_request_env(
+        tmp_path, human_named=False)
+    request = effect["reasoning_question_request"]
+    assert request["request_ref"] == f"db:directive:{inbound['directive_id']}"
+    assert daemon.query_one("SELECT count(*) FROM question") == (1,)
+
+    child_id = _admit_console_request(state, cycle, request)
+
+    assert daemon.query_one(
+        "SELECT parent_id,text,source,status FROM question WHERE id=?",
+        (child_id,)) == (
+            1, request["requested_text"], "human", "open")
+    binding = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision WHERE question_id=? "
+        "AND type='question_request_bound'", (child_id,))[0])
+    assert binding["request_ref"] == request["request_ref"]
+    assert binding["source_kind"] == "console_directive"
+    assert binding["source_authority_hash"] is None
+    assert load_question_import_authority(
+        daemon.conn, question_id=child_id) is None
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE question_id=? "
+        "AND type IN ('human_named_import_authority','import_reference_authority')",
+        (child_id,)) == (0,)
+
+
+@pytest.mark.parametrize("tamper", ["text", "parent", "kind", "provenance"])
+def test_console_request_ref_rejects_non_exact_or_wrong_provenance(
+        tmp_path, tamper):
+    daemon, state, cycle, _console, inbound, effect = _console_request_env(
+        tmp_path, human_named=False)
+    request = effect["reasoning_question_request"]
+    op = {
+        "op": "spawn_question", "request_ref": request["request_ref"],
+        "kind": request["suggested_kind"],
+        "parent_question_id": request["parent_question_id"],
+        "text": request["requested_text"],
+        "predicate_json": _REQUEST_PREDICATE,
+    }
+    if tamper == "text":
+        op["text"] += "（改写）"
+    elif tamper == "parent":
+        op["parent_question_id"] = None
+    elif tamper == "kind":
+        op["kind"] = "diagnosis"
+    else:
+        consumed_decision_id = daemon.query_one(
+            "SELECT consumed_decision_id FROM directive WHERE id=?",
+            (inbound["directive_id"],))[0]
+        # It is a real decision from this cycle, but not an
+        # import_trigger_completed authority.
+        op["request_ref"] = f"db:decision:{consumed_decision_id}"
+    with pytest.raises(ValueError, match="request_ref|exact"):
+        state.apply_tree_ops(cycle.cycle_id, [op])
+    assert daemon.query_one("SELECT count(*) FROM question") == (1,)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='question_request_bound'") == (0,)
+
+
+def test_human_named_request_binding_creates_authority_then_activates(tmp_path):
+    daemon, state, cycle, _console, _inbound, effect = _console_request_env(
+        tmp_path, human_named=True)
+    request = effect["reasoning_question_request"]
+    child_id = _admit_console_request(state, cycle, request)
+    authority = load_question_import_authority(
+        daemon.conn, question_id=child_id)
+    assert authority["trigger_kind"] == "human_named"
+    assert authority["canonical_uri"] == "https://github.com/owner/repo"
+    assert daemon.query_one(
+        "SELECT actor,type FROM decision WHERE question_id=? "
+        "AND type='human_named_import_authority'", (child_id,)) == (
+            "orchestrator", "human_named_import_authority")
+
+    action_cycle = _activate_question_for_import(state, child_id)
+    query = "human_named:https://github.com/owner/repo@" + "a" * 40
+    repo = RepoProvider(resolves=[
+        _result(query, candidates=[_candidate(repo="owner/repo")])])
+    service = _service(tmp_path, daemon, repo, ReferenceProvider())
+    activation_request = {
+        "version": 1, "trigger_kind": "human_named",
+        "source_authority_hash": authority["authority_hash"],
+        "need_summary": authority["need_summary"],
+    }
+    first = service(action_cycle, activation_request)
+    second = service(action_cycle, dict(activation_request))
+    assert first == second and first["candidate_count"] == 1
+    assert repo.resolve_calls == [(
+        "https://github.com/owner/repo", "a" * 40, query)]
+    assert daemon.query_one(
+        "SELECT question_id,trigger_kind,canonical_uri,revision "
+        "FROM external_candidate") == (
+            child_id, "human_named", "https://github.com/owner/repo", "a" * 40)
+
+
+@pytest.mark.parametrize("trigger_kind", ["stuck", "sota_reference"])
+def test_frozen_trigger_request_binding_creates_dep_authority_and_activates(
+        tmp_path, trigger_kind):
+    visit_threshold, streak_threshold = _stuck_counts()
+    daemon, state, origin_cycle = _base(
+        tmp_path, visit_count=visit_threshold,
+        consecutive_inconclusive=streak_threshold)
+    request = {
+        "version": 1, "trigger_kind": trigger_kind,
+        "query": f"frozen {trigger_kind} comparator",
+        "need_summary": f"{trigger_kind} 独立冻结参照",
+    }
+    if trigger_kind == "sota_reference":
+        request["reference"] = {
+            "kind": "paper", "uri": "https://arxiv.org/abs/2401.00001"}
+    repo = RepoProvider(searches=[
+        _result(request["query"], candidates=[_candidate()])])
+    reference = ReferenceProvider(content=b"immutable reference")
+    service = _service(tmp_path, daemon, repo, reference)
+    completion = service(origin_cycle, request)
+    completion_id = daemon.query_one(
+        "SELECT id FROM decision WHERE type='import_trigger_completed'")[0]
+    handoff = completion["reasoning_question_request"]
+    request_ref = f"db:decision:{completion_id}"
+    reasoning_pack = SqliteCompiler(
+        db.connect(str(tmp_path / "research.sqlite")), POLICY).render(
+            cycle_id=origin_cycle.cycle_id, stage="reasoning")
+    assert f'"request_ref": "{request_ref}"' in reasoning_pack.anchor_md
+
+    with state.atomic():
+        state.mark_inconclusive(origin_cycle.question_id)
+        state.apply_tree_ops(origin_cycle.cycle_id, [{
+            "op": "spawn_question", "local_key": "frozen-ref",
+            "request_ref": request_ref, "kind": handoff["kind"],
+            "parent_question_id": handoff["parent_question_id"],
+            "text": handoff["requested_text"],
+            "predicate_json": _REQUEST_PREDICATE,
+        }])
+        state.persist_selection(origin_cycle.cycle_id, Selection(
+            next_question_id="frozen-ref", next_intent="attack", scores=[]))
+        state.mark_cycle_done(origin_cycle.cycle_id)
+    child_id = daemon.query_one(
+        "SELECT id FROM question WHERE id<>1 ORDER BY id")[0]
+    authority = load_question_import_authority(
+        daemon.conn, question_id=child_id)
+    assert authority["trigger_kind"] == trigger_kind
+    assert authority["request_hash"] == completion["request_hash"]
+    assert daemon.query_one(
+        "SELECT question_id,depends_on_question_id,status,created_cycle "
+        "FROM question_dep") == (1, child_id, "pending", 1)
+    assert daemon.query_one(
+        "SELECT request_ref FROM (SELECT json_extract(payload_json,'$.request_ref') "
+        "AS request_ref FROM decision WHERE type='question_request_bound')") == (
+            request_ref,)
+
+    action_cycle = _activate_question_for_import(state, child_id)
+    activation_request = {
+        "version": 1, "trigger_kind": trigger_kind,
+        "source_authority_hash": authority["authority_hash"],
+        "need_summary": authority["need_summary"],
+    }
+    first = service(action_cycle, activation_request)
+    second = service(action_cycle, dict(activation_request))
+    assert first == second and first["candidate_count"] == 1
+    assert daemon.query_one(
+        "SELECT question_id,trigger_kind FROM external_candidate") == (
+            child_id, trigger_kind)
+    assert daemon.query_one(
+        "SELECT count(*) FROM external_candidate WHERE question_id=1") == (0,)
+    assert repo.search_calls == [(request["query"], 2)]
+    assert len(reference.calls) == (1 if trigger_kind == "sota_reference" else 0)
+
+    # Origin completion remains replayable after StateStore binds the child;
+    # neither recovery nor activation repeats the read-only survey.
+    assert service(origin_cycle, dict(request)) == completion
 
 
 class _ReferenceResponse:

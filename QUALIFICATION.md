@@ -1,5 +1,15 @@
 # T1/T2 qualification runbook
 
+> **Audience: deployment/evaluator maintainers, not research users.** In the
+> local product, users provide dataset/reference directories and choose an
+> evaluation mode in the Web wizard. They never author this contract, type a
+> backend mount path, run the commands below, or inspect sealed files. The Web
+> deployment-health response reports whether the separately privileged local
+> evaluator boundary has been installed; without it, T1 fails closed in the
+> page instead of redirecting the user to this file. The commands below are
+> retained as the auditable implementation/operator procedure and disaster
+> recovery reference.
+
 This is a thin qualification boundary around the existing orchestrator. It adds
 no second database, scheduler, daemon, or research state machine. It provides:
 

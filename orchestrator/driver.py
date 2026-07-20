@@ -4,7 +4,7 @@
 - Runner 真（codex exec）；Gate/StateStore/Compiler 用桩；**bundle 由本驱动器确定性造假**
   （evaluation.source='fake'、log/观测 synthetic=true——绝不写 M1 才有的 DB 表）。
 - 单进程串行；恢复/watchdog 是 M3 主题（本驱动器每轮内顺序执行、轮间状态在 StateStore 桩）。
-- 失败语义对齐 §4.2.3：idea 全不合格 / plan 评审两轮不过 → **阶段失败 = 研究轮正常收尾**
+- 失败语义对齐 §4.2.3：idea 全不合格 / plan 独立评审后一次定向修订仍无效 → **阶段失败 = 研究轮正常收尾**
   （cycle=done、Qn inconclusive、轮尾 reasoning 照跑）；产物结构非法重试（artifact_parse ≤2）
   用尽 / 收尾期语义拒绝 → cycle=failed、Qn 回 open。
   **M0 无事务注记**：reasoning 收尾按 §4.2.5(a) 顺序执行但**非原子**——若失败发生在
@@ -180,7 +180,7 @@ class M0Driver:
         return merged["selected_id"] is not None
 
     def _plan_stage(self, cycle) -> Optional[Dict[str, Any]]:
-        """计划 + 可回答性评审（独立调用 ≤ policy plan_review 轮）。None = 阶段失败。"""
+        """计划 + 独立评审；末轮 fail 后由 generator 定向修订一次。"""
         pack = self.compiler.render(cycle_id=cycle.cycle_id, stage="plan")
         plan = self._run_with_retry(cycle, "plan", "plan", pack, "plan.json")
         max_rounds = self.policy["flow"]["retry"]["plan_review"]
@@ -205,7 +205,39 @@ class M0Driver:
                     body_md="```json\n" + json.dumps(review["issues"], ensure_ascii=False, indent=2) + "\n```",
                     source="staging:plan_review.json", label=f"replan{round_no}")
                 plan = self._run_with_retry(cycle, "plan", "plan", pack, "plan.json")
-        return None   # 两轮仍不过 → 阶段失败（研究轮正常收尾）
+                continue
+
+            # Keep the M0 behavioral model aligned with the production
+            # AttackStages path: one independent reviewer is literal, and its
+            # final fail buys the original generator one bounded repair rather
+            # than silently becoming a second review call.
+            rejected = plan
+            pack = self.compiler.render(cycle_id=cycle.cycle_id, stage="plan")
+            self.compiler.amend(
+                pack, title="独立可回答性评审意见（仅一次；逐条修复后重出完整 plan.json）",
+                body_md="```json\n" + json.dumps(
+                    review["issues"], ensure_ascii=False, indent=2) + "\n```",
+                source="staging:plan_review.json", label=f"repair{round_no}")
+            plan = self._run_with_retry(cycle, "plan", "plan", pack, "plan.json")
+            if plan == rejected or "import_defer" in plan:
+                return None
+            self.state._record("agent", "plan_review_repair", {
+                "cycle": cycle.cycle_id,
+                "round_no": round_no,
+                "reviewed_plan_hash": hashlib.sha256(json.dumps(
+                    rejected, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")).encode("utf-8")).hexdigest(),
+                "plan_hash": hashlib.sha256(json.dumps(
+                    plan, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")).encode("utf-8")).hexdigest(),
+            })
+            res = self.gate.commit(
+                Artifact(stage="plan", files={"plan.json": plan}, md=""),
+                cycle_id=cycle.cycle_id, stage="plan")
+            if not res.ok:
+                return None
+            return plan
+        return None
 
     def _plan_review_call(self, cycle, plan: Dict[str, Any], round_no: int) -> Dict[str, Any]:
         pack = self.compiler.render_plan_review(cycle_id=cycle.cycle_id, plan=plan, round_no=round_no)
@@ -321,7 +353,7 @@ class M0Driver:
             self.state.persist_selection(cycle.cycle_id, Selection(
                 next_question_id=sel_raw["next_question_id"],
                 next_intent=sel_raw["next_intent"],
-                scores=sel_raw["scores"]))
+                scores=sel_raw.get("scores", [])))
         except ValueError as e:
             raise CycleFailed(f"reasoning 收尾被 StateStore 拒绝：{e}") from e
         self._route_from_selection(cycle)

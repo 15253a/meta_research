@@ -5,6 +5,7 @@ register_evaluation（§4.2.5(ii) 单事务）→ register_baseline（→legal �
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -14,6 +15,17 @@ from orchestrator import database as db
 from orchestrator import subject_manifest as SM
 from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import GateReject, open_gate_read_conn
+from orchestrator.pool_publication import (
+    BaselinePublication,
+    CheckpointPublication,
+    EvaluationPublicationSpec,
+    PoolPublisher,
+    ProtocolPublication,
+    TrainingPublicationSpec,
+    VariantPublication,
+    bind_training_database,
+    is_formally_published,
+)
 from orchestrator.writedaemon import WriteDaemon
 
 
@@ -120,6 +132,126 @@ def _build_chain(gate, d):
     return {"baseline_id": bid, "variant_id": vid, "bt": bt, "run": rid}
 
 
+def _formal_registration_ready(gate, d, tmp_path, *, with_execution_log=True):
+    """Build a real, verified publication around one pre-started factory attempt."""
+    final_identity = "# identity\n\n## 复现命令\npython train.py"
+    claimed = gate.gate_claim_baseline(
+        canonical_key="ck-formal", slug="formal", cycle_id="c2",
+        identity_draft_md="# planning draft")
+    bid, vid = claimed["baseline_id"], claimed["variant_id"]
+    with d.transaction() as conn:
+        bt = conn.execute(
+            "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id) "
+            "VALUES (2,2,'build',1,'pending',?,?)", (bid, vid)).lastrowid
+        conn.execute(
+            "INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) "
+            "VALUES (?,1,1)", (bt,))
+
+    gate.gate_start_build_target(build_target_id=bt)
+    gate.gate_progress_build_target(build_target_id=bt, to="smoke")
+    _judge_pass(d, bt, "bundle_code_review", "formal-code-sh")
+    gate.gate_progress_build_target(
+        build_target_id=bt, to="running", current_subject_hash="formal-code-sh")
+    rid = gate.gate_start_run(
+        build_target_id=bt, cycle_id="c2", variant_id=vid,
+        kind="build", env_hash="formal-env")
+
+    inputs = tmp_path / "formal-inputs"
+    code = inputs / "src"
+    code.mkdir(parents=True)
+    (code / "model.py").write_text(
+        "def forward(x):\n    return x + 1\n", encoding="utf-8")
+    identity = inputs / "identity.md"
+    identity.write_text("# identity", encoding="utf-8")
+    checkpoint = inputs / "final.pt"
+    checkpoint.write_bytes(b"formal-checkpoint\x00")
+    work = tmp_path / "work"
+    work.mkdir()
+    publisher = PoolPublisher(work)
+    training = publisher.publish_training(TrainingPublicationSpec(
+        baseline=BaselinePublication(
+            baseline_id=bid, slug="formal", canonical_key="ck-formal",
+            identity_source=identity, code_source=code,
+            repro_cmd_md="python train.py"),
+        variant=VariantPublication(
+            variant_id=vid, variant_key="base", config={}),
+        checkpoints=[CheckpointPublication(
+            checkpoint_id=None, ckpt_key="final", source=checkpoint)],
+    ))
+    checkpoint_binding = training.checkpoint_bindings[0]
+    with d.transaction() as conn:
+        checkpoint_id = conn.execute(
+            "INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,produced_by_run) "
+            "VALUES (?,?,?,?,?,?)",
+            (vid, checkpoint_binding["ckpt_key"], checkpoint_binding["path"],
+             checkpoint_binding["content_hash"], checkpoint_binding["hash_alg"], rid),
+        ).lastrowid
+        bind_training_database(
+            conn, training, updated_cycle=2,
+            checkpoint_ids={"final": checkpoint_id}, run_id=rid)
+    gate.gate_finish_run(run_id=rid, status="success")
+    _judge_pass(d, bt, "bundle_result_review", "formal-result-sh")
+
+    started = gate.gate_start_attempt(
+        cycle_id="c2", purpose="factory", build_target_id=bt,
+        create={
+            "variant_id": vid, "protocol_id": 1, "protocol_ver": 1,
+            "eval_key": "formal-eval", "source": "factory",
+            "target_set_hash": "formal-targets",
+        })
+    results = inputs / "evaluation"
+    results.mkdir()
+    (results / "eval.log").write_text(
+        "metric_value accuracy=0.91\n", encoding="utf-8")
+    metrics = [{
+        "metric_id": 1, "metric_ver": 1, "value": 0.91,
+        "scope": "aggregate",
+    }]
+    publication = publisher.publish_evaluation(EvaluationPublicationSpec(
+        training=training, evaluation_id=started["evaluation_id"],
+        eval_key="formal-eval", attempt_id=started["attempt_id"],
+        attempt_no=started["attempt_no"], results_source=results,
+        primary_artifact="eval.log", metrics=metrics,
+        protocol=ProtocolPublication(
+            protocol_id=1, version=1, name="proto", scope_spec={}),
+        checkpoint_ids={"final": checkpoint_id},
+    ))
+    log_binding = publication.database_bindings["evaluation_attempt"]
+    primary = publication.payload["objects"]["evaluation"]["primary_artifact"]
+    if with_execution_log:
+        with d.transaction() as conn:
+            conn.execute(
+                "INSERT INTO execution_log(evaluation_attempt_id,cycle_id,log_kind,ref,content_hash,bytes) "
+                "VALUES (?,2,'eval',?,?,?)",
+                (started["attempt_id"], log_binding["execution_log_ref"],
+                 log_binding["execution_log_hash"], primary["bytes"]))
+    production_gate = PoolGate(
+        d, gate.read, pool_publisher=publisher,
+        require_formal_publication=True)
+    return {
+        "gate": production_gate, "publisher": publisher, "training": training,
+        "publication": publication, "work": work,
+        "baseline_id": bid, "variant_id": vid, "build_target_id": bt,
+        "run_id": rid, "checkpoint_id": checkpoint_id,
+        **started,
+        "metric_results": metrics, "final_identity": final_identity,
+        "subject_hash": "formal-result-sh", "primary": primary,
+        "log_binding": log_binding,
+    }
+
+
+def _register_formal_evaluation_args(prepared, publication):
+    return {
+        "cycle_id": "c2",
+        "build_target_id": prepared["build_target_id"],
+        "purpose": "factory",
+        "current_subject_hash": prepared["subject_hash"],
+        "attempt_id": prepared["attempt_id"],
+        "metric_results": prepared["metric_results"],
+        "publication": publication,
+    }
+
+
 def test_full_registration_chain(env):
     gate, d = env
     ids = _build_chain(gate, d)
@@ -138,6 +270,240 @@ def test_full_registration_chain(env):
     assert d.query_one("SELECT status FROM variant WHERE id=?", (ids["variant_id"],))[0] == "legal"
     gate.gate_finish_build_target(build_target_id=ids["bt"], status="complete")   # CP5.1 complete 前置现可满足
     assert d.query_one("SELECT status FROM build_target WHERE id=?", (ids["bt"],))[0] == "complete"
+
+
+@pytest.mark.parametrize(
+    ("invalid_kind", "message"),
+    [
+        ("missing", "缺 verified pool publication"),
+        ("forged", "receipt 与文件复验结果不一致"),
+        ("forged_hash", "pool manifest hash 不符"),
+        ("stale", "formal evaluation artifact hash 失配"),
+    ],
+)
+def test_production_evaluation_rejects_missing_forged_or_stale_publication(
+        env, tmp_path, invalid_kind, message):
+    legacy_gate, d = env
+    prepared = _formal_registration_ready(legacy_gate, d, tmp_path)
+    publication = prepared["publication"]
+    if invalid_kind == "missing":
+        supplied = None
+    elif invalid_kind == "forged":
+        supplied = replace(publication, payload={})
+    elif invalid_kind == "forged_hash":
+        supplied = replace(publication, manifest_hash="0" * 64)
+    else:
+        (prepared["work"] / prepared["primary"]["path"]).write_bytes(b"stale")
+        supplied = publication
+
+    with pytest.raises(GateReject, match=message):
+        prepared["gate"].gate_register_evaluation(
+            **_register_formal_evaluation_args(prepared, supplied))
+
+    assert d.query_one(
+        "SELECT status,artifact_ref,transcript_ref FROM evaluation_attempt WHERE id=?",
+        (prepared["attempt_id"],)) == ("running", None, None)
+    assert d.query_one(
+        "SELECT status,canonical_attempt_id FROM evaluation WHERE id=?",
+        (prepared["evaluation_id"],)) == ("running", None)
+    assert d.query_one(
+        "SELECT count(*) FROM metric_result WHERE evaluation_id=?",
+        (prepared["evaluation_id"],))[0] == 0
+    assert d.query_one(
+        "SELECT identity_doc,status FROM baseline WHERE id=?",
+        (prepared["baseline_id"],)) == ("# planning draft", "building")
+    assert d.query_one(
+        "SELECT status FROM variant WHERE id=?", (prepared["variant_id"],))[0] == "building"
+    assert d.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 0
+    assert d.query_one("SELECT count(*) FROM card")[0] == 0
+
+
+def test_production_evaluation_and_legal_transition_require_atomic_publication_closure(
+        env, tmp_path):
+    legacy_gate, d = env
+    prepared = _formal_registration_ready(
+        legacy_gate, d, tmp_path, with_execution_log=False)
+    gate, publication = prepared["gate"], prepared["publication"]
+    register = _register_formal_evaluation_args(prepared, publication)
+
+    # Even a byte-valid publication cannot make the evaluation successful when
+    # its formal execution-log ref/hash is absent.  All earlier writes roll back.
+    with pytest.raises(GateReject, match="formal evaluation execution_log"):
+        gate.gate_register_evaluation(**register)
+    assert d.query_one(
+        "SELECT status,artifact_ref,transcript_ref FROM evaluation_attempt WHERE id=?",
+        (prepared["attempt_id"],)) == ("running", None, None)
+    assert d.query_one(
+        "SELECT status,canonical_attempt_id FROM evaluation WHERE id=?",
+        (prepared["evaluation_id"],)) == ("running", None)
+    assert d.query_one(
+        "SELECT identity_doc,status FROM baseline WHERE id=?",
+        (prepared["baseline_id"],)) == ("# planning draft", "building")
+    assert d.query_one(
+        "SELECT count(*) FROM metric_result WHERE evaluation_id=?",
+        (prepared["evaluation_id"],))[0] == 0
+    assert d.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 0
+
+    primary = prepared["primary"]
+    binding = prepared["log_binding"]
+    with d.transaction() as conn:
+        conn.execute(
+            "INSERT INTO execution_log(evaluation_attempt_id,cycle_id,log_kind,ref,content_hash,bytes) "
+            "VALUES (?,2,'eval',?,?,?)",
+            (prepared["attempt_id"], binding["execution_log_ref"],
+             binding["execution_log_hash"], primary["bytes"]))
+    assert gate.gate_register_evaluation(**register) == {
+        "evaluation_id": prepared["evaluation_id"],
+        "attempt_id": prepared["attempt_id"],
+    }
+    assert d.query_one(
+        "SELECT status,artifact_ref,transcript_ref FROM evaluation_attempt WHERE id=?",
+        (prepared["attempt_id"],)) == (
+            "success", binding["artifact_ref"], publication.manifest_ref)
+    assert d.query_one(
+        "SELECT status,canonical_attempt_id FROM evaluation WHERE id=?",
+        (prepared["evaluation_id"],)) == ("success", prepared["attempt_id"])
+    assert d.query_one(
+        "SELECT identity_doc,status FROM baseline WHERE id=?",
+        (prepared["baseline_id"],)) == (prepared["final_identity"], "building")
+    assert d.query_one(
+        "SELECT status FROM variant WHERE id=?", (prepared["variant_id"],))[0] == "building"
+    assert d.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 1
+    assert d.query_one(
+        "SELECT count(*) FROM card WHERE card_type IN ('baseline','variant','protocol')")[0] == 3
+    with d.transaction() as conn:
+        assert is_formally_published(conn, variant_id=prepared["variant_id"]) is False
+
+    gate.gate_register_baseline(
+        baseline_id=prepared["baseline_id"], variant_id=prepared["variant_id"],
+        build_target_id=prepared["build_target_id"],
+        evaluation_id=prepared["evaluation_id"], cycle_id="c2",
+        current_subject_hash=prepared["subject_hash"],
+        identity_doc="# identity", repro_cmd="python train.py",
+        run_id=prepared["run_id"], publication=publication)
+    assert d.query_one(
+        "SELECT status FROM baseline WHERE id=?", (prepared["baseline_id"],))[0] == "legal"
+    assert d.query_one(
+        "SELECT status FROM variant WHERE id=?", (prepared["variant_id"],))[0] == "legal"
+    with d.transaction() as conn:
+        assert is_formally_published(conn, variant_id=prepared["variant_id"]) is True
+    assert d.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 1
+
+
+def test_eval_only_registration_itself_requires_and_binds_formal_publication(
+        env, tmp_path):
+    legacy_gate, d = env
+    prepared = _formal_registration_ready(legacy_gate, d, tmp_path)
+    gate, publication = prepared["gate"], prepared["publication"]
+    # Isolate the evaluation-registration gate on the same fully constructed
+    # evidence graph: there is no later baseline/variant registration step for
+    # an eval-only target, so this transaction must create the DB publication anchor.
+    with d.transaction() as conn:
+        conn.execute(
+            "UPDATE build_target SET target_kind='eval',"
+            "eval_action='create_evaluation',attempt_purpose='standalone_eval',"
+            "evaluation_source='factory',eval_key='formal-eval' WHERE id=?",
+            (prepared["build_target_id"],))
+        conn.execute(
+            "UPDATE baseline SET identity_doc=?,status='legal' WHERE id=?",
+            (prepared["final_identity"], prepared["baseline_id"]))
+        conn.execute(
+            "UPDATE variant SET status='legal' WHERE id=?",
+            (prepared["variant_id"],))
+        assert is_formally_published(
+            conn, variant_id=prepared["variant_id"]) is False
+
+    with pytest.raises(GateReject, match="缺 verified pool publication"):
+        gate.gate_register_evaluation(
+            **_register_formal_evaluation_args(prepared, None))
+    assert d.query_one(
+        "SELECT status FROM evaluation_attempt WHERE id=?",
+        (prepared["attempt_id"],))[0] == "running"
+
+    gate.gate_register_evaluation(
+        **_register_formal_evaluation_args(prepared, publication))
+    assert d.query_one(
+        "SELECT status FROM evaluation_attempt WHERE id=?",
+        (prepared["attempt_id"],))[0] == "success"
+    assert d.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication' "
+        "AND json_extract(payload_json,'$.evaluation_id')=?",
+        (prepared["evaluation_id"],))[0] == 1
+    with d.transaction() as conn:
+        assert is_formally_published(
+            conn, variant_id=prepared["variant_id"]) is True
+
+
+def test_formal_append_attempt_binds_new_publication_without_replacing_canonical(
+        env, tmp_path):
+    legacy_gate, d = env
+    prepared = _formal_registration_ready(legacy_gate, d, tmp_path)
+    gate, first = prepared["gate"], prepared["publication"]
+    gate.gate_register_evaluation(
+        **_register_formal_evaluation_args(prepared, first))
+    gate.gate_register_baseline(
+        baseline_id=prepared["baseline_id"], variant_id=prepared["variant_id"],
+        build_target_id=prepared["build_target_id"],
+        evaluation_id=prepared["evaluation_id"], cycle_id="c2",
+        current_subject_hash=prepared["subject_hash"],
+        identity_doc="# identity", repro_cmd="python train.py",
+        run_id=prepared["run_id"], publication=first)
+    canonical_attempt = prepared["attempt_id"]
+
+    appended = gate.gate_start_attempt(
+        cycle_id="c2", purpose="repro_eval",
+        build_target_id=prepared["build_target_id"],
+        evaluation_id=prepared["evaluation_id"])
+    results = tmp_path / "append-evaluation"
+    results.mkdir()
+    (results / "eval.log").write_text(
+        "metric_value accuracy=0.92\n", encoding="utf-8")
+    metrics = [{
+        "metric_id": 1, "metric_ver": 1, "value": 0.92,
+        "scope": "aggregate",
+    }]
+    publication = prepared["publisher"].publish_evaluation(
+        EvaluationPublicationSpec(
+            training=prepared["training"],
+            evaluation_id=prepared["evaluation_id"], eval_key="formal-eval",
+            attempt_id=appended["attempt_id"], attempt_no=appended["attempt_no"],
+            results_source=results, primary_artifact="eval.log", metrics=metrics,
+            protocol=ProtocolPublication(
+                protocol_id=1, version=1, name="proto", scope_spec={}),
+            checkpoint_ids={"final": prepared["checkpoint_id"]},
+        ))
+    binding = publication.database_bindings["evaluation_attempt"]
+    primary = publication.payload["objects"]["evaluation"]["primary_artifact"]
+    with d.transaction() as conn:
+        conn.execute(
+            "INSERT INTO execution_log(evaluation_attempt_id,cycle_id,log_kind,ref,content_hash,bytes) "
+            "VALUES (?,2,'eval',?,?,?)",
+            (appended["attempt_id"], binding["execution_log_ref"],
+             binding["execution_log_hash"], primary["bytes"]))
+
+    gate.gate_register_evaluation(
+        cycle_id="c2", build_target_id=prepared["build_target_id"],
+        purpose="repro_eval", current_subject_hash=prepared["subject_hash"],
+        attempt_id=appended["attempt_id"], metric_results=metrics,
+        publication=publication)
+    assert d.query_one(
+        "SELECT status,canonical_attempt_id FROM evaluation WHERE id=?",
+        (prepared["evaluation_id"],)) == ("success", canonical_attempt)
+    assert d.query_one(
+        "SELECT status,artifact_ref,transcript_ref FROM evaluation_attempt WHERE id=?",
+        (appended["attempt_id"],)) == (
+            "success", binding["artifact_ref"], publication.manifest_ref)
+    assert d.query_one(
+        "SELECT count(*) FROM decision WHERE type='pool_publication' "
+        "AND json_extract(payload_json,'$.variant_id')=?",
+        (prepared["variant_id"],))[0] == 2
+    with d.transaction() as conn:
+        assert is_formally_published(
+            conn, variant_id=prepared["variant_id"]) is True
 
 
 def test_register_existing_running_attempt(env):
@@ -172,6 +538,59 @@ def test_register_evaluation_requires_result_review(env):
             metric_results=[{"metric_id": 1, "metric_ver": 1, "value": 0.9}],
             create={"variant_id": ids["variant_id"], "protocol_id": 1, "protocol_ver": 1,
                     "eval_key": "fac", "source": "factory", "target_set_hash": "tsh"})
+
+
+def test_reviews_can_be_disabled_without_weakening_registration_gates(env):
+    default_gate, d = env
+    gate = PoolGate(
+        d, default_gate.read,
+        require_code_review=False, require_result_review=False)
+    claimed = gate.gate_claim_baseline(
+        canonical_key="ck-no-review", slug="no-review", cycle_id="c2",
+        identity_draft_md="# draft")
+    bid, vid = claimed["baseline_id"], claimed["variant_id"]
+    with d.transaction() as conn:
+        bt = conn.execute(
+            "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id) "
+            "VALUES (2,2,'build',1,'pending',?,?)", (bid, vid)).lastrowid
+        conn.execute(
+            "INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) VALUES (?,1,1)",
+            (bt,))
+
+    gate.gate_start_build_target(build_target_id=bt)
+    gate.gate_progress_build_target(build_target_id=bt, to="smoke")
+    gate.gate_progress_build_target(build_target_id=bt, to="running")
+    rid = gate.gate_start_run(
+        build_target_id=bt, cycle_id="c2", variant_id=vid, kind="build", env_hash="eh")
+    with d.transaction() as conn:
+        conn.execute(
+            "INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,produced_by_run) "
+            "VALUES (?,'final','/p','ckh','sha256',?)", (vid, rid))
+    gate.gate_finish_run(run_id=rid, status="success")
+
+    create = {
+        "variant_id": vid, "protocol_id": 1, "protocol_ver": 1,
+        "eval_key": "fac-no-review", "source": "factory", "target_set_hash": "tsh",
+    }
+    with pytest.raises(GateReject, match="required metric"):         # metric gate 仍保留
+        gate.gate_register_evaluation(
+            cycle_id="c2", build_target_id=bt, purpose="factory",
+            current_subject_hash="unused", metric_results=[], create=create)
+    reg = gate.gate_register_evaluation(
+        cycle_id="c2", build_target_id=bt, purpose="factory",
+        current_subject_hash="unused",
+        metric_results=[{"metric_id": 1, "metric_ver": 1, "value": 0.91}],
+        create=create)
+    assert gate.review_passed(
+        build_target_id=bt, review_kind="bundle_result_review",
+        current_subject_hash="unused") is False
+    gate.gate_register_baseline(
+        baseline_id=bid, variant_id=vid, build_target_id=bt,
+        evaluation_id=reg["evaluation_id"], cycle_id="c2",
+        current_subject_hash="unused", identity_doc="# identity",
+        repro_cmd="python train.py", run_id=rid)
+    assert d.query_one("SELECT status FROM baseline WHERE id=?", (bid,))[0] == "legal"
+    assert d.query_one("SELECT status FROM variant WHERE id=?", (vid,))[0] == "legal"
 
 
 def test_register_evaluation_required_coverage_and_i2(env):

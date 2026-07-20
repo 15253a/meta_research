@@ -1,7 +1,9 @@
 """测试公共设施：定位系统根目录、加载 schema / fixture、$ref 注册表、DB 最小合法图。"""
 import json
+import shutil
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -85,6 +87,26 @@ def seeded_conn():
 @pytest.fixture(scope="session")
 def system_root() -> Path:
     return SYSTEM_ROOT
+
+
+@pytest.fixture()
+def docker_workspace_tmp_path() -> Path:
+    """Put nested-Docker bind fixtures on the production VEPFS mount domain.
+
+    Pytest's default ``/tmp`` is on an outer overlay, while the rootless Docker
+    daemon consumes workspace paths through the VEPFS bindfs mapping.  A long
+    suite can therefore expose a freshly populated ``/tmp`` bind as stale or
+    empty.  Real container tests use this fixture so their bind visibility
+    matches production work roots; ordinary unit tests retain ``tmp_path``.
+    """
+    parent = SYSTEM_ROOT / "runtime" / "pytest-docker"
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent.chmod(0o700)
+    path = Path(tempfile.mkdtemp(prefix="docker-test-", dir=parent))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def load_schema(name: str) -> dict:

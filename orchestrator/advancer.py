@@ -355,12 +355,13 @@ class SqliteAdvancer:
         if cyc.status in ("done", "failed", "aborted"):
             return "done"                # 幂等 / 恢复：已提交轮跳过（不重复写；权威判定在写事务内二次核，见 _reasoning_cycle）
         self.state.assert_current_cycle(cycle_id)
-        if cyc.route in ("attack", "eval_only", "reuse_only"):
+        if cyc.route in ("attack", "eval_only", "reuse_only", "dependency_wait"):
             if self.attack is None:
                 raise NotImplementedError(f"{cyc.route} 轮需装配 attack=AttackStages（多阶段计划执行器）")
             return self.attack.advance_stage(cyc)   # 按 cycle.status 游标推进一格（多格轮，run_cycles 内循环驱动）
         if cyc.route not in ("bootstrap", "decompose", "goal_amend"):
-            raise NotImplementedError(f"未支持的 route={cyc.route!r}（reuse_only/eval_only/dependency_wait 特化随对应 plan 形态接入）")
+            raise NotImplementedError(
+                f"未支持的 route={cyc.route!r}（reuse_only/eval_only 特化随对应 plan 形态接入）")
         self._reasoning_cycle(cyc)
         return "done"
 

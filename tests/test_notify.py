@@ -95,7 +95,7 @@ def _request(n=1):
     return {"summary_md": "需要外部数据集：镜像不含、无法自行获取", "items": _items(n)}
 
 
-def test_precheck_applies_durable_set_budget_semantics(env):
+def test_precheck_rejects_enabling_budget_guard_during_disabled_session(env):
     d, c = env["d"], env["c"]
     result = c.handle_inbound(
         connector="qq", raw_text="设置预算 50", idempotency_key="unsupported-budget",
@@ -107,14 +107,16 @@ def test_precheck_applies_durable_set_budget_semantics(env):
     assert make_advancer_precheck(c, d)() is None
     status, payload = d.query_one(
         "SELECT status,payload_json FROM directive WHERE id=?", (result["directive_id"],))
-    assert status == "consumed"
+    assert status == "rejected"
     parsed = json.loads(payload)
     assert parsed["budget_patch"] == {"session_max": 50.0}
-    actor, kind, effect_limit = d.query_one(
-        "SELECT actor,type,json_extract(payload_json,'$.effect.budget.session_max') "
+    assert parsed["rejection_kind"] == "application_unavailable"
+    assert "运行期不得启用/关闭成本记账" in parsed["rejection_reason"]
+    actor, kind = d.query_one(
+        "SELECT actor,type "
         "FROM decision WHERE directive_id=? ORDER BY id DESC LIMIT 1",
         (result["directive_id"],))
-    assert (actor, kind, effect_limit) == ("human", "directive_set_budget", 50.0)
+    assert (actor, kind) == ("orchestrator", "directive_application_rejected")
 
 
 def test_precheck_rejects_reasoning_directive_overflow_before_consumption(env):
@@ -632,7 +634,7 @@ def test_terminal_operations_validate_full_pending_request_before_cleanup(
     elif corruption == "too-many-items":
         items = _items(11)
     elif corruption == "schema-item":
-        del items[0]["failure_reason"]
+        del items[0]["desc"]
     elif corruption == "schema-summary":
         summary_md = ""
     elif corruption == "policy-limit":
@@ -770,12 +772,50 @@ def test_directive_rejected_and_superseded_events(env):
 
 
 # ============ 文件请求：创建负例 + schema 拒 ============
-def test_create_checked_schema_rejects_missing_attempted_paths(env, tmp_path):
+def test_create_checked_accepts_minimal_user_facing_request(env, tmp_path):
     svc = FileRequestService(env["d"], SCHEMAS, POLICY, str(tmp_path / "input"))
-    bad = _request(1)
-    del bad["items"][0]["attempted_paths"]
-    with pytest.raises(FileRequestReject, match="schema"):
-        svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request=bad)
+    request = {"summary_md": "需要补充材料", "items": [
+        {"kind": "paper", "desc": "用于核对许可"}]}
+    assert svc.create_checked(
+        goal_id=1, goal_ver=1, stage="plan", request=request) >= 1
+
+
+def test_permission_request_is_binary_and_never_accepts_upload(env, tmp_path):
+    d = env["d"]
+    svc = FileRequestService(d, SCHEMAS, POLICY, str(tmp_path / "input"))
+    request = {"summary_md": "需要读取已登记的本机目录", "items": [{
+        "kind": "permission", "desc": "允许本轮只读访问该已登记目录"}]}
+    rid = svc.create_checked(
+        goal_id=1, goal_ver=1, stage="plan", request=request)
+    mid = InteractionIngest(d).inbound(
+        connector="console", raw_text=f"同意权限请求 r{rid}",
+        idempotency_key="approve-permission", goal_id=1, goal_ver=1)
+    svc.approve(request_id=rid, resolved_message_id=mid)
+    status, resolution = d.query_one(
+        "SELECT status,resolution_json FROM interaction_request WHERE id=?", (rid,))
+    assert status == "resolved" and json.loads(resolution) == {"approved": True}
+    rendered = SqliteCompiler(d.conn, POLICY)._input_asset_receipts(
+        1, 1, "c1", "plan", [], [])
+    assert '"permission_decision":"approved"' in rendered
+
+    upload_request = {"summary_md": "只确认另一个权限", "items": [{
+        "kind": "permission", "desc": "允许本轮只读访问另一项已登记资源"}]}
+    upload_rid = svc.create_checked(
+        goal_id=1, goal_ver=1, stage="plan", request=upload_request)
+    upload_mid = InteractionIngest(d).inbound(
+        connector="console", raw_text=f"尝试向权限请求 r{upload_rid} 上传文件",
+        idempotency_key="upload-to-permission", goal_id=1, goal_ver=1)
+    with pytest.raises(ValueError, match="只能同意或不同意"):
+        svc.resolve(
+            request_id=upload_rid, uploads_dir=str(tmp_path / "uploads"),
+            resolved_message_id=upload_mid)
+
+    with pytest.raises(FileRequestReject, match="不得混|不得要求上传"):
+        svc.create_checked(goal_id=1, goal_ver=1, stage="plan", request={
+            "summary_md": "错误混合", "items": [
+                {"kind": "permission", "desc": "授权"},
+                {"kind": "dataset", "desc": "数据"},
+            ]})
 
 
 def test_create_checked_policy_negatives(env, tmp_path):
