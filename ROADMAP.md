@@ -30,10 +30,8 @@
   image 与后续 runtime identity 继承已落 `1e57611`，2b.2c reviewed adapter generation 已落 `c0ba5ed`。
   CP11.4c.2b.3a honest deployment preflight 已落 `16d5270`，2b.3b fixed GPU device bridge 已落 `563a496`；
   至此 CP11.4c.2 的代码与 fail-closed 部署合同收口。当前进入 CP11.4c.3 目标 VEPFS 两节点/真实
-  数百轮（明确下限 ≥200）故障注入验收；3a 会话诚实化及 3b.1/b.2a/b.2b.1/b.2b.2/b.2b.3 snapshot、
-  日志镜像、import/dependency CAS 与 registered checkpoint/log 原路径恢复已分别落
-  `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`/`866afda`，CP11.4c.3b 的代码与运维工具闭合；
-  独立故障域归档和真实恢复演练仍归 d.2。CP11.4c.3c.1a
+  数百轮（明确下限 ≥200）故障注入验收；3a 会话诚实化及 3b.1/b.2a/b.2b.1/b.2b.2 snapshot、日志镜像与
+  import/dependency CAS 离线恢复已分别落 `b2081a3`/`83ace54`/`011c98b`/`f59c72c`/`d72da35`。CP11.4c.3c.1a
   real SEED/DREAMER sealed-holdout、one-shot final 与独立 scorer 已落 `2a98e4b`；c.1b 以 `e1654fa`
   补齐 T1 spent-before-spawn confirmatory LODO、exact sandbox promotion、root immutable audit verdict 与全准入路径回放，
   CP11.4c.3c.1 闭合。CP11.4c.3c.2a
@@ -44,9 +42,7 @@
   的 tool-free query/adapter 工人，同时保留 root 开发跨 UID 与严格能力边界；d.1.1 以 `6aec828`
   修复白名单 PATH 对默认 Codex launcher 的 Node 解析回归；d.1.2–d.1.4 已闭合真实 plan、精确测量引用与
   malformed review 恢复，d.1.5 以 `b208233` 将 transcript/heartbeat 文件身份绑定 durable runner_call，
-  跨 checkpoint 不再覆盖旧调用证据。d.2a 以 `acb0684` 增加有界常驻退出模式，并将目标 preflight、两节点
-  canary、真实 connector、≥200 轮/fault、restore、T1/T2 与 `fixed_and_test` 证据交接串成单一 fail-closed
-  runbook。下一动作仍是 CP11.4c.3d.2 目标设施真实执行；当前节点无 NVIDIA container runtime，尚未完成
+  跨 checkpoint 不再覆盖旧调用证据。下一检查点进入 CP11.4c.3d.2 目标运行。当前节点无 NVIDIA container runtime，尚未完成
   两节点正向、GPU、真实 ≥200 轮或生产验收。
   - 用户 2026-07-07 授权**全自动模式**：OPEN 项不再停下问用户，自主裁决并落受审载体（记 build_log）。M1 三 OPEN 裁定已落 `meta-research/db/README.md`。
 
@@ -390,7 +386,7 @@
 - 来源：用户 2026-07-09 要求根据全系统设计/实现审查直接修改，并以独立 git 提交方便回滚。
 - 目标：保留 SQLite/Gate/append-only 骨架，优先消除会破坏无人值守承诺的 poison-pill、断裂控制面和单实例/执行边界缺口。
 - 验证方法：每类外部坏产物首次与全新实例重启均能业务收尾或受控停机、不重复裸崩；真实 HTTP 控制台可完成
-  hard directive confirm/reject 与文件请求 resolve/cancel；多目标 critical 语义、goal 最新版、单实例锁和子进程组终止均有正反例；全量测试绿。
+hard directive confirm/reject 与文件请求 resolve/cancel；多目标 critical 语义、goal 最新版、单实例锁和子进程组终止均有正反例；全量测试绿。
 - 检查点（模型切，边走边补）：
   - [x] CP11.1 外部产物接纳硬化：metric 严格解析/有限值 + 统一 SQLite ID 边界 +
     reasoning 语义拒收，首次/全新实例重启 no-wedge，DB 损坏 fail-loud。→ commit `ac53516`
@@ -497,15 +493,14 @@
           未实现 turn 内跨阶段提交的 B，不为可选吞吐模式新造第二套状态机。→ commit `b2081a3`
           （build_log 0072；相关 165 通过；内部代码/文档与外审最终轮 APPROVE；唯一全量受当前 20G
           overlay 仅余 175MB 并在运行中 ENOSPC 污染，依约未重跑）。
-        - [x] CP11.4c.3b 存储治理代码与运维工具：每轮 SQLite online 滚动备份 + views 独立 Git 提交 +
-          immutable/CAS 资产 manifest/hash；registered checkpoint/log 分级镜像、恢复闭包、容量阈值与安全 GC。
-          本项勾选不代表独立故障域归档或目标环境恢复演练通过，真实演练仍归 CP11.4c.3d.2。
+        - [ ] CP11.4c.3b 存储治理：每轮 SQLite online 滚动备份 + views 独立 Git 提交 + immutable/CAS 资产
+          manifest/hash；原始日志分级归档、恢复演练、容量阈值与安全 GC。不每轮复制大 checkpoint/content store。
           - [x] CP11.4c.3b.1 cycle snapshot 主干：research done 在当轮 τ/global-stop 检查后，其余
             import-worker/failed/aborted 在终态边界，以 SQLite online backup → 同快照 DB-derived views Git →
             immutable manifest 顺序发布；启动先幂等补缝，旧库只建诚实 adoption baseline，不伪造历史逐轮快照。
             → commit `83ace54`（build_log 0073；相关 105；内部代码/参考文档双审 APPROVE；
             外审误读已增补回归证伪，最终轮 CLI 挂起无 verdict；容量不足未启动全量）。
-          - [x] CP11.4c.3b.2 运维闭环：离线 verify/restore、至少 3 代已验证 DB backup、现有资源 envelope
+          - [ ] CP11.4c.3b.2 运维闭环：离线 verify/restore、至少 3 代已验证 DB backup、现有资源 envelope
             派生的容量门、dry-run-first 的有界 apply GC；registered checkpoint/content-store/log 原件不 GC。
             - [x] CP11.4c.3b.2a snapshot offline ops：独占既有 instance lease，逐轮验证 immutable
               pointer/manifest/views 链并深验最近 3 代 SQLite；只向不存在的新 work-root 恢复 SQLite 真相，
@@ -515,7 +510,7 @@
               继承已证明的 preflight envelope，但不把 `statvfs` 冒充持续 hard-quota 证明。
               → commit `011c98b`（build_log 0074；相关 118；内部双终审 APPROVE；外审第 1 轮 401、
               第 2 轮 5 分钟无 verdict；全量依用户要求留到最终检查点）。
-            - [x] CP11.4c.3b.2b registered asset closure：不加 daemon/第二 DB，只在现有 snapshot/CAS 上
+            - [ ] CP11.4c.3b.2b registered asset closure：不加 daemon/第二 DB，只在现有 snapshot/CAS 上
               补已登记资产的离线副本、校验与恢复闭包。
               - [x] CP11.4c.3b.2b.1 registered execution-log mirror：从最新已深验 SQLite snapshot 的
                 `execution_log` 行枚举冻结原件，建 deterministic gzip CAS + immutable per-row index；
@@ -532,17 +527,8 @@
                 → commit `d72da35`（build_log 0076；相关 storage/import/inspector **31 passed** +
                 既有 restore **4 passed**；内部三路终审 APPROVE；外审第 1 轮 401、第 2 轮约 5 分钟/49k tokens
                 无 verdict；全量依用户要求留到最终检查点）。
-              - [x] CP11.4c.3b.2b.3 registered checkpoint/log recovery：从最新 retained SQLite high-water
-                枚举 checkpoint 与 execution-log exact authority；checkpoint 进入 raw SHA256 CAS + immutable
-                per-row index，日志复用 deterministic gzip mirror，并按原相对路径 no-clobber hydration。
-                组合恢复严格按 SQLite → registered assets → import CAS，独立 marker 在 exact source authority、
-                completion receipt、逐文件复验和 import CAS 全闭合前不解除；append-only refs 通过完整 path lineage
-                多跳 relocation，不改写 DB，且 target 在 claim 前拒绝与任一历史根相等或互嵌。
-                → commit `866afda`（build_log 0090；storage **63** + evidence **30** + 相邻 **198**；唯一有效
-                全量 **1841 passed, 1 skipped**；外审最终 `APPROVE`）。
-              DB-registered checkpoint/log 与 DB 可达 import CAS 的代码闭包已完成。完整 work-root/fileset、
-              runner/guardian/qualification/uploads/views/connector authority、跨站独立故障域归档及目标环境演练
-              不在本父项的机器声明内，继续由各自 authority 与 CP11.4c.3d.2 验收，不能虚报完整灾备。
+              b.2b.2 的 import CAS scope 已完成；execution-log 正本、checkpoint/content store 与完整 work-root DR
+              仍明确不在该 scope，故 b.2b/b.2/b 父项暂不勾选，不虚报完整灾备。
         - [x] CP11.4c.3c 验收与科学隔离工具：不新增运行时调度系统，只提供薄 canary/runner/packer；
           c.1/c.2/c.3 均已闭合，真实目标环境验收仍归 c.3d.2。
           - [x] CP11.4c.3c.1 T1/T2 输入防火墙：机械执行并验证 §7.4 sealed-holdout/one-shot/non-feedback 约束。
@@ -614,8 +600,40 @@
           - [ ] CP11.4c.3d.2 目标环境真实验收：dedicated VM/private cgroup+NVIDIA Docker、GPFS
             quota/second node/connector 就位后，跑完真实 ≥200 轮、故障注入、全量回归与 T1/T2 qualification，
             再勾 CP11.4c。
-            - [x] CP11.4c.3d.2a 目标运行与出口证据交接：新增 `--exit-after-research` 有界常驻模式；
-              冻结 production preflight/two-node canary/connector/≥200 轮与 fault/restore/T1/T2 的执行顺序，
-              以 per-run no-clobber + 双 SHA manifest 向 `fixed_and_test` 交付机器矩阵和可披露原始证据，
-              敏感原件与用户裁决保持分离。→ commit `acb0684`（build_log 0091；run **61**；唯一有效全量
-              **1843 passed, 1 skipped**；两轮外审的终态 linger、owner-kill restart 与 symlink 泄露等反馈全修）。
+
+### 步⑬（Bundle Target DAG）常驻 per-target Worker + 并发实验调度
+
+- 来源：用户 2026-07-26 要求按 `.scratch/bundle-target-dag/` 当前 plan 修改 meta-research。
+- 目标：保留一个 cycle-wide Scheduler task，但把 target 实现、实验监控与 admission 责任下沉到
+  每 target 一个稳定、可恢复的 Worker task；DAG readiness 只认正式 publication、合法领域状态与
+  phase commit，资源足够时并发执行同一 ready frontier。
+- 验证方法：以 A→(B,C) 为权威外部行为场景——A admission 前 B/C 零执行副作用；A 正式 admission 后
+  B/C 同时 ready，资源足够时存在重叠执行区间；每 target 有独立稳定 Worker/review children/私有源码副本/
+  精确 GPU lease/增量日志 cursor/terminal report；owner/provider/Worker 中断恢复不重复研究资产；
+  replay 缺 dependency/input/Worker/lease/review/terminal 任一项 fail closed；聚焦测试、全量 pytest、
+  browser smoke、compileall、diff check 与最终独立 code review 通过。
+- 检查点（按 `.scratch/bundle-target-dag/issues/` 的纵向 ticket）：
+  - [x] CP13.1 耐久 target DAG + 受信 admission：additive migration、Plan dependency/parent/resource 契约、
+    环/缺失/自依赖/跨 cycle 拒绝、publication+legal+phase-commit admission 与 ready frontier。
+  - [x] CP13.2 文件侧增量实验监控：append-only event journal、snapshot/incremental cursor、
+    bounded wait、200 默认/1000 硬上限、UTF-8/chunk/半行/恢复与监控节奏。
+  - [x] CP13.3 per-target 常驻 Worker：cycle Scheduler 与 target Worker 能力隔离、稳定 provider task
+    身份、同 task repair/admission、独立 code/result review children、紧凑 terminal report。
+  - [x] CP13.4 publication-backed source reuse：精确 publication/source/hash binding、私有物化、
+    symlink/漂移拒绝、B/C 隔离发布。
+  - [x] CP13.5 trusted resource leases：抽象 GPU 数量→授权设备原子独占 lease、资源等待、
+    sandbox 精确子集、guardian-drained release 与 crash reconcile。
+  - [x] CP13.6 并发 ready-frontier Scheduler：稳定优先级、slot/resource-aware dispatch、独立 repair、
+    紧凑 overview/wait、B/C 重叠运行证明。
+  - [x] CP13.7 恢复与 DAG 失败传播：恢复 Scheduler/Worker 身份且不重复资产；非关键失败只 skip 后代，
+    critical replan 停止新调度、排空 guardian 后进入 Reasoning；replay fail closed。
+  - [x] CP13.8 A→(B,C) 全链与旧契约清理：三 baseline build、A 源码私有复用、全 admission 链、
+    中断恢复、terminal reports；退役严格串行 authoring/status-tail 生产路径并统一术语。
+- 结果（2026-07-26）：当前工作树已完成全部 8 个 ticket。外审第 1 轮发现新文件权限阻断，
+  修复后以无特权用户验证 import/migration/skill；第 2 轮发现 fixed Worker live repair/replan
+  错绑 cycle session，修复为精确 per-target owner，并用 `control_accepting` 关闭 Worker 退出
+  TOCTOU。最终 `pytest -q` 为 2765 passed、22 skipped；console/browser 97 passed；compileall、
+  diff check、非 root runtime asset 检查与内部终审均通过。
+- 提交：功能 commit `1762f98`（build_log 0092）。因开工前已有与 CP13 调用链重叠且无法安全拆分的
+  resident runtime/native review/storage 改动，提交采用同一全量回归验证的 107 文件代码闭包；运行产物、
+  `.scratch`、参考资料和反馈图片未纳入。
