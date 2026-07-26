@@ -5,11 +5,15 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
+import stat
 import subprocess
 import pwd
+import sys
+import tempfile
 import time
 import types
 from pathlib import Path
@@ -27,6 +31,19 @@ from orchestrator.runner import (DEFAULT_CODEX_MODEL, CodexRunner, parse_json_to
 from orchestrator.runtime_mcp import RuntimeIngestService, RuntimeMCPBroker
 from orchestrator.schemas import SchemaSet
 from orchestrator.writedaemon import WriteDaemon
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_codex_storage_environment(tmp_path, monkeypatch):
+    """Never let Runner tests inherit the developer machine's Codex stores."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CODEX_SQLITE_HOME", raising=False)
+    codex_home = tmp_path / ".test-codex-home"
+    codex_sqlite = tmp_path / ".test-codex-sqlite"
+    codex_home.mkdir()
+    codex_sqlite.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("CODEX_SQLITE_HOME", str(codex_sqlite))
 
 
 # ---------------- 解析（核心逻辑，无需 codex）----------------
@@ -65,6 +82,11 @@ def test_provider_invocation_id_and_conflicting_usage_are_explicit():
         "thread-abc", "thread_id")
     assert parse_provider_invocation_id("session id: session-xyz\n") == (
         "session-xyz", "session_id")
+    app_server_trace = (
+        '{"id":1,"result":{"thread":{"id":"thread-appserver-1",'
+        '"parentThreadId":null}}}\n')
+    assert parse_provider_invocation_id("", app_server_trace) == (
+        "thread-appserver-1", "thread_id")
     usage, source = CodexRunner._usage_with_source(
         "tokens used\n10\n", 0.5,
         '{"type":"turn.completed","usage":{"total_tokens":11}}')
@@ -93,16 +115,19 @@ class _FakeExecutionSupervisor:
 
     def run(self, cmd, *, stdin=None, capture_output=False, timeout_s=None,
             cwd=None, **_kwargs):
-        self.last_kwargs = dict(_kwargs)
+        self.last_kwargs = {"argv": list(cmd), **_kwargs}
         return self.fn(
             cmd, stdin=stdin, capture_output=capture_output,
             timeout=timeout_s, cwd=cwd)
 
 
 class _ReceiptExecutionSupervisor:
-    def __init__(self, receipt_dir):
+    def __init__(self, receipt_dir, *, stdout=b"",
+                 stderr=b"session id: session-real-1\ntokens used\n25\n"):
         self.authority = ExecutionSupervisor.standalone(receipt_dir)
         self.receipt_dir = self.authority.receipt_dir
+        self.stdout = stdout
+        self.stderr = stderr
 
     def run(self, cmd, *, stdin=None, capture_output=False, timeout_s=None,
             cwd=None, kind=None, operation_context=None, **_kwargs):
@@ -123,7 +148,7 @@ class _ReceiptExecutionSupervisor:
         })
         atomic_write_receipt(path, receipt)
         return types.SimpleNamespace(
-            returncode=0, stdout=b"", stderr=b"session id: session-real-1\ntokens used\n25\n",
+            returncode=0, stdout=self.stdout, stderr=self.stderr,
             receipt_path=path)
 
 
@@ -140,6 +165,61 @@ def test_runner_defaults_to_gpt_5_6_sol_max(tmp_path, monkeypatch):
     assert DEFAULT_CODEX_MODEL == "gpt-5.6-sol"
     assert runner.model == DEFAULT_CODEX_MODEL
     assert runner.effort == "max"
+
+
+def test_runner_defaults_to_direct_codex_cli(tmp_path, monkeypatch):
+    monkeypatch.delenv("METARESEARCH_CODEX_BIN", raising=False)
+
+    runner = _fake_runner(
+        tmp_path, _fake_run_factory(b"tokens used\n1\n"))
+
+    assert runner.bin == "/usr/local/bin/codex"
+    assert runner.bin != "codex-chatgpt"
+
+
+def test_explicit_direct_launcher_sees_bound_codex_storage(
+        tmp_path, monkeypatch):
+    launcher = tmp_path / "fake-direct-codex"
+    launcher.write_text(
+        "#!/usr/bin/python3\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "out = Path(sys.argv[sys.argv.index('-o') + 1])\n"
+        "payload = {'files': {'env.json': {\n"
+        "    'CODEX_HOME': os.environ.get('CODEX_HOME'),\n"
+        "    'CODEX_SQLITE_HOME': os.environ.get('CODEX_SQLITE_HOME'),\n"
+        "}}, 'md': ''}\n"
+        "out.write_text('```json\\n' + json.dumps(payload) + "
+        "'\\n```\\n', encoding='utf-8')\n"
+        "sys.stderr.write('tokens used\\n1\\n')\n",
+        encoding="utf-8")
+    launcher.chmod(0o700)
+    bound_codex_home = tmp_path / "vepfs-root" / ".codex-runtime" / "service"
+    bound_sqlite_home = (
+        tmp_path / "vepfs-root" / ".codex-runtime" / "service-sqlite")
+    bound_codex_home.mkdir(parents=True)
+    bound_sqlite_home.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(bound_codex_home))
+    monkeypatch.setenv("CODEX_SQLITE_HOME", str(bound_sqlite_home))
+    monkeypatch.setenv("METARESEARCH_CODEX_BIN", str(launcher))
+
+    runner = CodexRunner(transcripts_dir=tmp_path / "transcripts")
+    try:
+        artifact = runner.run_task(
+            system_prompt="s", skill="k", context_pack=_pack())
+    finally:
+        runner.execution_supervisor.close()
+
+    assert runner.bin == str(launcher)
+    assert artifact.files["env.json"] == {
+        "CODEX_HOME": str(bound_codex_home),
+        "CODEX_SQLITE_HOME": str(bound_sqlite_home),
+    }
+    assert all(
+        not Path(value).is_relative_to(Path("/root"))
+        for value in artifact.files["env.json"].values())
 
 
 def test_lifecycle_bound_runner_has_no_wall_clock_deadline(tmp_path):
@@ -220,16 +300,56 @@ def test_bundle_operator_reuses_thread_with_broad_local_and_network_tools(
         assert "本机与网络工具" in call["prompt"]
 
 
+def test_bundle_scheduler_prompt_requires_normal_terminal_drain(tmp_path):
+    captured = {}
+
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
+        captured["prompt"] = stdin.read().decode("utf-8")
+        out = Path(cmd[cmd.index("-o") + 1])
+        out.write_text(
+            '```json\n{"files":{},"md":"bundle scheduler complete"}\n```',
+            encoding="utf-8")
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=(
+                b'{"type":"thread.started","thread_id":"scheduler-thread-1"}\n'
+                b'{"type":"turn.completed","usage":{}}\n'
+            ),
+            stderr=b"tokens used\n1\n",
+        )
+
+    runner = _fake_runner(tmp_path, fake_run)
+    runner.bind_persistent_session(
+        session_id=None, role="bundle_scheduler")
+    runner.run_task(
+        system_prompt="s",
+        skill="k",
+        context_pack=ContextPack(
+            cycle_id="c1", stage="bundle", target_id=None,
+            anchor_md="frozen", neighborhood_md="", retrieval_md=""),
+    )
+
+    assert "正常完成也必须调用 bundle_drain" in captured["prompt"]
+    assert "cycle_terminal=true、drained=true" in captured["prompt"]
+
+
 def test_ordinary_runner_uses_explicit_minimal_environment(tmp_path, monkeypatch):
     """A shell-capable worker must not inherit connector, cloud, or host-only secrets."""
     codex_home = tmp_path / "codex-home"
+    codex_sqlite_home = tmp_path / "codex-sqlite"
     runtime_tmp = tmp_path / "runtime-tmp"
     monkeypatch.setenv("PATH", "/trusted/bin:/usr/bin:/bin")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("CODEX_SQLITE_HOME", str(codex_sqlite_home))
     monkeypatch.setenv("TMPDIR", str(runtime_tmp))
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:7890")
     monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "ca.pem"))
+    for name in (
+            "HF_HUB_CACHE", "HF_DATASETS_CACHE", "TRANSFORMERS_CACHE",
+            "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR",
+            "PYTHONPYCACHEPREFIX"):
+        monkeypatch.setenv(name, str(tmp_path / "bound" / name.lower()))
     monkeypatch.setenv("METARESEARCH_CODEX_MODEL", "deployment-model")
     monkeypatch.setenv("METARESEARCH_GITHUB_TOKEN", "must-not-reach-worker")
     monkeypatch.setenv("METARESEARCH_QQ_TOKEN", "must-not-reach-worker")
@@ -241,11 +361,15 @@ def test_ordinary_runner_uses_explicit_minimal_environment(tmp_path, monkeypatch
     process_env = runner.execution_supervisor.last_kwargs["env"]
 
     allowed = {
-        "PATH", "LANG", "LC_ALL", "CODEX_HOME", "HOME", "TMPDIR",
+        "PATH", "LANG", "LC_ALL", "CODEX_HOME", "CODEX_SQLITE_HOME",
+        "HOME", "TMPDIR", "TMP", "TEMP",
         "XDG_CACHE_HOME", "PIP_CACHE_DIR", "HF_HOME", "TORCH_HOME",
+        "HF_HUB_CACHE", "HF_DATASETS_CACHE", "TRANSFORMERS_CACHE",
+        "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR",
         "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
         "CONDA_PKGS_DIRS", "CONDA_ENVS_PATH", "UV_CACHE_DIR",
         "CUDA_CACHE_PATH", "MPLCONFIGDIR", "NUMBA_CACHE_DIR",
+        "PYTHONPYCACHEPREFIX",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy",
         "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR",
     }
@@ -253,6 +377,9 @@ def test_ordinary_runner_uses_explicit_minimal_environment(tmp_path, monkeypatch
     assert process_env["PATH"] == "/trusted/bin:/usr/bin:/bin"
     assert process_env["HOME"] == str(tmp_path / "home")
     assert process_env["CODEX_HOME"] == str(codex_home)
+    assert process_env["CODEX_SQLITE_HOME"] == str(codex_sqlite_home)
+    assert ("sqlite_home=" + json.dumps(str(codex_sqlite_home))) in (
+        runner.execution_supervisor.last_kwargs["argv"])
     assert process_env["TMPDIR"] == str(runtime_tmp)
     assert process_env["HTTP_PROXY"] == "http://proxy.invalid:7890"
     assert process_env["SSL_CERT_FILE"] == str(tmp_path / "ca.pem")
@@ -260,6 +387,156 @@ def test_ordinary_runner_uses_explicit_minimal_environment(tmp_path, monkeypatch
             "METARESEARCH_CODEX_MODEL", "METARESEARCH_GITHUB_TOKEN",
             "METARESEARCH_QQ_TOKEN", "AWS_SECRET_ACCESS_KEY", "UNRELATED_HOST_SECRET"):
         assert name not in process_env
+    for name in (
+            "HF_HUB_CACHE", "HF_DATASETS_CACHE", "TRANSFORMERS_CACHE",
+            "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR",
+            "PYTHONPYCACHEPREFIX"):
+        assert process_env[name] == str(tmp_path / "bound" / name.lower())
+
+
+def test_compat_process_receipt_directory_is_removed(monkeypatch):
+    created = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr(R.tempfile, "mkdtemp", recording_mkdtemp)
+    with open(os.devnull, "rb") as devnull:
+        result = R._run_process_group(
+            [sys.executable, "-c", "pass"],
+            stdin=devnull, timeout=5)
+
+    assert result.returncode == 0
+    assert len(created) == 1
+    assert not created[0].exists()
+
+
+def test_compat_process_run_error_remains_primary_when_close_fails(
+        tmp_path, monkeypatch):
+    receipt_dir = tmp_path / "receipts"
+    primary = RuntimeError("run primary")
+    cleanup = OSError("close cleanup")
+    removed = []
+
+    class FailingSupervisor:
+        def run(self, *_args, **_kwargs):
+            raise primary
+
+        def close(self):
+            raise cleanup
+
+    def make_receipts(**_kwargs):
+        receipt_dir.mkdir()
+        return str(receipt_dir)
+
+    monkeypatch.setattr(R.tempfile, "mkdtemp", make_receipts)
+    monkeypatch.setattr(
+        R.ExecutionSupervisor, "standalone",
+        lambda _receipt_dir: FailingSupervisor())
+    monkeypatch.setattr(
+        R.shutil, "rmtree", lambda path: removed.append(Path(path)))
+
+    with pytest.raises(RuntimeError, match="run primary") as caught:
+        R._run_process_group(["unused"], stdin=None, timeout=1)
+
+    assert caught.value is primary
+    assert any("close cleanup" in note for note in primary.__notes__)
+    assert receipt_dir.is_dir()
+    assert removed == []
+
+
+def test_compat_process_run_error_remains_primary_when_rmtree_fails(
+        tmp_path, monkeypatch):
+    receipt_dir = tmp_path / "receipts"
+    primary = RuntimeError("run primary")
+
+    class FailingRunSupervisor:
+        def run(self, *_args, **_kwargs):
+            raise primary
+
+        def close(self):
+            return None
+
+    def make_receipts(**_kwargs):
+        receipt_dir.mkdir()
+        return str(receipt_dir)
+
+    monkeypatch.setattr(R.tempfile, "mkdtemp", make_receipts)
+    monkeypatch.setattr(
+        R.ExecutionSupervisor, "standalone",
+        lambda _receipt_dir: FailingRunSupervisor())
+    monkeypatch.setattr(
+        R.shutil, "rmtree",
+        lambda _path: (_ for _ in ()).throw(OSError("rmtree cleanup")))
+
+    with pytest.raises(RuntimeError, match="run primary") as caught:
+        R._run_process_group(["unused"], stdin=None, timeout=1)
+
+    assert caught.value is primary
+    assert any("rmtree cleanup" in note for note in primary.__notes__)
+    assert receipt_dir.is_dir()
+
+
+def test_compat_process_close_failure_preserves_receipts_and_skips_delete(
+        tmp_path, monkeypatch):
+    receipt_dir = tmp_path / "receipts"
+    removed = []
+
+    class FailingCloseSupervisor:
+        def run(self, *_args, **_kwargs):
+            return types.SimpleNamespace(returncode=0)
+
+        def close(self):
+            raise OSError("close failed")
+
+    def make_receipts(**_kwargs):
+        receipt_dir.mkdir()
+        return str(receipt_dir)
+
+    monkeypatch.setattr(R.tempfile, "mkdtemp", make_receipts)
+    monkeypatch.setattr(
+        R.ExecutionSupervisor, "standalone",
+        lambda _receipt_dir: FailingCloseSupervisor())
+    monkeypatch.setattr(
+        R.shutil, "rmtree", lambda path: removed.append(Path(path)))
+
+    with pytest.raises(OSError, match="close failed"):
+        R._run_process_group(["unused"], stdin=None, timeout=1)
+
+    assert receipt_dir.is_dir()
+    assert removed == []
+
+
+def test_compat_process_rmtree_failure_is_primary_after_successful_close(
+        tmp_path, monkeypatch):
+    receipt_dir = tmp_path / "receipts"
+
+    class SuccessfulSupervisor:
+        def run(self, *_args, **_kwargs):
+            return types.SimpleNamespace(returncode=0)
+
+        def close(self):
+            return None
+
+    def make_receipts(**_kwargs):
+        receipt_dir.mkdir()
+        return str(receipt_dir)
+
+    monkeypatch.setattr(R.tempfile, "mkdtemp", make_receipts)
+    monkeypatch.setattr(
+        R.ExecutionSupervisor, "standalone",
+        lambda _receipt_dir: SuccessfulSupervisor())
+    monkeypatch.setattr(
+        R.shutil, "rmtree",
+        lambda _path: (_ for _ in ()).throw(OSError("rmtree failed")))
+
+    with pytest.raises(OSError, match="rmtree failed"):
+        R._run_process_group(["unused"], stdin=None, timeout=1)
+
+    assert receipt_dir.is_dir()
 
 
 def test_untrusted_file_receipt_guard_is_present_even_without_resolved_refs(tmp_path):
@@ -382,6 +659,119 @@ def test_managed_broad_tool_runner_uses_disposable_cwd_and_keeps_all_tools(
     assert captured["context_anchor"] == pack.anchor_md
     assert captured["context_index"]["delivery"] == "managed_readonly_paths"
     assert captured["context_index"]["sections"][0]["required_read"] is True
+
+
+def test_bundle_worker_gets_private_writable_published_input_copy(tmp_path):
+    workspace = tmp_path / "quest"
+    published = workspace / "c1" / "t7" / "published-inputs" / "base"
+    published.mkdir(parents=True)
+    durable_file = published / "model.py"
+    durable_file.write_bytes(b"VALUE = 1\n")
+    durable_inode = durable_file.stat().st_ino
+    captured = {}
+
+    def fake_run(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
+        runtime_file = Path(cwd) / "published-inputs" / "base" / "model.py"
+        captured["runtime"] = Path(cwd)
+        captured["before"] = runtime_file.read_bytes()
+        captured["inode"] = runtime_file.stat().st_ino
+        runtime_file.write_bytes(b"VALUE = 2\n")
+        captured["after"] = runtime_file.read_bytes()
+        Path(cmd[cmd.index("-o") + 1]).write_text(
+            '```json\n{"files":{},"md":"ok"}\n```',
+            encoding="utf-8")
+        return types.SimpleNamespace(
+            returncode=0, stdout=b"", stderr=b"tokens used\n1\n")
+
+    pack = ContextPack(
+        cycle_id="c1", stage="bundle", target_id="7", anchor_md="frozen",
+        neighborhood_md="", retrieval_md="",
+        artifact_refs=[{
+            "kind": "published_source_input",
+            "ref": str(published),
+            "source": "bundle_source_binding:1",
+            "content_hash": (
+                "sha256-tree-v1:"
+                "afba9f33a217a18d3fe3b79e94095b2f4b8ff5c99f71e3d71c186d45a6e6c6b5"
+            ),
+        }])
+
+    _fake_runner(
+        tmp_path / "transcripts", fake_run, workspace_dir=workspace,
+        sandbox_mode="workspace-write",
+    ).run_task(system_prompt="s", skill="k", context_pack=pack)
+
+    assert captured["before"] == b"VALUE = 1\n"
+    assert captured["after"] == b"VALUE = 2\n"
+    assert captured["inode"] != durable_inode
+    assert durable_file.read_bytes() == b"VALUE = 1\n"
+    assert not captured["runtime"].exists()
+
+
+def test_bundle_published_input_requires_writable_managed_workspace(tmp_path):
+    workspace = tmp_path / "quest"
+    workspace.mkdir()
+    launched = []
+    pack = ContextPack(
+        cycle_id="c1", stage="bundle", target_id="7", anchor_md="frozen",
+        neighborhood_md="", retrieval_md="",
+        artifact_refs=[{
+            "kind": "published_source_input",
+            "ref": str(
+                workspace / "c1" / "t7" / "published-inputs" / "base"),
+            "source": "bundle_source_binding:1",
+            "content_hash": "sha256-tree-v1:" + "a" * 64,
+        }])
+
+    with pytest.raises(R.RunnerError, match="writable managed workspace"):
+        _fake_runner(
+            tmp_path / "transcripts",
+            lambda *_args, **_kwargs: launched.append(True),
+            workspace_dir=workspace, no_host_tools=True,
+        ).run_task(system_prompt="s", skill="k", context_pack=pack)
+
+    assert launched == []
+
+
+@pytest.mark.parametrize("corruption", ["hash-drift", "symlink"])
+def test_bundle_worker_rejects_invalid_published_input_before_launch(
+        tmp_path, corruption):
+    workspace = tmp_path / "quest"
+    published = workspace / "c1" / "t7" / "published-inputs" / "base"
+    published.mkdir(parents=True)
+    if corruption == "hash-drift":
+        (published / "model.py").write_bytes(b"VALUE = 9\n")
+    else:
+        outside = tmp_path / "outside.py"
+        outside.write_bytes(b"VALUE = 1\n")
+        (published / "model.py").symlink_to(outside)
+    launched = []
+
+    def fake_run(*_args, **_kwargs):
+        launched.append(True)
+        raise AssertionError("invalid published input must fail before launch")
+
+    pack = ContextPack(
+        cycle_id="c1", stage="bundle", target_id="7", anchor_md="frozen",
+        neighborhood_md="", retrieval_md="",
+        artifact_refs=[{
+            "kind": "published_source_input",
+            "ref": str(published),
+            "source": "bundle_source_binding:1",
+            "content_hash": (
+                "sha256-tree-v1:"
+                "afba9f33a217a18d3fe3b79e94095b2f4b8ff5c99f71e3d71c186d45a6e6c6b5"
+            ),
+        }])
+
+    with pytest.raises(R.RunnerError, match="published input") as caught:
+        _fake_runner(
+            tmp_path / "transcripts", fake_run, workspace_dir=workspace,
+            sandbox_mode="workspace-write",
+        ).run_task(system_prompt="s", skill="k", context_pack=pack)
+
+    assert caught.value.failure_kind == "artifact_input"
+    assert launched == []
 
 
 def test_bundle_workspace_files_are_promoted_as_path_hash_refs(tmp_path):
@@ -601,6 +991,31 @@ def test_bound_runner_publishes_provider_receipt_before_return(tmp_path):
     assert art.prompt_sha256 == invocation.prompt_sha256
 
 
+def test_app_server_thread_id_is_persisted_in_runner_call_receipt(tmp_path):
+    trace = (
+        b'{"id":1,"result":{"thread":{"id":"thread-appserver-1",'
+        b'"parentThreadId":null}}}\n')
+    supervisor = _ReceiptExecutionSupervisor(
+        tmp_path / "executions", stdout=trace, stderr=b"")
+    runner = CodexRunner(
+        transcripts_dir=tmp_path / "transcripts",
+        execution_supervisor=supervisor)
+    runner.bind_runner_call(
+        runner_call_id=8, reconcile_protocol="runner-call-v1",
+        phase="idea", purpose="idea-appserver")
+
+    artifact = runner.run_task(
+        system_prompt="s", skill="k", context_pack=_pack())
+    invocation = load_provider_invocation_receipt(
+        Path(artifact.provider_receipt_ref), expected_runner_call_id=8,
+        expected_cycle_id="c1", expected_phase="idea",
+        expected_purpose="idea-appserver",
+        expected_execution_receipt_ref=artifact.execution_receipt_ref)
+
+    assert invocation.provider_invocation_id == "thread-appserver-1"
+    assert invocation.provider_invocation_id_kind == "thread_id"
+
+
 def test_tool_free_runner_keeps_live_web_but_disables_host_tools(tmp_path, monkeypatch):
     """interaction_query 只保留 Web search；命令行关 shell/浏览器/apps/再委派。"""
     monkeypatch.setenv("METARESEARCH_GITHUB_TOKEN", "must-not-reach-worker")
@@ -657,8 +1072,11 @@ def test_tool_free_runner_supports_non_root_production_service(
     monkeypatch.setattr(R.os, "geteuid", lambda: service.pw_uid)
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir(mode=0o700)
+    codex_sqlite_home = tmp_path / "codex-sqlite"
+    codex_sqlite_home.mkdir(mode=0o700)
     (codex_home / "auth.json").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("CODEX_SQLITE_HOME", str(codex_sqlite_home))
     monkeypatch.setenv("METARESEARCH_GITHUB_TOKEN", "must-not-reach-worker")
     monkeypatch.setenv("METARESEARCH_QQ_TOKEN", "must-not-reach-worker")
     captured = {}
@@ -695,10 +1113,19 @@ def test_tool_free_runner_supports_non_root_production_service(
         "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR",
     }
     assert set(process_env) == {
-        "PATH", "LANG", "LC_ALL", "CODEX_HOME", "HOME", "TMPDIR",
-        "XDG_CACHE_HOME", "PIP_CACHE_DIR", "HF_HOME", "TORCH_HOME",
+        "PATH", "LANG", "LC_ALL", "CODEX_HOME", "CODEX_SQLITE_HOME",
+        "HOME", "TMPDIR", "TMP", "TEMP",
+        "XDG_CACHE_HOME", "PIP_CACHE_DIR",
+        "HF_HOME", "HF_HUB_CACHE", "HF_DATASETS_CACHE",
+        "TRANSFORMERS_CACHE", "TORCH_HOME", "TORCH_EXTENSIONS_DIR",
+        "TRITON_CACHE_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        "XDG_STATE_HOME", "CONDA_PKGS_DIRS", "CONDA_ENVS_PATH",
+        "UV_CACHE_DIR", "CUDA_CACHE_PATH", "MPLCONFIGDIR",
+        "NUMBA_CACHE_DIR", "PYTHONPYCACHEPREFIX",
     } | (allowed_optional & set(os.environ))
     assert process_env["CODEX_HOME"] == str(codex_home)
+    assert process_env["CODEX_SQLITE_HOME"] == str(codex_sqlite_home)
+    assert ("sqlite_home=" + json.dumps(str(codex_sqlite_home))) in cmd
     assert process_env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
     assert "METARESEARCH_GITHUB_TOKEN" not in process_env
     assert "METARESEARCH_QQ_TOKEN" not in process_env
@@ -1140,6 +1567,348 @@ def test_runner_consumes_live_runtime_mcp_submission_end_to_end(tmp_path):
         conn.close()
 
 
+def test_bound_non_appserver_runner_grants_runtime_mcp_runner_call_identity(
+        tmp_path, monkeypatch):
+    class Broker:
+        socket_path = str(tmp_path / "runtime-mcp.sock")
+
+        def __init__(self):
+            self.grants = []
+
+        def grant(self, **kwargs):
+            self.grants.append(kwargs)
+            return "runtime-token"
+
+        def latest_stage_submission(self, _token):
+            return None
+
+        def revoke(self, _token):
+            pass
+
+    broker = Broker()
+    runner = CodexRunner(
+        transcripts_dir=tmp_path / "transcripts",
+        execution_supervisor=_FakeExecutionSupervisor(
+            _fake_run_factory(b"tokens used\n1\n")),
+        runtime_mcp_broker=broker)
+    runner.bind_runner_call(
+        runner_call_id=73, reconcile_protocol="runner-call-v1",
+        phase="idea", purpose="idea-main-c1-n1-a1")
+    monkeypatch.setattr(
+        runner, "_publish_provider_receipt", lambda **_kwargs: None)
+
+    runner.run_task(system_prompt="s", skill="k", context_pack=_pack())
+
+    assert broker.grants[0]["runner_call_id"] == 73
+    assert broker.grants[0].get("native_review_ledger") is None
+
+
+def test_timed_resident_stage_main_uses_app_server_for_native_review(
+        tmp_path, monkeypatch):
+    direct_codex = tmp_path / "managed-codex"
+    direct_codex.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    direct_codex.chmod(0o700)
+    monkeypatch.setenv("METARESEARCH_CODEX_BIN", str(direct_codex))
+
+    class StopAfterCommand(RuntimeError):
+        pass
+
+    class Broker:
+        socket_path = str(tmp_path / "runtime-mcp.sock")
+
+        def grant(self, **_kwargs):
+            return "runtime-token"
+
+        def latest_stage_submission(self, _token):
+            return None
+
+        def revoke(self, _token):
+            pass
+
+    class Supervisor:
+        def run(self, cmd, **kwargs):
+            assert cmd[:2] == ["/usr/bin/python3", R.APP_SERVER_DRIVER_PATH]
+            assert callable(kwargs.get("capture_observer"))
+            assert kwargs["kind"] == "codex-stage-main"
+            assert kwargs["operation_context"][
+                "native_review_spawn_proof_mode"
+            ] == "appserver-resume-lineage-v1"
+            assert kwargs["capture_observer"].__self__.spawn_proof_mode == (
+                "appserver-resume-lineage-v1")
+            raise StopAfterCommand
+
+    runner = CodexRunner(
+        transcripts_dir=tmp_path / "transcripts",
+        lifecycle_bound=False,
+        execution_supervisor=Supervisor(),
+        runtime_mcp_broker=Broker())
+    runner.bind_persistent_session(
+        session_id="stage-existing-thread", role="stage_main")
+    runner.bind_runner_call(
+        runner_call_id=74, reconcile_protocol="runner-call-v1",
+        phase="idea", purpose="idea-main-c1-n1-a1")
+
+    with pytest.raises(StopAfterCommand):
+        runner.run_task(system_prompt="s", skill="k", context_pack=_pack())
+
+    assert runner.timeout_s is not None
+
+
+def test_resident_runtime_mcp_stage_uses_app_server_start_then_resume(
+        tmp_path, monkeypatch):
+    fixture = (
+        Path(__file__).resolve().parent / "fixtures" /
+        "native_review_appserver_minimal.jsonl")
+    direct_codex = tmp_path / "managed-codex-0.144.5"
+    direct_codex.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    direct_codex.chmod(0o700)
+    monkeypatch.setenv("METARESEARCH_CODEX_BIN", str(direct_codex))
+
+    class Broker:
+        socket_path = str(tmp_path / "runtime-mcp.sock")
+
+        def __init__(self):
+            self.grants = []
+            self.revoked = []
+            self.asserted = []
+
+        def grant(self, **kwargs):
+            self.grants.append(kwargs)
+            return f"token-{len(self.grants)}"
+
+        def latest_stage_submission(self, _token):
+            return None
+
+        def assert_stage_turn_complete(self, token):
+            self.asserted.append(token)
+
+        def revoke(self, token):
+            self.revoked.append(token)
+
+    class AppServerSupervisor:
+        def __init__(self):
+            self.specs = []
+            self.commands = []
+
+        def run(self, cmd, *, capture_observer=None, env=None, **_kwargs):
+            self.commands.append(list(cmd))
+            assert cmd[:2] == ["/usr/bin/python3", R.APP_SERVER_DRIVER_PATH]
+            spec_path = Path(cmd[cmd.index("--spec") + 1])
+            assert stat.S_IMODE(spec_path.stat().st_mode) == 0o600
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            self.specs.append(spec)
+            assert env["METARESEARCH_CODEX_BIN"] == str(direct_codex)
+            assert callable(capture_observer)
+            grant = broker.grants[-1]
+            assert grant["runner_call_id"] in {61, 62, 63}
+            assert grant["native_review_ledger"] is capture_observer.__self__
+
+            parent = "stage-parent-1"
+            events = [
+                json.loads(line)
+                for line in fixture.read_text(encoding="utf-8").splitlines()]
+
+            def replace(value):
+                if isinstance(value, str):
+                    return value.replace("thread-parent-1", parent)
+                if isinstance(value, list):
+                    return [replace(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: replace(item) for key, item in value.items()}
+                return value
+
+            events = [replace(event) for event in events]
+            parent_message = next(
+                event for event in events
+                if event.get("method") == "item/completed"
+                and event.get("params", {}).get("threadId") == parent
+                and event.get("params", {}).get("item", {}).get("phase")
+                == "final_answer")
+            parent_message["params"]["item"]["text"] = (
+                '```json\n{"files":{"idea_set.json":'
+                '{"transport":"app-server"}},"md":"resident"}\n```')
+            raw = b"".join(
+                json.dumps(
+                    event, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8") + b"\n"
+                for event in events)
+            capture_observer(raw[:17])
+            capture_observer(raw[17:])
+            receipt = {
+                "state": "terminal",
+                "outcome": "exit",
+                "returncode": 0,
+                "group_drained": True,
+                "capture_stdout_bytes": len(raw),
+                "capture_stdout_sha256": (
+                    "sha256:" + hashlib.sha256(raw).hexdigest()),
+            }
+            receipt_path = tmp_path / f"execution-{len(self.specs)}.json"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            return types.SimpleNamespace(
+                returncode=0, stdout=raw, stderr=b"",
+                receipt=receipt, receipt_path=receipt_path)
+
+    broker = Broker()
+    supervisor = AppServerSupervisor()
+    runner = CodexRunner(
+        transcripts_dir=tmp_path / "transcripts",
+        lifecycle_bound=True,
+        execution_supervisor=supervisor,
+        runtime_mcp_broker=broker)
+    monkeypatch.setattr(
+        runner, "_publish_provider_receipt", lambda **_kwargs: None)
+    runner.bind_persistent_session(session_id=None, role="stage_main")
+
+    runner.bind_runner_call(
+        runner_call_id=61, reconcile_protocol="runner-call-v1",
+        phase="idea", purpose="idea-resident-1")
+    first = runner.run_task(
+        system_prompt="s", skill="k", context_pack=_pack())
+    runner.bind_runner_call(
+        runner_call_id=62, reconcile_protocol="runner-call-v1",
+        phase="idea", purpose="idea-resident-2")
+    second = runner.run_task(
+        system_prompt="s", skill="k", context_pack=_pack())
+
+    assert first.files == second.files == {
+        "idea_set.json": {"transport": "app-server"}}
+    assert [spec["thread_id"] for spec in supervisor.specs] == [
+        None, "stage-parent-1"]
+    assert all("exec" not in command for command in supervisor.commands)
+    assert runner._resume_session_id == "stage-parent-1"  # noqa: SLF001
+    assert len(runner._last_native_review_evidence) == 1  # noqa: SLF001
+    assert runner._last_native_review_evidence[0].child_thread_id == (  # noqa: SLF001
+        "thread-child-1")
+    assert len(list((tmp_path / "transcripts").glob("*.events.jsonl"))) == 2
+    assert broker.revoked == ["token-1", "token-2"]
+    assert [grant["runner_call_id"] for grant in broker.grants] == [61, 62]
+    assert (broker.grants[0]["native_review_ledger"]
+            is not broker.grants[1]["native_review_ledger"])
+    assert broker.asserted == []
+
+    # A separate resident Bundle main session must execute the owner-side
+    # normal-exit postcondition before its capability is revoked.
+    bundle_runner = CodexRunner(
+        transcripts_dir=tmp_path / "bundle-transcripts",
+        lifecycle_bound=True,
+        execution_supervisor=supervisor,
+        runtime_mcp_broker=broker)
+    monkeypatch.setattr(
+        bundle_runner, "_publish_provider_receipt", lambda **_kwargs: None)
+    bundle_runner.bind_persistent_session(session_id=None, role="stage_main")
+    bundle_runner.bind_runner_call(
+        runner_call_id=63, reconcile_protocol="runner-call-v1",
+        phase="bundle", purpose="bundle-resident-1")
+    bundle_runner.run_task(
+        system_prompt="s", skill="k",
+        context_pack=ContextPack(
+            cycle_id="c1", stage="bundle", target_id="7",
+            anchor_md="frozen", neighborhood_md="", retrieval_md=""))
+    assert broker.asserted == ["token-3"]
+    assert broker.revoked[-1] == "token-3"
+
+
+@pytest.mark.parametrize("failure_mode", [
+    "observer_rejects",
+    "parent_final_missing",
+])
+def test_resident_app_server_evidence_failure_still_publishes_provider_receipt(
+        tmp_path, monkeypatch, failure_mode):
+    direct_codex = tmp_path / "managed-codex-0.144.5"
+    direct_codex.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    direct_codex.chmod(0o700)
+    monkeypatch.setenv("METARESEARCH_CODEX_BIN", str(direct_codex))
+
+    fixture = (
+        Path(__file__).resolve().parent / "fixtures" /
+        "native_review_appserver_minimal.jsonl")
+    if failure_mode == "observer_rejects":
+        payload = b'{"malformed":]\n'
+        sleep_s = 30
+    else:
+        events = [
+            json.loads(line)
+            for line in fixture.read_text(encoding="utf-8").splitlines()]
+        events = [
+            event for event in events
+            if not (
+                event.get("method") == "item/completed"
+                and event.get("params", {}).get("threadId")
+                == "thread-parent-1"
+                and event.get("params", {}).get("item", {}).get("phase")
+                == "final_answer")]
+        payload = b"".join(
+            json.dumps(event, separators=(",", ":")).encode() + b"\n"
+            for event in events)
+        sleep_s = 0
+    payload_path = tmp_path / f"{failure_mode}.jsonl"
+    payload_path.write_bytes(payload)
+
+    class Broker:
+        socket_path = str(tmp_path / "runtime-mcp.sock")
+
+        def grant(self, **_kwargs):
+            return "failure-token"
+
+        def latest_stage_submission(self, _token):
+            return None
+
+        def revoke(self, _token):
+            pass
+
+    class DelegatingSupervisor:
+        def __init__(self):
+            self.authority = ExecutionSupervisor.standalone(
+                tmp_path / f"{failure_mode}-receipts")
+
+        def run(self, _cmd, *, capture_observer=None, timeout_s=None,
+                kind=None, operation_context=None, **_kwargs):
+            code = (
+                "import os,sys,time; "
+                "os.write(1,open(sys.argv[1],'rb').read()); "
+                "os.write(2,b'tokens used\\n5\\n'); "
+                "time.sleep(float(sys.argv[2]))")
+            return self.authority.run(
+                [sys.executable, "-c", code,
+                 str(payload_path), str(sleep_s)],
+                capture_output=True, timeout_s=timeout_s, kind=kind,
+                operation_context=operation_context,
+                capture_observer=capture_observer,
+                progress_interval_s=0.05)
+
+    supervisor = DelegatingSupervisor()
+    runner = CodexRunner(
+        transcripts_dir=tmp_path / "transcripts",
+        lifecycle_bound=True,
+        execution_supervisor=supervisor,
+        runtime_mcp_broker=Broker())
+    runner.bind_persistent_session(session_id=None, role="stage_main")
+    runner_call_id = 91 if failure_mode == "observer_rejects" else 92
+    runner.bind_runner_call(
+        runner_call_id=runner_call_id,
+        reconcile_protocol="runner-call-v1",
+        phase="idea", purpose=f"idea-{failure_mode}")
+    try:
+        with pytest.raises(R.RunnerError) as caught:
+            runner.run_task(
+                system_prompt="s", skill="k", context_pack=_pack())
+    finally:
+        supervisor.authority.close()
+
+    error = caught.value
+    assert error.usage is not None and error.usage.tokens_total == 5
+    assert error.execution_receipt_ref is not None
+    assert error.provider_receipt_ref is not None
+    invocation = load_provider_invocation_receipt(
+        Path(error.provider_receipt_ref),
+        expected_runner_call_id=runner_call_id,
+        expected_cycle_id="c1", expected_phase="idea",
+        expected_purpose=f"idea-{failure_mode}",
+        expected_execution_receipt_ref=error.execution_receipt_ref)
+    assert invocation.usage.tokens_total == 5
+
+
 @pytest.mark.parametrize("raw", [
     "no fenced json",
     '```json\n{"files":{}} {"extra":1}\n```',
@@ -1210,6 +1979,25 @@ def test_resident_timeout_without_provider_id_never_starts_fresh_thread(tmp_path
     with pytest.raises(R.RunnerError) as second:
         runner.run_task(system_prompt="s", skill="k", context_pack=_pack())
     assert second.value.failure_kind == "provider_session_missing"
+    assert len(calls) == 1
+
+
+def test_resident_nonzero_exit_reports_runtime_before_session_identity(tmp_path):
+    calls = []
+
+    def fail_before_session(cmd, stdin=None, capture_output=False, timeout=None, cwd=None):
+        calls.append(list(cmd))
+        return types.SimpleNamespace(
+            returncode=1, stdout=b"",
+            stderr=b"Provided authentication token is expired\n")
+
+    runner = _fake_runner(tmp_path, fail_before_session)
+    runner.bind_persistent_session(session_id=None, role="stage_main")
+
+    with pytest.raises(R.RunnerError, match="runner 进程失败") as error:
+        runner.run_task(system_prompt="s", skill="k", context_pack=_pack())
+
+    assert error.value.failure_kind == "runtime"
     assert len(calls) == 1
 
 

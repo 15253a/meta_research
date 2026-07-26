@@ -36,6 +36,18 @@ def _new_store(path=":memory:"):
     return s
 
 
+def test_production_done_requires_reasoning_phase_commit():
+    state = SQLiteStateStore(
+        WriteDaemon(db.connect(":memory:")), TEST_POLICY,
+        require_reasoning_commit=True)
+    state.create_goal(text="root goal", predicate_json={})
+    cycle = state.open_or_resume_cycle()
+    state.set_route(cycle.cycle_id, "bootstrap")
+
+    with pytest.raises(RuntimeError, match="reasoning phase_commit"):
+        state.mark_cycle_done(cycle.cycle_id)
+
+
 @pytest.fixture()
 def store():
     s = _new_store()
@@ -177,6 +189,29 @@ def test_max_open_questions_accounts_for_released_parent():
     with pytest.raises(ValueError, match="max_open_questions"):  # 2 子 + 释放的父 = 3 open > 2（旧代码漏算父 +1 会误放行）
         s.apply_tree_ops(c.cycle_id, [{"op": "add_children", "parent_question_id": root,
                                        "children": [{"local_key": "a", "text": "a"}, {"local_key": "b", "text": "b"}]}])
+
+
+def test_decompose_schedulability_respects_hard_tree_depth():
+    s = _store_with(max_decompose_depth=1)
+    root = _bootstrap_root(s)
+    _decompose(s, root, n=1)
+    child = f"q{s.daemon.query_one('SELECT id FROM question WHERE parent_id=1')[0]}"
+
+    assert s.decompose_guard_reason(child) == "max_decompose_depth"
+    assert s.is_schedulable(child, for_intent="decompose") is False
+    assert s.is_schedulable(child, for_intent="attack") is True
+
+
+def test_null_decompose_depth_is_unbounded():
+    s = _store_with(max_decompose_depth=None)
+    parent = _bootstrap_root(s)
+    for _ in range(6):
+        cid = _decompose(s, parent, n=1)
+        parent = f"q{s.daemon.query_one('SELECT max(id) FROM question')[0]}"
+        s.mark_cycle_done(cid)
+
+    assert s.decompose_guard_reason(parent) is None
+    assert s.is_schedulable(parent, for_intent="decompose") is True
 
 
 def test_max_children_per_node_cumulative(store):

@@ -19,7 +19,7 @@
     },
     "targets": {
       "type": "array",
-      "description": "要执行的事（按依赖序 seq）；每项一个 target_kind ∈ {build,exec,eval}（import 永不在此，§3.3.1）",
+      "description": "要执行的 Bundle DAG 节点；depends_on 承担正确性依赖，seq 只用于稳定显示与 ready frontier tie-break。每项一个 target_kind ∈ {build,exec,eval}（import 永不在此，§3.3.1）",
       "items": { "$ref": "#/$defs/target" }
     },
     "import_defer": { "$ref": "#/$defs/import_defer" },
@@ -119,15 +119,91 @@
     },
     "target": {
       "type": "object",
-      "required": ["target_key", "target_kind", "seq", "critical", "budget_estimate", "gpu_required", "spec_md"],
+      "required": ["target_key", "target_kind", "seq", "critical", "budget_estimate", "spec_md"],
       "additionalProperties": false,
       "properties": {
-        "target_key": { "type": "string", "minLength": 1, "description": "plan 内稳定键；bundle 产物与 required_metric 以此关联" },
+        "target_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+          "description": "plan 内稳定键；DAG edge、published source、bundle 产物与 required_metric 均以此关联"
+        },
         "target_kind": { "enum": ["build", "exec", "eval"] },
-        "seq": { "type": "integer", "minimum": 1, "description": "依赖序（bundle 严格串行按此执行）" },
+        "seq": { "type": "integer", "minimum": 1, "description": "稳定显示顺序与 ready target 调度 tie-break；不得作为依赖或 admission 正确性门禁" },
         "critical": { "type": "boolean", "description": "关键目标失败 → 早退（剩余未执行 pending 置 skipped）；非关键失败 → 本目标 failed、继续取下一个（RFAIL 口径对齐 06f 状态机）" },
         "budget_estimate": { "type": "number", "minimum": 0 },
-        "gpu_required": { "type": "boolean", "default": false, "description": "本 target 的 smoke/train/eval 是否需要 CUDA/GPU；新 plan 必须显式决定，旧 plan 省略时按 false" },
+        "gpu_required": { "type": "boolean", "description": "旧 Plan 兼容字段：false→gpu_count=0，true→gpu_count=1；resources 存在时以后者为准。新 Plan 应使用 resources.gpu_count" },
+        "resources": {
+          "type": "object",
+          "description": "抽象资源请求。Plan 只能声明数量；物理 GPU index、UUID 与 device identity 由受信 allocator 从授权 contract 派生，永不属于 Plan",
+          "required": ["gpu_count"],
+          "additionalProperties": false,
+          "properties": {
+            "gpu_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 64,
+              "description": "本 target 同时需要的 GPU 数；0 表示 CPU-only"
+            }
+          }
+        },
+        "replicate": {
+          "type": "object",
+          "description": "本 build/exec target 所声明的训练 replicate 身份。seed 在执行时写入 durable run；省略仅兼容旧 Plan，等价于 seed=null。seed 永不属于 baseline/variant identity 或 claim.config_json",
+          "required": ["seed"],
+          "additionalProperties": false,
+          "properties": {
+            "seed": {
+              "type": ["integer", "null"],
+              "minimum": -9223372036854775808,
+              "maximum": 9223372036854775807
+            }
+          }
+        },
+        "depends_on": {
+          "type": "array",
+          "description": "显式上游 target_key；全部上游 exact admission 后本 target 才 ready",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+          }
+        },
+        "parent_baseline": {
+          "type": "object",
+          "description": "新 baseline 的稳定父关系：指向本 Plan 中的上游 target，或指向既有 baseline_ref；二者恰一",
+          "additionalProperties": false,
+          "properties": {
+            "target_key": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            },
+            "baseline_ref": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          },
+          "oneOf": [
+            { "required": ["target_key"] },
+            { "required": ["baseline_ref"] }
+          ]
+        },
+        "published_source_inputs": {
+          "type": "array",
+          "description": "从 exact admitted upstream publication 绑定的源码输入；物化路径不由 Plan 声明",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "required": ["input_key", "target_key"],
+            "additionalProperties": false,
+            "properties": {
+              "input_key": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+              },
+              "target_key": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+              }
+            }
+          }
+        },
         "spec_md": { "type": "string", "minLength": 1, "description": "本目标做什么（构建/训练/评估内容，bundle 只照办）" },
         "need_ids": { "type": "array", "items": { "type": "string" } },
         "claim": {
@@ -139,15 +215,23 @@
             "slug": { "type": "string", "minLength": 1 },
             "baseline_ref": { "type": "string", "minLength": 1 },
             "variant_key": { "type": "string", "minLength": 1 },
-            "config_json": { "type": "object" }
+            "config_json": {
+              "$ref": "#/$defs/seedless_config",
+              "description": "variant 的训练配置身份；任何层级的 seed 必须移到 target.replicate.seed，并在 durable run 上登记"
+            }
           }
         },
         "eval_action": { "enum": ["create_evaluation", "append_attempt"] },
         "attempt_purpose": { "enum": ["factory", "retry", "metric_append", "repro_eval", "standalone_eval", "protocol_upgrade"] },
         "evaluation_id": { "type": "string", "description": "append_attempt 时定位既有 evaluation（M0 为产物级 id，M1 起 DB id；§6.11 字段名）" },
         "eval_key": { "type": "string", "minLength": 1, "description": "create_evaluation 时新格子的 eval_key（DDL build_target CHECK 要求）" },
-        "evaluation_source": { "enum": ["factory", "protocol_upgrade", "standalone_eval"], "description": "create_evaluation 时声明来源（DDL build_target CHECK 要求；M0 假执行由驱动器改标 fake 落 bundle 产物）" }
+        "evaluation_source": { "enum": ["factory", "protocol_upgrade", "standalone_eval"], "description": "create_evaluation 时声明来源（DDL build_target CHECK 要求；M0 假执行由驱动器改标 fake 落 bundle 产物）" },
+        "scientific_contract": { "$ref": "#/$defs/scientific_contract" }
       },
+      "anyOf": [
+        { "required": ["resources"] },
+        { "required": ["gpu_required"] }
+      ],
       "allOf": [
         {
           "if": { "properties": { "target_kind": { "const": "build" } }, "required": ["target_kind"] },
@@ -160,12 +244,19 @@
           "if": { "properties": { "target_kind": { "const": "exec" } } },
           "then": {
             "required": ["claim"],
-            "properties": { "claim": { "required": ["baseline_ref", "variant_key", "config_json"] } }
+            "properties": { "claim": { "required": ["baseline_ref", "variant_key", "config_json"] } },
+            "not": { "required": ["parent_baseline"] }
           }
         },
         {
           "if": { "properties": { "target_kind": { "const": "eval" } } },
-          "then": { "required": ["eval_action", "attempt_purpose"] }
+          "then": {
+            "required": ["eval_action", "attempt_purpose"],
+            "allOf": [
+              { "not": { "required": ["replicate"] } },
+              { "not": { "required": ["parent_baseline"] } }
+            ]
+          }
         },
         {
           "if": {
@@ -195,6 +286,102 @@
           "then": { "required": ["eval_key", "evaluation_source"] }
         }
       ]
+    },
+    "seedless_config": {
+      "type": "object",
+      "propertyNames": { "not": { "pattern": "^[sS][eE][eE][dD]$" } },
+      "additionalProperties": { "$ref": "#/$defs/seedless_json_value" }
+    },
+    "seedless_json_value": {
+      "anyOf": [
+        { "$ref": "#/$defs/seedless_config" },
+        {
+          "type": "array",
+          "items": { "$ref": "#/$defs/seedless_json_value" }
+        },
+        { "type": ["string", "number", "boolean", "null"] }
+      ]
+    },
+    "scientific_contract": {
+      "type": "object",
+      "description": "Plan 冻结的确定性科学判定合同。validity_gates 是硬门；outcome_rules 只分类有效证据，不能把 invalid 变 valid。零条 outcome rule 得到 inconclusive；多条规则仅在分类一致时采用该分类，否则保守得到 inconclusive。",
+      "required": ["validity_gates", "outcome_rules"],
+      "additionalProperties": false,
+      "properties": {
+        "validity_gates": {
+          "type": "array",
+          "description": "必须且各仅一次声明 required metrics、parser health、独立代码/Plan/数据边界审查回执三类硬门。第三类只证明独立审查回执已绑定，不声称运行时已证明不存在数据泄漏。",
+          "minItems": 3,
+          "maxItems": 16,
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "const": "required_metrics_present" } }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "const": "parser_not_suspect" } }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {
+                  "kind": {
+                    "const": "independent_code_plan_data_boundary_review_receipt_present"
+                  }
+                }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          ],
+          "items": {
+            "type": "object",
+            "required": ["gate_id", "kind"],
+            "additionalProperties": false,
+            "properties": {
+              "gate_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+              "kind": {
+                "enum": [
+                  "required_metrics_present",
+                  "parser_not_suspect",
+                  "independent_code_plan_data_boundary_review_receipt_present"
+                ]
+              }
+            }
+          }
+        },
+        "outcome_rules": {
+          "type": "array",
+          "description": "每条规则独立分类；零条或多规则冲突均确定性聚合为 inconclusive。",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "required": ["rule_id", "metric_id", "metric_ver", "operator", "threshold", "if_true", "if_false"],
+            "additionalProperties": false,
+            "properties": {
+              "rule_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+              "metric_id": { "type": "string", "minLength": 1 },
+              "metric_ver": { "type": "integer", "minimum": 1 },
+              "operator": { "enum": ["gt", "ge", "lt", "le", "eq", "ne"] },
+              "threshold": { "type": "number" },
+              "if_true": { "enum": ["supported", "refuted", "inconclusive"] },
+              "if_false": { "enum": ["supported", "refuted", "inconclusive"] }
+            }
+          }
+        }
+      }
     },
     "import_defer": {
       "type": "object",

@@ -232,7 +232,8 @@ class InMemoryStateStore:
                     raise ValueError(f"decompose 父问题不存在: {op['parent_question_id']}")
                 if parent.status != "active":
                     raise ValueError(f"decompose 父问题须为 active（当前 {parent.status}；终态/未选中不可分解）")
-                if self._depth_of(parent.qid) + 1 > guard["max_decompose_depth"]:
+                max_depth = guard.get("max_decompose_depth")
+                if max_depth is not None and self._depth_of(parent.qid) + 1 > max_depth:
                     raise ValueError("超出 max_decompose_depth")
                 children = op["children"]
                 if len(children) > guard["max_children_per_node"]:

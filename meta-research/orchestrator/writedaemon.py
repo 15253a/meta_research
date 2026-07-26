@@ -111,6 +111,20 @@ class WriteDaemon:
     def conn(self):
         return self._public_conn
 
+    @contextmanager
+    def connection_guard(self) -> Iterator[None]:
+        """Keep one multi-statement connection operation uninterleaved.
+
+        This is not a transaction API.  It exists for deep modules that use a
+        SQLite SAVEPOINT as their own tiny atomic suffix while sharing this
+        daemon-owned connection.  Holding the daemon lock across the complete
+        SAVEPOINT/RELEASE sequence prevents concurrent callers from nesting
+        unrelated savepoints on the same connection.
+        """
+        with self._lock:
+            self._owner_guard()
+            yield
+
     def owns_active_transaction(self, conn: sqlite3.Connection) -> bool:
         """Return whether ``conn`` is this daemon's raw connection inside its current transaction."""
         return self._in_txn and conn is self._conn and self._conn.in_transaction

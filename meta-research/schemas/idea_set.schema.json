@@ -145,7 +145,7 @@
       "properties": {
         "candidate_id": { "type": "string", "minLength": 1 },
         "query": { "type": "string", "minLength": 5, "maxLength": 512 },
-        "provider": { "const": "arxiv_api_v1" },
+        "provider": { "enum": ["arxiv_api_v1", "literature_federated_v1"] },
         "snapshot_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
         "snapshot_ref": { "type": "string", "pattern": "^state/novelty/[A-Za-z0-9_./-]+\\.json$" },
         "raw_content_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },

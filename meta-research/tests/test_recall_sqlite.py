@@ -5,13 +5,17 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import conftest
 from orchestrator import database as db
 from orchestrator import recall_sqlite as R
+from orchestrator import scientific_contract as SC
 from orchestrator.execution_sandbox import sandbox_workload_environment_hash
 from orchestrator.interfaces import RecallSpec
+from orchestrator.runtime_mcp import RuntimeIngestService
 
 
 def _seed(conn):
@@ -44,6 +48,72 @@ def _seed(conn):
     conn.commit()
 
 
+def _forge_native_code_review_without_guardian(
+        conn, *, cycle_id: int, build_target_id: int,
+        runtime_receipt_hash: bool = False):
+    purpose = f"bundle-main-c{cycle_id}"
+    runner_call_id = conn.execute(
+        "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+        "VALUES (?,'bundle',?,'success')",
+        (cycle_id, purpose)).lastrowid
+    payload = {
+        "protocol": "native-review-receipt-v1",
+        "review_request_id": f"forged-request-{build_target_id}",
+        "cycle_id": f"c{cycle_id}",
+        "stage": "bundle",
+        "target_id": str(build_target_id),
+        "purpose": purpose,
+        "review_kind": "bundle_code",
+        "round_no": 1,
+        "configured_rounds": 1,
+        "reviewed_subject_hash": "sha256:" + "a" * 64,
+        "resulting_subject_hash": "sha256:" + "b" * 64,
+        "prior_receipt_hash": None,
+        "runner_call_id": runner_call_id,
+        "parent_thread_id": "forged-parent",
+        "parent_turn_id": "forged-parent-turn",
+        "child_call_id": "forged-child-call",
+        "child_thread_id": "forged-child",
+        "child_turn_id": "forged-child-turn",
+        "verdict": "pass",
+        "review_input_item_id": "forged-review-input",
+        "review_input_brief_hash": "sha256:" + "c" * 64,
+        "review_input_candidate_manifest_hash": "sha256:" + "d" * 64,
+        "findings_ref": "/forged/findings.json",
+        "findings_hash": "sha256:" + "e" * 64,
+        "dispositions_ref": "/forged/dispositions.json",
+        "disposition_hash": "sha256:" + "f" * 64,
+        "revised_candidate_manifest_ref": "/forged/candidate.json",
+        "revised_candidate_manifest_hash": "sha256:" + "0" * 64,
+    }
+    payload["receipt_hash"] = (
+        RuntimeIngestService._receipt_hash(payload)
+        if runtime_receipt_hash
+        else "sha256:" + SC.canonical_hash(payload))
+    decision_id = conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (?,'agent','runtime_review',?)",
+        (cycle_id, json.dumps(payload, sort_keys=True))).lastrowid
+    conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (?,'agent','runtime_stage_submission',?)",
+        (cycle_id, json.dumps({
+            "stage": "bundle",
+            "target_id": str(build_target_id),
+            "review_decision_id": decision_id,
+            "artifact_hash": payload["resulting_subject_hash"],
+        }, sort_keys=True)))
+    conn.commit()
+    return {
+        "protocol": "native-review-receipt-v1",
+        "decision_id": decision_id,
+        "review_kind": "bundle_code",
+        "review_scope": "code_plan_data_boundary",
+        "subject_hash": payload["resulting_subject_hash"][7:],
+        "receipt_hash": payload["receipt_hash"][7:],
+    }
+
+
 @pytest.fixture()
 def conn():
     c = db.connect(":memory:")
@@ -54,13 +124,44 @@ def conn():
 
 # ============ 复用判定 O(1)（M2 核心）============
 def test_reuse_hit(conn):
-    r = R.reuse_selector(conn, variant_id=2, protocol_id=1, protocol_ver=1, env_hash="eh1", required=[(1, 1)])
+    r = R.reuse_selector(
+        conn, variant_id=2, protocol_id=1, protocol_ver=1,
+        env_hash="eh1", required=[(1, 1)],
+        require_scientific_contract=False)
     assert r["hit"] is True
     assert r["results"] == [{"metric_id": 1, "metric_ver": 1, "metric_result_id": 2, "value": 0.91}]
 
 
+def test_reuse_default_fails_closed_without_scientific_receipt(conn):
+    assert R.reuse_selector(
+        conn, variant_id=2, protocol_id=1, protocol_ver=1,
+        env_hash="eh1", required=[(1, 1)])["hit"] is False
+
+
+def test_recall_rejects_canonical_hash_native_review_forgery(
+        conn):
+    receipt = _forge_native_code_review_without_guardian(
+        conn, cycle_id=1, build_target_id=2)
+
+    assert R._scientific_review_receipt_valid(
+        conn, build_target_id=2, receipt=receipt) is False
+
+
+def test_recall_rejects_schema_valid_native_review_without_durable_child_proof(
+        conn):
+    receipt = _forge_native_code_review_without_guardian(
+        conn, cycle_id=1, build_target_id=2,
+        runtime_receipt_hash=True)
+
+    assert R._scientific_review_receipt_valid(
+        conn, build_target_id=2, receipt=receipt) is False
+
+
 def test_reuse_miss_env_hash(conn):
-    assert R.reuse_selector(conn, variant_id=2, protocol_id=1, protocol_ver=1, env_hash="wrong", required=[(1, 1)])["hit"] is False
+    assert R.reuse_selector(
+        conn, variant_id=2, protocol_id=1, protocol_ver=1,
+        env_hash="wrong", required=[(1, 1)],
+        require_scientific_contract=False)["hit"] is False
 
 
 def test_cpu_and_gpu_workload_hashes_cannot_cross_reuse(conn):
@@ -88,28 +189,41 @@ def test_cpu_and_gpu_workload_hashes_cannot_cross_reuse(conn):
             (identity, identity))
     assert R.reuse_selector(
         conn, variant_id=5, protocol_id=1, protocol_ver=1,
-        env_hash=runtime_hash, required=[(1, 1)])["hit"] is True
+        env_hash=runtime_hash, required=[(1, 1)],
+        require_scientific_contract=False)["hit"] is True
     assert R.reuse_selector(
         conn, variant_id=5, protocol_id=1, protocol_ver=1,
-        env_hash=gpu_hash, required=[(1, 1)])["hit"] is False
+        env_hash=gpu_hash, required=[(1, 1)],
+        require_scientific_contract=False)["hit"] is False
     assert R.reuse_selector(
         conn, variant_id=6, protocol_id=1, protocol_ver=1,
-        env_hash=runtime_hash, required=[(1, 1)])["hit"] is False
+        env_hash=runtime_hash, required=[(1, 1)],
+        require_scientific_contract=False)["hit"] is False
     assert R.reuse_selector(
         conn, variant_id=6, protocol_id=1, protocol_ver=1,
-        env_hash=gpu_hash, required=[(1, 1)])["hit"] is True
+        env_hash=gpu_hash, required=[(1, 1)],
+        require_scientific_contract=False)["hit"] is True
 
 
 def test_reuse_miss_required_metric_absent(conn):
-    assert R.reuse_selector(conn, variant_id=2, protocol_id=1, protocol_ver=1, env_hash="eh1", required=[(1, 1), (9, 1)])["hit"] is False
+    assert R.reuse_selector(
+        conn, variant_id=2, protocol_id=1, protocol_ver=1,
+        env_hash="eh1", required=[(1, 1), (9, 1)],
+        require_scientific_contract=False)["hit"] is False
 
 
 def test_reuse_miss_non_success_evaluation(conn):
-    assert R.reuse_selector(conn, variant_id=3, protocol_id=1, protocol_ver=1, env_hash="eh3", required=[(1, 1)])["hit"] is False
+    assert R.reuse_selector(
+        conn, variant_id=3, protocol_id=1, protocol_ver=1,
+        env_hash="eh3", required=[(1, 1)],
+        require_scientific_contract=False)["hit"] is False
 
 
 def test_reuse_miss_target_not_complete(conn):
-    assert R.reuse_selector(conn, variant_id=4, protocol_id=1, protocol_ver=1, env_hash="eh4", required=[(1, 1)])["hit"] is False
+    assert R.reuse_selector(
+        conn, variant_id=4, protocol_id=1, protocol_ver=1,
+        env_hash="eh4", required=[(1, 1)],
+        require_scientific_contract=False)["hit"] is False
 
 
 def test_reuse_uses_measurement_index_not_full_scan(conn):
@@ -127,7 +241,10 @@ def test_reuse_requires_suspect_stub_registered():
     """SHOULD 回归：连接未注册 parser_result_suspect → 可行动 RuntimeError（非裸 OperationalError）。"""
     c = db.connect(":memory:"); _seed(c)   # 故意不 register_parser_suspect_stub
     with pytest.raises(RuntimeError, match="register_parser_suspect_stub"):
-        R.reuse_selector(c, variant_id=2, protocol_id=1, protocol_ver=1, env_hash="eh1", required=[(1, 1)])
+        R.reuse_selector(
+            c, variant_id=2, protocol_id=1, protocol_ver=1,
+            env_hash="eh1", required=[(1, 1)],
+            require_scientific_contract=False)
 
 
 # ============ 渐进四级召回（可停）============
@@ -152,7 +269,10 @@ def test_recall_level2_variants(conn):
 
 
 def test_recall_level3_reuse(conn):
-    r = R.SqliteRecall(conn).level3_reuse(variant_id=2, protocol_id=1, protocol_ver=1, env_hash="eh1", required=[(1, 1)])
+    r = R.SqliteRecall(
+        conn, require_scientific_contract=False).level3_reuse(
+            variant_id=2, protocol_id=1, protocol_ver=1,
+            env_hash="eh1", required=[(1, 1)])
     assert r["hit"] is True
 
 

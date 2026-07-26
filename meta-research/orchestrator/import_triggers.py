@@ -858,7 +858,8 @@ class TrustedImportTriggerService:
             cursor = row[0]
             if cursor is not None:
                 depth += 1
-        if depth + 1 > int(guard["max_decompose_depth"]):
+        max_depth = guard.get("max_decompose_depth")
+        if max_depth is not None and depth + 1 > int(max_depth):
             raise ImportSearchError("import reference child 超出 max_decompose_depth")
         open_count = conn.execute(
             "SELECT count(*) FROM question WHERE status IN ('open','inconclusive')"

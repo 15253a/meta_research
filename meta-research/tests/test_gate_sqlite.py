@@ -8,14 +8,23 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import conftest
 from orchestrator import database as db
-from orchestrator.gate_sqlite import (GATE_DENY_TABLES, GATE_INPUT_VIEW_NAMES, GateInvariantError,
-                                       GateReject, SqliteGate, open_gate_read_conn)
+from orchestrator.gate_sqlite import (
+    GATE_DENY_TABLES,
+    GATE_INPUT_VIEW_NAMES,
+    GateInvariantError,
+    GateReject,
+    SqliteGate,
+    _SerializedReadConnection,
+    open_gate_read_conn,
+)
 from orchestrator.schemas import SchemaSet
 from orchestrator.writedaemon import WriteDaemon
 
@@ -97,6 +106,46 @@ def test_gate_input_views_closure_excludes_denied(gate_env):
     gate, _ = gate_env
     for v in GATE_INPUT_VIEW_NAMES:
         gate.read.execute(f"SELECT * FROM {v} LIMIT 1").fetchone()
+
+
+def test_gate_read_connection_serializes_cursor_calls_across_workers():
+    """Concurrent target gates must never enter one sqlite connection twice."""
+    active = 0
+    maximum_active = 0
+    state_lock = threading.Lock()
+    start = threading.Barrier(2)
+
+    class Cursor:
+        def fetchone(self):
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.02)
+            with state_lock:
+                active -= 1
+            return (1,)
+
+    class Connection:
+        def execute(self, _sql, _params=()):
+            return Cursor()
+
+    read = _SerializedReadConnection(Connection())
+    results = []
+
+    def query():
+        start.wait()
+        results.append(read.execute("SELECT 1").fetchone())
+
+    workers = [threading.Thread(target=query) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(1)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert results == [(1,), (1,)]
+    assert maximum_active == 1
 
 
 # ============ gate_close_question happy ============

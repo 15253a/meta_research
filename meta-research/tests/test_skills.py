@@ -51,14 +51,15 @@ STAGE_ANCHORS = {
         "targets=[]", "reuse_evidence", "import_defer", "plan.json",
     ],
     "bundle": [
-        "串行", "target_kind",
+        "`seq` 仅用于稳定显示", "target_kind",
         "smoke", "worktree",
         "code_review", "result_review",   # 双评审
         "engineering_blocked",
         # （步⑧ m7-1：删 "fake"/"synthetic" 锚——它们是 M0 造假桩必标；真执行契约起不再造假）
         "两段提交",
-        "早退", "skipped",                # RFAIL 分支
-        "critical",
+        "依赖后代 skip", "安全排空",       # DAG failure propagation
+        "critical", "snapshot", "incremental", "after_seq", "1000",
+        "Scheduler", "Worker",
         "execution_manifest", "plan_slice_hash", "metric_value", "{src}", "{ckpt}",   # 步⑧真执行契约锚
     ],
     "reasoning": [
@@ -149,7 +150,8 @@ def test_idea_skill_uses_pinned_adapter_contract_not_m0_simulation():
             "problem_card", "source-first", "claimed_method", "systematicity",
             "repair", "reangle", "batch diversity", "严禁生成 HTML",
             "联网查重未启用·文献级待验证", "绝不猜 engine/hash/model/sampling",
-            "wildidea_expand", "wildidea_search", 'files={"idea_set.json": ...}'):
+            "wildidea_expand", "wildidea_search", "服务端内部生成的 exact draft",
+            'files={"idea_set.json": ...}'):
         assert anchor in idea, f"idea/SKILL.md 缺 pinned adapter 契约: {anchor}"
     assert "phase=idea" not in idea
     assert "phase=audit" not in idea

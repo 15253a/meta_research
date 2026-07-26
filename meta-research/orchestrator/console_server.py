@@ -24,7 +24,6 @@ import ipaddress
 import json
 import math
 import os
-import pwd
 import re
 import sqlite3
 import stat
@@ -62,6 +61,7 @@ from .quest_process_manager import (
     QuestProcessUnavailableError,
 )
 from .quest_registry import QuestConflictError, QuestCorruptError, QuestRegistry
+from .runtime_storage import configure_process_storage
 from .web_quest_service import (
     WebQuestConflictError, WebQuestNotReadyError, WebQuestService,
     WebQuestRetryableError, WebQuestServiceError,
@@ -753,12 +753,12 @@ _TERMINAL_BUILD_TARGET_STATUSES = frozenset({
 
 def _latest_bundle_context_target(
         work_root: Path, cycle_id: int, target_ids: set[int]) -> Optional[int]:
-    """Infer the target currently bound to the long-lived Bundle turn.
+    """Choose one recently rendered Worker target for the bounded Web monitor.
 
-    ``bundle_next_target`` durably publishes a target-specific ContextPack
-    before the operator starts smoke/train/eval.  Reading only the filename and
-    mtime keeps the Web projection independent from the in-memory operator
-    session while avoiding a second orchestration authority.
+    Multiple fixed-target Workers may be active concurrently; this helper is
+    presentation-only and never claims to be the scheduling authority. Reading
+    only the filename and mtime keeps the Web projection independent from the
+    in-memory Scheduler while avoiding a second orchestration authority.
     """
     directory = work_root / "cycles" / f"c{cycle_id}" / "context_pack"
     fd = -1
@@ -1043,7 +1043,7 @@ def _training_live(
     elif current_target is None:
         substage, substage_label = "prepare", "Bundle 正在准备实验 target"
     elif current_target["status"] in _TERMINAL_BUILD_TARGET_STATUSES:
-        substage, substage_label = "review", "Codex 正在审查结果或切换下一 target"
+        substage, substage_label = "review", "Worker 正在审查当前 target 结果"
     elif logs_target_id != current_target_id or not logs:
         substage, substage_label = "prepare", "Codex 正在构建或准备实验命令"
     else:
@@ -3001,173 +3001,14 @@ def serve_quests(quests_root: Union[str, Path], system_root: Union[str, Path], *
     return httpd
 
 
-def _configure_process_storage(root: Union[str, Path]) -> Dict[str, str]:
-    """Keep every mutable host/Codex runtime path beneath the data root."""
-    # The console is also responsible for creating a new data root.  Resolve
-    # the prospective path first, then create and re-resolve it before placing
-    # any process scratch beneath it.
-    base = Path(root).expanduser().resolve(strict=False)
-    base.mkdir(parents=True, exist_ok=True, mode=0o700)
-    base = base.resolve(strict=True)
-    if stat.S_ISLNK(base.lstat().st_mode):
-        raise ValueError("运行时数据根不得是 symlink")
-
-    service_uid, service_gid = os.geteuid(), os.getegid()
-    requested_query_user = os.environ.get("METARESEARCH_QUERY_RUN_AS_USER")
-    if requested_query_user is None:
-        requested_query_user = (
-            "codexro" if service_uid == 0 else pwd.getpwuid(service_uid).pw_name
-        )
-    query_account = pwd.getpwnam(requested_query_user)
-    if service_uid != 0 and query_account.pw_uid != service_uid:
-        raise ValueError("non-root 服务不得把 Codex 运行目录交给其他 UID")
-
-    def ensure_directory(path: Path, *, uid: int, gid: int, mode: int) -> Path:
-        if path.exists() and path.is_symlink():
-            raise ValueError("运行时目录不得是 symlink")
-        path.mkdir(parents=True, exist_ok=True, mode=mode)
-        info = os.lstat(path)
-        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or os.path.realpath(path) != str(path)):
-            raise ValueError("运行时目录身份非法")
-        if service_uid == 0:
-            os.chown(path, uid, gid)
-        elif (info.st_uid, info.st_gid) != (uid, gid):
-            raise ValueError("运行时目录 owner 非当前服务 UID")
-        os.chmod(path, mode)
-        return path
-
-    # Execute-only shared parents let the dedicated codexro UID reach only its
-    # private children; quests/ and state/ retain their existing 0700 boundary.
-    os.chmod(base, 0o711)
-    process_tmp = ensure_directory(
-        base / ".process-tmp", uid=service_uid, gid=service_gid, mode=0o711)
-    cache_root = ensure_directory(
-        base / ".process-cache", uid=service_uid, gid=service_gid, mode=0o711)
-    home_root = ensure_directory(
-        base / ".process-home", uid=service_uid, gid=service_gid, mode=0o711)
-    codex_root = ensure_directory(
-        base / ".codex-runtime", uid=service_uid, gid=service_gid, mode=0o711)
-
-    service_cache = ensure_directory(
-        cache_root / "service", uid=service_uid, gid=service_gid, mode=0o700)
-    query_cache = ensure_directory(
-        cache_root / "query", uid=query_account.pw_uid,
-        gid=query_account.pw_gid, mode=0o700)
-    service_home = ensure_directory(
-        home_root / "service", uid=service_uid, gid=service_gid, mode=0o700)
-    query_home = ensure_directory(
-        home_root / "query", uid=query_account.pw_uid,
-        gid=query_account.pw_gid, mode=0o700)
-
-    prior_service_codex_home = os.environ.get("CODEX_HOME")
-    prior_query_codex_home = os.environ.get("METARESEARCH_QUERY_CODEX_HOME")
-    if prior_query_codex_home is None:
-        prior_query_codex_home = str(Path(query_account.pw_dir) / ".codex")
-    service_codex_home = ensure_directory(
-        codex_root / "service", uid=service_uid, gid=service_gid, mode=0o700)
-    query_codex_home = ensure_directory(
-        codex_root / "query", uid=query_account.pw_uid,
-        gid=query_account.pw_gid, mode=0o700)
-
-    def seed_codex_identity(destination: Path, source: Optional[str], *,
-                            uid: int, gid: int) -> None:
-        source_root = Path(source).expanduser() if source else None
-        for name in ("auth.json", "config.toml"):
-            target = destination / name
-            if target.exists() or target.is_symlink():
-                info = os.lstat(target)
-                if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                        or info.st_uid != uid or info.st_gid != gid
-                        or stat.S_IMODE(info.st_mode) != 0o600):
-                    raise ValueError(f"项目 Codex {name} 身份/权限非法")
-                continue
-            if source_root is None:
-                continue
-            source_path = source_root / name
-            try:
-                source_info = os.lstat(source_path)
-            except FileNotFoundError:
-                continue
-            if (not stat.S_ISREG(source_info.st_mode)
-                    or stat.S_ISLNK(source_info.st_mode)
-                    or source_info.st_size > 1024 * 1024):
-                raise ValueError(f"Codex bootstrap {name} 非有界普通文件")
-            payload = source_path.read_bytes()
-            if len(payload) != source_info.st_size:
-                raise ValueError(f"Codex bootstrap {name} 读取漂移")
-            flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                     | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
-            fd = os.open(target, flags, 0o600)
-            try:
-                view = memoryview(payload)
-                while view:
-                    written = os.write(fd, view)
-                    view = view[written:]
-                os.fchmod(fd, 0o600)
-                if service_uid == 0:
-                    os.fchown(fd, uid, gid)
-                os.fsync(fd)
-            except BaseException:
-                os.close(fd)
-                target.unlink(missing_ok=True)
-                raise
-            else:
-                os.close(fd)
-
-    seed_codex_identity(
-        service_codex_home, prior_service_codex_home,
-        uid=service_uid, gid=service_gid)
-    seed_codex_identity(
-        query_codex_home, prior_query_codex_home,
-        uid=query_account.pw_uid, gid=query_account.pw_gid)
-
-    paths = {
-        "TMPDIR": process_tmp,
-        "XDG_CACHE_HOME": service_cache,
-        "PIP_CACHE_DIR": service_cache / "pip",
-    }
-    ensure_directory(
-        paths["PIP_CACHE_DIR"], uid=service_uid, gid=service_gid, mode=0o700)
-    for key, path in paths.items():
-        os.environ[key] = str(path)
-    os.environ["TMP"] = str(paths["TMPDIR"])
-    os.environ["TEMP"] = str(paths["TMPDIR"])
-    os.environ["HOME"] = str(service_home)
-    os.environ["CODEX_HOME"] = str(service_codex_home)
-    os.environ["HF_HOME"] = str(service_cache / "huggingface")
-    os.environ["TORCH_HOME"] = str(service_cache / "torch")
-    # Package managers and compute libraries otherwise fall back to the
-    # service account's installation prefix (often /root on a small cloud
-    # root disk).  Bind their mutable state to the same VEPFS data tree.  HOME
-    # already catches most tools; these explicit variables cover tools whose
-    # cache location ignores HOME or follows the executable's base prefix.
-    extra_service_storage = {
-        "XDG_CONFIG_HOME": service_home / ".config",
-        "XDG_DATA_HOME": service_home / ".local" / "share",
-        "XDG_STATE_HOME": service_home / ".local" / "state",
-        "CONDA_PKGS_DIRS": service_cache / "conda-pkgs",
-        "CONDA_ENVS_PATH": base / "environments",
-        "UV_CACHE_DIR": service_cache / "uv",
-        "CUDA_CACHE_PATH": service_cache / "cuda",
-        "MPLCONFIGDIR": service_cache / "matplotlib",
-        "NUMBA_CACHE_DIR": service_cache / "numba",
-    }
-    for key, path in extra_service_storage.items():
-        ensure_directory(path, uid=service_uid, gid=service_gid, mode=0o700)
-        os.environ[key] = str(path)
-    os.environ["METARESEARCH_QUERY_HOME"] = str(query_home)
-    os.environ["METARESEARCH_QUERY_CODEX_HOME"] = str(query_codex_home)
-    os.environ["METARESEARCH_QUERY_CACHE_HOME"] = str(query_cache)
-    if "SSL_CERT_FILE" not in os.environ:
-        prefix = Path(sys.prefix).resolve(strict=True)
-        certificate = prefix / "ssl" / "cert.pem"
-        if (certificate.is_file()
-                and os.path.commonpath(
-                    (str(prefix), str(certificate.resolve(strict=True)))) == str(prefix)):
-            os.environ["SSL_CERT_FILE"] = str(certificate)
-    tempfile.tempdir = str(paths["TMPDIR"])
-    return {key: str(path) for key, path in paths.items()}
+def _configure_process_storage(
+        root: Union[str, Path], *,
+        private_work_root: Optional[Union[str, Path]] = None) -> Dict[str, str]:
+    """Compatibility name for the shared, entrypoint-independent binding."""
+    return configure_process_storage(
+        root, require_external_mount=True,
+        require_requested_root=True,
+        private_work_root=private_work_root)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -3196,22 +3037,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--no-outbound", action="store_true",
         help="本机运行不对外投递通知（多 quest Web owner 的默认值）")
     args = ap.parse_args(argv)
-    _configure_process_storage(args.quests_root or args.work_root)
-    if args.quests_root:
-        httpd = serve_quests(
-            args.quests_root, args.system_root, host=args.host, port=args.port,
-            qualification_profiles_root=args.qualification_profiles_root,
-            connector_profile=args.connector_profile,
-            no_outbound=(args.no_outbound or args.connector_profile is None),
-            max_cycles=args.max_cycles,
-            poll_interval_s=args.poll_interval_s,
-            local_import_roots=args.local_import_root)
-        scope = f"多 quest registry {Path(args.quests_root).resolve()}"
-    else:
-        db_path = str(Path(args.work_root) / "research.sqlite")
-        httpd = serve(
-            db_path, args.work_root, args.system_root, host=args.host, port=args.port)
-        scope = f"只读库 {db_path}"
+    if not _is_loopback_host(args.host):
+        print(
+            "[console] 启动预检失败：console_server 只允许 loopback host；"
+            "远程访问请使用 SSH tunnel",
+            file=sys.stderr)
+        return 2
+    work_root = (
+        None if args.work_root is None
+        else Path(os.path.abspath(os.fspath(args.work_root))))
+    storage_root = (
+        Path(os.path.abspath(os.fspath(args.quests_root)))
+        if args.quests_root is not None
+        else work_root.parent)
+    try:
+        _configure_process_storage(
+            storage_root, private_work_root=work_root)
+    except (OSError, ValueError) as error:
+        print(f"[console] 存储绑定失败：{error}", file=sys.stderr)
+        return 2
+    try:
+        if args.quests_root:
+            httpd = serve_quests(
+                args.quests_root, args.system_root, host=args.host, port=args.port,
+                qualification_profiles_root=args.qualification_profiles_root,
+                connector_profile=args.connector_profile,
+                no_outbound=(args.no_outbound or args.connector_profile is None),
+                max_cycles=args.max_cycles,
+                poll_interval_s=args.poll_interval_s,
+                local_import_roots=args.local_import_root)
+            scope = f"多 quest registry {Path(args.quests_root).resolve()}"
+        else:
+            db_path = str(Path(args.work_root) / "research.sqlite")
+            httpd = serve(
+                db_path, args.work_root, args.system_root,
+                host=args.host, port=args.port)
+            scope = f"只读库 {db_path}"
+    except (OSError, ValueError) as error:
+        print(f"[console] 启动失败：{error}", file=sys.stderr)
+        return 2
     bound_port = int(httpd.server_address[1])
     browser_url = _authenticated_console_url(
         args.host, bound_port, httpd.console_capability_token)

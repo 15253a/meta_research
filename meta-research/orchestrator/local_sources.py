@@ -481,7 +481,8 @@ class LocalSourceRegistry:
             raise
 
     def _scan(self, source: Path, allowed: Path,
-              allowed_identity: Tuple[int, ...], *, verified: bool) -> Dict[str, Any]:
+              allowed_identity: Tuple[int, ...], *, verified: bool,
+              verified_paths: Optional[frozenset[str]] = None) -> Dict[str, Any]:
         source_fd, source_info, parent_fd, entry_name = self._open_source(
             source, allowed, allowed_identity)
         # parent_fd is allowed_fd when the source is the allow root.  Otherwise
@@ -490,15 +491,18 @@ class LocalSourceRegistry:
         counters = {"files": 0, "entries": 0, "bytes": 0}
         try:
             if stat.S_ISREG(source_info.st_mode):
+                relative = _relative_name((source.name,))
                 self._scan_file(
                     source_fd, source_info, (source.name,), files, counters,
-                    verified=verified)
+                    verified=(verified or (
+                        verified_paths is not None
+                        and relative in verified_paths)))
                 source_type = "file"
                 manifest_root = source.parent
             elif stat.S_ISDIR(source_info.st_mode):
                 self._scan_directory(
                     source_fd, (), files, counters, depth=0,
-                    verified=verified)
+                    verified=verified, verified_paths=verified_paths)
                 source_type = "directory"
                 manifest_root = source
             else:  # The descriptor check in _open_source should make this unreachable.
@@ -530,7 +534,8 @@ class LocalSourceRegistry:
 
     def _scan_directory(self, directory_fd: int, parts: Tuple[str, ...],
                         files: List[Dict[str, Any]], counters: Dict[str, int],
-                        *, depth: int, verified: bool) -> None:
+                        *, depth: int, verified: bool,
+                        verified_paths: Optional[frozenset[str]] = None) -> None:
         if depth > _MAX_DEPTH:
             raise LocalSourceError("local source exceeds the directory depth budget")
         before = os.fstat(directory_fd)
@@ -573,7 +578,8 @@ class LocalSourceRegistry:
                     _assert_same(opened, observed, label="local source directory")
                     self._scan_directory(
                         child_fd, child_parts, files, counters,
-                        depth=depth + 1, verified=verified)
+                        depth=depth + 1, verified=verified,
+                        verified_paths=verified_paths)
                     after = os.fstat(child_fd)
                     _assert_same(after, observed, label="local source directory")
                 finally:
@@ -592,7 +598,9 @@ class LocalSourceRegistry:
                     _assert_same(opened, observed, label="local source file")
                     self._scan_file(
                         child_fd, opened, child_parts, files, counters,
-                        verified=verified)
+                        verified=(verified or (
+                            verified_paths is not None
+                            and _relative_name(child_parts) in verified_paths)))
                 finally:
                     os.close(child_fd)
             else:
@@ -854,10 +862,17 @@ class LocalSourceRegistry:
         with self._locked():
             return [self._public(row) for row in self._records_for_draft_locked(did)]
 
-    def _manifest(self, draft_id: object, *, verified: bool) -> Dict[str, Any]:
+    def _manifest(
+            self, draft_id: object, *, verified: bool,
+            verified_paths: Optional[Mapping[str, frozenset[str]]] = None,
+            ) -> Dict[str, Any]:
         did = _validate_hex32(draft_id, label="draft_id")
         with self._locked():
             rows = self._records_for_draft_locked(did)
+            known_source_ids = {row["source_id"] for row in rows}
+            if (verified_paths is not None
+                    and set(verified_paths) - known_source_ids):
+                raise ValueError("verified_paths contains an unknown source_id")
             sources = []
             total_files = 0
             total_bytes = 0
@@ -865,7 +880,10 @@ class LocalSourceRegistry:
                 source, allowed, allowed_identity = self._normalize_source(
                     record["source_path"])
                 scanned = self._scan(
-                    source, allowed, allowed_identity, verified=verified)
+                    source, allowed, allowed_identity, verified=verified,
+                    verified_paths=(
+                        None if verified_paths is None
+                        else verified_paths.get(record["source_id"], frozenset())))
                 total_files += scanned["file_count"]
                 total_bytes += scanned["total_bytes"]
                 if total_files > _MAX_FILES or total_bytes > _MAX_TOTAL_BYTES:
@@ -897,6 +915,37 @@ class LocalSourceRegistry:
         """Return a server-only SHA-256 manifest (contains absolute paths)."""
 
         return self._manifest(draft_id, verified=True)
+
+    def selectively_verified_manifest(
+            self, draft_id: object,
+            paths_by_source: Mapping[str, Sequence[str]]) -> Dict[str, Any]:
+        """Rescan all metadata while hashing only explicitly selected files.
+
+        Restart recovery uses this after the cheap metadata scan finds a small
+        number of replaced files.  The frozen manifest remains authoritative:
+        this method merely proves the current bytes without re-hashing an
+        otherwise unchanged multi-hundred-gigabyte source tree.
+        """
+
+        if not isinstance(paths_by_source, Mapping):
+            raise ValueError("paths_by_source must be an object")
+        normalized: Dict[str, frozenset[str]] = {}
+        for source_id, raw_paths in paths_by_source.items():
+            sid = _validate_hex32(source_id, label="source_id")
+            if (isinstance(raw_paths, (str, bytes, bytearray))
+                    or not isinstance(raw_paths, Sequence)):
+                raise ValueError("verified paths must be an array")
+            paths = []
+            for raw_path in raw_paths:
+                if not isinstance(raw_path, str):
+                    raise ValueError("verified path must be text")
+                canonical = _relative_name(tuple(raw_path.split("/")))
+                if canonical != raw_path:
+                    raise ValueError("verified path is not canonical")
+                paths.append(canonical)
+            normalized[sid] = frozenset(paths)
+        return self._manifest(
+            draft_id, verified=False, verified_paths=normalized)
 
     def public_preflight(self, draft_id: object) -> Dict[str, Any]:
         """Rescan metadata and return the only preflight shape safe for HTTP."""

@@ -1,10 +1,14 @@
 # db/ —— SQLite 唯一真相（治理说明）
 
-- `migrations/0001_appendix_a.sql`：唯一规范 schema，**逐字摘自** `reference/第一部分-系统架构设计.md`
+- `migrations/0001_appendix_a.sql`：原始规范 schema，**逐字摘自** `reference/第一部分-系统架构设计.md`
   附录 A（行 918–1614；v2.2 终稿 + v2.3/v2.4/v2.4.1 增量已并入原文）。
-- **字节冻结**：`orchestrator/database.py` 以 SHA256 常量锁定该文件，并在每次建库/开库时校验
-  「checksum + 计数（36 表/72 触发器/29 索引含自动/1 视图）+ user_version」。改动 schema =
-  决策性改动，须走检查点评审并同步更新冻结锚。
+- `migrations/0002_bundle_target_dag.sql`：Bundle target DAG、exact admission、publication-backed
+  source binding、Worker/resource/terminal durable facts 的 additive migration。
+- **逐版字节冻结**：`orchestrator/database.py` 以独立 SHA256 锚锁定每个 migration，并在每次
+  建库/开库时校验完整 migration chain。既有 v1 库先核验 v1 对象计数，再原子升级到 v2；
+  fresh 库按顺序执行 v1→v2。`0001` 永远保持原字节不变。
+- 当前 v2 三重锁为 checksum chain + 对象计数（46 表/88 触发器/50 索引含自动/1 视图）
+  + `PRAGMA user_version=2`。新增 schema 必须再加独立 additive migration 与冻结锚。
 - 运行库 `research.sqlite` 不入 Git（运行时产物）；migration 与本说明入 Git。
 
 ## M1 开工时的三项 OPEN 裁定（2026-07-07，用户授权模型裁定；本文件为受审载体）

@@ -21,7 +21,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from .artifact_capability import open_artifact, read_artifact_bytes
 from .ids import cnum as _cnum
 from .process_supervisor import (ExecutionRecoveryError, ExecutionSupervisor,
-                                 atomic_write_receipt, read_receipt)
+                                 atomic_write_receipt, read_receipt,
+                                 stream_execution_frames,
+                                 verified_execution_capture_size,
+                                 verified_execution_frame_size)
 from .writedaemon import WriteDaemon
 
 
@@ -42,6 +45,60 @@ def _read_exact(fd: int, size: int) -> bytes:
             raise OSError("exit sidecar short read")
         chunks.extend(chunk)
     return bytes(chunks)
+
+
+def _stream_artifact_identity(
+        path: Path, *, label: str) -> tuple[str, int]:
+    """Hash one immutable owner-controlled artifact with bounded reads."""
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        linked = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or (
+                linked.st_dev, linked.st_ino, linked.st_size,
+                linked.st_mtime_ns, linked.st_ctime_ns,
+            ) != (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            )
+        ):
+            raise OSError(f"{label} identity 非法")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(fd, 64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(fd)
+        relinked = os.lstat(path)
+        stable = (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if (
+            total != before.st_size
+            or stable != (
+                before.st_dev, before.st_ino, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            )
+            or (
+                relinked.st_dev, relinked.st_ino, relinked.st_size,
+                relinked.st_mtime_ns, relinked.st_ctime_ns,
+            ) != stable
+        ):
+            raise OSError(f"{label} changed during identity read")
+        return digest.hexdigest(), total
+    finally:
+        os.close(fd)
 
 
 def _validate_log_name(log_name: str) -> None:
@@ -105,7 +162,11 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
                           execution_context: Mapping[str, Any],
                           execution_sandbox=None,
                           recover_completed: bool = False,
-                          return_terminal_failure: bool = False) -> Optional[Dict[str, Any]]:
+                          return_terminal_failure: bool = False,
+                          stream_output_observer=None,
+                          stream_frame_offset: Optional[int] = None,
+                          stream_offsets: Optional[
+                              Mapping[str, int]] = None) -> Optional[Dict[str, Any]]:
     """Promote an owner-orphaned complete ``.partial`` using its central receipt.
 
     The guardian has already fsynced output and proved the descendant tree
@@ -119,6 +180,41 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
     the only audit artifact.
     """
     _validate_log_name(log_name)
+    stream_arguments = (
+        stream_output_observer is not None,
+        stream_frame_offset is not None,
+        stream_offsets is not None,
+    )
+    if any(stream_arguments) and not all(stream_arguments):
+        raise ValueError(
+            "stream recovery 要求 observer、frame_offset 与 offsets 同时提供")
+    normalized_stream_offsets = None
+    if stream_output_observer is not None:
+        if not callable(stream_output_observer):
+            raise ValueError(
+                "stream_output_observer 须为 callable 或 None")
+        if (
+            not isinstance(stream_offsets, Mapping)
+            or set(stream_offsets) != {"stdout", "stderr"}
+            or any(
+                isinstance(stream_offsets.get(stream), bool)
+                or not isinstance(stream_offsets.get(stream), int)
+                or int(stream_offsets[stream]) < 0
+                for stream in ("stdout", "stderr")
+            )
+        ):
+            raise ValueError(
+                "stream_offsets 须为 stdout/stderr 非负整数映射")
+        if (
+            isinstance(stream_frame_offset, bool)
+            or not isinstance(stream_frame_offset, int)
+            or stream_frame_offset < 0
+        ):
+            raise ValueError("stream_frame_offset 须为非负整数")
+        normalized_stream_offsets = {
+            stream: int(stream_offsets[stream])
+            for stream in ("stdout", "stderr")
+        }
     expected = dict(execution_context)
     if "log_name" in expected and expected["log_name"] != log_name:
         raise ValueError("execution_context.log_name 与 harness log_name 冲突")
@@ -210,6 +306,115 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
     if receipt.get("state") != "terminal" or receipt.get("group_drained") is not True:
         raise ExecutionRecoveryError(
             f"{owner_kind} {owner_id} guardian receipt 未 terminal+drained")
+    stream_identity = receipt.get("capture_stream_identity") is True
+    if stream_identity != (stream_output_observer is not None):
+        if stream_identity:
+            raise ExecutionRecoveryError(
+                f"{owner_kind} {owner_id} stream capture recovery "
+                "缺 journal observer/offsets")
+        raise ExecutionRecoveryError(
+            f"{owner_kind} {owner_id} receipt 非 stream capture，"
+            "拒绝应用 stream offsets")
+    if stream_identity:
+        assert normalized_stream_offsets is not None
+        try:
+            capture_sizes = {
+                stream: verified_execution_capture_size(
+                    receipt, stream=stream)
+                for stream in ("stdout", "stderr")
+            }
+            frame_size = verified_execution_frame_size(receipt)
+        except (OSError, ValueError) as error:
+            raise ExecutionRecoveryError(
+                f"{owner_kind} {owner_id} guardian stream capture "
+                "身份不可验证") from error
+        for stream in ("stdout", "stderr"):
+            if normalized_stream_offsets[stream] > capture_sizes[stream]:
+                raise ExecutionRecoveryError(
+                    f"{owner_kind} {owner_id} {stream} capture "
+                    "短于 journal committed offset")
+        assert stream_frame_offset is not None
+        if stream_frame_offset > frame_size:
+            raise ExecutionRecoveryError(
+                f"{owner_kind} {owner_id} frame capture "
+                "短于 journal committed offset")
+        if final_exists and partial_exists:
+            raise ExecutionRecoveryError(
+                f"{owner_kind} {owner_id} 同时存在 final 与 partial，拒绝恢复")
+        if not final_exists and not partial_exists:
+            raise ExecutionRecoveryError(
+                f"{owner_kind} {owner_id} stream receipt 存在但 "
+                f"{partial} 缺失")
+
+        partial_fd = -1
+        if not final_exists:
+            partial_fd = os.open(
+                partial,
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            info = os.fstat(partial_fd)
+            committed_total = sum(normalized_stream_offsets.values())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_uid != os.geteuid()
+            ):
+                os.close(partial_fd)
+                raise ExecutionRecoveryError(
+                    f"stream staged log 身份非法: {partial}")
+            if info.st_size < committed_total:
+                os.close(partial_fd)
+                raise ExecutionRecoveryError(
+                    f"{owner_kind} {owner_id} partial 短于 journal "
+                    "committed bytes")
+            if info.st_size > committed_total:
+                os.ftruncate(partial_fd, committed_total)
+                os.fsync(partial_fd)
+            os.lseek(partial_fd, committed_total, os.SEEK_SET)
+
+        try:
+            suffix_bytes = {"stdout": 0, "stderr": 0}
+
+            def accept_suffix(
+                    stream: str, chunk: bytes,
+                    frame_end_offset: int) -> None:
+                if partial_fd >= 0:
+                    _write_all(partial_fd, chunk)
+                    # The partial must never lag a durable journal cursor.  If
+                    # the owner dies after this fsync but before the observer
+                    # commits, the next recovery truncates the harmless extra
+                    # suffix back to committed_total.
+                    os.fsync(partial_fd)
+                assert stream_output_observer is not None
+                stream_output_observer(
+                    stream, chunk, frame_end_offset)
+                suffix_bytes[stream] += len(chunk)
+
+            final_frame_offset = stream_execution_frames(
+                receipt, start_offset=stream_frame_offset,
+                observer=accept_suffix)
+            if final_frame_offset != frame_size:
+                raise ExecutionRecoveryError(
+                    f"{owner_kind} {owner_id} frame capture suffix "
+                    "未完整恢复")
+            for stream in ("stdout", "stderr"):
+                if (
+                    normalized_stream_offsets[stream]
+                    + suffix_bytes[stream]
+                    != capture_sizes[stream]
+                ):
+                    raise ExecutionRecoveryError(
+                        f"{owner_kind} {owner_id} ordered frames 与 "
+                        f"{stream} raw capture 长度冲突")
+        except (OSError, ValueError) as error:
+            raise ExecutionRecoveryError(
+                f"{owner_kind} {owner_id} stream capture suffix "
+                "恢复失败") from error
+        finally:
+            if partial_fd >= 0:
+                os.close(partial_fd)
     if receipt.get("outcome") != "exit":
         if receipt.get("containment") == "docker-container-v1":
             try:
@@ -287,10 +492,11 @@ def recover_staged_result(*, staging_dir: str, log_name: str,
     if not final_exists:
         os.replace(partial, final)
         _fsync_dir(directory)
-    data = read_artifact_bytes(final, label="recovered staged log")
+    log_sha256, log_bytes = _stream_artifact_identity(
+        final, label="recovered staged log")
     return {
         "exit_code": exit_code, "log_path": str(final),
-        "log_sha256": hashlib.sha256(data).hexdigest(), "log_bytes": len(data),
+        "log_sha256": log_sha256, "log_bytes": log_bytes,
         "process_receipt_path": str(receipt_path), "process_receipt": receipt,
         "process_pointer_path": str(directory / (log_name + ".process.json")),
         "recovered_after_owner_loss": True,
@@ -306,11 +512,28 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                sandbox_invocation=None,
                inherit_environment: bool = True,
                progress_observer=None,
+               output_observer=None,
+               stream_output_observer=None,
                progress_interval_s: float = 5.0) -> Dict[str, Any]:
     """跑真子进程，stdout+stderr 合流写 staging log（.partial → 原子改名）。返回
     {exit_code, log_path, log_sha256, log_bytes}。超时 → kill 并抛 subprocess.TimeoutExpired
-    （.partial 留在 staging 供审计，不改名——半成品不冒充完整产物）。"""
+    （.partial 留在 staging 供审计，不改名——半成品不冒充完整产物）。
+
+    ``output_observer`` 从本次已打开的 partial FD 增量接收合流输出字节；每段只交付一次，
+    guardian 收口后还会在 FD 关闭前做 final drain。``stream_output_observer`` 接收
+    ``(stdout|stderr, bytes, frame_end_offset)``，同时按 guardian frame 顺序构造
+    历史兼容的合流 log；两种 observer 不得并用。observer 抛错会取消本次执行并原样上抛。"""
     _validate_log_name(log_name)
+    if output_observer is not None and not callable(output_observer):
+        raise ValueError("output_observer 须为 callable 或 None")
+    if (stream_output_observer is not None
+            and not callable(stream_output_observer)):
+        raise ValueError("stream_output_observer 须为 callable 或 None")
+    if output_observer is not None and stream_output_observer is not None:
+        raise ValueError(
+            "output_observer 与 stream_output_observer 不得同时使用")
+    if progress_observer is not None and not callable(progress_observer):
+        raise ValueError("progress_observer 须为 callable 或 None")
     context = dict(execution_context or {})
     if "log_name" in context and context["log_name"] != log_name:
         raise ValueError("execution_context.log_name 与 harness log_name 冲突")
@@ -327,13 +550,58 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
     execution_error: Optional[BaseException] = None
     result = None
     try:
-        with open(partial, "wb") as fh:
+        with open(partial, "w+b") as fh:
+            output_offset = 0
+            output_observer_error: Optional[BaseException] = None
+
+            def drain_output() -> None:
+                nonlocal output_offset, output_observer_error
+                if output_observer is None or output_observer_error is not None:
+                    return
+                while True:
+                    chunk = os.pread(fh.fileno(), 64 * 1024, output_offset)
+                    if not chunk:
+                        return
+                    # Advance before dispatch so a rejecting observer can never
+                    # receive the same bytes a second time during finalization.
+                    output_offset += len(chunk)
+                    try:
+                        output_observer(chunk)
+                    except BaseException as error:
+                        output_observer_error = error
+                        raise
+
+            def observe_progress() -> bool:
+                try:
+                    drain_output()
+                except BaseException:
+                    # Use the existing exact-execution cancellation channel.
+                    # The original observer error is restored after the
+                    # guardian has proved the descendant tree drained.
+                    return True
+                if progress_observer is None:
+                    return False
+                return progress_observer()
+
+            def observe_stream(
+                    stream: str, chunk: bytes,
+                    frame_end_offset: int) -> None:
+                # In stream-preserving mode the guardian owns the two raw
+                # captures.  Rebuild the historical combined staged log in
+                # exactly the parent observation order before publishing the
+                # labeled event to the append-only consumer.
+                _write_all(fh.fileno(), chunk)
+                os.fsync(fh.fileno())
+                assert stream_output_observer is not None
+                stream_output_observer(
+                    stream, chunk, frame_end_offset)
+
             # cwd=staging：脚本的相对路径产物（checkpoint/指标文件）落 staging（半成品目录纪律的自然延伸）。
             # Guardian 在直接子进程结束后仍要清空/reap 整棵后代树；只有这个机械边界返回
             # 后，.partial 才可能提升为不可变 final。
             try:
                 run_kwargs = {
-                    "stdin": None, "stdout": fh, "stderr": subprocess.STDOUT,
+                    "stdin": None,
                     "timeout_s": timeout_s, "cwd": d,
                     # A sandbox wrapper is trusted host control code and gets
                     # a deliberately minimal env; host credentials must never
@@ -349,19 +617,77 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                         sandbox_invocation.external_container
                         if sandbox_invocation is not None else None),
                 }
+                if stream_output_observer is None:
+                    run_kwargs.update({
+                        "stdout": fh, "stderr": subprocess.STDOUT,
+                    })
+                else:
+                    run_kwargs.update({
+                        "capture_output": True,
+                        "capture_result": False,
+                        "stream_capture_observer": observe_stream,
+                    })
                 # Do not pass the optional keywords to legacy/injected test
                 # supervisors unless observation is actually enabled.
-                if progress_observer is not None:
+                if (output_observer is not None
+                        or stream_output_observer is not None
+                        or progress_observer is not None):
                     run_kwargs.update({
-                        "progress_observer": progress_observer,
                         "progress_interval_s": progress_interval_s,
                     })
+                    if stream_output_observer is None:
+                        run_kwargs["progress_observer"] = observe_progress
+                    elif progress_observer is not None:
+                        run_kwargs["progress_observer"] = progress_observer
                 result = supervisor.run(cmd, **run_kwargs)
             except BaseException as error:
                 execution_error = error
             finally:
-                fh.flush()
-                os.fsync(fh.fileno())
+                try:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                except BaseException as error:
+                    if execution_error is None:
+                        execution_error = error
+                    else:
+                        note = getattr(execution_error, "add_note", None)
+                        if callable(note):
+                            note("partial flush/fsync 同时失败: "
+                                 f"{type(error).__name__}: {error}")
+                try:
+                    # supervisor.run only returns/raises after its guardian has
+                    # drained the whole tree, so this is the stable final suffix.
+                    drain_output()
+                except BaseException:
+                    # drain_output stored the exact callback exception.
+                    pass
+                if output_observer_error is not None:
+                    prior_error = execution_error
+                    receipt = None
+                    receipt_path = None
+                    if result is not None:
+                        receipt, receipt_path = result.receipt, result.receipt_path
+                    elif prior_error is not None:
+                        receipt = (getattr(prior_error, "receipt", None)
+                                   or getattr(prior_error, "execution_receipt", None))
+                        receipt_path = (
+                            getattr(prior_error, "receipt_path", None)
+                            or getattr(prior_error, "execution_receipt_path", None))
+                    if receipt is not None and receipt_path is not None:
+                        try:
+                            output_observer_error.receipt = receipt
+                            output_observer_error.receipt_path = receipt_path
+                            output_observer_error.execution_receipt = receipt
+                            output_observer_error.execution_receipt_path = receipt_path
+                        except BaseException:
+                            pass
+                    if (prior_error is not None
+                            and prior_error is not output_observer_error):
+                        note = getattr(output_observer_error, "add_note", None)
+                        if callable(note):
+                            note("observer 触发取消/收口时 execution 同时报告 "
+                                 f"{type(prior_error).__name__}: {prior_error}")
+                    execution_error = output_observer_error
     finally:
         if own_supervisor:
             supervisor.close()
@@ -372,6 +698,14 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
                    or getattr(execution_error, "execution_receipt", None))
         receipt_path = (getattr(execution_error, "receipt_path", None)
                         or getattr(execution_error, "execution_receipt_path", None))
+        if receipt is not None and receipt_path is not None:
+            try:
+                execution_error.receipt = receipt
+                execution_error.receipt_path = receipt_path
+                execution_error.execution_receipt = receipt
+                execution_error.execution_receipt_path = receipt_path
+            except BaseException:
+                pass
     if result is not None:
         receipt, receipt_path = result.receipt, result.receipt_path
     if receipt is not None and receipt_path is not None:
@@ -455,9 +789,10 @@ def run_staged(cmd: List[str], *, staging_dir: str, log_name: str, timeout_s: fl
     _ensure_exit_sidecar(d, log_name, exit_code)
     os.replace(partial, final)          # 原子改名：只有完整跑完的 log 得正式名（P6 staging 纪律）
     _fsync_dir(d)
-    data = read_artifact_bytes(final, label="completed staged log")
+    log_sha256, log_bytes = _stream_artifact_identity(
+        final, label="completed staged log")
     return {"exit_code": exit_code, "log_path": str(final),
-            "log_sha256": hashlib.sha256(data).hexdigest(), "log_bytes": len(data),
+            "log_sha256": log_sha256, "log_bytes": log_bytes,
             "process_receipt_path": str(result.receipt_path),
             "process_receipt": result.receipt,
             "process_pointer_path": str(d / (log_name + ".process.json"))}

@@ -10,6 +10,7 @@ import os
 import re
 import sqlite3
 import stat
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,23 @@ TEST_IDEMPOTENCY = "1" * 32
 
 
 def test_configure_process_storage_stays_beneath_data_root(tmp_path, monkeypatch):
+    for name in (
+            "TMPDIR", "TMP", "TEMP", "HOME", "CODEX_HOME",
+            "CODEX_SQLITE_HOME", "XDG_CACHE_HOME", "PIP_CACHE_DIR",
+            "HF_HOME", "HF_HUB_CACHE", "HF_DATASETS_CACHE",
+            "TRANSFORMERS_CACHE", "TORCH_HOME", "TORCH_EXTENSIONS_DIR",
+            "TRITON_CACHE_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+            "XDG_STATE_HOME", "CONDA_PKGS_DIRS", "CONDA_ENVS_PATH",
+            "UV_CACHE_DIR", "CUDA_CACHE_PATH", "MPLCONFIGDIR",
+            "NUMBA_CACHE_DIR", "PYTHONPYCACHEPREFIX",
+            "METARESEARCH_QUERY_HOME", "METARESEARCH_QUERY_CODEX_HOME",
+            "METARESEARCH_QUERY_CODEX_SQLITE_HOME",
+            "METARESEARCH_QUERY_CACHE_HOME", "METARESEARCH_STORAGE_ROOT"):
+        if name in os.environ:
+            monkeypatch.setenv(name, os.environ[name])
+        else:
+            monkeypatch.setenv(name, "")
+            monkeypatch.delenv(name)
     root = tmp_path / "runtime"
     root.mkdir()
     service_source = tmp_path / "service-source"
@@ -38,15 +56,20 @@ def test_configure_process_storage_stays_beneath_data_root(tmp_path, monkeypatch
     (query_source / "config.toml").write_text("query = true\n")
     monkeypatch.setenv("CODEX_HOME", str(service_source))
     monkeypatch.setenv("METARESEARCH_QUERY_CODEX_HOME", str(query_source))
+    monkeypatch.delenv("METARESEARCH_STORAGE_ROOT", raising=False)
     for key in ("TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "PIP_CACHE_DIR"):
         monkeypatch.setenv(key, "/outside-before-test")
     monkeypatch.setattr(CS.tempfile, "tempdir", CS.tempfile.tempdir)
 
-    configured = CS._configure_process_storage(root)
+    configured = CS.configure_process_storage(
+        root, require_external_mount=False)
 
     expected_tmp = root / ".process-tmp"
     expected_cache = root / ".process-cache" / "service"
-    assert configured == {
+    assert {
+        key: configured[key] for key in (
+            "TMPDIR", "XDG_CACHE_HOME", "PIP_CACHE_DIR")
+    } == {
         "TMPDIR": str(expected_tmp),
         "XDG_CACHE_HOME": str(expected_cache),
         "PIP_CACHE_DIR": str(expected_cache / "pip"),
@@ -55,10 +78,14 @@ def test_configure_process_storage_stays_beneath_data_root(tmp_path, monkeypatch
     assert CS.tempfile.tempdir == str(expected_tmp)
     assert os.environ["HOME"] == str(root / ".process-home" / "service")
     assert os.environ["CODEX_HOME"] == str(root / ".codex-runtime" / "service")
+    assert os.environ["CODEX_SQLITE_HOME"] == str(
+        root / ".codex-runtime" / "service-sqlite")
     assert os.environ["METARESEARCH_QUERY_HOME"] == str(
         root / ".process-home" / "query")
     assert os.environ["METARESEARCH_QUERY_CODEX_HOME"] == str(
         root / ".codex-runtime" / "query")
+    assert os.environ["METARESEARCH_QUERY_CODEX_SQLITE_HOME"] == str(
+        root / ".codex-runtime" / "query-sqlite")
     for key in (
             "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
             "CONDA_PKGS_DIRS", "CONDA_ENVS_PATH", "UV_CACHE_DIR",
@@ -73,7 +100,8 @@ def test_configure_process_storage_stays_beneath_data_root(tmp_path, monkeypatch
     assert stat.S_IMODE(expected_tmp.stat().st_mode) == 0o711
     for path in (expected_cache, expected_cache / "pip",
                  root / ".process-home" / "service",
-                 root / ".codex-runtime" / "service"):
+                 root / ".codex-runtime" / "service",
+                 root / ".codex-runtime" / "service-sqlite"):
         assert stat.S_IMODE(path.stat().st_mode) == 0o700
 
 
@@ -1582,7 +1610,8 @@ def test_browser_open_failure_prints_fragment_url_not_backend_capability_path(
     import webbrowser
 
     opened = []
-    monkeypatch.setattr(CS, "_configure_process_storage", lambda _root: {})
+    monkeypatch.setattr(
+        CS, "_configure_process_storage", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(CS, "serve_quests", lambda *_args, **_kwargs: _StoppedConsoleServer())
     monkeypatch.setattr(webbrowser, "open_new_tab", lambda url: opened.append(url) or False)
 
@@ -1600,12 +1629,150 @@ def test_browser_open_failure_prints_fragment_url_not_backend_capability_path(
     assert "工单/聊天记录" in output
 
 
+def test_main_reports_storage_startup_error_without_traceback(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        CS, "_configure_process_storage",
+        lambda *_args, **_kwargs: (
+            _ for _ in ()).throw(ValueError("storage rejected")))
+
+    assert CS.main([
+        "--system-root", SYSTEM_ROOT,
+        "--quests-root", str(tmp_path / "product-data"),
+        "--no-open-browser",
+    ]) == 2
+    captured = capsys.readouterr()
+    assert "存储绑定失败" in captured.err
+    assert "storage rejected" in captured.err
+
+
+def test_main_single_work_root_binds_shared_storage_to_its_parent(
+        vepfs_tmp_path, monkeypatch):
+    work = vepfs_tmp_path / "quest"
+    before_environment = dict(os.environ)
+    before_tempdir = tempfile.tempdir
+    monkeypatch.delenv("METARESEARCH_STORAGE_ROOT", raising=False)
+    monkeypatch.setattr(
+        CS, "serve", lambda *_args, **_kwargs: _StoppedConsoleServer())
+    try:
+        assert CS.main([
+            "--system-root", SYSTEM_ROOT, "--work-root", str(work),
+            "--no-open-browser",
+        ]) == 0
+        assert os.environ["METARESEARCH_STORAGE_ROOT"] == str(vepfs_tmp_path)
+        assert (vepfs_tmp_path / ".process-tmp").is_dir()
+        assert not (work / ".process-tmp").exists()
+    finally:
+        os.environ.clear()
+        os.environ.update(before_environment)
+        tempfile.tempdir = before_tempdir
+
+
+def test_main_explicit_quests_root_rejects_inherited_marker_without_side_effects(
+        vepfs_tmp_path, monkeypatch, capsys):
+    requested = vepfs_tmp_path / "requested"
+    marker = vepfs_tmp_path / "other-process-root"
+    before_environment = dict(os.environ)
+    before_tempdir = tempfile.tempdir
+    monkeypatch.setenv("METARESEARCH_STORAGE_ROOT", str(marker))
+    monkeypatch.setattr(
+        CS, "serve_quests",
+        lambda *_args, **_kwargs: _StoppedConsoleServer())
+    try:
+        assert CS.main([
+            "--system-root", SYSTEM_ROOT, "--quests-root", str(requested),
+            "--no-open-browser",
+        ]) == 2
+        assert not marker.exists()
+        assert not requested.exists()
+        assert dict(os.environ) == {
+            **before_environment, "METARESEARCH_STORAGE_ROOT": str(marker)}
+        assert tempfile.tempdir == before_tempdir
+        assert "存储绑定失败" in capsys.readouterr().err
+    finally:
+        os.environ.clear()
+        os.environ.update(before_environment)
+        tempfile.tempdir = before_tempdir
+
+
+def test_main_non_loopback_rejection_precedes_storage_mutation(
+        vepfs_tmp_path, monkeypatch, capsys):
+    requested = vepfs_tmp_path / "registry"
+    before_environment = dict(os.environ)
+    before_tempdir = tempfile.tempdir
+    monkeypatch.delenv("METARESEARCH_STORAGE_ROOT", raising=False)
+    try:
+        assert CS.main([
+            "--system-root", SYSTEM_ROOT, "--quests-root", str(requested),
+            "--host", "0.0.0.0", "--no-open-browser",
+        ]) == 2
+        assert not requested.exists()
+        assert dict(os.environ) == {
+            key: value for key, value in before_environment.items()
+            if key != "METARESEARCH_STORAGE_ROOT"}
+        assert tempfile.tempdir == before_tempdir
+        assert "loopback" in capsys.readouterr().err
+    finally:
+        os.environ.clear()
+        os.environ.update(before_environment)
+        tempfile.tempdir = before_tempdir
+
+
+def test_main_unknown_query_username_is_clean_storage_error(
+        vepfs_tmp_path, monkeypatch, capsys):
+    import orchestrator.runtime_storage as runtime_storage
+
+    requested = vepfs_tmp_path / "registry"
+    before_environment = dict(os.environ)
+    before_tempdir = tempfile.tempdir
+    monkeypatch.delenv("METARESEARCH_STORAGE_ROOT", raising=False)
+    monkeypatch.setenv(
+        "METARESEARCH_QUERY_RUN_AS_USER", "missing-storage-account")
+
+    def missing_user(_name):
+        raise KeyError("unknown username")
+
+    monkeypatch.setattr(runtime_storage.pwd, "getpwnam", missing_user)
+    try:
+        assert CS.main([
+            "--system-root", SYSTEM_ROOT, "--quests-root", str(requested),
+            "--no-open-browser",
+        ]) == 2
+        assert not requested.exists()
+        assert "存储绑定失败" in capsys.readouterr().err
+    finally:
+        os.environ.clear()
+        os.environ.update(before_environment)
+        tempfile.tempdir = before_tempdir
+
+
+@pytest.mark.parametrize("error_type", [ValueError, OSError])
+def test_main_reports_expected_serve_initialization_errors_cleanly(
+        tmp_path, monkeypatch, capsys, error_type):
+    monkeypatch.setattr(
+        CS, "_configure_process_storage", lambda *_args, **_kwargs: {})
+
+    def reject_serve(*_args, **_kwargs):
+        raise error_type("registry rejected")
+
+    monkeypatch.setattr(CS, "serve_quests", reject_serve)
+    assert CS.main([
+        "--system-root", SYSTEM_ROOT,
+        "--quests-root", str(tmp_path / "product-data"),
+        "--no-open-browser",
+    ]) == 2
+    captured = capsys.readouterr()
+    assert "启动失败" in captured.err
+    assert "registry rejected" in captured.err
+
+
 def test_successful_browser_open_does_not_echo_bearer_to_terminal(
         tmp_path, monkeypatch, capsys):
     import webbrowser
 
     opened = []
-    monkeypatch.setattr(CS, "_configure_process_storage", lambda _root: {})
+    monkeypatch.setattr(
+        CS, "_configure_process_storage", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(CS, "serve_quests", lambda *_args, **_kwargs: _StoppedConsoleServer())
     monkeypatch.setattr(webbrowser, "open_new_tab", lambda url: opened.append(url) or True)
 

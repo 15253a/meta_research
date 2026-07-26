@@ -13,6 +13,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import tempfile
 import time
 import types
 from pathlib import Path
@@ -49,6 +50,29 @@ from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = str(Path(__file__).resolve().parent.parent)
 _POLICY = yaml.safe_load((Path(SYSTEM_ROOT) / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+
+
+@pytest.fixture(autouse=True)
+def _bind_cli_tests_to_tmp_storage(request, monkeypatch):
+    """CLI behavior tests stub only the deployment-owned external mount."""
+    real_storage_tests = {
+        "test_main_real_storage_success_binds_work_parent",
+        "test_main_web_child_reuses_real_console_storage_marker",
+        "test_main_real_storage_rejects_private_inherited_marker_without_side_effects",
+        "test_main_unknown_service_uid_returns_clean_storage_error",
+    }
+    if request.node.name in real_storage_tests:
+        return
+    if (not request.node.name.startswith("test_main_")
+            and request.node.name != "test_stop_reason_print_prefers_block"):
+        return
+    import orchestrator.run as run_module
+
+    monkeypatch.setattr(
+        run_module, "configure_process_storage",
+        lambda root, *, require_external_mount, private_work_root=None: {
+            "METARESEARCH_STORAGE_ROOT": str(Path(root).absolute()),
+        })
 
 
 def _use_budgeted_policy(monkeypatch, *, session_max=100000):
@@ -1180,6 +1204,231 @@ def test_main_ctrl_c_exits_cleanly(tmp_path, monkeypatch, capsys):
     assert "Ctrl-C" in capsys.readouterr().out
 
 
+def test_main_derives_shared_storage_parent_and_reports_clean_error(
+        tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    work = tmp_path / "quest"
+    seen = []
+
+    def reject(root, *, require_external_mount, private_work_root=None):
+        seen.append((
+            Path(root), require_external_mount,
+            None if private_work_root is None else Path(private_work_root)))
+        raise ValueError("storage rejected")
+
+    monkeypatch.setattr(R, "configure_process_storage", reject)
+
+    assert R.main([
+        "--system-root", SYSTEM_ROOT, "--work-root", str(work),
+        "--once", "--no-outbound",
+    ]) == 2
+    assert seen == [(tmp_path, True, work)]
+    captured = capsys.readouterr()
+    assert "存储绑定失败" in captured.err
+    assert "storage rejected" in captured.err
+
+
+def test_main_real_storage_success_binds_work_parent(
+        vepfs_tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    class ZeroCycleSystem:
+        dual_mode = "A"
+        last_stop_reason = None
+
+        class advancer:
+            last_block_reason = None
+
+        def run(self, max_cycles):
+            assert max_cycles == 0
+            return []
+
+        def close(self):
+            return None
+
+    work = vepfs_tmp_path / "quest"
+    before_environment = dict(os.environ)
+    before_tempdir = tempfile.tempdir
+    monkeypatch.delenv("METARESEARCH_STORAGE_ROOT", raising=False)
+    monkeypatch.setattr(R, "build_system", lambda *_args, **_kwargs: ZeroCycleSystem())
+    try:
+        assert R.main([
+            "--system-root", SYSTEM_ROOT, "--work-root", str(work),
+            "--max-cycles", "0", "--once", "--no-outbound",
+        ]) == 0
+        assert os.environ["METARESEARCH_STORAGE_ROOT"] == str(vepfs_tmp_path)
+        assert (vepfs_tmp_path / ".process-tmp").is_dir()
+        assert not (work / ".process-tmp").exists()
+        assert "zero-cycle-preflight" in capsys.readouterr().out
+    finally:
+        os.environ.clear()
+        os.environ.update(before_environment)
+        tempfile.tempdir = before_tempdir
+
+
+def test_main_web_child_reuses_real_console_storage_marker(
+        vepfs_tmp_path, monkeypatch):
+    import orchestrator.console_server as CS
+    import orchestrator.run as R
+
+    class StoppedConsole:
+        console_capability_token = "a" * 64
+        server_address = ("127.0.0.1", 43123)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def shutdown(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    class ZeroCycleSystem:
+        dual_mode = "A"
+        last_stop_reason = None
+
+        class advancer:
+            last_block_reason = None
+
+        def run(self, max_cycles):
+            assert max_cycles == 0
+            return []
+
+        def close(self):
+            return None
+
+    registry = vepfs_tmp_path / "registry"
+    work = registry / "quests" / "q1" / "work"
+    before_environment = dict(os.environ)
+    before_tempdir = tempfile.tempdir
+    monkeypatch.delenv("METARESEARCH_STORAGE_ROOT", raising=False)
+    monkeypatch.setattr(
+        CS, "serve_quests", lambda *_args, **_kwargs: StoppedConsole())
+    monkeypatch.setattr(
+        R, "build_system", lambda *_args, **_kwargs: ZeroCycleSystem())
+    try:
+        assert CS.main([
+            "--system-root", SYSTEM_ROOT, "--quests-root", str(registry),
+            "--no-open-browser",
+        ]) == 0
+        assert os.environ["METARESEARCH_STORAGE_ROOT"] == str(registry)
+
+        assert R.main([
+            "--system-root", SYSTEM_ROOT, "--work-root", str(work),
+            "--max-cycles", "0", "--once", "--no-outbound",
+        ]) == 0
+        assert os.environ["METARESEARCH_STORAGE_ROOT"] == str(registry)
+        assert tempfile.tempdir == str(registry / ".process-tmp")
+        assert (registry / ".process-tmp").is_dir()
+        assert not (work / ".process-tmp").exists()
+        assert not (work.parent / ".process-tmp").exists()
+    finally:
+        os.environ.clear()
+        os.environ.update(before_environment)
+        tempfile.tempdir = before_tempdir
+
+
+def test_main_real_storage_rejects_private_inherited_marker_without_side_effects(
+        vepfs_tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+
+    work = vepfs_tmp_path / "quest"
+    nested = work / "private-storage"
+    before_environment = dict(os.environ)
+    before_tempdir = tempfile.tempdir
+    monkeypatch.setenv("METARESEARCH_STORAGE_ROOT", str(nested))
+    try:
+        assert R.main([
+            "--system-root", SYSTEM_ROOT, "--work-root", str(work),
+            "--once", "--no-outbound",
+        ]) == 2
+        assert not work.exists()
+        assert dict(os.environ) == {
+            **before_environment, "METARESEARCH_STORAGE_ROOT": str(nested)}
+        assert tempfile.tempdir == before_tempdir
+        assert "存储绑定失败" in capsys.readouterr().err
+    finally:
+        os.environ.clear()
+        os.environ.update(before_environment)
+        tempfile.tempdir = before_tempdir
+
+
+def test_main_unknown_service_uid_returns_clean_storage_error(
+        vepfs_tmp_path, monkeypatch, capsys):
+    import orchestrator.run as R
+    import orchestrator.runtime_storage as runtime_storage
+
+    work = vepfs_tmp_path / "quest"
+    before_environment = dict(os.environ)
+    before_tempdir = tempfile.tempdir
+    monkeypatch.delenv("METARESEARCH_STORAGE_ROOT", raising=False)
+    monkeypatch.delenv("METARESEARCH_QUERY_RUN_AS_USER", raising=False)
+    monkeypatch.setattr(runtime_storage.os, "geteuid", lambda: 424242)
+    monkeypatch.setattr(runtime_storage.os, "getegid", lambda: 424242)
+
+    def missing_uid(_uid):
+        raise KeyError("unknown uid")
+
+    monkeypatch.setattr(runtime_storage.pwd, "getpwuid", missing_uid)
+    try:
+        assert R.main([
+            "--system-root", SYSTEM_ROOT, "--work-root", str(work),
+            "--once", "--no-outbound",
+        ]) == 2
+        assert not (vepfs_tmp_path / ".process-tmp").exists()
+        assert "存储绑定失败" in capsys.readouterr().err
+    finally:
+        os.environ.clear()
+        os.environ.update(before_environment)
+        tempfile.tempdir = before_tempdir
+
+
+@pytest.mark.parametrize("manifest_override", [False, True])
+def test_local_execution_overrides_inherited_model_cache_paths(
+        tmp_path, monkeypatch, manifest_override):
+    from orchestrator.execution_sandbox import LocalExecutionSandbox
+
+    stale = tmp_path / "outside"
+    for name in (
+            "CODEX_HOME", "CODEX_SQLITE_HOME",
+            "HF_HOME", "HF_HUB_CACHE", "HF_DATASETS_CACHE",
+            "TRANSFORMERS_CACHE", "TORCH_HOME", "TORCH_EXTENSIONS_DIR",
+            "TRITON_CACHE_DIR", "XDG_CACHE_HOME", "PIP_CACHE_DIR",
+            "UV_CACHE_DIR", "CUDA_CACHE_PATH", "MPLCONFIGDIR",
+            "NUMBA_CACHE_DIR", "PYTHONPYCACHEPREFIX"):
+        monkeypatch.setenv(name, str(stale / name))
+    sandbox = LocalExecutionSandbox.__new__(LocalExecutionSandbox)
+    sandbox.work_root = tmp_path / "quest"
+    sandbox.python_path = Path(os.sys.executable)
+    sandbox.owner_guard = lambda: None
+    sandbox.gpu_contract = None
+    sandbox.local_environment_ca_environment = {}
+    sandbox._preflight_done = True
+
+    invocation = sandbox.prepare(
+        ["/bin/true"], staging_dir=sandbox.work_root / "run",
+        log_name="cache.log",
+        env=({
+            "CODEX_HOME": str(stale / "manifest-codex"),
+            "CODEX_SQLITE_HOME": str(stale / "manifest-codex-sqlite"),
+        } if manifest_override else None),
+        timeout_s=1)
+
+    runtime = sandbox.work_root / "runtime" / "local-execution"
+    assert invocation.env["HOME"] == str(runtime / "home")
+    assert invocation.env["TMPDIR"] == str(runtime / "tmp")
+    for name in (
+            "CODEX_HOME", "CODEX_SQLITE_HOME",
+            "HF_HOME", "HF_HUB_CACHE", "HF_DATASETS_CACHE",
+            "TRANSFORMERS_CACHE", "TORCH_HOME", "TORCH_EXTENSIONS_DIR",
+            "TRITON_CACHE_DIR", "XDG_CACHE_HOME", "PIP_CACHE_DIR",
+            "UV_CACHE_DIR", "CUDA_CACHE_PATH", "MPLCONFIGDIR",
+            "NUMBA_CACHE_DIR", "PYTHONPYCACHEPREFIX"):
+        assert os.path.commonpath((str(runtime), invocation.env[name])) == str(runtime)
+
+
 def test_main_exit_after_research_disables_terminal_linger(tmp_path, monkeypatch, capsys):
     import orchestrator.run as R
 
@@ -1426,6 +1675,8 @@ def test_default_attack_assembly_shares_owner_fenced_pool_publisher(tmp_path):
     try:
         attack = system.advancer.attack
         assert attack.gate.require_formal_publication is True
+        assert attack.gate.require_scientific_contract is True
+        assert system.state.require_reasoning_commit is True
         assert isinstance(attack.pool_publisher, PoolPublisher)
         assert attack.gate.pool_publisher is attack.pool_publisher
         assert attack.pool_publisher.work_root == tmp_path.absolute()
@@ -1445,7 +1696,7 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         BoundedReferenceSnapshotProvider, ImportTriggerRouter,
         TrustedImportTriggerService)
     from orchestrator.import_worker import ImportWorker
-    from orchestrator.stage_provider import JudgeProvider, PlanReviewProvider
+    from orchestrator.stage_provider import JudgeProvider
 
     system = build_system(SYSTEM_ROOT, str(tmp_path), runner_factory=_mock_factory([]))
     try:
@@ -1474,10 +1725,13 @@ def test_default_attack_assembly_includes_fenced_import_worker(tmp_path):
         assert system.advancer.attack.execution_sandbox_resolver is None
         assert worker.execution_sandbox.resource_mode == "unrestricted-local"
         assert "plan_review" not in system.advancer.attack.p
-        assert "judge" not in system.advancer.attack.p
+        # An injected, non-resident runner cannot emit native child-review
+        # receipts.  It therefore receives the explicit independent judge
+        # fallback instead of silently bypassing code/result review.
+        assert isinstance(system.advancer.attack.p["judge"], JudgeProvider)
         assert isinstance(worker.p["judge"], JudgeProvider)
-        assert system.advancer.attack.gate.require_code_review is False
-        assert system.advancer.attack.gate.require_result_review is False
+        assert system.advancer.attack.gate.require_code_review is True
+        assert system.advancer.attack.gate.require_result_review is True
         search = system.advancer.attack.p["import_search"]
         assert isinstance(search, ImportTriggerRouter)
         assert isinstance(search.new_structure, ImportSearchService)
@@ -2407,10 +2661,14 @@ def _lazy_factory(items):
     return lambda td, pt: MockRunner()
 
 
-def test_full_attack_flow_end_to_end(tmp_path, request):
-    """步⑧步级验证①：run.py 装配的**全系统**跑通完整流程——bootstrap→attack（idea→plan[真 gate 注册
-    协议/占坑]→bundle[manifest→harness 真子进程 smoke/train/eval]→机械门禁→
-    注册入池→真证据关问）→terminate。runner 为脚本化 mock（Codex 替身），其余全为真组件。"""
+def test_legacy_injected_full_attack_cannot_fake_green_dag_replay(
+        tmp_path, request):
+    """旧注入式 cycle-wide Bundle 可验证领域执行，但不能伪装成新 DAG 绿色闭包。
+
+    新生产路径由 A→(B,C) 集成测试覆盖；这里保留旧脚本化 runner 作为负向兼容测试：
+    即使训练、评估、publication 与 Reasoning 都成功，只要缺 Scheduler/Worker/review task
+    receipts，terminal replay 必须 fail closed。
+    """
     import sys as _sys
     import test_attack_advance as TA
     from orchestrator.manifest import canon_hash
@@ -2510,13 +2768,21 @@ def test_full_attack_flow_end_to_end(tmp_path, request):
         } for index, candidate in enumerate(wild_candidates)],
         "selected_id": "wild-1",
     }}
+    review_pass = {
+        "review_verdict.json": {
+            "verdict": "pass", "issues": [],
+            "notes_md": "脚本化独立 reviewer 接受冻结 subject",
+        }
+    }
     seq = [boot_attack,                          # c1 bootstrap（reasoning）
            idea_draft, idea_audit, predicate_plan,  # c2 attack：生成 → 独立盲审 → plan
            bundle_env,                           # bundle 信封（manifest+代码）
+           review_pass,                          # pre-smoke code↔Plan reviewer
+           review_pass,                          # post-eval result reviewer
            attack_reasoning]                     # 轮尾：真证据关问 + terminate
 
     class FakeNoveltyProvider:
-        name = "arxiv_api_v1"
+        name = "literature_federated_v1"
 
         def search(self, query, *, policy_hash):
             result_hash = "sha256:" + hashlib.sha256(query.encode()).hexdigest()
@@ -2547,8 +2813,9 @@ def test_full_attack_flow_end_to_end(tmp_path, request):
         SYSTEM_ROOT, str(tmp_path), runner_factory=_lazy_factory(seq),
         novelty_search_provider=FakeNoveltyProvider())
     runtime_env_hash[0] = sys_.advancer.attack.execution_sandbox.environment_hash
-    ids = sys_.run(max_cycles=6)
-    assert len(ids) == 2                                         # bootstrap + attack 两轮后 terminate
+    from orchestrator.cycle_replay import CycleReplayError
+    with pytest.raises(CycleReplayError, match="缺 Worker task/receipt identity"):
+        sys_.run(max_cycles=6)
     d = sys_.daemon
     # 全链断言：协议真注册 / 池 legal / 真测量 / 真证据关问。注入式测试
     # runner 保留 legacy Idea adapter 的一个 audit turn；默认 Codex 装配则在
@@ -2558,8 +2825,8 @@ def test_full_attack_flow_end_to_end(tmp_path, request):
     assert d.query_one("SELECT status FROM baseline WHERE canonical_key='ck-attack'")[0] == "legal"
     assert d.query_one("SELECT status, eval_key FROM evaluation WHERE source='factory'")[0:2] == ("success", "t1")
     assert d.query_one("SELECT value FROM metric_result ORDER BY id DESC LIMIT 1")[0] == 0.93
-    assert d.query_one("SELECT count(*) FROM runner_call WHERE phase='audit' AND status='success'")[0] == 1
-    assert d.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 1
+    assert d.query_one("SELECT count(*) FROM runner_call WHERE phase='audit' AND status='success'")[0] == 3
+    assert d.query_one("SELECT count(*) FROM decision WHERE actor='judge'")[0] == 3
     assert d.query_one("SELECT count(*) FROM decision WHERE type='idea_audit'")[0] == 1
     persisted_idea_audit = json.loads(d.query_one(
         "SELECT audit_json FROM idea WHERE status='selected'")[0])
@@ -2569,9 +2836,10 @@ def test_full_attack_flow_end_to_end(tmp_path, request):
     assert persisted_idea_audit["wildidea_extra"]["source_prototype"].startswith("P01")
     assert d.query_one("SELECT count(*) FROM decision WHERE type='plan_review'")[0] == 0
     assert d.query_one("SELECT count(*) FROM decision WHERE type IN "
-                       "('bundle_code_review','bundle_result_review')")[0] == 0
+                       "('bundle_code_review','bundle_result_review')")[0] == 2
     assert d.query_one("SELECT status FROM question WHERE text LIKE 'toy 基线%'")[0] == "answered"
     assert d.query_one("SELECT count(*) FROM build_target WHERE status='complete'")[0] == 1
+    assert d.query_one("SELECT count(*) FROM cycle WHERE status='done'")[0] == 2
     # 执行是真子进程：checkpoint 以 work-root-relative 正式池路径登记且文件真实存在。
     ck = d.query_one("SELECT path, content_hash FROM checkpoint")
     assert (tmp_path / ck[0]).exists() and len(ck[1]) == 64

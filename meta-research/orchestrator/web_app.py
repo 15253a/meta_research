@@ -36,6 +36,7 @@ def _default_data_root(system_root: Path) -> Path:
 
 _SYSTEM_MARKERS = (
     "db/migrations/0001_appendix_a.sql",
+    "db/migrations/0002_bundle_target_dag.sql",
     "engines/wildidea/UPSTREAM.json",
     "input/goal_brief.md",
     "policies/policy.yaml",

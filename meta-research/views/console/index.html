@@ -488,6 +488,19 @@ table.t tr.rowsel td{background:var(--accent-bg2); box-shadow:inset 2px 0 0 var(
 .qcall-empty{padding:8px 10px;color:var(--sub);font-size:11px;line-height:1.5}
 .qexec-reason{border-top:1px dashed rgba(120,145,137,.45); margin-top:8px; padding-top:8px; font-size:11.5px; line-height:1.55}
 .qexec-actions{display:flex; gap:6px; flex-wrap:wrap; margin-top:8px}
+.qcycle-nav{display:flex;gap:5px;overflow-x:auto;margin:0 0 9px;padding:0 0 3px;scrollbar-width:thin}
+.qcycle-choice{flex:0 0 auto;border:1px solid var(--line);border-radius:999px;background:var(--panel);color:var(--sub);padding:4px 8px;cursor:pointer;font:9.5px/1.2 var(--mono)}
+.qcycle-choice:hover{border-color:#90B8AE;background:var(--accent-bg)}.qcycle-choice.selected{border-color:var(--accent);background:var(--accent);color:#fff;font-weight:750}
+.qresearch-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.qresearch-head .small{margin-left:auto}
+.qresearch-overview{border-left:3px solid var(--accent);background:var(--accent-bg2);padding:8px 9px;margin:7px 0 9px;font-size:11.5px;line-height:1.55}
+.qhistory-list{display:flex;flex-direction:column;gap:8px}.qhistory-entry{border:1px solid var(--line);border-radius:6px;background:var(--panel2);padding:8px 9px}
+.qhistory-entry.current{border-color:#86B9AD;background:var(--accent-bg2)}.qhistory-entry.selected{box-shadow:inset 0 0 0 1px rgba(11,107,93,.2)}
+.qhistory-title{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:5px;font-size:11.5px}.qhistory-title .when{margin-left:auto;color:var(--sub);font:9px/1.35 var(--mono)}
+.qhistory-phases{display:flex;gap:4px;flex-wrap:wrap;margin:5px 0}.qhistory-phase{border:1px solid #C9D8D3;border-radius:999px;background:var(--panel);padding:2px 6px;color:var(--sub);font:9px/1.25 var(--mono)}
+.qhistory-text{font-size:11.5px;line-height:1.58;white-space:pre-wrap;overflow-wrap:anywhere}.qhistory-next{border-top:1px dashed var(--line);margin-top:7px;padding-top:7px;color:var(--sub);font-size:11px;line-height:1.55}
+.qhistory-evidence{margin-top:6px;color:var(--sub);font-size:9.5px;line-height:1.55}.qhistory-action{margin-top:7px}
+.qtarget-facts{display:flex;flex-direction:column;gap:5px;margin-top:7px}.qtarget-fact{border-left:2px solid var(--line);padding:5px 7px;background:var(--panel);font-size:10px;line-height:1.55;overflow-wrap:anywhere}
+.qtarget-fact-head{display:flex;align-items:center;gap:5px;flex-wrap:wrap}.qtarget-detail{margin-top:3px;color:var(--sub)}.qreasoning-proof{margin-top:6px;padding-top:6px;border-top:1px dashed var(--line);font-size:10px;color:var(--sub)}
 
 /* ---------- Web-first 新建 / 文件上传 ---------- */
 .webmodal{border:0;border-radius:9px;padding:0;width:min(760px,calc(100vw - 28px));max-height:calc(100vh - 28px);
@@ -1290,7 +1303,7 @@ const FILE_CONTENT = {
   "prompts/skills/plan/SKILL.md": { panel:"pool", panelLabel:"Baseline 池", note:"复用判定是 plan 的核心机械步。",
     body:'# plan SKILL(骨架,模拟)\n拆 verification needs → 逐 need 机械复用判定(测量索引 O(1),排除 parser_result_suspect)→ 锁评估协议(I1)+metric_defs+readout+smoke+预算 → 可回答性评审(≤2 轮) → gate_new_protocol / gate_claim_* / build_target 队列。\ntargets=[] ⇒ reuse_only;仅 eval ⇒ eval_only;build/exec ⇒ attack;缺外部能力 ⇒ import 三闸。' },
   "prompts/skills/bundle/SKILL.md": { panel:"cycles", panelLabel:"轮次",
-    body:'# bundle SKILL(骨架,模拟)\n逐 build_target 严格串行(bundle_cursor 落库),两段提交(§4.2.5):worktree → 构建 → smoke(修复循环无次数上限,受预算+watchdog)→ 代码适配评审(≤3,不过回修;轮尽 review_failed 不训练)→ 训练 run → 出厂评估(source=factory,结果落 staging)→ 结果评审(≤3:结果与 log 合理性+反查代码 bug;轮尽 review_failed 测量不注册)→ 三级校验 → gate_register_*(注册段单事务)→ 复制入池。eval 免训练同过结果评审。\nrun-owned log 随段(i)、成功评估 attempt-owned log 随段(ii)补登(parser 先行)。' },
+    body:'# bundle SKILL(骨架,模拟)\n每 cycle 一个 DAG Scheduler；每 build_target 一个固定且可恢复的 Worker。Scheduler 只派发 admitted ready frontier，Worker 只处理自己的 target：私有正式源码副本 → 构建 → smoke → 独立代码评审 → 训练 run → 出厂评估 → 独立结果评审 → 三级校验 → 正式 publication/admission。工程修复在原 Worker 内不设轮次上限。\n日志进入/恢复时读一次有界 snapshot，随后用 cursor 增量读取（默认 200、上限 1000；60→120→300→600→1800 秒退避）；Reasoning 只接收紧凑 terminal report。' },
   "prompts/skills/reasoning/SKILL.md": { panel:"evidence", panelLabel:"结论与证据",
     body:'# reasoning SKILL(骨架,模拟)\n轮尾四步:R1 答题(verdict+evidence,I3)→ R2 树维护(spawn/prune/applicability)→ R3 选题(四元打分,产 selection 不写 route)→ R4 收尾(cycle_report/views/LEDGER/通知,同一事务)。\nlog/观测只解释、不作证据;存疑 → 喂 plan 复现 eval。' },
   "prompts/skills/interaction_query/SKILL.md": { panel:"audit", panelLabel:"人机审计",
@@ -3023,6 +3036,112 @@ function _requestActionButtons(request,compact){
   if(permission)return `<button class="btn" data-file-request-action="${id}" style="padding:${pad};font-size:11px" onclick="fileRequestAction(${id},'approve')">同意</button> <button class="btn gray" data-file-request-action="${id}" style="padding:${pad};font-size:11px" onclick="fileRequestAction(${id},'cancel')">不同意</button>`;
   return `<button class="btn" data-file-request-action="${id}" style="padding:${pad};font-size:11px" onclick="fileRequestAction(${id},'resolve')">选择并上传</button> <button class="btn gray" data-file-request-action="${id}" style="padding:${pad};font-size:11px" onclick="fileRequestAction(${id},'cancel')">无法提供</button>`;
 }
+function _payloadObject(raw){
+  if(raw&&typeof raw==="object"&&!Array.isArray(raw))return raw;
+  if(typeof raw!=="string"||!raw.trim())return null;
+  try{const value=JSON.parse(raw);return value&&typeof value==="object"&&!Array.isArray(value)?value:null;}catch(error){return null;}
+}
+function _questionCycleRows(id){
+  const questionId=_uiPositiveId(id),ids=new Set(),add=value=>{const clean=_uiPositiveId(value);if(clean!=null)ids.add(clean);};
+  if(questionId==null)return [];
+  const question=q(questionId);if(question){add(question.active_cycle);add(question.closed_cycle);}
+  (DB.cycle||[]).forEach(row=>{if(Number(row.active_question_id)===questionId)add(row.id);});
+  // question_admission 只是“出生于某轮”，不是该问题已经被攻坚；其余带 question_id 的决策均是实际研究事件。
+  (DB.decision||[]).forEach(row=>{if(Number(row.question_id)===questionId&&row.type!=="question_admission")add(row.cycle_id);});
+  (DB.build_target||[]).forEach(row=>{if(Number(row.question_id)===questionId)add(row.cycle_id);});
+  (DB.answer||[]).forEach(row=>{if(Number(row.question_id)===questionId)add(row.cycle_id);});
+  (DB.evidence||[]).forEach(row=>{if(Number(row.question_id)===questionId)add(row.created_cycle);});
+  (DB.idea||[]).forEach(row=>{if(Number(row.question_id)===questionId)add(row.cycle_id);});
+  return (DB.cycle||[]).filter(row=>ids.has(Number(row.id))).sort((a,b)=>Number(b.id)-Number(a.id));
+}
+function _defaultQuestionCycle(id,rows){
+  const inflightId=_uiPositiveId(DB.live&&DB.live.inflight_cycle);
+  const live=rows.find(row=>Number(row.id)===inflightId&&Number(row.active_question_id)===Number(id));
+  return live||(rows[0]||null);
+}
+function _questionCycleSummary(id,cycleId){
+  const rows=(DB.decision||[]).filter(row=>Number(row.question_id)===Number(id)&&Number(row.cycle_id)===Number(cycleId)&&row.type==="runtime_cycle_summary").sort((a,b)=>Number(b.id)-Number(a.id));
+  if(!rows.length)return null;
+  const payload=_payloadObject(rows[0].payload_json||rows[0].payload);return payload?{row:rows[0],payload:payload}:null;
+}
+const Q_SCIENCE_DECISIONS=new Set(["bundle_scientific_contract","bundle_scientific_terminal"]);
+const Q_REVIEW_DECISIONS=new Set(["runtime_review","runtime_bundle_result_review_ack","bundle_code_review","bundle_result_review"]);
+const Q_POOL_DECISIONS=new Set(["bundle_training_candidate","pool_training_publication","pool_publication"]);
+function _cycleDecisionPayloads(cycleId,kinds){
+  return (DB.decision||[]).filter(row=>Number(row.cycle_id)===Number(cycleId)&&kinds.has(row.type)).sort((a,b)=>Number(a.id)-Number(b.id)).map(row=>({row:row,payload:_payloadObject(row.payload_json||row.payload)})).filter(item=>item.payload);
+}
+function _targetDecisionOwners(target){
+  const add=(set,value)=>{if(value!=null)set.add(String(value));};
+  const runIds=new Set((target.run_ids||[]).map(String)),evaluationIds=new Set((target.evaluation_ids||[]).map(String)),attemptIds=new Set((target.evaluation_attempt_ids||[]).map(String));
+  add(evaluationIds,target.evaluation_id);
+  (DB.run||[]).forEach(row=>{if(Number(row.build_target_id)===Number(target.id))add(runIds,row.id);});
+  (DB.evaluation||[]).forEach(row=>{if(Number(row.build_target_id)===Number(target.id))add(evaluationIds,row.id);});
+  (DB.evaluation_attempt||[]).forEach(row=>{if(Number(row.build_target_id)===Number(target.id)){add(attemptIds,row.id);add(evaluationIds,row.evaluation_id);}});
+  return {...target,run_ids:[...runIds],evaluation_ids:[...evaluationIds],evaluation_attempt_ids:[...attemptIds]};
+}
+function _targetDecisionMatch(payload,target,allowObjectIds){
+  const explicit=payload.build_target_id!=null?payload.build_target_id:payload.target_id;
+  if(explicit!=null)return String(explicit)===String(target.id);
+  if(!allowObjectIds)return false;
+  const levels=[
+    [["evaluation_attempt_id","attempt_id"],target.evaluation_attempt_ids||[]],
+    [["evaluation_id"],target.evaluation_ids||[]],
+    [["run_id"],target.run_ids||[]],
+    [["variant_id"],target.variant_id==null?[]:[target.variant_id]],
+    [["baseline_id"],target.baseline_id==null?[]:[target.baseline_id]],
+  ];
+  for(const [fields,owners] of levels){
+    const field=fields.find(name=>payload[name]!=null);if(!field)continue;
+    return owners.some(owner=>String(owner)===String(payload[field]));
+  }
+  return false;
+}
+function _targetStatusPresentation(target){
+  const label={complete:"已完成",failed:"失败",skipped:"已跳过",engineering_blocked:"工程阻塞",pending:"等待执行",building:"构建中",smoke:"Smoke 中",running:"运行中"}[target.status]||target.status||"未知";
+  const cls=target.status==="complete"?"c-ok":target.status==="failed"||target.status==="engineering_blocked"?"c-bad":target.status==="skipped"?"c-warn":"c-line";
+  return {label:label,cls:cls};
+}
+function _targetDurableFactsHTML(cycle,target,decisionSets){
+  const status=_targetStatusPresentation(target),suffix=target.failure_kind?" · "+target.failure_kind:"";
+  const science=decisionSets.science.filter(item=>_targetDecisionMatch(item.payload,target,false));
+  const reviews=decisionSets.reviews.filter(item=>_targetDecisionMatch(item.payload,target,false));
+  const pools=decisionSets.pools.filter(item=>_targetDecisionMatch(item.payload,target,true));
+  const commits=(DB.phase_commit||[]).filter(row=>Number(row.cycle_id)===Number(cycle.id)&&row.stage==="bundle"&&Number(row.target_id)===Number(target.id)).sort((a,b)=>Number(a.id)-Number(b.id));
+  const scienceHtml=science.length?science.map(item=>{
+    const p=item.payload;
+    return `<div class="qtarget-detail">科学 decision #${esc(String(item.row.id))} · 执行=${esc(p.execution_status||"—")} · 有效性=${esc(p.validity_status||"—")} · 科学结论=${esc(p.scientific_outcome||"—")} · 入池=${esc(p.pool_eligibility||"—")}</div>`;
+  }).join(""):'<div class="qtarget-detail">科学四轴：未记录</div>';
+  const reviewHtml=reviews.length?reviews.map(item=>{
+    const p=item.payload,round=p.round_no!=null?` · round ${esc(String(p.round_no))}/${esc(String(p.configured_rounds||"—"))}`:"";
+    const child=p.child_thread_id?` · child ${mono(p.child_thread_id)}`:"";
+    const receipt=p.receipt_hash||p.review_receipt_hash;
+    return `<div class="qtarget-detail">${esc(item.row.type)} decision #${esc(String(item.row.id))}${round}${p.verdict?` · verdict=${esc(p.verdict)}`:""}${child}${receipt?` · receipt ${mono(receipt)}`:""}</div>`;
+  }).join(""):'<div class="qtarget-detail">独立评审证明：未记录</div>';
+  const poolHtml=pools.length?pools.map(item=>{
+    const p=item.payload,ref=p.manifest_ref||p.training_manifest_ref||"";
+    return `<div class="qtarget-detail">${esc(item.row.type)} decision #${esc(String(item.row.id))}${ref?` · ${mono(ref)}`:""}${p.manifest_hash?` · ${mono(p.manifest_hash)}`:""}</div>`;
+  }).join(""):'<div class="qtarget-detail">池 decision：未记录</div>';
+  const commitHtml=commits.map(row=>`Bundle commit #${esc(String(row.id))}${row.artifact_hash?` · ${mono(row.artifact_hash)}`:""}`).join(" · ");
+  return `<div class="qtarget-fact"><div class="qtarget-fact-head"><b>${mono("target "+target.id)}</b>${chip(status.cls,status.label+suffix)}${chip("c-line",target.target_kind||"target")}${target.critical===0?chip("c-line","非关键"):""}</div>${commitHtml?`<div class="qtarget-detail">${commitHtml}</div>`:""}${scienceHtml}${reviewHtml}${poolHtml}</div>`;
+}
+function _cycleDurableFactsHTML(cycle,targets){
+  const decisionSets={science:_cycleDecisionPayloads(cycle.id,Q_SCIENCE_DECISIONS),reviews:_cycleDecisionPayloads(cycle.id,Q_REVIEW_DECISIONS),pools:_cycleDecisionPayloads(cycle.id,Q_POOL_DECISIONS)};
+  const targetHtml=targets.slice().sort((a,b)=>(Number(a.seq)-Number(b.seq))||(Number(a.id)-Number(b.id))).map(target=>_targetDurableFactsHTML(cycle,_targetDecisionOwners(target),decisionSets)).join("");
+  const reasoning=(DB.phase_commit||[]).filter(row=>Number(row.cycle_id)===Number(cycle.id)&&row.stage==="reasoning"&&row.target_id==null).sort((a,b)=>Number(a.id)-Number(b.id));
+  const reasoningHtml=reasoning.length?reasoning.map(row=>`Reasoning commit #${esc(String(row.id))}${row.artifact_hash?` · ${mono(row.artifact_hash)}`:""}`).join(" · "):"Reasoning commit：未记录";
+  return `${targetHtml?`<div class="qtarget-facts">${targetHtml}</div>`:""}<div class="qreasoning-proof">${reasoningHtml}</div>`;
+}
+function _questionCyclePhases(cycleId){
+  const phases=[],add=value=>{const phase=_researchPhase(value);if(phase&&!phases.includes(phase))phases.push(phase);};
+  (DB.runner_call||[]).filter(row=>Number(row.cycle_id)===Number(cycleId)).sort((a,b)=>Number(a.id)-Number(b.id)).forEach(row=>add(row.phase));
+  (DB.phase_commit||[]).filter(row=>Number(row.cycle_id)===Number(cycleId)).sort((a,b)=>Number(a.id)-Number(b.id)).forEach(row=>add(row.stage));
+  return phases;
+}
+function selectQuestionCycle(cycleId){
+  const cid=_uiPositiveId(cycleId);if(cid==null)return;
+  state.qExec={cycleId:cid,phase:null};
+  if(state.canvas.drawerQ!=null&&document.getElementById("cvdrawer"))refreshQuestionDrawer();else render();
+}
 function selectQuestionPhase(cycleId,phase){
   const cid=_uiPositiveId(cycleId),clean=_researchPhase(phase);if(cid==null||!clean)return;
   state.qExec={cycleId:cid,phase:clean};
@@ -3057,8 +3176,9 @@ function questionExecutionHTML(id){
   const lv=DB.live||{},sc=DB.status_card||{},cycles=Array.isArray(DB.cycle)?DB.cycle:[];
   const inflightId=_uiPositiveId(lv.inflight_cycle);
   const inflightCycle=inflightId==null?null:cycles.find(c=>Number(c.id)===inflightId);
-  const qCycles=cycles.filter(c=>Number(c.active_question_id)===Number(id)).sort((a,b)=>Number(b.id)-Number(a.id));
-  const currentCycle=(inflightCycle&&Number(inflightCycle.active_question_id)===Number(id))?inflightCycle:(qCycles[0]||null);
+  const qCycles=_questionCycleRows(id),defaultCycle=_defaultQuestionCycle(id,qCycles);
+  const requestedCycle=state.qExec.cycleId==null?null:qCycles.find(c=>Number(c.id)===Number(state.qExec.cycleId));
+  const currentCycle=requestedCycle||defaultCycle;
   const activeId=_uiPositiveId(inflightCycle&&inflightCycle.active_question_id)!=null?_uiPositiveId(inflightCycle.active_question_id):_uiPositiveId(sc.active_question);
   const isLiveCycle=!!(currentCycle&&inflightId===Number(currentCycle.id)),isActive=isLiveCycle&&activeId===Number(id);
   const pending=(DB.interaction_request||[]).find(r=>r.status==="pending"&&currentCycle&&Number(r.cycle_id)===Number(currentCycle.id))||null;
@@ -3074,7 +3194,9 @@ function questionExecutionHTML(id){
   const currentPhase=(pending&&_researchPhase(pending.stage))||(runningCall&&_researchPhase(runningCall.phase))||(sameCycle&&_researchPhase(rc.phase))||null;
   let selectedPhase=(state.qExec.cycleId===Number(currentCycle&&currentCycle.id)&&phases.includes(state.qExec.phase))?state.qExec.phase:null;
   if(!selectedPhase)selectedPhase=currentPhase||phases[phases.length-1]||null;
-  if(currentCycle&&selectedPhase)state.qExec={cycleId:Number(currentCycle.id),phase:selectedPhase};
+  // 只有用户显式选过轮次/阶段才钉住历史轮；默认视图始终跟随该问题最新的活跃 Cycle。
+  if(currentCycle&&Number(state.qExec.cycleId)===Number(currentCycle.id))state.qExec={cycleId:Number(currentCycle.id),phase:selectedPhase};
+  const cycleNav=qCycles.length>1?`<div class="qcycle-nav" aria-label="该问题的攻坚轮次">${qCycles.map(row=>`<button type="button" class="qcycle-choice ${currentCycle&&Number(row.id)===Number(currentCycle.id)?"selected":""}" onclick="selectQuestionCycle(${Number(row.id)})">c${Number(row.id)} · ${esc(row.route||"系统")}</button>`).join("")}</div>`:"";
   const phaseHtml=phases.length?phases.map(name=>{
     const phaseCalls=calls.filter(call=>_researchPhase(call.phase)===name),succeeded=phaseCalls.some(call=>call.status==="success");
     const failed=phaseCalls.length>0&&phaseCalls.every(call=>["failed","aborted"].includes(call.status));
@@ -3085,7 +3207,7 @@ function questionExecutionHTML(id){
     const count=phaseCalls.length>1?" · "+phaseCalls.length+"次":"";
     return `<button type="button" class="qphase ${cls}" onclick="selectQuestionPhase(${Number(currentCycle.id)},'${name}')">${esc(_phaseLabel(name))}<br>${esc(name+count+mark)}</button>`;
   }).join(""):`<div class="qphase-empty">这一轮没有单独调用 Codex，由系统规则直接推进；因此不会显示虚构的 idea → plan → bundle → reasoning 四段。</div>`;
-  const stageLabel=currentPhase?(_phaseLabel(currentPhase)+"（"+currentPhase+"）"):(currentCycle?"本轮当前没有 Codex 调用":"该问题还没有执行轮次");
+  const stageLabel=currentPhase?(_phaseLabel(currentPhase)+"（"+currentPhase+"）"):(currentCycle?(isLiveCycle?"本轮当前没有 Codex 调用":"第 c"+currentCycle.id+" 轮执行记录"):"该问题还没有执行轮次");
   const runtime=lv.orchestrator_active===true?"研究进程在线":"研究进程未在线";
   const cycleMeta=currentCycle?("第 c"+currentCycle.id+" 轮 · "+(currentCycle.route||"系统流程")+" · "+(currentCycle.status||"—")):"没有关联轮次";
   const relation=isActive?chip("c-acc","当前正在处理 Q"+id):(activeId!=null?chip("c-line","当前处理 Q"+activeId):chip("c-dead","当前无活跃问题"));
@@ -3102,8 +3224,44 @@ function questionExecutionHTML(id){
   return `<section class="qexec ${cssMode}">
     <div class="qexec-head"><span class="eyebrow">实时执行状态</span><div class="qexec-title">${esc(stageLabel)} ${chip(mode==="running"?"c-acc":mode==="awaiting_user"||mode==="paused"?"c-warn":mode==="interrupted"?"c-bad":"c-line",modeLabel)}</div>
       <div class="qexec-meta">${esc(cycleMeta)} · ${esc(runtime)}</div><div style="margin-top:5px">${relation}</div></div>
-    <div class="qexec-body"><div class="qphases">${phaseHtml}</div>${phaseOutput}${reason}${actions.length?'<div class="qexec-actions">'+actions.join("")+'</div>':""}</div>
+    <div class="qexec-body">${cycleNav}<div class="qphases">${phaseHtml}</div>${phaseOutput}${reason}${actions.length?'<div class="qexec-actions">'+actions.join("")+'</div>':""}</div>
   </section>`;
+}
+function questionResearchHistoryHTML(id){
+  const cycles=_questionCycleRows(id);if(!cycles.length)return `<section class="card qresearch"><div class="qresearch-head"><h3>问题攻坚综述</h3>${chip("c-line","0 个轮次")}</div><div class="small">该问题尚未进入独立攻坚 Cycle；进入后会在这里显示每轮做了什么、得到什么证据，以及 Reasoning 为什么继续、拆分或关闭。</div></section>`;
+  const inflightId=_uiPositiveId(DB.live&&DB.live.inflight_cycle),defaultCycle=_defaultQuestionCycle(id,cycles);
+  const selectedId=_uiPositiveId(state.qExec.cycleId)||(defaultCycle&&Number(defaultCycle.id));
+  const summaries=cycles.map(row=>({cycle:row,summary:_questionCycleSummary(id,row.id)})).filter(item=>item.summary);
+  const visible=cycles.slice(0,20),hidden=Math.max(0,cycles.length-visible.length);
+  const entries=visible.map(cycle=>{
+    const summary=_questionCycleSummary(id,cycle.id),payload=summary&&summary.payload||{};
+    const answer=(DB.answer||[]).find(row=>Number(row.question_id)===Number(id)&&Number(row.cycle_id)===Number(cycle.id));
+    const phaseCalls=(DB.runner_call||[]).filter(row=>Number(row.cycle_id)===Number(cycle.id)).sort((a,b)=>Number(a.id)-Number(b.id));
+    const phases=_questionCyclePhases(cycle.id),targets=(DB.build_target||[]).filter(row=>Number(row.cycle_id)===Number(cycle.id));
+    const isCurrent=Number(cycle.id)===inflightId,isSelected=Number(cycle.id)===Number(selectedId);
+    const outcome=String(payload.decision||(answer&&answer.verdict)||(isCurrent?"running":cycle.status||"未裁决"));
+    const outcomeLabel={answered:"已回答",refuted:"已反驳",inconclusive:"证据不足",decompose:"拆分问题",terminate:"终止研究",running:"执行中",done:"轮次完成",failed:"轮次失败",aborted:"已中止"}[outcome]||outcome;
+    const outcomeClass=outcome==="answered"?"c-ok":outcome==="refuted"||outcome==="failed"?"c-bad":outcome==="inconclusive"||outcome==="decompose"?"c-warn":isCurrent?"c-acc":"c-line";
+    const conclusion=typeof payload.conclusion_md==="string"&&payload.conclusion_md.trim()?payload.conclusion_md:(answer&&answer.answer_md)||(cycle.note||"");
+    const next=typeof payload.next_step_md==="string"?payload.next_step_md.trim():"";
+    const refs=Array.isArray(payload.evidence_refs)?payload.evidence_refs:[];
+    const runningPhase=phaseCalls.filter(row=>row.status==="created"||row.status==="running").slice(-1)[0];
+    const fallback=isCurrent?`本轮仍在 ${_phaseLabel(runningPhase&&runningPhase.phase||phases[phases.length-1]||cycle.status||"执行")}；Reasoning 提交后会自动形成轮末综述。`:`该轮没有可用的结构化 Reasoning 摘要；仍可切换到本轮查看真实阶段输出。`;
+    const phaseLine=phases.length?phases.map(phase=>`<span class="qhistory-phase">${esc(_phaseLabel(phase))}</span>`).join(""):'<span class="small">没有独立 Codex 阶段记录</span>';
+    const targetLine=targets.length?` · ${targets.length} 个实验 target`:"";
+    const durableFacts=_cycleDurableFactsHTML(cycle,targets);
+    const refsLine=refs.length?`<div class="qhistory-evidence"><b>证据引用：</b>${refs.slice(0,12).map(ref=>mono(ref)).join(" · ")}${refs.length>12?` · 另 ${refs.length-12} 条`:""}</div>`:"";
+    return `<article class="qhistory-entry ${isCurrent?"current":""} ${isSelected?"selected":""}">
+      <div class="qhistory-title"><b>${mono("c"+cycle.id)}</b>${chip("c-line",cycle.route||"系统流程")}${chip(outcomeClass,outcomeLabel)}<span class="when">${esc(cycle.started_at||"")}</span></div>
+      <div class="qhistory-phases">${phaseLine}</div><div class="small">阶段记录${targetLine}</div>${durableFacts}
+      <div class="qhistory-text" style="margin-top:6px"><b>本轮结论：</b>${esc(conclusion||fallback)}</div>
+      ${next?`<div class="qhistory-next"><b>Reasoning 决策 / 下一步：</b>${esc(next)}</div>`:""}${refsLine}
+      <div class="qhistory-action"><button type="button" class="btn gray" style="padding:3px 8px;font-size:10.5px" onclick="selectQuestionCycle(${Number(cycle.id)})">${isSelected?"正在查看本轮执行":"查看本轮阶段与实际输出"}</button></div>
+    </article>`;
+  }).join("");
+  const latestSummary=summaries[0];
+  const overview=`该问题累计关联 ${cycles.length} 个攻坚 Cycle，已有 ${summaries.length} 个结构化 Reasoning 轮末摘要。${latestSummary?`当前研究认识更新至 c${latestSummary.cycle.id}；下方按新到旧保留每轮结论、证据引用与下一步。`:"Reasoning 尚未形成可展示的轮末摘要；当前过程仍会保留阶段和真实输出。"}`;
+  return `<section class="card qresearch"><div class="qresearch-head"><h3>问题攻坚综述 <span class="en">cycle → reasoning summary</span></h3>${chip("c-acc",cycles.length+" 个轮次")}</div><div class="qresearch-overview">${esc(overview)}</div><div class="qhistory-list">${entries}</div>${hidden?`<div class="small" style="margin-top:8px">这里只显示最近 20 轮，另有 ${hidden} 轮可在“轮次”页查看。</div>`:""}</section>`;
 }
 function questionCardHTML(id){
   const x = q(id); if(!x) return "";
@@ -3134,7 +3292,7 @@ function questionCardHTML(id){
     :x.status==="dead_end"?'<hr class="divider"><div class="small">dead_end 关闭依据:'+(pruneDec?('decision #'+esc(pruneDec.id)+' '+esc(pruneDec.summary||pruneDec.type)):'未投影到对应 prune_branch decision')+'.</div>'
     :""}
     ${decs.length&&!a?'<hr class="divider"><div class="small">相关决策:'+decs.map(d=>"#"+d.id+" "+esc(d.type)).join(" · ")+"</div>":""}
-  </section>`;
+  </section>${questionResearchHistoryHTML(id)}`;
 }
 function qDetail(id){return questionExecutionHTML(id)+questionCardHTML(id);}
 

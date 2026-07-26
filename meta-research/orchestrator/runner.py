@@ -1,7 +1,8 @@
 """CodexRunner —— 智能运行时窄接口的真实现（M0 起即真，《第二部分》§6.2/§6.10）。
 
-生产研究的 Idea/Plan/Reasoning 各绑定一个 cycle+stage 私有的持久 Codex thread；Bundle 每个
-cycle 绑定一个工程 thread，在同一连续 turn 中串行覆盖全部 target 的产包、smoke/train/eval/repair。
+生产研究的 Idea/Plan/Reasoning 各绑定一个 cycle+stage 私有的持久 Codex thread；Bundle 每个 cycle
+绑定一个图级 Scheduler thread，并为每个 target 绑定一个独立工程 Worker thread。Scheduler 只派发
+ready frontier；每个 Worker 的连续 turn 只覆盖自己 target 的产包、smoke/train/eval/repair。
 一个正常 stage turn 是一个受 guardian 管理、可回收的进程；`codex exec resume` 只用于宿主进程灾难后找回原逻辑
 主智能体。没有耐久 provider id 时 fail closed，不得新建替代上下文。
 未声明 resident 合同的诊断/注入 Runner 才保留 `--ephemeral` 兼容行为。讲解员使用另一条 quest 私有
@@ -21,13 +22,14 @@ browser/computer/image/multi-agent 等工具，并显式开放 live Web 与命�
 研究工人使用：工人只接内联 ContextPack 并产 JSON 信封，不能用模型工具绕过实验容器读数据。
 
 工程配置走环境变量（非 policy.yaml——模型/二进制是工程事实，不在附录 C 旋钮注册表内）：
-  METARESEARCH_CODEX_BIN     默认 codex-chatgpt（本机已认证包装）
+  METARESEARCH_CODEX_BIN     默认 /usr/local/bin/codex（尊重进程绑定的 CODEX_HOME）
   METARESEARCH_CODEX_MODEL   默认 gpt-5.6-sol
   METARESEARCH_CODEX_EFFORT  默认 max
 METARESEARCH_CODEX_SANDBOX 普通显式 runner 的 sandbox；默认研究装配在 root 开发环境使用
                              独立 codexro UID + 本机后端，非 root 服务仍用 workspace-write+network
-  METARESEARCH_RUNNER_TIMEOUT_S 默认 3600（普通 Codex 调用；cycle-wide Bundle 主 turn 绑定 owner 生命周期，
-                                      不使用该墙钟截止；实验命令 watchdog 仍见 policy/manifest）
+  METARESEARCH_RUNNER_TIMEOUT_S 默认 3600（普通 Codex 调用；Bundle Scheduler/Worker resident turn
+                                      绑定 owner 生命周期，不使用该墙钟截止；实验命令 watchdog 仍见
+                                      policy/manifest）
   METARESEARCH_QUERY_RUN_AS_USER 可选专用低权用户（root 默认 codexro；non-root 只能填自身）
   METARESEARCH_QUERY_CODEX_BIN / METARESEARCH_QUERY_CODEX_HOME 工具禁用工人 CLI，及跨 UID 时的认证目录
 """
@@ -45,13 +47,31 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+from .bundle_sources import (
+    SourceMaterializationError,
+    copy_verified_source_tree,
+)
+from .codex_app_server_driver import (
+    AppServerDriverError,
+    extract_parent_final,
+    resolve_direct_codex_bin,
+)
+from .ids import cnum as _cnum, parse_positive_sqlite_int
 from .interfaces import Artifact, CallUsage, ContextPack, ManagedArtifactRef
+from .native_review import (
+    NativeReviewError,
+    NativeReviewEvidence,
+    NativeReviewLedger,
+    RAW_SPAWN_PROOF_MODE,
+    RESUMED_LINEAGE_PROOF_MODE,
+)
 from .process_supervisor import (
     ExecutionCleanupError,
     ExecutionSupervisor,
     ExecutionSupervisorError,
+    read_execution_capture,
     terminate_all_supervised_executions,
 )
 from .provider_invocation import write_provider_invocation_receipt
@@ -88,17 +108,30 @@ _CODEX_NETWORK_ENV_NAMES = (
     "SSL_CERT_FILE", "SSL_CERT_DIR",
 )
 _CODEX_STORAGE_ENV_NAMES = (
-    "XDG_CACHE_HOME", "PIP_CACHE_DIR", "HF_HOME", "TORCH_HOME",
+    "CODEX_SQLITE_HOME",
+    "XDG_CACHE_HOME", "PIP_CACHE_DIR",
+    "HF_HOME", "HF_HUB_CACHE", "HF_DATASETS_CACHE", "TRANSFORMERS_CACHE",
+    "TORCH_HOME", "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR",
     "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
     "CONDA_PKGS_DIRS", "CONDA_ENVS_PATH", "UV_CACHE_DIR", "CUDA_CACHE_PATH",
-    "MPLCONFIGDIR", "NUMBA_CACHE_DIR",
+    "MPLCONFIGDIR", "NUMBA_CACHE_DIR", "PYTHONPYCACHEPREFIX",
 )
 _MAX_MANAGED_LOCAL_SOURCE_MANIFEST_BYTES = 8 * 1024 * 1024
 _MAX_MANAGED_LOCAL_SOURCES = 16
 _MAX_MANAGED_TOP_LEVEL_ENTRIES = 32
 _SYSTEM_ROOT = Path(__file__).resolve().parent.parent
+APP_SERVER_DRIVER_PATH = str(
+    Path(__file__).resolve().with_name("codex_app_server_driver.py"))
 _READONLY_PROJECTION_DIR = "readonly_projection"
 _CONTEXT_PROJECTION_DIR = f"{_READONLY_PROJECTION_DIR}/context"
+_PUBLISHED_INPUT_KIND = "published_source_input"
+_PUBLISHED_INPUT_KEY_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_PUBLISHED_INPUT_HASH_RE = re.compile(
+    r"^sha256-tree-v1:([0-9a-f]{64})$")
+_PUBLISHED_INPUT_SOURCE_RE = re.compile(
+    r"^bundle_source_binding:([1-9][0-9]*)$")
+_MAX_PUBLISHED_INPUTS = 32
 
 
 def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
@@ -144,6 +177,23 @@ def _write_readonly_file(path: Path, payload: bytes) -> None:
             view = view[written:]
         os.fsync(fd)
         os.fchmod(fd, 0o444)
+    finally:
+        os.close(fd)
+
+
+def _write_private_file(path: Path, payload: bytes) -> None:
+    """Create one parent-owned 0600 file without a permissive mode window."""
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+        os.fchmod(fd, 0o600)
     finally:
         os.close(fd)
 
@@ -256,6 +306,105 @@ def _populate_readonly_projection(runtime_dir: Path, workspace_dir: Path,
         _populate_context_projection(runtime_dir, context_pack)
 
 
+def _published_input_specs(
+        workspace_dir: Path,
+        pack: ContextPack) -> list[tuple[str, Path, str]]:
+    refs = [
+        item for item in list(getattr(pack, "artifact_refs", ()) or ())
+        if isinstance(item, dict)
+        and item.get("kind") == _PUBLISHED_INPUT_KIND
+    ]
+    if not refs:
+        return []
+    if len(refs) > _MAX_PUBLISHED_INPUTS:
+        raise SourceMaterializationError(
+            f"published source inputs 超过上限 {_MAX_PUBLISHED_INPUTS}")
+    if pack.stage != "bundle" or pack.target_id is None:
+        raise SourceMaterializationError(
+            "published source input 只允许 bundle target ContextPack")
+    try:
+        cycle_id = _cnum(pack.cycle_id)
+        target_id = parse_positive_sqlite_int(
+            pack.target_id, label="bundle target id")
+    except ValueError as error:
+        raise SourceMaterializationError(
+            "published source input 的 cycle/target 身份非法") from error
+
+    expected_root = (
+        workspace_dir / f"c{cycle_id}" / f"t{target_id}"
+        / "published-inputs")
+    seen_keys = set()
+    seen_bindings = set()
+    specs = []
+    for item in refs:
+        if set(item) != {"kind", "ref", "source", "content_hash"}:
+            raise SourceMaterializationError(
+                "published source artifact_ref 字段非法")
+        source_match = _PUBLISHED_INPUT_SOURCE_RE.fullmatch(
+            item.get("source", ""))
+        hash_match = _PUBLISHED_INPUT_HASH_RE.fullmatch(
+            item.get("content_hash", ""))
+        ref = item.get("ref")
+        if (source_match is None or hash_match is None
+                or not isinstance(ref, str) or not ref or "\x00" in ref
+                or not os.path.isabs(ref) or os.path.abspath(ref) != ref):
+            raise SourceMaterializationError(
+                "published source artifact_ref 身份/hash 非法")
+        source_path = Path(ref)
+        input_key = source_path.name
+        binding_id = source_match.group(1)
+        if (_PUBLISHED_INPUT_KEY_RE.fullmatch(input_key) is None
+                or source_path != expected_root / input_key
+                or input_key in seen_keys
+                or binding_id in seen_bindings):
+            raise SourceMaterializationError(
+                "published source artifact_ref 路径/binding 冲突")
+
+        current = workspace_dir
+        for component in source_path.relative_to(workspace_dir).parts:
+            current = current / component
+            try:
+                info = current.lstat()
+            except OSError as error:
+                raise SourceMaterializationError(
+                    f"published source materialization 缺失: {current}") from error
+            if (stat.S_ISLNK(info.st_mode)
+                    or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.geteuid()):
+                raise SourceMaterializationError(
+                    f"published source materialization 身份非法: {current}")
+        seen_keys.add(input_key)
+        seen_bindings.add(binding_id)
+        specs.append((input_key, source_path, hash_match.group(1)))
+    return sorted(specs, key=lambda item: item[0])
+
+
+def _populate_published_inputs(
+        runtime_dir: Path,
+        workspace_dir: Path,
+        pack: ContextPack,
+        *,
+        output_uid: int,
+        output_gid: int) -> None:
+    specs = _published_input_specs(workspace_dir, pack)
+    if not specs:
+        return
+    destination_root = runtime_dir / "published-inputs"
+    destination_root.mkdir(mode=0o700)
+    for input_key, source, expected_hash in specs:
+        copy_verified_source_tree(
+            source, destination_root / input_key,
+            expected_hash=expected_hash,
+            source_uid=os.geteuid(),
+            destination_uid=output_uid,
+            destination_gid=output_gid)
+    if (output_uid, output_gid) != (os.geteuid(), os.getegid()):
+        os.chown(
+            destination_root, output_uid, output_gid,
+            follow_symlinks=False)
+    os.chmod(destination_root, 0o700)
+
+
 def _make_separate_uid_workspace(*, prefix: str, uid: int, gid: int,
                                  projection_source: Optional[Path] = None,
                                  projection_pack: Optional[ContextPack] = None,
@@ -270,6 +419,10 @@ def _make_separate_uid_workspace(*, prefix: str, uid: int, gid: int,
         if projection_source is not None:
             _populate_readonly_projection(
                 workspace, projection_source, context_pack=projection_pack)
+            if projection_pack is not None:
+                _populate_published_inputs(
+                    workspace, projection_source, projection_pack,
+                    output_uid=uid, output_gid=gid)
         elif projection_pack is not None:
             _populate_context_projection(workspace, projection_pack)
         os.chown(workspace, uid, gid)
@@ -390,9 +543,16 @@ def _codex_process_env(*, tmpdir: Optional[Path] = None) -> dict[str, str]:
     codex_home = os.environ.get("CODEX_HOME")
     if codex_home:
         env["CODEX_HOME"] = codex_home
+        # Keep SQLite state on the same explicitly bound storage unless the
+        # deployment supplies a separate location.  Passing this explicitly
+        # prevents the CLI from consulting the account's real home directory.
+        env["CODEX_SQLITE_HOME"] = os.environ.get(
+            "CODEX_SQLITE_HOME", codex_home)
     effective_tmpdir = str(tmpdir) if tmpdir is not None else os.environ.get("TMPDIR")
     if effective_tmpdir:
         env["TMPDIR"] = effective_tmpdir
+        env["TMP"] = effective_tmpdir
+        env["TEMP"] = effective_tmpdir
     for name in _CODEX_STORAGE_ENV_NAMES:
         if name in os.environ:
             env[name] = os.environ[name]
@@ -449,12 +609,51 @@ def _run_process_group(cmd, *, stdin, timeout, cwd=None):
     """Compatibility entry routed through the same guardian as production."""
     receipt_dir = Path(tempfile.mkdtemp(prefix="meta-research-execution-"))
     supervisor = ExecutionSupervisor.standalone(receipt_dir)
+
+    def attach_cleanup_note(primary: BaseException, label: str,
+                            secondary: BaseException) -> None:
+        note = f"{label} 失败: {type(secondary).__name__}: {secondary}"
+        add_note = getattr(primary, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+            return
+        notes = list(getattr(primary, "__notes__", ()))
+        notes.append(note)
+        try:
+            primary.__notes__ = notes
+        except (AttributeError, TypeError):
+            pass
+
     try:
-        return supervisor.run(
+        result = supervisor.run(
             cmd, stdin=stdin, capture_output=True, timeout_s=timeout,
             cwd=cwd, kind="compat-process")
-    finally:
+    except BaseException as primary:
+        try:
+            supervisor.close()
+        except BaseException as secondary:
+            # A failed close means the guardian may still need its receipt
+            # directory; preserve both it and the original run failure.
+            attach_cleanup_note(primary, "execution supervisor close", secondary)
+        else:
+            try:
+                shutil.rmtree(receipt_dir)
+            except FileNotFoundError:
+                pass
+            except BaseException as secondary:
+                attach_cleanup_note(
+                    primary, "execution receipt directory cleanup", secondary)
+        raise
+    else:
+        # Receipt deletion is allowed only after the supervisor proves close.
+        # On an otherwise successful run either cleanup failure is the primary
+        # result, and a close failure intentionally preserves the receipts.
         supervisor.close()
+        try:
+            shutil.rmtree(receipt_dir)
+        except FileNotFoundError:
+            pass
+        return result
 
 
 def terminate_active_process_groups(*, grace_s: float = 0.25) -> None:
@@ -777,7 +976,18 @@ def parse_provider_invocation_id(stderr_text: str,
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        candidate = event.get("thread_id") if isinstance(event, dict) and event.get("type") == "thread.started" else None
+        candidate = (
+            event.get("thread_id")
+            if isinstance(event, dict)
+            and event.get("type") == "thread.started" else None)
+        if (candidate is None and isinstance(event, dict)
+                and type(event.get("id")) is int and event.get("id") == 1
+                and isinstance(event.get("result"), dict)):
+            thread = event["result"].get("thread")
+            if (isinstance(thread, dict)
+                    and "parentThreadId" in thread
+                    and thread.get("parentThreadId") is None):
+                candidate = thread.get("id")
         if (isinstance(candidate, str)
                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", candidate)):
             thread_id = candidate
@@ -820,7 +1030,8 @@ class CodexRunner:
                 or not isinstance(lifecycle_bound, bool)):
             raise ValueError(
                 "runner tool_free/no_host_tools/isolated_host_tools/lifecycle_bound 须为 bool")
-        self.bin = os.environ.get("METARESEARCH_CODEX_BIN", "codex-chatgpt")
+        self.bin = os.environ.get(
+            "METARESEARCH_CODEX_BIN", "/usr/local/bin/codex")
         self.model = os.environ.get("METARESEARCH_CODEX_MODEL", DEFAULT_CODEX_MODEL)
         self.effort = os.environ.get("METARESEARCH_CODEX_EFFORT", DEFAULT_CODEX_EFFORT)
         self.lifecycle_bound = lifecycle_bound
@@ -867,6 +1078,7 @@ class CodexRunner:
         self.query_bin = os.environ.get(
             "METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex")
         self.query_codex_home = None
+        self.query_codex_sqlite_home = None
         self.query_cache_home = None
         if tool_free or isolated_host_tools:
             self.tool_free_isolation, account = tool_free_runtime_identity()
@@ -883,6 +1095,11 @@ class CodexRunner:
                 "METARESEARCH_QUERY_CODEX_HOME", str(Path(account.pw_dir) / ".codex")
             ) if self.tool_free_isolation == "separate-uid" else os.environ.get(
                 "CODEX_HOME", str(Path(account.pw_dir) / ".codex"))
+            self.query_codex_sqlite_home = os.environ.get(
+                "METARESEARCH_QUERY_CODEX_SQLITE_HOME",
+                self.query_codex_home
+            ) if self.tool_free_isolation == "separate-uid" else os.environ.get(
+                "CODEX_SQLITE_HOME", self.query_codex_home)
             default_query_home = (
                 account.pw_dir if self.tool_free_isolation == "separate-uid"
                 else os.environ.get("HOME", account.pw_dir))
@@ -893,6 +1110,10 @@ class CodexRunner:
                 str(Path(self.query_user_home) / ".cache"))
             if not (Path(self.query_codex_home) / "auth.json").is_file():
                 raise ValueError("低权限 Runner 运行账户缺 Codex auth.json")
+            sqlite_home = Path(self.query_codex_sqlite_home)
+            if (not sqlite_home.is_absolute() or not sqlite_home.is_dir()
+                    or sqlite_home.is_symlink()):
+                raise ValueError("低权限 Runner 缺可信 CODEX_SQLITE_HOME")
             if tool_free:
                 self.tool_free_contract = {
                     "tool_policy": TOOL_FREE_POLICY_VERSION,
@@ -925,6 +1146,8 @@ class CodexRunner:
         # contracts even when they happen to share the same runner class.
         self.require_stage_submission = False
         self._last_stage_submission: Optional[dict[str, Any]] = None
+        self._last_native_review_evidence: tuple[
+            NativeReviewEvidence, ...] = ()
 
     def bind_runner_call(self, *, runner_call_id: int, reconcile_protocol: str,
                          phase: str, purpose: str) -> None:
@@ -949,13 +1172,17 @@ class CodexRunner:
 
         The session id is supplied by trusted orchestration state, never by a
         model prompt. ``narrator`` preserves the quest-query contract;
-        ``stage_main`` owns one Idea/Plan/Bundle/Reasoning stage in one cycle;
+        ``stage_main`` owns one Idea/Plan/Reasoning stage in one cycle;
+        ``bundle_scheduler`` owns only graph scheduling for one cycle;
+        ``target_worker`` owns exactly one Bundle target;
         ``bundle_operator`` is a retired compatibility role. Diagnostic/injected workers that
         do not bind this method retain ``--ephemeral`` behavior.
         """
         if self._persistent_session_bound or self._call_no:
             raise ValueError("persistent session 只能在 runner 首次调用前绑定一次")
-        if role not in {"narrator", "bundle_operator", "stage_main"}:
+        if role not in {
+                "narrator", "bundle_operator", "stage_main",
+                "bundle_scheduler", "target_worker"}:
             raise ValueError("persistent session role 非法")
         if (session_id is not None
                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", session_id) is None):
@@ -1116,26 +1343,39 @@ class CodexRunner:
                 "不得用旧状态覆盖新锚。独立 reviewer 只能作为本主智能体的干净子上下文，结论返回"
                 "本 thread 后由本主智能体修改和提交。"
             )
-            if pack.stage == "bundle":
-                runtime_capability_notice += (
-                    " Bundle 必须在本唯一 cycle-wide turn 内闭环全部 target。"
-                    "第一步必须调用 bundle_next_target；它会绑定当前 target 并返回该 target "
-                    "的最新权威 ContextPack。为该 target 完成实现/评审后调用 "
-                    "submit_stage_artifact，再把成功响应的 submission_ref/submission_hash 交给 "
-                    "bundle_execute。bundle_execute 只异步启动官方管线并立即返回；必须用 "
-                    "bundle_status 轮询 worker_running、live_logs、latest_repair 与终态。"
-                    "实时日志已明确证明工程错误时可调用 bundle_repair 请求 guardian "
-                    "取消并排空；随后在同一 turn 修复完整包、重新提交和执行。只有冻结 "
-                    "plan/protocol 本身确实不可执行时调用 bundle_replan。"
-                    "当前 target 终态后必须再调用 bundle_next_target 继续下一个；只有它返回 "
-                    "cycle_complete=true 才可结束本 turn。controller_error 非空时不得假装完成。"
-                    "不得自行启动 smoke/train/eval，也不得使用旧的 bundle_operator_action。"
-                )
+        elif self._persistent_session_role == "bundle_scheduler":
+            runtime_capability_notice += (
+                "\n\n===== 会话契约：bundle_graph_scheduler =====\n"
+                "本 thread 是当前 cycle 唯一的 Bundle Scheduler。它只读取紧凑 DAG overview，"
+                "按服务端给出的确定性 ready frontier 调用 bundle_dispatch，并通过 bundle_wait "
+                "等待状态变化；critical replan 时调用 bundle_drain 排空 active guardian；"
+                "正常完成也必须调用 bundle_drain，并在 overview 同时证明 "
+                "cycle_terminal=true、drained=true 且 controller_error 为空后才退出。"
+                "不得创建或修改 target，不得编写/提交代码，不得调用 target execute/status/"
+                "repair/replan，也不得读取 raw log。只接受服务端有界 terminal report 引用和摘要。"
+                "所有 target 达到终态或 controller_error 明确阻塞前不得假装完成。"
+            )
+        elif self._persistent_session_role == "target_worker":
+            runtime_capability_notice += (
+                "\n\n===== 会话契约：bundle_target_worker =====\n"
+                "本 thread 只属于 ContextPack 绑定的一个 build target，恢复时必须继续同一 provider "
+                "task，不得调度、创建、跳过或修改其他 target。先实现固定 target，并用全新干净 "
+                "code-review child 审查后调用 submit_stage_artifact；再调用 bundle_execute 启动"
+                "官方 smoke/train/eval。监控只用 bundle_status 的 snapshot/incremental cursor，"
+                "推荐等待节奏 60→120→300→600→1800 秒，已消费 cursor 不得重复读取。"
+                "工程错误留在本 Worker 调用 bundle_repair 修复；冻结 plan/protocol 本身不可执行时"
+                "才调用 bundle_replan。eval 后必须另启一个全新的 result-review child，不能复用 "
+                "code reviewer。只有服务端正式 publication、phase commit、合法入库与 admission "
+                "全部确认后才可报告 target terminal。不得调用 Scheduler overview/dispatch/wait/drain。"
+            )
         final_tool_rule = (
             "可使用内置 live Web search；不得执行任何命令或调用其它工具。"
             if self.no_host_tools else
             "可使用本次已开放的本机与网络工具完成检索、检查和诊断；最终仍只返回规定 JSON 信封。")
         bundle_output_rule = (
+            " Bundle Scheduler 不得写 submission/ 或返回 target 文件；只调用图级调度工具。"
+            if (pack.stage == "bundle"
+                and self._persistent_session_role == "bundle_scheduler") else
             " Bundle 每个 target 的完整实现包须写入 cwd 的 submission/，在 submit_stage_artifact 的 "
             "workspace_files 参数中只列必要相对路径；不得把源码正文内联。工具成功后最终回复"
             "不再声明 workspace_files。官方执行只通过 bundle_execute。"
@@ -1199,8 +1439,18 @@ class CodexRunner:
         provider 回执在 guardian 已证明进程树 terminal 后、任何输出解析之前持久化；因此即使随后
         信封解析或数据库收口前崩溃，startup reconciliation 仍能精确补 token 账。
         失败也把当下可见的 token/墙钟挂到 RunnerError.usage，供 provider 在重试前记账。"""
+        has_published_inputs = any(
+            isinstance(item, dict)
+            and item.get("kind") == _PUBLISHED_INPUT_KIND
+            for item in list(getattr(pack, "artifact_refs", ()) or ()))
+        if has_published_inputs and (
+                self.no_host_tools or self.workspace_dir is None):
+            raise RunnerError(
+                "Bundle published input requires a writable managed workspace",
+                failure_kind="artifact_input")
         self._call_no += 1
         self._last_stage_submission = None
+        self._last_native_review_evidence = ()
         runner_call_id = self._runner_call_id
         reconcile_protocol = self._reconcile_protocol
         runner_call_phase = self._runner_call_phase
@@ -1214,6 +1464,13 @@ class CodexRunner:
             raise RunnerError(
                 "persistent Codex 调用此前未回报 provider id；拒绝在同一逻辑会话新开线程",
                 failure_kind="provider_session_missing")
+        use_app_server = (
+            self.runtime_mcp_broker is not None
+            and not self.no_host_tools
+            and not self.isolated_host_tools
+            and self._persistent_session_bound
+            and self._persistent_session_role in {
+                "stage_main", "bundle_scheduler", "target_worker"})
         # A process-local counter is sufficient only for unbound diagnostic/M0 calls.  Production
         # providers bind every external invocation to a durable runner_call first; use that database
         # identity in all transcript names so a checkpoint restart cannot reset a counter and overwrite
@@ -1226,7 +1483,9 @@ class CodexRunner:
         prompt_file = self.transcripts_dir / f"{tag}.prompt.md"
         out_file = self.transcripts_dir / f"{tag}.out.md"
         events_file = self.transcripts_dir / f"{tag}.events.jsonl"
-        for stale in (out_file, events_file):
+        app_server_spec_file = (
+            self.transcripts_dir / f"{tag}.appserver-spec.json")
+        for stale in (out_file, events_file, app_server_spec_file):
             try:
                 stale.unlink()                 # deterministic tag must never accept a prior call's stale receipt
             except FileNotFoundError:
@@ -1251,16 +1510,39 @@ class CodexRunner:
             # read-only. The worker can copy code into this disposable cwd, run local/GPU checks,
             # and return all durable changes through the artifact envelope.
             if self.isolated_host_tools:
-                runtime_cleanup_dir, runtime_dir = _make_separate_uid_workspace(
-                    prefix="meta-research-tools-anchor-",
-                    uid=self.query_uid, gid=self.query_gid,
-                    projection_source=self.workspace_dir,
-                    projection_pack=pack)
+                try:
+                    runtime_cleanup_dir, runtime_dir = _make_separate_uid_workspace(
+                        prefix="meta-research-tools-anchor-",
+                        uid=self.query_uid, gid=self.query_gid,
+                        projection_source=self.workspace_dir,
+                        projection_pack=pack)
+                except SourceMaterializationError as error:
+                    raise RunnerError(
+                        f"Bundle published input 投影失败：{error}",
+                        failure_kind="artifact_input") from error
             else:
                 runtime_dir = Path(tempfile.mkdtemp(prefix="meta-research-tools-"))
                 os.chmod(runtime_dir, 0o700)
-                _populate_context_projection(runtime_dir, pack)
-                runtime_cleanup_dir = runtime_dir
+                try:
+                    _populate_context_projection(runtime_dir, pack)
+                    _populate_published_inputs(
+                        runtime_dir, self.workspace_dir, pack,
+                        output_uid=os.geteuid(), output_gid=os.getegid())
+                    runtime_cleanup_dir = runtime_dir
+                except BaseException as setup_error:
+                    try:
+                        shutil.rmtree(runtime_dir)
+                    except OSError as cleanup_error:
+                        note = getattr(setup_error, "add_note", None)
+                        if callable(note):
+                            note(
+                                "published input setup 失败后的 workspace "
+                                f"清理也失败: {cleanup_error}")
+                    if isinstance(setup_error, SourceMaterializationError):
+                        raise RunnerError(
+                            f"Bundle published input 投影失败：{setup_error}",
+                            failure_kind="artifact_input") from setup_error
+                    raise
             runtime_cwd = runtime_dir
         runtime_out_file = (runtime_dir / f"{tag}.out.md"
                             if runtime_dir is not None else out_file)
@@ -1269,11 +1551,19 @@ class CodexRunner:
         # orchestrator instead of being inherited by a model process with shell access.
         process_env = _codex_process_env(tmpdir=runtime_dir)
         command_bin = self.query_bin if (self.tool_free or self.isolated_host_tools) else self.bin
+        sqlite_home = (
+            self.query_codex_sqlite_home
+            if (self.tool_free or self.isolated_host_tools)
+            else process_env.get("CODEX_SQLITE_HOME"))
+        if not sqlite_home:
+            raise RunnerError("Codex 调用缺 CODEX_SQLITE_HOME 存储绑定")
         # Put sandbox/cwd before ``exec`` because ``exec resume`` exposes them
         # as global options, not resume-local options.  A bound session omits
         # ``--ephemeral``; an existing id selects the documented resume path.
         cmd = [
-            command_bin, "-s", self.sandbox_mode, "-C", str(runtime_cwd), "exec",
+            command_bin,
+            "-c", "sqlite_home=" + json.dumps(str(sqlite_home)),
+            "-s", self.sandbox_mode, "-C", str(runtime_cwd), "exec",
         ]
         if self._resume_session_id is not None:
             cmd.extend(["resume", "--all"])
@@ -1294,6 +1584,17 @@ class CodexRunner:
             "-o", str(runtime_out_file),
         ])
         runtime_mcp_token = None
+        runtime_mcp_server_config = None
+        native_review_ledger = (
+            NativeReviewLedger(spawn_proof_mode=(
+                RESUMED_LINEAGE_PROOF_MODE
+                if self._resume_session_id is not None
+                else RAW_SPAWN_PROOF_MODE))
+            if use_app_server else None)
+        if use_app_server and runner_call_id is None:
+            raise RunnerError(
+                "resident app-server 缺 trusted runner_call_id",
+                failure_kind="runtime")
         if self.runtime_mcp_broker is not None and not self.no_host_tools:
             bridge_python = os.environ.get(
                 "METARESEARCH_RUNTIME_MCP_PYTHON", "/usr/bin/python3")
@@ -1307,6 +1608,20 @@ class CodexRunner:
             runtime_tool_timeout_s = (
                 3600.0 if self.timeout_s is None else
                 float(max(65.0, self.timeout_s - 30.0)))
+            runtime_mcp_server_config = {
+                "command": bridge_python,
+                "args": [bridge_script, "--stdio-bridge"],
+                "env_vars": [
+                    "METARESEARCH_RUNTIME_MCP_SOCKET",
+                    "METARESEARCH_RUNTIME_MCP_TOKEN",
+                    "METARESEARCH_RUNNER_TIMEOUT_S",
+                ],
+                "enabled": True,
+                "required": True,
+                "startup_timeout_sec": 10.0,
+                "tool_timeout_sec": runtime_tool_timeout_s,
+                "default_tools_approval_mode": "approve",
+            }
             mcp_config = [
                 "-c", ("mcp_servers.meta_research_runtime.command="
                        + json.dumps(bridge_python)),
@@ -1336,7 +1651,9 @@ class CodexRunner:
                 pack_hash=getattr(pack, "pack_hash", "") or "",
                 refs=list(getattr(pack, "refs", []) or []),
                 workspace_root=runtime_dir,
-                output_uid=int(self.output_uid))
+                output_uid=int(self.output_uid),
+                runner_call_id=runner_call_id,
+                native_review_ledger=native_review_ledger)
             process_env.update({
                 "METARESEARCH_RUNTIME_MCP_SOCKET": self.runtime_mcp_broker.socket_path,
                 "METARESEARCH_RUNTIME_MCP_TOKEN": runtime_mcp_token,
@@ -1386,11 +1703,39 @@ class CodexRunner:
                 "PATH": _TOOL_FREE_EXEC_PATH,
                 "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
                 "CODEX_HOME": query_home, "HOME": self.query_user_home,
-                "TMPDIR": str(runtime_dir),
+                "CODEX_SQLITE_HOME": self.query_codex_sqlite_home,
+                "TMPDIR": str(runtime_dir), "TMP": str(runtime_dir),
+                "TEMP": str(runtime_dir),
                 "XDG_CACHE_HOME": self.query_cache_home,
                 "PIP_CACHE_DIR": str(Path(self.query_cache_home) / "pip"),
                 "HF_HOME": str(Path(self.query_cache_home) / "huggingface"),
+                "HF_HUB_CACHE": str(
+                    Path(self.query_cache_home) / "huggingface" / "hub"),
+                "HF_DATASETS_CACHE": str(
+                    Path(self.query_cache_home) / "huggingface" / "datasets"),
+                "TRANSFORMERS_CACHE": str(
+                    Path(self.query_cache_home) / "huggingface" / "transformers"),
                 "TORCH_HOME": str(Path(self.query_cache_home) / "torch"),
+                "TORCH_EXTENSIONS_DIR": str(
+                    Path(self.query_cache_home) / "torch-extensions"),
+                "TRITON_CACHE_DIR": str(
+                    Path(self.query_cache_home) / "triton"),
+                "XDG_CONFIG_HOME": str(Path(self.query_user_home) / ".config"),
+                "XDG_DATA_HOME": str(
+                    Path(self.query_user_home) / ".local" / "share"),
+                "XDG_STATE_HOME": str(
+                    Path(self.query_user_home) / ".local" / "state"),
+                "CONDA_PKGS_DIRS": str(
+                    Path(self.query_cache_home) / "conda-pkgs"),
+                "CONDA_ENVS_PATH": str(
+                    Path(self.query_cache_home) / "conda-envs"),
+                "UV_CACHE_DIR": str(Path(self.query_cache_home) / "uv"),
+                "CUDA_CACHE_PATH": str(Path(self.query_cache_home) / "cuda"),
+                "MPLCONFIGDIR": str(
+                    Path(self.query_cache_home) / "matplotlib"),
+                "NUMBA_CACHE_DIR": str(Path(self.query_cache_home) / "numba"),
+                "PYTHONPYCACHEPREFIX": str(
+                    Path(self.query_cache_home) / "pycache"),
             }
             for name in _CODEX_NETWORK_ENV_NAMES:
                 if name in os.environ:
@@ -1411,6 +1756,63 @@ class CodexRunner:
                     "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
             else:
                 process_env = safe_env
+        if use_app_server:
+            if runtime_mcp_server_config is None or runtime_mcp_token is None:
+                raise RunnerError(
+                    "resident app-server 缺 runtime MCP capability",
+                    failure_kind="runtime")
+            codex_home = process_env.get("CODEX_HOME")
+            codex_sqlite_home = process_env.get("CODEX_SQLITE_HOME")
+            if not codex_home or not codex_sqlite_home:
+                raise RunnerError(
+                    "resident app-server 缺 VEPFS Codex storage binding",
+                    failure_kind="runtime")
+            try:
+                direct_codex = resolve_direct_codex_bin(os.environ)
+            except AppServerDriverError as error:
+                raise RunnerError(
+                    f"resident app-server direct CLI 解析失败：{error}",
+                    failure_kind="runtime") from error
+            # The driver receives only the already-resolved trusted absolute
+            # launcher.  This avoids its sanitized environment silently
+            # falling back to the older /usr/local CLI.
+            process_env["METARESEARCH_CODEX_BIN"] = direct_codex
+            app_config = {
+                "sqlite_home": str(codex_sqlite_home),
+                "web_search": "live",
+                "mcp_servers": {
+                    "meta_research_runtime": runtime_mcp_server_config,
+                },
+            }
+            if self.sandbox_mode == "workspace-write":
+                app_config["sandbox_workspace_write"] = {
+                    "network_access": True}
+            app_spec = {
+                "version": 1,
+                "expected_codex_home": str(codex_home),
+                "expected_codex_sqlite_home": str(codex_sqlite_home),
+                "model": self.model,
+                "effort": self.effort,
+                "cwd": str(runtime_cwd),
+                "runtime_workspace_roots": [str(runtime_cwd)],
+                "approval_policy": "never",
+                "sandbox_mode": self.sandbox_mode,
+                "network_access": True,
+                "config": app_config,
+                "required_mcp_servers": ["meta_research_runtime"],
+                "prompt": prompt,
+                "thread_id": self._resume_session_id,
+            }
+            _write_private_file(
+                app_server_spec_file,
+                json.dumps(
+                    app_spec, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False
+                ).encode("utf-8"))
+            cmd = [
+                "/usr/bin/python3", APP_SERVER_DRIVER_PATH,
+                "--spec", str(app_server_spec_file),
+            ]
         t0 = time.monotonic()
         copy_error = None
         artifact_collect_error = None
@@ -1420,6 +1822,9 @@ class CodexRunner:
         usage = CallUsage(tokens_known=False)
         stderr = stdout = ""
         try:
+            observer_kwargs = (
+                {"capture_observer": native_review_ledger.feed}
+                if native_review_ledger is not None else {})
             with prompt_file.open("rb") as fh:
                 proc = self.execution_supervisor.run(
                     cmd, stdin=fh, capture_output=True,
@@ -1430,6 +1835,7 @@ class CodexRunner:
                          else None),
                     env=process_env,
                         kind=("codex-resident-stage" if self.lifecycle_bound else
+                          "codex-stage-main" if use_app_server else
                           "codex-query" if self.tool_free else
                           "codex-runner-low-privilege" if self.isolated_host_tools else
                           "codex-no-host-tools" if self.no_host_tools else "codex-runner"),
@@ -1446,9 +1852,13 @@ class CodexRunner:
                         "provider": ("codex-cli" if runner_call_id is not None else None),
                         "provider_model": (self.model if runner_call_id is not None else None),
                         "provider_effort": (self.effort if runner_call_id is not None else None),
+                        "native_review_spawn_proof_mode": (
+                            native_review_ledger.spawn_proof_mode
+                            if native_review_ledger is not None else None),
                         "prompt_sha256": (
                             "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-                            if runner_call_id is not None else None)})
+                            if runner_call_id is not None else None)},
+                    **observer_kwargs)
             wallclock = round(time.monotonic() - t0, 3)
             execution_receipt_ref = (
                 str(proc.receipt_path) if getattr(proc, "receipt_path", None) is not None else None)
@@ -1462,9 +1872,66 @@ class CodexRunner:
                 prompt=prompt, usage=usage, usage_source=usage_source,
                 stderr=stderr, json_trace=stdout,
                 execution_receipt_ref=execution_receipt_ref, tag=tag)
+            if proc.returncode != 0:
+                tail = stderr[-500:]
+                raise RunnerError(
+                    f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}",
+                    usage=usage, transcript_ref=str(out_file),
+                    failure_kind="runtime",
+                    execution_receipt_ref=execution_receipt_ref,
+                    provider_receipt_ref=provider_receipt_ref)
             self._advance_persistent_session(stderr, stdout, usage=usage,
                                              execution_receipt_ref=execution_receipt_ref,
                                              provider_receipt_ref=provider_receipt_ref)
+            if native_review_ledger is not None:
+                captured = getattr(proc, "stdout", None)
+                receipt = getattr(proc, "receipt", None)
+                if not isinstance(captured, bytes) or not isinstance(receipt, dict):
+                    raise RunnerError(
+                        "resident app-server 缺 guardian capture/receipt",
+                        usage=usage, failure_kind="runtime",
+                        execution_receipt_ref=execution_receipt_ref,
+                        provider_receipt_ref=provider_receipt_ref)
+                try:
+                    events_file.write_bytes(captured)
+                    os.chmod(events_file, 0o600)
+                    evidence = native_review_ledger.finalize(
+                        receipt=receipt, captured_stdout=captured)
+                    parent_thread, parent_final = extract_parent_final(captured)
+                    provider_thread, _kind = parse_provider_invocation_id(
+                        "", captured.decode("utf-8", "strict"))
+                    if provider_thread != parent_thread:
+                        raise RunnerError(
+                            "resident app-server parent identity drift",
+                            usage=usage,
+                            failure_kind="provider_session_drift",
+                            execution_receipt_ref=execution_receipt_ref,
+                            provider_receipt_ref=provider_receipt_ref)
+                    runtime_out_file.write_bytes(parent_final)
+                    os.chmod(runtime_out_file, 0o600)
+                    self._last_native_review_evidence = evidence
+                except RunnerError:
+                    raise
+                except (NativeReviewError, AppServerDriverError,
+                        OSError, UnicodeDecodeError) as error:
+                    raise RunnerError(
+                        f"resident app-server evidence/output 收口失败：{error}",
+                        usage=usage, failure_kind="runtime",
+                        execution_receipt_ref=execution_receipt_ref,
+                        provider_receipt_ref=provider_receipt_ref) from error
+            if (use_app_server and pack.stage == "bundle"
+                    and runtime_mcp_token is not None
+                    and proc.returncode == 0 and runtime_out_file.exists()):
+                try:
+                    self.runtime_mcp_broker.assert_stage_turn_complete(
+                        runtime_mcp_token)
+                except Exception as error:
+                    raise RunnerError(
+                        "resident Bundle 主 turn 正常退出条件未满足："
+                        f"{error}",
+                        usage=usage, failure_kind="artifact_parse",
+                        execution_receipt_ref=execution_receipt_ref,
+                        provider_receipt_ref=provider_receipt_ref) from error
         except subprocess.TimeoutExpired as e:
             wallclock = round(time.monotonic() - t0, 3)
             stderr = self._stream_text(getattr(e, "stderr", None))
@@ -1500,6 +1967,59 @@ class CodexRunner:
                 failure_kind="timeout",
                 execution_receipt_ref=execution_receipt_ref,
                 provider_receipt_ref=provider_receipt_ref) from e
+        except NativeReviewError as error:
+            # A capture observer can reject malformed JSONL while the guardian
+            # is still running.  The supervisor nevertheless cancels/drains
+            # that exact tree and attaches its terminal receipt.  Recover the
+            # verified captures so the real provider call is durably costed
+            # before rejecting its scientific output.
+            receipt = getattr(error, "execution_receipt", None)
+            execution_path = getattr(
+                error, "execution_receipt_path", None)
+            wallclock = round(time.monotonic() - t0, 3)
+            captured_stdout = captured_stderr = b""
+            if isinstance(receipt, dict) and execution_path is not None:
+                execution_receipt_ref = str(execution_path)
+                try:
+                    captured_stdout = read_execution_capture(
+                        receipt, stream="stdout")
+                    captured_stderr = read_execution_capture(
+                        receipt, stream="stderr")
+                except (OSError, ValueError) as capture_error:
+                    note = getattr(error, "add_note", None)
+                    if callable(note):
+                        note(f"verified capture 读取失败: {capture_error}")
+                if captured_stdout:
+                    try:
+                        events_file.write_bytes(captured_stdout)
+                        os.chmod(events_file, 0o600)
+                    except OSError as archive_error:
+                        note = getattr(error, "add_note", None)
+                        if callable(note):
+                            note(f"app-server events 归档失败: {archive_error}")
+            stderr = self._stream_text(captured_stderr)
+            stdout = self._stream_text(captured_stdout)
+            usage, usage_source = self._usage_with_source(
+                stderr, wallclock, stdout)
+            provider_receipt_ref = self._publish_provider_receipt(
+                runner_call_id=runner_call_id, cycle_id=pack.cycle_id,
+                phase=runner_call_phase, purpose=runner_call_purpose,
+                prompt=prompt, usage=usage, usage_source=usage_source,
+                stderr=stderr, json_trace=stdout,
+                execution_receipt_ref=execution_receipt_ref, tag=tag)
+            self._adopt_reported_persistent_session(
+                stderr, stdout, usage=usage,
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref,
+                required=False)
+            if (self._persistent_session_bound
+                    and self._resume_session_id is None):
+                self._persistent_session_unrecoverable = True
+            raise RunnerError(
+                f"resident app-server capture observer 拒绝事件流：{error}",
+                usage=usage, failure_kind="runtime",
+                execution_receipt_ref=execution_receipt_ref,
+                provider_receipt_ref=provider_receipt_ref) from error
         except ExecutionCleanupError as e:
             wallclock = round(time.monotonic() - t0, 3)
             usage, usage_source = self._usage_with_source("", wallclock, "")
@@ -1608,7 +2128,7 @@ class CodexRunner:
                     transcript_ref=str(out_file),
                     execution_receipt_ref=execution_receipt_ref,
                     provider_receipt_ref=provider_receipt_ref) from error
-        if proc.returncode != 0 or not out_file.exists():
+        if not out_file.exists():
             tail = stderr[-500:]
             raise RunnerError(
                 f"runner 进程失败（exit={proc.returncode}）：{tag}\n{tail}", usage=usage,

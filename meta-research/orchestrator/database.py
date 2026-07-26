@@ -1,10 +1,12 @@
-"""SQLite 唯一真相的建库与守卫（M1a：migration version / schema checksum 锁定）。
+"""SQLite 唯一真相的建库、增量迁移与守卫。
 
 治理（详 db/README.md）：
 - `db/migrations/0001_appendix_a.sql` 逐字摘自《第一部分》附录 A，**字节冻结**——
   本模块以 SHA256 常量锁定；文件被改动（漂移/手滑）即拒绝建库。
-- 目标计数锁定：36 表 / 72 触发器 / 29 索引（12 显式 + 17 UNIQUE 自动）/ 1 视图。
-- PRAGMA user_version = schema 版本（=1）；不建额外元数据表（36 表计数是验收对象）。
+- 后续 schema 只能通过独立、同样 hash-locked 的 additive migration 引入；既有 v1
+  文件库按版本逐步升级，fresh 库依次执行完整 migration 链。
+- 每个版本同时锁定 schema 对象计数与 ``PRAGMA user_version``。不建 migration
+  元数据表，版本链与 checksum 锚由本模块维护。
 
 连接纪律：foreign_keys 每连接显式开启（SQLite 默认关）。本地文件系统用 WAL（§6.2）；
 GPFS/未知共享文件系统用 rollback journal。SQLite 官方要求 WAL 的全部进程位于同一 host，
@@ -22,10 +24,12 @@ from typing import Dict, Optional, Union
 
 
 _MIGRATION_RELATIVE = Path("db/migrations/0001_appendix_a.sql")
+_BUNDLE_DAG_MIGRATION_RELATIVE = Path(
+    "db/migrations/0002_bundle_target_dag.sql")
 
 
-def _resolve_migration_file() -> Path:
-    """Locate the frozen DDL in a checkout or an installed wheel.
+def _resolve_runtime_asset(relative: Path) -> Path:
+    """Locate one runtime asset in a checkout or an installed wheel.
 
     Runtime assets are installed under ``<data>/share/meta-research`` while a
     source checkout keeps them beside the Python package.  Database import
@@ -44,25 +48,38 @@ def _resolve_migration_file() -> Path:
     ])
     for root in candidates:
         try:
-            candidate = (root / _MIGRATION_RELATIVE).resolve(strict=True)
+            candidate = (root / relative).resolve(strict=True)
         except OSError:
             continue
         if candidate.is_file():
             return candidate
     # Keep import side-effect free and let the existing schema-drift/opening
     # boundary report the missing frozen migration when it is actually used.
-    return package_parent / _MIGRATION_RELATIVE
+    return package_parent / relative
+
+
+def _resolve_migration_file() -> Path:
+    """Backward-compatible locator for the byte-frozen v1 migration."""
+    return _resolve_runtime_asset(_MIGRATION_RELATIVE)
 
 
 MIGRATION_FILE = _resolve_migration_file()
+BUNDLE_DAG_MIGRATION_FILE = _resolve_runtime_asset(
+    _BUNDLE_DAG_MIGRATION_RELATIVE)
 
 # 字节冻结锚：附录 A 提取文件的 SHA256。任何改动=决策性改动，须走检查点评审并同步更新此常量。
 MIGRATION_SHA256 = "c56df2db0434877b5b3dcba17302e8967ed256a337988d0dd58cd5c7e5cfffd4"
+BUNDLE_DAG_MIGRATION_SHA256 = (
+    "5f2add9dcd5d6fbeb3c870fa677beccf175a472259fcadba2a48af50606b24aa")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-# 附录 A 自述计数（索引口径含 UNIQUE 自动索引，《第一部分》§5.7）
-EXPECTED_COUNTS: Dict[str, int] = {"table": 36, "trigger": 72, "index": 29, "view": 1}
+# 每版对象计数（索引口径含 UNIQUE 自动索引，《第一部分》§5.7）。
+EXPECTED_COUNTS_BY_VERSION: Dict[int, Dict[str, int]] = {
+    1: {"table": 36, "trigger": 72, "index": 29, "view": 1},
+    2: {"table": 46, "trigger": 88, "index": 50, "view": 1},
+}
+EXPECTED_COUNTS: Dict[str, int] = EXPECTED_COUNTS_BY_VERSION[SCHEMA_VERSION]
 
 
 class SchemaDriftError(RuntimeError):
@@ -189,12 +206,33 @@ def _establish_file_storage_mode(
 
 
 def _read_migration() -> str:
-    data = MIGRATION_FILE.read_bytes()
+    """Read and verify the frozen v1 migration (legacy public helper)."""
+    return _read_locked_migration(MIGRATION_FILE, MIGRATION_SHA256)
+
+
+def _read_locked_migration(path: Path, expected_hash: str) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise SchemaDriftError(f"migration 文件不可读：{path}") from error
     digest = hashlib.sha256(data).hexdigest()
-    if digest != MIGRATION_SHA256:
+    if digest != expected_hash:
         raise SchemaDriftError(
-            f"migration 文件 checksum 漂移：{digest} ≠ 冻结锚 {MIGRATION_SHA256}（{MIGRATION_FILE}）")
-    return data.decode("utf-8")
+            f"migration 文件 checksum 漂移：{digest} ≠ 冻结锚 "
+            f"{expected_hash}（{path}）")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SchemaDriftError(f"migration 文件不是 UTF-8：{path}") from error
+
+
+def _read_migrations() -> Dict[int, str]:
+    """Verify the complete known migration chain before opening a database."""
+    return {
+        1: _read_migration(),
+        2: _read_locked_migration(
+            BUNDLE_DAG_MIGRATION_FILE, BUNDLE_DAG_MIGRATION_SHA256),
+    }
 
 
 def live_counts(conn: sqlite3.Connection) -> Dict[str, int]:
@@ -215,25 +253,52 @@ def live_counts(conn: sqlite3.Connection) -> Dict[str, int]:
     }
 
 
-def verify_schema(conn: sqlite3.Connection) -> None:
+def _verify_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    expected = EXPECTED_COUNTS_BY_VERSION.get(version)
+    if expected is None:
+        raise SchemaDriftError(f"未知 schema 版本：user_version={version}")
     got = live_counts(conn)
-    if got != EXPECTED_COUNTS:
-        raise SchemaDriftError(f"schema 计数漂移：{got} ≠ {EXPECTED_COUNTS}")
+    if got != expected:
+        raise SchemaDriftError(f"schema 计数漂移：{got} ≠ {expected}")
     ver = conn.execute("PRAGMA user_version").fetchone()[0]
-    if ver != SCHEMA_VERSION:
-        raise SchemaDriftError(f"schema 版本不符：user_version={ver} ≠ {SCHEMA_VERSION}")
+    if ver != version:
+        raise SchemaDriftError(
+            f"schema 版本不符：user_version={ver} ≠ {version}")
+
+
+def verify_schema(conn: sqlite3.Connection) -> None:
+    _verify_schema_version(conn, SCHEMA_VERSION)
+
+
+def _apply_migration(
+        conn: sqlite3.Connection, *, version: int, migration_sql: str) -> None:
+    """Apply one migration and its version bump in one SQLite transaction."""
+    if version < 1 or version > SCHEMA_VERSION:
+        raise SchemaDriftError(f"拒绝执行未知 migration 版本：{version}")
+    script = (
+        "BEGIN IMMEDIATE;\n"
+        + migration_sql
+        + f"\nPRAGMA user_version = {version};\n"
+        + "COMMIT;\n"
+    )
+    try:
+        conn.executescript(script)
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 def connect(path: Union[str, Path] = ":memory:") -> sqlite3.Connection:
-    """建库（新库执行冻结 migration）或打开既有库，并做 checksum/计数/版本三重校验。
+    """Build, upgrade, or open a DB through the hash-locked migration chain.
 
-    checksum 每次 connect 都校验（fresh 与 reopen 一致）：字节冻结须在**主运行路径**上生效——
-    research.sqlite 每进程启动都是 reopen，若只在 fresh 校验，DDL 文件漂移后既有库仍照常打开，
-    冻结形同虚设。故这里先无条件校验文件、再决定建库还是仅开库。
+    Every known migration checksum is verified on every connect.  Existing
+    schemas are count/version checked *before* the next additive migration is
+    allowed to run, preventing a drifted v1 database from being blessed as v2.
     """
     is_memory = str(path) == ":memory:"
     required_mode = "memory" if is_memory else journal_mode_for_path(path)
-    migration_sql = _read_migration()   # 无条件校验文件 checksum（漂移即在此抛 SchemaDriftError）
+    migrations = _read_migrations()
     # The run process has one writer connection, but the interaction pump and
     # research driver use it from different threads.  WriteDaemon serializes
     # every access; disabling sqlite's thread-affinity check is therefore safe
@@ -243,11 +308,32 @@ def connect(path: Union[str, Path] = ":memory:") -> sqlite3.Connection:
         if not is_memory:
             _establish_file_storage_mode(conn, required_mode=required_mode)
         conn.execute("PRAGMA foreign_keys = ON")
-        fresh = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
-        if fresh:
-            conn.executescript(migration_sql)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            conn.commit()
+        object_count = conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+        current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if object_count == 0:
+            if current != 0:
+                raise SchemaDriftError(
+                    f"空库却声明 schema 版本：user_version={current}")
+        elif current == 0:
+            raise SchemaDriftError("非空数据库缺 PRAGMA user_version")
+        elif current > SCHEMA_VERSION:
+            raise SchemaDriftError(
+                f"schema 版本过新：user_version={current} > {SCHEMA_VERSION}")
+        elif current not in EXPECTED_COUNTS_BY_VERSION:
+            raise SchemaDriftError(f"未知 schema 版本：user_version={current}")
+
+        while current < SCHEMA_VERSION:
+            if current > 0:
+                _verify_schema_version(conn, current)
+            next_version = current + 1
+            _apply_migration(
+                conn,
+                version=next_version,
+                migration_sql=migrations[next_version],
+            )
+            current = next_version
         verify_schema(conn)
     except BaseException:
         try:

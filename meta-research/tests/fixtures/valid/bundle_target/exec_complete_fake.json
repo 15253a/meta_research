@@ -4,7 +4,7 @@
   "status": "complete",
   "variant": {
     "variant_key": "lr0.1-epoch50",
-    "config_json": { "lr": 0.1, "epochs": 50, "seed": 7 },
+    "config_json": { "lr": 0.1, "epochs": 50 },
     "overrides": []
   },
   "run": {

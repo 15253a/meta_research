@@ -100,6 +100,8 @@ def test_page_derived_from_prototype_and_wired():
     assert "onclick=\"fsToggle('${path}')\"" not in txt               # 上传文件名不得进入 inline JS（stored XSS）
     assert 'Q_EXEC_PHASES=new Set([' in txt and "Q_EXEC_PHASES.map" not in txt
     assert "function selectQuestionPhase(" in txt and "function _questionPhaseOutput(" in txt
+    assert "function selectQuestionCycle(" in txt and "function questionResearchHistoryHTML(" in txt
+    assert "问题攻坚综述" in txt and "Reasoning 决策 / 下一步" in txt
     assert "实际输出" in txt and 'data-live-output="1"' in txt
     assert "function _legacyLiveActivityRows(" in txt and "function syncCodexLiveChip(" in txt
     assert 'event.kind==="activity"' in txt and 'event.kind==="live"' in txt
@@ -432,6 +434,167 @@ def test_question_detail_uses_actual_phases_and_switches_codex_output(tmp_path):
         ["node", str(SMOKE), str(PAGE), str(pf), "", str(sf), "", str(df)],
         capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and "SMOKE_OK" in r.stdout and "DRAWER_SMOKE_OK" in r.stdout, (
+        f"stdout={r.stdout} stderr={r.stderr[:400]}")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node 不可用")
+def test_question_card_keeps_cycle_summary_after_question_lease_is_released(tmp_path):
+    """完成轮会清空 cycle.active_question_id；右栏仍须由耐久 Reasoning/产物关系找回攻坚史。"""
+    payload = _payload(tmp_path)
+    question = payload["tables"]["question"][0]
+    cycle = payload["tables"]["cycle"][0]
+    question_id, cycle_id = question["id"], cycle["id"]
+    question.update({"status": "inconclusive", "active_cycle": None, "closed_cycle": cycle_id})
+    cycle.update({"active_question_id": None, "route": "attack", "status": "done",
+                  "finished_at": "2026-07-21 07:00:00"})
+    decision_id = max([row["id"] for row in payload["tables"]["decision"]] or [0]) + 1
+    payload["tables"]["decision"].append({
+        "id": decision_id, "cycle_id": cycle_id, "question_id": question_id,
+        "directive_id": None, "actor": "agent", "type": "runtime_cycle_summary",
+        "prompt_version": "test", "policy_version": "test",
+        "payload_json": json.dumps({
+            "protocol": "runtime-cycle-summary-v1", "question_id": question_id,
+            "decision": "inconclusive",
+            "conclusion_md": "冻结协议下完成双对照训练，但置信区间仍跨越预声明阈值。",
+            "next_step_md": "补充不相交独立种子，并保持数据切分和阈值冻结。",
+            "evidence_refs": ["mr-test-1", "mr-test-2"],
+        }, ensure_ascii=False),
+        "created_at": "2026-07-21 07:00:00",
+    })
+    payload["tables"]["runner_call"] = [
+        {"id": 201, "cycle_id": cycle_id, "phase": "plan", "purpose": "plan",
+         "status": "success", "started_at": "t1", "finished_at": "t2"},
+        {"id": 202, "cycle_id": cycle_id, "phase": "bundle", "purpose": "bundle",
+         "status": "success", "started_at": "t2", "finished_at": "t3"},
+        {"id": 203, "cycle_id": cycle_id, "phase": "reasoning", "purpose": "reasoning",
+         "status": "success", "started_at": "t3", "finished_at": "t4"},
+    ]
+    payload["tables"]["phase_commit"] = [
+        {"id": 1, "cycle_id": cycle_id, "stage": "plan", "target_id": None},
+        {"id": 2, "cycle_id": cycle_id, "stage": "bundle", "target_id": 701,
+         "artifact_hash": "bundle-701"},
+        {"id": 3, "cycle_id": cycle_id, "stage": "bundle", "target_id": 702,
+         "artifact_hash": "bundle-702"},
+        {"id": 4, "cycle_id": cycle_id, "stage": "bundle", "target_id": 703,
+         "artifact_hash": "bundle-703"},
+        {"id": 5, "cycle_id": cycle_id, "stage": "bundle", "target_id": 704,
+         "artifact_hash": "bundle-704"},
+        {"id": 6, "cycle_id": cycle_id, "stage": "reasoning", "target_id": None,
+         "artifact_hash": "reasoning-final"},
+    ]
+    payload["tables"]["build_target"] = [
+        {"id": 701, "cycle_id": cycle_id, "question_id": question_id,
+         "target_kind": "exec", "seq": 1, "critical": 1, "status": "complete",
+         "failure_kind": None, "baseline_id": 801, "variant_id": 901,
+         "evaluation_id": 1001},
+        {"id": 702, "cycle_id": cycle_id, "question_id": question_id,
+         "target_kind": "exec", "seq": 2, "critical": 1, "status": "failed",
+         "failure_kind": "runtime", "baseline_id": None, "variant_id": None,
+         "evaluation_id": None},
+        {"id": 703, "cycle_id": cycle_id, "question_id": question_id,
+         "target_kind": "exec", "seq": 3, "critical": 0, "status": "skipped",
+         "failure_kind": "dependency_wait", "baseline_id": None, "variant_id": None,
+         "evaluation_id": None},
+        {"id": 704, "cycle_id": cycle_id, "question_id": None,
+         "target_kind": "exec", "seq": 4, "critical": 1,
+         "status": "engineering_blocked", "failure_kind": "smoke",
+         "baseline_id": None, "variant_id": None, "evaluation_id": None},
+    ]
+    for target in payload["tables"]["build_target"]:
+        target_id = target["id"]
+        payload["tables"]["decision"].append({
+            "id": decision_id + target_id, "cycle_id": cycle_id,
+            "question_id": question_id, "directive_id": None,
+            "actor": "orchestrator",
+            "type": ("bundle_scientific_contract" if target_id == 701
+                     else "bundle_scientific_terminal"),
+            "prompt_version": "test", "policy_version": "test",
+            "payload_json": json.dumps({
+                "protocol": ("bundle-scientific-contract-v1" if target_id == 701
+                             else "bundle-scientific-terminal-v1"),
+                "build_target_id": target_id,
+                "execution_status": {
+                    701: "succeeded", 702: "failed", 703: "skipped",
+                    704: "engineering_blocked",
+                }[target_id],
+                "validity_status": "valid" if target_id == 701 else "not_assessed",
+                "scientific_outcome": "refuted" if target_id == 701 else "unavailable",
+                "pool_eligibility": "eligible" if target_id == 701 else "ineligible",
+            }, ensure_ascii=False),
+            "created_at": "2026-07-21 06:59:00",
+        })
+    payload["tables"]["decision"].extend([
+        {
+            "id": decision_id + 800, "cycle_id": cycle_id,
+            "question_id": question_id, "directive_id": None, "actor": "agent",
+            "type": "runtime_review", "prompt_version": "test",
+            "policy_version": "test",
+            "payload_json": json.dumps({
+                "protocol": "native-review-receipt-v1", "cycle_id": f"c{cycle_id}",
+                "stage": "bundle", "target_id": "701",
+                "review_kind": "bundle_code", "round_no": 1,
+                "configured_rounds": 1, "verdict": "pass",
+                "child_thread_id": "child-review-t701",
+                "receipt_hash": "sha256:" + "c" * 64,
+            }, ensure_ascii=False),
+            "created_at": "2026-07-21 06:59:00",
+        },
+        {
+            "id": decision_id + 801, "cycle_id": cycle_id,
+            "question_id": question_id, "directive_id": None,
+            "actor": "orchestrator", "type": "runtime_bundle_result_review_ack",
+            "prompt_version": "test", "policy_version": "test",
+            "payload_json": json.dumps({
+                "protocol": "native-bundle-result-review-ack-v1",
+                "build_target_id": 701,
+                "review_decision_id": decision_id + 800,
+                "review_receipt_hash": "sha256:" + "c" * 64,
+            }, ensure_ascii=False),
+            "created_at": "2026-07-21 06:59:00",
+        },
+        {
+            "id": decision_id + 802, "cycle_id": cycle_id,
+            "question_id": question_id, "directive_id": None, "actor": "gate",
+            "type": "pool_publication", "prompt_version": "test",
+            "policy_version": "test",
+            "payload_json": json.dumps({
+                "baseline_id": 801, "variant_id": 901, "evaluation_id": 1001,
+                "manifest_ref": "formal/pool-701.json",
+                "manifest_hash": "sha256:" + "d" * 64,
+            }, ensure_ascii=False),
+            "created_at": "2026-07-21 06:59:00",
+        },
+    ])
+    payload["runner_output"] = [{
+        "key": "reasoning-final", "at": "t4", "runner_call_id": 203,
+        "cycle_id": cycle_id, "phase": "reasoning", "purpose": "reasoning",
+        "call_status": "success", "kind": "output", "text": "REASONING-FINAL",
+    }]
+    payload["live"].update({"mode": "idle", "inflight_cycle": None,
+                            "runner_call": None, "orchestrator_active": False})
+    payload["status_card"]["active_question"] = None
+    pf = tmp_path / "released-question-payload.json"
+    sf = tmp_path / "released-question-spec.json"
+    pf.write_text(json.dumps(payload), encoding="utf-8")
+    sf.write_text(json.dumps({
+        "question_id": question_id,
+        "present": [f"第 c{cycle_id} 轮执行记录", "实验构建与运行", "REASONING-FINAL"],
+        "card_present": ["问题攻坚综述", "1 个结构化 Reasoning 轮末摘要",
+                         "冻结协议下完成双对照训练", "补充不相交独立种子",
+                         "mr-test-1", "正在查看本轮执行",
+                         "target 701", "已完成", "target 702", "失败 · runtime",
+                         "target 703", "已跳过 · dependency_wait",
+                         "target 704", "工程阻塞 · smoke",
+                         "执行=succeeded", "有效性=valid", "科学结论=refuted",
+                         "入池=eligible", "child-review-t701",
+                         "pool_publication", "formal/pool-701.json",
+                         "Reasoning commit #6"],
+        "card_absent": ["0 个轮次"],
+    }, ensure_ascii=False), encoding="utf-8")
+    r = subprocess.run(
+        ["node", str(SMOKE), str(PAGE), str(pf), "", str(sf)],
+        capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "SMOKE_OK" in r.stdout, (
         f"stdout={r.stdout} stderr={r.stderr[:400]}")
 
 

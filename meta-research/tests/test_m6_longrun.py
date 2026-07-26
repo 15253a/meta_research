@@ -30,6 +30,11 @@ from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
+# Production currently permits unbounded depth.  This focused guard-envelope
+# test deliberately installs a finite depth so it can still prove the bounded
+# variant and terminate deterministically.
+if POLICY["tree_guard"]["max_decompose_depth"] is None:
+    POLICY["tree_guard"]["max_decompose_depth"] = 4
 
 MAX_DEPTH = POLICY["tree_guard"]["max_decompose_depth"]
 MAX_OPEN = POLICY["tree_guard"]["max_open_questions"]

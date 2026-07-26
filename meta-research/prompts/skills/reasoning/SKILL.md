@@ -65,8 +65,13 @@ failure summary、DECISION 或 cycle_report。`engineering_blocked` 只能说明
   （下一轮分解首题，别硬塞进一轮）。`next_question_id` 填该 local_key（编排器同事务
   解析为真实 id）。不答题。
 - **decompose**：对选中的超预算问题写**仍可各自证据关闭**的子问题（`add_children.children[]` 每项均带
-  `text + predicate_json`，受树规模护栏：max_children_per_node / max_decompose_depth）+ selection
+  `text + predicate_json`，受树规模护栏：max_children_per_node；max_decompose_depth 为正整数时才限制深度，
+  为 null 时深度不限）+ selection
   选一个子问题攻坚。不答题。不得把父问题所需的目录盘点、编码、运行或部署步骤拆成子问题。
+  若固定锚明确显示当前 active 父问题已被已启用的 `max_decompose_depth`、累计子题数或开放问题数硬护栏阻断，
+  则不得伪造子题或反复提交必败的 `add_children`：改交 `tree_ops={"ops":[]}`，从锚中的其他可调度
+  前沿选择下一题。核心事务会把该父问题无 visit 地释放并记录 `decompose_guard_fallback`；除此以外的
+  decompose 轮仍必须提交 `add_children`。
 - **goal_amend**：只做目标改版，不答题。`tree_ops.ops[0]` **必须且只能是一个**
   `amend_goal`；其中 `new_goal_text / predicate_json / rationale_md` 必须逐字段复制固定锚里
   已确认的 goal_amend directive，禁止自行润色、补写或换谓词。升版后才可追加：

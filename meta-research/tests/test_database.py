@@ -1,9 +1,10 @@
-"""CP2.1 · 建库与三重锁的否定/正向用例（M1a：schema 落地并证明冻结锁生效）。
+"""SQLite schema chain: frozen v1 plus hash-locked additive migrations.
 
 覆盖 database.connect / verify_schema 的守卫：
-- 正向：新建 :memory: → 36/72/29/1、foreign_keys ON；本地 file 库 WAL、共享库 rollback、重开幂等。
+- 正向：fresh 走完整 migration chain；v1 文件库自动升级；foreign_keys ON；
+  本地 file 库 WAL、共享库 rollback、重开幂等。
 - 否定：checksum 漂移 / 计数漂移 / 版本不符 → SchemaDriftError；FK 实际生效（悬空引用被拒）。
-- 保真：migration body 与 reference 附录 A（行 918–1614）字节一致——护「逐字摘自」claim。
+- 保真：0001 body 与 reference 附录 A（行 918–1614）字节一致且 SHA 不变。
 """
 from __future__ import annotations
 
@@ -38,10 +39,58 @@ def test_migration_locator_supports_wheel_share_layout(tmp_path, monkeypatch):
 def test_fresh_build_counts_and_version():
     conn = db.connect(":memory:")
     assert db.live_counts(conn) == db.EXPECTED_COUNTS == {
-        "table": 36, "trigger": 72, "index": 29, "view": 1}
+        "table": 46, "trigger": 88, "index": 50, "view": 1}
     assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     # verify_schema 已在 connect 内跑过；再显式跑一次不抛
     db.verify_schema(conn)
+
+
+def test_fresh_build_contains_bundle_dag_tables():
+    conn = db.connect(":memory:")
+    names = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {
+        "bundle_target_node",
+        "bundle_target_dependency",
+        "bundle_target_admission",
+        "bundle_source_request",
+        "bundle_source_binding",
+        "bundle_worker_task",
+        "bundle_scheduler_state",
+        "bundle_resource_request",
+        "bundle_resource_lease",
+        "bundle_terminal_report",
+    } <= names
+
+
+def test_existing_v1_file_is_upgraded_once_without_losing_data(
+        tmp_path, monkeypatch):
+    path = tmp_path / "research.sqlite"
+    legacy = sqlite3.connect(path)
+    legacy.executescript(db._read_migration())
+    legacy.execute("PRAGMA user_version = 1")
+    legacy.execute(
+        "INSERT INTO goal(id,version,text,predicate_json) "
+        "VALUES (1,1,'legacy','{}')")
+    legacy.commit()
+    legacy.close()
+
+    monkeypatch.setattr(db, "filesystem_type_for_path", lambda _path: "gpfs")
+    upgraded = db.connect(path)
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert upgraded.execute(
+        "SELECT text FROM goal WHERE id=1").fetchone()[0] == "legacy"
+    assert upgraded.execute(
+        "SELECT count(*) FROM sqlite_master "
+        "WHERE type='table' AND name='bundle_target_admission'"
+    ).fetchone()[0] == 1
+    upgraded.close()
+
+    reopened = db.connect(path)
+    assert reopened.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert reopened.execute(
+        "SELECT text FROM goal WHERE id=1").fetchone()[0] == "legacy"
 
 
 def test_foreign_keys_enabled_per_connection():
@@ -191,10 +240,16 @@ def test_checksum_drift_rejected(monkeypatch):
         db.connect(":memory:")
 
 
+def test_additive_migration_checksum_drift_rejected(monkeypatch):
+    monkeypatch.setattr(db, "BUNDLE_DAG_MIGRATION_SHA256", "0" * 64)
+    with pytest.raises(db.SchemaDriftError, match="checksum 漂移"):
+        db.connect(":memory:")
+
+
 def test_count_drift_rejected():
-    """库内实际计数与 36/72/29/1 不符 → verify_schema 拒。"""
+    """库内实际计数与当前版本不符 → verify_schema 拒。"""
     conn = db.connect(":memory:")
-    conn.execute("DROP TRIGGER trg_goal_nodel")           # 72 → 71
+    conn.execute("DROP TRIGGER trg_goal_nodel")
     with pytest.raises(db.SchemaDriftError, match="计数漂移"):
         db.verify_schema(conn)
 

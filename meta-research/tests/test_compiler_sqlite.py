@@ -4,19 +4,38 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
 import json
 from pathlib import Path
+import sys
+import threading
 
 import pytest
 import yaml
 
 import conftest
 from orchestrator import database as db
+from orchestrator import obs_parser as OP
 from orchestrator.compiler_sqlite import SqliteCompiler
 from orchestrator.console import Console
-from orchestrator.interfaces import StageBlockedOnResources
+from orchestrator.interfaces import CallUsage, StageBlockedOnResources
+from orchestrator.native_review_verifier import (
+    select_authoritative_native_review,
+    validate_native_reviews,
+)
+from orchestrator.process_supervisor import ExecutionSupervisor
+from orchestrator.provider_invocation import (
+    load_provider_invocation_receipt,
+    write_provider_invocation_receipt,
+)
+from orchestrator.runtime_mcp import RuntimeIngestService
 from orchestrator.question_admission import admission_payload, normalize_question_contract
 from orchestrator.question_progress import INCONCLUSIVE_PROTOCOL
+from orchestrator.scientific_contract import (
+    build_scientific_decision_payload,
+    canonical_hash as scientific_hash,
+)
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
@@ -39,7 +58,7 @@ def _seed(conn):
 
 
 @pytest.fixture()
-def comp():
+def comp(tmp_path):
     conn = db.connect(":memory:")
     _seed(conn)
     return SqliteCompiler(conn, POLICY)
@@ -47,6 +66,667 @@ def comp():
 
 def _bytes(pack):
     return (pack.anchor_md + "\x00" + pack.neighborhood_md + "\x00" + pack.retrieval_md).encode("utf-8")
+
+
+def _scientific_contract():
+    return {
+        "validity_gates": [
+            {"gate_id": "required", "kind": "required_metrics_present"},
+            {"gate_id": "parser", "kind": "parser_not_suspect"},
+            {
+                "gate_id": "independent_review",
+                "kind":
+                    "independent_code_plan_data_boundary_review_receipt_present",
+            },
+        ],
+        "outcome_rules": [{
+            "rule_id": "primary",
+            "metric_id": 1,
+            "metric_ver": 1,
+            "operator": "ge",
+            "threshold": 0.8,
+            "if_true": "supported",
+            "if_false": "refuted",
+        }],
+    }
+
+
+def _legacy_code_review_payload(*, build_target_id, runner_call_id):
+    return {
+        "build_target_id": build_target_id,
+        "review_kind": "bundle_code_review",
+        "round_no": 1,
+        "verdict": "pass",
+        "issues": [],
+        "notes_md": "",
+        "subject_hash": "1" * 64,
+        "runner_call_id": runner_call_id,
+        "policy_hash": "policy-test",
+    }
+
+
+def _legacy_code_review_receipt(
+        *, decision_id, build_target_id, runner_call_id):
+    review = _legacy_code_review_payload(
+        build_target_id=build_target_id,
+        runner_call_id=runner_call_id)
+    return {
+        "protocol": "legacy-bundle-code-review-v1",
+        "decision_id": decision_id,
+        "review_kind": "bundle_code",
+        "review_scope": "code_plan_data_boundary",
+        "subject_hash": review["subject_hash"],
+        "receipt_hash": scientific_hash({
+            "decision_id": decision_id, "payload": review,
+        }),
+    }
+
+
+def _science_payload(*, build_target_id, evaluation_id, attempt_id,
+                     metric_value=0.1, review_decision_id=4101,
+                     review_runner_call_id=201):
+    return build_scientific_decision_payload(
+        build_target_id=build_target_id,
+        evaluation_id=evaluation_id,
+        evaluation_attempt_id=attempt_id,
+        contract=_scientific_contract(),
+        execution_status="succeeded",
+        required_metrics={(1, 1)},
+        metric_results=[{
+            "metric_id": 1,
+            "metric_ver": 1,
+            "value": metric_value,
+            "scope": "aggregate",
+        }],
+        eval_log_hash="e" * 64,
+        parser={
+            "version": OP.PARSER_VERSION,
+            "policy_hash": OP.extraction_policy_hash(POLICY["observation"]),
+            "fields": {
+                "nan_seen": 0,
+                "divergence_flag": 0,
+                "oom_count": 0,
+                "warning_count": 0,
+                "retry_count": 0,
+                "last_loss": 0.2,
+                "loss_trend": "unknown",
+                "wall_clock_sec": None,
+                "parser_json": '{"n_loss_lines": 1}',
+            },
+            "suspect": False,
+        },
+        independent_review_receipt=_legacy_code_review_receipt(
+            decision_id=review_decision_id,
+            build_target_id=build_target_id,
+            runner_call_id=review_runner_call_id),
+    )
+
+
+def _native_review_payload(*, cycle_id="c3", target_id="5",
+                           verdict="fail"):
+    findings = [{
+        "finding_id": "F1",
+        "issue": "missing control",
+        "rationale": "the claim is otherwise underdetermined",
+        "fix_hint": "add the control",
+    }]
+    payload = {
+        "protocol": "native-review-receipt-v1",
+        "review_request_id": "review-request-1",
+        "cycle_id": cycle_id,
+        "stage": "bundle",
+        "target_id": target_id,
+        "purpose": "bundle-main-c3",
+        "review_kind": "bundle_result",
+        "round_no": 1,
+        "configured_rounds": 1,
+        "reviewed_subject_hash": "sha256:" + "3" * 64,
+        "resulting_subject_hash": "sha256:" + "4" * 64,
+        "prior_receipt_hash": None,
+        "runner_call_id": 10,
+        "parent_thread_id": "parent-thread",
+        "parent_turn_id": "parent-turn",
+        "child_call_id": "child-call",
+        "child_thread_id": "child-thread",
+        "child_turn_id": "child-turn",
+        "verdict": verdict,
+        "review_input_item_id": "review-input",
+        "review_input_brief_hash": "sha256:" + "5" * 64,
+        "review_input_candidate_manifest_hash": "sha256:" + "6" * 64,
+        "findings_ref": "/managed/reviews/findings.json",
+        "findings_hash": "sha256:" + hashlib.sha256((
+            json.dumps(
+                findings, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False) + "\n"
+        ).encode("utf-8")).hexdigest(),
+        "dispositions_ref": "/managed/reviews/dispositions.json",
+        "disposition_hash": "sha256:" + "8" * 64,
+        "revised_candidate_manifest_ref":
+            "/managed/reviews/revised-candidate.json",
+        "revised_candidate_manifest_hash": "sha256:" + "9" * 64,
+    }
+    raw = (json.dumps(
+        payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    payload["receipt_hash"] = "sha256:" + hashlib.sha256(raw).hexdigest()
+    return payload
+
+
+def _native_review_event_stream(receipt):
+    findings = [{
+        "finding_id": "F1",
+        "issue": "missing control",
+        "rationale": "the claim is otherwise underdetermined",
+        "fix_hint": "add the control",
+    }]
+    result_text = json.dumps({
+        "protocol": "native-review-result-v1",
+        "review_request_id": receipt["review_request_id"],
+        "verdict": receipt["verdict"],
+        "summary_md": "adversarial review",
+        "findings": findings,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    input_item = {
+        "arguments": {
+            "review_request_id": receipt["review_request_id"]},
+        "error": None,
+        "id": receipt["review_input_item_id"],
+        "result": {
+            "content": [],
+            "structuredContent": {
+                "ok": True,
+                "protocol": "native-review-input-v1",
+                "review_request_id": receipt["review_request_id"],
+                "reviewer_brief_hash":
+                    receipt["review_input_brief_hash"],
+                "candidate_manifest_hash":
+                    receipt["review_input_candidate_manifest_hash"],
+            },
+            "_meta": None,
+        },
+        "server": "meta_research_runtime",
+        "status": "completed",
+        "tool": "read_review_input",
+        "type": "mcpToolCall",
+    }
+    events = [
+        {"id": 0, "result": {"codexHome": "/managed/codex"}},
+        {
+            "id": 1,
+            "result": {
+                "thread": {
+                    "id": receipt["parent_thread_id"],
+                    "parentThreadId": None,
+                },
+            },
+        },
+        {
+            "id": 2,
+            "result": {
+                "turn": {
+                    "id": receipt["parent_turn_id"],
+                    "status": "inProgress",
+                },
+            },
+        },
+        {
+            "method": "rawResponseItem/completed",
+            "params": {
+                "item": {
+                    "arguments": json.dumps({
+                        "task_name": "reviewer",
+                        "fork_turns": "none",
+                        "message": "gAAAA-test-encrypted-review-task",
+                    }, sort_keys=True, separators=(",", ":")),
+                    "call_id": receipt["child_call_id"],
+                    "id": "fc-spawn-1",
+                    "name": "spawn_agent",
+                    "namespace": "collaboration",
+                    "type": "function_call",
+                },
+                "threadId": receipt["parent_thread_id"],
+                "turnId": receipt["parent_turn_id"],
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "agentThreadId": receipt["child_thread_id"],
+                    "id": receipt["child_call_id"],
+                    "kind": "started",
+                    "type": "subAgentActivity",
+                },
+                "threadId": receipt["parent_thread_id"],
+                "turnId": receipt["parent_turn_id"],
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "item": input_item,
+                "threadId": receipt["child_thread_id"],
+                "turnId": receipt["child_turn_id"],
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "msg-child-1",
+                    "phase": "final_answer",
+                    "text": result_text,
+                    "type": "agentMessage",
+                },
+                "threadId": receipt["child_thread_id"],
+                "turnId": receipt["child_turn_id"],
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": receipt["child_thread_id"],
+                "turn": {
+                    "error": None,
+                    "id": receipt["child_turn_id"],
+                    "status": "completed",
+                },
+            },
+        },
+        {
+            "id": "native-review-read:" + receipt["child_thread_id"],
+            "result": {
+                "thread": {
+                    "id": receipt["child_thread_id"],
+                    "parentThreadId": receipt["parent_thread_id"],
+                    "source": {
+                        "subAgent": {
+                            "thread_spawn": {
+                                "parent_thread_id":
+                                    receipt["parent_thread_id"],
+                            },
+                        },
+                    },
+                    "turns": [{
+                        "error": None,
+                        "id": receipt["child_turn_id"],
+                        "items": [
+                            input_item,
+                            {
+                                "id": "msg-child-1",
+                                "phase": "final_answer",
+                                "text": result_text,
+                                "type": "agentMessage",
+                            },
+                        ],
+                        "status": "completed",
+                    }],
+                },
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "msg-parent-1",
+                    "phase": "final_answer",
+                    "text": "done",
+                    "type": "agentMessage",
+                },
+                "threadId": receipt["parent_thread_id"],
+                "turnId": receipt["parent_turn_id"],
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": receipt["parent_thread_id"],
+                "turn": {
+                    "error": None,
+                    "id": receipt["parent_turn_id"],
+                    "status": "completed",
+                },
+            },
+        },
+    ]
+    return b"".join(
+        json.dumps(
+            event, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8") + b"\n"
+        for event in events)
+
+
+def _seed_native_review_guardian_authority(
+        comp, receipt, tmp_path, *, provider_thread_id=None):
+    raw = _native_review_event_stream(receipt)
+    supervisor = ExecutionSupervisor.standalone(
+        tmp_path / "native-review-receipts")
+    result = supervisor.run(
+        [
+            sys.executable, "-c",
+            "import sys;sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))",
+            raw.hex(),
+        ],
+        capture_output=True, timeout_s=None, kind="codex-resident-stage",
+        operation_context={
+            "cycle_id": receipt["cycle_id"],
+            "stage": receipt["stage"],
+            "target_id": receipt["target_id"],
+            "call_tag": receipt["purpose"],
+            "db_owner_kind": "runner_call",
+            "db_owner_id": receipt["runner_call_id"],
+            "db_phase": receipt["stage"],
+            "db_purpose": receipt["purpose"],
+            "reconcile_protocol": "runner-call-v1",
+            "provider": "codex-cli",
+            "provider_model": "gpt-test",
+            "provider_effort": "high",
+            "prompt_sha256": "sha256:" + "a" * 64,
+        })
+    provider_ref = write_provider_invocation_receipt(
+        receipt_dir=result.receipt_path.parent,
+        runner_call_id=receipt["runner_call_id"],
+        cycle_id=receipt["cycle_id"], phase=receipt["stage"],
+        purpose=receipt["purpose"], provider="codex-cli",
+        model="gpt-test", effort="high",
+        prompt_sha256="sha256:" + "a" * 64,
+        usage=CallUsage(tokens_known=False),
+        usage_source="unavailable",
+        execution_receipt_ref=str(result.receipt_path),
+        provider_invocation_id=(
+            provider_thread_id or receipt["parent_thread_id"]),
+        provider_invocation_id_kind="thread_id")
+    invocation = load_provider_invocation_receipt(
+        Path(provider_ref),
+        expected_runner_call_id=receipt["runner_call_id"],
+        expected_cycle_id=receipt["cycle_id"],
+        expected_phase=receipt["stage"],
+        expected_purpose=receipt["purpose"],
+        expected_execution_receipt_ref=str(result.receipt_path))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (3,'orchestrator','provider_invocation_accounted',?)",
+        (json.dumps({
+            "protocol": "provider-accounting-v1",
+            "runner_call_id": receipt["runner_call_id"],
+            "provider_receipt_ref": invocation.receipt_ref,
+            "provider_receipt_sha256": invocation.receipt_sha256,
+            "execution_receipt_ref": invocation.execution_receipt_ref,
+            "execution_receipt_sha256":
+                invocation.execution_receipt_sha256,
+            "execution_operation_id":
+                invocation.execution_operation_id,
+            "runner_terminal_status": "success",
+        }, ensure_ascii=False, sort_keys=True),))
+
+
+def _native_review_request_payload(receipt):
+    return {
+        "protocol": "native-review-request-v1",
+        "review_request_id": receipt["review_request_id"],
+        "cycle_id": receipt["cycle_id"],
+        "stage": receipt["stage"],
+        "target_id": receipt["target_id"],
+        "purpose": receipt["purpose"],
+        "review_kind": receipt["review_kind"],
+        "round_no": receipt["round_no"],
+        "configured_rounds": receipt["configured_rounds"],
+        "reviewed_subject_hash": receipt["reviewed_subject_hash"],
+        "prior_receipt_hash": receipt["prior_receipt_hash"],
+        "runner_call_id": receipt["runner_call_id"],
+        "parent_thread_id": receipt["parent_thread_id"],
+        "parent_turn_id": receipt["parent_turn_id"],
+        "candidate_manifest_ref": "/managed/reviews/candidate.json",
+        "candidate_manifest_hash":
+            receipt["review_input_candidate_manifest_hash"],
+        "reviewer_brief_ref": "/managed/reviews/brief.json",
+        "reviewer_brief_hash": receipt["review_input_brief_hash"],
+    }
+
+
+def _write_native_review_owner_input(receipt, tmp_path):
+    root = tmp_path / "native-review-owner-input"
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "protocol": "native-review-candidate-v1",
+        "artifact_hash": receipt["reviewed_subject_hash"],
+        "files": [],
+        "md": None,
+    }
+    manifest_bytes = (json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    manifest_path = root / "candidate-manifest.json"
+    manifest_path.write_bytes(manifest_bytes)
+    receipt["review_input_candidate_manifest_hash"] = (
+        "sha256:" + hashlib.sha256(manifest_bytes).hexdigest())
+    brief = {
+        "protocol": "native-review-brief-v1",
+        "review_request_id": receipt["review_request_id"],
+        "cycle_id": receipt["cycle_id"],
+        "stage": receipt["stage"],
+        "target_id": receipt["target_id"],
+        "purpose": receipt["purpose"],
+        "review_kind": receipt["review_kind"],
+        "round_no": receipt["round_no"],
+        "configured_rounds": receipt["configured_rounds"],
+        "reviewed_subject_hash": receipt["reviewed_subject_hash"],
+        "candidate_manifest": manifest,
+        "review_focus": RuntimeIngestService._native_review_focus(
+            receipt["review_kind"]),
+        "required_result_protocol": "native-review-result-v1",
+        "required_result_fields": {
+            "protocol": "native-review-result-v1",
+        },
+    }
+    brief_bytes = (json.dumps(
+        brief, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    brief_path = root / "reviewer-brief.json"
+    brief_path.write_bytes(brief_bytes)
+    receipt["review_input_brief_hash"] = (
+        "sha256:" + hashlib.sha256(brief_bytes).hexdigest())
+    revised_manifest = {
+        "protocol": "native-review-candidate-v1",
+        "artifact_hash": receipt["resulting_subject_hash"],
+        "files": [],
+        "md": None,
+    }
+    revised_bytes = (json.dumps(
+        revised_manifest, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    revised_path = root / "revised-candidate-manifest.json"
+    revised_path.write_bytes(revised_bytes)
+    receipt["revised_candidate_manifest_ref"] = str(revised_path)
+    receipt["revised_candidate_manifest_hash"] = (
+        "sha256:" + hashlib.sha256(revised_bytes).hexdigest())
+    receipt["receipt_hash"] = RuntimeIngestService._receipt_hash(receipt)
+    request = _native_review_request_payload(receipt)
+    request["candidate_manifest_ref"] = str(manifest_path)
+    request["reviewer_brief_ref"] = str(brief_path)
+    return request
+
+
+def _seed_stage_context_history(comp, *, artifact_ref="/managed/prior/submission.json"):
+    """Add one prior cycle and one current target without storing artifact bytes in SQLite."""
+    plan_slice = {
+        "target_key": "current-target",
+        "target_kind": "build",
+        "seq": 1,
+        "critical": True,
+        "budget_estimate": 1.0,
+        "baseline_key": "bk1",
+        "variant_key": "v1",
+        "eval_key": "e1",
+        "protocol": {"id": 1, "version": 1},
+        "required_metrics": [{"name": "acc", "version": 1}],
+        "gpu_required": False,
+        "scientific_contract": _scientific_contract(),
+        "config": {},
+    }
+    comp.conn.executescript("""
+      INSERT INTO cycle(id,goal_id,goal_ver,active_question_id,status,route,policy_version,finished_at)
+        VALUES (2,1,1,3,'done','attack','test','2026-07-01T00:00:00Z');
+      INSERT INTO cycle(id,goal_id,goal_ver,active_question_id,status,route,policy_version)
+        VALUES (3,1,1,3,'bundle','attack','test');
+      INSERT INTO idea(id,question_id,cycle_id,content_md,novelty_refs_json,audit_score,audit_json,status)
+        VALUES (2,3,3,'current idea','["paper:current"]',8.0,'{"decision":"pass"}','selected');
+      INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,critical,
+                               baseline_id,variant_id,failure_kind)
+        VALUES (3,2,3,'build',1,'failed',1,1,1,'data_invalid');
+      INSERT INTO baseline(id,slug,canonical_key,status)
+        VALUES (2,'prior-b','prior-bk','legal');
+      INSERT INTO variant(id,baseline_id,variant_key,config_json,result_summary,status)
+        VALUES (2,2,'prior-v','{}','prior valid negative result','legal');
+      INSERT INTO checkpoint(id,variant_id,ckpt_key,path,content_hash,hash_alg,
+                             artifact_type,origin)
+        VALUES (2,1,'prior-ckpt','/managed/prior/model.ckpt','prior-hash','sha256',
+                'checkpoint','none');
+      INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,critical,
+                               baseline_id,variant_id)
+        VALUES (4,2,3,'build',2,'complete',1,2,2);
+      INSERT INTO evaluation(id,variant_id,protocol_id,protocol_ver,eval_key,source,status,
+                             canonical_attempt_id,created_cycle,build_target_id,target_set_hash)
+        VALUES (2,2,1,1,'prior-eval','factory','created',NULL,2,4,'prior-target-set');
+      INSERT INTO evaluation_attempt(id,evaluation_id,cycle_id,build_target_id,attempt_no,
+                                     purpose,status,artifact_ref)
+        VALUES (10,2,2,4,1,'factory','success',
+                'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+      INSERT INTO metric_result(id,evaluation_id,evaluation_attempt_id,metric_id,metric_ver,
+                                value,scope)
+        VALUES (10,2,10,1,1,0.1,'aggregate');
+      UPDATE evaluation SET status='success',canonical_attempt_id=10 WHERE id=2;
+      INSERT INTO card(card_type,ref_id,goal_id,goal_ver,card_md,src_hash,updated_cycle)
+        VALUES ('family',1,1,1,'EEG representation family','family-hash',2);
+      INSERT INTO card(card_type,ref_id,goal_id,goal_ver,card_md,src_hash,updated_cycle)
+        VALUES ('protocol',1,1,1,'LODO method/protocol alias','protocol-hash',2);
+      INSERT INTO card(card_type,ref_id,goal_id,goal_ver,card_md,src_hash,updated_cycle)
+        VALUES ('failure',3,1,1,'prior split failure','failure-hash',2);
+      INSERT INTO runner_call(id,cycle_id,phase,purpose,status)
+        VALUES (10,3,'bundle','bundle-main-c3','success');
+      INSERT INTO runner_call(id,cycle_id,phase,purpose,status)
+        VALUES (201,2,'audit','bundle_code_review','success');
+    """)
+    comp.conn.execute(
+        "INSERT INTO build_target(id,cycle_id,question_id,target_kind,seq,status,critical,"
+        "baseline_id,variant_id,eval_key,plan_ref) VALUES (5,3,3,'build',1,'pending',1,1,1,'e1',?)",
+        (json.dumps(plan_slice, ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "UPDATE build_target SET plan_ref=? WHERE id=4",
+        (json.dumps(plan_slice, ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO build_target_required_metric("
+        "build_target_id,metric_id,metric_ver) VALUES (4,1,1)")
+    comp.conn.execute(
+        "INSERT INTO build_target_required_metric("
+        "build_target_id,metric_id,metric_ver) VALUES (5,1,1)")
+    comp.conn.execute(
+        "INSERT INTO decision(id,cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (4101,2,3,'judge','bundle_code_review',?)",
+        (json.dumps(
+            _legacy_code_review_payload(
+                build_target_id=4, runner_call_id=201),
+            ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO execution_log(id,evaluation_attempt_id,cycle_id,"
+        "log_kind,ref,content_hash,bytes) "
+        "VALUES (10,10,2,'eval','/managed/prior/eval.log',?,128)",
+        ("e" * 64,))
+    comp.conn.execute(
+        "INSERT INTO execution_observation("
+        "id,execution_log_id,source,nan_seen,divergence_flag,oom_count,"
+        "warning_count,retry_count,last_loss,loss_trend,wall_clock_sec,"
+        "parser_json,parser_version,extraction_policy_hash) "
+        "VALUES (10,10,'parser',0,0,0,0,0,0.2,'unknown',NULL,?,?,?)",
+        ('{"n_loss_lines": 1}', OP.PARSER_VERSION,
+         OP.extraction_policy_hash(POLICY["observation"])))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (2,3,'orchestrator','plan_rejected',?)",
+        (json.dumps({"question_id": 3, "reason": "prior protocol mismatch"},
+                    ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (2,3,'agent','runtime_cycle_summary',?)",
+        (json.dumps({
+            "protocol": "runtime-cycle-summary-v1",
+            "goal_id": 1,
+            "goal_ver": 1,
+            "question_id": 3,
+            "conclusion_md": "prior cycle found a valid negative result",
+            "decision": "replan",
+            "next_step_md": "repair the protocol boundary",
+            "evidence_refs": ["mr1"],
+            "revision": 1,
+        }, ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (2,3,'orchestrator','bundle_scientific_contract',?)",
+        (json.dumps(
+            _science_payload(
+                build_target_id=4, evaluation_id=2, attempt_id=10),
+            ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (2,3,'agent','runtime_stage_submission',?)",
+        (json.dumps({
+            "protocol": "runtime-stage-submission-index-v1",
+            "stage": "reasoning",
+            "target_id": None,
+            "purpose": "reasoning-main-c2",
+            "revision": 1,
+            "review_decision_id": None,
+            "artifact_hash": "sha256:" + "a" * 64,
+            "submission_ref": artifact_ref,
+            "submission_hash": "sha256:" + "b" * 64,
+            "file_names": ["answer.json", "selection.json", "tree_ops.json"],
+        }, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+    return plan_slice
+
+
+def _seed_current_scientific_result(comp):
+    comp.conn.executescript("""
+      INSERT INTO protocol(id,version,name,scope_spec_json)
+        VALUES (2,1,'current-proto','{}');
+      INSERT INTO protocol_metric(protocol_id,protocol_ver,metric_id,metric_ver)
+        VALUES (2,1,1,1);
+      INSERT INTO evaluation(id,variant_id,protocol_id,protocol_ver,eval_key,source,status,
+                             canonical_attempt_id,created_cycle,build_target_id,target_set_hash)
+        VALUES (3,1,2,1,'current-eval','factory','created',NULL,3,5,'current-target-set');
+      INSERT INTO evaluation_attempt(id,evaluation_id,cycle_id,build_target_id,attempt_no,
+                                     purpose,status,artifact_ref)
+        VALUES (11,3,3,5,1,'factory','success',
+                'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+      INSERT INTO metric_result(id,evaluation_id,evaluation_attempt_id,metric_id,metric_ver,
+                                value,scope)
+        VALUES (11,3,11,1,1,0.1,'aggregate');
+      UPDATE evaluation SET status='success',canonical_attempt_id=11 WHERE id=3;
+      UPDATE build_target SET evaluation_id=3,status='complete' WHERE id=5;
+      INSERT INTO runner_call(id,cycle_id,phase,purpose,status)
+        VALUES (202,3,'audit','bundle_code_review','success');
+    """)
+    comp.conn.execute(
+        "INSERT INTO decision(id,cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (9001,3,3,'judge','bundle_code_review',?)",
+        (json.dumps(
+            _legacy_code_review_payload(
+                build_target_id=5, runner_call_id=202),
+            ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO execution_log(id,evaluation_attempt_id,cycle_id,"
+        "log_kind,ref,content_hash,bytes) "
+        "VALUES (11,11,3,'eval','/managed/current/eval.log',?,128)",
+        ("e" * 64,))
+    comp.conn.execute(
+        "INSERT INTO execution_observation("
+        "id,execution_log_id,source,nan_seen,divergence_flag,oom_count,"
+        "warning_count,retry_count,last_loss,loss_trend,wall_clock_sec,"
+        "parser_json,parser_version,extraction_policy_hash) "
+        "VALUES (11,11,'parser',0,0,0,0,0,0.2,'unknown',NULL,?,?,?)",
+        ('{"n_loss_lines": 1}', OP.PARSER_VERSION,
+         OP.extraction_policy_hash(POLICY["observation"])))
+    comp.conn.commit()
 
 
 _REQUEST_ITEMS = [
@@ -94,6 +774,22 @@ def test_render_byte_identical(comp, stage):
     assert p1.pack_hash == p2.pack_hash
     assert _bytes(p1) == _bytes(p2)
     assert comp.manifest(p1) == comp.manifest(p2)   # 来源清单亦确定
+
+
+def test_same_compiler_serializes_concurrent_render_snapshots(comp):
+    start = threading.Barrier(3)
+
+    def render():
+        start.wait()
+        return comp.render(cycle_id="c1", stage="reasoning")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(render) for _ in range(2)]
+        start.wait()
+        packs = [future.result() for future in futures]
+
+    assert packs[0].pack_hash == packs[1].pack_hash
+    assert _bytes(packs[0]) == _bytes(packs[1])
 
 
 def test_consumed_note_is_present_in_same_cycle_reasoning_context(comp):
@@ -186,9 +882,15 @@ def test_consumed_question_directive_is_rendered_without_creating_question(comp)
     assert f"db:decision:{consumed_decision_id}" in pack.sources
 
 
-def test_bundle_requires_target_id(comp):
-    with pytest.raises(ValueError, match="target_id 不可为 None"):
-        comp.render(cycle_id="c1", stage="bundle")
+def test_targetless_bundle_pack_is_compact_scheduler_projection(comp):
+    pack = comp.render(cycle_id="c1", stage="bundle")
+
+    assert pack.target_id is None
+    assert "Bundle Scheduler DAG overview" in pack.anchor_md
+    assert "execution_manifest" not in pack.anchor_md
+    assert "live_logs" not in pack.anchor_md
+    assert "tail_text" not in pack.anchor_md
+    assert "db:bundle_graph:c1" in pack.sources
 
 
 def test_idea_audit_source_contains_only_current_question(comp):
@@ -279,6 +981,523 @@ def test_open_set_scoped_to_cycle_goal_version(comp):
 def test_different_stage_different_pack(comp):
     """不同 stage → 不同 pack（确定性不等于恒等）。"""
     assert comp.render(cycle_id="c1", stage="idea").pack_hash != comp.render(cycle_id="c1", stage="reasoning").pack_hash
+
+
+def test_stage_contextpacks_share_versioned_base_and_recall_prior_continuity(comp):
+    _seed_stage_context_history(comp)
+
+    packs = {
+        stage: comp.render(
+            cycle_id="c3", stage=stage,
+            target_id="5" if stage == "bundle" else None)
+        for stage in ("idea", "plan", "bundle", "reasoning")
+    }
+
+    assert {pack.version for pack in packs.values()} == {2}
+    assert len({pack.base_hash for pack in packs.values()}) == 1
+    assert all(len(pack.base_hash) == 64 for pack in packs.values())
+    assert len({pack.projection_hash for pack in packs.values()}) == 4
+    assert all(len(pack.projection_hash) == 64 for pack in packs.values())
+    for pack in packs.values():
+        assert "历史连续性索引（有界；大工件仅路径）" in pack.anchor_md
+        assert "prior protocol mismatch" in pack.anchor_md
+        assert "prior valid negative result" in pack.anchor_md
+        assert '"scientific_outcome": "refuted"' in pack.anchor_md
+        assert "prior cycle found a valid negative result" in pack.anchor_md
+        assert "/managed/prior/submission.json" in pack.anchor_md
+        assert {item["card_type"] for item in pack.card_refs}.issuperset(
+            {"baseline", "family", "protocol", "failure"})
+        assert any(
+            item["ref"] == "/managed/prior/submission.json"
+            and item["sha256"] == "sha256:" + "b" * 64
+            for item in pack.artifact_refs)
+        manifest = comp.manifest(pack)
+        assert manifest["version"] == 2
+        assert manifest["base_hash"] == pack.base_hash
+        assert manifest["projection_hash"] == pack.projection_hash
+
+
+def test_prior_reasoning_survives_completed_cycle_question_lease_release(comp):
+    _seed_stage_context_history(comp)
+    comp.conn.execute(
+        "UPDATE cycle SET active_question_id=NULL, next_question_id=3 "
+        "WHERE id=2")
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c3", stage="idea")
+
+    assert "prior cycle found a valid negative result" in pack.anchor_md
+
+
+def test_current_cycle_card_refresh_changes_projection_but_not_stable_base(comp):
+    _seed_stage_context_history(comp)
+    idea = comp.render(cycle_id="c3", stage="idea")
+
+    comp.conn.execute(
+        "UPDATE card SET card_md='current-cycle refreshed family',"
+        "src_hash='new-family-hash',updated_cycle=3 "
+        "WHERE card_type='family' AND ref_id=1")
+    comp.conn.commit()
+    plan = comp.render(cycle_id="c3", stage="plan")
+
+    assert plan.base_hash == idea.base_hash
+    assert plan.projection_hash != idea.projection_hash
+    assert "current-cycle refreshed family" in plan.anchor_md
+
+
+def test_context_rejects_conflicting_prior_reasoning_revision(comp):
+    _seed_stage_context_history(comp)
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (2,3,'agent','runtime_cycle_summary',?)",
+        (json.dumps({
+            "protocol": "runtime-cycle-summary-v1",
+            "goal_id": 1,
+            "goal_ver": 1,
+            "question_id": 3,
+            "conclusion_md": "conflicting replacement at the same revision",
+            "decision": "continue",
+            "next_step_md": "different next step",
+            "evidence_refs": ["mr-conflict"],
+            "revision": 1,
+        }, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="cycle summary.*revision"):
+        comp.render(cycle_id="c3", stage="idea")
+
+
+def test_idea_projection_keeps_bounded_novelty_and_audit_history(comp):
+    _seed_stage_context_history(comp)
+
+    pack = comp.render(cycle_id="c3", stage="idea")
+
+    assert "该问题已试 idea 及结局（防重复造轮）" in pack.anchor_md
+    assert "paper:current" in pack.anchor_md
+    assert "audit_score=8.0" in pack.anchor_md
+    assert "db:idea:2" in pack.sources
+
+
+def test_idea_projection_summarizes_object_novelty_receipts(comp):
+    _seed_stage_context_history(comp)
+    novelty_ref = {
+        "candidate_id": "c1",
+        "query": "random subspace EEG benchmark",
+        "provider": "literature_federated_v1",
+        "snapshot_hash": "sha256:" + "1" * 64,
+        "snapshot_ref":
+            "state/novelty/snapshots/sha256/example.json",
+        "raw_content_hash": "sha256:" + "2" * 64,
+        "result_content_hashes": [
+            "sha256:" + "3" * 64,
+            "sha256:" + "4" * 64,
+        ],
+        "ranking": [
+            "sha256:" + "3" * 64,
+            "sha256:" + "4" * 64,
+        ],
+        "policy_hash": "sha256:" + "5" * 64,
+    }
+    comp.conn.execute(
+        "UPDATE idea SET novelty_refs_json=? WHERE id=2",
+        (json.dumps(
+            [novelty_ref], ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c3", stage="idea")
+
+    assert '"candidate_id":"c1"' in pack.anchor_md
+    assert '"provider":"literature_federated_v1"' in pack.anchor_md
+    assert '"snapshot_ref":"state/novelty/snapshots/sha256/example.json"' in (
+        pack.anchor_md)
+    assert '"result_count":2' in pack.anchor_md
+    assert "sha256:" + "3" * 64 not in pack.anchor_md
+
+
+def test_idea_history_has_total_bound_not_only_per_field_bound(comp):
+    _seed_stage_context_history(comp)
+    for idea_id in range(100, 300):
+        comp.conn.execute(
+            "INSERT INTO idea(id,question_id,cycle_id,content_md,"
+            "novelty_refs_json,audit_score,audit_json,status) "
+            "VALUES (?,3,2,?,'[]',1.0,'{}','candidate')",
+            (idea_id, "IDEA-BULK-" + "x" * 4096))
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c3", stage="idea")
+
+    assert len(pack.anchor_md.encode("utf-8")) < 300_000
+    assert "idea history truncated" in pack.anchor_md
+
+
+def test_plan_review_feedback_keeps_base_metadata_and_rehashes_projection(comp):
+    pack = comp.render(cycle_id="c1", stage="plan")
+
+    amended = SqliteCompiler.amend_plan_review_feedback(
+        pack,
+        plan={"targets": []},
+        review={"decision": "fail", "issues": ["missing control"]},
+        decision_id=77,
+    )
+
+    assert amended.version == 2
+    assert amended.base_hash == pack.base_hash
+    assert amended.card_refs == pack.card_refs
+    assert amended.artifact_refs == pack.artifact_refs
+    assert amended.projection_hash != pack.projection_hash
+    assert len(amended.projection_hash) == 64
+
+
+def test_bundle_target_projection_exposes_attempt_and_log_refs_without_file_bytes(
+        comp, tmp_path):
+    _seed_stage_context_history(comp)
+    raw_log = tmp_path / "raw-eval.log"
+    raw_log.write_text(
+        "raw log contents must not be opened by compiler\n" * 20000,
+        encoding="utf-8")
+    comp.conn.execute(
+        "INSERT INTO evaluation_attempt(id,evaluation_id,cycle_id,build_target_id,attempt_no,"
+        "purpose,status,failure_kind,retry_of,artifact_ref,transcript_ref) "
+        "VALUES (2,1,3,5,2,'retry','failed','runtime',1,?,?)",
+        ("/managed/current/eval.log", "/managed/current/codex.jsonl"))
+    comp.conn.execute(
+        "INSERT INTO execution_log(id,evaluation_attempt_id,cycle_id,log_kind,ref,content_hash,bytes) "
+        "VALUES (2,2,3,'eval',?,'log-hash',9000000)",
+        (str(raw_log),))
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c3", stage="bundle", target_id="5")
+
+    assert "Bundle target delta（只含本 target）" in pack.anchor_md
+    assert '"attempt_id": "ea2"' in pack.anchor_md
+    assert '"failure_kind": "runtime"' in pack.anchor_md
+    assert "/managed/current/eval.log" in pack.anchor_md
+    assert str(raw_log) in pack.anchor_md
+    assert "9000000" in pack.anchor_md
+    assert "raw log contents must not be opened by compiler" not in pack.anchor_md
+    assert any(item["ref"] == str(raw_log)
+               for item in pack.artifact_refs)
+    assert "/managed/prior/model.ckpt" in pack.anchor_md
+
+
+def test_bundle_projection_rejects_target_from_another_cycle(comp):
+    _seed_stage_context_history(comp)
+
+    with pytest.raises(ValueError, match="不属于当前 cycle"):
+        comp.render(cycle_id="c3", stage="bundle", target_id="3")
+
+
+def test_bundle_projection_bounds_corrupt_long_artifact_refs(comp):
+    _seed_stage_context_history(comp)
+    comp.conn.execute(
+        "INSERT INTO evaluation_attempt(id,evaluation_id,cycle_id,build_target_id,attempt_no,"
+        "purpose,status,failure_kind,retry_of,artifact_ref,transcript_ref) "
+        "VALUES (2,1,3,5,2,'retry','failed','runtime',1,?,?)",
+        ("R" * 10000, "T" * 10000))
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c3", stage="bundle", target_id="5")
+
+    assert "R" * 5000 not in pack.anchor_md
+    assert "T" * 5000 not in pack.anchor_md
+    assert '"ref_truncated": true' in pack.anchor_md
+
+
+def test_reasoning_projection_summarizes_current_classification_and_review_refs(
+        comp, tmp_path):
+    _seed_stage_context_history(comp)
+    _seed_current_scientific_result(comp)
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'orchestrator','bundle_scientific_contract',?)",
+        (json.dumps(
+            _science_payload(
+                build_target_id=5, evaluation_id=3, attempt_id=11,
+                review_decision_id=9001, review_runner_call_id=202),
+            ensure_ascii=False, sort_keys=True),))
+    receipt = _native_review_payload()
+    request = _write_native_review_owner_input(receipt, tmp_path)
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (3,'agent','runtime_review_request',?)",
+        (json.dumps(request, ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'agent','runtime_review',?)",
+        (json.dumps(receipt, ensure_ascii=False, sort_keys=True),))
+    _seed_native_review_guardian_authority(comp, receipt, tmp_path)
+    comp.conn.commit()
+
+    pack = comp.render(cycle_id="c3", stage="reasoning")
+
+    assert "本轮 Bundle 科学状态与独立 review 索引" in pack.anchor_md
+    assert '"scientific_outcome": "refuted"' in pack.anchor_md
+    assert '"pool_eligibility": "eligible"' in pack.anchor_md
+    assert '"review_kind": "bundle_result"' in pack.anchor_md
+    assert "/managed/reviews/findings.json" in pack.anchor_md
+    assert any(item["ref"] == "/managed/reviews/findings.json"
+               for item in pack.artifact_refs)
+
+
+def test_native_review_verifier_keeps_repair_chains_separate_and_selects_latest(
+        comp, tmp_path):
+    _seed_stage_context_history(comp)
+    first = _native_review_payload(verdict="fail")
+    first_request = _write_native_review_owner_input(
+        first, tmp_path / "chain-1")
+    _seed_native_review_guardian_authority(
+        comp, first, tmp_path / "chain-1")
+
+    second = _native_review_payload(verdict="pass")
+    second.update({
+        "review_request_id": "review-request-2",
+        "runner_call_id": 11,
+        "parent_thread_id": "parent-thread-2",
+        "parent_turn_id": "parent-turn-2",
+        "child_call_id": "child-call-2",
+        "child_thread_id": "child-thread-2",
+        "child_turn_id": "child-turn-2",
+        "review_input_item_id": "review-input-2",
+    })
+    second_request = _write_native_review_owner_input(
+        second, tmp_path / "chain-2")
+    comp.conn.execute(
+        "INSERT INTO runner_call(id,cycle_id,phase,purpose,status) "
+        "VALUES (11,3,'bundle','bundle-main-c3','success')")
+    _seed_native_review_guardian_authority(
+        comp, second, tmp_path / "chain-2")
+
+    decision_ids = []
+    for request, receipt in (
+            (first_request, first), (second_request, second)):
+        comp.conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (3,'agent','runtime_review_request',?)",
+            (json.dumps(request, ensure_ascii=False, sort_keys=True),))
+        decision_ids.append(comp.conn.execute(
+            "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+            "VALUES (3,3,'agent','runtime_review',?)",
+            (json.dumps(
+                receipt, ensure_ascii=False, sort_keys=True),)).lastrowid)
+    comp.conn.commit()
+
+    selected = select_authoritative_native_review(
+        comp.conn, cycle_id=3, stage="bundle", target_id="5",
+        review_kind="bundle_result",
+        resulting_subject_hash=second["resulting_subject_hash"])
+    assert selected is not None and selected[0] == decision_ids[-1]
+    assert select_authoritative_native_review(
+        comp.conn, cycle_id=3, stage="bundle", target_id="5",
+        review_kind="bundle_result",
+        resulting_subject_hash=first["resulting_subject_hash"],
+        decision_id=decision_ids[0]) is None
+
+
+def test_native_review_verifier_skips_failed_runner_chain_after_bundle_retry(
+        comp, tmp_path):
+    _seed_stage_context_history(comp)
+    stale = _native_review_payload(verdict="fail")
+    stale_request = _write_native_review_owner_input(
+        stale, tmp_path / "failed-chain")
+    comp.conn.execute(
+        "UPDATE runner_call SET status='failed',failure_kind='runtime' "
+        "WHERE id=10")
+
+    fresh = _native_review_payload(verdict="pass")
+    fresh.update({
+        "review_request_id": "review-request-fresh",
+        "runner_call_id": 11,
+        "parent_thread_id": "parent-thread-fresh",
+        "parent_turn_id": "parent-turn-fresh",
+        "child_call_id": "child-call-fresh",
+        "child_thread_id": "child-thread-fresh",
+        "child_turn_id": "child-turn-fresh",
+        "review_input_item_id": "review-input-fresh",
+    })
+    fresh_request = _write_native_review_owner_input(
+        fresh, tmp_path / "successful-chain")
+    comp.conn.execute(
+        "INSERT INTO runner_call(id,cycle_id,phase,purpose,status) "
+        "VALUES (11,3,'bundle','bundle-main-c3','success')")
+    _seed_native_review_guardian_authority(
+        comp, fresh, tmp_path / "successful-chain")
+
+    decision_ids = []
+    for request, receipt in (
+            (stale_request, stale), (fresh_request, fresh)):
+        comp.conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (3,'agent','runtime_review_request',?)",
+            (json.dumps(request, ensure_ascii=False, sort_keys=True),))
+        decision_ids.append(comp.conn.execute(
+            "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+            "VALUES (3,3,'agent','runtime_review',?)",
+            (json.dumps(
+                receipt, ensure_ascii=False, sort_keys=True),)).lastrowid)
+    comp.conn.commit()
+
+    reviews = validate_native_reviews(comp.conn, cycle_id=3)
+
+    assert [decision_id for decision_id, _payload in reviews] == [
+        decision_ids[-1]]
+
+
+def test_reasoning_rejects_tampered_scientific_decision(comp):
+    _seed_stage_context_history(comp)
+    _seed_current_scientific_result(comp)
+    payload = _science_payload(
+        build_target_id=5, evaluation_id=3, attempt_id=11,
+        review_decision_id=9001, review_runner_call_id=202)
+    payload["scientific_outcome"] = "supported"
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'orchestrator','bundle_scientific_contract',?)",
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="scientific decision"):
+        comp.render(cycle_id="c3", stage="reasoning")
+
+
+def test_reasoning_rejects_self_consistent_science_facts_not_in_database(comp):
+    _seed_stage_context_history(comp)
+    _seed_current_scientific_result(comp)
+    payload = _science_payload(
+        build_target_id=5, evaluation_id=3, attempt_id=11,
+        metric_value=0.95,
+        review_decision_id=9001, review_runner_call_id=202)
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'orchestrator','bundle_scientific_contract',?)",
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="scientific decision.*DB"):
+        comp.render(cycle_id="c3", stage="reasoning")
+
+
+def test_reasoning_rejects_duplicate_scientific_scope(comp):
+    _seed_stage_context_history(comp)
+    _seed_current_scientific_result(comp)
+    payload = json.dumps(
+        _science_payload(
+            build_target_id=5, evaluation_id=3, attempt_id=11,
+            review_decision_id=9001, review_runner_call_id=202),
+        ensure_ascii=False, sort_keys=True)
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'orchestrator','bundle_scientific_contract',?)",
+        (payload,))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'orchestrator','bundle_scientific_contract',?)",
+        (payload,))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="重复"):
+        comp.render(cycle_id="c3", stage="reasoning")
+
+
+def test_reasoning_rejects_forged_native_review_receipt(comp):
+    _seed_stage_context_history(comp)
+    payload = _native_review_payload()
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'agent','runtime_review',?)",
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="native review"):
+        comp.render(cycle_id="c3", stage="reasoning")
+
+
+def test_reasoning_rejects_self_consistent_native_review_without_guardian_proof(
+        comp, tmp_path):
+    _seed_stage_context_history(comp)
+    payload = _native_review_payload()
+    request = _write_native_review_owner_input(payload, tmp_path)
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (3,'agent','runtime_review_request',?)",
+        (json.dumps(request, ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'agent','runtime_review',?)",
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="guardian|durable|provider"):
+        comp.render(cycle_id="c3", stage="reasoning")
+
+
+def test_reasoning_rejects_native_review_subject_rewritten_after_child_read(
+        comp, tmp_path):
+    _seed_stage_context_history(comp)
+    receipt = _native_review_payload()
+    request = _write_native_review_owner_input(receipt, tmp_path)
+    _seed_native_review_guardian_authority(comp, receipt, tmp_path)
+
+    rewritten_subject = "sha256:" + "f" * 64
+    request["reviewed_subject_hash"] = rewritten_subject
+    receipt["reviewed_subject_hash"] = rewritten_subject
+    receipt["receipt_hash"] = RuntimeIngestService._receipt_hash(receipt)
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (3,'agent','runtime_review_request',?)",
+        (json.dumps(request, ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'agent','runtime_review',?)",
+        (json.dumps(receipt, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="owner input|reviewer brief|subject"):
+        comp.render(cycle_id="c3", stage="reasoning")
+
+
+def test_reasoning_rejects_native_review_resulting_subject_rewritten_after_review(
+        comp, tmp_path):
+    _seed_stage_context_history(comp)
+    receipt = _native_review_payload()
+    request = _write_native_review_owner_input(receipt, tmp_path)
+    _seed_native_review_guardian_authority(comp, receipt, tmp_path)
+
+    receipt["resulting_subject_hash"] = "sha256:" + "d" * 64
+    receipt["receipt_hash"] = RuntimeIngestService._receipt_hash(receipt)
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (3,'agent','runtime_review_request',?)",
+        (json.dumps(request, ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'agent','runtime_review',?)",
+        (json.dumps(receipt, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="revised|resulting subject"):
+        comp.render(cycle_id="c3", stage="reasoning")
+
+
+def test_reasoning_rejects_native_review_from_wrong_provider_parent_session(
+        comp, tmp_path):
+    _seed_stage_context_history(comp)
+    receipt = _native_review_payload()
+    request = _write_native_review_owner_input(receipt, tmp_path)
+    _seed_native_review_guardian_authority(
+        comp, receipt, tmp_path,
+        provider_thread_id="different-provider-parent")
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+        "VALUES (3,'agent','runtime_review_request',?)",
+        (json.dumps(request, ensure_ascii=False, sort_keys=True),))
+    comp.conn.execute(
+        "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+        "VALUES (3,3,'agent','runtime_review',?)",
+        (json.dumps(receipt, ensure_ascii=False, sort_keys=True),))
+    comp.conn.commit()
+
+    with pytest.raises(ValueError, match="provider.*parent|session"):
+        comp.render(cycle_id="c3", stage="reasoning")
 
 
 def test_render_missing_cycle(comp):

@@ -27,8 +27,11 @@ plan 把选中的 idea 变成最小可证伪实验与最小可执行计划。对
 1. 前向逻辑或算法结构是否变化？是 → 新 `baseline`，用 `target_kind="build"`，并由你给稳定、语义化的
    `claim.canonical_key` 与 `claim.slug`。禁止 `auto-cN-tN`、轮次号或目录任务充当研究身份。
 2. 结构不变时，是否必须重新训练或产生新的可评对象？是 → 既有 legal baseline 下的新 `variant`，用
-   `target_kind="exec"`，声明 `baseline_ref + variant_key + config_json`。训练数据、切分、seed、超参和训练流程
-   属 variant 配置，不属于 baseline，也不得塞进 evaluation 身份。
+   `target_kind="exec"`，声明 `baseline_ref + variant_key + config_json`。训练数据、切分、超参和训练流程
+   属 variant 配置，不属于 baseline，也不得塞进 evaluation 身份。随机 seed 是执行 replicate 的事实：
+   单 seed 的 build/exec target 用 `replicate={"seed":...}` 冻结，并由编排器写入 durable `run.seed`；
+   不得把任何层级的 `seed` 塞进 `variant_key` 或 `config_json`。旧 Plan 省略 `replicate` 仅按
+   `seed=null` 兼容。
 3. 结构与训练产物均不变，只改变评估数据、协议、指标或重测吗？是 → `target_kind="eval"`：新协议格子用
    `create_evaluation`；同一格补指标/复现/重试用 `append_attempt`。evaluation 是对照元，不能登记为 baseline。
 
@@ -97,6 +100,14 @@ gpu_required`。编排器会用规范 selector 对 DB 真相重算；自由文�
   或目录齐备当研究指标。
 - `readout_rules[]` 逐指标给可回答问题的判读规则。编排器不得从 higher/lower 自动生成规则。
 - `build_target_required_metric[]` 必须逐 target 精确声明；不要把所有指标机械铺到所有 target。
+- 每个新 target 必须给 `scientific_contract`。`validity_gates` 必须各一次包含
+  `required_metrics_present`、`parser_not_suspect` 和
+  `independent_code_plan_data_boundary_review_receipt_present`。它们分别绑定 required 指标覆盖、
+  parser 健康，以及代码写完后由独立子智能体对代码↔Plan 一致性和数据边界所做审查的耐久回执。第三项只表示
+  独立审查确实发生并绑定了当前代码，不得表述为运行时已经证明“绝无泄漏”。三者都是 Bundle 的硬有效性门，
+  任一失败都禁止正式发布且直接交 Reasoning，不得用高分指标覆盖。`outcome_rules` 只能引用该 target 已声明的 required
+  metric/version；规则只把有效实验分类为 `supported | refuted | inconclusive`。零条规则或多规则分类冲突
+  均得到 `inconclusive`，仍是可入池、可复用的有效证据；负结果不得当作工程失败。
 - 每个 target 明确给连续 `seq`、`critical`、`budget_estimate`、`gpu_required` 与 `spec_md`，总预算不得超过 B(t)。
 - 计算资源锚的 `gpu_target_contract.policy` 是机械合同：`required` 时每个新 target
   以及 evaluation 复用证据都必须显式 `gpu_required=true`；`forbidden` 时必须全为
@@ -142,9 +153,31 @@ Plan 的职责是冻结研究语义，不是验证编排器、schema 或 Python 
       "critical":true,
       "budget_estimate":5.0,
       "gpu_required":true,
+      "replicate":{"seed":7},
       "spec_md":"实现随机子空间前向结构并按锁定 LODO 协议训练、评估；产逐折 checkpoint、fold 指标与 aggregate",
       "need_ids":["n1"],
-      "claim":{"canonical_key":"random-subspace-eeg-encoder","slug":"random-subspace-eeg"}
+      "claim":{"canonical_key":"random-subspace-eeg-encoder","slug":"random-subspace-eeg"},
+      "scientific_contract":{
+        "validity_gates":[
+          {"gate_id":"required","kind":"required_metrics_present"},
+          {"gate_id":"parser_health","kind":"parser_not_suspect"},
+          {
+            "gate_id":"independent_review",
+            "kind":"independent_code_plan_data_boundary_review_receipt_present"
+          }
+        ],
+        "outcome_rules":[
+          {
+            "rule_id":"primary_macro_f1",
+            "metric_id":"macro_f1",
+            "metric_ver":1,
+            "operator":"ge",
+            "threshold":0.7,
+            "if_true":"supported",
+            "if_false":"refuted"
+          }
+        ]
+      }
     }
   ],
   "protocol": {
@@ -182,12 +215,12 @@ baseline 或诚实失败。
 
 ## 主 turn 内的独立 plan reviewer
 
-Plan 主智能体启动恰好一个无历史、无 cwd、无 shell 的干净子智能体。reviewer 只看 selected idea、
-plan 草稿与主智能体显式交给它的固定约束，逐项核 need 覆盖、三问对象身份、协议不可变边界、
+Plan 主智能体按当前运行配置完成精确 N 轮评审；每轮新启一个无历史、无 cwd、无 shell 的干净子智能体。reviewer 只看 selected idea、
+plan 草稿与主智能体显式交给它的固定约束，逐项核 need 覆盖、三问对象身份、replicate/seed 归属、协议不可变边界、
 required metrics、readout、预算/GPU、依赖序与复用 selector 输入是否齐全。它不能读取主智能体的
-隐藏推理或宿主状态，也不能提交产物。review 强度为 1：只作一次独立判断；fail 意见回到同一
-Plan 主上下文定向修订，不再启动 reviewer或另一个顶层 Plan Codex。主智能体用
-`record_review(review_kind=plan)` 记录结果；编排器不得替模型补研究语义。
+隐藏推理或宿主状态，也不能提交产物。每轮意见都回到同一 Plan 主上下文定向修订，并用
+`record_review(review_kind=plan)` 记录处置与修订结果；第 N 轮修订后直接提交，不追加隐式复审，
+也不启动另一个顶层 Plan Codex。编排器不得替模型补研究语义。
 
 reviewer 也必须遵守上述可执行性边界：不得要求 `create_evaluation` 引用同一 plan 才创建的
 baseline/variant。多个新结构可以先以独立 build 身份和各自出厂 required metrics 完成本轮，再在这些
@@ -212,8 +245,8 @@ baseline/variant。多个新结构可以先以独立 build 身份和各自出厂
 - `issues` **无论 pass/fail 都是必填数组**；pass 时可为空，fail 时至少一项。
 - 每个 issue 必须含 `item` 与 `why`，可选 `fix_hint`；不得只把问题写进 envelope 的 `md` 或
   `notes_md`。结构化 `issues` 才是编排器可回放的评审结论。
-- review 强度为 1 时，fail 会触发同一 cycle 内一次定向修订，因此只报告会破坏可回答性、身份、泄漏边界、
-  指标闭包、预算或依赖正确性的实质问题，不把措辞偏好冒充 blocker；修订稿不会再调用第二个 reviewer。
+- 每轮只报告会破坏可回答性、身份、泄漏边界、指标闭包、预算或依赖正确性的实质问题，不把措辞偏好
+  冒充 blocker；主智能体完成配置的 N 轮后不再启动额外 reviewer。
 
 ## 门禁与写入
 

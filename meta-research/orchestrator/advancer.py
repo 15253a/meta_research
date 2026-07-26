@@ -19,11 +19,20 @@ SqliteCompiler，把一轮 cycle 按阶段推进到 done。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .cost_ledger import BudgetExhausted, CostAccountingFailed
 from .ids import cnum as _cnum
 from .interfaces import PlanOutcome, Route, Selection, Stage, StageBlockedOnResources
+from .phase_commit import check_or_record
+
+
+def _reasoning_artifact_hash(files: Dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        files, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
 
 # reasoning 产物提供者：(cycle, context_pack) -> {"tree_ops.json":{...}, "selection.json":{...}, "answer.json"?:{...}}
 # 生产路径 = 包 CodexRunner + schema 校验 + 重试（对齐 M0 driver._run_reasoning_with_retry，后续检查点接）；
@@ -395,7 +404,7 @@ class SqliteAdvancer:
 
         pack = self.compiler.render(cycle_id=cyc.cycle_id, stage="reasoning")
         files = self._reasoning(cyc, pack)   # 长操作（render / provider=Codex）在事务外（§6.13 铁律）
-        with self.state.atomic():
+        with self.state.atomic() as conn:
             # 二次核终态**优先于产物校验**（TOCTOU 安全，对齐 gate_close_question 写锁内重跑）：并发/重入若已把本轮推进到
             # 终态则跳过、不重复写，也不因本次冗余/畸形产物误报 raise。WriteDaemon 单写连接 + BEGIN IMMEDIATE 保证 re-read 见已提交推进。
             fresh = self.state.cycle(cyc.cycle_id)
@@ -403,11 +412,35 @@ class SqliteAdvancer:
                 return
             if fresh.route not in ("bootstrap", "decompose", "goal_amend"):   # 防御：route 本不可变
                 raise RuntimeError(f"reasoning-only 轮 route 在途被改？{fresh.route!r}")
-            ops = self._validated_ops(files, fresh.route)
+            decompose_guard_reason = (
+                self.state.decompose_guard_reason(fresh.question_id)
+                if fresh.route == "decompose" and fresh.question_id is not None
+                else None)
+            ops = self._validated_ops(
+                files, fresh.route,
+                decompose_guard_fallback=decompose_guard_reason is not None)
             if "selection.json" not in files:
                 raise ValueError("reasoning 产物缺 selection.json（reasoning 必产；生产路径由 provider 上游 schema 校验保证）")
             sel = files["selection.json"]
-            self.state.apply_tree_ops(cyc.cycle_id, ops)
+            if decompose_guard_reason is None:
+                self.state.apply_tree_ops(cyc.cycle_id, ops)
+            else:
+                # The parent was legally selected under an older/stale
+                # scheduling projection but no legal child can fit now.  An
+                # empty tree batch plus a different valid selection is the
+                # only non-destructive recovery: release the active lease,
+                # retain every question/evidence row, and let Reasoning choose
+                # another frontier item in this same core transaction.
+                blocked_question = fresh.question_id
+                self.state.release_question(blocked_question)
+                self.state.daemon.conn.execute(
+                    "INSERT INTO decision(cycle_id,question_id,actor,type,payload_json) "
+                    "VALUES (?,?,'orchestrator','decompose_guard_fallback',?)",
+                    (_cnum(cyc.cycle_id), int(blocked_question[1:]), json.dumps({
+                        "question_id": blocked_question,
+                        "guard": decompose_guard_reason,
+                        "effect": "released_without_visit_and_reselected",
+                    }, ensure_ascii=False, sort_keys=True)))
             # reasoning-only 轮（bootstrap/decompose）**不** persist-then-consume（不同 attack 轮）：非法
             # selection 抛 ValueError → 整 atomic 回滚（create_root 等一并复原，投影不漂移）→ 重启重调
             # provider（非确定，可复原）——这是本路径的既定恢复契约（test_advance_*_rollback 锁）。graceful
@@ -416,10 +449,19 @@ class SqliteAdvancer:
                 next_question_id=sel.get("next_question_id"),
                 next_intent=sel["next_intent"],
                 scores=sel.get("scores", [])))
+            if check_or_record(
+                    conn,
+                    cycle_id=cyc.cycle_id, stage="reasoning",
+                    target_id=None,
+                    artifact_hash=_reasoning_artifact_hash(files)) == "conflict":
+                raise RuntimeError(
+                    f"cycle {cyc.cycle_id} reasoning phase_commit 冲突")
             self.state.mark_cycle_done(cyc.cycle_id)
 
     @staticmethod
-    def _validated_ops(files: Dict[str, Any], route: str) -> list:
+    def _validated_ops(
+            files: Dict[str, Any], route: str, *,
+            decompose_guard_fallback: bool = False) -> list:
         """Fail closed on the route-specific reasoning tree contract."""
         if "tree_ops.json" not in files:
             raise ValueError(f"{route} 轮必产 tree_ops.json")
@@ -432,6 +474,12 @@ class SqliteAdvancer:
             if amend_indexes != [0]:
                 raise ValueError(
                     "goal_amend 轮须恰有一个 amend_goal 且必须是首个 op（先升版，再 seed/spawn）")
+            return ops
+        if route == "decompose" and decompose_guard_fallback:
+            if ops:
+                raise ValueError(
+                    "decompose 已被树护栏阻断时 tree_ops.ops 必须为空；"
+                    "只允许释放父问题并重新 selection")
             return ops
         need = "create_root" if route == "bootstrap" else "add_children"
         if not any(op.get("op") == need for op in ops):

@@ -846,7 +846,8 @@ class WebQuestService:
                 {"version": 1, "files": rows}, limits=limits)
             reports.append(preflight_managed_datasets(
                 Path(source["source_root"]), source_manifest,
-                limits=limits).public_dict())
+                limits=limits,
+                allow_external_hardlinks=True).public_dict())
         return self._merge_preflight_reports(
             reports, local_public=local_public,
             local_identity=local_identities,
@@ -1043,6 +1044,103 @@ class WebQuestService:
         projected["sources"] = sources
         return projected
 
+    @staticmethod
+    def _same_content_revalidation_paths(
+            expected: Mapping[str, Any], current: Mapping[str, Any],
+            ) -> Optional[Dict[str, List[str]]]:
+        """Plan bounded re-hashing when only file metadata has drifted.
+
+        The published SHA-256 values remain the sole byte authority.  Missing,
+        added, renamed or resized files still fail closed.  A replaced inode
+        may resume only after its current bytes are re-read and match the
+        frozen digest exactly.
+        """
+
+        expected_top = {
+            key: value for key, value in expected.items()
+            if key not in {"generated_at", "status", "sources"}
+        }
+        current_top = {
+            key: value for key, value in current.items()
+            if key not in {"generated_at", "status", "sources"}
+        }
+        if expected_top != current_top:
+            return None
+        expected_sources = expected.get("sources")
+        current_sources = current.get("sources")
+        if not isinstance(expected_sources, list) or not isinstance(current_sources, list):
+            return None
+        if (any(not isinstance(item, Mapping) for item in expected_sources)
+                or any(not isinstance(item, Mapping) for item in current_sources)):
+            return None
+        expected_by_id = {item.get("source_id"): item for item in expected_sources}
+        current_by_id = {item.get("source_id"): item for item in current_sources}
+        if (len(expected_by_id) != len(expected_sources)
+                or len(current_by_id) != len(current_sources)
+                or set(expected_by_id) != set(current_by_id)):
+            return None
+
+        binding_fields = {"device", "inode", "mode", "uid", "gid"}
+        selected: Dict[str, List[str]] = {}
+        for source_id in sorted(expected_by_id):
+            if not isinstance(source_id, str):
+                return None
+            expected_source = expected_by_id[source_id]
+            current_source = current_by_id[source_id]
+            expected_common = {
+                key: value for key, value in expected_source.items()
+                if key not in {"status", "files", "root_identity"}
+            }
+            current_common = {
+                key: value for key, value in current_source.items()
+                if key not in {"status", "files", "root_identity"}
+            }
+            if expected_common != current_common:
+                return None
+            expected_root = expected_source.get("root_identity")
+            current_root = current_source.get("root_identity")
+            if not isinstance(expected_root, Mapping) or not isinstance(current_root, Mapping):
+                return None
+            if ({key: expected_root.get(key) for key in binding_fields}
+                    != {key: current_root.get(key) for key in binding_fields}):
+                return None
+
+            expected_files = expected_source.get("files")
+            current_files = current_source.get("files")
+            if not isinstance(expected_files, list) or not isinstance(current_files, list):
+                return None
+            if (any(not isinstance(item, Mapping) for item in expected_files)
+                    or any(not isinstance(item, Mapping) for item in current_files)):
+                return None
+            expected_by_path = {item.get("path"): item for item in expected_files}
+            current_by_path = {item.get("path"): item for item in current_files}
+            if (len(expected_by_path) != len(expected_files)
+                    or len(current_by_path) != len(current_files)
+                    or set(expected_by_path) != set(current_by_path)):
+                return None
+            changed_paths = []
+            for path in sorted(expected_by_path):
+                if not isinstance(path, str):
+                    return None
+                expected_file = expected_by_path[path]
+                current_file = current_by_path[path]
+                if expected_file.get("size") != current_file.get("size"):
+                    return None
+                expected_metadata = {
+                    key: value for key, value in expected_file.items()
+                    if key != "sha256"
+                }
+                if expected_metadata == dict(current_file):
+                    continue
+                digest = expected_file.get("sha256")
+                if (not isinstance(digest, str) or len(digest) != 71
+                        or not digest.startswith("sha256:")):
+                    return None
+                changed_paths.append(path)
+            if changed_paths:
+                selected[source_id] = changed_paths
+        return selected
+
     def _verified_local_manifest(
             self, draft_id: str) -> tuple[Dict[str, Any], bytes, Dict[str, Any]]:
         path = self.local_manifests / f"{draft_id}.json"
@@ -1104,9 +1202,47 @@ class WebQuestService:
         # hash all source bytes again.
         current = self.local_sources.preflight_manifest(draft_id)
         if (self._local_manifest_metadata_identity(current)
-                != self._local_manifest_metadata_identity(expected)):
-            raise WebQuestNotReadyError(
-                "本机数据/参考目录自任务发布后发生变化；请在 Web 新建任务以冻结新版本")
+                == self._local_manifest_metadata_identity(expected)):
+            return
+        selected = self._same_content_revalidation_paths(expected, current)
+        if selected is not None and selected:
+            verified = self.local_sources.selectively_verified_manifest(
+                draft_id, selected)
+            # The second safe scan must still describe the exact metadata view
+            # which produced the revalidation plan; otherwise a concurrent
+            # mutation could make a correct digest belong to a stale view.
+            if (self._local_manifest_metadata_identity(verified)
+                    == self._local_manifest_metadata_identity(current)):
+                expected_sources = {
+                    item["source_id"]: item for item in expected["sources"]
+                }
+                verified_sources = {
+                    item["source_id"]: item for item in verified["sources"]
+                }
+                hashes_match = True
+                for source_id, paths in selected.items():
+                    expected_files = {
+                        item["path"]: item
+                        for item in expected_sources[source_id]["files"]
+                    }
+                    verified_files = {
+                        item["path"]: item
+                        for item in verified_sources[source_id]["files"]
+                    }
+                    if any(
+                            verified_files[path].get("sha256")
+                            != expected_files[path].get("sha256")
+                            for path in paths):
+                        hashes_match = False
+                        break
+                if hashes_match:
+                    return
+        elif selected == {}:
+            # Only non-content root metadata (for example directory mtime)
+            # changed while the root binding and every file identity remained.
+            return
+        raise WebQuestNotReadyError(
+            "本机数据/参考目录自任务发布后发生变化；请在 Web 新建任务以冻结新版本")
 
     def _resolve_profile(self, spec: Mapping[str, Any]):
         profile_id = spec.get("qualification_profile_id")

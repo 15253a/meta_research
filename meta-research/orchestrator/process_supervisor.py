@@ -34,6 +34,7 @@ import secrets
 import select
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,12 @@ _MAX_SPEC_BYTES = 2 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 128 * 1024
 _HEARTBEAT_INTERVAL_S = 2.0
 _ACTIVITY_SAMPLE_INTERVAL_S = 0.5
+_FRAME_MAGIC = b"MRFRAME1"
+_FRAME_FORMAT = "ordered-stream-v1"
+_FRAME_HEADER = struct.Struct(">8sBIQ")
+_FRAME_CHUNK_BYTES = 64 * 1024
+_FRAME_STREAM_IDS = {"stdout": 1, "stderr": 2}
+_FRAME_ID_STREAMS = {value: key for key, value in _FRAME_STREAM_IDS.items()}
 _KIND_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _OPERATION_RE = re.compile(r"^exec-[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -441,6 +448,10 @@ def _capture_path(path: Path, operation_id: str, stream: str) -> Path:
     return Path(path).parent / f"capture-{operation_id}.{stream}.bin"
 
 
+def _frame_capture_path(path: Path, operation_id: str) -> Path:
+    return Path(path).parent / f"capture-{operation_id}.frames.bin"
+
+
 def _open_capture_file(path: Path):  # noqa: ANN201 - binary file object
     flags = (os.O_RDWR | os.O_CREAT | os.O_EXCL
              | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
@@ -466,7 +477,8 @@ def _capture_identity(path: Path, fd: int) -> Dict[str, Any]:
     digest = hashlib.sha256()
     offset = 0
     while offset < info.st_size:
-        chunk = os.pread(fd, min(1024 * 1024, info.st_size - offset), offset)
+        chunk = os.pread(
+            fd, min(_FRAME_CHUNK_BYTES, info.st_size - offset), offset)
         if not chunk:
             raise ExecutionSupervisorError(f"durable capture 被截断: {path.name}")
         digest.update(chunk)
@@ -508,6 +520,72 @@ def _verified_capture_fd(receipt: Mapping[str, Any], *, stream: str) -> Tuple[in
         raise
 
 
+def _verified_frame_fd(
+        receipt: Mapping[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    ref = receipt.get("capture_frame_ref")
+    if not isinstance(ref, str) or not ref:
+        raise ValueError("execution receipt 缺 capture_frame_ref")
+    path = Path(ref)
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, flags)
+    try:
+        identity = _capture_identity(path, fd)
+        for field in ("sha256", "bytes", "device", "inode"):
+            if receipt.get(f"capture_frame_{field}") != identity[field]:
+                raise ValueError(
+                    "execution frame capture 与 receipt 身份不一致")
+        return fd, identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_frame_at(
+        fd: int, *, offset: int, total: int,
+        allow_eof: bool = True) -> Optional[Tuple[str, bytes, int]]:
+    if offset == total and allow_eof:
+        return None
+    if offset < 0 or offset + _FRAME_HEADER.size > total:
+        raise ValueError("ordered frame capture header 被截断")
+    header = os.pread(fd, _FRAME_HEADER.size, offset)
+    if len(header) != _FRAME_HEADER.size:
+        raise ValueError("ordered frame capture header 读取被截断")
+    magic, stream_id, length, recorded_offset = _FRAME_HEADER.unpack(header)
+    if (
+        magic != _FRAME_MAGIC
+        or stream_id not in _FRAME_ID_STREAMS
+        or length <= 0
+        or length > _FRAME_CHUNK_BYTES
+        or recorded_offset != offset
+    ):
+        raise ValueError("ordered frame capture header 非法")
+    payload_offset = offset + _FRAME_HEADER.size
+    frame_end = payload_offset + length
+    if frame_end > total:
+        raise ValueError("ordered frame capture payload 被截断")
+    payload = os.pread(fd, length, payload_offset)
+    if len(payload) != length:
+        raise ValueError("ordered frame capture payload 读取被截断")
+    return _FRAME_ID_STREAMS[stream_id], payload, frame_end
+
+
+def _validate_frame_capture_fd(
+        fd: int, *, total: int) -> Dict[str, int]:
+    offset = 0
+    stream_bytes = {"stdout": 0, "stderr": 0}
+    while offset < total:
+        frame = _read_frame_at(
+            fd, offset=offset, total=total, allow_eof=False)
+        assert frame is not None
+        stream_bytes[frame[0]] += len(frame[1])
+        offset = frame[2]
+    if offset != total:
+        raise ValueError("ordered frame capture 末尾非法")
+    return stream_bytes
+
+
 def read_execution_capture(receipt: Mapping[str, Any], *, stream: str) -> bytes:
     """Read a terminal guardian capture from one no-follow descriptor and verify its receipt identity."""
     if receipt.get("capture_error") is not None:
@@ -523,6 +601,102 @@ def read_execution_capture(receipt: Mapping[str, Any], *, stream: str) -> bytes:
             chunks.append(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def verified_execution_capture_size(
+        receipt: Mapping[str, Any], *, stream: str) -> int:
+    """Verify one terminal capture against its receipt and return byte size."""
+    if receipt.get("capture_error") is not None:
+        raise ValueError(
+            "execution receipt 已声明 capture_error，输出不可作为 recovery authority")
+    fd, identity = _verified_capture_fd(receipt, stream=stream)
+    try:
+        return int(identity["bytes"])
+    finally:
+        os.close(fd)
+
+
+def verified_execution_frame_size(receipt: Mapping[str, Any]) -> int:
+    """Verify the ordered frame capture and return its byte size."""
+    if receipt.get("capture_error") is not None:
+        raise ValueError(
+            "execution receipt 已声明 capture_error，frame 不可作为 recovery authority")
+    fd, identity = _verified_frame_fd(receipt)
+    try:
+        total = int(identity["bytes"])
+        _validate_frame_capture_fd(fd, total=total)
+        return total
+    finally:
+        os.close(fd)
+
+
+def stream_execution_frames(
+        receipt: Mapping[str, Any], *, start_offset: int,
+        observer: Callable[[str, bytes, int], None]) -> int:
+    """Deliver ordered guardian frames after one durable frame boundary."""
+    if receipt.get("capture_error") is not None:
+        raise ValueError(
+            "execution receipt 已声明 capture_error，frame 不可作为 recovery authority")
+    if (isinstance(start_offset, bool)
+            or not isinstance(start_offset, int)
+            or start_offset < 0):
+        raise ValueError("frame start_offset 须为非负整数")
+    if not callable(observer):
+        raise ValueError("frame observer 须为 callable")
+    fd, identity = _verified_frame_fd(receipt)
+    try:
+        total = int(identity["bytes"])
+        if start_offset > total:
+            raise ValueError("ordered frame capture 短于已提交 offset")
+        offset = start_offset
+        while offset < total:
+            frame = _read_frame_at(
+                fd, offset=offset, total=total, allow_eof=False)
+            assert frame is not None
+            stream, chunk, frame_end = frame
+            observer(stream, chunk, frame_end)
+            offset = frame_end
+        return offset
+    finally:
+        os.close(fd)
+
+
+def stream_execution_capture(
+        receipt: Mapping[str, Any], *, stream: str, start_offset: int,
+        observer: Callable[[bytes], None]) -> int:
+    """Deliver a verified guardian-capture suffix in bounded chunks.
+
+    The returned offset advances only after ``observer`` accepts a chunk.  A
+    caller can therefore persist its own offset atomically with the derived
+    journal facts and retry after owner loss without loading or repeating the
+    already committed prefix.
+    """
+    if receipt.get("capture_error") is not None:
+        raise ValueError(
+            "execution receipt 已声明 capture_error，输出不可作为 recovery authority")
+    if (isinstance(start_offset, bool)
+            or not isinstance(start_offset, int)
+            or start_offset < 0):
+        raise ValueError("capture start_offset 须为非负整数")
+    if not callable(observer):
+        raise ValueError("capture observer 须为 callable")
+    fd, identity = _verified_capture_fd(receipt, stream=stream)
+    try:
+        total = int(identity["bytes"])
+        if start_offset > total:
+            raise ValueError(
+                f"execution {stream} capture 短于已提交 offset")
+        offset = start_offset
+        while offset < total:
+            chunk = os.pread(fd, min(64 * 1024, total - offset), offset)
+            if not chunk:
+                raise ValueError(
+                    f"execution {stream} capture suffix 读取被截断")
+            observer(chunk)
+            offset += len(chunk)
+        return offset
     finally:
         os.close(fd)
 
@@ -649,6 +823,20 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
         if (capture_refs[0] != str(_capture_path(path, operation_id, "stdout"))
                 or capture_refs[1] != str(_capture_path(path, operation_id, "stderr"))):
             raise ValueError("execution capture ref 未按 operation_id 确定性命名")
+    stream_identity = receipt.get("capture_stream_identity")
+    if stream_identity is not None and stream_identity is not True:
+        raise ValueError("execution capture stream identity 标记非法")
+    if stream_identity is True and not all(capture_refs):
+        raise ValueError("stream identity receipt 缺 capture refs")
+    frame_ref = receipt.get("capture_frame_ref")
+    if stream_identity is True:
+        if (
+            frame_ref != str(_frame_capture_path(path, operation_id))
+            or receipt.get("capture_frame_format") != _FRAME_FORMAT
+        ):
+            raise ValueError("stream identity receipt 缺/错 frame capture")
+    elif frame_ref is not None or receipt.get("capture_frame_format") is not None:
+        raise ValueError("non-stream receipt 不得声明 frame capture")
     state = receipt.get("state")
     if state == "prepared":
         _validate_sandbox_receipt(
@@ -716,6 +904,20 @@ def _validate_receipt(receipt: Mapping[str, Any], path: Path) -> None:
         for stream in ("stdout", "stderr"):
             fd, _identity = _verified_capture_fd(receipt, stream=stream)
             os.close(fd)
+        if stream_identity is True:
+            frame_fd, frame_identity = _verified_frame_fd(receipt)
+            try:
+                frame_stream_bytes = _validate_frame_capture_fd(
+                    frame_fd, total=int(frame_identity["bytes"]))
+                if any(
+                    frame_stream_bytes[stream]
+                    != receipt.get(f"capture_{stream}_bytes")
+                    for stream in ("stdout", "stderr")
+                ):
+                    raise ValueError(
+                        "ordered frame capture 与 raw stream 长度冲突")
+            finally:
+                os.close(frame_fd)
 
 
 def validate_execution_receipt(receipt: Mapping[str, Any], path: Path) -> None:
@@ -944,8 +1146,14 @@ class ExecutionSupervisor:
                                     Path(receipt[f"capture_{stream}_ref"]))
                                 for field, value in identity.items():
                                     terminal[f"capture_{stream}_{field}"] = value
+                            if receipt.get("capture_stream_identity") is True:
+                                identity = _capture_identity_from_path(
+                                    Path(receipt["capture_frame_ref"]))
+                                for field, value in identity.items():
+                                    terminal[f"capture_frame_{field}"] = value
+                            terminal.pop("capture_error", None)
                         except Exception as error:
-                            for stream in ("stdout", "stderr"):
+                            for stream in ("stdout", "stderr", "frame"):
                                 for field in ("sha256", "bytes", "device", "inode"):
                                     terminal.pop(f"capture_{stream}_{field}", None)
                             terminal["capture_error"] = f"{type(error).__name__}: {error}"[:500]
@@ -998,6 +1206,7 @@ class ExecutionSupervisor:
                 active.cancel()
 
     def run(self, cmd: Sequence[str], *, stdin=None, capture_output: bool = False,
+            capture_result: bool = True,
             stdout=None, stderr=None, timeout_s: Optional[float],
             cwd: Optional[Path] = None,
             env: Optional[Mapping[str, str]] = None,
@@ -1005,6 +1214,9 @@ class ExecutionSupervisor:
             operation_context: Optional[Mapping[str, Any]] = None,
             external_container: Optional[Mapping[str, Any]] = None,
             progress_observer: Optional[Callable[[], bool]] = None,
+            capture_observer: Optional[Callable[[bytes], None]] = None,
+            stream_capture_observer: Optional[
+                Callable[[str, bytes, int], None]] = None,
             progress_interval_s: float = 5.0) -> ExecutionResult:
         """Execute one command and return only after its descendant tree is empty.
 
@@ -1013,6 +1225,18 @@ class ExecutionSupervisor:
         returning ``True`` asks the already-registered guardian to cancel this
         exact execution.  The hook may itself perform a bounded Codex operator
         turn while the guardian continues supervising the workload.
+
+        ``capture_observer`` receives each newly appended stdout byte exactly
+        once from position-independent reads of the guardian capture.  It
+        receives neither a path nor a descriptor and is valid only when
+        ``capture_output`` is enabled.
+
+        ``stream_capture_observer`` is the stream-preserving counterpart: it
+        receives ``("stdout"|"stderr", chunk, frame_end_offset)`` in the
+        guardian's durable frame order.  The two capture observers are
+        mutually exclusive.
+        ``capture_result=False`` keeps the durable, receipt-bound captures but
+        does not load them into the returned result.
         """
         if not isinstance(cmd, (list, tuple)) or not cmd:
             raise ValueError("cmd 须为非空 argv sequence")
@@ -1050,6 +1274,20 @@ class ExecutionSupervisor:
             timeout_s = float(timeout_s)
         if progress_observer is not None and not callable(progress_observer):
             raise ValueError("progress_observer 须为 callable 或 None")
+        if not isinstance(capture_result, bool):
+            raise ValueError("capture_result 须为 bool")
+        if capture_observer is not None and not callable(capture_observer):
+            raise ValueError("capture_observer 须为 callable 或 None")
+        if (stream_capture_observer is not None
+                and not callable(stream_capture_observer)):
+            raise ValueError("stream_capture_observer 须为 callable 或 None")
+        if capture_observer is not None and stream_capture_observer is not None:
+            raise ValueError(
+                "capture_observer 与 stream_capture_observer 不得同时使用")
+        if capture_observer is not None and not capture_output:
+            raise ValueError("capture_observer 要求 capture_output=True")
+        if stream_capture_observer is not None and not capture_output:
+            raise ValueError("stream_capture_observer 要求 capture_output=True")
         if (isinstance(progress_interval_s, bool)
                 or not isinstance(progress_interval_s, (int, float))
                 or not math.isfinite(float(progress_interval_s))
@@ -1092,6 +1330,16 @@ class ExecutionSupervisor:
                 "progress_observer": True,
                 "progress_interval_s": progress_interval_s,
             })
+        if capture_observer is not None:
+            spec_for_hash.update({
+                "capture_observer": True,
+                "capture_observer_interval_s": progress_interval_s,
+            })
+        if stream_capture_observer is not None:
+            spec_for_hash.update({
+                "stream_capture_observer": True,
+                "stream_capture_observer_interval_s": progress_interval_s,
+            })
         spec_sha256 = "sha256:" + hashlib.sha256(
             _canonical_json(spec_for_hash)).hexdigest()
         operation_id = f"exec-{secrets.token_hex(16)}"
@@ -1103,10 +1351,17 @@ class ExecutionSupervisor:
             external_container=sandbox)
         capture_stdout_path = _capture_path(receipt_path, operation_id, "stdout")
         capture_stderr_path = _capture_path(receipt_path, operation_id, "stderr")
+        capture_frame_path = _frame_capture_path(receipt_path, operation_id)
         if capture_output:
             prepared.update({
                 "capture_stdout_ref": str(capture_stdout_path),
                 "capture_stderr_ref": str(capture_stderr_path),
+            })
+        if stream_capture_observer is not None:
+            prepared.update({
+                "capture_stream_identity": True,
+                "capture_frame_ref": str(capture_frame_path),
+                "capture_frame_format": _FRAME_FORMAT,
             })
 
         old_sigint_handler = None
@@ -1119,19 +1374,23 @@ class ExecutionSupervisor:
                 raise ExecutionSupervisorError(
                     f"不支持的 SIGINT handler: {old_sigint_handler!r}")
 
-        out_tmp = err_tmp = None
+        out_tmp = err_tmp = frame_tmp = None
         if capture_output:
             try:
                 out_tmp = _open_capture_file(capture_stdout_path)
                 err_tmp = _open_capture_file(capture_stderr_path)
+                if stream_capture_observer is not None:
+                    frame_tmp = _open_capture_file(capture_frame_path)
             except BaseException:
-                for stream in (out_tmp, err_tmp):
+                for stream in (out_tmp, err_tmp, frame_tmp):
                     if stream is not None:
                         try:
                             stream.close()
                         except BaseException:
                             pass
-                for capture_path in (capture_stdout_path, capture_stderr_path):
+                for capture_path in (
+                        capture_stdout_path, capture_stderr_path,
+                        capture_frame_path):
                     try:
                         capture_path.unlink()
                     except OSError:
@@ -1257,7 +1516,12 @@ class ExecutionSupervisor:
                             "--owner-fd", str(owner_read),
                             "--owner-pid", str(os.getpid()),
                             "--fence-fd", str(fence_fd),
+                            "--frame-fd", str(
+                                -1 if frame_tmp is None
+                                else frame_tmp.fileno()),
                         ]
+                        if frame_tmp is not None:
+                            inherited.append(frame_tmp.fileno())
                         if fence_fd >= 0:
                             inherited.append(fence_fd)
                         if manage_sigint and old_sigint_handler != signal.SIG_IGN:
@@ -1356,8 +1620,13 @@ class ExecutionSupervisor:
                             identity = _capture_identity(capture_path, capture_file.fileno())
                             for field, value in identity.items():
                                 terminal[f"capture_{stream}_{field}"] = value
+                        if frame_tmp is not None:
+                            identity = _capture_identity(
+                                capture_frame_path, frame_tmp.fileno())
+                            for field, value in identity.items():
+                                terminal[f"capture_frame_{field}"] = value
                     except Exception as capture_error:
-                        for stream in ("stdout", "stderr"):
+                        for stream in ("stdout", "stderr", "frame"):
                             for field in ("sha256", "bytes", "device", "inode"):
                                 terminal.pop(f"capture_{stream}_{field}", None)
                         terminal["capture_error"] = (
@@ -1374,7 +1643,7 @@ class ExecutionSupervisor:
                 note = getattr(primary, "add_note", None)
                 if callable(note):
                     note(str(ambiguous))
-            for stream in (out_tmp, err_tmp):
+            for stream in (out_tmp, err_tmp, frame_tmp):
                 if stream is not None:
                     try:
                         stream.close()
@@ -1413,16 +1682,80 @@ class ExecutionSupervisor:
 
         primary_wait_error: Optional[BaseException] = pre_wait_error
         observer_cancelled = False
+        capture_observer_failed = False
+        capture_offset = 0
+        frame_offset = 0
+
+        def drain_capture() -> None:
+            nonlocal capture_offset, frame_offset
+            if (capture_observer is None
+                    and stream_capture_observer is None):
+                return
+            if capture_observer is not None:
+                assert out_tmp is not None
+                while True:
+                    chunk = os.pread(
+                        out_tmp.fileno(), _FRAME_CHUNK_BYTES,
+                        capture_offset)
+                    if not chunk:
+                        return
+                    capture_observer(chunk)
+                    capture_offset += len(chunk)
+            assert frame_tmp is not None
+            while True:
+                total = os.fstat(frame_tmp.fileno()).st_size
+                if frame_offset == total:
+                    return
+                if frame_offset + _FRAME_HEADER.size > total:
+                    return
+                header = os.pread(
+                    frame_tmp.fileno(), _FRAME_HEADER.size,
+                    frame_offset)
+                if len(header) != _FRAME_HEADER.size:
+                    return
+                magic, stream_id, length, recorded_offset = (
+                    _FRAME_HEADER.unpack(header))
+                if (
+                    magic != _FRAME_MAGIC
+                    or stream_id not in _FRAME_ID_STREAMS
+                    or length <= 0
+                    or length > _FRAME_CHUNK_BYTES
+                    or recorded_offset != frame_offset
+                ):
+                    raise ValueError(
+                        "live ordered frame capture header 非法")
+                frame_end = frame_offset + _FRAME_HEADER.size + length
+                if frame_end > total:
+                    return
+                chunk = os.pread(
+                    frame_tmp.fileno(), length,
+                    frame_offset + _FRAME_HEADER.size)
+                if len(chunk) != length:
+                    return
+                assert stream_capture_observer is not None
+                stream_capture_observer(
+                    _FRAME_ID_STREAMS[stream_id], chunk, frame_end)
+                frame_offset = frame_end
+
         while True:
             try:
                 if primary_wait_error is not None:
                     # A wait/cancel interruption permanently rejects new
-                    # spawn for this supervisor, then keeps converging.
-                    self._shutdown = True
+                    # spawn for this supervisor, then keeps converging.  A
+                    # capture decoder rejection is scoped to this exact tree:
+                    # its terminal receipt is still obtained, but unrelated
+                    # supervised work is not poisoned.
+                    if not capture_observer_failed:
+                        self._shutdown = True
                     active.cancel()
                     helper.wait()
                     break
-                if progress_observer is None or observer_cancelled:
+                polling = (
+                    capture_observer is not None
+                    or stream_capture_observer is not None
+                    or (progress_observer is not None
+                        and not observer_cancelled))
+                if not polling:
                     helper.wait()
                     break
                 try:
@@ -1431,13 +1764,22 @@ class ExecutionSupervisor:
                 except subprocess.TimeoutExpired:
                     # Timeout here is only the observation cadence.  The
                     # guardian independently enforces the execution deadline.
-                    request_cancel = progress_observer()
-                    if request_cancel is not False and request_cancel is not True:
-                        raise ValueError(
-                            "progress_observer 返回值须为 bool")
-                    if request_cancel:
-                        active.cancel()
-                        observer_cancelled = True
+                    if (capture_observer is not None
+                            or stream_capture_observer is not None):
+                        try:
+                            drain_capture()
+                        except BaseException as error:
+                            capture_observer_failed = True
+                            primary_wait_error = error
+                            continue
+                    if progress_observer is not None and not observer_cancelled:
+                        request_cancel = progress_observer()
+                        if request_cancel is not False and request_cancel is not True:
+                            raise ValueError(
+                                "progress_observer 返回值须为 bool")
+                        if request_cancel:
+                            active.cancel()
+                            observer_cancelled = True
             except BaseException as error:
                 self._shutdown = True
                 if primary_wait_error is None:
@@ -1445,6 +1787,21 @@ class ExecutionSupervisor:
                 else:
                     wait_notes.append(error)
                 continue
+
+        if ((capture_observer is not None
+             or stream_capture_observer is not None)
+                and not capture_observer_failed):
+            try:
+                # The guardian has now proved every descendant exited, so this
+                # read supplies the stable final suffix (including outputs
+                # shorter than one observation interval).
+                drain_capture()
+            except BaseException as error:
+                capture_observer_failed = True
+                if primary_wait_error is None:
+                    primary_wait_error = error
+                else:
+                    wait_notes.append(error)
 
         receipt: Optional[Dict[str, Any]] = None
         protocol_error: Optional[BaseException] = None
@@ -1504,13 +1861,17 @@ class ExecutionSupervisor:
 
         stdout_bytes = stderr_bytes = None
         if out_tmp is not None:
-            out_tmp.seek(0)
-            stdout_bytes = out_tmp.read()
+            if capture_result:
+                out_tmp.seek(0)
+                stdout_bytes = out_tmp.read()
             out_tmp.close()
         if err_tmp is not None:
-            err_tmp.seek(0)
-            stderr_bytes = err_tmp.read()
+            if capture_result:
+                err_tmp.seek(0)
+                stderr_bytes = err_tmp.read()
             err_tmp.close()
+        if frame_tmp is not None:
+            frame_tmp.close()
         if protocol_error is not None:
             unsafe = ExecutionSupervisorError(
                 "guardian 未提供可证明 drained 的 terminal；supervisor 已永久停机")
@@ -1761,11 +2122,13 @@ def _terminate_tree(proc: subprocess.Popen, *, leader_start: str,
         time.sleep(0.02)
 
 
-def _fsync_output_fds() -> None:
+def _fsync_output_fds(*, frame_fd: int = -1) -> None:
     while True:
         try:
             seen = set()
-            for fd in (1, 2):
+            for fd in (1, 2, frame_fd):
+                if fd < 0:
+                    continue
                 try:
                     info = os.fstat(fd)
                 except OSError:
@@ -1841,7 +2204,9 @@ def _sandbox_container_row(sandbox: Mapping[str, Any]) -> Optional[Tuple[str, st
 
 
 def _drain_external_container(
-        prepared: Mapping[str, Any], *, capture_logs: bool = False) -> Optional[Dict[str, Any]]:
+        prepared: Mapping[str, Any], *, capture_logs: bool = False,
+        frame_writer: Optional[Callable[[str, bytes], None]] = None,
+        ) -> Optional[Dict[str, Any]]:
     """Prove a Docker sandbox absent before publishing terminal authority.
 
     Docker workloads are not descendants of the CLI process.  Killing the
@@ -1871,9 +2236,15 @@ def _drain_external_container(
                     if (logs.returncode == 0
                             and len(logs.stdout) + len(logs.stderr) <= 4 * 1024 * 1024):
                         marker = b"\n[sandbox guardian recovered pre-cleanup logs]\n"
-                        _write_all(1, marker + logs.stdout)
+                        if frame_writer is None:
+                            _write_all(1, marker + logs.stdout)
+                        else:
+                            frame_writer("stdout", marker + logs.stdout)
                         if logs.stderr:
-                            _write_all(2, logs.stderr)
+                            if frame_writer is None:
+                                _write_all(2, logs.stderr)
+                            else:
+                                frame_writer("stderr", logs.stderr)
                 except BaseException:
                     # Container absence is the authority.  Best-effort failure
                     # logs must never prevent force-removal or release a false
@@ -1923,10 +2294,14 @@ def _await_external_registration_or_runner_exit(
         time.sleep(0.02)
 
 
-def _terminal_from(prepared: Mapping[str, Any], **updates) -> Dict[str, Any]:  # noqa: ANN003
+def _terminal_from(
+        prepared: Mapping[str, Any], *, frame_fd: int = -1,
+        frame_writer: Optional[Callable[[str, bytes], None]] = None,
+        **updates) -> Dict[str, Any]:  # noqa: ANN003
     terminal = dict(prepared)
     sandbox = _drain_external_container(
-        prepared, capture_logs=updates.get("outcome") != "exit")
+        prepared, capture_logs=updates.get("outcome") != "exit",
+        frame_writer=frame_writer)
     if sandbox is not None:
         terminal["sandbox"] = sandbox
     terminal.update(updates)
@@ -1940,8 +2315,15 @@ def _terminal_from(prepared: Mapping[str, Any], **updates) -> Dict[str, Any]:  #
                     Path(prepared[f"capture_{stream}_ref"]), fd)
                 for field, value in identity.items():
                     terminal[f"capture_{stream}_{field}"] = value
+            if prepared.get("capture_stream_identity") is True:
+                if frame_fd < 0:
+                    raise ValueError("stream capture 缺 guardian frame fd")
+                identity = _capture_identity(
+                    Path(prepared["capture_frame_ref"]), frame_fd)
+                for field, value in identity.items():
+                    terminal[f"capture_frame_{field}"] = value
         except Exception as error:
-            for stream in ("stdout", "stderr"):
+            for stream in ("stdout", "stderr", "frame"):
                 for field in ("sha256", "bytes", "device", "inode"):
                     terminal.pop(f"capture_{stream}_{field}", None)
             # Process-tree terminal authority remains publishable even when
@@ -1952,13 +2334,115 @@ def _terminal_from(prepared: Mapping[str, Any], **updates) -> Dict[str, Any]:  #
     return terminal
 
 
+class _GuardianStreamCapture:
+    """Guardian-owned ordered stdout/stderr framing over two payload pipes."""
+
+    def __init__(self, frame_fd: int) -> None:
+        if frame_fd < 0:
+            raise ValueError("ordered stream capture 缺 frame fd")
+        self.frame_fd = frame_fd
+        self.frame_offset = os.lseek(frame_fd, 0, os.SEEK_END)
+        if self.frame_offset != 0:
+            raise ValueError("new ordered frame capture 必须为空")
+        self.epoll = select.epoll()
+        self.readers: Dict[int, Tuple[str, int]] = {}
+        self.writers: Dict[str, int] = {}
+        try:
+            for stream, raw_fd in (("stdout", 1), ("stderr", 2)):
+                read_fd, write_fd = os.pipe2(
+                    getattr(os, "O_CLOEXEC", 0))
+                os.set_blocking(read_fd, False)
+                self.readers[read_fd] = (stream, raw_fd)
+                self.writers[stream] = write_fd
+                self.epoll.register(
+                    read_fd,
+                    select.EPOLLIN | select.EPOLLHUP | select.EPOLLERR)
+        except BaseException:
+            self.close()
+            raise
+
+    def payload_fd(self, stream: str) -> int:
+        return self.writers[stream]
+
+    def close_payload_writers(self) -> None:
+        for stream, fd in tuple(self.writers.items()):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self.writers.pop(stream, None)
+
+    def _close_reader(self, fd: int) -> None:
+        try:
+            self.epoll.unregister(fd)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        self.readers.pop(fd, None)
+
+    def emit(self, stream: str, data: bytes) -> None:
+        raw_fd = 1 if stream == "stdout" else 2
+        for offset in range(0, len(data), _FRAME_CHUNK_BYTES):
+            chunk = data[offset:offset + _FRAME_CHUNK_BYTES]
+            if not chunk:
+                continue
+            _write_all(raw_fd, chunk)
+            header = _FRAME_HEADER.pack(
+                _FRAME_MAGIC, _FRAME_STREAM_IDS[stream],
+                len(chunk), self.frame_offset)
+            _write_all(self.frame_fd, header + chunk)
+            self.frame_offset += len(header) + len(chunk)
+
+    def drain(self, wait_s: float) -> None:
+        """Drain ready frames, preserving epoll's readiness queue order."""
+        first = True
+        rounds = 0
+        while self.readers and rounds < 64:
+            events = self.epoll.poll(wait_s if first else 0.0, 2)
+            first = False
+            if not events:
+                return
+            for fd, _event_mask in events:
+                binding = self.readers.get(fd)
+                if binding is None:
+                    continue
+                try:
+                    chunk = os.read(fd, _FRAME_CHUNK_BYTES)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    self._close_reader(fd)
+                    continue
+                stream, _raw_fd = binding
+                self.emit(stream, chunk)
+            rounds += 1
+
+    def drain_until_eof(self) -> None:
+        while self.readers:
+            self.drain(0.05)
+
+    def close(self) -> None:
+        self.close_payload_writers()
+        for fd in tuple(self.readers):
+            self._close_reader(fd)
+        epoll = getattr(self, "epoll", None)
+        if epoll is not None:
+            try:
+                epoll.close()
+            except OSError:
+                pass
+
+
 def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
-                   fence_fd: int) -> int:
+                   fence_fd: int, frame_fd: int = -1) -> int:
     # Do not use fatal PR_SET_PDEATHSIG: the guardian must survive its owner to
     # clean the tree, fsync the receipt, and only then release the flock dup.
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1):
         signal.signal(sig, _guardian_signal)
-    for fd in (spec_fd, owner_fd, fence_fd):
+    for fd in (spec_fd, owner_fd, fence_fd, frame_fd):
         if fd >= 0:
             os.set_inheritable(fd, False)
     spec = _read_spec_fd(spec_fd)
@@ -1970,7 +2454,8 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         pdeath_event = _arm_parent_death_signal(owner_pid)
     except BaseException as error:
         terminal = _terminal_from(
-            prepared, outcome="spawn_failed", returncode=None,
+            prepared, frame_fd=frame_fd,
+            outcome="spawn_failed", returncode=None,
             started_at_unix=None, term_sent=False, kill_sent=False,
             spawn_error=f"pdeathsig:{type(error).__name__}")
         _write_receipt_until_durable(receipt_path, terminal)
@@ -1983,7 +2468,8 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         _children(os.getpid())
     except BaseException as error:
         terminal = _terminal_from(
-            prepared, outcome="spawn_failed", returncode=None,
+            prepared, frame_fd=frame_fd,
+            outcome="spawn_failed", returncode=None,
             started_at_unix=None, term_sent=False, kill_sent=False,
             spawn_error=f"subreaper/procfs:{type(error).__name__}")
         _write_receipt_until_durable(receipt_path, terminal)
@@ -1992,7 +2478,8 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
     event = pdeath_event or _owner_event(owner_fd, 0.0)
     if event is not None:
         terminal = _terminal_from(
-            prepared, outcome=event, returncode=None,
+            prepared, frame_fd=frame_fd,
+            outcome=event, returncode=None,
             started_at_unix=None, term_sent=False, kill_sent=False)
         _write_receipt_until_durable(receipt_path, terminal)
         _release_fence(fence_fd)
@@ -2000,7 +2487,10 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
 
     gate_read, gate_write = os.pipe2(getattr(os, "O_CLOEXEC", 0))
     proc: Optional[subprocess.Popen] = None
+    stream_capture: Optional[_GuardianStreamCapture] = None
     try:
+        if prepared.get("capture_stream_identity") is True:
+            stream_capture = _GuardianStreamCapture(frame_fd)
         os.lseek(spec_fd, 0, os.SEEK_SET)
         payload_args = [
             sys.executable, "-I", os.path.abspath(__file__), _PAYLOAD_FLAG,
@@ -2008,9 +2498,17 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         ]
         target_fds = tuple(int(fd) for fd in spec.get("target_pass_fds", []))
         proc = subprocess.Popen(
-            payload_args, stdin=None, stdout=None, stderr=None,
+            payload_args, stdin=None,
+            stdout=(
+                None if stream_capture is None
+                else stream_capture.payload_fd("stdout")),
+            stderr=(
+                None if stream_capture is None
+                else stream_capture.payload_fd("stderr")),
             close_fds=True, pass_fds=(spec_fd, gate_read, *target_fds),
             start_new_session=True)
+        if stream_capture is not None:
+            stream_capture.close_payload_writers()
         # The launcher inherited the explicit target capabilities.  Guardian
         # copies must close immediately: retaining a pipe writer or lock fd
         # would change pass_fds EOF/unlock semantics and could force timeout.
@@ -2064,6 +2562,8 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         os.close(gate_write)
         gate_write = -1
     except BaseException as error:
+        if stream_capture is not None:
+            stream_capture.close_payload_writers()
         if gate_write >= 0:
             try:
                 os.close(gate_write)
@@ -2086,14 +2586,22 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
             term_sent = kill_sent = False
             max_descendants = 0
             signal_errors = 0
+        if stream_capture is not None:
+            stream_capture.drain_until_eof()
         terminal = _terminal_from(
-            prepared, outcome="spawn_failed", returncode=None,
+            prepared, frame_fd=frame_fd,
+            frame_writer=(
+                None if stream_capture is None
+                else stream_capture.emit),
+            outcome="spawn_failed", returncode=None,
             started_at_unix=None, term_sent=term_sent, kill_sent=kill_sent,
             max_descendants=max_descendants,
             signal_error_count=signal_errors,
             spawn_error=type(error).__name__)
-        _fsync_output_fds()
+        _fsync_output_fds(frame_fd=frame_fd)
         _write_receipt_until_durable(receipt_path, terminal)
+        if stream_capture is not None:
+            stream_capture.close()
         _release_fence(fence_fd)
         return 0
     finally:
@@ -2115,10 +2623,13 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         while True:
             wait_s = (0.05 if deadline is None else
                       min(0.05, max(0.0, deadline - time.monotonic())))
-            event = _owner_event(owner_fd, wait_s)
+            event = _owner_event(
+                owner_fd, wait_s if stream_capture is None else 0.0)
             if event is not None:
                 outcome = event
                 break
+            if stream_capture is not None:
+                stream_capture.drain(wait_s)
             returncode = _poll_leader(proc)
             if returncode is not None:
                 outcome = ("exit" if _all_children_drained(proc)
@@ -2159,7 +2670,9 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
         # empty; preserve the fence if a future refactor violates it.
         while True:
             time.sleep(1.0)
-    _fsync_output_fds()
+    if stream_capture is not None:
+        stream_capture.drain_until_eof()
+    _fsync_output_fds(frame_fd=frame_fd)
     try:
         final_sample = _execution_activity_sample(proc)
     except ExecutionSupervisorError:
@@ -2177,12 +2690,18 @@ def _guardian_main(*, spec_fd: int, owner_fd: int, owner_pid: int,
     running["guardian_heartbeat_seq"] += 1
     running["guardian_heartbeat_at_unix"] = time.time()
     terminal = _terminal_from(
-        running, outcome=outcome, returncode=proc.returncode,
+        running, frame_fd=frame_fd,
+        frame_writer=(
+            None if stream_capture is None
+            else stream_capture.emit),
+        outcome=outcome, returncode=proc.returncode,
         term_sent=term_sent, kill_sent=kill_sent,
         max_descendants=max_descendants,
         signal_error_count=signal_errors)
     _atomic_write_heartbeat(heartbeat_path, terminal)
     _write_receipt_until_durable(receipt_path, terminal)
+    if stream_capture is not None:
+        stream_capture.close()
     _release_fence(fence_fd)
     return 0
 
@@ -2209,6 +2728,7 @@ def _parse_helper_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespa
     parser.add_argument("--owner-fd", type=int)
     parser.add_argument("--owner-pid", type=int)
     parser.add_argument("--fence-fd", type=int, default=-1)
+    parser.add_argument("--frame-fd", type=int, default=-1)
     parser.add_argument("--gate-fd", type=int)
     return parser.parse_args(argv)
 
@@ -2220,7 +2740,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             raise SystemExit("guardian 缺/非法 --owner-fd/--owner-pid")
         return _guardian_main(
             spec_fd=args.spec_fd, owner_fd=args.owner_fd, owner_pid=args.owner_pid,
-            fence_fd=args.fence_fd)
+            fence_fd=args.fence_fd, frame_fd=args.frame_fd)
     if args.gate_fd is None:
         raise SystemExit("payload 缺 --gate-fd")
     return _payload_main(spec_fd=args.spec_fd, gate_fd=args.gate_fd)
