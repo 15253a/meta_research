@@ -17,16 +17,19 @@ import pytest
 import yaml
 
 from orchestrator import database as db
+from orchestrator.bundle_tasks import BundleTaskRegistry
 from orchestrator.interfaces import Artifact, ContextPack
 from orchestrator.runner import RunnerError
 from orchestrator.schemas import SchemaSet
 from orchestrator.stage_provider import (
     BUNDLE_OPERATOR_SESSION_CONTRACT,
+    BUNDLE_TASK_SESSION_CONTRACT,
     PlanReviewProvider,
     STAGE_MAIN_SESSION_CONTRACT,
     StageProvider,
 )
 from orchestrator.wildidea_adapter import WildIdeaAdapter
+from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
 POLICY = yaml.safe_load((SYSTEM_ROOT / "policies" / "policy.yaml").read_text(encoding="utf-8"))
@@ -54,7 +57,7 @@ class MockRunner:
 
 class _FakeNoveltyProvider:
     """Deterministic trusted-host stand-in; unit tests never use the network."""
-    name = "arxiv_api_v1"
+    name = "literature_federated_v1"
 
     def search(self, query, *, policy_hash):
         result_hash = "sha256:" + hashlib.sha256(
@@ -101,6 +104,18 @@ def _resident_factory(factory):
 
 def _resident_runner(runner):
     runner.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+    return runner
+
+
+def _bundle_task_factory(factory):
+    factory.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+    factory.bundle_task_session_contract = BUNDLE_TASK_SESSION_CONTRACT
+    return factory
+
+
+def _bundle_task_runner(runner):
+    runner.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+    runner.bundle_task_session_contract = BUNDLE_TASK_SESSION_CONTRACT
     return runner
 
 
@@ -203,6 +218,188 @@ class _RecordingLedger:
 
     def finish_call(self, **kwargs):
         self.finished.append(kwargs)
+
+
+class _SqlLifecycleLedger:
+    """Small durable runner_call ledger used by Worker lifecycle seam tests."""
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+
+    def begin_call(self, *, cycle_id, phase, purpose):
+        with self.daemon.transaction() as conn:
+            return conn.execute(
+                "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+                "VALUES (?,?,?,'created')",
+                (int(str(cycle_id).removeprefix("c")), phase, purpose),
+            ).lastrowid
+
+    def mark_call_running(self, *, runner_call_id, transcript_ref):
+        with self.daemon.transaction() as conn:
+            changed = conn.execute(
+                "UPDATE runner_call SET status='running',transcript_ref=? "
+                "WHERE id=? AND status='created'",
+                (transcript_ref, runner_call_id),
+            ).rowcount
+            assert changed == 1
+
+    def abort_unstarted_call(self, *, runner_call_id, failure_kind):
+        with self.daemon.transaction() as conn:
+            conn.execute(
+                "UPDATE runner_call SET status='aborted',failure_kind=? "
+                "WHERE id=? AND status IN ('created','running')",
+                (failure_kind, runner_call_id),
+            )
+
+    def finish_call(
+            self, *, runner_call_id, status, usage, failure_kind=None,
+            transcript_ref=None, execution_receipt_ref=None,
+            provider_receipt_ref=None):
+        del usage
+        with self.daemon.transaction() as conn:
+            row = conn.execute(
+                "SELECT cycle_id FROM runner_call WHERE id=?",
+                (runner_call_id,),
+            ).fetchone()
+            changed = conn.execute(
+                "UPDATE runner_call SET status=?,failure_kind=?,"
+                "transcript_ref=COALESCE(?,transcript_ref) "
+                "WHERE id=? AND status='running'",
+                (status, failure_kind, transcript_ref, runner_call_id),
+            ).rowcount
+            assert changed == 1
+            if provider_receipt_ref is not None:
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'orchestrator',"
+                    "'provider_invocation_accounted',?)",
+                    (row[0], json.dumps({
+                        "protocol": "provider-accounting-v1",
+                        "runner_call_id": runner_call_id,
+                        "provider_receipt_ref": provider_receipt_ref,
+                        "execution_receipt_ref": execution_receipt_ref,
+                        "runner_terminal_status": status,
+                    }, sort_keys=True)),
+                )
+
+
+def _bundle_task_daemon(tmp_path):
+    conn = db.connect(tmp_path / "bundle-tasks.sqlite")
+    daemon = WriteDaemon(conn)
+    with daemon.transaction() as sql:
+        sql.execute(
+            "INSERT INTO goal(id,version,text,predicate_json) "
+            "VALUES (1,1,'goal','{}')")
+        sql.execute(
+            "INSERT INTO cycle(id,goal_id,goal_ver,status,policy_version) "
+            "VALUES (1,1,1,'bundle','test')")
+        sql.execute(
+            "INSERT INTO build_target("
+            "id,cycle_id,target_kind,seq,status) "
+            "VALUES (7,1,'build',1,'pending')")
+    return conn, daemon
+
+
+def _review_payload_hash(payload):
+    return "sha256:" + hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _test_verified_reviews(conn, *, cycle_id):
+    return [
+        (int(decision_id), json.loads(raw))
+        for decision_id, raw in conn.execute(
+            "SELECT id,payload_json FROM decision "
+            "WHERE cycle_id=? AND actor='agent' "
+            "AND type='runtime_review' ORDER BY id",
+            (cycle_id,),
+        ).fetchall()
+    ]
+
+
+def _record_authoritative_review_children(
+        daemon, *, runner_call_id, purpose, target_id=7):
+    with daemon.transaction() as conn:
+        for review_kind, child_thread_id, role_tag in (
+                ("bundle_code", "thread-code-review", "code"),
+                ("bundle_result", "thread-result-review", "result")):
+            receipt = {
+                "protocol": "native-review-receipt-v1",
+                "review_request_id": f"nrr-{role_tag}-000000000001",
+                "cycle_id": "c1",
+                "stage": "bundle",
+                "target_id": str(target_id),
+                "purpose": purpose,
+                "review_kind": review_kind,
+                "round_no": 1,
+                "configured_rounds": 1,
+                "runner_call_id": runner_call_id,
+                "child_thread_id": child_thread_id,
+                "verdict": "pass",
+                "resulting_subject_hash": (
+                    "sha256:" + (
+                        "a" if review_kind == "bundle_code"
+                        else "b") * 64),
+            }
+            receipt["receipt_hash"] = _review_payload_hash(receipt)
+            review_id = conn.execute(
+                "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                "VALUES (1,'agent','runtime_review',?)",
+                (json.dumps(receipt, sort_keys=True),),
+            ).lastrowid
+            snapshot_ref = f"/proof/{role_tag}-{runner_call_id}.json"
+            proof = {
+                "protocol": "native-review-live-owner-proof-v1",
+                "review_decision_id": review_id,
+                "review_receipt_hash": receipt["receipt_hash"],
+                "cycle_id": "c1",
+                "stage": "bundle",
+                "target_id": str(target_id),
+                "purpose": purpose,
+                "runner_call_id": runner_call_id,
+                "child_thread_id": child_thread_id,
+                "snapshot_ref": snapshot_ref,
+            }
+            conn.execute(
+                "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                "VALUES (1,'orchestrator',"
+                "'native_review_live_owner_proof',?)",
+                (json.dumps(proof, sort_keys=True),),
+            )
+            if review_kind == "bundle_code":
+                selector = {
+                    "protocol": "runtime-stage-submission-index-v1",
+                    "stage": "bundle",
+                    "target_id": str(target_id),
+                    "review_decision_id": review_id,
+                    "artifact_hash": receipt["resulting_subject_hash"],
+                }
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (1,'agent','runtime_stage_submission',?)",
+                    (json.dumps(selector, sort_keys=True),),
+                )
+            else:
+                selector = {
+                    "protocol": "native-bundle-result-review-ack-v2",
+                    "cycle_id": "c1",
+                    "build_target_id": target_id,
+                    "review_decision_id": review_id,
+                    "review_receipt_hash": receipt["receipt_hash"],
+                    "subject_hash": receipt["resulting_subject_hash"],
+                }
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (1,'orchestrator',"
+                    "'runtime_bundle_result_review_ack',?)",
+                    (json.dumps(selector, sort_keys=True),),
+                )
+        conn.execute(
+            "UPDATE build_target SET status='complete' WHERE id=?",
+            (target_id,),
+        )
 
 
 def _wildidea_provider(scripted, tmp_path, *, bridge=None, adapter=None):
@@ -355,6 +552,27 @@ def test_plan_search_sidecar_rejects_human_named_without_authority(tmp_path):
         {"import_search_request.json": bad}, {"plan.json": _PLAN}], tmp_path)
     assert sp.plan(NS(cycle_id="c1"), _pack("plan")) == {"plan.json": _PLAN}
     assert "source_authority_hash" in runner.skills_seen[1]
+
+
+def test_plan_gpu_compatibility_flag_derives_from_abstract_resource_count(
+        tmp_path):
+    plan = json.loads(json.dumps(_PLAN))
+    plan["targets"][0]["resources"] = {"gpu_count": 0}
+    plan["targets"][0]["gpu_required"] = True
+    policy = json.loads(json.dumps(NO_BUDGET_POLICY))
+    policy["resources"]["gpu_target_policy"] = "required"
+    runner = MockRunner([{"plan.json": plan}])
+    provider = StageProvider(
+        runner_factory=lambda _td, _purpose: runner,
+        schemas=SCHEMAS, policy=policy, system_prompt="SYS",
+        skills=SKILLS, work_root=str(tmp_path))
+
+    result = provider.plan(
+        NS(cycle_id="c1"), _pack("plan"))["plan.json"]
+
+    assert result["targets"][0]["resources"] == {"gpu_count": 0}
+    assert result["targets"][0]["gpu_required"] is False
+    assert result["targets"][1]["gpu_required"] is True
 
 
 def test_reasoning_returns_validated_files(tmp_path):
@@ -514,6 +732,252 @@ _MANIFEST = json.loads((_FIX / "execution_manifest" / "build_toy.json").read_tex
 def _bundle_envelope():
     return {"execution_manifest.json": _MANIFEST, "identity.md": "# toy\n## 复现命令\npython train.py",
             "train.py": "print('t')", "eval.py": "print('e')", "cfg.json": {"lr": 0.1}}
+
+
+def test_bundle_scheduler_and_target_worker_bind_distinct_resident_tasks(
+        tmp_path, monkeypatch):
+    class ResidentRunner(MockRunner):
+        def __init__(self, scripted, *, receipt_tag):
+            super().__init__(scripted)
+            self.bound = []
+            self.receipt_tag = receipt_tag
+            self.runner_call_id = None
+            self.purpose = None
+
+        def bind_persistent_session(self, *, session_id, role):
+            self.bound.append((session_id, role))
+
+        def bind_runner_call(
+                self, *, runner_call_id, reconcile_protocol,
+                phase, purpose):
+            del reconcile_protocol, phase
+            self.runner_call_id = runner_call_id
+            self.purpose = purpose
+
+        def run_task(self, *, system_prompt, skill, context_pack):
+            artifact = super().run_task(
+                system_prompt=system_prompt, skill=skill,
+                context_pack=context_pack)
+            if self.receipt_tag == "worker":
+                _record_authoritative_review_children(
+                    daemon, runner_call_id=self.runner_call_id,
+                    purpose=self.purpose)
+            artifact.execution_receipt_ref = (
+                f"/execution/{self.receipt_tag}.json")
+            artifact.provider_receipt_ref = (
+                f"/provider/{self.receipt_tag}.json")
+            return artifact
+
+    conn, daemon = _bundle_task_daemon(tmp_path)
+    ledger = _SqlLifecycleLedger(daemon)
+    purposes = []
+    runners = []
+
+    @_bundle_task_factory
+    def factory(_transcripts, purpose):
+        purposes.append(purpose)
+        scripted = [{}] if purpose.startswith("bundle-scheduler-") else [
+            _bundle_envelope()]
+        receipt_tag = (
+            "scheduler" if purpose.startswith("bundle-scheduler-")
+            else "worker")
+        runner = _bundle_task_runner(ResidentRunner(
+            scripted, receipt_tag=receipt_tag))
+        runners.append(runner)
+        return runner
+
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda path, **_kwargs: NS(
+            provider_invocation_id=(
+                "thread-scheduler"
+                if str(path).endswith("scheduler.json")
+                else "thread-worker"),
+            execution_outcome="exit",
+            execution_returncode=0,
+        ))
+    monkeypatch.setattr(
+        "orchestrator.bundle_tasks._load_verified_native_reviews",
+        _test_verified_reviews)
+    reconciliations = []
+    reconcile = BundleTaskRegistry.reconcile_terminal_workers
+
+    def record_reconciliation(registry, cycle_id):
+        reconciliations.append(cycle_id)
+        return reconcile(registry, cycle_id)
+
+    monkeypatch.setattr(
+        BundleTaskRegistry, "reconcile_terminal_workers",
+        record_reconciliation)
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, resident_stage_sessions=True,
+        inline_subagent_review=True)
+    scheduler_pack = NS(
+        cycle_id="c1", stage="bundle", target_id=None,
+        anchor_md="", neighborhood_md="", retrieval_md="", refs=[],
+        sources=[], pack_hash="scheduler-pack")
+
+    assert provider.bundle_scheduler(
+        NS(cycle_id="c1"), scheduler_pack) == {}
+    assert reconciliations == ["c1", "c1"]
+    worker_result = provider.bundle_worker(
+        NS(cycle_id="c1"), _pack("bundle"))
+
+    assert worker_result["execution_manifest.json"] == _MANIFEST
+    assert purposes == [
+        "bundle-scheduler-c1-n1",
+        "bundle-worker-c1-t7-n2",
+    ]
+    assert runners[0].bound == [(None, "bundle_scheduler")]
+    assert runners[1].bound == [(None, "target_worker")]
+    worker_skill = runners[1].skills_seen[0]
+    assert "bundle_next_target" not in worker_skill
+    assert 'mode="snapshot"' in worker_skill
+    assert 'mode="incremental"' in worker_skill
+    assert "60→120→300→600→1800" in worker_skill
+    assert "自己的 target" in worker_skill
+    assert worker_skill.index('mode="snapshot"') < worker_skill.index(
+        "bundle_execute 异步启动")
+    assert "bundle_execute 返回的更新 cursor" in worker_skill
+    assert daemon.query_one(
+        "SELECT build_target_id,role,provider_task_id,status,receipt_ref "
+        "FROM bundle_worker_task WHERE role='worker'") == (
+            7, "worker", "thread-worker", "completed",
+            "/provider/worker.json")
+    assert daemon.query_one(
+        "SELECT count(*) FROM bundle_worker_task "
+        "WHERE build_target_id=7") == (3,)
+    conn.close()
+
+
+def test_bundle_worker_provider_interruption_resumes_same_durable_task(
+        tmp_path, monkeypatch):
+    class ResidentRunner(MockRunner):
+        def __init__(self, scripted, *, receipt_tag):
+            super().__init__(scripted)
+            self.bound = []
+            self.receipt_tag = receipt_tag
+            self.runner_call_id = None
+            self.purpose = None
+
+        def bind_persistent_session(self, *, session_id, role):
+            self.bound.append((session_id, role))
+
+        def bind_runner_call(
+                self, *, runner_call_id, reconcile_protocol,
+                phase, purpose):
+            del reconcile_protocol, phase
+            self.runner_call_id = runner_call_id
+            self.purpose = purpose
+
+        def run_task(self, *, system_prompt, skill, context_pack):
+            artifact = super().run_task(
+                system_prompt=system_prompt, skill=skill,
+                context_pack=context_pack)
+            _record_authoritative_review_children(
+                daemon, runner_call_id=self.runner_call_id,
+                purpose=self.purpose)
+            artifact.execution_receipt_ref = (
+                f"/execution/{self.receipt_tag}.json")
+            artifact.provider_receipt_ref = (
+                f"/provider/{self.receipt_tag}.json")
+            return artifact
+
+    conn, daemon = _bundle_task_daemon(tmp_path)
+    ledger = _SqlLifecycleLedger(daemon)
+    runners = []
+
+    @_bundle_task_factory
+    def factory(_transcripts, _purpose):
+        ordinal = len(runners) + 1
+        receipt_tag = f"worker-{ordinal}"
+        scripted = (
+            [RunnerError(
+                "transport interrupted",
+                failure_kind="transport",
+                execution_receipt_ref=(
+                    f"/execution/{receipt_tag}.json"),
+                provider_receipt_ref=(
+                    f"/provider/{receipt_tag}.json"))]
+            if ordinal == 1 else [_bundle_envelope()]
+        )
+        runner = _bundle_task_runner(ResidentRunner(
+            scripted, receipt_tag=receipt_tag))
+        runners.append(runner)
+        return runner
+
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda _path, **_kwargs: NS(
+            provider_invocation_id="thread-worker",
+            execution_outcome="exit",
+            execution_returncode=0,
+        ))
+    monkeypatch.setattr(
+        "orchestrator.bundle_tasks._load_verified_native_reviews",
+        _test_verified_reviews)
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, resident_stage_sessions=True)
+
+    with pytest.raises(RunnerError, match="transport interrupted"):
+        provider.bundle_worker(
+            NS(cycle_id="c1"), _pack("bundle"))
+    assert daemon.query_one(
+        "SELECT provider_task_id,status,receipt_ref "
+        "FROM bundle_worker_task") == (
+            "thread-worker", "waiting", "/provider/worker-1.json")
+
+    result = provider.bundle_worker(
+        NS(cycle_id="c1"), _pack("bundle"))
+
+    assert result["execution_manifest.json"] == _MANIFEST
+    assert runners[0].bound == [(None, "target_worker")]
+    assert runners[1].bound == [("thread-worker", "target_worker")]
+    assert daemon.query_one(
+        "SELECT count(*),min(id),max(id) FROM bundle_worker_task "
+        "WHERE role='worker'") == (
+            1, 1, 1)
+    assert daemon.query_one(
+        "SELECT provider_task_id,status,receipt_ref "
+        "FROM bundle_worker_task WHERE role='worker'") == (
+            "thread-worker", "completed", "/provider/worker-1.json")
+    assert daemon.query(
+        "SELECT role,provider_task_id,status FROM bundle_worker_task "
+        "WHERE role<>'worker' ORDER BY role") == [
+            ("code_review", "thread-code-review", "completed"),
+            ("result_review", "thread-result-review", "completed"),
+        ]
+    conn.close()
+
+
+def test_bundle_task_scope_rejects_targetless_worker_and_targeted_scheduler(
+        tmp_path):
+    ledger = _RecordingLedger()
+    ledger.daemon = NS(query=lambda _sql, _params: [])
+
+    @_bundle_task_factory
+    def factory(_transcripts, _purpose):
+        return _bundle_task_runner(MockRunner([]))
+
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, resident_stage_sessions=True)
+    targetless = NS(
+        cycle_id="c1", stage="bundle", target_id=None,
+        anchor_md="", neighborhood_md="", retrieval_md="", refs=[],
+        sources=[], pack_hash="targetless")
+
+    with pytest.raises(ValueError, match="Scheduler.*target"):
+        provider.bundle_scheduler(
+            NS(cycle_id="c1"), _pack("bundle"))
+    with pytest.raises(ValueError, match="Worker.*target"):
+        provider.bundle_worker(
+            NS(cycle_id="c1"), targetless)
 
 
 def _bundle_operator_control(*, event="start", subject_char="a"):
@@ -781,6 +1245,162 @@ def test_plan_main_resumes_one_stage_thread_across_provider_turns(tmp_path, monk
     assert runners[1].bound == [("thread-plan-1", "stage_main")]
 
 
+def test_inline_review_skill_uses_owner_input_protocol_and_fresh_children(
+        tmp_path):
+    provider = StageProvider(
+        runner_factory=lambda _td, _pt: MockRunner([]),
+        schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        inline_subagent_review=True)
+
+    plan_skill = provider._main_stage_review_skill(
+        "plan", SKILLS["plan"], "plan", 1)
+    assert "prepare_review" in plan_skill
+    assert 'fork_turns="none"' in plan_skill
+    assert "read_review_input" in plan_skill
+    assert "native-review-result-v1" in plan_skill
+    assert "dispositions" in plan_skill
+    assert "record_review" in plan_skill
+    assert "精确 1 轮" in plan_skill
+
+    idea_skill = provider._main_stage_review_skill(
+        "idea", SKILLS["idea"], "idea", 1)
+    assert "wildidea_audit" in idea_skill
+    assert "generation_path=wildidea" in idea_skill
+    assert "服务端内部生成的 exact draft" in idea_skill
+    assert "不得启动 native child" in idea_skill
+    assert "generation_path=bypass" in idea_skill
+    assert "精确 1 轮" in idea_skill
+
+    bundle_skill = provider._main_stage_review_skill(
+        "bundle", SKILLS["bundle"], "bundle_code", 1)
+    assert "每个 target" in bundle_skill
+    assert "结果审查必须另启一个新的干净子智能体" in bundle_skill
+    assert "同一个干净子智能体" not in bundle_skill
+
+
+@pytest.mark.parametrize("require_provider_binding", [False, True])
+def test_resident_idea_main_absorbs_internal_wildidea_audit(
+        tmp_path, require_provider_binding):
+    purposes = []
+    ledger = _RecordingLedger()
+    ledger.daemon = NS(query=lambda _sql, _params: [])
+    adapter = WildIdeaAdapter(
+        SYSTEM_ROOT, NO_BUDGET_POLICY,
+        novelty_provider=_FakeNoveltyProvider())
+    pack = _real_pack("c1")
+    provider_holder = {}
+
+    draft_candidates = []
+    audit_scores = []
+    for index, candidate_id in enumerate(("c0", "c1", "c2")):
+        candidate = json.loads(json.dumps(
+            _IDEA["candidates"][0], ensure_ascii=False))
+        candidate["candidate_id"] = candidate_id
+        candidate["audit_mapping"]["source_domain"] += f"-{candidate_id}"
+        candidate["novelty_queries"] = [
+            f"cross subject EEG mechanism {candidate_id}"]
+        draft_candidates.append(candidate)
+        score = json.loads(json.dumps(
+            _IDEA["audit_scores"][0], ensure_ascii=False))
+        score["candidate_id"] = candidate_id
+        audit_scores.append(score)
+    draft = {
+        "need_innovation": True,
+        "candidates": draft_candidates,
+        "novelty_refs": [],
+    }
+
+    class MainRunner:
+        stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+
+        def __init__(self):
+            self.bound = []
+
+        def bind_persistent_session(self, *, session_id, role):
+            self.bound.append((session_id, role))
+
+        def run_task(self, *, system_prompt, skill, context_pack):
+            del system_prompt, skill
+            scope = NS(
+                cycle_id="c1", stage="idea", target_id=None,
+                purpose="idea-main-c1-n1-a1",
+                pack_hash=context_pack.pack_hash, runner_call_id=1)
+            expanded = provider_holder["provider"].prepare_resident_wildidea(
+                scope, need_innovation=True)
+            assert expanded["generation_path"] == "wildidea"
+            assert expanded["draft"] == draft
+            tampered = json.loads(json.dumps(
+                expanded["draft"], ensure_ascii=False))
+            tampered["candidates"][0]["core_claim"] += " caller mutation"
+            with pytest.raises(RuntimeError, match="服务端生成的 exact draft"):
+                provider_holder["provider"].audit_resident_wildidea(
+                    scope, draft=tampered)
+            merged = provider_holder["provider"].audit_resident_wildidea(
+                scope, draft=expanded["draft"])
+            return Artifact(
+                stage="idea",
+                files={"idea_set.json": merged["idea_set"]}, md="")
+
+    main_runner = MainRunner()
+    generation_runner = MockRunner([{
+        "idea_set.draft.json": draft,
+    }])
+    audit_runner = MockRunner([{
+        "idea_audit.json": {
+            "audit_scores": audit_scores,
+            "selected_id": "c2",
+        },
+    }])
+
+    @_resident_factory
+    def factory(_transcripts, purpose):
+        purposes.append(purpose)
+        if purpose.startswith("idea-main-"):
+            return main_runner
+        if purpose.startswith("idea-generate-internal-"):
+            return generation_runner
+        assert purpose.startswith("idea-audit-internal-")
+        return audit_runner
+
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS,
+        policy=NO_BUDGET_POLICY, system_prompt="SYS", skills=SKILLS,
+        work_root=str(tmp_path), cost_ledger=ledger,
+        resident_stage_sessions=True, inline_subagent_review=True,
+        wildidea_adapter=adapter, idea_audit_pack_builder=_audit_source,
+        require_wildidea_provider_binding=require_provider_binding)
+    provider_holder["provider"] = provider
+
+    if require_provider_binding:
+        with pytest.raises(
+                RuntimeError, match="accepted provider binding"):
+            provider.idea(NS(cycle_id="c1"), pack)
+        assert purposes == [
+            "idea-main-c1-n1",
+            "idea-generate-internal-n2",
+            "idea-audit-internal-n3",
+        ]
+        return
+
+    result = provider.idea(NS(cycle_id="c1"), pack)["idea_set.json"]
+
+    assert result["need_innovation"] is True
+    assert {row["candidate_id"] for row in result["audit_scores"]} == {
+        "c0", "c1", "c2"}
+    assert "provenance" not in result
+    assert purposes == [
+        "idea-main-c1-n1",
+        "idea-generate-internal-n2",
+        "idea-audit-internal-n3",
+    ]
+    assert "need_innovation=true" in generation_runner.skills_seen[0]
+    assert "不得调用 wildidea_expand" in generation_runner.skills_seen[0]
+    assert main_runner.bound == [(None, "stage_main")]
+    assert not hasattr(generation_runner, "bound")
+    assert not hasattr(audit_runner, "bound")
+
+
 def test_resident_plan_schema_reject_never_starts_outer_retry(tmp_path):
     class EmptyDaemon:
         def query(self, _sql, _params):
@@ -864,6 +1484,31 @@ def test_all_empty_receipts_block_fresh_resident_session(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="拒绝新建会话"):
         provider._stage_main_session_id(NS(cycle_id="c1"), "plan")
+
+
+def test_terminal_nonzero_empty_receipt_allows_fresh_resident_session(
+        tmp_path, monkeypatch):
+    class Daemon:
+        def query(self, _sql, _params):
+            return [
+                (11, "plan", "plan-main-c1-n1-a1", "/provider/empty", "/exec/11"),
+            ]
+
+    ledger = _RecordingLedger()
+    ledger.daemon = Daemon()
+    factory = _resident_factory(lambda _td, _pt: None)
+    provider = StageProvider(
+        runner_factory=factory, schemas=SCHEMAS, policy=NO_BUDGET_POLICY,
+        system_prompt="SYS", skills=SKILLS, work_root=str(tmp_path),
+        cost_ledger=ledger, resident_stage_sessions=True)
+    monkeypatch.setattr(
+        "orchestrator.stage_provider.load_provider_invocation_receipt",
+        lambda _path, **_kwargs: NS(
+            provider_invocation_id=None,
+            execution_outcome="exit",
+            execution_returncode=1))
+
+    assert provider._stage_main_session_id(NS(cycle_id="c1"), "plan") is None
 
 
 def test_bundle_operator_recovers_receipts_from_frozen_decision_schema(

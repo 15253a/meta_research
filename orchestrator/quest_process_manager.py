@@ -288,7 +288,7 @@ class QuestProcessManager:
         return request.process
 
     def runtime_health(self) -> Dict[str, Any]:
-        """Return a path-free, read-only readiness projection for the Web UI."""
+        """Return path-free readiness using the direct, storage-respecting CLI."""
         with self._guard:
             cached = self._health_cache
             if cached is not None and time.monotonic() - cached[0] < 10.0:
@@ -324,7 +324,8 @@ class QuestProcessManager:
             checks["docker_engine"] = (
                 os.path.isabs(engine) and os.path.isfile(engine)
                 and os.access(engine, os.X_OK))
-            codex_bin = os.environ.get("METARESEARCH_CODEX_BIN", "codex-chatgpt")
+            codex_bin = os.environ.get(
+                "METARESEARCH_CODEX_BIN", "/usr/local/bin/codex")
             query_bin = os.environ.get(
                 "METARESEARCH_QUERY_CODEX_BIN", "/usr/local/bin/codex")
             checks["codex_cli"] = shutil.which(codex_bin) is not None

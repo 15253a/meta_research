@@ -191,10 +191,19 @@ class CheckpointPublication:
 
 
 @dataclass(frozen=True)
+class ImplementationRevisionPublication:
+    """One immutable implementation/checkpoint generation owned by a run."""
+
+    run_id: int
+    code_source: Path
+
+
+@dataclass(frozen=True)
 class TrainingPublicationSpec:
     baseline: BaselinePublication
     variant: VariantPublication
     checkpoints: Sequence[CheckpointPublication]
+    implementation_revision: Optional[ImplementationRevisionPublication] = None
 
 
 @dataclass(frozen=True)
@@ -696,6 +705,7 @@ class PoolPublisher:
         variant_key = _component(variant.variant_key, label="variant_key")
         baseline_dir = _baseline_directory(baseline.slug, baseline.canonical_key)
         baseline_root = self.work_root / "baselines" / baseline_dir
+        variant_root = baseline_root / "variants" / variant_key
         config, config_raw = _config_json(variant.config)
         checkpoints = list(spec.checkpoints)
         if not checkpoints:
@@ -707,7 +717,17 @@ class PoolPublisher:
         if len(set(provided_checkpoint_ids)) != len(provided_checkpoint_ids):
             raise PoolPublicationError("checkpoint id 重复")
 
-        mode = "baseline" if baseline.publishes_identity else "variant"
+        publishes_identity = baseline.publishes_identity
+        revision_spec = spec.implementation_revision
+        if revision_spec is not None and publishes_identity:
+            raise PoolPublicationError(
+                "implementation revision 不得重发 baseline identity/source")
+        if revision_spec is not None and variant.overrides_source is not None:
+            raise PoolPublicationError(
+                "implementation revision 须由 run-bound code_source 唯一承载")
+        mode = (
+            "revision" if revision_spec is not None else
+            ("baseline" if publishes_identity else "variant"))
         stage = self._stage()
         try:
             if mode == "baseline":
@@ -722,6 +742,16 @@ class PoolPublisher:
                 variants_parent.mkdir(mode=0o700)
                 variant_stage = variants_parent / variant_key
                 variant_stage.mkdir(mode=0o700)
+                _write_new_file(variant_stage / "config.json", config_raw)
+                config_digest = _path_digest(variant_stage / "config.json")
+                overrides_digest = None
+                if variant.overrides_source is not None:
+                    overrides_digest = _copy_tree(
+                        Path(variant.overrides_source), variant_stage / "overrides")
+                checkpoint_stage_root = variant_stage / "checkpoints"
+                checkpoint_stage_root.mkdir(mode=0o700)
+                (variant_stage / "evaluations").mkdir(mode=0o700)
+                checkpoint_final_root = variant_root / "checkpoints"
             else:
                 _lstat_directory(baseline_root)
                 # An exec variant may only extend an already materialized baseline, never a
@@ -739,20 +769,59 @@ class PoolPublisher:
                 if code_digest["kind"] != "directory":
                     raise PoolPublicationError("既有 formal baseline src 不是目录")
                 variants_parent = baseline_root / "variants"
-                _lstat_directory(variants_parent, create=True)
-                final_unit = variants_parent / variant_key
-                unit = stage / "variant"
-                unit.mkdir(mode=0o700)
-                variant_stage = unit
-
-            _write_new_file(variant_stage / "config.json", config_raw)
-            config_digest = _path_digest(variant_stage / "config.json")
-            overrides_digest = None
-            if variant.overrides_source is not None:
-                overrides_digest = _copy_tree(
-                    Path(variant.overrides_source), variant_stage / "overrides")
-            (variant_stage / "checkpoints").mkdir(mode=0o700)
-            (variant_stage / "evaluations").mkdir(mode=0o700)
+                if mode == "variant":
+                    _lstat_directory(variants_parent, create=True)
+                    final_unit = variant_root
+                    unit = stage / "variant"
+                    unit.mkdir(mode=0o700)
+                    variant_stage = unit
+                    _write_new_file(variant_stage / "config.json", config_raw)
+                    config_digest = _path_digest(variant_stage / "config.json")
+                    overrides_digest = None
+                    if variant.overrides_source is not None:
+                        overrides_digest = _copy_tree(
+                            Path(variant.overrides_source),
+                            variant_stage / "overrides")
+                    checkpoint_stage_root = variant_stage / "checkpoints"
+                    checkpoint_stage_root.mkdir(mode=0o700)
+                    (variant_stage / "evaluations").mkdir(mode=0o700)
+                    checkpoint_final_root = variant_root / "checkpoints"
+                else:
+                    _lstat_directory(variant_root)
+                    config_path = variant_root / "config.json"
+                    if _read_regular(
+                            config_path, maximum=_MAX_MANIFEST_BYTES) != config_raw:
+                        raise PoolPublicationError(
+                            "implementation revision 与既有 variant config 不一致")
+                    config_digest = _path_digest(config_path)
+                    if config_digest["kind"] != "file":
+                        raise PoolPublicationError(
+                            "既有 formal variant config.json 不是文件")
+                    overrides_digest = None
+                    overrides_path = variant_root / "overrides"
+                    try:
+                        overrides_info = overrides_path.lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if (stat.S_ISLNK(overrides_info.st_mode)
+                                or not stat.S_ISDIR(overrides_info.st_mode)):
+                            raise PoolPublicationError(
+                                "既有 formal variant overrides 不是目录")
+                        overrides_digest = _path_digest(overrides_path)
+                    revision_run = _checked_id(
+                        revision_spec.run_id,
+                        label="implementation_revision.run_id")
+                    revisions_parent = variant_root / "revisions"
+                    _lstat_directory(revisions_parent, create=True)
+                    final_unit = revisions_parent / f"run-{revision_run}"
+                    unit = stage / "revision"
+                    unit.mkdir(mode=0o700)
+                    revision_code_digest = _copy_tree(
+                        Path(revision_spec.code_source), unit / "src")
+                    checkpoint_stage_root = unit / "checkpoints"
+                    checkpoint_stage_root.mkdir(mode=0o700)
+                    checkpoint_final_root = final_unit / "checkpoints"
 
             checkpoint_objects = []
             for item in sorted(checkpoints, key=lambda value: value.ckpt_key):
@@ -765,15 +834,14 @@ class PoolPublisher:
                     raise PoolPublicationError(
                         f"checkpoint 须为单个常规文件（多 fold 用多个 checkpoint）: {source}")
                 file_name = _component(item.file_name or source.name, label="checkpoint.file_name")
-                ckpt_dir = variant_stage / "checkpoints" / key
+                ckpt_dir = checkpoint_stage_root / key
                 ckpt_dir.mkdir(mode=0o700)
                 digest = _copy_file(source, ckpt_dir / file_name)
                 expected = _normalize_hash(item.expected_sha256, label=f"checkpoint {key} expected_sha256")
                 if expected is not None and digest["sha256"] != expected:
                     raise PoolPublicationError(
                         f"checkpoint {key} hash 不符: {digest['sha256']} != {expected}")
-                final_file = (baseline_root / "variants" / variant_key /
-                              "checkpoints" / key / file_name)
+                final_file = checkpoint_final_root / key / file_name
                 checkpoint_objects.append({
                     "checkpoint_id": cid, "ckpt_key": item.ckpt_key,
                     "path": _relative_ref(final_file, self.work_root),
@@ -783,7 +851,6 @@ class PoolPublisher:
 
             unit_digest = _path_digest(unit)
             self._publish_directory(unit, final_unit, unit_digest)
-            variant_root = baseline_root / "variants" / variant_key
             objects: Dict[str, Any] = {
                 "baseline": {
                     "baseline_id": bid, "slug": baseline.slug,
@@ -823,6 +890,22 @@ class PoolPublisher:
                     "bytes": code_asset["bytes"], "files": code_asset["files"],
                 },
             })
+            if mode == "revision":
+                revision_code = _path_digest(final_unit / "src")
+                if revision_code != revision_code_digest:
+                    raise PoolPublicationError(
+                        "implementation revision code 发布后 hash 漂移")
+                objects["implementation_revision"] = {
+                    "run_id": revision_run,
+                    "root": _relative_ref(final_unit, self.work_root),
+                    "code": {
+                        "path": _relative_ref(final_unit / "src", self.work_root),
+                        "sha256": revision_code["sha256"],
+                        "hash_alg": TREE_HASH_ALG,
+                        "bytes": revision_code["bytes"],
+                        "files": revision_code["files"],
+                    },
+                }
             payload = {
                 "schema": TRAINING_SCHEMA, "mode": mode, "objects": objects,
                 "unit": {"path": _relative_ref(final_unit, self.work_root),
@@ -983,6 +1066,9 @@ class PoolPublisher:
                      "files": attempt_publish_digest["files"]},
                 ],
             }
+            if "implementation_revision" in objects:
+                payload["objects"]["implementation_revision"] = (
+                    objects["implementation_revision"])
             # The manifest path is content addressed, so transcript_ref can carry both path and hash
             # without adding a schema column.  Fill it after hashing by keeping db_bindings outside the
             # hashed payload impossible; instead the binding stores the artifact hash now and callers
@@ -1006,6 +1092,10 @@ class PoolPublisher:
                     "execution_log_hash": final_primary_asset["sha256"],
                 },
             }
+            revision_binding = _implementation_revision_binding(objects)
+            if revision_binding is not None:
+                payload["db_bindings"]["implementation_revision"] = (
+                    revision_binding)
             manifest_ref, manifest_hash = self._publish_manifest(payload)
             return self.verify_publication(manifest_ref, expected_hash=manifest_hash)
         finally:
@@ -1022,8 +1112,9 @@ class PoolPublisher:
         ``.pool-staging``) are never accepted as formal assets.
         """
         mode = payload.get("mode")
-        if mode not in ("baseline", "variant"):
-            raise PoolPublicationError("training manifest mode 非 baseline/variant")
+        if mode not in ("baseline", "variant", "revision"):
+            raise PoolPublicationError(
+                "training manifest mode 非 baseline/variant/revision")
         objects = _manifest_mapping(payload.get("objects"), label="training.objects")
         baseline = _manifest_mapping(objects.get("baseline"), label="training.baseline")
         variant = _manifest_mapping(objects.get("variant"), label="training.variant")
@@ -1100,6 +1191,33 @@ class PoolPublisher:
                 or got_code["files"] != code["files"]):
             raise PoolPublicationError("formal baseline code hash 失配")
 
+        revision_root = None
+        if mode == "revision":
+            revision = _manifest_mapping(
+                objects.get("implementation_revision"),
+                label="training.implementation_revision")
+            revision_run = _checked_id(
+                revision.get("run_id"),
+                label="training.implementation_revision.run_id")
+            revision_root = variant_root / "revisions" / f"run-{revision_run}"
+            _exact_manifest_ref(
+                revision.get("root"), revision_root,
+                label="training.implementation_revision.root")
+            revision_code = _validate_tree_asset(
+                revision.get("code"), path=revision_root / "src",
+                label="training.implementation_revision.code")
+            got_revision_code = _path_digest(
+                _resolve_ref(self.work_root, revision_code["path"]))
+            if (got_revision_code["kind"] != "directory"
+                    or got_revision_code["sha256"] != revision_code["sha256"]
+                    or got_revision_code["bytes"] != revision_code["bytes"]
+                    or got_revision_code["files"] != revision_code["files"]):
+                raise PoolPublicationError(
+                    "formal implementation revision code hash 失配")
+        elif "implementation_revision" in objects:
+            raise PoolPublicationError(
+                "baseline/variant training manifest 不得带 implementation revision")
+
         seen_keys: set[str] = set()
         seen_ids: set[int] = set()
         for index, raw_checkpoint in enumerate(checkpoints, start=1):
@@ -1122,7 +1240,9 @@ class PoolPublisher:
             checkpoint_ref = _manifest_ref(
                 checkpoint.get("path"),
                 label=f"training.checkpoints[{index}].path")
-            checkpoint_parent = variant_root / "checkpoints" / key
+            checkpoint_parent = (
+                (revision_root if mode == "revision" else variant_root)
+                / "checkpoints" / key)
             if checkpoint_ref.parent != checkpoint_parent:
                 raise PoolPublicationError(
                     f"training checkpoint {key} 未位于身份派生的 formal namespace")
@@ -1141,12 +1261,22 @@ class PoolPublisher:
                 raise PoolPublicationError(
                     f"formal checkpoint hash 失配: {checkpoint_ref.as_posix()}")
 
-        unit_path = baseline_root if mode == "baseline" else variant_root
+        unit_path = (
+            baseline_root if mode == "baseline" else
+            (variant_root if mode == "variant" else revision_root))
         # The root is appendable, so its old tree digest cannot be re-hashed
         # after later variants/evaluations arrive.  Its namespace and metadata
         # are still schema-checked; immutable owned assets above are re-hashed.
-        _validate_tree_asset(payload.get("unit"), path=unit_path,
-                             label="training.unit")
+        unit = _validate_tree_asset(
+            payload.get("unit"), path=unit_path, label="training.unit")
+        if mode == "revision":
+            got_unit = _path_digest(_resolve_ref(self.work_root, unit["path"]))
+            if (got_unit["kind"] != "directory"
+                    or got_unit["sha256"] != unit["sha256"]
+                    or got_unit["bytes"] != unit["bytes"]
+                    or got_unit["files"] != unit["files"]):
+                raise PoolPublicationError(
+                    "formal implementation revision unit hash 失配")
         return objects
 
     def _validate_publication_contract(
@@ -1167,6 +1297,12 @@ class PoolPublisher:
         if variant != training_objects["variant"]:
             raise PoolPublicationError(
                 "publication variant 与 training_manifest objects 脱钩")
+        if (("implementation_revision" in objects)
+                != ("implementation_revision" in training_objects)
+                or objects.get("implementation_revision")
+                != training_objects.get("implementation_revision")):
+            raise PoolPublicationError(
+                "publication implementation revision 与 training_manifest objects 脱钩")
         training_checkpoints = training_objects["checkpoints"]
         if len(checkpoints) != len(training_checkpoints):
             raise PoolPublicationError(
@@ -1343,6 +1479,9 @@ class PoolPublisher:
                 "execution_log_hash": primary["sha256"],
             },
         }
+        revision_binding = _implementation_revision_binding(objects)
+        if revision_binding is not None:
+            expected_bindings["implementation_revision"] = revision_binding
         if bindings != expected_bindings:
             raise PoolPublicationError(
                 "publication db_bindings 与已验证 formal objects 身份脱钩")
@@ -1441,6 +1580,19 @@ def _resolve_checkpoint_ids(
     return resolved
 
 
+def _implementation_revision_binding(
+        objects: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    revision = objects.get("implementation_revision")
+    if revision is None:
+        return None
+    code = revision["code"]
+    return {
+        "run_id": revision["run_id"],
+        "code_ref": code["path"],
+        "commit_hash": TREE_HASH_ALG + ":" + code["sha256"],
+    }
+
+
 def _database_cards(publication: VerifiedPoolPublication) -> list[Dict[str, Any]]:
     objects = publication.payload["objects"]
     baseline, variant = objects["baseline"], objects["variant"]
@@ -1466,6 +1618,9 @@ def _database_cards(publication: VerifiedPoolPublication) -> list[Dict[str, Any]
         "pool_manifest": {"path": publication.manifest_ref,
                           "sha256": publication.manifest_hash},
     }
+    if "implementation_revision" in objects:
+        variant_source["implementation_revision"] = (
+            objects["implementation_revision"])
     cards.append({"card_type": "variant", "ref_id": variant["variant_id"],
                   "card_md": _card_markdown("Variant formal assets", variant_source),
                   "src_hash": _card_source_hash(variant_source)})
@@ -1512,21 +1667,34 @@ def bind_training_database(
     db_config, _ = _config_json(vrow[2])
     if db_config != variant["config"]:
         raise PoolPublicationError("formal config.json 与 DB variant.config_json 不一致")
-    for checkpoint in checkpoints:
-        row = conn.execute(
-            "SELECT variant_id,ckpt_key,path,content_hash,hash_alg FROM checkpoint WHERE id=?",
-            (checkpoint["checkpoint_id"],)).fetchone()
-        expected = (vid, checkpoint["ckpt_key"], checkpoint["path"],
-                    checkpoint["content_hash"], checkpoint["hash_alg"])
-        if row is None or tuple(row) != expected:
-            raise PoolPublicationError(
-                f"checkpoint {checkpoint['checkpoint_id']} 未以 formal path/hash INSERT")
     normalized_run = None
     if run_id is not None:
         normalized_run = _checked_id(run_id, label="run_id")
-        run = conn.execute("SELECT cycle_id,variant_id FROM run WHERE id=?", (normalized_run,)).fetchone()
+        run = conn.execute(
+            "SELECT cycle_id,variant_id FROM run WHERE id=?",
+            (normalized_run,)).fetchone()
         if run is None or tuple(run) != (cycle_id, vid):
-            raise PoolPublicationError("training publication run/cycle/variant 绑定不一致")
+            raise PoolPublicationError(
+                "training publication run/cycle/variant 绑定不一致")
+    revision_binding = _implementation_revision_binding(objects)
+    if (revision_binding is not None
+            and normalized_run != revision_binding["run_id"]):
+        raise PoolPublicationError(
+            "implementation revision 必须绑定其实际 training run")
+    for checkpoint in checkpoints:
+        row = conn.execute(
+            "SELECT variant_id,ckpt_key,path,content_hash,hash_alg,"
+            "produced_by_run FROM checkpoint WHERE id=?",
+            (checkpoint["checkpoint_id"],)).fetchone()
+        expected = (vid, checkpoint["ckpt_key"], checkpoint["path"],
+                    checkpoint["content_hash"], checkpoint["hash_alg"])
+        if row is None or tuple(row[:5]) != expected:
+            raise PoolPublicationError(
+                f"checkpoint {checkpoint['checkpoint_id']} 未以 formal path/hash INSERT")
+        if revision_binding is not None and row[5] != normalized_run:
+            raise PoolPublicationError(
+                f"implementation revision checkpoint "
+                f"{checkpoint['checkpoint_id']} 未由 run {normalized_run} 产生")
     if conn.execute("SELECT 1 FROM cycle WHERE id=?", (cycle_id,)).fetchone() is None:
         raise PoolPublicationError(f"updated cycle c{cycle_id} 不存在")
 
@@ -1539,6 +1707,8 @@ def bind_training_database(
         "checkpoint_ids": [item["checkpoint_id"] for item in checkpoints],
         "run_id": normalized_run,
     }
+    if revision_binding is not None:
+        event["implementation_revision"] = revision_binding
     canonical_event = _canonical(event).decode("utf-8").rstrip("\n")
     existing = conn.execute(
         "SELECT payload_json FROM decision WHERE actor='gate' "
@@ -1570,6 +1740,7 @@ def bind_database(conn, publication: VerifiedPoolPublication, *, updated_cycle: 
     baseline, variant = objects["baseline"], objects["variant"]
     protocol, evaluation = objects["protocol"], objects["evaluation"]
     bid, vid = baseline["baseline_id"], variant["variant_id"]
+    revision_binding = _implementation_revision_binding(objects)
 
     brow = conn.execute(
         "SELECT slug,canonical_key,identity_doc,code_ref,commit_hash,status FROM baseline WHERE id=?",
@@ -1598,13 +1769,19 @@ def bind_database(conn, publication: VerifiedPoolPublication, *, updated_cycle: 
 
     for checkpoint in objects["checkpoints"]:
         row = conn.execute(
-            "SELECT variant_id,ckpt_key,path,content_hash,hash_alg FROM checkpoint WHERE id=?",
+            "SELECT variant_id,ckpt_key,path,content_hash,hash_alg,"
+            "produced_by_run FROM checkpoint WHERE id=?",
             (checkpoint["checkpoint_id"],)).fetchone()
         expected = (vid, checkpoint["ckpt_key"], checkpoint["path"],
                     checkpoint["content_hash"], checkpoint["hash_alg"])
-        if row is None or tuple(row) != expected:
+        if row is None or tuple(row[:5]) != expected:
             raise PoolPublicationError(
                 f"checkpoint {checkpoint['checkpoint_id']} 未以正式池 path/hash 登记")
+        if (revision_binding is not None
+                and row[5] != revision_binding["run_id"]):
+            raise PoolPublicationError(
+                f"implementation revision checkpoint "
+                f"{checkpoint['checkpoint_id']} run 绑定漂移")
 
     prow = conn.execute(
         "SELECT name,scope_spec_json FROM protocol WHERE id=? AND version=?",
@@ -1668,7 +1845,11 @@ def bind_database(conn, publication: VerifiedPoolPublication, *, updated_cycle: 
             or training_event.get("baseline_id") != bid
             or training_event.get("variant_id") != vid
             or training_event.get("checkpoint_ids")
-            != [row["checkpoint_id"] for row in objects["checkpoints"]]):
+            != [row["checkpoint_id"] for row in objects["checkpoints"]]
+            or (("implementation_revision" in training_event)
+                != (revision_binding is not None))
+            or training_event.get("implementation_revision")
+            != revision_binding):
         raise PoolPublicationError("pool_training_publication DB 锚与完整 publication 不一致")
 
     # Only after every identity/path/hash check may the registration transaction bind refs.
@@ -1683,6 +1864,8 @@ def bind_database(conn, publication: VerifiedPoolPublication, *, updated_cycle: 
         "protocol_id": protocol["protocol_id"], "protocol_ver": protocol["version"],
         "evaluation_id": evaluation["evaluation_id"], "attempt_id": evaluation["attempt_id"],
     }
+    if revision_binding is not None:
+        event["implementation_revision"] = revision_binding
     existing = conn.execute(
         "SELECT payload_json FROM decision WHERE actor='gate' AND type='pool_publication' "
         "AND json_extract(payload_json,'$.manifest_hash')=? ORDER BY id",

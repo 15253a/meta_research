@@ -419,13 +419,21 @@ def test_public_status_redacts_process_and_path_authority(tmp_path):
 def test_runtime_health_is_path_free_and_checks_exact_image(tmp_path, monkeypatch):
     registry = _registry(tmp_path, "alpha")
     manager = QuestProcessManager(registry, SYSTEM_ROOT)
+    monkeypatch.delenv("METARESEARCH_CODEX_BIN", raising=False)
     image_id = (
         "sha256:eeeca161459e242a142661623fed2320f84e810603a42ffc4a5cdbc8694b3bb3")
     completed = type("Completed", (), {
         "returncode": 0, "stdout": image_id + "\n"})()
+    launcher_probes = []
+
+    def available_launcher(value):
+        launcher_probes.append(value)
+        return "/bin/tool"
+
     monkeypatch.setattr(process_manager_module.platform, "system", lambda: "Linux")
     monkeypatch.setattr(process_manager_module.platform, "machine", lambda: "x86_64")
-    monkeypatch.setattr(process_manager_module.shutil, "which", lambda _value: "/bin/tool")
+    monkeypatch.setattr(
+        process_manager_module.shutil, "which", available_launcher)
     monkeypatch.setattr(process_manager_module.os.path, "isfile", lambda _value: True)
     monkeypatch.setattr(process_manager_module.os, "access", lambda *_args: True)
     monkeypatch.setattr(
@@ -434,6 +442,8 @@ def test_runtime_health_is_path_free_and_checks_exact_image(tmp_path, monkeypatc
         health = manager.runtime_health()
         assert health["ready"] is True
         assert all(health["checks"].values())
+        assert launcher_probes.count("/usr/local/bin/codex") == 2
+        assert "codex-chatgpt" not in launcher_probes
         assert str(SYSTEM_ROOT) not in json.dumps(health)
         assert str(registry.root) not in json.dumps(health)
     finally:

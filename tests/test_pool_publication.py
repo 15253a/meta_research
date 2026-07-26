@@ -16,6 +16,7 @@ from orchestrator.pool_publication import (
     BaselinePublication,
     CheckpointPublication,
     EvaluationPublicationSpec,
+    ImplementationRevisionPublication,
     PoolPublicationError,
     PoolPublisher,
     ProtocolPublication,
@@ -130,6 +131,75 @@ def test_training_publication_copies_not_moves_and_checkpoint_binding_is_formal(
     assert (work / baseline["identity"]["path"]).read_text(encoding="utf-8") == (
         "# Evidence model\n\n## 复现命令\npython train.py")
     assert baseline["code"]["hash_alg"] == "sha256-tree-v1"
+    assert list((work / ".pool-staging").iterdir()) == []
+
+
+def test_training_revision_is_run_bound_append_only_and_replay_safe(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    identity, code, checkpoint, _results, _transcript = _sources(work)
+    publisher = PoolPublisher(work)
+    initial = publisher.publish_training(TrainingPublicationSpec(
+        baseline=BaselinePublication(
+            baseline_id=2, slug="evidence-model",
+            canonical_key="arch:evidence-v1",
+            identity_source=identity, code_source=code,
+            repro_cmd_md="python train.py"),
+        variant=VariantPublication(
+            variant_id=2, variant_key="base", config={"seed": 7}),
+        checkpoints=[CheckpointPublication(
+            checkpoint_id=2, ckpt_key="fold0", source=checkpoint)],
+    ))
+    initial_code = initial.payload["objects"]["baseline"]["code"]
+    initial_checkpoint = initial.checkpoint_bindings[0]
+    initial_code_bytes = (work / initial_code["path"] / "model.py").read_bytes()
+    initial_checkpoint_bytes = (work / initial_checkpoint["path"]).read_bytes()
+
+    revised_code = work / "questions" / "q2" / "cycles" / "c2" / "revised-src"
+    revised_code.mkdir()
+    (revised_code / "model.py").write_text(
+        "def forward(x):\n    return x + 2\n", encoding="utf-8")
+    revised_checkpoint = revised_code.parent / "fold0-v2.pt"
+    revised_checkpoint.write_bytes(b"checkpoint-fold-0-v2\x00")
+    revision_spec = TrainingPublicationSpec(
+        baseline=BaselinePublication(
+            baseline_id=2, slug="evidence-model",
+            canonical_key="arch:evidence-v1"),
+        variant=VariantPublication(
+            variant_id=2, variant_key="base", config={"seed": 7}),
+        checkpoints=[CheckpointPublication(
+            checkpoint_id=3, ckpt_key="fold0-r7",
+            source=revised_checkpoint)],
+        implementation_revision=ImplementationRevisionPublication(
+            run_id=7, code_source=revised_code),
+    )
+    first = publisher.publish_training(revision_spec)
+    second = publisher.publish_training(revision_spec)
+
+    assert first.manifest_ref == second.manifest_ref
+    assert first.payload["mode"] == "revision"
+    objects = first.payload["objects"]
+    revision = objects["implementation_revision"]
+    variant_root = objects["variant"]["root"]
+    assert revision["run_id"] == 7
+    assert revision["root"] == f"{variant_root}/revisions/run-7"
+    assert revision["code"]["path"] == f"{revision['root']}/src"
+    assert (work / revision["code"]["path"] / "model.py").read_text(
+        encoding="utf-8").endswith("return x + 2\n")
+    assert first.checkpoint_bindings[0]["path"].startswith(
+        f"{revision['root']}/checkpoints/fold0-r7/")
+    assert objects["baseline"]["code"] == initial_code
+    assert (work / initial_code["path"] / "model.py").read_bytes() == initial_code_bytes
+    assert (work / initial_checkpoint["path"]).read_bytes() == initial_checkpoint_bytes
+    assert publisher.verify_training(
+        initial.manifest_ref, expected_hash=initial.manifest_hash).payload == initial.payload
+
+    (revised_code / "model.py").write_text(
+        "def forward(x):\n    return x - 999\n", encoding="utf-8")
+    with pytest.raises(PoolPublicationError, match="不同内容占用"):
+        publisher.publish_training(revision_spec)
+    assert (work / revision["code"]["path"] / "model.py").read_text(
+        encoding="utf-8").endswith("return x + 2\n")
     assert list((work / ".pool-staging").iterdir()) == []
 
 

@@ -52,10 +52,23 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from . import harness as H
 from . import manifest as MF
 from . import obs_parser as OP
+from . import scientific_contract as SC
 from . import subject_manifest as SM
 from .artifact_capability import (ArtifactCapabilityError, open_artifact,
                                   read_artifact_bytes)
 from .budgeting import compute_budget
+from .bundle_graph import (
+    BundleGraph,
+    GraphValidationError,
+    VerifiedPublication,
+)
+from .bundle_scheduler import (
+    BundleScheduler,
+    SchedulerOverview,
+    TargetTerminal,
+)
+from .bundle_sources import BundleSources, SourceCapability
+from .execution_journal import ExecutionJournal, JournalView
 from .execution_sandbox import (
     SandboxOutputError,
     sandbox_environment_hash,
@@ -70,9 +83,12 @@ from .importer import DeferredImporter
 from .interfaces import BundleReplanRequired, InvalidSelectionError, Selection
 from .phase_commit import check_or_record
 from .pool_publication import (
+    TRAINING_DB_BINDING_SCHEMA,
+    TREE_HASH_ALG,
     BaselinePublication,
     CheckpointPublication,
     EvaluationPublicationSpec,
+    ImplementationRevisionPublication,
     PoolPublicationError,
     PoolPublisher,
     ProtocolPublication,
@@ -90,6 +106,10 @@ from .process_supervisor import (
     read_receipt,
 )
 from .recall_sqlite import reuse_selector
+from .resource_leases import (
+    GuardianDrainProof,
+    ResourceLeaseManager,
+)
 from .storage_paths import RegisteredPathError, resolve_registered_path
 
 _TERMINAL_TARGET = ("complete", "skipped", "failed", "engineering_blocked")
@@ -105,6 +125,52 @@ _BUNDLE_OPERATOR_SUSPICIOUS = re.compile(
     r"cuda[^\n]*(?:fail|error)|\bnan\b|\binf\b|diverg|segmentation fault|killed)",
     re.IGNORECASE,
 )
+
+
+class _PoolPublicationVerifier:
+    """Adapt PoolPublisher's verified manifest to BundleGraph admission."""
+
+    def __init__(self, publisher: Optional[PoolPublisher]):
+        self.publisher = publisher
+
+    def verify(
+            self, manifest_ref: str,
+            expected_hash: str) -> VerifiedPublication:
+        if self.publisher is None:
+            raise RuntimeError(
+                "Bundle admission 未装配正式 PoolPublisher")
+        publication = self.publisher.verify_publication(
+            manifest_ref, expected_hash=expected_hash)
+        objects = publication.payload["objects"]
+        bindings = publication.database_bindings
+        baseline = objects["baseline"]
+        variant = objects["variant"]
+        attempt = bindings["evaluation_attempt"]
+        source = (
+            bindings.get("implementation_revision")
+            or bindings.get("baseline"))
+        source_ref = source.get("code_ref") if source is not None else None
+        commit_hash = (
+            source.get("commit_hash") if source is not None else None)
+        source_hash = None
+        source_hash_alg = None
+        if commit_hash is not None:
+            if (not isinstance(commit_hash, str)
+                    or ":" not in commit_hash):
+                raise RuntimeError(
+                    "正式 publication source commit_hash 非法")
+            source_hash_alg, source_hash = commit_hash.split(":", 1)
+        return VerifiedPublication(
+            manifest_ref=publication.manifest_ref,
+            manifest_hash=publication.manifest_hash,
+            baseline_id=int(baseline["baseline_id"]),
+            variant_id=int(variant["variant_id"]),
+            evaluation_id=int(attempt["evaluation_id"]),
+            attempt_id=int(attempt["attempt_id"]),
+            source_ref=source_ref,
+            source_hash=source_hash,
+            source_hash_alg=source_hash_alg,
+        )
 
 
 def settle_sandbox_output_failure(gate, daemon, build_target_id: int,
@@ -193,6 +259,34 @@ class _BundleRepairNeeded(Exception):
         self.repair_of = dict(repair_of or {})
 
 
+class _BundleScientificInvalid(Exception):
+    """A completed execution whose frozen scientific validity gates failed.
+
+    This is evidence about the experiment contract, not an implementation bug:
+    the exact run/attempt facts remain durable, formal publication is forbidden,
+    the target is terminalized, and the cycle must continue to Reasoning.
+    """
+
+    def __init__(self, message: str, classification: Mapping[str, Any]):
+        super().__init__(message)
+        self.classification = dict(classification)
+
+
+class _BundleResultReviewPending(Exception):
+    """A valid, executed result is waiting for the resident child review.
+
+    No pool publication, evaluation registration, legal transition, target
+    terminalization, or engineering failure has happened yet.  The cycle-wide
+    Bundle main turn remains the owner and decides whether to resume admission,
+    repair/rerun, or route the frozen-plan problem to Reasoning.
+    """
+
+    def __init__(self, candidate_decision_id: int):
+        super().__init__(
+            f"Bundle result candidate d{candidate_decision_id} awaiting review")
+        self.candidate_decision_id = int(candidate_decision_id)
+
+
 class _BundleOperatorRepair(Exception):
     """The cycle-scoped Codex operator requested a controlled repair.
 
@@ -240,6 +334,57 @@ _METRIC_VALUE_RE = re.compile(
 def _canon_hash(obj: Any) -> str:
     return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _variant_seed_path(
+        value: Any, path: str = "claim.config_json") -> Optional[str]:
+    """Return the first nested ``seed`` key that would pollute variant identity."""
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if isinstance(key, str) and key.casefold() == "seed":
+                return child_path
+            found = _variant_seed_path(child, child_path)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found = _variant_seed_path(child, f"{path}[{index}]")
+            if found is not None:
+                return found
+    return None
+
+
+def _planned_run_seed(plan_slice: Mapping[str, Any]) -> Optional[int]:
+    """Resolve the Plan replicate seed recorded on each durable training run.
+
+    Omission remains the legacy spelling for ``seed=NULL``.  Validation is
+    repeated here because recovery consumes an already persisted plan_ref and
+    must fail closed if those bytes are corrupt or from an incompatible writer.
+    """
+    replicate = plan_slice.get("replicate")
+    if replicate is None:
+        return None
+    if (not isinstance(replicate, Mapping)
+            or set(replicate) != {"seed"}):
+        raise ValueError("replicate 须为仅含 seed 的对象")
+    if plan_slice.get("target_kind") not in ("build", "exec"):
+        raise ValueError("仅 build/exec target 可声明训练 replicate")
+    seed = replicate["seed"]
+    if seed is None:
+        return None
+    if (isinstance(seed, bool) or not isinstance(seed, int)
+            or not -(1 << 63) <= seed <= (1 << 63) - 1):
+        raise ValueError("replicate.seed 须为 SQLite signed-64 integer 或 null")
+    return seed
+
+
+def _same_checkpoint_hash_multiset(
+        durable_hashes: List[str],
+        candidate_hashes: Mapping[str, str]) -> bool:
+    """Bind a result candidate to every checkpoint, including duplicate bytes."""
+    return bool(durable_hashes) and sorted(durable_hashes) == sorted(
+        str(value) for value in candidate_hashes.values())
 
 
 def persist_selection_safe(state, cycle_id: str, sel: Dict[str, Any], *,
@@ -388,12 +533,18 @@ class AttackStages:
                 "METARESEARCH_BUNDLE_OPERATOR_POLL_S", "2"))
             self.bundle_operator_probe_s = float(os.environ.get(
                 "METARESEARCH_BUNDLE_OPERATOR_PROBE_S", "300"))
+            self.bundle_worker_slots = int(os.environ.get(
+                "METARESEARCH_BUNDLE_WORKER_SLOTS", "4"))
         except ValueError as error:
-            raise ValueError("bundle operator poll/probe 环境变量须为数字") from error
+            raise ValueError(
+                "bundle operator poll/probe/worker-slots 环境变量须为数字") from error
         if not 0.05 <= self.bundle_operator_poll_s <= 60.0:
             raise ValueError("METARESEARCH_BUNDLE_OPERATOR_POLL_S 须在 [0.05,60]")
         if not 1.0 <= self.bundle_operator_probe_s <= 3600.0:
             raise ValueError("METARESEARCH_BUNDLE_OPERATOR_PROBE_S 须在 [1,3600]")
+        if not 1 <= self.bundle_worker_slots <= 64:
+            raise ValueError(
+                "METARESEARCH_BUNDLE_WORKER_SLOTS 须在 [1,64]")
         gate_publisher = getattr(pool_gate, "pool_publisher", None)
         if (pool_publisher is not None and gate_publisher is not None
                 and pool_publisher is not gate_publisher):
@@ -402,6 +553,13 @@ class AttackStages:
         if (getattr(pool_gate, "require_formal_publication", False)
                 and self.pool_publisher is None):
             raise ValueError("生产 AttackStages 必须注入正式 PoolPublisher")
+        daemon = getattr(self.state, "daemon", None)
+        self.bundle_graph = (
+            None if daemon is None else BundleGraph(
+                daemon.conn,
+                publication_verifier=_PoolPublicationVerifier(
+                    self.pool_publisher),
+                connection_guard=daemon.connection_guard))
         # Production injects a full read-only connection with the real
         # parser_result_suspect UDF.  Keeping it separate from the writer avoids
         # a selector UDF recursively querying the connection currently executing
@@ -420,18 +578,40 @@ class AttackStages:
         # authority for target/run/attempt state; this map only coordinates the
         # live MCP binding and its background execution worker.
         self._bundle_cycle_sessions: Dict[int, Dict[str, Any]] = {}
+        # DAG runtime state is deliberately split: one graph Scheduler per
+        # cycle and one fixed Worker session per target.  These maps never
+        # determine readiness or terminal truth; durable graph/admission and
+        # build_target facts do.
+        self._bundle_schedulers: Dict[int, BundleScheduler] = {}
+        self._bundle_target_sessions: Dict[tuple[int, int], Dict[str, Any]] = {}
+        self._bundle_journals: Dict[int, ExecutionJournal] = {}
+        self._bundle_source_capabilities: Dict[
+            int, List[SourceCapability]] = {}
+        self._bundle_drain_receipts: Dict[int, str] = {}
+        self._resource_leases = (
+            None if daemon is None else ResourceLeaseManager(
+                daemon,
+                guardian_drained_verifier=self._bundle_guardian_drain_proof))
 
     def enable_resident_bundle_session(self) -> None:
         """Require one cycle-wide Bundle turn with asynchronous MCP execution."""
         with self._bundle_session_lock:
             if not self._bundle_accepting:
                 raise RuntimeError("AttackStages 已进入关闭生命周期")
+        # Dispatch is still fenced at this point.  Settle only leases whose
+        # exact post-guardian receipt survived an earlier owner interruption;
+        # unproven leases remain exclusive and are recoverable by their target.
+        if self._resource_leases is not None:
+            self._resource_leases.reconcile()
         self._resident_bundle_session_enabled = True
 
     def begin_close(self) -> None:
         """Fence admission before the shared supervisor starts cancellation."""
         with self._bundle_session_lock:
             self._bundle_accepting = False
+            schedulers = tuple(self._bundle_schedulers.values())
+        for scheduler in schedulers:
+            scheduler.begin_drain()
 
     def close(self, *, timeout_s: float = 10.0) -> None:
         """Fence new Bundle work and join every official execution worker.
@@ -459,6 +639,18 @@ class AttackStages:
 
         deadline = time.monotonic() + float(timeout_s)
         current = threading.current_thread()
+        with self._bundle_session_lock:
+            schedulers = tuple(self._bundle_schedulers.values())
+        for scheduler in schedulers:
+            remaining = deadline - time.monotonic()
+            if remaining < 0:
+                raise RuntimeError(
+                    "Bundle Scheduler 未在 close deadline 内排空")
+            try:
+                scheduler.drain(timeout_s=remaining)
+            except BundleSchedulerError as error:
+                raise RuntimeError(
+                    "Bundle Scheduler 未在 close deadline 内排空") from error
         while True:
             with self._bundle_session_lock:
                 workers = [
@@ -477,9 +669,26 @@ class AttackStages:
             # Join one at a time so every retry observes the exact live set.
             workers[0].join(timeout=min(0.1, remaining))
 
+        if self._resource_leases is not None:
+            self._resource_leases.reconcile()
         with self._bundle_session_lock:
+            capabilities = [
+                capability
+                for values in self._bundle_source_capabilities.values()
+                for capability in values
+            ]
+            journals = tuple(self._bundle_journals.values())
+            self._bundle_source_capabilities.clear()
+            self._bundle_journals.clear()
+            self._bundle_schedulers.clear()
+            self._bundle_target_sessions.clear()
+            self._bundle_cycle_sessions.clear()
             self._bundle_worker_threads.clear()
             self._bundle_closed = True
+        for capability in capabilities:
+            capability.close()
+        for journal in journals:
+            journal.close()
 
     def enable_resident_plan_session(self) -> None:
         """Expose Plan discovery/preflight as tools of the one resident turn."""
@@ -698,7 +907,9 @@ class AttackStages:
         }
 
     @staticmethod
-    def _reasoning_only_preflight_ops(files: Mapping[str, Any], route: str) -> List[Dict[str, Any]]:
+    def _reasoning_only_preflight_ops(
+            files: Mapping[str, Any], route: str, *,
+            decompose_guard_fallback: bool = False) -> List[Dict[str, Any]]:
         if "answer.json" in files:
             raise ValueError(f"{route} reasoning-only 轮不得提交 answer.json")
         tree = files.get("tree_ops.json")
@@ -711,6 +922,12 @@ class AttackStages:
             if indexes != [0]:
                 raise ValueError(
                     "goal_amend 轮须恰有一个 amend_goal 且必须是首个 op")
+            return ops
+        if route == "decompose" and decompose_guard_fallback:
+            if ops:
+                raise ValueError(
+                    "decompose 已被树护栏阻断时 tree_ops.ops 必须为空；"
+                    "请从可调度前沿重新 selection")
             return ops
         required = "create_root" if route == "bootstrap" else "add_children"
         if not any(isinstance(op, Mapping) and op.get("op") == required for op in ops):
@@ -756,17 +973,31 @@ class AttackStages:
                 if self.state.consumed_goal_amend_directive(cyc.cycle_id) is None:
                     raise ValueError("goal_amend 缺已确认 directive authority")
                 self.state.assert_goal_amend_quiescent(cyc.cycle_id)
-            ops = self._reasoning_only_preflight_ops(files, cyc.route)
+            decompose_guard_reason = (
+                self.state.decompose_guard_reason(cyc.question_id)
+                if cyc.route == "decompose" and cyc.question_id is not None
+                else None)
+            ops = self._reasoning_only_preflight_ops(
+                files, cyc.route,
+                decompose_guard_fallback=decompose_guard_reason is not None)
             try:
                 with self.state.atomic():
-                    self.state.apply_tree_ops(cyc.cycle_id, ops)
+                    if decompose_guard_reason is None:
+                        self.state.apply_tree_ops(cyc.cycle_id, ops)
+                    else:
+                        self.state.release_question(cyc.question_id)
                     self.state.persist_selection(cyc.cycle_id, Selection(
                         next_question_id=selection.get("next_question_id"),
                         next_intent=selection["next_intent"],
                         scores=selection.get("scores", [])))
                     raise _ReasoningPreflightRollback()
             except _ReasoningPreflightRollback:
-                return {"kind": cyc.route, "writes_performed": 0}
+                return {
+                    "kind": (
+                        "decompose_guard_fallback"
+                        if decompose_guard_reason is not None else cyc.route),
+                    "writes_performed": 0,
+                }
 
         if cyc.route not in {"attack", "eval_only", "reuse_only"}:
             raise RuntimeError(f"Reasoning route 非法: {cyc.route!r}")
@@ -830,10 +1061,145 @@ class AttackStages:
                 "worker": None,
                 "worker_error": None,
                 "repair_requested": None,
+                "control_accepting": False,
                 "control_sequence": 0,
                 "started_at": None,
                 "finished_at": None,
             })
+
+    @staticmethod
+    def _is_target_worker_scope(scope) -> bool:  # noqa: ANN001
+        return (
+            getattr(scope, "stage", None) == "bundle"
+            and str(getattr(scope, "purpose", "")).startswith(
+                "bundle-worker-c"))
+
+    def _bundle_target_session(
+            self, ci: int, target_id: int) -> Dict[str, Any]:
+        """Return coordination state for one fixed target Worker task."""
+        key = (ci, target_id)
+        with self._bundle_session_lock:
+            return self._bundle_target_sessions.setdefault(key, {
+                "active_target_id": target_id,
+                "pack": None,
+                "worker": None,
+                "worker_error": None,
+                "repair_requested": None,
+                "control_accepting": False,
+                "control_sequence": 0,
+                "started_at": None,
+                "finished_at": None,
+            })
+
+    def _bundle_runtime_session(
+            self, scope, ci: int, target_id: int) -> Dict[str, Any]:  # noqa: ANN001
+        if self._is_target_worker_scope(scope):
+            session = self._bundle_target_session(ci, target_id)
+        else:
+            session = self._bundle_cycle_session(ci)
+        with self._bundle_session_lock:
+            if session.get("active_target_id") != target_id:
+                raise RuntimeError(
+                    "Bundle control target 与 runtime session 绑定漂移")
+        return session
+
+    def _bundle_journal(
+            self, ci: int, target_id: int) -> ExecutionJournal:
+        with self._bundle_session_lock:
+            journal = self._bundle_journals.get(target_id)
+            if journal is None:
+                journal = ExecutionJournal(
+                    self.work / f"c{ci}" / "bundle-journal",
+                    target_id=target_id)
+                self._bundle_journals[target_id] = journal
+            return journal
+
+    def _bundle_drain_receipt_path(
+            self, ci: int, target_id: int) -> Path:
+        return (
+            self.work / "state" / "bundle-target-drain"
+            / f"c{ci}-t{target_id}.json")
+
+    def _record_bundle_drain_receipt(
+            self, ci: int, target_id: int, *, status: str) -> None:
+        """Record the target boundary reached after every guardian returned."""
+        if status not in _TERMINAL_TARGET:
+            raise RuntimeError("Bundle drain receipt 要求 target 终态")
+        path = self._bundle_drain_receipt_path(ci, target_id)
+        payload = {
+            "protocol": "bundle-target-guardian-drained-v1",
+            "cycle_id": ci,
+            "build_target_id": target_id,
+            "status": status,
+            "journal_ref": str(
+                self._bundle_journal(ci, target_id).event_path),
+        }
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    f"Bundle drain receipt 损坏: {path}") from error
+            if existing != payload:
+                raise RuntimeError(
+                    f"Bundle drain receipt 身份冲突: {path}")
+        else:
+            atomic_write_receipt(path, payload)
+        with self._bundle_session_lock:
+            self._bundle_drain_receipts[target_id] = str(path)
+
+    def _bundle_guardian_drain_proof(
+            self, *, build_target_id: int,
+            cycle_id: int) -> Optional[GuardianDrainProof]:
+        """Reverify the target-owned post-guardian receipt before lease release."""
+        path = self._bundle_drain_receipt_path(
+            cycle_id, build_target_id)
+        with self._bundle_session_lock:
+            session = self._bundle_target_sessions.get(
+                (cycle_id, build_target_id))
+            worker = None if session is None else session.get("worker")
+            if worker is not None and worker.is_alive():
+                return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        row = self.state.daemon.query_one(
+            "SELECT cycle_id,status FROM build_target WHERE id=?",
+            (build_target_id,))
+        if (
+            payload.get("protocol")
+            != "bundle-target-guardian-drained-v1"
+            or payload.get("cycle_id") != cycle_id
+            or payload.get("build_target_id") != build_target_id
+            or payload.get("status") not in _TERMINAL_TARGET
+            or row is None
+            or tuple(row) != (cycle_id, payload["status"])
+        ):
+            return None
+        return GuardianDrainProof(
+            build_target_id=build_target_id,
+            cycle_id=cycle_id,
+            receipt_ref=str(path))
+
+    @staticmethod
+    def _bundle_journal_projection(view: JournalView) -> Dict[str, Any]:
+        return {
+            "mode": view.reason,
+            "events": [
+                {
+                    "seq": event.seq,
+                    "stream": event.stream,
+                    "text": event.text,
+                    "fragment": event.fragment,
+                }
+                for event in view.events
+            ],
+            "cursor": view.cursor,
+            "latest_seq": view.latest_seq,
+            "status_revision": view.status_revision,
+            "wait_reason": view.reason,
+        }
 
     def _bundle_pack_projection(self, pack) -> Dict[str, Any]:  # noqa: ANN001
         return self._publish_live_context_pack(pack)
@@ -843,6 +1209,218 @@ class AttackStages:
             "SELECT id,target_kind,seq,critical,status,failure_kind,plan_ref "
             "FROM build_target WHERE cycle_id=? AND plan_ref IS NOT NULL "
             "ORDER BY seq,id", (ci,))
+
+    def _native_result_review_rounds(self) -> int:
+        """Return the resident result-review count without weakening Judge mode."""
+        raw = (((self.policy or {}).get("flow") or {}).get("retry") or {}).get(
+            "bundle_result_review", 0)
+        if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw <= 2:
+            raise RuntimeError(
+                "policy.flow.retry.bundle_result_review 须为 0..2")
+        return raw
+
+    def _native_result_review_required(self) -> bool:
+        return bool(
+            self._resident_bundle_session_enabled
+            and not self.gate.require_result_review
+            and self._native_result_review_rounds() > 0)
+
+    @staticmethod
+    def _validate_result_candidate_payload(
+            payload: Mapping[str, Any], *, cycle_id: Optional[int] = None,
+            build_target_id: Optional[int] = None) -> Dict[str, Any]:
+        required = {
+            "protocol", "cycle_id", "build_target_id", "evaluation_id",
+            "evaluation_attempt_id", "result_subject_hash",
+            "scientific_decision_hash", "execution_status",
+            "validity_status", "scientific_outcome", "pool_eligibility",
+            "metric_results", "eval_log", "checkpoint_hashes",
+        }
+        if (not isinstance(payload, Mapping)
+                or set(payload) != required
+                or payload.get("protocol") != "bundle-result-candidate-v1"):
+            raise RuntimeError("bundle result candidate 字段闭包/协议非法")
+        for field in (
+                "cycle_id", "build_target_id", "evaluation_id",
+                "evaluation_attempt_id"):
+            value = payload.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise RuntimeError(f"bundle result candidate {field} 非法")
+        if cycle_id is not None and payload["cycle_id"] != cycle_id:
+            raise RuntimeError("bundle result candidate cycle 身份漂移")
+        if (build_target_id is not None
+                and payload["build_target_id"] != build_target_id):
+            raise RuntimeError("bundle result candidate target 身份漂移")
+        for field in ("result_subject_hash", "scientific_decision_hash"):
+            value = payload.get(field)
+            if (not isinstance(value, str)
+                    or re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", value) is None):
+                raise RuntimeError(f"bundle result candidate {field} 非法")
+        if (payload.get("execution_status") != "succeeded"
+                or payload.get("validity_status") != "valid"
+                or payload.get("scientific_outcome")
+                not in {"supported", "refuted", "inconclusive"}
+                or payload.get("pool_eligibility") != "eligible"):
+            raise RuntimeError(
+                "bundle result candidate 只能承载 valid+eligible 执行结果")
+        metrics = payload.get("metric_results")
+        if not isinstance(metrics, list) or len(metrics) > 4096:
+            raise RuntimeError("bundle result candidate metric_results 非法")
+        checkpoint_hashes = payload.get("checkpoint_hashes")
+        if (not isinstance(checkpoint_hashes, dict)
+                or len(checkpoint_hashes) > 4096
+                or any(not isinstance(key, str)
+                       or re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", str(value))
+                       is None
+                       for key, value in checkpoint_hashes.items())):
+            raise RuntimeError("bundle result candidate checkpoint_hashes 非法")
+        log = payload.get("eval_log")
+        if (not isinstance(log, dict)
+                or set(log) != {"ref", "content_hash", "bytes"}
+                or not isinstance(log.get("ref"), str)
+                or len(log["ref"].encode("utf-8")) > 4096
+                or re.fullmatch(
+                    r"(?:sha256:)?[0-9a-f]{64}",
+                    str(log.get("content_hash") or "")) is None
+                or isinstance(log.get("bytes"), bool)
+                or not isinstance(log.get("bytes"), int)
+                or log["bytes"] < 0):
+            raise RuntimeError("bundle result candidate eval_log 非法")
+        return dict(payload)
+
+    def _pending_result_candidate(
+            self, *, cycle_id: int, build_target_id: int,
+            include_acknowledged: bool = True,
+            ) -> Optional[Dict[str, Any]]:
+        rows = self.state.daemon.query(
+            "SELECT d.id,d.payload_json FROM decision d "
+            "WHERE d.cycle_id=? AND d.actor='orchestrator' "
+            "AND d.type='bundle_result_candidate' "
+            "AND json_valid(d.payload_json) "
+            "AND json_extract(d.payload_json,'$.build_target_id')=? "
+            "AND NOT EXISTS (SELECT 1 FROM decision s "
+            " WHERE s.cycle_id=d.cycle_id AND s.actor='orchestrator' "
+            " AND s.type='bundle_result_candidate_superseded' "
+            " AND json_valid(s.payload_json) "
+            " AND json_extract(s.payload_json,'$.candidate_decision_id')=d.id) "
+            "ORDER BY d.id",
+            (cycle_id, build_target_id))
+        if len(rows) > 1:
+            raise RuntimeError(
+                f"target {build_target_id} 有多个 active result candidates")
+        if not rows:
+            return None
+        decision_id, raw = rows[0]
+        try:
+            payload = self._validate_result_candidate_payload(
+                json.loads(raw), cycle_id=cycle_id,
+                build_target_id=build_target_id)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("bundle result candidate JSON 损坏") from error
+        ack_rows = self.state.daemon.query(
+            "SELECT id,payload_json FROM decision "
+            "WHERE cycle_id=? AND actor='orchestrator' "
+            "AND type='runtime_bundle_result_review_ack' "
+            "AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.candidate_decision_id')=? "
+            "ORDER BY id", (cycle_id, int(decision_id)))
+        if len(ack_rows) > 1:
+            raise RuntimeError(
+                f"result candidate d{decision_id} 有多个 review ack")
+        if not include_acknowledged and ack_rows:
+            return None
+        return {
+            "decision_id": int(decision_id),
+            "payload": payload,
+            "ack": (
+                None if not ack_rows else {
+                    "decision_id": int(ack_rows[0][0]),
+                    "payload": json.loads(ack_rows[0][1]),
+                }),
+        }
+
+    def _ensure_native_result_review_before_admission(
+            self, *, cycle_id: str, build_target_id: int,
+            evaluation_id: int, attempt_id: int, result_subject_hash: str,
+            scientific: Mapping[str, Any],
+            metrics: List[Dict[str, Any]], eval_log_ref: str,
+            eval_log_hash: str, eval_log_bytes: int,
+            checkpoint_hashes: Mapping[str, str]) -> None:
+        """Persist one immutable pre-admission candidate and require its ack."""
+        if not self._native_result_review_required():
+            return
+        ci = _cnum(cycle_id)
+        payload = self._validate_result_candidate_payload({
+            "protocol": "bundle-result-candidate-v1",
+            "cycle_id": ci,
+            "build_target_id": build_target_id,
+            "evaluation_id": evaluation_id,
+            "evaluation_attempt_id": attempt_id,
+            "result_subject_hash": result_subject_hash,
+            "scientific_decision_hash": _canon_hash(dict(scientific)),
+            "execution_status": scientific["execution_status"],
+            "validity_status": scientific["validity_status"],
+            "scientific_outcome": scientific["scientific_outcome"],
+            "pool_eligibility": scientific["pool_eligibility"],
+            "metric_results": json.loads(json.dumps(
+                metrics, ensure_ascii=False, sort_keys=True, allow_nan=False)),
+            "eval_log": {
+                "ref": eval_log_ref,
+                "content_hash": eval_log_hash,
+                "bytes": int(eval_log_bytes),
+            },
+            "checkpoint_hashes": {
+                str(key): str(value)
+                for key, value in sorted(checkpoint_hashes.items())
+            },
+        }, cycle_id=ci, build_target_id=build_target_id)
+        canonical = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False)
+        with self.state.daemon.transaction() as conn:
+            existing = conn.execute(
+                "SELECT id,payload_json FROM decision "
+                "WHERE cycle_id=? AND actor='orchestrator' "
+                "AND type='bundle_result_candidate' "
+                "AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.build_target_id')=? "
+                "AND json_extract(payload_json,'$.evaluation_attempt_id')=? "
+                "ORDER BY id",
+                (ci, build_target_id, attempt_id)).fetchall()
+            if len(existing) > 1:
+                raise RuntimeError(
+                    f"attempt {attempt_id} result candidate 重复")
+            if existing:
+                if json.dumps(
+                        json.loads(existing[0][1]), ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":"),
+                        allow_nan=False) != canonical:
+                    raise RuntimeError(
+                        f"attempt {attempt_id} result candidate 身份漂移")
+                candidate_id = int(existing[0][0])
+            else:
+                candidate_id = int(conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'orchestrator','bundle_result_candidate',?)",
+                    (ci, canonical)).lastrowid)
+        active = self._pending_result_candidate(
+            cycle_id=ci, build_target_id=build_target_id)
+        if (active is None or active["decision_id"] != candidate_id):
+            raise RuntimeError(
+                f"attempt {attempt_id} result candidate 已被错误 supersede")
+        if active["ack"] is None:
+            raise _BundleResultReviewPending(candidate_id)
+        ack = active["ack"]["payload"]
+        if (not isinstance(ack, dict)
+                or ack.get("protocol")
+                != "native-bundle-result-review-ack-v2"
+                or ack.get("cycle_id") != cycle_id
+                or ack.get("build_target_id") != build_target_id
+                or ack.get("candidate_decision_id") != candidate_id
+                or ack.get("configured_rounds")
+                != self._native_result_review_rounds()):
+            raise RuntimeError(
+                f"result candidate d{candidate_id} review ack 身份非法")
 
     def _bundle_apply_early_exit(self, ci: int) -> None:
         replan = self.state.daemon.query_one(
@@ -865,6 +1443,407 @@ class AttackStages:
         if failed is not None:
             self._skip_after_critical_failure(
                 self.state.cycle(f"c{ci}"), int(failed[0]))
+
+    def _authorized_bundle_gpu_contract(
+            self, target_id: int):  # noqa: ANN001, ANN201
+        """Return the deployment-owned allocation surface, never Plan input."""
+        runtime_environment_hash = self._target_environment_hash(target_id)
+        selected = self._resolve_target_execution_sandbox(
+            runtime_environment_hash)
+        return (
+            None if selected is None
+            else getattr(selected, "gpu_contract", None))
+
+    def _launch_bundle_target_worker(
+            self, ci: int, target_id: int):  # noqa: ANN201
+        """Run/recover the one durable provider task bound to this target."""
+        if "bundle_worker" not in self.p:
+            raise RuntimeError(
+                "生产 Bundle Scheduler 缺 target Worker provider")
+        row = self.state.daemon.query_one(
+            "SELECT status FROM build_target "
+            "WHERE id=? AND cycle_id=? AND plan_ref IS NOT NULL",
+            (target_id, ci))
+        if row is None:
+            raise RuntimeError(
+                f"Scheduler target {target_id} 不属于 cycle c{ci}")
+        if row[0] in _TERMINAL_TARGET:
+            return self._read_bundle_target_terminal(target_id)
+        self._prepare_bundle_source_inputs(ci, target_id)
+        pack = self.compiler.render(
+            cycle_id=f"c{ci}", stage="bundle",
+            target_id=str(target_id))
+        session = self._bundle_target_session(ci, target_id)
+        with self._bundle_session_lock:
+            prior_pack = session.get("pack")
+            if (prior_pack is not None
+                    and prior_pack.pack_hash != pack.pack_hash):
+                raise RuntimeError(
+                    f"target {target_id} ContextPack 在 Worker task 内漂移")
+            session["pack"] = pack
+        result = self.p["bundle_worker"](
+            self.state.cycle(f"c{ci}"), pack)
+        final = self.state.daemon.query_one(
+            "SELECT status FROM build_target WHERE id=?", (target_id,))
+        if final is None or final[0] not in _TERMINAL_TARGET:
+            raise RuntimeError(
+                f"target Worker t{target_id} 在 durable terminal 前退出")
+        return result
+
+    def _bundle_terminal_report_payload(
+            self, target_id: int) -> Dict[str, Any]:
+        row = self.state.daemon.query_one(
+            "SELECT cycle_id,target_kind,seq,critical,status,failure_kind,"
+            "baseline_id,variant_id,evaluation_id "
+            "FROM build_target WHERE id=?", (target_id,))
+        if row is None:
+            raise RuntimeError(
+                f"Bundle terminal target {target_id} 不存在")
+        (ci, kind, seq, critical, status, failure_kind,
+         baseline_id, variant_id, evaluation_id) = row
+        if status not in _TERMINAL_TARGET:
+            raise RuntimeError(
+                f"Bundle target {target_id} 尚未终态: {status}")
+        admitted = self.state.daemon.query_one(
+            "SELECT manifest_ref,manifest_hash,attempt_id "
+            "FROM bundle_target_admission WHERE target_id=?",
+            (target_id,))
+        replan = self.state.daemon.query_one(
+            "SELECT 1 FROM decision WHERE cycle_id=? "
+            "AND actor='orchestrator' AND type='bundle_replan_required' "
+            "AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.build_target_id')=? LIMIT 1",
+            (ci, target_id)) is not None
+        report_status = (
+            "replan_required" if replan else
+            ("failed" if status == "engineering_blocked" else status))
+        if report_status == "complete" and admitted is None:
+            raise RuntimeError(
+                f"complete target {target_id} 缺 exact admission")
+        metrics = self.state.daemon.query(
+            "SELECT mr.id,mr.metric_id,mr.metric_ver,mr.value "
+            "FROM metric_result mr JOIN evaluation_attempt ea "
+            "ON ea.id=mr.evaluation_attempt_id "
+            "WHERE ea.build_target_id=? AND mr.scope='aggregate' "
+            "ORDER BY mr.id LIMIT 128", (target_id,))
+        return {
+            "protocol": "bundle-target-terminal-report-v1",
+            "cycle_id": int(ci),
+            "build_target_id": target_id,
+            "target_kind": kind,
+            "seq": int(seq),
+            "critical": bool(critical),
+            "status": report_status,
+            "failure_kind": failure_kind,
+            "domain": {
+                "baseline_id": baseline_id,
+                "variant_id": variant_id,
+                "evaluation_id": evaluation_id,
+                "attempt_id": None if admitted is None else int(admitted[2]),
+            },
+            "admission": (
+                None if admitted is None else {
+                    "manifest_ref": admitted[0],
+                    "manifest_hash": admitted[1],
+                }),
+            "metrics": [
+                {
+                    "metric_result_id": int(item[0]),
+                    "metric_id": int(item[1]),
+                    "metric_ver": int(item[2]),
+                    "value": float(item[3]),
+                }
+                for item in metrics
+            ],
+        }
+
+    def _ensure_bundle_terminal_report(
+            self, target_id: int) -> tuple[str, str, Dict[str, Any]]:
+        """Publish one bounded report and append its immutable SQL pointer."""
+        payload = self._bundle_terminal_report_payload(target_id)
+        ci = int(payload["cycle_id"])
+        report_path = (
+            self.work / f"c{ci}" / "reports"
+            / f"target-{target_id}.json")
+        raw = (
+            json.dumps(
+                payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(raw) > 128 * 1024:
+            raise RuntimeError(
+                f"target {target_id} terminal report 超过 128KiB")
+        digest = hashlib.sha256(raw).hexdigest()
+        if report_path.exists():
+            if report_path.is_symlink() or report_path.read_bytes() != raw:
+                raise RuntimeError(
+                    f"target {target_id} terminal report 身份冲突")
+        else:
+            atomic_write_receipt(report_path, payload)
+        summary = {
+            "protocol": payload["protocol"],
+            "target_kind": payload["target_kind"],
+            "seq": payload["seq"],
+            "critical": payload["critical"],
+            "failure_kind": payload["failure_kind"],
+            "metric_result_ids": [
+                item["metric_result_id"] for item in payload["metrics"]],
+            "admitted": payload["admission"] is not None,
+        }
+        summary_json = json.dumps(
+            summary, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False)
+        with self.state.daemon.transaction() as conn:
+            existing = conn.execute(
+                "SELECT cycle_id,report_ref,report_hash,status,summary_json "
+                "FROM bundle_terminal_report WHERE build_target_id=?",
+                (target_id,)).fetchone()
+            expected = (
+                ci, str(report_path), digest,
+                payload["status"], summary_json)
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO bundle_terminal_report("
+                    "build_target_id,cycle_id,report_ref,report_hash,"
+                    "status,summary_json) VALUES (?,?,?,?,?,?)",
+                    (target_id, *expected))
+            elif tuple(existing) != expected:
+                raise RuntimeError(
+                    f"target {target_id} durable terminal report 冲突")
+        return str(report_path), digest, payload
+
+    def _read_bundle_target_terminal(
+            self, target_id: int) -> Dict[str, Any]:
+        row = self.state.daemon.query_one(
+            "SELECT cycle_id,status,failure_kind,critical "
+            "FROM build_target WHERE id=?", (target_id,))
+        if row is None:
+            return {
+                "status": "interrupted",
+                "error_code": "target_missing",
+                "summary": "trusted build_target row is missing",
+            }
+        ci, status, failure_kind, critical = row
+        if status not in _TERMINAL_TARGET:
+            return {
+                "status": "interrupted",
+                "error_code": "worker_interrupted",
+                "summary": (
+                    f"Worker exited while target remained {status}"),
+            }
+        if status == "failed" and not bool(critical):
+            self._skip_after_critical_failure(
+                self.state.cycle(f"c{ci}"), target_id)
+        report_ref, report_hash, payload = (
+            self._ensure_bundle_terminal_report(target_id))
+        projected_status = payload["status"]
+        return {
+            "status": projected_status,
+            "report_ref": report_ref,
+            "report_hash": report_hash,
+            "summary": (
+                f"{payload['target_kind']} target {target_id} "
+                f"finished as {projected_status}"),
+            "error_code": failure_kind,
+            "critical_replan": bool(
+                status == "engineering_blocked"
+                or (status == "failed" and bool(critical))),
+        }
+
+    def _new_bundle_scheduler(self, ci: int) -> BundleScheduler:
+        return BundleScheduler(
+            cycle_id=ci,
+            graph=self.bundle_graph,
+            worker_slots=self.bundle_worker_slots,
+            launch_worker=lambda target_id: (
+                self._launch_bundle_target_worker(ci, target_id)),
+            resource_manager=self._resource_leases,
+            authorized_contract_resolver=(
+                self._authorized_bundle_gpu_contract),
+            terminal_reader=self._read_bundle_target_terminal,
+            revision_reader=lambda: self._bundle_scheduler_revision(
+                ci, advance=False),
+            revision_allocator=lambda: self._bundle_scheduler_revision(
+                ci, advance=True))
+
+    def _bundle_scheduler_revision(
+            self, ci: int, *, advance: bool) -> int:
+        """Read or atomically advance the cycle-scoped Scheduler cursor."""
+        if (
+            isinstance(ci, bool)
+            or not isinstance(ci, int)
+            or ci <= 0
+            or not isinstance(advance, bool)
+        ):
+            raise ValueError("Bundle Scheduler revision identity invalid")
+        with self.state.daemon.transaction() as conn:
+            conn.execute(
+                "INSERT INTO bundle_scheduler_state(cycle_id,revision) "
+                "VALUES (?,0) ON CONFLICT(cycle_id) DO NOTHING",
+                (ci,))
+            if advance:
+                updated = conn.execute(
+                    "UPDATE bundle_scheduler_state "
+                    "SET revision=revision+1,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE cycle_id=? AND revision<9223372036854775806",
+                    (ci,))
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        "Bundle Scheduler revision exhausted")
+            row = conn.execute(
+                "SELECT revision FROM bundle_scheduler_state "
+                "WHERE cycle_id=?", (ci,)).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Bundle Scheduler revision row missing")
+            return int(row[0])
+
+    def _bundle_scheduler(self, ci: int) -> BundleScheduler:
+        with self._bundle_session_lock:
+            scheduler = self._bundle_schedulers.get(ci)
+        replaceable = None
+        if scheduler is not None:
+            current = scheduler.overview()
+            # Provider/network interruption is recoverable in the same durable
+            # Worker task.  Replace only the in-process scheduler bookkeeping;
+            # task identity, target and leases remain durable.
+            interrupted = any(
+                item.status == "interrupted"
+                and self.state.daemon.query_one(
+                    "SELECT status FROM build_target WHERE id=?",
+                    (item.target_id,))[0] not in _TERMINAL_TARGET
+                for item in current.terminal
+            )
+            if interrupted and not current.active:
+                replaceable = scheduler
+                scheduler = None
+        if scheduler is None:
+            candidate = self._new_bundle_scheduler(ci)
+            with self._bundle_session_lock:
+                existing = self._bundle_schedulers.get(ci)
+                if existing is None or existing is replaceable:
+                    self._bundle_schedulers[ci] = candidate
+                    scheduler = candidate
+                else:
+                    scheduler = existing
+        return scheduler
+
+    def _bundle_scheduler_projection(
+            self, ci: int,
+            overview: SchedulerOverview) -> Dict[str, Any]:
+        graph = self.bundle_graph.overview(ci)
+        active = set(overview.active)
+        for target in graph.targets:
+            if target.status in _TERMINAL_TARGET and target.target_id not in active:
+                self._ensure_bundle_terminal_report(target.target_id)
+        targets = [
+            {
+                "build_target_id": target.target_id,
+                "target_key": target.target_key,
+                "seq": target.seq,
+                "status": target.status,
+                "admitted": target.admitted,
+                "depends_on": list(target.depends_on),
+                "blocked_by": list(target.blocked_by),
+                "gpu_count": target.gpu_count,
+            }
+            for target in graph.targets
+        ]
+        dangling_complete = [
+            target.target_id for target in graph.targets
+            if target.status == "complete" and not target.admitted]
+        reports = self.state.daemon.query_one(
+            "SELECT count(*) FROM bundle_terminal_report WHERE cycle_id=?",
+            (ci,))[0]
+        all_terminal = bool(targets) and all(
+            target["status"] in _TERMINAL_TARGET for target in targets)
+        interrupted = [
+            item.target_id for item in overview.terminal
+            if item.status == "interrupted"]
+        controller_error = None
+        if interrupted:
+            controller_error = (
+                f"recoverable Worker interruption: {interrupted}")
+        elif dangling_complete:
+            controller_error = (
+                f"complete targets missing exact admission: "
+                f"{dangling_complete}")
+        elif all_terminal and reports != len(targets):
+            controller_error = (
+                f"terminal report closure incomplete: "
+                f"{reports}/{len(targets)}")
+        return {
+            "cycle_id": f"c{ci}",
+            "revision": overview.revision,
+            "ready": list(overview.ready),
+            "active": list(overview.active),
+            "waiting": [
+                {"build_target_id": item.target_id,
+                 "reason": item.reason}
+                for item in overview.waiting
+            ],
+            "terminal": [
+                {
+                    "build_target_id": item.target_id,
+                    "status": item.status,
+                    "report_ref": item.report_ref,
+                    "report_hash": item.report_hash,
+                    "summary": item.summary,
+                    "error_code": item.error_code,
+                    "resource_status": item.resource_status,
+                }
+                for item in overview.terminal
+            ],
+            "targets": targets,
+            "draining": overview.draining,
+            "drained": overview.drained,
+            "critical_replan": overview.critical_replan,
+            "cycle_terminal": bool(
+                all_terminal and not overview.active
+                and not dangling_complete
+                and reports == len(targets)),
+            "controller_error": controller_error,
+        }
+
+    def bundle_scheduler_overview(self, scope) -> Dict[str, Any]:  # noqa: ANN001
+        ci = self._bundle_scope_cycle(scope)
+        return self._bundle_scheduler_projection(
+            ci, self._bundle_scheduler(ci).overview())
+
+    def dispatch_bundle_frontier(self, scope) -> Dict[str, Any]:  # noqa: ANN001
+        ci = self._bundle_scope_cycle(scope)
+        with self._bundle_session_lock:
+            if not self._bundle_accepting:
+                raise RuntimeError(
+                    "Bundle controller 正在关闭，拒绝 dispatch 新 target")
+        scheduler = self._bundle_scheduler(ci)
+        dispatched = scheduler.dispatch()
+        return {
+            "dispatched": list(dispatched.dispatched),
+            **self._bundle_scheduler_projection(
+                ci, scheduler.overview()),
+        }
+
+    def wait_bundle_scheduler(
+            self, scope, *, after_revision: int,
+            timeout_s: float) -> Dict[str, Any]:  # noqa: ANN001
+        ci = self._bundle_scope_cycle(scope)
+        waited = self._bundle_scheduler(ci).wait(
+            after_revision=after_revision, timeout_s=timeout_s)
+        return {
+            "timed_out": waited.timed_out,
+            **self._bundle_scheduler_projection(
+                ci, waited.overview),
+        }
+
+    def drain_bundle_scheduler(self, scope) -> Dict[str, Any]:  # noqa: ANN001
+        ci = self._bundle_scope_cycle(scope)
+        scheduler = self._bundle_scheduler(ci)
+        scheduler.drain()
+        self._bundle_apply_early_exit(ci)
+        return self._bundle_scheduler_projection(
+            ci, scheduler.overview())
 
     def bind_next_bundle_target(self, scope) -> Dict[str, Any]:  # noqa: ANN001
         """Bind the next target without leaving the one cycle-wide model turn."""
@@ -924,6 +1903,22 @@ class AttackStages:
     def bundle_session_scope(self, scope) -> Dict[str, Any]:  # noqa: ANN001
         """Return the exact target/ContextPack bound to this cycle turn."""
         ci = self._bundle_scope_cycle(scope)
+        if self._is_target_worker_scope(scope):
+            target_id = self._bundle_scope_target(scope)
+            self._prepare_bundle_source_inputs(ci, target_id)
+            session = self._bundle_target_session(ci, target_id)
+            with self._bundle_session_lock:
+                pack = session.get("pack")
+                if pack is None:
+                    pack = self.compiler.render(
+                        cycle_id=f"c{ci}", stage="bundle",
+                        target_id=str(target_id))
+                    session["pack"] = pack
+                return {
+                    "target_id": target_id,
+                    "pack_hash": pack.pack_hash,
+                    "refs": list(pack.refs),
+                }
         session = self._bundle_cycle_session(ci)
         with self._bundle_session_lock:
             target_id, pack = session.get("active_target_id"), session.get("pack")
@@ -948,6 +1943,50 @@ class AttackStages:
         if (row is None or row[0] != _cnum(scope.cycle_id) or row[1] is None):
             raise RuntimeError("Bundle session target 不属于当前 cycle 或缺冻结 plan")
         return target_id
+
+    def _prepare_bundle_source_inputs(
+            self, ci: int, target_id: int) -> None:
+        """Bind admitted upstream publications and create private Worker copies."""
+        requests = self.state.daemon.query(
+            "SELECT id,input_key FROM bundle_source_request "
+            "WHERE cycle_id=? AND downstream_target_id=? ORDER BY input_key,id",
+            (ci, target_id))
+        if not requests:
+            return
+        with self._bundle_session_lock:
+            if target_id in self._bundle_source_capabilities:
+                return
+
+        sources = BundleSources(
+            self.state.daemon.conn, work_root=self.work)
+        # Binding is a short database operation.  The filesystem copy happens
+        # afterwards with no writer transaction held.
+        for request_id, _input_key in requests:
+            with self.state.daemon.transaction():
+                sources.bind(int(request_id))
+
+        target_directory = (
+            self.work / f"c{ci}" / f"t{target_id}" / "published-inputs")
+        target_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(target_directory, 0o700)
+        capabilities: List[SourceCapability] = []
+        try:
+            for request_id, input_key in requests:
+                capabilities.append(sources.materialize(
+                    int(request_id),
+                    target_directory=target_directory,
+                    input_key=str(input_key)))
+        except BaseException:
+            for capability in capabilities:
+                capability.close()
+            raise
+        with self._bundle_session_lock:
+            existing = self._bundle_source_capabilities.get(target_id)
+            if existing is None:
+                self._bundle_source_capabilities[target_id] = capabilities
+            else:
+                for capability in capabilities:
+                    capability.close()
 
     def _bundle_live_logs(self, ci: int, target_id: int) -> List[Dict[str, Any]]:
         """Return bounded tails of mutable execution logs; never register them."""
@@ -1000,13 +2039,19 @@ class AttackStages:
             })
         return snapshots
 
-    def bundle_session_status(self, scope) -> Dict[str, Any]:  # noqa: ANN001
-        """Return compact authoritative execution/repair state to the live turn."""
+    def bundle_session_status(
+            self, scope, *, mode: Optional[str] = None,
+            after_seq: int = 0, after_status_revision: int = 0,
+            limit: int = 200,
+            timeout_s: float = 0) -> Dict[str, Any]:  # noqa: ANN001
+        """Return authoritative state plus a bounded cursor journal projection."""
         ci = self._bundle_scope_cycle(scope)
         target_id = self._bundle_scope_target(scope)
-        session = self._bundle_cycle_session(ci)
+        fixed_worker = self._is_target_worker_scope(scope)
+        session = self._bundle_runtime_session(scope, ci, target_id)
         with self._bundle_session_lock:
-            if session.get("active_target_id") != target_id:
+            if (not fixed_worker
+                    and session.get("active_target_id") != target_id):
                 raise RuntimeError("Bundle status target 与 cycle session 绑定漂移")
             worker = session.get("worker")
             worker_running = bool(worker is not None and worker.is_alive())
@@ -1028,17 +2073,29 @@ class AttackStages:
             "LEFT JOIN evaluation_attempt ea ON ea.id=el.evaluation_attempt_id "
             "WHERE coalesce(r.build_target_id,ea.build_target_id)=? "
             "ORDER BY el.id DESC LIMIT 20", (target_id,))
-        return {
+        result_candidate = self._pending_result_candidate(
+            cycle_id=ci, build_target_id=target_id)
+        terminal = row[0] in _TERMINAL_TARGET
+        status_projection = {
             "cycle_id": scope.cycle_id,
             "build_target_id": target_id,
             "target_kind": row[2],
             "seq": row[3],
             "status": row[0],
             "failure_kind": row[1],
-            "terminal": row[0] in _TERMINAL_TARGET,
+            "terminal": terminal,
             "worker_running": worker_running,
             "controller_error": (
                 None if worker_error is None else str(worker_error)),
+            "awaiting_result_review": bool(
+                result_candidate is not None
+                and result_candidate["ack"] is None),
+            "result_review_ready": bool(
+                result_candidate is not None
+                and result_candidate["ack"] is not None),
+            "result_candidate_decision_id": (
+                None if result_candidate is None
+                else result_candidate["decision_id"]),
             "cancellation_requested": (
                 None if repair_requested is None else dict(repair_requested)),
             "latest_repair": (
@@ -1048,11 +2105,49 @@ class AttackStages:
                 {"log_kind": item[0], "ref": item[1],
                  "content_hash": item[2], "bytes": item[3]}
                 for item in logs],
-            "live_logs": self._bundle_live_logs(ci, target_id),
         }
+        journal = self._bundle_journal(ci, target_id)
+        journal.publish_status({
+            key: status_projection[key]
+            for key in (
+                "cycle_id", "build_target_id", "target_kind", "seq",
+                "status", "failure_kind", "terminal", "worker_running",
+                "controller_error", "awaiting_result_review",
+                "result_review_ready")
+        }, terminal=terminal)
 
-    def _bundle_worker(self, ci: int, target_id: int) -> None:
-        session = self._bundle_cycle_session(ci)
+        requested_mode = (
+            "incremental" if mode is None and fixed_worker else mode)
+        if requested_mode is not None:
+            if requested_mode == "snapshot":
+                view = journal.snapshot(limit=limit)
+            elif requested_mode == "incremental":
+                view = journal.incremental(
+                    after_seq=after_seq, limit=limit)
+                if (not view.events and not view.terminal
+                        and float(timeout_s) > 0):
+                    view = journal.wait(
+                        after_seq=after_seq,
+                        after_status_revision=after_status_revision,
+                        timeout_s=float(timeout_s), limit=limit)
+            else:
+                raise ValueError(
+                    "Bundle journal mode 须为 snapshot/incremental")
+            status_projection["journal"] = self._bundle_journal_projection(
+                view)
+        else:
+            # Only an already-running pre-DAG cycle-wide task receives the old
+            # tail shape.  New fixed Workers always use the cursor journal.
+            status_projection["live_logs"] = self._bundle_live_logs(
+                ci, target_id)
+        return status_projection
+
+    def _bundle_worker(
+            self, ci: int, target_id: int, *,
+            fixed_worker: bool = False) -> None:
+        session = (
+            self._bundle_target_session(ci, target_id)
+            if fixed_worker else self._bundle_cycle_session(ci))
         error: Optional[BaseException] = None
         try:
             self._drive_target(self.state.cycle(f"c{ci}"), target_id)
@@ -1065,6 +2160,10 @@ class AttackStages:
             # guardian's next observer tick; never silently advance to a new
             # target after dropping a live main-agent decision.
             with self._bundle_session_lock:
+                # is_alive() remains true throughout this finally block.  Close
+                # the request gate before taking the last snapshot so a late
+                # MCP control cannot be acknowledged after the observer loop.
+                session["control_accepting"] = False
                 requested = (None if session.get("repair_requested") is None
                              else dict(session["repair_requested"]))
             if error is None and requested is not None:
@@ -1085,6 +2184,42 @@ class AttackStages:
                 if session.get("active_target_id") == target_id:
                     session["worker_error"] = error
                     session["finished_at"] = time.monotonic()
+            row = self.state.daemon.query_one(
+                "SELECT status,failure_kind FROM build_target WHERE id=?",
+                (target_id,))
+            terminal = bool(
+                row is not None and row[0] in _TERMINAL_TARGET)
+            journal = self._bundle_journal(ci, target_id)
+            journal.publish_status({
+                "cycle_id": f"c{ci}",
+                "build_target_id": target_id,
+                "status": None if row is None else row[0],
+                "failure_kind": None if row is None else row[1],
+                "terminal": terminal,
+                "worker_running": False,
+                "controller_error": (
+                    None if error is None else str(error)[:2048]),
+            }, terminal=terminal)
+            if terminal:
+                # Finalize both independently observed decoder lanes so
+                # recovery can prove no partial UTF-8 state remains.
+                try:
+                    journal.append("stdout", b"", final=True)
+                except RuntimeError as close_error:
+                    if "already finalized" not in str(close_error):
+                        raise
+                try:
+                    journal.append("stderr", b"", final=True)
+                except RuntimeError as close_error:
+                    if "already finalized" not in str(close_error):
+                        raise
+                self._record_bundle_drain_receipt(
+                    ci, target_id, status=str(row[0]))
+                with self._bundle_session_lock:
+                    capabilities = self._bundle_source_capabilities.pop(
+                        target_id, [])
+                for capability in capabilities:
+                    capability.close()
 
     def execute_bundle_session(self, scope, files: Mapping[str, Any]) -> Dict[str, Any]:  # noqa: ANN001
         """Start official execution asynchronously and return to Codex promptly."""
@@ -1097,7 +2232,8 @@ class AttackStages:
             if not self._bundle_accepting:
                 raise RuntimeError("Bundle controller 正在关闭，拒绝启动新执行")
             ci = self._bundle_scope_cycle(scope)
-            session = self._bundle_cycle_session(ci)
+            session = self._bundle_runtime_session(
+                scope, ci, target_id)
             if session.get("active_target_id") != target_id:
                 raise RuntimeError("Bundle execute target 与 cycle session 绑定漂移")
             status = self.state.daemon.query_one(
@@ -1112,10 +2248,12 @@ class AttackStages:
             self._bundle_session_payloads[target_id] = dict(files)
             session["worker_error"] = None
             session["repair_requested"] = None
+            session["control_accepting"] = True
             session["started_at"] = time.monotonic()
             session["finished_at"] = None
             worker = threading.Thread(
                 target=self._bundle_worker, args=(ci, target_id),
+                kwargs={"fixed_worker": self._is_target_worker_scope(scope)},
                 name=f"bundle-cycle-c{ci}-t{target_id}", daemon=False)
             session["worker"] = worker
             self._bundle_worker_threads = {
@@ -1126,19 +2264,244 @@ class AttackStages:
             except BaseException:
                 self._bundle_worker_threads.discard(worker)
                 session["worker"] = None
+                session["control_accepting"] = False
                 raise
         return self.bundle_session_status(scope)
+
+    def _supersede_result_candidate(
+            self, scope, *, action: str, diagnosis: str) -> Dict[str, Any]:  # noqa: ANN001
+        """Settle one pre-admission attempt before repair or replan."""
+        if action not in {"repair", "replan"}:
+            raise RuntimeError("bundle result candidate action 非法")
+        ci = self._bundle_scope_cycle(scope)
+        target_id = self._bundle_scope_target(scope)
+        candidate = self._pending_result_candidate(
+            cycle_id=ci, build_target_id=target_id)
+        if candidate is None:
+            raise RuntimeError("当前 target 没有待处理 result candidate")
+        payload = candidate["payload"]
+        attempt_id = int(payload["evaluation_attempt_id"])
+        evaluation_id = int(payload["evaluation_id"])
+        target_kind = self.state.daemon.query_one(
+            "SELECT target_kind FROM build_target WHERE id=?", (target_id,))[0]
+        invalidated_run_id = None
+        if target_kind in {"build", "exec"}:
+            run_rows = self.state.daemon.query(
+                "SELECT id FROM run WHERE build_target_id=? AND status='success' "
+                "ORDER BY id DESC", (target_id,))
+            if not run_rows:
+                raise RuntimeError(
+                    "build/exec result candidate 缺成功训练 run")
+            invalidated_run_id = int(run_rows[0][0])
+            durable_hashes = sorted(
+                str(row[0]) for row in self.state.daemon.query(
+                    "SELECT content_hash FROM checkpoint "
+                    "WHERE produced_by_run=? ORDER BY id",
+                    (invalidated_run_id,))
+            )
+            if not _same_checkpoint_hash_multiset(
+                    durable_hashes, payload["checkpoint_hashes"]):
+                raise RuntimeError(
+                    "result candidate checkpoint 不属于最新成功训练 run")
+        attempt = self.state.daemon.query_one(
+            "SELECT evaluation_id,status,failure_kind "
+            "FROM evaluation_attempt WHERE id=?",
+            (attempt_id,))
+        if attempt is None or int(attempt[0]) != evaluation_id:
+            raise RuntimeError(
+                "待处理 result candidate 的 evaluation attempt 身份漂移")
+        if (attempt[1] != "running"
+                and (attempt[1], attempt[2]) != (
+                    "failed", "protocol_violation")):
+            raise RuntimeError(
+                "待处理 result candidate 的 evaluation attempt "
+                "不是可恢复的 result-review settlement")
+        superseded = {
+            "protocol": "bundle-result-candidate-superseded-v1",
+            "build_target_id": target_id,
+            "candidate_decision_id": candidate["decision_id"],
+            "evaluation_id": evaluation_id,
+            "evaluation_attempt_id": attempt_id,
+            "invalidated_run_id": invalidated_run_id,
+            "action": action,
+            "diagnosis_md": diagnosis[:8192],
+        }
+        with self.state.daemon.transaction() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM decision "
+                "WHERE cycle_id=? AND actor='orchestrator' "
+                "AND type='bundle_result_candidate_superseded' "
+                "AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.candidate_decision_id')=?",
+                (ci, candidate["decision_id"])).fetchall()
+            canonical = json.dumps(
+                superseded, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"))
+            if rows and any(json.dumps(
+                    json.loads(row[0]), ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")) != canonical for row in rows):
+                raise RuntimeError("result candidate supersede decision 冲突")
+            if not rows:
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'orchestrator',"
+                    "'bundle_result_candidate_superseded',?)",
+                    (ci, canonical))
+        settled = {
+            **candidate,
+            "evaluation_id": evaluation_id,
+            "attempt_id": attempt_id,
+            "run_id": invalidated_run_id,
+            "diagnosis_md": diagnosis[:8192],
+        }
+        self._settle_result_supersession_owners(settled)
+        return settled
+
+    def _settle_result_supersession_owners(
+            self, settled: Mapping[str, Any]) -> None:
+        """Idempotently close owners after durable supersession intent."""
+        evaluation_id = int(settled["evaluation_id"])
+        attempt_id = int(settled["attempt_id"])
+        attempt = self.state.daemon.query_one(
+            "SELECT evaluation_id,status,failure_kind "
+            "FROM evaluation_attempt WHERE id=?",
+            (attempt_id,))
+        if attempt is None or int(attempt[0]) != evaluation_id:
+            raise RuntimeError(
+                "result supersession evaluation attempt 身份漂移")
+        if attempt[1] == "running":
+            self.gate.gate_finish_attempt(
+                attempt_id=attempt_id, status="failed",
+                failure_kind="protocol_violation")
+        elif (attempt[1], attempt[2]) != (
+                "failed", "protocol_violation"):
+            raise RuntimeError(
+                "result supersession attempt 不是可恢复的 failed owner")
+        evaluation = self.state.daemon.query_one(
+            "SELECT status FROM evaluation WHERE id=?", (evaluation_id,))
+        if evaluation is None:
+            raise RuntimeError(
+                f"result supersession evaluation {evaluation_id} 不存在")
+        if evaluation[0] != "success":
+            self.gate.gate_finish_evaluation(evaluation_id=evaluation_id)
+
+    def _unscheduled_result_supersession(
+            self, *, cycle_id: int, build_target_id: int,
+            ) -> Optional[Dict[str, Any]]:
+        """Recover a supersession committed before its repair request."""
+        rows = self.state.daemon.query(
+            "SELECT id,payload_json FROM decision "
+            "WHERE cycle_id=? AND actor='orchestrator' "
+            "AND type='bundle_result_candidate_superseded' "
+            "AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.build_target_id')=? "
+            "AND json_extract(payload_json,'$.action')='repair' "
+            "ORDER BY id DESC",
+            (cycle_id, build_target_id))
+        for decision_id, raw in rows:
+            try:
+                payload = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    f"result supersession d{decision_id} 损坏") from error
+            required = {
+                "protocol", "build_target_id", "candidate_decision_id",
+                "evaluation_id", "evaluation_attempt_id",
+                "invalidated_run_id", "action", "diagnosis_md",
+            }
+            if (set(payload) != required
+                    or payload.get("protocol")
+                    != "bundle-result-candidate-superseded-v1"
+                    or payload.get("build_target_id") != build_target_id
+                    or payload.get("action") != "repair"
+                    or any(isinstance(payload.get(field), bool)
+                           or not isinstance(payload.get(field), int)
+                           or payload[field] <= 0
+                           for field in (
+                               "candidate_decision_id", "evaluation_id",
+                               "evaluation_attempt_id"))
+                    or (payload.get("invalidated_run_id") is not None
+                        and (isinstance(payload["invalidated_run_id"], bool)
+                             or not isinstance(
+                                 payload["invalidated_run_id"], int)
+                             or payload["invalidated_run_id"] <= 0))
+                    or not isinstance(payload.get("diagnosis_md"), str)):
+                raise RuntimeError(
+                    f"result supersession d{decision_id} 契约损坏")
+            scheduled = self.state.daemon.query_one(
+                "SELECT 1 FROM decision WHERE actor='orchestrator' "
+                "AND type='bundle_repair_requested' "
+                "AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.build_target_id')=? "
+                "AND json_extract(payload_json,'$.phase')='result_review' "
+                "AND json_extract(payload_json,'$.repair_of.attempt_id')=? "
+                "LIMIT 1",
+                (build_target_id, payload["evaluation_attempt_id"]))
+            if scheduled is None:
+                return {
+                    "decision_id": decision_id,
+                    "evaluation_id": payload["evaluation_id"],
+                    "attempt_id": payload["evaluation_attempt_id"],
+                    "run_id": payload["invalidated_run_id"],
+                    "diagnosis_md": payload["diagnosis_md"],
+                }
+        return None
 
     def request_bundle_repair(self, scope, diagnosis: str) -> Dict[str, Any]:  # noqa: ANN001
         """Ask the live guardian observer to cancel for an engineering repair."""
         ci = self._bundle_scope_cycle(scope)
         target_id = self._bundle_scope_target(scope)
-        session = self._bundle_cycle_session(ci)
+        session = self._bundle_runtime_session(scope, ci, target_id)
         with self._bundle_session_lock:
             worker = session.get("worker")
-            if worker is None or not worker.is_alive():
+            worker_running = bool(worker is not None and worker.is_alive())
+            if worker_running and not session.get("control_accepting"):
                 raise RuntimeError(
-                    "Bundle target 当前无执行中命令；可直接修改并重提")
+                    "Bundle worker 正在收口；请读取最新状态后重试 repair")
+        if not worker_running:
+            candidate = self._pending_result_candidate(
+                cycle_id=ci, build_target_id=target_id)
+            if candidate is None:
+                open_repair = self._latest_open_repair(target_id)
+                if (open_repair is not None
+                        and open_repair.get("phase") == "result_review"):
+                    self._prepare_bundle_repair(
+                        self.state.cycle(scope.cycle_id),
+                        target_id, open_repair)
+                    return self.bundle_session_status(scope)
+                settled = self._unscheduled_result_supersession(
+                    cycle_id=ci, build_target_id=target_id)
+                if settled is None:
+                    raise RuntimeError(
+                        "Bundle target 当前无执行中命令；可直接修改并重提")
+                self._settle_result_supersession_owners(settled)
+            else:
+                settled = self._supersede_result_candidate(
+                    scope, action="repair", diagnosis=diagnosis)
+            settled_diagnosis = settled.get("diagnosis_md", diagnosis)
+            scheduled = self._schedule_bundle_repair(
+                self.state.cycle(scope.cycle_id), target_id,
+                _BundleRepairNeeded(
+                    "结果审查要求工程修复：\n" + settled_diagnosis,
+                    failure_kind="review_failed", phase="result_review",
+                    repair_of={
+                        "attempt_id": settled["attempt_id"],
+                        **({"run_id": settled["run_id"]}
+                           if settled["run_id"] is not None else {}),
+                    }))
+            if not scheduled:
+                raise RuntimeError("结果审查后的工程修复未获授权")
+            return self.bundle_session_status(scope)
+        with self._bundle_session_lock:
+            if session.get("active_target_id") != target_id:
+                raise RuntimeError(
+                    "Bundle repair target 与 runtime session 绑定漂移")
+            worker = session.get("worker")
+            if worker is None or not worker.is_alive():
+                raise RuntimeError("Bundle worker 状态在 repair 请求前漂移")
+            if not session.get("control_accepting"):
+                raise RuntimeError(
+                    "Bundle worker 正在收口；请读取最新状态后重试 repair")
             status = self.state.daemon.query_one(
                 "SELECT status FROM build_target WHERE id=?", (target_id,))[0]
             if status in _TERMINAL_TARGET:
@@ -1155,27 +2518,51 @@ class AttackStages:
         return self.bundle_session_status(scope)
 
     def _resident_bundle_control(self, target_id: int) -> Optional[Dict[str, Any]]:
+        """Return control requested by the session that owns this worker thread."""
         with self._bundle_session_lock:
-            for session in self._bundle_cycle_sessions.values():
-                if session.get("active_target_id") == target_id:
-                    request = session.get("repair_requested")
-                    if request is None:
-                        return None
-                    request["observed"] = True
-                    request["observed_at"] = time.monotonic()
-                    return dict(request)
-        return None
+            current_worker = threading.current_thread()
+            sessions = [
+                session
+                for (_ci, session_target_id), session
+                in self._bundle_target_sessions.items()
+                if session_target_id == target_id
+                and session.get("active_target_id") == target_id
+                and session.get("worker") is current_worker
+            ]
+            sessions.extend(
+                session
+                for session in self._bundle_cycle_sessions.values()
+                if session.get("active_target_id") == target_id
+                and session.get("worker") is current_worker
+            )
+            if len(sessions) > 1:
+                raise RuntimeError(
+                    "Bundle live control owner 不唯一，拒绝跨 Worker 取消")
+            if not sessions:
+                return None
+            request = sessions[0].get("repair_requested")
+            if request is None:
+                return None
+            request["observed"] = True
+            request["observed_at"] = time.monotonic()
+            return dict(request)
 
     def replan_bundle_session(self, scope, diagnosis: str) -> Dict[str, Any]:  # noqa: ANN001
         """Route an explicit main-agent frozen-plan diagnosis to Reasoning."""
         if not self._resident_bundle_session_enabled:
             raise RuntimeError("resident Bundle session controller 未启用")
         target_id = self._bundle_scope_target(scope)
+        ci = self._bundle_scope_cycle(scope)
+        session = self._bundle_runtime_session(scope, ci, target_id)
         with self._bundle_session_lock:
-            ci = self._bundle_scope_cycle(scope)
-            session = self._bundle_cycle_session(ci)
+            if session.get("active_target_id") != target_id:
+                raise RuntimeError(
+                    "Bundle replan target 与 runtime session 绑定漂移")
             worker = session.get("worker")
             if worker is not None and worker.is_alive():
+                if not session.get("control_accepting"):
+                    raise RuntimeError(
+                        "Bundle worker 正在收口；请读取最新状态后重试 replan")
                 session["control_sequence"] = int(
                     session.get("control_sequence") or 0) + 1
                 session["repair_requested"] = {
@@ -1185,18 +2572,30 @@ class AttackStages:
                     "observed": False,
                 }
                 return self.bundle_session_status(scope)
+            pending = self._pending_result_candidate(
+                cycle_id=ci, build_target_id=target_id)
+            if pending is not None:
+                self._supersede_result_candidate(
+                    scope, action="replan", diagnosis=diagnosis)
             status = self.state.daemon.query_one(
                 "SELECT status FROM build_target WHERE id=?", (target_id,))[0]
             if status in _TERMINAL_TARGET:
                 raise RuntimeError(
                     "Bundle target 已终态，不能回写 replan；每个 cycle 仍会进入 "
                     "Reasoning，请在该必经阶段基于终态证据决策")
-            # ``engineering_blocked`` is the existing mechanical early-exit
-            # state.  The accompanying durable bundle_replan_required record
-            # distinguishes a frozen-plan diagnosis from an implementation or
-            # environment block; Reasoning owns the research interpretation.
+            graph_target = self.state.daemon.query_one(
+                "SELECT 1 FROM bundle_target_node "
+                "WHERE target_id=? AND cycle_id=?",
+                (target_id, ci))
+            # New DAG targets use the normal failed state.  Their critical bit
+            # mechanically chooses all-pending drain versus descendant-only
+            # propagation.  engineering_blocked remains solely for a pre-DAG
+            # recovery row that cannot express that distinction.
             self.gate.gate_finish_build_target(
-                build_target_id=target_id, status="engineering_blocked",
+                build_target_id=target_id,
+                status=(
+                    "failed" if graph_target is not None
+                    else "engineering_blocked"),
                 failure_kind="protocol_violation")
             with self.state.daemon.transaction() as conn:
                 exists = conn.execute(
@@ -1222,7 +2621,9 @@ class AttackStages:
             variant_id: int, baseline_id: int, target_kind: str,
             manifest: Mapping[str, Any], src_dir: Path,
             checkpoint_sources: Mapping[str, Path],
-            checkpoint_hashes: Mapping[str, str]) -> Optional[VerifiedTrainingPublication]:
+            checkpoint_hashes: Mapping[str, str],
+            checkpoint_db_keys: Optional[Mapping[str, str]] = None,
+            ) -> Optional[VerifiedTrainingPublication]:
         """Copy immutable training assets before checkpoint rows reference them."""
         if self.pool_publisher is None:
             return None
@@ -1235,10 +2636,26 @@ class AttackStages:
             (variant_id, baseline_id))
         if baseline is None or variant is None:
             raise RuntimeError("formal training publication 的 baseline/variant 身份缺失")
+        prior_training = self.state.daemon.query_one(
+            "SELECT 1 FROM decision WHERE json_valid(payload_json) "
+            "AND ((actor='orchestrator' AND type='bundle_training_candidate') "
+            "OR (actor='gate' AND type='pool_training_publication')) "
+            "AND json_extract(payload_json,'$.variant_id')=? "
+            "AND json_type(payload_json,'$.run_id')='integer' "
+            "AND json_extract(payload_json,'$.run_id')<>? LIMIT 1",
+            (variant_id, run_id))
+        implementation_revision = (
+            ImplementationRevisionPublication(
+                run_id=run_id, code_source=src_dir)
+            if prior_training is not None else None)
+        initial_publication = implementation_revision is None
         legacy = "checkpoint" in manifest.get("expected_outputs", {})
         checkpoints = []
         for key, source in checkpoint_sources.items():
-            db_key = f"final-r{run_id}" if legacy else key
+            db_key = (
+                checkpoint_db_keys[key]
+                if checkpoint_db_keys is not None else
+                (f"final-r{run_id}" if legacy else key))
             checkpoints.append(CheckpointPublication(
                 ckpt_key=db_key, source=Path(source),
                 expected_sha256=checkpoint_hashes[key],
@@ -1247,15 +2664,24 @@ class AttackStages:
                 file_name="artifact.bin"))
         baseline_spec = BaselinePublication(
             baseline_id=baseline_id, slug=baseline[0], canonical_key=baseline[1],
-            identity_source=(src_dir / MF.IDENTITY_FILE if target_kind == "build" else None),
-            code_source=(src_dir if target_kind == "build" else None),
-            repro_cmd_md=(manifest["repro_cmd_md"] if target_kind == "build" else None))
+            identity_source=(
+                src_dir / MF.IDENTITY_FILE
+                if target_kind == "build" and initial_publication else None),
+            code_source=(
+                src_dir
+                if target_kind == "build" and initial_publication else None),
+            repro_cmd_md=(
+                manifest["repro_cmd_md"]
+                if target_kind == "build" and initial_publication else None))
         variant_spec = VariantPublication(
             variant_id=variant_id, variant_key=variant[0], config=variant[1],
-            overrides_source=(src_dir if target_kind == "exec" else None))
+            overrides_source=(
+                src_dir
+                if target_kind == "exec" and initial_publication else None))
         return self.pool_publisher.publish_training(TrainingPublicationSpec(
             baseline=baseline_spec, variant=variant_spec,
-            checkpoints=checkpoints))
+            checkpoints=checkpoints,
+            implementation_revision=implementation_revision))
 
     def _training_checkpoint_ids(
             self, training: VerifiedTrainingPublication, *, variant_id: int,
@@ -1284,34 +2710,241 @@ class AttackStages:
 
     def _recover_training_publication(
             self, *, variant_id: int,
-            run_id: Optional[int] = None) -> Optional[VerifiedTrainingPublication]:
-        """Recover the immutable training receipt from its DB anchor, never staging."""
+            run_id: Optional[int] = None,
+            allow_candidate: bool = False,
+            ) -> Optional[VerifiedTrainingPublication]:
+        """Recover an immutable admitted or pre-admission training receipt."""
         if self.pool_publisher is None:
             return None
         rows = self.state.daemon.query(
             "SELECT payload_json FROM decision WHERE actor='gate' "
             "AND type='pool_training_publication' "
-            "AND json_extract(payload_json,'$.variant_id')=? ORDER BY id DESC",
-            (variant_id,))
-        for (raw,) in rows:
+            "AND json_extract(payload_json,'$.variant_id')=? "
+            + ("AND json_extract(payload_json,'$.run_id')=? "
+               if run_id is not None else "")
+            + "ORDER BY id DESC LIMIT 1",
+            ((variant_id, run_id)
+             if run_id is not None else (variant_id,)))
+        if rows:
+            raw = rows[0][0]
             try:
                 event = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if run_id is not None and event.get("run_id") != run_id:
-                continue
-            reference, digest = event.get("manifest_ref"), event.get("manifest_hash")
-            if not isinstance(reference, str) or not isinstance(digest, str):
-                continue
+            except (TypeError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    "最新 admitted training publication JSON 损坏") from error
+            if (not isinstance(event, dict)
+                    or event.get("variant_id") != variant_id
+                    or (run_id is not None
+                        and event.get("run_id") != run_id)
+                    or not isinstance(event.get("manifest_ref"), str)
+                    or not event["manifest_ref"]
+                    or not isinstance(event.get("manifest_hash"), str)
+                    or not event["manifest_hash"]
+                    or not isinstance(event.get("checkpoint_ids"), list)):
+                raise RuntimeError(
+                    "最新 admitted training publication durable identity 损坏")
+            reference = event["manifest_ref"]
+            digest = event["manifest_hash"]
             training = self.pool_publisher.verify_training(
                 reference, expected_hash=digest)
-            ids = self._training_checkpoint_ids(training, variant_id=variant_id)
+            objects = training.payload["objects"]
+            baseline = objects["baseline"]
+            variant = objects["variant"]
+            revision = objects.get("implementation_revision")
+            revision_binding = None
+            if revision is not None:
+                revision_binding = {
+                    "run_id": revision["run_id"],
+                    "code_ref": revision["code"]["path"],
+                    "commit_hash": (
+                        TREE_HASH_ALG + ":" + revision["code"]["sha256"]),
+                }
+            expected_keys = {
+                "schema", "manifest_ref", "manifest_hash", "baseline_id",
+                "variant_id", "checkpoint_ids", "run_id",
+            }
+            if revision_binding is not None:
+                expected_keys.add("implementation_revision")
+            event_run_id = event.get("run_id")
+            if (set(event) != expected_keys
+                    or event.get("schema") != TRAINING_DB_BINDING_SCHEMA
+                    or event.get("manifest_ref") != training.manifest_ref
+                    or event.get("manifest_hash") != training.manifest_hash
+                    or not isinstance(event.get("baseline_id"), int)
+                    or isinstance(event.get("baseline_id"), bool)
+                    or event.get("baseline_id") != baseline["baseline_id"]
+                    or not isinstance(event.get("variant_id"), int)
+                    or isinstance(event.get("variant_id"), bool)
+                    or event.get("variant_id") != variant["variant_id"]
+                    or (event_run_id is not None
+                        and (not isinstance(event_run_id, int)
+                             or isinstance(event_run_id, bool)
+                             or event_run_id <= 0))
+                    or (revision_binding is not None
+                        and event_run_id != revision_binding["run_id"])
+                    or event.get("implementation_revision")
+                    != revision_binding
+                    or any(not isinstance(checkpoint_id, int)
+                           or isinstance(checkpoint_id, bool)
+                           or checkpoint_id <= 0
+                           for checkpoint_id in event["checkpoint_ids"])):
+                raise RuntimeError(
+                    "最新 admitted training publication DB 绑定损坏")
+            ids = self._training_checkpoint_ids(
+                training, variant_id=variant_id,
+                require_complete_variant=False)
             if event.get("checkpoint_ids") != [
                     ids[item["ckpt_key"]] for item in training.checkpoint_bindings]:
                 raise RuntimeError("pool_training_publication checkpoint id 锚损坏")
             return training
+        if not allow_candidate:
+            suffix = f"/run {run_id}" if run_id is not None else ""
+            raise RuntimeError(
+                f"variant {variant_id}{suffix} 缺 admitted training publication")
+        candidate_rows = self.state.daemon.query(
+            "SELECT payload_json FROM decision WHERE actor='orchestrator' "
+            "AND type='bundle_training_candidate' "
+            "AND json_extract(payload_json,'$.variant_id')=? "
+            + ("AND json_extract(payload_json,'$.run_id')=? " if run_id is not None else "")
+            + "ORDER BY id",
+            ((variant_id, run_id) if run_id is not None else (variant_id,)))
+        if len(candidate_rows) == 1:
+            try:
+                candidate = json.loads(candidate_rows[0][0])
+            except (TypeError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    "bundle_training_candidate decision JSON 损坏") from error
+            if (candidate.get("protocol")
+                    != "bundle-training-candidate-v1"
+                    or candidate.get("variant_id") != variant_id
+                    or (run_id is not None
+                        and candidate.get("run_id") != run_id)):
+                raise RuntimeError("bundle_training_candidate identity 损坏")
+            training = self.pool_publisher.verify_training(
+                candidate.get("manifest_ref"),
+                expected_hash=candidate.get("manifest_hash"))
+            ids = self._training_checkpoint_ids(
+                training, variant_id=variant_id,
+                require_complete_variant=False)
+            if candidate.get("checkpoint_ids") != [
+                    ids[item["ckpt_key"]]
+                    for item in training.checkpoint_bindings]:
+                raise RuntimeError(
+                    "bundle_training_candidate checkpoint id 锚损坏")
+            return training
+        if len(candidate_rows) > 1:
+            raise RuntimeError(
+                f"variant {variant_id}/run {run_id} 有冲突 training candidates")
         suffix = f"/run {run_id}" if run_id is not None else ""
-        raise RuntimeError(f"variant {variant_id}{suffix} 缺 formal training publication")
+        raise RuntimeError(
+            f"variant {variant_id}{suffix} 缺 training publication/candidate")
+
+    def _checkpoint_rows_for_reuse(
+            self, *, variant_id: int,
+            ) -> tuple[Optional[VerifiedTrainingPublication],
+                       List[tuple[int, str, str, str]]]:
+        """Return the active formal checkpoint generation, or legacy full rows.
+
+        Append-only repair deliberately leaves older checkpoint rows intact.
+        Production reuse must therefore follow the latest admitted training
+        receipt instead of treating all historical rows as executable peers.
+        """
+        if not getattr(self.gate, "require_formal_publication", False):
+            return None, self.state.daemon.query(
+                "SELECT id,ckpt_key,path,content_hash FROM checkpoint "
+                "WHERE variant_id=? ORDER BY id", (variant_id,))
+        training = self._recover_training_publication(variant_id=variant_id)
+        checkpoint_ids = self._training_checkpoint_ids(
+            training, variant_id=variant_id,
+            require_complete_variant=False)
+        revision = training.payload["objects"].get(
+            "implementation_revision")
+        expected_run = (
+            None if revision is None else int(revision["run_id"]))
+        rows: List[tuple[int, str, str, str]] = []
+        for binding in training.checkpoint_bindings:
+            checkpoint_id = checkpoint_ids[binding["ckpt_key"]]
+            row = self.state.daemon.query_one(
+                "SELECT id,ckpt_key,path,content_hash,produced_by_run "
+                "FROM checkpoint WHERE id=? AND variant_id=?",
+                (checkpoint_id, variant_id))
+            if row is None or tuple(row[:4]) != (
+                    checkpoint_id, binding["ckpt_key"], binding["path"],
+                    binding["content_hash"]):
+                raise RuntimeError(
+                    f"formal training receipt checkpoint ck{checkpoint_id} DB 绑定漂移")
+            if expected_run is not None and row[4] != expected_run:
+                raise RuntimeError(
+                    f"implementation revision run {expected_run} "
+                    f"错误绑定 checkpoint ck{checkpoint_id}/run {row[4]}")
+            rows.append(tuple(row[:4]))
+        if not rows:
+            raise RuntimeError(
+                f"formal training receipt for v{variant_id} 缺 checkpoint")
+        return training, rows
+
+    @staticmethod
+    def _record_training_candidate(
+            conn, training: VerifiedTrainingPublication, *,
+            cycle_id: int, baseline_id: int, variant_id: int,
+            run_id: int, checkpoint_ids: Mapping[str, int]) -> None:
+        payload = {
+            "protocol": "bundle-training-candidate-v1",
+            "manifest_ref": training.manifest_ref,
+            "manifest_hash": training.manifest_hash,
+            "baseline_id": baseline_id,
+            "variant_id": variant_id,
+            "run_id": run_id,
+            "checkpoint_ids": [
+                checkpoint_ids[item["ckpt_key"]]
+                for item in training.checkpoint_bindings
+            ],
+        }
+        canonical = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False)
+        rows = conn.execute(
+            "SELECT payload_json FROM decision WHERE cycle_id=? "
+            "AND actor='orchestrator' "
+            "AND type='bundle_training_candidate' "
+            "AND json_extract(payload_json,'$.run_id')=? ORDER BY id",
+            (cycle_id, run_id)).fetchall()
+        if rows:
+            if len(rows) != 1 or rows[0][0] != canonical:
+                raise RuntimeError(
+                    f"run {run_id} training candidate durable identity 冲突")
+            return
+        conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (?,'orchestrator','bundle_training_candidate',?)",
+            (cycle_id, canonical))
+
+    def _admit_training_publication(
+            self, *, training: VerifiedTrainingPublication,
+            cycle_id: str, build_target_id: int, evaluation_id: int,
+            attempt_id: int, baseline_id: int, variant_id: int,
+            run_id: int, scientific: Mapping[str, Any]) -> None:
+        validated = SC.validate_scientific_decision_payload(
+            scientific, expected_build_target_id=build_target_id,
+            expected_evaluation_id=evaluation_id,
+            expected_attempt_id=attempt_id)
+        if (validated["validity_status"] != "valid"
+                or validated["pool_eligibility"] != "eligible"):
+            raise RuntimeError(
+                "invalid/ineligible scientific result 不得绑定 training pool")
+        with self.state.daemon.transaction() as conn:
+            checkpoint_rows = conn.execute(
+                "SELECT id,ckpt_key FROM checkpoint "
+                "WHERE produced_by_run=? ORDER BY ckpt_key",
+                (run_id,)).fetchall()
+            if not checkpoint_rows:
+                raise RuntimeError(
+                    f"run {run_id} 缺 checkpoint，不得绑定 training pool")
+            bind_training_database(
+                conn, training, updated_cycle=_cnum(cycle_id),
+                checkpoint_ids={
+                    row[1]: row[0] for row in checkpoint_rows},
+                run_id=run_id)
 
     def _publish_evaluation_assets(
             self, *, training: VerifiedTrainingPublication, evaluation_id: int,
@@ -1332,7 +2965,8 @@ class AttackStages:
         if protocol is None:
             raise RuntimeError(f"protocol p{protocol_id}@{protocol_ver} 不存在")
         checkpoint_ids = self._training_checkpoint_ids(
-            training, variant_id=variant_id)
+            training, variant_id=variant_id,
+            require_complete_variant=False)
         transcript_source = self._evaluation_transcript_source(
             eval_log, transcript_ref)
         return self.pool_publisher.publish_evaluation(EvaluationPublicationSpec(
@@ -1494,6 +3128,24 @@ class AttackStages:
             raise RuntimeError(f"build_target {build_target_id} 不存在")
         return self._baseline_environment_hash(row[0])
 
+    def _resolve_target_execution_sandbox(
+            self, runtime_environment_hash: str):  # noqa: ANN201
+        """Resolve the deployment-owned parent sandbox for one baseline."""
+        if (self.execution_sandbox is None
+                or runtime_environment_hash
+                == self.execution_sandbox.environment_hash):
+            return self.execution_sandbox
+        if self.execution_sandbox_resolver is None:
+            raise RuntimeError(
+                "imported baseline 要求 dependency image，但系统未配置可信 resolver")
+        selected = self.execution_sandbox_resolver.resolve_environment_hash(
+            runtime_environment_hash)
+        if (getattr(selected, "environment_hash", None)
+                != runtime_environment_hash):
+            raise RuntimeError(
+                "dependency image resolver 返回了不同的 runtime identity")
+        return selected
+
     def _execution_sandbox_for(self, manifest: Mapping[str, Any], build_target_id: int):
         runtime_environment_hash = self._target_environment_hash(build_target_id)
         gpu_required = manifest.get("gpu_required", False)
@@ -1506,19 +3158,65 @@ class AttackStages:
             raise _BundleReject(
                 "manifest.env_hash 未继承 build_target baseline 的可信 CPU/GPU workload identity",
                 failure_kind="artifact_invalid")
-        if (self.execution_sandbox is None
-                or runtime_environment_hash == self.execution_sandbox.environment_hash):
-            selected = self.execution_sandbox
-        else:
-            if self.execution_sandbox_resolver is None:
+        selected = self._resolve_target_execution_sandbox(
+            runtime_environment_hash)
+        request = self.state.daemon.query_one(
+            "SELECT gpu_count FROM bundle_resource_request "
+            "WHERE build_target_id=?", (build_target_id,))
+        if request is not None:
+            gpu_count = int(request[0])
+            if gpu_required is not (gpu_count > 0):
+                raise _BundleReject(
+                    "manifest.gpu_required 与冻结 Plan resources.gpu_count "
+                    f"冲突（gpu_count={gpu_count}）",
+                    failure_kind="artifact_invalid")
+            allocation = self._resource_leases.acquire(
+                build_target_id=build_target_id,
+                authorized_gpu_contract=(
+                    None if selected is None
+                    else getattr(selected, "gpu_contract", None)),
+            )
+            if getattr(allocation, "status", None) != "acquired":
                 raise RuntimeError(
-                    "imported baseline 要求 dependency image，但系统未配置可信 resolver")
-            selected = self.execution_sandbox_resolver.resolve_environment_hash(
-                runtime_environment_hash)
-            if (getattr(selected, "environment_hash", None)
+                    f"target {build_target_id} 在 Worker 启动时缺已取得的 "
+                    "durable resource lease")
+            if getattr(
+                    allocation, "requested_gpu_count", None) != gpu_count:
+                raise RuntimeError(
+                    f"target {build_target_id} resource lease 数量漂移")
+            exact_contract = getattr(
+                allocation, "sandbox_gpu_contract", None)
+            if gpu_count > 0 and exact_contract is None:
+                raise RuntimeError(
+                    f"target {build_target_id} GPU lease 缺 exact contract")
+            if selected is None:
+                if gpu_count > 0:
+                    raise _BundleReject(
+                        "plan 要求 GPU，但部署未建立可执行的 fixed GPU allocation",
+                        failure_kind="env_invalid")
+                return None
+            derive = getattr(selected, "with_gpu_contract", None)
+            if not callable(derive):
+                if gpu_count == 0 and getattr(
+                        selected, "gpu_contract", None) is None:
+                    return selected
+                raise RuntimeError(
+                    "execution sandbox 缺 exact GPU lease 派生能力")
+            try:
+                leased = derive(exact_contract)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f"target {build_target_id} exact GPU lease 越出 "
+                    "deployment sandbox authority") from error
+            if (getattr(leased, "environment_hash", None)
                     != runtime_environment_hash):
                 raise RuntimeError(
-                    "dependency image resolver 返回了不同的 runtime identity")
+                    "per-target GPU lease 不得改变 baseline reusable "
+                    "environment identity")
+            if getattr(leased, "gpu_contract", None) != exact_contract:
+                raise RuntimeError(
+                    f"target {build_target_id} sandbox 未精确采用 durable lease")
+            return leased
         if gpu_required and getattr(selected, "gpu_contract", None) is None:
             raise _BundleReject(
                 "plan 要求 GPU，但部署未建立可执行的 fixed GPU allocation",
@@ -1747,17 +3445,24 @@ class AttackStages:
         if not isinstance(resources, Mapping):
             return
         target_policy = resources.get("gpu_target_policy")
-        if target_policy == "planner_select":
-            return
-        if target_policy not in {"required", "forbidden"}:
-            return
         targets = plan.get("targets")
         if not isinstance(targets, list):
             return
-        expected = target_policy == "required"
         for target in targets:
-            if isinstance(target, dict):
-                target["gpu_required"] = expected
+            if not isinstance(target, dict):
+                continue
+            request = target.get("resources")
+            gpu_count = (
+                request.get("gpu_count")
+                if isinstance(request, Mapping) else None)
+            if (not isinstance(gpu_count, bool)
+                    and isinstance(gpu_count, int)):
+                # ``gpu_required`` remains only the execution-manifest
+                # compatibility alias.  The frozen abstract count is
+                # authoritative whenever a new Plan declares resources.
+                target["gpu_required"] = gpu_count > 0
+            elif target_policy in {"required", "forbidden"}:
+                target["gpu_required"] = target_policy == "required"
 
     def _validate_plan_gpu_target_contract(self, plan: Mapping[str, Any]) -> None:
         """Enforce the deployment's explicit per-target GPU-mode policy.
@@ -2281,9 +3986,11 @@ class AttackStages:
         全部前置判失败一律 → _PlanReject（业务拒，不 raise 死循环）：I1 scope 冲突 / 复用协议缺 metric 绑定 /
         target_key·seq·metric_id 重复 / required 悬挂引用 / canonical_key 冲突（codex BLOCKER×3）。"""
         d = self.state.daemon
-        seqs = [t["seq"] for t in targets]
-        if seqs != list(range(1, len(targets) + 1)):
-            raise _PlanReject(f"targets.seq 须为从 1 起连续依赖序，实收 {seqs}")
+        try:
+            self.bundle_graph.validate_plan_declaration(targets)
+        except GraphValidationError as error:
+            raise _PlanReject(
+                f"Bundle target DAG 非法: {error}") from error
         estimates = []
         for target in targets:
             estimate = target.get("budget_estimate")
@@ -2367,6 +4074,16 @@ class AttackStages:
                 raise _PlanReject(
                     f"target_key {tk!r} 非正式池安全键（ASCII 字母数字开头，仅 ._-，最长 128）")
             claim = t.get("claim", {})
+            try:
+                _planned_run_seed(t)
+            except ValueError as error:
+                raise _PlanReject(
+                    f"target {tk} replicate 非法: {error}") from error
+            seed_path = _variant_seed_path(claim.get("config_json"))
+            if seed_path is not None:
+                raise _PlanReject(
+                    f"target {tk} 的 {seed_path} 把 seed 写入 variant identity；"
+                    "请改用 target.replicate.seed")
             if t["target_kind"] == "build":
                 ck, slug = claim["canonical_key"], claim["slug"]
                 if (not isinstance(slug, str)
@@ -2463,8 +4180,11 @@ class AttackStages:
                     if existing_eval is not None:
                         raise _PlanReject(
                             f"eval create 的格子 v{vid}/p{pid}@{pver} 已有 e{existing_eval[0]}——应走 append_attempt")
-                    checkpoints = d.query(
-                        "SELECT id,content_hash FROM checkpoint WHERE variant_id=? ORDER BY id", (vid,))
+                    _training, active_checkpoints = (
+                        self._checkpoint_rows_for_reuse(
+                            variant_id=vid))
+                    checkpoints = [
+                        (row[0], row[3]) for row in active_checkpoints]
                     if not checkpoints:
                         raise _PlanReject(
                             f"eval create 的 legal variant v{vid} 无可评 checkpoint")
@@ -2497,6 +4217,16 @@ class AttackStages:
                 eval_key = resolved["eval_key"]
                 target_set_hash = resolved["target_set_hash"]
             slice_ = dict(t)                    # 冻结 target 原样 + 绑定四件（plan_ref 权威；bundle manifest 交叉核锚）
+            try:
+                slice_["scientific_contract"] = SC.resolve_plan_scientific_contract(
+                    t.get("scientific_contract") or SC.default_scientific_contract(),
+                    metric_ids=mmap,
+                    declared_metrics=def_versions,
+                    required_metrics=req_by_tk.get(tk, []),
+                )
+            except SC.ScientificContractError as error:
+                raise _PlanReject(
+                    f"target {tk} scientific_contract 非法: {error}") from error
             slice_.update({"protocol_id": pid, "protocol_ver": pver, "eval_key": eval_key,
                            "target_set_hash": target_set_hash})
             if kind == "eval":
@@ -2546,17 +4276,71 @@ class AttackStages:
         fresh_bl: List[int] = []                             # 本调用新占的 baseline_id（build 回滚用）
         fresh_bt: List[int] = []                             # 本调用新建的 exec build_target（回滚用，连带 variant）
         try:
-            for dt in derived["targets"]:
+            # Baseline identity is frozen at INSERT time, including parent_id.
+            # Therefore claims follow the declared DAG rather than ``seq``:
+            # seq is display/tie-break metadata and a child may legally sort
+            # before its parent.  Graph declaration validation has already
+            # proved this loop can always make progress.
+            remaining = {
+                dt["target_key"]: dt for dt in derived["targets"]}
+            claim_order: List[Dict[str, Any]] = []
+            claimed_keys = set()
+            while remaining:
+                ready = sorted(
+                    (
+                        dt for dt in remaining.values()
+                        if set(dt["slice"].get("depends_on", ()))
+                        <= claimed_keys
+                    ),
+                    key=lambda dt: (
+                        int(dt["seq"]), str(dt["target_key"])),
+                )
+                if not ready:
+                    raise _PlanReject(
+                        "Bundle target DAG claim 顺序无法闭合")
+                for dt in ready:
+                    claim_order.append(dt)
+                    claimed_keys.add(dt["target_key"])
+                    remaining.pop(dt["target_key"])
+
+            for dt in claim_order:
                 tk, claim = dt["target_key"], dt["claim"]
                 if dt["kind"] == "build":
                     ck, slug = claim["canonical_key"], claim["slug"]
-                    row = d.query_one("SELECT id, born_cycle, slug FROM baseline WHERE canonical_key=?", (ck,))
+                    parent = dt["slice"].get("parent_baseline")
+                    parent_id = None
+                    if parent is not None:
+                        if "target_key" in parent:
+                            parent_claim = claims.get(parent["target_key"])
+                            if parent_claim is None:
+                                raise _PlanReject(
+                                    f"build target {tk} 的 parent target "
+                                    "尚未确定占坑身份")
+                            parent_id = int(parent_claim["baseline_id"])
+                        else:
+                            parent_row = d.query_one(
+                                "SELECT id,status FROM baseline "
+                                "WHERE canonical_key=?",
+                                (parent["baseline_ref"],))
+                            if parent_row is None or parent_row[1] != "legal":
+                                raise _PlanReject(
+                                    f"build target {tk} 的 parent baseline_ref "
+                                    f"{parent['baseline_ref']!r} 未解析到 legal baseline")
+                            parent_id = int(parent_row[0])
+                    row = d.query_one(
+                        "SELECT id,born_cycle,slug,parent_id FROM baseline "
+                        "WHERE canonical_key=?", (ck,))
                     if row and row[1] == ci and row[2] == slug:   # 本 cycle 已占（重放）→ 复用 baseline+base variant
+                        if row[3] != parent_id:
+                            raise _PlanReject(
+                                f"build target {tk} 的 parent baseline "
+                                "在崩溃重放时发生漂移")
                         vrow = d.query_one("SELECT id FROM variant WHERE baseline_id=? AND variant_key='base'", (row[0],))
                         claims[tk] = {"kind": "build", "baseline_id": row[0], "variant_id": vrow[0], "build_target_id": None}
                     else:
                         r = self.gate.gate_claim_baseline(canonical_key=ck, slug=slug, cycle_id=cycle_id,
-                                                          identity_draft_md=dt["identity_md"])
+                                                          identity_draft_md=dt["identity_md"],
+                                                          parent_id=parent_id)
                         fresh_bl.append(r["baseline_id"])
                         claims[tk] = {"kind": "build", "baseline_id": r["baseline_id"],
                                       "variant_id": r["variant_id"], "build_target_id": None}
@@ -2586,10 +4370,12 @@ class AttackStages:
                         "variant_id": dt["variant_id"], "evaluation_id": dt["evaluation_id"],
                         "build_target_id": None,
                     }
-        except GateReject:
+        except (GateReject, _PlanReject):
             if fresh_bl or fresh_bt:                         # 回滚孤儿（DELETE planned 无引用者，释放键）
                 with d.transaction() as conn:
-                    for bid in fresh_bl:
+                    # Children reference parents through immutable parent_id,
+                    # so unwind the topological claim order in reverse.
+                    for bid in reversed(fresh_bl):
                         conn.execute("DELETE FROM variant WHERE baseline_id=? AND status='planned'", (bid,))
                         conn.execute("DELETE FROM baseline WHERE id=? AND status='planned'", (bid,))
                     for bt in fresh_bt:
@@ -2769,6 +4555,7 @@ class AttackStages:
                 protocol_ver=group["protocol_ver"],
                 env_hash=expected_env_hash,
                 required=sorted(set(group["required"])),
+                require_scientific_contract=True,
             )
             if not selected["hit"]:
                 raise _PlanReject(
@@ -2814,6 +4601,7 @@ class AttackStages:
                         "plan_hash": ah,
                         "evidence": validated_reuse,
                     }, ensure_ascii=False, sort_keys=True)))
+            target_ids: Dict[str, int] = {}
             for dt, claim_info in built:
                 slice_json = json.dumps(dt["slice"], ensure_ascii=False, sort_keys=True)
                 if dt["kind"] == "build":                       # build：终局 INSERT build_target
@@ -2843,6 +4631,15 @@ class AttackStages:
                 for (mid, mver) in dt["required"]:
                     conn.execute("INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) "
                                  "VALUES (?,?,?)", (bt, mid, mver))
+                target_ids[dt["target_key"]] = int(bt)
+            if built:
+                if plan is None:
+                    raise RuntimeError(
+                        "Bundle graph registration 缺 plan artifact")
+                self.bundle_graph.register_plan(
+                    cycle_id=ci,
+                    plan_targets=plan["targets"],
+                    target_ids=target_ids)
             kinds = [dt["kind"] for dt, _claim in built]
             route = ("attack" if reject is not None or any(k in ("build", "exec") for k in kinds)
                      else "eval_only" if kinds else "reuse_only")
@@ -2983,12 +4780,24 @@ class AttackStages:
             raise RuntimeError(
                 f"bundle repair failure_kind 非法: {error.failure_kind!r}")
         max_repairs = self.policy["flow"]["retry"]["bundle_repair"]
-        unlimited = max_repairs is None
-        if (not unlimited and (isinstance(max_repairs, bool)
+        resident_dag_worker = bool(
+            self._resident_bundle_session_enabled
+            and d.query_one(
+                "SELECT 1 FROM bundle_target_node "
+                "WHERE target_id=? AND cycle_id=?",
+                (bt_id, _cnum(cyc.cycle_id))) is not None
+        )
+        configured_unlimited = max_repairs is None
+        if (not configured_unlimited and (isinstance(max_repairs, bool)
                 or not isinstance(max_repairs, int)
                 or not 0 <= max_repairs <= 3)):
             raise RuntimeError(
                 "policy.flow.retry.bundle_repair 必须为 null 或 0..3")
+        # Integer ceilings are retained only for draining an old pre-DAG
+        # authoring loop.  A fixed Target Worker always owns ordinary
+        # engineering repair until success or an explicit frozen-plan replan.
+        unlimited = configured_unlimited or resident_dag_worker
+        effective_repair_limit = None if unlimited else max_repairs
         row = d.query_one(
             "SELECT cycle_id,status,budget_estimate,created_at FROM build_target WHERE id=?",
             (bt_id,))
@@ -3000,11 +4809,17 @@ class AttackStages:
         spent = float(d.query_one(
             "SELECT COALESCE(SUM(l.money),0) FROM ledger l "
             "JOIN runner_call rc ON rc.id=l.runner_call_id WHERE rc.cycle_id=? AND ("
-            "rc.purpose LIKE ? OR rc.id IN (SELECT json_extract(payload_json,'$.runner_call_id') "
+            "rc.purpose LIKE ? OR rc.purpose LIKE ? OR "
+            "rc.id IN (SELECT json_extract(payload_json,'$.runner_call_id') "
             "FROM decision WHERE actor='judge' AND type IN "
             "('bundle_code_review','bundle_result_review') AND json_valid(payload_json) "
             "AND json_extract(payload_json,'$.build_target_id')=?))",
-            (row[0], f"bundle-c{row[0]}-t{bt_id}%", bt_id))[0])
+            (
+                row[0],
+                f"bundle-c{row[0]}-t{bt_id}%",
+                f"bundle-worker-c{row[0]}-t{bt_id}%",
+                bt_id,
+            ))[0])
         elapsed = float(d.query_one(
             "SELECT MAX(0,(julianday('now')-julianday(created_at))*86400.0) "
             "FROM build_target WHERE id=?", (bt_id,))[0] or 0.0)
@@ -3031,7 +4846,7 @@ class AttackStages:
             elif elapsed >= watchdog:
                 allowed = False
                 blocked_by = "watchdog"
-            elif repair_count >= max_repairs:
+            elif repair_count >= effective_repair_limit:
                 allowed = False
                 blocked_by = "repair_limit"
             elif spent < budget:
@@ -3066,7 +4881,7 @@ class AttackStages:
                             "repair_round": repair_count + 1,
                             "spent": spent,
                             "budget_estimate": budget,
-                            "repair_limit": max_repairs,
+                            "repair_limit": effective_repair_limit,
                         }, ensure_ascii=False, sort_keys=True)))
                 else:
                     allowed = False
@@ -3087,7 +4902,7 @@ class AttackStages:
                         None if source_hashes is None else _canon_hash(source_hashes)),
                     "spent": spent,
                     "budget_estimate": budget,
-                    "repair_limit": max_repairs,
+                    "repair_limit": effective_repair_limit,
                     "fresh_session_extension": extension,
                     "development_budget_override": development_override,
                 }
@@ -3182,50 +4997,83 @@ class AttackStages:
         return True
 
     def _bundle_stage_resident_cycle(self, cyc, rows: List[tuple]) -> bool:
-        """Run the whole cycle Bundle stage in one top-level Codex process.
+        """Run one cycle Scheduler task plus fixed per-target Worker tasks.
 
-        Per-target artifacts are consumed only by asynchronous MCP workers.
-        The provider's final (last-target) submission is deliberately ignored;
-        it can never be reinterpreted as the first target by the outer driver.
+        The compatibility branch exists only for a pre-DAG in-flight task.
+        New production assembly always provides ``bundle_scheduler`` and
+        ``bundle_worker`` and never asks one cycle-wide author to implement
+        multiple targets.
         """
         ci = _cnum(cyc.cycle_id)
         d = self.state.daemon
+        # Cold recovery may observe a target terminalized just before its
+        # append-only bundle phase commit.  Re-derive that commit from the
+        # terminal DB fact both on entry and after the resident worker returns.
+        for (target_id,) in rows:
+            status = d.query_one(
+                "SELECT status FROM build_target WHERE id=?", (target_id,))
+            if status is not None and status[0] in _TERMINAL_TARGET:
+                self._ensure_target_pc(cyc, int(target_id))
         self._bundle_apply_early_exit(ci)
-        live = d.query_one(
-            "SELECT id FROM build_target WHERE cycle_id=? AND plan_ref IS NOT NULL "
-            "AND status NOT IN ('complete','skipped','failed','engineering_blocked') "
-            "ORDER BY seq,id LIMIT 1", (ci,))
-        if live is not None:
-            first_target = int(live[0])
-            pack = self.compiler.render(
+        dag_runtime = (
+            "bundle_scheduler" in self.p
+            and "bundle_worker" in self.p)
+        if dag_runtime:
+            scheduler_pack = self.compiler.render(
                 cycle_id=cyc.cycle_id, stage="bundle",
-                target_id=str(first_target))
-            # Exactly one normal provider call for the entire cycle.  A later
-            # call is permitted only when the owner is reconstructing this same
-            # interrupted stage and StageProvider resumes its durable id.
-            try:
-                self.p["bundle"](cyc, pack)
-            except BundleReplanRequired as error:
-                # The cycle-wide resident main returns this control outcome
-                # only after it has concluded that code/environment repair
-                # cannot satisfy the frozen protocol.  Settle it at the same
-                # mechanical boundary used by a worker-side replan, then keep
-                # the normal Bundle -> Reasoning route instead of treating the
-                # control signal as an owner crash.
-                self._settle_bundle_replan(cyc, first_target, error)
+                target_id=None)
+            self._bundle_scheduler(ci)
+            self.p["bundle_scheduler"](cyc, scheduler_pack)
+            scheduler_state = self._bundle_scheduler(ci).overview()
+            if scheduler_state.active:
+                raise RuntimeError(
+                    "Bundle Scheduler 在 active Workers 排空前退出")
+            if not scheduler_state.drained:
+                raise RuntimeError(
+                    "Bundle Scheduler 未完成 guardian/resource 安全排空")
+            projection = self._bundle_scheduler_projection(
+                ci, scheduler_state)
+            if projection["controller_error"] is not None:
+                raise RuntimeError(
+                    "Bundle Scheduler 控制面异常: "
+                    + str(projection["controller_error"]))
+        else:
+            live = d.query_one(
+                "SELECT id FROM build_target WHERE cycle_id=? "
+                "AND plan_ref IS NOT NULL AND status NOT IN "
+                "('complete','skipped','failed','engineering_blocked') "
+                "ORDER BY seq,id LIMIT 1", (ci,))
+            if live is not None:
+                first_target = int(live[0])
+                pack = self.compiler.render(
+                    cycle_id=cyc.cycle_id, stage="bundle",
+                    target_id=str(first_target))
+                try:
+                    self.p["bundle"](cyc, pack)
+                except BundleReplanRequired as error:
+                    self._settle_bundle_replan(
+                        cyc, first_target, error)
 
-        session = self._bundle_cycle_session(ci)
-        with self._bundle_session_lock:
-            worker = session.get("worker")
-            worker_error = session.get("worker_error")
-        if worker is not None and worker.is_alive():
-            raise RuntimeError(
-                "Bundle 主 turn 在后台 target 执行结束前退出")
-        if worker_error is not None:
-            raise RuntimeError(
-                "Bundle 官方执行管线异常") from worker_error
+            session = self._bundle_cycle_session(ci)
+            with self._bundle_session_lock:
+                worker = session.get("worker")
+                worker_error = session.get("worker_error")
+            if worker is not None and worker.is_alive():
+                raise RuntimeError(
+                    "Bundle 主 turn 在后台 target 执行结束前退出")
+            if worker_error is not None:
+                raise RuntimeError(
+                    "Bundle 官方执行管线异常") from worker_error
 
         self._bundle_apply_early_exit(ci)
+        for (target_id,) in rows:
+            status = d.query_one(
+                "SELECT status FROM build_target WHERE id=?", (target_id,))
+            if status is not None and status[0] in _TERMINAL_TARGET:
+                self._ensure_target_pc(cyc, int(target_id))
+                if dag_runtime:
+                    self._ensure_bundle_terminal_report(
+                        int(target_id))
         remaining = d.query(
             "SELECT id,status FROM build_target WHERE cycle_id=? "
             "AND plan_ref IS NOT NULL AND status NOT IN "
@@ -3247,9 +5095,47 @@ class AttackStages:
             if dangling is not None:
                 raise RuntimeError(
                     f"Bundle 收口事务发现未终态 target {dangling[0]}")
+            expected_commits = conn.execute(
+                "SELECT count(*) FROM build_target WHERE cycle_id=? "
+                "AND plan_ref IS NOT NULL", (ci,)).fetchone()[0]
+            actual_commits = conn.execute(
+                "SELECT count(*) FROM phase_commit pc "
+                "JOIN build_target bt ON bt.id=pc.target_id "
+                "WHERE pc.cycle_id=? AND pc.stage='bundle' "
+                "AND bt.cycle_id=? AND bt.plan_ref IS NOT NULL",
+                (ci, ci)).fetchone()[0]
+            if actual_commits != expected_commits:
+                raise RuntimeError(
+                    f"Bundle 收口缺 target phase_commit："
+                    f"{actual_commits}/{expected_commits}")
+            if dag_runtime:
+                dangling_admission = conn.execute(
+                    "SELECT bt.id FROM build_target bt "
+                    "LEFT JOIN bundle_target_admission a "
+                    "ON a.target_id=bt.id "
+                    "WHERE bt.cycle_id=? AND bt.plan_ref IS NOT NULL "
+                    "AND bt.status='complete' AND a.id IS NULL LIMIT 1",
+                    (ci,)).fetchone()
+                if dangling_admission is not None:
+                    raise RuntimeError(
+                        f"Bundle 收口 complete target "
+                        f"{dangling_admission[0]} 缺 exact admission")
+                report_count = conn.execute(
+                    "SELECT count(*) FROM bundle_terminal_report "
+                    "WHERE cycle_id=?", (ci,)).fetchone()[0]
+                if report_count != expected_commits:
+                    raise RuntimeError(
+                        "Bundle 收口缺 terminal report："
+                        f"{report_count}/{expected_commits}")
             conn.execute("UPDATE cycle SET status='bundle' WHERE id=?", (ci,))
         with self._bundle_session_lock:
             self._bundle_cycle_sessions.pop(ci, None)
+            if dag_runtime:
+                self._bundle_schedulers.pop(ci, None)
+                for key in [
+                        key for key in self._bundle_target_sessions
+                        if key[0] == ci]:
+                    self._bundle_target_sessions.pop(key, None)
         return True
 
     def _skip_after_critical_failure(self, cyc, failed_target_id: int) -> None:
@@ -3267,8 +5153,15 @@ class AttackStages:
         if status is None:
             raise RuntimeError(f"Bundle replan target {bt_id} 不存在")
         if status[0] not in _TERMINAL_TARGET:
+            graph_target = d.query_one(
+                "SELECT 1 FROM bundle_target_node "
+                "WHERE target_id=? AND cycle_id=?",
+                (bt_id, _cnum(cyc.cycle_id)))
             self.gate.gate_finish_build_target(
-                build_target_id=bt_id, status="engineering_blocked",
+                build_target_id=bt_id,
+                status=(
+                    "failed" if graph_target is not None
+                    else "engineering_blocked"),
                 failure_kind="protocol_violation")
         with d.transaction() as conn:
             exists = conn.execute(
@@ -3598,6 +5491,22 @@ class AttackStages:
             manifest: Dict[str, Any], ledger: Mapping[str, str],
             staging_dir: str, log_name: str, **kwargs) -> Dict[str, Any]:
         """Let Codex start and live-observe one exact manifest capability."""
+        if self._resident_bundle_session_enabled:
+            if ("output_observer" in kwargs
+                    or "stream_output_observer" in kwargs):
+                raise RuntimeError(
+                    "Bundle journal output observer 不得由调用方覆盖")
+            journal = self._bundle_journal(
+                _cnum(cyc.cycle_id), bt_id)
+            capture_id = self._bundle_stream_capture_id(
+                execution_kind=f"manifest-{phase}",
+                execution_context=kwargs.get("execution_context"),
+                log_name=log_name)
+            journal.open_capture(capture_id)
+            kwargs["stream_output_observer"] = (
+                lambda stream, chunk, frame_end_offset:
+                    journal.append_capture(
+                        capture_id, stream, chunk, frame_end_offset))
         if "bundle_operator" not in self.p:
             if not self._resident_bundle_session_enabled:
                 return MF.run_manifest_command(
@@ -3727,6 +5636,64 @@ class AttackStages:
             raise _BundleOperatorRepair(phase, requested["diagnosis"])
         return result
 
+    def _bundle_stream_recovery_kwargs(
+            self, cyc, bt_id: int, *, execution_kind: str,
+            execution_context: Mapping[str, Any],
+            log_name: str) -> Dict[str, Any]:
+        """Bind guardian-capture suffix recovery to the target journal."""
+        if not self._resident_bundle_session_enabled:
+            return {}
+        journal = self._bundle_journal(_cnum(cyc.cycle_id), bt_id)
+        capture_id = self._bundle_stream_capture_id(
+            execution_kind=execution_kind,
+            execution_context=execution_context,
+            log_name=log_name)
+        checkpoint = journal.open_capture(capture_id)
+        return {
+            "stream_output_observer": (
+                lambda stream, chunk, frame_end_offset:
+                    journal.append_capture(
+                        capture_id, stream, chunk, frame_end_offset)),
+            "stream_frame_offset": checkpoint["frame_offset"],
+            "stream_offsets": checkpoint["stream_offsets"],
+        }
+
+    @staticmethod
+    def _bundle_stream_capture_id(
+            *, execution_kind: str,
+            execution_context: object,
+            log_name: str) -> str:
+        """Hash the exact per-operation identity used by guardian receipts."""
+        if (
+            not isinstance(execution_kind, str)
+            or not execution_kind
+            or not isinstance(execution_context, Mapping)
+            or not isinstance(log_name, str)
+            or not log_name
+        ):
+            raise RuntimeError(
+                "Bundle stream capture 缺 exact execution identity")
+        context = dict(execution_context)
+        if "log_name" in context and context["log_name"] != log_name:
+            raise RuntimeError(
+                "Bundle stream capture log_name identity 冲突")
+        context["log_name"] = log_name
+        try:
+            raw = json.dumps(
+                {
+                    "execution_context": context,
+                    "execution_kind": execution_kind,
+                },
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Bundle stream capture identity 非 JSON") from error
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+
     def _bundle_operator_terminal_reason(
             self, cyc, bt_id: int, *, phase: str, owner_kind: str, owner_id: int,
             manifest: Mapping[str, Any], ledger: Mapping[str, str],
@@ -3801,10 +5768,28 @@ class AttackStages:
             self._ensure_target_pc(cyc, bt_id)
         except _BundleRepairNeeded as error:
             self._schedule_bundle_repair(cyc, bt_id, error)
+        except _BundleResultReviewPending:
+            # Normal resident control point: execution facts and the immutable
+            # candidate are durable, but no formal publication or terminal
+            # target transition may occur before the child review is consumed.
+            return
         except BundleReplanRequired as error:
             self._settle_bundle_replan(cyc, bt_id, error)
+        except _BundleScientificInvalid:
+            if st() not in _TERMINAL_TARGET:
+                self.gate.gate_finish_build_target(
+                    build_target_id=bt_id, status="failed",
+                    failure_kind="protocol_violation")
+            self._ensure_target_pc(cyc, bt_id)
         except _BundleReject as e:
-            if e.failure_kind == "env_invalid":
+            resident_dag_worker = bool(
+                self._resident_bundle_session_enabled
+                and self.state.daemon.query_one(
+                    "SELECT 1 FROM bundle_target_node "
+                    "WHERE target_id=? AND cycle_id=?",
+                    (bt_id, _cnum(cyc.cycle_id))) is not None
+            )
+            if e.failure_kind == "env_invalid" and not resident_dag_worker:
                 if st() not in _TERMINAL_TARGET:
                     self.gate.gate_finish_build_target(
                         build_target_id=bt_id, status="engineering_blocked",
@@ -3814,18 +5799,74 @@ class AttackStages:
                 self._schedule_bundle_repair(
                     cyc, bt_id, _BundleRepairNeeded(
                         str(e), failure_kind=e.failure_kind,
-                        phase="artifact"))
+                        phase=(
+                            "environment"
+                            if e.failure_kind == "env_invalid"
+                            else "artifact")))
+
+    def _ensure_bundle_code_review(
+            self, cyc, bt_id: int, slice_: Mapping[str, Any],
+            manifest: Mapping[str, Any], ledger: Mapping[str, str],
+            staging: Path) -> str:
+        """Bind one independent code↔Plan review before any target command."""
+        code_sh = self._code_subject_hash(
+            dict(slice_), manifest, dict(ledger), staging)
+        if self.gate.require_code_review:
+            if "judge" not in self.p:
+                raise RuntimeError("代码评审已启用但未装配 judge provider")
+            self._judge_once(
+                cyc.cycle_id, bt_id, "bundle_code_review", code_sh)
+        if (self.gate.require_code_review
+                and not self.gate.review_passed(
+                    build_target_id=bt_id,
+                    review_kind="bundle_code_review",
+                    current_subject_hash=code_sh)):
+            review = self.state.daemon.query_one(
+                "SELECT payload_json FROM decision WHERE actor='judge' "
+                "AND type='bundle_code_review' AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.build_target_id')=? "
+                "ORDER BY id DESC LIMIT 1", (bt_id,))
+            raise _BundleRepairNeeded(
+                "code↔plan reviewer 未通过：\n"
+                + (review[0] if review else "未给反馈"),
+                failure_kind="review_failed", phase="code_review")
+        return code_sh
 
     def _drive_target_inner(self, cyc, bt_id: int) -> None:
         g = self.gate
         d = self.state.daemon
         slice_ = self._slice(bt_id)
         st = lambda: d.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0]
+        if self._recover_scientific_invalid(cyc, bt_id, slice_):
+            return
         if st() in _TERMINAL_TARGET:
             self._ensure_target_pc(cyc, bt_id)   # 崩在 complete 与 pc 之间 → 补 pc（幂等）
             return
         staging = self.work / f"c{_cnum(cyc.cycle_id)}" / f"t{bt_id}"
         repair = self._latest_open_repair(bt_id)
+        if repair is None:
+            settled = self._unscheduled_result_supersession(
+                cycle_id=_cnum(cyc.cycle_id), build_target_id=bt_id)
+            if settled is not None:
+                self._settle_result_supersession_owners(settled)
+                diagnosis = settled["diagnosis_md"]
+                scheduled = self._schedule_bundle_repair(
+                    cyc, bt_id, _BundleRepairNeeded(
+                        "结果审查要求工程修复：\n" + diagnosis,
+                        failure_kind="review_failed",
+                        phase="result_review",
+                        repair_of={
+                            "attempt_id": settled["attempt_id"],
+                            **({"run_id": settled["run_id"]}
+                               if settled["run_id"] is not None else {}),
+                        }))
+                if not scheduled:
+                    return
+                repair = self._latest_open_repair(bt_id)
+                if repair is None:
+                    raise RuntimeError(
+                        "result-review supersession 已 schedule "
+                        "但缺 open repair authority")
         if repair is not None:
             self._prepare_bundle_repair(cyc, bt_id, repair)
         src_dir = staging / "src"                 # 代码物化目录（每目标唯一；净土物化，与 run/eval 产物分离）
@@ -3838,6 +5879,8 @@ class AttackStages:
         execution_sandbox = self._execution_sandbox_for(manifest, bt_id)
         if st() == "pending":
             g.gate_start_build_target(build_target_id=bt_id)
+        code_sh = self._ensure_bundle_code_review(
+            cyc, bt_id, slice_, manifest, ledger, staging)
         if slice_["target_kind"] == "eval":
             if repair is not None:
                 self._validate_open_repair(cyc, bt_id)
@@ -3883,7 +5926,12 @@ class AttackStages:
                     staging_dir=str(smoke_dir), log_name=smoke_name,
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="manifest-smoke", execution_context=smoke_context,
-                    execution_sandbox=execution_sandbox)
+                    execution_sandbox=execution_sandbox,
+                    **self._bundle_stream_recovery_kwargs(
+                        cyc, bt_id,
+                        execution_kind="manifest-smoke",
+                        execution_context=smoke_context,
+                        log_name=smoke_name))
                 if sm is None:
                     self.owner_guard()             # external spawn 的最后一道 owner fence
                     try:
@@ -3918,24 +5966,6 @@ class AttackStages:
             if st() == "building":
                 g.gate_progress_build_target(build_target_id=bt_id, to="smoke")
         if st() == "smoke" or repair is not None:
-            # Exactly one independent code↔plan review per materialized code
-            # version, after its smoke and before any new training/evaluation.
-            code_sh = self._code_subject_hash(slice_, manifest, ledger, staging)
-            if g.require_code_review:
-                if "judge" not in self.p:
-                    raise RuntimeError("代码评审已启用但未装配 judge provider")
-                self._judge_once(cyc.cycle_id, bt_id, "bundle_code_review", code_sh)
-            if (g.require_code_review and not g.review_passed(
-                        build_target_id=bt_id, review_kind="bundle_code_review",
-                        current_subject_hash=code_sh)):
-                review = d.query_one(
-                    "SELECT payload_json FROM decision WHERE actor='judge' "
-                    "AND type='bundle_code_review' AND json_valid(payload_json) "
-                    "AND json_extract(payload_json,'$.build_target_id')=? "
-                    "ORDER BY id DESC LIMIT 1", (bt_id,))
-                raise _BundleRepairNeeded(
-                    "code↔plan reviewer 未通过：\n" + (review[0] if review else "未给反馈"),
-                    failure_kind="review_failed", phase="code_review")
             if st() == "smoke":
                 g.gate_progress_build_target(
                     build_target_id=bt_id, to="running", current_subject_hash=code_sh)
@@ -3944,8 +5974,385 @@ class AttackStages:
         if st() == "running":
             self._run_and_register(cyc, bt_id, slice_, manifest, ledger, staging, src_dir,
                                    allowed_asset_refs, asset_identities,
+                                   repair=repair,
                                    execution_sandbox=execution_sandbox)
         self._ensure_target_pc(cyc, bt_id)
+
+    def _recover_scientific_invalid(
+            self, cyc, build_target_id: int,
+            slice_: Mapping[str, Any]) -> bool:
+        """Finish an already-classified invalid attempt without repair.
+
+        The science decision is durable before attempt/target settlement.  A
+        crash in that narrow suffix must resume the same scientific outcome,
+        not reinterpret the failed attempt as an engineering bug and schedule
+        Bundle repair.
+        """
+        d = self.state.daemon
+        rows = d.query(
+            "SELECT id,payload_json FROM decision WHERE cycle_id=? "
+            "AND actor='orchestrator' "
+            "AND type='bundle_scientific_contract' "
+            "AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.build_target_id')=? "
+            "ORDER BY id DESC",
+            (_cnum(cyc.cycle_id), build_target_id))
+        if not rows:
+            return False
+        try:
+            payload = SC.validate_scientific_decision_payload(
+                json.loads(rows[0][1]),
+                expected_build_target_id=build_target_id)
+        except (SC.ScientificContractError, TypeError,
+                json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"target {build_target_id} scientific decision 损坏") from error
+        if payload["contract"] != SC.normalize_scientific_contract(
+                slice_["scientific_contract"]):
+            raise RuntimeError(
+                f"target {build_target_id} scientific decision 与冻结 Plan 冲突")
+        if payload["validity_status"] != "invalid":
+            return False
+        if (
+                payload["execution_status"] != "succeeded"
+                or payload["scientific_outcome"] != "unavailable"
+                or payload["pool_eligibility"] != "ineligible"
+                or not self.gate._scientific_review_receipt_valid(
+                    cycle_id=_cnum(cyc.cycle_id),
+                    build_target_id=build_target_id,
+                    receipt=payload["facts"][
+                        "independent_review_receipt"])):
+            raise RuntimeError(
+                f"target {build_target_id} invalid scientific decision 绑定非法")
+        attempt_id = payload["evaluation_attempt_id"]
+        evaluation_id = payload["evaluation_id"]
+        attempt = d.query_one(
+            "SELECT evaluation_id,status,failure_kind,artifact_ref "
+            "FROM evaluation_attempt WHERE id=? AND cycle_id=? "
+            "AND build_target_id=?",
+            (attempt_id, _cnum(cyc.cycle_id), build_target_id))
+        latest = d.query_one(
+            "SELECT id FROM evaluation_attempt "
+            "WHERE build_target_id=? ORDER BY id DESC LIMIT 1",
+            (build_target_id,))
+        if (attempt is None or attempt[0] != evaluation_id
+                or latest is None or latest[0] != attempt_id):
+            raise RuntimeError(
+                f"target {build_target_id} invalid scientific attempt scope 非最新")
+        artifact_ref = "sha256:" + payload["facts"]["eval_log_hash"]
+        if attempt[1] == "running":
+            self.gate.gate_finish_attempt(
+                attempt_id=attempt_id, status="failed",
+                failure_kind="protocol_violation",
+                artifact_ref=artifact_ref)
+        elif attempt[1] == "failed":
+            if (attempt[2] != "protocol_violation"
+                    or attempt[3] not in (None, artifact_ref)):
+                raise RuntimeError(
+                    f"target {build_target_id} invalid attempt 终态漂移")
+        else:
+            raise RuntimeError(
+                f"target {build_target_id} invalid attempt 状态非法: {attempt[1]}")
+        evaluation = d.query_one(
+            "SELECT status FROM evaluation WHERE id=?", (evaluation_id,))
+        if evaluation is None or evaluation[0] == "success":
+            raise RuntimeError(
+                f"target {build_target_id} invalid evaluation 状态非法")
+        if evaluation[0] != "failed":
+            self.gate.gate_finish_evaluation(evaluation_id=evaluation_id)
+        target_status = d.query_one(
+            "SELECT status FROM build_target WHERE id=?",
+            (build_target_id,))[0]
+        if target_status not in _TERMINAL_TARGET:
+            self.gate.gate_finish_build_target(
+                build_target_id=build_target_id, status="failed",
+                failure_kind="protocol_violation")
+        elif target_status != "failed":
+            raise RuntimeError(
+                f"target {build_target_id} invalid classification "
+                f"却终态为 {target_status}")
+        self._ensure_target_pc(cyc, build_target_id)
+        return True
+
+    @staticmethod
+    def _bare_sha256(value: Any, *, label: str) -> str:
+        text = str(value or "")
+        if text.startswith("sha256:"):
+            text = text[7:]
+        if re.fullmatch(r"[0-9a-f]{64}", text) is None:
+            raise RuntimeError(f"{label} 非 sha256")
+        return text
+
+    def _independent_code_review_receipt(
+            self, *, cycle_id: str, build_target_id: int,
+            code_ledger: Mapping[str, str],
+            ) -> Optional[Dict[str, Any]]:
+        """Resolve the exact independent review bound to the executed code.
+
+        Production uses the native child-review receipt referenced by the MCP
+        stage submission.  The legacy judge path remains only for injected
+        tests/migrations where ``require_code_review`` is explicitly enabled.
+        Neither form is described as runtime proof of non-access.
+        """
+        d = self.state.daemon
+        ci = _cnum(cycle_id)
+        expected_files = {
+            name: digest for name, digest in code_ledger.items()
+            if name != MF.ASSET_AUTHORIZATION_FILE
+        }
+        native_matches: List[Dict[str, Any]] = []
+        for decision_id, raw in d.query(
+                "SELECT id,payload_json FROM decision WHERE cycle_id=? "
+                "AND actor='agent' AND type='runtime_stage_submission' "
+                "AND json_valid(payload_json) ORDER BY id",
+                (ci,)):
+            try:
+                index = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (index.get("protocol")
+                    != "runtime-stage-submission-index-v1"
+                    or index.get("stage") != "bundle"
+                    or str(index.get("target_id")) != str(build_target_id)):
+                continue
+            try:
+                submission_bytes = read_artifact_bytes(
+                    Path(index["submission_ref"]),
+                    expected_hash=index["submission_hash"],
+                    label="runtime Bundle stage submission")
+                submission = json.loads(submission_bytes.decode("utf-8"))
+            except (KeyError, TypeError, UnicodeDecodeError,
+                    json.JSONDecodeError, OSError):
+                continue
+            if (submission.get("protocol") != "runtime-stage-submission-v1"
+                    or submission.get("stage") != "bundle"
+                    or submission.get("submission_kind") != "bundle"
+                    or str(submission.get("target_id")) != str(build_target_id)
+                    or submission.get("artifact_hash")
+                    != index.get("artifact_hash")
+                    or submission.get("review_decision_id")
+                    != index.get("review_decision_id")):
+                continue
+            entries = submission.get("files")
+            if not isinstance(entries, list):
+                continue
+            descriptor_files = []
+            submitted_hashes: Dict[str, str] = {}
+            valid_entries = True
+            for entry in entries:
+                if (not isinstance(entry, dict)
+                        or set(entry) != {
+                            "name", "kind", "path", "size_bytes", "sha256"}):
+                    valid_entries = False
+                    break
+                try:
+                    digest = self._bare_sha256(
+                        entry["sha256"], label="stage submission file hash")
+                except RuntimeError:
+                    valid_entries = False
+                    break
+                name = entry.get("name")
+                if not isinstance(name, str) or name in submitted_hashes:
+                    valid_entries = False
+                    break
+                submitted_hashes[name] = digest
+                descriptor_files.append({
+                    key: entry[key] for key in (
+                        "name", "kind", "size_bytes", "sha256")
+                })
+            if not valid_entries or submitted_hashes != expected_files:
+                continue
+            descriptor = {
+                "files": descriptor_files,
+                "md": (
+                    None if submission.get("md") is None else {
+                        key: submission["md"][key]
+                        for key in ("size_bytes", "sha256")
+                    }),
+            }
+            expected_artifact_hash = (
+                "sha256:" + SC.canonical_hash(descriptor))
+            if submission.get("artifact_hash") != expected_artifact_hash:
+                continue
+            review_id = submission.get("review_decision_id")
+            if (isinstance(review_id, bool)
+                    or not isinstance(review_id, int) or review_id <= 0):
+                continue
+            review_row = d.query_one(
+                "SELECT actor,type,payload_json FROM decision "
+                "WHERE id=? AND cycle_id=?", (review_id, ci))
+            if review_row is None or review_row[:2] != (
+                    "agent", "runtime_review"):
+                continue
+            try:
+                review = json.loads(review_row[2])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            receipt_core = dict(review)
+            receipt_hash = receipt_core.pop("receipt_hash", None)
+            if (
+                    review.get("protocol") != "native-review-receipt-v1"
+                    or review.get("stage") != "bundle"
+                    or review.get("review_kind") != "bundle_code"
+                    or str(review.get("target_id")) != str(build_target_id)
+                    or review.get("round_no")
+                    != review.get("configured_rounds")
+                    or review.get("resulting_subject_hash")
+                    != submission.get("artifact_hash")
+                    or receipt_hash
+                    != "sha256:" + SC.canonical_hash(receipt_core)):
+                continue
+            request_row = d.query_one(
+                "SELECT payload_json FROM decision WHERE cycle_id=? "
+                "AND actor='agent' AND type='runtime_review_request' "
+                "AND json_extract(payload_json,'$.review_request_id')=?",
+                (ci, review.get("review_request_id")))
+            if request_row is None:
+                continue
+            try:
+                request = json.loads(request_row[0])
+                brief_bytes = read_artifact_bytes(
+                    Path(request["reviewer_brief_ref"]),
+                    expected_hash=request["reviewer_brief_hash"],
+                    label="native Bundle code review brief")
+                brief = json.loads(brief_bytes.decode("utf-8"))
+            except (KeyError, TypeError, UnicodeDecodeError,
+                    json.JSONDecodeError, OSError):
+                continue
+            if brief.get("review_focus") != {
+                    "protocol": "bundle-code-review-focus-v1",
+                    "required_checks": [
+                        "frozen_plan_conformance",
+                        "train_validation_test_isolation",
+                        "heldout_access_order",
+                        "train_only_preprocessing_fit",
+                        "outcome_leakage",
+                    ],
+                    "evidence_limit":
+                        "reviewer attestation; not runtime proof of heldout non-access",
+                    }:
+                continue
+            native_matches.append({
+                "protocol": "native-review-receipt-v1",
+                "decision_id": review_id,
+                "review_kind": "bundle_code",
+                "review_scope": "code_plan_data_boundary",
+                "subject_hash": self._bare_sha256(
+                    review["resulting_subject_hash"],
+                    label="native review subject"),
+                "receipt_hash": self._bare_sha256(
+                    receipt_hash, label="native review receipt"),
+            })
+        if len(native_matches) > 1:
+            raise RuntimeError(
+                f"target {build_target_id} 当前代码匹配多个 native review submission")
+        if native_matches:
+            return native_matches[0]
+
+        if not self.gate.require_code_review:
+            return None
+        legacy_rows = d.query(
+            "SELECT id,payload_json FROM decision WHERE cycle_id=? "
+            "AND actor='judge' AND type='bundle_code_review' "
+            "AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.build_target_id')=? "
+            "ORDER BY id DESC",
+            (ci, build_target_id))
+        for decision_id, raw in legacy_rows:
+            try:
+                review = json.loads(raw)
+                subject_hash = self._bare_sha256(
+                    review.get("subject_hash"),
+                    label="legacy code review subject")
+            except (TypeError, json.JSONDecodeError, RuntimeError):
+                continue
+            if not self.gate.review_passed(
+                    build_target_id=build_target_id,
+                    review_kind="bundle_code_review",
+                    current_subject_hash=subject_hash):
+                continue
+            return {
+                "protocol": "legacy-bundle-code-review-v1",
+                "decision_id": int(decision_id),
+                "review_kind": "bundle_code",
+                "review_scope": "code_plan_data_boundary",
+                "subject_hash": subject_hash,
+                "receipt_hash": SC.canonical_hash({
+                    "decision_id": int(decision_id), "payload": review,
+                }),
+            }
+        return None
+
+    def _classify_scientific_result(
+            self, *, cycle_id: str, build_target_id: int,
+            evaluation_id: int, attempt_id: int,
+            slice_: Mapping[str, Any],
+            metrics: List[Dict[str, Any]],
+            eval_log: bytes, eval_log_hash: str,
+            code_ledger: Mapping[str, str]) -> Dict[str, Any]:
+        """Evaluate and durably bind the Plan-frozen contract before publication."""
+        d = self.state.daemon
+        required = [
+            (int(row[0]), int(row[1]))
+            for row in d.query(
+                "SELECT metric_id,metric_ver FROM build_target_required_metric "
+                "WHERE build_target_id=? ORDER BY metric_id,metric_ver",
+                (build_target_id,))
+        ]
+        text = eval_log.decode("utf-8", errors="replace")
+        parser_fields = OP.parse_log(text, self.obs_policy)
+        parser_suspect = bool(
+            OP.derive_suspect(parser_fields, self.obs_policy))
+        contract = SC.normalize_scientific_contract(
+            slice_["scientific_contract"])
+        review_receipt = self._independent_code_review_receipt(
+            cycle_id=cycle_id, build_target_id=build_target_id,
+            code_ledger=code_ledger)
+        payload = SC.build_scientific_decision_payload(
+            build_target_id=build_target_id,
+            evaluation_id=evaluation_id,
+            evaluation_attempt_id=attempt_id,
+            contract=contract,
+            execution_status="succeeded",
+            required_metrics=required,
+            metric_results=metrics,
+            eval_log_hash=eval_log_hash,
+            parser={
+                "version": OP.PARSER_VERSION,
+                "policy_hash": OP.extraction_policy_hash(self.obs_policy),
+                "fields": parser_fields,
+                "suspect": parser_suspect,
+            },
+            independent_review_receipt=review_receipt,
+        )
+        canonical = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False)
+        with d.transaction() as conn:
+            existing = conn.execute(
+                "SELECT payload_json FROM decision WHERE cycle_id=? "
+                "AND actor='orchestrator' AND type='bundle_scientific_contract' "
+                "AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.build_target_id')=? "
+                "AND json_extract(payload_json,'$.evaluation_id')=? "
+                "AND json_extract(payload_json,'$.evaluation_attempt_id')=? "
+                "ORDER BY id",
+                (_cnum(cycle_id), build_target_id,
+                 evaluation_id, attempt_id)).fetchall()
+            if existing:
+                if any(json.dumps(
+                        json.loads(row[0]), ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":")) != canonical
+                       for row in existing):
+                    raise RuntimeError(
+                        f"target {build_target_id} scientific classification "
+                        "与既有 durable decision 冲突")
+            else:
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'orchestrator','bundle_scientific_contract',?)",
+                    (_cnum(cycle_id), canonical))
+        return payload
 
     def _run_eval_target(self, cyc, bt_id: int, slice_, manifest, ledger,
                          staging: Path, src_dir: Path,
@@ -3966,8 +6373,8 @@ class AttackStages:
         if bt is None or bt[0] is None or bt[2] not in ("create_evaluation", "append_attempt"):
             raise RuntimeError(f"eval target {bt_id} 绑定损坏")
         vid, bound_eid, eval_action, planned_purpose = bt
-        checkpoints = d.query(
-            "SELECT id,ckpt_key,path,content_hash FROM checkpoint WHERE variant_id=? ORDER BY id", (vid,))
+        training_publication, checkpoints = self._checkpoint_rows_for_reuse(
+            variant_id=vid)
         if not checkpoints:
             raise RuntimeError(
                 f"eval target {bt_id} 的 v{vid} 无 legal checkpoint")
@@ -3985,8 +6392,9 @@ class AttackStages:
                     f"eval target {bt_id} checkpoint ck{checkpoint_id} 内容与 DB hash 不一致")
             checkpoint_paths[checkpoint_key] = checkpoint_file
 
-        training_publication = self._recover_training_publication(
-            variant_id=vid) if self.pool_publisher is not None else None
+        if training_publication is None and self.pool_publisher is not None:
+            training_publication = self._recover_training_publication(
+                variant_id=vid)
         pool_publication: Optional[VerifiedPoolPublication] = None
 
         if eval_action == "create_evaluation":
@@ -4097,7 +6505,12 @@ class AttackStages:
                     staging_dir=str(eval_dir), log_name="eval.log",
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="manifest-eval", execution_context=eval_context,
-                    execution_sandbox=execution_sandbox)
+                    execution_sandbox=execution_sandbox,
+                    **self._bundle_stream_recovery_kwargs(
+                        cyc, bt_id,
+                        execution_kind="manifest-eval",
+                        execution_context=eval_context,
+                        log_name="eval.log"))
                 if ev is None:
                     self.owner_guard()
                     try:
@@ -4160,6 +6573,18 @@ class AttackStages:
                 raise _BundleRepairNeeded(
                     str(error), failure_kind=error.failure_kind, phase="eval_parse",
                     repair_of={"attempt_id": aid}) from error
+            scientific = self._classify_scientific_result(
+                cycle_id=ci, build_target_id=bt_id,
+                evaluation_id=eid, attempt_id=aid,
+                slice_=slice_, metrics=metrics,
+                eval_log=eval_log, eval_log_hash=ev["log_sha256"],
+                code_ledger=ledger)
+            if scientific["validity_status"] != "valid":
+                finish_attempt_failure("protocol_violation")
+                raise _BundleScientificInvalid(
+                    "冻结科学合同的 validity gate 未通过；"
+                    "该结果不得发布或进入工程 repair",
+                    scientific)
             result_subject = SM.subject_hash(SM.result_review_manifest(
                 metrics_artifact_hash=_canon_hash(metrics),
                 checkpoint_hashes={
@@ -4185,6 +6610,15 @@ class AttackStages:
                     "结果 reviewer 未通过：\n" + (review[0] if review else "未给反馈"),
                     failure_kind="review_failed", phase="result_review",
                     repair_of={"attempt_id": aid})
+            self._ensure_native_result_review_before_admission(
+                cycle_id=ci, build_target_id=bt_id,
+                evaluation_id=eid, attempt_id=aid,
+                result_subject_hash=result_subject,
+                scientific=scientific, metrics=metrics,
+                eval_log_ref=str(ev["log_path"]),
+                eval_log_hash=ev["log_sha256"],
+                eval_log_bytes=int(ev["log_bytes"]),
+                checkpoint_hashes=checkpoint_hashes)
             if training_publication is not None:
                 pool_publication = self._publish_evaluation_assets(
                     training=training_publication, evaluation_id=eid,
@@ -4220,10 +6654,12 @@ class AttackStages:
         if not OP.suspect_attempt_has_current_obs(d.conn, aid, self.obs_policy):
             raise RuntimeError(
                 f"eval target {bt_id} attempt {aid} 无当前口径 parser 观测")
+        self._bind_target_evaluation(bt_id, eid)
         g.gate_finish_build_target(build_target_id=bt_id, status="complete")
 
     def _run_and_register(self, cyc, bt_id: int, slice_, manifest, ledger, staging: Path, src_dir: Path,
                           allowed_asset_refs, asset_identities, *,
+                          repair: Optional[Mapping[str, Any]] = None,
                           execution_sandbox=None) -> None:
         """phase (i) 执行事实 + phase (ii) 注册段（结构可恢复的短事务序列）。命令由 manifest 驱动（步⑧）。
         ⚠️ 与 import_worker._run_and_register_import **同构**（恢复缝隙修复须双向同步；共享骨架=M6 硬化）。"""
@@ -4232,14 +6668,39 @@ class AttackStages:
         vid = d.query_one("SELECT variant_id FROM build_target WHERE id=?", (bt_id,))[0]
         bid = d.query_one("SELECT baseline_id FROM build_target WHERE id=?", (bt_id,))[0]
         env_hash = manifest["env_hash"]
+        try:
+            planned_seed = _planned_run_seed(slice_)
+        except ValueError as error:
+            raise RuntimeError(
+                f"target {bt_id} 冻结 replicate 身份损坏: {error}") from error
         # —— (i) 训练 run。DB intent 先于进程；drained exit 回执可补 harness 本地发布，绝不盲目重训。——
         run_row = d.query_one(
-            "SELECT id,status,failure_kind FROM run WHERE build_target_id=? ORDER BY id DESC", (bt_id,))
+            "SELECT id,status,failure_kind,seed FROM run "
+            "WHERE build_target_id=? ORDER BY id DESC", (bt_id,))
+        if run_row is not None and run_row[3] != planned_seed:
+            raise RuntimeError(
+                f"target {bt_id} durable run seed={run_row[3]!r} "
+                f"与冻结 replicate seed={planned_seed!r} 冲突")
         rid: Optional[int] = None
         train_result: Optional[Dict[str, Any]] = None
         training_publication: Optional[VerifiedTrainingPublication] = None
+        result_review_rerun = bool(
+            repair is not None
+            and repair.get("phase") == "result_review"
+            and isinstance(repair.get("repair_of"), Mapping)
+            and repair["repair_of"].get("run_id") is not None)
         if run_row and run_row[1] == "success":
-            rid = run_row[0]
+            if result_review_rerun:
+                if repair["repair_of"]["run_id"] != run_row[0]:
+                    raise RuntimeError(
+                        "result-review repair 绑定的成功 run 已漂移")
+                # A result-review engineering repair replaces the executable
+                # implementation.  Reusing the prior successful checkpoint
+                # would bind new code review to old training facts, so append
+                # a fresh run even though the old run remains immutable.
+                rid = None
+            else:
+                rid = run_row[0]
         elif run_row and run_row[1] == "failed":
             if run_row[2] != "aborted":
                 if not self._repair_authorized(bt_id, "run", run_row[0]):
@@ -4281,7 +6742,12 @@ class AttackStages:
                     staging_dir=str(train_dir), log_name="train.log",
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="manifest-train", execution_context=train_context,
-                    execution_sandbox=execution_sandbox)
+                    execution_sandbox=execution_sandbox,
+                    **self._bundle_stream_recovery_kwargs(
+                        cyc, bt_id,
+                        execution_kind="manifest-train",
+                        execution_context=train_context,
+                        log_name="train.log"))
             if train_result is None:
                 # 没有 receipt/partial = gate_start_run 后、外部调用前死亡；确证未启动，
                 # 冻结旧 intent 为 aborted 后用新 run id 重试。
@@ -4291,6 +6757,7 @@ class AttackStages:
         if rid is None:
             rid = g.gate_start_run(build_target_id=bt_id, cycle_id=ci, variant_id=vid,
                                    kind=slice_["target_kind"],   # exec 目标→run.kind='exec'（trg_run_target_consistent）
+                                   seed=planned_seed,
                                    env_hash=env_hash)
             train_context = {
                 "cycle_id": ci, "build_target_id": bt_id,
@@ -4351,15 +6818,28 @@ class AttackStages:
                     source_hashes = {
                         key: checkpoint_caps[key].identity.content_hash.removeprefix("sha256:")
                         for key in ck_paths}
+                    checkpoint_db_keys: Dict[str, str] = {}
+                    for key in ck_paths:
+                        base_key = f"final-r{rid}" if legacy else key
+                        existing_owner = d.query_one(
+                            "SELECT produced_by_run FROM checkpoint "
+                            "WHERE variant_id=? AND ckpt_key=?",
+                            (vid, base_key))
+                        checkpoint_db_keys[key] = (
+                            base_key
+                            if existing_owner is None
+                            or existing_owner[0] == rid else
+                            f"{base_key}-r{rid}")
                     training_publication = self._publish_training_assets(
                         cycle_id=ci, build_target_id=bt_id, run_id=rid,
                         variant_id=vid, baseline_id=bid,
                         target_kind=slice_["target_kind"], manifest=manifest,
                         src_dir=src_dir, checkpoint_sources=ck_paths,
-                        checkpoint_hashes=source_hashes)
+                        checkpoint_hashes=source_hashes,
+                        checkpoint_db_keys=checkpoint_db_keys)
                     if training_publication is None:
                         expected_rows = [
-                            (vid, f"final-r{rid}" if legacy else key, str(path),
+                            (vid, checkpoint_db_keys[key], str(path),
                              source_hashes[key], rid)
                             for key, path in ck_paths.items()]
                     else:
@@ -4383,10 +6863,12 @@ class AttackStages:
                             checkpoint_rows = conn.execute(
                                 "SELECT id,ckpt_key FROM checkpoint WHERE produced_by_run=? "
                                 "ORDER BY ckpt_key", (rid,)).fetchall()
-                            bind_training_database(
-                                conn, training_publication, updated_cycle=_cnum(ci),
-                                checkpoint_ids={row[1]: row[0] for row in checkpoint_rows},
-                                run_id=rid)
+                            self._record_training_candidate(
+                                conn, training_publication,
+                                cycle_id=_cnum(ci), baseline_id=bid,
+                                variant_id=vid, run_id=rid,
+                                checkpoint_ids={
+                                    row[1]: row[0] for row in checkpoint_rows})
                     for checkpoint_cap in checkpoint_caps.values():
                         checkpoint_cap.verify_unchanged()
                         checkpoint_cap.verify_path_binding()
@@ -4404,7 +6886,7 @@ class AttackStages:
                     repair_of={"run_id": rid}) from error
         if self.pool_publisher is not None and training_publication is None:
             training_publication = self._recover_training_publication(
-                variant_id=vid, run_id=rid)
+                variant_id=vid, run_id=rid, allow_candidate=True)
         # train log 入账 + 观测 ingest：**无条件、幂等**（不藏在 fresh 分支——崩在 finish_run 与 ingest 之间时，
         # 复用 run 的续跑须从 staging 存活文件补登，否则杀 vs 不杀终库不一致，内审 SHOULD）
         self._register_and_ingest_log(ci, staging / f"run{rid}" / "train.log", log_kind="train", run_id=rid)
@@ -4417,7 +6899,15 @@ class AttackStages:
         checkpoint_hashes: Dict[str, str] = {}
         legacy_checkpoint = "checkpoint" in manifest.get("expected_outputs", {})
         for spec in MF.checkpoint_specs(manifest):
-            db_key = f"final-r{rid}" if legacy_checkpoint else spec.ckpt_key
+            base_key = (
+                f"final-r{rid}" if legacy_checkpoint else spec.ckpt_key)
+            direct = d.query_one(
+                "SELECT produced_by_run FROM checkpoint "
+                "WHERE variant_id=? AND ckpt_key=?",
+                (vid, base_key))
+            db_key = (
+                base_key if direct is None or direct[0] == rid
+                else f"{base_key}-r{rid}")
             row = checkpoint_by_db_key.get(db_key)
             if row is None:
                 raise RuntimeError(
@@ -4525,7 +7015,12 @@ class AttackStages:
                     staging_dir=str(eval_dir), log_name="eval.log",
                     execution_supervisor=self.execution_supervisor,
                     execution_kind="manifest-eval", execution_context=eval_context,
-                    execution_sandbox=execution_sandbox)
+                    execution_sandbox=execution_sandbox,
+                    **self._bundle_stream_recovery_kwargs(
+                        cyc, bt_id,
+                        execution_kind="manifest-eval",
+                        execution_context=eval_context,
+                        log_name="eval.log"))
                 if ev is None:
                     self.owner_guard()
                     try:
@@ -4583,6 +7078,23 @@ class AttackStages:
                 raise _BundleRepairNeeded(
                     str(error), failure_kind=error.failure_kind, phase="eval_parse",
                     repair_of={"attempt_id": aid}) from error
+            scientific = self._classify_scientific_result(
+                cycle_id=ci, build_target_id=bt_id,
+                evaluation_id=eid, attempt_id=aid,
+                slice_=slice_, metrics=metrics,
+                eval_log=eval_log, eval_log_hash=ev["log_sha256"],
+                code_ledger=ledger)
+            if scientific["validity_status"] != "valid":
+                g.gate_finish_attempt(
+                    attempt_id=aid, status="failed",
+                    failure_kind="protocol_violation",
+                    transcript_ref=ev.get("process_receipt_path"),
+                    artifact_ref=f"sha256:{ev['log_sha256']}")
+                g.gate_finish_evaluation(evaluation_id=eid)
+                raise _BundleScientificInvalid(
+                    "冻结科学合同的 validity gate 未通过；"
+                    "该结果不得发布或进入工程 repair",
+                    scientific)
             res_sh = self._result_subject_hash(bt_id, slice_, ledger, rid, metrics, ev)
             if g.require_result_review:
                 if "judge" not in self.p:
@@ -4607,6 +7119,23 @@ class AttackStages:
                     "结果 reviewer 未通过：\n" + (review[0] if review else "未给反馈"),
                     failure_kind="review_failed", phase="result_review",
                     repair_of={"attempt_id": aid})
+            self._ensure_native_result_review_before_admission(
+                cycle_id=ci, build_target_id=bt_id,
+                evaluation_id=eid, attempt_id=aid,
+                result_subject_hash=res_sh,
+                scientific=scientific, metrics=metrics,
+                eval_log_ref=str(ev["log_path"]),
+                eval_log_hash=ev["log_sha256"],
+                eval_log_bytes=int(ev["log_bytes"]),
+                checkpoint_hashes=checkpoint_hashes)
+            if training_publication is not None:
+                self._admit_training_publication(
+                    training=training_publication,
+                    cycle_id=ci, build_target_id=bt_id,
+                    evaluation_id=eid, attempt_id=aid,
+                    baseline_id=bid,
+                    variant_id=vid, run_id=rid,
+                    scientific=scientific)
             registration_artifact_ref = f"sha256:{ev['log_sha256']}"
             registration_transcript_ref = ev.get("process_receipt_path")
             if self.pool_publisher is not None:
@@ -4693,7 +7222,9 @@ class AttackStages:
                     identity_doc=identity_doc, repro_cmd=manifest["repro_cmd_md"], run_id=rid,
                     publication=pool_publication)
         if d.query_one("SELECT status FROM build_target WHERE id=?", (bt_id,))[0] not in _TERMINAL_TARGET:
-            self.gate.gate_finish_build_target(build_target_id=bt_id, status="complete")
+            self._bind_target_evaluation(bt_id, eid)
+            self.gate.gate_finish_build_target(
+                build_target_id=bt_id, status="complete")
 
     def _judge_once(self, cycle_id: str, bt_id: int, review_kind: str, subject_hash: str) -> None:
         judge_once(self.state.daemon, self.p["judge"], cycle_id, bt_id, review_kind, subject_hash)
@@ -4739,20 +7270,177 @@ class AttackStages:
         诚实注记（内审 SHOULD）：此 hash 锚终态而非产物集，**不承担** §4.2.5「staging 改写→conflict」侦测
         ——该防护在 bundle 侧由 result_review subject_hash 当下重算 + 终态目标不可重入（_drive_target 短路）
         + append-only gates 承担；产物集哈希锚 = M5/M6 硬化项。"""
-        row = self.state.daemon.query_one("SELECT status, seq FROM build_target WHERE id=?", (bt_id,))
+        row = self.state.daemon.query_one(
+            "SELECT status,seq,failure_kind,plan_ref "
+            "FROM build_target WHERE id=?", (bt_id,))
+        if row is None or row[0] not in _TERMINAL_TARGET:
+            raise RuntimeError(
+                f"bundle target {bt_id} 未终态，不得写 phase_commit")
+        self._ensure_terminal_scientific_status(
+            cyc, bt_id, target_status=row[0],
+            failure_kind=row[2], plan_ref=row[3])
         ah = _canon_hash({"target": bt_id, "final": row[0], "seq": row[1]})
         with self.state.daemon.transaction() as conn:
             if check_or_record(conn, cycle_id=cyc.cycle_id, stage="bundle",
                                target_id=bt_id, artifact_hash=ah) == "conflict":
                 raise ValueError(f"bundle target {bt_id} phase_commit 冲突（终态被改写？）")
+        if row[0] == "complete":
+            self._ensure_target_admission(cyc, bt_id)
+
+    def _bind_target_evaluation(
+            self, build_target_id: int,
+            evaluation_id: int) -> None:
+        """Bind a factory evaluation to its target before formal admission."""
+        with self.state.daemon.transaction() as conn:
+            row = conn.execute(
+                "SELECT evaluation_id FROM build_target WHERE id=?",
+                (build_target_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    f"build_target {build_target_id} 不存在")
+            if row[0] is not None and int(row[0]) != evaluation_id:
+                raise RuntimeError(
+                    f"build_target {build_target_id} evaluation identity 冲突")
+            if row[0] is None:
+                conn.execute(
+                    "UPDATE build_target SET evaluation_id=? WHERE id=?",
+                    (evaluation_id, build_target_id))
+
+    def _ensure_target_admission(self, cyc, bt_id: int) -> None:
+        """Close exact graph admission after publication and phase commit."""
+        registered = self.state.daemon.query_one(
+            "SELECT 1 FROM bundle_target_node WHERE target_id=?",
+            (bt_id,))
+        if registered is None:
+            # Compatibility for a quest whose Plan phase committed before the
+            # additive DAG migration. New plans always register the graph in
+            # the Plan terminal transaction.
+            return
+        if not getattr(self.gate, "require_formal_publication", False):
+            # A diagnostic/non-production gate cannot manufacture the formal
+            # publication proof required for DAG admission.
+            return
+        row = self.state.daemon.query_one(
+            "SELECT cycle_id,variant_id FROM build_target WHERE id=?",
+            (bt_id,))
+        if (row is None or row[0] != _cnum(cyc.cycle_id)
+                or row[1] is None):
+            raise RuntimeError(
+                f"target {bt_id} admission 缺 cycle/variant identity")
+        event = formal_publication_event(
+            self.state.daemon.conn, variant_id=int(row[1]))
+        if event is None:
+            raise RuntimeError(
+                f"target {bt_id} complete 但缺正式 publication closure")
+        decisions = self.state.daemon.query(
+            "SELECT id,payload_json FROM decision "
+            "WHERE cycle_id=? AND actor='gate' "
+            "AND type='pool_publication' "
+            "AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.variant_id')=? "
+            "ORDER BY id",
+            (_cnum(cyc.cycle_id), int(row[1])))
+        matching = []
+        for decision_id, raw in decisions:
+            try:
+                payload = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    f"target {bt_id} publication decision 损坏") from error
+            if payload == event:
+                matching.append(int(decision_id))
+        if len(matching) != 1:
+            raise RuntimeError(
+                f"target {bt_id} 缺唯一 exact publication decision")
+        self.bundle_graph.admit(
+            target_id=bt_id,
+            publication_decision_id=matching[0])
+
+    def _ensure_terminal_scientific_status(
+            self, cyc, build_target_id: int, *, target_status: str,
+            failure_kind: Optional[str], plan_ref: Optional[str]) -> None:
+        """Emit the four orthogonal statuses for non-measurement terminals."""
+        d = self.state.daemon
+        science_rows = d.query(
+            "SELECT payload_json FROM decision WHERE cycle_id=? "
+            "AND actor='orchestrator' "
+            "AND type='bundle_scientific_contract' "
+            "AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.build_target_id')=? "
+            "ORDER BY id",
+            (_cnum(cyc.cycle_id), build_target_id))
+        if science_rows:
+            # Exact attempt decisions carry richer facts and are authoritative.
+            for (raw,) in science_rows:
+                try:
+                    SC.validate_scientific_decision_payload(
+                        json.loads(raw),
+                        expected_build_target_id=build_target_id)
+                except (SC.ScientificContractError, TypeError,
+                        json.JSONDecodeError) as error:
+                    raise RuntimeError(
+                        f"target {build_target_id} scientific status 损坏") from error
+            return
+        execution_status = {
+            "complete": "succeeded",
+            "failed": "failed",
+            "skipped": "skipped",
+            "engineering_blocked": "engineering_blocked",
+        }[target_status]
+        if target_status == "complete" and self.gate.require_scientific_contract:
+            raise RuntimeError(
+                f"target {build_target_id} complete 但缺科学合同判定")
+        try:
+            parsed_ref = json.loads(plan_ref) if plan_ref else {}
+        except (TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"target {build_target_id} plan_ref 损坏") from error
+        contract = SC.normalize_scientific_contract(
+            parsed_ref.get("scientific_contract")
+            or SC.default_scientific_contract())
+        payload = {
+            "protocol": "bundle-scientific-terminal-v1",
+            "build_target_id": build_target_id,
+            "target_status": target_status,
+            "failure_kind": failure_kind,
+            "contract_hash": SC.canonical_hash(contract),
+            "execution_status": execution_status,
+            "validity_status": "not_assessed",
+            "scientific_outcome": "unavailable",
+            "pool_eligibility": "ineligible",
+        }
+        canonical = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False)
+        with d.transaction() as conn:
+            existing = conn.execute(
+                "SELECT payload_json FROM decision WHERE cycle_id=? "
+                "AND actor='orchestrator' "
+                "AND type='bundle_scientific_terminal' "
+                "AND json_extract(payload_json,'$.build_target_id')=? "
+                "ORDER BY id",
+                (_cnum(cyc.cycle_id), build_target_id)).fetchall()
+            if existing:
+                if len(existing) != 1 or existing[0][0] != canonical:
+                    raise RuntimeError(
+                        f"target {build_target_id} terminal scientific status 冲突")
+            else:
+                conn.execute(
+                    "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                    "VALUES (?,'orchestrator',"
+                    "'bundle_scientific_terminal',?)",
+                    (_cnum(cyc.cycle_id), canonical))
 
     # -- subject 构造（编排器确定性重算，judge 不自算，§4.1.4 附注）----------------
     def _code_subject_hash(self, slice_: Dict[str, Any], manifest, ledger: Dict[str, str], staging: Path) -> str:
-        """代码评审 subject（步⑧：真材料）：plan 切片哈希 + 物化代码 ledger 哈希（=真代码内容）+ 配置哈希 +
-        identity 草稿哈希（staged）+ smoke transcript。编排器确定性重算，judge/register 两处一致。"""
-        latest = H.latest_smoke_log(staging / "smoke")   # 数值序取最新（字典序 smoke-10<smoke-2，codex SHOULD）
-        smoke_ref = str(latest) if latest else "smoke:none"
-        smoke_hash = H.file_sha256(smoke_ref) if latest else "0" * 64
+        """Hash the materialized code/Plan review subject before smoke.
+
+        The legacy subject recipe retains a smoke entry for compatibility, but
+        this review intentionally binds the stable ``not-run`` marker: reviewer
+        approval must exist before smoke/train/eval can execute.
+        """
+        smoke_ref = "smoke:not-run"
+        smoke_hash = "0" * 64
         return SM.subject_hash(SM.code_review_manifest(
             plan_slice_hash=_canon_hash(slice_), code_diff_hash=_canon_hash(ledger),
             config_hashes={"config_json": _canon_hash(manifest["config_json"])},
@@ -4954,6 +7642,15 @@ class AttackStages:
             cyc, files, reason, question_id=question_id,
             selection_invalid=selection_invalid)
 
+    @staticmethod
+    def _record_reasoning_phase_commit(
+            conn, cyc, files: Mapping[str, Any]) -> None:
+        if check_or_record(
+                conn, cycle_id=cyc.cycle_id, stage="reasoning",
+                target_id=None, artifact_hash=_canon_hash(files)) == "conflict":
+            raise RuntimeError(
+                f"cycle {cyc.cycle_id} reasoning phase_commit 冲突")
+
     def _reasoning_stage(self, cyc) -> None:
         """attack 轮收尾：answer/evidence→tree_ops→selection→done 单事务。
         **产物先持久化再消费**（codex SHOULD）：reasoning files 先原子落 staging（tmp→replace），resume 时
@@ -5028,6 +7725,7 @@ class AttackStages:
                     raise _ReasoningReject(f"tree_ops 语义被拒绝: {e}") from e
                 persist_selection_safe(
                     self.state, cyc.cycle_id, sel, retry_on_invalid=True)
+                self._record_reasoning_phase_commit(conn, cyc, files)
                 self.state.mark_cycle_done(cyc.cycle_id)
         except _ReasoningReject as e:
             self._retry_reasoning_or_finish(
@@ -5078,6 +7776,7 @@ class AttackStages:
             conn.execute(
                 "UPDATE cycle SET next_question_id=NULL,next_intent='attack' WHERE id=?",
                 (_cnum(cyc.cycle_id),))
+            self._record_reasoning_phase_commit(conn, cyc, files)
             self.state.mark_cycle_done(cyc.cycle_id)
 
     def _finish_reasoning_rejected(self, cyc, files: Dict[str, Any], reason: str,
@@ -5147,6 +7846,7 @@ class AttackStages:
         self.state.persist_selection(
             cyc.cycle_id, Selection(next_question_id=fallback_question_id,
                                     next_intent=fallback_next_intent, scores=[]))
+        self._record_reasoning_phase_commit(conn, cyc, files)
         self.state.mark_cycle_done(cyc.cycle_id)
 
     def _legal_reasoning_fallback(self, conn, cyc, *, current_question_id: Optional[str]) \

@@ -203,6 +203,175 @@ def test_plan_gpu_requirement_is_explicit_abstract_resource_intent():
         validator.validate(omitted)
 
 
+def test_plan_accepts_dag_publication_inputs_and_abstract_gpu_counts():
+    path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
+    plan = load_json(path)
+    first, second = plan["targets"]
+    del first["gpu_required"]
+    first.update({
+        "depends_on": [],
+        "parent_baseline": {"baseline_ref": "baseline:existing-root"},
+        "resources": {"gpu_count": 0},
+    })
+    second.update({
+        "target_kind": "build",
+        "claim": {
+            "canonical_key": "logreg-gauss2d-child",
+            "slug": "logreg-gauss2d-child",
+        },
+    })
+    for field in (
+            "eval_action", "attempt_purpose", "evaluation_id",
+            "eval_key", "evaluation_source"):
+        second.pop(field, None)
+    del second["gpu_required"]
+    second.update({
+        "depends_on": ["t1"],
+        "parent_baseline": {"target_key": "t1"},
+        "published_source_inputs": [
+            {"input_key": "base", "target_key": "t1"},
+        ],
+        "resources": {"gpu_count": 2},
+    })
+
+    make_validator("plan").validate(plan)
+
+
+def test_seed_is_a_run_replicate_fact_not_variant_config_identity():
+    path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
+    validator = make_validator("plan")
+
+    plan = load_json(path)
+    plan["targets"][0]["replicate"] = {"seed": 37}
+    validator.validate(plan)
+
+    for config in (
+            {"lr": 0.1, "seed": 37},
+            {"lr": 0.1, "training": {"seed": 37}},
+            {"lr": 0.1, "SEED": 37}):
+        invalid = load_json(path)
+        invalid["targets"][0].update({
+            "target_kind": "exec",
+            "replicate": {"seed": 37},
+            "claim": {
+                "baseline_ref": "published-family",
+                "variant_key": "lr01",
+                "config_json": config,
+            },
+        })
+        with pytest.raises(ValidationError):
+            validator.validate(invalid)
+
+    bundle_path = (
+        SYSTEM_ROOT / "tests" / "fixtures" / "valid" /
+        "bundle_target" / "exec_complete_fake.json")
+    bundle = load_json(bundle_path)
+    make_validator("bundle_target").validate(bundle)
+    bundle["variant"]["config_json"]["seed"] = bundle["run"]["seed"]
+    with pytest.raises(ValidationError):
+        make_validator("bundle_target").validate(bundle)
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "value"),
+    [
+        ("resources", "gpu_ids", [0, 1]),
+        ("resources", "gpu_uuid", "GPU-deadbeef"),
+        ("resources", "device_ids", ["0"]),
+        ("target", "cuda_visible_devices", "0,1"),
+    ],
+)
+def test_plan_never_accepts_physical_gpu_identity(location, field, value):
+    path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
+    plan = load_json(path)
+    target = plan["targets"][0]
+    target["resources"] = {"gpu_count": 1}
+    if location == "resources":
+        target["resources"][field] = value
+    else:
+        target[field] = value
+
+    with pytest.raises(ValidationError):
+        make_validator("plan").validate(plan)
+
+
+def test_plan_new_resource_contract_takes_priority_but_legacy_gpu_flag_remains_readable():
+    path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
+    plan = load_json(path)
+    plan["targets"][0]["resources"] = {"gpu_count": 2}
+    plan["targets"][0]["gpu_required"] = False
+    validator = make_validator("plan")
+    validator.validate(plan)
+
+    legacy = load_json(path)
+    validator.validate(legacy)
+
+
+def test_plan_accepts_closed_scientific_contract_on_target():
+    path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
+    plan = load_json(path)
+    plan["targets"][0]["scientific_contract"] = {
+        "validity_gates": [
+            {"gate_id": "required", "kind": "required_metrics_present"},
+            {"gate_id": "health", "kind": "parser_not_suspect"},
+            {
+                "gate_id": "independent_review",
+                "kind":
+                    "independent_code_plan_data_boundary_review_receipt_present",
+            },
+        ],
+        "outcome_rules": [{
+            "rule_id": "primary",
+            "metric_id": plan["metric_defs"][0]["metric_id"],
+            "metric_ver": plan["metric_defs"][0]["version"],
+            "operator": "ge",
+            "threshold": 0.8,
+            "if_true": "supported",
+            "if_false": "refuted",
+        }],
+    }
+    validator = make_validator("plan")
+    validator.validate(plan)
+
+    plan["targets"][0]["scientific_contract"]["validity_gates"][0][
+        "model_verdict"] = "pass"
+    with pytest.raises(ValidationError):
+        validator.validate(plan)
+
+
+@pytest.mark.parametrize(
+    "missing_kind",
+    [
+        "required_metrics_present",
+        "parser_not_suspect",
+        "independent_code_plan_data_boundary_review_receipt_present",
+    ],
+)
+def test_plan_scientific_contract_requires_every_mandatory_gate(missing_kind):
+    path = SYSTEM_ROOT / "tests" / "fixtures" / "valid" / "plan" / "attack.json"
+    plan = load_json(path)
+    plan["targets"][0]["scientific_contract"] = {
+        "validity_gates": [
+            {"gate_id": "required", "kind": "required_metrics_present"},
+            {"gate_id": "health", "kind": "parser_not_suspect"},
+            {
+                "gate_id": "independent_review",
+                "kind":
+                    "independent_code_plan_data_boundary_review_receipt_present",
+            },
+        ],
+        "outcome_rules": [],
+    }
+    plan["targets"][0]["scientific_contract"]["validity_gates"] = [
+        gate
+        for gate in plan["targets"][0]["scientific_contract"]["validity_gates"]
+        if gate["kind"] != missing_kind
+    ]
+
+    with pytest.raises(ValidationError):
+        make_validator("plan").validate(plan)
+
+
 def test_policy_gpu_target_and_device_index_contract_is_explicit():
     with open(SYSTEM_ROOT / "policies" / "policy.yaml", encoding="utf-8") as f:
         base = yaml.safe_load(f)
@@ -367,16 +536,19 @@ def test_policy_defaults_match_appendix_c_spotchecks():
         }},
         "novelty_check": {
             "enabled": True, "status": "controlled_backend_enabled",
-            "provider": "arxiv_api_v1",
-            "endpoint": "https://export.arxiv.org/api/query",
+            "provider": "literature_federated_v1",
+            "endpoints": {
+                "crossref": "https://api.crossref.org/works",
+                "openalex": "https://api.openalex.org/works",
+            },
             "queries_per_candidate": 1,
-            "max_results_per_query": 10,
-            "timeout_s": 60,
+            "max_results_per_query": 30,
+            "timeout_s": 20,
             "max_response_bytes": 4194304,
-            "min_interval_s": 3,
-            "retry_attempts": 8,
-            "retry_initial_delay_s": 3,
-            "retry_max_delay_s": 120,
+            "min_interval_s": 0,
+            "retry_attempts": 3,
+            "retry_initial_delay_s": 1,
+            "retry_max_delay_s": 10,
         },
         "sd_threshold": 6, "dedup_budget": 10,
         "forbid_proto_term_source": "question_task_terms",
@@ -385,7 +557,7 @@ def test_policy_defaults_match_appendix_c_spotchecks():
         },
     }
     assert p["tree_guard"] == {
-        "max_decompose_depth": 4, "max_children_per_node": 6, "max_open_questions": 30,
+        "max_decompose_depth": None, "max_children_per_node": 6, "max_open_questions": 30,
     }
     assert p["retrieval"]["scale_thresholds"] == {
         "medium": {"est_cost_ratio": 0.25, "score": 0.40},

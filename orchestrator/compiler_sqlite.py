@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .budgeting import compute_budget
@@ -43,6 +46,7 @@ from .question_progress import QuestionProgressError, load_inconclusive_streak
 from .recall_sqlite import SqliteRecall
 from .resource_limits import (MAX_ASSETS_PER_GOAL, MAX_FILE_REQUESTS_PER_GOAL,
                               MAX_REASONING_DIRECTIVES_PER_CYCLE, MAX_REQUEST_ITEMS)
+from . import scientific_contract as SC
 
 _MAX_CONTEXT_ASSETS = MAX_ASSETS_PER_GOAL
 _MAX_CONTEXT_ASSETS_TOTAL = MAX_ASSETS_PER_GOAL
@@ -75,6 +79,28 @@ _MAX_PLAN_POOL_VARIANTS = 64
 _MAX_PLAN_PROTOCOLS = 24
 _MAX_PLAN_PROTOCOL_METRICS = 128
 _MAX_PLAN_MEASUREMENTS = 192
+_CONTEXT_PACK_VERSION = 2
+_MAX_CONTEXT_CARD_REFS = 24
+_MAX_CONTEXT_ARTIFACT_REFS = 32
+_MAX_CONTEXT_FAILURE_SUMMARIES = 8
+_MAX_CONTEXT_RESULT_SUMMARIES = 12
+_MAX_CONTEXT_RESULT_CLASSIFICATIONS = 8
+_MAX_CONTEXT_REASONING_SUMMARIES = 3
+_MAX_CONTEXT_CARD_SUMMARY_BYTES = 512
+_MAX_CONTEXT_HISTORY_SUMMARY_BYTES = 1024
+_MAX_CONTEXT_REF_BYTES = 4096
+_MAX_IDEA_HISTORY = 32
+_MAX_IDEA_HISTORY_RENDERED_BYTES = 192 * 1024
+_MAX_REASONING_TARGET_DECISIONS = 256
+_MAX_BUNDLE_DELTA_DEPENDENCIES = 32
+_MAX_BUNDLE_DELTA_ATTEMPTS = 16
+_MAX_BUNDLE_DELTA_RUNS = 16
+_MAX_BUNDLE_DELTA_CHECKPOINTS = 32
+_MAX_BUNDLE_DELTA_LOGS = 32
+_MAX_BUNDLE_DELTA_SUBMISSIONS = 16
+_MAX_BUNDLE_PUBLISHED_INPUTS = 32
+_PUBLISHED_INPUT_KEY_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def _canon_json_hash(value: Any) -> str:
@@ -187,7 +213,8 @@ class SqliteCompiler:
     def __init__(self, conn, policy: Dict[str, Any], *,
                  runtime_environment_hash: Optional[str] = None,
                  runtime_execution_backend: Optional[str] = None,
-                 replay_archive=None):
+                 replay_archive=None,
+                 work_root: Optional[Path] = None):
         # conn = 本类**独占**的只读用连接（isolation_level=None 交本类掌控事务，供 render 钉单一读快照）。
         # 「只读」是架构约定：调用方（M3 Advancer）应传一条专用 mode=ro 连接；
         # 本地 WAL 可并发读写，GPFS rollback mode 则由 SQLite 锁等待短写事务。
@@ -195,6 +222,7 @@ class SqliteCompiler:
         conn.isolation_level = None
         self.conn = conn
         self.policy = policy
+        self._render_lock = threading.RLock()
         if (runtime_environment_hash is not None
                 and (not isinstance(runtime_environment_hash, str)
                      or re.fullmatch(
@@ -204,20 +232,36 @@ class SqliteCompiler:
         if runtime_execution_backend not in {None, "docker", "local-conda"}:
             raise ValueError("compiler runtime_execution_backend 非法")
         self.runtime_execution_backend = runtime_execution_backend
+        if work_root is None:
+            self.work_root: Optional[Path] = None
+        else:
+            try:
+                raw_work_root = os.fspath(work_root)
+            except TypeError as error:
+                raise ValueError("compiler work_root 非法") from error
+            if (not isinstance(raw_work_root, str) or not raw_work_root
+                    or "\x00" in raw_work_root):
+                raise ValueError("compiler work_root 非法")
+            self.work_root = Path(os.path.abspath(raw_work_root))
         # Optional file-side outbox.  It never writes SQLite and is invoked
         # only after the render read transaction has committed.
         self.replay_archive = replay_archive
 
     # -- Compiler Protocol ------------------------------------------------------
     def render(self, *, cycle_id: str, stage: Stage, target_id: Optional[str] = None) -> ContextPack:
+        with self._render_lock:
+            return self._render_locked(
+                cycle_id=cycle_id, stage=stage, target_id=target_id)
+
+    def _render_locked(
+            self, *, cycle_id: str, stage: Stage,
+            target_id: Optional[str] = None) -> ContextPack:
         """确定性四区包。**钉单一读快照**：整个 render 在一个读事务内（BEGIN…COMMIT）——SQLite 一致快照
         不被并发 WriteDaemon 提交撬动，杜绝「cycle 取自 A 态、answers 取自 B 态」的混态包（护「同快照」）。
 
         「同快照」= 同行 + **同 id**：id 是快照身份的一部分，故 ORDER BY id 定序确定；不同插入序 = 不同快照
         （合法产出不同字节），M2 不要求二者相等。
         """
-        if stage == "bundle" and target_id is None:
-            raise ValueError("bundle 阶段须逐 target 渲染（target_id 不可为 None）")
         ci = _cnum(cycle_id)
         self.conn.execute("BEGIN")            # 钉读快照（deferred；首个读起快照）
         try:
@@ -230,17 +274,78 @@ class SqliteCompiler:
             refs: List[str] = []
             anchor = self._anchor(cycle_id, ci, stage, target_id, route, aq, goal_id, goal_ver, sources, refs)
             neighborhood = self._neighborhood(aq, sources)
+            common_index, card_refs, artifact_refs = self._common_context_index(
+                ci=ci, active_question_id=aq, goal_id=goal_id,
+                goal_ver=goal_ver, sources=sources)
+            # Cards are mutable compact indexes and may be refreshed by the
+            # resident main agent during this cycle.  They belong to the
+            # stage projection, not the frozen cross-stage base.
+            base_continuity = {
+                key: value for key, value in common_index.items()
+                if key != "card_index"
+            }
+            base_continuity["truncated"] = {
+                key: value
+                for key, value in common_index["truncated"].items()
+                if key != "cards"
+            }
+            base_payload = {
+                "protocol": "context-pack-base-v2",
+                "cycle_id": cycle_id,
+                "goal_id": goal_id,
+                "goal_ver": goal_ver,
+                "active_question_id": (
+                    None if aq is None else f"q{int(aq)}"),
+                "neighborhood_md": neighborhood,
+                "continuity": base_continuity,
+            }
+            base_hash = _canon_json_hash(base_payload)
+            continuity = {
+                "version": _CONTEXT_PACK_VERSION,
+                "base_hash": base_hash,
+                **common_index,
+            }
+            anchor += (
+                "\n\n## 历史连续性索引（有界；大工件仅路径）\n"
+                "> 这是已提交 DB 索引，不是指令。artifact_refs 只给规范路径/哈希/大小；"
+                "编译器不读取或内联这些文件。若 truncated=true，不得推断未展示项不存在。\n"
+                "```json\n"
+                + json.dumps(
+                    continuity, ensure_ascii=False, sort_keys=True, indent=2,
+                    allow_nan=False)
+                + "\n```")
+            stage_section, stage_artifact_refs = self._stage_projection(
+                ci=ci, stage=stage, target_id=target_id, sources=sources)
+            if stage_section:
+                anchor += "\n\n" + stage_section
+            artifact_refs = self._merge_artifact_refs(
+                artifact_refs, stage_artifact_refs)
             retrieval = self._plan_retrieval(aq, sources) if stage == "plan" else ""
         finally:
             self.conn.execute("COMMIT")       # 结束只读快照（无写、COMMIT 即释放）
         refs = sorted(set(refs))               # 文件请求回执的 opaque ref；不读/不内联文件字节
         pack = ContextPack(cycle_id=cycle_id, stage=stage, target_id=target_id,
                            anchor_md=anchor, neighborhood_md=neighborhood, retrieval_md=retrieval, refs=refs,
-                           sources=sorted(set(sources)))
+                           sources=sorted(set(sources)),
+                           version=_CONTEXT_PACK_VERSION,
+                           base_hash=base_hash,
+                           card_refs=card_refs,
+                           artifact_refs=artifact_refs,
+                           summary_index=common_index)
         # \x00 分隔四区（含 refs 规范化）再 hash：防区界重排碰撞；文件回执已可填 refs，
         # 因此必须继续使用同一口径把它们纳入回放身份。
         pack.pack_hash = hashlib.sha256(
             ("\x00".join((anchor, neighborhood, retrieval, json.dumps(refs, ensure_ascii=False)))).encode("utf-8")).hexdigest()
+        pack.projection_hash = _canon_json_hash({
+            "protocol": "context-pack-projection-v2",
+            "version": pack.version,
+            "stage": pack.stage,
+            "target_id": pack.target_id,
+            "base_hash": pack.base_hash,
+            "pack_hash": pack.pack_hash,
+            "card_refs": pack.card_refs,
+            "artifact_refs": pack.artifact_refs,
+        })
         # A terminal-cycle render is a read-only diagnostic/reconstruction,
         # not a new model turn.  Do not mutate its already-sealed replay
         # closure; StageProvider separately archives every actual invocation.
@@ -252,8 +357,17 @@ class SqliteCompiler:
     def manifest(self, pack: ContextPack) -> Dict[str, Any]:
         """pack 溯源 manifest（pack_hash + 分区来源清单）——**pack 的纯函数**（sources 就在 pack 上，
         不依赖实例态/instance，跨实例/重启/穿插 render 皆一致）；M3 起随 DECISION 入账。"""
-        return {"pack_hash": pack.pack_hash, "stage": pack.stage, "target_id": pack.target_id,
-                "sources": list(pack.sources)}
+        return {
+            "version": getattr(pack, "version", 1),
+            "pack_hash": pack.pack_hash,
+            "base_hash": getattr(pack, "base_hash", ""),
+            "projection_hash": getattr(pack, "projection_hash", ""),
+            "stage": pack.stage,
+            "target_id": pack.target_id,
+            "card_refs": list(getattr(pack, "card_refs", []) or []),
+            "artifact_refs": list(getattr(pack, "artifact_refs", []) or []),
+            "sources": list(pack.sources),
+        }
 
     def render_idea_audit_source(self, *, cycle_id: str) -> ContextPack:
         """Render the question-only source for the independent idea judge.
@@ -380,11 +494,1179 @@ class SqliteCompiler:
         amended = ContextPack(
             cycle_id=pack.cycle_id, stage=pack.stage, target_id=pack.target_id,
             anchor_md=anchor, neighborhood_md=pack.neighborhood_md,
-            retrieval_md=pack.retrieval_md, refs=list(pack.refs), sources=sources)
+            retrieval_md=pack.retrieval_md, refs=list(pack.refs), sources=sources,
+            version=getattr(pack, "version", 1),
+            base_hash=getattr(pack, "base_hash", ""),
+            card_refs=list(getattr(pack, "card_refs", []) or []),
+            artifact_refs=list(getattr(pack, "artifact_refs", []) or []),
+            summary_index=dict(getattr(pack, "summary_index", {}) or {}))
         amended.pack_hash = hashlib.sha256(("\x00".join((
             amended.anchor_md, amended.neighborhood_md, amended.retrieval_md,
             json.dumps(amended.refs, ensure_ascii=False)))).encode("utf-8")).hexdigest()
+        if amended.version >= 2:
+            amended.projection_hash = _canon_json_hash({
+                "protocol": "context-pack-projection-v2",
+                "version": amended.version,
+                "stage": amended.stage,
+                "target_id": amended.target_id,
+                "base_hash": amended.base_hash,
+                "pack_hash": amended.pack_hash,
+                "card_refs": amended.card_refs,
+                "artifact_refs": amended.artifact_refs,
+            })
         return amended
+
+    @staticmethod
+    def _history_json_object(raw: Any, *, label: str) -> Dict[str, Any]:
+        try:
+            value = json.loads(
+                raw, parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"非有限 JSON number: {token}")))
+        except (TypeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError(f"{label} JSON 损坏") from error
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} 须为 JSON object")
+        return value
+
+    @staticmethod
+    def _history_text(value: Any, *, label: str,
+                      limit: int = _MAX_CONTEXT_HISTORY_SUMMARY_BYTES) -> Dict[str, Any]:
+        shown, truncated = _bounded_utf8(
+            value, limit, label=label)
+        result: Dict[str, Any] = {"text": shown}
+        if truncated:
+            result["truncated"] = True
+        return result
+
+    @staticmethod
+    def _artifact_ref(
+            *, kind: str, ref: Any, source: str,
+            sha256: Optional[Any] = None,
+            content_hash: Optional[Any] = None,
+            size_bytes: Optional[Any] = None) -> Dict[str, Any]:
+        shown, truncated = _bounded_utf8(
+            ref, _MAX_CONTEXT_REF_BYTES, label=f"{source} artifact ref")
+        result: Dict[str, Any] = {
+            "kind": kind, "ref": shown, "source": source,
+        }
+        if truncated:
+            result["ref_truncated"] = True
+        if sha256 is not None:
+            if (not isinstance(sha256, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", sha256) is None):
+                raise ValueError(f"{source} artifact sha256 非法")
+            result["sha256"] = sha256
+        if content_hash is not None:
+            value, cut = _bounded_utf8(
+                content_hash, 256, label=f"{source} content_hash")
+            result["content_hash"] = value
+            if cut:
+                result["content_hash_truncated"] = True
+        if size_bytes is not None:
+            if (isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
+                    or size_bytes < 0):
+                raise ValueError(f"{source} artifact size_bytes 非法")
+            result["size_bytes"] = size_bytes
+        return result
+
+    @staticmethod
+    def _merge_artifact_refs(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: Dict[str, Dict[str, Any]] = {}
+        for group in groups:
+            for item in group:
+                key = json.dumps(
+                    item, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False)
+                merged.setdefault(key, item)
+        ordered = sorted(
+            merged,
+            key=lambda key: (
+                0 if merged[key].get("kind") == "published_source_input" else 1,
+                key,
+            ))
+        return [merged[key] for key in ordered][:_MAX_CONTEXT_ARTIFACT_REFS]
+
+    def _validated_scientific_decisions(
+            self, *, cycle_id: Optional[int] = None,
+            before_cycle: Optional[int] = None,
+            question_id: Optional[int] = None,
+            ) -> List[tuple[int, int, int, Dict[str, Any]]]:
+        if (cycle_id is None) == (before_cycle is None):
+            raise ValueError(
+                "scientific decision reader 须恰选 cycle_id/before_cycle")
+        predicate = "d.cycle_id=?" if cycle_id is not None else "d.cycle_id<?"
+        bound = cycle_id if cycle_id is not None else before_cycle
+        rows = self.conn.execute(
+            "SELECT d.id,d.cycle_id,d.question_id,d.payload_json "
+            "FROM decision d WHERE " + predicate + " "
+            "AND d.actor='orchestrator' "
+            "AND d.type='bundle_scientific_contract' "
+            "ORDER BY d.id", (bound,)).fetchall()
+        accepted: List[tuple[int, int, int, Dict[str, Any]]] = []
+        seen = set()
+        target_modes: Dict[int, str] = {}
+        for decision_id, decision_cycle, decision_question, raw in rows:
+            payload = self._history_json_object(
+                raw, label=f"decision d{decision_id}")
+            if payload.get("protocol") == "bundle-scientific-terminal-v1":
+                required = {
+                    "protocol", "build_target_id", "target_status",
+                    "failure_kind", "contract_hash", "execution_status",
+                    "validity_status", "scientific_outcome",
+                    "pool_eligibility",
+                }
+                target_id = payload.get("build_target_id")
+                target = self.conn.execute(
+                    "SELECT cycle_id,question_id,status,failure_kind,plan_ref "
+                    "FROM build_target WHERE id=?", (target_id,)).fetchone()
+                try:
+                    plan_slice = (
+                        json.loads(target[4]) if target is not None
+                        and target[4] else {})
+                    expected_contract = SC.normalize_scientific_contract(
+                        plan_slice.get("scientific_contract")
+                        or SC.default_scientific_contract())
+                except (TypeError, json.JSONDecodeError,
+                        SC.ScientificContractError) as error:
+                    raise ValueError(
+                        f"scientific decision d{decision_id} "
+                        "冻结 Plan contract 损坏") from error
+                expected_execution = {
+                    "complete": "succeeded",
+                    "failed": "failed",
+                    "skipped": "skipped",
+                    "engineering_blocked": "engineering_blocked",
+                }
+                if (set(payload) != required
+                        or isinstance(target_id, bool)
+                        or not isinstance(target_id, int) or target_id <= 0
+                        or target is None
+                        or target[0] != decision_cycle
+                        or (decision_question is not None
+                            and decision_question != target[1])
+                        or payload.get("target_status") != target[2]
+                        or payload.get("failure_kind") != target[3]
+                        or target[2] not in expected_execution
+                        or payload.get("execution_status")
+                        != expected_execution[target[2]]
+                        or payload.get("validity_status") != "not_assessed"
+                        or payload.get("scientific_outcome") != "unavailable"
+                        or payload.get("pool_eligibility") != "ineligible"
+                        or payload.get("contract_hash")
+                        != SC.canonical_hash(expected_contract)):
+                    raise ValueError(
+                        f"scientific decision d{decision_id} "
+                        "terminal DB 身份/状态冲突")
+                if question_id is not None and target[1] != question_id:
+                    continue
+                if target_id in target_modes:
+                    raise ValueError(
+                        f"scientific decision target scope 重复/冲突: "
+                        f"target={target_id}")
+                target_modes[target_id] = "terminal"
+                accepted.append(
+                    (decision_id, decision_cycle, target_id, payload))
+                continue
+            try:
+                payload = SC.validate_scientific_decision_payload(payload)
+            except SC.ScientificContractError as error:
+                raise ValueError(
+                    f"scientific decision d{decision_id} 不可复验: "
+                    f"{error}") from error
+            target_id = int(payload["build_target_id"])
+            target = self.conn.execute(
+                "SELECT cycle_id,question_id,evaluation_id,eval_action,"
+                "variant_id,status,plan_ref FROM build_target "
+                "WHERE id=?", (target_id,)).fetchone()
+            attempt = self.conn.execute(
+                "SELECT evaluation_id,cycle_id,build_target_id,artifact_ref,"
+                "status "
+                "FROM evaluation_attempt WHERE id=?",
+                (payload["evaluation_attempt_id"],)).fetchone()
+            evaluation = self.conn.execute(
+                "SELECT build_target_id,variant_id,status,canonical_attempt_id "
+                "FROM evaluation WHERE id=?",
+                (payload["evaluation_id"],)).fetchone()
+            if (target is None or attempt is None or evaluation is None
+                    or target[0] != decision_cycle
+                    or (decision_question is not None
+                        and decision_question != target[1])
+                    or attempt[:3] != (
+                        payload["evaluation_id"], decision_cycle, target_id)
+                    or evaluation[1] != target[4]
+                    or (
+                        target[3] == "append_attempt"
+                        and (target[2] != payload["evaluation_id"]))
+                    or (
+                        target[3] != "append_attempt"
+                        and evaluation[0] != target_id)
+                    or (target[2] is not None
+                        and target[2] != payload["evaluation_id"])):
+                raise ValueError(
+                    f"scientific decision d{decision_id} "
+                    "target/evaluation/attempt/cycle 归属不一致")
+            self._validate_scientific_db_facts(
+                decision_id=decision_id, decision_cycle=decision_cycle,
+                target_id=target_id, target=target, attempt=attempt,
+                evaluation=evaluation, payload=payload)
+            if question_id is not None and target[1] != question_id:
+                continue
+            key = (
+                target_id, payload["evaluation_id"],
+                payload["evaluation_attempt_id"])
+            if key in seen:
+                raise ValueError(
+                    f"scientific decision scope 重复: "
+                    f"target={target_id}, evaluation={key[1]}, attempt={key[2]}")
+            seen.add(key)
+            if target_modes.get(target_id) == "terminal":
+                raise ValueError(
+                    f"scientific decision target scope 重复/冲突: "
+                    f"target={target_id}")
+            target_modes[target_id] = "attempt"
+            accepted.append(
+                (decision_id, decision_cycle, target_id, payload))
+        return accepted
+
+    def _validate_scientific_db_facts(
+            self, *, decision_id: int, decision_cycle: int,
+            target_id: int, target, attempt, evaluation,
+            payload: Dict[str, Any]) -> None:  # noqa: ANN001 - sqlite row
+        facts = payload["facts"]
+        try:
+            plan_slice = json.loads(target[6]) if target[6] else {}
+            expected_contract = SC.normalize_scientific_contract(
+                plan_slice.get("scientific_contract")
+                or SC.default_scientific_contract())
+        except (TypeError, json.JSONDecodeError,
+                SC.ScientificContractError) as error:
+            raise ValueError(
+                f"scientific decision d{decision_id} "
+                "冻结 Plan contract 损坏") from error
+        required = [
+            (int(row[0]), int(row[1]))
+            for row in self.conn.execute(
+                "SELECT metric_id,metric_ver "
+                "FROM build_target_required_metric "
+                "WHERE build_target_id=? ORDER BY metric_id,metric_ver",
+                (target_id,)).fetchall()
+        ]
+        expected_required = [
+            {"metric_id": metric_id, "metric_ver": metric_ver}
+            for metric_id, metric_ver in required
+        ]
+        if (payload["contract"] != expected_contract
+                or facts["required_metrics"] != expected_required):
+            raise ValueError(
+                f"scientific decision d{decision_id} "
+                "contract/required 与 DB 真相冲突")
+
+        metric_rows = self.conn.execute(
+            "SELECT metric_id,metric_ver,value,scope,checkpoint_id "
+            "FROM metric_result WHERE evaluation_id=? "
+            "AND evaluation_attempt_id=? "
+            "ORDER BY metric_id,metric_ver,scope,checkpoint_id",
+            (payload["evaluation_id"],
+             payload["evaluation_attempt_id"])).fetchall()
+        db_metrics = [
+            {
+                "metric_id": int(row[0]),
+                "metric_ver": int(row[1]),
+                "value": float(row[2]),
+                "scope": str(row[3]),
+                **({"checkpoint_id": int(row[4])}
+                   if row[4] is not None else {}),
+            }
+            for row in metric_rows
+        ]
+        try:
+            rebuilt = SC.canonical_scientific_facts(
+                evaluation_id=payload["evaluation_id"],
+                evaluation_attempt_id=payload["evaluation_attempt_id"],
+                required_metrics=required,
+                metric_results=db_metrics,
+                eval_log_hash=facts["eval_log_hash"],
+                parser=facts["parser"],
+                independent_review_receipt=(
+                    facts["independent_review_receipt"]))
+        except SC.ScientificContractError as error:
+            raise ValueError(
+                f"scientific decision d{decision_id} DB facts 非法") from error
+        eligible = (
+            payload["validity_status"] == "valid"
+            and payload["pool_eligibility"] == "eligible")
+        eval_log_rows = self.conn.execute(
+            "SELECT id,content_hash FROM execution_log "
+            "WHERE evaluation_attempt_id=? AND log_kind='eval' ORDER BY id",
+            (payload["evaluation_attempt_id"],)).fetchall()
+        matching_eval_logs = [
+            row for row in eval_log_rows
+            if row[1] == facts["eval_log_hash"]
+        ]
+        if (len(eval_log_rows) != 1 or len(matching_eval_logs) != 1):
+            # An invalid scientific decision is committed just before its
+            # attempt is settled and may intentionally skip log ingestion.
+            # Its owner artifact hash still binds the evaluated bytes.  Any
+            # valid/eligible result must have the durable execution_log row.
+            if (eligible
+                    or attempt[3] != "sha256:" + facts["eval_log_hash"]):
+                raise ValueError(
+                    f"scientific decision d{decision_id} "
+                    "eval log 与 DB 真相冲突")
+        if metric_rows:
+            if rebuilt["metric_results"] != facts["metric_results"]:
+                raise ValueError(
+                    f"scientific decision d{decision_id} "
+                    "metric facts 与 DB 真相冲突")
+        elif eligible:
+            raise ValueError(
+                f"scientific decision d{decision_id} "
+                "eligible 但 DB metric facts 缺失")
+
+        review = facts["independent_review_receipt"]
+        if (review is not None
+                and not self._scientific_review_receipt_valid(
+                    cycle_id=decision_cycle, target_id=target_id,
+                    receipt=review)):
+            raise ValueError(
+                f"scientific decision d{decision_id} "
+                "independent review receipt 与 DB 真相冲突")
+
+        if not eligible:
+            return
+        if (target[5] != "complete" or attempt[4] != "success"
+                or evaluation[2] != "success"
+                or evaluation[3] != payload["evaluation_attempt_id"]):
+            raise ValueError(
+                f"scientific decision d{decision_id} "
+                "eligible terminal owner 与 DB 真相冲突")
+
+    def _scientific_review_receipt_valid(
+            self, *, cycle_id: int, target_id: int,
+            receipt: Dict[str, Any]) -> bool:
+        decision_id = receipt.get("decision_id")
+        if (isinstance(decision_id, bool)
+                or not isinstance(decision_id, int) or decision_id <= 0):
+            return False
+        protocol = receipt.get("protocol")
+        if protocol == "native-review-receipt-v1":
+            matches = [
+                payload for current_id, payload
+                in self._validated_native_reviews(cycle_id=cycle_id)
+                if current_id == decision_id
+            ]
+            if len(matches) != 1:
+                return False
+            review = matches[0]
+            if (review["stage"] != "bundle"
+                    or review["review_kind"] != "bundle_code"
+                    or str(review["target_id"]) != str(target_id)
+                    or review["round_no"] != review["configured_rounds"]
+                    or receipt.get("subject_hash")
+                    != review["resulting_subject_hash"].removeprefix(
+                        "sha256:")
+                    or receipt.get("receipt_hash")
+                    != review["receipt_hash"].removeprefix("sha256:")):
+                return False
+            submissions = self.conn.execute(
+                "SELECT payload_json FROM decision WHERE cycle_id=? "
+                "AND actor='agent' AND type='runtime_stage_submission' "
+                "AND json_valid(payload_json) "
+                "AND json_extract(payload_json,'$.stage')='bundle' "
+                "AND CAST(json_extract(payload_json,'$.target_id') AS TEXT)=? "
+                "AND json_extract(payload_json,'$.review_decision_id')=?",
+                (cycle_id, str(target_id), decision_id)).fetchall()
+            return (
+                len(submissions) == 1
+                and json.loads(submissions[0][0]).get("artifact_hash")
+                == "sha256:" + receipt["subject_hash"])
+        if protocol != "legacy-bundle-code-review-v1":
+            return False
+        row = self.conn.execute(
+            "SELECT actor,type,payload_json FROM decision "
+            "WHERE id=? AND cycle_id=?",
+            (decision_id, cycle_id)).fetchone()
+        if row is None or row[:2] != ("judge", "bundle_code_review"):
+            return False
+        try:
+            review = self._history_json_object(
+                row[2], label=f"decision d{decision_id}")
+        except ValueError:
+            return False
+        latest = self.conn.execute(
+            "SELECT id FROM decision WHERE cycle_id=? AND actor='judge' "
+            "AND type='bundle_code_review' AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.build_target_id')=? "
+            "ORDER BY id DESC LIMIT 1",
+            (cycle_id, target_id)).fetchone()
+        newer_malformed = self.conn.execute(
+            "SELECT 1 FROM decision WHERE cycle_id=? AND actor='judge' "
+            "AND type='bundle_code_review' AND NOT json_valid(payload_json) "
+            "AND id>? LIMIT 1", (cycle_id, decision_id)).fetchone()
+        runner = self.conn.execute(
+            "SELECT status,phase,purpose,cycle_id FROM runner_call WHERE id=?",
+            (review.get("runner_call_id"),)).fetchone()
+        return bool(
+            latest == (decision_id,) and newer_malformed is None
+            and review.get("build_target_id") == target_id
+            and review.get("verdict") == "pass"
+            and receipt.get("subject_hash") == review.get("subject_hash")
+            and receipt.get("receipt_hash") == SC.canonical_hash({
+                "decision_id": decision_id, "payload": review,
+            })
+            and runner == (
+                "success", "audit", "bundle_code_review", cycle_id))
+
+    def _validated_native_reviews(
+            self, *, cycle_id: int,
+            ) -> List[tuple[int, Dict[str, Any]]]:
+        from .native_review_verifier import validate_native_reviews
+
+        return validate_native_reviews(self.conn, cycle_id=cycle_id)
+
+    def _validated_prior_reasoning(
+            self, *, before_cycle: int, question_id: int,
+            goal_id: int,
+            ) -> tuple[List[tuple[int, int, Dict[str, Any]]], bool]:
+        rows = self.conn.execute(
+            "SELECT id,cycle_id,question_id,payload_json FROM decision "
+            "WHERE cycle_id<? AND question_id=? AND actor='agent' "
+            "AND type='runtime_cycle_summary' ORDER BY cycle_id,id",
+            (before_cycle, question_id)).fetchall()
+        required = {
+            "protocol", "goal_id", "goal_ver", "question_id",
+            "conclusion_md", "decision", "next_step_md",
+            "evidence_refs", "revision",
+        }
+        grouped: Dict[int, List[tuple[int, Dict[str, Any]]]] = {}
+        for decision_id, decision_cycle, decision_question, raw in rows:
+            payload = self._history_json_object(
+                raw, label=f"decision d{decision_id}")
+            revision = payload.get("revision")
+            evidence_refs = payload.get("evidence_refs")
+            cycle_owner = self.conn.execute(
+                "SELECT goal_id,goal_ver FROM cycle "
+                "WHERE id=?", (decision_cycle,)).fetchone()
+            if (set(payload) != required
+                    or payload.get("protocol")
+                    != "runtime-cycle-summary-v1"
+                    or payload.get("goal_id") != goal_id
+                    or payload.get("question_id") != decision_question
+                    or decision_question != question_id
+                    or cycle_owner is None
+                    or cycle_owner != (
+                        payload.get("goal_id"), payload.get("goal_ver"))
+                    or payload.get("decision") not in {
+                        "continue", "decompose", "replan", "terminate",
+                        "inconclusive"}
+                    or not isinstance(payload.get("conclusion_md"), str)
+                    or not isinstance(payload.get("next_step_md"), str)
+                    or isinstance(revision, bool)
+                    or not isinstance(revision, int) or revision <= 0
+                    or not isinstance(evidence_refs, list)
+                    or len(evidence_refs) > 256
+                    or any(
+                        not isinstance(ref, str) or not ref.strip()
+                        or len(ref.encode("utf-8")) > 4096
+                        for ref in evidence_refs)):
+                raise ValueError(
+                    f"decision d{decision_id} cycle summary 身份/字段非法")
+            grouped.setdefault(decision_cycle, []).append(
+                (decision_id, payload))
+
+        latest: List[tuple[int, int, Dict[str, Any]]] = []
+        for decision_cycle in sorted(grouped, reverse=True):
+            chain = sorted(
+                grouped[decision_cycle],
+                key=lambda item: (item[1]["revision"], item[0]))
+            if [payload["revision"] for _decision_id, payload in chain] != (
+                    list(range(1, len(chain) + 1))):
+                raise ValueError(
+                    f"cycle summary revision 缺失/重复/冲突: "
+                    f"c{decision_cycle}")
+            decision_id, payload = chain[-1]
+            latest.append((decision_id, decision_cycle, payload))
+        return (
+            latest[:_MAX_CONTEXT_REASONING_SUMMARIES],
+            len(latest) > _MAX_CONTEXT_REASONING_SUMMARIES,
+        )
+
+    def _common_context_index(
+            self, *, ci: int, active_question_id: Optional[int],
+            goal_id: int, goal_ver: int,
+            sources: List[str]) -> tuple[Dict[str, Any], List[Dict[str, Any]],
+                                         List[Dict[str, Any]]]:
+        """Build the stage-neutral history slice shared by all four projections.
+
+        Only cycles strictly before ``ci`` participate.  This keeps the base
+        stable across Idea/Plan/Bundle/Reasoning at one SQLite snapshot; current
+        target/current-cycle deltas are appended by ``_stage_projection``.
+        """
+        question = None
+        if active_question_id is not None:
+            row = self.conn.execute(
+                "SELECT text,status,visit_count FROM question WHERE id=?",
+                (active_question_id,)).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"ContextPack active question q{active_question_id} 不存在")
+            question = {
+                "question_id": f"q{active_question_id}",
+                **self._history_text(
+                    row[0], label=f"question q{active_question_id} text"),
+                "status": row[1],
+                "visit_count": row[2],
+            }
+
+        card_rows = self.conn.execute(
+            "SELECT id,card_type,ref_id,goal_id,goal_ver,card_md,src_hash,"
+            "updated_cycle FROM card WHERE stale=0 AND "
+            "(goal_id IS NULL OR (goal_id=? AND goal_ver=?)) "
+            "ORDER BY id LIMIT ?",
+            (goal_id, goal_ver, _MAX_CONTEXT_CARD_REFS + 1)).fetchall()
+        cards_cut = len(card_rows) > _MAX_CONTEXT_CARD_REFS
+        card_refs: List[Dict[str, Any]] = []
+        for card_id, card_type, ref_id, card_goal, card_ver, card_md, src_hash, updated in (
+                card_rows[:_MAX_CONTEXT_CARD_REFS]):
+            summary = self._history_text(
+                card_md, label=f"card {card_id} card_md",
+                limit=_MAX_CONTEXT_CARD_SUMMARY_BYTES)
+            item = {
+                "card_ref": f"card:{card_type}:{ref_id}",
+                "card_id": card_id,
+                "card_type": card_type,
+                "index_role": (
+                    "protocol_or_method" if card_type == "protocol"
+                    else "domain_or_family" if card_type == "family"
+                    else card_type),
+                "ref_id": ref_id,
+                "goal_id": card_goal,
+                "goal_ver": card_ver,
+                "src_hash": src_hash,
+                "updated_cycle": (
+                    None if updated is None else f"c{int(updated)}"),
+                "summary": summary,
+            }
+            card_refs.append(item)
+            sources.append(f"db:card:{card_id}")
+
+        failures: List[Dict[str, Any]] = []
+        failures_cut = False
+        if active_question_id is not None:
+            target_rows = self.conn.execute(
+                "SELECT id,cycle_id,target_kind,status,failure_kind FROM build_target "
+                "WHERE question_id=? AND cycle_id<? "
+                "AND status IN ('failed','engineering_blocked','skipped') "
+                "ORDER BY cycle_id DESC,id DESC LIMIT ?",
+                (active_question_id, ci,
+                 _MAX_CONTEXT_FAILURE_SUMMARIES + 1)).fetchall()
+            failures_cut = len(target_rows) > _MAX_CONTEXT_FAILURE_SUMMARIES
+            for target_id, cycle_id, kind, status, failure_kind in (
+                    target_rows[:_MAX_CONTEXT_FAILURE_SUMMARIES]):
+                failures.append({
+                    "kind": "bundle_target",
+                    "cycle_id": f"c{cycle_id}",
+                    "build_target_id": target_id,
+                    "target_kind": kind,
+                    "status": status,
+                    "failure_kind": failure_kind,
+                })
+                sources.append(f"db:build_target:{target_id}")
+            decision_rows = self.conn.execute(
+                "SELECT d.id,d.cycle_id,d.type,d.payload_json FROM decision d "
+                "WHERE d.cycle_id<? AND d.type IN "
+                "('plan_rejected','idea_stage_failed') AND json_valid(d.payload_json) "
+                "AND (d.question_id=? OR "
+                "json_extract(d.payload_json,'$.question_id')=? OR "
+                "json_extract(d.payload_json,'$.question_id')=?) "
+                "ORDER BY d.id DESC LIMIT ?",
+                (ci, active_question_id, active_question_id,
+                 f"q{active_question_id}",
+                 _MAX_CONTEXT_FAILURE_SUMMARIES + 1)).fetchall()
+            room = max(0, _MAX_CONTEXT_FAILURE_SUMMARIES - len(failures))
+            failures_cut = failures_cut or len(decision_rows) > room
+            for decision_id, cycle_id, decision_type, raw in decision_rows[:room]:
+                payload = self._history_json_object(
+                    raw, label=f"decision d{decision_id}")
+                reason = payload.get("reason") or payload.get("diagnosis_md")
+                item: Dict[str, Any] = {
+                    "kind": decision_type,
+                    "cycle_id": f"c{cycle_id}",
+                    "decision_id": decision_id,
+                }
+                if isinstance(reason, str):
+                    item["reason"] = self._history_text(
+                        reason, label=f"decision d{decision_id} reason")
+                failures.append(item)
+                sources.append(f"db:decision:{decision_id}")
+        results: List[Dict[str, Any]] = []
+        results_cut = False
+        if active_question_id is not None:
+            scientific_by_target: Dict[int, List[tuple[int, Dict[str, Any]]]] = {}
+            for decision_id, _cycle_id, target_id, classification in (
+                    self._validated_scientific_decisions(
+                        before_cycle=ci,
+                        question_id=active_question_id)):
+                scientific_by_target.setdefault(target_id, []).append(
+                    (decision_id, classification))
+            rows = self.conn.execute(
+                "SELECT bt.id,bt.cycle_id,bt.target_kind,bt.status,"
+                "v.id,v.result_summary FROM build_target bt "
+                "LEFT JOIN variant v ON v.id=bt.variant_id "
+                "WHERE bt.question_id=? AND bt.cycle_id<? "
+                "AND bt.status='complete' ORDER BY bt.cycle_id DESC,bt.id DESC "
+                "LIMIT ?",
+                (active_question_id, ci,
+                 _MAX_CONTEXT_RESULT_SUMMARIES + 1)).fetchall()
+            results_cut = len(rows) > _MAX_CONTEXT_RESULT_SUMMARIES
+            for (target_id, cycle_id, kind, status, variant_id, summary) in (
+                    rows[:_MAX_CONTEXT_RESULT_SUMMARIES]):
+                item: Dict[str, Any] = {
+                    "kind": "bundle_target",
+                    "cycle_id": f"c{cycle_id}",
+                    "build_target_id": target_id,
+                    "target_kind": kind,
+                    "status": status,
+                    "variant_id": (
+                        None if variant_id is None else f"v{variant_id}"),
+                }
+                if isinstance(summary, str):
+                    item["result_summary"] = self._history_text(
+                        summary, label=f"variant v{variant_id} result_summary")
+                classifications = []
+                for decision_id, classification in scientific_by_target.get(
+                        target_id, [])[:_MAX_CONTEXT_RESULT_CLASSIFICATIONS]:
+                    classifications.append({
+                        "decision_id": decision_id,
+                        "evaluation_id": classification["evaluation_id"],
+                        "evaluation_attempt_id":
+                            classification["evaluation_attempt_id"],
+                        "execution_status":
+                            classification["execution_status"],
+                        "validity_status":
+                            classification["validity_status"],
+                        "scientific_outcome":
+                            classification["scientific_outcome"],
+                        "pool_eligibility":
+                            classification["pool_eligibility"],
+                    })
+                    sources.append(f"db:decision:{decision_id}")
+                if classifications:
+                    item["scientific_classifications"] = classifications
+                    if (len(scientific_by_target.get(target_id, []))
+                            > _MAX_CONTEXT_RESULT_CLASSIFICATIONS):
+                        item["scientific_classifications_truncated"] = True
+                results.append(item)
+                sources.append(f"db:build_target:{target_id}")
+
+        prior_reasoning: List[Dict[str, Any]] = []
+        reasoning_cut = False
+        if active_question_id is not None:
+            reasoning_rows, reasoning_cut = self._validated_prior_reasoning(
+                before_cycle=ci, question_id=active_question_id,
+                goal_id=goal_id)
+            for decision_id, cycle_id, payload in reasoning_rows:
+                raw_evidence_refs = payload.get("evidence_refs") or []
+                evidence_refs = []
+                for index, ref in enumerate(raw_evidence_refs[:16], start=1):
+                    shown, cut = _bounded_utf8(
+                        ref, 512,
+                        label=f"decision d{decision_id} evidence_ref[{index}]")
+                    evidence_refs.append({
+                        "ref": shown,
+                        **({"truncated": True} if cut else {}),
+                    })
+                item = {
+                    "decision_id": decision_id,
+                    "cycle_id": f"c{cycle_id}",
+                    "decision": payload.get("decision"),
+                    "conclusion": self._history_text(
+                        payload.get("conclusion_md", ""),
+                        label=f"decision d{decision_id} conclusion"),
+                    "next_step": self._history_text(
+                        payload.get("next_step_md", ""),
+                        label=f"decision d{decision_id} next_step"),
+                    "evidence_refs": evidence_refs,
+                    "evidence_refs_truncated": len(raw_evidence_refs) > 16,
+                }
+                prior_reasoning.append(item)
+                sources.append(f"db:decision:{decision_id}")
+
+        artifact_refs: List[Dict[str, Any]] = []
+        artifacts_cut = False
+        if active_question_id is not None:
+            artifact_rows = self.conn.execute(
+                "SELECT d.id,d.cycle_id,d.payload_json FROM decision d "
+                "WHERE d.cycle_id<? AND d.actor='agent' "
+                "AND d.type='runtime_stage_submission' "
+                "AND json_valid(d.payload_json) AND (d.question_id=? OR "
+                "EXISTS (SELECT 1 FROM idea i WHERE i.cycle_id=d.cycle_id "
+                "AND i.question_id=?) OR EXISTS (SELECT 1 FROM build_target bt "
+                "WHERE bt.cycle_id=d.cycle_id AND bt.question_id=?) OR "
+                "EXISTS (SELECT 1 FROM decision rs WHERE rs.cycle_id=d.cycle_id "
+                "AND rs.question_id=? AND rs.type='runtime_cycle_summary')) "
+                "ORDER BY d.id DESC LIMIT ?",
+                (ci, active_question_id, active_question_id,
+                 active_question_id, active_question_id,
+                 _MAX_CONTEXT_ARTIFACT_REFS + 1)).fetchall()
+            artifacts_cut = (
+                len(artifact_rows) > _MAX_CONTEXT_ARTIFACT_REFS)
+            for decision_id, cycle_id, raw in (
+                    artifact_rows[:_MAX_CONTEXT_ARTIFACT_REFS]):
+                payload = self._history_json_object(
+                    raw, label=f"decision d{decision_id}")
+                if payload.get("protocol") != "runtime-stage-submission-index-v1":
+                    raise ValueError(
+                        f"decision d{decision_id} stage submission protocol 非法")
+                artifact_refs.append(self._artifact_ref(
+                    kind="stage_submission",
+                    ref=payload.get("submission_ref"),
+                    sha256=payload.get("submission_hash"),
+                    source=f"decision:d{decision_id}"))
+                sources.append(f"db:decision:{decision_id}")
+
+        artifact_refs = self._merge_artifact_refs(artifact_refs)
+        index = {
+            "protocol": "context-pack-continuity-v2",
+            "question": question,
+            "prior_reasoning": prior_reasoning,
+            "latest_failures": failures,
+            "existing_results": results,
+            "card_index": card_refs,
+            "artifact_refs": artifact_refs,
+            "truncated": {
+                "cards": cards_cut,
+                "failures": failures_cut,
+                "results": results_cut,
+                "prior_reasoning": reasoning_cut,
+                "artifact_refs": artifacts_cut,
+            },
+        }
+        return index, card_refs, artifact_refs
+
+    def _stage_projection(
+            self, *, ci: int, stage: Stage, target_id: Optional[str],
+            sources: List[str]) -> tuple[str, List[Dict[str, Any]]]:
+        if stage == "bundle" and target_id is not None:
+            return self._bundle_target_delta(
+                target_id, sources, expected_cycle_id=ci)
+        if stage == "reasoning":
+            return self._reasoning_science_review_index(ci, sources)
+        return "", []
+
+    def _bundle_target_delta(
+            self, target_id: str,
+            sources: List[str], *,
+            expected_cycle_id: int) -> tuple[str, List[Dict[str, Any]]]:
+        try:
+            bt = int(target_id)
+        except (TypeError, ValueError):
+            return "", []
+        row = self.conn.execute(
+            "SELECT cycle_id,question_id,baseline_id,variant_id,evaluation_id,"
+            "status,failure_kind FROM build_target WHERE id=?", (bt,)).fetchone()
+        if row is None:
+            return "", []
+        cycle_id, question_id, baseline_id, variant_id, evaluation_id, status, failure = row
+        if cycle_id != expected_cycle_id:
+            raise ValueError(
+                f"build_target {bt} 不属于当前 cycle c{expected_cycle_id}")
+        sources.append(f"db:build_target:{bt}")
+        artifacts: List[Dict[str, Any]] = []
+        binding_rows = self.conn.execute(
+            "SELECT id,request_id,input_key,upstream_target_id,"
+            "upstream_admission_id,publication_decision_id,manifest_ref,"
+            "manifest_hash,source_hash,source_hash_alg "
+            "FROM bundle_source_binding "
+            "WHERE cycle_id=? AND downstream_target_id=? "
+            "ORDER BY input_key,id LIMIT ?",
+            (cycle_id, bt, _MAX_BUNDLE_PUBLISHED_INPUTS + 1),
+        ).fetchall()
+        if len(binding_rows) > _MAX_BUNDLE_PUBLISHED_INPUTS:
+            raise ValueError(
+                f"build_target {bt} published input bindings 超过上限 "
+                f"{_MAX_BUNDLE_PUBLISHED_INPUTS}")
+        if binding_rows and self.work_root is None:
+            raise ValueError(
+                f"build_target {bt} 有 published input binding，"
+                "但 compiler 未绑定 work_root")
+        published_inputs = []
+        for (
+            binding_id, request_id, input_key, upstream_target_id,
+            upstream_admission_id, publication_decision_id, manifest_ref,
+            manifest_hash, source_hash, source_hash_alg,
+        ) in binding_rows:
+            if (any(isinstance(value, bool) or not isinstance(value, int)
+                    or value <= 0 for value in (
+                        binding_id, request_id, upstream_target_id,
+                        upstream_admission_id, publication_decision_id))
+                    or not isinstance(input_key, str)
+                    or _PUBLISHED_INPUT_KEY_RE.fullmatch(input_key) is None
+                    or not isinstance(manifest_ref, str)
+                    or not manifest_ref
+                    or len(manifest_ref.encode("utf-8")) > _MAX_CONTEXT_REF_BYTES
+                    or not isinstance(manifest_hash, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None
+                    or not isinstance(source_hash, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", source_hash) is None
+                    or source_hash_alg != "sha256-tree-v1"):
+                raise ValueError(
+                    f"bundle_source_binding {binding_id} 身份/hash 非法")
+            assert self.work_root is not None
+            materialized = (
+                self.work_root / f"c{cycle_id}" / f"t{bt}"
+                / "published-inputs" / input_key)
+            materialized_ref = str(materialized)
+            if len(materialized_ref.encode("utf-8")) > _MAX_CONTEXT_REF_BYTES:
+                raise ValueError(
+                    f"bundle_source_binding {binding_id} materialized ref 过长")
+            content_hash = f"{source_hash_alg}:{source_hash}"
+            source_label = f"bundle_source_binding:{binding_id}"
+            published_inputs.append({
+                "binding_id": binding_id,
+                "request_id": request_id,
+                "input_key": input_key,
+                "worker_path": f"published-inputs/{input_key}",
+                "upstream_target_id": upstream_target_id,
+                "upstream_admission_id": upstream_admission_id,
+                "publication_decision_id": publication_decision_id,
+                "manifest_ref": manifest_ref,
+                "manifest_hash": manifest_hash,
+                "content_hash": content_hash,
+            })
+            artifacts.append(self._artifact_ref(
+                kind="published_source_input",
+                ref=materialized_ref,
+                content_hash=content_hash,
+                source=source_label))
+            sources.append(f"db:{source_label}")
+
+        dependencies = []
+        dependencies_cut = False
+        if question_id is not None:
+            dependency_rows = self.conn.execute(
+                    "SELECT id,dep_type,depends_on_question_id,"
+                    "depends_on_baseline_id,status FROM question_dep "
+                    "WHERE question_id=? ORDER BY id LIMIT ?",
+                    (question_id,
+                     _MAX_BUNDLE_DELTA_DEPENDENCIES + 1)).fetchall()
+            dependencies_cut = (
+                len(dependency_rows) > _MAX_BUNDLE_DELTA_DEPENDENCIES)
+            for (dep_id, dep_type, dep_q, dep_b, dep_status) in (
+                    dependency_rows[:_MAX_BUNDLE_DELTA_DEPENDENCIES]):
+                dependencies.append({
+                    "dependency_id": dep_id,
+                    "dep_type": dep_type,
+                    "depends_on_question_id": (
+                        None if dep_q is None else f"q{dep_q}"),
+                    "depends_on_baseline_id": (
+                        None if dep_b is None else f"b{dep_b}"),
+                    "status": dep_status,
+                })
+                sources.append(f"db:question_dep:{dep_id}")
+
+        reusable = None
+        if baseline_id is not None:
+            reusable_row = self.conn.execute(
+                "SELECT b.slug,b.canonical_key,b.status,b.code_ref,b.commit_hash,"
+                "b.identity_doc,b.capability_summary,v.variant_key,v.status,"
+                "v.env_hash,v.result_summary FROM baseline b "
+                "LEFT JOIN variant v ON v.id=? WHERE b.id=?",
+                (variant_id, baseline_id)).fetchone()
+            if reusable_row is not None:
+                code_ref = reusable_row[3]
+                identity_doc = reusable_row[5]
+                if code_ref is not None and not isinstance(code_ref, str):
+                    raise ValueError(
+                        f"baseline b{baseline_id} code_ref 非文本")
+                if (identity_doc is not None
+                        and not isinstance(identity_doc, str)):
+                    raise ValueError(
+                        f"baseline b{baseline_id} identity_doc 非文本")
+                safe_code_ref = (
+                    code_ref if isinstance(code_ref, str)
+                    and "\n" not in code_ref
+                    and len(code_ref.encode("utf-8")) <= _MAX_CONTEXT_REF_BYTES
+                    else None)
+                safe_identity_ref = (
+                    identity_doc if isinstance(identity_doc, str)
+                    and "\n" not in identity_doc
+                    and len(identity_doc.encode("utf-8"))
+                    <= _MAX_CONTEXT_REF_BYTES else None)
+                reusable = {
+                    "baseline_id": f"b{baseline_id}",
+                    "slug": reusable_row[0],
+                    "canonical_key": reusable_row[1],
+                    "baseline_status": reusable_row[2],
+                    "code_ref": safe_code_ref,
+                    "code_ref_hash": (
+                        None if code_ref is None else
+                        "sha256:" + hashlib.sha256(
+                            code_ref.encode("utf-8")).hexdigest()),
+                    "commit_hash": reusable_row[4],
+                    "identity_doc_ref": safe_identity_ref,
+                    "identity_doc_hash": (
+                        None if identity_doc is None else
+                        "sha256:" + hashlib.sha256(
+                            identity_doc.encode("utf-8")).hexdigest()),
+                    "capability_summary": (
+                        None if reusable_row[6] is None else
+                        self._history_text(
+                            reusable_row[6],
+                            label=f"baseline b{baseline_id} capability")),
+                    "variant_id": (
+                        None if variant_id is None else f"v{variant_id}"),
+                    "variant_key": reusable_row[7],
+                    "variant_status": reusable_row[8],
+                    "env_hash": reusable_row[9],
+                    "result_summary": (
+                        None if reusable_row[10] is None else
+                        self._history_text(
+                            reusable_row[10],
+                            label=f"variant v{variant_id} result_summary")),
+                }
+                sources.append(f"db:baseline:{baseline_id}")
+                if variant_id is not None:
+                    sources.append(f"db:variant:{variant_id}")
+
+        attempt_rows = self.conn.execute(
+            "SELECT id,evaluation_id,attempt_no,purpose,status,failure_kind,"
+            "artifact_ref,transcript_ref FROM evaluation_attempt "
+            "WHERE build_target_id=? ORDER BY id LIMIT ?",
+            (bt, _MAX_BUNDLE_DELTA_ATTEMPTS + 1)).fetchall()
+        attempts = []
+        for (attempt_id, eid, attempt_no, purpose, attempt_status,
+             attempt_failure, artifact_ref, transcript_ref) in (
+                 attempt_rows[:_MAX_BUNDLE_DELTA_ATTEMPTS]):
+            item = {
+                "attempt_id": f"ea{attempt_id}",
+                "evaluation_id": f"e{eid}",
+                "attempt_no": attempt_no,
+                "purpose": purpose,
+                "status": attempt_status,
+                "failure_kind": attempt_failure,
+                "has_artifact_ref": bool(artifact_ref),
+                "has_transcript_ref": bool(transcript_ref),
+            }
+            attempts.append(item)
+            sources.append(f"db:evaluation_attempt:{attempt_id}")
+            if artifact_ref:
+                artifacts.append(self._artifact_ref(
+                    kind="evaluation_attempt_artifact", ref=artifact_ref,
+                    source=f"evaluation_attempt:ea{attempt_id}"))
+            if transcript_ref:
+                artifacts.append(self._artifact_ref(
+                    kind="provider_transcript", ref=transcript_ref,
+                    source=f"evaluation_attempt:ea{attempt_id}"))
+
+        run_rows = self.conn.execute(
+            "SELECT id,kind,status,failure_kind,commit_hash,env_hash FROM run "
+            "WHERE build_target_id=? ORDER BY id LIMIT ?",
+            (bt, _MAX_BUNDLE_DELTA_RUNS + 1)).fetchall()
+        runs = []
+        for run_id, kind, run_status, run_failure, commit_hash, env_hash in (
+                run_rows[:_MAX_BUNDLE_DELTA_RUNS]):
+            runs.append({
+                "run_id": f"r{run_id}", "kind": kind, "status": run_status,
+                "failure_kind": run_failure, "commit_hash": commit_hash,
+                "env_hash": env_hash,
+            })
+            sources.append(f"db:run:{run_id}")
+
+        checkpoint_rows = (
+            self.conn.execute(
+                "SELECT c.id,c.ckpt_key,c.path,c.content_hash,c.hash_alg,"
+                "c.artifact_type FROM checkpoint c WHERE c.variant_id=? "
+                "ORDER BY c.id LIMIT ?",
+                (variant_id,
+                 _MAX_BUNDLE_DELTA_CHECKPOINTS + 1)).fetchall()
+            if variant_id is not None else [])
+        checkpoints = []
+        for checkpoint_id, key, path, digest, hash_alg, artifact_type in (
+                checkpoint_rows[:_MAX_BUNDLE_DELTA_CHECKPOINTS]):
+            checkpoints.append({
+                "checkpoint_id": f"ckpt{checkpoint_id}", "ckpt_key": key,
+                "content_hash": digest, "hash_alg": hash_alg,
+                "artifact_type": artifact_type,
+            })
+            artifacts.append(self._artifact_ref(
+                kind="checkpoint", ref=path, content_hash=digest,
+                source=f"checkpoint:ckpt{checkpoint_id}"))
+            sources.append(f"db:checkpoint:{checkpoint_id}")
+
+        log_rows = self.conn.execute(
+            "SELECT el.id,el.log_kind,el.ref,el.content_hash,el.bytes "
+            "FROM execution_log el LEFT JOIN run r ON r.id=el.run_id "
+            "LEFT JOIN evaluation_attempt ea ON ea.id=el.evaluation_attempt_id "
+            "WHERE r.build_target_id=? OR ea.build_target_id=? "
+            "ORDER BY el.id LIMIT ?",
+            (bt, bt, _MAX_BUNDLE_DELTA_LOGS + 1)).fetchall()
+        logs = []
+        for log_id, kind, ref, digest, size in (
+                log_rows[:_MAX_BUNDLE_DELTA_LOGS]):
+            logs.append({
+                "execution_log_id": f"log{log_id}", "log_kind": kind,
+                "content_hash": digest, "size_bytes": size,
+            })
+            artifacts.append(self._artifact_ref(
+                kind="execution_log", ref=ref, content_hash=digest,
+                size_bytes=size, source=f"execution_log:log{log_id}"))
+            sources.append(f"db:execution_log:{log_id}")
+
+        submissions = []
+        submission_rows = self.conn.execute(
+                "SELECT id,payload_json FROM decision WHERE cycle_id=? "
+                "AND actor='agent' AND type='runtime_stage_submission' "
+                "AND json_valid(payload_json) "
+                "AND CAST(json_extract(payload_json,'$.target_id') AS TEXT)=? "
+                "ORDER BY id LIMIT ?",
+                (cycle_id, str(bt),
+                 _MAX_BUNDLE_DELTA_SUBMISSIONS + 1)).fetchall()
+        for decision_id, raw in (
+                submission_rows[:_MAX_BUNDLE_DELTA_SUBMISSIONS]):
+            payload = self._history_json_object(
+                raw, label=f"decision d{decision_id}")
+            if payload.get("protocol") != "runtime-stage-submission-index-v1":
+                raise ValueError(
+                    f"decision d{decision_id} stage submission protocol 非法")
+            submissions.append({
+                "decision_id": decision_id,
+                "stage": payload.get("stage"),
+                "purpose": payload.get("purpose"),
+                "revision": payload.get("revision"),
+                "artifact_hash": payload.get("artifact_hash"),
+                "submission_hash": payload.get("submission_hash"),
+            })
+            artifacts.append(self._artifact_ref(
+                kind="stage_submission", ref=payload.get("submission_ref"),
+                sha256=payload.get("submission_hash"),
+                source=f"decision:d{decision_id}"))
+            sources.append(f"db:decision:{decision_id}")
+
+        bounded_artifacts = self._merge_artifact_refs(artifacts)
+        payload = {
+            "protocol": "bundle-target-context-v2",
+            "build_target_id": bt,
+            "cycle_id": f"c{cycle_id}",
+            "question_id": (
+                None if question_id is None else f"q{question_id}"),
+            "status": status,
+            "failure_kind": failure,
+            "evaluation_id": (
+                None if evaluation_id is None else f"e{evaluation_id}"),
+            "published_inputs": published_inputs,
+            "dependencies": dependencies,
+            "relevant_baseline_variant": reusable,
+            "prior_attempts": attempts,
+            "runs": runs,
+            "checkpoints": checkpoints,
+            "execution_logs": logs,
+            "current_submissions": submissions,
+            "artifact_refs": bounded_artifacts,
+            "truncated": {
+                "dependencies": dependencies_cut,
+                "attempts": (
+                    len(attempt_rows) > _MAX_BUNDLE_DELTA_ATTEMPTS),
+                "runs": len(run_rows) > _MAX_BUNDLE_DELTA_RUNS,
+                "checkpoints": (
+                    len(checkpoint_rows) > _MAX_BUNDLE_DELTA_CHECKPOINTS),
+                "execution_logs": (
+                    len(log_rows) > _MAX_BUNDLE_DELTA_LOGS),
+                "current_submissions": (
+                    len(submission_rows) > _MAX_BUNDLE_DELTA_SUBMISSIONS),
+            },
+        }
+        return (
+            "## Bundle target delta（只含本 target）\n"
+            "> 大代码、checkpoint、transcript 与原始日志只列路径/哈希；"
+            "不得据摘要猜测文件内容，确有需要时按引用渐进读取。\n```json\n"
+            + json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, indent=2,
+                allow_nan=False)
+            + "\n```",
+            bounded_artifacts,
+        )
+
+    def _reasoning_science_review_index(
+            self, ci: int,
+            sources: List[str]) -> tuple[str, List[Dict[str, Any]]]:
+        validated_science = self._validated_scientific_decisions(
+            cycle_id=ci)
+        science = []
+        for decision_id, _cycle_id, _target_id, payload in (
+                validated_science[:_MAX_REASONING_TARGET_DECISIONS]):
+            science.append({
+                "decision_id": decision_id,
+                "build_target_id": payload.get("build_target_id"),
+                "evaluation_id": payload.get("evaluation_id"),
+                "evaluation_attempt_id": payload.get("evaluation_attempt_id"),
+                "execution_status": payload.get("execution_status"),
+                "validity_status": payload.get("validity_status"),
+                "scientific_outcome": payload.get("scientific_outcome"),
+                "pool_eligibility": payload.get("pool_eligibility"),
+                "contract_hash": payload.get("contract_hash"),
+                "facts_hash": payload.get("facts_hash"),
+            })
+            sources.append(f"db:decision:{decision_id}")
+
+        validated_reviews = self._validated_native_reviews(cycle_id=ci)
+        reviews = []
+        artifacts: List[Dict[str, Any]] = []
+        for decision_id, payload in (
+                validated_reviews[:_MAX_REASONING_TARGET_DECISIONS]):
+            item = {
+                "decision_id": decision_id,
+                "review_kind": payload.get("review_kind"),
+                "target_id": payload.get("target_id"),
+                "round_no": payload.get("round_no"),
+                "configured_rounds": payload.get("configured_rounds"),
+                "verdict": payload.get("verdict"),
+                "resulting_subject_hash": payload.get(
+                    "resulting_subject_hash"),
+                "findings_hash": payload.get("findings_hash"),
+                "disposition_hash": payload.get("disposition_hash"),
+                "revised_candidate_manifest_hash": payload.get(
+                    "revised_candidate_manifest_hash"),
+            }
+            reviews.append(item)
+            for kind, ref_key, hash_key in (
+                    ("review_findings", "findings_ref", "findings_hash"),
+                    ("review_dispositions", "dispositions_ref",
+                     "disposition_hash"),
+                    ("review_revised_candidate",
+                     "revised_candidate_manifest_ref",
+                     "revised_candidate_manifest_hash")):
+                if payload.get(ref_key):
+                    artifacts.append(self._artifact_ref(
+                        kind=kind, ref=payload[ref_key],
+                        sha256=payload.get(hash_key),
+                        source=f"decision:d{decision_id}"))
+            sources.append(f"db:decision:{decision_id}")
+        bounded_artifacts = self._merge_artifact_refs(artifacts)
+        payload = {
+            "protocol": "reasoning-bundle-index-v2",
+            "scientific_classifications": science,
+            "native_reviews": reviews,
+            "artifact_refs": bounded_artifacts,
+            "truncated": {
+                "scientific_classifications": (
+                    len(validated_science)
+                    > _MAX_REASONING_TARGET_DECISIONS),
+                "native_reviews": (
+                    len(validated_reviews)
+                    > _MAX_REASONING_TARGET_DECISIONS),
+            },
+        }
+        return (
+            "## 本轮 Bundle 科学状态与独立 review 索引\n"
+            "> Bundle 的 validity/pool 决定在此只读；Reasoning 只能解释与选下一步，"
+            "不得覆盖。review verdict 是审查记录，不替代四维科学分类。\n```json\n"
+            + json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, indent=2,
+                allow_nan=False)
+            + "\n```",
+            bounded_artifacts,
+        )
 
     # -- 分区渲染 ---------------------------------------------------------------
     def _anchor(self, cycle_id, ci, stage, target_id, route, aq, goal_id, goal_ver, sources, refs) -> str:
@@ -407,11 +1689,14 @@ class SqliteCompiler:
             parts.append(self._import_candidate_snapshot(aq, ci, sources))
             parts.append(self._import_failure_feedback(aq, sources))
             parts.append(self._plan_reject_feedback(aq, sources))
+        elif stage == "bundle" and target_id is None:
+            parts.append(self._bundle_scheduler_overview(ci, sources))
         elif stage == "bundle" and target_id is not None:
             # 完整计划切片（步⑧ CP8.2）：resolved 切片（plan_ref）+ plan_slice_hash（manifest 须回引此值）+
             # required 指标 int 绑定（eval 命令 metric_value 行须用这些 int id@ver）——真 Codex 据此产
             # execution_manifest.json + 代码 + identity.md。target_id 已消费（不同 target → 不同 pack）。
-            parts.append(self._bundle_target(target_id, sources))
+            parts.append(self._bundle_target(
+                target_id, sources, expected_cycle_id=ci))
             parts.append(self._bundle_repair_feedback(target_id, sources))
         elif stage == "reasoning":
             goal = self.conn.execute(
@@ -1758,13 +3043,21 @@ class SqliteCompiler:
         return (self.runtime_environment_hash
                 or sandbox_environment_hash(self.policy["execution"]["sandbox"])), False
 
-    def _bundle_target(self, target_id, sources) -> str:
+    def _bundle_target(
+            self, target_id, sources, *,
+            expected_cycle_id: Optional[int] = None) -> str:
         """bundle 目标锚区（步⑧）：resolved 切片全文 + plan_slice_hash（manifest.target_ref 须回引）+ required
         指标 int 绑定。target_id = build_target.id 的字符串（attack_stages 传 str(bt_id)）。"""
         try:
             bt = int(target_id)
         except (TypeError, ValueError):
             return f"## 本目标\n- target: {target_id}（无效 build_target id）"
+        owner = self.conn.execute(
+            "SELECT cycle_id FROM build_target WHERE id=?", (bt,)).fetchone()
+        if (owner is not None and expected_cycle_id is not None
+                and owner[0] != expected_cycle_id):
+            raise ValueError(
+                f"build_target {bt} 不属于当前 cycle c{expected_cycle_id}")
         row = self.conn.execute("SELECT plan_ref, baseline_id, variant_id, eval_key FROM build_target WHERE id=?",
                                 (bt,)).fetchone()
         sources.append(f"db:build_target:{bt}")
@@ -1822,6 +3115,86 @@ class SqliteCompiler:
                 "- resolved 计划切片（manifest 须与之 target_key/target_kind/seq/protocol 绑定/config 一致）:\n"
                 "```json\n" + json.dumps(slice_, ensure_ascii=False, sort_keys=True, indent=2) + "\n```")
 
+    def _bundle_scheduler_overview(
+            self, cycle_id: int, sources: List[str]) -> str:
+        """Render the Scheduler's compact graph projection without target data."""
+        rows = self.conn.execute(
+            "SELECT bt.id,coalesce(n.target_key,'t'||bt.id),"
+            "bt.target_kind,bt.seq,bt.critical,bt.status,bt.failure_kind,"
+            "CASE WHEN a.id IS NULL THEN 0 ELSE 1 END,"
+            "coalesce(w.status,'not_started'),"
+            "tr.report_ref,tr.report_hash,tr.status,"
+            "coalesce(rr.gpu_count,0),"
+            "(SELECT count(*) FROM bundle_resource_lease rl "
+            " WHERE rl.build_target_id=bt.id "
+            " AND rl.status IN ('active','releasing')) "
+            "FROM build_target bt "
+            "LEFT JOIN bundle_target_node n ON n.target_id=bt.id "
+            "LEFT JOIN bundle_target_admission a ON a.target_id=bt.id "
+            "LEFT JOIN bundle_worker_task w "
+            " ON w.build_target_id=bt.id AND w.role='worker' "
+            "LEFT JOIN bundle_terminal_report tr "
+            " ON tr.build_target_id=bt.id "
+            "LEFT JOIN bundle_resource_request rr "
+            " ON rr.build_target_id=bt.id "
+            "WHERE bt.cycle_id=? AND bt.plan_ref IS NOT NULL "
+            "ORDER BY bt.seq,bt.id",
+            (cycle_id,),
+        ).fetchall()
+        dependencies = self.conn.execute(
+            "SELECT upstream_target_id,downstream_target_id "
+            "FROM bundle_target_dependency WHERE cycle_id=? "
+            "ORDER BY downstream_target_id,upstream_target_id",
+            (cycle_id,),
+        ).fetchall()
+        dep_by_target: Dict[int, List[int]] = {}
+        for upstream, downstream in dependencies:
+            dep_by_target.setdefault(int(downstream), []).append(
+                int(upstream))
+        targets = [{
+            "build_target_id": int(row[0]),
+            "target_key": row[1],
+            "target_kind": row[2],
+            "seq": int(row[3]),
+            "critical": bool(row[4]),
+            "status": row[5],
+            "failure_kind": row[6],
+            "dependencies": dep_by_target.get(int(row[0]), []),
+            "admitted": bool(row[7]),
+            "worker_status": row[8],
+            "resource_request": {"gpu_count": int(row[12])},
+            "leased_gpu_count": int(row[13]),
+            "terminal_report": (
+                None if row[9] is None else {
+                    "report_ref": row[9],
+                    "report_hash": row[10],
+                    "status": row[11],
+                }),
+        } for row in rows]
+        sources.append(f"db:bundle_graph:c{cycle_id}")
+        payload = {
+            "protocol": "bundle-scheduler-overview-v1",
+            "cycle_id": f"c{cycle_id}",
+            "targets": targets,
+            "counts": {
+                "targets": len(targets),
+                "admitted": sum(
+                    1 for target in targets if target["admitted"]),
+                "terminal_reports": sum(
+                    1 for target in targets
+                    if target["terminal_report"] is not None),
+            },
+        }
+        return (
+            "## Bundle Scheduler DAG overview\n"
+            "> 这是有界图级投影；ready frontier 与 dispatch 只以 runtime "
+            "MCP 的 owner-side 结果为准。此投影不含源码或 raw log。\n"
+            "```json\n"
+            + json.dumps(
+                payload, ensure_ascii=False, sort_keys=True,
+                indent=2, allow_nan=False)
+            + "\n```")
+
     def _neighborhood(self, aq, sources) -> str:
         """结构邻域 = 祖先链（recursive on parent_id；DDL trg_question_parent_frozen 防环，seen 兜底坏数据）。"""
         if aq is None:
@@ -1845,10 +3218,102 @@ class SqliteCompiler:
         if aq is None:
             return ""
         rows = self.conn.execute(
-            "SELECT content_md, status FROM idea WHERE question_id=? ORDER BY id", (aq,)).fetchall()
+            "SELECT id,cycle_id,content_md,novelty_refs_json,audit_score,"
+            "audit_json,status FROM idea WHERE question_id=? ORDER BY id",
+            (aq,)).fetchmany(_MAX_IDEA_HISTORY + 1)
         if rows:
             sources.append(f"db:ideas:{aq}")
-        tried = [f"- [{s}] {c}" for c, s in rows]
+        tried = []
+        rendered_bytes = 0
+        history_cut = len(rows) > _MAX_IDEA_HISTORY
+        for idea_id, cycle_id, content, novelty_raw, score, audit_raw, status in (
+                rows[:_MAX_IDEA_HISTORY]):
+            content_shown, content_cut = _bounded_utf8(
+                content, 4096, label=f"idea i{idea_id} content_md")
+            novelty = []
+            if novelty_raw is not None:
+                try:
+                    decoded = json.loads(
+                        novelty_raw,
+                        parse_constant=lambda token: (_ for _ in ()).throw(
+                            ValueError(f"非有限 JSON number: {token}")))
+                except (json.JSONDecodeError, ValueError) as error:
+                    raise ValueError(
+                        f"idea i{idea_id} novelty_refs_json 损坏") from error
+                if not isinstance(decoded, list):
+                    raise ValueError(
+                        f"idea i{idea_id} novelty_refs_json 须为 array")
+                for index, ref in enumerate(decoded[:32], start=1):
+                    label = f"idea i{idea_id} novelty_ref[{index}]"
+                    if isinstance(ref, str):
+                        shown, cut = _bounded_utf8(
+                            ref, 512, label=label)
+                        novelty.append({
+                            "ref": shown,
+                            **({"truncated": True} if cut else {}),
+                        })
+                        continue
+                    if not isinstance(ref, dict):
+                        raise ValueError(
+                            f"{label} 须为字符串或 JSON object")
+                    summary: Dict[str, Any] = {}
+                    for field, limit in (
+                            ("candidate_id", 128),
+                            ("query", 512),
+                            ("provider", 128),
+                            ("snapshot_hash", 96),
+                            ("snapshot_ref", 512),
+                            ("raw_content_hash", 96),
+                            ("policy_hash", 96)):
+                        shown, cut = _bounded_utf8(
+                            ref.get(field), limit,
+                            label=f"{label}.{field}")
+                        summary[field] = shown
+                        if cut:
+                            summary[f"{field}_truncated"] = True
+                    result_hashes = ref.get("result_content_hashes")
+                    ranking = ref.get("ranking")
+                    if (
+                            not isinstance(result_hashes, list)
+                            or not isinstance(ranking, list)):
+                        raise ValueError(
+                            f"{label} result_content_hashes/ranking 须为 array")
+                    summary["result_count"] = len(result_hashes)
+                    summary["ranking_count"] = len(ranking)
+                    novelty.append(summary)
+            audit_summary = None
+            if audit_raw is not None:
+                audit = self._history_json_object(
+                    audit_raw, label=f"idea i{idea_id} audit_json")
+                canonical = json.dumps(
+                    audit, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False)
+                audit_summary = self._history_text(
+                    canonical, label=f"idea i{idea_id} audit summary",
+                    limit=2048)
+            line = (
+                f"- i{idea_id} cycle=c{cycle_id} [{status}] "
+                f"audit_score={score}; novelty_refs="
+                + json.dumps(
+                    novelty, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False)
+                + f"; content={content_shown}"
+                + ("（content 已裁剪）" if content_cut else "")
+                + ("; audit=" + json.dumps(
+                    audit_summary, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False)
+                   if audit_summary is not None else ""))
+            line_bytes = len(line.encode("utf-8"))
+            if rendered_bytes + line_bytes > _MAX_IDEA_HISTORY_RENDERED_BYTES:
+                history_cut = True
+                break
+            tried.append(line)
+            rendered_bytes += line_bytes
+            sources.append(f"db:idea:{idea_id}")
+        if history_cut:
+            tried.append(
+                "- （idea history truncated；仅展示有界历史，"
+                "未展示项仍保留在 DB）")
         return "## 该问题已试 idea 及结局（防重复造轮）\n" + ("\n".join(tried) or "（无）")
 
     def _closed_conclusions(self, goal_id, goal_ver, sources) -> str:

@@ -13,9 +13,9 @@ pool_publish）= CP5.2；本模块提供两者共用的双评审 DECISION 机械
 - DB 触发器（trg_run_frozen/trg_run_target_consistent/trg_attempt_frozen/trg_eval_sc_*/trg_mr_i2/
   trg_eval_no_abandon_if_cited…）是最终焊死层；本模块是前置门禁（干净拒 + 触发器未覆盖的 gate 级判据）。
 
-**bundle 串行（§4.2.5）**：目标间不共事务、按 seq 串行。「当前目标」**从 build_target 状态结构性推导**
-（= 本 cycle 最小 seq 的非终态目标），不依赖内存 cursor —— 崩溃重启即可从结构恢复（statestore 的
-in-process bundle_cursor 只是提示，真相在此）。
+**bundle DAG**：已注册 ``bundle_target_node`` 的新轮次以 exact
+``bundle_target_admission`` 解依赖；互不依赖的目标可并发，``seq`` 只作稳定展示/调度
+tie-break。尚未注册 DAG 的旧轮次继续使用按 seq 串行的兼容门禁，使升级/恢复不会改变既有事实。
 
 **check-then-act 注**：本模块判据在写事务**前**读（受限连接），未如 gate_close_question 在写锁内重跑
 gate-only 判据——单写者模型（WriteDaemon 单连接串行）下读写间无并发写入窗口；触发器兜底层与
@@ -138,7 +138,8 @@ class ExecGate:
 
     def gate_start_build_target(self, *, build_target_id: int) -> None:
         """pending → building（build/exec/import，池对象连动 building）/ running（eval，不动池）。
-        拒：非 pending；非当前串行目标（= 本 cycle 最小 seq 非终态者；有同 cycle 目标在途亦拒）。
+        DAG target 仅在所有上游拥有 exact admission 后可启动；独立 ready target 可并发且 seq
+        仅作 tie-break。无 DAG registration 的旧 target 仍按最小 seq 串行兼容。
         import 目标（M4 CP5.5 物化 worker）：连动同 build（占位 baseline planned→building + 物化变体）。"""
         bt = self._bt(build_target_id)
         if bt is None:
@@ -147,21 +148,47 @@ class ExecGate:
         self._assert_current_target(ci, build_target_id, action="start_build_target")
         if status != "pending":
             self._reject(ci, f"build_target {build_target_id} 非 pending（当前 {status}），不可 start")
-        inflight = self._q1("SELECT id FROM build_target WHERE cycle_id=? AND status IN ('building','smoke','running')", (ci,))
-        if inflight:
-            self._reject(ci, f"目标间串行（§4.2.5）：target {inflight[0]} 尚在途，不可并行 start {build_target_id}")
-        stopped = self._q1(
-            "SELECT id,status FROM build_target WHERE cycle_id=? AND seq<? AND "
-            "((critical=1 AND status='failed') OR status='engineering_blocked') "
-            "ORDER BY seq LIMIT 1", (ci, _seq))
-        if stopped is not None:
-            self._reject(
-                ci, f"target {stopped[0]}({stopped[1]}) 已触发 bundle 早退；"
-                f"后继 target {build_target_id} 只能置 skipped，不得启动")
-        cur = self._q1("SELECT id FROM build_target WHERE cycle_id=? AND status NOT IN "
-                       "('complete','skipped','failed','engineering_blocked') ORDER BY seq LIMIT 1", (ci,))
-        if cur is None or cur[0] != build_target_id:
-            self._reject(ci, f"非当前串行目标：应先处理 target {cur[0] if cur else '∅'}（seq 序），拒 start {build_target_id}")
+        graph_target = self._q1(
+            "SELECT 1 FROM bundle_target_node WHERE target_id=? AND cycle_id=?",
+            (build_target_id, ci))
+        if graph_target is not None:
+            blockers = self.read.execute(
+                "SELECT d.upstream_target_id "
+                "FROM bundle_target_dependency d "
+                "LEFT JOIN bundle_target_admission a "
+                "ON a.target_id=d.upstream_target_id AND a.cycle_id=d.cycle_id "
+                "WHERE d.cycle_id=? AND d.downstream_target_id=? AND a.id IS NULL "
+                "ORDER BY d.upstream_target_id",
+                (ci, build_target_id)).fetchall()
+            if blockers:
+                self._reject(
+                    ci,
+                    f"DAG target {build_target_id} 的上游尚无精确准入："
+                    f"{[int(row[0]) for row in blockers]}")
+        else:
+            inflight = self._q1(
+                "SELECT id FROM build_target WHERE cycle_id=? "
+                "AND status IN ('building','smoke','running')", (ci,))
+            if inflight:
+                self._reject(
+                    ci, f"目标间串行（legacy）：target {inflight[0]} 尚在途，"
+                    f"不可并行 start {build_target_id}")
+            stopped = self._q1(
+                "SELECT id,status FROM build_target WHERE cycle_id=? AND seq<? AND "
+                "((critical=1 AND status='failed') OR status='engineering_blocked') "
+                "ORDER BY seq LIMIT 1", (ci, _seq))
+            if stopped is not None:
+                self._reject(
+                    ci, f"target {stopped[0]}({stopped[1]}) 已触发 bundle 早退；"
+                    f"后继 target {build_target_id} 只能置 skipped，不得启动")
+            cur = self._q1(
+                "SELECT id FROM build_target WHERE cycle_id=? AND status NOT IN "
+                "('complete','skipped','failed','engineering_blocked') "
+                "ORDER BY seq LIMIT 1", (ci,))
+            if cur is None or cur[0] != build_target_id:
+                self._reject(
+                    ci, f"非当前串行目标：应先处理 target "
+                    f"{cur[0] if cur else '∅'}（seq 序），拒 start {build_target_id}")
         with self.daemon.transaction() as conn:
             if kind == "eval":
                 conn.execute("UPDATE build_target SET status='running' WHERE id=?", (build_target_id,))
@@ -364,10 +391,12 @@ class ExecGate:
                     f"{(target_status, target_failure)}")
 
     def gate_skip_remaining_targets(self, *, failed_target_id: int) -> List[int]:
-        """在 critical failure / engineering_blocked 后原子跳过所有尚未执行的后继目标。
+        """Propagate one terminal failure over the durable target graph.
 
-        返回本次或此前已收敛为 skipped 的后继 id，供编排器幂等补 phase_commit。池占坑与 target
-        同事务转 abandoned；任何后继已经开工都表示串行/恢复不变量损坏，必须 fail loud。
+        DAG non-critical failure skips only dependency descendants, leaving
+        independent branches runnable.  Critical/replan failure fences the
+        remaining pending graph.  Pre-DAG cycles retain the historical seq
+        early-exit rule.  Pool placeholders and targets converge atomically.
         """
         failed = self._bt(failed_target_id)
         if failed is None:
@@ -375,15 +404,78 @@ class ExecGate:
         _, ci, _kind, seq, status, *_ = failed
         self._assert_current_target(ci, failed_target_id, action="skip_remaining_targets")
         critical = self._q1("SELECT critical FROM build_target WHERE id=?", (failed_target_id,))[0]
-        if not (status == "engineering_blocked" or (status == "failed" and critical == 1)):
-            self._reject(
-                ci, f"target {failed_target_id} 未触发早退（status={status}, critical={critical}）")
-        rows = self.read.execute(
-            "SELECT id,target_kind,status,baseline_id,variant_id FROM build_target "
-            "WHERE cycle_id=? AND seq>? ORDER BY seq", (ci, seq)).fetchall()
-        bad = [(row[0], row[2]) for row in rows if row[2] not in ("pending", "skipped")]
+        graph_target = self._q1(
+            "SELECT 1 FROM bundle_target_node "
+            "WHERE target_id=? AND cycle_id=?", (failed_target_id, ci))
+        propagation = "legacy_critical"
+        if graph_target is not None:
+            if status not in ("failed", "engineering_blocked"):
+                self._reject(
+                    ci, f"DAG target {failed_target_id} 非失败终态，"
+                    f"不可传播 skip（status={status}）")
+            if status == "engineering_blocked" or critical == 1:
+                propagation = "critical_drain"
+                scope_rows = self.read.execute(
+                    "SELECT bt.id,bt.target_kind,bt.status,"
+                    "bt.baseline_id,bt.variant_id,bt.seq "
+                    "FROM bundle_target_node n "
+                    "JOIN build_target bt ON bt.id=n.target_id "
+                    "AND bt.cycle_id=n.cycle_id "
+                    "WHERE n.cycle_id=? AND n.target_id<>? "
+                    "ORDER BY bt.seq,bt.id",
+                    (ci, failed_target_id)).fetchall()
+                bad = [
+                    (row[0], row[2]) for row in scope_rows
+                    if row[2] in ("building", "smoke", "running")]
+                # Already-terminal independent work is retained and is not a
+                # target of the critical drain.
+                rows = [
+                    tuple(row[:5]) for row in scope_rows
+                    if row[2] in ("pending", "skipped")]
+            else:
+                propagation = "descendants"
+                scope_rows = self.read.execute(
+                    "WITH RECURSIVE descendants(target_id) AS ("
+                    " SELECT downstream_target_id "
+                    " FROM bundle_target_dependency "
+                    " WHERE cycle_id=? AND upstream_target_id=? "
+                    " UNION "
+                    " SELECT d.downstream_target_id "
+                    " FROM bundle_target_dependency d "
+                    " JOIN descendants x "
+                    " ON x.target_id=d.upstream_target_id "
+                    " WHERE d.cycle_id=?"
+                    ") "
+                    "SELECT bt.id,bt.target_kind,bt.status,"
+                    "bt.baseline_id,bt.variant_id,bt.seq "
+                    "FROM descendants x JOIN build_target bt "
+                    "ON bt.id=x.target_id AND bt.cycle_id=? "
+                    "ORDER BY bt.seq,bt.id",
+                    (ci, failed_target_id, ci, ci)).fetchall()
+                bad = [
+                    (row[0], row[2]) for row in scope_rows
+                    if row[2] not in ("pending", "skipped")]
+                rows = [tuple(row[:5]) for row in scope_rows]
+        else:
+            if not (status == "engineering_blocked"
+                    or (status == "failed" and critical == 1)):
+                self._reject(
+                    ci, f"target {failed_target_id} 未触发早退"
+                    f"（status={status}, critical={critical}）")
+            rows = self.read.execute(
+                "SELECT id,target_kind,status,baseline_id,variant_id "
+                "FROM build_target WHERE cycle_id=? AND seq>? ORDER BY seq",
+                (ci, seq)).fetchall()
+            bad = [
+                (row[0], row[2]) for row in rows
+                if row[2] not in ("pending", "skipped")]
         if bad:
-            self._reject(ci, f"早退后继目标已有执行/其他终态，拒绝掩盖串行损坏: {bad}")
+            self._reject(
+                ci, f"失败传播范围已有执行/冲突终态，拒绝掩盖损坏: {bad}")
+        decision_type = (
+            "bundle_descendant_skip"
+            if propagation == "descendants"
+            else "bundle_critical_early_exit")
         with self.daemon.transaction() as conn:
             for target_id, kind, target_status, baseline_id, variant_id in rows:
                 if target_status == "skipped":
@@ -401,15 +493,16 @@ class ExecGate:
                         (variant_id,))
             if conn.execute(
                     "SELECT 1 FROM decision WHERE actor='orchestrator' "
-                    "AND type='bundle_critical_early_exit' "
+                    "AND type=? "
                     "AND json_extract(payload_json,'$.failed_target_id')=? LIMIT 1",
-                    (failed_target_id,)).fetchone() is None:
+                    (decision_type, failed_target_id)).fetchone() is None:
                 conn.execute(
                     "INSERT INTO decision(cycle_id,actor,type,payload_json) "
-                    "VALUES (?,'orchestrator','bundle_critical_early_exit',?)",
-                    (ci, json.dumps({
+                    "VALUES (?,'orchestrator',?,?)",
+                    (ci, decision_type, json.dumps({
                         "failed_target_id": failed_target_id,
                         "failure_status": status,
+                        "propagation": propagation,
                         "skipped_target_ids": [row[0] for row in rows],
                     }, ensure_ascii=False, sort_keys=True)))
         return [row[0] for row in rows]

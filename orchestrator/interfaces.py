@@ -47,6 +47,15 @@ class ContextPack:
     refs: List[Ref] = field(default_factory=list)   # 引用区：可深潜的 ref 清单
     pack_hash: str = ""                # 包哈希（写 DECISION / 归档回放，P6）
     sources: List[str] = field(default_factory=list)   # 溯源来源清单（确定性排序）；manifest 从此取，使溯源是 pack 的纯函数（M2）
+    # v2 adds a stable common base plus a stage/target projection without
+    # changing the legacy four-region ``pack_hash`` contract.  Existing test
+    # doubles and archived v1 packs therefore remain constructible.
+    version: int = 1
+    base_hash: str = ""
+    projection_hash: str = ""
+    card_refs: List[Dict[str, Any]] = field(default_factory=list)
+    artifact_refs: List[Dict[str, Any]] = field(default_factory=list)
+    summary_index: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

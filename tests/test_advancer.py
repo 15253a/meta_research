@@ -138,6 +138,10 @@ def test_advance_bootstrap_to_done(env):
     assert reloaded.next_intent == "attack" and reloaded.next_question_id is not None   # selection 落库
     q = state.list_schedulable_questions()   # root 仍 open（selection 不改其状态）
     assert len(q) == 1 and "通用规律" in q[0]["text"]
+    assert state.daemon.query_one(
+        "SELECT count(*) FROM phase_commit "
+        "WHERE cycle_id=? AND stage='reasoning' AND target_id IS NULL",
+        (int(cyc.cycle_id[1:]),))[0] == 1
 
 
 def test_advance_idempotent_on_done(env):
@@ -214,6 +218,44 @@ def test_advance_bootstrap_requires_create_root(env):
     with pytest.raises(ValueError, match="create_root"):
         SqliteAdvancer(state, compiler, no_root).advance(cyc.cycle_id)
     assert state.cycle(cyc.cycle_id).status == "created"      # 未标 done
+
+
+def test_decompose_at_hard_depth_releases_and_reselects_atomically(env):
+    state, compiler = env
+    state.policy = yaml.safe_load(yaml.safe_dump(state.policy))
+    state.policy["tree_guard"]["max_decompose_depth"] = 4
+    with state.daemon.transaction() as conn:
+        parent = None
+        for index in range(5):
+            parent = conn.execute(
+                "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source) "
+                "VALUES (?,1,1,1,?,'open','agent')",
+                (parent, f"depth-{index}"),).lastrowid
+        alternate = conn.execute(
+            "INSERT INTO question(goal_id,goal_ver,born_goal_ver,text,status,source) "
+            "VALUES (1,1,1,'alternate','open','agent')").lastrowid
+
+    cyc = state.open_or_resume_cycle()
+    state.set_route(cyc.cycle_id, "decompose")
+    state.activate_question(f"q{parent}")
+
+    def fallback_provider(_cyc, _pack):
+        return {
+            "tree_ops.json": {"ops": []},
+            "selection.json": {
+                "next_question_id": f"q{alternate}",
+                "next_intent": "attack",
+                "scores": [],
+            },
+        }
+
+    assert SqliteAdvancer(state, compiler, fallback_provider).advance(cyc.cycle_id) == "done"
+    assert state.cycle(cyc.cycle_id).next_question_id == f"q{alternate}"
+    assert state.daemon.query_one(
+        "SELECT status FROM question WHERE id=?", (parent,))[0] == "open"
+    assert state.daemon.query_one(
+        "SELECT count(*) FROM decision WHERE cycle_id=? "
+        "AND type='decompose_guard_fallback'", (int(cyc.cycle_id[1:]),))[0] == 1
 
 
 def test_advance_attack_not_implemented(env):

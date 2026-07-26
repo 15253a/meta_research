@@ -307,7 +307,13 @@ class M0Driver:
             payload["variant"] = {"variant_key": claim.get("variant_key", f"v-fake-{n}"),
                                   "config_json": claim.get("config_json", {"fake": True}),
                                   "overrides": []}
-            payload["run"] = {"kind": kind, "status": "success", "seed": n, "cost": 0.0}
+            replicate = target.get("replicate")
+            payload["run"] = {
+                "kind": kind,
+                "status": "success",
+                "seed": None if replicate is None else replicate["seed"],
+                "cost": 0.0,
+            }
             payload["checkpoints"] = [{"ckpt_key": "final", "path": f"{ref_base}/ckpt-final.fake.json",
                                        "content_hash": fake_hash("ckpt"), "hash_alg": "sha256"}]
             payload["identity_draft_md"] = (f"## identity 草稿（M0 假执行）\n- 名称：{claim.get('canonical_key') or claim.get('baseline_ref', 'fake')}"

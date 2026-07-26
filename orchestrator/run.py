@@ -21,8 +21,9 @@ JudgeProvider（外部 import 兼容审查）+ AttackStages
 thread 跨阶段混合职责。每个正常 stage 在一个连续 turn/进程内完成格式修订、搜索、语义反馈与提交；
 主智能体通过 runtime MCP 获得即时反馈。耐久 provider id 只用于进程灾难后 `resume` 原 thread，缺 id 不得
 fresh retry。文件管理保存正文，SQL 只保存 path/hash 回执；编排器消费成功回执后执行核心
-question/baseline/phase 事务并进入下一格。Bundle 只创建一个 cycle-wide 主 turn；它在同一上下文中
-按依赖顺序处理全部 target，并通过 runtime MCP 异步启动、观察和修复 smoke/train/eval，直至 cycle 收口。
+question/baseline/phase 事务并进入下一格。Bundle 每个 cycle 创建一个只负责图级控制的 Scheduler task，
+并为每个 admitted ready target 创建一个固定、可恢复的 Worker task。Worker 只异步启动、增量观察和修复
+自己 target 的 smoke/train/eval；Scheduler 根据耐久 DAG 与资源 lease 派发、传播失败并安全收口。
 """
 from __future__ import annotations
 
@@ -80,7 +81,7 @@ from .mediator import CodexQueryResponder, Mediator, open_responder_read_conn
 from .notify import (DirectiveNotifier, FileRequestNotifier, FileRequestReject, FileRequestService,
                      InteractionNotifier, Outbox, ResearchNotifier,
                      make_advancer_precheck)
-from .novelty_search import ArxivNoveltySearchProvider
+from .federated_novelty import FederatedNoveltySearchProvider
 from .process_supervisor import ExecutionSupervisor
 from .pool_publication import PoolPublisher
 from .qualification_firewall import (
@@ -95,9 +96,11 @@ from .quest_runtime_profiles import (
 )
 from .runner import CodexRunner, RunnerError, terminate_active_process_groups
 from .runtime_mcp import RuntimeIngestService, RuntimeMCPBroker
+from .runtime_storage import configure_process_storage
 from .schemas import SchemaSet
 from .stage_provider import (
     BUNDLE_OPERATOR_SESSION_CONTRACT,
+    BUNDLE_TASK_SESSION_CONTRACT,
     JudgeProvider,
     STAGE_MAIN_SESSION_CONTRACT,
     StageProvider,
@@ -173,19 +176,22 @@ def _default_stage_runner(
         # commands and unbounded engineering repairs.  Its resident main turn
         # ends by explicit stage completion/owner shutdown, never by the
         # ordinary one-call wall-clock limit.
-        lifecycle_bound=purpose_tag.startswith("bundle-main-c"),
+        lifecycle_bound=purpose_tag.startswith((
+            "bundle-main-c", "bundle-scheduler-c", "bundle-worker-c")),
         execution_supervisor=execution_supervisor,
         runtime_mcp_broker=(None if strict_inline else runtime_mcp_broker))
     runner.require_stage_submission = (
         runtime_mcp_broker is not None
         and purpose_tag.startswith((
             "idea-main-c", "plan-main-c", "reasoning-main-c", "bundle-main-c",
+            "bundle-worker-c",
         )))
     # Persistence changes only provider conversation continuity.  The ordinary
     # operator may inspect with broad local/network tools, but official
     # smoke/train/eval launch and all state writes remain with the orchestrator.
     runner.bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
     runner.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+    runner.bundle_task_session_contract = BUNDLE_TASK_SESSION_CONTRACT
     return runner
 
 
@@ -638,7 +644,9 @@ class _GuardedRunner:
             getattr(inner, "bundle_operator_session_contract", None)
             == BUNDLE_OPERATOR_SESSION_CONTRACT
             or getattr(inner, "stage_main_session_contract", None)
-            == STAGE_MAIN_SESSION_CONTRACT)
+            == STAGE_MAIN_SESSION_CONTRACT
+            or getattr(inner, "bundle_task_session_contract", None)
+            == BUNDLE_TASK_SESSION_CONTRACT)
         self._persistent_session_capabilities_required = (
             require_persistent_session_capabilities
             or declared_persistent_contract)
@@ -691,6 +699,10 @@ class _GuardedRunner:
     @property
     def stage_main_session_contract(self):  # noqa: ANN201 - exact optional capability
         return getattr(self.inner, "stage_main_session_contract", None)
+
+    @property
+    def bundle_task_session_contract(self):  # noqa: ANN201 - exact optional capability
+        return getattr(self.inner, "bundle_task_session_contract", None)
 
 
 class _AssemblyCleanup:
@@ -1851,7 +1863,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
             controlled_novelty = (
                 novelty_search_provider
                 if novelty_search_provider is not None
-                else ArxivNoveltySearchProvider(
+                else FederatedNoveltySearchProvider(
                     novelty_policy, work_root=work, owner_guard=owner_guard))
         elif novelty_search_provider is not None:
             raise ValueError(
@@ -2058,7 +2070,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     # providers, or any new spawn, reconcile those receipts into their exact DB intents.
     ExecutionReconciler(
         daemon, cost_ledger, execution_supervisor.receipt_dir).reconcile_startup()
-    state = SQLiteStateStore(daemon, policy)
+    state = SQLiteStateStore(
+        daemon, policy, require_reasoning_commit=True)
     runtime_profile_monitor: Optional[_RuntimeProfileMonitor] = None
     applied_runtime_revision: Optional[int] = None
     applied_runtime_digest: Optional[str] = None
@@ -2157,7 +2170,8 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         runtime_execution_backend=(
             getattr(execution_sandbox, "backend_name", "docker")
             if execution_sandbox is not None else None),
-        replay_archive=cycle_replay)
+        replay_archive=cycle_replay,
+        work_root=work)
     publisher = SqliteStatusPublisher(publisher_conn, policy=policy,
                                       out_path=str(work / "state" / "status_card.json"))
     console = Console(daemon, policy=policy)
@@ -2167,6 +2181,9 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
     file_requests = FileRequestService(daemon, schemas, policy, input_root=str(work / "input"))
     system_prompt = (root / "prompts" / "system_prompt.md").read_text(encoding="utf-8")
     skills = {s: (root / "prompts" / "skills" / s / "SKILL.md").read_text(encoding="utf-8") for s in _STAGES}
+    skills["bundle_scheduler"] = (
+        root / "prompts" / "skills" / "bundle_scheduler" / "SKILL.md"
+    ).read_text(encoding="utf-8")
     skills["bundle_operator"] = (
         root / "prompts" / "skills" / "bundle_operator" / "SKILL.md"
     ).read_text(encoding="utf-8")
@@ -2199,6 +2216,7 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         rf.bundle_operator_session_contract = BUNDLE_OPERATOR_SESSION_CONTRACT
     if resident_stage_sessions:
         rf.stage_main_session_contract = STAGE_MAIN_SESSION_CONTRACT
+        rf.bundle_task_session_contract = BUNDLE_TASK_SESSION_CONTRACT
     if repository_materializer is not None:
         repository_materializer.bind_adapter_generator(
             AdapterGenerationService(
@@ -2344,12 +2362,12 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
                              wildidea_adapter=wildidea_adapter,
                              require_wildidea_provider_binding=(
                                  wildidea_adapter is not None and runner_factory is None),
-                             # One cycle-scoped engineering thread now spans
-                             # bundle/smoke/train/eval in every deployment for
-                             # the active runtime tool profile. Qualification
-                             # remains inline-only and rechecks its research-open
-                             # seal on every turn; injected runners require the
-                             # exact contract above.
+                             # Each target has one fixed resident engineering
+                             # task spanning bundle/smoke/train/eval; the
+                             # cycle-scoped Scheduler is graph-only.
+                             # Qualification remains inline-only and rechecks
+                             # its research-open seal on every turn; injected
+                             # runners require the exact contract above.
                              # Manifest execution, guardian supervision, gates
                              # and single-writer SQL ownership are unchanged.
                              bundle_operator_mode=bundle_operator_mode,
@@ -2385,12 +2403,21 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         # the same object; constructing an unfenced second publisher would split
         # the publication/registration capability across owner lifetimes.
         pool_publisher = PoolPublisher(work, owner_guard=owner_guard)
+        # The normal runtime proves reviews through the resident stage owner's
+        # native child ledger/MCP receipts.  A qualification or injected
+        # non-MCP runner cannot emit that proof, so it must use the existing
+        # independent JudgeProvider gates instead of silently running without
+        # either review mechanism.
+        native_stage_reviews = (
+            runtime_ingest_service is not None
+            and resident_stage_sessions)
         pool_gate = PoolGate(
             daemon, pool_conn,
             pool_publisher=pool_publisher,
             require_formal_publication=True,
-            require_code_review=False,
-            require_result_review=False)
+            require_scientific_contract=True,
+            require_code_review=not native_stage_reviews,
+            require_result_review=not native_stage_reviews)
         close_gate = SqliteGate(daemon, close_conn, schemas,
                                 parser_suspect=lambda aid: OP.suspect_for_attempt(
                                     obs_conn, aid, policy["observation"]))
@@ -2421,10 +2448,17 @@ def _assemble_system(*, root: Path, work: Path, policy: Dict[str, Any],
         attack_providers = {
             "idea": provider.idea,
             "plan": provider.plan,
+            # New cycles use one graph Scheduler task and one durable task per
+            # target.  The legacy cycle-wide provider remains available only
+            # to drain an already-running pre-DAG session.
             "bundle": provider.bundle,
+            "bundle_scheduler": provider.bundle_scheduler,
+            "bundle_worker": provider.bundle_worker,
             "reasoning": provider.reasoning,
             "import_search": import_control,
         }
+        if not native_stage_reviews:
+            attack_providers["judge"] = judge
         attack_stages = AttackStages(
             state=state, compiler=compiler, pool_gate=pool_gate, close_gate=close_gate,
             providers=attack_providers,
@@ -2545,6 +2579,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--no-outbound", action="store_true",
         help="显式禁用外部投递（仅离线/测试；通知仍在本地 outbox，不得视为生产交付）")
     args = ap.parse_args(argv)
+    # Standalone quests share mutable process state with sibling quests.  A
+    # Web child instead inherits and reuses the console registry-root marker.
+    work_root = Path(os.path.abspath(os.fspath(args.work_root)))
+    try:
+        configure_process_storage(
+            work_root.parent, require_external_mount=True,
+            private_work_root=work_root)
+    except (OSError, ValueError) as error:
+        print(f"[run] 存储绑定失败：{error}", file=sys.stderr)
+        return 2
     outbound_config = None
     if args.no_outbound:
         print("[run] 警告：外部 connector 已显式禁用；本地 outbox 不代表通知已交付", file=sys.stderr)

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -71,7 +72,72 @@ GATE_INPUT_VIEW_NAMES = ("gate_input_cycle", "gate_input_goal_current", "gate_in
                          "gate_input_child_answer", "gate_input_applicability", "gate_input_decision_human")
 
 
-def open_gate_read_conn(path: str) -> sqlite3.Connection:
+class _SerializedReadCursor:
+    """Keep every sqlite cursor operation outside concurrent Worker calls."""
+
+    def __init__(self, cursor, lock: threading.RLock):
+        self._cursor = cursor
+        self._lock = lock
+
+    def __getattr__(self, name):
+        attr = getattr(self._cursor, name)
+        if not callable(attr):
+            with self._lock:
+                return getattr(self._cursor, name)
+
+        def guarded(*args, **kwargs):
+            with self._lock:
+                result = attr(*args, **kwargs)
+                return self if result is self._cursor else result
+        return guarded
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            return next(self._cursor)
+
+
+class _SerializedReadConnection:
+    """Thread-safe facade for one physically read-only gate connection.
+
+    A ready frontier may run several target gates concurrently.  Python's
+    ``check_same_thread=False`` only permits thread hand-off; it does not make
+    simultaneous C calls on one connection safe.  The facade preserves the
+    single authorizer-bearing connection while serializing connection and
+    cursor calls with one re-entrant lock.
+    """
+
+    def __init__(self, conn):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_lock", threading.RLock())
+
+    def __getattr__(self, name):
+        attr = getattr(self._conn, name)
+        if not callable(attr):
+            with self._lock:
+                return getattr(self._conn, name)
+
+        def guarded(*args, **kwargs):
+            with self._lock:
+                result = attr(*args, **kwargs)
+                if result is self._conn:
+                    return self
+                if callable(getattr(result, "fetchone", None)):
+                    return _SerializedReadCursor(result, self._lock)
+                return result
+        return guarded
+
+    def __setattr__(self, name, value):
+        if name in {"_conn", "_lock"}:
+            object.__setattr__(self, name, value)
+            return
+        with self._lock:
+            setattr(self._conn, name, value)
+
+
+def open_gate_read_conn(path: str) -> _SerializedReadConnection:
     """开一条门禁**受限只读连接**：`mode=ro` URI 打开（主库物理只读、不可翻回可写，护单写路径 P1，
     比 PRAGMA query_only 强）→ 建 gate_input_* TEMP 视图（temp schema 可写、不受 mode=ro 限）→ 装
     authorizer 拒 9 禁表 SELECT。
@@ -88,7 +154,7 @@ def open_gate_read_conn(path: str) -> sqlite3.Connection:
         f"file:{quote(path)}?mode=ro", uri=True, check_same_thread=False)
     conn.executescript(GATE_INPUT_VIEWS)
     conn.set_authorizer(gate_authorizer)
-    return conn
+    return _SerializedReadConnection(conn)
 
 
 def _num(s: Any, prefix: str) -> Optional[int]:

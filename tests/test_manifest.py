@@ -1183,6 +1183,56 @@ def test_run_manifest_command_end_to_end(tmp_path):
     assert "metric_value: 1@1=0.93" in Path(ev["log_path"]).read_text(encoding="utf-8")
 
 
+def test_run_manifest_command_forwards_output_observer(tmp_path):
+    manifest = _manifest(_slice())
+    manifest["commands"]["train"]["argv"] = [
+        sys.executable, "-c",
+        "import os; os.write(1,b'manifest-tail')",
+    ]
+    src = tmp_path / "src"
+    ledger = MF.stage_bundle_files(
+        {"identity.md": "# toy", "train.py": "", "eval.py": ""},
+        manifest, src)
+    observed = []
+
+    result = MF.run_manifest_command(
+        manifest, "train", staging_dir=str(tmp_path / "run"),
+        log_name="train.log", src_dir=src, work_root=tmp_path,
+        policy=POLICY, expected_source_hashes=ledger,
+        output_observer=observed.append,
+    )
+
+    assert b"".join(observed) == b"manifest-tail"
+    assert Path(result["log_path"]).read_bytes() == b"manifest-tail"
+
+
+def test_run_manifest_command_forwards_stream_output_observer(tmp_path):
+    manifest = _manifest(_slice())
+    manifest["commands"]["train"]["argv"] = [
+        sys.executable, "-c",
+        "import os; os.write(1,b'normal'); os.write(2,b'warning')",
+    ]
+    src = tmp_path / "src"
+    ledger = MF.stage_bundle_files(
+        {"identity.md": "# toy", "train.py": "", "eval.py": ""},
+        manifest, src)
+    observed = []
+
+    result = MF.run_manifest_command(
+        manifest, "train", staging_dir=str(tmp_path / "run"),
+        log_name="train.log", src_dir=src, work_root=tmp_path,
+        policy=POLICY, expected_source_hashes=ledger,
+        stream_output_observer=lambda stream, chunk, frame_end: (
+            observed.append((stream, chunk, frame_end))),
+    )
+
+    assert [(stream, chunk) for stream, chunk, _end in observed] == [
+        ("stdout", b"normal"),
+        ("stderr", b"warning"),
+    ]
+    assert Path(result["log_path"]).read_bytes() == b"normalwarning"
+
+
 def test_run_manifest_command_with_multiple_named_checkpoints(tmp_path):
     manifest = _manifest(_slice())
     manifest["commands"]["eval"]["argv"] = [

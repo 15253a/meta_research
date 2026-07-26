@@ -12,6 +12,7 @@ provenance 五件套 join = test_import_worker.test_materialize_full_chain——
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -106,6 +107,40 @@ def test_case3_reuse_hit_zero_retrain(tmp_path):
     d.conn.close()
 
 
+def test_valid_refuted_result_enters_pool_and_remains_reusable(tmp_path):
+    path = str(tmp_path / "refuted.sqlite")
+    daemon, state, compiler, attack = TA._mk_env(
+        path, tmp_path / "w-refuted",
+        eval_body=(
+            "import sys,pathlib; "
+            "assert pathlib.Path(sys.argv[1]).read_text() == 'weights-v1'; "
+            "print('loss: 0.2'); print('metric_value: 1@1=0.80')"))
+    TA._bootstrap_attack(state)
+    SqliteAdvancer(
+        state, compiler, lambda c, p: None,
+        attack=attack).run_cycles(max_cycles=4)
+
+    scientific = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision "
+        "WHERE type='bundle_scientific_contract'")[0])
+    assert scientific["validity_status"] == "valid"
+    assert scientific["scientific_outcome"] == "refuted"
+    assert scientific["pool_eligibility"] == "eligible"
+    assert daemon.query_one("SELECT status FROM baseline")[0] == "legal"
+    variant_id, env_hash = daemon.query_one(
+        "SELECT e.variant_id,ea.env_hash FROM evaluation e "
+        "JOIN evaluation_attempt ea ON ea.id=e.canonical_attempt_id")
+    OP.register_parser_suspect_real(
+        daemon.conn, daemon.conn, OBS)
+    selected = R.reuse_selector(
+        daemon.conn, variant_id=variant_id,
+        protocol_id=1, protocol_ver=1,
+        env_hash=env_hash, required=[(1, 1)])
+    assert selected["hit"] is True
+    assert selected["results"][0]["value"] == 0.80
+    daemon.conn.close()
+
+
 # ============ 判例④：训练失败入账不入树 ============
 def test_case4_failure_accounted_not_in_tree(tmp_path):
     path = str(tmp_path / "research.sqlite")
@@ -150,7 +185,10 @@ def test_case5_suspect_not_evidence(tmp_path):
     """)
     conn.commit()
     OP.register_parser_suspect_real(conn, conn, OBS)
-    kw = dict(variant_id=2, protocol_id=1, protocol_ver=1, env_hash="eh1", required=[(1, 1)])
+    kw = dict(
+        variant_id=2, protocol_id=1, protocol_ver=1,
+        env_hash="eh1", required=[(1, 1)],
+        require_scientific_contract=False)
     assert R.reuse_selector(conn, **kw)["hit"] is True               # 前置：无观测 → 可复用
     nan_log = b"loss: 1.0\nloss: nan\n"
     import hashlib

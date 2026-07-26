@@ -3,9 +3,9 @@
 **为什么要它**：M0 driver（driver.py）用真 Codex 但跑在**桩栈**（StubGate/StubStateStore/StubCompiler +
 造假 bundle）——那是 M0 验收栈。M3+ 的真组件（SqliteAdvancer/AttackStages）消费**注入式** provider
 回调（生产=真 Codex 会话、测试=确定性替身）。生产研究路径中，每个 cycle 的 Idea、Plan、Reasoning
-各有一个逻辑常驻主 Codex thread；Bundle 由一个 cycle-wide 主 thread 在一个连续 turn/process 中严格
-串行全部 target 的产包、smoke/train/eval、日志观察和工程修复。耐久 provider id 只用于进程灾难后找回原 thread，
-不是正常事件间轮询或新建替代上下文的机制。
+各有一个逻辑常驻主 Codex thread；Bundle 则由一个图级 Scheduler task 与每 target 一个固定 Worker
+task 协作，ready target 可并发产包、smoke/train/eval、观察日志和工程修复。耐久 provider id 只用于
+进程灾难后找回原 task，不是新建替代上下文的机制。
 
 **provider 契约**（attack_stages 模块注释 / advancer reasoning_provider）：
 - StageProvider（产文件四阶段）：
@@ -16,8 +16,9 @@
     bundle_execute/bundle_status/bundle_replan 执行、观察、修复或收口；旧
     bundle_operator(cyc, pack, control) 仅保留给显式隔离资格测试
   - reasoning(cyc, pack) → {"selection.json": …, "tree_ops.json"?: …, "answer.json"?: …}
-- 正常研究路径的 reviewer 由阶段主智能体在当前 turn 内启动干净子智能体，主智能体等待意见、修订并
-  继续提交；PlanReviewProvider/JudgeProvider 仅保留给隔离资格测试和兼容装配。
+- 正常研究路径的 Plan/Bundle 与 bypass Idea reviewer 由阶段主智能体在当前 turn 内启动干净
+  子智能体；WildIdea generation/audit 是 Idea-stage 内部 capability，主智能体吸收其机械 merge。
+  PlanReviewProvider/JudgeProvider 仅保留给隔离资格测试和兼容装配。
 
 **阶段提交**：正常研究路径通过 runtime MCP 的 ``submit_stage_artifact`` 在主 turn 内完成文件闭包、
 schema、cycle/target 身份与 Bundle 冻结计划校验。错误直接返回给同一主智能体修正；成功后大产物留在
@@ -48,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .cost_ledger import BudgetExhausted, CostAccountingFailed
+from .bundle_tasks import BundleTaskRegistry
 from .harness import latest_smoke_log as _latest_smoke_log
 from .ids import cnum as _cnum
 from .interfaces import BundleReplanRequired, ContextPack, StageBlockedOnResources
@@ -76,6 +78,14 @@ BUNDLE_OPERATOR_SESSION_CONTRACT = (
 STAGE_MAIN_SESSION_CONTRACT = (
     "stage-main-persistent-session-v1:"
     "one-cycle-one-stage-one-provider-thread:durable-provider-id")
+
+# Bundle is no longer one cycle-wide target author.  The graph Scheduler and
+# every target Worker are separate durable provider tasks with disjoint runtime
+# capabilities.  This declaration is checked on the injected factory and each
+# produced runner before any provider session is created or resumed.
+BUNDLE_TASK_SESSION_CONTRACT = (
+    "bundle-task-persistent-session-v1:"
+    "one-cycle-one-scheduler:one-target-one-worker:durable-provider-id")
 
 
 class _RunnerCallHeartbeat:
@@ -157,6 +167,8 @@ _IDEA_AUDIT_FILES = {
     "required": ["idea_audit.json"], "optional": [], "exact": True}
 _BUNDLE_OPERATOR_FILES = {
     "required": ["bundle_operator_action.json"], "optional": [], "exact": True}
+_BUNDLE_SCHEDULER_FILES = {
+    "required": [], "optional": [], "exact": True}
 # skill 调用点说明（让工人聚焦本阶段；仿 driver._SKILL_SECTION）
 _CALL_NOTE = {
     "idea": "执行【生成任务】+【判官任务】，产 idea_set.json（候选全集 + selected_id）",
@@ -231,8 +243,8 @@ class StageProvider:
         self.bundle_operator_mode = bundle_operator_mode
         self.bundle_operator_guard = bundle_operator_guard or (lambda: None)
         # The adapter path remains for explicit compatibility/qualification
-        # assembly. Normal research uses the resident Idea main-agent branch
-        # above, with a clean child reviewer inside that main turn.
+        # assembly. Normal research uses the resident Idea main-agent branch:
+        # WildIdea owns its internal blind audit; bypass owns native review.
         self.wildidea_adapter = wildidea_adapter
         self.idea_audit_pack_builder = idea_audit_pack_builder
         self.require_wildidea_provider_binding = require_wildidea_provider_binding
@@ -244,6 +256,13 @@ class StageProvider:
                 != (self.idea_audit_pack_builder is None)):
             raise ValueError(
                 "WildIdea adapter 与 question-only idea audit pack builder 必须成对注入")
+        self._resident_idea_lock = threading.RLock()
+        self._resident_idea_contexts: Dict[
+            tuple[str, str], Dict[str, Any]] = {}
+        if (self.wildidea_adapter is not None
+                and self.resident_stage_sessions
+                and self.inline_subagent_review):
+            self.wildidea_adapter.bind_resident_controller(self)
         self.cost_ledger = cost_ledger         # None 仅允许 session_max=null 的显式诊断/测试装配
         self._cost_required = policy.get("budget", {}).get("session_max") is not None
         if self._cost_required and self.cost_ledger is None:
@@ -254,17 +273,34 @@ class StageProvider:
     # -- provider 回调（绑定阶段）------------------------------------------------
     def idea(self, cyc, pack) -> Dict[str, Any]:
         if self.inline_subagent_review:
-            # One live main Codex owns the whole Idea stage.  Its reviewer is a
-            # clean child context inside the same turn, so feedback can be
-            # applied without a second top-level session or adapter handoff.
-            return self._produce(
-                cyc, pack, stage="idea",
-                purpose_tag=(
-                    f"idea-main-c{_cnum(cyc.cycle_id)}"
-                    if self.resident_stage_sessions else None),
-                skill=self._main_stage_review_skill(
-                    "idea", self.skills["idea"], "idea",
-                    self.review_rounds["idea"]))
+            # One live main Codex owns the whole Idea stage.  WildIdea's
+            # generation/audit workers stay behind its MCP capability; only a
+            # server-bound bypass route uses native child review.
+            active_key = (str(cyc.cycle_id), str(pack.pack_hash))
+            if self.wildidea_adapter is not None and self.resident_stage_sessions:
+                with self._resident_idea_lock:
+                    if active_key in self._resident_idea_contexts:
+                        raise RuntimeError(
+                            "resident Idea ContextPack 已有活动主会话")
+                    self._resident_idea_contexts[active_key] = {
+                        "cyc": cyc, "pack": pack,
+                        "generation_path": None,
+                        "generation_pack": None,
+                    }
+            try:
+                return self._produce(
+                    cyc, pack, stage="idea",
+                    purpose_tag=(
+                        f"idea-main-c{_cnum(cyc.cycle_id)}"
+                        if self.resident_stage_sessions else None),
+                    skill=self._main_stage_review_skill(
+                        "idea", self.skills["idea"], "idea",
+                        self.review_rounds["idea"]))
+            finally:
+                if (self.wildidea_adapter is not None
+                        and self.resident_stage_sessions):
+                    with self._resident_idea_lock:
+                        self._resident_idea_contexts.pop(active_key, None)
         if self.wildidea_adapter is None:
             return self._produce(cyc, pack, stage="idea")
 
@@ -351,6 +387,183 @@ class StageProvider:
                 provenance={"derived_by": "wildidea_adapter.merge"})
         return {"idea_set.json": merged}
 
+    def _resident_idea_context(self, scope) -> Dict[str, Any]:  # noqa: ANN001
+        """Return the exact active resident Idea pack for one MCP capability."""
+        if (getattr(scope, "stage", None) != "idea"
+                or getattr(scope, "target_id", None) is not None):
+            raise RuntimeError("resident WildIdea scope 必须属于 Idea 主阶段")
+        key = (
+            str(getattr(scope, "cycle_id", "")),
+            str(getattr(scope, "pack_hash", "")),
+        )
+        with self._resident_idea_lock:
+            context = self._resident_idea_contexts.get(key)
+        if context is None:
+            raise RuntimeError(
+                "resident WildIdea scope 未绑定当前 Idea ContextPack")
+        return context
+
+    def prepare_resident_wildidea(
+            self, scope, *, need_innovation: bool) -> Dict[str, Any]:
+        """Run the chosen WildIdea generation behind the resident capability."""
+        if self.wildidea_adapter is None:
+            raise RuntimeError("resident WildIdea adapter 未装配")
+        context = self._resident_idea_context(scope)
+        expected_path = "wildidea" if need_innovation else "bypass"
+        with self._resident_idea_lock:
+            prior = context["generation_path"]
+            if prior is not None and prior != expected_path:
+                raise RuntimeError("resident WildIdea generation_path 不得重绑定")
+            if prior is not None:
+                return json.loads(json.dumps(
+                    context["expand_result"], ensure_ascii=False))
+
+        generation_pack = None
+        draft = None
+        if need_innovation:
+            generation_pack, generation_skill = (
+                self.wildidea_adapter.prepare_generation(
+                    context["pack"], self.skills["idea"]))
+            generation_skill += (
+                "\n\n===== Resident WildIdea route binding =====\n"
+                "当前服务端已冻结 need_innovation=true、"
+                "generation_path=wildidea。你是 capability 内部 generator，"
+                "不得重新判 NEED，不得调用 wildidea_expand、wildidea_audit、"
+                "prepare_review 或 submit_stage_artifact；只按上方 adapter ABI "
+                "产出 exact idea_set.draft.json。")
+
+            def validate_draft(files: Dict[str, Any]) -> Optional[str]:
+                errors = self.wildidea_adapter.validate_draft(
+                    files["idea_set.draft.json"])
+                return (
+                    "idea_set.draft.json adapter 闭包校验失败:\n"
+                    + "\n".join(errors) if errors else None)
+
+            def bind_generation_invocation(
+                    artifact, runner_call_id) -> None:  # noqa: ANN001
+                if (artifact.prompt_sha256 is None
+                        and artifact.provider_receipt_ref is None):
+                    return
+                self.wildidea_adapter.bind_accepted_invocation(
+                    generation_pack, role="generation",
+                    runner_call_id=runner_call_id,
+                    prompt_sha256=artifact.prompt_sha256,
+                    provider_receipt_ref=artifact.provider_receipt_ref,
+                    execution_receipt_ref=artifact.execution_receipt_ref)
+
+            draft_files = self._produce(
+                context["cyc"], generation_pack, stage="idea", phase="idea",
+                purpose_tag="idea-generate-internal",
+                spec=_IDEA_GENERATION_FILES,
+                skill=generation_skill, append_call_note=False,
+                post_validate=validate_draft,
+                on_accept=bind_generation_invocation,
+                allow_resource_request=False,
+                internal_stage_capability=True)
+            draft = json.loads(json.dumps(
+                draft_files["idea_set.draft.json"], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"), allow_nan=False))
+        result = self.wildidea_adapter.expand_for_tool(
+            pack_hash=context["pack"].pack_hash,
+            need_innovation=need_innovation)
+        result = {**result, "generation_path": expected_path}
+        if draft is not None:
+            result["draft"] = draft
+        with self._resident_idea_lock:
+            if context["generation_path"] not in {None, expected_path}:
+                raise RuntimeError("resident WildIdea generation_path 并发漂移")
+            context["generation_path"] = expected_path
+            context["generation_pack"] = generation_pack
+            context["generation_draft"] = draft
+            context["expand_result"] = json.loads(json.dumps(
+                result, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False))
+        return result
+
+    def audit_resident_wildidea(
+            self, scope, *, draft: Dict[str, Any]) -> Dict[str, Any]:
+        """Run WildIdea's blind audit internally and return its exact merge."""
+        if self.wildidea_adapter is None:
+            raise RuntimeError("resident WildIdea adapter 未装配")
+        context = self._resident_idea_context(scope)
+        with self._resident_idea_lock:
+            if context["generation_path"] != "wildidea":
+                raise RuntimeError(
+                    "wildidea_audit 只属于服务端绑定的 WildIdea 路径")
+            if context.get("audit_complete"):
+                raise RuntimeError("resident WildIdea internal audit 已完成")
+            generation_pack = context["generation_pack"]
+            generation_draft = context.get("generation_draft")
+        if generation_pack is None:
+            raise RuntimeError("resident WildIdea 缺 generation preparation")
+        if generation_draft is None:
+            raise RuntimeError("resident WildIdea 缺服务端 generation draft")
+        try:
+            supplied_draft_json = json.dumps(
+                draft, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False)
+            generation_draft_json = json.dumps(
+                generation_draft, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "wildidea_audit draft 不是有限 JSON") from error
+        if supplied_draft_json != generation_draft_json:
+            raise RuntimeError(
+                "wildidea_audit 只接受服务端生成的 exact draft")
+        authoritative_draft = json.loads(generation_draft_json)
+
+        audit_source_pack = self.idea_audit_pack_builder(
+            context["cyc"].cycle_id)
+        audit_pack, audit_skill = self.wildidea_adapter.prepare_audit(
+            audit_source_pack, authoritative_draft, self.skills["idea"],
+            generation_pack=generation_pack)
+
+        def validate_audit(files: Dict[str, Any]) -> Optional[str]:
+            errors = self.wildidea_adapter.validate_audit(
+                authoritative_draft, files["idea_audit.json"])
+            return ("idea_audit.json 候选闭包校验失败:\n" + "\n".join(errors)
+                    if errors else None)
+
+        def bind_judge_invocation(artifact, runner_call_id) -> None:  # noqa: ANN001
+            if (artifact.prompt_sha256 is None
+                    and artifact.provider_receipt_ref is None):
+                return
+            self.wildidea_adapter.bind_accepted_invocation(
+                generation_pack, role="judge",
+                runner_call_id=runner_call_id,
+                prompt_sha256=artifact.prompt_sha256,
+                provider_receipt_ref=artifact.provider_receipt_ref,
+                execution_receipt_ref=artifact.execution_receipt_ref)
+
+        audit_files = self._produce(
+            context["cyc"], audit_pack, stage="idea", phase="audit",
+            purpose_tag="idea-audit-internal", spec=_IDEA_AUDIT_FILES,
+            skill=audit_skill, append_call_note=False,
+            post_validate=validate_audit,
+            on_accept=bind_judge_invocation,
+            allow_resource_request=False,
+            internal_stage_capability=True)
+        merged = self.wildidea_adapter.merge(
+            authoritative_draft, audit_files["idea_audit.json"],
+            generation_pack=generation_pack,
+            base_skill=self.skills["idea"],
+            require_invocation_binding=self.require_wildidea_provider_binding)
+        final_errors = self._schema_errors("idea_set.json", merged)
+        if final_errors:
+            raise RunnerError(
+                "resident WildIdea merge 后 idea_set.json 非法:\n"
+                + "\n".join(final_errors[:8]),
+                failure_kind="adapter_contract")
+        internal_provenance = merged.pop("provenance", {})
+        result = {
+            "idea_set": merged,
+            "internal_provenance": internal_provenance,
+        }
+        with self._resident_idea_lock:
+            context["audit_complete"] = True
+        return json.loads(json.dumps(result, ensure_ascii=False))
+
     def plan(self, cyc, pack) -> Dict[str, Any]:
         return self._produce(
             cyc, pack, stage="plan",
@@ -373,6 +586,81 @@ class StageProvider:
             skill=self._main_stage_review_skill(
                 "bundle", self.skills["bundle"], "bundle_code",
                 self.review_rounds["bundle_code"]))
+
+    def bundle_scheduler(self, cyc, pack) -> Dict[str, Any]:
+        """Run the one graph-level Scheduler task for this cycle.
+
+        Scheduler state is authoritative in SQL/controller projections.  The
+        model task only calls the bounded overview/dispatch/wait/drain tools
+        and therefore returns no target artifact.
+        """
+        if pack.target_id is not None:
+            raise ValueError("Bundle Scheduler ContextPack 不得绑定 target")
+        if not self.resident_stage_sessions:
+            raise RuntimeError("Bundle Scheduler 必须使用耐久 resident task")
+        cycle_id = f"c{_cnum(cyc.cycle_id)}"
+        registry = self._bundle_task_registry()
+        registry.reconcile_terminal_workers(cycle_id)
+        try:
+            return self._produce(
+                cyc, pack, stage="bundle",
+                purpose_tag=f"bundle-scheduler-c{_cnum(cyc.cycle_id)}",
+                spec=_BUNDLE_SCHEDULER_FILES,
+                skill=self.skills.get(
+                    "bundle_scheduler", self.skills["bundle"]),
+                call_note=(
+                    "只调度 ready frontier 并等待/排空 Worker；"
+                    "不得编写、提交或执行 target 代码"),
+                allow_resource_request=False,
+                bundle_task_role="bundle_scheduler")
+        finally:
+            # A Worker can commit its target and then lose the host process
+            # before sealing the task ledger.  Scheduler boundaries are the
+            # production recovery seam because they already bracket graph
+            # dispatch/drain and carry no injected target artifact authority.
+            registry.reconcile_terminal_workers(cycle_id)
+
+    def bundle_worker(self, cyc, pack) -> Dict[str, Any]:
+        """Run or recover the stable resident Worker for one build target."""
+        try:
+            target_id = int(pack.target_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Bundle Target Worker ContextPack 缺合法 target") from error
+        if target_id <= 0:
+            raise ValueError("Bundle Target Worker target 须为正整数")
+        if not self.resident_stage_sessions:
+            raise RuntimeError("Bundle Target Worker 必须使用耐久 resident task")
+        cycle_id = f"c{_cnum(cyc.cycle_id)}"
+        registry = self._bundle_task_registry()
+        task = registry.prepare_worker(cycle_id, target_id=target_id)
+        worker_task = (
+            registry, cycle_id, target_id, task.provider_task_id)
+        try:
+            result = self._produce(
+                cyc, pack, stage="bundle",
+                purpose_tag=(
+                    f"bundle-worker-c{_cnum(cyc.cycle_id)}-t{target_id}"),
+                skill=self._main_stage_review_skill(
+                    "bundle", self.skills["bundle"], "bundle_code",
+                    self.review_rounds["bundle_code"]),
+                bundle_task_role="target_worker",
+                bundle_worker_task=worker_task)
+        except BundleReplanRequired:
+            # A trusted, accepted replan sidecar is a terminal Worker result,
+            # even though the provider API carries it as a control exception.
+            registry.mark_worker_completed(cycle_id, target_id=target_id)
+            raise
+        except BaseException:
+            registry.mark_worker_interrupted(cycle_id, target_id=target_id)
+            raise
+        try:
+            registry.mark_worker_completed(
+                cycle_id, target_id=target_id)
+        except BaseException:
+            registry.mark_worker_interrupted(cycle_id, target_id=target_id)
+            raise
+        return result
 
     def bundle_operator(self, cyc, pack, control: Dict[str, Any]) -> Dict[str, Any]:
         """Run one event turn in the cycle-scoped Bundle Codex session.
@@ -494,19 +782,30 @@ class StageProvider:
         no longer performs a second reviewer call or interprets/re-writes the
         review.  Core artifact schemas and question/baseline gates remain.
         """
-        if not self.inline_subagent_review or rounds <= 0:
+        if not self.inline_subagent_review:
+            return skill
+        if stage == "idea":
+            return skill + (
+                "\n\n===== Idea 路径分流（服务端绑定）=====\n"
+                "先调用 wildidea_expand；其返回的 generation_path 是本 turn "
+                "唯一权威分流，之后不得改写。"
+                "generation_path=wildidea 时，wildidea_expand 已在 Idea-stage "
+                "capability 内执行 generation；只把它返回的服务端内部生成的 exact draft "
+                "原样交给 wildidea_audit，不得自行生成、修订或替换 draft。该工具继续运行 "
+                "WildIdea 自己的盲审并机械 merge。主智能体只吸收并原样提交工具返回的 "
+                "idea_set，不得启动 native child，也不得自行改写 audit 结果。"
+                "generation_path=bypass 时，不调用 wildidea_audit；主智能体对现成"
+                f"方案完成精确 {rounds} 轮 native child review。每轮仍严格使用 "
+                "prepare_review → fork_turns=\"none\" 的子智能体读取 "
+                "read_review_input → 主智能体 dispositions/修订 → record_review；"
+                "第 N 轮修订后直接提交，不增加复审。"
+                "两条路径最终都调用 submit_stage_artifact；提交门只接受与服务端"
+                "路径回执及对应内部 audit/native review 证据一致的最终 hash。\n"
+            )
+        if rounds <= 0:
             return skill
         stage_specific = ""
-        if stage == "idea":
-            stage_specific = (
-                "本运行模式覆盖本文档中旧的‘生成 Runner + audit Runner + adapter merge’调用说明："
-                "本次主智能体直接生成最终 idea_set.json。先形成候选草稿，再把问题、候选草稿、"
-                "评分阈值与必要文献依据交给独立 reviewer；reviewer 返回六维 audit_scores、selected_id"
-                "和问题清单。主智能体吸收实质意见后形成最终 candidates/audit_scores/selected_id。"
-                "live Web 搜索可用于判断近邻，但不是可回放快照，因此没有受控内容哈希时必须令 "
-                "novelty_refs=[]，novelty_status=联网查重未启用·文献级待验证，绝不伪造 provenance。"
-            )
-        elif stage == "plan":
+        if stage == "plan":
             stage_specific = (
                 "先完成 plan 草稿，再让 reviewer 只检查 selected idea、该草稿与固定研究/资源约束；"
                 "reviewer 不读取主智能体推理，不编辑文件。主智能体收到意见后立即修订同一份计划，"
@@ -518,32 +817,59 @@ class StageProvider:
             )
         elif review_kind == "bundle_code":
             stage_specific = (
-                "Bundle 的 reviewer 必须恰好是同一个干净子智能体：创建后保留它的可定址会话，"
-                "不得在结果阶段再启动第二个子智能体。提交实现包前，让它独立检查冻结 plan 对齐、"
+                "你是只绑定锚区“本目标”的 Target Worker；整个 task 只能实现、执行、修复并准入"
+                "自己的 target，不得调用 Scheduler 工具、不得选择、切换或推进其他 target。"
+                "进入本 task 或中断恢复后，第一次 status 动作必须在实现/执行前且只调用一次 "
+                "bundle_status(mode=\"snapshot\", limit=200)，并保存返回 cursor。"
+                "Bundle 以每个 target 为独立评审作用域。提交实现包前，让"
+                "本次新建的干净 reviewer "
+                "独立检查冻结 plan 对齐、"
                 "代码/manifest、依赖、GPU 使用、smoke 可启动性与输出协议；修复后用 "
-                "record_review(review_kind=bundle_code) 留索引。提交成功后立即在当前 turn 调用 "
-                "bundle_execute 异步启动，并用 bundle_status 轮询部分日志/终态；中间反馈由主智能体"
-                "就地修复。得到 eval terminal 后，只把服务端给出的"
-                "权威退出码、日志、测量和产物回执发给这一个 reviewer 做 bundle_result 审查，然后用 "
-                "record_review(review_kind=bundle_result) 记录。当前 target 终态后调用 bundle_next_target，"
-                "复用这一 reviewer 处理下一 target，直到 cycle_complete=true。"
+                "record_review 留索引。本次代码 reviewer 完成后不复用；实验完成后的结果审查必须另启"
+                "一个新的干净子智能体。提交成功后立即在当前 turn 调用 "
+                "bundle_execute 异步启动；若有 bundle_execute 返回的更新 cursor，采用该更新 cursor，"
+                "不得重复消费已读事件。之后只用 "
+                "bundle_status(mode=\"incremental\", after_seq=<cursor>, limit=200, "
+                "timeout_s=<秒>) 读取新增事实，单次 limit 绝不超过 1000。长实验的有界等待按 "
+                "60→120→300→600→1800 秒递增（观测到进展后可从 60 秒重新开始），不得重复加载"
+                "完整日志。中间反馈由本 Worker 就地修复。得到 eval terminal 后，以权威退出码、"
+                "日志、测量和产物回执准备 "
+                "bundle_result 审查并走同一套 owner 输入协议；结果候选由 owner 在正式入池前从 "
+                "eval/scientific facts 生成，主智能体不得自行拼装或替换。审查完成后，主智能体明确"
+                "选择再次调用 bundle_execute 继续准入，或调用 bundle_repair 重跑，或调用 "
+                "bundle_replan 交 Reasoning。只有自己的 target 已达到耐久终态，且 complete 时已"
+                "完成精确 admission，才允许结束本 Worker turn；不得替 Scheduler 宣告 cycle 完成。"
             )
         elif review_kind == "bundle_result":
             stage_specific = (
-                "只有 terminal 事件执行本审查：让 reviewer 独立检查真实退出码、日志与产物可信度。"
+                "只有 owner 报告 awaiting_result_review=true 时执行本审查：每个 result candidate "
+                "新启干净 reviewer，独立检查真实退出码、日志、测量与产物可信度；此时尚未正式入池，"
+                "target 也尚未 complete。prepare_review 只传 review_kind；record_review 只传 "
+                "review_request_id 与完整 dispositions，均不得传 files/md/workspace_files，"
+                "因为 owner 会绑定不可变的 pre-admission 材料。record_review 后必须显式选择 "
+                "bundle_execute（接受并继续准入）、bundle_repair（工程修复/重跑）或 "
+                "bundle_replan（冻结计划问题交 Reasoning）。"
                 "工程问题必须选择 repair；只有研究计划/协议本身不可执行、继续改代码或环境也无法解决时"
                 "才选择 replan 交 Reasoning。"
             )
         return skill + (
             "\n\n===== 同一主智能体内的独立子智能体评审（当前配置）=====\n"
-            f"主智能体在本 stage turn 内保持在线。完成草稿后，使用 Codex multi-agent 能力依次启动 "
-            f"{rounds} 个独立、干净上下文 reviewer（review_kind={review_kind}）；每个 reviewer 只审查"
-            "你显式传给它的草稿和约束，不共享你的隐藏推理，也不得直接提交最终产物。等待 reviewer 返回，"
-            "逐条判断并在当前主上下文中立即修订；不要再开启顶层 Codex 会话。"
+            f"主智能体在本 stage turn 内保持在线，并完成精确 {rounds} 轮 "
+            f"review_kind={review_kind}。每轮都必须按以下协议执行："
+            "（1）主智能体用当前候选调用 prepare_review；"
+            "（2）只把返回的 review_request_id 及“调用 meta_research_runtime.read_review_input”"
+            "这一指令放入 spawn_agent 的 message，以 fork_turns=\"none\" 新启恰好一个干净子智能体，"
+            "不得手工复制候选或主上下文给它；"
+            "（3）该子智能体必须先以 review_request_id 调用 read_review_input，独立审查其返回的"
+            "权威 brief，并以严格 native-review-result-v1 JSON 作为 final；"
+            "（4）主智能体等待结果，逐条形成 dispositions，在当前主上下文修订候选，再用 "
+            "review_request_id、完整 dispositions 与修订后候选调用 record_review；"
+            "bundle_result 按上述 owner-bound 例外不传候选。"
+            "record_review 会从 live child ledger 读取 reviewer 原文，禁止由主智能体代填 verdict、"
+            "summary 或 findings。每一轮均新启一个干净子智能体；完成一轮修改即计一轮，不追加隐式复审。"
             + stage_specific
-            + "若注入 meta_research_runtime MCP，主智能体在吸收每次 reviewer 结果后调用 "
-              "record_review，原样记录 reviewer 的 pass/fail、摘要和字符串 issues；MCP 返回错误时在"
-              "当前 turn 修正参数并重试。最终信封不得夹带 review sidecar。\n"
+            + "MCP 返回格式、身份或候选错误时，在当前主 turn 按错误修正并重试；"
+              "最终信封不得夹带 review sidecar，也不得为修订再开启顶层 Codex 会话。\n"
         )
 
     # -- 阶段主 turn -----------------------------------------------------------
@@ -556,6 +882,9 @@ class StageProvider:
                  post_validate: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
                  on_accept: Optional[Callable[[Any, Optional[int]], None]] = None,
                  allow_resource_request: bool = True,
+                 internal_stage_capability: bool = False,
+                 bundle_task_role: Optional[str] = None,
+                 bundle_worker_task=None,
                  ) -> Dict[str, Any]:
         """Run one resident Codex turn and validate its accepted artifact.
 
@@ -575,14 +904,39 @@ class StageProvider:
             # byte no-ops in the archive.
             self.replay_archive.persist_context_pack(pack, label=purpose_tag)
         self._call_seq += 1
-        if stage == "bundle" and self.bundle_operator_mode:
+        if bundle_task_role is not None:
+            if (stage != "bundle"
+                    or bundle_task_role not in {
+                        "bundle_scheduler", "target_worker"}):
+                raise ValueError("Bundle task role/stage 组合非法")
+            if ((bundle_task_role == "target_worker")
+                    != (bundle_worker_task is not None)):
+                raise ValueError(
+                    "Bundle Worker task lifecycle 只允许 target_worker")
+        elif stage == "bundle" and self.bundle_operator_mode:
             # Qualification passes assert_research_open here.  Check it before
             # even constructing a Runner, so a published claim/final seal cannot
             # create a fresh provider session or any model-facing side effect.
             self.bundle_operator_guard()
         runner = self.runner_factory(self.work / f"cycles/{cyc.cycle_id}/transcripts",
                                      f"{purpose_tag}-n{self._call_seq}")
-        if stage == "bundle" and self.bundle_operator_mode:
+        if bundle_task_role is not None:
+            if (getattr(runner, "bundle_task_session_contract", None)
+                    != BUNDLE_TASK_SESSION_CONTRACT):
+                raise RuntimeError(
+                    "Bundle task runner 实例持久会话能力未声明或装配后漂移")
+            bind_session = getattr(runner, "bind_persistent_session", None)
+            if not callable(bind_session):
+                raise RuntimeError("Bundle task runner 缺 persistent session capability")
+            session_id = (
+                bundle_worker_task[3]
+                if bundle_task_role == "target_worker"
+                else self._bundle_task_session_id(
+                    cyc, pack, role=bundle_task_role))
+            bind_session(
+                session_id=session_id,
+                role=bundle_task_role)
+        elif stage == "bundle" and self.bundle_operator_mode:
             if (getattr(runner, "bundle_operator_session_contract", None)
                     != BUNDLE_OPERATOR_SESSION_CONTRACT):
                 raise RuntimeError(
@@ -594,7 +948,7 @@ class StageProvider:
                     "bundle operator runner 缺 persistent session capability")
             bind_session(
                 session_id=session_id, role="bundle_operator")
-        elif self.resident_stage_sessions:
+        elif self.resident_stage_sessions and not internal_stage_capability:
             if (getattr(runner, "stage_main_session_contract", None)
                     != STAGE_MAIN_SESSION_CONTRACT):
                 raise RuntimeError(
@@ -609,8 +963,9 @@ class StageProvider:
         if append_call_note:
             base_skill += (
                 f"\n\n===== 调用点 =====\n本次调用：{call_note or _CALL_NOTE[stage]}。")
-        resident_turn = self.resident_stage_sessions or (
-            stage == "bundle" and self.bundle_operator_mode)
+        resident_turn = bundle_task_role is not None or (
+            self.resident_stage_sessions and not internal_stage_capability
+        ) or (stage == "bundle" and self.bundle_operator_mode)
         max_attempts = 1 if resident_turn else self.retries + 1
         last_err = ""
         for attempt in range(max_attempts):
@@ -619,6 +974,20 @@ class StageProvider:
             call = self._begin_cost_call(
                 cyc, accounting_phase, runner, attempt,
                 purpose_tag=purpose_tag)
+            if bundle_worker_task is not None:
+                registry, cycle_id, target_id, _session_id = (
+                    bundle_worker_task)
+                try:
+                    registry.mark_worker_running(
+                        cycle_id, target_id=target_id)
+                except BaseException:
+                    if call is not None:
+                        runner_call_id, heartbeat = call
+                        heartbeat.finish("aborted")
+                        self.cost_ledger.abort_unstarted_call(
+                            runner_call_id=runner_call_id,
+                            failure_kind="worker_task_state_failed")
+                    raise
             try:
                 art = runner.run_task(system_prompt=self.system_prompt, skill=skill, context_pack=pack)
             except RunnerError as e:               # resident: close accounting, recover only above us
@@ -873,16 +1242,26 @@ class StageProvider:
             failure_kind="artifact_parse")
 
     def _normalize_plan_target_gpu_mode(self, plan: Dict[str, Any]) -> None:
-        """Apply the user's fixed compute choice without another model retry."""
-        if self.gpu_target_policy not in {"required", "forbidden"}:
-            return
+        """Project abstract GPU counts into the legacy boolean compatibility field."""
         targets = plan.get("targets")
         if not isinstance(targets, list):
             return
-        expected = self.gpu_target_policy == "required"
         for target in targets:
-            if isinstance(target, dict):
-                target["gpu_required"] = expected
+            if not isinstance(target, dict):
+                continue
+            resources = target.get("resources")
+            gpu_count = (
+                resources.get("gpu_count")
+                if isinstance(resources, dict) else None)
+            if (isinstance(gpu_count, int)
+                    and not isinstance(gpu_count, bool)
+                    and 0 <= gpu_count <= 64):
+                target["gpu_required"] = gpu_count > 0
+            elif ("resources" not in target
+                    and self.gpu_target_policy in {
+                        "required", "forbidden"}):
+                target["gpu_required"] = (
+                    self.gpu_target_policy == "required")
 
     def _bundle_operator_session_id(self, cyc, pack) -> Optional[str]:
         """Recover one cycle-scoped Bundle Codex thread from call receipts.
@@ -923,6 +1302,34 @@ class StageProvider:
             cyc, phase=stage, purpose_glob=purpose_glob,
             label=f"{stage} main {cyc.cycle_id}")
 
+    def _bundle_task_session_id(
+            self, cyc, pack, *, role: str) -> Optional[str]:
+        """Recover the exact Scheduler/Worker provider task from receipts."""
+        registry = self._bundle_task_registry()
+        cycle_id = f"c{_cnum(cyc.cycle_id)}"
+        if role == "bundle_scheduler":
+            registry_role = "scheduler"
+            target_id = None
+        elif role == "target_worker":
+            registry_role = "target_worker"
+            try:
+                target_id = int(pack.target_id)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Bundle Target Worker ContextPack 缺合法 target") from error
+        else:
+            raise ValueError("Bundle task role 非法")
+        return registry.recover(
+            cycle_id, role=registry_role, target_id=target_id)
+
+    def _bundle_task_registry(self) -> BundleTaskRegistry:
+        """Return the receipt-backed durable task ledger facade."""
+        daemon = getattr(self.cost_ledger, "daemon", None)
+        if daemon is None:
+            raise RuntimeError("Bundle task 缺 runner_call 权威库")
+        return BundleTaskRegistry(
+            daemon, receipt_loader=load_provider_invocation_receipt)
+
     def _recover_persistent_session_id(
             self, cyc, *, phase: str, purpose_glob: str,
             label: str) -> Optional[str]:
@@ -953,6 +1360,7 @@ class StageProvider:
             (_cnum(cyc.cycle_id), phase, purpose_glob))
         session_id: Optional[str] = None
         missing_provider_ids = 0
+        retryable_missing_provider_ids = 0
         seen_runner_calls: set[int] = set()
         for runner_call_id, phase, purpose, provider_ref, execution_ref in rows:
             if runner_call_id in seen_runner_calls:
@@ -966,17 +1374,25 @@ class StageProvider:
                 expected_execution_receipt_ref=execution_ref)
             candidate = invocation.provider_invocation_id
             if candidate is None:
-                # An early crash may have produced an accounted receipt before
-                # the provider exposed its id.  It must block a *fresh* retry,
-                # but must not poison a later, uniquely established session
-                # (for example a subsequent receipt imported by reconciliation).
                 missing_provider_ids += 1
+                # A normal non-zero process exit has a terminal, drained
+                # execution receipt and no accepted stage output.  Retrying it
+                # is safe and necessary for pre-session failures such as
+                # authentication or MCP startup.  Ambiguous timeout, owner
+                # loss, cancellation, or an unknown outcome still blocks a
+                # fresh thread because a provider session may remain live.
+                if (getattr(invocation, "execution_outcome", None) == "exit"
+                        and isinstance(
+                            getattr(invocation, "execution_returncode", None), int)
+                        and invocation.execution_returncode != 0):
+                    retryable_missing_provider_ids += 1
                 continue
             if session_id is not None and candidate != session_id:
                 raise RuntimeError(
                     f"{label} provider session 漂移")
             session_id = candidate
-        if rows and session_id is None:
+        if (rows and session_id is None
+                and retryable_missing_provider_ids != missing_provider_ids):
             raise RuntimeError(
                 f"{label} 历史调用均缺可续接 provider id；拒绝新建会话"
                 f"（receipts={missing_provider_ids}）")

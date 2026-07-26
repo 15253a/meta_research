@@ -954,10 +954,36 @@ def test_local_dataset_and_references_are_web_attached_verified_and_mounted_read
     assert {item["path"] for item in _web_local_source_mounts(quest.work_root)} == {
         str(dataset), str(references)}
 
+    # Replacing an inode with byte-identical content is recoverable: restart
+    # re-hashes only the drifted file against the immutable published digest.
+    replacement = dataset / "replacement.mat"
+    replacement.write_bytes(b"eeg bytes")
+    os.replace(replacement, dataset / "subject-01.mat")
+    resumed = service.start("local-folders", "b" * 32)
+    assert resumed["state"] == "running"
+    assert processes.started == [("local-folders", "b" * 32)]
+
     (dataset / "subject-01.mat").write_bytes(b"changed after publication")
     with pytest.raises(WebQuestNotReadyError, match="发生变化"):
-        service.start("local-folders", "b" * 32)
-    assert processes.started == []
+        service.start("local-folders", "c" * 32)
+    assert processes.started == [("local-folders", "b" * 32)]
+
+
+def test_local_dataset_preflight_accepts_external_hardlink(tmp_path):
+    service, _registry, drafts, _processes = _service(tmp_path)
+    draft = _create_draft(drafts, quest_id="local-hardlink")
+    dataset = tmp_path / "user-data"
+    dataset.mkdir()
+    archive = dataset / "SEED_IV.zip"
+    archive.write_bytes(b"not a real zip")
+    os.link(archive, tmp_path / "archive-cache.zip")
+
+    service.attach_local_source(
+        draft["draft_id"], "dataset", str(dataset), "8" * 32)
+    preflight = service.preflight(draft["draft_id"])
+
+    assert {item["dataset"] for item in preflight["candidates"]} >= {
+        "SEED-IV"}
 
 
 def test_runtime_file_request_upload_publishes_internal_capability_and_replays(

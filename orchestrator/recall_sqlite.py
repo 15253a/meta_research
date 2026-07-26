@@ -12,10 +12,13 @@ evaluation → 零执行引用历史；EXPLAIN QUERY PLAN 证明走该索引、�
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import scientific_contract as SC
 from .interfaces import Hit, RecallSpec, Ref
+from .native_review_verifier import native_review_receipt_valid
 
 
 def register_parser_suspect_stub(conn: sqlite3.Connection) -> None:
@@ -31,6 +34,8 @@ _REUSE_SQL = """
 WITH required(metric_id, metric_ver) AS (VALUES {values}),
 ranked AS (
   SELECT r.metric_id, r.metric_ver, mr.id AS metric_result_id, mr.value,
+         e.id AS evaluation_id, ea.id AS attempt_id,
+         COALESCE(ea.build_target_id, e.build_target_id) AS build_target_id,
          ROW_NUMBER() OVER (PARTITION BY r.metric_id, r.metric_ver
            ORDER BY (ea.id = e.canonical_attempt_id) DESC, ea.attempt_no DESC) AS rk
   FROM required r
@@ -42,7 +47,9 @@ ranked AS (
   LEFT JOIN build_target bt ON bt.id = COALESCE(ea.build_target_id, e.build_target_id)
   WHERE (COALESCE(ea.build_target_id, e.build_target_id) IS NULL OR bt.status = 'complete')
 )
-SELECT metric_id, metric_ver, metric_result_id, value FROM ranked WHERE rk = 1
+SELECT metric_id, metric_ver, metric_result_id, value,
+       evaluation_id, attempt_id, build_target_id
+FROM ranked WHERE rk = 1
 """
 
 
@@ -59,16 +66,186 @@ def _reuse_query(required: List[Tuple[int, int]], variant_id, protocol_id, proto
     return _REUSE_SQL.format(values=values), params
 
 
-def reuse_selector(conn: sqlite3.Connection, *, variant_id: int, protocol_id: int, protocol_ver: int,
-                   env_hash: str, required: List[Tuple[int, int]]) -> Dict[str, Any]:
+def _scientific_attempt_eligible(
+        conn: sqlite3.Connection, *, build_target_id: Optional[int],
+        evaluation_id: int, attempt_id: int) -> bool:
+    """Recompute the one exact Bundle science receipt against durable DB facts."""
+    if build_target_id is None:
+        return False
+    rows = conn.execute(
+        "SELECT payload_json FROM decision "
+        "WHERE actor='orchestrator' "
+        "AND type='bundle_scientific_contract' "
+        "AND json_valid(payload_json) "
+        "AND json_extract(payload_json,'$.build_target_id')=? "
+        "AND json_extract(payload_json,'$.evaluation_id')=? "
+        "AND json_extract(payload_json,'$.evaluation_attempt_id')=? "
+        "ORDER BY id",
+        (build_target_id, evaluation_id, attempt_id)).fetchall()
+    if len(rows) != 1:
+        return False
+    try:
+        payload = SC.validate_scientific_decision_payload(
+            json.loads(rows[0][0]),
+            expected_build_target_id=build_target_id,
+            expected_evaluation_id=evaluation_id,
+            expected_attempt_id=attempt_id)
+        if (payload["validity_status"] != "valid"
+                or payload["pool_eligibility"] != "eligible"):
+            return False
+        target = conn.execute(
+            "SELECT bt.plan_ref,bt.status,v.status,b.status "
+            "FROM build_target bt "
+            "JOIN evaluation e ON e.id=? "
+            "JOIN variant v ON v.id=e.variant_id "
+            "JOIN baseline b ON b.id=v.baseline_id "
+            "WHERE bt.id=?",
+            (evaluation_id, build_target_id)).fetchone()
+        if (target is None or not target[0]
+                or tuple(target[1:]) != ("complete", "legal", "legal")):
+            return False
+        plan_ref = json.loads(target[0])
+        contract = SC.normalize_scientific_contract(
+            plan_ref["scientific_contract"])
+        if SC.canonical_hash(contract) != payload["contract_hash"]:
+            return False
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not _scientific_review_receipt_valid(
+            conn, build_target_id=build_target_id,
+            receipt=payload["facts"]["independent_review_receipt"]):
+        return False
+
+    required = [
+        {"metric_id": int(row[0]), "metric_ver": int(row[1])}
+        for row in conn.execute(
+            "SELECT metric_id,metric_ver "
+            "FROM build_target_required_metric "
+            "WHERE build_target_id=? ORDER BY metric_id,metric_ver",
+            (build_target_id,)).fetchall()
+    ]
+    if required != payload["facts"]["required_metrics"]:
+        return False
+    db_metrics = []
+    for metric_id, metric_ver, value, scope, checkpoint_id in conn.execute(
+            "SELECT metric_id,metric_ver,value,scope,checkpoint_id "
+            "FROM metric_result WHERE evaluation_id=? "
+            "AND evaluation_attempt_id=? "
+            "ORDER BY metric_id,metric_ver,scope,COALESCE(checkpoint_id,0)",
+            (evaluation_id, attempt_id)).fetchall():
+        item = {
+            "metric_id": int(metric_id),
+            "metric_ver": int(metric_ver),
+            "value": float(value),
+            "scope": scope,
+        }
+        if checkpoint_id is not None:
+            item["checkpoint_id"] = int(checkpoint_id)
+        db_metrics.append(item)
+    facts_metrics = sorted(
+        payload["facts"]["metric_results"],
+        key=lambda item: (
+            item["metric_id"], item["metric_ver"], item["scope"],
+            item.get("checkpoint_id") or 0))
+    if db_metrics != facts_metrics:
+        return False
+    log_hashes = {
+        str(row[0]).removeprefix("sha256:")
+        for row in conn.execute(
+            "SELECT DISTINCT content_hash FROM execution_log "
+            "WHERE evaluation_attempt_id=? AND log_kind='eval'",
+            (attempt_id,)).fetchall()
+    }
+    return log_hashes == {payload["facts"]["eval_log_hash"]}
+
+
+def _scientific_review_receipt_valid(
+        conn: sqlite3.Connection, *, build_target_id: int,
+        receipt: Any) -> bool:
+    """Bind recall eligibility to the same real child-review decision."""
+    if not isinstance(receipt, dict):
+        return False
+    decision_id = receipt.get("decision_id")
+    if (isinstance(decision_id, bool)
+            or not isinstance(decision_id, int) or decision_id <= 0):
+        return False
+    target = conn.execute(
+        "SELECT cycle_id FROM build_target WHERE id=?",
+        (build_target_id,)).fetchone()
+    if target is None:
+        return False
+    row = conn.execute(
+        "SELECT cycle_id,actor,type,payload_json FROM decision WHERE id=?",
+        (decision_id,)).fetchone()
+    if row is None or row[0] != target[0]:
+        return False
+    try:
+        review = json.loads(row[3])
+    except (TypeError, json.JSONDecodeError):
+        return False
+    protocol = receipt.get("protocol")
+    if protocol == "native-review-receipt-v1":
+        return native_review_receipt_valid(
+            conn, cycle_id=int(target[0]), target_id=build_target_id,
+            receipt=receipt)
+    if protocol != "legacy-bundle-code-review-v1":
+        return False
+    if (
+            row[1:3] != ("judge", "bundle_code_review")
+            or review.get("build_target_id") != build_target_id
+            or review.get("verdict") != "pass"
+            or receipt.get("subject_hash") != review.get("subject_hash")
+            or receipt.get("receipt_hash") != SC.canonical_hash({
+                "decision_id": decision_id, "payload": review,
+            })):
+        return False
+    latest = conn.execute(
+        "SELECT id,payload_json FROM decision "
+        "WHERE actor='judge' AND type='bundle_code_review' "
+        "AND json_valid(payload_json) "
+        "AND json_extract(payload_json,'$.build_target_id')=? "
+        "ORDER BY id DESC LIMIT 1",
+        (build_target_id,)).fetchone()
+    malformed = conn.execute(
+        "SELECT 1 FROM decision "
+        "WHERE actor='judge' AND type='bundle_code_review' "
+        "AND NOT json_valid(payload_json) AND id>? LIMIT 1",
+        (decision_id,)).fetchone()
+    if latest is None or latest[0] != decision_id or malformed is not None:
+        return False
+    runner = conn.execute(
+        "SELECT status,phase,purpose,cycle_id FROM runner_call WHERE id=?",
+        (review.get("runner_call_id"),)).fetchone()
+    return runner == (
+        "success", "audit", "bundle_code_review", target[0])
+
+
+def reuse_selector(
+        conn: sqlite3.Connection, *, variant_id: int, protocol_id: int,
+        protocol_ver: int, env_hash: str,
+        required: List[Tuple[int, int]],
+        require_scientific_contract: bool = True) -> Dict[str, Any]:
     """复用判定（§4.1.5）：同 variant + protocol@ver + 全 required 指标齐 + env_hash 精确 + 非存疑 + target complete
     → **命中**（零执行引用历史 evaluation）。返回 {hit, results:[{metric_id,metric_ver,metric_result_id,value}]}；
     命中 ⟺ results 覆盖全部 required pair；缺任一 → hit=False（上层落 target）。"""
     sql, params = _reuse_query(required, variant_id, protocol_id, protocol_ver, env_hash)
     rows = _exec_with_suspect(conn, sql, params)
-    results = [{"metric_id": m, "metric_ver": v, "metric_result_id": mr, "value": val} for m, v, mr, val in rows]
+    results = [
+        {
+            "metric_id": m, "metric_ver": v,
+            "metric_result_id": mr, "value": val,
+        }
+        for m, v, mr, val, _eid, _aid, _btid in rows
+    ]
     covered = {(r["metric_id"], r["metric_ver"]) for r in results}
-    hit = covered.issuperset(set(required))
+    science_ok = (
+        not require_scientific_contract
+        or all(_scientific_attempt_eligible(
+            conn, build_target_id=btid,
+            evaluation_id=eid, attempt_id=aid)
+               for _m, _v, _mr, _value, eid, aid, btid in rows)
+    )
+    hit = covered.issuperset(set(required)) and science_ok
     return {"hit": hit, "results": results}
 
 
@@ -118,8 +295,11 @@ class SqliteCtx:
 class SqliteRecall:
     """渐进四级召回（§3.6.2），每级独立可停。M2：卡片文本 LIKE + tag（嵌入 defer）+ 变体矩阵 + 测量索引 O(1)。"""
 
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(
+            self, conn: sqlite3.Connection, *,
+            require_scientific_contract: bool = True):
         self.conn = conn
+        self.require_scientific_contract = require_scientific_contract
 
     def level1_cards(self, query: str, k: int = 5) -> List[Hit]:
         """① 初筛（§3.6.2 第1级）：语义检索 + faceted tag → 命中方法族/基线卡。ORDER BY id 定序。
@@ -151,7 +331,10 @@ class SqliteRecall:
         """③ 精确：测量索引 O(1) 复用判定（§4.1.5）。返回 reuse_selector 结果。
         前置：conn 须已 register_parser_suspect_stub（未注册 → reuse_selector 抛可行动 RuntimeError）。"""
         return reuse_selector(self.conn, variant_id=variant_id, protocol_id=protocol_id,
-                              protocol_ver=protocol_ver, env_hash=env_hash, required=required)
+                              protocol_ver=protocol_ver, env_hash=env_hash,
+                              required=required,
+                              require_scientific_contract=(
+                                  self.require_scientific_contract))
 
     # ④ 深潜 = SqliteCtx.fetch（另类，只读 MCP）。
 

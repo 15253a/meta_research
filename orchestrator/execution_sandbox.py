@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import math
@@ -548,6 +549,31 @@ def gpu_contract_hash(contract: Mapping[str, Any]) -> str:
     return _sha(_canonical(value))
 
 
+def _authorized_gpu_contract_subset(
+        authorized_contract: Optional[Mapping[str, Any]],
+        requested_contract: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return a defensive exact subset of one deployment-owned contract."""
+    authorized = normalize_gpu_contract(authorized_contract)
+    requested = normalize_gpu_contract(requested_contract)
+    if requested is None:
+        return None
+    if authorized is None:
+        raise ValueError(
+            "sandbox GPU subset 不得超出 deployment authorized contract")
+    for field in ("version", "provider", "driver_version", "request"):
+        if requested[field] != authorized[field]:
+            raise ValueError(
+                "sandbox GPU subset 不得修改 deployment authorized contract")
+    authorized_devices = {
+        item["uuid"]: item for item in authorized["devices"]}
+    if any(
+            authorized_devices.get(item["uuid"]) != item
+            for item in requested["devices"]):
+        raise ValueError(
+            "sandbox GPU subset 含 deployment authorized contract 外设备")
+    return requested
+
+
 def gpu_cli_argument(contract: Mapping[str, Any]) -> str:
     value = normalize_gpu_contract(contract)
     assert value is not None
@@ -967,6 +993,10 @@ class LocalExecutionSandbox:
             system_root if system_root is not None else Path(__file__).resolve().parent.parent)))
         self.owner_guard = owner_guard or (lambda: None)
         self.gpu_contract = normalize_gpu_contract(gpu_contract)
+        # Stable deployment capability identity and the active invocation
+        # allocation coincide at construction.  with_gpu_contract() may later
+        # lower only the latter without rewriting the baseline environment.
+        self._environment_gpu_contract = copy.deepcopy(self.gpu_contract)
         base = dict(config)
         local = base.get("local_environment")
         if not isinstance(local, Mapping) or local.get("enabled") is not True:
@@ -1002,6 +1032,25 @@ class LocalExecutionSandbox:
             key: local_ca for key in _LOCAL_ENV_CA_ENV_KEYS}
         self._preflight_done = False
         self.image_environment = self._python_environment_identity()
+
+    def with_gpu_contract(
+            self,
+            contract: Optional[Mapping[str, Any]]) -> "LocalExecutionSandbox":
+        """Lower active GPU authority without changing deployment identity."""
+        subset = _authorized_gpu_contract_subset(self.gpu_contract, contract)
+        derived = copy.copy(self)
+        derived.config = copy.deepcopy(self.config)
+        derived.gpu_contract = subset
+        derived._environment_gpu_contract = copy.deepcopy(
+            self._environment_gpu_contract)
+        derived.local_environment = copy.deepcopy(self.local_environment)
+        derived.local_environment_identity = copy.deepcopy(
+            self.local_environment_identity)
+        derived.local_environment_ca_environment = dict(
+            self.local_environment_ca_environment)
+        derived.image_environment = dict(self.image_environment)
+        derived._preflight_done = False
+        return derived
 
     def _python_environment_identity(self) -> Dict[str, str]:
         result = subprocess.run(
@@ -1109,17 +1158,40 @@ class LocalExecutionSandbox:
         cache = runtime_root / "cache"
         tmp = runtime_root / "tmp"
         home = runtime_root / "home"
-        for path in (runtime_root, cache, tmp, home):
+        storage_environment = {
+            "HOME": str(home),
+            "CODEX_HOME": str(runtime_root / "codex-home"),
+            "CODEX_SQLITE_HOME": str(runtime_root / "codex-sqlite"),
+            "TMPDIR": str(tmp), "TMP": str(tmp), "TEMP": str(tmp),
+            "XDG_CACHE_HOME": str(cache),
+            "PIP_CACHE_DIR": str(cache / "pip"),
+            "HF_HOME": str(cache / "huggingface"),
+            "HF_HUB_CACHE": str(cache / "huggingface" / "hub"),
+            "HF_DATASETS_CACHE": str(cache / "huggingface" / "datasets"),
+            "TRANSFORMERS_CACHE": str(cache / "huggingface" / "transformers"),
+            "TORCH_HOME": str(cache / "torch"),
+            "TORCH_EXTENSIONS_DIR": str(cache / "torch-extensions"),
+            "TRITON_CACHE_DIR": str(cache / "triton"),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+            "XDG_STATE_HOME": str(home / ".local" / "state"),
+            "CONDA_PKGS_DIRS": str(cache / "conda-pkgs"),
+            "CONDA_ENVS_PATH": str(runtime_root / "environments"),
+            "UV_CACHE_DIR": str(cache / "uv"),
+            "CUDA_CACHE_PATH": str(cache / "cuda"),
+            "MPLCONFIGDIR": str(cache / "matplotlib"),
+            "NUMBA_CACHE_DIR": str(cache / "numba"),
+            "PYTHONPYCACHEPREFIX": str(cache / "pycache"),
+        }
+        for path in {
+                runtime_root, cache, tmp, home,
+                *(Path(value) for value in storage_environment.values())}:
             path.mkdir(parents=True, exist_ok=True)
         process_env = dict(os.environ)
         process_env.update({
             "PATH": str(self.python_path.parent) + os.pathsep + process_env.get("PATH", os.defpath),
-            "HOME": str(home), "TMPDIR": str(tmp),
-            "XDG_CACHE_HOME": str(cache),
-            "PIP_CACHE_DIR": str(cache / "pip"),
-            "HF_HOME": str(cache / "huggingface"),
-            "TORCH_HOME": str(cache / "torch"),
             "PYTHONDONTWRITEBYTECODE": "1",
+            **storage_environment,
             **self.local_environment_ca_environment,
         })
         for key, value in (env or {}).items():
@@ -1127,6 +1199,9 @@ class LocalExecutionSandbox:
                     or not isinstance(value, str) or "\x00" in value):
                 raise ExecutionSandboxError("local execution env 须为字符串映射")
             process_env[key] = value
+        # Manifest/user-provided environment cannot redirect mutable package
+        # state outside the quest-local runtime boundary.
+        process_env.update(storage_environment)
         if gpu_required:
             visible = ",".join(
                 item["uuid"] for item in self.gpu_contract["devices"])
@@ -1176,6 +1251,10 @@ class DockerExecutionSandbox:
             system_root if system_root is not None else Path(__file__).resolve().parent.parent)))
         self.config = dict(config)
         self.gpu_contract = normalize_gpu_contract(gpu_contract)
+        # ``config.gpu_capability`` is the stable deployment environment
+        # projection.  ``gpu_contract`` is the exact active allocation used by
+        # prepare(); with_gpu_contract() can monotonically lower only that.
+        self._environment_gpu_contract = copy.deepcopy(self.gpu_contract)
         supplied_capability = self.config.get("gpu_capability")
         if self.gpu_contract is None:
             if supplied_capability is not None:
@@ -1227,6 +1306,26 @@ class DockerExecutionSandbox:
             if set(configured) != expected or len(configured) != len(expected):
                 raise ValueError(
                     "qualification sandbox readonly_mounts 必须精确等于 contract mounts")
+
+    def with_gpu_contract(
+            self,
+            contract: Optional[Mapping[str, Any]]) -> "DockerExecutionSandbox":
+        """Lower active GPU authority without changing deployment identity."""
+        subset = _authorized_gpu_contract_subset(self.gpu_contract, contract)
+        derived = copy.copy(self)
+        derived.config = copy.deepcopy(self.config)
+        derived.gpu_contract = subset
+        derived._environment_gpu_contract = copy.deepcopy(
+            self._environment_gpu_contract)
+        derived.image_environment = {}
+        derived.local_environment = copy.deepcopy(self.local_environment)
+        derived.local_environment_identity = copy.deepcopy(
+            self.local_environment_identity)
+        derived.local_environment_ca_environment = dict(
+            self.local_environment_ca_environment)
+        derived._preflight_done = False
+        derived._resource_mode = None
+        return derived
 
     def _validate_config(self) -> None:
         required = {

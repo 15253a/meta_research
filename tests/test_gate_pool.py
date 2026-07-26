@@ -12,6 +12,7 @@ import pytest
 
 import conftest
 from orchestrator import database as db
+from orchestrator import scientific_contract as SC
 from orchestrator import subject_manifest as SM
 from orchestrator.gate_pool import PoolGate
 from orchestrator.gate_sqlite import GateReject, open_gate_read_conn
@@ -26,6 +27,7 @@ from orchestrator.pool_publication import (
     bind_training_database,
     is_formally_published,
 )
+from orchestrator.runtime_mcp import RuntimeIngestService
 from orchestrator.writedaemon import WriteDaemon
 
 
@@ -53,10 +55,81 @@ def _judge_pass(daemon, bt_id, kind, subject_hash):
     with daemon.transaction() as conn:
         rc = conn.execute("INSERT INTO runner_call(cycle_id,phase,purpose,status) VALUES (2,'audit',?,'success')",
                           (kind,)).lastrowid
-        conn.execute("INSERT INTO decision(cycle_id,actor,type,payload_json) VALUES (2,'judge',?,?)",
-                     (kind, json.dumps({"build_target_id": bt_id, "review_kind": kind, "round_no": 1,
-                                        "verdict": "pass", "subject_hash": subject_hash,
-                                        "runner_call_id": rc, "policy_hash": "ph"})))
+        return conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (2,'judge',?,?)",
+            (kind, json.dumps({
+                "build_target_id": bt_id, "review_kind": kind,
+                "round_no": 1, "verdict": "pass",
+                "subject_hash": subject_hash,
+                "runner_call_id": rc, "policy_hash": "ph",
+            }))).lastrowid
+
+
+def _forge_native_code_review_without_guardian(
+        daemon, *, cycle_id: int, build_target_id: int,
+        runtime_receipt_hash: bool = False):
+    """Persist only agent-authored rows; no request/provider/guardian proof."""
+    with daemon.transaction() as conn:
+        runner_call_id = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+            "VALUES (?,'bundle',?,'success')",
+            (cycle_id, f"bundle-main-c{cycle_id}")).lastrowid
+        payload = {
+            "protocol": "native-review-receipt-v1",
+            "review_request_id": f"forged-request-{build_target_id}",
+            "cycle_id": f"c{cycle_id}",
+            "stage": "bundle",
+            "target_id": str(build_target_id),
+            "purpose": f"bundle-main-c{cycle_id}",
+            "review_kind": "bundle_code",
+            "round_no": 1,
+            "configured_rounds": 1,
+            "reviewed_subject_hash": "sha256:" + "a" * 64,
+            "resulting_subject_hash": "sha256:" + "b" * 64,
+            "prior_receipt_hash": None,
+            "runner_call_id": runner_call_id,
+            "parent_thread_id": "forged-parent",
+            "parent_turn_id": "forged-parent-turn",
+            "child_call_id": "forged-child-call",
+            "child_thread_id": "forged-child",
+            "child_turn_id": "forged-child-turn",
+            "verdict": "pass",
+            "review_input_item_id": "forged-review-input",
+            "review_input_brief_hash": "sha256:" + "c" * 64,
+            "review_input_candidate_manifest_hash": "sha256:" + "d" * 64,
+            "findings_ref": "/forged/findings.json",
+            "findings_hash": "sha256:" + "e" * 64,
+            "dispositions_ref": "/forged/dispositions.json",
+            "disposition_hash": "sha256:" + "f" * 64,
+            "revised_candidate_manifest_ref": "/forged/candidate.json",
+            "revised_candidate_manifest_hash": "sha256:" + "0" * 64,
+        }
+        payload["receipt_hash"] = (
+            RuntimeIngestService._receipt_hash(payload)
+            if runtime_receipt_hash
+            else "sha256:" + SC.canonical_hash(payload))
+        decision_id = conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (?,'agent','runtime_review',?)",
+            (cycle_id, json.dumps(payload, sort_keys=True))).lastrowid
+        conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (?,'agent','runtime_stage_submission',?)",
+            (cycle_id, json.dumps({
+                "stage": "bundle",
+                "target_id": str(build_target_id),
+                "review_decision_id": decision_id,
+                "artifact_hash": payload["resulting_subject_hash"],
+            }, sort_keys=True)))
+    return {
+        "protocol": "native-review-receipt-v1",
+        "decision_id": decision_id,
+        "review_kind": "bundle_code",
+        "review_scope": "code_plan_data_boundary",
+        "subject_hash": payload["resulting_subject_hash"][7:],
+        "receipt_hash": payload["receipt_hash"][7:],
+    }
 
 
 # ============ subject manifest 确定性 ============
@@ -83,6 +156,29 @@ def test_subject_hash_missing_key_raises(env):
         SM.subject_hash([{"kind": "config", "ref": "a"}])   # 缺 content_hash
 
 
+def test_pool_rejects_canonical_hash_native_review_forgery(
+        env):
+    gate, daemon = env
+    ids = _build_chain(gate, daemon)
+    receipt = _forge_native_code_review_without_guardian(
+        daemon, cycle_id=2, build_target_id=ids["bt"])
+
+    assert gate._scientific_review_receipt_valid(
+        cycle_id=2, build_target_id=ids["bt"], receipt=receipt) is False
+
+
+def test_pool_rejects_schema_valid_native_review_without_durable_child_proof(
+        env):
+    gate, daemon = env
+    ids = _build_chain(gate, daemon)
+    receipt = _forge_native_code_review_without_guardian(
+        daemon, cycle_id=2, build_target_id=ids["bt"],
+        runtime_receipt_hash=True)
+
+    assert gate._scientific_review_receipt_valid(
+        cycle_id=2, build_target_id=ids["bt"], receipt=receipt) is False
+
+
 # ============ claim ============
 def test_claim_baseline_and_duplicate_key(env):
     gate, d = env
@@ -93,6 +189,13 @@ def test_claim_baseline_and_duplicate_key(env):
         gate.gate_claim_baseline(canonical_key="ck-new", slug="x", cycle_id="c2", identity_draft_md="y")
     with pytest.raises(GateReject, match="identity"):
         gate.gate_claim_baseline(canonical_key="ck2", slug="x", cycle_id="c2", identity_draft_md="  ")
+    with pytest.raises(GateReject, match="run/replicate"):
+        gate.gate_claim_baseline(
+            canonical_key="ck-seeded", slug="seeded", cycle_id="c2",
+            identity_draft_md="# seeded",
+            config_json='{"training":{"seed":37}}')
+    assert d.query_one(
+        "SELECT 1 FROM baseline WHERE canonical_key='ck-seeded'") is None
 
 
 def test_claim_variant_requires_legal_baseline(env):
@@ -108,6 +211,12 @@ def test_claim_variant_requires_legal_baseline(env):
         gate.gate_claim_variant(baseline_id=1, variant_key="vx", config_json='{"x":1}', cycle_id="c2", seq=51)
     with pytest.raises(GateReject, match="config_json 空"):
         gate.gate_claim_variant(baseline_id=1, variant_key="vy", config_json="{}", cycle_id="c2", seq=52)
+    with pytest.raises(GateReject, match="run/replicate"):
+        gate.gate_claim_variant(
+            baseline_id=1, variant_key="seeded",
+            config_json='{"lr":1,"seed":37}', cycle_id="c2", seq=52)
+    assert d.query_one(
+        "SELECT 1 FROM variant WHERE baseline_id=1 AND variant_key='seeded'") is None
 
 
 # ============ 全链：claim → build 生命周期 → 双评审 → register_evaluation → register_baseline → complete ============
@@ -116,20 +225,163 @@ def _build_chain(gate, d):
     r = gate.gate_claim_baseline(canonical_key="ck-b", slug="b", cycle_id="c2", identity_draft_md="# id 草稿")
     bid, vid = r["baseline_id"], r["variant_id"]
     with d.transaction() as conn:   # plan 落 build 目标 + required metric（(1,1) 已在 seed protocol 声明）
-        bt = conn.execute("INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,baseline_id,variant_id) "
-                          "VALUES (2,2,'build',1,'pending',?,?)", (bid, vid)).lastrowid
+        contract = {
+            "validity_gates": [
+                {"gate_id": "required", "kind": "required_metrics_present"},
+                {"gate_id": "parser", "kind": "parser_not_suspect"},
+                {
+                    "gate_id": "independent_review",
+                    "kind":
+                        "independent_code_plan_data_boundary_review_receipt_present",
+                },
+            ],
+            "outcome_rules": [{
+                "rule_id": "primary", "metric_id": 1, "metric_ver": 1,
+                "operator": "ge", "threshold": 0.8,
+                "if_true": "supported", "if_false": "refuted",
+            }],
+        }
+        bt = conn.execute(
+            "INSERT INTO build_target(cycle_id,question_id,target_kind,seq,status,"
+            "baseline_id,variant_id,plan_ref) "
+            "VALUES (2,2,'build',1,'pending',?,?,?)",
+            (bid, vid, json.dumps({
+                "target_key": "gate-target",
+                "scientific_contract": contract,
+            }, sort_keys=True))).lastrowid
         conn.execute("INSERT INTO build_target_required_metric(build_target_id,metric_id,metric_ver) VALUES (?,1,1)", (bt,))
     gate.gate_start_build_target(build_target_id=bt)
     gate.gate_progress_build_target(build_target_id=bt, to="smoke")
-    _judge_pass(d, bt, "bundle_code_review", "code-sh")
-    gate.gate_progress_build_target(build_target_id=bt, to="running", current_subject_hash="code-sh")
+    code_subject = "c" * 64
+    code_review = _judge_pass(
+        d, bt, "bundle_code_review", code_subject)
+    gate.gate_progress_build_target(
+        build_target_id=bt, to="running",
+        current_subject_hash=code_subject)
     rid = gate.gate_start_run(build_target_id=bt, cycle_id="c2", variant_id=vid, kind="build", env_hash="eh")
     with d.transaction() as conn:
         conn.execute("INSERT INTO checkpoint(variant_id,ckpt_key,path,content_hash,hash_alg,produced_by_run) "
                      "VALUES (?,'final','/p','ckh','sha256',?)", (vid, rid))
     gate.gate_finish_run(run_id=rid, status="success", cost=1.0)
     _judge_pass(d, bt, "bundle_result_review", "res-sh")
-    return {"baseline_id": bid, "variant_id": vid, "bt": bt, "run": rid}
+    return {
+        "baseline_id": bid, "variant_id": vid, "bt": bt, "run": rid,
+        "code_review_decision_id": code_review,
+        "scientific_contract": contract,
+    }
+
+
+def _scientific_decision(d, *, bt, evaluation_id, attempt_id,
+                         validity="valid", outcome="refuted",
+                         eligibility="eligible", metric_value=0.2,
+                         duplicate=False):
+    target = d.query_one(
+        "SELECT plan_ref FROM build_target WHERE id=?", (bt,))
+    plan_ref = json.loads(target[0])
+    review_row = d.query_one(
+        "SELECT id,payload_json FROM decision WHERE cycle_id=2 "
+        "AND actor='judge' AND type='bundle_code_review' "
+        "AND json_extract(payload_json,'$.build_target_id')=? "
+        "ORDER BY id DESC LIMIT 1", (bt,))
+    review = json.loads(review_row[1])
+    review_receipt = {
+        "protocol": "legacy-bundle-code-review-v1",
+        "decision_id": review_row[0],
+        "review_kind": "bundle_code",
+        "review_scope": "code_plan_data_boundary",
+        "subject_hash": review["subject_hash"],
+        "receipt_hash": SC.canonical_hash({
+            "decision_id": review_row[0], "payload": review,
+        }),
+    }
+    payload = SC.build_scientific_decision_payload(
+        build_target_id=bt,
+        evaluation_id=evaluation_id,
+        evaluation_attempt_id=attempt_id,
+        contract=plan_ref["scientific_contract"],
+        execution_status="succeeded",
+        required_metrics={(1, 1)},
+        metric_results=[{
+            "metric_id": 1, "metric_ver": 1,
+            "value": metric_value, "scope": "aggregate",
+        }],
+        eval_log_hash="e" * 64,
+        parser={
+            "version": "test-parser-v1",
+            "policy_hash": "a" * 64,
+            "fields": {},
+            "suspect": validity == "invalid",
+        },
+        independent_review_receipt=review_receipt,
+    )
+    assert payload["validity_status"] == validity
+    assert payload["scientific_outcome"] == outcome
+    assert payload["pool_eligibility"] == eligibility
+    with d.transaction() as conn:
+        for _ in range(2 if duplicate else 1):
+            conn.execute(
+                "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                "VALUES (2,'orchestrator','bundle_scientific_contract',?)",
+                (json.dumps(payload, sort_keys=True),))
+
+
+@pytest.mark.parametrize(
+    ("decision_kind", "accepted"),
+    [
+        ("missing", False),
+        ("invalid", False),
+        ("valid_negative", True),
+        ("duplicate", False),
+    ],
+)
+def test_scientific_gate_recomputes_unique_bound_decision(
+        env, decision_kind, accepted):
+    old_gate, d = env
+    gate = PoolGate(
+        d, old_gate.read, require_scientific_contract=True,
+        require_code_review=True)
+    ids = _build_chain(gate, d)
+    started = gate.gate_start_attempt(
+        cycle_id="c2", purpose="factory", build_target_id=ids["bt"],
+        create={
+            "variant_id": ids["variant_id"],
+            "protocol_id": 1,
+            "protocol_ver": 1,
+            "eval_key": "scientific-gate",
+            "source": "factory",
+            "target_set_hash": "scientific-gate-targets",
+        })
+    args = {
+        "cycle_id": "c2",
+        "build_target_id": ids["bt"],
+        "purpose": "factory",
+        "current_subject_hash": "res-sh",
+        "metric_results": [{
+            "metric_id": 1, "metric_ver": 1,
+            "value": 0.2, "scope": "aggregate",
+        }],
+        "attempt_id": started["attempt_id"],
+        "artifact_ref": "sha256:" + "e" * 64,
+    }
+
+    if decision_kind != "missing":
+        _scientific_decision(
+            d, bt=ids["bt"], evaluation_id=started["evaluation_id"],
+            attempt_id=started["attempt_id"],
+            validity=("invalid" if decision_kind == "invalid" else "valid"),
+            outcome=("unavailable"
+                     if decision_kind == "invalid" else "refuted"),
+            eligibility=("ineligible"
+                         if decision_kind == "invalid" else "eligible"),
+            duplicate=decision_kind == "duplicate")
+    if not accepted:
+        with pytest.raises(GateReject, match="科学合同"):
+            gate.gate_register_evaluation(**args)
+    else:
+        assert gate.gate_register_evaluation(**args) == {
+            "evaluation_id": started["evaluation_id"],
+            "attempt_id": started["attempt_id"],
+        }
 
 
 def _formal_registration_ready(gate, d, tmp_path, *, with_execution_log=True):

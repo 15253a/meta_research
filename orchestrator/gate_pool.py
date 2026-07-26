@@ -18,11 +18,15 @@ register_baseline/variant 是其后的池迁移短事务；CP5.4 attack advance 
 """
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import scientific_contract as SC
 from .gate_exec import _ATTEMPT_PURPOSES, ExecGate
 from .ids import cnum as _cnum
+from .native_review_verifier import native_review_receipt_valid
 from .pool_publication import (
     PoolPublicationError,
     PoolPublisher,
@@ -32,10 +36,29 @@ from .pool_publication import (
 )
 
 
+def _variant_seed_path(value: Any, path: str = "config_json") -> Optional[str]:
+    """Find a nested seed key that would incorrectly become variant identity."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if isinstance(key, str) and key.casefold() == "seed":
+                return child_path
+            found = _variant_seed_path(child, child_path)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found = _variant_seed_path(child, f"{path}[{index}]")
+            if found is not None:
+                return found
+    return None
+
+
 class PoolGate(ExecGate):
 
     def __init__(self, *args, pool_publisher: Optional[PoolPublisher] = None,
-                 require_formal_publication: bool = False, **kwargs):
+                 require_formal_publication: bool = False,
+                 require_scientific_contract: bool = False, **kwargs):
         """Create the registration gate.
 
         ``require_formal_publication=False`` exists only for old migration/unit-test
@@ -43,13 +66,152 @@ class PoolGate(ExecGate):
         owns the work root; a caller-provided dataclass is then re-read and re-hashed
         immediately before the registration transaction.
         """
-        if type(require_formal_publication) is not bool:
-            raise TypeError("formal publication gate 策略必须是显式 bool")
+        if (type(require_formal_publication) is not bool
+                or type(require_scientific_contract) is not bool):
+            raise TypeError("formal/scientific publication gate 策略必须是显式 bool")
         if require_formal_publication and pool_publisher is None:
             raise ValueError("生产池注册必须注入 PoolPublisher")
         super().__init__(*args, **kwargs)
         self.pool_publisher = pool_publisher
         self.require_formal_publication = require_formal_publication
+        self.require_scientific_contract = require_scientific_contract
+
+    def _scientific_contract_eligible(
+            self, *, cycle_id: int, build_target_id: int,
+            evaluation_id: int, attempt_id: int,
+            metric_results: Optional[List[Dict[str, Any]]] = None,
+            artifact_ref: Optional[str] = None) -> bool:
+        """Recompute one unique exact-scope Bundle classification from DB facts."""
+        rows = self.read.execute(
+            "SELECT payload_json FROM decision WHERE cycle_id=? "
+            "AND actor='orchestrator' AND type='bundle_scientific_contract' "
+            "AND json_valid(payload_json) "
+            "AND json_extract(payload_json,'$.build_target_id')=? "
+            "AND json_extract(payload_json,'$.evaluation_id')=? "
+            "AND json_extract(payload_json,'$.evaluation_attempt_id')=? "
+            "ORDER BY id",
+            (cycle_id, build_target_id, evaluation_id, attempt_id)).fetchall()
+        if len(rows) != 1:
+            return False
+        try:
+            payload = SC.validate_scientific_decision_payload(
+                json.loads(rows[0][0]),
+                expected_build_target_id=build_target_id,
+                expected_evaluation_id=evaluation_id,
+                expected_attempt_id=attempt_id)
+            target = self._q1(
+                "SELECT cycle_id,plan_ref FROM build_target WHERE id=?",
+                (build_target_id,))
+            if target is None or target[0] != cycle_id or not target[1]:
+                return False
+            plan_slice = json.loads(target[1])
+            expected_contract = SC.normalize_scientific_contract(
+                plan_slice.get("scientific_contract")
+                or SC.default_scientific_contract())
+            if payload["contract"] != expected_contract:
+                return False
+            required = [
+                (int(row[0]), int(row[1]))
+                for row in self.read.execute(
+                    "SELECT metric_id,metric_ver "
+                    "FROM build_target_required_metric "
+                    "WHERE build_target_id=? ORDER BY metric_id,metric_ver",
+                    (build_target_id,)).fetchall()
+            ]
+            facts = payload["facts"]
+            if facts["required_metrics"] != [
+                    {"metric_id": metric_id, "metric_ver": metric_ver}
+                    for metric_id, metric_ver in required]:
+                return False
+            if metric_results is None:
+                metric_results = [
+                    {
+                        "metric_id": int(row[0]),
+                        "metric_ver": int(row[1]),
+                        "value": float(row[2]),
+                        "scope": str(row[3]),
+                        **({"checkpoint_id": int(row[4])}
+                           if row[4] is not None else {}),
+                    }
+                    for row in self.read.execute(
+                        "SELECT metric_id,metric_ver,value,scope,checkpoint_id "
+                        "FROM metric_result WHERE evaluation_id=? "
+                        "AND evaluation_attempt_id=? "
+                        "ORDER BY metric_id,metric_ver,scope,checkpoint_id",
+                        (evaluation_id, attempt_id)).fetchall()
+                ]
+            if artifact_ref is None:
+                attempt = self._q1(
+                    "SELECT artifact_ref FROM evaluation_attempt WHERE id=?",
+                    (attempt_id,))
+                artifact_ref = None if attempt is None else attempt[0]
+            if (not isinstance(artifact_ref, str)
+                    or re.fullmatch(
+                        r"sha256:[0-9a-f]{64}", artifact_ref) is None
+                    or artifact_ref[7:] != facts["eval_log_hash"]):
+                return False
+            rebuilt_facts = SC.canonical_scientific_facts(
+                evaluation_id=evaluation_id,
+                evaluation_attempt_id=attempt_id,
+                required_metrics=required,
+                metric_results=metric_results,
+                eval_log_hash=facts["eval_log_hash"],
+                parser=facts["parser"],
+                independent_review_receipt=(
+                    facts["independent_review_receipt"]))
+            if rebuilt_facts != facts:
+                return False
+            if not self._scientific_review_receipt_valid(
+                    cycle_id=cycle_id, build_target_id=build_target_id,
+                    receipt=facts["independent_review_receipt"]):
+                return False
+        except (SC.ScientificContractError, KeyError, TypeError, ValueError,
+                json.JSONDecodeError):
+            return False
+        return bool(
+            payload["execution_status"] == "succeeded"
+            and payload["validity_status"] == "valid"
+            and payload["scientific_outcome"]
+            in {"supported", "refuted", "inconclusive"}
+            and payload["pool_eligibility"] == "eligible")
+
+    def _scientific_review_receipt_valid(
+            self, *, cycle_id: int, build_target_id: int,
+            receipt: Optional[Dict[str, Any]]) -> bool:
+        """Bind the science fact to a real independent code-review decision."""
+        if not isinstance(receipt, dict):
+            return False
+        decision_id = receipt.get("decision_id")
+        if (isinstance(decision_id, bool)
+                or not isinstance(decision_id, int) or decision_id <= 0):
+            return False
+        row = self._q1(
+            "SELECT actor,type,payload_json FROM decision "
+            "WHERE id=? AND cycle_id=?", (decision_id, cycle_id))
+        if row is None:
+            return False
+        try:
+            review = json.loads(row[2])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        protocol = receipt.get("protocol")
+        if protocol == "native-review-receipt-v1":
+            return native_review_receipt_valid(
+                self.read, cycle_id=cycle_id, target_id=build_target_id,
+                receipt=receipt)
+        if protocol != "legacy-bundle-code-review-v1":
+            return False
+        if (row[:2] != ("judge", "bundle_code_review")
+                or review.get("build_target_id") != build_target_id
+                or receipt.get("subject_hash") != review.get("subject_hash")
+                or receipt.get("receipt_hash") != SC.canonical_hash({
+                    "decision_id": decision_id, "payload": review,
+                })):
+            return False
+        return self.review_passed(
+            build_target_id=build_target_id,
+            review_kind="bundle_code_review",
+            current_subject_hash=receipt["subject_hash"])
 
     def _verified_publication(
             self, ci: int, publication: Optional[VerifiedPoolPublication], *,
@@ -98,6 +260,20 @@ class PoolGate(ExecGate):
         if missing:
             self._reject(ci, f"{what} 缺键 {missing}: {item!r}")
 
+    def _require_seedless_variant_config(
+            self, ci: int, config_json: str) -> None:
+        try:
+            config = json.loads(config_json)
+        except (TypeError, json.JSONDecodeError) as error:
+            self._reject(ci, f"variant config_json 非法 JSON object: {error}")
+        if not isinstance(config, dict):
+            self._reject(ci, "variant config_json 须为 JSON object")
+        path = _variant_seed_path(config)
+        if path is not None:
+            self._reject(
+                ci, f"{path} 不得成为 baseline/variant identity；"
+                "seed 只属于 run/replicate")
+
     # -- claim ------------------------------------------------------------------
     def gate_claim_baseline(self, *, canonical_key: str, slug: str, cycle_id: str,
                             identity_draft_md: str, parent_id: Optional[int] = None,
@@ -115,6 +291,7 @@ class PoolGate(ExecGate):
             self._reject(ci, f"canonical_key 已占（I5）: {canonical_key!r}")
         if parent_id is not None and self._q1("SELECT 1 FROM baseline WHERE id=?", (parent_id,)) is None:
             self._reject(ci, f"parent baseline 不存在: {parent_id}")
+        self._require_seedless_variant_config(ci, config_json)
         try:
             with self.daemon.transaction() as conn:
                 bid = conn.execute(
@@ -149,6 +326,7 @@ class PoolGate(ExecGate):
             self._reject(ci, f"variant_key 已占: {variant_key!r}（baseline {baseline_id}）")
         if not config_json or not config_json.strip() or config_json.strip() == "{}":
             self._reject(ci, "claim_variant config_json 空（变体须有配置增量）")
+        self._require_seedless_variant_config(ci, config_json)
         try:
             with self.daemon.transaction() as conn:
                 vid = conn.execute("INSERT INTO variant(baseline_id,variant_key,config_json,status,born_question) "
@@ -283,6 +461,15 @@ class PoolGate(ExecGate):
                     self._reject(ci, "register_evaluation：transcript_ref 与 formal publication 不一致")
                 artifact_ref = formal_attempt["artifact_ref"]
                 transcript_ref = verified.manifest_ref
+        if self.require_scientific_contract:
+            if attempt_id is None or not self._scientific_contract_eligible(
+                    cycle_id=ci, build_target_id=build_target_id,
+                    evaluation_id=eid, attempt_id=attempt_id,
+                    metric_results=metric_results,
+                    artifact_ref=artifact_ref):
+                self._reject(
+                    ci, f"target {build_target_id} 缺少唯一、可复算、"
+                    "绑定 Plan/metrics/log/reviewer 且 eligible 的科学合同判定")
         try:
             with self.daemon.transaction() as conn:   # ——§4.2.5(ii) 单事务——
                 if attempt_id is not None:
@@ -381,6 +568,11 @@ class PoolGate(ExecGate):
             self._reject(ci, f"register：出厂 evaluation 非 success/无 canonical（{erow[2]}/{erow[3]}）")
         if erow[4] is not None and erow[4] != build_target_id:
             self._reject(ci, f"register：evaluation 绑 target {erow[4]}，本次 {build_target_id}")
+        if self.require_scientific_contract and not self._scientific_contract_eligible(
+                cycle_id=ci, build_target_id=build_target_id,
+                evaluation_id=evaluation_id, attempt_id=erow[3]):
+            self._reject(
+                ci, f"register：target {build_target_id} 的科学合同判定缺失、失效或不可入池")
         required = self.read.execute("SELECT metric_id, metric_ver FROM build_target_required_metric "
                                      "WHERE build_target_id=?", (build_target_id,)).fetchall()
         missing = [rm for rm in required if self._q1(

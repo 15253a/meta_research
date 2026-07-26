@@ -378,7 +378,13 @@
       "required": ["max_decompose_depth", "max_children_per_node", "max_open_questions"],
       "additionalProperties": false,
       "properties": {
-        "max_decompose_depth": { "type": "integer", "minimum": 1 },
+        "max_decompose_depth": {
+          "description": "正整数为硬深度上限；null 表示不限制分解深度",
+          "anyOf": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "null" }
+          ]
+        },
         "max_children_per_node": { "type": "integer", "minimum": 1 },
         "max_open_questions": { "type": "integer", "minimum": 1 }
       }
@@ -464,8 +470,16 @@
           "properties": {
             "enabled": { "type": "boolean" },
             "status": { "enum": ["pending_controlled_backend", "controlled_backend_enabled"] },
-            "provider": { "const": "arxiv_api_v1" },
-            "endpoint": { "const": "https://export.arxiv.org/api/query" },
+            "provider": { "const": "literature_federated_v1" },
+            "endpoints": {
+              "type": "object",
+              "required": ["crossref", "openalex"],
+              "additionalProperties": false,
+              "properties": {
+                "crossref": { "const": "https://api.crossref.org/works" },
+                "openalex": { "const": "https://api.openalex.org/works" }
+              }
+            },
             "queries_per_candidate": { "const": 1 },
             "max_results_per_query": { "type": "integer", "minimum": 1, "maximum": 50 },
             "timeout_s": { "type": "number", "exclusiveMinimum": 0, "maximum": 600 },
@@ -484,7 +498,7 @@
               "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
               "then": {
                 "required": [
-                  "provider", "endpoint", "queries_per_candidate", "max_results_per_query",
+                  "provider", "endpoints", "queries_per_candidate", "max_results_per_query",
                   "timeout_s", "max_response_bytes", "min_interval_s"
                 ],
                 "properties": { "status": { "const": "controlled_backend_enabled" } }

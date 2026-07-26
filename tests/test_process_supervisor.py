@@ -258,6 +258,160 @@ def test_progress_observer_cancel_drains_guardian_and_keeps_supervisor_reusable(
         supervisor.close()
 
 
+def test_capture_observer_receives_each_stdout_byte_once_including_final_suffix(
+        tmp_path):
+    supervisor = _supervisor(tmp_path)
+    chunks = []
+    payload = "alpha-βeta-final".encode("utf-8")
+    code = (
+        "import os,time; "
+        "os.write(1,b'alpha-'); time.sleep(.12); "
+        "os.write(1,'βeta'.encode()); time.sleep(.12); "
+        "os.write(1,b'-final')")
+    try:
+        result = supervisor.run(
+            [sys.executable, "-c", code],
+            capture_output=True, timeout_s=2, kind="probe",
+            capture_observer=chunks.append, progress_interval_s=0.05)
+    finally:
+        supervisor.close()
+
+    assert result.stdout == payload
+    assert b"".join(chunks) == payload
+    assert len(chunks) >= 2
+
+
+def test_stream_capture_observer_preserves_stream_identity_without_buffering_result(
+        tmp_path):
+    supervisor = _supervisor(tmp_path)
+    observed = []
+    code = (
+        "import os,time; "
+        "os.write(1,b'alpha'); time.sleep(.12); "
+        "os.write(2,b'warning'); time.sleep(.12); "
+        "os.write(1,b'omega')")
+    try:
+        result = supervisor.run(
+            [sys.executable, "-c", code],
+            capture_output=True, capture_result=False,
+            timeout_s=2, kind="probe",
+            stream_capture_observer=lambda stream, chunk, frame_end: (
+                observed.append((stream, chunk, frame_end))),
+            progress_interval_s=0.05)
+    finally:
+        supervisor.close()
+
+    assert [stream for stream, _chunk, _frame_end in observed] == [
+        "stdout", "stderr", "stdout",
+    ]
+    assert b"".join(
+        chunk for stream, chunk, _frame_end in observed
+        if stream == "stdout"
+    ) == b"alphaomega"
+    assert b"".join(
+        chunk for stream, chunk, _frame_end in observed
+        if stream == "stderr"
+    ) == b"warning"
+    assert [frame_end for _stream, _chunk, frame_end in observed] == sorted(
+        frame_end for _stream, _chunk, frame_end in observed)
+    assert result.stdout is None
+    assert result.stderr is None
+    assert result.receipt["capture_stream_identity"] is True
+    assert PS.read_execution_capture(
+        result.receipt, stream="stdout") == b"alphaomega"
+    assert PS.read_execution_capture(
+        result.receipt, stream="stderr") == b"warning"
+
+
+def test_stream_capture_guardian_preserves_stderr_before_stdout_without_sleep(
+        tmp_path):
+    supervisor = _supervisor(tmp_path)
+    observed = []
+    try:
+        result = supervisor.run(
+            [
+                sys.executable, "-c",
+                "import os; os.write(2,b'stderr-first\\n'); "
+                "os.write(1,b'stdout-second\\n')",
+            ],
+            capture_output=True, capture_result=False,
+            timeout_s=2, kind="probe",
+            stream_capture_observer=lambda stream, chunk, frame_end: (
+                observed.append((stream, chunk, frame_end))),
+            progress_interval_s=0.05)
+    finally:
+        supervisor.close()
+
+    assert [(stream, chunk) for stream, chunk, _end in observed] == [
+        ("stderr", b"stderr-first\n"),
+        ("stdout", b"stdout-second\n"),
+    ]
+    assert observed[0][2] < observed[1][2]
+    assert result.receipt["capture_frame_format"] == "ordered-stream-v1"
+    assert result.receipt["capture_frame_bytes"] == observed[-1][2]
+    assert result.receipt["capture_frame_sha256"].startswith("sha256:")
+    assert result.receipt["capture_frame_device"] >= 0
+    assert result.receipt["capture_frame_inode"] > 0
+    assert PS.verified_execution_frame_size(
+        result.receipt) == observed[-1][2]
+
+
+def test_capture_observer_requires_capture_output_and_callable(tmp_path):
+    supervisor = _supervisor(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="capture_output"):
+            supervisor.run(
+                [sys.executable, "-c", "pass"],
+                capture_output=False, timeout_s=2, kind="probe",
+                capture_observer=lambda _chunk: None)
+        with pytest.raises(ValueError, match="capture_observer"):
+            supervisor.run(
+                [sys.executable, "-c", "pass"],
+                capture_output=True, timeout_s=2, kind="probe",
+                capture_observer=object())
+        with pytest.raises(ValueError, match="capture_output"):
+            supervisor.run(
+                [sys.executable, "-c", "pass"],
+                capture_output=False, timeout_s=2, kind="probe",
+                stream_capture_observer=lambda _stream, _chunk, _end: None)
+        with pytest.raises(ValueError, match="stream_capture_observer"):
+            supervisor.run(
+                [sys.executable, "-c", "pass"],
+                capture_output=True, timeout_s=2, kind="probe",
+                stream_capture_observer=object())
+        with pytest.raises(ValueError, match="不得同时"):
+            supervisor.run(
+                [sys.executable, "-c", "pass"],
+                capture_output=True, timeout_s=2, kind="probe",
+                capture_observer=lambda _chunk: None,
+                stream_capture_observer=lambda _stream, _chunk, _end: None)
+    finally:
+        supervisor.close()
+
+
+def test_capture_observer_failure_cancels_exact_execution_and_attaches_receipt(
+        tmp_path):
+    supervisor = _supervisor(tmp_path, grace=0.08)
+
+    def reject(_chunk):
+        raise RuntimeError("ledger rejected capture")
+
+    try:
+        with pytest.raises(RuntimeError, match="ledger rejected") as caught:
+            supervisor.run(
+                [sys.executable, "-c",
+                 "import os,time; os.write(1,b'bad-event\\n'); time.sleep(30)"],
+                capture_output=True, timeout_s=30, kind="probe",
+                capture_observer=reject, progress_interval_s=0.05)
+        receipt = caught.value.execution_receipt
+        assert receipt["state"] == "terminal"
+        assert receipt["outcome"] == "cancelled"
+        assert receipt["group_drained"] is True
+        assert supervisor.active_count == 0
+    finally:
+        supervisor.close()
+
+
 @pytest.mark.parametrize("ignored", [True, False])
 def test_sigint_ignore_or_benign_custom_handler_keeps_original_semantics(
         tmp_path, ignored):

@@ -73,9 +73,15 @@ def _qnum_opt(s: Any) -> Optional[int]:
 
 
 class SQLiteStateStore:
-    def __init__(self, daemon: WriteDaemon, policy: Dict[str, Any]):
+    def __init__(self, daemon: WriteDaemon, policy: Dict[str, Any], *,
+                 require_reasoning_commit: bool = False):
+        if type(require_reasoning_commit) is not bool:
+            raise TypeError("require_reasoning_commit 须为 bool")
         self.daemon = daemon
         self.policy = policy
+        # Legacy/unit state-machine callers may close synthetic cycles directly.
+        # Production assembly enables this hard gate for every research cycle.
+        self.require_reasoning_commit = require_reasoning_commit
         self._policy_version = str(policy.get("policy_version", "v0"))
         self._active_conn = None                       # 非 None = 处于 atomic() 外层事务中
         self._bundle_cursor: Dict[str, Optional[str]] = {}
@@ -362,11 +368,20 @@ class SQLiteStateStore:
         self.assert_current_cycle(cycle_id)
         with self._write() as conn:
             active = conn.execute(
-                "SELECT active_question_id FROM cycle WHERE id=?", (_cnum(cycle_id),)).fetchone()
+                "SELECT active_question_id,route FROM cycle WHERE id=?",
+                (_cnum(cycle_id),)).fetchone()
             if active is None or active[0] is not None:
                 raise RuntimeError(
                     f"cycle {cycle_id} 仍持有 active_question_id="
                     f"{active[0] if active else 'missing'}，拒绝终态提交")
+            if (status == "done" and active[1] is not None
+                    and self.require_reasoning_commit
+                    and conn.execute(
+                        "SELECT 1 FROM phase_commit WHERE cycle_id=? "
+                        "AND stage='reasoning' AND target_id IS NULL",
+                        (_cnum(cycle_id),)).fetchone() is None):
+                raise RuntimeError(
+                    f"cycle {cycle_id} 缺 reasoning phase_commit，拒绝 done")
             changed = conn.execute(
                 "UPDATE cycle SET status=?, finished_at=CURRENT_TIMESTAMP "
                 "WHERE id=? AND status NOT IN ('done','failed','aborted')",
@@ -381,6 +396,48 @@ class SQLiteStateStore:
     # -- question 调度可见性 ----------------------------------------------------
     def _pending_dep_count(self, qid_int: int) -> int:
         return self._q1("SELECT count(*) FROM question_dep WHERE question_id=? AND status='pending'", (qid_int,))[0]
+
+    def decompose_guard_reason(self, qid: str) -> Optional[str]:
+        """Return the hard tree guard that makes even one new child impossible.
+
+        Selection validation used to treat every open/inconclusive question as
+        decomposable.  That allowed a durable ``next_intent=decompose`` for a
+        leaf already at ``max_decompose_depth``; the next cycle then acquired
+        the question but could never produce the mandatory ``add_children``
+        operation.  Keep this check in the StateStore because tree capacity is
+        core question state, not a model-side estimate.
+
+        The calculation works both before activation (the parent is counted in
+        the open frontier) and during a decompose cycle (the active parent is
+        temporarily absent from it).  It asks whether the smallest legal
+        operation -- one child -- can fit.
+        """
+        goal_id, goal_ver = self.current_goal_ref()
+        qi = _qnum(qid)
+        row = self._q1(
+            "SELECT status FROM question WHERE id=? AND goal_id=? AND goal_ver=?",
+            (qi, goal_id, goal_ver))
+        if row is None:
+            return "question_not_in_current_goal"
+        if self._pending_dep_count(qi):
+            return "pending_dependency"
+        guard = self.policy["tree_guard"]
+        max_depth = guard.get("max_decompose_depth")
+        if (max_depth is not None
+                and self._depth_of(self._rconn(), qi) + 1 > max_depth):
+            return "max_decompose_depth"
+        existing_children = self._q1(
+            "SELECT count(*) FROM question WHERE parent_id=?", (qi,))[0]
+        if existing_children + 1 > guard["max_children_per_node"]:
+            return "max_children_per_node"
+        open_count = self._q1(
+            "SELECT count(*) FROM question WHERE status IN ('open','inconclusive')")[0]
+        # An active parent must rejoin the open frontier when decomposition
+        # releases it; an already-open parent is included in open_count.
+        released_parent = 1 if row[0] == "active" else 0
+        if open_count + released_parent + 1 > guard["max_open_questions"]:
+            return "max_open_questions"
+        return None
 
     def is_schedulable(self, qid: str, *, for_intent: str = "attack") -> bool:
         goal_id, goal_ver = self.current_goal_ref()
@@ -397,6 +454,8 @@ class SQLiteStateStore:
         if status == "inconclusive" and for_intent == "attack":
             if visit >= self.policy["question_guard"]["max_inconclusive_per_question"]:
                 return False   # 到限：对 attack 不可选，仅可作 decompose / propose_prune 对象
+        if for_intent == "decompose" and self.decompose_guard_reason(qid) is not None:
+            return False
         return True
 
     def list_schedulable_questions(self) -> List[Dict[str, Any]]:
@@ -917,7 +976,8 @@ class SQLiteStateStore:
         if tuple(pr[1:3]) != (1, gver) or pr[3] != _cnum(cycle_id):
             raise ValueError("decompose 父问题不属于本 cycle 的 current goal lineage")
         pqi = _qnum(parent_qid)
-        if self._depth_of(conn, pqi) + 1 > guard["max_decompose_depth"]:
+        max_depth = guard.get("max_decompose_depth")
+        if max_depth is not None and self._depth_of(conn, pqi) + 1 > max_depth:
             raise ValueError("超出 max_decompose_depth")
         children = op["children"]
         # max_children_per_node = 该节点**累计**子问题上限（含此前多次 decompose 已挂的），非单次 op 上限——
@@ -1273,8 +1333,9 @@ class SQLiteStateStore:
             (parent_id,)).fetchone()[0]
         if children + 1 > int(guard["max_children_per_node"]):
             raise ValueError("request_ref child 超出 max_children_per_node")
-        if self._depth_of(conn, parent_id) + 1 > int(
-                guard["max_decompose_depth"]):
+        max_depth = guard.get("max_decompose_depth")
+        if (max_depth is not None
+                and self._depth_of(conn, parent_id) + 1 > int(max_depth)):
             raise ValueError("request_ref child 超出 max_decompose_depth")
 
     def _bind_spawn_request(

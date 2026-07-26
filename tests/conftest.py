@@ -109,6 +109,23 @@ def docker_workspace_tmp_path() -> Path:
         shutil.rmtree(path, ignore_errors=True)
 
 
+@pytest.fixture()
+def vepfs_tmp_path() -> Path:
+    """Use the same external VEPFS mount domain as production storage roots."""
+    parent = SYSTEM_ROOT / "runtime" / "pytest-storage"
+    parent.mkdir(parents=True, exist_ok=True, mode=0o711)
+    parent.chmod(0o711)
+    path = Path(tempfile.mkdtemp(prefix="storage-test-", dir=parent))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+
+
 def load_schema(name: str) -> dict:
     """按短名加载 schema（如 'plan' → schemas/plan.schema.json）。"""
     path = SCHEMAS_DIR / f"{name}.schema.json"

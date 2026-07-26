@@ -570,12 +570,17 @@ def _scan_tar(fd: int, file_size: int, evidence: _BundleEvidence,
 
 class _ManagedTreeScanner:
     def __init__(self, root: Path, manifest: ManagedDraftManifest,
-                 limits: DatasetPreflightLimits):
+                 limits: DatasetPreflightLimits, *,
+                 allow_external_hardlinks: bool = False):
         if not isinstance(root, Path):
             raise DatasetPreflightError(
                 "managed draft files root 须由服务端以 pathlib.Path capability 提供")
+        if not isinstance(allow_external_hardlinks, bool):
+            raise DatasetPreflightError(
+                "allow_external_hardlinks 须为 bool")
         self.limits = limits
         self.manifest = manifest
+        self.allow_external_hardlinks = allow_external_hardlinks
         self.by_path = {item.stored_relpath: item for item in manifest.files}
         self.unseen = set(self.by_path)
         self.counters = _ScanCounters()
@@ -689,7 +694,8 @@ class _ManagedTreeScanner:
         self.counters.files += 1
         if self.counters.files > self.limits.max_files:
             raise DatasetPreflightError("managed draft 文件数超过安全上限")
-        if expected.st_nlink != 1:
+        if (not self.allow_external_hardlinks
+                and expected.st_nlink != 1):
             raise DatasetPreflightError(f"managed draft 拒绝 hardlink: {relative}")
         if expected.st_size > self.limits.max_file_bytes:
             raise DatasetPreflightError("managed draft 单文件超过安全上限")
@@ -711,7 +717,9 @@ class _ManagedTreeScanner:
         try:
             opened = os.fstat(fd)
             current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (not self.allow_external_hardlinks
+                        and opened.st_nlink != 1)
                     or not _same_identity(expected, opened)
                     or not _same_identity(expected, current)):
                 raise DatasetPreflightError(
@@ -801,7 +809,8 @@ def _t1_status(candidates: Sequence[DatasetCandidate]) -> T1RequirementStatus:
 def preflight_managed_datasets(
         managed_draft_files_root: Path,
         manifest: Union[ManagedDraftManifest, Mapping[str, Any]], *,
-        limits: Optional[DatasetPreflightLimits] = None) -> DatasetPreflightReport:
+        limits: Optional[DatasetPreflightLimits] = None,
+        allow_external_hardlinks: bool = False) -> DatasetPreflightReport:
     """Recognize dataset *candidates* in one already-managed draft tree.
 
     The only filesystem argument is the server-side managed root.  Manifest
@@ -811,10 +820,13 @@ def preflight_managed_datasets(
     active_limits = limits if limits is not None else DatasetPreflightLimits()
     if not isinstance(active_limits, DatasetPreflightLimits):
         raise DatasetPreflightError("limits 须为 DatasetPreflightLimits")
+    if not isinstance(allow_external_hardlinks, bool):
+        raise DatasetPreflightError("allow_external_hardlinks 须为 bool")
     closed_manifest = ManagedDraftManifest.from_value(
         manifest, limits=active_limits)
     counters, evidence = _ManagedTreeScanner(
-        managed_draft_files_root, closed_manifest, active_limits).run()
+        managed_draft_files_root, closed_manifest, active_limits,
+        allow_external_hardlinks=allow_external_hardlinks).run()
     candidates = _build_candidates(evidence, active_limits)
     return DatasetPreflightReport(
         manifest_sha256=_manifest_hash(closed_manifest),

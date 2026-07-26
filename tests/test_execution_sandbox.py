@@ -15,6 +15,7 @@ from orchestrator.execution_sandbox import (
     _daemon_bind_source_candidates,
     DockerExecutionSandbox,
     ExecutionSandboxError,
+    LocalExecutionSandbox,
     gpu_capability_projection,
     gpu_cli_argument,
     gpu_contract_hash,
@@ -223,6 +224,196 @@ def test_gpu_capability_hash_is_stable_but_allocation_identity_is_exact():
     assert gpu_cli_argument(first) == (
         '"driver=nvidia","device=GPU-a,GPU-b",'
         '"capabilities=compute,utility"')
+
+
+def test_docker_sandbox_derives_and_prepares_only_the_authorized_gpu_subset(
+        tmp_path):
+    work = tmp_path / "work"
+    (work / "state").mkdir(parents=True)
+    owner_calls = []
+
+    def owner_guard():
+        owner_calls.append("owned")
+
+    full_contract = _gpu_contract("GPU-c", "GPU-b", "GPU-a")
+    sandbox = DockerExecutionSandbox(
+        work_root=work, system_root=SYSTEM_ROOT,
+        config=POLICY["execution"]["sandbox"],
+        owner_guard=owner_guard, gpu_contract=full_contract)
+    sandbox._preflight_done = True
+    sandbox._resource_mode = sandbox.config["resource_mode"]
+
+    derived = sandbox.with_gpu_contract(
+        _gpu_contract("GPU-c", "GPU-a"))
+
+    assert derived.work_root == sandbox.work_root
+    assert derived.system_root == sandbox.system_root
+    assert derived.owner_guard is owner_guard
+    assert derived.qualification_firewall is sandbox.qualification_firewall
+    assert [
+        item["uuid"] for item in sandbox.gpu_contract["devices"]
+    ] == ["GPU-a", "GPU-b", "GPU-c"]
+    assert [
+        item["uuid"] for item in derived.gpu_contract["devices"]
+    ] == ["GPU-a", "GPU-c"]
+    assert derived.gpu_contract is not sandbox.gpu_contract
+    assert derived.gpu_contract_hash == gpu_contract_hash(
+        _gpu_contract("GPU-c", "GPU-a"))
+    assert derived.gpu_contract_hash != sandbox.gpu_contract_hash
+    assert derived.config["gpu_capability"] == gpu_capability_projection(
+        full_contract)
+    assert derived.config == sandbox.config
+    assert derived.config is not sandbox.config
+    assert derived.environment_hash == sandbox.environment_hash
+    assert derived.workload_environment_hash(
+        True) == sandbox.workload_environment_hash(True)
+    assert derived.runtime_identity_hash != sandbox.runtime_identity_hash
+    assert derived._preflight_done is False
+    assert derived._resource_mode is None
+
+    # Avoid requiring a live daemon in this contract test; prepare must still
+    # bind the newly derived exact physical set rather than the parent set.
+    derived._preflight_done = True
+    derived._resource_mode = derived.config["resource_mode"]
+    invocation = derived.prepare(
+        ["python", "-c", "pass"], staging_dir=work / "derived",
+        log_name="derived.log", env=None, timeout_s=10,
+        execution_context={"phase": "derived-gpu", "log_name": "derived.log"},
+        gpu_required=True)
+    try:
+        invocation.spec_file.seek(0)
+        spec = json.loads(invocation.spec_file.read())
+        assert [item["uuid"] for item in spec["gpu"]["devices"]] == [
+            "GPU-a", "GPU-c"]
+        assert "GPU-b" not in json.dumps(spec)
+    finally:
+        invocation.close()
+    assert owner_calls
+
+
+def test_local_sandbox_derived_subset_can_preflight_and_prepare(
+        tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    owner_calls = []
+
+    def owner_guard():
+        owner_calls.append("owned")
+
+    sandbox = LocalExecutionSandbox(
+        work_root=work, system_root=SYSTEM_ROOT,
+        config=POLICY["execution"]["sandbox"],
+        owner_guard=owner_guard,
+        gpu_contract=_gpu_contract("GPU-c", "GPU-b", "GPU-a"))
+    sandbox._preflight_done = True
+
+    derived = sandbox.with_gpu_contract(_gpu_contract("GPU-c", "GPU-a"))
+
+    assert type(derived) is LocalExecutionSandbox
+    assert derived.work_root == sandbox.work_root
+    assert derived.system_root == sandbox.system_root
+    assert derived.owner_guard is owner_guard
+    assert [
+        item["uuid"] for item in derived.gpu_contract["devices"]
+    ] == ["GPU-a", "GPU-c"]
+    assert derived.gpu_contract_hash == gpu_contract_hash(
+        _gpu_contract("GPU-c", "GPU-a"))
+    assert derived.gpu_contract_hash != sandbox.gpu_contract_hash
+    assert derived.config == sandbox.config
+    assert derived.config is not sandbox.config
+    assert derived.environment_hash == sandbox.environment_hash
+    assert derived.workload_environment_hash(
+        True) == sandbox.workload_environment_hash(True)
+    assert derived.runtime_identity_hash != sandbox.runtime_identity_hash
+    assert derived._preflight_done is False
+
+    class _InventoryResult:
+        returncode = 0
+        stderr = b""
+        stdout = (
+            b"GPU-a, NVIDIA A100-SXM4-80GB, 81920, 8.0, 535.129.03\n"
+            b"GPU-b, NVIDIA A100-SXM4-80GB, 81920, 8.0, 535.129.03\n"
+            b"GPU-c, NVIDIA A100-SXM4-80GB, 81920, 8.0, 535.129.03\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: _InventoryResult())
+    derived.preflight()
+    invocation = derived.prepare(
+        [str(derived.python_path), "-c", "pass"],
+        staging_dir=work / "local-derived",
+        log_name="local-derived.log", env=None, timeout_s=10,
+        execution_context={
+            "phase": "local-derived-gpu", "log_name": "local-derived.log"},
+        gpu_required=True)
+
+    assert invocation.env["CUDA_VISIBLE_DEVICES"] == "GPU-a,GPU-c"
+    assert invocation.env["NVIDIA_VISIBLE_DEVICES"] == "GPU-a,GPU-c"
+    assert "GPU-b" not in invocation.env["CUDA_VISIBLE_DEVICES"]
+    assert derived._preflight_done is True
+    assert owner_calls
+
+
+def test_derived_sandbox_rejects_devices_outside_its_authorized_contract(
+        tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    full_contract = _gpu_contract("GPU-b", "GPU-a")
+    sandboxes = [
+        DockerExecutionSandbox(
+            work_root=work, system_root=SYSTEM_ROOT,
+            config=POLICY["execution"]["sandbox"],
+            gpu_contract=full_contract),
+        LocalExecutionSandbox(
+            work_root=work, system_root=SYSTEM_ROOT,
+            config=POLICY["execution"]["sandbox"],
+            gpu_contract=full_contract),
+    ]
+
+    for index, sandbox in enumerate(sandboxes):
+        with pytest.raises(ValueError, match="authorized contract"):
+            sandbox.with_gpu_contract(_gpu_contract("GPU-outside"))
+
+        forged = _gpu_contract("GPU-a")
+        forged["devices"][0]["memory_bytes"] //= 2
+        with pytest.raises(ValueError, match="authorized contract"):
+            sandbox.with_gpu_contract(forged)
+
+        narrowed = sandbox.with_gpu_contract(_gpu_contract("GPU-a"))
+        with pytest.raises(ValueError, match="authorized contract"):
+            narrowed.with_gpu_contract(_gpu_contract("GPU-b"))
+
+        cpu_only = sandbox.with_gpu_contract(None)
+        assert cpu_only.gpu_contract is None
+        assert cpu_only.gpu_contract_hash is None
+        assert cpu_only.config == sandbox.config
+        assert cpu_only.config["gpu_capability"] == (
+            sandbox.config["gpu_capability"])
+        assert cpu_only.environment_hash == sandbox.environment_hash
+        assert cpu_only.runtime_identity_hash != sandbox.runtime_identity_hash
+        with pytest.raises(ValueError, match="authorized contract"):
+            cpu_only.with_gpu_contract(_gpu_contract("GPU-a"))
+
+        cpu_only._preflight_done = True
+        if isinstance(cpu_only, DockerExecutionSandbox):
+            cpu_only._resource_mode = cpu_only.config["resource_mode"]
+        invocation = cpu_only.prepare(
+            [str(getattr(cpu_only, "python_path", "/usr/bin/python")),
+             "-c", "pass"],
+            staging_dir=work / f"cpu-only-{index}",
+            log_name=f"cpu-only-{index}.log", env=None, timeout_s=10,
+            execution_context={
+                "phase": "cpu-only", "log_name": f"cpu-only-{index}.log"},
+            gpu_required=False)
+        if isinstance(cpu_only, DockerExecutionSandbox):
+            try:
+                invocation.spec_file.seek(0)
+                spec = json.loads(invocation.spec_file.read())
+                assert spec["gpu"] is None
+            finally:
+                invocation.close()
+        else:
+            assert invocation.env["CUDA_VISIBLE_DEVICES"] == ""
+            assert invocation.env["NVIDIA_VISIBLE_DEVICES"] == "none"
 
 
 def test_gpu_prepare_binds_exact_request_and_inspect_rejects_drift(tmp_path):

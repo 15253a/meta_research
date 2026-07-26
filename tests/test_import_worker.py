@@ -121,7 +121,9 @@ def _seed_deferred(daemon, state, *, scope='{"allow_eval": true, "allow_publish_
     return {"cid": cid, "lic": lic, **r}
 
 
-def _mk_worker(path, work, fetch=_fetch_ok, *, formal_pool=False):
+def _mk_worker(
+        path, work, fetch=_fetch_ok, *, formal_pool=False,
+        scientific_contract=False):
     daemon = WriteDaemon(db.connect(path))
     state = SQLiteStateStore(daemon, POLICY)
     publisher = None
@@ -130,7 +132,8 @@ def _mk_worker(path, work, fetch=_fetch_ok, *, formal_pool=False):
         publisher = PoolPublisher(work)
     pool = PoolGate(
         daemon, open_gate_read_conn(path), pool_publisher=publisher,
-        require_formal_publication=formal_pool)
+        require_formal_publication=formal_pool,
+        require_scientific_contract=scientific_contract)
     w = ImportWorker(state=state, pool_gate=pool, providers={"fetch": fetch, "judge": _judge(daemon)},
                      obs_policy=OBS, work_root=str(work), pool_publisher=publisher)
     return daemon, state, w
@@ -435,6 +438,57 @@ def test_import_materialization_publishes_and_binds_formal_pool(tmp_path):
         "SELECT count(*) FROM decision WHERE type='pool_publication'")[0] == 1
     assert daemon.query_one(
         "SELECT count(*) FROM card WHERE card_type IN ('baseline','variant','protocol')")[0] == 3
+
+
+def test_import_worker_emits_bound_scientific_decision_for_shared_pool_gate(
+        tmp_path):
+    daemon, state, worker = _mk_worker(
+        str(tmp_path / "scientific-import.sqlite"),
+        tmp_path / "work", formal_pool=True, scientific_contract=True)
+    _seed_deferred(daemon, state)
+
+    assert worker.materialize_pending(max_items=1)
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision "
+        "WHERE type='bundle_scientific_contract'")[0])
+    assert payload["execution_status"] == "succeeded"
+    assert payload["validity_status"] == "valid"
+    assert payload["scientific_outcome"] == "inconclusive"
+    assert payload["pool_eligibility"] == "eligible"
+    assert payload["facts"]["independent_review_receipt"]["review_kind"] == (
+        "bundle_code")
+    assert daemon.query_one("SELECT status FROM baseline")[0] == "legal"
+
+
+def test_import_scientific_invalid_never_admits_training_or_evaluation_pool(
+        tmp_path):
+    def fetch_suspect(cand):
+        spec = _fetch_ok(cand)
+        spec["eval_cmd"] = [
+            sys.executable, "-c",
+            "print('loss: nan'); print('metric_value: 1@1=0.88')",
+        ]
+        return spec
+
+    daemon, state, worker = _mk_worker(
+        str(tmp_path / "scientific-invalid-import.sqlite"),
+        tmp_path / "work", fetch=fetch_suspect,
+        formal_pool=True, scientific_contract=True)
+    _seed_deferred(daemon, state)
+
+    assert worker.materialize_pending(max_items=1)
+    payload = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision "
+        "WHERE type='bundle_scientific_contract'")[0])
+    assert payload["validity_status"] == "invalid"
+    assert payload["pool_eligibility"] == "ineligible"
+    assert daemon.query_one("SELECT code_ref FROM baseline")[0] is None
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='pool_training_publication'")[0] == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='pool_publication'")[0] == 0
 
 
 def test_import_formal_eval_publish_replays_before_gate_registration(tmp_path, monkeypatch):

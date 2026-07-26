@@ -158,13 +158,16 @@ predicate_json: {
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `METARESEARCH_CODEX_BIN` | `codex-chatgpt` | 本机已认证的 codex 包装 |
+| `METARESEARCH_CODEX_BIN` | `/usr/local/bin/codex` | 直接 CLI；尊重 VEPFS binder 注入的 `CODEX_HOME` / `CODEX_SQLITE_HOME`，不得默认使用会重写账户目录的包装 |
 | `METARESEARCH_CODEX_MODEL` | `gpt-5.6-sol` | 当前 ChatGPT Codex 可用模型名 |
 | `METARESEARCH_CODEX_EFFORT` | `max` | 推理力度 |
 | `METARESEARCH_RUNNER_TIMEOUT_S` | `3600` | 普通 Codex 调用超时。跨整个 cycle 的 Bundle 常驻主 turn 绑定 owner 生命周期，不受该墙钟截止；官方 smoke/train/eval 仍各自使用 manifest watchdog。 |
 | `METARESEARCH_QUERY_CODEX_BIN` | `/usr/local/bin/codex` | query/adapter generation/review 的 tool-free CLI；工人 PATH 固定为 `/usr/local/bin:/usr/bin:/bin`，兼容该入口的 `env node` shebang |
 | `METARESEARCH_QUERY_RUN_AS_USER` | root 运行时默认 `codexro`；non-root 默认当前账户 | 可选 UID 隔离；production non-root service 无特权切换 UID，不设置或填当前 service account |
-| `METARESEARCH_QUERY_CODEX_HOME` | 专用账户的 `~/.codex` | 仅 root 显式/默认降权到独立 UID 时使用；同 UID production 使用已验证的 `CODEX_HOME` |
+| `CODEX_HOME` | Web 启动时固定为 `<data-root>/.codex-runtime/service` | 主智能体的配置、认证、日志、会话与包元数据；不得落到 `/root` |
+| `CODEX_SQLITE_HOME` | `<data-root>/.codex-runtime/service-sqlite` | 主智能体的 SQLite thread/state store；Runner 还用 CLI `sqlite_home` 覆盖配置文件中的潜在旧路径 |
+| `METARESEARCH_QUERY_CODEX_HOME` | `<data-root>/.codex-runtime/query` | 独立 reviewer/低权限 Codex 的配置、认证、日志与会话目录 |
+| `METARESEARCH_QUERY_CODEX_SQLITE_HOME` | `<data-root>/.codex-runtime/query-sqlite` | 独立 reviewer 的 SQLite thread/state store；目录归对应低权限 UID 所有 |
 | `METARESEARCH_GITHUB_TOKEN` | — | 可选的 GitHub 只读 API token；仅 plan 明确触发 repo discovery/direct resolve 时读取，不落 policy/DB/回执 |
 | `HTTP_PROXY`/`HTTPS_PROXY` | — | 真 Codex 需要（本机 7890）；Runner 仅从显式白名单转发代理/TLS 环境，不整包继承宿主环境 |
 
@@ -182,7 +185,8 @@ python -m orchestrator.run --system-root . --work-root /tmp/smoke --max-cycles 6
 - `flow.retry.bundle_repair`：同一冻结 plan 内每个 target 的实施自愈上限；当前默认为 `null`，
   表示同一 Bundle 主 turn 内的工程修复不按轮次截断。只有主 Codex 依权威日志判定冻结 plan 本身不可执行时
   才请求 replan 并交必经 Reasoning；用户停止、target 预算或 full watchdog 仍是独立安全界。
-- `tree_guard`：`max_decompose_depth` / `max_children_per_node` / `max_open_questions`（问题树规模护栏）。
+- `tree_guard`：`max_decompose_depth`（正整数为硬上限，`null` 为不限）/
+  `max_children_per_node` / `max_open_questions`（问题树规模护栏）。
 - `execution`：manifest 命令围栏——`default_timeout_s` / `max_timeout_s`；`path_allowlist` 必须与
   `sandbox.readonly_mounts` 完全相同（外部数据根只读映射）。`sandbox` 还固定 engine unix socket、image digest+ID、
   memory/pids/nofile/日志轮转/单文件/输出/CPU/tmpfs 上限；bundle 锚区给出的 runtime `env_hash` 由这些声明机械派生，
@@ -619,7 +623,8 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   Docker backing store 已接近/达到空间上限；这些都不是代码内的“允许降级”，切 production 会 fail-closed。
 - 不可信容器看不到 guardian/provider receipt、SQLite、Codex 凭据或整个 work-root，但同一 host 信任域内的 root/
   orchestrator UID 进程仍能控制 Docker socket 或改本地证据；要防该类 host 对手须独立 service account/VM/远端
-  attestation，不能靠 0600/HMAC 自我证明。普通受信 Runner 也只传 PATH、locale、`CODEX_HOME`/HOME/TMPDIR
+  attestation，不能靠 0600/HMAC 自我证明。普通受信 Runner 也只传 PATH、locale、`CODEX_HOME`/
+  `CODEX_SQLITE_HOME`/HOME/TMPDIR
   与代理/TLS 的显式环境白名单，不向 shell-capable 模型进程转发 connector/GitHub/cloud secrets；tool-free
   query/repository-adapter 与 qualification 隔离工人还始终使用空临时 cwd、关闭全部 host/web/plugin 工具并严核
   trace；production
@@ -825,10 +830,15 @@ durable 停机（τ / global_stop DECISION）会落库——下次同 work-root 
   execution log、完整 publication decision 与 cards 同一 gate 事务闭合后，baseline/variant 才能进入
   `legal`。崩溃最多留下可由同 hash 重放收养的未引用正式文件，不会留下指向 cycle staging 的 legal 身份；
   selector 还会拒绝只有 `status=legal`、没有完整 publication closure 的旧行。
-- Bundle 每个 cycle 只有一个 resident 主 Codex turn。它通过 `bundle_next_target` 串行绑定目标，通过
-  `bundle_execute` 异步启动官方 smoke/train/eval，并用 `bundle_status` 持续读取部分日志；工程错误经
-  `bundle_repair` 在原上下文内修复重跑。当前 `flow.retry.bundle_repair=null`，不创建 fresh session 或按轮次
-  截断；只有权威反馈证明冻结 plan 本身不可执行时才调用 `bundle_replan`，随后仍必须进入 Reasoning。
+- Bundle 每个 cycle 只有一个 resident Scheduler task，只读取紧凑 DAG 状态并派发 ready frontier；每个
+  `build_target` 绑定一个独立且可恢复的 resident Worker task，Worker 不能调度或修改其他 target。
+  Worker 通过 `bundle_execute` 异步启动官方 smoke/train/eval；进入/恢复时用一次有界
+  `bundle_status(mode=snapshot)`，随后只用带 cursor 的 incremental status（默认 200、硬上限 1000，
+  60→120→300→600→1800 秒退避）读取新事件。工程错误经 `bundle_repair` 在原 Worker/task/target
+  身份中修复重跑；Worker 越过最终 control snapshot 后会明确拒绝 late repair/replan，请求方必须重读
+  status 而不能假定取消已生效。当前 `flow.retry.bundle_repair=null`，不按轮次截断；只有权威反馈证明
+  冻结 plan 本身不可执行时才调用 `bundle_replan`，失败传播和排空仍由 Scheduler 依据耐久 DAG 处理并进入
+  Reasoning。
 - 三个非默认触发也已接入，但它们不能冒充 `new_structure`：`human_named` 只接受经 hard confirmation 的
   结构化 `inject_question`（规范 GitHub URI + 可选精确 commit + need summary），plan 只能回引其 exact authority
   hash，受信 connector 再固定 revision/license；自由文本 URL 不形成 authority。控制台消费和外部普查完成都

@@ -77,6 +77,14 @@ EVAL_OK = ("import sys, pathlib; assert pathlib.Path(sys.argv[1]).read_text() ==
 SMOKE_OK = "print('loss: 0.9'); print('smoke ok')"
 
 
+def test_result_candidate_checkpoint_binding_preserves_multiplicity():
+    digest = "a" * 64
+    assert AS._same_checkpoint_hash_multiset(
+        [digest, digest], {"fold0": digest, "fold1": digest})
+    assert not AS._same_checkpoint_hash_multiset(
+        [digest, digest], {"fold0": digest})
+
+
 def test_explicit_owner_guard_requires_same_fenced_supervisor(tmp_path):
     with pytest.raises(ValueError, match="ExecutionSupervisor"):
         AttackStages(
@@ -132,7 +140,26 @@ def _plan_json(ck="ck-attack", slug="toy-b"):
         "targets": [{"target_key": "t1", "target_kind": "build", "seq": 1, "critical": True,
                      "budget_estimate": 1.0, "gpu_required": False,
                      "spec_md": "训练线性 toy 基线并出厂评估", "need_ids": ["n1"],
-                     "claim": {"canonical_key": ck, "slug": slug}}],
+                     "claim": {"canonical_key": ck, "slug": slug},
+                     "scientific_contract": {
+                         "validity_gates": [
+                             {"gate_id": "required",
+                              "kind": "required_metrics_present"},
+                             {"gate_id": "health",
+                              "kind": "parser_not_suspect"},
+                             {
+                                 "gate_id": "independent_review",
+                                 "kind":
+                                     "independent_code_plan_data_boundary_review_receipt_present",
+                             },
+                         ],
+                         "outcome_rules": [{
+                             "rule_id": "primary", "metric_id": "m_acc",
+                             "metric_ver": 1, "operator": "ge",
+                             "threshold": 0.9, "if_true": "supported",
+                             "if_false": "refuted",
+                         }],
+                     }}],
         "protocol": {"name": "toy-proto", "version": 1,
                      "scope_spec": {"dataset": "toy", "split": "holdout"}, "smoke_md": "快速跑一步"},
         "metric_defs": [{"metric_id": "m_acc", "version": 1, "name": "acc", "direction": "higher",
@@ -141,12 +168,53 @@ def _plan_json(ck="ck-attack", slug="toy-b"):
         "build_target_required_metric": [{"target_key": "t1", "metric_id": "m_acc", "metric_ver": 1}]}}
 
 
+def _abc_dag_plan_json():
+    base = _plan_json()["plan.json"]
+    template = base["targets"][0]
+    targets = []
+    for seq, key in enumerate(("A", "B", "C"), start=1):
+        target = json.loads(json.dumps(template))
+        target.update({
+            "target_key": key,
+            "seq": seq,
+            "critical": False,
+            "spec_md": f"构建并评估独立结构 {key}",
+            "claim": {
+                "canonical_key": f"abc-{key.lower()}",
+                "slug": f"abc-{key.lower()}",
+            },
+        })
+        if key != "A":
+            target.update({
+                "depends_on": ["A"],
+                "parent_baseline": {"target_key": "A"},
+                "published_source_inputs": [{
+                    "input_key": "parent", "target_key": "A",
+                }],
+            })
+        targets.append(target)
+    base["targets"] = targets
+    base["build_target_required_metric"] = [
+        {
+            "target_key": key,
+            "metric_id": "m_acc",
+            "metric_ver": 1,
+        }
+        for key in ("A", "B", "C")
+    ]
+    return {"plan.json": base}
+
+
 def _bundle_provider(daemon, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_body=SMOKE_OK):
     """bundle provider（真 Codex 范式：读 pack 的 plan_slice_hash → 回引，产 manifest + 代码 + identity.md）。
     测试从 DB 读切片自算 plan_slice_hash（真 Codex 从 pack 照抄）；命令跑物化代码文件。"""
     def bundle(cyc, pack):
         bt = int(pack.target_id)
         slice_ = json.loads(daemon.query_one("SELECT plan_ref FROM build_target WHERE id=?", (bt,))[0])
+        if slice_.get("scientific_contract", {}).get("outcome_rules"):
+            assert isinstance(
+                slice_["scientific_contract"]["outcome_rules"][0]["metric_id"],
+                int)
         # exec 目标：plan claim.config_json 是配置决定者 → manifest 须照抄（cross_check 强制相等）
         cfg = (slice_.get("claim") or {}).get("config_json") or {"lr": 0.1}
         manifest = {
@@ -236,15 +304,18 @@ def _plan_review_provider(daemon, verdicts, calls):
 def _mk_env(path, work, *, train_body=TRAIN_OK, eval_body=EVAL_OK, smoke_body=SMOKE_OK,
             formal_pool=False):
     daemon = WriteDaemon(db.connect(path))
-    state = SQLiteStateStore(daemon, POLICY)
-    compiler = SqliteCompiler(db.connect(path), POLICY)
+    state = SQLiteStateStore(
+        daemon, POLICY, require_reasoning_commit=True)
+    compiler = SqliteCompiler(
+        db.connect(path), POLICY, work_root=Path(work))
     publisher = None
     if formal_pool:
         Path(work).mkdir(parents=True, exist_ok=True)
         publisher = PoolPublisher(work)
     pool = PoolGate(
         daemon, open_gate_read_conn(path), pool_publisher=publisher,
-        require_formal_publication=formal_pool)
+        require_formal_publication=formal_pool,
+        require_scientific_contract=True)
     obs_conn = db.connect(path)
     close_gate = SqliteGate(daemon, open_gate_read_conn(path), SchemaSet(SYSTEM_ROOT / "schemas"),
                             parser_suspect=lambda aid: OP.suspect_for_attempt(obs_conn, aid, OBS))
@@ -262,10 +333,14 @@ def _bootstrap_attack(state):
     state.create_goal(text="toy 研究目标", predicate_json={})
     c0 = state.open_or_resume_cycle()
     state.set_route(c0.cycle_id, "bootstrap")
-    with state.atomic():
+    with state.atomic() as conn:
         state.apply_tree_ops(c0.cycle_id, [{"op": "create_root", "text": "toy 基线能到 0.9 吗", "local_key": "r"}])
         state.persist_selection(c0.cycle_id, __import__("orchestrator.interfaces", fromlist=["Selection"]).Selection(
             next_question_id="r", next_intent="attack", scores=[]))
+        conn.execute(
+            "INSERT INTO phase_commit(cycle_id,stage,target_id,artifact_hash) "
+            "VALUES (1,'reasoning',NULL,?)",
+            (AS._canon_hash({"fixture": "bootstrap-reasoning"}),))
         state.mark_cycle_done(c0.cycle_id)
 
 
@@ -357,6 +432,77 @@ def test_manifest_runtime_uses_only_baseline_bound_resolver(env, monkeypatch):
     ProjectSandbox.environment_hash = "sha256:" + "e" * 64
     with pytest.raises(RuntimeError, match="不同的 runtime identity"):
         attack._execution_sandbox_for({"env_hash": project_hash}, 1)
+
+
+def test_manifest_runtime_is_restricted_to_the_exact_target_gpu_lease(
+        env, monkeypatch):
+    attack = env["adv"].attack
+    attack.policy = json.loads(json.dumps(POLICY))
+    attack.policy["resources"]["gpu_target_policy"] = "planner_select"
+    gpu_plan = _plan_json()
+    gpu_plan["plan.json"]["targets"][0]["resources"] = {"gpu_count": 2}
+    attack.p["plan"] = lambda _cyc, _pack: gpu_plan
+    cyc = env["adv"]._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = env["state"].cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    target_id = env["daemon"].query_one(
+        "SELECT id FROM build_target WHERE cycle_id=?",
+        (int(cyc.cycle_id[1:]),))[0]
+    assert env["daemon"].query_one(
+        "SELECT gpu_count FROM bundle_resource_request "
+        "WHERE build_target_id=?", (target_id,)) == (2,)
+    assert json.loads(env["daemon"].query_one(
+        "SELECT plan_ref FROM build_target WHERE id=?",
+        (target_id,))[0])["gpu_required"] is True
+
+    base_hash = RUNTIME_ENV_HASH
+    authorized = {"contract": "quest-authorized"}
+    exact = {"contract": "target-exact-subset"}
+    derived = SimpleNamespace(
+        environment_hash=base_hash, gpu_contract=exact)
+
+    class Sandbox:
+        environment_hash = base_hash
+        gpu_contract = authorized
+
+        def __init__(self):
+            self.seen = []
+
+        def with_gpu_contract(self, contract):
+            self.seen.append(contract)
+            return derived
+
+    class Leases:
+        def __init__(self):
+            self.calls = []
+
+        def acquire(self, *, build_target_id, authorized_gpu_contract):
+            self.calls.append((build_target_id, authorized_gpu_contract))
+            return SimpleNamespace(
+                status="acquired", requested_gpu_count=2,
+                sandbox_gpu_contract=exact)
+
+    sandbox = Sandbox()
+    leases = Leases()
+    attack.execution_sandbox = sandbox
+    attack._resource_leases = leases
+    monkeypatch.setattr(
+        attack, "_target_environment_hash", lambda _target_id: base_hash)
+    manifest = {
+        "env_hash": sandbox_workload_environment_hash(base_hash, True),
+        "gpu_required": True,
+    }
+
+    assert attack._execution_sandbox_for(manifest, target_id) is derived
+    assert sandbox.seen == [exact]
+    assert leases.calls == [(target_id, authorized)]
+
+    with pytest.raises(AS._BundleReject, match="gpu_count"):
+        attack._execution_sandbox_for({
+            "env_hash": base_hash,
+            "gpu_required": False,
+        }, target_id)
 
 
 # ============ 全链 e2e ============
@@ -459,6 +605,13 @@ def test_full_attack_cycle(env):
     # plan 落 target + 池占位 → bundle 全链后 complete + legal
     assert d.query_one("SELECT status FROM build_target WHERE target_kind='build'")[0] == "complete"
     assert d.query_one("SELECT status FROM baseline WHERE canonical_key='ck-attack'")[0] == "legal"
+    scientific = json.loads(d.query_one(
+        "SELECT payload_json FROM decision "
+        "WHERE actor='orchestrator' AND type='bundle_scientific_contract'")[0])
+    assert scientific["execution_status"] == "succeeded"
+    assert scientific["validity_status"] == "valid"
+    assert scientific["scientific_outcome"] == "supported"
+    assert scientific["pool_eligibility"] == "eligible"
     # 真 run + checkpoint + 观测（run log + attempt log 双 ingest）
     assert d.query_one("SELECT status FROM run WHERE kind='build'")[0] == "success"
     assert d.query_one("SELECT count(*) FROM checkpoint WHERE ckpt_key LIKE 'final-r%'")[0] == 1
@@ -476,8 +629,118 @@ def test_full_attack_cycle(env):
     assert d.query_one("SELECT count(*) FROM phase_commit WHERE stage='idea'")[0] == 1
     assert d.query_one("SELECT count(*) FROM phase_commit WHERE stage='plan'")[0] == 1
     assert d.query_one("SELECT count(*) FROM phase_commit WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
+    assert d.query_one(
+        "SELECT count(*) FROM phase_commit "
+        "WHERE cycle_id=2 AND stage='reasoning' AND target_id IS NULL")[0] == 1
     # cycle 终态 done
     assert env["state"].last_done_cycle().next_intent == "terminate"
+
+
+def test_scientific_invalid_result_is_not_published_or_sent_to_repair(tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    invalid_eval = (
+        "import sys, pathlib; "
+        "assert pathlib.Path(sys.argv[1]).read_text() == 'weights-v1'; "
+        "print('loss: nan'); print('metric_value: 1@1=0.99')")
+    daemon, state, compiler, attack = _mk_env(
+        path, tmp_path / "work", eval_body=invalid_eval,
+        formal_pool=True)
+    _bootstrap_attack(state)
+    attack.p["reasoning"] = lambda cyc, pack: {
+        "selection.json": {
+            "next_question_id": None,
+            "next_intent": "terminate",
+            "scores": [],
+        }}
+
+    SqliteAdvancer(
+        state, compiler, lambda c, p: None, attack=attack
+    ).run_cycles(max_cycles=4)
+
+    target = daemon.query_one(
+        "SELECT status,failure_kind FROM build_target")
+    assert target == ("failed", "protocol_violation")
+    assert daemon.query_one("SELECT status FROM baseline")[0] == "build_failed"
+    assert daemon.query_one(
+        "SELECT code_ref FROM baseline")[0] is None
+    assert daemon.query_one("SELECT count(*) FROM metric_result")[0] == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='pool_training_publication'")[0] == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='pool_publication'")[0] == 0
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_repair_requested'")[0] == 0
+    scientific = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision "
+        "WHERE type='bundle_scientific_contract'")[0])
+    assert scientific["validity_status"] == "invalid"
+    assert scientific["scientific_outcome"] == "unavailable"
+    assert scientific["pool_eligibility"] == "ineligible"
+    assert scientific["failed_gate_ids"] == ["health"]
+    assert daemon.query_one("SELECT status FROM cycle ORDER BY id DESC")[0] == "done"
+
+
+def test_scientific_invalid_crash_recovers_without_engineering_repair(
+        tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    invalid_eval = (
+        "import sys, pathlib; "
+        "assert pathlib.Path(sys.argv[1]).read_text() == 'weights-v1'; "
+        "print('loss: nan'); print('metric_value: 1@1=0.99')")
+    d1, s1, _, a1 = _mk_env(path, work, eval_body=invalid_eval)
+    _bootstrap_attack(s1)
+    original_finish = a1.gate.gate_finish_build_target
+    crashed = {"done": False}
+
+    def crash_before_invalid_target_terminal(**kwargs):
+        if (not crashed["done"]
+                and kwargs.get("status") == "failed"
+                and kwargs.get("failure_kind") == "protocol_violation"
+                and d1.query_one(
+                    "SELECT count(*) FROM decision "
+                    "WHERE type='bundle_scientific_contract'")[0] == 1):
+            crashed["done"] = True
+            raise SystemExit("SIM-KILL9-after-scientific-decision")
+        return original_finish(**kwargs)
+
+    a1.gate.gate_finish_build_target = crash_before_invalid_target_terminal
+    with pytest.raises(SystemExit, match="scientific-decision"):
+        SqliteAdvancer(
+            s1, a1.compiler, lambda c, p: None, attack=a1
+        ).run_cycles(max_cycles=4)
+    assert d1.query_one("SELECT status FROM build_target")[0] == "running"
+    assert d1.query_one("SELECT status FROM evaluation_attempt")[0] == "failed"
+    assert d1.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_repair_requested'")[0] == 0
+    d1.conn.close()
+
+    d2, s2, _, a2 = _mk_env(path, work, eval_body=invalid_eval)
+    a2.p["reasoning"] = lambda cyc, pack: {
+        "selection.json": {
+            "next_question_id": None, "next_intent": "terminate",
+            "scores": [],
+        }}
+    SqliteAdvancer(
+        s2, a2.compiler, lambda c, p: None, attack=a2
+    ).run_cycles(max_cycles=4)
+
+    assert d2.query_one(
+        "SELECT status,failure_kind FROM build_target") == (
+            "failed", "protocol_violation")
+    assert d2.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_repair_requested'")[0] == 0
+    assert d2.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_scientific_contract'")[0] == 1
+    assert d2.query_one(
+        "SELECT count(*) FROM phase_commit "
+        "WHERE stage='bundle' AND target_id IS NOT NULL")[0] == 1
 
 
 def test_resident_bundle_uses_one_cycle_wide_provider_turn_and_async_worker(
@@ -514,6 +777,9 @@ def test_resident_bundle_uses_one_cycle_wide_provider_turn_and_async_worker(
             cycle_id=main_cyc.cycle_id, stage="bundle",
             target_id=str(bound["build_target_id"]))
         files = materialize(main_cyc, initial_pack)
+        # Simulate owner death in the target-terminal -> phase_commit gap.
+        record_pc = attack._ensure_target_pc
+        attack._ensure_target_pc = lambda *_args, **_kwargs: None
         started = attack.execute_bundle_session(target_scope, files)
         assert "worker_running" in started
         with attack._bundle_session_lock:  # noqa: SLF001 - lifecycle contract
@@ -526,6 +792,7 @@ def test_resident_bundle_uses_one_cycle_wide_provider_turn_and_async_worker(
                 break
             assert time.monotonic() < deadline
             time.sleep(0.02)
+        attack._ensure_target_pc = record_pc
         assert status["controller_error"] is None
         assert status["terminal"] is True
         complete = attack.bind_next_bundle_target(cycle_scope)
@@ -541,7 +808,745 @@ def test_resident_bundle_uses_one_cycle_wide_provider_turn_and_async_worker(
     assert state.cycle(cyc.cycle_id).status == "bundle"
     assert daemon.query_one(
         "SELECT status FROM build_target ORDER BY id LIMIT 1") == ("complete",)
+    assert daemon.query_one(
+        "SELECT count(*) FROM phase_commit WHERE cycle_id=2 "
+        "AND stage='bundle' AND target_id IS NOT NULL") == (1,)
     attack.close()
+
+
+def test_dag_scheduler_runs_fixed_target_worker_to_exact_admission(tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(
+        path, work, formal_pool=True)
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(
+        state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+    materialize = attack.p["bundle"]
+    launched = []
+
+    def target_worker(main_cyc, pack):
+        target_id = int(pack.target_id)
+        launched.append(target_id)
+        scope = SimpleNamespace(
+            cycle_id=main_cyc.cycle_id,
+            stage="bundle",
+            target_id=str(target_id),
+            purpose=(
+                f"bundle-worker-c{int(main_cyc.cycle_id[1:])}"
+                f"-t{target_id}"),
+        )
+        binding = attack.bundle_session_scope(scope)
+        assert binding["target_id"] == target_id
+        files = materialize(main_cyc, pack)
+        attack.execute_bundle_session(scope, files)
+        deadline = time.monotonic() + 20
+        cursor = 0
+        while True:
+            status = attack.bundle_session_status(
+                scope, mode="incremental", after_seq=cursor,
+                limit=200, timeout_s=0.05)
+            cursor = status["journal"]["cursor"]
+            if not status["worker_running"]:
+                break
+            assert time.monotonic() < deadline
+        assert status["controller_error"] is None
+        assert status["terminal"] is True
+        return {}
+
+    def scheduler(main_cyc, pack):
+        assert pack.target_id is None
+        scope = SimpleNamespace(
+            cycle_id=main_cyc.cycle_id,
+            stage="bundle", target_id=None,
+            purpose=f"bundle-scheduler-c{int(main_cyc.cycle_id[1:])}",
+        )
+        deadline = time.monotonic() + 20
+        while True:
+            overview = attack.bundle_scheduler_overview(scope)
+            if overview["cycle_terminal"]:
+                break
+            dispatched = attack.dispatch_bundle_frontier(scope)
+            if dispatched["cycle_terminal"]:
+                break
+            attack.wait_bundle_scheduler(
+                scope, after_revision=dispatched["revision"],
+                timeout_s=0.05)
+            assert time.monotonic() < deadline
+        drained = attack.drain_bundle_scheduler(scope)
+        assert drained["cycle_terminal"] is True
+        return {}
+
+    attack.p["bundle_worker"] = target_worker
+    attack.p["bundle_scheduler"] = scheduler
+    attack.enable_resident_bundle_session()
+    assert attack.advance_stage(cyc) == "reasoning"
+    assert launched == [1]
+    assert daemon.query_one(
+        "SELECT count(*) FROM bundle_target_admission") == (1,)
+    assert daemon.query_one(
+        "SELECT count(*) FROM bundle_terminal_report") == (1,)
+    assert daemon.query_one(
+        "SELECT status FROM cycle WHERE id=2") == ("bundle",)
+    attack.close()
+
+
+def _bind_live_fixed_target_worker(tmp_path):
+    """Create one DAG target whose control owner is the current Worker thread."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(
+        path, work, formal_pool=True)
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(
+        state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+    attack.enable_resident_bundle_session()
+    ci = int(cyc.cycle_id[1:])
+    target_id = int(daemon.query_one(
+        "SELECT id FROM build_target WHERE cycle_id=? ORDER BY seq,id LIMIT 1",
+        (ci,))[0])
+    scope = SimpleNamespace(
+        cycle_id=cyc.cycle_id,
+        stage="bundle",
+        target_id=str(target_id),
+        purpose=f"bundle-worker-c{ci}-t{target_id}",
+    )
+    attack.bundle_session_scope(scope)
+    session = attack._bundle_target_session(ci, target_id)
+    with attack._bundle_session_lock:
+        session["worker"] = threading.current_thread()
+        session["control_accepting"] = True
+    return daemon, attack, scope, session, target_id
+
+
+def test_fixed_target_worker_live_repair_reaches_its_guardian_control(tmp_path):
+    daemon, attack, scope, session, target_id = (
+        _bind_live_fixed_target_worker(tmp_path))
+
+    status = attack.request_bundle_repair(
+        scope, "live target command needs an engineering repair")
+
+    assert status["worker_running"] is True
+    assert status["cancellation_requested"]["replan"] is False
+    control = attack._resident_bundle_control(target_id)
+    assert control["diagnosis_md"] == (
+        "live target command needs an engineering repair")
+    assert control["replan"] is False
+    with attack._bundle_session_lock:
+        assert session["repair_requested"]["observed"] is True
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_repair_requested'") == (0,)
+    attack.close()
+
+
+def test_fixed_target_worker_live_replan_cancels_before_terminal_write(tmp_path):
+    daemon, attack, scope, session, target_id = (
+        _bind_live_fixed_target_worker(tmp_path))
+
+    status = attack.replan_bundle_session(
+        scope, "the frozen scientific contract cannot be executed")
+
+    assert status["worker_running"] is True
+    assert status["terminal"] is False
+    assert status["cancellation_requested"]["replan"] is True
+    assert daemon.query_one(
+        "SELECT status FROM build_target WHERE id=?", (target_id,)) == (
+            "pending",)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_replan_required'") == (0,)
+    control = attack._resident_bundle_control(target_id)
+    assert control["diagnosis_md"] == (
+        "the frozen scientific contract cannot be executed")
+    assert control["replan"] is True
+    with attack._bundle_session_lock:
+        assert session["repair_requested"]["observed"] is True
+    attack.close()
+
+
+def test_fixed_target_worker_closing_boundary_rejects_late_control(
+        tmp_path, monkeypatch):
+    daemon, attack, scope, session, target_id = (
+        _bind_live_fixed_target_worker(tmp_path))
+    with attack._bundle_session_lock:
+        session["worker"] = None
+    closing = threading.Event()
+    release = threading.Event()
+    original_query_one = daemon.query_one
+
+    def block_after_control_snapshot(sql, args=()):
+        if (threading.current_thread() is not threading.main_thread()
+                and sql.startswith(
+                    "SELECT status,failure_kind FROM build_target")):
+            closing.set()
+            if not release.wait(timeout=10):
+                raise RuntimeError("test did not release closing Worker")
+        return original_query_one(sql, args)
+
+    monkeypatch.setattr(daemon, "query_one", block_after_control_snapshot)
+    monkeypatch.setattr(
+        attack, "_drive_target", lambda *_args, **_kwargs: None)
+    attack.execute_bundle_session(scope, {})
+    assert closing.wait(timeout=5)
+    try:
+        with attack._bundle_session_lock:
+            assert session.get("control_accepting") is False
+        for operation in (
+                attack.request_bundle_repair,
+                attack.replan_bundle_session):
+            with pytest.raises(RuntimeError, match="正在收口"):
+                operation(scope, "late control must be retried")
+        with attack._bundle_session_lock:
+            assert session["repair_requested"] is None
+    finally:
+        release.set()
+        worker = session["worker"]
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        attack.close()
+
+
+@pytest.mark.parametrize("operation", ["repair", "replan"])
+def test_legacy_bundle_control_rejects_stale_target_scope_without_mutation(
+        tmp_path, operation):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(
+        path, tmp_path / "work", formal_pool=True)
+    attack.p["plan"] = lambda _cyc, _pack: _abc_dag_plan_json()
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(
+        state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+    attack.enable_resident_bundle_session()
+    ci = int(cyc.cycle_id[1:])
+    target_ids = [
+        int(row[0]) for row in daemon.query(
+            "SELECT id FROM build_target WHERE cycle_id=? ORDER BY seq,id",
+            (ci,))
+    ]
+    assert len(target_ids) >= 2
+    session = attack._bundle_cycle_session(ci)
+    with attack._bundle_session_lock:
+        session["active_target_id"] = target_ids[0]
+        session["worker"] = threading.current_thread()
+        session["control_accepting"] = True
+    stale_scope = SimpleNamespace(
+        cycle_id=cyc.cycle_id, stage="bundle",
+        target_id=str(target_ids[1]))
+
+    with pytest.raises(RuntimeError, match="绑定漂移"):
+        if operation == "repair":
+            attack.request_bundle_repair(
+                stale_scope, "must not reach the active target")
+        else:
+            attack.replan_bundle_session(
+                stale_scope, "must not reach the active target")
+
+    with attack._bundle_session_lock:
+        assert session["repair_requested"] is None
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type IN "
+        "('bundle_repair_requested','bundle_replan_required')") == (0,)
+    attack.close()
+
+
+def test_abc_dag_admission_unlocks_overlapping_private_workers(tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    train_with_overlap = (
+        "import os, pathlib, time; print('loss: 0.5'); "
+        "os.write(2,b'train-warning\\n'); time.sleep(0.2); "
+        "pathlib.Path('ckpt.bin').write_text('weights-v1'); "
+        "print('loss: 0.2'); print('wall_clock_sec: 1.0')")
+    daemon, state, compiler, attack = _mk_env(
+        path, work, formal_pool=True,
+        train_body=train_with_overlap)
+    attack.p["plan"] = lambda _cyc, _pack: _abc_dag_plan_json()
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(
+        state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+    materialize = attack.p["bundle"]
+    activity_lock = threading.Lock()
+    active_workers = 0
+    maximum_overlap = 0
+    starts = {}
+    finishes = {}
+
+    def target_worker(main_cyc, pack):
+        nonlocal active_workers, maximum_overlap
+        target_id = int(pack.target_id)
+        with activity_lock:
+            active_workers += 1
+            maximum_overlap = max(maximum_overlap, active_workers)
+            starts[target_id] = time.monotonic()
+        try:
+            scope = SimpleNamespace(
+                cycle_id=main_cyc.cycle_id,
+                stage="bundle",
+                target_id=str(target_id),
+                purpose=(
+                    f"bundle-worker-c{int(main_cyc.cycle_id[1:])}"
+                    f"-t{target_id}"),
+            )
+            attack.bundle_session_scope(scope)
+            attack.execute_bundle_session(
+                scope, materialize(main_cyc, pack))
+            deadline = time.monotonic() + 30
+            cursor = 0
+            while True:
+                status = attack.bundle_session_status(
+                    scope, mode="incremental", after_seq=cursor,
+                    limit=200, timeout_s=0.05)
+                cursor = status["journal"]["cursor"]
+                if not status["worker_running"]:
+                    break
+                assert time.monotonic() < deadline
+            assert status["terminal"] is True
+            assert status["controller_error"] is None
+            return {}
+        finally:
+            with activity_lock:
+                finishes[target_id] = time.monotonic()
+                active_workers -= 1
+
+    def scheduler(main_cyc, pack):
+        assert pack.target_id is None
+        scope = SimpleNamespace(
+            cycle_id=main_cyc.cycle_id, stage="bundle",
+            target_id=None,
+            purpose=f"bundle-scheduler-c{int(main_cyc.cycle_id[1:])}",
+        )
+        deadline = time.monotonic() + 40
+        while True:
+            state_view = attack.bundle_scheduler_overview(scope)
+            if state_view["cycle_terminal"]:
+                break
+            dispatched = attack.dispatch_bundle_frontier(scope)
+            if dispatched["cycle_terminal"]:
+                break
+            attack.wait_bundle_scheduler(
+                scope, after_revision=dispatched["revision"],
+                timeout_s=0.05)
+            assert time.monotonic() < deadline
+        assert attack.drain_bundle_scheduler(
+            scope)["cycle_terminal"] is True
+        return {}
+
+    attack.p.update({
+        "bundle_worker": target_worker,
+        "bundle_scheduler": scheduler,
+    })
+    attack.enable_resident_bundle_session()
+    assert attack.advance_stage(cyc) == "reasoning"
+
+    rows = daemon.query(
+        "SELECT n.target_id,n.target_key,n.parent_target_id "
+        "FROM bundle_target_node n ORDER BY n.target_id")
+    ids = {key: target_id for target_id, key, _parent in rows}
+    assert rows == [
+        (ids["A"], "A", None),
+        (ids["B"], "B", ids["A"]),
+        (ids["C"], "C", ids["A"]),
+    ]
+    baseline_rows = daemon.query(
+        "SELECT bt.id,b.id,b.parent_id "
+        "FROM build_target bt JOIN baseline b ON b.id=bt.baseline_id "
+        "WHERE bt.cycle_id=2 ORDER BY bt.seq,bt.id")
+    baseline_by_target = {
+        target_id: (baseline_id, parent_id)
+        for target_id, baseline_id, parent_id in baseline_rows
+    }
+    a_baseline_id = baseline_by_target[ids["A"]][0]
+    assert baseline_by_target == {
+        ids["A"]: (a_baseline_id, None),
+        ids["B"]: (baseline_by_target[ids["B"]][0], a_baseline_id),
+        ids["C"]: (baseline_by_target[ids["C"]][0], a_baseline_id),
+    }
+    assert starts[ids["B"]] >= finishes[ids["A"]]
+    assert starts[ids["C"]] >= finishes[ids["A"]]
+    assert maximum_overlap >= 2
+    assert daemon.query_one(
+        "SELECT count(*) FROM bundle_target_admission") == (3,)
+    assert daemon.query_one(
+        "SELECT count(*) FROM bundle_source_binding") == (2,)
+    assert daemon.query_one(
+        "SELECT count(*) FROM bundle_terminal_report") == (3,)
+    b_source = work / "c2" / f"t{ids['B']}" / "published-inputs" / "parent"
+    c_source = work / "c2" / f"t{ids['C']}" / "published-inputs" / "parent"
+    assert b_source.is_dir() and c_source.is_dir()
+    assert (b_source / "train.py").stat().st_ino != (
+        c_source / "train.py").stat().st_ino
+    for target_id in ids.values():
+        records = [
+            json.loads(line)
+            for line in (
+                work / "c2" / "bundle-journal"
+                / f"target-{target_id}.events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+        ]
+        assert any(
+            record["stream"] == "stderr"
+            and record["text"] == "train-warning\n"
+            for record in records
+        )
+    attack.close()
+
+
+def test_resident_bundle_result_review_pauses_before_formal_admission(
+        tmp_path, monkeypatch):
+    """Native result review owns a pre-admission pause, not a post-pool audit."""
+    path = str(tmp_path / "research.sqlite")
+    work = tmp_path / "work"
+    daemon, state, compiler, attack = _mk_env(
+        path, work, formal_pool=True)
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(
+        state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+
+    # Keep the existing independent code reviewer, but model the production
+    # resident result reviewer which is supplied by the live MCP child ledger.
+    attack.gate.require_result_review = False
+    materialize = attack.p["bundle"]
+
+    def resident_bundle(main_cyc, initial_pack):
+        cycle_scope = SimpleNamespace(
+            cycle_id=main_cyc.cycle_id, stage="bundle", target_id=None)
+        bound = attack.bind_next_bundle_target(cycle_scope)
+        target_id = int(bound["build_target_id"])
+        target_scope = SimpleNamespace(
+            cycle_id=main_cyc.cycle_id, stage="bundle",
+            target_id=str(target_id))
+        files = materialize(main_cyc, initial_pack)
+        attack.execute_bundle_session(target_scope, files)
+        deadline = time.monotonic() + 20
+        while True:
+            status = attack.bundle_session_status(target_scope)
+            if not status["worker_running"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+
+        assert status["controller_error"] is None
+        assert status["terminal"] is False
+        assert status["status"] == "running"
+        assert status["awaiting_result_review"] is True
+        candidate_id = status["result_candidate_decision_id"]
+        assert isinstance(candidate_id, int) and candidate_id > 0
+        assert daemon.query_one(
+            "SELECT status FROM evaluation_attempt") == ("running",)
+        assert daemon.query_one(
+            "SELECT status FROM baseline")[0] != "legal"
+        assert daemon.query_one(
+            "SELECT status FROM variant")[0] != "legal"
+        assert daemon.query_one(
+            "SELECT count(*) FROM decision "
+            "WHERE actor='gate' AND type='pool_publication'") == (0,)
+
+        first_run_id = daemon.query_one(
+            "SELECT id FROM run WHERE build_target_id=?", (target_id,))[0]
+        first_training_candidate = json.loads(daemon.query_one(
+            "SELECT payload_json FROM decision "
+            "WHERE actor='orchestrator' AND type='bundle_training_candidate' "
+            "AND json_extract(payload_json,'$.run_id')=?",
+            (first_run_id,))[0])
+        first_training = PoolPublisher(work).verify_training(
+            first_training_candidate["manifest_ref"],
+            expected_hash=first_training_candidate["manifest_hash"])
+        first_baseline_code = first_training.payload["objects"]["baseline"]["code"]
+        first_checkpoint = first_training.checkpoint_bindings[0]
+        first_train_source = (
+            work / first_baseline_code["path"] / "train.py").read_bytes()
+        first_checkpoint_bytes = (work / first_checkpoint["path"]).read_bytes()
+        original_finish_evaluation = attack.gate.gate_finish_evaluation
+        original_schedule_repair = attack._schedule_bundle_repair
+        crash = {"after_attempt": True, "before_schedule": True}
+
+        def crash_after_attempt_settlement(**kwargs):
+            if crash["after_attempt"]:
+                crash["after_attempt"] = False
+                raise RuntimeError("injected post-attempt supersede crash")
+            return original_finish_evaluation(**kwargs)
+
+        def crash_after_supersede_before_schedule(*args, **kwargs):
+            if crash["before_schedule"]:
+                crash["before_schedule"] = False
+                raise RuntimeError("injected pre-repair-schedule crash")
+            return original_schedule_repair(*args, **kwargs)
+
+        monkeypatch.setattr(
+            attack.gate, "gate_finish_evaluation",
+            crash_after_attempt_settlement)
+        monkeypatch.setattr(
+            attack, "_schedule_bundle_repair",
+            crash_after_supersede_before_schedule)
+        diagnosis = "结果 reviewer 发现训练实现问题，必须用修订代码重新训练"
+        with pytest.raises(
+                RuntimeError, match="post-attempt supersede crash"):
+            attack.request_bundle_repair(target_scope, diagnosis)
+        assert daemon.query_one(
+            "SELECT status FROM evaluation_attempt") == ("failed",)
+        assert daemon.query_one(
+            "SELECT count(*) FROM decision "
+            "WHERE type='bundle_result_candidate_superseded'") == (1,)
+        with pytest.raises(
+                RuntimeError, match="pre-repair-schedule crash"):
+            attack.request_bundle_repair(target_scope, diagnosis)
+        assert daemon.query_one(
+            "SELECT count(*) FROM decision "
+            "WHERE type='bundle_result_candidate_superseded'") == (1,)
+        assert daemon.query_one(
+            "SELECT count(*) FROM decision "
+            "WHERE type='bundle_repair_requested'") == (0,)
+
+        repaired_files = dict(files)
+        repaired_train = (
+            "import pathlib; print('loss: 0.4'); "
+            "pathlib.Path('ckpt.bin').write_text('weights-v2')")
+        repaired_files["train.py"] = repaired_train
+        repaired_files["eval.py"] = (
+            "import sys, pathlib; "
+            "assert pathlib.Path(sys.argv[1]).read_text() == 'weights-v2'; "
+            "print('loss: 0.1'); print('metric_value: 1@1=0.94')")
+        deadline = time.monotonic() + 20
+        attack.execute_bundle_session(target_scope, repaired_files)
+        while True:
+            status = attack.bundle_session_status(target_scope)
+            if not status["worker_running"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert status["controller_error"] is None
+        assert status["awaiting_result_review"] is True
+        assert status["result_candidate_decision_id"] != candidate_id
+        assert daemon.query_one(
+            "SELECT count(*) FROM decision "
+            "WHERE type='bundle_repair_requested' "
+            "AND json_extract(payload_json,'$.phase')='result_review' "
+            "AND json_extract(payload_json,'$.repair_of.run_id')=?",
+            (first_run_id,)) == (1,)
+        runs = daemon.query(
+            "SELECT id,status FROM run WHERE build_target_id=? ORDER BY id",
+            (target_id,))
+        assert len(runs) == 2
+        assert runs[0] == (first_run_id, "success")
+        assert runs[1][1] == "success"
+        latest_run_id = runs[1][0]
+        latest_checkpoints = daemon.query(
+            "SELECT content_hash FROM checkpoint "
+            "WHERE produced_by_run=? ORDER BY id", (latest_run_id,))
+        assert latest_checkpoints
+        latest_candidate = json.loads(daemon.query_one(
+            "SELECT payload_json FROM decision WHERE id=?",
+            (status["result_candidate_decision_id"],))[0])
+        assert sorted(latest_candidate["checkpoint_hashes"].values()) == sorted(
+            row[0] for row in latest_checkpoints)
+        second_training_candidate = json.loads(daemon.query_one(
+            "SELECT payload_json FROM decision "
+            "WHERE actor='orchestrator' AND type='bundle_training_candidate' "
+            "AND json_extract(payload_json,'$.run_id')=?",
+            (latest_run_id,))[0])
+        assert second_training_candidate["run_id"] == latest_run_id
+        second_training = PoolPublisher(work).verify_training(
+            second_training_candidate["manifest_ref"],
+            expected_hash=second_training_candidate["manifest_hash"])
+        revision = second_training.payload["objects"]["implementation_revision"]
+        variant_root = second_training.payload["objects"]["variant"]["root"]
+        assert second_training.payload["mode"] == "revision"
+        assert revision["run_id"] == latest_run_id
+        assert revision["root"] == (
+            f"{variant_root}/revisions/run-{latest_run_id}")
+        assert revision["code"]["path"] == f"{revision['root']}/src"
+        revision_source = work / revision["code"]["path"]
+        assert (revision_source / "train.py").read_text(
+            encoding="utf-8") == repaired_train
+        assert all(
+            item["path"].startswith(f"{revision['root']}/checkpoints/")
+            for item in second_training.checkpoint_bindings)
+        assert {item["path"] for item in second_training.checkpoint_bindings}.isdisjoint(
+            {item["path"] for item in first_training.checkpoint_bindings})
+        assert (work / first_baseline_code["path"] / "train.py").read_bytes() == (
+            first_train_source)
+        assert (work / first_checkpoint["path"]).read_bytes() == first_checkpoint_bytes
+        PoolPublisher(work).verify_training(
+            first_training.manifest_ref,
+            expected_hash=first_training.manifest_hash)
+
+        # RuntimeMCP normally writes this only after exact-N live child proof.
+        # This controller test seeds that boundary to exercise the resume half;
+        # RuntimeMCP's dedicated tests verify the proof and full receipt.
+        ack = {
+            "protocol": "native-bundle-result-review-ack-v2",
+            "cycle_id": main_cyc.cycle_id,
+            "build_target_id": target_id,
+            "candidate_decision_id": status["result_candidate_decision_id"],
+            "subject_hash": "sha256:" + "a" * 64,
+            "configured_rounds": 1,
+            "review_decision_id": 1,
+            "review_receipt_hash": "sha256:" + "b" * 64,
+            "runner_call_id": 1,
+            "parent_thread_id": "test-parent",
+            "parent_turn_id": "test-turn",
+            "purpose": "bundle-main-test",
+        }
+        with daemon.transaction() as conn:
+            conn.execute(
+                "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                "VALUES (?,'orchestrator',"
+                "'runtime_bundle_result_review_ack',?)",
+                (int(main_cyc.cycle_id[1:]), json.dumps(
+                    ack, ensure_ascii=False, sort_keys=True)))
+
+        attack.execute_bundle_session(target_scope, repaired_files)
+        while True:
+            status = attack.bundle_session_status(target_scope)
+            if not status["worker_running"]:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        assert status["controller_error"] is None
+        assert status["terminal"] is True
+        assert status["status"] == "complete"
+        assert daemon.query_one(
+            "SELECT status FROM baseline") == ("legal",)
+        assert daemon.query_one(
+            "SELECT status FROM variant") == ("legal",)
+        training_event = json.loads(daemon.query_one(
+            "SELECT payload_json FROM decision "
+            "WHERE actor='gate' AND type='pool_training_publication' "
+            "AND json_extract(payload_json,'$.run_id')=?",
+            (latest_run_id,))[0])
+        expected_revision_binding = {
+            "run_id": latest_run_id,
+            "code_ref": revision["code"]["path"],
+            "commit_hash": "sha256-tree-v1:" + revision["code"]["sha256"],
+        }
+        assert training_event["implementation_revision"] == (
+            expected_revision_binding)
+        pool_event = json.loads(daemon.query_one(
+            "SELECT payload_json FROM decision "
+            "WHERE actor='gate' AND type='pool_publication' "
+            "AND json_extract(payload_json,'$.variant_id')=? "
+            "ORDER BY id DESC LIMIT 1", (second_training.payload[
+                "objects"]["variant"]["variant_id"],))[0])
+        assert pool_event["implementation_revision"] == expected_revision_binding
+        variant_card = daemon.query_one(
+            "SELECT card_md FROM card WHERE card_type='variant' "
+            "AND ref_id=?", (second_training.payload[
+                "objects"]["variant"]["variant_id"],))[0]
+        assert revision["code"]["path"] in variant_card
+        assert revision["code"]["sha256"] in variant_card
+        variant_id = second_training.payload["objects"]["variant"]["variant_id"]
+        active_training, active_checkpoint_rows = (
+            attack._checkpoint_rows_for_reuse(variant_id=variant_id))
+        assert active_training is not None
+        assert active_training.manifest_hash == second_training.manifest_hash
+        assert {row[0] for row in active_checkpoint_rows} == {
+            row[0] for row in daemon.query(
+                "SELECT id FROM checkpoint WHERE produced_by_run=?",
+                (latest_run_id,))}
+        assert len(daemon.query(
+            "SELECT id FROM checkpoint WHERE variant_id=?",
+            (variant_id,))) == 2
+        assert daemon.query_one(
+            "SELECT code_ref,commit_hash FROM baseline") == (
+                first_baseline_code["path"],
+                "sha256-tree-v1:" + first_baseline_code["sha256"])
+
+        # A later formal eval plan freezes and executes only the latest admitted
+        # checkpoint generation; the first run remains immutable history.
+        recheck_plan = _plan_json()["plan.json"]
+        recheck_plan["targets"] = [{
+            "target_key": "eval-repaired", "target_kind": "eval", "seq": 1,
+            "critical": True, "budget_estimate": 1.0,
+            "gpu_required": False, "spec_md": "复测修订 checkpoint",
+            "need_ids": ["n1"], "eval_action": "create_evaluation",
+            "attempt_purpose": "standalone_eval",
+            "eval_key": "repaired-check",
+            "evaluation_source": "standalone_eval",
+            "claim": {
+                "baseline_ref": daemon.query_one(
+                    "SELECT canonical_key FROM baseline")[0],
+                "variant_key": daemon.query_one(
+                    "SELECT variant_key FROM variant WHERE id=?",
+                    (variant_id,))[0],
+            },
+        }]
+        recheck_plan["protocol"] = {
+            "name": "toy-repaired-proto", "version": 1,
+            "scope_spec": {"dataset": "toy", "split": "repair-recheck"},
+            "smoke_md": "eval-only",
+        }
+        recheck_plan["build_target_required_metric"] = [{
+            "target_key": "eval-repaired",
+            "metric_id": "m_acc", "metric_ver": 1,
+        }]
+        derived = attack._derive_plan(
+            int(main_cyc.cycle_id[1:]), recheck_plan,
+            recheck_plan["targets"])
+        recheck_slice = derived["targets"][0]["slice"]
+        assert recheck_slice["target_set_hash"] == AS._canon_hash({
+            "variant_id": variant_id,
+            "checkpoints": [
+                {"id": row[0], "content_hash": row[3]}
+                for row in active_checkpoint_rows
+            ],
+            "protocol": [
+                derived["protocol"]["id"],
+                derived["protocol"]["version"],
+            ],
+        })
+        with daemon.transaction() as conn:
+            conn.execute(
+                "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+                "VALUES (?,'gate','pool_training_publication',?)",
+                (int(main_cyc.cycle_id[1:]), json.dumps({
+                    "schema": "meta-research-pool-training-db-binding/v1",
+                    "manifest_ref": first_training.manifest_ref,
+                    "manifest_hash": first_training.manifest_hash,
+                    "baseline_id": first_training.payload[
+                        "objects"]["baseline"]["baseline_id"],
+                    "variant_id": variant_id,
+                    "checkpoint_ids": first_training_candidate["checkpoint_ids"],
+                    "run_id": latest_run_id,
+                    "implementation_revision": expected_revision_binding,
+                }, ensure_ascii=False, sort_keys=True)))
+        with pytest.raises(
+                RuntimeError, match="最新 admitted training publication.*绑定"):
+            attack._checkpoint_rows_for_reuse(variant_id=variant_id)
+        complete = attack.bind_next_bundle_target(cycle_scope)
+        assert complete["cycle_complete"] is True
+        return files
+
+    attack.p["bundle"] = resident_bundle
+    attack.enable_resident_bundle_session()
+    assert attack.advance_stage(cyc) == "reasoning"
+    attack.close()
+    daemon.conn.close()
 
 
 def test_resident_bundle_top_level_replan_continues_through_reasoning(tmp_path):
@@ -578,7 +1583,7 @@ def test_resident_bundle_top_level_replan_continues_through_reasoning(tmp_path):
     assert attack.advance_stage(cyc) == "reasoning"
     assert daemon.query_one(
         "SELECT status,failure_kind FROM build_target")[:2] == (
-            "engineering_blocked", "protocol_violation")
+            "failed", "protocol_violation")
     assert daemon.query_one(
         "SELECT count(*) FROM decision "
         "WHERE type='bundle_replan_required'") == (1,)
@@ -588,6 +1593,56 @@ def test_resident_bundle_top_level_replan_continues_through_reasoning(tmp_path):
     assert reasoning_calls == [cyc.cycle_id]
     assert state.cycle(cyc.cycle_id).status == "done"
     attack.close()
+    daemon.conn.close()
+
+
+def test_noncritical_dag_replan_skips_only_descendants(tmp_path):
+    from orchestrator.interfaces import BundleReplanRequired
+
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(
+        path, tmp_path / "work")
+    plan = _abc_dag_plan_json()
+    independent = plan["plan.json"]["targets"][2]
+    independent.pop("depends_on")
+    independent.pop("parent_baseline")
+    independent.pop("published_source_inputs")
+    attack.p["plan"] = lambda _cyc, _pack: plan
+    _bootstrap_attack(state)
+    adv = SqliteAdvancer(
+        state, compiler, lambda _c, _p: None, attack=attack)
+    cyc = adv._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+
+    ids = {
+        key: target_id
+        for target_id, key in daemon.query(
+            "SELECT target_id,target_key FROM bundle_target_node "
+            "ORDER BY target_id")
+    }
+    attack._settle_bundle_replan(
+        cyc, ids["A"], BundleReplanRequired({
+            "summary_md": "A 的冻结协议不可执行",
+        }))
+    attack._bundle_apply_early_exit(int(cyc.cycle_id[1:]))
+
+    assert daemon.query(
+        "SELECT n.target_key,bt.status FROM bundle_target_node n "
+        "JOIN build_target bt ON bt.id=n.target_id "
+        "ORDER BY bt.seq,bt.id") == [
+            ("A", "failed"),
+            ("B", "skipped"),
+            ("C", "pending"),
+        ]
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_descendant_skip'") == (1,)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision "
+        "WHERE type='bundle_critical_early_exit'") == (0,)
     daemon.conn.close()
 
 
@@ -627,10 +1682,13 @@ def test_resident_plan_preflight_and_import_search_stay_in_current_cycle(
     plan = _plan_json()["plan.json"]
     checked = attack.preflight_plan_session(scope, plan)
     assert checked == {"kind": "execution", "target_count": 1}
-    bad = json.loads(json.dumps(plan))
-    bad["targets"][0]["seq"] = 2
-    with pytest.raises(AS._PlanReject, match="连续依赖序"):
-        attack.preflight_plan_session(scope, bad)
+    non_contiguous = json.loads(json.dumps(plan))
+    non_contiguous["targets"][0]["seq"] = 2
+    # DAG readiness comes from exact dependency/admission facts.  seq is only
+    # the stable display/dispatch tie-break and need not start at 1.
+    assert attack.preflight_plan_session(
+        scope, non_contiguous) == {
+            "kind": "execution", "target_count": 1}
 
     seen = []
 
@@ -698,6 +1756,48 @@ def test_resident_reasoning_semantic_preflight_is_exact_and_read_only(tmp_path):
         "SELECT status,visit_count FROM question WHERE id=1") == ("active", 0)
 
 
+def test_resident_reasoning_preflight_allows_guard_blocked_decompose_reselection(
+        tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, _compiler, attack = _mk_env(path, tmp_path / "work")
+    state.policy = json.loads(json.dumps(state.policy))
+    state.policy["tree_guard"]["max_decompose_depth"] = 4
+    state.create_goal(text="guard fallback", predicate_json={})
+    with daemon.transaction() as conn:
+        parent = None
+        for index in range(5):
+            parent = conn.execute(
+                "INSERT INTO question(parent_id,goal_id,goal_ver,born_goal_ver,text,status,source) "
+                "VALUES (?,1,1,1,?,'open','agent')",
+                (parent, f"depth-{index}"),).lastrowid
+        alternate = conn.execute(
+            "INSERT INTO question(goal_id,goal_ver,born_goal_ver,text,status,source) "
+            "VALUES (1,1,1,'alternate','open','agent')").lastrowid
+    cyc = state.open_or_resume_cycle()
+    state.set_route(cyc.cycle_id, "decompose")
+    state.activate_question(f"q{parent}")
+    attack.enable_resident_reasoning_session()
+    scope = SimpleNamespace(
+        cycle_id=cyc.cycle_id, stage="reasoning", target_id=None)
+    files = {
+        "tree_ops.json": {"ops": []},
+        "selection.json": {
+            "next_question_id": f"q{alternate}",
+            "next_intent": "attack",
+            "scores": [],
+        },
+    }
+
+    assert attack.preflight_reasoning_session(scope, files) == {
+        "kind": "decompose_guard_fallback", "writes_performed": 0,
+    }
+    assert daemon.query_one(
+        "SELECT status FROM question WHERE id=?", (parent,))[0] == "active"
+    assert daemon.query_one(
+        "SELECT active_question_id,next_question_id,next_intent FROM cycle WHERE id=?",
+        (int(cyc.cycle_id[1:]),)) == (parent, None, None)
+
+
 def _bundle_operator_action(control, action):
     """Echo one server-authored control identity with only the permitted choice."""
     return {"bundle_operator_action.json": {
@@ -735,6 +1835,9 @@ def test_bundle_operator_starts_and_accepts_all_phases_without_bypassing_gates_o
                 assert owner == {
                     "kind": "build_target", "id": control["build_target_id"]}
                 assert target_status == "building"
+                assert daemon.query_one(
+                    "SELECT count(*) FROM decision WHERE actor='judge' "
+                    "AND type='bundle_code_review'")[0] == 1
             elif phase == "train":
                 assert owner["kind"] == "run" and target_status == "running"
                 assert daemon.query_one(
@@ -789,7 +1892,7 @@ def test_bundle_operator_starts_and_accepts_all_phases_without_bypassing_gates_o
     assert all(payload["verdict"] == "pass" for _decision_id, payload in review_rows.values())
     operator_ids = {(payload["phase"], payload["event"]): decision_id
                     for decision_id, payload in operator_rows}
-    assert operator_ids[("smoke", "terminal")] < review_rows["bundle_code_review"][0]
+    assert review_rows["bundle_code_review"][0] < operator_ids[("smoke", "start")]
     assert review_rows["bundle_code_review"][0] < operator_ids[("train", "start")]
     assert operator_ids[("eval", "terminal")] < review_rows["bundle_result_review"][0]
 
@@ -805,6 +1908,8 @@ def test_bundle_operator_starts_and_accepts_all_phases_without_bypassing_gates_o
     assert daemon.query_one(
         "SELECT count(*) FROM decision WHERE actor='gate' "
         "AND type='pool_publication'") == (1,)
+    assert daemon.query_one(
+        "SELECT target_id,cycle_id FROM bundle_target_admission") == (1, 2)
     daemon.conn.close()
 
 
@@ -853,9 +1958,13 @@ def test_bundle_operator_smoke_terminal_repair_reuses_existing_repair_loop_then_
     assert daemon.query_one(
         "SELECT count(*) FROM decision WHERE actor='orchestrator' "
         "AND type='bundle_repair_validated'") == (1,)
-    assert daemon.query_one(
-        "SELECT count(*) FROM decision WHERE actor='judge' "
-        "AND type='bundle_code_review'") == (1,)
+    code_reviews = daemon.query(
+        "SELECT json_extract(payload_json,'$.subject_hash') FROM decision "
+        "WHERE actor='judge' AND type='bundle_code_review' ORDER BY id")
+    # The repair produced a new code subject.  That new subject must receive
+    # its own pre-smoke review instead of inheriting the stale receipt.
+    assert len(code_reviews) == 2
+    assert code_reviews[0][0] != code_reviews[1][0]
     assert daemon.query_one(
         "SELECT count(*) FROM decision WHERE actor='judge' "
         "AND type='bundle_result_review'") == (1,)
@@ -901,6 +2010,61 @@ def test_default_unbounded_bundle_repair_survives_more_than_legacy_limit(tmp_pat
     assert daemon.query_one("SELECT status FROM build_target") == ("complete",)
     assert daemon.query_one("SELECT status FROM baseline") == ("legal",)
     assert daemon.query_one("SELECT value FROM metric_result") == (0.93,)
+    daemon.conn.close()
+
+
+def test_resident_dag_worker_ignores_legacy_repair_limit_and_counts_its_cost(
+        tmp_path):
+    path = str(tmp_path / "research.sqlite")
+    daemon, state, compiler, attack = _mk_env(
+        path, tmp_path / "work")
+    _bootstrap_attack(state)
+    cyc = SqliteAdvancer(
+        state, compiler, lambda _c, _p: None,
+        attack=attack)._resume_or_open()
+    assert attack.advance_stage(cyc) == "plan"
+    cyc = state.cycle(cyc.cycle_id)
+    assert attack.advance_stage(cyc) == "bundle"
+    cyc = state.cycle(cyc.cycle_id)
+    target_id = daemon.query_one(
+        "SELECT id FROM build_target WHERE cycle_id=2")[0]
+    attack.enable_resident_bundle_session()
+    attack.policy = json.loads(json.dumps(attack.policy))
+    attack.policy["flow"]["retry"]["bundle_repair"] = 1
+    with daemon.transaction() as conn:
+        runner_call_id = conn.execute(
+            "INSERT INTO runner_call("
+            "cycle_id,phase,purpose,status) "
+            "VALUES (2,'bundle',?,'success')",
+            (f"bundle-worker-c2-t{target_id}-turn-1",),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO ledger("
+            "cycle_id,phase,runner_call_id,money,policy_version) "
+            "VALUES (2,'bundle',?,3.5,'test')",
+            (runner_call_id,),
+        )
+
+    for _ in range(3):
+        assert attack._schedule_bundle_repair(
+            cyc, target_id,
+            AS._BundleRepairNeeded(
+                "keep repairing", failure_kind="env_invalid",
+                phase="environment"),
+        ) is True
+
+    repairs = [
+        json.loads(row[0]) for row in daemon.query(
+            "SELECT payload_json FROM decision "
+            "WHERE type='bundle_repair_requested' ORDER BY id")
+    ]
+    assert [item["round_no"] for item in repairs] == [1, 2, 3]
+    assert all(item["repair_limit"] is None for item in repairs)
+    assert all(item["spent"] == 3.5 for item in repairs)
+    assert daemon.query_one(
+        "SELECT status FROM build_target WHERE id=?",
+        (target_id,)) == ("pending",)
+    attack.close()
     daemon.conn.close()
 
 
@@ -1323,6 +2487,12 @@ def test_zero_target_reuse_requires_and_exposes_canonical_measurement(tmp_path):
     path = str(tmp_path / "research.sqlite")
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w")
     _bootstrap_attack(state)
+    contract = AS.SC.default_scientific_contract()
+    plan_ref = json.dumps(
+        {"scientific_contract": contract}, sort_keys=True)
+    eval_log_hash = "a" * 64
+    parser_fields = OP.parse_log(
+        "loss: 0.2\nmetric_value: 1@1=0.93\n", OBS)
     with daemon.transaction() as conn:
         conn.execute(
             "INSERT INTO baseline(id,slug,canonical_key,status) "
@@ -1340,17 +2510,86 @@ def test_zero_target_reuse_requires_and_exposes_canonical_measurement(tmp_path):
             "INSERT INTO protocol_metric(protocol_id,protocol_ver,metric_id,metric_ver) "
             "VALUES (1,1,1,1)")
         conn.execute(
-            "INSERT INTO evaluation(id,variant_id,protocol_id,protocol_ver,eval_key,source,status,"
-            "created_cycle,target_set_hash) VALUES (1,1,1,1,'reuse-eval','standalone_eval',"
-            "'created',1,'reuse-target-set')")
+            "INSERT INTO build_target("
+            "id,cycle_id,question_id,target_kind,seq,status,variant_id,"
+            "eval_action,eval_key,evaluation_source,plan_ref) "
+            "VALUES (10,1,1,'eval',10,'complete',1,"
+            "'create_evaluation','reuse-eval','standalone_eval',?)",
+            (plan_ref,))
         conn.execute(
-            "INSERT INTO evaluation_attempt(id,evaluation_id,cycle_id,attempt_no,purpose,status,env_hash) "
-            "VALUES (1,1,1,1,'standalone_eval','success',?)", (RUNTIME_ENV_HASH,))
+            "INSERT INTO build_target_required_metric("
+            "build_target_id,metric_id,metric_ver) VALUES (10,1,1)")
+        conn.execute(
+            "INSERT INTO evaluation(id,variant_id,protocol_id,protocol_ver,eval_key,source,status,"
+            "created_cycle,build_target_id,target_set_hash) "
+            "VALUES (1,1,1,1,'reuse-eval','standalone_eval',"
+            "'created',1,10,'reuse-target-set')")
+        conn.execute(
+            "INSERT INTO evaluation_attempt("
+            "id,evaluation_id,cycle_id,build_target_id,attempt_no,purpose,"
+            "status,env_hash) "
+            "VALUES (1,1,1,10,1,'standalone_eval','success',?)",
+            (RUNTIME_ENV_HASH,))
         conn.execute(
             "INSERT INTO metric_result(id,evaluation_id,evaluation_attempt_id,metric_id,metric_ver,"
             "value,scope) VALUES (1,1,1,1,1,0.93,'aggregate')")
         conn.execute(
+            "INSERT INTO execution_log("
+            "id,evaluation_attempt_id,cycle_id,log_kind,ref,content_hash) "
+            "VALUES (10,1,1,'eval','history/reuse-eval.log',?)",
+            (eval_log_hash,))
+        conn.execute(
             "UPDATE evaluation SET status='success',canonical_attempt_id=1 WHERE id=1")
+        runner_call_id = conn.execute(
+            "INSERT INTO runner_call(cycle_id,phase,purpose,status) "
+            "VALUES (1,'audit','bundle_code_review','success')"
+        ).lastrowid
+        review = {
+            "build_target_id": 10,
+            "review_kind": "bundle_code_review",
+            "round_no": 1,
+            "verdict": "pass",
+            "subject_hash": "b" * 64,
+            "runner_call_id": runner_call_id,
+            "policy_hash": "test",
+        }
+        review_decision_id = conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (1,'judge','bundle_code_review',?)",
+            (json.dumps(review, sort_keys=True),)).lastrowid
+        scientific = AS.SC.build_scientific_decision_payload(
+            build_target_id=10, evaluation_id=1,
+            evaluation_attempt_id=1, contract=contract,
+            execution_status="succeeded",
+            required_metrics=[(1, 1)],
+            metric_results=[{
+                "metric_id": 1, "metric_ver": 1,
+                "value": 0.93, "scope": "aggregate",
+            }],
+            eval_log_hash=eval_log_hash,
+            parser={
+                "version": OP.PARSER_VERSION,
+                "policy_hash": OP.extraction_policy_hash(OBS),
+                "fields": parser_fields,
+                "suspect": False,
+            },
+            independent_review_receipt={
+                "protocol": "legacy-bundle-code-review-v1",
+                "decision_id": review_decision_id,
+                "review_kind": "bundle_code",
+                "review_scope": "code_plan_data_boundary",
+                "subject_hash": "b" * 64,
+                "receipt_hash": AS.SC.canonical_hash({
+                    "decision_id": review_decision_id,
+                    "payload": review,
+                }),
+            })
+        conn.execute(
+            "INSERT INTO decision(cycle_id,actor,type,payload_json) "
+            "VALUES (1,'orchestrator','bundle_scientific_contract',?)",
+            (json.dumps(
+                scientific, sort_keys=True,
+                separators=(",", ":")),))
 
     attack.p["plan"] = lambda cyc, pack: {"plan.json": {
         "needs": [{"need_id": "n1", "statement_md": "reuse exact fixed result"}],
@@ -1730,6 +2969,13 @@ def test_smoke_failure_fails_target(tmp_path):
     SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
     _assert_bundle_repair_exhausted(daemon, "smoke")
     assert daemon.query_one("SELECT count(*) FROM run")[0] == 0        # 未开训
+    terminal = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision "
+        "WHERE type='bundle_scientific_terminal'")[0])
+    assert terminal["execution_status"] == "engineering_blocked"
+    assert terminal["validity_status"] == "not_assessed"
+    assert terminal["scientific_outcome"] == "unavailable"
+    assert terminal["pool_eligibility"] == "ineligible"
     daemon.conn.close()
 
 
@@ -2928,7 +4174,7 @@ def test_sandbox_output_reject_settles_exact_train_owner(tmp_path, monkeypatch):
 
 
 def test_eval_missing_required_metric_target_failed(tmp_path):
-    """required metric 缺失会重出测量实现，到 bundle_repair 上限才 blocked。"""
+    """缺 required metric 是科学无效证据，不得误作工程故障反复重跑。"""
     path = str(tmp_path / "research.sqlite")
     # eval 打印一个不在 required(1@1) 的 metric → required 未覆盖 → register GateReject
     daemon, state, compiler, attack = _mk_env(path, tmp_path / "w",
@@ -2938,9 +4184,20 @@ def test_eval_missing_required_metric_target_failed(tmp_path):
         "selection.json": {"next_question_id": None, "next_intent": "terminate", "scores": []}}
     ids = SqliteAdvancer(state, compiler, lambda c, p: None, attack=attack).run_cycles(max_cycles=4)
     assert len(ids) == 1
-    _assert_bundle_repair_exhausted(daemon, "protocol_violation")
-    assert daemon.query_one("SELECT count(*) FROM evaluation_attempt")[0] == (
-        POLICY["flow"]["retry"]["bundle_repair"] + 1)
+    assert daemon.query_one(
+        "SELECT count(*) FROM decision WHERE type='bundle_repair_requested'") == (0,)
+    assert daemon.query_one("SELECT count(*) FROM evaluation_attempt") == (1,)
+    scientific = json.loads(daemon.query_one(
+        "SELECT payload_json FROM decision "
+        "WHERE type='bundle_scientific_contract'")[0])
+    assert scientific["execution_status"] == "succeeded"
+    assert scientific["validity_status"] == "invalid"
+    assert scientific["scientific_outcome"] == "unavailable"
+    assert scientific["pool_eligibility"] == "ineligible"
+    assert scientific["failed_gate_ids"] == ["required"]
+    assert daemon.query_one(
+        "SELECT status,failure_kind FROM build_target") == (
+            "failed", "protocol_violation")
     daemon.conn.close()
 
 
@@ -3028,8 +4285,16 @@ def test_phase_commit_conflict_rejected(env):
     pc = SqlitePhaseCommit(d)
     cid = env["state"].last_done_cycle().cycle_id
     assert pc.check_or_record(cycle_id=cid, stage="idea", target_id=None, artifact_hash="DRIFT") == "conflict"
-    assert pc.check_or_record(cycle_id=cid, stage="reasoning", target_id=None, artifact_hash="h") == "new"
-    assert pc.check_or_record(cycle_id=cid, stage="reasoning", target_id=None, artifact_hash="h") == "duplicate"
+    reasoning_hash = d.query_one(
+        "SELECT artifact_hash FROM phase_commit "
+        "WHERE stage='reasoning' AND target_id IS NULL "
+        "ORDER BY id DESC LIMIT 1")[0]
+    assert pc.check_or_record(
+        cycle_id=cid, stage="reasoning", target_id=None,
+        artifact_hash="DRIFT") == "conflict"
+    assert pc.check_or_record(
+        cycle_id=cid, stage="reasoning", target_id=None,
+        artifact_hash=reasoning_hash) == "duplicate"
 
 
 # ============ 管线强制先 ingest 再 complete ============
@@ -3060,6 +4325,7 @@ def test_exec_variant_of_legal_baseline(tmp_path):
     def exec_plan(cyc, pack):
         p = _plan_json()["plan.json"]
         p["targets"][0].update({"target_kind": "exec",
+                                "replicate": {"seed": 37},
                                 "claim": {"baseline_ref": "ck-base", "variant_key": "lr01", "config_json": {"lr": 0.01}}})
         return {"plan.json": p}
     attack.p["plan"] = exec_plan
@@ -3070,7 +4336,8 @@ def test_exec_variant_of_legal_baseline(tmp_path):
     assert json.loads(daemon.query_one("SELECT config_json FROM variant WHERE variant_key='lr01'")[0]) == {"lr": 0.01}
     assert daemon.query_one("SELECT target_kind, status FROM build_target")[0:2] == ("exec", "complete")
     # 真训练/评估 + 出厂测量 + 关问（exec 目标 → run.kind='exec'）
-    assert daemon.query_one("SELECT status FROM run WHERE kind='exec'")[0] == "success"
+    assert daemon.query_one("SELECT status,seed FROM run WHERE kind='exec'") == (
+        "success", 37)
     assert daemon.query_one("SELECT value FROM metric_result ORDER BY id DESC LIMIT 1")[0] == 0.93
     assert daemon.query_one("SELECT status FROM question WHERE text LIKE 'toy 基线%'")[0] == "answered"
     # gate_register_variant（非 register_baseline）：baseline 表未新增身份行
@@ -3118,6 +4385,7 @@ def _exec_env(path, work):
     def exec_plan(cyc, pack):
         p = _plan_json()["plan.json"]
         p["targets"][0].update({"target_kind": "exec",
+                                "replicate": {"seed": 37},
                                 "claim": {"baseline_ref": "ck-base", "variant_key": "lr01", "config_json": {"lr": 0.01}}})
         return {"plan.json": p}
     attack.p["plan"] = exec_plan
@@ -3155,6 +4423,7 @@ def test_exec_crash_between_claim_and_terminal_recovers(tmp_path):
     c = db.connect(path)
     assert c.execute("SELECT status FROM variant WHERE variant_key='lr01'").fetchone()[0] == "legal"
     assert c.execute("SELECT status FROM build_target WHERE target_kind='exec'").fetchone()[0] == "complete"
+    assert c.execute("SELECT seed FROM run WHERE kind='exec'").fetchone()[0] == 37
     c.close()
 
 

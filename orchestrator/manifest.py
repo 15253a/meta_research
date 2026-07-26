@@ -1340,6 +1340,8 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
                          execution_context: Optional[Dict[str, Any]] = None,
                          execution_sandbox=None,
                          progress_observer=None,
+                         output_observer=None,
+                         stream_output_observer=None,
                          progress_interval_s: float = 5.0) -> Dict[str, Any]:
     """解析+围栏后委托 harness.run_staged（cwd=staging_dir、.partial→原子改名、.exit 侧车——纪律全继承）。
     返回 run_staged 结果 {exit_code, log_path, log_sha256, log_bytes}；log 入账仍归调用方。"""
@@ -1410,6 +1412,16 @@ def run_manifest_command(manifest: Dict[str, Any], kind: str, *, staging_dir: st
         if progress_observer is not None:
             staged_kwargs.update({
                 "progress_observer": progress_observer,
+                "progress_interval_s": progress_interval_s,
+            })
+        if output_observer is not None:
+            staged_kwargs.update({
+                "output_observer": output_observer,
+                "progress_interval_s": progress_interval_s,
+            })
+        if stream_output_observer is not None:
+            staged_kwargs.update({
+                "stream_output_observer": stream_output_observer,
                 "progress_interval_s": progress_interval_s,
             })
         result = H.run_staged(run_argv, **staged_kwargs)

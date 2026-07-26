@@ -68,11 +68,31 @@ try {
     + ' this.__runtimeProfileSummary=_runtimeProfileSummary; this.__qualificationRuntimeProfile=_qualificationRuntimeProfile;'
     + ' this.__setQuestSetup=function(value){_questSetup=value;}; this.__renderPolling=function(){render({preserveScroll:true});};'
     + ' this.__narratorProgressState=_narratorProgressState;'
+    + ' this.__targetDecisionMatch=_targetDecisionMatch;'
     + ' this.__go=go; this.__captureRenderScroll=_captureRenderScroll; this.__restoreRenderScroll=_restoreRenderScroll;'
     + ' this.__questionExecution=questionExecutionHTML; this.__questionCard=questionCardHTML;'
     + ' this.__setDrawerQuestion=function(qid){state.tab="tree";state.canvas.drawerQ=qid;state.selQ=qid;state.qExec={cycleId:null,phase:null};};'
     + ' this.__refreshDrawer=refreshQuestionDrawer; this.__selectDrawer=canvasSelect;').call(ctx);
 } catch (e) { console.log('SMOKE_FAIL load/render: ' + e.message); process.exit(1); }
+
+const sharedOwnerA = {
+  id: 11, baseline_id: 20, variant_id: 21, evaluation_id: 101,
+  evaluation_ids: [101], evaluation_attempt_ids: [201], run_ids: [301],
+};
+const sharedOwnerB = {
+  id: 12, baseline_id: 20, variant_id: 21, evaluation_id: 102,
+  evaluation_ids: [102], evaluation_attempt_ids: [202], run_ids: [302],
+};
+if (!ctx.__targetDecisionMatch(
+      {evaluation_id: 101, attempt_id: 201, variant_id: 21}, sharedOwnerA, true)
+    || ctx.__targetDecisionMatch(
+      {evaluation_id: 101, attempt_id: 201, variant_id: 21}, sharedOwnerB, true)
+    || !ctx.__targetDecisionMatch(
+      {run_id: 301, variant_id: 21}, sharedOwnerA, true)
+    || ctx.__targetDecisionMatch(
+      {run_id: 301, variant_id: 21}, sharedOwnerB, true)) {
+  console.log('SMOKE_FAIL pool decision strongest target owner'); process.exit(1);
+}
 
 const narratorMessage = {id: 41};
 const narratorSession = {state: 'establishing'};
@@ -350,6 +370,13 @@ if (questionSpecPath) {
   }
   for (const marker of spec.absent || []) {
     if (detail.includes(marker)) { console.log('SMOKE_FAIL question detail invented: ' + marker); process.exit(1); }
+  }
+  const card = ctx.__questionCard(spec.question_id);
+  for (const marker of spec.card_present || []) {
+    if (!card.includes(marker)) { console.log('SMOKE_FAIL question card missing: ' + marker); process.exit(1); }
+  }
+  for (const marker of spec.card_absent || []) {
+    if (card.includes(marker)) { console.log('SMOKE_FAIL question card invented: ' + marker); process.exit(1); }
   }
   if (spec.select) {
     ctx.__setQuestionPhase(spec.select.cycle_id, spec.select.phase);

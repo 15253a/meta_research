@@ -177,13 +177,31 @@
       "additionalProperties": false,
       "properties": {
         "variant_key": { "type": "string", "minLength": 1 },
-        "config_json": { "type": "object", "description": "训练任务设置（不是评估协议——协议只经 evaluation 进入，§1.2.2）" },
+        "config_json": {
+          "$ref": "#/$defs/seedless_config",
+          "description": "variant 的训练配置身份（不是评估协议——协议只经 evaluation 进入，§1.2.2）；seed 只在 run/replicate 上登记"
+        },
         "overrides": {
           "type": "array",
           "description": "只改动的代码文件相对路径（覆盖 baseline src/ 执行；变体不复制整份源码，§5.1）",
           "items": { "type": "string" }
         }
       }
+    },
+    "seedless_config": {
+      "type": "object",
+      "propertyNames": { "not": { "pattern": "^[sS][eE][eE][dD]$" } },
+      "additionalProperties": { "$ref": "#/$defs/seedless_json_value" }
+    },
+    "seedless_json_value": {
+      "anyOf": [
+        { "$ref": "#/$defs/seedless_config" },
+        {
+          "type": "array",
+          "items": { "$ref": "#/$defs/seedless_json_value" }
+        },
+        { "type": ["string", "number", "boolean", "null"] }
+      ]
     },
     "run": {
       "type": "object",

@@ -18,6 +18,7 @@ from orchestrator import database as db
 from orchestrator import harness as H
 from orchestrator import obs_parser as OP
 from orchestrator import recall_sqlite as R
+from orchestrator.execution_journal import ExecutionJournal
 from orchestrator.writedaemon import WriteDaemon
 
 SYSTEM_ROOT = Path(__file__).resolve().parent.parent
@@ -85,6 +86,174 @@ def test_harness_real_subprocess_and_atomic_log(tmp_path):
     assert f["loss_trend"] == "down" and OP.derive_suspect(f, OBS) == 0
     r2 = H.run_staged(cmd, staging_dir=str(tmp_path / "st2"), log_name="train.log", timeout_s=60)
     assert r2["log_sha256"] == r["log_sha256"]                    # 同命令同输出 → 同 content_hash
+
+
+def test_harness_large_final_identity_is_streamed_without_whole_artifact_read(
+        tmp_path, monkeypatch):
+    import hashlib
+
+    payload = b"x" * (2 * 1024 * 1024 + 17)
+
+    def reject_whole_read(*_args, **_kwargs):
+        raise AssertionError("whole-artifact read is forbidden")
+
+    monkeypatch.setattr(H, "read_artifact_bytes", reject_whole_read)
+    result = H.run_staged(
+        [
+            sys.executable, "-c",
+            f"import os; data=b'x'*{len(payload)}; "
+            "[os.write(1,data[i:i+65536]) "
+            "for i in range(0,len(data),65536)]",
+        ],
+        staging_dir=str(tmp_path), log_name="large.log", timeout_s=5,
+    )
+
+    assert result["log_bytes"] == len(payload)
+    assert result["log_sha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_harness_output_observer_is_incremental_exactly_once_and_composes_progress(tmp_path):
+    observed = []
+    progress_ticks = []
+    cmd = [
+        sys.executable, "-c",
+        "import os,time; "
+        "os.write(1,b'alpha-'); time.sleep(0.12); "
+        "os.write(2,'beta'.encode()); time.sleep(0.12); "
+        "os.write(1,b'-final')",
+    ]
+
+    def observe_progress():
+        progress_ticks.append(True)
+        return False
+
+    result = H.run_staged(
+        cmd, staging_dir=str(tmp_path), log_name="stream.log", timeout_s=5,
+        output_observer=observed.append,
+        progress_observer=observe_progress,
+        progress_interval_s=0.05,
+    )
+
+    expected = b"alpha-beta-final"
+    assert b"".join(observed) == expected
+    assert Path(result["log_path"]).read_bytes() == expected
+    assert progress_ticks
+
+
+def test_harness_stream_output_observer_labels_streams_and_keeps_merged_log(
+        tmp_path):
+    observed = []
+    progress_ticks = []
+    cmd = [
+        sys.executable, "-c",
+        "import os,time; "
+        "os.write(1,b'alpha-'); time.sleep(0.12); "
+        "os.write(2,b'warning-'); time.sleep(0.12); "
+        "os.write(1,b'final')",
+    ]
+
+    result = H.run_staged(
+        cmd, staging_dir=str(tmp_path), log_name="streams.log", timeout_s=5,
+        stream_output_observer=lambda stream, chunk, frame_end: (
+            observed.append((stream, chunk, frame_end))),
+        progress_observer=lambda: progress_ticks.append(True) or False,
+        progress_interval_s=0.05,
+    )
+
+    assert [stream for stream, _chunk, _end in observed] == [
+        "stdout", "stderr", "stdout",
+    ]
+    assert b"".join(chunk for _stream, chunk, _end in observed) == (
+        b"alpha-warning-final")
+    assert Path(result["log_path"]).read_bytes() == b"alpha-warning-final"
+    assert progress_ticks
+
+
+def test_harness_rejects_ambiguous_combined_and_stream_observers(tmp_path):
+    with pytest.raises(ValueError, match="不得同时"):
+        H.run_staged(
+            [sys.executable, "-c", "pass"],
+            staging_dir=str(tmp_path), log_name="ambiguous.log", timeout_s=5,
+            output_observer=lambda _chunk: None,
+            stream_output_observer=lambda _stream, _chunk, _end: None,
+        )
+
+
+def test_harness_output_observer_error_cancels_and_fails_loud(tmp_path):
+    class ObserverError(RuntimeError):
+        pass
+
+    observed = []
+
+    def reject(chunk):
+        observed.append(chunk)
+        raise ObserverError("decoder rejected output")
+
+    with pytest.raises(ObserverError, match="decoder rejected output") as caught:
+        H.run_staged(
+            [
+                sys.executable, "-c",
+                "import os,pathlib,time; os.write(1,b'ready'); "
+                "time.sleep(30); pathlib.Path('too-late').write_text('bad')",
+            ],
+            staging_dir=str(tmp_path), log_name="rejected.log", timeout_s=5,
+            output_observer=reject, progress_interval_s=0.05,
+        )
+
+    assert b"".join(observed) == b"ready"
+    assert caught.value.receipt["outcome"] == "cancelled"
+    assert caught.value.receipt["group_drained"] is True
+    assert (tmp_path / "rejected.log.partial").read_bytes() == b"ready"
+    assert not (tmp_path / "rejected.log").exists()
+    assert not (tmp_path / "rejected.log.exit").exists()
+    assert not (tmp_path / "too-late").exists()
+
+
+def test_harness_stream_output_observer_error_cancels_exact_execution(tmp_path):
+    class ObserverError(RuntimeError):
+        pass
+
+    observed = []
+
+    def reject(stream, chunk, frame_end):
+        observed.append((stream, chunk, frame_end))
+        raise ObserverError("stream journal rejected output")
+
+    with pytest.raises(ObserverError, match="stream journal rejected") as caught:
+        H.run_staged(
+            [
+                sys.executable, "-c",
+                "import os,time; os.write(2,b'warning'); time.sleep(30)",
+            ],
+            staging_dir=str(tmp_path), log_name="rejected-stream.log",
+            timeout_s=5, stream_output_observer=reject,
+            progress_interval_s=0.05,
+        )
+
+    assert [(stream, chunk) for stream, chunk, _end in observed] == [
+        ("stderr", b"warning")]
+    assert caught.value.receipt["outcome"] == "cancelled"
+    assert caught.value.receipt["group_drained"] is True
+    assert (tmp_path / "rejected-stream.log.partial").read_bytes() == b"warning"
+    assert not (tmp_path / "rejected-stream.log").exists()
+
+
+def test_harness_output_observer_final_drains_timeout_suffix(tmp_path):
+    observed = []
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        H.run_staged(
+            [
+                sys.executable, "-c",
+                "import os,time; os.write(1,b'before-timeout'); time.sleep(30)",
+            ],
+            staging_dir=str(tmp_path), log_name="timeout.log", timeout_s=0.2,
+            output_observer=observed.append, progress_interval_s=1.0,
+        )
+
+    assert b"".join(observed) == b"before-timeout"
+    assert (tmp_path / "timeout.log.partial").read_bytes() == b"before-timeout"
+    assert not (tmp_path / "timeout.log").exists()
 
 
 def test_harness_timeout_leaves_partial(tmp_path):
@@ -192,6 +361,150 @@ def test_harness_recovers_drained_exit_partial_for_exact_owner(tmp_path, monkeyp
     assert (tmp_path / "eval.log").read_text().strip() == "metric_value: 1@1=0.9"
     assert (tmp_path / "eval.log.exit").read_text() == "0"
     assert not (tmp_path / "eval.log.partial").exists()
+
+
+def test_harness_recovery_hashes_large_final_with_bounded_descriptor_reads(
+        tmp_path, monkeypatch):
+    import hashlib
+
+    original = H.atomic_write_receipt
+    context = {
+        "reconcile_protocol": "execution-owner-v1",
+        "db_owner_kind": "run",
+        "db_owner_id": 88,
+        "cycle_id": "c2",
+        "build_target_id": 19,
+        "phase": "train",
+    }
+    size = 2 * 1024 * 1024 + 31
+
+    def fail_process_pointer(path, receipt):
+        if str(path).endswith(".process.json"):
+            raise OSError("owner-died-before-large-log-publish")
+        return original(path, receipt)
+
+    monkeypatch.setattr(H, "atomic_write_receipt", fail_process_pointer)
+    with pytest.raises(OSError, match="owner-died-before-large-log-publish"):
+        H.run_staged(
+            [
+                sys.executable, "-c",
+                f"import os; data=b'z'*{size}; "
+                "[os.write(1,data[i:i+65536]) "
+                "for i in range(0,len(data),65536)]",
+            ],
+            staging_dir=str(tmp_path), log_name="large.log", timeout_s=5,
+            execution_kind="harness", execution_context=context,
+        )
+
+    monkeypatch.setattr(H, "atomic_write_receipt", original)
+
+    def reject_whole_read(*_args, **_kwargs):
+        raise AssertionError("whole-artifact read is forbidden")
+
+    monkeypatch.setattr(H, "read_artifact_bytes", reject_whole_read)
+    recovered = H.recover_staged_result(
+        staging_dir=str(tmp_path), log_name="large.log",
+        execution_supervisor=None, execution_kind="harness",
+        execution_context=context,
+    )
+
+    assert recovered is not None
+    assert recovered["log_bytes"] == size
+    assert recovered["log_sha256"] == hashlib.sha256(
+        b"z" * size).hexdigest()
+
+
+def test_stream_recovery_replays_only_receipt_verified_uncommitted_suffix(
+        tmp_path, monkeypatch):
+    original = H.atomic_write_receipt
+    context = {
+        "reconcile_protocol": "execution-owner-v1",
+        "db_owner_kind": "run",
+        "db_owner_id": 73,
+        "cycle_id": "c2",
+        "build_target_id": 17,
+        "phase": "train",
+    }
+    journal_root = tmp_path / "journal"
+    journal = ExecutionJournal(journal_root, target_id=17)
+    capture_id = "harness-owner-loss-order"
+    journal.open_capture(capture_id)
+    dropped_tail = []
+
+    def simulate_owner_loss_between_partial_and_journal(
+            stream, chunk, frame_end_offset):
+        if b"alpha" not in chunk:
+            dropped_tail.append((stream, chunk))
+            return
+        journal.append_capture(
+            capture_id, stream, chunk, frame_end_offset)
+
+    def fail_process_pointer(path, receipt):
+        if str(path).endswith(".process.json"):
+            raise OSError("owner-died-before-stream-tail-commit")
+        return original(path, receipt)
+
+    monkeypatch.setattr(H, "atomic_write_receipt", fail_process_pointer)
+    with pytest.raises(
+            OSError, match="owner-died-before-stream-tail-commit"):
+        H.run_staged(
+            [
+                sys.executable, "-c",
+                "import os,time; "
+                "os.write(1,b'alpha\\n'); time.sleep(.12); "
+                "os.write(2,b'warn\\n'); "
+                "os.write(1,b'omega\\n')",
+            ],
+            staging_dir=str(tmp_path / "run"), log_name="train.log",
+            timeout_s=2, execution_kind="harness",
+            execution_context=context,
+            stream_output_observer=simulate_owner_loss_between_partial_and_journal,
+            progress_interval_s=0.05,
+        )
+    assert dropped_tail == [
+        ("stderr", b"warn\n"),
+        ("stdout", b"omega\n"),
+    ]
+    checkpoint = journal.open_capture(capture_id)
+    assert checkpoint["stream_offsets"] == {
+        "stdout": len(b"alpha\n"),
+        "stderr": 0,
+    }
+
+    monkeypatch.setattr(H, "atomic_write_receipt", original)
+    journal.close()
+    with ExecutionJournal(journal_root, target_id=17) as recovered_journal:
+        with pytest.raises(
+                H.ExecutionRecoveryError, match="缺 journal observer"):
+            H.recover_staged_result(
+                staging_dir=str(tmp_path / "run"), log_name="train.log",
+                execution_supervisor=None, execution_kind="harness",
+                execution_context=context,
+            )
+        recovered = H.recover_staged_result(
+            staging_dir=str(tmp_path / "run"), log_name="train.log",
+            execution_supervisor=None, execution_kind="harness",
+            execution_context=context,
+            stream_output_observer=(
+                lambda stream, chunk, frame_end_offset:
+                    recovered_journal.append_capture(
+                        capture_id, stream, chunk, frame_end_offset)),
+            stream_frame_offset=checkpoint["frame_offset"],
+            stream_offsets=checkpoint["stream_offsets"],
+        )
+        view = recovered_journal.snapshot()
+
+    assert recovered is not None and recovered["exit_code"] == 0
+    assert (tmp_path / "run" / "train.log").read_bytes() == (
+        b"alpha\nwarn\nomega\n")
+    assert [
+        (event.seq, event.stream, event.text) for event in view.events
+    ] == [
+        (1, "stdout", "alpha\n"),
+        (2, "stderr", "warn\n"),
+        (3, "stdout", "omega\n"),
+    ]
+    assert view.cursor == 3
 
 
 def test_harness_repair_attempt_ignores_archived_legacy_smoke_receipt(tmp_path):
@@ -414,7 +727,10 @@ def test_real_suspect_blocks_reuse():
     elid = H.register_execution_log(d, cycle_id="c1", log_kind="eval", ref="st/e2.log",
                                     content_hash=_h(NAN_LOG), n_bytes=1, evaluation_attempt_id=2)
     OP.register_parser_suspect_real(conn, conn, OBS)              # 单测同连接即可（生产 gate 用独立观测连接）
-    kw = dict(variant_id=2, protocol_id=1, protocol_ver=1, env_hash="eh1", required=[(1, 1)])
+    kw = dict(
+        variant_id=2, protocol_id=1, protocol_ver=1,
+        env_hash="eh1", required=[(1, 1)],
+        require_scientific_contract=False)
     assert R.reuse_selector(conn, **kw)["hit"] is True            # 无观测 → 无据不疑 → hit
     OP.ingest_observation(d, execution_log_id=elid, log_bytes=NAN_LOG.encode(), obs_policy=OBS)
     assert R.reuse_selector(conn, **kw)["hit"] is False           # nan 观测 → suspect=1 → 挡复用

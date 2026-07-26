@@ -113,6 +113,45 @@ def test_start_non_pending_and_wrong_order(env):
     assert d.query_one("SELECT status FROM build_target WHERE id=11")[0] == "running"
 
 
+def test_dag_roots_can_start_out_of_seq_and_concurrently(env):
+    gate, d = env
+    with d.transaction() as conn:
+        conn.execute(
+            "INSERT INTO bundle_target_node(target_id,cycle_id,target_key) "
+            "VALUES (10,2,'build-root'),(11,2,'eval-root')")
+        conn.execute(
+            "INSERT INTO bundle_resource_request(build_target_id,cycle_id,gpu_count,worker_slots) "
+            "VALUES (10,2,0,1),(11,2,0,1)")
+
+    # seq is only a deterministic frontier tie-breaker: independent roots may
+    # start in either order and may be in flight together.
+    gate.gate_start_build_target(build_target_id=11)
+    gate.gate_start_build_target(build_target_id=10)
+    assert d.query_one("SELECT status FROM build_target WHERE id=10")[0] == "building"
+    assert d.query_one("SELECT status FROM build_target WHERE id=11")[0] == "running"
+
+
+def test_dag_dependency_requires_exact_upstream_admission(env):
+    gate, d = env
+    with d.transaction() as conn:
+        conn.execute(
+            "INSERT INTO bundle_target_node(target_id,cycle_id,target_key) "
+            "VALUES (10,2,'upstream'),(11,2,'downstream')")
+        conn.execute(
+            "INSERT INTO bundle_resource_request(build_target_id,cycle_id,gpu_count,worker_slots) "
+            "VALUES (10,2,0,1),(11,2,0,1)")
+        conn.execute(
+            "INSERT INTO bundle_target_dependency("
+            "cycle_id,upstream_target_id,downstream_target_id"
+            ") VALUES (2,10,11)")
+
+    # Merely being an earlier target (or later becoming complete) cannot unlock
+    # a dependent target; only bundle_target_admission is the readiness fact.
+    with pytest.raises(GateReject, match="精确准入"):
+        gate.gate_start_build_target(build_target_id=11)
+    assert d.query_one("SELECT status FROM build_target WHERE id=11")[0] == "pending"
+
+
 def test_review_passed_requires_valid_runner_call(env):
     gate, d = env
     with d.transaction() as conn:   # runner_call 非 audit/failed → 评审不算过
@@ -313,6 +352,40 @@ def test_noncritical_failure_does_not_authorize_skip(env):
     with pytest.raises(GateReject, match="skipped 仅允许"):
         gate.gate_finish_build_target(build_target_id=11, status="skipped")
     assert d.query_one("SELECT status FROM build_target WHERE id=11")[0] == "pending"
+
+
+def test_dag_noncritical_failure_skips_only_descendants(env):
+    gate, d = env
+    with d.transaction() as conn:
+        conn.execute(
+            "UPDATE build_target SET critical=0 WHERE id=10")
+        conn.execute(
+            "INSERT INTO build_target("
+            "id,cycle_id,question_id,target_kind,seq,critical,status,"
+            "variant_id,evaluation_id,eval_action,plan_ref"
+            ") VALUES (12,2,2,'eval',3,0,'pending',1,1,"
+            "'append_attempt','{}')")
+        conn.execute(
+            "INSERT INTO bundle_target_node(target_id,cycle_id,target_key) "
+            "VALUES (10,2,'failed-root'),(11,2,'dependent'),"
+            "(12,2,'independent')")
+        conn.execute(
+            "INSERT INTO bundle_resource_request("
+            "build_target_id,cycle_id,gpu_count,worker_slots"
+            ") VALUES (10,2,0,1),(11,2,0,1),(12,2,0,1)")
+        conn.execute(
+            "INSERT INTO bundle_target_dependency("
+            "cycle_id,upstream_target_id,downstream_target_id"
+            ") VALUES (2,10,11)")
+
+    gate.gate_start_build_target(build_target_id=10)
+    gate.gate_finish_build_target(
+        build_target_id=10, status="failed", failure_kind="runtime")
+    assert gate.gate_skip_remaining_targets(failed_target_id=10) == [11]
+    assert d.query_one(
+        "SELECT status FROM build_target WHERE id=11")[0] == "skipped"
+    assert d.query_one(
+        "SELECT status FROM build_target WHERE id=12")[0] == "pending"
 
 
 def test_finish_attempt_bad_payload_clean_reject(env):

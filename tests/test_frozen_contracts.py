@@ -19,11 +19,12 @@ def _sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-# CP12 有意收紧 reuse-only 抽象契约：零 target 必须带结构化 reuse_evidence，
-# evaluation/child-answer 复用必须指明可机械回溯的精确 ID。命令、env_hash 与具体
-# device identity 仍由下方语义锁禁止。
+# CP13.1 有意加入 durable DAG / published-source / abstract resource 契约，
+# 把训练 seed 从 variant identity 分离到 target replicate / durable run，并
+# 将 parent_baseline 限定为会创建新 baseline identity 的 build target。
+# 命令、env_hash 与具体 physical device identity 仍由下方语义锁禁止。
 # 若再改 plan.schema（决策性），须更新此常量并走完整评审 + 记 build_log，绝不静默漂移。
-_PLAN_SCHEMA_SHA256 = "a21fa414754b7375a11e761c1d629df99d205fc9ae1e279a6b0c47c2eb3db021"
+_PLAN_SCHEMA_SHA256 = "713556e6adc71adb68607841d2c4e1beaf0835f45eee4e5e0e1d81d11fe3bd5c"
 
 
 def test_plan_schema_frozen():
@@ -58,6 +59,12 @@ def test_plan_schema_has_no_execution_fields():
 
 
 def test_migration_checksum_unchanged():
-    """DDL 三重锁的 MIGRATION_SHA256 未变（步⑧全程零 DDL 改动的机器证明）。"""
+    """原始附录 A migration 保持 byte-for-byte frozen。"""
     digest = _sha256(SYSTEM_ROOT / "db" / "migrations" / "0001_appendix_a.sql")
-    assert digest == db.MIGRATION_SHA256, "migration 文件漂移——步⑧承诺不改 DDL"
+    assert digest == db.MIGRATION_SHA256, "0001 migration 文件漂移"
+
+
+def test_bundle_dag_additive_migration_checksum_locked():
+    digest = _sha256(
+        SYSTEM_ROOT / "db" / "migrations" / "0002_bundle_target_dag.sql")
+    assert digest == db.BUNDLE_DAG_MIGRATION_SHA256

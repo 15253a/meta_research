@@ -719,6 +719,49 @@ def test_t1_confirmatory_sandbox_mounts_exact_frozen_explore_set(tmp_path):
         invocation.close()
 
 
+def test_gpu_subset_sandbox_preserves_exact_qualification_firewall(tmp_path):
+    work = tmp_path / "work"
+    contract = _t1_contract(tmp_path)
+    firewall = install_contract(work, contract)
+    config = _policy(contract)["execution"]["sandbox"]
+
+    def gpu_contract(*uuids):
+        return {
+            "version": 1,
+            "provider": "nvidia",
+            "driver_version": "535.129.03",
+            "request": {
+                "driver": "nvidia",
+                "capabilities": ["compute", "utility", "gpu"],
+                "options": {},
+            },
+            "devices": [{
+                "uuid": uuid,
+                "model": "NVIDIA A100-SXM4-80GB",
+                "memory_bytes": 80 * 1024 ** 3,
+                "compute_capability": "8.0",
+            } for uuid in uuids],
+        }
+
+    sandbox = DockerExecutionSandbox(
+        work_root=work, config=config, system_root=SYSTEM_ROOT,
+        gpu_contract=gpu_contract("GPU-b", "GPU-a"),
+        qualification_firewall=firewall)
+
+    derived = sandbox.with_gpu_contract(gpu_contract("GPU-a"))
+
+    assert derived.qualification_firewall is firewall
+    assert derived.work_root == sandbox.work_root
+    assert derived.system_root == sandbox.system_root
+    assert derived.owner_guard is sandbox.owner_guard
+    assert derived.config["readonly_mounts"] == sandbox.config["readonly_mounts"]
+    assert derived.config == sandbox.config
+    assert derived.environment_hash == sandbox.environment_hash
+    assert derived.runtime_identity_hash != sandbox.runtime_identity_hash
+    assert [item["uuid"] for item in derived.gpu_contract["devices"]] == [
+        "GPU-a"]
+
+
 def test_publish_fallback_reconciles_exact_crash_left_hardlink(tmp_path):
     parent = tmp_path / "state"
     parent.mkdir()

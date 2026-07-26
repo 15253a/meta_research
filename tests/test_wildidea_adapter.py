@@ -56,8 +56,11 @@ def _enabled_policy():
     policy["idea"]["novelty_check"] = {
         "enabled": True,
         "status": "controlled_backend_enabled",
-        "provider": "arxiv_api_v1",
-        "endpoint": "https://export.arxiv.org/api/query",
+        "provider": "literature_federated_v1",
+        "endpoints": {
+            "crossref": "https://api.crossref.org/works",
+            "openalex": "https://api.openalex.org/works",
+        },
         "queries_per_candidate": 1,
         "max_results_per_query": 10,
         "timeout_s": 20,
@@ -68,7 +71,7 @@ def _enabled_policy():
 
 
 class _FakeNoveltyProvider:
-    name = "arxiv_api_v1"
+    name = "literature_federated_v1"
 
     def __init__(self):
         self.calls = []
@@ -187,6 +190,40 @@ def test_startup_verifies_exact_upstream_identity_and_policy():
     bad["idea"]["engine"]["version"] = "wildidea@main"
     with pytest.raises(WildIdeaAdapterError, match="policy.idea.engine"):
         WildIdeaAdapter(SYSTEM_ROOT, bad)
+
+
+def test_resident_controller_binding_is_one_time_and_delegates():
+    adapter = WildIdeaAdapter(SYSTEM_ROOT, _policy())
+    calls = []
+
+    class Controller:
+        def prepare_resident_wildidea(
+                self, scope, *, need_innovation):  # noqa: ANN001
+            calls.append(("expand", scope, need_innovation))
+            return {"generation_path": (
+                "wildidea" if need_innovation else "bypass")}
+
+        def audit_resident_wildidea(self, scope, *, draft):  # noqa: ANN001
+            calls.append(("audit", scope, draft))
+            return {
+                "idea_set": {"selected_id": "c1"},
+                "internal_provenance": {},
+            }
+
+    controller = Controller()
+    adapter.bind_resident_controller(controller)
+    scope = object()
+    assert adapter.resident_expand(
+        scope, need_innovation=True)["generation_path"] == "wildidea"
+    assert adapter.resident_audit(
+        scope, draft={"draft": 1})["idea_set"]["selected_id"] == "c1"
+    assert calls == [
+        ("expand", scope, True),
+        ("audit", scope, {"draft": 1}),
+    ]
+    adapter.bind_resident_controller(controller)
+    with pytest.raises(WildIdeaAdapterError, match="不得重绑定"):
+        adapter.bind_resident_controller(Controller())
 
 
 def test_startup_fails_closed_on_any_vendored_byte_tamper(tmp_path):
@@ -493,7 +530,7 @@ def test_controlled_novelty_freezes_before_blind_audit_and_stamps_final_refs():
     assert len(final["novelty_refs"]) == 3
     assert {row["candidate_id"] for row in final["novelty_refs"]} == {
         "c0", "c1", "c2"}
-    assert all(row["provider"] == "arxiv_api_v1"
+    assert all(row["provider"] == "literature_federated_v1"
                for row in final["novelty_refs"])
     assert all(candidate["novelty_status"] ==
                "联网粗查已启用·文献级待人工验证"

@@ -521,6 +521,11 @@ def test_slow_network_delivery_never_blocks_interaction_pump(tmp_path):
 def test_cli_requires_explicit_outbound_choice_and_accepts_real_profile(tmp_path, monkeypatch, capsys):
     import orchestrator.run as run_module
 
+    monkeypatch.setattr(
+        run_module, "configure_process_storage",
+        lambda root, *, require_external_mount, private_work_root=None: {
+            "METARESEARCH_STORAGE_ROOT": str(Path(root).absolute()),
+        })
     missing_work = tmp_path / "missing-work"
     assert run_module.main([
         "--system-root", SYSTEM_ROOT, "--work-root", str(missing_work),
