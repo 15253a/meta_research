@@ -2,6 +2,12 @@
 
 这是 [“原型验证 Writing 交付物结构与修订体验”](https://github.com/15253a/meta_research/issues/76) 的抛弃式、只读 UI 原型，不是生产实现或正式规格。
 
+## 视觉方向
+
+本轮使用 Anthropic 的 [`frontend-design`](https://skills.sh/anthropics/skills/frontend-design) skill 重构为“证据光台”：对象是绑定冻结研究快照的可追溯 Writing 交付物，受众是负责核验来源与改稿边界的研究负责人，页面的单一任务是在不改写研究事实的前提下审阅一个精确版本并提出局部修订。
+
+冷色实验台、稿件层与 mono 坐标来自研究核验现场；交互式“证据光路”把正文的 `C-01 / E-02 / L-03` 坐标连接到精确 Resolution 及其支持边界。信号橙只用于修订或越界警告，C 中的编号只表示真实验收顺序。旧版暖纸张视觉仍保留在分支历史中，可随时比较或回退。
+
 ## 要回答的问题
 
 paper、报告和 PPT 是否应共享 `claim + evidence + limitation` 这一可追踪语义单元，只在组织与叙事方式上分化？用户能否清楚地查来源、识别陈旧与不完整、对精确交付物版本和输入 Snapshot 提出局部修订，并理解“修改交付物不等于改变研究事实”？
@@ -18,7 +24,7 @@ python -m http.server 8776 --bind 127.0.0.1 --directory /tmp/meta-research-issue
 - `http://127.0.0.1:8776/writing-prototype/?variant=B` — 交付物谱系地图
 - `http://127.0.0.1:8776/writing-prototype/?variant=C` — 聚焦式验收流程
 
-页面底部浮动栏或键盘左右方向键可以切换方案；输入框聚焦时不会拦截方向键。所有操作只更新浏览器内存，`coreWrites = 0`，不使用持久化。
+页面顶部 prototype bar 或键盘左右方向键可以切换方案；输入框聚焦时不会拦截方向键。所有操作只更新浏览器内存，`coreWrites = 0`，不使用持久化。
 
 ## 建议验收任务
 
