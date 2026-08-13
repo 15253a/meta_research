@@ -4,9 +4,9 @@
 
 ## 视觉方向
 
-本轮使用 Anthropic 的 [`frontend-design`](https://skills.sh/anthropics/skills/frontend-design) skill 重构为“证据光台”：对象是绑定冻结研究快照的可追溯 Writing 交付物，受众是负责核验来源与改稿边界的研究负责人，页面的单一任务是在不改写研究事实的前提下审阅一个精确版本并提出局部修订。
+本轮采用本机 `claude` CLI 产出的设计方向，并按 `frontend-design` 方法重构为“校样与批注道”（该机器的 CLI 包装脚本当前实际路由到 Kimi K3）：对象是绑定冻结研究快照的可追溯 Writing 交付物，受众是负责核验来源与改稿边界的研究负责人，页面的单一任务是在不改写研究事实的前提下审阅一个精确版本并提出局部修订。
 
-冷色实验台、稿件层与 mono 坐标来自研究核验现场；交互式“证据光路”把正文的 `C-01 / E-02 / L-03` 坐标连接到精确 Resolution 及其支持边界。信号橙只用于修订或越界警告，C 中的编号只表示真实验收顺序。旧版暖纸张视觉仍保留在分支历史中，可随时比较或回退。
+视觉取自当代编辑部的实体校样、页边批注、装订脊与版本签封：A 是“校样读批台”，B 是“同根三册对照”，C 是“纵向签核单”。唯一 Version Seal 直接绑定 `W-v3 / RG r184 / 父 W-v2`；旧版“证据光台”保留在 commit `14e3519b`，可随时比较或回退。
 
 ## 要回答的问题
 
@@ -20,11 +20,11 @@ python -m http.server 8776 --bind 127.0.0.1 --directory /tmp/meta-research-issue
 
 访问：
 
-- `http://127.0.0.1:8776/writing-prototype/?variant=A` — 语义脊柱审稿台
-- `http://127.0.0.1:8776/writing-prototype/?variant=B` — 交付物谱系地图
-- `http://127.0.0.1:8776/writing-prototype/?variant=C` — 聚焦式验收流程
+- `http://127.0.0.1:8776/writing-prototype/?variant=A` — 校样读批台
+- `http://127.0.0.1:8776/writing-prototype/?variant=B` — 同根三册对照
+- `http://127.0.0.1:8776/writing-prototype/?variant=C` — 纵向签核单
 
-页面顶部 prototype bar 或键盘左右方向键可以切换方案；输入框聚焦时不会拦截方向键。所有操作只更新浏览器内存，`coreWrites = 0`，不使用持久化。
+页面底部 prototype switcher 或键盘左右方向键可以切换方案；输入框聚焦时不会拦截方向键。所有操作只更新浏览器内存，`coreWrites = 0`，不使用持久化。
 
 ## 建议验收任务
 
