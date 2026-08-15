@@ -1,0 +1,7 @@
+interface:
+  display_name: "Idea Stage"
+  short_description: "Form typed, reviewable Idea outcomes"
+  default_prompt: "Use $idea-stage with a current typed Idea StageRunRequest to form and submit an IdeaOutcome."
+
+policy:
+  allow_implicit_invocation: false
