@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Deterministic Idea Stage contract fixture.
+"""Idea Stage 确定性契约 fixture。
 
-This module demonstrates semantic routing with explicitly non-authoritative
-fixture refs and fake ports.  It is not a production schema, Owner, transport,
-or candidate-generation algorithm.
+本模块以明确无生产权威的 fixture ref 与 fake port 演示语义路由；它不是
+生产 schema、State Owner、transport 或候选生成算法。
 """
 
 from __future__ import annotations
@@ -37,11 +36,11 @@ DISPOSITION_ACTIONS = {"revised", "not_adopted"}
 
 
 class ContractViolation(ValueError):
-    """The fixture failed a fail-closed contract gate."""
+    """Fixture 未通过 fail-closed 契约门禁。"""
 
 
 class TechnicalPortError(RuntimeError):
-    """A fake port experienced a typed technical failure."""
+    """Fake port 发生类型化技术失败。"""
 
 
 def _require_text(value: str, label: str) -> None:
@@ -60,6 +59,13 @@ def _require_fixture_ref(value: str, label: str) -> None:
 def _require_hash(value: str, label: str) -> None:
     if not isinstance(value, str) or not HASH_RE.match(value):
         raise ContractViolation("{} must be a sha256 content hash".format(label))
+
+
+def _require_text_tuple(value: Tuple[str, ...], label: str) -> None:
+    if not isinstance(value, tuple):
+        raise ContractViolation("{} must be an explicit frozen tuple".format(label))
+    for item in value:
+        _require_text(item, label + " item")
 
 
 def _jsonable(value: Any) -> Any:
@@ -84,77 +90,389 @@ def fixture_hash(seed: str) -> str:
 
 
 @dataclass(frozen=True)
-class ContextItem:
-    role: str
-    ref: str
-    sha256: str
+class AcceptedQuestionBinding:
+    question_ref: str
+    quest_ref: str
+    question_content_ref: str
+    question_content_hash: str
+    question_content_schema_ref: str
+    rm_content_accepted_receipt_ref: str
+    rg_question_accepted_receipt_ref: str
 
     def validate(self) -> None:
-        _require_text(self.role, "context item role")
-        _require_fixture_ref(self.ref, "context item ref")
-        _require_hash(self.sha256, "context item hash")
+        for label, value in (
+            ("Question ref", self.question_ref),
+            ("Question Quest ref", self.quest_ref),
+            ("Question content ref", self.question_content_ref),
+            ("Question content schema ref", self.question_content_schema_ref),
+            (
+                "Question content acceptance receipt",
+                self.rm_content_accepted_receipt_ref,
+            ),
+            (
+                "Question acceptance receipt",
+                self.rg_question_accepted_receipt_ref,
+            ),
+        ):
+            _require_fixture_ref(value, label)
+        _require_hash(self.question_content_hash, "Question content hash")
+
+
+@dataclass(frozen=True)
+class QuestGoalContent:
+    goal_statement: str
+    completion_milestones: Tuple[str, ...]
+    exclusions: Tuple[str, ...]
+
+    def validate(self) -> None:
+        _require_text(self.goal_statement, "Quest Goal statement")
+        _require_text_tuple(self.completion_milestones, "Quest Goal milestones")
+        _require_text_tuple(self.exclusions, "Quest Goal exclusions")
+
+
+@dataclass(frozen=True)
+class QuestGoalAnchor:
+    quest_ref: str
+    goal_revision_ref: str
+    goal_content_ref: str
+    goal_content_hash: str
+    goal_accepted_receipt_ref: str
+    content: QuestGoalContent
+
+    def validate(self) -> None:
+        for label, value in (
+            ("Quest ref", self.quest_ref),
+            ("Quest Goal revision ref", self.goal_revision_ref),
+            ("Quest Goal content ref", self.goal_content_ref),
+            ("Quest Goal acceptance receipt", self.goal_accepted_receipt_ref),
+        ):
+            _require_fixture_ref(value, label)
+        _require_hash(self.goal_content_hash, "Quest Goal content hash")
+        if not isinstance(self.content, QuestGoalContent):
+            raise ContractViolation("Quest Goal content projection must be typed")
+        self.content.validate()
+        if canonical_hash(self.content) != self.goal_content_hash:
+            raise ContractViolation("Quest Goal anchor copy-by-value hash drifted")
+
+
+@dataclass(frozen=True)
+class NoLiteratureAnchor:
+    status: str = field(default="none", init=False)
+
+    def validate(self) -> None:
+        if self.status != "none":
+            raise ContractViolation("empty literature anchor must use status none")
+
+
+@dataclass(frozen=True)
+class BoundLiteratureAnchor:
+    question_literature_revision_ref: str
+    revision_content_hash: str
+    rm_accepted_receipt_ref: str
+    rg_question_association_receipt_ref: str
+    summary_ref: str
+    papers_ref: str
+    fulltext_manifest_ref: str
+    status: str = field(default="bound", init=False)
+
+    def validate(self) -> None:
+        if self.status != "bound":
+            raise ContractViolation("bound literature anchor must use status bound")
+        for label, value in (
+            ("QuestionLiteratureRevision ref", self.question_literature_revision_ref),
+            ("literature RM acceptance receipt", self.rm_accepted_receipt_ref),
+            ("literature RG association receipt", self.rg_question_association_receipt_ref),
+            ("literature summary ref", self.summary_ref),
+            ("literature papers ref", self.papers_ref),
+            ("literature fulltext manifest ref", self.fulltext_manifest_ref),
+        ):
+            _require_fixture_ref(value, label)
+        _require_hash(self.revision_content_hash, "literature revision content hash")
+
+
+LiteratureAnchor = Union[NoLiteratureAnchor, BoundLiteratureAnchor]
+
+
+@dataclass(frozen=True)
+class StableReferenceBinding:
+    semantic_role: str
+    source_owner: str
+    object_ref: str
+    content_hash: str
+    authority_proof_refs: Tuple[str, ...]
+
+    def validate(self) -> None:
+        _require_text(self.semantic_role, "stable reference semantic role")
+        _require_text(self.source_owner, "stable reference source Owner")
+        _require_fixture_ref(self.object_ref, "stable object ref")
+        _require_hash(self.content_hash, "stable object content hash")
+        if not isinstance(self.authority_proof_refs, tuple) or not self.authority_proof_refs:
+            raise ContractViolation("stable reference requires authority proof")
+        for ref in self.authority_proof_refs:
+            _require_fixture_ref(ref, "authority proof ref")
+
+
+@dataclass(frozen=True)
+class PriorResearch:
+    history_basis_refs: Tuple[StableReferenceBinding, ...]
+    accepted_idea_outcomes: Tuple[StableReferenceBinding, ...]
+    accepted_formal_plan_refs: Tuple[StableReferenceBinding, ...]
+    reasoning_conclusion_refs: Tuple[StableReferenceBinding, ...]
+    accepted_evidence_refs: Tuple[StableReferenceBinding, ...]
+    prior_stage_commit_refs: Tuple[StableReferenceBinding, ...]
+
+    def validate(self) -> None:
+        for label, bindings in (
+            ("history basis", self.history_basis_refs),
+            ("accepted Idea outcomes", self.accepted_idea_outcomes),
+            ("accepted formal Plans", self.accepted_formal_plan_refs),
+            ("Reasoning conclusions", self.reasoning_conclusion_refs),
+            ("accepted evidence", self.accepted_evidence_refs),
+            ("prior StageCommits", self.prior_stage_commit_refs),
+        ):
+            if not isinstance(bindings, tuple):
+                raise ContractViolation(label + " must be an explicit frozen tuple")
+            for binding in bindings:
+                if not isinstance(binding, StableReferenceBinding):
+                    raise ContractViolation(label + " must use stable bindings")
+                binding.validate()
+
+
+@dataclass(frozen=True)
+class SoftConstraintBinding:
+    constraint_ref: str
+    revision_ref: str
+    content_hash: str
+    scope_ref: str
+    active_status_receipt_ref: str
+    statement: str
+
+    def validate(self) -> None:
+        for label, value in (
+            ("soft constraint ref", self.constraint_ref),
+            ("soft constraint revision ref", self.revision_ref),
+            ("soft constraint scope ref", self.scope_ref),
+            ("soft constraint active receipt", self.active_status_receipt_ref),
+        ):
+            _require_fixture_ref(value, label)
+        _require_hash(self.content_hash, "soft constraint content hash")
+        _require_text(self.statement, "soft constraint statement")
+
+
+@dataclass(frozen=True)
+class ActiveGuidance:
+    soft_constraint_bindings: Tuple[SoftConstraintBinding, ...]
+
+    def validate(self) -> None:
+        if not isinstance(self.soft_constraint_bindings, tuple):
+            raise ContractViolation("active guidance must be an explicit frozen tuple")
+        for binding in self.soft_constraint_bindings:
+            if not isinstance(binding, SoftConstraintBinding):
+                raise ContractViolation("active guidance bindings must be typed")
+            binding.validate()
+
+
+@dataclass(frozen=True)
+class ReadContract:
+    semantic_operation_id: str
+    content_schema_ref: str
+    media_type: str
+    unavailable_policy: str
+
+    def validate(self, requiredness: str) -> None:
+        _require_text(self.semantic_operation_id, "semantic operation id")
+        _require_fixture_ref(self.content_schema_ref, "navigation content schema ref")
+        _require_text(self.media_type, "navigation media type")
+        if self.unavailable_policy not in {"fail_closed", "preserve_unknown"}:
+            raise ContractViolation("navigation unavailable policy is invalid")
+        if requiredness == "required" and self.unavailable_policy != "fail_closed":
+            raise ContractViolation("required navigation roots must fail closed")
+
+
+@dataclass(frozen=True)
+class NavigationRoot:
+    binding_ref: str
+    semantic_role: str
+    source_owner: str
+    object_ref: str
+    content_hash: str
+    authority_proof_refs: Tuple[str, ...]
+    requiredness: str
+    data_classification: str
+    read_contract: ReadContract
+
+    def validate(self) -> None:
+        _require_fixture_ref(self.binding_ref, "navigation binding ref")
+        _require_text(self.semantic_role, "navigation semantic role")
+        _require_text(self.source_owner, "navigation source Owner")
+        _require_fixture_ref(self.object_ref, "navigation object ref")
+        _require_hash(self.content_hash, "navigation content hash")
+        if not isinstance(self.authority_proof_refs, tuple) or not self.authority_proof_refs:
+            raise ContractViolation("navigation root requires authority proof")
+        for ref in self.authority_proof_refs:
+            _require_fixture_ref(ref, "navigation authority proof ref")
+        if self.requiredness not in {"required", "optional"}:
+            raise ContractViolation("navigation requiredness is invalid")
+        if self.data_classification != "data_only":
+            raise ContractViolation("navigation roots must be data_only")
+        if not isinstance(self.read_contract, ReadContract):
+            raise ContractViolation("navigation read contract must be typed")
+        self.read_contract.validate(self.requiredness)
+
+
+@dataclass(frozen=True)
+class ContextPackIdentity:
+    schema_ref: str
+    schema_version: str
+    pack_ref: str
+    stage: str
+    quest_ref: str
+    cycle_ref: str
+    question_ref: str
+    compilation_basis_refs: Tuple[str, ...]
+
+    def validate(self) -> None:
+        for label, value in (
+            ("ContextPack schema ref", self.schema_ref),
+            ("ContextPack ref", self.pack_ref),
+            ("ContextPack Quest ref", self.quest_ref),
+            ("ContextPack Cycle ref", self.cycle_ref),
+            ("ContextPack Question ref", self.question_ref),
+        ):
+            _require_fixture_ref(value, label)
+        _require_text(self.schema_version, "ContextPack schema version")
+        if self.stage != "Idea":
+            raise ContractViolation("ContextPack stage must be Idea")
+        if not isinstance(self.compilation_basis_refs, tuple) or not self.compilation_basis_refs:
+            raise ContractViolation("ContextPack requires exact compilation bases")
+        for ref in self.compilation_basis_refs:
+            _require_fixture_ref(ref, "ContextPack compilation basis ref")
 
 
 @dataclass(frozen=True)
 class FrozenContextPack:
-    ref: str
-    bound_stage_run_request_ref: str
-    question_ref: str
-    question_literature_revision_ref: Optional[str]
-    items: Tuple[ContextItem, ...]
+    identity: ContextPackIdentity
+    accepted_question_binding: AcceptedQuestionBinding
+    accepted_question_content_data: Any
+    quest_goal_anchor: QuestGoalAnchor
+    literature_anchor: LiteratureAnchor
+    prior_research: PriorResearch
+    active_guidance: ActiveGuidance
+    navigation_roots: Tuple[NavigationRoot, ...]
     content_sha256: str
+
+    @property
+    def ref(self) -> str:
+        return self.identity.pack_ref
+
+    @property
+    def question_ref(self) -> str:
+        return self.identity.question_ref
+
+    @property
+    def question_literature_revision_ref(self) -> Optional[str]:
+        if isinstance(self.literature_anchor, BoundLiteratureAnchor):
+            return self.literature_anchor.question_literature_revision_ref
+        return None
 
     def payload_without_digest(self) -> Dict[str, Any]:
         return {
-            "ref": self.ref,
-            "bound_stage_run_request_ref": self.bound_stage_run_request_ref,
-            "question_ref": self.question_ref,
-            "question_literature_revision_ref": self.question_literature_revision_ref,
-            "items": self.items,
+            "identity": self.identity,
+            "accepted_question_binding": self.accepted_question_binding,
+            "accepted_question_content_data": self.accepted_question_content_data,
+            "quest_goal_anchor": self.quest_goal_anchor,
+            "literature_anchor": self.literature_anchor,
+            "prior_research": self.prior_research,
+            "active_guidance": self.active_guidance,
+            "navigation_roots": self.navigation_roots,
         }
 
     def validate(self) -> None:
-        _require_fixture_ref(self.ref, "ContextPack ref")
-        _require_fixture_ref(
-            self.bound_stage_run_request_ref, "bound StageRunRequest ref"
-        )
-        _require_fixture_ref(self.question_ref, "ContextPack Question ref")
-        if self.question_literature_revision_ref is not None:
-            _require_fixture_ref(
-                self.question_literature_revision_ref,
-                "QuestionLiteratureRevision ref",
+        if not isinstance(self.identity, ContextPackIdentity):
+            raise ContractViolation("ContextPack identity must be typed")
+        self.identity.validate()
+        if not isinstance(self.accepted_question_binding, AcceptedQuestionBinding):
+            raise ContractViolation("ContextPack accepted Question binding must be typed")
+        self.accepted_question_binding.validate()
+        if self.accepted_question_binding.question_ref != self.identity.question_ref:
+            raise ContractViolation(
+                "accepted Question binding does not match ContextPack identity"
             )
-        if not isinstance(self.items, tuple) or not self.items:
-            raise ContractViolation("ContextPack items must be a non-empty frozen tuple")
-        for item in self.items:
-            if not isinstance(item, ContextItem):
-                raise ContractViolation("ContextPack items must be typed ContextItem values")
-            item.validate()
+        if self.accepted_question_binding.quest_ref != self.identity.quest_ref:
+            raise ContractViolation(
+                "accepted Question Quest does not match ContextPack identity"
+            )
+        if self.accepted_question_content_data is None:
+            raise ContractViolation("accepted Question content data is required")
+        try:
+            accepted_content_hash = canonical_hash(
+                self.accepted_question_content_data
+            )
+        except (TypeError, ValueError) as exc:
+            raise ContractViolation(
+                "accepted Question content data must be canonical JSON data"
+            ) from exc
+        if (
+            accepted_content_hash
+            != self.accepted_question_binding.question_content_hash
+        ):
+            raise ContractViolation(
+                "accepted Question content data hash does not match its binding"
+            )
+        if not isinstance(self.quest_goal_anchor, QuestGoalAnchor):
+            raise ContractViolation("ContextPack Quest Goal anchor must be typed")
+        self.quest_goal_anchor.validate()
+        if self.quest_goal_anchor.quest_ref != self.identity.quest_ref:
+            raise ContractViolation("Quest Goal anchor does not match ContextPack identity")
+        if not isinstance(self.literature_anchor, (NoLiteratureAnchor, BoundLiteratureAnchor)):
+            raise ContractViolation("literature anchor must be a typed none|bound union")
+        self.literature_anchor.validate()
+        if not isinstance(self.prior_research, PriorResearch):
+            raise ContractViolation("prior research must be typed")
+        self.prior_research.validate()
+        if not isinstance(self.active_guidance, ActiveGuidance):
+            raise ContractViolation("active guidance must be typed")
+        self.active_guidance.validate()
+        if not isinstance(self.navigation_roots, tuple):
+            raise ContractViolation("navigation roots must be an explicit frozen tuple")
+        for root in self.navigation_roots:
+            if not isinstance(root, NavigationRoot):
+                raise ContractViolation("navigation roots must be typed")
+            root.validate()
         _require_hash(self.content_sha256, "ContextPack content hash")
         if canonical_hash(self.payload_without_digest()) != self.content_sha256:
             raise ContractViolation("ContextPack content hash drifted")
 
 
 def make_context_pack(
-    ref: str,
-    request_ref: str,
-    question_ref: str,
-    literature_revision_ref: Optional[str],
-    items: Tuple[ContextItem, ...],
+    identity: ContextPackIdentity,
+    accepted_question_binding: AcceptedQuestionBinding,
+    accepted_question_content_data: Any,
+    quest_goal_anchor: QuestGoalAnchor,
+    literature_anchor: LiteratureAnchor,
+    prior_research: PriorResearch,
+    active_guidance: ActiveGuidance,
+    navigation_roots: Tuple[NavigationRoot, ...],
 ) -> FrozenContextPack:
     payload = {
-        "ref": ref,
-        "bound_stage_run_request_ref": request_ref,
-        "question_ref": question_ref,
-        "question_literature_revision_ref": literature_revision_ref,
-        "items": items,
+        "identity": identity,
+        "accepted_question_binding": accepted_question_binding,
+        "accepted_question_content_data": accepted_question_content_data,
+        "quest_goal_anchor": quest_goal_anchor,
+        "literature_anchor": literature_anchor,
+        "prior_research": prior_research,
+        "active_guidance": active_guidance,
+        "navigation_roots": navigation_roots,
     }
     return FrozenContextPack(
-        ref=ref,
-        bound_stage_run_request_ref=request_ref,
-        question_ref=question_ref,
-        question_literature_revision_ref=literature_revision_ref,
-        items=items,
+        identity=identity,
+        accepted_question_binding=accepted_question_binding,
+        accepted_question_content_data=accepted_question_content_data,
+        quest_goal_anchor=quest_goal_anchor,
+        literature_anchor=literature_anchor,
+        prior_research=prior_research,
+        active_guidance=active_guidance,
+        navigation_roots=navigation_roots,
         content_sha256=canonical_hash(payload),
     )
 
@@ -167,37 +485,23 @@ class StageRunRequest:
     quest_ref: str
     cycle_ref: str
     question_ref: str
+    quest_goal_revision_ref: str
     foreground_epoch_ref: str
-    run_ref: str
-    root_session_ref: str
-    execution_fence_ref: str
     context_pack_ref: str
     context_pack_sha256: str
     question_literature_revision_ref: Optional[str]
-    explicit_invocation: bool = True
-    is_current: bool = True
-    root_fence_current: bool = True
-
     def validate(self) -> None:
         if self.contract_id != IDEA_CONTRACT:
             raise ContractViolation("unknown Idea typed contract")
         if self.stage != "Idea":
             raise ContractViolation("StageRunRequest stage must be Idea")
-        if self.explicit_invocation is not True:
-            raise ContractViolation("ordinary free text cannot invoke the Idea Stage")
-        if self.is_current is not True:
-            raise ContractViolation("StageRunRequest is not current")
-        if self.root_fence_current is not True:
-            raise ContractViolation("root Execution Fence is not current")
         for label, value in (
             ("StageRunRequest ref", self.ref),
             ("Quest ref", self.quest_ref),
             ("Cycle ref", self.cycle_ref),
             ("Question ref", self.question_ref),
+            ("Quest Goal revision ref", self.quest_goal_revision_ref),
             ("Foreground Epoch ref", self.foreground_epoch_ref),
-            ("Run ref", self.run_ref),
-            ("root Session ref", self.root_session_ref),
-            ("Execution Fence ref", self.execution_fence_ref),
             ("ContextPack ref", self.context_pack_ref),
         ):
             _require_fixture_ref(value, label)
@@ -210,32 +514,109 @@ class StageRunRequest:
 
 
 @dataclass(frozen=True)
+class IdeaRunBinding:
+    ref: str
+    run_ref: str
+    attempt_ref: str
+    root_session_ref: str
+    execution_fence_ref: str
+    stage_run_request_ref: str
+    stage_run_request_hash: str
+    context_pack_ref: str
+    context_pack_sha256: str
+    launch_manifest_ref: str
+    runtime_observation_ref: str
+
+    def validate(self, request: StageRunRequest) -> None:
+        for label, value in (
+            ("IdeaRunBinding ref", self.ref),
+            ("Run ref", self.run_ref),
+            ("Attempt ref", self.attempt_ref),
+            ("root Session ref", self.root_session_ref),
+            ("Execution Fence ref", self.execution_fence_ref),
+            ("bound StageRunRequest ref", self.stage_run_request_ref),
+            ("bound ContextPack ref", self.context_pack_ref),
+            ("launch manifest ref", self.launch_manifest_ref),
+            ("runtime observation ref", self.runtime_observation_ref),
+        ):
+            _require_fixture_ref(value, label)
+        _require_hash(self.stage_run_request_hash, "bound StageRunRequest hash")
+        _require_hash(self.context_pack_sha256, "bound ContextPack hash")
+        if self.stage_run_request_ref != request.ref:
+            raise ContractViolation("IdeaRunBinding is bound to another request")
+        if self.stage_run_request_hash != canonical_hash(request):
+            raise ContractViolation("IdeaRunBinding request hash does not match")
+        if (
+            self.context_pack_ref != request.context_pack_ref
+            or self.context_pack_sha256 != request.context_pack_sha256
+        ):
+            raise ContractViolation("IdeaRunBinding ContextPack does not match request")
+
+
+def make_run_binding(
+    request: StageRunRequest,
+    *,
+    suffix: str = "idea-1",
+) -> IdeaRunBinding:
+    return IdeaRunBinding(
+        ref="fixture:ar/run-binding/" + suffix,
+        run_ref="fixture:ar/run/" + suffix,
+        attempt_ref="fixture:ar/attempt/" + suffix,
+        root_session_ref="fixture:ar/session/root-" + suffix,
+        execution_fence_ref="fixture:ar/fence/" + suffix,
+        stage_run_request_ref=request.ref,
+        stage_run_request_hash=canonical_hash(request),
+        context_pack_ref=request.context_pack_ref,
+        context_pack_sha256=request.context_pack_sha256,
+        launch_manifest_ref="fixture:ar/launch/" + suffix,
+        runtime_observation_ref="fixture:ar/runtime-observation/" + suffix,
+    )
+
+
+@dataclass(frozen=True)
 class VerifiedInvocation:
     request: StageRunRequest
+    run_binding: IdeaRunBinding
     context_pack: FrozenContextPack
 
 
-def verify_invocation(request: Any, context_pack: Any) -> VerifiedInvocation:
+def verify_invocation(
+    request: Any, run_binding: Any, context_pack: Any
+) -> VerifiedInvocation:
     if not isinstance(request, StageRunRequest):
         raise ContractViolation("invocation must be a typed StageRunRequest")
     if not isinstance(context_pack, FrozenContextPack):
         raise ContractViolation("ContextPack must be an immutable typed fixture")
     request.validate()
+    if not isinstance(run_binding, IdeaRunBinding):
+        raise ContractViolation("runtime binding must be a typed IdeaRunBinding")
+    run_binding.validate(request)
     context_pack.validate()
-    if context_pack.bound_stage_run_request_ref != request.ref:
-        raise ContractViolation("ContextPack is bound to a different request")
     if context_pack.ref != request.context_pack_ref:
         raise ContractViolation("ContextPack ref does not match the request")
     if context_pack.content_sha256 != request.context_pack_sha256:
         raise ContractViolation("ContextPack hash does not match the request")
     if context_pack.question_ref != request.question_ref:
         raise ContractViolation("ContextPack Question does not match the request")
+    if context_pack.identity.quest_ref != request.quest_ref:
+        raise ContractViolation("ContextPack Quest does not match the request")
+    if context_pack.identity.cycle_ref != request.cycle_ref:
+        raise ContractViolation("ContextPack Cycle does not match the request")
+    if context_pack.quest_goal_anchor.goal_revision_ref != request.quest_goal_revision_ref:
+        raise ContractViolation("Quest Goal revision does not match the request")
     if (
         context_pack.question_literature_revision_ref
         != request.question_literature_revision_ref
     ):
         raise ContractViolation("literature revision binding does not match the request")
-    return VerifiedInvocation(request=request, context_pack=context_pack)
+    if (
+        run_binding.context_pack_ref != context_pack.ref
+        or run_binding.context_pack_sha256 != context_pack.content_sha256
+    ):
+        raise ContractViolation("runtime binding does not match exact ContextPack")
+    return VerifiedInvocation(
+        request=request, run_binding=run_binding, context_pack=context_pack
+    )
 
 
 @dataclass(frozen=True)
@@ -392,6 +773,22 @@ def validate_outcome(outcome: Any, verified: VerifiedInvocation) -> None:
         raise ContractViolation("outcome Question does not match the request")
     if outcome.context_pack_ref != verified.context_pack.ref:
         raise ContractViolation("outcome ContextPack does not match the request")
+    claimed_evidence_refs: Tuple[str, ...] = ()
+    if isinstance(outcome, IdeaSet):
+        for candidate in outcome.candidates:
+            claimed_evidence_refs += candidate.evidence_boundary.accepted_evidence_refs
+    else:
+        claimed_evidence_refs += outcome.evidence_boundary.accepted_evidence_refs
+        for family in outcome.candidate_families_considered:
+            claimed_evidence_refs += family.evidence_refs
+    bound_evidence_refs = {
+        binding.object_ref
+        for binding in verified.context_pack.prior_research.accepted_evidence_refs
+    }
+    if not set(claimed_evidence_refs).issubset(bound_evidence_refs):
+        raise ContractViolation(
+            "outcome claims accepted evidence without a ContextPack authority binding"
+        )
 
 
 @dataclass(frozen=True)
@@ -528,7 +925,7 @@ class ReviewedOutcome:
         validate_outcome(self.final_outcome, verified)
         if isinstance(self.review, AdvisoryReviewRecord):
             self.review.validate(
-                verified.request.root_session_ref,
+                verified.run_binding.root_session_ref,
                 self.reviewed_draft,
                 self.final_outcome,
             )
@@ -585,10 +982,10 @@ class FixtureOwnerReply:
 
 @dataclass(frozen=True)
 class SubmissionIdentity:
-    """Stable identity for one exact submission payload.
+    """一份 exact submission payload 的稳定 identity。
 
-    A semantic revision stays in the same Run/root Session but receives a new
-    identity linked to the rejected predecessor and its decision receipt.
+    语义修订留在同一 Run／根 Session，但取得新的 identity，并绑定被拒的
+    predecessor 与其 decision receipt。
     """
 
     ref: str
@@ -674,7 +1071,7 @@ class _SubmissionTransitionProof:
 
 @dataclass
 class SubmissionIdentityRegistry:
-    """Fixture-only idempotency registry for exact replay and revision checks."""
+    """只用于 fixture 的 exact replay 与 revision 幂等 registry。"""
 
     records: Dict[str, SubmissionRecord] = field(default_factory=dict)
     successor_by_ref: Dict[str, str] = field(default_factory=dict)
@@ -1086,10 +1483,12 @@ class SubmissionIdentityRegistry:
 
 
 def submission_payload_hash(
-    request: StageRunRequest,
+    verified: VerifiedInvocation,
     submission: SubmissionIdentity,
     reviewed: ReviewedOutcome,
 ) -> str:
+    request = verified.request
+    run_binding = verified.run_binding
     bindings = {
         "contract_id": request.contract_id,
         "stage_run_request_ref": request.ref,
@@ -1097,9 +1496,10 @@ def submission_payload_hash(
         "cycle_ref": request.cycle_ref,
         "question_ref": request.question_ref,
         "foreground_epoch_ref": request.foreground_epoch_ref,
-        "run_ref": request.run_ref,
-        "root_session_ref": request.root_session_ref,
-        "execution_fence_ref": request.execution_fence_ref,
+        "run_binding_ref": run_binding.ref,
+        "run_ref": run_binding.run_ref,
+        "root_session_ref": run_binding.root_session_ref,
+        "execution_fence_ref": run_binding.execution_fence_ref,
         "context_pack_ref": request.context_pack_ref,
         "context_pack_sha256": request.context_pack_sha256,
         "question_literature_revision_ref": (
@@ -1117,7 +1517,9 @@ def submission_payload_hash(
     )
 
 
-def feedback_loop_hash(request: StageRunRequest) -> str:
+def feedback_loop_hash(verified: VerifiedInvocation) -> str:
+    request = verified.request
+    run_binding = verified.run_binding
     return canonical_hash(
         {
             "contract_id": request.contract_id,
@@ -1127,9 +1529,10 @@ def feedback_loop_hash(request: StageRunRequest) -> str:
             "cycle_ref": request.cycle_ref,
             "question_ref": request.question_ref,
             "foreground_epoch_ref": request.foreground_epoch_ref,
-            "run_ref": request.run_ref,
-            "root_session_ref": request.root_session_ref,
-            "execution_fence_ref": request.execution_fence_ref,
+            "run_binding_ref": run_binding.ref,
+            "run_ref": run_binding.run_ref,
+            "root_session_ref": run_binding.root_session_ref,
+            "execution_fence_ref": run_binding.execution_fence_ref,
             "context_pack_ref": request.context_pack_ref,
             "context_pack_sha256": request.context_pack_sha256,
             "question_literature_revision_ref": (
@@ -1167,16 +1570,16 @@ class FixtureRunObservation:
     existing_stage_commit_ref: Optional[str] = None
     run_reconciled: bool = True
 
-    def validate(self, request: StageRunRequest) -> None:
+    def validate(self, run_binding: IdeaRunBinding) -> None:
         _require_fixture_ref(self.run_ref, "observed Run ref")
         _require_fixture_ref(self.root_session_ref, "observed root Session ref")
         _require_fixture_ref(
             self.execution_fence_ref, "observed Execution Fence ref"
         )
         if (
-            self.run_ref != request.run_ref
-            or self.root_session_ref != request.root_session_ref
-            or self.execution_fence_ref != request.execution_fence_ref
+            self.run_ref != run_binding.run_ref
+            or self.root_session_ref != run_binding.root_session_ref
+            or self.execution_fence_ref != run_binding.execution_fence_ref
         ):
             raise ContractViolation("Run observation is bound to another root execution")
         for label, refs in (
@@ -1244,14 +1647,21 @@ class FixtureRunObservation:
 
 
 class InvocationPort(Protocol):
+    # TODO-IMPL(AdvancementEngine.observe_idea_stage_run; source=#58)
     def observe_idea_stage_run(
         self, stage_run_request_ref: str
     ) -> StageRunRequest:
         ...
 
-    def read_frozen_context_pack(
+    # TODO-IMPL(AgentRuntime.observe_idea_run_binding; source=#71)
+    def observe_idea_run_binding(
+        self, stage_run_request_ref: str
+    ) -> IdeaRunBinding:
+        ...
+
+    # TODO-IMPL(AgentRuntime.verify_delivered_context_pack; source=#71)
+    def verify_delivered_context_pack(
         self,
-        stage_run_request_ref: str,
         context_pack_ref: str,
         expected_sha256: str,
     ) -> FrozenContextPack:
@@ -1259,6 +1669,7 @@ class InvocationPort(Protocol):
 
 
 class IdeaContentPort(Protocol):
+    # TODO-IMPL(ResearchMemory.accept_idea_outcome_content; source=#66)
     def accept_idea_outcome_content(
         self,
         request: StageRunRequest,
@@ -1268,6 +1679,7 @@ class IdeaContentPort(Protocol):
     ) -> FixtureOwnerReply:
         ...
 
+    # TODO-IMPL(ResearchMemory.reconcile_idea_outcome_content; source=#66)
     def reconcile_idea_outcome_content(
         self, request: StageRunRequest, submission: SubmissionIdentity
     ) -> FixtureOwnerReply:
@@ -1275,6 +1687,7 @@ class IdeaContentPort(Protocol):
 
 
 class IdeaDomainPort(Protocol):
+    # TODO-IMPL(ResearchGraph.submit_idea_outcome; source=#101)
     def submit_idea_outcome(
         self,
         request: StageRunRequest,
@@ -1285,6 +1698,7 @@ class IdeaDomainPort(Protocol):
     ) -> FixtureOwnerReply:
         ...
 
+    # TODO-IMPL(ResearchGraph.reconcile_idea_outcome; source=#101)
     def reconcile_idea_outcome(
         self, request: StageRunRequest, submission: SubmissionIdentity
     ) -> FixtureOwnerReply:
@@ -1292,9 +1706,11 @@ class IdeaDomainPort(Protocol):
 
 
 class RuntimePort(Protocol):
-    def observe_run(self, request: StageRunRequest) -> FixtureRunObservation:
+    # TODO-IMPL(AgentRuntime.observe_run; source=#71)
+    def observe_run(self, verified: VerifiedInvocation) -> FixtureRunObservation:
         ...
 
+    # TODO-IMPL(AgentRuntime.report_execution_blocker; source=#90)
     def report_execution_blocker(
         self, request: StageRunRequest, blocker: str
     ) -> str:
@@ -1302,11 +1718,13 @@ class RuntimePort(Protocol):
 
 
 class AdvancementPort(Protocol):
+    # TODO-IMPL(AdvancementEngine.submit_exhaustion_proposal; source=#90)
     def submit_exhaustion_proposal(
         self, request: StageRunRequest, proposal: "ExhaustionProposal"
     ) -> FixtureOwnerReply:
         ...
 
+    # TODO-IMPL(AdvancementEngine.reconcile_exhaustion_proposal; source=#90)
     def reconcile_exhaustion_proposal(
         self,
         request: StageRunRequest,
@@ -1330,7 +1748,16 @@ class FakeInvocationPort:
     request: StageRunRequest
     context_pack: FrozenContextPack
     observed_requests: Tuple[StageRunRequest, ...] = ()
+    request_current: bool = True
+    observed_request_currentness: Tuple[bool, ...] = ()
+    run_binding: Optional[IdeaRunBinding] = None
+    observed_run_bindings: Tuple[IdeaRunBinding, ...] = ()
+    run_binding_current: bool = True
+    observed_run_binding_currentness: Tuple[bool, ...] = ()
     _observation_index: int = field(default=0, init=False)
+    _request_currentness_index: int = field(default=0, init=False)
+    _binding_observation_index: int = field(default=0, init=False)
+    _binding_currentness_index: int = field(default=0, init=False)
 
     def observe_idea_stage_run(
         self, stage_run_request_ref: str
@@ -1345,22 +1772,58 @@ class FakeInvocationPort:
             observed = self.request
         if observed.ref != stage_run_request_ref:
             raise ContractViolation("observed a different StageRunRequest")
+        if self.observed_request_currentness:
+            currentness_index = min(
+                self._request_currentness_index,
+                len(self.observed_request_currentness) - 1,
+            )
+            is_current = self.observed_request_currentness[currentness_index]
+            self._request_currentness_index += 1
+        else:
+            is_current = self.request_current
+        if is_current is not True:
+            raise ContractViolation("Advancement Engine reports a stale StageRunRequest")
         return observed
 
-    def read_frozen_context_pack(
+    def observe_idea_run_binding(
+        self, stage_run_request_ref: str
+    ) -> IdeaRunBinding:
+        _require_fixture_ref(stage_run_request_ref, "StageRunRequest ref")
+        self.ledger.record("AgentRuntime.observe_idea_run_binding")
+        if self.observed_run_bindings:
+            index = min(
+                self._binding_observation_index,
+                len(self.observed_run_bindings) - 1,
+            )
+            binding = self.observed_run_bindings[index]
+            self._binding_observation_index += 1
+        else:
+            binding = self.run_binding or make_run_binding(self.request)
+        if binding.stage_run_request_ref != stage_run_request_ref:
+            raise ContractViolation("observed a binding for another StageRunRequest")
+        if self.observed_run_binding_currentness:
+            currentness_index = min(
+                self._binding_currentness_index,
+                len(self.observed_run_binding_currentness) - 1,
+            )
+            is_current = self.observed_run_binding_currentness[currentness_index]
+            self._binding_currentness_index += 1
+        else:
+            is_current = self.run_binding_current
+        if is_current is not True:
+            raise ContractViolation("Agent Runtime reports a stale execution fence")
+        return binding
+
+    def verify_delivered_context_pack(
         self,
-        stage_run_request_ref: str,
         context_pack_ref: str,
         expected_sha256: str,
     ) -> FrozenContextPack:
-        _require_fixture_ref(stage_run_request_ref, "StageRunRequest ref")
         _require_fixture_ref(context_pack_ref, "ContextPack ref")
         _require_hash(expected_sha256, "expected ContextPack hash")
-        self.ledger.record("ProjectionStore.read_frozen_context_pack")
+        self.ledger.record("AgentRuntime.verify_delivered_context_pack")
         if self.context_pack.ref != context_pack_ref:
             raise ContractViolation("read a different ContextPack")
-        if self.context_pack.bound_stage_run_request_ref != stage_run_request_ref:
-            raise ContractViolation("ContextPack read is bound to another request")
         if self.context_pack.content_sha256 != expected_sha256:
             raise ContractViolation("ContextPack read does not match the expected hash")
         return self.context_pack
@@ -1458,8 +1921,10 @@ class FakeRuntimePort:
     _observation_index: int = field(default=0, init=False)
     _blocker_index: int = field(default=0, init=False)
 
-    def observe_run(self, request: StageRunRequest) -> FixtureRunObservation:
+    def observe_run(self, verified: VerifiedInvocation) -> FixtureRunObservation:
         self.ledger.record("AgentRuntime.observe_run")
+        request = verified.request
+        run_binding = verified.run_binding
         request.validate()
         if self.observations:
             index = min(self._observation_index, len(self.observations) - 1)
@@ -1467,11 +1932,11 @@ class FakeRuntimePort:
             self._observation_index += 1
         else:
             observation = self.observation or FixtureRunObservation(
-                run_ref=request.run_ref,
-                root_session_ref=request.root_session_ref,
-                execution_fence_ref=request.execution_fence_ref,
+                run_ref=run_binding.run_ref,
+                root_session_ref=run_binding.root_session_ref,
+                execution_fence_ref=run_binding.execution_fence_ref,
             )
-        observation.validate(request)
+        observation.validate(run_binding)
         return observation
 
     def report_execution_blocker(
@@ -1564,9 +2029,9 @@ class ExhaustionReconciliationBinding:
         expected = (
             verified.request.contract_id,
             verified.request.ref,
-            verified.request.run_ref,
-            verified.request.root_session_ref,
-            verified.request.execution_fence_ref,
+            verified.run_binding.run_ref,
+            verified.run_binding.root_session_ref,
+            verified.run_binding.execution_fence_ref,
             verified.context_pack.ref,
             verified.context_pack.content_sha256,
         )
@@ -1900,10 +2365,8 @@ def verify_same_feedback_loop(
         "quest_ref",
         "cycle_ref",
         "question_ref",
+        "quest_goal_revision_ref",
         "foreground_epoch_ref",
-        "run_ref",
-        "root_session_ref",
-        "execution_fence_ref",
         "context_pack_ref",
         "context_pack_sha256",
         "question_literature_revision_ref",
@@ -1911,6 +2374,26 @@ def verify_same_feedback_loop(
     for field_name in fields:
         if getattr(previous.request, field_name) != getattr(
             current.request, field_name
+        ):
+            raise ContractViolation(
+                "Owner-feedback revision escaped the same Run/root Session/fence"
+            )
+    binding_fields = (
+        "ref",
+        "run_ref",
+        "attempt_ref",
+        "root_session_ref",
+        "execution_fence_ref",
+        "stage_run_request_ref",
+        "stage_run_request_hash",
+        "context_pack_ref",
+        "context_pack_sha256",
+        "launch_manifest_ref",
+        "runtime_observation_ref",
+    )
+    for field_name in binding_fields:
+        if getattr(previous.run_binding, field_name) != getattr(
+            current.run_binding, field_name
         ):
             raise ContractViolation(
                 "Owner-feedback revision escaped the same Run/root Session/fence"
@@ -1934,10 +2417,11 @@ def load_verified_invocation(
         raise ContractViolation("requested ContextPack ref does not match the request")
     if request.context_pack_sha256 != expected_context_pack_sha256:
         raise ContractViolation("requested ContextPack hash does not match the request")
-    context_pack = invocation_port.read_frozen_context_pack(
-        stage_run_request_ref, context_pack_ref, expected_context_pack_sha256
+    run_binding = invocation_port.observe_idea_run_binding(stage_run_request_ref)
+    context_pack = invocation_port.verify_delivered_context_pack(
+        context_pack_ref, expected_context_pack_sha256
     )
-    return verify_invocation(request, context_pack)
+    return verify_invocation(request, run_binding, context_pack)
 
 
 def revalidate_current_root(
@@ -1947,8 +2431,11 @@ def revalidate_current_root(
     if not isinstance(current_request, StageRunRequest):
         raise ContractViolation("re-observed request must remain typed")
     current_request.validate()
-    current = VerifiedInvocation(
-        request=current_request, context_pack=previous.context_pack
+    current_binding = invocation_port.observe_idea_run_binding(
+        previous.request.ref
+    )
+    current = verify_invocation(
+        current_request, current_binding, previous.context_pack
     )
     verify_same_feedback_loop(previous, current)
     return current
@@ -1983,12 +2470,12 @@ def submit_reviewed_outcome(
         invocation_port,
     )
     reviewed.validate(verified, submission)
-    observation = runtime_port.observe_run(verified.request)
-    observation.validate(verified.request)
+    observation = runtime_port.observe_run(verified)
+    observation.validate(verified.run_binding)
     previous_result = identity_registry.bind(
         submission,
-        submission_payload_hash(verified.request, submission, reviewed),
-        feedback_loop_hash(verified.request),
+        submission_payload_hash(verified, submission, reviewed),
+        feedback_loop_hash(verified),
         canonical_hash(reviewed.final_outcome),
         reviewed.review,
         observation,
@@ -2163,8 +2650,8 @@ def submit_reviewed_outcome(
         if content_ref is None or content_receipt_ref is None:
             raise ContractViolation("domain submit requires accepted content checkpoint")
         decision_phase = "domain"
-        domain_observation = runtime_port.observe_run(current.request)
-        domain_observation.validate(current.request)
+        domain_observation = runtime_port.observe_run(current)
+        domain_observation.validate(current.run_binding)
         domain_observation.assert_formal_write_ready()
         current = revalidate_current_root(current, invocation_port)
         domain_reply = domain_port.submit_idea_outcome(
@@ -2331,9 +2818,9 @@ class ExhaustionProposal:
             _require_fixture_ref(ref, label)
         if self.stage_run_request_ref != verified.request.ref:
             raise ContractViolation("exhaustion proposal binds a different request")
-        if self.run_ref != verified.request.run_ref:
+        if self.run_ref != verified.run_binding.run_ref:
             raise ContractViolation("exhaustion proposal binds a different Run")
-        if self.root_session_ref != verified.request.root_session_ref:
+        if self.root_session_ref != verified.run_binding.root_session_ref:
             raise ContractViolation("exhaustion proposal binds a different root Session")
         if self.context_pack_ref != verified.context_pack.ref:
             raise ContractViolation("exhaustion proposal binds a different ContextPack")
@@ -2347,8 +2834,8 @@ def build_exhaustion_proposal(
 ) -> ExhaustionProposal:
     proposal = ExhaustionProposal(
         stage_run_request_ref=verified.request.ref,
-        run_ref=verified.request.run_ref,
-        root_session_ref=verified.request.root_session_ref,
+        run_ref=verified.run_binding.run_ref,
+        root_session_ref=verified.run_binding.root_session_ref,
         context_pack_ref=verified.context_pack.ref,
         closure=closure,
     )
@@ -2371,17 +2858,17 @@ def submit_exhaustion_proposal(
         expected_context_pack_sha256,
         invocation_port,
     )
-    observation = runtime_port.observe_run(verified.request)
-    observation.validate(verified.request)
+    observation = runtime_port.observe_run(verified)
+    observation.validate(verified.run_binding)
     closure.validate(observation)
     current = revalidate_current_root(verified, invocation_port)
     proposal = build_exhaustion_proposal(current, closure)
     reconciliation_binding = ExhaustionReconciliationBinding(
         contract_id=current.request.contract_id,
         stage_run_request_ref=current.request.ref,
-        run_ref=current.request.run_ref,
-        root_session_ref=current.request.root_session_ref,
-        execution_fence_ref=current.request.execution_fence_ref,
+        run_ref=current.run_binding.run_ref,
+        root_session_ref=current.run_binding.root_session_ref,
+        execution_fence_ref=current.run_binding.execution_fence_ref,
         context_pack_ref=current.context_pack.ref,
         context_pack_sha256=current.context_pack.content_sha256,
         proposal_sha256=canonical_hash(proposal),
@@ -2500,8 +2987,8 @@ def reconcile_exhaustion_proposal(
         raise ContractViolation(
             "exhaustion reconciliation requires the prior unknown receipt proof"
         )
-    observation = runtime_port.observe_run(verified.request)
-    observation.validate(verified.request)
+    observation = runtime_port.observe_run(verified)
+    observation.validate(verified.run_binding)
     observation.assert_reconciliation_ready()
     current = revalidate_current_root(verified, invocation_port)
     decision_receipt_refs = previous_result.advancement_decision_receipt_refs
@@ -2566,42 +3053,141 @@ def reconcile_exhaustion_proposal(
         return result
 
 
-def fixture_request_and_pack() -> Tuple[StageRunRequest, FrozenContextPack]:
+def fixture_bound_literature() -> BoundLiteratureAnchor:
+    return BoundLiteratureAnchor(
+        question_literature_revision_ref="fixture:rg/question-literature/q1-r1",
+        revision_content_hash=fixture_hash("question-literature-q1-r1"),
+        rm_accepted_receipt_ref="fixture:rm/receipt/literature-q1-r1",
+        rg_question_association_receipt_ref="fixture:rg/receipt/literature-q1-r1",
+        summary_ref="fixture:rm/literature-summary/q1-r1",
+        papers_ref="fixture:rm/literature-papers/q1-r1",
+        fulltext_manifest_ref="fixture:rm/fulltext-manifest/q1-r1",
+    )
+
+
+def fixture_request_and_pack(
+    *,
+    literature_anchor: Optional[LiteratureAnchor] = None,
+) -> Tuple[StageRunRequest, FrozenContextPack]:
     request_ref = "fixture:ae/stage-run-request/idea-1"
+    quest_ref = "fixture:rg/quest/quest-1"
+    cycle_ref = "fixture:ae/cycle/cycle-1"
     question_ref = "fixture:rg/question/q1"
-    items = (
-        ContextItem(
-            role="question_card",
-            ref="fixture:rm/asset/question-card-v1",
-            sha256=fixture_hash("question-card-v1"),
+    goal_revision_ref = "fixture:rg/quest-goal/quest-1-r1"
+    accepted_question_content_data = {
+        "opaque_fixture_key": "accepted-value",
+        "opaque_fixture_payload": [17, True, {"nested": "data"}],
+    }
+    accepted_question_binding = AcceptedQuestionBinding(
+        question_ref=question_ref,
+        quest_ref=quest_ref,
+        question_content_ref="fixture:rm/question-content/q1-v1",
+        question_content_hash=canonical_hash(accepted_question_content_data),
+        question_content_schema_ref="fixture:schema/question-content/v1",
+        rm_content_accepted_receipt_ref=(
+            "fixture:rm/receipt/question-content-q1-v1"
         ),
-        ContextItem(
-            role="prior_idea_outcomes",
-            ref="fixture:rg/projection/prior-ideas-v1",
-            sha256=fixture_hash("prior-ideas-v1"),
+        rg_question_accepted_receipt_ref="fixture:rg/receipt/question-q1",
+    )
+    goal_content = QuestGoalContent(
+        goal_statement="Resolve the bounded research goal for Quest 1.",
+        completion_milestones=("Produce an accepted bounded answer.",),
+        exclusions=("Do not change the Quest Goal from the Idea stage.",),
+    )
+    quest_goal_anchor = QuestGoalAnchor(
+        quest_ref=quest_ref,
+        goal_revision_ref=goal_revision_ref,
+        goal_content_ref="fixture:rm/quest-goal/quest-1-r1",
+        goal_content_hash=canonical_hash(goal_content),
+        goal_accepted_receipt_ref="fixture:rg/receipt/quest-goal-quest-1-r1",
+        content=goal_content,
+    )
+    stable_history = StableReferenceBinding(
+        semantic_role="idea.prior_research.history_basis",
+        source_owner="ResearchMemory",
+        object_ref="fixture:rm/history/q1-v1",
+        content_hash=fixture_hash("history-q1-v1"),
+        authority_proof_refs=("fixture:rm/receipt/history-q1-v1",),
+    )
+    accepted_evidence_one = StableReferenceBinding(
+        semantic_role="idea.prior_research.accepted_evidence",
+        source_owner="ResearchMemory",
+        object_ref="fixture:rm/asset/evidence-1",
+        content_hash=fixture_hash("accepted-evidence-1"),
+        authority_proof_refs=("fixture:rm/receipt/evidence-1",),
+    )
+    accepted_evidence_two = StableReferenceBinding(
+        semantic_role="idea.prior_research.accepted_evidence",
+        source_owner="ResearchMemory",
+        object_ref="fixture:rm/asset/evidence-2",
+        content_hash=fixture_hash("accepted-evidence-2"),
+        authority_proof_refs=("fixture:rm/receipt/evidence-2",),
+    )
+    selected_literature = literature_anchor or NoLiteratureAnchor()
+    identity = ContextPackIdentity(
+        schema_ref="fixture:schema/idea-context-pack/v1",
+        schema_version="1",
+        pack_ref="fixture:projection/context-pack/idea-1",
+        stage="Idea",
+        quest_ref=quest_ref,
+        cycle_ref=cycle_ref,
+        question_ref=question_ref,
+        compilation_basis_refs=(
+            "fixture:ae/compilation-basis/idea-1",
+            accepted_question_binding.rg_question_accepted_receipt_ref,
+            quest_goal_anchor.goal_accepted_receipt_ref,
         ),
     )
     pack = make_context_pack(
-        ref="fixture:projection/context-pack/idea-1",
-        request_ref=request_ref,
-        question_ref=question_ref,
-        literature_revision_ref=None,
-        items=items,
+        identity=identity,
+        accepted_question_binding=accepted_question_binding,
+        accepted_question_content_data=accepted_question_content_data,
+        quest_goal_anchor=quest_goal_anchor,
+        literature_anchor=selected_literature,
+        prior_research=PriorResearch(
+            history_basis_refs=(stable_history,),
+            accepted_idea_outcomes=(),
+            accepted_formal_plan_refs=(),
+            reasoning_conclusion_refs=(),
+            accepted_evidence_refs=(accepted_evidence_one, accepted_evidence_two),
+            prior_stage_commit_refs=(),
+        ),
+        active_guidance=ActiveGuidance(soft_constraint_bindings=()),
+        navigation_roots=(
+            NavigationRoot(
+                binding_ref="fixture:ae/navigation/history-q1-v1",
+                semantic_role="idea.navigation.history",
+                source_owner="ResearchMemory",
+                object_ref=stable_history.object_ref,
+                content_hash=stable_history.content_hash,
+                authority_proof_refs=stable_history.authority_proof_refs,
+                requiredness="optional",
+                data_classification="data_only",
+                read_contract=ReadContract(
+                    semantic_operation_id="research_memory.read_accepted_history",
+                    content_schema_ref="fixture:schema/research-history/v1",
+                    media_type="application/json",
+                    unavailable_policy="preserve_unknown",
+                ),
+            ),
+        ),
     )
     request = StageRunRequest(
         contract_id=IDEA_CONTRACT,
         ref=request_ref,
         stage="Idea",
-        quest_ref="fixture:rg/quest/quest-1",
-        cycle_ref="fixture:ae/cycle/cycle-1",
+        quest_ref=quest_ref,
+        cycle_ref=cycle_ref,
         question_ref=question_ref,
+        quest_goal_revision_ref=goal_revision_ref,
         foreground_epoch_ref="fixture:ae/epoch/epoch-1",
-        run_ref="fixture:ar/run/idea-1",
-        root_session_ref="fixture:ar/session/root-idea-1",
-        execution_fence_ref="fixture:ar/fence/idea-1",
         context_pack_ref=pack.ref,
         context_pack_sha256=pack.content_sha256,
-        question_literature_revision_ref=None,
+        question_literature_revision_ref=(
+            selected_literature.question_literature_revision_ref
+            if isinstance(selected_literature, BoundLiteratureAnchor)
+            else None
+        ),
     )
     return request, pack
 
@@ -2609,33 +3195,70 @@ def fixture_request_and_pack() -> Tuple[StageRunRequest, FrozenContextPack]:
 def fixture_candidate(key: str = "c1") -> IdeaCandidate:
     return IdeaCandidate(
         candidate_key=key,
-        direction="Test whether a mechanism-level intervention answers Q1.",
-        rationale="The intervention changes the causal axis named by the Question.",
-        assumptions=("The frozen observations are comparable.",),
-        risks=("A correlated nuisance factor may explain the effect.",),
+        direction=(
+            "Suppress subject-identity information adversarially at the intermediate "
+            "EEG representation while preserving task-predictive features."
+        ),
+        rationale=(
+            "Subject identity may be a nuisance shortcut; separating it from task "
+            "signal could improve transfer to unseen subjects."
+        ),
+        assumptions=("Subject identity is separable from task-relevant signal.",),
+        risks=("Over-suppression may erase task-predictive subject variation.",),
         evidence_boundary=EvidenceBoundary(
             accepted_evidence_refs=("fixture:rm/asset/evidence-1",),
-            supported="The referenced observation establishes the baseline behavior.",
-            inferred="The intervention may alter that behavior through the proposed mechanism.",
-            unknown="The size and robustness of the effect remain unknown.",
+            supported=(
+                "The bound accepted evidence establishes subject-linked representation "
+                "shift in the baseline."
+            ),
+            inferred=(
+                "Reducing that shift may improve unseen-subject classification; this "
+                "causal link is not yet accepted evidence."
+            ),
+            unknown="Whether task signal survives the suppression remains unknown.",
         ),
         falsification_hint=FalsificationHint(
-            test="Compare the intervention with a held-fixed control.",
-            would_refute="The directional effect is absent under the frozen protocol.",
+            test=(
+                "Hold the task model family fixed and compare identity leakage, task "
+                "signal, and unseen-subject behavior with and without suppression."
+            ),
+            would_refute=(
+                "Identity leakage falls but unseen-subject behavior does not improve, "
+                "or task-relevant signal degrades."
+            ),
         ),
         material_difference=MaterialDifference(
-            from_history="No prior candidate changes this causal axis.",
-            from_peers="Peer candidates intervene on a different mechanism.",
-            plan_commitment_change="Plan would freeze a different semantic delta and test.",
+            from_history=(
+                "The bound history describes the shift but contains no intervention "
+                "that separates identity from task signal."
+            ),
+            from_peers="Peer candidates intervene on alignment or normalization instead.",
+            plan_commitment_change=(
+                "Plan must test both identity suppression and task-signal preservation, "
+                "not only aggregate classification change."
+            ),
         ),
     )
 
 
 def fixture_idea_set(candidate_count: int = 1) -> IdeaSet:
+    mechanism_axes = (
+        "identity-adversarial suppression",
+        "subject-invariant contrastive alignment",
+        "task-preserving conditional normalization",
+        "nuisance-stratified representation gating",
+    )
     candidates = tuple(
         replace(
             fixture_candidate("c{}".format(index + 1)),
-            direction="Test mechanism-level intervention {} for Q1.".format(index + 1),
+            direction=(
+                "Test {} as the mechanism for improving unseen-subject EEG behavior "
+                "without erasing task signal."
+            ).format(
+                mechanism_axes[index]
+                if index < len(mechanism_axes)
+                else "mechanism axis {}".format(index + 1)
+            ),
             material_difference=MaterialDifference(
                 from_history="History has no intervention on axis {}.".format(index + 1),
                 from_peers="This candidate changes axis {} rather than another axis.".format(

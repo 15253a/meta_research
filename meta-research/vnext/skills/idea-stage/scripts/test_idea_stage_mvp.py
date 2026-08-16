@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract tests for the deterministic Idea Stage fixture."""
+"""Idea Stage 确定性 fixture 的契约测试。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ import unittest
 from dataclasses import asdict, replace
 
 from idea_stage_mvp import (
+    AcceptedQuestionBinding,
     AdvisoryReviewRecord,
+    BoundLiteratureAnchor,
     CallLedger,
     ContractViolation,
     ExhaustionClosure,
@@ -25,14 +27,17 @@ from idea_stage_mvp import (
     SubmissionIdentity,
     SubmissionIdentityRegistry,
     SubmissionResult,
+    StageRunRequest,
     build_exhaustion_proposal,
     canonical_hash,
     fixture_hash,
+    fixture_bound_literature,
     fixture_idea_set,
     fixture_no_viable,
     fixture_request_and_pack,
     fixture_review,
     make_context_pack,
+    make_run_binding,
     reconcile_exhaustion_proposal,
     submit_exhaustion_proposal,
     submit_reviewed_outcome,
@@ -70,6 +75,7 @@ def accepted_domain_reply() -> FixtureOwnerReply:
 class IdeaStageMvpTests(unittest.TestCase):
     def setUp(self) -> None:
         self.request, self.pack = fixture_request_and_pack()
+        self.binding = make_run_binding(self.request)
 
     def clean_exhaustion_closure(self) -> ExhaustionClosure:
         return ExhaustionClosure(
@@ -158,17 +164,37 @@ class IdeaStageMvpTests(unittest.TestCase):
                 self.assertEqual(
                     [
                         "AdvancementEngine.observe_idea_stage_run",
-                        "ProjectionStore.read_frozen_context_pack",
+                        "AgentRuntime.observe_idea_run_binding",
+                        "AgentRuntime.verify_delivered_context_pack",
                         "AgentRuntime.observe_run",
                         "AdvancementEngine.observe_idea_stage_run",
+                        "AgentRuntime.observe_idea_run_binding",
                         "ResearchMemory.accept_idea_outcome_content",
                         "AgentRuntime.observe_run",
                         "AdvancementEngine.observe_idea_stage_run",
+                        "AgentRuntime.observe_idea_run_binding",
                         "ResearchGraph.submit_idea_outcome",
                     ],
                     ledger.events,
                 )
                 self.assert_no_forbidden_authority(ledger)
+
+    def test_claimed_accepted_evidence_requires_context_pack_authority_binding(self):
+        outcome = fixture_idea_set()
+        candidate = outcome.candidates[0]
+        unbound_candidate = replace(
+            candidate,
+            evidence_boundary=replace(
+                candidate.evidence_boundary,
+                accepted_evidence_refs=("fixture:rm/asset/unbound-evidence",),
+            ),
+        )
+        unbound_outcome = replace(outcome, candidates=(unbound_candidate,))
+        with self.assertRaisesRegex(
+            ContractViolation,
+            "without a ContextPack authority binding",
+        ):
+            self.submit(unbound_outcome)
 
     def test_reviewed_no_viable_is_accepted_outcome_not_exhaustion(self):
         result, ledger = self.submit(fixture_no_viable())
@@ -228,9 +254,6 @@ class IdeaStageMvpTests(unittest.TestCase):
         bad_requests = (
             replace(self.request, stage="Plan"),
             replace(self.request, contract_id="unknown"),
-            replace(self.request, is_current=False),
-            replace(self.request, root_fence_current=False),
-            replace(self.request, explicit_invocation=False),
         )
         for bad_request in bad_requests:
             with self.subTest(request=bad_request):
@@ -252,11 +275,40 @@ class IdeaStageMvpTests(unittest.TestCase):
                     ["AdvancementEngine.observe_idea_stage_run"], ledger.events
                 )
 
+        stale_ledger = CallLedger()
+        with self.assertRaises(ContractViolation):
+            submit_reviewed_outcome(
+                self.request.ref,
+                self.pack.ref,
+                self.pack.content_sha256,
+                SubmissionIdentity("fixture:agent/submission/stale-request"),
+                fixture_review(fixture_idea_set()),
+                FakeInvocationPort(
+                    stale_ledger,
+                    self.request,
+                    self.pack,
+                    request_current=False,
+                ),
+                FakeContentPort(stale_ledger, accepted_content_reply()),
+                FakeDomainPort(stale_ledger, accepted_domain_reply()),
+                FakeRuntimePort(stale_ledger),
+                SubmissionIdentityRegistry(),
+            )
+        self.assertEqual(
+            ["AdvancementEngine.observe_idea_stage_run"], stale_ledger.events
+        )
+
     def test_mutable_or_drifted_context_pack_fails_closed(self):
         drifted_pack = replace(self.pack, content_sha256=fixture_hash("drifted"))
         bad_packs = (
             drifted_pack,
-            replace(self.pack, bound_stage_run_request_ref="fixture:ae/other-request"),
+            replace(
+                self.pack,
+                accepted_question_binding=replace(
+                    self.pack.accepted_question_binding,
+                    rg_question_accepted_receipt_ref="",
+                ),
+            ),
         )
         for bad_pack in bad_packs:
             with self.subTest(pack=type(bad_pack).__name__):
@@ -277,10 +329,212 @@ class IdeaStageMvpTests(unittest.TestCase):
                 self.assertEqual(
                     [
                         "AdvancementEngine.observe_idea_stage_run",
-                        "ProjectionStore.read_frozen_context_pack",
+                        "AgentRuntime.observe_idea_run_binding",
+                        "AgentRuntime.verify_delivered_context_pack",
                     ],
                     ledger.events,
                 )
+
+    def test_request_excludes_ar_identities_and_pack_has_no_request_back_binding(self):
+        request_payload = asdict(self.request)
+        for forbidden in (
+            "run_ref",
+            "attempt_ref",
+            "root_session_ref",
+            "execution_fence_ref",
+            "is_current",
+        ):
+            self.assertNotIn(forbidden, request_payload)
+        with self.assertRaises(TypeError):
+            StageRunRequest(
+                **dict(
+                    request_payload,
+                    run_ref="fixture:ar/run/forged-in-request",
+                )
+            )
+        self.assertNotIn(
+            "bound_stage_run_request_ref",
+            repr(asdict(self.pack)),
+        )
+        self.assertNotIn("root_fence_current", asdict(self.binding))
+        self.binding.validate(self.request)
+
+    def test_accepted_question_binding_is_opaque_and_schema_agnostic(self):
+        opaque_content_data = {
+            "arbitrary_key": ["alpha", 23, False],
+            "extension": {"vendor_value": "v9"},
+        }
+        binding = replace(
+            self.pack.accepted_question_binding,
+            question_content_hash=canonical_hash(opaque_content_data),
+            question_content_schema_ref="fixture:schema/upstream-question/v9",
+        )
+        pack = make_context_pack(
+            identity=self.pack.identity,
+            accepted_question_binding=binding,
+            accepted_question_content_data=opaque_content_data,
+            quest_goal_anchor=self.pack.quest_goal_anchor,
+            literature_anchor=self.pack.literature_anchor,
+            prior_research=self.pack.prior_research,
+            active_guidance=self.pack.active_guidance,
+            navigation_roots=self.pack.navigation_roots,
+        )
+        request = replace(
+            self.request,
+            context_pack_sha256=pack.content_sha256,
+        )
+        verified = verify_invocation(request, make_run_binding(request), pack)
+        self.assertEqual(
+            opaque_content_data,
+            verified.context_pack.accepted_question_content_data,
+        )
+        self.assertEqual(
+            "fixture:schema/upstream-question/v9",
+            verified.context_pack.accepted_question_binding.question_content_schema_ref,
+        )
+        self.assertIsInstance(binding, AcceptedQuestionBinding)
+        self.assertEqual(
+            {
+                "question_ref",
+                "quest_ref",
+                "question_content_ref",
+                "question_content_hash",
+                "question_content_schema_ref",
+                "rm_content_accepted_receipt_ref",
+                "rg_question_accepted_receipt_ref",
+            },
+            set(asdict(binding)),
+        )
+        with self.assertRaises(TypeError):
+            AcceptedQuestionBinding(
+                **dict(
+                    asdict(binding),
+                    upstream_payload={"opaque": True},
+                )
+            )
+
+    def test_accepted_question_content_missing_tampered_or_mismatched_fails_closed(self):
+        missing = replace(self.pack, accepted_question_content_data=None)
+        with self.assertRaisesRegex(ContractViolation, "content data is required"):
+            missing.validate()
+
+        tampered = replace(
+            self.pack,
+            accepted_question_content_data={"tampered": ["different"]},
+        )
+        with self.assertRaisesRegex(ContractViolation, "hash does not match"):
+            tampered.validate()
+
+        mismatched_binding = replace(
+            self.pack.accepted_question_binding,
+            question_content_hash=fixture_hash("wrong-accepted-content"),
+        )
+        mismatched_pack = make_context_pack(
+            identity=self.pack.identity,
+            accepted_question_binding=mismatched_binding,
+            accepted_question_content_data=self.pack.accepted_question_content_data,
+            quest_goal_anchor=self.pack.quest_goal_anchor,
+            literature_anchor=self.pack.literature_anchor,
+            prior_research=self.pack.prior_research,
+            active_guidance=self.pack.active_guidance,
+            navigation_roots=self.pack.navigation_roots,
+        )
+        with self.assertRaisesRegex(ContractViolation, "hash does not match"):
+            mismatched_pack.validate()
+
+    def test_accepted_question_binding_requires_exact_refs_hash_and_receipts(self):
+        binding = self.pack.accepted_question_binding
+        invalid_fields = (
+            ("question_ref", "fixture:rg/question/latest"),
+            ("quest_ref", ""),
+            ("question_content_ref", "fixture:rm/question-content/latest"),
+            ("question_content_schema_ref", "fixture:schema/question/latest"),
+            ("rm_content_accepted_receipt_ref", ""),
+            ("rg_question_accepted_receipt_ref", ""),
+            ("question_content_hash", "sha256:not-a-digest"),
+        )
+        for field_name, value in invalid_fields:
+            with self.subTest(field=field_name):
+                with self.assertRaises(ContractViolation):
+                    replace(binding, **{field_name: value}).validate()
+
+    def test_request_run_and_pack_must_match_exactly(self):
+        mismatched_question_request = replace(
+            self.request,
+            question_ref="fixture:rg/question/other",
+        )
+        mismatched_pack_request = replace(
+            self.request,
+            context_pack_ref="fixture:projection/context-pack/other",
+        )
+        for request in (mismatched_question_request, mismatched_pack_request):
+            with self.subTest(request=request):
+                with self.assertRaises(ContractViolation):
+                    verify_invocation(request, make_run_binding(request), self.pack)
+
+        quest_mismatched_pack = replace(
+            self.pack,
+            accepted_question_binding=replace(
+                self.pack.accepted_question_binding,
+                quest_ref="fixture:rg/quest/other",
+            ),
+        )
+        with self.assertRaises(ContractViolation):
+            verify_invocation(self.request, self.binding, quest_mismatched_pack)
+
+        mismatched_bindings = (
+            replace(
+                self.binding,
+                stage_run_request_ref="fixture:ae/stage-run-request/other",
+            ),
+            replace(
+                self.binding,
+                stage_run_request_hash=fixture_hash("other-request"),
+            ),
+            replace(
+                self.binding,
+                context_pack_sha256=fixture_hash("other-pack"),
+            ),
+        )
+        for binding in mismatched_bindings:
+            with self.subTest(binding=binding):
+                with self.assertRaises(ContractViolation):
+                    verify_invocation(self.request, binding, self.pack)
+
+    def test_literature_anchor_is_strict_none_or_bound_union(self):
+        verify_invocation(self.request, self.binding, self.pack)
+        self.assertEqual("none", self.pack.literature_anchor.status)
+        self.assertIsNone(self.request.question_literature_revision_ref)
+
+        literature = fixture_bound_literature()
+        request, pack = fixture_request_and_pack(literature_anchor=literature)
+        binding = make_run_binding(request)
+        verified = verify_invocation(request, binding, pack)
+        self.assertEqual("bound", verified.context_pack.literature_anchor.status)
+        self.assertEqual(
+            literature.question_literature_revision_ref,
+            request.question_literature_revision_ref,
+        )
+
+        mismatched_request = replace(
+            request,
+            question_literature_revision_ref=None,
+        )
+        with self.assertRaises(ContractViolation):
+            verify_invocation(
+                mismatched_request,
+                make_run_binding(mismatched_request),
+                pack,
+            )
+
+        for malformed_anchor in (
+            replace(literature, rm_accepted_receipt_ref=""),
+            {"status": "none"},
+        ):
+            malformed_pack = replace(pack, literature_anchor=malformed_anchor)
+            with self.subTest(anchor=malformed_anchor):
+                with self.assertRaises(ContractViolation):
+                    verify_invocation(request, binding, malformed_pack)
 
     def test_independent_review_digest_and_dispositions_are_enforced(self):
         outcome = fixture_idea_set()
@@ -288,7 +542,7 @@ class IdeaStageMvpTests(unittest.TestCase):
         bad_reviews = (
             replace(
                 valid.review,
-                reviewer_session_ref=self.request.root_session_ref,
+                reviewer_session_ref=self.binding.root_session_ref,
             ),
             replace(valid.review, reviewed_draft_hash=fixture_hash("wrong-draft")),
             replace(valid.review, final_outcome_hash=fixture_hash("wrong-final")),
@@ -315,7 +569,8 @@ class IdeaStageMvpTests(unittest.TestCase):
                 self.assertEqual(
                     [
                         "AdvancementEngine.observe_idea_stage_run",
-                        "ProjectionStore.read_frozen_context_pack",
+                        "AgentRuntime.observe_idea_run_binding",
+                        "AgentRuntime.verify_delivered_context_pack",
                     ],
                     ledger.events,
                 )
@@ -361,9 +616,11 @@ class IdeaStageMvpTests(unittest.TestCase):
         self.assertEqual(
             [
                 "AdvancementEngine.observe_idea_stage_run",
-                "ProjectionStore.read_frozen_context_pack",
+                "AgentRuntime.observe_idea_run_binding",
+                "AgentRuntime.verify_delivered_context_pack",
                 "AgentRuntime.observe_run",
                 "AdvancementEngine.observe_idea_stage_run",
+                "AgentRuntime.observe_idea_run_binding",
                 "ResearchMemory.accept_idea_outcome_content",
             ],
             ledger.events,
@@ -396,8 +653,8 @@ class IdeaStageMvpTests(unittest.TestCase):
             "AdvancementEngine.submit_exhaustion_proposal", first_ledger.events
         )
 
-        previous = verify_invocation(self.request, self.pack)
-        current = verify_invocation(self.request, self.pack)
+        previous = verify_invocation(self.request, self.binding, self.pack)
+        current = verify_invocation(self.request, self.binding, self.pack)
         verify_same_feedback_loop(previous, current)
 
         final_outcome = fixture_idea_set(4)
@@ -428,10 +685,10 @@ class IdeaStageMvpTests(unittest.TestCase):
             "AdvancementEngine.submit_exhaustion_proposal", second_ledger.events
         )
 
-        changed_session = replace(
-            self.request, root_session_ref="fixture:ar/session/new-root"
+        changed_binding = replace(
+            self.binding, root_session_ref="fixture:ar/session/new-root"
         )
-        changed = verify_invocation(changed_session, self.pack)
+        changed = verify_invocation(self.request, changed_binding, self.pack)
         with self.assertRaises(ContractViolation):
             verify_same_feedback_loop(previous, changed)
 
@@ -619,13 +876,13 @@ class IdeaStageMvpTests(unittest.TestCase):
                 registry=registry,
             )
 
-        changed_root = replace(
-            self.request, root_session_ref="fixture:ar/session/other-root"
+        changed_binding = replace(
+            self.binding, root_session_ref="fixture:ar/session/other-root"
         )
         ledger = CallLedger()
         with self.assertRaises(ContractViolation):
             submit_reviewed_outcome(
-                changed_root.ref,
+                self.request.ref,
                 self.pack.ref,
                 self.pack.content_sha256,
                 SubmissionIdentity(
@@ -636,7 +893,12 @@ class IdeaStageMvpTests(unittest.TestCase):
                     ),
                 ),
                 fixture_review(fixture_idea_set(4)),
-                FakeInvocationPort(ledger, changed_root, self.pack),
+                FakeInvocationPort(
+                    ledger,
+                    self.request,
+                    self.pack,
+                    run_binding=changed_binding,
+                ),
                 FakeContentPort(ledger, accepted_content_reply()),
                 FakeDomainPort(ledger, accepted_domain_reply()),
                 FakeRuntimePort(ledger),
@@ -881,8 +1143,10 @@ class IdeaStageMvpTests(unittest.TestCase):
                     self.pack,
                     observed_requests=(
                         self.request,
-                        replace(self.request, root_fence_current=False),
+                        self.request,
                     ),
+                    observed_run_bindings=(self.binding, self.binding),
+                    observed_run_binding_currentness=(True, False),
                 ),
                 FakeContentPort(ledger, accepted_content_reply()),
                 FakeDomainPort(ledger, accepted_domain_reply()),
@@ -1043,9 +1307,9 @@ class IdeaStageMvpTests(unittest.TestCase):
             ),
         )
         recovery_observation = FixtureRunObservation(
-            run_ref=self.request.run_ref,
-            root_session_ref=self.request.root_session_ref,
-            execution_fence_ref=self.request.execution_fence_ref,
+            run_ref=self.binding.run_ref,
+            root_session_ref=self.binding.root_session_ref,
+            execution_fence_ref=self.binding.execution_fence_ref,
             recovery_dispositions=(
                 FixtureRecoveryDisposition(
                     human_request_ref="fixture:hc/human-request/superseded",
@@ -1120,9 +1384,9 @@ class IdeaStageMvpTests(unittest.TestCase):
         )
 
         recovered_observation = FixtureRunObservation(
-            run_ref=self.request.run_ref,
-            root_session_ref=self.request.root_session_ref,
-            execution_fence_ref=self.request.execution_fence_ref,
+            run_ref=self.binding.run_ref,
+            root_session_ref=self.binding.root_session_ref,
+            execution_fence_ref=self.binding.execution_fence_ref,
             recovery_dispositions=(
                 FixtureRecoveryDisposition(
                     human_request_ref="fixture:hc/human-request/recovery-1",
@@ -1175,9 +1439,9 @@ class IdeaStageMvpTests(unittest.TestCase):
             ),
         )
         observation = FixtureRunObservation(
-            run_ref=self.request.run_ref,
-            root_session_ref=self.request.root_session_ref,
-            execution_fence_ref=self.request.execution_fence_ref,
+            run_ref=self.binding.run_ref,
+            root_session_ref=self.binding.root_session_ref,
+            execution_fence_ref=self.binding.execution_fence_ref,
             recovery_dispositions=(
                 FixtureRecoveryDisposition(
                     human_request_ref="fixture:hc/human-request/change-1",
@@ -1248,9 +1512,9 @@ class IdeaStageMvpTests(unittest.TestCase):
             "fixture:agent/submission/content-checkpoint"
         )
         ready = FixtureRunObservation(
-            run_ref=self.request.run_ref,
-            root_session_ref=self.request.root_session_ref,
-            execution_fence_ref=self.request.execution_fence_ref,
+            run_ref=self.binding.run_ref,
+            root_session_ref=self.binding.root_session_ref,
+            execution_fence_ref=self.binding.execution_fence_ref,
         )
         blocked = replace(
             ready,
@@ -1387,9 +1651,11 @@ class IdeaStageMvpTests(unittest.TestCase):
         self.assertEqual(
             [
                 "AdvancementEngine.observe_idea_stage_run",
-                "ProjectionStore.read_frozen_context_pack",
+                "AgentRuntime.observe_idea_run_binding",
+                "AgentRuntime.verify_delivered_context_pack",
                 "AgentRuntime.observe_run",
                 "AdvancementEngine.observe_idea_stage_run",
+                "AgentRuntime.observe_idea_run_binding",
                 "ResearchMemory.accept_idea_outcome_content",
                 "AgentRuntime.report_execution_blocker",
             ],
@@ -1418,9 +1684,9 @@ class IdeaStageMvpTests(unittest.TestCase):
 
     def test_unresolved_runtime_fact_blocks_formal_owner_write(self):
         observation = FixtureRunObservation(
-            run_ref=self.request.run_ref,
-            root_session_ref=self.request.root_session_ref,
-            execution_fence_ref=self.request.execution_fence_ref,
+            run_ref=self.binding.run_ref,
+            root_session_ref=self.binding.root_session_ref,
+            execution_fence_ref=self.binding.execution_fence_ref,
             technical_blocker_refs=("fixture:ar/blocker/existing",),
         )
         with self.assertRaises(ContractViolation):
@@ -1464,9 +1730,11 @@ class IdeaStageMvpTests(unittest.TestCase):
         self.assertEqual(
             [
                 "AdvancementEngine.observe_idea_stage_run",
-                "ProjectionStore.read_frozen_context_pack",
+                "AgentRuntime.observe_idea_run_binding",
+                "AgentRuntime.verify_delivered_context_pack",
                 "AgentRuntime.observe_run",
                 "AdvancementEngine.observe_idea_stage_run",
+                "AgentRuntime.observe_idea_run_binding",
                 "AdvancementEngine.submit_exhaustion_proposal",
             ],
             ledger.events,
@@ -1585,21 +1853,25 @@ class IdeaStageMvpTests(unittest.TestCase):
 
         other_request_ref = "fixture:ae/stage-run-request/idea-cross-run"
         other_pack = make_context_pack(
-            ref="fixture:projection/context-pack/idea-cross-run",
-            request_ref=other_request_ref,
-            question_ref=self.request.question_ref,
-            literature_revision_ref=None,
-            items=self.pack.items,
+            identity=replace(
+                self.pack.identity,
+                pack_ref="fixture:projection/context-pack/idea-cross-run",
+            ),
+            accepted_question_binding=self.pack.accepted_question_binding,
+            accepted_question_content_data=self.pack.accepted_question_content_data,
+            quest_goal_anchor=self.pack.quest_goal_anchor,
+            literature_anchor=self.pack.literature_anchor,
+            prior_research=self.pack.prior_research,
+            active_guidance=self.pack.active_guidance,
+            navigation_roots=self.pack.navigation_roots,
         )
         other_request = replace(
             self.request,
             ref=other_request_ref,
-            run_ref="fixture:ar/run/idea-cross-run",
-            root_session_ref="fixture:ar/session/root-cross-run",
-            execution_fence_ref="fixture:ar/fence/idea-cross-run",
             context_pack_ref=other_pack.ref,
             context_pack_sha256=other_pack.content_sha256,
         )
+        other_binding = make_run_binding(other_request, suffix="idea-cross-run")
         cross_run_ledger = CallLedger()
         with self.assertRaises(ContractViolation):
             reconcile_exhaustion_proposal(
@@ -1608,7 +1880,10 @@ class IdeaStageMvpTests(unittest.TestCase):
                 other_pack.content_sha256,
                 still_unknown,
                 FakeInvocationPort(
-                    cross_run_ledger, other_request, other_pack
+                    cross_run_ledger,
+                    other_request,
+                    other_pack,
+                    run_binding=other_binding,
                 ),
                 FakeRuntimePort(cross_run_ledger),
                 FakeAdvancementPort(
@@ -1758,7 +2033,7 @@ class IdeaStageMvpTests(unittest.TestCase):
         )
 
     def test_exhaustion_does_not_require_prior_submission_or_rejection(self):
-        verified = verify_invocation(self.request, self.pack)
+        verified = verify_invocation(self.request, self.binding, self.pack)
         closure = ExhaustionClosure(
             exploration_record_refs=("fixture:agent/exploration/no-submit",),
             prior_submission_refs=(),
@@ -1793,9 +2068,9 @@ class IdeaStageMvpTests(unittest.TestCase):
             cannot_form_no_viable_reason="A negative outcome is not supportable.",
         )
         observation = FixtureRunObservation(
-            run_ref=self.request.run_ref,
-            root_session_ref=self.request.root_session_ref,
-            execution_fence_ref=self.request.execution_fence_ref,
+            run_ref=self.binding.run_ref,
+            root_session_ref=self.binding.root_session_ref,
+            execution_fence_ref=self.binding.execution_fence_ref,
             outcome_unknown_refs=("fixture:agent/submission/still-unknown",),
         )
         with self.assertRaises(ContractViolation):
@@ -1830,9 +2105,9 @@ class IdeaStageMvpTests(unittest.TestCase):
             cannot_form_no_viable_reason="A bounded negative claim is unsupported.",
         )
         observation = FixtureRunObservation(
-            run_ref=self.request.run_ref,
-            root_session_ref=self.request.root_session_ref,
-            execution_fence_ref=self.request.execution_fence_ref,
+            run_ref=self.binding.run_ref,
+            root_session_ref=self.binding.root_session_ref,
+            execution_fence_ref=self.binding.execution_fence_ref,
             prior_submission_refs=(
                 "fixture:agent/submission/rejected-before-exhaustion",
             ),
@@ -1907,10 +2182,10 @@ class IdeaStageMvpTests(unittest.TestCase):
                         FakeRuntimePort(
                             ledger,
                             FixtureRunObservation(
-                                run_ref=self.request.run_ref,
-                                root_session_ref=self.request.root_session_ref,
+                                run_ref=self.binding.run_ref,
+                                root_session_ref=self.binding.root_session_ref,
                                 execution_fence_ref=(
-                                    self.request.execution_fence_ref
+                                    self.binding.execution_fence_ref
                                 ),
                                 prior_submission_refs=(
                                     closure.prior_submission_refs
@@ -1948,7 +2223,7 @@ class IdeaStageMvpTests(unittest.TestCase):
         accepted, _ = self.submit(fixture_no_viable())
         self.assertTrue(accepted.simulated_domain_accepted)
         self.assertFalse(accepted.is_owner_fact)
-        verified = verify_invocation(self.request, self.pack)
+        verified = verify_invocation(self.request, self.binding, self.pack)
         closure = ExhaustionClosure(
             exploration_record_refs=("fixture:agent/exploration/1",),
             prior_submission_refs=("fixture:agent/submission/nvc",),

@@ -1,7 +1,7 @@
 interface:
-  display_name: "Idea Stage"
-  short_description: "Form typed, reviewable Idea outcomes"
-  default_prompt: "Use $idea-stage with a current typed Idea StageRunRequest to form and submit an IdeaOutcome."
+  display_name: "Idea 阶段"
+  short_description: "在 frozen binding 上形成经独立评审的 IdeaOutcome"
+  default_prompt: "使用 $idea-stage 在已接纳且冻结的 Question binding 上形成并提交 IdeaOutcome。"
 
 policy:
   allow_implicit_invocation: false
