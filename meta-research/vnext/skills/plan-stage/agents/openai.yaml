@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Stage"
+  short_description: "把 Question、IdeaSet 与证据组织成 FormalPlan"
+  default_prompt: "使用 $plan-stage，从当前 Question、完整 IdeaSet 与精确证据形成 FormalPlan。"
