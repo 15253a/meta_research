@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reasoning Stage"
+  short_description: "Synthesize evidence and choose the next research cycle."
+  default_prompt: "Use $reasoning-stage to synthesize a current research cycle and propose either the next cycle or a Quest-completion candidate."
