@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bundle Stage"
+  short_description: "滚动调度并收口由 TargetRun 局部监控的工作"
+  default_prompt: "使用 $bundle-stage 从当前 FormalPlan 滚动规划、执行并收口 Target 工作。"
