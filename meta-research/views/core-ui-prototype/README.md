@@ -31,7 +31,7 @@ A 的左侧“树”入口和首页“打开完整问题树”会进入同一只
 
 `create_question` 窗口先收集由人拥有的六字段 `CreationSeed`。字段可以只填一部分；确认前 Agent 不会改写或补全，确认后也只是冻结 Seed 并准备进入共同起草，并不代表 `QuestionProposal`、Formal Question、RM 接纳、RG 接纳或 Stage 推进已经发生。
 
-DeepFetch HumanRequest 窗口绑定精确的 `RequestId / revision`、`DeepFetchRun` 与获取项 fixture。它假设用户已选择 `oa_then_institution`：OA 检索没有合法全文，机构访问随后失效。新的精确 request revision 在浏览器 session 内自动展示一次，并优先于 stdout 自动弹层；关闭后不重复抢焦点。默认窗口没有诊断侧栏或内部滚动区，只给出“我已重连 / 跳过，之后只用 OA / 手动上传该文献”三个按钮；选择后才在原位展开该路线的测试、确认或上传步骤。底层 fixture 仍区分 HC response、发起 Owner 的 Evaluation / Disposition，以及 ACQ-17 的 currentness / Resume Validation；Authorization receipt 或 RM Asset receipt 不会冒充“机构访问已恢复”。终态 HR-27 再次打开时只显示只读历史，不会复活同一个 RequestId。`scenario=waiting` 可演示测试失败后以 `needs_input` 保持 active，默认场景演示测试通过后自动关闭。
+DeepFetch HumanRequest 窗口绑定精确的 `RequestId / revision`、`DeepFetchRun` 与获取项 fixture。它假设用户已选择 `oa_then_institution`：OA 检索没有合法全文，机构访问随后失效。新的精确 request revision 在浏览器 session 内自动展示一次，并优先于 stdout 自动弹层；关闭后不重复抢焦点。默认窗口没有诊断侧栏或内部滚动区，只给出“我已重连 / 跳过，之后只用 OA / 手动上传该文献”三个按钮；OA 与上传尚未提交时，这三个按钮保持可用并可直接切换路线，当前路线单独高亮，不使用额外的返回按钮。底层 fixture 仍区分 HC response、发起 Owner 的 Evaluation / Disposition，以及 ACQ-17 的 currentness / Resume Validation；Authorization receipt 或 RM Asset receipt 不会冒充“机构访问已恢复”。终态 HR-27 再次打开时只显示只读历史，不会复活同一个 RequestId。`scenario=waiting` 可演示测试失败后以 `needs_input` 保持 active，默认场景演示测试通过后自动关闭。
 
 外部数据集、API 或机构访问的申请在产品语义上是人类线下任务：系统可以给出精确步骤、所需材料与最终回传 schema，但不得冒充申请人代为提交。这个边界已确定，本轮窗口先具体检验 DeepFetch 图书馆恢复场景；外部申请与物理实验可在同一任务工作台结构上继续做 fixture。
 
