@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="zh-CN" data-prototype-route="true">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:,">
+  <title>vNext 核心主界面 · 视觉方向原型</title>
+  <!-- Three structural and visual variants for issue 107, switchable via ?variant=A|B|C. -->
+  <style>
+    *,*::before,*::after{box-sizing:border-box}
+    :root{
+      --switch-bg:#111827;--switch-ink:#f8fafc;--switch-line:#475569;
+      --focus:#ff8a55;--shadow:0 18px 55px rgba(15,23,42,.18)
+    }
+    html{min-width:320px;background:#edf0f4;scrollbar-gutter:stable}
+    body{margin:0;min-width:320px;min-height:100vh;padding-bottom:70px;overflow-x:hidden}
+    button,input,textarea,select{font:inherit;color:inherit}
+    button{cursor:pointer}
+    button:focus-visible,input:focus-visible,textarea:focus-visible,[tabindex]:focus-visible,summary:focus-visible{
+      outline:3px solid var(--focus);outline-offset:3px
+    }
+    button:disabled{cursor:not-allowed;opacity:.45}
+    h1,h2,h3,p,dl,dd{margin-top:0}
+    .variant{display:none;min-height:100vh}
+    body[data-variant="A"] .variant-a,
+    body[data-variant="B"] .variant-b,
+    body[data-variant="C"] .variant-c{display:block}
+    [data-only]{display:none!important}
+    body[data-scenario="return"] [data-only="return"],
+    body[data-scenario="waiting"] [data-only="waiting"],
+    body[data-scenario="stale"] [data-only="stale"]{display:initial!important}
+    body[data-scenario="return"] div[data-only="return"],
+    body[data-scenario="waiting"] div[data-only="waiting"],
+    body[data-scenario="stale"] div[data-only="stale"],
+    body[data-scenario="return"] section[data-only="return"],
+    body[data-scenario="waiting"] section[data-only="waiting"],
+    body[data-scenario="stale"] section[data-only="stale"]{display:block!important}
+    .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
+    /* shared prototype chrome */
+    .prototype-bar{
+      position:relative;z-index:60;display:flex;align-items:center;gap:14px;min-height:34px;padding:6px 18px;
+      background:#121826;color:#eef2ff;border-bottom:1px solid #374151;
+      font:700 9px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.105em;text-transform:uppercase
+    }
+    .prototype-bar strong{color:#fff}.prototype-bar .quiet{color:#9ca3af}.prototype-bar .spacer{flex:1}
+    .scenario-picker{display:flex;align-items:center;border:1px solid #475569;border-radius:999px;overflow:hidden;background:#1f2937}
+    .scenario-picker button{border:0;border-left:1px solid #475569;padding:5px 10px;background:transparent;color:#cbd5e1;font-size:9px;letter-spacing:.02em}
+    .scenario-picker button:first-child{border-left:0}
+    .scenario-picker button[aria-pressed="true"]{background:#f8fafc;color:#111827}
+    .prototype-assumption{
+      display:inline-flex;align-items:center;gap:5px;padding:3px 6px;border:1px dashed currentColor;
+      font:700 8px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap
+    }
+    .prototype-assumption::before{content:"△"}
+    .variant-switcher{
+      position:fixed;z-index:100;left:50%;bottom:13px;transform:translateX(-50%);display:grid;
+      grid-template-columns:42px minmax(185px,240px) 42px;align-items:center;overflow:hidden;
+      border:1px solid var(--switch-line);border-top:3px solid #ff8a55;border-radius:12px;
+      background:var(--switch-bg);color:var(--switch-ink);box-shadow:0 12px 35px rgba(0,0,0,.28)
+    }
+    .variant-switcher button{height:38px;border:0;background:#1f2937;color:#fff;font-size:18px}
+    .variant-switcher button:hover{background:#ff8a55;color:#111827}
+    .variant-switcher div{padding:0 12px;text-align:center;font:600 10px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .variant-switcher b{color:#fff;font-size:12px}
+    .prototype-state{
+      position:fixed;z-index:95;right:14px;bottom:14px;width:min(300px,calc(100vw - 28px));
+      border:1px solid rgba(71,85,105,.8);border-radius:9px;background:#111827;color:#dbeafe;
+      box-shadow:0 12px 34px rgba(0,0,0,.23);font:9px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace
+    }
+    .prototype-state summary{padding:8px 11px;cursor:pointer;color:#cbd5e1;letter-spacing:.05em}
+    .prototype-state pre{max-height:220px;overflow:auto;margin:0;padding:0 11px 11px;white-space:pre-wrap;color:#e0e7ff}
+    .prototype-state:not([open]){width:auto}
+    .prototype-state:not([open]) summary{width:58px;overflow:hidden;font-size:0;text-align:center}
+    .prototype-state:not([open]) summary::after{content:"STATE";font-size:8px;letter-spacing:.11em}
+    .toast{
+      position:fixed;z-index:120;left:50%;top:17px;transform:translateX(-50%);max-width:min(560px,calc(100vw - 28px));
+      padding:11px 16px;border-left:4px solid #ff8a55;border-radius:6px;background:#111827;color:#fff;
+      box-shadow:0 14px 36px rgba(0,0,0,.25);font:600 12px/1.5 system-ui,sans-serif
+    }
+    .draft-drawer{
+      position:fixed;z-index:110;inset:0 0 0 auto;width:min(465px,100vw);padding:20px;background:#f8fafc;color:#172033;
+      border-left:1px solid #cbd5e1;box-shadow:-24px 0 70px rgba(15,23,42,.2);transform:translateX(105%);transition:transform .24s ease
+    }
+    .draft-drawer[data-open="true"]{transform:translateX(0)}
+    .draft-head{display:flex;align-items:start;gap:12px;padding-bottom:16px;border-bottom:1px solid #d8dee9}
+    .draft-head h2{margin-bottom:4px;font:750 24px/1.08 system-ui,sans-serif;letter-spacing:-.025em}
+    .draft-head p{margin-bottom:0;color:#64748b;font:12px/1.5 system-ui,sans-serif}
+    .draft-head button{margin-left:auto;width:34px;height:34px;border:1px solid #cbd5e1;border-radius:50%;background:#fff}
+    .draft-step{margin-top:20px;padding:14px;border:1px solid #d8dee9;border-radius:9px;background:#fff}
+    .draft-step small{display:block;margin-bottom:7px;color:#64748b;font:700 9px/1.2 ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase}
+    .draft-step b{font:700 14px/1.45 system-ui,sans-serif}
+    .impact-row{display:grid;grid-template-columns:110px 1fr;gap:8px;padding:9px 0;border-bottom:1px solid #eef2f7;font:12px/1.5 system-ui,sans-serif}
+    .impact-row span:first-child{color:#64748b}.impact-row:last-child{border-bottom:0}
+    .draft-actions{display:flex;gap:8px;margin-top:18px}.draft-actions button{padding:10px 14px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;font-weight:700}
+    .draft-actions .confirm{border-color:#1e293b;background:#1e293b;color:#fff}
+
+    /* ================================================================
+       A — RETURN CHART / 返场航图
+       Palette: frost, porcelain, ink, cobalt, coral, jade.
+       Layout: navigation rail + return briefing + persistent companion.
+       Signature: three truth lanes crossing the Stage route.
+       ================================================================ */
+    .variant-a{
+      --a-bg:#eef3f8;--a-paper:#fbfdff;--a-ink:#17233a;--a-muted:#65738a;--a-line:#cfd9e6;
+      --a-cobalt:#3f5bd8;--a-cobalt-soft:#e5eaff;--a-coral:#e56f51;--a-coral-soft:#fff0eb;
+      --a-jade:#2e8779;--a-jade-soft:#e4f3ef;--a-steel:#8ba0bc;
+      background:var(--a-bg);color:var(--a-ink);font-family:"Aptos","Inter","PingFang SC","Microsoft YaHei",system-ui,sans-serif
+    }
+    .a-shell{display:grid;grid-template-columns:224px minmax(560px,1fr) 352px;grid-template-rows:70px minmax(0,1fr);min-height:calc(100vh - 34px)}
+    .a-top{
+      grid-column:1/-1;display:flex;align-items:center;gap:19px;padding:0 22px;background:var(--a-paper);
+      border-bottom:1px solid var(--a-line)
+    }
+    .a-brand{display:flex;align-items:center;gap:10px;min-width:183px}.a-mark{position:relative;width:34px;height:34px;border:2px solid var(--a-ink);border-radius:50%;display:grid;place-items:center;font:800 11px/1 ui-monospace,monospace}.a-mark::after{content:"";position:absolute;width:18px;border-top:2px solid var(--a-coral);transform:rotate(-36deg)}
+    .a-brand b{display:block;font-size:13px;letter-spacing:.02em}.a-brand small{display:block;margin-top:2px;color:var(--a-muted);font:9px/1.2 ui-monospace,monospace;letter-spacing:.05em;text-transform:uppercase}
+    .a-quest-switch{min-width:0;flex:1}.a-quest-switch small{display:block;margin-bottom:2px;color:var(--a-muted);font:700 8px/1.2 ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase}.a-quest-switch b{display:block;max-width:640px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+    .a-fresh{display:flex;align-items:center;gap:7px;color:var(--a-muted);font:10px/1.3 ui-monospace,monospace;white-space:nowrap}.a-fresh i{width:7px;height:7px;border-radius:50%;background:var(--a-jade);box-shadow:0 0 0 4px var(--a-jade-soft)}
+    .a-avatar{width:34px;height:34px;border:1px solid var(--a-line);border-radius:50%;background:linear-gradient(145deg,var(--a-cobalt-soft),#fff);display:grid;place-items:center;font-weight:800}
+    .a-nav{display:flex;flex-direction:column;gap:4px;padding:18px 12px;background:#e7eef5;border-right:1px solid var(--a-line)}
+    .a-nav-label{margin:13px 10px 4px;color:var(--a-muted);font:700 8px/1.2 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase}.a-nav-label:first-child{margin-top:0}
+    .a-nav button{display:flex;align-items:center;gap:10px;width:100%;padding:9px 11px;border:0;border-radius:8px;background:transparent;color:var(--a-ink);text-align:left;font-size:12px}.a-nav button:hover{background:rgba(255,255,255,.65)}.a-nav button.active{background:var(--a-paper);box-shadow:0 5px 18px rgba(23,35,58,.07);font-weight:750}.a-nav button .a-icon{width:20px;color:var(--a-muted);font:800 13px/1 ui-monospace,monospace}.a-nav button.active .a-icon{color:var(--a-cobalt)}.a-nav .count{margin-left:auto;min-width:20px;padding:2px 5px;border-radius:999px;background:var(--a-coral);color:#fff;text-align:center;font:700 9px/1.3 ui-monospace,monospace}
+    .a-nav-foot{margin-top:auto;padding:12px 10px;border-top:1px solid var(--a-line);color:var(--a-muted);font:10px/1.55 ui-monospace,monospace}.a-nav-foot b{color:var(--a-ink)}
+    .a-main{min-width:0;overflow:auto;padding:24px clamp(20px,3vw,42px) 76px}
+    .a-kicker{display:flex;align-items:center;gap:11px;margin-bottom:10px;color:var(--a-cobalt);font:750 9px/1.2 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase}.a-kicker::after{content:"";height:1px;flex:1;background:linear-gradient(90deg,var(--a-cobalt),transparent)}
+    .a-return-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:22px;align-items:end;margin-bottom:20px}.a-return-head h1{max-width:780px;margin-bottom:9px;font-family:"Songti SC","STSong","Noto Serif CJK SC",serif;font-size:clamp(30px,3vw,49px);font-weight:650;letter-spacing:-.045em;line-height:1.08}.a-return-head p{max-width:720px;margin-bottom:0;color:var(--a-muted);font-size:13px;line-height:1.7}.a-return-head .a-time{text-align:right;color:var(--a-muted);font:10px/1.6 ui-monospace,monospace}.a-return-head .a-time b{display:block;color:var(--a-ink);font-size:22px}
+    .a-priority{
+      display:grid;grid-template-columns:5px minmax(0,1fr) auto;gap:15px;align-items:center;margin-bottom:16px;padding:15px 16px 15px 0;
+      border:1px solid #efb8a8;border-radius:10px;background:var(--a-coral-soft)
+    }
+    .a-priority::before{content:"";align-self:stretch;border-radius:0 4px 4px 0;background:var(--a-coral)}.a-priority small{display:block;margin-bottom:4px;color:#a54530;font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase}.a-priority b{font-size:13px}.a-priority p{margin:3px 0 0;color:#7c554c;font-size:11.5px}.a-priority button{margin-right:2px;padding:8px 11px;border:1px solid var(--a-coral);border-radius:7px;background:var(--a-coral);color:#fff;font-size:11px;font-weight:750}
+    .a-stage-board{margin-bottom:16px;border:1px solid var(--a-line);border-radius:12px;background:var(--a-paper);box-shadow:0 10px 30px rgba(55,73,106,.06);overflow:hidden}
+    .a-board-head{display:flex;align-items:center;gap:11px;padding:13px 16px;border-bottom:1px solid var(--a-line)}.a-board-head b{font-size:12px}.a-board-head span{color:var(--a-muted);font:9px/1.3 ui-monospace,monospace}.a-board-head .asof{margin-left:auto}
+    .a-stage-route{display:grid;grid-template-columns:120px repeat(4,minmax(110px,1fr));position:relative}.a-stage-route::after{content:"";position:absolute;left:151px;right:10%;top:38px;border-top:1px dashed var(--a-steel);z-index:0}
+    .a-stage-route>div{position:relative;z-index:1;min-height:76px;padding:12px 13px;border-right:1px solid #e7edf4}.a-stage-route>div:last-child{border-right:0}.a-stage-route .axis{color:var(--a-muted);font:8px/1.3 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.07em}.a-stage-route .stage-name{display:block;margin:5px 0 2px;font-size:12px}.a-stage-route .stage-state{color:var(--a-muted);font-size:9.5px}.a-stage-route .stage-dot{position:absolute;right:13px;top:34px;width:9px;height:9px;border:2px solid var(--a-paper);border-radius:50%;background:var(--a-steel);box-shadow:0 0 0 1px var(--a-steel)}.a-stage-route .done .stage-dot{background:var(--a-jade);box-shadow:0 0 0 1px var(--a-jade)}.a-stage-route .current{background:linear-gradient(180deg,var(--a-cobalt-soft),transparent)}.a-stage-route .current .stage-dot{width:12px;height:12px;top:32px;background:var(--a-cobalt);box-shadow:0 0 0 3px #cfd7ff}.a-stage-route .current .stage-name{color:var(--a-cobalt);font-weight:800}
+    .a-truth-lanes{display:grid;grid-template-columns:120px repeat(4,minmax(110px,1fr));border-top:1px solid var(--a-line);font:9px/1.35 ui-monospace,monospace}.a-truth-lanes>div{padding:8px 12px;border-right:1px solid #e7edf4}.a-truth-lanes>div:last-child{border-right:0}.a-truth-lanes .lane-label{color:var(--a-muted);font-weight:750}.a-truth-lanes .truth{display:flex;align-items:center;gap:6px}.a-truth-lanes i{width:6px;height:6px;border-radius:50%;background:var(--a-steel)}.a-truth-lanes .yes i{background:var(--a-jade)}.a-truth-lanes .now i{background:var(--a-cobalt)}.a-truth-lanes .no{color:#8b98aa}
+    .a-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(255px,.8fr);gap:16px}
+    .a-panel{min-width:0;padding:17px;border:1px solid var(--a-line);border-radius:12px;background:var(--a-paper)}.a-panel-head{display:flex;align-items:start;gap:12px;margin-bottom:14px}.a-panel-head h2{margin-bottom:3px;font-size:15px}.a-panel-head p{margin-bottom:0;color:var(--a-muted);font-size:10.5px}.a-panel-head .tag{margin-left:auto;padding:4px 7px;border:1px solid #cbd5f4;border-radius:6px;background:var(--a-cobalt-soft);color:var(--a-cobalt);font:700 8px/1.2 ui-monospace,monospace}
+    .a-question{padding:15px;border-left:3px solid var(--a-cobalt);background:#f3f6ff}.a-question small{display:block;margin-bottom:7px;color:var(--a-cobalt);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase}.a-question h3{margin-bottom:8px;font-family:"Songti SC","STSong",serif;font-size:19px;line-height:1.35}.a-question p{margin-bottom:0;color:var(--a-muted);font-size:11px;line-height:1.65}
+    .a-evidence-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.a-evidence-row button{min-width:0;padding:10px;border:1px solid var(--a-line);border-radius:7px;background:#fff;text-align:left}.a-evidence-row button span{display:block;color:var(--a-muted);font:8px/1.2 ui-monospace,monospace}.a-evidence-row button b{display:block;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10.5px}
+    .a-run-list{display:flex;flex-direction:column;gap:8px}.a-run{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:9px;align-items:start;padding:10px;border:1px solid #e1e8f0;border-radius:8px}.a-run>i{width:8px;height:8px;margin-top:3px;border-radius:50%;background:var(--a-jade)}.a-run.active>i{background:var(--a-cobalt);box-shadow:0 0 0 4px var(--a-cobalt-soft)}.a-run small{display:block;color:var(--a-muted);font:8px/1.3 ui-monospace,monospace}.a-run b{display:block;margin-top:3px;font-size:10.5px}.a-run .run-state{color:var(--a-muted);font:8px/1.3 ui-monospace,monospace}
+    .a-companion{display:flex;flex-direction:column;min-width:0;border-left:1px solid var(--a-line);background:var(--a-paper)}
+    .a-companion-head{display:flex;align-items:center;gap:10px;padding:16px;border-bottom:1px solid var(--a-line)}.a-companion-head .orb{width:30px;height:30px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#fff 0 15%,#8ba1ff 18%,var(--a-cobalt) 58%,#263d9d);box-shadow:0 0 0 5px var(--a-cobalt-soft)}.a-companion-head b{font-size:12px}.a-companion-head small{display:block;margin-top:2px;color:var(--a-muted);font:8px/1.2 ui-monospace,monospace}.a-companion-head .online{margin-left:auto;color:var(--a-jade);font:9px/1.2 ui-monospace,monospace}
+    .a-chat{display:flex;flex:1;flex-direction:column;gap:13px;overflow:auto;padding:20px 16px}.a-message{max-width:90%;padding:11px 12px;border:1px solid var(--a-line);border-radius:12px 12px 12px 4px;background:#f5f8fb;font-size:11.5px;line-height:1.65}.a-message.me{align-self:flex-end;border-color:var(--a-cobalt);border-radius:12px 12px 4px 12px;background:var(--a-cobalt);color:#fff}.a-message .message-tag{display:block;margin-bottom:6px;color:var(--a-muted);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.05em}.a-message.me .message-tag{color:#cfd7ff}.a-proposal{padding:12px;border:1px solid #c9d2f5;border-radius:10px;background:var(--a-cobalt-soft)}.a-proposal small{display:flex;align-items:center;gap:7px;color:var(--a-cobalt);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.06em}.a-proposal h3{margin:8px 0 5px;font-size:12px}.a-proposal p{margin-bottom:10px;color:#57658a;font-size:10.5px;line-height:1.55}.a-proposal button{padding:7px 9px;border:1px solid var(--a-cobalt);border-radius:6px;background:var(--a-paper);color:var(--a-cobalt);font-size:10px;font-weight:750}
+    .a-compose{padding:12px 14px 18px;border-top:1px solid var(--a-line)}.a-compose-box{display:flex;gap:8px;align-items:end;padding:9px;border:1px solid var(--a-line);border-radius:10px;background:#fff}.a-compose-box textarea{min-height:38px;max-height:90px;flex:1;resize:none;border:0;background:transparent;font-size:11px}.a-compose-box textarea:focus-visible{outline:0}.a-compose-box button{width:34px;height:34px;border:0;border-radius:8px;background:var(--a-ink);color:#fff}.a-compose small{display:block;margin-top:6px;color:var(--a-muted);font:8px/1.4 ui-monospace,monospace}
+
+    /* ================================================================
+       B — NIGHT OBSERVATORY / 夜间观测台
+       Palette: aubergine, shell, violet, amber, sea glass.
+       Layout: no app sidebar; narrative sweep + attention dock + ledger.
+       Signature: a vertical return-sweep cuts through the event field.
+       ================================================================ */
+    .variant-b{
+      --b-night:#211b2d;--b-night2:#2c233b;--b-shell:#f3f0f6;--b-paper:#fffdfd;--b-ink:#241d31;
+      --b-muted:#81768e;--b-line:#d8cede;--b-violet:#7655c7;--b-violet2:#a995db;--b-amber:#efa84e;
+      --b-teal:#65b6a6;--b-rose:#c66b73;
+      background:var(--b-night);color:var(--b-shell);font-family:"Arial Narrow","Roboto Condensed","PingFang SC","Microsoft YaHei",system-ui,sans-serif
+    }
+    .b-shell{min-height:calc(100vh - 34px);background:linear-gradient(135deg,var(--b-night) 0 57%,#261e33 57%)}
+    .b-top{display:grid;grid-template-columns:auto minmax(300px,1fr) auto;align-items:center;gap:26px;padding:19px 28px;border-bottom:1px solid #44384f}
+    .b-wordmark{display:flex;align-items:center;gap:11px}.b-wordmark .glyph{width:40px;height:32px;border:1px solid #655877;display:grid;grid-template-columns:repeat(4,1fr);gap:3px;padding:7px}.b-wordmark .glyph i{background:var(--b-violet2)}.b-wordmark .glyph i:nth-child(2){height:65%;align-self:end;background:var(--b-amber)}.b-wordmark .glyph i:nth-child(3){height:45%;align-self:end;background:var(--b-teal)}.b-wordmark b{display:block;font-size:14px;letter-spacing:.04em}.b-wordmark small{display:block;margin-top:2px;color:#a99db6;font:8px/1.2 ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase}
+    .b-command{display:flex;align-items:center;gap:11px;max-width:760px;padding:9px 13px;border:1px solid #51445d;border-radius:4px;background:#2a2238;color:#d8cee3}.b-command span{color:var(--b-amber);font:700 11px/1 ui-monospace,monospace}.b-command b{font-size:12px}.b-command small{margin-left:auto;color:#94879f;font:8px/1.2 ui-monospace,monospace}
+    .b-top-actions{display:flex;gap:8px}.b-top-actions button{padding:8px 11px;border:1px solid #5c4e68;border-radius:4px;background:transparent;color:#e7deef;font-size:10px;font-weight:700}.b-top-actions .hot{border-color:var(--b-amber);color:#211b2d;background:var(--b-amber)}
+    .b-layout{display:grid;grid-template-columns:minmax(0,1fr) 362px;min-height:calc(100vh - 111px)}
+    .b-field{min-width:0;padding:30px clamp(22px,4vw,58px) 82px}
+    .b-field-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:20px;align-items:start;margin-bottom:22px}.b-field-head .eyebrow{margin-bottom:11px;color:var(--b-amber);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.15em;text-transform:uppercase}.b-field-head h1{max-width:820px;margin-bottom:9px;font-size:clamp(32px,4vw,61px);font-weight:760;letter-spacing:-.055em;line-height:.98}.b-field-head h1 em{color:var(--b-violet2);font-style:normal}.b-field-head p{max-width:690px;margin-bottom:0;color:#aa9db5;font-size:12px;line-height:1.7}.b-orbit{width:116px;height:116px;position:relative;border:1px solid #594a66;border-radius:50%;display:grid;place-items:center;color:#c9bdd4;font:700 9px/1.4 ui-monospace,monospace;text-align:center}.b-orbit::before,.b-orbit::after{content:"";position:absolute;border:1px solid #4b3f57;border-radius:50%}.b-orbit::before{inset:15px}.b-orbit::after{width:9px;height:9px;right:10px;top:28px;border:0;background:var(--b-amber);box-shadow:0 0 18px var(--b-amber)}.b-orbit b{display:block;color:#fff;font-size:18px}
+    .b-sweep{position:relative;display:grid;grid-template-columns:104px minmax(0,1fr);min-height:405px;border-top:1px solid #51445e;border-bottom:1px solid #51445e}.b-sweep::before{content:"";position:absolute;left:103px;top:0;bottom:0;border-left:1px solid #51445e}.b-sweep::after{content:"RETURN SWEEP";position:absolute;left:92px;top:118px;padding:5px 0;background:var(--b-night);color:var(--b-amber);font:700 7px/1 ui-monospace,monospace;letter-spacing:.15em;writing-mode:vertical-rl}
+    .b-time-axis{padding:20px 15px 20px 0;color:#7d7088;font:8px/1.3 ui-monospace,monospace;text-align:right}.b-time-axis div{height:76px}.b-time-axis b{display:block;color:#b3a6bd;font-size:10px}
+    .b-events{position:relative;padding:18px 0 18px 32px}.b-event{position:relative;display:grid;grid-template-columns:116px minmax(0,1fr) auto;gap:13px;align-items:start;min-height:76px;padding:11px 12px;border-bottom:1px solid #3d3248}.b-event:last-child{border-bottom:0}.b-event::before{content:"";position:absolute;left:-37px;top:18px;width:9px;height:9px;border:2px solid var(--b-night);border-radius:50%;background:var(--b-violet2);box-shadow:0 0 0 1px var(--b-violet2)}.b-event.important::before{background:var(--b-amber);box-shadow:0 0 0 4px rgba(239,168,78,.16)}.b-event .kind{color:var(--b-violet2);font:700 8px/1.4 ui-monospace,monospace;letter-spacing:.07em;text-transform:uppercase}.b-event.important .kind{color:var(--b-amber)}.b-event b{display:block;margin-bottom:4px;color:#f6f2f8;font-size:12px}.b-event p{margin-bottom:0;color:#aa9db5;font-size:10.5px;line-height:1.55}.b-event .proof{padding:4px 6px;border:1px solid #4d4059;color:#998ca4;font:7.5px/1.2 ui-monospace,monospace;white-space:nowrap}
+    .b-ledger{display:grid;grid-template-columns:130px repeat(4,minmax(115px,1fr));margin-top:18px;border:1px solid #51445e}.b-ledger>div{min-height:54px;padding:9px 10px;border-right:1px solid #51445e;border-bottom:1px solid #51445e}.b-ledger>div:nth-child(5n){border-right:0}.b-ledger>div:nth-last-child(-n+5){border-bottom:0}.b-ledger .head{color:#8f829a;font:700 8px/1.25 ui-monospace,monospace;letter-spacing:.07em;text-transform:uppercase}.b-ledger .row{color:#a89bb3;font-size:9px}.b-ledger .stage{color:#f0e9f5;font-weight:750}.b-ledger .done{background:rgba(101,182,166,.1);color:#8bd4c5}.b-ledger .current{background:rgba(118,85,199,.2);color:#c6b5ef}.b-ledger .pending{color:#72677b}.b-ledger .mark{display:inline-block;width:6px;height:6px;margin-right:5px;border-radius:50%;background:currentColor}
+    .b-dock{display:flex;flex-direction:column;min-width:0;background:var(--b-shell);color:var(--b-ink);border-left:1px solid #473a52}
+    .b-dock-head{padding:18px 18px 13px;border-bottom:1px solid var(--b-line)}.b-dock-head .eyebrow{display:flex;align-items:center;gap:7px;margin-bottom:6px;color:var(--b-violet);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}.b-dock-head .eyebrow i{width:8px;height:8px;border-radius:50%;background:var(--b-violet);box-shadow:0 0 0 4px #e7e0f7}.b-dock-head h2{margin-bottom:4px;font-size:19px;letter-spacing:-.02em}.b-dock-head p{margin-bottom:0;color:var(--b-muted);font-size:10.5px;line-height:1.5}
+    .b-attention{padding:14px 18px;border-bottom:1px solid var(--b-line);background:#fffaf3}.b-attention small{display:block;margin-bottom:6px;color:#a36316;font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase}.b-attention h3{margin-bottom:5px;font-size:13px}.b-attention p{margin-bottom:10px;color:#786d7e;font-size:10.5px;line-height:1.55}.b-attention button{padding:7px 9px;border:1px solid #b7731f;border-radius:3px;background:transparent;color:#92590f;font-size:10px;font-weight:750}
+    .b-chat{display:flex;flex:1;flex-direction:column;gap:12px;overflow:auto;padding:17px 18px}.b-chat .line{padding-bottom:12px;border-bottom:1px solid #e5dde9}.b-chat .line:last-child{border-bottom:0}.b-chat .who{display:flex;align-items:center;gap:8px;margin-bottom:6px;color:var(--b-muted);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.07em;text-transform:uppercase}.b-chat .who::before{content:"";width:14px;border-top:2px solid var(--b-violet)}.b-chat .line.me .who::before{border-color:var(--b-amber)}.b-chat p{margin-bottom:0;font-size:11.5px;line-height:1.65}.b-chat .proposal{margin-top:9px;padding:10px;border-left:3px solid var(--b-violet);background:#ebe5f5}.b-chat .proposal b{display:block;margin-bottom:4px;font-size:11px}.b-chat .proposal small{display:block;color:var(--b-muted);font:8px/1.4 ui-monospace,monospace}.b-chat .proposal button{margin-top:8px;padding:6px 8px;border:1px solid var(--b-violet);border-radius:3px;background:transparent;color:var(--b-violet);font-size:9.5px;font-weight:750}
+    .b-compose{display:grid;grid-template-columns:1fr auto;gap:8px;padding:13px 18px 19px;border-top:1px solid var(--b-line);background:var(--b-paper)}.b-compose input{min-width:0;padding:9px 10px;border:1px solid var(--b-line);border-radius:3px;background:#fff;font-size:10.5px}.b-compose button{padding:8px 11px;border:1px solid var(--b-ink);border-radius:3px;background:var(--b-ink);color:#fff;font-size:10px;font-weight:750}.b-assumption{grid-column:1/-1;color:var(--b-muted);font:8px/1.35 ui-monospace,monospace}
+
+    /* ================================================================
+       C — QUESTION CONSTELLATION / 问题星图
+       Palette: fog, white, deep teal, coral, sea glass, citron.
+       Layout: spatial relationship canvas + slim Stage spine + bottom companion.
+       Signature: a navigable constellation makes context the primary object.
+       ================================================================ */
+    .variant-c{
+      --c-fog:#eaf2f1;--c-paper:#fbfefd;--c-ink:#153038;--c-muted:#61777a;--c-line:#bfd3d2;
+      --c-teal:#08737b;--c-teal2:#49a9a4;--c-coral:#e5795d;--c-coral2:#ffe9e1;--c-citron:#d8df77;
+      background:var(--c-fog);color:var(--c-ink);font-family:"Trebuchet MS","PingFang SC","Microsoft YaHei",system-ui,sans-serif
+    }
+    .c-shell{min-height:calc(100vh - 34px);padding:18px 20px 80px;background-image:radial-gradient(rgba(8,115,123,.13) .7px,transparent .7px);background-size:17px 17px}
+    .c-top{display:grid;grid-template-columns:auto minmax(260px,1fr) auto;align-items:center;gap:22px;max-width:1680px;margin:0 auto 15px;padding:10px 13px;border:1px solid var(--c-line);border-radius:16px;background:rgba(251,254,253,.92);box-shadow:0 12px 34px rgba(21,48,56,.08);backdrop-filter:blur(10px)}
+    .c-brand{display:flex;align-items:center;gap:9px}.c-logo{width:34px;height:34px;border-radius:11px;background:var(--c-teal);color:#fff;display:grid;place-items:center;font:800 11px/1 ui-monospace,monospace;transform:rotate(-4deg)}.c-brand b{display:block;font-size:12px}.c-brand small{display:block;margin-top:1px;color:var(--c-muted);font:8px/1.2 ui-monospace,monospace;letter-spacing:.06em;text-transform:uppercase}
+    .c-breadcrumb{min-width:0;color:var(--c-muted);font:9px/1.3 ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.c-breadcrumb b{color:var(--c-ink)}
+    .c-tools{display:flex;gap:7px}.c-tools button{padding:7px 9px;border:1px solid var(--c-line);border-radius:9px;background:var(--c-paper);font-size:9.5px;font-weight:700}.c-tools button.hot{border-color:var(--c-teal);background:var(--c-teal);color:#fff}
+    .c-layout{display:grid;grid-template-columns:118px minmax(600px,1fr) 285px;grid-template-rows:minmax(550px,calc(100vh - 212px)) auto;gap:14px;max-width:1680px;margin:auto}
+    .c-stage-spine{grid-row:1;padding:13px 10px;border:1px solid var(--c-line);border-radius:16px;background:rgba(251,254,253,.92)}.c-stage-spine>small{display:block;margin:2px 6px 14px;color:var(--c-muted);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.13em;text-transform:uppercase}.c-stage-list{position:relative;display:flex;flex-direction:column;gap:5px}.c-stage-list::before{content:"";position:absolute;left:17px;top:21px;bottom:21px;border-left:1px dashed var(--c-line)}.c-stage-list button{position:relative;z-index:1;display:grid;grid-template-columns:22px 1fr;gap:7px;align-items:center;width:100%;min-height:72px;padding:8px 5px;border:0;border-radius:11px;background:transparent;text-align:left}.c-stage-list button:hover{background:#f0f8f6}.c-stage-list button.active{background:#dcefed}.c-stage-list .num{width:22px;height:22px;border:1px solid var(--c-line);border-radius:50%;background:var(--c-paper);display:grid;place-items:center;color:var(--c-muted);font:750 8px/1 ui-monospace,monospace}.c-stage-list button.done .num{border-color:var(--c-teal2);background:var(--c-teal2);color:#fff}.c-stage-list button.active .num{border-color:var(--c-teal);background:var(--c-teal);color:#fff;box-shadow:0 0 0 5px rgba(8,115,123,.12)}.c-stage-list b{display:block;font-size:9.5px}.c-stage-list small{display:block;margin-top:3px;color:var(--c-muted);font:7.5px/1.2 ui-monospace,monospace}
+    .c-map{position:relative;grid-row:1;min-width:0;overflow:hidden;border:1px solid var(--c-line);border-radius:22px;background:rgba(251,254,253,.94);box-shadow:0 16px 45px rgba(21,48,56,.08)}
+    .c-map-head{position:absolute;z-index:10;left:20px;right:20px;top:17px;display:flex;align-items:start;gap:13px}.c-map-head .eyebrow{margin-bottom:4px;color:var(--c-teal);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}.c-map-head h1{margin-bottom:0;font-size:clamp(20px,2.2vw,34px);letter-spacing:-.035em}.c-map-head .asof{margin-left:auto;color:var(--c-muted);font:8px/1.5 ui-monospace,monospace;text-align:right}.c-map-head .asof b{display:block;color:var(--c-ink);font-size:10px}
+    .c-canvas{position:absolute;inset:82px 18px 20px}.c-orbit{position:absolute;border:1px dashed var(--c-line);border-radius:50%;pointer-events:none}.c-orbit.one{width:440px;height:440px;left:50%;top:50%;transform:translate(-50%,-50%)}.c-orbit.two{width:650px;height:330px;left:50%;top:52%;transform:translate(-50%,-50%) rotate(-8deg)}.c-orbit.three{width:290px;height:560px;left:50%;top:48%;transform:translate(-50%,-50%) rotate(22deg)}
+    .c-node{position:absolute;z-index:3;padding:12px 13px;border:1px solid var(--c-line);border-radius:14px;background:var(--c-paper);box-shadow:0 9px 22px rgba(21,48,56,.08);text-align:left}.c-node:hover{transform:translateY(-2px);box-shadow:0 13px 30px rgba(21,48,56,.12)}.c-node small{display:block;margin-bottom:5px;color:var(--c-muted);font:750 7px/1.2 ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase}.c-node b{display:block;font-size:10.5px;line-height:1.35}.c-node p{margin:5px 0 0;color:var(--c-muted);font-size:8.5px;line-height:1.45}.c-node::after{content:"";position:absolute;width:8px;height:8px;border:2px solid var(--c-paper);border-radius:50%;background:var(--c-teal2);box-shadow:0 0 0 1px var(--c-teal2)}
+    .c-node.goal{left:4%;top:9%;width:180px;border-color:#a9c8c5}.c-node.goal::after{right:-5px;bottom:18px}.c-node.question{left:50%;top:47%;width:min(330px,38%);padding:18px;transform:translate(-50%,-50%);border:2px solid var(--c-teal);background:#f4fbf9;box-shadow:0 0 0 10px rgba(8,115,123,.07),0 17px 36px rgba(21,48,56,.12)}.c-node.question:hover{transform:translate(-50%,-52%)}.c-node.question small{color:var(--c-teal)}.c-node.question b{font-family:"Songti SC","STSong",serif;font-size:17px;line-height:1.45}.c-node.question::after{right:-6px;top:50%;background:var(--c-coral);box-shadow:0 0 0 1px var(--c-coral)}
+    .c-node.evidence{right:3%;top:15%;width:165px}.c-node.evidence::after{left:-5px;bottom:17px}.c-node.run{right:8%;bottom:13%;width:160px}.c-node.run::after{left:-5px;top:16px}.c-node.writing{left:7%;bottom:7%;width:180px}.c-node.writing::after{right:-5px;top:17px;background:var(--c-coral);box-shadow:0 0 0 1px var(--c-coral)}.c-node.request{right:29%;top:5%;width:170px;border-color:#e9aa99;background:var(--c-coral2)}.c-node.request::after{left:22px;bottom:-5px;background:var(--c-coral);box-shadow:0 0 0 1px var(--c-coral)}
+    .c-connector{position:absolute;z-index:1;height:1px;background:var(--c-line);transform-origin:left center}.c-connector.gq{left:19%;top:34%;width:27%;transform:rotate(12deg)}.c-connector.qe{left:61%;top:42%;width:25%;transform:rotate(-17deg)}.c-connector.qr{left:61%;top:57%;width:24%;transform:rotate(20deg)}.c-connector.qw{left:22%;top:67%;width:27%;transform:rotate(-17deg)}.c-connector.rq{left:55%;top:24%;width:17%;transform:rotate(52deg);background:#e9aa99}
+    .c-truth-key{position:absolute;z-index:6;left:18px;bottom:17px;display:flex;gap:10px;align-items:center;padding:7px 9px;border:1px solid var(--c-line);border-radius:10px;background:rgba(251,254,253,.9);color:var(--c-muted);font:7.5px/1.2 ui-monospace,monospace}.c-truth-key span{display:flex;gap:4px;align-items:center}.c-truth-key i{width:7px;height:7px;border-radius:50%;background:var(--c-teal2)}.c-truth-key span:nth-child(2) i{background:var(--c-coral)}.c-truth-key span:nth-child(3) i{background:var(--c-citron)}
+    .c-attention{grid-row:1;display:flex;flex-direction:column;gap:11px;min-width:0}.c-card{padding:14px;border:1px solid var(--c-line);border-radius:16px;background:rgba(251,254,253,.93)}.c-card .eyebrow{margin-bottom:8px;color:var(--c-muted);font:750 8px/1.2 ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase}.c-card h2{margin-bottom:6px;font-size:14px}.c-card p{margin-bottom:10px;color:var(--c-muted);font-size:10px;line-height:1.55}.c-request{border-color:#e7a995;background:rgba(255,240,235,.95)}.c-request .eyebrow{color:#aa4d36}.c-request button{padding:7px 9px;border:1px solid var(--c-coral);border-radius:8px;background:var(--c-coral);color:#fff;font-size:9.5px;font-weight:750}
+    .c-layer-list{display:flex;flex-direction:column;gap:7px}.c-layer{display:grid;grid-template-columns:8px 1fr auto;gap:7px;align-items:center;padding:8px;border:1px solid #dce9e7;border-radius:9px;background:#fff}.c-layer i{width:8px;height:8px;border-radius:50%;background:var(--c-teal2)}.c-layer.pending i{background:var(--c-citron)}.c-layer small{display:block;color:var(--c-muted);font:7px/1.2 ui-monospace,monospace}.c-layer b{display:block;margin-top:2px;font-size:9.5px}.c-layer span{color:var(--c-muted);font:7px/1.2 ui-monospace,monospace}
+    .c-entrances{display:grid;grid-template-columns:1fr 1fr;gap:7px}.c-entrances button{min-height:63px;padding:9px;border:1px solid var(--c-line);border-radius:10px;background:#fff;text-align:left}.c-entrances button b{display:block;font-size:9.5px}.c-entrances button small{display:block;margin-top:4px;color:var(--c-muted);font:7px/1.3 ui-monospace,monospace}.c-entrances button:last-child{grid-column:1/-1}
+    .c-companion{grid-column:1/-1;display:grid;grid-template-columns:118px minmax(0,1.5fr) minmax(280px,.8fr);gap:0;overflow:hidden;border:1px solid var(--c-line);border-radius:18px;background:rgba(251,254,253,.96);box-shadow:0 12px 32px rgba(21,48,56,.08)}.c-companion-label{display:grid;place-items:center;padding:15px;border-right:1px solid var(--c-line);background:#dcefed;text-align:center}.c-companion-label .orb{width:34px;height:34px;margin:auto auto 7px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#fff 0 12%,#74c9c3 16%,var(--c-teal) 68%)}.c-companion-label b{display:block;font-size:9.5px}.c-companion-label small{display:block;margin-top:3px;color:var(--c-muted);font:7px/1.2 ui-monospace,monospace}.c-companion-dialogue{display:flex;align-items:center;gap:16px;padding:15px 18px;border-right:1px solid var(--c-line)}.c-companion-dialogue .quote{max-width:640px;margin:0;font-family:"Songti SC","STSong",serif;font-size:14px;line-height:1.6}.c-companion-dialogue .quote b{color:var(--c-teal)}.c-companion-dialogue button{margin-left:auto;flex:0 0 auto;padding:8px 10px;border:1px solid var(--c-teal);border-radius:9px;background:transparent;color:var(--c-teal);font-size:9.5px;font-weight:750}.c-companion-input{display:grid;grid-template-columns:1fr auto;gap:7px;align-items:center;padding:14px}.c-companion-input input{min-width:0;padding:8px 9px;border:1px solid var(--c-line);border-radius:9px;background:#fff;font-size:9.5px}.c-companion-input button{width:34px;height:34px;border:0;border-radius:9px;background:var(--c-ink);color:#fff}.c-companion-input small{grid-column:1/-1;color:var(--c-muted);font:7px/1.3 ui-monospace,monospace}
+
+    @media(max-width:1220px){
+      .a-shell{grid-template-columns:72px minmax(510px,1fr) 320px}.a-brand{min-width:auto}.a-brand>div{display:none}.a-nav-label,.a-nav button>span:not(.a-icon):not(.count),.a-nav-foot{display:none}.a-nav button{justify-content:center}.a-nav button .count{position:absolute;margin:0 0 26px 28px}.a-nav{align-items:center}.a-nav button{position:relative;width:46px}.a-grid{grid-template-columns:1fr}.a-stage-route,.a-truth-lanes{grid-template-columns:96px repeat(4,minmax(100px,1fr))}.a-stage-route::after{left:127px}
+      .b-layout{grid-template-columns:minmax(0,1fr) 330px}.b-ledger{grid-template-columns:105px repeat(4,minmax(100px,1fr))}
+      .c-layout{grid-template-columns:96px minmax(520px,1fr) 250px}.c-stage-spine{padding-inline:7px}.c-stage-list button{grid-template-columns:22px 1fr}.c-node.goal{left:2%}.c-node.evidence{right:1%}.c-node.run{right:3%}.c-node.request{right:22%}
+    }
+    @media(max-width:920px){
+      .prototype-bar .quiet{display:none}.scenario-picker button{padding-inline:8px}
+      .a-shell{display:grid;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px auto}.a-top{grid-column:1/-1;padding-inline:14px}.a-fresh{display:none}.a-nav{grid-column:1;grid-row:2}.a-main{grid-column:2}.a-companion{grid-column:2;border-top:1px solid var(--a-line);border-left:0;min-height:480px}.a-stage-board{overflow-x:auto}.a-stage-route,.a-truth-lanes{min-width:690px}.a-return-head{grid-template-columns:1fr}.a-return-head .a-time{display:none}
+      .b-top{grid-template-columns:auto 1fr;padding-inline:18px}.b-command{display:none}.b-layout{display:block}.b-dock{min-height:520px}.b-field{padding-bottom:35px}.b-ledger{overflow:auto}.b-orbit{display:none}
+      .c-layout{grid-template-columns:90px minmax(0,1fr);grid-template-rows:620px auto auto}.c-attention{grid-column:1/-1;grid-row:2;display:grid;grid-template-columns:repeat(3,1fr)}.c-companion{grid-row:3}.c-node.question{width:44%}.c-node.request{right:15%}.c-companion{grid-template-columns:90px 1fr}.c-companion-input{grid-column:1/-1;border-top:1px solid var(--c-line)}
+    }
+    @media(max-width:650px){
+      body{padding-bottom:64px}.prototype-bar{padding:6px 10px;gap:8px}.prototype-bar>strong{font-size:8px}.prototype-bar>.quiet,.prototype-bar>.spacer{display:none}.scenario-picker{margin-left:auto}.scenario-picker button{font-size:8px;padding:5px 7px}.prototype-state{display:none}.variant-switcher{bottom:9px;grid-template-columns:38px minmax(150px,210px) 38px;max-width:calc(100vw - 16px)}.variant-switcher div{font-size:9px}
+      .draft-drawer{padding:16px}
+      .a-shell{display:block}.a-top{height:62px}.a-brand{display:none}.a-nav{position:sticky;z-index:20;top:0;display:flex;flex-direction:row;overflow-x:auto;padding:7px 10px;border-right:0;border-bottom:1px solid var(--a-line)}.a-nav button{flex:0 0 42px}.a-main{padding:19px 13px 32px}.a-return-head h1{font-size:30px}.a-priority{grid-template-columns:5px 1fr}.a-priority button{grid-column:2;width:max-content}.a-evidence-row{grid-template-columns:1fr}.a-stage-route,.a-truth-lanes{min-width:640px}.a-companion{min-height:500px}.a-chat{padding-inline:13px}
+      .b-top{padding:13px}.b-top-actions button:not(.hot){display:none}.b-field{padding:22px 13px 28px}.b-field-head h1{font-size:37px}.b-sweep{grid-template-columns:70px minmax(0,1fr)}.b-sweep::before{left:69px}.b-sweep::after{left:58px}.b-events{padding-left:24px}.b-event{grid-template-columns:1fr auto;gap:8px}.b-event .kind{grid-column:1/-1}.b-event::before{left:-29px}.b-time-axis{padding-right:9px}.b-ledger{grid-template-columns:85px repeat(4,105px)}.b-dock{min-height:550px}
+      .c-shell{padding:11px 9px 70px}.c-top{grid-template-columns:1fr auto}.c-breadcrumb{grid-column:1/-1;grid-row:2}.c-tools button:not(.hot){display:none}.c-layout{display:block}.c-stage-spine{margin-bottom:10px}.c-stage-spine>small{display:none}.c-stage-list{flex-direction:row;overflow-x:auto}.c-stage-list::before{display:none}.c-stage-list button{min-width:104px;min-height:58px}
+      .c-map{height:auto;margin-bottom:10px;padding:88px 11px 14px}.c-canvas{position:relative;inset:auto;display:flex;flex-direction:column;gap:9px}.c-orbit,.c-connector{display:none}.c-node{position:relative!important;inset:auto!important;width:auto!important;transform:none!important;box-shadow:none}.c-node:hover{transform:translateY(-2px)!important}.c-node.goal{order:1}.c-node.question{order:2;padding:16px}.c-node.question:hover{transform:translateY(-2px)!important}.c-node.request{order:3}.c-node.evidence{order:4}.c-node.run{order:5}.c-node.writing{order:6}.c-truth-key{position:relative;order:7;left:auto;bottom:auto;flex-wrap:wrap;width:max-content;max-width:100%}
+      .c-attention{display:block}.c-card{margin-bottom:10px}.c-companion{display:block}.c-companion-label{display:flex;gap:10px;align-items:center;text-align:left;border-right:0;border-bottom:1px solid var(--c-line)}.c-companion-label .orb{margin:0}.c-companion-dialogue{display:block;border-right:0;border-bottom:1px solid var(--c-line)}.c-companion-dialogue button{margin-top:10px}
+    }
+    @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+  </style>
+</head>
+<body data-variant="A" data-scenario="return">
+  <div class="prototype-bar">
+    <strong>ISSUE 107 · THROWAWAY UI STUDY</strong>
+    <span class="quiet">SYNTHETIC DATA · MEMORY ONLY · CORE WRITES 0</span>
+    <span class="spacer"></span>
+    <span>判断场景</span>
+    <div class="scenario-picker" role="group" aria-label="代表性场景">
+      <button data-scenario="return" aria-pressed="true">返场复核</button>
+      <button data-scenario="waiting" aria-pressed="false">局部等待</button>
+      <button data-scenario="stale" aria-pressed="false">结果陈旧</button>
+    </div>
+  </div>
+
+  <!-- A — Return chart -->
+  <section class="variant variant-a" aria-label="A 返场航图">
+    <div class="a-shell">
+      <header class="a-top">
+        <div class="a-brand"><span class="a-mark">MR</span><div><b>Meta Research</b><small>return chart</small></div></div>
+        <div class="a-quest-switch"><small>当前 Quest · QST-021</small><b>让小模型在低资源条件下稳定完成结构化科研推理</b></div>
+        <div class="a-fresh"><i></i>Snapshot 09:42 · 2 分钟前</div>
+        <div class="a-avatar" title="唯一研究负责人">M</div>
+      </header>
+      <nav class="a-nav" aria-label="主导航">
+        <div class="a-nav-label">研究</div>
+        <button class="active" data-action="留在总览"><span class="a-icon">⌂</span><span>Quest 总览</span></button>
+        <button data-action="打开问题世界"><span class="a-icon">◇</span><span>问题世界</span></button>
+        <button data-action="打开研究资产"><span class="a-icon">▤</span><span>材料与资产</span></button>
+        <div class="a-nav-label">交付与记录</div>
+        <button data-action="打开 Writing"><span class="a-icon">✎</span><span>Writing</span><span class="prototype-assumption">假设</span></button>
+        <button data-action="打开历史"><span class="a-icon">↺</span><span>历史与证据</span></button>
+        <div class="a-nav-label">需你处理</div>
+        <button data-action="查看待办"><span class="a-icon">!</span><span>人类待办</span><span class="count">1</span></button>
+        <div class="a-nav-foot"><b>仍在自主推进</b><br>1 个局部分支等待你，其他安全工作继续。</div>
+      </nav>
+      <main class="a-main">
+        <div class="a-kicker">Return briefing · 离开 2 天 7 小时</div>
+        <div class="a-return-head">
+          <div>
+            <h1>
+              <span data-only="return">欢迎回来。研究方向没变，但出现了一项需要你补齐的材料。</span>
+              <span data-only="waiting">一个分支正在等你；其余有效工作仍在继续。</span>
+              <span data-only="stale">研究已经前进，上一版阶段报告现在落后于当前证据。</span>
+            </h1>
+            <p>系统正在验证蒸馏后的推理轨迹是否能在 8GB 显存约束下保持稳定。这里先展示变化与依据，Run / Session 原始细节按需下钻。</p>
+          </div>
+          <div class="a-time"><b>02d 07h</b>since last review<br>Graph r184 · Epoch 7</div>
+        </div>
+        <div class="a-priority">
+          <div>
+            <small>
+              <span data-only="return">需要你 · 局部 HumanRequest</span>
+              <span data-only="waiting">等待你 · 只阻塞消融分支</span>
+              <span data-only="stale">建议处理 · Writing 输入已陈旧</span>
+            </small>
+            <b>
+              <span data-only="return">请上传训练轮次 17–23 的原始消融日志</span>
+              <span data-only="waiting">上传日志后，被阻塞分支将自动恢复</span>
+              <span data-only="stale">比较新证据后，再决定是否修订阶段报告 W-v3</span>
+            </b>
+            <p>
+              <span data-only="return">缺失日志只阻塞“长链稳定性”分支；另外两个 Target 正常运行。</span>
+              <span data-only="waiting">Request HR-19 · revision 2 · scope local · 不是 Quest 全局暂停。</span>
+              <span data-only="stale">W-v3 仍是可追溯的历史版本；不会被新 Snapshot 静默改写。</span>
+            </p>
+          </div>
+          <button data-action="处理当前关注项">处理</button>
+        </div>
+        <section class="a-stage-board" aria-label="Stage 与三层事实">
+          <div class="a-board-head"><b>Cycle 07 · 当前推进</b><span>不是单一进度条</span><span class="asof">AE Snapshot · as of 09:42</span></div>
+          <div class="a-stage-route">
+            <div class="axis">Stage route</div>
+            <div class="done"><span class="stage-name">Idea</span><span class="stage-state">候选集已接纳</span><i class="stage-dot"></i></div>
+            <div class="done"><span class="stage-name">Plan</span><span class="stage-state">FormalPlan r12</span><i class="stage-dot"></i></div>
+            <div class="current"><span class="stage-name">Bundle</span><span class="stage-state">3 个 Target 中</span><i class="stage-dot"></i></div>
+            <div><span class="stage-name">Reasoning</span><span class="stage-state">等待必需输入</span><i class="stage-dot"></i></div>
+          </div>
+          <div class="a-truth-lanes">
+            <div class="lane-label">execution completed</div><div class="yes truth"><i></i>yes</div><div class="yes truth"><i></i>yes</div><div class="now truth"><i></i>2 / 3</div><div class="no truth"><i></i>not started</div>
+            <div class="lane-label">domain accepted</div><div class="yes truth"><i></i>IdeaSet</div><div class="yes truth"><i></i>FormalPlan</div><div class="now truth"><i></i>1 / 3 Target</div><div class="no truth"><i></i>—</div>
+            <div class="lane-label">Stage advanced</div><div class="yes truth"><i></i>committed</div><div class="yes truth"><i></i>committed</div><div class="now truth"><i></i>current</div><div class="no truth"><i></i>pending</div>
+          </div>
+        </section>
+        <div class="a-grid">
+          <section class="a-panel">
+            <div class="a-panel-head"><div><h2>当前 Question</h2><p>RG accepted · immutable anchor</p></div><span class="tag">Q-38 · current</span></div>
+            <div class="a-question"><small>未知 · 合格答案形状 · 适用范围</small><h3>压缩推理轨迹后，哪些结构信息是小模型保持长链一致性的必要条件？</h3><p>需要给出可复现实验中的必要性边界，覆盖 1.5B–3B 模型，并明确不适用于需要外部工具调用的任务。</p></div>
+            <div class="a-evidence-row"><button data-action="查看 7 条证据"><span>正式证据</span><b>7 accepted refs</b></button><button data-action="查看 3 个资产"><span>活跃资产</span><b>3 exact versions</b></button><button data-action="查看问题下钻"><span>问题下钻</span><b>Anchor + history</b></button></div>
+          </section>
+          <section class="a-panel">
+            <div class="a-panel-head"><div><h2>后台工作</h2><p>Run 终态不等于领域接纳</p></div></div>
+            <div class="a-run-list">
+              <div class="a-run active"><i></i><div><small>RUN-221 · TARGET T-12</small><b>校验长链稳定性</b></div><span class="run-state">running</span></div>
+              <div class="a-run"><i></i><div><small>RUN-218 · TARGET T-09</small><b>短链基线已执行</b></div><span class="run-state">awaiting receipt</span></div>
+              <div class="a-run"><i></i><div><small>RUN-216 · TARGET T-07</small><b>低秩蒸馏结果已接纳</b></div><span class="run-state">accepted</span></div>
+            </div>
+          </section>
+        </div>
+      </main>
+      <aside class="a-companion" aria-label="Quest Companion">
+        <header class="a-companion-head"><span class="orb"></span><div><b>Quest Companion</b><small>贯穿本 Quest 的高频入口</small></div><span class="online">● ready</span></header>
+        <div class="a-chat">
+          <div class="a-message"><span class="message-tag">返场摘要 · 只读解释</span>你离开后，Plan 没有变化。Bundle 接纳了一个 Target 结果，另外两个仍在推进；其中一个缺少你本地保存的原始日志。</div>
+          <div class="a-message me"><span class="message-tag">普通讨论 · 无权威副作用</span>如果我今天不处理，会影响主结论吗？</div>
+          <div class="a-message"><span class="message-tag">解释 · Snapshot r184</span>不会立即影响。它只阻塞对长链稳定性的直接验证，短链和误差边界分支仍会继续。若到 Reasoning 前仍缺失，结论会明确收窄适用范围。</div>
+          <div class="a-proposal"><small>AGENT PROPOSAL · 仅建议</small><h3>是否把“今天先完成其余分支”记为软约束？</h3><p>软约束只影响后续探索优先级，不会暂停或改变任何权威状态。</p><button data-action="记录软约束草案">查看建议</button></div>
+          <div class="a-proposal"><small>COMMAND DRAFT · 无执行权</small><h3>暂停当前 Quest</h3><p>来自对话识别的可能硬操作；必须打开精确影响预览并由你确认。</p><button data-open-draft>打开操作草案</button> <span class="prototype-assumption">会话生命周期假设</span></div>
+        </div>
+        <div class="a-compose"><div class="a-compose-box"><textarea aria-label="给 Quest Companion 发消息" placeholder="讨论、提建议，或发起显式操作……"></textarea><button data-action="发送一条普通讨论" aria-label="发送">↑</button></div><small>普通聊天不会被猜成硬命令 · Companion 位置为原型假设</small></div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- B — Night observatory -->
+  <section class="variant variant-b" aria-label="B 夜间观测台">
+    <div class="b-shell">
+      <header class="b-top">
+        <div class="b-wordmark"><span class="glyph"><i></i><i></i><i></i><i></i></span><div><b>MR / OBSERVATORY</b><small>research night desk</small></div></div>
+        <div class="b-command"><span>⌘</span><b>QST-021 · 小模型的结构化科研推理</b><small>搜索、切换或直接提问 /</small></div>
+        <div class="b-top-actions"><button data-action="打开资产">资产</button><button data-action="打开 Writing">Writing △</button><button class="hot" data-action="处理一项待办">1 项待办</button></div>
+      </header>
+      <div class="b-layout">
+        <main class="b-field">
+          <div class="b-field-head">
+            <div><div class="eyebrow">RETURN OBSERVATION · 2 DAYS 07 HOURS</div><h1>系统没有停下。<br><em>这里是它为何走到现在。</em></h1><p>按因果叙事复核变化：先看被接纳的研究事实，再看当前执行与仍需你处理的边界。界面刻意不把所有事件压成绿色“成功”。</p></div>
+            <div class="b-orbit"><div><b>07</b>CYCLE<br>BUNDLE</div></div>
+          </div>
+          <section class="b-sweep" aria-label="离开后的关键事件">
+            <div class="b-time-axis"><div><b>09:42</b>现在</div><div><b>昨天</b>18:10</div><div><b>昨天</b>03:20</div><div><b>前天</b>02:35</div><div><b>离开</b>02:10</div></div>
+            <div class="b-events">
+              <article class="b-event important"><span class="kind"><span data-only="return">HumanRequest · local</span><span data-only="waiting">Waiting · local</span><span data-only="stale">Writing · stale</span></span><div><b><span data-only="return">需要轮次 17–23 的原始消融日志</span><span data-only="waiting">日志分支保持真实等待，其他 Target 继续</span><span data-only="stale">阶段报告 W-v3 的输入已落后于 Graph r184</span></b><p><span data-only="return">不是 Quest 全局暂停；也不是 Runtime failure。处理后由发起 Owner 验收，再独立判断工作是否恢复。</span><span data-only="waiting">直接依赖保持等待；安全且有意义的独立工作仍然可运行。</span><span data-only="stale">既有版本仍可追溯；新证据不会静默改写已接纳交付物。</span></p></div><span class="proof"><span data-only="return">HR-19 / r2</span><span data-only="waiting">scope local</span><span data-only="stale">W-v3 / r172</span></span></article>
+              <article class="b-event"><span class="kind">Domain accepted</span><div><b>低秩蒸馏 Target T-07 被正式接纳</b><p>负结果仍是 realized：蒸馏比率超过 42% 后，跨段一致性显著下降。</p></div><span class="proof">RG receipt</span></article>
+              <article class="b-event"><span class="kind">Execution complete</span><div><b>短链基线 Run 已执行完成</b><p>Runtime 已签执行终态，内容接纳仍在等待；Stage 没有因此推进。</p></div><span class="proof">AR RUN-218</span></article>
+              <article class="b-event"><span class="kind">Plan committed</span><div><b>FormalPlan r12 成为本轮冻结承诺</b><p>7 条历史证据复用，3 个 gap 转为 ExperimentBrief。</p></div><span class="proof">AE commit</span></article>
+              <article class="b-event"><span class="kind">Soft constraint</span><div><b>优先验证 8GB 显存可复现性</b><p>这是可撤回的研究偏好，不是硬命令或验收标准。</p></div><span class="proof">HC active</span></article>
+            </div>
+          </section>
+          <section class="b-ledger" aria-label="Stage 三层事实台账">
+            <div class="head">truth ledger</div><div class="head">Idea</div><div class="head">Plan</div><div class="head">Bundle</div><div class="head">Reasoning</div>
+            <div class="row">execution</div><div class="done"><span class="mark"></span>complete</div><div class="done"><span class="mark"></span>complete</div><div class="current"><span class="mark"></span>2 / 3</div><div class="pending">not started</div>
+            <div class="row">domain accepted</div><div class="done">IdeaSet</div><div class="done">FormalPlan</div><div class="current">1 / 3 Target</div><div class="pending">—</div>
+            <div class="row">Stage advanced</div><div class="done">committed</div><div class="done">committed</div><div class="current">current</div><div class="pending">pending</div>
+          </section>
+        </main>
+        <aside class="b-dock" aria-label="注意事项与 Quest Companion">
+          <header class="b-dock-head"><div class="eyebrow"><i></i>QUEST COMPANION · CONTINUOUS</div><h2>从变化中继续对话</h2><p>主入口贴着事件叙事，而不是另开一个脱离上下文的聊天页。</p></header>
+          <section class="b-attention"><small>需要你 · 1 项</small><h3>消融日志缺失</h3><p>目的：完成长链稳定性验证。阻塞范围：T-12；其他安全工作继续。</p><button data-action="查看 HumanRequest HR-19">查看请求</button></section>
+          <div class="b-chat">
+            <div class="line"><div class="who">Companion · 只读解释</div><p>最重要的变化不是 Run 完成，而是 T-07 的负结果被正式接纳。它收窄了“可安全压缩”的边界。</p></div>
+            <div class="line me"><div class="who">你 · 普通讨论</div><p>这会不会推翻当前 Question？</p></div>
+            <div class="line"><div class="who">Companion · Graph r184</div><p>不会。Question 的未知没有变化；新结果让 answer 的适用范围更精确。</p><div class="proposal"><b>Agent Proposal · 建议复核证据边界</b><small>接受建议最多生成 Command Draft，不直接改变研究。</small><button data-open-draft>展开草案</button></div></div>
+          </div>
+          <div class="b-compose"><input aria-label="给 Quest Companion 发消息" placeholder="问为什么，或提出一个软约束……"><button data-action="发送普通讨论">发送</button><span class="b-assumption">△ PROTOTYPE ASSUMPTION · exact session lifecycle remains open</span></div>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <!-- C — Question constellation -->
+  <section class="variant variant-c" aria-label="C 问题星图">
+    <div class="c-shell">
+      <header class="c-top">
+        <div class="c-brand"><span class="c-logo">MR</span><div><b>Meta Research</b><small>question constellation</small></div></div>
+        <div class="c-breadcrumb">Quest / <b>低资源结构化科研推理</b> / Cycle 07 / Bundle</div>
+        <div class="c-tools"><button data-action="打开历史">历史</button><button data-action="打开只读资产">资产</button><button class="hot" data-action="聚焦当前 Question">回到当前</button></div>
+      </header>
+      <div class="c-layout">
+        <aside class="c-stage-spine" aria-label="Stage 轨道">
+          <small>Cycle 07</small>
+          <div class="c-stage-list">
+            <button class="done" data-action="查看 Idea"><span class="num">1</span><span><b>Idea</b><small>committed</small></span></button>
+            <button class="done" data-action="查看 Plan"><span class="num">2</span><span><b>Plan</b><small>committed</small></span></button>
+            <button class="active" data-action="查看 Bundle"><span class="num">3</span><span><b>Bundle</b><small>current</small></span></button>
+            <button data-action="查看 Reasoning"><span class="num">4</span><span><b>Reasoning</b><small>required</small></span></button>
+          </div>
+        </aside>
+        <main class="c-map" aria-label="Quest 关系画布">
+          <header class="c-map-head"><div><div class="eyebrow">CURRENT RESEARCH WORLD</div><h1>把当前 Question 放在关系中心</h1></div><div class="asof"><b>Graph r184</b>as of 09:42<br>Projection may lag</div></header>
+          <div class="c-canvas">
+            <div class="c-orbit one"></div><div class="c-orbit two"></div><div class="c-orbit three"></div>
+            <span class="c-connector gq"></span><span class="c-connector qe"></span><span class="c-connector qr"></span><span class="c-connector qw"></span><span class="c-connector rq"></span>
+            <button class="c-node goal" data-action="查看 Goal"><small>Quest Goal</small><b>低资源下仍可复现、可解释的科研推理</b><p>Milestone 3 / 5</p></button>
+            <button class="c-node question" data-action="下钻当前 Question"><small>Current Question · Q-38</small><b>压缩推理轨迹后，哪些结构信息是保持长链一致性的必要条件？</b><p>RG accepted · immutable anchor · current</p></button>
+            <button class="c-node evidence" data-action="查看正式证据"><small>Evidence</small><b>7 条正式证据</b><p>2 条本轮新增 · 精确 refs</p></button>
+            <button class="c-node run" data-action="查看后台工作"><small>Live work</small><b>2 个 Target 仍在推进</b><p>1 accepted · 1 running</p></button>
+            <button class="c-node writing" data-action="查看 Writing"><small>Writing · △ assumption</small><b>阶段报告 W-v3</b><p><span data-only="return">current at r172</span><span data-only="waiting">paused independently</span><span data-only="stale">input stale at r184</span></p></button>
+            <button class="c-node request" data-action="查看 HumanRequest"><small>Needs you · local</small><b>补充轮次 17–23 日志</b><p>HR-19 · revision 2</p></button>
+            <div class="c-truth-key"><span><i></i>正式研究关系</span><span><i></i>人类交互 / 交付</span><span><i></i>Projection / 建议</span></div>
+          </div>
+        </main>
+        <aside class="c-attention" aria-label="关注与入口">
+          <section class="c-card c-request"><div class="eyebrow">需要你 · local</div><h2>上传消融日志</h2><p>只阻塞长链稳定性分支。响应不等于 Owner 已满足，也不等于工作已经恢复。</p><button data-action="处理 HumanRequest">处理请求</button></section>
+          <section class="c-card"><div class="eyebrow">三层事实 · Bundle</div><div class="c-layer-list"><div class="c-layer"><i></i><div><small>execution</small><b>2 / 3 completed</b></div><span>AR</span></div><div class="c-layer"><i></i><div><small>domain accepted</small><b>1 / 3 Target</b></div><span>RG</span></div><div class="c-layer pending"><i></i><div><small>Stage advanced</small><b>not yet</b></div><span>AE</span></div></div></section>
+          <section class="c-card"><div class="eyebrow">带上下文进入</div><div class="c-entrances"><button data-action="打开只读资产"><b>资产</b><small>3 exact versions</small></button><button data-action="打开 Writing"><b>Writing △</b><small>contract open</small></button><button data-action="打开证据与历史"><b>证据与历史</b><small>带 Q-38 返回上下文</small></button></div></section>
+        </aside>
+        <section class="c-companion" aria-label="Quest Companion">
+          <div class="c-companion-label"><span class="orb"></span><div><b>Companion</b><small>high-frequency entry</small></div></div>
+          <div class="c-companion-dialogue"><p class="quote">“这两天真正改变结论边界的是 <b>T-07 的负结果</b>；缺失日志不会让整个 Quest 停下。”</p><button data-open-draft>从解释到操作草案</button></div>
+          <div class="c-companion-input"><input aria-label="给 Quest Companion 发消息" placeholder="问这个关系为什么存在……"><button data-action="发送普通讨论">↑</button><small>△ Companion exact lifecycle is a prototype assumption</small></div>
+        </section>
+      </div>
+    </div>
+  </section>
+
+  <aside class="draft-drawer" data-open="false" aria-label="显式操作草案" aria-hidden="true">
+    <header class="draft-head"><div><span class="prototype-assumption">Command Draft · no authority</span><h2>暂停当前 Quest</h2><p>表单外壳先出现；影响预览由各 State Owner 分别贡献。</p></div><button data-close-draft aria-label="关闭草案">×</button></header>
+    <div class="draft-step"><small>Draft revision</small><b>Intent INT-42 · revision 3</b></div>
+    <div class="draft-step"><small>精确目标</small><b>QST-021 · Foreground Epoch 7</b></div>
+    <div class="draft-step">
+      <small>Impact Preview · sources preserved</small>
+      <div class="impact-row"><span>Advancement</span><b>停止签发新 Stage 工作；在途工作等待安全点</b></div>
+      <div class="impact-row"><span>Runtime</span><b>2 个 Run 将在可安全收口点停下</b></div>
+      <div class="impact-row"><span>Research Graph</span><b>Question 与已接纳结果不会删除</b></div>
+      <div class="impact-row"><span>Writing</span><b>不受影响 · 独立业务目的</b></div>
+    </div>
+    <div class="draft-step"><small>Currentness</small><b>预览绑定 Graph r184 / Epoch 7 · 还有 04:52 有效</b></div>
+    <div class="draft-actions"><button data-close-draft>继续编辑</button><button class="confirm" data-action="模拟确认暂停">确认暂停（mock）</button></div>
+    <p style="margin-top:13px;color:#64748b;font:9px/1.55 ui-monospace,monospace">确认只更新本页内存状态；不会派发 Owner Command，不会写入核心系统或 GitHub。</p>
+  </aside>
+
+  <nav class="variant-switcher" aria-label="视觉方案切换">
+    <button data-cycle="-1" aria-label="上一个方案">←</button>
+    <div><b id="variant-key">A</b> — <span id="variant-name">返场航图</span></div>
+    <button data-cycle="1" aria-label="下一个方案">→</button>
+  </nav>
+  <details class="prototype-state">
+    <summary>FULL RELEVANT PROTOTYPE STATE</summary>
+    <pre id="state-json"></pre>
+  </details>
+
+  <script>
+  (() => {
+    const variants = [
+      {key:"A", name:"返场航图", thesis:"30 秒恢复上下文；Companion 常驻右侧"},
+      {key:"B", name:"夜间观测台", thesis:"按因果时间叙事理解系统为何走到现在"},
+      {key:"C", name:"问题星图", thesis:"用空间关系理解 Goal、Question、证据与工作"}
+    ];
+    const scenarios = ["return","waiting","stale"];
+    const state = {
+      variant:"A",
+      scenario:"return",
+      question:"怎样的核心主界面配色、布局与信息密度最适合唯一研究负责人？",
+      fixture:"return after 2d 7h / Bundle current / one local HumanRequest",
+      draftOpen:false,
+      lastMockAction:null,
+      coreWrites:0,
+      networkWrites:0,
+      persistence:"browser memory only",
+      authorityBoundary:"Snapshot/Projection + HC interaction; UI owns no domain state",
+      openContractAssumptions:["Quest Companion exact lifecycle","Writing exact contract"]
+    };
+
+    function validVariant(raw){
+      const key=(raw||"A").toUpperCase();
+      return variants.some(v=>v.key===key)?key:"A";
+    }
+    function readUrl(){
+      const url=new URL(location.href);
+      state.variant=validVariant(url.searchParams.get("variant"));
+      const scenario=url.searchParams.get("scenario")||state.scenario;
+      state.scenario=scenarios.includes(scenario)?scenario:"return";
+    }
+    function writeUrl(){
+      const url=new URL(location.href);
+      url.searchParams.set("variant",state.variant);
+      if(state.scenario==="return") url.searchParams.delete("scenario");
+      else url.searchParams.set("scenario",state.scenario);
+      history.replaceState({},"",url);
+    }
+    function render(){
+      document.body.dataset.variant=state.variant;
+      document.body.dataset.scenario=state.scenario;
+      const variant=variants.find(v=>v.key===state.variant);
+      document.getElementById("variant-key").textContent=variant.key;
+      document.getElementById("variant-name").textContent=variant.name;
+      document.querySelectorAll("[data-scenario]").forEach(button=>{
+        button.setAttribute("aria-pressed",String(button.dataset.scenario===state.scenario));
+      });
+      const drawer=document.querySelector(".draft-drawer");
+      drawer.dataset.open=String(state.draftOpen);
+      drawer.setAttribute("aria-hidden",String(!state.draftOpen));
+      document.getElementById("state-json").textContent=JSON.stringify({...state,variantThesis:variant.thesis},null,2);
+    }
+    function setVariant(key){state.variant=validVariant(key);writeUrl();render()}
+    function cycle(direction){
+      const index=variants.findIndex(v=>v.key===state.variant);
+      setVariant(variants[(index+direction+variants.length)%variants.length].key);
+    }
+    function toast(message){
+      document.querySelectorAll(".toast").forEach(node=>node.remove());
+      const node=document.createElement("div");node.className="toast";node.setAttribute("role","status");node.textContent=message;
+      document.body.appendChild(node);setTimeout(()=>node.remove(),2600);
+    }
+    document.querySelectorAll("[data-cycle]").forEach(button=>button.addEventListener("click",()=>cycle(Number(button.dataset.cycle))));
+    document.querySelectorAll("[data-scenario]").forEach(button=>button.addEventListener("click",()=>{
+      state.scenario=button.dataset.scenario;writeUrl();render();
+    }));
+    document.querySelectorAll("[data-action]").forEach(button=>button.addEventListener("click",()=>{
+      state.lastMockAction=button.dataset.action;render();
+      toast(`${button.dataset.action}（mock）：只更新原型内存，没有领域写入。`);
+    }));
+    document.querySelectorAll("[data-open-draft]").forEach(button=>button.addEventListener("click",()=>{state.draftOpen=true;render();document.querySelector("[data-close-draft]").focus()}));
+    document.querySelectorAll("[data-close-draft]").forEach(button=>button.addEventListener("click",()=>{state.draftOpen=false;render()}));
+    addEventListener("keydown",event=>{
+      const target=event.target;
+      const editing=target&&(target.matches?.("input,textarea,select")||target.isContentEditable);
+      if(event.key==="Escape"&&state.draftOpen){state.draftOpen=false;render();return}
+      if(editing||state.draftOpen)return;
+      if(event.key==="ArrowLeft"){event.preventDefault();cycle(-1)}
+      if(event.key==="ArrowRight"){event.preventDefault();cycle(1)}
+    });
+    addEventListener("popstate",()=>{readUrl();render()});
+    readUrl();render();
+  })();
+  </script>
+</body>
+</html>
