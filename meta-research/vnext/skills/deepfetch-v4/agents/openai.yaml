@@ -1,0 +1,4 @@
+interface:
+  display_name: "DeepFetch v4"
+  short_description: "多维文献检索、全文获取、并行阅读、可信度评估与可追溯研究综述"
+  default_prompt: "Use $deepfetch-v4 to build a full-text-grounded literature map for this research prompt."
