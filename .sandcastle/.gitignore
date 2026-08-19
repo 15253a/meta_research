@@ -4,6 +4,7 @@ receipts/
 worktrees/
 inbox/
 .image-codex/
+codex-home/
 queue/*
 !queue/.gitkeep
 status.json*

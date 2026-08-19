@@ -12,7 +12,6 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
   readdirSync,
   readlinkSync,
   readSync,
@@ -22,6 +21,12 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import {
+  codexSandboxAuth,
+  requireDedicatedCodexHome,
+  requireDockerChatGptLogin,
+  requireSafeSandcastleEnvironment,
+} from "./codex-auth.mts";
 import {
   issueSemanticFingerprint,
   PROTECTED_CANDIDATE_PATHS,
@@ -41,6 +46,13 @@ const CONTROLLER_PATHS = [
   ".sandcastle/auto.mts",
   ".sandcastle/queue-core.mts",
   ".sandcastle/queue-core.test.mts",
+  ".sandcastle/codex-auth.mts",
+  ".sandcastle/codex-auth.test.mts",
+  ".sandcastle/codex-policy/config.toml",
+  ".sandcastle/login-codex.sh",
+  ".sandcastle/.gitignore",
+  ".sandcastle/.dockerignore",
+  ".sandcastle/.env.example",
   ".sandcastle/implement-ticket.md",
   ".sandcastle/verify-ticket.sh",
   ".agents/skills/implement-ticket/SKILL.md",
@@ -232,30 +244,6 @@ const writeLiveStatus = (
   renameSync(temporaryPath, liveStatusPath);
 };
 
-const resolveCodexApiKey = (): string => {
-  if (process.env.CODEX_API_KEY?.trim()) {
-    return process.env.CODEX_API_KEY.trim();
-  }
-  try {
-    const envFile = readFileSync(join(repoRoot, ".sandcastle", ".env"), "utf8");
-    const match = envFile.match(/^CODEX_API_KEY=(.*)$/m);
-    let value = match?.[1]?.trim() ?? "";
-    if (
-      value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'")))
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (value) return value;
-  } catch {
-    // Fall through to the actionable error below.
-  }
-  throw new Error(
-    "Configure CODEX_API_KEY in .sandcastle/.env or the host environment before a real run.",
-  );
-};
-
 const { values } = parseArgs({
   options: {
     issue: { type: "string", short: "i" },
@@ -377,7 +365,10 @@ if (additionalLinkedWorktrees.length > 0) {
     `Refusing a single-ticket run while other linked worktrees exist: ${additionalLinkedWorktrees.join(", ")}. Resolve or remove preserved attempts first.`,
   );
 }
-const codexApiKey = resolveCodexApiKey();
+requireSafeSandcastleEnvironment(repoRoot);
+const codexHome = requireDedicatedCodexHome(repoRoot);
+requireDockerChatGptLogin(repoRoot, imageName, codexHome);
+const sandboxAuth = codexSandboxAuth(codexHome);
 
 const selectedModel = requireValue(
   values.model ?? process.env.SANDCASTLE_CODEX_MODEL ?? DEFAULT_MODEL,
@@ -485,7 +476,7 @@ try {
     sandbox: docker({
       imageName,
       cpus: 4,
-      env: { CODEX_API_KEY: codexApiKey },
+      ...sandboxAuth,
     }),
   });
   implementation = await sandbox.run({
@@ -533,7 +524,7 @@ try {
     });
     console.log(JSON.stringify({ phase: "VERIFY", issueNumber, verifyCommand }));
     verification = await sandbox.exec(
-      `timeout --signal=TERM --kill-after=30s ${VERIFICATION_WALL_CLOCK_SECONDS}s env -u CODEX_API_KEY -u OPENAI_API_KEY -u GH_TOKEN bash -lc ${shellQuote(verifyCommand)}`,
+      `timeout --signal=TERM --kill-after=30s ${VERIFICATION_WALL_CLOCK_SECONDS}s env -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY -u GH_TOKEN bash -lc ${shellQuote(verifyCommand)}`,
       { onLine: (line) => process.stdout.write(`${line}\n`) },
     );
   }

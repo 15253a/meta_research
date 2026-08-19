@@ -16,6 +16,12 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import {
+  requireDedicatedCodexHome,
+  requireDockerChatGptLogin,
+  requireDockerCodexModelAccess,
+  requireSafeSandcastleEnvironment,
+} from "./codex-auth.mts";
+import {
   IMPLEMENTATION_ISSUE_MAX,
   IMPLEMENTATION_ISSUE_MIN,
   issueSemanticFingerprint,
@@ -42,6 +48,7 @@ const statePath = join(queueDir, "state.json");
 const liveStatusPath = join(repoRoot, ".sandcastle", "status.json");
 const receiptDir = join(repoRoot, ".sandcastle", "receipts");
 let activeState: QueueState | undefined;
+let codexModelPreflightPassedForCurrentTicket = false;
 
 type Receipt = {
   status: "READY_FOR_MERGE" | "NEEDS_HUMAN";
@@ -420,41 +427,29 @@ if (
   );
 }
 
-const ensureExecutionPrerequisites = async (): Promise<void> => {
-  const codexApiKey =
-    process.env.CODEX_API_KEY?.trim() ??
-    controllerEnvironment.CODEX_API_KEY?.trim();
-  if (!codexApiKey) {
-    throw new QueueFailure(
-      "Configure CODEX_API_KEY in .sandcastle/.env before starting autopilot.",
-      false,
-    );
-  }
+const ensureExecutionPrerequisites = (): void => {
+  requireSafeSandcastleEnvironment(repoRoot);
   if (runStatus("docker", ["image", "inspect", imageName]) !== 0) {
     throw new QueueFailure(
       `Docker image ${imageName} is unavailable; run npm run sandcastle:build-image first.`,
       false,
     );
   }
-  let response: Response;
+  let codexHome;
   try {
-    response = await fetch(
-      `https://api.openai.com/v1/models/${encodeURIComponent(model)}`,
-      {
-        headers: { Authorization: `Bearer ${codexApiKey}` },
-        signal: AbortSignal.timeout(15_000),
-      },
-    );
+    codexHome = requireDedicatedCodexHome(repoRoot);
+    requireDockerChatGptLogin(repoRoot, imageName, codexHome);
   } catch (error) {
-    throw new Error(
-      `Codex model preflight could not reach OpenAI: ${error instanceof Error ? error.message : String(error)}`,
+    throw new QueueFailure(
+      error instanceof Error ? error.message : String(error),
+      true,
     );
   }
-  if (!response.ok) {
-    throw new QueueFailure(
-      `CODEX_API_KEY cannot access model ${model} (HTTP ${response.status}).`,
-      false,
-    );
+  if (!codexModelPreflightPassedForCurrentTicket) {
+    // Online auth/model failures may be transient. Let the controller's
+    // bounded retry policy distinguish them from local login-policy failures.
+    requireDockerCodexModelAccess(repoRoot, imageName, model, codexHome);
+    codexModelPreflightPassedForCurrentTicket = true;
   }
 };
 
@@ -1141,6 +1136,14 @@ const reconcileAttemptState = (
   state: QueueState,
   viewer: string,
 ): QueueState => {
+  if (
+    state.stage === "CLAIMING" ||
+    (state.stage === "IMPLEMENTING" && !existsSync(state.receiptPath))
+  ) {
+    // A recovered attempt that still needs an Agent must pass the complete
+    // login/model gate before ensureLease can write a remote ref.
+    ensureExecutionPrerequisites();
+  }
   ensureLease(state);
   requireLeaseOwned(state);
   validateLeaseIdentity(state);
@@ -1201,6 +1204,7 @@ const reconcileAttemptState = (
     );
   }
 
+  ensureExecutionPrerequisites();
   const result = runTicket(issue, currentState);
   return persistState(stateFromReceipt(currentState, result));
 };
@@ -1727,12 +1731,14 @@ const runController = async (): Promise<void> => {
     if (state?.stage === "CLOSING") {
       finalizeClosingState(state);
       acceptedThisRun += 1;
+      codexModelPreflightPassedForCurrentTicket = false;
       state = undefined;
       if (acceptedThisRun >= maxTickets) break;
     }
     if (state?.stage === "MERGING") {
       mergePullRequest(state);
       acceptedThisRun += 1;
+      codexModelPreflightPassedForCurrentTicket = false;
       state = undefined;
       if (acceptedThisRun >= maxTickets) break;
     }
@@ -1761,7 +1767,7 @@ const runController = async (): Promise<void> => {
       break;
     }
 
-    await ensureExecutionPrerequisites();
+    ensureExecutionPrerequisites();
     const currentBaseSha = runHost("git", ["rev-parse", "HEAD"]);
     state = persistState(createAttemptState(candidate, currentBaseSha));
   }

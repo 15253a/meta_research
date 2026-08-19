@@ -14,18 +14,32 @@
 npm ci
 cp .sandcastle/.env.example .sandcastle/.env
 chmod 600 .sandcastle/.env
-# 只需编辑一次：填入受限且可轮换的 CODEX_API_KEY；模型已有默认值
 npm run sandcastle:build-image
+npm run sandcastle:login
 ```
+
+最后一条命令是三阶段登录向导：它准备被 Git/Docker 忽略的专用
+`.sandcastle/codex-home/`，在固定镜像中发起一次 ChatGPT device-code 登录，并
+验证同一镜像能够复用登录。它不会要求粘贴 token，不会复制当前宿主的
+Codex home，也不会创建 API key。登录缓存会在后续票据间复用并由 Codex 自动
+刷新；若账号撤销或需要切换，运行 `npm run sandcastle:login -- --force`
+显式退出专用缓存并重新登录。device-code 登录方法及缓存
+行为见 [OpenAI 官方认证文档](https://learn.chatgpt.com/docs/auth)。
 
 镜像固定为 Linux x86_64。构建命令先在宿主侧把 Codex CLI 0.148.0 准备到
 被忽略的 `.sandcastle/.image-codex/`，再构建 Docker 镜像；注册表凭据和
 代理配置不会因此进入镜像。基础镜像同时固定 tag 与平台 digest。
 
-GitHub 与 SSH 凭据只在宿主 controller；Agent 容器只得到 `CODEX_API_KEY`，
-没有 `gh`、SSH key、Docker socket 或宿主 Codex home。Sandcastle 0.12.0 会
-让该 key 在 sandbox 整个生命周期内可见，因此本环境只运行可信仓库代码。
-镜像用户与构建者 UID/GID 对齐；专用非特权宿主用户仍是长期运行的推荐方式。
+GitHub 与 SSH 凭据只在宿主 controller；Agent 容器只挂载该专用 Codex 登录
+目录以及只读的 ChatGPT-only 配置，没有 `gh`、SSH key、Docker socket、API
+key 或宿主 Codex home。登录缓存对 sandbox 整个生命周期可见，因此本环境只
+运行可信仓库、可信 ticket 和受控依赖；合并后的隔离复验不挂载它。当前若由
+root 宿主进程构建并运行，镜像用户也会是 `0:0`；长期运行仍推荐使用拥有仓库
+与专用登录目录的非特权宿主用户重新构建镜像。
+
+Codex 还可能把该 runner 的 session/临时元数据写进专用目录；这些数据与当前
+宿主 Codex 的配置、skills、历史和其他任务完全分离。目录保持 concurrency 1
+独占读写，不可提交、打包或供另一台 controller 并发挂载。
 
 ### 启动自动队列
 
@@ -34,8 +48,9 @@ npm run sandcastle:auto -- --dry-run
 npm run sandcastle:auto
 ```
 
-第二条命令会持续运行。任何 GitHub 写入前，它先检查 API key、所选模型与
-本地镜像；固定验证通过后直接创建并同步合并 PR，再自动复验、关票并重新查询
+第二条命令会持续运行。任何 GitHub 写入前，它先检查专用 ChatGPT 登录能否被
+固定镜像读取，并在不挂载仓库的临时容器中用 `--ephemeral` 验证所选模型与当前
+方案额度。固定验证通过后直接创建并同步合并 PR，再自动复验、关票并重新查询
 frontier。宿主/API 的短暂失败会自动退避重试；本地 checkpoint 与每票唯一的
 远端 lease 防止重启或另一台同账号机器重复执行。在发布/合并阶段按 `Ctrl+C`
 停止后，运行同一命令会与远端 PR 对账恢复。若在 Agent 执行中中断，已有
@@ -49,6 +64,9 @@ worktree，保留旧 branch 的 commits，并为同一票创建全新 attempt；
 证据，它会要求先提交或另行归档。没有对应状态时，这两个参数都会拒绝运行。
 Agent 单票默认最长 8 小时，可在 `.sandcastle/.env` 中调整为
 1–24 小时；连续基础设施错误重试 8 次后会停在可恢复状态，不会永久空转。
+`.sandcastle/.env` 只允许示例文件中的四个非敏感 controller 配置；不要在其中
+放置任何 token、key 或其他环境变量（空值也不允许，因为 Sandcastle 会回退到
+宿主同名变量）。
 
 实时查看：
 
