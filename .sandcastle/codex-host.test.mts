@@ -73,11 +73,11 @@ test("loads implement and both direct workflow dependencies", () => {
 
 test("bounds the stock host Codex process with GNU timeout", () => {
   const provider = hostCodexAgent(
-    "gpt-5.4",
+    "gpt-5.6-sol",
     3600,
     ["/tmp/sandcastle slot.lock", "/tmp/sandcastle attempt.lock"],
     {
-      effort: "high",
+      effort: "max",
       captureSessions: false,
     },
   );
@@ -91,6 +91,8 @@ test("bounds the stock host Codex process with GNU timeout", () => {
   );
   assert.match(command.command, /codex exec --ephemeral --json/);
   assert.match(command.command, /--dangerously-bypass-approvals-and-sandbox/);
+  assert.match(command.command, /-m 'gpt-5\.6-sol'/);
+  assert.match(command.command, /model_reasoning_effort="max"/);
 });
 
 test("holds a slot and attempt lock in one bounded command", () => {
@@ -277,7 +279,7 @@ test("allows only documented non-secret controller settings", () => {
   writeFileSync(
     join(repoRoot, ".sandcastle", ".env"),
     [
-      "SANDCASTLE_CODEX_MODEL=gpt-5.4",
+      "SANDCASTLE_CODEX_MODEL=gpt-5.6-sol",
       "SANDCASTLE_BASE_REF=develop_main",
       "SANDCASTLE_POLL_SECONDS=60",
       "SANDCASTLE_AGENT_WALL_CLOCK_SECONDS=28800",

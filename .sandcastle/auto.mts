@@ -51,7 +51,7 @@ import {
 const REPOSITORY = "15253a/meta_research";
 const PARENT_SPEC_NUMBER = 112;
 const DEFAULT_BASE_REF = "develop_main";
-const DEFAULT_MODEL = "gpt-5.4";
+const DEFAULT_MODEL = "gpt-5.6-sol";
 const DEFAULT_POLL_SECONDS = 60;
 const DEFAULT_MAX_AGENTS = 3;
 const DEFAULT_AGENT_WALL_CLOCK_SECONDS = 8 * 60 * 60;

@@ -42,7 +42,7 @@ const REPOSITORY = "15253a/meta_research";
 const PARENT_SPEC_NUMBER = 112;
 const IMPLEMENTATION_ISSUE_MIN = 113;
 const IMPLEMENTATION_ISSUE_MAX = 132;
-const DEFAULT_MODEL = "gpt-5.4";
+const DEFAULT_MODEL = "gpt-5.6-sol";
 const DEFAULT_VERIFY_COMMAND = "bash .sandcastle/verify-ticket.sh";
 const DEFAULT_AGENT_WALL_CLOCK_SECONDS = 8 * 60 * 60;
 const VERIFICATION_WALL_CLOCK_SECONDS = 30 * 60;
@@ -578,7 +578,7 @@ try {
       selectedModel,
       agentWallClockSeconds,
       agentLockPaths,
-      { effort: "high", captureSessions: false },
+      { effort: "max", captureSessions: false },
     ),
     promptFile: join(repoRoot, ".sandcastle", "implement-ticket.md"),
     promptArgs: {

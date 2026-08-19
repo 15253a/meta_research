@@ -76,6 +76,11 @@ export type MattWorkflow = {
   "code-review": WorkflowSkill;
 };
 
+type HostCodexOptions = Omit<CodexOptions, "effort"> & {
+  /** Sandcastle 0.12's type predates the Codex CLI's GPT-5.6 max effort. */
+  readonly effort?: CodexOptions["effort"] | "max";
+};
+
 export const HOST_AGENT_SLOT_COUNT = 3;
 
 const requireAttemptId = (attemptId: string): string => {
@@ -171,9 +176,10 @@ export const hostCodexAgent = (
   model: string,
   wallClockSeconds: number,
   runtimeLockPaths: string | readonly string[],
-  options: CodexOptions = {},
+  options: HostCodexOptions = {},
 ): AgentProvider => {
-  const provider = codex(model, options);
+  // The 0.12 runtime forwards effort verbatim as model_reasoning_effort.
+  const provider = codex(model, options as CodexOptions);
   return {
     ...provider,
     buildPrintCommand(commandOptions) {
@@ -641,7 +647,7 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(thisFile)) {
   const repoRoot = dirname(dirname(thisFile));
   const command = process.argv[2] ?? "--check";
   const model =
-    process.argv[3] ?? process.env.SANDCASTLE_CODEX_MODEL ?? "gpt-5.4";
+    process.argv[3] ?? process.env.SANDCASTLE_CODEX_MODEL ?? "gpt-5.6-sol";
   requireSafeControllerEnvironment(repoRoot);
   const context = requireHostCodexEnvironment();
   requireHostCodexLogin(repoRoot);
