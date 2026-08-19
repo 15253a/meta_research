@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meta-research-vnext"
+version = "0.1.0"
+description = "Local-first, human-governed research runtime"
+readme = "PRODUCT.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Proprietary" }
+authors = [{ name = "meta-research" }]
+dependencies = [
+  "alembic==1.16.5",
+  "fastapi==0.116.1",
+  "pydantic==2.11.7",
+  "sqlalchemy==2.0.43",
+  "uvicorn==0.35.0",
+]
+
+[project.scripts]
+meta-research = "meta_research.cli:main"
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meta_research"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/PRODUCT.md",
+  "/pyproject.toml",
+  "/uv.lock",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

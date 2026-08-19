@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$PROJECT_ROOT"
+umask 077
+
+VERIFY_ROOT=$(mktemp -d /tmp/meta-research-installed-verify.XXXXXX)
+INSTALL_ROOT="$VERIFY_ROOT/install"
+DATA_ROOT="$VERIFY_ROOT/data"
+DIST_ROOT="$VERIFY_ROOT/dist"
+LOCKED_REQUIREMENTS="$VERIFY_ROOT/locked-requirements.txt"
+START_RESULT="$VERIFY_ROOT/start.json"
+BOOTSTRAP_BODY="$VERIFY_ROOT/bootstrap.json"
+COOKIE_JAR="$VERIFY_ROOT/cookies.txt"
+SNAPSHOT="$VERIFY_ROOT/snapshot.json"
+SHELL_HTML="$VERIFY_ROOT/shell.html"
+CLIENT_BUNDLE="$VERIFY_ROOT/client-bundle.js"
+SSE_RESUME="$VERIFY_ROOT/sse-resume.txt"
+SSE_GAP="$VERIFY_ROOT/sse-gap.txt"
+
+cleanup() {
+  if [[ -x "$INSTALL_ROOT/bin/meta-research" ]]; then
+    "$INSTALL_ROOT/bin/meta-research" stop --data-root "$DATA_ROOT" --json >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "$VERIFY_ROOT"
+}
+trap cleanup EXIT
+
+uv lock --check
+uv export --frozen --no-dev --no-emit-project --format requirements.txt \
+  --output-file "$LOCKED_REQUIREMENTS" >/dev/null
+uv build --wheel --out-dir "$DIST_ROOT" >/dev/null
+uv venv --python 3.12 "$INSTALL_ROOT" >/dev/null
+WHEEL=$(find "$DIST_ROOT" -maxdepth 1 -type f -name '*.whl' -print -quit)
+test -n "$WHEEL"
+uv pip install --python "$INSTALL_ROOT/bin/python" \
+  --requirement "$LOCKED_REQUIREMENTS" >/dev/null
+uv pip install --python "$INSTALL_ROOT/bin/python" --no-deps "$WHEEL" >/dev/null
+uv pip check --python "$INSTALL_ROOT/bin/python"
+
+CLI="$INSTALL_ROOT/bin/meta-research"
+"$CLI" version --json | "$INSTALL_ROOT/bin/python" -c '
+import json, sys
+assert json.load(sys.stdin) == {"product": "meta-research-vnext", "version": "0.1.0"}
+'
+
+"$CLI" start --data-root "$DATA_ROOT" --port 0 --json >"$START_RESULT"
+"$INSTALL_ROOT/bin/python" - "$START_RESULT" "$BOOTSTRAP_BODY" <<'PY'
+import json
+import pathlib
+import sys
+
+started = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert started["status"] == "started"
+assert started["base_url"].startswith("http://127.0.0.1:")
+assert started["bootstrap_token"] not in started["base_url"]
+assert started["bootstrap_token"] not in started["web_url"]
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps({"token": started["bootstrap_token"]}, separators=(",", ":")),
+    encoding="utf-8",
+)
+PY
+
+BASE_URL=$("$INSTALL_ROOT/bin/python" -c '
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["base_url"])
+' "$START_RESULT")
+
+UNAUTHENTICATED_STATUS=$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' "$BASE_URL/api/v1/snapshot")
+test "$UNAUTHENTICATED_STATUS" = "401"
+
+curl --noproxy '*' --silent --show-error \
+  --cookie-jar "$COOKIE_JAR" \
+  --header "Origin: $BASE_URL" \
+  --header 'Content-Type: application/json' \
+  --data-binary "@$BOOTSTRAP_BODY" \
+  "$BASE_URL/auth/bootstrap" >/dev/null
+
+curl --noproxy '*' --silent --show-error \
+  --cookie "$COOKIE_JAR" \
+  "$BASE_URL/api/v1/snapshot" >"$SNAPSHOT"
+curl --noproxy '*' --silent --show-error \
+  --cookie "$COOKIE_JAR" \
+  "$BASE_URL/" >"$SHELL_HTML"
+
+CLIENT_ASSET=$("$INSTALL_ROOT/bin/python" -c '
+import pathlib, re, sys
+shell = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"<script[^>]+src=\"([^\"]+)\"", shell)
+assert match is not None
+print(match.group(1))
+' "$SHELL_HTML")
+curl --noproxy '*' --silent --show-error \
+  --cookie "$COOKIE_JAR" \
+  "$BASE_URL$CLIENT_ASSET" >"$CLIENT_BUNDLE"
+
+"$INSTALL_ROOT/bin/python" - "$SNAPSHOT" "$SHELL_HTML" "$CLIENT_BUNDLE" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert snapshot["product"] == {"name": "meta-research-vnext", "version": "0.1.0"}
+assert snapshot["readiness"]["status"] == "ready"
+assert snapshot["research_space"] == {
+    "status": "empty",
+    "quest_count": 0,
+    "question_count": 0,
+    "foreground_cycle_count": 0,
+}
+assert set(snapshot["owners"]) == {
+    "research_graph",
+    "advancement_engine",
+    "research_memory",
+    "agent_runtime",
+    "human_collaboration",
+}
+assert all(owner["status"] == "ready" for owner in snapshot["owners"].values())
+assert all(item["status"] == "capability_unavailable" for item in snapshot["unavailable"])
+
+shell = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+assert "Meta-research" in shell
+assert re.search(r"<script[^>]+src=", shell)
+assert "localStorage" not in shell
+
+client = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+assert "/api/v1/snapshot" in client
+assert "research_space" in client
+assert "readiness" in client
+assert "localStorage" not in client
+PY
+
+set +e
+curl --noproxy '*' --silent --no-buffer --max-time 2 \
+  --cookie "$COOKIE_JAR" \
+  --header 'Last-Event-ID: 0' \
+  "$BASE_URL/api/v1/events" >"$SSE_RESUME"
+SSE_STATUS=$?
+set -e
+test "$SSE_STATUS" = "0" || test "$SSE_STATUS" = "28"
+grep -F 'event: system.ready' "$SSE_RESUME" >/dev/null
+
+curl --noproxy '*' --silent --show-error --no-buffer \
+  --cookie "$COOKIE_JAR" \
+  --header 'Last-Event-ID: 999999' \
+  "$BASE_URL/api/v1/events" >"$SSE_GAP"
+grep -F 'event: snapshot.required' "$SSE_GAP" >/dev/null
+grep -F '"snapshot_url":"/api/v1/snapshot"' "$SSE_GAP" >/dev/null
+
+"$CLI" status --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '
+import json, sys
+assert json.load(sys.stdin)["status"] == "running"
+'
+"$CLI" stop --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '
+import json, sys
+assert json.load(sys.stdin)["status"] == "stopped"
+'
+
+"$INSTALL_ROOT/bin/python" - "$START_RESULT" "$DATA_ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+token = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["bootstrap_token"].encode()
+for path in pathlib.Path(sys.argv[2]).rglob("*"):
+    if path.is_file():
+        assert token not in path.read_bytes(), f"bootstrap token leaked into {path}"
+PY
+
+echo "installed public verification passed"
