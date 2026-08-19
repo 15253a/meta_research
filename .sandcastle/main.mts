@@ -1,9 +1,8 @@
 import {
   createSandbox,
-  codex,
   type AgentStreamEvent,
 } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -18,15 +17,19 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import {
-  codexSandboxAuth,
-  requireDedicatedCodexHome,
-  requireDockerChatGptLogin,
-  requireSafeSandcastleEnvironment,
-} from "./codex-auth.mts";
+  boundedHostCommand,
+  hostCodexAgent,
+  hostAgentRuntimeLockPath,
+  readMattWorkflowSkills,
+  requireHostAgentIdle,
+  requireHostCodexEnvironment,
+  requireHostCodexLogin,
+  requireSafeControllerEnvironment,
+} from "./codex-host.mts";
 import {
   issueSemanticFingerprint,
   PROTECTED_CANDIDATE_PATHS,
@@ -36,7 +39,6 @@ const REPOSITORY = "15253a/meta_research";
 const PARENT_SPEC_NUMBER = 112;
 const IMPLEMENTATION_ISSUE_MIN = 113;
 const IMPLEMENTATION_ISSUE_MAX = 132;
-const DEFAULT_IMAGE = "meta-research-sandcastle:0.12.0";
 const DEFAULT_MODEL = "gpt-5.4";
 const DEFAULT_VERIFY_COMMAND = "bash .sandcastle/verify-ticket.sh";
 const DEFAULT_AGENT_WALL_CLOCK_SECONDS = 8 * 60 * 60;
@@ -46,12 +48,9 @@ const CONTROLLER_PATHS = [
   ".sandcastle/auto.mts",
   ".sandcastle/queue-core.mts",
   ".sandcastle/queue-core.test.mts",
-  ".sandcastle/codex-auth.mts",
-  ".sandcastle/codex-auth.test.mts",
-  ".sandcastle/codex-policy/config.toml",
-  ".sandcastle/login-codex.sh",
+  ".sandcastle/codex-host.mts",
+  ".sandcastle/codex-host.test.mts",
   ".sandcastle/.gitignore",
-  ".sandcastle/.dockerignore",
   ".sandcastle/.env.example",
   ".sandcastle/implement-ticket.md",
   ".sandcastle/verify-ticket.sh",
@@ -253,7 +252,6 @@ const { values } = parseArgs({
     "attempt-id": { type: "string" },
     "agent-wall-clock-seconds": { type: "string" },
     "base-ref": { type: "string" },
-    image: { type: "string" },
   },
   strict: true,
 });
@@ -284,13 +282,16 @@ if (
 }
 const baseRef =
   values["base-ref"] ?? process.env.SANDCASTLE_BASE_REF ?? "develop_main";
-const imageName = values.image ?? process.env.SANDCASTLE_IMAGE ?? DEFAULT_IMAGE;
 const viewer = runHost("gh", ["api", "user", "--jq", ".login"]);
 const issue = fetchIssue(issueNumber);
 const parentSpec = fetchIssue(PARENT_SPEC_NUMBER);
 const baseSha = resolveCommit(baseRef);
+const managedWorktreeRoot = resolve(repoRoot, ".sandcastle", "worktrees");
 const additionalLinkedWorktrees = readLinkedWorktrees().filter(
-  (path) => path !== resolve(repoRoot),
+  (path) =>
+    path !== resolve(repoRoot) &&
+    (path === managedWorktreeRoot ||
+      path.startsWith(`${managedWorktreeRoot}${sep}`)),
 );
 const controllerMismatches = CONTROLLER_PATHS.filter((path) => {
   try {
@@ -362,13 +363,14 @@ if (controllerMismatches.length > 0) {
 }
 if (additionalLinkedWorktrees.length > 0) {
   throw new Error(
-    `Refusing a single-ticket run while other linked worktrees exist: ${additionalLinkedWorktrees.join(", ")}. Resolve or remove preserved attempts first.`,
+    `Refusing a single-ticket run while preserved Sandcastle worktrees exist: ${additionalLinkedWorktrees.join(", ")}. Resolve or remove preserved attempts first.`,
   );
 }
-requireSafeSandcastleEnvironment(repoRoot);
-const codexHome = requireDedicatedCodexHome(repoRoot);
-requireDockerChatGptLogin(repoRoot, imageName, codexHome);
-const sandboxAuth = codexSandboxAuth(codexHome);
+requireSafeControllerEnvironment(repoRoot);
+const hostCodex = requireHostCodexEnvironment();
+requireHostCodexLogin(repoRoot);
+requireHostAgentIdle(repoRoot);
+const mattWorkflow = readMattWorkflowSkills(hostCodex);
 
 const selectedModel = requireValue(
   values.model ?? process.env.SANDCASTLE_CODEX_MODEL ?? DEFAULT_MODEL,
@@ -440,6 +442,11 @@ const gitMetadataBefore = {
   control: fingerprintPath(gitCommonDir, isExpectedGitRuntimePath),
   objectAlternates: gitObjectAlternatePaths.map((path) => fingerprintPath(path)),
 };
+const controllerWorktreeStatusBefore = runHost("git", [
+  "status",
+  "--porcelain=v1",
+  "--untracked-files=all",
+]);
 
 type SandboxSession = Awaited<ReturnType<typeof createSandbox>>;
 let sandbox: SandboxSession | undefined;
@@ -473,15 +480,16 @@ try {
     cwd: repoRoot,
     branch,
     baseBranch: baseSha,
-    sandbox: docker({
-      imageName,
-      cpus: 4,
-      ...sandboxAuth,
-    }),
+    sandbox: noSandbox({ env: { CODEX_HOME: hostCodex.codexHome } }),
   });
   implementation = await sandbox.run({
     name: `issue-${issueNumber}`,
-    agent: codex(selectedModel, { effort: "high", captureSessions: false }),
+    agent: hostCodexAgent(
+      selectedModel,
+      agentWallClockSeconds,
+      hostAgentRuntimeLockPath(repoRoot),
+      { effort: "high", captureSessions: false },
+    ),
     promptFile: join(repoRoot, ".sandcastle", "implement-ticket.md"),
     promptArgs: {
       ISSUE_NUMBER: String(issueNumber),
@@ -490,15 +498,23 @@ try {
       BASE_SHA: baseSha,
       ATTEMPT_ID: attemptId,
       VERIFY_COMMAND: verifyCommand,
+      MATT_IMPLEMENT_SKILL: mattWorkflow.implement.content,
+      MATT_IMPLEMENT_PATH: mattWorkflow.implement.path,
+      MATT_TDD_SKILL: mattWorkflow.tdd.content,
+      MATT_TDD_PATH: mattWorkflow.tdd.path,
+      MATT_CODE_REVIEW_SKILL: mattWorkflow["code-review"].content,
+      MATT_CODE_REVIEW_PATH: mattWorkflow["code-review"].path,
     },
     maxIterations: 1,
     completionSignal: [
       "<implementation-ready/>",
       "<implementation-blocked/>",
     ],
-    idleTimeoutSeconds: 900,
-    completionTimeoutSeconds: 30,
-    signal: AbortSignal.timeout(agentWallClockSeconds * 1000),
+    // GNU timeout inside hostCodexAgent must end the real process before any
+    // Sandcastle race can return and leave it running against the worktree.
+    idleTimeoutSeconds: agentWallClockSeconds + 60,
+    completionTimeoutSeconds: agentWallClockSeconds + 60,
+    signal: AbortSignal.timeout((agentWallClockSeconds + 90) * 1000),
     logging: {
       type: "file",
       path: logPath,
@@ -524,7 +540,11 @@ try {
     });
     console.log(JSON.stringify({ phase: "VERIFY", issueNumber, verifyCommand }));
     verification = await sandbox.exec(
-      `timeout --signal=TERM --kill-after=30s ${VERIFICATION_WALL_CLOCK_SECONDS}s env -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY -u GH_TOKEN bash -lc ${shellQuote(verifyCommand)}`,
+      boundedHostCommand(
+        `env -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY -u GH_TOKEN bash -lc ${shellQuote(verifyCommand)}`,
+        VERIFICATION_WALL_CLOCK_SECONDS,
+        hostAgentRuntimeLockPath(repoRoot),
+      ),
       { onLine: (line) => process.stdout.write(`${line}\n`) },
     );
   }
@@ -600,6 +620,27 @@ try {
   failure = failure ? `${failure}; ${metadataFailure}` : metadataFailure;
 }
 
+let controllerWorktreeUnchanged = false;
+try {
+  controllerWorktreeUnchanged =
+    runHost("git", [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+    ]) === controllerWorktreeStatusBefore;
+  if (!controllerWorktreeUnchanged) {
+    failure = failure
+      ? `${failure}; controller worktree changed during host Agent execution`
+      : "controller worktree changed during host Agent execution";
+  }
+} catch (error) {
+  const controllerAuditFailure =
+    `controller worktree audit failed: ${error instanceof Error ? error.message : String(error)}`;
+  failure = failure
+    ? `${failure}; ${controllerAuditFailure}`
+    : controllerAuditFailure;
+}
+
 let currentness = {
   issueUnchanged: false,
   parentSpecUnchanged: false,
@@ -638,6 +679,7 @@ const ready =
   gitMetadataAudit.unexpectedRefChanges.length === 0 &&
   gitMetadataAudit.expectedBranchCreated &&
   gitMetadataAudit.branchTipMatchesRun &&
+  controllerWorktreeUnchanged &&
   currentness.issueUnchanged &&
   currentness.parentSpecUnchanged &&
   currentness.baseUnchanged;
@@ -653,9 +695,14 @@ const receipt = {
   issueFingerprint: issueSemanticFingerprint(issue),
   parentSpecFingerprint: issueSemanticFingerprint(parentSpec),
   model: selectedModel,
-  imageName,
+  execution: {
+    provider: "host-no-docker",
+    codexVersion: hostCodex.codexVersion,
+    codexHome: hostCodex.codexHome,
+    worktreeRoot: join(repoRoot, ".sandcastle", "worktrees"),
+    runtimeLock: hostAgentRuntimeLockPath(repoRoot),
+  },
   limits: {
-    cpus: 4,
     maxAgentRuns: 1,
     maxIterationsPerRun: 1,
     agentWallClockSeconds,
@@ -671,6 +718,9 @@ const receipt = {
     cleanWorktree: worktreeAudit,
   },
   gitMetadataAudit,
+  controllerWorktreeAudit: {
+    unchanged: controllerWorktreeUnchanged,
+  },
   currentness,
   failure,
   logPath,

@@ -1,5 +1,0 @@
-# This directory is mounted read-only beside the dedicated Codex home. The
-# login wizard creates config.toml in that home as a fixed symlink to this file.
-# Authentication is reusable, but it may never silently fall back to API billing.
-cli_auth_credentials_store = "file"
-forced_login_method = "chatgpt"

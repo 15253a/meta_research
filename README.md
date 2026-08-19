@@ -1,108 +1,106 @@
 # meta_research
-高度人机融合的科研管理平台
+
+高度人机融合的科研管理平台。
 
 ## Sandcastle 自动实现队列
 
-本分支使用 Sandcastle 0.12.0 + Codex 顺序处理 #113–#132。宿主 controller
-读取 GitHub 原生 `blockedBy`，自动选择 frontier、领取当前账号、调用
-`$implement-ticket`、验证、push、创建并合并以 `develop_main` 为 base 的 PR，
-随后复验、关闭对应 ticket，并继续下一张。正常路径不需要逐票人工操作。
+本分支使用 Sandcastle 0.12.0 + 当前宿主 Codex 顺序处理 #113–#132。
+controller 读取 GitHub 原生 `blockedBy`，自动选择 frontier、把票据分配给当前
+GitHub 账号、调用 Matt Pocock `$implement`、验证、push、创建并自动合并以
+`develop_main` 为 base 的 PR，随后复验、关闭票据并继续下一张。
 
 ### 初始化
 
+不需要 Docker、镜像构建或单独登录。直接复用当前 shell 中已经登录的 Codex：
+
 ```bash
+cd /vepfs-mlp2/c20250511/250806010/mxm/paper_agent/meta_research_main
 npm ci
 cp .sandcastle/.env.example .sandcastle/.env
 chmod 600 .sandcastle/.env
-npm run sandcastle:build-image
-npm run sandcastle:login
+npm run sandcastle:preflight
 ```
 
-最后一条命令是三阶段登录向导：它准备被 Git/Docker 忽略的专用
-`.sandcastle/codex-home/`，在固定镜像中发起一次 ChatGPT device-code 登录，并
-验证同一镜像能够复用登录。它不会要求粘贴 token，不会复制当前宿主的
-Codex home，也不会创建 API key。登录缓存会在后续票据间复用并由 Codex 自动
-刷新；若账号撤销或需要切换，运行 `npm run sandcastle:login -- --force`
-显式退出专用缓存并重新登录。device-code 登录方法及缓存
-行为见 [OpenAI 官方认证文档](https://learn.chatgpt.com/docs/auth)。
+`sandcastle:preflight` 会检查本机 `codex`、当前登录、当前 `$CODEX_HOME`，并通过
+Codex app-server 的 `skills/list` 确认 Matt Pocock 稳定包的 25 个 skills 都可见。
+其中包括 `$implement` 的直接依赖 `$tdd`、`$code-review`，以及它们引用的其他
+skills、模板和说明文件。配置、登录、skills、插件等均直接使用当前本机 Codex，
+不会再复制或镜像一份。
 
-镜像固定为 Linux x86_64。构建命令先在宿主侧把 Codex CLI 0.148.0 准备到
-被忽略的 `.sandcastle/.image-codex/`，再构建 Docker 镜像；注册表凭据和
-代理配置不会因此进入镜像。基础镜像同时固定 tag 与平台 digest。
+如需做一次真实但只读的模型工作流验证：
 
-GitHub 与 SSH 凭据只在宿主 controller；Agent 容器只挂载该专用 Codex 登录
-目录以及只读的 ChatGPT-only 配置，没有 `gh`、SSH key、Docker socket、API
-key 或宿主 Codex home。登录缓存对 sandbox 整个生命周期可见，因此本环境只
-运行可信仓库、可信 ticket 和受控依赖；合并后的隔离复验不挂载它。当前若由
-root 宿主进程构建并运行，镜像用户也会是 `0:0`；长期运行仍推荐使用拥有仓库
-与专用登录目录的非特权宿主用户重新构建镜像。
+```bash
+npm run sandcastle:smoke-implement
+```
 
-Codex 还可能把该 runner 的 session/临时元数据写进专用目录；这些数据与当前
-宿主 Codex 的配置、skills、历史和其他任务完全分离。目录保持 concurrency 1
-独占读写，不可提交、打包或供另一台 controller 并发挂载。
+### 启动
 
-### 启动自动队列
+先只读确认下一张票，再启动持续队列：
 
 ```bash
 npm run sandcastle:auto -- --dry-run
 npm run sandcastle:auto
 ```
 
-第二条命令会持续运行。任何 GitHub 写入前，它先检查专用 ChatGPT 登录能否被
-固定镜像读取，并在不挂载仓库的临时容器中用 `--ephemeral` 验证所选模型与当前
-方案额度。固定验证通过后直接创建并同步合并 PR，再自动复验、关票并重新查询
-frontier。宿主/API 的短暂失败会自动退避重试；本地 checkpoint 与每票唯一的
-远端 lease 防止重启或另一台同账号机器重复执行。在发布/合并阶段按 `Ctrl+C`
-停止后，运行同一命令会与远端 PR 对账恢复。若在 Agent 执行中中断，已有
-branch/worktree 会被保留并显示 `NEEDS_HUMAN`，避免静默丢弃工作；实现、
-验证、合并冲突或票据语义变化才会停住当前票，不会跳过它。
+每张票的普通 Git worktree 都位于：
 
-若状态中给出 `resumeStage`，修复所报告的外部条件后运行
-`npm run sandcastle:auto -- --resume`；若实现过程被中断且状态建议重试，运行
-`npm run sandcastle:auto -- --retry`。后者只会移除精确匹配且干净的残留
-worktree，保留旧 branch 的 commits，并为同一票创建全新 attempt；若仍有未提交
-证据，它会要求先提交或另行归档。没有对应状态时，这两个参数都会拒绝运行。
-Agent 单票默认最长 8 小时，可在 `.sandcastle/.env` 中调整为
-1–24 小时；连续基础设施错误重试 8 次后会停在可恢复状态，不会永久空转。
-`.sandcastle/.env` 只允许示例文件中的四个非敏感 controller 配置；不要在其中
-放置任何 token、key 或其他环境变量（空值也不允许，因为 Sandcastle 会回退到
-宿主同名变量）。
+```text
+meta_research_main/.sandcastle/worktrees/
+```
 
-实时查看：
+其他由你管理、位于该目录之外的 Git worktree 可以照常存在；controller 只会因
+上次失败而遗留的 Sandcastle managed worktree 停住并要求恢复。
+
+Sandcastle 使用本机 Codex 直接在该 worktree 中实现。`$implement` 的当前
+`SKILL.md` 以及 `$tdd`、`$code-review` 会被 controller 确定性展开进非交互
+prompt；完整本机 skills 包仍可由 Codex 正常发现和读取。
+
+这是明确的 host/no-Docker 模式：Agent 与 controller 使用同一个宿主账号，能
+访问该账号本来就能访问的本机文件、网络和凭据。适合这里的可信仓库与可信
+ticket，不再提供容器级隔离。Agent 子进程由独立 wall-clock timeout 兜底，避免
+Sandcastle 超时后仍在后台继续修改 worktree；parent-death signal 与独立 runtime
+lock 也会在 controller 异常退出时终止或标记仍存活的 Agent，`--retry` 不会抢先
+删除它正在使用的 worktree。
+
+自动流程如下：
+
+```text
+native frontier → claim → $implement → verify → push/PR
+→ auto merge → exact-commit host verify → close issue → next frontier
+```
+
+合并后的复验从精确 accepted commit 导出到
+`.sandcastle/inbox/post-merge-*`，而不是验证可移动的 `develop_main` HEAD；完成后
+自动清理。候选仍不得修改 `.sandcastle/`、`.agents/`、`.codex/`、`.github/`、
+根 controller package 文件、Git 配置/hooks 或其他 refs。
+
+### 查看与恢复
 
 ```bash
 npm run sandcastle:status
 npm run sandcastle:status -- --watch
 ```
 
-终端同时显示 Agent 文本与工具调用；完整日志和结果分别位于
-`.sandcastle/logs/`、`.sandcastle/receipts/`，当前阶段位于
-`.sandcastle/status.json`。
+完整日志、结果和当前阶段分别位于 `.sandcastle/logs/`、
+`.sandcastle/receipts/`、`.sandcastle/status.json`。
 
-### 自动流程
-
-```text
-native frontier → auto claim → $implement-ticket → verify → push/PR
-→ auto merge → post-merge verify → close issue → next frontier
-```
-
-固定验证入口是 `.sandcastle/verify-ticket.sh`。它要求产品保留锁定的 Python
-发行物、执行测试/构建，并调用仓库公共入口 `scripts/verify`；因此无需每张票
-重新输入 `--verify`。合并后的复验从精确 accepted commit 导出干净副本，在
-没有宿主 HOME、GH/SSH/Codex 凭据或 Docker socket 的一次性容器中运行。根
-`package.json`、lockfile 与 `tsconfig.json` 专属于 controller，产品前端包放在
-独立目录；`.github/` 也不允许候选修改，避免 PR 分支在合并前启动新 workflow。
-默认模型是当前本机已验证的 `gpt-5.4`，可在
-`.sandcastle/.env` 中一次性覆盖。
-
-需要调试某张票时仍可显式运行底层单票入口：
+若状态给出 `resumeStage`，修复外部条件后运行：
 
 ```bash
-npm run sandcastle:ticket -- \
-  --issue 113 \
-  --base-ref develop_main
+npm run sandcastle:auto -- --resume
 ```
 
-自动队列当前保持 concurrency 1；它已经消除了逐票选取、领取、传模型与验证
-命令、push、建 PR、关票和启动下一票的人工操作。后续若启用并发，需要先把
-Git ref/worktree 审计扩展为 batch allow-list，而不能直接套用官方并行模板。
+若实现被中断且状态建议重试：
+
+```bash
+npm run sandcastle:auto -- --retry
+```
+
+后者只清理精确匹配且干净的残留 worktree；未提交证据不会被静默删除。单票
+默认最长 8 小时，可在 `.sandcastle/.env` 调整为 1–24 小时。
+
+调试单张票仍可使用：
+
+```bash
+npm run sandcastle:ticket -- --issue 113 --base-ref develop_main
+```

@@ -12,15 +12,18 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import {
-  requireDedicatedCodexHome,
-  requireDockerChatGptLogin,
-  requireDockerCodexModelAccess,
-  requireSafeSandcastleEnvironment,
-} from "./codex-auth.mts";
+  HOST_RUNTIME_LOCK_CONFLICT_STATUS,
+  boundedHostCommand,
+  hostAgentRuntimeLockPath,
+  requireHostCodexEnvironment,
+  requireHostAgentIdle,
+  requireHostCodexLogin,
+  requireHostCodexModelAccess,
+  requireSafeControllerEnvironment,
+} from "./codex-host.mts";
 import {
   IMPLEMENTATION_ISSUE_MAX,
   IMPLEMENTATION_ISSUE_MIN,
@@ -38,7 +41,6 @@ const REPOSITORY = "15253a/meta_research";
 const PARENT_SPEC_NUMBER = 112;
 const DEFAULT_BASE_REF = "develop_main";
 const DEFAULT_MODEL = "gpt-5.4";
-const DEFAULT_IMAGE = "meta-research-sandcastle:0.12.0";
 const DEFAULT_POLL_SECONDS = 60;
 const DEFAULT_AGENT_WALL_CLOCK_SECONDS = 8 * 60 * 60;
 const MAX_TRANSIENT_FAILURES = 8;
@@ -271,18 +273,24 @@ const releaseLease = (state: QueueState): void => {
 };
 
 const verifyAcceptedCommit = (acceptedSha: string): void => {
-  if (runStatus("docker", ["image", "inspect", imageName]) !== 0) {
+  try {
+    requireHostAgentIdle(repoRoot);
+  } catch (error) {
     throw new QueueFailure(
-      `Docker image ${imageName} is unavailable for post-merge verification.`,
-      false,
+      error instanceof Error ? error.message : String(error),
+      true,
     );
   }
-  const temporaryRoot = mkdtempSync(join(tmpdir(), "sandcastle-verify-"));
+  const verificationRoot = join(repoRoot, ".sandcastle", "inbox");
+  mkdirSync(verificationRoot, { recursive: true, mode: 0o700 });
+  const temporaryRoot = mkdtempSync(
+    join(verificationRoot, `post-merge-${acceptedSha.slice(0, 12)}-`),
+  );
   const archivePath = join(temporaryRoot, "candidate.tar");
   const workspacePath = join(temporaryRoot, "workspace");
-  const containerName =
-    `sandcastle-post-verify-${acceptedSha.slice(0, 12)}-${process.pid}`;
+  const isolatedHome = join(temporaryRoot, "home");
   mkdirSync(workspacePath, { mode: 0o700 });
+  mkdirSync(isolatedHome, { mode: 0o700 });
   try {
     runHost("git", [
       "archive",
@@ -291,39 +299,56 @@ const verifyAcceptedCommit = (acceptedSha: string): void => {
       acceptedSha,
     ]);
     runVisible("tar", ["-xf", archivePath, "-C", workspacePath]);
-    runVisible("timeout", [
-      "--signal=TERM",
-      "--kill-after=30s",
-      "1800s",
-      "docker",
-      "run",
-      "--rm",
-      "--name",
-      containerName,
-      "--cap-drop=ALL",
-      "--security-opt",
-      "no-new-privileges",
-      "--tmpfs",
-      "/tmp:rw,nosuid,nodev,exec,size=4g",
-      "--env",
-      "HOME=/tmp/sandcastle-home",
-      "--volume",
-      `${workspacePath}:/workspace`,
-      "--workdir",
-      "/workspace",
-      "--entrypoint",
-      "/bin/bash",
-      imageName,
-      "-lc",
-      'mkdir -p "$HOME" && bash .sandcastle/verify-ticket.sh',
-    ]);
+    const verificationEnvironment: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: isolatedHome,
+    };
+    for (const key of [
+      "CODEX_HOME",
+      "CODEX_API_KEY",
+      "CODEX_ACCESS_TOKEN",
+      "OPENAI_API_KEY",
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "SSH_AUTH_SOCK",
+    ]) {
+      delete verificationEnvironment[key];
+    }
+    const result = spawnSync(
+      "sh",
+      [
+        "-c",
+        boundedHostCommand(
+          "bash .sandcastle/verify-ticket.sh",
+          1800,
+          hostAgentRuntimeLockPath(repoRoot),
+        ),
+      ],
+      {
+        cwd: workspacePath,
+        env: verificationEnvironment,
+        stdio: "inherit",
+      },
+    );
+    if (result.error) throw result.error;
+    if (result.status === HOST_RUNTIME_LOCK_CONFLICT_STATUS) {
+      throw new QueueFailure(
+        "Another host Agent or verifier is still running; retry post-merge verification after it exits.",
+        true,
+      );
+    }
+    if (result.status !== 0) {
+      throw new Error(
+        `verification exited with status ${result.status ?? "unknown"}`,
+      );
+    }
   } catch (error) {
+    if (error instanceof QueueFailure) throw error;
     throw new QueueFailure(
       `Post-merge verification failed for ${acceptedSha}: ${error instanceof Error ? error.message : String(error)}`,
       false,
     );
   } finally {
-    runStatus("docker", ["rm", "--force", containerName]);
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 };
@@ -385,12 +410,6 @@ const model =
     controllerEnvironment.SANDCASTLE_CODEX_MODEL ??
     DEFAULT_MODEL
   ).trim() || DEFAULT_MODEL;
-const imageName =
-  (
-    process.env.SANDCASTLE_IMAGE ??
-    controllerEnvironment.SANDCASTLE_IMAGE ??
-    DEFAULT_IMAGE
-  ).trim() || DEFAULT_IMAGE;
 const baseRef =
   (
     values["base-ref"] ??
@@ -428,17 +447,11 @@ if (
 }
 
 const ensureExecutionPrerequisites = (): void => {
-  requireSafeSandcastleEnvironment(repoRoot);
-  if (runStatus("docker", ["image", "inspect", imageName]) !== 0) {
-    throw new QueueFailure(
-      `Docker image ${imageName} is unavailable; run npm run sandcastle:build-image first.`,
-      false,
-    );
-  }
-  let codexHome;
+  requireSafeControllerEnvironment(repoRoot);
   try {
-    codexHome = requireDedicatedCodexHome(repoRoot);
-    requireDockerChatGptLogin(repoRoot, imageName, codexHome);
+    requireHostCodexEnvironment();
+    requireHostCodexLogin(repoRoot);
+    requireHostAgentIdle(repoRoot);
   } catch (error) {
     throw new QueueFailure(
       error instanceof Error ? error.message : String(error),
@@ -448,7 +461,7 @@ const ensureExecutionPrerequisites = (): void => {
   if (!codexModelPreflightPassedForCurrentTicket) {
     // Online auth/model failures may be transient. Let the controller's
     // bounded retry policy distinguish them from local login-policy failures.
-    requireDockerCodexModelAccess(repoRoot, imageName, model, codexHome);
+    requireHostCodexModelAccess(repoRoot, model);
     codexModelPreflightPassedForCurrentTicket = true;
   }
 };
@@ -968,8 +981,11 @@ const runTicket = (
   });
   console.log(`[IMPLEMENT] Starting issue #${issue.number}: ${issue.title}`);
   const result = spawnSync(
-    join(repoRoot, "node_modules", ".bin", "tsx"),
+    "setpriv",
     [
+      "--pdeathsig",
+      "TERM",
+      join(repoRoot, "node_modules", ".bin", "tsx"),
       ".sandcastle/main.mts",
       "--issue",
       String(issue.number),
@@ -977,8 +993,6 @@ const runTicket = (
       baseRef,
       "--model",
       model,
-      "--image",
-      imageName,
       "--attempt-id",
       state.attemptId,
       "--agent-wall-clock-seconds",
@@ -1070,6 +1084,14 @@ const retryInterruptedImplementation = (state: QueueState): void => {
   ) {
     throw new QueueFailure(
       "--retry is only supported for an interrupted implementation before PR creation.",
+      false,
+    );
+  }
+  try {
+    requireHostAgentIdle(repoRoot);
+  } catch (error) {
+    throw new QueueFailure(
+      error instanceof Error ? error.message : String(error),
       false,
     );
   }
@@ -1254,7 +1276,7 @@ const publishCandidate = (state: QueueState): QueueState => {
       `- Attempt: \`${state.attemptId}\``,
       `- Base: \`${state.baseRef}@${state.baseSha}\``,
       `- Receipt: \`${relative(repoRoot, state.receiptPath)}\``,
-      "- $implement-ticket and fixed verification: passed",
+      "- Matt $implement (tdd + code-review) and fixed verification: passed",
       "",
       `The controller will merge this PR, close #${state.issueNumber}, and continue automatically.`,
     ].join("\n");
@@ -1649,7 +1671,7 @@ const runController = async (): Promise<void> => {
                 : [`resume-${state.stage.toLowerCase()}`]
               : [
                   "claim-next-frontier",
-                  "implement-with-$implement-ticket",
+                  "implement-with-$implement",
                   "verify",
                   "push",
                   "open-pr",
