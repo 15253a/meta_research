@@ -1,4 +1,8 @@
-import { createSandbox, codex } from "@ai-hero/sandcastle";
+import {
+  createSandbox,
+  codex,
+  type AgentStreamEvent,
+} from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -12,26 +16,41 @@ import {
   readdirSync,
   readlinkSync,
   readSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import {
+  issueSemanticFingerprint,
+  PROTECTED_CANDIDATE_PATHS,
+} from "./queue-core.mts";
 
 const REPOSITORY = "15253a/meta_research";
 const PARENT_SPEC_NUMBER = 112;
 const IMPLEMENTATION_ISSUE_MIN = 113;
 const IMPLEMENTATION_ISSUE_MAX = 132;
 const DEFAULT_IMAGE = "meta-research-sandcastle:0.12.0";
-const AGENT_WALL_CLOCK_SECONDS = 60 * 60;
+const DEFAULT_MODEL = "gpt-5.4";
+const DEFAULT_VERIFY_COMMAND = "bash .sandcastle/verify-ticket.sh";
+const DEFAULT_AGENT_WALL_CLOCK_SECONDS = 8 * 60 * 60;
 const VERIFICATION_WALL_CLOCK_SECONDS = 30 * 60;
 const CONTROLLER_PATHS = [
   ".sandcastle/main.mts",
+  ".sandcastle/auto.mts",
+  ".sandcastle/queue-core.mts",
+  ".sandcastle/queue-core.test.mts",
   ".sandcastle/implement-ticket.md",
+  ".sandcastle/verify-ticket.sh",
   ".agents/skills/implement-ticket/SKILL.md",
   ".agents/skills/implement-ticket/agents/openai.yaml",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
 ] as const;
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const liveStatusPath = join(repoRoot, ".sandcastle", "status.json");
 
 type IssueRef = {
   number: number;
@@ -73,6 +92,21 @@ const fetchIssue = (number: number): GitHubIssue =>
 
 const resolveCommit = (ref: string): string =>
   runHost("git", ["rev-parse", "--verify", `${ref}^{commit}`]);
+
+const resolveRemoteBranch = (ref: string): string | undefined => {
+  const output = runHost("git", [
+    "ls-remote",
+    "--heads",
+    "origin",
+    `refs/heads/${ref}`,
+  ]);
+  if (!output) return undefined;
+  const [sha, remoteRef, ...extra] = output.split(/\s+/);
+  if (!sha || remoteRef !== `refs/heads/${ref}` || extra.length > 0) {
+    throw new Error(`Malformed remote branch response for ${ref}.`);
+  }
+  return sha;
+};
 
 const fingerprintPath = (
   root: string,
@@ -162,6 +196,42 @@ const requireValue = (value: string | undefined, message: string): string => {
 const shellQuote = (value: string): string =>
   `'${value.replaceAll("'", `'\\''`)}'`;
 
+const streamProgress = (details: Record<string, unknown>) => {
+  let lastHeartbeat = 0;
+  return (event: AgentStreamEvent): void => {
+    if (Date.now() - lastHeartbeat >= 15_000) {
+      writeLiveStatus("IMPLEMENTING", {
+        ...details,
+        heartbeatAt: new Date().toISOString(),
+      });
+      lastHeartbeat = Date.now();
+    }
+    if (event.type === "toolCall") {
+      console.log(`[IMPLEMENT] tool: ${event.name} ${event.formattedArgs}`);
+    } else if (event.type === "text" && event.message.trim()) {
+      process.stdout.write(`[IMPLEMENT] ${event.message}`);
+      if (!event.message.endsWith("\n")) process.stdout.write("\n");
+    }
+  };
+};
+
+const writeLiveStatus = (
+  phase: string,
+  details: Record<string, unknown> = {},
+): void => {
+  const temporaryPath = `${liveStatusPath}.tmp`;
+  writeFileSync(
+    temporaryPath,
+    `${JSON.stringify(
+      { phase, repository: REPOSITORY, ...details, updatedAt: new Date().toISOString() },
+      null,
+      2,
+    )}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+  renameSync(temporaryPath, liveStatusPath);
+};
+
 const resolveCodexApiKey = (): string => {
   if (process.env.CODEX_API_KEY?.trim()) {
     return process.env.CODEX_API_KEY.trim();
@@ -186,22 +256,14 @@ const resolveCodexApiKey = (): string => {
   );
 };
 
-const issueFingerprint = (issue: GitHubIssue): string =>
-  JSON.stringify({
-    state: issue.state,
-    updatedAt: issue.updatedAt,
-    assignees: issue.assignees.map(({ login }) => login).sort(),
-    blockedBy: issue.blockedBy.nodes
-      .map(({ number, state }) => ({ number, state }))
-      .sort((left, right) => left.number - right.number),
-  });
-
 const { values } = parseArgs({
   options: {
     issue: { type: "string", short: "i" },
     "dry-run": { type: "boolean" },
     model: { type: "string" },
     verify: { type: "string" },
+    "attempt-id": { type: "string" },
+    "agent-wall-clock-seconds": { type: "string" },
     "base-ref": { type: "string" },
     image: { type: "string" },
   },
@@ -218,6 +280,20 @@ if (!/^\d+$/.test(issueArgument) || !Number.isSafeInteger(issueNumber)) {
 }
 
 const dryRun = values["dry-run"] ?? false;
+const agentWallClockSeconds = Number(
+  values["agent-wall-clock-seconds"] ??
+    process.env.SANDCASTLE_AGENT_WALL_CLOCK_SECONDS ??
+    DEFAULT_AGENT_WALL_CLOCK_SECONDS,
+);
+if (
+  !Number.isInteger(agentWallClockSeconds) ||
+  agentWallClockSeconds < 3600 ||
+  agentWallClockSeconds > 24 * 60 * 60
+) {
+  throw new Error(
+    "--agent-wall-clock-seconds must be an integer from 3600 to 86400.",
+  );
+}
 const baseRef =
   values["base-ref"] ?? process.env.SANDCASTLE_BASE_REF ?? "develop_main";
 const imageName = values.image ?? process.env.SANDCASTLE_IMAGE ?? DEFAULT_IMAGE;
@@ -303,16 +379,26 @@ if (additionalLinkedWorktrees.length > 0) {
 }
 const codexApiKey = resolveCodexApiKey();
 
-const model = requireValue(
-  values.model ?? process.env.SANDCASTLE_CODEX_MODEL,
-  "Pass a validated Codex model with --model <model-id>.",
+const selectedModel = requireValue(
+  values.model ?? process.env.SANDCASTLE_CODEX_MODEL ?? DEFAULT_MODEL,
+  "A Codex model is required.",
 );
 const verifyCommand = requireValue(
-  values.verify ?? process.env.SANDCASTLE_VERIFY_COMMAND,
-  "Pass a fixed verification command with --verify <command>.",
+  values.verify ??
+    process.env.SANDCASTLE_VERIFY_COMMAND ??
+    DEFAULT_VERIFY_COMMAND,
+  "A verification command is required.",
 );
-const timestamp = new Date().toISOString().replaceAll(/[-:.]/g, "");
-const attemptId = `${timestamp}-${randomUUID().slice(0, 8)}`;
+const generatedAttemptId = `${new Date()
+  .toISOString()
+  .replaceAll(/[-:.]/g, "")}-${randomUUID().slice(0, 8)}`;
+const attemptId = requireValue(
+  values["attempt-id"] ?? generatedAttemptId,
+  "An attempt id is required.",
+);
+if (!/^[0-9A-Za-z][0-9A-Za-z-]{7,79}$/.test(attemptId)) {
+  throw new Error("--attempt-id must contain only 8-80 letters, digits, or hyphens.");
+}
 const branch = `codex/issue-${issueNumber}-${attemptId.toLowerCase()}`;
 const expectedBranchRef = `refs/heads/${branch}`;
 const logDir = join(repoRoot, ".sandcastle", "logs");
@@ -375,6 +461,23 @@ let closeResult: Awaited<ReturnType<SandboxSession["close"]>> | undefined;
 let failure: string | undefined;
 
 try {
+  writeLiveStatus("IMPLEMENTING", {
+    issueNumber,
+    issueTitle: issue.title,
+    branch,
+    attemptId,
+    model: selectedModel,
+    logPath,
+  });
+  console.log(
+    JSON.stringify({
+      phase: "IMPLEMENT",
+      issueNumber,
+      branch,
+      model: selectedModel,
+      logPath,
+    }),
+  );
   sandbox = await createSandbox({
     cwd: repoRoot,
     branch,
@@ -387,7 +490,7 @@ try {
   });
   implementation = await sandbox.run({
     name: `issue-${issueNumber}`,
-    agent: codex(model, { effort: "high", captureSessions: false }),
+    agent: codex(selectedModel, { effort: "high", captureSessions: false }),
     promptFile: join(repoRoot, ".sandcastle", "implement-ticket.md"),
     promptArgs: {
       ISSUE_NUMBER: String(issueNumber),
@@ -404,22 +507,48 @@ try {
     ],
     idleTimeoutSeconds: 900,
     completionTimeoutSeconds: 30,
-    signal: AbortSignal.timeout(AGENT_WALL_CLOCK_SECONDS * 1000),
-    logging: { type: "file", path: logPath, verbose: true },
+    signal: AbortSignal.timeout(agentWallClockSeconds * 1000),
+    logging: {
+      type: "file",
+      path: logPath,
+      verbose: true,
+      onAgentStreamEvent: streamProgress({
+        issueNumber,
+        issueTitle: issue.title,
+        branch,
+        attemptId,
+        model: selectedModel,
+        logPath,
+      }),
+    },
   });
 
   if (implementation.completionSignal === "<implementation-ready/>") {
+    writeLiveStatus("VERIFYING", {
+      issueNumber,
+      issueTitle: issue.title,
+      branch,
+      attemptId,
+      verifyCommand,
+    });
+    console.log(JSON.stringify({ phase: "VERIFY", issueNumber, verifyCommand }));
     verification = await sandbox.exec(
       `timeout --signal=TERM --kill-after=30s ${VERIFICATION_WALL_CLOCK_SECONDS}s env -u CODEX_API_KEY -u OPENAI_API_KEY -u GH_TOKEN bash -lc ${shellQuote(verifyCommand)}`,
       { onLine: (line) => process.stdout.write(`${line}\n`) },
     );
   }
 
+  writeLiveStatus("AUDITING", {
+    issueNumber,
+    issueTitle: issue.title,
+    branch,
+    attemptId,
+  });
   ancestryAudit = await sandbox.exec(
     `git merge-base --is-ancestor ${baseSha} HEAD`,
   );
   protectedPathAudit = await sandbox.exec(
-    `git diff --name-only ${baseSha}...HEAD -- .sandcastle .agents`,
+    `git diff --name-only ${baseSha}...HEAD -- ${PROTECTED_CANDIDATE_PATHS.map(shellQuote).join(" ")}`,
   );
   worktreeAudit = await sandbox.exec(
     "git status --porcelain=v1 --untracked-files=all",
@@ -488,11 +617,13 @@ let currentness = {
 try {
   const currentIssue = fetchIssue(issueNumber);
   const currentParentSpec = fetchIssue(PARENT_SPEC_NUMBER);
-  const currentBaseSha = resolveCommit(baseRef);
+  const currentBaseSha = resolveRemoteBranch(baseRef);
   currentness = {
-    issueUnchanged: issueFingerprint(currentIssue) === issueFingerprint(issue),
+    issueUnchanged:
+      issueSemanticFingerprint(currentIssue) === issueSemanticFingerprint(issue),
     parentSpecUnchanged:
-      issueFingerprint(currentParentSpec) === issueFingerprint(parentSpec),
+      issueSemanticFingerprint(currentParentSpec) ===
+      issueSemanticFingerprint(parentSpec),
     baseUnchanged: currentBaseSha === baseSha,
   };
 } catch (error) {
@@ -521,23 +652,27 @@ const ready =
   currentness.baseUnchanged;
 
 const receipt = {
-  status: ready ? "READY_FOR_HITL" : "NEEDS_HUMAN",
+  status: ready ? "READY_FOR_MERGE" : "NEEDS_HUMAN",
   acceptance: "PENDING",
   attemptId,
   issueNumber,
   branch,
   baseRef,
   baseSha,
-  model,
+  issueFingerprint: issueSemanticFingerprint(issue),
+  parentSpecFingerprint: issueSemanticFingerprint(parentSpec),
+  model: selectedModel,
   imageName,
   limits: {
     cpus: 4,
-    maxIterations: 1,
-    agentWallClockSeconds: AGENT_WALL_CLOCK_SECONDS,
+    maxAgentRuns: 1,
+    maxIterationsPerRun: 1,
+    agentWallClockSeconds,
     verificationWallClockSeconds: VERIFICATION_WALL_CLOCK_SECONDS,
   },
   completionSignal: implementation?.completionSignal,
   commits: implementation?.commits ?? [],
+  implementation,
   verification,
   policyAudit: {
     ancestry: ancestryAudit,
@@ -551,6 +686,19 @@ const receipt = {
   preservedWorktreePath: closeResult?.preservedWorktreePath,
   finishedAt: new Date().toISOString(),
 };
-writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+const temporaryReceiptPath = `${receiptPath}.tmp`;
+writeFileSync(temporaryReceiptPath, `${JSON.stringify(receipt, null, 2)}\n`, {
+  encoding: "utf8",
+  mode: 0o600,
+});
+renameSync(temporaryReceiptPath, receiptPath);
+writeLiveStatus(receipt.status, {
+  issueNumber,
+  issueTitle: issue.title,
+  branch,
+  attemptId,
+  receiptPath,
+  failure,
+});
 console.log(JSON.stringify({ receiptPath, ...receipt }, null, 2));
 if (!ready) process.exitCode = 2;

@@ -8,9 +8,12 @@
     "sandcastle:prepare-image": "npm install --prefix .sandcastle/.image-codex --package-lock=false --ignore-scripts --save-exact --os=linux --cpu=x64 @openai/codex@0.148.0",
     "sandcastle:build-image": "npm run sandcastle:prepare-image && sandcastle docker build-image --image-name meta-research-sandcastle:0.12.0",
     "sandcastle:typecheck": "tsc -p tsconfig.json",
+    "sandcastle:unit": "tsx --test .sandcastle/queue-core.test.mts",
     "sandcastle:dry-run": "tsx .sandcastle/main.mts --dry-run",
     "sandcastle:ticket": "tsx .sandcastle/main.mts",
-    "test": "npm run sandcastle:typecheck"
+    "sandcastle:auto": "flock --exclusive --nonblock .sandcastle/queue/autopilot.lock tsx .sandcastle/auto.mts",
+    "sandcastle:status": "tsx .sandcastle/auto.mts --status",
+    "test": "npm run sandcastle:typecheck && npm run sandcastle:unit"
   },
   "repository": {
     "type": "git",
