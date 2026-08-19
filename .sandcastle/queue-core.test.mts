@@ -4,10 +4,16 @@ import {
   issueSemanticFingerprint,
   pullRequestDisposition,
   PROTECTED_CANDIDATE_PATHS,
+  removeQueueAttempt,
+  replaceQueueAttempt,
+  selectFrontierBatch,
   selectNextFrontier,
   summarizeQueue,
+  upsertQueueAttempt,
   type PullRequestState,
   type QueueIssue,
+  type QueueSnapshot,
+  type QueueState,
 } from "./queue-core.mts";
 
 test("candidate protection includes GitHub workflows", () => {
@@ -53,6 +59,55 @@ test("continues an issue already assigned only to the viewer", () => {
     )?.number,
     113,
   );
+});
+
+test("selects at most three deterministic native-frontier issues", () => {
+  assert.deepEqual(
+    selectFrontierBatch({
+      issues: [issue(116), issue(114), issue(113), issue(115)],
+      viewer: "15253a",
+      activeIssueNumbers: new Set(),
+      limit: 3,
+    }).map(({ number }) => number),
+    [113, 114, 115],
+  );
+});
+
+test("batch selection excludes active and blocked issues", () => {
+  assert.deepEqual(
+    selectFrontierBatch({
+      issues: [
+        issue(113),
+        issue(114),
+        issue(115, {
+          blockedBy: {
+            totalCount: 1,
+            nodes: [{ number: 112, state: "OPEN", title: "ticket 112" }],
+          },
+        }),
+        issue(116),
+      ],
+      viewer: "15253a",
+      activeIssueNumbers: new Set([113]),
+      limit: 3,
+    }).map(({ number }) => number),
+    [114, 116],
+  );
+});
+
+test("batch selection accepts only limits from one through three", () => {
+  for (const limit of [0, 4, 1.5]) {
+    assert.throws(
+      () =>
+        selectFrontierBatch({
+          issues: [issue(113)],
+          viewer: "15253a",
+          activeIssueNumbers: new Set(),
+          limit,
+        }),
+      /integer from 1 to 3/,
+    );
+  }
 });
 
 test("does not take an issue assigned to another account", () => {
@@ -142,4 +197,90 @@ test("a merged PR is accepted; an unmerged close stops the queue", () => {
     "ACCEPT",
   );
   assert.equal(pullRequestDisposition({ ...base, state: "CLOSED" }), "STOP");
+});
+
+const queueState = (
+  issueNumber: number,
+  attemptId: string,
+  overrides: Partial<QueueState> = {},
+): QueueState => ({
+  version: 1,
+  stage: "IMPLEMENTING",
+  issueNumber,
+  issueTitle: `ticket ${issueNumber}`,
+  branch: `codex/issue-${issueNumber}-${attemptId}`,
+  baseRef: "develop_main",
+  baseSha: "base",
+  attemptId,
+  receiptPath: `.sandcastle/receipts/${attemptId}.json`,
+  leaseRef: `refs/heads/sandcastle/lease-${issueNumber}`,
+  leaseSha: `lease-${issueNumber}`,
+  updatedAt: "2026-08-19T00:00:00Z",
+  ...overrides,
+});
+
+test("snapshot upserts and removals preserve unrelated attempts", () => {
+  const empty: QueueSnapshot = { version: 2, attempts: [] };
+  const first = queueState(113, "attempt-113");
+  const second = queueState(114, "attempt-114");
+
+  const withFirst = upsertQueueAttempt(empty, first);
+  const withBoth = upsertQueueAttempt(withFirst, second);
+  const updatedFirst = upsertQueueAttempt(
+    withBoth,
+    queueState(113, "attempt-113", { stage: "PUBLISHING" }),
+  );
+  const withoutFirst = removeQueueAttempt(updatedFirst, "attempt-113");
+
+  assert.deepEqual(empty.attempts, []);
+  assert.deepEqual(withFirst.attempts.map(({ attemptId }) => attemptId), [
+    "attempt-113",
+  ]);
+  assert.deepEqual(
+    withBoth.attempts.map(({ attemptId }) => attemptId),
+    ["attempt-113", "attempt-114"],
+  );
+  assert.equal(updatedFirst.attempts[0]?.stage, "PUBLISHING");
+  assert.equal(updatedFirst.attempts[1]?.attemptId, "attempt-114");
+  assert.deepEqual(withoutFirst.attempts.map(({ attemptId }) => attemptId), [
+    "attempt-114",
+  ]);
+  assert.equal(withBoth.attempts[0]?.stage, "IMPLEMENTING");
+});
+
+test("targeted retry atomically replaces one failure and preserves siblings", () => {
+  const firstFailure = queueState(113, "attempt-113", {
+    stage: "NEEDS_HUMAN",
+    failedStage: "IMPLEMENTING",
+  });
+  const secondFailure = queueState(114, "attempt-114", {
+    stage: "NEEDS_HUMAN",
+    failedStage: "IMPLEMENTING",
+  });
+  const snapshot: QueueSnapshot = {
+    version: 2,
+    attempts: [firstFailure, secondFailure],
+  };
+  const replacement = queueState(113, "retry-113", {
+    stage: "CLAIMING",
+  });
+
+  const retried = replaceQueueAttempt(
+    snapshot,
+    firstFailure.attemptId,
+    replacement,
+  );
+
+  assert.deepEqual(
+    retried.attempts.map(({ issueNumber, attemptId, stage }) => ({
+      issueNumber,
+      attemptId,
+      stage,
+    })),
+    [
+      { issueNumber: 113, attemptId: "retry-113", stage: "CLAIMING" },
+      { issueNumber: 114, attemptId: "attempt-114", stage: "NEEDS_HUMAN" },
+    ],
+  );
+  assert.equal(snapshot.attempts[0]?.attemptId, "attempt-113");
 });

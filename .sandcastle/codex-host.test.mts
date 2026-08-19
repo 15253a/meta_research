@@ -12,12 +12,17 @@ import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import {
   IMPLEMENT_WORKFLOW_SKILLS,
+  HOST_AGENT_SLOT_COUNT,
   MATT_SKILL_NAMES,
   boundedHostCommand,
+  hostAgentLockPaths,
   hostAgentRuntimeLockPath,
+  hostAgentSlotLockPath,
   hostCodexAgent,
   readMattWorkflowSkills,
+  requireAllHostAgentsIdle,
   requireHostAgentIdle,
+  requireHostAgentSlotIdle,
   requireHostCodexEnvironment,
   requireSafeControllerEnvironment,
 } from "./codex-host.mts";
@@ -70,7 +75,7 @@ test("bounds the stock host Codex process with GNU timeout", () => {
   const provider = hostCodexAgent(
     "gpt-5.4",
     3600,
-    "/tmp/sandcastle agent.lock",
+    ["/tmp/sandcastle slot.lock", "/tmp/sandcastle attempt.lock"],
     {
       effort: "high",
       captureSessions: false,
@@ -82,10 +87,24 @@ test("bounds the stock host Codex process with GNU timeout", () => {
   });
   assert.match(
     command.command,
-    /^exec setpriv --pdeathsig TERM flock --no-fork --exclusive --nonblock --conflict-exit-code 75 '\/tmp\/sandcastle agent\.lock' timeout --signal=TERM --kill-after=30s 3600s codex exec /,
+    /^exec setpriv --pdeathsig TERM flock --no-fork --exclusive --nonblock --conflict-exit-code 75 '\/tmp\/sandcastle slot\.lock' flock --no-fork --exclusive --nonblock --conflict-exit-code 75 '\/tmp\/sandcastle attempt\.lock' timeout --signal=TERM --kill-after=30s 3600s codex exec /,
   );
   assert.match(command.command, /codex exec --ephemeral --json/);
   assert.match(command.command, /--dangerously-bypass-approvals-and-sandbox/);
+});
+
+test("holds a slot and attempt lock in one bounded command", () => {
+  assert.equal(
+    boundedHostCommand(
+      "codex exec",
+      3600,
+      ["/tmp/slot.lock", "/tmp/attempt.lock"],
+    ),
+    "exec setpriv --pdeathsig TERM " +
+      "flock --no-fork --exclusive --nonblock --conflict-exit-code 75 '/tmp/slot.lock' " +
+      "flock --no-fork --exclusive --nonblock --conflict-exit-code 75 '/tmp/attempt.lock' " +
+      "timeout --signal=TERM --kill-after=30s 3600s codex exec",
+  );
 });
 
 test("uses the same bounded host wrapper for verification commands", () => {
@@ -100,7 +119,9 @@ test("uses the same bounded host wrapper for verification commands", () => {
 test("killing the auto parent reaps a bounded verifier and releases its lock", async () => {
   const { repoRoot } = createFixture();
   const marker = join(repoRoot, ".sandcastle", "verifier-started");
-  const runtimeLock = hostAgentRuntimeLockPath(repoRoot);
+  const attemptId = "kill-chain-attempt";
+  const runtimeLock = hostAgentRuntimeLockPath(repoRoot, attemptId);
+  const slotLock = hostAgentSlotLockPath(repoRoot, 2);
   mkdirSync(join(repoRoot, ".sandcastle", "queue"), {
     recursive: true,
     mode: 0o700,
@@ -110,7 +131,7 @@ test("killing the auto parent reaps a bounded verifier and releases its lock", a
   const verifierCommand = boundedHostCommand(
     `sh -c ${quote(`trap '' TERM; : > ${quote(marker)}; sleep 60`)}`,
     5,
-    runtimeLock,
+    [slotLock, runtimeLock],
     1,
   );
   const mainCode = [
@@ -138,14 +159,20 @@ test("killing the auto parent reaps a bounded verifier and releases its lock", a
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.equal(existsSync(marker), true, "bounded verifier did not start");
-    assert.throws(() => requireHostAgentIdle(repoRoot), /still holds/);
+    assert.throws(
+      () => requireHostAgentIdle(repoRoot, attemptId),
+      /still holds/,
+    );
+    assert.throws(() => requireHostAgentSlotIdle(repoRoot, 2), /still holds/);
+    assert.throws(() => requireAllHostAgentsIdle(repoRoot), /still holds/);
 
     auto.kill("SIGKILL");
     const releaseDeadline = Date.now() + 5_000;
     let released = false;
     while (!released && Date.now() < releaseDeadline) {
       try {
-        requireHostAgentIdle(repoRoot);
+        requireHostAgentIdle(repoRoot, attemptId);
+        requireHostAgentSlotIdle(repoRoot, 2);
         released = true;
       } catch {
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -154,6 +181,87 @@ test("killing the auto parent reaps a bounded verifier and releases its lock", a
     assert.equal(released, true, "runtime lock survived its controller chain");
   } finally {
     auto.kill("SIGKILL");
+  }
+});
+
+test("three slots isolate concurrent ticket attempts", async () => {
+  const { repoRoot } = createFixture();
+  mkdirSync(join(repoRoot, ".sandcastle", "queue"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  assert.equal(HOST_AGENT_SLOT_COUNT, 3);
+  const quote = (value: string): string =>
+    `'${value.replaceAll("'", `'\\''`)}'`;
+  const attempts = ["parallel-a", "parallel-b", "parallel-c"];
+  const markers = attempts.map((attempt) =>
+    join(repoRoot, ".sandcastle", `${attempt}.started`),
+  );
+  const children = attempts.map((attempt, slot) =>
+    spawn(
+      "sh",
+      [
+        "-c",
+        boundedHostCommand(
+          `sh -c ${quote(`: > ${quote(markers[slot]!)}; sleep 60`)}`,
+          60,
+          hostAgentLockPaths(repoRoot, attempt, slot),
+          1,
+        ),
+      ],
+      { stdio: "ignore" },
+    ),
+  );
+
+  try {
+    const deadline = Date.now() + 5_000;
+    while (
+      markers.some((marker) => !existsSync(marker)) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(markers.every((marker) => existsSync(marker)), true);
+    for (const [slot, attempt] of attempts.entries()) {
+      assert.throws(
+        () => requireHostAgentSlotIdle(repoRoot, slot),
+        /still holds/,
+      );
+      assert.throws(
+        () => requireHostAgentIdle(repoRoot, attempt),
+        /still holds/,
+      );
+    }
+    assert.doesNotThrow(() => requireHostAgentIdle(repoRoot, "parallel-d"));
+    assert.throws(() => requireAllHostAgentsIdle(repoRoot), /still holds/);
+    const conflictStatus = await new Promise<number | null>((resolve) => {
+      const conflict = spawn(
+        "sh",
+        [
+          "-c",
+          boundedHostCommand(
+            "true",
+            5,
+            hostAgentLockPaths(repoRoot, "parallel-d", 0),
+            1,
+          ),
+        ],
+        { stdio: "ignore" },
+      );
+      conflict.once("close", (status) => resolve(status));
+    });
+    assert.equal(conflictStatus, 75);
+    assert.throws(() => hostAgentSlotLockPath(repoRoot, 3), /from 0 to 2/);
+  } finally {
+    for (const child of children) child.kill("SIGTERM");
+    await Promise.all(
+      children.map(
+        (child) =>
+          child.exitCode !== null || child.signalCode !== null
+            ? Promise.resolve()
+            : new Promise<void>((resolve) => child.once("exit", () => resolve())),
+      ),
+    );
   }
 });
 
@@ -173,6 +281,7 @@ test("allows only documented non-secret controller settings", () => {
       "SANDCASTLE_BASE_REF=develop_main",
       "SANDCASTLE_POLL_SECONDS=60",
       "SANDCASTLE_AGENT_WALL_CLOCK_SECONDS=28800",
+      "SANDCASTLE_MAX_AGENTS=3",
       "",
     ].join("\n"),
   );

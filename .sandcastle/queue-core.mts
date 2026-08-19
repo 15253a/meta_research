@@ -38,6 +38,16 @@ export type QueueStage =
   | "CLOSING"
   | "NEEDS_HUMAN";
 
+export type IntegrationVerification = {
+  sourceBaseSha: string;
+  sourceCandidateSha: string;
+  baseSha: string;
+  candidateSha: string;
+  treeSha: string;
+  mergeCommitSha: string;
+  verifiedAt: string;
+};
+
 export type QueueState = {
   version: 1;
   stage: QueueStage;
@@ -48,16 +58,23 @@ export type QueueState = {
   baseSha: string;
   candidateSha?: string;
   attemptId: string;
+  slot?: number;
   receiptPath: string;
   leaseRef: string;
   leaseSha: string;
   prNumber?: number;
   prUrl?: string;
   acceptedSha?: string;
+  integrationVerification?: IntegrationVerification;
   failedStage?: Exclude<QueueStage, "NEEDS_HUMAN">;
   resumeStage?: Exclude<QueueStage, "NEEDS_HUMAN">;
   error?: string;
   updatedAt: string;
+};
+
+export type QueueSnapshot = {
+  version: 2;
+  attempts: QueueState[];
 };
 
 export type PullRequestState = {
@@ -102,10 +119,22 @@ export const issueSemanticFingerprint = (issue: QueueIssue): string =>
       .sort((left, right) => left.number - right.number),
   });
 
-export const selectNextFrontier = (
-  issues: readonly QueueIssue[],
-  viewer: string,
-): QueueIssue | undefined => {
+export type SelectFrontierBatchOptions = {
+  issues: readonly QueueIssue[];
+  viewer: string;
+  activeIssueNumbers: ReadonlySet<number>;
+  limit: number;
+};
+
+export const selectFrontierBatch = ({
+  issues,
+  viewer,
+  activeIssueNumbers,
+  limit,
+}: SelectFrontierBatchOptions): QueueIssue[] => {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 3) {
+    throw new RangeError("Frontier batch limit must be an integer from 1 to 3.");
+  }
   for (const issue of issues) validateBlockerSnapshot(issue);
 
   return [...issues]
@@ -118,7 +147,80 @@ export const selectNextFrontier = (
       assignees.length === 0 ||
       (assignees.length === 1 && assignees[0]?.login === viewer),
     )
-    .sort((left, right) => left.number - right.number)[0];
+    .filter(({ number }) => !activeIssueNumbers.has(number))
+    .sort((left, right) => left.number - right.number)
+    .slice(0, limit);
+};
+
+export const selectNextFrontier = (
+  issues: readonly QueueIssue[],
+  viewer: string,
+): QueueIssue | undefined =>
+  selectFrontierBatch({
+    issues,
+    viewer,
+    activeIssueNumbers: new Set(),
+    limit: 1,
+  })[0];
+
+const sortAttempts = (attempts: QueueState[]): QueueState[] =>
+  attempts.sort(
+    (left, right) =>
+      left.issueNumber - right.issueNumber ||
+      left.attemptId.localeCompare(right.attemptId),
+  );
+
+export const upsertQueueAttempt = (
+  snapshot: QueueSnapshot,
+  attempt: QueueState,
+): QueueSnapshot => ({
+  version: 2,
+  attempts: sortAttempts([
+    ...snapshot.attempts.filter(
+      ({ attemptId }) => attemptId !== attempt.attemptId,
+    ),
+    attempt,
+  ]),
+});
+
+export const removeQueueAttempt = (
+  snapshot: QueueSnapshot,
+  attemptId: string,
+): QueueSnapshot => ({
+  version: 2,
+  attempts: snapshot.attempts.filter(
+    (attempt) => attempt.attemptId !== attemptId,
+  ),
+});
+
+export const replaceQueueAttempt = (
+  snapshot: QueueSnapshot,
+  previousAttemptId: string,
+  replacement: QueueState,
+): QueueSnapshot => {
+  const previous = snapshot.attempts.find(
+    ({ attemptId }) => attemptId === previousAttemptId,
+  );
+  if (
+    !previous ||
+    previous.issueNumber !== replacement.issueNumber ||
+    previousAttemptId === replacement.attemptId
+  ) {
+    throw new Error(
+      `Cannot replace queue attempt ${previousAttemptId} with ${replacement.attemptId}.`,
+    );
+  }
+  if (
+    snapshot.attempts.some(
+      ({ attemptId }) => attemptId === replacement.attemptId,
+    )
+  ) {
+    throw new Error(`Queue attempt ${replacement.attemptId} already exists.`);
+  }
+  return upsertQueueAttempt(
+    removeQueueAttempt(snapshot, previousAttemptId),
+    replacement,
+  );
 };
 
 export const summarizeQueue = (

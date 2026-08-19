@@ -22,8 +22,11 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import {
   boundedHostCommand,
-  hostCodexAgent,
+  HOST_AGENT_SLOT_COUNT,
+  hostAgentLockPaths,
   hostAgentRuntimeLockPath,
+  hostAgentSlotLockPath,
+  hostCodexAgent,
   readMattWorkflowSkills,
   requireHostAgentIdle,
   requireHostCodexEnvironment,
@@ -50,6 +53,8 @@ const CONTROLLER_PATHS = [
   ".sandcastle/queue-core.test.mts",
   ".sandcastle/codex-host.mts",
   ".sandcastle/codex-host.test.mts",
+  ".sandcastle/integration-verifier.mts",
+  ".sandcastle/integration-verifier.test.mts",
   ".sandcastle/.gitignore",
   ".sandcastle/.env.example",
   ".sandcastle/implement-ticket.md",
@@ -61,7 +66,6 @@ const CONTROLLER_PATHS = [
   "tsconfig.json",
 ] as const;
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const liveStatusPath = join(repoRoot, ".sandcastle", "status.json");
 
 type IssueRef = {
   number: number;
@@ -193,11 +197,21 @@ const refsEqual = (
 ): boolean =>
   left?.object === right?.object && left?.symref === right?.symref;
 
-const readLinkedWorktrees = (): string[] =>
+type LinkedWorktree = { path: string; branch?: string };
+
+const readLinkedWorktrees = (): LinkedWorktree[] =>
   runHost("git", ["worktree", "list", "--porcelain"])
-    .split("\n")
-    .filter((line) => line.startsWith("worktree "))
-    .map((line) => resolve(line.slice("worktree ".length)));
+    .split("\n\n")
+    .map((record) => record.split("\n").filter(Boolean))
+    .filter((lines) => lines.some((line) => line.startsWith("worktree ")))
+    .map((lines) => {
+      const worktree = lines.find((line) => line.startsWith("worktree "))!;
+      const branch = lines.find((line) => line.startsWith("branch refs/heads/"));
+      return {
+        path: resolve(worktree.slice("worktree ".length)),
+        branch: branch?.slice("branch refs/heads/".length),
+      };
+    });
 
 const requireValue = (value: string | undefined, message: string): string => {
   if (!value?.trim()) throw new Error(message);
@@ -230,6 +244,7 @@ const writeLiveStatus = (
   phase: string,
   details: Record<string, unknown> = {},
 ): void => {
+  mkdirSync(dirname(liveStatusPath), { recursive: true, mode: 0o700 });
   const temporaryPath = `${liveStatusPath}.tmp`;
   writeFileSync(
     temporaryPath,
@@ -252,6 +267,8 @@ const { values } = parseArgs({
     "attempt-id": { type: "string" },
     "agent-wall-clock-seconds": { type: "string" },
     "base-ref": { type: "string" },
+    slot: { type: "string" },
+    "cohort-branch": { type: "string", multiple: true },
   },
   strict: true,
 });
@@ -264,6 +281,63 @@ const issueNumber = Number(issueArgument);
 if (!/^\d+$/.test(issueArgument) || !Number.isSafeInteger(issueNumber)) {
   throw new Error("--issue must be an integer.");
 }
+const liveStatusPath = join(
+  repoRoot,
+  ".sandcastle",
+  "status",
+  `issue-${issueNumber}.json`,
+);
+
+const slotArgument = values.slot ?? "0";
+const slot = Number(slotArgument);
+if (!/^\d+$/.test(slotArgument) || !Number.isInteger(slot)) {
+  throw new Error("--slot must be an integer.");
+}
+if (slot < 0 || slot >= HOST_AGENT_SLOT_COUNT) {
+  throw new Error(
+    `--slot must be between 0 and ${HOST_AGENT_SLOT_COUNT - 1}.`,
+  );
+}
+
+const generatedAttemptId = `${new Date()
+  .toISOString()
+  .replaceAll(/[-:.]/g, "")}-${randomUUID().slice(0, 8)}`;
+const attemptId = requireValue(
+  values["attempt-id"] ?? generatedAttemptId,
+  "An attempt id is required.",
+);
+if (!/^[0-9A-Za-z][0-9A-Za-z-]{7,79}$/.test(attemptId)) {
+  throw new Error("--attempt-id must contain only 8-80 letters, digits, or hyphens.");
+}
+const branch = `codex/issue-${issueNumber}-${attemptId.toLowerCase()}`;
+const cohortArguments = values["cohort-branch"] ?? [];
+const cohortBranches = cohortArguments.length === 0
+  ? [branch]
+  : [...cohortArguments];
+if (new Set(cohortBranches).size !== cohortBranches.length) {
+  throw new Error("--cohort-branch values must be unique.");
+}
+if (cohortBranches.length > HOST_AGENT_SLOT_COUNT) {
+  throw new Error(
+    `A ticket cohort may contain at most ${HOST_AGENT_SLOT_COUNT} branches.`,
+  );
+}
+const invalidCohortBranch = cohortBranches.find(
+  (candidate) =>
+    !/^codex\/issue-(?:11[3-9]|12\d|13[0-2])-[0-9a-z][0-9a-z-]{7,79}$/.test(
+      candidate,
+    ),
+);
+if (invalidCohortBranch) {
+  throw new Error(`Invalid managed cohort branch: ${invalidCohortBranch}.`);
+}
+if (!cohortBranches.includes(branch)) {
+  throw new Error(
+    `The current ticket branch ${branch} must be included with --cohort-branch.`,
+  );
+}
+const cohortBranchSet = new Set(cohortBranches);
+const cohortRefs = new Set(cohortBranches.map((name) => `refs/heads/${name}`));
 
 const dryRun = values["dry-run"] ?? false;
 const agentWallClockSeconds = Number(
@@ -287,11 +361,24 @@ const issue = fetchIssue(issueNumber);
 const parentSpec = fetchIssue(PARENT_SPEC_NUMBER);
 const baseSha = resolveCommit(baseRef);
 const managedWorktreeRoot = resolve(repoRoot, ".sandcastle", "worktrees");
-const additionalLinkedWorktrees = readLinkedWorktrees().filter(
-  (path) =>
+const managedLinkedWorktrees = readLinkedWorktrees().filter(
+  ({ path }) =>
     path !== resolve(repoRoot) &&
     (path === managedWorktreeRoot ||
       path.startsWith(`${managedWorktreeRoot}${sep}`)),
+);
+const currentBranchLinkedWorktrees = managedLinkedWorktrees.filter(
+  ({ branch: linkedBranch }) => linkedBranch === branch,
+);
+const cohortSiblingWorktrees = managedLinkedWorktrees.filter(
+  ({ branch: linkedBranch }) =>
+    linkedBranch !== branch &&
+    linkedBranch !== undefined &&
+    cohortBranchSet.has(linkedBranch),
+);
+const unknownManagedWorktrees = managedLinkedWorktrees.filter(
+  ({ branch: linkedBranch }) =>
+    linkedBranch === undefined || !cohortBranchSet.has(linkedBranch),
 );
 const controllerMismatches = CONTROLLER_PATHS.filter((path) => {
   try {
@@ -341,7 +428,13 @@ const eligibility = {
   blockedBy: blockers.map(({ number, state }) => ({ number, state })),
   controllerAtBase: controllerMismatches.length === 0,
   controllerMismatches,
-  additionalLinkedWorktrees,
+  slot,
+  branch,
+  cohortBranches,
+  cohortSiblingWorktrees,
+  currentBranchLinkedWorktrees,
+  unknownManagedWorktrees,
+  additionalLinkedWorktrees: unknownManagedWorktrees.map(({ path }) => path),
   eligibleToClaim: assignees.length === 0,
   runnableByViewer: assignees.length === 1 && assignees[0] === viewer,
 };
@@ -361,15 +454,20 @@ if (controllerMismatches.length > 0) {
     `Base ${baseSha} does not contain the active controller files: ${controllerMismatches.join(", ")}. Commit the controller to --base-ref before a real run.`,
   );
 }
-if (additionalLinkedWorktrees.length > 0) {
+if (currentBranchLinkedWorktrees.length > 0) {
   throw new Error(
-    `Refusing a single-ticket run while preserved Sandcastle worktrees exist: ${additionalLinkedWorktrees.join(", ")}. Resolve or remove preserved attempts first.`,
+    `Refusing to reuse the current ticket's existing worktree: ${currentBranchLinkedWorktrees.map(({ path }) => path).join(", ")}. Recover or remove that exact attempt first.`,
+  );
+}
+if (unknownManagedWorktrees.length > 0) {
+  throw new Error(
+    `Unregistered Sandcastle worktrees are present: ${unknownManagedWorktrees.map(({ path, branch: linkedBranch }) => `${path} (${linkedBranch ?? "detached"})`).join(", ")}.`,
   );
 }
 requireSafeControllerEnvironment(repoRoot);
 const hostCodex = requireHostCodexEnvironment();
 requireHostCodexLogin(repoRoot);
-requireHostAgentIdle(repoRoot);
+requireHostAgentIdle(repoRoot, attemptId);
 const mattWorkflow = readMattWorkflowSkills(hostCodex);
 
 const selectedModel = requireValue(
@@ -382,18 +480,10 @@ const verifyCommand = requireValue(
     DEFAULT_VERIFY_COMMAND,
   "A verification command is required.",
 );
-const generatedAttemptId = `${new Date()
-  .toISOString()
-  .replaceAll(/[-:.]/g, "")}-${randomUUID().slice(0, 8)}`;
-const attemptId = requireValue(
-  values["attempt-id"] ?? generatedAttemptId,
-  "An attempt id is required.",
-);
-if (!/^[0-9A-Za-z][0-9A-Za-z-]{7,79}$/.test(attemptId)) {
-  throw new Error("--attempt-id must contain only 8-80 letters, digits, or hyphens.");
-}
-const branch = `codex/issue-${issueNumber}-${attemptId.toLowerCase()}`;
 const expectedBranchRef = `refs/heads/${branch}`;
+const runtimeLockPath = hostAgentRuntimeLockPath(repoRoot, attemptId);
+const slotLockPath = hostAgentSlotLockPath(repoRoot, slot);
+const agentLockPaths = hostAgentLockPaths(repoRoot, attemptId, slot);
 const logDir = join(repoRoot, ".sandcastle", "logs");
 const receiptDir = join(repoRoot, ".sandcastle", "receipts");
 const logPath = join(logDir, `${attemptId}-issue-${issueNumber}.log`);
@@ -487,7 +577,7 @@ try {
     agent: hostCodexAgent(
       selectedModel,
       agentWallClockSeconds,
-      hostAgentRuntimeLockPath(repoRoot),
+      agentLockPaths,
       { effort: "high", captureSessions: false },
     ),
     promptFile: join(repoRoot, ".sandcastle", "implement-ticket.md"),
@@ -543,7 +633,7 @@ try {
       boundedHostCommand(
         `env -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY -u GH_TOKEN bash -lc ${shellQuote(verifyCommand)}`,
         VERIFICATION_WALL_CLOCK_SECONDS,
-        hostAgentRuntimeLockPath(repoRoot),
+        agentLockPaths,
       ),
       { onLine: (line) => process.stdout.write(`${line}\n`) },
     );
@@ -585,12 +675,28 @@ let gitMetadataAudit = {
   unexpectedRefChanges: ["audit-not-completed"],
   expectedBranchCreated: false,
   branchTipMatchesRun: false,
+  unexpectedManagedWorktrees: ["audit-not-completed"],
 };
 try {
   const refsAfter = readRefs();
   const unexpectedRefChanges = [...new Set([...refsBefore.keys(), ...refsAfter.keys()])]
-    .filter((ref) => ref !== expectedBranchRef)
+    .filter((ref) => !cohortRefs.has(ref))
     .filter((ref) => !refsEqual(refsBefore.get(ref), refsAfter.get(ref)))
+    .sort();
+  const unexpectedManagedWorktrees = readLinkedWorktrees()
+    .filter(
+      ({ path }) =>
+        path !== resolve(repoRoot) &&
+        (path === managedWorktreeRoot ||
+          path.startsWith(`${managedWorktreeRoot}${sep}`)),
+    )
+    .filter(
+      ({ branch: linkedBranch }) =>
+        linkedBranch === undefined || !cohortBranchSet.has(linkedBranch),
+    )
+    .map(({ path, branch: linkedBranch }) =>
+      `${path} (${linkedBranch ?? "detached"})`,
+    )
     .sort();
   const expectedBranchState = refsAfter.get(expectedBranchRef);
   const reportedTip = implementation?.commits.at(-1)?.sha;
@@ -614,6 +720,7 @@ try {
       expectedBranchState !== undefined &&
       reportedTip !== undefined &&
       expectedBranchState.object === reportedTip,
+    unexpectedManagedWorktrees,
   };
 } catch (error) {
   const metadataFailure = `post-run Git metadata audit failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -677,6 +784,7 @@ const ready =
   gitMetadataAudit.controlFilesUnchanged &&
   gitMetadataAudit.objectAlternatesUnchanged &&
   gitMetadataAudit.unexpectedRefChanges.length === 0 &&
+  gitMetadataAudit.unexpectedManagedWorktrees.length === 0 &&
   gitMetadataAudit.expectedBranchCreated &&
   gitMetadataAudit.branchTipMatchesRun &&
   controllerWorktreeUnchanged &&
@@ -700,7 +808,10 @@ const receipt = {
     codexVersion: hostCodex.codexVersion,
     codexHome: hostCodex.codexHome,
     worktreeRoot: join(repoRoot, ".sandcastle", "worktrees"),
-    runtimeLock: hostAgentRuntimeLockPath(repoRoot),
+    slot,
+    slotLock: slotLockPath,
+    runtimeLock: runtimeLockPath,
+    cohortBranches,
   },
   limits: {
     maxAgentRuns: 1,

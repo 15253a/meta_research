@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -55,6 +56,7 @@ const ALLOWED_SANDCASTLE_ENV_KEYS = new Set([
   "SANDCASTLE_BASE_REF",
   "SANDCASTLE_POLL_SECONDS",
   "SANDCASTLE_AGENT_WALL_CLOCK_SECONDS",
+  "SANDCASTLE_MAX_AGENTS",
 ]);
 
 export type HostCodexContext = {
@@ -74,8 +76,56 @@ export type MattWorkflow = {
   "code-review": WorkflowSkill;
 };
 
-export const hostAgentRuntimeLockPath = (repoRoot: string): string =>
-  join(repoRoot, ".sandcastle", "queue", "agent-runtime.lock");
+export const HOST_AGENT_SLOT_COUNT = 3;
+
+const requireAttemptId = (attemptId: string): string => {
+  if (!/^[0-9A-Za-z][0-9A-Za-z-]{0,79}$/.test(attemptId)) {
+    throw new Error(
+      "Host Agent attempt ids must contain only 1-80 letters, digits, or hyphens.",
+    );
+  }
+  return attemptId;
+};
+
+const requireSlot = (slot: number): number => {
+  if (!Number.isInteger(slot) || slot < 0 || slot >= HOST_AGENT_SLOT_COUNT) {
+    throw new Error(
+      `Host Agent slot must be an integer from 0 to ${HOST_AGENT_SLOT_COUNT - 1}.`,
+    );
+  }
+  return slot;
+};
+
+export const hostAgentRuntimeLockPath = (
+  repoRoot: string,
+  attemptId: string,
+): string =>
+  join(
+    repoRoot,
+    ".sandcastle",
+    "queue",
+    `agent-runtime-${requireAttemptId(attemptId)}.lock`,
+  );
+
+export const hostAgentSlotLockPath = (
+  repoRoot: string,
+  slot: number,
+): string =>
+  join(
+    repoRoot,
+    ".sandcastle",
+    "queue",
+    `agent-slot-${requireSlot(slot)}.lock`,
+  );
+
+export const hostAgentLockPaths = (
+  repoRoot: string,
+  attemptId: string,
+  slot: number,
+): readonly [string, string] => [
+  hostAgentSlotLockPath(repoRoot, slot),
+  hostAgentRuntimeLockPath(repoRoot, attemptId),
+];
 export const HOST_RUNTIME_LOCK_CONFLICT_STATUS = 75;
 
 const shellQuote = (value: string): string =>
@@ -84,15 +134,33 @@ const shellQuote = (value: string): string =>
 export const boundedHostCommand = (
   command: string,
   wallClockSeconds: number,
-  runtimeLockPath: string,
+  runtimeLockPaths: string | readonly string[],
   killAfterSeconds = 30,
-): string =>
-  "exec setpriv --pdeathsig TERM " +
-  "flock --no-fork --exclusive --nonblock " +
-  `--conflict-exit-code ${HOST_RUNTIME_LOCK_CONFLICT_STATUS} ` +
-  `${shellQuote(runtimeLockPath)} ` +
-  `timeout --signal=TERM --kill-after=${killAfterSeconds}s ${wallClockSeconds}s ` +
-  command;
+): string => {
+  const locks = typeof runtimeLockPaths === "string"
+    ? [runtimeLockPaths]
+    : [...runtimeLockPaths];
+  if (locks.length === 0 || locks.some((path) => !path.trim())) {
+    throw new Error("At least one non-empty host runtime lock is required.");
+  }
+  if (new Set(locks).size !== locks.length) {
+    throw new Error("Host runtime locks must be unique.");
+  }
+  const lockCommands = locks
+    .map(
+      (path) =>
+        "flock --no-fork --exclusive --nonblock " +
+        `--conflict-exit-code ${HOST_RUNTIME_LOCK_CONFLICT_STATUS} ` +
+        `${shellQuote(path)} `,
+    )
+    .join("");
+  return (
+    "exec setpriv --pdeathsig TERM " +
+    lockCommands +
+    `timeout --signal=TERM --kill-after=${killAfterSeconds}s ${wallClockSeconds}s ` +
+    command
+  );
+};
 
 /**
  * Sandcastle's host provider does not terminate its spawned shell when an
@@ -102,7 +170,7 @@ export const boundedHostCommand = (
 export const hostCodexAgent = (
   model: string,
   wallClockSeconds: number,
-  runtimeLockPath: string,
+  runtimeLockPaths: string | readonly string[],
   options: CodexOptions = {},
 ): AgentProvider => {
   const provider = codex(model, options);
@@ -122,7 +190,7 @@ export const hostCodexAgent = (
         command: boundedHostCommand(
           ephemeralCommand,
           wallClockSeconds,
-          runtimeLockPath,
+          runtimeLockPaths,
         ),
       };
     },
@@ -248,8 +316,11 @@ export const requireHostCodexEnvironment = (): HostCodexContext => {
   };
 };
 
-export const requireHostAgentIdle = (repoRoot: string): void => {
-  const lockPath = hostAgentRuntimeLockPath(repoRoot);
+const requireLockIdle = (
+  repoRoot: string,
+  lockPath: string,
+  label: string,
+): void => {
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const result = spawnSync(
     "flock",
@@ -259,8 +330,47 @@ export const requireHostAgentIdle = (repoRoot: string): void => {
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(
-      `A previous host Codex Agent still holds ${lockPath}; wait for it to exit before recovery or retry.`,
+      `${label} still holds ${lockPath}; wait for it to exit before recovery or retry.`,
     );
+  }
+};
+
+export const requireHostAgentIdle = (
+  repoRoot: string,
+  attemptId: string,
+): void =>
+  requireLockIdle(
+    repoRoot,
+    hostAgentRuntimeLockPath(repoRoot, attemptId),
+    `Host Codex Agent attempt ${attemptId}`,
+  );
+
+export const requireHostAgentSlotIdle = (
+  repoRoot: string,
+  slot: number,
+): void =>
+  requireLockIdle(
+    repoRoot,
+    hostAgentSlotLockPath(repoRoot, slot),
+    `Host Codex Agent slot ${slot}`,
+  );
+
+export const requireAllHostAgentsIdle = (repoRoot: string): void => {
+  const queueDir = join(repoRoot, ".sandcastle", "queue");
+  mkdirSync(queueDir, { recursive: true, mode: 0o700 });
+  const runtimeLocks = readdirSync(queueDir)
+    .filter((name) => /^agent-runtime-[0-9A-Za-z][0-9A-Za-z-]{0,79}\.lock$/.test(name))
+    .map((name) => join(queueDir, name));
+  const legacyRuntimeLock = join(queueDir, "agent-runtime.lock");
+  if (existsSync(legacyRuntimeLock)) runtimeLocks.push(legacyRuntimeLock);
+  const locks = [
+    ...Array.from({ length: HOST_AGENT_SLOT_COUNT }, (_, slot) =>
+      hostAgentSlotLockPath(repoRoot, slot),
+    ),
+    ...runtimeLocks,
+  ];
+  for (const lockPath of new Set(locks)) {
+    requireLockIdle(repoRoot, lockPath, "A host Codex Agent or verifier");
   }
 };
 
@@ -535,7 +645,7 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(thisFile)) {
   requireSafeControllerEnvironment(repoRoot);
   const context = requireHostCodexEnvironment();
   requireHostCodexLogin(repoRoot);
-  requireHostAgentIdle(repoRoot);
+  requireAllHostAgentsIdle(repoRoot);
 
   if (command === "--check") {
     const discovered = await verifyHostSkillDiscovery(repoRoot, context);

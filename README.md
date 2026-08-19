@@ -4,10 +4,11 @@
 
 ## Sandcastle 自动实现队列
 
-本分支使用 Sandcastle 0.12.0 + 当前宿主 Codex 顺序处理 #113–#132。
-controller 读取 GitHub 原生 `blockedBy`，自动选择 frontier、把票据分配给当前
-GitHub 账号、调用 Matt Pocock `$implement`、验证、push、创建并自动合并以
-`develop_main` 为 base 的 PR，随后复验、关闭票据并继续下一张。
+本分支使用 Sandcastle 0.12.0 + 当前宿主 Codex 处理 #113–#132。controller
+读取 GitHub 原生 `blockedBy`，每轮自动选择最多 3 张 frontier 票据，为每张票
+创建独立 branch/worktree，并行调用 Matt Pocock `$implement`。一轮实现全部结束
+后，controller 会逐张做集成验证、push、创建并自动合并以 `develop_main` 为 base
+的 PR，随后复验、关闭票据并重新查询下一轮 frontier。
 
 ### 初始化
 
@@ -42,6 +43,17 @@ npm run sandcastle:auto -- --dry-run
 npm run sandcastle:auto
 ```
 
+默认并行度是 3，也可以临时降低（不能超过 3）：
+
+```bash
+npm run sandcastle:auto -- --max-agents 1
+```
+
+这里的并行度指顶层 ticket Agent。`$implement` 内部使用的 `$tdd`、
+`$code-review` 等工作流不占额外 Sandcastle ticket slot。GitHub 当前如果只有一张
+unblocked frontier（例如首轮只有 #113），controller 只会启动 1 个 Agent；只有
+依赖图同时放出 2–3 张票时才会并行。
+
 每张票的普通 Git worktree 都位于：
 
 ```text
@@ -65,9 +77,19 @@ lock 也会在 controller 异常退出时终止或标记仍存活的 Agent，`--
 自动流程如下：
 
 ```text
-native frontier → claim → $implement → verify → push/PR
-→ auto merge → exact-commit host verify → close issue → next frontier
+GitHub native frontier → 选最多3张 → claim
+→ 3个独立 worktree 中并行 $implement + verify
+→ 等待本轮全部完成
+→ 逐张 push/PR → 对最新 develop_main 做 integration verify
+→ atomic auto merge → exact-commit host verify → close issue
+→ 重新查询下一轮 frontier
 ```
+
+后一个 sibling 在前一个 PR 合并后会针对最新 `develop_main` 重新生成并验证合并
+树，并把 `{verified tree, current base, candidate}` 制成确定的 merge commit，再用
+`force-with-lease` 对 `develop_main` 做原子 compare-and-swap。PR head、merge commit
+双亲与最终 tree 全部精确匹配后才会接受。因此 Agent 执行可以并行，GitHub 发布
+和合并保持确定性的串行顺序。
 
 合并后的复验从精确 accepted commit 导出到
 `.sandcastle/inbox/post-merge-*`，而不是验证可移动的 `develop_main` HEAD；完成后
@@ -81,23 +103,26 @@ npm run sandcastle:status
 npm run sandcastle:status -- --watch
 ```
 
-完整日志、结果和当前阶段分别位于 `.sandcastle/logs/`、
-`.sandcastle/receipts/`、`.sandcastle/status.json`。
+完整日志、结果和 controller 当前阶段分别位于 `.sandcastle/logs/`、
+`.sandcastle/receipts/`、`.sandcastle/status.json`；每张并行票据的实时阶段位于
+`.sandcastle/status/issue-N.json`。`sandcastle:status` 会同时显示并行上限、占用
+slot、当前 cohort 和下一轮 frontier。
 
 若状态给出 `resumeStage`，修复外部条件后运行：
 
 ```bash
-npm run sandcastle:auto -- --resume
+npm run sandcastle:auto -- --resume --issue 113
 ```
 
 若实现被中断且状态建议重试：
 
 ```bash
-npm run sandcastle:auto -- --retry
+npm run sandcastle:auto -- --retry --issue 113
 ```
 
-后者只清理精确匹配且干净的残留 worktree；未提交证据不会被静默删除。单票
-默认最长 8 小时，可在 `.sandcastle/.env` 调整为 1–24 小时。
+只有一个失败 checkpoint 时可以省略 `--issue`；多个并行票据同时需要处理时必须
+显式指定。`--retry` 只清理精确匹配且干净的残留 worktree；未提交证据不会被
+静默删除。单票默认最长 8 小时，可在 `.sandcastle/.env` 调整为 1–24 小时。
 
 调试单张票仍可使用：
 

@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -18,6 +18,7 @@ import {
   HOST_RUNTIME_LOCK_CONFLICT_STATUS,
   boundedHostCommand,
   hostAgentRuntimeLockPath,
+  requireAllHostAgentsIdle,
   requireHostCodexEnvironment,
   requireHostAgentIdle,
   requireHostCodexLogin,
@@ -27,22 +28,35 @@ import {
 import {
   IMPLEMENTATION_ISSUE_MAX,
   IMPLEMENTATION_ISSUE_MIN,
+  PROTECTED_CANDIDATE_PATHS,
   issueSemanticFingerprint,
   pullRequestDisposition,
+  removeQueueAttempt,
+  replaceQueueAttempt,
+  selectFrontierBatch,
   selectNextFrontier,
   summarizeQueue,
+  upsertQueueAttempt,
   type PullRequestState,
   type QueueIssue,
+  type QueueSnapshot,
   type QueueStage,
   type QueueState,
 } from "./queue-core.mts";
+import {
+  advanceBaseAtomically,
+  verifyIntegratedCandidate,
+} from "./integration-verifier.mts";
 
 const REPOSITORY = "15253a/meta_research";
 const PARENT_SPEC_NUMBER = 112;
 const DEFAULT_BASE_REF = "develop_main";
 const DEFAULT_MODEL = "gpt-5.4";
 const DEFAULT_POLL_SECONDS = 60;
+const DEFAULT_MAX_AGENTS = 3;
 const DEFAULT_AGENT_WALL_CLOCK_SECONDS = 8 * 60 * 60;
+const FIXED_VERIFY_COMMAND = "bash .sandcastle/verify-ticket.sh";
+const INTEGRATION_VERIFY_WALL_CLOCK_SECONDS = 30 * 60;
 const MAX_TRANSIENT_FAILURES = 8;
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const queueDir = join(repoRoot, ".sandcastle", "queue");
@@ -50,7 +64,7 @@ const statePath = join(queueDir, "state.json");
 const liveStatusPath = join(repoRoot, ".sandcastle", "status.json");
 const receiptDir = join(repoRoot, ".sandcastle", "receipts");
 let activeState: QueueState | undefined;
-let codexModelPreflightPassedForCurrentTicket = false;
+let codexModelPreflightPassed = false;
 
 type Receipt = {
   status: "READY_FOR_MERGE" | "NEEDS_HUMAN";
@@ -153,19 +167,6 @@ const runStatus = (command: string, args: string[]): number =>
     cwd: repoRoot,
     stdio: "ignore",
   }).status ?? 1;
-
-const githubHttpStatus = (error: unknown): number | undefined => {
-  if (!error || typeof error !== "object") return undefined;
-  const candidate = error as { message?: unknown; stderr?: unknown };
-  const stderr = Buffer.isBuffer(candidate.stderr)
-    ? candidate.stderr.toString("utf8")
-    : typeof candidate.stderr === "string"
-      ? candidate.stderr
-      : "";
-  const text = `${typeof candidate.message === "string" ? candidate.message : ""}\n${stderr}`;
-  const match = text.match(/\bHTTP\s+(\d{3})\b/i);
-  return match ? Number(match[1]) : undefined;
-};
 
 const readRemoteRef = (ref: string): string | undefined => {
   const output = runHostRead("git", ["ls-remote", "--heads", "origin", ref]);
@@ -272,9 +273,9 @@ const releaseLease = (state: QueueState): void => {
   }
 };
 
-const verifyAcceptedCommit = (acceptedSha: string): void => {
+const verifyAcceptedCommit = (acceptedSha: string, attemptId: string): void => {
   try {
-    requireHostAgentIdle(repoRoot);
+    requireHostAgentIdle(repoRoot, attemptId);
   } catch (error) {
     throw new QueueFailure(
       error instanceof Error ? error.message : String(error),
@@ -321,7 +322,7 @@ const verifyAcceptedCommit = (acceptedSha: string): void => {
         boundedHostCommand(
           "bash .sandcastle/verify-ticket.sh",
           1800,
-          hostAgentRuntimeLockPath(repoRoot),
+          hostAgentRuntimeLockPath(repoRoot, attemptId),
         ),
       ],
       {
@@ -387,7 +388,9 @@ const { values } = parseArgs({
     retry: { type: "boolean" },
     resume: { type: "boolean" },
     model: { type: "string" },
+    issue: { type: "string" },
     "base-ref": { type: "string" },
+    "max-agents": { type: "string" },
     "poll-seconds": { type: "string" },
     "max-tickets": { type: "string" },
   },
@@ -424,6 +427,15 @@ const pollSeconds = Number(
     DEFAULT_POLL_SECONDS,
 );
 const maxTickets = Number(values["max-tickets"] ?? (once ? 1 : 20));
+const maxAgents = Number(
+  values["max-agents"] ??
+    process.env.SANDCASTLE_MAX_AGENTS ??
+    controllerEnvironment.SANDCASTLE_MAX_AGENTS ??
+    DEFAULT_MAX_AGENTS,
+);
+const requestedIssueNumber = values.issue === undefined
+  ? undefined
+  : Number(values.issue);
 const agentWallClockSeconds = Number(
   process.env.SANDCASTLE_AGENT_WALL_CLOCK_SECONDS ??
     controllerEnvironment.SANDCASTLE_AGENT_WALL_CLOCK_SECONDS ??
@@ -435,6 +447,16 @@ if (!Number.isInteger(pollSeconds) || pollSeconds < 5 || pollSeconds > 3600) {
 }
 if (!Number.isInteger(maxTickets) || maxTickets < 1 || maxTickets > 20) {
   throw new Error("--max-tickets must be an integer between 1 and 20.");
+}
+if (!Number.isInteger(maxAgents) || maxAgents < 1 || maxAgents > 3) {
+  throw new Error("--max-agents must be an integer between 1 and 3.");
+}
+if (
+  requestedIssueNumber !== undefined &&
+  (!/^\d+$/.test(values.issue ?? "") ||
+    !Number.isSafeInteger(requestedIssueNumber))
+) {
+  throw new Error("--issue must be an integer.");
 }
 if (
   !Number.isInteger(agentWallClockSeconds) ||
@@ -451,18 +473,18 @@ const ensureExecutionPrerequisites = (): void => {
   try {
     requireHostCodexEnvironment();
     requireHostCodexLogin(repoRoot);
-    requireHostAgentIdle(repoRoot);
+    requireAllHostAgentsIdle(repoRoot);
   } catch (error) {
     throw new QueueFailure(
       error instanceof Error ? error.message : String(error),
       true,
     );
   }
-  if (!codexModelPreflightPassedForCurrentTicket) {
+  if (!codexModelPreflightPassed) {
     // Online auth/model failures may be transient. Let the controller's
     // bounded retry policy distinguish them from local login-policy failures.
     requireHostCodexModelAccess(repoRoot, model);
-    codexModelPreflightPassedForCurrentTicket = true;
+    codexModelPreflightPassed = true;
   }
 };
 
@@ -551,17 +573,42 @@ const fetchImplementationIssues = (): QueueIssue[] => {
   return issues;
 };
 
-const readState = (): QueueState | undefined => {
-  if (!existsSync(statePath)) return undefined;
-  const state = JSON.parse(readFileSync(statePath, "utf8")) as QueueState;
-  if (state.version !== 1) throw new Error("Unsupported queue state version.");
-  return state;
+const emptyQueueSnapshot = (): QueueSnapshot => ({ version: 2, attempts: [] });
+
+const readQueueSnapshot = (): QueueSnapshot => {
+  if (!existsSync(statePath)) return emptyQueueSnapshot();
+  const parsed = JSON.parse(readFileSync(statePath, "utf8")) as
+    | QueueSnapshot
+    | QueueState;
+  const snapshot = parsed.version === 2
+    ? parsed
+    : parsed.version === 1
+      ? { version: 2 as const, attempts: [parsed] }
+      : undefined;
+  if (!snapshot) throw new Error("Unsupported queue state version.");
+  const attemptIds = new Set<string>();
+  const issueNumbers = new Set<number>();
+  for (const attempt of snapshot.attempts) {
+    if (attempt.version !== 1) {
+      throw new Error("Unsupported ticket attempt state version.");
+    }
+    if (attemptIds.has(attempt.attemptId) || issueNumbers.has(attempt.issueNumber)) {
+      throw new Error("Queue state contains duplicate attempt or issue ownership.");
+    }
+    attemptIds.add(attempt.attemptId);
+    issueNumbers.add(attempt.issueNumber);
+  }
+  return snapshot;
 };
 
-const writeState = (state: QueueState): void => {
+const writeQueueSnapshot = (snapshot: QueueSnapshot): void => {
   mkdirSync(queueDir, { recursive: true });
+  if (snapshot.attempts.length === 0) {
+    if (existsSync(statePath)) unlinkSync(statePath);
+    return;
+  }
   const temporaryPath = `${statePath}.tmp`;
-  writeFileSync(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, {
+  writeFileSync(temporaryPath, `${JSON.stringify(snapshot, null, 2)}\n`, {
     encoding: "utf8",
     mode: 0o600,
   });
@@ -569,14 +616,57 @@ const writeState = (state: QueueState): void => {
 };
 
 const persistState = (state: QueueState): QueueState => {
-  writeState(state);
+  const snapshot = readQueueSnapshot();
+  const conflicting = snapshot.attempts.find(
+    (attempt) =>
+      attempt.issueNumber === state.issueNumber &&
+      attempt.attemptId !== state.attemptId,
+  );
+  if (conflicting) {
+    throw new Error(
+      `Issue #${state.issueNumber} already belongs to attempt ${conflicting.attemptId}.`,
+    );
+  }
+  writeQueueSnapshot(upsertQueueAttempt(snapshot, state));
   activeState = state;
   return state;
 };
 
-const clearState = (): void => {
-  if (existsSync(statePath)) unlinkSync(statePath);
-  activeState = undefined;
+const clearState = (state: QueueState): void => {
+  writeQueueSnapshot(removeQueueAttempt(readQueueSnapshot(), state.attemptId));
+  const ticketStatusPath = join(
+    repoRoot,
+    ".sandcastle",
+    "status",
+    `issue-${state.issueNumber}.json`,
+  );
+  if (existsSync(ticketStatusPath)) unlinkSync(ticketStatusPath);
+  if (activeState?.attemptId === state.attemptId) activeState = undefined;
+};
+
+const replaceState = (
+  previous: QueueState,
+  replacement: QueueState,
+): QueueState => {
+  const snapshot = readQueueSnapshot();
+  const checkpoint = snapshot.attempts.find(
+    ({ attemptId }) => attemptId === previous.attemptId,
+  );
+  if (
+    !checkpoint ||
+    checkpoint.issueNumber !== previous.issueNumber ||
+    replacement.issueNumber !== previous.issueNumber ||
+    replacement.attemptId === previous.attemptId
+  ) {
+    throw new Error(
+      `Cannot atomically replace retry checkpoint ${previous.attemptId}.`,
+    );
+  }
+  writeQueueSnapshot(
+    replaceQueueAttempt(snapshot, previous.attemptId, replacement),
+  );
+  activeState = replacement;
+  return replacement;
 };
 
 const writeLiveStatus = (
@@ -609,6 +699,21 @@ const readLiveStatus = (): unknown => {
   } catch {
     return { phase: "UNKNOWN", error: "status.json is unreadable" };
   }
+};
+
+const readTicketStatuses = (): unknown[] => {
+  const statusDir = join(repoRoot, ".sandcastle", "status");
+  if (!existsSync(statusDir)) return [];
+  return readdirSync(statusDir)
+    .filter((name) => /^issue-\d+\.json$/.test(name))
+    .sort()
+    .flatMap((name) => {
+      try {
+        return [JSON.parse(readFileSync(join(statusDir, name), "utf8"))];
+      } catch {
+        return [];
+      }
+    });
 };
 
 const readReceipts = (): Array<{ path: string; receipt: Receipt }> => {
@@ -738,7 +843,7 @@ const findPullRequestForBranch = (
   );
 };
 
-const recoverOpenPullRequest = (): QueueState | undefined => {
+const recoverOpenPullRequests = (): QueueState[] => {
   const pullRequests = JSON.parse(
     runHostRead("gh", [
       "pr",
@@ -758,73 +863,67 @@ const recoverOpenPullRequest = (): QueueState | undefined => {
   const automationPullRequests = pullRequests.filter(({ headRefName }) =>
     /^codex\/issue-(?:11[3-9]|12\d|13[0-2])-/.test(headRefName),
   );
-  if (automationPullRequests.length > 1) {
-    throw new Error(
-      `Multiple open automation PRs target ${baseRef}: ` +
-        automationPullRequests.map(({ number }) => `#${number}`).join(", "),
-    );
-  }
-  const pullRequest = automationPullRequests[0];
-  if (!pullRequest) return undefined;
-  const recovered = findReceiptForBranch(pullRequest.headRefName);
-  if (
-    !recovered ||
-    recovered.receipt.status !== "READY_FOR_MERGE" ||
-    recovered.receipt.acceptance !== "PENDING" ||
-    recovered.receipt.baseRef !== baseRef ||
-    recovered.receipt.currentness?.issueUnchanged !== true ||
-    recovered.receipt.currentness.parentSpecUnchanged !== true ||
-    recovered.receipt.currentness.baseUnchanged !== true
-  ) {
-    throw new Error(
-      `PR #${pullRequest.number} has no matching READY_FOR_MERGE receipt.`,
-    );
-  }
-  const candidateSha = recovered.receipt.commits.at(-1)?.sha;
-  if (!candidateSha || pullRequest.headRefOid !== candidateSha) {
-    throw new Error(
-      `PR #${pullRequest.number} does not match its verified receipt commit.`,
-    );
-  }
-  const currentIssue = fetchIssue(recovered.receipt.issueNumber);
-  const currentParentSpec = fetchIssue(PARENT_SPEC_NUMBER);
-  if (
-    recovered.receipt.issueFingerprint !==
-      issueSemanticFingerprint(currentIssue) ||
-    recovered.receipt.parentSpecFingerprint !==
-      issueSemanticFingerprint(currentParentSpec)
-  ) {
-    throw new Error(
-      `PR #${pullRequest.number} requirements changed after implementation.`,
-    );
-  }
-  const leaseRef = leaseRefForIssue(recovered.receipt.issueNumber);
-  const leaseSha = readRemoteRef(leaseRef);
-  if (!leaseSha) {
-    throw new Error(
-      `PR #${pullRequest.number} has no active controller lease ${leaseRef}.`,
-    );
-  }
-  const recoveredState: QueueState = {
-    version: 1,
-    stage: "MERGING",
-    issueNumber: recovered.receipt.issueNumber,
-    issueTitle: currentIssue.title,
-    branch: recovered.receipt.branch,
-    baseRef: recovered.receipt.baseRef,
-    baseSha: recovered.receipt.baseSha,
-    candidateSha,
-    attemptId: recovered.receipt.attemptId,
-    receiptPath: recovered.path,
-    leaseRef,
-    leaseSha,
-    prNumber: pullRequest.number,
-    prUrl: pullRequest.url,
-    updatedAt: new Date().toISOString(),
-  };
-  requireLeaseOwned(recoveredState);
-  validateLeaseIdentity(recoveredState);
-  return recoveredState;
+  return automationPullRequests.map((pullRequest) => {
+    const recovered = findReceiptForBranch(pullRequest.headRefName);
+    if (
+      !recovered ||
+      recovered.receipt.status !== "READY_FOR_MERGE" ||
+      recovered.receipt.acceptance !== "PENDING" ||
+      recovered.receipt.baseRef !== baseRef ||
+      recovered.receipt.currentness?.issueUnchanged !== true ||
+      recovered.receipt.currentness.parentSpecUnchanged !== true ||
+      recovered.receipt.currentness.baseUnchanged !== true
+    ) {
+      throw new Error(
+        `PR #${pullRequest.number} has no matching READY_FOR_MERGE receipt.`,
+      );
+    }
+    const candidateSha = recovered.receipt.commits.at(-1)?.sha;
+    if (!candidateSha || pullRequest.headRefOid !== candidateSha) {
+      throw new Error(
+        `PR #${pullRequest.number} does not match its verified receipt commit.`,
+      );
+    }
+    const currentIssue = fetchIssue(recovered.receipt.issueNumber);
+    const currentParentSpec = fetchIssue(PARENT_SPEC_NUMBER);
+    if (
+      recovered.receipt.issueFingerprint !==
+        issueSemanticFingerprint(currentIssue) ||
+      recovered.receipt.parentSpecFingerprint !==
+        issueSemanticFingerprint(currentParentSpec)
+    ) {
+      throw new Error(
+        `PR #${pullRequest.number} requirements changed after implementation.`,
+      );
+    }
+    const leaseRef = leaseRefForIssue(recovered.receipt.issueNumber);
+    const leaseSha = readRemoteRef(leaseRef);
+    if (!leaseSha) {
+      throw new Error(
+        `PR #${pullRequest.number} has no active controller lease ${leaseRef}.`,
+      );
+    }
+    const recoveredState: QueueState = {
+      version: 1,
+      stage: "MERGING",
+      issueNumber: recovered.receipt.issueNumber,
+      issueTitle: currentIssue.title,
+      branch: recovered.receipt.branch,
+      baseRef: recovered.receipt.baseRef,
+      baseSha: recovered.receipt.baseSha,
+      candidateSha,
+      attemptId: recovered.receipt.attemptId,
+      receiptPath: recovered.path,
+      leaseRef,
+      leaseSha,
+      prNumber: pullRequest.number,
+      prUrl: pullRequest.url,
+      updatedAt: new Date().toISOString(),
+    };
+    requireLeaseOwned(recoveredState);
+    validateLeaseIdentity(recoveredState);
+    return recoveredState;
+  });
 };
 
 const remoteTrackingRef = `refs/remotes/origin/${baseRef}`;
@@ -865,21 +964,10 @@ const syncBase = (): { sha: string; changed: boolean } => {
   return { sha: runHost("git", ["rev-parse", "HEAD"]), changed };
 };
 
-const reexecAfterBaseChange = (changed: boolean): void => {
-  if (!changed) return;
-  console.log(`[RESTART] ${baseRef} advanced; reloading the committed controller.`);
-  const result = spawnSync(
-    join(repoRoot, "node_modules", ".bin", "tsx"),
-    [".sandcastle/auto.mts", ...process.argv.slice(2)],
-    { cwd: repoRoot, env: process.env, stdio: "inherit" },
-  );
-  if (result.error) throw result.error;
-  process.exit(result.status ?? 1);
-};
-
 const createAttemptState = (
   issue: QueueIssue,
   currentBaseSha: string,
+  slot: number,
 ): QueueState => {
   const attemptId = `${new Date()
     .toISOString()
@@ -903,6 +991,7 @@ const createAttemptState = (
     baseRef,
     baseSha: currentBaseSha,
     attemptId,
+    slot,
     receiptPath: join(
       receiptDir,
       `${attemptId}-issue-${issue.number}.json`,
@@ -962,10 +1051,11 @@ const claimIssue = (candidate: QueueIssue, viewer: string): QueueIssue => {
   return claimed;
 };
 
-const runTicket = (
+const runTicket = async (
   issue: QueueIssue,
   state: QueueState,
-): { path: string; receipt: Receipt } => {
+  cohortBranches: readonly string[],
+): Promise<{ path: string; receipt: Receipt }> => {
   if (existsSync(state.receiptPath)) {
     throw new QueueFailure(
       `Attempt receipt already exists: ${state.receiptPath}.`,
@@ -979,28 +1069,49 @@ const runTicket = (
     branch: state.branch,
     model,
   });
-  console.log(`[IMPLEMENT] Starting issue #${issue.number}: ${issue.title}`);
-  const result = spawnSync(
-    "setpriv",
-    [
-      "--pdeathsig",
-      "TERM",
-      join(repoRoot, "node_modules", ".bin", "tsx"),
-      ".sandcastle/main.mts",
-      "--issue",
-      String(issue.number),
-      "--base-ref",
-      baseRef,
-      "--model",
-      model,
-      "--attempt-id",
-      state.attemptId,
-      "--agent-wall-clock-seconds",
-      String(agentWallClockSeconds),
-    ],
-    { cwd: repoRoot, env: process.env, stdio: "inherit" },
+  if (state.slot === undefined || state.slot < 0 || state.slot >= maxAgents) {
+    throw new QueueFailure(
+      `Attempt ${state.attemptId} has no valid Agent slot.`,
+      false,
+    );
+  }
+  console.log(
+    `[IMPLEMENT slot ${state.slot + 1}/${maxAgents}] Starting issue #${issue.number}: ${issue.title}`,
   );
-  if (result.error) throw result.error;
+  const args = [
+    "--pdeathsig",
+    "TERM",
+    join(repoRoot, "node_modules", ".bin", "tsx"),
+    ".sandcastle/main.mts",
+    "--issue",
+    String(issue.number),
+    "--base-ref",
+    baseRef,
+    "--model",
+    model,
+    "--attempt-id",
+    state.attemptId,
+    "--slot",
+    String(state.slot),
+    "--agent-wall-clock-seconds",
+    String(agentWallClockSeconds),
+  ];
+  for (const branch of cohortBranches) {
+    args.push("--cohort-branch", branch);
+  }
+  const result = await new Promise<{ status: number | null; signal: NodeJS.Signals | null }>(
+    (resolvePromise, rejectPromise) => {
+      const child = spawn(
+    "setpriv",
+        args,
+        { cwd: repoRoot, env: process.env, stdio: "inherit" },
+      );
+      child.once("error", rejectPromise);
+      child.once("close", (status, signal) =>
+        resolvePromise({ status, signal }),
+      );
+    },
+  );
   let created: { path: string; receipt: Receipt } | undefined;
   if (existsSync(state.receiptPath)) {
     try {
@@ -1014,7 +1125,7 @@ const runTicket = (
   }
   if (!created) {
     throw new QueueFailure(
-      `Issue #${issue.number} exited with status ${result.status ?? "unknown"} without a receipt.`,
+      `Issue #${issue.number} exited with status ${result.status ?? result.signal ?? "unknown"} without a receipt.`,
       false,
     );
   }
@@ -1088,7 +1199,7 @@ const retryInterruptedImplementation = (state: QueueState): void => {
     );
   }
   try {
-    requireHostAgentIdle(repoRoot);
+    requireHostAgentIdle(repoRoot, state.attemptId);
   } catch (error) {
     throw new QueueFailure(
       error instanceof Error ? error.message : String(error),
@@ -1145,19 +1256,18 @@ const retryInterruptedImplementation = (state: QueueState): void => {
     );
   }
   if (leaseBeforeRetry) releaseLease(state);
-  clearState();
-  writeLiveStatus("RETRYING_IMPLEMENTATION", {
-    issueNumber: state.issueNumber,
-    issueTitle: state.issueTitle,
-    previousAttemptId: state.attemptId,
-    preservedBranch: state.branch,
-  });
 };
 
-const reconcileAttemptState = (
+type PreparedAttempt = {
+  state: QueueState;
+  issue: QueueIssue;
+  needsAgent: boolean;
+};
+
+const prepareAttemptState = (
   state: QueueState,
   viewer: string,
-): QueueState => {
+): PreparedAttempt => {
   if (
     state.stage === "CLAIMING" ||
     (state.stage === "IMPLEMENTING" && !existsSync(state.receiptPath))
@@ -1186,7 +1296,9 @@ const reconcileAttemptState = (
       updatedAt: new Date().toISOString(),
     });
   }
-  if (currentState.stage !== "IMPLEMENTING") return currentState;
+  if (currentState.stage !== "IMPLEMENTING") {
+    return { state: currentState, issue, needsAgent: false };
+  }
 
   if (existsSync(currentState.receiptPath)) {
     let recovered: { path: string; receipt: Receipt };
@@ -1209,7 +1321,8 @@ const reconcileAttemptState = (
         false,
       );
     }
-    return persistState(stateFromReceipt(currentState, recovered));
+    const recoveredState = persistState(stateFromReceipt(currentState, recovered));
+    return { state: recoveredState, issue, needsAgent: false };
   }
 
   const branchExists =
@@ -1226,15 +1339,16 @@ const reconcileAttemptState = (
     );
   }
 
-  ensureExecutionPrerequisites();
-  const result = runTicket(issue, currentState);
-  return persistState(stateFromReceipt(currentState, result));
+  return { state: currentState, issue, needsAgent: true };
 };
 
 const publishCandidate = (state: QueueState): QueueState => {
   requireCandidateState(state);
   requireLeaseOwned(state);
-  assertCandidateRequirementsCurrent(state);
+  // Parallel siblings may have advanced develop_main after this candidate was
+  // verified. Requirements stay frozen here; merge-lane integration verifies
+  // the exact candidate against the current base before any merge write.
+  assertCandidateRequirementsCurrent(state, false);
   writeLiveStatus("PUBLISHING", {
     issueNumber: state.issueNumber,
     issueTitle: state.issueTitle,
@@ -1348,32 +1462,55 @@ const acceptMergedPullRequest = (
   pullRequest: PullRequestState,
 ): ClosingState => {
   requireMergingState(state);
-  assertCandidateRequirementsCurrent(state);
+  assertCandidateRequirementsCurrent(state, false);
+  const integration = state.integrationVerification;
+  if (
+    !integration ||
+    integration.sourceBaseSha !== state.baseSha ||
+    integration.sourceCandidateSha !== state.candidateSha ||
+    integration.candidateSha !== state.candidateSha ||
+    !integration.mergeCommitSha
+  ) {
+    throw new QueueFailure(
+      `PR #${pullRequest.number} has no matching integration verification checkpoint.`,
+      false,
+    );
+  }
   if (
     pullRequest.baseRefName !== state.baseRef ||
-    pullRequest.headRefName !== state.branch
+    pullRequest.headRefName !== state.branch ||
+    pullRequest.headRefOid !== state.candidateSha
   ) {
     throw new Error(`PR #${pullRequest.number} no longer matches the queue state.`);
   }
-  const acceptedSha = pullRequest.mergeCommit?.oid;
-  if (!acceptedSha) throw new Error(`PR #${pullRequest.number} has no merge commit.`);
+  const acceptedSha = integration.mergeCommitSha;
+  if (pullRequest.mergeCommit?.oid !== acceptedSha) {
+    throw new QueueFailure(
+      `GitHub recorded ${pullRequest.mergeCommit?.oid ?? "no merge commit"} for PR #${pullRequest.number}, not verified ${acceptedSha}.`,
+      false,
+    );
+  }
   const mergeCommit = JSON.parse(
     runHostRead("gh", [
       "api",
       `repos/${REPOSITORY}/git/commits/${acceptedSha}`,
     ]),
-  ) as { parents?: Array<{ sha?: string }> };
+  ) as {
+    tree?: { sha?: string };
+    parents?: Array<{ sha?: string }>;
+  };
   if (
     mergeCommit.parents?.length !== 2 ||
-    mergeCommit.parents[0]?.sha !== state.baseSha ||
-    mergeCommit.parents[1]?.sha !== state.candidateSha
+    mergeCommit.parents[0]?.sha !== integration.baseSha ||
+    mergeCommit.parents[1]?.sha !== state.candidateSha ||
+    mergeCommit.tree?.sha !== integration.treeSha
   ) {
     throw new QueueFailure(
-      `PR #${pullRequest.number} merge commit parents do not match the frozen base and candidate.`,
+      `PR #${pullRequest.number} merge commit does not match the verified base, candidate, and integration tree.`,
       false,
     );
   }
-  reexecAfterBaseChange(syncBase().changed);
+  syncBase();
   if (runStatus("git", ["merge-base", "--is-ancestor", acceptedSha, "HEAD"]) !== 0) {
     throw new Error(
       `PR #${pullRequest.number} merge commit is not reachable from ${baseRef}.`,
@@ -1387,7 +1524,7 @@ const acceptMergedPullRequest = (
     prUrl: pullRequest.url,
     acceptedSha,
   });
-  verifyAcceptedCommit(acceptedSha);
+  verifyAcceptedCommit(acceptedSha, state.attemptId);
   assertCandidateRequirementsCurrent(state, false);
   const closing: ClosingState = {
     ...state,
@@ -1415,6 +1552,7 @@ const finalizeClosingState = (state: QueueState): void => {
     pullRequest.baseRefName !== state.baseRef ||
     pullRequest.headRefName !== state.branch ||
     pullRequest.headRefOid !== state.candidateSha ||
+    !pullRequest.mergedAt ||
     pullRequest.mergeCommit?.oid !== state.acceptedSha
   ) {
     throw new QueueFailure(
@@ -1422,7 +1560,7 @@ const finalizeClosingState = (state: QueueState): void => {
       false,
     );
   }
-  reexecAfterBaseChange(syncBase().changed);
+  syncBase();
   if (
     runStatus("git", [
       "merge-base",
@@ -1492,7 +1630,7 @@ const finalizeClosingState = (state: QueueState): void => {
     }
   }
   releaseLease(state);
-  clearState();
+  clearState(state);
   writeLiveStatus("ACCEPTED", {
     issueNumber: state.issueNumber,
     issueTitle: state.issueTitle,
@@ -1504,11 +1642,12 @@ const finalizeClosingState = (state: QueueState): void => {
   console.log(`[ACCEPTED] Issue #${state.issueNumber} merged and closed.`);
 };
 
-const mergePullRequest = (state: QueueState): void => {
-  requireMergingState(state);
+const mergePullRequest = (initialState: QueueState): void => {
+  requireMergingState(initialState);
+  let state: MergingState = initialState;
   requireLeaseOwned(state);
   validateLeaseIdentity(state);
-  assertCandidateRequirementsCurrent(state);
+  assertCandidateRequirementsCurrent(state, false);
 
   let pullRequest = fetchPullRequest(state.prNumber);
   const assertExactCandidate = (): void => {
@@ -1523,17 +1662,29 @@ const mergePullRequest = (state: QueueState): void => {
       );
     }
   };
-  const assertCleanMergeState = (): void => {
+  const assertMergeableAgainstVerifiedBase = (): void => {
+    const integration = state.integrationVerification;
+    if (!integration) {
+      throw new QueueFailure(
+        `PR #${pullRequest.number} has no integration verification checkpoint.`,
+        false,
+      );
+    }
     if (pullRequest.isDraft) {
       throw new QueueFailure(
         `PR #${pullRequest.number} is a draft and cannot be merged automatically.`,
         true,
       );
     }
-    if (pullRequest.baseRefOid !== state.baseSha) {
-      throw new QueueFailure(
-        `PR #${pullRequest.number} base moved from ${state.baseSha} to ${pullRequest.baseRefOid} before merge.`,
-        false,
+    if (pullRequest.baseRefOid !== integration.baseSha) {
+      throw new Error(
+        `${state.baseRef} moved from verified ${integration.baseSha} to ${pullRequest.baseRefOid}; integration will be reverified.`,
+      );
+    }
+    const remoteBaseSha = readRemoteRef(`refs/heads/${state.baseRef}`);
+    if (remoteBaseSha !== integration.baseSha) {
+      throw new Error(
+        `${state.baseRef} moved from verified ${integration.baseSha} to ${remoteBaseSha ?? "missing"}; integration will be reverified.`,
       );
     }
     if (
@@ -1544,12 +1695,12 @@ const mergePullRequest = (state: QueueState): void => {
         `GitHub has not computed mergeability for PR #${pullRequest.number} yet.`,
       );
     }
-    if (
-      pullRequest.mergeable !== "MERGEABLE" ||
-      pullRequest.mergeStateStatus !== "CLEAN"
-    ) {
+    const allowedState = ["CLEAN", "BEHIND"].includes(
+      pullRequest.mergeStateStatus,
+    );
+    if (pullRequest.mergeable !== "MERGEABLE" || !allowedState) {
       throw new QueueFailure(
-        `PR #${pullRequest.number} is not cleanly mergeable ` +
+        `PR #${pullRequest.number} is not eligible for verified automatic merge ` +
           `(mergeable=${pullRequest.mergeable}, state=${pullRequest.mergeStateStatus}).`,
         ["BLOCKED", "DRAFT", "HAS_HOOKS", "UNSTABLE"].includes(
           pullRequest.mergeStateStatus,
@@ -1557,8 +1708,8 @@ const mergePullRequest = (state: QueueState): void => {
       );
     }
   };
-  assertExactCandidate();
 
+  assertExactCandidate();
   let disposition = pullRequestDisposition(pullRequest);
   if (disposition === "ACCEPT") {
     const closing = acceptMergedPullRequest(state, pullRequest);
@@ -1571,7 +1722,101 @@ const mergePullRequest = (state: QueueState): void => {
       false,
     );
   }
-  assertCleanMergeState();
+
+  const remoteBaseBeforeIntegration = readRemoteRef(
+    `refs/heads/${state.baseRef}`,
+  );
+  const sourceIntegration = state.integrationVerification;
+  const sourceIntegrationIsCurrent =
+    sourceIntegration?.sourceBaseSha === state.baseSha &&
+    sourceIntegration.sourceCandidateSha === state.candidateSha &&
+    sourceIntegration.candidateSha === state.candidateSha;
+  if (
+    sourceIntegrationIsCurrent &&
+    remoteBaseBeforeIntegration === sourceIntegration.mergeCommitSha
+  ) {
+    throw new Error(
+      `Verified merge ${sourceIntegration.mergeCommitSha} is on ${state.baseRef}; waiting for GitHub to mark PR #${pullRequest.number} merged.`,
+    );
+  }
+  if (remoteBaseBeforeIntegration !== pullRequest.baseRefOid) {
+    throw new Error(
+      `${state.baseRef} moved while PR #${pullRequest.number} was being read; retrying from the new base.`,
+    );
+  }
+
+  const currentBaseSha = pullRequest.baseRefOid;
+  const existingIntegration = state.integrationVerification;
+  const integrationIsCurrent =
+    existingIntegration?.sourceBaseSha === state.baseSha &&
+    existingIntegration.sourceCandidateSha === state.candidateSha &&
+    existingIntegration.baseSha === currentBaseSha &&
+    existingIntegration.candidateSha === state.candidateSha &&
+    Boolean(existingIntegration.mergeCommitSha) &&
+    runStatus("git", [
+      "cat-file",
+      "-e",
+      `${existingIntegration.mergeCommitSha}^{commit}`,
+    ]) === 0;
+  if (!integrationIsCurrent) {
+    writeLiveStatus("INTEGRATION_VERIFY", {
+      issueNumber: state.issueNumber,
+      issueTitle: state.issueTitle,
+      branch: state.branch,
+      prNumber: state.prNumber,
+      sourceBaseSha: state.baseSha,
+      currentBaseSha,
+      candidateSha: state.candidateSha,
+      attemptId: state.attemptId,
+    });
+    console.log(
+      `[INTEGRATION_VERIFY] PR #${pullRequest.number} against ${currentBaseSha}.`,
+    );
+    let verified;
+    try {
+      verified = verifyIntegratedCandidate({
+        repoRoot,
+        baseSha: currentBaseSha,
+        candidateSha: state.candidateSha,
+        verifyCommand: FIXED_VERIFY_COMMAND,
+        runtimeLockPath: hostAgentRuntimeLockPath(repoRoot, state.attemptId),
+        wallClockSeconds: INTEGRATION_VERIFY_WALL_CLOCK_SECONDS,
+        protectedPaths: PROTECTED_CANDIDATE_PATHS,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new QueueFailure(
+        `Integration verification failed for PR #${pullRequest.number}: ${message}`,
+        message.includes("runtime lock is busy"),
+      );
+    }
+    state = persistState({
+      ...state,
+      integrationVerification: {
+        sourceBaseSha: state.baseSha,
+        sourceCandidateSha: state.candidateSha,
+        ...verified,
+      },
+      updatedAt: new Date().toISOString(),
+    }) as MergingState;
+  }
+
+  assertCandidateRequirementsCurrent(state, false);
+  pullRequest = fetchPullRequest(state.prNumber);
+  assertExactCandidate();
+  disposition = pullRequestDisposition(pullRequest);
+  if (disposition === "ACCEPT") {
+    const closing = acceptMergedPullRequest(state, pullRequest);
+    finalizeClosingState(closing);
+    return;
+  }
+  if (disposition === "STOP") {
+    throw new QueueFailure(
+      `PR #${pullRequest.number} was closed without merge after integration verification.`,
+      false,
+    );
+  }
+  assertMergeableAgainstVerifiedBase();
 
   writeLiveStatus("AUTO_MERGING", {
     issueNumber: state.issueNumber,
@@ -1580,25 +1825,40 @@ const mergePullRequest = (state: QueueState): void => {
     prNumber: state.prNumber,
     prUrl: state.prUrl,
     candidateSha: state.candidateSha,
+    integrationVerification: state.integrationVerification,
     attemptId: state.attemptId,
   });
   console.log(`[AUTO_MERGING] PR #${pullRequest.number}: ${pullRequest.url}`);
 
-  let mergeFailure: unknown;
-  try {
-    runHost("gh", [
-      "api",
-      "--method",
-      "PUT",
-      `repos/${REPOSITORY}/pulls/${pullRequest.number}/merge`,
-      "-f",
-      "merge_method=merge",
-      "-f",
-      `sha=${state.candidateSha}`,
-    ]);
-  } catch (error) {
-    mergeFailure = error;
+  const integration = state.integrationVerification!;
+  const preparedTreeSha = runHost("git", [
+    "rev-parse",
+    `${integration.mergeCommitSha}^{tree}`,
+  ]);
+  const preparedParents = runHost("git", [
+    "show",
+    "--format=%P",
+    "--no-patch",
+    integration.mergeCommitSha,
+  ]).split(" ");
+  if (
+    preparedTreeSha !== integration.treeSha ||
+    preparedParents.length !== 2 ||
+    preparedParents[0] !== integration.baseSha ||
+    preparedParents[1] !== state.candidateSha
+  ) {
+    throw new QueueFailure(
+      `Prepared merge ${integration.mergeCommitSha} no longer matches its verified tree and parents.`,
+      false,
+    );
   }
+
+  advanceBaseAtomically({
+    repoRoot,
+    baseRef: state.baseRef,
+    expectedBaseSha: integration.baseSha,
+    mergeCommitSha: integration.mergeCommitSha,
+  });
 
   pullRequest = fetchPullRequest(state.prNumber);
   assertExactCandidate();
@@ -1614,36 +1874,145 @@ const mergePullRequest = (state: QueueState): void => {
       false,
     );
   }
-  assertCleanMergeState();
-  if (mergeFailure) {
-    const httpStatus = githubHttpStatus(mergeFailure);
-    if (
-      httpStatus !== undefined &&
-      httpStatus >= 400 &&
-      httpStatus < 500 &&
-      httpStatus !== 408 &&
-      httpStatus !== 429
-    ) {
-      throw new QueueFailure(
-        `GitHub refused automatic merge for PR #${pullRequest.number} (HTTP ${httpStatus}).`,
-        true,
-      );
-    }
-    throw mergeFailure;
-  }
   throw new Error(
-    `PR #${pullRequest.number} remained open after GitHub accepted the merge command.`,
+    `Verified merge ${integration.mergeCommitSha} reached ${state.baseRef}; waiting for GitHub to mark PR #${pullRequest.number} merged.`,
   );
 };
 
+const sortAttempts = (attempts: readonly QueueState[]): QueueState[] =>
+  [...attempts].sort(
+    (left, right) =>
+      left.issueNumber - right.issueNumber ||
+      left.attemptId.localeCompare(right.attemptId),
+  );
+
+const reconcileRecoveredPullRequests = (
+  snapshot: QueueSnapshot,
+): QueueSnapshot => {
+  let next = snapshot;
+  for (const recovered of recoverOpenPullRequests()) {
+    const existing = next.attempts.find(
+      ({ issueNumber }) => issueNumber === recovered.issueNumber,
+    );
+    if (!existing) {
+      next = upsertQueueAttempt(next, recovered);
+      continue;
+    }
+    if (
+      existing.attemptId !== recovered.attemptId ||
+      (existing.candidateSha &&
+        existing.candidateSha !== recovered.candidateSha) ||
+      (existing.prNumber && existing.prNumber !== recovered.prNumber)
+    ) {
+      throw new QueueFailure(
+        `Open PR #${recovered.prNumber} conflicts with checkpoint for issue #${recovered.issueNumber}.`,
+        false,
+      );
+    }
+    if (existing.stage === "PUBLISHING" || existing.stage === "MERGING") {
+      next = upsertQueueAttempt(next, {
+        ...existing,
+        stage: "MERGING",
+        candidateSha: recovered.candidateSha,
+        prNumber: recovered.prNumber,
+        prUrl: recovered.prUrl,
+        updatedAt: new Date().toISOString(),
+      });
+      continue;
+    }
+    if (existing.stage !== "NEEDS_HUMAN") {
+      throw new QueueFailure(
+        `Open PR #${recovered.prNumber} conflicts with ${existing.stage} attempt ${existing.attemptId}.`,
+        false,
+      );
+    }
+  }
+  return next;
+};
+
+const plannedActionsForAttempt = (state: QueueState): string[] => {
+  if (state.stage !== "NEEDS_HUMAN") {
+    return [`resume-${state.stage.toLowerCase()}`];
+  }
+  if (state.resumeStage) {
+    return [
+      "fix-reported-condition",
+      `npm run sandcastle:auto -- --resume --issue ${state.issueNumber}`,
+    ];
+  }
+  if (state.failedStage === "IMPLEMENTING" && !state.prNumber) {
+    return [
+      "inspect-preserved-attempt",
+      `npm run sandcastle:auto -- --retry --issue ${state.issueNumber}`,
+    ];
+  }
+  return ["inspect-preserved-attempt"];
+};
+
+const recordAttemptFailure = (
+  fallbackState: QueueState,
+  error: unknown,
+  allowResume = error instanceof QueueFailure && error.resumable,
+): QueueState => {
+  const current =
+    readQueueSnapshot().attempts.find(
+      ({ attemptId }) => attemptId === fallbackState.attemptId,
+    ) ?? fallbackState;
+  if (current.stage === "NEEDS_HUMAN") return current;
+  const failedStage = current.stage as Exclude<QueueStage, "NEEDS_HUMAN">;
+  const message = error instanceof Error ? error.message : String(error);
+  return persistState({
+    ...current,
+    stage: "NEEDS_HUMAN",
+    failedStage,
+    resumeStage:
+      allowResume && failedStage !== "IMPLEMENTING" ? failedStage : undefined,
+    error: message,
+    updatedAt: new Date().toISOString(),
+  });
+};
+
+const selectRequestedFailure = (
+  snapshot: QueueSnapshot,
+): QueueState => {
+  const failures = sortAttempts(
+    snapshot.attempts.filter(({ stage }) => stage === "NEEDS_HUMAN"),
+  );
+  const selected = requestedIssueNumber === undefined
+    ? failures.length === 1
+      ? failures[0]
+      : undefined
+    : failures.find(({ issueNumber }) => issueNumber === requestedIssueNumber);
+  if (!selected) {
+    const qualifier = requestedIssueNumber === undefined
+      ? failures.length === 0
+        ? "There is no NEEDS_HUMAN checkpoint."
+        : "Multiple tickets need attention; pass --issue <number>."
+      : `Issue #${requestedIssueNumber} has no NEEDS_HUMAN checkpoint.`;
+    throw new QueueFailure(qualifier, false);
+  }
+  return selected;
+};
+
 const runController = async (): Promise<void> => {
-  let state = readState();
-  activeState = state;
+  activeState = undefined;
   const viewer = runHostRead("gh", ["api", "user", "--jq", ".login"]);
   if (statusOnly || dryRun) {
     do {
-      state = readState() ?? recoverOpenPullRequest();
+      const snapshot = reconcileRecoveredPullRequests(readQueueSnapshot());
       const issues = fetchImplementationIssues();
+      const running = snapshot.attempts.filter(({ stage }) =>
+        stage === "CLAIMING" || stage === "IMPLEMENTING",
+      ).length;
+      const hasRoundBarrier = snapshot.attempts.length > 0;
+      const frontier = hasRoundBarrier
+        ? []
+        : selectFrontierBatch({
+            issues,
+            viewer,
+            activeIssueNumbers: new Set(),
+            limit: maxAgents,
+          });
       console.log(
         JSON.stringify(
           {
@@ -1652,33 +2021,33 @@ const runController = async (): Promise<void> => {
             viewer,
             baseRef,
             model,
+            maxAgents,
+            capacity: {
+              limit: maxAgents,
+              running,
+              available: Math.max(0, maxAgents - running),
+              roundBarrier: hasRoundBarrier,
+            },
             queue: summarizeQueue(issues, viewer),
-            live: readLiveStatus(),
-            active: state,
-            plannedActions: state
-              ? state.stage === "NEEDS_HUMAN"
-                ? state.resumeStage
-                  ? [
-                      "fix-reported-condition",
-                      "npm run sandcastle:auto -- --resume",
-                    ]
-                  : state.failedStage === "IMPLEMENTING" && !state.prNumber
-                    ? [
-                        "inspect-preserved-attempt",
-                        "npm run sandcastle:auto -- --retry",
-                      ]
-                    : ["inspect-preserved-attempt"]
-                : [`resume-${state.stage.toLowerCase()}`]
-              : [
-                  "claim-next-frontier",
-                  "implement-with-$implement",
-                  "verify",
-                  "push",
-                  "open-pr",
-                  "auto-merge",
-                  "post-merge-verify",
-                  "close-issue",
-                ],
+            frontier: frontier.map(({ number, title }) => ({ number, title })),
+            live: {
+              controller: readLiveStatus(),
+              tickets: readTicketStatuses(),
+            },
+            active: sortAttempts(snapshot.attempts),
+            plannedActions:
+              snapshot.attempts.length > 0
+                ? sortAttempts(snapshot.attempts).map((state) => ({
+                    issueNumber: state.issueNumber,
+                    actions: plannedActionsForAttempt(state),
+                  }))
+                : [
+                    `claim-up-to-${maxAgents}-native-frontier-tickets`,
+                    "implement-each-with-$implement",
+                    "wait-for-round-barrier",
+                    "serial-integration-verify-and-auto-merge",
+                    "post-merge-verify-and-close",
+                  ],
           },
           null,
           2,
@@ -1690,97 +2059,256 @@ const runController = async (): Promise<void> => {
     return;
   }
 
-  state ??= recoverOpenPullRequest();
-  activeState = state;
-  reexecAfterBaseChange(syncBase().changed);
-  if (state && !existsSync(statePath)) state = persistState(state);
-  if (state && state.stage !== "NEEDS_HUMAN" && state.error) {
-    state = persistState({
-      ...state,
-      error: undefined,
-      updatedAt: new Date().toISOString(),
-    });
-  }
-  if (
-    state &&
-    state.stage !== "CLAIMING" &&
-    state.stage !== "IMPLEMENTING" &&
-    state.stage !== "CLOSING" &&
-    state.stage !== "NEEDS_HUMAN"
-  ) {
-    requireLeaseOwned(state);
-    validateLeaseIdentity(state);
+  if (requestedIssueNumber !== undefined && !retry && !resume) {
+    throw new QueueFailure("--issue is only used with --retry or --resume.", false);
   }
 
-  if ((retry || resume) && state?.stage !== "NEEDS_HUMAN") {
-    throw new QueueFailure(
-      `${retry ? "--retry" : "--resume"} requires an active NEEDS_HUMAN checkpoint.`,
-      false,
-    );
+  syncBase();
+  let snapshot = readQueueSnapshot();
+  const reconciled = reconcileRecoveredPullRequests(snapshot);
+  if (JSON.stringify(reconciled) !== JSON.stringify(snapshot)) {
+    writeQueueSnapshot(reconciled);
+  }
+  snapshot = readQueueSnapshot();
+  for (const state of snapshot.attempts) {
+    if (state.stage !== "NEEDS_HUMAN" && state.error) {
+      persistState({
+        ...state,
+        error: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+    }
   }
 
-  if (state?.stage === "NEEDS_HUMAN") {
+  if (retry || resume) {
+    const target = selectRequestedFailure(readQueueSnapshot());
+    activeState = target;
     if (retry) {
-      retryInterruptedImplementation(state);
-      state = undefined;
-    }
-  }
-
-  if (state?.stage === "NEEDS_HUMAN") {
-    if (!resume || !state.resumeStage) {
-      throw new QueueFailure(
-        state.error ??
-          `Attempt ${state.attemptId} needs human inspection before it can continue.`,
-        false,
+      const issue = fetchIssue(target.issueNumber);
+      if (!selectNextFrontier([issue], viewer)) {
+        throw new QueueFailure(
+          `Issue #${target.issueNumber} is no longer on the native frontier.`,
+          false,
+        );
+      }
+      ensureExecutionPrerequisites();
+      const occupiedSlots = new Set(
+        readQueueSnapshot().attempts
+          .filter(
+            ({ attemptId, stage }) =>
+              attemptId !== target.attemptId &&
+              (stage === "CLAIMING" || stage === "IMPLEMENTING"),
+          )
+          .map(({ slot }) => slot)
+          .filter((slot): slot is number => slot !== undefined),
       );
+      const retrySlot = Array.from({ length: maxAgents }, (_, slot) => slot)
+        .find((slot) => !occupiedSlots.has(slot));
+      if (retrySlot === undefined) {
+        throw new QueueFailure(
+          `No Agent slot is available to retry issue #${target.issueNumber}.`,
+          true,
+        );
+      }
+      const replacement = createAttemptState(
+        issue,
+        runHost("git", ["rev-parse", "HEAD"]),
+        retrySlot,
+      );
+      retryInterruptedImplementation(target);
+      replaceState(target, replacement);
+      writeLiveStatus("RETRYING_IMPLEMENTATION", {
+        issueNumber: target.issueNumber,
+        issueTitle: target.issueTitle,
+        previousAttemptId: target.attemptId,
+        attemptId: replacement.attemptId,
+        preservedBranch: target.branch,
+        branch: replacement.branch,
+        slot: replacement.slot,
+      });
+    } else {
+      if (!target.resumeStage) {
+        throw new QueueFailure(
+          `Issue #${target.issueNumber} has no resumable stage; inspect its preserved evidence.`,
+          false,
+        );
+      }
+      persistState({
+        ...target,
+        stage: target.resumeStage,
+        failedStage: undefined,
+        resumeStage: undefined,
+        error: undefined,
+        updatedAt: new Date().toISOString(),
+      });
     }
-    state = persistState({
-      ...state,
-      stage: state.resumeStage,
-      failedStage: undefined,
-      resumeStage: undefined,
-      error: undefined,
-      updatedAt: new Date().toISOString(),
-    });
   }
 
   let acceptedThisRun = 0;
   while (acceptedThisRun < maxTickets) {
-    if (state?.stage === "CLAIMING" || state?.stage === "IMPLEMENTING") {
-      state = reconcileAttemptState(state, viewer);
+    snapshot = readQueueSnapshot();
+    const workerStates = sortAttempts(
+      snapshot.attempts.filter(
+        ({ stage }) => stage === "CLAIMING" || stage === "IMPLEMENTING",
+      ),
+    );
+
+    if (workerStates.length > 0) {
+      if (workerStates.length > maxAgents) {
+        throw new QueueFailure(
+          `${workerStates.length} implementation attempts exceed --max-agents ${maxAgents}.`,
+          false,
+        );
+      }
+      activeState = undefined;
+      ensureExecutionPrerequisites();
+
+      const slottedStates = workerStates.map((state, slot) =>
+        state.slot === slot
+          ? state
+          : persistState({
+              ...state,
+              slot,
+              updatedAt: new Date().toISOString(),
+            }),
+      );
+      const prepared: PreparedAttempt[] = [];
+      for (const state of slottedStates) {
+        activeState = state;
+        try {
+          const attempt = prepareAttemptState(state, viewer);
+          if (attempt.needsAgent) prepared.push(attempt);
+        } catch (error) {
+          if (!(error instanceof QueueFailure)) throw error;
+          const failed = recordAttemptFailure(state, error);
+          console.error(
+            `[NEEDS_HUMAN #${failed.issueNumber}] ${failed.error ?? error.message}`,
+          );
+        }
+      }
+
+      if (prepared.length > 0) {
+        const cohortBranches = sortAttempts(readQueueSnapshot().attempts)
+          .map(({ branch }) => branch);
+        if (cohortBranches.length > 3) {
+          throw new QueueFailure(
+            `The active cohort has ${cohortBranches.length} branches; maximum is 3.`,
+            false,
+          );
+        }
+        writeLiveStatus("ROUND_IMPLEMENTING", {
+          maxAgents,
+          tickets: prepared.map(({ state, issue }) => ({
+            issueNumber: issue.number,
+            issueTitle: issue.title,
+            attemptId: state.attemptId,
+            branch: state.branch,
+            slot: state.slot,
+          })),
+        });
+        activeState = undefined;
+        const results = await Promise.allSettled(
+          prepared.map(({ issue, state }) =>
+            runTicket(issue, state, cohortBranches),
+          ),
+        );
+        for (const [index, result] of results.entries()) {
+          const state = prepared[index]!.state;
+          activeState = state;
+          if (result.status === "fulfilled") {
+            try {
+              persistState(stateFromReceipt(state, result.value));
+            } catch (error) {
+              const failed = recordAttemptFailure(state, error, false);
+              console.error(
+                `[NEEDS_HUMAN #${failed.issueNumber}] ${failed.error ?? String(error)}`,
+              );
+            }
+          } else {
+            const failed = recordAttemptFailure(state, result.reason, false);
+            console.error(
+              `[NEEDS_HUMAN #${failed.issueNumber}] ${failed.error ?? String(result.reason)}`,
+            );
+          }
+        }
+      }
+      activeState = undefined;
+      continue;
     }
-    if (state?.stage === "PUBLISHING") state = publishCandidate(state);
-    if (state?.stage === "CLOSING") {
-      finalizeClosingState(state);
-      acceptedThisRun += 1;
-      codexModelPreflightPassedForCurrentTicket = false;
-      state = undefined;
+
+    for (const state of sortAttempts(
+      snapshot.attempts.filter(({ stage }) => stage === "CLOSING"),
+    )) {
       if (acceptedThisRun >= maxTickets) break;
+      activeState = state;
+      try {
+        finalizeClosingState(state);
+        acceptedThisRun += 1;
+      } catch (error) {
+        if (!(error instanceof QueueFailure)) throw error;
+        recordAttemptFailure(state, error);
+      }
     }
-    if (state?.stage === "MERGING") {
-      mergePullRequest(state);
-      acceptedThisRun += 1;
-      codexModelPreflightPassedForCurrentTicket = false;
-      state = undefined;
+    if (acceptedThisRun >= maxTickets) break;
+
+    snapshot = readQueueSnapshot();
+    for (const state of sortAttempts(
+      snapshot.attempts.filter(({ stage }) => stage === "PUBLISHING"),
+    )) {
+      activeState = state;
+      try {
+        publishCandidate(state);
+      } catch (error) {
+        if (!(error instanceof QueueFailure)) throw error;
+        recordAttemptFailure(state, error);
+      }
+    }
+
+    snapshot = readQueueSnapshot();
+    for (const state of sortAttempts(
+      snapshot.attempts.filter(({ stage }) => stage === "MERGING"),
+    )) {
       if (acceptedThisRun >= maxTickets) break;
+      activeState = state;
+      try {
+        mergePullRequest(state);
+        acceptedThisRun += 1;
+      } catch (error) {
+        if (!(error instanceof QueueFailure)) throw error;
+        recordAttemptFailure(state, error);
+      }
     }
-    if (state?.stage === "NEEDS_HUMAN") {
+    if (acceptedThisRun >= maxTickets) break;
+
+    snapshot = readQueueSnapshot();
+    const failures = sortAttempts(
+      snapshot.attempts.filter(({ stage }) => stage === "NEEDS_HUMAN"),
+    );
+    if (failures.length > 0) {
+      activeState = failures[0];
       throw new QueueFailure(
-        state.error ?? `Attempt ${state.attemptId} needs human inspection.`,
+        failures[0]!.error ??
+          `Issue #${failures[0]!.issueNumber} needs human inspection.`,
         false,
       );
     }
-    if (state) continue;
+    if (snapshot.attempts.length > 0) continue;
 
     const issues = fetchImplementationIssues();
-    const candidate = selectNextFrontier(issues, viewer);
-    if (!candidate) {
+    const remaining = maxTickets - acceptedThisRun;
+    const frontier = selectFrontierBatch({
+      issues,
+      viewer,
+      activeIssueNumbers: new Set(),
+      limit: Math.min(maxAgents, remaining),
+    });
+    if (frontier.length === 0) {
       const summary = summarizeQueue(issues, viewer);
       if (summary.open === 0) {
-        writeLiveStatus("DONE", { queue: summary });
+        writeLiveStatus("DONE", { maxAgents, queue: summary });
         console.log("[DONE] All implementation tickets are closed.");
       } else {
-        writeLiveStatus("IDLE", { queue: summary });
+        writeLiveStatus("IDLE", { maxAgents, queue: summary });
         console.log(
           `[IDLE] No claimable native frontier. ` +
             `${summary.open} open; ${summary.assignedElsewhere} assigned elsewhere.`,
@@ -1789,10 +2317,14 @@ const runController = async (): Promise<void> => {
       break;
     }
 
+    activeState = undefined;
     ensureExecutionPrerequisites();
     const currentBaseSha = runHost("git", ["rev-parse", "HEAD"]);
-    state = persistState(createAttemptState(candidate, currentBaseSha));
+    for (const [slot, issue] of frontier.entries()) {
+      persistState(createAttemptState(issue, currentBaseSha, slot));
+    }
   }
+  activeState = undefined;
 };
 
 let transientFailures = 0;
