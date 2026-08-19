@@ -1,0 +1,29 @@
+{
+  "name": "meta-research-main",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "高度人机融合的科研管理平台",
+  "scripts": {
+    "sandcastle:prepare-image": "npm install --prefix .sandcastle/.image-codex --package-lock=false --ignore-scripts --save-exact --os=linux --cpu=x64 @openai/codex@0.148.0",
+    "sandcastle:build-image": "npm run sandcastle:prepare-image && sandcastle docker build-image --image-name meta-research-sandcastle:0.12.0",
+    "sandcastle:typecheck": "tsc -p tsconfig.json",
+    "sandcastle:dry-run": "tsx .sandcastle/main.mts --dry-run",
+    "sandcastle:ticket": "tsx .sandcastle/main.mts",
+    "test": "npm run sandcastle:typecheck"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github-meta-research:15253a/meta_research.git"
+  },
+  "keywords": [
+    "sandcastle",
+    "codex"
+  ],
+  "devDependencies": {
+    "@ai-hero/sandcastle": "0.12.0",
+    "@types/node": "26.2.0",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2"
+  }
+}
