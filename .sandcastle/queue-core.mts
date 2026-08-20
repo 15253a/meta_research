@@ -77,6 +77,31 @@ export type QueueSnapshot = {
   attempts: QueueState[];
 };
 
+/**
+ * A post-merge verification timeout cannot change the already accepted tree.
+ * It is safe to retry that exact verification after the host condition clears.
+ * This also recognizes checkpoints written before timeouts were resumable.
+ */
+export const resumeStageForAttempt = (
+  state: QueueState,
+): Exclude<QueueStage, "NEEDS_HUMAN"> | undefined => {
+  if (state.stage !== "NEEDS_HUMAN") return undefined;
+  if (state.resumeStage) return state.resumeStage;
+  if (
+    state.failedStage === "MERGING" &&
+    state.candidateSha &&
+    state.prNumber &&
+    state.prUrl &&
+    state.integrationVerification &&
+    /Post-merge verification failed.+verification exited with status 124/.test(
+      state.error ?? "",
+    )
+  ) {
+    return "MERGING";
+  }
+  return undefined;
+};
+
 export type PullRequestState = {
   number: number;
   url: string;

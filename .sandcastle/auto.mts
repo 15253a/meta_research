@@ -32,6 +32,7 @@ import {
   issueSemanticFingerprint,
   pullRequestDisposition,
   removeQueueAttempt,
+  resumeStageForAttempt,
   replaceQueueAttempt,
   selectFrontierBatch,
   selectNextFrontier,
@@ -345,9 +346,10 @@ const verifyAcceptedCommit = (acceptedSha: string, attemptId: string): void => {
     }
   } catch (error) {
     if (error instanceof QueueFailure) throw error;
+    const message = error instanceof Error ? error.message : String(error);
     throw new QueueFailure(
-      `Post-merge verification failed for ${acceptedSha}: ${error instanceof Error ? error.message : String(error)}`,
-      false,
+      `Post-merge verification failed for ${acceptedSha}: ${message}`,
+      /verification exited with status 124/.test(message),
     );
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
@@ -1934,7 +1936,7 @@ const plannedActionsForAttempt = (state: QueueState): string[] => {
   if (state.stage !== "NEEDS_HUMAN") {
     return [`resume-${state.stage.toLowerCase()}`];
   }
-  if (state.resumeStage) {
+  if (resumeStageForAttempt(state)) {
     return [
       "fix-reported-condition",
       `npm run sandcastle:auto -- --resume --issue ${state.issueNumber}`,
@@ -2127,7 +2129,8 @@ const runController = async (): Promise<void> => {
         slot: replacement.slot,
       });
     } else {
-      if (!target.resumeStage) {
+      const resumeStage = resumeStageForAttempt(target);
+      if (!resumeStage) {
         throw new QueueFailure(
           `Issue #${target.issueNumber} has no resumable stage; inspect its preserved evidence.`,
           false,
@@ -2135,7 +2138,7 @@ const runController = async (): Promise<void> => {
       }
       persistState({
         ...target,
-        stage: target.resumeStage,
+        stage: resumeStage,
         failedStage: undefined,
         resumeStage: undefined,
         error: undefined,

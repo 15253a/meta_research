@@ -5,6 +5,7 @@ import {
   pullRequestDisposition,
   PROTECTED_CANDIDATE_PATHS,
   removeQueueAttempt,
+  resumeStageForAttempt,
   replaceQueueAttempt,
   selectFrontierBatch,
   selectNextFrontier,
@@ -283,4 +284,33 @@ test("targeted retry atomically replaces one failure and preserves siblings", ()
     ],
   );
   assert.equal(snapshot.attempts[0]?.attemptId, "attempt-113");
+});
+
+test("a legacy post-merge timeout can resume only the merge checkpoint", () => {
+  const timedOut = queueState(113, "attempt-113", {
+    stage: "NEEDS_HUMAN",
+    candidateSha: "candidate",
+    prNumber: 134,
+    prUrl: "https://github.com/15253a/meta_research/pull/134",
+    failedStage: "MERGING",
+    integrationVerification: {
+      sourceBaseSha: "base",
+      sourceCandidateSha: "candidate",
+      baseSha: "base",
+      candidateSha: "candidate",
+      treeSha: "tree",
+      mergeCommitSha: "accepted",
+      verifiedAt: "2026-08-19T00:00:00Z",
+    },
+    error: "Post-merge verification failed for accepted: verification exited with status 124",
+  });
+
+  assert.equal(resumeStageForAttempt(timedOut), "MERGING");
+  assert.equal(
+    resumeStageForAttempt({
+      ...timedOut,
+      error: "Post-merge verification failed for accepted: verification exited with status 1",
+    }),
+    undefined,
+  );
 });
