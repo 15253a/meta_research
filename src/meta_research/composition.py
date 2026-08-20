@@ -31,6 +31,13 @@ from meta_research.owners.research_memory import (
 )
 from meta_research.paths import DataRoot
 from meta_research.projection import PublicProjection
+from meta_research.quest_drafting import (
+    CodexDraftingAdapter,
+    HostComputeProbe,
+    IntentDraftingProvider,
+    NvidiaSmiProbe,
+    ProposalDrafter,
+)
 
 
 @dataclass(frozen=True)
@@ -50,17 +57,54 @@ class ProductionRuntime:
     feed: DurableFeed
     projection: PublicProjection
     _database: Database
+    _provider_lifecycles: tuple[object, ...] = ()
+    _stop_requested: bool = False
+
+    def request_stop(self) -> None:
+        if self._stop_requested:
+            return
+        self._stop_requested = True
+        for lifecycle in self._provider_lifecycles:
+            request_stop = getattr(lifecycle, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
 
     def close(self) -> None:
-        self._database.close()
+        try:
+            self.request_stop()
+        finally:
+            self._database.close()
 
 
-def build_production_runtime(data_root: DataRoot) -> ProductionRuntime:
+def build_production_runtime(
+    data_root: DataRoot,
+    *,
+    proposal_drafter: ProposalDrafter | None = None,
+    intent_drafting_provider: IntentDraftingProvider | None = None,
+    host_compute_probe: HostComputeProbe | None = None,
+) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
     feed = DurableFeed(database)
     feed.ensure_initialized()
-    confirmation_verifier = create_bundle_confirmation_verifier(database)
+    codex_adapter = (
+        CodexDraftingAdapter(data_root.root / "drafting-provider")
+        if proposal_drafter is None or intent_drafting_provider is None
+        else None
+    )
+    proposal_drafter = proposal_drafter or codex_adapter
+    intent_drafting_provider = intent_drafting_provider or codex_adapter
+    assert proposal_drafter is not None
+    assert intent_drafting_provider is not None
+    host_compute_probe = host_compute_probe or NvidiaSmiProbe()
+    agent_runtime = create_agent_runtime_interface(
+        database,
+        feed,
+        host_compute_probe,
+    )
+    confirmation_verifier = create_bundle_confirmation_verifier(
+        database, agent_runtime
+    )
     research_memory_receipts = create_research_memory_receipt_verifier(
         database, data_root.objects
     )
@@ -92,13 +136,16 @@ def build_production_runtime(data_root: DataRoot) -> ProductionRuntime:
         research_graph=research_graph,
         advancement_engine=advancement_engine,
         research_memory=research_memory,
-        agent_runtime=create_agent_runtime_interface(database),
+        agent_runtime=agent_runtime,
         human_collaboration=create_human_collaboration_interface(
             database,
             feed,
             research_graph,
             research_memory,
             advancement_engine,
+            agent_runtime,
+            proposal_drafter,
+            intent_drafting_provider,
         ),
     )
     projection = PublicProjection(
@@ -110,6 +157,12 @@ def build_production_runtime(data_root: DataRoot) -> ProductionRuntime:
         owners.agent_runtime,
         owners.human_collaboration,
     )
+    provider_lifecycles: list[object] = []
+    for provider in (proposal_drafter, intent_drafting_provider):
+        if callable(getattr(provider, "request_stop", None)) and not any(
+            provider is lifecycle for lifecycle in provider_lifecycles
+        ):
+            provider_lifecycles.append(provider)
     return ProductionRuntime(
         data_root=data_root,
         owners=owners,
@@ -117,4 +170,5 @@ def build_production_runtime(data_root: DataRoot) -> ProductionRuntime:
         feed=feed,
         projection=projection,
         _database=database,
+        _provider_lifecycles=tuple(provider_lifecycles),
     )

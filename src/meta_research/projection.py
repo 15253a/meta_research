@@ -11,6 +11,16 @@ from meta_research.owners.research_graph import ResearchGraphInterface
 from meta_research.owners.research_memory import ResearchMemoryInterface
 
 
+_MAX_SNAPSHOT_ATTEMPTS = 3
+
+
+class SnapshotConsistencyUnavailable(RuntimeError):
+    """No exact public Snapshot cut could be assembled within the retry bound."""
+
+    def __init__(self) -> None:
+        super().__init__("snapshot_consistency_unavailable")
+
+
 class PublicProjection:
     """Rebuildable, read-only composition of the five Owner Snapshots."""
 
@@ -36,18 +46,32 @@ class PublicProjection:
         }
 
     def query_snapshot(self) -> dict[str, object]:
-        owner_snapshots = {
-            name: owner.query_snapshot() for name, owner in self._interfaces.items()
-        }
+        snapshot_consistent = False
+        for _attempt in range(_MAX_SNAPSHOT_ATTEMPTS):
+            feed_before = self._feed.query_readiness()
+            owner_snapshots = {
+                name: owner.query_snapshot()
+                for name, owner in self._interfaces.items()
+            }
+            current_quest_creation = (
+                self._human_collaboration.query_current_quest_creation()
+            )
+            feed_readiness = self._feed.query_readiness()
+            if feed_before.current_revision == feed_readiness.current_revision:
+                snapshot_consistent = True
+                break
+        if not snapshot_consistent:
+            raise SnapshotConsistencyUnavailable
         graph = owner_snapshots["research_graph"]
         advancement = owner_snapshots["advancement_engine"]
-        feed_readiness = self._feed.query_readiness()
         revision = feed_readiness.current_revision
 
         checks = [
             {
                 "name": "database",
-                "status": "ready" if feed_readiness.database_ready else "unavailable",
+                "status": (
+                    "ready" if feed_readiness.database_ready else "unavailable"
+                ),
             },
             {
                 "name": "object_store",
@@ -94,7 +118,7 @@ class PublicProjection:
             "quest_creation": {
                 "status": "ready",
                 "route": "direct",
-                "current": self._human_collaboration.query_current_quest_creation(),
+                "current": current_quest_creation,
                 "accepted_material_basis": {
                     "status": "capability_unavailable",
                     "reason": {

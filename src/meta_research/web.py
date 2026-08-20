@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hmac
 import json
 import logging
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Callable, Literal
 from urllib.parse import parse_qs, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
@@ -19,6 +19,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from meta_research.auth import AuthSession
 from meta_research.composition import ProductionRuntime
 from meta_research.owners.common import OwnerConflict
+from meta_research.projection import SnapshotConsistencyUnavailable
+from meta_research.quest_drafting import (
+    INTENT_MESSAGE_MAX_LENGTH,
+    QUESTION_FIELD_MAX_LENGTHS,
+)
 
 
 SESSION_COOKIE = "meta_research_session"
@@ -33,51 +38,128 @@ class ReconciliationHealth:
     retry_count: int = 0
 
 
+@dataclass
+class WorkerHealthUpdates:
+    _revision: int = 0
+    _changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def publish(self) -> None:
+        self._revision += 1
+        self._changed.set()
+
+    async def wait_after(self, revision: int, timeout: float) -> int | None:
+        while self._revision <= revision:
+            self._changed.clear()
+            if self._revision > revision:
+                break
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=timeout)
+            except TimeoutError:
+                return None
+        return self._revision
+
+
 class BootstrapExchange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     token: str = Field(min_length=20, max_length=256)
 
 
-class QuestDraftRequest(BaseModel):
+class OpenQuestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    goal: str = Field(min_length=1, max_length=4000)
-    completion_criteria: str = Field(min_length=1, max_length=4000)
-    key_configuration: str = Field(min_length=1, max_length=4000)
-    literature_scope: Literal[
-        "comprehensive", "open_access", "provided_materials"
-    ]
-    initial_question_direction: str = Field(min_length=1, max_length=4000)
-    material_receipts: list[str] = Field(default_factory=list, max_length=100)
+
+class LiteratureConfigurationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["oa_then_institution", "oa_only", "provided_only"] = (
+        "oa_then_institution"
+    )
+    library_entry_url: str = Field(default="", max_length=4000)
+    scope_exclusions: str = Field(default="", max_length=8000)
+    accepted_material_bindings: list[dict[str, object]] = Field(
+        default_factory=list, max_length=100
+    )
 
 
-class ReviseQuestDraftRequest(QuestDraftRequest):
+class QuestDraftV2Request(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    goal: str = Field(max_length=4000)
+    completion_criteria: str = Field(max_length=4000)
+    time_budget: Literal["7d", "30d", "90d", "open"] = "open"
+    route: Literal["direct", "deepfetch"] = "direct"
+    resource_envelope_ref: str | None = Field(default=None, max_length=64)
+    resource_envelope_hash: str | None = Field(default=None, max_length=64)
+    literature: LiteratureConfigurationRequest = Field(
+        default_factory=LiteratureConfigurationRequest
+    )
+    background_and_initial_direction: str = Field(default="", max_length=12000)
+
+
+class ReviseQuestDraftV2Request(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_draft_revision: int = Field(ge=1)
     expected_draft_hash: str = Field(min_length=64, max_length=64)
+    draft: QuestDraftV2Request
 
 
 class GenerateProposalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_draft_revision: int = Field(ge=1)
     expected_draft_hash: str = Field(min_length=64, max_length=64)
 
 
 class QuestionContentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    title: str = Field(max_length=500)
-    unknown_statement: str = Field(max_length=8000)
-    answer_shape: str = Field(max_length=8000)
-    applicability_scope: str = Field(max_length=8000)
-    background_context: str = Field(max_length=12000)
-    requirements_constraints: str = Field(max_length=12000)
+    title: str = Field(max_length=QUESTION_FIELD_MAX_LENGTHS["title"])
+    unknown_statement: str = Field(
+        max_length=QUESTION_FIELD_MAX_LENGTHS["unknown_statement"]
+    )
+    answer_shape: str = Field(
+        max_length=QUESTION_FIELD_MAX_LENGTHS["answer_shape"]
+    )
+    applicability_scope: str = Field(
+        max_length=QUESTION_FIELD_MAX_LENGTHS["applicability_scope"]
+    )
+    background_context: str = Field(
+        max_length=QUESTION_FIELD_MAX_LENGTHS["background_context"]
+    )
+    requirements_constraints: str = Field(
+        max_length=QUESTION_FIELD_MAX_LENGTHS["requirements_constraints"]
+    )
 
 
 class SaveProposalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_draft_revision: int = Field(ge=1)
     expected_draft_hash: str = Field(min_length=64, max_length=64)
+    expected_proposal_ref: str = Field(min_length=1, max_length=64)
+    expected_proposal_hash: str = Field(min_length=64, max_length=64)
+    explicit_review: bool = False
     content: QuestionContentRequest
+
+
+class ComputeProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selected_device_uuids: list[str] = Field(default_factory=list, max_length=32)
+
+
+class IntentMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_draft_revision: int = Field(ge=1)
+    expected_draft_hash: str = Field(min_length=64, max_length=64)
+    message: str = Field(min_length=1, max_length=INTENT_MESSAGE_MAX_LENGTH)
 
 
 class ConfirmationPreviewRequest(BaseModel):
@@ -103,16 +185,102 @@ class ConfirmQuestRequest(BaseModel):
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
+    reconciliation_task: asyncio.Task[None] | None = None
+    drafting_task: asyncio.Task[None] | None = None
+    reconciliation_health = ReconciliationHealth()
+    drafting_health = ReconciliationHealth()
+    worker_health_updates = WorkerHealthUpdates()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        nonlocal reconciliation_task, drafting_task
+        reconciliation_task = asyncio.create_task(
+            _reconcile_quest_initializations(
+                runtime,
+                reconciliation_health,
+                worker_health_updates.publish,
+            )
+        )
+        reconciliation_task.add_done_callback(_log_reconciliation_exit)
+        drafting_task = asyncio.create_task(
+            _process_quest_drafting(
+                runtime,
+                drafting_health,
+                worker_health_updates.publish,
+            )
+        )
+        drafting_task.add_done_callback(_log_reconciliation_exit)
+        try:
+            yield
+        finally:
+            tasks = tuple(
+                task
+                for task in (reconciliation_task, drafting_task)
+                if task is not None
+            )
+            try:
+                await asyncio.to_thread(runtime.request_stop)
+            except Exception:
+                LOGGER.exception("provider shutdown request failed")
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True), timeout=2.0
+                    )
+                except TimeoutError:
+                    LOGGER.error("quest workers did not stop within 2 seconds")
+
     app = FastAPI(
         title="Meta-research vNext",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     web_root = Path(str(files("meta_research") / "web_dist")).resolve()
     expected_host = urlsplit(base_url).netloc
-    reconciliation_task: asyncio.Task[None] | None = None
-    reconciliation_health = ReconciliationHealth()
+
+    def worker_check(
+        name: str,
+        task: asyncio.Task[None] | None,
+        health: ReconciliationHealth,
+    ) -> dict[str, object]:
+        running = task is not None and not task.done()
+        if running and health.status == "ready":
+            return {"name": name, "status": "ready"}
+        reason_code = health.last_error or (
+            "worker_not_started" if task is None else "worker_exited"
+        )
+        return {
+            "name": name,
+            "status": "unavailable",
+            "reason": {"code": reason_code},
+        }
+
+    def public_snapshot() -> dict[str, object]:
+        snapshot = runtime.projection.query_snapshot()
+        readiness = snapshot["readiness"]
+        checks = [
+            *readiness["checks"],
+            worker_check(
+                "quest_reconciliation_worker",
+                reconciliation_task,
+                reconciliation_health,
+            ),
+            worker_check("quest_drafting_worker", drafting_task, drafting_health),
+        ]
+        snapshot["readiness"] = {
+            "status": (
+                "ready"
+                if readiness["status"] == "ready"
+                and all(check["status"] == "ready" for check in checks)
+                else "unavailable"
+            ),
+            "checks": checks,
+        }
+        return snapshot
 
     @app.middleware("http")
     async def protect_every_request(request: Request, call_next):
@@ -131,7 +299,9 @@ def create_app(
                 return _error(401, "control_authentication_required")
         elif not public_auth_route:
             session_token = request.cookies.get(SESSION_COOKIE)
-            if not runtime.authentication.session_is_valid(session_token):
+            if not await asyncio.to_thread(
+                runtime.authentication.session_is_valid, session_token
+            ):
                 return _error(401, "authentication_required")
             request.state.session_token = session_token
 
@@ -158,8 +328,10 @@ def create_app(
                 csrf_header is None
                 or csrf_cookie is None
                 or not hmac.compare_digest(csrf_header, csrf_cookie)
-                or not runtime.authentication.csrf_matches(
-                    request.state.session_token, csrf_header
+                or not await asyncio.to_thread(
+                    runtime.authentication.csrf_matches,
+                    request.state.session_token,
+                    csrf_header,
                 )
             ):
                 return _error(403, "csrf_invalid")
@@ -187,32 +359,30 @@ def create_app(
             detail["status"] = "capability_unavailable"
         return JSONResponse(status_code=status_code, content={"detail": detail})
 
-    @app.on_event("startup")
-    async def start_quest_reconciliation() -> None:
-        nonlocal reconciliation_task
-        reconciliation_task = asyncio.create_task(
-            _reconcile_quest_initializations(runtime, reconciliation_health)
+    @app.exception_handler(SnapshotConsistencyUnavailable)
+    async def snapshot_consistency_unavailable(
+        _request: Request, _error: SnapshotConsistencyUnavailable
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": "snapshot_consistency_unavailable",
+                    "status": "capability_unavailable",
+                }
+            },
         )
-        reconciliation_task.add_done_callback(_log_reconciliation_exit)
-
-    @app.on_event("shutdown")
-    async def stop_quest_reconciliation() -> None:
-        if reconciliation_task is None:
-            return
-        reconciliation_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await reconciliation_task
 
     @app.post("/internal/bootstrap-token")
-    async def issue_bootstrap_token() -> dict[str, str]:
+    def issue_bootstrap_token() -> dict[str, str]:
         return {"bootstrap_token": runtime.authentication.issue_bootstrap_token()}
 
     @app.post("/internal/browser-grant")
-    async def issue_browser_grant() -> dict[str, str]:
+    def issue_browser_grant() -> dict[str, str]:
         return {"browser_grant": runtime.authentication.issue_browser_grant()}
 
     @app.post("/internal/browser-grant-status")
-    async def browser_grant_status(exchange: BootstrapExchange) -> dict[str, bool]:
+    def browser_grant_status(exchange: BootstrapExchange) -> dict[str, bool]:
         return {
             "consumed": runtime.authentication.browser_grant_was_consumed(
                 exchange.token
@@ -220,26 +390,31 @@ def create_app(
         }
 
     @app.get("/internal/readiness")
-    async def internal_readiness() -> dict[str, object]:
-        snapshot = runtime.projection.query_snapshot()
-        worker_ready = (
-            reconciliation_health.status == "ready"
-            and reconciliation_task is not None
-            and not reconciliation_task.done()
+    def internal_readiness() -> dict[str, object]:
+        snapshot = public_snapshot()
+        reconciliation = worker_check(
+            "quest_reconciliation_worker",
+            reconciliation_task,
+            reconciliation_health,
+        )
+        drafting = worker_check(
+            "quest_drafting_worker", drafting_task, drafting_health
         )
         return {
-            "status": (
-                snapshot["readiness"]["status"] if worker_ready else "unavailable"
-            ),
+            "status": snapshot["readiness"]["status"],
             "revision": snapshot["revision"],
             "reconciliation": {
-                "status": "ready" if worker_ready else "unavailable",
+                "status": reconciliation["status"],
                 "last_error": reconciliation_health.last_error,
+            },
+            "drafting": {
+                "status": drafting["status"],
+                "last_error": drafting_health.last_error,
             },
         }
 
     @app.post("/auth/bootstrap")
-    async def exchange_bootstrap(exchange: BootstrapExchange) -> JSONResponse:
+    def exchange_bootstrap(exchange: BootstrapExchange) -> JSONResponse:
         session = runtime.authentication.exchange_bootstrap_token(exchange.token)
         if session is None:
             raise HTTPException(
@@ -276,7 +451,9 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail={"code": "grant_invalid"}
             ) from error
-        session = runtime.authentication.exchange_browser_grant(grant)
+        session = await asyncio.to_thread(
+            runtime.authentication.exchange_browser_grant, grant
+        )
         if session is None:
             raise HTTPException(
                 status_code=401,
@@ -287,7 +464,7 @@ def create_app(
         return response
 
     @app.post("/auth/logout")
-    async def logout(request: Request) -> JSONResponse:
+    def logout(request: Request) -> JSONResponse:
         csrf_token = request.headers.get("x-csrf-token", "")
         session_token = request.state.session_token
         if not runtime.authentication.revoke_session(session_token, csrf_token):
@@ -298,36 +475,37 @@ def create_app(
         return response
 
     @app.get("/api/v1/session")
-    async def session_status() -> dict[str, str]:
+    def session_status() -> dict[str, str]:
         return {"status": "authenticated"}
 
     @app.post("/api/v1/quest-initializations", status_code=201)
-    async def create_quest_initialization(
-        request: Request, draft: QuestDraftRequest
+    def create_quest_initialization(
+        request: Request,
+        draft: OpenQuestRequest,
     ) -> dict[str, object]:
         return runtime.owners.human_collaboration.create_quest(
             draft.model_dump(), _idempotency_key(request)
         )
 
     @app.put("/api/v1/quest-initializations/{initialization_id}/draft")
-    async def revise_quest_initialization(
+    def revise_quest_initialization(
         initialization_id: str,
         request: Request,
-        draft: ReviseQuestDraftRequest,
+        draft: ReviseQuestDraftV2Request,
     ) -> dict[str, object]:
-        value = draft.model_dump(exclude={"expected_draft_hash"})
         return runtime.owners.human_collaboration.revise_quest_draft(
             initialization_id,
-            value,
+            draft.draft.model_dump(),
             draft.expected_draft_hash,
             _idempotency_key(request),
+            draft.expected_draft_revision,
         )
 
     @app.post(
         "/api/v1/quest-initializations/{initialization_id}/proposal",
-        status_code=201,
+        status_code=202,
     )
-    async def generate_question_proposal(
+    def generate_question_proposal(
         initialization_id: str,
         request: Request,
         generation: GenerateProposalRequest,
@@ -336,10 +514,27 @@ def create_app(
             initialization_id,
             generation.expected_draft_hash,
             _idempotency_key(request),
+            generation.expected_draft_revision,
+        )
+
+    @app.post(
+        "/api/v1/quest-initializations/{initialization_id}/proposal-generations",
+        status_code=202,
+    )
+    def enqueue_question_proposal(
+        initialization_id: str,
+        request: Request,
+        generation: GenerateProposalRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.generate_question_proposal(
+            initialization_id,
+            generation.expected_draft_hash,
+            _idempotency_key(request),
+            generation.expected_draft_revision,
         )
 
     @app.put("/api/v1/quest-initializations/{initialization_id}/proposal")
-    async def save_question_proposal(
+    def save_question_proposal(
         initialization_id: str,
         request: Request,
         proposal: SaveProposalRequest,
@@ -349,13 +544,48 @@ def create_app(
             proposal.expected_draft_hash,
             proposal.content.model_dump(),
             _idempotency_key(request),
+            proposal.expected_draft_revision,
+            proposal.expected_proposal_ref,
+            proposal.expected_proposal_hash,
+            proposal.explicit_review,
+        )
+
+    @app.post(
+        "/api/v1/quest-initializations/{initialization_id}/compute-probe"
+    )
+    def observe_host_compute(
+        initialization_id: str,
+        request: Request,
+        selection: ComputeProbeRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.observe_host_compute(
+            initialization_id,
+            selection.selected_device_uuids,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/quest-initializations/{initialization_id}/intent-session/messages",
+        status_code=202,
+    )
+    def send_intent_message(
+        initialization_id: str,
+        request: Request,
+        message: IntentMessageRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.send_intent_message(
+            initialization_id,
+            expected_draft_revision=message.expected_draft_revision,
+            expected_draft_hash=message.expected_draft_hash,
+            message=message.message,
+            idempotency_key=_idempotency_key(request),
         )
 
     @app.post(
         "/api/v1/quest-initializations/{initialization_id}/confirmation-preview",
         status_code=201,
     )
-    async def preview_quest_confirmation(
+    def preview_quest_confirmation(
         initialization_id: str,
         request: Request,
         preview: ConfirmationPreviewRequest,
@@ -373,7 +603,7 @@ def create_app(
         "/api/v1/quest-initializations/{initialization_id}/confirmation",
         status_code=202,
     )
-    async def confirm_quest_initialization(
+    def confirm_quest_initialization(
         initialization_id: str,
         request: Request,
         confirmation: ConfirmQuestRequest,
@@ -390,24 +620,37 @@ def create_app(
         )
 
     @app.post("/api/v1/quest-initializations/{initialization_id}/cancel")
-    async def cancel_quest_initialization(
+    def cancel_quest_initialization(
         initialization_id: str, request: Request
     ) -> dict[str, object]:
         return runtime.owners.human_collaboration.cancel_quest(
             initialization_id, _idempotency_key(request)
         )
 
+    @app.get("/api/v1/quest-initializations/current")
+    def query_current_quest_initialization() -> dict[str, object] | None:
+        return runtime.owners.human_collaboration.query_current_quest_creation()
+
     @app.get("/api/v1/quest-initializations/{initialization_id}")
-    async def query_quest_initialization(
+    def query_quest_initialization(
         initialization_id: str,
     ) -> dict[str, object]:
         return runtime.owners.human_collaboration.query_quest_creation(
             initialization_id
         )
 
+    @app.get(
+        "/api/v1/quest-initializations/{initialization_id}/intent-session"
+    )
+    def query_intent_session(initialization_id: str) -> dict[str, object]:
+        view = runtime.owners.human_collaboration.query_quest_creation(
+            initialization_id
+        )
+        return {"intent_session": view["intent_session"]}
+
     @app.get("/api/v1/snapshot")
-    async def query_snapshot() -> dict[str, object]:
-        return runtime.projection.query_snapshot()
+    def query_snapshot() -> dict[str, object]:
+        return public_snapshot()
 
     @app.get("/api/v1/events")
     async def stream_events(request: Request) -> StreamingResponse:
@@ -425,7 +668,12 @@ def create_app(
                 status_code=400, detail={"code": "last_event_id_invalid"}
             ) from error
         return StreamingResponse(
-            _event_stream(runtime, request, last_revision),
+            _event_stream(
+                runtime,
+                request,
+                last_revision,
+                worker_health_updates,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-store",
@@ -435,7 +683,7 @@ def create_app(
         )
 
     @app.get("/")
-    async def web_shell() -> FileResponse:
+    def web_shell() -> FileResponse:
         index = web_root / "index.html"
         if not index.is_file():
             raise HTTPException(
@@ -444,7 +692,7 @@ def create_app(
         return FileResponse(index)
 
     @app.get("/assets/{asset_path:path}")
-    async def web_asset(asset_path: str) -> FileResponse:
+    def web_asset(asset_path: str) -> FileResponse:
         asset_root = (web_root / "assets").resolve()
         candidate = (asset_root / asset_path).resolve()
         if not candidate.is_relative_to(asset_root) or not candidate.is_file():
@@ -455,12 +703,37 @@ def create_app(
 
 
 async def _event_stream(
-    runtime: ProductionRuntime, request: Request, last_revision: int
+    runtime: ProductionRuntime,
+    request: Request,
+    last_revision: int,
+    worker_health_updates: WorkerHealthUpdates | None = None,
 ) -> AsyncIterator[str]:
     cursor = last_revision
     first_page = True
+    health_revision = (
+        worker_health_updates.revision if worker_health_updates is not None else 0
+    )
+    if worker_health_updates is not None and health_revision > 0:
+        if not await _sse_session_is_valid(runtime, request):
+            return
+        payload = json.dumps(
+            {
+                "reason": "worker_health_changed",
+                "snapshot_url": "/api/v1/snapshot",
+                "snapshot_revision": last_revision,
+            },
+            separators=(",", ":"),
+        )
+        yield (
+            "event: snapshot.required\n"
+            f"data: {payload}\n\n"
+        )
     while True:
-        page = runtime.feed.read_after(cursor)
+        if not await _sse_session_is_valid(runtime, request):
+            return
+        page = await asyncio.to_thread(runtime.feed.read_after, cursor)
+        if not await _sse_session_is_valid(runtime, request):
+            return
         if page.revision_gap:
             payload = json.dumps(
                 {
@@ -477,21 +750,67 @@ async def _event_stream(
             )
             return
         for event in page.events:
-            cursor = event.revision
+            if not await _sse_session_is_valid(runtime, request):
+                return
             payload = json.dumps(event.payload, separators=(",", ":"))
             yield (
-                f"id: {event.revision}\n"
                 f"event: {event.event_type}\n"
                 f"data: {payload}\n\n"
             )
+            if not await _sse_session_is_valid(runtime, request):
+                return
+            projection_payload = json.dumps(
+                {"revision": event.revision, "event_type": event.event_type},
+                separators=(",", ":"),
+            )
+            yield (
+                f"id: {event.revision}\n"
+                "event: projection.updated\n"
+                f"data: {projection_payload}\n\n"
+            )
+            cursor = event.revision
         if first_page and page.events:
             first_page = False
             continue
         first_page = False
         if await request.is_disconnected():
             return
-        yield ": keep-alive\n\n"
-        await asyncio.sleep(1)
+        if not await _sse_session_is_valid(runtime, request):
+            return
+        if worker_health_updates is None:
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(1)
+            continue
+        next_health_revision = await worker_health_updates.wait_after(
+            health_revision, timeout=1.0
+        )
+        if not await _sse_session_is_valid(runtime, request):
+            return
+        if next_health_revision is None:
+            yield ": keep-alive\n\n"
+            continue
+        health_revision = next_health_revision
+        payload = json.dumps(
+            {
+                "reason": "worker_health_changed",
+                "snapshot_url": "/api/v1/snapshot",
+                "snapshot_revision": page.current_revision,
+            },
+            separators=(",", ":"),
+        )
+        yield (
+            "event: snapshot.required\n"
+            f"data: {payload}\n\n"
+        )
+
+
+async def _sse_session_is_valid(
+    runtime: ProductionRuntime, request: Request
+) -> bool:
+    session_token = getattr(request.state, "session_token", None)
+    return await asyncio.to_thread(
+        runtime.authentication.session_is_valid, session_token
+    )
 
 
 def _set_session_cookie(response, session: AuthSession) -> None:
@@ -526,26 +845,71 @@ def _idempotency_key(request: Request) -> str:
 
 
 async def _reconcile_quest_initializations(
-    runtime: ProductionRuntime, health: ReconciliationHealth
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
 ) -> None:
     while True:
         try:
             advanced = await asyncio.to_thread(
                 runtime.owners.human_collaboration.reconcile_once
             )
-        except (OSError, OwnerConflict, SQLAlchemyError) as error:
-            health.status = "unavailable"
-            health.last_error = (
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("quest reconciliation attempt failed unexpectedly")
+            error_code = (
                 error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
             health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
             retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
             await asyncio.sleep(retry_delay)
         else:
+            changed = health.status != "ready" or health.last_error is not None
             health.status = "ready"
             health.last_error = None
             health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
             await asyncio.sleep(0 if advanced else 1.0)
+
+
+async def _process_quest_drafting(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    while True:
+        try:
+            advanced = await asyncio.to_thread(
+                runtime.owners.human_collaboration.process_drafting_once
+            )
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("quest drafting attempt failed unexpectedly")
+            error_code = (
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
 
 
 def _log_reconciliation_exit(task: asyncio.Task[None]) -> None:

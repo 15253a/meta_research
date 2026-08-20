@@ -1,0 +1,82 @@
+{
+  "source": {
+    "repository": "15253a/meta_research",
+    "commit": "d7e2c9b79792d82285881f39c3fb2de2dd260d5f",
+    "path": "meta-research/views/core-ui-prototype/index.html",
+    "blob_sha1": "ffd45bcd233ba5bed30cb47cbf82598dab2ce349",
+    "html_sha256": "36e48dc7e93f469a7ef7dcea0b163589655623aad66913c88061a6dda6e9d998"
+  },
+  "render": {
+    "browser": "Google Chrome 151.0.7922.71",
+    "route": "variant=A",
+    "animations": "disabled"
+  },
+  "references": {
+    "shell-1440.png": {
+      "surface": "shell",
+      "viewport": { "width": 1440, "height": 1000 },
+      "sha256": "4e5c63d98f2f1faf35e7ec8f2119060038eea730ada324586605cd6fcbbc6d69",
+      "expectedDiffPixelRatio": 0.08039097222222222,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.061678, 0.082122, 0.005856, 0.059133, 0.047056, 0.132222, 0.041467, 0.190289, 0.087778, 0.048267, 0.2852, 0.021233, 0.032289, 0.076633, 0.076378, 0.038656],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "78d1170a772e275f1ff1814418547733199582b19b32a71373981f68a58e2cc7",
+      "maxProductionDiffPixels": 0
+    },
+    "shell-800.png": {
+      "surface": "shell",
+      "viewport": { "width": 800, "height": 1000 },
+      "sha256": "b4374a9559648660b53a79c0e3c6fbe74b744a6026be4005f26c0a7841f64b1a",
+      "expectedDiffPixelRatio": 0.0789475,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.0405, 0.11358, 0.03384, 0.02688, 0.03694, 0.05988, 0.14126, 0.01886, 0.08704, 0.05318, 0.0198, 0.0214, 0.0842, 0.23764, 0.19818, 0.08998],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "1a30dcaaaffff61f124f555e6e70179111d0ca96692b37ca120fcbb223517c0d",
+      "maxProductionDiffPixels": 0
+    },
+    "shell-390.png": {
+      "surface": "shell",
+      "viewport": { "width": 390, "height": 844 },
+      "sha256": "a59647e5de0892d6880e1e7a40706d78fc1565d6d5db2e7d7389859f1d29e53d",
+      "expectedDiffPixelRatio": 0.13027706890266133,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.237944, 0.075201, 0.043387, 0.021327, 0.106806, 0.17758, 0.17218, 0.035738, 0.187766, 0.082358, 0.14091, 0.093674, 0.138858, 0.241416, 0.261299, 0.07051],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "98a0bee25f1464eaf98655aa62aa528e7dae27db0a347e73a4d6e43265584b67",
+      "maxProductionDiffPixels": 0
+    },
+    "create-quest-1440.png": {
+      "surface": "create-quest",
+      "viewport": { "width": 1440, "height": 900 },
+      "sha256": "362cf50db5ff688e17e496e7481687f4ef48543b546add951ff5c7ceb8722a1f",
+      "expectedDiffPixelRatio": 0.0661983024691358,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.071185, 0.010346, 0.003358, 0.147235, 0.073889, 0.025975, 0.000519, 0.122185, 0.043963, 0.019568, 0.031062, 0.092901, 0.024395, 0.08837, 0.076494, 0.227728],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "3d9c84ae5471f365f93abec43ff250570035de46a9a48b48ede2d795714d8d52",
+      "maxProductionDiffPixels": 0
+    },
+    "create-quest-800.png": {
+      "surface": "create-quest",
+      "viewport": { "width": 800, "height": 900 },
+      "sha256": "4f4fa317b54b47d1ada9f095a2588822fddd40582598d5a9637a6563fe49a4e7",
+      "expectedDiffPixelRatio": 0.1441763888888889,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.098644, 0.080578, 0.130356, 0.282378, 0.106556, 0.068289, 0.194911, 0.386667, 0.043822, 0.093533, 0.035222, 0.117244, 0.074556, 0.051089, 0.159244, 0.383733],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "77e7d19d3fdc51ac254fa2a992f3823cec88122a45c60c131c84909f219d63ab",
+      "maxProductionDiffPixels": 0
+    },
+    "create-quest-390.png": {
+      "surface": "create-quest",
+      "viewport": { "width": 390, "height": 844 },
+      "sha256": "a532065b6b72840f658b85be197af7d8a4ac1983956672aea16a36437d26ead6",
+      "expectedDiffPixelRatio": 0.149930125167092,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.083842, 0.17816, 0.102458, 0.19441, 0.076855, 0.126028, 0.078761, 0.189622, 0.062784, 0.055083, 0.036253, 0.194893, 0.161675, 0.235274, 0.277276, 0.342248],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "7ef5e3c0394fe0cafced5c07152ce9480472b8733034476e6d23de8127f1ac2e",
+      "maxProductionDiffPixels": 0
+    }
+  }
+}

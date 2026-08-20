@@ -1,196 +1,479 @@
 from __future__ import annotations
 
 import json
-import re
+import os
+import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
+
+from meta_research.composition import build_production_runtime
+from meta_research.paths import prepare_data_root
+from meta_research.quest_drafting import (
+    HostComputeDevice,
+    HostComputeSnapshot,
+    IntentTurnRequest,
+    IntentTurnResult,
+    ProposalDraftRequest,
+    ProposalDraftResult,
+)
+from meta_research.web import create_app
 
 
-def run_cli(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+QUESTION = {
+    "title": "低照度显微图像中的稀有形态保真",
+    "unknown_statement": "尚不明确哪种自监督去噪条件能保留稀有形态。",
+    "answer_shape": "形成带反例和证据边界的比较结论。",
+    "applicability_scope": "低照度荧光显微公开数据。",
+    "background_context": "研究稀有细胞形态。",
+    "requirements_constraints": "两周内，使用获准 GPU。",
+}
+
+
+class DeterministicDraftingAdapter:
+    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+        assert request.draft["goal"]
+        assert request.draft["completion_criteria"]
+        return ProposalDraftResult(
+            content=QUESTION,
+            adapter_kind="test_deterministic",
+        )
+
+    def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
+        assert request.draft["goal"]
+        return IntentTurnResult(
+            reply=f"建议先把完成标准具体化：{request.message}",
+            native_session_ref=request.native_session_ref or "test-native-session",
+            adapter_kind="test_deterministic",
+        )
+
+
+class DeterministicProbe:
+    def observe(self) -> HostComputeSnapshot:
+        return HostComputeSnapshot(
+            status="ready",
+            observed_at=1720000000.0,
+            devices=(
+                HostComputeDevice(
+                    uuid="GPU-test-1",
+                    name="Test GPU",
+                    memory_total_mib=81920,
+                ),
+            ),
+            adapter_kind="test_probe",
+        )
+
+
+def _run_cli(
+    executable: str,
+    *args: str,
+    check: bool = True,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["meta-research", *args],
+        [executable, *args],
         check=check,
         capture_output=True,
         text=True,
         timeout=20,
+        env=env,
     )
 
 
-def run_cli_json(*args: str) -> dict[str, object]:
-    return json.loads(run_cli(*args).stdout)
-
-
-def preview_confirmation(
-    client: httpx.Client,
-    write_headers: dict[str, str],
-    creation: dict[str, object],
-    *,
-    idempotency_key: str,
+def _run_cli_json(
+    executable: str,
+    *args: str,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
-    response = client.post(
-        "/api/v1/quest-initializations/"
-        f"{creation['initialization_id']}/confirmation-preview",
-        headers={**write_headers, "Idempotency-Key": idempotency_key},
-        json={
-            "quest_draft_revision": creation["quest_draft"]["revision"],
-            "quest_draft_hash": creation["quest_draft"]["hash"],
-            "proposal_ref": creation["proposal"]["ref"],
-            "proposal_hash": creation["proposal"]["hash"],
-        },
+    return json.loads(_run_cli(executable, *args, env=env).stdout)
+
+
+def _authenticate_http(
+    base_url: str,
+    bootstrap_token: str,
+) -> tuple[httpx.Client, dict[str, str]]:
+    client = httpx.Client(base_url=base_url, timeout=5, trust_env=False)
+    exchanged = client.post(
+        "/auth/bootstrap",
+        headers={"Origin": base_url},
+        json={"token": bootstrap_token},
     )
-    response.raise_for_status()
-    return response.json()
-
-
-def confirmation_payload(creation: dict[str, object]) -> dict[str, object]:
-    return {
-        "quest_draft_revision": creation["quest_draft"]["revision"],
-        "quest_draft_hash": creation["quest_draft"]["hash"],
-        "proposal_ref": creation["proposal"]["ref"],
-        "proposal_hash": creation["proposal"]["hash"],
-        "preview_ref": creation["confirmation_preview"]["ref"],
-        "preview_hash": creation["confirmation_preview"]["hash"],
+    exchanged.raise_for_status()
+    return client, {
+        "Origin": base_url,
+        "X-CSRF-Token": exchanged.json()["csrf_token"],
     }
 
 
-def test_confirming_an_unknown_initialization_returns_typed_not_found(
-    authenticated_product,
-) -> None:
-    _data_root, client, write_headers = authenticated_product
-    response = client.post(
-        "/api/v1/quest-initializations/quest_init_missing/confirmation",
-        headers={**write_headers, "Idempotency-Key": "confirm-missing"},
-        json={
-            "quest_draft_revision": 1,
-            "quest_draft_hash": "0" * 64,
-            "proposal_ref": "question_proposal_missing",
-            "proposal_hash": "1" * 64,
-            "preview_ref": "hc_preview_missing",
-            "preview_hash": "2" * 64,
-        },
+def _authenticate_test_client(runtime) -> tuple[TestClient, dict[str, str]]:
+    base_url = "http://testserver"
+    client = TestClient(
+        create_app(runtime, base_url=base_url, control_key="control-secret"),
+        base_url=base_url,
     )
-    assert response.status_code == 404
-    assert response.json()["detail"] == {"code": "quest_initialization_not_found"}
+    bootstrap = runtime.authentication.issue_bootstrap_token()
+    exchanged = client.post(
+        "/auth/bootstrap",
+        headers={"Origin": base_url},
+        json={"token": bootstrap},
+    )
+    assert exchanged.status_code == 200
+    return client, {
+        "Origin": base_url,
+        "X-CSRF-Token": exchanged.json()["csrf_token"],
+    }
+
+
+def _write_headers(base: dict[str, str], idempotency_key: str) -> dict[str, str]:
+    return {**base, "Idempotency-Key": idempotency_key}
+
+
+def _confirmation_payload(creation: dict[str, object]) -> dict[str, object]:
+    draft = creation["quest_draft"]
+    proposal = creation["proposal"]
+    preview = creation["confirmation_preview"]
+    assert isinstance(draft, dict)
+    assert isinstance(proposal, dict)
+    assert isinstance(preview, dict)
+    return {
+        "quest_draft_revision": draft["revision"],
+        "quest_draft_hash": draft["hash"],
+        "proposal_ref": proposal["ref"],
+        "proposal_hash": proposal["hash"],
+        "preview_ref": preview["ref"],
+        "preview_hash": preview["hash"],
+    }
+
+
+def _draft_from(creation: dict[str, object]) -> dict[str, object]:
+    draft_view = creation["quest_draft"]
+    assert isinstance(draft_view, dict)
+    draft = dict(draft_view["value"])
+    draft.update(
+        {
+            "goal": "判断低照度显微图像去噪能否保留稀有形态。",
+            "completion_criteria": "形成带反例和证据边界的比较结论。",
+            "time_budget": "30d",
+            "background_and_initial_direction": "比较自监督和监督基线。",
+        }
+    )
+    return draft
+
+
+def _poll_http_view(
+    client: httpx.Client,
+    initialization_id: str,
+    predicate,
+    *,
+    timeout: float = 5,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    view: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        response = client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        )
+        response.raise_for_status()
+        view = response.json()
+        if predicate(view):
+            return view
+        time.sleep(0.05)
+    raise AssertionError(f"Quest initialization did not reach the expected state: {view}")
 
 
 @pytest.fixture
-def authenticated_product(tmp_path: Path):
-    data_root = tmp_path / "quest-initialization-data"
-    started = run_cli_json(
+def providerless_installed_product(tmp_path: Path):
+    executable = shutil.which("meta-research")
+    assert executable is not None
+
+    provider_path = tmp_path / "provider-path"
+    provider_path.mkdir()
+    nvidia_smi = provider_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "test \"$*\" = \"--query-gpu=uuid,name,memory.total "
+        "--format=csv,noheader,nounits\" || exit 64\n"
+        "printf '%s\\n' 'GPU-installed-test, Installed Verification GPU, 81920'\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    daemon_env = {**os.environ, "PATH": str(provider_path)}
+
+    data_root = tmp_path / "installed-product-data"
+    started = _run_cli_json(
+        executable,
         "start",
         "--data-root",
         str(data_root),
         "--port",
         "0",
         "--json",
+        env=daemon_env,
     )
-    client = httpx.Client(
-        base_url=str(started["base_url"]), timeout=5, trust_env=False
+    base_url = str(started["base_url"])
+    unauthenticated = httpx.get(
+        f"{base_url}/api/v1/snapshot",
+        timeout=5,
+        trust_env=False,
     )
-    exchanged = client.post(
-        "/auth/bootstrap",
-        headers={"Origin": str(started["base_url"])},
-        json={"token": str(started["bootstrap_token"])},
+    assert unauthenticated.status_code == 401
+    client, write_headers = _authenticate_http(
+        base_url,
+        str(started["bootstrap_token"]),
     )
-    exchanged.raise_for_status()
     try:
-        yield data_root, client, {
-            "Origin": str(started["base_url"]),
-            "X-CSRF-Token": exchanged.json()["csrf_token"],
-        }
+        yield executable, daemon_env, data_root, started, client, write_headers
     finally:
         client.close()
-        run_cli("stop", "--data-root", str(data_root), "--json", check=False)
+        _run_cli(
+            executable,
+            "stop",
+            "--data-root",
+            str(data_root),
+            "--json",
+            check=False,
+            env=daemon_env,
+        )
 
 
-def test_direct_first_question_reaches_distinct_owner_receipts(
-    authenticated_product,
+def test_installed_v2_api_exposes_typed_provider_unavailability_without_domain_facts(
+    providerless_installed_product,
 ) -> None:
-    _data_root, client, write_headers = authenticated_product
-    draft = {
-        "goal": "判断低照度显微图像的自监督去噪能否保留稀有细胞形态。",
-        "completion_criteria": "给出可复核的适用条件、反例和证据边界。",
-        "key_configuration": "单卡 24 GB；优先复用公开数据；两周内形成阶段结论。",
-        "literature_scope": "open_access",
-        "initial_question_direction": "比较自监督去噪与监督基线对稀有形态的影响。",
-        "material_receipts": [],
-    }
-
-    created_response = client.post(
-        "/api/v1/quest-initializations",
-        headers={**write_headers, "Idempotency-Key": "create-direct-quest-1"},
-        json=draft,
-    )
-    assert created_response.status_code == 201
-    created = created_response.json()
-    assert created["creation_context"] == "quest_initialization"
-    assert created["route"] == "direct"
-    assert created["receipts"] == {
-        "human_confirmation": {"status": "not_attempted"},
-        "quest_goal": {"status": "not_attempted"},
-        "question_content": {"status": "not_attempted"},
-        "question_identity": {"status": "not_attempted"},
-        "cycle_activation": {"status": "not_attempted"},
-    }
-    assert "quest_ref" not in json.dumps(created)
-    assert "question_ref" not in json.dumps(created)
-
-    generated_response = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "generate-proposal-1"},
-        json={"expected_draft_hash": created["quest_draft"]["hash"]},
-    )
-    assert generated_response.status_code == 201
-    generated = generated_response.json()
-    proposal = generated["proposal"]
-    assert proposal["status"] == "current"
-    assert proposal["basis_hash"] == created["quest_draft"]["hash"]
-    assert set(proposal["content"]) == {
-        "title",
-        "unknown_statement",
-        "answer_shape",
-        "applicability_scope",
-        "background_context",
-        "requirements_constraints",
-    }
-    assert all(value.strip() for value in proposal["content"].values())
-
-    without_preview = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/confirmation",
-        headers={**write_headers, "Idempotency-Key": "confirm-without-preview"},
-        json={
-            "quest_draft_revision": generated["quest_draft"]["revision"],
-            "quest_draft_hash": generated["quest_draft"]["hash"],
-            "proposal_ref": proposal["ref"],
-            "proposal_hash": proposal["hash"],
-            "preview_ref": "hc_preview_not_issued",
-            "preview_hash": "0" * 64,
-        },
-    )
-    assert without_preview.status_code == 409
-    assert without_preview.json()["detail"]["code"] == "confirmation_preview_required"
-    rejected_view = client.get(
-        f"/api/v1/quest-initializations/{created['initialization_id']}"
-    ).json()
-    assert rejected_view["receipts"]["human_confirmation"] == {
-        "status": "rejected",
-        "reason": {"code": "confirmation_preview_required"},
-    }
-
-    before_preview = client.get("/api/v1/snapshot").json()
-    previewed = preview_confirmation(
+    (
+        executable,
+        daemon_env,
+        data_root,
+        started,
         client,
         write_headers,
-        generated,
-        idempotency_key="preview-bundle-1",
+    ) = providerless_installed_product
+
+    snapshot = client.get("/api/v1/snapshot").json()
+    assert snapshot["readiness"]["status"] == "ready"
+    assert snapshot["research_space"] == {
+        "status": "empty",
+        "quest_count": 0,
+        "question_count": 0,
+        "foreground_cycle_count": 0,
+    }
+
+    shell = client.get("/")
+    shell.raise_for_status()
+    assert "text/html" in shell.headers["content-type"]
+    assert "<script" in shell.text
+
+    opened_response = client.post(
+        "/api/v1/quest-initializations",
+        headers=_write_headers(write_headers, "installed-open-v2"),
+        json={},
     )
-    preview = previewed["confirmation_preview"]
+    assert opened_response.status_code == 201
+    opened = opened_response.json()
+    assert opened["quest_draft"]["schema_ref"].endswith("/v2")
+    assert opened["intent_session"]["status"] == "open"
+
+    probed_response = client.post(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}/compute-probe",
+        headers=_write_headers(write_headers, "installed-compute-probe"),
+        json={"selected_device_uuids": ["GPU-installed-test"]},
+    )
+    probed_response.raise_for_status()
+    probed = probed_response.json()
+    assert probed["compute"]["status"] == "ready"
+    assert probed["resource_envelope"]["selected_device_uuids"] == [
+        "GPU-installed-test"
+    ]
+
+    saved_response = client.put(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}/draft",
+        headers=_write_headers(write_headers, "installed-autosave-v2"),
+        json={
+            "expected_draft_revision": probed["quest_draft"]["revision"],
+            "expected_draft_hash": probed["quest_draft"]["hash"],
+            "draft": _draft_from(probed),
+        },
+    )
+    saved_response.raise_for_status()
+    saved = saved_response.json()
+
+    intent_response = client.post(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}"
+        "/intent-session/messages",
+        headers=_write_headers(write_headers, "installed-intent-turn"),
+        json={
+            "expected_draft_revision": saved["quest_draft"]["revision"],
+            "expected_draft_hash": saved["quest_draft"]["hash"],
+            "message": "怎样把问题边界缩小？",
+        },
+    )
+    assert intent_response.status_code == 202
+
+    generation_response = client.post(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}"
+        "/proposal-generations",
+        headers=_write_headers(write_headers, "installed-generate-proposal"),
+        json={
+            "expected_draft_revision": saved["quest_draft"]["revision"],
+            "expected_draft_hash": saved["quest_draft"]["hash"],
+        },
+    )
+    assert generation_response.status_code == 202
+
+    unavailable = _poll_http_view(
+        client,
+        opened["initialization_id"],
+        lambda view: (
+            view["proposal_generation"] is not None
+            and view["proposal_generation"]["status"] == "capability_unavailable"
+            and view["intent_session"]["turns"]
+            and view["intent_session"]["turns"][0]["assistant_status"]
+            == "unavailable"
+        ),
+    )
+    assert unavailable["proposal_generation"]["failure"] == {
+        "code": "codex_cli_unavailable"
+    }
+    assert unavailable["intent_session"]["turns"][0]["reason"] == {
+        "code": "codex_cli_unavailable"
+    }
+    assert unavailable["proposal"] is None
+    assert unavailable["confirmation_preview"] is None
+    assert all(
+        receipt["status"] == "not_attempted"
+        for receipt in unavailable["receipts"].values()
+    )
+    assert client.get("/api/v1/snapshot").json()["research_space"] == {
+        "status": "empty",
+        "quest_count": 0,
+        "question_count": 0,
+        "foreground_cycle_count": 0,
+    }
+
+    initialization_id = opened["initialization_id"]
+    client.close()
+    _run_cli(
+        executable,
+        "stop",
+        "--data-root",
+        str(data_root),
+        "--json",
+        env=daemon_env,
+    )
+    restarted = _run_cli_json(
+        executable,
+        "start",
+        "--data-root",
+        str(data_root),
+        "--port",
+        "0",
+        "--json",
+        env=daemon_env,
+    )
+    resumed_client, _resumed_headers = _authenticate_http(
+        str(restarted["base_url"]),
+        str(restarted["bootstrap_token"]),
+    )
+    try:
+        restored = resumed_client.get(
+            f"/api/v1/quest-initializations/{initialization_id}"
+        )
+        restored.raise_for_status()
+        restored_view = restored.json()
+        assert restored_view["proposal_generation"]["status"] == (
+            "capability_unavailable"
+        )
+        assert restored_view["intent_session"]["turns"][0][
+            "assistant_status"
+        ] == "unavailable"
+    finally:
+        resumed_client.close()
+
+
+def test_injected_async_success_auto_previews_and_recovers_owner_receipts(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    data_root_path = tmp_path / "deterministic-success"
+    adapter = DeterministicDraftingAdapter()
+    runtime = build_production_runtime(
+        prepare_data_root(data_root_path),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    client, write_headers = _authenticate_test_client(runtime)
+    request.addfinalizer(runtime.close)
+    request.addfinalizer(client.close)
+
+    opened = client.post(
+        "/api/v1/quest-initializations",
+        headers=_write_headers(write_headers, "success-open-v2"),
+        json={},
+    ).json()
+    probed = client.post(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}/compute-probe",
+        headers=_write_headers(write_headers, "success-compute-probe"),
+        json={"selected_device_uuids": ["GPU-test-1"]},
+    ).json()
+    saved = client.put(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}/draft",
+        headers=_write_headers(write_headers, "success-autosave-v2"),
+        json={
+            "expected_draft_revision": probed["quest_draft"]["revision"],
+            "expected_draft_hash": probed["quest_draft"]["hash"],
+            "draft": _draft_from(probed),
+        },
+    ).json()
+    client.post(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}"
+        "/intent-session/messages",
+        headers=_write_headers(write_headers, "success-intent-turn"),
+        json={
+            "expected_draft_revision": saved["quest_draft"]["revision"],
+            "expected_draft_hash": saved["quest_draft"]["hash"],
+            "message": "怎样把问题边界缩小？",
+        },
+    ).raise_for_status()
+    queued = client.post(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}"
+        "/proposal-generations",
+        headers=_write_headers(write_headers, "success-generate-proposal"),
+        json={
+            "expected_draft_revision": saved["quest_draft"]["revision"],
+            "expected_draft_hash": saved["quest_draft"]["hash"],
+        },
+    )
+    assert queued.status_code == 202
+    assert queued.json()["status"] == "proposal_generating"
+
+    ready: dict[str, object] = {}
+    for _ in range(10):
+        runtime.owners.human_collaboration.process_drafting_once()
+        ready = client.get(
+            f"/api/v1/quest-initializations/{opened['initialization_id']}"
+        ).json()
+        if (
+            ready["status"] == "proposal_ready"
+            and ready["intent_session"]["turns"][0]["assistant_status"]
+            == "completed"
+        ):
+            break
+    assert ready["status"] == "proposal_ready"
+    assert ready["proposal"]["content"] == QUESTION
+    assert ready["proposal_generation"]["status"] == "succeeded"
+    assert ready["intent_session"]["turns"][0]["assistant_status"] == "completed"
+    assert "建议先把完成标准具体化" in ready["intent_session"]["turns"][0][
+        "assistant_content"
+    ]
+    preview = ready["confirmation_preview"]
     assert preview["status"] == "current"
-    assert preview["basis_revision"] == generated["quest_draft"]["revision"]
+    assert preview["will_happen"]
+    assert preview["will_not_happen"]
     assert {
         (assertion["owner"], assertion["operation"])
         for assertion in preview["target_assertions"]
@@ -200,32 +483,60 @@ def test_direct_first_question_reaches_distinct_owner_receipts(
         ("research_graph", "accept_root_question"),
         ("advancement_engine", "activate_initial_cycle"),
     }
-    after_preview = client.get("/api/v1/snapshot").json()
-    for owner in ("research_graph", "research_memory", "advancement_engine"):
-        assert after_preview["owners"][owner] == before_preview["owners"][owner]
 
+    exact_confirmation = _confirmation_payload(ready)
     confirmed_response = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/confirmation",
-        headers={**write_headers, "Idempotency-Key": "confirm-bundle-1"},
-        json=confirmation_payload(previewed),
+        f"/api/v1/quest-initializations/{opened['initialization_id']}/confirmation",
+        headers=_write_headers(write_headers, "success-confirm-bundle"),
+        json=exact_confirmation,
     )
     assert confirmed_response.status_code == 202
     confirmed = confirmed_response.json()
     assert confirmed["receipts"]["human_confirmation"]["status"] == "accepted"
+    confirmation_ref = confirmed["receipts"]["human_confirmation"]["receipt_ref"]
 
-    deadline = time.monotonic() + 5
-    while confirmed["status"] != "completed" and time.monotonic() < deadline:
-        time.sleep(0.05)
-        response = client.get(
-            f"/api/v1/quest-initializations/{created['initialization_id']}"
-        )
-        response.raise_for_status()
-        confirmed = response.json()
+    assert runtime.owners.human_collaboration.reconcile_once()
+    assert runtime.owners.human_collaboration.reconcile_once()
+    interrupted = client.get(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}"
+    ).json()
+    assert interrupted["status"] == "dispatching"
+    accepted_before_restart = {
+        name: receipt["receipt_ref"]
+        for name, receipt in interrupted["receipts"].items()
+        if receipt["status"] == "accepted"
+    }
+    assert set(accepted_before_restart) == {
+        "human_confirmation",
+        "quest_goal",
+        "question_content",
+    }
 
-    assert confirmed["status"] == "completed"
+    client.close()
+    runtime.close()
+
+    restarted = build_production_runtime(
+        prepare_data_root(data_root_path),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    resumed_client, resumed_headers = _authenticate_test_client(restarted)
+    request.addfinalizer(restarted.close)
+    request.addfinalizer(resumed_client.close)
+    completed: dict[str, object] = {}
+    for _ in range(10):
+        restarted.owners.human_collaboration.reconcile_once()
+        completed = resumed_client.get(
+            f"/api/v1/quest-initializations/{opened['initialization_id']}"
+        ).json()
+        if completed["status"] == "completed":
+            break
+
+    assert completed["status"] == "completed"
     assert {
         name: receipt["status"]
-        for name, receipt in confirmed["receipts"].items()
+        for name, receipt in completed["receipts"].items()
     } == {
         "human_confirmation": "accepted",
         "quest_goal": "accepted",
@@ -233,476 +544,37 @@ def test_direct_first_question_reaches_distinct_owner_receipts(
         "question_identity": "accepted",
         "cycle_activation": "accepted",
     }
+    assert completed["receipts"]["human_confirmation"]["receipt_ref"] == (
+        confirmation_ref
+    )
+    for name, receipt_ref in accepted_before_restart.items():
+        assert completed["receipts"][name]["receipt_ref"] == receipt_ref
     receipt_refs = [
-        receipt["receipt_ref"] for receipt in confirmed["receipts"].values()
+        receipt["receipt_ref"] for receipt in completed["receipts"].values()
     ]
-    assert len(receipt_refs) == len(set(receipt_refs))
-    assert [
-        (receipt["issuer"], receipt["kind"])
-        for receipt in confirmed["receipts"].values()
-    ] == [
-        ("human_collaboration", "quest_bundle_confirmation"),
-        ("research_graph", "quest_acceptance"),
-        ("research_memory", "question_content_acceptance"),
-        ("research_graph", "root_question_acceptance"),
-        ("advancement_engine", "initial_cycle_activation"),
-    ]
-    assert confirmed["quest_ref"].startswith("quest_")
-    assert confirmed["question_ref"].startswith("question_")
-    assert confirmed["cycle_ref"].startswith("cycle_")
-
-    snapshot = client.get("/api/v1/snapshot").json()
-    assert snapshot["research_space"] == {
+    assert len(receipt_refs) == len(set(receipt_refs)) == 5
+    assert completed["quest_ref"].startswith("quest_")
+    assert completed["question_ref"].startswith("question_")
+    assert completed["cycle_ref"].startswith("cycle_")
+    assert resumed_client.get("/api/v1/snapshot").json()["research_space"] == {
         "status": "active",
         "quest_count": 1,
         "question_count": 1,
         "foreground_cycle_count": 1,
     }
-    assert not any(
-        item["capability"] == "quest_creation"
-        for item in snapshot["unavailable"]
-    )
+    assert resumed_client.get(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}/intent-session"
+    ).json()["intent_session"]["turns"][0]["assistant_status"] == "completed"
 
-
-def test_production_web_exposes_the_continuous_direct_creation_window(
-    authenticated_product,
-) -> None:
-    _data_root, client, _write_headers = authenticated_product
-
-    shell = client.get("/")
-    shell.raise_for_status()
-    script_path = re.search(r'<script[^>]+src="([^"]+)"', shell.text)
-    assert script_path is not None
-    bundle = client.get(script_path.group(1))
-    bundle.raise_for_status()
-
-    assert "/api/v1/quest-initializations" in bundle.text
-    assert "定义 Quest 与首问题" in bundle.text
-    assert "生成六字段问题" in bundle.text
-    assert "修改 Quest 基底" in bundle.text
-    assert "按新基底明确复核原问题" in bundle.text
-    assert "确定性 Impact Preview" in bundle.text
-    assert "生成影响预览" in bundle.text
-    assert "确认 Quest 与首问题" in bundle.text
-    assert "查看并恢复当前创建" in bundle.text
-    assert "创建新的 Quest" in bundle.text
-    assert "CreationSeed" not in bundle.text
-
-
-def test_changed_quest_basis_makes_the_old_proposal_and_confirmation_stale(
-    authenticated_product,
-) -> None:
-    _data_root, client, write_headers = authenticated_product
-    draft = {
-        "goal": "解释一种催化体系的选择性来源。",
-        "completion_criteria": "形成带反例的机制边界。",
-        "key_configuration": "仅使用公开数据，计算预算为单卡。",
-        "literature_scope": "open_access",
-        "initial_question_direction": "电子效应还是位阻主导选择性？",
-        "material_receipts": [],
-    }
-    created = client.post(
-        "/api/v1/quest-initializations",
-        headers={**write_headers, "Idempotency-Key": "create-stale-quest"},
-        json=draft,
-    ).json()
-    generated = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "generate-stale-proposal"},
-        json={"expected_draft_hash": created["quest_draft"]["hash"]},
-    ).json()
-    old_proposal = generated["proposal"]
-    previewed = preview_confirmation(
-        client,
-        write_headers,
-        generated,
-        idempotency_key="preview-stale-bundle",
-    )
-    old_preview = previewed["confirmation_preview"]
-
-    revised_response = client.put(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/draft",
-        headers={**write_headers, "Idempotency-Key": "revise-stale-draft"},
-        json={
-            **draft,
-            "goal": "解释并可证伪该催化体系的选择性来源。",
-            "expected_draft_hash": created["quest_draft"]["hash"],
-        },
-    )
-    revised_response.raise_for_status()
-    revised = revised_response.json()
-    assert revised["proposal"]["status"] == "stale"
-    assert revised["proposal"]["ref"] == old_proposal["ref"]
-    assert revised["confirmation_preview"]["status"] == "stale"
-    assert revised["confirmation_preview"]["ref"] == old_preview["ref"]
-
-    reverted_response = client.put(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/draft",
-        headers={**write_headers, "Idempotency-Key": "revert-stale-draft"},
-        json={
-            **draft,
-            "expected_draft_hash": revised["quest_draft"]["hash"],
-        },
-    )
-    reverted_response.raise_for_status()
-    reverted = reverted_response.json()
-    assert reverted["quest_draft"]["hash"] == created["quest_draft"]["hash"]
-    assert reverted["quest_draft"]["revision"] == 3
-    assert reverted["proposal"]["status"] == "stale"
-    assert reverted["confirmation_preview"]["status"] == "stale"
-
-    stale_confirmation = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/confirmation",
-        headers={**write_headers, "Idempotency-Key": "confirm-stale-bundle"},
-        json=confirmation_payload(previewed),
-    )
-    assert stale_confirmation.status_code == 409
-    assert stale_confirmation.json()["detail"]["code"] == "quest_draft_stale"
-
-    after_rejection = client.get(
-        f"/api/v1/quest-initializations/{created['initialization_id']}"
-    ).json()
-    assert after_rejection["receipts"]["human_confirmation"] == {
-        "status": "stale",
-        "reason": {"code": "quest_draft_stale"},
-    }
-    assert all(
-        receipt["status"] == "not_attempted"
-        and receipt["reason"]["code"] == "human_confirmation_not_accepted"
-        for name, receipt in after_rejection["receipts"].items()
-        if name != "human_confirmation"
-    )
-    assert client.get("/api/v1/snapshot").json()["research_space"] == {
-        "status": "empty",
-        "quest_count": 0,
-        "question_count": 0,
-        "foreground_cycle_count": 0,
-    }
-
-    explicitly_reviewed = client.put(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "review-old-content-on-new-basis"},
-        json={
-            "expected_draft_hash": reverted["quest_draft"]["hash"],
-            "content": old_proposal["content"],
-        },
-    ).json()
-    assert explicitly_reviewed["proposal"]["status"] == "current"
-    assert explicitly_reviewed["proposal"]["basis_revision"] == 3
-    assert explicitly_reviewed["proposal"]["ref"] != old_proposal["ref"]
-    assert explicitly_reviewed["receipts"]["human_confirmation"] == {
-        "status": "not_attempted"
-    }
-
-
-def test_undelivered_material_basis_fails_typed_without_creating_domain_facts(
-    authenticated_product,
-) -> None:
-    _data_root, client, write_headers = authenticated_product
-    response = client.post(
-        "/api/v1/quest-initializations",
-        headers={**write_headers, "Idempotency-Key": "material-basis-unavailable"},
-        json={
-            "goal": "整理用户提供的论文材料。",
-            "completion_criteria": "形成可审查的问题边界。",
-            "key_configuration": "仅使用已接纳材料。",
-            "literature_scope": "provided_materials",
-            "initial_question_direction": "材料支持哪些可检验问题？",
-            "material_receipts": ["unverified-material-is-not-a-receipt"],
-        },
-    )
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": {
-            "code": "research_memory_asset_intake_not_delivered",
-            "status": "capability_unavailable",
-        }
-    }
-    snapshot = client.get("/api/v1/snapshot").json()
-    assert snapshot["quest_creation"]["current"] is None
-    assert snapshot["research_space"]["quest_count"] == 0
-    assert snapshot["owners"]["research_memory"]["facts"]["asset_count"] == 0
-
-
-def test_cancelled_draft_never_allocates_quest_or_question_identity(
-    authenticated_product,
-) -> None:
-    _data_root, client, write_headers = authenticated_product
-    draft = {
-        "goal": "建立一个可取消的研究草案。",
-        "completion_criteria": "取消前不产生正式研究身份。",
-        "key_configuration": "不启动外部工作。",
-        "literature_scope": "open_access",
-        "initial_question_direction": "该草案是否值得继续？",
-        "material_receipts": [],
-    }
-    created = client.post(
-        "/api/v1/quest-initializations",
-        headers={**write_headers, "Idempotency-Key": "create-cancelled-draft"},
-        json=draft,
-    ).json()
-    client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "draft-before-cancel"},
-        json={"expected_draft_hash": created["quest_draft"]["hash"]},
-    ).raise_for_status()
-
-    cancelled_response = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/cancel",
-        headers={**write_headers, "Idempotency-Key": "cancel-draft-once"},
-        json={},
-    )
-    cancelled_response.raise_for_status()
-    cancelled = cancelled_response.json()
-
-    assert cancelled["status"] == "cancelled"
-    assert "quest_ref" not in cancelled
-    assert "question_ref" not in cancelled
-    assert all(
-        receipt["status"] == "not_attempted"
-        for receipt in cancelled["receipts"].values()
-    )
-    assert client.get("/api/v1/snapshot").json()["research_space"] == {
-        "status": "empty",
-        "quest_count": 0,
-        "question_count": 0,
-        "foreground_cycle_count": 0,
-    }
-
-
-def test_proposal_can_be_regenerated_edited_and_idempotently_confirmed(
-    authenticated_product,
-) -> None:
-    _data_root, client, write_headers = authenticated_product
-    draft = {
-        "goal": "判断一种时序预测方法在哪些分布漂移下仍可靠。",
-        "completion_criteria": "给出可证伪的可靠性边界。",
-        "key_configuration": "公开基准；单卡；固定两周窗口。",
-        "literature_scope": "open_access",
-        "initial_question_direction": "比较协变量漂移与概念漂移的影响。",
-        "material_receipts": [],
-    }
-    created = client.post(
-        "/api/v1/quest-initializations",
-        headers={**write_headers, "Idempotency-Key": "create-editable-proposal"},
-        json=draft,
-    ).json()
-    first = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "generate-proposal-first"},
-        json={"expected_draft_hash": created["quest_draft"]["hash"]},
-    ).json()
-    regenerated = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "generate-proposal-second"},
-        json={"expected_draft_hash": created["quest_draft"]["hash"]},
-    ).json()
-    assert regenerated["proposal"]["revision"] == 2
-    assert regenerated["proposal"]["ref"] != first["proposal"]["ref"]
-
-    edited_content = {
-        **regenerated["proposal"]["content"],
-        "title": "分布漂移下时序预测可靠性的适用边界",
-        "answer_shape": "按漂移类型给出可复核的成立条件、失效反例与不确定性。",
-    }
-    edit_payload = {
-        "expected_draft_hash": created["quest_draft"]["hash"],
-        "content": edited_content,
-    }
-    saved = client.put(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "save-edited-proposal"},
-        json=edit_payload,
-    ).json()
-    assert saved["proposal"]["revision"] == 3
-    assert saved["proposal"]["content"] == edited_content
-    previewed = preview_confirmation(
-        client,
-        write_headers,
-        saved,
-        idempotency_key="preview-edited-proposal",
-    )
-
-    conflicting_replay = client.put(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "save-edited-proposal"},
-        json={
-            **edit_payload,
-            "content": {**edited_content, "title": "不同的重放内容"},
-        },
-    )
-    assert conflicting_replay.status_code == 409
-    assert conflicting_replay.json()["detail"]["code"] == "idempotency_conflict"
-
-    confirmed = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/confirmation",
-        headers={**write_headers, "Idempotency-Key": "confirm-edited-proposal"},
-        json=confirmation_payload(previewed),
-    ).json()
-    original_confirmation = confirmed["receipts"]["human_confirmation"][
-        "receipt_ref"
-    ]
-    replayed = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/confirmation",
-        headers={**write_headers, "Idempotency-Key": "confirm-edited-proposal-retry"},
-        json=confirmation_payload(previewed),
-    ).json()
-    assert (
-        replayed["receipts"]["human_confirmation"]["receipt_ref"]
-        == original_confirmation
-    )
-
-
-def test_daemon_restart_resumes_from_the_first_missing_owner_receipt(
-    authenticated_product,
-) -> None:
-    data_root, client, write_headers = authenticated_product
-    draft = {
-        "goal": "验证跨 daemon 重启的创建恢复。",
-        "completion_criteria": "恢复后只存在一个 Quest、Question 与 Cycle。",
-        "key_configuration": "真实 SQLite；禁止重复领域效果。",
-        "literature_scope": "open_access",
-        "initial_question_direction": "分层 receipt 能否精确恢复？",
-        "material_receipts": [],
-    }
-    created = client.post(
-        "/api/v1/quest-initializations",
-        headers={**write_headers, "Idempotency-Key": "create-restart-quest"},
-        json=draft,
-    ).json()
-    generated = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "generate-restart-proposal"},
-        json={"expected_draft_hash": created["quest_draft"]["hash"]},
-    ).json()
-    previewed = preview_confirmation(
-        client,
-        write_headers,
-        generated,
-        idempotency_key="preview-before-restart",
-    )
-    exact_confirmation = confirmation_payload(previewed)
-    confirmed = client.post(
-        f"/api/v1/quest-initializations/{created['initialization_id']}/confirmation",
-        headers={**write_headers, "Idempotency-Key": "confirm-before-restart"},
+    replay = resumed_client.post(
+        f"/api/v1/quest-initializations/{opened['initialization_id']}/confirmation",
+        headers=_write_headers(resumed_headers, "success-confirm-after-restart"),
         json=exact_confirmation,
-    ).json()
-    assert confirmed["status"] == "dispatching"
-    confirmation_ref = confirmed["receipts"]["human_confirmation"]["receipt_ref"]
-
-    client.close()
-    run_cli("stop", "--data-root", str(data_root), "--json")
-    restarted = run_cli_json(
-        "start", "--data-root", str(data_root), "--port", "0", "--json"
     )
-    with httpx.Client(
-        base_url=str(restarted["base_url"]), timeout=5, trust_env=False
-    ) as resumed_client:
-        exchange = resumed_client.post(
-            "/auth/bootstrap",
-            headers={"Origin": str(restarted["base_url"])},
-            json={"token": str(restarted["bootstrap_token"])},
-        )
-        exchange.raise_for_status()
-        resumed_headers = {
-            "Origin": str(restarted["base_url"]),
-            "X-CSRF-Token": exchange.json()["csrf_token"],
-        }
-        deadline = time.monotonic() + 5
-        resumed = resumed_client.get(
-            f"/api/v1/quest-initializations/{created['initialization_id']}"
-        ).json()
-        while resumed["status"] != "completed" and time.monotonic() < deadline:
-            time.sleep(0.05)
-            resumed = resumed_client.get(
-                f"/api/v1/quest-initializations/{created['initialization_id']}"
-            ).json()
+    replay.raise_for_status()
+    assert replay.json()["quest_ref"] == completed["quest_ref"]
+    assert replay.json()["question_ref"] == completed["question_ref"]
+    assert replay.json()["cycle_ref"] == completed["cycle_ref"]
 
-        assert resumed["status"] == "completed"
-        assert (
-            resumed["receipts"]["human_confirmation"]["receipt_ref"]
-            == confirmation_ref
-        )
-        replay = resumed_client.post(
-            f"/api/v1/quest-initializations/{created['initialization_id']}/confirmation",
-            headers={
-                **resumed_headers,
-                "Idempotency-Key": "confirm-after-lost-ack",
-            },
-            json=exact_confirmation,
-        )
-        replay.raise_for_status()
-        assert replay.json()["quest_ref"] == resumed["quest_ref"]
-        assert replay.json()["memory_ref"] == resumed["memory_ref"]
-        assert replay.json()["question_ref"] == resumed["question_ref"]
-        assert replay.json()["cycle_ref"] == resumed["cycle_ref"]
-        assert resumed_client.get("/api/v1/snapshot").json()["research_space"] == {
-            "status": "active",
-            "quest_count": 1,
-            "question_count": 1,
-            "foreground_cycle_count": 1,
-        }
-
-
-def test_completed_initialization_leaves_the_recovery_queue_and_allows_next_quest(
-    authenticated_product,
-) -> None:
-    _data_root, client, write_headers = authenticated_product
-    first = client.post(
-        "/api/v1/quest-initializations",
-        headers={**write_headers, "Idempotency-Key": "create-first-of-two"},
-        json={
-            "goal": "建立第一项研究。",
-            "completion_criteria": "形成第一项可复核结论。",
-            "key_configuration": "公开资料。",
-            "literature_scope": "open_access",
-            "initial_question_direction": "第一项未知是什么？",
-            "material_receipts": [],
-        },
-    ).json()
-    generated = client.post(
-        f"/api/v1/quest-initializations/{first['initialization_id']}/proposal",
-        headers={**write_headers, "Idempotency-Key": "generate-first-of-two"},
-        json={"expected_draft_hash": first["quest_draft"]["hash"]},
-    ).json()
-    previewed = preview_confirmation(
-        client,
-        write_headers,
-        generated,
-        idempotency_key="preview-first-of-two",
-    )
-    client.post(
-        f"/api/v1/quest-initializations/{first['initialization_id']}/confirmation",
-        headers={**write_headers, "Idempotency-Key": "confirm-first-of-two"},
-        json=confirmation_payload(previewed),
-    ).raise_for_status()
-
-    deadline = time.monotonic() + 5
-    completed = previewed
-    while completed["status"] != "completed" and time.monotonic() < deadline:
-        time.sleep(0.05)
-        completed = client.get(
-            f"/api/v1/quest-initializations/{first['initialization_id']}"
-        ).json()
-    assert completed["status"] == "completed"
-
-    second_response = client.post(
-        "/api/v1/quest-initializations",
-        headers={**write_headers, "Idempotency-Key": "create-second-of-two"},
-        json={
-            "goal": "建立第二项独立研究。",
-            "completion_criteria": "形成第二项可复核结论。",
-            "key_configuration": "另一组公开资料。",
-            "literature_scope": "open_access",
-            "initial_question_direction": "第二项未知是什么？",
-            "material_receipts": [],
-        },
-    )
-    assert second_response.status_code == 201
-    second = second_response.json()
-    assert second["initialization_id"] != first["initialization_id"]
-    assert second["status"] == "draft"
-    assert client.get("/api/v1/snapshot").json()["quest_creation"]["current"][
-        "initialization_id"
-    ] == second["initialization_id"]
+    resumed_client.close()
+    restarted.close()

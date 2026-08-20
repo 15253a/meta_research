@@ -17,13 +17,45 @@ export type UnavailableCapability = {
   reason: { code: string; message?: string };
 };
 
+export type LiteratureMode = "oa_then_institution" | "oa_only" | "provided_only";
+
 export type QuestDraft = {
+  goal: string;
+  completion_criteria: string;
+  time_budget: "7d" | "30d" | "90d" | "open";
+  route: "direct" | "deepfetch";
+  resource_envelope_ref: string | null;
+  resource_envelope_hash: string | null;
+  literature: {
+    mode: LiteratureMode;
+    library_entry_url: string;
+    scope_exclusions: string;
+    accepted_material_bindings: Array<Record<string, unknown>>;
+  };
+  background_and_initial_direction: string;
+};
+
+export type LegacyQuestDraft = {
   goal: string;
   completion_criteria: string;
   key_configuration: string;
   literature_scope: "comprehensive" | "open_access" | "provided_materials";
   initial_question_direction: string;
   material_receipts: string[];
+};
+
+export type QuestDraftValue = QuestDraft | LegacyQuestDraft;
+
+export type QuestDraftWriteBasis = {
+  revision: number;
+  hash: string;
+};
+
+export type QuestionProposalWriteBasis = {
+  draftRevision: number;
+  draftHash: string;
+  proposalRef: string | null;
+  proposalHash: string | null;
 };
 
 export type QuestionContent = {
@@ -53,39 +85,135 @@ export type ReceiptState =
       reason: { code: string };
     };
 
+export type ComputeDevice = {
+  uuid: string;
+  name: string;
+  memory_total_mib: number;
+};
+
+export type QuestComputeSnapshot = {
+  snapshot_ref: string;
+  status: "ready" | "unavailable";
+  adapter_kind: string;
+  observed_at: number;
+  devices: ComputeDevice[];
+  reason: null | { code: string };
+};
+
+export type QuestResourceEnvelope = {
+  ref: string;
+  hash: string;
+  schema_ref: string;
+  status: "current" | "stale";
+  host_snapshot_ref: string;
+  time_budget: QuestDraft["time_budget"];
+  hard_ceiling: {
+    kind: "wall_clock" | "open_ended";
+    seconds: number | null;
+  };
+  selected_device_uuids: string[];
+};
+
+export type IntentSessionTurn = {
+  ref: string;
+  ordinal: number;
+  basis_revision: number;
+  basis_hash: string;
+  user_content: string;
+  user_content_hash: string;
+  assistant_status: "queued" | "running" | "completed" | "unavailable" | "failed";
+  assistant_content: string | null;
+  assistant_content_hash: string | null;
+  reason: null | { code: string };
+};
+
+export type TargetAssertion = {
+  owner: string;
+  operation: string;
+  may_change: string[];
+  will_not_change: string[];
+  preconditions: string[];
+  risks: string[];
+  stale_if: string[];
+  bindings: Record<string, unknown>;
+  target_hash: string;
+};
+
+export type QuestCapability =
+  | { status: "ready" }
+  | Omit<UnavailableCapability, "capability">;
+
 export type QuestCreationView = {
   initialization_id: string;
   creation_context: "quest_initialization";
-  route: "direct";
-  status: "draft" | "proposal_ready" | "dispatching" | "completed" | "cancelled";
-  quest_draft: { revision: number; hash: string; value: QuestDraft };
+  route: "direct" | "deepfetch";
+  status:
+    | "draft"
+    | "proposal_generating"
+    | "proposal_ready"
+    | "proposal_stale"
+    | "dispatching"
+    | "partial"
+    | "recovering"
+    | "unavailable"
+    | "completed"
+    | "cancelled";
+  quest_draft: {
+    revision: number;
+    hash: string;
+    schema_ref: string;
+    value: QuestDraftValue;
+  };
+  compute: QuestComputeSnapshot | null;
+  resource_envelope: QuestResourceEnvelope | null;
+  proposal_generation: null | {
+    ref: string;
+    basis_revision: number;
+    basis_hash: string;
+    status:
+      | "queued"
+      | "running"
+      | "succeeded"
+      | "capability_unavailable"
+      | "failed";
+    adapter_kind: string;
+    attempt_count: number;
+    proposal_ref?: string;
+    proposal_hash?: string;
+    failure: null | { code: string };
+  };
   proposal: null | {
     ref: string;
     revision: number;
     hash: string;
     basis_revision: number;
     basis_hash: string;
-    status: "current" | "stale";
+    status: "current" | "incomplete" | "stale";
     content: QuestionContent;
   };
   confirmation_preview: null | {
     ref: string;
     hash: string;
+    schema_ref: string;
     basis_revision: number;
     basis_hash: string;
     proposal_ref: string;
     proposal_hash: string;
     status: "current" | "stale" | "consumed";
-    target_assertions: Array<{
-      owner: string;
-      operation: string;
-      may_change: string[];
-      will_not_change: string[];
-      preconditions: string[];
-      risks: string[];
-      stale_if: string[];
-      target_hash: string;
-    }>;
+    target_assertions: TargetAssertion[];
+    will_happen: string[];
+    will_not_happen: string[];
+    feed_revision: number | null;
+  };
+  intent_session: null | {
+    ref: string;
+    status: "open" | "closed";
+    turns: IntentSessionTurn[];
+  };
+  capabilities: {
+    direct: QuestCapability;
+    first_question_deepfetch: QuestCapability;
+    accepted_material_basis: QuestCapability;
   };
   receipts: Record<
     | "human_confirmation"
@@ -95,6 +223,13 @@ export type QuestCreationView = {
     | "cycle_activation",
     ReceiptState
   >;
+  recovery: null | {
+    state: string;
+    first_missing_step: string | null;
+    attempt_count: number;
+    reason: null | { code: string };
+    next_retry_at: number | null;
+  };
   canonical_empty_advancement: boolean;
   quest_ref?: string;
   memory_ref?: string;
@@ -117,8 +252,8 @@ export type PublicSnapshot = {
     status: "ready";
     route: "direct";
     current: QuestCreationView | null;
-    accepted_material_basis: UnavailableCapability;
-    first_question_deepfetch: UnavailableCapability;
+    accepted_material_basis: Omit<UnavailableCapability, "capability">;
+    first_question_deepfetch: Omit<UnavailableCapability, "capability">;
   };
   unavailable: UnavailableCapability[];
 };
@@ -141,18 +276,34 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
   return (await response.json()) as PublicSnapshot;
 }
 
-export function createQuest(draft: QuestDraft): Promise<QuestCreationView> {
-  return writeJson("/api/v1/quest-initializations", "POST", draft);
+export function createQuest(): Promise<QuestCreationView> {
+  return writeJson("/api/v1/quest-initializations", "POST", {});
 }
 
 export function reviseQuestDraft(
   creation: QuestCreationView,
   draft: QuestDraft,
+  expected: QuestDraftWriteBasis = creation.quest_draft,
 ): Promise<QuestCreationView> {
   return writeJson(
     `/api/v1/quest-initializations/${creation.initialization_id}/draft`,
     "PUT",
-    { ...draft, expected_draft_hash: creation.quest_draft.hash },
+    {
+      expected_draft_revision: expected.revision,
+      expected_draft_hash: expected.hash,
+      draft,
+    },
+  );
+}
+
+export function observeHostCompute(
+  creation: QuestCreationView,
+  selectedDeviceUuids: string[] = [],
+): Promise<QuestCreationView> {
+  return writeJson(
+    `/api/v1/quest-initializations/${creation.initialization_id}/compute-probe`,
+    "POST",
+    { selected_device_uuids: selectedDeviceUuids },
   );
 }
 
@@ -160,21 +311,71 @@ export function generateQuestionProposal(
   creation: QuestCreationView,
 ): Promise<QuestCreationView> {
   return writeJson(
-    `/api/v1/quest-initializations/${creation.initialization_id}/proposal`,
+    `/api/v1/quest-initializations/${creation.initialization_id}/proposal-generations`,
     "POST",
-    { expected_draft_hash: creation.quest_draft.hash },
+    {
+      expected_draft_revision: creation.quest_draft.revision,
+      expected_draft_hash: creation.quest_draft.hash,
+    },
   );
 }
 
 export function saveQuestionProposal(
   creation: QuestCreationView,
   content: QuestionContent,
+  explicitReview = false,
+  expected: QuestionProposalWriteBasis = {
+    draftRevision: creation.quest_draft.revision,
+    draftHash: creation.quest_draft.hash,
+    proposalRef: creation.proposal?.ref ?? null,
+    proposalHash: creation.proposal?.hash ?? null,
+  },
 ): Promise<QuestCreationView> {
   return writeJson(
     `/api/v1/quest-initializations/${creation.initialization_id}/proposal`,
     "PUT",
-    { expected_draft_hash: creation.quest_draft.hash, content },
+    {
+      expected_draft_revision: expected.draftRevision,
+      expected_draft_hash: expected.draftHash,
+      expected_proposal_ref: expected.proposalRef,
+      expected_proposal_hash: expected.proposalHash,
+      explicit_review: explicitReview,
+      content,
+    },
   );
+}
+
+export function sendIntentMessage(
+  creation: QuestCreationView,
+  message: string,
+): Promise<QuestCreationView> {
+  return writeJson(
+    `/api/v1/quest-initializations/${creation.initialization_id}/intent-session/messages`,
+    "POST",
+    {
+      expected_draft_revision: creation.quest_draft.revision,
+      expected_draft_hash: creation.quest_draft.hash,
+      message,
+    },
+  );
+}
+
+export async function fetchQuestCreation(
+  initializationId: string,
+  signal?: AbortSignal,
+): Promise<QuestCreationView> {
+  const response = await fetch(
+    `/api/v1/quest-initializations/${initializationId}`,
+    {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+      signal,
+    },
+  );
+  if (!response.ok) {
+    throw new ProductError(`quest_initialization_unavailable:${response.status}`);
+  }
+  return (await response.json()) as QuestCreationView;
 }
 
 export function confirmQuest(
@@ -194,22 +395,6 @@ export function confirmQuest(
       proposal_hash: creation.proposal.hash,
       preview_ref: creation.confirmation_preview.ref,
       preview_hash: creation.confirmation_preview.hash,
-    },
-  );
-}
-
-export function previewQuestConfirmation(
-  creation: QuestCreationView,
-): Promise<QuestCreationView> {
-  if (!creation.proposal) throw new ProductError("question_proposal_missing");
-  return writeJson(
-    `/api/v1/quest-initializations/${creation.initialization_id}/confirmation-preview`,
-    "POST",
-    {
-      quest_draft_revision: creation.quest_draft.revision,
-      quest_draft_hash: creation.quest_draft.hash,
-      proposal_ref: creation.proposal.ref,
-      proposal_hash: creation.proposal.hash,
     },
   );
 }
@@ -322,17 +507,17 @@ export function followProjection(
   onSnapshotRequired: () => void,
   onConnection: (connected: boolean) => void,
 ): () => void {
-  const stream = new EventSource(`/api/v1/events?after=${afterRevision}`);
-  stream.onopen = () => onConnection(true);
-  stream.onerror = () => onConnection(false);
-  const update = (event: Event) => {
-    onRevision(Number((event as MessageEvent).lastEventId));
-  };
-  for (const eventType of [
+  const eventTypes = [
     "system.ready",
     "human_collaboration.quest_draft_created",
     "human_collaboration.quest_draft_revised",
+    "human_collaboration.host_compute_observed",
+    "human_collaboration.question_proposal_generation_queued",
+    "human_collaboration.question_proposal_generation_failed",
     "human_collaboration.question_proposal_recorded",
+    "human_collaboration.intent_message_queued",
+    "human_collaboration.intent_reply_failed",
+    "human_collaboration.intent_reply_recorded",
     "human_collaboration.confirmation_preview_recorded",
     "human_collaboration.quest_bundle_confirmed",
     "human_collaboration.bundle_confirmation_not_accepted",
@@ -344,9 +529,70 @@ export function followProjection(
     "research_memory.question_content_accepted",
     "research_graph.root_question_accepted",
     "advancement_engine.initial_cycle_activated",
-  ]) {
-    stream.addEventListener(eventType, update);
-  }
-  stream.addEventListener("snapshot.required", () => onSnapshotRequired());
-  return () => stream.close();
+  ];
+  let cursor = afterRevision;
+  let stream: EventSource | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectAttempt = 0;
+  let stopped = false;
+
+  const acceptCursor = (event: Event) => {
+    const revision = Number((event as MessageEvent).lastEventId);
+    if (!Number.isSafeInteger(revision) || revision <= cursor) return false;
+    cursor = revision;
+    return true;
+  };
+
+  const scheduleSnapshotReload = () => {
+    if (reloadTimer !== null) return;
+    reloadTimer = setTimeout(() => {
+      reloadTimer = null;
+      onRevision(cursor);
+    }, 50);
+  };
+
+  const connect = () => {
+    if (stopped) return;
+    const next = new EventSource(`/api/v1/events?after=${cursor}`);
+    stream = next;
+    next.onopen = () => {
+      reconnectAttempt = 0;
+      onConnection(true);
+    };
+    next.onerror = () => {
+      if (stopped || stream !== next) return;
+      onConnection(false);
+      next.close();
+      stream = null;
+      const delay = Math.min(250 * 2 ** reconnectAttempt, 4_000);
+      reconnectAttempt += 1;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    };
+    const update = (event: Event) => {
+      if (!acceptCursor(event)) return;
+      scheduleSnapshotReload();
+    };
+    next.addEventListener("projection.updated", update);
+    for (const eventType of eventTypes) next.addEventListener(eventType, update);
+    next.addEventListener("snapshot.required", (event) => {
+      acceptCursor(event);
+      if (reloadTimer !== null) {
+        clearTimeout(reloadTimer);
+        reloadTimer = null;
+      }
+      onSnapshotRequired();
+    });
+  };
+
+  connect();
+  return () => {
+    stopped = true;
+    if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+    if (reloadTimer !== null) clearTimeout(reloadTimer);
+    stream?.close();
+  };
 }

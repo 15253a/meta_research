@@ -97,6 +97,8 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "object_store",
             "owner_interfaces",
             "projection",
+            "quest_drafting_worker",
+            "quest_reconciliation_worker",
         }
         assert snapshot["research_space"] == {
             "status": "empty",
@@ -169,14 +171,26 @@ def test_sse_resumes_by_revision_and_directs_gaps_to_the_snapshot(
             "GET", "/api/v1/events", headers={"Last-Event-ID": "0"}
         ) as resumed:
             lines = []
+            completed_events = 0
             for line in resumed.iter_lines():
                 lines.append(line)
                 if line == "":
-                    break
+                    completed_events += 1
+                    if completed_events == 2:
+                        break
         assert resumed.status_code == 200
+        assert "event: projection.updated" in lines
         assert "event: system.ready" in lines
-        event_id = next(line.removeprefix("id: ") for line in lines if line.startswith("id: "))
-        assert int(event_id) >= 1
+        assert lines.index("event: system.ready") < lines.index(
+            "event: projection.updated"
+        )
+        event_ids = [
+            int(line.removeprefix("id: "))
+            for line in lines
+            if line.startswith("id: ")
+        ]
+        assert len(event_ids) == 1
+        assert event_ids[0] >= 1
 
         with client.stream(
             "GET",
@@ -184,11 +198,15 @@ def test_sse_resumes_by_revision_and_directs_gaps_to_the_snapshot(
             headers={"Last-Event-ID": "0"},
         ) as reconnected:
             reconnect_lines = []
+            completed_events = 0
             for line in reconnected.iter_lines():
                 reconnect_lines.append(line)
                 if line == "":
-                    break
+                    completed_events += 1
+                    if completed_events == 2:
+                        break
         assert reconnected.status_code == 200
+        assert "event: projection.updated" in reconnect_lines
         assert "event: system.ready" in reconnect_lines
 
         with client.stream(

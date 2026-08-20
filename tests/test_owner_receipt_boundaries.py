@@ -11,8 +11,63 @@ from meta_research.owners.common import (
     AcceptanceReceipt,
     OwnerConflict,
     canonical_hash,
+    canonical_json,
 )
 from meta_research.paths import prepare_data_root
+from meta_research.quest_drafting import (
+    HostComputeSnapshot,
+    IntentTurnRequest,
+    IntentTurnResult,
+    ProposalDraftRequest,
+    ProposalDraftResult,
+)
+
+
+_QUESTION = {
+    "title": "跨 Owner receipt 的验证边界",
+    "unknown_statement": "尚不明确哪些跨 Owner 验证是充分且必要的。",
+    "answer_shape": "形成可复核的 lineage 与失败边界。",
+    "applicability_scope": "当前 SQLite Owner Interfaces。",
+    "background_context": "验证 receipt 不能由调用者伪造。",
+    "requirements_constraints": "保持 Owner 权限与精确 binding。",
+}
+
+
+class _DeterministicDraftingAdapter:
+    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+        return ProposalDraftResult(_QUESTION, "test_deterministic")
+
+    def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
+        return IntentTurnResult("测试回复", "test-session", "test_deterministic")
+
+
+class _UnavailableProbe:
+    def observe(self) -> HostComputeSnapshot:
+        return HostComputeSnapshot(
+            status="unavailable",
+            observed_at=0.0,
+            devices=(),
+            adapter_kind="test_probe",
+            reason_code="test_unavailable",
+        )
+
+
+def _runtime(path: Path):
+    adapter = _DeterministicDraftingAdapter()
+    return build_production_runtime(
+        prepare_data_root(path),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=_UnavailableProbe(),
+    )
+
+
+def _generate(hc, created: dict[str, object], key: str) -> dict[str, object]:
+    hc.generate_question_proposal(
+        created["initialization_id"], created["quest_draft"]["hash"], key
+    )
+    assert hc.process_drafting_once()
+    return hc.query_quest_creation(created["initialization_id"])
 
 
 def _draft() -> dict[str, object]:
@@ -29,11 +84,7 @@ def _draft() -> dict[str, object]:
 def _confirm_direct_quest(runtime, prefix: str) -> dict[str, object]:
     hc = runtime.owners.human_collaboration
     created = hc.create_quest(_draft(), f"{prefix}-create")
-    proposed = hc.generate_question_proposal(
-        created["initialization_id"],
-        created["quest_draft"]["hash"],
-        f"{prefix}-proposal",
-    )
+    proposed = _generate(hc, created, f"{prefix}-proposal")
     previewed = hc.preview_confirmation(
         created["initialization_id"],
         quest_draft_revision=created["quest_draft"]["revision"],
@@ -58,18 +109,14 @@ def _confirm_direct_quest(runtime, prefix: str) -> dict[str, object]:
 def test_each_downstream_owner_rejects_forged_upstream_receipts(
     tmp_path: Path,
 ) -> None:
-    runtime = build_production_runtime(prepare_data_root(tmp_path / "receipt-boundary"))
+    runtime = _runtime(tmp_path / "receipt-boundary")
     hc = runtime.owners.human_collaboration
     rg = runtime.owners.research_graph
     rm = runtime.owners.research_memory
     ae = runtime.owners.advancement_engine
     try:
         created = hc.create_quest(_draft(), "owner-create")
-        proposal_view = hc.generate_question_proposal(
-            created["initialization_id"],
-            created["quest_draft"]["hash"],
-            "owner-generate",
-        )
+        proposal_view = _generate(hc, created, "owner-generate")
         proposal = proposal_view["proposal"]
 
         fake_confirmation = AcceptanceReceipt(
@@ -189,18 +236,107 @@ def test_each_downstream_owner_rejects_forged_upstream_receipts(
         runtime.close()
 
 
+def test_research_graph_goal_custody_rejects_tampered_authoritative_json(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "rg-goal-custody")
+    hc = runtime.owners.human_collaboration
+    rg = runtime.owners.research_graph
+    try:
+        created = _confirm_direct_quest(runtime, "rg-goal-custody")
+        assert hc.reconcile_once()
+        initialization_id = created["initialization_id"]
+        quest = rg.query_quest(initialization_id)
+        assert quest is not None
+
+        tampered_draft = {
+            **_draft(),
+            "goal": "绕过已接纳 draft hash 的篡改目标。",
+        }
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE rg_quests SET goal_json = :goal_json "
+                    "WHERE initialization_id = :initialization_id"
+                ),
+                {
+                    "goal_json": canonical_json(tampered_draft),
+                    "initialization_id": initialization_id,
+                },
+            )
+
+        with pytest.raises(OwnerConflict, match="quest_receipt_invalid"):
+            rg.query_quest(initialization_id)
+        with pytest.raises(OwnerConflict, match="quest_receipt_invalid"):
+            rg.verify_quest_receipt(
+                initialization_id=initialization_id,
+                quest_ref=quest.quest_ref,
+                proposal_ref=quest.proposal_ref,
+                proposal_hash=quest.proposal_hash,
+                confirmation_ref=quest.confirmation.receipt_ref,
+                receipt=quest.receipt,
+            )
+
+        assert not hc.reconcile_once()
+        assert hc.query_quest_creation(initialization_id)["receipts"]["quest_goal"] == {
+            "status": "rejected",
+            "reason": {"code": "quest_receipt_invalid"},
+        }
+    finally:
+        runtime.close()
+
+
+def test_research_graph_idempotent_replay_revalidates_authoritative_goal_json(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "rg-goal-replay")
+    hc = runtime.owners.human_collaboration
+    rg = runtime.owners.research_graph
+    try:
+        created = _confirm_direct_quest(runtime, "rg-goal-replay")
+        assert hc.reconcile_once()
+        initialization_id = created["initialization_id"]
+        quest = rg.query_quest(initialization_id)
+        assert quest is not None
+
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE rg_quests SET goal_json = :goal_json "
+                    "WHERE initialization_id = :initialization_id"
+                ),
+                {
+                    "goal_json": canonical_json(
+                        {**_draft(), "goal": "重放前被篡改的目标。"}
+                    ),
+                    "initialization_id": initialization_id,
+                },
+            )
+
+        with pytest.raises(OwnerConflict, match="quest_receipt_invalid"):
+            rg.accept_quest(
+                initialization_id=initialization_id,
+                draft=created["quest_draft"]["value"],
+                draft_revision=quest.draft_revision,
+                draft_hash=quest.draft_hash,
+                proposal_ref=quest.proposal_ref,
+                proposal_hash=quest.proposal_hash,
+                preview_ref=quest.preview_ref,
+                preview_hash=quest.preview_hash,
+                confirmation=quest.confirmation,
+            )
+    finally:
+        runtime.close()
+
+
 def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstream(
     tmp_path: Path,
 ) -> None:
-    runtime = build_production_runtime(prepare_data_root(tmp_path / "partial-custody"))
+    runtime = _runtime(tmp_path / "partial-custody")
     hc = runtime.owners.human_collaboration
     try:
         created = hc.create_quest(_draft(), "partial-create")
-        generated = hc.generate_question_proposal(
-            created["initialization_id"],
-            created["quest_draft"]["hash"],
-            "partial-generate",
-        )
+        generated = _generate(hc, created, "partial-generate")
         proposal = generated["proposal"]
         previewed = hc.preview_confirmation(
             created["initialization_id"],
@@ -259,10 +395,68 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
         runtime.close()
 
 
+def test_damaged_completed_quest_is_unavailable_without_reentering_active_queue(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "completed-custody-preempts-new-draft")
+    hc = runtime.owners.human_collaboration
+    try:
+        first = _confirm_direct_quest(runtime, "completed-custody-first")
+        for _step in range(4):
+            assert hc.reconcile_once()
+        assert hc.query_quest_creation(first["initialization_id"])["status"] == (
+            "completed"
+        )
+
+        second = hc.create_quest({}, "completed-custody-second")
+        assert second["initialization_id"] != first["initialization_id"]
+        next(
+            runtime.data_root.objects.glob("formal-question-content/*/*.json")
+        ).unlink()
+
+        damaged = hc.query_quest_creation(first["initialization_id"])
+        assert damaged["status"] == "unavailable"
+        assert hc.query_quest_creation(second["initialization_id"])["status"] == (
+            "draft"
+        )
+        current = hc.query_current_quest_creation()
+        assert current is not None
+        assert current["initialization_id"] == second["initialization_id"]
+        assert current["status"] == "draft"
+
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_reconciliation_checkpoints SET updated_at = 0 WHERE "
+                    "initialization_id = :initialization_id"
+                ),
+                {"initialization_id": first["initialization_id"]},
+            )
+        assert not hc.reconcile_once()
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_reconciliation_checkpoints SET next_retry_at = 0 "
+                    "WHERE initialization_id = :initialization_id"
+                ),
+                {"initialization_id": first["initialization_id"]},
+            )
+        assert hc.reconcile_once()
+        assert hc.query_quest_creation(first["initialization_id"])["status"] == (
+            "completed"
+        )
+        resumed = hc.query_current_quest_creation()
+        assert resumed is not None
+        assert resumed["initialization_id"] == second["initialization_id"]
+        assert resumed["status"] == "draft"
+    finally:
+        runtime.close()
+
+
 def test_public_receipt_projection_fails_closed_when_owner_evidence_is_tampered(
     tmp_path: Path,
 ) -> None:
-    runtime = build_production_runtime(prepare_data_root(tmp_path / "tampered-receipts"))
+    runtime = _runtime(tmp_path / "tampered-receipts")
     hc = runtime.owners.human_collaboration
     try:
         created = _confirm_direct_quest(runtime, "tamper")
@@ -342,7 +536,7 @@ def test_public_receipt_projection_fails_closed_when_owner_evidence_is_tampered(
 def test_native_rm_io_failure_is_durable_and_recovers_from_the_same_layer(
     tmp_path: Path,
 ) -> None:
-    runtime = build_production_runtime(prepare_data_root(tmp_path / "rm-io-failure"))
+    runtime = _runtime(tmp_path / "rm-io-failure")
     hc = runtime.owners.human_collaboration
     try:
         created = _confirm_direct_quest(runtime, "rm-io")
@@ -362,6 +556,14 @@ def test_native_rm_io_failure_is_durable_and_recovers_from_the_same_layer(
         }
 
         blocked_directory.unlink()
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_reconciliation_checkpoints SET next_retry_at = 0 "
+                    "WHERE initialization_id = :initialization_id"
+                ),
+                {"initialization_id": created["initialization_id"]},
+            )
         assert hc.reconcile_once()
         recovered = hc.query_quest_creation(created["initialization_id"])
         assert recovered["receipts"]["question_content"]["status"] == "accepted"
@@ -369,10 +571,56 @@ def test_native_rm_io_failure_is_durable_and_recovers_from_the_same_layer(
         runtime.close()
 
 
+def test_reconciliation_honors_backoff_and_counts_repeated_failures(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "reconciliation-backoff")
+    hc = runtime.owners.human_collaboration
+    try:
+        created = _confirm_direct_quest(runtime, "backoff")
+        assert hc.reconcile_once()  # RG Quest accepted.
+        blocked_directory = runtime.data_root.objects / "formal-question-content"
+        blocked_directory.write_text("not a directory", encoding="utf-8")
+
+        assert not hc.reconcile_once()
+        first = hc.query_quest_creation(created["initialization_id"])["recovery"]
+        assert first["attempt_count"] == 1
+        assert first["next_retry_at"] is not None
+
+        assert not hc.reconcile_once()
+        unchanged = hc.query_quest_creation(created["initialization_id"])["recovery"]
+        assert unchanged["attempt_count"] == 1
+        assert unchanged["next_retry_at"] == first["next_retry_at"]
+
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_reconciliation_checkpoints SET next_retry_at = 0 "
+                    "WHERE initialization_id = :initialization_id"
+                ),
+                {"initialization_id": created["initialization_id"]},
+            )
+        assert not hc.reconcile_once()
+        repeated = hc.query_quest_creation(created["initialization_id"])["recovery"]
+        assert repeated["attempt_count"] == 2
+        assert repeated["next_retry_at"] > first["next_retry_at"]
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM hc_reconciliation_attempts WHERE "
+                    "initialization_id = :initialization_id AND step = "
+                    "'question_content'"
+                ),
+                {"initialization_id": created["initialization_id"]},
+            ).scalar_one() == 2
+    finally:
+        runtime.close()
+
+
 def test_cycle_commit_is_not_publicly_complete_until_hc_completion_is_durable(
     tmp_path: Path,
 ) -> None:
-    runtime = build_production_runtime(prepare_data_root(tmp_path / "completion-window"))
+    runtime = _runtime(tmp_path / "completion-window")
     hc = runtime.owners.human_collaboration
     try:
         created = _confirm_direct_quest(runtime, "completion-window")
@@ -392,6 +640,11 @@ def test_cycle_commit_is_not_publicly_complete_until_hc_completion_is_durable(
 
         interrupted = hc.query_quest_creation(created["initialization_id"])
         assert interrupted["status"] == "dispatching"
+        assert hc.query_current_quest_creation()["initialization_id"] == created[
+            "initialization_id"
+        ]
+        resumed = hc.create_quest({}, "resume-completion-window")
+        assert resumed["initialization_id"] == created["initialization_id"]
         with pytest.raises(OwnerConflict, match="quest_initialization_already_active"):
             hc.create_quest({**_draft(), "goal": "第二个 Quest"}, "second-too-soon")
 
@@ -399,9 +652,80 @@ def test_cycle_commit_is_not_publicly_complete_until_hc_completion_is_durable(
         assert hc.query_quest_creation(created["initialization_id"])["status"] == (
             "completed"
         )
+        assert hc.query_current_quest_creation() is None
         second = hc.create_quest(
             {**_draft(), "goal": "第二个 Quest"}, "second-after-complete"
         )
         assert second["status"] == "draft"
+
+        replayed_first = hc.create_quest(_draft(), "completion-window-create")
+        assert replayed_first["initialization_id"] == created["initialization_id"]
+        assert replayed_first["status"] == "completed"
+        with pytest.raises(OwnerConflict, match="idempotency_conflict"):
+            hc.create_quest(
+                {**_draft(), "goal": "第二个 Quest"},
+                "completion-window-create",
+            )
+    finally:
+        runtime.close()
+
+
+def test_completed_status_fails_closed_when_research_memory_custody_is_lost(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "completed-custody-loss")
+    hc = runtime.owners.human_collaboration
+    try:
+        created = _confirm_direct_quest(runtime, "completed-custody-loss")
+        while hc.query_quest_creation(created["initialization_id"])["status"] != (
+            "completed"
+        ):
+            assert hc.reconcile_once()
+        with runtime._database.read() as connection:
+            object_path = connection.execute(
+                text(
+                    "SELECT object_path FROM rm_formal_question_contents WHERE "
+                    "initialization_id = :initialization_id"
+                ),
+                {"initialization_id": created["initialization_id"]},
+            ).scalar_one()
+        (runtime.data_root.objects / object_path).unlink()
+
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_reconciliation_checkpoints SET updated_at = 0 WHERE "
+                    "initialization_id = :initialization_id"
+                ),
+                {"initialization_id": created["initialization_id"]},
+            )
+
+        broken = hc.query_quest_creation(created["initialization_id"])
+        assert broken["status"] == "unavailable"
+        assert hc.query_current_quest_creation() is None
+        resumed = hc.create_quest({}, "start-after-damaged-completed")
+        assert resumed["initialization_id"] != created["initialization_id"]
+        assert resumed["status"] == "draft"
+        assert broken["receipts"]["question_content"] == {
+            "status": "rejected",
+            "reason": {"code": "question_content_custody_unavailable"},
+        }
+        for layer in ("question_identity", "cycle_activation"):
+            assert broken["receipts"][layer] == {
+                "status": "not_attempted",
+                "reason": {
+                    "code": "upstream_not_accepted",
+                    "upstream_step": "question_content",
+                },
+            }
+
+        assert not hc.reconcile_once()
+        still_broken = hc.query_quest_creation(created["initialization_id"])
+        assert still_broken["status"] == "unavailable"
+        assert still_broken["recovery"]["state"] == "partial"
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text("SELECT COUNT(*) FROM hc_quest_initializations")
+            ).scalar_one() == 2
     finally:
         runtime.close()

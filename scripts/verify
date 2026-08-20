@@ -9,28 +9,34 @@ VERIFY_ROOT=$(mktemp -d /tmp/meta-research-installed-verify.XXXXXX)
 INSTALL_ROOT="$VERIFY_ROOT/install"
 DATA_ROOT="$VERIFY_ROOT/data"
 DIST_ROOT="$VERIFY_ROOT/dist"
+PROVIDER_PATH="$VERIFY_ROOT/provider-path"
+CODEX_CALLS="$PROVIDER_PATH/codex-calls.jsonl"
 LOCKED_REQUIREMENTS="$VERIFY_ROOT/locked-requirements.txt"
 START_RESULT="$VERIFY_ROOT/start.json"
+RESTART_RESULT="$VERIFY_ROOT/restart.json"
+FINAL_RESTART_RESULT="$VERIFY_ROOT/final-restart.json"
 BOOTSTRAP_BODY="$VERIFY_ROOT/bootstrap.json"
 AUTH_RESULT="$VERIFY_ROOT/auth.json"
 COOKIE_JAR="$VERIFY_ROOT/cookies.txt"
 SNAPSHOT="$VERIFY_ROOT/snapshot.json"
 SHELL_HTML="$VERIFY_ROOT/shell.html"
-CLIENT_BUNDLE="$VERIFY_ROOT/client-bundle.js"
+SHELL_ASSETS="$VERIFY_ROOT/shell-assets.txt"
+SHELL_ASSET_ROOT="$VERIFY_ROOT/shell-assets"
 SSE_RESUME="$VERIFY_ROOT/sse-resume.txt"
 SSE_GAP="$VERIFY_ROOT/sse-gap.txt"
-QUEST_DRAFT="$VERIFY_ROOT/quest-draft.json"
-QUEST_CREATED="$VERIFY_ROOT/quest-created.json"
-PROPOSAL_REQUEST="$VERIFY_ROOT/proposal-request.json"
-PROPOSAL_RESULT="$VERIFY_ROOT/proposal-result.json"
-PREVIEW_REQUEST="$VERIFY_ROOT/preview-request.json"
-PREVIEW_RESULT="$VERIFY_ROOT/preview-result.json"
-CONFIRMATION_REQUEST="$VERIFY_ROOT/confirmation-request.json"
-QUEST_RESULT="$VERIFY_ROOT/quest-result.json"
+QUEST_OPENED="$VERIFY_ROOT/quest-opened.json"
+QUEST_PROBED="$VERIFY_ROOT/quest-probed.json"
+DRAFT_REQUEST="$VERIFY_ROOT/draft-request.json"
+QUEST_SAVED="$VERIFY_ROOT/quest-saved.json"
+INTENT_REQUEST="$VERIFY_ROOT/intent-request.json"
+GENERATION_REQUEST="$VERIFY_ROOT/generation-request.json"
+QUEST_VIEW="$VERIFY_ROOT/quest-view.json"
+SUCCESS_RESULT="$VERIFY_ROOT/success.json"
 
 cleanup() {
   if [[ -x "$INSTALL_ROOT/bin/meta-research" ]]; then
-    "$INSTALL_ROOT/bin/meta-research" stop --data-root "$DATA_ROOT" --json >/dev/null 2>&1 || true
+    "$INSTALL_ROOT/bin/meta-research" stop \
+      --data-root "$DATA_ROOT" --json >/dev/null 2>&1 || true
   fi
   rm -rf -- "$VERIFY_ROOT"
 }
@@ -39,6 +45,11 @@ trap cleanup EXIT
 uv lock --check
 uv export --frozen --no-dev --no-emit-project --format requirements.txt \
   --output-file "$LOCKED_REQUIREMENTS" >/dev/null
+(
+  cd "$PROJECT_ROOT/web"
+  npm ci
+  npm run build
+)
 uv build --wheel --out-dir "$DIST_ROOT" >/dev/null
 uv venv --python 3.12 "$INSTALL_ROOT" >/dev/null
 WHEEL=$(find "$DIST_ROOT" -maxdepth 1 -type f -name '*.whl' -print -quit)
@@ -54,7 +65,28 @@ import json, sys
 assert json.load(sys.stdin) == {"product": "meta-research-vnext", "version": "0.1.0"}
 '
 
-"$CLI" start --data-root "$DATA_ROOT" --port 0 --json >"$START_RESULT"
+mkdir -p "$PROVIDER_PATH"
+"$INSTALL_ROOT/bin/python" - "$PROVIDER_PATH/nvidia-smi" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text(
+    "#!/bin/sh\n"
+    "test \"$*\" = \"--query-gpu=uuid,name,memory.total "
+    "--format=csv,noheader,nounits\" || exit 64\n"
+    "printf '%s\\n' 'GPU-installed-test, Installed Verification GPU, 81920'\n",
+    encoding="utf-8",
+)
+path.chmod(0o755)
+PY
+if PATH="$PROVIDER_PATH" command -v codex >/dev/null 2>&1; then
+  echo "providerless verification PATH unexpectedly resolves codex" >&2
+  exit 1
+fi
+
+PATH="$PROVIDER_PATH" "$CLI" start \
+  --data-root "$DATA_ROOT" --port 0 --json >"$START_RESULT"
 "$INSTALL_ROOT/bin/python" - "$START_RESULT" "$BOOTSTRAP_BODY" <<'PY'
 import json
 import pathlib
@@ -76,7 +108,8 @@ import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["base_url"])
 ' "$START_RESULT")
 
-UNAUTHENTICATED_STATUS=$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' "$BASE_URL/api/v1/snapshot")
+UNAUTHENTICATED_STATUS=$(curl --noproxy '*' --silent --output /dev/null \
+  --write-out '%{http_code}' "$BASE_URL/api/v1/snapshot")
 test "$UNAUTHENTICATED_STATUS" = "401"
 
 curl --noproxy '*' --silent --show-error \
@@ -98,22 +131,24 @@ curl --noproxy '*' --silent --show-error \
   --cookie "$COOKIE_JAR" \
   "$BASE_URL/" >"$SHELL_HTML"
 
-CLIENT_ASSET=$("$INSTALL_ROOT/bin/python" -c '
-import pathlib, re, sys
-shell = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-match = re.search(r"<script[^>]+src=\"([^\"]+)\"", shell)
-assert match is not None
-print(match.group(1))
-' "$SHELL_HTML")
-curl --noproxy '*' --silent --show-error \
-  --cookie "$COOKIE_JAR" \
-  "$BASE_URL$CLIENT_ASSET" >"$CLIENT_BUNDLE"
-
-"$INSTALL_ROOT/bin/python" - "$SNAPSHOT" "$SHELL_HTML" "$CLIENT_BUNDLE" <<'PY'
+"$INSTALL_ROOT/bin/python" - "$SNAPSHOT" "$SHELL_HTML" "$SHELL_ASSETS" <<'PY'
+from html.parser import HTMLParser
 import json
 import pathlib
-import re
 import sys
+
+
+class ShellAssetParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.assets: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "script" and values.get("src"):
+            self.assets.append(("script", str(values["src"])))
+        if tag == "link" and values.get("rel") == "stylesheet" and values.get("href"):
+            self.assets.append(("stylesheet", str(values["href"])))
 
 snapshot = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert snapshot["product"] == {"name": "meta-research-vnext", "version": "0.1.0"}
@@ -132,19 +167,39 @@ assert set(snapshot["owners"]) == {
     "human_collaboration",
 }
 assert all(owner["status"] == "ready" for owner in snapshot["owners"].values())
-assert all(item["status"] == "capability_unavailable" for item in snapshot["unavailable"])
 
 shell = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 assert "Meta-research" in shell
-assert re.search(r"<script[^>]+src=", shell)
 assert "localStorage" not in shell
-
-client = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
-assert "/api/v1/snapshot" in client
-assert "research_space" in client
-assert "readiness" in client
-assert "localStorage" not in client
+parser = ShellAssetParser()
+parser.feed(shell)
+assert any(kind == "script" for kind, _path in parser.assets)
+assert any(kind == "stylesheet" for kind, _path in parser.assets)
+for _kind, path in parser.assets:
+    assert path.startswith("/assets/") and ".." not in path
+pathlib.Path(sys.argv[3]).write_text(
+    "".join(f"{kind}\t{path}\n" for kind, path in parser.assets),
+    encoding="utf-8",
+)
 PY
+
+mkdir -p "$SHELL_ASSET_ROOT"
+ASSET_INDEX=0
+while IFS=$'\t' read -r ASSET_KIND ASSET_PATH; do
+  ASSET_INDEX=$((ASSET_INDEX + 1))
+  ASSET_BODY="$SHELL_ASSET_ROOT/$ASSET_INDEX"
+  ASSET_MIME=$(curl --noproxy '*' --silent --show-error --fail \
+    --cookie "$COOKIE_JAR" \
+    --output "$ASSET_BODY" \
+    --write-out '%{content_type}' \
+    "$BASE_URL$ASSET_PATH")
+  test -s "$ASSET_BODY"
+  if [[ "$ASSET_KIND" = "script" ]]; then
+    [[ "$ASSET_MIME" = "text/javascript"* || "$ASSET_MIME" = "application/javascript"* ]]
+  else
+    [[ "$ASSET_MIME" = "text/css"* ]]
+  fi
+done <"$SHELL_ASSETS"
 
 set +e
 curl --noproxy '*' --silent --no-buffer --max-time 2 \
@@ -156,31 +211,114 @@ set -e
 test "$SSE_STATUS" = "0" || test "$SSE_STATUS" = "28"
 grep -F 'event: system.ready' "$SSE_RESUME" >/dev/null
 
-curl --noproxy '*' --silent --show-error --no-buffer \
+set +e
+curl --noproxy '*' --silent --show-error --no-buffer --max-time 2 \
   --cookie "$COOKIE_JAR" \
   --header 'Last-Event-ID: 999999' \
   "$BASE_URL/api/v1/events" >"$SSE_GAP"
+SSE_GAP_STATUS=$?
+set -e
+test "$SSE_GAP_STATUS" = "0" || test "$SSE_GAP_STATUS" = "28"
 grep -F 'event: snapshot.required' "$SSE_GAP" >/dev/null
 grep -F '"snapshot_url":"/api/v1/snapshot"' "$SSE_GAP" >/dev/null
 
-"$INSTALL_ROOT/bin/python" - "$QUEST_DRAFT" <<'PY'
+curl --noproxy '*' --silent --show-error --fail \
+  --cookie "$COOKIE_JAR" \
+  --header "Origin: $BASE_URL" \
+  --header "X-CSRF-Token: $CSRF_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: installed-open-v2' \
+  --data-binary '{}' \
+  "$BASE_URL/api/v1/quest-initializations" >"$QUEST_OPENED"
+
+INITIALIZATION_ID=$("$INSTALL_ROOT/bin/python" -c '
+import json, sys
+opened = json.load(open(sys.argv[1], encoding="utf-8"))
+assert opened["status"] == "draft"
+assert opened["quest_draft"]["schema_ref"].endswith("/v2")
+assert opened["intent_session"]["status"] == "open"
+print(opened["initialization_id"])
+' "$QUEST_OPENED")
+
+curl --noproxy '*' --silent --show-error --fail \
+  --cookie "$COOKIE_JAR" \
+  --header "Origin: $BASE_URL" \
+  --header "X-CSRF-Token: $CSRF_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: installed-compute-probe' \
+  --data-binary '{"selected_device_uuids":["GPU-installed-test"]}' \
+  "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID/compute-probe" \
+  >"$QUEST_PROBED"
+
+"$INSTALL_ROOT/bin/python" - "$QUEST_PROBED" "$DRAFT_REQUEST" <<'PY'
 import json
 import pathlib
 import sys
 
-pathlib.Path(sys.argv[1]).write_text(
-    json.dumps(
-        {
-            "goal": "Verify the installed direct Quest initialization path.",
-            "completion_criteria": "Observe distinct accepted receipts and one active Cycle.",
-            "key_configuration": "Installed wheel, isolated data root, public HTTP only.",
-            "literature_scope": "open_access",
-            "initial_question_direction": "Can the installed product recover exact layered acceptance?",
-            "material_receipts": [],
-        },
-        separators=(",", ":"),
-    ),
+probed = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert probed["compute"]["status"] == "ready"
+assert probed["resource_envelope"]["selected_device_uuids"] == ["GPU-installed-test"]
+draft = dict(probed["quest_draft"]["value"])
+draft.update(
+    {
+        "goal": "Verify the installed v2 Quest initialization boundary.",
+        "completion_criteria": "Observe a typed provider failure without domain facts.",
+        "time_budget": "30d",
+        "background_and_initial_direction": "Exercise the public asynchronous API.",
+    }
+)
+payload = {
+    "expected_draft_revision": probed["quest_draft"]["revision"],
+    "expected_draft_hash": probed["quest_draft"]["hash"],
+    "draft": draft,
+}
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(payload, separators=(",", ":")), encoding="utf-8"
+)
+PY
+
+curl --noproxy '*' --silent --show-error --fail \
+  --request PUT \
+  --cookie "$COOKIE_JAR" \
+  --header "Origin: $BASE_URL" \
+  --header "X-CSRF-Token: $CSRF_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: installed-autosave-v2' \
+  --data-binary "@$DRAFT_REQUEST" \
+  "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID/draft" \
+  >"$QUEST_SAVED"
+
+"$INSTALL_ROOT/bin/python" - \
+  "$QUEST_PROBED" "$QUEST_SAVED" "$INTENT_REQUEST" "$GENERATION_REQUEST" <<'PY'
+import json
+import pathlib
+import sys
+
+probed = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+saved = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+assert saved["resource_envelope"]["ref"] != probed["resource_envelope"]["ref"]
+assert saved["resource_envelope"]["status"] == "current"
+assert saved["resource_envelope"]["time_budget"] == "30d"
+assert saved["resource_envelope"]["hard_ceiling"] == {
+    "kind": "wall_clock",
+    "seconds": 2_592_000,
+}
+assert saved["quest_draft"]["value"]["resource_envelope_ref"] == saved[
+    "resource_envelope"
+]["ref"]
+assert saved["quest_draft"]["value"]["resource_envelope_hash"] == saved[
+    "resource_envelope"
+]["hash"]
+basis = {
+    "expected_draft_revision": saved["quest_draft"]["revision"],
+    "expected_draft_hash": saved["quest_draft"]["hash"],
+}
+pathlib.Path(sys.argv[3]).write_text(
+    json.dumps({**basis, "message": "How should the boundary be narrowed?"}, separators=(",", ":")),
     encoding="utf-8",
+)
+pathlib.Path(sys.argv[4]).write_text(
+    json.dumps(basis, separators=(",", ":")), encoding="utf-8"
 )
 PY
 
@@ -189,32 +327,10 @@ curl --noproxy '*' --silent --show-error --fail \
   --header "Origin: $BASE_URL" \
   --header "X-CSRF-Token: $CSRF_TOKEN" \
   --header 'Content-Type: application/json' \
-  --header 'Idempotency-Key: installed-create-quest' \
-  --data-binary "@$QUEST_DRAFT" \
-  "$BASE_URL/api/v1/quest-initializations" >"$QUEST_CREATED"
-
-"$INSTALL_ROOT/bin/python" - "$QUEST_CREATED" "$PROPOSAL_REQUEST" <<'PY'
-import json
-import pathlib
-import sys
-
-created = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert created["creation_context"] == "quest_initialization"
-assert created["route"] == "direct"
-assert all(item["status"] == "not_attempted" for item in created["receipts"].values())
-pathlib.Path(sys.argv[2]).write_text(
-    json.dumps(
-        {"expected_draft_hash": created["quest_draft"]["hash"]},
-        separators=(",", ":"),
-    ),
-    encoding="utf-8",
-)
-PY
-
-INITIALIZATION_ID=$("$INSTALL_ROOT/bin/python" -c '
-import json, sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["initialization_id"])
-' "$QUEST_CREATED")
+  --header 'Idempotency-Key: installed-intent-turn' \
+  --data-binary "@$INTENT_REQUEST" \
+  "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID/intent-session/messages" \
+  >/dev/null
 
 curl --noproxy '*' --silent --show-error --fail \
   --cookie "$COOKIE_JAR" \
@@ -222,95 +338,32 @@ curl --noproxy '*' --silent --show-error --fail \
   --header "X-CSRF-Token: $CSRF_TOKEN" \
   --header 'Content-Type: application/json' \
   --header 'Idempotency-Key: installed-generate-proposal' \
-  --data-binary "@$PROPOSAL_REQUEST" \
-  "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID/proposal" >"$PROPOSAL_RESULT"
-
-"$INSTALL_ROOT/bin/python" - "$QUEST_CREATED" "$PROPOSAL_RESULT" "$PREVIEW_REQUEST" <<'PY'
-import json
-import pathlib
-import sys
-
-created = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-generated = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-proposal = generated["proposal"]
-assert proposal["status"] == "current"
-assert set(proposal["content"]) == {
-    "title",
-    "unknown_statement",
-    "answer_shape",
-    "applicability_scope",
-    "background_context",
-    "requirements_constraints",
-}
-assert all(value.strip() for value in proposal["content"].values())
-pathlib.Path(sys.argv[3]).write_text(
-    json.dumps(
-        {
-            "quest_draft_revision": created["quest_draft"]["revision"],
-            "quest_draft_hash": created["quest_draft"]["hash"],
-            "proposal_ref": proposal["ref"],
-            "proposal_hash": proposal["hash"],
-        },
-        separators=(",", ":"),
-    ),
-    encoding="utf-8",
-)
-PY
-
-curl --noproxy '*' --silent --show-error --fail \
-  --cookie "$COOKIE_JAR" \
-  --header "Origin: $BASE_URL" \
-  --header "X-CSRF-Token: $CSRF_TOKEN" \
-  --header 'Content-Type: application/json' \
-  --header 'Idempotency-Key: installed-preview-bundle' \
-  --data-binary "@$PREVIEW_REQUEST" \
-  "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID/confirmation-preview" >"$PREVIEW_RESULT"
-
-"$INSTALL_ROOT/bin/python" - "$PREVIEW_RESULT" "$CONFIRMATION_REQUEST" <<'PY'
-import json
-import pathlib
-import sys
-
-previewed = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-preview = previewed["confirmation_preview"]
-assert preview["status"] == "current"
-assert len(preview["target_assertions"]) == 4
-proposal = previewed["proposal"]
-draft = previewed["quest_draft"]
-pathlib.Path(sys.argv[2]).write_text(
-    json.dumps(
-        {
-            "quest_draft_revision": draft["revision"],
-            "quest_draft_hash": draft["hash"],
-            "proposal_ref": proposal["ref"],
-            "proposal_hash": proposal["hash"],
-            "preview_ref": preview["ref"],
-            "preview_hash": preview["hash"],
-        },
-        separators=(",", ":"),
-    ),
-    encoding="utf-8",
-)
-PY
-
-curl --noproxy '*' --silent --show-error --fail \
-  --cookie "$COOKIE_JAR" \
-  --header "Origin: $BASE_URL" \
-  --header "X-CSRF-Token: $CSRF_TOKEN" \
-  --header 'Content-Type: application/json' \
-  --header 'Idempotency-Key: installed-confirm-bundle' \
-  --data-binary "@$CONFIRMATION_REQUEST" \
-  "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID/confirmation" >"$QUEST_RESULT"
+  --data-binary "@$GENERATION_REQUEST" \
+  "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID/proposal-generations" \
+  >/dev/null
 
 for _ in $(seq 1 100); do
   curl --noproxy '*' --silent --show-error --fail \
     --cookie "$COOKIE_JAR" \
-    "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID" >"$QUEST_RESULT"
-  QUEST_STATUS=$("$INSTALL_ROOT/bin/python" -c '
-import json, sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["status"])
-' "$QUEST_RESULT")
-  if [[ "$QUEST_STATUS" = "completed" ]]; then
+    "$BASE_URL/api/v1/quest-initializations/$INITIALIZATION_ID" >"$QUEST_VIEW"
+  if "$INSTALL_ROOT/bin/python" - "$QUEST_VIEW" <<'PY'
+import json
+import pathlib
+import sys
+
+view = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+generation = view.get("proposal_generation")
+turns = view.get("intent_session", {}).get("turns", [])
+raise SystemExit(
+    0
+    if generation
+    and generation["status"] == "capability_unavailable"
+    and turns
+    and turns[0]["assistant_status"] == "unavailable"
+    else 1
+)
+PY
+  then
     break
   fi
   sleep 0.05
@@ -320,46 +373,479 @@ curl --noproxy '*' --silent --show-error --fail \
   --cookie "$COOKIE_JAR" \
   "$BASE_URL/api/v1/snapshot" >"$SNAPSHOT"
 
-"$INSTALL_ROOT/bin/python" - "$QUEST_RESULT" "$SNAPSHOT" "$CLIENT_BUNDLE" <<'PY'
+"$INSTALL_ROOT/bin/python" - "$QUEST_VIEW" "$SNAPSHOT" <<'PY'
 import json
 import pathlib
 import sys
 
-quest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+view = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 snapshot = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-client = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
-assert quest["status"] == "completed"
-assert all(item["status"] == "accepted" for item in quest["receipts"].values())
-assert all(item["issuer"] and item["kind"] for item in quest["receipts"].values())
-assert len({item["receipt_ref"] for item in quest["receipts"].values()}) == 5
+assert view["proposal_generation"]["status"] == "capability_unavailable"
+assert view["proposal_generation"]["failure"] == {"code": "codex_cli_unavailable"}
+turn = view["intent_session"]["turns"][0]
+assert turn["assistant_status"] == "unavailable"
+assert turn["reason"] == {"code": "codex_cli_unavailable"}
+assert view["proposal"] is None
+assert view["confirmation_preview"] is None
+assert all(receipt["status"] == "not_attempted" for receipt in view["receipts"].values())
+assert snapshot["research_space"] == {
+    "status": "empty",
+    "quest_count": 0,
+    "question_count": 0,
+    "foreground_cycle_count": 0,
+}
+PY
+
+"$CLI" stop --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '
+import json, sys
+assert json.load(sys.stdin)["status"] == "stopped"
+'
+"$INSTALL_ROOT/bin/python" - \
+  "$PROVIDER_PATH/codex" "$CODEX_CALLS" <<'PY'
+import pathlib
+import sys
+
+
+path = pathlib.Path(sys.argv[1])
+calls_path = pathlib.Path(sys.argv[2])
+source = f'''#!{sys.executable}
+import json
+import pathlib
+import re
+import sys
+
+
+args = sys.argv[1:]
+assert args[0] == "exec"
+assert args[1:5] == [
+    "--skip-git-repo-check", "--sandbox", "read-only", "--cd"
+]
+assert args[6] == "--json"
+assert args[7] == "--output-schema"
+assert args[9] == "--output-last-message"
+assert args[-1] == "-"
+schema = json.loads(pathlib.Path(args[8]).read_text(encoding="utf-8"))
+output_path = pathlib.Path(args[10])
+prompt = sys.stdin.read()
+match = re.search(r"(?m)^initialization_id=([^\\n]+)$", prompt)
+assert match is not None
+initialization_id = match.group(1)
+properties = set(schema["properties"])
+resume_ref = None
+if "resume" in args:
+    resume_index = args.index("resume")
+    resume_ref = args[resume_index + 1]
+record = {{
+    "kind": "intent" if properties == {{"reply"}} else "proposal",
+    "ephemeral": "--ephemeral" in args,
+    "initialization_id": initialization_id,
+    "resume_ref": resume_ref,
+}}
+with pathlib.Path({str(calls_path)!r}).open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(record, separators=(",", ":")) + "\\n")
+
+if properties == {{"reply"}}:
+    assert "Intent Drafting Session" in prompt
+    assert "--ephemeral" not in args
+    thread_id = f"installed-native-{{initialization_id}}"
+    if resume_ref is not None:
+        assert resume_ref == thread_id
+    output = {{
+        "reply": "建议把完成标准绑定到公开 Snapshot 与五层 Owner receipts。"
+    }}
+    print(json.dumps({{"type": "thread.started", "thread_id": thread_id}}))
+else:
+    assert properties == {{
+        "title",
+        "unknown_statement",
+        "answer_shape",
+        "applicability_scope",
+        "background_context",
+        "requirements_constraints",
+    }}
+    assert args[-2:] == ["--ephemeral", "-"]
+    assert "Proposal Drafter" in prompt
+    output = {{
+        "title": "安装态 production Adapter 与 Owner receipts",
+        "unknown_statement": "尚未证明安装 wheel 能经真实 Codex CLI seam 形成可确认 Proposal。",
+        "answer_shape": "形成带公开状态、五层 receipts 与重启恢复证据的有界结论。",
+        "applicability_scope": "本地安装的 direct Quest 初始化路径。",
+        "background_context": "验证 wheel、daemon、Codex adapter 与公开 HTTP 边界。",
+        "requirements_constraints": "使用已选择 GPU envelope，并遵守 30 天硬上限。",
+    }}
+output_path.write_text(
+    json.dumps(output, ensure_ascii=False, separators=(",", ":")),
+    encoding="utf-8",
+)
+'''
+path.write_text(source, encoding="utf-8")
+path.chmod(0o755)
+PY
+PATH="$PROVIDER_PATH" "$CLI" start \
+  --data-root "$DATA_ROOT" --port 0 --json >"$RESTART_RESULT"
+"$INSTALL_ROOT/bin/python" - \
+  "$RESTART_RESULT" "$INITIALIZATION_ID" "$SUCCESS_RESULT" "$CODEX_CALLS" <<'PY'
+from __future__ import annotations
+
+from http.cookiejar import CookieJar
+import json
+import pathlib
+import sys
+import time
+import urllib.request
+
+
+started = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+old_initialization_id = sys.argv[2]
+result_path = pathlib.Path(sys.argv[3])
+calls_path = pathlib.Path(sys.argv[4])
+assert started["status"] == "started"
+base_url = started["base_url"]
+cookies = CookieJar()
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(cookies)
+)
+csrf_token: str | None = None
+
+
+def request(
+    method: str,
+    path: str,
+    payload: object | None = None,
+    *,
+    idempotency_key: str | None = None,
+) -> object:
+    headers = {"Accept": "application/json"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, separators=(",", ":")).encode()
+        headers.update({"Content-Type": "application/json", "Origin": base_url})
+        if csrf_token is not None:
+            headers["X-CSRF-Token"] = csrf_token
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+    with opener.open(
+        urllib.request.Request(
+            f"{base_url}{path}", data=data, headers=headers, method=method
+        ),
+        timeout=5,
+    ) as response:
+        return json.load(response)
+
+
+exchange = request(
+    "POST", "/auth/bootstrap", {"token": started["bootstrap_token"]}
+)
+assert isinstance(exchange, dict)
+csrf_token = str(exchange["csrf_token"])
+
+restored = request(
+    "GET", f"/api/v1/quest-initializations/{old_initialization_id}"
+)
+assert isinstance(restored, dict)
+assert restored["proposal_generation"]["status"] == "capability_unavailable"
+assert restored["intent_session"]["turns"][0]["assistant_status"] == "unavailable"
+cancelled = request(
+    "POST",
+    f"/api/v1/quest-initializations/{old_initialization_id}/cancel",
+    {},
+    idempotency_key="installed-cancel-unavailable",
+)
+assert isinstance(cancelled, dict)
+assert cancelled["status"] == "cancelled"
+assert cancelled.get("quest_ref") is None
+
+opened = request(
+    "POST",
+    "/api/v1/quest-initializations",
+    {},
+    idempotency_key="installed-success-open",
+)
+assert isinstance(opened, dict)
+initialization_id = str(opened["initialization_id"])
+probed = request(
+    "POST",
+    f"/api/v1/quest-initializations/{initialization_id}/compute-probe",
+    {"selected_device_uuids": ["GPU-installed-test"]},
+    idempotency_key="installed-success-probe",
+)
+assert isinstance(probed, dict)
+draft = dict(probed["quest_draft"]["value"])
+draft.update(
+    {
+        "goal": "验证安装 wheel 的 production Codex drafting 与 Owner receipt 链。",
+        "completion_criteria": "Intent、Proposal、Preview 与五层 receipt 均可公开复核。",
+        "time_budget": "30d",
+        "background_and_initial_direction": "只经 loopback HTTP 与外部 Codex CLI seam。",
+    }
+)
+saved = request(
+    "PUT",
+    f"/api/v1/quest-initializations/{initialization_id}/draft",
+    {
+        "expected_draft_revision": probed["quest_draft"]["revision"],
+        "expected_draft_hash": probed["quest_draft"]["hash"],
+        "draft": draft,
+    },
+    idempotency_key="installed-success-save",
+)
+assert isinstance(saved, dict)
+basis = {
+    "expected_draft_revision": saved["quest_draft"]["revision"],
+    "expected_draft_hash": saved["quest_draft"]["hash"],
+}
+request(
+    "POST",
+    f"/api/v1/quest-initializations/{initialization_id}/intent-session/messages",
+    {**basis, "message": "怎样证明安装态没有绕过 production Adapter？"},
+    idempotency_key="installed-success-intent",
+)
+request(
+    "POST",
+    f"/api/v1/quest-initializations/{initialization_id}/proposal-generations",
+    basis,
+    idempotency_key="installed-success-generation",
+)
+
+deadline = time.monotonic() + 20
+while True:
+    ready = request("GET", f"/api/v1/quest-initializations/{initialization_id}")
+    assert isinstance(ready, dict)
+    generation = ready.get("proposal_generation") or {}
+    turns = (ready.get("intent_session") or {}).get("turns", [])
+    if generation.get("status") in {"capability_unavailable", "failed"}:
+        raise AssertionError(f"production Codex proposal failed: {generation}")
+    if turns and turns[0]["assistant_status"] in {"unavailable", "failed"}:
+        raise AssertionError(f"production Codex intent failed: {turns[0]}")
+    if (
+        generation.get("status") == "succeeded"
+        and turns
+        and turns[0]["assistant_status"] == "completed"
+        and (ready.get("confirmation_preview") or {}).get("status") == "current"
+    ):
+        break
+    if time.monotonic() >= deadline:
+        raise AssertionError(f"production Codex drafting did not settle: {ready}")
+    time.sleep(0.05)
+
+assert generation["adapter_kind"] == "codex_cli"
+assert turns[0]["assistant_content"] == (
+    "建议把完成标准绑定到公开 Snapshot 与五层 Owner receipts。"
+)
+assert set(ready["proposal"]["content"]) == {
+    "title",
+    "unknown_statement",
+    "answer_shape",
+    "applicability_scope",
+    "background_context",
+    "requirements_constraints",
+}
+preview = ready["confirmation_preview"]
+assert preview["target_assertions"]
+request(
+    "POST",
+    f"/api/v1/quest-initializations/{initialization_id}/intent-session/messages",
+    {**basis, "message": "再确认一次 native session resume 边界。"},
+    idempotency_key="installed-success-intent-resume",
+)
+deadline = time.monotonic() + 20
+while True:
+    ready = request("GET", f"/api/v1/quest-initializations/{initialization_id}")
+    assert isinstance(ready, dict)
+    turns = (ready.get("intent_session") or {}).get("turns", [])
+    if len(turns) == 2 and turns[1]["assistant_status"] == "completed":
+        break
+    if len(turns) == 2 and turns[1]["assistant_status"] in {"unavailable", "failed"}:
+        raise AssertionError(f"production Codex resume failed: {turns[1]}")
+    if time.monotonic() >= deadline:
+        raise AssertionError(f"production Codex resume did not settle: {ready}")
+    time.sleep(0.05)
+preview = ready["confirmation_preview"]
+assert preview["status"] == "current"
+confirmed = request(
+    "POST",
+    f"/api/v1/quest-initializations/{initialization_id}/confirmation",
+    {
+        "quest_draft_revision": ready["quest_draft"]["revision"],
+        "quest_draft_hash": ready["quest_draft"]["hash"],
+        "proposal_ref": ready["proposal"]["ref"],
+        "proposal_hash": ready["proposal"]["hash"],
+        "preview_ref": preview["ref"],
+        "preview_hash": preview["hash"],
+    },
+    idempotency_key="installed-success-confirm",
+)
+assert isinstance(confirmed, dict)
+deadline = time.monotonic() + 30
+while confirmed["status"] != "completed":
+    if time.monotonic() >= deadline:
+        raise AssertionError(f"Owner receipt chain did not complete: {confirmed}")
+    time.sleep(0.05)
+    confirmed = request(
+        "GET", f"/api/v1/quest-initializations/{initialization_id}"
+    )
+    assert isinstance(confirmed, dict)
+
+assert {key: value["status"] for key, value in confirmed["receipts"].items()} == {
+    "human_confirmation": "accepted",
+    "quest_goal": "accepted",
+    "question_content": "accepted",
+    "question_identity": "accepted",
+    "cycle_activation": "accepted",
+}
+receipt_refs = set()
+for receipt in confirmed["receipts"].values():
+    assert all(receipt[field] for field in ("issuer", "kind", "receipt_ref", "subject_ref"))
+    assert len(receipt["payload_hash"]) == 64
+    receipt_refs.add(receipt["receipt_ref"])
+assert len(receipt_refs) == 5
+assert confirmed["recovery"]["state"] == "completed"
+assert all(
+    confirmed.get(key)
+    for key in ("quest_ref", "memory_ref", "question_ref", "cycle_ref")
+)
+calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+assert sorted(call["kind"] for call in calls) == ["intent", "intent", "proposal"]
+intent_calls = [call for call in calls if call["kind"] == "intent"]
+assert intent_calls[0]["ephemeral"] is False
+assert intent_calls[0]["resume_ref"] is None
+assert intent_calls[1]["resume_ref"] == f"installed-native-{initialization_id}"
+assert [call["ephemeral"] for call in calls if call["kind"] == "proposal"] == [True]
+snapshot = request("GET", "/api/v1/snapshot")
+assert isinstance(snapshot, dict)
 assert snapshot["research_space"] == {
     "status": "active",
     "quest_count": 1,
     "question_count": 1,
     "foreground_cycle_count": 1,
 }
-assert "/api/v1/quest-initializations" in client
-assert "CreationSeed" not in client
+result_path.write_text(
+    json.dumps(
+        {
+            "initialization_id": initialization_id,
+            "quest_ref": confirmed["quest_ref"],
+            "memory_ref": confirmed["memory_ref"],
+            "question_ref": confirmed["question_ref"],
+            "cycle_ref": confirmed["cycle_ref"],
+            "receipt_refs": {
+                key: value["receipt_ref"]
+                for key, value in confirmed["receipts"].items()
+            },
+            "turns": confirmed["intent_session"]["turns"],
+        },
+        separators=(",", ":"),
+    ),
+    encoding="utf-8",
+)
 PY
 
-"$CLI" status --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '
-import json, sys
-assert json.load(sys.stdin)["status"] == "running"
-'
 "$CLI" stop --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '
 import json, sys
 assert json.load(sys.stdin)["status"] == "stopped"
 '
 
-"$INSTALL_ROOT/bin/python" - "$START_RESULT" "$DATA_ROOT" <<'PY'
+PATH="$PROVIDER_PATH" "$CLI" start \
+  --data-root "$DATA_ROOT" --port 0 --json >"$FINAL_RESTART_RESULT"
+"$INSTALL_ROOT/bin/python" - \
+  "$FINAL_RESTART_RESULT" "$SUCCESS_RESULT" <<'PY'
+from http.cookiejar import CookieJar
+import json
+import pathlib
+import sys
+import urllib.request
+
+
+started = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+success = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+assert started["status"] == "started"
+base_url = started["base_url"]
+cookies = CookieJar()
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(cookies)
+)
+csrf_token = ""
+
+
+def request(method: str, path: str, payload=None, *, idempotency_key=None):
+    headers = {"Accept": "application/json"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, separators=(",", ":")).encode()
+        headers.update({"Content-Type": "application/json", "Origin": base_url})
+        if csrf_token:
+            headers["X-CSRF-Token"] = csrf_token
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+    with opener.open(
+        urllib.request.Request(
+            f"{base_url}{path}", data=data, headers=headers, method=method
+        ),
+        timeout=5,
+    ) as response:
+        return json.load(response)
+
+
+exchange = request(
+    "POST", "/auth/bootstrap", {"token": started["bootstrap_token"]}
+)
+csrf_token = exchange["csrf_token"]
+restored = request(
+    "GET", f"/api/v1/quest-initializations/{success['initialization_id']}"
+)
+assert restored["status"] == "completed"
+assert restored["quest_ref"] == success["quest_ref"]
+assert restored["memory_ref"] == success["memory_ref"]
+assert restored["question_ref"] == success["question_ref"]
+assert restored["cycle_ref"] == success["cycle_ref"]
+assert {
+    key: value["receipt_ref"] for key, value in restored["receipts"].items()
+} == success["receipt_refs"]
+assert all(value["status"] == "accepted" for value in restored["receipts"].values())
+assert restored["intent_session"]["turns"] == success["turns"]
+assert request("GET", "/api/v1/quest-initializations/current") is None
+second = request(
+    "POST",
+    "/api/v1/quest-initializations",
+    {},
+    idempotency_key="installed-second-open",
+)
+assert second["status"] == "draft"
+assert second["quest_draft"]["schema_ref"].endswith("/v2")
+assert second["initialization_id"] != success["initialization_id"]
+cancelled = request(
+    "POST",
+    f"/api/v1/quest-initializations/{second['initialization_id']}/cancel",
+    {},
+    idempotency_key="installed-second-cancel",
+)
+assert cancelled["status"] == "cancelled"
+PY
+
+"$CLI" stop --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '
+import json, sys
+assert json.load(sys.stdin)["status"] == "stopped"
+'
+
+"$CLI" status --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '
+import json, sys
+assert json.load(sys.stdin)["status"] == "stopped"
+'
+
+"$INSTALL_ROOT/bin/python" - \
+  "$START_RESULT" "$RESTART_RESULT" "$FINAL_RESTART_RESULT" "$DATA_ROOT" <<'PY'
 import json
 import pathlib
 import sys
 
-token = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["bootstrap_token"].encode()
-for path in pathlib.Path(sys.argv[2]).rglob("*"):
+tokens = [
+    json.loads(pathlib.Path(path).read_text(encoding="utf-8"))["bootstrap_token"].encode()
+    for path in sys.argv[1:-1]
+]
+for path in pathlib.Path(sys.argv[-1]).rglob("*"):
     if path.is_file():
-        assert token not in path.read_bytes(), f"bootstrap token leaked into {path}"
+        contents = path.read_bytes()
+        for token in tokens:
+            assert token not in contents, f"bootstrap token leaked into {path}"
 PY
 
 echo "installed public verification passed"

@@ -20,6 +20,7 @@ from meta_research.owners.common import (
     QuestionContentReceiptVerifier,
     canonical_hash,
     canonical_json,
+    decoded_object,
     new_ref,
 )
 
@@ -170,7 +171,10 @@ class SQLiteResearchGraphReceiptVerifier:
                 ),
                 {"initialization_id": initialization_id, "quest_ref": quest_ref},
             ).first()
-        if row is None or (
+        if row is None:
+            raise OwnerConflict("quest_receipt_invalid")
+        _verify_quest_goal_integrity(row)
+        if (
             row.proposal_ref != proposal_ref
             or row.proposal_hash != proposal_hash
             or row.confirmation_ref != confirmation_ref
@@ -391,6 +395,7 @@ class SQLiteResearchGraph:
                 {"initialization_id": initialization_id},
             ).first()
             if existing is not None:
+                _verify_quest_goal_integrity(existing)
                 expected = (
                     existing.draft_revision == draft_revision
                     and existing.draft_hash == draft_hash
@@ -596,6 +601,15 @@ def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> s
             "bindings": bindings,
         }
     )
+
+
+def _verify_quest_goal_integrity(row) -> None:
+    try:
+        stored_draft_hash = canonical_hash(decoded_object(row.goal_json))
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("quest_receipt_invalid") from error
+    if stored_draft_hash != row.draft_hash:
+        raise OwnerConflict("quest_receipt_invalid")
 
 
 def _quest_receipt_hash(row) -> str:
