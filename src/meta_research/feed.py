@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 from meta_research import __version__
 from meta_research.database import Database
@@ -82,6 +83,34 @@ class DurableFeed:
                     text("SELECT COALESCE(MAX(revision), 0) FROM durable_feed")
                 ).scalar_one()
             )
+
+    def record(
+        self,
+        connection: Connection,
+        event_type: str,
+        payload: dict[str, object],
+    ) -> int:
+        """Append an Owner event inside the caller's authoritative transaction."""
+        result = connection.execute(
+            text(
+                "INSERT INTO durable_feed (event_type, payload_json, recorded_at) "
+                "VALUES (:event_type, :payload, :recorded_at)"
+            ),
+            {
+                "event_type": event_type,
+                "payload": json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                "recorded_at": time.time(),
+            },
+        )
+        revision = int(result.lastrowid)
+        connection.execute(
+            text(
+                "UPDATE projection_offsets SET revision = :revision "
+                "WHERE projection_name = 'public_snapshot'"
+            ),
+            {"revision": revision},
+        )
+        return revision
 
     def query_readiness(self) -> FeedReadiness:
         with self._database.read() as connection:

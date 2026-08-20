@@ -1,6 +1,7 @@
-import { StrictMode, useCallback, useEffect, useState } from "react";
+import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { fetchSnapshot, followProjection, type PublicSnapshot } from "./api";
+import { QuestCreationWorkbench } from "./QuestCreation";
 import "./styles.css";
 
 const ownerLabels: Record<string, string> = {
@@ -26,40 +27,76 @@ function App() {
   const [snapshot, setSnapshot] = useState<PublicSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  const [creationMode, setCreationMode] = useState<"current" | "new" | null>(
+    () => {
+      const panel = new URLSearchParams(window.location.search).get("panel");
+      return panel === "new-quest" ? "new" : panel === "create-quest" ? "current" : null;
+    },
+  );
+  const [streamCursor, setStreamCursor] = useState<number | null>(null);
+  const reloadInFlight = useRef(false);
+  const reloadQueued = useRef(false);
+
+  const openCreation = () => {
+    window.history.replaceState(null, "", "/?panel=create-quest");
+    setCreationMode("current");
+  };
+
+  const openNewCreation = () => {
+    window.history.replaceState(null, "", "/?panel=new-quest");
+    setCreationMode("new");
+  };
+
+  const closeCreation = () => {
+    window.history.replaceState(null, "", "/");
+    setCreationMode(null);
+  };
 
   const reload = useCallback(async (signal?: AbortSignal) => {
+    if (reloadInFlight.current) {
+      reloadQueued.current = true;
+      return;
+    }
+    reloadInFlight.current = true;
     try {
-      const next = await fetchSnapshot(signal);
-      setSnapshot(next);
-      setError(null);
-    } catch (caught) {
-      if ((caught as Error).name !== "AbortError") {
-        setError("无法读取本地 Snapshot。请确认 daemon 仍在运行，然后刷新页面。");
-      }
+      do {
+        reloadQueued.current = false;
+        try {
+          const next = await fetchSnapshot(signal);
+          setSnapshot((current) =>
+            current && current.revision > next.revision ? current : next,
+          );
+          setStreamCursor((current) => current ?? next.revision);
+          setError(null);
+        } catch (caught) {
+          if ((caught as Error).name !== "AbortError") {
+            setError("无法读取本地 Snapshot。请确认 daemon 仍在运行，然后刷新页面。");
+          }
+        }
+      } while (reloadQueued.current && !signal?.aborted);
+    } finally {
+      reloadInFlight.current = false;
+      if (reloadQueued.current && !signal?.aborted) void reload();
     }
   }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     void reload(controller.signal);
-    const stop = followProjection(
-      (revision) => {
-        setSnapshot((current) =>
-          current && revision > current.revision
-            ? { ...current, revision }
-            : current,
-        );
-      },
+    return () => controller.abort();
+  }, [reload]);
+
+  useEffect(() => {
+    if (streamCursor === null) return;
+    return followProjection(
+      streamCursor,
+      () => void reload(),
       () => void reload(),
       setConnected,
     );
-    return () => {
-      controller.abort();
-      stop();
-    };
-  }, [reload]);
+  }, [reload, streamCursor]);
 
-  if (error) {
+  if (error && !snapshot) {
     return (
       <main className="fatal-state">
         <p className="eyebrow">本地连接不可用</p>
@@ -84,9 +121,7 @@ function App() {
 
   const isReady = snapshot.readiness.status === "ready";
   const isEmpty = snapshot.research_space.status === "empty";
-  const questCreation = snapshot.unavailable.find(
-    (item) => item.capability === "quest_creation",
-  );
+  const questCreation = snapshot.quest_creation.current;
   const questCompanion = snapshot.unavailable.find(
     (item) => item.capability === "quest_companion",
   );
@@ -111,6 +146,12 @@ function App() {
       </header>
 
       <div className="spectral-axis" aria-hidden="true" />
+
+      {error ? (
+        <p className="runtime-warning" role="alert">
+          {error} 正在保留最后一次单调 Snapshot。
+        </p>
+      ) : null}
 
       <main className="workspace">
         <section className="research-world" aria-labelledby="world-title">
@@ -141,20 +182,36 @@ function App() {
                     .map((check) => `${check.name}:${check.status}`)
                     .join(" · ") || "readiness:unavailable"}
                 </small>
+                {questCreation ? (
+                  <div className="research-actions">
+                    <button
+                      type="button"
+                      className="empty-primary"
+                      onClick={openCreation}
+                    >
+                      查看并恢复当前创建
+                    </button>
+                  </div>
+                ) : null}
               </div>
             ) : isEmpty ? (
               <div className="empty-copy">
-                <p className="eyebrow">Canonical empty advancement</p>
-                <h2>这里还没有 Quest</h2>
+                <p className="eyebrow">Direct creation ready</p>
+                <h2>{questCreation ? "首个 Quest 正在形成" : "这里还没有 Quest"}</h2>
                 <p>
-                  SQLite、对象存储和五个 Owner Interface 已就绪。首个 Quest
-                  创建能力尚未在当前发行版启用。
+                  {questCreation
+                    ? "继续审阅当前 Quest 基底、六字段问题与分层接纳状态。"
+                    : "在一个连续窗口中定义 Goal、完成标准、关键配置与首问题方向。"}
                 </p>
-                <button type="button" disabled aria-describedby="quest-unavailable">
-                  创建第一个 Quest
+                <button
+                  type="button"
+                  className="empty-primary"
+                  onClick={openCreation}
+                >
+                  {questCreation ? "继续创建" : "创建第一个 Quest"}
                 </button>
-                <small id="quest-unavailable">
-                  {questCreation?.status ?? "capability_state_unavailable"} · 尚未启用
+                <small>
+                  direct · {snapshot.quest_creation.status} · 材料 basis 尚未启用
                 </small>
               </div>
             ) : (
@@ -165,6 +222,28 @@ function App() {
                   {snapshot.research_space.quest_count} 个 Quest ·{" "}
                   {snapshot.research_space.question_count} 个 Question
                 </p>
+                <div className="research-actions">
+                  {questCreation ? (
+                    <button
+                      type="button"
+                      className="empty-primary"
+                      onClick={openCreation}
+                    >
+                      {questCreation.status === "completed"
+                        ? "查看创建 receipts"
+                        : "查看并恢复当前创建"}
+                    </button>
+                  ) : null}
+                  {questCreation?.status === "completed" ? (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={openNewCreation}
+                    >
+                      创建新的 Quest
+                    </button>
+                  ) : null}
+                </div>
               </div>
             )}
           </div>
@@ -229,6 +308,13 @@ function App() {
           </section>
         </aside>
       </main>
+      {creationMode ? (
+        <QuestCreationWorkbench
+          current={creationMode === "new" ? null : snapshot.quest_creation.current}
+          onClose={closeCreation}
+          onChanged={() => void reload()}
+        />
+      ) : null}
     </div>
   );
 }

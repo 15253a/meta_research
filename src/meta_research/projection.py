@@ -26,6 +26,7 @@ class PublicProjection:
     ) -> None:
         self._feed = feed
         self._object_store = object_store
+        self._human_collaboration = human_collaboration
         self._interfaces = {
             "research_graph": research_graph,
             "advancement_engine": advancement_engine,
@@ -52,7 +53,18 @@ class PublicProjection:
                 "name": "object_store",
                 "status": "ready" if self._object_store.is_dir() else "unavailable",
             },
-            {"name": "owner_interfaces", "status": "ready", "count": 5},
+            {
+                "name": "owner_interfaces",
+                "status": (
+                    "ready"
+                    if all(
+                        snapshot.status == "ready"
+                        for snapshot in owner_snapshots.values()
+                    )
+                    else "unavailable"
+                ),
+                "count": 5,
+            },
             {"name": "durable_feed", "status": "ready", "revision": revision},
             {
                 "name": "projection",
@@ -79,6 +91,21 @@ class PublicProjection:
                 name: snapshot.as_public_dict()
                 for name, snapshot in owner_snapshots.items()
             },
+            "quest_creation": {
+                "status": "ready",
+                "route": "direct",
+                "current": self._human_collaboration.query_current_quest_creation(),
+                "accepted_material_basis": {
+                    "status": "capability_unavailable",
+                    "reason": {
+                        "code": "research_memory_asset_intake_not_delivered"
+                    },
+                },
+                "first_question_deepfetch": {
+                    "status": "capability_unavailable",
+                    "reason": {"code": "deepfetch_not_delivered"},
+                },
+            },
             "unavailable": _release_capabilities(),
         }
 
@@ -95,7 +122,8 @@ def _release_capabilities() -> list[dict[str, object]]:
             "reason": reason.copy(),
         }
         for capability in (
-            "quest_creation",
+            "first_question_deepfetch",
+            "accepted_material_basis",
             "quest_companion",
             "stage_execution",
             "writing",

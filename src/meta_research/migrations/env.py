@@ -10,6 +10,7 @@ def run_migrations_online() -> None:
         target_metadata=None,
         compare_type=True,
         render_as_batch=False,
+        transactional_ddl=True,
     )
     with context.begin_transaction():
         context.run_migrations()

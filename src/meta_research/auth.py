@@ -112,6 +112,25 @@ class Authentication:
             ).first()
         return row is not None
 
+    def csrf_matches(self, token: str | None, csrf_token: str | None) -> bool:
+        if not token or not csrf_token:
+            return False
+        now = time.time()
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT 1 FROM auth_sessions WHERE session_hash = :session_hash "
+                    "AND csrf_hash = :csrf_hash AND revoked_at IS NULL "
+                    "AND expires_at > :now"
+                ),
+                {
+                    "session_hash": _digest(token),
+                    "csrf_hash": _digest(csrf_token),
+                    "now": now,
+                },
+            ).first()
+        return row is not None
+
     def revoke_session(self, token: str, csrf_token: str) -> bool:
         now = time.time()
         with self._database.write() as connection:

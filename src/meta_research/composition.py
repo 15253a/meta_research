@@ -16,15 +16,18 @@ from meta_research.owners.agent_runtime import (
 )
 from meta_research.owners.human_collaboration import (
     HumanCollaborationInterface,
+    create_bundle_confirmation_verifier,
     create_human_collaboration_interface,
 )
 from meta_research.owners.research_graph import (
     ResearchGraphInterface,
     create_research_graph_interface,
+    create_research_graph_receipt_verifier,
 )
 from meta_research.owners.research_memory import (
     ResearchMemoryInterface,
     create_research_memory_interface,
+    create_research_memory_receipt_verifier,
 )
 from meta_research.paths import DataRoot
 from meta_research.projection import PublicProjection
@@ -55,15 +58,49 @@ class ProductionRuntime:
 def build_production_runtime(data_root: DataRoot) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
-    owners = OwnerInterfaces(
-        research_graph=create_research_graph_interface(database),
-        advancement_engine=create_advancement_engine_interface(database),
-        research_memory=create_research_memory_interface(database, data_root.objects),
-        agent_runtime=create_agent_runtime_interface(database),
-        human_collaboration=create_human_collaboration_interface(database),
-    )
     feed = DurableFeed(database)
     feed.ensure_initialized()
+    confirmation_verifier = create_bundle_confirmation_verifier(database)
+    research_memory_receipts = create_research_memory_receipt_verifier(
+        database, data_root.objects
+    )
+    research_graph_receipts = create_research_graph_receipt_verifier(
+        database, confirmation_verifier, research_memory_receipts
+    )
+    research_graph = create_research_graph_interface(
+        database,
+        feed,
+        confirmation_verifier,
+        research_memory_receipts,
+        research_graph_receipts,
+    )
+    research_memory = create_research_memory_interface(
+        database,
+        data_root.objects,
+        feed,
+        confirmation_verifier,
+        research_graph_receipts,
+        research_memory_receipts,
+    )
+    advancement_engine = create_advancement_engine_interface(
+        database,
+        feed,
+        research_graph_receipts,
+        research_graph_receipts,
+    )
+    owners = OwnerInterfaces(
+        research_graph=research_graph,
+        advancement_engine=advancement_engine,
+        research_memory=research_memory,
+        agent_runtime=create_agent_runtime_interface(database),
+        human_collaboration=create_human_collaboration_interface(
+            database,
+            feed,
+            research_graph,
+            research_memory,
+            advancement_engine,
+        ),
+    )
     projection = PublicProjection(
         feed,
         data_root.objects,

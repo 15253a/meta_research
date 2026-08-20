@@ -179,6 +179,19 @@ def test_sse_resumes_by_revision_and_directs_gaps_to_the_snapshot(
         assert int(event_id) >= 1
 
         with client.stream(
+            "GET",
+            "/api/v1/events?after=999999",
+            headers={"Last-Event-ID": "0"},
+        ) as reconnected:
+            reconnect_lines = []
+            for line in reconnected.iter_lines():
+                reconnect_lines.append(line)
+                if line == "":
+                    break
+        assert reconnected.status_code == 200
+        assert "event: system.ready" in reconnect_lines
+
+        with client.stream(
             "GET", "/api/v1/events", headers={"Last-Event-ID": "999999"}
         ) as gap:
             gap_text = "\n".join(gap.iter_lines())
