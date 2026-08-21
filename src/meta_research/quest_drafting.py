@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -162,13 +163,47 @@ class _PipeInputWriter:
     def write(self, stream: BinaryIO) -> None:
         try:
             stream.write(self._value)
-        except BrokenPipeError:
-            pass
+        except BrokenPipeError as error:
+            self.error = error
         except OSError as error:
             self.error = error
         finally:
             with contextlib.suppress(OSError):
                 stream.close()
+
+
+def _write_process_identity(
+    path: Path, process_id: int, process_group: int | None
+) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as destination:
+            json.dump(
+                {
+                    "process_id": process_id,
+                    "process_group": process_group,
+                    "recorded_at": time.time(),
+                },
+                destination,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_bounded_provider_stream(path: Path) -> str:
+    with path.open("rb") as source:
+        value = source.read(PROVIDER_STREAM_MAX_BYTES + 1)
+    return value.decode("utf-8", errors="replace")
 
 
 class _CancellableProcessRunner:
@@ -190,6 +225,116 @@ class _CancellableProcessRunner:
         self, job_ref: str, argv: list[str], input_text: str, timeout: float
     ) -> subprocess.CompletedProcess[str]:
         return self._run(job_ref, argv, input_text, timeout)
+
+    def run_durable_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        input_text: str,
+        timeout: float,
+        stdout_path: Path,
+        pid_path: Path,
+        supervisor_request_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run through a supervisor that outlives a daemon crash.
+
+        The supervisor owns provider stdin/stdout and writes the signed exit
+        receipt. A daemon SIGKILL therefore cannot lose a completed response or
+        guess the child return code from output files alone.
+        """
+
+        deadline = time.monotonic() + timeout + self._termination_grace_seconds + 1.0
+        process: subprocess.Popen[bytes] | None = None
+        process_group: int | None = None
+        del input_text
+        try:
+            with self._lock:
+                if self._stopping or job_ref in self._cancelled_jobs:
+                    raise _ProcessStopped
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "meta_research.provider_supervisor",
+                    str(supervisor_request_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=os.name == "posix",
+            )
+            process_group = os.getpgid(process.pid) if os.name == "posix" else None
+            ready_path = supervisor_request_path.parent / "supervisor-ready.json"
+            startup_deadline = min(deadline, time.monotonic() + 5.0)
+            while not ready_path.exists():
+                if process.poll() is not None:
+                    raise OSError("provider supervisor did not become ready")
+                if time.monotonic() >= startup_deadline:
+                    self._signal_process_tree(
+                        process, process_group, signal.SIGKILL
+                    )
+                    process.wait()
+                    raise OSError("provider supervisor readiness timed out")
+                time.sleep(0.01)
+            with self._lock:
+                should_stop = self._stopping or job_ref in self._cancelled_jobs
+                if not should_stop:
+                    self._processes[process] = process_group
+                    self._jobs[job_ref] = (process, process_group)
+            if should_stop:
+                self._terminate_processes(((process, process_group),))
+                raise _ProcessStopped
+            _write_process_identity(pid_path, process.pid, process_group)
+            oversized = False
+            while process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                try:
+                    process.wait(timeout=min(remaining, 0.05))
+                except subprocess.TimeoutExpired:
+                    if (
+                        stdout_path.exists()
+                        and stdout_path.stat().st_size > PROVIDER_STREAM_MAX_BYTES
+                    ):
+                        oversized = True
+                        self._signal_process_tree(
+                            process, process_group, signal.SIGKILL
+                        )
+                        process.wait()
+                        break
+            with self._lock:
+                stopped = (
+                    self._stopping
+                    or process in self._cancelled
+                    or job_ref in self._cancelled_jobs
+                )
+            if stopped:
+                raise _ProcessStopped
+            if not stdout_path.exists():
+                raise OSError("provider supervisor did not create stdout")
+            stdout = _read_bounded_provider_stream(stdout_path)
+            if process.returncode != 0 and not oversized:
+                raise OSError("provider supervisor failed")
+            return subprocess.CompletedProcess(
+                argv,
+                process.returncode,
+                stdout=stdout,
+                stderr="",
+            )
+        except subprocess.TimeoutExpired:
+            if process is not None:
+                self._signal_process_tree(process, process_group, signal.SIGKILL)
+                process.wait()
+            raise
+        finally:
+            if process is not None:
+                with self._lock:
+                    self._processes.pop(process, None)
+                    active = self._jobs.get(job_ref)
+                    if active is not None and active[0] is process:
+                        self._jobs.pop(job_ref, None)
+                    self._cancelled.discard(process)
 
     def _run(
         self,

@@ -8,17 +8,28 @@ from sqlalchemy import text
 
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
+from meta_research.idea_contract import (
+    IdeaContractError,
+    validate_idea_context_pack,
+)
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
     SQLiteOwnerSnapshot,
 )
 from meta_research.owners.common import (
+    AcceptedQuestionBinding,
+    AcceptedQuestionBindingVerifier,
     AcceptanceReceipt,
+    IdeaOutcomeDecisionVerifier,
     OwnerConflict,
     OwnerSnapshot,
     QuestReceiptVerifier,
     RootQuestionReceiptVerifier,
+    RunCompletionReceiptVerifier,
+    VerifiedStageRunRequestBinding,
     canonical_hash,
+    canonical_json,
+    decoded_object,
     new_ref,
 )
 from meta_research.owners.research_graph import AcceptedQuestion, AcceptedQuest
@@ -26,12 +37,51 @@ from meta_research.owners.research_graph import AcceptedQuestion, AcceptedQuest
 
 AE_OWNER = "advancement_engine"
 CYCLE_RECEIPT_KIND = "initial_cycle_activation"
+STAGE_REQUEST_RECEIPT_KIND = "stage_run_request"
+STAGE_COMMIT_RECEIPT_KIND = "stage_commit"
+IDEA_STAGE = "idea"
+IDEA_SET_OUTCOME_KIND = "idea_set"
+NO_VIABLE_CANDIDATE_OUTCOME_KIND = "no_viable_candidate"
+COMPLETED_DISPOSITION = "completed"
+COMPLETABLE_IDEA_OUTCOME_KINDS = {
+    IDEA_SET_OUTCOME_KIND,
+    NO_VIABLE_CANDIDATE_OUTCOME_KIND,
+}
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 
 
 @dataclass(frozen=True)
 class ActivatedCycle:
     cycle_ref: str
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class StageRunRequest:
+    request_ref: str
+    cycle_ref: str
+    stage: str
+    epoch: int
+    context_pack_ref: str
+    context_pack_hash: str
+    context_pack: dict[str, object]
+    accepted_question: AcceptedQuestionBinding
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class StageCommit:
+    commit_ref: str
+    request_ref: str
+    cycle_ref: str
+    stage: str
+    epoch: int
+    run_ref: str
+    outcome_ref: str
+    outcome_kind: str
+    disposition: str
+    run_completion_receipt: AcceptanceReceipt
+    outcome_receipt: AcceptanceReceipt
     receipt: AcceptanceReceipt
 
 
@@ -58,14 +108,51 @@ class AdvancementEngineInterface(Protocol):
         question: AcceptedQuestion,
     ) -> ActivatedCycle: ...
 
+    def ensure_idea_stage_request(
+        self,
+        *,
+        cycle_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        context_pack: dict[str, object],
+        idempotency_key: str,
+    ) -> StageRunRequest: ...
+
+    def query_idea_stage_request(self, cycle_ref: str) -> StageRunRequest | None: ...
+
+    def commit_idea_stage(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        outcome_ref: str,
+        outcome_kind: str,
+        run_completion_receipt: AcceptanceReceipt,
+        outcome_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> StageCommit: ...
+
+    def query_idea_stage_commit(self, request_ref: str) -> StageCommit | None: ...
+
+    def verify_stage_run_request(
+        self,
+        *,
+        request_ref: str,
+        cycle_ref: str,
+        epoch: int,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=AE_OWNER,
     statement=text(
-        "SELECT revision, foreground_cycle_count "
+        "SELECT revision, foreground_cycle_count, stage_request_count, "
+        "stage_commit_count "
         "FROM advancement_engine_state WHERE singleton = 'owner'"
     ),
-    fact_names=("foreground_cycle_count",),
+    fact_names=("foreground_cycle_count", "stage_request_count", "stage_commit_count"),
 )
 
 
@@ -76,11 +163,18 @@ class SQLiteAdvancementEngine:
         feed: DurableFeed,
         quest_verifier: QuestReceiptVerifier,
         question_verifier: RootQuestionReceiptVerifier,
+        accepted_question_verifier: AcceptedQuestionBindingVerifier | None = None,
+        run_completion_verifier: RunCompletionReceiptVerifier | None = None,
+        outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._quest_verifier = quest_verifier
         self._question_verifier = question_verifier
+        self._accepted_question_verifier = accepted_question_verifier
+        self._run_completion_verifier = run_completion_verifier
+        self._outcome_verifier = outcome_verifier
+        self._stage_request_verifier = SQLiteAdvancementEngineReceiptVerifier(database)
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
 
     def query_snapshot(self) -> OwnerSnapshot:
@@ -232,6 +326,494 @@ class SQLiteAdvancementEngine:
             raise OwnerConflict("cycle_receipt_missing_after_commit")
         return activated
 
+    def ensure_idea_stage_request(
+        self,
+        *,
+        cycle_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        context_pack: dict[str, object],
+        idempotency_key: str,
+    ) -> StageRunRequest:
+        _validate_idempotency_key(idempotency_key)
+        context_pack_json = canonical_json(context_pack)
+        context_pack_hash = canonical_hash(context_pack)
+        epoch = 1
+        request_input = {
+            "command": "ensure_idea_stage_request",
+            "cycle_ref": cycle_ref,
+            "stage": IDEA_STAGE,
+            "epoch": epoch,
+            "accepted_question": accepted_question.as_dict(),
+            "context_pack_hash": context_pack_hash,
+        }
+        request_hash = canonical_hash(request_input)
+        _query_ae_command(
+            self._database,
+            idempotency_key,
+            "ensure_idea_stage_request",
+            request_hash,
+        )
+        try:
+            validate_idea_context_pack(
+                context_pack,
+                cycle_ref=cycle_ref,
+                accepted_question_binding=accepted_question.as_dict(),
+            )
+        except IdeaContractError as error:
+            raise OwnerConflict(str(error)) from error
+        self._verify_cycle_question(cycle_ref, accepted_question)
+
+        with self._database.write() as connection:
+            replay_ref = _ae_command_replay(
+                connection,
+                idempotency_key,
+                "ensure_idea_stage_request",
+                request_hash,
+            )
+            if replay_ref is not None:
+                replay = connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_run_requests WHERE request_ref = "
+                        ":request_ref"
+                    ),
+                    {"request_ref": replay_ref},
+                ).first()
+                if replay is None:
+                    raise OwnerConflict("stage_command_result_missing")
+                return self._stage_request_from_row(replay)
+
+            existing = connection.execute(
+                text("SELECT * FROM ae_stage_run_requests WHERE cycle_ref = :cycle_ref"),
+                {"cycle_ref": cycle_ref},
+            ).first()
+            if existing is not None:
+                if existing.request_hash != request_hash:
+                    raise OwnerConflict("stage_run_request_conflict")
+                _record_ae_command(
+                    connection,
+                    idempotency_key,
+                    "ensure_idea_stage_request",
+                    request_hash,
+                    existing.request_ref,
+                )
+                return self._stage_request_from_row(existing)
+
+            request_ref = new_ref("stage_request")
+            context_pack_ref = new_ref("context_pack")
+            receipt_ref = new_ref("ae_stage_request_receipt")
+            bindings = {
+                **_question_binding_columns(accepted_question),
+                "cycle_ref": cycle_ref,
+                "stage": IDEA_STAGE,
+                "epoch": epoch,
+                "context_pack_ref": context_pack_ref,
+                "context_pack_hash": context_pack_hash,
+            }
+            receipt_hash = _receipt_hash(
+                STAGE_REQUEST_RECEIPT_KIND, request_ref, bindings
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO ae_stage_run_requests (request_ref, cycle_ref, "
+                    "stage, epoch, initialization_id, quest_ref, question_ref, "
+                    "content_ref, content_hash, schema_ref, content_receipt_ref, "
+                    "content_receipt_hash, question_receipt_ref, "
+                    "question_receipt_hash, context_pack_ref, context_pack_json, "
+                    "context_pack_hash, idempotency_key, request_hash, receipt_ref, "
+                    "receipt_hash, created_at) VALUES (:request_ref, :cycle_ref, "
+                    ":stage, :epoch, :initialization_id, :quest_ref, :question_ref, "
+                    ":content_ref, :content_hash, :schema_ref, :content_receipt_ref, "
+                    ":content_receipt_hash, :question_receipt_ref, "
+                    ":question_receipt_hash, :context_pack_ref, :context_pack_json, "
+                    ":context_pack_hash, :idempotency_key, :request_hash, "
+                    ":receipt_ref, :receipt_hash, :created_at)"
+                ),
+                {
+                    **bindings,
+                    "request_ref": request_ref,
+                    "context_pack_json": context_pack_json,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "created_at": time.time(),
+                },
+            )
+            _record_ae_command(
+                connection,
+                idempotency_key,
+                "ensure_idea_stage_request",
+                request_hash,
+                request_ref,
+            )
+            connection.execute(
+                text(
+                    "UPDATE advancement_engine_state SET revision = revision + 1, "
+                    "stage_request_count = stage_request_count + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "advancement_engine.stage_run_requested",
+                {
+                    "request_ref": request_ref,
+                    "cycle_ref": cycle_ref,
+                    "stage": IDEA_STAGE,
+                    "epoch": epoch,
+                    "context_pack_ref": context_pack_ref,
+                    "context_pack_hash": context_pack_hash,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        requested = self.query_idea_stage_request(cycle_ref)
+        if requested is None:
+            raise OwnerConflict("stage_run_request_missing_after_commit")
+        return requested
+
+    def query_idea_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text("SELECT * FROM ae_stage_run_requests WHERE cycle_ref = :cycle_ref"),
+                {"cycle_ref": cycle_ref},
+            ).first()
+        if row is None:
+            return None
+        return self._stage_request_from_row(row)
+
+    def _stage_request_from_row(self, row) -> StageRunRequest:
+        requested = _stage_request(row)
+        self._verify_cycle_question(row.cycle_ref, requested.accepted_question)
+        self._stage_request_verifier.verify_stage_run_request(
+            request_ref=requested.request_ref,
+            cycle_ref=requested.cycle_ref,
+            epoch=requested.epoch,
+            context_pack_ref=requested.context_pack_ref,
+            context_pack_hash=requested.context_pack_hash,
+            receipt=requested.receipt,
+        )
+        return requested
+
+    def _verify_cycle_question(
+        self, cycle_ref: str, accepted_question: AcceptedQuestionBinding
+    ) -> None:
+        if self._accepted_question_verifier is None:
+            raise OwnerConflict("accepted_question_verifier_unavailable")
+        with self._database.read() as connection:
+            cycle = connection.execute(
+                text("SELECT * FROM ae_initial_cycles WHERE cycle_ref = :cycle_ref"),
+                {"cycle_ref": cycle_ref},
+            ).first()
+        if cycle is None or (
+            cycle.initialization_id != accepted_question.initialization_id
+            or cycle.quest_ref != accepted_question.quest_ref
+            or cycle.question_ref != accepted_question.question_ref
+            or cycle.question_receipt_ref
+            != accepted_question.question_receipt.receipt_ref
+            or cycle.question_receipt_hash
+            != accepted_question.question_receipt.payload_hash
+        ):
+            raise OwnerConflict("stage_run_question_lineage_invalid")
+        self._question_verifier.verify_root_question_receipt(
+            initialization_id=accepted_question.initialization_id,
+            quest_ref=accepted_question.quest_ref,
+            question_ref=accepted_question.question_ref,
+            receipt=accepted_question.question_receipt,
+        )
+        self._accepted_question_verifier.verify_accepted_question_binding(
+            accepted_question
+        )
+
+    def commit_idea_stage(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        outcome_ref: str,
+        outcome_kind: str,
+        run_completion_receipt: AcceptanceReceipt,
+        outcome_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> StageCommit:
+        _validate_idempotency_key(idempotency_key)
+        command_input = {
+            "command": "commit_idea_stage",
+            "request_ref": request_ref,
+            "run_ref": run_ref,
+            "outcome_ref": outcome_ref,
+            "outcome_kind": outcome_kind,
+            "disposition": COMPLETED_DISPOSITION,
+            "run_completion_receipt": run_completion_receipt.as_public_dict(),
+            "outcome_receipt": outcome_receipt.as_public_dict(),
+        }
+        command_hash = canonical_hash(command_input)
+        _query_ae_command(
+            self._database,
+            idempotency_key,
+            "commit_idea_stage",
+            command_hash,
+        )
+        if outcome_kind not in COMPLETABLE_IDEA_OUTCOME_KINDS:
+            raise OwnerConflict("idea_stage_outcome_not_committable")
+        request = self._query_stage_request_by_ref(request_ref)
+        if self._run_completion_verifier is None or self._outcome_verifier is None:
+            raise OwnerConflict("idea_stage_verifier_unavailable")
+        self._run_completion_verifier.verify_run_completion_receipt(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=None,
+            outcome_ref=outcome_ref,
+            receipt=run_completion_receipt,
+        )
+        self._outcome_verifier.verify_idea_outcome_decision(
+            request_ref=request_ref,
+            submission_ref=None,
+            decision="accepted",
+            outcome_ref=outcome_ref,
+            outcome_kind=outcome_kind,
+            receipt=outcome_receipt,
+        )
+        with self._database.write() as connection:
+            replay_ref = _ae_command_replay(
+                connection,
+                idempotency_key,
+                "commit_idea_stage",
+                command_hash,
+            )
+            if replay_ref is not None:
+                replay = connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_commits WHERE commit_ref = "
+                        ":commit_ref"
+                    ),
+                    {"commit_ref": replay_ref},
+                ).first()
+                if replay is None:
+                    raise OwnerConflict("stage_command_result_missing")
+                return self._stage_commit_from_row(replay)
+
+            existing = connection.execute(
+                text("SELECT * FROM ae_stage_commits WHERE request_ref = :request_ref"),
+                {"request_ref": request_ref},
+            ).first()
+            if existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("stage_commit_conflict")
+                _record_ae_command(
+                    connection,
+                    idempotency_key,
+                    "commit_idea_stage",
+                    command_hash,
+                    existing.commit_ref,
+                )
+                return self._stage_commit_from_row(existing)
+
+            commit_ref = new_ref("stage_commit")
+            receipt_ref = new_ref("ae_stage_commit_receipt")
+            bindings = {
+                "request_ref": request_ref,
+                "cycle_ref": request.cycle_ref,
+                "stage": request.stage,
+                "epoch": request.epoch,
+                "run_ref": run_ref,
+                "outcome_ref": outcome_ref,
+                "outcome_kind": outcome_kind,
+                "disposition": COMPLETED_DISPOSITION,
+                "run_completion_receipt_ref": run_completion_receipt.receipt_ref,
+                "run_completion_receipt_hash": run_completion_receipt.payload_hash,
+                "outcome_receipt_ref": outcome_receipt.receipt_ref,
+                "outcome_receipt_hash": outcome_receipt.payload_hash,
+            }
+            receipt_hash = _receipt_hash(STAGE_COMMIT_RECEIPT_KIND, commit_ref, bindings)
+            connection.execute(
+                text(
+                    "INSERT INTO ae_stage_commits (commit_ref, request_ref, "
+                    "cycle_ref, stage, epoch, run_ref, outcome_ref, "
+                    "outcome_kind, disposition, "
+                    "run_completion_receipt_ref, run_completion_receipt_hash, "
+                    "outcome_receipt_ref, outcome_receipt_hash, idempotency_key, "
+                    "request_hash, receipt_ref, receipt_hash, committed_at) VALUES "
+                    "(:commit_ref, :request_ref, :cycle_ref, :stage, :epoch, "
+                    ":run_ref, :outcome_ref, :outcome_kind, :disposition, "
+                    ":run_completion_receipt_ref, "
+                    ":run_completion_receipt_hash, :outcome_receipt_ref, "
+                    ":outcome_receipt_hash, :idempotency_key, :request_hash, "
+                    ":receipt_ref, :receipt_hash, :committed_at)"
+                ),
+                {
+                    **bindings,
+                    "commit_ref": commit_ref,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": command_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "committed_at": time.time(),
+                },
+            )
+            _record_ae_command(
+                connection,
+                idempotency_key,
+                "commit_idea_stage",
+                command_hash,
+                commit_ref,
+            )
+            connection.execute(
+                text(
+                    "UPDATE advancement_engine_state SET revision = revision + 1, "
+                    "stage_commit_count = stage_commit_count + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "advancement_engine.stage_committed",
+                {
+                    "commit_ref": commit_ref,
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "outcome_ref": outcome_ref,
+                    "outcome_kind": outcome_kind,
+                    "disposition": COMPLETED_DISPOSITION,
+                    "stage": request.stage,
+                    "epoch": request.epoch,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        committed = self.query_idea_stage_commit(request_ref)
+        if committed is None:
+            raise OwnerConflict("stage_commit_missing_after_commit")
+        return committed
+
+    def query_idea_stage_commit(self, request_ref: str) -> StageCommit | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text("SELECT * FROM ae_stage_commits WHERE request_ref = :request_ref"),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            return None
+        return self._stage_commit_from_row(row)
+
+    def _stage_commit_from_row(self, row) -> StageCommit:
+        committed = _stage_commit(row)
+        if row.receipt_hash != _stage_commit_receipt_hash(row):
+            raise OwnerConflict("stage_commit_receipt_invalid")
+        if self._run_completion_verifier is not None:
+            self._run_completion_verifier.verify_run_completion_receipt(
+                request_ref=row.request_ref,
+                run_ref=row.run_ref,
+                attempt_ref=None,
+                outcome_ref=row.outcome_ref,
+                receipt=committed.run_completion_receipt,
+            )
+        if self._outcome_verifier is not None:
+            self._outcome_verifier.verify_idea_outcome_decision(
+                request_ref=row.request_ref,
+                submission_ref=None,
+                decision="accepted",
+                outcome_ref=row.outcome_ref,
+                outcome_kind=row.outcome_kind,
+                receipt=committed.outcome_receipt,
+            )
+        return committed
+
+    def _query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text("SELECT * FROM ae_stage_run_requests WHERE request_ref = :request_ref"),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("stage_run_request_not_found")
+        return self._stage_request_from_row(row)
+
+    def verify_stage_run_request(self, **values) -> None:
+        self._stage_request_verifier.verify_stage_run_request(**values)
+
+
+class SQLiteAdvancementEngineReceiptVerifier:
+    """Narrow AE issuer verifier used by Agent Runtime."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def verify_stage_run_request(
+        self,
+        *,
+        request_ref: str,
+        cycle_ref: str,
+        epoch: int,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != AE_OWNER
+            or receipt.kind != STAGE_REQUEST_RECEIPT_KIND
+            or receipt.subject_ref != request_ref
+        ):
+            raise OwnerConflict("stage_run_request_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE request_ref = "
+                    ":request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None or (
+            row.cycle_ref != cycle_ref
+            or int(row.epoch) != epoch
+            or row.context_pack_ref != context_pack_ref
+            or row.context_pack_hash != context_pack_hash
+            or row.receipt_ref != receipt.receipt_ref
+            or row.receipt_hash != receipt.payload_hash
+        ):
+            raise OwnerConflict("stage_run_request_receipt_invalid")
+        _verify_stage_request_integrity(row)
+
+    def verify_idea_stage_request_binding(
+        self,
+        *,
+        request_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        context_pack_ref: str,
+    ) -> VerifiedStageRunRequestBinding:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE request_ref = "
+                    ":request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("stage_run_request_receipt_invalid")
+        requested = _stage_request(row)
+        if (
+            requested.accepted_question != accepted_question
+            or requested.context_pack_ref != context_pack_ref
+        ):
+            raise OwnerConflict("stage_run_request_binding_invalid")
+        self.verify_stage_run_request(
+            request_ref=requested.request_ref,
+            cycle_ref=requested.cycle_ref,
+            epoch=requested.epoch,
+            context_pack_ref=requested.context_pack_ref,
+            context_pack_hash=requested.context_pack_hash,
+            receipt=requested.receipt,
+        )
+        return VerifiedStageRunRequestBinding(
+            request_ref=requested.request_ref,
+            cycle_ref=requested.cycle_ref,
+            epoch=requested.epoch,
+            accepted_question=requested.accepted_question,
+            context_pack_ref=requested.context_pack_ref,
+            context_pack_hash=requested.context_pack_hash,
+            context_pack=requested.context_pack,
+            receipt=requested.receipt,
+        )
+
 
 def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> str:
     return canonical_hash(
@@ -274,15 +856,267 @@ def _activated_cycle(row) -> ActivatedCycle:
     )
 
 
+def _question_binding_columns(binding: AcceptedQuestionBinding) -> dict[str, object]:
+    return {
+        "initialization_id": binding.initialization_id,
+        "quest_ref": binding.quest_ref,
+        "question_ref": binding.question_ref,
+        "content_ref": binding.content_ref,
+        "content_hash": binding.content_hash,
+        "schema_ref": binding.schema_ref,
+        "content_receipt_ref": binding.content_receipt.receipt_ref,
+        "content_receipt_hash": binding.content_receipt.payload_hash,
+        "question_receipt_ref": binding.question_receipt.receipt_ref,
+        "question_receipt_hash": binding.question_receipt.payload_hash,
+    }
+
+
+def _question_binding(row) -> AcceptedQuestionBinding:
+    return AcceptedQuestionBinding(
+        initialization_id=row.initialization_id,
+        quest_ref=row.quest_ref,
+        question_ref=row.question_ref,
+        content_ref=row.content_ref,
+        content_hash=row.content_hash,
+        schema_ref=row.schema_ref,
+        content_receipt=AcceptanceReceipt(
+            issuer="research_memory",
+            kind="question_content_acceptance",
+            receipt_ref=row.content_receipt_ref,
+            subject_ref=row.content_ref,
+            payload_hash=row.content_receipt_hash,
+        ),
+        question_receipt=AcceptanceReceipt(
+            issuer="research_graph",
+            kind="root_question_acceptance",
+            receipt_ref=row.question_receipt_ref,
+            subject_ref=row.question_ref,
+            payload_hash=row.question_receipt_hash,
+        ),
+    )
+
+
+def _stage_request_bindings(row) -> dict[str, object]:
+    return {
+        **_question_binding_columns(_question_binding(row)),
+        "cycle_ref": row.cycle_ref,
+        "stage": row.stage,
+        "epoch": int(row.epoch),
+        "context_pack_ref": row.context_pack_ref,
+        "context_pack_hash": row.context_pack_hash,
+    }
+
+
+def _stage_request_receipt_hash(row) -> str:
+    return _receipt_hash(
+        STAGE_REQUEST_RECEIPT_KIND, row.request_ref, _stage_request_bindings(row)
+    )
+
+
+def _verify_stage_request_integrity(row) -> dict[str, object]:
+    try:
+        context_pack = decoded_object(row.context_pack_json)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("stage_run_request_invalid") from error
+    binding = _question_binding(row)
+    try:
+        validate_idea_context_pack(
+            context_pack,
+            cycle_ref=row.cycle_ref,
+            accepted_question_binding=binding.as_dict(),
+        )
+    except IdeaContractError as error:
+        raise OwnerConflict(str(error)) from error
+    expected_request_hash = canonical_hash(
+        {
+            "command": "ensure_idea_stage_request",
+            "cycle_ref": row.cycle_ref,
+            "stage": row.stage,
+            "epoch": int(row.epoch),
+            "accepted_question": binding.as_dict(),
+            "context_pack_hash": row.context_pack_hash,
+        }
+    )
+    if (
+        row.stage != IDEA_STAGE
+        or int(row.epoch) < 1
+        or canonical_hash(context_pack) != row.context_pack_hash
+        or canonical_json(context_pack) != row.context_pack_json
+        or row.request_hash != expected_request_hash
+        or row.receipt_hash != _stage_request_receipt_hash(row)
+    ):
+        raise OwnerConflict("stage_run_request_invalid")
+    return context_pack
+
+
+def _stage_request(row) -> StageRunRequest:
+    context_pack = _verify_stage_request_integrity(row)
+    return StageRunRequest(
+        request_ref=row.request_ref,
+        cycle_ref=row.cycle_ref,
+        stage=row.stage,
+        epoch=int(row.epoch),
+        context_pack_ref=row.context_pack_ref,
+        context_pack_hash=row.context_pack_hash,
+        context_pack=context_pack,
+        accepted_question=_question_binding(row),
+        receipt=AcceptanceReceipt(
+            issuer=AE_OWNER,
+            kind=STAGE_REQUEST_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.request_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
+def _stage_commit_bindings(row) -> dict[str, object]:
+    return {
+        "request_ref": row.request_ref,
+        "cycle_ref": row.cycle_ref,
+        "stage": row.stage,
+        "epoch": int(row.epoch),
+        "run_ref": row.run_ref,
+        "outcome_ref": row.outcome_ref,
+        "outcome_kind": row.outcome_kind,
+        "disposition": row.disposition,
+        "run_completion_receipt_ref": row.run_completion_receipt_ref,
+        "run_completion_receipt_hash": row.run_completion_receipt_hash,
+        "outcome_receipt_ref": row.outcome_receipt_ref,
+        "outcome_receipt_hash": row.outcome_receipt_hash,
+    }
+
+
+def _stage_commit_receipt_hash(row) -> str:
+    return _receipt_hash(
+        STAGE_COMMIT_RECEIPT_KIND, row.commit_ref, _stage_commit_bindings(row)
+    )
+
+
+def _stage_commit(row) -> StageCommit:
+    if (
+        row.outcome_kind not in COMPLETABLE_IDEA_OUTCOME_KINDS
+        or row.disposition != COMPLETED_DISPOSITION
+    ):
+        raise OwnerConflict("stage_commit_disposition_invalid")
+    return StageCommit(
+        commit_ref=row.commit_ref,
+        request_ref=row.request_ref,
+        cycle_ref=row.cycle_ref,
+        stage=row.stage,
+        epoch=int(row.epoch),
+        run_ref=row.run_ref,
+        outcome_ref=row.outcome_ref,
+        outcome_kind=row.outcome_kind,
+        disposition=row.disposition,
+        run_completion_receipt=AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind="run_execution_completed",
+            receipt_ref=row.run_completion_receipt_ref,
+            subject_ref=row.run_ref,
+            payload_hash=row.run_completion_receipt_hash,
+        ),
+        outcome_receipt=AcceptanceReceipt(
+            issuer="research_graph",
+            kind="idea_outcome_accepted",
+            receipt_ref=row.outcome_receipt_ref,
+            subject_ref=row.outcome_ref,
+            payload_hash=row.outcome_receipt_hash,
+        ),
+        receipt=AcceptanceReceipt(
+            issuer=AE_OWNER,
+            kind=STAGE_COMMIT_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.commit_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
+def _ae_command_replay(
+    connection,
+    idempotency_key: str,
+    command_kind: str,
+    request_hash: str,
+) -> str | None:
+    row = connection.execute(
+        text(
+            "SELECT * FROM ae_stage_commands WHERE idempotency_key = "
+            ":idempotency_key"
+        ),
+        {"idempotency_key": idempotency_key},
+    ).first()
+    if row is None:
+        return None
+    if row.command_kind != command_kind or row.request_hash != request_hash:
+        raise OwnerConflict("idempotency_conflict")
+    return row.result_ref
+
+
+def _query_ae_command(
+    database: Database,
+    idempotency_key: str,
+    command_kind: str,
+    request_hash: str,
+) -> str | None:
+    with database.read() as connection:
+        return _ae_command_replay(
+            connection,
+            idempotency_key,
+            command_kind,
+            request_hash,
+        )
+
+
+def _record_ae_command(
+    connection,
+    idempotency_key: str,
+    command_kind: str,
+    request_hash: str,
+    result_ref: str,
+) -> None:
+    connection.execute(
+        text(
+            "INSERT INTO ae_stage_commands (idempotency_key, command_kind, "
+            "request_hash, result_ref, recorded_at) VALUES (:idempotency_key, "
+            ":command_kind, :request_hash, :result_ref, :recorded_at)"
+        ),
+        {
+            "idempotency_key": idempotency_key,
+            "command_kind": command_kind,
+            "request_hash": request_hash,
+            "result_ref": result_ref,
+            "recorded_at": time.time(),
+        },
+    )
+
+
+def _validate_idempotency_key(value: str) -> None:
+    if not value or len(value) > 128:
+        raise OwnerConflict("idempotency_key_invalid")
+
+
+def create_advancement_engine_receipt_verifier(
+    database: Database,
+) -> SQLiteAdvancementEngineReceiptVerifier:
+    return SQLiteAdvancementEngineReceiptVerifier(database)
+
+
 def create_advancement_engine_interface(
     database: Database,
     feed: DurableFeed,
     quest_verifier: QuestReceiptVerifier,
     question_verifier: RootQuestionReceiptVerifier,
+    accepted_question_verifier: AcceptedQuestionBindingVerifier | None = None,
+    run_completion_verifier: RunCompletionReceiptVerifier | None = None,
+    outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
 ) -> AdvancementEngineInterface:
     return SQLiteAdvancementEngine(
         database,
         feed,
         quest_verifier,
         question_verifier,
+        accepted_question_verifier,
+        run_completion_verifier,
+        outcome_verifier,
     )

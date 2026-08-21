@@ -423,7 +423,7 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert version == ("0003_quest_direct_web",)
+    assert version == ("0004_idea_stage",)
     assert "formal_content_count" in columns
     assert "hc_quest_initializations" in tables
     assert "hc_proposal_generation_attempts" in tables
@@ -490,7 +490,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0003_quest_direct_web",)
+        ).fetchone() == ("0004_idea_stage",)
 
 
 def test_process_exit_mid_0003_ddl_recovers_on_the_next_upgrade(
@@ -550,7 +550,7 @@ upgrade_database(Path(sys.argv[1]))
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0003_quest_direct_web",)
+        ).fetchone() == ("0004_idea_stage",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -654,6 +654,12 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+        new_indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
         quick_check = connection.execute("PRAGMA quick_check").fetchone()
 
@@ -666,7 +672,7 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 ("d" * 64,),
             )
 
-    assert version == ("0003_quest_direct_web",)
+    assert version == ("0004_idea_stage",)
     assert feed == ("legacy.event", '{"kept":true}', 17.0)
     assert auth == ("a" * 64, "b" * 64, 18.0, 1800.0, None)
     assert initialization == (
@@ -694,9 +700,73 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
         "hc_confirmation_preview_bindings",
         "hc_reconciliation_checkpoints",
         "hc_reconciliation_attempts",
+        "ae_stage_run_requests",
+        "ar_stage_runs",
+        "ar_stage_sessions",
+        "ar_stage_attempts",
+        "ar_execution_fences",
+        "ar_idea_provider_invocations",
+        "rm_idea_outcome_contents",
+        "rg_idea_outcome_decisions",
+        "ae_stage_commits",
     } <= new_tables
+    assert "ix_durable_feed_event_type_revision" in new_indexes
+    assert "uq_ar_stage_sessions_native_session_ref" in new_indexes
+    assert "ix_ar_idea_provider_invocations_status" in new_indexes
     assert foreign_key_errors == []
     assert quick_check == ("ok",)
+
+
+def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "interrupted-0004.sqlite3"
+    _upgrade_to_revision(database, "0003_quest_direct_web")
+    original_create_table = Operations.create_table
+    failed_once = False
+
+    def fail_after_runtime_table(self, table_name, *args, **kwargs):
+        nonlocal failed_once
+        created = original_create_table(self, table_name, *args, **kwargs)
+        if table_name == "ar_stage_sessions" and not failed_once:
+            failed_once = True
+            raise OSError("injected 0004 migration interruption")
+        return created
+
+    monkeypatch.setattr(Operations, "create_table", fail_after_runtime_table)
+    with pytest.raises(OSError, match="injected 0004 migration interruption"):
+        upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0003_quest_direct_web",)
+        ae_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(advancement_engine_state)"
+            )
+        }
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert "stage_request_count" not in ae_columns
+    assert "ae_stage_run_requests" not in tables
+    assert "ar_stage_runs" not in tables
+    assert "ar_stage_sessions" not in tables
+
+    monkeypatch.setattr(Operations, "create_table", original_create_table)
+    upgrade_database(database)
+    upgrade_database(database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0004_idea_stage",)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
 
 def test_0003_workflow_tables_enforce_lineage_and_paired_state(

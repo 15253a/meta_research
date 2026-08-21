@@ -168,3 +168,28 @@ class DurableFeed:
             maximum,
             False,
         )
+
+    def read_event_type(self, event_type: str) -> tuple[DurableEvent, ...]:
+        """Read one event family as a routing index, never as authority.
+
+        Application workers use this narrow query to discover aggregate refs and
+        then revalidate every returned identity through its State Owner.  It
+        avoids replaying unrelated history on every idle worker poll.
+        """
+
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT revision, event_type, payload_json FROM durable_feed "
+                    "WHERE event_type = :event_type ORDER BY revision"
+                ),
+                {"event_type": event_type},
+            ).all()
+        return tuple(
+            DurableEvent(
+                revision=int(row.revision),
+                event_type=row.event_type,
+                payload=json.loads(row.payload_json),
+            )
+            for row in rows
+        )

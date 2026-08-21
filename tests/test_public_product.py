@@ -97,6 +97,7 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "object_store",
             "owner_interfaces",
             "projection",
+            "idea_stage_worker",
             "quest_drafting_worker",
             "quest_reconciliation_worker",
         }

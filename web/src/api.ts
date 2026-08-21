@@ -3,6 +3,7 @@ export type ReadinessCheck = {
   status: "ready" | "stale" | "unavailable";
   revision?: number;
   count?: number;
+  reason?: { code?: string; message?: string };
 };
 
 export type OwnerSnapshot = {
@@ -237,6 +238,145 @@ export type QuestCreationView = {
   cycle_ref?: string;
 };
 
+export type IdeaReceipt = {
+  status?: string;
+  issuer?: string;
+  kind?: string;
+  receipt_ref?: string;
+  subject_ref?: string;
+  payload_hash?: string;
+  [key: string]: unknown;
+};
+
+export type IdeaAcceptanceFact = {
+  status: string;
+  receipt?: IdeaReceipt | null;
+  reason?: null | { code?: string; message?: string; [key: string]: unknown };
+  [key: string]: unknown;
+};
+
+export type IdeaQuestionSummary = {
+  quest_ref?: string;
+  question_ref?: string;
+  graph_revision?: number;
+  title?: string;
+  unknown_statement?: string;
+  answer_shape?: string;
+  applicability_scope?: string;
+  [key: string]: unknown;
+};
+
+export type IdeaStageProjection = {
+  eligibility: {
+    status: string;
+    cycle_ref?: string;
+    question_ref?: string;
+    reason?: null | { code?: string; message?: string; [key: string]: unknown };
+    [key: string]: unknown;
+  };
+  stage_run_request: null | {
+    status?: string;
+    request_ref?: string;
+    stage_run_request_ref?: string;
+    cycle_ref?: string;
+    stage?: string;
+    epoch?: number;
+    foreground_epoch_ref?: string;
+    accepted_question_binding?: null | (IdeaQuestionSummary & {
+      initialization_id?: string;
+      ref?: string;
+      binding_ref?: string;
+      content_ref?: string;
+      content_hash?: string;
+      schema_ref?: string;
+      question_content_ref?: string;
+      question_content_hash?: string;
+      content_receipt?: IdeaReceipt | null;
+      question_receipt?: IdeaReceipt | null;
+    });
+    context_pack_ref?: string;
+    context_pack_hash?: string;
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  run: null | {
+    status: string;
+    run_ref?: string;
+    attempt_ref?: string;
+    attempt_generation?: number;
+    submission_ref?: string | null;
+    root_session_ref?: string;
+    native_session_ref?: string | null;
+    provider_operations?: {
+      primary?: {
+        invocation_ref?: string;
+        status?: string;
+        request_hash?: string;
+        response_hash?: string | null;
+      };
+      review?: {
+        invocation_ref?: string;
+        status?: string;
+        request_hash?: string;
+        response_hash?: string | null;
+      };
+    };
+    primary_draft_checkpoint?: null | {
+      status: "recorded";
+      draft_hash: string;
+      adapter_kind: string;
+    };
+    fence_ref?: string;
+    fence_status?: string;
+    attempt_execution_receipt?: IdeaReceipt | null;
+    completion_receipt?: IdeaReceipt | null;
+    blocker?: null | {
+      code?: string;
+      message?: string;
+      [key: string]: unknown;
+    };
+    review?: null | {
+      status?: string;
+      reviewer_session_ref?: string;
+      finding_count?: number;
+      disposition_count?: number;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+  outcome_acceptance: {
+    status: string;
+    outcome_kind?: string;
+    outcome_ref?: string | null;
+    content: IdeaAcceptanceFact;
+    domain: IdeaAcceptanceFact;
+    rejection?: null | {
+      code?: string;
+      message?: string;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+  stage_commit: null | {
+    status: string;
+    commit_ref?: string;
+    stage_commit_ref?: string;
+    request_ref?: string;
+    cycle_ref?: string;
+    stage?: string;
+    epoch?: number;
+    run_ref?: string;
+    outcome_ref?: string;
+    outcome_kind?: string;
+    run_completion_receipt?: IdeaReceipt | null;
+    outcome_receipt?: IdeaReceipt | null;
+    receipt?: IdeaReceipt | null;
+    next_stage?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+};
+
 export type PublicSnapshot = {
   product: { name: string; version: string };
   revision: number;
@@ -246,6 +386,7 @@ export type PublicSnapshot = {
     quest_count: number;
     question_count: number;
     foreground_cycle_count: number;
+    current_question?: IdeaQuestionSummary | null;
   };
   owners: Record<string, OwnerSnapshot>;
   quest_creation: {
@@ -255,6 +396,7 @@ export type PublicSnapshot = {
     accepted_material_basis: Omit<UnavailableCapability, "capability">;
     first_question_deepfetch: Omit<UnavailableCapability, "capability">;
   };
+  idea_stage?: IdeaStageProjection | null;
   unavailable: UnavailableCapability[];
 };
 
@@ -529,6 +671,15 @@ export function followProjection(
     "research_memory.question_content_accepted",
     "research_graph.root_question_accepted",
     "advancement_engine.initial_cycle_activated",
+    "advancement_engine.stage_run_requested",
+    "agent_runtime.stage_run_admitted",
+    "agent_runtime.attempt_executed",
+    "agent_runtime.attempt_rejected",
+    "agent_runtime.stage_run_completed",
+    "research_memory.idea_outcome_content_accepted",
+    "research_graph.idea_outcome_accepted",
+    "research_graph.idea_outcome_rejected",
+    "advancement_engine.stage_committed",
   ];
   let cursor = afterRevision;
   let stream: EventSource | null = null;

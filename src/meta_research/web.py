@@ -187,13 +187,15 @@ def create_app(
 ) -> FastAPI:
     reconciliation_task: asyncio.Task[None] | None = None
     drafting_task: asyncio.Task[None] | None = None
+    idea_stage_task: asyncio.Task[None] | None = None
     reconciliation_health = ReconciliationHealth()
     drafting_health = ReconciliationHealth()
+    idea_stage_health = ReconciliationHealth()
     worker_health_updates = WorkerHealthUpdates()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        nonlocal reconciliation_task, drafting_task
+        nonlocal reconciliation_task, drafting_task, idea_stage_task
         reconciliation_task = asyncio.create_task(
             _reconcile_quest_initializations(
                 runtime,
@@ -210,12 +212,20 @@ def create_app(
             )
         )
         drafting_task.add_done_callback(_log_reconciliation_exit)
+        idea_stage_task = asyncio.create_task(
+            _process_idea_stage(
+                runtime,
+                idea_stage_health,
+                worker_health_updates.publish,
+            )
+        )
+        idea_stage_task.add_done_callback(_log_reconciliation_exit)
         try:
             yield
         finally:
             tasks = tuple(
                 task
-                for task in (reconciliation_task, drafting_task)
+                for task in (reconciliation_task, drafting_task, idea_stage_task)
                 if task is not None
             )
             try:
@@ -270,12 +280,16 @@ def create_app(
                 reconciliation_health,
             ),
             worker_check("quest_drafting_worker", drafting_task, drafting_health),
+            worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
+        ]
+        core_checks = [
+            check for check in checks if check["name"] != "idea_stage_worker"
         ]
         snapshot["readiness"] = {
             "status": (
                 "ready"
                 if readiness["status"] == "ready"
-                and all(check["status"] == "ready" for check in checks)
+                and all(check["status"] == "ready" for check in core_checks)
                 else "unavailable"
             ),
             "checks": checks,
@@ -400,6 +414,9 @@ def create_app(
         drafting = worker_check(
             "quest_drafting_worker", drafting_task, drafting_health
         )
+        idea_stage = worker_check(
+            "idea_stage_worker", idea_stage_task, idea_stage_health
+        )
         return {
             "status": snapshot["readiness"]["status"],
             "revision": snapshot["revision"],
@@ -410,6 +427,10 @@ def create_app(
             "drafting": {
                 "status": drafting["status"],
                 "last_error": drafting_health.last_error,
+            },
+            "idea_stage": {
+                "status": idea_stage["status"],
+                "last_error": idea_stage_health.last_error,
             },
         }
 
@@ -651,6 +672,10 @@ def create_app(
     @app.get("/api/v1/snapshot")
     def query_snapshot() -> dict[str, object]:
         return public_snapshot()
+
+    @app.get("/api/v1/idea-stage/current")
+    def query_current_idea_stage() -> dict[str, object]:
+        return runtime.idea_stage.query_current()
 
     @app.get("/api/v1/events")
     async def stream_events(request: Request) -> StreamingResponse:
@@ -910,6 +935,54 @@ async def _process_quest_drafting(
             if changed and on_health_change is not None:
                 on_health_change()
             await asyncio.sleep(0 if advanced else 0.2)
+
+
+async def _process_idea_stage(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Advance one verified Idea boundary at a time and retry transient adapters."""
+
+    while True:
+        try:
+            advanced = await asyncio.to_thread(runtime.idea_stage.process_once)
+            transient_error = runtime.idea_stage.transient_error
+            if transient_error is not None:
+                raise _IdeaStageTransientError(transient_error)
+        except Exception as error:
+            if not isinstance(
+                error,
+                (OSError, OwnerConflict, SQLAlchemyError, _IdeaStageTransientError),
+            ):
+                LOGGER.exception("idea stage attempt failed unexpectedly")
+            error_code = (
+                error.code
+                if isinstance(error, (OwnerConflict, _IdeaStageTransientError))
+                else type(error).__name__
+            )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
+class _IdeaStageTransientError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def _log_reconciliation_exit(task: asyncio.Task[None]) -> None:
