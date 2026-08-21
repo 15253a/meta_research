@@ -35,6 +35,25 @@ handled, but extremely unlikely theoretical tails do not justify an unbounded
 series of patches that makes normal progress slower or less reliable. Residual
 tail risk should be recorded and bounded instead.
 
+## 2026-08-21 Session-topology clarification
+
+Short-lived review, retrieval, and verification work stays inside the current
+managed Harness Session. A packaged Skill uses the native Codex or Claude agent
+tree to spawn a focused child agent, then the root Agent owns every disposition
+and the final revision. Independence means a separate task context and an
+advisory-only role; it does not require Agent Runtime to create another Run,
+Attempt, Fence, or top-level Codex/Claude Session.
+
+Idea therefore keeps one managed native Session. Its primary draft is durably
+checkpointed, then the child-review turn resumes that same Session and returns
+the review, root dispositions, and final Outcome together. Child-agent
+provenance may be shown for audit, but the child is internal Harness topology,
+not an Owner or a durable domain identity. Only work that needs an independently
+managed long-lived lifecycle, pause/resume, monitoring, resources, or fencing
+gets another top-level Session; a formally scheduled Target is the canonical
+example. This keeps ordinary research fast and understandable without weakening
+the review or Owner-acceptance boundaries.
+
 From the empty research space, the Web product now supports the direct
 Quest-initialization path. A research lead defines the Goal, completion
 criteria, key configuration, literature scope, and first-question direction;
@@ -62,11 +81,13 @@ StageRunRequest, Run/Attempt, content and domain acceptance, and StageCommit as
 separate facts. Durable checkpoints let a daemon restart continue from the
 first missing Owner boundary; idempotent replay and stale Execution Fences
 cannot duplicate a formal submission or advance the Stage early.
-Agent Runtime persists each primary/review provider invocation before launch;
-the Harness seals thread events and structured results in a durable transport
-spool, so a response lost before the Owner transaction is reconciled rather
-than invoking Codex a second time. An incomplete, unverifiable spool fails
-closed instead of guessing whether the external effect happened.
+Agent Runtime persists both provider turns before launch. The primary turn
+creates and checkpoints the native Session; the child-review turn resumes that
+same Session instead of creating a reviewer Session. The Harness seals thread
+events and structured results in a durable transport spool, so a response lost
+before the Owner transaction is reconciled rather than being invoked again. An
+incomplete, unverifiable spool fails closed instead of guessing whether the
+external effect happened.
 
 The generic `stage_execution` capability remains unavailable until the later
 Plan, Bundle, and Reasoning execution slices are delivered; the Idea execution

@@ -141,7 +141,10 @@ class _IdeaProvider:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            reviewer_session_ref=f"codex-reviewer-{request.submission_revision}",
+            review_mode="harness_child_agent",
+            reviewer_agent_ref=(
+                f"codex-child-reviewer-{request.submission_revision}"
+            ),
             adapter_kind=draft.adapter_kind,
         )
 

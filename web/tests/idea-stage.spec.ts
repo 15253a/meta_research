@@ -163,7 +163,8 @@ const AWAITING: IdeaStageFixture = {
     fence_status: "submitted",
     review: {
       status: "completed",
-      reviewer_session_ref: "session-idea-reviewer-001",
+      review_mode: "harness_child_agent",
+      reviewer_agent_ref: "agent-idea-reviewer-001",
       finding_count: 1,
       disposition_count: 1,
     },
@@ -551,6 +552,25 @@ test("the active Lumen shell keeps all five Idea facts separate", async ({ page 
   ).toBeVisible();
   await expect(stageCard.getByText("stage_commit", { exact: true })).toBeVisible();
   await expect(stageCard.getByText(RECEIPT.receipt_ref, { exact: true })).toBeVisible();
+  await expect(
+    stageCard
+      .getByText("Child reviewer agent", { exact: true })
+      .locator("..").getByRole("definition"),
+  ).toHaveText("agent-idea-reviewer-001");
+  await expect(
+    stageCard.getByText("Child-review provider turn", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    stageCard
+      .getByText("Review mode", { exact: true })
+      .locator("..").getByRole("definition"),
+  ).toHaveText("harness_child_agent");
+  await expect(
+    stageCard.getByText("Independent reviewer", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    stageCard.getByText("Review provider operation", { exact: true }),
+  ).toHaveCount(0);
 });
 
 test("Idea projection updates preserve focus and the fixed responsive order", async ({

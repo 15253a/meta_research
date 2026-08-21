@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from meta_research.composition import build_production_runtime
+from meta_research.idea_stage import _public_run
 from meta_research.idea_skill import IdeaSkillDraft, IdeaSkillRequest, IdeaSkillResult
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash
@@ -115,7 +117,8 @@ class _DeterministicIdeaSkill:
             findings=(),
             dispositions=(),
             primary_session_ref=draft.primary_session_ref,
-            reviewer_session_ref="codex-reviewer-1",
+            review_mode="harness_child_agent",
+            reviewer_agent_ref="codex-child-reviewer-1",
             adapter_kind="test_deterministic",
         )
 
@@ -301,9 +304,41 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
         assert committed["stage_commit"]["outcome_kind"] == "IdeaSet"
         assert committed["stage_commit"]["receipt"]["issuer"] == "advancement_engine"
         assert len(provider.requests) == 1
-        assert (
-            committed["run"]["root_session_ref"]
-            != committed["run"]["review"]["reviewer_session_ref"]
+        assert committed["run"]["native_session_ref"] == "codex-primary-1"
+        assert committed["run"]["review"] == {
+            "status": "completed",
+            "review_mode": "harness_child_agent",
+            "reviewer_agent_ref": "codex-child-reviewer-1",
+            "finding_count": 0,
+            "disposition_count": 0,
+        }
+
+        # The v2 field is additive. Already-issued v1 payloads keep their
+        # original public reviewer_session_ref instead of losing audit data.
+        persisted_run = runtime.owners.agent_runtime.query_idea_stage_run(
+            committed["stage_run_request"]["request_ref"]
         )
+        assert persisted_run is not None and persisted_run.execution is not None
+        legacy_review = dict(persisted_run.execution.review)
+        legacy_review["schema_ref"] = "meta-research/idea-advisory-review/v1"
+        legacy_review["reviewer_session_ref"] = "legacy-reviewer-session-1"
+        legacy_review.pop("review_mode")
+        legacy_review.pop("reviewer_agent_ref")
+        legacy_projection = _public_run(
+            replace(
+                persisted_run,
+                execution=replace(
+                    persisted_run.execution,
+                    review=legacy_review,
+                ),
+            )
+        )
+        assert legacy_projection["review"] == {
+            "status": "completed",
+            "review_mode": "legacy_external_session",
+            "reviewer_session_ref": "legacy-reviewer-session-1",
+            "finding_count": 0,
+            "disposition_count": 0,
+        }
     finally:
         runtime.close()

@@ -673,7 +673,7 @@ function IdeaStageCard({
               : null}
           />
           <IdeaDetail
-            label="Review provider operation"
+            label="Child-review provider turn"
             value={run?.provider_operations?.review?.invocation_ref
               ? `${run.provider_operations.review.invocation_ref} · ${run.provider_operations.review.status ?? "unknown"}`
               : null}
@@ -718,7 +718,15 @@ function IdeaStageCard({
             value={receiptKind(run?.completion_receipt)}
           />
           <IdeaDetail
-            label="Independent reviewer"
+            label="Child reviewer agent"
+            value={run?.review?.reviewer_agent_ref}
+          />
+          <IdeaDetail
+            label="Review mode"
+            value={run?.review?.review_mode}
+          />
+          <IdeaDetail
+            label="Legacy reviewer Session"
             value={run?.review?.reviewer_session_ref}
           />
           <IdeaDetail label="Outcome" value={acceptance.outcome_ref} />

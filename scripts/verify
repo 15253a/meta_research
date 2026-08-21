@@ -505,6 +505,12 @@ elif properties == {{"outcome"}}:
     assert 'web_search="live"' in config_values
     assert args[args.index("--sandbox") + 1] == "danger-full-access"
     assert args[args.index("--model") + 1] == "gpt-5.4"
+    enabled = {{
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--enable"
+    }}
+    assert "multi_agent" in enabled
     disabled = {{
         args[index + 1]
         for index, value in enumerate(args[:-1])
@@ -569,7 +575,12 @@ elif properties == {{"outcome"}}:
         "resume_ref": resume_ref,
         "thread_id": thread_id,
     }}
-elif properties == {{"findings"}}:
+elif properties == {{
+    "reviewer_agent_ref",
+    "findings",
+    "final_outcome",
+    "dispositions",
+}}:
     assert "--ignore-user-config" in args
     assert args[args.index("--config") + 1] == "mcp_servers={{}}"
     config_values = {{
@@ -580,21 +591,78 @@ elif properties == {{"findings"}}:
     assert 'approval_policy="never"' in config_values
     assert 'web_search="live"' in config_values
     assert args[args.index("--sandbox") + 1] == "danger-full-access"
-    question_match = re.search(r'"question_ref":"([^"\\n]+)"', prompt)
+    enabled = {{
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--enable"
+    }}
+    assert "multi_agent" in enabled
+    stage_match = re.search(r"(?m)^stage_request_ref=([^\\n]+)$", prompt)
+    question_match = re.search(r"(?m)^question_ref=([^\\n]+)$", prompt)
+    context_match = re.search(r"(?m)^context_pack_ref=([^\\n]+)$", prompt)
+    draft_match = re.search(r"(?m)^reviewed_draft=(.+)$", prompt)
+    assert stage_match is not None
     assert question_match is not None
+    assert context_match is not None
+    assert draft_match is not None
+    stage_request_ref = stage_match.group(1)
     question_ref = question_match.group(1)
-    assert "独立 advisory reviewer" in prompt
+    context_pack_ref = context_match.group(1)
+    reviewed_draft = json.loads(draft_match.group(1))
+    assert reviewed_draft["question_ref"] == question_ref
+    assert reviewed_draft["context_pack_ref"] == context_pack_ref
+    assert "spawn" in prompt
+    assert "reviewer" in prompt
     assert "--ephemeral" not in args
-    assert resume_ref is None
-    thread_id = f"installed-idea-review-{{question_ref}}"
-    output = {{"findings": []}}
+    thread_id = f"installed-idea-native-{{stage_request_ref}}"
+    assert resume_ref == thread_id
+    assert args[-3:] == ["resume", thread_id, "-"]
+    reviewer_agent_ref = f"installed-child-reviewer-{{question_ref}}"
+    output = {{
+        "reviewer_agent_ref": reviewer_agent_ref,
+        "findings": [],
+        "final_outcome": reviewed_draft,
+        "dispositions": [],
+    }}
     print(json.dumps({{"type": "thread.started", "thread_id": thread_id}}))
+    print(json.dumps({{
+        "type": "item.completed",
+        "item": {{
+            "id": "child-review-spawn",
+            "type": "collab_tool_call",
+            "tool": "spawn_agent",
+            "sender_thread_id": thread_id,
+            "receiver_thread_ids": [reviewer_agent_ref],
+            "prompt": "Review the exact frozen Idea draft.",
+            "agents_states": {{
+                reviewer_agent_ref: {{"status": "pending_init", "message": None}}
+            }},
+            "status": "completed",
+        }},
+    }}))
+    print(json.dumps({{
+        "type": "item.completed",
+        "item": {{
+            "id": "child-review-wait",
+            "type": "collab_tool_call",
+            "tool": "wait",
+            "sender_thread_id": thread_id,
+            "receiver_thread_ids": [reviewer_agent_ref],
+            "prompt": None,
+            "agents_states": {{
+                reviewer_agent_ref: {{"status": "completed", "message": "[]"}}
+            }},
+            "status": "completed",
+        }},
+    }}))
     record = {{
-        "kind": "idea_review",
+        "kind": "idea_child_review",
         "ephemeral": False,
+        "stage_request_ref": stage_request_ref,
         "question_ref": question_ref,
-        "resume_ref": None,
+        "resume_ref": resume_ref,
         "thread_id": thread_id,
+        "reviewer_agent_ref": reviewer_agent_ref,
     }}
 else:
     raise AssertionError(f"unexpected schema properties: {{properties}}")
@@ -866,7 +934,7 @@ while True:
 calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
 assert sorted(call["kind"] for call in calls) == [
     "idea",
-    "idea_review",
+    "idea_child_review",
     "intent",
     "intent",
     "proposal",
@@ -877,10 +945,11 @@ assert intent_calls[0]["resume_ref"] is None
 assert intent_calls[1]["resume_ref"] == f"installed-native-{initialization_id}"
 assert [call["ephemeral"] for call in calls if call["kind"] == "proposal"] == [True]
 idea_calls = [call for call in calls if call["kind"] == "idea"]
-review_calls = [call for call in calls if call["kind"] == "idea_review"]
+review_calls = [call for call in calls if call["kind"] == "idea_child_review"]
 assert len(idea_calls) == len(review_calls) == 1
 assert idea_calls[0]["resume_ref"] is None
-assert idea_calls[0]["thread_id"] != review_calls[0]["thread_id"]
+assert review_calls[0]["resume_ref"] == idea_calls[0]["thread_id"]
+assert review_calls[0]["thread_id"] == idea_calls[0]["thread_id"]
 
 research_space = snapshot["research_space"]
 assert {key: research_space[key] for key in (
@@ -911,8 +980,8 @@ assert run["status"] == "completed"
 assert run["attempt_execution_receipt"]["kind"] == "idea_attempt_execution"
 assert run["completion_receipt"]["kind"] == "run_execution_completed"
 assert run["native_session_ref"] == idea_calls[0]["thread_id"]
-assert run["review"]["reviewer_session_ref"] == review_calls[0]["thread_id"]
-assert run["root_session_ref"] != run["review"]["reviewer_session_ref"]
+assert run["review"]["review_mode"] == "harness_child_agent"
+assert run["review"]["reviewer_agent_ref"] == review_calls[0]["reviewer_agent_ref"]
 assert acceptance["status"] == "accepted"
 assert acceptance["content"]["receipt"]["kind"] == "idea_outcome_content_acceptance"
 assert acceptance["domain"]["receipt"]["kind"] == "idea_outcome_accepted"

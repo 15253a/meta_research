@@ -595,14 +595,29 @@ def _public_run(run: IdeaStageRun) -> dict[str, object]:
     if execution is not None:
         findings = execution.review.get("findings", [])
         dispositions = execution.review.get("dispositions", [])
+        review_mode = execution.review.get("review_mode")
+        reviewer_agent_ref = execution.review.get("reviewer_agent_ref")
         review = {
             "status": "completed",
-            "reviewer_session_ref": execution.review.get("reviewer_session_ref"),
+            "review_mode": (
+                review_mode
+                if isinstance(review_mode, str)
+                else "legacy_external_session"
+            ),
             "finding_count": len(findings) if isinstance(findings, list) else 0,
             "disposition_count": (
                 len(dispositions) if isinstance(dispositions, list) else 0
             ),
         }
+        if isinstance(reviewer_agent_ref, str):
+            review["reviewer_agent_ref"] = reviewer_agent_ref
+        legacy_reviewer_session_ref = execution.review.get(
+            "reviewer_session_ref"
+        )
+        if isinstance(legacy_reviewer_session_ref, str):
+            # Preserve the v1 public field additively for already-issued
+            # immutable review payloads. New v2 reviews never write it.
+            review["reviewer_session_ref"] = legacy_reviewer_session_ref
     return {
         "status": status,
         "run_ref": run.run_ref,

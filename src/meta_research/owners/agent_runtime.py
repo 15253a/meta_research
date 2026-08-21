@@ -11,7 +11,11 @@ from sqlalchemy.exc import IntegrityError
 
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
-from meta_research.idea_contract import material_outcome_hash
+from meta_research.idea_contract import (
+    IDEA_REVIEW_SCHEMA_REF,
+    IDEA_REVIEW_SCHEMA_V1_REF,
+    material_outcome_hash,
+)
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
     SQLiteOwnerSnapshot,
@@ -60,6 +64,7 @@ _IDEA_SAFE_CAPABILITIES = {
     "approval-policy-never",
     "filesystem-danger-full-access",
     "global-config-ignored",
+    "harness-child-agent-review",
     "mcp-config-empty",
     "native-session-resume",
     "shell-tool-enabled",
@@ -1057,9 +1062,10 @@ class SQLiteAgentRuntime:
     ) -> IdeaPrimaryDraft:
         """Bind the real native Session immediately after primary generation.
 
-        Independent review is a later provider phase. Persisting this transport
-        checkpoint prevents reviewer failure or daemon restart from creating a
-        second primary Session for the same Attempt/Fence.
+        Child-agent review is a later provider turn in this same native
+        Session. Persisting this transport checkpoint prevents review failure
+        or daemon restart from creating a second managed Session for the same
+        Attempt/Fence.
         """
 
         _validate_stage_idempotency_key(idempotency_key)
@@ -1245,13 +1251,9 @@ class SQLiteAgentRuntime:
         runtime_binding, _runtime_binding_json, runtime_binding_hash = (
             _validated_runtime_binding(runtime_binding)
         )
-        reviewer_session_ref = review.get("reviewer_session_ref")
-        if (
-            not isinstance(reviewer_session_ref, str)
-            or not reviewer_session_ref
-            or reviewer_session_ref == native_session_ref
-        ):
-            raise OwnerConflict("attempt_review_independence_invalid")
+        reviewer_agent_ref = _validate_attempt_review_for_write(
+            review, native_session_ref=native_session_ref
+        )
         reviewed_draft = _resolved_reviewed_draft(
             outcome,
             review,
@@ -1296,7 +1298,7 @@ class SQLiteAgentRuntime:
             preview_run, preview_attempt, preview_session, preview_fence = (
                 _load_stage_fence(connection, run_ref, attempt_ref, fence_ref)
             )
-            if reviewer_session_ref == preview_session.session_ref:
+            if reviewer_agent_ref == preview_session.session_ref:
                 raise OwnerConflict("attempt_review_independence_invalid")
             if (
                 _runtime_binding_from_row(preview_run) != runtime_binding
@@ -1362,7 +1364,7 @@ class SQLiteAgentRuntime:
             run, attempt, session, fence = _load_stage_fence(
                 connection, run_ref, attempt_ref, fence_ref
             )
-            if reviewer_session_ref == session.session_ref:
+            if reviewer_agent_ref == session.session_ref:
                 raise OwnerConflict("attempt_review_independence_invalid")
             if (
                 _runtime_binding_from_row(run) != runtime_binding
@@ -2855,6 +2857,33 @@ def _resolved_reviewed_draft(
     if review.get("reviewed_draft_hash") != canonical_hash(outcome):
         raise OwnerConflict("reviewed_draft_missing")
     return outcome
+
+
+def _validate_attempt_review_for_write(
+    review: dict[str, object], *, native_session_ref: str
+) -> str:
+    """Accept only the child-agent review contract for new AR executions.
+
+    Historical v1 reviews remain readable from their immutable execution
+    payloads.  They are not a production write format: their
+    ``reviewer_session_ref`` encoded the retired extra-Session topology.
+    """
+
+    if review.get("schema_ref") == IDEA_REVIEW_SCHEMA_V1_REF:
+        raise OwnerConflict("attempt_review_legacy_read_only")
+    reviewer_agent_ref = review.get("reviewer_agent_ref")
+    if (
+        review.get("schema_ref") != IDEA_REVIEW_SCHEMA_REF
+        or review.get("review_mode") != "harness_child_agent"
+        or not isinstance(reviewer_agent_ref, str)
+        or not reviewer_agent_ref.strip()
+        or len(reviewer_agent_ref) > 512
+        or reviewer_agent_ref == native_session_ref
+        or review.get("independent") is not True
+        or review.get("advisory_only") is not True
+    ):
+        raise OwnerConflict("attempt_review_independence_invalid")
+    return reviewer_agent_ref
 
 
 def _runtime_binding_from_row(row) -> IdeaRuntimeBinding:

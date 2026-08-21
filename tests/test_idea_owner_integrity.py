@@ -169,8 +169,9 @@ def _outcome() -> dict[str, object]:
 
 def _review(outcome_hash: str) -> dict[str, object]:
     return {
-        "schema_ref": "meta-research/idea-advisory-review/v1",
-        "reviewer_session_ref": "reviewer-1",
+        "schema_ref": "meta-research/idea-advisory-review/v2",
+        "review_mode": "harness_child_agent",
+        "reviewer_agent_ref": "reviewer-agent-1",
         "reviewed_draft_hash": outcome_hash,
         "findings": [],
         "dispositions": [],
@@ -178,6 +179,33 @@ def _review(outcome_hash: str) -> dict[str, object]:
         "independent": True,
         "advisory_only": True,
     }
+
+
+def _legacy_review(outcome_hash: str) -> dict[str, object]:
+    return {
+        "schema_ref": "meta-research/idea-advisory-review/v1",
+        "reviewer_session_ref": "legacy-reviewer-session",
+        "reviewed_draft_hash": outcome_hash,
+        "findings": [],
+        "dispositions": [],
+        "final_outcome_hash": outcome_hash,
+        "independent": True,
+        "advisory_only": True,
+    }
+
+
+def test_legacy_review_payload_remains_readable_without_rewriting() -> None:
+    outcome = _outcome()
+    outcome_hash, review_hash = validate_idea_content(
+        outcome,
+        _legacy_review(canonical_hash(outcome)),
+        reviewed_draft=outcome,
+    )
+
+    assert outcome_hash == canonical_hash(outcome)
+    assert review_hash == canonical_hash(
+        _legacy_review(canonical_hash(outcome))
+    )
 
 
 def _record_direct_execution(runtime, **values):
@@ -462,6 +490,87 @@ def test_agent_runtime_requires_primary_checkpoint_before_execution(
         runtime.close()
 
 
+def test_agent_runtime_only_writes_child_agent_review_v2(tmp_path: Path) -> None:
+    runtime = _runtime(
+        prepare_data_root(tmp_path / "execution-review-identity"),
+        _IdeaProvider(),
+    )
+    try:
+        completed = _confirm_question(runtime)
+        question, request, run = _admit_direct_idea_request(
+            runtime,
+            completed,
+            "execution-review-identity",
+        )
+        outcome = _bound_outcome(question.question_ref, request.context_pack_ref)
+        invalid_mode = _review(canonical_hash(outcome))
+        invalid_mode["review_mode"] = "external_session"
+
+        with pytest.raises(
+            OwnerConflict, match="attempt_review_independence_invalid"
+        ):
+            _record_direct_execution(
+                runtime,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                submission_ref="invalid-review-mode",
+                native_session_ref="execution-review-native",
+                runtime_binding=run.runtime_binding,
+                outcome=outcome,
+                reviewed_draft=outcome,
+                review=invalid_mode,
+                idempotency_key="invalid-review-mode",
+            )
+
+        parent_as_reviewer = _review(canonical_hash(outcome))
+        parent_as_reviewer["reviewer_agent_ref"] = (
+            "execution-review-native"
+        )
+        with pytest.raises(
+            OwnerConflict, match="attempt_review_independence_invalid"
+        ):
+            _record_direct_execution(
+                runtime,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                submission_ref="parent-as-reviewer",
+                native_session_ref="execution-review-native",
+                runtime_binding=run.runtime_binding,
+                outcome=outcome,
+                reviewed_draft=outcome,
+                review=parent_as_reviewer,
+                idempotency_key="parent-as-reviewer",
+            )
+
+        with pytest.raises(
+            OwnerConflict, match="attempt_review_legacy_read_only"
+        ):
+            _record_direct_execution(
+                runtime,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                submission_ref="legacy-review-write",
+                native_session_ref="execution-review-native",
+                runtime_binding=run.runtime_binding,
+                outcome=outcome,
+                reviewed_draft=outcome,
+                review=_legacy_review(canonical_hash(outcome)),
+                idempotency_key="legacy-review-write",
+            )
+
+        current = runtime.owners.agent_runtime.query_idea_stage_run(
+            request.request_ref
+        )
+        assert current is not None
+        assert current.native_session_ref == "execution-review-native"
+        assert current.execution is None
+    finally:
+        runtime.close()
+
+
 def test_research_memory_recomputes_reviewed_draft_hash_at_acceptance_seam(
     tmp_path: Path,
 ) -> None:
@@ -482,8 +591,9 @@ def test_research_memory_recomputes_reviewed_draft_hash_at_acceptance_seam(
             "经独立审查后的可证伪拓扑干预。"
         )
         review = {
-            "schema_ref": "meta-research/idea-advisory-review/v1",
-            "reviewer_session_ref": "rm-independent-reviewer",
+            "schema_ref": "meta-research/idea-advisory-review/v2",
+            "review_mode": "harness_child_agent",
+            "reviewer_agent_ref": "rm-independent-reviewer-agent",
             # This is the old exploit: a well-shaped but invented digest, with
             # no immutable reviewed bytes available to the accepting Owner.
             "reviewed_draft_hash": "f" * 64,
@@ -560,8 +670,9 @@ def test_reviewed_draft_hash_remains_verifiable_through_rm_and_rg(
             "以跨增强拓扑稳定性作为可证伪干预轴。"
         )
         review = {
-            "schema_ref": "meta-research/idea-advisory-review/v1",
-            "reviewer_session_ref": "reviewed-draft-chain-reviewer",
+            "schema_ref": "meta-research/idea-advisory-review/v2",
+            "review_mode": "harness_child_agent",
+            "reviewer_agent_ref": "reviewed-draft-chain-reviewer-agent",
             "reviewed_draft_hash": canonical_hash(reviewed_draft),
             "findings": [
                 {

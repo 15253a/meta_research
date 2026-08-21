@@ -20,7 +20,10 @@ from meta_research.idea_skill import (
     IdeaSkillUnavailable,
     validate_idea_skill_result,
 )
-from meta_research.idea_contract import material_outcome_hash
+from meta_research.idea_contract import (
+    material_outcome_hash,
+    validate_advisory_review,
+)
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
 from meta_research.owners.common import canonical_hash
 from meta_research.quest_drafting import PROVIDER_RESULT_MAX_BYTES
@@ -122,18 +125,37 @@ def _result(
     *,
     draft: dict[str, object] | None = None,
     final: dict[str, object] | None = None,
-    reviewer_session_ref: str = "codex-reviewer:1",
+    findings: tuple[dict[str, str], ...] = (),
+    dispositions: tuple[dict[str, str], ...] = (),
+    review_mode: str = "harness_child_agent",
+    reviewer_agent_ref: str = "codex-child-reviewer:1",
 ) -> IdeaSkillResult:
     draft = draft or _idea_set()
     return IdeaSkillResult(
         reviewed_draft=draft,
         final_outcome=final or draft,
-        findings=(),
-        dispositions=(),
+        findings=findings,
+        dispositions=dispositions,
         primary_session_ref="codex-primary:1",
-        reviewer_session_ref=reviewer_session_ref,
+        review_mode=review_mode,
+        reviewer_agent_ref=reviewer_agent_ref,
         adapter_kind="test",
     )
+
+
+def _review_turn_output(
+    *,
+    findings: list[dict[str, str]] | None = None,
+    final_outcome: dict[str, object] | None = None,
+    dispositions: list[dict[str, str]] | None = None,
+    reviewer_agent_ref: str = "codex-child-reviewer:1",
+) -> dict[str, object]:
+    return {
+        "reviewer_agent_ref": reviewer_agent_ref,
+        "findings": findings or [],
+        "final_outcome": final_outcome or _idea_set(),
+        "dispositions": dispositions or [],
+    }
 
 
 def test_canonical_skill_is_an_installed_runtime_resource() -> None:
@@ -145,6 +167,9 @@ def test_canonical_skill_is_an_installed_runtime_resource() -> None:
     assert "execution completed != content accepted != domain accepted" in skill
     assert "NoViableCandidate" in contract
     assert "canonical selected Idea" in skill
+    assert "spawn" in skill
+    assert "短命 child reviewer" in skill
+    assert 'fork_turns="none"' in skill
 
 
 def test_runtime_binding_fixes_harness_artifact_and_output_contract(
@@ -183,6 +208,7 @@ def test_runtime_binding_fixes_harness_artifact_and_output_contract(
     assert "filesystem-danger-full-access" in first_binding.capability_bindings
     assert "shell-tool-enabled" in first_binding.capability_bindings
     assert "web-search-live" in first_binding.capability_bindings
+    assert "harness-child-agent-review" in first_binding.capability_bindings
     assert any(
         binding == "runtime-policy:trusted-local-broad/v1"
         for binding in first_binding.resource_bindings
@@ -190,6 +216,9 @@ def test_runtime_binding_fixes_harness_artifact_and_output_contract(
     assert any(
         binding == "codex-config:web_search=live"
         for binding in first_binding.resource_bindings
+    )
+    assert "codex-config:features.multi_agent=true" in (
+        first_binding.resource_bindings
     )
     assert any(
         binding == "sandbox-policy:danger-full-access"
@@ -242,6 +271,89 @@ def test_validator_accepts_a_reviewed_idea_set_with_exact_evidence() -> None:
     assert review_hash
 
 
+def test_validator_accepts_a_material_revision_with_a_revised_disposition() -> None:
+    finding = {
+        "finding_id": "finding-1",
+        "category": "falsifiability",
+        "message": "增加可推翻条件。",
+    }
+    revised = _idea_set("比较带预注册推翻阈值的结构一致性与像素重建")
+
+    draft_hash, outcome_hash, _review_hash = validate_idea_skill_result(
+        _request(),
+        _result(
+            final=revised,
+            findings=(finding,),
+            dispositions=(
+                {
+                    "finding_id": "finding-1",
+                    "action": "revised",
+                    "rationale": "已增加可推翻阈值。",
+                },
+            ),
+        ),
+    )
+
+    assert draft_hash != outcome_hash
+
+
+def test_validator_rejects_revised_disposition_without_a_material_revision() -> None:
+    finding = {
+        "finding_id": "finding-1",
+        "category": "falsifiability",
+        "message": "增加可推翻条件。",
+    }
+
+    with pytest.raises(IdeaSkillContractError, match="review_revision_not_material"):
+        validate_idea_skill_result(
+            _request(),
+            _result(
+                findings=(finding,),
+                dispositions=(
+                    {
+                        "finding_id": "finding-1",
+                        "action": "revised",
+                        "rationale": "声称已修订。",
+                    },
+                ),
+            ),
+        )
+
+
+def test_validator_rejects_changed_outcome_without_a_revised_disposition() -> None:
+    revised = _idea_set("比较带预注册推翻阈值的结构一致性与像素重建")
+
+    with pytest.raises(
+        IdeaSkillContractError,
+        match="review_outcome_changed_without_revision",
+    ):
+        validate_idea_skill_result(_request(), _result(final=revised))
+
+
+def test_validator_keeps_historical_v1_review_payloads_readable() -> None:
+    reviewed_draft_hash = canonical_hash(_idea_set())
+    outcome_hash = canonical_hash(
+        _idea_set("历史 v1 曾允许 reviewer 后的 Outcome 与草稿不同")
+    )
+
+    review_hash = validate_advisory_review(
+        {
+            "schema_ref": "meta-research/idea-advisory-review/v1",
+            "reviewer_session_ref": "historical-reviewer-session:1",
+            "reviewed_draft_hash": reviewed_draft_hash,
+            "findings": [],
+            "dispositions": [],
+            "final_outcome_hash": outcome_hash,
+            "independent": True,
+            "advisory_only": True,
+        },
+        outcome_hash=outcome_hash,
+        reviewed_draft_hash=reviewed_draft_hash,
+    )
+
+    assert review_hash
+
+
 def test_validator_accepts_no_viable_candidate_as_a_real_outcome() -> None:
     outcome = _no_viable_candidate()
 
@@ -267,10 +379,10 @@ def test_complete_idea_set_rejects_materially_duplicate_candidates() -> None:
         validate_idea_skill_result(_request(), _result(draft=outcome))
 
 
-def test_validator_rejects_a_reviewer_from_the_root_session() -> None:
+def test_validator_rejects_a_child_reviewer_ref_from_the_root_session() -> None:
     with pytest.raises(IdeaSkillContractError, match="idea_review_not_independent"):
         validate_idea_skill_result(
-            _request(), _result(reviewer_session_ref="run-session:1")
+            _request(), _result(reviewer_agent_ref="run-session:1")
         )
 
 
@@ -319,9 +431,17 @@ class _SequenceRunner:
         outputs: list[dict[str, object]],
         *,
         thread_ids: list[str] | None = None,
+        emit_review_spawn: bool = True,
+        emit_review_timeout_wait: bool = False,
+        emit_review_wait: bool = True,
+        observed_reviewer_agent_ref: str | None = None,
     ) -> None:
         self._outputs = iter(outputs)
         self._thread_ids = None if thread_ids is None else iter(thread_ids)
+        self._emit_review_spawn = emit_review_spawn
+        self._emit_review_timeout_wait = emit_review_timeout_wait
+        self._emit_review_wait = emit_review_wait
+        self._observed_reviewer_agent_ref = observed_reviewer_agent_ref
         self.calls: list[tuple[list[str], str, dict[str, object]]] = []
 
     def __call__(
@@ -336,17 +456,57 @@ class _SequenceRunner:
         thread_id = (
             next(self._thread_ids)
             if self._thread_ids is not None
-            else (
-                "codex-reviewer:1"
-                if set(schema.get("properties", {})) == {"findings"}
-                else "codex-primary:1"
-            )
+            else "codex-primary:1"
         )
         self.calls.append((argv, prompt, schema))
+        events: list[dict[str, object]] = [
+            {"type": "thread.started", "thread_id": thread_id}
+        ]
+        if "reviewer_agent_ref" in schema.get("properties", {}):
+            reviewer_agent_ref = self._observed_reviewer_agent_ref or output.get(
+                "reviewer_agent_ref"
+            )
+            assert isinstance(reviewer_agent_ref, str)
+            if self._emit_review_spawn:
+                events.append(
+                    _collab_event(
+                        tool="spawn_agent",
+                        sender_thread_id=thread_id,
+                        reviewer_agent_ref=reviewer_agent_ref,
+                        agent_status="pending_init",
+                    )
+                )
+            if self._emit_review_timeout_wait:
+                events.append(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "collab-wait-timeout:1",
+                            "type": "collab_tool_call",
+                            "tool": "wait",
+                            "sender_thread_id": thread_id,
+                            "receiver_thread_ids": [],
+                            "prompt": None,
+                            "agents_states": {},
+                            "status": "completed",
+                        },
+                    }
+                )
+            if self._emit_review_wait:
+                events.append(
+                    _collab_event(
+                        tool="wait",
+                        sender_thread_id=thread_id,
+                        reviewer_agent_ref=reviewer_agent_ref,
+                        agent_status="completed",
+                    )
+                )
         return subprocess.CompletedProcess(
             argv,
             0,
-            stdout=json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            stdout="\n".join(
+                json.dumps(event, ensure_ascii=False) for event in events
+            ),
             stderr="",
         )
 
@@ -355,6 +515,32 @@ class _SequenceRunner:
     ) -> subprocess.CompletedProcess[str]:
         del job_ref
         return self(argv, prompt, timeout)
+
+
+def _collab_event(
+    *,
+    tool: str,
+    sender_thread_id: str,
+    reviewer_agent_ref: str,
+    agent_status: str,
+) -> dict[str, object]:
+    return {
+        "type": "item.completed",
+        "item": {
+            "id": f"collab-{tool}:1",
+            "type": "collab_tool_call",
+            "tool": tool,
+            "sender_thread_id": sender_thread_id,
+            "receiver_thread_ids": [reviewer_agent_ref],
+            "agents_states": {
+                reviewer_agent_ref: {
+                    "status": agent_status,
+                    "message": "review complete" if agent_status == "completed" else None,
+                }
+            },
+            "status": "completed",
+        },
+    }
 
 
 class _OutcomeUnknownRunner:
@@ -552,7 +738,9 @@ def _descendant_codex_executable(path: Path, child_pid_path: Path) -> Path:
 def test_production_adapter_runs_the_packaged_skill_and_independent_review(
     tmp_path: Path,
 ) -> None:
-    runner = _SequenceRunner([{"outcome": _idea_set()}, {"findings": []}])
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, _review_turn_output()]
+    )
     adapter = CodexIdeaSkillAdapter(
         tmp_path / "idea-provider", process_runner=runner
     )
@@ -562,12 +750,14 @@ def test_production_adapter_runs_the_packaged_skill_and_independent_review(
     validate_idea_skill_result(request, result)
 
     assert result.primary_session_ref == "codex-primary:1"
-    assert result.reviewer_session_ref == "codex-reviewer:1"
+    assert result.review_mode == "harness_child_agent"
+    assert result.reviewer_agent_ref == "codex-child-reviewer:1"
     assert result.adapter_kind == "codex_cli"
     assert len(runner.calls) == 2
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
-    _review_argv, review_prompt, review_schema = runner.calls[1]
+    review_argv, review_prompt, review_schema = runner.calls[1]
     assert primary_argv[:2] == ["codex", "exec"]
+    assert primary_argv[2:4] == ["--enable", "multi_agent"]
     assert "--ignore-user-config" in primary_argv
     assert "--ignore-rules" in primary_argv
     assert primary_argv[primary_argv.index("--config") + 1] == "mcp_servers={}"
@@ -601,9 +791,129 @@ def test_production_adapter_runs_the_packaged_skill_and_independent_review(
     assert set(primary_schema["properties"]) == {"outcome"}
     assert "anyOf" in primary_schema["properties"]["outcome"]
     assert "独立 advisory reviewer" in review_prompt
+    assert "spawn" in review_prompt
+    assert "wait" in review_prompt
+    assert "短命 child reviewer" in review_prompt
+    assert 'fork_turns="none"' in review_prompt
     assert "## IdeaStageInvocation" in review_prompt
     assert "## Accepted handoff" in review_prompt
-    assert set(review_schema["properties"]) == {"findings"}
+    assert "reviewed_draft=" in review_prompt
+    assert review_argv[-3:] == ["resume", "codex-primary:1", "-"]
+    assert set(review_schema["properties"]) == {
+        "reviewer_agent_ref",
+        "findings",
+        "final_outcome",
+        "dispositions",
+    }
+
+
+def test_production_adapter_rejects_review_without_a_successful_spawn(
+    tmp_path: Path,
+) -> None:
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, _review_turn_output()],
+        emit_review_spawn=False,
+    )
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "review-missing-spawn",
+        process_runner=runner,
+    )
+
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_child_review_spawn_invalid",
+    ):
+        adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+
+
+def test_production_adapter_rejects_review_without_a_completed_wait(
+    tmp_path: Path,
+) -> None:
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, _review_turn_output()],
+        emit_review_wait=False,
+    )
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "review-missing-wait",
+        process_runner=runner,
+    )
+
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_child_review_wait_invalid",
+    ):
+        adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+
+
+def test_production_adapter_accepts_timeout_then_terminal_wait(
+    tmp_path: Path,
+) -> None:
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, _review_turn_output()],
+        emit_review_timeout_wait=True,
+    )
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "review-timeout-then-completed",
+        process_runner=runner,
+    )
+
+    result = adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+
+    assert result.reviewer_agent_ref == "codex-child-reviewer:1"
+
+
+def test_production_adapter_rejects_a_forged_reviewer_agent_ref(
+    tmp_path: Path,
+) -> None:
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, _review_turn_output()],
+        observed_reviewer_agent_ref="actual-codex-child:1",
+    )
+    adapter = CodexIdeaSkillAdapter(
+        tmp_path / "review-forged-child-ref",
+        process_runner=runner,
+    )
+
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_child_review_ref_mismatch",
+    ):
+        adapter.execute(_request(runtime_binding=adapter.runtime_binding()))
+
+
+def test_production_adapter_rechecks_child_trace_on_durable_recovery(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "durable-review-missing-wait"
+    runner = _SequenceRunner(
+        [{"outcome": _idea_set()}, _review_turn_output()],
+        emit_review_wait=False,
+    )
+    first = CodexIdeaSkillAdapter(workspace, process_runner=runner)
+    request = _request(
+        runtime_binding=first.runtime_binding(),
+        job_ref="idea-review-operation:invalid-child-trace",
+    )
+    draft = first.generate_draft(request)
+    review_request = replace(
+        request,
+        native_session_ref=draft.primary_session_ref,
+    )
+
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_child_review_wait_invalid",
+    ):
+        first.review_draft(review_request, draft)
+
+    no_replay = _SequenceRunner([])
+    restarted = CodexIdeaSkillAdapter(workspace, process_runner=no_replay)
+    with pytest.raises(
+        IdeaSkillUnavailable,
+        match="codex_child_review_wait_invalid",
+    ):
+        restarted.review_draft(review_request, draft)
+    assert no_replay.calls == []
 
 
 def test_production_adapter_resumes_the_root_session_for_review_dispositions(
@@ -618,17 +928,17 @@ def test_production_adapter_resumes_the_root_session_for_review_dispositions(
     runner = _SequenceRunner(
         [
             {"outcome": _idea_set()},
-            {"findings": [finding]},
-            {
-                "final_outcome": final,
-                "dispositions": [
+            _review_turn_output(
+                findings=[finding],
+                final_outcome=final,
+                dispositions=[
                     {
                         "finding_id": "finding-1",
                         "action": "revised",
                         "rationale": "已把推翻阈值写入候选方向与 falsification hint。",
                     }
                 ],
-            },
+            ),
         ]
     )
     adapter = CodexIdeaSkillAdapter(
@@ -642,11 +952,13 @@ def test_production_adapter_resumes_the_root_session_for_review_dispositions(
     assert result.final_outcome == final
     assert result.findings == (finding,)
     assert result.dispositions[0]["action"] == "revised"
-    assert len(runner.calls) == 3
-    revision_argv, revision_prompt, revision_schema = runner.calls[2]
-    assert revision_argv[-3:] == ["resume", "codex-primary:1", "-"]
-    assert "根 Idea Agent" in revision_prompt
-    assert set(revision_schema["properties"]) == {
+    assert len(runner.calls) == 2
+    review_argv, review_prompt, review_schema = runner.calls[1]
+    assert review_argv[-3:] == ["resume", "codex-primary:1", "-"]
+    assert "根 Idea Agent" in review_prompt
+    assert set(review_schema["properties"]) == {
+        "reviewer_agent_ref",
+        "findings",
         "final_outcome",
         "dispositions",
     }
@@ -663,21 +975,20 @@ def test_production_adapter_rejects_a_resume_that_changes_native_session(
     runner = _SequenceRunner(
         [
             {"outcome": _idea_set()},
-            {"findings": [finding]},
-            {
-                "final_outcome": _idea_set("加入可反驳阈值的结构一致性"),
-                "dispositions": [
+            _review_turn_output(
+                findings=[finding],
+                final_outcome=_idea_set("加入可反驳阈值的结构一致性"),
+                dispositions=[
                     {
                         "finding_id": "finding-1",
                         "action": "revised",
                         "rationale": "加入了推翻阈值。",
                     }
                 ],
-            },
+            ),
         ],
         thread_ids=[
             "codex-primary:1",
-            "codex-reviewer:1",
             "alien-native-session",
         ],
     )
@@ -693,7 +1004,7 @@ def test_production_adapter_rejects_a_resume_that_changes_native_session(
     ):
         adapter.execute(request)
 
-    assert runner.calls[2][0][-3:] == ["resume", "codex-primary:1", "-"]
+    assert runner.calls[1][0][-3:] == ["resume", "codex-primary:1", "-"]
 
 
 def test_production_adapter_reconciles_each_durable_provider_phase(
@@ -711,17 +1022,17 @@ def test_production_adapter_reconciles_each_durable_provider_phase(
     first_runner = _SequenceRunner(
         [
             {"outcome": _idea_set()},
-            {"findings": [finding]},
-            {
-                "final_outcome": revised,
-                "dispositions": [
+            _review_turn_output(
+                findings=[finding],
+                final_outcome=revised,
+                dispositions=[
                     {
                         "finding_id": "durable-finding",
                         "action": "revised",
                         "rationale": "已补充预注册阈值。",
                     }
                 ],
-            },
+            ),
         ]
     )
     first = CodexIdeaSkillAdapter(workspace, process_runner=first_runner)
@@ -753,11 +1064,8 @@ def test_production_adapter_reconciles_each_durable_provider_phase(
     )
     result = first.review_draft(review_request, draft)
     assert result.final_outcome == revised
-    assert len(first_runner.calls) == 3
-    for phase in ("review", "revision"):
-        next(
-            workspace.glob(f"provider-operations/*/{phase}/completed.json")
-        ).unlink()
+    assert len(first_runner.calls) == 2
+    next(workspace.glob("provider-operations/*/review/completed.json")).unlink()
 
     recovered_result = restarted.review_draft(review_request, recovered_draft)
     assert recovered_result == result

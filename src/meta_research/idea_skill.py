@@ -92,7 +92,8 @@ class IdeaSkillResult:
     findings: tuple[dict[str, str], ...]
     dispositions: tuple[dict[str, str], ...]
     primary_session_ref: str
-    reviewer_session_ref: str
+    review_mode: str
+    reviewer_agent_ref: str
     adapter_kind: str
 
 
@@ -165,11 +166,13 @@ def validate_idea_skill_result(
         ("context_pack_ref", request.context_pack_ref),
         ("root_session_ref", request.root_session_ref),
         ("primary_session_ref", result.primary_session_ref),
-        ("reviewer_session_ref", result.reviewer_session_ref),
+        ("reviewer_agent_ref", result.reviewer_agent_ref),
         ("adapter_kind", result.adapter_kind),
     ):
         _require_text(value, label)
-    if result.reviewer_session_ref in {
+    if result.review_mode != "harness_child_agent":
+        raise IdeaSkillContractError("idea_review_mode_invalid")
+    if result.reviewer_agent_ref in {
         request.root_session_ref,
         result.primary_session_ref,
     }:
@@ -209,7 +212,8 @@ def validate_idea_skill_result(
 
     review_payload = {
         "schema_ref": IDEA_REVIEW_SCHEMA_REF,
-        "reviewer_session_ref": result.reviewer_session_ref,
+        "review_mode": result.review_mode,
+        "reviewer_agent_ref": result.reviewer_agent_ref,
         "reviewed_draft_hash": draft_hash,
         "findings": list(result.findings),
         "dispositions": list(result.dispositions),
@@ -229,7 +233,8 @@ def review_record(
 ) -> dict[str, object]:
     return {
         "schema_ref": IDEA_REVIEW_SCHEMA_REF,
-        "reviewer_session_ref": result.reviewer_session_ref,
+        "review_mode": result.review_mode,
+        "reviewer_agent_ref": result.reviewer_agent_ref,
         "reviewed_draft_hash": draft_hash,
         "findings": list(result.findings),
         "dispositions": list(result.dispositions),
@@ -299,11 +304,9 @@ class CodexIdeaSkillAdapter:
             "outcome-envelope-template": _outcome_envelope_schema(
                 "__question_ref__", "__context_pack_ref__"
             ),
-            "review-findings": _review_findings_schema(),
-            "review-revision-template": _revision_schema(
+            "child-review-finalization-template": _review_finalization_schema(
                 "__question_ref__",
                 "__context_pack_ref__",
-                ("__finding_id__",),
             ),
         }
         return IdeaRuntimeBinding(
@@ -322,6 +325,7 @@ class CodexIdeaSkillAdapter:
                 "approval-policy-never",
                 "filesystem-danger-full-access",
                 "global-config-ignored",
+                "harness-child-agent-review",
                 "mcp-config-empty",
                 "native-session-resume",
                 "shell-tool-enabled",
@@ -347,6 +351,7 @@ class CodexIdeaSkillAdapter:
                 "disabled-codex-features:"
                 + ",".join(_DISABLED_CODEX_FEATURES),
                 "codex-config:approval_policy=never",
+                "codex-config:features.multi_agent=true",
                 "codex-config:web_search=live",
                 "output-route:codex-output-last-message/json-schema/v1",
                 "provider-output-limits:"
@@ -396,7 +401,7 @@ class CodexIdeaSkillAdapter:
             f"accepted_question={canonical_json(request.accepted_question_content)}\n"
             f"context_pack={canonical_json(request.context_pack)}"
         )
-        primary_output, primary_session = self._invoke(
+        primary_output, primary_session, _primary_stdout = self._invoke(
             operation_name="primary",
             prompt=primary_prompt,
             schema=_outcome_envelope_schema(
@@ -427,69 +432,65 @@ class CodexIdeaSkillAdapter:
 
         reviewer_prompt = (
             f"{skill}\n\n"
-            "你是独立 advisory reviewer。只检查 Question 对齐、实质重复、证据边界、"
-            "可证伪性与 Plan 可用性。你不批准 Outcome，不评分、不选择 winner。"
-            "返回 findings 数组；没有发现时返回空数组。\n"
+            "你仍是根 Idea Agent。必须把独立 advisory reviewer 委派给 Harness：在当前 "
+            "managed native Session 内使用 Harness "
+            "原生 spawn_agent 能力以 fork_turns=\"none\" 启动一个全新上下文的短命 child "
+            "reviewer，并 wait 到它完成；Claude Code 使用等价的全新上下文 "
+            "subagent。不要另开、"
+            "持久化或管理第二个顶层 Codex Session。child reviewer 只检查 Question 对齐、"
+            "实质重复、证据边界、可证伪性与 Plan 可用性，不批准 Outcome、不评分、"
+            "不选择 winner。根 Idea Agent 必须根据 child findings 逐条给出 revised | "
+            "not_adopted disposition，并在同一个 resumed turn 返回最终完整 Outcome。"
+            "revised 必须实际改变 Outcome；没有 finding 时返回空 findings/dispositions。"
+            "只返回 reviewer_agent_ref、findings、final_outcome、dispositions。不得声称 "
+            "reviewer 或根 Agent 拥有 Owner 接纳权。\n"
+            f"stage_request_ref={request.stage_request_ref}\n"
+            f"question_ref={request.question_ref}\n"
+            f"context_pack_ref={request.context_pack_ref}\n"
             f"question={canonical_json(request.accepted_question_content)}\n"
-            f"outcome={canonical_json(draft.draft)}"
+            f"reviewed_draft={canonical_json(draft.draft)}"
         )
-        reviewed, reviewer_session = self._invoke(
+        reviewed, resumed_session, review_stdout = self._invoke(
             operation_name="review",
             prompt=reviewer_prompt,
-            schema=_review_findings_schema(),
-            native_session_ref=None,
+            schema=_review_finalization_schema(
+                request.question_ref, request.context_pack_ref
+            ),
+            native_session_ref=draft.primary_session_ref,
             job_ref=request.job_ref,
         )
-        if (
-            reviewer_session is None
-            or reviewer_session == draft.primary_session_ref
-        ):
-            raise IdeaSkillUnavailable("codex_reviewer_session_missing")
+        if resumed_session != draft.primary_session_ref:
+            raise IdeaSkillUnavailable("codex_primary_session_changed")
+        reviewer_agent_ref = reviewed.get("reviewer_agent_ref")
         findings_value = reviewed.get("findings")
-        if not isinstance(findings_value, list):
+        final_value = reviewed.get("final_outcome")
+        disposition_value = reviewed.get("dispositions")
+        if (
+            not isinstance(reviewer_agent_ref, str)
+            or not reviewer_agent_ref
+            or not isinstance(findings_value, list)
+            or not isinstance(final_value, dict)
+            or not isinstance(disposition_value, list)
+        ):
             raise IdeaSkillUnavailable("codex_review_invalid")
+        _verify_child_review_trace(
+            review_stdout,
+            root_session_ref=draft.primary_session_ref,
+            reviewer_agent_ref=reviewer_agent_ref,
+        )
         findings = tuple(cast(dict[str, str], item) for item in findings_value)
-
-        final_outcome = draft.draft
-        dispositions: tuple[dict[str, str], ...] = ()
-        if findings:
-            revision_prompt = (
-                "独立 reviewer 已返回 findings。你仍是根 Idea Agent；逐条给出 "
-                "revised | not_adopted disposition，并返回最终完整 Outcome。"
-                "revised 必须实际改变 Outcome。不得声称 reviewer 或你拥有 Owner 接纳权。\n"
-                f"findings={canonical_json(list(findings))}"
-            )
-            revised, resumed_session = self._invoke(
-                operation_name="revision",
-                prompt=revision_prompt,
-                schema=_revision_schema(
-                    request.question_ref,
-                    request.context_pack_ref,
-                    tuple(item["finding_id"] for item in findings),
-                ),
-                native_session_ref=draft.primary_session_ref,
-                job_ref=request.job_ref,
-            )
-            if resumed_session != draft.primary_session_ref:
-                raise IdeaSkillUnavailable("codex_primary_session_changed")
-            final_value = revised.get("final_outcome")
-            disposition_value = revised.get("dispositions")
-            if not isinstance(final_value, dict) or not isinstance(
-                disposition_value, list
-            ):
-                raise IdeaSkillUnavailable("codex_revision_invalid")
-            final_outcome = cast(dict[str, object], final_value)
-            dispositions = tuple(
-                cast(dict[str, str], item) for item in disposition_value
-            )
+        dispositions = tuple(
+            cast(dict[str, str], item) for item in disposition_value
+        )
 
         result = IdeaSkillResult(
             reviewed_draft=draft.draft,
-            final_outcome=final_outcome,
+            final_outcome=cast(dict[str, object], final_value),
             findings=findings,
             dispositions=dispositions,
             primary_session_ref=draft.primary_session_ref,
-            reviewer_session_ref=reviewer_session,
+            review_mode="harness_child_agent",
+            reviewer_agent_ref=reviewer_agent_ref,
             adapter_kind=draft.adapter_kind,
         )
         return result
@@ -509,7 +510,7 @@ class CodexIdeaSkillAdapter:
         schema: dict[str, object],
         native_session_ref: str | None,
         job_ref: str | None,
-    ) -> tuple[dict[str, object], str | None]:
+    ) -> tuple[dict[str, object], str | None, str]:
         if job_ref is not None:
             operation_root = self._workspace / "provider-operations"
             directory = (
@@ -547,7 +548,7 @@ class CodexIdeaSkillAdapter:
         prompt: str,
         schema: dict[str, object],
         native_session_ref: str | None,
-    ) -> tuple[dict[str, object], str | None]:
+    ) -> tuple[dict[str, object], str | None, str]:
         directory.mkdir(parents=True, exist_ok=True)
         invocation_base = {
             "schema_ref": "meta-research/codex-provider-operation/v1",
@@ -640,7 +641,7 @@ class CodexIdeaSkillAdapter:
         job_ref: str | None,
         stdout_path: Path | None,
         invocation_hash: str | None,
-    ) -> tuple[dict[str, object], str | None]:
+    ) -> tuple[dict[str, object], str | None, str]:
         directory.mkdir(parents=True, exist_ok=True)
         schema_path = directory / "output-schema.json"
         result_path = directory / "last-message.json"
@@ -653,6 +654,8 @@ class CodexIdeaSkillAdapter:
         argv = [
                 self._executable,
                 "exec",
+                "--enable",
+                "multi_agent",
                 "--skip-git-repo-check",
                 "--ignore-user-config",
                 "--ignore-rules",
@@ -785,9 +788,13 @@ class CodexIdeaSkillAdapter:
             raise IdeaSkillUnavailable("codex_output_invalid") from error
         if not isinstance(decoded, dict):
             raise IdeaSkillUnavailable("codex_output_invalid")
-        return cast(dict[str, object], decoded), _verified_native_session(
+        return (
+            cast(dict[str, object], decoded),
+            _verified_native_session(
+                completed.stdout,
+                expected=native_session_ref,
+            ),
             completed.stdout,
-            expected=native_session_ref,
         )
 
 
@@ -1073,6 +1080,91 @@ def _verified_native_session(stdout: str, *, expected: str | None) -> str:
     return observed
 
 
+def _verify_child_review_trace(
+    stdout: str,
+    *,
+    root_session_ref: str,
+    reviewer_agent_ref: str,
+) -> None:
+    successful_calls: dict[str, list[dict[str, object]]] = {
+        "spawn_agent": [],
+        "wait": [],
+    }
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "collab_tool_call"
+            or item.get("status") != "completed"
+        ):
+            continue
+        tool = item.get("tool")
+        if tool in successful_calls:
+            successful_calls[cast(str, tool)].append(
+                cast(dict[str, object], item)
+            )
+
+    spawn_calls = successful_calls["spawn_agent"]
+    if len(spawn_calls) != 1:
+        raise IdeaSkillUnavailable("codex_child_review_spawn_invalid")
+    spawn = spawn_calls[0]
+    spawn_receivers = spawn.get("receiver_thread_ids")
+    spawn_states = spawn.get("agents_states")
+    if (
+        spawn.get("sender_thread_id") != root_session_ref
+        or not isinstance(spawn_receivers, list)
+        or len(spawn_receivers) != 1
+        or not isinstance(spawn_receivers[0], str)
+        or not spawn_receivers[0]
+        or not isinstance(spawn_states, dict)
+    ):
+        raise IdeaSkillUnavailable("codex_child_review_spawn_invalid")
+    spawned_child_ref = spawn_receivers[0]
+    spawned_state = spawn_states.get(spawned_child_ref)
+    if (
+        not isinstance(spawned_state, dict)
+        or not isinstance(spawned_state.get("status"), str)
+        or not spawned_state["status"]
+    ):
+        raise IdeaSkillUnavailable("codex_child_review_spawn_invalid")
+    if reviewer_agent_ref != spawned_child_ref:
+        raise IdeaSkillUnavailable("codex_child_review_ref_mismatch")
+
+    wait_calls = successful_calls["wait"]
+    if not wait_calls:
+        raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
+    terminal_wait_seen = False
+    for wait in wait_calls:
+        wait_receivers = wait.get("receiver_thread_ids")
+        wait_states = wait.get("agents_states")
+        if (
+            wait.get("sender_thread_id") != root_session_ref
+            or not isinstance(wait_receivers, list)
+            or not isinstance(wait_states, dict)
+        ):
+            raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
+        # Codex can emit a completed, empty wait event when the bounded wait
+        # times out, then wait again for the same child. It is not a second
+        # reviewer and must not strand an otherwise valid durable result.
+        if wait_receivers == [] and wait_states == {}:
+            continue
+        if wait_receivers != [spawned_child_ref]:
+            raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
+        completed_state = wait_states.get(spawned_child_ref)
+        if not isinstance(completed_state, dict):
+            raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
+        if completed_state.get("status") == "completed":
+            terminal_wait_seen = True
+    if not terminal_wait_seen:
+        raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
+
+
 def _write_completed_operation(
     directory: Path,
     *,
@@ -1108,7 +1200,7 @@ def _read_completed_operation(
     *,
     invocation_hash: str,
     native_session_ref: str | None,
-) -> tuple[dict[str, object], str | None]:
+) -> tuple[dict[str, object], str | None, str]:
     exit_marker = _verified_success_exit(
         directory,
         invocation_hash=invocation_hash,
@@ -1168,7 +1260,11 @@ def _read_completed_operation(
         or recovered_session != observed_session
     ):
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
-    return cast(dict[str, object], decoded), cast(str | None, recovered_session)
+    return (
+        cast(dict[str, object], decoded),
+        cast(str | None, recovered_session),
+        stdout,
+    )
 
 
 def _read_spool_text(path: Path, limit: int) -> str:
@@ -1466,11 +1562,14 @@ def _outcome_envelope_schema(
     }
 
 
-def _review_findings_schema() -> dict[str, object]:
+def _review_finalization_schema(
+    question_ref: str, context_pack_ref: str
+) -> dict[str, object]:
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "reviewer_agent_ref": {"type": "string", "minLength": 1},
             "findings": {
                 "type": "array",
                 "items": {
@@ -1478,34 +1577,23 @@ def _review_findings_schema() -> dict[str, object]:
                     "additionalProperties": False,
                     "properties": {
                         "finding_id": {"type": "string", "minLength": 1},
-                        "category": {"type": "string", "enum": sorted(REVIEW_CATEGORIES)},
+                        "category": {
+                            "type": "string",
+                            "enum": sorted(REVIEW_CATEGORIES),
+                        },
                         "message": {"type": "string", "minLength": 1},
                     },
                     "required": ["finding_id", "category", "message"],
                 },
-            }
-        },
-        "required": ["findings"],
-    }
-
-
-def _revision_schema(
-    question_ref: str, context_pack_ref: str, finding_ids: tuple[str, ...]
-) -> dict[str, object]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
+            },
             "final_outcome": _outcome_schema(question_ref, context_pack_ref),
             "dispositions": {
                 "type": "array",
-                "minItems": len(finding_ids),
-                "maxItems": len(finding_ids),
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "finding_id": {"type": "string", "enum": list(finding_ids)},
+                        "finding_id": {"type": "string", "minLength": 1},
                         "action": {"type": "string", "enum": sorted(DISPOSITION_ACTIONS)},
                         "rationale": {"type": "string", "minLength": 1},
                     },
@@ -1513,5 +1601,10 @@ def _revision_schema(
                 },
             },
         },
-        "required": ["final_outcome", "dispositions"],
+        "required": [
+            "reviewer_agent_ref",
+            "findings",
+            "final_outcome",
+            "dispositions",
+        ],
     }

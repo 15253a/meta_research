@@ -15,7 +15,8 @@ REVIEW_CATEGORIES = {
 }
 DISPOSITION_ACTIONS = {"revised", "not_adopted"}
 IDEA_OUTCOME_SCHEMA_REF = "meta-research/idea-outcome/v1"
-IDEA_REVIEW_SCHEMA_REF = "meta-research/idea-advisory-review/v1"
+IDEA_REVIEW_SCHEMA_V1_REF = "meta-research/idea-advisory-review/v1"
+IDEA_REVIEW_SCHEMA_REF = "meta-research/idea-advisory-review/v2"
 IDEA_CONTEXT_PACK_SCHEMA_REF = "meta-research/idea-context-pack/v1"
 _IDEA_CONTEXT_PACK_FIELDS = {
     "schema_ref",
@@ -111,20 +112,32 @@ def validate_advisory_review(
     outcome_hash: str,
     reviewed_draft_hash: str | None = None,
 ) -> str:
-    if not isinstance(review, dict) or set(review) != {
+    if not isinstance(review, dict):
+        raise IdeaContractError("idea_review_shape_invalid")
+    schema_ref = review.get("schema_ref")
+    common_fields = {
         "schema_ref",
-        "reviewer_session_ref",
         "reviewed_draft_hash",
         "findings",
         "dispositions",
         "final_outcome_hash",
         "independent",
         "advisory_only",
-    }:
-        raise IdeaContractError("idea_review_shape_invalid")
-    if review["schema_ref"] != IDEA_REVIEW_SCHEMA_REF:
+    }
+    if schema_ref == IDEA_REVIEW_SCHEMA_REF:
+        expected_fields = common_fields | {"review_mode", "reviewer_agent_ref"}
+    elif schema_ref == IDEA_REVIEW_SCHEMA_V1_REF:
+        expected_fields = common_fields | {"reviewer_session_ref"}
+    else:
         raise IdeaContractError("idea_review_schema_invalid")
-    _require_text(review["reviewer_session_ref"], "reviewer_session_ref")
+    if set(review) != expected_fields:
+        raise IdeaContractError("idea_review_shape_invalid")
+    if schema_ref == IDEA_REVIEW_SCHEMA_REF:
+        if review["review_mode"] != "harness_child_agent":
+            raise IdeaContractError("idea_review_mode_invalid")
+        _require_text(review["reviewer_agent_ref"], "reviewer_agent_ref")
+    else:
+        _require_text(review["reviewer_session_ref"], "reviewer_session_ref")
     claimed_reviewed_draft_hash = review["reviewed_draft_hash"]
     final_outcome_hash = review["final_outcome_hash"]
     if (
@@ -179,10 +192,16 @@ def validate_advisory_review(
         disposition_ids
     ) != set(finding_ids):
         raise IdeaContractError("review_dispositions_incomplete")
-    if any(item["action"] == "revised" for item in dispositions) and (
-        claimed_reviewed_draft_hash == outcome_hash
-    ):
+    has_revision = any(item["action"] == "revised" for item in dispositions)
+    outcome_changed = claimed_reviewed_draft_hash != outcome_hash
+    if has_revision and not outcome_changed:
         raise IdeaContractError("review_revision_not_material")
+    if (
+        schema_ref == IDEA_REVIEW_SCHEMA_REF
+        and outcome_changed
+        and not has_revision
+    ):
+        raise IdeaContractError("review_outcome_changed_without_revision")
     return _canonical_hash(review)
 
 

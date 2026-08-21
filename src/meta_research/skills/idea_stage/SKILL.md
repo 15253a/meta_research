@@ -28,15 +28,17 @@ description: 在冻结的 accepted Question binding 上形成、评审并提交 
 
 ## 3. 独立挑战
 
-1. 首次正式提交前，将完整去重草稿交给独立 advisory reviewer。
-2. reviewer 只检查 Question 对齐、实质重复、证据边界、可证伪性和 Plan 可用性；不批准、不评分、不选 winner。
-3. 根 Agent 对每条 finding 给出唯一 `revised | not_adopted` disposition；声称 revised 时必须实际改变最终 Outcome hash。
+1. 首次正式提交前，根 Agent 必须在当前 managed native Session 内使用 Harness 原生能力 `spawn_agent` 启动一个短命 child reviewer，并 `wait` 到它完成；Codex 必须以 `fork_turns="none"` spawn，Claude Code 则使用等价的全新上下文 subagent。不要为 reviewer 另开或长期管理一个顶层 Codex／Claude Code Session。
+2. 只把 exact Question、完整去重草稿及本节 rubric 交给 child reviewer；不要把根 Agent 的隐藏推理当作评审依据。Reviewer 只检查 Question 对齐、实质重复、证据边界、可证伪性和 Plan 可用性；不批准、不评分、不选 winner。
+3. child reviewer 返回 `reviewer_agent_ref` 与 findings 后即结束。这个 ref 是 Harness 内的短命执行证据，不是 Agent Runtime Session，也不得被恢复成长期 reviewer。
+4. 根 Agent 在同一个 resumed turn 中对每条 finding 给出唯一 `revised | not_adopted` disposition，并返回 child identity、findings、最终完整 Outcome 与 dispositions；系统把此前已冻结的 reviewed draft checkpoint 与这些结果一起形成 Submission。reviewed draft 与最终 Outcome hash 不同，当且仅当至少一条 disposition 为 `revised`。
+5. 若 Harness 实际没有 child-agent 能力、child 未完成，或返回的 `reviewer_agent_ref` 与 Harness spawn/wait 事件不一致，返回 typed blocker；根 Agent 不得以自我评审伪造 `harness_child_agent`。
 
 ## 4. 提交并恢复
 
 1. 每次正式写入前重验原 invocation closure。
 2. 先保存 RM content ref/receipt checkpoint，再提交 RG domain outcome；两层状态和 receipt 永不合并。
-3. `rejected` 在同一根 Session 中按正式 feedback 实质修订，并以新 submission identity 绑定 predecessor 与 rejection receipt。
+3. `rejected` 在同一根 Session 中按正式 feedback 实质修订，并以新 submission identity 绑定 predecessor 与 rejection receipt；新 Attempt 的 bounded review 仍使用新的短命 child reviewer，不创建长期 reviewer Session。
 4. `stale | needs_input | outcome_unknown | technical_blocker` 保留原生状态；unknown 只对账原 identity，不能盲重放。
 5. 一个 submission identity 只能绑定一个 immutable payload 与 invocation closure。
 

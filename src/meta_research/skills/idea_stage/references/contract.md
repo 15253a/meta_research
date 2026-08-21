@@ -12,7 +12,9 @@
 
 ## 独立评审
 
-首次提交携带 advisory review：独立 `reviewer_session_ref`、reviewed draft hash、分类为 `question_alignment | material_duplicate | evidence_boundary | falsifiability | plan_usability` 的 findings、每条 finding 唯一的 `revised | not_adopted` disposition，以及 final outcome hash。Reviewer 没有 Owner authority。
+首次提交携带 v2 advisory review：`review_mode = harness_child_agent`、Harness 返回的短命 `reviewer_agent_ref`、reviewed draft hash、分类为 `question_alignment | material_duplicate | evidence_boundary | falsifiability | plan_usability` 的 findings、每条 finding 唯一的 `revised | not_adopted` disposition，以及 final outcome hash。Reviewer 由根 Agent 在当前 managed native Session 内原生 spawn 并 wait；Adapter 从同一 Codex JSONL 中交叉验证恰好一次成功 `spawn_agent`、同一 child 的成功 `wait/completed`、root sender 与最终 `reviewer_agent_ref`。它不是另一个 Agent Runtime Session，也没有 Owner authority。
+
+根 Agent 在同一个 resumed turn 中消费 child findings、形成 dispositions 并返回最终 Outcome。reviewed draft hash 与 final outcome hash 不同，当且仅当至少一条 disposition 的 action 为 `revised`。历史 v1 `reviewer_session_ref` 只允许读取既有 immutable payload；新 Submission 不得再写 v1。
 
 Owner rejection 的 successor 必须绑定 predecessor submission、真实 rejection receipt 和根 Agent 的修订，并产生实质不同的 Outcome hash。
 
