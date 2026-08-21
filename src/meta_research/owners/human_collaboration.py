@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from typing import Protocol, cast
 from urllib.parse import parse_qsl, urlsplit
@@ -21,6 +22,7 @@ from meta_research.owners.agent_runtime import (
     HostComputeObservation,
 )
 from meta_research.owners.common import (
+    AcceptedAssetBinding,
     AcceptanceReceipt,
     OwnerConflict,
     OwnerSnapshot,
@@ -59,6 +61,9 @@ HC_OWNER = "human_collaboration"
 CONFIRMATION_RECEIPT_KIND = "quest_bundle_confirmation"
 _DRAFTING_CLAIM_LEASE_SECONDS = 5 * 60
 _COMPLETED_CUSTODY_AUDIT_SECONDS = 60
+_PREVIEW_REFRESH_RETRY_SECONDS = 60.0
+_PREVIEW_REFRESH_CACHE_LIMIT = 256
+MAX_ACCEPTED_MATERIAL_BINDINGS = 100
 
 
 def _proposal_provider_job_ref(generation_ref: str, attempt_count: int) -> str:
@@ -262,11 +267,35 @@ class SQLiteHumanCollaboration:
         self._proposal_drafter = proposal_drafter
         self._intent_drafting_provider = intent_drafting_provider
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
+        self._preview_refresh_lock = threading.Lock()
+        self._preview_refresh_attempts: dict[str, tuple[str, float]] = {}
         self._upgrade_active_legacy_draft()
         self._recover_interrupted_drafting()
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
+
+    def _verify_material_bindings(self, draft: dict[str, object]) -> None:
+        for binding in _accepted_material_bindings(draft):
+            self._research_memory.verify_asset_binding(
+                asset_ref=binding.asset_ref,
+                version_ref=binding.version_ref,
+                content_hash=binding.content_hash,
+                manifest_hash=binding.manifest_hash,
+                receipt=binding.receipt,
+            )
+
+    def _verify_material_projection_bindings(
+        self, draft: dict[str, object]
+    ) -> None:
+        for binding in _accepted_material_bindings(draft):
+            self._research_memory.verify_asset_projection_binding(
+                asset_ref=binding.asset_ref,
+                version_ref=binding.version_ref,
+                content_hash=binding.content_hash,
+                manifest_hash=binding.manifest_hash,
+                receipt=binding.receipt,
+            )
 
     def _public_owner_revisions(self) -> dict[str, int]:
         """Read cross-Owner currentness only through each public Interface."""
@@ -274,7 +303,9 @@ class SQLiteHumanCollaboration:
         return {
             "human_collaboration": self.query_snapshot().revision,
             "research_graph": self._research_graph.query_snapshot().revision,
-            "research_memory": self._research_memory.query_snapshot().revision,
+            "research_memory": (
+                self._research_memory.query_projection_snapshot().revision
+            ),
             "advancement_engine": self._advancement_engine.query_snapshot().revision,
         }
 
@@ -456,6 +487,7 @@ class SQLiteHumanCollaboration:
             )
         if replay is not None:
             return self.query_quest_creation(replay)
+        self._verify_material_bindings(normalized)
         current = self.query_current_quest_creation()
         if current is not None:
             current_draft = cast(dict[str, object], current["quest_draft"])
@@ -592,6 +624,13 @@ class SQLiteHumanCollaboration:
                 "draft": normalized,
             }
         )
+        with self._database.read() as connection:
+            replay = self._query_command(
+                connection, idempotency_key, "revise_draft", request_hash
+            )
+        if replay is not None:
+            return self.query_quest_creation(initialization_id)
+        self._verify_material_bindings(normalized)
         with self._database.write() as connection:
             replay = self._query_command(
                 connection, idempotency_key, "revise_draft", request_hash
@@ -730,6 +769,25 @@ class SQLiteHumanCollaboration:
                 "expected_draft_revision": expected_draft_revision,
             }
         )
+        with self._database.read() as connection:
+            replay = self._query_command(
+                connection, idempotency_key, "generate_proposal", request_hash
+            )
+            if replay is None:
+                preflight_row = self._require_initialization(
+                    connection, initialization_id
+                )
+                preflight_draft, _proposal = (
+                    _require_initialization_artifact_integrity(
+                        connection, preflight_row
+                    )
+                )
+            else:
+                preflight_draft = None
+        if replay is not None:
+            return self.query_quest_creation(initialization_id)
+        assert preflight_draft is not None
+        self._verify_material_bindings(preflight_draft)
         with self._database.write() as connection:
             replay = self._query_command(
                 connection, idempotency_key, "generate_proposal", request_hash
@@ -852,6 +910,30 @@ class SQLiteHumanCollaboration:
                 "content": normalized,
             }
         )
+        with self._database.read() as connection:
+            replay = self._query_command(
+                connection, idempotency_key, "save_proposal", request_hash
+            )
+            if replay is None:
+                preflight_row = self._require_initialization(
+                    connection, initialization_id
+                )
+                preflight_draft, _proposal = (
+                    _require_initialization_artifact_integrity(
+                        connection, preflight_row
+                    )
+                )
+            else:
+                preflight_row = None
+                preflight_draft = None
+        if replay is not None:
+            return self.query_quest_creation(initialization_id)
+        if (
+            preflight_row is not None
+            and preflight_row.draft_schema_ref == DRAFT_V2_SCHEMA
+        ):
+            assert preflight_draft is not None
+            self._verify_material_bindings(preflight_draft)
         refresh_preview = False
         with self._database.write() as connection:
             replay = self._query_command(
@@ -935,8 +1017,22 @@ class SQLiteHumanCollaboration:
             replay = self._query_command(
                 connection, idempotency_key, "observe_host_compute", request_hash
             )
+            if replay is None:
+                preflight_row = self._require_initialization(
+                    connection, initialization_id
+                )
+                _require_initialization_artifact_integrity(
+                    connection, preflight_row
+                )
+                preflight_draft = decoded_object(preflight_row.draft_json)
+                preflight_draft_hash = preflight_row.draft_hash
+            else:
+                preflight_draft = None
+                preflight_draft_hash = None
         if replay is not None:
             return self.query_quest_creation(initialization_id)
+        assert preflight_draft is not None
+        self._verify_material_bindings(preflight_draft)
 
         observation = self._agent_runtime.observe_host_compute(
             "human_collaboration:"
@@ -951,6 +1047,8 @@ class SQLiteHumanCollaboration:
             if replay is None:
                 row = self._require_initialization(connection, initialization_id)
                 _require_initialization_artifact_integrity(connection, row)
+                if row.draft_hash != preflight_draft_hash:
+                    raise OwnerConflict("quest_draft_stale")
                 if row.status in {"confirmed", "completed", "cancelled"}:
                     raise OwnerConflict("quest_initialization_is_terminal")
                 result_ref = snapshot_ref
@@ -1945,8 +2043,10 @@ class SQLiteHumanCollaboration:
                 if row.status in {"confirmed", "completed", "cancelled"}:
                     raise OwnerConflict("quest_initialization_is_terminal")
                 self._validate_current_proposal(connection, row, request)
+                draft = decoded_object(row.draft_json)
+                self._verify_material_bindings(draft)
                 self._require_current_resource_envelope(
-                    connection, initialization_id, decoded_object(row.draft_json)
+                    connection, initialization_id, draft
                 )
         if row.draft_schema_ref == DRAFT_V2_SCHEMA:
             self._auto_refresh_preview(initialization_id)
@@ -2151,6 +2251,35 @@ class SQLiteHumanCollaboration:
         )
         if prior_failure is not None:
             raise OwnerConflict(prior_failure)
+        with self._database.read() as connection:
+            replay = self._query_command(
+                connection, idempotency_key, "confirm", request_hash
+            )
+            if replay is None:
+                preflight_row = self._require_initialization(
+                    connection, initialization_id
+                )
+                preflight_draft = (
+                    None
+                    if preflight_row.confirmation_ref is not None
+                    else decoded_object(preflight_row.draft_json)
+                )
+            else:
+                preflight_draft = None
+        if replay is not None:
+            return self.query_quest_creation(initialization_id)
+        if preflight_draft is not None:
+            try:
+                self._verify_material_bindings(preflight_draft)
+            except OwnerConflict as error:
+                self._record_confirmation_failure(
+                    initialization_id,
+                    idempotency_key,
+                    request,
+                    request_hash,
+                    error.code,
+                )
+                raise
         try:
             with self._database.write() as connection:
                 replay = self._query_command(
@@ -2593,6 +2722,30 @@ class SQLiteHumanCollaboration:
         except OwnerConflict as error:
             quest = None
             quest_failure = error
+        material_bindings = _accepted_material_bindings(current_draft_value)
+        material_roles = ()
+        material_failure: OwnerConflict | None = None
+        material_complete = not material_bindings
+        if quest is not None and material_bindings:
+            try:
+                material_roles = self._research_graph.query_asset_roles(
+                    quest_ref=quest.quest_ref,
+                    role="quest_source_material",
+                )
+            except OwnerConflict as error:
+                material_failure = error
+            else:
+                expected_material_refs = {
+                    binding.version_ref for binding in material_bindings
+                }
+                material_roles = tuple(
+                    role
+                    for role in material_roles
+                    if role.version_ref in expected_material_refs
+                )
+                material_complete = expected_material_refs.issubset(
+                    {role.version_ref for role in material_roles}
+                )
         content_failure: OwnerConflict | None = None
         try:
             content = self._research_memory.query_question_content(initialization_id)
@@ -2625,6 +2778,16 @@ class SQLiteHumanCollaboration:
             else:
                 proposal_complete = True
         proposal_current = proposal_basis_current and proposal_complete
+        material_bindings_current = True
+        if (
+            row.confirmation_ref is None
+            and row.preview_ref is not None
+            and material_bindings
+        ):
+            try:
+                self._verify_material_projection_bindings(current_draft_value)
+            except OwnerConflict:
+                material_bindings_current = False
         preview_current = (
             row.preview_ref is not None
             and row.preview_basis_revision == row.draft_revision
@@ -2632,6 +2795,7 @@ class SQLiteHumanCollaboration:
             and row.preview_proposal_ref == row.proposal_ref
             and row.preview_proposal_hash == row.proposal_hash
             and proposal_current
+            and material_bindings_current
             and (
                 row.draft_schema_ref != DRAFT_V2_SCHEMA
                 or envelope_current and preview_binding is not None
@@ -2659,6 +2823,7 @@ class SQLiteHumanCollaboration:
         )
         live_failures = {
             "quest_goal": quest_failure,
+            "quest_source_material": material_failure,
             "question_content": content_failure,
             "question_identity": question_failure,
             "cycle_activation": cycle_failure,
@@ -2673,6 +2838,7 @@ class SQLiteHumanCollaboration:
             status = (
                 "completed"
                 if live_failure_layer is None
+                and material_complete
                 and all(value is not None for value in (quest, content, question, cycle))
                 else "unavailable"
             )
@@ -2746,25 +2912,33 @@ class SQLiteHumanCollaboration:
             "question_identity": _project_owner_receipt(question, question_failure),
             "cycle_activation": _project_owner_receipt(cycle, cycle_failure),
         }
+        ordered_layers = ["quest_goal"]
+        if material_bindings:
+            ordered_layers.append("quest_source_material")
+            receipts["quest_source_material"] = (
+                {
+                    "status": "accepted",
+                    "issuer": "research_graph",
+                    "kind": "quest_source_material_role_set",
+                    "role_refs": [role.role_ref for role in material_roles],
+                    "receipts": [
+                        role.receipt.as_public_dict() for role in material_roles
+                    ],
+                }
+                if material_complete
+                else _project_owner_receipt(None, material_failure)
+            )
+        ordered_layers.extend(
+            ["question_content", "question_identity", "cycle_activation"]
+        )
         if human_receipt["status"] in {"stale", "rejected"}:
-            for layer in (
-                "quest_goal",
-                "question_content",
-                "question_identity",
-                "cycle_activation",
-            ):
+            for layer in ordered_layers:
                 if receipts[layer]["status"] == "not_attempted":
                     receipts[layer] = {
                         "status": "not_attempted",
                         "reason": {"code": "human_confirmation_not_accepted"},
                     }
         if failure is not None and receipts[failure.layer]["status"] != "accepted":
-            ordered_layers = (
-                "quest_goal",
-                "question_content",
-                "question_identity",
-                "cycle_activation",
-            )
             failure_index = ordered_layers.index(failure.layer)
             receipts[failure.layer] = {
                 "status": failure.status,
@@ -2774,12 +2948,6 @@ class SQLiteHumanCollaboration:
                 if receipts[layer]["status"] != "accepted":
                     receipts[layer] = _not_attempted(failure.layer)
         if live_failure_layer is not None:
-            ordered_layers = (
-                "quest_goal",
-                "question_content",
-                "question_identity",
-                "cycle_activation",
-            )
             failure_index = ordered_layers.index(live_failure_layer)
             for layer in ordered_layers[failure_index + 1 :]:
                 receipts[layer] = _not_attempted(live_failure_layer)
@@ -2962,12 +3130,7 @@ class SQLiteHumanCollaboration:
                     "status": "capability_unavailable",
                     "reason": {"code": "deepfetch_not_delivered"},
                 },
-                "accepted_material_basis": {
-                    "status": "capability_unavailable",
-                    "reason": {
-                        "code": "research_memory_asset_intake_not_delivered"
-                    },
-                },
+                "accepted_material_basis": {"status": "ready"},
             },
         }
         if quest is not None:
@@ -3091,6 +3254,44 @@ class SQLiteHumanCollaboration:
             self._clear_dispatch_failure(initialization_id, "quest_goal")
             return True
         self._clear_dispatch_failure(initialization_id, "quest_goal")
+
+        material_bindings = _accepted_material_bindings(draft)
+        if material_bindings:
+            try:
+                roles = self._research_graph.query_asset_roles(
+                    quest_ref=quest.quest_ref, role="quest_source_material"
+                )
+                accepted_version_refs = {role.version_ref for role in roles}
+                for binding in material_bindings:
+                    if binding.version_ref in accepted_version_refs:
+                        continue
+                    self._research_graph.accept_asset_role(
+                        binding=binding,
+                        role="quest_source_material",
+                        quest_ref=quest.quest_ref,
+                        idempotency_key=(
+                            "quest-source-material:"
+                            + canonical_hash(
+                                {
+                                    "initialization_id": initialization_id,
+                                    "version_ref": binding.version_ref,
+                                }
+                            )
+                        ),
+                    )
+                    return True
+            except (OwnerConflict, OSError) as error:
+                self._record_dispatch_failure(
+                    initialization_id,
+                    "quest_source_material",
+                    _dispatch_failure_reason(
+                        error, "quest_source_material_unavailable"
+                    ),
+                )
+                return False
+        self._clear_dispatch_failure(
+            initialization_id, "quest_source_material"
+        )
 
         try:
             content = self._research_memory.query_question_content(initialization_id)
@@ -3560,18 +3761,67 @@ class SQLiteHumanCollaboration:
                 envelope_hash, str
             ):
                 return False
-            try:
-                envelope_value = self._require_current_resource_envelope(
-                    connection, initialization_id, draft
-                )
-            except OwnerConflict:
-                return False
             request = {
+                "initialization_id": initialization_id,
                 "quest_draft_revision": int(row.draft_revision),
                 "quest_draft_hash": row.draft_hash,
                 "proposal_ref": row.proposal_ref,
                 "proposal_hash": row.proposal_hash,
             }
+            refresh_basis = canonical_hash(
+                {
+                    **request,
+                    "resource_envelope_ref": envelope_ref,
+                    "resource_envelope_hash": envelope_hash,
+                    "owner_revisions": self._public_owner_revisions(),
+                    "feed_revision": self._feed.current_revision(),
+                }
+            )
+            now = time.time()
+            with self._preview_refresh_lock:
+                prior_attempt = self._preview_refresh_attempts.get(initialization_id)
+                if (
+                    prior_attempt is not None
+                    and prior_attempt[0] == refresh_basis
+                    and prior_attempt[1] > now
+                ):
+                    return False
+                if (
+                    initialization_id not in self._preview_refresh_attempts
+                    and len(self._preview_refresh_attempts)
+                    >= _PREVIEW_REFRESH_CACHE_LIMIT
+                ):
+                    oldest_initialization_id = next(
+                        iter(self._preview_refresh_attempts)
+                    )
+                    self._preview_refresh_attempts.pop(oldest_initialization_id)
+                self._preview_refresh_attempts[initialization_id] = (
+                    refresh_basis,
+                    now + _PREVIEW_REFRESH_RETRY_SECONDS,
+                )
+            if row.preview_ref is not None and row.preview_hash is not None:
+                try:
+                    self._validate_current_preview_binding(
+                        connection,
+                        row,
+                        {
+                            **request,
+                            "preview_ref": row.preview_ref,
+                            "preview_hash": row.preview_hash,
+                        },
+                    )
+                except OwnerConflict:
+                    pass
+                else:
+                    return False
+            try:
+                self._verify_material_projection_bindings(draft)
+                envelope_value = self._require_current_resource_envelope(
+                    connection, initialization_id, draft
+                )
+            except OwnerConflict:
+                return False
+        material_bindings = _accepted_material_bindings(draft)
         assertions = [
             self._research_graph.preview_quest_acceptance(
                 initialization_id=initialization_id,
@@ -3579,33 +3829,52 @@ class SQLiteHumanCollaboration:
                 draft_hash=cast(str, request["quest_draft_hash"]),
                 proposal_ref=cast(str, request["proposal_ref"]),
                 proposal_hash=cast(str, request["proposal_hash"]),
-            ),
-            self._research_memory.preview_question_content_acceptance(
-                initialization_id=initialization_id,
-                proposal_ref=cast(str, request["proposal_ref"]),
-                proposal_hash=cast(str, request["proposal_hash"]),
-            ),
-            self._research_graph.preview_root_question_acceptance(
-                initialization_id=initialization_id,
-                proposal_ref=cast(str, request["proposal_ref"]),
-                proposal_hash=cast(str, request["proposal_hash"]),
-            ),
-            self._advancement_engine.preview_initial_cycle_activation(
-                initialization_id=initialization_id,
-                proposal_ref=cast(str, request["proposal_ref"]),
-                proposal_hash=cast(str, request["proposal_hash"]),
-            ),
+            )
         ]
+        if material_bindings:
+            assertions.append(
+                self._research_graph.preview_asset_role_acceptance(
+                    initialization_id=initialization_id,
+                    role="quest_source_material",
+                    bindings=material_bindings,
+                )
+            )
+        assertions.extend(
+            [
+                self._research_memory.preview_question_content_acceptance(
+                    initialization_id=initialization_id,
+                    proposal_ref=cast(str, request["proposal_ref"]),
+                    proposal_hash=cast(str, request["proposal_hash"]),
+                ),
+                self._research_graph.preview_root_question_acceptance(
+                    initialization_id=initialization_id,
+                    proposal_ref=cast(str, request["proposal_ref"]),
+                    proposal_hash=cast(str, request["proposal_hash"]),
+                ),
+                self._advancement_engine.preview_initial_cycle_activation(
+                    initialization_id=initialization_id,
+                    proposal_ref=cast(str, request["proposal_ref"]),
+                    proposal_hash=cast(str, request["proposal_hash"]),
+                ),
+            ]
+        )
         assertions_hash = canonical_hash(assertions)
         owner_revisions = self._public_owner_revisions()
+        will_happen = [
+            "记录一次 Human Collaboration 最终确认",
+            "依次请求 Quest、Question 内容、根 Question 与初始 Cycle 的 Owner 接受",
+            "按 Resource Envelope 使用时间预算 "
+            f"{envelope_value['time_budget']} 与计算卡 "
+            f"{', '.join(cast(list[str], envelope_value['selected_device_uuids']))}",
+        ]
+        if material_bindings:
+            will_happen.insert(
+                2,
+                "由 Research Graph 接纳 "
+                f"{len(material_bindings)} 个精确 Quest Source Material 角色",
+            )
         summary = {
-            "will_happen": [
-                "记录一次 Human Collaboration 最终确认",
-                "依次请求 Quest、Question 内容、根 Question 与初始 Cycle 的 Owner 接受",
-                "按 Resource Envelope 使用时间预算 "
-                f"{envelope_value['time_budget']} 与计算卡 "
-                f"{', '.join(cast(list[str], envelope_value['selected_device_uuids']))}",
-            ],
+            "will_happen": will_happen,
             "will_not_happen": [
                 "不会在确认前创建 Quest、Question 或 Cycle",
                 "不会把草稿、预览或模型回复当作 Owner receipt",
@@ -4528,13 +4797,20 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
             scope_exclusions, str
         ):
             raise OwnerConflict("literature_configuration_invalid")
-        if not isinstance(bindings, list) or any(
-            not isinstance(item, dict) or not _finite_json_value(item)
-            for item in bindings
+        if (
+            not isinstance(bindings, list)
+            or len(bindings) > MAX_ACCEPTED_MATERIAL_BINDINGS
         ):
             raise OwnerConflict("accepted_material_bindings_invalid")
-        if mode == "provided_only" or bindings:
-            raise OwnerConflict("research_memory_asset_intake_not_delivered")
+        normalized_bindings = [
+            _validated_material_binding_dict(item) for item in bindings
+        ]
+        version_refs = [
+            cast(str, item["version_ref"]) for item in normalized_bindings
+        ]
+        if len(version_refs) != len(set(version_refs)):
+            raise OwnerConflict("accepted_material_bindings_invalid")
+        normalized_bindings.sort(key=lambda item: cast(str, item["version_ref"]))
         library_entry_url = _validated_library_entry_url(library_entry_url)
         normalized.update(
             {
@@ -4546,7 +4822,7 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
                     "mode": mode,
                     "library_entry_url": library_entry_url,
                     "scope_exclusions": scope_exclusions.strip(),
-                    "accepted_material_bindings": bindings,
+                    "accepted_material_bindings": normalized_bindings,
                 },
             }
         )
@@ -4710,6 +4986,92 @@ def _finite_json_value(value: object) -> bool:
     return False
 
 
+def _validated_material_binding_dict(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "asset_ref",
+        "version_ref",
+        "content_hash",
+        "manifest_hash",
+        "receipt",
+    }:
+        raise OwnerConflict("accepted_material_bindings_invalid")
+    asset_ref = value["asset_ref"]
+    version_ref = value["version_ref"]
+    content_hash = value["content_hash"]
+    manifest_hash = value["manifest_hash"]
+    receipt = value["receipt"]
+    if (
+        not isinstance(asset_ref, str)
+        or not asset_ref
+        or not isinstance(version_ref, str)
+        or not version_ref
+        or not isinstance(content_hash, str)
+        or len(content_hash) != 64
+        or not isinstance(manifest_hash, str)
+        or len(manifest_hash) != 64
+        or not isinstance(receipt, dict)
+        or set(receipt)
+        != {
+            "status",
+            "issuer",
+            "kind",
+            "receipt_ref",
+            "subject_ref",
+            "payload_hash",
+        }
+        or receipt.get("status") != "accepted"
+        or receipt.get("issuer") != "research_memory"
+        or not isinstance(receipt.get("kind"), str)
+        or not receipt.get("kind")
+        or not isinstance(receipt.get("receipt_ref"), str)
+        or not receipt.get("receipt_ref")
+        or receipt.get("subject_ref") != version_ref
+        or not isinstance(receipt.get("payload_hash"), str)
+        or len(cast(str, receipt.get("payload_hash"))) != 64
+    ):
+        raise OwnerConflict("accepted_material_bindings_invalid")
+    return {
+        "asset_ref": asset_ref,
+        "version_ref": version_ref,
+        "content_hash": content_hash,
+        "manifest_hash": manifest_hash,
+        "receipt": dict(receipt),
+    }
+
+
+def _accepted_material_bindings(
+    draft: dict[str, object],
+) -> tuple[AcceptedAssetBinding, ...]:
+    if _draft_schema_ref(draft) != DRAFT_V2_SCHEMA:
+        return ()
+    literature = draft.get("literature")
+    if not isinstance(literature, dict):
+        raise OwnerConflict("literature_configuration_invalid")
+    raw_bindings = literature.get("accepted_material_bindings")
+    if not isinstance(raw_bindings, list):
+        raise OwnerConflict("accepted_material_bindings_invalid")
+    bindings: list[AcceptedAssetBinding] = []
+    for value in raw_bindings:
+        normalized = _validated_material_binding_dict(value)
+        receipt = cast(dict[str, object], normalized["receipt"])
+        bindings.append(
+            AcceptedAssetBinding(
+                asset_ref=cast(str, normalized["asset_ref"]),
+                version_ref=cast(str, normalized["version_ref"]),
+                content_hash=cast(str, normalized["content_hash"]),
+                manifest_hash=cast(str, normalized["manifest_hash"]),
+                receipt=AcceptanceReceipt(
+                    issuer=cast(str, receipt["issuer"]),
+                    kind=cast(str, receipt["kind"]),
+                    receipt_ref=cast(str, receipt["receipt_ref"]),
+                    subject_ref=cast(str, receipt["subject_ref"]),
+                    payload_hash=cast(str, receipt["payload_hash"]),
+                ),
+            )
+        )
+    return tuple(bindings)
+
+
 def _draft_schema_ref(draft: dict[str, object]) -> str:
     return DRAFT_V2_SCHEMA if "time_budget" in draft else DRAFT_V1_SCHEMA
 
@@ -4736,10 +5098,10 @@ def _validate_generation_basis(draft: dict[str, object]) -> None:
     ):
         raise OwnerConflict("resource_envelope_required")
     literature = cast(dict[str, object], normalized["literature"])
-    if literature["mode"] == "provided_only" or literature[
+    if literature["mode"] == "provided_only" and not literature[
         "accepted_material_bindings"
     ]:
-        raise OwnerConflict("research_memory_asset_intake_not_delivered")
+        raise OwnerConflict("accepted_material_binding_required")
 
 
 def _validate_question_content(

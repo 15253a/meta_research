@@ -1,24 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hmac
 import json
 import logging
+import math
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
-from typing import AsyncIterator, Callable, Literal
-from urllib.parse import parse_qs, urlsplit
+from typing import AsyncIterator, Callable, Literal, TypeVar
+from urllib.parse import parse_qs, quote, urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
 
 from meta_research.auth import AuthSession
 from meta_research.composition import ProductionRuntime
 from meta_research.owners.common import OwnerConflict
+from meta_research.owners.research_graph import ASSET_ROLE_QUERY_MAX_PAGE_SIZE
+from meta_research.owners.research_memory import (
+    ASSET_HISTORY_QUERY_MAX_PAGE_SIZE,
+    ASSET_PROJECTION_HISTORY_PER_VERSION,
+    AssetIntakeRequest,
+)
 from meta_research.projection import SnapshotConsistencyUnavailable
 from meta_research.quest_drafting import (
     INTENT_MESSAGE_MAX_LENGTH,
@@ -29,6 +39,18 @@ from meta_research.quest_drafting import (
 SESSION_COOKIE = "meta_research_session"
 CSRF_COOKIE = "meta_research_csrf"
 LOGGER = logging.getLogger(__name__)
+MAX_ASSET_INTAKE_REQUEST_BODY_BYTES = 96 * 1024 * 1024
+MAX_COMMAND_REQUEST_BODY_BYTES = 1 * 1024 * 1024
+# Kept as the public intake-envelope constant used by compatibility tests and
+# callers that size a Research Asset request before sending it.
+MAX_JSON_REQUEST_BODY_BYTES = MAX_ASSET_INTAKE_REQUEST_BODY_BYTES
+MAX_CONCURRENT_ASSET_INTAKE_REQUESTS = 2
+MAX_CONCURRENT_ASSET_IO_OPERATIONS = 2
+ASSET_WORKER_WATCHDOG_SECONDS = 5.0
+ASSET_ROUTE_WATCHDOG_SECONDS = 5.0
+DRAFTING_WORKER_WATCHDOG_SECONDS = 190.0
+IDEA_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -182,20 +204,114 @@ class ConfirmQuestRequest(BaseModel):
     preview_hash: str = Field(min_length=64, max_length=64)
 
 
+class AssetIntakeWebRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_kind: Literal[
+        "text",
+        "file",
+        "directory",
+        "local_path",
+        "repository",
+        "link",
+        "system_artifact",
+    ]
+    custody_mode: Literal["managed", "linked_local"]
+    display_name: str = Field(min_length=1, max_length=512)
+    media_type: str = Field(default="application/octet-stream", max_length=255)
+    text: str | None = Field(default=None, max_length=16_000_000)
+    content_base64: str | None = Field(default=None, max_length=140_000_000)
+    source_locator: str | None = Field(default=None, max_length=16_000)
+    provenance: dict[str, object] | None = None
+    asset_ref: str | None = Field(default=None, max_length=128)
+    asynchronous: bool = False
+
+    def as_owner_request(self) -> AssetIntakeRequest:
+        if self.text is not None and self.content_base64 is not None:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "asset_content_encoding_ambiguous"},
+            )
+        content: bytes | None
+        if self.text is not None:
+            content = self.text.encode("utf-8")
+        elif self.content_base64 is not None:
+            try:
+                content = base64.b64decode(self.content_base64, validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "asset_content_base64_invalid"},
+                ) from error
+        else:
+            content = None
+        request = AssetIntakeRequest(
+            source_kind=self.source_kind,
+            custody_mode=self.custody_mode,
+            display_name=self.display_name,
+            media_type=self.media_type,
+            content=content,
+            source_locator=self.source_locator,
+            provenance=self.provenance,
+            asset_ref=self.asset_ref,
+            asynchronous=self.asynchronous,
+        )
+        try:
+            request.validate()
+        except OwnerConflict as error:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": error.code},
+            ) from error
+        return request
+
+
+class AssetRoleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["evidence", "quest_source_material"]
+    quest_ref: str = Field(min_length=1, max_length=128)
+
+
+class AssetHoldRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=1024)
+
+
+class ReleaseEligibilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_reference_revision: int | None = Field(default=None, ge=0)
+
+
+class EmptyCommandRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
     reconciliation_task: asyncio.Task[None] | None = None
     drafting_task: asyncio.Task[None] | None = None
     idea_stage_task: asyncio.Task[None] | None = None
+    research_asset_task: asyncio.Task[None] | None = None
+    research_asset_verification_task: asyncio.Task[None] | None = None
     reconciliation_health = ReconciliationHealth()
     drafting_health = ReconciliationHealth()
     idea_stage_health = ReconciliationHealth()
+    research_asset_health = ReconciliationHealth()
+    research_asset_verification_health = ReconciliationHealth()
     worker_health_updates = WorkerHealthUpdates()
+    asset_intake_slots = asyncio.Semaphore(MAX_CONCURRENT_ASSET_INTAKE_REQUESTS)
+    asset_io_slots = asyncio.Semaphore(MAX_CONCURRENT_ASSET_IO_OPERATIONS)
+    asset_intake_recovery_slots = asyncio.Semaphore(1)
+    asset_handoff_singleflight = _AssetIOSingleFlight()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         nonlocal reconciliation_task, drafting_task, idea_stage_task
+        nonlocal research_asset_task, research_asset_verification_task
         reconciliation_task = asyncio.create_task(
             _reconcile_quest_initializations(
                 runtime,
@@ -220,12 +336,34 @@ def create_app(
             )
         )
         idea_stage_task.add_done_callback(_log_reconciliation_exit)
+        research_asset_task = asyncio.create_task(
+            _process_research_assets(
+                runtime,
+                research_asset_health,
+                worker_health_updates.publish,
+            )
+        )
+        research_asset_task.add_done_callback(_log_reconciliation_exit)
+        research_asset_verification_task = asyncio.create_task(
+            _verify_research_assets(
+                runtime,
+                research_asset_verification_health,
+                worker_health_updates.publish,
+            )
+        )
+        research_asset_verification_task.add_done_callback(_log_reconciliation_exit)
         try:
             yield
         finally:
             tasks = tuple(
                 task
-                for task in (reconciliation_task, drafting_task, idea_stage_task)
+                for task in (
+                    reconciliation_task,
+                    drafting_task,
+                    idea_stage_task,
+                    research_asset_task,
+                    research_asset_verification_task,
+                )
                 if task is not None
             )
             try:
@@ -281,9 +419,26 @@ def create_app(
             ),
             worker_check("quest_drafting_worker", drafting_task, drafting_health),
             worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
+            worker_check(
+                "research_asset_intake_worker",
+                research_asset_task,
+                research_asset_health,
+            ),
+            worker_check(
+                "research_asset_verification_worker",
+                research_asset_verification_task,
+                research_asset_verification_health,
+            ),
         ]
         core_checks = [
-            check for check in checks if check["name"] != "idea_stage_worker"
+            check
+            for check in checks
+            if check["name"]
+            not in {
+                "idea_stage_worker",
+                "research_asset_intake_worker",
+                "research_asset_verification_worker",
+            }
         ]
         snapshot["readiness"] = {
             "status": (
@@ -327,6 +482,10 @@ def create_app(
             path.startswith("/api/")
             and request.method in {"POST", "PUT", "PATCH", "DELETE"}
         )
+        is_asset_intake = (
+            request.method == "POST"
+            and path == "/api/v1/research-assets/intakes"
+        )
         if json_auth_route or unsafe_api_route:
             content_type = (
                 request.headers.get("content-type", "").split(";", 1)[0].strip()
@@ -350,21 +509,67 @@ def create_app(
             ):
                 return _error(403, "csrf_invalid")
 
-        response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; base-uri 'none'; connect-src 'self'; "
-            "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
-            "img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'"
-        )
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        return response
+        async def dispatch() -> Response:
+            if json_auth_route or unsafe_api_route:
+                request_body_limit = (
+                    MAX_ASSET_INTAKE_REQUEST_BODY_BYTES
+                    if is_asset_intake
+                    else MAX_COMMAND_REQUEST_BODY_BYTES
+                )
+                content_length = request.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError:
+                        return _error(400, "content_length_invalid")
+                    if (
+                        declared_length < 0
+                        or declared_length > request_body_limit
+                    ):
+                        return _error(413, "request_body_too_large")
+                body = bytearray()
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > request_body_limit:
+                        return _error(413, "request_body_too_large")
+                    body.extend(chunk)
+                request._body = bytes(body)
+
+            response = await call_next(request)
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; base-uri 'none'; connect-src 'self'; "
+                "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+                "img-src 'self' data:; object-src 'none'; script-src 'self'; "
+                "style-src 'self'"
+            )
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            return response
+
+        if not is_asset_intake:
+            return await dispatch()
+        try:
+            await asyncio.wait_for(asset_intake_slots.acquire(), timeout=0.05)
+        except TimeoutError:
+            return _error(503, "asset_intake_busy")
+        try:
+            return await dispatch()
+        finally:
+            asset_intake_slots.release()
 
     @app.exception_handler(OwnerConflict)
     async def owner_conflict(_request: Request, error: OwnerConflict) -> JSONResponse:
-        status_code = 404 if error.code == "quest_initialization_not_found" else 409
+        status_code = (
+            404
+            if error.code
+            in {
+                "asset_intake_not_found",
+                "asset_not_found",
+                "quest_initialization_not_found",
+            }
+            else 409
+        )
         detail: dict[str, object] = {"code": error.code}
         if error.code in {
             "research_memory_asset_intake_not_delivered",
@@ -417,6 +622,16 @@ def create_app(
         idea_stage = worker_check(
             "idea_stage_worker", idea_stage_task, idea_stage_health
         )
+        research_assets = worker_check(
+            "research_asset_intake_worker",
+            research_asset_task,
+            research_asset_health,
+        )
+        research_asset_verification = worker_check(
+            "research_asset_verification_worker",
+            research_asset_verification_task,
+            research_asset_verification_health,
+        )
         return {
             "status": snapshot["readiness"]["status"],
             "revision": snapshot["revision"],
@@ -431,6 +646,14 @@ def create_app(
             "idea_stage": {
                 "status": idea_stage["status"],
                 "last_error": idea_stage_health.last_error,
+            },
+            "research_assets": {
+                "status": research_assets["status"],
+                "last_error": research_asset_health.last_error,
+            },
+            "research_asset_verification": {
+                "status": research_asset_verification["status"],
+                "last_error": research_asset_verification_health.last_error,
             },
         }
 
@@ -500,75 +723,103 @@ def create_app(
         return {"status": "authenticated"}
 
     @app.post("/api/v1/quest-initializations", status_code=201)
-    def create_quest_initialization(
+    async def create_quest_initialization(
         request: Request,
         draft: OpenQuestRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.create_quest(
-            draft.model_dump(), _idempotency_key(request)
+        owner_draft = draft.model_dump()
+        idempotency_key = _idempotency_key(request)
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.create_quest(
+                owner_draft, idempotency_key
+            ),
+            slots=asset_io_slots,
+            timeout_code="quest_material_io_timeout",
         )
 
     @app.put("/api/v1/quest-initializations/{initialization_id}/draft")
-    def revise_quest_initialization(
+    async def revise_quest_initialization(
         initialization_id: str,
         request: Request,
         draft: ReviseQuestDraftV2Request,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.revise_quest_draft(
-            initialization_id,
-            draft.draft.model_dump(),
-            draft.expected_draft_hash,
-            _idempotency_key(request),
-            draft.expected_draft_revision,
+        owner_draft = draft.draft.model_dump()
+        idempotency_key = _idempotency_key(request)
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.revise_quest_draft(
+                initialization_id,
+                owner_draft,
+                draft.expected_draft_hash,
+                idempotency_key,
+                draft.expected_draft_revision,
+            ),
+            slots=asset_io_slots,
+            timeout_code="quest_material_io_timeout",
         )
 
     @app.post(
         "/api/v1/quest-initializations/{initialization_id}/proposal",
         status_code=202,
     )
-    def generate_question_proposal(
+    async def generate_question_proposal(
         initialization_id: str,
         request: Request,
         generation: GenerateProposalRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.generate_question_proposal(
-            initialization_id,
-            generation.expected_draft_hash,
-            _idempotency_key(request),
-            generation.expected_draft_revision,
+        idempotency_key = _idempotency_key(request)
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.generate_question_proposal(
+                initialization_id,
+                generation.expected_draft_hash,
+                idempotency_key,
+                generation.expected_draft_revision,
+            ),
+            slots=asset_io_slots,
+            timeout_code="quest_material_io_timeout",
         )
 
     @app.post(
         "/api/v1/quest-initializations/{initialization_id}/proposal-generations",
         status_code=202,
     )
-    def enqueue_question_proposal(
+    async def enqueue_question_proposal(
         initialization_id: str,
         request: Request,
         generation: GenerateProposalRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.generate_question_proposal(
-            initialization_id,
-            generation.expected_draft_hash,
-            _idempotency_key(request),
-            generation.expected_draft_revision,
+        idempotency_key = _idempotency_key(request)
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.generate_question_proposal(
+                initialization_id,
+                generation.expected_draft_hash,
+                idempotency_key,
+                generation.expected_draft_revision,
+            ),
+            slots=asset_io_slots,
+            timeout_code="quest_material_io_timeout",
         )
 
     @app.put("/api/v1/quest-initializations/{initialization_id}/proposal")
-    def save_question_proposal(
+    async def save_question_proposal(
         initialization_id: str,
         request: Request,
         proposal: SaveProposalRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.save_question_proposal(
-            initialization_id,
-            proposal.expected_draft_hash,
-            proposal.content.model_dump(),
-            _idempotency_key(request),
-            proposal.expected_draft_revision,
-            proposal.expected_proposal_ref,
-            proposal.expected_proposal_hash,
-            proposal.explicit_review,
+        content = proposal.content.model_dump()
+        idempotency_key = _idempotency_key(request)
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.save_question_proposal(
+                initialization_id,
+                proposal.expected_draft_hash,
+                content,
+                idempotency_key,
+                proposal.expected_draft_revision,
+                proposal.expected_proposal_ref,
+                proposal.expected_proposal_hash,
+                proposal.explicit_review,
+            ),
+            slots=asset_io_slots,
+            timeout_code="quest_material_io_timeout",
         )
 
     @app.post(
@@ -606,38 +857,48 @@ def create_app(
         "/api/v1/quest-initializations/{initialization_id}/confirmation-preview",
         status_code=201,
     )
-    def preview_quest_confirmation(
+    async def preview_quest_confirmation(
         initialization_id: str,
         request: Request,
         preview: ConfirmationPreviewRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.preview_confirmation(
-            initialization_id,
-            quest_draft_revision=preview.quest_draft_revision,
-            quest_draft_hash=preview.quest_draft_hash,
-            proposal_ref=preview.proposal_ref,
-            proposal_hash=preview.proposal_hash,
-            idempotency_key=_idempotency_key(request),
+        idempotency_key = _idempotency_key(request)
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.preview_confirmation(
+                initialization_id,
+                quest_draft_revision=preview.quest_draft_revision,
+                quest_draft_hash=preview.quest_draft_hash,
+                proposal_ref=preview.proposal_ref,
+                proposal_hash=preview.proposal_hash,
+                idempotency_key=idempotency_key,
+            ),
+            slots=asset_io_slots,
+            timeout_code="quest_material_io_timeout",
         )
 
     @app.post(
         "/api/v1/quest-initializations/{initialization_id}/confirmation",
         status_code=202,
     )
-    def confirm_quest_initialization(
+    async def confirm_quest_initialization(
         initialization_id: str,
         request: Request,
         confirmation: ConfirmQuestRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.confirm_quest(
-            initialization_id,
-            quest_draft_revision=confirmation.quest_draft_revision,
-            quest_draft_hash=confirmation.quest_draft_hash,
-            proposal_ref=confirmation.proposal_ref,
-            proposal_hash=confirmation.proposal_hash,
-            preview_ref=confirmation.preview_ref,
-            preview_hash=confirmation.preview_hash,
-            idempotency_key=_idempotency_key(request),
+        idempotency_key = _idempotency_key(request)
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.confirm_quest(
+                initialization_id,
+                quest_draft_revision=confirmation.quest_draft_revision,
+                quest_draft_hash=confirmation.quest_draft_hash,
+                proposal_ref=confirmation.proposal_ref,
+                proposal_hash=confirmation.proposal_hash,
+                preview_ref=confirmation.preview_ref,
+                preview_hash=confirmation.preview_hash,
+                idempotency_key=idempotency_key,
+            ),
+            slots=asset_io_slots,
+            timeout_code="quest_material_io_timeout",
         )
 
     @app.post("/api/v1/quest-initializations/{initialization_id}/cancel")
@@ -668,6 +929,322 @@ def create_app(
             initialization_id
         )
         return {"intent_session": view["intent_session"]}
+
+    @app.get("/api/v1/research-assets")
+    def query_research_assets(
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> dict[str, object]:
+        return runtime.projection.query_snapshot(
+            asset_offset=offset,
+            asset_limit=limit,
+        )["research_assets"]
+
+    @app.post("/api/v1/research-assets/intakes")
+    async def submit_research_asset(
+        request: Request,
+        intake: AssetIntakeWebRequest,
+    ) -> JSONResponse:
+        owner_request = intake.as_owner_request()
+        idempotency_key = _idempotency_key(request)
+        try:
+            result = await _await_bounded_asset_io(
+                lambda: runtime.owners.research_memory.submit_asset_intake(
+                    owner_request,
+                    idempotency_key=idempotency_key,
+                ),
+                slots=asset_io_slots,
+                timeout_code="asset_intake_io_timeout",
+            )
+        except HTTPException as error:
+            if error.detail != {"code": "asset_intake_io_timeout"}:
+                raise
+            recover_intake = (
+                runtime.owners.research_memory.query_asset_intake_by_idempotency_key
+            )
+            result = await _await_bounded_asset_io(
+                lambda: recover_intake(idempotency_key, owner_request),
+                slots=asset_intake_recovery_slots,
+                timeout_code="asset_intake_recovery_io_timeout",
+            )
+            if result is None:
+                raise error
+        return JSONResponse(
+            status_code=(
+                202 if result.status in {"queued", "processing"} else 201
+            ),
+            content=result.as_public_dict(),
+        )
+
+    @app.get("/api/v1/research-assets/intakes/{job_ref}")
+    def query_research_asset_intake(job_ref: str) -> dict[str, object]:
+        return runtime.owners.research_memory.query_asset_intake(
+            job_ref
+        ).as_public_dict()
+
+    @app.get("/api/v1/research-assets/roles")
+    def query_research_asset_roles(
+        quest_ref: str | None = None,
+        role: Literal["evidence", "quest_source_material"] | None = None,
+        cursor: str | None = Query(default=None, max_length=512),
+        limit: int = Query(
+            default=50, ge=1, le=ASSET_ROLE_QUERY_MAX_PAGE_SIZE
+        ),
+    ) -> dict[str, object]:
+        before_timestamp, before_ref = _decode_history_cursor(cursor)
+        for _attempt in range(3):
+            revision_before = (
+                runtime.owners.research_graph.query_asset_reference_revision()
+            )
+            rows = runtime.owners.research_graph.query_asset_roles(
+                quest_ref=quest_ref,
+                role=role,
+                limit=limit + 1,
+                newest_first=True,
+                before_timestamp=before_timestamp,
+                before_ref=before_ref,
+            )
+            revision_after = (
+                runtime.owners.research_graph.query_asset_reference_revision()
+            )
+            if revision_before == revision_after:
+                page = _history_page(
+                    rows,
+                    limit=limit,
+                    timestamp_field="accepted_at",
+                    ref_field="role_ref",
+                )
+                return {**page, "reference_revision": revision_after}
+        raise SnapshotConsistencyUnavailable
+
+    @app.get("/api/v1/research-assets/{memory_ref}")
+    def query_research_asset(memory_ref: str) -> dict[str, object]:
+        for _attempt in range(3):
+            feed_before = runtime.feed.query_readiness().current_revision
+            research_memory_revision = (
+                runtime.owners.research_memory.query_projection_snapshot().revision
+            )
+            item = (
+                runtime.owners.research_memory.query_asset_projection_inventory_item(
+                    memory_ref
+                )
+            )
+            if item is None:
+                raise OwnerConflict("asset_not_found")
+            custodies = runtime.owners.research_memory.query_asset_custodies(
+                memory_ref
+            )
+            roles = runtime.owners.research_graph.query_asset_roles(
+                version_refs=(memory_ref,),
+                limit=ASSET_PROJECTION_HISTORY_PER_VERSION,
+                newest_first=True,
+            )
+            holds = runtime.owners.research_memory.query_asset_holds(
+                memory_refs=(memory_ref,),
+                limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
+            )
+            assessments = (
+                runtime.owners.research_memory.query_release_eligibility_assessments(
+                    memory_ref,
+                    limit=ASSET_PROJECTION_HISTORY_PER_VERSION,
+                    newest_first=True,
+                )
+            )
+            reference_revision = (
+                runtime.owners.research_graph.query_asset_reference_revision()
+            )
+            feed_after = runtime.feed.query_readiness().current_revision
+            if feed_before == feed_after:
+                return {
+                    **item.as_public_dict(),
+                    "custodies": [row.as_public_dict() for row in custodies],
+                    "roles": [row.as_public_dict() for row in roles],
+                    "holds": [row.as_public_dict() for row in holds],
+                    "release_assessments": [
+                        row.as_public_dict() for row in assessments
+                    ],
+                    "revision": feed_after,
+                    "inventory_revision": research_memory_revision,
+                    "reference_revision": reference_revision,
+                }
+        raise SnapshotConsistencyUnavailable
+
+    @app.get("/api/v1/research-assets/{memory_ref}/roles")
+    def query_research_asset_role_history(
+        memory_ref: str,
+        cursor: str | None = Query(default=None, max_length=512),
+        limit: int = Query(
+            default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE
+        ),
+    ) -> dict[str, object]:
+        before_timestamp, before_ref = _decode_history_cursor(cursor)
+        rows = runtime.owners.research_graph.query_asset_roles(
+            version_refs=(memory_ref,),
+            limit=limit + 1,
+            newest_first=True,
+            before_timestamp=before_timestamp,
+            before_ref=before_ref,
+        )
+        return _history_page(
+            rows,
+            limit=limit,
+            timestamp_field="accepted_at",
+            ref_field="role_ref",
+        )
+
+    @app.get("/api/v1/research-assets/{memory_ref}/holds")
+    def query_research_asset_hold_history(
+        memory_ref: str,
+        cursor: str | None = Query(default=None, max_length=512),
+        limit: int = Query(
+            default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE
+        ),
+    ) -> dict[str, object]:
+        before_timestamp, before_ref = _decode_history_cursor(cursor)
+        rows = runtime.owners.research_memory.query_asset_holds(
+            memory_ref,
+            limit=limit + 1,
+            newest_first=True,
+            before_timestamp=before_timestamp,
+            before_ref=before_ref,
+        )
+        return _history_page(
+            rows,
+            limit=limit,
+            timestamp_field="placed_at",
+            ref_field="hold_ref",
+        )
+
+    @app.get("/api/v1/research-assets/{memory_ref}/release-assessments")
+    def query_research_asset_release_history(
+        memory_ref: str,
+        cursor: str | None = Query(default=None, max_length=512),
+        limit: int = Query(
+            default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE
+        ),
+    ) -> dict[str, object]:
+        before_timestamp, before_ref = _decode_history_cursor(cursor)
+        rows = runtime.owners.research_memory.query_release_eligibility_assessments(
+            memory_ref,
+            limit=limit + 1,
+            newest_first=True,
+            before_timestamp=before_timestamp,
+            before_ref=before_ref,
+        )
+        return _history_page(
+            rows,
+            limit=limit,
+            timestamp_field="assessed_at",
+            ref_field="assessment_ref",
+        )
+
+    @app.get("/api/v1/research-assets/{memory_ref}/content")
+    async def materialize_research_asset(memory_ref: str) -> Response:
+        materialized = await _await_bounded_asset_io(
+            lambda: runtime.owners.research_memory.materialize_asset(memory_ref),
+            slots=asset_io_slots,
+            timeout_code="asset_materialization_io_timeout",
+        )
+        return Response(
+            content=materialized.content,
+            media_type=materialized.media_type,
+            headers={
+                "Content-Disposition": (
+                    "attachment; filename*=UTF-8''"
+                    + quote(materialized.file_name, safe="")
+                )
+            },
+        )
+
+    @app.post("/api/v1/research-assets/{memory_ref}/custody/managed")
+    async def handoff_research_asset_custody(
+        memory_ref: str,
+        request: Request,
+        _command: EmptyCommandRequest,
+    ) -> dict[str, object]:
+        idempotency_key = _idempotency_key(request)
+        accepted = await asset_handoff_singleflight.run(
+            (memory_ref, idempotency_key),
+            lambda: runtime.owners.research_memory.handoff_asset_to_managed(
+                memory_ref,
+                idempotency_key=idempotency_key,
+            ),
+            slots=asset_io_slots,
+            timeout_code="asset_custody_io_timeout",
+        )
+        return accepted.as_public_dict()
+
+    @app.post("/api/v1/research-assets/{memory_ref}/roles", status_code=201)
+    async def accept_research_asset_role(
+        memory_ref: str,
+        request: Request,
+        role: AssetRoleRequest,
+    ) -> dict[str, object]:
+        idempotency_key = _idempotency_key(request)
+
+        def command():
+            accepted = runtime.owners.research_memory.query_asset_version(memory_ref)
+            if accepted is None:
+                raise OwnerConflict("asset_not_found")
+            return runtime.owners.research_graph.accept_asset_role(
+                binding=accepted.as_binding(),
+                role=role.role,
+                quest_ref=role.quest_ref,
+                idempotency_key=idempotency_key,
+            )
+
+        accepted_role = await _await_bounded_asset_io(
+            command,
+            slots=asset_io_slots,
+            timeout_code="asset_role_io_timeout",
+        )
+        return accepted_role.as_public_dict()
+
+    @app.post("/api/v1/research-assets/{memory_ref}/holds", status_code=201)
+    def place_research_asset_hold(
+        memory_ref: str,
+        request: Request,
+        hold: AssetHoldRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.research_memory.place_asset_hold(
+            memory_ref,
+            reason=hold.reason,
+            idempotency_key=_idempotency_key(request),
+        ).as_public_dict()
+
+    @app.post("/api/v1/research-assets/holds/{hold_ref}/release")
+    def release_research_asset_hold(
+        hold_ref: str,
+        request: Request,
+        _command: EmptyCommandRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.research_memory.release_asset_hold(
+            hold_ref,
+            idempotency_key=_idempotency_key(request),
+        ).as_public_dict()
+
+    @app.post(
+        "/api/v1/research-assets/{memory_ref}/release-eligibility",
+        status_code=201,
+    )
+    async def assess_research_asset_release(
+        memory_ref: str,
+        request: Request,
+        assessment: ReleaseEligibilityRequest,
+    ) -> dict[str, object]:
+        idempotency_key = _idempotency_key(request)
+        result = await _await_bounded_asset_io(
+            lambda: runtime.owners.research_memory.assess_release_eligibility(
+                memory_ref,
+                expected_reference_revision=(
+                    assessment.expected_reference_revision
+                ),
+                idempotency_key=idempotency_key,
+            ),
+            slots=asset_io_slots,
+            timeout_code="asset_release_io_timeout",
+        )
+        return result.as_public_dict()
 
     @app.get("/api/v1/snapshot")
     def query_snapshot() -> dict[str, object]:
@@ -876,8 +1453,12 @@ async def _reconcile_quest_initializations(
 ) -> None:
     while True:
         try:
-            advanced = await asyncio.to_thread(
-                runtime.owners.human_collaboration.reconcile_once
+            advanced = await _await_monitored_worker_call(
+                runtime.owners.human_collaboration.reconcile_once,
+                health=health,
+                timeout_code="quest_reconciliation_io_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
             )
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
@@ -910,8 +1491,12 @@ async def _process_quest_drafting(
 ) -> None:
     while True:
         try:
-            advanced = await asyncio.to_thread(
-                runtime.owners.human_collaboration.process_drafting_once
+            advanced = await _await_monitored_worker_call(
+                runtime.owners.human_collaboration.process_drafting_once,
+                health=health,
+                timeout_code="quest_drafting_operation_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=DRAFTING_WORKER_WATCHDOG_SECONDS,
             )
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
@@ -937,6 +1522,262 @@ async def _process_quest_drafting(
             await asyncio.sleep(0 if advanced else 0.2)
 
 
+async def _process_research_assets(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Finish durable asynchronous Asset Intake jobs without scan starvation."""
+
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                runtime.owners.research_memory.process_asset_intake_once,
+                health=health,
+                timeout_code="asset_intake_io_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
+            )
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("research asset intake failed unexpectedly")
+            error_code = (
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0.05 if advanced else 0.2)
+
+
+async def _verify_research_assets(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Advance the bounded durable verifier independently of intake latency."""
+
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                runtime.owners.research_memory.verify_asset_inventory_once,
+                health=health,
+                timeout_code="asset_verification_io_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=ASSET_WORKER_WATCHDOG_SECONDS,
+            )
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("research asset verification failed unexpectedly")
+            error_code = (
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0.05 if advanced else 0.2)
+
+
+async def _await_monitored_worker_call(
+    call: Callable[[], bool],
+    *,
+    health: ReconciliationHealth,
+    timeout_code: str,
+    on_health_change: Callable[[], None] | None,
+    timeout_seconds: float,
+) -> bool:
+    """Keep worker stalls outside the event loop and expose a watchdog.
+
+    Python cannot safely cancel a thread blocked inside an arbitrary FUSE/NFS
+    syscall. A dedicated daemon thread therefore owns exactly one operation;
+    the coroutine publishes a typed blocker after a bounded interval without
+    spawning duplicate attempts. If the mount recovers, the same durable job
+    resumes. A stuck daemon thread cannot hold process shutdown open.
+    """
+
+    operation = _daemon_thread_call(call)
+    timed_out = False
+    while True:
+        done, _pending = await asyncio.wait(
+            {operation},
+            timeout=timeout_seconds,
+        )
+        if done:
+            return operation.result()
+        if timed_out:
+            continue
+        timed_out = True
+        changed = (
+            health.status != "unavailable"
+            or health.last_error != timeout_code
+        )
+        health.status = "unavailable"
+        health.last_error = timeout_code
+        health.retry_count += 1
+        if changed and on_health_change is not None:
+            on_health_change()
+
+
+async def _await_bounded_asset_io(
+    call: Callable[[], _T],
+    *,
+    slots: asyncio.Semaphore,
+    timeout_code: str,
+) -> _T:
+    """Run a public deep-I/O operation without occupying AnyIO's thread pool."""
+
+    try:
+        await asyncio.wait_for(slots.acquire(), timeout=0.05)
+    except TimeoutError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "asset_io_busy"},
+        ) from error
+    try:
+        operation = _daemon_thread_call(call)
+    except BaseException:
+        slots.release()
+        raise
+
+    def release_slot(_completed: asyncio.Future[_T]) -> None:
+        slots.release()
+
+    operation.add_done_callback(release_slot)
+    return await _await_asset_io_operation(operation, timeout_code=timeout_code)
+
+
+class _AssetIOSingleFlight:
+    """Keep retries of one serialized Owner operation off the shared I/O slots."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._key: tuple[str, str] | None = None
+        self._operation: asyncio.Future[object] | None = None
+
+    async def run(
+        self,
+        key: tuple[str, str],
+        call: Callable[[], _T],
+        *,
+        slots: asyncio.Semaphore,
+        timeout_code: str,
+    ) -> _T:
+        async with self._lock:
+            operation = self._operation
+            if operation is not None and not operation.done():
+                if self._key != key:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "asset_custody_busy"},
+                    )
+            else:
+                try:
+                    await asyncio.wait_for(slots.acquire(), timeout=0.05)
+                except TimeoutError as error:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "asset_io_busy"},
+                    ) from error
+                try:
+                    operation = _daemon_thread_call(call)
+                except BaseException:
+                    slots.release()
+                    raise
+                self._key = key
+                self._operation = operation
+
+                def finish(completed: asyncio.Future[object]) -> None:
+                    slots.release()
+                    if self._operation is completed:
+                        self._key = None
+                        self._operation = None
+
+                operation.add_done_callback(finish)
+        return await _await_asset_io_operation(
+            operation,
+            timeout_code=timeout_code,
+        )
+
+
+async def _await_asset_io_operation(
+    operation: asyncio.Future[_T], *, timeout_code: str
+) -> _T:
+    done, _pending = await asyncio.wait(
+        {operation},
+        timeout=ASSET_ROUTE_WATCHDOG_SECONDS,
+    )
+    if done:
+        return operation.result()
+    raise HTTPException(
+        status_code=503,
+        detail={"code": timeout_code},
+    )
+
+
+def _daemon_thread_call(call: Callable[[], _T]) -> asyncio.Future[_T]:
+    loop = asyncio.get_running_loop()
+    result: asyncio.Future[_T] = loop.create_future()
+
+    def consume_late_error(completed: asyncio.Future[_T]) -> None:
+        if not completed.cancelled():
+            completed.exception()
+
+    result.add_done_callback(consume_late_error)
+
+    def deliver_value(value: _T) -> None:
+        if not result.done():
+            result.set_result(value)
+
+    def deliver_error(error: BaseException) -> None:
+        if not result.done():
+            result.set_exception(error)
+
+    def run() -> None:
+        try:
+            value = call()
+        except BaseException as error:
+            try:
+                loop.call_soon_threadsafe(deliver_error, error)
+            except RuntimeError:
+                pass
+        else:
+            try:
+                loop.call_soon_threadsafe(deliver_value, value)
+            except RuntimeError:
+                pass
+
+    threading.Thread(
+        target=run,
+        name="meta-research-worker-operation",
+        daemon=True,
+    ).start()
+    return result
+
+
 async def _process_idea_stage(
     runtime: ProductionRuntime,
     health: ReconciliationHealth,
@@ -946,7 +1787,13 @@ async def _process_idea_stage(
 
     while True:
         try:
-            advanced = await asyncio.to_thread(runtime.idea_stage.process_once)
+            advanced = await _await_monitored_worker_call(
+                runtime.idea_stage.process_once,
+                health=health,
+                timeout_code="idea_stage_operation_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=IDEA_STAGE_WORKER_WATCHDOG_SECONDS,
+            )
             transient_error = runtime.idea_stage.transient_error
             if transient_error is not None:
                 raise _IdeaStageTransientError(transient_error)
@@ -998,3 +1845,64 @@ def _log_reconciliation_exit(task: asyncio.Task[None]) -> None:
 
 def _error(status_code: int, code: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": {"code": code}})
+
+
+def _history_page(
+    rows,
+    *,
+    limit: int,
+    timestamp_field: str,
+    ref_field: str,
+) -> dict[str, object]:
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        last = page[-1]
+        next_cursor = _encode_history_cursor(
+            float(getattr(last, timestamp_field)),
+            str(getattr(last, ref_field)),
+        )
+    return {
+        "items": [item.as_public_dict() for item in page],
+        "limit": limit,
+        "has_more": len(rows) > limit,
+        "next_cursor": next_cursor,
+    }
+
+
+def _encode_history_cursor(timestamp: float, ref: str) -> str:
+    payload = json.dumps(
+        {"timestamp": timestamp, "ref": ref},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_history_cursor(cursor: str | None) -> tuple[float | None, str | None]:
+    if cursor is None:
+        return None, None
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        document = json.loads(
+            base64.b64decode(
+                cursor + padding,
+                altchars=b"-_",
+                validate=True,
+            ).decode("utf-8")
+        )
+        timestamp = document["timestamp"]
+        ref = document["ref"]
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as error:
+        raise OwnerConflict("asset_history_cursor_invalid") from error
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, (int, float))
+        or not math.isfinite(float(timestamp))
+        or not isinstance(ref, str)
+        or not ref
+        or len(ref) > 128
+        or set(document) != {"timestamp", "ref"}
+    ):
+        raise OwnerConflict("asset_history_cursor_invalid")
+    return float(timestamp), ref

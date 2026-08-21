@@ -43,6 +43,48 @@ class _StaticOwner:
         return OwnerSnapshot(self._owner, 1, self._facts)
 
 
+class _StaticResearchMemory(_StaticOwner):
+    def query_asset_inventory(self) -> tuple[()]:
+        return ()
+
+    def query_asset_custodies(
+        self, *, memory_refs: tuple[str, ...] | None = None
+    ) -> tuple[()]:
+        return ()
+
+    def query_asset_holds(
+        self,
+        *,
+        memory_refs: tuple[str, ...] | None = None,
+        limit_per_version: int | None = None,
+    ) -> tuple[()]:
+        return ()
+
+    def query_release_eligibility_assessments(
+        self,
+        *,
+        memory_refs: tuple[str, ...] | None = None,
+        limit_per_version: int | None = None,
+    ) -> tuple[()]:
+        return ()
+
+
+class _StaticResearchGraph(_StaticOwner):
+    def query_asset_roles(self) -> tuple[()]:
+        return ()
+
+    def query_asset_projection_roles(
+        self,
+        *,
+        version_refs: tuple[str, ...],
+        limit_per_version: int,
+    ) -> tuple[()]:
+        return ()
+
+    def query_asset_reference_revision(self) -> int:
+        return 1
+
+
 class _RacingResearchGraph:
     def __init__(self, feed: _MutableFeed) -> None:
         self._feed = feed
@@ -63,6 +105,20 @@ class _RacingResearchGraph:
             self._feed.revision = 2
         return snapshot
 
+    def query_asset_roles(self) -> tuple[()]:
+        return ()
+
+    def query_asset_projection_roles(
+        self,
+        *,
+        version_refs: tuple[str, ...],
+        limit_per_version: int,
+    ) -> tuple[()]:
+        return ()
+
+    def query_asset_reference_revision(self) -> int:
+        return self._feed.revision
+
 
 class _HumanCollaboration(_StaticOwner):
     def query_current_quest_creation(self) -> None:
@@ -81,7 +137,9 @@ def test_snapshot_retries_when_feed_advances_during_owner_reads(
         advancement_engine=_StaticOwner(
             "advancement_engine", {"foreground_cycle_count": 0}
         ),  # type: ignore[arg-type]
-        research_memory=_StaticOwner("research_memory", {}),  # type: ignore[arg-type]
+        research_memory=_StaticResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
         agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
         human_collaboration=_HumanCollaboration(
             "human_collaboration", {}
@@ -103,13 +161,15 @@ def test_snapshot_fails_closed_without_publishing_an_unstable_owner_cut(
     projection = PublicProjection(
         feed=feed,  # type: ignore[arg-type]
         object_store=tmp_path,
-        research_graph=_StaticOwner(
+        research_graph=_StaticResearchGraph(
             "research_graph", {"quest_count": 0, "question_count": 0}
         ),  # type: ignore[arg-type]
         advancement_engine=_StaticOwner(
             "advancement_engine", {"foreground_cycle_count": 0}
         ),  # type: ignore[arg-type]
-        research_memory=_StaticOwner("research_memory", {}),  # type: ignore[arg-type]
+        research_memory=_StaticResearchMemory(
+            "research_memory", {}
+        ),  # type: ignore[arg-type]
         agent_runtime=_StaticOwner("agent_runtime", {}),  # type: ignore[arg-type]
         human_collaboration=_HumanCollaboration(
             "human_collaboration", {}

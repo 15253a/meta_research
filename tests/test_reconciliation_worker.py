@@ -13,13 +13,209 @@ from meta_research.composition import build_production_runtime
 from meta_research.feed import DurableEvent, FeedPage
 from meta_research.paths import prepare_data_root
 from meta_research.web import (
+    _AssetIOSingleFlight,
     ReconciliationHealth,
     WorkerHealthUpdates,
+    _await_bounded_asset_io,
+    _await_monitored_worker_call,
     _event_stream,
+    _process_research_assets,
     _process_quest_drafting,
     _reconcile_quest_initializations,
     create_app,
 )
+
+
+def test_research_asset_worker_watchdog_exposes_stuck_io_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    released = threading.Event()
+    calls = 0
+
+    def process_asset_intake_once() -> bool:
+        nonlocal calls
+        calls += 1
+        started.set()
+        released.wait(timeout=2.0)
+        return False
+
+    runtime = SimpleNamespace(
+        owners=SimpleNamespace(
+            research_memory=SimpleNamespace(
+                process_asset_intake_once=process_asset_intake_once
+            )
+        )
+    )
+    health = ReconciliationHealth()
+    monkeypatch.setattr("meta_research.web.ASSET_WORKER_WATCHDOG_SECONDS", 0.03)
+
+    async def exercise() -> None:
+        worker = asyncio.create_task(_process_research_assets(runtime, health))
+        assert await asyncio.to_thread(started.wait, 0.5)
+        await asyncio.sleep(0.08)
+        assert not worker.done()
+        assert health.status == "unavailable"
+        assert health.last_error == "asset_intake_io_timeout"
+        assert calls == 1
+
+        released.set()
+        deadline = time.monotonic() + 0.8
+        while health.status != "ready" and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert health.status == "ready"
+        assert health.last_error is None
+
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    asyncio.run(exercise())
+
+
+def test_bounded_asset_route_times_out_without_releasing_a_stuck_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    released = threading.Event()
+
+    def blocking_io() -> str:
+        started.set()
+        released.wait(timeout=2.0)
+        return "accepted"
+
+    monkeypatch.setattr("meta_research.web.ASSET_ROUTE_WATCHDOG_SECONDS", 0.03)
+
+    async def exercise() -> None:
+        slots = asyncio.Semaphore(1)
+        with pytest.raises(Exception) as failure:
+            await _await_bounded_asset_io(
+                blocking_io,
+                slots=slots,
+                timeout_code="asset_command_io_timeout",
+            )
+        assert getattr(failure.value, "status_code", None) == 503
+        assert getattr(failure.value, "detail", None) == {
+            "code": "asset_command_io_timeout"
+        }
+        assert started.is_set()
+        assert slots.locked()
+
+        released.set()
+        deadline = time.monotonic() + 0.5
+        while slots.locked() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert not slots.locked()
+
+    asyncio.run(exercise())
+
+
+def test_handoff_retry_joins_single_flight_without_consuming_the_spare_io_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    released = threading.Event()
+    calls = 0
+
+    def blocking_handoff() -> str:
+        nonlocal calls
+        calls += 1
+        started.set()
+        released.wait(timeout=2.0)
+        return "managed"
+
+    monkeypatch.setattr("meta_research.web.ASSET_ROUTE_WATCHDOG_SECONDS", 0.03)
+
+    async def exercise() -> None:
+        slots = asyncio.Semaphore(2)
+        handoffs = _AssetIOSingleFlight()
+        with pytest.raises(Exception) as first_timeout:
+            await handoffs.run(
+                ("memory-1", "handoff-key"),
+                blocking_handoff,
+                slots=slots,
+                timeout_code="asset_custody_io_timeout",
+            )
+        assert getattr(first_timeout.value, "detail", None) == {
+            "code": "asset_custody_io_timeout"
+        }
+        assert started.is_set()
+
+        with pytest.raises(Exception) as retry_timeout:
+            await handoffs.run(
+                ("memory-1", "handoff-key"),
+                blocking_handoff,
+                slots=slots,
+                timeout_code="asset_custody_io_timeout",
+            )
+        assert getattr(retry_timeout.value, "detail", None) == {
+            "code": "asset_custody_io_timeout"
+        }
+        assert calls == 1
+
+        assert await _await_bounded_asset_io(
+            lambda: "unrelated-asset-io",
+            slots=slots,
+            timeout_code="unrelated_io_timeout",
+        ) == "unrelated-asset-io"
+
+        with pytest.raises(Exception) as competing_handoff:
+            await handoffs.run(
+                ("memory-2", "other-key"),
+                lambda: "must-not-start",
+                slots=slots,
+                timeout_code="asset_custody_io_timeout",
+            )
+        assert getattr(competing_handoff.value, "detail", None) == {
+            "code": "asset_custody_busy"
+        }
+        assert calls == 1
+
+        released.set()
+        deadline = time.monotonic() + 0.5
+        while slots._value != 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert slots._value == 2
+
+    asyncio.run(exercise())
+
+
+def test_worker_and_route_watchdogs_do_not_swallow_operation_timeout_errors() -> None:
+    def operation_timeout() -> bool:
+        raise TimeoutError("underlying operation timeout")
+
+    async def exercise() -> None:
+        health = ReconciliationHealth()
+        ticker_ran = False
+
+        async def ticker() -> None:
+            nonlocal ticker_ran
+            await asyncio.sleep(0.01)
+            ticker_ran = True
+
+        ticker_task = asyncio.create_task(ticker())
+        with pytest.raises(TimeoutError, match="underlying operation timeout"):
+            await _await_monitored_worker_call(
+                operation_timeout,
+                health=health,
+                timeout_code="watchdog_timeout",
+                on_health_change=None,
+                timeout_seconds=0.03,
+            )
+        await ticker_task
+        assert ticker_ran
+        assert health.status == "ready"
+
+        slots = asyncio.Semaphore(1)
+        with pytest.raises(TimeoutError, match="underlying operation timeout"):
+            await _await_bounded_asset_io(
+                operation_timeout,
+                slots=slots,
+                timeout_code="route_watchdog_timeout",
+            )
+        assert not slots.locked()
+
+    asyncio.run(exercise())
 
 
 def test_reconciliation_worker_is_non_blocking_and_recovers_after_io_failure() -> None:

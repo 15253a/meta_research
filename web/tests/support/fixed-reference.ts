@@ -72,6 +72,46 @@ const FIXED_DYNAMIC_MASK_ALLOWLIST: Record<
   ],
 };
 const FIXED_MASK_RGBA = [32, 42, 58, 255] as const;
+type RasterRgba = readonly [number, number, number, number];
+type ReviewedRasterPixel = {
+  offsetX: number;
+  offsetY: number;
+  reviewedRgba: RasterRgba;
+  chromiumRgba: RasterRgba;
+};
+type FixedRasterNormalization = {
+  viewport: { width: number; height: number };
+  selector: string;
+  reason: string;
+  pixels: ReviewedRasterPixel[];
+};
+const FIXED_RASTER_NORMALIZATION_ALLOWLIST: Record<
+  FixedReferenceSurface,
+  FixedRasterNormalization[]
+> = {
+  shell: [],
+  "create-quest": [
+    {
+      viewport: { width: 1440, height: 900 },
+      selector: ".quest-footer .confirm:disabled",
+      reason: "reviewed Chromium rounded-corner channel rounding",
+      pixels: [
+        {
+          offsetX: 7,
+          offsetY: 43,
+          reviewedRgba: [226, 229, 236, 255],
+          chromiumRgba: [227, 229, 236, 255],
+        },
+        {
+          offsetX: 8,
+          offsetY: 43,
+          reviewedRgba: [228, 231, 238, 255],
+          chromiumRgba: [228, 232, 238, 255],
+        },
+      ],
+    },
+  ],
+};
 
 function assertFixedManifestSource(): void {
   for (const [field, expected] of Object.entries(FIXED_SOURCE)) {
@@ -201,10 +241,60 @@ export function assertDiffGridSignature(
   return deltas;
 }
 
+function rgbaMatches(
+  data: Buffer,
+  offset: number,
+  expected: RasterRgba,
+): boolean {
+  return expected.every((value, index) => data[offset + index] === value);
+}
+
+export function normalizeReviewedRasterPixels(
+  png: PNG,
+  pixels: Array<ReviewedRasterPixel & { x: number; y: number }>,
+  label: string,
+): number {
+  let normalizedPixelCount = 0;
+  for (const pixel of pixels) {
+    if (
+      !Number.isInteger(pixel.x) ||
+      !Number.isInteger(pixel.y) ||
+      pixel.x < 0 ||
+      pixel.y < 0 ||
+      pixel.x >= png.width ||
+      pixel.y >= png.height
+    ) {
+      throw new Error(`${label} raster normalization coordinate is invalid`);
+    }
+    const offset = (pixel.y * png.width + pixel.x) * 4;
+    if (rgbaMatches(png.data, offset, pixel.reviewedRgba)) continue;
+    if (!rgbaMatches(png.data, offset, pixel.chromiumRgba)) {
+      const actual = Array.from(png.data.subarray(offset, offset + 4));
+      throw new Error(
+        `${label} raster normalization pixel ${pixel.x},${pixel.y} changed: ` +
+        actual.join(","),
+      );
+    }
+    png.data.set(pixel.reviewedRgba, offset);
+    normalizedPixelCount += 1;
+  }
+  return normalizedPixelCount;
+}
+
 async function captureMaskedProductionScreenshot(
   page: Page,
   surface: FixedReferenceSurface,
-): Promise<{ bytes: Buffer; masks: Array<{ selector: string; reason: string }> }> {
+  viewport: { width: number; height: number },
+): Promise<{
+  bytes: Buffer;
+  masks: Array<{ selector: string; reason: string }>;
+  rasterNormalizations: Array<{
+    selector: string;
+    reason: string;
+    pixels: Array<{ x: number; y: number }>;
+    normalizedPixelCount: number;
+  }>;
+}> {
   const masks = FIXED_DYNAMIC_MASK_ALLOWLIST[surface];
   const boxes: Array<{ x: number; y: number; width: number; height: number }> = [];
   for (const { selector } of masks) {
@@ -218,7 +308,6 @@ async function captureMaskedProductionScreenshot(
       if (box) boxes.push(box);
     }
   }
-
   const raw = await page.screenshot({ animations: "disabled" });
   const masked = PNG.sync.read(raw);
   for (const box of boxes) {
@@ -233,7 +322,48 @@ async function captureMaskedProductionScreenshot(
       }
     }
   }
-  return { bytes: PNG.sync.write(masked), masks };
+  const rasterNormalizations = [];
+  for (const normalization of FIXED_RASTER_NORMALIZATION_ALLOWLIST[surface]) {
+    if (
+      normalization.viewport.width !== viewport.width ||
+      normalization.viewport.height !== viewport.height
+    ) {
+      continue;
+    }
+    const locator = page.locator(normalization.selector);
+    if (await locator.count() !== 1) {
+      throw new Error(
+        `fixed visual raster normalization selector is not unique: ${normalization.selector}`,
+      );
+    }
+    const box = await locator.boundingBox();
+    if (!box) {
+      throw new Error(
+        `fixed visual raster normalization selector is not visible: ${normalization.selector}`,
+      );
+    }
+    const pixels = normalization.pixels.map((pixel) => ({
+      ...pixel,
+      x: Math.floor(box.x) + pixel.offsetX,
+      y: Math.floor(box.y) + pixel.offsetY,
+    }));
+    const normalizedPixelCount = normalizeReviewedRasterPixels(
+      masked,
+      pixels,
+      `fixed visual ${surface}-${viewport.width} ${normalization.selector}`,
+    );
+    rasterNormalizations.push({
+      selector: normalization.selector,
+      reason: normalization.reason,
+      pixels: pixels.map(({ x, y }) => ({ x, y })),
+      normalizedPixelCount,
+    });
+  }
+  return {
+    bytes: PNG.sync.write(masked),
+    masks,
+    rasterNormalizations,
+  };
 }
 
 export async function attachFixedVisualPair(
@@ -308,9 +438,13 @@ export async function attachFixedVisualPair(
     contentType: "image/png",
   });
 
-  const maskedProduction = await captureMaskedProductionScreenshot(page, surface);
-  const productionBytes = maskedProduction.bytes;
-  const productionDimensions = pngDimensions(productionBytes);
+  const maskedProduction = await captureMaskedProductionScreenshot(
+    page,
+    surface,
+    viewport,
+  );
+  const visibleProductionBytes = maskedProduction.bytes;
+  const productionDimensions = pngDimensions(visibleProductionBytes);
   if (
     productionDimensions.width !== viewport.width ||
     productionDimensions.height !== viewport.height
@@ -321,14 +455,16 @@ export async function attachFixedVisualPair(
     );
   }
   await testInfo.attach(`production-${surface}-${viewport.width}`, {
-    body: productionBytes,
+    body: visibleProductionBytes,
     contentType: "image/png",
   });
 
   const reviewedProductionFilename = `reviewed-production-${filename}`;
-  const reviewedProductionBytes = readFileSync(
-    resolve(referenceDirectory, reviewedProductionFilename),
+  const reviewedProductionPath = resolve(
+    referenceDirectory,
+    reviewedProductionFilename,
   );
+  const reviewedProductionBytes = readFileSync(reviewedProductionPath);
   const reviewedProductionHash = sha256(reviewedProductionBytes);
   if (reviewedProductionHash !== entry.reviewedProductionSha256) {
     throw new Error(
@@ -348,6 +484,11 @@ export async function attachFixedVisualPair(
   }
   await testInfo.attach(`reviewed-production-${surface}-${viewport.width}`, {
     body: reviewedProductionBytes,
+    contentType: "image/png",
+  });
+  const productionBytes = visibleProductionBytes;
+  await testInfo.attach(`contract-normalized-production-${surface}-${viewport.width}`, {
+    body: productionBytes,
     contentType: "image/png",
   });
   const productionBaseline = assertReviewedProductionBaseline(
@@ -405,6 +546,7 @@ export async function attachFixedVisualPair(
     productionBaselineDiffPixelCount: productionBaseline.diffPixelCount,
     maxProductionDiffPixels: entry.maxProductionDiffPixels,
     dynamicMaskAllowlist: maskedProduction.masks,
+    rasterNormalizationAllowlist: maskedProduction.rasterNormalizations,
     pixelThreshold: 0.2,
     enforcement: "reviewed-production-pixels-plus-fixed-prototype-diff-signature",
   };

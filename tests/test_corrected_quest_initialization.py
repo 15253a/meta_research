@@ -1551,7 +1551,7 @@ def test_public_draft_rejects_non_finite_nested_material_bindings(
         runtime.close()
 
 
-def test_public_v2_rejects_undelivered_material_basis_before_persisting_it(
+def test_public_v2_rejects_unverifiable_material_binding_before_persisting_it(
     tmp_path: Path,
 ) -> None:
     adapter = DeterministicDraftingAdapter()
@@ -1590,8 +1590,7 @@ def test_public_v2_rejects_undelivered_material_basis_before_persisting_it(
 
             assert rejected.status_code == 409
             assert rejected.json()["detail"] == {
-                "code": "research_memory_asset_intake_not_delivered",
-                "status": "capability_unavailable",
+                "code": "accepted_material_bindings_invalid"
             }
             current = client.get(
                 f"/api/v1/quest-initializations/{opened['initialization_id']}"
@@ -1884,7 +1883,7 @@ def test_owner_rejects_an_intent_reply_over_the_shared_length_limit(
         runtime.close()
 
 
-def test_succeeded_proposal_job_does_not_repeat_provider_after_preview_crash(
+def test_succeeded_proposal_job_survives_preview_failure_without_provider_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     adapter = DeterministicDraftingAdapter()
@@ -1928,9 +1927,9 @@ def test_succeeded_proposal_job_does_not_repeat_provider_after_preview_crash(
         monkeypatch.setattr(hc, "_auto_refresh_preview", crash_preview)
         with pytest.raises(RuntimeError, match="simulated preview crash"):
             hc.process_drafting_once()
-        after_crash = hc.query_quest_creation(saved["initialization_id"])
-        assert after_crash["proposal_generation"]["status"] == "succeeded"
-        assert after_crash["proposal"] is not None
+        after_provider = hc.query_quest_creation(saved["initialization_id"])
+        assert after_provider["proposal_generation"]["status"] == "succeeded"
+        assert after_provider["proposal"] is not None
         assert adapter.draft_calls == 1
 
         monkeypatch.setattr(hc, "_auto_refresh_preview", original_preview)
@@ -1938,6 +1937,49 @@ def test_succeeded_proposal_job_does_not_repeat_provider_after_preview_crash(
         settled = hc.query_quest_creation(saved["initialization_id"])
         assert settled["status"] == "proposal_ready"
         assert adapter.draft_calls == 1
+    finally:
+        runtime.close()
+
+
+def test_succeeded_intent_job_survives_preview_failure_without_provider_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = DeterministicDraftingAdapter()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "intent-preview-boundary"),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    hc = runtime.owners.human_collaboration
+    try:
+        opened = hc.create_quest({}, "intent-preview-boundary-open")
+        hc.send_intent_message(
+            opened["initialization_id"],
+            expected_draft_revision=opened["quest_draft"]["revision"],
+            expected_draft_hash=opened["quest_draft"]["hash"],
+            message="Provider receipt 形成后，本轮立即结束。",
+            idempotency_key="intent-preview-boundary-message",
+        )
+        original_preview = hc._auto_refresh_preview  # type: ignore[attr-defined]
+        monkeypatch.setattr(
+            hc,
+            "_auto_refresh_preview",
+            lambda _initialization_id: (_ for _ in ()).throw(
+                RuntimeError("preview must run on a later pass")
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="preview must run on a later pass"):
+            hc.process_drafting_once()
+        turn = hc.query_quest_creation(opened["initialization_id"])[
+            "intent_session"
+        ]["turns"][0]
+        assert turn["assistant_status"] == "completed"
+        assert len(adapter.intent_requests) == 1
+        monkeypatch.setattr(hc, "_auto_refresh_preview", original_preview)
+        assert not hc.process_drafting_once()
+        assert len(adapter.intent_requests) == 1
     finally:
         runtime.close()
 

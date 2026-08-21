@@ -16,33 +16,33 @@
       "surface": "shell",
       "viewport": { "width": 1440, "height": 1000 },
       "sha256": "4e5c63d98f2f1faf35e7ec8f2119060038eea730ada324586605cd6fcbbc6d69",
-      "expectedDiffPixelRatio": 0.08039097222222222,
+      "expectedDiffPixelRatio": 0.08032986111111111,
       "maxDiffPixelRatioDelta": 0.003,
-      "expectedDiffGrid": [0.061678, 0.082122, 0.005856, 0.059133, 0.047056, 0.132222, 0.041467, 0.190289, 0.087778, 0.048267, 0.2852, 0.021233, 0.032289, 0.076633, 0.076378, 0.038656],
+      "expectedDiffGrid": [0.061667, 0.082122, 0.005856, 0.059133, 0.047056, 0.132222, 0.041467, 0.190289, 0.087778, 0.048267, 0.284233, 0.021233, 0.032289, 0.076633, 0.076378, 0.038656],
       "maxGridCellDelta": 0.006,
-      "reviewedProductionSha256": "78d1170a772e275f1ff1814418547733199582b19b32a71373981f68a58e2cc7",
+      "reviewedProductionSha256": "5e5185745d5d317dbabc30eb2d5cec8addce1e5c4486649d084dd7c7a6d9c7b6",
       "maxProductionDiffPixels": 0
     },
     "shell-800.png": {
       "surface": "shell",
       "viewport": { "width": 800, "height": 1000 },
       "sha256": "b4374a9559648660b53a79c0e3c6fbe74b744a6026be4005f26c0a7841f64b1a",
-      "expectedDiffPixelRatio": 0.0789475,
+      "expectedDiffPixelRatio": 0.07881625,
       "maxDiffPixelRatioDelta": 0.003,
-      "expectedDiffGrid": [0.0405, 0.11358, 0.03384, 0.02688, 0.03694, 0.05988, 0.14126, 0.01886, 0.08704, 0.05318, 0.0198, 0.0214, 0.0842, 0.23764, 0.19818, 0.08998],
+      "expectedDiffGrid": [0.04048, 0.11358, 0.03384, 0.02688, 0.03694, 0.05988, 0.14126, 0.01886, 0.08704, 0.05318, 0.0198, 0.0214, 0.0842, 0.23764, 0.19818, 0.0879],
       "maxGridCellDelta": 0.006,
-      "reviewedProductionSha256": "1a30dcaaaffff61f124f555e6e70179111d0ca96692b37ca120fcbb223517c0d",
+      "reviewedProductionSha256": "100980a5bd37f4127cd31d7dcb8634fadb718a69770c15fa73e25f4b4433bd0e",
       "maxProductionDiffPixels": 0
     },
     "shell-390.png": {
       "surface": "shell",
       "viewport": { "width": 390, "height": 844 },
       "sha256": "a59647e5de0892d6880e1e7a40706d78fc1565d6d5db2e7d7389859f1d29e53d",
-      "expectedDiffPixelRatio": 0.13027706890266133,
+      "expectedDiffPixelRatio": 0.13039251427877022,
       "maxDiffPixelRatioDelta": 0.003,
-      "expectedDiffGrid": [0.237944, 0.075201, 0.043387, 0.021327, 0.106806, 0.17758, 0.17218, 0.035738, 0.187766, 0.082358, 0.14091, 0.093674, 0.138858, 0.241416, 0.261299, 0.07051],
+      "expectedDiffGrid": [0.237944, 0.076458, 0.043387, 0.021327, 0.106806, 0.17758, 0.17218, 0.035738, 0.187766, 0.082358, 0.14091, 0.093674, 0.138858, 0.241416, 0.263839, 0.068575],
       "maxGridCellDelta": 0.006,
-      "reviewedProductionSha256": "98a0bee25f1464eaf98655aa62aa528e7dae27db0a347e73a4d6e43265584b67",
+      "reviewedProductionSha256": "c9fa0352d462cbe24bd5cc4bf76be5a9bd86ef2200ab992980bdb2b69e359a26",
       "maxProductionDiffPixels": 0
     },
     "create-quest-1440.png": {
@@ -53,7 +53,7 @@
       "maxDiffPixelRatioDelta": 0.003,
       "expectedDiffGrid": [0.071185, 0.010346, 0.003358, 0.147235, 0.073889, 0.025975, 0.000519, 0.122185, 0.043963, 0.019568, 0.031062, 0.092901, 0.024395, 0.08837, 0.076494, 0.227728],
       "maxGridCellDelta": 0.006,
-      "reviewedProductionSha256": "3d9c84ae5471f365f93abec43ff250570035de46a9a48b48ede2d795714d8d52",
+      "reviewedProductionSha256": "ac28a99e0719125ed576bdb61d5ceb4d40fc0a2dd83f169f61647687dad8a50f",
       "maxProductionDiffPixels": 0
     },
     "create-quest-800.png": {

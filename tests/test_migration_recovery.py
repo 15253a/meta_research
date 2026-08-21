@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -423,7 +424,7 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert version == ("0004_idea_stage",)
+    assert version == ("0006_research_asset_recovery",)
     assert "formal_content_count" in columns
     assert "hc_quest_initializations" in tables
     assert "hc_proposal_generation_attempts" in tables
@@ -490,7 +491,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0004_idea_stage",)
+        ).fetchone() == ("0006_research_asset_recovery",)
 
 
 def test_process_exit_mid_0003_ddl_recovers_on_the_next_upgrade(
@@ -550,7 +551,7 @@ upgrade_database(Path(sys.argv[1]))
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0004_idea_stage",)
+        ).fetchone() == ("0006_research_asset_recovery",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -672,7 +673,7 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 ("d" * 64,),
             )
 
-    assert version == ("0004_idea_stage",)
+    assert version == ("0006_research_asset_recovery",)
     assert feed == ("legacy.event", '{"kept":true}', 17.0)
     assert auth == ("a" * 64, "b" * 64, 18.0, 1800.0, None)
     assert initialization == (
@@ -764,9 +765,604 @@ def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0004_idea_stage",)
+        ).fetchone() == ("0006_research_asset_recovery",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+
+def test_interrupted_0005_rolls_back_and_converges_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "interrupted-0005.sqlite3"
+    _upgrade_to_revision(database, "0004_idea_stage")
+    original_create_table = Operations.create_table
+    failed_once = False
+
+    def fail_after_intake_table(self, table_name, *args, **kwargs):
+        nonlocal failed_once
+        created = original_create_table(self, table_name, *args, **kwargs)
+        if table_name == "rm_asset_intakes" and not failed_once:
+            failed_once = True
+            raise OSError("injected 0005 migration interruption")
+        return created
+
+    monkeypatch.setattr(Operations, "create_table", fail_after_intake_table)
+    with pytest.raises(OSError, match="injected 0005 migration interruption"):
+        upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0004_idea_stage",)
+        rm_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(research_memory_state)"
+            )
+        }
+        rg_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(research_graph_state)"
+            )
+        }
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert "asset_version_count" not in rm_columns
+    assert "asset_role_count" not in rg_columns
+    assert "rm_assets" not in tables
+    assert "rm_asset_versions" not in tables
+    assert "rm_asset_intakes" not in tables
+
+    monkeypatch.setattr(Operations, "create_table", original_create_table)
+    upgrade_database(database)
+    upgrade_database(database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0006_research_asset_recovery",)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+
+def test_0005_backfills_existing_rm_contents_without_changing_identity_or_receipts(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "upgrade-from-0004.sqlite3"
+    _upgrade_to_revision(database, "0004_idea_stage")
+    formal_value = {"schema_ref": "legacy-question", "title": "kept exactly"}
+    formal_json = json.dumps(
+        formal_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    formal_hash = canonical_hash(formal_value)
+    idea_value = {
+        "schema_ref": "legacy-idea",
+        "outcome": {"kind": "no_viable_candidate"},
+    }
+    idea_json = json.dumps(
+        idea_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    idea_hash = canonical_hash(idea_value)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO rm_formal_question_contents "
+            "(content_ref, initialization_id, quest_ref, quest_receipt_ref, "
+            "quest_receipt_hash, proposal_ref, proposal_hash, confirmation_ref, "
+            "confirmation_hash, content_hash, schema_ref, content_json, "
+            "object_path, receipt_ref, receipt_hash, accepted_at) VALUES "
+            "('question_content_kept', 'quest_init_kept', 'quest_kept', "
+            "'quest_receipt_kept', ?, 'proposal_kept', ?, 'confirmation_kept', "
+            "?, ?, 'meta-research/formal-question-content/v1', ?, "
+            "'formal-question-content/aa/kept.json', "
+            "'rm_question_receipt_kept', ?, 41.0)",
+            (
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                formal_hash,
+                formal_json,
+                "4" * 64,
+            ),
+        )
+        # Foreign-key parents are irrelevant to this lossless RM transform.  The
+        # legacy row itself is the migration input under test.
+        connection.execute(
+            "INSERT INTO rm_idea_outcome_contents "
+            "(content_ref, request_ref, run_ref, attempt_ref, fence_ref, "
+            "submission_ref, outcome_kind, outcome_json, outcome_hash, "
+            "reviewed_draft_json, reviewed_draft_hash, review_json, review_hash, "
+            "payload_json, payload_hash, object_path, execution_receipt_ref, "
+            "execution_receipt_hash, receipt_ref, receipt_hash, accepted_at) "
+            "VALUES ('idea_content_kept', 'request_kept', 'run_kept', "
+            "'attempt_kept', 'fence_kept', 'submission_kept', "
+            "'no_viable_candidate', '{}', ?, '{}', ?, '{}', ?, ?, ?, "
+            "'idea-outcome-content/bb/kept.json', 'execution_receipt_kept', ?, "
+            "'rm_idea_receipt_kept', ?, 42.0)",
+            (
+                "5" * 64,
+                "6" * 64,
+                "7" * 64,
+                idea_json,
+                idea_hash,
+                "8" * 64,
+                "9" * 64,
+            ),
+        )
+        connection.commit()
+
+    upgrade_database(database)
+    upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0006_research_asset_recovery",)
+        original_formal = connection.execute(
+            "SELECT content_ref, content_hash, object_path, receipt_ref, "
+            "receipt_hash FROM rm_formal_question_contents"
+        ).fetchone()
+        original_idea = connection.execute(
+            "SELECT content_ref, payload_hash, object_path, receipt_ref, "
+            "receipt_hash FROM rm_idea_outcome_contents"
+        ).fetchone()
+        versions = connection.execute(
+            "SELECT version_ref, asset_ref, version_number, content_hash, "
+            "acceptance_kind, receipt_ref, receipt_hash, manifest_json "
+            "FROM rm_asset_versions ORDER BY accepted_at"
+        ).fetchall()
+        custodies = connection.execute(
+            "SELECT version_ref, custody_mode, receipt_ref, receipt_hash "
+            "FROM rm_asset_custodies ORDER BY version_ref"
+        ).fetchall()
+        counters = connection.execute(
+            "SELECT asset_count, asset_version_count, object_count "
+            "FROM research_memory_state "
+            "WHERE singleton = 'owner'"
+        ).fetchone()
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+    assert original_formal == (
+        "question_content_kept",
+        formal_hash,
+        "formal-question-content/aa/kept.json",
+        "rm_question_receipt_kept",
+        "4" * 64,
+    )
+    assert original_idea == (
+        "idea_content_kept",
+        idea_hash,
+        "idea-outcome-content/bb/kept.json",
+        "rm_idea_receipt_kept",
+        "9" * 64,
+    )
+    assert [row[:7] for row in versions] == [
+        (
+            "question_content_kept",
+            "question_content_kept",
+            1,
+            formal_hash,
+            "question_content_acceptance",
+            "rm_question_receipt_kept",
+            "4" * 64,
+        ),
+        (
+            "idea_content_kept",
+            "idea_content_kept",
+            1,
+            idea_hash,
+            "idea_outcome_content_acceptance",
+            "rm_idea_receipt_kept",
+            "9" * 64,
+        ),
+    ]
+    assert json.loads(versions[0][7])["entries"][0]["object_path"] == (
+        "formal-question-content/aa/kept.json"
+    )
+    assert json.loads(versions[1][7])["entries"][0]["object_path"] == (
+        "idea-outcome-content/bb/kept.json"
+    )
+    assert custodies == [
+        (
+            "idea_content_kept",
+            "managed",
+            "rm_idea_receipt_kept",
+            "9" * 64,
+        ),
+        (
+            "question_content_kept",
+            "managed",
+            "rm_question_receipt_kept",
+            "4" * 64,
+        ),
+    ]
+    assert counters == (2, 2, 2)
+
+
+def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "upgrade-from-existing-0005.sqlite3"
+    _upgrade_to_revision(database, "0005_research_assets")
+    payload = b"accepted before migration 0006\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    object_path = f"assets/{digest[:2]}/{digest}"
+    manifest = {
+        "schema_ref": "meta-research/asset-manifest/v1",
+        "kind": "file",
+        "entries": [
+            {
+                "path": "pre-0006.txt",
+                "sha256": digest,
+                "size": len(payload),
+                "object_path": object_path,
+            }
+        ],
+    }
+    manifest_json = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    inline_request = {
+        "asset_ref": None,
+        "asynchronous": True,
+        "content_base64": "YmlnLXBheWxvYWQ=",
+        "custody_mode": "managed",
+        "display_name": "payload.txt",
+        "media_type": "text/plain",
+        "provenance": {},
+        "source_kind": "file",
+        "source_locator": None,
+    }
+    inline_request_json = json.dumps(
+        inline_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    locator_request = {
+        **inline_request,
+        "content_base64": None,
+        "custody_mode": "linked_local",
+        "display_name": "linked.txt",
+        "source_kind": "local_path",
+        "source_locator": "/absolute/legacy/source.txt",
+    }
+    locator_request_json = json.dumps(
+        locator_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0005_research_assets",)
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rm_managed_objects'"
+        ).fetchone() is None
+        connection.execute(
+            "INSERT INTO rm_assets (asset_ref, created_at) VALUES "
+            "('asset_pre_0006', 51.0)"
+        )
+        connection.execute(
+            "INSERT INTO rm_asset_versions (version_ref, asset_ref, "
+            "version_number, source_kind, display_name, media_type, content_hash, "
+            "manifest_json, manifest_hash, byte_count, provenance_json, "
+            "provenance_hash, acceptance_kind, receipt_ref, receipt_hash, "
+            "accepted_at) VALUES ('asset_version_pre_0006', 'asset_pre_0006', 1, "
+            "'text', 'pre-0006.txt', 'text/plain', ?, ?, ?, ?, '{}', ?, "
+            "'asset_acceptance', 'receipt_pre_0006', ?, 51.0)",
+            (
+                digest,
+                manifest_json,
+                canonical_hash(manifest),
+                len(payload),
+                canonical_hash({}),
+                "a" * 64,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO rm_asset_custodies (custody_ref, version_ref, "
+            "custody_mode, source_locator, receipt_kind, receipt_ref, "
+            "receipt_hash, established_at) VALUES ('custody_pre_0006', "
+            "'asset_version_pre_0006', 'managed', NULL, 'asset_acceptance', "
+            "'receipt_pre_0006', ?, 51.0)",
+            ("a" * 64,),
+        )
+        for job_ref, request_json in (
+            ("job_legacy_inline", inline_request_json),
+            ("job_legacy_locator", locator_request_json),
+        ):
+            connection.execute(
+                "INSERT INTO rm_asset_intakes (job_ref, idempotency_key, "
+                "request_json, request_hash, status, failure_code, attempt_count, "
+                "completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, "
+                "'failed', 'legacy_failure', 1, 51.0, 50.0, 51.0)",
+                (
+                    job_ref,
+                    f"key_{job_ref}",
+                    request_json,
+                    hashlib.sha256(request_json.encode("utf-8")).hexdigest(),
+                ),
+            )
+        connection.commit()
+
+    upgrade_database(database)
+    upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0006_research_asset_recovery",)
+        assert connection.execute(
+            "SELECT object_path, content_hash, byte_count FROM "
+            "rm_managed_objects"
+        ).fetchone() == (object_path, digest, len(payload))
+        assert connection.execute(
+            "SELECT object_count FROM research_memory_state WHERE singleton = "
+            "'owner'"
+        ).fetchone() == (1,)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {
+            "rm_asset_repair_commands",
+            "rm_asset_verification_observations",
+            "rm_asset_verification_state",
+            "rg_asset_role_commands",
+        } <= tables
+        assert connection.execute(
+            "SELECT integrity, availability, next_verify_at FROM "
+            "rm_asset_verification_observations WHERE version_ref = "
+            "'asset_version_pre_0006'"
+        ).fetchone() == ("unknown", "unknown", 0.0)
+        inline_stored = connection.execute(
+            "SELECT request_json, request_source_kind, request_custody_mode, "
+            "request_payload_scrubbed FROM rm_asset_intakes WHERE job_ref = "
+            "'job_legacy_inline'"
+        ).fetchone()
+        assert inline_stored == (
+            '{"custody_mode":"managed","payload_scrubbed":true,'
+            '"source_kind":"file"}',
+            "file",
+            "managed",
+            1,
+        )
+        locator_stored = connection.execute(
+            "SELECT request_json, request_payload_scrubbed FROM "
+            "rm_asset_intakes WHERE job_ref = 'job_legacy_locator'"
+        ).fetchone()
+        assert locator_stored == (
+            '{"custody_mode":"linked_local","payload_scrubbed":true,'
+            '"source_kind":"local_path"}',
+            1,
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+
+def test_0006_preserves_0005_linked_and_nonportable_asset_facts_fail_closed(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "legacy-asset-compatibility")
+    _upgrade_to_revision(data_root.database, "0005_research_assets")
+    linked_source = tmp_path / "legacy-linked.txt"
+    linked_payload = b"linked bytes accepted by the 0005 contract\n"
+    linked_source.write_bytes(linked_payload)
+    managed_payload = b"managed bytes with a nonportable historical name\n"
+
+    def accepted_asset_values(
+        *,
+        suffix: str,
+        payload: bytes,
+        custody_mode: str,
+        path: str,
+        object_path: str | None,
+        source_locator: str | None,
+    ) -> dict[str, object]:
+        asset_ref = f"asset_legacy_{suffix}"
+        version_ref = f"asset_version_legacy_{suffix}"
+        digest = hashlib.sha256(payload).hexdigest()
+        manifest = {
+            "schema_ref": "meta-research/asset-manifest/v1",
+            "kind": "file",
+            "entries": [
+                {
+                    "path": path,
+                    "sha256": digest,
+                    "size": len(payload),
+                    "object_path": object_path,
+                }
+            ],
+        }
+        provenance = {"source_kind": "local_path"}
+        manifest_json = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        provenance_json = json.dumps(
+            provenance, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        bindings = {
+            "asset_ref": asset_ref,
+            "version_number": 1,
+            "source_kind": "local_path",
+            "display_name": path,
+            "media_type": "text/plain",
+            "content_hash": digest,
+            "manifest_hash": canonical_hash(manifest),
+            "byte_count": len(payload),
+            "provenance_hash": canonical_hash(provenance),
+            "custody_modes": [custody_mode],
+        }
+        receipt_hash = canonical_hash(
+            {
+                "schema_ref": "meta-research/owner-acceptance-receipt/v1",
+                "issuer": "research_memory",
+                "kind": "asset_acceptance",
+                "subject_ref": version_ref,
+                "bindings": bindings,
+            }
+        )
+        return {
+            **bindings,
+            "version_ref": version_ref,
+            "manifest_json": manifest_json,
+            "provenance_json": provenance_json,
+            "receipt_ref": f"receipt_legacy_{suffix}",
+            "receipt_hash": receipt_hash,
+            "custody_ref": f"custody_legacy_{suffix}",
+            "custody_mode": custody_mode,
+            "source_locator": source_locator,
+        }
+
+    linked = accepted_asset_values(
+        suffix="linked",
+        payload=linked_payload,
+        custody_mode="linked_local",
+        path=linked_source.name,
+        object_path=None,
+        source_locator=str(linked_source.resolve()),
+    )
+    managed_object_path = (
+        f"assets/{hashlib.sha256(managed_payload).hexdigest()[:2]}/"
+        f"{hashlib.sha256(managed_payload).hexdigest()}"
+    )
+    managed = accepted_asset_values(
+        suffix="managed",
+        payload=managed_payload,
+        custody_mode="managed",
+        path="C:poison.txt",
+        object_path=managed_object_path,
+        source_locator=None,
+    )
+    managed_path = data_root.objects / managed_object_path
+    managed_path.parent.mkdir(parents=True, exist_ok=True)
+    managed_path.write_bytes(managed_payload)
+    with sqlite3.connect(data_root.database) as connection:
+        for accepted in (linked, managed):
+            connection.execute(
+                "INSERT INTO rm_assets (asset_ref, created_at) VALUES (?, 51.0)",
+                (accepted["asset_ref"],),
+            )
+            connection.execute(
+                "INSERT INTO rm_asset_versions (version_ref, asset_ref, "
+                "version_number, source_kind, display_name, media_type, "
+                "content_hash, manifest_json, manifest_hash, byte_count, "
+                "provenance_json, provenance_hash, acceptance_kind, receipt_ref, "
+                "receipt_hash, accepted_at) VALUES (?, ?, 1, 'local_path', ?, "
+                "'text/plain', ?, ?, ?, ?, ?, ?, 'asset_acceptance', ?, ?, 51.0)",
+                (
+                    accepted["version_ref"],
+                    accepted["asset_ref"],
+                    accepted["display_name"],
+                    accepted["content_hash"],
+                    accepted["manifest_json"],
+                    accepted["manifest_hash"],
+                    accepted["byte_count"],
+                    accepted["provenance_json"],
+                    accepted["provenance_hash"],
+                    accepted["receipt_ref"],
+                    accepted["receipt_hash"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO rm_asset_custodies (custody_ref, version_ref, "
+                "custody_mode, source_locator, receipt_kind, receipt_ref, "
+                "receipt_hash, established_at) VALUES (?, ?, ?, ?, "
+                "'asset_acceptance', ?, ?, 51.0)",
+                (
+                    accepted["custody_ref"],
+                    accepted["version_ref"],
+                    accepted["custody_mode"],
+                    accepted["source_locator"],
+                    accepted["receipt_ref"],
+                    accepted["receipt_hash"],
+                ),
+            )
+        legacy_linked_request = {
+            "asset_ref": None,
+            "asynchronous": False,
+            "content_base64": None,
+            "custody_mode": "linked_local",
+            "display_name": linked_source.name,
+            "media_type": "text/plain",
+            "provenance": {},
+            "source_kind": "local_path",
+            "source_locator": str(linked_source.resolve()),
+        }
+        legacy_linked_request_json = json.dumps(
+            legacy_linked_request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        connection.execute(
+            "INSERT INTO rm_asset_intakes (job_ref, idempotency_key, "
+            "request_json, request_hash, status, asset_ref, version_ref, "
+            "attempt_count, completed_at, created_at, updated_at) VALUES "
+            "('job_legacy_linked', 'key_legacy_linked', ?, ?, 'accepted', ?, ?, "
+            "1, 51.0, 50.0, 51.0)",
+            (
+                legacy_linked_request_json,
+                hashlib.sha256(
+                    legacy_linked_request_json.encode("utf-8")
+                ).hexdigest(),
+                linked["asset_ref"],
+                linked["version_ref"],
+            ),
+        )
+        connection.execute(
+            "UPDATE research_memory_state SET asset_count = 2, "
+            "asset_version_count = 2 WHERE singleton = 'owner'"
+        )
+        connection.commit()
+
+    upgrade_database(data_root.database)
+    runtime = build_production_runtime(data_root)
+    try:
+        projected = runtime.projection.query_snapshot()["research_assets"]
+        assert {item["memory_ref"] for item in projected["items"]} == {
+            linked["version_ref"],
+            managed["version_ref"],
+        }
+        assert all(item["verification_pending"] for item in projected["items"])
+        inventory = {
+            item.memory_ref: item
+            for item in runtime.owners.research_memory.query_asset_inventory()
+        }
+        assert (
+            inventory[str(linked["version_ref"])].integrity,
+            inventory[str(linked["version_ref"])].availability,
+        ) == ("verified", "available")
+        assert (
+            inventory[str(managed["version_ref"])].integrity,
+            inventory[str(managed["version_ref"])].availability,
+        ) == ("verified", "available")
+        linked_custody = runtime.owners.research_memory.query_asset_custodies(
+            str(linked["version_ref"])
+        )[0]
+        assert linked_custody.source_locator == str(linked_source.resolve())
+        assert linked_custody.locator_receipted is True
+        assert linked_custody.receipt.kind == "asset_acceptance"
+        assert linked_custody.established_at == 51.0
+        assert linked_custody.locator_receipt is not None
+        assert linked_custody.locator_receipt.kind == (
+            "asset_custody_locator_migrated"
+        )
+        assert linked_custody.locator_bound_at is not None
+        assert linked_custody.locator_bound_at > linked_custody.established_at
+        assert runtime.owners.research_memory.materialize_asset(
+            str(linked["version_ref"])
+        ).content == linked_payload
+        with pytest.raises(
+            OwnerConflict, match="asset_materialization_unsupported"
+        ):
+            runtime.owners.research_memory.materialize_asset(
+                str(managed["version_ref"])
+            )
+    finally:
+        runtime.close()
 
 
 def test_0003_workflow_tables_enforce_lineage_and_paired_state(

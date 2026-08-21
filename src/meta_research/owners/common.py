@@ -46,6 +46,77 @@ class AcceptanceReceipt:
 
 
 @dataclass(frozen=True)
+class AcceptedAssetBinding:
+    """Exact immutable RM AssetVersion binding consumed across Owner seams."""
+
+    asset_ref: str
+    version_ref: str
+    content_hash: str
+    manifest_hash: str
+    receipt: AcceptanceReceipt
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "asset_ref": self.asset_ref,
+            "version_ref": self.version_ref,
+            "content_hash": self.content_hash,
+            "manifest_hash": self.manifest_hash,
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+
+class AssetBindingVerifier(Protocol):
+    def verify_asset_receipt(
+        self,
+        *,
+        asset_ref: str,
+        version_ref: str,
+        content_hash: str,
+        manifest_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_asset_binding(
+        self,
+        *,
+        asset_ref: str,
+        version_ref: str,
+        content_hash: str,
+        manifest_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
+class EvidenceRefVerifier(Protocol):
+    def verify_evidence_refs(
+        self,
+        *,
+        quest_ref: str,
+        version_refs: tuple[str, ...],
+        expected_reference_revision: int | None = None,
+        require_current: bool = False,
+    ) -> None: ...
+
+    def assert_evidence_state(
+        self,
+        *,
+        quest_ref: str,
+        version_refs: tuple[str, ...],
+        expected_reference_revision: int,
+    ) -> None: ...
+
+
+class AssetReferenceReader(Protocol):
+    def query_asset_reference_revision(self) -> int: ...
+
+    def query_asset_references(self, version_ref: str) -> tuple[str, ...]: ...
+
+    def query_asset_reference_state(
+        self, version_ref: str
+    ) -> tuple[int, tuple[str, ...]]: ...
+
+
+@dataclass(frozen=True)
 class AcceptedQuestionBinding:
     """Exact cross-Owner input frozen into a Stage invocation.
 

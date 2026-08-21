@@ -10,6 +10,7 @@ from meta_research.database import Database
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import (
     IdeaContractError,
+    evidence_reference_revision,
     validate_idea_context_pack,
 )
 from meta_research.owners._sqlite_snapshot import (
@@ -20,6 +21,7 @@ from meta_research.owners.common import (
     AcceptedQuestionBinding,
     AcceptedQuestionBindingVerifier,
     AcceptanceReceipt,
+    EvidenceRefVerifier,
     IdeaOutcomeDecisionVerifier,
     OwnerConflict,
     OwnerSnapshot,
@@ -164,6 +166,7 @@ class SQLiteAdvancementEngine:
         quest_verifier: QuestReceiptVerifier,
         question_verifier: RootQuestionReceiptVerifier,
         accepted_question_verifier: AcceptedQuestionBindingVerifier | None = None,
+        evidence_verifier: EvidenceRefVerifier | None = None,
         run_completion_verifier: RunCompletionReceiptVerifier | None = None,
         outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
     ) -> None:
@@ -172,6 +175,7 @@ class SQLiteAdvancementEngine:
         self._quest_verifier = quest_verifier
         self._question_verifier = question_verifier
         self._accepted_question_verifier = accepted_question_verifier
+        self._evidence_verifier = evidence_verifier
         self._run_completion_verifier = run_completion_verifier
         self._outcome_verifier = outcome_verifier
         self._stage_request_verifier = SQLiteAdvancementEngineReceiptVerifier(database)
@@ -347,14 +351,16 @@ class SQLiteAdvancementEngine:
             "context_pack_hash": context_pack_hash,
         }
         request_hash = canonical_hash(request_input)
-        _query_ae_command(
+        replay_ref = _query_ae_command(
             self._database,
             idempotency_key,
             "ensure_idea_stage_request",
             request_hash,
         )
+        if replay_ref is not None:
+            return self._query_stage_request_ref(replay_ref)
         try:
-            validate_idea_context_pack(
+            evidence_refs = validate_idea_context_pack(
                 context_pack,
                 cycle_ref=cycle_ref,
                 accepted_question_binding=accepted_question.as_dict(),
@@ -363,6 +369,63 @@ class SQLiteAdvancementEngine:
             raise OwnerConflict(str(error)) from error
         self._verify_cycle_question(cycle_ref, accepted_question)
 
+        # Natural-key replay is a historical receipt lookup. It must not
+        # pursue today's Evidence set or current custody.
+        with self._database.read() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                    ":cycle_ref"
+                ),
+                {"cycle_ref": cycle_ref},
+            ).first()
+        if existing is not None:
+            if existing.request_hash != request_hash:
+                raise OwnerConflict("stage_run_request_conflict")
+            with self._database.write() as connection:
+                replay_ref = _ae_command_replay(
+                    connection,
+                    idempotency_key,
+                    "ensure_idea_stage_request",
+                    request_hash,
+                )
+                if replay_ref is None:
+                    current = connection.execute(
+                        text(
+                            "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                            ":cycle_ref"
+                        ),
+                        {"cycle_ref": cycle_ref},
+                    ).first()
+                    if current is None or current.request_hash != request_hash:
+                        raise OwnerConflict("stage_run_request_conflict")
+                    replay_ref = current.request_ref
+                    _record_ae_command(
+                        connection,
+                        idempotency_key,
+                        "ensure_idea_stage_request",
+                        request_hash,
+                        replay_ref,
+                    )
+            return self._query_stage_request_ref(replay_ref)
+
+        # Current custody verification can involve bounded file hashing. Keep
+        # it outside the process-wide SQLite writer lock, then close the race
+        # with a cheap per-Quest Evidence CAS inside the transaction.
+        self._verify_context_evidence(
+            accepted_question,
+            context_pack,
+            evidence_refs,
+            require_current=True,
+        )
+        try:
+            reference_revision = evidence_reference_revision(context_pack)
+        except IdeaContractError as error:
+            raise OwnerConflict(str(error)) from error
+        if reference_revision is None or self._evidence_verifier is None:
+            raise OwnerConflict("evidence_verifier_unavailable")
+
+        result_ref: str
         with self._database.write() as connection:
             replay_ref = _ae_command_replay(
                 connection,
@@ -371,105 +434,104 @@ class SQLiteAdvancementEngine:
                 request_hash,
             )
             if replay_ref is not None:
-                replay = connection.execute(
+                result_ref = replay_ref
+            else:
+                existing = connection.execute(
                     text(
-                        "SELECT * FROM ae_stage_run_requests WHERE request_ref = "
-                        ":request_ref"
+                        "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                        ":cycle_ref"
                     ),
-                    {"request_ref": replay_ref},
+                    {"cycle_ref": cycle_ref},
                 ).first()
-                if replay is None:
-                    raise OwnerConflict("stage_command_result_missing")
-                return self._stage_request_from_row(replay)
-
-            existing = connection.execute(
-                text("SELECT * FROM ae_stage_run_requests WHERE cycle_ref = :cycle_ref"),
-                {"cycle_ref": cycle_ref},
-            ).first()
-            if existing is not None:
-                if existing.request_hash != request_hash:
-                    raise OwnerConflict("stage_run_request_conflict")
-                _record_ae_command(
-                    connection,
-                    idempotency_key,
-                    "ensure_idea_stage_request",
-                    request_hash,
-                    existing.request_ref,
-                )
-                return self._stage_request_from_row(existing)
-
-            request_ref = new_ref("stage_request")
-            context_pack_ref = new_ref("context_pack")
-            receipt_ref = new_ref("ae_stage_request_receipt")
-            bindings = {
-                **_question_binding_columns(accepted_question),
-                "cycle_ref": cycle_ref,
-                "stage": IDEA_STAGE,
-                "epoch": epoch,
-                "context_pack_ref": context_pack_ref,
-                "context_pack_hash": context_pack_hash,
-            }
-            receipt_hash = _receipt_hash(
-                STAGE_REQUEST_RECEIPT_KIND, request_ref, bindings
-            )
-            connection.execute(
-                text(
-                    "INSERT INTO ae_stage_run_requests (request_ref, cycle_ref, "
-                    "stage, epoch, initialization_id, quest_ref, question_ref, "
-                    "content_ref, content_hash, schema_ref, content_receipt_ref, "
-                    "content_receipt_hash, question_receipt_ref, "
-                    "question_receipt_hash, context_pack_ref, context_pack_json, "
-                    "context_pack_hash, idempotency_key, request_hash, receipt_ref, "
-                    "receipt_hash, created_at) VALUES (:request_ref, :cycle_ref, "
-                    ":stage, :epoch, :initialization_id, :quest_ref, :question_ref, "
-                    ":content_ref, :content_hash, :schema_ref, :content_receipt_ref, "
-                    ":content_receipt_hash, :question_receipt_ref, "
-                    ":question_receipt_hash, :context_pack_ref, :context_pack_json, "
-                    ":context_pack_hash, :idempotency_key, :request_hash, "
-                    ":receipt_ref, :receipt_hash, :created_at)"
-                ),
-                {
-                    **bindings,
-                    "request_ref": request_ref,
-                    "context_pack_json": context_pack_json,
-                    "idempotency_key": idempotency_key,
-                    "request_hash": request_hash,
-                    "receipt_ref": receipt_ref,
-                    "receipt_hash": receipt_hash,
-                    "created_at": time.time(),
-                },
-            )
-            _record_ae_command(
-                connection,
-                idempotency_key,
-                "ensure_idea_stage_request",
-                request_hash,
-                request_ref,
-            )
-            connection.execute(
-                text(
-                    "UPDATE advancement_engine_state SET revision = revision + 1, "
-                    "stage_request_count = stage_request_count + 1 "
-                    "WHERE singleton = 'owner'"
-                )
-            )
-            self._feed.record(
-                connection,
-                "advancement_engine.stage_run_requested",
-                {
-                    "request_ref": request_ref,
-                    "cycle_ref": cycle_ref,
-                    "stage": IDEA_STAGE,
-                    "epoch": epoch,
-                    "context_pack_ref": context_pack_ref,
-                    "context_pack_hash": context_pack_hash,
-                    "receipt_ref": receipt_ref,
-                },
-            )
-        requested = self.query_idea_stage_request(cycle_ref)
-        if requested is None:
-            raise OwnerConflict("stage_run_request_missing_after_commit")
-        return requested
+                if existing is not None:
+                    if existing.request_hash != request_hash:
+                        raise OwnerConflict("stage_run_request_conflict")
+                    result_ref = existing.request_ref
+                    _record_ae_command(
+                        connection,
+                        idempotency_key,
+                        "ensure_idea_stage_request",
+                        request_hash,
+                        result_ref,
+                    )
+                else:
+                    self._evidence_verifier.assert_evidence_state(
+                        quest_ref=accepted_question.quest_ref,
+                        version_refs=tuple(sorted(evidence_refs)),
+                        expected_reference_revision=reference_revision,
+                    )
+                    request_ref = new_ref("stage_request")
+                    context_pack_ref = new_ref("context_pack")
+                    receipt_ref = new_ref("ae_stage_request_receipt")
+                    bindings = {
+                        **_question_binding_columns(accepted_question),
+                        "cycle_ref": cycle_ref,
+                        "stage": IDEA_STAGE,
+                        "epoch": epoch,
+                        "context_pack_ref": context_pack_ref,
+                        "context_pack_hash": context_pack_hash,
+                    }
+                    receipt_hash = _receipt_hash(
+                        STAGE_REQUEST_RECEIPT_KIND, request_ref, bindings
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO ae_stage_run_requests (request_ref, "
+                            "cycle_ref, stage, epoch, initialization_id, quest_ref, "
+                            "question_ref, content_ref, content_hash, schema_ref, "
+                            "content_receipt_ref, content_receipt_hash, "
+                            "question_receipt_ref, question_receipt_hash, "
+                            "context_pack_ref, context_pack_json, context_pack_hash, "
+                            "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                            "created_at) VALUES (:request_ref, :cycle_ref, :stage, "
+                            ":epoch, :initialization_id, :quest_ref, :question_ref, "
+                            ":content_ref, :content_hash, :schema_ref, "
+                            ":content_receipt_ref, :content_receipt_hash, "
+                            ":question_receipt_ref, :question_receipt_hash, "
+                            ":context_pack_ref, :context_pack_json, "
+                            ":context_pack_hash, :idempotency_key, :request_hash, "
+                            ":receipt_ref, :receipt_hash, :created_at)"
+                        ),
+                        {
+                            **bindings,
+                            "request_ref": request_ref,
+                            "context_pack_json": context_pack_json,
+                            "idempotency_key": idempotency_key,
+                            "request_hash": request_hash,
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "created_at": time.time(),
+                        },
+                    )
+                    _record_ae_command(
+                        connection,
+                        idempotency_key,
+                        "ensure_idea_stage_request",
+                        request_hash,
+                        request_ref,
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE advancement_engine_state SET revision = "
+                            "revision + 1, stage_request_count = "
+                            "stage_request_count + 1 WHERE singleton = 'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "advancement_engine.stage_run_requested",
+                        {
+                            "request_ref": request_ref,
+                            "cycle_ref": cycle_ref,
+                            "stage": IDEA_STAGE,
+                            "epoch": epoch,
+                            "context_pack_ref": context_pack_ref,
+                            "context_pack_hash": context_pack_hash,
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+                    result_ref = request_ref
+        return self._query_stage_request_ref(result_ref)
 
     def query_idea_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
         with self._database.read() as connection:
@@ -481,9 +543,36 @@ class SQLiteAdvancementEngine:
             return None
         return self._stage_request_from_row(row)
 
+    def _query_stage_request_ref(self, request_ref: str) -> StageRunRequest:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE request_ref = "
+                    ":request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("stage_command_result_missing")
+        return self._stage_request_from_row(row)
+
     def _stage_request_from_row(self, row) -> StageRunRequest:
         requested = _stage_request(row)
         self._verify_cycle_question(row.cycle_ref, requested.accepted_question)
+        try:
+            evidence_refs = validate_idea_context_pack(
+                requested.context_pack,
+                cycle_ref=requested.cycle_ref,
+                accepted_question_binding=requested.accepted_question.as_dict(),
+            )
+        except IdeaContractError as error:
+            raise OwnerConflict(str(error)) from error
+        self._verify_context_evidence(
+            requested.accepted_question,
+            requested.context_pack,
+            evidence_refs,
+            require_current=False,
+        )
         self._stage_request_verifier.verify_stage_run_request(
             request_ref=requested.request_ref,
             cycle_ref=requested.cycle_ref,
@@ -493,6 +582,32 @@ class SQLiteAdvancementEngine:
             receipt=requested.receipt,
         )
         return requested
+
+    def _verify_context_evidence(
+        self,
+        accepted_question: AcceptedQuestionBinding,
+        context_pack: dict[str, object],
+        evidence_refs: set[str],
+        *,
+        require_current: bool,
+    ) -> None:
+        try:
+            reference_revision = evidence_reference_revision(context_pack)
+        except IdeaContractError as error:
+            raise OwnerConflict(str(error)) from error
+        if require_current and reference_revision is None:
+            raise OwnerConflict("idea_context_pack_invalid")
+        if not require_current and not evidence_refs:
+            return
+        if self._evidence_verifier is None:
+            raise OwnerConflict("evidence_verifier_unavailable")
+        self._evidence_verifier.verify_evidence_refs(
+            quest_ref=accepted_question.quest_ref,
+            version_refs=tuple(sorted(evidence_refs)),
+            expected_reference_revision=(
+                reference_revision if require_current else None
+            ),
+        )
 
     def _verify_cycle_question(
         self, cycle_ref: str, accepted_question: AcceptedQuestionBinding
@@ -1108,6 +1223,7 @@ def create_advancement_engine_interface(
     quest_verifier: QuestReceiptVerifier,
     question_verifier: RootQuestionReceiptVerifier,
     accepted_question_verifier: AcceptedQuestionBindingVerifier | None = None,
+    evidence_verifier: EvidenceRefVerifier | None = None,
     run_completion_verifier: RunCompletionReceiptVerifier | None = None,
     outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
 ) -> AdvancementEngineInterface:
@@ -1117,6 +1233,7 @@ def create_advancement_engine_interface(
         quest_verifier,
         question_verifier,
         accepted_question_verifier,
+        evidence_verifier,
         run_completion_verifier,
         outcome_verifier,
     )

@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 
-from meta_research.idea_contract import IdeaContractError, validate_idea_content
+from meta_research.idea_contract import (
+    IdeaContractError,
+    validate_idea_content,
+    validate_idea_context_pack,
+)
 from meta_research.owners.advancement_engine import (
     create_advancement_engine_receipt_verifier,
 )
@@ -89,16 +93,39 @@ def _confirm_question_with_prefix(runtime, prefix: str) -> dict[str, object]:
     return completed
 
 
+def test_historical_v1_context_pack_never_accepts_evidence_refs() -> None:
+    accepted_question = {"question_ref": "question-v1"}
+    context_pack = {
+        "schema_ref": "meta-research/idea-context-pack/v1",
+        "cycle_ref": "cycle-v1",
+        "accepted_question_binding": accepted_question,
+        "accepted_evidence_refs": ["asset-version-not-authorized-by-v1"],
+        "literature_binding": None,
+        "prior_accepted_bindings": [],
+        "active_guidance_bindings": [],
+    }
+    with pytest.raises(IdeaContractError, match="idea_context_pack_invalid"):
+        validate_idea_context_pack(
+            context_pack,
+            cycle_ref="cycle-v1",
+            accepted_question_binding=accepted_question,
+        )
+
+
 def _prepare_direct_idea_request(runtime, completed: dict[str, object], prefix: str):
     question = runtime.owners.research_graph.query_question(
         completed["initialization_id"]
     )
     assert question is not None
+    evidence_revision, evidence_refs = (
+        runtime.owners.research_graph.query_evidence_state(question.quest_ref)
+    )
     context_pack = {
-        "schema_ref": "meta-research/idea-context-pack/v1",
+        "schema_ref": "meta-research/idea-context-pack/v2",
         "cycle_ref": completed["cycle_ref"],
         "accepted_question_binding": question.as_binding().as_dict(),
-        "accepted_evidence_refs": [],
+        "accepted_evidence_refs": list(evidence_refs),
+        "evidence_reference_revision": evidence_revision,
         "literature_binding": None,
         "prior_accepted_bindings": [],
         "active_guidance_bindings": [],
@@ -716,6 +743,19 @@ def test_reviewed_draft_hash_remains_verifiable_through_rm_and_rg(
             review=execution.review,
             execution_receipt=execution.receipt,
         )
+        mirrored = runtime.owners.research_memory.query_asset_version(
+            content.content_ref
+        )
+        assert mirrored is not None
+        assert mirrored.asset_ref == content.content_ref
+        assert mirrored.version_ref == content.content_ref
+        assert mirrored.source_kind == "idea_outcome"
+        assert mirrored.content_hash == content.payload_hash
+        assert mirrored.receipt == content.receipt
+        assert {
+            item.memory_ref
+            for item in runtime.owners.research_memory.query_asset_inventory()
+        } >= {question.content_ref, content.content_ref}
         assert content.reviewed_draft == reviewed_draft
         assert content.reviewed_draft_hash == canonical_hash(reviewed_draft)
         question_content = runtime.owners.research_memory.read_question_content(
@@ -733,6 +773,21 @@ def test_reviewed_draft_hash_remains_verifiable_through_rm_and_rg(
         assert runtime.owners.research_graph.query_idea_outcome_decision(
             execution.submission_ref
         ) == decision
+        idea_release = (
+            runtime.owners.research_memory.assess_release_eligibility(
+                content.content_ref,
+                expected_reference_revision=(
+                    runtime.owners.research_graph.query_asset_reference_revision()
+                ),
+                idempotency_key="reviewed-draft-idea-release",
+            )
+        )
+        assert idea_release.eligible is False
+        assert idea_release.reason_codes == ("semantic_reference_active",)
+        assert idea_release.active_reference_refs == (
+            f"rm-idea-content:{content.content_ref}",
+            f"idea-outcome:{decision.decision_ref}",
+        )
     finally:
         runtime.close()
 

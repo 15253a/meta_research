@@ -124,6 +124,7 @@ def build_production_runtime(
         confirmation_verifier,
         research_memory_receipts,
         research_memory_receipts,
+        research_memory_receipts,
         attempt_receipts,
         stage_request_receipts,
     )
@@ -139,6 +140,7 @@ def build_production_runtime(
         feed,
         confirmation_verifier,
         research_memory_receipts,
+        research_memory_receipts,
         research_graph_receipts,
         research_memory_receipts,
         attempt_receipts,
@@ -152,10 +154,12 @@ def build_production_runtime(
         research_graph_receipts,
         research_memory_receipts,
         attempt_receipts,
+        research_graph,
     )
     advancement_engine = create_advancement_engine_interface(
         database,
         feed,
+        research_graph_receipts,
         research_graph_receipts,
         research_graph_receipts,
         research_graph_receipts,

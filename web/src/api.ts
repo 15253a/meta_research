@@ -18,6 +18,147 @@ export type UnavailableCapability = {
   reason: { code: string; message?: string };
 };
 
+export type AssetReceipt = {
+  issuer: string;
+  kind: string;
+  receipt_ref: string;
+  subject_ref: string;
+  payload_hash: string;
+};
+
+export type ResearchAssetItem = {
+  asset_ref: string;
+  version_ref: string;
+  memory_ref: string;
+  version_number: number;
+  source_kind: string;
+  display_name: string;
+  media_type: string;
+  content_hash: string;
+  manifest_hash: string;
+  byte_count: number;
+  provenance: Record<string, unknown>;
+  custody_modes: string[];
+  integrity: string;
+  availability: string;
+  verification_observed_at: number | null;
+  verification_pending: boolean;
+  accepted_at: number;
+  receipt: AssetReceipt;
+};
+
+export type ResearchAssetCustody = {
+  version_ref: string;
+  custody_ref: string;
+  custody_mode: "managed" | "linked_local";
+  source_locator: string | null;
+  locator_receipted: boolean;
+  locator_bound_at: number | null;
+  locator_receipt: AssetReceipt | null;
+  established_at: number;
+  receipt: AssetReceipt;
+};
+
+export type ResearchAssetRole = {
+  role_ref: string;
+  version_ref: string;
+  asset_ref: string;
+  asset_hash: string;
+  manifest_hash: string;
+  role: "evidence" | "quest_source_material";
+  quest_ref: string;
+  accepted_at: number;
+  asset_receipt: AssetReceipt;
+  receipt: AssetReceipt;
+};
+
+export type ResearchAssetHold = {
+  hold_ref: string;
+  version_ref: string;
+  reason: string;
+  active: boolean;
+  placed_at: number;
+  released_at: number | null;
+  placement_receipt: AssetReceipt;
+  release_receipt: AssetReceipt | null;
+};
+
+export type AssetReleaseAssessment = {
+  assessment_ref: string;
+  version_ref: string;
+  expected_reference_revision: number | null;
+  observed_reference_revision: number | null;
+  active_reference_refs: string[];
+  active_hold_refs: string[];
+  eligible: boolean;
+  reason_codes: string[];
+  assessed_at: number;
+  receipt: AssetReceipt;
+};
+
+export type ResearchAssetsView = {
+  status: "ready";
+  revision: number;
+  inventory_revision: number;
+  items: ResearchAssetItem[];
+  custodies: ResearchAssetCustody[];
+  roles: ResearchAssetRole[];
+  holds: ResearchAssetHold[];
+  release_assessments: AssetReleaseAssessment[];
+  reference_revision: number;
+  offset: number;
+  limit: number;
+  total_count: number;
+  has_more: boolean;
+};
+
+export type ResearchAssetDetail = ResearchAssetItem & {
+  revision: number;
+  inventory_revision: number;
+  custodies: ResearchAssetCustody[];
+  roles: ResearchAssetRole[];
+  holds: ResearchAssetHold[];
+  release_assessments: AssetReleaseAssessment[];
+  reference_revision: number;
+};
+
+export type AssetHistoryPage<T> = {
+  items: T[];
+  limit: number;
+  has_more: boolean;
+  next_cursor: string | null;
+};
+
+export type AssetIntakeRequest = {
+  source_kind:
+    | "text"
+    | "file"
+    | "directory"
+    | "local_path"
+    | "repository"
+    | "link"
+    | "system_artifact";
+  custody_mode: "managed" | "linked_local";
+  display_name: string;
+  media_type: string;
+  text?: string;
+  content_base64?: string;
+  source_locator?: string;
+  provenance?: Record<string, unknown>;
+  asset_ref?: string;
+  asynchronous?: boolean;
+};
+
+export type AssetIntakeResult = {
+  job_ref: string;
+  status: "queued" | "processing" | "accepted" | "failed";
+  source_kind: string;
+  custody_mode: string;
+  attempt_count: number;
+  asset: null | (ResearchAssetItem & { provenance?: Record<string, unknown> });
+  failure: null | { code: string };
+};
+
 export type LiteratureMode = "oa_then_institution" | "oa_only" | "provided_only";
 
 export type QuestDraft = {
@@ -85,6 +226,16 @@ export type ReceiptState =
       status: "rejected" | "stale";
       reason: { code: string };
     };
+
+export type AggregateReceiptState = {
+  status: "accepted";
+  issuer: string;
+  kind: "quest_source_material_role_set";
+  role_refs: string[];
+  receipts: Array<Extract<ReceiptState, { status: "accepted" }>>;
+};
+
+export type QuestReceiptState = ReceiptState | AggregateReceiptState;
 
 export type ComputeDevice = {
   uuid: string;
@@ -223,7 +374,9 @@ export type QuestCreationView = {
     | "question_identity"
     | "cycle_activation",
     ReceiptState
-  >;
+  > & {
+    quest_source_material?: QuestReceiptState;
+  };
   recovery: null | {
     state: string;
     first_missing_step: string | null;
@@ -395,9 +548,10 @@ export type PublicSnapshot = {
     status: "ready";
     route: "direct";
     current: QuestCreationView | null;
-    accepted_material_basis: Omit<UnavailableCapability, "capability">;
+    accepted_material_basis: QuestCapability;
     first_question_deepfetch: Omit<UnavailableCapability, "capability">;
   };
+  research_assets: ResearchAssetsView;
   idea_stage?: IdeaStageProjection | null;
   unavailable: UnavailableCapability[];
 };
@@ -418,6 +572,149 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
     throw new ProductError(`snapshot_unavailable:${response.status}`);
   }
   return (await response.json()) as PublicSnapshot;
+}
+
+export async function fetchResearchAssets(
+  signal?: AbortSignal,
+  offset = 0,
+  limit = 50,
+): Promise<ResearchAssetsView> {
+  const parameters = new URLSearchParams({
+    offset: String(offset),
+    limit: String(limit),
+  });
+  return readJson(`/api/v1/research-assets?${parameters}`, signal);
+}
+
+export function fetchResearchAsset(
+  memoryRef: string,
+  signal?: AbortSignal,
+): Promise<ResearchAssetDetail> {
+  return readJson(
+    `/api/v1/research-assets/${encodeURIComponent(memoryRef)}`,
+    signal,
+  );
+}
+
+function fetchAssetHistory<T>(
+  memoryRef: string,
+  kind: "roles" | "holds" | "release-assessments",
+  cursor: string | null,
+  limit = 50,
+): Promise<AssetHistoryPage<T>> {
+  const parameters = new URLSearchParams({ limit: String(limit) });
+  if (cursor !== null) parameters.set("cursor", cursor);
+  return readJson(
+    `/api/v1/research-assets/${encodeURIComponent(memoryRef)}/${kind}?${parameters}`,
+  );
+}
+
+export function fetchAssetRoleHistory(
+  memoryRef: string,
+  cursor: string | null,
+): Promise<AssetHistoryPage<ResearchAssetRole>> {
+  return fetchAssetHistory(memoryRef, "roles", cursor);
+}
+
+export function fetchAssetHoldHistory(
+  memoryRef: string,
+  cursor: string | null,
+): Promise<AssetHistoryPage<ResearchAssetHold>> {
+  return fetchAssetHistory(memoryRef, "holds", cursor);
+}
+
+export function fetchAssetReleaseHistory(
+  memoryRef: string,
+  cursor: string | null,
+): Promise<AssetHistoryPage<AssetReleaseAssessment>> {
+  return fetchAssetHistory(memoryRef, "release-assessments", cursor);
+}
+
+export async function submitAssetIntake(
+  intake: AssetIntakeRequest,
+): Promise<AssetIntakeResult> {
+  const result = await writeJson<AssetIntakeResult>(
+    "/api/v1/research-assets/intakes",
+    "POST",
+    intake,
+    {
+      retainPending: () => true,
+      onRetained: (result, pendingWrite) => {
+        writeSessionValue(
+          pendingAssetIntakeSlot,
+          JSON.stringify({ job_ref: result.job_ref, write_slot: pendingWrite.slot }),
+        );
+      },
+    },
+  );
+  return result;
+}
+
+export async function fetchAssetIntake(
+  jobRef: string,
+  signal?: AbortSignal,
+): Promise<AssetIntakeResult> {
+  const result = await readJson<AssetIntakeResult>(
+    `/api/v1/research-assets/intakes/${jobRef}`,
+    signal,
+  );
+  return result;
+}
+
+export function pendingAssetIntakeJobRef(): string | null {
+  const record = readPendingAssetIntake();
+  return record?.job_ref ?? null;
+}
+
+export function acknowledgeAssetIntake(jobRef: string): void {
+  clearPendingAssetIntake(jobRef);
+}
+
+export function handoffAssetToManaged(memoryRef: string): Promise<{
+  version_ref: string;
+  custody_ref: string;
+  custody_mode: "managed";
+  established_at: number;
+  receipt: AssetReceipt;
+}> {
+  return writeJson(
+    `/api/v1/research-assets/${memoryRef}/custody/managed`,
+    "POST",
+    {},
+  );
+}
+
+export function placeAssetHold(
+  memoryRef: string,
+  reason: string,
+): Promise<ResearchAssetHold> {
+  return writeJson(`/api/v1/research-assets/${memoryRef}/holds`, "POST", { reason });
+}
+
+export function releaseAssetHold(holdRef: string): Promise<ResearchAssetHold> {
+  return writeJson(`/api/v1/research-assets/holds/${holdRef}/release`, "POST", {});
+}
+
+export function assessAssetRelease(
+  memoryRef: string,
+  expectedReferenceRevision: number,
+): Promise<AssetReleaseAssessment> {
+  return writeJson(
+    `/api/v1/research-assets/${memoryRef}/release-eligibility`,
+    "POST",
+    { expected_reference_revision: expectedReferenceRevision },
+  );
+}
+
+export function acceptAssetRole(
+  memoryRef: string,
+  role: "evidence" | "quest_source_material",
+  questRef: string,
+): Promise<ResearchAssetRole> {
+  return writeJson(`/api/v1/research-assets/${memoryRef}/roles`, "POST", {
+    role,
+    quest_ref: questRef,
+  });
 }
 
 export function createQuest(): Promise<QuestCreationView> {
@@ -551,10 +848,26 @@ export function cancelQuest(creation: QuestCreationView): Promise<QuestCreationV
   );
 }
 
+async function readJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+    signal,
+  });
+  if (!response.ok) {
+    throw new ProductError(`request_failed:${response.status}`);
+  }
+  return (await response.json()) as T;
+}
+
 async function writeJson<T>(
   path: string,
   method: "POST" | "PUT",
   body: object,
+  options?: {
+    retainPending: (payload: T) => boolean;
+    onRetained: (payload: T, pendingWrite: PendingWrite) => void;
+  },
 ): Promise<T> {
   const csrfToken = readCookie("meta_research_csrf");
   if (!csrfToken) throw new ProductError("csrf_token_unavailable");
@@ -582,17 +895,22 @@ async function writeJson<T>(
     throw new ProductError(code);
   }
   const payload = (await response.json()) as T;
-  pendingWrite.clear();
+  if (options?.retainPending(payload)) options.onRetained(payload, pendingWrite);
+  else pendingWrite.clear();
   return payload;
 }
 
 const inMemoryPendingWrites = new Map<string, string>();
+const pendingAssetIntakeSlot = "meta_research_pending_asset_intake";
+
+type PendingWrite = { key: string; slot: string; clear: () => void };
+type PendingAssetIntake = { job_ref: string; write_slot: string };
 
 async function reserveIdempotencyKey(
   method: string,
   path: string,
   bodyJson: string,
-): Promise<{ key: string; clear: () => void }> {
+): Promise<PendingWrite> {
   const bytes = new TextEncoder().encode(`${method}\n${path}\n${bodyJson}`);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
@@ -605,11 +923,33 @@ async function reserveIdempotencyKey(
   writeSessionValue(slot, key);
   return {
     key,
+    slot,
     clear: () => {
       inMemoryPendingWrites.delete(slot);
       removeSessionValue(slot);
     },
   };
+}
+
+function readPendingAssetIntake(): PendingAssetIntake | null {
+  const value = readSessionValue(pendingAssetIntakeSlot);
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingAssetIntake>;
+    return typeof parsed.job_ref === "string" && typeof parsed.write_slot === "string"
+      ? { job_ref: parsed.job_ref, write_slot: parsed.write_slot }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingAssetIntake(jobRef: string): void {
+  const record = readPendingAssetIntake();
+  if (!record || record.job_ref !== jobRef) return;
+  inMemoryPendingWrites.delete(record.write_slot);
+  removeSessionValue(record.write_slot);
+  removeSessionValue(pendingAssetIntakeSlot);
 }
 
 function readSessionValue(key: string): string | null {
@@ -682,6 +1022,14 @@ export function followProjection(
     "research_graph.idea_outcome_accepted",
     "research_graph.idea_outcome_rejected",
     "advancement_engine.stage_committed",
+    "research_memory.asset_intake_queued",
+    "research_memory.asset_accepted",
+    "research_memory.asset_intake_failed",
+    "research_memory.asset_custody_handed_off",
+    "research_memory.asset_hold_placed",
+    "research_memory.asset_hold_released",
+    "research_memory.release_eligibility_assessed",
+    "research_graph.asset_role_accepted",
   ];
   let cursor = afterRevision;
   let stream: EventSource | null = null;

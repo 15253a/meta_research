@@ -11,6 +11,7 @@ from meta_research.database import Database
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import (
     IdeaContractError,
+    MAX_IDEA_CONTEXT_EVIDENCE_REFS,
     material_text,
     validate_idea_content,
     validate_idea_context_pack,
@@ -20,8 +21,10 @@ from meta_research.owners._sqlite_snapshot import (
     SQLiteOwnerSnapshot,
 )
 from meta_research.owners.common import (
+    AcceptedAssetBinding,
     AcceptedQuestionBinding,
     AcceptanceReceipt,
+    AssetBindingVerifier,
     AttemptExecutionReceiptVerifier,
     BundleConfirmationVerifier,
     IdeaContentReceiptVerifier,
@@ -41,7 +44,12 @@ QUEST_RECEIPT_KIND = "quest_acceptance"
 QUESTION_RECEIPT_KIND = "root_question_acceptance"
 IDEA_ACCEPTED_RECEIPT_KIND = "idea_outcome_accepted"
 IDEA_REJECTED_RECEIPT_KIND = "idea_outcome_rejected"
+ASSET_ROLE_RECEIPT_KIND = "asset_role_acceptance"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
+MAX_ASSET_ROLES_PER_QUEST = MAX_IDEA_CONTEXT_EVIDENCE_REFS
+MAX_ASSET_ROLES_PER_VERSION = 100
+ASSET_ROLE_PROJECTION_HISTORY_PER_VERSION = 20
+ASSET_ROLE_QUERY_MAX_PAGE_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -80,6 +88,43 @@ class AcceptedQuestion:
             schema_ref=self.schema_ref,
             content_receipt=self.content_receipt,
             question_receipt=self.receipt,
+        )
+
+
+@dataclass(frozen=True)
+class AcceptedAssetRole:
+    role_ref: str
+    version_ref: str
+    asset_ref: str
+    asset_hash: str
+    manifest_hash: str
+    role: str
+    quest_ref: str
+    accepted_at: float
+    asset_receipt: AcceptanceReceipt
+    receipt: AcceptanceReceipt
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "role_ref": self.role_ref,
+            "version_ref": self.version_ref,
+            "asset_ref": self.asset_ref,
+            "asset_hash": self.asset_hash,
+            "manifest_hash": self.manifest_hash,
+            "role": self.role,
+            "quest_ref": self.quest_ref,
+            "accepted_at": self.accepted_at,
+            "asset_receipt": self.asset_receipt.as_public_dict(),
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+    def asset_binding(self) -> AcceptedAssetBinding:
+        return AcceptedAssetBinding(
+            asset_ref=self.asset_ref,
+            version_ref=self.version_ref,
+            content_hash=self.asset_hash,
+            manifest_hash=self.manifest_hash,
+            receipt=self.asset_receipt,
         )
 
 
@@ -145,6 +190,14 @@ class ResearchGraphInterface(Protocol):
         proposal_hash: str,
     ) -> dict[str, object]: ...
 
+    def preview_asset_role_acceptance(
+        self,
+        *,
+        initialization_id: str,
+        role: str,
+        bindings: tuple[AcceptedAssetBinding, ...],
+    ) -> dict[str, object]: ...
+
     def query_quest(self, initialization_id: str) -> AcceptedQuest | None: ...
 
     def accept_quest(
@@ -198,6 +251,52 @@ class ResearchGraphInterface(Protocol):
         self, binding: AcceptedQuestionBinding
     ) -> None: ...
 
+    def accept_asset_role(
+        self,
+        *,
+        binding: AcceptedAssetBinding,
+        role: str,
+        quest_ref: str,
+        idempotency_key: str,
+    ) -> AcceptedAssetRole: ...
+
+    def query_asset_roles(
+        self,
+        *,
+        quest_ref: str | None = None,
+        role: str | None = None,
+        version_refs: tuple[str, ...] | None = None,
+        limit_per_version: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+        before_timestamp: float | None = None,
+        before_ref: str | None = None,
+    ) -> tuple[AcceptedAssetRole, ...]: ...
+
+    def query_asset_projection_roles(
+        self,
+        *,
+        version_refs: tuple[str, ...],
+        limit_per_version: int,
+    ) -> tuple[AcceptedAssetRole, ...]: ...
+
+    def query_evidence_refs(self, quest_ref: str) -> tuple[str, ...]: ...
+
+    def query_evidence_state(self, quest_ref: str) -> tuple[int, tuple[str, ...]]: ...
+
+    def query_evidence_reference_state(
+        self, quest_ref: str
+    ) -> tuple[int, tuple[str, ...]]: ...
+
+    def query_asset_reference_revision(self) -> int: ...
+
+    def query_asset_references(self, version_ref: str) -> tuple[str, ...]: ...
+
+    def query_asset_reference_state(
+        self, version_ref: str
+    ) -> tuple[int, tuple[str, ...]]: ...
+
     def decide_idea_outcome(
         self,
         *,
@@ -218,7 +317,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
     owner=RG_OWNER,
     statement=text(
         "SELECT revision, quest_count, question_count, idea_outcome_count, "
-        "idea_rejection_count "
+        "idea_rejection_count, asset_role_count, evidence_role_count, "
+        "source_material_role_count "
         "FROM research_graph_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -226,6 +326,9 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "question_count",
         "idea_outcome_count",
         "idea_rejection_count",
+        "asset_role_count",
+        "evidence_role_count",
+        "source_material_role_count",
     ),
 )
 
@@ -238,6 +341,7 @@ class SQLiteResearchGraphReceiptVerifier:
         database: Database,
         confirmation_verifier: BundleConfirmationVerifier,
         content_verifier: QuestionContentReceiptVerifier,
+        asset_verifier: AssetBindingVerifier,
         idea_content_verifier: IdeaContentReceiptVerifier | None = None,
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
         stage_request_verifier: StageRunRequestVerifier | None = None,
@@ -245,6 +349,7 @@ class SQLiteResearchGraphReceiptVerifier:
         self._database = database
         self._confirmation_verifier = confirmation_verifier
         self._content_verifier = content_verifier
+        self._asset_verifier = asset_verifier
         self._idea_content_verifier = idea_content_verifier
         self._execution_verifier = execution_verifier
         self._stage_request_verifier = stage_request_verifier
@@ -405,6 +510,172 @@ class SQLiteResearchGraphReceiptVerifier:
             receipt=binding.question_receipt,
         )
 
+    def verify_asset_role_receipt(
+        self,
+        *,
+        role_ref: str,
+        version_ref: str,
+        role: str,
+        quest_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != RG_OWNER
+            or receipt.kind != ASSET_ROLE_RECEIPT_KIND
+            or receipt.subject_ref != role_ref
+        ):
+            raise OwnerConflict("asset_role_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_asset_roles WHERE role_ref = :role_ref"
+                ),
+                {"role_ref": role_ref},
+            ).first()
+            quest = connection.execute(
+                text("SELECT * FROM rg_quests WHERE quest_ref = :quest_ref"),
+                {"quest_ref": quest_ref},
+            ).first()
+        if row is None or (
+            row.version_ref != version_ref
+            or row.role != role
+            or row.quest_ref != quest_ref
+            or row.receipt_ref != receipt.receipt_ref
+            or row.receipt_hash != receipt.payload_hash
+            or row.receipt_hash != _asset_role_receipt_hash(row)
+        ):
+            raise OwnerConflict("asset_role_receipt_invalid")
+        if quest is None:
+            raise OwnerConflict("asset_role_quest_invalid")
+        accepted_quest = _accepted_quest(quest)
+        self.verify_quest_receipt(
+            initialization_id=accepted_quest.initialization_id,
+            quest_ref=accepted_quest.quest_ref,
+            proposal_ref=accepted_quest.proposal_ref,
+            proposal_hash=accepted_quest.proposal_hash,
+            confirmation_ref=accepted_quest.confirmation.receipt_ref,
+            receipt=accepted_quest.receipt,
+        )
+        self._asset_verifier.verify_asset_receipt(
+            asset_ref=row.asset_ref,
+            version_ref=row.version_ref,
+            content_hash=row.asset_hash,
+            manifest_hash=row.manifest_hash,
+            receipt=AcceptanceReceipt(
+                issuer="research_memory",
+                kind=row.asset_receipt_kind,
+                receipt_ref=row.asset_receipt_ref,
+                subject_ref=row.version_ref,
+                payload_hash=row.asset_receipt_hash,
+            ),
+        )
+
+    def verify_evidence_refs(
+        self,
+        *,
+        quest_ref: str,
+        version_refs: tuple[str, ...],
+        expected_reference_revision: int | None = None,
+        require_current: bool = False,
+    ) -> None:
+        if (
+            not version_refs
+            and expected_reference_revision is None
+            and not require_current
+        ):
+            return
+        if tuple(sorted(set(version_refs))) != version_refs:
+            raise OwnerConflict("idea_context_pack_invalid")
+        revision, current_refs = self._query_evidence_state(
+            quest_ref,
+            current=expected_reference_revision is not None or require_current,
+        )
+        if expected_reference_revision is not None and (
+            revision != expected_reference_revision or current_refs != version_refs
+        ):
+            raise OwnerConflict("idea_context_pack_stale")
+        if (
+            expected_reference_revision is None
+            and require_current
+            and current_refs != version_refs
+        ):
+            raise OwnerConflict("idea_context_pack_stale")
+        if expected_reference_revision is None and any(
+            version_ref not in current_refs for version_ref in version_refs
+        ):
+            raise OwnerConflict("idea_context_pack_invalid")
+
+    def assert_evidence_state(
+        self,
+        *,
+        quest_ref: str,
+        version_refs: tuple[str, ...],
+        expected_reference_revision: int,
+    ) -> None:
+        """Cheap CAS used only after the caller already verified every receipt."""
+
+        with self._database.read() as connection:
+            current_refs = tuple(
+                row.version_ref
+                for row in connection.execute(
+                    text(
+                        "SELECT version_ref FROM rg_asset_roles WHERE "
+                        "quest_ref = :quest_ref AND role = 'evidence' ORDER BY "
+                        "version_ref"
+                    ),
+                    {"quest_ref": quest_ref},
+                ).all()
+            )
+        if (
+            len(current_refs) != expected_reference_revision
+            or current_refs != version_refs
+        ):
+            raise OwnerConflict("idea_context_pack_stale")
+
+    def query_evidence_state(
+        self, quest_ref: str
+    ) -> tuple[int, tuple[str, ...]]:
+        return self._query_evidence_state(quest_ref, current=True)
+
+    def query_evidence_reference_state(
+        self, quest_ref: str
+    ) -> tuple[int, tuple[str, ...]]:
+        """Return receipt-verified frozen refs without current custody I/O."""
+
+        return self._query_evidence_state(quest_ref, current=False)
+
+    def _query_evidence_state(
+        self, quest_ref: str, *, current: bool
+    ) -> tuple[int, tuple[str, ...]]:
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM rg_asset_roles WHERE quest_ref = :quest_ref "
+                    "AND role = 'evidence' ORDER BY version_ref"
+                ),
+                {"quest_ref": quest_ref},
+            ).all()
+        revision = len(rows)
+        for row in rows:
+            accepted = _accepted_asset_role(row)
+            self.verify_asset_role_receipt(
+                role_ref=accepted.role_ref,
+                version_ref=accepted.version_ref,
+                role=accepted.role,
+                quest_ref=accepted.quest_ref,
+                receipt=accepted.receipt,
+            )
+            if current:
+                binding = accepted.asset_binding()
+                self._asset_verifier.verify_asset_binding(
+                    asset_ref=binding.asset_ref,
+                    version_ref=binding.version_ref,
+                    content_hash=binding.content_hash,
+                    manifest_hash=binding.manifest_hash,
+                    receipt=binding.receipt,
+                )
+        return revision, tuple(row.version_ref for row in rows)
+
     def verify_idea_outcome_decision(
         self,
         *,
@@ -480,13 +751,17 @@ class SQLiteResearchGraphReceiptVerifier:
             context_pack_ref=row.context_pack_ref,
         )
         try:
-            validate_idea_context_pack(
+            verified_evidence_refs = validate_idea_context_pack(
                 verified_request.context_pack,
                 cycle_ref=verified_request.cycle_ref,
                 accepted_question_binding=accepted_question.as_dict(),
             )
         except IdeaContractError as error:
             raise OwnerConflict(str(error)) from error
+        self.verify_evidence_refs(
+            quest_ref=accepted_question.quest_ref,
+            version_refs=tuple(sorted(verified_evidence_refs)),
+        )
         if self._idea_content_verifier is not None:
             self._idea_content_verifier.verify_idea_content_receipt(
                 request_ref=row.request_ref,
@@ -529,6 +804,7 @@ class SQLiteResearchGraph:
         feed: DurableFeed,
         confirmation_verifier: BundleConfirmationVerifier,
         content_verifier: QuestionContentReceiptVerifier,
+        asset_verifier: AssetBindingVerifier,
         receipt_verifier: SQLiteResearchGraphReceiptVerifier,
         idea_content_verifier: IdeaContentReceiptVerifier | None = None,
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
@@ -538,6 +814,7 @@ class SQLiteResearchGraph:
         self._feed = feed
         self._confirmation_verifier = confirmation_verifier
         self._content_verifier = content_verifier
+        self._asset_verifier = asset_verifier
         self._receipt_verifier = receipt_verifier
         self._idea_content_verifier = idea_content_verifier
         self._execution_verifier = execution_verifier
@@ -596,6 +873,40 @@ class SQLiteResearchGraph:
                 "initialization_id": initialization_id,
                 "proposal_ref": proposal_ref,
                 "proposal_hash": proposal_hash,
+            },
+        }
+        return {**assertion, "target_hash": canonical_hash(assertion)}
+
+    def preview_asset_role_acceptance(
+        self,
+        *,
+        initialization_id: str,
+        role: str,
+        bindings: tuple[AcceptedAssetBinding, ...],
+    ) -> dict[str, object]:
+        if role not in {"evidence", "quest_source_material"} or not bindings:
+            raise OwnerConflict("asset_role_invalid")
+        assertion = {
+            "owner": RG_OWNER,
+            "operation": "accept_asset_roles",
+            "may_change": ["asset_semantic_roles", "graph_head"],
+            "will_not_change": ["asset_content", "asset_custody"],
+            "preconditions": [
+                "exact_quest_receipt",
+                "exact_rm_asset_receipts",
+                "current_asset_custody",
+            ],
+            "risks": [
+                "downstream_acceptance_stops_if_any_asset_binding_is_stale"
+            ],
+            "stale_if": [
+                "accepted_material_bindings_change",
+                "asset_receipt_or_custody_changes",
+            ],
+            "bindings": {
+                "initialization_id": initialization_id,
+                "role": role,
+                "assets": [binding.as_dict() for binding in bindings],
             },
         }
         return {**assertion, "target_hash": canonical_hash(assertion)}
@@ -850,6 +1161,468 @@ class SQLiteResearchGraph:
     ) -> None:
         self._receipt_verifier.verify_accepted_question_binding(binding)
 
+    def accept_asset_role(
+        self,
+        *,
+        binding: AcceptedAssetBinding,
+        role: str,
+        quest_ref: str,
+        idempotency_key: str,
+    ) -> AcceptedAssetRole:
+        if role not in {"evidence", "quest_source_material"}:
+            raise OwnerConflict("asset_role_invalid")
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise OwnerConflict("asset_role_idempotency_key_invalid")
+        request = {
+            "binding": binding.as_dict(),
+            "role": role,
+            "quest_ref": quest_ref,
+        }
+        request_hash = canonical_hash(request)
+        with self._database.read() as connection:
+            command = connection.execute(
+                text(
+                    "SELECT * FROM rg_asset_role_commands WHERE idempotency_key = "
+                    ":idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            existing = (
+                None
+                if command is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM rg_asset_roles WHERE role_ref = :role_ref"
+                    ),
+                    {"role_ref": command.role_ref},
+                ).first()
+            )
+            quest_row = connection.execute(
+                text("SELECT * FROM rg_quests WHERE quest_ref = :quest_ref"),
+                {"quest_ref": quest_ref},
+            ).first()
+        if command is not None:
+            if command.request_hash != request_hash:
+                raise OwnerConflict("asset_role_idempotency_conflict")
+            if existing is None:
+                raise OwnerConflict("asset_role_command_invalid")
+            accepted = _accepted_asset_role(existing)
+            self._verify_asset_role(accepted, current=False)
+            return accepted
+        if quest_row is None:
+            raise OwnerConflict("asset_role_quest_invalid")
+        quest = _accepted_quest(quest_row)
+        self._receipt_verifier.verify_quest_receipt(
+            initialization_id=quest.initialization_id,
+            quest_ref=quest.quest_ref,
+            proposal_ref=quest.proposal_ref,
+            proposal_hash=quest.proposal_hash,
+            confirmation_ref=quest.confirmation.receipt_ref,
+            receipt=quest.receipt,
+        )
+        self._asset_verifier.verify_asset_binding(
+            asset_ref=binding.asset_ref,
+            version_ref=binding.version_ref,
+            content_hash=binding.content_hash,
+            manifest_hash=binding.manifest_hash,
+            receipt=binding.receipt,
+        )
+        with self._database.write() as connection:
+            command = connection.execute(
+                text(
+                    "SELECT * FROM rg_asset_role_commands WHERE idempotency_key = "
+                    ":idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if command is not None:
+                if command.request_hash != request_hash:
+                    raise OwnerConflict("asset_role_idempotency_conflict")
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM rg_asset_roles WHERE role_ref = :role_ref"
+                    ),
+                    {"role_ref": command.role_ref},
+                ).first()
+                if existing is None:
+                    raise OwnerConflict("asset_role_command_invalid")
+                return _accepted_asset_role(existing)
+            semantic_replay = connection.execute(
+                text(
+                    "SELECT * FROM rg_asset_roles WHERE version_ref = :version_ref "
+                    "AND role = :role AND quest_ref = :quest_ref"
+                ),
+                {
+                    "version_ref": binding.version_ref,
+                    "role": role,
+                    "quest_ref": quest_ref,
+                },
+            ).first()
+            if semantic_replay is not None:
+                if semantic_replay.request_hash != request_hash:
+                    raise OwnerConflict("asset_role_acceptance_conflict")
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_asset_role_commands (idempotency_key, "
+                        "request_hash, role_ref, recorded_at) VALUES "
+                        "(:idempotency_key, :request_hash, :role_ref, :recorded_at)"
+                    ),
+                    {
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "role_ref": semantic_replay.role_ref,
+                        "recorded_at": time.time(),
+                    },
+                )
+                return _accepted_asset_role(semantic_replay)
+            role_count = int(
+                connection.execute(
+                    text(
+                        "SELECT COUNT(*) FROM rg_asset_roles WHERE role = :role "
+                        "AND quest_ref = :quest_ref"
+                    ),
+                    {"role": role, "quest_ref": quest_ref},
+                ).scalar_one()
+            )
+            if role_count >= MAX_ASSET_ROLES_PER_QUEST:
+                raise OwnerConflict(
+                    "evidence_role_limit_reached"
+                    if role == "evidence"
+                    else "quest_source_material_role_limit_reached"
+                )
+            version_role_count = int(
+                connection.execute(
+                    text(
+                        "SELECT COUNT(*) FROM rg_asset_roles WHERE "
+                        "version_ref = :version_ref"
+                    ),
+                    {"version_ref": binding.version_ref},
+                ).scalar_one()
+            )
+            if version_role_count >= MAX_ASSET_ROLES_PER_VERSION:
+                raise OwnerConflict("asset_version_role_limit_reached")
+            role_ref = new_ref("asset_role")
+            receipt_ref = new_ref("rg_asset_role_receipt")
+            bindings = {
+                "version_ref": binding.version_ref,
+                "asset_ref": binding.asset_ref,
+                "asset_hash": binding.content_hash,
+                "manifest_hash": binding.manifest_hash,
+                "asset_receipt_kind": binding.receipt.kind,
+                "asset_receipt_ref": binding.receipt.receipt_ref,
+                "asset_receipt_hash": binding.receipt.payload_hash,
+                "role": role,
+                "quest_ref": quest_ref,
+            }
+            receipt_hash = _receipt_hash(
+                ASSET_ROLE_RECEIPT_KIND, role_ref, bindings
+            )
+            now = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO rg_asset_roles (role_ref, version_ref, asset_ref, "
+                    "asset_hash, manifest_hash, asset_receipt_kind, "
+                    "asset_receipt_ref, asset_receipt_hash, role, quest_ref, "
+                    "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                    "accepted_at) VALUES (:role_ref, :version_ref, :asset_ref, "
+                    ":asset_hash, :manifest_hash, :asset_receipt_kind, "
+                    ":asset_receipt_ref, :asset_receipt_hash, :role, :quest_ref, "
+                    ":idempotency_key, :request_hash, :receipt_ref, :receipt_hash, "
+                    ":accepted_at)"
+                ),
+                {
+                    **bindings,
+                    "role_ref": role_ref,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "accepted_at": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO rg_asset_role_commands (idempotency_key, "
+                    "request_hash, role_ref, recorded_at) VALUES "
+                    "(:idempotency_key, :request_hash, :role_ref, :recorded_at)"
+                ),
+                {
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "role_ref": role_ref,
+                    "recorded_at": now,
+                },
+            )
+            role_counter = (
+                "evidence_role_count"
+                if role == "evidence"
+                else "source_material_role_count"
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_graph_state SET revision = revision + 1, "
+                    "asset_role_count = asset_role_count + 1, "
+                    f"{role_counter} = {role_counter} + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "research_graph.asset_role_accepted",
+                {
+                    "role_ref": role_ref,
+                    "version_ref": binding.version_ref,
+                    "role": role,
+                    "quest_ref": quest_ref,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        accepted = self.query_asset_roles(quest_ref=quest_ref, role=role)
+        for candidate in accepted:
+            if candidate.version_ref == binding.version_ref:
+                return candidate
+        raise OwnerConflict("asset_role_missing_after_commit")
+
+    def query_asset_roles(
+        self,
+        *,
+        quest_ref: str | None = None,
+        role: str | None = None,
+        version_refs: tuple[str, ...] | None = None,
+        limit_per_version: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+        before_timestamp: float | None = None,
+        before_ref: str | None = None,
+    ) -> tuple[AcceptedAssetRole, ...]:
+        return self._query_asset_roles(
+            quest_ref=quest_ref,
+            role=role,
+            version_refs=version_refs,
+            limit_per_version=limit_per_version,
+            limit=limit,
+            offset=offset,
+            newest_first=newest_first,
+            before_timestamp=before_timestamp,
+            before_ref=before_ref,
+            verify_dependencies=True,
+        )
+
+    def query_asset_projection_roles(
+        self,
+        *,
+        version_refs: tuple[str, ...],
+        limit_per_version: int,
+    ) -> tuple[AcceptedAssetRole, ...]:
+        """Return bounded immutable role facts without N+1 dependency reads.
+
+        The role receipt itself binds the Quest and accepted RM receipt.  The
+        Projection composer cross-checks that embedded RM binding against the
+        AssetVersion already present in the same exact Snapshot cut.
+        """
+
+        return self._query_asset_roles(
+            version_refs=version_refs,
+            limit_per_version=limit_per_version,
+            verify_dependencies=False,
+        )
+
+    def _query_asset_roles(
+        self,
+        *,
+        quest_ref: str | None = None,
+        role: str | None = None,
+        version_refs: tuple[str, ...] | None = None,
+        limit_per_version: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+        before_timestamp: float | None = None,
+        before_ref: str | None = None,
+        verify_dependencies: bool,
+    ) -> tuple[AcceptedAssetRole, ...]:
+        if offset < 0 or (
+            limit is not None
+            and (limit < 1 or limit > ASSET_ROLE_QUERY_MAX_PAGE_SIZE + 1)
+        ):
+            raise OwnerConflict("asset_role_query_invalid")
+        if limit is not None and limit_per_version is not None:
+            raise OwnerConflict("asset_role_query_invalid")
+        if (before_timestamp is None) != (before_ref is None) or (
+            before_timestamp is not None and not newest_first
+        ):
+            raise OwnerConflict("asset_role_query_invalid")
+        if role is not None and role not in {"evidence", "quest_source_material"}:
+            raise OwnerConflict("asset_role_invalid")
+        clauses: list[str] = []
+        parameters: dict[str, object] = {}
+        if quest_ref is not None:
+            clauses.append("quest_ref = :quest_ref")
+            parameters["quest_ref"] = quest_ref
+        if role is not None:
+            clauses.append("role = :role")
+            parameters["role"] = role
+        if before_timestamp is not None and before_ref is not None:
+            clauses.append(
+                "(accepted_at < :before_timestamp OR (accepted_at = "
+                ":before_timestamp AND role_ref < :before_ref))"
+            )
+            parameters.update(
+                {"before_timestamp": before_timestamp, "before_ref": before_ref}
+            )
+        if version_refs == ():
+            return ()
+        if version_refs is not None:
+            version_parameters = {
+                f"version_ref_{index}": version_ref
+                for index, version_ref in enumerate(version_refs)
+            }
+            placeholders = ", ".join(
+                f":{name}" for name in version_parameters
+            )
+            clauses.append(f"version_ref IN ({placeholders})")
+            parameters.update(version_parameters)
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        query = "SELECT * FROM rg_asset_roles" + where
+        if limit_per_version is not None:
+            if not 1 <= limit_per_version <= ASSET_ROLE_PROJECTION_HISTORY_PER_VERSION:
+                raise OwnerConflict("asset_role_query_invalid")
+            query = (
+                "SELECT * FROM (SELECT roles.*, ROW_NUMBER() OVER (PARTITION BY "
+                "version_ref ORDER BY accepted_at DESC, role_ref DESC) AS "
+                "row_rank FROM ("
+                + query
+                + ") AS roles) AS ranked WHERE row_rank <= :history_limit"
+            )
+            parameters["history_limit"] = limit_per_version
+        direction = " DESC" if newest_first else ""
+        query += f" ORDER BY accepted_at{direction}, role_ref{direction}"
+        if limit is not None:
+            query += " LIMIT :query_limit OFFSET :query_offset"
+            parameters.update({"query_limit": limit, "query_offset": offset})
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(query),
+                parameters,
+            ).all()
+        accepted = tuple(_accepted_asset_role(row) for row in rows)
+        if verify_dependencies:
+            for item in accepted:
+                self._verify_asset_role(item, current=False)
+        return accepted
+
+    def query_evidence_refs(self, quest_ref: str) -> tuple[str, ...]:
+        return self.query_evidence_state(quest_ref)[1]
+
+    def query_evidence_state(
+        self, quest_ref: str
+    ) -> tuple[int, tuple[str, ...]]:
+        return self._receipt_verifier.query_evidence_state(quest_ref)
+
+    def query_evidence_reference_state(
+        self, quest_ref: str
+    ) -> tuple[int, tuple[str, ...]]:
+        return self._receipt_verifier.query_evidence_reference_state(quest_ref)
+
+    def query_asset_reference_revision(self) -> int:
+        return self.query_snapshot().revision
+
+    def query_asset_references(self, version_ref: str) -> tuple[str, ...]:
+        return self.query_asset_reference_state(version_ref)[1]
+
+    def query_asset_reference_state(
+        self, version_ref: str
+    ) -> tuple[int, tuple[str, ...]]:
+        with self._database.read() as connection:
+            revision = int(
+                connection.execute(
+                    text(
+                        "SELECT revision FROM research_graph_state WHERE "
+                        "singleton = 'owner'"
+                    )
+                ).scalar_one()
+            )
+            role_rows = connection.execute(
+                text(
+                    "SELECT * FROM rg_asset_roles WHERE version_ref = "
+                    ":version_ref ORDER BY role_ref"
+                ),
+                {"version_ref": version_ref},
+            ).all()
+            question_rows = connection.execute(
+                text(
+                    "SELECT * FROM rg_questions WHERE content_ref = "
+                    ":version_ref ORDER BY question_ref"
+                ),
+                {"version_ref": version_ref},
+            ).all()
+            decision_rows = connection.execute(
+                text(
+                    "SELECT * FROM rg_idea_outcome_decisions WHERE "
+                    "idea_content_ref = :version_ref ORDER BY decision_ref"
+                ),
+                {"version_ref": version_ref},
+            ).all()
+        roles = tuple(_accepted_asset_role(row) for row in role_rows)
+        for role in roles:
+            self._verify_asset_role(role, current=False)
+        questions = tuple(_accepted_question(row) for row in question_rows)
+        for question in questions:
+            self._receipt_verifier.verify_root_question_receipt(
+                initialization_id=question.initialization_id,
+                quest_ref=question.quest_ref,
+                question_ref=question.question_ref,
+                receipt=question.receipt,
+            )
+        decisions = tuple(_idea_decision(row) for row in decision_rows)
+        for row, decision in zip(decision_rows, decisions, strict=True):
+            self._receipt_verifier.verify_idea_outcome_decision(
+                request_ref=row.request_ref,
+                submission_ref=row.submission_ref,
+                decision=row.decision,
+                outcome_ref=row.outcome_ref,
+                receipt=decision.receipt,
+                outcome_kind=row.outcome_kind,
+            )
+        references = tuple(
+            sorted(
+                [
+                    f"asset-role:{item.role_ref}"
+                    for item in roles
+                ]
+                + [
+                    f"formal-question:{item.question_ref}"
+                    for item in questions
+                ]
+                + [
+                    f"idea-outcome:{item.decision_ref}"
+                    for item in decisions
+                ]
+            )
+        )
+        return revision, references
+
+    def _verify_asset_role(
+        self, accepted: AcceptedAssetRole, *, current: bool
+    ) -> None:
+        self._receipt_verifier.verify_asset_role_receipt(
+            role_ref=accepted.role_ref,
+            version_ref=accepted.version_ref,
+            role=accepted.role,
+            quest_ref=accepted.quest_ref,
+            receipt=accepted.receipt,
+        )
+        if current:
+            binding = accepted.asset_binding()
+            self._asset_verifier.verify_asset_binding(
+                asset_ref=binding.asset_ref,
+                version_ref=binding.version_ref,
+                content_hash=binding.content_hash,
+                manifest_hash=binding.manifest_hash,
+                receipt=binding.receipt,
+            )
+
     def decide_idea_outcome(
         self,
         *,
@@ -920,6 +1693,11 @@ class SQLiteResearchGraph:
             )
         except IdeaContractError as error:
             raise OwnerConflict(str(error)) from error
+        self._receipt_verifier.verify_evidence_refs(
+            quest_ref=accepted_question.quest_ref,
+            version_refs=tuple(sorted(verified_evidence_refs)),
+            require_current=False,
+        )
         if (
             validated_outcome_hash != content.outcome_hash
             or canonical_hash(content.reviewed_draft)
@@ -1099,6 +1877,58 @@ def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> s
             "subject_ref": subject_ref,
             "bindings": bindings,
         }
+    )
+
+
+def _asset_role_bindings(row) -> dict[str, object]:
+    return {
+        "version_ref": row.version_ref,
+        "asset_ref": row.asset_ref,
+        "asset_hash": row.asset_hash,
+        "manifest_hash": row.manifest_hash,
+        "asset_receipt_kind": row.asset_receipt_kind,
+        "asset_receipt_ref": row.asset_receipt_ref,
+        "asset_receipt_hash": row.asset_receipt_hash,
+        "role": row.role,
+        "quest_ref": row.quest_ref,
+    }
+
+
+def _asset_role_receipt_hash(row) -> str:
+    return _receipt_hash(
+        ASSET_ROLE_RECEIPT_KIND, row.role_ref, _asset_role_bindings(row)
+    )
+
+
+def _accepted_asset_role(row) -> AcceptedAssetRole:
+    if (
+        row.role not in {"evidence", "quest_source_material"}
+        or row.receipt_hash != _asset_role_receipt_hash(row)
+    ):
+        raise OwnerConflict("asset_role_receipt_invalid")
+    return AcceptedAssetRole(
+        role_ref=row.role_ref,
+        version_ref=row.version_ref,
+        asset_ref=row.asset_ref,
+        asset_hash=row.asset_hash,
+        manifest_hash=row.manifest_hash,
+        role=row.role,
+        quest_ref=row.quest_ref,
+        accepted_at=float(row.accepted_at),
+        asset_receipt=AcceptanceReceipt(
+            issuer="research_memory",
+            kind=row.asset_receipt_kind,
+            receipt_ref=row.asset_receipt_ref,
+            subject_ref=row.version_ref,
+            payload_hash=row.asset_receipt_hash,
+        ),
+        receipt=AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=ASSET_ROLE_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.role_ref,
+            payload_hash=row.receipt_hash,
+        ),
     )
 
 
@@ -1330,6 +2160,7 @@ def create_research_graph_receipt_verifier(
     database: Database,
     confirmation_verifier: BundleConfirmationVerifier,
     content_verifier: QuestionContentReceiptVerifier,
+    asset_verifier: AssetBindingVerifier,
     idea_content_verifier: IdeaContentReceiptVerifier | None = None,
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
     stage_request_verifier: StageRunRequestVerifier | None = None,
@@ -1338,6 +2169,7 @@ def create_research_graph_receipt_verifier(
         database,
         confirmation_verifier,
         content_verifier,
+        asset_verifier,
         idea_content_verifier,
         execution_verifier,
         stage_request_verifier,
@@ -1349,6 +2181,7 @@ def create_research_graph_interface(
     feed: DurableFeed,
     confirmation_verifier: BundleConfirmationVerifier,
     content_verifier: QuestionContentReceiptVerifier,
+    asset_verifier: AssetBindingVerifier,
     receipt_verifier: SQLiteResearchGraphReceiptVerifier,
     idea_content_verifier: IdeaContentReceiptVerifier | None = None,
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
@@ -1359,6 +2192,7 @@ def create_research_graph_interface(
         feed,
         confirmation_verifier,
         content_verifier,
+        asset_verifier,
         receipt_verifier,
         idea_content_verifier,
         execution_verifier,

@@ -18,7 +18,9 @@ IDEA_OUTCOME_SCHEMA_REF = "meta-research/idea-outcome/v1"
 IDEA_REVIEW_SCHEMA_V1_REF = "meta-research/idea-advisory-review/v1"
 IDEA_REVIEW_SCHEMA_REF = "meta-research/idea-advisory-review/v2"
 IDEA_CONTEXT_PACK_SCHEMA_REF = "meta-research/idea-context-pack/v1"
-_IDEA_CONTEXT_PACK_FIELDS = {
+IDEA_CONTEXT_PACK_SCHEMA_V2_REF = "meta-research/idea-context-pack/v2"
+MAX_IDEA_CONTEXT_EVIDENCE_REFS = 100
+_IDEA_CONTEXT_PACK_V1_FIELDS = {
     "schema_ref",
     "cycle_ref",
     "accepted_question_binding",
@@ -26,6 +28,9 @@ _IDEA_CONTEXT_PACK_FIELDS = {
     "literature_binding",
     "prior_accepted_bindings",
     "active_guidance_bindings",
+}
+_IDEA_CONTEXT_PACK_V2_FIELDS = _IDEA_CONTEXT_PACK_V1_FIELDS | {
+    "evidence_reference_revision"
 }
 _MATERIAL_IDENTITY_FIELDS = {
     "candidate_key",
@@ -211,28 +216,58 @@ def validate_idea_context_pack(
     cycle_ref: str,
     accepted_question_binding: dict[str, object],
 ) -> set[str]:
-    """Validate the current Idea invocation closure at its Owner boundary.
+    """Validate the pure shape of the current Idea invocation closure.
 
-    Evidence, literature, history, and guidance Owner verifiers are not yet
-    delivered. Their bindings therefore fail closed to their exact empty form.
+    The RG Owner verifies non-empty Evidence refs at command boundaries.  Empty
+    packs remain valid historical artifacts after Evidence support is enabled.
     """
 
-    if (
-        not isinstance(context_pack, dict)
-        or set(context_pack) != _IDEA_CONTEXT_PACK_FIELDS
-    ):
+    if not isinstance(context_pack, dict):
+        raise IdeaContractError("idea_context_pack_invalid")
+    schema_ref = context_pack.get("schema_ref")
+    expected_fields = (
+        _IDEA_CONTEXT_PACK_V2_FIELDS
+        if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V2_REF
+        else _IDEA_CONTEXT_PACK_V1_FIELDS
+    )
+    if set(context_pack) != expected_fields:
         raise IdeaContractError("idea_context_pack_invalid")
     if (
-        context_pack["schema_ref"] != IDEA_CONTEXT_PACK_SCHEMA_REF
+        schema_ref
+        not in {IDEA_CONTEXT_PACK_SCHEMA_REF, IDEA_CONTEXT_PACK_SCHEMA_V2_REF}
         or context_pack["cycle_ref"] != cycle_ref
         or context_pack["accepted_question_binding"] != accepted_question_binding
-        or context_pack["accepted_evidence_refs"] != []
         or context_pack["literature_binding"] is not None
         or context_pack["prior_accepted_bindings"] != []
         or context_pack["active_guidance_bindings"] != []
     ):
         raise IdeaContractError("idea_context_pack_invalid")
-    return set()
+    if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V2_REF:
+        revision = context_pack["evidence_reference_revision"]
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            raise IdeaContractError("idea_context_pack_invalid")
+    refs = context_pack["accepted_evidence_refs"]
+    if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_REF and refs != []:
+        # V1 never carried Evidence authority. Keep that immutable schema
+        # violation on the original public error contract.
+        raise IdeaContractError("idea_context_pack_invalid")
+    if (
+        not isinstance(refs, list)
+        or len(refs) > MAX_IDEA_CONTEXT_EVIDENCE_REFS
+        or not all(isinstance(item, str) and item for item in refs)
+        or refs != sorted(set(refs))
+    ):
+        raise IdeaContractError("context_pack_evidence_bindings_invalid")
+    return set(cast(list[str], refs))
+
+
+def evidence_reference_revision(context_pack: dict[str, object]) -> int | None:
+    value = context_pack.get("evidence_reference_revision")
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise IdeaContractError("idea_context_pack_invalid")
+    return value
 
 
 def material_text(value: str) -> str:

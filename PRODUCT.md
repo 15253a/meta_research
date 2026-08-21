@@ -93,10 +93,34 @@ The generic `stage_execution` capability remains unavailable until the later
 Plan, Bundle, and Reasoning execution slices are delivered; the Idea execution
 implemented here is reported only through the five explicit `idea_stage` facts.
 
-Accepted-material basis and first-question DeepFetch remain explicitly typed
-as unavailable until their own production slices are delivered. The direct
-path does not use a CreationSeed or treat unavailable material intake as a
-waiver.
+Research Asset is now a production vertical slice. The authenticated Web can
+submit text, uploaded files, directories, local paths, repositories, links,
+and system artifacts through Research Memory's public Command Interface. Each
+successful intake forms one immutable AssetVersion with an exact MemoryRef,
+hashes, provenance, custody facts, and Asset Accepted Receipt. Managed custody
+is accepted only after the content-addressed object is verified; linked-local
+custody freezes its manifest and reports later source drift as availability,
+without rewriting historical integrity or receipts. Async jobs, interrupted
+processing, pre-existing object bytes, replay, and daemon restart reconcile
+through the same durable intake record.
+
+The Research Asset Inventory is a read-only Projection over those public Owner
+Queries. It keeps integrity and availability separate, materializes only an
+exact MemoryRef, and includes durable Hold and ReleaseEligibility receipts.
+Custody handoff verifies managed bytes before it issues the target receipt and
+never moves or deletes the user's original. ReleaseEligibility is an assessment,
+not a delete command, and fails closed when an RG reference, Hold, stale
+reference revision, or uncertain state remains. Research Graph separately
+accepts Evidence and Quest Source Material roles; those semantic roles do not
+transfer content or custody ownership out of Research Memory. Existing formal
+Question and Idea content is migrated into the unified inventory without
+changing its stable ref, hash, object path, or historical receipt.
+
+Quest creation may select exact accepted AssetVersion bindings for its material
+basis, including `provided_only`; raw browser files and paths still cannot enter
+that basis directly. First-question DeepFetch remains explicitly typed as
+unavailable until its production slice is delivered. The direct path does not
+use a CreationSeed or treat DeepFetch unavailability as a waiver.
 
 The supported public host operations are exposed by the `meta-research`
 command. Research state is observed through the authenticated Snapshot and SSE

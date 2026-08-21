@@ -606,6 +606,24 @@ def test_worker_recovers_every_quest_without_latest_cycle_starvation(
         runtime.close()
 
 
+def test_one_worker_pass_attempts_at_most_one_provider_boundary(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "one-provider-boundary-per-pass")
+    provider = _IdeaProvider()
+    runtime = _runtime(data_root, provider)
+    try:
+        _confirm_question(runtime, "provider-budget-first")
+        runtime.idea_stage.start("provider-budget-first-start")
+        _confirm_question(runtime, "provider-budget-second")
+        runtime.idea_stage.start("provider-budget-second-start")
+
+        assert runtime.idea_stage.process_once()
+        assert len(provider.requests) == 1
+    finally:
+        runtime.close()
+
+
 def test_correcting_rejection_chain_cannot_starve_a_later_quest(
     tmp_path: Path,
 ) -> None:

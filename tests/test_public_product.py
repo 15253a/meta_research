@@ -98,6 +98,8 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "owner_interfaces",
             "projection",
             "idea_stage_worker",
+            "research_asset_intake_worker",
+            "research_asset_verification_worker",
             "quest_drafting_worker",
             "quest_reconciliation_worker",
         }

@@ -9,6 +9,7 @@ import {
   type UnavailableCapability,
 } from "./api";
 import { QuestCreationWorkbench } from "./QuestCreation";
+import { ResearchAssetsWorkbench } from "./ResearchAssets";
 import "./shell.css";
 
 const capabilityLabels: Record<string, string> = {
@@ -35,13 +36,17 @@ type ShellState =
   | "ready-empty"
   | "ready-active";
 
+type CapabilityState =
+  | UnavailableCapability
+  | { capability: string; status: "ready" };
+
 if (window.location.pathname === "/auth/launch") {
   window.history.replaceState(null, "", "/");
 }
 
-function uniqueUnavailable(snapshot: PublicSnapshot | null): UnavailableCapability[] {
+function uniqueCapabilities(snapshot: PublicSnapshot | null): CapabilityState[] {
   if (!snapshot) return [];
-  const entries = [
+  const entries: CapabilityState[] = [
     {
       capability: "accepted_material_basis",
       ...snapshot.quest_creation.accepted_material_basis,
@@ -67,7 +72,12 @@ function shellState(snapshot: PublicSnapshot | null, error: string | null): Shel
 function questCreationReady(snapshot: PublicSnapshot | null): boolean {
   if (!snapshot) return false;
   const requiredChecks = snapshot.readiness.checks.filter(
-    (check) => check.name !== "idea_stage_worker",
+    (check) =>
+      ![
+        "idea_stage_worker",
+        "research_asset_intake_worker",
+        "research_asset_verification_worker",
+      ].includes(check.name),
   );
   return requiredChecks.length > 0
     ? requiredChecks.every((check) => check.status === "ready")
@@ -104,16 +114,25 @@ function RailButton({
 
 function LumenRail({
   canCreate,
+  canBrowseAssets,
   onCreate,
+  onBrowseAssets,
 }: {
   canCreate: boolean;
+  canBrowseAssets: boolean;
   onCreate: () => void;
+  onBrowseAssets: () => void;
 }) {
   return (
     <nav className="lumen-rail" aria-label="主导航" data-shell-region="rail">
       <RailButton label="Quest 总览" glyph="⌂" active />
       <RailButton label="问题树" glyph="树" unavailable />
-      <RailButton label="Research Asset" glyph="▤" unavailable />
+      <RailButton
+        label="Research Asset"
+        glyph="▤"
+        unavailable={!canBrowseAssets}
+        onClick={onBrowseAssets}
+      />
       <RailButton label="Writing" glyph="✎" unavailable />
       <RailButton label="历史" glyph="↺" unavailable />
       <RailButton label="HumanRequest" glyph="!" unavailable />
@@ -782,7 +801,7 @@ function WorkspaceMain({
   streamInterrupted: boolean;
   retry: () => void;
 }) {
-  const unavailable = uniqueUnavailable(snapshot);
+  const unavailable = uniqueCapabilities(snapshot);
   const ideaStage = snapshot?.research_space.status === "active"
     ? snapshot.idea_stage ?? null
     : null;
@@ -853,7 +872,7 @@ function WorkspaceMain({
             {unavailable.length ? (
               <ul>
                 {unavailable.map((item) => (
-                  <li key={item.capability}>
+                  <li key={item.capability} data-capability={item.capability}>
                     <span>{capabilityLabels[item.capability] ?? item.capability}</span>
                     <code>{item.status}</code>
                   </li>
@@ -874,6 +893,12 @@ function WorkspaceMain({
                     <div key={name}>
                       <dt>{ownerLabels[name] ?? name}</dt>
                       <dd>{owner.status} · r{owner.revision}</dd>
+                    </div>
+                  ))}
+                  {snapshot.readiness.checks.map((check) => (
+                    <div key={check.name}>
+                      <dt>{check.name}</dt>
+                      <dd>{check.status}</dd>
                     </div>
                   ))}
                 </dl>
@@ -958,6 +983,9 @@ function App() {
       return panel === "new-quest" ? "new" : panel === "create-quest" ? "current" : null;
     },
   );
+  const [assetsOpen, setAssetsOpen] = useState(
+    () => new URLSearchParams(window.location.search).get("panel") === "research-assets",
+  );
   const [streamCursor, setStreamCursor] = useState<number | null>(null);
   const [snapshotRetrySequence, setSnapshotRetrySequence] = useState(0);
   const reloadInFlight = useRef(false);
@@ -1032,6 +1060,13 @@ function App() {
 
   const state = shellState(snapshot, error);
   const canCreate = questCreationReady(snapshot);
+  const canBrowseAssets = snapshot?.research_assets.status === "ready";
+  const intakeWorkerReady = snapshot?.readiness.checks.find(
+    (check) => check.name === "research_asset_intake_worker",
+  )?.status === "ready";
+  const verificationWorkerReady = snapshot?.readiness.checks.find(
+    (check) => check.name === "research_asset_verification_worker",
+  )?.status === "ready";
   const openCreation = () => {
     if (!canCreate) return;
     window.history.replaceState(null, "", "/?panel=create-quest");
@@ -1040,6 +1075,16 @@ function App() {
   const closeCreation = () => {
     window.history.replaceState(null, "", "/");
     setCreationMode(null);
+  };
+  const openAssets = () => {
+    if (!canBrowseAssets) return;
+    setCreationMode(null);
+    window.history.replaceState(null, "", "/?panel=research-assets");
+    setAssetsOpen(true);
+  };
+  const closeAssets = () => {
+    window.history.replaceState(null, "", "/");
+    setAssetsOpen(false);
   };
 
   return (
@@ -1063,7 +1108,12 @@ function App() {
             {snapshot ? <code>rev {snapshot.revision}</code> : null}
           </div>
         </header>
-        <LumenRail canCreate={Boolean(canCreate)} onCreate={openCreation} />
+        <LumenRail
+          canCreate={Boolean(canCreate)}
+          canBrowseAssets={canBrowseAssets}
+          onCreate={openCreation}
+          onBrowseAssets={openAssets}
+        />
         <WorkspaceMain
           snapshot={snapshot}
           state={state}
@@ -1076,7 +1126,21 @@ function App() {
       {creationMode && snapshot ? (
         <QuestCreationWorkbench
           current={creationMode === "new" ? null : snapshot.quest_creation.current}
+          researchAssets={snapshot.research_assets.items}
+          researchAssetInventoryRevision={
+            snapshot.research_assets.inventory_revision
+          }
+          researchAssetTotal={snapshot.research_assets.total_count}
           onClose={closeCreation}
+          onChanged={() => void reload()}
+        />
+      ) : null}
+      {assetsOpen && snapshot ? (
+        <ResearchAssetsWorkbench
+          initial={snapshot.research_assets}
+          intakeWorkerReady={Boolean(intakeWorkerReady)}
+          verificationWorkerReady={Boolean(verificationWorkerReady)}
+          onClose={closeAssets}
           onChanged={() => void reload()}
         />
       ) : null}

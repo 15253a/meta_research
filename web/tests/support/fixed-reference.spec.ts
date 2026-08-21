@@ -4,6 +4,7 @@ import { PNG } from "pngjs";
 import {
   assertDiffGridSignature,
   assertReviewedProductionBaseline,
+  normalizeReviewedRasterPixels,
 } from "./fixed-reference.js";
 
 
@@ -49,4 +50,37 @@ test("rejects a fixed color-token drift below the prototype similarity threshold
     0,
     "fixed-color-token-drift",
   )).toThrow(/reviewed production baseline drifted/);
+});
+
+test("normalizes only an exact reviewed rounded-corner raster variant", () => {
+  const image = new PNG({ width: 4, height: 4 });
+  image.data.fill(255);
+  image.data.set([227, 229, 236, 255], (2 * image.width + 1) * 4);
+
+  expect(normalizeReviewedRasterPixels(image, [
+    {
+      x: 1,
+      y: 2,
+      offsetX: 1,
+      offsetY: 2,
+      reviewedRgba: [226, 229, 236, 255],
+      chromiumRgba: [227, 229, 236, 255],
+    },
+  ], "rounded-corner")).toBe(1);
+  expect(
+    Array.from(image.data.subarray((2 * image.width + 1) * 4, (2 * image.width + 2) * 4)),
+  ).toEqual([226, 229, 236, 255]);
+  expect(Array.from(image.data.subarray(0, 4))).toEqual([255, 255, 255, 255]);
+
+  image.data.set([227, 230, 236, 255], (2 * image.width + 1) * 4);
+  expect(() => normalizeReviewedRasterPixels(image, [
+    {
+      x: 1,
+      y: 2,
+      offsetX: 1,
+      offsetY: 2,
+      reviewedRgba: [226, 229, 236, 255],
+      chromiumRgba: [227, 229, 236, 255],
+    },
+  ], "rounded-corner")).toThrow(/raster normalization pixel 1,2 changed/);
 });

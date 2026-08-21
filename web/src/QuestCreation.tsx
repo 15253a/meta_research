@@ -11,6 +11,7 @@ import {
   confirmQuest,
   createQuest,
   fetchQuestCreation,
+  fetchResearchAssets,
   generateQuestionProposal,
   observeHostCompute,
   ProductError,
@@ -20,7 +21,8 @@ import {
   type IntentSessionTurn,
   type LegacyQuestDraft,
   type QuestionContent,
-  type ReceiptState,
+  type QuestReceiptState,
+  type ResearchAssetItem,
   type QuestCreationView,
   type QuestDraft,
 } from "./api";
@@ -152,10 +154,16 @@ const idleOperations: InFlightOperations = {
 
 export function QuestCreationWorkbench({
   current,
+  researchAssets,
+  researchAssetInventoryRevision,
+  researchAssetTotal,
   onClose,
   onChanged,
 }: {
   current: QuestCreationView | null;
+  researchAssets: ResearchAssetItem[];
+  researchAssetInventoryRevision: number;
+  researchAssetTotal: number;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -222,6 +230,71 @@ export function QuestCreationWorkbench({
   const [error, setError] = useState<ProductFailure | null>(null);
   const [intentText, setIntentText] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [materialPickerOpen, setMaterialPickerOpen] = useState(false);
+  const [materialAssets, setMaterialAssets] = useState(researchAssets);
+  const [materialInventoryRevision, setMaterialInventoryRevision] = useState(
+    researchAssetInventoryRevision,
+  );
+  const materialInventoryRevisionRef = useRef(
+    researchAssetInventoryRevision,
+  );
+  const [materialTotal, setMaterialTotal] = useState(researchAssetTotal);
+  const [materialsLoading, setMaterialsLoading] = useState(false);
+
+  useEffect(() => {
+    materialInventoryRevisionRef.current = researchAssetInventoryRevision;
+    setMaterialAssets((current) => {
+      if (materialInventoryRevision !== researchAssetInventoryRevision) {
+        return researchAssets;
+      }
+      const byRef = new Map(
+        current.map((item) => [item.memory_ref, item]),
+      );
+      for (const item of researchAssets) byRef.set(item.memory_ref, item);
+      return [...byRef.values()];
+    });
+    setMaterialInventoryRevision(researchAssetInventoryRevision);
+    setMaterialTotal(researchAssetTotal);
+  }, [researchAssetInventoryRevision, researchAssetTotal, researchAssets]);
+
+  const loadMoreMaterials = useCallback(async () => {
+    if (materialsLoading || materialAssets.length >= materialTotal) return;
+    setMaterialsLoading(true);
+    try {
+      const next = await fetchResearchAssets(
+        undefined,
+        materialAssets.length,
+        50,
+      );
+      if (
+        next.inventory_revision !== materialInventoryRevisionRef.current
+      ) {
+        const currentPage = await fetchResearchAssets();
+        setMaterialAssets(currentPage.items);
+        materialInventoryRevisionRef.current = currentPage.inventory_revision;
+        setMaterialInventoryRevision(currentPage.inventory_revision);
+        setMaterialTotal(currentPage.total_count);
+        return;
+      }
+      setMaterialAssets((current) => {
+        const byRef = new Map(current.map((item) => [item.memory_ref, item]));
+        for (const item of next.items) byRef.set(item.memory_ref, item);
+        return [...byRef.values()];
+      });
+      setMaterialTotal(next.total_count);
+    } catch (caught) {
+      const code = caught instanceof ProductError ? caught.code : "unknown_error";
+      errorFocusRef.current = "alert";
+      setError({ code, message: messageFor(code) });
+    } finally {
+      setMaterialsLoading(false);
+    }
+  }, [
+    materialAssets.length,
+    materialInventoryRevision,
+    materialTotal,
+    materialsLoading,
+  ]);
 
   const applyView = useCallback((
     received: QuestCreationView,
@@ -681,6 +754,23 @@ export function QuestCreationWorkbench({
     setHasEditedDraft(true);
     setDraftSaveState("unsaved");
     if (writeConflictRef.current === null) setError(null);
+  };
+
+  const toggleAcceptedMaterial = (asset: ResearchAssetItem) => {
+    const bindings = draftRef.current.literature.accepted_material_bindings;
+    const selected = bindings.some(
+      (binding) => binding.version_ref === asset.version_ref,
+    );
+    const nextBindings = selected
+      ? bindings.filter((binding) => binding.version_ref !== asset.version_ref)
+      : [...bindings, researchAssetBinding(asset)];
+    updateDraft({
+      ...draftRef.current,
+      literature: {
+        ...draftRef.current.literature,
+        accepted_material_bindings: nextBindings,
+      },
+    });
   };
 
   const updateProposal = (key: keyof QuestionContent, value: string) => {
@@ -1220,7 +1310,9 @@ export function QuestCreationWorkbench({
                     >
                       <option value="oa_then_institution">全面搜索（包括图书馆）</option>
                       <option value="oa_only">只搜索开放获取资源</option>
-                      <option value="provided_only" disabled>只使用我提供的材料</option>
+                      <option value="provided_only" disabled={materialTotal === 0}>
+                        只使用我提供的材料
+                      </option>
                     </select>
                   </label>
                   <div className="quest-library-prep">
@@ -1254,8 +1346,10 @@ export function QuestCreationWorkbench({
                     不收集密码、Cookie、token、OTP 或浏览器 profile；入口 URL 只是 Quest 配置。
                   </small>
                   {draft.literature.mode === "provided_only" ? (
-                    <small className="quest-library-boundary unavailable">
-                      capability_unavailable · research_memory_asset_intake_not_delivered
+                    <small className="quest-library-boundary">
+                      {draft.literature.accepted_material_bindings.length
+                        ? `已绑定 ${draft.literature.accepted_material_bindings.length} 个 RM Accepted AssetVersion。`
+                        : "请在下方选择至少一个已由 Research Memory 接纳的精确版本。"}
                     </small>
                   ) : null}
                 </div>
@@ -1294,10 +1388,62 @@ export function QuestCreationWorkbench({
                       />
                     </label>
                     <div className="quest-material-boundary">
-                      <button className="quest-material-button" type="button" disabled>选择文件夹</button>
-                      <button className="quest-material-button" type="button" disabled>选择文件</button>
-                      <span className="quest-unavailable-tag">capability_unavailable</span>
-                      <span>raw 文件、路径或 MaterialSubmission 不是 RM Asset Accepted Receipt，不能进入当前 basis。</span>
+                      <button
+                        className="quest-material-button"
+                        type="button"
+                        disabled={!creation || draftInteractionLocked}
+                        aria-expanded={materialPickerOpen}
+                        onClick={() => setMaterialPickerOpen((open) => !open)}
+                      >
+                        选择文件夹
+                      </button>
+                      <button
+                        className="quest-material-button"
+                        type="button"
+                        disabled={!creation || draftInteractionLocked}
+                        aria-expanded={materialPickerOpen}
+                        onClick={() => setMaterialPickerOpen((open) => !open)}
+                      >
+                        选择文件
+                      </button>
+                      <span className="quest-accepted-tag">RM accepted only</span>
+                      <span>只选择已接纳 AssetVersion；raw 文件与路径仍不能直接进入 basis。</span>
+                      {materialPickerOpen ? (
+                        <div className="quest-material-picker" role="group" aria-label="选择已接纳 Research Asset">
+                          {materialAssets.length ? materialAssets.map((asset) => {
+                            const selected = draft.literature.accepted_material_bindings.some(
+                              (binding) => binding.version_ref === asset.version_ref,
+                            );
+                            return (
+                              <button
+                                key={asset.version_ref}
+                                type="button"
+                                aria-pressed={selected}
+                                onClick={() => toggleAcceptedMaterial(asset)}
+                              >
+                                <span>{selected ? "✓" : "+"}</span>
+                                <b>{asset.display_name}</b>
+                                <small>{asset.version_ref} · integrity {asset.integrity} · availability {asset.availability}</small>
+                              </button>
+                            );
+                          }) : (
+                            <small>尚无可选版本；先从左侧 Research Asset 工作台完成 Intake。</small>
+                          )}
+                          {materialAssets.length < materialTotal ? (
+                            <button
+                              type="button"
+                              disabled={materialsLoading}
+                              onClick={() => void loadMoreMaterials()}
+                            >
+                              <span>+</span>
+                              <b>{materialsLoading ? "正在读取…" : "加载更多已接纳版本"}</b>
+                              <small>
+                                已显示 {materialAssets.length} / {materialTotal}
+                              </small>
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
                   </div>
                 </details>
@@ -1722,7 +1868,7 @@ function ReceiptTechnicalDetails({
   receipt,
 }: {
   name: string;
-  receipt: ReceiptState;
+  receipt: QuestReceiptState;
 }) {
   return (
     <article className={`quest-technical-record receipt ${receipt.status}`}>
@@ -1731,9 +1877,18 @@ function ReceiptTechnicalDetails({
         <>
           <span>issuer · {receipt.issuer}</span>
           <span>kind · {receipt.kind}</span>
-          <span>receipt · {receipt.receipt_ref}</span>
-          <span>subject · {receipt.subject_ref}</span>
-          <span>payload hash · {receipt.payload_hash}</span>
+          {"role_refs" in receipt ? (
+            <>
+              <span>role refs · {technicalList(receipt.role_refs)}</span>
+              <span>receipts · {receipt.receipts.length}</span>
+            </>
+          ) : (
+            <>
+              <span>receipt · {receipt.receipt_ref}</span>
+              <span>subject · {receipt.subject_ref}</span>
+              <span>payload hash · {receipt.payload_hash}</span>
+            </>
+          )}
         </>
       ) : receipt.reason ? (
         <>
@@ -2093,6 +2248,16 @@ function timeBudgetLabel(value: QuestDraft["time_budget"]): string {
 function formatMemory(memoryTotalMib: number): string {
   const gib = memoryTotalMib / 1024;
   return `${Number.isInteger(gib) ? gib.toFixed(0) : gib.toFixed(1)} GiB`;
+}
+
+function researchAssetBinding(asset: ResearchAssetItem): Record<string, unknown> {
+  return {
+    asset_ref: asset.asset_ref,
+    version_ref: asset.version_ref,
+    content_hash: asset.content_hash,
+    manifest_hash: asset.manifest_hash,
+    receipt: { ...asset.receipt },
+  };
 }
 
 function messageFor(code: string): string {

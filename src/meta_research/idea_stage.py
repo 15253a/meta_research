@@ -37,7 +37,7 @@ from meta_research.owners.research_memory import (
 )
 
 
-IDEA_CONTEXT_PACK_SCHEMA_REF = "meta-research/idea-context-pack/v1"
+IDEA_CONTEXT_PACK_SCHEMA_REF = "meta-research/idea-context-pack/v2"
 _CYCLE_EVENT = "advancement_engine.initial_cycle_activated"
 
 
@@ -46,6 +46,12 @@ class _CurrentCycle:
     revision: int
     cycle_ref: str
     question: AcceptedQuestion
+
+
+@dataclass(frozen=True)
+class _CycleStep:
+    advanced: bool
+    provider_boundary_attempted: bool = False
 
 
 class IdeaStageWorker:
@@ -73,6 +79,7 @@ class IdeaStageWorker:
         self._research_graph = research_graph
         self._provider = provider
         self._transient_error: str | None = None
+        self._provider_cursor_cycle_ref: str | None = None
 
     @property
     def transient_error(self) -> str | None:
@@ -127,15 +134,34 @@ class IdeaStageWorker:
         transient_error: str | None = None
         advanced = False
         self._transient_error = None
-        for current in self._discover_cycles():
-            if self._process_cycle(current):
+        cycles = list(self._discover_cycles())
+        if self._provider_cursor_cycle_ref is not None:
+            cursor = next(
+                (
+                    index
+                    for index, cycle in enumerate(cycles)
+                    if cycle.cycle_ref == self._provider_cursor_cycle_ref
+                ),
+                None,
+            )
+            if cursor is not None:
+                cycles = cycles[cursor + 1 :] + cycles[: cursor + 1]
+        for current in cycles:
+            step = self._process_cycle(current)
+            if step.advanced:
                 advanced = True
             if self._transient_error is not None:
                 transient_error = transient_error or self._transient_error
+            # One provider boundary can legitimately consume the full provider
+            # deadline. Later provider work belongs to the next daemon pass so
+            # the watchdog does not scale with the number of active Cycles.
+            if step.provider_boundary_attempted:
+                self._provider_cursor_cycle_ref = current.cycle_ref
+                break
         self._transient_error = transient_error
         return advanced
 
-    def _process_cycle(self, current: _CurrentCycle) -> bool:
+    def _process_cycle(self, current: _CurrentCycle) -> _CycleStep:
         """Cross at most one Owner boundary for one revalidated cycle."""
 
         request = self._advancement_engine.query_idea_stage_request(
@@ -150,22 +176,22 @@ class IdeaStageWorker:
                     "idea-request", current.cycle_ref, "worker"
                 ),
             )
-            return True
+            return _CycleStep(True)
         run = self._agent_runtime.query_idea_stage_run(request.request_ref)
         if run is None:
             try:
                 runtime_binding = self._provider.runtime_binding()
             except IdeaSkillUnavailable as error:
                 self._transient_error = error.code
-                return False
+                return _CycleStep(False, provider_boundary_attempted=True)
             self._agent_runtime.admit_idea_stage(
                 request,
                 _operation_key("idea-admit", request.request_ref),
                 runtime_binding=runtime_binding,
             )
-            return True
+            return _CycleStep(True, provider_boundary_attempted=True)
         if self._advancement_engine.query_idea_stage_commit(request.request_ref):
-            return False
+            return _CycleStep(False)
 
         execution = run.execution
         if execution is None:
@@ -186,7 +212,7 @@ class IdeaStageWorker:
                 review=execution.review,
                 execution_receipt=execution.receipt,
             )
-            return True
+            return _CycleStep(True)
 
         decision = self._research_graph.query_idea_outcome_decision(
             execution.submission_ref
@@ -201,7 +227,7 @@ class IdeaStageWorker:
                 content=content,
                 execution_receipt=execution.receipt,
             )
-            return True
+            return _CycleStep(True)
 
         if decision.decision == "rejected":
             self._agent_runtime.continue_after_idea_rejection(
@@ -216,7 +242,7 @@ class IdeaStageWorker:
                     decision.receipt.receipt_ref,
                 ),
             )
-            return True
+            return _CycleStep(True)
         if decision.decision != "accepted" or decision.outcome_ref is None:
             raise OwnerConflict("idea_outcome_decision_invalid")
 
@@ -234,7 +260,7 @@ class IdeaStageWorker:
                     decision.outcome_ref,
                 ),
             )
-            return True
+            return _CycleStep(True)
 
         if decision.outcome_kind not in {"idea_set", "no_viable_candidate"}:
             raise OwnerConflict("idea_outcome_kind_invalid")
@@ -250,7 +276,7 @@ class IdeaStageWorker:
                 "idea-commit", request.request_ref, decision.outcome_ref
             ),
         )
-        return True
+        return _CycleStep(True)
 
     def query_current(self) -> dict[str, object]:
         """Compose the fixed five-slot public Idea Stage projection."""
@@ -338,7 +364,7 @@ class IdeaStageWorker:
         current: _CurrentCycle,
         request: StageRunRequest,
         run: IdeaStageRun,
-    ) -> bool:
+    ) -> _CycleStep:
         predecessor = run.predecessor_execution
         rejection = run.rejection_receipt
         decision: IdeaOutcomeDecision | None = None
@@ -374,10 +400,10 @@ class IdeaStageWorker:
             runtime_binding = self._provider.runtime_binding()
         except IdeaSkillUnavailable as error:
             self._transient_error = error.code
-            return False
+            return _CycleStep(False, provider_boundary_attempted=True)
         if runtime_binding != run.runtime_binding:
             self._transient_error = "idea_runtime_binding_drift"
-            return False
+            return _CycleStep(False, provider_boundary_attempted=True)
         job_ref = (
             run.primary_invocation.invocation_ref
             if run.primary_draft is None
@@ -409,10 +435,10 @@ class IdeaStageWorker:
                 draft_hash = validate_idea_skill_draft(skill_request, draft)
             except IdeaSkillUnavailable as error:
                 self._transient_error = error.code
-                return False
+                return _CycleStep(False, provider_boundary_attempted=True)
             except IdeaSkillContractError as error:
                 self._transient_error = str(error)
-                return False
+                return _CycleStep(False, provider_boundary_attempted=True)
             checkpoint = self._agent_runtime.record_idea_primary_draft(
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
@@ -428,7 +454,7 @@ class IdeaStageWorker:
             if checkpoint.draft_hash != draft_hash:
                 raise OwnerConflict("idea_primary_draft_hash_mismatch")
             self._transient_error = None
-            return True
+            return _CycleStep(True, provider_boundary_attempted=True)
 
         checkpoint = run.primary_draft
         draft = IdeaSkillDraft(
@@ -445,10 +471,10 @@ class IdeaStageWorker:
             )
         except IdeaSkillUnavailable as error:
             self._transient_error = error.code
-            return False
+            return _CycleStep(False, provider_boundary_attempted=True)
         except IdeaSkillContractError as error:
             self._transient_error = str(error)
-            return False
+            return _CycleStep(False, provider_boundary_attempted=True)
         review = review_record(
             result,
             draft_hash=draft_hash,
@@ -481,7 +507,7 @@ class IdeaStageWorker:
         finish_job = getattr(self._provider, "finish_job", None)
         if callable(finish_job):
             finish_job(job_ref)
-        return True
+        return _CycleStep(True, provider_boundary_attempted=True)
 
     def _accepted_facts(
         self, execution: AttemptExecution | None
@@ -506,11 +532,20 @@ class IdeaStageWorker:
         return content
 
     def _context_pack(self, current: _CurrentCycle) -> dict[str, object]:
+        reference_query = getattr(
+            self._research_graph,
+            "query_evidence_reference_state",
+            self._research_graph.query_evidence_state,
+        )
+        evidence_revision, evidence_refs = reference_query(
+            current.question.quest_ref
+        )
         return {
             "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_REF,
             "cycle_ref": current.cycle_ref,
             "accepted_question_binding": current.question.as_binding().as_dict(),
-            "accepted_evidence_refs": [],
+            "accepted_evidence_refs": list(evidence_refs),
+            "evidence_reference_revision": evidence_revision,
             "literature_binding": None,
             "prior_accepted_bindings": [],
             "active_guidance_bindings": [],

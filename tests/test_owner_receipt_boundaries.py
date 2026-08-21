@@ -106,6 +106,75 @@ def _confirm_direct_quest(runtime, prefix: str) -> dict[str, object]:
     return created
 
 
+def test_unified_legacy_asset_tamper_fails_every_public_consumer_closed(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "legacy-asset-consumers")
+    hc = runtime.owners.human_collaboration
+    rm = runtime.owners.research_memory
+    rg = runtime.owners.research_graph
+    try:
+        created = _confirm_direct_quest(runtime, "legacy-asset")
+        assert hc.reconcile_once()
+        assert hc.reconcile_once()
+        content = rm.query_question_content(created["initialization_id"])
+        assert content is not None
+
+        owner_referenced = rm.assess_release_eligibility(
+            content.content_ref,
+            expected_reference_revision=rg.query_asset_reference_revision(),
+            idempotency_key="legacy-asset-owner-reference",
+        )
+        assert owner_referenced.eligible is False
+        assert owner_referenced.active_reference_refs == (
+            f"rm-formal-content:{content.content_ref}",
+        )
+        assert owner_referenced.reason_codes == ("semantic_reference_active",)
+
+        tampered_hash = "f" * 64
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE rm_asset_versions SET receipt_hash = :receipt_hash "
+                    "WHERE version_ref = :version_ref"
+                ),
+                {
+                    "receipt_hash": tampered_hash,
+                    "version_ref": content.content_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE rm_asset_custodies SET receipt_hash = :receipt_hash "
+                    "WHERE version_ref = :version_ref"
+                ),
+                {
+                    "receipt_hash": tampered_hash,
+                    "version_ref": content.content_ref,
+                },
+            )
+
+        with pytest.raises(OwnerConflict, match="asset_receipt_invalid"):
+            rm.materialize_asset(content.content_ref)
+        with pytest.raises(OwnerConflict, match="asset_receipt_invalid"):
+            rm.handoff_asset_to_managed(
+                content.content_ref,
+                idempotency_key="legacy-asset-handoff",
+            )
+        assessment = rm.assess_release_eligibility(
+            content.content_ref,
+            expected_reference_revision=rg.query_asset_reference_revision(),
+            idempotency_key="legacy-asset-release",
+        )
+        assert assessment.eligible is False
+        assert assessment.reason_codes == (
+            "asset_state_uncertain",
+            "semantic_reference_active",
+        )
+    finally:
+        runtime.close()
+
+
 def test_each_downstream_owner_rejects_forged_upstream_receipts(
     tmp_path: Path,
 ) -> None:
@@ -187,6 +256,17 @@ def test_each_downstream_owner_rejects_forged_upstream_receipts(
         assert hc.reconcile_once()
         content = rm.query_question_content(created["initialization_id"])
         assert content is not None
+        mirrored = rm.query_asset_version(content.content_ref)
+        assert mirrored is not None
+        assert mirrored.asset_ref == content.content_ref
+        assert mirrored.version_ref == content.content_ref
+        assert mirrored.source_kind == "formal_question"
+        assert mirrored.content_hash == content.content_hash
+        assert mirrored.receipt == content.receipt
+        assert tuple(
+            item.memory_ref for item in rm.query_asset_inventory()
+        ) == (content.content_ref,)
+        assert rm.query_snapshot().facts["object_count"] == 1
         forged_rm_receipt = replace(content.receipt, issuer="human_collaboration")
         with pytest.raises(OwnerConflict, match="question_content_receipt_issuer_invalid"):
             rg.accept_root_question(
@@ -202,6 +282,17 @@ def test_each_downstream_owner_rejects_forged_upstream_receipts(
         assert hc.reconcile_once()
         question = rg.query_question(created["initialization_id"])
         assert question is not None
+        question_release = rm.assess_release_eligibility(
+            content.content_ref,
+            expected_reference_revision=rg.query_asset_reference_revision(),
+            idempotency_key="owner-question-release-check",
+        )
+        assert question_release.eligible is False
+        assert question_release.reason_codes == ("semantic_reference_active",)
+        assert question_release.active_reference_refs == (
+            f"rm-formal-content:{content.content_ref}",
+            f"formal-question:{question.question_ref}",
+        )
         forged_rg_receipt = replace(question.receipt, issuer="research_memory")
         with pytest.raises(OwnerConflict, match="root_question_receipt_issuer_invalid"):
             ae.activate_initial_cycle(
@@ -229,6 +320,15 @@ def test_each_downstream_owner_rejects_forged_upstream_receipts(
                 question=question,
             )
         assert ae.query_snapshot().facts["foreground_cycle_count"] == 0
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE rm_asset_verification_observations SET "
+                    "next_verify_at = 0 WHERE version_ref = :version_ref"
+                ),
+                {"version_ref": content.content_ref},
+            )
+        assert rm.verify_asset_inventory_once()
         assert runtime.projection.query_snapshot()["readiness"]["status"] == (
             "unavailable"
         )
@@ -389,6 +489,9 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
             "question_count": 0,
             "idea_outcome_count": 0,
             "idea_rejection_count": 0,
+            "asset_role_count": 0,
+            "evidence_role_count": 0,
+            "source_material_role_count": 0,
         }
         assert runtime.owners.advancement_engine.query_snapshot().facts[
             "foreground_cycle_count"
