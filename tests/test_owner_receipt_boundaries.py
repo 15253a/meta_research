@@ -387,6 +387,8 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
         assert runtime.owners.research_graph.query_snapshot().facts == {
             "quest_count": 1,
             "question_count": 0,
+            "idea_outcome_count": 0,
+            "idea_rejection_count": 0,
         }
         assert runtime.owners.advancement_engine.query_snapshot().facts[
             "foreground_cycle_count"

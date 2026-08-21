@@ -45,6 +45,54 @@ class AcceptanceReceipt:
         }
 
 
+@dataclass(frozen=True)
+class AcceptedQuestionBinding:
+    """Exact cross-Owner input frozen into a Stage invocation.
+
+    The binding deliberately carries only stable identities and issuer receipts.
+    Question content remains opaque data supplied separately by Research Memory.
+    """
+
+    initialization_id: str
+    quest_ref: str
+    question_ref: str
+    content_ref: str
+    content_hash: str
+    schema_ref: str
+    content_receipt: AcceptanceReceipt
+    question_receipt: AcceptanceReceipt
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "initialization_id": self.initialization_id,
+            "quest_ref": self.quest_ref,
+            "question_ref": self.question_ref,
+            "content_ref": self.content_ref,
+            "content_hash": self.content_hash,
+            "schema_ref": self.schema_ref,
+            "content_receipt": self.content_receipt.as_public_dict(),
+            "question_receipt": self.question_receipt.as_public_dict(),
+        }
+
+
+class AcceptedQuestionBindingVerifier(Protocol):
+    def verify_accepted_question_binding(
+        self, binding: AcceptedQuestionBinding
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class VerifiedStageRunRequestBinding:
+    request_ref: str
+    cycle_ref: str
+    epoch: int
+    accepted_question: AcceptedQuestionBinding
+    context_pack_ref: str
+    context_pack_hash: str
+    context_pack: dict[str, object]
+    receipt: AcceptanceReceipt
+
+
 class BundleConfirmationVerifier(Protocol):
     def verify_bundle_confirmation(
         self,
@@ -95,6 +143,81 @@ class RootQuestionReceiptVerifier(Protocol):
         initialization_id: str,
         quest_ref: str,
         question_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
+class StageRunRequestVerifier(Protocol):
+    def verify_stage_run_request(
+        self,
+        *,
+        request_ref: str,
+        cycle_ref: str,
+        epoch: int,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_idea_stage_request_binding(
+        self,
+        *,
+        request_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        context_pack_ref: str,
+    ) -> VerifiedStageRunRequestBinding: ...
+
+
+class AttemptExecutionReceiptVerifier(Protocol):
+    def verify_attempt_execution_receipt(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        payload_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
+class IdeaContentReceiptVerifier(Protocol):
+    def verify_idea_content_receipt(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str,
+        content_ref: str,
+        payload_hash: str,
+        outcome_hash: str,
+        reviewed_draft_hash: str,
+        review_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
+class IdeaOutcomeDecisionVerifier(Protocol):
+    def verify_idea_outcome_decision(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str | None,
+        decision: str,
+        outcome_ref: str | None,
+        receipt: AcceptanceReceipt,
+        outcome_kind: str | None = None,
+    ) -> None: ...
+
+
+class RunCompletionReceiptVerifier(Protocol):
+    def verify_run_completion_receipt(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str | None,
+        outcome_ref: str,
         receipt: AcceptanceReceipt,
     ) -> None: ...
 

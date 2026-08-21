@@ -416,35 +416,32 @@ import sys
 
 
 args = sys.argv[1:]
+if args == ["--version"]:
+    print("codex-cli installed-fake 1")
+    raise SystemExit(0)
 assert args[0] == "exec"
-assert args[1:5] == [
-    "--skip-git-repo-check", "--sandbox", "read-only", "--cd"
-]
-assert args[6] == "--json"
-assert args[7] == "--output-schema"
-assert args[9] == "--output-last-message"
+assert "--skip-git-repo-check" in args
+assert args[args.index("--cd") + 1]
+assert "--json" in args
 assert args[-1] == "-"
-schema = json.loads(pathlib.Path(args[8]).read_text(encoding="utf-8"))
-output_path = pathlib.Path(args[10])
+schema = json.loads(
+    pathlib.Path(args[args.index("--output-schema") + 1]).read_text(
+        encoding="utf-8"
+    )
+)
+output_path = pathlib.Path(args[args.index("--output-last-message") + 1])
 prompt = sys.stdin.read()
-match = re.search(r"(?m)^initialization_id=([^\\n]+)$", prompt)
-assert match is not None
-initialization_id = match.group(1)
 properties = set(schema["properties"])
 resume_ref = None
 if "resume" in args:
     resume_index = args.index("resume")
     resume_ref = args[resume_index + 1]
-record = {{
-    "kind": "intent" if properties == {{"reply"}} else "proposal",
-    "ephemeral": "--ephemeral" in args,
-    "initialization_id": initialization_id,
-    "resume_ref": resume_ref,
-}}
-with pathlib.Path({str(calls_path)!r}).open("a", encoding="utf-8") as stream:
-    stream.write(json.dumps(record, separators=(",", ":")) + "\\n")
 
 if properties == {{"reply"}}:
+    assert args[args.index("--sandbox") + 1] == "read-only"
+    match = re.search(r"(?m)^initialization_id=([^\\n]+)$", prompt)
+    assert match is not None
+    initialization_id = match.group(1)
     assert "Intent Drafting Session" in prompt
     assert "--ephemeral" not in args
     thread_id = f"installed-native-{{initialization_id}}"
@@ -454,7 +451,24 @@ if properties == {{"reply"}}:
         "reply": "建议把完成标准绑定到公开 Snapshot 与五层 Owner receipts。"
     }}
     print(json.dumps({{"type": "thread.started", "thread_id": thread_id}}))
-else:
+    record = {{
+        "kind": "intent",
+        "ephemeral": False,
+        "initialization_id": initialization_id,
+        "resume_ref": resume_ref,
+    }}
+elif properties == {{
+    "title",
+    "unknown_statement",
+    "answer_shape",
+    "applicability_scope",
+    "background_context",
+    "requirements_constraints",
+}}:
+    assert args[args.index("--sandbox") + 1] == "read-only"
+    match = re.search(r"(?m)^initialization_id=([^\\n]+)$", prompt)
+    assert match is not None
+    initialization_id = match.group(1)
     assert properties == {{
         "title",
         "unknown_statement",
@@ -473,6 +487,188 @@ else:
         "background_context": "验证 wheel、daemon、Codex adapter 与公开 HTTP 边界。",
         "requirements_constraints": "使用已选择 GPU envelope，并遵守 30 天硬上限。",
     }}
+    record = {{
+        "kind": "proposal",
+        "ephemeral": True,
+        "initialization_id": initialization_id,
+        "resume_ref": resume_ref,
+    }}
+elif properties == {{"outcome"}}:
+    assert "--ignore-user-config" in args
+    assert args[args.index("--config") + 1] == "mcp_servers={{}}"
+    config_values = {{
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--config"
+    }}
+    assert 'approval_policy="never"' in config_values
+    assert 'web_search="live"' in config_values
+    assert args[args.index("--sandbox") + 1] == "danger-full-access"
+    assert args[args.index("--model") + 1] == "gpt-5.4"
+    enabled = {{
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--enable"
+    }}
+    assert "multi_agent" in enabled
+    disabled = {{
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--disable"
+    }}
+    assert {{"apps", "browser_use", "computer_use"}} <= disabled
+    assert "shell_tool" not in disabled
+    assert "skill_search" not in disabled
+    assert "view_image" not in disabled
+    stage_match = re.search(r"(?m)^stage_request_ref=([^\\n]+)$", prompt)
+    question_match = re.search(r"(?m)^question_ref=([^\\n]+)$", prompt)
+    context_match = re.search(r"(?m)^context_pack_ref=([^\\n]+)$", prompt)
+    assert stage_match is not None
+    assert question_match is not None
+    assert context_match is not None
+    stage_request_ref = stage_match.group(1)
+    question_ref = question_match.group(1)
+    context_pack_ref = context_match.group(1)
+    assert "Idea 主 Agent" in prompt
+    assert "--ephemeral" not in args
+    thread_id = f"installed-idea-native-{{stage_request_ref}}"
+    if resume_ref is not None:
+        assert resume_ref == thread_id
+    output = {{
+        "outcome": {{
+            "kind": "IdeaSet",
+            "question_ref": question_ref,
+            "context_pack_ref": context_pack_ref,
+            "candidates": [
+                {{
+                    "candidate_key": "installed-owner-chain",
+                    "direction": "用公开 Projection 与逐层 receipt 验证安装态闭环。",
+                    "rationale": "公开状态可同时证明执行、内容接纳、领域接纳和推进没有混同。",
+                    "assumptions": ["loopback daemon 能持续恢复同一 SQLite 状态。"],
+                    "risks": ["仅看最终状态可能遗漏中间时序错误。"],
+                    "evidence_boundary": {{
+                        "accepted_evidence_refs": [],
+                        "supported": "Accepted Question 已冻结安装态验证范围。",
+                        "inferred": "五层公开事实可揭示提前推进。",
+                        "unknown": "不同宿主的恢复延迟仍可能变化。",
+                    }},
+                    "falsification_hint": {{
+                        "test": "重启 daemon 并比较所有 receipt ref。",
+                        "would_refute": "重启后 receipt 改变或 StageCommit 提前出现。",
+                    }},
+                    "material_difference": {{
+                        "from_history": "当前 ContextPack 尚无已接纳 IdeaOutcome。",
+                        "from_peers": "该候选以公开 Owner 事实而非进程内成功标志验收。",
+                        "plan_commitment_change": "后续 Plan 必须保留安装与恢复证据。",
+                    }},
+                }}
+            ],
+            "recommendation": None,
+        }}
+    }}
+    print(json.dumps({{"type": "thread.started", "thread_id": thread_id}}))
+    record = {{
+        "kind": "idea",
+        "ephemeral": False,
+        "stage_request_ref": stage_request_ref,
+        "question_ref": question_ref,
+        "resume_ref": resume_ref,
+        "thread_id": thread_id,
+    }}
+elif properties == {{
+    "reviewer_agent_ref",
+    "findings",
+    "final_outcome",
+    "dispositions",
+}}:
+    assert "--ignore-user-config" in args
+    assert args[args.index("--config") + 1] == "mcp_servers={{}}"
+    config_values = {{
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--config"
+    }}
+    assert 'approval_policy="never"' in config_values
+    assert 'web_search="live"' in config_values
+    assert args[args.index("--sandbox") + 1] == "danger-full-access"
+    enabled = {{
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--enable"
+    }}
+    assert "multi_agent" in enabled
+    stage_match = re.search(r"(?m)^stage_request_ref=([^\\n]+)$", prompt)
+    question_match = re.search(r"(?m)^question_ref=([^\\n]+)$", prompt)
+    context_match = re.search(r"(?m)^context_pack_ref=([^\\n]+)$", prompt)
+    draft_match = re.search(r"(?m)^reviewed_draft=(.+)$", prompt)
+    assert stage_match is not None
+    assert question_match is not None
+    assert context_match is not None
+    assert draft_match is not None
+    stage_request_ref = stage_match.group(1)
+    question_ref = question_match.group(1)
+    context_pack_ref = context_match.group(1)
+    reviewed_draft = json.loads(draft_match.group(1))
+    assert reviewed_draft["question_ref"] == question_ref
+    assert reviewed_draft["context_pack_ref"] == context_pack_ref
+    assert "spawn" in prompt
+    assert "reviewer" in prompt
+    assert "--ephemeral" not in args
+    thread_id = f"installed-idea-native-{{stage_request_ref}}"
+    assert resume_ref == thread_id
+    assert args[-3:] == ["resume", thread_id, "-"]
+    reviewer_agent_ref = f"installed-child-reviewer-{{question_ref}}"
+    output = {{
+        "reviewer_agent_ref": reviewer_agent_ref,
+        "findings": [],
+        "final_outcome": reviewed_draft,
+        "dispositions": [],
+    }}
+    print(json.dumps({{"type": "thread.started", "thread_id": thread_id}}))
+    print(json.dumps({{
+        "type": "item.completed",
+        "item": {{
+            "id": "child-review-spawn",
+            "type": "collab_tool_call",
+            "tool": "spawn_agent",
+            "sender_thread_id": thread_id,
+            "receiver_thread_ids": [reviewer_agent_ref],
+            "prompt": "Review the exact frozen Idea draft.",
+            "agents_states": {{
+                reviewer_agent_ref: {{"status": "pending_init", "message": None}}
+            }},
+            "status": "completed",
+        }},
+    }}))
+    print(json.dumps({{
+        "type": "item.completed",
+        "item": {{
+            "id": "child-review-wait",
+            "type": "collab_tool_call",
+            "tool": "wait",
+            "sender_thread_id": thread_id,
+            "receiver_thread_ids": [reviewer_agent_ref],
+            "prompt": None,
+            "agents_states": {{
+                reviewer_agent_ref: {{"status": "completed", "message": "[]"}}
+            }},
+            "status": "completed",
+        }},
+    }}))
+    record = {{
+        "kind": "idea_child_review",
+        "ephemeral": False,
+        "stage_request_ref": stage_request_ref,
+        "question_ref": question_ref,
+        "resume_ref": resume_ref,
+        "thread_id": thread_id,
+        "reviewer_agent_ref": reviewer_agent_ref,
+    }}
+else:
+    raise AssertionError(f"unexpected schema properties: {{properties}}")
+
+with pathlib.Path({str(calls_path)!r}).open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(record, separators=(",", ":")) + "\\n")
 output_path.write_text(
     json.dumps(output, ensure_ascii=False, separators=(",", ":")),
     encoding="utf-8",
@@ -488,6 +684,7 @@ PATH="$PROVIDER_PATH" "$CLI" start \
 from __future__ import annotations
 
 from http.cookiejar import CookieJar
+from urllib.error import HTTPError
 import json
 import pathlib
 import sys
@@ -653,7 +850,12 @@ while True:
     ready = request("GET", f"/api/v1/quest-initializations/{initialization_id}")
     assert isinstance(ready, dict)
     turns = (ready.get("intent_session") or {}).get("turns", [])
-    if len(turns) == 2 and turns[1]["assistant_status"] == "completed":
+    preview_status = (ready.get("confirmation_preview") or {}).get("status")
+    if (
+        len(turns) == 2
+        and turns[1]["assistant_status"] == "completed"
+        and preview_status == "current"
+    ):
         break
     if len(turns) == 2 and turns[1]["assistant_status"] in {"unavailable", "failed"}:
         raise AssertionError(f"production Codex resume failed: {turns[1]}")
@@ -705,20 +907,91 @@ assert all(
     for key in ("quest_ref", "memory_ref", "question_ref", "cycle_ref")
 )
 calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
-assert sorted(call["kind"] for call in calls) == ["intent", "intent", "proposal"]
+deadline = time.monotonic() + 60
+while True:
+    try:
+        snapshot = request("GET", "/api/v1/snapshot")
+    except HTTPError as error:
+        if error.code != 503:
+            raise
+        unavailable = json.load(error)
+        assert unavailable["detail"]["code"] == "snapshot_consistency_unavailable"
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"installed Idea Snapshot stayed inconsistent: {unavailable}"
+            ) from error
+        time.sleep(0.05)
+        continue
+    assert isinstance(snapshot, dict)
+    idea_stage = snapshot.get("idea_stage") or {}
+    stage_commit = idea_stage.get("stage_commit") or {}
+    if stage_commit.get("status") == "Completed":
+        break
+    if time.monotonic() >= deadline:
+        raise AssertionError(f"installed Idea Stage did not settle: {idea_stage}")
+    time.sleep(0.05)
+
+calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+assert sorted(call["kind"] for call in calls) == [
+    "idea",
+    "idea_child_review",
+    "intent",
+    "intent",
+    "proposal",
+]
 intent_calls = [call for call in calls if call["kind"] == "intent"]
 assert intent_calls[0]["ephemeral"] is False
 assert intent_calls[0]["resume_ref"] is None
 assert intent_calls[1]["resume_ref"] == f"installed-native-{initialization_id}"
 assert [call["ephemeral"] for call in calls if call["kind"] == "proposal"] == [True]
-snapshot = request("GET", "/api/v1/snapshot")
-assert isinstance(snapshot, dict)
-assert snapshot["research_space"] == {
+idea_calls = [call for call in calls if call["kind"] == "idea"]
+review_calls = [call for call in calls if call["kind"] == "idea_child_review"]
+assert len(idea_calls) == len(review_calls) == 1
+assert idea_calls[0]["resume_ref"] is None
+assert review_calls[0]["resume_ref"] == idea_calls[0]["thread_id"]
+assert review_calls[0]["thread_id"] == idea_calls[0]["thread_id"]
+
+research_space = snapshot["research_space"]
+assert {key: research_space[key] for key in (
+    "status",
+    "quest_count",
+    "question_count",
+    "foreground_cycle_count",
+)} == {
     "status": "active",
     "quest_count": 1,
     "question_count": 1,
     "foreground_cycle_count": 1,
 }
+assert research_space["current_question"]["question_ref"] == confirmed["question_ref"]
+assert set(idea_stage) == {
+    "eligibility",
+    "stage_run_request",
+    "run",
+    "outcome_acceptance",
+    "stage_commit",
+}
+stage_request = idea_stage["stage_run_request"]
+run = idea_stage["run"]
+acceptance = idea_stage["outcome_acceptance"]
+assert stage_request["receipt"]["kind"] == "stage_run_request"
+assert stage_request["accepted_question_binding"]["question_ref"] == confirmed["question_ref"]
+assert run["status"] == "completed"
+assert run["attempt_execution_receipt"]["kind"] == "idea_attempt_execution"
+assert run["completion_receipt"]["kind"] == "run_execution_completed"
+assert run["native_session_ref"] == idea_calls[0]["thread_id"]
+assert run["review"]["review_mode"] == "harness_child_agent"
+assert run["review"]["reviewer_agent_ref"] == review_calls[0]["reviewer_agent_ref"]
+assert acceptance["status"] == "accepted"
+assert acceptance["content"]["receipt"]["kind"] == "idea_outcome_content_acceptance"
+assert acceptance["domain"]["receipt"]["kind"] == "idea_outcome_accepted"
+assert stage_commit["receipt"]["kind"] == "stage_commit"
+assert stage_commit["run_completion_receipt"]["receipt_ref"] == (
+    run["completion_receipt"]["receipt_ref"]
+)
+assert stage_commit["outcome_receipt"]["receipt_ref"] == (
+    acceptance["domain"]["receipt"]["receipt_ref"]
+)
 result_path.write_text(
     json.dumps(
         {
@@ -732,6 +1005,8 @@ result_path.write_text(
                 for key, value in confirmed["receipts"].items()
             },
             "turns": confirmed["intent_session"]["turns"],
+            "idea_stage": idea_stage,
+            "provider_call_count": len(calls),
         },
         separators=(",", ":"),
     ),
@@ -744,19 +1019,26 @@ import json, sys
 assert json.load(sys.stdin)["status"] == "stopped"
 '
 
+mv "$PROVIDER_PATH/codex" "$PROVIDER_PATH/codex.disabled"
+if PATH="$PROVIDER_PATH" command -v codex >/dev/null 2>&1; then
+  echo "recovery verification PATH unexpectedly resolves codex" >&2
+  exit 1
+fi
 PATH="$PROVIDER_PATH" "$CLI" start \
   --data-root "$DATA_ROOT" --port 0 --json >"$FINAL_RESTART_RESULT"
 "$INSTALL_ROOT/bin/python" - \
-  "$FINAL_RESTART_RESULT" "$SUCCESS_RESULT" <<'PY'
+  "$FINAL_RESTART_RESULT" "$SUCCESS_RESULT" "$CODEX_CALLS" <<'PY'
 from http.cookiejar import CookieJar
 import json
 import pathlib
 import sys
+import time
 import urllib.request
 
 
 started = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 success = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+calls_path = pathlib.Path(sys.argv[3])
 assert started["status"] == "started"
 base_url = started["base_url"]
 cookies = CookieJar()
@@ -803,6 +1085,23 @@ assert {
 assert all(value["status"] == "accepted" for value in restored["receipts"].values())
 assert restored["intent_session"]["turns"] == success["turns"]
 assert request("GET", "/api/v1/quest-initializations/current") is None
+deadline = time.monotonic() + 10
+while True:
+    snapshot = request("GET", "/api/v1/snapshot")
+    idea_worker = next(
+        check
+        for check in snapshot["readiness"]["checks"]
+        if check["name"] == "idea_stage_worker"
+    )
+    if idea_worker["status"] == "ready":
+        break
+    if time.monotonic() >= deadline:
+        raise AssertionError(f"providerless Idea worker did not recover: {idea_worker}")
+    time.sleep(0.05)
+assert snapshot["idea_stage"] == success["idea_stage"]
+assert len(calls_path.read_text(encoding="utf-8").splitlines()) == (
+    success["provider_call_count"]
+)
 second = request(
     "POST",
     "/api/v1/quest-initializations",
@@ -819,6 +1118,17 @@ cancelled = request(
     idempotency_key="installed-second-cancel",
 )
 assert cancelled["status"] == "cancelled"
+time.sleep(0.5)
+settled = request("GET", "/api/v1/snapshot")
+assert next(
+    check
+    for check in settled["readiness"]["checks"]
+    if check["name"] == "idea_stage_worker"
+)["status"] == "ready"
+assert settled["idea_stage"] == success["idea_stage"]
+assert len(calls_path.read_text(encoding="utf-8").splitlines()) == (
+    success["provider_call_count"]
+)
 PY
 
 "$CLI" stop --data-root "$DATA_ROOT" --json | "$INSTALL_ROOT/bin/python" -c '

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from meta_research import __version__
 from meta_research.feed import DurableFeed
@@ -9,6 +10,9 @@ from meta_research.owners.agent_runtime import AgentRuntimeInterface
 from meta_research.owners.human_collaboration import HumanCollaborationInterface
 from meta_research.owners.research_graph import ResearchGraphInterface
 from meta_research.owners.research_memory import ResearchMemoryInterface
+
+if TYPE_CHECKING:
+    from meta_research.idea_stage import IdeaStageWorker
 
 
 _MAX_SNAPSHOT_ATTEMPTS = 3
@@ -33,10 +37,12 @@ class PublicProjection:
         research_memory: ResearchMemoryInterface,
         agent_runtime: AgentRuntimeInterface,
         human_collaboration: HumanCollaborationInterface,
+        idea_stage: IdeaStageWorker | None = None,
     ) -> None:
         self._feed = feed
         self._object_store = object_store
         self._human_collaboration = human_collaboration
+        self._idea_stage = idea_stage
         self._interfaces = {
             "research_graph": research_graph,
             "advancement_engine": advancement_engine,
@@ -55,6 +61,14 @@ class PublicProjection:
             }
             current_quest_creation = (
                 self._human_collaboration.query_current_quest_creation()
+            )
+            idea_stage = (
+                None if self._idea_stage is None else self._idea_stage.query_current()
+            )
+            current_question = (
+                None
+                if self._idea_stage is None
+                else self._idea_stage.query_current_question()
             )
             feed_readiness = self._feed.query_readiness()
             if feed_before.current_revision == feed_readiness.current_revision:
@@ -101,16 +115,19 @@ class PublicProjection:
             },
         ]
         ready = all(check["status"] == "ready" for check in checks)
-        return {
+        research_space: dict[str, object] = {
+            "status": "empty" if graph.facts["quest_count"] == 0 else "active",
+            "quest_count": graph.facts["quest_count"],
+            "question_count": graph.facts["question_count"],
+            "foreground_cycle_count": advancement.facts["foreground_cycle_count"],
+        }
+        if current_question is not None:
+            research_space["current_question"] = current_question
+        snapshot: dict[str, object] = {
             "product": {"name": "meta-research-vnext", "version": __version__},
             "revision": revision,
             "readiness": {"status": "ready" if ready else "unavailable", "checks": checks},
-            "research_space": {
-                "status": "empty" if graph.facts["quest_count"] == 0 else "active",
-                "quest_count": graph.facts["quest_count"],
-                "question_count": graph.facts["question_count"],
-                "foreground_cycle_count": advancement.facts["foreground_cycle_count"],
-            },
+            "research_space": research_space,
             "owners": {
                 name: snapshot.as_public_dict()
                 for name, snapshot in owner_snapshots.items()
@@ -132,6 +149,9 @@ class PublicProjection:
             },
             "unavailable": _release_capabilities(),
         }
+        if idea_stage is not None:
+            snapshot["idea_stage"] = idea_stage
+        return snapshot
 
 
 def _release_capabilities() -> list[dict[str, object]]:

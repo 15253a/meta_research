@@ -556,12 +556,26 @@ def test_injected_async_success_auto_previews_and_recovers_owner_receipts(
     assert completed["quest_ref"].startswith("quest_")
     assert completed["question_ref"].startswith("question_")
     assert completed["cycle_ref"].startswith("cycle_")
-    assert resumed_client.get("/api/v1/snapshot").json()["research_space"] == {
+    research_space = resumed_client.get("/api/v1/snapshot").json()[
+        "research_space"
+    ]
+    assert {
+        key: research_space[key]
+        for key in (
+            "status",
+            "quest_count",
+            "question_count",
+            "foreground_cycle_count",
+        )
+    } == {
         "status": "active",
         "quest_count": 1,
         "question_count": 1,
         "foreground_cycle_count": 1,
     }
+    assert research_space["current_question"]["question_ref"] == completed[
+        "question_ref"
+    ]
     assert resumed_client.get(
         f"/api/v1/quest-initializations/{opened['initialization_id']}/intent-session"
     ).json()["intent_session"]["turns"][0]["assistant_status"] == "completed"

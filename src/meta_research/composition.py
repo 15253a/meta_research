@@ -5,14 +5,19 @@ from dataclasses import dataclass
 from meta_research.auth import Authentication
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
+from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillProvider
+from meta_research.idea_stage import IdeaStageWorker
 from meta_research.migration import upgrade_database
 from meta_research.owners.advancement_engine import (
     AdvancementEngineInterface,
     create_advancement_engine_interface,
+    create_advancement_engine_receipt_verifier,
 )
 from meta_research.owners.agent_runtime import (
     AgentRuntimeInterface,
     create_agent_runtime_interface,
+    create_agent_runtime_receipt_verifier,
+    create_host_compute_observation_reader,
 )
 from meta_research.owners.human_collaboration import (
     HumanCollaborationInterface,
@@ -56,6 +61,7 @@ class ProductionRuntime:
     authentication: Authentication
     feed: DurableFeed
     projection: PublicProjection
+    idea_stage: IdeaStageWorker
     _database: Database
     _provider_lifecycles: tuple[object, ...] = ()
     _stop_requested: bool = False
@@ -82,6 +88,7 @@ def build_production_runtime(
     proposal_drafter: ProposalDrafter | None = None,
     intent_drafting_provider: IntentDraftingProvider | None = None,
     host_compute_probe: HostComputeProbe | None = None,
+    idea_skill_provider: IdeaSkillProvider | None = None,
 ) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
@@ -97,19 +104,35 @@ def build_production_runtime(
     assert proposal_drafter is not None
     assert intent_drafting_provider is not None
     host_compute_probe = host_compute_probe or NvidiaSmiProbe()
+    idea_skill_provider = idea_skill_provider or CodexIdeaSkillAdapter(
+        data_root.root / "idea-skill-provider"
+    )
+
+    host_compute_reader = create_host_compute_observation_reader(database)
+    confirmation_verifier = create_bundle_confirmation_verifier(
+        database, host_compute_reader
+    )
+    stage_request_receipts = create_advancement_engine_receipt_verifier(database)
+    attempt_receipts = create_agent_runtime_receipt_verifier(
+        database, stage_request_receipts
+    )
+    research_memory_receipts = create_research_memory_receipt_verifier(
+        database, data_root.objects, attempt_receipts
+    )
+    research_graph_receipts = create_research_graph_receipt_verifier(
+        database,
+        confirmation_verifier,
+        research_memory_receipts,
+        research_memory_receipts,
+        attempt_receipts,
+        stage_request_receipts,
+    )
     agent_runtime = create_agent_runtime_interface(
         database,
         feed,
         host_compute_probe,
-    )
-    confirmation_verifier = create_bundle_confirmation_verifier(
-        database, agent_runtime
-    )
-    research_memory_receipts = create_research_memory_receipt_verifier(
-        database, data_root.objects
-    )
-    research_graph_receipts = create_research_graph_receipt_verifier(
-        database, confirmation_verifier, research_memory_receipts
+        stage_request_receipts,
+        research_graph_receipts,
     )
     research_graph = create_research_graph_interface(
         database,
@@ -117,6 +140,9 @@ def build_production_runtime(
         confirmation_verifier,
         research_memory_receipts,
         research_graph_receipts,
+        research_memory_receipts,
+        attempt_receipts,
+        stage_request_receipts,
     )
     research_memory = create_research_memory_interface(
         database,
@@ -125,11 +151,15 @@ def build_production_runtime(
         confirmation_verifier,
         research_graph_receipts,
         research_memory_receipts,
+        attempt_receipts,
     )
     advancement_engine = create_advancement_engine_interface(
         database,
         feed,
         research_graph_receipts,
+        research_graph_receipts,
+        research_graph_receipts,
+        attempt_receipts,
         research_graph_receipts,
     )
     owners = OwnerInterfaces(
@@ -148,6 +178,14 @@ def build_production_runtime(
             intent_drafting_provider,
         ),
     )
+    idea_stage = IdeaStageWorker(
+        feed,
+        owners.advancement_engine,
+        owners.agent_runtime,
+        owners.research_memory,
+        owners.research_graph,
+        idea_skill_provider,
+    )
     projection = PublicProjection(
         feed,
         data_root.objects,
@@ -156,9 +194,14 @@ def build_production_runtime(
         owners.research_memory,
         owners.agent_runtime,
         owners.human_collaboration,
+        idea_stage,
     )
     provider_lifecycles: list[object] = []
-    for provider in (proposal_drafter, intent_drafting_provider):
+    for provider in (
+        proposal_drafter,
+        intent_drafting_provider,
+        idea_skill_provider,
+    ):
         if callable(getattr(provider, "request_stop", None)) and not any(
             provider is lifecycle for lifecycle in provider_lifecycles
         ):
@@ -169,6 +212,7 @@ def build_production_runtime(
         authentication=Authentication(database),
         feed=feed,
         projection=projection,
+        idea_stage=idea_stage,
         _database=database,
         _provider_lifecycles=tuple(provider_lifecycles),
     )
