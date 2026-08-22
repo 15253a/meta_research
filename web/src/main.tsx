@@ -5,6 +5,7 @@ import {
   followProjection,
   type IdeaQuestionSummary,
   type IdeaStageProjection,
+  type PlanStageProjection,
   type PublicSnapshot,
   type UnavailableCapability,
 } from "./api";
@@ -75,6 +76,7 @@ function questCreationReady(snapshot: PublicSnapshot | null): boolean {
     (check) =>
       ![
         "idea_stage_worker",
+        "plan_stage_worker",
         "research_asset_intake_worker",
         "research_asset_verification_worker",
       ].includes(check.name),
@@ -189,6 +191,7 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
   const empty = snapshot.research_space.status === "empty";
   const creation = snapshot.quest_creation.current;
   const ideaStage = snapshot.idea_stage ?? null;
+  const planStage = snapshot.plan_stage ?? null;
 
   if (!ready) {
     const failedChecks = snapshot.readiness.checks
@@ -235,6 +238,15 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
           </div>
         </div>
       </>
+    );
+  }
+
+  if (planStage) {
+    return (
+      <PlanStageHero
+        planStage={planStage}
+        question={planQuestion(planStage, snapshot)}
+      />
     );
   }
 
@@ -316,6 +328,21 @@ function ideaQuestion(
   };
 }
 
+function planQuestion(
+  planStage: PlanStageProjection,
+  snapshot?: PublicSnapshot,
+): IdeaQuestionSummary {
+  const creation = snapshot?.quest_creation.current;
+  return {
+    quest_ref: creation?.quest_ref,
+    question_ref: planStage.eligibility.question_ref ?? creation?.question_ref,
+    graph_revision: snapshot?.owners.research_graph?.revision,
+    ...(creation?.proposal?.content ?? {}),
+    ...(planStage.stage_run_request?.accepted_question_binding ?? {}),
+    ...(snapshot?.research_space.current_question ?? {}),
+  };
+}
+
 function IdeaStageHero({
   ideaStage,
   question,
@@ -377,16 +404,72 @@ function IdeaStageHero({
   );
 }
 
-function CurrentQuestionCard({
-  ideaStage,
+function PlanStageHero({
+  planStage,
   question,
 }: {
-  ideaStage: IdeaStageProjection;
+  planStage: PlanStageProjection;
   question: IdeaQuestionSummary;
 }) {
-  const questionRef = question.question_ref
-    ?? ideaStage.stage_run_request?.accepted_question_binding?.question_ref
-    ?? "accepted Question";
+  const committed = Boolean(planStage.stage_commit);
+  const nextStage = planStage.stage_commit?.next_stage?.toLowerCase();
+  const noGap = planStage.plan_acceptance.bundle_disposition
+    === "no_new_experiment_required";
+
+  return (
+    <>
+      <p className="lumen-eyebrow">Research cycle · Plan Projection</p>
+      <h1 id="workspace-title">
+        {committed ? "Plan 已形成正式交接。" : "从已接纳的 IdeaSet 出发。"}<br />
+        <em>{committed ? "资产、领域接纳与推进仍然分开。" : "Plan 正在形成。"}</em>
+      </h1>
+      <p>
+        {noGap
+          ? "所有 AnswerContract obligations 已覆盖；系统不会伪造 Bundle Run，后续由 Advancement Engine 显式处理 Bundle skip。"
+          : question.unknown_statement
+            ?? "Plan 只消费精确的 AcceptedQuestionBinding 与完整、已接纳的 IdeaSet；daemon 自动推进，Web 不提供逐 Run 启动或授权。"}
+      </p>
+      <ol className="lumen-stage-strip" aria-label="当前研究周期的四个 Stage">
+        <li className="done">
+          <small>01 · COMMITTED</small>
+          <b>Idea</b>
+        </li>
+        <li
+          className={committed ? "done" : "current"}
+          aria-current={committed ? undefined : "step"}
+        >
+          <small>{committed ? "02 · COMMITTED" : "02 · NOW"}</small>
+          <b>Plan</b>
+        </li>
+        <li
+          className={nextStage === "bundle" ? "current" : undefined}
+          aria-current={nextStage === "bundle" ? "step" : undefined}
+        >
+          <small>
+            03 · {noGap ? "SKIP PATH" : nextStage === "bundle" ? "NEXT" : "LATER"}
+          </small>
+          <b>Bundle</b>
+        </li>
+        <li
+          className={nextStage === "reasoning" ? "current" : undefined}
+          aria-current={nextStage === "reasoning" ? "step" : undefined}
+        >
+          <small>04 · {nextStage === "reasoning" ? "NOW" : "REQUIRED"}</small>
+          <b>Reasoning</b>
+        </li>
+      </ol>
+    </>
+  );
+}
+
+function CurrentQuestionCard({
+  stage,
+  question,
+}: {
+  stage: "Idea" | "Plan";
+  question: IdeaQuestionSummary;
+}) {
+  const questionRef = question.question_ref ?? "accepted Question";
   const graphRevision = question.graph_revision;
 
   return (
@@ -401,12 +484,12 @@ function CurrentQuestionCard({
           {graphRevision === undefined ? "Research Graph · 只读投影" : `Graph r${graphRevision} · 只读投影`}
         </small>
       </header>
-      <div className="lumen-question-path" aria-label="当前 Question 与 Idea Stage 路径">
+      <div className="lumen-question-path" aria-label={`当前 Question 与 ${stage} Stage 路径`}>
         <span className="quest"><small>Quest</small><b>{question.quest_ref ?? "current"}</b></span>
         <i aria-hidden="true" />
         <span className="question"><small>Formal Question</small><b>{questionRef}</b></span>
         <i aria-hidden="true" />
-        <span className="idea"><small>Current Stage</small><b>Idea</b></span>
+        <span className={stage.toLowerCase()}><small>Current Stage</small><b>{stage}</b></span>
       </div>
       <div className="lumen-question-copy">
         <small>Unknown / answer shape / scope</small>
@@ -414,7 +497,7 @@ function CurrentQuestionCard({
         <p>
           {question.applicability_scope
             ?? question.answer_shape
-            ?? "Question 内容由 Research Graph 拥有；这个页面只消费公开 Projection。"}
+            ?? `Question 内容由 Research Graph 拥有；${stage} 页面只消费公开 Projection。`}
         </p>
       </div>
     </section>
@@ -788,6 +871,305 @@ function IdeaStageCard({
   );
 }
 
+type PlanStageState = IdeaStageState;
+
+function planStageHealthBlocker(
+  snapshot: PublicSnapshot | null,
+): IdeaStageHealthBlocker | null {
+  const worker = snapshot?.readiness.checks.find(
+    (check) => check.name === "plan_stage_worker" && check.status !== "ready",
+  );
+  if (!worker) return null;
+  return { code: worker.reason?.code ?? `plan_stage_worker_${worker.status}` };
+}
+
+function currentPlanStageState(planStage: PlanStageProjection): PlanStageState {
+  if (planStage.stage_commit) return "stage-commit";
+  if (planStage.plan_acceptance.status !== "not_attempted") {
+    return "awaiting-acceptance";
+  }
+  if (planStage.run) return "run";
+  if (planStage.stage_run_request) return "stage-run-request";
+  return "eligibility";
+}
+
+function planFactRows(
+  planStage: PlanStageProjection,
+  phase: PlanStageState,
+): ReturnType<typeof ideaFactRows> {
+  const eligibility = planStage.eligibility;
+  const request = planStage.stage_run_request;
+  const run = planStage.run;
+  const acceptance = planStage.plan_acceptance;
+  const commit = planStage.stage_commit;
+  const eligibilityBlocked = !["eligible", "requested", "consumed"].includes(
+    eligibility.status,
+  );
+  const acceptanceBlocked = ["rejected", "stale", "needs_input"].includes(
+    acceptance.status,
+  );
+
+  let acceptanceTitle = "尚未提交 Owner 接纳";
+  if (acceptance.status === "awaiting_content") {
+    acceptanceTitle = "Attempt 执行证据已形成；PlanDocument 正等待 Research Memory 接纳";
+  } else if (acceptance.status === "awaiting_domain") {
+    acceptanceTitle = "PlanDocument 已接纳；FormalPlan 正等待 Research Graph 接纳";
+  } else if (acceptance.status === "accepted") {
+    acceptanceTitle = run?.status === "completed"
+      ? "PlanDocument 与 FormalPlan 均已接纳；Run completion 已独立形成"
+      : "FormalPlan 已接纳；仍未等于 Run completed 或 Stage 推进";
+  } else if (acceptance.status === "rejected") {
+    acceptanceTitle = "FormalPlan 已被退回；current Session 将依据结构化反馈修订重提";
+  } else if (acceptance.status === "stale") {
+    acceptanceTitle = "Plan 的 frozen basis 已陈旧，不能继续推进";
+  } else if (acceptance.status === "needs_input") {
+    acceptanceTitle = "Plan 需要精确输入；相关工作保持等待";
+  }
+
+  return [
+    {
+      slot: "eligibility",
+      label: "Plan eligibility",
+      owner: "AE",
+      state: eligibilityBlocked
+        ? "blocked"
+        : phase === "eligibility" ? "current" : "done",
+      title: eligibility.status === "eligible"
+        ? "已接纳完整 IdeaSet，Plan Stage 具备启动资格"
+        : eligibility.status === "requested"
+          ? "启动资格已由 current Plan StageRunRequest 消费"
+          : `Plan eligibility · ${eligibility.status}`,
+      status: eligibility.status,
+    },
+    {
+      slot: "stage-run-request",
+      label: "StageRunRequest",
+      owner: "AE",
+      state: request
+        ? phase === "stage-run-request" ? "current" : "done"
+        : "pending",
+      title: request
+        ? "已冻结 AcceptedQuestionBinding、AcceptedIdeaSetBinding 与 Plan ContextPack"
+        : "等待 Advancement Engine 签发冻结请求",
+      status: request ? request.status ?? "issued" : "not_issued",
+    },
+    {
+      slot: "run",
+      label: "Run",
+      owner: "AR",
+      state: run
+        ? isRunBlocked(run.status)
+          ? "blocked"
+          : run.status === "completed"
+            ? "done"
+            : run.status === "awaiting_acceptance" || phase === "run"
+              ? "current"
+              : "done"
+        : "pending",
+      title: !run
+        ? "等待 Agent Runtime admission"
+        : isRunBlocked(run.status)
+          ? "Run 被类型化 blocker 阻塞；不会伪造 PlanDocument 或 FormalPlan"
+          : run.status === "completed"
+            ? "Owner 接纳已验证，Run 已正式完成"
+            : run.status === "awaiting_acceptance"
+              ? "Attempt 执行证据已形成；Run 等待 Owner 接纳后完成"
+              : run.status === "admitted"
+                ? "Agent Runtime 已 admission；实际 Plan Skill 尚未形成 Attempt 执行证据"
+                : "Run 正在执行实际 Plan Skill",
+      status: run?.status ?? "not_created",
+    },
+    {
+      slot: "plan-acceptance",
+      label: "Plan acceptance",
+      owner: "RM / RG",
+      state: acceptanceBlocked
+        ? "blocked"
+        : acceptance.status === "accepted"
+          ? "done"
+          : phase === "awaiting-acceptance" ? "current" : "pending",
+      title: acceptanceTitle,
+      status: acceptance.status,
+    },
+    {
+      slot: "stage-commit",
+      label: "StageCommit",
+      owner: "AE",
+      state: commit
+        ? "done"
+        : acceptance.status === "accepted" ? "current" : "pending",
+      title: commit
+        ? `StageCommit(${commit.status}) 已形成`
+        : "尚无 StageCommit；不会把执行、资产或领域接纳合并为 success",
+      status: commit?.status ?? "not_committed",
+    },
+  ];
+}
+
+function recordText(
+  value: Record<string, unknown>,
+  ...keys: string[]
+): string | null {
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate) return candidate;
+  }
+  return null;
+}
+
+function PlanStageCard({
+  planStage,
+  healthBlocker,
+}: {
+  planStage: PlanStageProjection;
+  healthBlocker: IdeaStageHealthBlocker | null;
+}) {
+  const phase = currentPlanStageState(planStage);
+  const rows = planFactRows(planStage, phase);
+  const request = planStage.stage_run_request;
+  const ideaSet = request?.accepted_idea_set_binding;
+  const run = planStage.run;
+  const acceptance = planStage.plan_acceptance;
+  const commit = planStage.stage_commit;
+  const noGap = acceptance.bundle_disposition === "no_new_experiment_required";
+
+  return (
+    <section
+      className="lumen-card lumen-idea-card lumen-plan-card"
+      aria-labelledby="plan-stage-title"
+      data-testid="plan-stage-card"
+      data-plan-stage-state={phase}
+    >
+      <header className="lumen-card-head">
+        <b id="plan-stage-title">Plan 的五层事实</b>
+        <small>execution ≠ asset ≠ domain ≠ advancement</small>
+      </header>
+      {healthBlocker ? (
+        <div
+          className="lumen-idea-health-blocker"
+          data-testid="plan-stage-health-blocker"
+          role="status"
+        >
+          <span aria-hidden="true">!</span>
+          <div>
+            <b>Plan 自动推进暂时不可用</b>
+            <small>已完成的请求、运行与 Owner receipt 仍在；worker 恢复后会从首个缺口继续。</small>
+          </div>
+          <code>{healthBlocker.code}</code>
+        </div>
+      ) : null}
+      {noGap ? (
+        <div className="lumen-plan-disposition" data-testid="plan-no-gap-disposition">
+          <span aria-hidden="true">✓</span>
+          <p>
+            <b>no new experiment required</b>
+            <small>0 gap · 0 ExperimentBrief；不会创建伪造的 Bundle Run。</small>
+          </p>
+        </div>
+      ) : null}
+      <div className="lumen-idea-facts" role="list">
+        {rows.map((row) => (
+          <article
+            key={row.slot}
+            className="lumen-idea-fact"
+            data-plan-slot={row.slot}
+            data-state={row.state}
+            role="listitem"
+          >
+            <span className="lumen-idea-fact-mark" aria-hidden="true">
+              {row.state === "done" ? "✓" : row.state === "blocked" ? "!" : "→"}
+            </span>
+            <div>
+              <small>{row.label}</small>
+              <b>{row.title}</b>
+              {row.slot === "plan-acceptance" ? (
+                <span className="lumen-plan-acceptance-layers">
+                  <span data-plan-owner-layer="content">
+                    <small>PlanDocument · RM</small>
+                    <code>{acceptance.content.status}</code>
+                  </span>
+                  <span data-plan-owner-layer="domain">
+                    <small>FormalPlan · RG</small>
+                    <code>{acceptance.domain.status}</code>
+                  </span>
+                </span>
+              ) : <code>{row.status}</code>}
+            </div>
+            <span>{row.owner}</span>
+          </article>
+        ))}
+      </div>
+      <details className="lumen-idea-details">
+        <summary>查看 Plan 运行身份与 receipt</summary>
+        <dl>
+          <IdeaDetail label="Cycle" value={planStage.eligibility.cycle_ref} />
+          <IdeaDetail
+            label="Eligibility reason"
+            value={reasonCode(planStage.eligibility.reason)}
+          />
+          <IdeaDetail
+            label="StageRunRequest"
+            value={request?.request_ref ?? request?.stage_run_request_ref}
+          />
+          <IdeaDetail label="StageRunRequest receipt" value={receiptRef(request?.receipt)} />
+          <IdeaDetail label="AcceptedQuestionBinding" value={
+            request?.accepted_question_binding?.ref
+              ?? request?.accepted_question_binding?.binding_ref
+              ?? request?.accepted_question_binding?.question_ref
+          } />
+          <IdeaDetail label="AcceptedIdeaSetBinding" value={
+            ideaSet?.ref ?? ideaSet?.binding_ref ?? ideaSet?.idea_set_ref ?? ideaSet?.outcome_ref
+          } />
+          <IdeaDetail label="IdeaSet content" value={ideaSet?.content_ref} />
+          <IdeaDetail label="IdeaSet candidates" value={ideaSet?.candidate_count} />
+          <IdeaDetail label="IdeaSet content receipt" value={receiptRef(ideaSet?.content_receipt)} />
+          <IdeaDetail label="IdeaSet domain receipt" value={receiptRef(ideaSet?.domain_receipt)} />
+          <IdeaDetail label="Idea StageCommit receipt" value={receiptRef(ideaSet?.stage_commit_receipt)} />
+          <IdeaDetail label="ContextPack" value={request?.context_pack_ref} />
+          <IdeaDetail label="ContextPack hash" value={request?.context_pack_hash} />
+          <IdeaDetail label="Run" value={run?.run_ref} />
+          <IdeaDetail label="Attempt" value={run?.attempt_ref
+            ? `${run.attempt_ref}${run.attempt_generation === undefined ? "" : ` · generation ${run.attempt_generation}`}`
+            : null
+          } />
+          <IdeaDetail label="Root Session" value={run?.root_session_ref} />
+          <IdeaDetail label="Native Session" value={run?.native_session_ref} />
+          <IdeaDetail label="Execution Fence" value={run?.fence_ref
+            ? `${run.fence_ref}${run.fence_status ? ` · ${run.fence_status}` : ""}`
+            : null
+          } />
+          <IdeaDetail label="Attempt execution receipt" value={receiptRef(run?.attempt_execution_receipt)} />
+          <IdeaDetail label="Run completion receipt" value={receiptRef(run?.completion_receipt)} />
+          <IdeaDetail label="Child reviewer agent" value={run?.review?.reviewer_agent_ref} />
+          <IdeaDetail label="PlanDocument" value={
+            acceptance.plan_document_ref
+              ?? recordText(acceptance.content, "plan_document_ref", "content_ref")
+          } />
+          <IdeaDetail label="PlanDocument receipt" value={receiptRef(
+            acceptance.content.receipt ?? acceptance.content,
+          )} />
+          <IdeaDetail label="FormalPlan" value={
+            acceptance.formal_plan_ref
+              ?? acceptance.outcome_ref
+              ?? recordText(acceptance.domain, "formal_plan_ref", "outcome_ref")
+          } />
+          <IdeaDetail label="FormalPlan receipt" value={receiptRef(
+            acceptance.domain.receipt ?? acceptance.domain,
+          )} />
+          <IdeaDetail label="Acceptance rejection" value={reasonCode(acceptance.rejection)} />
+          <IdeaDetail label="AnswerContract hash" value={acceptance.answer_contract_hash} />
+          <IdeaDetail label="Gap count" value={acceptance.gap_count} />
+          <IdeaDetail label="ExperimentBrief count" value={acceptance.experiment_brief_count} />
+          <IdeaDetail label="Bundle disposition" value={acceptance.bundle_disposition} />
+          <IdeaDetail label="StageCommit" value={commit?.commit_ref ?? commit?.stage_commit_ref} />
+          <IdeaDetail label="StageCommit receipt" value={receiptRef(commit?.receipt)} />
+          <IdeaDetail label="Next Stage" value={commit?.next_stage} />
+        </dl>
+      </details>
+    </section>
+  );
+}
+
 function WorkspaceMain({
   snapshot,
   state,
@@ -805,7 +1187,11 @@ function WorkspaceMain({
   const ideaStage = snapshot?.research_space.status === "active"
     ? snapshot.idea_stage ?? null
     : null;
+  const planStage = snapshot?.research_space.status === "active"
+    ? snapshot.plan_stage ?? null
+    : null;
   const ideaHealthBlocker = ideaStageHealthBlocker(snapshot);
+  const planHealthBlocker = planStageHealthBlocker(snapshot);
   return (
     <main
       id="main-content"
@@ -837,9 +1223,14 @@ function WorkspaceMain({
       </section>
 
       <div className="lumen-lower">
-        {ideaStage ? (
+        {planStage ? (
           <CurrentQuestionCard
-            ideaStage={ideaStage}
+            stage="Plan"
+            question={planQuestion(planStage, snapshot ?? undefined)}
+          />
+        ) : ideaStage ? (
+          <CurrentQuestionCard
+            stage="Idea"
             question={ideaQuestion(ideaStage, snapshot ?? undefined)}
           />
         ) : (
@@ -858,7 +1249,12 @@ function WorkspaceMain({
           </section>
         )}
 
-        {ideaStage ? (
+        {planStage ? (
+          <PlanStageCard
+            planStage={planStage}
+            healthBlocker={planHealthBlocker}
+          />
+        ) : ideaStage ? (
           <IdeaStageCard
             ideaStage={ideaStage}
             healthBlocker={ideaHealthBlocker}

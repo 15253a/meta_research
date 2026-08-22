@@ -19,6 +19,7 @@ from meta_research.owners.research_memory import (
 
 if TYPE_CHECKING:
     from meta_research.idea_stage import IdeaStageWorker
+    from meta_research.plan_stage import PlanStageWorker
 
 
 _MAX_SNAPSHOT_ATTEMPTS = 3
@@ -44,6 +45,7 @@ class PublicProjection:
         agent_runtime: AgentRuntimeInterface,
         human_collaboration: HumanCollaborationInterface,
         idea_stage: IdeaStageWorker | None = None,
+        plan_stage: PlanStageWorker | None = None,
     ) -> None:
         self._feed = feed
         self._object_store = object_store
@@ -51,6 +53,7 @@ class PublicProjection:
         self._research_graph = research_graph
         self._research_memory = research_memory
         self._idea_stage = idea_stage
+        self._plan_stage = plan_stage
         self._interfaces = {
             "research_graph": research_graph,
             "advancement_engine": advancement_engine,
@@ -83,6 +86,9 @@ class PublicProjection:
             )
             idea_stage = (
                 None if self._idea_stage is None else self._idea_stage.query_current()
+            )
+            plan_stage = (
+                None if self._plan_stage is None else self._plan_stage.query_current()
             )
             current_question = (
                 None
@@ -263,7 +269,37 @@ class PublicProjection:
         }
         if idea_stage is not None:
             snapshot["idea_stage"] = idea_stage
+        if plan_stage is not None and _plan_stage_is_public(plan_stage):
+            snapshot["plan_stage"] = plan_stage
         return snapshot
+
+
+def _plan_stage_is_public(projection: dict[str, object]) -> bool:
+    """Publish Plan only after the accepted IdeaSet makes it actionable.
+
+    An empty, ineligible Plan projection must not displace the still-current Idea
+    experience in the fixed public shell.  Once eligibility is established, any
+    durable downstream boundary keeps Plan visible through recovery and commit.
+    """
+
+    eligibility = projection.get("eligibility")
+    if isinstance(eligibility, dict) and eligibility.get("status") in {
+        "eligible",
+        "requested",
+        "consumed",
+    }:
+        return True
+    if any(projection.get(field) is not None for field in (
+        "stage_run_request",
+        "run",
+        "stage_commit",
+    )):
+        return True
+    acceptance = projection.get("plan_acceptance")
+    return isinstance(acceptance, dict) and acceptance.get("status") not in {
+        None,
+        "not_attempted",
+    }
 
 
 def _query_bounded_inventory(query, *, offset: int, limit: int):

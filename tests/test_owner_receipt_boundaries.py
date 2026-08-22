@@ -489,6 +489,8 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
             "question_count": 0,
             "idea_outcome_count": 0,
             "idea_rejection_count": 0,
+            "formal_plan_count": 0,
+            "plan_rejection_count": 0,
             "asset_role_count": 0,
             "evidence_role_count": 0,
             "source_material_role_count": 0,

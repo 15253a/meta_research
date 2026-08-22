@@ -603,7 +603,8 @@ a:focus-visible,
   background: #eef9f6;
 }
 
-.lumen-question-path > span.idea {
+.lumen-question-path > span.idea,
+.lumen-question-path > span.plan {
   border-color: #c9c7f7;
   background: var(--ice);
 }
@@ -815,6 +816,65 @@ a:focus-visible,
 .lumen-idea-fact[data-state="blocked"] .lumen-idea-fact-mark {
   color: #bb4d32;
   background: #ffe5dd;
+}
+
+.lumen-plan-disposition {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  margin-bottom: 10px;
+  padding: 10px 11px;
+  border: 1px solid #d4ebe6;
+  border-radius: 12px;
+  background: #f0f9f7;
+}
+
+.lumen-plan-disposition > span {
+  display: grid;
+  width: 31px;
+  height: 31px;
+  flex: 0 0 31px;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--aqua);
+  background: #dff3ef;
+  font-weight: 850;
+}
+
+.lumen-plan-disposition p { margin: 0; }
+.lumen-plan-disposition b,
+.lumen-plan-disposition small { display: block; }
+.lumen-plan-disposition b {
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+.lumen-plan-disposition small {
+  margin-top: 3px;
+  color: var(--ink-muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.lumen-plan-acceptance-layers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.lumen-plan-acceptance-layers > span {
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid #dfe3eb;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.lumen-plan-acceptance-layers small,
+.lumen-plan-acceptance-layers code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .lumen-idea-details {

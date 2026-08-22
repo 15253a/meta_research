@@ -86,6 +86,19 @@ class AssetBindingVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
+    def verify_plan_evidence_binding(
+        self,
+        *,
+        asset_ref: str,
+        version_ref: str,
+        content_hash: str,
+        manifest_hash: str,
+        target_commit_root_ref: str,
+        provenance_closure_refs: tuple[str, ...],
+        receipt: AcceptanceReceipt,
+        require_current: bool = True,
+    ) -> None: ...
+
 
 class EvidenceRefVerifier(Protocol):
     def verify_evidence_refs(
@@ -103,6 +116,15 @@ class EvidenceRefVerifier(Protocol):
         quest_ref: str,
         version_refs: tuple[str, ...],
         expected_reference_revision: int,
+    ) -> None: ...
+
+    def verify_plan_evidence_catalog(
+        self,
+        *,
+        quest_ref: str,
+        evidence_catalog: list[dict[str, object]],
+        expected_reference_revision: int,
+        require_current: bool = True,
     ) -> None: ...
 
 
@@ -153,6 +175,41 @@ class AcceptedQuestionBindingVerifier(Protocol):
 
 
 @dataclass(frozen=True)
+class AcceptedIdeaSetBinding:
+    """Exact accepted IdeaSet closure consumed by Plan.
+
+    The complete immutable IdeaSet remains data. Its RM, RG, and AE receipts
+    independently prove content acceptance, domain acceptance, and stage
+    advancement; none substitutes for another.
+    """
+
+    outcome_ref: str
+    content_ref: str
+    payload_hash: str
+    outcome_hash: str
+    content_receipt: AcceptanceReceipt
+    outcome_receipt: AcceptanceReceipt
+    stage_commit_ref: str
+    stage_commit_receipt: AcceptanceReceipt
+    idea_set: dict[str, object]
+    outcome_kind: str = "idea_set"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "outcome_ref": self.outcome_ref,
+            "outcome_kind": self.outcome_kind,
+            "content_ref": self.content_ref,
+            "payload_hash": self.payload_hash,
+            "outcome_hash": self.outcome_hash,
+            "content_receipt": self.content_receipt.as_public_dict(),
+            "outcome_receipt": self.outcome_receipt.as_public_dict(),
+            "stage_commit_ref": self.stage_commit_ref,
+            "stage_commit_receipt": self.stage_commit_receipt.as_public_dict(),
+            "idea_set": self.idea_set,
+        }
+
+
+@dataclass(frozen=True)
 class VerifiedStageRunRequestBinding:
     request_ref: str
     cycle_ref: str
@@ -162,6 +219,7 @@ class VerifiedStageRunRequestBinding:
     context_pack_hash: str
     context_pack: dict[str, object]
     receipt: AcceptanceReceipt
+    accepted_idea_set: AcceptedIdeaSetBinding | None = None
 
 
 class BundleConfirmationVerifier(Protocol):
@@ -251,6 +309,22 @@ class StageRunRequestVerifier(Protocol):
         context_pack_ref: str,
     ) -> VerifiedStageRunRequestBinding: ...
 
+    def verify_plan_stage_request_binding(
+        self,
+        *,
+        request_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        accepted_idea_set: AcceptedIdeaSetBinding,
+        context_pack_ref: str,
+    ) -> VerifiedStageRunRequestBinding: ...
+
+    def query_verified_plan_stage_request(
+        self,
+        *,
+        request_ref: str,
+        context_pack_ref: str,
+    ) -> VerifiedStageRunRequestBinding: ...
+
 
 class DeepFetchRunRequestVerifier(Protocol):
     def verify_deepfetch_run_request(
@@ -314,7 +388,26 @@ class IdeaContentReceiptVerifier(Protocol):
     ) -> None: ...
 
 
+class PlanContentReceiptVerifier(Protocol):
+    def verify_plan_content_receipt(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str,
+        content_ref: str,
+        payload_hash: str,
+        plan_hash: str,
+        reviewed_draft_hash: str,
+        review_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
 class IdeaOutcomeDecisionVerifier(Protocol):
+    def verify_accepted_idea_set_binding(
+        self, binding: AcceptedIdeaSetBinding
+    ) -> None: ...
+
     def verify_idea_outcome_decision(
         self,
         *,
@@ -324,6 +417,18 @@ class IdeaOutcomeDecisionVerifier(Protocol):
         outcome_ref: str | None,
         receipt: AcceptanceReceipt,
         outcome_kind: str | None = None,
+    ) -> None: ...
+
+
+class FormalPlanDecisionVerifier(Protocol):
+    def verify_formal_plan_decision(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str | None,
+        decision: str,
+        formal_plan_ref: str | None,
+        receipt: AcceptanceReceipt,
     ) -> None: ...
 
 

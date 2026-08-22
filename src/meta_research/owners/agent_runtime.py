@@ -44,6 +44,10 @@ from meta_research.idea_contract import (
     IDEA_REVIEW_SCHEMA_V1_REF,
     material_outcome_hash,
 )
+from meta_research.plan_contract import (
+    PLAN_REVIEW_SCHEMA_REF,
+    material_plan_hash,
+)
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
     SQLiteOwnerSnapshot,
@@ -51,6 +55,7 @@ from meta_research.owners._sqlite_snapshot import (
 from meta_research.owners.common import (
     AcceptanceReceipt,
     DeepFetchRunRequestVerifier,
+    FormalPlanDecisionVerifier,
     IdeaOutcomeDecisionVerifier,
     OwnerConflict,
     OwnerSnapshot,
@@ -87,6 +92,9 @@ AR_OWNER = "agent_runtime"
 ATTEMPT_EXECUTION_SCHEMA = "meta-research/idea-attempt-execution/v2"
 IDEA_RUNTIME_BINDING_SCHEMA = "meta-research/idea-runtime-binding/v1"
 ATTEMPT_EXECUTION_RECEIPT_KIND = "idea_attempt_execution"
+PLAN_ATTEMPT_EXECUTION_SCHEMA = "meta-research/plan-attempt-execution/v1"
+PLAN_RUNTIME_BINDING_SCHEMA = "meta-research/plan-runtime-binding/v1"
+PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND = "plan_attempt_execution"
 RUN_COMPLETION_RECEIPT_KIND = "run_execution_completed"
 DEEPFETCH_EXECUTION_RECEIPT_KIND = "deepfetch_execution_completed"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
@@ -147,14 +155,39 @@ class IdeaRuntimeBinding:
 
 
 @dataclass(frozen=True)
+class PlanRuntimeBinding:
+    packaged_skill_bundle_hash: str
+    instruction_set_hash: str
+    model_ref: str
+    harness_adapter_ref: str
+    mcp_bindings: tuple[str, ...]
+    capability_bindings: tuple[str, ...]
+    resource_bindings: tuple[str, ...]
+    schema_ref: str = PLAN_RUNTIME_BINDING_SCHEMA
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_ref": self.schema_ref,
+            "packaged_skill_bundle_hash": self.packaged_skill_bundle_hash,
+            "instruction_set_hash": self.instruction_set_hash,
+            "model_ref": self.model_ref,
+            "harness_adapter_ref": self.harness_adapter_ref,
+            "mcp_bindings": list(self.mcp_bindings),
+            "capability_bindings": list(self.capability_bindings),
+            "resource_bindings": list(self.resource_bindings),
+        }
+
+
+@dataclass(frozen=True)
 class AttemptExecution:
+    stage: str
     request_ref: str
     run_ref: str
     attempt_ref: str
     fence_ref: str
     submission_ref: str
     native_session_ref: str
-    runtime_binding: IdeaRuntimeBinding
+    runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding
     runtime_binding_hash: str
     payload_hash: str
     payload_json: str
@@ -219,7 +252,7 @@ class IdeaStageRun:
     attempt_generation: int
     root_session_ref: str
     native_session_ref: str | None
-    runtime_binding: IdeaRuntimeBinding
+    runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding
     runtime_binding_hash: str
     fence_ref: str
     primary_invocation: IdeaProviderInvocation
@@ -237,6 +270,9 @@ class IdeaStageRun:
     @property
     def completion_receipt(self) -> AcceptanceReceipt | None:
         return None if self.completion is None else self.completion.receipt
+
+
+PlanStageRun = IdeaStageRun
 
 
 @dataclass(frozen=True)
@@ -398,6 +434,71 @@ class AgentRuntimeInterface(Protocol):
 
     def query_idea_run_completion(self, run_ref: str) -> RunCompletion | None: ...
 
+    def admit_plan_stage(
+        self,
+        request: StageRunRequest,
+        idempotency_key: str,
+        *,
+        runtime_binding: PlanRuntimeBinding,
+    ) -> PlanStageRun: ...
+
+    def query_plan_stage_run(self, request_ref: str) -> PlanStageRun | None: ...
+
+    def record_plan_primary_draft(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding: PlanRuntimeBinding,
+        draft: dict[str, object],
+        adapter_kind: str,
+        idempotency_key: str,
+    ) -> IdeaPrimaryDraft: ...
+
+    def record_plan_attempt_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        native_session_ref: str,
+        runtime_binding: PlanRuntimeBinding,
+        plan: dict[str, object],
+        review: dict[str, object],
+        idempotency_key: str,
+        reviewed_draft: dict[str, object] | None = None,
+    ) -> AttemptExecution: ...
+
+    def query_plan_attempt_execution(
+        self, submission_ref: str
+    ) -> AttemptExecution | None: ...
+
+    def continue_after_plan_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> PlanStageRun: ...
+
+    def complete_plan_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        formal_plan_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> RunCompletion: ...
+
+    def query_plan_run_completion(self, run_ref: str) -> RunCompletion | None: ...
+
     def verify_attempt_execution_receipt(self, **values) -> None: ...
 
     def verify_run_completion_receipt(self, **values) -> None: ...
@@ -465,6 +566,7 @@ class SQLiteAgentRuntime:
         host_compute_probe: HostComputeProbe,
         stage_request_verifier: StageRunRequestVerifier | None = None,
         outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
+        formal_plan_verifier: FormalPlanDecisionVerifier | None = None,
         deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
         acquisition_private_root: Path | None = None,
     ) -> None:
@@ -473,6 +575,7 @@ class SQLiteAgentRuntime:
         self._host_compute_probe = host_compute_probe
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
+        self._formal_plan_verifier = formal_plan_verifier
         self._deepfetch_request_verifier = deepfetch_request_verifier
         self._acquisition_private_root = (
             acquisition_private_root
@@ -2422,13 +2525,43 @@ class SQLiteAgentRuntime:
         *,
         runtime_binding: IdeaRuntimeBinding,
     ) -> IdeaStageRun:
+        return self._admit_stage(
+            request,
+            idempotency_key,
+            runtime_binding=runtime_binding,
+            expected_stage="idea",
+        )
+
+    def admit_plan_stage(
+        self,
+        request: StageRunRequest,
+        idempotency_key: str,
+        *,
+        runtime_binding: PlanRuntimeBinding,
+    ) -> PlanStageRun:
+        return self._admit_stage(
+            request,
+            idempotency_key,
+            runtime_binding=runtime_binding,
+            expected_stage="plan",
+        )
+
+    def _admit_stage(
+        self,
+        request: StageRunRequest,
+        idempotency_key: str,
+        *,
+        runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding,
+        expected_stage: str,
+    ) -> IdeaStageRun:
         _validate_stage_idempotency_key(idempotency_key)
         runtime_binding, runtime_binding_json, runtime_binding_hash = (
-            _validated_runtime_binding(runtime_binding)
+            _validated_runtime_binding(runtime_binding, stage=expected_stage)
         )
+        command_kind = f"admit_{expected_stage}_stage"
         command_hash = canonical_hash(
             {
-                "command": "admit_idea_stage",
+                "command": command_kind,
                 "request_ref": request.request_ref,
                 "cycle_ref": request.cycle_ref,
                 "stage": request.stage,
@@ -2443,13 +2576,13 @@ class SQLiteAgentRuntime:
         _query_stage_command(
             self._database,
             idempotency_key,
-            "admit_idea_stage",
+            command_kind,
             command_hash,
         )
         if self._stage_request_verifier is None:
             raise OwnerConflict("stage_request_verifier_unavailable")
         if (
-            request.stage != "idea"
+            request.stage != expected_stage
             or request.epoch < 1
             or canonical_hash(request.context_pack) != request.context_pack_hash
         ):
@@ -2464,7 +2597,7 @@ class SQLiteAgentRuntime:
         )
         with self._database.write() as connection:
             replay_ref = _stage_command_replay(
-                connection, idempotency_key, "admit_idea_stage", command_hash
+                connection, idempotency_key, command_kind, command_hash
             )
             if replay_ref is not None:
                 row = connection.execute(
@@ -2491,17 +2624,17 @@ class SQLiteAgentRuntime:
                     _record_stage_command(
                         connection,
                         idempotency_key,
-                        "admit_idea_stage",
+                        command_kind,
                         command_hash,
                         existing.run_ref,
                     )
                     replay_request_ref = existing.request_ref
                 else:
                     now = time.time()
-                    run_ref = new_ref("idea_run")
-                    attempt_ref = new_ref("idea_attempt")
-                    session_ref = new_ref("idea_session")
-                    fence_ref = new_ref("idea_fence")
+                    run_ref = new_ref(f"{expected_stage}_run")
+                    attempt_ref = new_ref(f"{expected_stage}_attempt")
+                    session_ref = new_ref(f"{expected_stage}_session")
+                    fence_ref = new_ref(f"{expected_stage}_fence")
                     connection.execute(
                         text(
                             "INSERT INTO ar_stage_runs (run_ref, request_ref, "
@@ -2595,11 +2728,12 @@ class SQLiteAgentRuntime:
                         runtime_binding_hash=runtime_binding_hash,
                         predecessor_attempt_ref=None,
                         prepared_at=now,
+                        stage=expected_stage,
                     )
                     _record_stage_command(
                         connection,
                         idempotency_key,
-                        "admit_idea_stage",
+                        command_kind,
                         command_hash,
                         run_ref,
                     )
@@ -2628,22 +2762,38 @@ class SQLiteAgentRuntime:
                         },
                     )
                     replay_request_ref = request.request_ref
-        admitted = self.query_idea_stage_run(replay_request_ref)
+        admitted = self._query_stage_run(replay_request_ref, expected_stage)
         if admitted is None:
             raise OwnerConflict("stage_run_missing_after_admission")
         return admitted
 
     def query_idea_stage_run(self, request_ref: str) -> IdeaStageRun | None:
+        return self._query_stage_run(request_ref, "idea")
+
+    def query_plan_stage_run(self, request_ref: str) -> PlanStageRun | None:
+        return self._query_stage_run(request_ref, "plan")
+
+    def _query_stage_run(
+        self, request_ref: str, expected_stage: str
+    ) -> IdeaStageRun | None:
         with self._database.read() as connection:
             run = connection.execute(
-                text("SELECT * FROM ar_stage_runs WHERE request_ref = :request_ref"),
-                {"request_ref": request_ref},
+                text(
+                    "SELECT * FROM ar_stage_runs WHERE request_ref = :request_ref "
+                    "AND stage = :stage"
+                ),
+                {"request_ref": request_ref, "stage": expected_stage},
             ).first()
         if run is None:
             return None
-        return self._idea_stage_run_from_row(run)
+        return self._stage_run_from_row(run, expected_stage)
 
     def _idea_stage_run_from_row(self, run) -> IdeaStageRun:
+        return self._stage_run_from_row(run, "idea")
+
+    def _stage_run_from_row(self, run, expected_stage: str) -> IdeaStageRun:
+        if run.stage != expected_stage:
+            raise OwnerConflict("stage_run_integrity_invalid")
         runtime_binding = _runtime_binding_from_row(run)
         with self._database.read() as connection:
             session = connection.execute(
@@ -2735,6 +2885,7 @@ class SQLiteAgentRuntime:
                 native_session_ref=primary_draft.native_session_ref,
                 draft=primary_draft.draft,
                 adapter_kind=primary_draft.adapter_kind,
+                stage=run.stage,
             )
         ):
             raise OwnerConflict("idea_provider_invocation_invalid")
@@ -2750,6 +2901,7 @@ class SQLiteAgentRuntime:
                 reviewed_draft=execution.reviewed_draft,
                 outcome=execution.outcome,
                 review=execution.review,
+                stage=run.stage,
             )
         ):
             raise OwnerConflict("idea_provider_invocation_invalid")
@@ -2778,14 +2930,13 @@ class SQLiteAgentRuntime:
                 raise OwnerConflict("rejection_lineage_invalid")
             rejection_receipt = AcceptanceReceipt(
                 issuer="research_graph",
-                kind="idea_outcome_rejected",
+                kind=_stage_decision_receipt_kind(expected_stage, accepted=False),
                 receipt_ref=predecessor.decision_receipt_ref,
                 subject_ref=predecessor.decision_receipt_subject_ref,
                 payload_hash=predecessor.decision_receipt_hash,
             )
-            if self._outcome_verifier is None:
-                raise OwnerConflict("idea_outcome_verifier_unavailable")
-            self._outcome_verifier.verify_idea_outcome_decision(
+            self._verify_stage_decision(
+                stage=expected_stage,
                 request_ref=run.request_ref,
                 submission_ref=predecessor.submission_ref,
                 decision="rejected",
@@ -2848,6 +2999,55 @@ class SQLiteAgentRuntime:
         adapter_kind: str,
         idempotency_key: str,
     ) -> IdeaPrimaryDraft:
+        return self._record_stage_primary_draft(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            native_session_ref=native_session_ref,
+            runtime_binding=runtime_binding,
+            draft=draft,
+            adapter_kind=adapter_kind,
+            idempotency_key=idempotency_key,
+            expected_stage="idea",
+        )
+
+    def record_plan_primary_draft(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding: PlanRuntimeBinding,
+        draft: dict[str, object],
+        adapter_kind: str,
+        idempotency_key: str,
+    ) -> IdeaPrimaryDraft:
+        return self._record_stage_primary_draft(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            native_session_ref=native_session_ref,
+            runtime_binding=runtime_binding,
+            draft=draft,
+            adapter_kind=adapter_kind,
+            idempotency_key=idempotency_key,
+            expected_stage="plan",
+        )
+
+    def _record_stage_primary_draft(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding,
+        draft: dict[str, object],
+        adapter_kind: str,
+        idempotency_key: str,
+        expected_stage: str,
+    ) -> IdeaPrimaryDraft:
         """Bind the real native Session immediately after primary generation.
 
         Child-agent review is a later provider turn in this same native
@@ -2865,7 +3065,7 @@ class SQLiteAgentRuntime:
         ):
             raise OwnerConflict("idea_primary_draft_invalid")
         runtime_binding, _binding_json, runtime_binding_hash = (
-            _validated_runtime_binding(runtime_binding)
+            _validated_runtime_binding(runtime_binding, stage=expected_stage)
         )
         draft_json = canonical_json(draft)
         draft_hash = canonical_hash(draft)
@@ -2873,10 +3073,12 @@ class SQLiteAgentRuntime:
             native_session_ref=native_session_ref,
             draft=draft,
             adapter_kind=adapter_kind,
+            stage=expected_stage,
         )
+        command_kind = f"record_{expected_stage}_primary_draft"
         command_hash = canonical_hash(
             {
-                "command": "record_idea_primary_draft",
+                "command": command_kind,
                 "run_ref": run_ref,
                 "attempt_ref": attempt_ref,
                 "fence_ref": fence_ref,
@@ -2890,20 +3092,22 @@ class SQLiteAgentRuntime:
         _query_stage_command(
             self._database,
             idempotency_key,
-            "record_idea_primary_draft",
+            command_kind,
             command_hash,
         )
         with self._database.write() as connection:
             replay_ref = _stage_command_replay(
                 connection,
                 idempotency_key,
-                "record_idea_primary_draft",
+                command_kind,
                 command_hash,
             )
             run, attempt, session, fence = _load_stage_fence(
                 connection, run_ref, attempt_ref, fence_ref
             )
             if (
+                run.stage != expected_stage
+                or
                 _runtime_binding_from_row(run) != runtime_binding
                 or run.runtime_binding_hash != runtime_binding_hash
             ):
@@ -2931,7 +3135,7 @@ class SQLiteAgentRuntime:
                 _record_stage_command(
                     connection,
                     idempotency_key,
-                    "record_idea_primary_draft",
+                    command_kind,
                     command_hash,
                     attempt_ref,
                 )
@@ -2989,7 +3193,7 @@ class SQLiteAgentRuntime:
                 _record_stage_command(
                     connection,
                     idempotency_key,
-                    "record_idea_primary_draft",
+                    command_kind,
                     command_hash,
                     attempt_ref,
                 )
@@ -3014,7 +3218,7 @@ class SQLiteAgentRuntime:
                         "provider_response_hash": provider_response_hash,
                     },
                 )
-        current = self.query_idea_stage_run(run.request_ref)
+        current = self._query_stage_run(run.request_ref, expected_stage)
         if current is None or current.primary_draft is None:
             raise OwnerConflict("idea_primary_draft_missing_after_commit")
         return current.primary_draft
@@ -3033,23 +3237,82 @@ class SQLiteAgentRuntime:
         idempotency_key: str,
         reviewed_draft: dict[str, object] | None = None,
     ) -> AttemptExecution:
+        return self._record_stage_attempt_execution(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            submission_ref=submission_ref,
+            native_session_ref=native_session_ref,
+            runtime_binding=runtime_binding,
+            outcome=outcome,
+            review=review,
+            idempotency_key=idempotency_key,
+            reviewed_draft=reviewed_draft,
+            expected_stage="idea",
+        )
+
+    def record_plan_attempt_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        native_session_ref: str,
+        runtime_binding: PlanRuntimeBinding,
+        plan: dict[str, object],
+        review: dict[str, object],
+        idempotency_key: str,
+        reviewed_draft: dict[str, object] | None = None,
+    ) -> AttemptExecution:
+        return self._record_stage_attempt_execution(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            submission_ref=submission_ref,
+            native_session_ref=native_session_ref,
+            runtime_binding=runtime_binding,
+            outcome=plan,
+            review=review,
+            idempotency_key=idempotency_key,
+            reviewed_draft=reviewed_draft,
+            expected_stage="plan",
+        )
+
+    def _record_stage_attempt_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        submission_ref: str,
+        native_session_ref: str,
+        runtime_binding: IdeaRuntimeBinding | PlanRuntimeBinding,
+        outcome: dict[str, object],
+        review: dict[str, object],
+        idempotency_key: str,
+        reviewed_draft: dict[str, object] | None,
+        expected_stage: str,
+    ) -> AttemptExecution:
         _validate_stage_idempotency_key(idempotency_key)
         if not submission_ref or not native_session_ref:
             raise OwnerConflict("attempt_execution_identity_invalid")
         runtime_binding, _runtime_binding_json, runtime_binding_hash = (
-            _validated_runtime_binding(runtime_binding)
+            _validated_runtime_binding(runtime_binding, stage=expected_stage)
         )
         reviewer_agent_ref = _validate_attempt_review_for_write(
-            review, native_session_ref=native_session_ref
+            review,
+            native_session_ref=native_session_ref,
+            stage=expected_stage,
         )
         reviewed_draft = _resolved_reviewed_draft(
             outcome,
             review,
             reviewed_draft,
         )
-        outcome_material_hash = material_outcome_hash(outcome)
+        outcome_material_hash = _stage_material_hash(expected_stage, outcome)
         payload = {
-            "schema_ref": ATTEMPT_EXECUTION_SCHEMA,
+            "schema_ref": _stage_execution_schema(expected_stage),
             "outcome": outcome,
             "reviewed_draft": reviewed_draft,
             "review": review,
@@ -3061,10 +3324,12 @@ class SQLiteAgentRuntime:
             reviewed_draft=reviewed_draft,
             outcome=outcome,
             review=review,
+            stage=expected_stage,
         )
+        command_kind = f"record_{expected_stage}_attempt_execution"
         command_hash = canonical_hash(
             {
-                "command": "record_idea_attempt_execution",
+                "command": command_kind,
                 "run_ref": run_ref,
                 "attempt_ref": attempt_ref,
                 "fence_ref": fence_ref,
@@ -3079,7 +3344,7 @@ class SQLiteAgentRuntime:
         _query_stage_command(
             self._database,
             idempotency_key,
-            "record_idea_attempt_execution",
+            command_kind,
             command_hash,
         )
         with self._database.read() as connection:
@@ -3089,7 +3354,8 @@ class SQLiteAgentRuntime:
             if reviewer_agent_ref == preview_session.session_ref:
                 raise OwnerConflict("attempt_review_independence_invalid")
             if (
-                _runtime_binding_from_row(preview_run) != runtime_binding
+                preview_run.stage != expected_stage
+                or _runtime_binding_from_row(preview_run) != runtime_binding
                 or preview_run.runtime_binding_hash != runtime_binding_hash
             ):
                 raise OwnerConflict("idea_runtime_binding_drift")
@@ -3113,6 +3379,7 @@ class SQLiteAgentRuntime:
                     native_session_ref=primary_draft.native_session_ref,
                     draft=primary_draft.draft,
                     adapter_kind=primary_draft.adapter_kind,
+                    stage=preview_run.stage,
                 )
                 or review_invocation.status == "completed"
                 and review_invocation.response_hash != provider_response_hash
@@ -3129,9 +3396,8 @@ class SQLiteAgentRuntime:
                 )
             )
         if predecessor_receipt is not None:
-            if self._outcome_verifier is None:
-                raise OwnerConflict("idea_outcome_verifier_unavailable")
-            self._outcome_verifier.verify_idea_outcome_decision(
+            self._verify_stage_decision(
+                stage=expected_stage,
                 request_ref=preview_run.request_ref,
                 submission_ref=predecessor_submission_ref,
                 decision="rejected",
@@ -3142,7 +3408,7 @@ class SQLiteAgentRuntime:
             replay_ref = _stage_command_replay(
                 connection,
                 idempotency_key,
-                "record_idea_attempt_execution",
+                command_kind,
                 command_hash,
             )
             if replay_ref is not None:
@@ -3155,7 +3421,8 @@ class SQLiteAgentRuntime:
             if reviewer_agent_ref == session.session_ref:
                 raise OwnerConflict("attempt_review_independence_invalid")
             if (
-                _runtime_binding_from_row(run) != runtime_binding
+                run.stage != expected_stage
+                or _runtime_binding_from_row(run) != runtime_binding
                 or run.runtime_binding_hash != runtime_binding_hash
             ):
                 raise OwnerConflict("idea_runtime_binding_drift")
@@ -3200,7 +3467,7 @@ class SQLiteAgentRuntime:
                     _record_stage_command(
                         connection,
                         idempotency_key,
-                        "record_idea_attempt_execution",
+                        command_kind,
                         command_hash,
                         submission_ref,
                     )
@@ -3238,7 +3505,9 @@ class SQLiteAgentRuntime:
                     **lineage,
                 }
                 receipt_hash = _owner_receipt_hash(
-                    ATTEMPT_EXECUTION_RECEIPT_KIND, submission_ref, bindings
+                    _stage_execution_receipt_kind(expected_stage),
+                    submission_ref,
+                    bindings,
                 )
                 try:
                     connection.execute(
@@ -3303,7 +3572,7 @@ class SQLiteAgentRuntime:
                 _record_stage_command(
                     connection,
                     idempotency_key,
-                    "record_idea_attempt_execution",
+                    command_kind,
                     command_hash,
                     submission_ref,
                 )
@@ -3330,13 +3599,26 @@ class SQLiteAgentRuntime:
                     },
                 )
                 replay_submission_ref = submission_ref
-        executed = self.query_idea_attempt_execution(replay_submission_ref)
+        executed = self._query_stage_attempt_execution(
+            replay_submission_ref,
+            expected_stage,
+        )
         if executed is None:
             raise OwnerConflict("attempt_execution_missing_after_commit")
         return executed
 
     def query_idea_attempt_execution(
         self, submission_ref: str
+    ) -> AttemptExecution | None:
+        return self._query_stage_attempt_execution(submission_ref, "idea")
+
+    def query_plan_attempt_execution(
+        self, submission_ref: str
+    ) -> AttemptExecution | None:
+        return self._query_stage_attempt_execution(submission_ref, "plan")
+
+    def _query_stage_attempt_execution(
+        self, submission_ref: str, expected_stage: str
     ) -> AttemptExecution | None:
         with self._database.read() as connection:
             row = connection.execute(
@@ -3354,6 +3636,8 @@ class SQLiteAgentRuntime:
                 {"submission_ref": submission_ref},
             ).first()
             if row is None:
+                return None
+            if row.stage != expected_stage:
                 return None
             executed = _attempt_execution(row, row, row)
             _verify_provider_execution_chain(connection, row, executed)
@@ -3377,10 +3661,48 @@ class SQLiteAgentRuntime:
         decision_receipt: AcceptanceReceipt,
         idempotency_key: str,
     ) -> IdeaStageRun:
+        return self._continue_after_stage_rejection(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="idea",
+        )
+
+    def continue_after_plan_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> PlanStageRun:
+        return self._continue_after_stage_rejection(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="plan",
+        )
+
+    def _continue_after_stage_rejection(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+        expected_stage: str,
+    ) -> IdeaStageRun:
         _validate_stage_idempotency_key(idempotency_key)
+        command_kind = f"continue_after_{expected_stage}_rejection"
         command_hash = canonical_hash(
             {
-                "command": "continue_after_idea_rejection",
+                "command": command_kind,
                 "run_ref": run_ref,
                 "attempt_ref": attempt_ref,
                 "fence_ref": fence_ref,
@@ -3390,21 +3712,22 @@ class SQLiteAgentRuntime:
         replay = _query_stage_command(
             self._database,
             idempotency_key,
-            "continue_after_idea_rejection",
+            command_kind,
             command_hash,
         )
         if replay is not None:
-            return self._query_idea_run_by_ref(run_ref)
-        if self._outcome_verifier is None:
-            raise OwnerConflict("idea_outcome_verifier_unavailable")
+            return self._query_stage_run_by_ref(run_ref, expected_stage)
         with self._database.read() as connection:
             run, attempt, _session, fence = _load_stage_fence(
                 connection, run_ref, attempt_ref, fence_ref
             )
             _require_current_fence(run, attempt, fence, "executed", "submitted")
+            if run.stage != expected_stage:
+                raise OwnerConflict("stage_run_integrity_invalid")
             request_ref = run.request_ref
             submission_ref = attempt.submission_ref
-        self._outcome_verifier.verify_idea_outcome_decision(
+        self._verify_stage_decision(
+            stage=expected_stage,
             request_ref=request_ref,
             submission_ref=submission_ref,
             decision="rejected",
@@ -3415,7 +3738,7 @@ class SQLiteAgentRuntime:
             replay_ref = _stage_command_replay(
                 connection,
                 idempotency_key,
-                "continue_after_idea_rejection",
+                command_kind,
                 command_hash,
             )
             if replay_ref is None:
@@ -3427,8 +3750,8 @@ class SQLiteAgentRuntime:
                     raise OwnerConflict("native_session_missing")
                 now = time.time()
                 next_generation = int(attempt.generation) + 1
-                successor_ref = new_ref("idea_attempt")
-                successor_fence_ref = new_ref("idea_fence")
+                successor_ref = new_ref(f"{expected_stage}_attempt")
+                successor_fence_ref = new_ref(f"{expected_stage}_fence")
                 connection.execute(
                     text(
                         "UPDATE ar_stage_attempts SET status = 'rejected', "
@@ -3500,6 +3823,7 @@ class SQLiteAgentRuntime:
                     runtime_binding_hash=run.runtime_binding_hash,
                     predecessor_attempt_ref=attempt_ref,
                     prepared_at=now,
+                    stage=expected_stage,
                 )
                 connection.execute(
                     text(
@@ -3517,7 +3841,7 @@ class SQLiteAgentRuntime:
                 _record_stage_command(
                     connection,
                     idempotency_key,
-                    "continue_after_idea_rejection",
+                    command_kind,
                     command_hash,
                     successor_ref,
                 )
@@ -3541,7 +3865,7 @@ class SQLiteAgentRuntime:
                         "fence_ref": successor_fence_ref,
                     },
                 )
-        return self._query_idea_run_by_ref(run_ref)
+        return self._query_stage_run_by_ref(run_ref, expected_stage)
 
     def complete_idea_run(
         self,
@@ -3553,12 +3877,54 @@ class SQLiteAgentRuntime:
         decision_receipt: AcceptanceReceipt,
         idempotency_key: str,
     ) -> RunCompletion:
+        return self._complete_stage_run(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            outcome_ref=outcome_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="idea",
+        )
+
+    def complete_plan_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        formal_plan_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> RunCompletion:
+        return self._complete_stage_run(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            outcome_ref=formal_plan_ref,
+            decision_receipt=decision_receipt,
+            idempotency_key=idempotency_key,
+            expected_stage="plan",
+        )
+
+    def _complete_stage_run(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        outcome_ref: str,
+        decision_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+        expected_stage: str,
+    ) -> RunCompletion:
         _validate_stage_idempotency_key(idempotency_key)
         if not outcome_ref:
             raise OwnerConflict("outcome_ref_invalid")
+        command_kind = f"complete_{expected_stage}_run"
         command_hash = canonical_hash(
             {
-                "command": "complete_idea_run",
+                "command": command_kind,
                 "run_ref": run_ref,
                 "attempt_ref": attempt_ref,
                 "fence_ref": fence_ref,
@@ -3569,24 +3935,25 @@ class SQLiteAgentRuntime:
         replay = _query_stage_command(
             self._database,
             idempotency_key,
-            "complete_idea_run",
+            command_kind,
             command_hash,
         )
         if replay is not None:
-            completed = self.query_idea_run_completion(run_ref)
+            completed = self._query_stage_run_completion(run_ref, expected_stage)
             if completed is None:
                 raise OwnerConflict("run_completion_missing")
             return completed
-        if self._outcome_verifier is None:
-            raise OwnerConflict("idea_outcome_verifier_unavailable")
         with self._database.read() as connection:
             run, attempt, _session, fence = _load_stage_fence(
                 connection, run_ref, attempt_ref, fence_ref
             )
             _require_current_fence(run, attempt, fence, "executed", "submitted")
+            if run.stage != expected_stage:
+                raise OwnerConflict("stage_run_integrity_invalid")
             request_ref = run.request_ref
             submission_ref = attempt.submission_ref
-        self._outcome_verifier.verify_idea_outcome_decision(
+        self._verify_stage_decision(
+            stage=expected_stage,
             request_ref=request_ref,
             submission_ref=submission_ref,
             decision="accepted",
@@ -3597,7 +3964,7 @@ class SQLiteAgentRuntime:
             replay_ref = _stage_command_replay(
                 connection,
                 idempotency_key,
-                "complete_idea_run",
+                command_kind,
                 command_hash,
             )
             if replay_ref is None:
@@ -3669,7 +4036,7 @@ class SQLiteAgentRuntime:
                 _record_stage_command(
                     connection,
                     idempotency_key,
-                    "complete_idea_run",
+                    command_kind,
                     command_hash,
                     run_ref,
                 )
@@ -3693,18 +4060,30 @@ class SQLiteAgentRuntime:
                         "receipt_ref": receipt_ref,
                     },
                 )
-        completed = self.query_idea_run_completion(run_ref)
+        completed = self._query_stage_run_completion(run_ref, expected_stage)
         if completed is None:
             raise OwnerConflict("run_completion_missing_after_commit")
         return completed
 
     def query_idea_run_completion(self, run_ref: str) -> RunCompletion | None:
+        return self._query_stage_run_completion(run_ref, "idea")
+
+    def query_plan_run_completion(self, run_ref: str) -> RunCompletion | None:
+        return self._query_stage_run_completion(run_ref, "plan")
+
+    def _query_stage_run_completion(
+        self, run_ref: str, expected_stage: str
+    ) -> RunCompletion | None:
         with self._database.read() as connection:
             run = connection.execute(
                 text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
                 {"run_ref": run_ref},
             ).first()
-            if run is None or run.status != "completed":
+            if (
+                run is None
+                or run.stage != expected_stage
+                or run.status != "completed"
+            ):
                 return None
             attempt = connection.execute(
                 text(
@@ -3726,6 +4105,11 @@ class SQLiteAgentRuntime:
         return completed
 
     def _query_idea_run_by_ref(self, run_ref: str) -> IdeaStageRun:
+        return self._query_stage_run_by_ref(run_ref, "idea")
+
+    def _query_stage_run_by_ref(
+        self, run_ref: str, expected_stage: str
+    ) -> IdeaStageRun:
         with self._database.read() as connection:
             row = connection.execute(
                 text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
@@ -3733,7 +4117,41 @@ class SQLiteAgentRuntime:
             ).first()
         if row is None:
             raise OwnerConflict("stage_run_not_found")
-        return self._idea_stage_run_from_row(row)
+        return self._stage_run_from_row(row, expected_stage)
+
+    def _verify_stage_decision(
+        self,
+        *,
+        stage: str,
+        request_ref: str,
+        submission_ref: str | None,
+        decision: str,
+        outcome_ref: str | None,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if stage == "idea":
+            if self._outcome_verifier is None:
+                raise OwnerConflict("idea_outcome_verifier_unavailable")
+            self._outcome_verifier.verify_idea_outcome_decision(
+                request_ref=request_ref,
+                submission_ref=submission_ref,
+                decision=decision,
+                outcome_ref=outcome_ref,
+                receipt=receipt,
+            )
+            return
+        if stage == "plan":
+            if self._formal_plan_verifier is None:
+                raise OwnerConflict("formal_plan_verifier_unavailable")
+            self._formal_plan_verifier.verify_formal_plan_decision(
+                request_ref=request_ref,
+                submission_ref=submission_ref,
+                decision=decision,
+                formal_plan_ref=outcome_ref,
+                receipt=receipt,
+            )
+            return
+        raise OwnerConflict("stage_run_integrity_invalid")
 
     def verify_attempt_execution_receipt(self, **values) -> None:
         self._receipt_verifier.verify_attempt_execution_receipt(**values)
@@ -3769,7 +4187,11 @@ class SQLiteAgentRuntimeReceiptVerifier:
     ) -> None:
         if (
             receipt.issuer != AR_OWNER
-            or receipt.kind != ATTEMPT_EXECUTION_RECEIPT_KIND
+            or receipt.kind
+            not in {
+                ATTEMPT_EXECUTION_RECEIPT_KIND,
+                PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND,
+            }
             or receipt.subject_ref != submission_ref
         ):
             raise OwnerConflict("attempt_execution_receipt_issuer_invalid")
@@ -3799,6 +4221,7 @@ class SQLiteAgentRuntimeReceiptVerifier:
             or row.submission_ref != submission_ref
             or row.payload_hash != payload_hash
             or row.execution_receipt_hash != receipt.payload_hash
+            or receipt.kind != _stage_execution_receipt_kind(row.stage)
         ):
             raise OwnerConflict("attempt_execution_receipt_invalid")
         outcome = executed.outcome
@@ -4270,6 +4693,38 @@ def _owner_receipt_hash(
     )
 
 
+def _stage_execution_schema(stage: str) -> str:
+    if stage == "idea":
+        return ATTEMPT_EXECUTION_SCHEMA
+    if stage == "plan":
+        return PLAN_ATTEMPT_EXECUTION_SCHEMA
+    raise OwnerConflict("stage_run_integrity_invalid")
+
+
+def _stage_execution_receipt_kind(stage: str) -> str:
+    if stage == "idea":
+        return ATTEMPT_EXECUTION_RECEIPT_KIND
+    if stage == "plan":
+        return PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND
+    raise OwnerConflict("stage_run_integrity_invalid")
+
+
+def _stage_decision_receipt_kind(stage: str, *, accepted: bool) -> str:
+    if stage == "idea":
+        return "idea_outcome_accepted" if accepted else "idea_outcome_rejected"
+    if stage == "plan":
+        return "formal_plan_accepted" if accepted else "formal_plan_rejected"
+    raise OwnerConflict("stage_run_integrity_invalid")
+
+
+def _stage_material_hash(stage: str, outcome: dict[str, object]) -> str:
+    if stage == "idea":
+        return material_outcome_hash(outcome)
+    if stage == "plan":
+        return material_plan_hash(outcome)
+    raise OwnerConflict("stage_run_integrity_invalid")
+
+
 def _execution_bindings(row) -> dict[str, object]:
     return {
         "request_ref": row.request_ref,
@@ -4303,7 +4758,7 @@ def _verify_execution_row(
         review = payload["review"]
         if (
             set(payload) != {"schema_ref", "outcome", "reviewed_draft", "review"}
-            or payload["schema_ref"] != ATTEMPT_EXECUTION_SCHEMA
+            or payload["schema_ref"] != _stage_execution_schema(row.stage)
             or not isinstance(outcome, dict)
             or not isinstance(reviewed_draft, dict)
             or not isinstance(review, dict)
@@ -4338,10 +4793,10 @@ def _verify_execution_row(
         or lineage_invalid
         or canonical_json(payload) != row.payload_json
         or canonical_hash(payload) != row.payload_hash
-        or material_outcome_hash(outcome) != row.material_outcome_hash
+        or _stage_material_hash(row.stage, outcome) != row.material_outcome_hash
         or row.execution_receipt_hash
         != _owner_receipt_hash(
-            ATTEMPT_EXECUTION_RECEIPT_KIND,
+            _stage_execution_receipt_kind(row.stage),
             row.submission_ref,
             _execution_bindings(row),
         )
@@ -4400,10 +4855,11 @@ def _provider_invocation_request_hash(
     context_pack_hash: str,
     runtime_binding_hash: str,
     predecessor_attempt_ref: str | None,
+    stage: str = "idea",
 ) -> str:
     return canonical_hash(
         {
-            "schema_ref": "meta-research/idea-provider-invocation/v1",
+            "schema_ref": f"meta-research/{stage}-provider-invocation/v1",
             "invocation_ref": invocation_ref,
             "phase": phase,
             "request_ref": request_ref,
@@ -4425,10 +4881,11 @@ def _primary_provider_response_hash(
     native_session_ref: str,
     draft: dict[str, object],
     adapter_kind: str,
+    stage: str = "idea",
 ) -> str:
     return canonical_hash(
         {
-            "schema_ref": "meta-research/idea-primary-provider-response/v1",
+            "schema_ref": f"meta-research/{stage}-primary-provider-response/v1",
             "native_session_ref": native_session_ref,
             "draft": draft,
             "adapter_kind": adapter_kind,
@@ -4442,10 +4899,11 @@ def _review_provider_response_hash(
     reviewed_draft: dict[str, object],
     outcome: dict[str, object],
     review: dict[str, object],
+    stage: str = "idea",
 ) -> str:
     return canonical_hash(
         {
-            "schema_ref": "meta-research/idea-review-provider-response/v1",
+            "schema_ref": f"meta-research/{stage}-review-provider-response/v1",
             "native_session_ref": native_session_ref,
             "reviewed_draft": reviewed_draft,
             "outcome": outcome,
@@ -4468,12 +4926,13 @@ def _insert_provider_invocations(
     runtime_binding_hash: str,
     predecessor_attempt_ref: str | None,
     prepared_at: float,
+    stage: str = "idea",
 ) -> None:
     for phase in ("primary", "review"):
-        invocation_ref = new_ref(f"idea_{phase}_invocation")
+        invocation_ref = new_ref(f"{stage}_{phase}_invocation")
         connection.execute(
             text(
-                "INSERT INTO ar_idea_provider_invocations (invocation_ref, "
+                "INSERT INTO ar_stage_provider_invocations (invocation_ref, "
                 "run_ref, attempt_ref, fence_ref, phase, request_hash, "
                 "runtime_binding_hash, status, prepared_at) VALUES "
                 "(:invocation_ref, :run_ref, :attempt_ref, :fence_ref, :phase, "
@@ -4498,6 +4957,7 @@ def _insert_provider_invocations(
                     context_pack_hash=context_pack_hash,
                     runtime_binding_hash=runtime_binding_hash,
                     predecessor_attempt_ref=predecessor_attempt_ref,
+                    stage=stage,
                 ),
                 "runtime_binding_hash": runtime_binding_hash,
                 "prepared_at": prepared_at,
@@ -4510,7 +4970,7 @@ def _provider_invocations(
 ) -> tuple[IdeaProviderInvocation, IdeaProviderInvocation]:
     rows = connection.execute(
         text(
-            "SELECT * FROM ar_idea_provider_invocations WHERE "
+            "SELECT * FROM ar_stage_provider_invocations WHERE "
             "attempt_ref = :attempt_ref ORDER BY phase"
         ),
         {"attempt_ref": attempt.attempt_ref},
@@ -4534,6 +4994,7 @@ def _provider_invocations(
             context_pack_hash=run.context_pack_hash,
             runtime_binding_hash=run.runtime_binding_hash,
             predecessor_attempt_ref=attempt.predecessor_attempt_ref,
+            stage=run.stage,
         )
         if (
             row.run_ref != run.run_ref
@@ -4582,7 +5043,7 @@ def _complete_provider_invocation(
     now = time.time()
     connection.execute(
         text(
-            "UPDATE ar_idea_provider_invocations SET status = 'completed', "
+            "UPDATE ar_stage_provider_invocations SET status = 'completed', "
             "response_hash = :response_hash, completed_at = :completed_at WHERE "
             "invocation_ref = :invocation_ref AND status = 'prepared'"
         ),
@@ -4613,6 +5074,7 @@ def _verify_provider_execution_chain(
             native_session_ref=checkpoint.native_session_ref,
             draft=checkpoint.draft,
             adapter_kind=checkpoint.adapter_kind,
+            stage=row.stage,
         )
         or review.status != "completed"
         or review.response_hash
@@ -4621,6 +5083,7 @@ def _verify_provider_execution_chain(
             reviewed_draft=execution.reviewed_draft,
             outcome=execution.outcome,
             review=execution.review,
+            stage=row.stage,
         )
     ):
         raise OwnerConflict("idea_provider_invocation_invalid")
@@ -4635,6 +5098,7 @@ def _attempt_execution(run, attempt, session) -> AttemptExecution:
     outcome, reviewed_draft, review = _verify_execution_row(row)
     runtime_binding = _runtime_binding_from_row(row)
     return AttemptExecution(
+        stage=row.stage,
         request_ref=row.request_ref,
         run_ref=row.run_ref,
         attempt_ref=row.attempt_ref,
@@ -4652,7 +5116,7 @@ def _attempt_execution(run, attempt, session) -> AttemptExecution:
         review=review,
         receipt=AcceptanceReceipt(
             issuer=AR_OWNER,
-            kind=ATTEMPT_EXECUTION_RECEIPT_KIND,
+            kind=_stage_execution_receipt_kind(row.stage),
             receipt_ref=row.execution_receipt_ref,
             subject_ref=row.submission_ref,
             payload_hash=row.execution_receipt_hash,
@@ -4665,7 +5129,7 @@ def _attempt_execution(run, attempt, session) -> AttemptExecution:
             if row.predecessor_attempt_ref is None
             else AcceptanceReceipt(
                 issuer="research_graph",
-                kind="idea_outcome_rejected",
+                kind=_stage_decision_receipt_kind(row.stage, accepted=False),
                 receipt_ref=row.predecessor_rejection_receipt_ref,
                 subject_ref=row.predecessor_rejection_receipt_subject_ref,
                 payload_hash=row.predecessor_rejection_receipt_hash,
@@ -4766,11 +5230,11 @@ def _successor_execution_lineage(
     predecessor_execution = _attempt_execution(run, predecessor, session)
     predecessor_outcome_hash = canonical_hash(predecessor_execution.outcome)
     predecessor_material_hash = predecessor_execution.material_outcome_hash
-    if material_outcome_hash(outcome) == predecessor_material_hash:
+    if _stage_material_hash(run.stage, outcome) == predecessor_material_hash:
         raise OwnerConflict("attempt_successor_outcome_unchanged")
     receipt = AcceptanceReceipt(
         issuer="research_graph",
-        kind="idea_outcome_rejected",
+        kind=_stage_decision_receipt_kind(run.stage, accepted=False),
         receipt_ref=predecessor.decision_receipt_ref,
         subject_ref=predecessor.decision_receipt_subject_ref,
         payload_hash=predecessor.decision_receipt_hash,
@@ -4829,9 +5293,10 @@ def _verify_persisted_successor_lineage(
         or predecessor.native_session_ref != row.native_session_ref
         or int(row.generation) != int(predecessor.generation) + 1
         or canonical_hash(predecessor_outcome) != row.predecessor_outcome_hash
-        or material_outcome_hash(predecessor_outcome)
+        or _stage_material_hash(row.stage, predecessor_outcome)
         != row.predecessor_material_outcome_hash
-        or material_outcome_hash(outcome) == row.predecessor_material_outcome_hash
+        or _stage_material_hash(row.stage, outcome)
+        == row.predecessor_material_outcome_hash
         or predecessor.decision_receipt_ref != row.predecessor_rejection_receipt_ref
         or predecessor.decision_receipt_subject_ref
         != row.predecessor_rejection_receipt_subject_ref
@@ -4877,7 +5342,7 @@ def _run_completion(run, attempt) -> RunCompletion:
         outcome_ref=run.outcome_ref,
         decision_receipt=AcceptanceReceipt(
             issuer="research_graph",
-            kind="idea_outcome_accepted",
+            kind=_stage_decision_receipt_kind(run.stage, accepted=True),
             receipt_ref=attempt.decision_receipt_ref,
             subject_ref=run.outcome_ref,
             payload_hash=attempt.decision_receipt_hash,
@@ -4946,9 +5411,15 @@ def _validate_stage_idempotency_key(value: str) -> None:
 
 
 def _validated_runtime_binding(
-    binding: IdeaRuntimeBinding,
-) -> tuple[IdeaRuntimeBinding, str, str]:
-    if not isinstance(binding, IdeaRuntimeBinding):
+    binding: IdeaRuntimeBinding | PlanRuntimeBinding,
+    *,
+    stage: str | None = None,
+) -> tuple[IdeaRuntimeBinding | PlanRuntimeBinding, str, str]:
+    expected_type = IdeaRuntimeBinding if stage != "plan" else PlanRuntimeBinding
+    expected_schema = (
+        IDEA_RUNTIME_BINDING_SCHEMA if stage != "plan" else PLAN_RUNTIME_BINDING_SCHEMA
+    )
+    if not isinstance(binding, expected_type):
         raise OwnerConflict("idea_runtime_binding_invalid")
     value = binding.as_dict()
     if (
@@ -4963,7 +5434,7 @@ def _validated_runtime_binding(
             "capability_bindings",
             "resource_bindings",
         }
-        or binding.schema_ref != IDEA_RUNTIME_BINDING_SCHEMA
+        or binding.schema_ref != expected_schema
         or not _is_sha256(binding.packaged_skill_bundle_hash)
         or not _is_sha256(binding.instruction_set_hash)
         or not _runtime_ref(binding.model_ref)
@@ -5018,7 +5489,7 @@ def _resolved_reviewed_draft(
 
 
 def _validate_attempt_review_for_write(
-    review: dict[str, object], *, native_session_ref: str
+    review: dict[str, object], *, native_session_ref: str, stage: str = "idea"
 ) -> str:
     """Accept only the child-agent review contract for new AR executions.
 
@@ -5027,11 +5498,14 @@ def _validate_attempt_review_for_write(
     ``reviewer_session_ref`` encoded the retired extra-Session topology.
     """
 
-    if review.get("schema_ref") == IDEA_REVIEW_SCHEMA_V1_REF:
+    if stage == "idea" and review.get("schema_ref") == IDEA_REVIEW_SCHEMA_V1_REF:
         raise OwnerConflict("attempt_review_legacy_read_only")
+    expected_schema = (
+        IDEA_REVIEW_SCHEMA_REF if stage == "idea" else PLAN_REVIEW_SCHEMA_REF
+    )
     reviewer_agent_ref = review.get("reviewer_agent_ref")
     if (
-        review.get("schema_ref") != IDEA_REVIEW_SCHEMA_REF
+        review.get("schema_ref") != expected_schema
         or review.get("review_mode") != "harness_child_agent"
         or not isinstance(reviewer_agent_ref, str)
         or not reviewer_agent_ref.strip()
@@ -5044,7 +5518,7 @@ def _validate_attempt_review_for_write(
     return reviewer_agent_ref
 
 
-def _runtime_binding_from_row(row) -> IdeaRuntimeBinding:
+def _runtime_binding_from_row(row) -> IdeaRuntimeBinding | PlanRuntimeBinding:
     try:
         value = decoded_object(row.runtime_binding_json)
         if set(value) != {
@@ -5065,7 +5539,10 @@ def _runtime_binding_from_row(row) -> IdeaRuntimeBinding:
         ):
             if not isinstance(value[field], list):
                 raise TypeError(field)
-        binding = IdeaRuntimeBinding(
+        binding_type = IdeaRuntimeBinding if row.stage == "idea" else PlanRuntimeBinding
+        if row.stage not in {"idea", "plan"}:
+            raise TypeError("stage")
+        binding = binding_type(
             packaged_skill_bundle_hash=value["packaged_skill_bundle_hash"],
             instruction_set_hash=value["instruction_set_hash"],
             model_ref=value["model_ref"],
@@ -5075,12 +5552,14 @@ def _runtime_binding_from_row(row) -> IdeaRuntimeBinding:
             resource_bindings=tuple(value["resource_bindings"]),
             schema_ref=value["schema_ref"],
         )
-        binding, binding_json, binding_hash = _validated_runtime_binding(binding)
+        binding, binding_json, binding_hash = _validated_runtime_binding(
+            binding, stage=row.stage
+        )
     except (KeyError, TypeError, ValueError) as error:
         raise OwnerConflict("idea_runtime_binding_invalid") from error
     expected_admission_hash = canonical_hash(
         {
-            "command": "admit_idea_stage",
+            "command": f"admit_{row.stage}_stage",
             "request_ref": row.request_ref,
             "cycle_ref": row.cycle_ref,
             "stage": row.stage,
@@ -5249,6 +5728,7 @@ def create_agent_runtime_interface(
     host_compute_probe: HostComputeProbe,
     stage_request_verifier: StageRunRequestVerifier | None = None,
     outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
+    formal_plan_verifier: FormalPlanDecisionVerifier | None = None,
     deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
     acquisition_private_root: Path | None = None,
 ) -> AgentRuntimeInterface:
@@ -5258,6 +5738,7 @@ def create_agent_runtime_interface(
         host_compute_probe,
         stage_request_verifier,
         outcome_verifier,
+        formal_plan_verifier,
         deepfetch_request_verifier,
         acquisition_private_root,
     )
