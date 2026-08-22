@@ -22,6 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from meta_research.auth import AuthSession
 from meta_research.composition import ProductionRuntime
+from meta_research.experiment import ExperimentIntent
 from meta_research.owners.common import OwnerConflict
 from meta_research.owners.research_graph import ASSET_ROLE_QUERY_MAX_PAGE_SIZE
 from meta_research.owners.research_memory import (
@@ -51,6 +52,7 @@ ASSET_ROUTE_WATCHDOG_SECONDS = 5.0
 DRAFTING_WORKER_WATCHDOG_SECONDS = 190.0
 IDEA_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 DEEPFETCH_WORKER_WATCHDOG_SECONDS = 1810.0
+EXPERIMENT_WORKER_WATCHDOG_SECONDS = 30.0
 _T = TypeVar("_T")
 
 
@@ -297,6 +299,32 @@ class EmptyCommandRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class StartExperimentRequest(BaseModel):
+    """Web intent for one stable, Owner-authorized experiment request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_request_ref: str = Field(min_length=1, max_length=96)
+    quest_ref: str = Field(min_length=1, max_length=96)
+    title: str = Field(min_length=1, max_length=512)
+    hypothesis: str = Field(min_length=1, max_length=4000)
+    variant_parameter: float = Field(allow_inf_nan=False)
+    sample_count: int = Field(ge=4, le=4096)
+    request_kind: Literal["retrain", "remeasure"] = "retrain"
+    source_variant_run_ref: str | None = Field(default=None, max_length=96)
+    selected_checkpoint_role_refs: list[str] = Field(
+        default_factory=list,
+        max_length=32,
+    )
+
+    def as_intent(self) -> ExperimentIntent:
+        value = self.model_dump()
+        value["selected_checkpoint_role_refs"] = tuple(
+            self.selected_checkpoint_role_refs
+        )
+        return ExperimentIntent(**value)
+
+
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
@@ -304,12 +332,14 @@ def create_app(
     drafting_task: asyncio.Task[None] | None = None
     deepfetch_task: asyncio.Task[None] | None = None
     idea_stage_task: asyncio.Task[None] | None = None
+    experiment_task: asyncio.Task[None] | None = None
     research_asset_task: asyncio.Task[None] | None = None
     research_asset_verification_task: asyncio.Task[None] | None = None
     reconciliation_health = ReconciliationHealth()
     drafting_health = ReconciliationHealth()
     deepfetch_health = ReconciliationHealth()
     idea_stage_health = ReconciliationHealth()
+    experiment_health = ReconciliationHealth()
     research_asset_health = ReconciliationHealth()
     research_asset_verification_health = ReconciliationHealth()
     worker_health_updates = WorkerHealthUpdates()
@@ -321,6 +351,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         nonlocal reconciliation_task, drafting_task, deepfetch_task, idea_stage_task
+        nonlocal experiment_task
         nonlocal research_asset_task, research_asset_verification_task
         reconciliation_task = asyncio.create_task(
             _reconcile_quest_initializations(
@@ -354,6 +385,14 @@ def create_app(
             )
         )
         idea_stage_task.add_done_callback(_log_reconciliation_exit)
+        experiment_task = asyncio.create_task(
+            _process_experiments(
+                runtime,
+                experiment_health,
+                worker_health_updates.publish,
+            )
+        )
+        experiment_task.add_done_callback(_log_reconciliation_exit)
         research_asset_task = asyncio.create_task(
             _process_research_assets(
                 runtime,
@@ -380,6 +419,7 @@ def create_app(
                     drafting_task,
                     deepfetch_task,
                     idea_stage_task,
+                    experiment_task,
                     research_asset_task,
                     research_asset_verification_task,
                 )
@@ -443,6 +483,11 @@ def create_app(
                 deepfetch_health,
             ),
             worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
+            worker_check(
+                "experiment_worker",
+                experiment_task,
+                experiment_health,
+            ),
             worker_check(
                 "research_asset_intake_worker",
                 research_asset_task,
@@ -590,6 +635,7 @@ def create_app(
             in {
                 "asset_intake_not_found",
                 "asset_not_found",
+                "experiment_not_found",
                 "quest_initialization_not_found",
             }
             else 409
@@ -659,6 +705,9 @@ def create_app(
             research_asset_verification_task,
             research_asset_verification_health,
         )
+        experiment = worker_check(
+            "experiment_worker", experiment_task, experiment_health
+        )
         return {
             "status": snapshot["readiness"]["status"],
             "revision": snapshot["revision"],
@@ -677,6 +726,10 @@ def create_app(
             "idea_stage": {
                 "status": idea_stage["status"],
                 "last_error": idea_stage_health.last_error,
+            },
+            "experiment": {
+                "status": experiment["status"],
+                "last_error": experiment_health.last_error,
             },
             "research_assets": {
                 "status": research_assets["status"],
@@ -1300,6 +1353,52 @@ def create_app(
     def query_snapshot() -> dict[str, object]:
         return public_snapshot()
 
+    @app.post("/api/v1/experiments", status_code=201)
+    async def start_experiment(
+        request: Request,
+        experiment: StartExperimentRequest,
+    ) -> dict[str, object]:
+        idempotency_key = _idempotency_key(request)
+        return await _await_bounded_asset_io(
+            lambda: runtime.experiment.start(
+                experiment.as_intent(), idempotency_key, require_idle=True
+            ),
+            slots=asset_io_slots,
+            timeout_code="experiment_admission_io_timeout",
+        )
+
+    @app.get("/api/v1/experiments/current")
+    def query_current_experiment() -> dict[str, object]:
+        current = runtime.experiment.query_current()
+        return {
+            "status": "idle" if current is None else "active",
+            "current": current,
+        }
+
+    @app.get("/api/v1/experiments/{evaluation_attempt_ref}")
+    def query_experiment(evaluation_attempt_ref: str) -> dict[str, object]:
+        return runtime.experiment.query(evaluation_attempt_ref)
+
+    @app.get("/api/v1/experiments/{evaluation_attempt_ref}/events")
+    def query_experiment_events(
+        evaluation_attempt_ref: str,
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=256, ge=1, le=512),
+    ) -> dict[str, object]:
+        items = runtime.experiment.query_events(
+            evaluation_attempt_ref,
+            after_sequence=after,
+            limit=limit,
+        )
+        return {
+            "items": list(items),
+            "after_sequence": after,
+            "limit": limit,
+            "next_after_sequence": (
+                after if not items else items[-1]["sequence"]
+            ),
+        }
+
     @app.get("/api/v1/idea-stage/current")
     def query_current_idea_stage() -> dict[str, object]:
         return runtime.idea_stage.query_current()
@@ -1514,9 +1613,13 @@ async def _reconcile_quest_initializations(
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("quest reconciliation attempt failed unexpectedly")
             error_code = (
-                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+                error.code
+                if isinstance(error, OwnerConflict)
+                else type(error).__name__
             )
-            changed = health.status != "unavailable" or health.last_error != error_code
+            changed = (
+                health.status != "unavailable" or health.last_error != error_code
+            )
             health.status = "unavailable"
             health.last_error = error_code
             health.retry_count += 1
@@ -1591,6 +1694,46 @@ async def _process_first_question_deepfetch(
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("first-question DeepFetch attempt failed unexpectedly")
+            error_code = (
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
+async def _process_experiments(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Advance execution, RM assets, then atomic Formal Measurement."""
+
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                runtime.experiment.process_once,
+                health=health,
+                timeout_code="experiment_operation_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=EXPERIMENT_WORKER_WATCHDOG_SECONDS,
+            )
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("experiment worker attempt failed unexpectedly")
             error_code = (
                 error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )

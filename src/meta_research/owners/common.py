@@ -4,7 +4,10 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
+
+if TYPE_CHECKING:
+    from meta_research.experiment_contract import ExperimentResultComponentManifest
 
 
 OwnerFact: TypeAlias = int | str | bool | None
@@ -295,6 +298,39 @@ class AttemptExecutionReceiptVerifier(Protocol):
         attempt_ref: str,
         fence_ref: str,
         result_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_experiment_execution_receipt(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        evaluation_attempt_ref: str,
+        result_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> "ExperimentResultComponentManifest": ...
+
+
+class ExperimentInputBindingVerifier(Protocol):
+    def verify_experiment_execution_request(
+        self,
+        *,
+        execution_request_ref: str,
+        quest_ref: str,
+        definition_hash: str,
+        implementation_binding: AcceptedAssetBinding,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_experiment_input_binding(
+        self,
+        *,
+        binding_ref: str,
+        subject_kind: str,
+        subject_ref: str,
+        inputs_hash: str,
         receipt: AcceptanceReceipt,
     ) -> None: ...
 

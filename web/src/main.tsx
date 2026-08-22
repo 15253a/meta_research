@@ -3,11 +3,19 @@ import { createRoot } from "react-dom/client";
 import {
   fetchSnapshot,
   followProjection,
+  type ExperimentProjection,
   type IdeaQuestionSummary,
   type IdeaStageProjection,
   type PublicSnapshot,
   type UnavailableCapability,
 } from "./api";
+import {
+  CurrentExperimentSummary,
+  ExecutionObserver,
+  ExperimentToolbarEntry,
+  useExecutionObserver,
+} from "./ExecutionObserver";
+import { ExperimentLauncher } from "./ExperimentLauncher";
 import { QuestCreationWorkbench } from "./QuestCreation";
 import { ResearchAssetsWorkbench } from "./ResearchAssets";
 import "./shell.css";
@@ -75,6 +83,7 @@ function questCreationReady(snapshot: PublicSnapshot | null): boolean {
     (check) =>
       ![
         "idea_stage_worker",
+        "experiment_worker",
         "research_asset_intake_worker",
         "research_asset_verification_worker",
       ].includes(check.name),
@@ -380,9 +389,13 @@ function IdeaStageHero({
 function CurrentQuestionCard({
   ideaStage,
   question,
+  experiment,
+  onOpenExperiment,
 }: {
   ideaStage: IdeaStageProjection;
   question: IdeaQuestionSummary;
+  experiment: ExperimentProjection | null;
+  onOpenExperiment: (trigger: HTMLElement) => void;
 }) {
   const questionRef = question.question_ref
     ?? ideaStage.stage_run_request?.accepted_question_binding?.question_ref
@@ -400,6 +413,12 @@ function CurrentQuestionCard({
         <small>
           {graphRevision === undefined ? "Research Graph · 只读投影" : `Graph r${graphRevision} · 只读投影`}
         </small>
+        {experiment ? (
+          <ExperimentToolbarEntry
+            experiment={experiment}
+            onOpen={onOpenExperiment}
+          />
+        ) : null}
       </header>
       <div className="lumen-question-path" aria-label="当前 Question 与 Idea Stage 路径">
         <span className="quest"><small>Quest</small><b>{question.quest_ref ?? "current"}</b></span>
@@ -577,9 +596,17 @@ function IdeaDetail({ label, value }: { label: string; value?: string | number |
 function IdeaStageCard({
   ideaStage,
   healthBlocker,
+  experiment,
+  questRef,
+  onOpenExperiment,
+  onExperimentStarted,
 }: {
   ideaStage: IdeaStageProjection;
   healthBlocker: IdeaStageHealthBlocker | null;
+  experiment: ExperimentProjection | null;
+  questRef: string | null;
+  onOpenExperiment: (trigger: HTMLElement) => void;
+  onExperimentStarted: (experiment: ExperimentProjection) => void;
 }) {
   const phase = currentIdeaStageState(ideaStage);
   const rows = ideaFactRows(ideaStage, phase);
@@ -612,6 +639,20 @@ function IdeaStageCard({
           </div>
           <code>{healthBlocker.code}</code>
         </div>
+      ) : null}
+      {experiment ? (
+        <CurrentExperimentSummary
+          experiment={experiment}
+          onOpen={onOpenExperiment}
+        />
+      ) : null}
+      {questRef ? (
+        <ExperimentLauncher
+          key={`${questRef}:${experiment?.identities.evaluation_attempt_ref ?? "first"}`}
+          questRef={questRef}
+          sourceExperiment={experiment}
+          onStarted={onExperimentStarted}
+        />
       ) : null}
       <div className="lumen-idea-facts" role="list">
         {rows.map((row) => (
@@ -794,18 +835,26 @@ function WorkspaceMain({
   error,
   streamInterrupted,
   retry,
+  onOpenExperiment,
+  onExperimentStarted,
 }: {
   snapshot: PublicSnapshot | null;
   state: ShellState;
   error: string | null;
   streamInterrupted: boolean;
   retry: () => void;
+  onOpenExperiment: (trigger: HTMLElement) => void;
+  onExperimentStarted: (experiment: ExperimentProjection) => void;
 }) {
   const unavailable = uniqueCapabilities(snapshot);
   const ideaStage = snapshot?.research_space.status === "active"
     ? snapshot.idea_stage ?? null
     : null;
   const ideaHealthBlocker = ideaStageHealthBlocker(snapshot);
+  const experiment = snapshot?.experiment?.current ?? null;
+  const question = ideaStage
+    ? ideaQuestion(ideaStage, snapshot ?? undefined)
+    : null;
   return (
     <main
       id="main-content"
@@ -840,7 +889,9 @@ function WorkspaceMain({
         {ideaStage ? (
           <CurrentQuestionCard
             ideaStage={ideaStage}
-            question={ideaQuestion(ideaStage, snapshot ?? undefined)}
+            question={question!}
+            experiment={experiment}
+            onOpenExperiment={onOpenExperiment}
           />
         ) : (
           <section className="lumen-card lumen-next-card" aria-labelledby="next-title">
@@ -862,6 +913,10 @@ function WorkspaceMain({
           <IdeaStageCard
             ideaStage={ideaStage}
             healthBlocker={ideaHealthBlocker}
+            experiment={experiment}
+            questRef={question?.quest_ref ?? null}
+            onOpenExperiment={onOpenExperiment}
+            onExperimentStarted={onExperimentStarted}
           />
         ) : (
           <section className="lumen-card lumen-availability" aria-labelledby="availability-title">
@@ -990,6 +1045,10 @@ function App() {
   const [snapshotRetrySequence, setSnapshotRetrySequence] = useState(0);
   const reloadInFlight = useRef(false);
   const reloadQueued = useRef(false);
+  const executionObserver = useExecutionObserver(
+    snapshot?.experiment?.current ?? null,
+    Boolean(creationMode || assetsOpen),
+  );
 
   const handleConnection = useCallback((next: boolean) => {
     setConnected(next);
@@ -1031,6 +1090,15 @@ function App() {
       if (reloadQueued.current && !signal?.aborted) void reload();
     }
   }, []);
+
+  const handleExperimentStarted = useCallback((experiment: ExperimentProjection) => {
+    executionObserver.recordStarted(experiment);
+    setSnapshot((current) => current ? {
+      ...current,
+      experiment: { status: "active", current: experiment },
+    } : current);
+    window.setTimeout(() => void reload(), 0);
+  }, [executionObserver.recordStarted, reload]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1120,6 +1188,8 @@ function App() {
           error={error}
           streamInterrupted={streamInterrupted}
           retry={() => void reload()}
+          onOpenExperiment={executionObserver.open}
+          onExperimentStarted={handleExperimentStarted}
         />
         <CompanionShell state={state} />
       </div>
@@ -1144,6 +1214,7 @@ function App() {
           onChanged={() => void reload()}
         />
       ) : null}
+      <ExecutionObserver controller={executionObserver} />
     </>
   );
 }

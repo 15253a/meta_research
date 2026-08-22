@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
-import fcntl
 import json
 import os
 import secrets
@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -23,6 +24,49 @@ SUPERVISOR_EXIT_SCHEMA = "meta-research/codex-provider-supervisor-exit/v1"
 
 class ProviderSupervisorError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class TypedExecutionFence:
+    """Cross-provider Run/Attempt/Session/Fence identity invariant."""
+
+    run_ref: str
+    attempt_ref: str
+    generation: int
+    root_session_ref: str
+    fence_ref: str
+
+    def validate(self) -> None:
+        if (
+            not self.run_ref
+            or not self.attempt_ref
+            or isinstance(self.generation, bool)
+            or self.generation < 1
+            or not self.root_session_ref
+            or not self.fence_ref
+        ):
+            raise ProviderSupervisorError("typed_execution_fence_invalid")
+
+
+def provider_operation_ref(
+    run_ref: str,
+    operation_kind: str,
+    generation: int,
+) -> str:
+    """Stable effect identity shared by durable provider Run implementations."""
+
+    if (
+        not run_ref
+        or not operation_kind
+        or ":" in operation_kind
+        or isinstance(generation, bool)
+        or generation < 1
+    ):
+        raise ProviderSupervisorError("provider_operation_identity_invalid")
+    value = f"{run_ref}:{operation_kind}:{generation}"
+    if len(value) > 128:
+        raise ProviderSupervisorError("provider_operation_identity_invalid")
+    return value
 
 
 def ensure_transport_key(workspace: Path) -> tuple[Path, bytes]:
@@ -39,6 +83,46 @@ def ensure_transport_key(workspace: Path) -> tuple[Path, bytes]:
 
 def transport_key_hash(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def transport_canonical_json(value: object) -> str:
+    """Canonical transport encoding shared by durable provider adapters."""
+
+    return _canonical_json(value)
+
+
+def sealed_transport_envelope(
+    payload: dict[str, object], key: bytes
+) -> dict[str, object]:
+    return {"payload": payload, "seal": _seal(payload, key)}
+
+
+def verify_transport_envelope(
+    envelope: dict[str, object], key: bytes
+) -> dict[str, object]:
+    return _verified_envelope_payload(envelope, key)
+
+
+def write_transport_envelope(
+    path: Path, payload: dict[str, object], key: bytes
+) -> None:
+    _write_signed_envelope(path, payload, key)
+
+
+def read_transport_envelope(path: Path, key: bytes) -> dict[str, object]:
+    return _read_signed_envelope(path, key)
+
+
+def transport_file_sha256(path: Path) -> str:
+    return _file_sha256(path)
+
+
+def provider_process_group_running(process_group: int) -> bool:
+    return _process_group_running(process_group)
+
+
+def terminate_provider_process_group(process_group: int) -> bool:
+    return _terminate_process_group(process_group)
 
 
 def read_transport_key_for_operation(
@@ -263,6 +347,7 @@ def _publish_exclusive(path: Path, value: bytes) -> bool:
     )
     try:
         with temporary.open("xb") as destination:
+            os.fchmod(destination.fileno(), 0o600)
             destination.write(value)
             destination.flush()
             os.fsync(destination.fileno())

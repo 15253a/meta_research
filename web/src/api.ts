@@ -613,6 +613,74 @@ export type IdeaStageProjection = {
   [key: string]: unknown;
 };
 
+export type ExperimentObservation = {
+  event_ref: string;
+  sequence: number;
+  attempt_ref: string;
+  fence_ref: string;
+  kind: "status" | "stdout" | "telemetry" | string;
+  payload: Record<string, unknown>;
+  observed_at: number;
+};
+
+export type ExperimentStdoutObservation = {
+  mode?: string;
+  complete?: boolean;
+  truncated?: boolean;
+  dropped?: number;
+  first_sequence?: number | null;
+  last_sequence?: number | null;
+  observed_at?: number | string | null;
+};
+
+export type ExperimentExecutionProjection = {
+  status: string;
+  run_ref?: string;
+  execution_request_ref?: string;
+  attempt_ref?: string;
+  attempt_generation?: number;
+  root_session_ref?: string;
+  fence_ref?: string;
+  fence_status?: string;
+  runtime_binding_hash?: string;
+  events?: ExperimentObservation[];
+  stdout_observation?: ExperimentStdoutObservation;
+  execution_receipt?: IdeaReceipt | null;
+  failure?: null | { code?: string; [key: string]: unknown };
+  [key: string]: unknown;
+};
+
+export type ExperimentProjection = {
+  intent: {
+    execution_request_ref?: string;
+    quest_ref?: string;
+    title?: string;
+    hypothesis?: string;
+    [key: string]: unknown;
+  };
+  identities: {
+    baseline_ref?: string;
+    variant_ref?: string;
+    evaluation_protocol_ref?: string;
+    protocol_version_ref?: string;
+    evaluation_ref?: string;
+    variant_run_ref?: string;
+    evaluation_attempt_ref?: string;
+    [key: string]: unknown;
+  };
+  execution: ExperimentExecutionProjection;
+  execution_request?: Record<string, unknown>;
+  frozen_inputs?: Record<string, unknown>;
+  assets?: Record<string, unknown>;
+  formal_measurement?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export type PublicExperimentProjection = {
+  status: "idle" | "active";
+  current: ExperimentProjection | null;
+};
+
 export type PublicSnapshot = {
   product: { name: string; version: string };
   revision: number;
@@ -634,6 +702,7 @@ export type PublicSnapshot = {
   };
   research_assets: ResearchAssetsView;
   idea_stage?: IdeaStageProjection | null;
+  experiment: PublicExperimentProjection;
   unavailable: UnavailableCapability[];
 };
 
@@ -653,6 +722,32 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
     throw new ProductError(`snapshot_unavailable:${response.status}`);
   }
   return (await response.json()) as PublicSnapshot;
+}
+
+type ExperimentStartRequestBase = {
+  execution_request_ref: string;
+  quest_ref: string;
+  title: string;
+  hypothesis: string;
+  variant_parameter: number;
+  sample_count: number;
+};
+
+export type ExperimentStartRequest = ExperimentStartRequestBase & (
+  | {
+      request_kind: "retrain";
+    }
+  | {
+      request_kind: "remeasure";
+      source_variant_run_ref: string;
+      selected_checkpoint_role_refs: string[];
+    }
+);
+
+export function startExperiment(
+  intent: ExperimentStartRequest,
+): Promise<ExperimentProjection> {
+  return writeJson("/api/v1/experiments", "POST", intent);
 }
 
 export async function fetchResearchAssets(
@@ -1116,6 +1211,17 @@ export function followProjection(
     "research_graph.idea_outcome_accepted",
     "research_graph.idea_outcome_rejected",
     "advancement_engine.stage_committed",
+    "research_graph.experiment_admitted",
+    "agent_runtime.experiment_admitted",
+    "agent_runtime.experiment_started",
+    "agent_runtime.experiment_observed",
+    "agent_runtime.experiment_completed",
+    "agent_runtime.experiment_failed",
+    "agent_runtime.experiment_replaced",
+    "agent_runtime.experiment_recovered",
+    "research_graph.experiment_assets_accepted",
+    "research_graph.formal_measurement_accepted",
+    "research_graph.formal_measurement_rejected",
     "research_memory.asset_intake_queued",
     "research_memory.asset_accepted",
     "research_memory.asset_intake_failed",

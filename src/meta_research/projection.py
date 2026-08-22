@@ -18,6 +18,7 @@ from meta_research.owners.research_memory import (
 )
 
 if TYPE_CHECKING:
+    from meta_research.experiment import ExperimentService
     from meta_research.idea_stage import IdeaStageWorker
 
 
@@ -44,6 +45,7 @@ class PublicProjection:
         agent_runtime: AgentRuntimeInterface,
         human_collaboration: HumanCollaborationInterface,
         idea_stage: IdeaStageWorker | None = None,
+        experiment: ExperimentService | None = None,
     ) -> None:
         self._feed = feed
         self._object_store = object_store
@@ -51,6 +53,7 @@ class PublicProjection:
         self._research_graph = research_graph
         self._research_memory = research_memory
         self._idea_stage = idea_stage
+        self._experiment = experiment
         self._interfaces = {
             "research_graph": research_graph,
             "advancement_engine": advancement_engine,
@@ -83,6 +86,11 @@ class PublicProjection:
             )
             idea_stage = (
                 None if self._idea_stage is None else self._idea_stage.query_current()
+            )
+            current_experiment = (
+                None
+                if self._experiment is None
+                else self._experiment.query_current()
             )
             current_question = (
                 None
@@ -258,6 +266,10 @@ class PublicProjection:
                 "limit": asset_limit,
                 "total_count": asset_total,
                 "has_more": asset_offset + len(research_assets) < asset_total,
+            },
+            "experiment": {
+                "status": "idle" if current_experiment is None else "active",
+                "current": current_experiment,
             },
             "unavailable": _release_capabilities(),
         }
