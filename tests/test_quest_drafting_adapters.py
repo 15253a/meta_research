@@ -159,6 +159,38 @@ def test_codex_intent_reply_resumes_the_native_session(tmp_path: Path) -> None:
     assert "native-1" in second.calls[0][0]
 
 
+def test_codex_intent_reply_names_the_manual_creation_boundary(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingRunner({"reply": "只调整六字段 Proposal，不改写 Seed。"})
+    adapter = CodexDraftingAdapter(tmp_path / "manual-drafting", process_runner=runner)
+
+    adapter.reply(
+        IntentTurnRequest(
+            initialization_id="quest_init_manual",
+            draft_revision=2,
+            draft_hash="d" * 64,
+            draft={
+                "creation_mode": "ManualCreation",
+                "parent_question_ref": "question_parent",
+                "confirmed_seed": {"intent": "用户精确原话"},
+            },
+            message="怎样收窄答案边界？",
+            native_session_ref=None,
+            creation_context_kind="manual_question_creation",
+            creation_context_ref="manual_creation_1",
+            context_generation=3,
+        )
+    )
+
+    prompt = runner.calls[0][1]
+    assert "后续 Question" in prompt
+    assert "manual_creation_1" in prompt
+    assert "context_generation=3" in prompt
+    assert "已确认 Seed 不可改写" in prompt
+    assert "创建 Quest 之前" not in prompt
+
+
 def test_codex_intent_reply_schema_and_adapter_share_the_public_length_limit(
     tmp_path: Path,
 ) -> None:

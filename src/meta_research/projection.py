@@ -89,6 +89,37 @@ class PublicProjection:
                 if self._idea_stage is None
                 else self._idea_stage.query_current_question()
             )
+            question_tree_items: list[dict[str, object]] = []
+            question_tree_reason: dict[str, str] | None = None
+            query_question_tree = getattr(
+                self._research_graph, "query_question_tree", None
+            )
+            if callable(query_question_tree):
+                try:
+                    for question in query_question_tree():
+                        content = self._research_memory.read_question_content(
+                            question.content_ref, question.content_hash
+                        )
+                        question_tree_items.append(
+                            {
+                                "question_ref": question.question_ref,
+                                "quest_ref": question.quest_ref,
+                                "parent_question_ref": question.parent_question_ref,
+                                "title": content.get("title"),
+                                "unknown_statement": content.get(
+                                    "unknown_statement"
+                                ),
+                                "content_ref": question.content_ref,
+                                "content_hash": question.content_hash,
+                                "schema_ref": question.schema_ref,
+                                "question_receipt_ref": (
+                                    question.receipt.receipt_ref
+                                ),
+                            }
+                        )
+                except OwnerConflict as error:
+                    question_tree_items = []
+                    question_tree_reason = {"code": str(error)}
             projection_inventory = getattr(
                 self._research_memory,
                 "query_asset_projection_inventory",
@@ -238,6 +269,19 @@ class PublicProjection:
                 "first_question_deepfetch": {
                     "status": "ready",
                 },
+            },
+            "question_tree": {
+                "status": (
+                    "ready" if question_tree_reason is None else "unavailable"
+                ),
+                "items": question_tree_items,
+                "reason": question_tree_reason,
+            },
+            "manual_question_creation": {
+                "status": "ready",
+                "creation_mode": "ManualCreation",
+                "deepfetch": {"status": "ready"},
+                "explicit_waiver": {"status": "ready"},
             },
             "research_assets": {
                 "status": "ready",

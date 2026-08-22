@@ -45,6 +45,9 @@ class ProposalDraftRequest:
     draft: dict[str, object]
     job_ref: str | None = None
     literature_snapshot: dict[str, object] | None = None
+    creation_context_kind: str = "quest_initialization"
+    creation_context_ref: str | None = None
+    context_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,9 @@ class IntentTurnRequest:
     message: str
     native_session_ref: str | None
     job_ref: str | None = None
+    creation_context_kind: str = "quest_initialization"
+    creation_context_ref: str | None = None
+    context_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -629,11 +635,23 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         return ProposalDraftResult(content=content, adapter_kind="codex_cli")
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
+        if request.creation_context_kind == "manual_question_creation":
+            role = (
+                "你是后续 Question 的 ManualCreation Drafting Session 助手。"
+                "已确认 Seed 不可改写；只能建议如何调整六字段 Proposal。"
+                "不得确认 Proposal、创建 Question、改变父子关系或签发 receipt。\n\n"
+                f"creation_context_ref={request.creation_context_ref}\n"
+                f"context_generation={request.context_generation}\n"
+                f"quest_initialization_id={request.initialization_id}\n"
+            )
+        else:
+            role = (
+                "你是创建 Quest 之前的 Intent Drafting Session 助手。帮助用户澄清意图，"
+                "但只能回复建议；不得修改草稿、确认 bundle、创建领域对象或签发 receipt。\n\n"
+                f"initialization_id={request.initialization_id}\n"
+            )
         context = (
-            "你是创建 Quest 之前的 Intent Drafting Session 助手。帮助用户澄清意图，"
-            "但只能回复建议；不得修改草稿、确认 bundle、创建领域对象或签发 receipt。\n\n"
-            f"initialization_id={request.initialization_id}\n"
-            f"current_draft_revision={request.draft_revision}\n"
+            role + f"current_draft_revision={request.draft_revision}\n"
             f"current_draft_hash={request.draft_hash}\n"
             f"current_draft={_canonical_json(request.draft)}\n"
             f"user_message={request.message}"

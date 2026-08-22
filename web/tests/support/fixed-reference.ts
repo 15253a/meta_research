@@ -7,12 +7,16 @@ import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 
 
-export type FixedReferenceSurface = "shell" | "create-quest";
+export type FixedReferenceSurface = "shell" | "create-quest" | "create-question";
 
-type FixedReferenceEntry = {
+type FixedReferenceEntryBase = {
   surface: FixedReferenceSurface;
   viewport: { width: number; height: number };
   sha256: string;
+};
+
+type ReviewedFixedReferenceEntry = FixedReferenceEntryBase & {
+  productionReview?: "reviewed";
   expectedDiffPixelRatio: number;
   maxDiffPixelRatioDelta: number;
   expectedDiffGrid: number[];
@@ -20,6 +24,14 @@ type FixedReferenceEntry = {
   reviewedProductionSha256: string;
   maxProductionDiffPixels: number;
 };
+
+type PendingFixedReferenceEntry = FixedReferenceEntryBase & {
+  productionReview: "pending";
+};
+
+type FixedReferenceEntry =
+  | ReviewedFixedReferenceEntry
+  | PendingFixedReferenceEntry;
 
 type FixedReferenceManifest = {
   source: {
@@ -70,6 +82,17 @@ const FIXED_DYNAMIC_MASK_ALLOWLIST: Record<
       reason: "session status and bound draft revision",
     },
   ],
+  "create-question": [
+    { selector: ".lumen-connection code", reason: "durable feed revision" },
+    {
+      selector: ".manual-chip:first-child",
+      reason: "accepted Quest ref",
+    },
+    {
+      selector: ".manual-parent-context code",
+      reason: "accepted parent Question ref",
+    },
+  ],
 };
 const FIXED_MASK_RGBA = [32, 42, 58, 255] as const;
 type RasterRgba = readonly [number, number, number, number];
@@ -111,6 +134,7 @@ const FIXED_RASTER_NORMALIZATION_ALLOWLIST: Record<
       ],
     },
   ],
+  "create-question": [],
 };
 
 function assertFixedManifestSource(): void {
@@ -138,6 +162,53 @@ function pngDimensions(bytes: Buffer): { width: number; height: number } {
   return {
     width: bytes.readUInt32BE(16),
     height: bytes.readUInt32BE(20),
+  };
+}
+
+export type FixedVisualReferenceInspection = {
+  filename: string;
+  sha256: string;
+  viewport: { width: number; height: number };
+  productionReview: "pending" | "reviewed";
+};
+
+export function inspectFixedVisualReference(
+  surface: FixedReferenceSurface,
+  viewport: { width: number; height: number },
+): FixedVisualReferenceInspection {
+  assertFixedManifestSource();
+  const filename = `${surface}-${viewport.width}.png`;
+  const entry = manifest.references[filename];
+  if (!entry) throw new Error(`fixed visual reference is not allowlisted: ${filename}`);
+  if (
+    entry.surface !== surface ||
+    entry.viewport.width !== viewport.width ||
+    entry.viewport.height !== viewport.height
+  ) {
+    throw new Error(`fixed visual reference viewport mismatch: ${filename}`);
+  }
+  const referenceBytes = readFileSync(resolve(referenceDirectory, filename));
+  const actualHash = sha256(referenceBytes);
+  if (actualHash !== entry.sha256) {
+    throw new Error(
+      `fixed visual reference hash mismatch for ${filename}: ${actualHash}`,
+    );
+  }
+  const dimensions = pngDimensions(referenceBytes);
+  if (
+    dimensions.width !== viewport.width ||
+    dimensions.height !== viewport.height
+  ) {
+    throw new Error(
+      `fixed visual reference dimensions mismatch for ${filename}: ` +
+      `${dimensions.width}x${dimensions.height}`,
+    );
+  }
+  return {
+    filename,
+    sha256: actualHash,
+    viewport: dimensions,
+    productionReview: entry.productionReview === "pending" ? "pending" : "reviewed",
   };
 }
 
@@ -281,7 +352,7 @@ export function normalizeReviewedRasterPixels(
   return normalizedPixelCount;
 }
 
-async function captureMaskedProductionScreenshot(
+export async function captureFixedProductionScreenshot(
   page: Page,
   surface: FixedReferenceSurface,
   viewport: { width: number; height: number },
@@ -372,16 +443,13 @@ export async function attachFixedVisualPair(
   surface: FixedReferenceSurface,
   viewport: { width: number; height: number },
 ): Promise<void> {
-  assertFixedManifestSource();
-  const filename = `${surface}-${viewport.width}.png`;
+  const inspection = inspectFixedVisualReference(surface, viewport);
+  const filename = inspection.filename;
   const entry = manifest.references[filename];
-  if (!entry) throw new Error(`fixed visual reference is not allowlisted: ${filename}`);
-  if (
-    entry.surface !== surface ||
-    entry.viewport.width !== viewport.width ||
-    entry.viewport.height !== viewport.height
-  ) {
-    throw new Error(`fixed visual reference viewport mismatch: ${filename}`);
+  if (!entry || entry.productionReview === "pending") {
+    throw new Error(
+      `fixed visual production baseline is pending review: ${filename}`,
+    );
   }
   if (
     !Number.isFinite(entry.expectedDiffPixelRatio) ||
@@ -409,22 +477,6 @@ export async function attachFixedVisualPair(
   );
 
   const referenceBytes = readFileSync(resolve(referenceDirectory, filename));
-  const actualHash = sha256(referenceBytes);
-  if (actualHash !== entry.sha256) {
-    throw new Error(
-      `fixed visual reference hash mismatch for ${filename}: ${actualHash}`,
-    );
-  }
-  const dimensions = pngDimensions(referenceBytes);
-  if (
-    dimensions.width !== viewport.width ||
-    dimensions.height !== viewport.height
-  ) {
-    throw new Error(
-      `fixed visual reference dimensions mismatch for ${filename}: ` +
-      `${dimensions.width}x${dimensions.height}`,
-    );
-  }
 
   const manifestAttachment = "fixed-d7e2c9b7-manifest";
   if (!testInfo.attachments.some(({ name }) => name === manifestAttachment)) {
@@ -438,7 +490,7 @@ export async function attachFixedVisualPair(
     contentType: "image/png",
   });
 
-  const maskedProduction = await captureMaskedProductionScreenshot(
+  const maskedProduction = await captureFixedProductionScreenshot(
     page,
     surface,
     viewport,

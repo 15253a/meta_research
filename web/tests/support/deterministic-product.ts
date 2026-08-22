@@ -15,6 +15,7 @@ type ProductStart = {
 
 type DeterministicProductOptions = {
   legacyState?: "draft" | "recovering";
+  manualRoot?: boolean;
 };
 
 const supportDirectory = dirname(fileURLToPath(import.meta.url));
@@ -50,6 +51,9 @@ export class DeterministicProduct {
     }
     if (options.legacyState) {
       argv.push("--legacy-state", options.legacyState);
+    }
+    if (options.manualRoot) {
+      argv.push("--manual-root");
     }
     const child = spawn(
       "uv",

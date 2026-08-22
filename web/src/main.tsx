@@ -1,14 +1,50 @@
-import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
+import {
+  StrictMode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Ref,
+} from "react";
 import { createRoot } from "react-dom/client";
 import {
+  acknowledgeAssetIntake,
+  adaptManualQuestionCreation,
+  cancelManualQuestionCreation,
+  confirmManualCreationSeed,
+  confirmManualDeepFetchWaiver,
+  confirmManualQuestionProposal,
+  fetchAssetIntake,
+  fetchCurrentManualQuestionCreation,
+  fetchLiteratureSnapshot,
+  fetchManualQuestionCreation,
   fetchSnapshot,
   followProjection,
+  openManualQuestionCreation,
+  ProductError,
+  saveManualQuestionProposal,
+  sendManualDraftingMessage,
+  startManualCreationDeepFetch,
+  submitAssetIntake,
+  type AssetIntakeRequest,
+  type AssetIntakeResult,
+  type AssetReceipt,
   type IdeaQuestionSummary,
   type IdeaStageProjection,
+  type ManualAcceptedMaterialBinding,
+  type ManualQuestionCreationRawView,
   type PublicSnapshot,
+  type QuestionTreeItem,
   type UnavailableCapability,
 } from "./api";
+import {
+  ManualCreation,
+  type ManualCreationMaterialDraft,
+  type ManualQuestionCreationView,
+} from "./ManualCreation";
 import { QuestCreationWorkbench } from "./QuestCreation";
+import { QuestionTree } from "./QuestionTree";
 import { ResearchAssetsWorkbench } from "./ResearchAssets";
 import "./shell.css";
 
@@ -29,6 +65,190 @@ const ownerLabels: Record<string, string> = {
   human_collaboration: "人机协作",
 };
 
+const MANUAL_MAX_MATERIALS = 100;
+const MANUAL_MAX_ASSET_BYTES = 64 * 1024 * 1024;
+
+type AcceptedAssetReceipt = AssetReceipt & { status: "accepted" };
+
+type ManualPanelState = {
+  raw: ManualQuestionCreationRawView;
+  parent: QuestionTreeItem;
+  opener: HTMLButtonElement;
+  researchReceipt: AcceptedAssetReceipt | null;
+};
+
+function isAcceptedAssetReceipt(value: unknown): value is AcceptedAssetReceipt {
+  if (!value || typeof value !== "object") return false;
+  const receipt = value as Partial<AcceptedAssetReceipt>;
+  return receipt.status === "accepted" &&
+    typeof receipt.issuer === "string" &&
+    typeof receipt.kind === "string" &&
+    typeof receipt.receipt_ref === "string" &&
+    typeof receipt.subject_ref === "string" &&
+    typeof receipt.payload_hash === "string";
+}
+
+async function hydrateManualResearchReceipt(
+  raw: ManualQuestionCreationRawView,
+  signal?: AbortSignal,
+): Promise<AcceptedAssetReceipt | null> {
+  const deepfetch = raw.research_path.deepfetch;
+  const embedded = deepfetch?.literature_snapshot;
+  if (embedded && isAcceptedAssetReceipt(embedded.receipt)) {
+    const identityMatches =
+      (embedded.snapshot_ref === undefined || embedded.snapshot_ref === deepfetch.snapshot_ref) &&
+      (embedded.request_ref === undefined || embedded.request_ref === deepfetch.request_ref) &&
+      (embedded.creation_context_kind === undefined ||
+        embedded.creation_context_kind === "manual_question_creation") &&
+      (embedded.creation_context_ref === undefined ||
+        embedded.creation_context_ref === raw.context_ref) &&
+      (embedded.quest_ref === undefined || embedded.quest_ref === raw.quest_ref);
+    if (identityMatches) return embedded.receipt;
+  }
+  if (deepfetch?.status !== "succeeded" || !deepfetch.snapshot_ref) return null;
+
+  try {
+    const snapshot = await fetchLiteratureSnapshot(deepfetch.snapshot_ref, signal);
+    if (
+      snapshot.snapshot_ref !== deepfetch.snapshot_ref ||
+      snapshot.request_ref !== deepfetch.request_ref ||
+      snapshot.creation_context_kind !== "manual_question_creation" ||
+      snapshot.creation_context_ref !== raw.context_ref ||
+      snapshot.quest_ref !== raw.quest_ref ||
+      !isAcceptedAssetReceipt(snapshot.receipt) ||
+      snapshot.receipt.subject_ref !== snapshot.snapshot_ref
+    ) {
+      return null;
+    }
+    return snapshot.receipt;
+  } catch (caught) {
+    if ((caught as Error).name === "AbortError") throw caught;
+    return null;
+  }
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function acceptedManualMaterialBinding(
+  initial: AssetIntakeResult,
+): Promise<ManualAcceptedMaterialBinding> {
+  let result = initial;
+  let retryCount = 0;
+  while (["queued", "processing"].includes(result.status)) {
+    await delay(Math.min(4_000, 250 * 2 ** Math.min(retryCount, 4)));
+    result = await fetchAssetIntake(result.job_ref);
+    retryCount += 1;
+  }
+
+  if (result.status === "failed") {
+    acknowledgeAssetIntake(result.job_ref);
+    throw new ProductError(result.failure?.code ?? "manual_material_intake_failed");
+  }
+  if (result.status !== "accepted" || !result.asset) {
+    acknowledgeAssetIntake(result.job_ref);
+    throw new ProductError("manual_material_intake_result_invalid");
+  }
+  if (!isAcceptedAssetReceipt(result.asset.receipt)) {
+    acknowledgeAssetIntake(result.job_ref);
+    throw new ProductError("manual_material_receipt_unavailable");
+  }
+
+  const binding: ManualAcceptedMaterialBinding = {
+    asset_ref: result.asset.asset_ref,
+    version_ref: result.asset.version_ref,
+    content_hash: result.asset.content_hash,
+    manifest_hash: result.asset.manifest_hash,
+    receipt: result.asset.receipt,
+  };
+  acknowledgeAssetIntake(result.job_ref);
+  return binding;
+}
+
+function manualMaterialDisplayName(value: string): string {
+  const name = value.trim();
+  if (!name || name.length > 512) {
+    throw new ProductError("asset_display_name_invalid");
+  }
+  return name;
+}
+
+async function intakeManualMaterials(
+  contextRef: string,
+  draft: ManualCreationMaterialDraft,
+): Promise<ManualAcceptedMaterialBinding[]> {
+  if (draft.mode === "unprovided") return [];
+
+  if (draft.mode === "path") {
+    const localPath = draft.local_path.trim();
+    const isAbsolute = localPath.startsWith("/") ||
+      /^[A-Za-z]:[\\/]/.test(localPath) ||
+      /^\\\\/.test(localPath);
+    const pathParts = localPath.replaceAll("\\", "/").split("/").filter(Boolean);
+    if (!isAbsolute || !pathParts.length || localPath.length > 16_000) {
+      throw new ProductError("asset_source_locator_absolute_required");
+    }
+    const request: AssetIntakeRequest = {
+      source_kind: "directory",
+      custody_mode: "linked_local",
+      display_name: manualMaterialDisplayName(pathParts.at(-1) ?? ""),
+      media_type: "application/x-directory",
+      source_locator: localPath,
+      asynchronous: false,
+      provenance: {
+        submitted_via: "manual_question_creation",
+        creation_context_ref: contextRef,
+        selection_mode: "path",
+      },
+    };
+    const result = await submitAssetIntake(request);
+    return [await acceptedManualMaterialBinding(result)];
+  }
+
+  const files = [...draft.files];
+  if (!files.length) throw new ProductError("manual_material_files_required");
+  if (files.length > MANUAL_MAX_MATERIALS) {
+    throw new ProductError("accepted_material_bindings_invalid");
+  }
+
+  const bindings: ManualAcceptedMaterialBinding[] = [];
+  for (const file of files) {
+    if (file.size > MANUAL_MAX_ASSET_BYTES) {
+      throw new ProductError("asset_content_too_large");
+    }
+    const relativePath = (file as File & { webkitRelativePath?: string })
+      .webkitRelativePath ?? "";
+    const request: AssetIntakeRequest = {
+      source_kind: "file",
+      custody_mode: "managed",
+      display_name: manualMaterialDisplayName(file.name),
+      media_type: file.type || "application/octet-stream",
+      content_base64: arrayBufferToBase64(await file.arrayBuffer()),
+      asynchronous: false,
+      provenance: {
+        submitted_via: "manual_question_creation",
+        creation_context_ref: contextRef,
+        selection_mode: draft.mode,
+        relative_path: relativePath || null,
+      },
+    };
+    bindings.push(
+      await acceptedManualMaterialBinding(await submitAssetIntake(request)),
+    );
+  }
+  return bindings;
+}
+
 type ShellState =
   | "loading"
   | "first-error"
@@ -42,6 +262,26 @@ type CapabilityState =
 
 if (window.location.pathname === "/auth/launch") {
   window.history.replaceState(null, "", "/");
+}
+
+function questionTreeUrl(questionRef?: string | null): string {
+  const parameters = new URLSearchParams({
+    variant: "A",
+    view: "questions",
+  });
+  if (questionRef) parameters.set("node", questionRef);
+  parameters.set("panel", "question-tree");
+  return `/?${parameters}`;
+}
+
+function manualCreationUrl(parentQuestionRef: string): string {
+  const parameters = new URLSearchParams({
+    variant: "A",
+    view: "questions",
+    node: parentQuestionRef,
+    panel: "create-question",
+  });
+  return `/?${parameters}`;
 }
 
 function uniqueCapabilities(snapshot: PublicSnapshot | null): CapabilityState[] {
@@ -89,20 +329,25 @@ function RailButton({
   glyph,
   active = false,
   unavailable = false,
+  unavailableReason = "capability_unavailable",
+  buttonRef,
   onClick,
 }: {
   label: string;
   glyph: string;
   active?: boolean;
   unavailable?: boolean;
+  unavailableReason?: string;
+  buttonRef?: Ref<HTMLButtonElement>;
   onClick?: () => void;
 }) {
   return (
     <button
+      ref={buttonRef}
       type="button"
       className={active ? "lumen-rail-button active" : "lumen-rail-button"}
       aria-label={label}
-      title={unavailable ? `${label} · capability_unavailable` : label}
+      title={unavailable ? `${label} · ${unavailableReason}` : label}
       disabled={unavailable}
       onClick={onClick}
     >
@@ -115,18 +360,36 @@ function RailButton({
 function LumenRail({
   canCreate,
   canBrowseAssets,
+  canBrowseQuestions,
+  questionsActive,
+  questionUnavailableReason,
+  questionButtonRef,
   onCreate,
   onBrowseAssets,
+  onBrowseQuestions,
 }: {
   canCreate: boolean;
   canBrowseAssets: boolean;
+  canBrowseQuestions: boolean;
+  questionsActive: boolean;
+  questionUnavailableReason: string;
+  questionButtonRef: Ref<HTMLButtonElement>;
   onCreate: () => void;
   onBrowseAssets: () => void;
+  onBrowseQuestions: () => void;
 }) {
   return (
     <nav className="lumen-rail" aria-label="主导航" data-shell-region="rail">
-      <RailButton label="Quest 总览" glyph="⌂" active />
-      <RailButton label="问题树" glyph="树" unavailable />
+      <RailButton label="Quest 总览" glyph="⌂" active={!questionsActive} />
+      <RailButton
+        label="问题树"
+        glyph="树"
+        active={questionsActive}
+        unavailable={!canBrowseQuestions}
+        unavailableReason={questionUnavailableReason}
+        buttonRef={questionButtonRef}
+        onClick={onBrowseQuestions}
+      />
       <RailButton
         label="Research Asset"
         glyph="▤"
@@ -973,6 +1236,10 @@ function CompanionShell({ state }: { state: ShellState }) {
 }
 
 function App() {
+  const initialParameters = useMemo(
+    () => new URLSearchParams(window.location.search),
+    [],
+  );
   const [snapshot, setSnapshot] = useState<PublicSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
@@ -986,10 +1253,30 @@ function App() {
   const [assetsOpen, setAssetsOpen] = useState(
     () => new URLSearchParams(window.location.search).get("panel") === "research-assets",
   );
+  const [questionTreeOpen, setQuestionTreeOpen] = useState(
+    () => ["question-tree", "create-question"].includes(
+      initialParameters.get("panel") ?? "",
+    ) || initialParameters.get("view") === "questions",
+  );
+  const [questionRouteNodeRef, setQuestionRouteNodeRef] = useState<string | null>(
+    () => initialParameters.get("node"),
+  );
+  const [pendingDirectManualParentRef, setPendingDirectManualParentRef] = useState<
+    string | null
+  >(() => initialParameters.get("panel") === "create-question"
+    ? initialParameters.get("node")
+    : null);
+  const [manualPanel, setManualPanel] = useState<ManualPanelState | null>(null);
+  const [manualOpeningParentRef, setManualOpeningParentRef] = useState<
+    string | null
+  >(null);
+  const [manualOpenError, setManualOpenError] = useState<string | null>(null);
   const [streamCursor, setStreamCursor] = useState<number | null>(null);
   const [snapshotRetrySequence, setSnapshotRetrySequence] = useState(0);
   const reloadInFlight = useRef(false);
   const reloadQueued = useRef(false);
+  const manualDetailSequence = useRef(0);
+  const questionTreeButtonRef = useRef<HTMLButtonElement>(null);
 
   const handleConnection = useCallback((next: boolean) => {
     setConnected(next);
@@ -1048,19 +1335,71 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [error, reload, snapshotRetrySequence]);
 
+  const streamReady = streamCursor !== null;
   useEffect(() => {
-    if (streamCursor === null) return;
+    if (!streamReady) return;
     return followProjection(
-      streamCursor,
+      streamCursor ?? 0,
       () => void reload(),
       () => void reload(),
       handleConnection,
     );
-  }, [handleConnection, reload, streamCursor]);
+    // followProjection advances its own monotonic cursor. Reconnecting this
+    // long-lived stream for every Snapshot revision can briefly occupy every
+    // browser connection slot and starve an Owner command.
+  }, [handleConnection, reload, streamReady]);
+
+  const manualContextRef = manualPanel?.raw.context_ref ?? null;
+  useEffect(() => {
+    if (!manualContextRef || !snapshot) return;
+    const controller = new AbortController();
+    const capturedSequence = manualDetailSequence.current;
+    void (async () => {
+      try {
+        const raw = await fetchManualQuestionCreation(
+          manualContextRef,
+          controller.signal,
+        );
+        const researchReceipt = await hydrateManualResearchReceipt(
+          raw,
+          controller.signal,
+        );
+        if (
+          controller.signal.aborted ||
+          capturedSequence !== manualDetailSequence.current
+        ) {
+          return;
+        }
+        setManualPanel((current) =>
+          current?.raw.context_ref === manualContextRef
+            ? { ...current, raw, researchReceipt }
+            : current,
+        );
+      } catch (caught) {
+        if ((caught as Error).name === "AbortError") return;
+        // Keep the last verified detail. A later Snapshot revision retries the
+        // held context_ref; current-context queries are intentionally not used.
+      }
+    })();
+    return () => controller.abort();
+  }, [manualContextRef, snapshot?.revision]);
 
   const state = shellState(snapshot, error);
   const canCreate = questCreationReady(snapshot);
   const canBrowseAssets = snapshot?.research_assets.status === "ready";
+  const canBrowseQuestions = snapshot?.question_tree.status === "ready";
+  const manualCreationReady =
+    snapshot?.manual_question_creation.status === "ready";
+  const manualView = useMemo(
+    () => manualPanel
+      ? adaptManualQuestionCreation(manualPanel.raw, {
+          parent_question_title:
+            manualPanel.parent.title ?? manualPanel.parent.unknown_statement,
+          research_receipt: manualPanel.researchReceipt,
+        })
+      : null,
+    [manualPanel],
+  );
   const intakeWorkerReady = snapshot?.readiness.checks.find(
     (check) => check.name === "research_asset_intake_worker",
   )?.status === "ready";
@@ -1069,6 +1408,10 @@ function App() {
   )?.status === "ready";
   const openCreation = () => {
     if (!canCreate) return;
+    setQuestionTreeOpen(false);
+    setAssetsOpen(false);
+    setManualPanel(null);
+    setPendingDirectManualParentRef(null);
     window.history.replaceState(null, "", "/?panel=create-quest");
     setCreationMode("current");
   };
@@ -1079,6 +1422,9 @@ function App() {
   const openAssets = () => {
     if (!canBrowseAssets) return;
     setCreationMode(null);
+    setQuestionTreeOpen(false);
+    setManualPanel(null);
+    setPendingDirectManualParentRef(null);
     window.history.replaceState(null, "", "/?panel=research-assets");
     setAssetsOpen(true);
   };
@@ -1086,6 +1432,146 @@ function App() {
     window.history.replaceState(null, "", "/");
     setAssetsOpen(false);
   };
+  const openQuestionTree = () => {
+    if (!canBrowseQuestions) return;
+    setCreationMode(null);
+    setAssetsOpen(false);
+    setManualPanel(null);
+    setManualOpenError(null);
+    setQuestionRouteNodeRef(null);
+    setPendingDirectManualParentRef(null);
+    window.history.replaceState(null, "", questionTreeUrl());
+    setQuestionTreeOpen(true);
+  };
+  const closeQuestionTree = () => {
+    setManualPanel(null);
+    setQuestionTreeOpen(false);
+    setQuestionRouteNodeRef(null);
+    setPendingDirectManualParentRef(null);
+    setManualOpenError(null);
+    window.history.replaceState(null, "", "/");
+    requestAnimationFrame(() => {
+      questionTreeButtonRef.current?.focus({ preventScroll: true });
+    });
+  };
+
+  const openManualCreation = async (
+    parent: QuestionTreeItem,
+    opener: HTMLButtonElement,
+  ) => {
+    if (!manualCreationReady || manualOpeningParentRef !== null) return;
+    setQuestionRouteNodeRef(parent.question_ref);
+    setPendingDirectManualParentRef(null);
+    window.history.replaceState(
+      null,
+      "",
+      manualCreationUrl(parent.question_ref),
+    );
+    setManualOpeningParentRef(parent.question_ref);
+    setManualOpenError(null);
+    try {
+      const current = await fetchCurrentManualQuestionCreation(
+        parent.quest_ref,
+        parent.question_ref,
+      );
+      const raw = current ?? await openManualQuestionCreation(
+        parent.quest_ref,
+        parent.question_ref,
+      );
+      if (
+        raw.quest_ref !== parent.quest_ref ||
+        raw.parent_question_ref !== parent.question_ref
+      ) {
+        throw new ProductError("manual_creation_target_mismatch");
+      }
+      const researchReceipt = await hydrateManualResearchReceipt(raw);
+      manualDetailSequence.current += 1;
+      setManualPanel({ raw, parent, opener, researchReceipt });
+      await reload();
+    } catch (caught) {
+      const code = caught instanceof ProductError ? caught.code : "unknown_error";
+      setManualOpenError(code);
+      window.history.replaceState(
+        null,
+        "",
+        questionTreeUrl(parent.question_ref),
+      );
+      requestAnimationFrame(() => opener.focus({ preventScroll: true }));
+    } finally {
+      setManualOpeningParentRef(null);
+    }
+  };
+
+  const applyManualRaw = useCallback(async (
+    raw: ManualQuestionCreationRawView,
+    basis: Pick<ManualPanelState, "parent" | "opener">,
+  ): Promise<ManualQuestionCreationView> => {
+    const researchReceipt = await hydrateManualResearchReceipt(raw);
+    manualDetailSequence.current += 1;
+    setManualPanel((current) =>
+      current?.raw.context_ref === raw.context_ref
+        ? { ...current, raw, researchReceipt }
+        : current,
+    );
+    await reload();
+    return adaptManualQuestionCreation(raw, {
+      parent_question_title: basis.parent.title ?? basis.parent.unknown_statement,
+      research_receipt: researchReceipt,
+    });
+  }, [reload]);
+
+  useEffect(() => {
+    if (
+      !pendingDirectManualParentRef ||
+      manualPanel ||
+      manualOpeningParentRef !== null ||
+      !snapshot
+    ) {
+      return;
+    }
+    if (
+      snapshot.question_tree.status !== "ready" ||
+      snapshot.manual_question_creation.status !== "ready"
+    ) {
+      setPendingDirectManualParentRef(null);
+      setManualOpenError("manual_creation_capability_unavailable");
+      window.history.replaceState(
+        null,
+        "",
+        questionTreeUrl(pendingDirectManualParentRef),
+      );
+      return;
+    }
+    const parent = snapshot.question_tree.items.find(
+      (item) => item.question_ref === pendingDirectManualParentRef,
+    );
+    if (!parent) {
+      setPendingDirectManualParentRef(null);
+      setManualOpenError("manual_creation_parent_not_present");
+      window.history.replaceState(null, "", questionTreeUrl());
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      const opener = document.querySelector<HTMLButtonElement>(
+        `[data-create-parent-ref="${CSS.escape(parent.question_ref)}"]`,
+      );
+      if (!opener) return;
+      setPendingDirectManualParentRef(null);
+      void openManualCreation(parent, opener);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [
+    manualOpeningParentRef,
+    manualPanel,
+    pendingDirectManualParentRef,
+    snapshot?.revision,
+  ]);
+
+  const questionUnavailableReason = !snapshot
+    ? "projection_loading"
+    : snapshot.question_tree.status === "ready"
+      ? ""
+      : `${snapshot.question_tree.status} · ${snapshot.question_tree.reason.code}`;
 
   return (
     <>
@@ -1111,16 +1597,38 @@ function App() {
         <LumenRail
           canCreate={Boolean(canCreate)}
           canBrowseAssets={canBrowseAssets}
+          canBrowseQuestions={canBrowseQuestions}
+          questionsActive={questionTreeOpen}
+          questionUnavailableReason={questionUnavailableReason}
+          questionButtonRef={questionTreeButtonRef}
           onCreate={openCreation}
           onBrowseAssets={openAssets}
+          onBrowseQuestions={openQuestionTree}
         />
-        <WorkspaceMain
-          snapshot={snapshot}
-          state={state}
-          error={error}
-          streamInterrupted={streamInterrupted}
-          retry={() => void reload()}
-        />
+        {questionTreeOpen && snapshot ? (
+          <QuestionTree
+            items={snapshot.question_tree.items}
+            graphRevision={snapshot.owners.research_graph?.revision ?? null}
+            projectionStatus={snapshot.question_tree.status}
+            projectionReason={snapshot.question_tree.reason?.code ?? null}
+            initialQuestionRef={questionRouteNodeRef}
+            manualCreationReady={Boolean(
+              manualCreationReady && snapshot.question_tree.status === "ready",
+            )}
+            openingParentRef={manualOpeningParentRef}
+            openError={manualOpenError}
+            onClose={closeQuestionTree}
+            onCreateQuestion={openManualCreation}
+          />
+        ) : (
+          <WorkspaceMain
+            snapshot={snapshot}
+            state={state}
+            error={error}
+            streamInterrupted={streamInterrupted}
+            retry={() => void reload()}
+          />
+        )}
         <CompanionShell state={state} />
       </div>
       {creationMode && snapshot ? (
@@ -1142,6 +1650,122 @@ function App() {
           verificationWorkerReady={Boolean(verificationWorkerReady)}
           onClose={closeAssets}
           onChanged={() => void reload()}
+        />
+      ) : null}
+      {manualPanel && manualView ? (
+        <ManualCreation
+          view={manualView}
+          returnFocusTo={manualPanel.opener}
+          onClose={() => {
+            window.history.replaceState(
+              null,
+              "",
+              questionTreeUrl(manualPanel.parent.question_ref),
+            );
+            setManualPanel(null);
+            setManualOpenError(null);
+          }}
+          onCancel={async ({ creation_id }) => {
+            if (creation_id !== manualPanel.raw.context_ref) {
+              throw new ProductError("manual_creation_context_stale");
+            }
+            const raw = await cancelManualQuestionCreation(creation_id);
+            await applyManualRaw(raw, manualPanel);
+          }}
+          onConfirmSeed={async ({ creation_id, seed }) => {
+            if (creation_id !== manualPanel.raw.context_ref) {
+              throw new ProductError("manual_creation_context_stale");
+            }
+            const acceptedBindings = await intakeManualMaterials(
+              creation_id,
+              seed.material_draft,
+            );
+            const raw = await confirmManualCreationSeed(creation_id, {
+              intent: seed.intent,
+              fields: seed.fields,
+              accepted_material_bindings: acceptedBindings,
+              deepfetch_preference: seed.deepfetch_preference,
+            });
+            await applyManualRaw(raw, manualPanel);
+          }}
+          onStartDeepFetch={async ({ creation_id, seed_ref, seed_hash }) => {
+            if (creation_id !== manualPanel.raw.context_ref) {
+              throw new ProductError("manual_creation_context_stale");
+            }
+            const raw = await startManualCreationDeepFetch(
+              creation_id,
+              seed_ref,
+              seed_hash,
+            );
+            await applyManualRaw(raw, manualPanel);
+          }}
+          onConfirmWaiver={async ({ creation_id, seed_ref, seed_hash }) => {
+            if (creation_id !== manualPanel.raw.context_ref) {
+              throw new ProductError("manual_creation_context_stale");
+            }
+            const raw = await confirmManualDeepFetchWaiver(
+              creation_id,
+              seed_ref,
+              seed_hash,
+            );
+            await applyManualRaw(raw, manualPanel);
+          }}
+          onSendDraftMessage={async ({
+            creation_id,
+            session_ref,
+            expected_basis_hash,
+            message,
+          }) => {
+            if (
+              creation_id !== manualPanel.raw.context_ref ||
+              session_ref !== manualPanel.raw.drafting_session?.ref
+            ) {
+              throw new ProductError("manual_drafting_session_stale");
+            }
+            const raw = await sendManualDraftingMessage(
+              creation_id,
+              expected_basis_hash,
+              message,
+            );
+            await applyManualRaw(raw, manualPanel);
+          }}
+          onSaveProposal={async ({
+            creation_id,
+            expected_basis_hash,
+            expected_proposal_ref,
+            expected_proposal_hash,
+            content,
+          }) => {
+            if (creation_id !== manualPanel.raw.context_ref) {
+              throw new ProductError("manual_creation_context_stale");
+            }
+            const raw = await saveManualQuestionProposal(creation_id, {
+              expected_basis_hash,
+              expected_proposal_ref,
+              expected_proposal_hash,
+              content,
+            });
+            const next = await applyManualRaw(raw, manualPanel);
+            if (!next.proposal) {
+              throw new ProductError("manual_question_proposal_missing");
+            }
+            return next.proposal;
+          }}
+          onConfirmProposal={async ({
+            creation_id,
+            proposal_ref,
+            proposal_hash,
+          }) => {
+            if (creation_id !== manualPanel.raw.context_ref) {
+              throw new ProductError("manual_creation_context_stale");
+            }
+            const raw = await confirmManualQuestionProposal(
+              creation_id,
+              proposal_ref,
+              proposal_hash,
+            );
+            await applyManualRaw(raw, manualPanel);
+          }}
         />
       ) : null}
     </>

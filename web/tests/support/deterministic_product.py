@@ -134,7 +134,7 @@ class DeterministicDeepFetchProvider:
         )
 
     def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
-        assert request.scope["goal"]
+        assert request.scope.get("goal") or request.scope.get("quest_goal")
         assert request.authorization_receipt.issuer == "human_collaboration"
         time.sleep(1.4)
         return DeepFetchResult(
@@ -281,9 +281,85 @@ def seed_legacy_current(human_collaboration, legacy_state: str) -> None:
         raise RuntimeError(f"legacy fixture did not enter recovering: {recovered['status']}")
 
 
+def seed_manual_root(human_collaboration) -> None:
+    opened = human_collaboration.create_quest({}, "chrome-manual-root-open")
+    first_probe = human_collaboration.observe_host_compute(
+        opened["initialization_id"],
+        [],
+        "chrome-manual-root-first-probe",
+    )
+    if first_probe["compute"]["status"] != "unavailable":
+        raise RuntimeError("manual fixture expected the sequenced unavailable probe")
+    probed = human_collaboration.observe_host_compute(
+        opened["initialization_id"],
+        ["GPU-deterministic-1"],
+        "chrome-manual-root-ready-probe",
+    )
+    draft = dict(probed["quest_draft"]["value"])
+    draft.update(
+        {
+            "goal": "判断低照度显微图像去噪能否保留稀有形态。",
+            "completion_criteria": "形成带反例和证据边界的比较结论。",
+            "time_budget": "30d",
+            "route": "direct",
+            "literature": {
+                "mode": "oa_only",
+                "library_entry_url": "",
+                "scope_exclusions": "",
+                "accepted_material_bindings": [],
+            },
+            "background_and_initial_direction": "比较自监督和监督基线。",
+        }
+    )
+    saved = human_collaboration.revise_quest_draft(
+        opened["initialization_id"],
+        draft,
+        probed["quest_draft"]["hash"],
+        "chrome-manual-root-draft",
+        probed["quest_draft"]["revision"],
+    )
+    human_collaboration.generate_question_proposal(
+        saved["initialization_id"],
+        saved["quest_draft"]["hash"],
+        "chrome-manual-root-proposal",
+        saved["quest_draft"]["revision"],
+    )
+    if not human_collaboration.process_drafting_once():
+        raise RuntimeError("manual fixture proposal was not processed")
+    ready = human_collaboration.query_quest_creation(opened["initialization_id"])
+    previewed = human_collaboration.preview_confirmation(
+        ready["initialization_id"],
+        quest_draft_revision=ready["quest_draft"]["revision"],
+        quest_draft_hash=ready["quest_draft"]["hash"],
+        proposal_ref=ready["proposal"]["ref"],
+        proposal_hash=ready["proposal"]["hash"],
+        idempotency_key="chrome-manual-root-preview",
+    )
+    preview = previewed["confirmation_preview"]
+    human_collaboration.confirm_quest(
+        ready["initialization_id"],
+        quest_draft_revision=ready["quest_draft"]["revision"],
+        quest_draft_hash=ready["quest_draft"]["hash"],
+        proposal_ref=ready["proposal"]["ref"],
+        proposal_hash=ready["proposal"]["hash"],
+        preview_ref=preview["ref"],
+        preview_hash=preview["hash"],
+        idempotency_key="chrome-manual-root-confirm",
+    )
+    for _attempt in range(8):
+        if not human_collaboration.reconcile_once():
+            break
+    completed = human_collaboration.query_quest_creation(opened["initialization_id"])
+    if completed["status"] != "completed":
+        raise RuntimeError(
+            f"manual fixture root did not complete: {completed['status']}"
+        )
+
+
 async def serve(
     data_root: Path,
     legacy_state: str | None,
+    manual_root: bool,
     web_root: Path | None,
 ) -> None:
     intent_started = threading.Event()
@@ -296,6 +372,8 @@ async def serve(
         deepfetch_provider=DeterministicDeepFetchProvider(),
     )
     human_collaboration = runtime.owners.human_collaboration
+    if manual_root:
+        seed_manual_root(human_collaboration)
     human_collaboration._research_graph = TransientResearchGraph(  # noqa: SLF001
         runtime.owners.research_graph,
         failure_limit=1_000 if legacy_state == "recovering" else 3,
@@ -363,9 +441,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--legacy-state", choices=("draft", "recovering"))
+    parser.add_argument("--manual-root", action="store_true")
     parser.add_argument("--web-root", type=Path)
     args = parser.parse_args()
-    asyncio.run(serve(args.data_root, args.legacy_state, args.web_root))
+    asyncio.run(serve(args.data_root, args.legacy_state, args.manual_root, args.web_root))
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ from meta_research.owners.common import (
     AssetReferenceReader,
     AttemptExecutionReceiptVerifier,
     BundleConfirmationVerifier,
+    ManualQuestionConfirmationVerifier,
     OwnerConflict,
     OwnerSnapshot,
     QUESTION_PROPOSAL_SCHEMA,
@@ -48,12 +49,20 @@ from meta_research.owners.agent_runtime import (
     DeepFetchRun,
 )
 from meta_research.owners.research_graph import AcceptedQuest
+from meta_research.quest_drafting import QUESTION_FIELD_MAX_LENGTHS
+
+
+class ResearchGraphReferenceReader(AssetReferenceReader, Protocol):
+    """Read public RG identities in addition to its asset-reference projection."""
+
+    def query_quest_by_ref(self, quest_ref: str) -> AcceptedQuest | None: ...
 
 
 QUESTION_CONTENT_SCHEMA = "meta-research/formal-question-content/v1"
 ASSET_MANIFEST_SCHEMA = "meta-research/asset-manifest/v1"
 RM_OWNER = "research_memory"
 CONTENT_RECEIPT_KIND = "question_content_acceptance"
+MANUAL_CONTENT_RECEIPT_KIND = "manual_question_content_acceptance"
 IDEA_CONTENT_RECEIPT_KIND = "idea_outcome_content_acceptance"
 LITERATURE_SNAPSHOT_RECEIPT_KIND = "literature_snapshot_acceptance"
 ASSET_RECEIPT_KIND = "asset_acceptance"
@@ -86,6 +95,15 @@ ASSET_VERIFICATION_INTERVAL_SECONDS = 300.0
 TRANSIENT_ASSET_INTAKE_CONFLICTS = {
     "asset_source_unavailable",
     "asset_source_changed_during_intake",
+}
+QUESTION_FIELDS = tuple(QUESTION_FIELD_MAX_LENGTHS)
+REQUIRED_QUESTION_FIELDS = QUESTION_FIELDS[:4]
+_PSEUDO_QUESTION_VALUES = {
+    "unknown",
+    "not_applicable",
+    "not applicable",
+    "n/a",
+    "na",
 }
 
 AssetSourceKind = Literal[
@@ -358,6 +376,21 @@ class AcceptedQuestionContent:
 
 
 @dataclass(frozen=True)
+class AcceptedManualQuestionContent:
+    context_ref: str
+    quest_ref: str
+    parent_question_ref: str
+    content_ref: str
+    content_hash: str
+    schema_ref: str
+    proposal_ref: str
+    proposal_hash: str
+    confirmation_ref: str
+    confirmation_hash: str
+    receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
 class AcceptedIdeaOutcomeContent:
     request_ref: str
     run_ref: str
@@ -403,9 +436,12 @@ class AcceptedLiteratureSnapshot:
     fulltext_count: int
     execution_receipt: AcceptanceReceipt
     receipt: AcceptanceReceipt
+    creation_context_kind: str
+    creation_context_ref: str | None
+    quest_ref: str | None
 
     def as_public_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "status": "accepted",
             "snapshot_ref": self.snapshot_ref,
             "request_ref": self.request_ref,
@@ -427,11 +463,20 @@ class AcceptedLiteratureSnapshot:
             "fulltext_count": self.fulltext_count,
             "receipt": self.receipt.as_public_dict(),
         }
+        if self.creation_context_kind == "manual_question_creation":
+            result.update(
+                {
+                    "creation_context_kind": self.creation_context_kind,
+                    "creation_context_ref": self.creation_context_ref,
+                    "quest_ref": self.quest_ref,
+                }
+            )
+        return result
 
     def as_context_binding(self) -> dict[str, object]:
         """Return the compact issuer-owned binding carried into Idea."""
 
-        return {
+        result = {
             "schema_ref": "meta-research/idea-literature-binding/v1",
             "snapshot_ref": self.snapshot_ref,
             "snapshot_hash": self.snapshot_hash,
@@ -440,6 +485,15 @@ class AcceptedLiteratureSnapshot:
             "draft_hash": self.draft_hash,
             "receipt": self.receipt.as_public_dict(),
         }
+        if self.creation_context_kind == "manual_question_creation":
+            result.update(
+                {
+                    "creation_context_kind": self.creation_context_kind,
+                    "creation_context_ref": self.creation_context_ref,
+                    "quest_ref": self.quest_ref,
+                }
+            )
+        return result
 
 
 class ResearchMemoryInterface(Protocol):
@@ -616,6 +670,39 @@ class ResearchMemoryInterface(Protocol):
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
+    def query_manual_question_content(
+        self, context_ref: str
+    ) -> AcceptedManualQuestionContent | None: ...
+
+    def accept_manual_question_content(
+        self,
+        *,
+        context_ref: str,
+        quest: AcceptedQuest,
+        parent_question_ref: str,
+        proposal_ref: str,
+        proposal_hash: str,
+        confirmation: AcceptanceReceipt,
+        content: dict[str, object],
+        content_hash: str,
+    ) -> AcceptedManualQuestionContent: ...
+
+    def verify_manual_question_content_receipt(
+        self,
+        *,
+        context_ref: str,
+        quest_ref: str,
+        parent_question_ref: str,
+        content_ref: str,
+        content_hash: str,
+        schema_ref: str,
+        proposal_ref: str,
+        proposal_hash: str,
+        confirmation_ref: str,
+        confirmation_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
     def accept_idea_outcome_content(
         self,
         *,
@@ -663,6 +750,9 @@ class ResearchMemoryInterface(Protocol):
         draft_revision: int,
         draft_hash: str,
         receipt: AcceptanceReceipt | None = None,
+        creation_context_kind: str = "quest_initialization",
+        creation_context_ref: str | None = None,
+        quest_ref: str | None = None,
     ) -> None: ...
 
     def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]: ...
@@ -739,6 +829,51 @@ class SQLiteResearchMemoryReceiptVerifier:
             or row.receipt_hash != _content_receipt_hash(row)
         ):
             raise OwnerConflict("question_content_receipt_invalid")
+        _verify_object(self._object_store, row)
+
+    def verify_manual_question_content_receipt(
+        self,
+        *,
+        context_ref: str,
+        quest_ref: str,
+        parent_question_ref: str,
+        content_ref: str,
+        content_hash: str,
+        schema_ref: str,
+        proposal_ref: str,
+        proposal_hash: str,
+        confirmation_ref: str,
+        confirmation_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != RM_OWNER
+            or receipt.kind != MANUAL_CONTENT_RECEIPT_KIND
+            or receipt.subject_ref != content_ref
+        ):
+            raise OwnerConflict("manual_question_content_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_manual_question_contents WHERE "
+                    "context_ref = :context_ref AND content_ref = :content_ref"
+                ),
+                {"context_ref": context_ref, "content_ref": content_ref},
+            ).first()
+        if row is None or (
+            row.quest_ref != quest_ref
+            or row.parent_question_ref != parent_question_ref
+            or row.content_hash != content_hash
+            or row.schema_ref != schema_ref
+            or row.proposal_ref != proposal_ref
+            or row.proposal_hash != proposal_hash
+            or row.confirmation_ref != confirmation_ref
+            or row.confirmation_hash != confirmation_hash
+            or row.receipt_ref != receipt.receipt_ref
+            or row.receipt_hash != receipt.payload_hash
+            or row.receipt_hash != _manual_content_receipt_hash(row)
+        ):
+            raise OwnerConflict("manual_question_content_receipt_invalid")
         _verify_object(self._object_store, row)
 
     def verify_idea_content_receipt(
@@ -845,6 +980,15 @@ class SQLiteResearchMemoryReceiptVerifier:
                 or legacy.receipt_hash != _content_receipt_hash(legacy)
             ):
                 raise OwnerConflict("asset_receipt_invalid")
+        elif row.acceptance_kind == MANUAL_CONTENT_RECEIPT_KIND:
+            manual = _legacy_manual_question_row(self._database, version_ref)
+            if (
+                manual.content_hash != content_hash
+                or manual.receipt_ref != receipt.receipt_ref
+                or manual.receipt_hash != receipt.payload_hash
+                or manual.receipt_hash != _manual_content_receipt_hash(manual)
+            ):
+                raise OwnerConflict("asset_receipt_invalid")
         elif row.acceptance_kind == IDEA_CONTENT_RECEIPT_KIND:
             legacy = _legacy_idea_row(self._database, version_ref)
             if (
@@ -911,7 +1055,8 @@ class SQLiteResearchMemory:
         quest_verifier: QuestReceiptVerifier,
         receipt_verifier: SQLiteResearchMemoryReceiptVerifier,
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
-        reference_reader: AssetReferenceReader | None = None,
+        reference_reader: ResearchGraphReferenceReader | None = None,
+        manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
     ) -> None:
         self._database = database
         self._object_store = object_store
@@ -921,6 +1066,7 @@ class SQLiteResearchMemory:
         self._receipt_verifier = receipt_verifier
         self._execution_verifier = execution_verifier
         self._reference_reader = reference_reader
+        self._manual_confirmation_verifier = manual_confirmation_verifier
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         # Handoff can perform durable, crash-recoverable object repair. Keep a
         # single in-process performer so timeout followers replay or alias the
@@ -3151,7 +3297,10 @@ class SQLiteResearchMemory:
             if not asset_state_valid:
                 reasons.append("asset_state_uncertain")
             owner_reference_refs: tuple[str, ...] = ()
-            if asset.acceptance_kind == CONTENT_RECEIPT_KIND:
+            if asset.acceptance_kind in {
+                CONTENT_RECEIPT_KIND,
+                MANUAL_CONTENT_RECEIPT_KIND,
+            }:
                 owner_reference_refs = (
                     f"rm-formal-content:{memory_ref}",
                 )
@@ -3637,6 +3786,7 @@ class SQLiteResearchMemory:
     def read_question_content(
         self, content_ref: str, expected_hash: str
     ) -> dict[str, object]:
+        manual = False
         with self._database.read() as connection:
             row = connection.execute(
                 text(
@@ -3645,19 +3795,33 @@ class SQLiteResearchMemory:
                 ),
                 {"content_ref": content_ref},
             ).first()
+            if row is None:
+                row = connection.execute(
+                    text(
+                        "SELECT * FROM rm_manual_question_contents WHERE "
+                        "content_ref = :content_ref"
+                    ),
+                    {"content_ref": content_ref},
+                ).first()
+                manual = row is not None
         if row is None or row.content_hash != expected_hash:
             raise OwnerConflict("question_content_not_found")
         _verify_object(self._object_store, row)
-        self._receipt_verifier.verify_question_content_receipt(
-            initialization_id=row.initialization_id,
-            content_ref=row.content_ref,
-            content_hash=row.content_hash,
-            schema_ref=row.schema_ref,
-            proposal_ref=row.proposal_ref,
-            proposal_hash=row.proposal_hash,
-            confirmation_ref=row.confirmation_ref,
-            receipt=_accepted_content(row).receipt,
-        )
+        if manual:
+            accepted = self.query_manual_question_content(row.context_ref)
+            if accepted is None or accepted.content_ref != content_ref:
+                raise OwnerConflict("question_content_not_found")
+        else:
+            self._receipt_verifier.verify_question_content_receipt(
+                initialization_id=row.initialization_id,
+                content_ref=row.content_ref,
+                content_hash=row.content_hash,
+                schema_ref=row.schema_ref,
+                proposal_ref=row.proposal_ref,
+                proposal_hash=row.proposal_hash,
+                confirmation_ref=row.confirmation_ref,
+                receipt=_accepted_content(row).receipt,
+            )
         try:
             content = decoded_object(row.content_json)
         except (TypeError, ValueError) as error:
@@ -3832,6 +3996,213 @@ class SQLiteResearchMemory:
 
     def verify_question_content_receipt(self, **values) -> None:
         self._receipt_verifier.verify_question_content_receipt(**values)
+
+    def query_manual_question_content(
+        self, context_ref: str
+    ) -> AcceptedManualQuestionContent | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_manual_question_contents WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+        if row is None:
+            return None
+        _verify_object(self._object_store, row)
+        accepted = _accepted_manual_content(row)
+        quest_query = getattr(self._reference_reader, "query_quest_by_ref", None)
+        if not callable(quest_query):
+            raise OwnerConflict("quest_receipt_verifier_unavailable")
+        quest = quest_query(row.quest_ref)
+        if quest is None:
+            raise OwnerConflict("manual_question_quest_not_present")
+        self._quest_verifier.verify_quest_receipt(
+            initialization_id=quest.initialization_id,
+            quest_ref=quest.quest_ref,
+            proposal_ref=quest.proposal_ref,
+            proposal_hash=quest.proposal_hash,
+            confirmation_ref=quest.confirmation.receipt_ref,
+            receipt=quest.receipt,
+        )
+        self._verify_manual_confirmation(
+            context_ref=row.context_ref,
+            quest_ref=row.quest_ref,
+            parent_question_ref=row.parent_question_ref,
+            proposal_ref=row.proposal_ref,
+            proposal_hash=row.proposal_hash,
+            content_hash=row.content_hash,
+            receipt=_manual_confirmation_receipt(row),
+        )
+        self._receipt_verifier.verify_manual_question_content_receipt(
+            context_ref=row.context_ref,
+            quest_ref=row.quest_ref,
+            parent_question_ref=row.parent_question_ref,
+            content_ref=row.content_ref,
+            content_hash=row.content_hash,
+            schema_ref=row.schema_ref,
+            proposal_ref=row.proposal_ref,
+            proposal_hash=row.proposal_hash,
+            confirmation_ref=row.confirmation_ref,
+            confirmation_hash=row.confirmation_hash,
+            receipt=accepted.receipt,
+        )
+        return accepted
+
+    def accept_manual_question_content(
+        self,
+        *,
+        context_ref: str,
+        quest: AcceptedQuest,
+        parent_question_ref: str,
+        proposal_ref: str,
+        proposal_hash: str,
+        confirmation: AcceptanceReceipt,
+        content: dict[str, object],
+        content_hash: str,
+    ) -> AcceptedManualQuestionContent:
+        for value in (
+            context_ref,
+            quest.quest_ref,
+            parent_question_ref,
+            proposal_ref,
+            proposal_hash,
+            content_hash,
+        ):
+            if not value:
+                raise OwnerConflict("manual_question_content_lineage_invalid")
+        normalized = _normalized_question_content(content)
+        if canonical_hash(normalized) != content_hash:
+            raise OwnerConflict("question_content_hash_mismatch")
+        self._verify_manual_confirmation(
+            context_ref=context_ref,
+            quest_ref=quest.quest_ref,
+            parent_question_ref=parent_question_ref,
+            proposal_ref=proposal_ref,
+            proposal_hash=proposal_hash,
+            content_hash=content_hash,
+            receipt=confirmation,
+        )
+        self._quest_verifier.verify_quest_receipt(
+            initialization_id=quest.initialization_id,
+            quest_ref=quest.quest_ref,
+            proposal_ref=quest.proposal_ref,
+            proposal_hash=quest.proposal_hash,
+            confirmation_ref=quest.confirmation.receipt_ref,
+            receipt=quest.receipt,
+        )
+        bindings = {
+            "context_ref": context_ref,
+            "quest_ref": quest.quest_ref,
+            "parent_question_ref": parent_question_ref,
+            "proposal_ref": proposal_ref,
+            "proposal_hash": proposal_hash,
+            "confirmation_ref": confirmation.receipt_ref,
+            "confirmation_hash": confirmation.payload_hash,
+            "content_hash": content_hash,
+            "schema_ref": QUESTION_CONTENT_SCHEMA,
+        }
+        content_json = canonical_json(normalized)
+        object_path = self._store_content(content_hash, content_json)
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM rm_manual_question_contents WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+            if existing is not None:
+                if any(
+                    getattr(existing, key) != value for key, value in bindings.items()
+                ) or existing.receipt_hash != _manual_content_receipt_hash(existing):
+                    raise OwnerConflict("manual_question_content_acceptance_conflict")
+                _verify_object(self._object_store, existing)
+                return _accepted_manual_content(existing)
+
+            content_ref = new_ref("memory_content")
+            receipt_ref = new_ref("rm_manual_content_receipt")
+            receipt_hash = _receipt_hash(
+                MANUAL_CONTENT_RECEIPT_KIND, content_ref, bindings
+            )
+            accepted_at = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO rm_manual_question_contents (content_ref, "
+                    "context_ref, quest_ref, parent_question_ref, proposal_ref, "
+                    "proposal_hash, confirmation_ref, confirmation_hash, content_hash, "
+                    "schema_ref, content_json, object_path, receipt_ref, receipt_hash, "
+                    "accepted_at) VALUES (:content_ref, :context_ref, :quest_ref, "
+                    ":parent_question_ref, :proposal_ref, :proposal_hash, "
+                    ":confirmation_ref, :confirmation_hash, :content_hash, "
+                    ":schema_ref, :content_json, :object_path, :receipt_ref, "
+                    ":receipt_hash, :accepted_at)"
+                ),
+                {
+                    **bindings,
+                    "content_ref": content_ref,
+                    "content_json": content_json,
+                    "object_path": object_path,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "accepted_at": accepted_at,
+                },
+            )
+            _insert_managed_content_asset(
+                connection,
+                version_ref=content_ref,
+                source_kind="formal_question",
+                display_name="Manual Formal Question content",
+                content_hash=content_hash,
+                content_json=content_json,
+                object_path=object_path,
+                provenance={
+                    "source_table": "rm_manual_question_contents",
+                    "context_ref": context_ref,
+                    "quest_ref": quest.quest_ref,
+                    "parent_question_ref": parent_question_ref,
+                    "proposal_ref": proposal_ref,
+                },
+                acceptance_kind=MANUAL_CONTENT_RECEIPT_KIND,
+                receipt_ref=receipt_ref,
+                receipt_hash=receipt_hash,
+                accepted_at=accepted_at,
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_memory_state SET revision = revision + 1, "
+                    "asset_count = (SELECT COUNT(*) FROM rm_assets), "
+                    "asset_version_count = (SELECT COUNT(*) FROM rm_asset_versions), "
+                    "object_count = :object_count, formal_content_count = "
+                    "formal_content_count + 1 WHERE singleton = 'owner'"
+                ),
+                {"object_count": _managed_object_count(connection)},
+            )
+            self._feed.record(
+                connection,
+                "research_memory.manual_question_content_accepted",
+                {
+                    "context_ref": context_ref,
+                    "quest_ref": quest.quest_ref,
+                    "parent_question_ref": parent_question_ref,
+                    "content_ref": content_ref,
+                    "content_hash": content_hash,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        accepted = self.query_manual_question_content(context_ref)
+        if accepted is None:
+            raise OwnerConflict("manual_question_content_receipt_missing_after_commit")
+        return accepted
+
+    def verify_manual_question_content_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_manual_question_content_receipt(**values)
+
+    def _verify_manual_confirmation(self, **values) -> None:
+        if self._manual_confirmation_verifier is None:
+            raise OwnerConflict("manual_question_confirmation_verifier_unavailable")
+        self._manual_confirmation_verifier.verify_manual_question_confirmation(**values)
 
     def accept_idea_outcome_content(
         self,
@@ -4049,6 +4420,17 @@ class SQLiteResearchMemory:
         request: DeepFetchRunRequest,
         run: DeepFetchRun,
     ) -> AcceptedLiteratureSnapshot:
+        creation_context_kind = request.creation_context_kind
+        if creation_context_kind == "quest_initialization":
+            creation_context_ref = None
+            quest_ref = None
+        elif creation_context_kind == "manual_question_creation":
+            creation_context_ref = request.creation_context_ref
+            quest_ref = request.quest_ref
+            if not creation_context_ref or not quest_ref:
+                raise OwnerConflict("literature_snapshot_context_invalid")
+        else:
+            raise OwnerConflict("literature_snapshot_context_invalid")
         if (
             run.status != "executed"
             or run.request_ref != request.request_ref
@@ -4078,9 +4460,20 @@ class SQLiteResearchMemory:
                 or existing.run_ref != run.run_ref
                 or existing.attempt_ref != run.attempt_ref
                 or existing.fence_ref != run.fence_ref
+                or existing.creation_context_kind != creation_context_kind
+                or existing.creation_context_ref != creation_context_ref
+                or existing.quest_ref != quest_ref
             ):
                 raise OwnerConflict("literature_snapshot_identity_conflict")
             return existing
+        if creation_context_kind == "manual_question_creation":
+            existing = self._query_literature_snapshot_for_context(
+                creation_context_kind, creation_context_ref
+            )
+            if existing is not None:
+                if existing.request_ref != request.request_ref:
+                    raise OwnerConflict("literature_snapshot_context_conflict")
+                return existing
 
         summary_document = {
             "schema_ref": "meta-research/literature-summary/v1",
@@ -4149,6 +4542,14 @@ class SQLiteResearchMemory:
             "limitations_hash": limitations_hash,
             "web_evidence_hash": web_evidence_hash,
         }
+        if creation_context_kind == "manual_question_creation":
+            snapshot_binding.update(
+                {
+                    "creation_context_kind": creation_context_kind,
+                    "creation_context_ref": creation_context_ref,
+                    "quest_ref": quest_ref,
+                }
+            )
         snapshot_hash = canonical_hash(snapshot_binding)
         receipt_ref = new_ref("rm_receipt")
         receipt_hash = _literature_snapshot_receipt_hash(
@@ -4157,6 +4558,9 @@ class SQLiteResearchMemory:
             request_ref=request.request_ref,
             result_hash=run.result_hash,
             execution_receipt=run.execution_receipt,
+            creation_context_kind=creation_context_kind,
+            creation_context_ref=creation_context_ref,
+            quest_ref=quest_ref,
         )
         now = time.time()
         with self._database.write() as connection:
@@ -4167,23 +4571,44 @@ class SQLiteResearchMemory:
                 ),
                 {"request_ref": request.request_ref},
             ).first()
+            if (
+                existing_row is None
+                and creation_context_kind == "manual_question_creation"
+            ):
+                context_row = connection.execute(
+                    text(
+                        "SELECT * FROM rm_literature_snapshots WHERE "
+                        "creation_context_kind = :creation_context_kind AND "
+                        "creation_context_ref = :creation_context_ref"
+                    ),
+                    {
+                        "creation_context_kind": creation_context_kind,
+                        "creation_context_ref": creation_context_ref,
+                    },
+                ).first()
+                if context_row is not None:
+                    raise OwnerConflict("literature_snapshot_context_conflict")
             if existing_row is None:
                 connection.execute(
                     text(
                         "INSERT INTO rm_literature_snapshots (snapshot_ref, "
-                        "request_ref, initialization_id, draft_revision, draft_hash, "
+                        "request_ref, creation_context_kind, creation_context_ref, "
+                        "quest_ref, initialization_id, draft_revision, draft_hash, "
                         "scope_hash, run_ref, attempt_ref, fence_ref, result_hash, "
                         "execution_receipt_ref, execution_receipt_hash, completion, "
                         "summary_ref, summary_hash, summary_object_path, papers_ref, "
-                        "papers_hash, papers_object_path, fulltexts_ref, fulltexts_hash, "
+                        "papers_hash, papers_object_path, fulltexts_ref, "
+                        "fulltexts_hash, "
                         "fulltexts_object_path, limitations_json, limitations_hash, "
                         "web_evidence_json, web_evidence_hash, "
                         "snapshot_hash, receipt_ref, receipt_hash, accepted_at) VALUES "
-                        "(:snapshot_ref, :request_ref, :initialization_id, "
+                        "(:snapshot_ref, :request_ref, :creation_context_kind, "
+                        ":creation_context_ref, :quest_ref, :initialization_id, "
                         ":draft_revision, :draft_hash, :scope_hash, :run_ref, "
                         ":attempt_ref, :fence_ref, :result_hash, "
-                        ":execution_receipt_ref, :execution_receipt_hash, :completion, "
-                        ":summary_ref, :summary_hash, :summary_object_path, :papers_ref, "
+                        ":execution_receipt_ref, :execution_receipt_hash, "
+                        ":completion, :summary_ref, :summary_hash, "
+                        ":summary_object_path, :papers_ref, "
                         ":papers_hash, :papers_object_path, :fulltexts_ref, "
                         ":fulltexts_hash, :fulltexts_object_path, :limitations_json, "
                         ":limitations_hash, :web_evidence_json, "
@@ -4193,6 +4618,9 @@ class SQLiteResearchMemory:
                     ),
                     {
                         **snapshot_binding,
+                        "creation_context_kind": creation_context_kind,
+                        "creation_context_ref": creation_context_ref,
+                        "quest_ref": quest_ref,
                         "execution_receipt_ref": run.execution_receipt.receipt_ref,
                         "execution_receipt_hash": run.execution_receipt.payload_hash,
                         "summary_object_path": summary_path,
@@ -4229,6 +4657,15 @@ class SQLiteResearchMemory:
         accepted = self.query_literature_snapshot(snapshot_ref)
         if accepted is None:
             raise OwnerConflict("literature_snapshot_not_found")
+        if (
+            accepted.request_ref != request.request_ref
+            or accepted.run_ref != run.run_ref
+            or accepted.result_hash != run.result_hash
+            or accepted.creation_context_kind != creation_context_kind
+            or accepted.creation_context_ref != creation_context_ref
+            or accepted.quest_ref != quest_ref
+        ):
+            raise OwnerConflict("literature_snapshot_identity_conflict")
         return accepted
 
     def query_literature_snapshot(
@@ -4257,6 +4694,23 @@ class SQLiteResearchMemory:
             ).first()
         return None if row is None else self._accepted_literature_snapshot(row)
 
+    def _query_literature_snapshot_for_context(
+        self, creation_context_kind: str, creation_context_ref: str
+    ) -> AcceptedLiteratureSnapshot | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_literature_snapshots WHERE "
+                    "creation_context_kind = :creation_context_kind AND "
+                    "creation_context_ref = :creation_context_ref"
+                ),
+                {
+                    "creation_context_kind": creation_context_kind,
+                    "creation_context_ref": creation_context_ref,
+                },
+            ).first()
+        return None if row is None else self._accepted_literature_snapshot(row)
+
     def query_literature_snapshot_for_basis(
         self, initialization_id: str, draft_revision: int, draft_hash: str
     ) -> AcceptedLiteratureSnapshot | None:
@@ -4265,7 +4719,9 @@ class SQLiteResearchMemory:
                 text(
                     "SELECT * FROM rm_literature_snapshots WHERE "
                     "initialization_id = :initialization_id AND draft_revision = "
-                    ":draft_revision AND draft_hash = :draft_hash"
+                    ":draft_revision AND draft_hash = :draft_hash AND "
+                    "(creation_context_kind IS NULL OR "
+                    "creation_context_kind = 'quest_initialization')"
                 ),
                 {
                     "initialization_id": initialization_id,
@@ -4284,6 +4740,9 @@ class SQLiteResearchMemory:
         draft_revision: int,
         draft_hash: str,
         receipt: AcceptanceReceipt | None = None,
+        creation_context_kind: str = "quest_initialization",
+        creation_context_ref: str | None = None,
+        quest_ref: str | None = None,
     ) -> None:
         snapshot = self.query_literature_snapshot(snapshot_ref)
         if snapshot is None or (
@@ -4291,6 +4750,9 @@ class SQLiteResearchMemory:
             or snapshot.initialization_id != initialization_id
             or snapshot.draft_revision != draft_revision
             or snapshot.draft_hash != draft_hash
+            or snapshot.creation_context_kind != creation_context_kind
+            or snapshot.creation_context_ref != creation_context_ref
+            or snapshot.quest_ref != quest_ref
             or receipt is not None
             and snapshot.receipt != receipt
         ):
@@ -4327,6 +4789,27 @@ class SQLiteResearchMemory:
         paper_count = _validated_stored_papers_document(
             papers_document, str(row.request_ref)
         )
+        stored_context_kind = row.creation_context_kind
+        if stored_context_kind is None:
+            creation_context_kind = "quest_initialization"
+        else:
+            creation_context_kind = str(stored_context_kind)
+        if creation_context_kind == "manual_question_creation":
+            if not row.creation_context_ref or not row.quest_ref:
+                raise OwnerConflict("literature_snapshot_invalid")
+            creation_context_ref = str(row.creation_context_ref)
+            quest_ref = str(row.quest_ref)
+        elif creation_context_kind == "quest_initialization":
+            if (
+                row.creation_context_ref not in (None, row.initialization_id)
+                or row.quest_ref is not None
+            ):
+                raise OwnerConflict("literature_snapshot_invalid")
+            # Root request objects historically have no explicit context ref.
+            creation_context_ref = None
+            quest_ref = None
+        else:
+            raise OwnerConflict("literature_snapshot_invalid")
         snapshot_binding = {
             "schema_ref": "meta-research/literature-snapshot/v1",
             "snapshot_ref": row.snapshot_ref,
@@ -4349,6 +4832,14 @@ class SQLiteResearchMemory:
             "limitations_hash": row.limitations_hash,
             "web_evidence_hash": row.web_evidence_hash,
         }
+        if creation_context_kind == "manual_question_creation":
+            snapshot_binding.update(
+                {
+                    "creation_context_kind": creation_context_kind,
+                    "creation_context_ref": creation_context_ref,
+                    "quest_ref": quest_ref,
+                }
+            )
         execution_receipt = AcceptanceReceipt(
             issuer="agent_runtime",
             kind=DEEPFETCH_EXECUTION_RECEIPT_KIND,
@@ -4372,6 +4863,9 @@ class SQLiteResearchMemory:
                 request_ref=row.request_ref,
                 result_hash=row.result_hash,
                 execution_receipt=execution_receipt,
+                creation_context_kind=creation_context_kind,
+                creation_context_ref=creation_context_ref,
+                quest_ref=quest_ref,
             )
         ):
             raise OwnerConflict("literature_snapshot_invalid")
@@ -4409,6 +4903,9 @@ class SQLiteResearchMemory:
             fulltext_count=len(fulltexts_document["fulltexts"]),
             execution_receipt=execution_receipt,
             receipt=receipt,
+            creation_context_kind=creation_context_kind,
+            creation_context_ref=creation_context_ref,
+            quest_ref=quest_ref,
         )
 
     def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]:
@@ -4712,19 +5209,31 @@ def _literature_snapshot_receipt_hash(
     request_ref: str,
     result_hash: str,
     execution_receipt: AcceptanceReceipt,
+    creation_context_kind: str = "quest_initialization",
+    creation_context_ref: str | None = None,
+    quest_ref: str | None = None,
 ) -> str:
+    bindings: dict[str, object] = {
+        "snapshot_hash": snapshot_hash,
+        "request_ref": request_ref,
+        "result_hash": result_hash,
+        "execution_receipt": execution_receipt.as_public_dict(),
+    }
+    if creation_context_kind == "manual_question_creation":
+        bindings.update(
+            {
+                "creation_context_kind": creation_context_kind,
+                "creation_context_ref": creation_context_ref,
+                "quest_ref": quest_ref,
+            }
+        )
     return canonical_hash(
         {
             "schema_ref": RECEIPT_SCHEMA,
             "issuer": RM_OWNER,
             "kind": LITERATURE_SNAPSHOT_RECEIPT_KIND,
             "subject_ref": snapshot_ref,
-            "bindings": {
-                "snapshot_hash": snapshot_hash,
-                "request_ref": request_ref,
-                "result_hash": result_hash,
-                "execution_receipt": execution_receipt.as_public_dict(),
-            },
+            "bindings": bindings,
         }
     )
 
@@ -6106,6 +6615,20 @@ def _legacy_question_row(database: Database, content_ref: str):
     return row
 
 
+def _legacy_manual_question_row(database: Database, content_ref: str):
+    with database.read() as connection:
+        row = connection.execute(
+            text(
+                "SELECT * FROM rm_manual_question_contents WHERE content_ref = "
+                ":content_ref"
+            ),
+            {"content_ref": content_ref},
+        ).first()
+    if row is None:
+        raise OwnerConflict("asset_receipt_invalid")
+    return row
+
+
 def _legacy_idea_row(database: Database, content_ref: str):
     with database.read() as connection:
         row = connection.execute(
@@ -6240,6 +6763,53 @@ def _content_receipt_hash(row) -> str:
     )
 
 
+def _manual_content_receipt_hash(row) -> str:
+    return _receipt_hash(
+        MANUAL_CONTENT_RECEIPT_KIND,
+        row.content_ref,
+        {
+            "context_ref": row.context_ref,
+            "quest_ref": row.quest_ref,
+            "parent_question_ref": row.parent_question_ref,
+            "proposal_ref": row.proposal_ref,
+            "proposal_hash": row.proposal_hash,
+            "confirmation_ref": row.confirmation_ref,
+            "confirmation_hash": row.confirmation_hash,
+            "content_hash": row.content_hash,
+            "schema_ref": row.schema_ref,
+        },
+    )
+
+
+def _manual_confirmation_receipt(row) -> AcceptanceReceipt:
+    return AcceptanceReceipt(
+        issuer="human_collaboration",
+        kind="manual_question_proposal_confirmation",
+        receipt_ref=row.confirmation_ref,
+        subject_ref=row.proposal_ref,
+        payload_hash=row.confirmation_hash,
+    )
+
+
+def _normalized_question_content(content: dict[str, object]) -> dict[str, object]:
+    if set(content) != set(QUESTION_FIELDS):
+        raise OwnerConflict("question_proposal_schema_invalid")
+    normalized: dict[str, object] = {}
+    for field in QUESTION_FIELDS:
+        value = content[field]
+        if not isinstance(value, str):
+            raise OwnerConflict(f"{field}_invalid")
+        value = value.strip()
+        if len(value) > QUESTION_FIELD_MAX_LENGTHS[field]:
+            raise OwnerConflict(f"{field}_too_long")
+        if field in REQUIRED_QUESTION_FIELDS and (
+            not value or value.lower() in _PSEUDO_QUESTION_VALUES
+        ):
+            raise OwnerConflict(f"{field}_required")
+        normalized[field] = value
+    return normalized
+
+
 def _idea_content_bindings(row) -> dict[str, object]:
     return {
         "request_ref": row.request_ref,
@@ -6275,6 +6845,28 @@ def _accepted_content(row) -> AcceptedQuestionContent:
         receipt=AcceptanceReceipt(
             issuer=RM_OWNER,
             kind=CONTENT_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.content_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
+def _accepted_manual_content(row) -> AcceptedManualQuestionContent:
+    return AcceptedManualQuestionContent(
+        context_ref=row.context_ref,
+        quest_ref=row.quest_ref,
+        parent_question_ref=row.parent_question_ref,
+        content_ref=row.content_ref,
+        content_hash=row.content_hash,
+        schema_ref=row.schema_ref,
+        proposal_ref=row.proposal_ref,
+        proposal_hash=row.proposal_hash,
+        confirmation_ref=row.confirmation_ref,
+        confirmation_hash=row.confirmation_hash,
+        receipt=AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=MANUAL_CONTENT_RECEIPT_KIND,
             receipt_ref=row.receipt_ref,
             subject_ref=row.content_ref,
             payload_hash=row.receipt_hash,
@@ -6341,7 +6933,8 @@ def create_research_memory_interface(
     quest_verifier: QuestReceiptVerifier,
     receipt_verifier: SQLiteResearchMemoryReceiptVerifier,
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
-    reference_reader: AssetReferenceReader | None = None,
+    reference_reader: ResearchGraphReferenceReader | None = None,
+    manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
 ) -> ResearchMemoryInterface:
     return SQLiteResearchMemory(
         database,
@@ -6352,4 +6945,5 @@ def create_research_memory_interface(
         receipt_verifier,
         execution_verifier,
         reference_reader,
+        manual_confirmation_verifier,
     )

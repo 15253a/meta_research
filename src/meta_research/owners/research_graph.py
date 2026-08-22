@@ -28,6 +28,7 @@ from meta_research.owners.common import (
     AttemptExecutionReceiptVerifier,
     BundleConfirmationVerifier,
     IdeaContentReceiptVerifier,
+    ManualQuestionConfirmationVerifier,
     OwnerConflict,
     OwnerSnapshot,
     QuestionContentReceiptVerifier,
@@ -42,6 +43,7 @@ from meta_research.owners.common import (
 RG_OWNER = "research_graph"
 QUEST_RECEIPT_KIND = "quest_acceptance"
 QUESTION_RECEIPT_KIND = "root_question_acceptance"
+MANUAL_QUESTION_RECEIPT_KIND = "manual_question_acceptance"
 IDEA_ACCEPTED_RECEIPT_KIND = "idea_outcome_accepted"
 IDEA_REJECTED_RECEIPT_KIND = "idea_outcome_rejected"
 ASSET_ROLE_RECEIPT_KIND = "asset_role_acceptance"
@@ -62,6 +64,7 @@ class AcceptedQuest:
     proposal_hash: str
     preview_ref: str
     preview_hash: str
+    draft: dict[str, object]
     confirmation: AcceptanceReceipt
     receipt: AcceptanceReceipt
 
@@ -77,6 +80,9 @@ class AcceptedQuestion:
     content_receipt: AcceptanceReceipt
     confirmation_ref: str
     receipt: AcceptanceReceipt
+    context_ref: str | None = None
+    parent_question_ref: str | None = None
+    confirmation_hash: str | None = None
 
     def as_binding(self) -> AcceptedQuestionBinding:
         return AcceptedQuestionBinding(
@@ -89,6 +95,20 @@ class AcceptedQuestion:
             content_receipt=self.content_receipt,
             question_receipt=self.receipt,
         )
+
+
+class AcceptedManualQuestionContent(Protocol):
+    context_ref: str
+    quest_ref: str
+    parent_question_ref: str
+    content_ref: str
+    content_hash: str
+    schema_ref: str
+    proposal_ref: str
+    proposal_hash: str
+    confirmation_ref: str
+    confirmation_hash: str
+    receipt: AcceptanceReceipt
 
 
 @dataclass(frozen=True)
@@ -200,6 +220,8 @@ class ResearchGraphInterface(Protocol):
 
     def query_quest(self, initialization_id: str) -> AcceptedQuest | None: ...
 
+    def query_quest_by_ref(self, quest_ref: str) -> AcceptedQuest | None: ...
+
     def accept_quest(
         self,
         *,
@@ -216,6 +238,12 @@ class ResearchGraphInterface(Protocol):
 
     def query_question(self, initialization_id: str) -> AcceptedQuestion | None: ...
 
+    def query_question_by_ref(self, question_ref: str) -> AcceptedQuestion | None: ...
+
+    def query_question_tree(
+        self, quest_ref: str | None = None
+    ) -> tuple[AcceptedQuestion, ...]: ...
+
     def accept_root_question(
         self,
         *,
@@ -225,6 +253,16 @@ class ResearchGraphInterface(Protocol):
         content_hash: str,
         schema_ref: str,
         content_receipt: AcceptanceReceipt,
+    ) -> AcceptedQuestion: ...
+
+    def accept_manual_question(
+        self,
+        *,
+        context_ref: str,
+        quest: AcceptedQuest,
+        parent_question: AcceptedQuestion,
+        content: AcceptedManualQuestionContent,
+        confirmation: AcceptanceReceipt,
     ) -> AcceptedQuestion: ...
 
     def verify_quest_receipt(
@@ -244,6 +282,16 @@ class ResearchGraphInterface(Protocol):
         initialization_id: str,
         quest_ref: str,
         question_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_question_receipt(
+        self,
+        *,
+        context_ref: str,
+        quest_ref: str,
+        question_ref: str,
+        parent_question_ref: str | None,
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
@@ -345,6 +393,7 @@ class SQLiteResearchGraphReceiptVerifier:
         idea_content_verifier: IdeaContentReceiptVerifier | None = None,
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
         stage_request_verifier: StageRunRequestVerifier | None = None,
+        manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
     ) -> None:
         self._database = database
         self._confirmation_verifier = confirmation_verifier
@@ -353,6 +402,7 @@ class SQLiteResearchGraphReceiptVerifier:
         self._idea_content_verifier = idea_content_verifier
         self._execution_verifier = execution_verifier
         self._stage_request_verifier = stage_request_verifier
+        self._manual_confirmation_verifier = manual_confirmation_verifier
 
     def verify_quest_receipt(
         self,
@@ -469,6 +519,148 @@ class SQLiteResearchGraphReceiptVerifier:
             receipt=AcceptanceReceipt(
                 issuer="research_memory",
                 kind="question_content_acceptance",
+                receipt_ref=row.content_receipt_ref,
+                subject_ref=row.content_ref,
+                payload_hash=row.content_receipt_hash,
+            ),
+        )
+
+    def verify_question_receipt(
+        self,
+        *,
+        context_ref: str,
+        quest_ref: str,
+        question_ref: str,
+        parent_question_ref: str | None,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        self._verify_question_receipt(
+            context_ref=context_ref,
+            quest_ref=quest_ref,
+            question_ref=question_ref,
+            parent_question_ref=parent_question_ref,
+            receipt=receipt,
+            visited=set(),
+        )
+
+    def _verify_question_receipt(
+        self,
+        *,
+        context_ref: str,
+        quest_ref: str,
+        question_ref: str,
+        parent_question_ref: str | None,
+        receipt: AcceptanceReceipt,
+        visited: set[str],
+    ) -> None:
+        if question_ref in visited:
+            raise OwnerConflict("question_parent_lineage_invalid")
+        visited.add(question_ref)
+        if receipt.kind == QUESTION_RECEIPT_KIND:
+            if parent_question_ref is not None:
+                raise OwnerConflict("root_question_receipt_invalid")
+            self.verify_root_question_receipt(
+                initialization_id=context_ref,
+                quest_ref=quest_ref,
+                question_ref=question_ref,
+                receipt=receipt,
+            )
+            return
+        if (
+            receipt.issuer != RG_OWNER
+            or receipt.kind != MANUAL_QUESTION_RECEIPT_KIND
+            or receipt.subject_ref != question_ref
+            or parent_question_ref is None
+        ):
+            raise OwnerConflict("manual_question_receipt_issuer_invalid")
+        if self._manual_confirmation_verifier is None:
+            raise OwnerConflict("manual_question_confirmation_verifier_unavailable")
+
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT manual.*, quests.initialization_id AS "
+                    "quest_initialization_id FROM rg_manual_questions AS manual "
+                    "JOIN rg_quests AS quests ON quests.quest_ref = manual.quest_ref "
+                    "WHERE manual.context_ref = :context_ref AND "
+                    "manual.question_ref = :question_ref"
+                ),
+                {"context_ref": context_ref, "question_ref": question_ref},
+            ).first()
+            parent_kind, parent_row = _query_question_record(
+                connection, parent_question_ref
+            )
+            quest_row = connection.execute(
+                text("SELECT * FROM rg_quests WHERE quest_ref = :quest_ref"),
+                {"quest_ref": quest_ref},
+            ).first()
+        if row is None or (
+            row.quest_ref != quest_ref
+            or row.parent_question_ref != parent_question_ref
+            or row.receipt_ref != receipt.receipt_ref
+            or row.receipt_hash != receipt.payload_hash
+            or row.receipt_hash != _manual_question_receipt_hash(row)
+        ):
+            raise OwnerConflict("manual_question_receipt_invalid")
+        if quest_row is None:
+            raise OwnerConflict("manual_question_quest_not_present")
+        quest = _accepted_quest(quest_row)
+        self.verify_quest_receipt(
+            initialization_id=quest.initialization_id,
+            quest_ref=quest.quest_ref,
+            proposal_ref=quest.proposal_ref,
+            proposal_hash=quest.proposal_hash,
+            confirmation_ref=quest.confirmation.receipt_ref,
+            receipt=quest.receipt,
+        )
+        if parent_row is None or parent_row.quest_ref != quest_ref:
+            raise OwnerConflict("manual_question_parent_not_present")
+        parent_context_ref, parent_parent_ref, parent_receipt = (
+            _question_record_receipt(parent_kind, parent_row)
+        )
+        if (
+            row.parent_question_receipt_ref != parent_receipt.receipt_ref
+            or row.parent_question_receipt_hash != parent_receipt.payload_hash
+        ):
+            raise OwnerConflict("manual_question_parent_stale")
+        self._verify_question_receipt(
+            context_ref=parent_context_ref,
+            quest_ref=quest_ref,
+            question_ref=parent_question_ref,
+            parent_question_ref=parent_parent_ref,
+            receipt=parent_receipt,
+            visited=visited,
+        )
+        confirmation = AcceptanceReceipt(
+            issuer="human_collaboration",
+            kind="manual_question_proposal_confirmation",
+            receipt_ref=row.confirmation_ref,
+            subject_ref=row.proposal_ref,
+            payload_hash=row.confirmation_hash,
+        )
+        self._manual_confirmation_verifier.verify_manual_question_confirmation(
+            context_ref=row.context_ref,
+            quest_ref=row.quest_ref,
+            parent_question_ref=row.parent_question_ref,
+            proposal_ref=row.proposal_ref,
+            proposal_hash=row.proposal_hash,
+            content_hash=row.content_hash,
+            receipt=confirmation,
+        )
+        self._content_verifier.verify_manual_question_content_receipt(
+            context_ref=row.context_ref,
+            quest_ref=row.quest_ref,
+            parent_question_ref=row.parent_question_ref,
+            content_ref=row.content_ref,
+            content_hash=row.content_hash,
+            schema_ref=row.schema_ref,
+            proposal_ref=row.proposal_ref,
+            proposal_hash=row.proposal_hash,
+            confirmation_ref=row.confirmation_ref,
+            confirmation_hash=row.confirmation_hash,
+            receipt=AcceptanceReceipt(
+                issuer="research_memory",
+                kind="manual_question_content_acceptance",
                 receipt_ref=row.content_receipt_ref,
                 subject_ref=row.content_ref,
                 payload_hash=row.content_receipt_hash,
@@ -809,6 +1001,7 @@ class SQLiteResearchGraph:
         idea_content_verifier: IdeaContentReceiptVerifier | None = None,
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
         stage_request_verifier: StageRunRequestVerifier | None = None,
+        manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -819,6 +1012,7 @@ class SQLiteResearchGraph:
         self._idea_content_verifier = idea_content_verifier
         self._execution_verifier = execution_verifier
         self._stage_request_verifier = stage_request_verifier
+        self._manual_confirmation_verifier = manual_confirmation_verifier
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
 
     def query_snapshot(self) -> OwnerSnapshot:
@@ -922,6 +1116,25 @@ class SQLiteResearchGraph:
         accepted = _accepted_quest(row)
         self._receipt_verifier.verify_quest_receipt(
             initialization_id=initialization_id,
+            quest_ref=accepted.quest_ref,
+            proposal_ref=accepted.proposal_ref,
+            proposal_hash=accepted.proposal_hash,
+            confirmation_ref=accepted.confirmation.receipt_ref,
+            receipt=accepted.receipt,
+        )
+        return accepted
+
+    def query_quest_by_ref(self, quest_ref: str) -> AcceptedQuest | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text("SELECT * FROM rg_quests WHERE quest_ref = :quest_ref"),
+                {"quest_ref": quest_ref},
+            ).first()
+        if row is None:
+            return None
+        accepted = _accepted_quest(row)
+        self._receipt_verifier.verify_quest_receipt(
+            initialization_id=accepted.initialization_id,
             quest_ref=accepted.quest_ref,
             proposal_ref=accepted.proposal_ref,
             proposal_hash=accepted.proposal_hash,
@@ -1051,6 +1264,51 @@ class SQLiteResearchGraph:
         )
         return accepted
 
+    def query_question_by_ref(self, question_ref: str) -> AcceptedQuestion | None:
+        with self._database.read() as connection:
+            kind, row = _query_question_record(connection, question_ref)
+        if row is None:
+            return None
+        accepted = (
+            _accepted_question(row)
+            if kind == "root"
+            else _accepted_manual_question(row)
+        )
+        assert accepted.context_ref is not None
+        self._receipt_verifier.verify_question_receipt(
+            context_ref=accepted.context_ref,
+            quest_ref=accepted.quest_ref,
+            question_ref=accepted.question_ref,
+            parent_question_ref=accepted.parent_question_ref,
+            receipt=accepted.receipt,
+        )
+        return accepted
+
+    def query_question_tree(
+        self, quest_ref: str | None = None
+    ) -> tuple[AcceptedQuestion, ...]:
+        root_filter = "" if quest_ref is None else " WHERE quest_ref = :quest_ref"
+        manual_filter = "" if quest_ref is None else " WHERE quest_ref = :quest_ref"
+        with self._database.read() as connection:
+            refs = connection.execute(
+                text(
+                    "SELECT question_ref, accepted_at FROM rg_questions"
+                    + root_filter
+                    + " UNION ALL SELECT question_ref, accepted_at FROM "
+                    "rg_manual_questions"
+                    + manual_filter
+                    + " ORDER BY accepted_at, question_ref"
+                ),
+                {} if quest_ref is None else {"quest_ref": quest_ref},
+            ).all()
+        questions: list[AcceptedQuestion] = []
+        for row in refs:
+            question = self.query_question_by_ref(str(row.question_ref))
+            if question is None:
+                raise OwnerConflict("question_tree_identity_missing")
+            questions.append(question)
+        return tuple(questions)
+
     def accept_root_question(
         self,
         *,
@@ -1150,11 +1408,195 @@ class SQLiteResearchGraph:
             raise OwnerConflict("root_question_receipt_missing_after_commit")
         return accepted
 
+    def accept_manual_question(
+        self,
+        *,
+        context_ref: str,
+        quest: AcceptedQuest,
+        parent_question: AcceptedQuestion,
+        content: AcceptedManualQuestionContent,
+        confirmation: AcceptanceReceipt,
+    ) -> AcceptedQuestion:
+        if self._manual_confirmation_verifier is None:
+            raise OwnerConflict("manual_question_confirmation_verifier_unavailable")
+        if (
+            not context_ref
+            or parent_question.context_ref is None
+            or parent_question.question_ref == ""
+            or canonical_hash(quest.draft) != quest.draft_hash
+        ):
+            raise OwnerConflict("manual_question_acceptance_lineage_invalid")
+        if (
+            parent_question.quest_ref != quest.quest_ref
+            or content.context_ref != context_ref
+            or content.quest_ref != quest.quest_ref
+            or content.parent_question_ref != parent_question.question_ref
+            or content.confirmation_ref != confirmation.receipt_ref
+            or content.confirmation_hash != confirmation.payload_hash
+            or confirmation.issuer != "human_collaboration"
+            or confirmation.kind != "manual_question_proposal_confirmation"
+            or confirmation.subject_ref != content.proposal_ref
+        ):
+            raise OwnerConflict("manual_question_acceptance_binding_invalid")
+        self._receipt_verifier.verify_quest_receipt(
+            initialization_id=quest.initialization_id,
+            quest_ref=quest.quest_ref,
+            proposal_ref=quest.proposal_ref,
+            proposal_hash=quest.proposal_hash,
+            confirmation_ref=quest.confirmation.receipt_ref,
+            receipt=quest.receipt,
+        )
+        self._receipt_verifier.verify_question_receipt(
+            context_ref=parent_question.context_ref,
+            quest_ref=quest.quest_ref,
+            question_ref=parent_question.question_ref,
+            parent_question_ref=parent_question.parent_question_ref,
+            receipt=parent_question.receipt,
+        )
+        self._manual_confirmation_verifier.verify_manual_question_confirmation(
+            context_ref=context_ref,
+            quest_ref=quest.quest_ref,
+            parent_question_ref=parent_question.question_ref,
+            proposal_ref=content.proposal_ref,
+            proposal_hash=content.proposal_hash,
+            content_hash=content.content_hash,
+            receipt=confirmation,
+        )
+        self._content_verifier.verify_manual_question_content_receipt(
+            context_ref=context_ref,
+            quest_ref=quest.quest_ref,
+            parent_question_ref=parent_question.question_ref,
+            content_ref=content.content_ref,
+            content_hash=content.content_hash,
+            schema_ref=content.schema_ref,
+            proposal_ref=content.proposal_ref,
+            proposal_hash=content.proposal_hash,
+            confirmation_ref=content.confirmation_ref,
+            confirmation_hash=content.confirmation_hash,
+            receipt=content.receipt,
+        )
+        bindings = {
+            "context_ref": context_ref,
+            "quest_ref": quest.quest_ref,
+            "parent_question_ref": parent_question.question_ref,
+            "parent_question_receipt_ref": parent_question.receipt.receipt_ref,
+            "parent_question_receipt_hash": parent_question.receipt.payload_hash,
+            "content_ref": content.content_ref,
+            "content_hash": content.content_hash,
+            "schema_ref": content.schema_ref,
+            "content_receipt_ref": content.receipt.receipt_ref,
+            "content_receipt_hash": content.receipt.payload_hash,
+            "proposal_ref": content.proposal_ref,
+            "proposal_hash": content.proposal_hash,
+            "confirmation_ref": confirmation.receipt_ref,
+            "confirmation_hash": confirmation.payload_hash,
+        }
+        with self._database.write() as connection:
+            quest_row = connection.execute(
+                text("SELECT * FROM rg_quests WHERE quest_ref = :quest_ref"),
+                {"quest_ref": quest.quest_ref},
+            ).first()
+            if quest_row is None:
+                raise OwnerConflict("manual_question_quest_not_present")
+            current_quest = _accepted_quest(quest_row)
+            if (
+                current_quest.initialization_id != quest.initialization_id
+                or current_quest.draft_hash != quest.draft_hash
+                or current_quest.receipt != quest.receipt
+            ):
+                raise OwnerConflict("manual_question_quest_stale")
+
+            parent_kind, parent_row = _query_question_record(
+                connection, parent_question.question_ref
+            )
+            if parent_row is None or parent_row.quest_ref != quest.quest_ref:
+                raise OwnerConflict("manual_question_parent_not_present")
+            parent_context_ref, parent_parent_ref, parent_receipt = (
+                _question_record_receipt(parent_kind, parent_row)
+            )
+            if (
+                parent_context_ref != parent_question.context_ref
+                or parent_parent_ref != parent_question.parent_question_ref
+                or parent_receipt != parent_question.receipt
+            ):
+                raise OwnerConflict("manual_question_parent_stale")
+
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM rg_manual_questions WHERE "
+                    "context_ref = :context_ref"
+                ),
+                {"context_ref": context_ref},
+            ).first()
+            if existing is not None:
+                if any(
+                    getattr(existing, key) != value for key, value in bindings.items()
+                ) or existing.receipt_hash != _manual_question_receipt_hash(existing):
+                    raise OwnerConflict("manual_question_acceptance_conflict")
+                return _accepted_manual_question(
+                    existing, initialization_id=quest.initialization_id
+                )
+
+            question_ref = new_ref("question")
+            receipt_ref = new_ref("rg_manual_question_receipt")
+            receipt_hash = _receipt_hash(
+                MANUAL_QUESTION_RECEIPT_KIND, question_ref, bindings
+            )
+            accepted_at = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO rg_manual_questions (question_ref, context_ref, "
+                    "quest_ref, parent_question_ref, parent_question_receipt_ref, "
+                    "parent_question_receipt_hash, content_ref, content_hash, "
+                    "schema_ref, content_receipt_ref, content_receipt_hash, "
+                    "proposal_ref, proposal_hash, confirmation_ref, "
+                    "confirmation_hash, receipt_ref, receipt_hash, "
+                    "accepted_at) VALUES (:question_ref, :context_ref, :quest_ref, "
+                    ":parent_question_ref, :parent_question_receipt_ref, "
+                    ":parent_question_receipt_hash, :content_ref, :content_hash, "
+                    ":schema_ref, :content_receipt_ref, :content_receipt_hash, "
+                    ":proposal_ref, :proposal_hash, :confirmation_ref, "
+                    ":confirmation_hash, :receipt_ref, "
+                    ":receipt_hash, :accepted_at)"
+                ),
+                {
+                    **bindings,
+                    "question_ref": question_ref,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "accepted_at": accepted_at,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_graph_state SET revision = revision + 1, "
+                    "question_count = question_count + 1 WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "research_graph.manual_question_accepted",
+                {
+                    "context_ref": context_ref,
+                    "quest_ref": quest.quest_ref,
+                    "parent_question_ref": parent_question.question_ref,
+                    "question_ref": question_ref,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        accepted = self.query_question_by_ref(question_ref)
+        if accepted is None:
+            raise OwnerConflict("manual_question_receipt_missing_after_commit")
+        return accepted
+
     def verify_quest_receipt(self, **values) -> None:
         self._receipt_verifier.verify_quest_receipt(**values)
 
     def verify_root_question_receipt(self, **values) -> None:
         self._receipt_verifier.verify_root_question_receipt(**values)
+
+    def verify_question_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_question_receipt(**values)
 
     def verify_accepted_question_binding(
         self, binding: AcceptedQuestionBinding
@@ -1978,6 +2420,84 @@ def _question_receipt_hash(row) -> str:
     )
 
 
+def _manual_question_receipt_hash(row) -> str:
+    return _receipt_hash(
+        MANUAL_QUESTION_RECEIPT_KIND,
+        row.question_ref,
+        {
+            "context_ref": row.context_ref,
+            "quest_ref": row.quest_ref,
+            "parent_question_ref": row.parent_question_ref,
+            "parent_question_receipt_ref": row.parent_question_receipt_ref,
+            "parent_question_receipt_hash": row.parent_question_receipt_hash,
+            "content_ref": row.content_ref,
+            "content_hash": row.content_hash,
+            "schema_ref": row.schema_ref,
+            "content_receipt_ref": row.content_receipt_ref,
+            "content_receipt_hash": row.content_receipt_hash,
+            "proposal_ref": row.proposal_ref,
+            "proposal_hash": row.proposal_hash,
+            "confirmation_ref": row.confirmation_ref,
+            "confirmation_hash": row.confirmation_hash,
+        },
+    )
+
+
+def _query_question_record(connection, question_ref: str):
+    root = connection.execute(
+        text("SELECT * FROM rg_questions WHERE question_ref = :question_ref"),
+        {"question_ref": question_ref},
+    ).first()
+    manual = connection.execute(
+        text(
+            "SELECT manual.*, quests.initialization_id AS quest_initialization_id "
+            "FROM rg_manual_questions AS manual JOIN rg_quests AS quests ON "
+            "quests.quest_ref = manual.quest_ref WHERE manual.question_ref = "
+            ":question_ref"
+        ),
+        {"question_ref": question_ref},
+    ).first()
+    if root is not None and manual is not None:
+        raise OwnerConflict("question_identity_conflict")
+    if root is not None:
+        return "root", root
+    if manual is not None:
+        return "manual", manual
+    return None, None
+
+
+def _question_record_receipt(kind: str | None, row):
+    if kind == "root":
+        if row.receipt_hash != _question_receipt_hash(row):
+            raise OwnerConflict("root_question_receipt_invalid")
+        return (
+            row.initialization_id,
+            None,
+            AcceptanceReceipt(
+                issuer=RG_OWNER,
+                kind=QUESTION_RECEIPT_KIND,
+                receipt_ref=row.receipt_ref,
+                subject_ref=row.question_ref,
+                payload_hash=row.receipt_hash,
+            ),
+        )
+    if kind == "manual":
+        if row.receipt_hash != _manual_question_receipt_hash(row):
+            raise OwnerConflict("manual_question_receipt_invalid")
+        return (
+            row.context_ref,
+            row.parent_question_ref,
+            AcceptanceReceipt(
+                issuer=RG_OWNER,
+                kind=MANUAL_QUESTION_RECEIPT_KIND,
+                receipt_ref=row.receipt_ref,
+                subject_ref=row.question_ref,
+                payload_hash=row.receipt_hash,
+            ),
+        )
+    raise OwnerConflict("question_identity_missing")
+
+
 def _evaluate_idea_outcome(
     question_content: dict[str, object], outcome: dict[str, object]
 ) -> tuple[str, str | None, tuple[str, ...]]:
@@ -2104,6 +2624,11 @@ def _idea_decision(row) -> IdeaOutcomeDecision:
 
 
 def _accepted_quest(row) -> AcceptedQuest:
+    _verify_quest_goal_integrity(row)
+    try:
+        draft = decoded_object(row.goal_json)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("quest_receipt_invalid") from error
     return AcceptedQuest(
         initialization_id=row.initialization_id,
         quest_ref=row.quest_ref,
@@ -2113,6 +2638,7 @@ def _accepted_quest(row) -> AcceptedQuest:
         proposal_hash=row.proposal_hash,
         preview_ref=row.preview_ref,
         preview_hash=row.preview_hash,
+        draft=draft,
         confirmation=AcceptanceReceipt(
             issuer="human_collaboration",
             kind="quest_bundle_confirmation",
@@ -2153,6 +2679,44 @@ def _accepted_question(row) -> AcceptedQuestion:
             subject_ref=row.question_ref,
             payload_hash=row.receipt_hash,
         ),
+        context_ref=row.initialization_id,
+        parent_question_ref=None,
+    )
+
+
+def _accepted_manual_question(
+    row, *, initialization_id: str | None = None
+) -> AcceptedQuestion:
+    resolved_initialization_id = getattr(
+        row, "quest_initialization_id", initialization_id
+    )
+    if not isinstance(resolved_initialization_id, str) or not resolved_initialization_id:
+        raise OwnerConflict("manual_question_quest_not_present")
+    return AcceptedQuestion(
+        initialization_id=resolved_initialization_id,
+        question_ref=row.question_ref,
+        quest_ref=row.quest_ref,
+        content_ref=row.content_ref,
+        content_hash=row.content_hash,
+        schema_ref=row.schema_ref,
+        content_receipt=AcceptanceReceipt(
+            issuer="research_memory",
+            kind="manual_question_content_acceptance",
+            receipt_ref=row.content_receipt_ref,
+            subject_ref=row.content_ref,
+            payload_hash=row.content_receipt_hash,
+        ),
+        confirmation_ref=row.confirmation_ref,
+        receipt=AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=MANUAL_QUESTION_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.question_ref,
+            payload_hash=row.receipt_hash,
+        ),
+        context_ref=row.context_ref,
+        parent_question_ref=row.parent_question_ref,
+        confirmation_hash=row.confirmation_hash,
     )
 
 
@@ -2164,6 +2728,7 @@ def create_research_graph_receipt_verifier(
     idea_content_verifier: IdeaContentReceiptVerifier | None = None,
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
     stage_request_verifier: StageRunRequestVerifier | None = None,
+    manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
 ) -> SQLiteResearchGraphReceiptVerifier:
     return SQLiteResearchGraphReceiptVerifier(
         database,
@@ -2173,6 +2738,7 @@ def create_research_graph_receipt_verifier(
         idea_content_verifier,
         execution_verifier,
         stage_request_verifier,
+        manual_confirmation_verifier,
     )
 
 
@@ -2186,6 +2752,7 @@ def create_research_graph_interface(
     idea_content_verifier: IdeaContentReceiptVerifier | None = None,
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
     stage_request_verifier: StageRunRequestVerifier | None = None,
+    manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
 ) -> ResearchGraphInterface:
     return SQLiteResearchGraph(
         database,
@@ -2197,4 +2764,5 @@ def create_research_graph_interface(
         idea_content_verifier,
         execution_verifier,
         stage_request_verifier,
+        manual_confirmation_verifier,
     )

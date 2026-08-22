@@ -1,3 +1,11 @@
+import type {
+  ManualCreationAcceptedMaterialBindingView,
+  ManualCreationDraftingTurn,
+  ManualCreationReceiptState,
+  ManualQuestionContent,
+  ManualQuestionCreationView,
+} from "./ManualCreation";
+
 export type ReadinessCheck = {
   name: string;
   status: "ready" | "stale" | "unavailable";
@@ -318,6 +326,9 @@ export type LiteratureSnapshot = {
   paper_count: number;
   fulltext_count: number;
   receipt: Extract<ReceiptState, { status: "accepted" }>;
+  creation_context_kind?: "manual_question_creation";
+  creation_context_ref?: string;
+  quest_ref?: string;
 };
 
 export type DeepFetchProjection = {
@@ -470,6 +481,178 @@ export type QuestCreationView = {
   memory_ref?: string;
   question_ref?: string;
   cycle_ref?: string;
+};
+
+export type QuestionTreeItem = {
+  question_ref: string;
+  quest_ref: string;
+  parent_question_ref: string | null;
+  title: string | null;
+  unknown_statement: string | null;
+  content_ref: string;
+  content_hash: string;
+  schema_ref: string;
+  question_receipt_ref: string;
+};
+
+export type QuestionTreeProjection =
+  | {
+      status: "ready";
+      items: QuestionTreeItem[];
+      reason: null;
+    }
+  | {
+      status: "unavailable";
+      reason: { code: string; message?: string };
+      items: [];
+    }
+  | {
+      status: "capability_unavailable";
+      reason: { code: string; message?: string };
+      items: [];
+    };
+
+export type ManualQuestionCreationCapability =
+  | {
+      status: "ready";
+      creation_mode: "ManualCreation";
+      deepfetch: QuestCapability;
+      explicit_waiver: QuestCapability;
+    }
+  | {
+      status: "capability_unavailable";
+      creation_mode: "ManualCreation";
+      reason: { code: string; message?: string };
+      deepfetch?: never;
+      explicit_waiver?: never;
+    };
+
+export type ManualAcceptedMaterialBinding = {
+  asset_ref: string;
+  version_ref: string;
+  content_hash: string;
+  manifest_hash: string;
+  receipt: AssetReceipt & { status: "accepted" };
+};
+
+export type ManualRawReceiptState =
+  | { status: "not_attempted" | "pending"; reason?: { code: string; upstream_step?: string } }
+  | ({ status: "accepted" } & Partial<AssetReceipt>)
+  | {
+      status: "rejected" | "stale" | "unavailable";
+      reason: { code: string; upstream_step?: string };
+    };
+
+export type ManualQuestionCreationRawView = {
+  schema_ref: "meta-research/manual-question-creation/v1";
+  context_ref: string;
+  creation_mode: "ManualCreation";
+  generation: number;
+  quest_ref: string;
+  quest_initialization_id: string;
+  parent_question_ref: string;
+  status:
+    | "draft"
+    | "seed_confirmed"
+    | "research_pending"
+    | "research_ready"
+    | "confirmed"
+    | "recovering"
+    | "completed"
+    | "cancelled";
+  seed: null | {
+    ref: string;
+    hash: string;
+    value: {
+      intent: string;
+      fields: QuestionContent;
+      accepted_material_bindings: ManualAcceptedMaterialBinding[];
+      deepfetch_preference: "use" | "skip" | "later";
+    };
+    receipt: AssetReceipt & { status: "accepted" };
+  };
+  research_path: {
+    status: "not_selected" | "pending" | "queued" | "running" | "ready" | "waived" | "failed" | "cancelled";
+    basis_hash?: string | null;
+    deepfetch: null | {
+      request_ref: string;
+      status: "pending" | "queued" | "running" | "succeeded" | "failed" | "cancelled";
+      run_ref: string | null;
+      snapshot_ref: string | null;
+      literature_snapshot?: null | {
+        snapshot_ref?: string;
+        request_ref?: string;
+        creation_context_kind?: "manual_question_creation";
+        creation_context_ref?: string;
+        quest_ref?: string;
+        receipt: AssetReceipt & { status: "accepted" };
+      };
+      failure: null | { code: string };
+    };
+    waiver: null | {
+      status: "accepted";
+      ref: string;
+      decision_hash: string;
+      hash: string;
+      receipt: AssetReceipt & { status: "accepted" };
+    };
+  };
+  proposal: null | {
+    ref: string;
+    revision: number;
+    hash: string;
+    basis_hash: string;
+    content: QuestionContent;
+    status: "current" | "confirmed" | "stale";
+  };
+  confirmation: null | {
+    proposal_ref: string;
+    proposal_hash: string;
+    hash: string;
+    receipt: AssetReceipt & { status: "accepted" };
+  };
+  drafting_session: null | {
+    ref: string;
+    status: "open" | "closed";
+    turns: Array<{
+      ref: string;
+      ordinal: number;
+      basis_hash: string;
+      user_content: string;
+      assistant_status: "queued" | "running" | "completed" | "unavailable" | "failed";
+      assistant_content: string | null;
+      reason: null | { code: string };
+    }>;
+  };
+  receipts: {
+    seed: ManualRawReceiptState;
+    research: ManualRawReceiptState;
+    confirmation: ManualRawReceiptState;
+    content: ManualRawReceiptState;
+    question: ManualRawReceiptState;
+  };
+  recovery: null | {
+    first_missing_step: string | null;
+    attempt_count: number;
+    reason: null | { code: string };
+    next_retry_at: number | null;
+  };
+  question_anchor: null | {
+    question_ref: string;
+    quest_ref: string;
+    parent_question_ref: string;
+    content_ref: string;
+    content_hash: string;
+    schema_ref: string;
+    content_receipt_ref: string;
+    question_receipt_ref: string;
+  };
+  cancellation: null | (AssetReceipt & { status: "accepted" });
+  capabilities: {
+    manual_creation: QuestCapability;
+    deepfetch: QuestCapability;
+    explicit_waiver: QuestCapability;
+  };
 };
 
 export type IdeaReceipt = {
@@ -632,10 +815,234 @@ export type PublicSnapshot = {
     accepted_material_basis: QuestCapability;
     first_question_deepfetch: QuestCapability;
   };
+  question_tree: QuestionTreeProjection;
+  manual_question_creation: ManualQuestionCreationCapability;
   research_assets: ResearchAssetsView;
   idea_stage?: IdeaStageProjection | null;
   unavailable: UnavailableCapability[];
 };
+
+function adaptManualReceipt(receipt: ManualRawReceiptState): ManualCreationReceiptState {
+  if (receipt.status === "accepted") {
+    if (
+      typeof receipt.issuer !== "string" ||
+      typeof receipt.kind !== "string" ||
+      typeof receipt.receipt_ref !== "string" ||
+      typeof receipt.subject_ref !== "string" ||
+      typeof receipt.payload_hash !== "string"
+    ) {
+      return {
+        status: "unavailable",
+        reason: { code: "accepted_receipt_identity_unavailable" },
+      };
+    }
+    return {
+      status: "accepted",
+      issuer: receipt.issuer,
+      kind: receipt.kind,
+      receipt_ref: receipt.receipt_ref,
+      subject_ref: receipt.subject_ref,
+      payload_hash: receipt.payload_hash,
+    };
+  }
+  if (["rejected", "stale", "unavailable"].includes(receipt.status)) {
+    const rejected = receipt as Extract<
+      ManualRawReceiptState,
+      { status: "rejected" | "stale" | "unavailable" }
+    >;
+    return { status: rejected.status, reason: { ...rejected.reason } };
+  }
+  return {
+    status: "not_attempted",
+    reason: receipt.reason
+      ? { ...receipt.reason }
+      : receipt.status === "pending"
+        ? { code: "owner_receipt_pending" }
+        : undefined,
+  };
+}
+
+function adaptManualContent(content: QuestionContent): ManualQuestionContent {
+  return {
+    title: content.title,
+    unknown_statement: content.unknown_statement,
+    answer_shape: content.answer_shape,
+    applicability_scope: content.applicability_scope,
+    background_context: content.background_context,
+    requirements_constraints: content.requirements_constraints,
+  };
+}
+
+function adaptManualMaterialBinding(
+  binding: ManualAcceptedMaterialBinding,
+): ManualCreationAcceptedMaterialBindingView {
+  return {
+    asset_ref: binding.asset_ref,
+    version_ref: binding.version_ref,
+    content_hash: binding.content_hash,
+    manifest_hash: binding.manifest_hash,
+    receipt: {
+      status: "accepted",
+      issuer: binding.receipt.issuer,
+      kind: binding.receipt.kind,
+      receipt_ref: binding.receipt.receipt_ref,
+      subject_ref: binding.receipt.subject_ref,
+      payload_hash: binding.receipt.payload_hash,
+    },
+  };
+}
+
+function adaptManualStatus(
+  status: ManualQuestionCreationRawView["status"],
+): ManualQuestionCreationView["status"] {
+  const statuses: Record<
+    ManualQuestionCreationRawView["status"],
+    ManualQuestionCreationView["status"]
+  > = {
+    draft: "seed_draft",
+    seed_confirmed: "seed_confirmed",
+    research_pending: "drafting",
+    research_ready: "proposal_ready",
+    confirmed: "confirming",
+    recovering: "recovering",
+    completed: "completed",
+    cancelled: "cancelled",
+  };
+  return statuses[status];
+}
+
+function adaptManualTurns(
+  session: ManualQuestionCreationRawView["drafting_session"],
+): ManualCreationDraftingTurn[] {
+  if (!session) return [];
+  return session.turns.flatMap((turn) => {
+    const rows: ManualCreationDraftingTurn[] = [
+      {
+        turn_ref: `${turn.ref}:user`,
+        role: "user",
+        content: turn.user_content,
+        status: "completed",
+      },
+    ];
+    if (turn.assistant_content !== null) {
+      rows.push({
+        turn_ref: `${turn.ref}:assistant`,
+        role: "assistant",
+        content: turn.assistant_content,
+        status: ["queued", "running", "completed"].includes(turn.assistant_status)
+          ? turn.assistant_status as "queued" | "running" | "completed"
+          : "failed",
+      });
+    }
+    return rows;
+  });
+}
+
+export function adaptManualQuestionCreation(
+  raw: ManualQuestionCreationRawView,
+  labels: {
+    quest_title?: string | null;
+    parent_question_title?: string | null;
+    research_receipt?: (AssetReceipt & { status: "accepted" }) | null;
+  } = {},
+): ManualQuestionCreationView {
+  const turns = adaptManualTurns(raw.drafting_session);
+  const assistantWaiting = raw.drafting_session?.turns.some((turn) =>
+    ["queued", "running"].includes(turn.assistant_status),
+  ) ?? false;
+  const rawDeepFetch = raw.research_path.deepfetch;
+  const deepfetchStatus = rawDeepFetch?.status === "succeeded"
+    ? "completed"
+    : rawDeepFetch?.status === "pending"
+      ? "queued"
+      : rawDeepFetch?.status ?? "not_started";
+  const deepfetch = rawDeepFetch === null
+    ? null
+    : {
+        status: deepfetchStatus,
+        run_ref: rawDeepFetch.run_ref,
+        receipt: adaptManualReceipt(
+          rawDeepFetch.literature_snapshot?.receipt
+            ?? labels.research_receipt
+            ?? raw.receipts.research,
+        ),
+        reason: rawDeepFetch.failure,
+      } as ManualQuestionCreationView["research"]["deepfetch"];
+  const failure = raw.recovery?.reason ?? (
+    raw.capabilities.manual_creation.status === "ready"
+      ? null
+      : raw.capabilities.manual_creation.reason
+  );
+
+  return {
+    creation_id: raw.context_ref,
+    status: adaptManualStatus(raw.status),
+    quest_ref: raw.quest_ref,
+    quest_title: labels.quest_title ?? null,
+    parent_question_ref: raw.parent_question_ref,
+    parent_question_title: labels.parent_question_title ?? null,
+    seed: {
+      ref: raw.seed?.ref ?? null,
+      hash: raw.seed?.hash ?? null,
+      value: raw.seed
+        ? {
+            intent: raw.seed.value.intent,
+            fields: adaptManualContent(raw.seed.value.fields),
+            accepted_material_bindings: raw.seed.value.accepted_material_bindings.map(
+              adaptManualMaterialBinding,
+            ),
+            deepfetch_preference: raw.seed.value.deepfetch_preference,
+          }
+        : null,
+      receipt: adaptManualReceipt(raw.receipts.seed),
+    },
+    research: {
+      decision: raw.research_path.waiver
+        ? "waiver"
+        : raw.research_path.deepfetch
+          ? "deepfetch"
+          : "undecided",
+      basis_hash: raw.research_path.basis_hash ?? null,
+      deepfetch,
+      waiver_receipt: raw.research_path.waiver
+        ? adaptManualReceipt(raw.research_path.waiver.receipt)
+        : { status: "not_attempted" },
+    },
+    drafting_session: {
+      session_ref: raw.drafting_session?.ref ?? null,
+      status: raw.drafting_session === null
+        ? "inactive"
+        : raw.drafting_session.status === "closed"
+          ? "closed"
+          : assistantWaiting
+            ? "waiting"
+            : "ready",
+      turns,
+    },
+    proposal: raw.proposal
+      ? {
+          ref: raw.proposal.ref,
+          hash: raw.proposal.hash,
+          content: adaptManualContent(raw.proposal.content),
+          status: raw.proposal.status,
+        }
+      : null,
+    receipts: {
+      proposal_confirmation: adaptManualReceipt(raw.receipts.confirmation),
+      question_content: adaptManualReceipt(raw.receipts.content),
+      question_identity: adaptManualReceipt(raw.receipts.question),
+    },
+    question_anchor: raw.question_anchor
+      ? {
+          ref: raw.question_anchor.question_ref,
+          question_ref: raw.question_anchor.question_ref,
+          content_ref: raw.question_anchor.content_ref,
+          content_hash: raw.question_anchor.content_hash,
+        }
+      : null,
+    failure: failure ? { code: failure.code } : null,
+  };
+}
 
 export class ProductError extends Error {
   constructor(public readonly code: string) {
@@ -653,6 +1060,144 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
     throw new ProductError(`snapshot_unavailable:${response.status}`);
   }
   return (await response.json()) as PublicSnapshot;
+}
+
+export function fetchLiteratureSnapshot(
+  snapshotRef: string,
+  signal?: AbortSignal,
+): Promise<LiteratureSnapshot> {
+  return readJson(
+    `/api/v1/literature-snapshots/${encodeURIComponent(snapshotRef)}`,
+    signal,
+  );
+}
+
+export function openManualQuestionCreation(
+  questRef: string,
+  parentQuestionRef: string,
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson("/api/v1/manual-question-creations", "POST", {
+    quest_ref: questRef,
+    parent_question_ref: parentQuestionRef,
+  });
+}
+
+export function fetchCurrentManualQuestionCreation(
+  questRef: string,
+  parentQuestionRef: string,
+  signal?: AbortSignal,
+): Promise<ManualQuestionCreationRawView | null> {
+  const parameters = new URLSearchParams({
+    quest_ref: questRef,
+    parent_question_ref: parentQuestionRef,
+  });
+  return readJson(`/api/v1/manual-question-creations/current?${parameters}`, signal);
+}
+
+export function fetchManualQuestionCreation(
+  contextRef: string,
+  signal?: AbortSignal,
+): Promise<ManualQuestionCreationRawView> {
+  return readJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}`,
+    signal,
+  );
+}
+
+export function confirmManualCreationSeed(
+  contextRef: string,
+  seed: {
+    intent: string;
+    fields: ManualQuestionContent;
+    accepted_material_bindings: ManualAcceptedMaterialBinding[];
+    deepfetch_preference: "use" | "skip" | "later";
+  },
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}/seed-confirmation`,
+    "POST",
+    { seed },
+  );
+}
+
+export function startManualCreationDeepFetch(
+  contextRef: string,
+  expectedSeedRef: string,
+  expectedSeedHash: string,
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}/deepfetch`,
+    "POST",
+    {
+      expected_seed_ref: expectedSeedRef,
+      expected_seed_hash: expectedSeedHash,
+    },
+  );
+}
+
+export function confirmManualDeepFetchWaiver(
+  contextRef: string,
+  expectedSeedRef: string,
+  expectedSeedHash: string,
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}/deepfetch-waiver`,
+    "POST",
+    {
+      expected_seed_ref: expectedSeedRef,
+      expected_seed_hash: expectedSeedHash,
+    },
+  );
+}
+
+export function sendManualDraftingMessage(
+  contextRef: string,
+  expectedBasisHash: string,
+  message: string,
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}/drafting-session/messages`,
+    "POST",
+    { expected_basis_hash: expectedBasisHash, message },
+  );
+}
+
+export function saveManualQuestionProposal(
+  contextRef: string,
+  input: {
+    expected_basis_hash: string;
+    expected_proposal_ref: string | null;
+    expected_proposal_hash: string | null;
+    content: ManualQuestionContent;
+  },
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}/proposal`,
+    "PUT",
+    input,
+  );
+}
+
+export function confirmManualQuestionProposal(
+  contextRef: string,
+  proposalRef: string,
+  proposalHash: string,
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}/proposal-confirmation`,
+    "POST",
+    { proposal_ref: proposalRef, proposal_hash: proposalHash },
+  );
+}
+
+export function cancelManualQuestionCreation(
+  contextRef: string,
+): Promise<ManualQuestionCreationRawView> {
+  return writeJson(
+    `/api/v1/manual-question-creations/${encodeURIComponent(contextRef)}/cancel`,
+    "POST",
+    {},
+  );
 }
 
 export async function fetchResearchAssets(
@@ -1103,6 +1648,20 @@ export function followProjection(
     "human_collaboration.quest_initialization_completed",
     "human_collaboration.quest_dispatch_rejected",
     "human_collaboration.quest_dispatch_recovery_started",
+    "human_collaboration.manual_question_creation_opened",
+    "human_collaboration.manual_creation_seed_confirmed",
+    "human_collaboration.manual_deepfetch_requested",
+    "human_collaboration.manual_deepfetch_retried",
+    "human_collaboration.manual_deepfetch_completed",
+    "human_collaboration.manual_deepfetch_failed",
+    "human_collaboration.manual_deepfetch_waived",
+    "human_collaboration.manual_drafting_turn_completed",
+    "human_collaboration.manual_question_proposal_submitted",
+    "human_collaboration.manual_question_proposal_confirmed",
+    "human_collaboration.manual_question_content_observed",
+    "human_collaboration.manual_question_recovery_pending",
+    "human_collaboration.manual_question_creation_completed",
+    "human_collaboration.manual_question_creation_cancelled",
     "research_graph.quest_accepted",
     "research_memory.question_content_accepted",
     "research_graph.root_question_accepted",

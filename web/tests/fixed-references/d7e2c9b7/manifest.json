@@ -9,6 +9,11 @@
   "render": {
     "browser": "Google Chrome 151.0.7922.71",
     "route": "variant=A",
+    "routes": {
+      "shell": "?variant=A",
+      "create-quest": "?variant=A&panel=create-quest",
+      "create-question": "?variant=A&view=questions&node=Q-38.2&panel=create-question"
+    },
     "animations": "disabled"
   },
   "references": {
@@ -76,6 +81,42 @@
       "expectedDiffGrid": [0.08384228269897884, 0.17816036367153495, 0.10245761469682904, 0.19440951736144696, 0.07685542580739728, 0.12602766224973402, 0.07876093223237407, 0.18962182029209787, 0.06278399374603019, 0.0550826965857433, 0.03625348121366102, 0.19489312312602766, 0.1616748912884155, 0.23527420446851727, 0.27722675526457224, 0.34374697746397137],
       "maxGridCellDelta": 0.006,
       "reviewedProductionSha256": "9ab59c778afa58cfc66011b861671013dd6c0608ce0163529d5e19850cd082fa",
+      "maxProductionDiffPixels": 0
+    },
+    "create-question-1440.png": {
+      "surface": "create-question",
+      "viewport": { "width": 1440, "height": 900 },
+      "sha256": "9f850600a06262f9a43b571d62e2bf87860e39085f290e26bd6fcffa68030d27",
+      "productionReview": "reviewed",
+      "expectedDiffPixelRatio": 0.07116975308641975,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.0685925925925926, 0.011074074074074075, 0.03745679012345679, 0.1544320987654321, 0.07297530864197531, 0.018629629629629628, 0.03458024691358025, 0.1351111111111111, 0.06251851851851851, 0.046, 0.023530864197530865, 0.10396296296296297, 0.004888888888888889, 0.10255555555555555, 0.0795679012345679, 0.1828395061728395],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "096735b41d97f0731a5db320ccf0c292fadf23df2731e5cfff5daa2d1803d328",
+      "maxProductionDiffPixels": 0
+    },
+    "create-question-800.png": {
+      "surface": "create-question",
+      "viewport": { "width": 800, "height": 900 },
+      "sha256": "504ff7dc22124664a983baaf351a02791b946986f8e2c97f93507d8afa3c5095",
+      "productionReview": "reviewed",
+      "expectedDiffPixelRatio": 0.08780138888888889,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.09662222222222222, 0.050555555555555555, 0.0536, 0.1602222222222222, 0.11995555555555555, 0.07822222222222222, 0.051977777777777776, 0.1597111111111111, 0.08293333333333333, 0.03704444444444444, 0.019755555555555554, 0.10773333333333333, 0.052311111111111114, 0.0474, 0.04351111111111111, 0.24326666666666666],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "bc4955ab2fd760bf44f5e9fe709d59e4fd08b248d537320817d66d87b65d4a16",
+      "maxProductionDiffPixels": 0
+    },
+    "create-question-390.png": {
+      "surface": "create-question",
+      "viewport": { "width": 390, "height": 844 },
+      "sha256": "21464171e4c6173643a3e8906c58443b497b775155cefb4b21db21cff0b94ffb",
+      "productionReview": "reviewed",
+      "expectedDiffPixelRatio": 0.10078988941548184,
+      "maxDiffPixelRatioDelta": 0.003,
+      "expectedDiffGrid": [0.0727023989837299, 0.10025147499758197, 0.05061806810963991, 0.033852403520649964, 0.13450920994772073, 0.1688267724151272, 0.09771827820393805, 0.049037624528484376, 0.07714858064200909, 0.10489409033755683, 0.05374505301216593, 0.013008995067221201, 0.07529193335613427, 0.17583905600154753, 0.22411687106073191, 0.18086855595318696],
+      "maxGridCellDelta": 0.006,
+      "reviewedProductionSha256": "5e291959c56227d4830483e8cb85678ebef6360767bb227c9eb0cb3e8f139a5f",
       "maxProductionDiffPixels": 0
     }
   }

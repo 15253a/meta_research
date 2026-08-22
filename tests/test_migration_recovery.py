@@ -424,7 +424,7 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert version == ("0008_quest_acquisition_session",)
+    assert version == ("0009_manual_question_creation",)
     assert "formal_content_count" in columns
     assert "hc_quest_initializations" in tables
     assert "hc_proposal_generation_attempts" in tables
@@ -491,7 +491,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0008_quest_acquisition_session",)
+        ).fetchone() == ("0009_manual_question_creation",)
 
 
 def test_process_exit_mid_0003_ddl_recovers_on_the_next_upgrade(
@@ -551,7 +551,7 @@ upgrade_database(Path(sys.argv[1]))
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0008_quest_acquisition_session",)
+        ).fetchone() == ("0009_manual_question_creation",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -673,7 +673,7 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 ("d" * 64,),
             )
 
-    assert version == ("0008_quest_acquisition_session",)
+    assert version == ("0009_manual_question_creation",)
     assert feed == ("legacy.event", '{"kept":true}', 17.0)
     assert auth == ("a" * 64, "b" * 64, 18.0, 1800.0, None)
     assert initialization == (
@@ -765,7 +765,7 @@ def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0008_quest_acquisition_session",)
+        ).fetchone() == ("0009_manual_question_creation",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -824,7 +824,7 @@ def test_interrupted_0005_rolls_back_and_converges_on_retry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0008_quest_acquisition_session",)
+        ).fetchone() == ("0009_manual_question_creation",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -900,7 +900,7 @@ def test_0005_backfills_existing_rm_contents_without_changing_identity_or_receip
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0008_quest_acquisition_session",)
+        ).fetchone() == ("0009_manual_question_creation",)
         original_formal = connection.execute(
             "SELECT content_ref, content_hash, object_path, receipt_ref, "
             "receipt_hash FROM rm_formal_question_contents"
@@ -1091,7 +1091,7 @@ def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0008_quest_acquisition_session",)
+        ).fetchone() == ("0009_manual_question_creation",)
         assert connection.execute(
             "SELECT object_path, content_hash, byte_count FROM "
             "rm_managed_objects"
@@ -1433,7 +1433,7 @@ def test_interrupted_0007_rolls_back_typed_runs_and_snapshot_bindings(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0008_quest_acquisition_session",)
+        ).fetchone() == ("0009_manual_question_creation",)
         tables = {
             row[0]
             for row in connection.execute(
@@ -1556,7 +1556,7 @@ def test_interrupted_0008_rolls_back_acquisition_sessions_and_converges(
             "PRAGMA foreign_key_check"
         ).fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
-    assert version == ("0008_quest_acquisition_session",)
+    assert version == ("0009_manual_question_creation",)
     assert {
         "ar_acquisition_sessions",
         "ar_acquisition_requests",
@@ -1736,3 +1736,196 @@ def test_0003_refuses_to_guess_when_multiple_active_initializations_exist(
             )
         }
     assert "draft_schema_ref" not in columns
+
+
+def test_interrupted_0009_restores_literature_identity_and_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "interrupted-0009.sqlite3"
+    _upgrade_to_revision(database, "0008_quest_acquisition_session")
+    digest = "9" * 64
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO rm_literature_snapshots "
+            "(snapshot_ref, request_ref, initialization_id, draft_revision, "
+            "draft_hash, scope_hash, run_ref, attempt_ref, fence_ref, result_hash, "
+            "execution_receipt_ref, execution_receipt_hash, completion, summary_ref, "
+            "summary_hash, summary_object_path, papers_ref, papers_hash, "
+            "papers_object_path, fulltexts_ref, fulltexts_hash, fulltexts_object_path, "
+            "limitations_json, limitations_hash, web_evidence_json, "
+            "web_evidence_hash, snapshot_hash, receipt_ref, receipt_hash, accepted_at) "
+            "VALUES ('snapshot_before_0009', 'request_before_0009', "
+            "'quest_init_before_0009', 1, ?, ?, 'run_before_0009', "
+            "'attempt_before_0009', 'fence_before_0009', ?, "
+            "'execution_receipt_before_0009', ?, 'complete', "
+            "'summary_before_0009', ?, 'summary/path', 'papers_before_0009', ?, "
+            "'papers/path', 'fulltexts_before_0009', ?, 'fulltexts/path', '[]', ?, "
+            "'[]', ?, ?, 'literature_receipt_before_0009', ?, 90.0)",
+            (digest,) * 11,
+        )
+        connection.commit()
+
+    original_create_table = Operations.create_table
+    failed_once = False
+
+    def fail_after_manual_context(self, table_name, *args, **kwargs):
+        nonlocal failed_once
+        created = original_create_table(self, table_name, *args, **kwargs)
+        if table_name == "hc_manual_question_creations" and not failed_once:
+            failed_once = True
+            raise OSError("injected 0009 migration interruption")
+        return created
+
+    monkeypatch.setattr(Operations, "create_table", fail_after_manual_context)
+    with pytest.raises(OSError, match="injected 0009 migration interruption"):
+        upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0008_quest_acquisition_session",)
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(rm_literature_snapshots)")
+        }
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        preserved = connection.execute(
+            "SELECT initialization_id, draft_revision, draft_hash "
+            "FROM rm_literature_snapshots WHERE snapshot_ref = 'snapshot_before_0009'"
+        ).fetchone()
+    assert "creation_context_ref" not in columns
+    assert "hc_manual_question_creations" not in tables
+    assert preserved == ("quest_init_before_0009", 1, digest)
+
+    monkeypatch.setattr(Operations, "create_table", original_create_table)
+    upgrade_database(database)
+    upgrade_database(database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0009_manual_question_creation",)
+        backfilled = connection.execute(
+            "SELECT creation_context_kind, creation_context_ref, quest_ref "
+            "FROM rm_literature_snapshots WHERE snapshot_ref = 'snapshot_before_0009'"
+        ).fetchone()
+        counters = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(human_collaboration_state)")
+        }
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    assert backfilled == (
+        "quest_initialization",
+        "quest_init_before_0009",
+        None,
+    )
+    assert {
+        "manual_creation_count",
+        "active_manual_creation_count",
+        "confirmed_manual_seed_count",
+    } <= counters
+    assert {
+        "hc_manual_question_creations",
+        "hc_manual_question_commands",
+        "hc_manual_drafting_sessions",
+        "hc_manual_drafting_turns",
+        "hc_manual_deepfetch_requests",
+        "rm_manual_question_contents",
+        "rg_manual_questions",
+    } <= tables
+    assert foreign_key_failures == []
+    assert integrity == ("ok",)
+
+
+def test_0009_preserves_multiple_historical_root_snapshots_per_quest(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "historical-root-snapshots-0009.sqlite3"
+    _upgrade_to_revision(database, "0008_quest_acquisition_session")
+    columns = (
+        "snapshot_ref, request_ref, initialization_id, draft_revision, "
+        "draft_hash, scope_hash, run_ref, attempt_ref, fence_ref, result_hash, "
+        "execution_receipt_ref, execution_receipt_hash, completion, summary_ref, "
+        "summary_hash, summary_object_path, papers_ref, papers_hash, "
+        "papers_object_path, fulltexts_ref, fulltexts_hash, fulltexts_object_path, "
+        "limitations_json, limitations_hash, web_evidence_json, "
+        "web_evidence_hash, snapshot_hash, receipt_ref, receipt_hash, accepted_at"
+    )
+    with sqlite3.connect(database) as connection:
+        for revision, digest in ((1, "8" * 64), (2, "9" * 64)):
+            suffix = str(revision)
+            connection.execute(
+                f"INSERT INTO rm_literature_snapshots ({columns}) VALUES ("
+                ":snapshot_ref, :request_ref, :initialization_id, :draft_revision, "
+                ":draft_hash, :scope_hash, :run_ref, :attempt_ref, :fence_ref, "
+                ":result_hash, :execution_receipt_ref, :execution_receipt_hash, "
+                ":completion, :summary_ref, :summary_hash, :summary_object_path, "
+                ":papers_ref, :papers_hash, :papers_object_path, :fulltexts_ref, "
+                ":fulltexts_hash, :fulltexts_object_path, :limitations_json, "
+                ":limitations_hash, :web_evidence_json, :web_evidence_hash, "
+                ":snapshot_hash, :receipt_ref, :receipt_hash, :accepted_at)",
+                {
+                    "snapshot_ref": f"historical_snapshot_{suffix}",
+                    "request_ref": f"historical_request_{suffix}",
+                    "initialization_id": "quest_init_historical_snapshots",
+                    "draft_revision": revision,
+                    "draft_hash": digest,
+                    "scope_hash": digest,
+                    "run_ref": f"historical_run_{suffix}",
+                    "attempt_ref": f"historical_attempt_{suffix}",
+                    "fence_ref": f"historical_fence_{suffix}",
+                    "result_hash": digest,
+                    "execution_receipt_ref": f"historical_execution_{suffix}",
+                    "execution_receipt_hash": digest,
+                    "completion": "complete",
+                    "summary_ref": f"historical_summary_{suffix}",
+                    "summary_hash": digest,
+                    "summary_object_path": f"summary/{suffix}",
+                    "papers_ref": f"historical_papers_{suffix}",
+                    "papers_hash": digest,
+                    "papers_object_path": f"papers/{suffix}",
+                    "fulltexts_ref": f"historical_fulltexts_{suffix}",
+                    "fulltexts_hash": digest,
+                    "fulltexts_object_path": f"fulltexts/{suffix}",
+                    "limitations_json": "[]",
+                    "limitations_hash": digest,
+                    "web_evidence_json": "[]",
+                    "web_evidence_hash": digest,
+                    "snapshot_hash": digest,
+                    "receipt_ref": f"historical_receipt_{suffix}",
+                    "receipt_hash": digest,
+                    "accepted_at": 90.0 + revision,
+                },
+            )
+        connection.commit()
+
+    upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT creation_context_kind, creation_context_ref, draft_revision "
+            "FROM rm_literature_snapshots ORDER BY draft_revision"
+        ).fetchall()
+        context_index = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND "
+            "name = 'uq_rm_literature_snapshot_context'"
+        ).fetchone()
+    assert rows == [
+        ("quest_initialization", "quest_init_historical_snapshots", 1),
+        ("quest_initialization", "quest_init_historical_snapshots", 2),
+    ]
+    assert context_index is not None
+    assert "WHERE creation_context_kind = 'manual_question_creation'" in (
+        context_index[0]
+    )

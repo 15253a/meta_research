@@ -14,6 +14,10 @@ from meta_research.acquisition import AcquisitionProvider
 from meta_research.database import Database
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
+from meta_research.manual_creation import (
+    ManualQuestionCreation,
+    manual_deepfetch_receipt_hash,
+)
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
     SQLiteOwnerSnapshot,
@@ -178,11 +182,88 @@ class HumanCollaborationInterface(Protocol):
 
     def query_current_quest_creation(self) -> dict[str, object] | None: ...
 
+    def open_manual_question_creation(
+        self,
+        *,
+        quest_ref: str,
+        parent_question_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def confirm_manual_creation_seed(
+        self,
+        context_ref: str,
+        *,
+        seed: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def record_manual_deepfetch_waiver(
+        self,
+        context_ref: str,
+        *,
+        expected_seed_ref: str,
+        expected_seed_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def start_manual_creation_deepfetch(
+        self,
+        context_ref: str,
+        *,
+        expected_seed_ref: str,
+        expected_seed_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def send_manual_drafting_message(
+        self,
+        context_ref: str,
+        *,
+        expected_basis_hash: str,
+        message: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def save_manual_question_proposal(
+        self,
+        context_ref: str,
+        *,
+        content: dict[str, object],
+        expected_basis_hash: str,
+        idempotency_key: str,
+        expected_proposal_ref: str | None = None,
+        expected_proposal_hash: str | None = None,
+    ) -> dict[str, object]: ...
+
+    def confirm_manual_question_proposal(
+        self,
+        context_ref: str,
+        *,
+        proposal_ref: str,
+        proposal_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def cancel_manual_question_creation(
+        self, context_ref: str, idempotency_key: str
+    ) -> dict[str, object]: ...
+
+    def query_manual_question_creation(
+        self, context_ref: str
+    ) -> dict[str, object]: ...
+
+    def query_current_manual_question_creation(
+        self, *, quest_ref: str, parent_question_ref: str
+    ) -> dict[str, object] | None: ...
+
     def reconcile_once(self) -> bool: ...
 
     def process_drafting_once(self) -> bool: ...
 
-    def query_next_deepfetch_request(self) -> DeepFetchRunRequest | None: ...
+    def query_next_deepfetch_request(
+        self, excluded_request_refs: tuple[str, ...] = ()
+    ) -> DeepFetchRunRequest | None: ...
 
     def query_deepfetch_request(
         self, request_ref: str
@@ -206,10 +287,18 @@ class HumanCollaborationInterface(Protocol):
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=HC_OWNER,
     statement=text(
-        "SELECT revision, pending_intent_count, authorization_count "
+        "SELECT revision, pending_intent_count, authorization_count, "
+        "manual_creation_count, active_manual_creation_count, "
+        "confirmed_manual_seed_count "
         "FROM human_collaboration_state WHERE singleton = 'owner'"
     ),
-    fact_names=("pending_intent_count", "authorization_count"),
+    fact_names=(
+        "pending_intent_count",
+        "authorization_count",
+        "manual_creation_count",
+        "active_manual_creation_count",
+        "confirmed_manual_seed_count",
+    ),
 )
 
 
@@ -237,6 +326,12 @@ class SQLiteDeepFetchRunRequestVerifier:
         result_route: str,
         receipt: AcceptanceReceipt,
         require_active: bool = False,
+        creation_context_kind: str = "quest_initialization",
+        creation_context_ref: str | None = None,
+        context_generation: int | None = None,
+        quest_ref: str | None = None,
+        parent_question_ref: str | None = None,
+        context_basis_hash: str | None = None,
     ) -> None:
         if (
             receipt.issuer != HC_OWNER
@@ -247,8 +342,13 @@ class SQLiteDeepFetchRunRequestVerifier:
         with self._database.read() as connection:
             row = connection.execute(
                 text(
-                    "SELECT * FROM hc_deepfetch_requests WHERE "
-                    "request_ref = :request_ref"
+                    "SELECT * FROM "
+                    + (
+                        "hc_manual_deepfetch_requests"
+                        if creation_context_kind == "manual_question_creation"
+                        else "hc_deepfetch_requests"
+                    )
+                    + " WHERE request_ref = :request_ref"
                 ),
                 {"request_ref": request_ref},
             ).first()
@@ -258,11 +358,29 @@ class SQLiteDeepFetchRunRequestVerifier:
             require_active and row.status != "queued"
         ):
             raise OwnerConflict("deepfetch_request_not_active")
+        row_draft_revision = (
+            int(row.quest_draft_revision)
+            if creation_context_kind == "manual_question_creation"
+            else int(row.draft_revision)
+        )
+        row_draft_hash = (
+            row.quest_draft_hash
+            if creation_context_kind == "manual_question_creation"
+            else row.draft_hash
+        )
+        context_invalid = creation_context_kind == "manual_question_creation" and (
+            row.context_ref != creation_context_ref
+            or int(row.generation) != context_generation
+            or row.quest_ref != quest_ref
+            or row.parent_question_ref != parent_question_ref
+            or row.context_basis_hash != context_basis_hash
+        )
         if (
-            row.initialization_id != initialization_id
+            context_invalid
+            or row.initialization_id != initialization_id
             or row.correlation_ref != correlation_ref
-            or int(row.draft_revision) != draft_revision
-            or row.draft_hash != draft_hash
+            or row_draft_revision != draft_revision
+            or row_draft_hash != draft_hash
             or row.scope_hash != scope_hash
             or row.material_bindings_hash != material_bindings_hash
             or row.resource_envelope_ref != resource_envelope_ref
@@ -274,7 +392,12 @@ class SQLiteDeepFetchRunRequestVerifier:
             or row.result_route != result_route
             or row.authorization_receipt_ref != receipt.receipt_ref
             or row.authorization_hash != receipt.payload_hash
-            or row.authorization_hash != _deepfetch_request_receipt_hash(row)
+            or row.authorization_hash
+            != (
+                manual_deepfetch_receipt_hash(row)
+                if creation_context_kind == "manual_question_creation"
+                else _deepfetch_request_receipt_hash(row)
+            )
         ):
             raise OwnerConflict("deepfetch_request_receipt_invalid")
 
@@ -386,6 +509,15 @@ class SQLiteHumanCollaboration:
         self._proposal_drafter = proposal_drafter
         self._intent_drafting_provider = intent_drafting_provider
         self._acquisition_provider = acquisition_provider
+        self._manual_creation = ManualQuestionCreation(
+            database,
+            feed,
+            research_graph,
+            research_memory,
+            agent_runtime,
+            acquisition_provider,
+            intent_drafting_provider,
+        )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._preview_refresh_lock = threading.Lock()
         self._preview_refresh_attempts: dict[str, tuple[str, float]] = {}
@@ -1845,6 +1977,8 @@ class SQLiteHumanCollaboration:
             return True
         if self._process_intent_turn_once():
             return True
+        if self._manual_creation.process_drafting_once():
+            return True
         with self._database.read() as connection:
             initialization_id = connection.execute(
                 text(
@@ -3121,9 +3255,12 @@ class SQLiteHumanCollaboration:
         )
         return running_generation_refs, running_turn_refs
 
-    def query_next_deepfetch_request(self) -> DeepFetchRunRequest | None:
+    def query_next_deepfetch_request(
+        self, excluded_request_refs: tuple[str, ...] = ()
+    ) -> DeepFetchRunRequest | None:
+        excluded = set(excluded_request_refs)
         with self._database.read() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 text(
                     "SELECT requests.*, revisions.draft_json AS frozen_draft_json, "
                     "revisions.draft_hash AS revision_draft_hash FROM "
@@ -3131,10 +3268,18 @@ class SQLiteHumanCollaboration:
                     "hc_quest_draft_revisions AS revisions ON "
                     "revisions.initialization_id = requests.initialization_id AND "
                     "revisions.revision = requests.draft_revision WHERE "
-                    "requests.status = 'queued' ORDER BY requests.created_at LIMIT 1"
+                    "requests.status = 'queued' ORDER BY requests.created_at"
                 )
-            ).first()
-        return None if row is None else _deepfetch_request_from_row(row)
+            ).all()
+        row = next(
+            (candidate for candidate in rows if candidate.request_ref not in excluded),
+            None,
+        )
+        if row is not None:
+            return _deepfetch_request_from_row(row)
+        return self._manual_creation.query_next_deepfetch_request(
+            excluded_request_refs
+        )
 
     def query_deepfetch_request(self, request_ref: str) -> DeepFetchRunRequest | None:
         with self._database.read() as connection:
@@ -3150,7 +3295,9 @@ class SQLiteHumanCollaboration:
                 ),
                 {"request_ref": request_ref},
             ).first()
-        return None if row is None else _deepfetch_request_from_row(row)
+        if row is not None:
+            return _deepfetch_request_from_row(row)
+        return self._manual_creation.query_deepfetch_request(request_ref)
 
     def record_deepfetch_succeeded(
         self,
@@ -3159,6 +3306,14 @@ class SQLiteHumanCollaboration:
         snapshot: AcceptedLiteratureSnapshot,
     ) -> None:
         request = self.query_deepfetch_request(request_ref)
+        if (
+            request is not None
+            and request.creation_context_kind == "manual_question_creation"
+        ):
+            self._manual_creation.record_deepfetch_succeeded(
+                request_ref, run_ref, snapshot
+            )
+            return
         run = self._agent_runtime.query_deepfetch_run(request_ref)
         if (
             request is None
@@ -3295,6 +3450,12 @@ class SQLiteHumanCollaboration:
         failure_code: str,
         run_ref: str | None = None,
     ) -> None:
+        manual_request = self._manual_creation.query_deepfetch_request(request_ref)
+        if manual_request is not None:
+            self._manual_creation.record_deepfetch_failed(
+                request_ref, failure_code, run_ref
+            )
+            return
         if not failure_code or len(failure_code) > 96:
             failure_code = "deepfetch_failed"
         now = time.time()
@@ -4033,7 +4194,141 @@ class SQLiteHumanCollaboration:
             else None
         )
 
+    def open_manual_question_creation(
+        self,
+        *,
+        quest_ref: str,
+        parent_question_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._manual_creation.open(
+            quest_ref=quest_ref,
+            parent_question_ref=parent_question_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def confirm_manual_creation_seed(
+        self,
+        context_ref: str,
+        *,
+        seed: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._manual_creation.confirm_seed(
+            context_ref,
+            seed=seed,
+            idempotency_key=idempotency_key,
+        )
+
+    def record_manual_deepfetch_waiver(
+        self,
+        context_ref: str,
+        *,
+        expected_seed_ref: str,
+        expected_seed_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        try:
+            return self._manual_creation.record_waiver(
+                context_ref,
+                expected_seed_ref=expected_seed_ref,
+                expected_seed_hash=expected_seed_hash,
+                idempotency_key=idempotency_key,
+            )
+        except OwnerConflict as error:
+            if error.code == "idempotency_conflict":
+                raise OwnerConflict(
+                    "manual_creation_waiver_idempotency_conflict"
+                ) from error
+            raise
+
+    def save_manual_question_proposal(
+        self,
+        context_ref: str,
+        *,
+        content: dict[str, object],
+        expected_basis_hash: str,
+        idempotency_key: str,
+        expected_proposal_ref: str | None = None,
+        expected_proposal_hash: str | None = None,
+    ) -> dict[str, object]:
+        return self._manual_creation.save_proposal(
+            context_ref,
+            content=content,
+            expected_basis_hash=expected_basis_hash,
+            expected_proposal_ref=expected_proposal_ref,
+            expected_proposal_hash=expected_proposal_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def start_manual_creation_deepfetch(
+        self,
+        context_ref: str,
+        *,
+        expected_seed_ref: str,
+        expected_seed_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._manual_creation.start_deepfetch(
+            context_ref,
+            expected_seed_ref=expected_seed_ref,
+            expected_seed_hash=expected_seed_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def send_manual_drafting_message(
+        self,
+        context_ref: str,
+        *,
+        expected_basis_hash: str,
+        message: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._manual_creation.send_drafting_message(
+            context_ref,
+            expected_basis_hash=expected_basis_hash,
+            message=message,
+            idempotency_key=idempotency_key,
+        )
+
+    def confirm_manual_question_proposal(
+        self,
+        context_ref: str,
+        *,
+        proposal_ref: str,
+        proposal_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._manual_creation.confirm_proposal(
+            context_ref,
+            proposal_ref=proposal_ref,
+            proposal_hash=proposal_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def cancel_manual_question_creation(
+        self, context_ref: str, idempotency_key: str
+    ) -> dict[str, object]:
+        return self._manual_creation.cancel(
+            context_ref, idempotency_key=idempotency_key
+        )
+
+    def query_manual_question_creation(
+        self, context_ref: str
+    ) -> dict[str, object]:
+        return self._manual_creation.query(context_ref)
+
+    def query_current_manual_question_creation(
+        self, *, quest_ref: str, parent_question_ref: str
+    ) -> dict[str, object] | None:
+        return self._manual_creation.query_current(
+            quest_ref=quest_ref,
+            parent_question_ref=parent_question_ref,
+        )
+
     def reconcile_once(self) -> bool:
+        if self._manual_creation.reconcile_once():
+            return True
         with self._database.read() as connection:
             initialization_ids = (
                 connection.execute(

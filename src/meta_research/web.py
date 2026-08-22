@@ -212,6 +212,62 @@ class ConfirmQuestRequest(BaseModel):
     preview_hash: str = Field(min_length=64, max_length=64)
 
 
+class OpenManualQuestionCreationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    quest_ref: str = Field(min_length=1, max_length=64)
+    parent_question_ref: str = Field(min_length=1, max_length=64)
+
+
+class ManualCreationSeedRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: str = Field(min_length=1, max_length=12000)
+    fields: QuestionContentRequest
+    accepted_material_bindings: list[dict[str, object]] = Field(
+        default_factory=list, max_length=100
+    )
+    deepfetch_preference: Literal["use", "skip", "later"] = "later"
+
+
+class ConfirmManualSeedRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seed: ManualCreationSeedRequest
+
+
+class ManualResearchPathRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_seed_ref: str = Field(min_length=1, max_length=64)
+    expected_seed_hash: str = Field(min_length=64, max_length=64)
+
+
+class ManualDraftingMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_basis_hash: str = Field(min_length=64, max_length=64)
+    message: str = Field(min_length=1, max_length=INTENT_MESSAGE_MAX_LENGTH)
+
+
+class SaveManualQuestionProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_basis_hash: str = Field(min_length=64, max_length=64)
+    expected_proposal_ref: str | None = Field(default=None, max_length=64)
+    expected_proposal_hash: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
+    content: QuestionContentRequest
+
+
+class ConfirmManualQuestionProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_ref: str = Field(min_length=1, max_length=64)
+    proposal_hash: str = Field(min_length=64, max_length=64)
+
+
 class AssetIntakeWebRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -590,6 +646,7 @@ def create_app(
             in {
                 "asset_intake_not_found",
                 "asset_not_found",
+                "manual_question_creation_not_found",
                 "quest_initialization_not_found",
             }
             else 409
@@ -975,6 +1032,146 @@ def create_app(
             initialization_id
         )
         return {"intent_session": view["intent_session"]}
+
+    @app.post("/api/v1/manual-question-creations", status_code=201)
+    def open_manual_question_creation(
+        request: Request,
+        target: OpenManualQuestionCreationRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.open_manual_question_creation(
+            quest_ref=target.quest_ref,
+            parent_question_ref=target.parent_question_ref,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.get("/api/v1/manual-question-creations/current")
+    def query_current_manual_question_creation(
+        quest_ref: str = Query(min_length=1, max_length=64),
+        parent_question_ref: str = Query(min_length=1, max_length=64),
+    ) -> dict[str, object] | None:
+        return (
+            runtime.owners.human_collaboration.query_current_manual_question_creation(
+                quest_ref=quest_ref,
+                parent_question_ref=parent_question_ref,
+            )
+        )
+
+    @app.get("/api/v1/manual-question-creations/{context_ref}")
+    def query_manual_question_creation(context_ref: str) -> dict[str, object]:
+        return runtime.owners.human_collaboration.query_manual_question_creation(
+            context_ref
+        )
+
+    @app.post(
+        "/api/v1/manual-question-creations/{context_ref}/seed-confirmation",
+        status_code=201,
+    )
+    async def confirm_manual_creation_seed(
+        context_ref: str,
+        request: Request,
+        confirmation: ConfirmManualSeedRequest,
+    ) -> dict[str, object]:
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.confirm_manual_creation_seed(
+                context_ref,
+                seed=confirmation.seed.model_dump(),
+                idempotency_key=_idempotency_key(request),
+            ),
+            slots=asset_io_slots,
+            timeout_code="manual_creation_material_io_timeout",
+        )
+
+    @app.post(
+        "/api/v1/manual-question-creations/{context_ref}/deepfetch",
+        status_code=202,
+    )
+    def start_manual_creation_deepfetch(
+        context_ref: str,
+        request: Request,
+        selection: ManualResearchPathRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.start_manual_creation_deepfetch(
+            context_ref,
+            expected_seed_ref=selection.expected_seed_ref,
+            expected_seed_hash=selection.expected_seed_hash,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/manual-question-creations/{context_ref}/deepfetch-waiver",
+        status_code=201,
+    )
+    def record_manual_deepfetch_waiver(
+        context_ref: str,
+        request: Request,
+        selection: ManualResearchPathRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.record_manual_deepfetch_waiver(
+            context_ref,
+            expected_seed_ref=selection.expected_seed_ref,
+            expected_seed_hash=selection.expected_seed_hash,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/manual-question-creations/{context_ref}/drafting-session/messages"
+    )
+    def send_manual_drafting_message(
+        context_ref: str,
+        request: Request,
+        turn: ManualDraftingMessageRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.send_manual_drafting_message(
+            context_ref,
+            expected_basis_hash=turn.expected_basis_hash,
+            message=turn.message,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.put("/api/v1/manual-question-creations/{context_ref}/proposal")
+    async def save_manual_question_proposal(
+        context_ref: str,
+        request: Request,
+        proposal: SaveManualQuestionProposalRequest,
+    ) -> dict[str, object]:
+        return await _await_bounded_asset_io(
+            lambda: runtime.owners.human_collaboration.save_manual_question_proposal(
+                context_ref,
+                content=proposal.content.model_dump(),
+                expected_basis_hash=proposal.expected_basis_hash,
+                expected_proposal_ref=proposal.expected_proposal_ref,
+                expected_proposal_hash=proposal.expected_proposal_hash,
+                idempotency_key=_idempotency_key(request),
+            ),
+            slots=asset_io_slots,
+            timeout_code="manual_creation_material_io_timeout",
+        )
+
+    @app.post(
+        "/api/v1/manual-question-creations/{context_ref}/proposal-confirmation",
+        status_code=202,
+    )
+    def confirm_manual_question_proposal(
+        context_ref: str,
+        request: Request,
+        confirmation: ConfirmManualQuestionProposalRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.confirm_manual_question_proposal(
+            context_ref,
+            proposal_ref=confirmation.proposal_ref,
+            proposal_hash=confirmation.proposal_hash,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post("/api/v1/manual-question-creations/{context_ref}/cancel")
+    def cancel_manual_question_creation(
+        context_ref: str,
+        request: Request,
+        _empty: EmptyCommandRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.cancel_manual_question_creation(
+            context_ref, _idempotency_key(request)
+        )
 
     @app.get("/api/v1/literature-snapshots/{snapshot_ref}")
     def query_literature_snapshot(snapshot_ref: str) -> dict[str, object]:

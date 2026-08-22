@@ -19,6 +19,9 @@ from meta_research.feed import DurableFeed
 from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillProvider
 from meta_research.idea_stage import IdeaStageWorker
+from meta_research.manual_creation import (
+    create_manual_question_confirmation_verifier,
+)
 from meta_research.migration import upgrade_database
 from meta_research.owners.advancement_engine import (
     AdvancementEngineInterface,
@@ -158,6 +161,9 @@ def build_production_runtime(
     research_memory_receipts = create_research_memory_receipt_verifier(
         database, data_root.objects, attempt_receipts
     )
+    manual_question_confirmations = create_manual_question_confirmation_verifier(
+        database
+    )
     research_graph_receipts = create_research_graph_receipt_verifier(
         database,
         confirmation_verifier,
@@ -166,6 +172,7 @@ def build_production_runtime(
         research_memory_receipts,
         attempt_receipts,
         stage_request_receipts,
+        manual_confirmation_verifier=manual_question_confirmations,
     )
     agent_runtime = create_agent_runtime_interface(
         database,
@@ -193,6 +200,7 @@ def build_production_runtime(
         research_memory_receipts,
         attempt_receipts,
         stage_request_receipts,
+        manual_confirmation_verifier=manual_question_confirmations,
     )
     research_memory = create_research_memory_interface(
         database,
@@ -203,7 +211,9 @@ def build_production_runtime(
         research_memory_receipts,
         attempt_receipts,
         research_graph,
+        manual_question_confirmations,
     )
+    manual_question_confirmations.bind_research_memory_verifier(research_memory)
     confirmation_verifier.bind_literature_snapshot_verifier(research_memory)
     advancement_engine = create_advancement_engine_interface(
         database,

@@ -125,6 +125,18 @@ same six-field Proposal and final confirmation continue. The `direct` path does
 not create a snapshot, use a CreationSeed, or treat DeepFetch failure,
 cancellation, timeout, or unavailability as a waiver.
 
+Follow-up questions use a separate `manual_question_creation` context entered
+from an accepted Question in the Web question tree. Human Collaboration first
+freezes the user's exact CreationSeed, then requires either a completed
+DeepFetch LiteratureSnapshot or a distinct explicit waiver before an exact
+six-field Proposal can be confirmed. Research Memory accepts the immutable
+content before Research Graph atomically accepts the child identity, present
+parent, and content binding. A restart resumes from the first missing Owner
+receipt and reuses the same content ref; closing the browser does not cancel the
+context, and neither a failed nor a cancelled DeepFetch is treated as a waiver.
+The resulting stable QuestionAnchor does not activate a cycle or advance a
+Stage.
+
 The supported public host operations are exposed by the `meta-research`
 command. Research state is observed through the authenticated Snapshot and SSE
 interfaces; the Web client does not read persistence directly.

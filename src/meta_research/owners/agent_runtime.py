@@ -1558,12 +1558,33 @@ class SQLiteAgentRuntime:
             result_route=request.result_route,
             receipt=request.authorization_receipt,
             require_active=False,
+            creation_context_kind=request.creation_context_kind,
+            creation_context_ref=request.creation_context_ref,
+            context_generation=request.context_generation,
+            quest_ref=request.quest_ref,
+            parent_question_ref=request.parent_question_ref,
+            context_basis_hash=request.context_basis_hash,
         )
         if (
-            request.result_route != "same_quest_initialization_proposal"
+            request.result_route
+            not in {
+                "same_quest_initialization_proposal",
+                "same_manual_question_creation_proposal",
+            }
             or canonical_hash(request.scope) != request.scope_hash
             or request.draft_revision < 1
             or canonical_hash(request.draft) != request.draft_hash
+            or request.creation_context_kind == "manual_question_creation"
+            and (
+                request.result_route
+                != "same_manual_question_creation_proposal"
+                or request.creation_context_ref is None
+                or request.context_generation is None
+                or request.context_generation < 1
+                or request.quest_ref is None
+                or request.parent_question_ref is None
+                or request.context_basis_hash is None
+            )
         ):
             raise OwnerConflict("deepfetch_run_request_invalid")
         self._verify_deepfetch_acquisition_binding(request, require_ready=False)
@@ -1917,6 +1938,12 @@ class SQLiteAgentRuntime:
                 result_route=request.result_route,
                 receipt=request.authorization_receipt,
                 require_active=True,
+                creation_context_kind=request.creation_context_kind,
+                creation_context_ref=request.creation_context_ref,
+                context_generation=request.context_generation,
+                quest_ref=request.quest_ref,
+                parent_question_ref=request.parent_question_ref,
+                context_basis_hash=request.context_basis_hash,
             )
             self._verify_deepfetch_acquisition_binding(
                 request, require_ready=True

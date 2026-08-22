@@ -179,6 +179,22 @@ class BundleConfirmationVerifier(Protocol):
     ) -> None: ...
 
 
+class ManualQuestionConfirmationVerifier(Protocol):
+    """Verify one exact HC-owned ManualCreation Proposal confirmation."""
+
+    def verify_manual_question_confirmation(
+        self,
+        *,
+        context_ref: str,
+        quest_ref: str,
+        parent_question_ref: str,
+        proposal_ref: str,
+        proposal_hash: str,
+        content_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
 class LiteratureSnapshotVerifier(Protocol):
     def verify_literature_snapshot_binding(
         self,
@@ -189,6 +205,9 @@ class LiteratureSnapshotVerifier(Protocol):
         draft_revision: int,
         draft_hash: str,
         receipt: AcceptanceReceipt | None = None,
+        creation_context_kind: str = "quest_initialization",
+        creation_context_ref: str | None = None,
+        quest_ref: str | None = None,
     ) -> None: ...
 
 
@@ -219,6 +238,22 @@ class QuestionContentReceiptVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
+    def verify_manual_question_content_receipt(
+        self,
+        *,
+        context_ref: str,
+        quest_ref: str,
+        parent_question_ref: str,
+        content_ref: str,
+        content_hash: str,
+        schema_ref: str,
+        proposal_ref: str,
+        proposal_hash: str,
+        confirmation_ref: str,
+        confirmation_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
 
 class RootQuestionReceiptVerifier(Protocol):
     def verify_root_question_receipt(
@@ -227,6 +262,16 @@ class RootQuestionReceiptVerifier(Protocol):
         initialization_id: str,
         quest_ref: str,
         question_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_question_receipt(
+        self,
+        *,
+        context_ref: str,
+        quest_ref: str,
+        question_ref: str,
+        parent_question_ref: str | None,
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
@@ -271,6 +316,12 @@ class DeepFetchRunRequestVerifier(Protocol):
         result_route: str,
         receipt: AcceptanceReceipt,
         require_active: bool = False,
+        creation_context_kind: str = "quest_initialization",
+        creation_context_ref: str | None = None,
+        context_generation: int | None = None,
+        quest_ref: str | None = None,
+        parent_question_ref: str | None = None,
+        context_basis_hash: str | None = None,
     ) -> None: ...
 
 
