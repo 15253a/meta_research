@@ -237,11 +237,16 @@ def validate_idea_context_pack(
         not in {IDEA_CONTEXT_PACK_SCHEMA_REF, IDEA_CONTEXT_PACK_SCHEMA_V2_REF}
         or context_pack["cycle_ref"] != cycle_ref
         or context_pack["accepted_question_binding"] != accepted_question_binding
-        or context_pack["literature_binding"] is not None
         or context_pack["prior_accepted_bindings"] != []
         or context_pack["active_guidance_bindings"] != []
     ):
         raise IdeaContractError("idea_context_pack_invalid")
+    literature = context_pack["literature_binding"]
+    if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_REF:
+        if literature is not None:
+            raise IdeaContractError("idea_context_pack_invalid")
+    elif literature is not None:
+        _validate_literature_binding(literature)
     if schema_ref == IDEA_CONTEXT_PACK_SCHEMA_V2_REF:
         revision = context_pack["evidence_reference_revision"]
         if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
@@ -259,6 +264,65 @@ def validate_idea_context_pack(
     ):
         raise IdeaContractError("context_pack_evidence_bindings_invalid")
     return set(cast(list[str], refs))
+
+
+def literature_binding(
+    context_pack: dict[str, object],
+) -> dict[str, object] | None:
+    value = context_pack.get("literature_binding")
+    if value is None:
+        return None
+    _validate_literature_binding(value)
+    return cast(dict[str, object], value)
+
+
+def _validate_literature_binding(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_ref",
+        "snapshot_ref",
+        "snapshot_hash",
+        "initialization_id",
+        "draft_revision",
+        "draft_hash",
+        "receipt",
+    }:
+        raise IdeaContractError("idea_context_pack_invalid")
+    receipt = value.get("receipt")
+    revision = value.get("draft_revision")
+    if (
+        value.get("schema_ref")
+        != "meta-research/idea-literature-binding/v1"
+        or not all(
+            isinstance(value.get(field), str) and value.get(field)
+            for field in ("snapshot_ref", "initialization_id")
+        )
+        or not isinstance(value.get("snapshot_hash"), str)
+        or len(cast(str, value["snapshot_hash"])) != 64
+        or not isinstance(value.get("draft_hash"), str)
+        or len(cast(str, value["draft_hash"])) != 64
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+        or not isinstance(receipt, dict)
+        or set(receipt)
+        != {
+            "status",
+            "issuer",
+            "kind",
+            "receipt_ref",
+            "subject_ref",
+            "payload_hash",
+        }
+        or receipt.get("status") != "accepted"
+        or receipt.get("issuer") != "research_memory"
+        or receipt.get("kind") != "literature_snapshot_acceptance"
+        or receipt.get("subject_ref") != value.get("snapshot_ref")
+        or not isinstance(receipt.get("receipt_ref"), str)
+        or not receipt.get("receipt_ref")
+        or not isinstance(receipt.get("payload_hash"), str)
+        or len(cast(str, receipt["payload_hash"])) != 64
+    ):
+        raise IdeaContractError("idea_context_pack_invalid")
 
 
 def evidence_reference_revision(context_pack: dict[str, object]) -> int | None:

@@ -61,6 +61,7 @@ DRAFT_V2_SCHEMA = "meta-research/quest-initialization-draft/v2"
 # The six-field QuestionProposal contract is unchanged; draft/envelope currentness
 # lives in its basis binding, so downstream receipt verifiers remain compatible.
 PROPOSAL_V2_SCHEMA = QUESTION_PROPOSAL_SCHEMA
+PROPOSAL_BINDING_V2_SCHEMA = "meta-research/question-proposal-binding/v2"
 RESOURCE_ENVELOPE_SCHEMA = "meta-research/quest-resource-envelope/v1"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 HC_OWNER = "human_collaboration"
@@ -218,10 +219,12 @@ class SQLiteDeepFetchRunRequestVerifier:
         draft_revision: int,
         draft_hash: str,
         scope_hash: str,
+        material_bindings_hash: str,
         resource_envelope_ref: str,
         resource_envelope_hash: str,
         result_route: str,
         receipt: AcceptanceReceipt,
+        require_active: bool = False,
     ) -> None:
         if (
             receipt.issuer != HC_OWNER
@@ -237,12 +240,19 @@ class SQLiteDeepFetchRunRequestVerifier:
                 ),
                 {"request_ref": request_ref},
             ).first()
-        if row is None or (
+        if row is None:
+            raise OwnerConflict("deepfetch_request_receipt_invalid")
+        if row.status not in {"queued", "succeeded"} or (
+            require_active and row.status != "queued"
+        ):
+            raise OwnerConflict("deepfetch_request_not_active")
+        if (
             row.initialization_id != initialization_id
             or row.correlation_ref != correlation_ref
             or int(row.draft_revision) != draft_revision
             or row.draft_hash != draft_hash
             or row.scope_hash != scope_hash
+            or row.material_bindings_hash != material_bindings_hash
             or row.resource_envelope_ref != resource_envelope_ref
             or row.resource_envelope_hash != resource_envelope_hash
             or row.result_route != result_route
@@ -377,9 +387,7 @@ class SQLiteHumanCollaboration:
                 receipt=binding.receipt,
             )
 
-    def _verify_material_projection_bindings(
-        self, draft: dict[str, object]
-    ) -> None:
+    def _verify_material_projection_bindings(self, draft: dict[str, object]) -> None:
         for binding in _accepted_material_bindings(draft):
             self._research_memory.verify_asset_projection_binding(
                 asset_ref=binding.asset_ref,
@@ -733,9 +741,7 @@ class SQLiteHumanCollaboration:
                 _require_initialization_artifact_integrity(connection, row)
                 if row.status in {"confirmed", "completed", "cancelled"}:
                     raise OwnerConflict("quest_draft_is_terminal")
-                _require_draft_cas(
-                    row, expected_draft_hash, expected_draft_revision
-                )
+                _require_draft_cas(row, expected_draft_hash, expected_draft_revision)
                 self._validate_resource_envelope_binding(
                     connection, initialization_id, normalized
                 )
@@ -869,10 +875,8 @@ class SQLiteHumanCollaboration:
                 preflight_row = self._require_initialization(
                     connection, initialization_id
                 )
-                preflight_draft, _proposal = (
-                    _require_initialization_artifact_integrity(
-                        connection, preflight_row
-                    )
+                preflight_draft, _proposal = _require_initialization_artifact_integrity(
+                    connection, preflight_row
                 )
             else:
                 preflight_draft = None
@@ -891,9 +895,7 @@ class SQLiteHumanCollaboration:
                 )
                 if row.status in {"confirmed", "completed", "cancelled"}:
                     raise OwnerConflict("quest_initialization_is_terminal")
-                _require_draft_cas(
-                    row, expected_draft_hash, expected_draft_revision
-                )
+                _require_draft_cas(row, expected_draft_hash, expected_draft_revision)
                 _validate_generation_basis(draft)
                 if row.draft_schema_ref == DRAFT_V2_SCHEMA:
                     self._require_current_resource_envelope(
@@ -906,6 +908,8 @@ class SQLiteHumanCollaboration:
                         initialization_id=initialization_id,
                         row=row,
                         draft=draft,
+                        idempotency_key=idempotency_key,
+                        request_hash=request_hash,
                     )
                     self._record_command(
                         connection,
@@ -1010,6 +1014,8 @@ class SQLiteHumanCollaboration:
         initialization_id: str,
         row: Row,
         draft: dict[str, object],
+        idempotency_key: str,
+        request_hash: str,
     ) -> str:
         if draft.get("route") != "deepfetch":
             raise OwnerConflict("deepfetch_route_required")
@@ -1048,6 +1054,18 @@ class SQLiteHumanCollaboration:
                 )
             elif existing.status == "cancelled":
                 raise OwnerConflict("deepfetch_request_cancelled")
+            elif existing.status == "succeeded":
+                if existing.snapshot_ref is None:
+                    raise OwnerConflict("deepfetch_result_binding_invalid")
+                self._queue_deepfetch_proposal_generation(
+                    connection,
+                    initialization_id=initialization_id,
+                    row=row,
+                    request_ref=str(existing.request_ref),
+                    snapshot_ref=str(existing.snapshot_ref),
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                )
             return str(existing.request_ref)
 
         scope = _deepfetch_scope(draft)
@@ -1148,6 +1166,81 @@ class SQLiteHumanCollaboration:
         )
         return request_ref
 
+    def _queue_deepfetch_proposal_generation(
+        self,
+        connection: Connection,
+        *,
+        initialization_id: str,
+        row: Row,
+        request_ref: str,
+        snapshot_ref: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> str:
+        active = connection.execute(
+            text(
+                "SELECT generation_ref, literature_snapshot_ref FROM "
+                "hc_proposal_generation_attempts WHERE initialization_id = "
+                ":initialization_id AND basis_revision = :basis_revision AND "
+                "basis_hash = :basis_hash AND route = 'deepfetch' AND status IN "
+                "('queued', 'running') ORDER BY created_at LIMIT 1"
+            ),
+            {
+                "initialization_id": initialization_id,
+                "basis_revision": int(row.draft_revision),
+                "basis_hash": row.draft_hash,
+            },
+        ).first()
+        if active is not None:
+            if active.literature_snapshot_ref != snapshot_ref:
+                raise OwnerConflict("deepfetch_proposal_route_conflict")
+            return str(active.generation_ref)
+        generation_ref = new_ref("proposal_generation")
+        now = time.time()
+        connection.execute(
+            text(
+                "INSERT INTO hc_proposal_generation_attempts "
+                "(generation_ref, initialization_id, idempotency_key, request_hash, "
+                "route, basis_revision, basis_hash, starting_proposal_revision, "
+                "status, adapter_kind, attempt_count, literature_snapshot_ref, "
+                "created_at) VALUES (:generation_ref, :initialization_id, "
+                ":idempotency_key, :request_hash, 'deepfetch', :basis_revision, "
+                ":basis_hash, :starting_proposal_revision, 'queued', :adapter_kind, "
+                "0, :literature_snapshot_ref, :now)"
+            ),
+            {
+                "generation_ref": generation_ref,
+                "initialization_id": initialization_id,
+                "idempotency_key": idempotency_key,
+                "request_hash": request_hash,
+                "basis_revision": int(row.draft_revision),
+                "basis_hash": row.draft_hash,
+                "starting_proposal_revision": int(row.proposal_revision),
+                "adapter_kind": type(self._proposal_drafter).__name__,
+                "literature_snapshot_ref": snapshot_ref,
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE human_collaboration_state SET revision = revision + 1 "
+                "WHERE singleton = 'owner'"
+            )
+        )
+        self._feed.record(
+            connection,
+            "human_collaboration.question_proposal_generation_queued",
+            {
+                "initialization_id": initialization_id,
+                "generation_ref": generation_ref,
+                "request_ref": request_ref,
+                "basis_revision": int(row.draft_revision),
+                "basis_hash": row.draft_hash,
+                "literature_snapshot_ref": snapshot_ref,
+            },
+        )
+        return generation_ref
+
     def save_question_proposal(
         self,
         initialization_id: str,
@@ -1180,10 +1273,8 @@ class SQLiteHumanCollaboration:
                 preflight_row = self._require_initialization(
                     connection, initialization_id
                 )
-                preflight_draft, _proposal = (
-                    _require_initialization_artifact_integrity(
-                        connection, preflight_row
-                    )
+                preflight_draft, _proposal = _require_initialization_artifact_integrity(
+                    connection, preflight_row
                 )
             else:
                 preflight_row = None
@@ -1208,9 +1299,7 @@ class SQLiteHumanCollaboration:
                 )
                 if row.status in {"confirmed", "completed", "cancelled"}:
                     raise OwnerConflict("quest_initialization_is_terminal")
-                _require_draft_cas(
-                    row, expected_draft_hash, expected_draft_revision
-                )
+                _require_draft_cas(row, expected_draft_hash, expected_draft_revision)
                 if row.proposal_ref is None:
                     raise OwnerConflict("question_proposal_missing")
                 if row.draft_schema_ref == DRAFT_V2_SCHEMA and (
@@ -1266,6 +1355,11 @@ class SQLiteHumanCollaboration:
                         if literature_snapshot is None
                         else literature_snapshot.snapshot_ref
                     ),
+                    literature_snapshot_hash=(
+                        None
+                        if literature_snapshot is None
+                        else literature_snapshot.snapshot_hash
+                    ),
                 )
                 refresh_preview = adopt_current_basis
         if refresh_preview:
@@ -1295,9 +1389,7 @@ class SQLiteHumanCollaboration:
                 preflight_row = self._require_initialization(
                     connection, initialization_id
                 )
-                _require_initialization_artifact_integrity(
-                    connection, preflight_row
-                )
+                _require_initialization_artifact_integrity(connection, preflight_row)
                 preflight_draft = decoded_object(preflight_row.draft_json)
                 preflight_draft_hash = preflight_row.draft_hash
             else:
@@ -1732,9 +1824,7 @@ class SQLiteHumanCollaboration:
         finally:
             self._finish_provider_job(self._proposal_drafter, provider_job_ref)
 
-    def _complete_claimed_proposal_job(
-        self, job: Row, revision: Row | None
-    ) -> bool:
+    def _complete_claimed_proposal_job(self, job: Row, revision: Row | None) -> bool:
         claim_attempt = int(job.attempt_count)
         provider_job_ref = _proposal_provider_job_ref(
             str(job.generation_ref), claim_attempt
@@ -1767,10 +1857,8 @@ class SQLiteHumanCollaboration:
                 )
                 return True
             if (
-                literature_snapshot.get("initialization_id")
-                != job.initialization_id
-                or literature_snapshot.get("draft_revision")
-                != int(job.basis_revision)
+                literature_snapshot.get("initialization_id") != job.initialization_id
+                or literature_snapshot.get("draft_revision") != int(job.basis_revision)
                 or literature_snapshot.get("draft_hash") != job.basis_hash
             ):
                 self._fail_proposal_job(
@@ -1798,9 +1886,7 @@ class SQLiteHumanCollaboration:
                 )
                 return True
             status = (
-                "capability_unavailable"
-                if "unavailable" in error.code
-                else "failed"
+                "capability_unavailable" if "unavailable" in error.code else "failed"
             )
             self._fail_proposal_job(
                 job.generation_ref,
@@ -1845,13 +1931,11 @@ class SQLiteHumanCollaboration:
                 row.status in {"confirmed", "completed", "cancelled"}
                 or int(row.draft_revision) != int(job.basis_revision)
                 or row.draft_hash != job.basis_hash
-                or int(row.proposal_revision)
-                != int(job.starting_proposal_revision)
+                or int(row.proposal_revision) != int(job.starting_proposal_revision)
             ):
                 failure_code = (
                     "proposal_changed_during_generation"
-                    if int(row.proposal_revision)
-                    != int(job.starting_proposal_revision)
+                    if int(row.proposal_revision) != int(job.starting_proposal_revision)
                     else "generation_basis_stale"
                 )
                 connection.execute(
@@ -1896,6 +1980,11 @@ class SQLiteHumanCollaboration:
                     record_command=False,
                     schema_ref=PROPOSAL_V2_SCHEMA,
                     literature_snapshot_ref=job.literature_snapshot_ref,
+                    literature_snapshot_hash=(
+                        None
+                        if literature_snapshot is None
+                        else str(literature_snapshot["snapshot_hash"])
+                    ),
                 )
                 connection.execute(
                     text(
@@ -2105,9 +2194,7 @@ class SQLiteHumanCollaboration:
                 turn, initialization_id, prior_metadata, turn_revision
             )
         finally:
-            self._finish_provider_job(
-                self._intent_drafting_provider, provider_job_ref
-            )
+            self._finish_provider_job(self._intent_drafting_provider, provider_job_ref)
 
     def _complete_claimed_intent_turn(
         self,
@@ -2117,9 +2204,7 @@ class SQLiteHumanCollaboration:
         turn_revision: Row | None,
     ) -> bool:
         claim_attempt = int(turn.assistant_attempt_count)
-        provider_job_ref = _intent_provider_job_ref(
-            str(turn.turn_ref), claim_attempt
-        )
+        provider_job_ref = _intent_provider_job_ref(str(turn.turn_ref), claim_attempt)
         if turn_revision is None or turn_revision.draft_hash != turn.basis_hash:
             with self._database.write() as connection:
                 updated = connection.execute(
@@ -2228,9 +2313,7 @@ class SQLiteHumanCollaboration:
             return True
 
         with self._database.write() as connection:
-            current = self._require_initialization(
-                connection, str(initialization_id)
-            )
+            current = self._require_initialization(connection, str(initialization_id))
             metadata = {
                 "adapter_kind": result.adapter_kind,
                 "native_session_ref": result.native_session_ref,
@@ -2562,9 +2645,7 @@ class SQLiteHumanCollaboration:
             "preview_hash": preview_hash,
         }
         request_hash = canonical_hash({"command": "confirm", **request})
-        prior_failure = self._query_confirmation_attempt(
-            idempotency_key, request_hash
-        )
+        prior_failure = self._query_confirmation_attempt(idempotency_key, request_hash)
         if prior_failure is not None:
             raise OwnerConflict(prior_failure)
         with self._database.read() as connection:
@@ -2869,9 +2950,7 @@ class SQLiteHumanCollaboration:
             )
         )
         running_generation_refs = tuple(
-            _proposal_provider_job_ref(
-                str(row.generation_ref), int(row.attempt_count)
-            )
+            _proposal_provider_job_ref(str(row.generation_ref), int(row.attempt_count))
             for row in connection.execute(
                 text(
                     "SELECT generation_ref, attempt_count FROM "
@@ -2934,9 +3013,7 @@ class SQLiteHumanCollaboration:
             ).first()
         return None if row is None else _deepfetch_request_from_row(row)
 
-    def query_deepfetch_request(
-        self, request_ref: str
-    ) -> DeepFetchRunRequest | None:
+    def query_deepfetch_request(self, request_ref: str) -> DeepFetchRunRequest | None:
         with self._database.read() as connection:
             row = connection.execute(
                 text(
@@ -2960,18 +3037,22 @@ class SQLiteHumanCollaboration:
     ) -> None:
         request = self.query_deepfetch_request(request_ref)
         run = self._agent_runtime.query_deepfetch_run(request_ref)
-        if request is None or run is None or (
-            run.status != "executed"
-            or run.run_ref != run_ref
-            or run.execution_receipt is None
-            or snapshot.request_ref != request_ref
-            or snapshot.initialization_id != request.initialization_id
-            or snapshot.draft_revision != request.draft_revision
-            or snapshot.draft_hash != request.draft_hash
-            or snapshot.scope_hash != request.scope_hash
-            or snapshot.run_ref != run_ref
-            or snapshot.result_hash != run.result_hash
-            or snapshot.execution_receipt != run.execution_receipt
+        if (
+            request is None
+            or run is None
+            or (
+                run.status != "executed"
+                or run.run_ref != run_ref
+                or run.execution_receipt is None
+                or snapshot.request_ref != request_ref
+                or snapshot.initialization_id != request.initialization_id
+                or snapshot.draft_revision != request.draft_revision
+                or snapshot.draft_hash != request.draft_hash
+                or snapshot.scope_hash != request.scope_hash
+                or snapshot.run_ref != run_ref
+                or snapshot.result_hash != run.result_hash
+                or snapshot.execution_receipt != run.execution_receipt
+            )
         ):
             raise OwnerConflict("deepfetch_result_binding_invalid")
         now = time.time()
@@ -3065,8 +3146,7 @@ class SQLiteHumanCollaboration:
                         },
                     )
                 elif (
-                    existing_generation.literature_snapshot_ref
-                    != snapshot.snapshot_ref
+                    existing_generation.literature_snapshot_ref != snapshot.snapshot_ref
                 ):
                     raise OwnerConflict("deepfetch_proposal_route_conflict")
             connection.execute(
@@ -3139,9 +3219,7 @@ class SQLiteHumanCollaboration:
             current_draft_value, proposal_value = (
                 _require_initialization_artifact_integrity(connection, row)
             )
-            current_envelope_ref = current_draft_value.get(
-                "resource_envelope_ref"
-            )
+            current_envelope_ref = current_draft_value.get("resource_envelope_ref")
             failure = connection.execute(
                 text(
                     "SELECT layer, status, reason_code FROM "
@@ -3313,9 +3391,7 @@ class SQLiteHumanCollaboration:
                         envelope_value = candidate_envelope
         envelope_current = (
             envelope_value is not None
-            and _resource_envelope_matches_draft(
-                current_draft_value, envelope_value
-            )
+            and _resource_envelope_matches_draft(current_draft_value, envelope_value)
         )
         quest_failure: OwnerConflict | None = None
         try:
@@ -3414,7 +3490,8 @@ class SQLiteHumanCollaboration:
             and material_bindings_current
             and (
                 row.draft_schema_ref != DRAFT_V2_SCHEMA
-                or envelope_current and preview_binding is not None
+                or envelope_current
+                and preview_binding is not None
             )
         )
         if current_draft_value.get("route") == "deepfetch":
@@ -3479,27 +3556,29 @@ class SQLiteHumanCollaboration:
                 "completed"
                 if live_failure_layer is None
                 and material_complete
-                and all(value is not None for value in (quest, content, question, cycle))
+                and all(
+                    value is not None for value in (quest, content, question, cycle)
+                )
                 else "unavailable"
             )
         elif row.confirmation_ref is not None:
             status = (
                 "recovering"
                 if checkpoint is not None and checkpoint.state == "recovering"
-                else
-                "partial"
-                if (failure is not None or live_failure_layer is not None)
-                and any(value is not None for value in (quest, content, question, cycle))
                 else (
-                    "recovering"
-                    if failure is not None or live_failure_layer is not None
-                    else "dispatching"
+                    "partial"
+                    if (failure is not None or live_failure_layer is not None)
+                    and any(
+                        value is not None for value in (quest, content, question, cycle)
+                    )
+                    else (
+                        "recovering"
+                        if failure is not None or live_failure_layer is not None
+                        else "dispatching"
+                    )
                 )
             )
-        elif (
-            generation_current
-            and generation.status in {"queued", "running"}
-        ):
+        elif generation_current and generation.status in {"queued", "running"}:
             status = "proposal_generating"
         elif deepfetch_active:
             status = "proposal_generating"
@@ -3818,27 +3897,31 @@ class SQLiteHumanCollaboration:
 
     def reconcile_once(self) -> bool:
         with self._database.read() as connection:
-            initialization_ids = connection.execute(
-                text(
-                    "SELECT initializations.initialization_id FROM "
-                    "hc_quest_initializations AS initializations LEFT JOIN "
-                    "hc_reconciliation_checkpoints AS checkpoints ON "
-                    "checkpoints.initialization_id = initializations.initialization_id "
-                    "WHERE (initializations.status = 'confirmed' OR "
-                    "initializations.status = 'completed' AND "
-                    "(checkpoints.state IN ('partial', 'recovering') OR "
-                    "checkpoints.updated_at IS NULL OR checkpoints.updated_at <= "
-                    ":completed_audit_before)) AND "
-                    "(checkpoints.next_retry_at IS NULL OR checkpoints.next_retry_at "
-                    "<= :now) ORDER BY initializations.updated_at"
-                ),
-                {
-                    "now": time.time(),
-                    "completed_audit_before": (
-                        time.time() - _COMPLETED_CUSTODY_AUDIT_SECONDS
+            initialization_ids = (
+                connection.execute(
+                    text(
+                        "SELECT initializations.initialization_id FROM "
+                        "hc_quest_initializations AS initializations LEFT JOIN "
+                        "hc_reconciliation_checkpoints AS checkpoints ON "
+                        "checkpoints.initialization_id = initializations.initialization_id "
+                        "WHERE (initializations.status = 'confirmed' OR "
+                        "initializations.status = 'completed' AND "
+                        "(checkpoints.state IN ('partial', 'recovering') OR "
+                        "checkpoints.updated_at IS NULL OR checkpoints.updated_at <= "
+                        ":completed_audit_before)) AND "
+                        "(checkpoints.next_retry_at IS NULL OR checkpoints.next_retry_at "
+                        "<= :now) ORDER BY initializations.updated_at"
                     ),
-                },
-            ).scalars().all()
+                    {
+                        "now": time.time(),
+                        "completed_audit_before": (
+                            time.time() - _COMPLETED_CUSTODY_AUDIT_SECONDS
+                        ),
+                    },
+                )
+                .scalars()
+                .all()
+            )
         for raw_id in initialization_ids:
             if self._reconcile_initialization_once(str(raw_id)):
                 return True
@@ -3943,9 +4026,7 @@ class SQLiteHumanCollaboration:
                     ),
                 )
                 return False
-        self._clear_dispatch_failure(
-            initialization_id, "quest_source_material"
-        )
+        self._clear_dispatch_failure(initialization_id, "quest_source_material")
 
         try:
             content = self._research_memory.query_question_content(initialization_id)
@@ -4027,9 +4108,7 @@ class SQLiteHumanCollaboration:
                 self._record_dispatch_failure(
                     initialization_id,
                     "question_identity",
-                    _dispatch_failure_reason(
-                        error, "question_identity_io_unavailable"
-                    ),
+                    _dispatch_failure_reason(error, "question_identity_io_unavailable"),
                 )
                 return False
             self._clear_dispatch_failure(initialization_id, "question_identity")
@@ -4056,9 +4135,7 @@ class SQLiteHumanCollaboration:
                 self._record_dispatch_failure(
                     initialization_id,
                     "cycle_activation",
-                    _dispatch_failure_reason(
-                        error, "cycle_activation_io_unavailable"
-                    ),
+                    _dispatch_failure_reason(error, "cycle_activation_io_unavailable"),
                 )
                 return False
             self._clear_dispatch_failure(initialization_id, "cycle_activation")
@@ -4179,7 +4256,8 @@ class SQLiteHumanCollaboration:
                     "layer": layer,
                     "attempt_count": attempt_number,
                     "reason_code": reason_code,
-                    "next_retry_at": now + min(30.0, 0.5 * (2**min(attempt_number, 6))),
+                    "next_retry_at": now
+                    + min(30.0, 0.5 * (2 ** min(attempt_number, 6))),
                     "now": now,
                 },
             )
@@ -4284,9 +4362,7 @@ class SQLiteHumanCollaboration:
             raise OwnerConflict("resource_envelope_stale") from error
         except OwnerConflict as error:
             raise OwnerConflict("resource_envelope_stale") from error
-        if not _resource_envelope_integrity_is_valid(
-            binding, envelope, observation
-        ):
+        if not _resource_envelope_integrity_is_valid(binding, envelope, observation):
             raise OwnerConflict("resource_envelope_stale")
         if _resource_envelope_matches_draft(draft, envelope):
             return None
@@ -4436,7 +4512,8 @@ class SQLiteHumanCollaboration:
         if proposal_ref is not None:
             proposal = connection.execute(
                 text(
-                    "SELECT literature_snapshot_ref FROM hc_question_proposals "
+                    "SELECT literature_snapshot_ref, literature_snapshot_hash, "
+                    "binding_schema_ref FROM hc_question_proposals "
                     "WHERE proposal_ref = :proposal_ref AND initialization_id = "
                     ":initialization_id"
                 ),
@@ -4448,6 +4525,8 @@ class SQLiteHumanCollaboration:
             if (
                 proposal is None
                 or proposal.literature_snapshot_ref != snapshot.snapshot_ref
+                or proposal.literature_snapshot_hash != snapshot.snapshot_hash
+                or proposal.binding_schema_ref != PROPOSAL_BINDING_V2_SCHEMA
             ):
                 raise OwnerConflict("literature_snapshot_stale")
         return snapshot
@@ -4469,9 +4548,7 @@ class SQLiteHumanCollaboration:
             draft = decoded_object(row.draft_json)
             envelope_ref = draft.get("resource_envelope_ref")
             envelope_hash = draft.get("resource_envelope_hash")
-            if not isinstance(envelope_ref, str) or not isinstance(
-                envelope_hash, str
-            ):
+            if not isinstance(envelope_ref, str) or not isinstance(envelope_hash, str):
                 return False
             try:
                 literature_snapshot = self._require_current_deepfetch_snapshot(
@@ -4811,6 +4888,7 @@ class SQLiteHumanCollaboration:
         basis_revision: int | None = None,
         basis_hash: str | None = None,
         literature_snapshot_ref: str | None = None,
+        literature_snapshot_hash: str | None = None,
     ) -> tuple[str, str]:
         normalized = _validate_question_content(content, require_complete=False)
         schema_ref = schema_ref or (
@@ -4824,24 +4902,40 @@ class SQLiteHumanCollaboration:
         )
         basis_hash = row.draft_hash if basis_hash is None else basis_hash
         proposal_ref = new_ref("question_proposal")
-        proposal_hash = canonical_hash(
-            {
-                "schema_ref": schema_ref,
-                "basis_revision": basis_revision,
-                "basis_hash": basis_hash,
-                "content": normalized,
-            }
+        binding_schema_ref = (
+            PROPOSAL_BINDING_V2_SCHEMA
+            if row.draft_schema_ref == DRAFT_V2_SCHEMA
+            else None
         )
+        if (literature_snapshot_ref is None) != (literature_snapshot_hash is None):
+            raise OwnerConflict("literature_snapshot_binding_invalid")
+        proposal_binding: dict[str, object] = {
+            "schema_ref": schema_ref,
+            "basis_revision": basis_revision,
+            "basis_hash": basis_hash,
+            "content": normalized,
+        }
+        if binding_schema_ref is not None:
+            proposal_binding.update(
+                {
+                    "binding_schema_ref": binding_schema_ref,
+                    "literature_snapshot_ref": literature_snapshot_ref,
+                    "literature_snapshot_hash": literature_snapshot_hash,
+                }
+            )
+        proposal_hash = canonical_hash(proposal_binding)
         now = time.time()
         connection.execute(
             text(
                 "INSERT INTO hc_question_proposals (proposal_ref, "
                 "initialization_id, revision, basis_revision, basis_hash, "
                 "content_json, proposal_hash, schema_ref, literature_snapshot_ref, "
+                "literature_snapshot_hash, binding_schema_ref, "
                 "recorded_at) VALUES (:proposal_ref, "
                 ":initialization_id, :revision, :basis_revision, :basis_hash, "
                 ":content_json, :proposal_hash, :schema_ref, "
-                ":literature_snapshot_ref, :now)"
+                ":literature_snapshot_ref, :literature_snapshot_hash, "
+                ":binding_schema_ref, :now)"
             ),
             {
                 "proposal_ref": proposal_ref,
@@ -4853,6 +4947,8 @@ class SQLiteHumanCollaboration:
                 "proposal_hash": proposal_hash,
                 "schema_ref": schema_ref,
                 "literature_snapshot_ref": literature_snapshot_ref,
+                "literature_snapshot_hash": literature_snapshot_hash,
+                "binding_schema_ref": binding_schema_ref,
                 "now": now,
             },
         )
@@ -4957,14 +5053,10 @@ class SQLiteHumanCollaboration:
         except OwnerConflict as error:
             raise OwnerConflict("confirmation_preview_stale") from error
         literature_snapshot_ref = (
-            None
-            if literature_snapshot is None
-            else literature_snapshot.snapshot_ref
+            None if literature_snapshot is None else literature_snapshot.snapshot_ref
         )
         literature_snapshot_hash = (
-            None
-            if literature_snapshot is None
-            else literature_snapshot.snapshot_hash
+            None if literature_snapshot is None else literature_snapshot.snapshot_hash
         )
         envelope_ref = draft.get("resource_envelope_ref")
         envelope_hash = draft.get("resource_envelope_hash")
@@ -5074,11 +5166,16 @@ class SQLiteHumanCollaboration:
         request_hash: str,
         reason_code: str,
     ) -> None:
-        decision = "stale" if reason_code in {
-            "quest_draft_stale",
-            "question_proposal_stale",
-            "confirmation_preview_stale",
-        } else "rejected"
+        decision = (
+            "stale"
+            if reason_code
+            in {
+                "quest_draft_stale",
+                "question_proposal_stale",
+                "confirmation_preview_stale",
+            }
+            else "rejected"
+        )
         with self._database.write() as connection:
             existing = connection.execute(
                 text(
@@ -5208,9 +5305,7 @@ def _project_owner_receipt(fact, failure: OwnerConflict | None) -> dict[str, obj
     return fact.receipt.as_public_dict() if fact is not None else _not_attempted()
 
 
-def _dispatch_failure_reason(
-    error: OwnerConflict | OSError, io_reason: str
-) -> str:
+def _dispatch_failure_reason(error: OwnerConflict | OSError, io_reason: str) -> str:
     return error.code if isinstance(error, OwnerConflict) else io_reason
 
 
@@ -5273,7 +5368,9 @@ def _require_initialization_artifact_integrity(
         proposal_record = connection.execute(
             text(
                 "SELECT initialization_id, revision, basis_revision, basis_hash, "
-                "content_json, proposal_hash, schema_ref FROM "
+                "content_json, proposal_hash, schema_ref, "
+                "literature_snapshot_ref, literature_snapshot_hash, "
+                "binding_schema_ref FROM "
                 "hc_question_proposals WHERE proposal_ref = :proposal_ref"
             ),
             {"proposal_ref": row.proposal_ref},
@@ -5281,14 +5378,37 @@ def _require_initialization_artifact_integrity(
         if proposal_record is None:
             raise OwnerConflict(error_code)
         recorded_content = decoded_object(proposal_record.content_json)
-        bound_proposal_hash = canonical_hash(
-            {
-                "schema_ref": proposal_record.schema_ref,
-                "basis_revision": int(proposal_record.basis_revision),
-                "basis_hash": proposal_record.basis_hash,
-                "content": recorded_content,
-            }
-        )
+        proposal_binding: dict[str, object] = {
+            "schema_ref": proposal_record.schema_ref,
+            "basis_revision": int(proposal_record.basis_revision),
+            "basis_hash": proposal_record.basis_hash,
+            "content": recorded_content,
+        }
+        if proposal_record.binding_schema_ref is None:
+            if (
+                proposal_record.literature_snapshot_ref is not None
+                or proposal_record.literature_snapshot_hash is not None
+            ):
+                raise OwnerConflict(error_code)
+        elif proposal_record.binding_schema_ref == PROPOSAL_BINDING_V2_SCHEMA:
+            if (proposal_record.literature_snapshot_ref is None) != (
+                proposal_record.literature_snapshot_hash is None
+            ):
+                raise OwnerConflict(error_code)
+            proposal_binding.update(
+                {
+                    "binding_schema_ref": proposal_record.binding_schema_ref,
+                    "literature_snapshot_ref": (
+                        proposal_record.literature_snapshot_ref
+                    ),
+                    "literature_snapshot_hash": (
+                        proposal_record.literature_snapshot_hash
+                    ),
+                }
+            )
+        else:
+            raise OwnerConflict(error_code)
+        bound_proposal_hash = canonical_hash(proposal_binding)
         accepted_proposal_hashes = {bound_proposal_hash}
         proposal_basis_schema = connection.execute(
             text(
@@ -5701,9 +5821,7 @@ def _public_deepfetch(
         "literature_snapshot": (
             None if snapshot is None else snapshot.as_public_dict()
         ),
-        "failure": (
-            None if failure_code is None else {"code": failure_code}
-        ),
+        "failure": (None if failure_code is None else {"code": failure_code}),
     }
 
 
@@ -5774,9 +5892,7 @@ def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
         normalized_bindings = [
             _validated_material_binding_dict(item) for item in bindings
         ]
-        version_refs = [
-            cast(str, item["version_ref"]) for item in normalized_bindings
-        ]
+        version_refs = [cast(str, item["version_ref"]) for item in normalized_bindings]
         if len(version_refs) != len(set(version_refs)):
             raise OwnerConflict("accepted_material_bindings_invalid")
         normalized_bindings.sort(key=lambda item: cast(str, item["version_ref"]))
@@ -6049,13 +6165,18 @@ def _validate_generation_basis(draft: dict[str, object]) -> None:
     normalized = _validate_draft(draft)
     for field in ("goal", "completion_criteria"):
         value = normalized[field]
-        if not isinstance(value, str) or not value.strip() or value.lower() in {
-            "unknown",
-            "not_applicable",
-            "not applicable",
-            "n/a",
-            "na",
-        }:
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value.lower()
+            in {
+                "unknown",
+                "not_applicable",
+                "not applicable",
+                "n/a",
+                "na",
+            }
+        ):
             raise OwnerConflict(f"{field}_required")
     if _draft_schema_ref(normalized) == DRAFT_V1_SCHEMA:
         return
@@ -6065,9 +6186,10 @@ def _validate_generation_basis(draft: dict[str, object]) -> None:
     ):
         raise OwnerConflict("resource_envelope_required")
     literature = cast(dict[str, object], normalized["literature"])
-    if literature["mode"] == "provided_only" and not literature[
-        "accepted_material_bindings"
-    ]:
+    if (
+        literature["mode"] == "provided_only"
+        and not literature["accepted_material_bindings"]
+    ):
         raise OwnerConflict("accepted_material_binding_required")
 
 
@@ -6084,10 +6206,14 @@ def _validate_question_content(
         value = value.strip()
         if len(value) > QUESTION_FIELD_MAX_LENGTHS[field]:
             raise OwnerConflict(f"{field}_too_long")
-        if require_complete and field in REQUIRED_QUESTION_FIELDS and (
-            not value
-            or value.lower()
-            in {"unknown", "not_applicable", "not applicable", "n/a", "na"}
+        if (
+            require_complete
+            and field in REQUIRED_QUESTION_FIELDS
+            and (
+                not value
+                or value.lower()
+                in {"unknown", "not_applicable", "not applicable", "n/a", "na"}
+            )
         ):
             raise OwnerConflict(f"{field}_required")
         normalized[field] = value

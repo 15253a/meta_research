@@ -118,9 +118,12 @@ changing its stable ref, hash, object path, or historical receipt.
 
 Quest creation may select exact accepted AssetVersion bindings for its material
 basis, including `provided_only`; raw browser files and paths still cannot enter
-that basis directly. First-question DeepFetch remains explicitly typed as
-unavailable until its production slice is delivered. The direct path does not
-use a CreationSeed or treat DeepFetch unavailability as a waiver.
+that basis directly. First-question DeepFetch is available as the explicit
+`deepfetch` route: HC freezes and authorizes one request, AR executes a fenced
+live Web Search/Fetch Run, and RM accepts an exact LiteratureSnapshot before the
+same six-field Proposal and final confirmation continue. The `direct` path does
+not create a snapshot, use a CreationSeed, or treat DeepFetch failure,
+cancellation, timeout, or unavailability as a waiver.
 
 The supported public host operations are exposed by the `meta-research`
 command. Research state is observed through the authenticated Snapshot and SSE

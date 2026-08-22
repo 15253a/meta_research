@@ -188,6 +188,7 @@ class LiteratureSnapshotVerifier(Protocol):
         initialization_id: str,
         draft_revision: int,
         draft_hash: str,
+        receipt: AcceptanceReceipt | None = None,
     ) -> None: ...
 
 
@@ -261,10 +262,12 @@ class DeepFetchRunRequestVerifier(Protocol):
         draft_revision: int,
         draft_hash: str,
         scope_hash: str,
+        material_bindings_hash: str,
         resource_envelope_ref: str,
         resource_envelope_hash: str,
         result_route: str,
         receipt: AcceptanceReceipt,
+        require_active: bool = False,
     ) -> None: ...
 
 

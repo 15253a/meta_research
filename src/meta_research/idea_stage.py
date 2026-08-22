@@ -540,13 +540,25 @@ class IdeaStageWorker:
         evidence_revision, evidence_refs = reference_query(
             current.question.quest_ref
         )
+        quest = self._research_graph.query_quest(
+            current.question.initialization_id
+        )
+        if quest is None or quest.quest_ref != current.question.quest_ref:
+            raise OwnerConflict("idea_question_quest_binding_invalid")
+        snapshot = self._research_memory.query_literature_snapshot_for_basis(
+            quest.initialization_id,
+            quest.draft_revision,
+            quest.draft_hash,
+        )
         return {
             "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_REF,
             "cycle_ref": current.cycle_ref,
             "accepted_question_binding": current.question.as_binding().as_dict(),
             "accepted_evidence_refs": list(evidence_refs),
             "evidence_reference_revision": evidence_revision,
-            "literature_binding": None,
+            "literature_binding": (
+                None if snapshot is None else snapshot.as_context_binding()
+            ),
             "prior_accepted_bindings": [],
             "active_guidance_bindings": [],
         }

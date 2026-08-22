@@ -35,6 +35,10 @@ class FirstQuestionDeepFetchWorker:
                 snapshot,
             )
         except DeepFetchUnavailable as error:
+            if error.code == "deepfetch_provider_stopped":
+                return True
+            if error.code == "deepfetch_provider_reconciliation_pending":
+                return False
             run = self._agent_runtime.query_deepfetch_run(request.request_ref)
             self._human_collaboration.record_deepfetch_failed(
                 request.request_ref,
@@ -44,6 +48,13 @@ class FirstQuestionDeepFetchWorker:
         except OwnerConflict as error:
             if error.code == "deepfetch_run_busy":
                 return False
+            if error.code in {
+                "deepfetch_attempt_fence_stale",
+                "deepfetch_run_cancelled",
+            }:
+                # A predecessor Attempt is no longer authoritative.  Its late
+                # completion must not write failure state onto the successor.
+                return True
             run = self._agent_runtime.query_deepfetch_run(request.request_ref)
             self._human_collaboration.record_deepfetch_failed(
                 request.request_ref,

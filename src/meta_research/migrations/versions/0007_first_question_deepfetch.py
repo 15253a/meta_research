@@ -32,14 +32,10 @@ def _hash(name: str) -> sa.CheckConstraint:
 
 def upgrade() -> None:
     op.add_column("agent_runtime_state", _counter("deepfetch_run_count"))
-    op.add_column(
-        "agent_runtime_state", _counter("deepfetch_completed_run_count")
-    )
+    op.add_column("agent_runtime_state", _counter("deepfetch_completed_run_count"))
     op.add_column("agent_runtime_state", _counter("deepfetch_attempt_count"))
     op.add_column("agent_runtime_state", _counter("deepfetch_session_count"))
-    op.add_column(
-        "research_memory_state", _counter("literature_snapshot_count")
-    )
+    op.add_column("research_memory_state", _counter("literature_snapshot_count"))
     op.add_column(
         "hc_proposal_generation_attempts",
         sa.Column("literature_snapshot_ref", sa.String(length=64), nullable=True),
@@ -47,6 +43,14 @@ def upgrade() -> None:
     op.add_column(
         "hc_question_proposals",
         sa.Column("literature_snapshot_ref", sa.String(length=64), nullable=True),
+    )
+    op.add_column(
+        "hc_question_proposals",
+        sa.Column("literature_snapshot_hash", sa.String(length=64), nullable=True),
+    )
+    op.add_column(
+        "hc_question_proposals",
+        sa.Column("binding_schema_ref", sa.String(length=80), nullable=True),
     )
     op.add_column(
         "hc_confirmation_preview_bindings",
@@ -141,9 +145,28 @@ def upgrade() -> None:
         sa.Column("status", sa.String(length=24), nullable=False),
         sa.Column("current_attempt_ref", sa.String(length=64), nullable=True),
         sa.Column("attempt_generation", sa.Integer(), nullable=False),
+        sa.Column(
+            "provider_operation_ref", sa.String(length=128), nullable=False, unique=True
+        ),
+        sa.Column("provider_operation_generation", sa.Integer(), nullable=False),
+        sa.Column(
+            "provider_operation_retry_permitted",
+            sa.Integer(),
+            nullable=False,
+            server_default="0",
+        ),
+        sa.Column(
+            "reconciliation_attempt_count",
+            sa.Integer(),
+            nullable=False,
+            server_default="0",
+        ),
+        sa.Column("next_reconcile_at", sa.Float(), nullable=True),
         sa.Column("result_json", sa.Text(), nullable=True),
         sa.Column("result_hash", sa.String(length=64), nullable=True),
-        sa.Column("execution_receipt_ref", sa.String(length=64), nullable=True, unique=True),
+        sa.Column(
+            "execution_receipt_ref", sa.String(length=64), nullable=True, unique=True
+        ),
         sa.Column("execution_receipt_hash", sa.String(length=64), nullable=True),
         sa.Column("failure_code", sa.String(length=96), nullable=True),
         sa.Column("created_at", sa.Float(), nullable=False),
@@ -152,6 +175,16 @@ def upgrade() -> None:
         _hash("request_hash"),
         _hash("runtime_binding_hash"),
         sa.CheckConstraint("attempt_generation >= 0"),
+        sa.CheckConstraint("provider_operation_generation >= 1"),
+        sa.CheckConstraint("provider_operation_retry_permitted IN (0, 1)"),
+        sa.CheckConstraint("reconciliation_attempt_count >= 0"),
+        sa.CheckConstraint(
+            "provider_operation_retry_permitted = 0 OR status = 'failed'"
+        ),
+        sa.CheckConstraint(
+            "next_reconcile_at IS NULL OR "
+            "(status = 'admitted' AND reconciliation_attempt_count > 0)"
+        ),
         sa.CheckConstraint(
             "status IN ('admitted', 'running', 'executed', 'failed', 'cancelled')"
         ),
@@ -256,10 +289,18 @@ def upgrade() -> None:
         sa.Column("fulltexts_object_path", sa.Text(), nullable=False),
         sa.Column("limitations_json", sa.Text(), nullable=False),
         sa.Column("limitations_hash", sa.String(length=64), nullable=False),
+        sa.Column("web_evidence_json", sa.Text(), nullable=False),
+        sa.Column("web_evidence_hash", sa.String(length=64), nullable=False),
         sa.Column("snapshot_hash", sa.String(length=64), nullable=False),
         sa.Column("receipt_ref", sa.String(length=64), nullable=False, unique=True),
         sa.Column("receipt_hash", sa.String(length=64), nullable=False),
         sa.Column("accepted_at", sa.Float(), nullable=False),
+        sa.UniqueConstraint(
+            "initialization_id",
+            "draft_revision",
+            "draft_hash",
+            name="uq_rm_literature_snapshot_basis",
+        ),
         sa.CheckConstraint("draft_revision >= 1"),
         _hash("draft_hash"),
         _hash("scope_hash"),
@@ -269,6 +310,7 @@ def upgrade() -> None:
         _hash("papers_hash"),
         _hash("fulltexts_hash"),
         _hash("limitations_hash"),
+        _hash("web_evidence_hash"),
         _hash("snapshot_hash"),
         _hash("receipt_hash"),
         sa.CheckConstraint("completion IN ('complete', 'limited', 'honest_empty')"),

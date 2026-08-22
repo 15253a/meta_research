@@ -176,6 +176,7 @@ def build_production_runtime(
         research_graph_receipts,
         attempt_receipts,
         research_graph_receipts,
+        research_memory,
     )
     human_collaboration = create_human_collaboration_interface(
         database,

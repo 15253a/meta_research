@@ -397,6 +397,7 @@ class AcceptedLiteratureSnapshot:
     fulltexts_ref: str
     fulltexts_hash: str
     limitations: tuple[str, ...]
+    web_evidence_hash: str
     snapshot_hash: str
     paper_count: int
     fulltext_count: int
@@ -420,9 +421,23 @@ class AcceptedLiteratureSnapshot:
             "fulltexts_ref": self.fulltexts_ref,
             "fulltexts_hash": self.fulltexts_hash,
             "limitations": list(self.limitations),
+            "web_evidence_hash": self.web_evidence_hash,
             "snapshot_hash": self.snapshot_hash,
             "paper_count": self.paper_count,
             "fulltext_count": self.fulltext_count,
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+    def as_context_binding(self) -> dict[str, object]:
+        """Return the compact issuer-owned binding carried into Idea."""
+
+        return {
+            "schema_ref": "meta-research/idea-literature-binding/v1",
+            "snapshot_ref": self.snapshot_ref,
+            "snapshot_hash": self.snapshot_hash,
+            "initialization_id": self.initialization_id,
+            "draft_revision": self.draft_revision,
+            "draft_hash": self.draft_hash,
             "receipt": self.receipt.as_public_dict(),
         }
 
@@ -635,6 +650,10 @@ class ResearchMemoryInterface(Protocol):
         self, request_ref: str
     ) -> AcceptedLiteratureSnapshot | None: ...
 
+    def query_literature_snapshot_for_basis(
+        self, initialization_id: str, draft_revision: int, draft_hash: str
+    ) -> AcceptedLiteratureSnapshot | None: ...
+
     def verify_literature_snapshot_binding(
         self,
         *,
@@ -643,6 +662,7 @@ class ResearchMemoryInterface(Protocol):
         initialization_id: str,
         draft_revision: int,
         draft_hash: str,
+        receipt: AcceptanceReceipt | None = None,
     ) -> None: ...
 
     def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]: ...
@@ -3656,14 +3676,39 @@ class SQLiteResearchMemory:
     ) -> AcceptedQuestionContent:
         if canonical_hash(content) != content_hash:
             raise OwnerConflict("question_content_hash_mismatch")
-        if canonical_hash(
+        proposal_binding: dict[str, object] = {
+            "schema_ref": QUESTION_PROPOSAL_SCHEMA,
+            "basis_revision": quest.draft_revision,
+            "basis_hash": quest.draft_hash,
+            "content": content,
+        }
+        legacy_proposal_hash = canonical_hash(proposal_binding)
+        literature_snapshot = self.query_literature_snapshot_for_basis(
+            initialization_id,
+            quest.draft_revision,
+            quest.draft_hash,
+        )
+        proposal_binding.update(
             {
-                "schema_ref": QUESTION_PROPOSAL_SCHEMA,
-                "basis_revision": quest.draft_revision,
-                "basis_hash": quest.draft_hash,
-                "content": content,
+                "binding_schema_ref": (
+                    "meta-research/question-proposal-binding/v2"
+                ),
+                "literature_snapshot_ref": (
+                    None
+                    if literature_snapshot is None
+                    else literature_snapshot.snapshot_ref
+                ),
+                "literature_snapshot_hash": (
+                    None
+                    if literature_snapshot is None
+                    else literature_snapshot.snapshot_hash
+                ),
             }
-        ) != quest.proposal_hash:
+        )
+        if quest.proposal_hash not in {
+            legacy_proposal_hash,
+            canonical_hash(proposal_binding),
+        }:
             raise OwnerConflict("question_content_proposal_mismatch")
         self._confirmation_verifier.verify_bundle_confirmation(
             initialization_id=initialization_id,
@@ -4070,6 +4115,9 @@ class SQLiteResearchMemory:
         limitations = tuple(result["limitations"])
         limitations_json = canonical_json(list(limitations))
         limitations_hash = canonical_hash(list(limitations))
+        web_evidence = result["web_evidence"]
+        web_evidence_json = canonical_json(web_evidence)
+        web_evidence_hash = canonical_hash(web_evidence)
         snapshot_ref = new_ref("literature_snapshot")
         snapshot_binding = {
             "schema_ref": "meta-research/literature-snapshot/v1",
@@ -4091,6 +4139,7 @@ class SQLiteResearchMemory:
             "fulltexts_ref": fulltexts_ref,
             "fulltexts_hash": fulltexts_hash,
             "limitations_hash": limitations_hash,
+            "web_evidence_hash": web_evidence_hash,
         }
         snapshot_hash = canonical_hash(snapshot_binding)
         receipt_ref = new_ref("rm_receipt")
@@ -4120,6 +4169,7 @@ class SQLiteResearchMemory:
                         "summary_ref, summary_hash, summary_object_path, papers_ref, "
                         "papers_hash, papers_object_path, fulltexts_ref, fulltexts_hash, "
                         "fulltexts_object_path, limitations_json, limitations_hash, "
+                        "web_evidence_json, web_evidence_hash, "
                         "snapshot_hash, receipt_ref, receipt_hash, accepted_at) VALUES "
                         "(:snapshot_ref, :request_ref, :initialization_id, "
                         ":draft_revision, :draft_hash, :scope_hash, :run_ref, "
@@ -4128,7 +4178,9 @@ class SQLiteResearchMemory:
                         ":summary_ref, :summary_hash, :summary_object_path, :papers_ref, "
                         ":papers_hash, :papers_object_path, :fulltexts_ref, "
                         ":fulltexts_hash, :fulltexts_object_path, :limitations_json, "
-                        ":limitations_hash, :snapshot_hash, :receipt_ref, :receipt_hash, "
+                        ":limitations_hash, :web_evidence_json, "
+                        ":web_evidence_hash, :snapshot_hash, :receipt_ref, "
+                        ":receipt_hash, "
                         ":accepted_at)"
                     ),
                     {
@@ -4139,6 +4191,8 @@ class SQLiteResearchMemory:
                         "papers_object_path": papers_path,
                         "fulltexts_object_path": fulltexts_path,
                         "limitations_json": limitations_json,
+                        "web_evidence_json": web_evidence_json,
+                        "web_evidence_hash": web_evidence_hash,
                         "snapshot_hash": snapshot_hash,
                         "receipt_ref": receipt_ref,
                         "receipt_hash": receipt_hash,
@@ -4195,6 +4249,24 @@ class SQLiteResearchMemory:
             ).first()
         return None if row is None else self._accepted_literature_snapshot(row)
 
+    def query_literature_snapshot_for_basis(
+        self, initialization_id: str, draft_revision: int, draft_hash: str
+    ) -> AcceptedLiteratureSnapshot | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_literature_snapshots WHERE "
+                    "initialization_id = :initialization_id AND draft_revision = "
+                    ":draft_revision AND draft_hash = :draft_hash"
+                ),
+                {
+                    "initialization_id": initialization_id,
+                    "draft_revision": draft_revision,
+                    "draft_hash": draft_hash,
+                },
+            ).first()
+        return None if row is None else self._accepted_literature_snapshot(row)
+
     def verify_literature_snapshot_binding(
         self,
         *,
@@ -4203,6 +4275,7 @@ class SQLiteResearchMemory:
         initialization_id: str,
         draft_revision: int,
         draft_hash: str,
+        receipt: AcceptanceReceipt | None = None,
     ) -> None:
         snapshot = self.query_literature_snapshot(snapshot_ref)
         if snapshot is None or (
@@ -4210,6 +4283,8 @@ class SQLiteResearchMemory:
             or snapshot.initialization_id != initialization_id
             or snapshot.draft_revision != draft_revision
             or snapshot.draft_hash != draft_hash
+            or receipt is not None
+            and snapshot.receipt != receipt
         ):
             raise OwnerConflict("literature_snapshot_binding_invalid")
 
@@ -4225,6 +4300,7 @@ class SQLiteResearchMemory:
         )
         try:
             limitations = json.loads(row.limitations_json)
+            web_evidence = json.loads(row.web_evidence_json)
         except json.JSONDecodeError as error:
             raise OwnerConflict("literature_snapshot_invalid") from error
         if (
@@ -4232,6 +4308,8 @@ class SQLiteResearchMemory:
             or any(not isinstance(value, str) for value in limitations)
             or canonical_json(limitations) != row.limitations_json
             or canonical_hash(limitations) != row.limitations_hash
+            or canonical_json(web_evidence) != row.web_evidence_json
+            or canonical_hash(web_evidence) != row.web_evidence_hash
             or summary_document.get("request_ref") != row.request_ref
             or papers_document.get("request_ref") != row.request_ref
             or fulltexts_document.get("request_ref") != row.request_ref
@@ -4259,6 +4337,7 @@ class SQLiteResearchMemory:
             "fulltexts_ref": row.fulltexts_ref,
             "fulltexts_hash": row.fulltexts_hash,
             "limitations_hash": row.limitations_hash,
+            "web_evidence_hash": row.web_evidence_hash,
         }
         execution_receipt = AcceptanceReceipt(
             issuer="agent_runtime",
@@ -4314,6 +4393,7 @@ class SQLiteResearchMemory:
             fulltexts_ref=row.fulltexts_ref,
             fulltexts_hash=row.fulltexts_hash,
             limitations=tuple(limitations),
+            web_evidence_hash=row.web_evidence_hash,
             snapshot_hash=row.snapshot_hash,
             paper_count=len(papers_document["papers"]),
             fulltext_count=len(fulltexts_document["fulltexts"]),
@@ -4342,11 +4422,18 @@ class SQLiteResearchMemory:
         fulltexts = self._read_literature_object(
             row.fulltexts_object_path, row.fulltexts_hash
         )["fulltexts"]
+        try:
+            web_evidence = json.loads(row.web_evidence_json)
+        except json.JSONDecodeError as error:
+            raise OwnerConflict("literature_snapshot_invalid") from error
+        if canonical_hash(web_evidence) != row.web_evidence_hash:
+            raise OwnerConflict("literature_snapshot_invalid")
         return {
             **accepted.as_public_dict(),
             "summary": summary,
             "papers": papers,
             "fulltexts": fulltexts,
+            "web_evidence": web_evidence,
         }
 
     def _store_literature_object(
@@ -4482,6 +4569,7 @@ def _validated_literature_result(
         "limitations",
         "native_session_ref",
         "adapter_kind",
+        "web_evidence",
     }
     if (
         set(result) != expected_fields

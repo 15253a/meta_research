@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlsplit
 
+from meta_research.provider_supervisor import (
+    SUPERVISOR_REQUEST_SCHEMA,
+    ProviderSupervisorError,
+    ensure_transport_key,
+    read_verified_exit_receipt,
+    write_supervisor_request,
+)
 from meta_research.quest_drafting import (
     PROVIDER_RESULT_MAX_BYTES,
     PROVIDER_STREAM_MAX_BYTES,
@@ -24,6 +35,7 @@ if TYPE_CHECKING:
 DEEPFETCH_REQUEST_SCHEMA = "meta-research/first-question-deepfetch-request/v1"
 DEEPFETCH_RESULT_SCHEMA = "meta-research/first-question-deepfetch-result/v1"
 DEEPFETCH_RUNTIME_BINDING_SCHEMA = "meta-research/deepfetch-runtime-binding/v1"
+DEEPFETCH_WEB_EVIDENCE_SCHEMA = "meta-research/deepfetch-web-evidence/v1"
 MAX_DEEPFETCH_PAPERS = 500
 MAX_DEEPFETCH_FULLTEXTS = 100
 MAX_DEEPFETCH_SUMMARY_LENGTH = 100_000
@@ -48,9 +60,28 @@ def canonical_hash(value: object) -> str:
 class DeepFetchUnavailable(RuntimeError):
     """A real Web Research provider could not return a verifiable result."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        durable_outcome: Literal["unknown", "pending", "terminal"] = "unknown",
+        native_session_ref: str | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.durable_outcome = durable_outcome
+        self.native_session_ref = native_session_ref
+
+    def as_verified_terminal(
+        self, native_session_ref: str | None
+    ) -> DeepFetchUnavailable:
+        """Bind an error to a signed terminal provider receipt."""
+
+        return DeepFetchUnavailable(
+            self.code,
+            durable_outcome="terminal",
+            native_session_ref=native_session_ref,
+        )
 
 
 @dataclass(frozen=True)
@@ -135,6 +166,7 @@ class DeepFetchResult:
     limitations: tuple[str, ...]
     native_session_ref: str
     adapter_kind: str
+    web_evidence: dict[str, object] | None = None
 
 
 class DeepFetchProvider(Protocol):
@@ -201,8 +233,7 @@ def validate_deepfetch_result(
     if len(paper_urls) != len(papers):
         raise DeepFetchUnavailable("deepfetch_papers_duplicate")
     fulltexts = tuple(
-        _validated_fulltext(value, paper_urls=paper_urls)
-        for value in result.fulltexts
+        _validated_fulltext(value, paper_urls=paper_urls) for value in result.fulltexts
     )
     fulltext_urls = {cast(str, item["paper_url"]) for item in fulltexts}
     if len(fulltext_urls) != len(fulltexts):
@@ -225,6 +256,30 @@ def validate_deepfetch_result(
         raise DeepFetchUnavailable("deepfetch_limited_result_limit_missing")
     if result.completion == "complete" and not papers:
         raise DeepFetchUnavailable("deepfetch_complete_result_empty")
+    statuses = {
+        cast(str, paper["url"]): cast(str, paper["fulltext_status"]) for paper in papers
+    }
+    if any(
+        (status == "accepted") != (paper_url in fulltext_urls)
+        for paper_url, status in statuses.items()
+    ):
+        raise DeepFetchUnavailable("deepfetch_fulltext_status_mismatch")
+    if result.completion == "complete" and (
+        limitations
+        or len(fulltexts) != len(papers)
+        or any(status != "accepted" for status in statuses.values())
+    ):
+        raise DeepFetchUnavailable("deepfetch_complete_result_incomplete")
+    if result.completion == "limited" and not papers:
+        raise DeepFetchUnavailable("deepfetch_limited_result_empty")
+
+    web_evidence = _validated_web_evidence(result.web_evidence)
+    production_adapter = (
+        request.runtime_binding.provider_ref
+        == "meta_research.deepfetch.CodexDeepFetchAdapter"
+    )
+    if production_adapter and web_evidence is None:
+        raise DeepFetchUnavailable("deepfetch_web_evidence_missing")
 
     payload: dict[str, object] = {
         "schema_ref": DEEPFETCH_RESULT_SCHEMA,
@@ -241,6 +296,7 @@ def validate_deepfetch_result(
         "limitations": list(limitations),
         "native_session_ref": native_session_ref,
         "adapter_kind": adapter_kind,
+        "web_evidence": web_evidence,
     }
     return payload, canonical_hash(payload)
 
@@ -255,10 +311,9 @@ class CodexDeepFetchAdapter:
         executable: str = "codex",
         model_ref: str = "gpt-5.4",
         timeout_seconds: float = 30 * 60,
-        process_runner: Callable[
-            [list[str], str, float], subprocess.CompletedProcess[str]
-        ]
-        | None = None,
+        process_runner: (
+            Callable[[list[str], str, float], subprocess.CompletedProcess[str]] | None
+        ) = None,
     ) -> None:
         self._workspace = workspace
         self._workspace.mkdir(parents=True, exist_ok=True)
@@ -281,6 +336,12 @@ class CodexDeepFetchAdapter:
         finish_job = getattr(self._runner, "finish_job", None)
         if callable(finish_job):
             finish_job(job_ref)
+
+    @property
+    def requires_verified_terminal_retry(self) -> bool:
+        """Whether a new durable effect requires a signed terminal predecessor."""
+
+        return callable(getattr(self._runner, "run_durable_job", None))
 
     def runtime_binding(self) -> DeepFetchRuntimeBinding:
         return DeepFetchRuntimeBinding(
@@ -312,7 +373,7 @@ class CodexDeepFetchAdapter:
             "accepted_material_bindings="
             f"{canonical_json(list(request.accepted_material_bindings))}"
         )
-        raw, native_session_ref = self._invoke(request, prompt)
+        raw, native_session_ref, web_evidence = self._invoke(request, prompt)
         try:
             if set(raw) != {
                 "completion",
@@ -333,17 +394,29 @@ class CodexDeepFetchAdapter:
                 limitations=tuple(cast(list[str], raw["limitations"])),
                 native_session_ref=native_session_ref,
                 adapter_kind="codex_cli",
+                web_evidence=web_evidence,
             )
             validate_deepfetch_result(request, result)
             return result
+        except DeepFetchUnavailable as error:
+            if self.requires_verified_terminal_retry:
+                raise error.as_verified_terminal(native_session_ref) from error
+            raise
         except (KeyError, TypeError, ValueError) as error:
-            raise DeepFetchUnavailable("codex_deepfetch_output_invalid") from error
+            invalid = DeepFetchUnavailable("codex_deepfetch_output_invalid")
+            if self.requires_verified_terminal_retry:
+                invalid = invalid.as_verified_terminal(native_session_ref)
+            raise invalid from error
 
     def _invoke(
         self,
         request: DeepFetchProviderRequest,
         prompt: str,
-    ) -> tuple[dict[str, object], str]:
+    ) -> tuple[dict[str, object], str, dict[str, object]]:
+        if request.job_ref is not None and callable(
+            getattr(self._runner, "run_durable_job", None)
+        ):
+            return self._invoke_durable(request, prompt)
         with tempfile.TemporaryDirectory(
             prefix="deepfetch-", dir=self._workspace
         ) as raw_directory:
@@ -418,7 +491,353 @@ class CodexDeepFetchAdapter:
             )
             if native_session_ref is None:
                 raise DeepFetchUnavailable("codex_deepfetch_session_ref_missing")
-            return cast(dict[str, object], decoded), native_session_ref
+            web_evidence = _verified_web_evidence(completed.stdout)
+            return cast(dict[str, object], decoded), native_session_ref, web_evidence
+
+    def _invoke_durable(
+        self,
+        request: DeepFetchProviderRequest,
+        prompt: str,
+    ) -> tuple[dict[str, object], str, dict[str, object]]:
+        """Reconcile one logical provider operation across daemon Attempts."""
+
+        assert request.job_ref is not None
+        operation_root = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": request.job_ref})
+        )
+        try:
+            _key_path, transport_key = ensure_transport_key(self._workspace)
+        except (OSError, ProviderSupervisorError) as error:
+            raise DeepFetchUnavailable("deepfetch_provider_spool_invalid") from error
+        native_session_ref = request.native_session_ref
+        trace_parts: list[str] = []
+        for segment_number in range(8):
+            segment_name = (
+                "initial" if segment_number == 0 else f"resume-{segment_number}"
+            )
+            directory = operation_root / f"deepfetch-{segment_name}"
+            outcome = self._run_durable_segment(
+                directory=directory,
+                segment_name=segment_name,
+                job_ref=request.job_ref,
+                request=request,
+                prompt=prompt,
+                native_session_ref=native_session_ref,
+                transport_key=transport_key,
+            )
+            trace_parts.append(outcome[2])
+            if outcome[0] == "completed":
+                decoded = outcome[1]
+                assert isinstance(decoded, dict)
+                completed_session = outcome[3]
+                assert isinstance(completed_session, str)
+                try:
+                    evidence = _verified_web_evidence("\n".join(trace_parts))
+                except DeepFetchUnavailable as error:
+                    raise error.as_verified_terminal(completed_session) from error
+                return decoded, completed_session, evidence
+            recovered_session = outcome[3]
+            if not isinstance(recovered_session, str) or not recovered_session:
+                if outcome[0] == "stopped":
+                    raise DeepFetchUnavailable(
+                        "deepfetch_provider_stopped_before_session",
+                        durable_outcome="terminal",
+                    )
+                raise DeepFetchUnavailable("codex_deepfetch_session_ref_missing")
+            if native_session_ref is not None and (
+                native_session_ref != recovered_session
+            ):
+                raise DeepFetchUnavailable("deepfetch_native_session_changed")
+            native_session_ref = recovered_session
+        raise DeepFetchUnavailable("deepfetch_provider_recovery_exhausted")
+
+    def _run_durable_segment(
+        self,
+        *,
+        directory: Path,
+        segment_name: str,
+        job_ref: str,
+        request: DeepFetchProviderRequest,
+        prompt: str,
+        native_session_ref: str | None,
+        transport_key: bytes,
+    ) -> tuple[str, dict[str, object] | None, str, str | None]:
+        directory.mkdir(parents=True, exist_ok=True)
+        schema = _deepfetch_output_schema()
+        invocation = {
+            "schema_ref": "meta-research/deepfetch-provider-operation/v1",
+            "job_ref": job_ref,
+            "segment_name": segment_name,
+            "request_ref": request.request_ref,
+            "correlation_ref": request.correlation_ref,
+            "draft_hash": request.draft_hash,
+            "scope_hash": request.scope_hash,
+            "runtime_binding_hash": canonical_hash(request.runtime_binding.as_dict()),
+            "native_session_ref": native_session_ref,
+            "prompt_hash": canonical_hash(prompt),
+            "output_schema_hash": canonical_hash(schema),
+            "model_ref": self._model_ref,
+        }
+        invocation_hash = canonical_hash(invocation)
+        invocation_path = directory / "invocation.json"
+        envelope = {
+            "payload": invocation,
+            "seal": hmac.new(
+                transport_key,
+                canonical_json(invocation).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest(),
+        }
+        encoded_invocation = canonical_json(envelope)
+        created = _write_exclusive_text(invocation_path, encoded_invocation)
+        if not created:
+            try:
+                persisted = json.loads(invocation_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise DeepFetchUnavailable(
+                    "deepfetch_provider_spool_invalid"
+                ) from error
+            if persisted != envelope:
+                raise DeepFetchUnavailable("deepfetch_provider_identity_conflict")
+
+        prompt_path = directory / "prompt.txt"
+        schema_path = directory / "output-schema.json"
+        stdout_path = directory / "stdout.jsonl"
+        result_path = directory / "last-message.json"
+        receipt_path = directory / "supervisor-exit.json"
+        _ensure_durable_text(prompt_path, prompt)
+        _ensure_durable_text(schema_path, canonical_json(schema))
+        effect_paths = (
+            directory / "supervisor-ready.json",
+            directory / "provider-started.json",
+            stdout_path,
+            result_path,
+        )
+        if not receipt_path.exists():
+            if not created and any(path.exists() for path in effect_paths):
+                raise DeepFetchUnavailable(
+                    "deepfetch_provider_reconciliation_pending",
+                    durable_outcome="pending",
+                )
+            argv = self._durable_argv(
+                schema_path=schema_path,
+                result_path=result_path,
+                native_session_ref=native_session_ref,
+            )
+            supervisor_request_path = directory / "supervisor-request.json"
+            try:
+                write_supervisor_request(
+                    supervisor_request_path,
+                    {
+                        "schema_ref": SUPERVISOR_REQUEST_SCHEMA,
+                        "invocation_hash": invocation_hash,
+                        "argv": argv,
+                        "timeout_seconds": self._timeout_seconds,
+                        "stream_max_bytes": PROVIDER_STREAM_MAX_BYTES,
+                        "result_max_bytes": PROVIDER_RESULT_MAX_BYTES,
+                        "prompt_path": str(prompt_path),
+                        "schema_path": str(schema_path),
+                        "stdout_path": str(stdout_path),
+                        "result_path": str(result_path),
+                        "lock_path": str(directory / "supervisor.lock"),
+                        "ready_path": str(directory / "supervisor-ready.json"),
+                        "started_path": str(directory / "provider-started.json"),
+                        "receipt_path": str(receipt_path),
+                    },
+                    transport_key,
+                )
+                durable_job = self._runner.run_durable_job
+                durable_job(
+                    job_ref,
+                    argv,
+                    prompt,
+                    self._timeout_seconds,
+                    stdout_path,
+                    directory / "pid.json",
+                    supervisor_request_path,
+                )
+            except _ProcessStopped as error:
+                raise DeepFetchUnavailable(
+                    "deepfetch_provider_stopped", durable_outcome="pending"
+                ) from error
+            except FileNotFoundError as error:
+                raise DeepFetchUnavailable("codex_cli_unavailable") from error
+            except subprocess.TimeoutExpired as error:
+                raise DeepFetchUnavailable(
+                    "deepfetch_provider_reconciliation_pending",
+                    durable_outcome="pending",
+                ) from error
+            except ProviderSupervisorError as error:
+                raise DeepFetchUnavailable(
+                    "deepfetch_provider_spool_invalid"
+                ) from error
+            except OSError as error:
+                if any(path.exists() for path in effect_paths):
+                    raise DeepFetchUnavailable(
+                        "deepfetch_provider_reconciliation_pending",
+                        durable_outcome="pending",
+                    ) from error
+                raise DeepFetchUnavailable("codex_deepfetch_io_unavailable") from error
+        return self._read_durable_segment(
+            directory=directory,
+            invocation_hash=invocation_hash,
+            native_session_ref=native_session_ref,
+            transport_key=transport_key,
+        )
+
+    def _durable_argv(
+        self,
+        *,
+        schema_path: Path,
+        result_path: Path,
+        native_session_ref: str | None,
+    ) -> list[str]:
+        argv = [
+            self._executable,
+            "exec",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--strict-config",
+            "--config",
+            "mcp_servers={}",
+            "--config",
+            'approval_policy="never"',
+            "--config",
+            'web_search="live"',
+            "--sandbox",
+            "read-only",
+            "--model",
+            self._model_ref,
+            "--cd",
+            str(self._workspace),
+            "--json",
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(result_path),
+        ]
+        if native_session_ref is None:
+            argv.append("-")
+        else:
+            argv.extend(["resume", native_session_ref, "-"])
+        return argv
+
+    def _read_durable_segment(
+        self,
+        *,
+        directory: Path,
+        invocation_hash: str,
+        native_session_ref: str | None,
+        transport_key: bytes,
+    ) -> tuple[str, dict[str, object] | None, str, str | None]:
+        receipt_path = directory / "supervisor-exit.json"
+        if not receipt_path.exists():
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_reconciliation_pending",
+                durable_outcome="pending",
+            )
+        prompt_path = directory / "prompt.txt"
+        schema_path = directory / "output-schema.json"
+        stdout_path = directory / "stdout.jsonl"
+        result_path = directory / "last-message.json"
+        try:
+            receipt, _envelope = read_verified_exit_receipt(
+                receipt_path,
+                key=transport_key,
+                invocation_hash=invocation_hash,
+                prompt_path=prompt_path,
+                schema_path=schema_path,
+                stdout_path=stdout_path,
+                result_path=result_path,
+            )
+            if stdout_path.stat().st_size > PROVIDER_STREAM_MAX_BYTES:
+                raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
+            stdout = stdout_path.read_text(encoding="utf-8")
+        except DeepFetchUnavailable:
+            raise
+        except (OSError, UnicodeDecodeError, ProviderSupervisorError) as error:
+            raise DeepFetchUnavailable("deepfetch_provider_spool_invalid") from error
+        observed_session_ref = _thread_id(stdout)
+        if receipt["termination_reason"] == "stopped":
+            return "stopped", None, stdout, observed_session_ref
+        if receipt["termination_reason"] == "timeout":
+            raise DeepFetchUnavailable(
+                "codex_deepfetch_timeout",
+                durable_outcome="terminal",
+                native_session_ref=observed_session_ref,
+            )
+        if receipt["termination_reason"] != "completed" or receipt["returncode"] != 0:
+            raise DeepFetchUnavailable(
+                "codex_deepfetch_failed",
+                durable_outcome="terminal",
+                native_session_ref=observed_session_ref,
+            )
+        if observed_session_ref is None:
+            raise DeepFetchUnavailable(
+                "codex_deepfetch_session_ref_missing", durable_outcome="terminal"
+            )
+        if (
+            native_session_ref is not None
+            and observed_session_ref != native_session_ref
+        ):
+            raise DeepFetchUnavailable("deepfetch_native_session_changed")
+        try:
+            if result_path.stat().st_size > PROVIDER_RESULT_MAX_BYTES:
+                raise DeepFetchUnavailable("codex_deepfetch_output_too_large")
+            decoded = json.loads(result_path.read_text(encoding="utf-8"))
+        except DeepFetchUnavailable as error:
+            raise error.as_verified_terminal(observed_session_ref) from error
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise DeepFetchUnavailable(
+                "codex_deepfetch_output_invalid",
+                durable_outcome="terminal",
+                native_session_ref=observed_session_ref,
+            ) from error
+        if not isinstance(decoded, dict):
+            raise DeepFetchUnavailable(
+                "codex_deepfetch_output_invalid",
+                durable_outcome="terminal",
+                native_session_ref=observed_session_ref,
+            )
+        return (
+            "completed",
+            cast(dict[str, object], decoded),
+            stdout,
+            observed_session_ref,
+        )
+
+
+def _write_exclusive_text(path: Path, value: str) -> bool:
+    try:
+        with path.open("x", encoding="utf-8") as destination:
+            destination.write(value)
+            destination.flush()
+            os.fsync(destination.fileno())
+        _fsync_directory(path.parent)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _ensure_durable_text(path: Path, value: str) -> None:
+    if _write_exclusive_text(path, value):
+        return
+    try:
+        persisted = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise DeepFetchUnavailable("deepfetch_provider_spool_invalid") from error
+    if persisted != value:
+        raise DeepFetchUnavailable("deepfetch_provider_identity_conflict")
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validated_paper(value: object) -> dict[str, object]:
@@ -450,6 +869,12 @@ def _validated_paper(value: object) -> dict[str, object]:
     retrieved_at = _required_text(
         value["retrieved_at"], maximum=80, code="deepfetch_retrieved_at_invalid"
     )
+    try:
+        timestamp = datetime.fromisoformat(retrieved_at)
+    except ValueError as error:
+        raise DeepFetchUnavailable("deepfetch_retrieved_at_invalid") from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise DeepFetchUnavailable("deepfetch_retrieved_at_invalid")
     return {
         "title": title,
         "url": url,
@@ -488,9 +913,7 @@ def _validated_fulltext(
         "paper_url": paper_url,
         "media_type": media_type,
         "content": content,
-        "content_hash": canonical_hash(
-            {"media_type": media_type, "content": content}
-        ),
+        "content_hash": canonical_hash({"media_type": media_type, "content": content}),
     }
 
 
@@ -512,6 +935,26 @@ def _validated_public_url(value: object, code: str) -> str:
         "secret",
         "session",
         "token",
+        # Common pre-signed URL credentials.  The short Azure SAS names are
+        # intentionally blocked here because persisted research URLs must be
+        # stable public locators, never bearer capabilities.
+        "sig",
+        "signature",
+        "googleaccessid",
+        "expires",
+        "sv",
+        "ss",
+        "srt",
+        "sp",
+        "se",
+        "st",
+        "spr",
+        "skoid",
+        "sktid",
+        "skt",
+        "ske",
+        "sks",
+        "skv",
     }
     query_names = {name.casefold() for name, _ in parse_qsl(parsed.query)}
     if (
@@ -523,6 +966,7 @@ def _validated_public_url(value: object, code: str) -> str:
         or port is not None
         and not 1 <= port <= 65_535
         or query_names & sensitive_names
+        or any(name.startswith(("x-amz-", "x-goog-")) for name in query_names)
     ):
         raise DeepFetchUnavailable(code)
     return url
@@ -548,6 +992,101 @@ def _thread_id(stdout: str) -> str | None:
             if isinstance(value, str) and value:
                 return value
     return None
+
+
+def _validated_web_evidence(
+    value: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if set(value) != {
+        "schema_ref",
+        "search_event_count",
+        "fetch_event_count",
+        "trace_hash",
+    }:
+        raise DeepFetchUnavailable("deepfetch_web_evidence_invalid")
+    search_count = value.get("search_event_count")
+    fetch_count = value.get("fetch_event_count")
+    trace_hash = value.get("trace_hash")
+    if (
+        value.get("schema_ref") != DEEPFETCH_WEB_EVIDENCE_SCHEMA
+        or not isinstance(search_count, int)
+        or isinstance(search_count, bool)
+        or search_count < 1
+        or not isinstance(fetch_count, int)
+        or isinstance(fetch_count, bool)
+        or fetch_count < 1
+        or not isinstance(trace_hash, str)
+        or len(trace_hash) != 64
+    ):
+        raise DeepFetchUnavailable("deepfetch_web_evidence_invalid")
+    return {
+        "schema_ref": DEEPFETCH_WEB_EVIDENCE_SCHEMA,
+        "search_event_count": search_count,
+        "fetch_event_count": fetch_count,
+        "trace_hash": trace_hash,
+    }
+
+
+def _verified_web_evidence(stdout: str) -> dict[str, object]:
+    """Derive a non-secret proof from Codex-owned completed Web events."""
+
+    trace: list[dict[str, object]] = []
+    event_refs: set[str] = set()
+    search_count = 0
+    fetch_count = 0
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "web_search":
+            continue
+        event_ref = item.get("id")
+        if not isinstance(event_ref, str) or not event_ref:
+            continue
+        if event_ref in event_refs:
+            raise DeepFetchUnavailable("deepfetch_web_evidence_invalid")
+        event_refs.add(event_ref)
+        action = item.get("action")
+        if not isinstance(action, dict):
+            continue
+        action_type = action.get("type")
+        query = item.get("query")
+        if action_type == "search":
+            kind = "search"
+            search_count += 1
+        # Codex reports open(ref_id=...) as a completed `other` Web action with
+        # an empty query; the completed web_search item is the verifiable fetch.
+        elif action_type in {"open", "open_page", "fetch"} or (
+            action_type == "other"
+            and isinstance(query, str)
+            and (query == "" or query.startswith(("https://", "http://")))
+        ):
+            kind = "fetch"
+            fetch_count += 1
+        else:
+            continue
+        trace.append(
+            {
+                "kind": kind,
+                "event_ref": event_ref,
+                "query_hash": canonical_hash(query) if isinstance(query, str) else None,
+            }
+        )
+    evidence = {
+        "schema_ref": DEEPFETCH_WEB_EVIDENCE_SCHEMA,
+        "search_event_count": search_count,
+        "fetch_event_count": fetch_count,
+        "trace_hash": canonical_hash(trace),
+    }
+    validated = _validated_web_evidence(evidence)
+    assert validated is not None
+    return validated
 
 
 def _deepfetch_output_schema() -> dict[str, object]:

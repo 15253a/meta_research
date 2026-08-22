@@ -11,6 +11,7 @@ from meta_research.feed import DurableFeed
 from meta_research.idea_contract import (
     IdeaContractError,
     evidence_reference_revision,
+    literature_binding,
     validate_idea_context_pack,
 )
 from meta_research.owners._sqlite_snapshot import (
@@ -23,6 +24,7 @@ from meta_research.owners.common import (
     AcceptanceReceipt,
     EvidenceRefVerifier,
     IdeaOutcomeDecisionVerifier,
+    LiteratureSnapshotVerifier,
     OwnerConflict,
     OwnerSnapshot,
     QuestReceiptVerifier,
@@ -169,6 +171,7 @@ class SQLiteAdvancementEngine:
         evidence_verifier: EvidenceRefVerifier | None = None,
         run_completion_verifier: RunCompletionReceiptVerifier | None = None,
         outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
+        literature_snapshot_verifier: LiteratureSnapshotVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -178,6 +181,7 @@ class SQLiteAdvancementEngine:
         self._evidence_verifier = evidence_verifier
         self._run_completion_verifier = run_completion_verifier
         self._outcome_verifier = outcome_verifier
+        self._literature_snapshot_verifier = literature_snapshot_verifier
         self._stage_request_verifier = SQLiteAdvancementEngineReceiptVerifier(database)
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
 
@@ -368,6 +372,7 @@ class SQLiteAdvancementEngine:
         except IdeaContractError as error:
             raise OwnerConflict(str(error)) from error
         self._verify_cycle_question(cycle_ref, accepted_question)
+        self._verify_context_literature(accepted_question, context_pack)
 
         # Natural-key replay is a historical receipt lookup. It must not
         # pursue today's Evidence set or current custody.
@@ -573,6 +578,9 @@ class SQLiteAdvancementEngine:
             evidence_refs,
             require_current=False,
         )
+        self._verify_context_literature(
+            requested.accepted_question, requested.context_pack
+        )
         self._stage_request_verifier.verify_stage_run_request(
             request_ref=requested.request_ref,
             cycle_ref=requested.cycle_ref,
@@ -607,6 +615,39 @@ class SQLiteAdvancementEngine:
             expected_reference_revision=(
                 reference_revision if require_current else None
             ),
+        )
+
+    def _verify_context_literature(
+        self,
+        accepted_question: AcceptedQuestionBinding,
+        context_pack: dict[str, object],
+    ) -> None:
+        try:
+            binding = literature_binding(context_pack)
+        except IdeaContractError as error:
+            raise OwnerConflict(str(error)) from error
+        if binding is None:
+            return
+        if self._literature_snapshot_verifier is None:
+            raise OwnerConflict("literature_snapshot_verifier_unavailable")
+        receipt_value = binding["receipt"]
+        assert isinstance(receipt_value, dict)
+        if binding["initialization_id"] != accepted_question.initialization_id:
+            raise OwnerConflict("literature_snapshot_binding_invalid")
+        receipt = AcceptanceReceipt(
+            issuer=str(receipt_value["issuer"]),
+            kind=str(receipt_value["kind"]),
+            receipt_ref=str(receipt_value["receipt_ref"]),
+            subject_ref=str(receipt_value["subject_ref"]),
+            payload_hash=str(receipt_value["payload_hash"]),
+        )
+        self._literature_snapshot_verifier.verify_literature_snapshot_binding(
+            snapshot_ref=str(binding["snapshot_ref"]),
+            snapshot_hash=str(binding["snapshot_hash"]),
+            initialization_id=str(binding["initialization_id"]),
+            draft_revision=int(binding["draft_revision"]),
+            draft_hash=str(binding["draft_hash"]),
+            receipt=receipt,
         )
 
     def _verify_cycle_question(
@@ -1226,6 +1267,7 @@ def create_advancement_engine_interface(
     evidence_verifier: EvidenceRefVerifier | None = None,
     run_completion_verifier: RunCompletionReceiptVerifier | None = None,
     outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
+    literature_snapshot_verifier: LiteratureSnapshotVerifier | None = None,
 ) -> AdvancementEngineInterface:
     return SQLiteAdvancementEngine(
         database,
@@ -1236,4 +1278,5 @@ def create_advancement_engine_interface(
         evidence_verifier,
         run_completion_verifier,
         outcome_verifier,
+        literature_snapshot_verifier,
     )
