@@ -35,6 +35,8 @@ class FirstQuestionDeepFetchWorker:
                 snapshot,
             )
         except DeepFetchUnavailable as error:
+            if error.code == "deepfetch_acquisition_waiting_user":
+                return False
             if error.code == "deepfetch_provider_stopped":
                 return True
             if error.code == "deepfetch_provider_reconciliation_pending":
@@ -48,6 +50,12 @@ class FirstQuestionDeepFetchWorker:
         except OwnerConflict as error:
             if error.code == "deepfetch_run_busy":
                 return False
+            if error.code == "deepfetch_acquisition_not_ready":
+                session = self._agent_runtime.query_acquisition_session(
+                    session_ref=request.acquisition_session_ref
+                )
+                if session is not None and session.status == "waiting_user":
+                    return False
             if error.code in {
                 "deepfetch_attempt_fence_stale",
                 "deepfetch_run_cancelled",

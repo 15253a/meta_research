@@ -139,6 +139,13 @@ class GenerateProposalRequest(BaseModel):
     expected_draft_hash: str = Field(min_length=64, max_length=64)
 
 
+class PrepareAcquisitionSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_draft_revision: int = Field(ge=1)
+    expected_draft_hash: str = Field(min_length=64, max_length=64)
+
+
 class QuestionContentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -858,6 +865,21 @@ def create_app(
             initialization_id,
             selection.selected_device_uuids,
             _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/quest-initializations/{initialization_id}/acquisition-session"
+    )
+    def prepare_acquisition_session(
+        initialization_id: str,
+        request: Request,
+        preparation: PrepareAcquisitionSessionRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.prepare_acquisition_session(
+            initialization_id,
+            preparation.expected_draft_hash,
+            _idempotency_key(request),
+            preparation.expected_draft_revision,
         )
 
     @app.post(

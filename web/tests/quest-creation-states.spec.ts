@@ -254,7 +254,7 @@ async function fillRequiredBasis(
 
 async function selectReadyCompute(dialog: Locator) {
   const probe = dialog.getByRole("button", {
-    name: /检测本机计算卡|重新检测/,
+    name: /^(检测本机计算卡|重新检测)$/,
   });
   await probe.click();
   const device = dialog.getByRole("button", {
@@ -343,6 +343,10 @@ test("DeepFetch unfolds real progress and its accepted snapshot inside the same 
   const deepfetchChoice = dialog.getByRole("button", { name: "先运行 DeepFetch" });
   await deepfetchChoice.click();
   await expect(deepfetchChoice).toHaveAttribute("aria-pressed", "true");
+  await dialog.getByLabel("文献搜索范围").selectOption("oa_only");
+  await expect(dialog.getByTestId("acquisition-session-status")).toContainText(
+    "ready · current",
+  );
   const runway = dialog.getByTestId("deepfetch-runway");
   await expect(runway).toHaveAttribute("data-status", "not-started");
   await expect(runway).toContainText("进度只读取 durable Projection");
@@ -1070,11 +1074,18 @@ test("real Chrome traverses the corrected durable state machine and a second cre
     "disabled",
     "",
   );
-  await expect(
-    dialog.getByText("capability_unavailable", { exact: true }).first(),
-  ).toBeVisible();
+  const acquisitionStatus = dialog.getByTestId("acquisition-session-status");
+  await expect(acquisitionStatus).toContainText(
+    "ready · current · browser not_required",
+  );
   await literature.selectOption("oa_then_institution");
   await expect(literature).toHaveValue("oa_then_institution");
+  await expect(acquisitionStatus).toContainText(
+    "waiting_user · current · institutional_entry_required",
+  );
+  await expect(
+    dialog.getByRole("button", { name: "重新检测登录" }),
+  ).toBeEnabled();
   await expect(dialog.getByRole("button", { name: "先运行 DeepFetch" })).toBeEnabled();
   await expect(dialog.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
 

@@ -5,12 +5,30 @@ import math
 import threading
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Protocol
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from meta_research.database import Database
+from meta_research.acquisition import (
+    AcquisitionBatchExecution,
+    AcquisitionBatchRequest,
+    AcquisitionItemResult,
+    AcquisitionPaper,
+    AcquisitionProvider,
+    AcquisitionPreflightRequest,
+    AcquisitionRuntimeBinding,
+    AcquisitionSession,
+    AcquisitionUnavailable,
+    aggregate_batch_status,
+    canonical_hash as acquisition_hash,
+    validate_batch_request,
+    validate_item_results,
+    validate_preflight_result,
+    validate_runtime_binding as validate_acquisition_runtime_binding,
+)
 from meta_research.deepfetch import (
     DeepFetchProvider,
     DeepFetchProviderRequest,
@@ -277,6 +295,34 @@ class AgentRuntimeInterface(Protocol):
 
     def query_host_compute(self, snapshot_ref: str) -> HostComputeObservation: ...
 
+    def prepare_acquisition_session(
+        self,
+        *,
+        initialization_id: str,
+        draft_revision: int,
+        config: dict[str, object],
+        provider: AcquisitionProvider,
+    ) -> AcquisitionSession: ...
+
+    def query_acquisition_session(
+        self,
+        *,
+        initialization_id: str | None = None,
+        session_ref: str | None = None,
+        quest_ref: str | None = None,
+    ) -> AcquisitionSession | None: ...
+
+    def acquire_literature(
+        self,
+        session_ref: str,
+        request: AcquisitionBatchRequest,
+        provider: AcquisitionProvider,
+    ) -> AcquisitionBatchExecution: ...
+
+    def bind_acquisition_session_to_quest(
+        self, initialization_id: str, quest_ref: str
+    ) -> AcquisitionSession | None: ...
+
     def execute_deepfetch(
         self,
         request: DeepFetchRunRequest,
@@ -365,7 +411,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "SELECT revision, active_run_count, stage_run_count, completed_run_count, "
         "attempt_count, session_count, deepfetch_run_count, "
         "deepfetch_completed_run_count, deepfetch_attempt_count, "
-        "deepfetch_session_count "
+        "deepfetch_session_count, acquisition_session_count, "
+        "acquisition_request_count, acquisition_active_slot_count "
         "FROM agent_runtime_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -378,6 +425,9 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "deepfetch_completed_run_count",
         "deepfetch_attempt_count",
         "deepfetch_session_count",
+        "acquisition_session_count",
+        "acquisition_request_count",
+        "acquisition_active_slot_count",
     ),
 )
 
@@ -416,6 +466,7 @@ class SQLiteAgentRuntime:
         stage_request_verifier: StageRunRequestVerifier | None = None,
         outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
         deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
+        acquisition_private_root: Path | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -423,6 +474,12 @@ class SQLiteAgentRuntime:
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
         self._deepfetch_request_verifier = deepfetch_request_verifier
+        self._acquisition_private_root = (
+            acquisition_private_root
+            if acquisition_private_root is not None
+            else Path(".meta-research-acquisition")
+        )
+        self._acquisition_private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._receipt_verifier = SQLiteAgentRuntimeReceiptVerifier(
             database, stage_request_verifier
         )
@@ -430,6 +487,7 @@ class SQLiteAgentRuntime:
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._deepfetch_provider_lock = threading.Lock()
         self._deepfetch_providers: dict[str, DeepFetchProvider] = {}
+        self._recover_interrupted_acquisition()
         self._recover_interrupted_deepfetch()
 
     def query_snapshot(self) -> OwnerSnapshot:
@@ -713,6 +771,712 @@ class SQLiteAgentRuntime:
     def query_host_compute(self, snapshot_ref: str) -> HostComputeObservation:
         return self._host_compute_reader.query_host_compute(snapshot_ref)
 
+    def _recover_interrupted_acquisition(self) -> None:
+        """Release daemon-local slots without replaying an unknown download."""
+
+        now = time.time()
+        with self._database.write() as connection:
+            sessions = connection.execute(
+                text(
+                    "UPDATE ar_acquisition_sessions SET status = 'waiting_user', "
+                    "slot_held = 0, reason_code = "
+                    "'acquisition_reconciliation_required', updated_at = :now "
+                    "WHERE status IN ('probing', 'acquiring')"
+                ),
+                {"now": now},
+            )
+            requests = connection.execute(
+                text(
+                    "UPDATE ar_acquisition_requests SET status = 'waiting_user', "
+                    "results_json = COALESCE(results_json, :results_json), "
+                    "results_hash = COALESCE(results_hash, :results_hash), "
+                    "updated_at = :now, completed_at = :now WHERE status = 'running'"
+                ),
+                {
+                    "results_json": canonical_json(
+                        [
+                            {
+                                "paper_id": "__batch__",
+                                "status": "waiting_user",
+                                "path": None,
+                                "format": None,
+                                "failure": {
+                                    "code": "acquisition_reconciliation_required",
+                                    "detail": (
+                                        "daemon 重启后必须用原 request_id 对账，"
+                                        "不得启动新的下载副作用。"
+                                    ),
+                                },
+                            }
+                        ]
+                    ),
+                    "results_hash": canonical_hash(
+                        [
+                            {
+                                "paper_id": "__batch__",
+                                "status": "waiting_user",
+                                "path": None,
+                                "format": None,
+                                "failure": {
+                                    "code": "acquisition_reconciliation_required",
+                                    "detail": (
+                                        "daemon 重启后必须用原 request_id 对账，"
+                                        "不得启动新的下载副作用。"
+                                    ),
+                                },
+                            }
+                        ]
+                    ),
+                    "now": now,
+                },
+            )
+            recovered = (sessions.rowcount or 0) + (requests.rowcount or 0)
+            if recovered:
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1, "
+                        "acquisition_active_slot_count = 0 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.acquisition_recovered",
+                    {"recovered_record_count": recovered},
+                )
+
+    def prepare_acquisition_session(
+        self,
+        *,
+        initialization_id: str,
+        draft_revision: int,
+        config: dict[str, object],
+        provider: AcquisitionProvider,
+    ) -> AcquisitionSession:
+        if (
+            not initialization_id
+            or draft_revision < 1
+            or set(config) != {"mode", "library_entry_url"}
+            or config.get("mode")
+            not in {"oa_then_institution", "oa_only", "provided_only"}
+            or not isinstance(config.get("library_entry_url"), str)
+        ):
+            raise OwnerConflict("acquisition_preflight_request_invalid")
+        mode = str(config["mode"])
+        library_entry_url = str(config["library_entry_url"])
+        normalized_config = {
+            "schema_ref": "meta-research/acquisition-session-config/v1",
+            "mode": mode,
+            "library_entry_url": library_entry_url,
+        }
+        config_json = canonical_json(normalized_config)
+        config_hash = canonical_hash(normalized_config)
+        try:
+            runtime_binding = provider.runtime_binding()
+            runtime_binding_hash = validate_acquisition_runtime_binding(
+                runtime_binding
+            )
+        except AcquisitionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+        runtime_binding_json = canonical_json(runtime_binding.as_dict())
+        now = time.time()
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_acquisition_sessions WHERE "
+                    "initialization_id = :initialization_id"
+                ),
+                {"initialization_id": initialization_id},
+            ).first()
+            if row is not None and (
+                row.config_hash == config_hash
+                and row.runtime_binding_hash == runtime_binding_hash
+                and row.status == "ready"
+            ):
+                return _acquisition_session_from_row(row)
+            if row is None:
+                session_ref = new_ref("acquisition_session")
+                generation = 1
+                previous_browser_context_ref = None
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_acquisition_sessions (session_ref, "
+                        "initialization_id, config_json, config_hash, mode, "
+                        "runtime_binding_json, runtime_binding_hash, status, "
+                        "preflight_generation, slot_held, created_at, updated_at) "
+                        "VALUES (:session_ref, :initialization_id, :config_json, "
+                        ":config_hash, :mode, :runtime_binding_json, "
+                        ":runtime_binding_hash, 'probing', :generation, 1, :now, :now)"
+                    ),
+                    {
+                        "session_ref": session_ref,
+                        "initialization_id": initialization_id,
+                        "config_json": config_json,
+                        "config_hash": config_hash,
+                        "mode": mode,
+                        "runtime_binding_json": runtime_binding_json,
+                        "runtime_binding_hash": runtime_binding_hash,
+                        "generation": generation,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1, "
+                        "acquisition_session_count = acquisition_session_count + 1, "
+                        "acquisition_active_slot_count = "
+                        "acquisition_active_slot_count + 1 WHERE singleton = 'owner'"
+                    )
+                )
+            else:
+                if row.status in {"probing", "acquiring"}:
+                    raise OwnerConflict("acquisition_session_busy")
+                if row.status == "cancelled":
+                    raise OwnerConflict("acquisition_session_cancelled")
+                session_ref = str(row.session_ref)
+                generation = int(row.preflight_generation) + 1
+                previous_browser_context_ref = (
+                    None
+                    if row.browser_context_ref is None
+                    else str(row.browser_context_ref)
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_acquisition_sessions SET config_json = "
+                        ":config_json, config_hash = :config_hash, mode = :mode, "
+                        "runtime_binding_json = :runtime_binding_json, "
+                        "runtime_binding_hash = :runtime_binding_hash, status = "
+                        "'probing', preflight_generation = :generation, "
+                        "current_request_id = NULL, slot_held = 1, reason_code = NULL, "
+                        "evidence_json = NULL, evidence_hash = NULL, updated_at = :now "
+                        "WHERE session_ref = :session_ref"
+                    ),
+                    {
+                        "session_ref": session_ref,
+                        "config_json": config_json,
+                        "config_hash": config_hash,
+                        "mode": mode,
+                        "runtime_binding_json": runtime_binding_json,
+                        "runtime_binding_hash": runtime_binding_hash,
+                        "generation": generation,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1, "
+                        "acquisition_active_slot_count = "
+                        "acquisition_active_slot_count + 1 WHERE singleton = 'owner'"
+                    )
+                )
+            self._feed.record(
+                connection,
+                "agent_runtime.acquisition_preflight_started",
+                {
+                    "session_ref": session_ref,
+                    "initialization_id": initialization_id,
+                    "preflight_generation": generation,
+                    "config_hash": config_hash,
+                },
+            )
+
+        private_state = self._acquisition_private_root / session_ref
+        private_state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        provider_request = AcquisitionPreflightRequest(
+            session_ref=session_ref,
+            initialization_id=initialization_id,
+            draft_revision=draft_revision,
+            config_hash=config_hash,
+            mode=mode,  # type: ignore[arg-type]
+            library_entry_url=library_entry_url,
+            private_state_dir=str(private_state),
+            previous_browser_context_ref=previous_browser_context_ref,
+        )
+        try:
+            result = validate_preflight_result(
+                provider_request, provider.preflight(provider_request)
+            )
+        except AcquisitionUnavailable as error:
+            result = None
+            failure_code = error.code
+        except Exception:
+            result = None
+            failure_code = "acquisition_preflight_provider_error"
+
+        evidence = {} if result is None else result.evidence
+        evidence_json = canonical_json(evidence)
+        evidence_hash = canonical_hash(evidence)
+        final_status = "unavailable" if result is None else result.status
+        reason_code = failure_code if result is None else result.reason_code
+        browser_context_ref = (
+            previous_browser_context_ref
+            if result is None
+            else result.browser_context_ref
+        )
+        completed_at = time.time()
+        with self._database.write() as connection:
+            current = connection.execute(
+                text(
+                    "SELECT status, preflight_generation, config_hash FROM "
+                    "ar_acquisition_sessions WHERE session_ref = :session_ref"
+                ),
+                {"session_ref": session_ref},
+            ).one()
+            if (
+                current.status != "probing"
+                or int(current.preflight_generation) != generation
+                or current.config_hash != config_hash
+            ):
+                raise OwnerConflict("acquisition_preflight_fence_stale")
+            connection.execute(
+                text(
+                    "UPDATE ar_acquisition_sessions SET status = :status, "
+                    "browser_context_ref = :browser_context_ref, slot_held = 0, "
+                    "reason_code = :reason_code, evidence_json = :evidence_json, "
+                    "evidence_hash = :evidence_hash, updated_at = :now, "
+                    "last_ready_at = CASE WHEN :status = 'ready' THEN :now ELSE "
+                    "last_ready_at END WHERE session_ref = :session_ref"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "status": final_status,
+                    "browser_context_ref": browser_context_ref,
+                    "reason_code": reason_code,
+                    "evidence_json": evidence_json,
+                    "evidence_hash": evidence_hash,
+                    "now": completed_at,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "acquisition_active_slot_count = "
+                    "acquisition_active_slot_count - 1 WHERE singleton = 'owner' "
+                    "AND acquisition_active_slot_count > 0"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.acquisition_preflight_completed",
+                {
+                    "session_ref": session_ref,
+                    "status": final_status,
+                    "reason_code": reason_code,
+                },
+            )
+        session = self.query_acquisition_session(session_ref=session_ref)
+        assert session is not None
+        return session
+
+    def query_acquisition_session(
+        self,
+        *,
+        initialization_id: str | None = None,
+        session_ref: str | None = None,
+        quest_ref: str | None = None,
+    ) -> AcquisitionSession | None:
+        selectors = [
+            value is not None for value in (initialization_id, session_ref, quest_ref)
+        ]
+        if sum(selectors) != 1:
+            raise OwnerConflict("acquisition_session_query_invalid")
+        if initialization_id is not None:
+            clause = "initialization_id = :value"
+            value = initialization_id
+        elif session_ref is not None:
+            clause = "session_ref = :value"
+            value = session_ref
+        else:
+            clause = "quest_ref = :value"
+            value = quest_ref
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(f"SELECT * FROM ar_acquisition_sessions WHERE {clause}"),
+                {"value": value},
+            ).first()
+        return None if row is None else _acquisition_session_from_row(row)
+
+    def acquire_literature(
+        self,
+        session_ref: str,
+        request: AcquisitionBatchRequest,
+        provider: AcquisitionProvider,
+    ) -> AcquisitionBatchExecution:
+        try:
+            request_hash = validate_batch_request(request)
+            runtime_binding = provider.runtime_binding()
+            runtime_binding_hash = validate_acquisition_runtime_binding(
+                runtime_binding
+            )
+        except AcquisitionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+        now = time.time()
+        previous_results: tuple[AcquisitionItemResult, ...] = ()
+        reconcile_only = False
+        new_request = False
+        with self._database.write() as connection:
+            session_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_acquisition_sessions WHERE "
+                    "session_ref = :session_ref"
+                ),
+                {"session_ref": session_ref},
+            ).first()
+            if session_row is None:
+                raise OwnerConflict("acquisition_session_not_found")
+            if session_row.runtime_binding_hash != runtime_binding_hash:
+                raise OwnerConflict("acquisition_runtime_binding_drift")
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_acquisition_requests WHERE "
+                    "request_id = :request_id"
+                ),
+                {"request_id": request.request_id},
+            ).first()
+            if existing is not None:
+                if (
+                    existing.session_ref != session_ref
+                    or existing.request_hash != request_hash
+                ):
+                    raise OwnerConflict("acquisition_request_identity_conflict")
+                if existing.status in {"obtained", "partial", "missing"}:
+                    return _acquisition_execution_from_row(
+                        existing,
+                        session_row,
+                        self._acquisition_private_root,
+                    )
+                if existing.status == "running":
+                    raise OwnerConflict("acquisition_request_busy")
+                if existing.status != "waiting_user":
+                    raise OwnerConflict("acquisition_request_not_resumable")
+                previous_execution = _acquisition_execution_from_row(
+                    existing,
+                    session_row,
+                    self._acquisition_private_root,
+                )
+                previous_results = previous_execution.results
+                if [result.paper_id for result in previous_results] == [
+                    "__batch__"
+                ]:
+                    previous_results = tuple(
+                        _reconciliation_acquisition_item(paper.paper_id)
+                        for paper in request.papers
+                    )
+                    reconcile_only = True
+                else:
+                    try:
+                        validate_item_results(request, previous_results)
+                    except AcquisitionUnavailable as error:
+                        raise OwnerConflict(error.code) from error
+                    reconcile_only = any(
+                        result.status == "waiting_user"
+                        and result.failure is not None
+                        and result.failure.get("code")
+                        == "acquisition_reconciliation_required"
+                        for result in previous_results
+                    )
+                attempt_count = int(existing.attempt_count) + 1
+            else:
+                new_request = True
+                attempt_count = 1
+                previous_results = tuple(
+                    _reconciliation_acquisition_item(paper.paper_id)
+                    for paper in request.papers
+                )
+
+            claimed = connection.execute(
+                text(
+                    "UPDATE ar_acquisition_sessions SET status = 'acquiring', "
+                    "current_request_id = :request_id, slot_held = 1, "
+                    "reason_code = NULL, updated_at = :now WHERE session_ref = "
+                    ":session_ref AND status = 'ready' AND slot_held = 0"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                    "now": now,
+                },
+            )
+            if claimed.rowcount != 1:
+                raise OwnerConflict("acquisition_session_busy")
+
+            inflight_results = tuple(
+                (
+                    _reconciliation_acquisition_item(result.paper_id)
+                    if result.status == "waiting_user"
+                    else result
+                )
+                for result in previous_results
+            )
+            inflight_payload = [result.as_dict() for result in inflight_results]
+            if new_request:
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_acquisition_requests (request_id, session_ref, "
+                        "request_json, request_hash, route_policy, status, results_json, "
+                        "results_hash, attempt_count, created_at, updated_at) VALUES "
+                        "(:request_id, :session_ref, :request_json, :request_hash, "
+                        ":route_policy, 'running', :results_json, :results_hash, 1, "
+                        ":now, :now)"
+                    ),
+                    {
+                        "request_id": request.request_id,
+                        "session_ref": session_ref,
+                        "request_json": canonical_json(request.identity_payload()),
+                        "request_hash": request_hash,
+                        "route_policy": request.route_policy,
+                        "results_json": canonical_json(inflight_payload),
+                        "results_hash": canonical_hash(inflight_payload),
+                        "now": now,
+                    },
+                )
+            else:
+                connection.execute(
+                    text(
+                        "UPDATE ar_acquisition_requests SET status = 'running', "
+                        "results_json = :results_json, results_hash = :results_hash, "
+                        "attempt_count = :attempt_count, updated_at = :now, "
+                        "completed_at = NULL WHERE request_id = :request_id"
+                    ),
+                    {
+                        "request_id": request.request_id,
+                        "results_json": canonical_json(inflight_payload),
+                        "results_hash": canonical_hash(inflight_payload),
+                        "attempt_count": attempt_count,
+                        "now": now,
+                    },
+                )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "acquisition_request_count = acquisition_request_count + "
+                    ":request_increment, acquisition_active_slot_count = "
+                    "acquisition_active_slot_count + 1 WHERE singleton = 'owner'"
+                ),
+                {"request_increment": 1 if new_request else 0},
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.acquisition_batch_started",
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                    "route_policy": request.route_policy,
+                },
+            )
+            browser_context_ref = (
+                None
+                if session_row.browser_context_ref is None
+                else str(session_row.browser_context_ref)
+            )
+
+        target_dir = (
+            self._acquisition_private_root
+            / session_ref
+            / "requests"
+            / request.request_id
+        )
+        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        provider_request = request.bind_to_session(
+            session_ref=session_ref,
+            session_mode=str(session_row.mode),
+            browser_context_ref=browser_context_ref,
+            provider_state_dir=self._acquisition_private_root / session_ref,
+            target_dir=target_dir,
+        )
+        affected_ids = {
+            result.paper_id
+            for result in previous_results
+            if result.status == "waiting_user"
+        }
+        affected_papers = tuple(
+            paper
+            for paper in provider_request.papers
+            if new_request or paper.paper_id in affected_ids
+        )
+        attempt_request = replace(provider_request, papers=affected_papers)
+        try:
+            reconcile = getattr(provider, "reconcile", None)
+            if reconcile_only:
+                if not callable(reconcile):
+                    attempted_results = tuple(
+                        _reconciliation_acquisition_item(paper.paper_id)
+                        for paper in attempt_request.papers
+                    )
+                else:
+                    attempted_results = tuple(reconcile(attempt_request))
+            else:
+                attempted_results = tuple(provider.acquire(attempt_request))
+            attempted_results = validate_item_results(
+                attempt_request, attempted_results
+            )
+            attempted_by_id = {
+                result.paper_id: result for result in attempted_results
+            }
+            previous_by_id = {
+                result.paper_id: result
+                for result in previous_results
+                if result.status != "waiting_user"
+            }
+            results = tuple(
+                attempted_by_id.get(paper.paper_id)
+                or previous_by_id.get(paper.paper_id)
+                or _reconciliation_acquisition_item(paper.paper_id)
+                for paper in provider_request.papers
+            )
+            results = validate_item_results(provider_request, results)
+            status = aggregate_batch_status(results)
+        except Exception:
+            attempted_by_id = {
+                paper.paper_id: _reconciliation_acquisition_item(paper.paper_id)
+                for paper in attempt_request.papers
+            }
+            previous_by_id = {
+                result.paper_id: result
+                for result in previous_results
+                if result.status != "waiting_user"
+            }
+            results = tuple(
+                attempted_by_id.get(paper.paper_id)
+                or previous_by_id.get(paper.paper_id)
+                or _reconciliation_acquisition_item(paper.paper_id)
+                for paper in provider_request.papers
+            )
+            status = aggregate_batch_status(results)
+        results_payload = [result.as_dict() for result in results]
+        results_json = canonical_json(results_payload)
+        results_hash = canonical_hash(results_payload)
+        completed_at = time.time()
+        session_status = "waiting_user" if status == "waiting_user" else "ready"
+        reason_code = (
+            next(
+                (
+                    result.failure["code"]
+                    for result in results
+                    if result.status == "waiting_user" and result.failure is not None
+                ),
+                "acquisition_waiting_user",
+            )
+            if status == "waiting_user"
+            else None
+        )
+        with self._database.write() as connection:
+            current = connection.execute(
+                text(
+                    "SELECT status, session_ref, request_hash FROM "
+                    "ar_acquisition_requests WHERE request_id = :request_id"
+                ),
+                {"request_id": request.request_id},
+            ).one()
+            if (
+                current.status != "running"
+                or current.session_ref != session_ref
+                or current.request_hash != request_hash
+            ):
+                raise OwnerConflict("acquisition_request_fence_stale")
+            connection.execute(
+                text(
+                    "UPDATE ar_acquisition_requests SET status = :status, "
+                    "results_json = :results_json, results_hash = :results_hash, "
+                    "updated_at = :now, completed_at = :now WHERE request_id = "
+                    ":request_id"
+                ),
+                {
+                    "request_id": request.request_id,
+                    "status": status,
+                    "results_json": results_json,
+                    "results_hash": results_hash,
+                    "now": completed_at,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_acquisition_sessions SET status = :session_status, "
+                    "request_count = request_count + :request_increment, "
+                    "current_request_id = CASE WHEN :session_status = "
+                    "'waiting_user' THEN :request_id ELSE NULL END, slot_held = 0, "
+                    "reason_code = :reason_code, updated_at = :now WHERE "
+                    "session_ref = :session_ref AND status = 'acquiring'"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "session_status": session_status,
+                    "request_id": request.request_id,
+                    "request_increment": 1 if new_request else 0,
+                    "reason_code": reason_code,
+                    "now": completed_at,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "acquisition_active_slot_count = "
+                    "acquisition_active_slot_count - 1 WHERE singleton = 'owner' "
+                    "AND acquisition_active_slot_count > 0"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.acquisition_batch_completed",
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                    "status": status,
+                },
+            )
+        return AcquisitionBatchExecution(
+            request_id=request.request_id,
+            session_ref=session_ref,
+            status=status,
+            request=provider_request,
+            results=results,
+        )
+
+    def bind_acquisition_session_to_quest(
+        self, initialization_id: str, quest_ref: str
+    ) -> AcquisitionSession | None:
+        if not initialization_id or not quest_ref:
+            raise OwnerConflict("acquisition_quest_binding_invalid")
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT quest_ref FROM ar_acquisition_sessions WHERE "
+                    "initialization_id = :initialization_id"
+                ),
+                {"initialization_id": initialization_id},
+            ).first()
+            if row is None:
+                return None
+            if row.quest_ref not in {None, quest_ref}:
+                raise OwnerConflict("acquisition_quest_binding_conflict")
+            if row.quest_ref is None:
+                connection.execute(
+                    text(
+                        "UPDATE ar_acquisition_sessions SET quest_ref = :quest_ref, "
+                        "updated_at = :now WHERE initialization_id = "
+                        ":initialization_id"
+                    ),
+                    {
+                        "initialization_id": initialization_id,
+                        "quest_ref": quest_ref,
+                        "now": time.time(),
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.acquisition_bound_to_quest",
+                    {
+                        "initialization_id": initialization_id,
+                        "quest_ref": quest_ref,
+                    },
+                )
+        return self.query_acquisition_session(initialization_id=initialization_id)
+
     def _recover_interrupted_deepfetch(self) -> None:
         now = time.time()
         with self._database.write() as connection:
@@ -746,6 +1510,27 @@ class SQLiteAgentRuntime:
                     {"recovered_record_count": recovered},
                 )
 
+    def _verify_deepfetch_acquisition_binding(
+        self,
+        request: DeepFetchRunRequest,
+        *,
+        require_ready: bool,
+    ) -> AcquisitionSession:
+        session = self.query_acquisition_session(
+            session_ref=request.acquisition_session_ref
+        )
+        if (
+            session is None
+            or session.initialization_id != request.initialization_id
+            or session.config_hash != request.acquisition_config_hash
+            or session.runtime_binding_hash
+            != request.acquisition_runtime_binding_hash
+        ):
+            raise OwnerConflict("deepfetch_acquisition_binding_invalid")
+        if require_ready and (session.status != "ready" or session.slot_held):
+            raise OwnerConflict("deepfetch_acquisition_not_ready")
+        return session
+
     def execute_deepfetch(
         self,
         request: DeepFetchRunRequest,
@@ -765,6 +1550,11 @@ class SQLiteAgentRuntime:
             ),
             resource_envelope_ref=request.resource_envelope_ref,
             resource_envelope_hash=request.resource_envelope_hash,
+            acquisition_session_ref=request.acquisition_session_ref,
+            acquisition_config_hash=request.acquisition_config_hash,
+            acquisition_runtime_binding_hash=(
+                request.acquisition_runtime_binding_hash
+            ),
             result_route=request.result_route,
             receipt=request.authorization_receipt,
             require_active=False,
@@ -776,6 +1566,7 @@ class SQLiteAgentRuntime:
             or canonical_hash(request.draft) != request.draft_hash
         ):
             raise OwnerConflict("deepfetch_run_request_invalid")
+        self._verify_deepfetch_acquisition_binding(request, require_ready=False)
         try:
             runtime_binding = provider.runtime_binding()
             runtime_binding_hash = validate_runtime_binding(runtime_binding)
@@ -819,6 +1610,11 @@ class SQLiteAgentRuntime:
             draft_hash=request.draft_hash,
             scope=request.scope,
             scope_hash=request.scope_hash,
+            acquisition_session_ref=request.acquisition_session_ref,
+            acquisition_config_hash=request.acquisition_config_hash,
+            acquisition_runtime_binding_hash=(
+                request.acquisition_runtime_binding_hash
+            ),
             accepted_material_bindings=request.accepted_material_bindings,
             authorization_receipt=request.authorization_receipt,
             runtime_binding=runtime_binding,
@@ -849,6 +1645,7 @@ class SQLiteAgentRuntime:
             )
         except DeepFetchUnavailable as error:
             if error.code in {
+                "deepfetch_acquisition_waiting_user",
                 "deepfetch_provider_stopped",
                 "deepfetch_provider_reconciliation_pending",
             }:
@@ -858,6 +1655,7 @@ class SQLiteAgentRuntime:
                     generation=generation,
                     fence_ref=fence_ref,
                     reason_code=error.code,
+                    native_session_ref=error.native_session_ref,
                 )
                 if effective_code != error.code:
                     raise DeepFetchUnavailable(effective_code) from error
@@ -906,6 +1704,7 @@ class SQLiteAgentRuntime:
         generation: int,
         fence_ref: str,
         reason_code: str,
+        native_session_ref: str | None,
     ) -> str:
         """Fence a daemon-local wait while leaving the logical Run admitted."""
 
@@ -926,9 +1725,17 @@ class SQLiteAgentRuntime:
                 ),
                 {"attempt_ref": attempt_ref},
             ).first()
+            session = connection.execute(
+                text(
+                    "SELECT native_session_ref FROM ar_deepfetch_sessions "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
             if (
                 run is None
                 or attempt is None
+                or session is None
                 or (
                     run.status != "running"
                     or run.current_attempt_ref != attempt_ref
@@ -938,6 +1745,12 @@ class SQLiteAgentRuntime:
                 )
             ):
                 return reason_code
+            if (
+                native_session_ref is not None
+                and session.native_session_ref is not None
+                and str(session.native_session_ref) != native_session_ref
+            ):
+                return "deepfetch_native_session_changed"
             pending_count = (
                 int(run.reconciliation_attempt_count) + 1
                 if reason_code == "deepfetch_provider_reconciliation_pending"
@@ -1012,6 +1825,19 @@ class SQLiteAgentRuntime:
                     "now": now,
                 },
             )
+            if native_session_ref is not None:
+                connection.execute(
+                    text(
+                        "UPDATE ar_deepfetch_sessions SET native_session_ref = "
+                        ":native_session_ref, updated_at = :now WHERE run_ref = "
+                        ":run_ref"
+                    ),
+                    {
+                        "run_ref": run_ref,
+                        "native_session_ref": native_session_ref,
+                        "now": now,
+                    },
+                )
             connection.execute(
                 text(
                     "UPDATE ar_deepfetch_runs SET status = 'admitted', "
@@ -1083,9 +1909,17 @@ class SQLiteAgentRuntime:
                 ),
                 resource_envelope_ref=request.resource_envelope_ref,
                 resource_envelope_hash=request.resource_envelope_hash,
+                acquisition_session_ref=request.acquisition_session_ref,
+                acquisition_config_hash=request.acquisition_config_hash,
+                acquisition_runtime_binding_hash=(
+                    request.acquisition_runtime_binding_hash
+                ),
                 result_route=request.result_route,
                 receipt=request.authorization_receipt,
                 require_active=True,
+            )
+            self._verify_deepfetch_acquisition_binding(
+                request, require_ready=True
             )
             run = connection.execute(
                 text(
@@ -3109,6 +3943,219 @@ class SQLiteAgentRuntimeReceiptVerifier:
             raise OwnerConflict("deepfetch_execution_receipt_invalid")
 
 
+def _acquisition_runtime_binding(value: str) -> AcquisitionRuntimeBinding:
+    try:
+        payload = decoded_object(value)
+        capabilities = payload["capability_bindings"]
+        if (
+            set(payload)
+            != {
+                "schema_ref",
+                "provider_ref",
+                "provider_version",
+                "capability_bindings",
+            }
+            or payload["schema_ref"]
+            != "meta-research/nature-downloader-runtime-binding/v1"
+            or not isinstance(capabilities, list)
+            or any(not isinstance(item, str) for item in capabilities)
+        ):
+            raise TypeError("acquisition runtime binding")
+        binding = AcquisitionRuntimeBinding(
+            provider_ref=str(payload["provider_ref"]),
+            provider_version=str(payload["provider_version"]),
+            capability_bindings=tuple(capabilities),
+        )
+        validate_acquisition_runtime_binding(binding)
+        return binding
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        AcquisitionUnavailable,
+    ) as error:
+        raise OwnerConflict("acquisition_session_invalid") from error
+
+
+def _acquisition_session_from_row(row) -> AcquisitionSession:
+    runtime_binding = _acquisition_runtime_binding(row.runtime_binding_json)
+    try:
+        config = decoded_object(row.config_json)
+        evidence = (
+            None if row.evidence_json is None else decoded_object(row.evidence_json)
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("acquisition_session_invalid") from error
+    if (
+        canonical_json(config) != row.config_json
+        or canonical_hash(config) != row.config_hash
+        or canonical_json(runtime_binding.as_dict()) != row.runtime_binding_json
+        or canonical_hash(runtime_binding.as_dict()) != row.runtime_binding_hash
+        or (
+            evidence is None
+            and (row.evidence_json is not None or row.evidence_hash is not None)
+        )
+        or (
+            evidence is not None
+            and (
+                canonical_json(evidence) != row.evidence_json
+                or canonical_hash(evidence) != row.evidence_hash
+            )
+        )
+        or bool(row.slot_held) != (row.status in {"probing", "acquiring"})
+    ):
+        raise OwnerConflict("acquisition_session_invalid")
+    return AcquisitionSession(
+        session_ref=str(row.session_ref),
+        initialization_id=str(row.initialization_id),
+        quest_ref=None if row.quest_ref is None else str(row.quest_ref),
+        status=str(row.status),
+        config_hash=str(row.config_hash),
+        mode=str(row.mode),
+        browser_context_ref=(
+            None
+            if row.browser_context_ref is None
+            else str(row.browser_context_ref)
+        ),
+        runtime_binding=runtime_binding,
+        runtime_binding_hash=str(row.runtime_binding_hash),
+        preflight_generation=int(row.preflight_generation),
+        request_count=int(row.request_count),
+        current_request_id=(
+            None if row.current_request_id is None else str(row.current_request_id)
+        ),
+        slot_held=bool(row.slot_held),
+        reason_code=None if row.reason_code is None else str(row.reason_code),
+        evidence_hash=(
+            None if row.evidence_hash is None else str(row.evidence_hash)
+        ),
+    )
+
+
+def _acquisition_request_from_json(value: str) -> AcquisitionBatchRequest:
+    try:
+        payload = decoded_object(value)
+        raw_papers = payload["papers"]
+        if (
+            set(payload)
+            != {"schema_ref", "request_id", "route_policy", "papers"}
+            or not isinstance(raw_papers, list)
+        ):
+            raise TypeError("acquisition request")
+        papers = tuple(
+            AcquisitionPaper(
+                paper_id=str(item["paper_id"]),
+                title=str(item["title"]),
+                doi=None if item["doi"] is None else str(item["doi"]),
+                arxiv_id=(
+                    None if item["arxiv_id"] is None else str(item["arxiv_id"])
+                ),
+                source_urls=tuple(str(url) for url in item["source_urls"]),
+            )
+            for item in raw_papers
+            if isinstance(item, dict)
+            and set(item)
+            == {"paper_id", "title", "doi", "arxiv_id", "source_urls"}
+            and isinstance(item["source_urls"], list)
+        )
+        if len(papers) != len(raw_papers):
+            raise TypeError("acquisition papers")
+        request = AcquisitionBatchRequest(
+            request_id=str(payload["request_id"]),
+            route_policy=payload["route_policy"],
+            papers=papers,
+        )
+        validate_batch_request(request)
+        return request
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        AcquisitionUnavailable,
+    ) as error:
+        raise OwnerConflict("acquisition_request_invalid") from error
+
+
+def _acquisition_execution_from_row(
+    row,
+    session_row,
+    acquisition_private_root: Path,
+) -> AcquisitionBatchExecution:
+    request = _acquisition_request_from_json(row.request_json).bind_to_session(
+        session_ref=str(row.session_ref),
+        session_mode=str(session_row.mode),
+        browser_context_ref=(
+            None
+            if session_row.browser_context_ref is None
+            else str(session_row.browser_context_ref)
+        ),
+        provider_state_dir=acquisition_private_root / str(row.session_ref),
+        target_dir=(
+            acquisition_private_root
+            / str(row.session_ref)
+            / "requests"
+            / str(row.request_id)
+        ),
+    )
+    try:
+        raw_results = json.loads(row.results_json)
+        if (
+            not isinstance(raw_results, list)
+            or canonical_json(raw_results) != row.results_json
+            or canonical_hash(raw_results) != row.results_hash
+        ):
+            raise TypeError("acquisition results")
+        results = tuple(
+            AcquisitionItemResult(
+                paper_id=item["paper_id"],
+                status=item["status"],
+                path=item["path"],
+                format=item["format"],
+                failure=item["failure"],
+            )
+            for item in raw_results
+        )
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise OwnerConflict("acquisition_result_invalid") from error
+    return AcquisitionBatchExecution(
+        request_id=str(row.request_id),
+        session_ref=str(row.session_ref),
+        status=str(row.status),
+        request=request,
+        results=results,
+    )
+
+
+def _failed_acquisition_item(
+    paper_id: str, code: str
+) -> AcquisitionItemResult:
+    return AcquisitionItemResult(
+        paper_id=paper_id,
+        status="missing",
+        path=None,
+        format=None,
+        failure={"code": code, "detail": "Nature Downloader 未形成可接纳正文。"},
+    )
+
+
+def _reconciliation_acquisition_item(paper_id: str) -> AcquisitionItemResult:
+    return AcquisitionItemResult(
+        paper_id=paper_id,
+        status="waiting_user",
+        path=None,
+        format=None,
+        failure={
+            "code": "acquisition_reconciliation_required",
+            "detail": (
+                "既有下载操作尚未形成可验证终态；系统将先对账，"
+                "不会重复启动下载。"
+            ),
+        },
+    )
+
+
 def _deepfetch_runtime_binding(value: str) -> DeepFetchRuntimeBinding:
     try:
         decoded = decoded_object(value)
@@ -4203,6 +5250,7 @@ def create_agent_runtime_interface(
     stage_request_verifier: StageRunRequestVerifier | None = None,
     outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
     deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
+    acquisition_private_root: Path | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
         database,
@@ -4211,6 +5259,7 @@ def create_agent_runtime_interface(
         stage_request_verifier,
         outcome_verifier,
         deepfetch_request_verifier,
+        acquisition_private_root,
     )
 
 

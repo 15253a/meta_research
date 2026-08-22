@@ -4087,11 +4087,19 @@ class SQLiteResearchMemory:
             "request_ref": request.request_ref,
             "summary": result["summary"],
         }
-        papers_document = {
-            "schema_ref": "meta-research/papers-ledger/v1",
-            "request_ref": request.request_ref,
-            "papers": result["papers"],
-        }
+        if result.get("papers_ledger") is None:
+            papers_document = {
+                "schema_ref": "meta-research/papers-ledger/v1",
+                "request_ref": request.request_ref,
+                "papers": result["papers"],
+            }
+        else:
+            papers_document = {
+                "schema_ref": "meta-research/papers-ledger/v2",
+                "request_ref": request.request_ref,
+                "ledger": result["papers_ledger"],
+                "display_papers": result["papers"],
+            }
         fulltexts_document = {
             "schema_ref": "meta-research/fulltext-collection/v1",
             "request_ref": request.request_ref,
@@ -4313,10 +4321,12 @@ class SQLiteResearchMemory:
             or summary_document.get("request_ref") != row.request_ref
             or papers_document.get("request_ref") != row.request_ref
             or fulltexts_document.get("request_ref") != row.request_ref
-            or not isinstance(papers_document.get("papers"), list)
             or not isinstance(fulltexts_document.get("fulltexts"), list)
         ):
             raise OwnerConflict("literature_snapshot_invalid")
+        paper_count = _validated_stored_papers_document(
+            papers_document, str(row.request_ref)
+        )
         snapshot_binding = {
             "schema_ref": "meta-research/literature-snapshot/v1",
             "snapshot_ref": row.snapshot_ref,
@@ -4395,7 +4405,7 @@ class SQLiteResearchMemory:
             limitations=tuple(limitations),
             web_evidence_hash=row.web_evidence_hash,
             snapshot_hash=row.snapshot_hash,
-            paper_count=len(papers_document["papers"]),
+            paper_count=paper_count,
             fulltext_count=len(fulltexts_document["fulltexts"]),
             execution_receipt=execution_receipt,
             receipt=receipt,
@@ -4416,9 +4426,16 @@ class SQLiteResearchMemory:
         summary = self._read_literature_object(
             row.summary_object_path, row.summary_hash
         )["summary"]
-        papers = self._read_literature_object(
+        papers_document = self._read_literature_object(
             row.papers_object_path, row.papers_hash
-        )["papers"]
+        )
+        _validated_stored_papers_document(papers_document, str(row.request_ref))
+        if papers_document.get("schema_ref") == "meta-research/papers-ledger/v2":
+            papers = papers_document["display_papers"]
+            papers_ledger = papers_document["ledger"]
+        else:
+            papers = papers_document["papers"]
+            papers_ledger = None
         fulltexts = self._read_literature_object(
             row.fulltexts_object_path, row.fulltexts_hash
         )["fulltexts"]
@@ -4432,6 +4449,7 @@ class SQLiteResearchMemory:
             **accepted.as_public_dict(),
             "summary": summary,
             "papers": papers,
+            "papers_ledger": papers_ledger,
             "fulltexts": fulltexts,
             "web_evidence": web_evidence,
         }
@@ -4554,7 +4572,7 @@ def _validated_literature_result(
     result = run.result
     if result is None or run.result_hash is None:
         raise OwnerConflict("deepfetch_execution_incomplete")
-    expected_fields = {
+    common_fields = {
         "schema_ref",
         "request_ref",
         "initialization_id",
@@ -4571,10 +4589,19 @@ def _validated_literature_result(
         "adapter_kind",
         "web_evidence",
     }
+    schema_ref = result.get("schema_ref")
+    expected_fields = (
+        {*common_fields, "papers_ledger"}
+        if schema_ref == "meta-research/first-question-deepfetch-result/v2"
+        else common_fields
+    )
     if (
         set(result) != expected_fields
-        or result.get("schema_ref")
-        != "meta-research/first-question-deepfetch-result/v1"
+        or schema_ref
+        not in {
+            "meta-research/first-question-deepfetch-result/v1",
+            "meta-research/first-question-deepfetch-result/v2",
+        }
         or result.get("request_ref") != request.request_ref
         or result.get("initialization_id") != request.initialization_id
         or result.get("correlation_ref") != request.correlation_ref
@@ -4609,6 +4636,10 @@ def _validated_literature_result(
         for value in fulltexts
     ):
         raise OwnerConflict("literature_snapshot_payload_invalid")
+    if schema_ref == "meta-research/first-question-deepfetch-result/v2":
+        ledger = result.get("papers_ledger")
+        if ledger is not None:
+            _validated_v4_ledger(ledger, expected_count=len(papers))
     for value in fulltexts:
         assert isinstance(value, dict)
         if value.get("content_hash") != canonical_hash(
@@ -4619,6 +4650,59 @@ def _validated_literature_result(
         ):
             raise OwnerConflict("literature_snapshot_payload_invalid")
     return result
+
+
+def _validated_stored_papers_document(
+    value: dict[str, object], request_ref: str
+) -> int:
+    schema_ref = value.get("schema_ref")
+    if schema_ref == "meta-research/papers-ledger/v1":
+        if (
+            set(value) != {"schema_ref", "request_ref", "papers"}
+            or value.get("request_ref") != request_ref
+            or not isinstance(value.get("papers"), list)
+        ):
+            raise OwnerConflict("literature_snapshot_invalid")
+        return len(value["papers"])
+    if schema_ref == "meta-research/papers-ledger/v2":
+        display = value.get("display_papers")
+        if (
+            set(value)
+            != {"schema_ref", "request_ref", "ledger", "display_papers"}
+            or value.get("request_ref") != request_ref
+            or not isinstance(display, list)
+        ):
+            raise OwnerConflict("literature_snapshot_invalid")
+        return _validated_v4_ledger(value.get("ledger"), expected_count=len(display))
+    raise OwnerConflict("literature_snapshot_invalid")
+
+
+def _validated_v4_ledger(value: object, *, expected_count: int) -> int:
+    required = {
+        "schema_version",
+        "topic",
+        "run",
+        "paper_order",
+        "papers",
+        "missing_fulltexts",
+        "limitations",
+    }
+    if not isinstance(value, dict):
+        raise OwnerConflict("literature_snapshot_payload_invalid")
+    paper_order = value.get("paper_order")
+    papers = value.get("papers")
+    if (
+        set(value) != required
+        or value.get("schema_version") != "deepfetch.papers.v4"
+        or not isinstance(paper_order, list)
+        or any(not isinstance(item, str) or not item for item in paper_order)
+        or len(set(paper_order)) != len(paper_order)
+        or len(paper_order) != expected_count
+        or not isinstance(papers, dict)
+        or set(papers) != set(paper_order)
+    ):
+        raise OwnerConflict("literature_snapshot_payload_invalid")
+    return len(paper_order)
 
 
 def _literature_snapshot_receipt_hash(

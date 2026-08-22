@@ -279,6 +279,25 @@ export type DeepFetchRun = {
   failure: null | { code: string };
 };
 
+export type AcquisitionSessionProjection = {
+  session_ref: string;
+  status:
+    | "probing"
+    | "ready"
+    | "waiting_user"
+    | "unavailable"
+    | "acquiring"
+    | "cancelled";
+  freshness: "current" | "stale";
+  mode: QuestDraft["literature"]["mode"];
+  preflight_generation: number;
+  request_count: number;
+  current_request_id: string | null;
+  slot_held: boolean;
+  browser_context: "verified" | "unavailable";
+  reason: null | { code: string };
+};
+
 export type LiteratureSnapshot = {
   status: "accepted";
   snapshot_ref: string;
@@ -422,6 +441,7 @@ export type QuestCreationView = {
     status: "open" | "closed";
     turns: IntentSessionTurn[];
   };
+  acquisition_session: AcquisitionSessionProjection | null;
   deepfetch: DeepFetchProjection | null;
   capabilities: {
     direct: QuestCapability;
@@ -806,6 +826,19 @@ export function observeHostCompute(
     `/api/v1/quest-initializations/${creation.initialization_id}/compute-probe`,
     "POST",
     { selected_device_uuids: selectedDeviceUuids },
+  );
+}
+
+export function prepareAcquisitionSession(
+  creation: QuestCreationView,
+): Promise<QuestCreationView> {
+  return writeJson(
+    `/api/v1/quest-initializations/${creation.initialization_id}/acquisition-session`,
+    "POST",
+    {
+      expected_draft_revision: creation.quest_draft.revision,
+      expected_draft_hash: creation.quest_draft.hash,
+    },
   );
 }
 

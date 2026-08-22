@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -35,6 +36,103 @@ QUESTION = {
     "applicability_scope": "低照度荧光显微公开数据。",
     "background_context": "DeepFetch 找到两篇可核查论文，其中一篇没有开放全文。",
     "requirements_constraints": "两周内，使用获准 GPU；保留缺全文限制。",
+}
+
+PROTOTYPE_COMMIT = "cb369c938da835bcd07202e03ccc770551984070"
+PROTOTYPE_EMPTY_LEDGER = {
+    "schema_version": "deepfetch.papers.v4",
+    "topic": {
+        "input": "低照度显微图像中的稀有形态保真",
+        "interpretation": "寻找可核查的代表性研究。",
+        "search_concepts": ["low-light microscopy denoising"],
+        "scope_notes": [],
+    },
+    "run": {
+        "intensity": "medium",
+        "active_search_budget_minutes": 13,
+        "active_search_elapsed_seconds": 42,
+        "dimensions_used": [
+            "text_queries",
+            "literature_roles",
+            "citation_graph",
+        ],
+        "stopping_reason": "coverage_saturated",
+    },
+    "paper_order": [],
+    "papers": {},
+    "missing_fulltexts": [],
+    "limitations": ["检索未形成可纳入的精确论文。"],
+}
+PROTOTYPE_EMPTY_FINAL = {
+    "action": "finalize",
+    "acquisition_request": None,
+    "completion": "honest_empty",
+    "limitations": ["检索未形成可纳入的精确论文。"],
+    "workflow": {
+        "prototype_commit": PROTOTYPE_COMMIT,
+        "main_agent_status": "complete",
+        "reader_assignments": [],
+        "finalize_status": "passed",
+        "finalized_at": "2026-08-22T00:00:00Z",
+    },
+}
+DETERMINISTIC_LEDGER = {
+    "schema_version": "deepfetch.papers.v4",
+    "topic": {
+        "input": "低照度显微图像中的稀有形态保真",
+        "interpretation": "比较两篇代表性研究。",
+        "search_concepts": ["low-light microscopy"],
+        "scope_notes": [],
+    },
+    "run": {
+        "intensity": "medium",
+        "active_search_budget_minutes": 13,
+        "active_search_elapsed_seconds": 42,
+        "dimensions_used": ["text_queries", "literature_roles", "citation_graph"],
+        "stopping_reason": "coverage_saturated",
+    },
+    "paper_order": ["doi:10.1000/example.one", "title:rare-morphology"],
+    "papers": {
+        "doi:10.1000/example.one": {
+            "identity": {
+                "paper_id": "doi:10.1000/example.one",
+                "title": "Self-supervised denoising for fluorescence microscopy",
+                "doi": "10.1000/example.one",
+                "arxiv_id": None,
+                "openalex_id": "W1",
+            },
+            "metadata": {"authors": ["A. Researcher"], "source_urls": ["https://example.org/papers/one"]},
+            "pre_understanding": {"summary": "摘要支持纳入。", "evidence_level": "abstract_supported"},
+            "fulltext_path": "fulltext/one.html",
+            "reading": {
+                "status": "complete",
+                "understanding_summary": "Reader 保留了完整理解。",
+                "methods": ["self-supervision"],
+                "experimental_setup": {"datasets_samples": ["microscopy"]},
+                "key_claims": [{"claim": "保留稀有形态", "evidence_locators": ["loc-1"]}],
+                "limitations": [{"description": "样本有限", "source": "reader"}],
+                "artifacts": {"code": {"reported": True, "items": []}},
+                "credibility": {"score": 4, "assessment_confidence": "medium"},
+                "evidence_locators": [{"id": "loc-1", "section": "Results"}],
+                "notes": [],
+            },
+        },
+        "title:rare-morphology": {
+            "identity": {
+                "paper_id": "title:rare-morphology",
+                "title": "Rare morphology preservation under low light",
+                "doi": None,
+                "arxiv_id": None,
+                "openalex_id": None,
+            },
+            "metadata": {"authors": [], "source_urls": ["https://example.org/papers/two"]},
+            "pre_understanding": {"summary": "题名支持候选。", "evidence_level": "title_only"},
+            "fulltext_path": None,
+            "reading": {"status": "not_read"},
+        },
+    },
+    "missing_fulltexts": ["title:rare-morphology"],
+    "limitations": ["第二篇论文没有可合法获取的开放全文。"],
 }
 
 
@@ -112,6 +210,7 @@ class DeterministicDeepFetchProvider:
                 "fetch_event_count": 2,
                 "trace_hash": "d" * 64,
             },
+            papers_ledger=copy.deepcopy(DETERMINISTIC_LEDGER),
         )
 
 
@@ -226,6 +325,11 @@ def _deepfetch_draft(view: dict[str, object]) -> dict[str, object]:
             "completion_criteria": "形成带反例和证据边界的比较结论。",
             "time_budget": "30d",
             "route": "deepfetch",
+            "literature": {
+                **draft["literature"],
+                "mode": "oa_only",
+                "library_entry_url": "",
+            },
             "background_and_initial_direction": "比较自监督和监督基线。",
         }
     )
@@ -260,6 +364,15 @@ def _open_and_queue_deepfetch(
     )
     saved_response.raise_for_status()
     saved = saved_response.json()
+    prepared_response = client.post(
+        f"/api/v1/quest-initializations/{initialization_id}/acquisition-session",
+        headers=_write_headers(write_headers, f"{key_prefix}-acquisition"),
+        json={
+            "expected_draft_revision": saved["quest_draft"]["revision"],
+            "expected_draft_hash": saved["quest_draft"]["hash"],
+        },
+    )
+    prepared_response.raise_for_status()
     queued_response = client.post(
         f"/api/v1/quest-initializations/{initialization_id}/proposal-generations",
         headers=_write_headers(write_headers, f"{key_prefix}-start"),
@@ -307,6 +420,17 @@ def test_deepfetch_prepares_one_exact_snapshot_then_returns_to_the_same_proposal
         )
         saved_response.raise_for_status()
         saved = saved_response.json()
+
+        prepared_response = client.post(
+            f"/api/v1/quest-initializations/{opened['initialization_id']}"
+            "/acquisition-session",
+            headers=_write_headers(write_headers, "deepfetch-acquisition"),
+            json={
+                "expected_draft_revision": saved["quest_draft"]["revision"],
+                "expected_draft_hash": saved["quest_draft"]["hash"],
+            },
+        )
+        prepared_response.raise_for_status()
 
         queued_response = client.post(
             f"/api/v1/quest-initializations/{opened['initialization_id']}"
@@ -363,6 +487,10 @@ def test_deepfetch_prepares_one_exact_snapshot_then_returns_to_the_same_proposal
         assert snapshot_response.json()["limitations"] == [
             "第二篇论文没有可合法获取的开放全文。"
         ]
+        assert snapshot_response.json()["papers_ledger"] == DETERMINISTIC_LEDGER
+        assert snapshot_response.json()["papers_ledger"]["papers"][
+            "doi:10.1000/example.one"
+        ]["reading"]["key_claims"][0]["evidence_locators"] == ["loc-1"]
         assert snapshot_response.json()["web_evidence"] == {
             "schema_ref": "meta-research/deepfetch-web-evidence/v1",
             "search_event_count": 1,
@@ -561,14 +689,6 @@ def test_terminal_codex_failure_retries_a_new_operation_in_the_same_native_sessi
     tmp_path: Path, failure_mode: str, failure_code: str
 ) -> None:
     executable = tmp_path / "fake-codex"
-    result = DeterministicDeepFetchProvider.result()
-    output = {
-        "completion": result.completion,
-        "summary": result.summary,
-        "papers": list(result.papers),
-        "fulltexts": list(result.fulltexts),
-        "limitations": list(result.limitations),
-    }
     executable.write_text(
         """#!/usr/bin/env python3
 import json
@@ -582,7 +702,7 @@ count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
 counter_path.write_text(str(count), encoding='utf-8')
 with arguments_path.open('a', encoding='utf-8') as stream:
     stream.write(json.dumps(arguments) + '\\n')
-sys.stdin.read()
+prompt = sys.stdin.read()
 thread_ref = 'native-terminal-retry'
 print(json.dumps({'type': 'thread.started', 'thread_id': thread_ref}), flush=True)
 failure_mode = '__FAILURE_MODE__'
@@ -598,13 +718,20 @@ if count > 1 or failure_mode != 'missing_web_evidence':
         'id': 'open-terminal', 'type': 'web_search', 'query': '',
         'action': {'type': 'other'}}}), flush=True)
 result_path = pathlib.Path(arguments[arguments.index('--output-last-message') + 1])
-payload = {} if count == 1 and failure_mode == 'invalid_result' else __RESULT__
+output_root = pathlib.Path(next(
+    line.split('=', 1)[1] for line in prompt.splitlines()
+    if line.startswith('public_output_root=')
+))
+(output_root / 'fulltext').mkdir(parents=True, exist_ok=True)
+(output_root / 'papers.json').write_text(
+    json.dumps(__LEDGER__, ensure_ascii=False), encoding='utf-8')
+(output_root / 'summary.md').write_text(
+    '# 范围\\n\\n本轮检索未形成可纳入的精确论文。\\n', encoding='utf-8')
+payload = {} if count == 1 and failure_mode == 'invalid_result' else __FINAL__
 result_path.write_text(json.dumps(payload), encoding='utf-8')
-""".replace(
-            "__RESULT__", repr(output)
-        ).replace(
-            "__FAILURE_MODE__", failure_mode
-        ),
+""".replace("__LEDGER__", repr(PROTOTYPE_EMPTY_LEDGER)).replace(
+            "__FINAL__", repr(PROTOTYPE_EMPTY_FINAL)
+        ).replace("__FAILURE_MODE__", failure_mode),
         encoding="utf-8",
     )
     executable.chmod(0o700)

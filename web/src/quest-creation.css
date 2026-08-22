@@ -517,6 +517,28 @@
   font: 800 8px/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
 }
 
+.quest-unavailable-tag.ready {
+  color: #137e70;
+  background: #e7f7f3;
+}
+
+.quest-unavailable-tag.probing,
+.quest-unavailable-tag.acquiring {
+  color: #345f9f;
+  background: #eaf1ff;
+}
+
+.quest-unavailable-tag.waiting_user {
+  color: #8a5b16;
+  background: #fff4d8;
+}
+
+.quest-unavailable-tag.not-checked,
+.quest-unavailable-tag.cancelled {
+  color: #667085;
+  background: #eef1f5;
+}
+
 .quest-optional-card summary {
   min-height: 44px;
   padding: 12px 2px;

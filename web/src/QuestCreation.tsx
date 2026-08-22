@@ -14,6 +14,7 @@ import {
   fetchResearchAssets,
   generateQuestionProposal,
   observeHostCompute,
+  prepareAcquisitionSession,
   ProductError,
   reviseQuestDraft,
   saveQuestionProposal,
@@ -106,6 +107,7 @@ const proposalFields: Array<{
 type SaveState = "opening" | "restored" | "unsaved" | "saving" | "saved" | "error";
 type Operation =
   | "compute"
+  | "acquisition"
   | "generating"
   | "reviewing"
   | "intent"
@@ -144,6 +146,7 @@ type NormalizedQuestCreationView = Omit<QuestCreationView, "quest_draft"> & {
 
 const idleOperations: InFlightOperations = {
   compute: false,
+  acquisition: false,
   generating: false,
   reviewing: false,
   intent: false,
@@ -172,8 +175,11 @@ export function QuestCreationWorkbench({
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const errorRef = useRef<HTMLDivElement>(null);
-  const errorFocusRef = useRef<"draft" | "compute" | "proposal" | "conflict" | "alert">("alert");
+  const errorFocusRef = useRef<
+    "draft" | "compute" | "acquisition" | "proposal" | "conflict" | "alert"
+  >("alert");
   const computeButtonRef = useRef<HTMLButtonElement>(null);
+  const acquisitionButtonRef = useRef<HTMLButtonElement>(null);
   const proposalActionRef = useRef<HTMLButtonElement>(null);
   const conflictRecoveryRef = useRef<HTMLButtonElement>(null);
   const firstRequiredRef = useRef<HTMLTextAreaElement>(null);
@@ -188,6 +194,7 @@ export function QuestCreationWorkbench({
   const operationSequenceRef = useRef(0);
   const operationTokensRef = useRef<Record<Operation, number>>({
     compute: 0,
+    acquisition: 0,
     generating: 0,
     reviewing: 0,
     intent: 0,
@@ -403,8 +410,17 @@ export function QuestCreationWorkbench({
       : ["quest_basis_incomplete"].includes(code)
       ? "draft"
       : ["resource_envelope_required", "compute_device_selection_stale"].includes(code)
-        ? "compute"
-        : [
+      ? "compute"
+      : [
+          "acquisition_session_required",
+          "acquisition_session_stale",
+          "acquisition_session_not_ready",
+          "deepfetch_acquisition_not_ready",
+          "institutional_entry_required",
+          "institutional_login_required",
+        ].includes(code)
+        ? "acquisition"
+      : [
             "confirmation_preview_required",
             "confirmation_preview_stale",
           ].includes(code)
@@ -418,6 +434,7 @@ export function QuestCreationWorkbench({
     const target = {
       draft: firstRequiredRef.current,
       compute: computeButtonRef.current,
+      acquisition: acquisitionButtonRef.current,
       proposal: proposalActionRef.current,
       conflict: conflictRecoveryRef.current,
       alert: errorRef.current,
@@ -627,7 +644,31 @@ export function QuestCreationWorkbench({
     setError(null);
     const task = (async () => {
       try {
-        const next = await reviseQuestDraft(basis, captured, expectedBasis);
+        const saved = await reviseQuestDraft(basis, captured, expectedBasis);
+        if (!mountedRef.current) return saved;
+        let next = saved;
+        const acquisitionChanged = literatureAcquisitionConfigChanged(
+          basis.quest_draft.value,
+          captured,
+        );
+        if (
+          acquisitionChanged ||
+          !saved.acquisition_session ||
+          saved.acquisition_session.freshness !== "current"
+        ) {
+          try {
+            next = await prepareAcquisitionSession(saved);
+          } catch (caught) {
+            // The DraftRevision is already durable. Keep that truth visible
+            // even if the independent environment probe could not return.
+            applyView(saved, {
+              syncDraft: sameDraft(draftRef.current, captured),
+              syncProposal: !proposalDirtyRef.current,
+              adoptDirtyDraftBasis: true,
+            });
+            showError(caught);
+          }
+        }
         if (!mountedRef.current) return next;
         const unchanged = sameDraft(draftRef.current, captured);
         applyView(next, {
@@ -852,12 +893,38 @@ export function QuestCreationWorkbench({
     }
   };
 
+  const detectAcquisition = async () => {
+    const token = beginOperation("acquisition");
+    setError(null);
+    try {
+      const basis = await persistDraft();
+      if (!basis || !operationIsCurrent("acquisition", token)) return;
+      const next = await prepareAcquisitionSession(basis);
+      if (!operationIsCurrent("acquisition", token)) return;
+      applyView(next, {
+        syncDraft: true,
+        syncProposal: !proposalDirtyRef.current,
+        adoptDirtyDraftBasis: true,
+      });
+      const session = next.acquisition_session;
+      if (session && session.status !== "ready") {
+        showError(new ProductError(
+          session.reason?.code ?? "acquisition_session_not_ready",
+        ));
+      }
+    } catch (caught) {
+      if (operationIsCurrent("acquisition", token)) showError(caught);
+    } finally {
+      finishOperation("acquisition", token);
+    }
+  };
+
   const generateProposal = async (returnFocus?: HTMLButtonElement) => {
     const token = beginOperation("generating");
     let restoreTriggerFocus = false;
     setError(null);
     try {
-      const basis = await persistProposal();
+      let basis = await persistProposal();
       if (!basis || !operationIsCurrent("generating", token)) return;
       if (!draftIsComplete(draftRef.current)) {
         showError(new ProductError("quest_basis_incomplete"));
@@ -868,6 +935,29 @@ export function QuestCreationWorkbench({
         showError(new ProductError("resource_envelope_required"));
         requestAnimationFrame(() => computeButtonRef.current?.focus());
         return;
+      }
+      if (
+        draftRef.current.route === "deepfetch" &&
+        (
+          !basis.acquisition_session ||
+          basis.acquisition_session.freshness !== "current" ||
+          basis.acquisition_session.status !== "ready"
+        )
+      ) {
+        basis = await prepareAcquisitionSession(basis);
+        if (!operationIsCurrent("generating", token)) return;
+        applyView(basis, {
+          syncDraft: true,
+          syncProposal: !proposalDirtyRef.current,
+        });
+        if (basis.acquisition_session?.status !== "ready") {
+          showError(new ProductError(
+            basis.acquisition_session?.reason?.code ??
+              "acquisition_session_not_ready",
+          ));
+          requestAnimationFrame(() => acquisitionButtonRef.current?.focus());
+          return;
+        }
       }
       const queued = await generateQuestionProposal(basis);
       if (!operationIsCurrent("generating", token)) return;
@@ -1053,20 +1143,23 @@ export function QuestCreationWorkbench({
       creation.proposal_generation.status,
     ),
   );
+  const acquisitionSession = creation?.acquisition_session ?? null;
   const deepfetch = creation?.deepfetch ?? null;
   const durableIntentActive = Boolean(
     creation?.intent_session?.turns.some((turn) =>
       ["queued", "running"].includes(turn.assistant_status)),
   );
   const terminalMutationActive = inFlight.confirming || inFlight.cancelling || inFlight.closing;
-  const draftInteractionLocked = terminal || inFlight.reviewing || terminalMutationActive;
-  const sessionInteractionLocked = terminal || durableIntentActive || inFlight.intent ||
+  const draftInteractionLocked = terminal || inFlight.acquisition || inFlight.reviewing || terminalMutationActive;
+  const sessionInteractionLocked = terminal || durableIntentActive || inFlight.intent || inFlight.acquisition ||
     inFlight.reviewing || terminalMutationActive;
-  const proposalInteractionLocked = terminal || proposalGenerationActive || inFlight.generating ||
+  const proposalInteractionLocked = terminal || proposalGenerationActive || inFlight.generating || inFlight.acquisition ||
     inFlight.reviewing || terminalMutationActive;
-  const computeActionLocked = terminal || inFlight.compute || inFlight.generating ||
+  const computeActionLocked = terminal || inFlight.compute || inFlight.acquisition || inFlight.generating ||
     proposalGenerationActive || inFlight.reviewing || terminalMutationActive;
-  const proposalActionLocked = terminal || inFlight.compute || inFlight.generating ||
+  const acquisitionActionLocked = terminal || inFlight.acquisition || inFlight.generating ||
+    proposalGenerationActive || inFlight.reviewing || terminalMutationActive;
+  const proposalActionLocked = terminal || inFlight.compute || inFlight.acquisition || inFlight.generating ||
     proposalGenerationActive || inFlight.reviewing || terminalMutationActive;
   const anyOperationActive = Object.values(inFlight).some(Boolean);
   const draftComplete = draftIsComplete(draft);
@@ -1325,12 +1418,36 @@ export function QuestCreationWorkbench({
                     <i aria-hidden="true">↗</i>
                     <div>
                       <b>全面搜索前准备 Google Chrome</b>
-                      <small>保留 Chrome 连接器、浏览器控制与图书馆登录入口；本票不伪造检测结果。</small>
+                      <small>检测真实 provider、浏览器控制与获准资源；凭据和 provider manifest 始终留在私有会话。</small>
                     </div>
-                    <button className="quest-library-test" type="button" disabled>
-                      检测搜索环境
+                    <button
+                      ref={acquisitionButtonRef}
+                      className="quest-library-test"
+                      type="button"
+                      disabled={
+                        !creation ||
+                        acquisitionActionLocked ||
+                        draftSaveState === "saving"
+                      }
+                      onClick={() => void detectAcquisition()}
+                    >
+                      {inFlight.acquisition
+                        ? "正在检测…"
+                        : acquisitionSession?.status === "waiting_user"
+                          ? "重新检测登录"
+                          : acquisitionSession
+                            ? "重新检测"
+                            : "检测搜索环境"}
                     </button>
-                    <span className="quest-unavailable-tag">capability_unavailable</span>
+                    <span
+                      className={`quest-unavailable-tag ${acquisitionSession?.status ?? "not-checked"}`}
+                      data-testid="acquisition-session-status"
+                      aria-live="polite"
+                    >
+                      {inFlight.acquisition
+                        ? "probing · current"
+                        : acquisitionSessionCopy(acquisitionSession, draft)}
+                    </span>
                   </div>
                   <label className="quest-field">
                     <span>图书馆／数据库入口链接 <em>可选</em></span>
@@ -2097,6 +2214,33 @@ function sameDraft(left: QuestDraft, right: QuestDraft): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function literatureAcquisitionConfigChanged(
+  left: QuestDraft,
+  right: QuestDraft,
+): boolean {
+  return left.literature.mode !== right.literature.mode ||
+    left.literature.library_entry_url.trim() !==
+      right.literature.library_entry_url.trim();
+}
+
+function acquisitionSessionCopy(
+  session: QuestCreationView["acquisition_session"],
+  draft: QuestDraft,
+): string {
+  if (!session) return "not_checked";
+  const freshness = session.mode === draft.literature.mode
+    ? session.freshness
+    : "stale";
+  if (session.status === "ready") {
+    const browser = draft.literature.mode === "oa_then_institution"
+      ? `browser ${session.browser_context}`
+      : "browser not_required";
+    return `ready · ${freshness} · ${browser}`;
+  }
+  const reason = session.reason?.code ?? "no_reason";
+  return `${session.status} · ${freshness} · ${reason}`;
+}
+
 function sameQuestion(left: QuestionContent | null, right: QuestionContent | null): boolean {
   if (left === null || right === null) return left === right;
   return JSON.stringify(left) === JSON.stringify(right);
@@ -2436,6 +2580,17 @@ function messageFor(code: string): string {
     confirmation_preview_stale: "Impact Preview 已陈旧；等待系统自动刷新后再确认。",
     quest_basis_incomplete: "请先补齐 Quest 目标与完成标准。",
     resource_envelope_required: "请先检测真实本机计算卡并形成 Quest Resource Envelope。",
+    acquisition_session_required: "请先检测真实文献获取环境并形成当前 AcquisitionSession。",
+    acquisition_session_stale: "AcquisitionSession 与当前文献配置不一致；请重新检测。",
+    acquisition_session_not_ready: "当前 AcquisitionSession 尚未 ready；请按状态提示处理后重新检测。",
+    deepfetch_acquisition_not_ready: "DeepFetch 正等待当前 AcquisitionSession 恢复 ready。",
+    institutional_entry_required: "全面搜索需要填写获准的图书馆或数据库入口链接。",
+    library_entry_url_required: "全面搜索需要填写获准的图书馆或数据库入口链接，或切换为只搜索开放获取资源。",
+    institutional_login_required: "请在已打开的 Google Chrome 资源页完成机构登录，然后重新检测。",
+    institutional_preflight_unavailable: "机构资源预检未通过；请确认本机浏览器控制与入口可用。",
+    institutional_resource_unverified: "浏览器已连接，但尚未验证到获准的数据库资源页。",
+    nature_downloader_unavailable: "固定 Nature Downloader provider 当前不可执行。",
+    deepfetch_acquisition_waiting_user: "DeepFetch 已保存精确批次，正在等待你完成浏览器登录；恢复后不会换 request_id。",
     literature_snapshot_required: "当前 DeepFetch basis 尚无已接纳 LiteratureSnapshot；请先运行或重试检索。",
     literature_snapshot_stale: "LiteratureSnapshot 与当前 DraftRevision 不一致；旧快照已保留但不会静默套用。",
     web_search_temporarily_unavailable: "真实 Web Search 暂不可用；可沿同一 correlation 重试，不会转成 direct waiver。",

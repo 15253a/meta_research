@@ -2,9 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from meta_research.acquisition import (
+    AcquisitionBatchExecution,
+    AcquisitionBatchRequest,
+    AcquisitionProvider,
+    NatureDownloaderAdapter,
+)
 from meta_research.auth import Authentication
 from meta_research.database import Database
-from meta_research.deepfetch import CodexDeepFetchAdapter, DeepFetchProvider
+from meta_research.deepfetch import (
+    CodexDeepFetchAdapter,
+    DeepFetchAcquisitionClient,
+    DeepFetchProvider,
+)
 from meta_research.feed import DurableFeed
 from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillProvider
@@ -86,6 +96,27 @@ class ProductionRuntime:
             self._database.close()
 
 
+class _AgentRuntimeAcquisitionClient(DeepFetchAcquisitionClient):
+    def __init__(
+        self,
+        agent_runtime: AgentRuntimeInterface,
+        provider: AcquisitionProvider,
+    ) -> None:
+        self._agent_runtime = agent_runtime
+        self._provider = provider
+
+    def acquire(
+        self,
+        session_ref: str,
+        request: AcquisitionBatchRequest,
+    ) -> AcquisitionBatchExecution:
+        return self._agent_runtime.acquire_literature(
+            session_ref,
+            request,
+            self._provider,
+        )
+
+
 def build_production_runtime(
     data_root: DataRoot,
     *,
@@ -94,6 +125,7 @@ def build_production_runtime(
     host_compute_probe: HostComputeProbe | None = None,
     idea_skill_provider: IdeaSkillProvider | None = None,
     deepfetch_provider: DeepFetchProvider | None = None,
+    acquisition_provider: AcquisitionProvider | None = None,
 ) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
@@ -112,9 +144,7 @@ def build_production_runtime(
     idea_skill_provider = idea_skill_provider or CodexIdeaSkillAdapter(
         data_root.root / "idea-skill-provider"
     )
-    deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
-        data_root.root / "deepfetch-provider"
-    )
+    acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
 
     host_compute_reader = create_host_compute_observation_reader(database)
     confirmation_verifier = create_bundle_confirmation_verifier(
@@ -144,6 +174,14 @@ def build_production_runtime(
         stage_request_receipts,
         research_graph_receipts,
         deepfetch_request_receipts,
+        data_root.run / "acquisition-sessions",
+    )
+    deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
+        data_root.root / "deepfetch-provider",
+        acquisition_client=_AgentRuntimeAcquisitionClient(
+            agent_runtime,
+            acquisition_provider,
+        ),
     )
     research_graph = create_research_graph_interface(
         database,
@@ -187,6 +225,7 @@ def build_production_runtime(
         agent_runtime,
         proposal_drafter,
         intent_drafting_provider,
+        acquisition_provider,
     )
     owners = OwnerInterfaces(
         research_graph=research_graph,
@@ -225,6 +264,7 @@ def build_production_runtime(
         intent_drafting_provider,
         idea_skill_provider,
         deepfetch_provider,
+        acquisition_provider,
     ):
         if callable(getattr(provider, "request_stop", None)) and not any(
             provider is lifecycle for lifecycle in provider_lifecycles

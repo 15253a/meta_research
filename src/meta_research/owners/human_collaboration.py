@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl, urlsplit
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Row
 
+from meta_research.acquisition import AcquisitionProvider
 from meta_research.database import Database
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
@@ -101,6 +102,14 @@ class HumanCollaborationInterface(Protocol):
     ) -> dict[str, object]: ...
 
     def generate_question_proposal(
+        self,
+        initialization_id: str,
+        expected_draft_hash: str,
+        idempotency_key: str,
+        expected_draft_revision: int | None = None,
+    ) -> dict[str, object]: ...
+
+    def prepare_acquisition_session(
         self,
         initialization_id: str,
         expected_draft_hash: str,
@@ -222,6 +231,9 @@ class SQLiteDeepFetchRunRequestVerifier:
         material_bindings_hash: str,
         resource_envelope_ref: str,
         resource_envelope_hash: str,
+        acquisition_session_ref: str,
+        acquisition_config_hash: str,
+        acquisition_runtime_binding_hash: str,
         result_route: str,
         receipt: AcceptanceReceipt,
         require_active: bool = False,
@@ -255,6 +267,10 @@ class SQLiteDeepFetchRunRequestVerifier:
             or row.material_bindings_hash != material_bindings_hash
             or row.resource_envelope_ref != resource_envelope_ref
             or row.resource_envelope_hash != resource_envelope_hash
+            or row.acquisition_session_ref != acquisition_session_ref
+            or row.acquisition_config_hash != acquisition_config_hash
+            or row.acquisition_runtime_binding_hash
+            != acquisition_runtime_binding_hash
             or row.result_route != result_route
             or row.authorization_receipt_ref != receipt.receipt_ref
             or row.authorization_hash != receipt.payload_hash
@@ -359,6 +375,7 @@ class SQLiteHumanCollaboration:
         agent_runtime: AgentRuntimeInterface,
         proposal_drafter: ProposalDrafter,
         intent_drafting_provider: IntentDraftingProvider,
+        acquisition_provider: AcquisitionProvider,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -368,6 +385,7 @@ class SQLiteHumanCollaboration:
         self._agent_runtime = agent_runtime
         self._proposal_drafter = proposal_drafter
         self._intent_drafting_provider = intent_drafting_provider
+        self._acquisition_provider = acquisition_provider
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._preview_refresh_lock = threading.Lock()
         self._preview_refresh_attempts: dict[str, tuple[str, float]] = {}
@@ -930,6 +948,83 @@ class SQLiteHumanCollaboration:
                     )
         return self.query_quest_creation(initialization_id)
 
+    def prepare_acquisition_session(
+        self,
+        initialization_id: str,
+        expected_draft_hash: str,
+        idempotency_key: str,
+        expected_draft_revision: int | None = None,
+    ) -> dict[str, object]:
+        request_hash = canonical_hash(
+            {
+                "command": "prepare_acquisition_session",
+                "initialization_id": initialization_id,
+                "expected_draft_hash": expected_draft_hash,
+                "expected_draft_revision": expected_draft_revision,
+            }
+        )
+        with self._database.read() as connection:
+            replay = self._query_command(
+                connection,
+                idempotency_key,
+                "prepare_acquisition_session",
+                request_hash,
+            )
+            row = self._require_initialization(connection, initialization_id)
+            draft, _proposal = _require_initialization_artifact_integrity(
+                connection, row
+            )
+        if row.status in {"confirmed", "completed", "cancelled"}:
+            raise OwnerConflict("quest_initialization_is_terminal")
+        _require_draft_cas(row, expected_draft_hash, expected_draft_revision)
+        if _draft_schema_ref(draft) != DRAFT_V2_SCHEMA:
+            raise OwnerConflict("acquisition_session_requires_v2_draft")
+        literature = draft["literature"]
+        assert isinstance(literature, dict)
+        config = {
+            "mode": literature["mode"],
+            "library_entry_url": literature["library_entry_url"],
+        }
+        if replay is None:
+            self._agent_runtime.prepare_acquisition_session(
+                initialization_id=initialization_id,
+                draft_revision=int(row.draft_revision),
+                config=config,
+                provider=self._acquisition_provider,
+            )
+            with self._database.write() as connection:
+                replay = self._query_command(
+                    connection,
+                    idempotency_key,
+                    "prepare_acquisition_session",
+                    request_hash,
+                )
+                if replay is None:
+                    self._record_command(
+                        connection,
+                        idempotency_key,
+                        initialization_id,
+                        "prepare_acquisition_session",
+                        request_hash,
+                        initialization_id,
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE human_collaboration_state SET revision = "
+                            "revision + 1 WHERE singleton = 'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "human_collaboration.acquisition_prepared",
+                        {
+                            "initialization_id": initialization_id,
+                            "draft_revision": int(row.draft_revision),
+                            "config_hash": _acquisition_config_hash(draft),
+                        },
+                    )
+        return self.query_quest_creation(initialization_id)
+
     def _queue_direct_proposal_generation(
         self,
         connection: Connection,
@@ -1019,6 +1114,15 @@ class SQLiteHumanCollaboration:
     ) -> str:
         if draft.get("route") != "deepfetch":
             raise OwnerConflict("deepfetch_route_required")
+        acquisition_session = self._agent_runtime.query_acquisition_session(
+            initialization_id=initialization_id
+        )
+        if acquisition_session is None:
+            raise OwnerConflict("acquisition_session_required")
+        if acquisition_session.config_hash != _acquisition_config_hash(draft):
+            raise OwnerConflict("acquisition_session_stale")
+        if acquisition_session.status != "ready" or acquisition_session.slot_held:
+            raise OwnerConflict("acquisition_session_not_ready")
         existing = connection.execute(
             text(
                 "SELECT * FROM hc_deepfetch_requests WHERE initialization_id = "
@@ -1090,6 +1194,11 @@ class SQLiteHumanCollaboration:
                 "material_bindings_hash": material_bindings_hash,
                 "resource_envelope_ref": envelope_ref,
                 "resource_envelope_hash": envelope_hash,
+                "acquisition_session_ref": acquisition_session.session_ref,
+                "acquisition_config_hash": acquisition_session.config_hash,
+                "acquisition_runtime_binding_hash": (
+                    acquisition_session.runtime_binding_hash
+                ),
             }
         )
         correlation_ref = f"deepfetch_correlation_{correlation_hash[:32]}"
@@ -1105,6 +1214,11 @@ class SQLiteHumanCollaboration:
             "material_bindings_hash": material_bindings_hash,
             "resource_envelope_ref": envelope_ref,
             "resource_envelope_hash": envelope_hash,
+            "acquisition_session_ref": acquisition_session.session_ref,
+            "acquisition_config_hash": acquisition_session.config_hash,
+            "acquisition_runtime_binding_hash": (
+                acquisition_session.runtime_binding_hash
+            ),
             "result_route": result_route,
         }
         receipt_hash = _owner_receipt_hash(
@@ -1118,12 +1232,16 @@ class SQLiteHumanCollaboration:
                 "INSERT INTO hc_deepfetch_requests (request_ref, initialization_id, "
                 "correlation_ref, draft_revision, draft_hash, scope_json, scope_hash, "
                 "material_bindings_json, material_bindings_hash, "
-                "resource_envelope_ref, resource_envelope_hash, result_route, "
+                "resource_envelope_ref, resource_envelope_hash, "
+                "acquisition_session_ref, acquisition_config_hash, "
+                "acquisition_runtime_binding_hash, result_route, "
                 "authorization_receipt_ref, authorization_hash, status, created_at, "
                 "updated_at) VALUES (:request_ref, :initialization_id, "
                 ":correlation_ref, :draft_revision, :draft_hash, :scope_json, "
                 ":scope_hash, :material_bindings_json, :material_bindings_hash, "
-                ":resource_envelope_ref, :resource_envelope_hash, :result_route, "
+                ":resource_envelope_ref, :resource_envelope_hash, "
+                ":acquisition_session_ref, :acquisition_config_hash, "
+                ":acquisition_runtime_binding_hash, :result_route, "
                 ":authorization_receipt_ref, :authorization_hash, 'queued', :now, "
                 ":now)"
             ),
@@ -1139,6 +1257,11 @@ class SQLiteHumanCollaboration:
                 "material_bindings_hash": material_bindings_hash,
                 "resource_envelope_ref": envelope_ref,
                 "resource_envelope_hash": envelope_hash,
+                "acquisition_session_ref": acquisition_session.session_ref,
+                "acquisition_config_hash": acquisition_session.config_hash,
+                "acquisition_runtime_binding_hash": (
+                    acquisition_session.runtime_binding_hash
+                ),
                 "result_route": result_route,
                 "authorization_receipt_ref": receipt_ref,
                 "authorization_hash": receipt_hash,
@@ -3353,6 +3476,9 @@ class SQLiteHumanCollaboration:
             if deepfetch_request is not None
             else None
         )
+        acquisition_session = self._agent_runtime.query_acquisition_session(
+            initialization_id=initialization_id
+        )
         literature_snapshot = (
             self._research_memory.query_literature_snapshot(
                 deepfetch_request.snapshot_ref
@@ -3839,6 +3965,18 @@ class SQLiteHumanCollaboration:
                 basis_current=deepfetch_basis_current,
                 proposal_current=proposal_current,
             ),
+            "acquisition_session": (
+                None
+                if acquisition_session is None
+                else acquisition_session.as_public_dict(
+                    freshness=(
+                        "current"
+                        if acquisition_session.config_hash
+                        == _acquisition_config_hash(current_draft_value)
+                        else "stale"
+                    )
+                )
+            ),
             "receipts": receipts,
             "recovery": (
                 {
@@ -3991,6 +4129,30 @@ class SQLiteHumanCollaboration:
             self._clear_dispatch_failure(initialization_id, "quest_goal")
             return True
         self._clear_dispatch_failure(initialization_id, "quest_goal")
+
+        acquisition_session = self._agent_runtime.query_acquisition_session(
+            initialization_id=initialization_id
+        )
+        if (
+            acquisition_session is not None
+            and acquisition_session.quest_ref != quest.quest_ref
+        ):
+            try:
+                self._agent_runtime.bind_acquisition_session_to_quest(
+                    initialization_id, quest.quest_ref
+                )
+            except (OwnerConflict, OSError) as error:
+                self._record_dispatch_failure(
+                    initialization_id,
+                    "acquisition_session",
+                    _dispatch_failure_reason(
+                        error, "acquisition_session_binding_unavailable"
+                    ),
+                )
+                return False
+            self._clear_dispatch_failure(initialization_id, "acquisition_session")
+            return True
+        self._clear_dispatch_failure(initialization_id, "acquisition_session")
 
         material_bindings = _accepted_material_bindings(draft)
         if material_bindings:
@@ -5678,6 +5840,25 @@ def _deepfetch_scope(draft: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _acquisition_config_hash(draft: dict[str, object]) -> str:
+    literature = draft.get("literature")
+    if not isinstance(literature, dict):
+        return canonical_hash(
+            {
+                "schema_ref": "meta-research/acquisition-session-config/v1",
+                "mode": "provided_only",
+                "library_entry_url": "",
+            }
+        )
+    return canonical_hash(
+        {
+            "schema_ref": "meta-research/acquisition-session-config/v1",
+            "mode": literature.get("mode"),
+            "library_entry_url": literature.get("library_entry_url"),
+        }
+    )
+
+
 def _owner_receipt_hash(
     kind: str,
     subject_ref: str,
@@ -5707,6 +5888,11 @@ def _deepfetch_request_receipt_hash(row: Row) -> str:
             "material_bindings_hash": row.material_bindings_hash,
             "resource_envelope_ref": row.resource_envelope_ref,
             "resource_envelope_hash": row.resource_envelope_hash,
+            "acquisition_session_ref": row.acquisition_session_ref,
+            "acquisition_config_hash": row.acquisition_config_hash,
+            "acquisition_runtime_binding_hash": (
+                row.acquisition_runtime_binding_hash
+            ),
             "result_route": row.result_route,
         },
     )
@@ -5743,6 +5929,9 @@ def _deepfetch_request_from_row(row: Row) -> DeepFetchRunRequest:
         scope_hash=row.scope_hash,
         resource_envelope_ref=row.resource_envelope_ref,
         resource_envelope_hash=row.resource_envelope_hash,
+        acquisition_session_ref=row.acquisition_session_ref,
+        acquisition_config_hash=row.acquisition_config_hash,
+        acquisition_runtime_binding_hash=row.acquisition_runtime_binding_hash,
         accepted_material_bindings=tuple(materials),
         result_route=row.result_route,
         authorization_receipt=AcceptanceReceipt(
@@ -6242,6 +6431,7 @@ def create_human_collaboration_interface(
     agent_runtime: AgentRuntimeInterface,
     proposal_drafter: ProposalDrafter,
     intent_drafting_provider: IntentDraftingProvider,
+    acquisition_provider: AcquisitionProvider,
 ) -> HumanCollaborationInterface:
     return SQLiteHumanCollaboration(
         database,
@@ -6252,4 +6442,5 @@ def create_human_collaboration_interface(
         agent_runtime,
         proposal_drafter,
         intent_drafting_provider,
+        acquisition_provider,
     )
