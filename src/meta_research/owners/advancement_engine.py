@@ -622,7 +622,7 @@ class SQLiteAdvancementEngine:
         if replay_ref is not None:
             return self._query_stage_request_ref(replay_ref)
         try:
-            evidence_by_ref = validate_plan_context_pack(
+            validate_plan_context_pack(
                 context_pack,
                 cycle_ref=cycle_ref,
                 accepted_question_binding=accepted_question.as_dict(),
@@ -676,12 +676,6 @@ class SQLiteAdvancementEngine:
         assert isinstance(reference_revision, int)
         evidence_catalog = context_pack["evidence_catalog"]
         assert isinstance(evidence_catalog, list)
-        version_refs = tuple(
-            sorted(
-                str(evidence["asset_version_ref"])
-                for evidence in evidence_by_ref.values()
-            )
-        )
         self._verify_plan_evidence(
             accepted_question,
             evidence_catalog,
@@ -719,10 +713,12 @@ class SQLiteAdvancementEngine:
                         result_ref,
                     )
                 else:
-                    self._evidence_verifier.assert_evidence_state(
+                    self._evidence_verifier.verify_plan_evidence_catalog(
                         quest_ref=accepted_question.quest_ref,
-                        version_refs=version_refs,
+                        evidence_catalog=evidence_catalog,
                         expected_reference_revision=reference_revision,
+                        require_current=True,
+                        require_complete=True,
                     )
                     request_ref = new_ref("stage_request")
                     context_pack_ref = new_ref("context_pack")
@@ -863,6 +859,8 @@ class SQLiteAdvancementEngine:
                 expected_reference_revision=int(
                     requested.context_pack["evidence_reference_revision"]
                 ),
+                require_current=False,
+                require_complete=False,
             )
         else:
             raise OwnerConflict("stage_run_request_invalid")
@@ -910,6 +908,8 @@ class SQLiteAdvancementEngine:
         evidence_catalog: list[dict[str, object]],
         *,
         expected_reference_revision: int,
+        require_current: bool = True,
+        require_complete: bool = True,
     ) -> None:
         if self._evidence_verifier is None:
             raise OwnerConflict("evidence_verifier_unavailable")
@@ -917,7 +917,8 @@ class SQLiteAdvancementEngine:
             quest_ref=accepted_question.quest_ref,
             evidence_catalog=evidence_catalog,
             expected_reference_revision=expected_reference_revision,
-            require_current=True,
+            require_current=require_current,
+            require_complete=require_complete,
         )
 
     def _verify_context_evidence(

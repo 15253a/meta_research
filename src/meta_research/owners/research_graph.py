@@ -230,6 +230,31 @@ class FormalPlanDecision:
     receipt: AcceptanceReceipt
 
 
+class TargetCommitEvidenceAuthority(Protocol):
+    """Future #122 authority behind the Plan Baseline Pool projection.
+
+    A generic Research Graph asset role and Research Memory provenance metadata
+    are not proof that a successful TargetCommit selected an evidence leaf.
+    Until the TargetCommit model exists, the public Plan catalog must therefore
+    remain empty rather than manufacturing lineage from those records.
+    """
+
+    def query_plan_evidence_catalog(
+        self, *, quest_ref: str
+    ) -> tuple[int, tuple[dict[str, object], ...]]: ...
+
+    def verify_plan_evidence_catalog(
+        self,
+        *,
+        quest_ref: str,
+        evidence_catalog: list[dict[str, object]],
+        expected_reference_revision: int,
+        require_current: bool = True,
+        require_complete: bool = True,
+        selected_evidence_refs: frozenset[str] | None = None,
+    ) -> None: ...
+
+
 class ResearchGraphInterface(Protocol):
     """Whole public Interface for authoritative research semantics."""
 
@@ -352,6 +377,10 @@ class ResearchGraphInterface(Protocol):
         self, quest_ref: str
     ) -> tuple[int, tuple[str, ...]]: ...
 
+    def query_plan_evidence_catalog(
+        self, *, quest_ref: str
+    ) -> tuple[int, tuple[dict[str, object], ...]]: ...
+
     def query_asset_reference_revision(self) -> int: ...
 
     def query_asset_references(self, version_ref: str) -> tuple[str, ...]: ...
@@ -428,6 +457,8 @@ class SQLiteResearchGraphReceiptVerifier:
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
         stage_request_verifier: StageRunRequestVerifier | None = None,
         plan_content_verifier: PlanContentReceiptVerifier | None = None,
+        target_commit_evidence_authority: TargetCommitEvidenceAuthority
+        | None = None,
     ) -> None:
         self._database = database
         self._confirmation_verifier = confirmation_verifier
@@ -437,6 +468,9 @@ class SQLiteResearchGraphReceiptVerifier:
         self._execution_verifier = execution_verifier
         self._stage_request_verifier = stage_request_verifier
         self._plan_content_verifier = plan_content_verifier
+        self._target_commit_evidence_authority = (
+            target_commit_evidence_authority
+        )
 
     def verify_quest_receipt(
         self,
@@ -723,107 +757,56 @@ class SQLiteResearchGraphReceiptVerifier:
         evidence_catalog: list[dict[str, object]],
         expected_reference_revision: int,
         require_current: bool = True,
+        require_complete: bool = True,
+        selected_evidence_refs: frozenset[str] | None = None,
     ) -> None:
         if (
             not isinstance(expected_reference_revision, int)
             or isinstance(expected_reference_revision, bool)
             or expected_reference_revision < 0
             or not isinstance(evidence_catalog, list)
+            or (
+                selected_evidence_refs is not None
+                and not isinstance(selected_evidence_refs, frozenset)
+            )
         ):
             raise OwnerConflict("plan_evidence_catalog_invalid")
-        with self._database.read() as connection:
-            role_rows = connection.execute(
-                text(
-                    "SELECT * FROM rg_asset_roles WHERE quest_ref = :quest_ref "
-                    "AND role = 'evidence' ORDER BY version_ref"
-                ),
-                {"quest_ref": quest_ref},
-            ).all()
+        authority = self._target_commit_evidence_authority
+        if authority is None:
+            if (
+                expected_reference_revision != 0
+                or evidence_catalog
+                or selected_evidence_refs
+            ):
+                raise OwnerConflict("target_commit_evidence_authority_unavailable")
+            return
+        authority.verify_plan_evidence_catalog(
+            quest_ref=quest_ref,
+            evidence_catalog=evidence_catalog,
+            expected_reference_revision=expected_reference_revision,
+            require_current=require_current,
+            require_complete=require_complete,
+            selected_evidence_refs=selected_evidence_refs,
+        )
+
+    def query_plan_evidence_catalog(
+        self, *, quest_ref: str
+    ) -> tuple[int, tuple[dict[str, object], ...]]:
+        authority = self._target_commit_evidence_authority
+        if authority is None:
+            return 0, ()
+        revision, catalog = authority.query_plan_evidence_catalog(
+            quest_ref=quest_ref
+        )
         if (
-            expected_reference_revision != len(role_rows)
-            or len(evidence_catalog) != len(role_rows)
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 0
+            or not isinstance(catalog, tuple)
+            or not all(isinstance(item, dict) for item in catalog)
         ):
-            raise OwnerConflict("plan_evidence_catalog_stale")
-        roles_by_ref = {row.role_ref: row for row in role_rows}
-        seen_role_refs: set[str] = set()
-        seen_version_refs: set[str] = set()
-        for evidence in evidence_catalog:
-            if not isinstance(evidence, dict):
-                raise OwnerConflict("plan_evidence_ref_invalid")
-            role_ref = evidence.get("role_ref")
-            version_ref = evidence.get("asset_version_ref")
-            role = roles_by_ref.get(role_ref)
-            asset_receipt = evidence.get("asset_receipt")
-            role_receipt = evidence.get("role_receipt")
-            if (
-                role is None
-                or not isinstance(role_ref, str)
-                or not isinstance(version_ref, str)
-                or role_ref in seen_role_refs
-                or version_ref in seen_version_refs
-                or not isinstance(asset_receipt, dict)
-                or not isinstance(role_receipt, dict)
-            ):
-                raise OwnerConflict("plan_evidence_ref_invalid")
-            target_root_ref = evidence.get("target_commit_root_ref")
-            closure_refs = evidence.get("provenance_closure_refs")
-            if (
-                role.version_ref != version_ref
-                or role.quest_ref != quest_ref
-                or role.role != "evidence"
-                or role.asset_ref != evidence.get("asset_ref")
-                or role.asset_hash != evidence.get("content_hash")
-                or role.manifest_hash != evidence.get("manifest_hash")
-                or not isinstance(target_root_ref, str)
-                or not target_root_ref.strip()
-                or not isinstance(closure_refs, list)
-                or not closure_refs
-                or not all(
-                    isinstance(value, str) and value.strip()
-                    for value in closure_refs
-                )
-                or evidence.get("capabilities") != ["evidence"]
-                or evidence.get("eligibility_token_ref") != role.receipt_ref
-                or evidence.get("currentness_receipt_ref") != role.receipt_ref
-                or evidence.get("integrity_receipt_ref")
-                != role.asset_receipt_ref
-                or evidence.get("availability_receipt_ref")
-                != role.asset_receipt_ref
-                or asset_receipt.get("issuer") != "research_memory"
-                or asset_receipt.get("kind") != role.asset_receipt_kind
-                or asset_receipt.get("receipt_ref") != role.asset_receipt_ref
-                or asset_receipt.get("subject_ref") != version_ref
-                or asset_receipt.get("payload_hash") != role.asset_receipt_hash
-                or role_receipt.get("issuer") != RG_OWNER
-                or role_receipt.get("kind") != ASSET_ROLE_RECEIPT_KIND
-                or role_receipt.get("receipt_ref") != role.receipt_ref
-                or role_receipt.get("subject_ref") != role_ref
-                or role_receipt.get("payload_hash") != role.receipt_hash
-            ):
-                raise OwnerConflict("plan_evidence_ref_invalid")
-            accepted = _accepted_asset_role(role)
-            self.verify_asset_role_receipt(
-                role_ref=accepted.role_ref,
-                version_ref=accepted.version_ref,
-                role=accepted.role,
-                quest_ref=accepted.quest_ref,
-                receipt=accepted.receipt,
-            )
-            binding = accepted.asset_binding()
-            self._asset_verifier.verify_plan_evidence_binding(
-                asset_ref=binding.asset_ref,
-                version_ref=binding.version_ref,
-                content_hash=binding.content_hash,
-                manifest_hash=binding.manifest_hash,
-                target_commit_root_ref=target_root_ref,
-                provenance_closure_refs=tuple(closure_refs),
-                receipt=binding.receipt,
-                require_current=require_current,
-            )
-            seen_role_refs.add(role_ref)
-            seen_version_refs.add(version_ref)
-        if seen_role_refs != set(roles_by_ref):
-            raise OwnerConflict("plan_evidence_catalog_stale")
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+        return revision, catalog
 
     def query_evidence_state(
         self, quest_ref: str
@@ -1138,14 +1121,15 @@ class SQLiteResearchGraphReceiptVerifier:
             != accepted_idea_set.stage_commit_receipt.payload_hash
         ):
             raise OwnerConflict("formal_plan_request_lineage_invalid")
-        self.verify_plan_evidence_catalog(
-            quest_ref=row.quest_ref,
-            evidence_catalog=evidence_catalog,
-            expected_reference_revision=evidence_revision,
-            require_current=True,
-        )
         if self._plan_content_verifier is None:
             raise OwnerConflict("plan_content_verifier_unavailable")
+        plan_content_receipt = AcceptanceReceipt(
+            issuer="research_memory",
+            kind="plan_document_content_acceptance",
+            receipt_ref=row.plan_content_receipt_ref,
+            subject_ref=row.plan_content_ref,
+            payload_hash=row.plan_content_receipt_hash,
+        )
         self._plan_content_verifier.verify_plan_content_receipt(
             request_ref=row.request_ref,
             submission_ref=row.submission_ref,
@@ -1154,13 +1138,22 @@ class SQLiteResearchGraphReceiptVerifier:
             plan_hash=row.plan_document_hash,
             reviewed_draft_hash=row.reviewed_draft_hash,
             review_hash=row.review_hash,
-            receipt=AcceptanceReceipt(
-                issuer="research_memory",
-                kind="plan_document_content_acceptance",
-                receipt_ref=row.plan_content_receipt_ref,
-                subject_ref=row.plan_content_ref,
-                payload_hash=row.plan_content_receipt_hash,
-            ),
+            receipt=plan_content_receipt,
+        )
+        selected_evidence_refs = (
+            self._plan_content_verifier.query_plan_selected_evidence_refs(
+                submission_ref=row.submission_ref,
+                content_ref=row.plan_content_ref,
+                receipt=plan_content_receipt,
+            )
+        )
+        self.verify_plan_evidence_catalog(
+            quest_ref=row.quest_ref,
+            evidence_catalog=evidence_catalog,
+            expected_reference_revision=evidence_revision,
+            require_current=row.decision == "accepted",
+            require_complete=False,
+            selected_evidence_refs=selected_evidence_refs,
         )
         if self._execution_verifier is None:
             raise OwnerConflict("attempt_execution_verifier_unavailable")
@@ -1911,6 +1904,13 @@ class SQLiteResearchGraph:
     ) -> tuple[int, tuple[str, ...]]:
         return self._receipt_verifier.query_evidence_reference_state(quest_ref)
 
+    def query_plan_evidence_catalog(
+        self, *, quest_ref: str
+    ) -> tuple[int, tuple[dict[str, object], ...]]:
+        return self._receipt_verifier.query_plan_evidence_catalog(
+            quest_ref=quest_ref
+        )
+
     def query_asset_reference_revision(self) -> int:
         return self.query_snapshot().revision
 
@@ -2365,6 +2365,10 @@ class SQLiteResearchGraph:
             evidence_catalog=evidence_catalog,
             expected_reference_revision=evidence_revision,
             require_current=True,
+            require_complete=False,
+            selected_evidence_refs=_selected_plan_evidence_refs(
+                content.plan_document
+            ),
         )
         answer_contract = content.plan_document.get("answer_contract")
         if (
@@ -2830,6 +2834,23 @@ def _idea_decision(row) -> IdeaOutcomeDecision:
     )
 
 
+def _selected_plan_evidence_refs(
+    plan_document: dict[str, object],
+) -> frozenset[str]:
+    reuse_set = plan_document.get("evidence_reuse_set")
+    if not isinstance(reuse_set, list):
+        raise OwnerConflict("plan_evidence_reuse_set_invalid")
+    refs: set[str] = set()
+    for use in reuse_set:
+        if not isinstance(use, dict):
+            raise OwnerConflict("plan_evidence_reuse_set_invalid")
+        evidence_ref = use.get("evidence_ref")
+        if not isinstance(evidence_ref, str) or not evidence_ref:
+            raise OwnerConflict("plan_evidence_reuse_set_invalid")
+        refs.add(evidence_ref)
+    return frozenset(refs)
+
+
 def _evaluate_formal_plan(
     question_content: dict[str, object],
     plan_document: dict[str, object],
@@ -3045,6 +3066,7 @@ def create_research_graph_receipt_verifier(
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
     stage_request_verifier: StageRunRequestVerifier | None = None,
     plan_content_verifier: PlanContentReceiptVerifier | None = None,
+    target_commit_evidence_authority: TargetCommitEvidenceAuthority | None = None,
 ) -> SQLiteResearchGraphReceiptVerifier:
     return SQLiteResearchGraphReceiptVerifier(
         database,
@@ -3055,6 +3077,7 @@ def create_research_graph_receipt_verifier(
         execution_verifier,
         stage_request_verifier,
         plan_content_verifier,
+        target_commit_evidence_authority,
     )
 
 

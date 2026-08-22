@@ -95,6 +95,7 @@ class AssetBindingVerifier(Protocol):
         manifest_hash: str,
         target_commit_root_ref: str,
         provenance_closure_refs: tuple[str, ...],
+        capabilities: tuple[str, ...],
         receipt: AcceptanceReceipt,
         require_current: bool = True,
     ) -> None: ...
@@ -125,6 +126,8 @@ class EvidenceRefVerifier(Protocol):
         evidence_catalog: list[dict[str, object]],
         expected_reference_revision: int,
         require_current: bool = True,
+        require_complete: bool = True,
+        selected_evidence_refs: frozenset[str] | None = None,
     ) -> None: ...
 
 
@@ -401,6 +404,14 @@ class PlanContentReceiptVerifier(Protocol):
         review_hash: str,
         receipt: AcceptanceReceipt,
     ) -> None: ...
+
+    def query_plan_selected_evidence_refs(
+        self,
+        *,
+        submission_ref: str,
+        content_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> frozenset[str]: ...
 
 
 class IdeaOutcomeDecisionVerifier(Protocol):

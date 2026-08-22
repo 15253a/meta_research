@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 from meta_research.feed import DurableFeed
 from meta_research.idea_stage import _public_run
@@ -32,7 +32,6 @@ from meta_research.owners.research_memory import (
     ResearchMemoryInterface,
 )
 from meta_research.plan_contract import (
-    EVIDENCE_REF_SCHEMA_REF,
     PLAN_CONTEXT_PACK_SCHEMA_REF,
     material_plan_hash,
 )
@@ -568,51 +567,18 @@ class PlanStageWorker:
 
     def _context_pack(self, eligible: _EligiblePlan) -> dict[str, object]:
         current = eligible.current
-        evidence_revision, version_refs = self._research_graph.query_evidence_state(
-            current.question.quest_ref
-        )
-        roles = self._research_graph.query_asset_roles(
-            quest_ref=current.question.quest_ref,
-            role="evidence",
-        )
-        role_by_version: dict[str, Any] = {}
-        for role in roles:
-            if role.version_ref in role_by_version:
-                raise OwnerConflict("plan_evidence_role_ambiguous")
-            role_by_version[role.version_ref] = role
-        if tuple(sorted(role_by_version)) != tuple(sorted(version_refs)) or (
-            evidence_revision != len(version_refs)
-        ):
-            raise OwnerConflict("plan_evidence_catalog_stale")
-
-        catalog: list[dict[str, object]] = []
-        for version_ref in sorted(version_refs):
-            role = role_by_version[version_ref]
-            inventory = self._research_memory.query_asset_inventory_item(
-                version_ref
+        evidence_revision, evidence_catalog = (
+            self._research_graph.query_plan_evidence_catalog(
+                quest_ref=current.question.quest_ref
             )
-            if inventory is None:
-                raise OwnerConflict("plan_evidence_unavailable")
-            if inventory.integrity != "verified":
-                raise OwnerConflict("plan_evidence_integrity_failed")
-            if inventory.availability != "available":
-                raise OwnerConflict("plan_evidence_unavailable")
-            if (
-                inventory.version_ref != role.version_ref
-                or inventory.asset_ref != role.asset_ref
-                or inventory.content_hash != role.asset_hash
-                or inventory.manifest_hash != role.manifest_hash
-                or inventory.receipt != role.asset_receipt
-            ):
-                raise OwnerConflict("plan_evidence_receipt_mismatch")
-            catalog.append(_evidence_ref(role, inventory))
+        )
 
         return {
             "schema_ref": PLAN_CONTEXT_PACK_SCHEMA_REF,
             "cycle_ref": current.cycle_ref,
             "accepted_question_binding": current.question.as_binding().as_dict(),
             "accepted_idea_set_binding": eligible.accepted_idea_set.as_dict(),
-            "evidence_catalog": catalog,
+            "evidence_catalog": [dict(item) for item in evidence_catalog],
             "evidence_reference_revision": evidence_revision,
         }
 
@@ -728,75 +694,6 @@ class PlanStageWorker:
                 raise OwnerConflict("plan_cycle_index_invalid")
             candidates[cycle_ref] = _CurrentCycle(revision, cycle_ref, question)
         return tuple(sorted(candidates.values(), key=lambda item: item.revision))
-
-
-def _evidence_ref(role: Any, inventory: Any) -> dict[str, object]:
-    provenance = inventory.provenance
-    if not isinstance(provenance, dict):
-        raise OwnerConflict("plan_evidence_provenance_invalid")
-    target_root = _first_text(
-        provenance.get("target_commit_root_ref"),
-        provenance.get("target_commit_ref"),
-        provenance.get("root_ref"),
-        inventory.asset_ref,
-    )
-    closure = _text_list(
-        provenance.get("provenance_closure_refs"),
-        provenance.get("closure_refs"),
-    )
-    if not closure:
-        closure = [f"asset-version:{inventory.version_ref}"]
-    capabilities = ["evidence"]
-    identity = {
-        "asset_version_ref": inventory.version_ref,
-        "role_ref": role.role_ref,
-        "content_hash": inventory.content_hash,
-        "manifest_hash": inventory.manifest_hash,
-        "target_commit_root_ref": target_root,
-        "provenance_closure_refs": closure,
-        "capabilities": capabilities,
-        "asset_receipt_ref": inventory.receipt.receipt_ref,
-        "role_receipt_ref": role.receipt.receipt_ref,
-    }
-    return {
-        "schema_ref": EVIDENCE_REF_SCHEMA_REF,
-        "evidence_ref": "evidence_" + canonical_hash(identity)[:32],
-        "asset_version_ref": inventory.version_ref,
-        "asset_ref": inventory.asset_ref,
-        "content_hash": inventory.content_hash,
-        "manifest_hash": inventory.manifest_hash,
-        "target_commit_root_ref": target_root,
-        "provenance_closure_refs": closure,
-        "capabilities": capabilities,
-        "eligibility_token_ref": role.receipt.receipt_ref,
-        "integrity_receipt_ref": inventory.receipt.receipt_ref,
-        "availability_receipt_ref": inventory.receipt.receipt_ref,
-        "currentness_receipt_ref": role.receipt.receipt_ref,
-        "asset_receipt": inventory.receipt.as_public_dict(),
-        "role_ref": role.role_ref,
-        "role_receipt": role.receipt.as_public_dict(),
-    }
-
-
-def _first_text(*values: object) -> str:
-    for value in values:
-        if isinstance(value, str) and value.strip():
-            return value
-    raise OwnerConflict("plan_evidence_provenance_invalid")
-
-
-def _text_list(*values: object) -> list[str]:
-    for value in values:
-        if (
-            isinstance(value, (list, tuple))
-            and value
-            and all(isinstance(item, str) and item.strip() for item in value)
-        ):
-            items = list(cast(list[str] | tuple[str, ...], value))
-            if len(items) != len(set(items)):
-                raise OwnerConflict("plan_evidence_provenance_invalid")
-            return items
-    return []
 
 
 def _operation_key(prefix: str, *values: str) -> str:

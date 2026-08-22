@@ -935,6 +935,44 @@ class SQLiteResearchMemoryReceiptVerifier:
                 ),
             )
 
+    def query_plan_selected_evidence_refs(
+        self,
+        *,
+        submission_ref: str,
+        content_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> frozenset[str]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_plan_documents WHERE content_ref = "
+                    ":content_ref AND submission_ref = :submission_ref"
+                ),
+                {"content_ref": content_ref, "submission_ref": submission_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("plan_content_receipt_invalid")
+        self.verify_plan_content_receipt(
+            request_ref=row.request_ref,
+            submission_ref=row.submission_ref,
+            content_ref=row.content_ref,
+            payload_hash=row.payload_hash,
+            plan_hash=row.plan_document_hash,
+            reviewed_draft_hash=row.reviewed_draft_hash,
+            review_hash=row.review_hash,
+            receipt=receipt,
+        )
+        try:
+            plan_document = decoded_object(row.plan_document_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("plan_content_invalid") from error
+        if (
+            canonical_json(plan_document) != row.plan_document_json
+            or canonical_hash(plan_document) != row.plan_document_hash
+        ):
+            raise OwnerConflict("plan_content_invalid")
+        return _selected_plan_evidence_refs(plan_document)
+
     def verify_asset_receipt(
         self,
         *,
@@ -1073,6 +1111,7 @@ class SQLiteResearchMemoryReceiptVerifier:
         manifest_hash: str,
         target_commit_root_ref: str,
         provenance_closure_refs: tuple[str, ...],
+        capabilities: tuple[str, ...],
         receipt: AcceptanceReceipt,
         require_current: bool = True,
     ) -> None:
@@ -1094,13 +1133,14 @@ class SQLiteResearchMemoryReceiptVerifier:
             ).first()
         if row is None:
             raise OwnerConflict("plan_evidence_binding_invalid")
-        target, closure = _plan_evidence_provenance(row)
+        target, closure, stored_capabilities = _plan_evidence_provenance(row)
         if (
             row.asset_ref != asset_ref
             or row.content_hash != content_hash
             or row.manifest_hash != manifest_hash
             or target != target_commit_root_ref
             or closure != provenance_closure_refs
+            or stored_capabilities != capabilities
         ):
             raise OwnerConflict("plan_evidence_binding_invalid")
 
@@ -6700,7 +6740,9 @@ def _plan_row(database: Database, content_ref: str):
     return row
 
 
-def _plan_evidence_provenance(row) -> tuple[str, tuple[str, ...]]:
+def _plan_evidence_provenance(
+    row,
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     try:
         provenance = decoded_object(row.provenance_json)
     except (TypeError, ValueError) as error:
@@ -6711,19 +6753,24 @@ def _plan_evidence_provenance(row) -> tuple[str, tuple[str, ...]]:
     ):
         raise OwnerConflict("plan_evidence_binding_invalid")
     target = provenance.get("target_commit_root_ref")
-    if not isinstance(target, str) or not target.strip():
-        target = row.asset_ref
     closure = provenance.get("provenance_closure_refs")
-    if not isinstance(closure, list):
-        closure = provenance.get("closure_refs")
+    capabilities = provenance.get("capabilities")
     if (
-        not isinstance(closure, list)
+        not isinstance(target, str)
+        or not target.strip()
+        or not isinstance(closure, list)
         or not closure
         or not all(isinstance(value, str) and value.strip() for value in closure)
         or len(closure) != len(set(closure))
+        or not isinstance(capabilities, list)
+        or not capabilities
+        or not all(
+            isinstance(value, str) and value.strip() for value in capabilities
+        )
+        or len(capabilities) != len(set(capabilities))
     ):
-        closure = [f"asset-version:{row.version_ref}"]
-    return target, tuple(closure)
+        raise OwnerConflict("plan_evidence_binding_invalid")
+    return target, tuple(closure), tuple(capabilities)
 
 
 def _verify_object(object_store: Path, row) -> None:
@@ -6829,6 +6876,23 @@ def _verify_plan_object(object_store: Path, row) -> None:
         or payload != row.payload_json.encode("utf-8")
     ):
         raise OwnerConflict("plan_content_custody_unavailable")
+
+
+def _selected_plan_evidence_refs(
+    plan_document: dict[str, object],
+) -> frozenset[str]:
+    reuse_set = plan_document.get("evidence_reuse_set")
+    if not isinstance(reuse_set, list):
+        raise OwnerConflict("plan_content_invalid")
+    refs: set[str] = set()
+    for use in reuse_set:
+        if not isinstance(use, dict):
+            raise OwnerConflict("plan_content_invalid")
+        evidence_ref = use.get("evidence_ref")
+        if not isinstance(evidence_ref, str) or not evidence_ref:
+            raise OwnerConflict("plan_content_invalid")
+        refs.add(evidence_ref)
+    return frozenset(refs)
 
 
 def _verify_plan_payload(

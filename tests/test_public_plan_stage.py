@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from meta_research.composition import build_production_runtime
 from meta_research.idea_skill import (
     IdeaSkillDraft,
@@ -11,7 +9,7 @@ from meta_research.idea_skill import (
     IdeaSkillResult,
 )
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding, PlanRuntimeBinding
-from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.common import canonical_hash
 from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.paths import prepare_data_root
 from meta_research.plan_contract import PLAN_DOCUMENT_SCHEMA_REF
@@ -412,11 +410,11 @@ def _owner_revisions(runtime) -> tuple[int, int, int, int]:
     )
 
 
-def test_plan_stage_keeps_five_fact_layers_and_no_gap_does_not_fake_bundle(
+def test_plan_stage_keeps_five_fact_layers_with_a_real_gap(
     tmp_path: Path,
 ) -> None:
     idea_skill = _DeterministicIdeaSkill()
-    plan_skill = _DeterministicPlanSkill(no_gap=True)
+    plan_skill = _DeterministicPlanSkill(no_gap=False)
     runtime = _runtime(
         tmp_path / "plan-stage",
         idea_skill=idea_skill,
@@ -435,28 +433,6 @@ def test_plan_stage_keeps_five_fact_layers_and_no_gap_does_not_fake_bundle(
         }
         assert waiting_for_idea["stage_run_request"] is None
         assert waiting_for_idea["run"] is None
-        intake = runtime.owners.research_memory.submit_asset_intake(
-            AssetIntakeRequest(
-                source_kind="text",
-                custody_mode="managed",
-                display_name="accepted-observation.md",
-                media_type="text/markdown; charset=utf-8",
-                content=b"Rare morphology remains observable in both conditions.\n",
-                provenance={
-                    "target_commit_root_ref": "target_commit_root_1",
-                    "provenance_closure_refs": ["source_closure_1"],
-                    "capabilities": ["query_support"],
-                },
-            ),
-            idempotency_key="plan-evidence-intake",
-        )
-        assert intake.asset is not None
-        runtime.owners.research_graph.accept_asset_role(
-            binding=intake.asset.as_binding(),
-            role="evidence",
-            quest_ref=quest["quest_ref"],
-            idempotency_key="plan-evidence-role",
-        )
         idea = _finish_idea_stage(runtime)
         assert idea["stage_commit"]["outcome_kind"] == "IdeaSet"
 
@@ -527,12 +503,12 @@ def test_plan_stage_keeps_five_fact_layers_and_no_gap_does_not_fake_bundle(
         assert committed["plan_acceptance"]["content"]["status"] == "accepted"
         assert committed["plan_acceptance"]["domain"]["status"] == "accepted"
         assert committed["plan_acceptance"]["bundle_disposition"] == (
-            "no_new_experiment_required"
+            "experiments_required"
         )
         assert committed["stage_commit"]["outcome_kind"] == "FormalPlan"
         assert committed["stage_commit"]["next_stage"] == "Bundle"
         assert committed["stage_commit"]["bundle_disposition"] == (
-            "no_new_experiment_required"
+            "experiments_required"
         )
         assert "bundle_run" not in committed
 
@@ -542,16 +518,12 @@ def test_plan_stage_keeps_five_fact_layers_and_no_gap_does_not_fake_bundle(
             quest["question_ref"]
         )
         assert context["accepted_idea_set_binding"]["outcome_kind"] == "idea_set"
-        assert context["evidence_reference_revision"] == 1
-        evidence_ref = context["evidence_catalog"][0]
-        assert evidence_ref["asset_version_ref"] == intake.asset.version_ref
-        assert evidence_ref["target_commit_root_ref"] == "target_commit_root_1"
-        assert evidence_ref["provenance_closure_refs"] == ["source_closure_1"]
-        assert evidence_ref["capabilities"] == ["evidence"]
-        assert evidence_ref["asset_receipt"]["receipt_ref"] == (
-            intake.asset.receipt.receipt_ref
-        )
-        assert evidence_ref["role_receipt"]["issuer"] == "research_graph"
+        assert context["evidence_reference_revision"] == 0
+        assert context["evidence_catalog"] == []
+        assert plan_skill.documents[-1]["gap_set"] == [
+            "rare-morphology-comparison"
+        ]
+        assert len(plan_skill.documents[-1]["experiment_briefs"]) == 1
     finally:
         runtime.close()
 
@@ -665,47 +637,124 @@ def test_formal_plan_rejection_revises_in_the_same_native_session(
         runtime.close()
 
 
-def test_plan_context_fails_closed_when_an_accepted_evidence_asset_drifts(
+def test_generic_evidence_role_cannot_masquerade_as_target_commit_evidence(
     tmp_path: Path,
 ) -> None:
-    source = tmp_path / "mutable-observation.md"
-    source.write_text("accepted bytes\n", encoding="utf-8")
     runtime = _runtime(
-        tmp_path / "evidence-drift",
+        tmp_path / "generic-evidence-role",
         idea_skill=_DeterministicIdeaSkill(),
-        plan_skill=_DeterministicPlanSkill(no_gap=True),
+        plan_skill=_DeterministicPlanSkill(no_gap=False),
     )
     try:
         quest = _confirm_direct_quest(runtime)
         intake = runtime.owners.research_memory.submit_asset_intake(
             AssetIntakeRequest(
-                source_kind="local_path",
-                custody_mode="linked_local",
-                display_name=source.name,
-                source_locator=str(source),
+                source_kind="text",
+                custody_mode="managed",
+                display_name="generic-observation.md",
+                media_type="text/markdown; charset=utf-8",
+                content=b"Accepted bytes with only claimed TargetCommit text.\n",
+                provenance={
+                    "target_commit_root_ref": "claimed_target_commit",
+                    "provenance_closure_refs": ["claimed_attempt"],
+                    "capabilities": ["query_support"],
+                },
             ),
-            idempotency_key="plan-drift-intake",
+            idempotency_key="plan-generic-evidence-intake",
         )
         assert intake.asset is not None
         runtime.owners.research_graph.accept_asset_role(
             binding=intake.asset.as_binding(),
             role="evidence",
             quest_ref=quest["quest_ref"],
-            idempotency_key="plan-drift-role",
+            idempotency_key="plan-generic-evidence-role",
         )
         _finish_idea_stage(runtime)
-        source.write_text("changed bytes\n", encoding="utf-8")
 
-        with pytest.raises(
-            OwnerConflict,
-            match="asset_custody_unavailable|plan_evidence_unavailable",
-        ):
-            runtime.plan_stage.process_once()
-        assert (
-            runtime.owners.advancement_engine.query_plan_stage_request(
-                quest["cycle_ref"]
-            )
-            is None
+        assert runtime.plan_stage.process_once()
+        request = runtime.owners.advancement_engine.query_plan_stage_request(
+            quest["cycle_ref"]
         )
+        assert request is not None
+        assert request.context_pack["evidence_reference_revision"] == 0
+        assert request.context_pack["evidence_catalog"] == []
+    finally:
+        runtime.close()
+
+
+def test_frozen_empty_plan_catalog_survives_later_generic_evidence_role(
+    tmp_path: Path,
+) -> None:
+    plan_skill = _DeterministicPlanSkill(no_gap=False)
+    runtime = _runtime(
+        tmp_path / "frozen-plan-evidence",
+        idea_skill=_DeterministicIdeaSkill(),
+        plan_skill=plan_skill,
+    )
+    try:
+        quest = _confirm_direct_quest(runtime)
+        first = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="first-observation.md",
+                media_type="text/markdown; charset=utf-8",
+                content=b"First accepted observation.\n",
+                provenance={
+                    "target_commit_root_ref": "target_commit_root_first",
+                    "provenance_closure_refs": ["source_closure_first"],
+                    "capabilities": ["query_support"],
+                },
+            ),
+            idempotency_key="plan-first-evidence-intake",
+        )
+        assert first.asset is not None
+        runtime.owners.research_graph.accept_asset_role(
+            binding=first.asset.as_binding(),
+            role="evidence",
+            quest_ref=quest["quest_ref"],
+            idempotency_key="plan-first-evidence-role",
+        )
+        _finish_idea_stage(runtime)
+        assert runtime.plan_stage.process_once()  # freeze the Plan request
+        request = runtime.owners.advancement_engine.query_plan_stage_request(
+            quest["cycle_ref"]
+        )
+        assert request is not None
+        assert request.context_pack["evidence_catalog"] == []
+
+        second = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="later-observation.md",
+                media_type="text/markdown; charset=utf-8",
+                content=b"Accepted only after the Plan request was frozen.\n",
+                provenance={
+                    "target_commit_root_ref": "target_commit_root_later",
+                    "provenance_closure_refs": ["source_closure_later"],
+                    "capabilities": ["query_support"],
+                },
+            ),
+            idempotency_key="plan-later-evidence-intake",
+        )
+        assert second.asset is not None
+        runtime.owners.research_graph.accept_asset_role(
+            binding=second.asset.as_binding(),
+            role="evidence",
+            quest_ref=quest["quest_ref"],
+            idempotency_key="plan-later-evidence-role",
+        )
+
+        for _step in range(12):
+            current = runtime.plan_stage.query_current()
+            if current["stage_commit"] is not None:
+                break
+            assert runtime.plan_stage.process_once()
+        committed = runtime.plan_stage.query_current()
+        assert committed["stage_commit"]["status"] == "Completed"
+        assert len(plan_skill.requests) == 1
+        frozen_catalog = plan_skill.requests[0].context_pack["evidence_catalog"]
+        assert frozen_catalog == []
     finally:
         runtime.close()
