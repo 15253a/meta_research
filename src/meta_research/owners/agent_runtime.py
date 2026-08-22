@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Protocol
@@ -10,6 +11,15 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from meta_research.database import Database
+from meta_research.deepfetch import (
+    DeepFetchProvider,
+    DeepFetchProviderRequest,
+    DeepFetchRunRequest,
+    DeepFetchRuntimeBinding,
+    DeepFetchUnavailable,
+    validate_deepfetch_result,
+    validate_runtime_binding,
+)
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import (
     IDEA_REVIEW_SCHEMA_REF,
@@ -22,6 +32,7 @@ from meta_research.owners._sqlite_snapshot import (
 )
 from meta_research.owners.common import (
     AcceptanceReceipt,
+    DeepFetchRunRequestVerifier,
     IdeaOutcomeDecisionVerifier,
     OwnerConflict,
     OwnerSnapshot,
@@ -59,6 +70,7 @@ ATTEMPT_EXECUTION_SCHEMA = "meta-research/idea-attempt-execution/v2"
 IDEA_RUNTIME_BINDING_SCHEMA = "meta-research/idea-runtime-binding/v1"
 ATTEMPT_EXECUTION_RECEIPT_KIND = "idea_attempt_execution"
 RUN_COMPLETION_RECEIPT_KIND = "run_execution_completed"
+DEEPFETCH_EXECUTION_RECEIPT_KIND = "deepfetch_execution_completed"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 _IDEA_SAFE_CAPABILITIES = {
     "approval-policy-never",
@@ -206,6 +218,47 @@ class IdeaStageRun:
         return None if self.completion is None else self.completion.receipt
 
 
+@dataclass(frozen=True)
+class DeepFetchRun:
+    request_ref: str
+    run_ref: str
+    correlation_ref: str
+    status: str
+    attempt_ref: str | None
+    attempt_generation: int
+    root_session_ref: str
+    native_session_ref: str | None
+    fence_ref: str | None
+    runtime_binding: DeepFetchRuntimeBinding
+    runtime_binding_hash: str
+    result: dict[str, object] | None
+    result_hash: str | None
+    execution_receipt: AcceptanceReceipt | None
+    failure_code: str | None
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "run_ref": self.run_ref,
+            "status": self.status,
+            "attempt_ref": self.attempt_ref,
+            "attempt_generation": self.attempt_generation,
+            "root_session_ref": self.root_session_ref,
+            "native_session_ref": self.native_session_ref,
+            "fence_ref": self.fence_ref,
+            "runtime_binding_hash": self.runtime_binding_hash,
+            "execution_receipt": (
+                None
+                if self.execution_receipt is None
+                else self.execution_receipt.as_public_dict()
+            ),
+            "failure": (
+                None
+                if self.failure_code is None
+                else {"code": self.failure_code}
+            ),
+        }
+
+
 class HostComputeObservationReader(Protocol):
     """Read-only AR seam for already persisted host observations."""
 
@@ -220,6 +273,16 @@ class AgentRuntimeInterface(Protocol):
     def observe_host_compute(self, idempotency_key: str) -> HostComputeObservation: ...
 
     def query_host_compute(self, snapshot_ref: str) -> HostComputeObservation: ...
+
+    def execute_deepfetch(
+        self,
+        request: DeepFetchRunRequest,
+        provider: DeepFetchProvider,
+    ) -> DeepFetchRun: ...
+
+    def query_deepfetch_run(self, request_ref: str) -> DeepFetchRun | None: ...
+
+    def cancel_deepfetch(self, request_ref: str) -> DeepFetchRun | None: ...
 
     def admit_idea_stage(
         self,
@@ -290,12 +353,16 @@ class AgentRuntimeInterface(Protocol):
 
     def verify_run_completion_receipt(self, **values) -> None: ...
 
+    def verify_deepfetch_execution_receipt(self, **values) -> None: ...
+
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=AR_OWNER,
     statement=text(
         "SELECT revision, active_run_count, stage_run_count, completed_run_count, "
-        "attempt_count, session_count "
+        "attempt_count, session_count, deepfetch_run_count, "
+        "deepfetch_completed_run_count, deepfetch_attempt_count, "
+        "deepfetch_session_count "
         "FROM agent_runtime_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -304,6 +371,10 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "completed_run_count",
         "attempt_count",
         "session_count",
+        "deepfetch_run_count",
+        "deepfetch_completed_run_count",
+        "deepfetch_attempt_count",
+        "deepfetch_session_count",
     ),
 )
 
@@ -341,17 +412,22 @@ class SQLiteAgentRuntime:
         host_compute_probe: HostComputeProbe,
         stage_request_verifier: StageRunRequestVerifier | None = None,
         outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
+        deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._host_compute_probe = host_compute_probe
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
+        self._deepfetch_request_verifier = deepfetch_request_verifier
         self._receipt_verifier = SQLiteAgentRuntimeReceiptVerifier(
             database, stage_request_verifier
         )
         self._host_compute_reader = SQLiteHostComputeObservationReader(database)
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
+        self._deepfetch_provider_lock = threading.Lock()
+        self._deepfetch_providers: dict[str, DeepFetchProvider] = {}
+        self._recover_interrupted_deepfetch()
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
@@ -635,6 +711,584 @@ class SQLiteAgentRuntime:
 
     def query_host_compute(self, snapshot_ref: str) -> HostComputeObservation:
         return self._host_compute_reader.query_host_compute(snapshot_ref)
+
+    def _recover_interrupted_deepfetch(self) -> None:
+        now = time.time()
+        with self._database.write() as connection:
+            attempts = connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_attempts SET status = 'superseded', "
+                    "failure_code = 'daemon_restarted', completed_at = :now "
+                    "WHERE status = 'running'"
+                ),
+                {"now": now},
+            )
+            runs = connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_runs SET status = 'admitted', "
+                    "current_attempt_ref = NULL, failure_code = NULL, "
+                    "completed_at = NULL, updated_at = :now WHERE status = 'running'"
+                ),
+                {"now": now},
+            )
+            recovered = (attempts.rowcount or 0) + (runs.rowcount or 0)
+            if recovered:
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.deepfetch_recovered",
+                    {"recovered_record_count": recovered},
+                )
+
+    def execute_deepfetch(
+        self,
+        request: DeepFetchRunRequest,
+        provider: DeepFetchProvider,
+    ) -> DeepFetchRun:
+        if self._deepfetch_request_verifier is None:
+            raise OwnerConflict("deepfetch_request_verifier_unavailable")
+        self._deepfetch_request_verifier.verify_deepfetch_run_request(
+            request_ref=request.request_ref,
+            initialization_id=request.initialization_id,
+            correlation_ref=request.correlation_ref,
+            draft_revision=request.draft_revision,
+            draft_hash=request.draft_hash,
+            scope_hash=request.scope_hash,
+            resource_envelope_ref=request.resource_envelope_ref,
+            resource_envelope_hash=request.resource_envelope_hash,
+            result_route=request.result_route,
+            receipt=request.authorization_receipt,
+        )
+        if (
+            request.result_route != "same_quest_initialization_proposal"
+            or canonical_hash(request.scope) != request.scope_hash
+            or request.draft_revision < 1
+            or canonical_hash(request.draft) != request.draft_hash
+        ):
+            raise OwnerConflict("deepfetch_run_request_invalid")
+        try:
+            runtime_binding = provider.runtime_binding()
+            runtime_binding_hash = validate_runtime_binding(runtime_binding)
+        except DeepFetchUnavailable as error:
+            raise OwnerConflict(error.code) from error
+        runtime_binding_json = canonical_json(runtime_binding.as_dict())
+        request_hash = canonical_hash(request.payload())
+
+        existing = self.query_deepfetch_run(request.request_ref)
+        if existing is not None and existing.status == "executed":
+            if (
+                existing.correlation_ref != request.correlation_ref
+                or existing.runtime_binding_hash != runtime_binding_hash
+            ):
+                raise OwnerConflict("deepfetch_run_identity_conflict")
+            return existing
+
+        run_ref, root_session_ref, attempt_ref, generation, fence_ref, native_ref = (
+            self._start_deepfetch_attempt(
+                request=request,
+                request_hash=request_hash,
+                runtime_binding_json=runtime_binding_json,
+                runtime_binding_hash=runtime_binding_hash,
+            )
+        )
+        job_ref = f"{run_ref}:attempt:{generation}"
+        provider_request = DeepFetchProviderRequest(
+            request_ref=request.request_ref,
+            initialization_id=request.initialization_id,
+            correlation_ref=request.correlation_ref,
+            draft_revision=request.draft_revision,
+            draft_hash=request.draft_hash,
+            scope=request.scope,
+            scope_hash=request.scope_hash,
+            accepted_material_bindings=request.accepted_material_bindings,
+            authorization_receipt=request.authorization_receipt,
+            runtime_binding=runtime_binding,
+            run_ref=run_ref,
+            root_session_ref=root_session_ref,
+            attempt_ref=attempt_ref,
+            attempt_generation=generation,
+            fence_ref=fence_ref,
+            native_session_ref=native_ref,
+            job_ref=job_ref,
+        )
+        with self._deepfetch_provider_lock:
+            self._deepfetch_providers[request.request_ref] = provider
+        try:
+            result = provider.execute(provider_request)
+            result_payload, result_hash = validate_deepfetch_result(
+                provider_request, result
+            )
+            return self._complete_deepfetch_attempt(
+                request=request,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                generation=generation,
+                fence_ref=fence_ref,
+                runtime_binding_hash=runtime_binding_hash,
+                result_payload=result_payload,
+                result_hash=result_hash,
+            )
+        except DeepFetchUnavailable as error:
+            self._fail_deepfetch_attempt(
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                generation=generation,
+                fence_ref=fence_ref,
+                failure_code=error.code,
+            )
+            raise
+        except BaseException:
+            self._fail_deepfetch_attempt(
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                generation=generation,
+                fence_ref=fence_ref,
+                failure_code="deepfetch_provider_error",
+            )
+            raise
+        finally:
+            with self._deepfetch_provider_lock:
+                current_provider = self._deepfetch_providers.get(request.request_ref)
+                if current_provider is provider:
+                    self._deepfetch_providers.pop(request.request_ref, None)
+            finish_job = getattr(provider, "finish_job", None)
+            if callable(finish_job):
+                finish_job(job_ref)
+
+    def _start_deepfetch_attempt(
+        self,
+        *,
+        request: DeepFetchRunRequest,
+        request_hash: str,
+        runtime_binding_json: str,
+        runtime_binding_hash: str,
+    ) -> tuple[str, str, str, int, str, str | None]:
+        now = time.time()
+        with self._database.write() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT * FROM ar_deepfetch_runs WHERE request_ref = :request_ref"
+                ),
+                {"request_ref": request.request_ref},
+            ).first()
+            is_new = run is None
+            was_failed = run is not None and run.status == "failed"
+            if run is not None:
+                if (
+                    run.request_hash != request_hash
+                    or run.correlation_ref != request.correlation_ref
+                    or run.runtime_binding_json != runtime_binding_json
+                    or run.runtime_binding_hash != runtime_binding_hash
+                ):
+                    raise OwnerConflict("deepfetch_run_identity_conflict")
+                if run.status == "executed":
+                    raise OwnerConflict("deepfetch_run_already_executed")
+                if run.status == "running":
+                    raise OwnerConflict("deepfetch_run_busy")
+                if run.status == "cancelled":
+                    raise OwnerConflict("deepfetch_run_cancelled")
+                run_ref = str(run.run_ref)
+                generation = int(run.attempt_generation) + 1
+                session = connection.execute(
+                    text(
+                        "SELECT * FROM ar_deepfetch_sessions WHERE run_ref = :run_ref"
+                    ),
+                    {"run_ref": run_ref},
+                ).one()
+                root_session_ref = str(session.root_session_ref)
+                native_session_ref = (
+                    None
+                    if session.native_session_ref is None
+                    else str(session.native_session_ref)
+                )
+            else:
+                run_ref = new_ref("deepfetch_run")
+                root_session_ref = new_ref("deepfetch_session")
+                native_session_ref = None
+                generation = 1
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_deepfetch_runs (run_ref, request_ref, "
+                        "correlation_ref, request_hash, runtime_binding_json, "
+                        "runtime_binding_hash, status, attempt_generation, created_at, "
+                        "updated_at) VALUES (:run_ref, :request_ref, :correlation_ref, "
+                        ":request_hash, :runtime_binding_json, :runtime_binding_hash, "
+                        "'admitted', 0, :now, :now)"
+                    ),
+                    {
+                        "run_ref": run_ref,
+                        "request_ref": request.request_ref,
+                        "correlation_ref": request.correlation_ref,
+                        "request_hash": request_hash,
+                        "runtime_binding_json": runtime_binding_json,
+                        "runtime_binding_hash": runtime_binding_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_deepfetch_sessions (root_session_ref, run_ref, "
+                        "status, created_at, updated_at) VALUES (:root_session_ref, "
+                        ":run_ref, 'open', :now, :now)"
+                    ),
+                    {
+                        "root_session_ref": root_session_ref,
+                        "run_ref": run_ref,
+                        "now": now,
+                    },
+                )
+            attempt_ref = new_ref("deepfetch_attempt")
+            fence_ref = new_ref("deepfetch_fence")
+            connection.execute(
+                text(
+                    "INSERT INTO ar_deepfetch_attempts (attempt_ref, run_ref, "
+                    "generation, root_session_ref, fence_ref, status, started_at) "
+                    "VALUES (:attempt_ref, :run_ref, :generation, :root_session_ref, "
+                    ":fence_ref, 'running', :now)"
+                ),
+                {
+                    "attempt_ref": attempt_ref,
+                    "run_ref": run_ref,
+                    "generation": generation,
+                    "root_session_ref": root_session_ref,
+                    "fence_ref": fence_ref,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_runs SET status = 'running', "
+                    "current_attempt_ref = :attempt_ref, "
+                    "attempt_generation = :generation, failure_code = NULL, "
+                    "completed_at = NULL, updated_at = :now WHERE run_ref = :run_ref"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "generation": generation,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "active_run_count = active_run_count + :active_increment, "
+                    "deepfetch_run_count = deepfetch_run_count + :run_increment, "
+                    "deepfetch_attempt_count = deepfetch_attempt_count + 1, "
+                    "deepfetch_session_count = deepfetch_session_count + "
+                    ":session_increment WHERE singleton = 'owner'"
+                ),
+                {
+                    "active_increment": 1 if is_new or was_failed else 0,
+                    "run_increment": 1 if is_new else 0,
+                    "session_increment": 1 if is_new else 0,
+                },
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.deepfetch_attempt_started",
+                {
+                    "request_ref": request.request_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "attempt_generation": generation,
+                    "fence_ref": fence_ref,
+                },
+            )
+        return (
+            run_ref,
+            root_session_ref,
+            attempt_ref,
+            generation,
+            fence_ref,
+            native_session_ref,
+        )
+
+    def _complete_deepfetch_attempt(
+        self,
+        *,
+        request: DeepFetchRunRequest,
+        run_ref: str,
+        attempt_ref: str,
+        generation: int,
+        fence_ref: str,
+        runtime_binding_hash: str,
+        result_payload: dict[str, object],
+        result_hash: str,
+    ) -> DeepFetchRun:
+        native_session_ref = str(result_payload["native_session_ref"])
+        receipt_ref = new_ref("ar_receipt")
+        receipt_bindings = {
+            "request_ref": request.request_ref,
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "attempt_generation": generation,
+            "fence_ref": fence_ref,
+            "native_session_ref": native_session_ref,
+            "runtime_binding_hash": runtime_binding_hash,
+            "result_hash": result_hash,
+        }
+        receipt_hash = _owner_receipt_hash(
+            DEEPFETCH_EXECUTION_RECEIPT_KIND,
+            run_ref,
+            receipt_bindings,
+        )
+        now = time.time()
+        with self._database.write() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT * FROM ar_deepfetch_runs WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).one()
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_deepfetch_attempts WHERE "
+                    "attempt_ref = :attempt_ref"
+                ),
+                {"attempt_ref": attempt_ref},
+            ).one()
+            session = connection.execute(
+                text(
+                    "SELECT * FROM ar_deepfetch_sessions WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).one()
+            if (
+                run.status != "running"
+                or run.current_attempt_ref != attempt_ref
+                or int(run.attempt_generation) != generation
+                or attempt.status != "running"
+                or attempt.fence_ref != fence_ref
+                or session.status != "open"
+            ):
+                raise OwnerConflict("deepfetch_attempt_fence_stale")
+            if session.native_session_ref is not None and (
+                session.native_session_ref != native_session_ref
+            ):
+                raise OwnerConflict("deepfetch_native_session_changed")
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_sessions SET native_session_ref = "
+                    ":native_session_ref, status = 'completed', updated_at = :now "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "native_session_ref": native_session_ref,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_attempts SET status = 'executed', "
+                    "result_hash = :result_hash, completed_at = :now WHERE "
+                    "attempt_ref = :attempt_ref AND status = 'running'"
+                ),
+                {
+                    "attempt_ref": attempt_ref,
+                    "result_hash": result_hash,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_runs SET status = 'executed', "
+                    "result_json = :result_json, result_hash = :result_hash, "
+                    "execution_receipt_ref = :receipt_ref, "
+                    "execution_receipt_hash = :receipt_hash, failure_code = NULL, "
+                    "updated_at = :now, completed_at = :now WHERE run_ref = :run_ref"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "result_json": canonical_json(result_payload),
+                    "result_hash": result_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "active_run_count = active_run_count - 1, "
+                    "deepfetch_completed_run_count = "
+                    "deepfetch_completed_run_count + 1 WHERE singleton = 'owner' "
+                    "AND active_run_count > 0"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.deepfetch_executed",
+                {
+                    "request_ref": request.request_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "result_hash": result_hash,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        completed = self.query_deepfetch_run(request.request_ref)
+        assert completed is not None
+        return completed
+
+    def _fail_deepfetch_attempt(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        generation: int,
+        fence_ref: str,
+        failure_code: str,
+    ) -> None:
+        now = time.time()
+        with self._database.write() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT status, current_attempt_ref, attempt_generation, "
+                    "request_ref FROM ar_deepfetch_runs WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            attempt = connection.execute(
+                text(
+                    "SELECT status, fence_ref FROM ar_deepfetch_attempts WHERE "
+                    "attempt_ref = :attempt_ref"
+                ),
+                {"attempt_ref": attempt_ref},
+            ).first()
+            if run is None or attempt is None or (
+                run.status != "running"
+                or run.current_attempt_ref != attempt_ref
+                or int(run.attempt_generation) != generation
+                or attempt.status != "running"
+                or attempt.fence_ref != fence_ref
+            ):
+                return
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_attempts SET status = 'failed', "
+                    "failure_code = :failure_code, completed_at = :now WHERE "
+                    "attempt_ref = :attempt_ref"
+                ),
+                {
+                    "attempt_ref": attempt_ref,
+                    "failure_code": failure_code,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_runs SET status = 'failed', "
+                    "failure_code = :failure_code, updated_at = :now, "
+                    "completed_at = :now WHERE run_ref = :run_ref"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "failure_code": failure_code,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "active_run_count = active_run_count - 1 WHERE "
+                    "singleton = 'owner' AND active_run_count > 0"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.deepfetch_failed",
+                {
+                    "request_ref": run.request_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "reason_code": failure_code,
+                },
+            )
+
+    def query_deepfetch_run(self, request_ref: str) -> DeepFetchRun | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT r.*, s.root_session_ref, s.native_session_ref, "
+                    "s.status AS session_status, a.attempt_ref AS joined_attempt_ref, "
+                    "a.generation AS joined_generation, a.fence_ref, "
+                    "a.status AS attempt_status FROM ar_deepfetch_runs r "
+                    "JOIN ar_deepfetch_sessions s ON s.run_ref = r.run_ref "
+                    "LEFT JOIN ar_deepfetch_attempts a ON a.attempt_ref = "
+                    "r.current_attempt_ref WHERE r.request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        return None if row is None else _deepfetch_run_from_row(row)
+
+    def cancel_deepfetch(self, request_ref: str) -> DeepFetchRun | None:
+        current_before_cancel = self.query_deepfetch_run(request_ref)
+        with self._deepfetch_provider_lock:
+            provider = self._deepfetch_providers.get(request_ref)
+        if provider is not None:
+            cancel_job = getattr(provider, "cancel_job", None)
+            if callable(cancel_job):
+                current = current_before_cancel
+                if current is not None and current.attempt_generation > 0:
+                    cancel_job(
+                        f"{current.run_ref}:attempt:{current.attempt_generation}"
+                    )
+        now = time.time()
+        with self._database.write() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT * FROM ar_deepfetch_runs WHERE request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+            if run is None or run.status in {"executed", "cancelled"}:
+                return current_before_cancel
+            was_active = run.status in {"admitted", "running"}
+            if run.current_attempt_ref is not None:
+                connection.execute(
+                    text(
+                        "UPDATE ar_deepfetch_attempts SET status = 'cancelled', "
+                        "failure_code = 'deepfetch_cancelled', completed_at = :now "
+                        "WHERE attempt_ref = :attempt_ref AND status = 'running'"
+                    ),
+                    {"attempt_ref": run.current_attempt_ref, "now": now},
+                )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_sessions SET status = 'cancelled', "
+                    "updated_at = :now WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run.run_ref, "now": now},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_runs SET status = 'cancelled', "
+                    "failure_code = 'deepfetch_cancelled', updated_at = :now, "
+                    "completed_at = :now WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run.run_ref, "now": now},
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "active_run_count = active_run_count - :active_decrement WHERE "
+                    "singleton = 'owner' AND active_run_count >= :active_decrement"
+                ),
+                {"active_decrement": 1 if was_active else 0},
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.deepfetch_cancelled",
+                {"request_ref": request_ref, "run_ref": run.run_ref},
+            )
+        return self.query_deepfetch_run(request_ref)
 
     def admit_idea_stage(
         self,
@@ -1954,6 +2608,9 @@ class SQLiteAgentRuntime:
     def verify_run_completion_receipt(self, **values) -> None:
         self._receipt_verifier.verify_run_completion_receipt(**values)
 
+    def verify_deepfetch_execution_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_deepfetch_execution_receipt(**values)
+
 
 class SQLiteAgentRuntimeReceiptVerifier:
     """Narrow AR issuer verifier with optional AE provenance verification."""
@@ -2089,6 +2746,150 @@ class SQLiteAgentRuntimeReceiptVerifier:
                     payload_hash=run.request_receipt_hash,
                 ),
             )
+
+    def verify_deepfetch_execution_receipt(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        result_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != AR_OWNER
+            or receipt.kind != DEEPFETCH_EXECUTION_RECEIPT_KIND
+            or receipt.subject_ref != run_ref
+        ):
+            raise OwnerConflict("deepfetch_execution_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT r.*, s.root_session_ref, s.native_session_ref, "
+                    "a.attempt_ref AS joined_attempt_ref, "
+                    "a.generation AS joined_generation, a.fence_ref, "
+                    "a.status AS attempt_status, a.result_hash AS "
+                    "attempt_result_hash FROM ar_deepfetch_runs r JOIN "
+                    "ar_deepfetch_sessions s ON s.run_ref = r.run_ref JOIN "
+                    "ar_deepfetch_attempts a ON a.attempt_ref = "
+                    "r.current_attempt_ref WHERE r.execution_receipt_ref = "
+                    ":receipt_ref"
+                ),
+                {"receipt_ref": receipt.receipt_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("deepfetch_execution_receipt_invalid")
+        run = _deepfetch_run_from_row(row)
+        expected_hash = _owner_receipt_hash(
+            DEEPFETCH_EXECUTION_RECEIPT_KIND,
+            run.run_ref,
+            {
+                "request_ref": run.request_ref,
+                "run_ref": run.run_ref,
+                "attempt_ref": run.attempt_ref,
+                "attempt_generation": run.attempt_generation,
+                "fence_ref": run.fence_ref,
+                "native_session_ref": run.native_session_ref,
+                "runtime_binding_hash": run.runtime_binding_hash,
+                "result_hash": run.result_hash,
+            },
+        )
+        if (
+            run.status != "executed"
+            or row.attempt_status != "executed"
+            or run.request_ref != request_ref
+            or run.run_ref != run_ref
+            or run.attempt_ref != attempt_ref
+            or run.fence_ref != fence_ref
+            or run.result_hash != result_hash
+            or row.attempt_result_hash != result_hash
+            or row.execution_receipt_hash != receipt.payload_hash
+            or receipt.payload_hash != expected_hash
+        ):
+            raise OwnerConflict("deepfetch_execution_receipt_invalid")
+
+
+def _deepfetch_runtime_binding(value: str) -> DeepFetchRuntimeBinding:
+    try:
+        decoded = decoded_object(value)
+        if set(decoded) != {
+            "schema_ref",
+            "provider_ref",
+            "provider_version",
+            "model_ref",
+            "harness_ref",
+            "capability_bindings",
+        } or decoded["schema_ref"] != "meta-research/deepfetch-runtime-binding/v1":
+            raise TypeError("runtime binding")
+        capabilities = decoded["capability_bindings"]
+        if not isinstance(capabilities, list) or any(
+            not isinstance(item, str) for item in capabilities
+        ):
+            raise TypeError("capability bindings")
+        binding = DeepFetchRuntimeBinding(
+            provider_ref=str(decoded["provider_ref"]),
+            provider_version=str(decoded["provider_version"]),
+            model_ref=str(decoded["model_ref"]),
+            harness_ref=str(decoded["harness_ref"]),
+            capability_bindings=tuple(capabilities),
+        )
+        validate_runtime_binding(binding)
+        return binding
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, DeepFetchUnavailable) as error:
+        raise OwnerConflict("deepfetch_runtime_binding_invalid") from error
+
+
+def _deepfetch_run_from_row(row) -> DeepFetchRun:
+    runtime_binding = _deepfetch_runtime_binding(row.runtime_binding_json)
+    if (
+        canonical_json(runtime_binding.as_dict()) != row.runtime_binding_json
+        or canonical_hash(runtime_binding.as_dict()) != row.runtime_binding_hash
+    ):
+        raise OwnerConflict("deepfetch_runtime_binding_invalid")
+    result: dict[str, object] | None = None
+    receipt: AcceptanceReceipt | None = None
+    if row.result_json is not None:
+        try:
+            result = decoded_object(row.result_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OwnerConflict("deepfetch_result_invalid") from error
+        if (
+            canonical_json(result) != row.result_json
+            or canonical_hash(result) != row.result_hash
+        ):
+            raise OwnerConflict("deepfetch_result_invalid")
+    if row.execution_receipt_ref is not None:
+        receipt = AcceptanceReceipt(
+            issuer=AR_OWNER,
+            kind=DEEPFETCH_EXECUTION_RECEIPT_KIND,
+            receipt_ref=row.execution_receipt_ref,
+            subject_ref=row.run_ref,
+            payload_hash=row.execution_receipt_hash,
+        )
+    attempt_ref = getattr(row, "joined_attempt_ref", None)
+    fence_ref = getattr(row, "fence_ref", None)
+    if row.status in {"running", "executed"} and (
+        attempt_ref is None or fence_ref is None
+    ):
+        raise OwnerConflict("deepfetch_attempt_invalid")
+    return DeepFetchRun(
+        request_ref=row.request_ref,
+        run_ref=row.run_ref,
+        correlation_ref=row.correlation_ref,
+        status=row.status,
+        attempt_ref=attempt_ref,
+        attempt_generation=int(row.attempt_generation),
+        root_session_ref=row.root_session_ref,
+        native_session_ref=row.native_session_ref,
+        fence_ref=fence_ref,
+        runtime_binding=runtime_binding,
+        runtime_binding_hash=row.runtime_binding_hash,
+        result=result,
+        result_hash=row.result_hash,
+        execution_receipt=receipt,
+        failure_code=row.failure_code,
+    )
 
 
 def _owner_receipt_hash(
@@ -3089,6 +3890,7 @@ def create_agent_runtime_interface(
     host_compute_probe: HostComputeProbe,
     stage_request_verifier: StageRunRequestVerifier | None = None,
     outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
+    deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
         database,
@@ -3096,6 +3898,7 @@ def create_agent_runtime_interface(
         host_compute_probe,
         stage_request_verifier,
         outcome_verifier,
+        deepfetch_request_verifier,
     )
 
 

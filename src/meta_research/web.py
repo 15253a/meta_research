@@ -50,6 +50,7 @@ ASSET_WORKER_WATCHDOG_SECONDS = 5.0
 ASSET_ROUTE_WATCHDOG_SECONDS = 5.0
 DRAFTING_WORKER_WATCHDOG_SECONDS = 190.0
 IDEA_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
+DEEPFETCH_WORKER_WATCHDOG_SECONDS = 1810.0
 _T = TypeVar("_T")
 
 
@@ -294,11 +295,13 @@ def create_app(
 ) -> FastAPI:
     reconciliation_task: asyncio.Task[None] | None = None
     drafting_task: asyncio.Task[None] | None = None
+    deepfetch_task: asyncio.Task[None] | None = None
     idea_stage_task: asyncio.Task[None] | None = None
     research_asset_task: asyncio.Task[None] | None = None
     research_asset_verification_task: asyncio.Task[None] | None = None
     reconciliation_health = ReconciliationHealth()
     drafting_health = ReconciliationHealth()
+    deepfetch_health = ReconciliationHealth()
     idea_stage_health = ReconciliationHealth()
     research_asset_health = ReconciliationHealth()
     research_asset_verification_health = ReconciliationHealth()
@@ -310,7 +313,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        nonlocal reconciliation_task, drafting_task, idea_stage_task
+        nonlocal reconciliation_task, drafting_task, deepfetch_task, idea_stage_task
         nonlocal research_asset_task, research_asset_verification_task
         reconciliation_task = asyncio.create_task(
             _reconcile_quest_initializations(
@@ -328,6 +331,14 @@ def create_app(
             )
         )
         drafting_task.add_done_callback(_log_reconciliation_exit)
+        deepfetch_task = asyncio.create_task(
+            _process_first_question_deepfetch(
+                runtime,
+                deepfetch_health,
+                worker_health_updates.publish,
+            )
+        )
+        deepfetch_task.add_done_callback(_log_reconciliation_exit)
         idea_stage_task = asyncio.create_task(
             _process_idea_stage(
                 runtime,
@@ -360,6 +371,7 @@ def create_app(
                 for task in (
                     reconciliation_task,
                     drafting_task,
+                    deepfetch_task,
                     idea_stage_task,
                     research_asset_task,
                     research_asset_verification_task,
@@ -418,6 +430,11 @@ def create_app(
                 reconciliation_health,
             ),
             worker_check("quest_drafting_worker", drafting_task, drafting_health),
+            worker_check(
+                "first_question_deepfetch_worker",
+                deepfetch_task,
+                deepfetch_health,
+            ),
             worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
             worker_check(
                 "research_asset_intake_worker",
@@ -619,6 +636,9 @@ def create_app(
         drafting = worker_check(
             "quest_drafting_worker", drafting_task, drafting_health
         )
+        deepfetch = worker_check(
+            "first_question_deepfetch_worker", deepfetch_task, deepfetch_health
+        )
         idea_stage = worker_check(
             "idea_stage_worker", idea_stage_task, idea_stage_health
         )
@@ -642,6 +662,10 @@ def create_app(
             "drafting": {
                 "status": drafting["status"],
                 "last_error": drafting_health.last_error,
+            },
+            "deepfetch": {
+                "status": deepfetch["status"],
+                "last_error": deepfetch_health.last_error,
             },
             "idea_stage": {
                 "status": idea_stage["status"],
@@ -929,6 +953,10 @@ def create_app(
             initialization_id
         )
         return {"intent_session": view["intent_session"]}
+
+    @app.get("/api/v1/literature-snapshots/{snapshot_ref}")
+    def query_literature_snapshot(snapshot_ref: str) -> dict[str, object]:
+        return runtime.owners.research_memory.read_literature_snapshot(snapshot_ref)
 
     @app.get("/api/v1/research-assets")
     def query_research_assets(
@@ -1501,6 +1529,46 @@ async def _process_quest_drafting(
         except Exception as error:
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("quest drafting attempt failed unexpectedly")
+            error_code = (
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
+            )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
+async def _process_first_question_deepfetch(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Advance one durable, authorization-bound first-question DeepFetch run."""
+
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                runtime.deepfetch.process_once,
+                health=health,
+                timeout_code="deepfetch_operation_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=DEEPFETCH_WORKER_WATCHDOG_SECONDS,
+            )
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("first-question DeepFetch attempt failed unexpectedly")
             error_code = (
                 error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )

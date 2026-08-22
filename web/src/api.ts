@@ -266,6 +266,64 @@ export type QuestResourceEnvelope = {
   selected_device_uuids: string[];
 };
 
+export type DeepFetchRun = {
+  run_ref: string;
+  status: "admitted" | "running" | "executed" | "failed" | "cancelled";
+  attempt_ref: string | null;
+  attempt_generation: number;
+  root_session_ref: string;
+  native_session_ref: string | null;
+  fence_ref: string | null;
+  runtime_binding_hash: string;
+  execution_receipt: Extract<ReceiptState, { status: "accepted" }> | null;
+  failure: null | { code: string };
+};
+
+export type LiteratureSnapshot = {
+  status: "accepted";
+  snapshot_ref: string;
+  request_ref: string;
+  initialization_id: string;
+  draft_revision: number;
+  draft_hash: string;
+  scope_hash: string;
+  completion: "complete" | "limited" | "honest_empty";
+  summary_ref: string;
+  summary_hash: string;
+  papers_ref: string;
+  papers_hash: string;
+  fulltexts_ref: string;
+  fulltexts_hash: string;
+  limitations: string[];
+  snapshot_hash: string;
+  paper_count: number;
+  fulltext_count: number;
+  receipt: Extract<ReceiptState, { status: "accepted" }>;
+};
+
+export type DeepFetchProjection = {
+  request_ref: string;
+  correlation_ref: string;
+  basis_revision: number;
+  basis_hash: string;
+  scope_hash: string;
+  status: "queued" | "running" | "accepting" | "succeeded" | "failed" | "cancelled";
+  activity:
+    | "waiting_for_runtime"
+    | "web_research"
+    | "accepting_assets"
+    | "proposal_drafting"
+    | "complete"
+    | "needs_retry"
+    | "cancelled";
+  progress: { completed: number; total: number };
+  freshness: "current" | "stale";
+  authorization_receipt: Extract<ReceiptState, { status: "accepted" }>;
+  run: DeepFetchRun | null;
+  literature_snapshot: LiteratureSnapshot | null;
+  failure: null | { code: string };
+};
+
 export type IntentSessionTurn = {
   ref: string;
   ordinal: number;
@@ -333,6 +391,7 @@ export type QuestCreationView = {
     proposal_ref?: string;
     proposal_hash?: string;
     failure: null | { code: string };
+    literature_snapshot_ref: string | null;
   };
   proposal: null | {
     ref: string;
@@ -342,6 +401,7 @@ export type QuestCreationView = {
     basis_hash: string;
     status: "current" | "incomplete" | "stale";
     content: QuestionContent;
+    literature_snapshot_ref: string | null;
   };
   confirmation_preview: null | {
     ref: string;
@@ -362,6 +422,7 @@ export type QuestCreationView = {
     status: "open" | "closed";
     turns: IntentSessionTurn[];
   };
+  deepfetch: DeepFetchProjection | null;
   capabilities: {
     direct: QuestCapability;
     first_question_deepfetch: QuestCapability;
@@ -546,10 +607,10 @@ export type PublicSnapshot = {
   owners: Record<string, OwnerSnapshot>;
   quest_creation: {
     status: "ready";
-    route: "direct";
+    route: "direct_or_deepfetch";
     current: QuestCreationView | null;
     accepted_material_basis: QuestCapability;
-    first_question_deepfetch: Omit<UnavailableCapability, "capability">;
+    first_question_deepfetch: QuestCapability;
   };
   research_assets: ResearchAssetsView;
   idea_stage?: IdeaStageProjection | null;

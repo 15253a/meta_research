@@ -101,6 +101,7 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "research_asset_intake_worker",
             "research_asset_verification_worker",
             "quest_drafting_worker",
+            "first_question_deepfetch_worker",
             "quest_reconciliation_worker",
         }
         assert snapshot["research_space"] == {

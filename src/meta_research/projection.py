@@ -230,14 +230,13 @@ class PublicProjection:
             },
             "quest_creation": {
                 "status": "ready",
-                "route": "direct",
+                "route": "direct_or_deepfetch",
                 "current": current_quest_creation,
                 "accepted_material_basis": {
                     "status": "ready",
                 },
                 "first_question_deepfetch": {
-                    "status": "capability_unavailable",
-                    "reason": {"code": "deepfetch_not_delivered"},
+                    "status": "ready",
                 },
             },
             "research_assets": {
@@ -296,7 +295,6 @@ def _release_capabilities() -> list[dict[str, object]]:
             "reason": reason.copy(),
         }
         for capability in (
-            "first_question_deepfetch",
             "quest_companion",
             "stage_execution",
             "writing",

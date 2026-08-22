@@ -71,6 +71,7 @@ type PublicQuestCreation = {
     ref: string;
     hash: string;
     status: string;
+    literature_snapshot_ref: string | null;
     content: {
       title: string;
       unknown_statement: string;
@@ -82,6 +83,30 @@ type PublicQuestCreation = {
   };
   proposal_generation: null | {
     status: string;
+    failure: null | { code: string };
+  };
+  deepfetch: null | {
+    request_ref: string;
+    status: string;
+    activity: string;
+    freshness: string;
+    progress: { completed: number; total: number };
+    run: null | {
+      run_ref: string;
+      attempt_generation: number;
+      root_session_ref: string;
+      native_session_ref: string | null;
+      execution_receipt: null | PublicReceipt;
+    };
+    literature_snapshot: null | {
+      status: string;
+      snapshot_ref: string;
+      completion: string;
+      paper_count: number;
+      fulltext_count: number;
+      limitations: string[];
+      receipt: PublicReceipt;
+    };
     failure: null | { code: string };
   };
   confirmation_preview: null | {
@@ -290,6 +315,109 @@ test("the ready Proposal keeps the accepted violet source and six seed-field car
   await generateReadyProposal(dialog);
 
   await expectAcceptedProposalContract(dialog);
+});
+
+test("DeepFetch unfolds real progress and its accepted snapshot inside the same Quest window", async ({
+  page,
+}) => {
+  test.setTimeout(45_000);
+  await page.setViewportSize({ width: 800, height: 1000 });
+  await openAuthenticatedProduct(page, runningProduct());
+  const { dialog } = await openCreation(page);
+  const session = dialog.getByRole("complementary", {
+    name: "讨论 Quest 与第一问",
+  });
+  await fillRequiredBasis(
+    dialog,
+    "用真实 Web Research 核查低照度显微去噪的证据边界",
+    "形成带论文账本、全文限制和反例的第一问",
+  );
+  await dialog.getByRole("button", { name: "检测本机计算卡" }).click();
+  await expect(
+    dialog.getByText("capability_unavailable · deterministic_probe_unavailable", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await selectReadyCompute(dialog);
+
+  const deepfetchChoice = dialog.getByRole("button", { name: "先运行 DeepFetch" });
+  await deepfetchChoice.click();
+  await expect(deepfetchChoice).toHaveAttribute("aria-pressed", "true");
+  const runway = dialog.getByTestId("deepfetch-runway");
+  await expect(runway).toHaveAttribute("data-status", "not-started");
+  await expect(runway).toContainText("进度只读取 durable Projection");
+  await expect(session).toBeVisible();
+
+  await dialog.getByRole("button", { name: "生成第一个问题" }).click();
+  await expect(runway).toHaveAttribute("data-status", /queued|running|succeeded/, {
+    timeout: 8_000,
+  });
+  await expect(runway.getByLabel("DeepFetch 真实进度")).toBeVisible();
+  await expect(session).toBeVisible();
+  await expect(runway).toContainText("2 papers · 1 fulltexts · RM accepted", {
+    timeout: 12_000,
+  });
+  await expect(runway).toContainText("第二篇论文没有可合法获取的开放全文。");
+  await expect(dialog.getByLabel("首问题标题")).toHaveValue(QUESTION.title, {
+    timeout: 15_000,
+  });
+  await expect(dialog.getByLabel("首问题背景上下文")).toHaveValue(
+    "DeepFetch 已核查两篇论文；一篇没有可合法获取的开放全文。",
+  );
+  await expect(runway).toHaveAttribute("data-status", "succeeded");
+  await expect(runway).toContainText("首问题已原位展开");
+  await expectAcceptedProposalContract(dialog);
+
+  const current = await publicCurrent(page);
+  expect(current).toMatchObject({
+    status: "proposal_ready",
+    deepfetch: {
+      status: "succeeded",
+      freshness: "current",
+      progress: { completed: 5, total: 5 },
+      run: {
+        attempt_generation: 1,
+        native_session_ref: "chrome-deepfetch-native-session",
+        execution_receipt: { status: "accepted", issuer: "agent_runtime" },
+      },
+      literature_snapshot: {
+        status: "accepted",
+        completion: "limited",
+        paper_count: 2,
+        fulltext_count: 1,
+        receipt: { status: "accepted", issuer: "research_memory" },
+      },
+    },
+  });
+  expect(current?.proposal?.literature_snapshot_ref).toBe(
+    current?.deepfetch?.literature_snapshot?.snapshot_ref,
+  );
+  expect(
+    Object.values(current?.receipts ?? {}).every(
+      (receipt) => receipt.status === "not_attempted",
+    ),
+  ).toBeTruthy();
+  expect(current).not.toHaveProperty("quest_ref");
+  expect(current).not.toHaveProperty("question_ref");
+  await expect(page.getByRole("dialog")).toHaveCount(1);
+  await expect(
+    dialog.getByRole("button", { name: "确认创建 Quest 与第一个问题" }),
+  ).toBeEnabled();
+
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 800, height: 1000 },
+    { width: 1440, height: 1000 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expect(runway).toBeVisible();
+    await expect(session).toBeVisible();
+    const geometry = await page.evaluate(() => ({
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    }));
+    expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
+  }
 });
 
 async function publicCurrent(page: Page) {
@@ -947,7 +1075,7 @@ test("real Chrome traverses the corrected durable state machine and a second cre
   ).toBeVisible();
   await literature.selectOption("oa_then_institution");
   await expect(literature).toHaveValue("oa_then_institution");
-  await expect(dialog.getByRole("button", { name: "先运行 DeepFetch" })).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "先运行 DeepFetch" })).toBeEnabled();
   await expect(dialog.getByRole("button", { name: "直接根据目标生成" })).toBeEnabled();
 
   await dialog.getByRole("button", { name: "检测本机计算卡" }).click();

@@ -44,6 +44,7 @@ class ProposalDraftRequest:
     draft_hash: str
     draft: dict[str, object]
     job_ref: str | None = None
+    literature_snapshot: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -595,6 +596,14 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             finish_job(job_ref)
 
     def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+        literature_instruction = (
+            "\nDeepFetch 未运行；不得声称已执行检索。"
+            if request.literature_snapshot is None
+            else "\nDeepFetch LiteratureSnapshot="
+            + _canonical_json(request.literature_snapshot)
+            + "\n必须保留 Snapshot 中的限制、缺全文和诚实空结果，不得把执行完成"
+            "冒充 Evidence acceptance。"
+        )
         prompt = (
             "你是 meta-research 的 Proposal Drafter。只基于给定的 Quest 草稿，"
             "生成一个可编辑的 QuestionProposal。不得声称已创建 Quest、Question、"
@@ -604,6 +613,7 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             f"draft_revision={request.draft_revision}\n"
             f"draft_hash={request.draft_hash}\n"
             f"draft={_canonical_json(request.draft)}"
+            f"{literature_instruction}"
         )
         raw, _thread_id = self._invoke(
             prompt,

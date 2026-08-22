@@ -424,7 +424,7 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert version == ("0006_research_asset_recovery",)
+    assert version == ("0007_first_question_deepfetch",)
     assert "formal_content_count" in columns
     assert "hc_quest_initializations" in tables
     assert "hc_proposal_generation_attempts" in tables
@@ -491,7 +491,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0006_research_asset_recovery",)
+        ).fetchone() == ("0007_first_question_deepfetch",)
 
 
 def test_process_exit_mid_0003_ddl_recovers_on_the_next_upgrade(
@@ -551,7 +551,7 @@ upgrade_database(Path(sys.argv[1]))
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0006_research_asset_recovery",)
+        ).fetchone() == ("0007_first_question_deepfetch",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -673,7 +673,7 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 ("d" * 64,),
             )
 
-    assert version == ("0006_research_asset_recovery",)
+    assert version == ("0007_first_question_deepfetch",)
     assert feed == ("legacy.event", '{"kept":true}', 17.0)
     assert auth == ("a" * 64, "b" * 64, 18.0, 1800.0, None)
     assert initialization == (
@@ -765,7 +765,7 @@ def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0006_research_asset_recovery",)
+        ).fetchone() == ("0007_first_question_deepfetch",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -824,7 +824,7 @@ def test_interrupted_0005_rolls_back_and_converges_on_retry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0006_research_asset_recovery",)
+        ).fetchone() == ("0007_first_question_deepfetch",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -900,7 +900,7 @@ def test_0005_backfills_existing_rm_contents_without_changing_identity_or_receip
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0006_research_asset_recovery",)
+        ).fetchone() == ("0007_first_question_deepfetch",)
         original_formal = connection.execute(
             "SELECT content_ref, content_hash, object_path, receipt_ref, "
             "receipt_hash FROM rm_formal_question_contents"
@@ -1091,7 +1091,7 @@ def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0006_research_asset_recovery",)
+        ).fetchone() == ("0007_first_question_deepfetch",)
         assert connection.execute(
             "SELECT object_path, content_hash, byte_count FROM "
             "rm_managed_objects"
@@ -1363,6 +1363,105 @@ def test_0006_preserves_0005_linked_and_nonportable_asset_facts_fail_closed(
             )
     finally:
         runtime.close()
+
+
+def test_interrupted_0007_rolls_back_typed_runs_and_snapshot_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "interrupted-0007.sqlite3"
+    _upgrade_to_revision(database, "0006_research_asset_recovery")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO durable_feed (revision, event_type, payload_json, "
+            "recorded_at) VALUES (1, 'before.0007', '{}', 71.0)"
+        )
+        connection.commit()
+
+    original_create_table = Operations.create_table
+    failed_once = False
+
+    def fail_after_session_table(self, table_name, *args, **kwargs):
+        nonlocal failed_once
+        created = original_create_table(self, table_name, *args, **kwargs)
+        if table_name == "ar_deepfetch_sessions" and not failed_once:
+            failed_once = True
+            raise OSError("injected 0007 migration interruption")
+        return created
+
+    monkeypatch.setattr(Operations, "create_table", fail_after_session_table)
+    with pytest.raises(OSError, match="injected 0007 migration interruption"):
+        upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0006_research_asset_recovery",)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        ar_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(agent_runtime_state)")
+        }
+        proposal_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(hc_question_proposals)")
+        }
+        preview_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(hc_confirmation_preview_bindings)"
+            )
+        }
+        preserved = connection.execute(
+            "SELECT event_type, payload_json, recorded_at FROM durable_feed "
+            "WHERE revision = 1"
+        ).fetchone()
+    assert "hc_deepfetch_requests" not in tables
+    assert "ar_deepfetch_sessions" not in tables
+    assert "deepfetch_run_count" not in ar_columns
+    assert "literature_snapshot_ref" not in proposal_columns
+    assert "literature_snapshot_hash" not in preview_columns
+    assert preserved == ("before.0007", "{}", 71.0)
+
+    monkeypatch.setattr(Operations, "create_table", original_create_table)
+    upgrade_database(database)
+    upgrade_database(database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0007_first_question_deepfetch",)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        ar_state = connection.execute(
+            "SELECT deepfetch_run_count, deepfetch_completed_run_count, "
+            "deepfetch_attempt_count, deepfetch_session_count FROM "
+            "agent_runtime_state WHERE singleton = 'owner'"
+        ).fetchone()
+        rm_state = connection.execute(
+            "SELECT literature_snapshot_count FROM research_memory_state "
+            "WHERE singleton = 'owner'"
+        ).fetchone()
+        foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    assert {
+        "hc_deepfetch_requests",
+        "ar_deepfetch_runs",
+        "ar_deepfetch_sessions",
+        "ar_deepfetch_attempts",
+        "rm_literature_snapshots",
+    }.issubset(tables)
+    assert ar_state == (0, 0, 0, 0)
+    assert rm_state == (0,)
+    assert foreign_key_failures == []
+    assert integrity == ("ok",)
 
 
 def test_0003_workflow_tables_enforce_lineage_and_paired_state(

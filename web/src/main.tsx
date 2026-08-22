@@ -231,7 +231,7 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
           <span aria-hidden="true">✓</span>
           <div>
             <b>本地研究空间已就绪</b>
-            <small>0 Quest · 0 Question · direct {snapshot.quest_creation.status}</small>
+            <small>0 Quest · 0 Question · direct / DeepFetch {snapshot.quest_creation.status}</small>
           </div>
         </div>
       </>

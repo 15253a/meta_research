@@ -12,6 +12,11 @@ import uvicorn
 
 import meta_research.web as web_module
 from meta_research.composition import build_production_runtime
+from meta_research.deepfetch import (
+    DeepFetchProviderRequest,
+    DeepFetchResult,
+    DeepFetchRuntimeBinding,
+)
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
     DraftingUnavailable,
@@ -58,8 +63,13 @@ class DeterministicDraftingAdapter:
         # Keep the durable queued/running state observable across a real browser
         # close/reopen without exposing a test-only HTTP control surface.
         time.sleep(2.0)
+        content = dict(QUESTION)
+        if request.literature_snapshot is not None:
+            content["background_context"] = (
+                "DeepFetch 已核查两篇论文；一篇没有可合法获取的开放全文。"
+            )
         return ProposalDraftResult(
-            content=QUESTION,
+            content=content,
             adapter_kind="chrome_deterministic",
         )
 
@@ -108,6 +118,56 @@ class SequencedHostProbe:
                 ),
             ),
             adapter_kind="chrome_controlled_probe",
+        )
+
+
+class DeterministicDeepFetchProvider:
+    """A real asynchronous provider seam with deterministic Web Research output."""
+
+    def runtime_binding(self) -> DeepFetchRuntimeBinding:
+        return DeepFetchRuntimeBinding(
+            provider_ref="chrome/deterministic-deepfetch",
+            provider_version="1",
+            model_ref="chrome-test-model",
+            harness_ref="chrome-test-harness",
+            capability_bindings=("web-search-live", "web-fetch-live"),
+        )
+
+    def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult:
+        assert request.scope["goal"]
+        assert request.authorization_receipt.issuer == "human_collaboration"
+        time.sleep(1.4)
+        return DeepFetchResult(
+            completion="limited",
+            summary="两篇可核查论文比较了低照度显微去噪。",
+            papers=(
+                {
+                    "title": "Self-supervised microscopy denoising",
+                    "url": "https://example.org/papers/one",
+                    "doi": "10.1000/chrome.one",
+                    "source_kind": "publisher",
+                    "fulltext_status": "accepted",
+                    "retrieved_at": "2026-08-22T00:00:00Z",
+                },
+                {
+                    "title": "Rare morphology under low light",
+                    "url": "https://example.org/papers/two",
+                    "doi": None,
+                    "source_kind": "publisher",
+                    "fulltext_status": "unavailable",
+                    "retrieved_at": "2026-08-22T00:00:01Z",
+                },
+            ),
+            fulltexts=(
+                {
+                    "paper_url": "https://example.org/papers/one",
+                    "media_type": "text/plain",
+                    "content": "Deterministic accepted open full text.",
+                },
+            ),
+            limitations=("第二篇论文没有可合法获取的开放全文。",),
+            native_session_ref="chrome-deepfetch-native-session",
+            adapter_kind="chrome_deterministic_deepfetch",
         )
 
 
@@ -233,6 +293,7 @@ async def serve(
         proposal_drafter=adapter,
         intent_drafting_provider=adapter,
         host_compute_probe=SequencedHostProbe(intent_started),
+        deepfetch_provider=DeterministicDeepFetchProvider(),
     )
     human_collaboration = runtime.owners.human_collaboration
     human_collaboration._research_graph = TransientResearchGraph(  # noqa: SLF001

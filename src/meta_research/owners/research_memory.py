@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import text
 
 from meta_research.database import Database
+from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import IdeaContractError, validate_idea_content
 from meta_research.owners._sqlite_snapshot import (
@@ -41,7 +42,11 @@ from meta_research.owners.common import (
     decoded_object,
     new_ref,
 )
-from meta_research.owners.agent_runtime import ATTEMPT_EXECUTION_SCHEMA
+from meta_research.owners.agent_runtime import (
+    ATTEMPT_EXECUTION_SCHEMA,
+    DEEPFETCH_EXECUTION_RECEIPT_KIND,
+    DeepFetchRun,
+)
 from meta_research.owners.research_graph import AcceptedQuest
 
 
@@ -50,6 +55,7 @@ ASSET_MANIFEST_SCHEMA = "meta-research/asset-manifest/v1"
 RM_OWNER = "research_memory"
 CONTENT_RECEIPT_KIND = "question_content_acceptance"
 IDEA_CONTENT_RECEIPT_KIND = "idea_outcome_content_acceptance"
+LITERATURE_SNAPSHOT_RECEIPT_KIND = "literature_snapshot_acceptance"
 ASSET_RECEIPT_KIND = "asset_acceptance"
 ASSET_CUSTODY_ESTABLISHED_RECEIPT_KIND = "asset_custody_established"
 ASSET_CUSTODY_LOCATOR_MIGRATED_RECEIPT_KIND = (
@@ -371,6 +377,56 @@ class AcceptedIdeaOutcomeContent:
     receipt: AcceptanceReceipt
 
 
+@dataclass(frozen=True)
+class AcceptedLiteratureSnapshot:
+    snapshot_ref: str
+    request_ref: str
+    initialization_id: str
+    draft_revision: int
+    draft_hash: str
+    scope_hash: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    result_hash: str
+    completion: str
+    summary_ref: str
+    summary_hash: str
+    papers_ref: str
+    papers_hash: str
+    fulltexts_ref: str
+    fulltexts_hash: str
+    limitations: tuple[str, ...]
+    snapshot_hash: str
+    paper_count: int
+    fulltext_count: int
+    execution_receipt: AcceptanceReceipt
+    receipt: AcceptanceReceipt
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "status": "accepted",
+            "snapshot_ref": self.snapshot_ref,
+            "request_ref": self.request_ref,
+            "initialization_id": self.initialization_id,
+            "draft_revision": self.draft_revision,
+            "draft_hash": self.draft_hash,
+            "scope_hash": self.scope_hash,
+            "completion": self.completion,
+            "summary_ref": self.summary_ref,
+            "summary_hash": self.summary_hash,
+            "papers_ref": self.papers_ref,
+            "papers_hash": self.papers_hash,
+            "fulltexts_ref": self.fulltexts_ref,
+            "fulltexts_hash": self.fulltexts_hash,
+            "limitations": list(self.limitations),
+            "snapshot_hash": self.snapshot_hash,
+            "paper_count": self.paper_count,
+            "fulltext_count": self.fulltext_count,
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+
 class ResearchMemoryInterface(Protocol):
     """Whole public Interface for immutable content identity and custody."""
 
@@ -565,12 +621,39 @@ class ResearchMemoryInterface(Protocol):
 
     def verify_idea_content_receipt(self, **values) -> None: ...
 
+    def accept_literature_snapshot(
+        self,
+        request: DeepFetchRunRequest,
+        run: DeepFetchRun,
+    ) -> AcceptedLiteratureSnapshot: ...
+
+    def query_literature_snapshot(
+        self, snapshot_ref: str
+    ) -> AcceptedLiteratureSnapshot | None: ...
+
+    def query_literature_snapshot_for_request(
+        self, request_ref: str
+    ) -> AcceptedLiteratureSnapshot | None: ...
+
+    def verify_literature_snapshot_binding(
+        self,
+        *,
+        snapshot_ref: str,
+        snapshot_hash: str,
+        initialization_id: str,
+        draft_revision: int,
+        draft_hash: str,
+    ) -> None: ...
+
+    def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]: ...
+
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=RM_OWNER,
     statement=text(
         "SELECT revision, asset_count, object_count, formal_content_count, "
-        "idea_content_count, asset_version_count, pending_intake_count, hold_count "
+        "idea_content_count, asset_version_count, pending_intake_count, hold_count, "
+        "literature_snapshot_count "
         "FROM research_memory_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -581,6 +664,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "asset_version_count",
         "pending_intake_count",
         "hold_count",
+        "literature_snapshot_count",
     ),
 )
 
@@ -3915,6 +3999,404 @@ class SQLiteResearchMemory:
     def verify_idea_content_receipt(self, **values) -> None:
         self._receipt_verifier.verify_idea_content_receipt(**values)
 
+    def accept_literature_snapshot(
+        self,
+        request: DeepFetchRunRequest,
+        run: DeepFetchRun,
+    ) -> AcceptedLiteratureSnapshot:
+        if (
+            run.status != "executed"
+            or run.request_ref != request.request_ref
+            or run.correlation_ref != request.correlation_ref
+            or run.attempt_ref is None
+            or run.fence_ref is None
+            or run.result is None
+            or run.result_hash is None
+            or run.execution_receipt is None
+        ):
+            raise OwnerConflict("deepfetch_execution_incomplete")
+        result = _validated_literature_result(request, run)
+        if self._execution_verifier is None:
+            raise OwnerConflict("deepfetch_execution_verifier_unavailable")
+        self._execution_verifier.verify_deepfetch_execution_receipt(
+            request_ref=request.request_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            result_hash=run.result_hash,
+            receipt=run.execution_receipt,
+        )
+        existing = self.query_literature_snapshot_for_request(request.request_ref)
+        if existing is not None:
+            if (
+                existing.result_hash != run.result_hash
+                or existing.run_ref != run.run_ref
+                or existing.attempt_ref != run.attempt_ref
+                or existing.fence_ref != run.fence_ref
+            ):
+                raise OwnerConflict("literature_snapshot_identity_conflict")
+            return existing
+
+        summary_document = {
+            "schema_ref": "meta-research/literature-summary/v1",
+            "request_ref": request.request_ref,
+            "summary": result["summary"],
+        }
+        papers_document = {
+            "schema_ref": "meta-research/papers-ledger/v1",
+            "request_ref": request.request_ref,
+            "papers": result["papers"],
+        }
+        fulltexts_document = {
+            "schema_ref": "meta-research/fulltext-collection/v1",
+            "request_ref": request.request_ref,
+            "fulltexts": result["fulltexts"],
+        }
+        summary_hash = canonical_hash(summary_document)
+        papers_hash = canonical_hash(papers_document)
+        fulltexts_hash = canonical_hash(fulltexts_document)
+        summary_ref = f"literature_summary_{summary_hash[:32]}"
+        papers_ref = f"papers_ledger_{papers_hash[:32]}"
+        fulltexts_ref = f"fulltexts_{fulltexts_hash[:32]}"
+        summary_path = self._store_literature_object(
+            "summary", summary_hash, canonical_json(summary_document)
+        )
+        papers_path = self._store_literature_object(
+            "papers", papers_hash, canonical_json(papers_document)
+        )
+        fulltexts_path = self._store_literature_object(
+            "fulltexts", fulltexts_hash, canonical_json(fulltexts_document)
+        )
+        limitations = tuple(result["limitations"])
+        limitations_json = canonical_json(list(limitations))
+        limitations_hash = canonical_hash(list(limitations))
+        snapshot_ref = new_ref("literature_snapshot")
+        snapshot_binding = {
+            "schema_ref": "meta-research/literature-snapshot/v1",
+            "snapshot_ref": snapshot_ref,
+            "request_ref": request.request_ref,
+            "initialization_id": request.initialization_id,
+            "draft_revision": request.draft_revision,
+            "draft_hash": request.draft_hash,
+            "scope_hash": request.scope_hash,
+            "run_ref": run.run_ref,
+            "attempt_ref": run.attempt_ref,
+            "fence_ref": run.fence_ref,
+            "result_hash": run.result_hash,
+            "completion": result["completion"],
+            "summary_ref": summary_ref,
+            "summary_hash": summary_hash,
+            "papers_ref": papers_ref,
+            "papers_hash": papers_hash,
+            "fulltexts_ref": fulltexts_ref,
+            "fulltexts_hash": fulltexts_hash,
+            "limitations_hash": limitations_hash,
+        }
+        snapshot_hash = canonical_hash(snapshot_binding)
+        receipt_ref = new_ref("rm_receipt")
+        receipt_hash = _literature_snapshot_receipt_hash(
+            snapshot_ref=snapshot_ref,
+            snapshot_hash=snapshot_hash,
+            request_ref=request.request_ref,
+            result_hash=run.result_hash,
+            execution_receipt=run.execution_receipt,
+        )
+        now = time.time()
+        with self._database.write() as connection:
+            existing_row = connection.execute(
+                text(
+                    "SELECT * FROM rm_literature_snapshots WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request.request_ref},
+            ).first()
+            if existing_row is None:
+                connection.execute(
+                    text(
+                        "INSERT INTO rm_literature_snapshots (snapshot_ref, "
+                        "request_ref, initialization_id, draft_revision, draft_hash, "
+                        "scope_hash, run_ref, attempt_ref, fence_ref, result_hash, "
+                        "execution_receipt_ref, execution_receipt_hash, completion, "
+                        "summary_ref, summary_hash, summary_object_path, papers_ref, "
+                        "papers_hash, papers_object_path, fulltexts_ref, fulltexts_hash, "
+                        "fulltexts_object_path, limitations_json, limitations_hash, "
+                        "snapshot_hash, receipt_ref, receipt_hash, accepted_at) VALUES "
+                        "(:snapshot_ref, :request_ref, :initialization_id, "
+                        ":draft_revision, :draft_hash, :scope_hash, :run_ref, "
+                        ":attempt_ref, :fence_ref, :result_hash, "
+                        ":execution_receipt_ref, :execution_receipt_hash, :completion, "
+                        ":summary_ref, :summary_hash, :summary_object_path, :papers_ref, "
+                        ":papers_hash, :papers_object_path, :fulltexts_ref, "
+                        ":fulltexts_hash, :fulltexts_object_path, :limitations_json, "
+                        ":limitations_hash, :snapshot_hash, :receipt_ref, :receipt_hash, "
+                        ":accepted_at)"
+                    ),
+                    {
+                        **snapshot_binding,
+                        "execution_receipt_ref": run.execution_receipt.receipt_ref,
+                        "execution_receipt_hash": run.execution_receipt.payload_hash,
+                        "summary_object_path": summary_path,
+                        "papers_object_path": papers_path,
+                        "fulltexts_object_path": fulltexts_path,
+                        "limitations_json": limitations_json,
+                        "snapshot_hash": snapshot_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "accepted_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE research_memory_state SET revision = revision + 1, "
+                        "object_count = object_count + 3, literature_snapshot_count = "
+                        "literature_snapshot_count + 1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "research_memory.literature_snapshot_accepted",
+                    {
+                        "snapshot_ref": snapshot_ref,
+                        "request_ref": request.request_ref,
+                        "snapshot_hash": snapshot_hash,
+                        "completion": result["completion"],
+                    },
+                )
+            else:
+                snapshot_ref = str(existing_row.snapshot_ref)
+        accepted = self.query_literature_snapshot(snapshot_ref)
+        if accepted is None:
+            raise OwnerConflict("literature_snapshot_not_found")
+        return accepted
+
+    def query_literature_snapshot(
+        self, snapshot_ref: str
+    ) -> AcceptedLiteratureSnapshot | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_literature_snapshots WHERE "
+                    "snapshot_ref = :snapshot_ref"
+                ),
+                {"snapshot_ref": snapshot_ref},
+            ).first()
+        return None if row is None else self._accepted_literature_snapshot(row)
+
+    def query_literature_snapshot_for_request(
+        self, request_ref: str
+    ) -> AcceptedLiteratureSnapshot | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_literature_snapshots WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        return None if row is None else self._accepted_literature_snapshot(row)
+
+    def verify_literature_snapshot_binding(
+        self,
+        *,
+        snapshot_ref: str,
+        snapshot_hash: str,
+        initialization_id: str,
+        draft_revision: int,
+        draft_hash: str,
+    ) -> None:
+        snapshot = self.query_literature_snapshot(snapshot_ref)
+        if snapshot is None or (
+            snapshot.snapshot_hash != snapshot_hash
+            or snapshot.initialization_id != initialization_id
+            or snapshot.draft_revision != draft_revision
+            or snapshot.draft_hash != draft_hash
+        ):
+            raise OwnerConflict("literature_snapshot_binding_invalid")
+
+    def _accepted_literature_snapshot(self, row) -> AcceptedLiteratureSnapshot:
+        summary_document = self._read_literature_object(
+            row.summary_object_path, row.summary_hash
+        )
+        papers_document = self._read_literature_object(
+            row.papers_object_path, row.papers_hash
+        )
+        fulltexts_document = self._read_literature_object(
+            row.fulltexts_object_path, row.fulltexts_hash
+        )
+        try:
+            limitations = json.loads(row.limitations_json)
+        except json.JSONDecodeError as error:
+            raise OwnerConflict("literature_snapshot_invalid") from error
+        if (
+            not isinstance(limitations, list)
+            or any(not isinstance(value, str) for value in limitations)
+            or canonical_json(limitations) != row.limitations_json
+            or canonical_hash(limitations) != row.limitations_hash
+            or summary_document.get("request_ref") != row.request_ref
+            or papers_document.get("request_ref") != row.request_ref
+            or fulltexts_document.get("request_ref") != row.request_ref
+            or not isinstance(papers_document.get("papers"), list)
+            or not isinstance(fulltexts_document.get("fulltexts"), list)
+        ):
+            raise OwnerConflict("literature_snapshot_invalid")
+        snapshot_binding = {
+            "schema_ref": "meta-research/literature-snapshot/v1",
+            "snapshot_ref": row.snapshot_ref,
+            "request_ref": row.request_ref,
+            "initialization_id": row.initialization_id,
+            "draft_revision": int(row.draft_revision),
+            "draft_hash": row.draft_hash,
+            "scope_hash": row.scope_hash,
+            "run_ref": row.run_ref,
+            "attempt_ref": row.attempt_ref,
+            "fence_ref": row.fence_ref,
+            "result_hash": row.result_hash,
+            "completion": row.completion,
+            "summary_ref": row.summary_ref,
+            "summary_hash": row.summary_hash,
+            "papers_ref": row.papers_ref,
+            "papers_hash": row.papers_hash,
+            "fulltexts_ref": row.fulltexts_ref,
+            "fulltexts_hash": row.fulltexts_hash,
+            "limitations_hash": row.limitations_hash,
+        }
+        execution_receipt = AcceptanceReceipt(
+            issuer="agent_runtime",
+            kind=DEEPFETCH_EXECUTION_RECEIPT_KIND,
+            receipt_ref=row.execution_receipt_ref,
+            subject_ref=row.run_ref,
+            payload_hash=row.execution_receipt_hash,
+        )
+        receipt = AcceptanceReceipt(
+            issuer=RM_OWNER,
+            kind=LITERATURE_SNAPSHOT_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.snapshot_ref,
+            payload_hash=row.receipt_hash,
+        )
+        if (
+            canonical_hash(snapshot_binding) != row.snapshot_hash
+            or row.receipt_hash
+            != _literature_snapshot_receipt_hash(
+                snapshot_ref=row.snapshot_ref,
+                snapshot_hash=row.snapshot_hash,
+                request_ref=row.request_ref,
+                result_hash=row.result_hash,
+                execution_receipt=execution_receipt,
+            )
+        ):
+            raise OwnerConflict("literature_snapshot_invalid")
+        if self._execution_verifier is not None:
+            self._execution_verifier.verify_deepfetch_execution_receipt(
+                request_ref=row.request_ref,
+                run_ref=row.run_ref,
+                attempt_ref=row.attempt_ref,
+                fence_ref=row.fence_ref,
+                result_hash=row.result_hash,
+                receipt=execution_receipt,
+            )
+        return AcceptedLiteratureSnapshot(
+            snapshot_ref=row.snapshot_ref,
+            request_ref=row.request_ref,
+            initialization_id=row.initialization_id,
+            draft_revision=int(row.draft_revision),
+            draft_hash=row.draft_hash,
+            scope_hash=row.scope_hash,
+            run_ref=row.run_ref,
+            attempt_ref=row.attempt_ref,
+            fence_ref=row.fence_ref,
+            result_hash=row.result_hash,
+            completion=row.completion,
+            summary_ref=row.summary_ref,
+            summary_hash=row.summary_hash,
+            papers_ref=row.papers_ref,
+            papers_hash=row.papers_hash,
+            fulltexts_ref=row.fulltexts_ref,
+            fulltexts_hash=row.fulltexts_hash,
+            limitations=tuple(limitations),
+            snapshot_hash=row.snapshot_hash,
+            paper_count=len(papers_document["papers"]),
+            fulltext_count=len(fulltexts_document["fulltexts"]),
+            execution_receipt=execution_receipt,
+            receipt=receipt,
+        )
+
+    def read_literature_snapshot(self, snapshot_ref: str) -> dict[str, object]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_literature_snapshots WHERE "
+                    "snapshot_ref = :snapshot_ref"
+                ),
+                {"snapshot_ref": snapshot_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("literature_snapshot_not_found")
+        accepted = self._accepted_literature_snapshot(row)
+        summary = self._read_literature_object(
+            row.summary_object_path, row.summary_hash
+        )["summary"]
+        papers = self._read_literature_object(
+            row.papers_object_path, row.papers_hash
+        )["papers"]
+        fulltexts = self._read_literature_object(
+            row.fulltexts_object_path, row.fulltexts_hash
+        )["fulltexts"]
+        return {
+            **accepted.as_public_dict(),
+            "summary": summary,
+            "papers": papers,
+            "fulltexts": fulltexts,
+        }
+
+    def _store_literature_object(
+        self, kind: str, content_hash: str, content_json: str
+    ) -> str:
+        directory = self._object_store / "literature-snapshot" / kind / content_hash[:2]
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = directory / f"{content_hash}.json"
+        expected_bytes = content_json.encode("utf-8")
+        if destination.is_file():
+            if destination.read_bytes() != expected_bytes:
+                raise OwnerConflict("literature_snapshot_custody_conflict")
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{content_hash}.", dir=directory
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(expected_bytes)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary.chmod(0o600)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        directory_descriptor = os.open(
+            directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        return str(destination.relative_to(self._object_store))
+
+    def _read_literature_object(
+        self, object_path: str, expected_hash: str
+    ) -> dict[str, object]:
+        expected_root = (self._object_store / "literature-snapshot").resolve()
+        candidate = (self._object_store / object_path).resolve()
+        if not candidate.is_relative_to(expected_root) or not candidate.is_file():
+            raise OwnerConflict("literature_snapshot_custody_unavailable")
+        try:
+            decoded = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise OwnerConflict("literature_snapshot_custody_unavailable") from error
+        if not isinstance(decoded, dict) or canonical_hash(decoded) != expected_hash:
+            raise OwnerConflict("literature_snapshot_custody_unavailable")
+        return decoded
+
     def _store_content(self, content_hash: str, content_json: str) -> str:
         directory = self._object_store / "formal-question-content" / content_hash[:2]
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -3976,6 +4458,103 @@ class SQLiteResearchMemory:
         finally:
             os.close(directory_descriptor)
         return str(destination.relative_to(self._object_store))
+
+
+def _validated_literature_result(
+    request: DeepFetchRunRequest,
+    run: DeepFetchRun,
+) -> dict[str, object]:
+    result = run.result
+    if result is None or run.result_hash is None:
+        raise OwnerConflict("deepfetch_execution_incomplete")
+    expected_fields = {
+        "schema_ref",
+        "request_ref",
+        "initialization_id",
+        "correlation_ref",
+        "draft_revision",
+        "draft_hash",
+        "scope_hash",
+        "completion",
+        "summary",
+        "papers",
+        "fulltexts",
+        "limitations",
+        "native_session_ref",
+        "adapter_kind",
+    }
+    if (
+        set(result) != expected_fields
+        or result.get("schema_ref")
+        != "meta-research/first-question-deepfetch-result/v1"
+        or result.get("request_ref") != request.request_ref
+        or result.get("initialization_id") != request.initialization_id
+        or result.get("correlation_ref") != request.correlation_ref
+        or result.get("draft_revision") != request.draft_revision
+        or result.get("draft_hash") != request.draft_hash
+        or result.get("scope_hash") != request.scope_hash
+        or result.get("completion") not in {"complete", "limited", "honest_empty"}
+        or not isinstance(result.get("summary"), str)
+        or not isinstance(result.get("papers"), list)
+        or not isinstance(result.get("fulltexts"), list)
+        or not isinstance(result.get("limitations"), list)
+        or any(not isinstance(value, str) for value in result["limitations"])
+        or canonical_hash(result) != run.result_hash
+    ):
+        raise OwnerConflict("literature_snapshot_payload_invalid")
+    paper_fields = {
+        "title",
+        "url",
+        "doi",
+        "source_kind",
+        "fulltext_status",
+        "retrieved_at",
+    }
+    fulltext_fields = {"paper_url", "media_type", "content", "content_hash"}
+    papers = result["papers"]
+    fulltexts = result["fulltexts"]
+    if any(
+        not isinstance(value, dict) or set(value) != paper_fields
+        for value in papers
+    ) or any(
+        not isinstance(value, dict) or set(value) != fulltext_fields
+        for value in fulltexts
+    ):
+        raise OwnerConflict("literature_snapshot_payload_invalid")
+    for value in fulltexts:
+        assert isinstance(value, dict)
+        if value.get("content_hash") != canonical_hash(
+            {
+                "media_type": value.get("media_type"),
+                "content": value.get("content"),
+            }
+        ):
+            raise OwnerConflict("literature_snapshot_payload_invalid")
+    return result
+
+
+def _literature_snapshot_receipt_hash(
+    *,
+    snapshot_ref: str,
+    snapshot_hash: str,
+    request_ref: str,
+    result_hash: str,
+    execution_receipt: AcceptanceReceipt,
+) -> str:
+    return canonical_hash(
+        {
+            "schema_ref": RECEIPT_SCHEMA,
+            "issuer": RM_OWNER,
+            "kind": LITERATURE_SNAPSHOT_RECEIPT_KIND,
+            "subject_ref": snapshot_ref,
+            "bindings": {
+                "snapshot_hash": snapshot_hash,
+                "request_ref": request_ref,
+                "result_hash": result_hash,
+                "execution_receipt": execution_receipt.as_public_dict(),
+            },
+        }
+    )
 
 
 def _asset_request_document(request: AssetIntakeRequest) -> dict[str, object]:

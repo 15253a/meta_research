@@ -4,7 +4,9 @@ from dataclasses import dataclass
 
 from meta_research.auth import Authentication
 from meta_research.database import Database
+from meta_research.deepfetch import CodexDeepFetchAdapter, DeepFetchProvider
 from meta_research.feed import DurableFeed
+from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillProvider
 from meta_research.idea_stage import IdeaStageWorker
 from meta_research.migration import upgrade_database
@@ -22,6 +24,7 @@ from meta_research.owners.agent_runtime import (
 from meta_research.owners.human_collaboration import (
     HumanCollaborationInterface,
     create_bundle_confirmation_verifier,
+    create_deepfetch_request_verifier,
     create_human_collaboration_interface,
 )
 from meta_research.owners.research_graph import (
@@ -62,6 +65,7 @@ class ProductionRuntime:
     feed: DurableFeed
     projection: PublicProjection
     idea_stage: IdeaStageWorker
+    deepfetch: FirstQuestionDeepFetchWorker
     _database: Database
     _provider_lifecycles: tuple[object, ...] = ()
     _stop_requested: bool = False
@@ -89,6 +93,7 @@ def build_production_runtime(
     intent_drafting_provider: IntentDraftingProvider | None = None,
     host_compute_probe: HostComputeProbe | None = None,
     idea_skill_provider: IdeaSkillProvider | None = None,
+    deepfetch_provider: DeepFetchProvider | None = None,
 ) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
@@ -107,12 +112,16 @@ def build_production_runtime(
     idea_skill_provider = idea_skill_provider or CodexIdeaSkillAdapter(
         data_root.root / "idea-skill-provider"
     )
+    deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
+        data_root.root / "deepfetch-provider"
+    )
 
     host_compute_reader = create_host_compute_observation_reader(database)
     confirmation_verifier = create_bundle_confirmation_verifier(
         database, host_compute_reader
     )
     stage_request_receipts = create_advancement_engine_receipt_verifier(database)
+    deepfetch_request_receipts = create_deepfetch_request_verifier(database)
     attempt_receipts = create_agent_runtime_receipt_verifier(
         database, stage_request_receipts
     )
@@ -134,6 +143,7 @@ def build_production_runtime(
         host_compute_probe,
         stage_request_receipts,
         research_graph_receipts,
+        deepfetch_request_receipts,
     )
     research_graph = create_research_graph_interface(
         database,
@@ -156,6 +166,7 @@ def build_production_runtime(
         attempt_receipts,
         research_graph,
     )
+    confirmation_verifier.bind_literature_snapshot_verifier(research_memory)
     advancement_engine = create_advancement_engine_interface(
         database,
         feed,
@@ -166,21 +177,22 @@ def build_production_runtime(
         attempt_receipts,
         research_graph_receipts,
     )
+    human_collaboration = create_human_collaboration_interface(
+        database,
+        feed,
+        research_graph,
+        research_memory,
+        advancement_engine,
+        agent_runtime,
+        proposal_drafter,
+        intent_drafting_provider,
+    )
     owners = OwnerInterfaces(
         research_graph=research_graph,
         advancement_engine=advancement_engine,
         research_memory=research_memory,
         agent_runtime=agent_runtime,
-        human_collaboration=create_human_collaboration_interface(
-            database,
-            feed,
-            research_graph,
-            research_memory,
-            advancement_engine,
-            agent_runtime,
-            proposal_drafter,
-            intent_drafting_provider,
-        ),
+        human_collaboration=human_collaboration,
     )
     idea_stage = IdeaStageWorker(
         feed,
@@ -189,6 +201,12 @@ def build_production_runtime(
         owners.research_memory,
         owners.research_graph,
         idea_skill_provider,
+    )
+    deepfetch = FirstQuestionDeepFetchWorker(
+        human_collaboration,
+        agent_runtime,
+        research_memory,
+        deepfetch_provider,
     )
     projection = PublicProjection(
         feed,
@@ -205,6 +223,7 @@ def build_production_runtime(
         proposal_drafter,
         intent_drafting_provider,
         idea_skill_provider,
+        deepfetch_provider,
     ):
         if callable(getattr(provider, "request_stop", None)) and not any(
             provider is lifecycle for lifecycle in provider_lifecycles
@@ -217,6 +236,7 @@ def build_production_runtime(
         feed=feed,
         projection=projection,
         idea_stage=idea_stage,
+        deepfetch=deepfetch,
         _database=database,
         _provider_lifecycles=tuple(provider_lifecycles),
     )

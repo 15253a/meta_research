@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, Row
 
 from meta_research.database import Database
+from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
@@ -19,11 +20,13 @@ from meta_research.owners._sqlite_snapshot import (
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime import (
     AgentRuntimeInterface,
+    DeepFetchRun,
     HostComputeObservation,
 )
 from meta_research.owners.common import (
     AcceptedAssetBinding,
     AcceptanceReceipt,
+    LiteratureSnapshotVerifier,
     OwnerConflict,
     OwnerSnapshot,
     QUESTION_PROPOSAL_SCHEMA,
@@ -33,7 +36,10 @@ from meta_research.owners.common import (
     new_ref,
 )
 from meta_research.owners.research_graph import ResearchGraphInterface
-from meta_research.owners.research_memory import ResearchMemoryInterface
+from meta_research.owners.research_memory import (
+    AcceptedLiteratureSnapshot,
+    ResearchMemoryInterface,
+)
 from meta_research.quest_drafting import (
     DraftingUnavailable,
     INTENT_MESSAGE_MAX_LENGTH,
@@ -59,6 +65,7 @@ RESOURCE_ENVELOPE_SCHEMA = "meta-research/quest-resource-envelope/v1"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 HC_OWNER = "human_collaboration"
 CONFIRMATION_RECEIPT_KIND = "quest_bundle_confirmation"
+DEEPFETCH_REQUEST_RECEIPT_KIND = "deepfetch_run_request"
 _DRAFTING_CLAIM_LEASE_SECONDS = 5 * 60
 _COMPLETED_CUSTODY_AUDIT_SECONDS = 60
 _PREVIEW_REFRESH_RETRY_SECONDS = 60.0
@@ -165,6 +172,26 @@ class HumanCollaborationInterface(Protocol):
 
     def process_drafting_once(self) -> bool: ...
 
+    def query_next_deepfetch_request(self) -> DeepFetchRunRequest | None: ...
+
+    def query_deepfetch_request(
+        self, request_ref: str
+    ) -> DeepFetchRunRequest | None: ...
+
+    def record_deepfetch_succeeded(
+        self,
+        request_ref: str,
+        run_ref: str,
+        snapshot: AcceptedLiteratureSnapshot,
+    ) -> None: ...
+
+    def record_deepfetch_failed(
+        self,
+        request_ref: str,
+        failure_code: str,
+        run_ref: str | None = None,
+    ) -> None: ...
+
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=HC_OWNER,
@@ -176,6 +203,56 @@ _SNAPSHOT = OwnerSnapshotQuery(
 )
 
 
+class SQLiteDeepFetchRunRequestVerifier:
+    """HC-owned narrow verifier for pre-Quest DeepFetch authority."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def verify_deepfetch_run_request(
+        self,
+        *,
+        request_ref: str,
+        initialization_id: str,
+        correlation_ref: str,
+        draft_revision: int,
+        draft_hash: str,
+        scope_hash: str,
+        resource_envelope_ref: str,
+        resource_envelope_hash: str,
+        result_route: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != HC_OWNER
+            or receipt.kind != DEEPFETCH_REQUEST_RECEIPT_KIND
+            or receipt.subject_ref != request_ref
+        ):
+            raise OwnerConflict("deepfetch_request_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None or (
+            row.initialization_id != initialization_id
+            or row.correlation_ref != correlation_ref
+            or int(row.draft_revision) != draft_revision
+            or row.draft_hash != draft_hash
+            or row.scope_hash != scope_hash
+            or row.resource_envelope_ref != resource_envelope_ref
+            or row.resource_envelope_hash != resource_envelope_hash
+            or row.result_route != result_route
+            or row.authorization_receipt_ref != receipt.receipt_ref
+            or row.authorization_hash != receipt.payload_hash
+            or row.authorization_hash != _deepfetch_request_receipt_hash(row)
+        ):
+            raise OwnerConflict("deepfetch_request_receipt_invalid")
+
+
 class SQLiteBundleConfirmationVerifier:
     """HC-owned narrow authority used by downstream receipt consumers."""
 
@@ -184,6 +261,17 @@ class SQLiteBundleConfirmationVerifier:
     ) -> None:
         self._database = database
         self._agent_runtime = agent_runtime
+        self._literature_snapshot_verifier: LiteratureSnapshotVerifier | None = None
+
+    def bind_literature_snapshot_verifier(
+        self, verifier: LiteratureSnapshotVerifier
+    ) -> None:
+        if (
+            self._literature_snapshot_verifier is not None
+            and self._literature_snapshot_verifier is not verifier
+        ):
+            raise OwnerConflict("literature_snapshot_verifier_already_bound")
+        self._literature_snapshot_verifier = verifier
 
     def verify_bundle_confirmation(
         self,
@@ -228,7 +316,11 @@ class SQLiteBundleConfirmationVerifier:
                 )
                 if row.draft_schema_ref == DRAFT_V2_SCHEMA:
                     _validate_preview_artifact_integrity(
-                        connection, row, request, self._agent_runtime
+                        connection,
+                        row,
+                        request,
+                        self._agent_runtime,
+                        self._literature_snapshot_verifier,
                     )
         if row is None or row.status not in {"confirmed", "completed"}:
             raise OwnerConflict("bundle_confirmation_receipt_invalid")
@@ -808,65 +900,140 @@ class SQLiteHumanCollaboration:
                         connection, initialization_id, draft
                     )
                 route = str(draft.get("route", "direct"))
-                if route != "direct":
-                    raise OwnerConflict("deepfetch_not_delivered")
-                active_generation = connection.execute(
-                    text(
-                        "SELECT generation_ref FROM "
-                        "hc_proposal_generation_attempts WHERE initialization_id = "
-                        ":initialization_id AND basis_revision = :basis_revision AND "
-                        "basis_hash = :basis_hash AND status IN ('queued', 'running') "
-                        "ORDER BY created_at LIMIT 1"
-                    ),
-                    {
-                        "initialization_id": initialization_id,
-                        "basis_revision": int(row.draft_revision),
-                        "basis_hash": row.draft_hash,
-                    },
-                ).first()
-                if active_generation is not None:
+                if route == "deepfetch":
+                    request_ref = self._queue_deepfetch_request(
+                        connection,
+                        initialization_id=initialization_id,
+                        row=row,
+                        draft=draft,
+                    )
                     self._record_command(
                         connection,
                         idempotency_key,
                         initialization_id,
                         "generate_proposal",
                         request_hash,
-                        active_generation.generation_ref,
+                        request_ref,
                     )
-                    return self.query_quest_creation(initialization_id)
-                generation_ref = new_ref("proposal_generation")
-                now = time.time()
+                else:
+                    generation_ref = self._queue_direct_proposal_generation(
+                        connection,
+                        initialization_id=initialization_id,
+                        row=row,
+                        route=route,
+                        idempotency_key=idempotency_key,
+                        request_hash=request_hash,
+                    )
+        return self.query_quest_creation(initialization_id)
+
+    def _queue_direct_proposal_generation(
+        self,
+        connection: Connection,
+        *,
+        initialization_id: str,
+        row: Row,
+        route: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> str:
+        active_generation = connection.execute(
+            text(
+                "SELECT generation_ref FROM hc_proposal_generation_attempts WHERE "
+                "initialization_id = :initialization_id AND basis_revision = "
+                ":basis_revision AND basis_hash = :basis_hash AND status IN "
+                "('queued', 'running') ORDER BY created_at LIMIT 1"
+            ),
+            {
+                "initialization_id": initialization_id,
+                "basis_revision": int(row.draft_revision),
+                "basis_hash": row.draft_hash,
+            },
+        ).first()
+        if active_generation is not None:
+            generation_ref = str(active_generation.generation_ref)
+        else:
+            generation_ref = new_ref("proposal_generation")
+            now = time.time()
+            connection.execute(
+                text(
+                    "INSERT INTO hc_proposal_generation_attempts "
+                    "(generation_ref, initialization_id, idempotency_key, request_hash, "
+                    "route, basis_revision, basis_hash, starting_proposal_revision, "
+                    "status, adapter_kind, attempt_count, created_at) VALUES "
+                    "(:generation_ref, :initialization_id, :idempotency_key, "
+                    ":request_hash, :route, :basis_revision, :basis_hash, "
+                    ":starting_proposal_revision, 'queued', :adapter_kind, 0, :now)"
+                ),
+                {
+                    "generation_ref": generation_ref,
+                    "initialization_id": initialization_id,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "route": route,
+                    "basis_revision": int(row.draft_revision),
+                    "basis_hash": row.draft_hash,
+                    "starting_proposal_revision": int(row.proposal_revision),
+                    "adapter_kind": type(self._proposal_drafter).__name__,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE human_collaboration_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "human_collaboration.question_proposal_generation_queued",
+                {
+                    "initialization_id": initialization_id,
+                    "generation_ref": generation_ref,
+                    "basis_revision": int(row.draft_revision),
+                    "basis_hash": row.draft_hash,
+                },
+            )
+        self._record_command(
+            connection,
+            idempotency_key,
+            initialization_id,
+            "generate_proposal",
+            request_hash,
+            generation_ref,
+        )
+        return generation_ref
+
+    def _queue_deepfetch_request(
+        self,
+        connection: Connection,
+        *,
+        initialization_id: str,
+        row: Row,
+        draft: dict[str, object],
+    ) -> str:
+        if draft.get("route") != "deepfetch":
+            raise OwnerConflict("deepfetch_route_required")
+        existing = connection.execute(
+            text(
+                "SELECT * FROM hc_deepfetch_requests WHERE initialization_id = "
+                ":initialization_id AND draft_revision = :draft_revision AND "
+                "draft_hash = :draft_hash"
+            ),
+            {
+                "initialization_id": initialization_id,
+                "draft_revision": int(row.draft_revision),
+                "draft_hash": row.draft_hash,
+            },
+        ).first()
+        if existing is not None:
+            if existing.status == "failed":
                 connection.execute(
                     text(
-                        "INSERT INTO hc_proposal_generation_attempts "
-                        "(generation_ref, initialization_id, idempotency_key, "
-                        "request_hash, route, basis_revision, basis_hash, "
-                        "starting_proposal_revision, status, adapter_kind, attempt_count, "
-                        "created_at) VALUES "
-                        "(:generation_ref, :initialization_id, :idempotency_key, "
-                        ":request_hash, :route, :basis_revision, :basis_hash, "
-                        ":starting_proposal_revision, 'queued', :adapter_kind, 0, :now)"
+                        "UPDATE hc_deepfetch_requests SET status = 'queued', "
+                        "failure_code = NULL, completed_at = NULL, updated_at = :now "
+                        "WHERE request_ref = :request_ref AND status = 'failed'"
                     ),
-                    {
-                        "generation_ref": generation_ref,
-                        "initialization_id": initialization_id,
-                        "idempotency_key": idempotency_key,
-                        "request_hash": request_hash,
-                        "route": route,
-                        "basis_revision": int(row.draft_revision),
-                        "basis_hash": row.draft_hash,
-                        "starting_proposal_revision": int(row.proposal_revision),
-                        "adapter_kind": type(self._proposal_drafter).__name__,
-                        "now": now,
-                    },
-                )
-                self._record_command(
-                    connection,
-                    idempotency_key,
-                    initialization_id,
-                    "generate_proposal",
-                    request_hash,
-                    generation_ref,
+                    {"request_ref": existing.request_ref, "now": time.time()},
                 )
                 connection.execute(
                     text(
@@ -876,15 +1043,110 @@ class SQLiteHumanCollaboration:
                 )
                 self._feed.record(
                     connection,
-                    "human_collaboration.question_proposal_generation_queued",
-                    {
-                        "initialization_id": initialization_id,
-                        "generation_ref": generation_ref,
-                        "basis_revision": int(row.draft_revision),
-                        "basis_hash": row.draft_hash,
-                    },
+                    "human_collaboration.deepfetch_retried",
+                    {"request_ref": existing.request_ref},
                 )
-        return self.query_quest_creation(initialization_id)
+            elif existing.status == "cancelled":
+                raise OwnerConflict("deepfetch_request_cancelled")
+            return str(existing.request_ref)
+
+        scope = _deepfetch_scope(draft)
+        scope_json = canonical_json(scope)
+        scope_hash = canonical_hash(scope)
+        material_bindings = [
+            binding.as_dict() for binding in _accepted_material_bindings(draft)
+        ]
+        material_bindings_json = canonical_json(material_bindings)
+        material_bindings_hash = canonical_hash(material_bindings)
+        envelope_ref = draft.get("resource_envelope_ref")
+        envelope_hash = draft.get("resource_envelope_hash")
+        if not isinstance(envelope_ref, str) or not isinstance(envelope_hash, str):
+            raise OwnerConflict("resource_envelope_required")
+        correlation_hash = canonical_hash(
+            {
+                "schema_ref": "meta-research/deepfetch-correlation/v1",
+                "initialization_id": initialization_id,
+                "draft_revision": int(row.draft_revision),
+                "draft_hash": row.draft_hash,
+                "scope_hash": scope_hash,
+                "material_bindings_hash": material_bindings_hash,
+                "resource_envelope_ref": envelope_ref,
+                "resource_envelope_hash": envelope_hash,
+            }
+        )
+        correlation_ref = f"deepfetch_correlation_{correlation_hash[:32]}"
+        request_ref = new_ref("deepfetch_request")
+        result_route = "same_quest_initialization_proposal"
+        receipt_ref = new_ref("hc_receipt")
+        receipt_bindings = {
+            "initialization_id": initialization_id,
+            "correlation_ref": correlation_ref,
+            "draft_revision": int(row.draft_revision),
+            "draft_hash": row.draft_hash,
+            "scope_hash": scope_hash,
+            "material_bindings_hash": material_bindings_hash,
+            "resource_envelope_ref": envelope_ref,
+            "resource_envelope_hash": envelope_hash,
+            "result_route": result_route,
+        }
+        receipt_hash = _owner_receipt_hash(
+            DEEPFETCH_REQUEST_RECEIPT_KIND,
+            request_ref,
+            receipt_bindings,
+        )
+        now = time.time()
+        connection.execute(
+            text(
+                "INSERT INTO hc_deepfetch_requests (request_ref, initialization_id, "
+                "correlation_ref, draft_revision, draft_hash, scope_json, scope_hash, "
+                "material_bindings_json, material_bindings_hash, "
+                "resource_envelope_ref, resource_envelope_hash, result_route, "
+                "authorization_receipt_ref, authorization_hash, status, created_at, "
+                "updated_at) VALUES (:request_ref, :initialization_id, "
+                ":correlation_ref, :draft_revision, :draft_hash, :scope_json, "
+                ":scope_hash, :material_bindings_json, :material_bindings_hash, "
+                ":resource_envelope_ref, :resource_envelope_hash, :result_route, "
+                ":authorization_receipt_ref, :authorization_hash, 'queued', :now, "
+                ":now)"
+            ),
+            {
+                "request_ref": request_ref,
+                "initialization_id": initialization_id,
+                "correlation_ref": correlation_ref,
+                "draft_revision": int(row.draft_revision),
+                "draft_hash": row.draft_hash,
+                "scope_json": scope_json,
+                "scope_hash": scope_hash,
+                "material_bindings_json": material_bindings_json,
+                "material_bindings_hash": material_bindings_hash,
+                "resource_envelope_ref": envelope_ref,
+                "resource_envelope_hash": envelope_hash,
+                "result_route": result_route,
+                "authorization_receipt_ref": receipt_ref,
+                "authorization_hash": receipt_hash,
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE human_collaboration_state SET revision = revision + 1 "
+                "WHERE singleton = 'owner'"
+            )
+        )
+        self._feed.record(
+            connection,
+            "human_collaboration.deepfetch_requested",
+            {
+                "request_ref": request_ref,
+                "initialization_id": initialization_id,
+                "correlation_ref": correlation_ref,
+                "draft_revision": int(row.draft_revision),
+                "draft_hash": row.draft_hash,
+                "scope_hash": scope_hash,
+                "authorization_receipt_ref": receipt_ref,
+            },
+        )
+        return request_ref
 
     def save_question_proposal(
         self,
@@ -965,6 +1227,13 @@ class SQLiteHumanCollaboration:
                     self._require_current_resource_envelope(
                         connection, initialization_id, draft
                     )
+                literature_snapshot = self._require_current_deepfetch_snapshot(
+                    connection,
+                    initialization_id,
+                    row,
+                    draft,
+                    proposal_ref=str(row.proposal_ref),
+                )
                 proposal_is_current = (
                     int(row.proposal_basis_revision) == int(row.draft_revision)
                     and row.proposal_basis_hash == row.draft_hash
@@ -991,6 +1260,11 @@ class SQLiteHumanCollaboration:
                         row.draft_hash
                         if adopt_current_basis
                         else row.proposal_basis_hash
+                    ),
+                    literature_snapshot_ref=(
+                        None
+                        if literature_snapshot is None
+                        else literature_snapshot.snapshot_ref
                     ),
                 )
                 refresh_preview = adopt_current_basis
@@ -1472,6 +1746,39 @@ class SQLiteHumanCollaboration:
                 "generation_basis_invalid",
             )
             return True
+        literature_snapshot: dict[str, object] | None = None
+        if job.route == "deepfetch":
+            if job.literature_snapshot_ref is None:
+                self._fail_proposal_job(
+                    job.generation_ref,
+                    claim_attempt,
+                    "literature_snapshot_required",
+                )
+                return True
+            try:
+                literature_snapshot = self._research_memory.read_literature_snapshot(
+                    str(job.literature_snapshot_ref)
+                )
+            except OwnerConflict as error:
+                self._fail_proposal_job(
+                    job.generation_ref,
+                    claim_attempt,
+                    error.code,
+                )
+                return True
+            if (
+                literature_snapshot.get("initialization_id")
+                != job.initialization_id
+                or literature_snapshot.get("draft_revision")
+                != int(job.basis_revision)
+                or literature_snapshot.get("draft_hash") != job.basis_hash
+            ):
+                self._fail_proposal_job(
+                    job.generation_ref,
+                    claim_attempt,
+                    "literature_snapshot_basis_invalid",
+                )
+                return True
         try:
             result = self._proposal_drafter.draft(
                 ProposalDraftRequest(
@@ -1480,6 +1787,7 @@ class SQLiteHumanCollaboration:
                     draft_hash=job.basis_hash,
                     draft=decoded_object(revision.draft_json),
                     job_ref=provider_job_ref,
+                    literature_snapshot=literature_snapshot,
                 )
             )
             content = _validate_question_content(result.content)
@@ -1587,6 +1895,7 @@ class SQLiteHumanCollaboration:
                     "generate_proposal",
                     record_command=False,
                     schema_ref=PROPOSAL_V2_SCHEMA,
+                    literature_snapshot_ref=job.literature_snapshot_ref,
                 )
                 connection.execute(
                     text(
@@ -2048,6 +2357,13 @@ class SQLiteHumanCollaboration:
                 self._require_current_resource_envelope(
                     connection, initialization_id, draft
                 )
+                self._require_current_deepfetch_snapshot(
+                    connection,
+                    initialization_id,
+                    row,
+                    draft,
+                    proposal_ref=proposal_ref,
+                )
         if row.draft_schema_ref == DRAFT_V2_SCHEMA:
             self._auto_refresh_preview(initialization_id)
             with self._database.write() as connection:
@@ -2415,6 +2731,7 @@ class SQLiteHumanCollaboration:
     ) -> dict[str, object]:
         terminal_transitioned = False
         running_provider_jobs: tuple[tuple[str, ...], tuple[str, ...]] = ((), ())
+        deepfetch_request_refs: tuple[str, ...] = ()
         request_hash = canonical_hash(
             {"command": "cancel", "initialization_id": initialization_id}
         )
@@ -2428,6 +2745,36 @@ class SQLiteHumanCollaboration:
                     raise OwnerConflict("confirmed_quest_cannot_be_cancelled")
                 if row.status != "cancelled":
                     now = time.time()
+                    deepfetch_request_refs = tuple(
+                        str(value)
+                        for value in connection.execute(
+                            text(
+                                "SELECT request_ref FROM hc_deepfetch_requests WHERE "
+                                "initialization_id = :initialization_id AND status = "
+                                "'queued'"
+                            ),
+                            {"initialization_id": initialization_id},
+                        ).scalars()
+                    )
+                    if deepfetch_request_refs:
+                        connection.execute(
+                            text(
+                                "UPDATE hc_deepfetch_requests SET status = "
+                                "'cancelled', failure_code = 'initialization_cancelled', "
+                                "updated_at = :now, completed_at = :now WHERE "
+                                "initialization_id = :initialization_id AND status = "
+                                "'queued'"
+                            ),
+                            {"initialization_id": initialization_id, "now": now},
+                        )
+                        self._feed.record(
+                            connection,
+                            "human_collaboration.deepfetch_cancelled",
+                            {
+                                "initialization_id": initialization_id,
+                                "request_refs": list(deepfetch_request_refs),
+                            },
+                        )
                     connection.execute(
                         text(
                             "UPDATE hc_quest_initializations SET status = 'cancelled', "
@@ -2465,6 +2812,8 @@ class SQLiteHumanCollaboration:
                 )
         if terminal_transitioned:
             self._cancel_provider_jobs(*running_provider_jobs)
+            for request_ref in deepfetch_request_refs:
+                self._agent_runtime.cancel_deepfetch(request_ref)
         return self.query_quest_creation(initialization_id)
 
     def _cancel_provider_jobs(
@@ -2570,6 +2919,220 @@ class SQLiteHumanCollaboration:
         )
         return running_generation_refs, running_turn_refs
 
+    def query_next_deepfetch_request(self) -> DeepFetchRunRequest | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT requests.*, revisions.draft_json AS frozen_draft_json, "
+                    "revisions.draft_hash AS revision_draft_hash FROM "
+                    "hc_deepfetch_requests AS requests JOIN "
+                    "hc_quest_draft_revisions AS revisions ON "
+                    "revisions.initialization_id = requests.initialization_id AND "
+                    "revisions.revision = requests.draft_revision WHERE "
+                    "requests.status = 'queued' ORDER BY requests.created_at LIMIT 1"
+                )
+            ).first()
+        return None if row is None else _deepfetch_request_from_row(row)
+
+    def query_deepfetch_request(
+        self, request_ref: str
+    ) -> DeepFetchRunRequest | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT requests.*, revisions.draft_json AS frozen_draft_json, "
+                    "revisions.draft_hash AS revision_draft_hash FROM "
+                    "hc_deepfetch_requests AS requests JOIN "
+                    "hc_quest_draft_revisions AS revisions ON "
+                    "revisions.initialization_id = requests.initialization_id AND "
+                    "revisions.revision = requests.draft_revision WHERE "
+                    "requests.request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        return None if row is None else _deepfetch_request_from_row(row)
+
+    def record_deepfetch_succeeded(
+        self,
+        request_ref: str,
+        run_ref: str,
+        snapshot: AcceptedLiteratureSnapshot,
+    ) -> None:
+        request = self.query_deepfetch_request(request_ref)
+        run = self._agent_runtime.query_deepfetch_run(request_ref)
+        if request is None or run is None or (
+            run.status != "executed"
+            or run.run_ref != run_ref
+            or run.execution_receipt is None
+            or snapshot.request_ref != request_ref
+            or snapshot.initialization_id != request.initialization_id
+            or snapshot.draft_revision != request.draft_revision
+            or snapshot.draft_hash != request.draft_hash
+            or snapshot.scope_hash != request.scope_hash
+            or snapshot.run_ref != run_ref
+            or snapshot.result_hash != run.result_hash
+            or snapshot.execution_receipt != run.execution_receipt
+        ):
+            raise OwnerConflict("deepfetch_result_binding_invalid")
+        now = time.time()
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).one()
+            if row.status == "succeeded":
+                if row.run_ref != run_ref or row.snapshot_ref != snapshot.snapshot_ref:
+                    raise OwnerConflict("deepfetch_result_binding_invalid")
+                return
+            if row.status != "queued":
+                raise OwnerConflict("deepfetch_request_not_active")
+            connection.execute(
+                text(
+                    "UPDATE hc_deepfetch_requests SET status = 'succeeded', "
+                    "run_ref = :run_ref, snapshot_ref = :snapshot_ref, "
+                    "failure_code = NULL, updated_at = :now, completed_at = :now "
+                    "WHERE request_ref = :request_ref AND status = 'queued'"
+                ),
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "snapshot_ref": snapshot.snapshot_ref,
+                    "now": now,
+                },
+            )
+            initialization = self._require_initialization(
+                connection, request.initialization_id
+            )
+            basis_is_current = (
+                int(initialization.draft_revision) == request.draft_revision
+                and initialization.draft_hash == request.draft_hash
+                and initialization.status not in {"confirmed", "completed", "cancelled"}
+            )
+            if basis_is_current:
+                existing_generation = connection.execute(
+                    text(
+                        "SELECT generation_ref, literature_snapshot_ref FROM "
+                        "hc_proposal_generation_attempts WHERE initialization_id = "
+                        ":initialization_id AND basis_revision = :basis_revision AND "
+                        "basis_hash = :basis_hash AND route = 'deepfetch' ORDER BY "
+                        "created_at LIMIT 1"
+                    ),
+                    {
+                        "initialization_id": request.initialization_id,
+                        "basis_revision": request.draft_revision,
+                        "basis_hash": request.draft_hash,
+                    },
+                ).first()
+                if existing_generation is None:
+                    generation_ref = new_ref("proposal_generation")
+                    generation_key = f"deepfetch-proposal:{request_ref}"
+                    generation_hash = canonical_hash(
+                        {
+                            "command": "generate_proposal_after_deepfetch",
+                            "request_ref": request_ref,
+                            "snapshot_ref": snapshot.snapshot_ref,
+                            "snapshot_hash": snapshot.snapshot_hash,
+                        }
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO hc_proposal_generation_attempts "
+                            "(generation_ref, initialization_id, idempotency_key, "
+                            "request_hash, route, basis_revision, basis_hash, "
+                            "starting_proposal_revision, status, adapter_kind, "
+                            "attempt_count, literature_snapshot_ref, created_at) VALUES "
+                            "(:generation_ref, :initialization_id, :idempotency_key, "
+                            ":request_hash, 'deepfetch', :basis_revision, :basis_hash, "
+                            ":starting_proposal_revision, 'queued', :adapter_kind, 0, "
+                            ":literature_snapshot_ref, :now)"
+                        ),
+                        {
+                            "generation_ref": generation_ref,
+                            "initialization_id": request.initialization_id,
+                            "idempotency_key": generation_key,
+                            "request_hash": generation_hash,
+                            "basis_revision": request.draft_revision,
+                            "basis_hash": request.draft_hash,
+                            "starting_proposal_revision": int(
+                                initialization.proposal_revision
+                            ),
+                            "adapter_kind": type(self._proposal_drafter).__name__,
+                            "literature_snapshot_ref": snapshot.snapshot_ref,
+                            "now": now,
+                        },
+                    )
+                elif (
+                    existing_generation.literature_snapshot_ref
+                    != snapshot.snapshot_ref
+                ):
+                    raise OwnerConflict("deepfetch_proposal_route_conflict")
+            connection.execute(
+                text(
+                    "UPDATE human_collaboration_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "human_collaboration.deepfetch_completed",
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "snapshot_ref": snapshot.snapshot_ref,
+                    "basis_current": basis_is_current,
+                },
+            )
+
+    def record_deepfetch_failed(
+        self,
+        request_ref: str,
+        failure_code: str,
+        run_ref: str | None = None,
+    ) -> None:
+        if not failure_code or len(failure_code) > 96:
+            failure_code = "deepfetch_failed"
+        now = time.time()
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_deepfetch_requests WHERE "
+                    "request_ref = :request_ref"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+            if row is None:
+                raise OwnerConflict("deepfetch_request_not_found")
+            if row.status in {"succeeded", "cancelled"}:
+                return
+            connection.execute(
+                text(
+                    "UPDATE hc_deepfetch_requests SET status = 'failed', "
+                    "run_ref = COALESCE(:run_ref, run_ref), failure_code = "
+                    ":failure_code, updated_at = :now, completed_at = :now WHERE "
+                    "request_ref = :request_ref AND status = 'queued'"
+                ),
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run_ref,
+                    "failure_code": failure_code,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE human_collaboration_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "human_collaboration.deepfetch_failed",
+                {"request_ref": request_ref, "reason_code": failure_code},
+            )
+
     def query_quest_creation(self, initialization_id: str) -> dict[str, object]:
         with self._database.read() as connection:
             row = self._require_initialization(connection, initialization_id)
@@ -2608,11 +3171,36 @@ class SQLiteHumanCollaboration:
                 text(
                     "SELECT generation_ref, basis_revision, basis_hash, status, "
                     "adapter_kind, attempt_count, proposal_ref, proposal_hash, "
-                    "failure_code FROM hc_proposal_generation_attempts WHERE "
+                    "failure_code, literature_snapshot_ref FROM "
+                    "hc_proposal_generation_attempts WHERE "
                     "initialization_id = :initialization_id ORDER BY created_at DESC "
                     "LIMIT 1"
                 ),
                 {"initialization_id": initialization_id},
+            ).first()
+            proposal_record = (
+                connection.execute(
+                    text(
+                        "SELECT literature_snapshot_ref FROM hc_question_proposals "
+                        "WHERE proposal_ref = :proposal_ref"
+                    ),
+                    {"proposal_ref": row.proposal_ref},
+                ).first()
+                if row.proposal_ref is not None
+                else None
+            )
+            deepfetch_request = connection.execute(
+                text(
+                    "SELECT * FROM hc_deepfetch_requests WHERE initialization_id = "
+                    ":initialization_id ORDER BY CASE WHEN draft_revision = "
+                    ":current_revision AND draft_hash = :current_hash THEN 0 ELSE 1 "
+                    "END, created_at DESC LIMIT 1"
+                ),
+                {
+                    "initialization_id": initialization_id,
+                    "current_revision": int(row.draft_revision),
+                    "current_hash": row.draft_hash,
+                },
             ).first()
             envelope = connection.execute(
                 text(
@@ -2682,6 +3270,19 @@ class SQLiteHumanCollaboration:
                 if row.preview_ref is not None
                 else None
             )
+        deepfetch_run = (
+            self._agent_runtime.query_deepfetch_run(deepfetch_request.request_ref)
+            if deepfetch_request is not None
+            else None
+        )
+        literature_snapshot = (
+            self._research_memory.query_literature_snapshot(
+                deepfetch_request.snapshot_ref
+            )
+            if deepfetch_request is not None
+            and deepfetch_request.snapshot_ref is not None
+            else None
+        )
         compute: HostComputeObservation | None = None
         if compute_snapshot_ref is not None:
             try:
@@ -2778,6 +3379,21 @@ class SQLiteHumanCollaboration:
             else:
                 proposal_complete = True
         proposal_current = proposal_basis_current and proposal_complete
+        deepfetch_basis_current = (
+            deepfetch_request is not None
+            and int(deepfetch_request.draft_revision) == int(row.draft_revision)
+            and deepfetch_request.draft_hash == row.draft_hash
+        )
+        if current_draft_value.get("route") == "deepfetch":
+            proposal_current = proposal_current and (
+                deepfetch_basis_current
+                and deepfetch_request is not None
+                and deepfetch_request.status == "succeeded"
+                and literature_snapshot is not None
+                and proposal_record is not None
+                and proposal_record.literature_snapshot_ref
+                == literature_snapshot.snapshot_ref
+            )
         material_bindings_current = True
         if (
             row.confirmation_ref is None
@@ -2801,6 +3417,21 @@ class SQLiteHumanCollaboration:
                 or envelope_current and preview_binding is not None
             )
         )
+        if current_draft_value.get("route") == "deepfetch":
+            preview_current = preview_current and (
+                deepfetch_basis_current
+                and deepfetch_request is not None
+                and deepfetch_request.status == "succeeded"
+                and literature_snapshot is not None
+                and proposal_record is not None
+                and proposal_record.literature_snapshot_ref
+                == literature_snapshot.snapshot_ref
+                and preview_binding is not None
+                and preview_binding.literature_snapshot_ref
+                == literature_snapshot.snapshot_ref
+                and preview_binding.literature_snapshot_hash
+                == literature_snapshot.snapshot_hash
+            )
         current_owner_revisions = self._public_owner_revisions()
         if preview_binding is not None:
             preview_current = preview_current and (
@@ -2820,6 +3451,15 @@ class SQLiteHumanCollaboration:
             generation is not None
             and int(generation.basis_revision) == int(row.draft_revision)
             and generation.basis_hash == row.draft_hash
+        )
+        deepfetch_active = (
+            deepfetch_basis_current
+            and deepfetch_request is not None
+            and deepfetch_request.status == "queued"
+            and (
+                deepfetch_run is None
+                or deepfetch_run.status in {"admitted", "running", "executed"}
+            )
         )
         live_failures = {
             "quest_goal": quest_failure,
@@ -2860,6 +3500,8 @@ class SQLiteHumanCollaboration:
             generation_current
             and generation.status in {"queued", "running"}
         ):
+            status = "proposal_generating"
+        elif deepfetch_active:
             status = "proposal_generating"
         elif proposal_current and (
             row.draft_schema_ref != DRAFT_V2_SCHEMA or preview_current
@@ -2984,6 +3626,7 @@ class SQLiteHumanCollaboration:
                         if generation.failure_code is not None
                         else None
                     ),
+                    "literature_snapshot_ref": generation.literature_snapshot_ref,
                 }
                 if generation is not None
                 else None
@@ -3001,6 +3644,11 @@ class SQLiteHumanCollaboration:
                         else "incomplete" if proposal_basis_current else "stale"
                     ),
                     "content": proposal_value,
+                    "literature_snapshot_ref": (
+                        proposal_record.literature_snapshot_ref
+                        if proposal_record is not None
+                        else None
+                    ),
                 }
                 if row.proposal_ref is not None
                 else None
@@ -3105,6 +3753,13 @@ class SQLiteHumanCollaboration:
                 if intent_session is not None
                 else None
             ),
+            "deepfetch": _public_deepfetch(
+                deepfetch_request,
+                deepfetch_run,
+                literature_snapshot,
+                basis_current=deepfetch_basis_current,
+                proposal_current=proposal_current,
+            ),
             "receipts": receipts,
             "recovery": (
                 {
@@ -3127,8 +3782,7 @@ class SQLiteHumanCollaboration:
             "capabilities": {
                 "direct": {"status": "ready"},
                 "first_question_deepfetch": {
-                    "status": "capability_unavailable",
-                    "reason": {"code": "deepfetch_not_delivered"},
+                    "status": "ready",
                 },
                 "accepted_material_basis": {"status": "ready"},
             },
@@ -3740,6 +4394,64 @@ class SQLiteHumanCollaboration:
             raise OwnerConflict("resource_envelope_stale")
         return envelope_value
 
+    def _require_current_deepfetch_snapshot(
+        self,
+        connection: Connection,
+        initialization_id: str,
+        row: Row,
+        draft: dict[str, object],
+        *,
+        proposal_ref: str | None = None,
+    ) -> AcceptedLiteratureSnapshot | None:
+        """Return the exact accepted snapshot authorized by this draft basis."""
+
+        if draft.get("route") != "deepfetch":
+            return None
+        request = connection.execute(
+            text(
+                "SELECT request_ref, snapshot_ref FROM hc_deepfetch_requests WHERE "
+                "initialization_id = :initialization_id AND draft_revision = "
+                ":draft_revision AND draft_hash = :draft_hash AND status = "
+                "'succeeded'"
+            ),
+            {
+                "initialization_id": initialization_id,
+                "draft_revision": int(row.draft_revision),
+                "draft_hash": row.draft_hash,
+            },
+        ).first()
+        if request is None or request.snapshot_ref is None:
+            raise OwnerConflict("literature_snapshot_required")
+        snapshot = self._research_memory.query_literature_snapshot(
+            str(request.snapshot_ref)
+        )
+        if (
+            snapshot is None
+            or snapshot.request_ref != request.request_ref
+            or snapshot.initialization_id != initialization_id
+            or snapshot.draft_revision != int(row.draft_revision)
+            or snapshot.draft_hash != row.draft_hash
+        ):
+            raise OwnerConflict("literature_snapshot_stale")
+        if proposal_ref is not None:
+            proposal = connection.execute(
+                text(
+                    "SELECT literature_snapshot_ref FROM hc_question_proposals "
+                    "WHERE proposal_ref = :proposal_ref AND initialization_id = "
+                    ":initialization_id"
+                ),
+                {
+                    "proposal_ref": proposal_ref,
+                    "initialization_id": initialization_id,
+                },
+            ).first()
+            if (
+                proposal is None
+                or proposal.literature_snapshot_ref != snapshot.snapshot_ref
+            ):
+                raise OwnerConflict("literature_snapshot_stale")
+        return snapshot
+
     def _auto_refresh_preview(self, initialization_id: str) -> bool:
         with self._database.read() as connection:
             row = self._require_initialization(connection, initialization_id)
@@ -3761,6 +4473,26 @@ class SQLiteHumanCollaboration:
                 envelope_hash, str
             ):
                 return False
+            try:
+                literature_snapshot = self._require_current_deepfetch_snapshot(
+                    connection,
+                    initialization_id,
+                    row,
+                    draft,
+                    proposal_ref=str(row.proposal_ref),
+                )
+            except OwnerConflict:
+                return False
+            literature_snapshot_ref = (
+                None
+                if literature_snapshot is None
+                else literature_snapshot.snapshot_ref
+            )
+            literature_snapshot_hash = (
+                None
+                if literature_snapshot is None
+                else literature_snapshot.snapshot_hash
+            )
             request = {
                 "initialization_id": initialization_id,
                 "quest_draft_revision": int(row.draft_revision),
@@ -3773,6 +4505,8 @@ class SQLiteHumanCollaboration:
                     **request,
                     "resource_envelope_ref": envelope_ref,
                     "resource_envelope_hash": envelope_hash,
+                    "literature_snapshot_ref": literature_snapshot_ref,
+                    "literature_snapshot_hash": literature_snapshot_hash,
                     "owner_revisions": self._public_owner_revisions(),
                     "feed_revision": self._feed.current_revision(),
                 }
@@ -3873,6 +4607,12 @@ class SQLiteHumanCollaboration:
                 "由 Research Graph 接纳 "
                 f"{len(material_bindings)} 个精确 Quest Source Material 角色",
             )
+        if literature_snapshot is not None:
+            will_happen.insert(
+                2,
+                "仅使用已由 Research Memory 接纳的精确 LiteratureSnapshot "
+                f"{literature_snapshot.snapshot_ref}",
+            )
         summary = {
             "will_happen": will_happen,
             "will_not_happen": [
@@ -3897,6 +4637,8 @@ class SQLiteHumanCollaboration:
                     "previews.assertions_hash = :assertions_hash AND "
                     "bindings.resource_envelope_ref = :envelope_ref AND "
                     "bindings.resource_envelope_hash = :envelope_hash AND "
+                    "bindings.literature_snapshot_ref IS :literature_snapshot_ref AND "
+                    "bindings.literature_snapshot_hash IS :literature_snapshot_hash AND "
                     "bindings.owner_revisions_hash = :owner_revisions_hash AND "
                     "bindings.feed_revision = :feed_revision AND "
                     "bindings.summary_hash = :summary_hash ORDER BY "
@@ -3911,6 +4653,8 @@ class SQLiteHumanCollaboration:
                     "assertions_hash": assertions_hash,
                     "envelope_ref": envelope_ref,
                     "envelope_hash": envelope_hash,
+                    "literature_snapshot_ref": literature_snapshot_ref,
+                    "literature_snapshot_hash": literature_snapshot_hash,
                     "owner_revisions_hash": canonical_hash(owner_revisions),
                     "feed_revision": current_feed_revision,
                     "summary_hash": canonical_hash(summary),
@@ -3958,6 +4702,8 @@ class SQLiteHumanCollaboration:
             binding = {
                 "resource_envelope_ref": envelope_ref,
                 "resource_envelope_hash": envelope_hash,
+                "literature_snapshot_ref": literature_snapshot_ref,
+                "literature_snapshot_hash": literature_snapshot_hash,
                 "owner_revisions": owner_revisions,
                 "feed_revision": feed_revision,
                 "summary": summary,
@@ -3997,10 +4743,12 @@ class SQLiteHumanCollaboration:
                 text(
                     "INSERT INTO hc_confirmation_preview_bindings "
                     "(preview_ref, schema_ref, resource_envelope_ref, "
-                    "resource_envelope_hash, owner_revisions_json, "
+                    "resource_envelope_hash, literature_snapshot_ref, "
+                    "literature_snapshot_hash, owner_revisions_json, "
                     "owner_revisions_hash, feed_revision, summary_json, "
                     "summary_hash) VALUES (:preview_ref, :schema_ref, "
                     ":resource_envelope_ref, :resource_envelope_hash, "
+                    ":literature_snapshot_ref, :literature_snapshot_hash, "
                     ":owner_revisions_json, :owner_revisions_hash, :feed_revision, "
                     ":summary_json, :summary_hash)"
                 ),
@@ -4009,6 +4757,8 @@ class SQLiteHumanCollaboration:
                     "schema_ref": PREVIEW_V2_SCHEMA,
                     "resource_envelope_ref": envelope_ref,
                     "resource_envelope_hash": envelope_hash,
+                    "literature_snapshot_ref": literature_snapshot_ref,
+                    "literature_snapshot_hash": literature_snapshot_hash,
                     "owner_revisions_json": canonical_json(owner_revisions),
                     "owner_revisions_hash": canonical_hash(owner_revisions),
                     "feed_revision": feed_revision,
@@ -4060,6 +4810,7 @@ class SQLiteHumanCollaboration:
         schema_ref: str | None = None,
         basis_revision: int | None = None,
         basis_hash: str | None = None,
+        literature_snapshot_ref: str | None = None,
     ) -> tuple[str, str]:
         normalized = _validate_question_content(content, require_complete=False)
         schema_ref = schema_ref or (
@@ -4086,9 +4837,11 @@ class SQLiteHumanCollaboration:
             text(
                 "INSERT INTO hc_question_proposals (proposal_ref, "
                 "initialization_id, revision, basis_revision, basis_hash, "
-                "content_json, proposal_hash, schema_ref, recorded_at) VALUES (:proposal_ref, "
+                "content_json, proposal_hash, schema_ref, literature_snapshot_ref, "
+                "recorded_at) VALUES (:proposal_ref, "
                 ":initialization_id, :revision, :basis_revision, :basis_hash, "
-                ":content_json, :proposal_hash, :schema_ref, :now)"
+                ":content_json, :proposal_hash, :schema_ref, "
+                ":literature_snapshot_ref, :now)"
             ),
             {
                 "proposal_ref": proposal_ref,
@@ -4099,6 +4852,7 @@ class SQLiteHumanCollaboration:
                 "content_json": canonical_json(normalized),
                 "proposal_hash": proposal_hash,
                 "schema_ref": schema_ref,
+                "literature_snapshot_ref": literature_snapshot_ref,
                 "now": now,
             },
         )
@@ -4192,6 +4946,26 @@ class SQLiteHumanCollaboration:
         if preview is None or preview.schema_ref != PREVIEW_V2_SCHEMA:
             raise OwnerConflict("confirmation_preview_stale")
         draft = decoded_object(row.draft_json)
+        try:
+            literature_snapshot = self._require_current_deepfetch_snapshot(
+                connection,
+                str(request["initialization_id"]),
+                row,
+                draft,
+                proposal_ref=str(request["proposal_ref"]),
+            )
+        except OwnerConflict as error:
+            raise OwnerConflict("confirmation_preview_stale") from error
+        literature_snapshot_ref = (
+            None
+            if literature_snapshot is None
+            else literature_snapshot.snapshot_ref
+        )
+        literature_snapshot_hash = (
+            None
+            if literature_snapshot is None
+            else literature_snapshot.snapshot_hash
+        )
         envelope_ref = draft.get("resource_envelope_ref")
         envelope_hash = draft.get("resource_envelope_hash")
         envelope = connection.execute(
@@ -4226,6 +5000,8 @@ class SQLiteHumanCollaboration:
             or observation is None
             or preview.resource_envelope_ref != envelope_ref
             or preview.resource_envelope_hash != envelope_hash
+            or preview.literature_snapshot_ref != literature_snapshot_ref
+            or preview.literature_snapshot_hash != literature_snapshot_hash
             or envelope.envelope_hash != envelope_hash
             or not _resource_envelope_integrity_is_valid(
                 envelope, envelope_value, observation
@@ -4241,6 +5017,8 @@ class SQLiteHumanCollaboration:
         binding = {
             "resource_envelope_ref": preview.resource_envelope_ref,
             "resource_envelope_hash": preview.resource_envelope_hash,
+            "literature_snapshot_ref": preview.literature_snapshot_ref,
+            "literature_snapshot_hash": preview.literature_snapshot_hash,
             "owner_revisions": stored_owner_revisions,
             "feed_revision": int(preview.feed_revision),
             "summary": summary,
@@ -4570,6 +5348,7 @@ def _validate_preview_artifact_integrity(
     row: Row,
     request: dict[str, object],
     agent_runtime: AgentRuntimeInterface,
+    literature_snapshot_verifier: LiteratureSnapshotVerifier | None,
 ) -> None:
     _require_initialization_artifact_integrity(
         connection,
@@ -4614,9 +5393,33 @@ def _validate_preview_artifact_integrity(
         OwnerConflict,
     ) as error:
         raise OwnerConflict("bundle_confirmation_receipt_invalid") from error
+    if draft.get("route") == "deepfetch":
+        if (
+            literature_snapshot_verifier is None
+            or preview.literature_snapshot_ref is None
+            or preview.literature_snapshot_hash is None
+        ):
+            raise OwnerConflict("bundle_confirmation_receipt_invalid")
+        try:
+            literature_snapshot_verifier.verify_literature_snapshot_binding(
+                snapshot_ref=str(preview.literature_snapshot_ref),
+                snapshot_hash=str(preview.literature_snapshot_hash),
+                initialization_id=str(request["initialization_id"]),
+                draft_revision=int(request["quest_draft_revision"]),
+                draft_hash=str(request["quest_draft_hash"]),
+            )
+        except OwnerConflict as error:
+            raise OwnerConflict("bundle_confirmation_receipt_invalid") from error
+    elif (
+        preview.literature_snapshot_ref is not None
+        or preview.literature_snapshot_hash is not None
+    ):
+        raise OwnerConflict("bundle_confirmation_receipt_invalid")
     binding = {
         "resource_envelope_ref": preview.resource_envelope_ref,
         "resource_envelope_hash": preview.resource_envelope_hash,
+        "literature_snapshot_ref": preview.literature_snapshot_ref,
+        "literature_snapshot_hash": preview.literature_snapshot_hash,
         "owner_revisions": owner_revisions,
         "feed_revision": int(preview.feed_revision),
         "summary": summary,
@@ -4736,6 +5539,172 @@ def _resource_envelope_integrity_is_valid(
         and all(device is not None for device in expected_devices)
         and selected_devices == expected_devices
     )
+
+
+def _deepfetch_scope(draft: dict[str, object]) -> dict[str, object]:
+    literature = draft.get("literature")
+    if not isinstance(literature, dict):
+        raise OwnerConflict("literature_configuration_invalid")
+    return {
+        "schema_ref": "meta-research/first-question-deepfetch-scope/v1",
+        "goal": draft.get("goal"),
+        "completion_criteria": draft.get("completion_criteria"),
+        "background_and_initial_direction": draft.get(
+            "background_and_initial_direction"
+        ),
+        "literature_mode": literature.get("mode"),
+        "library_entry_url": literature.get("library_entry_url"),
+        "scope_exclusions": literature.get("scope_exclusions"),
+    }
+
+
+def _owner_receipt_hash(
+    kind: str,
+    subject_ref: str,
+    bindings: dict[str, object],
+) -> str:
+    return canonical_hash(
+        {
+            "schema_ref": RECEIPT_SCHEMA,
+            "issuer": HC_OWNER,
+            "kind": kind,
+            "subject_ref": subject_ref,
+            "bindings": bindings,
+        }
+    )
+
+
+def _deepfetch_request_receipt_hash(row: Row) -> str:
+    return _owner_receipt_hash(
+        DEEPFETCH_REQUEST_RECEIPT_KIND,
+        row.request_ref,
+        {
+            "initialization_id": row.initialization_id,
+            "correlation_ref": row.correlation_ref,
+            "draft_revision": int(row.draft_revision),
+            "draft_hash": row.draft_hash,
+            "scope_hash": row.scope_hash,
+            "material_bindings_hash": row.material_bindings_hash,
+            "resource_envelope_ref": row.resource_envelope_ref,
+            "resource_envelope_hash": row.resource_envelope_hash,
+            "result_route": row.result_route,
+        },
+    )
+
+
+def _deepfetch_request_from_row(row: Row) -> DeepFetchRunRequest:
+    try:
+        draft = decoded_object(row.frozen_draft_json)
+        scope = decoded_object(row.scope_json)
+        materials = json.loads(row.material_bindings_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("deepfetch_request_invalid") from error
+    if (
+        not isinstance(materials, list)
+        or any(not isinstance(value, dict) for value in materials)
+        or row.revision_draft_hash != row.draft_hash
+        or canonical_json(draft) != row.frozen_draft_json
+        or canonical_hash(draft) != row.draft_hash
+        or canonical_json(scope) != row.scope_json
+        or canonical_hash(scope) != row.scope_hash
+        or canonical_json(materials) != row.material_bindings_json
+        or canonical_hash(materials) != row.material_bindings_hash
+        or row.authorization_hash != _deepfetch_request_receipt_hash(row)
+    ):
+        raise OwnerConflict("deepfetch_request_invalid")
+    return DeepFetchRunRequest(
+        request_ref=row.request_ref,
+        initialization_id=row.initialization_id,
+        correlation_ref=row.correlation_ref,
+        draft_revision=int(row.draft_revision),
+        draft_hash=row.draft_hash,
+        draft=draft,
+        scope=scope,
+        scope_hash=row.scope_hash,
+        resource_envelope_ref=row.resource_envelope_ref,
+        resource_envelope_hash=row.resource_envelope_hash,
+        accepted_material_bindings=tuple(materials),
+        result_route=row.result_route,
+        authorization_receipt=AcceptanceReceipt(
+            issuer=HC_OWNER,
+            kind=DEEPFETCH_REQUEST_RECEIPT_KIND,
+            receipt_ref=row.authorization_receipt_ref,
+            subject_ref=row.request_ref,
+            payload_hash=row.authorization_hash,
+        ),
+    )
+
+
+def _public_deepfetch(
+    request: Row | None,
+    run: DeepFetchRun | None,
+    snapshot: AcceptedLiteratureSnapshot | None,
+    *,
+    basis_current: bool,
+    proposal_current: bool,
+) -> dict[str, object] | None:
+    if request is None:
+        return None
+    if request.status == "cancelled":
+        status = "cancelled"
+        activity = "cancelled"
+        completed = 0
+    elif request.status == "failed" or run is not None and run.status == "failed":
+        status = "failed"
+        activity = "needs_retry"
+        completed = 1 if run is not None else 0
+    elif request.status == "succeeded":
+        status = "succeeded"
+        if basis_current and not proposal_current:
+            activity = "proposal_drafting"
+            completed = 4
+        else:
+            activity = "complete"
+            completed = 5 if proposal_current else 4
+    elif run is None or run.status == "admitted":
+        status = "queued"
+        activity = "waiting_for_runtime"
+        completed = 0
+    elif run.status == "running":
+        status = "running"
+        activity = "web_research"
+        completed = 2
+    elif run.status == "executed":
+        status = "accepting"
+        activity = "accepting_assets"
+        completed = 3
+    else:
+        status = run.status
+        activity = "waiting_for_runtime"
+        completed = 0
+    failure_code = request.failure_code
+    if failure_code is None and run is not None:
+        failure_code = run.failure_code
+    return {
+        "request_ref": request.request_ref,
+        "correlation_ref": request.correlation_ref,
+        "basis_revision": int(request.draft_revision),
+        "basis_hash": request.draft_hash,
+        "scope_hash": request.scope_hash,
+        "status": status,
+        "activity": activity,
+        "progress": {"completed": completed, "total": 5},
+        "freshness": "current" if basis_current else "stale",
+        "authorization_receipt": AcceptanceReceipt(
+            issuer=HC_OWNER,
+            kind=DEEPFETCH_REQUEST_RECEIPT_KIND,
+            receipt_ref=request.authorization_receipt_ref,
+            subject_ref=request.request_ref,
+            payload_hash=request.authorization_hash,
+        ).as_public_dict(),
+        "run": None if run is None else run.as_public_dict(),
+        "literature_snapshot": (
+            None if snapshot is None else snapshot.as_public_dict()
+        ),
+        "failure": (
+            None if failure_code is None else {"code": failure_code}
+        ),
+    }
 
 
 def _validate_draft(draft: dict[str, object]) -> dict[str, object]:
@@ -5090,8 +6059,6 @@ def _validate_generation_basis(draft: dict[str, object]) -> None:
             raise OwnerConflict(f"{field}_required")
     if _draft_schema_ref(normalized) == DRAFT_V1_SCHEMA:
         return
-    if normalized["route"] != "direct":
-        raise OwnerConflict("deepfetch_not_delivered")
     if (
         normalized["resource_envelope_ref"] is None
         or normalized["resource_envelope_hash"] is None
@@ -5132,6 +6099,12 @@ def create_bundle_confirmation_verifier(
     agent_runtime: AgentRuntimeInterface,
 ) -> SQLiteBundleConfirmationVerifier:
     return SQLiteBundleConfirmationVerifier(database, agent_runtime)
+
+
+def create_deepfetch_request_verifier(
+    database: Database,
+) -> SQLiteDeepFetchRunRequestVerifier:
+    return SQLiteDeepFetchRunRequestVerifier(database)
 
 
 def create_human_collaboration_interface(

@@ -179,6 +179,18 @@ class BundleConfirmationVerifier(Protocol):
     ) -> None: ...
 
 
+class LiteratureSnapshotVerifier(Protocol):
+    def verify_literature_snapshot_binding(
+        self,
+        *,
+        snapshot_ref: str,
+        snapshot_hash: str,
+        initialization_id: str,
+        draft_revision: int,
+        draft_hash: str,
+    ) -> None: ...
+
+
 class QuestReceiptVerifier(Protocol):
     def verify_quest_receipt(
         self,
@@ -239,6 +251,23 @@ class StageRunRequestVerifier(Protocol):
     ) -> VerifiedStageRunRequestBinding: ...
 
 
+class DeepFetchRunRequestVerifier(Protocol):
+    def verify_deepfetch_run_request(
+        self,
+        *,
+        request_ref: str,
+        initialization_id: str,
+        correlation_ref: str,
+        draft_revision: int,
+        draft_hash: str,
+        scope_hash: str,
+        resource_envelope_ref: str,
+        resource_envelope_hash: str,
+        result_route: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
 class AttemptExecutionReceiptVerifier(Protocol):
     def verify_attempt_execution_receipt(
         self,
@@ -249,6 +278,17 @@ class AttemptExecutionReceiptVerifier(Protocol):
         fence_ref: str,
         submission_ref: str,
         payload_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_deepfetch_execution_receipt(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        result_hash: str,
         receipt: AcceptanceReceipt,
     ) -> None: ...
 

@@ -875,15 +875,20 @@ export function QuestCreationWorkbench({
       const next = await pollCreation(
         queued.initialization_id,
         proposalGenerationSettled,
+        draftRef.current.route === "deepfetch" ? 1_810_000 : 190_000,
       );
       if (!operationIsCurrent("generating", token)) return;
       applyView(next, { syncProposal: Boolean(next.proposal) });
       if (
         next.proposal_generation?.status === "capability_unavailable" ||
-        next.proposal_generation?.status === "failed"
+        next.proposal_generation?.status === "failed" ||
+        next.deepfetch?.status === "failed" ||
+        next.deepfetch?.status === "cancelled"
       ) {
         showError(new ProductError(
-          next.proposal_generation.failure?.code ?? "proposal_drafter_unavailable",
+          next.deepfetch?.failure?.code ??
+          next.proposal_generation?.failure?.code ??
+          "proposal_drafter_unavailable",
         ));
       } else {
         restoreTriggerFocus = true;
@@ -1048,6 +1053,7 @@ export function QuestCreationWorkbench({
       creation.proposal_generation.status,
     ),
   );
+  const deepfetch = creation?.deepfetch ?? null;
   const durableIntentActive = Boolean(
     creation?.intent_session?.turns.some((turn) =>
       ["queued", "running"].includes(turn.assistant_status)),
@@ -1452,7 +1458,7 @@ export function QuestCreationWorkbench({
               <section className="quest-journey-section" data-journey-section="route" aria-labelledby="quest-route-title">
                 <div className="quest-section-heading">
                   <b id="quest-route-title">生成第一问之前，要不要补充检索？</b>
-                  <small>direct 可用 · DeepFetch 原位保留</small>
+                  <small>direct 与 DeepFetch 均在当前 initialization 原位收敛</small>
                 </div>
                 <div className="quest-route-card">
                   <div className="quest-route-options">
@@ -1460,12 +1466,12 @@ export function QuestCreationWorkbench({
                       className="quest-route-choice"
                       type="button"
                       aria-label="先运行 DeepFetch"
-                      aria-pressed={false}
-                      disabled
+                      aria-pressed={draft.route === "deepfetch"}
+                      disabled={!creation || draftInteractionLocked}
+                      onClick={() => updateDraft({ ...draft, route: "deepfetch" })}
                     >
                       <b>先运行 DeepFetch</b>
-                      <small>结合补充文献生成首问题。</small>
-                      <span className="quest-unavailable-tag">capability_unavailable</span>
+                      <small>绑定当前 DraftRevision 做真实 Web Research，再原位起草六字段。</small>
                     </button>
                     <button
                       className="quest-route-choice"
@@ -1480,8 +1486,94 @@ export function QuestCreationWorkbench({
                     </button>
                   </div>
                   <p className="quest-route-note">
-                    <b>当前边界：</b>本票只交付 direct；这不是 CreationSeed，也不是 DeepFetch waiver。
+                    <b>当前边界：</b>
+                    {draft.route === "deepfetch"
+                      ? " DeepFetch 只形成 RM 接纳的精确 LiteratureSnapshot；不会创建 Quest、Question 或 Cycle，也不会替你完成最终确认。"
+                      : " direct 使用当前精确 Quest basis 起草；没有检索运行，也不会伪造 LiteratureSnapshot。"}
                   </p>
+                  {draft.route === "deepfetch" ? (
+                    <div
+                      className={`quest-deepfetch-runway ${deepfetch?.status ?? "not-started"}`}
+                      data-testid="deepfetch-runway"
+                      data-status={deepfetch?.status ?? "not-started"}
+                      role="status"
+                      aria-live="polite"
+                    >
+                      <div className="quest-deepfetch-head">
+                        <div>
+                          <small>FIRST-QUESTION PREPARATION</small>
+                          <b>DeepFetch Web Research</b>
+                        </div>
+                        <span>{deepfetch ? deepfetchStatusLabel(deepfetch.status) : "等待启动"}</span>
+                      </div>
+                      {deepfetch ? (
+                        <>
+                          <div className="quest-deepfetch-progress">
+                            <progress
+                              aria-label="DeepFetch 真实进度"
+                              value={deepfetch.progress.completed}
+                              max={deepfetch.progress.total}
+                            />
+                            <code>
+                              {deepfetch.progress.completed}/{deepfetch.progress.total}
+                            </code>
+                          </div>
+                          <div className="quest-deepfetch-stages" aria-label="DeepFetch 活动阶段">
+                            {["授权", "排队", "Web Research", "RM 接纳", "Proposal"].map((label, index) => (
+                              <span
+                                key={label}
+                                className={index < deepfetch.progress.completed ? "done" : undefined}
+                              >
+                                {label}
+                              </span>
+                            ))}
+                          </div>
+                          <div className="quest-deepfetch-facts">
+                            <span>
+                              <small>ACTIVITY</small>
+                              <b>{deepfetchActivityLabel(deepfetch.activity)}</b>
+                            </span>
+                            <span>
+                              <small>FRESHNESS</small>
+                              <b>{deepfetch.freshness}</b>
+                            </span>
+                            <span>
+                              <small>ATTEMPT</small>
+                              <b>{deepfetch.run?.attempt_generation ?? 0}</b>
+                            </span>
+                          </div>
+                          {deepfetch.literature_snapshot ? (
+                            <div className="quest-deepfetch-snapshot">
+                              <div>
+                                <b>
+                                  LiteratureSnapshot · {deepfetch.literature_snapshot.completion}
+                                </b>
+                                <small>
+                                  {deepfetch.literature_snapshot.paper_count} papers · {deepfetch.literature_snapshot.fulltext_count} fulltexts · RM accepted
+                                </small>
+                              </div>
+                              {deepfetch.literature_snapshot.limitations.length ? (
+                                <ul>
+                                  {deepfetch.literature_snapshot.limitations.map((limitation) => (
+                                    <li key={limitation}>{limitation}</li>
+                                  ))}
+                                </ul>
+                              ) : null}
+                            </div>
+                          ) : null}
+                          {deepfetch.failure ? (
+                            <p className="quest-deepfetch-failure">
+                              {messageFor(deepfetch.failure.code)} 重新点击“生成第一个问题”会沿同一 correlation 创建新 Attempt。
+                            </p>
+                          ) : null}
+                        </>
+                      ) : (
+                        <p className="quest-deepfetch-awaiting">
+                          保存当前 DraftRevision 和 Resource Envelope 后，点击下方唯一生成按钮启动；进度只读取 durable Projection。
+                        </p>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
               </section>
 
@@ -1499,9 +1591,13 @@ export function QuestCreationWorkbench({
 
                   {creation?.status === "proposal_generating" ? (
                     <div className="quest-proposal-state generating" role="status">
-                      <span>正在依据精确 DraftRevision 生成六字段；Quest 配置和右侧 Session 仍可使用。</span>
+                      <span>
+                        {draft.route === "deepfetch"
+                          ? "正在准备精确 LiteratureSnapshot 并原位生成六字段；右侧 Drafting Session 始终保留。"
+                          : "正在依据精确 DraftRevision 生成六字段；Quest 配置和右侧 Session 仍可使用。"}
+                      </span>
                       <code>proposal_generating</code>
-                      <small>{creation.proposal_generation?.status ?? "queued"}</small>
+                      <small>{creation.deepfetch?.activity ?? creation.proposal_generation?.status ?? "queued"}</small>
                     </div>
                   ) : null}
                   {creation?.status === "proposal_stale" || creation?.proposal?.status === "stale" ? (
@@ -2012,7 +2108,8 @@ function meaningful(value: string): boolean {
 }
 
 function draftIsComplete(value: QuestDraft): boolean {
-  return meaningful(value.goal) && meaningful(value.completion_criteria) && value.route === "direct";
+  return meaningful(value.goal) && meaningful(value.completion_criteria) &&
+    ["direct", "deepfetch"].includes(value.route);
 }
 
 function questionIsComplete(value: QuestionContent | null): boolean {
@@ -2105,6 +2202,20 @@ function viewIsOlder(
     proposalGenerationStatusRank(nextGeneration.status) <
       proposalGenerationStatusRank(currentGeneration.status)
   ) return true;
+  const currentDeepFetch = current.deepfetch;
+  const nextDeepFetch = next.deepfetch;
+  if (
+    currentDeepFetch &&
+    ["queued", "running", "accepting"].includes(currentDeepFetch.status) &&
+    next.quest_draft.revision === current.quest_draft.revision &&
+    nextDeepFetch?.request_ref !== currentDeepFetch.request_ref
+  ) return true;
+  if (
+    currentDeepFetch &&
+    nextDeepFetch?.request_ref === currentDeepFetch.request_ref &&
+    ["queued", "running", "accepting"].includes(currentDeepFetch.status) &&
+    deepfetchStatusRank(nextDeepFetch.status) < deepfetchStatusRank(currentDeepFetch.status)
+  ) return true;
   return false;
 }
 
@@ -2138,6 +2249,13 @@ function proposalGenerationStatusRank(
 
 function proposalGenerationSettled(creation: QuestCreationView): boolean {
   const generation = creation.proposal_generation;
+  const deepfetch = creation.deepfetch;
+  if (deepfetch && ["failed", "cancelled"].includes(deepfetch.status)) return true;
+  if (
+    deepfetch &&
+    deepfetch.freshness === "stale" &&
+    deepfetch.status === "succeeded"
+  ) return true;
   if (!generation) return false;
   if (["capability_unavailable", "failed"].includes(generation.status)) return true;
   if (generation.status !== "succeeded") return false;
@@ -2146,6 +2264,39 @@ function proposalGenerationSettled(creation: QuestCreationView): boolean {
   // current Preview can (or should) be produced for it.
   if (creation.proposal?.status === "stale") return true;
   return confirmationIsCurrent(creation);
+}
+
+function deepfetchStatusRank(
+  status: NonNullable<QuestCreationView["deepfetch"]>["status"],
+): number {
+  return ["queued", "running", "accepting", "succeeded", "failed", "cancelled"].indexOf(status);
+}
+
+function deepfetchStatusLabel(
+  status: NonNullable<QuestCreationView["deepfetch"]>["status"],
+): string {
+  return {
+    queued: "已授权 · 排队中",
+    running: "真实检索中",
+    accepting: "RM 接纳中",
+    succeeded: "快照已接纳",
+    failed: "需要重试",
+    cancelled: "已取消",
+  }[status];
+}
+
+function deepfetchActivityLabel(
+  activity: NonNullable<QuestCreationView["deepfetch"]>["activity"],
+): string {
+  return {
+    waiting_for_runtime: "等待 Agent Runtime",
+    web_research: "Web Search / Fetch",
+    accepting_assets: "接纳 summary / papers / fulltexts",
+    proposal_drafting: "使用精确快照起草",
+    complete: "首问题已原位展开",
+    needs_retry: "运行未完成",
+    cancelled: "运行已取消",
+  }[activity];
 }
 
 function creationIsLocked(creation: QuestCreationView): boolean {
@@ -2197,7 +2348,15 @@ function footerCopy(
   if (!meaningful(draft.goal)) return "请先填写 Quest 目标";
   if (!meaningful(draft.completion_criteria)) return "还需填写完成标准";
   if (!creation.resource_envelope) return "请检测本机计算卡，并为 Quest 形成 Resource Envelope";
-  if (!proposal) return creation.status === "proposal_generating" ? "首问题正在原位生成" : "请生成第一个问题";
+  if (!proposal) {
+    if (creation.deepfetch?.status === "failed") return "DeepFetch 未完成；可沿同一 correlation 重试";
+    if (creation.status === "proposal_generating") {
+      return creation.route === "deepfetch"
+        ? "DeepFetch 正在原位准备 LiteratureSnapshot 与首问题"
+        : "首问题正在原位生成";
+    }
+    return "请生成第一个问题";
+  }
   if (proposalDirty) return "首问题修改正在自动保存";
   if (!questionIsComplete(proposal)) return "首问题仍需补齐四个必填字段";
   if (!confirmationIsCurrent(creation)) return "依据已变化；等待 current Impact Preview";
@@ -2206,10 +2365,18 @@ function footerCopy(
 
 function proposalSourceCopy(creation: QuestCreationView | null): string {
   if (!creation) return "等待 initialization";
-  if (creation.status === "proposal_generating") return "production drafter · generating";
+  if (creation.status === "proposal_generating") {
+    return creation.route === "deepfetch"
+      ? `DeepFetch · ${creation.deepfetch?.activity ?? "queued"}`
+      : "production drafter · generating";
+  }
   if (creation.proposal?.status === "stale") return `旧 Proposal · basis r${creation.proposal.basis_revision}`;
-  if (creation.proposal?.status === "incomplete") return `direct · incomplete draft r${creation.proposal.basis_revision}`;
-  if (creation.proposal) return `direct · current draft r${creation.proposal.basis_revision}`;
+  if (creation.proposal?.status === "incomplete") {
+    return `${creation.route} · incomplete draft r${creation.proposal.basis_revision}`;
+  }
+  if (creation.proposal) {
+    return `${creation.route} · current draft r${creation.proposal.basis_revision}`;
+  }
   if (creation.proposal_generation?.status === "capability_unavailable") return "capability_unavailable";
   return "等待生成";
 }
@@ -2269,7 +2436,12 @@ function messageFor(code: string): string {
     confirmation_preview_stale: "Impact Preview 已陈旧；等待系统自动刷新后再确认。",
     quest_basis_incomplete: "请先补齐 Quest 目标与完成标准。",
     resource_envelope_required: "请先检测真实本机计算卡并形成 Quest Resource Envelope。",
-    deepfetch_not_delivered: "DeepFetch 尚未交付；当前只能使用 direct 路线。",
+    literature_snapshot_required: "当前 DeepFetch basis 尚无已接纳 LiteratureSnapshot；请先运行或重试检索。",
+    literature_snapshot_stale: "LiteratureSnapshot 与当前 DraftRevision 不一致；旧快照已保留但不会静默套用。",
+    web_search_temporarily_unavailable: "真实 Web Search 暂不可用；可沿同一 correlation 重试，不会转成 direct waiver。",
+    codex_deepfetch_timeout: "DeepFetch 本次 Attempt 超时；当前草案未丢失，可从同一运行检查点重试。",
+    deepfetch_provider_stopped: "DeepFetch Provider 已停止；系统会按原 correlation 恢复，不会接纳晚到结果。",
+    initialization_cancelled: "初始化已取消；DeepFetch 结果不会转成 Proposal 或任何 domain object。",
     research_memory_asset_intake_not_delivered: "材料接纳尚未交付；raw 文件或路径不能进入 basis。",
     codex_cli_unavailable: "生产 Proposal Drafter 当前不可用；系统不会用静态模板代替。",
     codex_cli_failed: "生产 Proposal Drafter 未完成请求；当前草案与旧 Proposal 已保留。",
