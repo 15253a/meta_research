@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from meta_research.auth import AuthSession
 from meta_research.composition import ProductionRuntime
 from meta_research.owners.common import OwnerConflict
+from meta_research.owners.secret_detection import contains_secret
 from meta_research.owners.research_graph import ASSET_ROLE_QUERY_MAX_PAGE_SIZE
 from meta_research.owners.research_memory import (
     ASSET_HISTORY_QUERY_MAX_PAGE_SIZE,
@@ -295,6 +296,83 @@ class ReleaseEligibilityRequest(BaseModel):
 
 class EmptyCommandRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class CompanionMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_ref: str | None = Field(default=None, min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=INTENT_MESSAGE_MAX_LENGTH)
+
+
+class HumanRequestResponseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["provided", "declined", "deferred"]
+    facts: dict[str, object] = Field(default_factory=dict)
+    note: str = Field(default="", max_length=4000)
+
+
+class AgentProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_ref: str = Field(min_length=1, max_length=128)
+    proposal: dict[str, object]
+
+
+class AgentProposalConversionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_scope_ref: str = Field(min_length=1, max_length=128)
+    expected_proposal_hash: str = Field(min_length=64, max_length=64)
+
+
+class SoftConstraintRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_ref: str = Field(min_length=1, max_length=128)
+    guidance: dict[str, object]
+
+
+class WithdrawSoftConstraintRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1)
+
+
+class CommandDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_ref: str = Field(min_length=1, max_length=128)
+    command: dict[str, object]
+
+
+class CommandRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1)
+    command: dict[str, object]
+
+
+class CommandPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draft_revision: int = Field(ge=1)
+    draft_hash: str = Field(min_length=64, max_length=64)
+
+
+class CommandConfirmationRequest(CommandPreviewRequest):
+    preview_ref: str = Field(min_length=1, max_length=64)
+    preview_hash: str = Field(min_length=64, max_length=64)
+
+
+class CapabilityAuthorizationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capability: str = Field(min_length=1, max_length=64)
+    decision: Literal["granted", "denied", "revoked"]
+    scope: dict[str, object]
+    confirmation_receipt_ref: str = Field(min_length=1, max_length=64)
 
 
 def create_app(
@@ -752,6 +830,181 @@ def create_app(
     @app.get("/api/v1/session")
     def session_status() -> dict[str, str]:
         return {"status": "authenticated"}
+
+    @app.post("/api/v1/companion/messages", status_code=202)
+    def send_companion_message(
+        request: Request, message: CompanionMessageRequest
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.send_companion_message(
+            message.scope_ref or "workspace",
+            message.message,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-requests/{request_ref}/responses", status_code=201
+    )
+    def respond_to_human_request(
+        request_ref: str,
+        request: Request,
+        response: HumanRequestResponseRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.respond_to_human_request(
+            request_ref,
+            decision=response.decision,
+            facts=response.facts,
+            note=response.note,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post("/api/v1/human-collaboration/agent-proposals", status_code=201)
+    def record_agent_proposal(
+        request: Request, proposal: AgentProposalRequest
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.record_agent_proposal(
+            proposal.scope_ref,
+            proposal.proposal,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-collaboration/agent-proposals/{proposal_ref}/soft-constraint",
+        status_code=201,
+    )
+    def convert_agent_proposal_to_soft_constraint(
+        proposal_ref: str,
+        request: Request,
+        conversion: AgentProposalConversionRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.convert_agent_proposal_to_soft_constraint(
+            proposal_ref,
+            expected_scope_ref=conversion.expected_scope_ref,
+            expected_proposal_hash=conversion.expected_proposal_hash,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-collaboration/agent-proposals/{proposal_ref}/command-draft",
+        status_code=201,
+    )
+    def convert_agent_proposal_to_command_draft(
+        proposal_ref: str,
+        request: Request,
+        conversion: AgentProposalConversionRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.convert_agent_proposal_to_command_draft(
+            proposal_ref,
+            expected_scope_ref=conversion.expected_scope_ref,
+            expected_proposal_hash=conversion.expected_proposal_hash,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post("/api/v1/human-collaboration/soft-constraints", status_code=201)
+    def record_soft_constraint(
+        request: Request, constraint: SoftConstraintRequest
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.record_soft_constraint(
+            constraint.scope_ref,
+            constraint.guidance,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-collaboration/soft-constraints/{constraint_ref}/withdrawals"
+    )
+    def withdraw_soft_constraint(
+        constraint_ref: str,
+        request: Request,
+        withdrawal: WithdrawSoftConstraintRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.withdraw_soft_constraint(
+            constraint_ref,
+            withdrawal.expected_revision,
+            _idempotency_key(request),
+        )
+
+    @app.post("/api/v1/human-collaboration/commands", status_code=201)
+    def create_command_draft(
+        request: Request, command: CommandDraftRequest
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.create_command_draft(
+            command.scope_ref,
+            command.command,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-collaboration/commands/{intent_id}/revisions",
+        status_code=201,
+    )
+    def revise_command_draft(
+        intent_id: str,
+        request: Request,
+        revision: CommandRevisionRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.revise_command_draft(
+            intent_id,
+            revision.expected_revision,
+            revision.command,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-collaboration/commands/{intent_id}/previews",
+        status_code=201,
+    )
+    def preview_command(
+        intent_id: str,
+        request: Request,
+        preview: CommandPreviewRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.preview_command(
+            intent_id,
+            preview.draft_revision,
+            preview.draft_hash,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-collaboration/commands/{intent_id}/confirmations",
+        status_code=201,
+    )
+    def confirm_command(
+        intent_id: str,
+        request: Request,
+        confirmation: CommandConfirmationRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.confirm_command(
+            intent_id,
+            confirmation.draft_revision,
+            confirmation.draft_hash,
+            confirmation.preview_ref,
+            confirmation.preview_hash,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-collaboration/commands/{intent_id}/authorizations",
+        status_code=201,
+    )
+    def decide_capability_authorization(
+        intent_id: str,
+        request: Request,
+        authorization: CapabilityAuthorizationRequest,
+    ) -> dict[str, object]:
+        command = runtime.owners.human_collaboration.query_command(intent_id)
+        receipt = command.get("confirmation_receipt")
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("receipt_ref")
+            != authorization.confirmation_receipt_ref
+        ):
+            raise OwnerConflict("authorization_confirmation_invalid")
+        return runtime.owners.human_collaboration.decide_capability_authorization(
+            str(command["scope_ref"]),
+            authorization.model_dump(),
+            _idempotency_key(request),
+        )
 
     @app.post("/api/v1/quest-initializations", status_code=201)
     async def create_quest_initialization(
@@ -1488,7 +1741,11 @@ def _set_session_cookie(response, session: AuthSession) -> None:
 
 def _idempotency_key(request: Request) -> str:
     value = request.headers.get("idempotency-key", "")
-    if not 1 <= len(value) <= 128 or any(character.isspace() for character in value):
+    if (
+        not 1 <= len(value) <= 128
+        or any(character.isspace() for character in value)
+        or contains_secret(value)
+    ):
         raise HTTPException(
             status_code=400,
             detail={"code": "idempotency_key_invalid"},

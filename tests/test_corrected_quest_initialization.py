@@ -2288,7 +2288,7 @@ def test_corrected_v2_confirmation_preserves_the_owner_receipt_chain(
         draft.update(
             {
                 "goal": "验证 corrected v2 receipt 链。",
-                "completion_criteria": "五层 receipt 均可独立复核。",
+                "completion_criteria": "六层 receipt 均可独立复核。",
                 "background_and_initial_direction": "验证兼容性。",
             }
         )
@@ -2327,6 +2327,7 @@ def test_corrected_v2_confirmation_preserves_the_owner_receipt_chain(
         } == {
             "human_confirmation": "accepted",
             "quest_goal": "accepted",
+            "broad_research_authorization": "accepted",
             "question_content": "accepted",
             "question_identity": "accepted",
             "cycle_activation": "accepted",

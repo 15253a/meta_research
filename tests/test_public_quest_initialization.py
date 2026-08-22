@@ -478,6 +478,7 @@ def test_injected_async_success_auto_previews_and_recovers_owner_receipts(
         (assertion["owner"], assertion["operation"])
         for assertion in preview["target_assertions"]
     } == {
+        ("human_collaboration", "issue_broad_research_authorization"),
         ("research_graph", "accept_quest"),
         ("research_memory", "accept_question_content"),
         ("research_graph", "accept_root_question"),
@@ -509,7 +510,7 @@ def test_injected_async_success_auto_previews_and_recovers_owner_receipts(
     assert set(accepted_before_restart) == {
         "human_confirmation",
         "quest_goal",
-        "question_content",
+        "broad_research_authorization",
     }
 
     client.close()
@@ -540,6 +541,7 @@ def test_injected_async_success_auto_previews_and_recovers_owner_receipts(
     } == {
         "human_confirmation": "accepted",
         "quest_goal": "accepted",
+        "broad_research_authorization": "accepted",
         "question_content": "accepted",
         "question_identity": "accepted",
         "cycle_activation": "accepted",
@@ -552,7 +554,7 @@ def test_injected_async_success_auto_previews_and_recovers_owner_receipts(
     receipt_refs = [
         receipt["receipt_ref"] for receipt in completed["receipts"].values()
     ]
-    assert len(receipt_refs) == len(set(receipt_refs)) == 5
+    assert len(receipt_refs) == len(set(receipt_refs)) == 6
     assert completed["quest_ref"].startswith("quest_")
     assert completed["question_ref"].startswith("question_")
     assert completed["cycle_ref"].startswith("cycle_")

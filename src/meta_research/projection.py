@@ -7,7 +7,7 @@ from meta_research import __version__
 from meta_research.feed import DurableFeed
 from meta_research.owners.advancement_engine import AdvancementEngineInterface
 from meta_research.owners.agent_runtime import AgentRuntimeInterface
-from meta_research.owners.common import OwnerConflict, OwnerSnapshot
+from meta_research.owners.common import OwnerConflict, OwnerSnapshot, canonical_hash
 from meta_research.owners.human_collaboration import HumanCollaborationInterface
 from meta_research.owners.research_graph import ResearchGraphInterface
 from meta_research.owners.research_memory import ResearchMemoryInterface
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 
 _MAX_SNAPSHOT_ATTEMPTS = 3
+_COLLABORATION_SCOPE_PAGE_SIZE = 101
 
 
 class SnapshotConsistencyUnavailable(RuntimeError):
@@ -50,6 +51,8 @@ class PublicProjection:
         self._human_collaboration = human_collaboration
         self._research_graph = research_graph
         self._research_memory = research_memory
+        self._advancement_engine = advancement_engine
+        self._agent_runtime = agent_runtime
         self._idea_stage = idea_stage
         self._interfaces = {
             "research_graph": research_graph,
@@ -81,6 +84,14 @@ class PublicProjection:
             current_quest_creation = (
                 self._human_collaboration.query_current_quest_creation()
             )
+            collaboration_scope_query = getattr(
+                self._human_collaboration, "query_collaboration_scope", None
+            )
+            collaboration_scope = (
+                collaboration_scope_query()
+                if callable(collaboration_scope_query)
+                else _collaboration_scope(current_quest_creation)
+            )
             idea_stage = (
                 None if self._idea_stage is None else self._idea_stage.query_current()
             )
@@ -88,6 +99,33 @@ class PublicProjection:
                 None
                 if self._idea_stage is None
                 else self._idea_stage.query_current_question()
+            )
+            human_requests = tuple(
+                request
+                for owner in (
+                    self._research_graph,
+                    self._research_memory,
+                    self._agent_runtime,
+                    self._advancement_engine,
+                )
+                for request in owner.query_human_requests()
+            )
+            collaboration_scopes = tuple(
+                dict.fromkeys(
+                    [
+                        collaboration_scope,
+                        *(str(item["request_ref"]) for item in human_requests),
+                    ]
+                )
+            )
+            collaboration = _query_collaboration_pages(
+                self._human_collaboration,
+                collaboration_scopes,
+            )
+            safe_runnable_basis = _safe_meaningful_runnable_basis(
+                self._agent_runtime,
+                collaboration_scope,
+                human_requests,
             )
             projection_inventory = getattr(
                 self._research_memory,
@@ -259,6 +297,12 @@ class PublicProjection:
                 "total_count": asset_total,
                 "has_more": asset_offset + len(research_assets) < asset_total,
             },
+            "human_collaboration": _human_collaboration_projection(
+                collaboration_scope,
+                human_requests,
+                collaboration,
+                safe_runnable_basis,
+            ),
             "unavailable": _release_capabilities(),
         }
         if idea_stage is not None:
@@ -268,6 +312,33 @@ class PublicProjection:
 
 def _query_bounded_inventory(query, *, offset: int, limit: int):
     return query(offset=offset, limit=limit)
+
+
+def _query_collaboration_pages(
+    owner: HumanCollaborationInterface,
+    scopes: tuple[str, ...],
+) -> dict[str, list[dict[str, object]]]:
+    combined = {
+        "messages": [],
+        "soft_constraints": [],
+        "agent_proposals": [],
+        "commands": [],
+        "authorizations": [],
+    }
+    seen: dict[str, set[str]] = {name: set() for name in combined}
+    for offset in range(0, len(scopes), _COLLABORATION_SCOPE_PAGE_SIZE):
+        page = owner.query_collaboration_projection(
+            scopes[offset : offset + _COLLABORATION_SCOPE_PAGE_SIZE]
+        )
+        for name, items in page.items():
+            if name not in combined:
+                raise OwnerConflict("collaboration_projection_invalid")
+            for item in items:
+                identity = canonical_hash(item)
+                if identity not in seen[name]:
+                    seen[name].add(identity)
+                    combined[name].append(item)
+    return combined
 
 
 def _query_related(
@@ -283,6 +354,167 @@ def _query_related(
     return query(**kwargs)
 
 
+def _collaboration_scope(
+    current_quest_creation: dict[str, object] | None,
+) -> str:
+    if current_quest_creation is None:
+        return "workspace"
+    quest_ref = current_quest_creation.get("quest_ref")
+    if isinstance(quest_ref, str) and quest_ref:
+        return f"quest:{quest_ref}"
+    initialization_id = current_quest_creation.get("initialization_id")
+    if isinstance(initialization_id, str) and initialization_id:
+        return f"quest-initialization:{initialization_id}"
+    return "workspace"
+
+
+def _human_collaboration_projection(
+    scope_ref: str,
+    requests: tuple[dict[str, object], ...],
+    collaboration: dict[str, list[dict[str, object]]],
+    safe_runnable_basis: list[dict[str, object]],
+) -> dict[str, object]:
+    quest_ref = (
+        scope_ref.removeprefix("quest:") if scope_ref.startswith("quest:") else None
+    )
+    scoped_requests = (
+        requests
+        if quest_ref is None
+        else tuple(item for item in requests if item.get("quest_ref") == quest_ref)
+    )
+    blocked_waiters = [
+        waiter
+        for request in scoped_requests
+        if request.get("status") == "open"
+        for waiter in request.get("direct_waiters", [])
+        if isinstance(waiter, dict) and waiter.get("status") == "blocked"
+    ]
+    quest_waiting = any(
+        waiter.get("wait_scope") == "quest" for waiter in blocked_waiters
+    )
+    local_waiting = any(
+        waiter.get("wait_scope") == "local" for waiter in blocked_waiters
+    )
+    safe_meaningful_runnable_exists = bool(safe_runnable_basis)
+    blockers = sorted(
+        {
+            blocker
+            for waiter in blocked_waiters
+            for blocker in waiter.get("other_blockers", [])
+            if isinstance(blocker, str)
+        }
+    )
+    ordered_requests = sorted(
+        requests,
+        key=lambda item: (
+            item.get("status") != "open",
+            float(item.get("created_at", 0.0)),
+            str(item.get("request_ref", "")),
+        ),
+    )
+    return {
+        "companion": {
+            "status": "ready",
+            "scope_ref": scope_ref,
+            "messages": collaboration["messages"],
+            "soft_constraints": collaboration["soft_constraints"],
+            "agent_proposals": collaboration["agent_proposals"],
+        },
+        "human_requests": {
+            "status": "ready",
+            "waiting": {
+                "scope": (
+                    "quest"
+                    if quest_waiting and not safe_meaningful_runnable_exists
+                    else "local"
+                    if quest_waiting or local_waiting
+                    else "none"
+                ),
+                "safe_meaningful_runnable_exists": (
+                    safe_meaningful_runnable_exists
+                ),
+                "safe_runnable_basis": safe_runnable_basis,
+                "other_blockers": blockers,
+            },
+            "items": ordered_requests,
+        },
+        "commands": {
+            "status": "ready",
+            "items": collaboration["commands"],
+            "authorizations": collaboration["authorizations"],
+        },
+    }
+
+
+def _safe_meaningful_runnable_basis(
+    agent_runtime: AgentRuntimeInterface,
+    scope_ref: str,
+    requests: tuple[dict[str, object], ...],
+) -> list[dict[str, object]]:
+    """Ask the execution Owner for exact Quest-bound work, never infer from counts."""
+
+    if not scope_ref.startswith("quest:"):
+        return []
+    quest_ref = scope_ref.removeprefix("quest:")
+    if not quest_ref:
+        raise OwnerConflict("collaboration_scope_invalid")
+    blocked_waiters: list[dict[str, object]] = []
+    for request in requests:
+        if request.get("quest_ref") != quest_ref or request.get("status") != "open":
+            continue
+        for waiter in request.get("direct_waiters", []):
+            if not isinstance(waiter, dict) or waiter.get("status") != "blocked":
+                continue
+            waiter_ref = waiter.get("waiter_ref")
+            target_assertion = waiter.get("target_assertion")
+            if not isinstance(waiter_ref, str) or not isinstance(
+                target_assertion, dict
+            ):
+                raise OwnerConflict("safe_meaningful_runnable_projection_invalid")
+            blocked_waiters.append(
+                {
+                    "waiter_ref": waiter_ref,
+                    "target_assertion": dict(target_assertion),
+                }
+            )
+    ordered_blocked_waiters = tuple(
+        sorted(
+            blocked_waiters,
+            key=lambda item: (
+                str(item["waiter_ref"]),
+                canonical_hash(item["target_assertion"]),
+            ),
+        )
+    )
+    query = getattr(agent_runtime, "query_safe_meaningful_runnable", None)
+    if not callable(query):
+        return []
+    observed = query(quest_ref, ordered_blocked_waiters)
+    if not isinstance(observed, (list, tuple)) or len(observed) > 100:
+        raise OwnerConflict("safe_meaningful_runnable_projection_invalid")
+    basis: list[dict[str, object]] = []
+    seen_refs: set[str] = set()
+    for item in observed:
+        if (
+            not isinstance(item, dict)
+            or item.get("owner") != "agent_runtime"
+            or item.get("quest_ref") != quest_ref
+            or not isinstance(item.get("owner_revision"), int)
+            or isinstance(item.get("owner_revision"), bool)
+            or not isinstance(item.get("work_kind"), str)
+            or not isinstance(item.get("work_ref"), str)
+            or not isinstance(item.get("status"), str)
+            or item["work_ref"] in seen_refs
+        ):
+            raise OwnerConflict("safe_meaningful_runnable_projection_invalid")
+        seen_refs.add(str(item["work_ref"]))
+        basis.append(dict(item))
+    return sorted(
+        basis,
+        key=lambda item: (str(item["work_kind"]), str(item["work_ref"])),
+    )
+
+
 def _release_capabilities() -> list[dict[str, object]]:
     reason = {
         "code": "not_enabled_in_this_release",
@@ -295,7 +527,6 @@ def _release_capabilities() -> list[dict[str, object]]:
             "reason": reason.copy(),
         }
         for capability in (
-            "quest_companion",
             "stage_execution",
             "writing",
         )

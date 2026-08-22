@@ -563,6 +563,7 @@ async function expectTargetAssertions(
       .sort(),
   ).toEqual([
     "advancement_engine:activate_initial_cycle",
+    "human_collaboration:issue_broad_research_authorization",
     "research_graph:accept_quest",
     "research_graph:accept_root_question",
     "research_memory:accept_question_content",
@@ -600,7 +601,14 @@ async function expectAcceptedReceipts(
   const accepted = Object.entries(view.receipts).filter(
     ([, receipt]) => receipt.status === "accepted",
   );
-  expect(accepted).toHaveLength(5);
+  expect(accepted.map(([name]) => name).sort()).toEqual([
+    "broad_research_authorization",
+    "cycle_activation",
+    "human_confirmation",
+    "quest_goal",
+    "question_content",
+    "question_identity",
+  ]);
   for (const [name, receipt] of accepted) {
     expect(receipt).toMatchObject({
       issuer: expect.any(String),

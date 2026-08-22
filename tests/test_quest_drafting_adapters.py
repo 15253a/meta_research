@@ -201,6 +201,94 @@ def test_codex_intent_adapter_enforces_the_exact_reply_schema(
         )
 
 
+def test_codex_companion_may_return_one_typed_non_authoritative_proposal(
+    tmp_path: Path,
+) -> None:
+    proposal = {
+        "proposal_kind": "alternative_route",
+        "text": "Prefer OA sources while institutional access is blocked.",
+        "applies_to": ["literature_acquisition"],
+    }
+    runner = RecordingRunner(
+        {"reply": "The institution route is still blocked.", "agent_proposal": proposal},
+        thread_id="companion-native-1",
+    )
+    adapter = CodexDraftingAdapter(tmp_path / "drafting", process_runner=runner)
+
+    result = adapter.reply(
+        IntentTurnRequest(
+            initialization_id="human_request_context_1",
+            draft_revision=0,
+            draft_hash="d" * 64,
+            draft={
+                "interaction_kind": "conversation",
+                "scope_ref": "human_request_context_1",
+                "authoritative_effect": False,
+                "current_context": {
+                    "status": "open",
+                    "obligation": "Reconnect the institution route.",
+                },
+            },
+            message="What alternative is available?",
+            native_session_ref=None,
+        )
+    )
+
+    assert result.agent_proposal == proposal
+    assert "Reconnect the institution route" in runner.calls[0][1]
+    assert set(runner.schemas[0]["required"]) == {"reply", "agent_proposal"}
+
+
+def test_codex_companion_can_propose_a_typed_command_without_authorizing_it(
+    tmp_path: Path,
+) -> None:
+    command = {
+        "command_kind": "capability_authorization",
+        "payload": {
+            "capability": "broad_research",
+            "decision": "revoked",
+            "scope": {
+                "quest_ref": "quest_1",
+                "destination": None,
+                "asset_ref": None,
+                "duration": None,
+                "method": None,
+                "exclusions": [],
+            },
+        },
+    }
+    proposal = {
+        "proposal_kind": "command_draft",
+        "text": "Prepare a revocation draft for explicit human review.",
+        "applies_to": ["quest_authorization"],
+        "command": command,
+    }
+    runner = RecordingRunner(
+        {"reply": "I prepared a non-authoritative draft.", "agent_proposal": proposal},
+        thread_id="companion-command-native-1",
+    )
+    adapter = CodexDraftingAdapter(tmp_path / "drafting", process_runner=runner)
+
+    result = adapter.reply(
+        IntentTurnRequest(
+            initialization_id="quest:quest_1",
+            draft_revision=0,
+            draft_hash="e" * 64,
+            draft={
+                "interaction_kind": "conversation",
+                "scope_ref": "quest:quest_1",
+                "authoritative_effect": False,
+                "current_context": {"quest_ref": "quest_1"},
+            },
+            message="Prepare revocation for review.",
+            native_session_ref=None,
+        )
+    )
+
+    assert result.agent_proposal == proposal
+    assert result.agent_proposal["command"] == command
+
+
 def test_codex_adapter_fails_typed_instead_of_fabricating_a_reply(
     tmp_path: Path,
 ) -> None:

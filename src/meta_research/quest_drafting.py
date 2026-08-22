@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -69,6 +70,7 @@ class IntentTurnResult:
     reply: str
     native_session_ref: str
     adapter_kind: str
+    agent_proposal: dict[str, object] | None = None
 
 
 class ProposalDrafter(Protocol):
@@ -594,6 +596,7 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         finish_job = getattr(self._process_runner, "finish_job", None)
         if callable(finish_job):
             finish_job(job_ref)
+        _remove_durable_job(self._durable_job_directory(job_ref))
 
     def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
         literature_instruction = (
@@ -629,9 +632,19 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         return ProposalDraftResult(content=content, adapter_kind="codex_cli")
 
     def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
+        companion = request.draft.get("interaction_kind") == "conversation"
+        role_instruction = (
+            "你是当前研究上下文中的 Quest Companion。只能依据 current_draft 中的"
+            "已投影事实解释状态、验收边界和替代路线；不得把聊天推断成人类回应、"
+            "约束、确认或授权。若确有一个值得用户显式采纳的可撤回建议，可在"
+            "agent_proposal 返回结构化草案，否则必须返回 null。"
+            if companion
+            else "你是创建 Quest 之前的 Intent Drafting Session 助手。帮助用户澄清意图，"
+            "但只能回复建议；不得修改草稿、确认 bundle、创建领域对象或签发 receipt。"
+        )
         context = (
-            "你是创建 Quest 之前的 Intent Drafting Session 助手。帮助用户澄清意图，"
-            "但只能回复建议；不得修改草稿、确认 bundle、创建领域对象或签发 receipt。\n\n"
+            role_instruction
+            + "\n\n"
             f"initialization_id={request.initialization_id}\n"
             f"current_draft_revision={request.draft_revision}\n"
             f"current_draft_hash={request.draft_hash}\n"
@@ -640,28 +653,103 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         )
         raw, thread_id = self._invoke(
             context,
-            _reply_schema(),
+            _reply_schema(include_agent_proposal=companion),
             native_session_ref=request.native_session_ref,
             ephemeral=False,
             job_ref=request.job_ref,
         )
         reply = raw.get("reply")
+        expected_keys = (
+            {"reply", "agent_proposal"} if companion else {"reply"}
+        )
         if (
-            set(raw) != {"reply"}
+            set(raw) != expected_keys
             or not isinstance(reply, str)
             or not reply.strip()
             or len(reply.strip()) > INTENT_REPLY_MAX_LENGTH
         ):
             raise DraftingUnavailable("codex_intent_reply_invalid")
+        try:
+            agent_proposal = (
+                _validated_agent_proposal(raw.get("agent_proposal"))
+                if companion
+                else None
+            )
+        except (TypeError, ValueError) as error:
+            raise DraftingUnavailable("codex_agent_proposal_invalid") from error
         if thread_id is None:
             raise DraftingUnavailable("codex_session_ref_missing")
         return IntentTurnResult(
             reply=reply.strip(),
             native_session_ref=thread_id,
             adapter_kind="codex_cli",
+            agent_proposal=agent_proposal,
         )
 
     def _invoke(
+        self,
+        prompt: str,
+        schema: dict[str, object],
+        *,
+        native_session_ref: str | None,
+        ephemeral: bool,
+        job_ref: str | None,
+    ) -> tuple[dict[str, object], str | None]:
+        if job_ref is None:
+            return self._invoke_once(
+                prompt,
+                schema,
+                native_session_ref=native_session_ref,
+                ephemeral=ephemeral,
+                job_ref=None,
+            )
+        invocation = {
+            "schema_ref": "meta-research/codex-drafting-job/v1",
+            "job_ref": job_ref,
+            "prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "schema_hash": hashlib.sha256(
+                _canonical_json(schema).encode("utf-8")
+            ).hexdigest(),
+            "native_session_ref": native_session_ref,
+            "ephemeral": ephemeral,
+        }
+        directory = self._durable_job_directory(job_ref)
+        try:
+            directory.parent.mkdir(parents=True, exist_ok=True)
+            directory.mkdir()
+        except FileExistsError:
+            return _read_durable_job(directory, invocation)
+        _write_durable_json(directory / "invocation.json", invocation)
+        result = self._invoke_once(
+            prompt,
+            schema,
+            native_session_ref=native_session_ref,
+            ephemeral=ephemeral,
+            job_ref=job_ref,
+        )
+        raw, thread_id = result
+        sealed = {
+            "schema_ref": "meta-research/codex-drafting-result/v1",
+            "job_ref": job_ref,
+            "invocation_hash": hashlib.sha256(
+                _canonical_json(invocation).encode("utf-8")
+            ).hexdigest(),
+            "raw": raw,
+            "thread_id": thread_id,
+            "result_hash": hashlib.sha256(
+                _canonical_json(
+                    {"raw": raw, "thread_id": thread_id}
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        _write_durable_json(directory / "result.json", sealed)
+        return result
+
+    def _durable_job_directory(self, job_ref: str) -> Path:
+        digest = hashlib.sha256(job_ref.encode("utf-8")).hexdigest()
+        return self._workspace / ".provider-jobs" / digest
+
+    def _invoke_once(
         self,
         prompt: str,
         schema: dict[str, object],
@@ -733,6 +821,101 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
                 raise DraftingUnavailable("codex_output_invalid")
             thread_id = native_session_ref or _thread_id(completed.stdout)
             return cast(dict[str, object], decoded), thread_id
+
+
+def _write_durable_json(path: Path, value: object) -> None:
+    payload = _canonical_json(value)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_durable_job(
+    directory: Path,
+    expected_invocation: dict[str, object],
+) -> tuple[dict[str, object], str | None]:
+    try:
+        invocation = json.loads(
+            _read_bounded_text(directory / "invocation.json", 64 * 1024)
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DraftingUnavailable("codex_job_spool_invalid") from error
+    if invocation != expected_invocation:
+        raise DraftingUnavailable("codex_job_spool_conflict")
+    result_path = directory / "result.json"
+    if not result_path.is_file():
+        raise DraftingUnavailable("codex_job_outcome_unknown")
+    try:
+        sealed = json.loads(
+            _read_bounded_text(result_path, PROVIDER_RESULT_MAX_BYTES)
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DraftingUnavailable("codex_job_spool_invalid") from error
+    expected_invocation_hash = hashlib.sha256(
+        _canonical_json(expected_invocation).encode("utf-8")
+    ).hexdigest()
+    if (
+        not isinstance(sealed, dict)
+        or set(sealed)
+        != {
+            "schema_ref",
+            "job_ref",
+            "invocation_hash",
+            "raw",
+            "thread_id",
+            "result_hash",
+        }
+        or sealed.get("schema_ref")
+        != "meta-research/codex-drafting-result/v1"
+        or sealed.get("job_ref") != expected_invocation["job_ref"]
+        or sealed.get("invocation_hash") != expected_invocation_hash
+        or not isinstance(sealed.get("raw"), dict)
+        or (
+            sealed.get("thread_id") is not None
+            and not isinstance(sealed.get("thread_id"), str)
+        )
+        or sealed.get("result_hash")
+        != hashlib.sha256(
+            _canonical_json(
+                {
+                    "raw": sealed.get("raw"),
+                    "thread_id": sealed.get("thread_id"),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    ):
+        raise DraftingUnavailable("codex_job_spool_invalid")
+    return cast(dict[str, object], sealed["raw"]), cast(
+        str | None, sealed["thread_id"]
+    )
+
+
+def _remove_durable_job(directory: Path) -> None:
+    for name in ("result.json", "invocation.json"):
+        (directory / name).unlink(missing_ok=True)
+    try:
+        directory.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    try:
+        directory.parent.rmdir()
+    except OSError:
+        pass
 
 
 class NvidiaSmiProbe(HostComputeProbe):
@@ -864,8 +1047,8 @@ def _proposal_schema() -> dict[str, object]:
     }
 
 
-def _reply_schema() -> dict[str, object]:
-    return {
+def _reply_schema(*, include_agent_proposal: bool = False) -> dict[str, object]:
+    schema: dict[str, object] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
@@ -876,6 +1059,167 @@ def _reply_schema() -> dict[str, object]:
             }
         },
         "required": ["reply"],
+    }
+    if include_agent_proposal:
+        properties = cast(dict[str, object], schema["properties"])
+        properties["agent_proposal"] = {
+            "anyOf": [
+                {"type": "null"},
+                _soft_agent_proposal_schema(),
+                _command_agent_proposal_schema(),
+            ]
+        }
+        cast(list[str], schema["required"]).append("agent_proposal")
+    return schema
+
+
+def _validated_agent_proposal(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) not in (
+        {"proposal_kind", "text", "applies_to"},
+        {"proposal_kind", "text", "applies_to", "command"},
+    ):
+        raise TypeError("agent_proposal")
+    proposal_kind = value["proposal_kind"]
+    text_value = value["text"]
+    applies_to = value["applies_to"]
+    if (
+        not isinstance(proposal_kind, str)
+        or not proposal_kind.strip()
+        or len(proposal_kind.strip()) > 64
+        or not isinstance(text_value, str)
+        or not text_value.strip()
+        or len(text_value.strip()) > 8000
+        or not isinstance(applies_to, list)
+        or len(applies_to) > 20
+        or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or len(item.strip()) > 64
+            for item in applies_to
+        )
+    ):
+        raise ValueError("agent_proposal")
+    normalized: dict[str, object] = {
+        "proposal_kind": proposal_kind.strip(),
+        "text": text_value.strip(),
+        "applies_to": [cast(str, item).strip() for item in applies_to],
+    }
+    if "command" in value:
+        command = value["command"]
+        if (
+            proposal_kind.strip() != "command_draft"
+            or not isinstance(command, dict)
+            or set(command) != {"command_kind", "payload"}
+            or command.get("command_kind") != "capability_authorization"
+            or not isinstance(command.get("payload"), dict)
+        ):
+            raise ValueError("agent_proposal")
+        payload = cast(dict[str, object], command["payload"])
+        if (
+            set(payload) != {"capability", "decision", "scope"}
+            or not isinstance(payload.get("capability"), str)
+            or not cast(str, payload["capability"]).strip()
+            or len(cast(str, payload["capability"]).strip()) > 64
+            or payload.get("decision") not in {"granted", "denied", "revoked"}
+            or not isinstance(payload.get("scope"), dict)
+        ):
+            raise ValueError("agent_proposal")
+        normalized["command"] = {
+            "command_kind": "capability_authorization",
+            "payload": {
+                "capability": cast(str, payload["capability"]).strip(),
+                "decision": payload["decision"],
+                "scope": dict(cast(dict[str, object], payload["scope"])),
+            },
+        }
+    return normalized
+
+
+def _proposal_text_properties() -> dict[str, object]:
+    return {
+        "proposal_kind": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+        },
+        "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000,
+        },
+        "applies_to": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+            },
+        },
+    }
+
+
+def _soft_agent_proposal_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": _proposal_text_properties(),
+        "required": ["proposal_kind", "text", "applies_to"],
+    }
+
+
+def _command_agent_proposal_schema() -> dict[str, object]:
+    scope_properties = {
+        name: {"type": ["string", "null"], "maxLength": 2048}
+        for name in ("quest_ref", "destination", "asset_ref", "duration", "method")
+    }
+    scope_properties["exclusions"] = {
+        "type": "array",
+        "maxItems": 20,
+        "items": {"type": "string", "maxLength": 256},
+    }
+    properties = _proposal_text_properties()
+    properties["proposal_kind"] = {"type": "string", "enum": ["command_draft"]}
+    properties["command"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "command_kind": {
+                "type": "string",
+                "enum": ["capability_authorization"],
+            },
+            "payload": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "capability": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                    },
+                    "decision": {
+                        "type": "string",
+                        "enum": ["granted", "denied", "revoked"],
+                    },
+                    "scope": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": scope_properties,
+                        "required": list(scope_properties),
+                    },
+                },
+                "required": ["capability", "decision", "scope"],
+            },
+        },
+        "required": ["command_kind", "payload"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": ["proposal_kind", "text", "applies_to", "command"],
     }
 
 

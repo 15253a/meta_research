@@ -451,6 +451,7 @@ export type QuestCreationView = {
   receipts: Record<
     | "human_confirmation"
     | "quest_goal"
+    | "broad_research_authorization"
     | "question_content"
     | "question_identity"
     | "cycle_activation",
@@ -634,7 +635,266 @@ export type PublicSnapshot = {
   };
   research_assets: ResearchAssetsView;
   idea_stage?: IdeaStageProjection | null;
+  human_collaboration?: HumanCollaborationProjection;
   unavailable: UnavailableCapability[];
+};
+
+export type CompanionMessage = {
+  message_ref?: string;
+  scope_ref?: string | null;
+  role: "user" | "assistant" | "system";
+  content?: string;
+  message?: string;
+  text?: string;
+  status?: "queued" | "processing" | "running" | "completed" | "failed";
+  created_at?: number;
+  reason?: { code?: string } | null;
+};
+
+export type CompanionSoftConstraint = {
+  constraint_ref?: string;
+  scope_ref?: string | null;
+  source_proposal_ref?: string | null;
+  revision?: number;
+  guidance?: Record<string, unknown>;
+  text?: string;
+  content?: string;
+  status: "active" | "withdrawn" | "expired" | "superseded";
+  receipt_ref?: string;
+};
+
+export type CompanionAgentProposal = {
+  proposal_ref?: string;
+  scope_ref?: string | null;
+  proposal?: Record<string, unknown>;
+  proposal_hash?: string;
+  title?: string;
+  summary?: string;
+  content?: string;
+  status?: string;
+  kind?: string;
+  impact_preview?: HumanRequestImpactPreview | null;
+};
+
+export type HumanRequestWaiter = {
+  waiter_ref: string;
+  generation?: number;
+  wait_scope: "local" | "quest";
+  status?: "blocked" | "released" | "cancelled" | "consumed";
+  other_blockers?: string[];
+  target_assertion?: Record<string, unknown>;
+  resume_validation?: null | {
+    validation_ref: string;
+    request_ref: string;
+    waiter_ref: string;
+    generation: number;
+    target_assertion_hash: string;
+    authorization_receipt_ref?: string | null;
+    other_blockers: string[];
+    status: "released" | "blocked";
+    reason?: { code?: string } | null;
+    started_work: boolean;
+    consumption?: null | {
+      consumption_ref: string;
+      request_ref: string;
+      waiter_ref: string;
+      generation: number;
+      validation_ref: string;
+      work_ref: string;
+      work_hash: string;
+      receipt: AssetReceipt;
+      created_at: number;
+    };
+    created_at: number;
+  };
+};
+
+export type HumanRequestImpactPreview = {
+  preview_ref?: string;
+  preview_hash?: string;
+  target_assertion?: Record<string, unknown>;
+  will_change?: string[];
+  will_not_change?: string[];
+  risks?: string[];
+  stale_conditions?: string[];
+};
+
+export type HumanRequestItem = {
+  request_ref: string;
+  request_id: string;
+  revision: number;
+  issuer: string;
+  quest_ref?: string | null;
+  kind:
+    | "library_reconnect"
+    | "external_material_api_access"
+    | "offline_action"
+    | "capability_authorization";
+  status: "open" | "satisfied" | "declined" | "withdrawn" | "expired" | "superseded";
+  obligation: string;
+  business_purpose?: string;
+  target_assertion?: Record<string, unknown>;
+  acceptance_conditions?: string[];
+  required_authorization?: Record<string, unknown> | null;
+  impact_preview?: HumanRequestImpactPreview | null;
+  direct_waiters?: HumanRequestWaiter[];
+  responses?: Array<Record<string, unknown>>;
+  evaluation?: Record<string, unknown> | null;
+  disposition?: Record<string, unknown> | null;
+};
+
+export type HumanRequestResponseBody = {
+  decision: "provided" | "declined" | "deferred";
+  facts: Record<string, unknown>;
+  note: string;
+};
+
+export type PendingHumanRequestResponse = {
+  schema: "meta-research/human-request-response/v1";
+  request_ref: string;
+  response_path: string;
+  sealed_response: PendingHumanRequestAssetResponse["sealed_response"];
+  response_idempotency_key: string;
+  response_write_slot: string;
+};
+
+export type PendingHumanRequestAssetResponse = {
+  schema: "meta-research/human-request-asset-response/v1";
+  request_ref: string;
+  asset_job_ref: string;
+  asset_intake_write_slot: string;
+  fact_prefix: "material" | "result";
+  accepted_asset: AcceptedHumanRequestAssetBinding;
+  response_path: string;
+  sealed_response: {
+    algorithm: "AES-GCM";
+    key_ref: string;
+    iv_base64: string;
+    ciphertext_ref: string;
+    body_hash: string;
+    binding_hash: string;
+  };
+  response_idempotency_key: string;
+  response_write_slot: string;
+};
+
+export type AcceptedHumanRequestAssetBinding = {
+  asset_ref: string;
+  version_ref: string;
+  memory_ref: string;
+  content_hash: string;
+  manifest_hash: string;
+  receipt: AssetReceipt;
+};
+
+type PendingAcceptedHumanRequestAsset = {
+  schema: "meta-research/human-request-accepted-asset/v1";
+  request_ref: string;
+  asset_job_ref: string;
+  asset_intake_write_slot: string;
+  fact_prefix: "material" | "result";
+  accepted_asset: AcceptedHumanRequestAssetBinding;
+};
+
+type PendingHumanRequestAssetIntakeOperation = {
+  schema: "meta-research/human-request-asset-intake/v1";
+  request_ref: string;
+  intake_path: "/api/v1/research-assets/intakes";
+  asset_idempotency_key: string;
+  asset_write_slot: string;
+  sealed_operation: PendingHumanRequestAssetResponse["sealed_response"];
+};
+
+type HumanRequestAssetIntakeOperationBody = {
+  intake: AssetIntakeRequest;
+  response: HumanRequestResponseBody;
+  fact_prefix: "material" | "result";
+};
+
+export type HumanCommandDraft = {
+  command_kind: string;
+  payload: {
+    capability: string;
+    decision: "granted" | "denied" | "revoked";
+    scope: Record<string, unknown>;
+  };
+};
+
+export type HumanCommandOwnerPreview = {
+  source_owner: string;
+  target_assertion: Record<string, unknown>;
+  will_happen: string[];
+  will_not_happen: string[];
+  risks: string[];
+  stale_conditions: string[];
+  digest: string;
+};
+
+export type HumanCommand = {
+  intent_id: string;
+  scope_ref: string;
+  source_proposal_ref?: string | null;
+  status: "draft" | "previewed" | "confirmed" | "cancelled";
+  draft_revision: number;
+  draft_hash: string;
+  draft: HumanCommandDraft;
+  executed: false;
+  impact_preview: null | {
+    preview_ref: string;
+    preview_hash: string;
+    draft_revision: number;
+    draft_hash: string;
+    owner_previews: HumanCommandOwnerPreview[];
+    owner_revisions: Record<string, number>;
+    status: "current" | "stale" | "consumed";
+  };
+  confirmation_receipt: null | AssetReceipt & { status: "accepted" };
+  authorization?: HumanCapabilityAuthorization | null;
+};
+
+export type HumanCapabilityAuthorization = {
+  authorization_ref: string;
+  scope_ref: string;
+  authorization_kind: "capability" | "broad_research";
+  capability: string | null;
+  decision: "granted" | "denied" | "revoked";
+  status: string;
+  requirement: Record<string, unknown>;
+  policy: Record<string, unknown>;
+  confirmation_receipt_ref: string;
+  quest_ref: string | null;
+  receipt_ref: string;
+  receipt: AssetReceipt;
+  created_at: number;
+  is_current?: boolean;
+  effective_decision?: "granted" | "denied" | "revoked";
+};
+
+export type HumanCollaborationProjection = {
+  companion: {
+    status: "ready" | "unavailable";
+    scope_ref?: string | null;
+    messages: CompanionMessage[];
+    soft_constraints: CompanionSoftConstraint[];
+    agent_proposals: CompanionAgentProposal[];
+    reason?: { code?: string } | null;
+  };
+  human_requests: {
+    status: "ready" | "unavailable";
+    waiting: {
+      scope: "none" | "local" | "quest";
+      safe_meaningful_runnable_exists: boolean;
+      other_blockers: string[];
+    };
+    items: HumanRequestItem[];
+    reason?: { code?: string } | null;
+  };
+  commands: {
+    status: "ready" | "unavailable";
+    items: HumanCommand[];
+    authorizations: HumanCapabilityAuthorization[];
+    reason?: { code?: string } | null;
+  };
 };
 
 export class ProductError extends Error {
@@ -653,6 +913,720 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
     throw new ProductError(`snapshot_unavailable:${response.status}`);
   }
   return (await response.json()) as PublicSnapshot;
+}
+
+export function sendCompanionMessage(
+  message: string,
+  scopeRef?: string | null,
+): Promise<Record<string, unknown>> {
+  return writeJson("/api/v1/companion/messages", "POST", {
+    ...(scopeRef ? { scope_ref: scopeRef } : {}),
+    message,
+  });
+}
+
+export async function respondToHumanRequest(
+  requestRef: string,
+  response: HumanRequestResponseBody,
+): Promise<Record<string, unknown>> {
+  return runHumanRequestRecoverySingleFlight(
+    `response-submit:${requestRef}`,
+    requestRef,
+    async () => {
+      await stageHumanRequestResponse(requestRef, response);
+      return deliverPendingHumanRequestResponseOnce(requestRef);
+    },
+  );
+}
+
+async function stageHumanRequestResponse(
+  requestRef: string,
+  response: HumanRequestResponseBody,
+): Promise<PendingHumanRequestResponse> {
+  await hydratePendingHumanRequestRecovery();
+  const responsePath = humanRequestResponsePath(requestRef);
+  const responseBody = JSON.parse(JSON.stringify(response)) as HumanRequestResponseBody;
+  const bodyJson = JSON.stringify(responseBody);
+  const bodyHash = await sha256Hex(bodyJson);
+  const existing = readPendingHumanRequestResponse(requestRef);
+  if (existing) {
+    if (existing.request_ref !== requestRef
+        || existing.response_path !== responsePath
+        || existing.sealed_response.body_hash !== bodyHash) {
+      throw new ProductError("human_request_response_recovery_conflict");
+    }
+    return existing;
+  }
+  if (readPendingHumanRequestAssetResponse(requestRef)
+      || readPendingHumanRequestAssetIntakeOperation(requestRef)
+      || readPendingAcceptedHumanRequestAsset(requestRef)) {
+    throw new ProductError("human_request_response_recovery_conflict");
+  }
+  const pendingWrite = await reserveIdempotencyKey("POST", responsePath, bodyJson);
+  const bindingJson = JSON.stringify({
+    schema: "meta-research/human-request-response/v1",
+    request_ref: requestRef,
+    response_path: responsePath,
+    response_idempotency_key: pendingWrite.key,
+    response_write_slot: pendingWrite.slot,
+  });
+  let preparedResponse: PreparedHumanRequestRecoveryPayload;
+  try {
+    preparedResponse = await sealHumanRequestResponse(bodyJson, bodyHash, bindingJson);
+  } catch (error) {
+    pendingWrite.clear();
+    throw error;
+  }
+  const delivery: PendingHumanRequestResponse = {
+    schema: "meta-research/human-request-response/v1",
+    request_ref: requestRef,
+    response_path: responsePath,
+    sealed_response: preparedResponse.sealed,
+    response_idempotency_key: pendingWrite.key,
+    response_write_slot: pendingWrite.slot,
+  };
+  const serialized = JSON.stringify(delivery);
+  try {
+    await storeHumanRequestRecoveryRecord(
+      "response",
+      requestRef,
+      serialized,
+      preparedResponse,
+    );
+  } catch (error) {
+    pendingWrite.clear();
+    throw error;
+  }
+  return delivery;
+}
+
+export function pendingHumanRequestResponse(
+  requestRef?: string,
+): PendingHumanRequestResponse | null {
+  return readPendingHumanRequestResponse(requestRef);
+}
+
+export function deliverPendingHumanRequestResponse(
+  requestRef: string,
+): Promise<Record<string, unknown>> {
+  return runHumanRequestRecoverySingleFlight(
+    `response:${requestRef}`,
+    requestRef,
+    () => deliverPendingHumanRequestResponseOnce(requestRef),
+  );
+}
+
+async function deliverPendingHumanRequestResponseOnce(
+  requestRef: string,
+): Promise<Record<string, unknown>> {
+  await hydratePendingHumanRequestRecovery();
+  const delivery = readPendingHumanRequestResponse(requestRef);
+  if (!delivery || delivery.request_ref !== requestRef
+      || delivery.response_path !== humanRequestResponsePath(requestRef)) {
+    throw new ProductError("human_request_response_recovery_conflict");
+  }
+  const response = await unsealHumanRequestResponseBody(
+    delivery.sealed_response,
+    humanRequestResponseDeliveryBindingJson(delivery),
+  );
+  const responseWrite: { value: PendingWrite | null } = { value: null };
+  try {
+    const result = await writeJson<Record<string, unknown>>(
+      delivery.response_path,
+      "POST",
+      response,
+      {
+        retainPending: () => true,
+        onRetained: () => undefined,
+        onReserved: (pendingWrite) => {
+          if (pendingWrite.key !== delivery.response_idempotency_key
+              || pendingWrite.slot !== delivery.response_write_slot) {
+            throw new ProductError("human_request_response_idempotency_mismatch");
+          }
+          responseWrite.value = pendingWrite;
+        },
+      },
+    );
+    await deleteHumanRequestRecoveryRecord(
+      "response",
+      delivery.request_ref,
+      JSON.stringify(delivery),
+      delivery.sealed_response,
+    );
+    responseWrite.value?.clear();
+    return result;
+  } catch (error) {
+    if (isCorrectableHumanResponseRejection(error)
+        || isPermanentHumanResponseRejection(error)) {
+      await discardPendingHumanRequestResponse(delivery);
+    }
+    throw error;
+  }
+}
+
+async function stageHumanRequestAssetResponse(
+  requestRef: string,
+  assetJobRef: string,
+  assetIntakeWriteSlot: string,
+  factPrefix: "material" | "result",
+  acceptedAsset: AcceptedHumanRequestAssetBinding,
+  response: HumanRequestResponseBody,
+): Promise<PendingHumanRequestAssetResponse> {
+  await hydratePendingHumanRequestRecovery();
+  const responsePath = humanRequestResponsePath(requestRef);
+  const acceptedAssetBinding = {
+    asset_ref: acceptedAsset.asset_ref,
+    version_ref: acceptedAsset.version_ref,
+    memory_ref: acceptedAsset.memory_ref,
+    content_hash: acceptedAsset.content_hash,
+    manifest_hash: acceptedAsset.manifest_hash,
+    receipt: { ...acceptedAsset.receipt },
+  };
+  const responseBody = JSON.parse(JSON.stringify(response)) as HumanRequestResponseBody;
+  const responseBodyJson = JSON.stringify(responseBody);
+  const responseBodyHash = await sha256Hex(responseBodyJson);
+  const existing = readPendingHumanRequestAssetResponse(requestRef);
+  if (existing) {
+    if (existing.request_ref !== requestRef
+        || existing.asset_job_ref !== assetJobRef
+        || existing.asset_intake_write_slot !== assetIntakeWriteSlot
+        || existing.fact_prefix !== factPrefix
+        || existing.response_path !== responsePath
+        || existing.sealed_response.body_hash !== responseBodyHash
+        || JSON.stringify(existing.accepted_asset) !== JSON.stringify(acceptedAssetBinding)) {
+      throw new ProductError("human_request_asset_response_recovery_conflict");
+    }
+    return existing;
+  }
+  const pendingWrite = await reserveIdempotencyKey("POST", responsePath, responseBodyJson);
+  const bindingJson = JSON.stringify({
+    schema: "meta-research/human-request-asset-response/v1",
+    request_ref: requestRef,
+    asset_job_ref: assetJobRef,
+    asset_intake_write_slot: assetIntakeWriteSlot,
+    fact_prefix: factPrefix,
+    accepted_asset: acceptedAssetBinding,
+    response_path: responsePath,
+    response_idempotency_key: pendingWrite.key,
+    response_write_slot: pendingWrite.slot,
+  });
+  let preparedResponse: PreparedHumanRequestRecoveryPayload;
+  try {
+    preparedResponse = await sealHumanRequestResponse(
+      responseBodyJson,
+      responseBodyHash,
+      bindingJson,
+    );
+  } catch (error) {
+    pendingWrite.clear();
+    throw error;
+  }
+  const delivery: PendingHumanRequestAssetResponse = {
+    schema: "meta-research/human-request-asset-response/v1",
+    request_ref: requestRef,
+    asset_job_ref: assetJobRef,
+    asset_intake_write_slot: assetIntakeWriteSlot,
+    fact_prefix: factPrefix,
+    accepted_asset: acceptedAssetBinding,
+    response_path: responsePath,
+    sealed_response: preparedResponse.sealed,
+    response_idempotency_key: pendingWrite.key,
+    response_write_slot: pendingWrite.slot,
+  };
+  const serialized = JSON.stringify(delivery);
+  try {
+    await storeHumanRequestRecoveryRecord(
+      "asset-response",
+      requestRef,
+      serialized,
+      preparedResponse,
+    );
+  } catch (error) {
+    pendingWrite.clear();
+    throw error;
+  }
+  return delivery;
+}
+
+export function pendingHumanRequestAssetResponse(
+  requestRef?: string,
+): PendingHumanRequestAssetResponse | null {
+  return readPendingHumanRequestAssetResponse(requestRef);
+}
+
+export function pendingHumanRequestAssetIntakeRequestRef(
+  requestRef?: string,
+): string | null {
+  return readPendingHumanRequestAssetIntakeOperation(requestRef)?.request_ref ?? null;
+}
+
+export function pendingAcceptedHumanRequestAssetRequestRef(
+  requestRef?: string,
+): string | null {
+  return readPendingAcceptedHumanRequestAsset(requestRef)?.request_ref ?? null;
+}
+
+export async function stagePendingAcceptedHumanRequestAssetResponse(
+  requestRef: string,
+  response: HumanRequestResponseBody,
+): Promise<PendingHumanRequestAssetResponse> {
+  return runHumanRequestRecoverySingleFlight(
+    `accepted-asset-stage:${requestRef}`,
+    requestRef,
+    () => stagePendingAcceptedHumanRequestAssetResponseOnce(requestRef, response),
+  );
+}
+
+async function stagePendingAcceptedHumanRequestAssetResponseOnce(
+  requestRef: string,
+  response: HumanRequestResponseBody,
+): Promise<PendingHumanRequestAssetResponse> {
+  await hydratePendingHumanRequestRecovery();
+  const accepted = readPendingAcceptedHumanRequestAsset(requestRef);
+  if (!accepted || accepted.request_ref !== requestRef) {
+    throw new ProductError("human_request_accepted_asset_recovery_conflict");
+  }
+  const exactResponse: HumanRequestResponseBody = {
+    ...response,
+    facts: {
+      ...response.facts,
+      [`${accepted.fact_prefix}_source_ref`]: accepted.accepted_asset.memory_ref,
+      [`${accepted.fact_prefix}_version_ref`]: accepted.accepted_asset.version_ref,
+      [`${accepted.fact_prefix}_content_hash`]: accepted.accepted_asset.content_hash,
+      [`${accepted.fact_prefix}_manifest_hash`]: accepted.accepted_asset.manifest_hash,
+      [`${accepted.fact_prefix}_acceptance_receipt_ref`]:
+        accepted.accepted_asset.receipt.receipt_ref,
+    },
+  };
+  const delivery = await stageHumanRequestAssetResponse(
+    accepted.request_ref,
+    accepted.asset_job_ref,
+    accepted.asset_intake_write_slot,
+    accepted.fact_prefix,
+    accepted.accepted_asset,
+    exactResponse,
+  );
+  await deleteHumanRequestRecoveryRecord(
+    "accepted-asset",
+    accepted.request_ref,
+    JSON.stringify(accepted),
+  );
+  return delivery;
+}
+
+export async function resumePendingHumanRequestAssetIntake(
+  requestRef: string,
+): Promise<AssetIntakeResult> {
+  await hydratePendingHumanRequestRecovery();
+  const operation = readPendingHumanRequestAssetIntakeOperation(requestRef);
+  if (!operation || operation.request_ref !== requestRef) {
+    throw new ProductError("human_request_asset_intake_recovery_conflict");
+  }
+  return executeHumanRequestAssetIntakeOperationOnce(operation);
+}
+
+export async function reconcileOrphanedHumanRequestAssetRecovery(
+  currentRequestRefs: string[],
+): Promise<boolean> {
+  await hydratePendingHumanRequestRecovery();
+  const current = new Set(currentRequestRefs);
+  let changed = false;
+  for (const response of readPendingHumanRequestResponses()) {
+    try {
+      await deliverPendingHumanRequestResponse(response.request_ref);
+      changed = true;
+    } catch (error) {
+      if (!readPendingHumanRequestResponse(response.request_ref)) changed = true;
+      else throw error;
+    }
+  }
+
+  for (const delivery of readPendingHumanRequestAssetResponses()) {
+    try {
+      await deliverPendingHumanRequestAssetResponse(delivery.request_ref);
+      changed = true;
+    } catch (error) {
+      if (!readPendingHumanRequestAssetResponse(delivery.request_ref)) changed = true;
+      else throw error;
+    }
+  }
+
+  for (const operation of readPendingHumanRequestAssetIntakeOperations()) {
+    try {
+      const result = await executeHumanRequestAssetIntakeOperation(operation);
+      if (result.status === "accepted" && result.asset) {
+        await deliverPendingHumanRequestAssetResponse(operation.request_ref);
+      }
+      changed = true;
+    } catch (error) {
+      if (!readPendingHumanRequestAssetIntakeOperation(operation.request_ref)
+          && !readPendingHumanRequestAssetResponse(operation.request_ref)) changed = true;
+      else throw error;
+    }
+  }
+
+  for (const accepted of readPendingAcceptedHumanRequestAssets()) {
+    if (current.has(accepted.request_ref)) continue;
+    clearPendingWriteSlot(accepted.asset_intake_write_slot);
+    removePendingAssetIntakeMarker(accepted.asset_job_ref);
+    await deleteHumanRequestRecoveryRecord(
+      "accepted-asset",
+      accepted.request_ref,
+      JSON.stringify(accepted),
+    );
+    changed = true;
+  }
+  return changed;
+}
+
+async function stageHumanRequestAssetIntakeOperation(
+  requestRef: string,
+  pendingWrite: PendingWrite,
+  body: HumanRequestAssetIntakeOperationBody,
+): Promise<PendingHumanRequestAssetIntakeOperation> {
+  const bindingJson = JSON.stringify({
+    schema: "meta-research/human-request-asset-intake/v1",
+    request_ref: requestRef,
+    intake_path: "/api/v1/research-assets/intakes",
+    asset_idempotency_key: pendingWrite.key,
+    asset_write_slot: pendingWrite.slot,
+  });
+  const bodyJson = JSON.stringify(body);
+  const preparedOperation = await sealHumanRequestResponse(
+    bodyJson,
+    await sha256Hex(bodyJson),
+    bindingJson,
+  );
+  const operation: PendingHumanRequestAssetIntakeOperation = {
+    schema: "meta-research/human-request-asset-intake/v1",
+    request_ref: requestRef,
+    intake_path: "/api/v1/research-assets/intakes",
+    asset_idempotency_key: pendingWrite.key,
+    asset_write_slot: pendingWrite.slot,
+    sealed_operation: preparedOperation.sealed,
+  };
+  const serialized = JSON.stringify(operation);
+  await storeHumanRequestRecoveryRecord(
+    "asset-intake",
+    requestRef,
+    serialized,
+    preparedOperation,
+  );
+  return operation;
+}
+
+async function executeHumanRequestAssetIntakeOperation(
+  operation: PendingHumanRequestAssetIntakeOperation,
+): Promise<AssetIntakeResult> {
+  return runHumanRequestRecoverySingleFlight(
+    `asset-intake:${operation.sealed_operation.key_ref}`,
+    operation.request_ref,
+    () => executeHumanRequestAssetIntakeOperationOnce(operation),
+  );
+}
+
+async function executeHumanRequestAssetIntakeOperationOnce(
+  operation: PendingHumanRequestAssetIntakeOperation,
+): Promise<AssetIntakeResult> {
+  const body = await unsealHumanRequestAssetIntakeOperation(operation);
+  const result = await writeJson<AssetIntakeResult>(
+    operation.intake_path,
+    "POST",
+    body.intake,
+    {
+      retainPending: () => true,
+      onReserved: (pendingWrite) => {
+        if (pendingWrite.key !== operation.asset_idempotency_key
+            || pendingWrite.slot !== operation.asset_write_slot) {
+          throw new ProductError("human_request_asset_intake_idempotency_mismatch");
+        }
+      },
+      onRetained: async (result, pendingWrite) => {
+        writeSessionValue(
+          pendingAssetIntakeSlot,
+          JSON.stringify({ job_ref: result.job_ref, write_slot: pendingWrite.slot }),
+        );
+        if (result.status !== "accepted" || !result.asset) return;
+        const exactResponse: HumanRequestResponseBody = {
+          ...body.response,
+          facts: {
+            ...body.response.facts,
+            [`${body.fact_prefix}_source_ref`]: result.asset.memory_ref,
+            [`${body.fact_prefix}_version_ref`]: result.asset.version_ref,
+            [`${body.fact_prefix}_content_hash`]: result.asset.content_hash,
+            [`${body.fact_prefix}_manifest_hash`]: result.asset.manifest_hash,
+            [`${body.fact_prefix}_acceptance_receipt_ref`]: result.asset.receipt.receipt_ref,
+          },
+        };
+        await stageHumanRequestAssetResponse(
+          operation.request_ref,
+          result.job_ref,
+          pendingWrite.slot,
+          body.fact_prefix,
+          result.asset,
+          exactResponse,
+        );
+      },
+    },
+  );
+  if (result.status === "accepted" && result.asset) {
+    removePendingAssetIntakeMarker(result.job_ref);
+  }
+  await clearPendingHumanRequestAssetIntakeOperation(operation);
+  return result;
+}
+
+export function deliverPendingHumanRequestAssetResponse(
+  requestRef: string,
+): Promise<Record<string, unknown>> {
+  return runHumanRequestRecoverySingleFlight(
+    `asset-response:${requestRef}`,
+    requestRef,
+    () => deliverPendingHumanRequestAssetResponseOnce(requestRef),
+  );
+}
+
+async function deliverPendingHumanRequestAssetResponseOnce(
+  requestRef: string,
+): Promise<Record<string, unknown>> {
+  await hydratePendingHumanRequestRecovery();
+  const delivery = readPendingHumanRequestAssetResponse(requestRef);
+  if (!delivery) {
+    throw new ProductError("human_request_asset_response_recovery_missing");
+  }
+  if (delivery.request_ref !== requestRef
+      || delivery.response_path !== humanRequestResponsePath(requestRef)) {
+    throw new ProductError("human_request_asset_response_recovery_conflict");
+  }
+  await clearMatchingHumanRequestAssetIntakeOperation(
+    delivery.request_ref,
+    delivery.asset_intake_write_slot,
+  );
+  removePendingAssetIntakeMarker(delivery.asset_job_ref);
+  await removeMatchingPendingAcceptedHumanRequestAsset(delivery.request_ref);
+  const response = await unsealHumanRequestResponse(delivery);
+  const responseWrite: { value: PendingWrite | null } = { value: null };
+  let result: Record<string, unknown>;
+  try {
+    result = await writeJson<Record<string, unknown>>(
+      delivery.response_path,
+      "POST",
+      response,
+      {
+        retainPending: () => true,
+        onRetained: () => undefined,
+        onReserved: (pendingWrite) => {
+          if (pendingWrite.key !== delivery.response_idempotency_key
+              || pendingWrite.slot !== delivery.response_write_slot) {
+            throw new ProductError("human_request_asset_response_idempotency_mismatch");
+          }
+          responseWrite.value = pendingWrite;
+        },
+      },
+    );
+  } catch (error) {
+    if (isCorrectableHumanResponseRejection(error)) {
+      try {
+        await persistPendingAcceptedHumanRequestAsset(delivery);
+      } catch {
+        // The rejected response is always destroyed even if the non-sensitive
+        // accepted-asset fallback cannot be persisted.
+      }
+      await discardPendingHumanRequestAssetResponse(delivery);
+    } else if (isPermanentHumanResponseRejection(error)) {
+      await discardPendingHumanRequestAssetResponse(delivery);
+    }
+    throw error;
+  }
+
+  // Clearing the asset write first is safe because the accepted facts and receipt
+  // remain sealed in the delivery record. Removing the delivery record before the
+  // response key means a crash can only leave a harmless key, never force a replay
+  // under a new identity.
+  clearPendingWriteSlot(delivery.asset_intake_write_slot);
+  await deleteHumanRequestRecoveryRecord(
+    "asset-response",
+    delivery.request_ref,
+    JSON.stringify(delivery),
+    delivery.sealed_response,
+  );
+  responseWrite.value?.clear();
+  return result;
+}
+
+function isCorrectableHumanResponseRejection(error: unknown): boolean {
+  return error instanceof ProductError && (
+    error.code === "human_response_secret_forbidden"
+    || error.code === "human_request_secret_forbidden"
+    || error.code === "human_collaboration_secret_forbidden"
+    || error.code === "human_response_decision_invalid"
+    || error.code === "human_response_facts_invalid"
+    || error.code === "human_response_facts_too_large"
+    || error.code === "human_response_note_invalid"
+  );
+}
+
+function isPermanentHumanResponseRejection(error: unknown): boolean {
+  return error instanceof ProductError && (
+    error.code === "human_request_not_current"
+    || error.code === "human_request_not_found"
+    || error.code === "idempotency_conflict"
+  );
+}
+
+async function discardPendingHumanRequestAssetResponse(
+  delivery: PendingHumanRequestAssetResponse,
+): Promise<void> {
+  clearPendingWriteSlot(delivery.asset_intake_write_slot);
+  clearPendingWriteSlot(delivery.response_write_slot);
+  removePendingAssetIntakeMarker(delivery.asset_job_ref);
+  await deleteHumanRequestRecoveryRecord(
+    "asset-response",
+    delivery.request_ref,
+    JSON.stringify(delivery),
+    delivery.sealed_response,
+  );
+}
+
+async function discardPendingHumanRequestResponse(
+  delivery: PendingHumanRequestResponse,
+): Promise<void> {
+  clearPendingWriteSlot(delivery.response_write_slot);
+  await deleteHumanRequestRecoveryRecord(
+    "response",
+    delivery.request_ref,
+    JSON.stringify(delivery),
+    delivery.sealed_response,
+  );
+}
+
+function humanRequestResponsePath(requestRef: string): string {
+  return `/api/v1/human-requests/${encodeURIComponent(requestRef)}/responses`;
+}
+
+export function createHumanCommand(
+  scopeRef: string,
+  command: HumanCommandDraft,
+): Promise<HumanCommand> {
+  return writeJson("/api/v1/human-collaboration/commands", "POST", {
+    scope_ref: scopeRef,
+    command,
+  });
+}
+
+export function convertAgentProposalToCommandDraft(
+  proposal: CompanionAgentProposal,
+): Promise<{ proposal: CompanionAgentProposal; command_draft: HumanCommand }> {
+  if (!proposal.proposal_ref || !proposal.scope_ref || !proposal.proposal_hash) {
+    throw new ProductError("agent_proposal_current_basis_required");
+  }
+  return writeJson(
+    `/api/v1/human-collaboration/agent-proposals/${encodeURIComponent(proposal.proposal_ref)}/command-draft`,
+    "POST",
+    {
+      expected_scope_ref: proposal.scope_ref,
+      expected_proposal_hash: proposal.proposal_hash,
+    },
+  );
+}
+
+export function reviseHumanCommand(
+  command: HumanCommand,
+  draft: HumanCommandDraft,
+): Promise<HumanCommand> {
+  return writeJson(
+    `/api/v1/human-collaboration/commands/${encodeURIComponent(command.intent_id)}/revisions`,
+    "POST",
+    { expected_revision: command.draft_revision, command: draft },
+  );
+}
+
+export function previewHumanCommand(command: HumanCommand): Promise<HumanCommand> {
+  return writeJson(
+    `/api/v1/human-collaboration/commands/${encodeURIComponent(command.intent_id)}/previews`,
+    "POST",
+    {
+      draft_revision: command.draft_revision,
+      draft_hash: command.draft_hash,
+    },
+  );
+}
+
+export function confirmHumanCommand(command: HumanCommand): Promise<HumanCommand> {
+  const preview = command.impact_preview;
+  if (!preview || preview.status !== "current") {
+    throw new ProductError("command_preview_current_required");
+  }
+  return writeJson(
+    `/api/v1/human-collaboration/commands/${encodeURIComponent(command.intent_id)}/confirmations`,
+    "POST",
+    {
+      draft_revision: command.draft_revision,
+      draft_hash: command.draft_hash,
+      preview_ref: preview.preview_ref,
+      preview_hash: preview.preview_hash,
+    },
+  );
+}
+
+export function authorizeHumanCommand(
+  command: HumanCommand,
+): Promise<HumanCapabilityAuthorization> {
+  const confirmation = command.confirmation_receipt;
+  if (!confirmation) throw new ProductError("human_confirmation_required");
+  const payload = command.draft.payload;
+  return writeJson(
+    `/api/v1/human-collaboration/commands/${encodeURIComponent(command.intent_id)}/authorizations`,
+    "POST",
+    {
+      capability: payload.capability,
+      decision: payload.decision,
+      scope: payload.scope,
+      confirmation_receipt_ref: confirmation.receipt_ref,
+    },
+  );
+}
+
+export function recordSoftConstraint(
+  scopeRef: string,
+  guidance: Record<string, unknown>,
+): Promise<CompanionSoftConstraint> {
+  return writeJson("/api/v1/human-collaboration/soft-constraints", "POST", {
+    scope_ref: scopeRef,
+    guidance,
+  });
+}
+
+export function convertAgentProposalToSoftConstraint(
+  proposal: CompanionAgentProposal,
+): Promise<{
+  proposal: CompanionAgentProposal;
+  soft_constraint: CompanionSoftConstraint;
+}> {
+  if (!proposal.proposal_ref || !proposal.scope_ref || !proposal.proposal_hash) {
+    throw new ProductError("agent_proposal_current_basis_required");
+  }
+  return writeJson(
+    `/api/v1/human-collaboration/agent-proposals/${encodeURIComponent(proposal.proposal_ref)}/soft-constraint`,
+    "POST",
+    {
+      expected_scope_ref: proposal.scope_ref,
+      expected_proposal_hash: proposal.proposal_hash,
+    },
+  );
+}
+
+export function withdrawSoftConstraint(
+  constraint: CompanionSoftConstraint,
+): Promise<CompanionSoftConstraint> {
+  if (!constraint.constraint_ref || constraint.revision === undefined) {
+    throw new ProductError("soft_constraint_current_revision_required");
+  }
+  return writeJson(
+    `/api/v1/human-collaboration/soft-constraints/${encodeURIComponent(constraint.constraint_ref)}/withdrawals`,
+    "POST",
+    { expected_revision: constraint.revision },
+  );
 }
 
 export async function fetchResearchAssets(
@@ -729,6 +1703,60 @@ export async function submitAssetIntake(
     },
   );
   return result;
+}
+
+export async function submitHumanRequestAssetIntake(
+  requestRef: string,
+  intake: AssetIntakeRequest,
+  response: HumanRequestResponseBody,
+  factPrefix: "material" | "result",
+): Promise<AssetIntakeResult> {
+  return runHumanRequestRecoverySingleFlight(
+    `asset-intake-submit:${requestRef}`,
+    requestRef,
+    () => submitHumanRequestAssetIntakeOnce(
+      requestRef,
+      intake,
+      response,
+      factPrefix,
+    ),
+  );
+}
+
+async function submitHumanRequestAssetIntakeOnce(
+  requestRef: string,
+  intake: AssetIntakeRequest,
+  response: HumanRequestResponseBody,
+  factPrefix: "material" | "result",
+): Promise<AssetIntakeResult> {
+  await hydratePendingHumanRequestRecovery();
+  const existing = readPendingHumanRequestAssetIntakeOperation(requestRef);
+  if (existing) {
+    throw new ProductError("human_request_asset_intake_recovery_conflict");
+  }
+  const operationBody: HumanRequestAssetIntakeOperationBody = {
+    intake: JSON.parse(JSON.stringify(intake)) as AssetIntakeRequest,
+    response: JSON.parse(JSON.stringify(response)) as HumanRequestResponseBody,
+    fact_prefix: factPrefix,
+  };
+  const intakePath = "/api/v1/research-assets/intakes" as const;
+  const pendingWrite = await reserveIdempotencyKey(
+    "POST",
+    intakePath,
+    JSON.stringify(operationBody.intake),
+  );
+  let operation: PendingHumanRequestAssetIntakeOperation;
+  try {
+    operation = await stageHumanRequestAssetIntakeOperation(
+      requestRef,
+      pendingWrite,
+      operationBody,
+    );
+  } catch (error) {
+    pendingWrite.clear();
+    throw error;
+  }
+  return executeHumanRequestAssetIntakeOperationOnce(operation);
 }
 
 export async function fetchAssetIntake(
@@ -960,13 +1988,15 @@ async function writeJson<T>(
   body: object,
   options?: {
     retainPending: (payload: T) => boolean;
-    onRetained: (payload: T, pendingWrite: PendingWrite) => void;
+    onRetained: (payload: T, pendingWrite: PendingWrite) => void | Promise<void>;
+    onReserved?: (pendingWrite: PendingWrite) => void;
   },
 ): Promise<T> {
   const csrfToken = readCookie("meta_research_csrf");
   if (!csrfToken) throw new ProductError("csrf_token_unavailable");
   const bodyJson = JSON.stringify(body);
   const pendingWrite = await reserveIdempotencyKey(method, path, bodyJson);
+  options?.onReserved?.(pendingWrite);
   const response = await fetch(path, {
     method,
     credentials: "same-origin",
@@ -989,13 +2019,69 @@ async function writeJson<T>(
     throw new ProductError(code);
   }
   const payload = (await response.json()) as T;
-  if (options?.retainPending(payload)) options.onRetained(payload, pendingWrite);
+  if (options?.retainPending(payload)) await options.onRetained(payload, pendingWrite);
   else pendingWrite.clear();
   return payload;
 }
 
 const inMemoryPendingWrites = new Map<string, string>();
 const pendingAssetIntakeSlot = "meta_research_pending_asset_intake";
+const pendingHumanRequestResponseSlot = "meta_research_pending_human_request_response";
+const pendingHumanRequestAssetResponseSlot =
+  "meta_research_pending_human_request_asset_response";
+const pendingHumanRequestAssetIntakeOperationSlot =
+  "meta_research_pending_human_request_asset_intake_operation";
+const pendingAcceptedHumanRequestAssetSlot =
+  "meta_research_pending_human_request_accepted_asset";
+const humanRequestRecoveryManifestSlots = [
+  pendingHumanRequestResponseSlot,
+  pendingHumanRequestAssetResponseSlot,
+  pendingHumanRequestAssetIntakeOperationSlot,
+  pendingAcceptedHumanRequestAssetSlot,
+] as const;
+type HumanRequestRecoveryManifestKind =
+  | "response"
+  | "asset-response"
+  | "asset-intake"
+  | "accepted-asset";
+const humanRequestRecoveryManifestKinds: Array<{
+  kind: HumanRequestRecoveryManifestKind;
+  legacySlot: typeof humanRequestRecoveryManifestSlots[number];
+}> = [
+  { kind: "response", legacySlot: pendingHumanRequestResponseSlot },
+  { kind: "asset-response", legacySlot: pendingHumanRequestAssetResponseSlot },
+  { kind: "asset-intake", legacySlot: pendingHumanRequestAssetIntakeOperationSlot },
+  { kind: "accepted-asset", legacySlot: pendingAcceptedHumanRequestAssetSlot },
+];
+const humanRequestRecoveryManifestCache = new Map<string, string>();
+const humanRequestRecoveryFlights = new Map<string, Promise<unknown>>();
+let humanRequestRecoveryHydration: Promise<void> | null = null;
+
+function runHumanRequestRecoverySingleFlight<T>(
+  identity: string,
+  requestRef: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const existing = humanRequestRecoveryFlights.get(identity);
+  if (existing) return existing as Promise<T>;
+  const execute = (): Promise<T> => {
+    if (typeof navigator !== "undefined" && navigator.locks) {
+      return navigator.locks.request(
+        `meta-research:human-request-recovery:${requestRef}`,
+        { mode: "exclusive" },
+        () => operation(),
+      ) as unknown as Promise<T>;
+    }
+    return operation();
+  };
+  const flight = execute().finally(() => {
+    if (humanRequestRecoveryFlights.get(identity) === flight) {
+      humanRequestRecoveryFlights.delete(identity);
+    }
+  });
+  humanRequestRecoveryFlights.set(identity, flight);
+  return flight;
+}
 
 type PendingWrite = { key: string; slot: string; clear: () => void };
 type PendingAssetIntake = { job_ref: string; write_slot: string };
@@ -1044,6 +2130,956 @@ function clearPendingAssetIntake(jobRef: string): void {
   inMemoryPendingWrites.delete(record.write_slot);
   removeSessionValue(record.write_slot);
   removeSessionValue(pendingAssetIntakeSlot);
+}
+
+function removePendingAssetIntakeMarker(jobRef: string): void {
+  const record = readPendingAssetIntake();
+  if (record?.job_ref === jobRef) removeSessionValue(pendingAssetIntakeSlot);
+}
+
+function clearPendingWriteSlot(slot: string): void {
+  inMemoryPendingWrites.delete(slot);
+  removeSessionValue(slot);
+}
+
+function humanRequestRecoveryManifestKey(
+  kind: HumanRequestRecoveryManifestKind,
+  requestRef: string,
+): string {
+  return `meta-research/human-request-recovery/v2:${kind}:${encodeURIComponent(requestRef)}`;
+}
+
+function recoveryManifestValues(kind: HumanRequestRecoveryManifestKind): string[] {
+  const prefix = `meta-research/human-request-recovery/v2:${kind}:`;
+  return Array.from(humanRequestRecoveryManifestCache.entries())
+    .filter(([key]) => key.startsWith(prefix))
+    .map(([, serialized]) => serialized);
+}
+
+function recoveryManifestValue(
+  kind: HumanRequestRecoveryManifestKind,
+  requestRef?: string,
+): string | null {
+  if (requestRef) {
+    return humanRequestRecoveryManifestCache.get(
+      humanRequestRecoveryManifestKey(kind, requestRef),
+    ) ?? null;
+  }
+  return recoveryManifestValues(kind)[0] ?? null;
+}
+
+function parsePendingHumanRequestResponse(
+  value: string | null,
+): PendingHumanRequestResponse | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingHumanRequestResponse>;
+    const sealed = parsed.sealed_response as
+      | Partial<PendingHumanRequestResponse["sealed_response"]>
+      | undefined;
+    const valid = parsed.schema === "meta-research/human-request-response/v1"
+      && typeof parsed.request_ref === "string"
+      && typeof parsed.response_path === "string"
+      && typeof parsed.response_idempotency_key === "string"
+      && typeof parsed.response_write_slot === "string"
+      && sealed?.algorithm === "AES-GCM"
+      && typeof sealed.key_ref === "string"
+      && typeof sealed.iv_base64 === "string"
+      && typeof sealed.ciphertext_ref === "string"
+      && typeof sealed.body_hash === "string"
+      && typeof sealed.binding_hash === "string";
+    if (!valid) throw new ProductError("human_request_response_recovery_invalid");
+    return parsed as PendingHumanRequestResponse;
+  } catch (error) {
+    if (error instanceof ProductError) throw error;
+    throw new ProductError("human_request_response_recovery_invalid");
+  }
+}
+
+function readPendingHumanRequestResponse(
+  requestRef?: string,
+): PendingHumanRequestResponse | null {
+  return parsePendingHumanRequestResponse(recoveryManifestValue("response", requestRef));
+}
+
+function readPendingHumanRequestResponses(): PendingHumanRequestResponse[] {
+  return recoveryManifestValues("response").map((serialized) => {
+    const response = parsePendingHumanRequestResponse(serialized);
+    if (!response) throw new ProductError("human_request_response_recovery_invalid");
+    return response;
+  });
+}
+
+function parsePendingHumanRequestAssetResponse(
+  value: string | null,
+): PendingHumanRequestAssetResponse | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingHumanRequestAssetResponse>;
+    const acceptedAsset = parsed.accepted_asset as
+      | Partial<PendingHumanRequestAssetResponse["accepted_asset"]>
+      | undefined;
+    const receipt = acceptedAsset?.receipt as Partial<AssetReceipt> | undefined;
+    const sealedResponse = parsed.sealed_response as
+      | Partial<PendingHumanRequestAssetResponse["sealed_response"]>
+      | undefined;
+    const valid = parsed.schema === "meta-research/human-request-asset-response/v1"
+      && typeof parsed.request_ref === "string"
+      && typeof parsed.asset_job_ref === "string"
+      && typeof parsed.asset_intake_write_slot === "string"
+      && (parsed.fact_prefix === "material" || parsed.fact_prefix === "result")
+      && typeof parsed.response_path === "string"
+      && typeof parsed.response_idempotency_key === "string"
+      && typeof parsed.response_write_slot === "string"
+      && typeof acceptedAsset?.asset_ref === "string"
+      && typeof acceptedAsset.version_ref === "string"
+      && typeof acceptedAsset.memory_ref === "string"
+      && typeof acceptedAsset.content_hash === "string"
+      && typeof acceptedAsset.manifest_hash === "string"
+      && typeof receipt?.issuer === "string"
+      && typeof receipt.kind === "string"
+      && typeof receipt.receipt_ref === "string"
+      && typeof receipt.subject_ref === "string"
+      && typeof receipt.payload_hash === "string"
+      && sealedResponse?.algorithm === "AES-GCM"
+      && typeof sealedResponse.key_ref === "string"
+      && typeof sealedResponse.iv_base64 === "string"
+      && typeof sealedResponse.ciphertext_ref === "string"
+      && typeof sealedResponse.body_hash === "string"
+      && typeof sealedResponse.binding_hash === "string";
+    if (!valid) {
+      throw new ProductError("human_request_asset_response_recovery_invalid");
+    }
+    return parsed as PendingHumanRequestAssetResponse;
+  } catch (error) {
+    if (error instanceof ProductError) throw error;
+    throw new ProductError("human_request_asset_response_recovery_invalid");
+  }
+}
+
+function readPendingHumanRequestAssetResponse(
+  requestRef?: string,
+): PendingHumanRequestAssetResponse | null {
+  return parsePendingHumanRequestAssetResponse(
+    recoveryManifestValue("asset-response", requestRef),
+  );
+}
+
+function readPendingHumanRequestAssetResponses(): PendingHumanRequestAssetResponse[] {
+  return recoveryManifestValues("asset-response").map((serialized) => {
+    const response = parsePendingHumanRequestAssetResponse(serialized);
+    if (!response) {
+      throw new ProductError("human_request_asset_response_recovery_invalid");
+    }
+    return response;
+  });
+}
+
+function parsePendingHumanRequestAssetIntakeOperation(
+  value: string | null,
+):
+  PendingHumanRequestAssetIntakeOperation | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingHumanRequestAssetIntakeOperation>;
+    const sealed = parsed.sealed_operation as
+      | Partial<PendingHumanRequestAssetResponse["sealed_response"]>
+      | undefined;
+    const valid = parsed.schema === "meta-research/human-request-asset-intake/v1"
+      && typeof parsed.request_ref === "string"
+      && parsed.intake_path === "/api/v1/research-assets/intakes"
+      && typeof parsed.asset_idempotency_key === "string"
+      && typeof parsed.asset_write_slot === "string"
+      && sealed?.algorithm === "AES-GCM"
+      && typeof sealed.key_ref === "string"
+      && typeof sealed.iv_base64 === "string"
+      && typeof sealed.ciphertext_ref === "string"
+      && typeof sealed.body_hash === "string"
+      && typeof sealed.binding_hash === "string";
+    if (!valid) {
+      throw new ProductError("human_request_asset_intake_recovery_invalid");
+    }
+    return parsed as PendingHumanRequestAssetIntakeOperation;
+  } catch (error) {
+    if (error instanceof ProductError) throw error;
+    throw new ProductError("human_request_asset_intake_recovery_invalid");
+  }
+}
+
+function readPendingHumanRequestAssetIntakeOperation(
+  requestRef?: string,
+): PendingHumanRequestAssetIntakeOperation | null {
+  return parsePendingHumanRequestAssetIntakeOperation(
+    recoveryManifestValue("asset-intake", requestRef),
+  );
+}
+
+function readPendingHumanRequestAssetIntakeOperations():
+  PendingHumanRequestAssetIntakeOperation[] {
+  return recoveryManifestValues("asset-intake").map((serialized) => {
+    const operation = parsePendingHumanRequestAssetIntakeOperation(serialized);
+    if (!operation) {
+      throw new ProductError("human_request_asset_intake_recovery_invalid");
+    }
+    return operation;
+  });
+}
+
+function parsePendingAcceptedHumanRequestAsset(
+  value: string | null,
+): PendingAcceptedHumanRequestAsset | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingAcceptedHumanRequestAsset>;
+    const asset = parsed.accepted_asset as Partial<AcceptedHumanRequestAssetBinding> | undefined;
+    const receipt = asset?.receipt as Partial<AssetReceipt> | undefined;
+    const valid = parsed.schema === "meta-research/human-request-accepted-asset/v1"
+      && typeof parsed.request_ref === "string"
+      && typeof parsed.asset_job_ref === "string"
+      && typeof parsed.asset_intake_write_slot === "string"
+      && (parsed.fact_prefix === "material" || parsed.fact_prefix === "result")
+      && typeof asset?.asset_ref === "string"
+      && typeof asset.version_ref === "string"
+      && typeof asset.memory_ref === "string"
+      && typeof asset.content_hash === "string"
+      && typeof asset.manifest_hash === "string"
+      && typeof receipt?.issuer === "string"
+      && typeof receipt.kind === "string"
+      && typeof receipt.receipt_ref === "string"
+      && typeof receipt.subject_ref === "string"
+      && typeof receipt.payload_hash === "string";
+    if (!valid) throw new ProductError("human_request_accepted_asset_recovery_invalid");
+    return parsed as PendingAcceptedHumanRequestAsset;
+  } catch (error) {
+    if (error instanceof ProductError) throw error;
+    throw new ProductError("human_request_accepted_asset_recovery_invalid");
+  }
+}
+
+function readPendingAcceptedHumanRequestAsset(
+  requestRef?: string,
+): PendingAcceptedHumanRequestAsset | null {
+  return parsePendingAcceptedHumanRequestAsset(
+    recoveryManifestValue("accepted-asset", requestRef),
+  );
+}
+
+function readPendingAcceptedHumanRequestAssets(): PendingAcceptedHumanRequestAsset[] {
+  return recoveryManifestValues("accepted-asset").map((serialized) => {
+    const accepted = parsePendingAcceptedHumanRequestAsset(serialized);
+    if (!accepted) {
+      throw new ProductError("human_request_accepted_asset_recovery_invalid");
+    }
+    return accepted;
+  });
+}
+
+async function persistPendingAcceptedHumanRequestAsset(
+  delivery: PendingHumanRequestAssetResponse,
+): Promise<void> {
+  const accepted: PendingAcceptedHumanRequestAsset = {
+    schema: "meta-research/human-request-accepted-asset/v1",
+    request_ref: delivery.request_ref,
+    asset_job_ref: delivery.asset_job_ref,
+    asset_intake_write_slot: delivery.asset_intake_write_slot,
+    fact_prefix: delivery.fact_prefix,
+    accepted_asset: delivery.accepted_asset,
+  };
+  const serialized = JSON.stringify(accepted);
+  await storeHumanRequestRecoveryRecord(
+    "accepted-asset",
+    accepted.request_ref,
+    serialized,
+  );
+}
+
+async function removeMatchingPendingAcceptedHumanRequestAsset(
+  requestRef: string,
+): Promise<void> {
+  const accepted = readPendingAcceptedHumanRequestAsset(requestRef);
+  if (accepted?.request_ref === requestRef) {
+    await deleteHumanRequestRecoveryRecord(
+      "accepted-asset",
+      accepted.request_ref,
+      JSON.stringify(accepted),
+    );
+  }
+}
+
+async function clearPendingHumanRequestAssetIntakeOperation(
+  operation: PendingHumanRequestAssetIntakeOperation,
+): Promise<void> {
+  const current = readPendingHumanRequestAssetIntakeOperation(operation.request_ref);
+  if (!current || current.sealed_operation.key_ref !== operation.sealed_operation.key_ref) return;
+  await deleteHumanRequestRecoveryRecord(
+    "asset-intake",
+    operation.request_ref,
+    JSON.stringify(operation),
+    operation.sealed_operation,
+  );
+}
+
+async function clearMatchingHumanRequestAssetIntakeOperation(
+  requestRef: string,
+  assetWriteSlot: string,
+): Promise<void> {
+  const operation = readPendingHumanRequestAssetIntakeOperation(requestRef);
+  if (!operation || operation.request_ref !== requestRef
+      || operation.asset_write_slot !== assetWriteSlot) return;
+  await clearPendingHumanRequestAssetIntakeOperation(operation);
+}
+
+const humanRequestRecoveryDatabase = "meta_research_human_request_recovery";
+const humanRequestRecoveryKeyStore = "sealed_response_keys";
+const humanRequestRecoveryCiphertextStore = "sealed_payloads";
+const humanRequestRecoveryManifestStore = "recovery_manifests";
+
+type PreparedHumanRequestRecoveryPayload = {
+  sealed: PendingHumanRequestAssetResponse["sealed_response"];
+  key: CryptoKey;
+  ciphertext: ArrayBuffer;
+};
+
+async function sealHumanRequestResponse(
+  bodyJson: string,
+  bodyHash: string,
+  bindingJson: string,
+): Promise<PreparedHumanRequestRecoveryPayload> {
+  const key = await crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+  const keyRef = crypto.randomUUID();
+  const ciphertextRef = crypto.randomUUID();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv,
+      additionalData: new TextEncoder().encode(bindingJson),
+    },
+    key,
+    new TextEncoder().encode(bodyJson),
+  );
+  return {
+    sealed: {
+      algorithm: "AES-GCM",
+      key_ref: keyRef,
+      iv_base64: bytesToBase64(iv),
+      ciphertext_ref: ciphertextRef,
+      body_hash: bodyHash,
+      binding_hash: await sha256Hex(bindingJson),
+    },
+    key,
+    ciphertext,
+  };
+}
+
+async function unsealHumanRequestResponse(
+  delivery: PendingHumanRequestAssetResponse,
+): Promise<HumanRequestResponseBody> {
+  return unsealHumanRequestResponseBody(
+    delivery.sealed_response,
+    humanRequestResponseBindingJson(delivery),
+  );
+}
+
+async function unsealHumanRequestResponseBody(
+  sealedResponse: PendingHumanRequestAssetResponse["sealed_response"],
+  bindingJson: string,
+): Promise<HumanRequestResponseBody> {
+  const bodyJson = await unsealRecoveryPayload(sealedResponse, bindingJson);
+  try {
+    const parsed = JSON.parse(bodyJson) as Partial<HumanRequestResponseBody>;
+    const valid = (parsed.decision === "provided"
+      || parsed.decision === "declined"
+      || parsed.decision === "deferred")
+      && parsed.facts !== null
+      && typeof parsed.facts === "object"
+      && !Array.isArray(parsed.facts)
+      && typeof parsed.note === "string";
+    if (!valid) throw new Error("invalid response shape");
+    return parsed as HumanRequestResponseBody;
+  } catch {
+    throw new ProductError("human_request_asset_response_body_invalid");
+  }
+}
+
+async function unsealHumanRequestAssetIntakeOperation(
+  operation: PendingHumanRequestAssetIntakeOperation,
+): Promise<HumanRequestAssetIntakeOperationBody> {
+  const bindingJson = JSON.stringify({
+    schema: operation.schema,
+    request_ref: operation.request_ref,
+    intake_path: operation.intake_path,
+    asset_idempotency_key: operation.asset_idempotency_key,
+    asset_write_slot: operation.asset_write_slot,
+  });
+  const bodyJson = await unsealRecoveryPayload(operation.sealed_operation, bindingJson);
+  try {
+    const parsed = JSON.parse(bodyJson) as Partial<HumanRequestAssetIntakeOperationBody>;
+    const response = parsed.response as Partial<HumanRequestResponseBody> | undefined;
+    const valid = parsed.intake !== null
+      && typeof parsed.intake === "object"
+      && (parsed.fact_prefix === "material" || parsed.fact_prefix === "result")
+      && (response?.decision === "provided"
+        || response?.decision === "declined"
+        || response?.decision === "deferred")
+      && response.facts !== null
+      && typeof response.facts === "object"
+      && !Array.isArray(response.facts)
+      && typeof response.note === "string";
+    if (!valid) throw new Error("invalid intake operation shape");
+    return parsed as HumanRequestAssetIntakeOperationBody;
+  } catch {
+    throw new ProductError("human_request_asset_intake_body_invalid");
+  }
+}
+
+async function unsealRecoveryPayload(
+  sealed: PendingHumanRequestAssetResponse["sealed_response"],
+  bindingJson: string,
+): Promise<string> {
+  if (await sha256Hex(bindingJson) !== sealed.binding_hash) {
+    throw new ProductError("human_request_recovery_binding_invalid");
+  }
+  const recoveryPayload = await readHumanRequestRecoveryPayload(
+    sealed.key_ref,
+    sealed.ciphertext_ref,
+  );
+  if (!recoveryPayload) {
+    throw new ProductError("human_request_recovery_sealing_key_missing");
+  }
+  let bodyJson: string;
+  try {
+    const plaintext = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: base64ToBytes(sealed.iv_base64),
+        additionalData: new TextEncoder().encode(bindingJson),
+      },
+      recoveryPayload.key,
+      recoveryPayload.ciphertext,
+    );
+    bodyJson = new TextDecoder().decode(plaintext);
+  } catch {
+    throw new ProductError("human_request_recovery_seal_invalid");
+  }
+  if (await sha256Hex(bodyJson) !== sealed.body_hash) {
+    throw new ProductError("human_request_recovery_body_invalid");
+  }
+  return bodyJson;
+}
+
+function humanRequestResponseBindingJson(
+  delivery: PendingHumanRequestAssetResponse,
+): string {
+  return JSON.stringify({
+    schema: delivery.schema,
+    request_ref: delivery.request_ref,
+    asset_job_ref: delivery.asset_job_ref,
+    asset_intake_write_slot: delivery.asset_intake_write_slot,
+    fact_prefix: delivery.fact_prefix,
+    accepted_asset: delivery.accepted_asset,
+    response_path: delivery.response_path,
+    response_idempotency_key: delivery.response_idempotency_key,
+    response_write_slot: delivery.response_write_slot,
+  });
+}
+
+function humanRequestResponseDeliveryBindingJson(
+  delivery: PendingHumanRequestResponse,
+): string {
+  return JSON.stringify({
+    schema: delivery.schema,
+    request_ref: delivery.request_ref,
+    response_path: delivery.response_path,
+    response_idempotency_key: delivery.response_idempotency_key,
+    response_write_slot: delivery.response_write_slot,
+  });
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+async function openHumanRequestRecoveryDatabase(): Promise<IDBDatabase> {
+  if (typeof indexedDB === "undefined") {
+    throw new ProductError("human_request_asset_response_key_store_unavailable");
+  }
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(humanRequestRecoveryDatabase, 3);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(humanRequestRecoveryKeyStore)) {
+        request.result.createObjectStore(humanRequestRecoveryKeyStore);
+      }
+      if (!request.result.objectStoreNames.contains(humanRequestRecoveryCiphertextStore)) {
+        request.result.createObjectStore(humanRequestRecoveryCiphertextStore);
+      }
+      if (!request.result.objectStoreNames.contains(humanRequestRecoveryManifestStore)) {
+        request.result.createObjectStore(humanRequestRecoveryManifestStore);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(new ProductError(
+      "human_request_asset_response_key_store_unavailable",
+    ));
+    request.onblocked = () => reject(new ProductError(
+      "human_request_asset_response_key_store_unavailable",
+    ));
+  });
+}
+
+async function readHumanRequestRecoveryPayload(
+  keyRef: string,
+  ciphertextRef: string,
+): Promise<{ key: CryptoKey; ciphertext: ArrayBuffer } | null> {
+  const database = await openHumanRequestRecoveryDatabase();
+  try {
+    return await new Promise<{ key: CryptoKey; ciphertext: ArrayBuffer } | null>(
+      (resolve, reject) => {
+        const transaction = database.transaction(
+          [humanRequestRecoveryKeyStore, humanRequestRecoveryCiphertextStore],
+          "readonly",
+        );
+        const keyRequest = transaction.objectStore(humanRequestRecoveryKeyStore).get(keyRef);
+        const ciphertextRequest = transaction.objectStore(humanRequestRecoveryCiphertextStore)
+          .get(ciphertextRef);
+        transaction.oncomplete = () => {
+          const key = keyRequest.result as CryptoKey | undefined;
+          const ciphertext = ciphertextRequest.result as ArrayBuffer | undefined;
+          resolve(key && ciphertext ? { key, ciphertext } : null);
+        };
+        transaction.onerror = () => reject(new ProductError(
+          "human_request_asset_response_key_store_unavailable",
+        ));
+        transaction.onabort = () => reject(new ProductError(
+          "human_request_asset_response_key_store_unavailable",
+        ));
+      },
+    );
+  } finally {
+    database.close();
+  }
+}
+
+export function hydratePendingHumanRequestRecovery(): Promise<void> {
+  if (!humanRequestRecoveryHydration) {
+    const hydration = hydratePendingHumanRequestRecoveryOnce();
+    const wrappedHydration = hydration.finally(() => {
+      if (humanRequestRecoveryHydration === wrappedHydration) {
+        humanRequestRecoveryHydration = null;
+      }
+    });
+    humanRequestRecoveryHydration = wrappedHydration;
+  }
+  return humanRequestRecoveryHydration;
+}
+
+async function hydratePendingHumanRequestRecoveryOnce(): Promise<void> {
+  const legacyManifests = await readHumanRequestRecoveryManifests();
+  for (const { legacySlot } of humanRequestRecoveryManifestKinds) {
+    const serialized = legacyManifests.get(legacySlot) ?? readSessionValue(legacySlot);
+    if (!serialized) continue;
+    let descriptor: HumanRequestRecoveryManifestDescriptor;
+    try {
+      descriptor = describeHumanRequestRecoveryManifest(serialized);
+    } catch {
+      continue;
+    }
+    await migrateLegacyHumanRequestRecoveryManifest(
+      legacySlot,
+      humanRequestRecoveryManifestKey(descriptor.kind, descriptor.requestRef),
+      serialized,
+      legacyManifests.has(legacySlot),
+    );
+  }
+
+  const manifests = await reconcileHumanRequestRecoveryDatabase();
+  humanRequestRecoveryManifestCache.clear();
+  manifests.forEach((serialized, key) => {
+    humanRequestRecoveryManifestCache.set(key, serialized);
+    const descriptor = describeHumanRequestRecoveryManifest(serialized);
+    if (descriptor.pendingWrite) {
+      seedPendingWrite(descriptor.pendingWrite.slot, descriptor.pendingWrite.key);
+    }
+  });
+  humanRequestRecoveryManifestKinds.forEach(({ kind }) => {
+    syncHumanRequestRecoverySessionCache(kind);
+  });
+}
+
+function seedPendingWrite(slot: string, key: string): void {
+  inMemoryPendingWrites.set(slot, key);
+  writeSessionValue(slot, key);
+}
+
+type HumanRequestRecoveryManifestDescriptor = {
+  kind: HumanRequestRecoveryManifestKind;
+  requestRef: string;
+  sealed?: PendingHumanRequestAssetResponse["sealed_response"];
+  pendingWrite?: { slot: string; key: string };
+};
+
+function describeHumanRequestRecoveryManifest(
+  serialized: string,
+): HumanRequestRecoveryManifestDescriptor {
+  let schema: unknown;
+  try {
+    schema = (JSON.parse(serialized) as { schema?: unknown }).schema;
+  } catch {
+    throw new ProductError("human_request_recovery_manifest_invalid");
+  }
+  if (schema === "meta-research/human-request-response/v1") {
+    const response = parsePendingHumanRequestResponse(serialized);
+    if (!response) throw new ProductError("human_request_response_recovery_invalid");
+    return {
+      kind: "response",
+      requestRef: response.request_ref,
+      sealed: response.sealed_response,
+      pendingWrite: {
+        slot: response.response_write_slot,
+        key: response.response_idempotency_key,
+      },
+    };
+  }
+  if (schema === "meta-research/human-request-asset-response/v1") {
+    const response = parsePendingHumanRequestAssetResponse(serialized);
+    if (!response) {
+      throw new ProductError("human_request_asset_response_recovery_invalid");
+    }
+    return {
+      kind: "asset-response",
+      requestRef: response.request_ref,
+      sealed: response.sealed_response,
+      pendingWrite: {
+        slot: response.response_write_slot,
+        key: response.response_idempotency_key,
+      },
+    };
+  }
+  if (schema === "meta-research/human-request-asset-intake/v1") {
+    const operation = parsePendingHumanRequestAssetIntakeOperation(serialized);
+    if (!operation) {
+      throw new ProductError("human_request_asset_intake_recovery_invalid");
+    }
+    return {
+      kind: "asset-intake",
+      requestRef: operation.request_ref,
+      sealed: operation.sealed_operation,
+      pendingWrite: {
+        slot: operation.asset_write_slot,
+        key: operation.asset_idempotency_key,
+      },
+    };
+  }
+  if (schema === "meta-research/human-request-accepted-asset/v1") {
+    const accepted = parsePendingAcceptedHumanRequestAsset(serialized);
+    if (!accepted) {
+      throw new ProductError("human_request_accepted_asset_recovery_invalid");
+    }
+    return { kind: "accepted-asset", requestRef: accepted.request_ref };
+  }
+  throw new ProductError("human_request_recovery_manifest_invalid");
+}
+
+function syncHumanRequestRecoverySessionCache(
+  kind: HumanRequestRecoveryManifestKind,
+): void {
+  const legacySlot = humanRequestRecoveryManifestKinds.find(
+    (entry) => entry.kind === kind,
+  )!.legacySlot;
+  const serialized = recoveryManifestValues(kind)[0];
+  if (serialized) writeSessionValue(legacySlot, serialized);
+  else removeSessionValue(legacySlot);
+}
+
+async function storeHumanRequestRecoveryRecord(
+  kind: HumanRequestRecoveryManifestKind,
+  requestRef: string,
+  serialized: string,
+  prepared?: PreparedHumanRequestRecoveryPayload,
+): Promise<void> {
+  const manifestKey = humanRequestRecoveryManifestKey(kind, requestRef);
+  const database = await openHumanRequestRecoveryDatabase();
+  let conflict = false;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(
+        [
+          humanRequestRecoveryKeyStore,
+          humanRequestRecoveryCiphertextStore,
+          humanRequestRecoveryManifestStore,
+        ],
+        "readwrite",
+      );
+      const manifestStore = transaction.objectStore(humanRequestRecoveryManifestStore);
+      const existingRequest = manifestStore.get(manifestKey);
+      existingRequest.onsuccess = () => {
+        const existing = existingRequest.result;
+        if (existing !== undefined && existing !== serialized) {
+          conflict = true;
+          transaction.abort();
+          return;
+        }
+        if (existing === serialized) return;
+        if (prepared) {
+          transaction.objectStore(humanRequestRecoveryKeyStore)
+            .put(prepared.key, prepared.sealed.key_ref);
+          transaction.objectStore(humanRequestRecoveryCiphertextStore)
+            .put(prepared.ciphertext, prepared.sealed.ciphertext_ref);
+        }
+        manifestStore.put(serialized, manifestKey);
+      };
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(new ProductError(
+        "human_request_recovery_manifest_store_unavailable",
+      ));
+      transaction.onabort = () => reject(new ProductError(conflict
+        ? "human_request_recovery_manifest_conflict"
+        : "human_request_recovery_manifest_store_unavailable"));
+    });
+  } finally {
+    database.close();
+  }
+  humanRequestRecoveryManifestCache.set(manifestKey, serialized);
+  syncHumanRequestRecoverySessionCache(kind);
+}
+
+async function deleteHumanRequestRecoveryRecord(
+  kind: HumanRequestRecoveryManifestKind,
+  requestRef: string,
+  expectedSerialized: string,
+  sealed?: PendingHumanRequestAssetResponse["sealed_response"],
+): Promise<void> {
+  const manifestKey = humanRequestRecoveryManifestKey(kind, requestRef);
+  const database = await openHumanRequestRecoveryDatabase();
+  let conflict = false;
+  let deleted = false;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(
+        [
+          humanRequestRecoveryKeyStore,
+          humanRequestRecoveryCiphertextStore,
+          humanRequestRecoveryManifestStore,
+        ],
+        "readwrite",
+      );
+      const manifestStore = transaction.objectStore(humanRequestRecoveryManifestStore);
+      const currentRequest = manifestStore.get(manifestKey);
+      currentRequest.onsuccess = () => {
+        const current = currentRequest.result;
+        if (current === undefined) return;
+        if (current !== expectedSerialized) {
+          conflict = true;
+          transaction.abort();
+          return;
+        }
+        manifestStore.delete(manifestKey);
+        if (sealed) {
+          transaction.objectStore(humanRequestRecoveryKeyStore).delete(sealed.key_ref);
+          transaction.objectStore(humanRequestRecoveryCiphertextStore)
+            .delete(sealed.ciphertext_ref);
+        }
+        deleted = true;
+      };
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(new ProductError(
+        "human_request_recovery_manifest_store_unavailable",
+      ));
+      transaction.onabort = () => reject(new ProductError(conflict
+        ? "human_request_recovery_manifest_conflict"
+        : "human_request_recovery_manifest_store_unavailable"));
+    });
+  } finally {
+    database.close();
+  }
+  if (deleted || humanRequestRecoveryManifestCache.get(manifestKey) === expectedSerialized) {
+    humanRequestRecoveryManifestCache.delete(manifestKey);
+    syncHumanRequestRecoverySessionCache(kind);
+  }
+}
+
+async function readHumanRequestRecoveryManifests(): Promise<Map<string, string>> {
+  const database = await openHumanRequestRecoveryDatabase();
+  try {
+    return await new Promise<Map<string, string>>((resolve, reject) => {
+      const transaction = database.transaction(
+        humanRequestRecoveryManifestStore,
+        "readonly",
+      );
+      const store = transaction.objectStore(humanRequestRecoveryManifestStore);
+      const keysRequest = store.getAllKeys();
+      const valuesRequest = store.getAll();
+      transaction.oncomplete = () => {
+        const keys = keysRequest.result;
+        const values = valuesRequest.result;
+        const entries = keys.flatMap((key, index) => (
+          typeof key === "string" && typeof values[index] === "string"
+            ? [[key, values[index]] as const]
+            : []
+        ));
+        resolve(new Map(entries));
+      };
+      transaction.onerror = () => reject(new ProductError(
+        "human_request_recovery_manifest_store_unavailable",
+      ));
+      transaction.onabort = () => reject(new ProductError(
+        "human_request_recovery_manifest_store_unavailable",
+      ));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function migrateLegacyHumanRequestRecoveryManifest(
+  legacyKey: string,
+  manifestKey: string,
+  serialized: string,
+  deleteLegacy: boolean,
+): Promise<void> {
+  const database = await openHumanRequestRecoveryDatabase();
+  let conflict = false;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(
+        humanRequestRecoveryManifestStore,
+        "readwrite",
+      );
+      const store = transaction.objectStore(humanRequestRecoveryManifestStore);
+      const currentRequest = store.get(manifestKey);
+      currentRequest.onsuccess = () => {
+        if (currentRequest.result !== undefined && currentRequest.result !== serialized) {
+          conflict = true;
+          transaction.abort();
+          return;
+        }
+        if (currentRequest.result === undefined) store.put(serialized, manifestKey);
+        if (deleteLegacy) store.delete(legacyKey);
+      };
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(new ProductError(
+        "human_request_recovery_manifest_store_unavailable",
+      ));
+      transaction.onabort = () => reject(new ProductError(conflict
+        ? "human_request_recovery_manifest_conflict"
+        : "human_request_recovery_manifest_store_unavailable"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function reconcileHumanRequestRecoveryDatabase(): Promise<Map<string, string>> {
+  const database = await openHumanRequestRecoveryDatabase();
+  let validManifests = new Map<string, string>();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(
+        [
+          humanRequestRecoveryKeyStore,
+          humanRequestRecoveryCiphertextStore,
+          humanRequestRecoveryManifestStore,
+        ],
+        "readwrite",
+      );
+      const keyStore = transaction.objectStore(humanRequestRecoveryKeyStore);
+      const ciphertextStore = transaction.objectStore(humanRequestRecoveryCiphertextStore);
+      const manifestStore = transaction.objectStore(humanRequestRecoveryManifestStore);
+      const manifestKeysRequest = manifestStore.getAllKeys();
+      const manifestValuesRequest = manifestStore.getAll();
+      const keyRefsRequest = keyStore.getAllKeys();
+      const ciphertextRefsRequest = ciphertextStore.getAllKeys();
+      let completedReads = 0;
+      const inspect = () => {
+        completedReads += 1;
+        if (completedReads !== 4) return;
+        const existingKeyRefs = new Set(
+          keyRefsRequest.result.filter((key): key is string => typeof key === "string"),
+        );
+        const existingCiphertextRefs = new Set(
+          ciphertextRefsRequest.result.filter(
+            (key): key is string => typeof key === "string",
+          ),
+        );
+        const referencedKeyRefs = new Set<string>();
+        const referencedCiphertextRefs = new Set<string>();
+        const next = new Map<string, string>();
+        manifestKeysRequest.result.forEach((key, index) => {
+          const serialized = manifestValuesRequest.result[index];
+          if (typeof key !== "string" || typeof serialized !== "string") {
+            manifestStore.delete(key);
+            return;
+          }
+          try {
+            const descriptor = describeHumanRequestRecoveryManifest(serialized);
+            const exactKey = humanRequestRecoveryManifestKey(
+              descriptor.kind,
+              descriptor.requestRef,
+            );
+            const payloadPresent = !descriptor.sealed
+              || (existingKeyRefs.has(descriptor.sealed.key_ref)
+                && existingCiphertextRefs.has(descriptor.sealed.ciphertext_ref));
+            if (key !== exactKey || !payloadPresent) {
+              manifestStore.delete(key);
+              return;
+            }
+            next.set(key, serialized);
+            if (descriptor.sealed) {
+              referencedKeyRefs.add(descriptor.sealed.key_ref);
+              referencedCiphertextRefs.add(descriptor.sealed.ciphertext_ref);
+            }
+          } catch {
+            manifestStore.delete(key);
+          }
+        });
+        existingKeyRefs.forEach((key) => {
+          if (!referencedKeyRefs.has(key)) keyStore.delete(key);
+        });
+        existingCiphertextRefs.forEach((key) => {
+          if (!referencedCiphertextRefs.has(key)) ciphertextStore.delete(key);
+        });
+        validManifests = next;
+      };
+      manifestKeysRequest.onsuccess = inspect;
+      manifestValuesRequest.onsuccess = inspect;
+      keyRefsRequest.onsuccess = inspect;
+      ciphertextRefsRequest.onsuccess = inspect;
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(new ProductError(
+        "human_request_recovery_manifest_store_unavailable",
+      ));
+      transaction.onabort = () => reject(new ProductError(
+        "human_request_recovery_manifest_store_unavailable",
+      ));
+    });
+  } finally {
+    database.close();
+  }
+  return validManifests;
 }
 
 function readSessionValue(key: string): string | null {
@@ -1103,6 +3139,39 @@ export function followProjection(
     "human_collaboration.quest_initialization_completed",
     "human_collaboration.quest_dispatch_rejected",
     "human_collaboration.quest_dispatch_recovery_started",
+    "human_collaboration.companion_message_queued",
+    "human_collaboration.companion_reply_recorded",
+    "human_collaboration.companion_reply_failed",
+    "human_collaboration.soft_constraint_recorded",
+    "human_collaboration.soft_constraint_withdrawn",
+    "human_collaboration.agent_proposal_recorded",
+    "human_collaboration.command_draft_created",
+    "human_collaboration.command_draft_revised",
+    "human_collaboration.command_preview_recorded",
+    "human_collaboration.command_confirmed",
+    "human_collaboration.capability_authorization_recorded",
+    "human_collaboration.human_request_responded",
+    "human_collaboration.human_request_response_recorded",
+    "research_graph.human_request_opened",
+    "research_graph.human_request_revised",
+    "research_graph.human_request_evaluated",
+    "research_graph.human_request_resume_validated",
+    "research_graph.human_request_resume_consumed",
+    "research_memory.human_request_opened",
+    "research_memory.human_request_revised",
+    "research_memory.human_request_evaluated",
+    "research_memory.human_request_resume_validated",
+    "research_memory.human_request_resume_consumed",
+    "agent_runtime.human_request_opened",
+    "agent_runtime.human_request_revised",
+    "agent_runtime.human_request_evaluated",
+    "agent_runtime.human_request_resume_validated",
+    "agent_runtime.human_request_resume_consumed",
+    "advancement_engine.human_request_opened",
+    "advancement_engine.human_request_revised",
+    "advancement_engine.human_request_evaluated",
+    "advancement_engine.human_request_resume_validated",
+    "advancement_engine.human_request_resume_consumed",
     "research_graph.quest_accepted",
     "research_memory.question_content_accepted",
     "research_graph.root_question_accepted",
