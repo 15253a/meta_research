@@ -17,7 +17,21 @@ from meta_research.deepfetch import (
     DeepFetchResult,
     DeepFetchRuntimeBinding,
 )
+from meta_research.idea_skill import (
+    IdeaSkillDraft,
+    IdeaSkillRequest,
+    IdeaSkillResult,
+)
+from meta_research.owners.agent_runtime import IdeaRuntimeBinding, PlanRuntimeBinding
+from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
+from meta_research.plan_contract import PLAN_DOCUMENT_SCHEMA_REF
+from meta_research.plan_skill import (
+    PlanSkillDraft,
+    PlanSkillRequest,
+    PlanSkillResult,
+    PlanSkillUnavailable,
+)
 from meta_research.quest_drafting import (
     DraftingUnavailable,
     HostComputeDevice,
@@ -169,6 +183,229 @@ class DeterministicDeepFetchProvider:
             native_session_ref="chrome-deepfetch-native-session",
             adapter_kind="chrome_deterministic_deepfetch",
         )
+
+
+class DeterministicIdeaSkill:
+    """The real Idea worker consumes this deterministic external-provider seam."""
+
+    def runtime_binding(self) -> IdeaRuntimeBinding:
+        return IdeaRuntimeBinding(
+            packaged_skill_bundle_hash=canonical_hash(
+                {"skill": "chrome-plan-prerequisite"}
+            ),
+            instruction_set_hash=canonical_hash(
+                {"instructions": "chrome-plan-prerequisite"}
+            ),
+            model_ref="chrome-test-model",
+            harness_adapter_ref="chrome-deterministic-idea-v1",
+            mcp_bindings=(),
+            capability_bindings=(),
+            resource_bindings=(),
+        )
+
+    def generate_draft(self, request: IdeaSkillRequest) -> IdeaSkillDraft:
+        outcome = {
+            "kind": "IdeaSet",
+            "question_ref": request.question_ref,
+            "context_pack_ref": request.context_pack_ref,
+            "candidates": [
+                {
+                    "candidate_key": "rare-morphology-consistency",
+                    "direction": "以跨增强一致性约束自监督去噪。",
+                    "rationale": "结构一致性与像素重建具有不同偏置。",
+                    "assumptions": ["稀有形态在受控增强下保持拓扑稳定。"],
+                    "risks": ["一致性约束可能同时保留传感器伪影。"],
+                    "evidence_boundary": {
+                        "accepted_evidence_refs": [],
+                        "supported": "Question 固定了低照度形态保真范围。",
+                        "inferred": "结构一致性可能改善稀有形态保真。",
+                        "unknown": "跨设备稳健性未知。",
+                    },
+                    "falsification_hint": {
+                        "test": "比较稀有形态召回率与伪影率。",
+                        "would_refute": "召回率未改善或伪影显著增加。",
+                    },
+                    "material_difference": {
+                        "from_history": "当前 ContextPack 没有同一机制。",
+                        "from_peers": "干预轴是结构一致性而非像素误差。",
+                        "plan_commitment_change": "Plan 需比较一致性与像素基线。",
+                    },
+                }
+            ],
+            "recommendation": None,
+        }
+        return IdeaSkillDraft(
+            draft=outcome,
+            primary_session_ref=request.native_session_ref
+            or "chrome-idea-primary-session",
+            adapter_kind="chrome_deterministic_idea",
+        )
+
+    def review_draft(
+        self, request: IdeaSkillRequest, draft: IdeaSkillDraft
+    ) -> IdeaSkillResult:
+        return IdeaSkillResult(
+            reviewed_draft=draft.draft,
+            final_outcome=draft.draft,
+            findings=(),
+            dispositions=(),
+            primary_session_ref=draft.primary_session_ref,
+            review_mode="harness_child_agent",
+            reviewer_agent_ref="chrome-idea-child-reviewer",
+            adapter_kind="chrome_deterministic_idea",
+        )
+
+    def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
+        return self.review_draft(request, self.generate_draft(request))
+
+
+class ProviderPhaseControl:
+    """Private adapter handshake; it never changes Owner or Projection state."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._stopped = threading.Event()
+
+    def wait_for_release(self, phase: str) -> None:
+        (self._root / f"{phase}.started").write_text(
+            "started\n", encoding="utf-8"
+        )
+        release = self._root / f"{phase}.release"
+        while not release.is_file():
+            if self._stopped.wait(timeout=0.025):
+                raise PlanSkillUnavailable("chrome_plan_provider_stopped")
+
+    def request_stop(self) -> None:
+        self._stopped.set()
+
+
+class ControlledDeterministicPlanSkill:
+    """A deterministic external provider exercised by the production Plan worker."""
+
+    def __init__(self, control: ProviderPhaseControl) -> None:
+        self._control = control
+
+    def request_stop(self) -> None:
+        self._control.request_stop()
+
+    def runtime_binding(self) -> PlanRuntimeBinding:
+        return PlanRuntimeBinding(
+            packaged_skill_bundle_hash=canonical_hash(
+                {"skill": "chrome-production-plan"}
+            ),
+            instruction_set_hash=canonical_hash(
+                {"instructions": "chrome-production-plan"}
+            ),
+            model_ref="chrome-test-model",
+            harness_adapter_ref="chrome-deterministic-plan-v1",
+            mcp_bindings=(),
+            capability_bindings=(),
+            resource_bindings=(),
+        )
+
+    def _document(self, request: PlanSkillRequest) -> dict[str, object]:
+        idea_ref = request.accepted_idea_set["candidates"][0]["candidate_key"]
+        obligation = {
+            "obligation_key": "rare-morphology-comparison",
+            "statement": "比较去噪条件对稀有形态保真的差异并报告反例边界。",
+            "minimum_support": "至少一项可复查结果及适用范围。",
+            "question_trace": ["unknown_statement", "answer_shape"],
+            "idea_relevance": [
+                {
+                    "idea_ref": idea_ref,
+                    "role": "experiment_lens",
+                    "rationale": "该候选直接限定比较结构与证伪边界。",
+                }
+            ],
+        }
+        contract_without_hash = {
+            "source_question_ref": request.question_ref,
+            "source_idea_set_ref": request.idea_set_ref,
+            "obligations": [obligation],
+        }
+        answer_contract = {
+            **contract_without_hash,
+            "answer_contract_hash": canonical_hash(contract_without_hash),
+        }
+        return {
+            "schema_ref": PLAN_DOCUMENT_SCHEMA_REF,
+            "kind": "PlanDocument",
+            "question_ref": request.question_ref,
+            "idea_set_ref": request.idea_set_ref,
+            "context_pack_ref": request.context_pack_ref,
+            "answer_contract": answer_contract,
+            "evidence_reuse_set": [],
+            "coverage": [
+                {
+                    "obligation_key": "rare-morphology-comparison",
+                    "disposition": "gap",
+                    "evidence_uses": [],
+                    "insufficiency": "当前证据没有可比较的条件级结果。",
+                }
+            ],
+            "gap_set": ["rare-morphology-comparison"],
+            "experiment_briefs": [
+                {
+                    "experiment_key": "compare-denoising-conditions",
+                    "gap_obligation_keys": ["rare-morphology-comparison"],
+                    "goal": "比较两类去噪条件的形态保真与伪影。",
+                    "characteristics": "固定数据拆分并报告召回率和伪影率。",
+                    "boundary_constraints": "固定预算、标注规则和主指标。",
+                    "semantic_delta": "仅改变去噪条件；保留数据与评价协议。",
+                    "contributing_idea_refs": [idea_ref],
+                }
+            ],
+            "idea_trace": [
+                {
+                    "idea_ref": idea_ref,
+                    "obligation_roles": [
+                        {
+                            "obligation_key": "rare-morphology-comparison",
+                            "role": "experiment_lens",
+                        }
+                    ],
+                }
+            ],
+            "bundle_disposition": "experiments_required",
+            "source_bindings": {
+                "question_ref": request.question_ref,
+                "idea_set_ref": request.idea_set_ref,
+                "context_pack_ref": request.context_pack_ref,
+                "context_pack_hash": request.context_pack_hash,
+                "evidence_reference_revision": request.context_pack[
+                    "evidence_reference_revision"
+                ],
+            },
+        }
+
+    def generate_draft(self, request: PlanSkillRequest) -> PlanSkillDraft:
+        self._control.wait_for_release("plan-primary")
+        return PlanSkillDraft(
+            draft=self._document(request),
+            primary_session_ref=request.native_session_ref
+            or "chrome-plan-primary-session",
+            adapter_kind="chrome_deterministic_plan",
+        )
+
+    def review_draft(
+        self, request: PlanSkillRequest, draft: PlanSkillDraft
+    ) -> PlanSkillResult:
+        self._control.wait_for_release("plan-review")
+        return PlanSkillResult(
+            reviewed_draft=draft.draft,
+            final_plan=draft.draft,
+            findings=(),
+            dispositions=(),
+            primary_session_ref=draft.primary_session_ref,
+            review_mode="harness_child_agent",
+            reviewer_agent_ref="chrome-plan-child-reviewer",
+            adapter_kind="chrome_deterministic_plan",
+        )
+
+    def execute(self, request: PlanSkillRequest) -> PlanSkillResult:
+        draft = self.generate_draft(request)
+        return self.review_draft(request, draft)
 
 
 class TransientResearchGraph:
@@ -361,14 +598,27 @@ async def serve(
     legacy_state: str | None,
     manual_root: bool,
     web_root: Path | None,
+    stage_pipeline: str | None,
 ) -> None:
     intent_started = threading.Event()
     adapter = DeterministicDraftingAdapter(intent_started)
+    prepared_data_root = prepare_data_root(data_root)
+    idea_skill = None
+    plan_skill = None
+    if stage_pipeline == "plan-gap":
+        idea_skill = DeterministicIdeaSkill()
+        plan_skill = ControlledDeterministicPlanSkill(
+            ProviderPhaseControl(
+                prepared_data_root.run / "chrome-provider-control"
+            )
+        )
     runtime = build_production_runtime(
-        prepare_data_root(data_root),
+        prepared_data_root,
         proposal_drafter=adapter,
         intent_drafting_provider=adapter,
         host_compute_probe=SequencedHostProbe(intent_started),
+        idea_skill_provider=idea_skill,
+        plan_skill_provider=plan_skill,
         deepfetch_provider=DeterministicDeepFetchProvider(),
     )
     human_collaboration = runtime.owners.human_collaboration
@@ -442,9 +692,18 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--legacy-state", choices=("draft", "recovering"))
     parser.add_argument("--manual-root", action="store_true")
+    parser.add_argument("--stage-pipeline", choices=("plan-gap",))
     parser.add_argument("--web-root", type=Path)
     args = parser.parse_args()
-    asyncio.run(serve(args.data_root, args.legacy_state, args.manual_root, args.web_root))
+    asyncio.run(
+        serve(
+            args.data_root,
+            args.legacy_state,
+            args.manual_root,
+            args.web_root,
+            args.stage_pipeline,
+        )
+    )
 
 
 if __name__ == "__main__":

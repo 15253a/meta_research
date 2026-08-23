@@ -16,12 +16,18 @@ from meta_research.idea_contract import (
     validate_idea_content,
     validate_idea_context_pack,
 )
+from meta_research.plan_contract import (
+    PlanContractError,
+    validate_plan_context_pack,
+    validate_plan_document,
+)
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
     SQLiteOwnerSnapshot,
 )
 from meta_research.owners.common import (
     AcceptedAssetBinding,
+    AcceptedIdeaSetBinding,
     AcceptedQuestionBinding,
     AcceptanceReceipt,
     AssetBindingVerifier,
@@ -31,6 +37,7 @@ from meta_research.owners.common import (
     ManualQuestionConfirmationVerifier,
     OwnerConflict,
     OwnerSnapshot,
+    PlanContentReceiptVerifier,
     QuestionContentReceiptVerifier,
     StageRunRequestVerifier,
     canonical_hash,
@@ -51,6 +58,8 @@ QUESTION_RECEIPT_KIND = "root_question_acceptance"
 MANUAL_QUESTION_RECEIPT_KIND = "manual_question_acceptance"
 IDEA_ACCEPTED_RECEIPT_KIND = "idea_outcome_accepted"
 IDEA_REJECTED_RECEIPT_KIND = "idea_outcome_rejected"
+FORMAL_PLAN_ACCEPTED_RECEIPT_KIND = "formal_plan_accepted"
+FORMAL_PLAN_REJECTED_RECEIPT_KIND = "formal_plan_rejected"
 ASSET_ROLE_RECEIPT_KIND = "asset_role_acceptance"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 MAX_ASSET_ROLES_PER_QUEST = MAX_IDEA_CONTEXT_EVIDENCE_REFS
@@ -172,6 +181,40 @@ class AcceptedIdeaContent(Protocol):
     receipt: AcceptanceReceipt
 
 
+class AcceptedPlanContent(Protocol):
+    request_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    submission_ref: str
+    initialization_id: str
+    quest_ref: str
+    question_ref: str
+    context_pack_ref: str
+    question_content_ref: str
+    question_content_hash: str
+    question_content_receipt: AcceptanceReceipt
+    question_receipt: AcceptanceReceipt
+    idea_outcome_ref: str
+    idea_content_ref: str
+    idea_content_hash: str
+    idea_content_receipt: AcceptanceReceipt
+    idea_outcome_receipt: AcceptanceReceipt
+    idea_stage_commit_ref: str
+    idea_stage_commit_receipt: AcceptanceReceipt
+    content_ref: str
+    payload_hash: str
+    plan_document_hash: str
+    answer_contract_hash: str
+    reviewed_draft_hash: str
+    review_hash: str
+    plan_document: dict[str, object]
+    reviewed_draft: dict[str, object]
+    review: dict[str, object]
+    execution_receipt: AcceptanceReceipt
+    receipt: AcceptanceReceipt
+
+
 @dataclass(frozen=True)
 class IdeaOutcomeDecision:
     decision_ref: str
@@ -190,6 +233,51 @@ class IdeaOutcomeDecision:
     feedback: tuple[str, ...]
     content_ref: str
     receipt: AcceptanceReceipt
+
+
+@dataclass(frozen=True)
+class FormalPlanDecision:
+    decision_ref: str
+    request_ref: str
+    submission_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    context_pack_ref: str
+    decision: str
+    formal_plan_ref: str | None
+    plan_document_hash: str
+    answer_contract_hash: str
+    bundle_disposition: str
+    reason_code: str | None
+    feedback: tuple[str, ...]
+    content_ref: str
+    receipt: AcceptanceReceipt
+
+
+class TargetCommitEvidenceAuthority(Protocol):
+    """Future #122 authority behind the Plan Baseline Pool projection.
+
+    A generic Research Graph asset role and Research Memory provenance metadata
+    are not proof that a successful TargetCommit selected an evidence leaf.
+    Until the TargetCommit model exists, the public Plan catalog must therefore
+    remain empty rather than manufacturing lineage from those records.
+    """
+
+    def query_plan_evidence_catalog(
+        self, *, quest_ref: str
+    ) -> tuple[int, tuple[dict[str, object], ...]]: ...
+
+    def verify_plan_evidence_catalog(
+        self,
+        *,
+        quest_ref: str,
+        evidence_catalog: list[dict[str, object]],
+        expected_reference_revision: int,
+        require_current: bool = True,
+        require_complete: bool = True,
+        selected_evidence_refs: frozenset[str] | None = None,
+    ) -> None: ...
 
 
 class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
@@ -342,6 +430,10 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
         self, quest_ref: str
     ) -> tuple[int, tuple[str, ...]]: ...
 
+    def query_plan_evidence_catalog(
+        self, *, quest_ref: str
+    ) -> tuple[int, tuple[dict[str, object], ...]]: ...
+
     def query_asset_reference_revision(self) -> int: ...
 
     def query_asset_references(self, version_ref: str) -> tuple[str, ...]: ...
@@ -365,12 +457,29 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
 
     def verify_idea_outcome_decision(self, **values) -> None: ...
 
+    def decide_formal_plan(
+        self,
+        *,
+        accepted_question: AcceptedQuestionBinding,
+        accepted_idea_set: AcceptedIdeaSetBinding,
+        question_content: dict[str, object],
+        content: AcceptedPlanContent,
+        execution_receipt: AcceptanceReceipt,
+    ) -> FormalPlanDecision: ...
+
+    def query_formal_plan_decision(
+        self, submission_ref: str
+    ) -> FormalPlanDecision | None: ...
+
+    def verify_formal_plan_decision(self, **values) -> None: ...
+
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=RG_OWNER,
     statement=text(
         "SELECT revision, quest_count, question_count, idea_outcome_count, "
-        "idea_rejection_count, asset_role_count, evidence_role_count, "
+        "idea_rejection_count, formal_plan_count, plan_rejection_count, "
+        "asset_role_count, evidence_role_count, "
         "source_material_role_count, human_request_count "
         "FROM research_graph_state WHERE singleton = 'owner'"
     ),
@@ -379,6 +488,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "question_count",
         "idea_outcome_count",
         "idea_rejection_count",
+        "formal_plan_count",
+        "plan_rejection_count",
         "asset_role_count",
         "evidence_role_count",
         "source_material_role_count",
@@ -400,6 +511,9 @@ class SQLiteResearchGraphReceiptVerifier:
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
         stage_request_verifier: StageRunRequestVerifier | None = None,
         manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
+        plan_content_verifier: PlanContentReceiptVerifier | None = None,
+        target_commit_evidence_authority: TargetCommitEvidenceAuthority
+        | None = None,
     ) -> None:
         self._database = database
         self._confirmation_verifier = confirmation_verifier
@@ -409,6 +523,10 @@ class SQLiteResearchGraphReceiptVerifier:
         self._execution_verifier = execution_verifier
         self._stage_request_verifier = stage_request_verifier
         self._manual_confirmation_verifier = manual_confirmation_verifier
+        self._plan_content_verifier = plan_content_verifier
+        self._target_commit_evidence_authority = (
+            target_commit_evidence_authority
+        )
 
     def verify_quest_receipt(
         self,
@@ -830,6 +948,64 @@ class SQLiteResearchGraphReceiptVerifier:
         ):
             raise OwnerConflict("idea_context_pack_stale")
 
+    def verify_plan_evidence_catalog(
+        self,
+        *,
+        quest_ref: str,
+        evidence_catalog: list[dict[str, object]],
+        expected_reference_revision: int,
+        require_current: bool = True,
+        require_complete: bool = True,
+        selected_evidence_refs: frozenset[str] | None = None,
+    ) -> None:
+        if (
+            not isinstance(expected_reference_revision, int)
+            or isinstance(expected_reference_revision, bool)
+            or expected_reference_revision < 0
+            or not isinstance(evidence_catalog, list)
+            or (
+                selected_evidence_refs is not None
+                and not isinstance(selected_evidence_refs, frozenset)
+            )
+        ):
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+        authority = self._target_commit_evidence_authority
+        if authority is None:
+            if (
+                expected_reference_revision != 0
+                or evidence_catalog
+                or selected_evidence_refs
+            ):
+                raise OwnerConflict("target_commit_evidence_authority_unavailable")
+            return
+        authority.verify_plan_evidence_catalog(
+            quest_ref=quest_ref,
+            evidence_catalog=evidence_catalog,
+            expected_reference_revision=expected_reference_revision,
+            require_current=require_current,
+            require_complete=require_complete,
+            selected_evidence_refs=selected_evidence_refs,
+        )
+
+    def query_plan_evidence_catalog(
+        self, *, quest_ref: str
+    ) -> tuple[int, tuple[dict[str, object], ...]]:
+        authority = self._target_commit_evidence_authority
+        if authority is None:
+            return 0, ()
+        revision, catalog = authority.query_plan_evidence_catalog(
+            quest_ref=quest_ref
+        )
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 0
+            or not isinstance(catalog, tuple)
+            or not all(isinstance(item, dict) for item in catalog)
+        ):
+            raise OwnerConflict("plan_evidence_catalog_invalid")
+        return revision, catalog
+
     def query_evidence_state(
         self, quest_ref: str
     ) -> tuple[int, tuple[str, ...]]:
@@ -994,6 +1170,207 @@ class SQLiteResearchGraphReceiptVerifier:
                 ),
             )
 
+    def verify_accepted_idea_set_binding(
+        self, binding: AcceptedIdeaSetBinding
+    ) -> None:
+        if (
+            binding.outcome_kind != "idea_set"
+            or binding.outcome_receipt.issuer != RG_OWNER
+            or binding.outcome_receipt.kind != IDEA_ACCEPTED_RECEIPT_KIND
+            or binding.outcome_receipt.subject_ref != binding.outcome_ref
+            or binding.content_receipt.issuer != "research_memory"
+            or binding.content_receipt.kind
+            != "idea_outcome_content_acceptance"
+            or binding.content_receipt.subject_ref != binding.content_ref
+            or canonical_hash(binding.idea_set) != binding.outcome_hash
+        ):
+            raise OwnerConflict("accepted_idea_set_binding_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_idea_outcome_decisions WHERE outcome_ref = "
+                    ":outcome_ref AND decision = 'accepted'"
+                ),
+                {"outcome_ref": binding.outcome_ref},
+            ).first()
+        if row is None or (
+            row.outcome_kind != "idea_set"
+            or row.idea_content_ref != binding.content_ref
+            or row.payload_hash != binding.payload_hash
+            or row.outcome_hash != binding.outcome_hash
+            or row.idea_content_receipt_ref
+            != binding.content_receipt.receipt_ref
+            or row.idea_content_receipt_hash
+            != binding.content_receipt.payload_hash
+            or row.receipt_ref != binding.outcome_receipt.receipt_ref
+            or row.receipt_hash != binding.outcome_receipt.payload_hash
+        ):
+            raise OwnerConflict("accepted_idea_set_binding_invalid")
+        self.verify_idea_outcome_decision(
+            request_ref=row.request_ref,
+            submission_ref=row.submission_ref,
+            decision="accepted",
+            outcome_ref=binding.outcome_ref,
+            outcome_kind="idea_set",
+            receipt=binding.outcome_receipt,
+        )
+
+    def verify_formal_plan_decision(
+        self,
+        *,
+        request_ref: str,
+        submission_ref: str | None,
+        decision: str,
+        formal_plan_ref: str | None,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        expected_kind = (
+            FORMAL_PLAN_ACCEPTED_RECEIPT_KIND
+            if decision == "accepted"
+            else FORMAL_PLAN_REJECTED_RECEIPT_KIND
+        )
+        if receipt.issuer != RG_OWNER or receipt.kind != expected_kind:
+            raise OwnerConflict("formal_plan_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_formal_plan_decisions WHERE receipt_ref = "
+                    ":receipt_ref"
+                ),
+                {"receipt_ref": receipt.receipt_ref},
+            ).first()
+        if row is None or (
+            row.request_ref != request_ref
+            or (submission_ref is not None and row.submission_ref != submission_ref)
+            or row.decision != decision
+            or row.formal_plan_ref != formal_plan_ref
+            or row.receipt_hash != receipt.payload_hash
+            or receipt.subject_ref
+            != (row.formal_plan_ref or row.decision_ref)
+            or row.receipt_hash != _formal_plan_decision_receipt_hash(row)
+        ):
+            raise OwnerConflict("formal_plan_receipt_invalid")
+        _formal_plan_decision(row)
+        if self._stage_request_verifier is None:
+            raise OwnerConflict("stage_request_verifier_unavailable")
+        verified_request = (
+            self._stage_request_verifier.query_verified_plan_stage_request(
+                request_ref=request_ref,
+                context_pack_ref=row.context_pack_ref,
+            )
+        )
+        try:
+            context_pack = verified_request.context_pack
+            question_binding = context_pack.get("accepted_question_binding")
+            idea_binding = context_pack.get("accepted_idea_set_binding")
+            evidence_catalog = context_pack.get("evidence_catalog")
+            evidence_revision = context_pack.get("evidence_reference_revision")
+            if (
+                not isinstance(question_binding, dict)
+                or not isinstance(idea_binding, dict)
+                or not isinstance(evidence_catalog, list)
+                or not isinstance(evidence_revision, int)
+                or isinstance(evidence_revision, bool)
+            ):
+                raise PlanContractError("plan_context_pack_invalid")
+            validate_plan_context_pack(
+                context_pack,
+                cycle_ref=verified_request.cycle_ref,
+                accepted_question_binding=question_binding,
+            )
+        except (PlanContractError, TypeError, ValueError) as error:
+            code = str(error) or "plan_context_pack_invalid"
+            raise OwnerConflict(code) from error
+        accepted_idea_set = verified_request.accepted_idea_set
+        if accepted_idea_set is None or (
+            question_binding != verified_request.accepted_question.as_dict()
+            or idea_binding != accepted_idea_set.as_dict()
+            or row.initialization_id
+            != verified_request.accepted_question.initialization_id
+            or row.quest_ref != verified_request.accepted_question.quest_ref
+            or row.question_ref != verified_request.accepted_question.question_ref
+            or row.question_content_ref
+            != verified_request.accepted_question.content_ref
+            or row.question_content_hash
+            != verified_request.accepted_question.content_hash
+            or row.question_content_receipt_ref
+            != verified_request.accepted_question.content_receipt.receipt_ref
+            or row.question_content_receipt_hash
+            != verified_request.accepted_question.content_receipt.payload_hash
+            or row.question_receipt_ref
+            != verified_request.accepted_question.question_receipt.receipt_ref
+            or row.question_receipt_hash
+            != verified_request.accepted_question.question_receipt.payload_hash
+            or row.idea_outcome_ref != accepted_idea_set.outcome_ref
+            or row.idea_content_ref != accepted_idea_set.content_ref
+            or row.idea_content_hash != accepted_idea_set.payload_hash
+            or row.idea_content_receipt_ref
+            != accepted_idea_set.content_receipt.receipt_ref
+            or row.idea_content_receipt_hash
+            != accepted_idea_set.content_receipt.payload_hash
+            or row.idea_outcome_receipt_ref
+            != accepted_idea_set.outcome_receipt.receipt_ref
+            or row.idea_outcome_receipt_hash
+            != accepted_idea_set.outcome_receipt.payload_hash
+            or row.idea_stage_commit_ref != accepted_idea_set.stage_commit_ref
+            or row.idea_stage_commit_receipt_ref
+            != accepted_idea_set.stage_commit_receipt.receipt_ref
+            or row.idea_stage_commit_receipt_hash
+            != accepted_idea_set.stage_commit_receipt.payload_hash
+        ):
+            raise OwnerConflict("formal_plan_request_lineage_invalid")
+        if self._plan_content_verifier is None:
+            raise OwnerConflict("plan_content_verifier_unavailable")
+        plan_content_receipt = AcceptanceReceipt(
+            issuer="research_memory",
+            kind="plan_document_content_acceptance",
+            receipt_ref=row.plan_content_receipt_ref,
+            subject_ref=row.plan_content_ref,
+            payload_hash=row.plan_content_receipt_hash,
+        )
+        self._plan_content_verifier.verify_plan_content_receipt(
+            request_ref=row.request_ref,
+            submission_ref=row.submission_ref,
+            content_ref=row.plan_content_ref,
+            payload_hash=row.payload_hash,
+            plan_hash=row.plan_document_hash,
+            reviewed_draft_hash=row.reviewed_draft_hash,
+            review_hash=row.review_hash,
+            receipt=plan_content_receipt,
+        )
+        selected_evidence_refs = (
+            self._plan_content_verifier.query_plan_selected_evidence_refs(
+                submission_ref=row.submission_ref,
+                content_ref=row.plan_content_ref,
+                receipt=plan_content_receipt,
+            )
+        )
+        self.verify_plan_evidence_catalog(
+            quest_ref=row.quest_ref,
+            evidence_catalog=evidence_catalog,
+            expected_reference_revision=evidence_revision,
+            require_current=row.decision == "accepted",
+            require_complete=False,
+            selected_evidence_refs=selected_evidence_refs,
+        )
+        if self._execution_verifier is None:
+            raise OwnerConflict("attempt_execution_verifier_unavailable")
+        self._execution_verifier.verify_attempt_execution_receipt(
+            request_ref=row.request_ref,
+            run_ref=row.run_ref,
+            attempt_ref=row.attempt_ref,
+            fence_ref=row.fence_ref,
+            submission_ref=row.submission_ref,
+            payload_hash=row.payload_hash,
+            receipt=AcceptanceReceipt(
+                issuer="agent_runtime",
+                kind="plan_attempt_execution",
+                receipt_ref=row.execution_receipt_ref,
+                subject_ref=row.submission_ref,
+                payload_hash=row.execution_receipt_hash,
+            ),
+        )
+
 
 class SQLiteResearchGraph(HumanRequestOwnerMixin):
     def __init__(
@@ -1009,6 +1386,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         stage_request_verifier: StageRunRequestVerifier | None = None,
         manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
         human_response_verifier: HumanResponseVerifier | None = None,
+        plan_content_verifier: PlanContentReceiptVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -1023,6 +1401,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         self._configure_human_request_owner(
             database, feed, RG_OWNER, human_response_verifier
         )
+        self._plan_content_verifier = plan_content_verifier
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
 
     def query_snapshot(self) -> OwnerSnapshot:
@@ -1977,6 +2356,13 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
     ) -> tuple[int, tuple[str, ...]]:
         return self._receipt_verifier.query_evidence_reference_state(quest_ref)
 
+    def query_plan_evidence_catalog(
+        self, *, quest_ref: str
+    ) -> tuple[int, tuple[dict[str, object], ...]]:
+        return self._receipt_verifier.query_plan_evidence_catalog(
+            quest_ref=quest_ref
+        )
+
     def query_asset_reference_revision(self) -> int:
         return self.query_snapshot().revision
 
@@ -2319,6 +2705,351 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
     def verify_idea_outcome_decision(self, **values) -> None:
         self._receipt_verifier.verify_idea_outcome_decision(**values)
 
+    def decide_formal_plan(
+        self,
+        *,
+        accepted_question: AcceptedQuestionBinding,
+        accepted_idea_set: AcceptedIdeaSetBinding,
+        question_content: dict[str, object],
+        content: AcceptedPlanContent,
+        execution_receipt: AcceptanceReceipt,
+    ) -> FormalPlanDecision:
+        if (
+            self._plan_content_verifier is None
+            or self._execution_verifier is None
+            or self._stage_request_verifier is None
+        ):
+            raise OwnerConflict("formal_plan_verifier_unavailable")
+        self._receipt_verifier.verify_accepted_question_binding(accepted_question)
+        self._receipt_verifier.verify_accepted_idea_set_binding(accepted_idea_set)
+        if canonical_hash(question_content) != accepted_question.content_hash:
+            raise OwnerConflict("accepted_question_content_mismatch")
+        if (
+            content.request_ref == ""
+            or content.submission_ref == ""
+            or content.execution_receipt != execution_receipt
+            or content.initialization_id != accepted_question.initialization_id
+            or content.quest_ref != accepted_question.quest_ref
+            or content.question_ref != accepted_question.question_ref
+            or content.question_content_ref != accepted_question.content_ref
+            or content.question_content_hash != accepted_question.content_hash
+            or content.question_content_receipt
+            != accepted_question.content_receipt
+            or content.question_receipt != accepted_question.question_receipt
+            or content.idea_outcome_ref != accepted_idea_set.outcome_ref
+            or content.idea_content_ref != accepted_idea_set.content_ref
+            or content.idea_content_hash != accepted_idea_set.payload_hash
+            or content.idea_content_receipt != accepted_idea_set.content_receipt
+            or content.idea_outcome_receipt != accepted_idea_set.outcome_receipt
+            or content.idea_stage_commit_ref
+            != accepted_idea_set.stage_commit_ref
+            or content.idea_stage_commit_receipt
+            != accepted_idea_set.stage_commit_receipt
+        ):
+            raise OwnerConflict("formal_plan_lineage_invalid")
+        self._execution_verifier.verify_attempt_execution_receipt(
+            request_ref=content.request_ref,
+            run_ref=content.run_ref,
+            attempt_ref=content.attempt_ref,
+            fence_ref=content.fence_ref,
+            submission_ref=content.submission_ref,
+            payload_hash=content.payload_hash,
+            receipt=execution_receipt,
+        )
+        self._plan_content_verifier.verify_plan_content_receipt(
+            request_ref=content.request_ref,
+            submission_ref=content.submission_ref,
+            content_ref=content.content_ref,
+            payload_hash=content.payload_hash,
+            plan_hash=content.plan_document_hash,
+            reviewed_draft_hash=content.reviewed_draft_hash,
+            review_hash=content.review_hash,
+            receipt=content.receipt,
+        )
+        verified_request = (
+            self._stage_request_verifier.verify_plan_stage_request_binding(
+                request_ref=content.request_ref,
+                accepted_question=accepted_question,
+                accepted_idea_set=accepted_idea_set,
+                context_pack_ref=content.context_pack_ref,
+            )
+        )
+        if (
+            verified_request.accepted_question != accepted_question
+            or verified_request.accepted_idea_set != accepted_idea_set
+            or verified_request.context_pack_ref != content.context_pack_ref
+            or canonical_hash(verified_request.context_pack)
+            != verified_request.context_pack_hash
+        ):
+            raise OwnerConflict("formal_plan_request_lineage_invalid")
+        try:
+            evidence_by_ref = validate_plan_context_pack(
+                verified_request.context_pack,
+                cycle_ref=verified_request.cycle_ref,
+                accepted_question_binding=accepted_question.as_dict(),
+            )
+            evidence_catalog = verified_request.context_pack.get(
+                "evidence_catalog"
+            )
+            evidence_revision = verified_request.context_pack.get(
+                "evidence_reference_revision"
+            )
+            if (
+                not isinstance(evidence_catalog, list)
+                or not isinstance(evidence_revision, int)
+                or isinstance(evidence_revision, bool)
+            ):
+                raise PlanContractError("plan_evidence_catalog_invalid")
+            validated_plan_hash = validate_plan_document(
+                content.plan_document,
+                question_ref=accepted_question.question_ref,
+                idea_set_ref=accepted_idea_set.outcome_ref,
+                context_pack_ref=content.context_pack_ref,
+                context_pack_hash=verified_request.context_pack_hash,
+                accepted_idea_set=accepted_idea_set.idea_set,
+                evidence_by_ref=evidence_by_ref,
+                evidence_reference_revision=evidence_revision,
+            )
+        except PlanContractError as error:
+            raise OwnerConflict(str(error)) from error
+        self._receipt_verifier.verify_plan_evidence_catalog(
+            quest_ref=accepted_question.quest_ref,
+            evidence_catalog=evidence_catalog,
+            expected_reference_revision=evidence_revision,
+            require_current=True,
+            require_complete=False,
+            selected_evidence_refs=_selected_plan_evidence_refs(
+                content.plan_document
+            ),
+        )
+        answer_contract = content.plan_document.get("answer_contract")
+        if (
+            validated_plan_hash != content.plan_document_hash
+            or not isinstance(answer_contract, dict)
+            or answer_contract.get("answer_contract_hash")
+            != content.answer_contract_hash
+        ):
+            raise OwnerConflict("formal_plan_content_hash_invalid")
+        decision, reason_code, feedback = _evaluate_formal_plan(
+            question_content,
+            content.plan_document,
+        )
+        feedback_json = canonical_json(list(feedback))
+        feedback_hash = canonical_hash(list(feedback))
+        bundle_disposition = content.plan_document.get("bundle_disposition")
+        if bundle_disposition not in {
+            "experiments_required",
+            "no_new_experiment_required",
+        }:
+            raise OwnerConflict("formal_plan_bundle_disposition_invalid")
+        bindings = {
+            "request_ref": content.request_ref,
+            "submission_ref": content.submission_ref,
+            "run_ref": content.run_ref,
+            "attempt_ref": content.attempt_ref,
+            "fence_ref": content.fence_ref,
+            "initialization_id": accepted_question.initialization_id,
+            "quest_ref": accepted_question.quest_ref,
+            "question_ref": accepted_question.question_ref,
+            "context_pack_ref": content.context_pack_ref,
+            "question_content_ref": accepted_question.content_ref,
+            "question_content_hash": accepted_question.content_hash,
+            "question_content_receipt_ref": (
+                accepted_question.content_receipt.receipt_ref
+            ),
+            "question_content_receipt_hash": (
+                accepted_question.content_receipt.payload_hash
+            ),
+            "question_receipt_ref": (
+                accepted_question.question_receipt.receipt_ref
+            ),
+            "question_receipt_hash": (
+                accepted_question.question_receipt.payload_hash
+            ),
+            "idea_outcome_ref": accepted_idea_set.outcome_ref,
+            "idea_content_ref": accepted_idea_set.content_ref,
+            "idea_content_hash": accepted_idea_set.payload_hash,
+            "idea_content_receipt_ref": (
+                accepted_idea_set.content_receipt.receipt_ref
+            ),
+            "idea_content_receipt_hash": (
+                accepted_idea_set.content_receipt.payload_hash
+            ),
+            "idea_outcome_receipt_ref": (
+                accepted_idea_set.outcome_receipt.receipt_ref
+            ),
+            "idea_outcome_receipt_hash": (
+                accepted_idea_set.outcome_receipt.payload_hash
+            ),
+            "idea_stage_commit_ref": accepted_idea_set.stage_commit_ref,
+            "idea_stage_commit_receipt_ref": (
+                accepted_idea_set.stage_commit_receipt.receipt_ref
+            ),
+            "idea_stage_commit_receipt_hash": (
+                accepted_idea_set.stage_commit_receipt.payload_hash
+            ),
+            "plan_content_ref": content.content_ref,
+            "plan_content_receipt_ref": content.receipt.receipt_ref,
+            "plan_content_receipt_hash": content.receipt.payload_hash,
+            "execution_receipt_ref": execution_receipt.receipt_ref,
+            "execution_receipt_hash": execution_receipt.payload_hash,
+            "payload_hash": content.payload_hash,
+            "plan_document_hash": content.plan_document_hash,
+            "answer_contract_hash": content.answer_contract_hash,
+            "reviewed_draft_hash": content.reviewed_draft_hash,
+            "review_hash": content.review_hash,
+            "bundle_disposition": bundle_disposition,
+            "decision": decision,
+            "reason_code": reason_code,
+            "feedback_hash": feedback_hash,
+        }
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM rg_formal_plan_decisions WHERE submission_ref = "
+                    ":submission_ref"
+                ),
+                {"submission_ref": content.submission_ref},
+            ).first()
+            if existing is not None:
+                if any(
+                    getattr(existing, key) != value
+                    for key, value in bindings.items()
+                ):
+                    raise OwnerConflict("formal_plan_decision_conflict")
+                return _formal_plan_decision(existing)
+            accepted = connection.execute(
+                text(
+                    "SELECT submission_ref FROM rg_formal_plan_decisions WHERE "
+                    "request_ref = :request_ref AND decision = 'accepted'"
+                ),
+                {"request_ref": content.request_ref},
+            ).first()
+            if accepted is not None:
+                raise OwnerConflict("formal_plan_already_accepted")
+
+            decision_ref = new_ref("formal_plan_decision")
+            formal_plan_ref = (
+                new_ref("formal_plan") if decision == "accepted" else None
+            )
+            receipt_ref = new_ref("rg_formal_plan_receipt")
+            subject_ref = formal_plan_ref or decision_ref
+            receipt_kind = (
+                FORMAL_PLAN_ACCEPTED_RECEIPT_KIND
+                if decision == "accepted"
+                else FORMAL_PLAN_REJECTED_RECEIPT_KIND
+            )
+            receipt_bindings = {
+                **bindings,
+                "formal_plan_ref": formal_plan_ref,
+            }
+            receipt_hash = _receipt_hash(
+                receipt_kind,
+                subject_ref,
+                receipt_bindings,
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO rg_formal_plan_decisions (decision_ref, "
+                    "request_ref, submission_ref, run_ref, attempt_ref, fence_ref, "
+                    "initialization_id, quest_ref, question_ref, context_pack_ref, "
+                    "question_content_ref, question_content_hash, "
+                    "question_content_receipt_ref, question_content_receipt_hash, "
+                    "question_receipt_ref, question_receipt_hash, "
+                    "idea_outcome_ref, idea_content_ref, idea_content_hash, "
+                    "idea_content_receipt_ref, idea_content_receipt_hash, "
+                    "idea_outcome_receipt_ref, idea_outcome_receipt_hash, "
+                    "idea_stage_commit_ref, idea_stage_commit_receipt_ref, "
+                    "idea_stage_commit_receipt_hash, plan_content_ref, "
+                    "plan_content_receipt_ref, plan_content_receipt_hash, "
+                    "execution_receipt_ref, execution_receipt_hash, payload_hash, "
+                    "plan_document_hash, answer_contract_hash, reviewed_draft_hash, "
+                    "review_hash, bundle_disposition, decision, formal_plan_ref, "
+                    "reason_code, feedback_json, feedback_hash, receipt_ref, "
+                    "receipt_hash, decided_at) VALUES (:decision_ref, :request_ref, "
+                    ":submission_ref, :run_ref, :attempt_ref, :fence_ref, "
+                    ":initialization_id, :quest_ref, :question_ref, "
+                    ":context_pack_ref, :question_content_ref, "
+                    ":question_content_hash, :question_content_receipt_ref, "
+                    ":question_content_receipt_hash, :question_receipt_ref, "
+                    ":question_receipt_hash, :idea_outcome_ref, :idea_content_ref, "
+                    ":idea_content_hash, :idea_content_receipt_ref, "
+                    ":idea_content_receipt_hash, :idea_outcome_receipt_ref, "
+                    ":idea_outcome_receipt_hash, :idea_stage_commit_ref, "
+                    ":idea_stage_commit_receipt_ref, "
+                    ":idea_stage_commit_receipt_hash, :plan_content_ref, "
+                    ":plan_content_receipt_ref, :plan_content_receipt_hash, "
+                    ":execution_receipt_ref, :execution_receipt_hash, :payload_hash, "
+                    ":plan_document_hash, :answer_contract_hash, "
+                    ":reviewed_draft_hash, :review_hash, :bundle_disposition, "
+                    ":decision, :formal_plan_ref, :reason_code, :feedback_json, "
+                    ":feedback_hash, :receipt_ref, :receipt_hash, :decided_at)"
+                ),
+                {
+                    **bindings,
+                    "decision_ref": decision_ref,
+                    "formal_plan_ref": formal_plan_ref,
+                    "feedback_json": feedback_json,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "decided_at": time.time(),
+                },
+            )
+            counter = (
+                "formal_plan_count = formal_plan_count + 1"
+                if decision == "accepted"
+                else "plan_rejection_count = plan_rejection_count + 1"
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_graph_state SET revision = revision + 1, "
+                    f"{counter} WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                f"research_graph.formal_plan_{decision}",
+                {
+                    "request_ref": content.request_ref,
+                    "submission_ref": content.submission_ref,
+                    "decision_ref": decision_ref,
+                    "decision": decision,
+                    "formal_plan_ref": formal_plan_ref,
+                    "reason_code": reason_code,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        decided = self.query_formal_plan_decision(content.submission_ref)
+        if decided is None:
+            raise OwnerConflict("formal_plan_decision_missing_after_commit")
+        return decided
+
+    def query_formal_plan_decision(
+        self, submission_ref: str
+    ) -> FormalPlanDecision | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_formal_plan_decisions WHERE submission_ref = "
+                    ":submission_ref"
+                ),
+                {"submission_ref": submission_ref},
+            ).first()
+        if row is None:
+            return None
+        decided = _formal_plan_decision(row)
+        self._receipt_verifier.verify_formal_plan_decision(
+            request_ref=row.request_ref,
+            submission_ref=row.submission_ref,
+            decision=row.decision,
+            formal_plan_ref=row.formal_plan_ref,
+            receipt=decided.receipt,
+        )
+        return decided
+
+    def verify_formal_plan_decision(self, **values) -> None:
+        self._receipt_verifier.verify_formal_plan_decision(**values)
+
 
 def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> str:
     return canonical_hash(
@@ -2633,6 +3364,176 @@ def _idea_decision(row) -> IdeaOutcomeDecision:
     )
 
 
+def _selected_plan_evidence_refs(
+    plan_document: dict[str, object],
+) -> frozenset[str]:
+    reuse_set = plan_document.get("evidence_reuse_set")
+    if not isinstance(reuse_set, list):
+        raise OwnerConflict("plan_evidence_reuse_set_invalid")
+    refs: set[str] = set()
+    for use in reuse_set:
+        if not isinstance(use, dict):
+            raise OwnerConflict("plan_evidence_reuse_set_invalid")
+        evidence_ref = use.get("evidence_ref")
+        if not isinstance(evidence_ref, str) or not evidence_ref:
+            raise OwnerConflict("plan_evidence_reuse_set_invalid")
+        refs.add(evidence_ref)
+    return frozenset(refs)
+
+
+def _evaluate_formal_plan(
+    question_content: dict[str, object],
+    plan_document: dict[str, object],
+) -> tuple[str, str | None, tuple[str, ...]]:
+    anchors = {
+        material_text(value)
+        for key in ("unknown_statement", "answer_shape", "applicability_scope")
+        if isinstance((value := question_content.get(key)), str)
+        and material_text(value)
+    }
+    answer_contract = plan_document.get("answer_contract")
+    obligations = (
+        answer_contract.get("obligations")
+        if isinstance(answer_contract, dict)
+        else None
+    )
+    if isinstance(obligations, list):
+        for obligation in obligations:
+            if not isinstance(obligation, dict):
+                continue
+            statement = obligation.get("statement")
+            if isinstance(statement, str) and material_text(statement) in anchors:
+                return (
+                    "rejected",
+                    "question_obligation_restatement",
+                    (
+                        "AnswerContract obligation merely restates an accepted "
+                        "Question field; rewrite it as a concrete answer obligation "
+                        "with a distinct support threshold.",
+                    ),
+                )
+    return "accepted", None, ()
+
+
+def _formal_plan_decision_bindings(row) -> dict[str, object]:
+    return {
+        "request_ref": row.request_ref,
+        "submission_ref": row.submission_ref,
+        "run_ref": row.run_ref,
+        "attempt_ref": row.attempt_ref,
+        "fence_ref": row.fence_ref,
+        "initialization_id": row.initialization_id,
+        "quest_ref": row.quest_ref,
+        "question_ref": row.question_ref,
+        "context_pack_ref": row.context_pack_ref,
+        "question_content_ref": row.question_content_ref,
+        "question_content_hash": row.question_content_hash,
+        "question_content_receipt_ref": row.question_content_receipt_ref,
+        "question_content_receipt_hash": row.question_content_receipt_hash,
+        "question_receipt_ref": row.question_receipt_ref,
+        "question_receipt_hash": row.question_receipt_hash,
+        "idea_outcome_ref": row.idea_outcome_ref,
+        "idea_content_ref": row.idea_content_ref,
+        "idea_content_hash": row.idea_content_hash,
+        "idea_content_receipt_ref": row.idea_content_receipt_ref,
+        "idea_content_receipt_hash": row.idea_content_receipt_hash,
+        "idea_outcome_receipt_ref": row.idea_outcome_receipt_ref,
+        "idea_outcome_receipt_hash": row.idea_outcome_receipt_hash,
+        "idea_stage_commit_ref": row.idea_stage_commit_ref,
+        "idea_stage_commit_receipt_ref": row.idea_stage_commit_receipt_ref,
+        "idea_stage_commit_receipt_hash": row.idea_stage_commit_receipt_hash,
+        "plan_content_ref": row.plan_content_ref,
+        "plan_content_receipt_ref": row.plan_content_receipt_ref,
+        "plan_content_receipt_hash": row.plan_content_receipt_hash,
+        "execution_receipt_ref": row.execution_receipt_ref,
+        "execution_receipt_hash": row.execution_receipt_hash,
+        "payload_hash": row.payload_hash,
+        "plan_document_hash": row.plan_document_hash,
+        "answer_contract_hash": row.answer_contract_hash,
+        "reviewed_draft_hash": row.reviewed_draft_hash,
+        "review_hash": row.review_hash,
+        "bundle_disposition": row.bundle_disposition,
+        "decision": row.decision,
+        "reason_code": row.reason_code,
+        "feedback_hash": row.feedback_hash,
+        "formal_plan_ref": row.formal_plan_ref,
+    }
+
+
+def _formal_plan_decision_receipt_hash(row) -> str:
+    kind = (
+        FORMAL_PLAN_ACCEPTED_RECEIPT_KIND
+        if row.decision == "accepted"
+        else FORMAL_PLAN_REJECTED_RECEIPT_KIND
+    )
+    subject_ref = row.formal_plan_ref or row.decision_ref
+    return _receipt_hash(
+        kind,
+        subject_ref,
+        _formal_plan_decision_bindings(row),
+    )
+
+
+def _formal_plan_decision(row) -> FormalPlanDecision:
+    try:
+        feedback_value = json.loads(row.feedback_json)
+        if not isinstance(feedback_value, list) or not all(
+            isinstance(item, str) and item for item in feedback_value
+        ):
+            raise TypeError("feedback")
+        feedback = tuple(feedback_value)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("formal_plan_decision_invalid") from error
+    if (
+        canonical_json(list(feedback)) != row.feedback_json
+        or canonical_hash(list(feedback)) != row.feedback_hash
+        or row.receipt_hash != _formal_plan_decision_receipt_hash(row)
+        or (row.decision == "accepted") != (row.formal_plan_ref is not None)
+        or (
+            row.decision == "accepted"
+            and (row.reason_code is not None or feedback)
+        )
+        or (
+            row.decision == "rejected"
+            and (
+                row.reason_code is None
+                or not feedback
+                or row.formal_plan_ref is not None
+            )
+        )
+    ):
+        raise OwnerConflict("formal_plan_decision_invalid")
+    subject_ref = row.formal_plan_ref or row.decision_ref
+    return FormalPlanDecision(
+        decision_ref=row.decision_ref,
+        request_ref=row.request_ref,
+        submission_ref=row.submission_ref,
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        context_pack_ref=row.context_pack_ref,
+        decision=row.decision,
+        formal_plan_ref=row.formal_plan_ref,
+        plan_document_hash=row.plan_document_hash,
+        answer_contract_hash=row.answer_contract_hash,
+        bundle_disposition=row.bundle_disposition,
+        reason_code=row.reason_code,
+        feedback=feedback,
+        content_ref=row.plan_content_ref,
+        receipt=AcceptanceReceipt(
+            issuer=RG_OWNER,
+            kind=(
+                FORMAL_PLAN_ACCEPTED_RECEIPT_KIND
+                if row.decision == "accepted"
+                else FORMAL_PLAN_REJECTED_RECEIPT_KIND
+            ),
+            receipt_ref=row.receipt_ref,
+            subject_ref=subject_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
 def _accepted_quest(row) -> AcceptedQuest:
     _verify_quest_goal_integrity(row)
     try:
@@ -2739,6 +3640,8 @@ def create_research_graph_receipt_verifier(
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
     stage_request_verifier: StageRunRequestVerifier | None = None,
     manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
+    plan_content_verifier: PlanContentReceiptVerifier | None = None,
+    target_commit_evidence_authority: TargetCommitEvidenceAuthority | None = None,
 ) -> SQLiteResearchGraphReceiptVerifier:
     return SQLiteResearchGraphReceiptVerifier(
         database,
@@ -2749,6 +3652,8 @@ def create_research_graph_receipt_verifier(
         execution_verifier,
         stage_request_verifier,
         manual_confirmation_verifier,
+        plan_content_verifier,
+        target_commit_evidence_authority,
     )
 
 
@@ -2764,6 +3669,7 @@ def create_research_graph_interface(
     stage_request_verifier: StageRunRequestVerifier | None = None,
     manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
     human_response_verifier: HumanResponseVerifier | None = None,
+    plan_content_verifier: PlanContentReceiptVerifier | None = None,
 ) -> ResearchGraphInterface:
     return SQLiteResearchGraph(
         database,
@@ -2777,4 +3683,5 @@ def create_research_graph_interface(
         stage_request_verifier,
         manual_confirmation_verifier,
         human_response_verifier,
+        plan_content_verifier,
     )

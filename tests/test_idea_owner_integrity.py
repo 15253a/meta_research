@@ -271,7 +271,7 @@ def test_provider_invocation_identity_is_bound_by_owner_hash(tmp_path: Path) -> 
         with runtime._database.write() as connection:
             connection.execute(
                 text(
-                    "UPDATE ar_idea_provider_invocations SET invocation_ref = "
+                    "UPDATE ar_stage_provider_invocations SET invocation_ref = "
                     ":forged_ref WHERE invocation_ref = :invocation_ref"
                 ),
                 {

@@ -52,6 +52,8 @@ from meta_research.owners.research_memory import (
     create_research_memory_receipt_verifier,
 )
 from meta_research.paths import DataRoot
+from meta_research.plan_skill import CodexPlanSkillAdapter, PlanSkillProvider
+from meta_research.plan_stage import PlanStageWorker
 from meta_research.projection import PublicProjection
 from meta_research.quest_drafting import (
     CodexDraftingAdapter,
@@ -79,6 +81,7 @@ class ProductionRuntime:
     feed: DurableFeed
     projection: PublicProjection
     idea_stage: IdeaStageWorker
+    plan_stage: PlanStageWorker
     deepfetch: FirstQuestionDeepFetchWorker
     _database: Database
     _provider_lifecycles: tuple[object, ...] = ()
@@ -128,6 +131,7 @@ def build_production_runtime(
     intent_drafting_provider: IntentDraftingProvider | None = None,
     host_compute_probe: HostComputeProbe | None = None,
     idea_skill_provider: IdeaSkillProvider | None = None,
+    plan_skill_provider: PlanSkillProvider | None = None,
     deepfetch_provider: DeepFetchProvider | None = None,
     acquisition_provider: AcquisitionProvider | None = None,
 ) -> ProductionRuntime:
@@ -148,46 +152,60 @@ def build_production_runtime(
     idea_skill_provider = idea_skill_provider or CodexIdeaSkillAdapter(
         data_root.root / "idea-skill-provider"
     )
+    plan_skill_provider = plan_skill_provider or CodexPlanSkillAdapter(
+        data_root.root / "plan-skill-provider"
+    )
     acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
 
     host_compute_reader = create_host_compute_observation_reader(database)
     human_response_verifier = create_human_response_verifier(database)
     confirmation_verifier = create_bundle_confirmation_verifier(
-        database, host_compute_reader
+        database=database,
+        agent_runtime=host_compute_reader,
     )
-    stage_request_receipts = create_advancement_engine_receipt_verifier(database)
-    deepfetch_request_receipts = create_deepfetch_request_verifier(database)
+    stage_request_receipts = create_advancement_engine_receipt_verifier(
+        database=database
+    )
+    deepfetch_request_receipts = create_deepfetch_request_verifier(
+        database=database
+    )
     attempt_receipts = create_agent_runtime_receipt_verifier(
-        database, stage_request_receipts
+        database=database,
+        stage_request_verifier=stage_request_receipts,
     )
     research_memory_receipts = create_research_memory_receipt_verifier(
-        database, data_root.objects, attempt_receipts
+        database=database,
+        object_store=data_root.objects,
+        execution_verifier=attempt_receipts,
+        stage_request_verifier=stage_request_receipts,
     )
     manual_question_confirmations = create_manual_question_confirmation_verifier(
         database
     )
     research_graph_receipts = create_research_graph_receipt_verifier(
-        database,
-        confirmation_verifier,
-        research_memory_receipts,
-        research_memory_receipts,
-        research_memory_receipts,
-        attempt_receipts,
-        stage_request_receipts,
+        database=database,
+        confirmation_verifier=confirmation_verifier,
+        content_verifier=research_memory_receipts,
+        asset_verifier=research_memory_receipts,
+        idea_content_verifier=research_memory_receipts,
+        execution_verifier=attempt_receipts,
+        stage_request_verifier=stage_request_receipts,
         manual_confirmation_verifier=manual_question_confirmations,
+        plan_content_verifier=research_memory_receipts,
     )
     human_response_verifier.bind_quest_receipt_verifier(
         research_graph_receipts
     )
     agent_runtime = create_agent_runtime_interface(
-        database,
-        feed,
-        host_compute_probe,
-        stage_request_receipts,
-        research_graph_receipts,
-        deepfetch_request_receipts,
-        data_root.run / "acquisition-sessions",
-        human_response_verifier,
+        database=database,
+        feed=feed,
+        host_compute_probe=host_compute_probe,
+        stage_request_verifier=stage_request_receipts,
+        outcome_verifier=research_graph_receipts,
+        formal_plan_verifier=research_graph_receipts,
+        deepfetch_request_verifier=deepfetch_request_receipts,
+        acquisition_private_root=data_root.run / "acquisition-sessions",
+        human_response_verifier=human_response_verifier,
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
@@ -197,55 +215,58 @@ def build_production_runtime(
         ),
     )
     research_graph = create_research_graph_interface(
-        database,
-        feed,
-        confirmation_verifier,
-        research_memory_receipts,
-        research_memory_receipts,
-        research_graph_receipts,
-        research_memory_receipts,
-        attempt_receipts,
-        stage_request_receipts,
+        database=database,
+        feed=feed,
+        confirmation_verifier=confirmation_verifier,
+        content_verifier=research_memory_receipts,
+        asset_verifier=research_memory_receipts,
+        receipt_verifier=research_graph_receipts,
+        idea_content_verifier=research_memory_receipts,
+        execution_verifier=attempt_receipts,
+        stage_request_verifier=stage_request_receipts,
         manual_confirmation_verifier=manual_question_confirmations,
         human_response_verifier=human_response_verifier,
+        plan_content_verifier=research_memory_receipts,
     )
     research_memory = create_research_memory_interface(
-        database,
-        data_root.objects,
-        feed,
-        confirmation_verifier,
-        research_graph_receipts,
-        research_memory_receipts,
-        attempt_receipts,
-        research_graph,
+        database=database,
+        object_store=data_root.objects,
+        feed=feed,
+        confirmation_verifier=confirmation_verifier,
+        quest_verifier=research_graph_receipts,
+        receipt_verifier=research_memory_receipts,
+        execution_verifier=attempt_receipts,
+        reference_reader=research_graph,
         manual_confirmation_verifier=manual_question_confirmations,
         human_response_verifier=human_response_verifier,
+        stage_request_verifier=stage_request_receipts,
     )
     manual_question_confirmations.bind_research_memory_verifier(research_memory)
     agent_runtime.bind_research_material_resolver(research_memory)
     confirmation_verifier.bind_literature_snapshot_verifier(research_memory)
     advancement_engine = create_advancement_engine_interface(
-        database,
-        feed,
-        research_graph_receipts,
-        research_graph_receipts,
-        research_graph_receipts,
-        research_graph_receipts,
-        attempt_receipts,
-        research_graph_receipts,
-        research_memory,
-        human_response_verifier,
+        database=database,
+        feed=feed,
+        quest_verifier=research_graph_receipts,
+        question_verifier=research_graph_receipts,
+        accepted_question_verifier=research_graph_receipts,
+        evidence_verifier=research_graph_receipts,
+        run_completion_verifier=attempt_receipts,
+        outcome_verifier=research_graph_receipts,
+        formal_plan_verifier=research_graph_receipts,
+        literature_snapshot_verifier=research_memory,
+        human_response_verifier=human_response_verifier,
     )
     human_collaboration = create_human_collaboration_interface(
-        database,
-        feed,
-        research_graph,
-        research_memory,
-        advancement_engine,
-        agent_runtime,
-        proposal_drafter,
-        intent_drafting_provider,
-        acquisition_provider,
+        database=database,
+        feed=feed,
+        research_graph=research_graph,
+        research_memory=research_memory,
+        advancement_engine=advancement_engine,
+        agent_runtime=agent_runtime,
+        proposal_drafter=proposal_drafter,
+        intent_drafting_provider=intent_drafting_provider,
+        acquisition_provider=acquisition_provider,
     )
     owners = OwnerInterfaces(
         research_graph=research_graph,
@@ -263,6 +284,14 @@ def build_production_runtime(
         idea_skill_provider,
         owners.human_collaboration,
     )
+    plan_stage = PlanStageWorker(
+        feed,
+        owners.advancement_engine,
+        owners.agent_runtime,
+        owners.research_memory,
+        owners.research_graph,
+        plan_skill_provider,
+    )
     deepfetch = FirstQuestionDeepFetchWorker(
         human_collaboration,
         agent_runtime,
@@ -277,13 +306,15 @@ def build_production_runtime(
         owners.research_memory,
         owners.agent_runtime,
         owners.human_collaboration,
-        idea_stage,
+        idea_stage=idea_stage,
+        plan_stage=plan_stage,
     )
     provider_lifecycles: list[object] = []
     for provider in (
         proposal_drafter,
         intent_drafting_provider,
         idea_skill_provider,
+        plan_skill_provider,
         deepfetch_provider,
         acquisition_provider,
     ):
@@ -298,6 +329,7 @@ def build_production_runtime(
         feed=feed,
         projection=projection,
         idea_stage=idea_stage,
+        plan_stage=plan_stage,
         deepfetch=deepfetch,
         _database=database,
         _provider_lifecycles=tuple(provider_lifecycles),

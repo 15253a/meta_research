@@ -51,6 +51,7 @@ ASSET_WORKER_WATCHDOG_SECONDS = 5.0
 ASSET_ROUTE_WATCHDOG_SECONDS = 5.0
 DRAFTING_WORKER_WATCHDOG_SECONDS = 190.0
 IDEA_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
+PLAN_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 DEEPFETCH_WORKER_WATCHDOG_SECONDS = 1810.0
 _T = TypeVar("_T")
 
@@ -438,12 +439,14 @@ def create_app(
     drafting_task: asyncio.Task[None] | None = None
     deepfetch_task: asyncio.Task[None] | None = None
     idea_stage_task: asyncio.Task[None] | None = None
+    plan_stage_task: asyncio.Task[None] | None = None
     research_asset_task: asyncio.Task[None] | None = None
     research_asset_verification_task: asyncio.Task[None] | None = None
     reconciliation_health = ReconciliationHealth()
     drafting_health = ReconciliationHealth()
     deepfetch_health = ReconciliationHealth()
     idea_stage_health = ReconciliationHealth()
+    plan_stage_health = ReconciliationHealth()
     research_asset_health = ReconciliationHealth()
     research_asset_verification_health = ReconciliationHealth()
     worker_health_updates = WorkerHealthUpdates()
@@ -455,6 +458,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         nonlocal reconciliation_task, drafting_task, deepfetch_task, idea_stage_task
+        nonlocal plan_stage_task
         nonlocal research_asset_task, research_asset_verification_task
         reconciliation_task = asyncio.create_task(
             _reconcile_quest_initializations(
@@ -488,6 +492,14 @@ def create_app(
             )
         )
         idea_stage_task.add_done_callback(_log_reconciliation_exit)
+        plan_stage_task = asyncio.create_task(
+            _process_plan_stage(
+                runtime,
+                plan_stage_health,
+                worker_health_updates.publish,
+            )
+        )
+        plan_stage_task.add_done_callback(_log_reconciliation_exit)
         research_asset_task = asyncio.create_task(
             _process_research_assets(
                 runtime,
@@ -514,6 +526,7 @@ def create_app(
                     drafting_task,
                     deepfetch_task,
                     idea_stage_task,
+                    plan_stage_task,
                     research_asset_task,
                     research_asset_verification_task,
                 )
@@ -577,6 +590,7 @@ def create_app(
                 deepfetch_health,
             ),
             worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
+            worker_check("plan_stage_worker", plan_stage_task, plan_stage_health),
             worker_check(
                 "research_asset_intake_worker",
                 research_asset_task,
@@ -594,6 +608,7 @@ def create_app(
             if check["name"]
             not in {
                 "idea_stage_worker",
+                "plan_stage_worker",
                 "research_asset_intake_worker",
                 "research_asset_verification_worker",
             }
@@ -784,6 +799,9 @@ def create_app(
         idea_stage = worker_check(
             "idea_stage_worker", idea_stage_task, idea_stage_health
         )
+        plan_stage = worker_check(
+            "plan_stage_worker", plan_stage_task, plan_stage_health
+        )
         research_assets = worker_check(
             "research_asset_intake_worker",
             research_asset_task,
@@ -812,6 +830,10 @@ def create_app(
             "idea_stage": {
                 "status": idea_stage["status"],
                 "last_error": idea_stage_health.last_error,
+            },
+            "plan_stage": {
+                "status": plan_stage["status"],
+                "last_error": plan_stage_health.last_error,
             },
             "research_assets": {
                 "status": research_assets["status"],
@@ -1754,6 +1776,10 @@ def create_app(
     def query_current_idea_stage() -> dict[str, object]:
         return runtime.idea_stage.query_current()
 
+    @app.get("/api/v1/plan-stage/current")
+    def query_current_plan_stage() -> dict[str, object]:
+        return runtime.plan_stage.query_current()
+
     @app.get("/api/v1/events")
     async def stream_events(request: Request) -> StreamingResponse:
         raw_revision = (
@@ -2370,7 +2396,61 @@ async def _process_idea_stage(
             await asyncio.sleep(0 if advanced else 0.2)
 
 
+async def _process_plan_stage(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Advance one verified Plan boundary at a time under daemon ownership."""
+
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                runtime.plan_stage.process_once,
+                health=health,
+                timeout_code="plan_stage_operation_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=PLAN_STAGE_WORKER_WATCHDOG_SECONDS,
+            )
+            transient_error = runtime.plan_stage.transient_error
+            if transient_error is not None:
+                raise _PlanStageTransientError(transient_error)
+        except Exception as error:
+            if not isinstance(
+                error,
+                (OSError, OwnerConflict, SQLAlchemyError, _PlanStageTransientError),
+            ):
+                LOGGER.exception("plan stage attempt failed unexpectedly")
+            error_code = (
+                error.code
+                if isinstance(error, (OwnerConflict, _PlanStageTransientError))
+                else type(error).__name__
+            )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
 class _IdeaStageTransientError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _PlanStageTransientError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code

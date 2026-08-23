@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Stage"
+  short_description: "把 accepted Question 与完整 IdeaSet 收口为 FormalPlan"
+  default_prompt: "使用 $plan-stage 从当前冻结闭包形成可审计 FormalPlan。"

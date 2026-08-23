@@ -797,6 +797,70 @@ export type IdeaStageProjection = {
   [key: string]: unknown;
 };
 
+export type PlanIdeaSetSummary = {
+  ref?: string;
+  binding_ref?: string;
+  idea_set_ref?: string;
+  outcome_ref?: string;
+  content_ref?: string;
+  content_hash?: string;
+  schema_ref?: string;
+  candidate_count?: number;
+  content_receipt?: IdeaReceipt | null;
+  domain_receipt?: IdeaReceipt | null;
+  stage_commit_receipt?: IdeaReceipt | null;
+  [key: string]: unknown;
+};
+
+export type PlanStageProjection = {
+  eligibility: {
+    status: string;
+    cycle_ref?: string;
+    question_ref?: string;
+    idea_outcome_ref?: string;
+    reason?: null | { code?: string; message?: string; [key: string]: unknown };
+    [key: string]: unknown;
+  };
+  stage_run_request: null | {
+    status?: string;
+    request_ref?: string;
+    stage_run_request_ref?: string;
+    cycle_ref?: string;
+    stage?: string;
+    epoch?: number;
+    foreground_epoch_ref?: string;
+    accepted_question_binding?: NonNullable<
+      IdeaStageProjection["stage_run_request"]
+    >["accepted_question_binding"];
+    accepted_idea_set_binding?: PlanIdeaSetSummary | null;
+    context_pack_ref?: string;
+    context_pack_hash?: string;
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  run: IdeaStageProjection["run"];
+  plan_acceptance: {
+    status: string;
+    plan_document_ref?: string | null;
+    formal_plan_ref?: string | null;
+    outcome_ref?: string | null;
+    content: IdeaAcceptanceFact;
+    domain: IdeaAcceptanceFact;
+    bundle_disposition?: "experiments_required" | "no_new_experiment_required" | string;
+    answer_contract_hash?: string | null;
+    gap_count?: number;
+    experiment_brief_count?: number;
+    rejection?: null | {
+      code?: string;
+      message?: string;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+  stage_commit: IdeaStageProjection["stage_commit"];
+  [key: string]: unknown;
+};
+
 export type PublicSnapshot = {
   product: { name: string; version: string };
   revision: number;
@@ -821,6 +885,7 @@ export type PublicSnapshot = {
   research_assets: ResearchAssetsView;
   idea_stage?: IdeaStageProjection | null;
   human_collaboration?: HumanCollaborationProjection;
+  plan_stage?: PlanStageProjection | null;
   unavailable: UnavailableCapability[];
 };
 
@@ -3664,6 +3729,7 @@ export function followProjection(
   onRevision: (revision: number) => void,
   onSnapshotRequired: () => void,
   onConnection: (connected: boolean) => void,
+  latestSnapshotRevision?: () => number | null,
 ): () => void {
   const eventTypes = [
     "system.ready",
@@ -3776,6 +3842,15 @@ export function followProjection(
 
   const connect = () => {
     if (stopped) return;
+    const latestRevision = latestSnapshotRevision?.();
+    if (
+      latestRevision !== null
+      && latestRevision !== undefined
+      && Number.isSafeInteger(latestRevision)
+      && latestRevision > cursor
+    ) {
+      cursor = latestRevision;
+    }
     const next = new EventSource(`/api/v1/events?after=${cursor}`);
     stream = next;
     next.onopen = () => {

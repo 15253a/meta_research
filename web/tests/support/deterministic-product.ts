@@ -1,6 +1,6 @@
 import type { Page } from "@playwright/test";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -16,7 +16,10 @@ type ProductStart = {
 type DeterministicProductOptions = {
   legacyState?: "draft" | "recovering";
   manualRoot?: boolean;
+  stagePipeline?: "plan-gap";
 };
+
+export type PlanProviderPhase = "plan-primary" | "plan-review";
 
 const supportDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(supportDirectory, "../../..");
@@ -54,6 +57,9 @@ export class DeterministicProduct {
     }
     if (options.manualRoot) {
       argv.push("--manual-root");
+    }
+    if (options.stagePipeline) {
+      argv.push("--stage-pipeline", options.stagePipeline);
     }
     const child = spawn(
       "uv",
@@ -154,6 +160,43 @@ export class DeterministicProduct {
       throw new Error("deterministic product has no accepted question content to damage");
     }
     rmSync(custodyRoot, { recursive: true });
+  }
+
+  async waitForPlanProviderPhase(
+    phase: PlanProviderPhase,
+    timeoutMs = 20_000,
+  ): Promise<void> {
+    const marker = this.providerMarker(phase, "started");
+    const deadline = Date.now() + timeoutMs;
+    while (!existsSync(marker)) {
+      if (this.unexpectedExit || this.process.exitCode !== null) {
+        throw new Error(
+          `deterministic product exited while waiting for ${phase}`,
+        );
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for deterministic ${phase}`);
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+    }
+  }
+
+  releasePlanProviderPhase(phase: PlanProviderPhase): void {
+    writeFileSync(this.providerMarker(phase, "release"), "release\n", {
+      encoding: "utf8",
+    });
+  }
+
+  private providerMarker(
+    phase: PlanProviderPhase,
+    state: "started" | "release",
+  ): string {
+    return join(
+      this.dataRoot,
+      "run",
+      "chrome-provider-control",
+      `${phase}.${state}`,
+    );
   }
 
   async stop(): Promise<void> {

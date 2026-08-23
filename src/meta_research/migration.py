@@ -12,6 +12,13 @@ from meta_research.database import _configure_sqlite
 
 def _configure_migration_sqlite(dbapi_connection, connection_record) -> None:
     _configure_sqlite(dbapi_connection, connection_record)
+    # SQLite rewrites referenced table names during ALTER TABLE and enforces
+    # parent drops while a schema-rebuild migration is still in flight.  The
+    # migration connection therefore performs DDL with FK enforcement off;
+    # every normal Database connection re-enables it via _configure_sqlite.
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=OFF")
+    cursor.close()
     # Python 3.11's sqlite3 legacy mode otherwise autocommits DDL before
     # Alembic can roll the revision back.
     dbapi_connection.isolation_level = None

@@ -71,9 +71,14 @@ const MAX_REVIEWED_DIFF_DELTA = 0.003;
 const DIFF_GRID_CELL_COUNT = 16;
 const MAX_REVIEWED_GRID_CELL_DELTA = 0.006;
 const MAX_REVIEWED_PRODUCTION_DIFF_PIXELS = 400;
+type FixedDynamicMask = {
+  selector: string;
+  reason: string;
+  region?: "element" | "viewport-right-of-element";
+};
 const FIXED_DYNAMIC_MASK_ALLOWLIST: Record<
   FixedReferenceSurface,
-  Array<{ selector: string; reason: string }>
+  FixedDynamicMask[]
 > = {
   shell: [
     { selector: ".lumen-connection code", reason: "durable feed revision" },
@@ -98,6 +103,11 @@ const FIXED_DYNAMIC_MASK_ALLOWLIST: Record<
     {
       selector: ".manual-parent-context code",
       reason: "accepted parent Question ref",
+    },
+    {
+      selector: ".manual-dialog",
+      reason: "native dialog backdrop over independently scrolling Companion",
+      region: "viewport-right-of-element",
     },
   ],
   "human-request": [],
@@ -373,7 +383,7 @@ export async function captureFixedProductionScreenshot(
   viewport: { width: number; height: number },
 ): Promise<{
   bytes: Buffer;
-  masks: Array<{ selector: string; reason: string }>;
+  masks: FixedDynamicMask[];
   rasterNormalizations: Array<{
     selector: string;
     reason: string;
@@ -382,25 +392,37 @@ export async function captureFixedProductionScreenshot(
   }>;
 }> {
   const masks = FIXED_DYNAMIC_MASK_ALLOWLIST[surface];
-  const boxes: Array<{ x: number; y: number; width: number; height: number }> = [];
-  for (const { selector } of masks) {
-    const locator = page.locator(selector);
+  const boxes: Array<{
+    mask: FixedDynamicMask;
+    box: { x: number; y: number; width: number; height: number };
+  }> = [];
+  for (const mask of masks) {
+    const locator = page.locator(mask.selector);
     const count = await locator.count();
     if (count === 0) {
-      throw new Error(`fixed visual dynamic mask selector is missing: ${selector}`);
+      throw new Error(
+        `fixed visual dynamic mask selector is missing: ${mask.selector}`,
+      );
     }
     for (let index = 0; index < count; index += 1) {
       const box = await locator.nth(index).boundingBox();
-      if (box) boxes.push(box);
+      if (box) boxes.push({ mask, box });
     }
   }
   const raw = await page.screenshot({ animations: "disabled" });
   const masked = PNG.sync.read(raw);
-  for (const box of boxes) {
-    const left = Math.max(0, Math.floor(box.x));
-    const top = Math.max(0, Math.floor(box.y));
-    const right = Math.min(masked.width, Math.ceil(box.x + box.width));
-    const bottom = Math.min(masked.height, Math.ceil(box.y + box.height));
+  for (const { mask, box } of boxes) {
+    const masksRightBackdrop = mask.region === "viewport-right-of-element";
+    const left = masksRightBackdrop
+      ? Math.min(masked.width, Math.ceil(box.x + box.width))
+      : Math.max(0, Math.floor(box.x));
+    const top = masksRightBackdrop ? 0 : Math.max(0, Math.floor(box.y));
+    const right = masksRightBackdrop
+      ? masked.width
+      : Math.min(masked.width, Math.ceil(box.x + box.width));
+    const bottom = masksRightBackdrop
+      ? masked.height
+      : Math.min(masked.height, Math.ceil(box.y + box.height));
     for (let y = top; y < bottom; y += 1) {
       for (let x = left; x < right; x += 1) {
         const offset = (y * masked.width + x) * 4;
