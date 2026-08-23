@@ -929,6 +929,76 @@ export type PublicExperimentProjection = {
   current: ExperimentProjection | null;
 };
 
+export type HarnessCapabilityState = {
+  status: "available" | "capability_unavailable";
+  evidence_refs: string[];
+  reason?: { code: string };
+};
+
+export type HarnessCapabilityProfile = {
+  schema_ref: "meta-research/harness-capability-profile/v1";
+  harness_family: "codex" | "claude";
+  locked_version: string;
+  provider_version: string;
+  native_session_ref: string;
+  capabilities: Record<string, HarnessCapabilityState>;
+  run_ref: string;
+  attempt_ref: string;
+  root_session_ref: string;
+  fence_ref: string;
+  provider_operation_ref: string;
+  provider_operation_refs: string[];
+  provider_transport_receipts: Array<{
+    provider_operation_ref: string;
+    schema_ref: "meta-research/harness-provider-transport-receipt/v1";
+    spool_ref: string;
+    transport_invocation_hash: string;
+    supervisor_receipt_hash: string;
+    termination_reason: string;
+    provider_returncode: number;
+  }>;
+  status: "executed";
+};
+
+export type HarnessAdapterStatus = {
+  harness_family: "codex" | "claude";
+  locked_version: string;
+  provider_version?: string;
+  status: "ready" | "capability_unavailable";
+  installation_status: "ready" | "capability_unavailable";
+  reason?: { code: string };
+  capability_profile: HarnessCapabilityProfile | null;
+  provider_operation: {
+    operation_ref: string;
+    generation: number;
+    status: "running" | "executed" | "failed" | "unknown_outcome";
+    outcome_code: string | null;
+  } | null;
+  missing_reason: { code: string } | null;
+};
+
+export type HarnessStatus = {
+  status: "ready" | "capability_unavailable";
+  gateway: {
+    status: "ready";
+    server_instance_ref: string;
+    deployment_profile: "local_resident_streamable_http";
+    transport: "streamable_http";
+    protocol_version: string;
+    catalog_revision: number;
+    catalog_hash: string;
+    operation_ids: string[];
+    health_receipt: {
+      issuer: "semantic_mcp_gateway";
+      kind: "resident_health";
+      receipt_ref: string;
+      subject_ref: string;
+      payload_hash: string;
+    };
+  };
+  adapters: HarnessAdapterStatus[];
+};
+
 export type PublicSnapshot = {
   product: { name: string; version: string };
   revision: number;
@@ -955,6 +1025,7 @@ export type PublicSnapshot = {
   human_collaboration?: HumanCollaborationProjection;
   plan_stage?: PlanStageProjection | null;
   experiment: PublicExperimentProjection;
+  harnesses: HarnessStatus;
   unavailable: UnavailableCapability[];
 };
 

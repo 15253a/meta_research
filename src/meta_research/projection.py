@@ -19,6 +19,7 @@ from meta_research.owners.research_memory import (
 
 if TYPE_CHECKING:
     from meta_research.experiment import ExperimentService
+    from meta_research.harness import HarnessRuntime
     from meta_research.idea_stage import IdeaStageWorker
     from meta_research.plan_stage import PlanStageWorker
 
@@ -49,6 +50,7 @@ class PublicProjection:
         idea_stage: IdeaStageWorker | None = None,
         plan_stage: PlanStageWorker | None = None,
         experiment: ExperimentService | None = None,
+        harnesses: HarnessRuntime | None = None,
     ) -> None:
         self._feed = feed
         self._object_store = object_store
@@ -60,6 +62,7 @@ class PublicProjection:
         self._idea_stage = idea_stage
         self._plan_stage = plan_stage
         self._experiment = experiment
+        self._harnesses = harnesses
         self._interfaces = {
             "research_graph": research_graph,
             "advancement_engine": advancement_engine,
@@ -365,6 +368,16 @@ class PublicProjection:
                 "status": "idle" if current_experiment is None else "active",
                 "current": current_experiment,
             },
+            "harnesses": (
+                {
+                    "status": "capability_unavailable",
+                    "reason": {"code": "harness_runtime_unavailable"},
+                    "gateway": None,
+                    "adapters": [],
+                }
+                if self._harnesses is None
+                else self._harnesses.query_status()
+            ),
             "unavailable": _release_capabilities(),
         }
         if idea_stage is not None:

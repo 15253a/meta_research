@@ -53,6 +53,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_data_root(status_parser)
     status_parser.add_argument("--json", action="store_true", dest="as_json")
 
+    doctor_parser = commands.add_parser(
+        "doctor", help="Inspect locked Harness and MCP capabilities"
+    )
+    _add_data_root(doctor_parser)
+    doctor_parser.add_argument("--json", action="store_true", dest="as_json")
+
     session_parser = commands.add_parser(
         "session", help="Issue a one-use browser bootstrap token"
     )
@@ -107,6 +113,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 status,
                 args.as_json,
                 human=f"Daemon is {status['status']}",
+            )
+        if args.command == "doctor":
+            state = _require_running(data_root)
+            result = _internal_request(
+                data_root, state, "/internal/doctor", method="GET"
+            )
+            return _emit(
+                result,
+                args.as_json,
+                human=(
+                    f"Harness gateway is {result['status']} at "
+                    f"{state.base_url}/mcp"
+                ),
             )
         if args.command == "session":
             state = _require_running(data_root)

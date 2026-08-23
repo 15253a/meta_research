@@ -63,6 +63,10 @@ from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
     SQLiteOwnerSnapshot,
 )
+from meta_research.owners.agent_runtime_harness import (
+    AgentRuntimeHarnessInterface,
+    SQLiteAgentRuntimeHarness,
+)
 from meta_research.owners.common import (
     AcceptedAssetBinding,
     AcceptanceReceipt,
@@ -109,6 +113,19 @@ class HostComputeObservation:
     @property
     def capabilities(self) -> dict[str, object]:
         return {"devices": [device.as_dict() for device in self.devices]}
+
+    def as_public_dict(self) -> dict[str, object]:
+        value: dict[str, object] = {
+            "snapshot_ref": self.snapshot_ref,
+            "status": self.status,
+            "observed_at": self.observed_at,
+            "devices": [device.as_dict() for device in self.devices],
+            "adapter_kind": self.adapter_kind,
+            "capabilities_hash": self.capabilities_hash,
+        }
+        if self.reason_code is not None:
+            value["reason"] = {"code": self.reason_code}
+        return value
 
 
 AR_OWNER = "agent_runtime"
@@ -427,6 +444,10 @@ class HostComputeObservationReader(Protocol):
 
     def query_host_compute(self, snapshot_ref: str) -> HostComputeObservation: ...
 
+    def reconcile_host_compute(
+        self, idempotency_key: str
+    ) -> HostComputeObservation | None: ...
+
 
 class ResearchMaterialResolver(Protocol):
     """Narrow RM Query seam used to validate and materialize accepted content."""
@@ -438,6 +459,9 @@ class ResearchMaterialResolver(Protocol):
 
 class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for Run, Attempt, Session, Fence, and host facts."""
+
+    @property
+    def harness_runs(self) -> AgentRuntimeHarnessInterface: ...
 
     def query_snapshot(self) -> OwnerSnapshot: ...
 
@@ -813,12 +837,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         )
         self._host_compute_reader = SQLiteHostComputeObservationReader(database)
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
+        self._harness_runs = SQLiteAgentRuntimeHarness(database, feed)
         self._deepfetch_provider_lock = threading.Lock()
         self._deepfetch_providers: dict[str, DeepFetchProvider] = {}
         self._recover_interrupted_acquisition()
         self._recover_acquisition_human_requests()
         self._recover_interrupted_deepfetch()
         self._recover_interrupted_experiments()
+
+    @property
+    def harness_runs(self) -> AgentRuntimeHarnessInterface:
+        return self._harness_runs
 
     def bind_research_material_resolver(
         self, resolver: ResearchMaterialResolver
@@ -1196,6 +1225,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
 
     def query_host_compute(self, snapshot_ref: str) -> HostComputeObservation:
         return self._host_compute_reader.query_host_compute(snapshot_ref)
+
+    def reconcile_host_compute(
+        self, idempotency_key: str
+    ) -> HostComputeObservation | None:
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise OwnerConflict("idempotency_key_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_host_capability_snapshots WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        return None if row is None else _observation_from_row(row)
 
     def _recover_interrupted_acquisition(self) -> None:
         """Release daemon-local slots without replaying an unknown download."""

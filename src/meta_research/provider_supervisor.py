@@ -20,6 +20,16 @@ from typing import cast
 TRANSPORT_KEY_BYTES = 32
 SUPERVISOR_REQUEST_SCHEMA = "meta-research/codex-provider-supervisor-request/v1"
 SUPERVISOR_EXIT_SCHEMA = "meta-research/codex-provider-supervisor-exit/v1"
+SUPERVISOR_REQUEST_SCHEMA_V2 = "meta-research/provider-supervisor-request/v2"
+SUPERVISOR_EXIT_SCHEMA_V2 = "meta-research/provider-supervisor-exit/v2"
+_SUPERVISOR_REQUEST_SCHEMAS = {
+    SUPERVISOR_REQUEST_SCHEMA,
+    SUPERVISOR_REQUEST_SCHEMA_V2,
+}
+_SUPERVISOR_EXIT_SCHEMAS = {
+    SUPERVISOR_EXIT_SCHEMA,
+    SUPERVISOR_EXIT_SCHEMA_V2,
+}
 
 
 class ProviderSupervisorError(RuntimeError):
@@ -137,14 +147,14 @@ def write_supervisor_request(
     payload: dict[str, object],
     key: bytes,
 ) -> None:
-    if payload.get("schema_ref") != SUPERVISOR_REQUEST_SCHEMA:
+    if payload.get("schema_ref") not in _SUPERVISOR_REQUEST_SCHEMAS:
         raise ProviderSupervisorError("provider_supervisor_request_invalid")
     _write_signed_envelope(path, payload, key)
 
 
 def read_supervisor_request(path: Path, key: bytes) -> dict[str, object]:
     payload = _read_signed_envelope(path, key)
-    if payload.get("schema_ref") != SUPERVISOR_REQUEST_SCHEMA:
+    if payload.get("schema_ref") not in _SUPERVISOR_REQUEST_SCHEMAS:
         raise ProviderSupervisorError("provider_supervisor_request_invalid")
     return payload
 
@@ -161,10 +171,11 @@ def write_exit_receipt(
     returncode: int,
     input_bytes: int,
     termination_reason: str = "completed",
+    schema_ref: str = SUPERVISOR_EXIT_SCHEMA,
 ) -> None:
     prompt_bytes = prompt_path.stat().st_size
     payload: dict[str, object] = {
-        "schema_ref": SUPERVISOR_EXIT_SCHEMA,
+        "schema_ref": schema_ref,
         "invocation_hash": invocation_hash,
         "returncode": returncode,
         "termination_reason": termination_reason,
@@ -215,7 +226,7 @@ def read_verified_exit_receipt(
     )
     if (
         set(payload) != expected_keys
-        or payload.get("schema_ref") != SUPERVISOR_EXIT_SCHEMA
+        or payload.get("schema_ref") not in _SUPERVISOR_EXIT_SCHEMAS
         or payload.get("invocation_hash") != invocation_hash
         or not isinstance(returncode, int)
         or isinstance(returncode, bool)
@@ -537,6 +548,7 @@ def supervise(request_path: Path) -> None:
     request_path = request_path.resolve()
     key = _read_transport_key(_operation_key_path(request_path.parent))
     payload = read_supervisor_request(request_path, key)
+    generic_schema = payload.get("schema_ref") == SUPERVISOR_REQUEST_SCHEMA_V2
     invocation_hash = payload.get("invocation_hash")
     if not isinstance(invocation_hash, str) or len(invocation_hash) != 64:
         raise ProviderSupervisorError("provider_supervisor_request_invalid")
@@ -559,7 +571,11 @@ def supervise(request_path: Path) -> None:
             raise ProviderSupervisorError("provider_outcome_unknown")
         _write_phase_marker(
             paths["ready_path"],
-            schema_ref="meta-research/codex-provider-supervisor-ready/v1",
+            schema_ref=(
+                "meta-research/provider-supervisor-ready/v2"
+                if generic_schema
+                else "meta-research/codex-provider-supervisor-ready/v1"
+            ),
             invocation_hash=invocation_hash,
             key=key,
         )
@@ -572,6 +588,16 @@ def supervise(request_path: Path) -> None:
             stream_max_bytes=stream_max_bytes,
             result_max_bytes=result_max_bytes,
             stop_requested=lambda: stop_requested,
+            started_schema_ref=(
+                "meta-research/provider-started/v2"
+                if generic_schema
+                else "meta-research/codex-provider-started/v1"
+            ),
+            exit_schema_ref=(
+                SUPERVISOR_EXIT_SCHEMA_V2
+                if generic_schema
+                else SUPERVISOR_EXIT_SCHEMA
+            ),
         )
 
 
@@ -585,6 +611,8 @@ def _supervise_locked(
     stream_max_bytes: int,
     result_max_bytes: int,
     stop_requested: Callable[[], bool],
+    started_schema_ref: str,
+    exit_schema_ref: str,
 ) -> None:
     prompt_path = paths["prompt_path"]
     schema_path = paths["schema_path"]
@@ -616,7 +644,7 @@ def _supervise_locked(
         else:
             _write_phase_marker(
                 paths["started_path"],
-                schema_ref="meta-research/codex-provider-started/v1",
+                schema_ref=started_schema_ref,
                 invocation_hash=invocation_hash,
                 key=key,
             )
@@ -726,6 +754,7 @@ def _supervise_locked(
         returncode=returncode,
         input_bytes=input_bytes,
         termination_reason=termination_reason,
+        schema_ref=exit_schema_ref,
     )
 
 

@@ -36,6 +36,7 @@ from meta_research.quest_drafting import (
     INTENT_MESSAGE_MAX_LENGTH,
     QUESTION_FIELD_MAX_LENGTHS,
 )
+from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
 
 
 SESSION_COOKIE = "meta_research_session"
@@ -43,6 +44,7 @@ CSRF_COOKIE = "meta_research_csrf"
 LOGGER = logging.getLogger(__name__)
 MAX_ASSET_INTAKE_REQUEST_BODY_BYTES = 96 * 1024 * 1024
 MAX_COMMAND_REQUEST_BODY_BYTES = 1 * 1024 * 1024
+MAX_MCP_REQUEST_BODY_BYTES = 1 * 1024 * 1024
 # Kept as the public intake-envelope constant used by compatibility tests and
 # callers that size a Research Asset request before sending it.
 MAX_JSON_REQUEST_BODY_BYTES = MAX_ASSET_INTAKE_REQUEST_BODY_BYTES
@@ -678,12 +680,32 @@ def create_app(
             "/auth/launch",
         }
         internal_route = path.startswith("/internal/")
+        mcp_route = path == "/mcp"
+
+        if mcp_route:
+            content_type = (
+                request.headers.get("content-type", "").split(";", 1)[0].strip()
+            )
+            if request.method == "POST" and content_type != "application/json":
+                return _error(415, "json_required")
+            origin = request.headers.get("origin")
+            if origin is not None and origin != base_url:
+                return _error(403, "origin_invalid")
+            accepted = {
+                item.split(";", 1)[0].strip()
+                for item in request.headers.get("accept", "").split(",")
+            }
+            if request.method == "POST" and not {
+                "application/json",
+                "text/event-stream",
+            }.issubset(accepted):
+                return _error(406, "mcp_accept_required")
 
         if internal_route:
             supplied = request.headers.get("x-meta-research-control")
             if not runtime.authentication.control_key_matches(supplied, control_key):
                 return _error(401, "control_authentication_required")
-        elif not public_auth_route:
+        elif not public_auth_route and not mcp_route:
             session_token = request.cookies.get(SESSION_COOKIE)
             if not await asyncio.to_thread(
                 runtime.authentication.session_is_valid, session_token
@@ -727,11 +749,15 @@ def create_app(
                 return _error(403, "csrf_invalid")
 
         async def dispatch() -> Response:
-            if json_auth_route or unsafe_api_route:
+            if json_auth_route or unsafe_api_route or mcp_route:
                 request_body_limit = (
                     MAX_ASSET_INTAKE_REQUEST_BODY_BYTES
                     if is_asset_intake
-                    else MAX_COMMAND_REQUEST_BODY_BYTES
+                    else (
+                        MAX_MCP_REQUEST_BODY_BYTES
+                        if mcp_route
+                        else MAX_COMMAND_REQUEST_BODY_BYTES
+                    )
                 )
                 content_length = request.headers.get("content-length")
                 if content_length is not None:
@@ -897,6 +923,10 @@ def create_app(
             },
         }
 
+    @app.get("/internal/doctor")
+    def internal_doctor() -> dict[str, object]:
+        return runtime.harnesses.query_status()
+
     @app.post("/auth/bootstrap")
     def exchange_bootstrap(exchange: BootstrapExchange) -> JSONResponse:
         session = runtime.authentication.exchange_bootstrap_token(exchange.token)
@@ -914,6 +944,32 @@ def create_app(
         )
         _set_session_cookie(response, session)
         return response
+
+    @app.post("/mcp")
+    async def semantic_mcp(request: Request) -> Response:
+        authorization = request.headers.get("authorization", "")
+        token = (
+            authorization.removeprefix("Bearer ")
+            if authorization.startswith("Bearer ")
+            else None
+        )
+        try:
+            message = await request.json()
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            message = None
+        method = message.get("method") if isinstance(message, dict) else None
+        if method != "initialize":
+            protocol_version = request.headers.get("mcp-protocol-version")
+            if protocol_version is None:
+                return _error(400, "mcp_protocol_version_required")
+            if protocol_version != MCP_PROTOCOL_VERSION:
+                return _error(400, "mcp_protocol_version_unsupported")
+        status, payload = await asyncio.to_thread(
+            runtime.harnesses.dispatch_mcp, token, message
+        )
+        if payload is None:
+            return Response(status_code=status)
+        return JSONResponse(payload, status_code=status)
 
     @app.post("/auth/launch")
     async def exchange_browser_grant(request: Request) -> FileResponse:

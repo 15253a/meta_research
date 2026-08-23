@@ -244,6 +244,7 @@ class _CancellableProcessRunner:
         stdout_path: Path,
         pid_path: Path,
         supervisor_request_path: Path,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run through a supervisor that outlives a daemon crash.
 
@@ -271,6 +272,11 @@ class _CancellableProcessRunner:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=os.name == "posix",
+                env=(
+                    None
+                    if environment is None
+                    else {**os.environ, **environment}
+                ),
             )
             process_group = os.getpgid(process.pid) if os.name == "posix" else None
             ready_path = supervisor_request_path.parent / "supervisor-ready.json"
