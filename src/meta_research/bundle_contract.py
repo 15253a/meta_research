@@ -16,6 +16,52 @@ class BundleContractError(ValueError):
     pass
 
 
+def target_execution_assertion(
+    *,
+    quest_ref: str,
+    stage_request_ref: str,
+    graph_ref: str,
+    target_ref: str,
+    target_spec_hash: str,
+    risk_class: str,
+) -> dict[str, object]:
+    """Canonical exact subject used by the high-risk Target waiter."""
+
+    return {
+        "schema_ref": "meta-research/target-execution-assertion/v1",
+        "operation": "execute_target",
+        "quest_ref": quest_ref,
+        "stage_request_ref": stage_request_ref,
+        "graph_ref": graph_ref,
+        "target_ref": target_ref,
+        "target_spec_hash": target_spec_hash,
+        "risk_class": risk_class,
+    }
+
+
+def target_execution_authorization_requirement(
+    *,
+    quest_ref: str,
+    stage_request_ref: str,
+    graph_ref: str,
+    target_ref: str,
+    target_spec_hash: str,
+) -> dict[str, object]:
+    """Canonical single-Target capability requirement verified by HC."""
+
+    return {
+        "capability": "execute_high_risk_target",
+        "scope": {
+            "authorization_mode": "single_target",
+            "quest_ref": quest_ref,
+            "stage_request_ref": stage_request_ref,
+            "graph_ref": graph_ref,
+            "target_ref": target_ref,
+            "target_spec_hash": target_spec_hash,
+        },
+    }
+
+
 def validate_bundle_context_pack(
     context_pack: dict[str, object],
     *,
@@ -266,6 +312,7 @@ def validate_target_plan_review(
             raise BundleContractError("target_plan_review_invalid")
         finding_ids.add(cast(str, finding["finding_id"]))
     disposition_ids: set[str] = set()
+    revised = False
     for value in dispositions:
         disposition = _object(value, "target_plan_review_invalid")
         _exact_keys(
@@ -281,8 +328,16 @@ def validate_target_plan_review(
         ):
             raise BundleContractError("target_plan_review_invalid")
         disposition_ids.add(cast(str, disposition["finding_id"]))
+        revised = revised or disposition.get("action") == "revised"
     if disposition_ids != finding_ids:
         raise BundleContractError("target_plan_review_invalid")
+    changed = reviewed_draft_hash != final_target_plan_hash
+    if changed != revised:
+        raise BundleContractError(
+            "target_plan_review_revision_not_material"
+            if revised
+            else "target_plan_changed_without_review_revision"
+        )
     return canonical_hash(review)
 
 

@@ -80,6 +80,8 @@ def test_interrupted_bundle_migration_rolls_back_and_restarts_cleanly(
         foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA quick_check").fetchone()
     assert {
+        "ar_bundle_dispatch_decisions",
+        "ar_target_run_admissions",
         "rg_target_graphs",
         "rg_targets",
         "rg_target_run_bindings",

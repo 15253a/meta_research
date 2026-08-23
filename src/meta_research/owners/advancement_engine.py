@@ -1802,6 +1802,23 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                     existing.commit_ref,
                 )
                 return self._stage_commit_from_row(existing)
+            current_request = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                    ":cycle_ref AND stage = 'bundle' ORDER BY epoch DESC, "
+                    "created_at DESC, request_ref DESC LIMIT 1"
+                ),
+                {"cycle_ref": request.cycle_ref},
+            ).first()
+            if current_request is None or (
+                current_request.request_ref != request.request_ref
+                or int(current_request.epoch) != request.epoch
+                or current_request.context_pack_ref != request.context_pack_ref
+                or current_request.context_pack_hash != request.context_pack_hash
+                or current_request.receipt_ref != request.receipt.receipt_ref
+                or current_request.receipt_hash != request.receipt.payload_hash
+            ):
+                raise OwnerConflict("bundle_foreground_epoch_stale")
             commit_ref = new_ref("stage_commit")
             receipt_ref = new_ref("ae_stage_commit_receipt")
             bindings = {

@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Protocol, cast
 
-from meta_research.bundle_contract import BUNDLE_CONTEXT_PACK_SCHEMA_REF
+from meta_research.bundle_contract import (
+    BUNDLE_CONTEXT_PACK_SCHEMA_REF,
+    target_execution_assertion,
+    target_execution_authorization_requirement,
+)
 from meta_research.bundle_skill import (
+    BundleDispatchRequest,
     BundleSkillContractError,
     BundleSkillDraft,
     BundleSkillProvider,
     BundleSkillRequest,
     BundleSkillUnavailable,
     review_record,
+    validate_bundle_dispatch_result,
     validate_bundle_skill_draft,
     validate_bundle_skill_result,
 )
@@ -35,10 +42,13 @@ from meta_research.owners.common import (
 )
 from meta_research.owners.research_graph import (
     AcceptedQuestion,
+    AcceptedTarget,
+    AcceptedTargetGraph,
     FormalPlanDecision,
     ResearchGraphInterface,
     TargetCommit,
 )
+from meta_research.owners.human_collaboration import HumanCollaborationInterface
 from meta_research.owners.research_memory import (
     AcceptedPlanDocument,
     AssetIntakeRequest,
@@ -92,6 +102,14 @@ class _EligibleBundle:
         )
 
 
+@dataclass(frozen=True)
+class _TargetAuthorization:
+    request_ref: str
+    waiter_ref: str
+    generation: int
+    authorization_receipt_ref: str
+
+
 class BundleStageWorker:
     """Recoverable Bundle orchestration through the four Owner Interfaces.
 
@@ -109,6 +127,7 @@ class BundleStageWorker:
         research_graph: ResearchGraphInterface,
         provider: BundleSkillProvider,
         experiment: ExperimentCoordinator,
+        human_collaboration: HumanCollaborationInterface | None = None,
     ) -> None:
         self._feed = feed
         self._advancement_engine = advancement_engine
@@ -117,6 +136,7 @@ class BundleStageWorker:
         self._research_graph = research_graph
         self._provider = provider
         self._experiment = experiment
+        self._human_collaboration = human_collaboration
         self._transient_error: str | None = None
 
     @property
@@ -243,25 +263,110 @@ class BundleStageWorker:
                         "bundle-commit", request.request_ref, graph.graph_ref
                     ),
                 )
+                self._finish_bundle_jobs(run)
                 return True
+            self._finish_bundle_jobs(run)
             return False
         frontier = self._research_graph.query_target_frontier(graph.graph_ref)
-        if frontier:
-            target = frontier[0]
-            if target.spec.get("risk_class") == "high":
-                self._transient_error = "target_high_risk_authorization_required"
+        authorizations: dict[str, _TargetAuthorization] = {}
+        for target in frontier:
+            if target.spec.get("risk_class") != "high":
+                continue
+            authorization, changed = self._advance_target_authorization(
+                graph=graph,
+                target=target,
+            )
+            if changed:
+                return True
+            if authorization is not None:
+                authorizations[target.target_ref] = authorization
+        dispatchable = tuple(
+            target
+            for target in frontier
+            if target.spec.get("risk_class") != "high"
+            or target.target_ref in authorizations
+        )
+        dispatch_frontier = tuple(
+            self._dispatch_target(target) for target in dispatchable
+        )
+        dispatch_state = self._dispatch_state(graph, commits)
+        decisions = self._agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+        latest = decisions[-1] if decisions else None
+        same_input = latest is not None and (
+            latest.graph_ref == graph.graph_ref
+            and latest.frontier == dispatch_frontier
+            and latest.state == dispatch_state
+        )
+        pending_dispatch = (
+            latest
+            if same_input
+            and latest.action == "dispatch"
+            and latest.selected_target_ref
+            in {target.target_ref for target in dispatchable}
+            else None
+        )
+        coordination_needed = bool(dispatchable) or bool(
+            cast(list[object], dispatch_state["blocked_targets"])
+        )
+        if pending_dispatch is None and coordination_needed and not same_input:
+            if run.native_session_ref is None:
+                raise OwnerConflict("bundle_native_session_missing")
+            dispatch_request = BundleDispatchRequest(
+                stage_request_ref=request.request_ref,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                graph_ref=graph.graph_ref,
+                generation=len(decisions) + 1,
+                frontier=dispatch_frontier,
+                state=dispatch_state,
+                native_session_ref=run.native_session_ref,
+                runtime_binding=cast(BundleRuntimeBinding, run.runtime_binding),
+                job_ref=run.review_invocation.invocation_ref,
+            )
+            try:
+                result = self._provider.schedule_target(dispatch_request)
+                validate_bundle_dispatch_result(dispatch_request, result)
+            except BundleSkillUnavailable as error:
+                self._transient_error = error.code
                 return False
+            except BundleSkillContractError as error:
+                self._transient_error = str(error)
+                return False
+            self._agent_runtime.record_bundle_dispatch_decision(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                native_session_ref=result.native_session_ref,
+                graph_ref=graph.graph_ref,
+                generation=dispatch_request.generation,
+                frontier=dispatch_frontier,
+                state=dispatch_state,
+                action=result.action,
+                selected_target_ref=result.selected_target_ref,
+                rationale=result.rationale,
+                idempotency_key=_operation_key(
+                    "bundle-dispatch", run.run_ref, str(len(decisions) + 1)
+                ),
+            )
+            self._transient_error = (
+                None
+                if result.action == "dispatch"
+                else "bundle_replan_required"
+                if result.action == "replan_required"
+                else "bundle_root_waiting"
+            )
+            return True
+        if pending_dispatch is not None:
+            target = next(
+                target
+                for target in dispatchable
+                if target.target_ref == pending_dispatch.selected_target_ref
+            )
             binding = self._research_graph.query_target_run_binding(target.target_ref)
             if binding is None:
                 execution = self._experiment.start(
-                    ExperimentIntent(
-                        execution_request_ref=f"bundle-target-{target.target_ref}",
-                        quest_ref=graph.quest_ref,
-                        title=cast(str, target.spec["title"]),
-                        hypothesis=cast(str, target.spec["hypothesis"]),
-                        variant_parameter=float(target.spec["variant_parameter"]),
-                        sample_count=cast(int, target.spec["sample_count"]),
-                    ),
+                    _target_experiment_intent(graph.quest_ref, target),
                     _operation_key("target-start", target.target_ref),
                 )
                 identities = execution.get("identities")
@@ -276,13 +381,46 @@ class BundleStageWorker:
                     or not isinstance(intent.get("execution_request_ref"), str)
                 ):
                     raise OwnerConflict("target_run_admission_invalid")
+                evaluation_attempt_ref = cast(str, identities["evaluation_attempt_ref"])
+                domain = self._research_graph.query_experiment(evaluation_attempt_ref)
+                if domain is None:
+                    raise OwnerConflict("target_run_domain_admission_missing")
+                authorization = authorizations.get(target.target_ref)
+                admission = self._agent_runtime.admit_target_run(
+                    target_ref=target.target_ref,
+                    target_spec_hash=target.spec_hash,
+                    graph_ref=graph.graph_ref,
+                    stage_request_ref=request.request_ref,
+                    quest_ref=graph.quest_ref,
+                    target_run_ref=cast(str, runtime["run_ref"]),
+                    evaluation_attempt_ref=evaluation_attempt_ref,
+                    execution_request_ref=cast(str, intent["execution_request_ref"]),
+                    definition_hash=domain.execution_request.definition_hash,
+                    idempotency_key=_operation_key(
+                        "target-run-admit", target.target_ref
+                    ),
+                    human_request_ref=(
+                        None if authorization is None else authorization.request_ref
+                    ),
+                    human_waiter_ref=(
+                        None if authorization is None else authorization.waiter_ref
+                    ),
+                    human_waiter_generation=(
+                        None if authorization is None else authorization.generation
+                    ),
+                    human_authorization_receipt_ref=(
+                        None
+                        if authorization is None
+                        else authorization.authorization_receipt_ref
+                    ),
+                )
                 self._research_graph.bind_target_run(
                     target_ref=target.target_ref,
                     target_run_ref=cast(str, runtime["run_ref"]),
-                    evaluation_attempt_ref=cast(
-                        str, identities["evaluation_attempt_ref"]
-                    ),
+                    evaluation_attempt_ref=evaluation_attempt_ref,
                     execution_request_ref=cast(str, intent["execution_request_ref"]),
+                    definition_hash=domain.execution_request.definition_hash,
+                    admission_receipt=admission.receipt,
                 )
                 self._transient_error = None
                 return True
@@ -307,6 +445,24 @@ class BundleStageWorker:
                 or target_run.execution_receipt is None
             ):
                 continue
+            result_roles = tuple(
+                role
+                for role in self._research_graph.query_experiment_asset_roles(
+                    binding.evaluation_attempt_ref
+                )
+                if role.role == "result_content"
+            )
+            if len(result_roles) != 1:
+                raise OwnerConflict("target_commit_result_content_invalid")
+            materialized = self._research_memory.materialize_asset(
+                result_roles[0].binding.version_ref
+            )
+            try:
+                result_content = json.loads(materialized.content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise OwnerConflict("target_commit_result_content_invalid") from error
+            if not isinstance(result_content, dict):
+                raise OwnerConflict("target_commit_result_content_invalid")
             self._research_graph.accept_target_commit(
                 target_ref=target.target_ref,
                 target_run_ref=target_run.run_ref,
@@ -314,9 +470,255 @@ class BundleStageWorker:
                 fence_ref=target_run.fence_ref,
                 execution_result_hash=target_run.result_hash,
                 execution_receipt=target_run.execution_receipt,
+                result_content=result_content,
             )
             return True
         return False
+
+    def _advance_target_authorization(
+        self,
+        *,
+        graph: AcceptedTargetGraph,
+        target: AcceptedTarget,
+    ) -> tuple[_TargetAuthorization | None, bool]:
+        if self._human_collaboration is None:
+            self._transient_error = "human_collaboration_unavailable"
+            return None, False
+        assertion = _target_authorization_assertion(graph, target)
+        requirement = _target_authorization_requirement(graph, target)
+        request = self._target_human_request(graph.quest_ref, assertion)
+        waiter = {
+            "waiter_ref": target.target_ref,
+            "generation": 1,
+            "target_assertion": assertion,
+            "wait_scope": "local",
+            "other_blockers": [],
+        }
+        if request is None:
+            self._agent_runtime.open_human_request(
+                request_kind="capability_authorization",
+                obligation=("决定是否仅为这一精确高风险 Target 授予一次执行权限。"),
+                business_purpose=(
+                    "只恢复对应 Target；同一 DAG 中其他普通 Target 继续推进。"
+                ),
+                target_assertion=assertion,
+                acceptance_conditions=(
+                    "Human Collaboration 保存 exact granted authorization receipt。",
+                    "Agent Runtime 重验 current Target/spec 与同一 waiter generation。",
+                ),
+                direct_waiter=waiter,
+                required_authorization=requirement,
+                quest_ref=graph.quest_ref,
+                idempotency_key=_operation_key(
+                    "target-human-request", target.target_ref
+                ),
+            )
+            self._transient_error = "target_high_risk_authorization_required"
+            return None, True
+        responses = cast(list[dict[str, object]], request.get("responses", []))
+        if request.get("status") == "open":
+            declined = tuple(
+                cast(str, response["response_ref"])
+                for response in responses
+                if response.get("decision") == "declined"
+                and isinstance(response.get("response_ref"), str)
+            )
+            if declined:
+                self._agent_runtime.evaluate_human_request(
+                    cast(str, request["request_ref"]),
+                    response_refs=declined,
+                    decision="declined",
+                    reason_code="target_authorization_declined",
+                    accepted_evidence_refs=(),
+                    idempotency_key=_operation_key(
+                        "target-human-decline", target.target_ref
+                    ),
+                )
+                self._transient_error = "target_high_risk_authorization_declined"
+                return None, True
+            provided = tuple(
+                cast(str, response["response_ref"])
+                for response in responses
+                if response.get("decision") == "provided"
+                and isinstance(response.get("response_ref"), str)
+            )
+            authorization_ref = self._target_authorization_receipt(
+                graph.quest_ref, requirement
+            )
+            if provided and authorization_ref is not None:
+                self._agent_runtime.evaluate_human_request(
+                    cast(str, request["request_ref"]),
+                    response_refs=provided,
+                    decision="satisfied",
+                    reason_code="target_authorization_verified",
+                    accepted_evidence_refs=(authorization_ref,),
+                    idempotency_key=_operation_key(
+                        "target-human-satisfy", target.target_ref
+                    ),
+                )
+                return None, True
+            self._transient_error = "target_high_risk_authorization_required"
+            return None, False
+        if request.get("status") == "declined":
+            self._transient_error = "target_high_risk_authorization_declined"
+            return None, False
+        if request.get("status") != "satisfied":
+            self._transient_error = "target_high_risk_authorization_required"
+            return None, False
+        waiters = cast(list[dict[str, object]], request.get("direct_waiters", []))
+        matching = [
+            item
+            for item in waiters
+            if item.get("waiter_ref") == target.target_ref
+            and item.get("generation") == 1
+            and item.get("target_assertion") == assertion
+        ]
+        authorization_ref = self._target_authorization_receipt(
+            graph.quest_ref, requirement
+        )
+        if len(matching) != 1 or authorization_ref is None:
+            self._transient_error = "target_high_risk_authorization_stale"
+            return None, False
+        current_waiter = matching[0]
+        if current_waiter.get("status") == "blocked":
+            validation = self._agent_runtime.validate_human_request_waiter(
+                cast(str, request["request_ref"]),
+                waiter_ref=target.target_ref,
+                generation=1,
+                target_assertion=assertion,
+                other_blockers=(),
+                authorization_receipt_ref=authorization_ref,
+                idempotency_key=_operation_key(
+                    "target-human-resume", target.target_ref
+                ),
+            )
+            if validation.get("status") == "released":
+                return None, True
+            reason = validation.get("reason")
+            self._transient_error = (
+                cast(str, reason["code"])
+                if isinstance(reason, dict) and isinstance(reason.get("code"), str)
+                else "target_high_risk_authorization_stale"
+            )
+            return None, False
+        if current_waiter.get("status") not in {"released", "consumed"}:
+            self._transient_error = "target_high_risk_authorization_stale"
+            return None, False
+        self._transient_error = None
+        return (
+            _TargetAuthorization(
+                request_ref=cast(str, request["request_ref"]),
+                waiter_ref=target.target_ref,
+                generation=1,
+                authorization_receipt_ref=authorization_ref,
+            ),
+            False,
+        )
+
+    def _target_human_request(
+        self, quest_ref: str, assertion: dict[str, object]
+    ) -> dict[str, object] | None:
+        matches = [
+            request
+            for request in self._agent_runtime.query_human_requests(
+                quest_ref=quest_ref, include_history=True
+            )
+            if request.get("kind") == "capability_authorization"
+            and request.get("target_assertion") == assertion
+            and request.get("current") is True
+        ]
+        if len(matches) > 1:
+            raise OwnerConflict("target_human_request_conflict")
+        return matches[0] if matches else None
+
+    def _target_authorization_receipt(
+        self, quest_ref: str, requirement: dict[str, object]
+    ) -> str | None:
+        if self._human_collaboration is None:
+            return None
+        projection = self._human_collaboration.query_collaboration_projection(
+            (f"quest:{quest_ref}",)
+        )
+        matches = [
+            authorization
+            for authorization in projection.get("authorizations", [])
+            if authorization.get("authorization_kind") == "capability"
+            and authorization.get("status") == "granted"
+            and authorization.get("is_current") is True
+            and authorization.get("requirement") == requirement
+            and isinstance(authorization.get("receipt_ref"), str)
+        ]
+        if len(matches) > 1:
+            raise OwnerConflict("target_authorization_conflict")
+        return None if not matches else cast(str, matches[0]["receipt_ref"])
+
+    def _dispatch_state(
+        self,
+        graph: AcceptedTargetGraph,
+        commits: tuple[TargetCommit, ...],
+    ) -> dict[str, object]:
+        committed = {commit.target_ref: commit for commit in commits}
+        blocked: list[dict[str, object]] = []
+        running: list[dict[str, object]] = []
+        for target in graph.targets:
+            if target.target_ref in committed:
+                continue
+            binding = self._research_graph.query_target_run_binding(target.target_ref)
+            if binding is not None:
+                target_run = self._agent_runtime.query_experiment_run(
+                    binding.evaluation_attempt_ref
+                )
+                if target_run is not None and target_run.status == "failed":
+                    blocked.append(
+                        {
+                            "target_ref": target.target_ref,
+                            "reason": {
+                                "code": target_run.failure_code or "target_run_failed"
+                            },
+                        }
+                    )
+                else:
+                    running.append(
+                        {
+                            "target_ref": target.target_ref,
+                            "target_run_ref": binding.target_run_ref,
+                        }
+                    )
+                continue
+            if target.spec.get("risk_class") == "high":
+                assertion = _target_authorization_assertion(graph, target)
+                request = self._target_human_request(graph.quest_ref, assertion)
+                if request is None or request.get("status") != "satisfied":
+                    blocked.append(
+                        {
+                            "target_ref": target.target_ref,
+                            "reason": {
+                                "code": (
+                                    "target_high_risk_authorization_declined"
+                                    if request is not None
+                                    and request.get("status") == "declined"
+                                    else "target_high_risk_authorization_required"
+                                )
+                            },
+                        }
+                    )
+        return {
+            "schema_ref": "meta-research/bundle-dispatch-state/v1",
+            "target_commit_refs": [commit.commit_ref for commit in commits],
+            "running_targets": running,
+            "blocked_targets": blocked,
+        }
+
+    @staticmethod
+    def _dispatch_target(target: AcceptedTarget) -> dict[str, object]:
+        return {
+            "target_ref": target.target_ref,
+            "target_key": target.target_key,
+            "spec_hash": target.spec_hash,
+            "spec": target.spec,
+            "dependency_refs": list(target.dependency_refs),
+            "receipt": target.receipt.as_public_dict(),
+        }
 
     def _publish_target_commit_evidence(
         self,
@@ -422,11 +824,50 @@ class BundleStageWorker:
                     blocker = {
                         "code": (target_execution.failure_code or "target_run_failed")
                     }
-                elif target.spec.get("risk_class") == "high":
-                    status = "blocked"
-                    blocker = {"code": "target_high_risk_authorization_required"}
                 elif target_binding is not None:
                     status = "running"
+                elif (
+                    target.spec.get("risk_class") == "high"
+                    and target.target_ref in frontier_refs
+                ):
+                    assertion = _target_authorization_assertion(graph, target)
+                    human_request = self._target_human_request(
+                        graph.quest_ref, assertion
+                    )
+                    waiter = (
+                        None
+                        if human_request is None
+                        else next(
+                            (
+                                item
+                                for item in cast(
+                                    list[dict[str, object]],
+                                    human_request.get("direct_waiters", []),
+                                )
+                                if item.get("waiter_ref") == target.target_ref
+                                and item.get("generation") == 1
+                            ),
+                            None,
+                        )
+                    )
+                    if (
+                        human_request is not None
+                        and human_request.get("status") == "satisfied"
+                        and waiter is not None
+                        and waiter.get("status") in {"released", "consumed"}
+                        and target.target_ref in frontier_refs
+                    ):
+                        status = "ready"
+                    else:
+                        status = "blocked"
+                        blocker = {
+                            "code": (
+                                "target_high_risk_authorization_declined"
+                                if human_request is not None
+                                and human_request.get("status") == "declined"
+                                else "target_high_risk_authorization_required"
+                            )
+                        }
                 elif target.target_ref in frontier_refs:
                     status = "ready"
                 else:
@@ -472,6 +913,15 @@ class BundleStageWorker:
                 }
                 for commit in commits
             ]
+            _evidence_revision, evidence_catalog = (
+                self._research_graph.query_plan_evidence_catalog(
+                    quest_ref=graph.quest_ref
+                )
+            )
+            evidence_by_commit = {
+                cast(str, evidence["target_commit_root_ref"]): evidence
+                for evidence in evidence_catalog
+            }
             baseline_pool = [
                 {
                     "target_commit_ref": commit.commit_ref,
@@ -479,8 +929,14 @@ class BundleStageWorker:
                     "result_disposition": commit.result_disposition,
                     "metric_result": commit.closure["metric_result"],
                     "receipt": commit.receipt.as_public_dict(),
+                    "evidence_ref": evidence["evidence_ref"],
+                    "asset_version_ref": evidence["asset_version_ref"],
+                    "content_hash": evidence["content_hash"],
+                    "role_ref": evidence["role_ref"],
+                    "role_receipt": evidence["role_receipt"],
                 }
                 for commit in commits
+                if (evidence := evidence_by_commit.get(commit.commit_ref)) is not None
             ]
         disposition: dict[str, object] = {"status": "not_attempted"}
         if graph is not None:
@@ -699,10 +1155,17 @@ class BundleStageWorker:
             ),
         )
         self._transient_error = None
-        finish_job = getattr(self._provider, "finish_job", None)
-        if callable(finish_job):
-            finish_job(skill_request.job_ref)
         return True
+
+    def _finish_bundle_jobs(self, run: BundleStageRun) -> None:
+        finish_job = getattr(self._provider, "finish_job", None)
+        if not callable(finish_job):
+            return
+        for job_ref in {
+            run.primary_invocation.invocation_ref,
+            run.review_invocation.invocation_ref,
+        }:
+            finish_job(job_ref)
 
     def _discover_current_cycle(self) -> _CurrentCycle | None:
         candidates: dict[str, _CurrentCycle] = {}
@@ -812,6 +1275,44 @@ def _public_commit(commit: StageCommit) -> dict[str, object]:
         "receipt": commit.receipt.as_public_dict(),
         "next_stage": "Reasoning",
     }
+
+
+def _target_experiment_intent(
+    quest_ref: str, target: AcceptedTarget
+) -> ExperimentIntent:
+    return ExperimentIntent(
+        execution_request_ref=f"bundle-target-{target.target_ref}",
+        quest_ref=quest_ref,
+        title=cast(str, target.spec["title"]),
+        hypothesis=cast(str, target.spec["hypothesis"]),
+        variant_parameter=float(target.spec["variant_parameter"]),
+        sample_count=cast(int, target.spec["sample_count"]),
+    )
+
+
+def _target_authorization_assertion(
+    graph: AcceptedTargetGraph, target: AcceptedTarget
+) -> dict[str, object]:
+    return target_execution_assertion(
+        quest_ref=graph.quest_ref,
+        stage_request_ref=graph.request_ref,
+        graph_ref=graph.graph_ref,
+        target_ref=target.target_ref,
+        target_spec_hash=target.spec_hash,
+        risk_class=cast(str, target.spec["risk_class"]),
+    )
+
+
+def _target_authorization_requirement(
+    graph: AcceptedTargetGraph, target: AcceptedTarget
+) -> dict[str, object]:
+    return target_execution_authorization_requirement(
+        quest_ref=graph.quest_ref,
+        stage_request_ref=graph.request_ref,
+        graph_ref=graph.graph_ref,
+        target_ref=target.target_ref,
+        target_spec_hash=target.spec_hash,
+    )
 
 
 def _operation_key(*parts: str) -> str:

@@ -337,6 +337,7 @@ def build_production_runtime(
         owners.research_graph,
         bundle_skill_provider,
         experiment,
+        owners.human_collaboration,
     )
     projection = PublicProjection(
         feed,

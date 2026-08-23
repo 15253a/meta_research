@@ -358,6 +358,10 @@ def _create_target_authorities() -> None:
         sa.Column("target_run_ref", sa.String(96), nullable=False, unique=True),
         sa.Column("evaluation_attempt_ref", sa.String(96), nullable=False, unique=True),
         sa.Column("execution_request_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("definition_hash", sa.String(64), nullable=False),
+        sa.Column("admission_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("admission_receipt_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("admission_receipt_hash", sa.String(64), nullable=False),
         sa.Column("receipt_ref", sa.String(96), nullable=False, unique=True),
         sa.Column("receipt_hash", sa.String(64), nullable=False),
         sa.Column("bound_at", sa.Float(), nullable=False),
@@ -370,6 +374,8 @@ def _create_target_authorities() -> None:
             ["execution_request_ref"], ["rg_experiment_requests.execution_request_ref"]
         ),
         sa.ForeignKeyConstraint(["target_run_ref"], ["ar_experiment_runs.run_ref"]),
+        _hash("definition_hash"),
+        _hash("admission_receipt_hash"),
         _hash("receipt_hash"),
     )
     op.create_table(
@@ -397,6 +403,93 @@ def _create_target_authorities() -> None:
         ),
         _hash("target_spec_hash"),
         _hash("closure_hash"),
+        _hash("receipt_hash"),
+    )
+    op.create_table(
+        "ar_target_run_admissions",
+        sa.Column("admission_ref", sa.String(96), primary_key=True),
+        sa.Column("target_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("target_spec_hash", sa.String(64), nullable=False),
+        sa.Column("graph_ref", sa.String(96), nullable=False),
+        sa.Column("stage_request_ref", sa.String(64), nullable=False),
+        sa.Column("quest_ref", sa.String(96), nullable=False),
+        sa.Column("target_run_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("evaluation_attempt_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("execution_request_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("definition_hash", sa.String(64), nullable=False),
+        sa.Column("human_request_ref", sa.String(96), nullable=True),
+        sa.Column("human_waiter_ref", sa.String(128), nullable=True),
+        sa.Column("human_waiter_generation", sa.Integer(), nullable=True),
+        sa.Column("human_authorization_receipt_ref", sa.String(96), nullable=True),
+        sa.Column("idempotency_key", sa.String(128), nullable=False, unique=True),
+        sa.Column("request_hash", sa.String(64), nullable=False),
+        sa.Column("receipt_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("receipt_hash", sa.String(64), nullable=False),
+        sa.Column("admitted_at", sa.Float(), nullable=False),
+        sa.ForeignKeyConstraint(["target_ref"], ["rg_targets.target_ref"]),
+        sa.ForeignKeyConstraint(["graph_ref"], ["rg_target_graphs.graph_ref"]),
+        sa.ForeignKeyConstraint(
+            ["stage_request_ref"], ["ae_stage_run_requests.request_ref"]
+        ),
+        sa.ForeignKeyConstraint(["target_run_ref"], ["ar_experiment_runs.run_ref"]),
+        sa.ForeignKeyConstraint(
+            ["evaluation_attempt_ref"],
+            ["rg_evaluation_attempts.evaluation_attempt_ref"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["execution_request_ref"], ["rg_experiment_requests.execution_request_ref"]
+        ),
+        sa.CheckConstraint(
+            "(human_request_ref IS NULL AND human_waiter_ref IS NULL "
+            "AND human_waiter_generation IS NULL "
+            "AND human_authorization_receipt_ref IS NULL) OR "
+            "(human_request_ref IS NOT NULL AND human_waiter_ref IS NOT NULL "
+            "AND human_waiter_generation >= 1 "
+            "AND human_authorization_receipt_ref IS NOT NULL)"
+        ),
+        _hash("target_spec_hash"),
+        _hash("definition_hash"),
+        _hash("request_hash"),
+        _hash("receipt_hash"),
+    )
+    op.create_table(
+        "ar_bundle_dispatch_decisions",
+        sa.Column("decision_ref", sa.String(96), primary_key=True),
+        sa.Column("run_ref", sa.String(64), nullable=False),
+        sa.Column("attempt_ref", sa.String(64), nullable=False),
+        sa.Column("fence_ref", sa.String(64), nullable=False),
+        sa.Column("native_session_ref", sa.String(128), nullable=False),
+        sa.Column("graph_ref", sa.String(96), nullable=False),
+        sa.Column("generation", sa.Integer(), nullable=False),
+        sa.Column("frontier_json", sa.Text(), nullable=False),
+        sa.Column("frontier_hash", sa.String(64), nullable=False),
+        sa.Column("state_json", sa.Text(), nullable=False),
+        sa.Column("state_hash", sa.String(64), nullable=False),
+        sa.Column("action", sa.String(24), nullable=False),
+        sa.Column("selected_target_ref", sa.String(96), nullable=True),
+        sa.Column("rationale", sa.String(512), nullable=False),
+        sa.Column("decision_hash", sa.String(64), nullable=False),
+        sa.Column("idempotency_key", sa.String(128), nullable=False, unique=True),
+        sa.Column("request_hash", sa.String(64), nullable=False),
+        sa.Column("receipt_ref", sa.String(96), nullable=False, unique=True),
+        sa.Column("receipt_hash", sa.String(64), nullable=False),
+        sa.Column("created_at", sa.Float(), nullable=False),
+        sa.ForeignKeyConstraint(["run_ref"], ["ar_stage_runs.run_ref"]),
+        sa.ForeignKeyConstraint(["attempt_ref"], ["ar_stage_attempts.attempt_ref"]),
+        sa.ForeignKeyConstraint(["fence_ref"], ["ar_execution_fences.fence_ref"]),
+        sa.ForeignKeyConstraint(["graph_ref"], ["rg_target_graphs.graph_ref"]),
+        sa.ForeignKeyConstraint(["selected_target_ref"], ["rg_targets.target_ref"]),
+        sa.UniqueConstraint("run_ref", "generation"),
+        sa.CheckConstraint("generation >= 1"),
+        sa.CheckConstraint(
+            "(action = 'dispatch' AND selected_target_ref IS NOT NULL) OR "
+            "(action IN ('wait', 'replan_required') "
+            "AND selected_target_ref IS NULL)"
+        ),
+        _hash("frontier_hash"),
+        _hash("state_hash"),
+        _hash("decision_hash"),
+        _hash("request_hash"),
         _hash("receipt_hash"),
     )
 

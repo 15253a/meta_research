@@ -9,6 +9,7 @@ import pytest
 
 from meta_research.bundle_contract import BundleContractError, validate_target_plan
 from meta_research.bundle_skill import (
+    BundleDispatchRequest,
     BundleSkillRequest,
     CodexBundleSkillAdapter,
     validate_bundle_skill_result,
@@ -150,6 +151,11 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
                 "final_target_plan": target_plan,
                 "dispositions": [],
             },
+            {
+                "action": "dispatch",
+                "selected_target_ref": "target:accepted-structure",
+                "rationale": "This frontier item closes the frozen gap.",
+            },
         ]
     )
     adapter = CodexBundleSkillAdapter(
@@ -174,6 +180,30 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
 
     result = adapter.execute(request)
     validate_bundle_skill_result(request, result)
+    dispatch = adapter.schedule_target(
+        BundleDispatchRequest(
+            stage_request_ref=request.stage_request_ref,
+            run_ref="bundle-run:1",
+            attempt_ref="bundle-attempt:1",
+            fence_ref="bundle-fence:1",
+            graph_ref="target-graph:1",
+            generation=1,
+            frontier=(
+                {
+                    "target_ref": "target:accepted-structure",
+                    "target_key": "target:structure",
+                },
+            ),
+            state={
+                "schema_ref": "meta-research/bundle-dispatch-state/v1",
+                "target_commit_refs": [],
+                "running_targets": [],
+                "blocked_targets": [],
+            },
+            native_session_ref=result.primary_session_ref,
+            runtime_binding=binding,
+        )
+    )
 
     assert result.primary_session_ref == "codex-bundle-primary:1"
     assert result.reviewer_agent_ref == "codex-bundle-reviewer:1"
@@ -183,6 +213,7 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     )
     primary_argv, primary_prompt, primary_schema = runner.calls[0]
     review_argv, review_prompt, review_schema = runner.calls[1]
+    dispatch_argv, dispatch_prompt, dispatch_schema = runner.calls[2]
     assert primary_argv[:2] == [str(tmp_path / "codex"), "exec"]
     assert "Agent Session 绝不是 Target 或 TargetRun" in primary_prompt
     assert primary_schema["properties"]["target_plan"]["properties"]["targets"]
@@ -190,6 +221,13 @@ def test_production_adapter_freezes_skill_and_uses_fresh_child_review(
     assert 'fork_turns="none"' in review_prompt
     assert "Target DAG" in review_prompt
     assert "final_target_plan" in review_schema["properties"]
+    assert dispatch.selected_target_ref == "target:accepted-structure"
+    assert dispatch.native_session_ref == result.primary_session_ref
+    assert dispatch_argv[-3:] == ["resume", "codex-bundle-primary:1", "-"]
+    assert "durable frontier" in dispatch_prompt
+    assert dispatch_schema["properties"]["selected_target_ref"]["anyOf"][0]["enum"] == [
+        "target:accepted-structure"
+    ]
 
 
 def test_target_plan_rejects_a_cycle_before_research_graph_acceptance() -> None:

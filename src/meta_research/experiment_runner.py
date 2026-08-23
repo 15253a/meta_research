@@ -103,12 +103,23 @@ def main() -> int:
             "selected_checkpoint_count": len(checkpoint_hashes),
             "selected_checkpoint_content_hashes": checkpoint_hashes,
             "direction": (
-                "negative" if mean_delta < 0 else "positive" if mean_delta > 0 else "zero"
+                "negative"
+                if mean_delta < 0
+                else "positive"
+                if mean_delta > 0
+                else "zero"
             ),
             "interpretation": "direction is observable, not an acceptance gate",
         },
         "result_content": {
             "schema_ref": "meta-research/micro-experiment-result/v1",
+            "result_disposition": (
+                "negative"
+                if mean_delta < 0
+                else "positive"
+                if mean_delta > 0
+                else "zero"
+            ),
             "metrics": {
                 "baseline_mean": baseline_mean,
                 "variant_mean": variant_mean,

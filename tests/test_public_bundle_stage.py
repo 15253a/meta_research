@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
+import threading
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from meta_research.bundle_skill import (
+    BundleDispatchRequest,
+    BundleDispatchResult,
     BundleSkillDraft,
     BundleSkillRequest,
     BundleSkillResult,
 )
 from meta_research.composition import build_production_runtime
-from meta_research.experiment_contract import ExperimentProviderUnavailable
+from meta_research.experiment_contract import (
+    ExperimentIntent,
+    ExperimentProviderUnavailable,
+)
 from meta_research.owners.agent_runtime import BundleRuntimeBinding
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.owners.research_memory import AssetIntakeRequest
@@ -99,6 +108,22 @@ class _DeterministicBundleSkill:
         draft = self.generate_draft(request)
         return self.review_draft(request, draft)
 
+    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+        selected = (
+            None if not request.frontier else str(request.frontier[-1]["target_ref"])
+        )
+        return BundleDispatchResult(
+            action="wait" if selected is None else "dispatch",
+            selected_target_ref=selected,
+            rationale=(
+                "No currently dispatchable Target."
+                if selected is None
+                else "Select the highest-priority durable frontier item."
+            ),
+            native_session_ref=request.native_session_ref,
+            adapter_kind="test_deterministic",
+        )
+
 
 class _TwoTargetBundleSkill(_DeterministicBundleSkill):
     def _target_plan(self, request: BundleSkillRequest) -> dict[str, object]:
@@ -119,6 +144,24 @@ class _TwoTargetBundleSkill(_DeterministicBundleSkill):
         return target_plan
 
 
+class _ParallelTwoTargetBundleSkill(_TwoTargetBundleSkill):
+    def _target_plan(self, request: BundleSkillRequest) -> dict[str, object]:
+        target_plan = super()._target_plan(request)
+        second = target_plan["targets"][1]
+        assert isinstance(second, dict)
+        second["depends_on"] = []
+        return target_plan
+
+
+class _HighRiskBundleSkill(_DeterministicBundleSkill):
+    def _target_plan(self, request: BundleSkillRequest) -> dict[str, object]:
+        target_plan = super()._target_plan(request)
+        target = target_plan["targets"][0]
+        assert isinstance(target, dict)
+        target["risk_class"] = "high"
+        return target_plan
+
+
 class _FailAfterFirstTargetProvider(_DeterministicExperimentProvider):
     def execute(self, request, observe):
         if self.execute_calls >= 1:
@@ -129,6 +172,22 @@ class _FailAfterFirstTargetProvider(_DeterministicExperimentProvider):
                 durable_outcome="terminal",
             )
         return super().execute(request, observe)
+
+
+class _DispositionExperimentProvider(_DeterministicExperimentProvider):
+    def __init__(self, disposition: str) -> None:
+        super().__init__()
+        self._disposition = disposition
+
+    def execute(self, request, observe):
+        result = super().execute(request, observe)
+        return replace(
+            result,
+            result_content={
+                **result.result_content,
+                "result_disposition": self._disposition,
+            },
+        )
 
 
 class _FixtureTargetCommitEvidenceAuthority:
@@ -256,6 +315,77 @@ def _finish_plan_stage(runtime) -> dict[str, object]:
     raise AssertionError("Plan Stage did not reach StageCommit")
 
 
+def _accepted_result_content(runtime, evaluation_attempt_ref: str) -> dict[str, object]:
+    roles = runtime.owners.research_graph.query_experiment_asset_roles(
+        evaluation_attempt_ref
+    )
+    result_roles = [role for role in roles if role.role == "result_content"]
+    assert len(result_roles) == 1
+    materialized = runtime.owners.research_memory.materialize_asset(
+        result_roles[0].binding.version_ref
+    )
+    value = json.loads(materialized.content.decode("utf-8"))
+    assert isinstance(value, dict)
+    return value
+
+
+def _grant_request_capability(runtime, request: dict[str, object]) -> dict[str, object]:
+    requirement = request["required_authorization"]
+    assert isinstance(requirement, dict)
+    capability = requirement["capability"]
+    capability_scope = requirement["scope"]
+    quest_ref = request["quest_ref"]
+    assert isinstance(capability, str)
+    assert isinstance(capability_scope, dict)
+    assert isinstance(quest_ref, str)
+    response = runtime.owners.human_collaboration.respond_to_human_request(
+        request["request_ref"],
+        decision="provided",
+        facts={"authorization_decision": "allow_once"},
+        note="Grant only the exact Target described by this request.",
+        idempotency_key="bundle-high-risk-response",
+    )
+    drafted = runtime.owners.human_collaboration.create_command_draft(
+        f"quest:{quest_ref}",
+        {
+            "command_kind": "capability_authorization",
+            "payload": {
+                "capability": capability,
+                "decision": "granted",
+                "scope": capability_scope,
+            },
+        },
+        "bundle-high-risk-command-draft",
+    )
+    preview = runtime.owners.human_collaboration.preview_command(
+        drafted["intent_id"],
+        drafted["draft_revision"],
+        drafted["draft_hash"],
+        "bundle-high-risk-command-preview",
+    )["impact_preview"]
+    confirmed = runtime.owners.human_collaboration.confirm_command(
+        drafted["intent_id"],
+        drafted["draft_revision"],
+        drafted["draft_hash"],
+        preview["preview_ref"],
+        preview["preview_hash"],
+        "bundle-high-risk-command-confirm",
+    )
+    authorization = runtime.owners.human_collaboration.decide_capability_authorization(
+        f"quest:{quest_ref}",
+        {
+            **requirement,
+            "decision": "granted",
+            "confirmation_receipt_ref": confirmed["confirmation_receipt"][
+                "receipt_ref"
+            ],
+        },
+        "bundle-risk-auth-record",
+    )
+    assert response["decision"] == "provided"
+    return authorization
+
+
 def test_gap_plan_becomes_publicly_eligible_for_bundle_without_early_truth(
     tmp_path: Path,
 ) -> None:
@@ -368,6 +498,271 @@ def test_bundle_root_run_accepts_a_distinct_target_dag(
         runtime.close()
 
 
+def test_target_graph_must_match_the_exact_executed_target_plan(
+    tmp_path: Path,
+) -> None:
+    runtime = _bundle_runtime(tmp_path / "bundle-executed-plan-binding")
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(8):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            request_projection = current["stage_run_request"]
+            if request_projection is None:
+                continue
+            run = runtime.owners.agent_runtime.query_bundle_stage_run(
+                request_projection["request_ref"]
+            )
+            if run is not None and run.execution is not None:
+                break
+        else:
+            raise AssertionError("Bundle attempt did not execute TargetPlan")
+
+        assert runtime.owners.research_graph.query_target_graph(run.request_ref) is None
+        forged_plan = deepcopy(run.execution.outcome)
+        forged_target = forged_plan["targets"][0]
+        assert isinstance(forged_target, dict)
+        forged_target["title"] = "未由该 execution receipt 执行的另一个标题"
+        with pytest.raises(
+            OwnerConflict, match="target_plan_execution_binding_invalid"
+        ):
+            runtime.owners.research_graph.accept_target_graph(
+                request_ref=run.request_ref,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                submission_ref=run.execution.submission_ref,
+                context_pack_ref=request_projection["context_pack_ref"],
+                target_plan=forged_plan,
+                target_plan_hash=canonical_hash(forged_plan),
+                execution_payload_hash=run.execution.payload_hash,
+                execution_receipt=run.execution.receipt,
+            )
+        assert runtime.owners.research_graph.query_target_graph(run.request_ref) is None
+        assert runtime.bundle_stage.process_once()
+        assert runtime.bundle_stage.query_current()["target_graph"]["status"] == (
+            "accepted"
+        )
+    finally:
+        runtime.close()
+
+
+def test_target_run_admission_rejects_an_unrelated_experiment(
+    tmp_path: Path,
+) -> None:
+    runtime = _bundle_runtime(tmp_path / "bundle-unrelated-target-run")
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(10):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            if current["target_graph"]["status"] == "accepted":
+                break
+        else:
+            raise AssertionError("Bundle did not accept TargetGraph")
+        graph = runtime.owners.research_graph.query_target_graph(
+            current["stage_run_request"]["request_ref"]
+        )
+        assert graph is not None
+        target = graph.targets[0]
+        unrelated = runtime.experiment.start(
+            ExperimentIntent(
+                execution_request_ref=f"unrelated-{target.target_ref}",
+                quest_ref=graph.quest_ref,
+                title="Unrelated accepted experiment",
+                hypothesis="This experiment does not implement the TargetSpec.",
+                variant_parameter=0.5,
+                sample_count=8,
+            ),
+            "bundle-unrelated-experiment",
+        )
+        identities = unrelated["identities"]
+        execution = unrelated["execution"]
+        intent = unrelated["intent"]
+        assert isinstance(identities, dict)
+        assert isinstance(execution, dict)
+        assert isinstance(intent, dict)
+        domain = runtime.owners.research_graph.query_experiment(
+            identities["evaluation_attempt_ref"]
+        )
+        assert domain is not None
+        with pytest.raises(OwnerConflict, match="target_run_candidate_invalid"):
+            runtime.owners.agent_runtime.admit_target_run(
+                target_ref=target.target_ref,
+                target_spec_hash=target.spec_hash,
+                graph_ref=graph.graph_ref,
+                stage_request_ref=graph.request_ref,
+                quest_ref=graph.quest_ref,
+                target_run_ref=execution["run_ref"],
+                evaluation_attempt_ref=identities["evaluation_attempt_ref"],
+                execution_request_ref=intent["execution_request_ref"],
+                definition_hash=domain.execution_request.definition_hash,
+                idempotency_key="bundle-unrelated-target-admission",
+            )
+        assert (
+            runtime.owners.research_graph.query_target_run_binding(target.target_ref)
+            is None
+        )
+    finally:
+        runtime.close()
+
+
+def test_bundle_root_session_selects_from_the_durable_parallel_frontier(
+    tmp_path: Path,
+) -> None:
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-root-frontier",
+        bundle_skill_provider=_ParallelTwoTargetBundleSkill(),
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+
+        for _step in range(12):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            run = runtime.owners.agent_runtime.query_bundle_stage_run(
+                current["stage_run_request"]["request_ref"]
+            )
+            if run is None:
+                continue
+            decisions = runtime.owners.agent_runtime.query_bundle_dispatch_decisions(
+                run.run_ref
+            )
+            if decisions:
+                break
+        else:
+            raise AssertionError("Bundle root did not persist a dispatch decision")
+
+        targets = current["target_graph"]["targets"]
+        assert len(current["target_graph"]["frontier"]) == 2
+        assert decisions[-1].selected_target_ref == targets[-1]["target_ref"]
+        assert decisions[-1].selected_target_ref != targets[0]["target_ref"]
+        assert decisions[-1].native_session_ref == current["run"]["native_session_ref"]
+
+        assert runtime.bundle_stage.process_once()
+        after_dispatch = runtime.bundle_stage.query_current()
+        first, selected = after_dispatch["target_graph"]["targets"]
+        assert first["target_run_ref"] is None
+        assert selected["target_run_ref"].startswith("experiment_run_")
+    finally:
+        runtime.close()
+
+
+def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicExperimentProvider()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-high-risk",
+        bundle_skill_provider=_HighRiskBundleSkill(),
+        experiment_provider=provider,
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+
+        for _step in range(12):
+            changed = runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            requests = runtime.owners.agent_runtime.query_human_requests(
+                include_history=True,
+            )
+            if requests:
+                break
+            assert changed
+        else:
+            raise AssertionError("High-risk Target did not open HumanRequest")
+
+        # The request is local to the exact Target and does not create a
+        # TargetRun merely because the Quest has broad authorization.
+        target = current["target_graph"]["targets"][0]
+        assert target["status"] == "blocked"
+        assert target["blocker"] == {"code": "target_high_risk_authorization_required"}
+        assert target["target_run_ref"] is None
+        assert provider.execute_calls == 0
+        request = requests[0]
+        assert request["target_assertion"]["target_ref"] == target["target_ref"]
+        assert request["target_assertion"]["target_spec_hash"] == target["spec_hash"]
+
+        graph = runtime.owners.research_graph.query_target_graph(
+            current["stage_run_request"]["request_ref"]
+        )
+        assert graph is not None
+        accepted_target = graph.targets[0]
+        unauthorized_execution = runtime.experiment.start(
+            ExperimentIntent(
+                execution_request_ref=f"bundle-target-{accepted_target.target_ref}",
+                quest_ref=graph.quest_ref,
+                title=str(accepted_target.spec["title"]),
+                hypothesis=str(accepted_target.spec["hypothesis"]),
+                variant_parameter=float(accepted_target.spec["variant_parameter"]),
+                sample_count=int(accepted_target.spec["sample_count"]),
+            ),
+            "bundle-high-risk-unauthorized-preflight",
+        )
+        identities = unauthorized_execution["identities"]
+        execution = unauthorized_execution["execution"]
+        intent = unauthorized_execution["intent"]
+        assert isinstance(identities, dict)
+        assert isinstance(execution, dict)
+        assert isinstance(intent, dict)
+        domain = runtime.owners.research_graph.query_experiment(
+            identities["evaluation_attempt_ref"]
+        )
+        assert domain is not None
+        with pytest.raises(OwnerConflict, match="target_run_authorization_invalid"):
+            runtime.owners.agent_runtime.admit_target_run(
+                target_ref=accepted_target.target_ref,
+                target_spec_hash=accepted_target.spec_hash,
+                graph_ref=graph.graph_ref,
+                stage_request_ref=graph.request_ref,
+                quest_ref=graph.quest_ref,
+                target_run_ref=execution["run_ref"],
+                evaluation_attempt_ref=identities["evaluation_attempt_ref"],
+                execution_request_ref=intent["execution_request_ref"],
+                definition_hash=domain.execution_request.definition_hash,
+                idempotency_key="bundle-high-risk-unauthorized-admission",
+            )
+        assert provider.execute_calls == 0
+
+        authorization = _grant_request_capability(runtime, request)
+        for _step in range(10):
+            runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            target = current["target_graph"]["targets"][0]
+            if target["target_run_ref"] is not None:
+                break
+        else:
+            raise AssertionError("Authorized Target did not resume")
+
+        binding = runtime.owners.research_graph.query_target_run_binding(
+            target["target_ref"]
+        )
+        admission = runtime.owners.agent_runtime.query_target_run_admission(
+            target["target_ref"]
+        )
+        assert binding is not None
+        assert admission is not None
+        assert admission.human_request_ref == request["request_ref"]
+        assert admission.human_waiter_ref == target["target_ref"]
+        assert admission.human_authorization_receipt_ref == authorization["receipt_ref"]
+        assert binding.admission_receipt == admission.receipt
+        persisted = runtime.owners.agent_runtime.query_human_request(
+            request["request_ref"]
+        )
+        assert persisted is not None
+        assert persisted["direct_waiters"][0]["status"] == "consumed"
+    finally:
+        runtime.close()
+
+
 def test_one_gap_runs_as_a_formal_target_and_freezes_a_negative_commit(
     tmp_path: Path,
 ) -> None:
@@ -405,7 +800,51 @@ def test_one_gap_runs_as_a_formal_target_and_freezes_a_negative_commit(
         )
         assert committed["closure"]["log_assets"]
         assert committed["closure"]["analysis_assets"]
+        assert (
+            committed["closure"]["target_run_binding"]["admission_receipt"]["status"]
+            == "accepted"
+        )
+        assert committed["closure"]["execution_request"]["receipt"]["status"] == (
+            "accepted"
+        )
         assert committed["receipt"]["status"] == "accepted"
+        assert current["baseline_pool"] == []
+
+        assert runtime.bundle_stage.process_once()
+        published = runtime.bundle_stage.query_current()
+        assert len(published["baseline_pool"]) == 1
+        baseline = published["baseline_pool"][0]
+        assert baseline["target_commit_ref"] == committed["commit_ref"]
+        assert baseline["evidence_ref"].startswith("evidence_")
+        assert baseline["role_receipt"]["status"] == "accepted"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("disposition", ("nonsignificant", "denied", "uncertain"))
+def test_valid_nonpositive_target_outcomes_are_realized_not_failed(
+    tmp_path: Path,
+    disposition: str,
+) -> None:
+    runtime = _bundle_runtime(
+        tmp_path / f"bundle-disposition-{disposition}",
+        experiment_provider=_DispositionExperimentProvider(disposition),
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(28):
+            runtime.bundle_stage.process_once()
+            runtime.experiment.process_once()
+            current = runtime.bundle_stage.query_current()
+            if current["target_commits"]:
+                break
+        else:
+            raise AssertionError(f"Bundle did not realize {disposition}")
+        assert current["target_graph"]["targets"][0]["status"] == "committed"
+        assert current["target_commits"][0]["result_disposition"] == disposition
+        assert current["target_commits"][0]["status"] == "realized"
     finally:
         runtime.close()
 
@@ -444,6 +883,84 @@ def test_all_target_commits_complete_the_root_run_and_bundle_stage(
         )
         assert current["stage_commit"]["receipt"]["status"] == "accepted"
         assert current["stage_commit"]["next_stage"] == "Reasoning"
+    finally:
+        runtime.close()
+
+
+def test_bundle_stage_commit_rejects_an_epoch_changed_during_verification(
+    tmp_path: Path,
+) -> None:
+    runtime = _bundle_runtime(tmp_path / "bundle-epoch-cas")
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(32):
+            runtime.bundle_stage.process_once()
+            runtime.experiment.process_once()
+            current = runtime.bundle_stage.query_current()
+            if (
+                current["run"] is not None
+                and current["run"]["status"] == "completed"
+                and current["stage_commit"] is None
+            ):
+                break
+        else:
+            raise AssertionError("Bundle did not reach pre-commit completion")
+
+        request_ref = current["stage_run_request"]["request_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        graph = runtime.owners.research_graph.query_target_graph(request_ref)
+        assert run is not None and run.completion is not None
+        assert graph is not None
+        commits = runtime.owners.research_graph.query_target_commits(graph.graph_ref)
+        original_verifier = runtime.owners.advancement_engine._target_commit_verifier
+        assert original_verifier is not None
+        verification_complete = threading.Event()
+        continue_commit = threading.Event()
+
+        class _PausingVerifier:
+            def verify_target_commit_set(self, **values) -> None:
+                original_verifier.verify_target_commit_set(**values)
+                verification_complete.set()
+                assert continue_commit.wait(timeout=5)
+
+        runtime.owners.advancement_engine._target_commit_verifier = _PausingVerifier()
+        failures: list[BaseException] = []
+
+        def commit() -> None:
+            try:
+                runtime.owners.advancement_engine.commit_bundle_stage(
+                    request_ref=request_ref,
+                    run_ref=run.run_ref,
+                    target_graph_ref=graph.graph_ref,
+                    target_commit_receipts=tuple(value.receipt for value in commits),
+                    run_completion_receipt=run.completion.receipt,
+                    target_graph_receipt=graph.receipt,
+                    idempotency_key="bundle-epoch-race-commit",
+                )
+            except Exception as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=commit)
+        worker.start()
+        assert verification_complete.wait(timeout=5)
+        with runtime._database.write() as connection:
+            connection.exec_driver_sql(
+                "UPDATE ae_stage_run_requests SET epoch = epoch + 1 "
+                "WHERE request_ref = ?",
+                (request_ref,),
+            )
+        continue_commit.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], OwnerConflict)
+        assert str(failures[0]) == "bundle_foreground_epoch_stale"
+        assert (
+            runtime.owners.advancement_engine.query_bundle_stage_commit(request_ref)
+            is None
+        )
     finally:
         runtime.close()
 
@@ -590,6 +1107,9 @@ def test_old_fence_is_rejected_and_lost_target_commit_ack_is_idempotent(
                 fence_ref=f"{target_run.fence_ref}-stale",
                 execution_result_hash=target_run.result_hash,
                 execution_receipt=target_run.execution_receipt,
+                result_content=_accepted_result_content(
+                    runtime, binding.evaluation_attempt_ref
+                ),
             )
         assert current["target_commits"] == []
 
@@ -600,6 +1120,9 @@ def test_old_fence_is_rejected_and_lost_target_commit_ack_is_idempotent(
             fence_ref=target_run.fence_ref,
             execution_result_hash=target_run.result_hash,
             execution_receipt=target_run.execution_receipt,
+            result_content=_accepted_result_content(
+                runtime, binding.evaluation_attempt_ref
+            ),
         )
         replay = runtime.owners.research_graph.accept_target_commit(
             target_ref=target["target_ref"],
@@ -608,6 +1131,9 @@ def test_old_fence_is_rejected_and_lost_target_commit_ack_is_idempotent(
             fence_ref=target_run.fence_ref,
             execution_result_hash=target_run.result_hash,
             execution_receipt=target_run.execution_receipt,
+            result_content=_accepted_result_content(
+                runtime, binding.evaluation_attempt_ref
+            ),
         )
         assert replay == first
         graph = runtime.owners.research_graph.query_target_graph(

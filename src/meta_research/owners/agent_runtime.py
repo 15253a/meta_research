@@ -62,6 +62,8 @@ from meta_research.plan_contract import (
 from meta_research.bundle_contract import (
     TARGET_PLAN_REVIEW_SCHEMA_REF,
     material_target_plan_hash,
+    target_execution_assertion,
+    target_execution_authorization_requirement,
 )
 from meta_research.owners._sqlite_snapshot import (
     OwnerSnapshotQuery,
@@ -126,6 +128,8 @@ PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND = "plan_attempt_execution"
 BUNDLE_ATTEMPT_EXECUTION_SCHEMA = "meta-research/bundle-attempt-execution/v1"
 BUNDLE_RUNTIME_BINDING_SCHEMA = "meta-research/bundle-runtime-binding/v1"
 BUNDLE_ATTEMPT_EXECUTION_RECEIPT_KIND = "bundle_attempt_execution"
+BUNDLE_DISPATCH_RECEIPT_KIND = "bundle_target_dispatch"
+TARGET_RUN_ADMISSION_RECEIPT_KIND = "target_run_admission"
 RUN_COMPLETION_RECEIPT_KIND = "run_execution_completed"
 DEEPFETCH_EXECUTION_RECEIPT_KIND = "deepfetch_execution_completed"
 EXPERIMENT_EXECUTION_RECEIPT_KIND = "experiment_execution_completed"
@@ -257,6 +261,57 @@ class AttemptExecution:
     predecessor_outcome_hash: str | None = None
     predecessor_material_outcome_hash: str | None = None
     predecessor_rejection_receipt: AcceptanceReceipt | None = None
+
+
+@dataclass(frozen=True)
+class BundleDispatchDecision:
+    decision_ref: str
+    run_ref: str
+    attempt_ref: str
+    fence_ref: str
+    native_session_ref: str
+    graph_ref: str
+    generation: int
+    frontier: tuple[dict[str, object], ...]
+    state: dict[str, object]
+    action: str
+    selected_target_ref: str | None
+    rationale: str
+    decision_hash: str
+    receipt: AcceptanceReceipt
+
+    def as_public_dict(self) -> dict[str, object]:
+        return {
+            "decision_ref": self.decision_ref,
+            "generation": self.generation,
+            "graph_ref": self.graph_ref,
+            "frontier": list(self.frontier),
+            "state": self.state,
+            "action": self.action,
+            "selected_target_ref": self.selected_target_ref,
+            "rationale": self.rationale,
+            "decision_hash": self.decision_hash,
+            "receipt": self.receipt.as_public_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class TargetRunAdmission:
+    admission_ref: str
+    target_ref: str
+    target_spec_hash: str
+    graph_ref: str
+    stage_request_ref: str
+    quest_ref: str
+    target_run_ref: str
+    evaluation_attempt_ref: str
+    execution_request_ref: str
+    definition_hash: str
+    receipt: AcceptanceReceipt
+    human_request_ref: str | None = None
+    human_waiter_ref: str | None = None
+    human_waiter_generation: int | None = None
+    human_authorization_receipt_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -696,6 +751,27 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         self, submission_ref: str
     ) -> AttemptExecution | None: ...
 
+    def record_bundle_dispatch_decision(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        graph_ref: str,
+        generation: int,
+        frontier: tuple[dict[str, object], ...],
+        state: dict[str, object],
+        action: str,
+        selected_target_ref: str | None,
+        rationale: str,
+        idempotency_key: str,
+    ) -> BundleDispatchDecision: ...
+
+    def query_bundle_dispatch_decisions(
+        self, run_ref: str
+    ) -> tuple[BundleDispatchDecision, ...]: ...
+
     def complete_bundle_run(
         self,
         *,
@@ -709,7 +785,9 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
 
     def query_bundle_run_completion(self, run_ref: str) -> RunCompletion | None: ...
 
-    def verify_attempt_execution_receipt(self, **values) -> None: ...
+    def verify_attempt_execution_receipt(self, **values) -> str: ...
+
+    def verify_target_run_admission_receipt(self, **values) -> None: ...
 
     def verify_run_completion_receipt(self, **values) -> None: ...
 
@@ -730,6 +808,29 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     def query_experiment_run(
         self, evaluation_attempt_ref: str
     ) -> ExperimentRun | None: ...
+
+    def admit_target_run(
+        self,
+        *,
+        target_ref: str,
+        target_spec_hash: str,
+        graph_ref: str,
+        stage_request_ref: str,
+        quest_ref: str,
+        target_run_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+        idempotency_key: str,
+        human_request_ref: str | None = None,
+        human_waiter_ref: str | None = None,
+        human_waiter_generation: int | None = None,
+        human_authorization_receipt_ref: str | None = None,
+    ) -> TargetRunAdmission: ...
+
+    def query_target_run_admission(
+        self, target_ref: str
+    ) -> TargetRunAdmission | None: ...
 
     def query_active_experiment_run(self) -> ExperimentRun | None: ...
 
@@ -5216,6 +5317,203 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     ) -> AttemptExecution | None:
         return self._query_stage_attempt_execution(submission_ref, "bundle")
 
+    def record_bundle_dispatch_decision(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        native_session_ref: str,
+        graph_ref: str,
+        generation: int,
+        frontier: tuple[dict[str, object], ...],
+        state: dict[str, object],
+        action: str,
+        selected_target_ref: str | None,
+        rationale: str,
+        idempotency_key: str,
+    ) -> BundleDispatchDecision:
+        """Persist one rolling choice made by the current Bundle root Session."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        if (
+            not native_session_ref
+            or not graph_ref
+            or isinstance(generation, bool)
+            or generation < 1
+            or len(frontier) > 64
+            or not isinstance(state, dict)
+            or not isinstance(rationale, str)
+            or not rationale.strip()
+            or len(rationale) > 512
+            or any(not isinstance(item, dict) for item in frontier)
+        ):
+            raise OwnerConflict("bundle_dispatch_decision_invalid")
+        selected = [
+            item for item in frontier if item.get("target_ref") == selected_target_ref
+        ]
+        if (
+            action not in {"dispatch", "wait", "replan_required"}
+            or (
+                action == "dispatch" and (not selected_target_ref or len(selected) != 1)
+            )
+            or (action != "dispatch" and selected_target_ref is not None)
+        ):
+            raise OwnerConflict("bundle_dispatch_target_not_in_frontier")
+        frontier_json = canonical_json(list(frontier))
+        frontier_hash = canonical_hash(list(frontier))
+        state_json = canonical_json(state)
+        state_hash = canonical_hash(state)
+        command_hash = canonical_hash(
+            {
+                "command": "record_bundle_dispatch_decision",
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+                "native_session_ref": native_session_ref,
+                "graph_ref": graph_ref,
+                "generation": generation,
+                "frontier_hash": frontier_hash,
+                "state_hash": state_hash,
+                "action": action,
+                "selected_target_ref": selected_target_ref,
+                "rationale": rationale,
+            }
+        )
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_dispatch_decisions WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("idempotency_conflict")
+                decision_ref = existing.decision_ref
+            else:
+                run, attempt, session, fence = _load_stage_fence(
+                    connection, run_ref, attempt_ref, fence_ref
+                )
+                _require_current_fence(run, attempt, fence, "executed", "submitted")
+                if (
+                    run.stage != "bundle"
+                    or session.native_session_ref != native_session_ref
+                ):
+                    raise OwnerConflict("bundle_dispatch_fence_invalid")
+                verifier = self._target_graph_verifier
+                if verifier is None:
+                    raise OwnerConflict("target_graph_verifier_unavailable")
+                verifier.verify_bundle_dispatch_frontier(
+                    request_ref=run.request_ref,
+                    run_ref=run_ref,
+                    graph_ref=graph_ref,
+                    frontier=frontier,
+                )
+                expected_generation = int(
+                    connection.execute(
+                        text(
+                            "SELECT COALESCE(MAX(generation), 0) + 1 FROM "
+                            "ar_bundle_dispatch_decisions WHERE run_ref = :run_ref"
+                        ),
+                        {"run_ref": run_ref},
+                    ).scalar_one()
+                )
+                if generation != expected_generation:
+                    raise OwnerConflict("bundle_dispatch_generation_stale")
+                decision = {
+                    "schema_ref": "meta-research/bundle-dispatch-decision/v1",
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "native_session_ref": native_session_ref,
+                    "graph_ref": graph_ref,
+                    "generation": generation,
+                    "frontier_hash": frontier_hash,
+                    "state_hash": state_hash,
+                    "action": action,
+                    "selected_target_ref": selected_target_ref,
+                    "rationale": rationale,
+                }
+                decision_hash = canonical_hash(decision)
+                decision_ref = new_ref("bundle_dispatch")
+                receipt_ref = new_ref("ar_bundle_dispatch_receipt")
+                bindings = {
+                    **decision,
+                    "decision_hash": decision_hash,
+                }
+                receipt_hash = _owner_receipt_hash(
+                    BUNDLE_DISPATCH_RECEIPT_KIND, decision_ref, bindings
+                )
+                now = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_bundle_dispatch_decisions "
+                        "(decision_ref, run_ref, attempt_ref, fence_ref, "
+                        "native_session_ref, graph_ref, generation, frontier_json, "
+                        "frontier_hash, state_json, state_hash, "
+                        "action, selected_target_ref, rationale, decision_hash, "
+                        "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                        "created_at) VALUES (:decision_ref, :run_ref, "
+                        ":attempt_ref, :fence_ref, :native_session_ref, :graph_ref, "
+                        ":generation, :frontier_json, :frontier_hash, :state_json, "
+                        ":state_hash, :action, :selected_target_ref, :rationale, "
+                        ":decision_hash, :idempotency_key, :request_hash, "
+                        ":receipt_ref, :receipt_hash, :created_at)"
+                    ),
+                    {
+                        **bindings,
+                        "decision_ref": decision_ref,
+                        "frontier_json": frontier_json,
+                        "state_json": state_json,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": command_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "created_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.bundle_target_dispatched",
+                    {
+                        "decision_ref": decision_ref,
+                        "run_ref": run_ref,
+                        "graph_ref": graph_ref,
+                        "generation": generation,
+                        "action": action,
+                        "selected_target_ref": selected_target_ref,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+        decisions = self.query_bundle_dispatch_decisions(run_ref)
+        matching = tuple(
+            decision for decision in decisions if decision.decision_ref == decision_ref
+        )
+        if len(matching) != 1:
+            raise OwnerConflict("bundle_dispatch_decision_missing_after_commit")
+        return matching[0]
+
+    def query_bundle_dispatch_decisions(
+        self, run_ref: str
+    ) -> tuple[BundleDispatchDecision, ...]:
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_bundle_dispatch_decisions WHERE run_ref = "
+                    ":run_ref ORDER BY generation"
+                ),
+                {"run_ref": run_ref},
+            ).all()
+        return tuple(_bundle_dispatch_decision(row) for row in rows)
+
     def _query_stage_attempt_execution(
         self, submission_ref: str, expected_stage: str
     ) -> AttemptExecution | None:
@@ -6334,6 +6632,292 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             stdout_event_count=int(event_summary.stdout_event_count),
         )
 
+    def admit_target_run(
+        self,
+        *,
+        target_ref: str,
+        target_spec_hash: str,
+        graph_ref: str,
+        stage_request_ref: str,
+        quest_ref: str,
+        target_run_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+        idempotency_key: str,
+        human_request_ref: str | None = None,
+        human_waiter_ref: str | None = None,
+        human_waiter_generation: int | None = None,
+        human_authorization_receipt_ref: str | None = None,
+    ) -> TargetRunAdmission:
+        """Issue the AR-owned admission that a TargetRun binding consumes."""
+
+        _validate_stage_idempotency_key(idempotency_key)
+        required = (
+            target_ref,
+            graph_ref,
+            stage_request_ref,
+            quest_ref,
+            target_run_ref,
+            evaluation_attempt_ref,
+            execution_request_ref,
+        )
+        human_values = (
+            human_request_ref,
+            human_waiter_ref,
+            human_waiter_generation,
+            human_authorization_receipt_ref,
+        )
+        has_human_authorization = all(value is not None for value in human_values)
+        if (
+            any(not isinstance(value, str) or not value for value in required)
+            or len(target_spec_hash) != 64
+            or len(definition_hash) != 64
+            or (
+                any(value is not None for value in human_values)
+                and not has_human_authorization
+            )
+            or (
+                has_human_authorization
+                and (
+                    not isinstance(human_waiter_generation, int)
+                    or isinstance(human_waiter_generation, bool)
+                    or human_waiter_generation < 1
+                )
+            )
+        ):
+            raise OwnerConflict("target_run_admission_invalid")
+        command = {
+            "command": "admit_target_run",
+            "target_ref": target_ref,
+            "target_spec_hash": target_spec_hash,
+            "graph_ref": graph_ref,
+            "stage_request_ref": stage_request_ref,
+            "quest_ref": quest_ref,
+            "target_run_ref": target_run_ref,
+            "evaluation_attempt_ref": evaluation_attempt_ref,
+            "execution_request_ref": execution_request_ref,
+            "definition_hash": definition_hash,
+            "human_request_ref": human_request_ref,
+            "human_waiter_ref": human_waiter_ref,
+            "human_waiter_generation": human_waiter_generation,
+            "human_authorization_receipt_ref": human_authorization_receipt_ref,
+        }
+        request_hash = canonical_hash(command)
+        with self._database.write() as connection:
+            verifier = self._target_graph_verifier
+            if verifier is None:
+                raise OwnerConflict("target_graph_verifier_unavailable")
+            risk_class = verifier.verify_target_run_candidate(
+                target_ref=target_ref,
+                target_spec_hash=target_spec_hash,
+                graph_ref=graph_ref,
+                stage_request_ref=stage_request_ref,
+                quest_ref=quest_ref,
+                evaluation_attempt_ref=evaluation_attempt_ref,
+                execution_request_ref=execution_request_ref,
+                definition_hash=definition_hash,
+            )
+            if (risk_class == "high") != has_human_authorization:
+                raise OwnerConflict("target_run_authorization_invalid")
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_run_admissions WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if existing is not None:
+                if existing.request_hash != request_hash:
+                    raise OwnerConflict("idempotency_conflict")
+                admission_ref = existing.admission_ref
+            else:
+                experiment = connection.execute(
+                    text("SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"),
+                    {"run_ref": target_run_ref},
+                ).first()
+                if experiment is None or (
+                    experiment.quest_ref != quest_ref
+                    or experiment.evaluation_attempt_ref != evaluation_attempt_ref
+                    or experiment.execution_request_ref != execution_request_ref
+                    or experiment.definition_hash != definition_hash
+                    or experiment.status not in {"admitted", "running", "executed"}
+                ):
+                    raise OwnerConflict("target_run_experiment_binding_invalid")
+                duplicate = connection.execute(
+                    text(
+                        "SELECT * FROM ar_target_run_admissions WHERE target_ref = "
+                        ":target_ref OR target_run_ref = :target_run_ref"
+                    ),
+                    {
+                        "target_ref": target_ref,
+                        "target_run_ref": target_run_ref,
+                    },
+                ).first()
+                if duplicate is not None:
+                    raise OwnerConflict("target_run_admission_conflict")
+                admission_ref = new_ref("target_run_admission")
+                if has_human_authorization:
+                    assertion = target_execution_assertion(
+                        quest_ref=quest_ref,
+                        stage_request_ref=stage_request_ref,
+                        graph_ref=graph_ref,
+                        target_ref=target_ref,
+                        target_spec_hash=target_spec_hash,
+                        risk_class=risk_class,
+                    )
+                    requirement = target_execution_authorization_requirement(
+                        quest_ref=quest_ref,
+                        stage_request_ref=stage_request_ref,
+                        graph_ref=graph_ref,
+                        target_ref=target_ref,
+                        target_spec_hash=target_spec_hash,
+                    )
+                    human_request = connection.execute(
+                        text(
+                            "SELECT * FROM owner_human_requests WHERE issuer = "
+                            ":issuer AND request_ref = :request_ref"
+                        ),
+                        {
+                            "issuer": AR_OWNER,
+                            "request_ref": human_request_ref,
+                        },
+                    ).first()
+                    waiter = connection.execute(
+                        text(
+                            "SELECT * FROM owner_human_request_waiters WHERE "
+                            "request_ref = :request_ref AND waiter_ref = "
+                            ":waiter_ref"
+                        ),
+                        {
+                            "request_ref": human_request_ref,
+                            "waiter_ref": human_waiter_ref,
+                        },
+                    ).first()
+                    validation = connection.execute(
+                        text(
+                            "SELECT * FROM "
+                            "owner_human_request_resume_validations WHERE "
+                            "request_ref = :request_ref AND waiter_ref = "
+                            ":waiter_ref ORDER BY created_at DESC, "
+                            "validation_ref DESC LIMIT 1"
+                        ),
+                        {
+                            "request_ref": human_request_ref,
+                            "waiter_ref": human_waiter_ref,
+                        },
+                    ).first()
+                    if human_request is None or waiter is None or validation is None:
+                        raise OwnerConflict("target_run_authorization_invalid")
+                    try:
+                        stored_assertion = decoded_object(
+                            human_request.target_assertion_json
+                        )
+                        stored_requirement = decoded_object(
+                            human_request.required_authorization_json
+                        )
+                    except (TypeError, ValueError) as error:
+                        raise OwnerConflict(
+                            "target_run_authorization_invalid"
+                        ) from error
+                    if (
+                        human_request.kind != "capability_authorization"
+                        or human_request.quest_ref != quest_ref
+                        or stored_assertion != assertion
+                        or stored_requirement != requirement
+                        or waiter.target_assertion_hash != canonical_hash(assertion)
+                        or int(waiter.generation) != cast(int, human_waiter_generation)
+                        or validation.authorization_receipt_ref
+                        != human_authorization_receipt_ref
+                    ):
+                        raise OwnerConflict("target_run_authorization_invalid")
+                    verifier = self._authorization_verifier
+                    if verifier is None:
+                        raise OwnerConflict("human_collaboration_verifier_unavailable")
+                    verifier.verify_capability_authorization(
+                        requirement=requirement,
+                        receipt_ref=cast(str, human_authorization_receipt_ref),
+                    )
+                    self._consume_human_request_waiter(
+                        connection,
+                        request_ref=cast(str, human_request_ref),
+                        waiter_ref=cast(str, human_waiter_ref),
+                        generation=cast(int, human_waiter_generation),
+                        work_ref=admission_ref,
+                        work_hash=request_hash,
+                    )
+                bindings = {
+                    key: value for key, value in command.items() if key != "command"
+                }
+                receipt_ref = new_ref("ar_target_run_admission_receipt")
+                receipt_hash = _owner_receipt_hash(
+                    TARGET_RUN_ADMISSION_RECEIPT_KIND,
+                    admission_ref,
+                    bindings,
+                )
+                now = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_target_run_admissions (admission_ref, "
+                        "target_ref, target_spec_hash, graph_ref, "
+                        "stage_request_ref, quest_ref, target_run_ref, "
+                        "evaluation_attempt_ref, execution_request_ref, "
+                        "definition_hash, human_request_ref, human_waiter_ref, "
+                        "human_waiter_generation, "
+                        "human_authorization_receipt_ref, idempotency_key, "
+                        "request_hash, receipt_ref, receipt_hash, admitted_at) "
+                        "VALUES (:admission_ref, :target_ref, :target_spec_hash, "
+                        ":graph_ref, :stage_request_ref, :quest_ref, "
+                        ":target_run_ref, :evaluation_attempt_ref, "
+                        ":execution_request_ref, :definition_hash, "
+                        ":human_request_ref, :human_waiter_ref, "
+                        ":human_waiter_generation, "
+                        ":human_authorization_receipt_ref, :idempotency_key, "
+                        ":request_hash, :receipt_ref, :receipt_hash, :admitted_at)"
+                    ),
+                    {
+                        **bindings,
+                        "admission_ref": admission_ref,
+                        "idempotency_key": idempotency_key,
+                        "request_hash": request_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "admitted_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.target_run_admitted",
+                    {
+                        "admission_ref": admission_ref,
+                        "target_ref": target_ref,
+                        "target_run_ref": target_run_ref,
+                        "evaluation_attempt_ref": evaluation_attempt_ref,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+        admitted = self.query_target_run_admission(target_ref)
+        if admitted is None or admitted.admission_ref != admission_ref:
+            raise OwnerConflict("target_run_admission_missing_after_commit")
+        return admitted
+
+    def query_target_run_admission(self, target_ref: str) -> TargetRunAdmission | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_run_admissions WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+        return None if row is None else _target_run_admission(row)
+
     def query_experiment_events(
         self,
         evaluation_attempt_ref: str,
@@ -7017,8 +7601,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise OwnerConflict("experiment_replacement_missing_after_commit")
         return replacement
 
-    def verify_attempt_execution_receipt(self, **values) -> None:
-        self._receipt_verifier.verify_attempt_execution_receipt(**values)
+    def verify_attempt_execution_receipt(self, **values) -> str:
+        return self._receipt_verifier.verify_attempt_execution_receipt(**values)
+
+    def verify_target_run_admission_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_target_run_admission_receipt(**values)
 
     def verify_run_completion_receipt(self, **values) -> None:
         self._receipt_verifier.verify_run_completion_receipt(**values)
@@ -7053,7 +7640,7 @@ class SQLiteAgentRuntimeReceiptVerifier:
         submission_ref: str,
         payload_hash: str,
         receipt: AcceptanceReceipt,
-    ) -> None:
+    ) -> str:
         if (
             receipt.issuer != AR_OWNER
             or receipt.kind
@@ -7111,6 +7698,60 @@ class SQLiteAgentRuntimeReceiptVerifier:
                     payload_hash=row.request_receipt_hash,
                 ),
             )
+        return executed.material_outcome_hash
+
+    def verify_target_run_admission_receipt(
+        self,
+        *,
+        target_ref: str,
+        target_spec_hash: str,
+        graph_ref: str,
+        stage_request_ref: str,
+        quest_ref: str,
+        target_run_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        if (
+            receipt.issuer != AR_OWNER
+            or receipt.kind != TARGET_RUN_ADMISSION_RECEIPT_KIND
+        ):
+            raise OwnerConflict("target_run_admission_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_run_admissions WHERE receipt_ref = "
+                    ":receipt_ref"
+                ),
+                {"receipt_ref": receipt.receipt_ref},
+            ).first()
+            experiment = connection.execute(
+                text("SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"),
+                {"run_ref": target_run_ref},
+            ).first()
+        if row is None or experiment is None:
+            raise OwnerConflict("target_run_admission_receipt_invalid")
+        admission = _target_run_admission(row)
+        if (
+            receipt.subject_ref != admission.admission_ref
+            or receipt != admission.receipt
+            or admission.target_ref != target_ref
+            or admission.target_spec_hash != target_spec_hash
+            or admission.graph_ref != graph_ref
+            or admission.stage_request_ref != stage_request_ref
+            or admission.quest_ref != quest_ref
+            or admission.target_run_ref != target_run_ref
+            or admission.evaluation_attempt_ref != evaluation_attempt_ref
+            or admission.execution_request_ref != execution_request_ref
+            or admission.definition_hash != definition_hash
+            or experiment.quest_ref != quest_ref
+            or experiment.evaluation_attempt_ref != evaluation_attempt_ref
+            or experiment.execution_request_ref != execution_request_ref
+            or experiment.definition_hash != definition_hash
+        ):
+            raise OwnerConflict("target_run_admission_receipt_invalid")
 
     def verify_run_completion_receipt(
         self,
@@ -8951,6 +9592,125 @@ def _insert_replacement_attempt(
         },
     )
     return attempt_ref, fence_ref
+
+
+def _bundle_dispatch_decision(row) -> BundleDispatchDecision:
+    try:
+        frontier_value = json.loads(row.frontier_json)
+        state = decoded_object(row.state_json)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise OwnerConflict("bundle_dispatch_decision_invalid") from error
+    if not isinstance(frontier_value, list) or any(
+        not isinstance(item, dict) for item in frontier_value
+    ):
+        raise OwnerConflict("bundle_dispatch_decision_invalid")
+    frontier = tuple(cast(dict[str, object], item) for item in frontier_value)
+    decision = {
+        "schema_ref": "meta-research/bundle-dispatch-decision/v1",
+        "run_ref": row.run_ref,
+        "attempt_ref": row.attempt_ref,
+        "fence_ref": row.fence_ref,
+        "native_session_ref": row.native_session_ref,
+        "graph_ref": row.graph_ref,
+        "generation": int(row.generation),
+        "frontier_hash": row.frontier_hash,
+        "state_hash": row.state_hash,
+        "action": row.action,
+        "selected_target_ref": row.selected_target_ref,
+        "rationale": row.rationale,
+    }
+    bindings = {**decision, "decision_hash": row.decision_hash}
+    if (
+        canonical_json(list(frontier)) != row.frontier_json
+        or canonical_hash(list(frontier)) != row.frontier_hash
+        or canonical_json(state) != row.state_json
+        or canonical_hash(state) != row.state_hash
+        or canonical_hash(decision) != row.decision_hash
+        or row.action not in {"dispatch", "wait", "replan_required"}
+        or (
+            row.action == "dispatch"
+            and sum(
+                item.get("target_ref") == row.selected_target_ref for item in frontier
+            )
+            != 1
+        )
+        or (row.action != "dispatch" and row.selected_target_ref is not None)
+        or row.receipt_hash
+        != _owner_receipt_hash(BUNDLE_DISPATCH_RECEIPT_KIND, row.decision_ref, bindings)
+    ):
+        raise OwnerConflict("bundle_dispatch_decision_invalid")
+    return BundleDispatchDecision(
+        decision_ref=row.decision_ref,
+        run_ref=row.run_ref,
+        attempt_ref=row.attempt_ref,
+        fence_ref=row.fence_ref,
+        native_session_ref=row.native_session_ref,
+        graph_ref=row.graph_ref,
+        generation=int(row.generation),
+        frontier=frontier,
+        state=state,
+        action=row.action,
+        selected_target_ref=row.selected_target_ref,
+        rationale=row.rationale,
+        decision_hash=row.decision_hash,
+        receipt=AcceptanceReceipt(
+            issuer=AR_OWNER,
+            kind=BUNDLE_DISPATCH_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.decision_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
+
+
+def _target_run_admission(row) -> TargetRunAdmission:
+    bindings = {
+        "target_ref": row.target_ref,
+        "target_spec_hash": row.target_spec_hash,
+        "graph_ref": row.graph_ref,
+        "stage_request_ref": row.stage_request_ref,
+        "quest_ref": row.quest_ref,
+        "target_run_ref": row.target_run_ref,
+        "evaluation_attempt_ref": row.evaluation_attempt_ref,
+        "execution_request_ref": row.execution_request_ref,
+        "definition_hash": row.definition_hash,
+        "human_request_ref": row.human_request_ref,
+        "human_waiter_ref": row.human_waiter_ref,
+        "human_waiter_generation": (
+            None
+            if row.human_waiter_generation is None
+            else int(row.human_waiter_generation)
+        ),
+        "human_authorization_receipt_ref": row.human_authorization_receipt_ref,
+    }
+    request_hash = canonical_hash({"command": "admit_target_run", **bindings})
+    if row.request_hash != request_hash or row.receipt_hash != _owner_receipt_hash(
+        TARGET_RUN_ADMISSION_RECEIPT_KIND, row.admission_ref, bindings
+    ):
+        raise OwnerConflict("target_run_admission_invalid")
+    return TargetRunAdmission(
+        admission_ref=row.admission_ref,
+        target_ref=row.target_ref,
+        target_spec_hash=row.target_spec_hash,
+        graph_ref=row.graph_ref,
+        stage_request_ref=row.stage_request_ref,
+        quest_ref=row.quest_ref,
+        target_run_ref=row.target_run_ref,
+        evaluation_attempt_ref=row.evaluation_attempt_ref,
+        execution_request_ref=row.execution_request_ref,
+        definition_hash=row.definition_hash,
+        human_request_ref=row.human_request_ref,
+        human_waiter_ref=row.human_waiter_ref,
+        human_waiter_generation=bindings["human_waiter_generation"],
+        human_authorization_receipt_ref=row.human_authorization_receipt_ref,
+        receipt=AcceptanceReceipt(
+            issuer=AR_OWNER,
+            kind=TARGET_RUN_ADMISSION_RECEIPT_KIND,
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.admission_ref,
+            payload_hash=row.receipt_hash,
+        ),
+    )
 
 
 def _experiment_execution_receipt_hash(

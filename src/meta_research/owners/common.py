@@ -466,6 +466,21 @@ class AttemptExecutionReceiptVerifier(Protocol):
         submission_ref: str,
         payload_hash: str,
         receipt: AcceptanceReceipt,
+    ) -> str: ...
+
+    def verify_target_run_admission_receipt(
+        self,
+        *,
+        target_ref: str,
+        target_spec_hash: str,
+        graph_ref: str,
+        stage_request_ref: str,
+        quest_ref: str,
+        target_run_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+        receipt: AcceptanceReceipt,
     ) -> None: ...
 
     def verify_deepfetch_execution_receipt(
@@ -594,6 +609,28 @@ class TargetGraphReceiptVerifier(Protocol):
         run_ref: str,
         graph_ref: str,
         receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_target_run_candidate(
+        self,
+        *,
+        target_ref: str,
+        target_spec_hash: str,
+        graph_ref: str,
+        stage_request_ref: str,
+        quest_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+    ) -> str: ...
+
+    def verify_bundle_dispatch_frontier(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        graph_ref: str,
+        frontier: tuple[dict[str, object], ...],
     ) -> None: ...
 
 

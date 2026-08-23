@@ -1753,6 +1753,7 @@ function PermissionForm({
       <OptionalNote value={note} onChange={setNote} placeholder="例如：仅允许 /metadata，并限制最多下载 10 MB。" />
       <button className="hc-submit" type="button" disabled={disabled} onClick={() => void submit(
         decision ? { authorization_decision: decision } : {},
+        decision === "denied" ? "declined" : "provided",
       )}>提交回应</button>
     </>
   );
