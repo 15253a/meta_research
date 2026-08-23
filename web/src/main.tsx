@@ -2025,6 +2025,25 @@ function WorkspaceMain({
                 <dl>
                   <div><dt>版本</dt><dd>{snapshot.product.version}</dd></div>
                   <div><dt>Readiness</dt><dd>{snapshot.readiness.status}</dd></div>
+                  <div>
+                    <dt>Semantic MCP</dt>
+                    <dd>
+                      {snapshot.harnesses.status} · {snapshot.harnesses.gateway?.transport ?? snapshot.harnesses.reason?.code ?? "gateway_unavailable"}
+                    </dd>
+                  </div>
+                  {snapshot.harnesses.adapters.map((adapter) => (
+                    <div key={`harness:${adapter.harness_family}`}>
+                      <dt>{adapter.harness_family} Harness</dt>
+                      <dd>
+                        lock {adapter.locked_version} · {adapter.status} · {adapter.capability_profile
+                          ? `profile ${adapter.capability_profile.status}`
+                          : `capability_unavailable · ${adapter.missing_reason?.code ?? adapter.reason?.code ?? "reason_unavailable"}`}
+                        {adapter.provider_operation
+                          ? ` · operation ${adapter.provider_operation.status}${adapter.provider_operation.outcome_code ? `/${adapter.provider_operation.outcome_code}` : ""}`
+                          : ""}
+                      </dd>
+                    </div>
+                  ))}
                   {Object.entries(snapshot.owners).map(([name, owner]) => (
                     <div key={name}>
                       <dt>{ownerLabels[name] ?? name}</dt>

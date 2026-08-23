@@ -419,3 +419,25 @@ def test_writing_runtime_binding_seals_the_complete_provider_contract(
     for invalid in invalid_bindings:
         with pytest.raises(OwnerConflict, match="writing_runtime_binding"):
             invalid.validate()
+
+
+def test_cancel_reconciliation_inspects_writing_provider_phases(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "provider"
+    adapter = CodexWritingSkillAdapter(
+        workspace,
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=_SequenceRunner([]),
+    )
+    job_ref = "writing-job:cancel-reconciliation"
+    operation = (
+        workspace
+        / "provider-operations"
+        / canonical_hash({"job_ref": job_ref})
+        / "writing-primary"
+    )
+    operation.mkdir(parents=True)
+    (operation / "partial-spool").write_text("unknown", encoding="utf-8")
+
+    assert adapter.reconcile_cancelled_job(job_ref) is False

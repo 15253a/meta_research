@@ -176,6 +176,21 @@ test("authenticated empty workspace keeps the fixed Lumen shell", async ({ page 
   await expect(page.getByText("capability_unavailable", { exact: true }).first()).toBeVisible();
 });
 
+test("technical details expose Semantic MCP and both locked Harness profiles", async ({ page }) => {
+  await openAuthenticatedProduct(page);
+
+  await page.getByText("查看运行详情", { exact: true }).click();
+  const details = page.locator(".lumen-technical-details");
+
+  await expect(details.getByText("Semantic MCP", { exact: true })).toBeVisible();
+  await expect(details).toContainText("streamable_http");
+  await expect(details.getByText("codex Harness", { exact: true })).toBeVisible();
+  await expect(details.getByText("claude Harness", { exact: true })).toBeVisible();
+  await expect(details).toContainText("lock 0.147.0");
+  await expect(details).toContainText("lock 2.1.220");
+  await expect(details).toContainText("conformance_probe_not_recorded");
+});
+
 test("an SSE interruption warns over the last good snapshot without leaving the shell", async ({ page }) => {
   await openAuthenticatedProduct(page);
   await expect(page.getByText("Projection 实时连接", { exact: true })).toBeVisible();

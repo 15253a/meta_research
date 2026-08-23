@@ -203,6 +203,7 @@ class CodexWritingSkillAdapter(CodexIdeaSkillAdapter):
     # tool, not arbitrary shell egress.
     _sandbox_mode = "workspace-write"
     _shell_environment_inherit = "none"
+    _reconciliation_operation_names = ("writing-primary", "writing-review")
 
     def runtime_binding(self) -> WritingRuntimeBinding:
         resources = _writing_skill_resources()

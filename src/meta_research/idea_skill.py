@@ -264,6 +264,7 @@ class CodexIdeaSkillAdapter:
 
     _sandbox_mode = "danger-full-access"
     _shell_environment_inherit: str | None = None
+    _reconciliation_operation_names = ("primary", "review")
 
     def __init__(
         self,
@@ -344,7 +345,7 @@ class CodexIdeaSkillAdapter:
             return True
         try:
             _key_path, key = self._transport_key()
-            for operation_name in ("primary", "review"):
+            for operation_name in self._reconciliation_operation_names:
                 directory = operation_root / operation_name
                 if not directory.exists():
                     continue

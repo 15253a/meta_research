@@ -24,6 +24,13 @@ from meta_research.experiment import (
     ExperimentService,
 )
 from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
+from meta_research.harness import HarnessRuntime
+from meta_research.harness_adapters import (
+    ClaudeHarnessAdapter,
+    CodexHarnessAdapter,
+    HarnessAdapter,
+    HarnessSupervisorTransport,
+)
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillProvider
 from meta_research.idea_stage import IdeaStageWorker
 from meta_research.manual_creation import (
@@ -69,10 +76,12 @@ from meta_research.quest_drafting import (
     IntentDraftingProvider,
     NvidiaSmiProbe,
     ProposalDrafter,
+    _CancellableProcessRunner,
 )
 from meta_research.target_commit_evidence import TargetCommitEvidenceCatalog
 from meta_research.writing import WritingReportService
 from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillProvider
+from meta_research.semantic_owner_gateway import create_semantic_owner_gateway
 
 
 @dataclass(frozen=True)
@@ -97,6 +106,7 @@ class ProductionRuntime:
     deepfetch: FirstQuestionDeepFetchWorker
     experiment: ExperimentService
     writing: WritingReportService
+    harnesses: HarnessRuntime
     _database: Database
     _provider_lifecycles: tuple[object, ...] = ()
     _stop_requested: bool = False
@@ -152,11 +162,13 @@ def build_production_runtime(
     acquisition_provider: AcquisitionProvider | None = None,
     experiment_provider: ExperimentProvider | None = None,
     writing_skill_provider: WritingSkillProvider | None = None,
+    harness_adapters: tuple[HarnessAdapter, ...] | None = None,
 ) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
     feed = DurableFeed(database)
     feed.ensure_initialized()
+    shared_provider_runner = _CancellableProcessRunner()
     codex_adapter = (
         CodexDraftingAdapter(data_root.root / "drafting-provider")
         if proposal_drafter is None or intent_drafting_provider is None
@@ -168,20 +180,24 @@ def build_production_runtime(
     assert intent_drafting_provider is not None
     host_compute_probe = host_compute_probe or NvidiaSmiProbe()
     idea_skill_provider = idea_skill_provider or CodexIdeaSkillAdapter(
-        data_root.root / "idea-skill-provider"
+        data_root.root / "idea-skill-provider",
+        process_runner=shared_provider_runner,
     )
     plan_skill_provider = plan_skill_provider or CodexPlanSkillAdapter(
-        data_root.root / "plan-skill-provider"
+        data_root.root / "plan-skill-provider",
+        process_runner=shared_provider_runner,
     )
     bundle_skill_provider = bundle_skill_provider or CodexBundleSkillAdapter(
-        data_root.root / "bundle-skill-provider"
+        data_root.root / "bundle-skill-provider",
+        process_runner=shared_provider_runner,
     )
     acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
     experiment_provider = experiment_provider or BuiltinMicroExperimentProvider(
         data_root.run / "experiment-provider"
     )
     writing_skill_provider = writing_skill_provider or CodexWritingSkillAdapter(
-        data_root.root / "writing-skill-provider"
+        data_root.root / "writing-skill-provider",
+        process_runner=shared_provider_runner,
     )
 
     host_compute_reader = create_host_compute_observation_reader(database)
@@ -239,6 +255,7 @@ def build_production_runtime(
             agent_runtime,
             acquisition_provider,
         ),
+        process_runner=shared_provider_runner,
     )
     agent_runtime.bind_provider_quiescence_driver(
         idea_skill_provider,
@@ -334,6 +351,31 @@ def build_production_runtime(
         agent_runtime=agent_runtime,
         human_collaboration=human_collaboration,
     )
+    semantic_gateway = create_semantic_owner_gateway(
+        research_graph=owners.research_graph,
+        advancement_engine_snapshot=owners.advancement_engine.query_snapshot,
+        research_memory_snapshot=owners.research_memory.query_snapshot,
+        agent_runtime=owners.agent_runtime,
+        human_collaboration_snapshot=owners.human_collaboration.query_snapshot,
+    )
+    if harness_adapters is None:
+        shared_harness_transport = HarnessSupervisorTransport(
+            data_root.run / "harness-supervisor",
+            process_runner=shared_provider_runner,
+        )
+        harness_adapters = (
+            CodexHarnessAdapter(
+                data_root.run / "harness", runner=shared_harness_transport
+            ),
+            ClaudeHarnessAdapter(
+                data_root.run / "harness", runner=shared_harness_transport
+            ),
+        )
+    harnesses = HarnessRuntime(
+        owners.agent_runtime.harness_runs,
+        semantic_gateway,
+        harness_adapters,
+    )
     idea_stage = IdeaStageWorker(
         feed,
         owners.advancement_engine,
@@ -394,9 +436,11 @@ def build_production_runtime(
         bundle_stage=bundle_stage,
         experiment=experiment,
         writing=writing,
+        harnesses=harnesses,
     )
     provider_lifecycles: list[object] = []
     for provider in (
+        shared_provider_runner,
         proposal_drafter,
         intent_drafting_provider,
         idea_skill_provider,
@@ -423,6 +467,7 @@ def build_production_runtime(
         deepfetch=deepfetch,
         experiment=experiment,
         writing=writing,
+        harnesses=harnesses,
         _database=database,
         _provider_lifecycles=tuple(provider_lifecycles),
     )

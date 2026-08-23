@@ -104,7 +104,7 @@ def test_fresh_0009_has_experiment_schema_and_zeroed_owner_counters(
         ).fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
 
-    assert version == ("0015_writing_report",)
+    assert version == ("0016_semantic_mcp_harness",)
     assert _EXPERIMENT_TABLES <= tables
     assert set(_RG_COUNTERS) <= rg_columns
     assert set(_AR_COUNTERS) <= ar_columns
@@ -164,7 +164,7 @@ def test_existing_0008_upgrades_then_experiment_admission_reopens(
     with sqlite3.connect(data_root.database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0015_writing_report",)
+        ).fetchone() == ("0016_semantic_mcp_harness",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

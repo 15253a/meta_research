@@ -20,6 +20,7 @@ from meta_research.owners.research_memory import (
 if TYPE_CHECKING:
     from meta_research.bundle_stage import BundleStageWorker
     from meta_research.experiment import ExperimentService
+    from meta_research.harness import HarnessRuntime
     from meta_research.idea_stage import IdeaStageWorker
     from meta_research.plan_stage import PlanStageWorker
     from meta_research.writing import WritingReportService
@@ -53,6 +54,7 @@ class PublicProjection:
         experiment: ExperimentService | None = None,
         bundle_stage: BundleStageWorker | None = None,
         writing: WritingReportService | None = None,
+        harnesses: HarnessRuntime | None = None,
     ) -> None:
         self._feed = feed
         self._object_store = object_store
@@ -66,6 +68,7 @@ class PublicProjection:
         self._bundle_stage = bundle_stage
         self._experiment = experiment
         self._writing = writing
+        self._harnesses = harnesses
         self._interfaces = {
             "research_graph": research_graph,
             "advancement_engine": advancement_engine,
@@ -189,6 +192,16 @@ class PublicProjection:
                 }
                 if self._writing is None
                 else self._writing.query_overview()
+            )
+            harnesses = (
+                {
+                    "status": "capability_unavailable",
+                    "reason": {"code": "harness_runtime_unavailable"},
+                    "gateway": None,
+                    "adapters": [],
+                }
+                if self._harnesses is None
+                else self._harnesses.query_status()
             )
             question_tree_items: list[dict[str, object]] = []
             question_tree_reason: dict[str, str] | None = None
@@ -445,6 +458,7 @@ class PublicProjection:
                 "current": current_experiment,
             },
             "writing": writing,
+            "harnesses": harnesses,
             "unavailable": _release_capabilities(),
         }
         if idea_stage is not None:

@@ -34,16 +34,16 @@ def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
-def test_interrupted_0013_rolls_back_then_retries_without_losing_0012_state(
+def test_interrupted_0015_rolls_back_then_retries_without_losing_0014_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = tmp_path / "interrupted-writing.sqlite3"
-    _upgrade_to_revision(database, "0012_experiment_measurement")
+    _upgrade_to_revision(database, "0014_advancement_runtime_control")
     with sqlite3.connect(database) as connection:
         connection.execute(
             "INSERT INTO durable_feed "
             "(revision, event_type, payload_json, recorded_at) "
-            "VALUES (1, 'before.0013', '{}', 130.0)"
+            "VALUES (1, 'before.0015', '{}', 130.0)"
         )
         connection.commit()
 
@@ -54,17 +54,17 @@ def test_interrupted_0013_rolls_back_then_retries_without_losing_0012_state(
         nonlocal failed_once
         if table_name == "ar_writing_runs" and not failed_once:
             failed_once = True
-            raise OSError("injected 0013 migration interruption")
+            raise OSError("injected 0015 migration interruption")
         return original_create_table(self, table_name, *args, **kwargs)
 
     monkeypatch.setattr(Operations, "create_table", fail_during_writing_migration)
-    with pytest.raises(OSError, match="injected 0013 migration interruption"):
-        upgrade_database(database)
+    with pytest.raises(OSError, match="injected 0015 migration interruption"):
+        _upgrade_to_revision(database, "0015_writing_report")
 
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0014_advancement_runtime_control",)
         assert not (_AR_COUNTERS & _columns(connection, "agent_runtime_state"))
         assert not (_RG_COUNTERS & _columns(connection, "research_graph_state"))
         tables = {
@@ -77,11 +77,11 @@ def test_interrupted_0013_rolls_back_then_retries_without_losing_0012_state(
         assert connection.execute(
             "SELECT event_type, payload_json, recorded_at FROM durable_feed "
             "WHERE revision = 1"
-        ).fetchone() == ("before.0013", "{}", 130.0)
+        ).fetchone() == ("before.0015", "{}", 130.0)
 
     monkeypatch.setattr(Operations, "create_table", original_create_table)
-    upgrade_database(database)
-    upgrade_database(database)
+    _upgrade_to_revision(database, "0015_writing_report")
+    _upgrade_to_revision(database, "0015_writing_report")
 
     with sqlite3.connect(database) as connection:
         version = connection.execute(
@@ -116,17 +116,17 @@ def test_interrupted_0013_rolls_back_then_retries_without_losing_0012_state(
     assert _TABLES <= tables
     assert ar_values == (0,) * len(_AR_COUNTERS)
     assert rg_values == (0,) * len(_RG_COUNTERS)
-    assert preserved == ("before.0013", "{}", 130.0)
+    assert preserved == ("before.0015", "{}", 130.0)
     assert foreign_keys == []
     assert integrity == ("ok",)
 
 
-def test_0013_is_forward_only(tmp_path: Path) -> None:
+def test_0015_is_forward_only(tmp_path: Path) -> None:
     database = tmp_path / "forward-only-writing.sqlite3"
-    upgrade_database(database)
+    _upgrade_to_revision(database, "0015_writing_report")
 
     with pytest.raises(RuntimeError, match="forward-only"):
-        _downgrade_to_revision(database, "0012_experiment_measurement")
+        _downgrade_to_revision(database, "0014_advancement_runtime_control")
 
     with sqlite3.connect(database) as connection:
         assert connection.execute(

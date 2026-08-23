@@ -282,6 +282,32 @@ def test_sse_resumes_by_revision_and_directs_gaps_to_the_snapshot(
     launch_document.unlink(missing_ok=True)
 
 
+def test_doctor_json_reports_locked_harness_versions_and_missing_reasons(
+    running_product,
+) -> None:
+    data_root, _started = running_product
+
+    doctor = run_cli_json(
+        "doctor", "--data-root", str(data_root), "--json"
+    )
+
+    assert doctor["status"] in {"ready", "capability_unavailable"}
+    assert doctor["gateway"]["transport"] == "streamable_http"
+    assert [item["harness_family"] for item in doctor["adapters"]] == [
+        "codex",
+        "claude",
+    ]
+    assert [item["locked_version"] for item in doctor["adapters"]] == [
+        "0.147.0",
+        "2.1.220",
+    ]
+    assert all(
+        item["capability_profile"] is not None
+        or item["missing_reason"]["code"] == "conformance_probe_not_recorded"
+        for item in doctor["adapters"]
+    )
+
+
 def test_loopback_authentication_origin_content_type_and_csrf_fail_closed(
     running_product,
 ) -> None:
