@@ -1767,6 +1767,309 @@ class _BlockingWritingSkill(_DeterministicWritingSkill):
         return super().generate_draft(request)
 
 
+class _ControlledBlockingWritingSkill(_DeterministicWritingSkill):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release_terminal = threading.Event()
+        self.cancelled_jobs: list[str] = []
+
+    def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
+        self.started.set()
+        self.release_terminal.wait(timeout=5)
+        raise WritingSkillUnavailable("codex_cli_stopped")
+
+    def cancel_job(self, job_ref: str) -> None:
+        self.cancelled_jobs.append(job_ref)
+
+    def reconcile_cancelled_job(self, job_ref: str) -> bool:
+        assert job_ref in self.cancelled_jobs
+        return self.release_terminal.is_set()
+
+
+def test_writing_admission_and_provider_phases_use_the_shared_managed_seam(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "writing-managed-provider-units")
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            "writing-managed-provider-units",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        managed = runtime.owners.agent_runtime.query_managed_run(run_ref)
+        assert managed is not None
+        assert managed["run_kind"] == "writing"
+        assert managed["quest_ref"] is None
+        assert managed["status"] == "running"
+        assert managed["attempt_ref"] == admitted["run"]["attempt_ref"]
+        assert managed["root_session_ref"] == admitted["run"]["root_session_ref"]
+        assert managed["fence_ref"] == admitted["run"]["fence_ref"]
+        assert all(
+            item["run_ref"] != run_ref
+            for item in runtime.owners.agent_runtime.query_managed_runs(
+                quest["quest_ref"]
+            )
+        )
+
+        assert runtime.writing.process_once()
+        assert runtime.writing.process_once()
+        with runtime._database.read() as connection:
+            units = connection.exec_driver_sql(
+                "SELECT unit_kind, status, operation_ref FROM ar_provider_units "
+                "WHERE run_ref = ? ORDER BY started_at, unit_kind",
+                (run_ref,),
+            ).fetchall()
+        owner_run = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert owner_run is not None
+        assert units == [
+            ("writing_primary", "completed", owner_run.provider_job_ref),
+            ("writing_review", "completed", owner_run.provider_job_ref),
+        ]
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("phase", ["primary", "review"])
+def test_writing_retries_a_lost_provider_safe_ack_from_durable_owner_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    provider = _DeterministicWritingSkill()
+    runtime = _runtime(tmp_path / f"writing-lost-safe-ack-{phase}", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            f"writing-lost-safe-ack-{phase}",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        if phase == "review":
+            assert runtime.writing.process_once()
+
+        original_ack = (
+            runtime.owners.agent_runtime.acknowledge_provider_safe_point
+        )
+        current = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert current is not None
+        target_unit_ref = runtime.writing._provider_unit_ref(
+            current, f"writing_{phase}"
+        )
+        lost = False
+
+        def lose_first_ack(**values) -> None:
+            nonlocal lost
+            if not lost and values.get("unit_ref") == target_unit_ref:
+                lost = True
+                raise OwnerConflict("simulated_provider_safe_ack_loss")
+            original_ack(**values)
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            lose_first_ack,
+        )
+        with pytest.raises(OwnerConflict, match="simulated_provider_safe_ack_loss"):
+            runtime.writing.process_once()
+        owner_after_commit = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert owner_after_commit is not None
+        assert owner_after_commit.status == "active"
+        if phase == "primary":
+            assert owner_after_commit.checkpoint is not None
+            assert owner_after_commit.execution is None
+        else:
+            assert owner_after_commit.execution is not None
+        with runtime._database.read() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT status FROM ar_provider_units WHERE run_ref = ? AND "
+                "unit_kind = ?",
+                (run_ref, f"writing_{phase}"),
+            ).scalar_one() == "active"
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            original_ack,
+        )
+        assert runtime.writing.process_once()
+        recovered = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert recovered is not None
+        assert recovered.status == "active"
+        assert recovered.failure_code is None
+        with runtime._database.read() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT status FROM ar_provider_units WHERE run_ref = ? AND "
+                "unit_kind = ?",
+                (run_ref, f"writing_{phase}"),
+            ).scalar_one() == "completed"
+        assert len(provider.draft_requests) == 1
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("control_kind", ["pause", "timeout"])
+def test_writing_control_waits_for_provider_exit_before_replacing_attempt(
+    tmp_path: Path,
+    control_kind: str,
+) -> None:
+    provider = _ControlledBlockingWritingSkill()
+    runtime = _runtime(tmp_path / f"writing-provider-stop-{control_kind}", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            f"writing-provider-stop-{control_kind}",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        old_attempt_ref = admitted["run"]["attempt_ref"]
+        old_fence_ref = admitted["run"]["fence_ref"]
+        owner_before = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert owner_before is not None
+        errors: list[BaseException] = []
+
+        def execute_provider() -> None:
+            try:
+                runtime.writing.process_once()
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        worker = threading.Thread(target=execute_provider, daemon=True)
+        worker.start()
+        assert provider.started.wait(timeout=2)
+
+        if control_kind == "pause":
+            controlled = runtime.writing.control_report(
+                run_ref,
+                action="pause",
+                idempotency_key="writing-managed-provider-pause",
+            )
+            assert controlled["status"] == "paused"
+        else:
+            runtime.writing.block_writing_claim(
+                run_ref=run_ref,
+                attempt_ref=old_attempt_ref,
+                fence_ref=old_fence_ref,
+            )
+            assert runtime.writing.query_writing_report(run_ref)["status"] == "blocked"
+        assert provider.cancelled_jobs == [owner_before.provider_job_ref]
+        managed = runtime.owners.agent_runtime.query_managed_run(run_ref)
+        assert managed is not None
+        assert managed["cleanup_status"] == "pending"
+        assert managed["status"] in {"suspended_fenced", "reconciliation_required"}
+        with runtime._database.read() as connection:
+            unit_status = connection.exec_driver_sql(
+                "SELECT status FROM ar_provider_units WHERE run_ref = ?",
+                (run_ref,),
+            ).scalar_one()
+            revoked = connection.exec_driver_sql(
+                "SELECT reason_code FROM ar_fence_revocations WHERE fence_ref = ?",
+                (old_fence_ref,),
+            ).scalar_one()
+        assert unit_status == "revocation_pending"
+        assert revoked in {"writing_paused", "writing_operation_timeout"}
+        with pytest.raises(OwnerConflict, match="runtime_quiescence_pending"):
+            runtime.writing.control_report(
+                run_ref,
+                action="resume",
+                idempotency_key=f"writing-provider-stop-{control_kind}-early-resume",
+            )
+
+        provider.release_terminal.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert errors == []
+        cleaned = runtime.owners.agent_runtime.query_managed_run(run_ref)
+        assert cleaned is not None
+        assert cleaned["cleanup_status"] == "completed"
+        with runtime._database.read() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT status FROM ar_provider_units WHERE run_ref = ?",
+                (run_ref,),
+            ).scalar_one() == "revoked"
+
+        resumed = runtime.writing.control_report(
+            run_ref,
+            action="resume",
+            idempotency_key=f"writing-provider-stop-{control_kind}-resume",
+        )
+        assert resumed["run"]["attempt_ref"] != old_attempt_ref
+        assert resumed["run"]["fence_ref"] != old_fence_ref
+        owner_after = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert owner_after is not None
+        assert owner_after.provider_job_ref != owner_before.provider_job_ref
+    finally:
+        provider.release_terminal.set()
+        runtime.close()
+
+
+def test_writing_restart_reuses_the_sealed_operation_without_attempt_churn(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "writing-managed-restart"
+    provider = _DeterministicWritingSkill()
+    runtime = _runtime(root, provider)
+    quest = _confirm_direct_quest(runtime)
+    admitted = _admit_report(runtime, quest["quest_ref"], "writing-managed-restart")
+    run_ref = admitted["run"]["run_ref"]
+    original = runtime.owners.agent_runtime.query_writing_report(run_ref)
+    assert original is not None
+    unit_ref = "provider_unit_" + canonical_hash(
+        {
+            "provider_job_ref": original.provider_job_ref,
+            "attempt_ref": original.attempt_ref,
+            "unit_kind": "writing_primary",
+        }
+    )[:64]
+    runtime.owners.agent_runtime.begin_provider_unit(
+        unit_ref=unit_ref,
+        operation_ref=original.provider_job_ref,
+        run_ref=run_ref,
+        attempt_ref=original.attempt_ref,
+        fence_ref=original.fence_ref,
+        unit_kind="writing_primary",
+    )
+    runtime.close()
+
+    restarted = _runtime(root, provider)
+    recovered = restarted.owners.agent_runtime.query_writing_report(run_ref)
+    assert recovered is not None
+    assert recovered.attempt_generation == original.attempt_generation + 1
+    assert recovered.provider_job_ref == original.provider_job_ref
+    assert recovered.attempt_ref != original.attempt_ref
+    assert recovered.fence_ref != original.fence_ref
+    assert restarted.owners.agent_runtime.query_managed_run(run_ref)[
+        "cleanup_status"
+    ] == "none"
+    restarted.close()
+
+    restarted_again = _runtime(root, provider)
+    try:
+        stable = restarted_again.owners.agent_runtime.query_writing_report(run_ref)
+        assert stable is not None
+        assert stable.attempt_ref == recovered.attempt_ref
+        assert stable.attempt_generation == recovered.attempt_generation
+        assert stable.provider_job_ref == original.provider_job_ref
+
+        assert restarted_again.writing.process_once()
+        with restarted_again._database.read() as connection:
+            statuses = connection.exec_driver_sql(
+                "SELECT attempt_ref, status, operation_ref FROM ar_provider_units "
+                "WHERE run_ref = ? ORDER BY started_at, unit_ref",
+                (run_ref,),
+            ).fetchall()
+        assert statuses == [
+            (original.attempt_ref, "revoked", original.provider_job_ref),
+            (stable.attempt_ref, "completed", original.provider_job_ref),
+        ]
+    finally:
+        restarted_again.close()
+
+
 def test_provider_failure_is_durable_does_not_starve_later_runs_and_can_resume(
     tmp_path: Path,
 ) -> None:

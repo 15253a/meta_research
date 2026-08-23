@@ -41,6 +41,21 @@ def test_interrupted_0015_rolls_back_then_retries_without_losing_0014_state(
     _upgrade_to_revision(database, "0014_advancement_runtime_control")
     with sqlite3.connect(database) as connection:
         connection.execute(
+            "INSERT INTO ar_run_controls (run_ref, run_kind, quest_ref, cycle_ref, "
+            "epoch, status, attempt_ref, root_session_ref, fence_ref, "
+            "control_revision, safe_point_ref, terminal_reason, cleanup_status, "
+            "updated_at) VALUES ('migration-provider-run', 'experiment', NULL, "
+            "NULL, NULL, 'running', 'migration-attempt', 'migration-root', "
+            "'migration-fence', 1, NULL, NULL, 'none', 129.0)"
+        )
+        connection.execute(
+            "INSERT INTO ar_provider_units (unit_ref, operation_ref, run_ref, "
+            "attempt_ref, fence_ref, unit_kind, status, started_at, completed_at) "
+            "VALUES ('migration-provider-unit', 'migration-operation', "
+            "'migration-provider-run', 'migration-attempt', 'migration-fence', "
+            "'experiment', 'active', 129.0, NULL)"
+        )
+        connection.execute(
             "INSERT INTO durable_feed "
             "(revision, event_type, payload_json, recorded_at) "
             "VALUES (1, 'before.0015', '{}', 130.0)"
@@ -109,6 +124,32 @@ def test_interrupted_0015_rolls_back_then_retries_without_losing_0014_state(
         ).fetchone()
         foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA quick_check").fetchone()
+        provider_unit = connection.execute(
+            "SELECT operation_ref, run_ref, attempt_ref, fence_ref, unit_kind, "
+            "status, started_at, completed_at FROM ar_provider_units WHERE "
+            "unit_ref = 'migration-provider-unit'"
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO ar_provider_units (unit_ref, operation_ref, run_ref, "
+            "attempt_ref, fence_ref, unit_kind, status, started_at, completed_at) "
+            "VALUES ('migration-writing-primary', 'migration-writing-operation', "
+            "'migration-provider-run', 'migration-writing-attempt', "
+            "'migration-writing-fence', 'writing_primary', 'active', 131.0, NULL)"
+        )
+        connection.execute(
+            "INSERT INTO ar_provider_units (unit_ref, operation_ref, run_ref, "
+            "attempt_ref, fence_ref, unit_kind, status, started_at, completed_at) "
+            "VALUES ('migration-writing-review', 'migration-writing-operation', "
+            "'migration-provider-run', 'migration-writing-attempt', "
+            "'migration-writing-fence', 'writing_review', 'completed', 131.0, 132.0)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO ar_provider_units (unit_ref, operation_ref, run_ref, "
+                "unit_kind, status, started_at) VALUES ('migration-invalid-unit', "
+                "'migration-invalid-operation', 'migration-provider-run', "
+                "'writing_unknown', 'active', 133.0)"
+            )
 
     assert version == ("0015_writing_report",)
     assert _AR_COUNTERS <= ar_columns
@@ -119,6 +160,16 @@ def test_interrupted_0015_rolls_back_then_retries_without_losing_0014_state(
     assert preserved == ("before.0015", "{}", 130.0)
     assert foreign_keys == []
     assert integrity == ("ok",)
+    assert provider_unit == (
+        "migration-operation",
+        "migration-provider-run",
+        "migration-attempt",
+        "migration-fence",
+        "experiment",
+        "active",
+        129.0,
+        None,
+    )
 
 
 def test_0015_is_forward_only(tmp_path: Path) -> None:

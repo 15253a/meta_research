@@ -36,6 +36,10 @@ from meta_research.writing_skill import (
 )
 
 
+_WRITING_PROVIDER_UNIT_KINDS = ("writing_primary", "writing_review")
+_PROVIDER_RECONCILIATION_PENDING = "codex_operation_reconciliation_pending"
+
+
 class WritingReportService:
     """Owner-neutral Writing orchestration composed only through public Interfaces."""
 
@@ -218,7 +222,13 @@ class WritingReportService:
     ) -> tuple[str, str, str] | None:
         """Return the exact oldest Attempt that still has a durable boundary."""
 
+        self._agent_runtime.reconcile_pending_provider_cleanup(
+            self._provider,
+            unit_kinds=_WRITING_PROVIDER_UNIT_KINDS,
+        )
         for run in self._agent_runtime.query_active_writing_reports():
+            if self._agent_runtime.provider_quiescence_requested(run.run_ref):
+                continue
             claim = (run.run_ref, run.attempt_ref, run.fence_ref)
             if claim in excluded_claims:
                 continue
@@ -283,6 +293,14 @@ class WritingReportService:
             except OwnerConflict as error:
                 self._block_if_still_current(run, error.code)
                 return True
+            if run.execution is not None:
+                self._acknowledge_durable_provider_boundary(
+                    run, "writing_review"
+                )
+            elif run.checkpoint is not None:
+                self._acknowledge_durable_provider_boundary(
+                    run, "writing_primary"
+                )
             try:
                 command = self._human_collaboration.query_command(run.intent_id)
                 payload = self._writing_payload(command)
@@ -311,18 +329,12 @@ class WritingReportService:
                 return True
             if run.checkpoint is None:
                 assert request is not None
+                unit_ref: str | None = None
+                provider_safe = True
                 try:
+                    unit_ref = self._begin_provider_unit(run, "writing_primary")
                     draft = self._provider.generate_draft(request)
                     validate_writing_skill_draft(request, draft)
-                except (WritingSkillUnavailable, OwnerConflict) as error:
-                    self._agent_runtime.fail_writing_report(
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        failure_code=error.code,
-                    )
-                    return True
-                try:
                     self._agent_runtime.record_writing_checkpoint(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
@@ -335,8 +347,16 @@ class WritingReportService:
                             "writing-checkpoint", run.run_ref, run.attempt_ref
                         ),
                     )
-                except OwnerConflict as error:
+                except (WritingSkillUnavailable, OwnerConflict) as error:
+                    provider_safe = error.code != _PROVIDER_RECONCILIATION_PENDING
+                    if self._agent_runtime.provider_quiescence_requested(run.run_ref):
+                        return True
+                    if not provider_safe:
+                        raise
                     self._block_if_still_current(run, error.code)
+                finally:
+                    if unit_ref is not None and provider_safe:
+                        self._acknowledge_provider_unit(run, unit_ref)
                 return True
             if run.execution is None:
                 assert request is not None
@@ -352,31 +372,25 @@ class WritingReportService:
                         "native_session_ref": run.checkpoint.native_session_ref,
                     }
                 )
+                unit_ref = None
+                provider_safe = True
                 try:
+                    unit_ref = self._begin_provider_unit(run, "writing_review")
                     result = self._provider.review_draft(resumed_request, draft)
                     final_hash, citations_hash, review_hash = (
                         validate_writing_skill_result(resumed_request, draft, result)
                     )
-                except (WritingSkillUnavailable, OwnerConflict) as error:
-                    self._agent_runtime.fail_writing_report(
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        failure_code=error.code,
-                    )
-                    return True
-                review = {
-                    "review_mode": result.review_mode,
-                    "reviewer_agent_ref": result.reviewer_agent_ref,
-                    "review_task_hash": result.review_task_hash,
-                    "reviewed_markdown_hash": run.checkpoint.markdown_hash,
-                    "findings": list(result.findings),
-                    "dispositions": list(result.dispositions),
-                    "final_markdown_hash": final_hash,
-                    "citations_hash": citations_hash,
-                    "review_hash": review_hash,
-                }
-                try:
+                    review = {
+                        "review_mode": result.review_mode,
+                        "reviewer_agent_ref": result.reviewer_agent_ref,
+                        "review_task_hash": result.review_task_hash,
+                        "reviewed_markdown_hash": run.checkpoint.markdown_hash,
+                        "findings": list(result.findings),
+                        "dispositions": list(result.dispositions),
+                        "final_markdown_hash": final_hash,
+                        "citations_hash": citations_hash,
+                        "review_hash": review_hash,
+                    }
                     self._agent_runtime.record_writing_execution(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
@@ -390,9 +404,17 @@ class WritingReportService:
                             "writing-execution", run.run_ref, run.attempt_ref
                         ),
                     )
-                except OwnerConflict as error:
+                except (WritingSkillUnavailable, OwnerConflict) as error:
+                    provider_safe = error.code != _PROVIDER_RECONCILIATION_PENDING
+                    if self._agent_runtime.provider_quiescence_requested(run.run_ref):
+                        return True
+                    if not provider_safe:
+                        raise
                     self._block_if_still_current(run, error.code)
                     return True
+                finally:
+                    if unit_ref is not None and provider_safe:
+                        self._acknowledge_provider_unit(run, unit_ref)
                 finish_job = getattr(self._provider, "finish_job", None)
                 if callable(finish_job):
                     finish_job(job_ref)
@@ -518,7 +540,7 @@ class WritingReportService:
         """Persist a timeout only if the originally claimed Fence is current."""
 
         try:
-            self._agent_runtime.fail_writing_report(
+            blocked = self._agent_runtime.fail_writing_report(
                 run_ref=run_ref,
                 attempt_ref=attempt_ref,
                 fence_ref=fence_ref,
@@ -528,6 +550,9 @@ class WritingReportService:
             # A concurrent control or late completion already retired this
             # Fence; in either case the watchdog claim is no longer runnable.
             return
+        cancel_job = getattr(self._provider, "cancel_job", None)
+        if callable(cancel_job):
+            cancel_job(blocked.provider_job_ref)
 
     def control_report(
         self,
@@ -1311,6 +1336,48 @@ class WritingReportService:
     def _writing_job_ref(run: WritingRun, content_revision: int) -> str:
         del content_revision
         return run.provider_job_ref
+
+    @staticmethod
+    def _provider_unit_ref(run: WritingRun, unit_kind: str) -> str:
+        return "provider_unit_" + canonical_hash(
+            {
+                "provider_job_ref": run.provider_job_ref,
+                "attempt_ref": run.attempt_ref,
+                "unit_kind": unit_kind,
+            }
+        )[:64]
+
+    def _begin_provider_unit(self, run: WritingRun, unit_kind: str) -> str:
+        unit_ref = self._provider_unit_ref(run, unit_kind)
+        self._agent_runtime.begin_provider_unit(
+            unit_ref=unit_ref,
+            operation_ref=run.provider_job_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            unit_kind=unit_kind,
+        )
+        return unit_ref
+
+    def _acknowledge_provider_unit(self, run: WritingRun, unit_ref: str) -> None:
+        self._agent_runtime.acknowledge_provider_safe_point(
+            unit_ref=unit_ref,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+        )
+
+    def _acknowledge_durable_provider_boundary(
+        self, run: WritingRun, unit_kind: str
+    ) -> None:
+        try:
+            self._acknowledge_provider_unit(
+                run,
+                self._provider_unit_ref(run, unit_kind),
+            )
+        except OwnerConflict as error:
+            if error.code != "runtime_provider_unit_not_found":
+                raise
 
     @staticmethod
     def _deliverable_failure_code(result: AssetIntakeResult) -> str:

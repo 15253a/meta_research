@@ -1258,6 +1258,8 @@ _PROVIDER_UNIT_KINDS = frozenset(
         "bundle_review",
         "deepfetch",
         "experiment",
+        "writing_primary",
+        "writing_review",
     }
 )
 
@@ -1503,7 +1505,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "run_ref": unit.run_ref,
                     },
                 )
-            if replaced_unit_refs:
+            if recovered or replaced_unit_refs:
                 connection.execute(
                     text(
                         "UPDATE agent_runtime_state SET revision = revision + 1, "
@@ -1694,6 +1696,24 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                             "native_session_ref": None,
                             "fence_ref": fence_ref,
                             "provider_job_ref": provider_job_ref,
+                            "now": now,
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO ar_run_controls (run_ref, run_kind, "
+                            "quest_ref, cycle_ref, epoch, status, attempt_ref, "
+                            "root_session_ref, fence_ref, control_revision, "
+                            "safe_point_ref, terminal_reason, cleanup_status, "
+                            "updated_at) VALUES (:run_ref, 'writing', NULL, NULL, "
+                            "NULL, 'running', :attempt_ref, :root_session_ref, "
+                            ":fence_ref, 1, NULL, NULL, 'none', :now)"
+                        ),
+                        {
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "root_session_ref": root_session_ref,
+                            "fence_ref": fence_ref,
                             "now": now,
                         },
                     )
@@ -1892,6 +1912,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "now": now,
                         "attempt_ref": attempt_ref,
                     },
+                )
+                _retire_writing_managed_attempt(
+                    connection,
+                    run=row,
+                    managed_status="reconciliation_required",
+                    reason_code=failure_code,
+                    now=now,
                 )
                 connection.execute(
                     text(
@@ -2482,6 +2509,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "run_ref": run_ref,
                     },
                 )
+                _sync_writing_managed_attempt(
+                    connection,
+                    run_ref=run_ref,
+                    old_attempt_ref=run.attempt_ref,
+                    old_fence_ref=run.fence_ref,
+                    new_attempt_ref=replacement_ref,
+                    new_fence_ref=replacement_fence,
+                    root_session_ref=run.root_session_ref,
+                    preserve_cleanup=False,
+                    now=now,
+                )
                 connection.execute(
                     text(
                         "UPDATE agent_runtime_state SET revision = revision + 1, "
@@ -2552,6 +2590,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 ).first()
                 if run is None:
                     raise OwnerConflict("writing_run_not_found")
+                control = connection.execute(
+                    text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                    {"run_ref": run_ref},
+                ).first()
+                if (
+                    control is None
+                    or control.run_kind != "writing"
+                    or control.attempt_ref != run.attempt_ref
+                    or control.fence_ref != run.fence_ref
+                    or control.root_session_ref != run.root_session_ref
+                ):
+                    raise OwnerConflict("writing_runtime_control_integrity_invalid")
                 if (
                     expected_attempt_ref is not None
                     and expected_fence_ref is not None
@@ -2643,6 +2693,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         raise OwnerConflict("writing_run_terminal")
                     else:
                         raise OwnerConflict("writing_control_transition_invalid")
+                if target == "active" and control.cleanup_status == "pending":
+                    raise OwnerConflict("runtime_quiescence_pending")
                 now = time.time()
                 if run.status in {"blocked", "paused"} and target == "active":
                     if run.status == "blocked" and run.failure_code in {
@@ -2760,6 +2812,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                                 "run_ref": run_ref,
                             },
                         )
+                        _sync_writing_managed_attempt(
+                            connection,
+                            run_ref=run_ref,
+                            old_attempt_ref=run.attempt_ref,
+                            old_fence_ref=run.fence_ref,
+                            new_attempt_ref=replacement_ref,
+                            new_fence_ref=replacement_fence,
+                            root_session_ref=run.root_session_ref,
+                            preserve_cleanup=False,
+                            now=now,
+                        )
                         connection.execute(
                             text(
                                 "UPDATE agent_runtime_state SET revision = revision "
@@ -2794,6 +2857,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                                 "WHERE attempt_ref = :attempt_ref"
                             ),
                             {"attempt_ref": run.attempt_ref},
+                        )
+                        _sync_writing_managed_attempt(
+                            connection,
+                            run_ref=run_ref,
+                            old_attempt_ref=run.attempt_ref,
+                            old_fence_ref=run.fence_ref,
+                            new_attempt_ref=run.attempt_ref,
+                            new_fence_ref=run.fence_ref,
+                            root_session_ref=run.root_session_ref,
+                            preserve_cleanup=False,
+                            now=now,
                         )
                         connection.execute(
                             text(
@@ -2840,6 +2914,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                             ),
                             {"now": now, "attempt_ref": run.attempt_ref},
                         )
+                    _retire_writing_managed_attempt(
+                        connection,
+                        run=run,
+                        managed_status=(
+                            "terminated"
+                            if target == "cancelled"
+                            else "suspended_fenced"
+                        ),
+                        reason_code=(
+                            "writing_cancelled"
+                            if target == "cancelled"
+                            else "writing_paused"
+                        ),
+                        now=now,
+                    )
                     connection.execute(
                         text(
                             "UPDATE agent_runtime_state SET revision = revision + 1, "
@@ -10392,8 +10481,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "SELECT run.*, attempt.provider_job_ref AS provider_job_ref FROM "
                     "ar_writing_runs AS run JOIN "
                     "ar_writing_attempts AS attempt ON attempt.attempt_ref = "
-                    "run.attempt_ref WHERE run.status = 'active' AND "
-                    "attempt.status IN ('admitted', 'running') ORDER BY run.run_ref"
+                    "run.attempt_ref JOIN ar_run_controls AS control ON "
+                    "control.run_ref = run.run_ref AND control.run_kind = 'writing' "
+                    "WHERE run.status = 'active' AND attempt.status IN "
+                    "('admitted', 'running') AND (NOT EXISTS (SELECT 1 FROM "
+                    "ar_provider_units pending WHERE pending.run_ref = run.run_ref "
+                    "AND pending.status = 'revocation_pending') OR EXISTS (SELECT 1 "
+                    "FROM ar_provider_units pending WHERE pending.run_ref = "
+                    "run.run_ref AND pending.attempt_ref IS run.attempt_ref AND "
+                    "pending.fence_ref IS run.fence_ref AND pending.status = "
+                    "'revocation_pending')) ORDER BY run.run_ref"
                 )
             ).all()
             for run in runs:
@@ -10418,6 +10515,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 attempt_ref = new_ref("writing_attempt")
                 fence_ref = new_ref("writing_fence")
                 attempt_status = "running" if checkpoint is not None else "admitted"
+                _revoke_writing_fence(
+                    connection,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    reason_code="daemon_restart_inflight",
+                    now=now,
+                )
                 connection.execute(
                     text(
                         "UPDATE ar_writing_attempts SET status = 'retired', "
@@ -10537,6 +10642,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "run_ref": run.run_ref,
                         "retired_attempt_ref": run.attempt_ref,
                     },
+                )
+                _sync_writing_managed_attempt(
+                    connection,
+                    run_ref=run.run_ref,
+                    old_attempt_ref=run.attempt_ref,
+                    old_fence_ref=run.fence_ref,
+                    new_attempt_ref=attempt_ref,
+                    new_fence_ref=fence_ref,
+                    root_session_ref=run.root_session_ref,
+                    preserve_cleanup=False,
+                    now=now,
                 )
                 self._feed.record(
                     connection,
@@ -14101,6 +14217,192 @@ def _validate_writing_review_contract(
         raise OwnerConflict("writing_feedback_revision_not_material")
 
 
+def _revoke_writing_fence(
+    connection,
+    *,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+    reason_code: str,
+    now: float,
+) -> None:
+    revocation_reason = reason_code[:96]
+    operation_ref = (
+        "writing-control-"
+        + canonical_hash(
+            {
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+                "reason_code": revocation_reason,
+            }
+        )[:48]
+    )
+    inserted = connection.execute(
+        text(
+            "INSERT INTO ar_fence_revocations (fence_ref, operation_ref, "
+            "run_ref, attempt_ref, reason_code, revoked_at) VALUES "
+            "(:fence_ref, :operation_ref, :run_ref, :attempt_ref, "
+            ":reason_code, :now) ON CONFLICT(fence_ref) DO NOTHING"
+        ),
+        {
+            "fence_ref": fence_ref,
+            "operation_ref": operation_ref,
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "reason_code": revocation_reason,
+            "now": now,
+        },
+    )
+    if inserted.rowcount:
+        connection.execute(
+            text(
+                "UPDATE agent_runtime_state SET fenced_attempt_count = "
+                "fenced_attempt_count + 1 WHERE singleton = 'owner'"
+            )
+        )
+
+
+def _retire_writing_managed_attempt(
+    connection,
+    *,
+    run,
+    managed_status: str,
+    reason_code: str | None,
+    now: float,
+) -> None:
+    """Fence one Writing Attempt and expose any physical cleanup still owed."""
+
+    control = connection.execute(
+        text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+        {"run_ref": run.run_ref},
+    ).first()
+    attempt = connection.execute(
+        text("SELECT status FROM ar_writing_attempts WHERE attempt_ref = :attempt_ref"),
+        {"attempt_ref": run.attempt_ref},
+    ).first()
+    if (
+        control is None
+        or control.run_kind != "writing"
+        or control.attempt_ref != run.attempt_ref
+        or control.root_session_ref != run.root_session_ref
+        or control.fence_ref != run.fence_ref
+        or attempt is None
+    ):
+        raise OwnerConflict("writing_runtime_control_integrity_invalid")
+    pending_before = connection.execute(
+        text(
+            "SELECT 1 FROM ar_provider_units WHERE run_ref = :run_ref AND "
+            "attempt_ref IS :attempt_ref AND fence_ref IS :fence_ref AND status IN "
+            "('active', 'revocation_pending') LIMIT 1"
+        ),
+        {
+            "run_ref": run.run_ref,
+            "attempt_ref": run.attempt_ref,
+            "fence_ref": run.fence_ref,
+        },
+    ).first()
+    if attempt.status != "completed" or pending_before is not None:
+        _revoke_writing_fence(
+            connection,
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            reason_code=reason_code or "writing_controlled",
+            now=now,
+        )
+    connection.execute(
+        text(
+            "UPDATE ar_provider_units SET status = 'revocation_pending' WHERE "
+            "run_ref = :run_ref AND attempt_ref IS :attempt_ref AND fence_ref IS "
+            ":fence_ref AND status = 'active'"
+        ),
+        {
+            "run_ref": run.run_ref,
+            "attempt_ref": run.attempt_ref,
+            "fence_ref": run.fence_ref,
+        },
+    )
+    pending = connection.execute(
+        text(
+            "SELECT 1 FROM ar_provider_units WHERE run_ref = :run_ref AND status "
+            "IN ('active', 'revocation_pending') LIMIT 1"
+        ),
+        {"run_ref": run.run_ref},
+    ).first()
+    cleanup_status = (
+        "pending"
+        if pending is not None
+        else ("completed" if managed_status == "terminated" else "none")
+    )
+    terminal_reason = None if reason_code is None else reason_code[:96]
+    connection.execute(
+        text(
+            "UPDATE ar_run_controls SET status = :status, safe_point_ref = NULL, "
+            "terminal_reason = :reason_code, cleanup_status = :cleanup_status, "
+            "control_revision = control_revision + 1, updated_at = :now WHERE "
+            "run_ref = :run_ref"
+        ),
+        {
+            "status": managed_status,
+            "reason_code": terminal_reason,
+            "cleanup_status": cleanup_status,
+            "now": now,
+            "run_ref": run.run_ref,
+        },
+    )
+
+
+def _sync_writing_managed_attempt(
+    connection,
+    *,
+    run_ref: str,
+    old_attempt_ref: str,
+    old_fence_ref: str,
+    new_attempt_ref: str,
+    new_fence_ref: str,
+    root_session_ref: str,
+    preserve_cleanup: bool,
+    now: float,
+) -> None:
+    control = connection.execute(
+        text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+        {"run_ref": run_ref},
+    ).first()
+    if (
+        control is None
+        or control.run_kind != "writing"
+        or control.attempt_ref != old_attempt_ref
+        or control.fence_ref != old_fence_ref
+        or control.root_session_ref != root_session_ref
+    ):
+        raise OwnerConflict("writing_runtime_control_integrity_invalid")
+    if control.cleanup_status == "pending" and not preserve_cleanup:
+        raise OwnerConflict("runtime_quiescence_pending")
+    cleanup_status = (
+        "pending"
+        if preserve_cleanup and control.cleanup_status == "pending"
+        else "none"
+    )
+    connection.execute(
+        text(
+            "UPDATE ar_run_controls SET status = 'running', attempt_ref = "
+            ":attempt_ref, root_session_ref = :root_session_ref, fence_ref = "
+            ":fence_ref, safe_point_ref = NULL, terminal_reason = NULL, "
+            "cleanup_status = :cleanup_status, control_revision = "
+            "control_revision + 1, updated_at = :now WHERE run_ref = :run_ref"
+        ),
+        {
+            "attempt_ref": new_attempt_ref,
+            "root_session_ref": root_session_ref,
+            "fence_ref": new_fence_ref,
+            "cleanup_status": cleanup_status,
+            "now": now,
+            "run_ref": run_ref,
+        },
+    )
+
+
 def _current_writing_run_row(connection, run_ref: str, attempt_ref: str, fence_ref: str):
     row = connection.execute(
         text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
@@ -14126,6 +14428,7 @@ def _current_writing_run_row(connection, run_ref: str, attempt_ref: str, fence_r
         or attempt.status not in {"admitted", "running", "completed"}
     ):
         raise OwnerConflict("writing_fence_stale")
+    _assert_runtime_control_allows(connection, run_ref, fence_ref)
     return row
 
 
@@ -15068,7 +15371,14 @@ def _prepared_control_affects_run(connection, run_ref: str) -> bool:
 
 
 def _provider_quiescence_requested(connection, run_ref: str) -> bool:
-    return any(
+    control_cleanup_pending = connection.execute(
+        text(
+            "SELECT 1 FROM ar_run_controls WHERE run_ref = :run_ref AND "
+            "cleanup_status = 'pending'"
+        ),
+        {"run_ref": run_ref},
+    ).first()
+    return control_cleanup_pending is not None or any(
         reservation.action in {"pause", "prune"}
         or (
             reservation.action == "normal_switch"
@@ -15369,6 +15679,15 @@ def _provider_operation_for_unit(connection, *, unit_ref: str, run_ref: str) -> 
             text(
                 "SELECT provider_operation_ref FROM ar_experiment_runs WHERE run_ref = "
                 ":run_ref"
+            ),
+            {"run_ref": run_ref},
+        ).scalar_one_or_none()
+    elif control is not None and control.run_kind == "writing":
+        operation_ref = connection.execute(
+            text(
+                "SELECT attempts.provider_job_ref FROM ar_writing_runs runs JOIN "
+                "ar_writing_attempts attempts ON attempts.attempt_ref = "
+                "runs.attempt_ref WHERE runs.run_ref = :run_ref"
             ),
             {"run_ref": run_ref},
         ).scalar_one_or_none()

@@ -277,6 +277,10 @@ def build_production_runtime(
         experiment_provider,
         unit_kinds=("experiment",),
     )
+    agent_runtime.bind_provider_quiescence_driver(
+        writing_skill_provider,
+        unit_kinds=("writing_primary", "writing_review"),
+    )
     research_graph = create_research_graph_interface(
         database=database,
         feed=feed,

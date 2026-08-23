@@ -7,6 +7,8 @@ Create Date: 2026-08-23
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import sqlalchemy as sa
 from alembic import op
 
@@ -21,7 +23,71 @@ def _hash(name: str) -> sa.CheckConstraint:
     return sa.CheckConstraint(f"length({name}) = 64")
 
 
+def _copy_rows(source: str, target: str, columns: Sequence[str]) -> None:
+    column_list = ", ".join(columns)
+    op.execute(
+        f"INSERT INTO {target} ({column_list}) SELECT {column_list} FROM {source}"
+    )
+
+
+def _replace_provider_units() -> None:
+    """Extend the shared provider registry without losing 0014 control truth."""
+
+    source = "ar_provider_units"
+    backup = "ar_provider_units_pre_writing"
+    columns = (
+        "unit_ref",
+        "operation_ref",
+        "run_ref",
+        "attempt_ref",
+        "fence_ref",
+        "unit_kind",
+        "status",
+        "started_at",
+        "completed_at",
+    )
+    connection = op.get_bind()
+    connection.exec_driver_sql("PRAGMA legacy_alter_table=ON")
+    try:
+        op.rename_table(source, backup)
+        op.create_table(
+            source,
+            sa.Column("unit_ref", sa.String(length=96), primary_key=True),
+            sa.Column("operation_ref", sa.String(length=128), nullable=False),
+            sa.Column("run_ref", sa.String(length=96), nullable=False),
+            sa.Column("attempt_ref", sa.String(length=96), nullable=True),
+            sa.Column("fence_ref", sa.String(length=96), nullable=True),
+            sa.Column("unit_kind", sa.String(length=32), nullable=False),
+            sa.Column("status", sa.String(length=16), nullable=False),
+            sa.Column("started_at", sa.Float(), nullable=False),
+            sa.Column("completed_at", sa.Float(), nullable=True),
+            sa.ForeignKeyConstraint(["run_ref"], ["ar_run_controls.run_ref"]),
+            sa.CheckConstraint(
+                "unit_kind IN ('idea_primary', 'idea_review', 'plan_primary', "
+                "'plan_review', 'bundle_primary', 'bundle_review', 'deepfetch', "
+                "'experiment', 'writing_primary', 'writing_review')"
+            ),
+            sa.CheckConstraint(
+                "status IN ('active', 'revocation_pending', 'completed', 'revoked')"
+            ),
+            sa.CheckConstraint(
+                "(status IN ('active', 'revocation_pending') AND completed_at IS NULL) OR "
+                "(status IN ('completed', 'revoked') AND completed_at IS NOT NULL)"
+            ),
+        )
+        _copy_rows(backup, source, columns)
+        op.drop_table(backup)
+        op.create_index(
+            "ix_ar_provider_units_active",
+            source,
+            ["run_ref", "status"],
+        )
+    finally:
+        connection.exec_driver_sql("PRAGMA legacy_alter_table=OFF")
+
+
 def upgrade() -> None:
+    _replace_provider_units()
     for name in (
         "writing_run_count",
         "writing_attempt_count",
