@@ -34,10 +34,12 @@ from meta_research.provider_supervisor import (
     SUPERVISOR_REQUEST_SCHEMA,
     ensure_transport_key,
     read_transport_key_for_operation,
+    read_transport_envelope,
     read_verified_exit_receipt,
     transport_key_hash,
     write_exit_receipt,
     write_supervisor_request,
+    write_supervisor_stop_request,
 )
 from meta_research.quest_drafting import (
     PROVIDER_RESULT_MAX_BYTES,
@@ -256,6 +258,9 @@ class CodexIdeaSkillAdapter:
     It has no Owner Interface and cannot create receipts or advance a Stage.
     """
 
+    _sandbox_mode = "danger-full-access"
+    _shell_environment_inherit: str | None = None
+
     def __init__(
         self,
         workspace: Path,
@@ -283,9 +288,39 @@ class CodexIdeaSkillAdapter:
             request_stop()
 
     def cancel_job(self, job_ref: str) -> None:
+        self._request_durable_job_stop(job_ref)
         cancel_job = getattr(self._runner, "cancel_job", None)
         if callable(cancel_job):
             cancel_job(job_ref)
+
+    def _request_durable_job_stop(self, job_ref: str) -> None:
+        operation_root = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": job_ref})
+        )
+        if not operation_root.exists():
+            return
+        try:
+            _key_path, transport_key = self._transport_key()
+            for directory in operation_root.iterdir():
+                invocation_path = directory / "invocation.json"
+                if not directory.is_dir() or not invocation_path.is_file():
+                    continue
+                invocation = read_transport_envelope(
+                    invocation_path, transport_key
+                )
+                if invocation.get("job_ref") != job_ref:
+                    raise ProviderSupervisorError(
+                        "provider_supervisor_stop_invalid"
+                    )
+                write_supervisor_stop_request(
+                    directory / "supervisor-stop.json",
+                    key=transport_key,
+                    invocation_hash=canonical_hash(invocation),
+                )
+        except (OSError, ProviderSupervisorError) as error:
+            raise IdeaSkillUnavailable("codex_operation_spool_invalid") from error
 
     def finish_job(self, job_ref: str) -> None:
         finish_job = getattr(self._runner, "finish_job", None)
@@ -652,36 +687,44 @@ class CodexIdeaSkillAdapter:
         else:
             _write_durable(schema_path, schema_json)
         argv = [
-                self._executable,
-                "exec",
-                "--enable",
-                "multi_agent",
-                "--skip-git-repo-check",
-                "--ignore-user-config",
-                "--ignore-rules",
-                "--strict-config",
-                "--config",
-                "mcp_servers={}",
-                "--config",
-                'approval_policy="never"',
-                "--config",
-                'web_search="live"',
-                *(
-                    value
-                    for feature in _DISABLED_CODEX_FEATURES
-                    for value in ("--disable", feature)
-                ),
-                "--sandbox",
-                "danger-full-access",
-                "--model",
-                self._model_ref,
-                "--cd",
-                str(self._agent_workspace),
-                "--json",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(result_path),
+            self._executable,
+            "exec",
+            "--enable",
+            "multi_agent",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
+            "--config",
+            "mcp_servers={}",
+            "--config",
+            'approval_policy="never"',
+            "--config",
+            'web_search="live"',
+            *(
+                (
+                    "--config",
+                    "shell_environment_policy.inherit=\"none\"",
+                )
+                if self._shell_environment_inherit == "none"
+                else ()
+            ),
+            *(
+                value
+                for feature in _DISABLED_CODEX_FEATURES
+                for value in ("--disable", feature)
+            ),
+            "--sandbox",
+            self._sandbox_mode,
+            "--model",
+            self._model_ref,
+            "--cd",
+            str(self._agent_workspace),
+            "--json",
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(result_path),
         ]
         if native_session_ref is None:
             argv.append("-")
@@ -728,6 +771,9 @@ class CodexIdeaSkillAdapter:
                                 ),
                                 "receipt_path": str(
                                     directory / "supervisor-exit.json"
+                                ),
+                                "stop_path": str(
+                                    directory / "supervisor-stop.json"
                                 ),
                             },
                             transport_key,
@@ -1085,7 +1131,8 @@ def _verify_child_review_trace(
     *,
     root_session_ref: str,
     reviewer_agent_ref: str,
-) -> None:
+    expected_spawn_prompt: str | None = None,
+) -> str | None:
     successful_calls: dict[str, list[dict[str, object]]] = {
         "spawn_agent": [],
         "wait": [],
@@ -1135,11 +1182,17 @@ def _verify_child_review_trace(
         raise IdeaSkillUnavailable("codex_child_review_spawn_invalid")
     if reviewer_agent_ref != spawned_child_ref:
         raise IdeaSkillUnavailable("codex_child_review_ref_mismatch")
+    if (
+        expected_spawn_prompt is not None
+        and spawn.get("prompt") != expected_spawn_prompt
+    ):
+        raise IdeaSkillUnavailable("codex_child_review_task_mismatch")
 
     wait_calls = successful_calls["wait"]
     if not wait_calls:
         raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
     terminal_wait_seen = False
+    terminal_message: str | None = None
     for wait in wait_calls:
         wait_receivers = wait.get("receiver_thread_ids")
         wait_states = wait.get("agents_states")
@@ -1161,8 +1214,22 @@ def _verify_child_review_trace(
             raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
         if completed_state.get("status") == "completed":
             terminal_wait_seen = True
+            message = completed_state.get("message")
+            if message is not None:
+                if not isinstance(message, str) or not message.strip():
+                    raise IdeaSkillUnavailable(
+                        "codex_child_review_wait_invalid"
+                    )
+                if terminal_message is not None and terminal_message != message:
+                    raise IdeaSkillUnavailable(
+                        "codex_child_review_wait_invalid"
+                    )
+                terminal_message = message
     if not terminal_wait_seen:
         raise IdeaSkillUnavailable("codex_child_review_wait_invalid")
+    if expected_spawn_prompt is not None and terminal_message is None:
+        raise IdeaSkillUnavailable("codex_child_review_result_missing")
+    return terminal_message
 
 
 def _write_completed_operation(

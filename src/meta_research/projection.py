@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from meta_research.experiment import ExperimentService
     from meta_research.idea_stage import IdeaStageWorker
     from meta_research.plan_stage import PlanStageWorker
+    from meta_research.writing import WritingReportService
 
 
 _MAX_SNAPSHOT_ATTEMPTS = 3
@@ -49,6 +50,7 @@ class PublicProjection:
         idea_stage: IdeaStageWorker | None = None,
         plan_stage: PlanStageWorker | None = None,
         experiment: ExperimentService | None = None,
+        writing: WritingReportService | None = None,
     ) -> None:
         self._feed = feed
         self._object_store = object_store
@@ -60,6 +62,7 @@ class PublicProjection:
         self._idea_stage = idea_stage
         self._plan_stage = plan_stage
         self._experiment = experiment
+        self._writing = writing
         self._interfaces = {
             "research_graph": research_graph,
             "advancement_engine": advancement_engine,
@@ -113,6 +116,16 @@ class PublicProjection:
                 None
                 if self._idea_stage is None
                 else self._idea_stage.query_current_question()
+            )
+            writing = (
+                {
+                    "status": "unavailable",
+                    "document_types": ["report"],
+                    "runs": [],
+                    "reason": {"code": "writing_capability_not_configured"},
+                }
+                if self._writing is None
+                else self._writing.query_overview()
             )
             question_tree_items: list[dict[str, object]] = []
             question_tree_reason: dict[str, str] | None = None
@@ -365,6 +378,7 @@ class PublicProjection:
                 "status": "idle" if current_experiment is None else "active",
                 "current": current_experiment,
             },
+            "writing": writing,
             "unavailable": _release_capabilities(),
         }
         if idea_stage is not None:
@@ -620,6 +634,5 @@ def _release_capabilities() -> list[dict[str, object]]:
         }
         for capability in (
             "stage_execution",
-            "writing",
         )
     ]

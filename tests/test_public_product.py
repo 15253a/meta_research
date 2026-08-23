@@ -104,8 +104,9 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "quest_drafting_worker",
             "first_question_deepfetch_worker",
             "quest_reconciliation_worker",
-            "experiment_worker",
-        }
+                "experiment_worker",
+                "writing_worker",
+            }
         assert snapshot["research_space"] == {
             "status": "empty",
             "quest_count": 0,

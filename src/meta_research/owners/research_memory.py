@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 import threading
@@ -15,8 +16,9 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Literal, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
+from pypdf import PdfReader
 from sqlalchemy import text
 
 from meta_research.database import Database
@@ -99,6 +101,7 @@ ASSET_HISTORY_QUERY_MAX_PAGE_SIZE = 100
 MAX_ACTIVE_ASSET_HOLDS_PER_VERSION = 20
 MAX_PENDING_ASSET_INTAKES = 32
 MAX_PENDING_ASSET_REQUEST_BYTES = 256 * 1024 * 1024
+MAX_WRITING_CITATION_EXCERPT_CHARS = 1_000_000
 ASSET_HASH_CHUNK_BYTES = 1024 * 1024
 ASSET_CUSTODY_RECEIPT_KIND = "asset_custody_handoff"
 ASSET_HOLD_PLACED_RECEIPT_KIND = "asset_hold_placed"
@@ -113,6 +116,10 @@ TRANSIENT_ASSET_INTAKE_CONFLICTS = {
     "asset_source_unavailable",
     "asset_source_changed_during_intake",
 }
+_WRITING_BARE_LOCATOR = re.compile(r"(line|page):([1-9][0-9]{0,8})\Z")
+_WRITING_PATH_LOCATOR = re.compile(
+    r"path:([^#]+)#(line|page):([1-9][0-9]{0,8})\Z"
+)
 QUESTION_FIELDS = tuple(QUESTION_FIELD_MAX_LENGTHS)
 REQUIRED_QUESTION_FIELDS = QUESTION_FIELDS[:4]
 _PSEUDO_QUESTION_VALUES = {
@@ -556,7 +563,11 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     def query_projection_snapshot(self) -> OwnerSnapshot: ...
 
     def submit_asset_intake(
-        self, request: AssetIntakeRequest, *, idempotency_key: str
+        self,
+        request: AssetIntakeRequest,
+        *,
+        idempotency_key: str,
+        operation_namespace: str | None = None,
     ) -> AssetIntakeResult: ...
 
     def process_asset_intake_once(self) -> bool: ...
@@ -566,7 +577,11 @@ class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     def query_asset_intake(self, job_ref: str) -> AssetIntakeResult: ...
 
     def query_asset_intake_by_idempotency_key(
-        self, idempotency_key: str, request: AssetIntakeRequest
+        self,
+        idempotency_key: str,
+        request: AssetIntakeRequest,
+        *,
+        operation_namespace: str | None = None,
     ) -> AssetIntakeResult | None: ...
 
     def query_asset_version(
@@ -1252,6 +1267,213 @@ class SQLiteResearchMemoryReceiptVerifier:
         if integrity != "verified" or availability != "available":
             raise OwnerConflict("asset_custody_unavailable")
 
+    def verify_writing_deliverable(
+        self,
+        *,
+        binding: AcceptedAssetBinding,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        quest_ref: str,
+        snapshot_ref: str,
+        snapshot_hash: str,
+        allowed_source_version_refs: tuple[str, ...],
+        final_markdown_hash: str,
+        citations_hash: str,
+        execution_receipt: AcceptanceReceipt,
+        require_current: bool = True,
+    ) -> str:
+        verify_asset = (
+            self.verify_asset_binding
+            if require_current
+            else self.verify_asset_receipt
+        )
+        verify_asset(
+            asset_ref=binding.asset_ref,
+            version_ref=binding.version_ref,
+            content_hash=binding.content_hash,
+            manifest_hash=binding.manifest_hash,
+            receipt=binding.receipt,
+        )
+        if self._execution_verifier is None:
+            raise OwnerConflict("writing_execution_verifier_unavailable")
+        execution = self._execution_verifier.verify_writing_execution_receipt(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            final_markdown_hash=final_markdown_hash,
+            citations_hash=citations_hash,
+            receipt=execution_receipt,
+            quest_ref=quest_ref,
+            snapshot_ref=snapshot_ref,
+            snapshot_hash=snapshot_hash,
+            allowed_source_version_refs=allowed_source_version_refs,
+            require_current=require_current,
+            require_authorized=require_current,
+        )
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_asset_versions WHERE version_ref = "
+                    ":version_ref"
+                ),
+                {"version_ref": binding.version_ref},
+            ).first()
+            custodies = connection.execute(
+                text(
+                    "SELECT * FROM rm_asset_custodies WHERE version_ref = "
+                    ":version_ref ORDER BY custody_mode"
+                ),
+                {"version_ref": binding.version_ref},
+            ).all()
+        if row is None or row.media_type != "text/markdown; charset=utf-8":
+            raise OwnerConflict("writing_deliverable_invalid")
+        manifest, provenance = _verify_asset_metadata(
+            row, custodies, require_portable_paths=True
+        )
+        entries = manifest.get("entries")
+        if (
+            manifest.get("kind") != "file"
+            or not isinstance(entries, list)
+            or len(entries) != 1
+            or not isinstance(entries[0], dict)
+        ):
+            raise OwnerConflict("writing_deliverable_invalid")
+        historical_markdown = execution.get("final_markdown")
+        if not isinstance(historical_markdown, str):
+            raise OwnerConflict("writing_deliverable_execution_mismatch")
+        if require_current:
+            content = _materialized_entry_content(
+                self._object_store, row, custodies, manifest, entries[0]
+            )
+            try:
+                markdown = content.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise OwnerConflict("writing_deliverable_invalid") from error
+        else:
+            # Historical acceptance is an immutable receipt/metadata fact. AR
+            # retains the exact accepted Markdown in its signed execution row,
+            # so a later custody outage must not erase the RG decision ledger.
+            markdown = historical_markdown
+            content = markdown.encode("utf-8")
+        expected_provenance = {
+            "schema_ref": "meta-research/writing-deliverable-provenance/v1",
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "fence_ref": fence_ref,
+            "quest_ref": quest_ref,
+            "snapshot_ref": snapshot_ref,
+            "snapshot_hash": snapshot_hash,
+            "final_markdown_hash": final_markdown_hash,
+            "citations_hash": citations_hash,
+            "execution_receipt": execution_receipt.as_public_dict(),
+            "predecessor_version_ref": provenance.get(
+                "predecessor_version_ref"
+            ),
+            "source_kind": "text",
+        }
+        if (
+            provenance != expected_provenance
+            or historical_markdown != markdown
+            or hashlib.sha256(content).hexdigest() != row.content_hash
+            or int(entries[0]["size"]) != len(content)
+            or _writing_deliverable_markdown_hash(markdown) != final_markdown_hash
+        ):
+            raise OwnerConflict("writing_deliverable_execution_mismatch")
+        return markdown
+
+    def verify_writing_source_locator(
+        self, *, version_ref: str, locator: str
+    ) -> str:
+        parsed = _parse_writing_source_locator(locator)
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rm_asset_versions WHERE version_ref = "
+                    ":version_ref"
+                ),
+                {"version_ref": version_ref},
+            ).first()
+            custodies = connection.execute(
+                text(
+                    "SELECT * FROM rm_asset_custodies WHERE version_ref = "
+                    ":version_ref ORDER BY custody_mode"
+                ),
+                {"version_ref": version_ref},
+            ).all()
+        if row is None:
+            raise OwnerConflict("writing_citation_source_unaccepted")
+        manifest, _provenance = _verify_asset_metadata(
+            row, custodies, require_portable_paths=True
+        )
+        entries = manifest.get("entries")
+        if (
+            not isinstance(entries, list)
+            or not entries
+            or not all(isinstance(entry, dict) for entry in entries)
+        ):
+            raise OwnerConflict("writing_citation_locator_unverifiable")
+        kind, entry_path, ordinal = parsed
+        if manifest.get("kind") == "file":
+            if entry_path is not None or len(entries) != 1:
+                raise OwnerConflict("writing_citation_locator_unverifiable")
+            entry = entries[0]
+        elif manifest.get("kind") == "directory":
+            if entry_path is None:
+                raise OwnerConflict("writing_citation_locator_unverifiable")
+            entry = next(
+                (
+                    candidate
+                    for candidate in entries
+                    if candidate.get("path") == entry_path
+                ),
+                None,
+            )
+            if entry is None:
+                raise OwnerConflict("writing_citation_locator_unverifiable")
+        else:
+            raise OwnerConflict("writing_citation_locator_unverifiable")
+        content = _materialized_entry_content(
+            self._object_store, row, custodies, manifest, entry
+        )
+        path = str(entry.get("path", ""))
+        is_pdf = (
+            row.media_type.casefold() == "application/pdf"
+            or path.casefold().endswith(".pdf")
+        )
+        if kind == "page":
+            if not is_pdf:
+                raise OwnerConflict("writing_citation_locator_unverifiable")
+            try:
+                reader = PdfReader(io.BytesIO(content))
+                if ordinal > len(reader.pages):
+                    raise OwnerConflict("writing_citation_locator_unverifiable")
+                excerpt = reader.pages[ordinal - 1].extract_text() or ""
+            except OwnerConflict:
+                raise
+            except Exception as error:
+                raise OwnerConflict(
+                    "writing_citation_locator_unverifiable"
+                ) from error
+            if (
+                not excerpt.strip()
+                or len(excerpt) > MAX_WRITING_CITATION_EXCERPT_CHARS
+            ):
+                raise OwnerConflict("writing_citation_locator_unverifiable")
+            return excerpt
+        if is_pdf:
+            raise OwnerConflict("writing_citation_locator_unverifiable")
+        try:
+            lines = content.decode("utf-8").splitlines()
+        except UnicodeDecodeError as error:
+            raise OwnerConflict("writing_citation_locator_unverifiable") from error
+        if ordinal > len(lines):
+            raise OwnerConflict("writing_citation_locator_unverifiable")
+        excerpt = lines[ordinal - 1]
+        if len(excerpt) > MAX_WRITING_CITATION_EXCERPT_CHARS:
+            raise OwnerConflict("writing_citation_locator_unverifiable")
+        return excerpt
+
     def verify_plan_evidence_binding(
         self,
         *,
@@ -1345,13 +1567,28 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
             )
 
     def submit_asset_intake(
-        self, request: AssetIntakeRequest, *, idempotency_key: str
+        self,
+        request: AssetIntakeRequest,
+        *,
+        idempotency_key: str,
+        operation_namespace: str | None = None,
     ) -> AssetIntakeResult:
         if not idempotency_key or len(idempotency_key) > 128:
             raise OwnerConflict("asset_intake_idempotency_key_invalid")
         request_document = _asset_request_document(request)
         request_json = canonical_json(request_document)
         request_hash = canonical_hash(request_document)
+        provenance = request_document.get("provenance")
+        is_writing_deliverable = (
+            isinstance(provenance, dict)
+            and provenance.get("schema_ref")
+            == "meta-research/writing-deliverable-provenance/v1"
+        )
+        idempotency_key = _asset_intake_storage_key(
+            idempotency_key,
+            request_document,
+            operation_namespace=operation_namespace,
+        )
         requested_asset_ref = request_document.get("asset_ref")
         if requested_asset_ref is not None:
             with self._database.read() as connection:
@@ -1365,6 +1602,8 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 raise OwnerConflict("asset_not_found")
         sync_claimed = False
         with self._database.write() as connection:
+            if is_writing_deliverable:
+                self._verify_writing_intake_current(request_document)
             existing = connection.execute(
                 text(
                     "SELECT * FROM rm_asset_intakes WHERE idempotency_key = "
@@ -1754,6 +1993,75 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                     },
                 )
 
+    def _verify_writing_intake_current(
+        self, request: dict[str, object]
+    ) -> None:
+        provenance = request.get("provenance")
+        if self._execution_verifier is None or not isinstance(provenance, dict):
+            raise OwnerConflict("writing_deliverable_provenance_invalid")
+        required = {
+            "schema_ref",
+            "run_ref",
+            "attempt_ref",
+            "fence_ref",
+            "quest_ref",
+            "snapshot_ref",
+            "snapshot_hash",
+            "final_markdown_hash",
+            "citations_hash",
+            "execution_receipt",
+            "predecessor_version_ref",
+        }
+        if (
+            set(provenance) != required
+            or request.get("source_kind") != "text"
+            or request.get("custody_mode") != "managed"
+            or request.get("media_type") != "text/markdown; charset=utf-8"
+            or bool(request.get("asynchronous"))
+        ):
+            raise OwnerConflict("writing_deliverable_provenance_invalid")
+        receipt = _writing_receipt_from_value(provenance.get("execution_receipt"))
+        values = {}
+        for field in (
+            "run_ref",
+            "attempt_ref",
+            "fence_ref",
+            "quest_ref",
+            "snapshot_ref",
+            "snapshot_hash",
+            "final_markdown_hash",
+            "citations_hash",
+        ):
+            value = provenance.get(field)
+            if not isinstance(value, str) or not value:
+                raise OwnerConflict("writing_deliverable_provenance_invalid")
+            values[field] = value
+        execution = self._execution_verifier.verify_writing_execution_receipt(
+            run_ref=values["run_ref"],
+            attempt_ref=values["attempt_ref"],
+            fence_ref=values["fence_ref"],
+            quest_ref=values["quest_ref"],
+            snapshot_ref=values["snapshot_ref"],
+            snapshot_hash=values["snapshot_hash"],
+            final_markdown_hash=values["final_markdown_hash"],
+            citations_hash=values["citations_hash"],
+            receipt=receipt,
+            require_current=True,
+            require_authorized=True,
+        )
+        encoded = request.get("content_base64")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+            markdown = content.decode("utf-8")
+        except (TypeError, ValueError, UnicodeDecodeError) as error:
+            raise OwnerConflict("writing_deliverable_invalid") from error
+        if (
+            execution.get("final_markdown") != markdown
+            or _writing_deliverable_markdown_hash(markdown)
+            != values["final_markdown_hash"]
+        ):
+            raise OwnerConflict("writing_deliverable_execution_mismatch")
+
     def _prepare_asset(self, request: dict[str, object]) -> _PreparedAsset:
         source_kind = request.get("source_kind")
         custody_mode = request.get("custody_mode")
@@ -1948,6 +2256,16 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
                 return
             if job.status != "processing":
                 raise OwnerConflict("asset_intake_not_claimed")
+            provenance_input = request.get("provenance")
+            if (
+                isinstance(provenance_input, dict)
+                and provenance_input.get("schema_ref")
+                == "meta-research/writing-deliverable-provenance/v1"
+            ):
+                # This is the final RM commit boundary. Requiring the exact
+                # active Attempt/Fence and current authorization here makes a
+                # concurrent pause/cancel/revoke a true barrier.
+                self._verify_writing_intake_current(request)
             requested_asset_ref = request.get("asset_ref")
             if requested_asset_ref is None:
                 asset_ref = new_ref("asset")
@@ -2206,9 +2524,19 @@ class SQLiteResearchMemory(HumanRequestOwnerMixin):
         )
 
     def query_asset_intake_by_idempotency_key(
-        self, idempotency_key: str, request: AssetIntakeRequest
+        self,
+        idempotency_key: str,
+        request: AssetIntakeRequest,
+        *,
+        operation_namespace: str | None = None,
     ) -> AssetIntakeResult | None:
-        request_hash = canonical_hash(_asset_request_document(request))
+        request_document = _asset_request_document(request)
+        request_hash = canonical_hash(request_document)
+        idempotency_key = _asset_intake_storage_key(
+            idempotency_key,
+            request_document,
+            operation_namespace=operation_namespace,
+        )
         with self._database.read() as connection:
             row = connection.execute(
                 text(
@@ -6147,6 +6475,31 @@ def _valid_portable_asset_path(value: str) -> bool:
     )
 
 
+def _parse_writing_source_locator(
+    value: object,
+) -> tuple[str, str | None, int]:
+    if not isinstance(value, str) or len(value) > 2000:
+        raise OwnerConflict("writing_citation_locator_unverifiable")
+    bare = _WRITING_BARE_LOCATOR.fullmatch(value)
+    if bare is not None:
+        return bare.group(1), None, int(bare.group(2))
+    located = _WRITING_PATH_LOCATOR.fullmatch(value)
+    if located is None:
+        raise OwnerConflict("writing_citation_locator_unverifiable")
+    encoded_path = located.group(1)
+    try:
+        path = unquote(encoded_path, encoding="utf-8", errors="strict")
+    except (UnicodeDecodeError, UnicodeEncodeError) as error:
+        raise OwnerConflict("writing_citation_locator_unverifiable") from error
+    if (
+        not _valid_portable_asset_path(path)
+        or quote(path, safe="/-._~", encoding="utf-8", errors="strict")
+        != encoded_path
+    ):
+        raise OwnerConflict("writing_citation_locator_unverifiable")
+    return located.group(2), path, int(located.group(3))
+
+
 def _valid_portable_asset_component(value: str) -> bool:
     reserved = {
         "CON",
@@ -7010,6 +7363,69 @@ def _materialized_entry_content(
         except (OSError, OwnerConflict):
             continue
     raise OwnerConflict("asset_custody_unavailable")
+
+
+def _writing_deliverable_markdown_hash(markdown: str) -> str:
+    if not isinstance(markdown, str) or not markdown.strip():
+        raise OwnerConflict("writing_deliverable_invalid")
+    return canonical_hash(
+        {"media_type": "text/markdown; charset=utf-8", "content": markdown}
+    )
+
+
+def _asset_intake_storage_key(
+    caller_key: str,
+    request: dict[str, object],
+    *,
+    operation_namespace: str | None,
+) -> str:
+    provenance = request.get("provenance")
+    if operation_namespace == "writing_deliverable":
+        if (
+            not isinstance(provenance, dict)
+            or provenance.get("schema_ref")
+            != "meta-research/writing-deliverable-provenance/v1"
+        ):
+            raise OwnerConflict("writing_deliverable_provenance_invalid")
+        return "rm-writing:" + canonical_hash(
+            {
+                "caller_key": caller_key,
+                "run_ref": provenance.get("run_ref"),
+                "attempt_ref": provenance.get("attempt_ref"),
+            }
+        )
+    if operation_namespace is not None:
+        raise OwnerConflict("asset_intake_operation_namespace_invalid")
+    return caller_key
+
+
+def _writing_receipt_from_value(value: object) -> AcceptanceReceipt:
+    if not isinstance(value, dict) or set(value) != {
+        "status",
+        "issuer",
+        "kind",
+        "receipt_ref",
+        "subject_ref",
+        "payload_hash",
+    } or value.get("status") != "accepted":
+        raise OwnerConflict("writing_deliverable_provenance_invalid")
+    try:
+        receipt = AcceptanceReceipt(
+            issuer=str(value["issuer"]),
+            kind=str(value["kind"]),
+            receipt_ref=str(value["receipt_ref"]),
+            subject_ref=str(value["subject_ref"]),
+            payload_hash=str(value["payload_hash"]),
+        )
+    except KeyError as error:
+        raise OwnerConflict("writing_deliverable_provenance_invalid") from error
+    if (
+        receipt.issuer != "agent_runtime"
+        or receipt.kind != "writing_execution_completed"
+        or len(receipt.payload_hash) != 64
+    ):
+        raise OwnerConflict("writing_deliverable_provenance_invalid")
+    return receipt
 
 
 def _managed_asset_object_path(object_hash: str) -> str:

@@ -1412,6 +1412,56 @@ def test_graceful_stop_leaves_a_signed_provider_termination(
     assert forbidden_replay.calls == []
 
 
+def test_durable_job_cancel_survives_daemon_runner_replacement(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "supervisor-durable-cancel-provider"
+    executable = _fake_codex_executable(
+        tmp_path / "fake-codex-supervisor-durable-cancel",
+        read_all_input=True,
+        sleep_seconds=5,
+    )
+    job_ref = "idea-primary-operation:durable-cancel"
+    first = CodexIdeaSkillAdapter(
+        workspace,
+        executable=str(executable),
+        timeout_seconds=10,
+    )
+    request = _request(runtime_binding=first.runtime_binding(), job_ref=job_ref)
+    errors: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            first.generate_draft(request)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    deadline = time.monotonic() + 5
+    while not list(workspace.glob("provider-operations/*/primary/pid.json")):
+        if time.monotonic() >= deadline:
+            raise AssertionError("supervisor did not start")
+        time.sleep(0.01)
+
+    # This adapter has a fresh in-memory runner, as it would after daemon restart.
+    restarted = CodexIdeaSkillAdapter(
+        workspace,
+        executable=str(executable),
+        timeout_seconds=10,
+    )
+    restarted.cancel_job(job_ref)
+
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    operation = next(workspace.glob("provider-operations/*/primary"))
+    receipt = json.loads(
+        (operation / "supervisor-exit.json").read_text(encoding="utf-8")
+    )
+    assert receipt["payload"]["termination_reason"] == "stopped"
+
+
 def test_durable_supervisor_recovers_a_prelaunch_daemon_loss(
     tmp_path: Path,
 ) -> None:

@@ -67,6 +67,8 @@ from meta_research.quest_drafting import (
     NvidiaSmiProbe,
     ProposalDrafter,
 )
+from meta_research.writing import WritingReportService
+from meta_research.writing_skill import CodexWritingSkillAdapter, WritingSkillProvider
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,7 @@ class ProductionRuntime:
     plan_stage: PlanStageWorker
     deepfetch: FirstQuestionDeepFetchWorker
     experiment: ExperimentService
+    writing: WritingReportService
     _database: Database
     _provider_lifecycles: tuple[object, ...] = ()
     _stop_requested: bool = False
@@ -141,6 +144,7 @@ def build_production_runtime(
     deepfetch_provider: DeepFetchProvider | None = None,
     acquisition_provider: AcquisitionProvider | None = None,
     experiment_provider: ExperimentProvider | None = None,
+    writing_skill_provider: WritingSkillProvider | None = None,
 ) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
@@ -166,6 +170,9 @@ def build_production_runtime(
     experiment_provider = experiment_provider or BuiltinMicroExperimentProvider(
         data_root.run / "experiment-provider"
     )
+    writing_skill_provider = writing_skill_provider or CodexWritingSkillAdapter(
+        data_root.root / "writing-skill-provider"
+    )
 
     host_compute_reader = create_host_compute_observation_reader(database)
     human_response_verifier = create_human_response_verifier(database)
@@ -182,6 +189,7 @@ def build_production_runtime(
     attempt_receipts = create_agent_runtime_receipt_verifier(
         database=database,
         stage_request_verifier=stage_request_receipts,
+        writing_authorization_verifier=human_response_verifier,
     )
     research_memory_receipts = create_research_memory_receipt_verifier(
         database=database,
@@ -239,6 +247,7 @@ def build_production_runtime(
         human_response_verifier=human_response_verifier,
         plan_content_verifier=research_memory_receipts,
     )
+    agent_runtime.bind_writing_citation_verifier(research_graph_receipts)
     research_memory = create_research_memory_interface(
         database=database,
         object_store=data_root.objects,
@@ -315,6 +324,14 @@ def build_production_runtime(
         research_memory,
         experiment_provider,
     )
+    writing = WritingReportService(
+        research_graph,
+        advancement_engine,
+        research_memory,
+        agent_runtime,
+        human_collaboration,
+        writing_skill_provider,
+    )
     projection = PublicProjection(
         feed,
         data_root.objects,
@@ -326,6 +343,7 @@ def build_production_runtime(
         idea_stage=idea_stage,
         plan_stage=plan_stage,
         experiment=experiment,
+        writing=writing,
     )
     provider_lifecycles: list[object] = []
     for provider in (
@@ -336,6 +354,7 @@ def build_production_runtime(
         deepfetch_provider,
         acquisition_provider,
         experiment_provider,
+        writing_skill_provider,
     ):
         if callable(getattr(provider, "request_stop", None)) and not any(
             provider is lifecycle for lifecycle in provider_lifecycles
@@ -351,6 +370,7 @@ def build_production_runtime(
         plan_stage=plan_stage,
         deepfetch=deepfetch,
         experiment=experiment,
+        writing=writing,
         _database=database,
         _provider_lifecycles=tuple(provider_lifecycles),
     )

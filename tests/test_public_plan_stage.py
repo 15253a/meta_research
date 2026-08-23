@@ -512,6 +512,28 @@ def test_plan_stage_keeps_five_fact_layers_with_a_real_gap(
         )
         assert "bundle_run" not in committed
 
+        plan_run = runtime.owners.agent_runtime.query_plan_stage_run(
+            committed["stage_run_request"]["request_ref"]
+        )
+        assert plan_run is not None and plan_run.execution is not None
+        writing = runtime.writing.create_report_intent(
+            quest_ref=quest["quest_ref"],
+            title="Plan 后阶段报告",
+            audience="研究负责人",
+            purpose="验证 Writing Snapshot 接收 FormalPlan",
+            instructions="保留已接纳 Plan 的精确内容与 receipt。",
+            idempotency_key="plan-committed-writing-snapshot",
+        )
+        accepted_plan = writing["snapshot"]["advancement"]["stages"]["plan"][
+            "accepted"
+        ]
+        assert accepted_plan["commit_ref"] == committed["stage_commit"][
+            "commit_ref"
+        ]
+        assert accepted_plan["result"]["plan_document"] == (
+            plan_run.execution.outcome
+        )
+
         assert len(plan_skill.requests) == 1
         context = plan_skill.requests[0].context_pack
         assert context["accepted_question_binding"]["question_ref"] == (

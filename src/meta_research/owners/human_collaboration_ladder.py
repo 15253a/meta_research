@@ -25,6 +25,11 @@ from meta_research.quest_drafting import (
     IntentDraftingProvider,
     IntentTurnRequest,
 )
+from meta_research.writing_contract import (
+    WRITING_RESEARCH_SNAPSHOT_SCHEMA,
+    normalize_report_intent,
+    validate_writing_execution_budget,
+)
 
 
 HC_OWNER = "human_collaboration"
@@ -67,6 +72,8 @@ _HARD_COMMAND_KINDS = {
     "high_risk_operation",
     "capability_expansion",
     "capability_authorization",
+    "writing_report_start",
+    "writing_report_cancel",
 }
 _MAX_PENDING_COMPANION_TURNS = 64
 
@@ -165,11 +172,13 @@ class SQLiteHumanCollaborationLadder:
         feed: DurableFeed,
         drafting_provider: IntentDraftingProvider,
         context_resolver: Callable[[str], dict[str, object]] | None = None,
+        writing_snapshot_verifier: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._drafting_provider = drafting_provider
         self._context_resolver = context_resolver
+        self._writing_snapshot_verifier = writing_snapshot_verifier
         with self._database.write() as connection:
             recovered = connection.execute(
                 text(
@@ -1284,9 +1293,6 @@ class SQLiteHumanCollaborationLadder:
         )
         del intent
         payload = cast(dict[str, object], draft["payload"])
-        capability = cast(str, payload["capability"])
-        decision = cast(str, payload["decision"])
-        scope = cast(dict[str, object], payload["scope"])
         with self._database.read() as connection:
             authorization_count = int(
                 connection.execute(
@@ -1296,38 +1302,112 @@ class SQLiteHumanCollaborationLadder:
                     )
                 ).scalar_one()
             )
-        target_assertion = {
-            "owner": HC_OWNER,
-            "operation": "decide_capability_authorization",
-            "intent_id": intent_id,
-            "capability": capability,
-            "decision": decision,
-            "scope_hash": canonical_hash(scope),
-            "authorization_head": authorization_count,
-        }
-        owner_preview = {
-            "source_owner": HC_OWNER,
-            "target_assertion": target_assertion,
-            "will_happen": [
-                f"record an independent {decision} decision for {capability}"
-            ],
-            "will_not_happen": [
-                "confirmation alone will not grant the capability",
-                "no domain effect, Owner acceptance, Run, or Stage transition occurs",
-                "the authorization cannot exceed the system hard ceiling",
-            ],
-            "risks": [
-                "a grant may permit the exact high-risk capability inside its narrow scope"
-            ],
-            "stale_conditions": [
-                "the command draft changes",
-                "the capability authorization head changes",
-            ],
-        }
+        if draft["command_kind"] == "writing_report_start":
+            snapshot = cast(dict[str, object], payload["snapshot"])
+            if self._writing_snapshot_verifier is None:
+                raise OwnerConflict("writing_snapshot_verifier_unavailable")
+            self._writing_snapshot_verifier(snapshot)
+            target_assertion = {
+                "owner": HC_OWNER,
+                "operation": "start_writing_report",
+                "intent_id": intent_id,
+                "quest_ref": payload["quest_ref"],
+                "intent_hash": payload["intent_hash"],
+                "snapshot_ref": payload["snapshot_ref"],
+                "snapshot_hash": payload["snapshot_hash"],
+                "execution_budget_hash": canonical_hash(
+                    payload["execution_budget"]
+                ),
+                "authorization_head": authorization_count,
+            }
+            owner_preview = {
+                "source_owner": HC_OWNER,
+                "target_assertion": target_assertion,
+                "will_happen": [
+                    "记录精确的 report Writing Intent 与冻结研究 Snapshot",
+                    "确认后允许 Agent Runtime 建立独立 Writing Run",
+                ],
+                "will_not_happen": [
+                    "主 Quest Stage 不会被暂停或推进",
+                    "确认本身不会接受交付物、引用或渲染结果",
+                    "不会发布、发送或提交到外部系统",
+                ],
+                "risks": ["研究 Snapshot 变化后必须重新确认"],
+                "stale_conditions": [
+                    "Writing Intent 或冻结 Snapshot 发生变化",
+                    "Quest 的广义研究授权发生变化",
+                ],
+            }
+        elif draft["command_kind"] == "writing_report_cancel":
+            target_assertion = {
+                "owner": HC_OWNER,
+                "operation": "cancel_writing_report",
+                "intent_id": intent_id,
+                "quest_ref": payload["quest_ref"],
+                "run_ref": payload["run_ref"],
+                "attempt_ref": payload["attempt_ref"],
+                "fence_ref": payload["fence_ref"],
+                "effect": payload["effect"],
+                "authorization_head": authorization_count,
+            }
+            owner_preview = {
+                "source_owner": HC_OWNER,
+                "target_assertion": target_assertion,
+                "will_happen": [
+                    "终止这一 Writing Run 的当前 managed Session",
+                    "保留既有 checkpoint、版本、receipt 与审计历史",
+                ],
+                "will_not_happen": [
+                    "不会删除已接纳的 Research Memory 资产",
+                    "不会停止、取消或推进主 Quest",
+                    "不会发布、发送或提交到外部系统",
+                ],
+                "risks": ["Writing Run 进入终态后不能继续或再修订"],
+                "stale_conditions": [
+                    "Writing Run 的 current Attempt 或 Fence 发生变化",
+                    "Quest 的授权策略发生变化",
+                ],
+            }
+        else:
+            capability = cast(str, payload["capability"])
+            decision = cast(str, payload["decision"])
+            scope = cast(dict[str, object], payload["scope"])
+            target_assertion = {
+                "owner": HC_OWNER,
+                "operation": "decide_capability_authorization",
+                "intent_id": intent_id,
+                "capability": capability,
+                "decision": decision,
+                "scope_hash": canonical_hash(scope),
+                "authorization_head": authorization_count,
+            }
+            owner_preview = {
+                "source_owner": HC_OWNER,
+                "target_assertion": target_assertion,
+                "will_happen": [
+                    f"record an independent {decision} decision for {capability}"
+                ],
+                "will_not_happen": [
+                    "confirmation alone will not grant the capability",
+                    "no domain effect, Owner acceptance, Run, or Stage transition occurs",
+                    "the authorization cannot exceed the system hard ceiling",
+                ],
+                "risks": [
+                    "a grant may permit the exact high-risk capability inside its narrow scope"
+                ],
+                "stale_conditions": [
+                    "the command draft changes",
+                    "the capability authorization head changes",
+                ],
+            }
         owner_previews = [
             {**owner_preview, "digest": canonical_hash(owner_preview)}
         ]
         owner_revisions = {"human_collaboration": authorization_count}
+        if draft["command_kind"] == "writing_report_start":
+            owner_revisions.update(
+                cast(dict[str, int], snapshot["owner_revisions"])
+            )
         with self._database.write() as connection:
             replay = _collaboration_command(
                 connection, idempotency_key, "command_preview", command_hash
@@ -1427,8 +1507,16 @@ class SQLiteHumanCollaborationLadder:
                 "preview_hash": preview_hash,
             }
         )
+        with self._database.read() as connection:
+            replay = _collaboration_command(
+                connection, idempotency_key, "command_confirm", command_hash
+            )
+        if replay is not None:
+            return self.query_command(intent_id)
         try:
-            self._current_command(intent_id, draft_revision, draft_hash)
+            _intent, _draft_row, confirmed_draft = self._current_command(
+                intent_id, draft_revision, draft_hash
+            )
         except OwnerConflict as error:
             if error.code == "command_draft_stale":
                 raise OwnerConflict("command_preview_stale") from error
@@ -1464,7 +1552,19 @@ class SQLiteHumanCollaborationLadder:
                         )
                     ).scalar_one()
                 )
-                if owner_revisions != {"human_collaboration": authorization_count}:
+                expected_owner_revisions = {
+                    "human_collaboration": authorization_count
+                }
+                if confirmed_draft.get("command_kind") == "writing_report_start":
+                    payload = cast(dict[str, object], confirmed_draft["payload"])
+                    snapshot = cast(dict[str, object], payload["snapshot"])
+                    if self._writing_snapshot_verifier is None:
+                        raise OwnerConflict("writing_snapshot_verifier_unavailable")
+                    self._writing_snapshot_verifier(snapshot)
+                    expected_owner_revisions.update(
+                        cast(dict[str, int], snapshot["owner_revisions"])
+                    )
+                if owner_revisions != expected_owner_revisions:
                     raise OwnerConflict("command_preview_stale")
                 confirmation_ref = new_ref("human_confirmation")
                 receipt_hash = canonical_hash(
@@ -1667,25 +1767,111 @@ class SQLiteHumanCollaborationLadder:
             )
         return result
 
+    def query_command_by_idempotency_key(
+        self, idempotency_key: str, *, command_kind: str
+    ) -> dict[str, object] | None:
+        _idempotency_key(idempotency_key)
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT command_kind, result_ref FROM hc_collaboration_commands "
+                    "WHERE idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        if row is None:
+            return None
+        if row.command_kind != command_kind:
+            raise OwnerConflict("idempotency_conflict")
+        return self.query_command(str(row.result_ref))
+
+    def query_commands(self, *, command_kind: str) -> tuple[dict[str, object], ...]:
+        if command_kind not in {"writing_report_start", "writing_report_cancel"}:
+            raise OwnerConflict("command_kind_invalid")
+        with self._database.read() as connection:
+            refs = connection.execute(
+                text(
+                    "SELECT intents.intent_id FROM hc_command_intents AS intents "
+                    "JOIN hc_command_drafts AS drafts ON drafts.intent_id = "
+                    "intents.intent_id AND drafts.draft_revision = "
+                    "intents.current_revision WHERE json_extract("
+                    "drafts.draft_json, '$.command_kind') = :command_kind "
+                    "ORDER BY intents.created_at DESC, intents.intent_id DESC"
+                ),
+                {"command_kind": command_kind},
+            ).scalars().all()
+        commands = tuple(self.query_command(str(ref)) for ref in refs)
+        if any(
+            cast(dict[str, object], command["draft"]).get("command_kind")
+            != command_kind
+            for command in commands
+        ):
+            raise OwnerConflict("command_kind_integrity_invalid")
+        return commands
+
     def _validate_command(self, value: dict[str, object]) -> dict[str, object]:
         command = _document(value, "command_draft_invalid")
         if set(command) != {"command_kind", "payload"}:
             raise OwnerConflict("command_draft_invalid")
         if command["command_kind"] not in _HARD_COMMAND_KINDS:
             raise OwnerConflict("command_kind_not_confirmation_gated")
-        if command["command_kind"] != "capability_authorization":
-            raise OwnerConflict("command_target_unavailable")
         payload = command["payload"]
-        if not isinstance(payload, dict) or set(payload) != {
-            "capability",
-            "decision",
-            "scope",
-        }:
+        if not isinstance(payload, dict):
             raise OwnerConflict("command_payload_invalid")
-        _text(payload["capability"], "capability_required", 64)
-        if payload["decision"] not in {"granted", "denied", "revoked"}:
-            raise OwnerConflict("authorization_decision_invalid")
-        _document(payload["scope"], "authorization_scope_invalid")
+        if command["command_kind"] == "writing_report_start":
+            if set(payload) != {
+                "document_type",
+                "quest_ref",
+                "intent",
+                "intent_hash",
+                "snapshot",
+                "snapshot_ref",
+                "snapshot_hash",
+                "execution_budget",
+            }:
+                raise OwnerConflict("command_payload_invalid")
+            if payload["document_type"] != "report":
+                raise OwnerConflict("writing_document_type_invalid")
+            _scope_ref(payload["quest_ref"], "writing_quest_ref_invalid")
+            intent = _document(payload["intent"], "writing_intent_invalid")
+            if normalize_report_intent(intent) != intent:
+                raise OwnerConflict("writing_intent_invalid")
+            if canonical_hash(intent) != payload["intent_hash"]:
+                raise OwnerConflict("writing_intent_hash_mismatch")
+            snapshot = _document(payload["snapshot"], "writing_snapshot_invalid")
+            snapshot_without_hash = dict(snapshot)
+            embedded_hash = snapshot_without_hash.pop("snapshot_hash", None)
+            if (
+                snapshot.get("schema_ref") != WRITING_RESEARCH_SNAPSHOT_SCHEMA
+                or snapshot.get("quest_ref") != payload["quest_ref"]
+                or snapshot.get("snapshot_ref") != payload["snapshot_ref"]
+                or embedded_hash != payload["snapshot_hash"]
+                or canonical_hash(snapshot_without_hash) != payload["snapshot_hash"]
+            ):
+                raise OwnerConflict("writing_snapshot_hash_mismatch")
+            validate_writing_execution_budget(payload["execution_budget"])
+        elif command["command_kind"] == "writing_report_cancel":
+            if set(payload) != {
+                "quest_ref",
+                "run_ref",
+                "attempt_ref",
+                "fence_ref",
+                "effect",
+            }:
+                raise OwnerConflict("command_payload_invalid")
+            for field in ("quest_ref", "run_ref", "attempt_ref", "fence_ref"):
+                _scope_ref(payload[field], f"writing_cancel_{field}_invalid")
+            if payload["effect"] != "terminal_cancel_preserve_history":
+                raise OwnerConflict("writing_cancel_effect_invalid")
+        elif command["command_kind"] == "capability_authorization":
+            if set(payload) != {"capability", "decision", "scope"}:
+                raise OwnerConflict("command_payload_invalid")
+            _text(payload["capability"], "capability_required", 64)
+            if payload["decision"] not in {"granted", "denied", "revoked"}:
+                raise OwnerConflict("authorization_decision_invalid")
+            _document(payload["scope"], "authorization_scope_invalid")
+        else:
+            raise OwnerConflict("command_target_unavailable")
         _reject_secret_content(command)
         return command
 

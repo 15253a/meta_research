@@ -14,6 +14,7 @@ from meta_research.feed import DurableEvent, FeedPage
 from meta_research.paths import prepare_data_root
 from meta_research.web import (
     _AssetIOSingleFlight,
+    _PendingWorkerRetirement,
     ReconciliationHealth,
     WorkerHealthUpdates,
     _await_bounded_asset_io,
@@ -21,6 +22,7 @@ from meta_research.web import (
     _event_stream,
     _process_research_assets,
     _process_quest_drafting,
+    _process_writing,
     _reconcile_quest_initializations,
     create_app,
 )
@@ -216,6 +218,153 @@ def test_worker_and_route_watchdogs_do_not_swallow_operation_timeout_errors() ->
         assert not slots.locked()
 
     asyncio.run(exercise())
+
+
+def test_worker_watchdog_retires_the_stuck_claim_and_returns_to_the_queue() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    retired = threading.Event()
+
+    def never_returns_without_release() -> bool:
+        started.set()
+        release.wait(timeout=2)
+        return True
+
+    async def exercise() -> None:
+        health = ReconciliationHealth()
+        result = await _await_monitored_worker_call(
+            never_returns_without_release,
+            health=health,
+            timeout_code="writing_operation_timeout",
+            on_health_change=None,
+            on_timeout=retired.set,
+            timeout_seconds=0.03,
+        )
+
+        assert started.is_set()
+        assert retired.is_set()
+        assert result is False
+        assert health.status == "unavailable"
+        assert health.last_error == "writing_operation_timeout"
+        release.set()
+
+    asyncio.run(exercise())
+
+
+def test_worker_watchdog_does_not_wait_forever_for_a_stuck_retirement() -> None:
+    operation_started = threading.Event()
+    retirement_started = threading.Event()
+    release = threading.Event()
+
+    def stuck_operation() -> bool:
+        operation_started.set()
+        release.wait(timeout=2)
+        return True
+
+    def stuck_retirement() -> None:
+        retirement_started.set()
+        release.wait(timeout=2)
+
+    async def exercise() -> None:
+        health = ReconciliationHealth()
+        result = await asyncio.wait_for(
+            _await_monitored_worker_call(
+                stuck_operation,
+                health=health,
+                timeout_code="writing_operation_timeout",
+                on_health_change=None,
+                on_timeout=stuck_retirement,
+                timeout_seconds=0.02,
+            ),
+            timeout=0.15,
+        )
+        assert isinstance(result, _PendingWorkerRetirement)
+        assert operation_started.is_set()
+        assert retirement_started.is_set()
+        assert health.status == "unavailable"
+        assert health.last_error == "writing_operation_timeout"
+        release.set()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+
+
+def test_writing_worker_quarantines_an_unretired_claim_and_advances_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stuck_started = threading.Event()
+    later_completed = threading.Event()
+    release_operation = threading.Event()
+    release_retirement = threading.Event()
+    calls = {"stuck": 0, "later": 0}
+    stuck_claim = ("writing_run:stuck", "attempt:stuck", "fence:stuck")
+    later_claim = ("writing_run:later", "attempt:later", "fence:later")
+
+    class FakeWriting:
+        def next_runnable_claim(
+            self,
+            *,
+            excluded_claims: frozenset[tuple[str, str, str]] = frozenset(),
+        ) -> tuple[str, str, str] | None:
+            if stuck_claim not in excluded_claims:
+                return stuck_claim
+            if not later_completed.is_set() and later_claim not in excluded_claims:
+                return later_claim
+            return None
+
+        def process_once(
+            self,
+            *,
+            expected_run_ref: str,
+            expected_attempt_ref: str,
+            expected_fence_ref: str,
+        ) -> bool:
+            claim = (
+                expected_run_ref,
+                expected_attempt_ref,
+                expected_fence_ref,
+            )
+            if claim == stuck_claim:
+                calls["stuck"] += 1
+                stuck_started.set()
+                release_operation.wait(timeout=2)
+                return True
+            assert claim == later_claim
+            calls["later"] += 1
+            later_completed.set()
+            return True
+
+        def block_writing_claim(
+            self, *, run_ref: str, attempt_ref: str, fence_ref: str
+        ) -> None:
+            assert (run_ref, attempt_ref, fence_ref) == stuck_claim
+            release_retirement.wait(timeout=2)
+
+    runtime = SimpleNamespace(writing=FakeWriting())
+    health = ReconciliationHealth()
+    monkeypatch.setattr(
+        "meta_research.web.WRITING_WORKER_WATCHDOG_SECONDS", 0.02
+    )
+
+    async def exercise() -> None:
+        worker = asyncio.create_task(_process_writing(runtime, health))
+        assert await asyncio.to_thread(stuck_started.wait, 0.5)
+        assert await asyncio.to_thread(later_completed.wait, 0.5)
+        await asyncio.sleep(0.08)
+        assert calls == {"stuck": 1, "later": 1}
+        assert health.status == "unavailable"
+        assert health.last_error == "writing_claim_retirement_pending"
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_operation.set()
+        release_retirement.set()
 
 
 def test_reconciliation_worker_is_non_blocking_and_recovers_after_io_failure() -> None:

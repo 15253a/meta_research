@@ -957,6 +957,7 @@ class CodexDeepFetchAdapter:
                         "ready_path": str(directory / "supervisor-ready.json"),
                         "started_path": str(directory / "provider-started.json"),
                         "receipt_path": str(receipt_path),
+                        "stop_path": str(directory / "supervisor-stop.json"),
                     },
                     transport_key,
                 )

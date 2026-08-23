@@ -89,6 +89,27 @@ class AssetBindingVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
+    def verify_writing_deliverable(
+        self,
+        *,
+        binding: AcceptedAssetBinding,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        quest_ref: str,
+        snapshot_ref: str,
+        snapshot_hash: str,
+        allowed_source_version_refs: tuple[str, ...],
+        final_markdown_hash: str,
+        citations_hash: str,
+        execution_receipt: AcceptanceReceipt,
+        require_current: bool = True,
+    ) -> str: ...
+
+    def verify_writing_source_locator(
+        self, *, version_ref: str, locator: str
+    ) -> str: ...
+
     def verify_plan_evidence_binding(
         self,
         *,
@@ -439,6 +460,23 @@ class AttemptExecutionReceiptVerifier(Protocol):
         result_hash: str,
         receipt: AcceptanceReceipt,
     ) -> "ExperimentResultComponentManifest": ...
+
+    def verify_writing_execution_receipt(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        final_markdown_hash: str,
+        citations_hash: str,
+        receipt: AcceptanceReceipt,
+        quest_ref: str | None = None,
+        snapshot_ref: str | None = None,
+        snapshot_hash: str | None = None,
+        allowed_source_version_refs: tuple[str, ...] | None = None,
+        require_current: bool = False,
+        require_authorized: bool = False,
+    ) -> dict[str, object]: ...
 
 
 class ExperimentInputBindingVerifier(Protocol):

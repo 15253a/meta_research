@@ -163,6 +163,48 @@ different facts. Its fixed Execution Fence window observes bounded durable raw
 stdout and scoped hardware telemetry, marks stale or historical data honestly,
 and never promotes live observations into RM or RG truth.
 
+Writing Report is a separate long-lived capability, not a fifth Stage and not a
+gate on Quest advancement. Human Collaboration freezes an exact report Intent,
+Research Snapshot, Owner revision cut, and bounded execution budget before
+Agent Runtime admits one managed root/native Session. The packaged Writing
+Skill may draft, self-review through a focused child context, revise, and use
+ordinary read-only research capabilities covered by the Quest policy, but it
+cannot publish, send, accept its own deliverable, or claim formal citation
+correctness. Pause and resume retain the Session lineage while retiring stale
+Execution Fences; terminal cancellation requires a separate exact impact
+preview and human confirmation. The default budget bounds content revisions
+and output bytes, not elapsed wall time; an idle or paused Session has no hidden
+24-hour expiry.
+
+Each content revision is an immutable Agent Runtime Attempt with its own
+predecessor, feedback, decision, provider operation, and Fence. Research Memory
+first accepts the exact Markdown bytes as an AssetVersion; Research Graph then
+independently verifies the frozen admission, execution receipt, deliverable
+provenance, source roles, citation anchors, and supported claims before issuing
+an acceptance or rejection. A formally supported claim is exact source wording
+that RM can read back at its locator; translations, paraphrases, and synthesis
+remain visibly classified inference or uncertainty unless a separate verifier
+can prove them. Rejection creates a materially changed successor
+within the same Writing Session until the frozen revision/resource budget is
+exhausted. A revoked authorization, stale cut, unverifiable receipt, timeout,
+or exhausted budget persists a typed run-local blocker without making the core
+Quest unavailable or starving another Writing Run.
+
+The Web reads Writing only through the same consistent Public Projection. It
+keeps unadmitted intents recoverable, displays execution, RM deliverable, RG
+citation, and renderer as separate facts, and exposes immutable version history
+with content/evidence/citation comparison and stale-state reporting. Any
+currently available RM deliverable remains viewable with its RG status, including
+rejected versions; formal rendering remains gated on RG acceptance. Rendering an
+accepted version also requires currently verified, available RM custody and is
+deterministic: repeated reads do not create a new AssetVersion or formal
+decision. Historical acceptance remains visible during a custody outage while
+the current deliverable and renderer expose a typed unavailable state. Durable
+operation identities,
+provider spools, stop markers, checkpoints, and retired Fences make lost ACK,
+daemon restart, pause, and late worker results reconcile from the first missing
+boundary without duplicating delivery or citation acceptance.
+
 The supported public host operations are exposed by the `meta-research`
 command. Research state is observed through the authenticated Snapshot and SSE
 interfaces; the Web client does not read persistence directly.

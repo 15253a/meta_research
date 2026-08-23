@@ -56,6 +56,7 @@ import { ExperimentLauncher } from "./ExperimentLauncher";
 import { QuestCreationWorkbench } from "./QuestCreation";
 import { QuestionTree } from "./QuestionTree";
 import { ResearchAssetsWorkbench } from "./ResearchAssets";
+import { WritingReportWorkbench } from "./WritingReport";
 import {
   HumanRequestSurface,
   QuestCompanion,
@@ -330,6 +331,10 @@ function uniqueCapabilities(snapshot: PublicSnapshot | null): CapabilityState[] 
       ...snapshot.quest_creation.first_question_deepfetch,
     },
     ...snapshot.unavailable,
+    {
+      capability: "writing",
+      status: snapshot.writing.status,
+    },
   ];
   return entries.filter(
     (entry, index) =>
@@ -351,6 +356,7 @@ function questCreationReady(snapshot: PublicSnapshot | null): boolean {
         "idea_stage_worker",
         "plan_stage_worker",
         "experiment_worker",
+        "writing_worker",
         "research_asset_intake_worker",
         "research_asset_verification_worker",
       ].includes(check.name),
@@ -404,33 +410,41 @@ function LumenRail({
   canBrowseAssets,
   canBrowseQuestions,
   questionsActive,
+  canBrowseWriting,
+  writingOpen,
   questionUnavailableReason,
   questionButtonRef,
+  writingButtonRef,
   onBrowseQuestions,
   canBrowseHumanRequests,
   humanRequestCount,
   humanRequestsOpen,
   onCreate,
   onBrowseAssets,
+  onBrowseWriting,
   onBrowseHumanRequests,
 }: {
   canCreate: boolean;
   canBrowseAssets: boolean;
   canBrowseQuestions: boolean;
   questionsActive: boolean;
+  canBrowseWriting: boolean;
+  writingOpen: boolean;
   questionUnavailableReason: string;
   questionButtonRef: Ref<HTMLButtonElement>;
+  writingButtonRef: Ref<HTMLButtonElement>;
   canBrowseHumanRequests: boolean;
   humanRequestCount: number;
   humanRequestsOpen: boolean;
   onCreate: () => void;
   onBrowseAssets: () => void;
+  onBrowseWriting: () => void;
   onBrowseQuestions: () => void;
   onBrowseHumanRequests: () => void;
 }) {
   return (
     <nav className="lumen-rail" aria-label="主导航" data-shell-region="rail">
-      <RailButton label="Quest 总览" glyph="⌂" active={!questionsActive} />
+      <RailButton label="Quest 总览" glyph="⌂" active={!questionsActive && !writingOpen} />
       <RailButton
         label="问题树"
         glyph="树"
@@ -446,7 +460,14 @@ function LumenRail({
         unavailable={!canBrowseAssets}
         onClick={onBrowseAssets}
       />
-      <RailButton label="Writing" glyph="✎" unavailable />
+      <RailButton
+        label="Writing"
+        glyph="✎"
+        active={writingOpen}
+        unavailable={!canBrowseWriting}
+        buttonRef={writingButtonRef}
+        onClick={onBrowseWriting}
+      />
       <RailButton label="历史" glyph="↺" unavailable />
       <RailButton
         label="HumanRequest"
@@ -1693,6 +1714,9 @@ function App() {
   const [assetsOpen, setAssetsOpen] = useState(
     () => new URLSearchParams(window.location.search).get("panel") === "research-assets",
   );
+  const [writingOpen, setWritingOpen] = useState(
+    () => new URLSearchParams(window.location.search).get("panel") === "writing",
+  );
   const [questionTreeOpen, setQuestionTreeOpen] = useState(
     () => ["question-tree", "create-question"].includes(
       initialParameters.get("panel") ?? "",
@@ -1731,10 +1755,11 @@ function App() {
   const streamCursorRef = useRef<number | null>(null);
   const manualDetailSequence = useRef(0);
   const questionTreeButtonRef = useRef<HTMLButtonElement>(null);
+  const writingButtonRef = useRef<HTMLButtonElement>(null);
   const humanRequestReturnFocusRef = useRef<HTMLElement | null>(null);
   const executionObserver = useExecutionObserver(
     snapshot?.experiment?.current ?? null,
-    Boolean(creationMode || assetsOpen),
+    Boolean(creationMode || assetsOpen || writingOpen),
   );
 
   const handleConnection = useCallback((next: boolean) => {
@@ -1900,6 +1925,7 @@ function App() {
     }
     setCreationMode(null);
     setAssetsOpen(false);
+    setWritingOpen(false);
     setSelectedHumanRequestRef(globalRequest.request_ref);
     setHumanRequestRouteKind(null);
     window.history.replaceState(
@@ -1914,6 +1940,7 @@ function App() {
   const canCreate = questCreationReady(snapshot);
   const canBrowseAssets = snapshot?.research_assets.status === "ready";
   const canBrowseQuestions = snapshot?.question_tree.status === "ready";
+  const canBrowseWriting = snapshot?.writing.status === "ready";
   const manualCreationReady =
     snapshot?.manual_question_creation.status === "ready";
   const manualView = useMemo(
@@ -1940,6 +1967,7 @@ function App() {
     if (!canCreate) return;
     setQuestionTreeOpen(false);
     setAssetsOpen(false);
+    setWritingOpen(false);
     setManualPanel(null);
     setPendingDirectManualParentRef(null);
     window.history.replaceState(null, "", "/?panel=create-quest");
@@ -1953,6 +1981,7 @@ function App() {
     if (!canBrowseAssets) return;
     setCreationMode(null);
     setQuestionTreeOpen(false);
+    setWritingOpen(false);
     setManualPanel(null);
     setPendingDirectManualParentRef(null);
     window.history.replaceState(null, "", "/?panel=research-assets");
@@ -1966,6 +1995,7 @@ function App() {
     if (!canBrowseQuestions) return;
     setCreationMode(null);
     setAssetsOpen(false);
+    setWritingOpen(false);
     setManualPanel(null);
     setManualOpenError(null);
     setQuestionRouteNodeRef(null);
@@ -1982,6 +2012,27 @@ function App() {
     window.history.replaceState(null, "", "/");
     requestAnimationFrame(() => {
       questionTreeButtonRef.current?.focus({ preventScroll: true });
+    });
+  };
+
+  const openWriting = () => {
+    if (!canBrowseWriting || !snapshot) return;
+    setCreationMode(null);
+    setAssetsOpen(false);
+    setQuestionTreeOpen(false);
+    setManualPanel(null);
+    setPendingDirectManualParentRef(null);
+    setHumanRequestsOpen(false);
+    setHumanRequestRouteKind(null);
+    setSelectedHumanRequestRef(null);
+    window.history.replaceState(null, "", "/?panel=writing");
+    setWritingOpen(true);
+  };
+  const closeWriting = () => {
+    window.history.replaceState(null, "", "/");
+    setWritingOpen(false);
+    requestAnimationFrame(() => {
+      writingButtonRef.current?.focus({ preventScroll: true });
     });
   };
 
@@ -2111,6 +2162,7 @@ function App() {
     }
     setCreationMode(null);
     setAssetsOpen(false);
+    setWritingOpen(false);
     setHumanRequestRouteKind(null);
     setSelectedHumanRequestRef(requestRef);
     const request = snapshot?.human_collaboration?.human_requests.items.find(
@@ -2176,14 +2228,18 @@ function App() {
           canBrowseAssets={canBrowseAssets}
           canBrowseQuestions={canBrowseQuestions}
           questionsActive={questionTreeOpen}
+          canBrowseWriting={Boolean(canBrowseWriting)}
+          writingOpen={writingOpen}
           questionUnavailableReason={questionUnavailableReason}
           questionButtonRef={questionTreeButtonRef}
+          writingButtonRef={writingButtonRef}
           onBrowseQuestions={openQuestionTree}
           canBrowseHumanRequests={canBrowseHumanRequests}
           humanRequestCount={humanRequestCount}
           humanRequestsOpen={humanRequestsOpen}
           onCreate={openCreation}
           onBrowseAssets={openAssets}
+          onBrowseWriting={openWriting}
           onBrowseHumanRequests={() => openHumanRequests()}
         />
         {questionTreeOpen && snapshot ? (
@@ -2245,6 +2301,19 @@ function App() {
           intakeWorkerReady={Boolean(intakeWorkerReady)}
           verificationWorkerReady={Boolean(verificationWorkerReady)}
           onClose={closeAssets}
+          onChanged={() => void reload()}
+        />
+      ) : null}
+      {writingOpen && snapshot ? (
+        <WritingReportWorkbench
+          initial={snapshot.writing}
+          questRef={
+            snapshot.research_space.current_question?.quest_ref
+              ?? snapshot.question_tree.items[0]?.quest_ref
+              ?? snapshot.quest_creation.current?.quest_ref
+              ?? null
+          }
+          onClose={closeWriting}
           onChanged={() => void reload()}
         />
       ) : null}

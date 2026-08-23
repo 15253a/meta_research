@@ -42,6 +42,13 @@ from meta_research.quest_drafting import (
     ProposalDraftResult,
 )
 from meta_research.web import create_app
+from meta_research.writing_contract import WritingRuntimeBinding
+from meta_research.writing_skill import (
+    WritingSkillDraft,
+    WritingSkillRequest,
+    WritingSkillResult,
+    writing_review_task_hash,
+)
 
 
 QUESTION = {
@@ -257,6 +264,76 @@ class DeterministicIdeaSkill:
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult:
         return self.review_draft(request, self.generate_draft(request))
+
+
+class DeterministicWritingSkill:
+    """A resumable Writing provider used through the production public seams."""
+
+    def runtime_binding(self) -> WritingRuntimeBinding:
+        return WritingRuntimeBinding(
+            packaged_skill_bundle_hash=canonical_hash(
+                {"skill": "chrome-production-writing"}
+            ),
+            instruction_set_hash=canonical_hash(
+                {"instructions": "chrome-production-writing"}
+            ),
+            model_ref="chrome-test-model",
+            harness_adapter_ref="chrome-deterministic-writing-v1",
+            mcp_bindings=(),
+            capability_bindings=(),
+            resource_bindings=(),
+        )
+
+    def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
+        # Keep the active Session observable long enough for pause and browser-close
+        # recovery checks without introducing a test-only product endpoint.
+        time.sleep(0.35)
+        feedback = "；".join(request.feedback) or "无追加反馈"
+        return WritingSkillDraft(
+            markdown=(
+                f"# {request.intent['title']} · draft r{request.revision}\n\n"
+                f"当前草稿依据冻结 Snapshot。反馈：{feedback}。\n"
+            ),
+            citations=(),
+            primary_session_ref=request.native_session_ref
+            or f"chrome-writing-native-session:{request.run_ref}",
+            adapter_kind="chrome_deterministic_writing",
+        )
+
+    def review_draft(
+        self, request: WritingSkillRequest, draft: WritingSkillDraft
+    ) -> WritingSkillResult:
+        time.sleep(0.35)
+        return WritingSkillResult(
+            reviewed_markdown=draft.markdown,
+            final_markdown=(
+                f"# {request.intent['title']} · r{request.revision}\n\n"
+                "<!-- meta-research-structure -->\n"
+                "## 结论\n\n"
+                "<!-- meta-research-claim:evidence-gap -->\n"
+                "**Evidence gap:** "
+                "当前冻结 Snapshot 尚无可引用研究资产，因此不形成超出证据的确定性结论。\n"
+            ),
+            citations=(),
+            findings=(
+                {
+                    "category": "evidence_boundary",
+                    "finding": "草稿没有明确陈述当前证据缺口。",
+                },
+            ),
+            dispositions=(
+                {
+                    "category": "evidence_boundary",
+                    "action": "revised",
+                    "reason": "在最终报告中明确冻结 Snapshot 的证据边界。",
+                },
+            ),
+            primary_session_ref=draft.primary_session_ref,
+            review_mode="harness_child_agent",
+            reviewer_agent_ref="chrome-writing-child-reviewer",
+            review_task_hash=writing_review_task_hash(request, draft),
+            adapter_kind=draft.adapter_kind,
+        )
 
 
 class ProviderPhaseControl:
@@ -619,6 +696,7 @@ async def serve(
         host_compute_probe=SequencedHostProbe(intent_started),
         idea_skill_provider=idea_skill,
         plan_skill_provider=plan_skill,
+        writing_skill_provider=DeterministicWritingSkill(),
         deepfetch_provider=DeterministicDeepFetchProvider(),
     )
     human_collaboration = runtime.owners.human_collaboration

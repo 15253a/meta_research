@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,12 @@ from meta_research.quest_drafting import (
     IntentTurnResult,
     ProposalDraftRequest,
     ProposalDraftResult,
+)
+from meta_research.writing_contract import WritingRuntimeBinding
+from meta_research.writing_skill import (
+    WritingSkillDraft,
+    WritingSkillRequest,
+    WritingSkillResult,
 )
 
 
@@ -52,6 +59,31 @@ class _UnavailableProbe:
         )
 
 
+class _BindingOnlyWritingSkill:
+    def runtime_binding(self) -> WritingRuntimeBinding:
+        return WritingRuntimeBinding(
+            packaged_skill_bundle_hash=canonical_hash({"skill": "boundary-test"}),
+            instruction_set_hash=canonical_hash(
+                {"instructions": "boundary-test"}
+            ),
+            model_ref="test-model-v1",
+            harness_adapter_ref="test-boundary-v1",
+            mcp_bindings=(),
+            capability_bindings=(),
+            resource_bindings=(),
+        )
+
+    def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
+        del request
+        raise AssertionError("Writing execution is outside this Owner boundary test")
+
+    def review_draft(
+        self, request: WritingSkillRequest, draft: WritingSkillDraft
+    ) -> WritingSkillResult:
+        del request, draft
+        raise AssertionError("Writing execution is outside this Owner boundary test")
+
+
 def _runtime(path: Path):
     adapter = _DeterministicDraftingAdapter()
     return build_production_runtime(
@@ -59,6 +91,17 @@ def _runtime(path: Path):
         proposal_drafter=adapter,
         intent_drafting_provider=adapter,
         host_compute_probe=_UnavailableProbe(),
+    )
+
+
+def _writing_runtime(path: Path):
+    adapter = _DeterministicDraftingAdapter()
+    return build_production_runtime(
+        prepare_data_root(path),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=_UnavailableProbe(),
+        writing_skill_provider=_BindingOnlyWritingSkill(),
     )
 
 
@@ -104,6 +147,99 @@ def _confirm_direct_quest(runtime, prefix: str) -> dict[str, object]:
         idempotency_key=f"{prefix}-confirm",
     )
     return created
+
+
+def test_writing_owner_query_rejects_snapshot_and_attempt_linkage_tamper(
+    tmp_path: Path,
+) -> None:
+    runtime = _writing_runtime(tmp_path / "writing-owner-integrity")
+    hc = runtime.owners.human_collaboration
+    ar = runtime.owners.agent_runtime
+    try:
+        created = _confirm_direct_quest(runtime, "writing-owner-integrity")
+        for _step in range(8):
+            current = hc.query_quest_creation(created["initialization_id"])
+            if current["status"] == "completed":
+                break
+            assert hc.reconcile_once()
+        completed = hc.query_quest_creation(created["initialization_id"])
+        assert completed["status"] == "completed"
+
+        drafted = runtime.writing.create_report_intent(
+            quest_ref=completed["quest_ref"],
+            title="Owner 完整性报告",
+            audience="研究负责人",
+            purpose="验证冻结 Snapshot 与当前 Attempt linkage",
+            instructions="只验证 admission，不执行 provider。",
+            idempotency_key="writing-owner-integrity-create",
+        )
+        previewed = runtime.writing.preview_report_intent(
+            drafted["intent_id"],
+            idempotency_key="writing-owner-integrity-preview",
+        )
+        preview = previewed["impact_preview"]
+        admitted = runtime.writing.confirm_report_intent(
+            drafted["intent_id"],
+            draft_revision=previewed["draft_revision"],
+            draft_hash=previewed["draft_hash"],
+            preview_ref=preview["preview_ref"],
+            preview_hash=preview["preview_hash"],
+            idempotency_key="writing-owner-integrity-confirm",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        attempt_ref = admitted["run"]["attempt_ref"]
+
+        with runtime._database.read() as connection:
+            original_snapshot_json = connection.execute(
+                text(
+                    "SELECT snapshot_json FROM ar_writing_runs WHERE "
+                    "run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).scalar_one()
+        tampered_snapshot = json.loads(original_snapshot_json)
+        tampered_snapshot["accepted_sources"] = [
+            {
+                "version_ref": "forged_version",
+                "role": "evidence",
+            }
+        ]
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ar_writing_runs SET snapshot_json = :snapshot_json "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {
+                    "snapshot_json": canonical_json(tampered_snapshot),
+                    "run_ref": run_ref,
+                },
+            )
+        with pytest.raises(OwnerConflict, match="writing_run_integrity_invalid"):
+            ar.query_writing_report(run_ref)
+
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE ar_writing_runs SET snapshot_json = :snapshot_json "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {"snapshot_json": original_snapshot_json, "run_ref": run_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_writing_attempts SET fence_ref = :fence_ref "
+                    "WHERE attempt_ref = :attempt_ref"
+                ),
+                {
+                    "fence_ref": "writing_fence_tampered",
+                    "attempt_ref": attempt_ref,
+                },
+            )
+        with pytest.raises(OwnerConflict, match="writing_attempt_integrity_invalid"):
+            ar.query_writing_report(run_ref)
+    finally:
+        runtime.close()
 
 
 def test_unified_legacy_asset_tamper_fails_every_public_consumer_closed(
@@ -515,9 +651,11 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
             "variant_run_count": 0,
             "evaluation_attempt_count": 0,
             "experiment_input_binding_count": 0,
-            "experiment_asset_role_count": 0,
-            "formal_measurement_count": 0,
-        }
+                "experiment_asset_role_count": 0,
+                "formal_measurement_count": 0,
+                "writing_citation_decision_count": 0,
+                "writing_citation_rejection_count": 0,
+            }
         assert runtime.owners.advancement_engine.query_snapshot().facts[
             "foreground_cycle_count"
         ] == 0
