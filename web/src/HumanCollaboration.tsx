@@ -16,6 +16,7 @@ import {
   deliverPendingHumanRequestResponse,
   createHumanCommand,
   deliverPendingHumanRequestAssetResponse,
+  executeHumanCommand,
   hydratePendingHumanRequestRecovery,
   pendingAcceptedHumanRequestAssetRequestRef,
   pendingAssetIntakeJobRef,
@@ -39,9 +40,13 @@ import {
   type HumanCapabilityAuthorization,
   type HumanCommand,
   type HumanCommandDraft,
+  type HumanCapabilityCommandDraft,
   type HumanRequestImpactPreview,
   type HumanRequestItem,
   type HumanRequestResponseBody,
+  type QuestionTreeItem,
+  type ResearchControlAction,
+  type ResearchControlProjection,
 } from "./api";
 
 export type CompanionShellState =
@@ -150,11 +155,15 @@ function scopeLabel(request: HumanRequestItem): string {
 export function QuestCompanion({
   state,
   collaboration,
+  researchControl,
+  questions = [],
   onChanged,
   onOpenRequest,
 }: {
   state: CompanionShellState;
   collaboration?: HumanCollaborationProjection;
+  researchControl?: ResearchControlProjection;
+  questions?: readonly QuestionTreeItem[];
   onChanged: () => void;
   onOpenRequest: (requestRef: string) => void;
 }) {
@@ -298,6 +307,14 @@ export function QuestCompanion({
             onChanged={onChanged}
           />
         )) : null}
+        {ready && researchControl?.status === "ready" && researchControl.foreground ? (
+          <ResearchControlComposer
+            control={researchControl}
+            questions={questions}
+            scopeRef={scopeRef}
+            onChanged={onChanged}
+          />
+        ) : null}
         {!ready ? (
           <article className="lumen-proposal">
             <small>当前边界 · 无写入</small>
@@ -330,6 +347,245 @@ export function QuestCompanion({
         <small>{error ? `发送失败 · ${error}` : "普通聊天不会被猜成硬命令"}</small>
       </form>
     </aside>
+  );
+}
+
+const researchControlLabels: Record<ResearchControlAction, string> = {
+  pause: "暂停当前 Quest",
+  resume: "恢复当前 Quest",
+  normal_switch: "安全切换",
+  forced_switch: "强制切换",
+  cancel: "取消当前 Cycle",
+  abandon: "放弃当前 Cycle",
+  prune: "剪裁 Question",
+  restore: "恢复 Question",
+};
+
+const questionTargetActions = new Set<ResearchControlAction>([
+  "normal_switch",
+  "forced_switch",
+  "prune",
+  "restore",
+]);
+
+type ResearchControlTargetScope = "cycle" | "stage" | "run";
+
+const scopedControlActions = new Set<ResearchControlAction>([
+  "pause",
+  "resume",
+  "cancel",
+]);
+
+function ResearchControlComposer({
+  control,
+  questions,
+  scopeRef,
+  onChanged,
+}: {
+  control: ResearchControlProjection;
+  questions: readonly QuestionTreeItem[];
+  scopeRef: string | null;
+  onChanged: () => void;
+}) {
+  const foreground = control.foreground!;
+  const initialAction: ResearchControlAction = foreground.status === "suspended"
+    ? "resume"
+    : "pause";
+  const [action, setAction] = useState<ResearchControlAction>(initialAction);
+  const [targetScope, setTargetScope] = useState<ResearchControlTargetScope>("cycle");
+  const [targetQuestionRef, setTargetQuestionRef] = useState(
+    questions.find((item) => item.question_ref !== foreground.question_ref
+      && item.lifecycle_status === "active")?.question_ref
+      ?? foreground.question_ref,
+  );
+  const [runRef, setRunRef] = useState(control.managed_runs.find((item) =>
+    !["completed", "terminated"].includes(item.status))?.run_ref ?? "");
+  const [pruneRecordRef, setPruneRecordRef] = useState(
+    control.recovery_records[0]?.prune_record_ref ?? "",
+  );
+  const [reason, setReason] = useState("operator_requested");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const availableActions = control.actions.length
+    ? control.actions
+    : (Object.keys(researchControlLabels) as ResearchControlAction[]);
+  const activeQuestions = questions.filter((item) => item.lifecycle_status === "active");
+  const selectableQuestions = action === "normal_switch" || action === "forced_switch"
+    ? activeQuestions.filter((item) => item.question_ref !== foreground.question_ref)
+    : activeQuestions;
+  const managedRuns = control.managed_runs.filter((item) =>
+    !["completed", "terminated"].includes(item.status));
+  const selectedPruneRecord = control.recovery_records.find((item) =>
+    item.prune_record_ref === pruneRecordRef) ?? null;
+  const effectiveScope = scopedControlActions.has(action) ? targetScope : "cycle";
+  const missingTarget = effectiveScope === "run" && !runRef
+    || action === "restore" && !selectedPruneRecord
+    || questionTargetActions.has(action)
+      && action !== "restore"
+      && !selectableQuestions.some((item) => item.question_ref === targetQuestionRef);
+
+  useEffect(() => {
+    if (!scopedControlActions.has(action)) setTargetScope("cycle");
+    if (action === "restore" && !selectedPruneRecord) {
+      setPruneRecordRef(control.recovery_records[0]?.prune_record_ref ?? "");
+    }
+    if (questionTargetActions.has(action)
+      && action !== "restore"
+      && !selectableQuestions.some((item) => item.question_ref === targetQuestionRef)) {
+      setTargetQuestionRef(selectableQuestions[0]?.question_ref ?? "");
+    }
+    if (effectiveScope === "run" && !managedRuns.some((item) => item.run_ref === runRef)) {
+      setRunRef(managedRuns[0]?.run_ref ?? "");
+    }
+  }, [action, control.recovery_records, effectiveScope, managedRuns,
+    runRef, selectableQuestions, selectedPruneRecord, targetQuestionRef]);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (pending || !scopeRef || !reason.trim() || missingTarget) return;
+    setPending(true);
+    setError(null);
+    try {
+      const target = {
+        quest_ref: foreground.quest_ref,
+        cycle_ref: foreground.cycle_ref,
+        question_ref: foreground.question_ref,
+        epoch: foreground.epoch,
+        target_scope: effectiveScope,
+        ...(effectiveScope === "run" ? { run_ref: runRef } : {}),
+        ...(action === "restore" && selectedPruneRecord
+          ? {
+            target_question_ref: selectedPruneRecord.root_question_ref,
+            prune_record_ref: selectedPruneRecord.prune_record_ref,
+          }
+          : questionTargetActions.has(action)
+          ? { target_question_ref: targetQuestionRef }
+          : {}),
+      };
+      await createHumanCommand(`quest:${foreground.quest_ref}`, {
+        command_kind: "research_control",
+        payload: { action, target, reason: reason.trim() },
+      });
+      onChanged();
+    } catch (caught) {
+      setError(reasonCode(caught));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <section className="lumen-research-control" aria-label="研究控制">
+      <details>
+        <summary>
+          <span>研究控制</span>
+          <small>按需建立精确 Command Draft</small>
+        </summary>
+        <div className="lumen-research-control-body">
+          <small>FOREGROUND CONTROL · PREVIEW FIRST</small>
+          <b>{researchControlLabels[action]}</b>
+          <p>
+            Epoch {foreground.epoch} · {foreground.stage} · {foreground.status}
+            {control.managed_runs.length
+              ? ` · ${control.managed_runs.length} managed Run`
+              : " · 当前无在途 Run"}
+          </p>
+          <form onSubmit={(event) => void submit(event)}>
+            <label>
+              控制动作
+              <select
+                aria-label="控制动作"
+                value={action}
+                onChange={(event) => setAction(event.target.value as ResearchControlAction)}
+              >
+                {availableActions.map((item) => (
+                  <option value={item} key={item}>{researchControlLabels[item]}</option>
+                ))}
+              </select>
+            </label>
+            {scopedControlActions.has(action) ? (
+              <label>
+                控制范围
+                <select
+                  aria-label="控制范围"
+                  value={targetScope}
+                  onChange={(event) => setTargetScope(
+                    event.target.value as ResearchControlTargetScope,
+                  )}
+                >
+                  <option value="cycle">当前 Cycle</option>
+                  <option value="stage">当前 Stage</option>
+                  <option value="run">一个 managed Run</option>
+                </select>
+              </label>
+            ) : null}
+            {effectiveScope === "run" ? (
+              <label>
+                Managed Run
+                <select
+                  aria-label="Managed Run"
+                  value={runRef}
+                  onChange={(event) => setRunRef(event.target.value)}
+                >
+                  {managedRuns.map((item) => (
+                    <option value={item.run_ref} key={item.run_ref}>
+                      {item.run_kind} · {item.status} · {item.run_ref}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+            {questionTargetActions.has(action) && action !== "restore" ? (
+              <label>
+                目标 Question
+                <select
+                  aria-label="目标 Question"
+                  value={targetQuestionRef}
+                  onChange={(event) => setTargetQuestionRef(event.target.value)}
+                >
+                  {selectableQuestions.map((item) => (
+                    <option value={item.question_ref} key={item.question_ref}>
+                      {item.title ?? item.question_ref}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+            {action === "restore" ? (
+              <label>
+                恢复记录
+                <select
+                  aria-label="恢复记录"
+                  value={pruneRecordRef}
+                  onChange={(event) => setPruneRecordRef(event.target.value)}
+                >
+                  {control.recovery_records.map((item) => (
+                    <option value={item.prune_record_ref} key={item.prune_record_ref}>
+                      {item.root_question_ref} · {item.affected_question_count} Questions
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+            <label>
+              操作理由
+              <input
+                aria-label="操作理由"
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+              />
+            </label>
+            <button type="submit" disabled={pending || !reason.trim() || missingTarget}>
+              查看操作草案
+            </button>
+          </form>
+          <span>不会直接写 Owner；先生成精确草案，再检查 Impact Preview。</span>
+          {action === "restore" && !selectedPruneRecord ? (
+            <em role="status">没有可恢复的 PruneRecord。</em>
+          ) : null}
+          {error ? <em role="status">草案失败 · {error}</em> : null}
+        </div>
+      </details>
+    </section>
   );
 }
 
@@ -392,20 +648,37 @@ function HumanCommandCard({
   authorization?: HumanCapabilityAuthorization | null;
   onChanged: () => void;
 }) {
+  const capabilityCommand = command.draft.command_kind === "capability_authorization"
+    ? command.draft
+    : null;
+  const controlCommand = command.draft.command_kind === "research_control"
+    ? command.draft
+    : null;
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reviewedPreviewRef, setReviewedPreviewRef] = useState<string | null>(null);
+  const previewDetailsRef = useRef<HTMLDetailsElement | null>(null);
   const [recordedAuthorization, setRecordedAuthorization] = useState<HumanCapabilityAuthorization | null>(null);
-  const [capabilityDraft, setCapabilityDraft] = useState(command.draft.payload.capability);
-  const [decisionDraft, setDecisionDraft] = useState(command.draft.payload.decision);
-  const [scopeDraft, setScopeDraft] = useState(() => JSON.stringify(command.draft.payload.scope, null, 2));
+  const [capabilityDraft, setCapabilityDraft] = useState(
+    capabilityCommand?.payload.capability ?? "",
+  );
+  const [decisionDraft, setDecisionDraft] = useState<
+    HumanCapabilityCommandDraft["payload"]["decision"]
+  >(capabilityCommand?.payload.decision ?? "denied");
+  const [scopeDraft, setScopeDraft] = useState(() => JSON.stringify(
+    capabilityCommand?.payload.scope ?? {},
+    null,
+    2,
+  ));
 
   useEffect(() => {
-    setCapabilityDraft(command.draft.payload.capability);
-    setDecisionDraft(command.draft.payload.decision);
-    setScopeDraft(JSON.stringify(command.draft.payload.scope, null, 2));
+    if (command.draft.command_kind === "capability_authorization") {
+      setCapabilityDraft(command.draft.payload.capability);
+      setDecisionDraft(command.draft.payload.decision);
+      setScopeDraft(JSON.stringify(command.draft.payload.scope, null, 2));
+    }
     setReviewedPreviewRef(null);
-  }, [command.draft_hash, command.draft_revision]);
+  }, [command.draft, command.draft_hash, command.draft_revision]);
 
   const act = async (operation: () => Promise<HumanCommand>) => {
     setPending(true);
@@ -423,8 +696,14 @@ function HumanCommandCard({
   const currentPreview = preview?.status === "current"
     && preview.draft_revision === command.draft_revision
     && preview.draft_hash === command.draft_hash;
-  const payload = command.draft.payload;
-  const authorization = projectedAuthorization ?? recordedAuthorization;
+  useEffect(() => {
+    if (currentPreview && preview && previewDetailsRef.current?.open) {
+      setReviewedPreviewRef(preview.preview_ref);
+    }
+  }, [currentPreview, preview]);
+  const authorization = capabilityCommand
+    ? projectedAuthorization ?? recordedAuthorization
+    : null;
   const authorize = async () => {
     setPending(true);
     setError(null);
@@ -440,6 +719,10 @@ function HumanCommandCard({
   };
   const revise = async (event: FormEvent) => {
     event.preventDefault();
+    if (!capabilityCommand) {
+      setError("capability_authorization_command_required");
+      return;
+    }
     let scope: unknown;
     try {
       scope = JSON.parse(scopeDraft);
@@ -452,7 +735,7 @@ function HumanCommandCard({
       return;
     }
     await act(() => reviseHumanCommand(command, {
-      command_kind: command.draft.command_kind,
+      command_kind: "capability_authorization",
       payload: {
         capability: capabilityDraft.trim(),
         decision: decisionDraft,
@@ -463,12 +746,25 @@ function HumanCommandCard({
   return (
     <article className="lumen-command" data-command-status={command.status}>
       <small>COMMAND DRAFT · NO AUTHORITY</small>
-      <b>{payload.decision} · {payload.capability}</b>
-      <p>{stringify(payload.scope)}</p>
+      {controlCommand ? (
+        <>
+          <b>{researchControlLabels[controlCommand.payload.action]}</b>
+          <p>
+            Quest {controlCommand.payload.target.quest_ref} · Cycle {controlCommand.payload.target.cycle_ref}
+            {` · Epoch ${controlCommand.payload.target.epoch}`}
+          </p>
+          <code>{stringify(controlCommand.payload)}</code>
+        </>
+      ) : capabilityCommand ? (
+        <>
+          <b>{capabilityCommand.payload.decision} · {capabilityCommand.payload.capability}</b>
+          <p>{stringify(capabilityCommand.payload.scope)}</p>
+        </>
+      ) : null}
       {command.source_proposal_ref ? (
         <code className="lumen-source-proposal">source · {command.source_proposal_ref}</code>
       ) : null}
-      <details onToggle={(event) => {
+      <details ref={previewDetailsRef} onToggle={(event) => {
         if (event.currentTarget.open && currentPreview && preview) {
           setReviewedPreviewRef(preview.preview_ref);
         }
@@ -493,7 +789,7 @@ function HumanCommandCard({
           </div>
         ) : null}
       </details>
-      {!command.confirmation_receipt ? (
+      {!command.confirmation_receipt && capabilityCommand ? (
         <details className="lumen-command-revision">
           <summary>修订精确 Command Draft</summary>
           <form onSubmit={(event) => void revise(event)}>
@@ -510,7 +806,9 @@ function HumanCommandCard({
               <select
                 aria-label={`Command ${command.intent_id} decision`}
                 value={decisionDraft}
-                onChange={(event) => setDecisionDraft(event.target.value as HumanCommandDraft["payload"]["decision"])}
+                onChange={(event) => setDecisionDraft(
+                  event.target.value as HumanCapabilityCommandDraft["payload"]["decision"],
+                )}
               >
                 <option value="granted">granted</option>
                 <option value="denied">denied</option>
@@ -551,10 +849,29 @@ function HumanCommandCard({
         <div className="lumen-confirmed">
           <b>Human Confirmation 已记录</b>
           <span>{command.confirmation_receipt.receipt_ref}</span>
-          <p>确认没有执行命令，也没有签发 Capability Authorization。</p>
+          <p>{controlCommand
+            ? command.executed
+              ? "确认与 Owner execution receipts 均已持久化。"
+              : "确认已记录，控制尚未执行。"
+            : "确认没有执行命令，也没有签发 Capability Authorization。"}</p>
         </div>
       ) : null}
-      {command.confirmation_receipt && !authorization ? (
+      {command.confirmation_receipt && controlCommand && !command.executed ? (
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => void act(() => executeHumanCommand(command))}
+        >
+          执行已确认控制
+        </button>
+      ) : null}
+      {command.control_execution ? (
+        <div className="lumen-authorized lumen-control-executed">
+          <b>CONTROL EXECUTION · {command.control_execution.status.toUpperCase()}</b>
+          <span>{command.control_execution.receipt_ref}</span>
+        </div>
+      ) : null}
+      {command.confirmation_receipt && capabilityCommand && !authorization ? (
         <button type="button" disabled={pending} onClick={() => void authorize()}>
           签发独立 Capability Authorization
         </button>
@@ -686,7 +1003,9 @@ function commandDraftFromProposal(
   proposal?: Record<string, unknown>,
 ): HumanCommandDraft | null {
   const command = proposal?.command;
-  if (!isRecord(command) || typeof command.command_kind !== "string") return null;
+  if (!isRecord(command) || command.command_kind !== "capability_authorization") {
+    return null;
+  }
   const payload = command.payload;
   if (!isRecord(payload)
     || typeof payload.capability !== "string"
@@ -696,7 +1015,7 @@ function commandDraftFromProposal(
     command_kind: command.command_kind,
     payload: {
       capability: payload.capability,
-      decision: payload.decision as HumanCommandDraft["payload"]["decision"],
+      decision: payload.decision as HumanCapabilityCommandDraft["payload"]["decision"],
       scope: payload.scope,
     },
   };

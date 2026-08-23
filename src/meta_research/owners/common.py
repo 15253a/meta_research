@@ -386,6 +386,17 @@ class StageRunRequestVerifier(Protocol):
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
+    def verify_current_stage_run_request(
+        self,
+        *,
+        request_ref: str,
+        cycle_ref: str,
+        epoch: int,
+        context_pack_ref: str,
+        context_pack_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
     def verify_idea_stage_request_binding(
         self,
         *,

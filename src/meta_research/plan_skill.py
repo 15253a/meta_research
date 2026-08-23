@@ -90,6 +90,8 @@ class PlanSkillProvider(Protocol):
 
     def execute(self, request: PlanSkillRequest) -> PlanSkillResult: ...
 
+    def reconcile_cancelled_job(self, job_ref: str) -> bool: ...
+
 
 def validate_plan_skill_draft(
     request: PlanSkillRequest, result: PlanSkillDraft

@@ -17,6 +17,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from meta_research.provider_supervisor import (
+    PROVIDER_OPERATION_ENV,
     ProviderSupervisorError,
     ensure_transport_key as ensure_shared_transport_key,
     provider_process_group_running,
@@ -244,14 +245,34 @@ def _phase_marker(
     phase: str,
     values: dict[str, object],
     key: bytes,
+    *,
+    provider_process: subprocess.Popen[bytes] | None = None,
+    operation_path: Path | None = None,
 ) -> None:
+    payload: dict[str, object] = {
+        "schema_ref": (
+            MARKER_SCHEMA
+            if provider_process is None
+            else "meta-research/experiment-provider-phase/v2"
+        ),
+        "phase": phase,
+        "invocation_hash": values["invocation_hash"],
+        "supervisor_process_id": os.getpid(),
+        "supervisor_process_group": os.getpgrp(),
+    }
+    if provider_process is not None:
+        if operation_path is None:
+            raise ExperimentSupervisorError("provider_process_identity_invalid")
+        payload.update(
+            {
+                "provider_process_id": provider_process.pid,
+                "provider_process_group": os.getpgid(provider_process.pid),
+                "provider_operation_path": str(operation_path.resolve()),
+            }
+        )
     write_signed(
         path,
-        {
-            "schema_ref": MARKER_SCHEMA,
-            "phase": phase,
-            "invocation_hash": values["invocation_hash"],
-        },
+        payload,
         key,
     )
 
@@ -265,7 +286,6 @@ def _supervise_locked(
     observation_path = directory / "observations.jsonl"
     if stdout_path.exists() or observation_path.exists():
         raise ExperimentSupervisorError("spool_invalid")
-    _phase_marker(directory / "provider-started.json", "started", values, key)
     started_at = time.time()
     termination_reason = "completed"
     returncode = 127
@@ -304,13 +324,26 @@ def _supervise_locked(
                 stdin=stdin_stream,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                env={"PATH": os.environ.get("PATH", "")},
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    PROVIDER_OPERATION_ENV: str(
+                        (directory / "supervisor-request.json").resolve()
+                    ),
+                },
                 start_new_session=True,
             )
         except OSError:
             process = None
             termination_reason = "launch_failed"
         if process is not None:
+            _phase_marker(
+                directory / "provider-started.json",
+                "started",
+                values,
+                key,
+                provider_process=process,
+                operation_path=directory / "supervisor-request.json",
+            )
             assert process.stdout is not None
             cadence = float(values["telemetry_cadence_seconds"])
             initial_observed_at = time.time()

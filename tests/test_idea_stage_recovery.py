@@ -301,17 +301,17 @@ def test_restart_resumes_each_durable_boundary_without_provider_replay(
     try:
         completed = _confirm_question(runtime)
         runtime.idea_stage.start("recovery-stage-start")
-        for expected_status in (
-            "not_attempted",
-            "awaiting_content",
-            "awaiting_domain",
-            "accepted",
-            "accepted",
-            "accepted",
+        for expected_status, expected_feed_delta in (
+            ("not_attempted", 3),
+            ("awaiting_content", 3),
+            ("awaiting_domain", 1),
+            ("accepted", 1),
+            ("accepted", 1),
+            ("accepted", 1),
         ):
             before = runtime.feed.current_revision()
             assert runtime.idea_stage.process_once()
-            assert runtime.feed.current_revision() == before + 1
+            assert runtime.feed.current_revision() == before + expected_feed_delta
             assert runtime.idea_stage.query_current()["outcome_acceptance"][
                 "status"
             ] == expected_status

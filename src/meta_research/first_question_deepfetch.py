@@ -23,6 +23,11 @@ class FirstQuestionDeepFetchWorker:
         self._provider = provider
 
     def process_once(self) -> bool:
+        if self._agent_runtime.reconcile_pending_provider_cleanup(
+            self._provider,
+            unit_kinds=("deepfetch",),
+        ):
+            return True
         blocked_request_refs: set[str] = set()
         while True:
             request = self._human_collaboration.query_next_deepfetch_request(
@@ -67,6 +72,10 @@ class FirstQuestionDeepFetchWorker:
                 if error.code in {
                     "deepfetch_attempt_fence_stale",
                     "deepfetch_run_cancelled",
+                    "runtime_run_suspended",
+                    "runtime_fence_revoked",
+                    "runtime_reconciliation_required",
+                    "terminal_run_cannot_reopen",
                 }:
                     # A predecessor Attempt is no longer authoritative.  Its late
                     # completion must not write failure state onto the successor.

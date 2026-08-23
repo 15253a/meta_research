@@ -26,7 +26,10 @@ from meta_research.provider_supervisor import (
     SUPERVISOR_REQUEST_SCHEMA,
     ProviderSupervisorError,
     ensure_transport_key,
+    read_transport_envelope,
     read_verified_exit_receipt,
+    request_supervisor_stop,
+    supervisor_request_never_started,
     write_supervisor_request,
 )
 from meta_research.quest_drafting import (
@@ -253,6 +256,8 @@ class DeepFetchProvider(Protocol):
 
     def execute(self, request: DeepFetchProviderRequest) -> DeepFetchResult: ...
 
+    def reconcile_cancelled_job(self, job_ref: str) -> bool: ...
+
 
 class DeepFetchAcquisitionClient(Protocol):
     """Narrow hosted port exposed to the v4 main-agent adapter."""
@@ -437,6 +442,79 @@ class CodexDeepFetchAdapter:
             finish_job(job_ref)
             for turn_number in range(12):
                 finish_job(f"{job_ref}:v4-turn:{turn_number}")
+
+    def reconcile_cancelled_job(self, job_ref: str) -> bool:
+        """Stop and verify all durable DeepFetch segments for a terminal Run."""
+
+        self.cancel_job(job_ref)
+        operation_root = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": job_ref})
+        )
+        if not operation_root.exists():
+            return True
+        try:
+            _key_path, key = ensure_transport_key(self._workspace)
+            directories = sorted(
+                path
+                for path in operation_root.iterdir()
+                if path.is_dir() and path.name.startswith("deepfetch-")
+            )
+            for directory in directories:
+                invocation_path = directory / "invocation.json"
+                if not invocation_path.is_file():
+                    if any(directory.iterdir()):
+                        raise ProviderSupervisorError(
+                            "provider_supervisor_spool_invalid"
+                        )
+                    continue
+                invocation = read_transport_envelope(invocation_path, key)
+                segment_name = directory.name.removeprefix("deepfetch-")
+                if (
+                    invocation.get("schema_ref")
+                    != "meta-research/deepfetch-provider-operation/v1"
+                    or invocation.get("job_ref") != job_ref
+                    or invocation.get("segment_name") != segment_name
+                ):
+                    raise ProviderSupervisorError(
+                        "provider_supervisor_spool_invalid"
+                    )
+                invocation_hash = canonical_hash(invocation)
+                receipt_path = directory / "supervisor-exit.json"
+                if not receipt_path.is_file():
+                    if not (directory / "supervisor-ready.json").is_file():
+                        if not supervisor_request_never_started(
+                            directory,
+                            key=key,
+                            invocation_hash=invocation_hash,
+                            request_schema=SUPERVISOR_REQUEST_SCHEMA,
+                        ):
+                            return False
+                        continue
+                    if not request_supervisor_stop(
+                        directory,
+                        key=key,
+                        invocation_hash=invocation_hash,
+                        ready_schema=(
+                            "meta-research/codex-provider-supervisor-ready/v1"
+                        ),
+                    ):
+                        return False
+                    if not receipt_path.is_file():
+                        continue
+                read_verified_exit_receipt(
+                    receipt_path,
+                    key=key,
+                    invocation_hash=invocation_hash,
+                    prompt_path=directory / "prompt.txt",
+                    schema_path=directory / "output-schema.json",
+                    stdout_path=directory / "stdout.jsonl",
+                    result_path=directory / "last-message.json",
+                )
+        except (OSError, ProviderSupervisorError, DeepFetchUnavailable):
+            return False
+        return True
 
     @property
     def requires_verified_terminal_retry(self) -> bool:

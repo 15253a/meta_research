@@ -232,6 +232,26 @@ def build_production_runtime(
             acquisition_provider,
         ),
     )
+    agent_runtime.bind_provider_quiescence_driver(
+        idea_skill_provider,
+        unit_kinds=("idea_primary", "idea_review"),
+    )
+    agent_runtime.bind_provider_quiescence_driver(
+        plan_skill_provider,
+        unit_kinds=("plan_primary", "plan_review"),
+    )
+    agent_runtime.bind_provider_quiescence_driver(
+        bundle_skill_provider,
+        unit_kinds=("bundle_primary", "bundle_review"),
+    )
+    agent_runtime.bind_provider_quiescence_driver(
+        deepfetch_provider,
+        unit_kinds=("deepfetch",),
+    )
+    agent_runtime.bind_provider_quiescence_driver(
+        experiment_provider,
+        unit_kinds=("experiment",),
+    )
     research_graph = create_research_graph_interface(
         database=database,
         feed=feed,
@@ -245,6 +265,7 @@ def build_production_runtime(
         manual_confirmation_verifier=manual_question_confirmations,
         human_response_verifier=human_response_verifier,
         plan_content_verifier=research_memory_receipts,
+        runtime_control_verifier=attempt_receipts,
     )
     research_memory = create_research_memory_interface(
         database=database,
@@ -281,6 +302,10 @@ def build_production_runtime(
         target_commit_verifier=research_graph_receipts,
         literature_snapshot_verifier=research_memory,
         human_response_verifier=human_response_verifier,
+        runtime_control_verifier=attempt_receipts,
+        question_control_verifier=research_graph_receipts,
+        stage_disposition_basis_verifier=research_graph_receipts,
+        current_question_verifier=research_graph_receipts,
     )
     human_collaboration = create_human_collaboration_interface(
         database=database,

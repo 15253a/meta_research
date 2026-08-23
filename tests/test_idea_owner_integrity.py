@@ -1145,6 +1145,21 @@ def test_advancement_engine_completes_an_accepted_no_viable_candidate(
 
         engine = runtime.owners.advancement_engine
         before = engine.query_snapshot()
+        foreground = engine.query_foreground(completed["quest_ref"])
+        assert foreground is not None
+        with pytest.raises(
+            OwnerConflict, match="stage_disposition_execution_required"
+        ):
+            engine.commit_stage_disposition(
+                cycle_ref=completed["cycle_ref"],
+                stage="idea",
+                epoch=foreground["epoch"],
+                disposition="exhausted",
+                basis_kind="accepted_no_viable_candidate",
+                basis_ref=decision.outcome_ref,
+                basis_receipt=decision.receipt,
+                idempotency_key="nvc-must-not-impersonate-exhaustion",
+            )
         commit = engine.commit_idea_stage(
             request_ref=request.request_ref,
             run_ref=run.run_ref,
@@ -1170,6 +1185,10 @@ def test_advancement_engine_completes_an_accepted_no_viable_candidate(
         assert after.revision == before.revision + 1
         assert after.facts["stage_commit_count"] == 1
         assert engine.query_idea_stage_commit(request.request_ref) == commit
+        next_foreground = engine.query_foreground(completed["quest_ref"])
+        assert next_foreground is not None
+        assert next_foreground["stage"] == "reasoning"
+        assert runtime.plan_stage.process_once() is False
     finally:
         runtime.close()
 

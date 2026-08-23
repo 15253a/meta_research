@@ -7,6 +7,7 @@ from typing import Callable, cast
 
 from sqlalchemy import text
 
+from meta_research.control_contract import validate_control_payload
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
 from meta_research.owners.common import (
@@ -67,6 +68,7 @@ _HARD_COMMAND_KINDS = {
     "high_risk_operation",
     "capability_expansion",
     "capability_authorization",
+    "research_control",
 }
 _MAX_PENDING_COMPANION_TURNS = 64
 
@@ -165,11 +167,17 @@ class SQLiteHumanCollaborationLadder:
         feed: DurableFeed,
         drafting_provider: IntentDraftingProvider,
         context_resolver: Callable[[str], dict[str, object]] | None = None,
+        control_preview_resolver: Callable[
+            [str, dict[str, object]],
+            tuple[list[dict[str, object]], dict[str, int]],
+        ]
+        | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._drafting_provider = drafting_provider
         self._context_resolver = context_resolver
+        self._control_preview_resolver = control_preview_resolver
         with self._database.write() as connection:
             recovered = connection.execute(
                 text(
@@ -1282,52 +1290,71 @@ class SQLiteHumanCollaborationLadder:
         intent, draft_row, draft = self._current_command(
             intent_id, draft_revision, draft_hash
         )
-        del intent
         payload = cast(dict[str, object], draft["payload"])
-        capability = cast(str, payload["capability"])
-        decision = cast(str, payload["decision"])
-        scope = cast(dict[str, object], payload["scope"])
-        with self._database.read() as connection:
-            authorization_count = int(
-                connection.execute(
-                    text(
-                        "SELECT authorization_count FROM human_collaboration_state "
-                        "WHERE singleton = 'owner'"
-                    )
-                ).scalar_one()
+        if draft["command_kind"] == "research_control":
+            if self._control_preview_resolver is None:
+                raise OwnerConflict("research_control_unavailable")
+            owner_previews, owner_revisions = self._control_preview_resolver(
+                str(intent.scope_ref), payload
             )
-        target_assertion = {
-            "owner": HC_OWNER,
-            "operation": "decide_capability_authorization",
-            "intent_id": intent_id,
-            "capability": capability,
-            "decision": decision,
-            "scope_hash": canonical_hash(scope),
-            "authorization_head": authorization_count,
-        }
-        owner_preview = {
-            "source_owner": HC_OWNER,
-            "target_assertion": target_assertion,
-            "will_happen": [
-                f"record an independent {decision} decision for {capability}"
-            ],
-            "will_not_happen": [
-                "confirmation alone will not grant the capability",
-                "no domain effect, Owner acceptance, Run, or Stage transition occurs",
-                "the authorization cannot exceed the system hard ceiling",
-            ],
-            "risks": [
-                "a grant may permit the exact high-risk capability inside its narrow scope"
-            ],
-            "stale_conditions": [
-                "the command draft changes",
-                "the capability authorization head changes",
-            ],
-        }
-        owner_previews = [
-            {**owner_preview, "digest": canonical_hash(owner_preview)}
-        ]
-        owner_revisions = {"human_collaboration": authorization_count}
+            if (
+                not owner_previews
+                or set(owner_revisions)
+                != {str(item.get("source_owner")) for item in owner_previews}
+                or any(
+                    item.get("digest")
+                    != canonical_hash(
+                        {key: value for key, value in item.items() if key != "digest"}
+                    )
+                    for item in owner_previews
+                )
+            ):
+                raise OwnerConflict("command_owner_preview_invalid")
+        else:
+            capability = cast(str, payload["capability"])
+            decision = cast(str, payload["decision"])
+            scope = cast(dict[str, object], payload["scope"])
+            with self._database.read() as connection:
+                authorization_count = int(
+                    connection.execute(
+                        text(
+                            "SELECT authorization_count FROM human_collaboration_state "
+                            "WHERE singleton = 'owner'"
+                        )
+                    ).scalar_one()
+                )
+            target_assertion = {
+                "owner": HC_OWNER,
+                "operation": "decide_capability_authorization",
+                "intent_id": intent_id,
+                "capability": capability,
+                "decision": decision,
+                "scope_hash": canonical_hash(scope),
+                "authorization_head": authorization_count,
+            }
+            owner_preview = {
+                "source_owner": HC_OWNER,
+                "target_assertion": target_assertion,
+                "will_happen": [
+                    f"record an independent {decision} decision for {capability}"
+                ],
+                "will_not_happen": [
+                    "confirmation alone will not grant the capability",
+                    "no domain effect, Owner acceptance, Run, or Stage transition occurs",
+                    "the authorization cannot exceed the system hard ceiling",
+                ],
+                "risks": [
+                    "a grant may permit the exact high-risk capability inside its narrow scope"
+                ],
+                "stale_conditions": [
+                    "the command draft changes",
+                    "the capability authorization head changes",
+                ],
+            }
+            owner_previews = [
+                {**owner_preview, "digest": canonical_hash(owner_preview)}
+            ]
+            owner_revisions = {"human_collaboration": authorization_count}
         with self._database.write() as connection:
             replay = _collaboration_command(
                 connection, idempotency_key, "command_preview", command_hash
@@ -1456,15 +1483,9 @@ class SQLiteHumanCollaborationLadder:
                 owner_revisions = decoded_object(preview.owner_revisions_json)
                 if canonical_hash(owner_revisions) != preview.owner_revisions_hash:
                     raise OwnerConflict("command_preview_stale")
-                authorization_count = int(
-                    connection.execute(
-                        text(
-                            "SELECT authorization_count FROM "
-                            "human_collaboration_state WHERE singleton = 'owner'"
-                        )
-                    ).scalar_one()
-                )
-                if owner_revisions != {"human_collaboration": authorization_count}:
+                if owner_revisions != _current_owner_revisions(
+                    connection, tuple(owner_revisions)
+                ):
                     raise OwnerConflict("command_preview_stale")
                 confirmation_ref = new_ref("human_confirmation")
                 receipt_hash = canonical_hash(
@@ -1595,6 +1616,13 @@ class SQLiteHumanCollaborationLadder:
                     {"confirmation_ref": confirmation.confirmation_ref},
                 ).scalar_one_or_none()
             )
+            execution = connection.execute(
+                text(
+                    "SELECT * FROM hc_command_executions WHERE intent_id = "
+                    ":intent_id"
+                ),
+                {"intent_id": intent_id},
+            ).first()
         document = decoded_object(draft.draft_json)
         if canonical_hash(document) != draft.draft_hash:
             raise OwnerConflict("command_draft_invalid")
@@ -1606,7 +1634,7 @@ class SQLiteHumanCollaborationLadder:
             "draft_revision": int(draft.draft_revision),
             "draft_hash": draft.draft_hash,
             "draft": document,
-            "executed": False,
+            "executed": execution is not None,
             "impact_preview": None,
             "confirmation_receipt": None,
         }
@@ -1665,6 +1693,32 @@ class SQLiteHumanCollaborationLadder:
             result["authorization"] = self.query_authorization(
                 str(authorization_ref)
             )
+        if execution is not None:
+            owner_receipts = json.loads(execution.owner_receipts_json)
+            expected_execution_receipt_hash = canonical_hash(
+                {
+                    "issuer": HC_OWNER,
+                    "kind": "confirmed_command_execution",
+                    "subject_ref": execution.execution_ref,
+                    "intent_id": execution.intent_id,
+                    "confirmation_receipt_ref": execution.confirmation_ref,
+                    "command_hash": execution.command_hash,
+                    "owner_receipts_hash": execution.owner_receipts_hash,
+                }
+            )
+            if (
+                canonical_json(owner_receipts) != execution.owner_receipts_json
+                or canonical_hash(owner_receipts) != execution.owner_receipts_hash
+                or execution.receipt_hash != expected_execution_receipt_hash
+            ):
+                raise OwnerConflict("command_execution_receipt_invalid")
+            result["control_execution"] = {
+                "execution_ref": execution.execution_ref,
+                "status": execution.status,
+                "owner_receipts": owner_receipts,
+                "receipt_ref": execution.receipt_ref,
+                "receipt_hash": execution.receipt_hash,
+            }
         return result
 
     def _validate_command(self, value: dict[str, object]) -> dict[str, object]:
@@ -1673,6 +1727,10 @@ class SQLiteHumanCollaborationLadder:
             raise OwnerConflict("command_draft_invalid")
         if command["command_kind"] not in _HARD_COMMAND_KINDS:
             raise OwnerConflict("command_kind_not_confirmation_gated")
+        if command["command_kind"] == "research_control":
+            command["payload"] = validate_control_payload(command["payload"])
+            _reject_secret_content(command)
+            return command
         if command["command_kind"] != "capability_authorization":
             raise OwnerConflict("command_target_unavailable")
         payload = command["payload"]
@@ -2499,6 +2557,33 @@ def _idempotency_key(value: str) -> None:
         or contains_secret(value)
     ):
         raise OwnerConflict("idempotency_key_invalid")
+
+
+def _current_owner_revisions(
+    connection, owners: tuple[str, ...]
+) -> dict[str, int]:
+    fields = {
+        # Capability previews historically bind the authorization head rather
+        # than unrelated Companion/command activity on HC's global revision.
+        "human_collaboration": ("human_collaboration_state", "authorization_count"),
+        "advancement_engine": ("advancement_engine_state", "revision"),
+        "agent_runtime": ("agent_runtime_state", "revision"),
+        "research_graph": ("research_graph_state", "revision"),
+        "research_memory": ("research_memory_state", "revision"),
+    }
+    if any(owner not in fields for owner in owners):
+        raise OwnerConflict("command_owner_preview_invalid")
+    return {
+        owner: int(
+            connection.execute(
+                text(
+                    f"SELECT {fields[owner][1]} FROM {fields[owner][0]} "
+                    "WHERE singleton = 'owner'"
+                )
+            ).scalar_one()
+        )
+        for owner in owners
+    }
 
 
 def _scope_ref(value: object, code: str) -> str:

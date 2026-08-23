@@ -424,6 +424,12 @@ class CommandConfirmationRequest(CommandPreviewRequest):
     preview_hash: str = Field(min_length=64, max_length=64)
 
 
+class CommandExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation_receipt_ref: str = Field(min_length=1, max_length=96)
+
+
 class CapabilityAuthorizationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1126,6 +1132,21 @@ def create_app(
             confirmation.draft_hash,
             confirmation.preview_ref,
             confirmation.preview_hash,
+            _idempotency_key(request),
+        )
+
+    @app.post(
+        "/api/v1/human-collaboration/commands/{intent_id}/executions",
+        status_code=201,
+    )
+    def execute_confirmed_command(
+        intent_id: str,
+        request: Request,
+        execution: CommandExecutionRequest,
+    ) -> dict[str, object]:
+        return runtime.owners.human_collaboration.execute_confirmed_command(
+            intent_id,
+            execution.confirmation_receipt_ref,
             _idempotency_key(request),
         )
 

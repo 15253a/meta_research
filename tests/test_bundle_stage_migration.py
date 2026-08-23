@@ -61,8 +61,8 @@ def test_interrupted_bundle_migration_rolls_back_and_restarts_cleanly(
     assert "'bundle'" not in request_ddl
 
     monkeypatch.setattr(Operations, "create_table", original_create_table)
-    upgrade_database(database)
-    upgrade_database(database)
+    _upgrade_to_revision(database, "0013_bundle_target_dag")
+    _upgrade_to_revision(database, "0013_bundle_target_dag")
 
     with sqlite3.connect(database) as connection:
         assert connection.execute(

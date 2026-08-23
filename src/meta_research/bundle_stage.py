@@ -1061,6 +1061,13 @@ class BundleStageWorker:
         if runtime_binding != run.runtime_binding:
             self._transient_error = "bundle_runtime_binding_drift"
             return False
+        invocation = (
+            run.primary_invocation
+            if run.primary_draft is None
+            else run.review_invocation
+        )
+        job_ref = invocation.operation_ref
+        unit_ref = invocation.invocation_ref
         skill_request = BundleSkillRequest(
             stage_request_ref=request.request_ref,
             cycle_ref=request.cycle_ref,
@@ -1073,95 +1080,134 @@ class BundleStageWorker:
             root_session_ref=run.root_session_ref,
             runtime_binding=run.runtime_binding,
             native_session_ref=run.native_session_ref,
-            job_ref=(
-                run.primary_invocation.invocation_ref
-                if run.primary_draft is None
-                else run.review_invocation.invocation_ref
-            ),
+            job_ref=job_ref,
         )
         if run.primary_draft is None:
-            try:
-                draft = self._provider.generate_draft(skill_request)
-                draft_hash = validate_bundle_skill_draft(skill_request, draft)
-            except BundleSkillUnavailable as error:
-                self._transient_error = error.code
-                return False
-            except BundleSkillContractError as error:
-                self._transient_error = str(error)
-                return False
-            checkpoint = self._agent_runtime.record_bundle_primary_draft(
+            self._agent_runtime.begin_provider_unit(
+                unit_ref=unit_ref,
+                operation_ref=job_ref,
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
                 fence_ref=run.fence_ref,
-                native_session_ref=draft.primary_session_ref,
-                runtime_binding=run.runtime_binding,
-                draft=draft.draft,
-                adapter_kind=draft.adapter_kind,
-                idempotency_key=_operation_key(
-                    "bundle-primary", run.run_ref, run.attempt_ref, draft_hash
-                ),
+                unit_kind="bundle_primary",
             )
-            if checkpoint.draft_hash != draft_hash:
-                raise OwnerConflict("bundle_primary_draft_hash_mismatch")
-            self._transient_error = None
-            return True
+            provider_safe = True
+            try:
+                try:
+                    draft = self._provider.generate_draft(skill_request)
+                    draft_hash = validate_bundle_skill_draft(skill_request, draft)
+                except BundleSkillUnavailable as error:
+                    if error.code == "codex_operation_reconciliation_pending":
+                        provider_safe = False
+                    self._transient_error = error.code
+                    return False
+                except BundleSkillContractError as error:
+                    self._transient_error = str(error)
+                    return False
+                checkpoint = self._agent_runtime.record_bundle_primary_draft(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=draft.primary_session_ref,
+                    runtime_binding=run.runtime_binding,
+                    draft=draft.draft,
+                    adapter_kind=draft.adapter_kind,
+                    idempotency_key=_operation_key(
+                        "bundle-primary", run.run_ref, run.attempt_ref, draft_hash
+                    ),
+                )
+                if checkpoint.draft_hash != draft_hash:
+                    raise OwnerConflict("bundle_primary_draft_hash_mismatch")
+                self._transient_error = None
+                return True
+            finally:
+                if provider_safe:
+                    self._agent_runtime.acknowledge_provider_safe_point(
+                        unit_ref=unit_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                    )
         draft = BundleSkillDraft(
             draft=run.primary_draft.draft,
             primary_session_ref=run.primary_draft.native_session_ref,
             adapter_kind=run.primary_draft.adapter_kind,
         )
-        try:
-            result = self._provider.review_draft(skill_request, draft)
-            draft_hash, target_plan_hash, _review_hash = validate_bundle_skill_result(
-                skill_request, result
-            )
-        except BundleSkillUnavailable as error:
-            self._transient_error = error.code
-            return False
-        except BundleSkillContractError as error:
-            self._transient_error = str(error)
-            return False
-        review = review_record(
-            result,
-            draft_hash=draft_hash,
-            final_target_plan_hash=target_plan_hash,
-        )
-        submission_ref = (
-            "bundle_submission_"
-            + canonical_hash(
-                {
-                    "request_ref": request.request_ref,
-                    "attempt_ref": run.attempt_ref,
-                    "fence_ref": run.fence_ref,
-                    "target_plan_hash": target_plan_hash,
-                    "review_hash": canonical_hash(review),
-                }
-            )[:32]
-        )
-        self._agent_runtime.record_bundle_attempt_execution(
+        self._agent_runtime.begin_provider_unit(
+            unit_ref=unit_ref,
+            operation_ref=job_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
-            submission_ref=submission_ref,
-            native_session_ref=result.primary_session_ref,
-            runtime_binding=run.runtime_binding,
-            target_plan=result.final_target_plan,
-            reviewed_draft=result.reviewed_draft,
-            review=review,
-            idempotency_key=_operation_key(
-                "bundle-execute", run.run_ref, run.attempt_ref
-            ),
+            unit_kind="bundle_review",
         )
-        self._transient_error = None
-        return True
+        provider_safe = True
+        try:
+            try:
+                result = self._provider.review_draft(skill_request, draft)
+                draft_hash, target_plan_hash, _review_hash = (
+                    validate_bundle_skill_result(skill_request, result)
+                )
+            except BundleSkillUnavailable as error:
+                if error.code == "codex_operation_reconciliation_pending":
+                    provider_safe = False
+                self._transient_error = error.code
+                return False
+            except BundleSkillContractError as error:
+                self._transient_error = str(error)
+                return False
+            review = review_record(
+                result,
+                draft_hash=draft_hash,
+                final_target_plan_hash=target_plan_hash,
+            )
+            submission_ref = (
+                "bundle_submission_"
+                + canonical_hash(
+                    {
+                        "request_ref": request.request_ref,
+                        "attempt_ref": run.attempt_ref,
+                        "fence_ref": run.fence_ref,
+                        "target_plan_hash": target_plan_hash,
+                        "review_hash": canonical_hash(review),
+                    }
+                )[:32]
+            )
+            self._agent_runtime.record_bundle_attempt_execution(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                submission_ref=submission_ref,
+                native_session_ref=result.primary_session_ref,
+                runtime_binding=run.runtime_binding,
+                target_plan=result.final_target_plan,
+                reviewed_draft=result.reviewed_draft,
+                review=review,
+                idempotency_key=_operation_key(
+                    "bundle-execute", run.run_ref, run.attempt_ref
+                ),
+            )
+            self._transient_error = None
+            finish_job = getattr(self._provider, "finish_job", None)
+            if callable(finish_job):
+                finish_job(job_ref)
+            return True
+        finally:
+            if provider_safe:
+                self._agent_runtime.acknowledge_provider_safe_point(
+                    unit_ref=unit_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                )
 
     def _finish_bundle_jobs(self, run: BundleStageRun) -> None:
         finish_job = getattr(self._provider, "finish_job", None)
         if not callable(finish_job):
             return
         for job_ref in {
-            run.primary_invocation.invocation_ref,
-            run.review_invocation.invocation_ref,
+            run.primary_invocation.operation_ref,
+            run.review_invocation.operation_ref,
         }:
             finish_job(job_ref)
 
