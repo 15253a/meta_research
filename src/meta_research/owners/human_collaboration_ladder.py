@@ -1548,12 +1548,13 @@ class SQLiteHumanCollaborationLadder:
             if error.code == "command_draft_stale":
                 raise OwnerConflict("command_preview_stale") from error
             raise
+        writing_snapshot: dict[str, object] | None = None
         if confirmed_draft.get("command_kind") == "writing_report_start":
             payload = cast(dict[str, object], confirmed_draft["payload"])
-            snapshot = cast(dict[str, object], payload["snapshot"])
+            writing_snapshot = cast(dict[str, object], payload["snapshot"])
             if self._writing_snapshot_verifier is None:
                 raise OwnerConflict("writing_snapshot_verifier_unavailable")
-            self._writing_snapshot_verifier(snapshot)
+            self._writing_snapshot_verifier(writing_snapshot)
         with self._database.write() as connection:
             replay = _collaboration_command(
                 connection, idempotency_key, "command_confirm", command_hash
@@ -1577,9 +1578,26 @@ class SQLiteHumanCollaborationLadder:
                 owner_revisions = decoded_object(preview.owner_revisions_json)
                 if canonical_hash(owner_revisions) != preview.owner_revisions_hash:
                     raise OwnerConflict("command_preview_stale")
-                if owner_revisions != _current_owner_revisions(
-                    connection, tuple(owner_revisions)
-                ):
+                if writing_snapshot is None:
+                    expected_owner_revisions = _current_owner_revisions(
+                        connection, tuple(owner_revisions)
+                    )
+                else:
+                    # WritingResearchSnapshotReader verifies semantic
+                    # currentness while deliberately excluding global Owner
+                    # bookkeeping revisions from that basis. Preserve the
+                    # frozen coherent-cut revisions in the preview and only
+                    # re-read HC's mutable authorization head here.
+                    expected_owner_revisions = _current_owner_revisions(
+                        connection, ("human_collaboration",)
+                    )
+                    expected_owner_revisions.update(
+                        cast(
+                            dict[str, int],
+                            writing_snapshot["owner_revisions"],
+                        )
+                    )
+                if owner_revisions != expected_owner_revisions:
                     raise OwnerConflict("command_preview_stale")
                 confirmation_ref = new_ref("human_confirmation")
                 receipt_hash = canonical_hash(

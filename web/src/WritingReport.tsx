@@ -206,14 +206,35 @@ export function WritingReportWorkbench({
     setBusy(action);
     setError(null);
     try {
-      replaceReport(
-        await controlWritingRun(
-          selected.run.run_ref,
-          action,
-          selected.run.attempt_ref,
-          selected.run.fence_ref,
-        ),
-      );
+      const cleanupDeadline = Date.now() + 5_000;
+      while (true) {
+        try {
+          replaceReport(
+            await controlWritingRun(
+              selected.run.run_ref,
+              action,
+              selected.run.attempt_ref,
+              selected.run.fence_ref,
+            ),
+          );
+          break;
+        } catch (caught) {
+          const code = errorCode(caught);
+          if (
+            action === "resume"
+            && code === "runtime_quiescence_pending"
+            && Date.now() < cleanupDeadline
+          ) {
+            // Pause retires the logical Fence before an in-flight provider is
+            // physically quiescent. Preserve this one user resume intent and
+            // replay its idempotent command after the worker records the safe
+            // boundary instead of requiring a timing-dependent second click.
+            await new Promise((resolveDelay) => window.setTimeout(resolveDelay, 100));
+            continue;
+          }
+          throw caught;
+        }
+      }
       onChanged();
     } catch (caught) {
       setError(errorCode(caught));

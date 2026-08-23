@@ -1537,6 +1537,48 @@ def test_confirmation_fails_closed_when_frozen_research_snapshot_is_stale(
         runtime.close()
 
 
+def test_confirmation_ignores_unrelated_owner_revision_bookkeeping(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path / "writing-bookkeeping-revision")
+    try:
+        quest = _confirm_direct_quest(runtime)
+        drafted = runtime.writing.create_report_intent(
+            quest_ref=quest["quest_ref"],
+            title="稳定 Snapshot 报告",
+            audience="研究负责人",
+            purpose="区分研究 basis 与 Owner bookkeeping",
+            instructions="不得把无关资产误判为 Snapshot 变化。",
+            idempotency_key="writing-bookkeeping-create",
+        )
+        previewed = runtime.writing.preview_report_intent(
+            drafted["intent_id"], idempotency_key="writing-bookkeeping-preview"
+        )
+        unrelated = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="unrelated-owner-bookkeeping.txt",
+                content=b"not accepted into this Quest\n",
+            ),
+            idempotency_key="writing-bookkeeping-unrelated-asset",
+        )
+        assert unrelated.asset is not None
+
+        preview = previewed["impact_preview"]
+        confirmed = runtime.writing.confirm_report_intent(
+            drafted["intent_id"],
+            draft_revision=previewed["draft_revision"],
+            draft_hash=previewed["draft_hash"],
+            preview_ref=preview["preview_ref"],
+            preview_hash=preview["preview_hash"],
+            idempotency_key="writing-bookkeeping-confirm",
+        )
+        assert confirmed["run"]["status"] == "active"
+    finally:
+        runtime.close()
+
+
 def test_experiment_closure_pages_past_256_without_silent_snapshot_truncation() -> None:
     admissions = [
         (f"evaluation_attempt:{index:04d}", float(index + 1))
