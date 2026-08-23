@@ -891,6 +891,7 @@ while confirmed["status"] != "completed":
 assert {key: value["status"] for key, value in confirmed["receipts"].items()} == {
     "human_confirmation": "accepted",
     "quest_goal": "accepted",
+    "broad_research_authorization": "accepted",
     "question_content": "accepted",
     "question_identity": "accepted",
     "cycle_activation": "accepted",
@@ -900,7 +901,7 @@ for receipt in confirmed["receipts"].values():
     assert all(receipt[field] for field in ("issuer", "kind", "receipt_ref", "subject_ref"))
     assert len(receipt["payload_hash"]) == 64
     receipt_refs.add(receipt["receipt_ref"])
-assert len(receipt_refs) == 5
+assert len(receipt_refs) == 6
 assert confirmed["recovery"]["state"] == "completed"
 assert all(
     confirmed.get(key)
