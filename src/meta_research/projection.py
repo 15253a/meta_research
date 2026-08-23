@@ -98,6 +98,63 @@ class PublicProjection:
                 if callable(collaboration_scope_query)
                 else _collaboration_scope(current_quest_creation)
             )
+            control_quest_ref = (
+                collaboration_scope.removeprefix("quest:")
+                if collaboration_scope.startswith("quest:")
+                else None
+            )
+            foreground_query = getattr(
+                self._advancement_engine, "query_foreground", None
+            )
+            managed_runs_query = getattr(
+                self._agent_runtime, "query_managed_runs", None
+            )
+            prune_records_query = getattr(
+                self._research_graph, "query_restorable_prune_records", None
+            )
+            research_control = (
+                {
+                    "status": "ready",
+                    "quest_ref": control_quest_ref,
+                    "foreground": foreground_query(control_quest_ref),
+                    "managed_runs": list(managed_runs_query(control_quest_ref)),
+                    "recovery_records": (
+                        list(prune_records_query(control_quest_ref))
+                        if callable(prune_records_query)
+                        else []
+                    ),
+                    "actions": [
+                        "pause",
+                        "resume",
+                        "normal_switch",
+                        "forced_switch",
+                        "cancel",
+                        "abandon",
+                        "prune",
+                        "restore",
+                    ],
+                }
+                if control_quest_ref is not None
+                and callable(foreground_query)
+                and callable(managed_runs_query)
+                else {
+                    "status": "capability_unavailable",
+                    "quest_ref": control_quest_ref,
+                    "foreground": None,
+                    "managed_runs": [],
+                    "recovery_records": [],
+                    "actions": [],
+                }
+                if control_quest_ref is not None
+                else {
+                    "status": "idle",
+                    "quest_ref": None,
+                    "foreground": None,
+                    "managed_runs": [],
+                    "recovery_records": [],
+                    "actions": [],
+                }
+            )
             idea_stage = (
                 None if self._idea_stage is None else self._idea_stage.query_current()
             )
@@ -125,6 +182,14 @@ class PublicProjection:
                         content = self._research_memory.read_question_content(
                             question.content_ref, question.content_hash
                         )
+                        query_lifecycle = getattr(
+                            self._research_graph, "query_question_lifecycle", None
+                        )
+                        lifecycle = (
+                            query_lifecycle(question.question_ref)
+                            if callable(query_lifecycle)
+                            else {"status": "active", "revision": 1}
+                        )
                         question_tree_items.append(
                             {
                                 "question_ref": question.question_ref,
@@ -140,6 +205,8 @@ class PublicProjection:
                                 "question_receipt_ref": (
                                     question.receipt.receipt_ref
                                 ),
+                                "lifecycle_status": lifecycle["status"],
+                                "lifecycle_revision": lifecycle["revision"],
                             }
                         )
                 except OwnerConflict as error:
@@ -361,6 +428,7 @@ class PublicProjection:
                 collaboration,
                 safe_runnable_basis,
             ),
+            "research_control": research_control,
             "experiment": {
                 "status": "idle" if current_experiment is None else "active",
                 "current": current_experiment,

@@ -494,6 +494,8 @@ export type QuestionTreeItem = {
   content_hash: string;
   schema_ref: string;
   question_receipt_ref: string;
+  lifecycle_status: "active" | "pruned";
+  lifecycle_revision: number;
 };
 
 export type QuestionTreeProjection =
@@ -883,6 +885,7 @@ export type ExperimentStdoutObservation = {
 
 export type ExperimentExecutionProjection = {
   status: string;
+  managed_status?: string;
   run_ref?: string;
   execution_request_ref?: string;
   attempt_ref?: string;
@@ -953,6 +956,7 @@ export type PublicSnapshot = {
   research_assets: ResearchAssetsView;
   idea_stage?: IdeaStageProjection | null;
   human_collaboration?: HumanCollaborationProjection;
+  research_control: ResearchControlProjection;
   plan_stage?: PlanStageProjection | null;
   experiment: PublicExperimentProjection;
   unavailable: UnavailableCapability[];
@@ -1351,14 +1355,48 @@ type HumanRequestAssetIntakeOperationBody = {
   fact_prefix: "material" | "result";
 };
 
-export type HumanCommandDraft = {
-  command_kind: string;
+export type HumanCapabilityCommandDraft = {
+  command_kind: "capability_authorization";
   payload: {
     capability: string;
     decision: "granted" | "denied" | "revoked";
     scope: Record<string, unknown>;
   };
 };
+
+export type ResearchControlAction =
+  | "pause"
+  | "resume"
+  | "normal_switch"
+  | "forced_switch"
+  | "cancel"
+  | "abandon"
+  | "prune"
+  | "restore";
+
+export type ResearchControlTarget = {
+  quest_ref: string;
+  cycle_ref: string;
+  question_ref: string;
+  epoch: number;
+  target_scope?: "cycle" | "stage" | "run";
+  run_ref?: string;
+  target_question_ref?: string;
+  prune_record_ref?: string;
+};
+
+export type ResearchControlCommandDraft = {
+  command_kind: "research_control";
+  payload: {
+    action: ResearchControlAction;
+    target: ResearchControlTarget;
+    reason: string;
+  };
+};
+
+export type HumanCommandDraft =
+  | HumanCapabilityCommandDraft
+  | ResearchControlCommandDraft;
 
 export type HumanCommandOwnerPreview = {
   source_owner: string;
@@ -1378,7 +1416,7 @@ export type HumanCommand = {
   draft_revision: number;
   draft_hash: string;
   draft: HumanCommandDraft;
-  executed: false;
+  executed: boolean;
   impact_preview: null | {
     preview_ref: string;
     preview_hash: string;
@@ -1390,6 +1428,60 @@ export type HumanCommand = {
   };
   confirmation_receipt: null | AssetReceipt & { status: "accepted" };
   authorization?: HumanCapabilityAuthorization | null;
+  control_execution?: null | {
+    execution_ref: string;
+    status: "completed";
+    owner_receipts: Record<string, unknown>[];
+    receipt_ref: string;
+    receipt_hash: string;
+  };
+};
+
+export type ManagedRunProjection = {
+  run_ref: string;
+  run_kind: string;
+  quest_ref: string | null;
+  cycle_ref: string | null;
+  epoch: number | null;
+  status: string;
+  attempt_ref: string | null;
+  root_session_ref: string | null;
+  fence_ref: string | null;
+  control_revision: number;
+  safe_point_ref: string | null;
+  terminal_reason: string | null;
+  cleanup_status: "none" | "pending" | "completed";
+  updated_at: number;
+};
+
+export type ResearchControlProjection = {
+  status: "ready" | "idle" | "capability_unavailable";
+  quest_ref: string | null;
+  foreground: null | {
+    quest_ref: string;
+    cycle_ref: string;
+    question_ref: string;
+    stage: string;
+    epoch: number;
+    status: string;
+    grant_ref: string;
+    grant_status: string;
+    safe_point_ref: string | null;
+    pending_operation_ref: string | null;
+    owner_revision: number;
+  };
+  managed_runs: ManagedRunProjection[];
+  recovery_records: Array<{
+    prune_record_ref: string;
+    quest_ref: string;
+    root_question_ref: string;
+    affected_question_refs: string[];
+    affected_question_count: number;
+    receipt_ref: string;
+    receipt_hash: string;
+    created_at: number;
+  }>;
+  actions: ResearchControlAction[];
 };
 
 export type HumanCapabilityAuthorization = {
@@ -2247,11 +2339,26 @@ export function confirmHumanCommand(command: HumanCommand): Promise<HumanCommand
   );
 }
 
+export function executeHumanCommand(command: HumanCommand): Promise<HumanCommand> {
+  const confirmation = command.confirmation_receipt;
+  if (!confirmation || command.draft.command_kind !== "research_control") {
+    throw new ProductError("research_control_confirmation_required");
+  }
+  return writeJson(
+    `/api/v1/human-collaboration/commands/${encodeURIComponent(command.intent_id)}/executions`,
+    "POST",
+    { confirmation_receipt_ref: confirmation.receipt_ref },
+  );
+}
+
 export function authorizeHumanCommand(
   command: HumanCommand,
 ): Promise<HumanCapabilityAuthorization> {
   const confirmation = command.confirmation_receipt;
   if (!confirmation) throw new ProductError("human_confirmation_required");
+  if (command.draft.command_kind !== "capability_authorization") {
+    throw new ProductError("capability_authorization_command_required");
+  }
   const payload = command.draft.payload;
   return writeJson(
     `/api/v1/human-collaboration/commands/${encodeURIComponent(command.intent_id)}/authorizations`,

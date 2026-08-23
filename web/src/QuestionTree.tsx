@@ -20,11 +20,17 @@ export type QuestionTreeProps = {
   projectionReason?: string | null;
   initialQuestionRef?: string | null;
   manualCreationReady: boolean;
+  controlsInert?: boolean;
   openingParentRef?: string | null;
   openError?: string | null;
   onClose: () => void;
   onCreateQuestion: (
     parent: QuestionTreeItem,
+    opener: HTMLButtonElement,
+  ) => void | Promise<void>;
+  onControlQuestion: (
+    action: "prune",
+    question: QuestionTreeItem,
     opener: HTMLButtonElement,
   ) => void | Promise<void>;
 };
@@ -177,10 +183,12 @@ export function QuestionTree({
   projectionReason = null,
   initialQuestionRef = null,
   manualCreationReady,
+  controlsInert = false,
   openingParentRef = null,
   openError = null,
   onClose,
   onCreateQuestion,
+  onControlQuestion,
 }: QuestionTreeProps) {
   const mainRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -497,8 +505,18 @@ export function QuestionTree({
                       className="question-node-action prune"
                       type="button"
                       aria-label={`剪裁 ${item.question_ref}`}
-                      title="capability_unavailable · question_pruning"
-                      disabled
+                      title={controlsInert
+                        ? "capability_unavailable · question_pruning"
+                        : "建立剪裁 Question 的控制草案"}
+                      disabled={controlsInert}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void onControlQuestion(
+                          "prune",
+                          item,
+                          event.currentTarget,
+                        );
+                      }}
                     >
                       ×
                     </button>
@@ -582,7 +600,9 @@ export function QuestionTree({
             <span><i aria-hidden="true" /> 实线：RG 父子拓扑</span>
             <span><i className="selected" aria-hidden="true" /> 紫色光晕：本地选中</span>
             <span><i className="human" aria-hidden="true" /> 珊瑚点：Projection 未提供关联 HumanRequest</span>
-            <span>悬停节点：左侧剪裁（typed disabled）· 右侧新建子问题</span>
+            <span>{controlsInert
+              ? "悬停节点：左侧剪裁（typed disabled）· 右侧新建子问题"
+              : "悬停节点：左侧建立剪裁草案 · 右侧新建子问题"}</span>
           </div>
         </section>
 
@@ -603,7 +623,7 @@ export function QuestionTree({
             </div>
             <div className="question-tree-inspector-facts">
               <div><small>Topology / RG</small><b>{selected.parent_question_ref ? `${selected.parent_question_ref} 的直接子题` : "Quest 根问题"} · {graphLabel}</b></div>
-              <div><small>Question fact / RG</small><b>{selected.question_receipt_ref}</b></div>
+              <div><small>Question fact / RG</small><b>{selected.question_receipt_ref}{controlsInert ? "" : ` · ${selected.lifecycle_status} r${selected.lifecycle_revision}`}</b></div>
               <div><small>Content fact / RM</small><b>{selected.content_ref} · {selected.content_hash}</b></div>
               <div><small>Cycle binding / AE</small><b>capability_unavailable · Projection 未提供</b></div>
             </div>

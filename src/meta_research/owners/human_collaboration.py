@@ -11,6 +11,11 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, Row
 
 from meta_research.acquisition import AcquisitionProvider
+from meta_research.control_contract import (
+    QUESTION_ACTIONS,
+    SWITCH_ACTIONS,
+    validate_control_payload,
+)
 from meta_research.database import Database
 from meta_research.deepfetch import DeepFetchRunRequest
 from meta_research.feed import DurableFeed
@@ -94,6 +99,58 @@ _PREVIEW_REFRESH_RETRY_SECONDS = 60.0
 _PREVIEW_REFRESH_CACHE_LIMIT = 256
 MAX_ACCEPTED_MATERIAL_BINDINGS = 100
 HUMAN_RESPONSE_RECEIPT_SCHEMA = "meta-research/human-request-response/v1"
+_MANAGED_RUN_STATUSES = {
+    "running",
+    "suspended",
+    "suspended_fenced",
+    "reconciliation_required",
+    "terminated",
+    "completed",
+}
+_SWITCH_EFFECT_STATUSES = {
+    "suspended",
+    "suspended_fenced",
+    "reconciliation_required",
+}
+
+
+def _switch_runtime_effect_requires_compensation(
+    runtime_receipt: dict[str, object], *, action: str
+) -> bool:
+    """Distinguish an AR suspension/fence from a completed normal handoff.
+
+    Non-Bundle normal switches leave their StageRun running until its StageCommit;
+    by the time AE can invalidate the target that Run may already be completed and
+    must never be reopened.  Forced switches and Bundle handoffs instead publish a
+    suspended/fenced post-state in the issuer-owned AR receipt and do require the
+    durable compensation path.
+    """
+
+    if (
+        runtime_receipt.get("issuer") != "agent_runtime"
+        or runtime_receipt.get("kind") != "runtime_control"
+        or runtime_receipt.get("action") != action
+    ):
+        raise OwnerConflict("runtime_control_receipt_invalid")
+    affected_runs = runtime_receipt.get("affected_runs")
+    if not isinstance(affected_runs, list):
+        raise OwnerConflict("runtime_control_receipt_invalid")
+    requires_compensation = False
+    for affected in affected_runs:
+        if not isinstance(affected, dict):
+            raise OwnerConflict("runtime_control_receipt_invalid")
+        run_ref = affected.get("run_ref")
+        status = affected.get("status")
+        if (
+            not isinstance(run_ref, str)
+            or not run_ref
+            or status not in _MANAGED_RUN_STATUSES
+        ):
+            raise OwnerConflict("runtime_control_receipt_invalid")
+        requires_compensation = (
+            requires_compensation or status in _SWITCH_EFFECT_STATUSES
+        )
+    return requires_compensation
 
 
 def _proposal_provider_job_ref(generation_ref: str, attempt_count: int) -> str:
@@ -196,6 +253,13 @@ class HumanCollaborationInterface(Protocol):
     ) -> dict[str, object]: ...
 
     def query_command(self, intent_id: str) -> dict[str, object]: ...
+
+    def execute_confirmed_command(
+        self,
+        intent_id: str,
+        confirmation_receipt_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
 
     def decide_capability_authorization(
         self,
@@ -409,7 +473,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "manual_creation_count, active_manual_creation_count, "
         "confirmed_manual_seed_count, "
         "human_response_count, companion_session_count, "
-        "pending_companion_turn_count, soft_constraint_count "
+        "pending_companion_turn_count, soft_constraint_count, "
+        "command_execution_count "
         "FROM human_collaboration_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -422,6 +487,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "companion_session_count",
         "pending_companion_turn_count",
         "soft_constraint_count",
+        "command_execution_count",
     ),
 )
 
@@ -1126,6 +1192,7 @@ class SQLiteHumanCollaboration:
             feed,
             intent_drafting_provider,
             self._resolve_companion_context,
+            self._resolve_control_preview,
         )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._preview_refresh_lock = threading.Lock()
@@ -1134,6 +1201,176 @@ class SQLiteHumanCollaboration:
         self._prefer_companion_drafting = True
         self._upgrade_active_legacy_draft()
         self._recover_interrupted_drafting()
+        self._recover_interrupted_control_commands()
+
+    def _recover_interrupted_control_commands(self, *, limit: int | None = None) -> bool:
+        """Finish or safely unwind confirmed cross-Owner control sagas."""
+
+        with self._database.read() as connection:
+            sagas = connection.execute(
+                text(
+                    "SELECT * FROM hc_control_sagas WHERE status NOT IN "
+                    "('completed', 'aborted') ORDER BY created_at, intent_id"
+                )
+            ).all()
+        if limit is not None:
+            sagas = sagas[:limit]
+        progressed = False
+        for saga in sagas:
+            try:
+                intent_id = saga.intent_id
+                operation_ref = saga.operation_ref
+                compensated = (
+                    self._agent_runtime.query_runtime_control_compensation(
+                        operation_ref
+                    )
+                )
+                if saga.status == "compensated" or compensated is not None:
+                    self._mark_control_saga(
+                        intent_id, status="compensated", last_error=saga.last_error
+                    )
+                    if saga.action in {"prune", "restore"}:
+                        self._research_graph.abort_question_control(
+                            operation_ref=operation_ref,
+                            reason_code="runtime_compensated",
+                        )
+                    if saga.target_scope != "run":
+                        self._advancement_engine.abort_foreground_control(
+                            operation_ref=operation_ref,
+                            reason_code="runtime_compensated",
+                        )
+                    self._mark_control_saga(
+                        intent_id,
+                        status="aborted",
+                        last_error="runtime_compensated",
+                    )
+                    progressed = True
+                    continue
+                command = self._collaboration_ladder.query_command(intent_id)
+                confirmation = command.get("confirmation_receipt")
+                if not isinstance(confirmation, dict) or not isinstance(
+                    confirmation.get("receipt_ref"), str
+                ):
+                    continue
+                self.execute_confirmed_command(
+                    intent_id,
+                    cast(str, confirmation["receipt_ref"]),
+                    "control-recovery-"
+                    + canonical_hash({"intent_id": intent_id})[:48],
+                )
+                with self._database.read() as connection:
+                    current_status = connection.execute(
+                        text(
+                            "SELECT status FROM hc_control_sagas WHERE intent_id = "
+                            ":intent_id"
+                        ),
+                        {"intent_id": intent_id},
+                    ).scalar_one()
+                progressed = progressed or current_status != saga.status
+            except OwnerConflict:
+                # A pending normal handoff or a command that now requires a fresh
+                # preview remains durably visible; initialization itself must stay
+                # available so the operator can inspect/retry it.
+                continue
+        return progressed
+
+    def _ensure_control_saga(
+        self,
+        *,
+        intent_id: str,
+        confirmation_ref: str,
+        operation_ref: str,
+        action: str,
+        target_scope: str,
+        command_hash: str,
+    ) -> object:
+        now = time.time()
+        with self._database.write() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_control_sagas WHERE intent_id = :intent_id OR "
+                    "operation_ref = :operation_ref"
+                ),
+                {"intent_id": intent_id, "operation_ref": operation_ref},
+            ).first()
+            if row is None:
+                connection.execute(
+                    text(
+                        "INSERT INTO hc_control_sagas (intent_id, confirmation_ref, "
+                        "operation_ref, action, target_scope, command_hash, status, "
+                        "created_at, updated_at) VALUES (:intent_id, "
+                        ":confirmation_ref, :operation_ref, :action, :target_scope, "
+                        ":command_hash, 'preparing', :now, :now)"
+                    ),
+                    {
+                        "intent_id": intent_id,
+                        "confirmation_ref": confirmation_ref,
+                        "operation_ref": operation_ref,
+                        "action": action,
+                        "target_scope": target_scope,
+                        "command_hash": command_hash,
+                        "now": now,
+                    },
+                )
+                row = connection.execute(
+                    text(
+                        "SELECT * FROM hc_control_sagas WHERE intent_id = :intent_id"
+                    ),
+                    {"intent_id": intent_id},
+                ).one()
+            if (
+                row.confirmation_ref != confirmation_ref
+                or row.operation_ref != operation_ref
+                or row.action != action
+                or row.target_scope != target_scope
+                or row.command_hash != command_hash
+            ):
+                raise OwnerConflict("idempotency_conflict")
+        return row
+
+    def _mark_control_saga(
+        self,
+        intent_id: str,
+        *,
+        status: str,
+        runtime_receipt: dict[str, object] | None = None,
+        graph_receipt: dict[str, object] | None = None,
+        advancement_receipt: dict[str, object] | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        values: dict[str, object] = {
+            "intent_id": intent_id,
+            "status": status,
+            "last_error": last_error,
+            "now": time.time(),
+        }
+        assignments = ["status = :status", "last_error = :last_error", "updated_at = :now"]
+        for name, receipt in (
+            ("runtime", runtime_receipt),
+            ("graph", graph_receipt),
+            ("advancement", advancement_receipt),
+        ):
+            if receipt is None:
+                continue
+            values[f"{name}_receipt_json"] = canonical_json(receipt)
+            values[f"{name}_receipt_hash"] = canonical_hash(receipt)
+            assignments.extend(
+                [
+                    f"{name}_receipt_json = :{name}_receipt_json",
+                    f"{name}_receipt_hash = :{name}_receipt_hash",
+                ]
+            )
+        with self._database.write() as connection:
+            changed = connection.execute(
+                text(
+                    "UPDATE hc_control_sagas SET "
+                    + ", ".join(assignments)
+                    + " WHERE intent_id = :intent_id"
+                ),
+                values,
+            )
+            if changed.rowcount != 1:
+                raise OwnerConflict("research_control_saga_missing")
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
@@ -1320,6 +1557,589 @@ class SQLiteHumanCollaboration:
         )
 
     def query_command(self, intent_id: str) -> dict[str, object]:
+        return self._collaboration_ladder.query_command(intent_id)
+
+    def _resolve_control_preview(
+        self, scope_ref: str, payload: dict[str, object]
+    ) -> tuple[list[dict[str, object]], dict[str, int]]:
+        control = validate_control_payload(payload)
+        target = cast(dict[str, object], control["target"])
+        quest_ref = cast(str, target["quest_ref"])
+        if scope_ref != f"quest:{quest_ref}":
+            raise OwnerConflict("research_control_scope_mismatch")
+        action = cast(str, control["action"])
+        if action in QUESTION_ACTIONS or action == "resume":
+            question_ref = cast(
+                str,
+                target[
+                    "target_question_ref"
+                    if action in QUESTION_ACTIONS
+                    else "question_ref"
+                ],
+            )
+            question = (
+                self._research_graph.query_question_history_by_ref(question_ref)
+                if action == "restore"
+                else self._research_graph.query_question_by_ref(question_ref)
+            )
+            if question is None or question.quest_ref != quest_ref:
+                raise OwnerConflict(
+                    "research_control_question_not_present"
+                    if action != "restore"
+                    else "research_control_question_target_invalid"
+                )
+        graph_preview = None
+        graph_revision = None
+        affected_question_refs = None
+        if action in {"prune", "restore"}:
+            graph_preview, graph_revision = (
+                self._research_graph.preview_question_control(control)
+            )
+            affected = cast(dict[str, object], graph_preview["target_assertion"])[
+                "affected_question_refs"
+            ]
+            if not isinstance(affected, list) or not all(
+                isinstance(item, str) and item for item in affected
+            ):
+                raise OwnerConflict("question_control_affected_set_invalid")
+            affected_question_refs = tuple(affected)
+        target_scope = cast(str, target["target_scope"])
+        source_stage = None
+        ae_preview = None
+        ae_revision = None
+        if target_scope != "run":
+            ae_preview, ae_revision = (
+                self._advancement_engine.preview_foreground_control(control)
+            )
+            ae_assertion = ae_preview.get("target_assertion")
+            if not isinstance(ae_assertion, dict):
+                raise OwnerConflict("foreground_control_preview_invalid")
+            raw_source_stage = ae_assertion.get("source_stage")
+            if not isinstance(raw_source_stage, str):
+                raise OwnerConflict("foreground_control_preview_invalid")
+            source_stage = raw_source_stage
+        ar_preview, ar_revision = self._agent_runtime.preview_runtime_control(
+            control,
+            affected_question_refs=affected_question_refs,
+            source_stage=source_stage if action == "normal_switch" else None,
+        )
+        previews = [ar_preview]
+        revisions = {"agent_runtime": ar_revision}
+        if ae_preview is not None and ae_revision is not None:
+            previews.insert(0, ae_preview)
+            revisions = {
+                "advancement_engine": ae_revision,
+                **revisions,
+            }
+        if graph_preview is not None and graph_revision is not None:
+            previews.append(graph_preview)
+            revisions["research_graph"] = graph_revision
+        return previews, revisions
+
+    def execute_confirmed_command(
+        self,
+        intent_id: str,
+        confirmation_receipt_ref: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise OwnerConflict("idempotency_key_required")
+        command = self._collaboration_ladder.query_command(intent_id)
+        confirmation = command.get("confirmation_receipt")
+        if (
+            command.get("draft", {}).get("command_kind") != "research_control"
+            or not isinstance(confirmation, dict)
+            or confirmation.get("receipt_ref") != confirmation_receipt_ref
+        ):
+            raise OwnerConflict("research_control_confirmation_invalid")
+        control = validate_control_payload(command["draft"]["payload"])
+        preview = command.get("impact_preview")
+        if not isinstance(preview, dict):
+            raise OwnerConflict("research_control_confirmation_invalid")
+        owner_revisions = preview.get("owner_revisions")
+        if not isinstance(owner_revisions, dict):
+            raise OwnerConflict("research_control_confirmation_invalid")
+        command_hash = canonical_hash(
+            {
+                "intent_id": intent_id,
+                "confirmation_receipt_ref": confirmation_receipt_ref,
+                "draft_hash": command["draft_hash"],
+                "preview_hash": preview["preview_hash"],
+                "control": control,
+            }
+        )
+        with self._database.read() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM hc_command_executions WHERE intent_id = "
+                    ":intent_id OR idempotency_key = :idempotency_key"
+                ),
+                {"intent_id": intent_id, "idempotency_key": idempotency_key},
+            ).first()
+        if existing is not None:
+            if (
+                existing.intent_id != intent_id
+                or existing.confirmation_ref != confirmation_receipt_ref
+                or existing.command_hash != command_hash
+            ):
+                raise OwnerConflict("idempotency_conflict")
+            # The execution receipt and saga terminal marker normally commit in
+            # one HC transaction below.  This also repairs receipts written by an
+            # older process that stopped before the terminal marker existed.
+            with self._database.write() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE hc_control_sagas SET status = 'completed', "
+                        "last_error = NULL, updated_at = :now WHERE intent_id = "
+                        ":intent_id"
+                    ),
+                    {"intent_id": intent_id, "now": time.time()},
+                )
+            return self._collaboration_ladder.query_command(intent_id)
+
+        target = cast(dict[str, object], control["target"])
+        action = cast(str, control["action"])
+        target_scope = cast(str, target["target_scope"])
+        existing_advancement = (
+            self._advancement_engine.query_foreground_control_by_intent(intent_id)
+            if target_scope != "run"
+            else None
+        )
+        target_question = (
+            (
+                self._research_graph.query_question_history_by_ref(
+                    cast(
+                        str,
+                        target[
+                            "target_question_ref"
+                            if action in QUESTION_ACTIONS
+                            else "question_ref"
+                        ],
+                    )
+                )
+                if action == "restore"
+                or (
+                    action in QUESTION_ACTIONS
+                    and existing_advancement is not None
+                )
+                else self._research_graph.query_question_by_ref(
+                    cast(
+                        str,
+                        target[
+                            "target_question_ref"
+                            if action in QUESTION_ACTIONS
+                            else "question_ref"
+                        ],
+                    )
+                )
+            )
+            if action in QUESTION_ACTIONS or action == "resume"
+            else None
+        )
+        if (action in QUESTION_ACTIONS or action == "resume") and (
+            target_question is None
+            or target_question.quest_ref != target["quest_ref"]
+        ):
+            raise OwnerConflict(
+                "research_control_question_not_present"
+                if action != "restore"
+                else "research_control_question_target_invalid"
+            )
+        ar_revision = owner_revisions.get("agent_runtime")
+        if not isinstance(ar_revision, int) or isinstance(ar_revision, bool):
+            raise OwnerConflict("research_control_confirmation_invalid")
+        prepared = None
+        operation_prefix = "runtime_control" if target_scope == "run" else "ae_control"
+        operation_ref = (
+            f"{operation_prefix}_{canonical_hash({'intent_id': intent_id})[:48]}"
+        )
+        saga = self._ensure_control_saga(
+            intent_id=intent_id,
+            confirmation_ref=confirmation_receipt_ref,
+            operation_ref=operation_ref,
+            action=action,
+            target_scope=target_scope,
+            command_hash=command_hash,
+        )
+        compensated = self._agent_runtime.query_runtime_control_compensation(
+            operation_ref
+        )
+        if saga.status in {"compensated", "aborted"} or compensated is not None:
+            if action in {"prune", "restore"}:
+                self._research_graph.abort_question_control(
+                    operation_ref=operation_ref,
+                    reason_code="runtime_compensated",
+                )
+            if target_scope != "run":
+                self._advancement_engine.abort_foreground_control(
+                    operation_ref=operation_ref,
+                    reason_code="runtime_compensated",
+                )
+            self._mark_control_saga(
+                intent_id,
+                status="aborted",
+                last_error="runtime_compensated",
+            )
+            raise OwnerConflict("research_control_repreview_required")
+        if (
+            isinstance(existing_advancement, dict)
+            and existing_advancement.get("status") == "aborted"
+        ):
+            abort_reason = existing_advancement.get("abort_reason_code")
+            if not isinstance(abort_reason, str) or not abort_reason:
+                raise OwnerConflict("foreground_control_operation_invalid")
+            if abort_reason == "switch_target_invalidated":
+                if action not in SWITCH_ACTIONS:
+                    raise OwnerConflict("foreground_control_operation_invalid")
+                runtime_receipt = self._agent_runtime.query_runtime_control_receipt(
+                    operation_ref
+                )
+                if runtime_receipt is None:
+                    raise OwnerConflict("runtime_control_receipt_invalid")
+                if _switch_runtime_effect_requires_compensation(
+                    runtime_receipt, action=action
+                ):
+                    self._agent_runtime.compensate_runtime_control(
+                        operation_ref=operation_ref,
+                        reason_code="switch_target_invalidated",
+                    )
+                    self._mark_control_saga(
+                        intent_id,
+                        status="compensated",
+                        runtime_receipt=runtime_receipt,
+                        advancement_receipt=existing_advancement,
+                        last_error=abort_reason,
+                    )
+            self._mark_control_saga(
+                intent_id,
+                status="aborted",
+                advancement_receipt=existing_advancement,
+                last_error=abort_reason,
+            )
+            raise OwnerConflict("research_control_repreview_required")
+        ae_prepared = False
+        ar_prepared = False
+        rg_prepared = False
+        affected_question_refs: tuple[str, ...] | None = None
+        source_stage: str | None = None
+        try:
+            if target_scope != "run":
+                ae_revision = owner_revisions.get("advancement_engine")
+                if not isinstance(ae_revision, int) or isinstance(ae_revision, bool):
+                    raise OwnerConflict("research_control_confirmation_invalid")
+                prepared = self._advancement_engine.prepare_foreground_control(
+                    intent_id=intent_id,
+                    payload=control,
+                    expected_revision=ae_revision,
+                    idempotency_key=f"{idempotency_key}:ae:prepare",
+                    target_question=target_question,
+                )
+                operation_ref = cast(str, prepared["operation_ref"])
+                ae_prepared = True
+                if action == "normal_switch":
+                    raw_source_stage = prepared.get("source_stage")
+                    if not isinstance(raw_source_stage, str):
+                        raise OwnerConflict("foreground_control_operation_invalid")
+                    source_stage = raw_source_stage
+            if action in {"prune", "restore"}:
+                graph_revision = owner_revisions.get("research_graph")
+                if not isinstance(graph_revision, int) or isinstance(
+                    graph_revision, bool
+                ):
+                    raise OwnerConflict("research_control_confirmation_invalid")
+                graph_reservation = self._research_graph.prepare_question_control(
+                    operation_ref=operation_ref,
+                    payload=control,
+                    expected_revision=graph_revision,
+                    idempotency_key=f"{idempotency_key}:rg:prepare",
+                )
+                rg_prepared = True
+                affected = graph_reservation.get("affected_question_refs")
+                if not isinstance(affected, list) or not all(
+                    isinstance(item, str) and item for item in affected
+                ):
+                    raise OwnerConflict("question_control_affected_set_invalid")
+                affected_question_refs = tuple(affected)
+            self._agent_runtime.prepare_runtime_control(
+                operation_ref=operation_ref,
+                payload=control,
+                expected_revision=ar_revision,
+                idempotency_key=f"{idempotency_key}:ar:prepare",
+                affected_question_refs=affected_question_refs,
+                source_stage=source_stage,
+            )
+            ar_prepared = True
+            self._mark_control_saga(intent_id, status="prepared")
+        except OwnerConflict:
+            if rg_prepared:
+                self._research_graph.abort_question_control(
+                    operation_ref=operation_ref,
+                    reason_code="owner_prepare_failed",
+                )
+            if ar_prepared:
+                self._agent_runtime.abort_runtime_control(
+                    operation_ref=operation_ref,
+                    reason_code="owner_prepare_failed",
+                )
+            if ae_prepared:
+                self._advancement_engine.abort_foreground_control(
+                    operation_ref=operation_ref,
+                    reason_code="owner_prepare_failed",
+                )
+            self._mark_control_saga(
+                intent_id,
+                status="aborted",
+                last_error="owner_prepare_failed",
+            )
+            raise
+        runtime_receipt = None
+        graph_receipt = None
+        advancement_receipt = None
+        runtime_applied = False
+        graph_applied = False
+        try:
+            runtime_receipt = self._agent_runtime.apply_runtime_control(
+                operation_ref=operation_ref,
+                payload=control,
+                expected_revision=ar_revision,
+                idempotency_key=f"{idempotency_key}:ar",
+                affected_question_refs=affected_question_refs,
+                source_stage=source_stage,
+            )
+            runtime_applied = True
+            self._mark_control_saga(
+                intent_id,
+                status="runtime_applied",
+                runtime_receipt=runtime_receipt,
+            )
+            if action in {"prune", "restore"}:
+                graph_revision = owner_revisions.get("research_graph")
+                if not isinstance(graph_revision, int) or isinstance(
+                    graph_revision, bool
+                ):
+                    raise OwnerConflict("research_control_confirmation_invalid")
+                graph_receipt = self._research_graph.apply_question_control(
+                    operation_ref=operation_ref,
+                    payload=control,
+                    runtime_receipt=runtime_receipt,
+                    expected_revision=graph_revision,
+                    idempotency_key=f"{idempotency_key}:rg",
+                )
+                graph_applied = True
+                self._mark_control_saga(
+                    intent_id,
+                    status="graph_applied",
+                    runtime_receipt=runtime_receipt,
+                    graph_receipt=graph_receipt,
+                )
+            if prepared is not None:
+                advancement_receipt = (
+                    self._advancement_engine.complete_foreground_control(
+                        operation_ref=operation_ref,
+                        runtime_receipt=runtime_receipt,
+                        graph_receipt=graph_receipt,
+                        idempotency_key=f"{idempotency_key}:ae:complete",
+                    )
+                )
+                if advancement_receipt.get("status") not in {
+                    "completed",
+                    "handoff_pending",
+                }:
+                    raise OwnerConflict("foreground_control_receipt_invalid")
+                self._mark_control_saga(
+                    intent_id,
+                    status="advancement_applied",
+                    runtime_receipt=runtime_receipt,
+                    graph_receipt=graph_receipt,
+                    advancement_receipt=advancement_receipt,
+                )
+                if advancement_receipt.get("status") == "handoff_pending":
+                    pending = self._collaboration_ladder.query_command(intent_id)
+                    pending["control_pending"] = advancement_receipt
+                    return pending
+        except OwnerConflict as error:
+            # Owner prepare only reserves a frozen scope.  If a later Owner loses
+            # currentness, restore the already-applied AR effect using a new Fence
+            # (never by resurrecting the revoked one), then release every pending
+            # reservation so a fresh preview can proceed.
+            if (
+                runtime_applied
+                and action in SWITCH_ACTIONS
+                and isinstance(advancement_receipt, dict)
+                and advancement_receipt.get("status") == "aborted"
+            ):
+                if not isinstance(runtime_receipt, dict):
+                    raise OwnerConflict("runtime_control_receipt_invalid") from error
+                if _switch_runtime_effect_requires_compensation(
+                    runtime_receipt, action=action
+                ):
+                    self._agent_runtime.compensate_runtime_control(
+                        operation_ref=operation_ref,
+                        reason_code="switch_target_invalidated",
+                    )
+                    self._mark_control_saga(
+                        intent_id,
+                        status="compensated",
+                        runtime_receipt=runtime_receipt,
+                        advancement_receipt=advancement_receipt,
+                        last_error="switch_target_invalidated",
+                    )
+                self._mark_control_saga(
+                    intent_id,
+                    status="aborted",
+                    runtime_receipt=runtime_receipt,
+                    advancement_receipt=advancement_receipt,
+                    last_error="switch_target_invalidated",
+                )
+                raise OwnerConflict("research_control_repreview_required") from error
+            if runtime_applied and not graph_applied and action in {"prune", "restore"}:
+                self._agent_runtime.compensate_runtime_control(
+                    operation_ref=operation_ref,
+                    reason_code="downstream_owner_apply_failed",
+                )
+                self._mark_control_saga(
+                    intent_id,
+                    status="compensated",
+                    runtime_receipt=runtime_receipt,
+                    last_error="downstream_owner_apply_failed",
+                )
+                if rg_prepared:
+                    self._research_graph.abort_question_control(
+                        operation_ref=operation_ref,
+                        reason_code="owner_apply_failed",
+                    )
+                if ae_prepared:
+                    self._advancement_engine.abort_foreground_control(
+                        operation_ref=operation_ref,
+                        reason_code="owner_apply_failed",
+                    )
+                self._mark_control_saga(
+                    intent_id,
+                    status="aborted",
+                    runtime_receipt=runtime_receipt,
+                    last_error="owner_apply_failed",
+                )
+            elif not runtime_applied:
+                if rg_prepared:
+                    self._research_graph.abort_question_control(
+                        operation_ref=operation_ref,
+                        reason_code="owner_apply_failed",
+                    )
+                if ar_prepared:
+                    self._agent_runtime.abort_runtime_control(
+                        operation_ref=operation_ref,
+                        reason_code="owner_apply_failed",
+                    )
+                if ae_prepared:
+                    self._advancement_engine.abort_foreground_control(
+                        operation_ref=operation_ref,
+                        reason_code="owner_apply_failed",
+                    )
+                self._mark_control_saga(
+                    intent_id,
+                    status="aborted",
+                    last_error="owner_apply_failed",
+                )
+            else:
+                # At least one Owner effect is now durable.  Preserve the last
+                # completed step and recover forward; aborting AE here would make
+                # an applied RG/AR effect impossible to reconcile.
+                self._mark_control_saga(
+                    intent_id,
+                    status="graph_applied" if graph_applied else "runtime_applied",
+                    runtime_receipt=runtime_receipt,
+                    graph_receipt=graph_receipt,
+                    last_error=error.code,
+                )
+            raise
+        assert runtime_receipt is not None
+        owner_receipts = [runtime_receipt]
+        if advancement_receipt is not None:
+            owner_receipts.insert(0, advancement_receipt)
+        if graph_receipt is not None:
+            owner_receipts.append(graph_receipt)
+        owner_receipts_hash = canonical_hash(owner_receipts)
+        execution_ref = new_ref("command_execution")
+        receipt_ref = new_ref("hc_execution_receipt")
+        receipt_hash = canonical_hash(
+            {
+                "issuer": HC_OWNER,
+                "kind": "confirmed_command_execution",
+                "subject_ref": execution_ref,
+                "intent_id": intent_id,
+                "confirmation_receipt_ref": confirmation_receipt_ref,
+                "command_hash": command_hash,
+                "owner_receipts_hash": owner_receipts_hash,
+            }
+        )
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM hc_command_executions WHERE intent_id = "
+                    ":intent_id OR idempotency_key = :idempotency_key"
+                ),
+                {"intent_id": intent_id, "idempotency_key": idempotency_key},
+            ).first()
+            if existing is None:
+                connection.execute(
+                    text(
+                        "INSERT INTO hc_command_executions (execution_ref, intent_id, "
+                        "confirmation_ref, idempotency_key, command_hash, "
+                        "owner_receipts_json, owner_receipts_hash, receipt_ref, "
+                        "receipt_hash, status, created_at) VALUES (:execution_ref, "
+                        ":intent_id, :confirmation_ref, :idempotency_key, "
+                        ":command_hash, :owner_receipts_json, :owner_receipts_hash, "
+                        ":receipt_ref, :receipt_hash, 'completed', :created_at)"
+                    ),
+                    {
+                        "execution_ref": execution_ref,
+                        "intent_id": intent_id,
+                        "confirmation_ref": confirmation_receipt_ref,
+                        "idempotency_key": idempotency_key,
+                        "command_hash": command_hash,
+                        "owner_receipts_json": canonical_json(owner_receipts),
+                        "owner_receipts_hash": owner_receipts_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "created_at": time.time(),
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = revision + "
+                        "1, command_execution_count = command_execution_count + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "human_collaboration.confirmed_command_executed",
+                    {
+                        "intent_id": intent_id,
+                        "execution_ref": execution_ref,
+                        "owner_receipt_refs": [
+                            item.get("receipt_ref")
+                            or cast(dict[str, object], item.get("receipt", {})).get(
+                                "receipt_ref"
+                            )
+                            for item in owner_receipts
+                        ],
+                    },
+                )
+            elif (
+                existing.confirmation_ref != confirmation_receipt_ref
+                or existing.command_hash != command_hash
+            ):
+                raise OwnerConflict("idempotency_conflict")
+            saga = connection.execute(
+                text(
+                    "UPDATE hc_control_sagas SET status = 'completed', last_error = "
+                    "NULL, updated_at = :now WHERE intent_id = :intent_id"
+                ),
+                {"intent_id": intent_id, "now": time.time()},
+            )
+            if saga.rowcount != 1:
+                raise OwnerConflict("research_control_saga_missing")
         return self._collaboration_ladder.query_command(intent_id)
 
     def decide_capability_authorization(
@@ -5439,6 +6259,8 @@ class SQLiteHumanCollaboration:
 
     def reconcile_once(self) -> bool:
         if self._manual_creation.reconcile_once():
+            return True
+        if self._recover_interrupted_control_commands(limit=1):
             return True
         with self._database.read() as connection:
             initialization_ids = (

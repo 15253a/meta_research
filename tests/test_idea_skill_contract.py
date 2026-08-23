@@ -5,6 +5,7 @@ from importlib.resources import files
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
@@ -1412,6 +1413,54 @@ def test_graceful_stop_leaves_a_signed_provider_termination(
     assert forbidden_replay.calls == []
 
 
+def test_cleanup_terminates_provider_orphaned_by_supervisor_crash(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "orphaned-supervisor-provider"
+    executable = _fake_codex_executable(
+        tmp_path / "fake-codex-orphaned-supervisor",
+        read_all_input=True,
+        sleep_seconds=30,
+    )
+    runner = _DetachedSupervisorRunner()
+    adapter = CodexIdeaSkillAdapter(
+        workspace,
+        executable=str(executable),
+        timeout_seconds=60,
+        process_runner=runner,
+    )
+    job_ref = "idea-primary-operation:orphaned-supervisor"
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        job_ref=job_ref,
+    )
+
+    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_io_unavailable"):
+        adapter.generate_draft(request)
+    operation = next(workspace.glob("provider-operations/*/primary"))
+    deadline = time.monotonic() + 5
+    while not (operation / "provider-started.json").is_file():
+        if time.monotonic() >= deadline:
+            raise AssertionError("provider process marker was not published")
+        time.sleep(0.01)
+    marker = json.loads(
+        (operation / "provider-started.json").read_text(encoding="utf-8")
+    )["payload"]
+    provider_process_id = int(marker["provider_process_id"])
+    assert runner.process is not None
+    os.kill(runner.process.pid, signal.SIGKILL)
+    runner.process.wait(timeout=2)
+    assert not (operation / "supervisor-exit.json").exists()
+
+    assert adapter.reconcile_cancelled_job(job_ref) is True
+    deadline = time.monotonic() + 2
+    while Path(f"/proc/{provider_process_id}").exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("orphaned provider survived cleanup reconciliation")
+        time.sleep(0.01)
+    assert not (operation / "supervisor-exit.json").exists()
+
+
 def test_durable_supervisor_recovers_a_prelaunch_daemon_loss(
     tmp_path: Path,
 ) -> None:
@@ -1443,6 +1492,40 @@ def test_durable_supervisor_recovers_a_prelaunch_daemon_loss(
     assert recovered.draft == _idea_set()
     assert (operation / "provider-started.json").is_file()
     assert (operation / "completed.json").is_file()
+
+
+def test_cancelled_prelaunch_operation_becomes_safe_after_startup_window(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "prelaunch-cancel-provider"
+    executable = _fake_codex_executable(
+        tmp_path / "fake-codex-prelaunch-cancel",
+        read_all_input=True,
+    )
+    adapter = CodexIdeaSkillAdapter(
+        workspace,
+        executable=str(executable),
+        process_runner=_PrelaunchLossRunner(),
+    )
+    job_ref = "idea-primary-operation:prelaunch-cancel"
+    request = _request(
+        runtime_binding=adapter.runtime_binding(),
+        job_ref=job_ref,
+    )
+
+    with pytest.raises(IdeaSkillUnavailable, match="codex_cli_io_unavailable"):
+        adapter.generate_draft(request)
+    operation = next(workspace.glob("provider-operations/*/primary"))
+    request_path = operation / "supervisor-request.json"
+    assert request_path.is_file()
+    assert adapter.reconcile_cancelled_job(job_ref) is False
+
+    # Simulate a restart after the runner's persisted five-second launch window.
+    os.utime(request_path, (0, 0))
+    assert adapter.reconcile_cancelled_job(job_ref) is True
+    assert not (operation / "supervisor-ready.json").exists()
+    assert not (operation / "provider-started.json").exists()
+    assert not (operation / "supervisor-exit.json").exists()
 
 
 def test_adapter_rejects_multiple_native_session_identities(

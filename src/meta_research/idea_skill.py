@@ -33,8 +33,11 @@ from meta_research.provider_supervisor import (
     ProviderSupervisorError,
     SUPERVISOR_REQUEST_SCHEMA,
     ensure_transport_key,
+    read_transport_envelope,
     read_transport_key_for_operation,
     read_verified_exit_receipt,
+    request_supervisor_stop,
+    supervisor_request_never_started,
     transport_key_hash,
     write_exit_receipt,
     write_supervisor_request,
@@ -114,6 +117,8 @@ class IdeaSkillProvider(Protocol):
     ) -> IdeaSkillResult: ...
 
     def execute(self, request: IdeaSkillRequest) -> IdeaSkillResult: ...
+
+    def reconcile_cancelled_job(self, job_ref: str) -> bool: ...
 
 
 def validate_idea_skill_draft(
@@ -291,6 +296,97 @@ class CodexIdeaSkillAdapter:
         finish_job = getattr(self._runner, "finish_job", None)
         if callable(finish_job):
             finish_job(job_ref)
+
+    def reconcile_cancelled_job(self, job_ref: str) -> bool:
+        """Stop and verify every durable phase belonging to a terminal Run."""
+
+        self.cancel_job(job_ref)
+        operation_root = (
+            self._workspace
+            / "provider-operations"
+            / canonical_hash({"job_ref": job_ref})
+        )
+        if not operation_root.exists():
+            return True
+        try:
+            _key_path, key = self._transport_key()
+            for operation_name in ("primary", "review"):
+                directory = operation_root / operation_name
+                if not directory.exists():
+                    continue
+                invocation_path = directory / "invocation.json"
+                if not invocation_path.is_file():
+                    if any(directory.iterdir()):
+                        raise ProviderSupervisorError(
+                            "provider_supervisor_spool_invalid"
+                        )
+                    continue
+                invocation = read_transport_envelope(invocation_path, key)
+                if (
+                    set(invocation)
+                    != {
+                        "schema_ref",
+                        "job_ref",
+                        "operation_name",
+                        "prompt_hash",
+                        "output_schema_hash",
+                        "native_session_ref",
+                        "model_ref",
+                        "transport_mode",
+                    }
+                    or invocation.get("schema_ref")
+                    != "meta-research/codex-provider-operation/v1"
+                    or invocation.get("job_ref") != job_ref
+                    or invocation.get("operation_name") != operation_name
+                ):
+                    raise ProviderSupervisorError(
+                        "provider_supervisor_spool_invalid"
+                    )
+                if invocation.get("transport_mode") != "durable_supervisor":
+                    # An unsealed in-process runner has no cross-restart terminal
+                    # proof. Keep cleanup pending instead of guessing it stopped.
+                    return False
+                invocation_hash = canonical_hash(invocation)
+                receipt_path = directory / "supervisor-exit.json"
+                if not receipt_path.is_file():
+                    if not (directory / "supervisor-ready.json").is_file():
+                        # No request means Popen was never attempted. A prepared
+                        # request without a signed PID marker remains unknown and
+                        # is retried by the next reconciliation pass.
+                        if not supervisor_request_never_started(
+                            directory,
+                            key=key,
+                            invocation_hash=invocation_hash,
+                            request_schema=SUPERVISOR_REQUEST_SCHEMA,
+                        ):
+                            return False
+                        continue
+                    if not request_supervisor_stop(
+                        directory,
+                        key=key,
+                        invocation_hash=invocation_hash,
+                        ready_schema=(
+                            "meta-research/codex-provider-supervisor-ready/v1"
+                        ),
+                    ):
+                        return False
+                    if not receipt_path.is_file():
+                        # A dead supervisor cannot seal an exit receipt. The
+                        # shared helper has instead verified/terminated every
+                        # process carrying this exact operation token.
+                        continue
+                read_verified_exit_receipt(
+                    receipt_path,
+                    key=key,
+                    invocation_hash=invocation_hash,
+                    prompt_path=directory / "prompt.txt",
+                    schema_path=directory / "output-schema.json",
+                    stdout_path=directory / "stdout.jsonl",
+                    result_path=directory / "last-message.json",
+                )
+        except (OSError, ProviderSupervisorError, IdeaSkillUnavailable):
+            return False
+        return True
 
     def runtime_binding(self) -> IdeaRuntimeBinding:
         resources = _idea_skill_resources()

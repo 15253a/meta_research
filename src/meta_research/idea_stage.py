@@ -134,6 +134,11 @@ class IdeaStageWorker:
         RG and AE before a command is issued.
         """
 
+        if self._agent_runtime.reconcile_pending_provider_cleanup(
+            self._provider,
+            unit_kinds=("idea_primary", "idea_review"),
+        ):
+            return True
         transient_error: str | None = None
         advanced = False
         self._transient_error = None
@@ -193,6 +198,9 @@ class IdeaStageWorker:
                 runtime_binding=runtime_binding,
             )
             return _CycleStep(True, provider_boundary_attempted=True)
+        managed = self._agent_runtime.query_managed_run(run.run_ref)
+        if managed is not None and managed["status"] not in {"running", "completed"}:
+            return _CycleStep(False)
         if self._advancement_engine.query_idea_stage_commit(request.request_ref):
             return _CycleStep(False)
 
@@ -391,7 +399,10 @@ class IdeaStageWorker:
             ):
                 raise OwnerConflict("rejection_lineage_invalid")
             predecessor_hash = material_outcome_hash(predecessor.outcome)
-        elif run.attempt_generation != 1 or (
+        elif (
+            run.attempt_generation != 1
+            and run.technical_predecessor_attempt_ref is None
+        ) or (
             (run.native_session_ref is None) != (run.primary_draft is None)
         ):
             raise OwnerConflict("attempt_lineage_invalid")
@@ -407,11 +418,13 @@ class IdeaStageWorker:
         if runtime_binding != run.runtime_binding:
             self._transient_error = "idea_runtime_binding_drift"
             return _CycleStep(False, provider_boundary_attempted=True)
-        job_ref = (
-            run.primary_invocation.invocation_ref
+        invocation = (
+            run.primary_invocation
             if run.primary_draft is None
-            else run.review_invocation.invocation_ref
+            else run.review_invocation
         )
+        job_ref = invocation.operation_ref
+        unit_ref = invocation.invocation_ref
         skill_request = IdeaSkillRequest(
             stage_request_ref=request.request_ref,
             question_ref=current.question.question_ref,
@@ -433,31 +446,51 @@ class IdeaStageWorker:
             job_ref=job_ref,
         )
         if run.primary_draft is None:
-            try:
-                draft = self._provider.generate_draft(skill_request)
-                draft_hash = validate_idea_skill_draft(skill_request, draft)
-            except IdeaSkillUnavailable as error:
-                self._transient_error = error.code
-                return _CycleStep(False, provider_boundary_attempted=True)
-            except IdeaSkillContractError as error:
-                self._transient_error = str(error)
-                return _CycleStep(False, provider_boundary_attempted=True)
-            checkpoint = self._agent_runtime.record_idea_primary_draft(
+            self._agent_runtime.begin_provider_unit(
+                unit_ref=unit_ref,
+                operation_ref=job_ref,
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
                 fence_ref=run.fence_ref,
-                native_session_ref=draft.primary_session_ref,
-                runtime_binding=run.runtime_binding,
-                draft=draft.draft,
-                adapter_kind=draft.adapter_kind,
-                idempotency_key=_operation_key(
-                    "idea-primary", run.run_ref, run.attempt_ref, draft_hash
-                ),
+                unit_kind="idea_primary",
             )
-            if checkpoint.draft_hash != draft_hash:
-                raise OwnerConflict("idea_primary_draft_hash_mismatch")
-            self._transient_error = None
-            return _CycleStep(True, provider_boundary_attempted=True)
+            provider_safe = True
+            try:
+                try:
+                    draft = self._provider.generate_draft(skill_request)
+                    draft_hash = validate_idea_skill_draft(skill_request, draft)
+                except IdeaSkillUnavailable as error:
+                    if error.code == "codex_operation_reconciliation_pending":
+                        provider_safe = False
+                    self._transient_error = error.code
+                    return _CycleStep(False, provider_boundary_attempted=True)
+                except IdeaSkillContractError as error:
+                    self._transient_error = str(error)
+                    return _CycleStep(False, provider_boundary_attempted=True)
+                checkpoint = self._agent_runtime.record_idea_primary_draft(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=draft.primary_session_ref,
+                    runtime_binding=run.runtime_binding,
+                    draft=draft.draft,
+                    adapter_kind=draft.adapter_kind,
+                    idempotency_key=_operation_key(
+                        "idea-primary", run.run_ref, run.attempt_ref, draft_hash
+                    ),
+                )
+                if checkpoint.draft_hash != draft_hash:
+                    raise OwnerConflict("idea_primary_draft_hash_mismatch")
+                self._transient_error = None
+                return _CycleStep(True, provider_boundary_attempted=True)
+            finally:
+                if provider_safe:
+                    self._agent_runtime.acknowledge_provider_safe_point(
+                        unit_ref=unit_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                    )
 
         checkpoint = run.primary_draft
         draft = IdeaSkillDraft(
@@ -465,52 +498,72 @@ class IdeaStageWorker:
             primary_session_ref=checkpoint.native_session_ref,
             adapter_kind=checkpoint.adapter_kind,
         )
-        try:
-            result = self._provider.review_draft(skill_request, draft)
-            draft_hash, outcome_hash, _review_hash = validate_idea_skill_result(
-                skill_request,
-                result,
-                predecessor_material_outcome_hash=predecessor_hash,
-            )
-        except IdeaSkillUnavailable as error:
-            self._transient_error = error.code
-            return _CycleStep(False, provider_boundary_attempted=True)
-        except IdeaSkillContractError as error:
-            self._transient_error = str(error)
-            return _CycleStep(False, provider_boundary_attempted=True)
-        review = review_record(
-            result,
-            draft_hash=draft_hash,
-            outcome_hash=outcome_hash,
-        )
-        submission_ref = "idea_submission_" + canonical_hash(
-            {
-                "request_ref": request.request_ref,
-                "attempt_ref": run.attempt_ref,
-                "fence_ref": run.fence_ref,
-                "outcome_hash": outcome_hash,
-                "review_hash": canonical_hash(review),
-            }
-        )[:32]
-        self._agent_runtime.record_idea_attempt_execution(
+        self._agent_runtime.begin_provider_unit(
+            unit_ref=unit_ref,
+            operation_ref=job_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
-            submission_ref=submission_ref,
-            native_session_ref=result.primary_session_ref,
-            runtime_binding=run.runtime_binding,
-            outcome=result.final_outcome,
-            reviewed_draft=result.reviewed_draft,
-            review=review,
-            idempotency_key=_operation_key(
-                "idea-execute", run.run_ref, run.attempt_ref
-            ),
+            unit_kind="idea_review",
         )
-        self._transient_error = None
-        finish_job = getattr(self._provider, "finish_job", None)
-        if callable(finish_job):
-            finish_job(job_ref)
-        return _CycleStep(True, provider_boundary_attempted=True)
+        provider_safe = True
+        try:
+            try:
+                result = self._provider.review_draft(skill_request, draft)
+                draft_hash, outcome_hash, _review_hash = validate_idea_skill_result(
+                    skill_request,
+                    result,
+                    predecessor_material_outcome_hash=predecessor_hash,
+                )
+            except IdeaSkillUnavailable as error:
+                if error.code == "codex_operation_reconciliation_pending":
+                    provider_safe = False
+                self._transient_error = error.code
+                return _CycleStep(False, provider_boundary_attempted=True)
+            except IdeaSkillContractError as error:
+                self._transient_error = str(error)
+                return _CycleStep(False, provider_boundary_attempted=True)
+            review = review_record(
+                result,
+                draft_hash=draft_hash,
+                outcome_hash=outcome_hash,
+            )
+            submission_ref = "idea_submission_" + canonical_hash(
+                {
+                    "request_ref": request.request_ref,
+                    "attempt_ref": run.attempt_ref,
+                    "fence_ref": run.fence_ref,
+                    "outcome_hash": outcome_hash,
+                    "review_hash": canonical_hash(review),
+                }
+            )[:32]
+            self._agent_runtime.record_idea_attempt_execution(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                submission_ref=submission_ref,
+                native_session_ref=result.primary_session_ref,
+                runtime_binding=run.runtime_binding,
+                outcome=result.final_outcome,
+                reviewed_draft=result.reviewed_draft,
+                review=review,
+                idempotency_key=_operation_key(
+                    "idea-execute", run.run_ref, run.attempt_ref
+                ),
+            )
+            self._transient_error = None
+            finish_job = getattr(self._provider, "finish_job", None)
+            if callable(finish_job):
+                finish_job(job_ref)
+            return _CycleStep(True, provider_boundary_attempted=True)
+        finally:
+            if provider_safe:
+                self._agent_runtime.acknowledge_provider_safe_point(
+                    unit_ref=unit_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                )
 
     def _accepted_facts(
         self, execution: AttemptExecution | None
@@ -586,39 +639,49 @@ class IdeaStageWorker:
         """Return the newest revalidated cycle for the public foreground view."""
 
         candidates = self._discover_cycles()
-        if not candidates:
-            return None
-        return candidates[-1]
+        if candidates:
+            return candidates[-1]
+        # The public Idea projection remains inspectable after AE advances the
+        # same Cycle to Plan.  Worker discovery below is still current-stage
+        # only, so this historical fallback cannot derive new Idea work.
+        historical: list[_CurrentCycle] = []
+        for foreground in self._advancement_engine.query_active_foregrounds():
+            cycle_ref = cast(str, foreground["cycle_ref"])
+            request = self._advancement_engine.query_idea_stage_request(cycle_ref)
+            if request is None or self._advancement_engine.query_idea_stage_commit(
+                request.request_ref
+            ) is None:
+                continue
+            question = self._research_graph.query_question_by_ref(
+                cast(str, foreground["question_ref"])
+            )
+            if question is None or question.quest_ref != foreground["quest_ref"]:
+                raise OwnerConflict("idea_cycle_index_invalid")
+            historical.append(
+                _CurrentCycle(cast(int, foreground["epoch"]), cycle_ref, question)
+            )
+        return None if not historical else historical[-1]
 
     def _discover_cycles(self) -> tuple[_CurrentCycle, ...]:
-        """Discover every cycle through the typed feed index and Owner reads."""
+        """Read current Grants; historical activation events are only an audit log."""
 
-        candidates: dict[str, _CurrentCycle] = {}
-        for event in self._feed.read_event_type(_CYCLE_EVENT):
-            revision = event.revision
-            payload = event.payload
-            initialization_id = payload.get("initialization_id")
-            cycle_ref = payload.get("cycle_ref")
-            question_ref = payload.get("question_ref")
-            if not all(
-                isinstance(value, str) and value
-                for value in (initialization_id, cycle_ref, question_ref)
-            ):
+        values: list[_CurrentCycle] = []
+        for foreground in self._advancement_engine.query_active_foregrounds(
+            stage="idea"
+        ):
+            question = self._research_graph.query_question_by_ref(
+                cast(str, foreground["question_ref"])
+            )
+            if question is None or question.quest_ref != foreground["quest_ref"]:
                 raise OwnerConflict("idea_cycle_index_invalid")
-            initialization_id = cast(str, initialization_id)
-            cycle_ref = cast(str, cycle_ref)
-            question_ref = cast(str, question_ref)
-            question = self._research_graph.query_question(initialization_id)
-            cycle = self._advancement_engine.query_initial_cycle(initialization_id)
-            if (
-                question is None
-                or cycle is None
-                or question.question_ref != question_ref
-                or cycle.cycle_ref != cycle_ref
-            ):
-                raise OwnerConflict("idea_cycle_index_invalid")
-            candidates[cycle_ref] = _CurrentCycle(revision, cycle_ref, question)
-        return tuple(sorted(candidates.values(), key=lambda item: item.revision))
+            values.append(
+                _CurrentCycle(
+                    cast(int, foreground["epoch"]),
+                    cast(str, foreground["cycle_ref"]),
+                    question,
+                )
+            )
+        return tuple(values)
 
 
 def _operation_key(prefix: str, *values: str) -> str:
@@ -653,7 +716,9 @@ def _public_run(run: IdeaStageRun) -> dict[str, object]:
     if status == "running":
         status = "admitted"
     fence_status = "current"
-    if run.completion is not None:
+    if status in {"terminated", "suspended_fenced", "reconciliation_required"}:
+        fence_status = "revoked"
+    elif run.completion is not None:
         fence_status = "completed"
     elif execution is not None:
         fence_status = "submitted"

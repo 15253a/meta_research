@@ -31,6 +31,7 @@ from meta_research.experiment_contract import (
 )
 from meta_research.experiment_provider_supervisor import (
     EXIT_SCHEMA,
+    MARKER_SCHEMA,
     OBSERVATION_MAX_RECORD_BYTES,
     OBSERVATION_SCHEMA,
     REQUEST_SCHEMA,
@@ -48,6 +49,22 @@ from meta_research.owners.research_memory import (
     AssetIntakeRequest,
     ResearchMemoryInterface,
 )
+from meta_research.provider_supervisor import (
+    ProviderSupervisorError,
+    request_supervisor_stop,
+    supervisor_request_never_started,
+)
+
+
+_EXPERIMENT_CONTROL_WON_CODES = frozenset(
+    {
+        "runtime_fence_revoked",
+        "experiment_fence_stale",
+        "runtime_reconciliation_required",
+        "runtime_run_suspended",
+        "terminal_run_cannot_reopen",
+    }
+)
 
 
 class ExperimentProvider(Protocol):
@@ -60,6 +77,8 @@ class ExperimentProvider(Protocol):
         request: ExperimentProviderRequest,
         observe: ExperimentObserver,
     ) -> ExperimentProviderResult: ...
+
+    def reconcile_cancelled_job(self, job_ref: str) -> bool: ...
 
 
 class BuiltinMicroExperimentProvider:
@@ -278,6 +297,96 @@ class BuiltinMicroExperimentProvider:
     def request_stop(self) -> None:
         with self._state_lock:
             self._stop_requested = True
+
+    def reconcile_cancelled_job(self, job_ref: str) -> bool:
+        """Stop one detached experiment operation and verify its exit receipt."""
+
+        operation = (
+            self._workspace
+            / "provider-operations"
+            / hashlib.sha256(job_ref.encode("utf-8")).hexdigest()
+        )
+        if not operation.exists():
+            return True
+        try:
+            key = ensure_transport_key(self._workspace)
+            invocation = read_signed(operation / "invocation.json", key)
+            if (
+                invocation.get("schema_ref")
+                != "meta-research/experiment-provider-operation/v1"
+                or invocation.get("provider_operation_ref") != job_ref
+            ):
+                return False
+            invocation_hash = canonical_hash(invocation)
+            receipt_path = operation / "supervisor-exit.json"
+            if not receipt_path.is_file():
+                if not (operation / "supervisor-ready.json").is_file():
+                    if not supervisor_request_never_started(
+                        operation,
+                        key=key,
+                        invocation_hash=invocation_hash,
+                        request_schema=REQUEST_SCHEMA,
+                    ):
+                        return False
+                    return True
+                if not request_supervisor_stop(
+                    operation,
+                    key=key,
+                    invocation_hash=invocation_hash,
+                    ready_schema=MARKER_SCHEMA,
+                ):
+                    return False
+                if not receipt_path.is_file():
+                    return True
+            receipt = read_signed(receipt_path, key)
+            stdin_path = operation / "stdin.json"
+            stdout_path = operation / "stdout.bin"
+            observation_path = operation / "observations.jsonl"
+            if (
+                set(receipt)
+                != {
+                    "schema_ref",
+                    "invocation_hash",
+                    "termination_reason",
+                    "returncode",
+                    "stdin_hash",
+                    "stdout_hash",
+                    "stdout_bytes",
+                    "observation_hash",
+                    "observation_bytes",
+                    "observation_count",
+                    "started_at",
+                    "completed_at",
+                }
+                or receipt.get("schema_ref") != EXIT_SCHEMA
+                or receipt.get("invocation_hash") != invocation_hash
+                or receipt.get("termination_reason")
+                not in {
+                    "completed",
+                    "timeout",
+                    "stopped",
+                    "output_limit",
+                    "descendant_process",
+                    "launch_failed",
+                }
+                or not isinstance(receipt.get("returncode"), int)
+                or isinstance(receipt.get("returncode"), bool)
+                or receipt.get("stdin_hash") != file_sha256(stdin_path)
+                or receipt.get("stdout_hash") != file_sha256(stdout_path)
+                or receipt.get("stdout_bytes") != stdout_path.stat().st_size
+                or receipt.get("observation_hash")
+                != file_sha256(observation_path)
+                or receipt.get("observation_bytes")
+                != observation_path.stat().st_size
+            ):
+                return False
+        except (
+            OSError,
+            ExperimentSupervisorError,
+            ProviderSupervisorError,
+        ):
+            return False
+        return True
 
     def _raise_if_shutdown_requested(self) -> None:
         with self._state_lock:
@@ -879,6 +988,11 @@ class ExperimentService:
         )
 
     def process_once(self) -> bool:
+        if self._agent_runtime.reconcile_pending_provider_cleanup(
+            self._provider,
+            unit_kinds=("experiment",),
+        ):
+            return True
         run = self._agent_runtime.claim_next_experiment()
         if run is not None:
             domain = self._research_graph.query_experiment(run.evaluation_attempt_ref)
@@ -890,20 +1004,38 @@ class ExperimentService:
                     failure_code="experiment_domain_binding_missing",
                 )
                 return True
+            provider_safe = True
             try:
                 current_binding = self._provider.runtime_binding()
                 if canonical_hash(current_binding.as_dict()) != run.runtime_binding_hash:
                     raise OwnerConflict("experiment_runtime_binding_stale")
 
                 def observe(observation: ExperimentObservation) -> None:
-                    self._agent_runtime.record_experiment_observation(
-                        run_ref=run.run_ref,
-                        attempt_ref=run.attempt_ref,
-                        fence_ref=run.fence_ref,
-                        kind=observation.kind,
-                        payload=observation.payload,
-                        observed_at=observation.observed_at,
-                    )
+                    try:
+                        self._agent_runtime.record_experiment_observation(
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            kind=observation.kind,
+                            payload=observation.payload,
+                            observed_at=observation.observed_at,
+                        )
+                    except OwnerConflict as error:
+                        if error.code not in _EXPERIMENT_CONTROL_WON_CODES:
+                            raise
+                        # A late telemetry record proves only that the detached
+                        # provider is *still* active. Do not unwind to the outer
+                        # terminal handler and forge a Safe Point. Ask the bound
+                        # adapter to stop this exact operation, then continue
+                        # monitoring until execute() observes a real exit.
+                        reconcile = getattr(
+                            self._provider, "reconcile_cancelled_job", None
+                        )
+                        if callable(reconcile):
+                            try:
+                                reconcile(run.provider_operation_ref)
+                            except Exception:
+                                pass
 
                 result = self._provider.execute(
                     self._provider_request(
@@ -926,18 +1058,45 @@ class ExperimentService:
                     result=result.as_document(),
                 )
             except OwnerConflict as error:
+                managed = self._agent_runtime.query_managed_run(run.run_ref)
+                provider_terminal_after_control = (
+                    isinstance(error, ExperimentProviderUnavailable)
+                    and error.durable_outcome == "terminal"
+                    and managed is not None
+                    and managed["status"] != "running"
+                )
                 if error.code == "experiment_provider_shutdown_detached":
                     # ProductionRuntime is stopping. Leave the fenced AR Attempt
                     # running so startup recovery can replace only the technical
                     # Attempt and reconcile this same durable provider operation.
-                    pass
+                    provider_safe = False
                 elif error.code == "experiment_provider_reconciliation_pending":
+                    provider_safe = False
                     self._agent_runtime.defer_experiment_reconciliation(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
                         fence_ref=run.fence_ref,
                         reason_code=error.code,
                     )
+                elif error.code in _EXPERIMENT_CONTROL_WON_CODES:
+                    # A control command won the race after the provider reached a
+                    # physical terminal boundary.  The revoked Fence owns the
+                    # logical result; finally still acknowledges cleanup.
+                    pass
+                elif self._agent_runtime.provider_quiescence_requested(run.run_ref):
+                    # An operation-scoped pause/prune stop reached a real provider
+                    # boundary. Keep the logical Run admitted for the control
+                    # transaction, which will persist its Safe Point and suspension.
+                    pass
+                elif provider_terminal_after_control:
+                    # The stop reconciler can prove physical termination and let
+                    # the control transaction commit before this worker receives
+                    # the provider's terminal receipt.  In that ordering the
+                    # managed status, not the now-applied reservation, proves the
+                    # old Attempt lost the race.  Treat its late receipt as an ACK;
+                    # retrying/failing through the revoked Fence would leak a
+                    # spurious runtime_run_suspended error to the daemon.
+                    pass
                 elif (
                     isinstance(error, ExperimentProviderUnavailable)
                     and error.durable_outcome == "terminal"
@@ -959,12 +1118,20 @@ class ExperimentService:
                         failure_code=error.code,
                     )
             except Exception:
-                self._agent_runtime.fail_experiment_execution(
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    failure_code="experiment_provider_failed",
-                )
+                if not self._agent_runtime.provider_quiescence_requested(run.run_ref):
+                    self._agent_runtime.fail_experiment_execution(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        failure_code="experiment_provider_failed",
+                    )
+            finally:
+                if provider_safe:
+                    self._agent_runtime.acknowledge_provider_safe_point(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                    )
             return True
 
         if self._reconcile_runtime_admission_once():

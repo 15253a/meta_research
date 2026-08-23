@@ -4,10 +4,11 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from sqlalchemy import text
 
+from meta_research.control_contract import signed_owner_preview, validate_control_payload
 from meta_research.database import Database
 from meta_research.experiment_contract import (
     EXPERIMENT_INPUT_BINDING_SCHEMA,
@@ -300,11 +301,72 @@ class TargetCommitEvidenceAuthority(Protocol):
     ) -> None: ...
 
 
+class RuntimeControlReceiptVerifier(Protocol):
+    def verify_runtime_control_receipt(
+        self,
+        *,
+        operation_ref: str,
+        action: str,
+        target: dict[str, object],
+        receipt: dict[str, object],
+    ) -> None: ...
+
+    def verify_runtime_quiescence_receipt(
+        self,
+        *,
+        operation_ref: str,
+        target: dict[str, object],
+        affected_question_refs: tuple[str, ...],
+        receipt: dict[str, object],
+    ) -> None: ...
+
+
 class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for authoritative research semantics."""
 
     def query_snapshot(self) -> OwnerSnapshot: ...
 
+    def query_question_lifecycle(self, question_ref: str) -> dict[str, object]: ...
+
+    def query_restorable_prune_records(
+        self, quest_ref: str
+    ) -> tuple[dict[str, object], ...]: ...
+
+    def preview_question_control(
+        self, payload: dict[str, object]
+    ) -> tuple[dict[str, object], int]: ...
+
+    def apply_question_control(
+        self,
+        *,
+        operation_ref: str,
+        payload: dict[str, object],
+        runtime_receipt: dict[str, object],
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def prepare_question_control(
+        self,
+        *,
+        operation_ref: str,
+        payload: dict[str, object],
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def abort_question_control(
+        self, *, operation_ref: str, reason_code: str
+    ) -> None: ...
+
+    def verify_question_control_receipt(
+        self,
+        *,
+        operation_ref: str,
+        action: str,
+        target: dict[str, object],
+        receipt: dict[str, object],
+    ) -> None: ...
     def preview_quest_acceptance(
         self,
         *,
@@ -352,6 +414,10 @@ class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
     def query_question(self, initialization_id: str) -> AcceptedQuestion | None: ...
 
     def query_question_by_ref(self, question_ref: str) -> AcceptedQuestion | None: ...
+
+    def query_question_history_by_ref(
+        self, question_ref: str
+    ) -> AcceptedQuestion | None: ...
 
     def query_question_tree(
         self, quest_ref: str | None = None
@@ -632,6 +698,84 @@ class SQLiteResearchGraphReceiptVerifier:
             target_commit_evidence_authority
         )
 
+    def verify_question_control_receipt(
+        self,
+        *,
+        operation_ref: str,
+        action: str,
+        target: dict[str, object],
+        receipt: dict[str, object],
+    ) -> None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT commands.*, lifecycle.quest_ref FROM "
+                    "rg_question_lifecycle_commands commands JOIN "
+                    "rg_question_lifecycle lifecycle ON lifecycle.question_ref = "
+                    "commands.question_ref WHERE commands.operation_ref = "
+                    ":operation_ref"
+                ),
+                {"operation_ref": operation_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("question_control_receipt_invalid")
+        persisted = _question_control_receipt(row)
+        expected_hash = canonical_hash(
+            {
+                "issuer": RG_OWNER,
+                "kind": "question_lifecycle",
+                "subject_ref": operation_ref,
+                "action": action,
+                "quest_ref": target.get("quest_ref"),
+                "question_ref": target.get("target_question_ref"),
+                "affected_refs_hash": row.affected_refs_hash,
+                "base_version": int(row.base_version),
+                "committed_version": int(row.committed_version),
+                "record_ref": row.record_ref,
+                "prune_record_ref": target.get("prune_record_ref"),
+                "runtime_receipt_hash": row.runtime_receipt_hash,
+            }
+        )
+        if (
+            row.action != action
+            or row.quest_ref != target.get("quest_ref")
+            or row.question_ref != target.get("target_question_ref")
+            or row.prune_record_ref != target.get("prune_record_ref")
+            or row.receipt_hash != expected_hash
+            or persisted != receipt
+        ):
+            raise OwnerConflict("question_control_receipt_invalid")
+
+    def verify_current_question(
+        self,
+        *,
+        quest_ref: str,
+        question_ref: str,
+        question_receipt_ref: str,
+        question_receipt_hash: str,
+    ) -> None:
+        """Revalidate a switch target at the actual Grant handoff boundary."""
+
+        with self._database.read() as connection:
+            _kind, question = _query_question_record(connection, question_ref)
+            lifecycle = connection.execute(
+                text(
+                    "SELECT * FROM rg_question_lifecycle WHERE question_ref = "
+                    ":question_ref"
+                ),
+                {"question_ref": question_ref},
+            ).first()
+        if (
+            question is None
+            or lifecycle is None
+            or question.quest_ref != quest_ref
+            or lifecycle.quest_ref != quest_ref
+            or lifecycle.status != "active"
+            or question.receipt_ref != question_receipt_ref
+            or question.receipt_hash != question_receipt_hash
+        ):
+            raise OwnerConflict("research_control_question_not_present")
+
     def verify_quest_receipt(
         self,
         *,
@@ -909,6 +1053,47 @@ class SQLiteResearchGraphReceiptVerifier:
                     "question_ref": binding.question_ref,
                 },
             ).first()
+            manual = (
+                None
+                if row is not None
+                else connection.execute(
+                    text(
+                        "SELECT manual.*, quests.initialization_id AS "
+                        "quest_initialization_id FROM rg_manual_questions AS "
+                        "manual JOIN rg_quests AS quests ON quests.quest_ref = "
+                        "manual.quest_ref WHERE quests.initialization_id = "
+                        ":initialization_id AND manual.question_ref = :question_ref"
+                    ),
+                    {
+                        "initialization_id": binding.initialization_id,
+                        "question_ref": binding.question_ref,
+                    },
+                ).first()
+            )
+        if row is None and manual is not None:
+            if (
+                manual.quest_ref != binding.quest_ref
+                or manual.content_ref != binding.content_ref
+                or manual.content_hash != binding.content_hash
+                or manual.schema_ref != binding.schema_ref
+                or manual.content_receipt_ref != binding.content_receipt.receipt_ref
+                or manual.content_receipt_hash != binding.content_receipt.payload_hash
+                or binding.content_receipt.issuer != "research_memory"
+                or binding.content_receipt.kind
+                != "manual_question_content_acceptance"
+                or binding.content_receipt.subject_ref != binding.content_ref
+                or manual.receipt_ref != binding.question_receipt.receipt_ref
+                or manual.receipt_hash != binding.question_receipt.payload_hash
+            ):
+                raise OwnerConflict("accepted_question_binding_invalid")
+            self.verify_question_receipt(
+                context_ref=manual.context_ref,
+                quest_ref=binding.quest_ref,
+                question_ref=binding.question_ref,
+                parent_question_ref=manual.parent_question_ref,
+                receipt=binding.question_receipt,
+            )
+            return
         if row is None or (
             row.quest_ref != binding.quest_ref
             or row.content_ref != binding.content_ref
@@ -1626,6 +1811,58 @@ class SQLiteResearchGraphReceiptVerifier:
             ),
         )
 
+    def verify_stage_disposition_basis(
+        self,
+        *,
+        cycle_ref: str,
+        quest_ref: str,
+        question_ref: str,
+        stage: str,
+        epoch: int,
+        disposition: str,
+        basis_kind: str,
+        basis_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> None:
+        """Verify the RG fact behind a non-execution StageCommit.
+
+        Cycle/Epoch currentness remains AE-owned; this verifier authenticates the
+        immutable domain basis and its Question lineage only.
+        """
+
+        if (
+            stage == "bundle"
+            and disposition == "skipped"
+            and basis_kind == "formal_plan_no_new_experiment_required"
+        ):
+            with self._database.read() as connection:
+                row = connection.execute(
+                    text(
+                        "SELECT * FROM rg_formal_plan_decisions WHERE formal_plan_ref = "
+                        ":basis_ref"
+                    ),
+                    {"basis_ref": basis_ref},
+                ).first()
+            if row is None or (
+                row.quest_ref != quest_ref
+                or row.question_ref != question_ref
+                or row.decision != "accepted"
+                or row.bundle_disposition != "no_new_experiment_required"
+            ):
+                raise OwnerConflict("stage_commit_basis_invalid")
+            self.verify_formal_plan_decision(
+                request_ref=row.request_ref,
+                submission_ref=row.submission_ref,
+                decision="accepted",
+                formal_plan_ref=basis_ref,
+                receipt=receipt,
+            )
+            return
+        # An accepted NoViableCandidate is a real negative Idea outcome.  It
+        # routes directly to Reasoning and must never impersonate independent
+        # evidence that both Idea outcome forms are exhausted.
+        raise OwnerConflict("stage_commit_basis_invalid")
+
 
 class SQLiteResearchGraph(HumanRequestOwnerMixin):
     def __init__(
@@ -1642,6 +1879,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
         human_response_verifier: HumanResponseVerifier | None = None,
         plan_content_verifier: PlanContentReceiptVerifier | None = None,
+        runtime_control_verifier: RuntimeControlReceiptVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -1657,10 +1895,679 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             database, feed, RG_OWNER, human_response_verifier
         )
         self._plan_content_verifier = plan_content_verifier
+        self._runtime_control_verifier = runtime_control_verifier
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
+
+    def verify_question_control_receipt(self, **values) -> None:
+        self._receipt_verifier.verify_question_control_receipt(**values)
+
+    def query_question_lifecycle(self, question_ref: str) -> dict[str, object]:
+        if not isinstance(question_ref, str) or not question_ref:
+            raise OwnerConflict("question_ref_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT lifecycle.*, state.revision AS owner_revision FROM "
+                    "rg_question_lifecycle lifecycle JOIN research_graph_state "
+                    "state ON state.singleton = 'owner' WHERE question_ref = "
+                    ":question_ref"
+                ),
+                {"question_ref": question_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("question_lifecycle_not_found")
+        return {
+            "question_ref": row.question_ref,
+            "quest_ref": row.quest_ref,
+            "status": row.status,
+            "revision": int(row.revision),
+            "owner_revision": int(row.owner_revision),
+            "updated_at": float(row.updated_at),
+        }
+
+    def query_restorable_prune_records(
+        self, quest_ref: str
+    ) -> tuple[dict[str, object], ...]:
+        """Expose exact, still-current PruneRecords through the recovery seam."""
+
+        if not isinstance(quest_ref, str) or not quest_ref or len(quest_ref) > 64:
+            raise OwnerConflict("quest_ref_invalid")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT prune.* FROM rg_prune_records prune WHERE "
+                    "prune.quest_ref = :quest_ref AND NOT EXISTS (SELECT 1 FROM "
+                    "rg_restore_records restore WHERE restore.prune_record_ref = "
+                    "prune.prune_record_ref) ORDER BY prune.created_at, "
+                    "prune.prune_record_ref"
+                ),
+                {"quest_ref": quest_ref},
+            ).all()
+            values: list[dict[str, object]] = []
+            for row in rows:
+                try:
+                    affected_refs = json.loads(row.affected_refs_json)
+                except (TypeError, ValueError) as error:
+                    raise OwnerConflict("question_prune_record_invalid") from error
+                if (
+                    not isinstance(affected_refs, list)
+                    or not affected_refs
+                    or any(
+                        not isinstance(question_ref, str) or not question_ref
+                        for question_ref in affected_refs
+                    )
+                    or canonical_json(affected_refs) != row.affected_refs_json
+                    or canonical_hash(affected_refs) != row.affected_refs_hash
+                ):
+                    raise OwnerConflict("question_prune_record_invalid")
+                placeholders = ", ".join(
+                    f":question_ref_{index}"
+                    for index in range(len(affected_refs))
+                )
+                lifecycle = connection.execute(
+                    text(
+                        "SELECT question_ref, status FROM rg_question_lifecycle WHERE "
+                        f"quest_ref = :quest_ref AND question_ref IN ({placeholders})"
+                    ),
+                    {
+                        "quest_ref": quest_ref,
+                        **{
+                            f"question_ref_{index}": question_ref
+                            for index, question_ref in enumerate(affected_refs)
+                        },
+                    },
+                ).all()
+                if len(lifecycle) != len(affected_refs) or any(
+                    item.status != "pruned" for item in lifecycle
+                ):
+                    raise OwnerConflict("question_prune_record_not_current")
+                values.append(
+                    {
+                        "prune_record_ref": row.prune_record_ref,
+                        "quest_ref": row.quest_ref,
+                        "root_question_ref": row.root_question_ref,
+                        "affected_question_refs": affected_refs,
+                        "affected_question_count": len(affected_refs),
+                        "receipt_ref": row.receipt_ref,
+                        "receipt_hash": row.receipt_hash,
+                        "created_at": float(row.created_at),
+                    }
+                )
+        return tuple(values)
+
+    def preview_question_control(
+        self, payload: dict[str, object]
+    ) -> tuple[dict[str, object], int]:
+        control = validate_control_payload(payload)
+        action = cast(str, control["action"])
+        if action not in {"prune", "restore"}:
+            raise OwnerConflict("question_control_action_invalid")
+        target = cast(dict[str, object], control["target"])
+        question_ref = cast(str, target["target_question_ref"])
+        with self._database.read() as connection:
+            revision = int(
+                connection.execute(
+                    text(
+                        "SELECT revision FROM research_graph_state WHERE singleton = "
+                        "'owner'"
+                    )
+                ).scalar_one()
+            )
+            graph_version = int(
+                connection.execute(
+                    text(
+                        "SELECT graph_version FROM rg_graph_heads WHERE "
+                        "quest_ref = :quest_ref"
+                    ),
+                    {"quest_ref": target["quest_ref"]},
+                ).scalar_one()
+            )
+            prune_record = None
+            if action == "restore":
+                prune_record = connection.execute(
+                    text(
+                        "SELECT * FROM rg_prune_records WHERE prune_record_ref = "
+                        ":prune_record_ref"
+                    ),
+                    {"prune_record_ref": target["prune_record_ref"]},
+                ).first()
+                if prune_record is None or (
+                    prune_record.quest_ref != target["quest_ref"]
+                    or prune_record.root_question_ref != question_ref
+                ):
+                    raise OwnerConflict("question_restore_record_invalid")
+                affected_refs = json.loads(prune_record.affected_refs_json)
+                if canonical_hash(affected_refs) != prune_record.affected_refs_hash:
+                    raise OwnerConflict("question_prune_record_invalid")
+            else:
+                affected_refs = _question_subtree_refs(
+                    connection, cast(str, target["quest_ref"]), question_ref
+                )
+            lifecycle_rows = connection.execute(
+                text(
+                    "SELECT question_ref, status, revision FROM "
+                    "rg_question_lifecycle WHERE quest_ref = :quest_ref"
+                ),
+                {"quest_ref": target["quest_ref"]},
+            ).all()
+        lifecycle = {row.question_ref: row for row in lifecycle_rows}
+        if question_ref not in lifecycle:
+            raise OwnerConflict("question_lifecycle_not_found")
+        required_status = "active" if action == "prune" else "pruned"
+        effective_refs = [
+            ref for ref in affected_refs if lifecycle[ref].status == required_status
+        ]
+        if action == "restore" and effective_refs != affected_refs:
+            raise OwnerConflict("question_restore_record_not_current")
+        assertion = {
+            "owner": RG_OWNER,
+            "operation": "change_question_lifecycle",
+            "action": action,
+            "quest_ref": target["quest_ref"],
+            "question_ref": question_ref,
+            "graph_version": graph_version,
+            "prune_record_ref": target.get("prune_record_ref"),
+            "affected_question_refs": effective_refs,
+            "question_revisions": {
+                ref: int(lifecycle[ref].revision) for ref in affected_refs
+            },
+            "owner_revision": revision,
+        }
+        preview = signed_owner_preview(
+            source_owner=RG_OWNER,
+            target_assertion=assertion,
+            will_happen=[
+                (
+                    "将目标 Question 与当前活跃后代标记为 pruned"
+                    if action == "prune"
+                    else "只恢复指定 PruneRecord 当时实际剪裁的成员"
+                ),
+                "保留 Question 身份、父子拓扑、内容与历史 receipt",
+            ],
+            will_not_happen=[
+                "不会删除 Question 或 Research Asset",
+                "不会改写既有领域接纳或 Stage outcome",
+            ],
+            risks=[
+                "若目标是当前 Foreground Question，AE 会独立暂停该 Cycle"
+            ],
+            stale_conditions=[
+                "问题树拓扑或任一目标生命周期 revision 改变",
+                "Research Graph owner revision 改变",
+            ],
+        )
+        return preview, revision
+
+    def prepare_question_control(
+        self,
+        *,
+        operation_ref: str,
+        payload: dict[str, object],
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        if not isinstance(operation_ref, str) or not operation_ref:
+            raise OwnerConflict("question_control_operation_invalid")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise OwnerConflict("idempotency_key_required")
+        control = validate_control_payload(payload)
+        action = cast(str, control["action"])
+        if action not in {"prune", "restore"}:
+            raise OwnerConflict("question_control_action_invalid")
+        target = cast(dict[str, object], control["target"])
+        question_ref = cast(str, target["target_question_ref"])
+        payload_json = canonical_json(control)
+        payload_hash = canonical_hash(control)
+        now = time.time()
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM rg_question_control_reservations WHERE "
+                    "operation_ref = :operation_ref OR idempotency_key = "
+                    ":idempotency_key"
+                ),
+                {
+                    "operation_ref": operation_ref,
+                    "idempotency_key": idempotency_key,
+                },
+            ).first()
+            if replay is not None:
+                if (
+                    replay.operation_ref != operation_ref
+                    or replay.payload_hash != payload_hash
+                    or int(replay.expected_revision) != expected_revision
+                ):
+                    raise OwnerConflict("idempotency_conflict")
+                if replay.status == "aborted":
+                    raise OwnerConflict("question_control_repreview_required")
+                return _question_control_reservation_document(replay)
+            revision = int(
+                connection.execute(
+                    text(
+                        "SELECT revision FROM research_graph_state WHERE singleton = "
+                        "'owner'"
+                    )
+                ).scalar_one()
+            )
+            if revision != expected_revision:
+                raise OwnerConflict("command_preview_stale")
+            graph_version = int(
+                connection.execute(
+                    text(
+                        "SELECT graph_version FROM rg_graph_heads WHERE quest_ref = "
+                        ":quest_ref"
+                    ),
+                    {"quest_ref": target["quest_ref"]},
+                ).scalar_one()
+            )
+            affected_refs = _question_control_affected_refs(
+                connection, action=action, target=target
+            )
+            lifecycle = _question_control_lifecycle_snapshot(
+                connection,
+                quest_ref=cast(str, target["quest_ref"]),
+                affected_refs=affected_refs,
+            )
+            required_status = "active" if action == "prune" else "pruned"
+            if not affected_refs or any(
+                item["status"] != required_status for item in lifecycle
+            ):
+                raise OwnerConflict(
+                    "question_restore_record_not_current"
+                    if action == "restore"
+                    else "question_control_no_effect"
+                )
+            affected_hash = canonical_hash(affected_refs)
+            lifecycle_hash = canonical_hash(lifecycle)
+            connection.execute(
+                text(
+                    "INSERT INTO rg_question_control_reservations (operation_ref, "
+                    "idempotency_key, action, payload_json, payload_hash, "
+                    "expected_revision, graph_version, affected_refs_json, "
+                    "affected_refs_hash, lifecycle_json, lifecycle_hash, status, "
+                    "created_at, updated_at) VALUES (:operation_ref, "
+                    ":idempotency_key, :action, :payload_json, :payload_hash, "
+                    ":expected_revision, :graph_version, :affected_refs_json, "
+                    ":affected_refs_hash, :lifecycle_json, :lifecycle_hash, "
+                    "'prepared', :now, :now)"
+                ),
+                {
+                    "operation_ref": operation_ref,
+                    "idempotency_key": idempotency_key,
+                    "action": action,
+                    "payload_json": payload_json,
+                    "payload_hash": payload_hash,
+                    "expected_revision": expected_revision,
+                    "graph_version": graph_version,
+                    "affected_refs_json": canonical_json(affected_refs),
+                    "affected_refs_hash": affected_hash,
+                    "lifecycle_json": canonical_json(lifecycle),
+                    "lifecycle_hash": lifecycle_hash,
+                    "now": now,
+                },
+            )
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_question_control_reservations WHERE "
+                    "operation_ref = :operation_ref"
+                ),
+                {"operation_ref": operation_ref},
+            ).one()
+        return _question_control_reservation_document(row)
+
+    def abort_question_control(
+        self, *, operation_ref: str, reason_code: str
+    ) -> None:
+        if not isinstance(operation_ref, str) or not operation_ref:
+            raise OwnerConflict("question_control_operation_invalid")
+        if not isinstance(reason_code, str) or not reason_code or len(reason_code) > 96:
+            raise OwnerConflict("question_control_abort_reason_invalid")
+        with self._database.write() as connection:
+            completed = connection.execute(
+                text(
+                    "SELECT operation_ref FROM rg_question_lifecycle_commands WHERE "
+                    "operation_ref = :operation_ref"
+                ),
+                {"operation_ref": operation_ref},
+            ).first()
+            if completed is not None:
+                raise OwnerConflict("question_control_already_completed")
+            connection.execute(
+                text(
+                    "UPDATE rg_question_control_reservations SET status = 'aborted', "
+                    "updated_at = :now WHERE operation_ref = :operation_ref AND "
+                    "status = 'prepared'"
+                ),
+                {"now": time.time(), "operation_ref": operation_ref},
+            )
+
+    def apply_question_control(
+        self,
+        *,
+        operation_ref: str,
+        payload: dict[str, object],
+        runtime_receipt: dict[str, object],
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        if not isinstance(operation_ref, str) or not operation_ref:
+            raise OwnerConflict("question_control_operation_invalid")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise OwnerConflict("idempotency_key_required")
+        control = validate_control_payload(payload)
+        action = cast(str, control["action"])
+        if action not in {"prune", "restore"}:
+            raise OwnerConflict("question_control_action_invalid")
+        target = cast(dict[str, object], control["target"])
+        question_ref = cast(str, target["target_question_ref"])
+        self.prepare_question_control(
+            operation_ref=operation_ref,
+            payload=control,
+            expected_revision=expected_revision,
+            idempotency_key=(
+                "question-control-prepare-"
+                + canonical_hash({"operation_ref": operation_ref})[:48]
+            ),
+        )
+        if self._runtime_control_verifier is None:
+            raise OwnerConflict("runtime_control_verifier_unavailable")
+        try:
+            self._runtime_control_verifier.verify_runtime_control_receipt(
+                operation_ref=operation_ref,
+                action=action,
+                target=target,
+                receipt=runtime_receipt,
+            )
+            if action == "prune":
+                with self._database.read() as connection:
+                    reservation = connection.execute(
+                        text(
+                            "SELECT affected_refs_json FROM "
+                            "rg_question_control_reservations WHERE operation_ref = "
+                            ":operation_ref"
+                        ),
+                        {"operation_ref": operation_ref},
+                    ).first()
+                quiescence = runtime_receipt.get("quiescence_receipt")
+                if reservation is None or not isinstance(quiescence, dict):
+                    raise OwnerConflict("runtime_quiescence_receipt_invalid")
+                frozen_refs = tuple(json.loads(reservation.affected_refs_json))
+                self._runtime_control_verifier.verify_runtime_quiescence_receipt(
+                    operation_ref=operation_ref,
+                    target=target,
+                    affected_question_refs=frozen_refs,
+                    receipt=quiescence,
+                )
+        except OwnerConflict as error:
+            raise OwnerConflict(
+                "question_control_quiescence_receipt_invalid"
+            ) from error
+        runtime_receipt_hash = canonical_hash(runtime_receipt)
+        request_hash = canonical_hash(
+            {
+                "operation_ref": operation_ref,
+                "payload": control,
+                "expected_revision": expected_revision,
+                "runtime_receipt_hash": runtime_receipt_hash,
+            }
+        )
+        now = time.time()
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM rg_question_lifecycle_commands WHERE "
+                    "idempotency_key = :idempotency_key OR operation_ref = "
+                    ":operation_ref"
+                ),
+                {
+                    "idempotency_key": idempotency_key,
+                    "operation_ref": operation_ref,
+                },
+            ).first()
+            if replay is not None:
+                if replay.request_hash != request_hash:
+                    raise OwnerConflict("idempotency_conflict")
+                return _question_control_receipt(replay)
+            reservation = connection.execute(
+                text(
+                    "SELECT * FROM rg_question_control_reservations WHERE "
+                    "operation_ref = :operation_ref"
+                ),
+                {"operation_ref": operation_ref},
+            ).one()
+            if reservation.status != "prepared":
+                raise OwnerConflict("question_control_repreview_required")
+            graph_head = connection.execute(
+                text(
+                    "SELECT * FROM rg_graph_heads WHERE quest_ref = :quest_ref"
+                ),
+                {"quest_ref": target["quest_ref"]},
+            ).one()
+            base_version = int(graph_head.graph_version)
+            affected_refs = json.loads(reservation.affected_refs_json)
+            reserved_lifecycle = json.loads(reservation.lifecycle_json)
+            current_lifecycle = _question_control_lifecycle_snapshot(
+                connection,
+                quest_ref=cast(str, target["quest_ref"]),
+                affected_refs=affected_refs,
+            )
+            if (
+                base_version != int(reservation.graph_version)
+                or canonical_hash(affected_refs) != reservation.affected_refs_hash
+                or canonical_hash(reserved_lifecycle) != reservation.lifecycle_hash
+                or current_lifecycle != reserved_lifecycle
+            ):
+                connection.execute(
+                    text(
+                        "UPDATE rg_question_control_reservations SET status = "
+                        "'aborted', updated_at = :now WHERE operation_ref = "
+                        ":operation_ref"
+                    ),
+                    {"now": now, "operation_ref": operation_ref},
+                )
+                raise OwnerConflict("question_control_reservation_stale")
+            if action == "restore":
+                parent_ref = _question_parent_ref(connection, question_ref)
+                if parent_ref is not None and parent_ref not in affected_refs:
+                    parent = connection.execute(
+                        text(
+                            "SELECT status FROM rg_question_lifecycle WHERE "
+                            "question_ref = :question_ref"
+                        ),
+                        {"question_ref": parent_ref},
+                    ).first()
+                    if parent is None or parent.status != "active":
+                        raise OwnerConflict("question_restore_parent_pruned")
+            current_status = "active" if action == "prune" else "pruned"
+            next_status = "pruned" if action == "prune" else "active"
+            effective_refs: list[str] = []
+            for ref in affected_refs:
+                changed = connection.execute(
+                    text(
+                        "UPDATE rg_question_lifecycle SET status = :next_status, "
+                        "revision = revision + 1, updated_at = :now WHERE "
+                        "question_ref = :question_ref AND status = :current_status"
+                    ),
+                    {
+                        "next_status": next_status,
+                        "now": now,
+                        "question_ref": ref,
+                        "current_status": current_status,
+                    },
+                )
+                if changed.rowcount:
+                    effective_refs.append(ref)
+            if action == "restore" and effective_refs != affected_refs:
+                raise OwnerConflict("question_restore_record_not_current")
+            if not effective_refs:
+                raise OwnerConflict("question_control_no_effect")
+            receipt_ref = new_ref("rg_question_control_receipt")
+            affected_hash = canonical_hash(effective_refs)
+            committed_version = base_version + 1
+            record_ref = new_ref(
+                "prune_record" if action == "prune" else "restore_record"
+            )
+            receipt_hash = canonical_hash(
+                {
+                    "issuer": RG_OWNER,
+                    "kind": "question_lifecycle",
+                    "subject_ref": operation_ref,
+                    "action": action,
+                    "quest_ref": target["quest_ref"],
+                    "question_ref": question_ref,
+                    "affected_refs_hash": affected_hash,
+                    "base_version": base_version,
+                    "committed_version": committed_version,
+                    "record_ref": record_ref,
+                    "prune_record_ref": target.get("prune_record_ref"),
+                    "runtime_receipt_hash": runtime_receipt_hash,
+                }
+            )
+            if action == "prune":
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_prune_records (prune_record_ref, "
+                        "operation_ref, quest_ref, root_question_ref, base_version, "
+                        "committed_version, affected_refs_json, affected_refs_hash, "
+                        "runtime_receipt_hash, receipt_ref, receipt_hash, created_at) "
+                        "VALUES (:record_ref, :operation_ref, :quest_ref, "
+                        ":question_ref, :base_version, :committed_version, "
+                        ":affected_json, :affected_hash, :runtime_receipt_hash, "
+                        ":receipt_ref, :receipt_hash, :now)"
+                    ),
+                    {
+                        "record_ref": record_ref,
+                        "operation_ref": operation_ref,
+                        "quest_ref": target["quest_ref"],
+                        "question_ref": question_ref,
+                        "base_version": base_version,
+                        "committed_version": committed_version,
+                        "affected_json": canonical_json(effective_refs),
+                        "affected_hash": affected_hash,
+                        "runtime_receipt_hash": runtime_receipt_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                    },
+                )
+            else:
+                connection.execute(
+                    text(
+                        "INSERT INTO rg_restore_records (restore_record_ref, "
+                        "operation_ref, prune_record_ref, quest_ref, "
+                        "root_question_ref, base_version, committed_version, "
+                        "affected_refs_json, affected_refs_hash, receipt_ref, "
+                        "receipt_hash, created_at) VALUES (:record_ref, "
+                        ":operation_ref, :prune_record_ref, :quest_ref, "
+                        ":question_ref, :base_version, :committed_version, "
+                        ":affected_json, :affected_hash, :receipt_ref, "
+                        ":receipt_hash, :now)"
+                    ),
+                    {
+                        "record_ref": record_ref,
+                        "operation_ref": operation_ref,
+                        "prune_record_ref": target["prune_record_ref"],
+                        "quest_ref": target["quest_ref"],
+                        "question_ref": question_ref,
+                        "base_version": base_version,
+                        "committed_version": committed_version,
+                        "affected_json": canonical_json(effective_refs),
+                        "affected_hash": affected_hash,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                    },
+                )
+            connection.execute(
+                text(
+                    "UPDATE rg_graph_heads SET graph_version = :committed_version, "
+                    "updated_at = :now WHERE quest_ref = :quest_ref AND "
+                    "graph_version = :base_version"
+                ),
+                {
+                    "committed_version": committed_version,
+                    "now": now,
+                    "quest_ref": target["quest_ref"],
+                    "base_version": base_version,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE rg_question_control_reservations SET status = 'applied', "
+                    "updated_at = :now WHERE operation_ref = :operation_ref AND "
+                    "status = 'prepared'"
+                ),
+                {"now": now, "operation_ref": operation_ref},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO rg_question_lifecycle_commands "
+                    "(idempotency_key, operation_ref, action, question_ref, "
+                    "record_ref, prune_record_ref, base_version, "
+                    "committed_version, runtime_receipt_hash, "
+                    "request_hash, affected_refs_json, affected_refs_hash, "
+                    "receipt_ref, receipt_hash, recorded_at) VALUES "
+                    "(:idempotency_key, :operation_ref, :action, :question_ref, "
+                    ":record_ref, :prune_record_ref, :base_version, "
+                    ":committed_version, :runtime_receipt_hash, "
+                    ":request_hash, :affected_json, :affected_hash, :receipt_ref, "
+                    ":receipt_hash, :now)"
+                ),
+                {
+                    "idempotency_key": idempotency_key,
+                    "operation_ref": operation_ref,
+                    "action": action,
+                    "question_ref": question_ref,
+                    "record_ref": record_ref,
+                    "prune_record_ref": target.get("prune_record_ref"),
+                    "base_version": base_version,
+                    "committed_version": committed_version,
+                    "runtime_receipt_hash": runtime_receipt_hash,
+                    "request_hash": request_hash,
+                    "affected_json": canonical_json(effective_refs),
+                    "affected_hash": affected_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE research_graph_state SET revision = revision + 1, "
+                    "question_prune_count = question_prune_count + :delta WHERE "
+                    "singleton = 'owner'"
+                ),
+                {
+                    "delta": (
+                        len(effective_refs)
+                        if action == "prune"
+                        else -len(effective_refs)
+                    )
+                },
+            )
+            self._feed.record(
+                connection,
+                "research_graph.question_lifecycle_changed",
+                {
+                    "operation_ref": operation_ref,
+                    "action": action,
+                    "question_ref": question_ref,
+                    "affected_question_refs": effective_refs,
+                    "record_ref": record_ref,
+                    "graph_version": committed_version,
+                },
+            )
+            row = connection.execute(
+                text(
+                    "SELECT * FROM rg_question_lifecycle_commands WHERE "
+                    "operation_ref = :operation_ref"
+                ),
+                {"operation_ref": operation_ref},
+            ).one()
+        return _question_control_receipt(row)
 
     def preview_quest_acceptance(
         self,
@@ -1870,6 +2777,13 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             )
             connection.execute(
                 text(
+                    "INSERT INTO rg_graph_heads (quest_ref, graph_version, "
+                    "updated_at) VALUES (:quest_ref, 0, :updated_at)"
+                ),
+                {"quest_ref": quest_ref, "updated_at": time.time()},
+            )
+            connection.execute(
+                text(
                     "UPDATE research_graph_state SET revision = revision + 1, "
                     "quest_count = quest_count + 1 WHERE singleton = 'owner'"
                 )
@@ -1909,6 +2823,14 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
         return accepted
 
     def query_question_by_ref(self, question_ref: str) -> AcceptedQuestion | None:
+        lifecycle = self.query_question_lifecycle(question_ref)
+        if lifecycle["status"] != "active":
+            return None
+        return self.query_question_history_by_ref(question_ref)
+
+    def query_question_history_by_ref(
+        self, question_ref: str
+    ) -> AcceptedQuestion | None:
         with self._database.read() as connection:
             kind, row = _query_question_record(connection, question_ref)
         if row is None:
@@ -1931,17 +2853,27 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
     def query_question_tree(
         self, quest_ref: str | None = None
     ) -> tuple[AcceptedQuestion, ...]:
-        root_filter = "" if quest_ref is None else " WHERE quest_ref = :quest_ref"
-        manual_filter = "" if quest_ref is None else " WHERE quest_ref = :quest_ref"
+        root_filter = (
+            "" if quest_ref is None else " WHERE questions.quest_ref = :quest_ref"
+        )
+        manual_filter = root_filter
         with self._database.read() as connection:
             refs = connection.execute(
                 text(
-                    "SELECT question_ref, accepted_at FROM rg_questions"
+                    "SELECT * FROM (SELECT questions.question_ref AS "
+                    "question_ref, questions.accepted_at AS accepted_at FROM "
+                    "rg_questions questions JOIN rg_question_lifecycle lifecycle "
+                    "ON lifecycle.question_ref = questions.question_ref AND "
+                    "lifecycle.status = 'active'"
                     + root_filter
-                    + " UNION ALL SELECT question_ref, accepted_at FROM "
-                    "rg_manual_questions"
+                    + " UNION ALL SELECT questions.question_ref AS question_ref, "
+                    "questions.accepted_at AS accepted_at FROM "
+                    "rg_manual_questions questions "
+                    "JOIN rg_question_lifecycle lifecycle ON "
+                    "lifecycle.question_ref = questions.question_ref AND "
+                    "lifecycle.status = 'active'"
                     + manual_filter
-                    + " ORDER BY accepted_at, question_ref"
+                    + ") ORDER BY accepted_at, question_ref"
                 ),
                 {} if quest_ref is None else {"quest_ref": quest_ref},
             ).all()
@@ -2011,6 +2943,7 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
             question_ref = new_ref("question")
             receipt_ref = new_ref("rg_question_receipt")
             receipt_hash = _receipt_hash(QUESTION_RECEIPT_KIND, question_ref, bindings)
+            accepted_at = time.time()
             connection.execute(
                 text(
                     "INSERT INTO rg_questions (question_ref, initialization_id, "
@@ -2028,8 +2961,27 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                     "question_ref": question_ref,
                     "receipt_ref": receipt_ref,
                     "receipt_hash": receipt_hash,
-                    "accepted_at": time.time(),
+                    "accepted_at": accepted_at,
                 },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO rg_question_lifecycle (question_ref, quest_ref, "
+                    "status, revision, updated_at) VALUES (:question_ref, "
+                    ":quest_ref, 'active', 1, :updated_at)"
+                ),
+                {
+                    "question_ref": question_ref,
+                    "quest_ref": quest.quest_ref,
+                    "updated_at": accepted_at,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE rg_graph_heads SET graph_version = graph_version + 1, "
+                    "updated_at = :updated_at WHERE quest_ref = :quest_ref"
+                ),
+                {"quest_ref": quest.quest_ref, "updated_at": accepted_at},
             )
             connection.execute(
                 text(
@@ -2210,6 +3162,25 @@ class SQLiteResearchGraph(HumanRequestOwnerMixin):
                     "receipt_hash": receipt_hash,
                     "accepted_at": accepted_at,
                 },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO rg_question_lifecycle (question_ref, quest_ref, "
+                    "status, revision, updated_at) VALUES (:question_ref, "
+                    ":quest_ref, 'active', 1, :updated_at)"
+                ),
+                {
+                    "question_ref": question_ref,
+                    "quest_ref": quest.quest_ref,
+                    "updated_at": accepted_at,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE rg_graph_heads SET graph_version = graph_version + 1, "
+                    "updated_at = :updated_at WHERE quest_ref = :quest_ref"
+                ),
+                {"quest_ref": quest.quest_ref, "updated_at": accepted_at},
             )
             connection.execute(
                 text(
@@ -5390,6 +6361,153 @@ def _quest_receipt_hash(row) -> str:
     )
 
 
+def _question_topology_rows(connection, quest_ref: str):
+    return connection.execute(
+        text(
+            "SELECT question_ref, NULL AS parent_question_ref FROM rg_questions "
+            "WHERE quest_ref = :quest_ref UNION ALL SELECT question_ref, "
+            "parent_question_ref FROM rg_manual_questions WHERE quest_ref = "
+            ":quest_ref ORDER BY question_ref"
+        ),
+        {"quest_ref": quest_ref},
+    ).all()
+
+
+def _question_subtree_refs(
+    connection, quest_ref: str, question_ref: str
+) -> list[str]:
+    rows = _question_topology_rows(connection, quest_ref)
+    by_ref = {str(row.question_ref): row for row in rows}
+    if question_ref not in by_ref:
+        raise OwnerConflict("research_control_question_target_invalid")
+    children: dict[str, list[str]] = {}
+    for row in rows:
+        if row.parent_question_ref is not None:
+            children.setdefault(str(row.parent_question_ref), []).append(
+                str(row.question_ref)
+            )
+    ordered: list[str] = []
+
+    def append(ref: str) -> None:
+        if ref in ordered:
+            raise OwnerConflict("question_parent_lineage_invalid")
+        ordered.append(ref)
+        for child in sorted(children.get(ref, [])):
+            append(child)
+
+    append(question_ref)
+    return ordered
+
+
+def _question_parent_ref(connection, question_ref: str) -> str | None:
+    row = connection.execute(
+        text(
+            "SELECT parent_question_ref FROM rg_manual_questions WHERE "
+            "question_ref = :question_ref"
+        ),
+        {"question_ref": question_ref},
+    ).first()
+    return None if row is None else str(row.parent_question_ref)
+
+
+def _question_control_affected_refs(
+    connection, *, action: str, target: dict[str, object]
+) -> list[str]:
+    question_ref = cast(str, target["target_question_ref"])
+    if action == "prune":
+        return _question_subtree_refs(
+            connection, cast(str, target["quest_ref"]), question_ref
+        )
+    prune_record = connection.execute(
+        text(
+            "SELECT * FROM rg_prune_records WHERE prune_record_ref = "
+            ":prune_record_ref"
+        ),
+        {"prune_record_ref": target.get("prune_record_ref")},
+    ).first()
+    if prune_record is None or (
+        prune_record.quest_ref != target["quest_ref"]
+        or prune_record.root_question_ref != question_ref
+    ):
+        raise OwnerConflict("question_restore_record_invalid")
+    affected_refs = json.loads(prune_record.affected_refs_json)
+    if canonical_hash(affected_refs) != prune_record.affected_refs_hash:
+        raise OwnerConflict("question_prune_record_invalid")
+    return [cast(str, item) for item in affected_refs]
+
+
+def _question_control_lifecycle_snapshot(
+    connection, *, quest_ref: str, affected_refs: list[str]
+) -> list[dict[str, object]]:
+    values: list[dict[str, object]] = []
+    for question_ref in affected_refs:
+        row = connection.execute(
+            text(
+                "SELECT question_ref, status, revision FROM rg_question_lifecycle "
+                "WHERE quest_ref = :quest_ref AND question_ref = :question_ref"
+            ),
+            {"quest_ref": quest_ref, "question_ref": question_ref},
+        ).first()
+        if row is None:
+            raise OwnerConflict("question_lifecycle_not_found")
+        values.append(
+            {
+                "question_ref": row.question_ref,
+                "status": row.status,
+                "revision": int(row.revision),
+            }
+        )
+    return values
+
+
+def _question_control_reservation_document(row) -> dict[str, object]:
+    affected_refs = json.loads(row.affected_refs_json)
+    lifecycle = json.loads(row.lifecycle_json)
+    try:
+        payload = decoded_object(row.payload_json)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("question_control_reservation_invalid") from error
+    if (
+        canonical_hash(payload) != row.payload_hash
+        or canonical_hash(affected_refs) != row.affected_refs_hash
+        or canonical_hash(lifecycle) != row.lifecycle_hash
+    ):
+        raise OwnerConflict("question_control_reservation_invalid")
+    return {
+        "operation_ref": row.operation_ref,
+        "action": row.action,
+        "status": row.status,
+        "expected_revision": int(row.expected_revision),
+        "graph_version": int(row.graph_version),
+        "affected_question_refs": affected_refs,
+        "lifecycle": lifecycle,
+    }
+
+
+def _question_control_receipt(row) -> dict[str, object]:
+    affected_refs = json.loads(row.affected_refs_json)
+    if canonical_hash(affected_refs) != row.affected_refs_hash:
+        raise OwnerConflict("question_control_receipt_invalid")
+    return {
+        "status": "completed",
+        "issuer": RG_OWNER,
+        "kind": "question_lifecycle",
+        "operation_ref": row.operation_ref,
+        "action": row.action,
+        "question_ref": row.question_ref,
+        "record_ref": row.record_ref,
+        "prune_record_ref": (
+            row.record_ref if row.action == "prune" else row.prune_record_ref
+        ),
+        "restore_record_ref": row.record_ref if row.action == "restore" else None,
+        "base_graph_version": int(row.base_version),
+        "committed_graph_version": int(row.committed_version),
+        "affected_question_refs": affected_refs,
+        "receipt_ref": row.receipt_ref,
+        "receipt_hash": row.receipt_hash,
+    }
+
+
 def _question_receipt_hash(row) -> str:
     return _receipt_hash(
         QUESTION_RECEIPT_KIND,
@@ -5918,6 +7036,7 @@ def create_research_graph_interface(
     manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
     human_response_verifier: HumanResponseVerifier | None = None,
     plan_content_verifier: PlanContentReceiptVerifier | None = None,
+    runtime_control_verifier: RuntimeControlReceiptVerifier | None = None,
 ) -> ResearchGraphInterface:
     return SQLiteResearchGraph(
         database,
@@ -5932,4 +7051,5 @@ def create_research_graph_interface(
         manual_confirmation_verifier,
         human_response_verifier,
         plan_content_verifier,
+        runtime_control_verifier,
     )

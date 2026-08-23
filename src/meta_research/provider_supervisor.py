@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import errno
 import hashlib
 import hmac
 import json
@@ -20,6 +21,8 @@ from typing import cast
 TRANSPORT_KEY_BYTES = 32
 SUPERVISOR_REQUEST_SCHEMA = "meta-research/codex-provider-supervisor-request/v1"
 SUPERVISOR_EXIT_SCHEMA = "meta-research/codex-provider-supervisor-exit/v1"
+SUPERVISOR_STARTUP_GRACE_SECONDS = 5.5
+PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION"
 
 
 class ProviderSupervisorError(RuntimeError):
@@ -123,6 +126,259 @@ def provider_process_group_running(process_group: int) -> bool:
 
 def terminate_provider_process_group(process_group: int) -> bool:
     return _terminate_process_group(process_group)
+
+
+def request_supervisor_stop(
+    operation_directory: Path,
+    *,
+    key: bytes,
+    invocation_hash: str,
+    ready_schema: str,
+    wait_seconds: float = 2.0,
+) -> bool:
+    """Request a verified detached supervisor to reach a signed terminal boundary.
+
+    The ready marker is sealed by the operation transport key and binds the PID to
+    the exact invocation.  We additionally verify the live command line before
+    signalling, so a stale/reused PID can never be treated as this provider job.
+    """
+
+    receipt_path = operation_directory / "supervisor-exit.json"
+    if receipt_path.is_file():
+        return True
+    ready = read_transport_envelope(
+        operation_directory / "supervisor-ready.json", key
+    )
+    process_id = ready.get("supervisor_process_id")
+    process_group = ready.get("supervisor_process_group")
+    ready_keys = {
+        "schema_ref",
+        "invocation_hash",
+        "supervisor_process_id",
+        "supervisor_process_group",
+    }
+    if (
+        frozenset(ready)
+        not in {frozenset(ready_keys), frozenset({*ready_keys, "phase"})}
+        or ready.get("schema_ref") != ready_schema
+        or ("phase" in ready and ready.get("phase") != "ready")
+        or ready.get("invocation_hash") != invocation_hash
+        or not isinstance(process_id, int)
+        or isinstance(process_id, bool)
+        or process_id <= 1
+        or not isinstance(process_group, int)
+        or isinstance(process_group, bool)
+        or process_group != process_id
+    ):
+        raise ProviderSupervisorError("provider_supervisor_ready_invalid")
+    request_path = (operation_directory / "supervisor-request.json").resolve()
+    try:
+        live_group = os.getpgid(process_id)
+        command_line = Path(f"/proc/{process_id}/cmdline").read_bytes().split(b"\0")
+    except ProcessLookupError:
+        live_group = None
+        command_line = []
+    except OSError as error:
+        raise ProviderSupervisorError("provider_supervisor_identity_invalid") from error
+    if live_group is not None:
+        if live_group != process_group or str(request_path).encode() not in command_line:
+            raise ProviderSupervisorError("provider_supervisor_identity_invalid")
+        try:
+            os.kill(process_id, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + wait_seconds
+    while not receipt_path.is_file() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if receipt_path.is_file():
+        return True
+    try:
+        supervisor_running = os.getpgid(process_id) == process_group
+    except ProcessLookupError:
+        supervisor_running = False
+    except OSError as error:
+        raise ProviderSupervisorError(
+            "provider_supervisor_identity_invalid"
+        ) from error
+    if supervisor_running:
+        return False
+    return _terminate_or_verify_bound_provider_absent(
+        operation_directory,
+        key=key,
+        invocation_hash=invocation_hash,
+    )
+
+
+def supervisor_request_never_started(
+    operation_directory: Path,
+    *,
+    key: bytes,
+    invocation_hash: str,
+    request_schema: str,
+    now: float | None = None,
+) -> bool:
+    """Prove that a durable request aged past its launch window without Popen.
+
+    The supervisor protocol publishes ``ready`` before ``started`` and before
+    the provider Popen.  Age alone is not proof, however: the daemon that owned
+    the five-second readiness deadline may have died while a detached supervisor
+    was scheduled but had not yet published ``ready``.  We therefore also prove
+    that no same-user live process is bound to the exact request path.
+    """
+
+    request_path = operation_directory / "supervisor-request.json"
+    if not request_path.is_file():
+        return True
+    request = read_transport_envelope(request_path, key)
+    if (
+        request.get("schema_ref") != request_schema
+        or request.get("invocation_hash") != invocation_hash
+    ):
+        raise ProviderSupervisorError("provider_supervisor_request_invalid")
+    if any(
+        (operation_directory / name).exists()
+        for name in (
+            "supervisor-ready.json",
+            "provider-started.json",
+            "supervisor-exit.json",
+        )
+    ):
+        return False
+    observed_at = time.time() if now is None else now
+    if (
+        observed_at - request_path.stat().st_mtime
+        < SUPERVISOR_STARTUP_GRACE_SECONDS
+    ):
+        return False
+    return not _supervisor_processes_for_request(request_path.resolve())
+
+
+def _supervisor_processes_for_request(request_path: Path) -> set[int]:
+    """Find same-user live supervisors carrying one exact durable request path."""
+
+    request_token = str(request_path).encode("utf-8")
+    process_ids: set[int] = set()
+    current_uid = os.getuid()
+    for process_directory in Path("/proc").glob("[0-9]*"):
+        try:
+            metadata = process_directory.stat()
+            if metadata.st_uid != current_uid:
+                continue
+            command_line = (process_directory / "cmdline").read_bytes().split(b"\0")
+            if request_token not in command_line:
+                continue
+            process_id = int(process_directory.name)
+            os.getpgid(process_id)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as error:
+            # Same-uid identity becoming unreadable is an unknown effect, not
+            # evidence that the supervisor never launched.
+            raise ProviderSupervisorError(
+                "provider_supervisor_identity_unavailable"
+            ) from error
+        except OSError as error:
+            if error.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            raise ProviderSupervisorError(
+                "provider_supervisor_identity_unavailable"
+            ) from error
+        except ValueError as error:
+            raise ProviderSupervisorError(
+                "provider_supervisor_identity_unavailable"
+            ) from error
+        if process_id <= 1:
+            raise ProviderSupervisorError("provider_supervisor_identity_invalid")
+        process_ids.add(process_id)
+    return process_ids
+
+
+def _terminate_or_verify_bound_provider_absent(
+    operation_directory: Path,
+    *,
+    key: bytes,
+    invocation_hash: str,
+) -> bool:
+    """Terminate provider groups bound to this exact sealed operation path."""
+
+    request_path = (operation_directory / "supervisor-request.json").resolve()
+    marker_path = operation_directory / "provider-started.json"
+    marker_group: int | None = None
+    if marker_path.is_file():
+        marker = read_transport_envelope(marker_path, key)
+        base_keys = {
+            "schema_ref",
+            "invocation_hash",
+            "supervisor_process_id",
+            "supervisor_process_group",
+            "provider_process_id",
+            "provider_process_group",
+            "provider_operation_path",
+        }
+        if (
+            frozenset(marker)
+            not in {frozenset(base_keys), frozenset({*base_keys, "phase"})}
+            or marker.get("invocation_hash") != invocation_hash
+            or marker.get("schema_ref")
+            not in {
+                "meta-research/codex-provider-started/v2",
+                "meta-research/experiment-provider-phase/v2",
+            }
+            or ("phase" in marker and marker.get("phase") != "started")
+            or marker.get("provider_operation_path") != str(request_path)
+            or not isinstance(marker.get("provider_process_id"), int)
+            or isinstance(marker.get("provider_process_id"), bool)
+            or int(marker["provider_process_id"]) <= 1
+            or not isinstance(marker.get("provider_process_group"), int)
+            or isinstance(marker.get("provider_process_group"), bool)
+            or marker.get("provider_process_group")
+            != marker.get("provider_process_id")
+        ):
+            raise ProviderSupervisorError("provider_started_marker_invalid")
+        marker_group = int(marker["provider_process_group"])
+
+    groups = _provider_groups_for_operation(request_path)
+    if marker_group is not None and _process_group_running(marker_group):
+        # A reused numeric PGID is never enough: at least one live group member
+        # must still carry the exact operation token inherited at Popen.
+        if marker_group not in groups:
+            return False
+        groups.add(marker_group)
+    for group in groups:
+        if not _terminate_process_group(group):
+            return False
+    remaining = _provider_groups_for_operation(request_path)
+    if remaining:
+        return False
+    return marker_group is None or not _process_group_running(marker_group)
+
+
+def _provider_groups_for_operation(request_path: Path) -> set[int]:
+    token = f"{PROVIDER_OPERATION_ENV}={request_path}".encode("utf-8")
+    groups: set[int] = set()
+    for process_directory in Path("/proc").glob("[0-9]*"):
+        try:
+            values = (process_directory / "environ").read_bytes().split(b"\0")
+            if token not in values:
+                continue
+            process_id = int(process_directory.name)
+            process_group = os.getpgid(process_id)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EPERM, errno.ENOENT, errno.ESRCH}:
+                continue
+            raise ProviderSupervisorError(
+                "provider_process_identity_unavailable"
+            ) from error
+        except ValueError as error:
+            raise ProviderSupervisorError(
+                "provider_process_identity_unavailable"
+            ) from error
+        if process_id <= 1 or process_group <= 1:
+            raise ProviderSupervisorError("provider_process_identity_invalid")
+        groups.add(process_group)
+    return groups
 
 
 def read_transport_key_for_operation(
@@ -522,15 +778,26 @@ def _write_phase_marker(
     schema_ref: str,
     invocation_hash: str,
     key: bytes,
+    provider_process: subprocess.Popen[bytes] | None = None,
+    operation_path: Path | None = None,
 ) -> None:
-    _write_signed_envelope(
-        path,
-        {
-            "schema_ref": schema_ref,
-            "invocation_hash": invocation_hash,
-        },
-        key,
-    )
+    payload: dict[str, object] = {
+        "schema_ref": schema_ref,
+        "invocation_hash": invocation_hash,
+        "supervisor_process_id": os.getpid(),
+        "supervisor_process_group": os.getpgrp(),
+    }
+    if provider_process is not None:
+        if operation_path is None:
+            raise ProviderSupervisorError("provider_process_identity_invalid")
+        payload.update(
+            {
+                "provider_process_id": provider_process.pid,
+                "provider_process_group": os.getpgid(provider_process.pid),
+                "provider_operation_path": str(operation_path.resolve()),
+            }
+        )
+    _write_signed_envelope(path, payload, key)
 
 
 def supervise(request_path: Path) -> None:
@@ -614,18 +881,18 @@ def _supervise_locked(
             os.close(result_read_fd)
             os.close(result_write_fd)
         else:
-            _write_phase_marker(
-                paths["started_path"],
-                schema_ref="meta-research/codex-provider-started/v1",
-                invocation_hash=invocation_hash,
-                key=key,
-            )
             try:
+                operation_path = (
+                    paths["ready_path"].parent / "supervisor-request.json"
+                ).resolve()
+                provider_environment = dict(os.environ)
+                provider_environment[PROVIDER_OPERATION_ENV] = str(operation_path)
                 process = subprocess.Popen(
                     provider_argv,
                     stdin=prompt_stream,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
+                    env=provider_environment,
                     start_new_session=True,
                 )
             except OSError:
@@ -634,6 +901,14 @@ def _supervise_locked(
                 termination_reason = "launch_failed"
                 returncode = 127
             else:
+                _write_phase_marker(
+                    paths["started_path"],
+                    schema_ref="meta-research/codex-provider-started/v2",
+                    invocation_hash=invocation_hash,
+                    key=key,
+                    provider_process=process,
+                    operation_path=operation_path,
+                )
                 assert process.stdout is not None
                 stdout_drainer = threading.Thread(
                     target=_bounded_stdout_drain,

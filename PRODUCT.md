@@ -89,9 +89,29 @@ before the Owner transaction is reconciled rather than being invoked again. An
 incomplete, unverifiable spool fails closed instead of guessing whether the
 external effect happened.
 
-The generic `stage_execution` capability remains unavailable until the later
-Plan, Bundle, and Reasoning execution slices are delivered; the Idea execution
-implemented here is reported only through the five explicit `idea_stage` facts.
+Foreground and long-running execution control is also a production Owner
+workflow. The fixed Lumen Companion and Question Tree can create exact
+pause/resume, normal/forced switch, cancel, abandon, and prune/restore command
+drafts. Every such command remains inert until Human Collaboration has shown a
+current per-Owner Impact Preview, recorded confirmation of the exact draft and
+preview hashes, and explicitly dispatched the confirmed control. The Web writes
+intent only; it never edits Cycle, Run, Fence, or Question lifecycle state.
+
+Advancement Engine exclusively owns the Foreground Cycle, current Stage,
+Foreground Grant/Epoch, StageRunRequest, and StageCommit. Agent Runtime
+exclusively owns each formal managed Run, replaceable Attempt, root Session,
+Binding, Fence, Safe Point, and execution receipt. A normal switch retains the
+source Grant until the current StageRun forms a StageCommit; a forced switch
+revokes the old Epoch and Run Fence before a new Epoch is granted, so a late old
+result cannot advance. Recoverable technical failure preserves the Run and root
+Session while replacing only the Attempt and Fence; terminal Runs cannot reopen.
+DeepFetch and experiment provider effects retain a stable operation identity for
+reconciliation. These ledgers and the current Foreground projection are rebuilt
+from SQLite after browser, daemon, worker, or host interruption.
+
+The generic `stage_execution` capability remains unavailable. Concrete Idea and
+Plan execution are reported through their five explicit Stage fact layers;
+Bundle, Target, Reasoning, and Writing remain separate delivery slices.
 
 Research Asset is now a production vertical slice. The authenticated Web can
 submit text, uploaded files, directories, local paths, repositories, links,

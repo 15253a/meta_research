@@ -129,6 +129,8 @@ def test_web_start_runs_the_real_layered_worker_and_exposes_durable_observations
             assert current is not None
             assert current["identities"]["evaluation_attempt_ref"] == attempt_ref
             assert current["execution"]["status"] == "executed"
+            assert current["execution"]["managed_status"] == "completed"
+            assert current["execution"]["fence_status"] == "completed"
             assert [
                 event["kind"] for event in current["execution"]["events"]
             ] == ["status", "stdout", "telemetry", "status"]

@@ -15,6 +15,7 @@ import {
   confirmManualCreationSeed,
   confirmManualDeepFetchWaiver,
   confirmManualQuestionProposal,
+  createHumanCommand,
   fetchAssetIntake,
   fetchCurrentManualQuestionCreation,
   fetchLiteratureSnapshot,
@@ -39,6 +40,7 @@ import {
   type PlanStageProjection,
   type PublicSnapshot,
   type QuestionTreeItem,
+  type ResearchControlAction,
   type UnavailableCapability,
 } from "./api";
 import {
@@ -2032,6 +2034,46 @@ function App() {
     }
   };
 
+  const controlQuestionLifecycle = async (
+    action: Extract<ResearchControlAction, "prune">,
+    question: QuestionTreeItem,
+    opener: HTMLButtonElement,
+  ) => {
+    const foreground = snapshot?.research_control.foreground;
+    if (
+      snapshot?.research_control.status !== "ready"
+      || !foreground
+      || question.quest_ref !== foreground.quest_ref
+    ) {
+      setManualOpenError("research_control_foreground_unavailable");
+      return;
+    }
+    setManualOpenError(null);
+    try {
+      await createHumanCommand(`quest:${foreground.quest_ref}`, {
+        command_kind: "research_control",
+        payload: {
+          action,
+          target: {
+            quest_ref: foreground.quest_ref,
+            cycle_ref: foreground.cycle_ref,
+            question_ref: foreground.question_ref,
+            epoch: foreground.epoch,
+            target_question_ref: question.question_ref,
+          },
+          reason: "operator_requested",
+        },
+      });
+      await reload();
+    } catch (caught) {
+      setManualOpenError(
+        caught instanceof ProductError ? caught.code : "research_control_failed",
+      );
+    } finally {
+      requestAnimationFrame(() => opener.focus({ preventScroll: true }));
+    }
+  };
+
   const applyManualRaw = useCallback(async (
     raw: ManualQuestionCreationRawView,
     basis: Pick<ManualPanelState, "parent" | "opener">,
@@ -2196,10 +2238,12 @@ function App() {
             manualCreationReady={Boolean(
               manualCreationReady && snapshot.question_tree.status === "ready",
             )}
+            controlsInert={manualPanel !== null}
             openingParentRef={manualOpeningParentRef}
             openError={manualOpenError}
             onClose={closeQuestionTree}
             onCreateQuestion={openManualCreation}
+            onControlQuestion={controlQuestionLifecycle}
           />
         ) : (
           <WorkspaceMain
@@ -2215,6 +2259,8 @@ function App() {
         <QuestCompanion
           state={state}
           collaboration={snapshot?.human_collaboration}
+          researchControl={manualPanel ? undefined : snapshot?.research_control}
+          questions={snapshot?.question_tree.items ?? []}
           onChanged={() => void reload()}
           onOpenRequest={(requestRef) => openHumanRequests(requestRef)}
         />

@@ -114,6 +114,11 @@ class PlanStageWorker:
         """Advance recoverable Plan work without requiring a per-Run click."""
 
         transient_error: str | None = None
+        if self._agent_runtime.reconcile_pending_provider_cleanup(
+            self._provider,
+            unit_kinds=("plan_primary", "plan_review"),
+        ):
+            return True
         self._transient_error = None
         cycles = list(self._discover_cycles())
         if self._provider_cursor_cycle_ref is not None:
@@ -168,6 +173,7 @@ class PlanStageWorker:
 
         run = self._agent_runtime.query_plan_stage_run(request.request_ref)
         if run is None:
+            provider_safe = True
             try:
                 runtime_binding = self._provider.runtime_binding()
             except PlanSkillUnavailable as error:
@@ -179,6 +185,9 @@ class PlanStageWorker:
                 runtime_binding=runtime_binding,
             )
             return _CycleStep(True, provider_boundary_attempted=True)
+        managed = self._agent_runtime.query_managed_run(run.run_ref)
+        if managed is not None and managed["status"] not in {"running", "completed"}:
+            return _CycleStep(False)
         if self._advancement_engine.query_plan_stage_commit(request.request_ref):
             return _CycleStep(False)
 
@@ -363,7 +372,10 @@ class PlanStageWorker:
             ):
                 raise OwnerConflict("rejection_lineage_invalid")
             predecessor_hash = material_plan_hash(predecessor.outcome)
-        elif run.attempt_generation != 1 or (
+        elif (
+            run.attempt_generation != 1
+            and run.technical_predecessor_attempt_ref is None
+        ) or (
             (run.native_session_ref is None) != (run.primary_draft is None)
         ):
             raise OwnerConflict("attempt_lineage_invalid")
@@ -383,11 +395,13 @@ class PlanStageWorker:
             return _CycleStep(False, provider_boundary_attempted=True)
         if request.accepted_idea_set is None:
             raise OwnerConflict("plan_idea_set_binding_missing")
-        job_ref = (
-            run.primary_invocation.invocation_ref
+        invocation = (
+            run.primary_invocation
             if run.primary_draft is None
-            else run.review_invocation.invocation_ref
+            else run.review_invocation
         )
+        job_ref = invocation.operation_ref
+        unit_ref = invocation.invocation_ref
         skill_request = PlanSkillRequest(
             stage_request_ref=request.request_ref,
             cycle_ref=request.cycle_ref,
@@ -412,31 +426,51 @@ class PlanStageWorker:
             job_ref=job_ref,
         )
         if run.primary_draft is None:
-            try:
-                draft = self._provider.generate_draft(skill_request)
-                draft_hash = validate_plan_skill_draft(skill_request, draft)
-            except PlanSkillUnavailable as error:
-                self._transient_error = error.code
-                return _CycleStep(False, provider_boundary_attempted=True)
-            except PlanSkillContractError as error:
-                self._transient_error = str(error)
-                return _CycleStep(False, provider_boundary_attempted=True)
-            checkpoint = self._agent_runtime.record_plan_primary_draft(
+            self._agent_runtime.begin_provider_unit(
+                unit_ref=unit_ref,
+                operation_ref=job_ref,
                 run_ref=run.run_ref,
                 attempt_ref=run.attempt_ref,
                 fence_ref=run.fence_ref,
-                native_session_ref=draft.primary_session_ref,
-                runtime_binding=run.runtime_binding,
-                draft=draft.draft,
-                adapter_kind=draft.adapter_kind,
-                idempotency_key=_operation_key(
-                    "plan-primary", run.run_ref, run.attempt_ref, draft_hash
-                ),
+                unit_kind="plan_primary",
             )
-            if checkpoint.draft_hash != draft_hash:
-                raise OwnerConflict("plan_primary_draft_hash_mismatch")
-            self._transient_error = None
-            return _CycleStep(True, provider_boundary_attempted=True)
+            provider_safe = True
+            try:
+                try:
+                    draft = self._provider.generate_draft(skill_request)
+                    draft_hash = validate_plan_skill_draft(skill_request, draft)
+                except PlanSkillUnavailable as error:
+                    if error.code == "codex_operation_reconciliation_pending":
+                        provider_safe = False
+                    self._transient_error = error.code
+                    return _CycleStep(False, provider_boundary_attempted=True)
+                except PlanSkillContractError as error:
+                    self._transient_error = str(error)
+                    return _CycleStep(False, provider_boundary_attempted=True)
+                checkpoint = self._agent_runtime.record_plan_primary_draft(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=draft.primary_session_ref,
+                    runtime_binding=run.runtime_binding,
+                    draft=draft.draft,
+                    adapter_kind=draft.adapter_kind,
+                    idempotency_key=_operation_key(
+                        "plan-primary", run.run_ref, run.attempt_ref, draft_hash
+                    ),
+                )
+                if checkpoint.draft_hash != draft_hash:
+                    raise OwnerConflict("plan_primary_draft_hash_mismatch")
+                self._transient_error = None
+                return _CycleStep(True, provider_boundary_attempted=True)
+            finally:
+                if provider_safe:
+                    self._agent_runtime.acknowledge_provider_safe_point(
+                        unit_ref=unit_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                    )
 
         checkpoint = run.primary_draft
         draft = PlanSkillDraft(
@@ -444,52 +478,72 @@ class PlanStageWorker:
             primary_session_ref=checkpoint.native_session_ref,
             adapter_kind=checkpoint.adapter_kind,
         )
-        try:
-            result = self._provider.review_draft(skill_request, draft)
-            draft_hash, plan_hash, _review_hash = validate_plan_skill_result(
-                skill_request,
-                result,
-                predecessor_material_plan_hash=predecessor_hash,
-            )
-        except PlanSkillUnavailable as error:
-            self._transient_error = error.code
-            return _CycleStep(False, provider_boundary_attempted=True)
-        except PlanSkillContractError as error:
-            self._transient_error = str(error)
-            return _CycleStep(False, provider_boundary_attempted=True)
-        review = review_record(
-            result,
-            draft_hash=draft_hash,
-            final_plan_hash=plan_hash,
-        )
-        submission_ref = "plan_submission_" + canonical_hash(
-            {
-                "request_ref": request.request_ref,
-                "attempt_ref": run.attempt_ref,
-                "fence_ref": run.fence_ref,
-                "plan_hash": plan_hash,
-                "review_hash": canonical_hash(review),
-            }
-        )[:32]
-        self._agent_runtime.record_plan_attempt_execution(
+        self._agent_runtime.begin_provider_unit(
+            unit_ref=unit_ref,
+            operation_ref=job_ref,
             run_ref=run.run_ref,
             attempt_ref=run.attempt_ref,
             fence_ref=run.fence_ref,
-            submission_ref=submission_ref,
-            native_session_ref=result.primary_session_ref,
-            runtime_binding=run.runtime_binding,
-            plan=result.final_plan,
-            reviewed_draft=result.reviewed_draft,
-            review=review,
-            idempotency_key=_operation_key(
-                "plan-execute", run.run_ref, run.attempt_ref
-            ),
+            unit_kind="plan_review",
         )
-        self._transient_error = None
-        finish_job = getattr(self._provider, "finish_job", None)
-        if callable(finish_job):
-            finish_job(job_ref)
-        return _CycleStep(True, provider_boundary_attempted=True)
+        provider_safe = True
+        try:
+            try:
+                result = self._provider.review_draft(skill_request, draft)
+                draft_hash, plan_hash, _review_hash = validate_plan_skill_result(
+                    skill_request,
+                    result,
+                    predecessor_material_plan_hash=predecessor_hash,
+                )
+            except PlanSkillUnavailable as error:
+                if error.code == "codex_operation_reconciliation_pending":
+                    provider_safe = False
+                self._transient_error = error.code
+                return _CycleStep(False, provider_boundary_attempted=True)
+            except PlanSkillContractError as error:
+                self._transient_error = str(error)
+                return _CycleStep(False, provider_boundary_attempted=True)
+            review = review_record(
+                result,
+                draft_hash=draft_hash,
+                final_plan_hash=plan_hash,
+            )
+            submission_ref = "plan_submission_" + canonical_hash(
+                {
+                    "request_ref": request.request_ref,
+                    "attempt_ref": run.attempt_ref,
+                    "fence_ref": run.fence_ref,
+                    "plan_hash": plan_hash,
+                    "review_hash": canonical_hash(review),
+                }
+            )[:32]
+            self._agent_runtime.record_plan_attempt_execution(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                submission_ref=submission_ref,
+                native_session_ref=result.primary_session_ref,
+                runtime_binding=run.runtime_binding,
+                plan=result.final_plan,
+                reviewed_draft=result.reviewed_draft,
+                review=review,
+                idempotency_key=_operation_key(
+                    "plan-execute", run.run_ref, run.attempt_ref
+                ),
+            )
+            self._transient_error = None
+            finish_job = getattr(self._provider, "finish_job", None)
+            if callable(finish_job):
+                finish_job(job_ref)
+            return _CycleStep(True, provider_boundary_attempted=True)
+        finally:
+            if provider_safe:
+                self._agent_runtime.acknowledge_provider_safe_point(
+                    unit_ref=unit_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                )
 
     def _qualify(self, current: _CurrentCycle) -> _Qualification:
         idea_request = self._advancement_engine.query_idea_stage_request(
@@ -665,35 +719,39 @@ class PlanStageWorker:
 
     def _discover_current_cycle(self) -> _CurrentCycle | None:
         candidates = self._discover_cycles()
-        return None if not candidates else candidates[-1]
+        if candidates:
+            return candidates[-1]
+        visible: list[_CurrentCycle] = []
+        for foreground in self._advancement_engine.query_active_foregrounds():
+            cycle_ref = cast(str, foreground["cycle_ref"])
+            question = self._research_graph.query_question_by_ref(
+                cast(str, foreground["question_ref"])
+            )
+            if question is None or question.quest_ref != foreground["quest_ref"]:
+                raise OwnerConflict("plan_cycle_index_invalid")
+            visible.append(
+                _CurrentCycle(cast(int, foreground["epoch"]), cycle_ref, question)
+            )
+        return None if not visible else visible[-1]
 
     def _discover_cycles(self) -> tuple[_CurrentCycle, ...]:
-        candidates: dict[str, _CurrentCycle] = {}
-        for event in self._feed.read_event_type(_CYCLE_EVENT):
-            revision = event.revision
-            payload = event.payload
-            initialization_id = payload.get("initialization_id")
-            cycle_ref = payload.get("cycle_ref")
-            question_ref = payload.get("question_ref")
-            if not all(
-                isinstance(value, str) and value
-                for value in (initialization_id, cycle_ref, question_ref)
-            ):
+        values: list[_CurrentCycle] = []
+        for foreground in self._advancement_engine.query_active_foregrounds(
+            stage="plan"
+        ):
+            question = self._research_graph.query_question_by_ref(
+                cast(str, foreground["question_ref"])
+            )
+            if question is None or question.quest_ref != foreground["quest_ref"]:
                 raise OwnerConflict("plan_cycle_index_invalid")
-            initialization_id = cast(str, initialization_id)
-            cycle_ref = cast(str, cycle_ref)
-            question_ref = cast(str, question_ref)
-            question = self._research_graph.query_question(initialization_id)
-            cycle = self._advancement_engine.query_initial_cycle(initialization_id)
-            if (
-                question is None
-                or cycle is None
-                or question.question_ref != question_ref
-                or cycle.cycle_ref != cycle_ref
-            ):
-                raise OwnerConflict("plan_cycle_index_invalid")
-            candidates[cycle_ref] = _CurrentCycle(revision, cycle_ref, question)
-        return tuple(sorted(candidates.values(), key=lambda item: item.revision))
+            values.append(
+                _CurrentCycle(
+                    cast(int, foreground["epoch"]),
+                    cast(str, foreground["cycle_ref"]),
+                    question,
+                )
+            )
+        return tuple(values)
 
 
 def _operation_key(prefix: str, *values: str) -> str:
