@@ -1330,6 +1330,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self._deepfetch_providers: dict[str, DeepFetchProvider] = {}
         self._provider_quiescence_lock = threading.Lock()
         self._provider_quiescence_drivers: dict[str, object] = {}
+        self._recover_completed_writing_provider_units()
         self._recover_interrupted_provider_units()
         self._recover_interrupted_acquisition()
         self._recover_acquisition_human_requests()
@@ -1345,6 +1346,45 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self, resolver: ResearchMaterialResolver
     ) -> None:
         self._research_material_resolver = resolver
+
+    def _recover_completed_writing_provider_units(self) -> None:
+        """Close lost safe ACKs before generic startup fencing runs.
+
+        A Writing checkpoint or execution is an Agent Runtime-owned durable
+        boundary.  If the daemon died after committing that boundary but
+        before acknowledging its provider unit, revoking the same Fence would
+        turn a completed review into an unrecoverable historical result.
+        Reuse the normal acknowledgement path so explicit stop/revocation and
+        cleanup semantics remain identical.
+        """
+
+        with self._database.read() as connection:
+            units = connection.execute(
+                text(
+                    "SELECT unit.unit_ref, unit.run_ref, unit.attempt_ref, "
+                    "unit.fence_ref FROM ar_provider_units AS unit JOIN "
+                    "ar_run_controls AS control ON control.run_ref = unit.run_ref "
+                    "WHERE control.run_kind = 'writing' AND unit.status IN "
+                    "('active', 'revocation_pending') AND unit.attempt_ref IS NOT "
+                    "NULL AND unit.fence_ref IS NOT NULL AND ((unit.unit_kind = "
+                    "'writing_primary' AND EXISTS (SELECT 1 FROM "
+                    "ar_writing_checkpoints AS checkpoint WHERE "
+                    "checkpoint.run_ref = unit.run_ref AND checkpoint.attempt_ref = "
+                    "unit.attempt_ref AND checkpoint.fence_ref = unit.fence_ref)) OR "
+                    "(unit.unit_kind = 'writing_review' AND EXISTS (SELECT 1 FROM "
+                    "ar_writing_executions AS execution WHERE execution.run_ref = "
+                    "unit.run_ref AND execution.attempt_ref = unit.attempt_ref AND "
+                    "execution.fence_ref = unit.fence_ref))) ORDER BY "
+                    "unit.started_at, unit.unit_ref"
+                )
+            ).all()
+        for unit in units:
+            self.acknowledge_provider_safe_point(
+                unit_ref=unit.unit_ref,
+                run_ref=unit.run_ref,
+                attempt_ref=unit.attempt_ref,
+                fence_ref=unit.fence_ref,
+            )
 
     def _recover_interrupted_provider_units(self) -> None:
         """Permanently retire provider Fences left active by a dead daemon.

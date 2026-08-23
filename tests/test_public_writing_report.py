@@ -1911,6 +1911,83 @@ def test_writing_retries_a_lost_provider_safe_ack_from_durable_owner_truth(
         runtime.close()
 
 
+def test_writing_startup_closes_a_lost_review_ack_before_fencing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "writing-lost-review-ack-restart"
+    provider = _DeterministicWritingSkill()
+    runtime = _runtime(data_root, provider)
+    reopened = None
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            "writing-lost-review-ack-restart",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        assert runtime.writing.process_once()
+
+        original_ack = (
+            runtime.owners.agent_runtime.acknowledge_provider_safe_point
+        )
+        current = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert current is not None
+        review_unit_ref = runtime.writing._provider_unit_ref(
+            current, "writing_review"
+        )
+
+        def lose_review_ack(**values) -> None:
+            if values.get("unit_ref") == review_unit_ref:
+                raise OwnerConflict("simulated_provider_safe_ack_loss")
+            original_ack(**values)
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            lose_review_ack,
+        )
+        with pytest.raises(OwnerConflict, match="simulated_provider_safe_ack_loss"):
+            runtime.writing.process_once()
+        committed = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert committed is not None
+        assert committed.execution is not None
+        attempt_ref = committed.attempt_ref
+        fence_ref = committed.fence_ref
+        runtime.close()
+        runtime = None
+
+        reopened = _runtime(data_root, provider)
+        recovered = reopened.owners.agent_runtime.query_writing_report(run_ref)
+        assert recovered is not None
+        assert recovered.attempt_ref == attempt_ref
+        assert recovered.fence_ref == fence_ref
+        assert recovered.execution is not None
+        assert recovered.failure_code is None
+        with reopened._database.read() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT status FROM ar_provider_units WHERE unit_ref = ?",
+                (review_unit_ref,),
+            ).scalar_one() == "completed"
+            assert connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM ar_fence_revocations WHERE fence_ref = ?",
+                (fence_ref,),
+            ).scalar_one() == 0
+
+        assert reopened.writing.process_once()
+        continued = reopened.owners.agent_runtime.query_writing_report(run_ref)
+        assert continued is not None
+        assert continued.status == "active"
+        assert continued.failure_code is None
+        assert len(provider.draft_requests) == 1
+    finally:
+        if runtime is not None:
+            runtime.close()
+        if reopened is not None:
+            reopened.close()
+
+
 @pytest.mark.parametrize("control_kind", ["pause", "timeout"])
 def test_writing_control_waits_for_provider_exit_before_replacing_attempt(
     tmp_path: Path,
