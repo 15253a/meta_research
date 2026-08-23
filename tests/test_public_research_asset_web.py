@@ -367,7 +367,9 @@ def test_sync_intake_watchdog_returns_the_durable_job_before_late_acceptance(
         return original_prepare(request)
 
     monkeypatch.setattr(research_memory, "_prepare_asset", blocked_prepare)
-    monkeypatch.setattr("meta_research.web.ASSET_ROUTE_WATCHDOG_SECONDS", 0.03)
+    # Leave enough scheduling headroom for the independent recovery query;
+    # the prepared-asset call remains blocked well beyond this watchdog.
+    monkeypatch.setattr("meta_research.web.ASSET_ROUTE_WATCHDOG_SECONDS", 0.2)
     try:
         with client:
             response = client.post(
@@ -383,8 +385,11 @@ def test_sync_intake_watchdog_returns_the_durable_job_before_late_acceptance(
                     "text": "durable before filesystem completion\n",
                 },
             )
-            assert started.is_set()
             assert response.status_code == 202
+            # The watchdog may return the durable processing row before the
+            # daemon thread receives a scheduler timeslice.  The operation
+            # must still start without a duplicate request being dispatched.
+            assert started.wait(timeout=1.0)
             pending = response.json()
             assert pending["status"] == "processing"
             job_ref = pending["job_ref"]
