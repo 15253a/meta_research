@@ -56,6 +56,7 @@ PLAN_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 DEEPFETCH_WORKER_WATCHDOG_SECONDS = 1810.0
 EXPERIMENT_WORKER_WATCHDOG_SECONDS = 30.0
+WRITING_WORKER_WATCHDOG_SECONDS = 910.0
 _T = TypeVar("_T")
 
 
@@ -64,6 +65,12 @@ class ReconciliationHealth:
     status: Literal["ready", "unavailable"] = "ready"
     last_error: str | None = None
     retry_count: int = 0
+
+
+@dataclass(frozen=True)
+class _PendingWorkerRetirement:
+    operation: asyncio.Future[bool]
+    retirement: asyncio.Future[None]
 
 
 @dataclass
@@ -465,6 +472,39 @@ class StartExperimentRequest(BaseModel):
         return ExperimentIntent(**value)
 
 
+class WritingIntentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    quest_ref: str = Field(min_length=1, max_length=96)
+    title: str = Field(min_length=1, max_length=512)
+    audience: str = Field(min_length=1, max_length=2000)
+    purpose: str = Field(min_length=1, max_length=4000)
+    instructions: str = Field(default="", max_length=12000)
+
+
+class WritingConfirmationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draft_revision: int = Field(ge=1)
+    draft_hash: str = Field(min_length=64, max_length=64)
+    preview_ref: str = Field(min_length=1, max_length=128)
+    preview_hash: str = Field(min_length=64, max_length=64)
+
+
+class WritingControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["pause", "resume"]
+    expected_attempt_ref: str = Field(min_length=1, max_length=128)
+    expected_fence_ref: str = Field(min_length=1, max_length=128)
+
+
+class WritingRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    feedback: list[str] = Field(min_length=1, max_length=64)
+
+
 def create_app(
     runtime: ProductionRuntime, *, base_url: str, control_key: str
 ) -> FastAPI:
@@ -475,6 +515,7 @@ def create_app(
     plan_stage_task: asyncio.Task[None] | None = None
     bundle_stage_task: asyncio.Task[None] | None = None
     experiment_task: asyncio.Task[None] | None = None
+    writing_task: asyncio.Task[None] | None = None
     research_asset_task: asyncio.Task[None] | None = None
     research_asset_verification_task: asyncio.Task[None] | None = None
     reconciliation_health = ReconciliationHealth()
@@ -484,6 +525,7 @@ def create_app(
     plan_stage_health = ReconciliationHealth()
     bundle_stage_health = ReconciliationHealth()
     experiment_health = ReconciliationHealth()
+    writing_health = ReconciliationHealth()
     research_asset_health = ReconciliationHealth()
     research_asset_verification_health = ReconciliationHealth()
     worker_health_updates = WorkerHealthUpdates()
@@ -495,7 +537,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         nonlocal reconciliation_task, drafting_task, deepfetch_task, idea_stage_task
-        nonlocal plan_stage_task, bundle_stage_task, experiment_task
+        nonlocal plan_stage_task, bundle_stage_task, experiment_task, writing_task
         nonlocal research_asset_task, research_asset_verification_task
         reconciliation_task = asyncio.create_task(
             _reconcile_quest_initializations(
@@ -553,6 +595,14 @@ def create_app(
             )
         )
         experiment_task.add_done_callback(_log_reconciliation_exit)
+        writing_task = asyncio.create_task(
+            _process_writing(
+                runtime,
+                writing_health,
+                worker_health_updates.publish,
+            )
+        )
+        writing_task.add_done_callback(_log_reconciliation_exit)
         research_asset_task = asyncio.create_task(
             _process_research_assets(
                 runtime,
@@ -582,6 +632,7 @@ def create_app(
                     plan_stage_task,
                     bundle_stage_task,
                     experiment_task,
+                    writing_task,
                     research_asset_task,
                     research_asset_verification_task,
                 )
@@ -652,6 +703,7 @@ def create_app(
                 experiment_task,
                 experiment_health,
             ),
+            worker_check("writing_worker", writing_task, writing_health),
             worker_check(
                 "research_asset_intake_worker",
                 research_asset_task,
@@ -671,6 +723,7 @@ def create_app(
                 "idea_stage_worker",
                 "plan_stage_worker",
                 "bundle_stage_worker",
+                "writing_worker",
                 "research_asset_intake_worker",
                 "research_asset_verification_worker",
             }
@@ -802,6 +855,7 @@ def create_app(
                 "manual_question_creation_not_found",
                 "experiment_not_found",
                 "quest_initialization_not_found",
+                "writing_run_not_found",
             }
             else 409
         )
@@ -877,6 +931,7 @@ def create_app(
         experiment = worker_check(
             "experiment_worker", experiment_task, experiment_health
         )
+        writing = worker_check("writing_worker", writing_task, writing_health)
         return {
             "status": snapshot["readiness"]["status"],
             "revision": snapshot["revision"],
@@ -907,6 +962,10 @@ def create_app(
             "experiment": {
                 "status": experiment["status"],
                 "last_error": experiment_health.last_error,
+            },
+            "writing": {
+                "status": writing["status"],
+                "last_error": writing_health.last_error,
             },
             "research_assets": {
                 "status": research_assets["status"],
@@ -1837,6 +1896,144 @@ def create_app(
     def query_snapshot() -> dict[str, object]:
         return public_snapshot()
 
+    @app.get("/api/v1/writing")
+    def query_writing() -> dict[str, object]:
+        return runtime.writing.query_overview()
+
+    @app.post("/api/v1/writing/intents", status_code=201)
+    def create_writing_intent(
+        request: Request, intent: WritingIntentRequest
+    ) -> dict[str, object]:
+        return runtime.writing.create_report_intent(
+            **intent.model_dump(), idempotency_key=_idempotency_key(request)
+        )
+
+    @app.post("/api/v1/writing/intents/{intent_id}/preview")
+    def preview_writing_intent(
+        request: Request, intent_id: str, _command: EmptyCommandRequest
+    ) -> dict[str, object]:
+        return runtime.writing.preview_report_intent(
+            intent_id, idempotency_key=_idempotency_key(request)
+        )
+
+    @app.post("/api/v1/writing/intents/{intent_id}/confirmation")
+    def confirm_writing_intent(
+        request: Request,
+        intent_id: str,
+        confirmation: WritingConfirmationRequest,
+    ) -> dict[str, object]:
+        return runtime.writing.confirm_report_intent(
+            intent_id,
+            **confirmation.model_dump(),
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.get("/api/v1/writing/runs/{run_ref}")
+    def query_writing_run(run_ref: str) -> dict[str, object]:
+        return runtime.writing.query_writing_report(run_ref)
+
+    @app.post("/api/v1/writing/runs/{run_ref}/control")
+    def control_writing_run(
+        request: Request, run_ref: str, command: WritingControlRequest
+    ) -> dict[str, object]:
+        return runtime.writing.control_report(
+            run_ref,
+            action=command.action,
+            expected_attempt_ref=command.expected_attempt_ref,
+            expected_fence_ref=command.expected_fence_ref,
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post("/api/v1/writing/runs/{run_ref}/cancellation-intents")
+    def preview_writing_cancellation(
+        request: Request, run_ref: str, _command: EmptyCommandRequest
+    ) -> dict[str, object]:
+        return runtime.writing.preview_report_cancellation(
+            run_ref, idempotency_key=_idempotency_key(request)
+        )
+
+    @app.post(
+        "/api/v1/writing/runs/{run_ref}/cancellation-intents/"
+        "{cancellation_intent_id}/confirmation"
+    )
+    def confirm_writing_cancellation(
+        request: Request,
+        run_ref: str,
+        cancellation_intent_id: str,
+        confirmation: WritingConfirmationRequest,
+    ) -> dict[str, object]:
+        return runtime.writing.confirm_report_cancellation(
+            run_ref,
+            cancellation_intent_id,
+            **confirmation.model_dump(),
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.post("/api/v1/writing/runs/{run_ref}/revisions")
+    def revise_writing_run(
+        request: Request, run_ref: str, revision: WritingRevisionRequest
+    ) -> dict[str, object]:
+        return runtime.writing.request_revision(
+            run_ref,
+            feedback=tuple(revision.feedback),
+            idempotency_key=_idempotency_key(request),
+        )
+
+    @app.get("/api/v1/writing/runs/{run_ref}/compare")
+    def compare_writing_versions(
+        run_ref: str,
+        left_version_ref: str = Query(min_length=1, max_length=96),
+        right_version_ref: str = Query(min_length=1, max_length=96),
+    ) -> dict[str, object]:
+        return runtime.writing.compare_report_versions(
+            run_ref,
+            left_version_ref=left_version_ref,
+            right_version_ref=right_version_ref,
+        )
+
+    @app.get(
+        "/api/v1/writing/runs/{run_ref}/versions/{version_ref}/content"
+    )
+    def view_writing_report_version(run_ref: str, version_ref: str) -> Response:
+        viewed = runtime.writing.view_report_version(
+            run_ref,
+            version_ref=version_ref,
+        )
+        return Response(
+            content=viewed["content"],
+            media_type="text/markdown",
+            headers={
+                "X-Writing-Version-Ref": str(viewed["version_ref"]),
+                "X-Writing-Content-Hash": str(viewed["content_hash"]),
+                "X-Writing-Citation-Status": str(viewed["citation_status"]),
+                "X-Writing-Formal-Renderer": "false",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @app.get("/api/v1/writing/runs/{run_ref}/render")
+    def render_writing_report(
+        run_ref: str,
+        format: Literal["markdown"] = Query(default="markdown"),
+        version_ref: str | None = Query(
+            default=None, min_length=1, max_length=96
+        ),
+    ) -> Response:
+        rendered = runtime.writing.render_report(
+            run_ref,
+            version_ref=version_ref,
+            format=format,
+        )
+        return Response(
+            content=rendered["content"],
+            media_type="text/markdown",
+            headers={
+                "X-Writing-Version-Ref": str(rendered["version_ref"]),
+                "X-Writing-Render-Hash": str(rendered["render_hash"]),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @app.post("/api/v1/experiments", status_code=201)
     async def start_experiment(
         request: Request,
@@ -2234,6 +2431,108 @@ async def _process_experiments(
             await asyncio.sleep(0 if advanced else 0.2)
 
 
+async def _process_writing(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Advance autonomous Writing independently of any browser connection."""
+
+    quarantined: dict[
+        tuple[str, str, str], _PendingWorkerRetirement | None
+    ] = {}
+    while True:
+        try:
+            for pending_claim, pending in tuple(quarantined.items()):
+                if pending is None:
+                    continue
+                if pending.operation.done():
+                    try:
+                        pending.operation.result()
+                    except Exception:
+                        # The retired Fence prevents any late result from
+                        # crossing a durable Owner boundary.
+                        pass
+                if not pending.retirement.done():
+                    continue
+                try:
+                    pending.retirement.result()
+                except Exception:
+                    # An unexpected retirement failure is fail-closed for this
+                    # process. A new Fence (control/resume) is a different
+                    # claim and remains runnable.
+                    quarantined[pending_claim] = None
+                else:
+                    quarantined.pop(pending_claim, None)
+            claim = await _daemon_thread_call(
+                lambda: runtime.writing.next_runnable_claim(
+                    excluded_claims=frozenset(quarantined)
+                )
+            )
+            if claim is None:
+                advanced = False
+            else:
+                run_ref, attempt_ref, fence_ref = claim
+                outcome = await _await_monitored_worker_call(
+                    lambda: runtime.writing.process_once(
+                        expected_run_ref=run_ref,
+                        expected_attempt_ref=attempt_ref,
+                        expected_fence_ref=fence_ref,
+                    ),
+                    health=health,
+                    timeout_code="writing_operation_timeout",
+                    on_health_change=on_health_change,
+                    on_timeout=lambda: runtime.writing.block_writing_claim(
+                        run_ref=run_ref,
+                        attempt_ref=attempt_ref,
+                        fence_ref=fence_ref,
+                    ),
+                    timeout_seconds=WRITING_WORKER_WATCHDOG_SECONDS,
+                )
+                if isinstance(outcome, _PendingWorkerRetirement):
+                    quarantined[claim] = outcome
+                    advanced = False
+                else:
+                    advanced = outcome
+        except Exception as error:
+            if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
+                LOGGER.exception("writing worker attempt failed unexpectedly")
+            error_code = (
+                error.code
+                if isinstance(error, OwnerConflict)
+                else str(getattr(error, "code", type(error).__name__))
+            )
+            changed = (
+                health.status != "unavailable" or health.last_error != error_code
+            )
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            if quarantined:
+                changed = (
+                    health.status != "unavailable"
+                    or health.last_error
+                    != "writing_claim_retirement_pending"
+                )
+                health.status = "unavailable"
+                health.last_error = "writing_claim_retirement_pending"
+            else:
+                changed = (
+                    health.status != "ready" or health.last_error is not None
+                )
+                health.status = "ready"
+                health.last_error = None
+                health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
 async def _process_research_assets(
     runtime: ProductionRuntime,
     health: ReconciliationHealth,
@@ -2320,8 +2619,9 @@ async def _await_monitored_worker_call(
     health: ReconciliationHealth,
     timeout_code: str,
     on_health_change: Callable[[], None] | None,
+    on_timeout: Callable[[], None] | None = None,
     timeout_seconds: float,
-) -> bool:
+) -> bool | _PendingWorkerRetirement:
     """Keep worker stalls outside the event loop and expose a watchdog.
 
     Python cannot safely cancel a thread blocked inside an arbitrary FUSE/NFS
@@ -2332,23 +2632,41 @@ async def _await_monitored_worker_call(
     """
 
     operation = _daemon_thread_call(call)
-    timed_out = False
-    while True:
-        done, _pending = await asyncio.wait(
-            {operation},
-            timeout=timeout_seconds,
+    done, _pending = await asyncio.wait(
+        {operation},
+        timeout=timeout_seconds,
+    )
+    if done:
+        return operation.result()
+    changed = (
+        health.status != "unavailable"
+        or health.last_error != timeout_code
+    )
+    health.status = "unavailable"
+    health.last_error = timeout_code
+    health.retry_count += 1
+    if on_timeout is not None:
+        retirement = _daemon_thread_call(on_timeout)
+        retired, _pending_retirement = await asyncio.wait(
+            {retirement}, timeout=timeout_seconds
         )
-        if done:
-            return operation.result()
-        if timed_out:
-            continue
-        timed_out = True
-        changed = health.status != "unavailable" or health.last_error != timeout_code
-        health.status = "unavailable"
-        health.last_error = timeout_code
-        health.retry_count += 1
-        if changed and on_health_change is not None:
-            on_health_change()
+        if retired:
+            retirement.result()
+        else:
+            if changed and on_health_change is not None:
+                on_health_change()
+            return _PendingWorkerRetirement(operation, retirement)
+    if changed and on_health_change is not None:
+        on_health_change()
+    if on_timeout is not None:
+        # The timed-out thread may still return, but the Owner callback has
+        # retired its durable Fence. Let the worker loop continue with the next
+        # runnable Run.
+        return False
+    # Existing workers without a durable timeout/Fence seam must not be
+    # duplicated. Keep exposing the watchdog state until their one operation
+    # returns, then let the caller restore ready health.
+    return await operation
 
 
 async def _await_bounded_asset_io(

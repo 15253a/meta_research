@@ -76,6 +76,7 @@ from meta_research.quest_drafting import (
     ProposalDraftRequest,
     QUESTION_FIELD_MAX_LENGTHS,
 )
+from meta_research.writing_snapshot import WritingResearchSnapshotReader
 
 
 QUESTION_FIELDS = tuple(QUESTION_FIELD_MAX_LENGTHS)
@@ -260,6 +261,14 @@ class HumanCollaborationInterface(Protocol):
         confirmation_receipt_ref: str,
         idempotency_key: str,
     ) -> dict[str, object]: ...
+
+    def query_command_by_idempotency_key(
+        self, idempotency_key: str, *, command_kind: str
+    ) -> dict[str, object] | None: ...
+
+    def query_commands(
+        self, *, command_kind: str
+    ) -> tuple[dict[str, object], ...]: ...
 
     def decide_capability_authorization(
         self,
@@ -894,6 +903,89 @@ class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
             quest_ref=quest_ref, require_effective_grant=True
         )
 
+    def verify_command_confirmation(
+        self,
+        *,
+        intent_id: str,
+        command_kind: str,
+        draft_revision: int,
+        draft_hash: str,
+        preview_ref: str,
+        preview_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> dict[str, object]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT intents.current_revision, intents.status, "
+                    "drafts.draft_json, drafts.draft_hash, previews.preview_hash, "
+                    "previews.owner_previews_json, previews.owner_previews_hash, "
+                    "previews.owner_revisions_json, previews.owner_revisions_hash, "
+                    "confirmations.confirmation_ref, confirmations.receipt_hash "
+                    "FROM hc_command_intents AS intents JOIN hc_command_drafts AS "
+                    "drafts ON drafts.intent_id = intents.intent_id JOIN "
+                    "hc_command_previews AS previews ON previews.intent_id = "
+                    "intents.intent_id JOIN hc_command_confirmations AS "
+                    "confirmations ON confirmations.intent_id = intents.intent_id "
+                    "WHERE intents.intent_id = :intent_id AND "
+                    "drafts.draft_revision = :draft_revision AND "
+                    "previews.preview_ref = :preview_ref AND "
+                    "confirmations.preview_ref = previews.preview_ref"
+                ),
+                {
+                    "intent_id": intent_id,
+                    "draft_revision": draft_revision,
+                    "preview_ref": preview_ref,
+                },
+            ).first()
+        if row is None:
+            raise OwnerConflict("command_confirmation_invalid")
+        try:
+            draft = decoded_object(row.draft_json)
+            owner_previews = json.loads(row.owner_previews_json)
+            owner_revisions = decoded_object(row.owner_revisions_json)
+            expected_preview_hash = canonical_hash(
+                {
+                    "intent_id": intent_id,
+                    "draft_revision": draft_revision,
+                    "draft_hash": draft_hash,
+                    "owner_previews": owner_previews,
+                    "owner_revisions": owner_revisions,
+                }
+            )
+            expected_receipt_hash = canonical_hash(
+                {
+                    "schema_ref": "meta-research/human-confirmation-receipt/v1",
+                    "issuer": "human_collaboration",
+                    "intent_id": intent_id,
+                    "draft_revision": draft_revision,
+                    "draft_hash": draft_hash,
+                    "preview_ref": preview_ref,
+                    "preview_hash": preview_hash,
+                }
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OwnerConflict("command_confirmation_invalid") from error
+        if (
+            int(row.current_revision) != draft_revision
+            or row.status != "confirmed"
+            or row.draft_hash != draft_hash
+            or canonical_hash(draft) != draft_hash
+            or draft.get("command_kind") != command_kind
+            or row.preview_hash != preview_hash
+            or canonical_hash(owner_previews) != row.owner_previews_hash
+            or canonical_hash(owner_revisions) != row.owner_revisions_hash
+            or expected_preview_hash != preview_hash
+            or row.confirmation_ref != receipt.receipt_ref
+            or row.receipt_hash != receipt.payload_hash
+            or expected_receipt_hash != receipt.payload_hash
+            or receipt.issuer != "human_collaboration"
+            or receipt.kind != "human_confirmation"
+            or receipt.subject_ref != intent_id
+        ):
+            raise OwnerConflict("command_confirmation_invalid")
+        return cast(dict[str, object], draft)
+
     def inspect_broad_research_authorization(
         self, *, quest_ref: str
     ) -> dict[str, object]:
@@ -1187,12 +1279,19 @@ class SQLiteHumanCollaboration:
         )
         self._fact_verifier = SQLiteHumanCollaborationFactVerifier(database)
         self._fact_verifier.bind_quest_receipt_verifier(research_graph)
+        writing_snapshots = WritingResearchSnapshotReader(
+            research_graph,
+            advancement_engine,
+            research_memory,
+            agent_runtime,
+        )
         self._collaboration_ladder = SQLiteHumanCollaborationLadder(
             database,
             feed,
             intent_drafting_provider,
-            self._resolve_companion_context,
-            self._resolve_control_preview,
+            context_resolver=self._resolve_companion_context,
+            control_preview_resolver=self._resolve_control_preview,
+            writing_snapshot_verifier=writing_snapshots.verify_current,
         )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._preview_refresh_lock = threading.Lock()
@@ -2141,6 +2240,20 @@ class SQLiteHumanCollaboration:
             if saga.rowcount != 1:
                 raise OwnerConflict("research_control_saga_missing")
         return self._collaboration_ladder.query_command(intent_id)
+
+    def query_command_by_idempotency_key(
+        self, idempotency_key: str, *, command_kind: str
+    ) -> dict[str, object] | None:
+        return self._collaboration_ladder.query_command_by_idempotency_key(
+            idempotency_key, command_kind=command_kind
+        )
+
+    def query_commands(
+        self, *, command_kind: str
+    ) -> tuple[dict[str, object], ...]:
+        return self._collaboration_ladder.query_commands(
+            command_kind=command_kind
+        )
 
     def decide_capability_authorization(
         self,

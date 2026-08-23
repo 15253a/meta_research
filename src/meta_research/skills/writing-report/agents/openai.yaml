@@ -1,0 +1,4 @@
+interface:
+  display_name: "Writing Report"
+  short_description: "Draft and revise evidence-grounded reports"
+  default_prompt: "Use $writing-report to draft and self-review a report from the frozen Quest snapshot."

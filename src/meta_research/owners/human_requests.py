@@ -71,6 +71,18 @@ class HumanResponseVerifier(Protocol):
         self, *, quest_ref: str
     ) -> dict[str, object]: ...
 
+    def verify_command_confirmation(
+        self,
+        *,
+        intent_id: str,
+        command_kind: str,
+        draft_revision: int,
+        draft_hash: str,
+        preview_ref: str,
+        preview_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> dict[str, object]: ...
+
     def verify_guidance_snapshot(
         self,
         *,

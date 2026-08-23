@@ -23,6 +23,7 @@ SUPERVISOR_REQUEST_SCHEMA = "meta-research/codex-provider-supervisor-request/v1"
 SUPERVISOR_EXIT_SCHEMA = "meta-research/codex-provider-supervisor-exit/v1"
 SUPERVISOR_STARTUP_GRACE_SECONDS = 5.5
 PROVIDER_OPERATION_ENV = "META_RESEARCH_PROVIDER_OPERATION"
+SUPERVISOR_STOP_SCHEMA = "meta-research/codex-provider-supervisor-stop/v1"
 
 
 class ProviderSupervisorError(RuntimeError):
@@ -405,6 +406,35 @@ def read_supervisor_request(path: Path, key: bytes) -> dict[str, object]:
     return payload
 
 
+def write_supervisor_stop_request(
+    path: Path, *, key: bytes, invocation_hash: str
+) -> None:
+    if not isinstance(invocation_hash, str) or len(invocation_hash) != 64:
+        raise ProviderSupervisorError("provider_supervisor_stop_invalid")
+    _write_signed_envelope(
+        path,
+        {
+            "schema_ref": SUPERVISOR_STOP_SCHEMA,
+            "invocation_hash": invocation_hash,
+        },
+        key,
+    )
+
+
+def supervisor_stop_requested(
+    path: Path, *, key: bytes, invocation_hash: str
+) -> bool:
+    if not path.exists():
+        return False
+    payload = _read_signed_envelope(path, key)
+    if payload != {
+        "schema_ref": SUPERVISOR_STOP_SCHEMA,
+        "invocation_hash": invocation_hash,
+    }:
+        raise ProviderSupervisorError("provider_supervisor_stop_invalid")
+    return True
+
+
 def write_exit_receipt(
     path: Path,
     *,
@@ -638,6 +668,7 @@ def _validated_request_paths(
         "ready_path": directory / "supervisor-ready.json",
         "started_path": directory / "provider-started.json",
         "receipt_path": directory / "supervisor-exit.json",
+        "stop_path": directory / "supervisor-stop.json",
     }
     argv = payload.get("argv")
     timeout_seconds = payload.get("timeout_seconds")
@@ -838,7 +869,10 @@ def supervise(request_path: Path) -> None:
             timeout_seconds=timeout_seconds,
             stream_max_bytes=stream_max_bytes,
             result_max_bytes=result_max_bytes,
-            stop_requested=lambda: stop_requested,
+            stop_requested=lambda: stop_requested
+            or supervisor_stop_requested(
+                paths["stop_path"], key=key, invocation_hash=invocation_hash
+            ),
         )
 
 

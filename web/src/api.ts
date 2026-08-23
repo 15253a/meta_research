@@ -1018,6 +1018,164 @@ export type PublicExperimentProjection = {
   current: ExperimentProjection | null;
 };
 
+export type WritingReceipt = AssetReceipt & { status?: "accepted" };
+
+export type WritingVersion = {
+  version_ref: string;
+  asset_ref: string;
+  version_number: number;
+  content_hash: string;
+  accepted_at: number;
+  integrity: string;
+  availability: string;
+  citation_status: "accepted" | "rejected";
+  citations: Array<{
+    citation_ref: string;
+    source_version_ref: string;
+    locator: string;
+    claim: string;
+    source_quote: string;
+  }>;
+  citation_feedback: string[];
+  deliverable_receipt: WritingReceipt;
+  citation_receipt: WritingReceipt;
+};
+
+export type WritingReportView = {
+  intent_id: string;
+  status: "draft" | "previewed" | "confirmed" | "running" | "paused" | "blocked" | "cancelled" | "completed";
+  document_type: "report";
+  draft_revision: number;
+  draft_hash: string;
+  intent: {
+    schema_ref: string;
+    title: string;
+    audience: string;
+    purpose: string;
+    instructions: string;
+  };
+  snapshot: {
+    snapshot_ref: string;
+    snapshot_hash: string;
+    quest_ref: string;
+    accepted_sources: Array<{ version_ref: string; [key: string]: unknown }>;
+    [key: string]: unknown;
+  };
+  impact_preview: null | {
+    preview_ref: string;
+    preview_hash: string;
+    status: string;
+    snapshot_hash: string;
+    target_assertion?: Record<string, unknown>;
+    owner_revisions?: Record<string, number>;
+    will_happen: string[];
+    will_not_happen: string[];
+    risks: string[];
+    stale_conditions: string[];
+  };
+  confirmation_receipt: WritingReceipt | null;
+  run: null | {
+    run_ref: string;
+    status: "active" | "paused" | "blocked" | "cancelled" | "completed";
+    attempt_ref: string;
+    attempt_generation: number;
+    content_revision: number;
+    root_session_ref: string;
+    native_session_ref: string | null;
+    fence_ref: string;
+    runtime_binding_hash: string;
+  };
+  execution: Record<string, unknown> & { status: string; receipt?: WritingReceipt | null };
+  deliverable: Record<string, unknown> & {
+    status: string;
+    version_ref?: string;
+    asset_ref?: string;
+    version_number?: number;
+    acceptance_status?: "accepted";
+    integrity?: string;
+    availability?: string;
+    failure?: null | { code: string };
+    receipt?: WritingReceipt;
+  };
+  citation: Record<string, unknown> & {
+    status: string;
+    feedback?: string[];
+    receipt?: WritingReceipt;
+  };
+  renderer: { status: string; reason?: { code: string } };
+  versions?: WritingVersion[];
+};
+
+export type WritingOverview = {
+  status: "ready";
+  document_types: ["report"];
+  runs: WritingReportView[];
+};
+
+export type WritingComparison = {
+  run_ref: string;
+  left_version_ref: string;
+  right_version_ref: string;
+  content: {
+    changed: boolean;
+    left_hash: string;
+    right_hash: string;
+    unified_diff: string;
+  };
+  evidence: {
+    changed: boolean;
+    left_source_version_refs: string[];
+    right_source_version_refs: string[];
+    added_source_version_refs: string[];
+    removed_source_version_refs: string[];
+  };
+  citation: {
+    changed: boolean;
+    left_status: string;
+    right_status: string;
+    left_citations: WritingVersion["citations"];
+    right_citations: WritingVersion["citations"];
+    added_citation_refs: string[];
+    removed_citation_refs: string[];
+    changed_citations: Array<{
+      citation_ref: string;
+      left: WritingVersion["citations"][number];
+      right: WritingVersion["citations"][number];
+    }>;
+  };
+  stale: boolean;
+  frozen_snapshot_hash: string;
+  current_snapshot_hash: string;
+};
+
+export type WritingRender = {
+  version_ref: string;
+  render_hash: string;
+  content: string;
+};
+
+export type WritingVersionContent = {
+  version_ref: string;
+  content_hash: string;
+  citation_status: string;
+  formal_renderer: false;
+  content: string;
+};
+
+export type WritingCancellationPreview = {
+  intent_id: string;
+  draft_revision: number;
+  draft_hash: string;
+  impact_preview: null | {
+    preview_ref: string;
+    preview_hash: string;
+    will_happen: string[];
+    will_not_happen: string[];
+    risks: string[];
+    stale_conditions: string[];
+  };
+};
+
 export type PublicSnapshot = {
   product: { name: string; version: string };
   revision: number;
@@ -1046,6 +1204,7 @@ export type PublicSnapshot = {
   plan_stage?: PlanStageProjection | null;
   bundle_stage?: BundleStageProjection | null;
   experiment: PublicExperimentProjection;
+  writing: WritingOverview;
   unavailable: UnavailableCapability[];
 };
 
@@ -1632,6 +1791,186 @@ export async function fetchSnapshot(signal?: AbortSignal): Promise<PublicSnapsho
     throw new ProductError(`snapshot_unavailable:${response.status}`);
   }
   return (await response.json()) as PublicSnapshot;
+}
+
+export function fetchWriting(signal?: AbortSignal): Promise<WritingOverview> {
+  return readJson("/api/v1/writing", signal);
+}
+
+export function createWritingIntent(input: {
+  quest_ref: string;
+  title: string;
+  audience: string;
+  purpose: string;
+  instructions: string;
+}): Promise<WritingReportView> {
+  return writeJson("/api/v1/writing/intents", "POST", input);
+}
+
+export function previewWritingIntent(intentId: string): Promise<WritingReportView> {
+  return writeJson(
+    `/api/v1/writing/intents/${encodeURIComponent(intentId)}/preview`,
+    "POST",
+    {},
+  );
+}
+
+export function confirmWritingIntent(
+  report: WritingReportView,
+): Promise<WritingReportView> {
+  if (!report.impact_preview) throw new ProductError("writing_preview_required");
+  return writeJson(
+    `/api/v1/writing/intents/${encodeURIComponent(report.intent_id)}/confirmation`,
+    "POST",
+    {
+      draft_revision: report.draft_revision,
+      draft_hash: report.draft_hash,
+      preview_ref: report.impact_preview.preview_ref,
+      preview_hash: report.impact_preview.preview_hash,
+    },
+  );
+}
+
+export function controlWritingRun(
+  runRef: string,
+  action: "pause" | "resume",
+  expectedAttemptRef: string,
+  expectedFenceRef: string,
+): Promise<WritingReportView> {
+  return writeJson(
+    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/control`,
+    "POST",
+    {
+      action,
+      expected_attempt_ref: expectedAttemptRef,
+      expected_fence_ref: expectedFenceRef,
+    },
+  );
+}
+
+export function previewWritingCancellation(
+  runRef: string,
+): Promise<WritingCancellationPreview> {
+  return writeJson(
+    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/cancellation-intents`,
+    "POST",
+    {},
+  );
+}
+
+export function confirmWritingCancellation(
+  runRef: string,
+  cancellation: WritingCancellationPreview,
+): Promise<WritingReportView> {
+  if (!cancellation.impact_preview) {
+    throw new ProductError("writing_cancel_preview_required");
+  }
+  return writeJson(
+    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/cancellation-intents/${encodeURIComponent(cancellation.intent_id)}/confirmation`,
+    "POST",
+    {
+      draft_revision: cancellation.draft_revision,
+      draft_hash: cancellation.draft_hash,
+      preview_ref: cancellation.impact_preview.preview_ref,
+      preview_hash: cancellation.impact_preview.preview_hash,
+    },
+  );
+}
+
+export function reviseWritingRun(
+  runRef: string,
+  feedback: string[],
+): Promise<WritingReportView> {
+  return writeJson(
+    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/revisions`,
+    "POST",
+    { feedback },
+  );
+}
+
+export function compareWritingVersions(
+  runRef: string,
+  leftVersionRef: string,
+  rightVersionRef: string,
+  signal?: AbortSignal,
+): Promise<WritingComparison> {
+  const parameters = new URLSearchParams({
+    left_version_ref: leftVersionRef,
+    right_version_ref: rightVersionRef,
+  });
+  return readJson(
+    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/compare?${parameters}`,
+    signal,
+  );
+}
+
+export function writingRenderUrl(runRef: string, versionRef?: string): string {
+  const parameters = new URLSearchParams({ format: "markdown" });
+  if (versionRef) parameters.set("version_ref", versionRef);
+  return `/api/v1/writing/runs/${encodeURIComponent(runRef)}/render?${parameters}`;
+}
+
+export async function fetchWritingRender(
+  runRef: string,
+  versionRef?: string,
+  signal?: AbortSignal,
+): Promise<WritingRender> {
+  const response = await fetch(writingRenderUrl(runRef, versionRef), {
+    credentials: "same-origin",
+    headers: { Accept: "text/markdown" },
+    signal,
+  });
+  if (!response.ok) {
+    throw new ProductError(`writing_render_unavailable:${response.status}`);
+  }
+  const renderedVersion = response.headers.get("X-Writing-Version-Ref");
+  const renderHash = response.headers.get("X-Writing-Render-Hash");
+  if (!renderedVersion || !renderHash) {
+    throw new ProductError("writing_render_identity_missing");
+  }
+  return {
+    version_ref: renderedVersion,
+    render_hash: renderHash,
+    content: await response.text(),
+  };
+}
+
+export async function fetchWritingVersionContent(
+  runRef: string,
+  versionRef: string,
+  signal?: AbortSignal,
+): Promise<WritingVersionContent> {
+  const response = await fetch(
+    `/api/v1/writing/runs/${encodeURIComponent(runRef)}/versions/`
+      + `${encodeURIComponent(versionRef)}/content`,
+    {
+      credentials: "same-origin",
+      headers: { Accept: "text/markdown" },
+      signal,
+    },
+  );
+  if (!response.ok) {
+    throw new ProductError(`writing_version_content_unavailable:${response.status}`);
+  }
+  const viewedVersion = response.headers.get("X-Writing-Version-Ref");
+  const contentHash = response.headers.get("X-Writing-Content-Hash");
+  const citationStatus = response.headers.get("X-Writing-Citation-Status");
+  const formalRenderer = response.headers.get("X-Writing-Formal-Renderer");
+  if (
+    !viewedVersion
+    || !contentHash
+    || !citationStatus
+    || formalRenderer !== "false"
+  ) {
+    throw new ProductError("writing_version_content_identity_missing");
+  }
+  return {
+    version_ref: viewedVersion,
+    content_hash: contentHash,
+    citation_status: citationStatus,
+    formal_renderer: false,
+    content: await response.text(),
+  };
 }
 
 export function fetchLiteratureSnapshot(

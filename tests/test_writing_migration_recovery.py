@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+from alembic.operations import Operations
+
+from meta_research.migration import upgrade_database
+from test_migration_recovery import _downgrade_to_revision, _upgrade_to_revision
+
+
+_AR_COUNTERS = {
+    "writing_run_count",
+    "writing_attempt_count",
+    "writing_session_count",
+    "active_writing_run_count",
+}
+_RG_COUNTERS = {
+    "writing_citation_decision_count",
+    "writing_citation_rejection_count",
+}
+_TABLES = {
+    "ar_writing_runs",
+    "ar_writing_attempts",
+    "ar_writing_checkpoints",
+    "ar_writing_executions",
+    "ar_writing_commands",
+    "rg_writing_citation_decisions",
+}
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def test_interrupted_0013_rolls_back_then_retries_without_losing_0012_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "interrupted-writing.sqlite3"
+    _upgrade_to_revision(database, "0012_experiment_measurement")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO durable_feed "
+            "(revision, event_type, payload_json, recorded_at) "
+            "VALUES (1, 'before.0013', '{}', 130.0)"
+        )
+        connection.commit()
+
+    original_create_table = Operations.create_table
+    failed_once = False
+
+    def fail_during_writing_migration(self, table_name, *args, **kwargs):
+        nonlocal failed_once
+        if table_name == "ar_writing_runs" and not failed_once:
+            failed_once = True
+            raise OSError("injected 0013 migration interruption")
+        return original_create_table(self, table_name, *args, **kwargs)
+
+    monkeypatch.setattr(Operations, "create_table", fail_during_writing_migration)
+    with pytest.raises(OSError, match="injected 0013 migration interruption"):
+        upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0012_experiment_measurement",)
+        assert not (_AR_COUNTERS & _columns(connection, "agent_runtime_state"))
+        assert not (_RG_COUNTERS & _columns(connection, "research_graph_state"))
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert not (_TABLES & tables)
+        assert connection.execute(
+            "SELECT event_type, payload_json, recorded_at FROM durable_feed "
+            "WHERE revision = 1"
+        ).fetchone() == ("before.0013", "{}", 130.0)
+
+    monkeypatch.setattr(Operations, "create_table", original_create_table)
+    upgrade_database(database)
+    upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        version = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        ar_columns = _columns(connection, "agent_runtime_state")
+        rg_columns = _columns(connection, "research_graph_state")
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        ar_values = connection.execute(
+            f"SELECT {', '.join(sorted(_AR_COUNTERS))} FROM agent_runtime_state "
+            "WHERE singleton = 'owner'"
+        ).fetchone()
+        rg_values = connection.execute(
+            f"SELECT {', '.join(sorted(_RG_COUNTERS))} FROM research_graph_state "
+            "WHERE singleton = 'owner'"
+        ).fetchone()
+        preserved = connection.execute(
+            "SELECT event_type, payload_json, recorded_at FROM durable_feed "
+            "WHERE revision = 1"
+        ).fetchone()
+        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+        integrity = connection.execute("PRAGMA quick_check").fetchone()
+
+    assert version == ("0015_writing_report",)
+    assert _AR_COUNTERS <= ar_columns
+    assert _RG_COUNTERS <= rg_columns
+    assert _TABLES <= tables
+    assert ar_values == (0,) * len(_AR_COUNTERS)
+    assert rg_values == (0,) * len(_RG_COUNTERS)
+    assert preserved == ("before.0013", "{}", 130.0)
+    assert foreign_keys == []
+    assert integrity == ("ok",)
+
+
+def test_0013_is_forward_only(tmp_path: Path) -> None:
+    database = tmp_path / "forward-only-writing.sqlite3"
+    upgrade_database(database)
+
+    with pytest.raises(RuntimeError, match="forward-only"):
+        _downgrade_to_revision(database, "0012_experiment_measurement")
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0015_writing_report",)

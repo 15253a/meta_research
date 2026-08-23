@@ -191,7 +191,10 @@ export function QuestCompanion({
     ? companion?.agent_proposals.filter((item) => item.scope_ref === scopeRef) ?? []
     : [];
   const commands = scopeRef
-    ? collaboration?.commands.items.filter((item) => item.scope_ref === scopeRef) ?? []
+    ? collaboration?.commands.items.filter((item) =>
+      item.scope_ref === scopeRef
+      && item.draft.command_kind === "capability_authorization"
+    ) ?? []
     : [];
   const broadAuthorizationHistory = scopeRef
     ? collaboration?.commands.authorizations.filter((item) =>

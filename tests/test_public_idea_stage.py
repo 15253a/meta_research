@@ -344,13 +344,31 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
             "finding_count": 0,
             "disposition_count": 0,
         }
-
-        # The v2 field is additive. Already-issued v1 payloads keep their
-        # original public reviewer_session_ref instead of losing audit data.
         persisted_run = runtime.owners.agent_runtime.query_idea_stage_run(
             committed["stage_run_request"]["request_ref"]
         )
         assert persisted_run is not None and persisted_run.execution is not None
+
+        writing = runtime.writing.create_report_intent(
+            quest_ref=quest["quest_ref"],
+            title="Idea 后阶段报告",
+            audience="研究负责人",
+            purpose="验证 Writing Snapshot 接收已接纳结果",
+            instructions="保持精确结果 lineage。",
+            idempotency_key="idea-committed-writing-snapshot",
+        )
+        accepted_idea = writing["snapshot"]["advancement"]["stages"]["idea"][
+            "accepted"
+        ]
+        assert accepted_idea["commit_ref"] == committed["stage_commit"][
+            "commit_ref"
+        ]
+        assert accepted_idea["result"]["outcome"] == (
+            persisted_run.execution.outcome
+        )
+
+        # The v2 field is additive. Already-issued v1 payloads keep their
+        # original public reviewer_session_ref instead of losing audit data.
         legacy_review = dict(persisted_run.execution.review)
         legacy_review["schema_ref"] = "meta-research/idea-advisory-review/v1"
         legacy_review["reviewer_session_ref"] = "legacy-reviewer-session-1"
