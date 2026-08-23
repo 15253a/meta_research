@@ -7,7 +7,14 @@ import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 
 
-export type FixedReferenceSurface = "shell" | "create-quest" | "create-question";
+export type FixedReferenceSurface =
+  | "shell"
+  | "create-quest"
+  | "create-question"
+  | "human-request"
+  | "external-request"
+  | "offline-operation"
+  | "permission-request";
 
 type FixedReferenceEntryBase = {
   surface: FixedReferenceSurface;
@@ -93,6 +100,10 @@ const FIXED_DYNAMIC_MASK_ALLOWLIST: Record<
       reason: "accepted parent Question ref",
     },
   ],
+  "human-request": [],
+  "external-request": [],
+  "offline-operation": [],
+  "permission-request": [],
 };
 const FIXED_MASK_RGBA = [32, 42, 58, 255] as const;
 type RasterRgba = readonly [number, number, number, number];
@@ -135,6 +146,10 @@ const FIXED_RASTER_NORMALIZATION_ALLOWLIST: Record<
     },
   ],
   "create-question": [],
+  "human-request": [],
+  "external-request": [],
+  "offline-operation": [],
+  "permission-request": [],
 };
 
 function assertFixedManifestSource(): void {
@@ -510,7 +525,6 @@ export async function attachFixedVisualPair(
     body: visibleProductionBytes,
     contentType: "image/png",
   });
-
   const reviewedProductionFilename = `reviewed-production-${filename}`;
   const reviewedProductionPath = resolve(
     referenceDirectory,

@@ -43,6 +43,11 @@ from meta_research.owners.common import (
     decoded_object,
     new_ref,
 )
+from meta_research.owners.human_requests import (
+    HumanRequestOwnerInterface,
+    HumanRequestOwnerMixin,
+    HumanResponseVerifier,
+)
 from meta_research.owners.agent_runtime import (
     ATTEMPT_EXECUTION_SCHEMA,
     DEEPFETCH_EXECUTION_RECEIPT_KIND,
@@ -496,7 +501,7 @@ class AcceptedLiteratureSnapshot:
         return result
 
 
-class ResearchMemoryInterface(Protocol):
+class ResearchMemoryInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for immutable content identity and custody."""
 
     def query_snapshot(self) -> OwnerSnapshot: ...
@@ -763,7 +768,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
     statement=text(
         "SELECT revision, asset_count, object_count, formal_content_count, "
         "idea_content_count, asset_version_count, pending_intake_count, hold_count, "
-        "literature_snapshot_count "
+        "literature_snapshot_count, human_request_count "
         "FROM research_memory_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -775,6 +780,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "pending_intake_count",
         "hold_count",
         "literature_snapshot_count",
+        "human_request_count",
     ),
 )
 
@@ -1045,7 +1051,7 @@ class SQLiteResearchMemoryReceiptVerifier:
             raise OwnerConflict("asset_custody_unavailable")
 
 
-class SQLiteResearchMemory:
+class SQLiteResearchMemory(HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,
@@ -1057,6 +1063,7 @@ class SQLiteResearchMemory:
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
         reference_reader: ResearchGraphReferenceReader | None = None,
         manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
+        human_response_verifier: HumanResponseVerifier | None = None,
     ) -> None:
         self._database = database
         self._object_store = object_store
@@ -1067,6 +1074,9 @@ class SQLiteResearchMemory:
         self._execution_verifier = execution_verifier
         self._reference_reader = reference_reader
         self._manual_confirmation_verifier = manual_confirmation_verifier
+        self._configure_human_request_owner(
+            database, feed, RM_OWNER, human_response_verifier
+        )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         # Handoff can perform durable, crash-recoverable object repair. Keep a
         # single in-process performer so timeout followers replay or alias the
@@ -6935,6 +6945,7 @@ def create_research_memory_interface(
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
     reference_reader: ResearchGraphReferenceReader | None = None,
     manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
+    human_response_verifier: HumanResponseVerifier | None = None,
 ) -> ResearchMemoryInterface:
     return SQLiteResearchMemory(
         database,
@@ -6946,4 +6957,5 @@ def create_research_memory_interface(
         execution_verifier,
         reference_reader,
         manual_confirmation_verifier,
+        human_response_verifier,
     )

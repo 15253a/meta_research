@@ -26,6 +26,7 @@ from meta_research.owners.agent_runtime import (
     IdeaStageRun,
 )
 from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.human_collaboration import HumanCollaborationInterface
 from meta_research.owners.research_graph import (
     AcceptedQuestion,
     IdeaOutcomeDecision,
@@ -71,6 +72,7 @@ class IdeaStageWorker:
         research_memory: ResearchMemoryInterface,
         research_graph: ResearchGraphInterface,
         provider: IdeaSkillProvider,
+        human_collaboration: HumanCollaborationInterface | None = None,
     ) -> None:
         self._feed = feed
         self._advancement_engine = advancement_engine
@@ -78,6 +80,7 @@ class IdeaStageWorker:
         self._research_memory = research_memory
         self._research_graph = research_graph
         self._provider = provider
+        self._human_collaboration = human_collaboration
         self._transient_error: str | None = None
         self._provider_cursor_cycle_ref: str | None = None
 
@@ -550,6 +553,22 @@ class IdeaStageWorker:
             quest.draft_revision,
             quest.draft_hash,
         )
+        guidance_bindings: list[dict[str, object]] = []
+        if self._human_collaboration is not None:
+            guidance_bindings = (
+                self._human_collaboration.query_active_guidance_bindings(
+                    f"quest:{quest.quest_ref}"
+                )
+            )
+            for binding in guidance_bindings:
+                self._human_collaboration.verify_guidance_binding(binding)
+            guidance_bindings.sort(
+                key=lambda item: (
+                    str(item["scope_ref"]),
+                    str(item["constraint_ref"]),
+                    int(cast(int, item["revision"])),
+                )
+            )
         return {
             "schema_ref": IDEA_CONTEXT_PACK_SCHEMA_REF,
             "cycle_ref": current.cycle_ref,
@@ -560,7 +579,7 @@ class IdeaStageWorker:
                 None if snapshot is None else snapshot.as_context_binding()
             ),
             "prior_accepted_bindings": [],
-            "active_guidance_bindings": [],
+            "active_guidance_bindings": guidance_bindings,
         }
 
     def _discover_current_cycle(self) -> _CurrentCycle | None:

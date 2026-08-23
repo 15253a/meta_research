@@ -38,6 +38,11 @@ from meta_research.owners.common import (
     decoded_object,
     new_ref,
 )
+from meta_research.owners.human_requests import (
+    HumanRequestOwnerInterface,
+    HumanRequestOwnerMixin,
+    HumanResponseVerifier,
+)
 
 
 RG_OWNER = "research_graph"
@@ -187,7 +192,7 @@ class IdeaOutcomeDecision:
     receipt: AcceptanceReceipt
 
 
-class ResearchGraphInterface(Protocol):
+class ResearchGraphInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for authoritative research semantics."""
 
     def query_snapshot(self) -> OwnerSnapshot: ...
@@ -366,7 +371,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
     statement=text(
         "SELECT revision, quest_count, question_count, idea_outcome_count, "
         "idea_rejection_count, asset_role_count, evidence_role_count, "
-        "source_material_role_count "
+        "source_material_role_count, human_request_count "
         "FROM research_graph_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -377,6 +382,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "asset_role_count",
         "evidence_role_count",
         "source_material_role_count",
+        "human_request_count",
     ),
 )
 
@@ -989,7 +995,7 @@ class SQLiteResearchGraphReceiptVerifier:
             )
 
 
-class SQLiteResearchGraph:
+class SQLiteResearchGraph(HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,
@@ -1002,6 +1008,7 @@ class SQLiteResearchGraph:
         execution_verifier: AttemptExecutionReceiptVerifier | None = None,
         stage_request_verifier: StageRunRequestVerifier | None = None,
         manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
+        human_response_verifier: HumanResponseVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -1013,6 +1020,9 @@ class SQLiteResearchGraph:
         self._execution_verifier = execution_verifier
         self._stage_request_verifier = stage_request_verifier
         self._manual_confirmation_verifier = manual_confirmation_verifier
+        self._configure_human_request_owner(
+            database, feed, RG_OWNER, human_response_verifier
+        )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
 
     def query_snapshot(self) -> OwnerSnapshot:
@@ -2753,6 +2763,7 @@ def create_research_graph_interface(
     execution_verifier: AttemptExecutionReceiptVerifier | None = None,
     stage_request_verifier: StageRunRequestVerifier | None = None,
     manual_confirmation_verifier: ManualQuestionConfirmationVerifier | None = None,
+    human_response_verifier: HumanResponseVerifier | None = None,
 ) -> ResearchGraphInterface:
     return SQLiteResearchGraph(
         database,
@@ -2765,4 +2776,5 @@ def create_research_graph_interface(
         execution_verifier,
         stage_request_verifier,
         manual_confirmation_verifier,
+        human_response_verifier,
     )

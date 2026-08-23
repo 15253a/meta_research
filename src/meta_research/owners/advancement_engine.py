@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from sqlalchemy import text
 
@@ -35,6 +35,11 @@ from meta_research.owners.common import (
     canonical_json,
     decoded_object,
     new_ref,
+)
+from meta_research.owners.human_requests import (
+    HumanRequestOwnerInterface,
+    HumanRequestOwnerMixin,
+    HumanResponseVerifier,
 )
 from meta_research.owners.research_graph import AcceptedQuestion, AcceptedQuest
 
@@ -89,7 +94,7 @@ class StageCommit:
     receipt: AcceptanceReceipt
 
 
-class AdvancementEngineInterface(Protocol):
+class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for Cycle, Stage, and Foreground authority."""
 
     def query_snapshot(self) -> OwnerSnapshot: ...
@@ -153,14 +158,19 @@ _SNAPSHOT = OwnerSnapshotQuery(
     owner=AE_OWNER,
     statement=text(
         "SELECT revision, foreground_cycle_count, stage_request_count, "
-        "stage_commit_count "
+        "stage_commit_count, human_request_count "
         "FROM advancement_engine_state WHERE singleton = 'owner'"
     ),
-    fact_names=("foreground_cycle_count", "stage_request_count", "stage_commit_count"),
+    fact_names=(
+        "foreground_cycle_count",
+        "stage_request_count",
+        "stage_commit_count",
+        "human_request_count",
+    ),
 )
 
 
-class SQLiteAdvancementEngine:
+class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
     def __init__(
         self,
         database: Database,
@@ -172,6 +182,7 @@ class SQLiteAdvancementEngine:
         run_completion_verifier: RunCompletionReceiptVerifier | None = None,
         outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
         literature_snapshot_verifier: LiteratureSnapshotVerifier | None = None,
+        human_response_verifier: HumanResponseVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -182,6 +193,10 @@ class SQLiteAdvancementEngine:
         self._run_completion_verifier = run_completion_verifier
         self._outcome_verifier = outcome_verifier
         self._literature_snapshot_verifier = literature_snapshot_verifier
+        self._authorization_verifier = human_response_verifier
+        self._configure_human_request_owner(
+            database, feed, AE_OWNER, human_response_verifier
+        )
         self._stage_request_verifier = SQLiteAdvancementEngineReceiptVerifier(database)
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
 
@@ -343,6 +358,11 @@ class SQLiteAdvancementEngine:
         idempotency_key: str,
     ) -> StageRunRequest:
         _validate_idempotency_key(idempotency_key)
+        if self._authorization_verifier is None:
+            raise OwnerConflict("broad_research_authorization_verifier_unavailable")
+        self._authorization_verifier.verify_broad_research_authorization(
+            quest_ref=accepted_question.quest_ref
+        )
         context_pack_json = canonical_json(context_pack)
         context_pack_hash = canonical_hash(context_pack)
         epoch = 1
@@ -464,6 +484,19 @@ class SQLiteAdvancementEngine:
                         quest_ref=accepted_question.quest_ref,
                         version_refs=tuple(sorted(evidence_refs)),
                         expected_reference_revision=reference_revision,
+                    )
+                    guidance_bindings = context_pack.get(
+                        "active_guidance_bindings"
+                    )
+                    if not isinstance(guidance_bindings, list):
+                        raise OwnerConflict(
+                            "idea_context_guidance_bindings_invalid"
+                        )
+                    self._authorization_verifier.verify_guidance_snapshot(
+                        scope_ref=f"quest:{accepted_question.quest_ref}",
+                        bindings=cast(
+                            list[dict[str, object]], guidance_bindings
+                        ),
                     )
                     request_ref = new_ref("stage_request")
                     context_pack_ref = new_ref("context_pack")
@@ -1268,6 +1301,7 @@ def create_advancement_engine_interface(
     run_completion_verifier: RunCompletionReceiptVerifier | None = None,
     outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
     literature_snapshot_verifier: LiteratureSnapshotVerifier | None = None,
+    human_response_verifier: HumanResponseVerifier | None = None,
 ) -> AdvancementEngineInterface:
     return SQLiteAdvancementEngine(
         database,
@@ -1279,4 +1313,5 @@ def create_advancement_engine_interface(
         run_completion_verifier,
         outcome_verifier,
         literature_snapshot_verifier,
+        human_response_verifier,
     )

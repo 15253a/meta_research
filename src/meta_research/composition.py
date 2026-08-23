@@ -39,6 +39,7 @@ from meta_research.owners.human_collaboration import (
     create_bundle_confirmation_verifier,
     create_deepfetch_request_verifier,
     create_human_collaboration_interface,
+    create_human_response_verifier,
 )
 from meta_research.owners.research_graph import (
     ResearchGraphInterface,
@@ -150,6 +151,7 @@ def build_production_runtime(
     acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
 
     host_compute_reader = create_host_compute_observation_reader(database)
+    human_response_verifier = create_human_response_verifier(database)
     confirmation_verifier = create_bundle_confirmation_verifier(
         database, host_compute_reader
     )
@@ -174,6 +176,9 @@ def build_production_runtime(
         stage_request_receipts,
         manual_confirmation_verifier=manual_question_confirmations,
     )
+    human_response_verifier.bind_quest_receipt_verifier(
+        research_graph_receipts
+    )
     agent_runtime = create_agent_runtime_interface(
         database,
         feed,
@@ -182,6 +187,7 @@ def build_production_runtime(
         research_graph_receipts,
         deepfetch_request_receipts,
         data_root.run / "acquisition-sessions",
+        human_response_verifier,
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
@@ -201,6 +207,7 @@ def build_production_runtime(
         attempt_receipts,
         stage_request_receipts,
         manual_confirmation_verifier=manual_question_confirmations,
+        human_response_verifier=human_response_verifier,
     )
     research_memory = create_research_memory_interface(
         database,
@@ -211,9 +218,11 @@ def build_production_runtime(
         research_memory_receipts,
         attempt_receipts,
         research_graph,
-        manual_question_confirmations,
+        manual_confirmation_verifier=manual_question_confirmations,
+        human_response_verifier=human_response_verifier,
     )
     manual_question_confirmations.bind_research_memory_verifier(research_memory)
+    agent_runtime.bind_research_material_resolver(research_memory)
     confirmation_verifier.bind_literature_snapshot_verifier(research_memory)
     advancement_engine = create_advancement_engine_interface(
         database,
@@ -225,6 +234,7 @@ def build_production_runtime(
         attempt_receipts,
         research_graph_receipts,
         research_memory,
+        human_response_verifier,
     )
     human_collaboration = create_human_collaboration_interface(
         database,
@@ -251,6 +261,7 @@ def build_production_runtime(
         owners.research_memory,
         owners.research_graph,
         idea_skill_provider,
+        owners.human_collaboration,
     )
     deepfetch = FirstQuestionDeepFetchWorker(
         human_collaboration,

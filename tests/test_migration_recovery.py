@@ -20,7 +20,7 @@ from meta_research.migration import (
     upgrade_database,
 )
 from meta_research.composition import build_production_runtime
-from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.paths import prepare_data_root
 
 
@@ -50,6 +50,295 @@ def _upgrade_to_revision(database: Path, revision: str) -> None:
             command.upgrade(config, revision)
     finally:
         engine.dispose()
+
+
+def _downgrade_to_revision(database: Path, revision: str) -> None:
+    engine = create_engine(
+        URL.create("sqlite+pysqlite", database=str(database)), future=True
+    )
+    event.listen(engine, "connect", _configure_migration_sqlite)
+    event.listen(engine, "begin", _begin_migration_transaction)
+    config = Config()
+    config.set_main_option(
+        "script_location", str(files("meta_research.migrations"))
+    )
+    try:
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, revision)
+    finally:
+        engine.dispose()
+
+
+def _insert_completed_0008_quest(
+    connection: sqlite3.Connection,
+) -> dict[str, str]:
+    """Freeze a valid v1 confirmation/Quest chain as it existed at 0008."""
+
+    initialization_id = "quest_init_pre_0009_completed"
+    proposal_ref = "question_proposal_pre_0009"
+    preview_ref = "hc_preview_pre_0009"
+    confirmation_ref = "hc_confirmation_pre_0009"
+    quest_ref = "quest_pre_0009"
+    quest_receipt_ref = "rg_quest_receipt_pre_0009"
+    draft = {
+        "goal": "Preserve the accepted pre-0009 Quest.",
+        "completion_criteria": "Recover its missing broad authorization.",
+        "key_configuration": "local and reversible research only",
+        "literature_scope": "open_access",
+        "initial_question_direction": "Use the already accepted question.",
+        "material_receipts": [],
+    }
+    draft_hash = canonical_hash(draft)
+    proposal = dict(LEGACY_QUESTION)
+    proposal_hash = canonical_hash(proposal)
+
+    def target(assertion: dict[str, object]) -> dict[str, object]:
+        return {**assertion, "target_hash": canonical_hash(assertion)}
+
+    assertions = [
+        target(
+            {
+                "owner": "research_graph",
+                "operation": "accept_quest",
+                "may_change": ["quest_identity", "goal_revision", "graph_head"],
+                "will_not_change": ["question_identity", "research_cycle"],
+                "preconditions": [
+                    "exact_human_confirmation",
+                    "no_existing_quest_for_initialization",
+                ],
+                "risks": [
+                    "quest_may_remain_empty_if_downstream_acceptance_fails"
+                ],
+                "stale_if": [
+                    "quest_draft_revision_changes",
+                    "proposal_changes",
+                ],
+                "bindings": {
+                    "initialization_id": initialization_id,
+                    "draft_revision": 1,
+                    "draft_hash": draft_hash,
+                    "proposal_ref": proposal_ref,
+                    "proposal_hash": proposal_hash,
+                },
+            }
+        ),
+        target(
+            {
+                "owner": "research_memory",
+                "operation": "accept_question_content",
+                "may_change": [
+                    "immutable_question_content",
+                    "managed_custody",
+                ],
+                "will_not_change": [
+                    "question_identity",
+                    "quest_graph",
+                    "research_cycle",
+                ],
+                "preconditions": [
+                    "exact_human_confirmation",
+                    "exact_quest_receipt",
+                ],
+                "risks": ["custody_failure_leaves_the_accepted_quest_empty"],
+                "stale_if": ["proposal_changes", "quest_receipt_changes"],
+                "bindings": {
+                    "initialization_id": initialization_id,
+                    "proposal_ref": proposal_ref,
+                    "proposal_hash": proposal_hash,
+                },
+            }
+        ),
+        target(
+            {
+                "owner": "research_graph",
+                "operation": "accept_root_question",
+                "may_change": [
+                    "root_question_identity",
+                    "quest_question_edge",
+                ],
+                "will_not_change": ["question_content", "research_cycle"],
+                "preconditions": [
+                    "exact_quest_receipt",
+                    "exact_rm_content_receipt",
+                ],
+                "risks": [
+                    "question_identity_is_not_created_if_either_receipt_is_stale"
+                ],
+                "stale_if": [
+                    "quest_receipt_changes",
+                    "content_receipt_changes",
+                ],
+                "bindings": {
+                    "initialization_id": initialization_id,
+                    "proposal_ref": proposal_ref,
+                    "proposal_hash": proposal_hash,
+                },
+            }
+        ),
+        target(
+            {
+                "owner": "advancement_engine",
+                "operation": "activate_initial_cycle",
+                "may_change": ["research_cycle", "foreground_cycle"],
+                "will_not_change": [
+                    "quest_goal",
+                    "question_content",
+                    "question_identity",
+                ],
+                "preconditions": [
+                    "exact_quest_receipt",
+                    "exact_root_question_receipt",
+                ],
+                "risks": [
+                    "cycle_remains_not_attempted_if_question_receipt_is_stale"
+                ],
+                "stale_if": [
+                    "quest_receipt_changes",
+                    "root_question_receipt_changes",
+                ],
+                "bindings": {
+                    "initialization_id": initialization_id,
+                    "proposal_ref": proposal_ref,
+                    "proposal_hash": proposal_hash,
+                },
+            }
+        ),
+    ]
+    assertions_hash = canonical_hash(assertions)
+    preview_request = {
+        "initialization_id": initialization_id,
+        "quest_draft_revision": 1,
+        "quest_draft_hash": draft_hash,
+        "proposal_ref": proposal_ref,
+        "proposal_hash": proposal_hash,
+    }
+    preview_hash = canonical_hash(
+        {
+            "schema_ref": "meta-research/quest-initialization-impact-preview/v1",
+            **preview_request,
+            "assertions_hash": assertions_hash,
+        }
+    )
+    confirmation_request = {
+        **preview_request,
+        "preview_ref": preview_ref,
+        "preview_hash": preview_hash,
+    }
+    confirmation_hash = canonical_hash(
+        {
+            "schema_ref": "meta-research/owner-acceptance-receipt/v1",
+            "issuer": "human_collaboration",
+            "kind": "quest_bundle_confirmation",
+            "subject_ref": initialization_id,
+            "bindings": confirmation_request,
+        }
+    )
+    quest_bindings = {
+        "initialization_id": initialization_id,
+        "draft_revision": 1,
+        "draft_hash": draft_hash,
+        "proposal_ref": proposal_ref,
+        "proposal_hash": proposal_hash,
+        "preview_ref": preview_ref,
+        "preview_hash": preview_hash,
+        "confirmation_ref": confirmation_ref,
+        "confirmation_hash": confirmation_hash,
+    }
+    quest_receipt_hash = canonical_hash(
+        {
+            "schema_ref": "meta-research/owner-acceptance-receipt/v1",
+            "issuer": "research_graph",
+            "kind": "quest_acceptance",
+            "subject_ref": quest_ref,
+            "bindings": quest_bindings,
+        }
+    )
+    values = {
+        **quest_bindings,
+        "quest_ref": quest_ref,
+        "quest_receipt_ref": quest_receipt_ref,
+        "quest_receipt_hash": quest_receipt_hash,
+        "draft_json": canonical_json(draft),
+        "proposal_json": canonical_json(proposal),
+        "preview_json": canonical_json(assertions),
+        "assertions_hash": assertions_hash,
+    }
+    connection.execute(
+        "INSERT INTO hc_quest_initializations "
+        "(initialization_id, status, draft_revision, draft_json, draft_hash, "
+        "proposal_revision, proposal_ref, proposal_json, proposal_hash, "
+        "proposal_basis_revision, proposal_basis_hash, preview_ref, preview_hash, "
+        "preview_json, preview_basis_revision, preview_basis_hash, "
+        "preview_proposal_ref, preview_proposal_hash, confirmation_ref, "
+        "confirmation_hash, confirmed_draft_revision, confirmed_draft_hash, "
+        "confirmed_proposal_ref, confirmed_proposal_hash, confirmed_preview_ref, "
+        "confirmed_preview_hash, created_at, updated_at, draft_schema_ref) VALUES "
+        "(:initialization_id, 'completed', 1, :draft_json, :draft_hash, 1, "
+        ":proposal_ref, :proposal_json, :proposal_hash, 1, :draft_hash, "
+        ":preview_ref, :preview_hash, :preview_json, 1, :draft_hash, "
+        ":proposal_ref, :proposal_hash, :confirmation_ref, :confirmation_hash, "
+        "1, :draft_hash, :proposal_ref, :proposal_hash, :preview_ref, "
+        ":preview_hash, 100.0, 101.0, "
+        "'meta-research/quest-initialization-draft/v1')",
+        values,
+    )
+    connection.execute(
+        "INSERT INTO hc_quest_draft_revisions "
+        "(initialization_id, revision, draft_json, draft_hash, recorded_at, "
+        "draft_schema_ref) VALUES (:initialization_id, 1, :draft_json, "
+        ":draft_hash, 100.0, 'meta-research/quest-initialization-draft/v1')",
+        values,
+    )
+    connection.execute(
+        "INSERT INTO hc_question_proposals "
+        "(proposal_ref, initialization_id, revision, basis_revision, basis_hash, "
+        "content_json, proposal_hash, recorded_at, schema_ref) VALUES "
+        "(:proposal_ref, :initialization_id, 1, 1, :draft_hash, :proposal_json, "
+        ":proposal_hash, 100.0, 'meta-research/question-proposal/v1')",
+        values,
+    )
+    connection.execute(
+        "INSERT INTO hc_confirmation_previews "
+        "(preview_ref, initialization_id, basis_revision, basis_hash, "
+        "proposal_ref, proposal_hash, assertions_json, assertions_hash, "
+        "preview_hash, recorded_at) VALUES (:preview_ref, :initialization_id, 1, "
+        ":draft_hash, :proposal_ref, :proposal_hash, :preview_json, "
+        ":assertions_hash, :preview_hash, 100.0)",
+        values,
+    )
+    connection.execute(
+        "INSERT INTO hc_reconciliation_checkpoints "
+        "(initialization_id, state, first_missing_step, attempt_count, "
+        "reason_code, next_retry_at, updated_at) VALUES "
+        "(:initialization_id, 'completed', NULL, 3, NULL, NULL, 101.0)",
+        values,
+    )
+    connection.execute(
+        "INSERT INTO rg_quests "
+        "(quest_ref, initialization_id, draft_revision, draft_hash, proposal_ref, "
+        "proposal_hash, preview_ref, preview_hash, goal_json, confirmation_ref, "
+        "confirmation_hash, receipt_ref, receipt_hash, accepted_at) VALUES "
+        "(:quest_ref, :initialization_id, 1, :draft_hash, :proposal_ref, "
+        ":proposal_hash, :preview_ref, :preview_hash, :draft_json, "
+        ":confirmation_ref, :confirmation_hash, :quest_receipt_ref, "
+        ":quest_receipt_hash, 101.0)",
+        values,
+    )
+    connection.execute(
+        "UPDATE research_graph_state SET revision = revision + 1, "
+        "quest_count = quest_count + 1 WHERE singleton = 'owner'"
+    )
+    return {
+        "initialization_id": initialization_id,
+        "preview_ref": preview_ref,
+        "preview_hash": preview_hash,
+        "confirmation_ref": confirmation_ref,
+        "confirmation_hash": confirmation_hash,
+        "quest_ref": quest_ref,
+        "quest_receipt_ref": quest_receipt_ref,
+        "quest_receipt_hash": quest_receipt_hash,
+    }
 
 
 @pytest.mark.parametrize(
@@ -424,7 +713,7 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert version == ("0009_manual_question_creation",)
+    assert version == ("0010_human_collaboration",)
     assert "formal_content_count" in columns
     assert "hc_quest_initializations" in tables
     assert "hc_proposal_generation_attempts" in tables
@@ -491,7 +780,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0009_manual_question_creation",)
+        ).fetchone() == ("0010_human_collaboration",)
 
 
 def test_process_exit_mid_0003_ddl_recovers_on_the_next_upgrade(
@@ -551,7 +840,7 @@ upgrade_database(Path(sys.argv[1]))
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0009_manual_question_creation",)
+        ).fetchone() == ("0010_human_collaboration",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -673,7 +962,7 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 ("d" * 64,),
             )
 
-    assert version == ("0009_manual_question_creation",)
+    assert version == ("0010_human_collaboration",)
     assert feed == ("legacy.event", '{"kept":true}', 17.0)
     assert auth == ("a" * 64, "b" * 64, 18.0, 1800.0, None)
     assert initialization == (
@@ -765,7 +1054,7 @@ def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0009_manual_question_creation",)
+        ).fetchone() == ("0010_human_collaboration",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -824,7 +1113,7 @@ def test_interrupted_0005_rolls_back_and_converges_on_retry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0009_manual_question_creation",)
+        ).fetchone() == ("0010_human_collaboration",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -900,7 +1189,7 @@ def test_0005_backfills_existing_rm_contents_without_changing_identity_or_receip
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0009_manual_question_creation",)
+        ).fetchone() == ("0010_human_collaboration",)
         original_formal = connection.execute(
             "SELECT content_ref, content_hash, object_path, receipt_ref, "
             "receipt_hash FROM rm_formal_question_contents"
@@ -1091,7 +1380,7 @@ def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0009_manual_question_creation",)
+        ).fetchone() == ("0010_human_collaboration",)
         assert connection.execute(
             "SELECT object_path, content_hash, byte_count FROM "
             "rm_managed_objects"
@@ -1433,7 +1722,7 @@ def test_interrupted_0007_rolls_back_typed_runs_and_snapshot_bindings(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0009_manual_question_creation",)
+        ).fetchone() == ("0010_human_collaboration",)
         tables = {
             row[0]
             for row in connection.execute(
@@ -1556,7 +1845,7 @@ def test_interrupted_0008_rolls_back_acquisition_sessions_and_converges(
             "PRAGMA foreign_key_check"
         ).fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
-    assert version == ("0009_manual_question_creation",)
+    assert version == ("0010_human_collaboration",)
     assert {
         "ar_acquisition_sessions",
         "ar_acquisition_requests",
@@ -1567,6 +1856,454 @@ def test_interrupted_0008_rolls_back_acquisition_sessions_and_converges(
         "acquisition_runtime_binding_hash",
     }.issubset(request_columns)
     assert runtime_state == (0, 0, 0)
+    assert foreign_key_failures == []
+    assert integrity == ("ok",)
+
+
+def test_0009_completed_initialization_becomes_recoverable_without_fake_auth(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "completed-before-0009.sqlite3"
+    _upgrade_to_revision(database, "0008_quest_acquisition_session")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO hc_quest_initializations "
+            "(initialization_id, status, draft_revision, draft_json, draft_hash, "
+            "proposal_revision, created_at, updated_at) VALUES "
+            "('completed_before_0009', 'completed', 1, '{}', ?, 0, 90.0, 91.0)",
+            ("9" * 64,),
+        )
+        connection.execute(
+            "INSERT INTO hc_reconciliation_checkpoints "
+            "(initialization_id, state, first_missing_step, attempt_count, "
+            "reason_code, next_retry_at, updated_at) VALUES "
+            "('completed_before_0009', 'completed', NULL, 4, NULL, NULL, 91.0)"
+        )
+        connection.commit()
+
+    upgrade_database(database)
+    with sqlite3.connect(database) as connection:
+        version = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        checkpoint = connection.execute(
+            "SELECT state, first_missing_step, attempt_count, reason_code, "
+            "next_retry_at FROM hc_reconciliation_checkpoints WHERE "
+            "initialization_id = 'completed_before_0009'"
+        ).fetchone()
+        authorization_count = connection.execute(
+            "SELECT count(*) FROM hc_capability_authorizations"
+        ).fetchone()
+        checkpoint_ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_reconciliation_checkpoints'"
+        ).fetchone()[0]
+        attempt_ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_reconciliation_attempts'"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO hc_reconciliation_attempts "
+            "(attempt_ref, initialization_id, step, attempt_number, outcome, "
+            "reason_code, started_at, finished_at) VALUES "
+            "('broad_auth_recovery', 'completed_before_0009', "
+            "'broad_research_authorization', 1, 'accepted', NULL, 92.0, 93.0)"
+        )
+        connection.execute(
+            "INSERT INTO hc_reconciliation_attempts "
+            "(attempt_ref, initialization_id, step, attempt_number, outcome, "
+            "reason_code, started_at, finished_at) VALUES "
+            "('acquisition_recovery', 'completed_before_0009', "
+            "'acquisition_session', 1, 'accepted', NULL, 94.0, 95.0)"
+        )
+        connection.commit()
+
+    assert version == ("0010_human_collaboration",)
+    assert checkpoint == (
+        "partial",
+        "broad_research_authorization",
+        4,
+        "broad_research_authorization_missing",
+        0.0,
+    )
+    assert authorization_count == (0,)
+    assert "broad_research_authorization" in checkpoint_ddl
+    assert "acquisition_session" in checkpoint_ddl
+    assert "broad_research_authorization" in attempt_ddl
+    assert "acquisition_session" in attempt_ddl
+
+    _downgrade_to_revision(database, "0009_manual_question_creation")
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone() == ("0009_manual_question_creation",)
+        assert connection.execute(
+            "SELECT state, first_missing_step, attempt_count, reason_code, "
+            "next_retry_at FROM hc_reconciliation_checkpoints WHERE "
+            "initialization_id = 'completed_before_0009'"
+        ).fetchone() == ("completed", None, 4, None, None)
+        assert connection.execute(
+            "SELECT step FROM hc_reconciliation_attempts"
+        ).fetchall() == []
+        checkpoint_ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_reconciliation_checkpoints'"
+        ).fetchone()[0]
+        attempt_ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_reconciliation_attempts'"
+        ).fetchone()[0]
+        assert "broad_research_authorization" not in checkpoint_ddl
+        assert "acquisition_session" not in checkpoint_ddl
+        assert "broad_research_authorization" not in attempt_ddl
+        assert "acquisition_session" not in attempt_ddl
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+
+def test_0009_first_reconcile_issues_one_marked_legacy_broad_authorization(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "legacy-broad-authorization")
+    _upgrade_to_revision(data_root.database, "0008_quest_acquisition_session")
+    with sqlite3.connect(data_root.database) as connection:
+        legacy = _insert_completed_0008_quest(connection)
+        connection.commit()
+        stored_assertions = json.loads(
+            connection.execute(
+                "SELECT assertions_json FROM hc_confirmation_previews WHERE "
+                "preview_ref = ?",
+                (legacy["preview_ref"],),
+            ).fetchone()[0]
+        )
+        assert len(stored_assertions) == 4
+        assert not any(
+            isinstance(assertion, dict)
+            and assertion.get("owner") == "human_collaboration"
+            for assertion in stored_assertions
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+    upgrade_database(data_root.database)
+    with sqlite3.connect(data_root.database) as connection:
+        marker = connection.execute(
+            "SELECT preview_ref, preview_hash, confirmation_ref, confirmation_hash, "
+            "basis_kind, policy_schema_ref FROM "
+            "hc_legacy_broad_authorization_bases WHERE initialization_id = ?",
+            (legacy["initialization_id"],),
+        ).fetchone()
+        checkpoint = connection.execute(
+            "SELECT state, first_missing_step, reason_code FROM "
+            "hc_reconciliation_checkpoints WHERE initialization_id = ?",
+            (legacy["initialization_id"],),
+        ).fetchone()
+        assert connection.execute(
+            "SELECT count(*) FROM hc_capability_authorizations"
+        ).fetchone() == (0,)
+    assert marker == (
+        legacy["preview_ref"],
+        legacy["preview_hash"],
+        legacy["confirmation_ref"],
+        legacy["confirmation_hash"],
+        "legacy_implicit_quest_confirmation_policy",
+        "meta-research/trusted-local-broad/v1",
+    )
+    assert checkpoint == (
+        "partial",
+        "broad_research_authorization",
+        "broad_research_authorization_missing",
+    )
+
+    runtime = build_production_runtime(data_root)
+    try:
+        human = runtime.owners.human_collaboration
+        assert human.query_broad_research_authorization(legacy["quest_ref"]) is None
+        assert human.reconcile_once()
+        authorization = human.query_broad_research_authorization(
+            legacy["quest_ref"]
+        )
+        assert authorization is not None
+        assert authorization["policy"]["schema_ref"] == (
+            "meta-research/trusted-local-broad/v1"
+        )
+        assert authorization["target_assertion"]["bindings"]["basis_kind"] == (
+            "legacy_implicit_quest_confirmation_policy"
+        )
+        assert authorization["target_assertion"] not in stored_assertions
+        assert authorization["basis_preview_ref"] == legacy["preview_ref"]
+        assert authorization["basis_preview_hash"] == legacy["preview_hash"]
+        assert authorization["confirmation_receipt_ref"] == (
+            legacy["confirmation_ref"]
+        )
+        assert authorization["confirmation_receipt_hash"] == (
+            legacy["confirmation_hash"]
+        )
+        assert authorization["quest_receipt_ref"] == legacy["quest_receipt_ref"]
+        assert authorization["quest_receipt_hash"] == (
+            legacy["quest_receipt_hash"]
+        )
+        assert authorization["receipt_ref"] not in {
+            legacy["confirmation_ref"],
+            legacy["quest_receipt_ref"],
+        }
+        authorization_receipt_ref = authorization["receipt_ref"]
+        assert human.query_snapshot().facts["authorization_count"] == 1
+    finally:
+        runtime.close()
+
+    with sqlite3.connect(data_root.database) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM hc_capability_authorizations WHERE "
+            "authorization_kind = 'broad_research' AND quest_ref = ?",
+            (legacy["quest_ref"],),
+        ).fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM rg_quests").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT receipt_ref, receipt_hash FROM rg_quests WHERE quest_ref = ?",
+            (legacy["quest_ref"],),
+        ).fetchone() == (
+            legacy["quest_receipt_ref"],
+            legacy["quest_receipt_hash"],
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM rm_formal_question_contents"
+        ).fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM rg_questions").fetchone() == (
+            0,
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM ae_initial_cycles"
+        ).fetchone() == (0,)
+
+    restarted = build_production_runtime(data_root)
+    try:
+        human = restarted.owners.human_collaboration
+        replay = human.query_broad_research_authorization(legacy["quest_ref"])
+        assert replay is not None
+        assert replay["receipt_ref"] == authorization_receipt_ref
+        human.reconcile_once()
+        assert human.query_broad_research_authorization(legacy["quest_ref"])[
+            "receipt_ref"
+        ] == authorization_receipt_ref
+        assert human.query_snapshot().facts["authorization_count"] == 1
+    finally:
+        restarted.close()
+
+    with sqlite3.connect(data_root.database) as connection:
+        connection.execute(
+            "INSERT INTO hc_quest_initializations "
+            "(initialization_id, status, draft_revision, draft_json, draft_hash, "
+            "proposal_revision, confirmation_ref, confirmation_hash, "
+            "confirmed_preview_ref, confirmed_preview_hash, created_at, "
+            "updated_at) VALUES ('fresh_0009_confirmation', 'completed', 1, "
+            "'{}', ?, 0, 'fresh_confirmation', ?, 'fresh_preview', ?, 200.0, "
+            "200.0)",
+            ("d" * 64, "e" * 64, "f" * 64),
+        )
+        connection.commit()
+        assert connection.execute(
+            "SELECT count(*) FROM hc_legacy_broad_authorization_bases WHERE "
+            "initialization_id = 'fresh_0009_confirmation'"
+        ).fetchone() == (0,)
+
+    _downgrade_to_revision(
+        data_root.database, "0009_manual_question_creation"
+    )
+    with sqlite3.connect(data_root.database) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_legacy_broad_authorization_bases'"
+        ).fetchone() == (0,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+
+
+def test_interrupted_0009_rolls_back_whole_revision_and_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "interrupted-0009.sqlite3"
+    _upgrade_to_revision(database, "0008_quest_acquisition_session")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO durable_feed (revision, event_type, payload_json, "
+            "recorded_at) VALUES (1, 'before.0009', '{}', 96.0)"
+        )
+        connection.execute(
+            "INSERT INTO hc_quest_initializations "
+            "(initialization_id, status, draft_revision, draft_json, draft_hash, "
+            "proposal_revision, created_at, updated_at) VALUES "
+            "('completed_during_0009', 'completed', 1, '{}', ?, 0, 96.0, 97.0)",
+            ("a" * 64,),
+        )
+        connection.execute(
+            "INSERT INTO hc_reconciliation_checkpoints "
+            "(initialization_id, state, first_missing_step, attempt_count, "
+            "reason_code, next_retry_at, updated_at) VALUES "
+            "('completed_during_0009', 'completed', NULL, 2, NULL, NULL, 97.0)"
+        )
+        connection.commit()
+
+    original_create_table = Operations.create_table
+    failed_once = False
+
+    def fail_after_authorization_table(self, table_name, *args, **kwargs):
+        nonlocal failed_once
+        created = original_create_table(self, table_name, *args, **kwargs)
+        if table_name == "hc_capability_authorizations" and not failed_once:
+            failed_once = True
+            raise OSError("injected 0009 migration interruption")
+        return created
+
+    monkeypatch.setattr(
+        Operations,
+        "create_table",
+        fail_after_authorization_table,
+    )
+    with pytest.raises(OSError, match="injected 0009 migration interruption"):
+        upgrade_database(database)
+
+    with sqlite3.connect(database) as connection:
+        version_after_failure = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        tables_after_failure = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        collaboration_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(human_collaboration_state)"
+            )
+        }
+        graph_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(research_graph_state)")
+        }
+        checkpoint = connection.execute(
+            "SELECT state, first_missing_step, attempt_count, reason_code, "
+            "next_retry_at FROM hc_reconciliation_checkpoints WHERE "
+            "initialization_id = 'completed_during_0009'"
+        ).fetchone()
+        checkpoint_ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_reconciliation_checkpoints'"
+        ).fetchone()[0]
+        attempt_ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_reconciliation_attempts'"
+        ).fetchone()[0]
+        preserved = connection.execute(
+            "SELECT event_type, payload_json, recorded_at FROM durable_feed "
+            "WHERE revision = 1"
+        ).fetchone()
+        foreign_key_failures = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+        integrity = connection.execute("PRAGMA quick_check").fetchone()
+
+    assert version_after_failure == ("0008_quest_acquisition_session",)
+    assert "hc_capability_authorizations" not in tables_after_failure
+    assert "hc_legacy_broad_authorization_bases" not in tables_after_failure
+    assert "owner_human_requests" not in tables_after_failure
+    reconciliation_tables = {
+        name
+        for name in tables_after_failure
+        if name.startswith("hc_reconciliation_")
+    }
+    assert reconciliation_tables == {
+        "hc_reconciliation_checkpoints",
+        "hc_reconciliation_attempts",
+    }
+    assert "human_response_count" not in collaboration_columns
+    assert "human_request_count" not in graph_columns
+    assert checkpoint == ("completed", None, 2, None, None)
+    assert "broad_research_authorization" not in checkpoint_ddl
+    assert "acquisition_session" not in checkpoint_ddl
+    assert "broad_research_authorization" not in attempt_ddl
+    assert "acquisition_session" not in attempt_ddl
+    assert preserved == ("before.0009", "{}", 96.0)
+    assert foreign_key_failures == []
+    assert integrity == ("ok",)
+
+    monkeypatch.setattr(Operations, "create_table", original_create_table)
+    upgrade_database(database)
+    upgrade_database(database)
+    with sqlite3.connect(database) as connection:
+        version = connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        collaboration_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(human_collaboration_state)"
+            )
+        }
+        graph_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(research_graph_state)")
+        }
+        checkpoint = connection.execute(
+            "SELECT state, first_missing_step, attempt_count, reason_code, "
+            "next_retry_at FROM hc_reconciliation_checkpoints WHERE "
+            "initialization_id = 'completed_during_0009'"
+        ).fetchone()
+        authorization_count = connection.execute(
+            "SELECT count(*) FROM hc_capability_authorizations"
+        ).fetchone()
+        checkpoint_ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_reconciliation_checkpoints'"
+        ).fetchone()[0]
+        attempt_ddl = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
+            "name = 'hc_reconciliation_attempts'"
+        ).fetchone()[0]
+        preserved = connection.execute(
+            "SELECT event_type, payload_json, recorded_at FROM durable_feed "
+            "WHERE revision = 1"
+        ).fetchone()
+        foreign_key_failures = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+        integrity = connection.execute("PRAGMA quick_check").fetchone()
+
+    assert version == ("0010_human_collaboration",)
+    assert {
+        "owner_human_requests",
+        "hc_command_previews",
+        "hc_legacy_broad_authorization_bases",
+        "hc_capability_authorizations",
+    }.issubset(tables)
+    assert {
+        "human_response_count",
+        "companion_session_count",
+        "pending_companion_turn_count",
+        "soft_constraint_count",
+    }.issubset(collaboration_columns)
+    assert "human_request_count" in graph_columns
+    assert checkpoint == (
+        "partial",
+        "broad_research_authorization",
+        2,
+        "broad_research_authorization_missing",
+        0.0,
+    )
+    assert authorization_count == (0,)
+    assert "broad_research_authorization" in checkpoint_ddl
+    assert "acquisition_session" in checkpoint_ddl
+    assert "broad_research_authorization" in attempt_ddl
+    assert "acquisition_session" in attempt_ddl
+    assert preserved == ("before.0009", "{}", 96.0)
     assert foreign_key_failures == []
     assert integrity == ("ok",)
 
@@ -1808,7 +2545,7 @@ def test_interrupted_0009_restores_literature_identity_and_converges(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0009_manual_question_creation",)
+        ).fetchone() == ("0010_human_collaboration",)
         backfilled = connection.execute(
             "SELECT creation_context_kind, creation_context_ref, quest_ref "
             "FROM rm_literature_snapshots WHERE snapshot_ref = 'snapshot_before_0009'"

@@ -203,9 +203,13 @@ def test_rg_accepts_precise_asset_roles_and_revalidates_current_evidence(
         )
 
         human = runtime.owners.human_collaboration
-        for _step in range(4):
-            if not human.reconcile_once():
-                break
+        assert human.reconcile_once()  # Independent HC broad-research authorization.
+        assert human.query_quest_creation(quest.initialization_id)["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
+        assert human.reconcile_once()  # RM formal-question content receipt.
+        assert human.reconcile_once()  # RG root-question receipt.
+        assert human.reconcile_once()  # AE initial-cycle receipt and HC completion.
         completed = human.query_quest_creation(quest.initialization_id)
         assert completed["status"] == "completed"
         accepted_question = runtime.owners.research_graph.query_question(
@@ -531,7 +535,11 @@ def test_confirmed_quest_material_binding_becomes_a_separate_rg_role(
             preview_hash=recovered_preview["hash"],
             idempotency_key="quest-material-confirm",
         )
-        assert human.reconcile_once()
+        assert human.reconcile_once()  # RG Quest receipt.
+        assert human.reconcile_once()  # Independent HC broad-research authorization.
+        assert human.query_quest_creation(opened["initialization_id"])["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
         original_accept_role = runtime.owners.research_graph.accept_asset_role
 
         def reject_material_role(**_values):
@@ -545,6 +553,9 @@ def test_confirmed_quest_material_binding_becomes_a_separate_rg_role(
         assert not human.reconcile_once()
         partial = human.query_quest_creation(opened["initialization_id"])
         assert partial["receipts"]["quest_goal"]["status"] == "accepted"
+        assert partial["receipts"]["broad_research_authorization"]["status"] == (
+            "accepted"
+        )
         assert partial["receipts"]["quest_source_material"] == {
             "status": "rejected",
             "reason": {"code": "quest_source_material_unavailable"},

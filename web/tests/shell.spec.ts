@@ -466,9 +466,12 @@ test("skip navigation, visible focus, and reduced motion remain inside the fixed
   await page.keyboard.press("Shift+Tab");
   await expect(page.getByRole("button", { name: "创建 Quest" })).toBeFocused();
   await page.keyboard.press("Shift+Tab");
+  await expect(page.getByRole("button", { name: "HumanRequest" })).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
   await expect(page.getByRole("button", { name: "Research Asset" })).toBeFocused();
   await page.keyboard.press("Shift+Tab");
   await expect(page.getByRole("button", { name: "Quest 总览" })).toBeFocused();
+  await page.keyboard.press("Tab");
   await page.keyboard.press("Tab");
   await page.keyboard.press("Tab");
   await page.keyboard.press("Tab");
@@ -558,7 +561,6 @@ test("the ready-empty Lumen shell keeps its visual contract at the fixed widths"
   expect(unavailableLabels).toEqual([
     "Research Asset",
     "首问题 DeepFetch",
-    "Quest Companion",
     "Stage 执行",
     "Writing",
   ]);

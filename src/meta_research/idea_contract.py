@@ -20,6 +20,7 @@ IDEA_REVIEW_SCHEMA_REF = "meta-research/idea-advisory-review/v2"
 IDEA_CONTEXT_PACK_SCHEMA_REF = "meta-research/idea-context-pack/v1"
 IDEA_CONTEXT_PACK_SCHEMA_V2_REF = "meta-research/idea-context-pack/v2"
 MAX_IDEA_CONTEXT_EVIDENCE_REFS = 100
+MAX_IDEA_CONTEXT_GUIDANCE_BINDINGS = 100
 _IDEA_CONTEXT_PACK_V1_FIELDS = {
     "schema_ref",
     "cycle_ref",
@@ -238,7 +239,6 @@ def validate_idea_context_pack(
         or context_pack["cycle_ref"] != cycle_ref
         or context_pack["accepted_question_binding"] != accepted_question_binding
         or context_pack["prior_accepted_bindings"] != []
-        or context_pack["active_guidance_bindings"] != []
     ):
         raise IdeaContractError("idea_context_pack_invalid")
     literature = context_pack["literature_binding"]
@@ -263,6 +263,58 @@ def validate_idea_context_pack(
         or refs != sorted(set(refs))
     ):
         raise IdeaContractError("context_pack_evidence_bindings_invalid")
+    guidance = context_pack["active_guidance_bindings"]
+    if (
+        not isinstance(guidance, list)
+        or len(guidance) > MAX_IDEA_CONTEXT_GUIDANCE_BINDINGS
+    ):
+        raise IdeaContractError("idea_context_guidance_bindings_invalid")
+    guidance_keys: list[tuple[str, str, int]] = []
+    receipt_refs: list[str] = []
+    expected_guidance_fields = {
+        "schema_ref",
+        "issuer",
+        "constraint_ref",
+        "scope_ref",
+        "revision",
+        "guidance",
+        "guidance_hash",
+        "receipt_ref",
+        "receipt_hash",
+    }
+    for binding in guidance:
+        if (
+            not isinstance(binding, dict)
+            or set(binding) != expected_guidance_fields
+            or binding.get("schema_ref")
+            != "meta-research/active-guidance-binding/v1"
+            or binding.get("issuer") != "human_collaboration"
+            or not isinstance(binding.get("revision"), int)
+            or isinstance(binding.get("revision"), bool)
+            or cast(int, binding.get("revision")) < 1
+            or not isinstance(binding.get("guidance"), dict)
+            or not binding.get("guidance")
+            or not _is_hash(binding.get("guidance_hash"))
+            or _canonical_hash(binding.get("guidance"))
+            != binding.get("guidance_hash")
+            or not _is_hash(binding.get("receipt_hash"))
+        ):
+            raise IdeaContractError("idea_context_guidance_bindings_invalid")
+        _require_text(binding.get("constraint_ref"), "constraint_ref")
+        _require_text(binding.get("scope_ref"), "scope_ref")
+        _require_text(binding.get("receipt_ref"), "receipt_ref")
+        constraint_ref = cast(str, binding["constraint_ref"])
+        scope_ref = cast(str, binding["scope_ref"])
+        receipt_ref = cast(str, binding["receipt_ref"])
+        guidance_keys.append(
+            (scope_ref, constraint_ref, cast(int, binding["revision"]))
+        )
+        receipt_refs.append(receipt_ref)
+    if (
+        guidance_keys != sorted(set(guidance_keys))
+        or len(receipt_refs) != len(set(receipt_refs))
+    ):
+        raise IdeaContractError("idea_context_guidance_bindings_invalid")
     return set(cast(list[str], refs))
 
 

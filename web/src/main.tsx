@@ -34,6 +34,7 @@ import {
   type IdeaStageProjection,
   type ManualAcceptedMaterialBinding,
   type ManualQuestionCreationRawView,
+  type HumanRequestItem,
   type PublicSnapshot,
   type QuestionTreeItem,
   type UnavailableCapability,
@@ -46,6 +47,10 @@ import {
 import { QuestCreationWorkbench } from "./QuestCreation";
 import { QuestionTree } from "./QuestionTree";
 import { ResearchAssetsWorkbench } from "./ResearchAssets";
+import {
+  HumanRequestSurface,
+  QuestCompanion,
+} from "./HumanCollaboration";
 import "./shell.css";
 
 const capabilityLabels: Record<string, string> = {
@@ -260,6 +265,26 @@ type CapabilityState =
   | UnavailableCapability
   | { capability: string; status: "ready" };
 
+const humanRequestPanelByKind: Record<HumanRequestItem["kind"], string> = {
+  library_reconnect: "human-request",
+  external_material_api_access: "external-request",
+  offline_action: "offline-operation",
+  capability_authorization: "permission-request",
+};
+
+function humanRequestKindFromPanel(
+  panel: string | null,
+): HumanRequestItem["kind"] | null {
+  const entry = Object.entries(humanRequestPanelByKind).find(
+    ([, routePanel]) => routePanel === panel,
+  );
+  return (entry?.[0] as HumanRequestItem["kind"] | undefined) ?? null;
+}
+
+function isHumanRequestPanel(panel: string | null): boolean {
+  return panel === "human-requests" || humanRequestKindFromPanel(panel) !== null;
+}
+
 if (window.location.pathname === "/auth/launch") {
   window.history.replaceState(null, "", "/");
 }
@@ -331,6 +356,7 @@ function RailButton({
   unavailable = false,
   unavailableReason = "capability_unavailable",
   buttonRef,
+  attention = false,
   onClick,
 }: {
   label: string;
@@ -339,6 +365,7 @@ function RailButton({
   unavailable?: boolean;
   unavailableReason?: string;
   buttonRef?: Ref<HTMLButtonElement>;
+  attention?: boolean;
   onClick?: () => void;
 }) {
   return (
@@ -347,12 +374,16 @@ function RailButton({
       type="button"
       className={active ? "lumen-rail-button active" : "lumen-rail-button"}
       aria-label={label}
-      title={unavailable ? `${label} · ${unavailableReason}` : label}
+      title={unavailable
+        ? `${label} · ${unavailableReason}`
+        : attention
+          ? `${label} · needs you`
+          : label}
       disabled={unavailable}
       onClick={onClick}
     >
       <span aria-hidden="true">{glyph}</span>
-      {unavailable ? <i aria-hidden="true" /> : null}
+      {unavailable || attention ? <i aria-hidden="true" /> : null}
     </button>
   );
 }
@@ -364,9 +395,13 @@ function LumenRail({
   questionsActive,
   questionUnavailableReason,
   questionButtonRef,
+  onBrowseQuestions,
+  canBrowseHumanRequests,
+  humanRequestCount,
+  humanRequestsOpen,
   onCreate,
   onBrowseAssets,
-  onBrowseQuestions,
+  onBrowseHumanRequests,
 }: {
   canCreate: boolean;
   canBrowseAssets: boolean;
@@ -374,9 +409,13 @@ function LumenRail({
   questionsActive: boolean;
   questionUnavailableReason: string;
   questionButtonRef: Ref<HTMLButtonElement>;
+  canBrowseHumanRequests: boolean;
+  humanRequestCount: number;
+  humanRequestsOpen: boolean;
   onCreate: () => void;
   onBrowseAssets: () => void;
   onBrowseQuestions: () => void;
+  onBrowseHumanRequests: () => void;
 }) {
   return (
     <nav className="lumen-rail" aria-label="主导航" data-shell-region="rail">
@@ -398,7 +437,14 @@ function LumenRail({
       />
       <RailButton label="Writing" glyph="✎" unavailable />
       <RailButton label="历史" glyph="↺" unavailable />
-      <RailButton label="HumanRequest" glyph="!" unavailable />
+      <RailButton
+        label="HumanRequest"
+        glyph="!"
+        active={humanRequestsOpen}
+        unavailable={!canBrowseHumanRequests}
+        attention={humanRequestCount > 0}
+        onClick={onBrowseHumanRequests}
+      />
       <RailButton
         label="创建 Quest"
         glyph="＋"
@@ -1174,67 +1220,6 @@ function WorkspaceMain({
   );
 }
 
-function CompanionShell({ state }: { state: ShellState }) {
-  const copy: Record<ShellState, { label: string; message: string }> = {
-    loading: {
-      label: "正在建立上下文",
-      message: "我会在首个 Snapshot 返回后，用同一个窗口解释研究空间。",
-    },
-    "first-error": {
-      label: "本地连接不可用",
-      message: "首个 Snapshot 尚未返回；Shell 保持在位，修复 daemon 后可以重新读取。",
-    },
-    "readiness-unavailable": {
-      label: "底座尚未就绪",
-      message: "readiness 当前不可用。研究浏览保持只读，不会猜测或补写 Owner 状态。",
-    },
-    "ready-empty": {
-      label: "研究空间已就绪",
-      message: "这里还没有 Quest。使用左侧 ＋ 后，我会继续留在这个位置。",
-    },
-    "ready-active": {
-      label: "跟随当前 Projection",
-      message: "我会在这里解释研究状态；普通聊天不会直接写入领域事实。",
-    },
-  };
-
-  return (
-    <aside
-      className="lumen-companion"
-      aria-label="Quest Companion"
-      data-shell-region="companion"
-      tabIndex={0}
-    >
-      <header className="lumen-companion-head">
-        <span className="lumen-orb" aria-hidden="true" />
-        <div>
-          <b>Quest Companion</b>
-          <small>贯穿研究空间的高频入口</small>
-        </div>
-        <code>capability_unavailable</code>
-      </header>
-      <div className="lumen-chat" aria-live="polite">
-        <article className="lumen-message">
-          <small>{copy[state].label}</small>
-          {copy[state].message}
-        </article>
-        <article className="lumen-proposal">
-          <small>当前边界 · 无写入</small>
-          <b>对话能力尚未启用</b>
-          <p>这个固定位置不会被 capability list、Owner revision 或 receipt rail 取代。</p>
-        </article>
-      </div>
-      <div className="lumen-compose">
-        <div>
-          <input aria-label="给 Quest Companion 发消息" disabled placeholder="Quest Companion 尚未启用" />
-          <button type="button" disabled aria-label="发送消息">↑</button>
-        </div>
-        <small>普通聊天不会被猜成硬命令</small>
-      </div>
-    </aside>
-  );
-}
-
 function App() {
   const initialParameters = useMemo(
     () => new URLSearchParams(window.location.search),
@@ -1271,12 +1256,26 @@ function App() {
     string | null
   >(null);
   const [manualOpenError, setManualOpenError] = useState<string | null>(null);
+  const [humanRequestsOpen, setHumanRequestsOpen] = useState(
+    () => isHumanRequestPanel(
+      new URLSearchParams(window.location.search).get("panel"),
+    ),
+  );
+  const [humanRequestRouteKind, setHumanRequestRouteKind] = useState<
+    HumanRequestItem["kind"] | null
+  >(
+    () => humanRequestKindFromPanel(
+      new URLSearchParams(window.location.search).get("panel"),
+    ),
+  );
+  const [selectedHumanRequestRef, setSelectedHumanRequestRef] = useState<string | null>(null);
   const [streamCursor, setStreamCursor] = useState<number | null>(null);
   const [snapshotRetrySequence, setSnapshotRetrySequence] = useState(0);
   const reloadInFlight = useRef(false);
   const reloadQueued = useRef(false);
   const manualDetailSequence = useRef(0);
   const questionTreeButtonRef = useRef<HTMLButtonElement>(null);
+  const humanRequestReturnFocusRef = useRef<HTMLElement | null>(null);
 
   const handleConnection = useCallback((next: boolean) => {
     setConnected(next);
@@ -1384,6 +1383,61 @@ function App() {
     return () => controller.abort();
   }, [manualContextRef, snapshot?.revision]);
 
+  useEffect(() => {
+    const humanRequests = snapshot?.human_collaboration?.human_requests;
+    if (!humanRequestsOpen || !humanRequestRouteKind || humanRequests?.status !== "ready") {
+      return;
+    }
+    const selected = humanRequests.items.find(
+      (item) => item.kind === humanRequestRouteKind && item.status === "open",
+    ) ?? humanRequests.items.find((item) => item.kind === humanRequestRouteKind);
+    if (!selected) return;
+    setSelectedHumanRequestRef(selected.request_ref);
+    setHumanRequestRouteKind(null);
+  }, [humanRequestRouteKind, humanRequestsOpen, snapshot?.human_collaboration?.human_requests]);
+
+  useEffect(() => {
+    const humanRequests = snapshot?.human_collaboration?.human_requests;
+    if (humanRequests?.status !== "ready") return;
+    const companionScope = snapshot?.human_collaboration?.companion.scope_ref;
+    if (!companionScope) return;
+    const questRef = companionScope.startsWith("quest:")
+      ? companionScope.slice("quest:".length)
+      : companionScope;
+    const candidates = humanRequests.items.filter((item) =>
+      item.status === "open"
+      && item.quest_ref === questRef
+      && item.direct_waiters?.some((waiter) => waiter.wait_scope === "quest")
+      && !humanRequests.waiting.safe_meaningful_runnable_exists,
+    );
+    const globalRequest = candidates.find((item) => {
+      const key = `meta_research:human_request:auto_presented:${item.request_ref}`;
+      try {
+        return window.sessionStorage.getItem(key) === null;
+      } catch {
+        return true;
+      }
+    });
+    if (!globalRequest) return;
+    const presentationKey = `meta_research:human_request:auto_presented:${globalRequest.request_ref}`;
+    try {
+      if (window.sessionStorage.getItem(presentationKey)) return;
+      window.sessionStorage.setItem(presentationKey, "presented");
+    } catch {
+      // The in-memory open still presents the current global request once this render.
+    }
+    setCreationMode(null);
+    setAssetsOpen(false);
+    setSelectedHumanRequestRef(globalRequest.request_ref);
+    setHumanRequestRouteKind(null);
+    window.history.replaceState(
+      null,
+      "",
+      `/?panel=${humanRequestPanelByKind[globalRequest.kind]}`,
+    );
+    setHumanRequestsOpen(true);
+  }, [snapshot?.human_collaboration?.human_requests]);
+
   const state = shellState(snapshot, error);
   const canCreate = questCreationReady(snapshot);
   const canBrowseAssets = snapshot?.research_assets.status === "ready";
@@ -1400,6 +1454,10 @@ function App() {
       : null,
     [manualPanel],
   );
+  const canBrowseHumanRequests = snapshot?.human_collaboration?.human_requests.status === "ready";
+  const humanRequestCount = snapshot?.human_collaboration?.human_requests.items.filter(
+    (item) => item.status === "open",
+  ).length ?? 0;
   const intakeWorkerReady = snapshot?.readiness.checks.find(
     (check) => check.name === "research_asset_intake_worker",
   )?.status === "ready";
@@ -1573,10 +1631,57 @@ function App() {
       ? ""
       : `${snapshot.question_tree.status} · ${snapshot.question_tree.reason.code}`;
 
+  const openHumanRequests = (requestRef: string | null = null) => {
+    if (!canBrowseHumanRequests) return;
+    const active = document.activeElement;
+    if (!humanRequestsOpen && active instanceof HTMLElement) {
+      humanRequestReturnFocusRef.current = active;
+    }
+    setCreationMode(null);
+    setAssetsOpen(false);
+    setHumanRequestRouteKind(null);
+    setSelectedHumanRequestRef(requestRef);
+    const request = snapshot?.human_collaboration?.human_requests.items.find(
+      (item) => item.request_ref === requestRef,
+    );
+    const panel = request ? humanRequestPanelByKind[request.kind] : "human-requests";
+    window.history.replaceState(null, "", `/?panel=${panel}`);
+    setHumanRequestsOpen(true);
+  };
+  const selectHumanRequest = (requestRef: string | null) => {
+    setSelectedHumanRequestRef(requestRef);
+    if (requestRef === null) {
+      window.history.replaceState(null, "", "/?panel=human-requests");
+      return;
+    }
+    const request = snapshot?.human_collaboration?.human_requests.items.find(
+      (item) => item.request_ref === requestRef,
+    );
+    if (request) {
+      window.history.replaceState(
+        null,
+        "",
+        `/?panel=${humanRequestPanelByKind[request.kind]}`,
+      );
+    }
+  };
+  const closeHumanRequests = () => {
+    const returnFocus = humanRequestReturnFocusRef.current;
+    window.history.replaceState(null, "", "/");
+    setHumanRequestsOpen(false);
+    setHumanRequestRouteKind(null);
+    setSelectedHumanRequestRef(null);
+    humanRequestReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+      else document.querySelector<HTMLButtonElement>("[aria-label='HumanRequest']")?.focus();
+    });
+  };
+
   return (
     <>
-      <a className="lumen-skip" href="#main-content">跳到主要内容</a>
-      <div className="lumen-shell" data-testid="product-shell" data-shell-state={state}>
+      <a className="lumen-skip" href="#main-content" data-hc-background>跳到主要内容</a>
+      <div className="lumen-shell" data-testid="product-shell" data-shell-state={state} data-hc-background>
         <header className="lumen-header" data-shell-region="header">
           <div className="lumen-brand" aria-label="Meta-research">
             <span className="lumen-logo" aria-hidden="true">MR</span>
@@ -1601,9 +1706,13 @@ function App() {
           questionsActive={questionTreeOpen}
           questionUnavailableReason={questionUnavailableReason}
           questionButtonRef={questionTreeButtonRef}
+          onBrowseQuestions={openQuestionTree}
+          canBrowseHumanRequests={canBrowseHumanRequests}
+          humanRequestCount={humanRequestCount}
+          humanRequestsOpen={humanRequestsOpen}
           onCreate={openCreation}
           onBrowseAssets={openAssets}
-          onBrowseQuestions={openQuestionTree}
+          onBrowseHumanRequests={() => openHumanRequests()}
         />
         {questionTreeOpen && snapshot ? (
           <QuestionTree
@@ -1629,8 +1738,21 @@ function App() {
             retry={() => void reload()}
           />
         )}
-        <CompanionShell state={state} />
+        <QuestCompanion
+          state={state}
+          collaboration={snapshot?.human_collaboration}
+          onChanged={() => void reload()}
+          onOpenRequest={(requestRef) => openHumanRequests(requestRef)}
+        />
       </div>
+      <HumanRequestSurface
+        open={humanRequestsOpen}
+        selectedRef={selectedHumanRequestRef}
+        collaboration={snapshot?.human_collaboration}
+        onSelect={selectHumanRequest}
+        onClose={closeHumanRequests}
+        onChanged={() => void reload()}
+      />
       {creationMode && snapshot ? (
         <QuestCreationWorkbench
           current={creationMode === "new" ? null : snapshot.quest_creation.current}

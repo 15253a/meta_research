@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+from sqlalchemy import text
+
 from meta_research.composition import build_production_runtime
 from meta_research.idea_stage import _public_run
 from meta_research.idea_skill import IdeaSkillDraft, IdeaSkillRequest, IdeaSkillResult
 from meta_research.owners.agent_runtime import IdeaRuntimeBinding
-from meta_research.owners.common import canonical_hash
+from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
     HostComputeDevice,
@@ -246,6 +249,35 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
         assert requested["run"]["completion_receipt"] is None
         assert requested["outcome_acceptance"]["status"] == "not_attempted"
         assert requested["stage_commit"] is None
+        safe_runnable = (
+            runtime.owners.agent_runtime.query_safe_meaningful_runnable(
+                quest["quest_ref"], ()
+            )
+        )
+        assert safe_runnable == (
+            {
+                "owner": "agent_runtime",
+                "owner_revision": runtime.owners.agent_runtime.query_snapshot().revision,
+                "quest_ref": quest["quest_ref"],
+                "work_kind": "stage_run",
+                "work_ref": requested["run"]["run_ref"],
+                "status": "running",
+            },
+        )
+        assert (
+            runtime.owners.agent_runtime.query_safe_meaningful_runnable(
+                quest["quest_ref"],
+                (
+                    {
+                        "waiter_ref": "approval:opaque-waiter",
+                        "target_assertion": {
+                            "run_ref": requested["run"]["run_ref"]
+                        },
+                    },
+                ),
+            )
+            == ()
+        )
 
         assert runtime.idea_stage.process_once()
         primary_bound = runtime.idea_stage.query_current()
@@ -340,5 +372,119 @@ def test_idea_stage_keeps_execution_content_domain_and_stage_facts_separate(
             "finding_count": 0,
             "disposition_count": 0,
         }
+    finally:
+        runtime.close()
+
+
+def test_idea_context_pack_uses_only_current_hc_guidance_receipts(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicIdeaSkill()
+    runtime = _runtime(tmp_path / "idea-active-guidance", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        human = runtime.owners.human_collaboration
+        scope_ref = f"quest:{quest['quest_ref']}"
+        constraint = human.record_soft_constraint(
+            scope_ref,
+            {"text": "优先比较可证伪的局部机制，不扩大 Quest 范围。"},
+            "idea-guidance-constraint",
+        )
+
+        runtime.idea_stage.start("idea-guidance-start")
+        request = runtime.owners.advancement_engine.query_idea_stage_request(
+            quest["cycle_ref"]
+        )
+        assert request is not None
+        bindings = request.context_pack["active_guidance_bindings"]
+        assert bindings == human.query_active_guidance_bindings(scope_ref)
+        assert bindings[0]["constraint_ref"] == constraint["constraint_ref"]
+        assert bindings[0]["issuer"] == "human_collaboration"
+        assert bindings[0]["guidance"] == constraint["guidance"]
+        human.verify_guidance_binding(bindings[0])
+    finally:
+        runtime.close()
+
+
+def test_idea_request_rejects_guidance_withdrawn_after_context_pack_build(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    provider = _DeterministicIdeaSkill()
+    runtime = _runtime(tmp_path / "idea-guidance-currentness", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        human = runtime.owners.human_collaboration
+        scope_ref = f"quest:{quest['quest_ref']}"
+        constraint = human.record_soft_constraint(
+            scope_ref,
+            {"text": "Keep the Idea stage within the accepted Quest scope."},
+            "idea-guidance-race-constraint",
+        )
+        advancement = runtime.owners.advancement_engine
+        ensure = advancement.ensure_idea_stage_request
+        withdrawn = False
+
+        def withdraw_before_owner_commit(**values):
+            nonlocal withdrawn
+            if not withdrawn:
+                withdrawn = True
+                human.withdraw_soft_constraint(
+                    constraint["constraint_ref"],
+                    constraint["revision"],
+                    "idea-guidance-race-withdraw",
+                )
+            return ensure(**values)
+
+        monkeypatch.setattr(
+            advancement,
+            "ensure_idea_stage_request",
+            withdraw_before_owner_commit,
+        )
+        with pytest.raises(OwnerConflict, match="guidance_bindings_stale"):
+            runtime.idea_stage.start("idea-guidance-race-start")
+        assert advancement.query_idea_stage_request(quest["cycle_ref"]) is None
+    finally:
+        runtime.close()
+
+
+def test_multiple_active_guidance_bindings_use_one_canonical_order(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicIdeaSkill()
+    runtime = _runtime(tmp_path / "idea-guidance-canonical-order", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        human = runtime.owners.human_collaboration
+        scope_ref = f"quest:{quest['quest_ref']}"
+        constraints = [
+            human.record_soft_constraint(
+                scope_ref,
+                {"text": f"Canonical guidance {ordinal}."},
+                f"idea-guidance-order-{ordinal}",
+            )
+            for ordinal in (1, 2)
+        ]
+        ordered_refs = sorted(item["constraint_ref"] for item in constraints)
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_soft_constraints SET created_at = CASE "
+                    "WHEN constraint_ref = :first_ref THEN 200.0 ELSE 100.0 END "
+                    "WHERE constraint_ref IN (:first_ref, :second_ref)"
+                ),
+                {
+                    "first_ref": ordered_refs[0],
+                    "second_ref": ordered_refs[1],
+                },
+            )
+
+        runtime.idea_stage.start("idea-guidance-canonical-order-start")
+        request = runtime.owners.advancement_engine.query_idea_stage_request(
+            quest["cycle_ref"]
+        )
+        assert request is not None
+        bindings = request.context_pack["active_guidance_bindings"]
+        assert [item["constraint_ref"] for item in bindings] == ordered_refs
     finally:
         runtime.close()

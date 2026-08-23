@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -59,6 +60,11 @@ from meta_research.owners.common import (
     canonical_json,
     decoded_object,
     new_ref,
+)
+from meta_research.owners.human_requests import (
+    HumanRequestOwnerInterface,
+    HumanRequestOwnerMixin,
+    HumanResponseVerifier,
 )
 from meta_research.owners.advancement_engine import StageRunRequest
 from meta_research.quest_drafting import (
@@ -286,10 +292,26 @@ class HostComputeObservationReader(Protocol):
     def query_host_compute(self, snapshot_ref: str) -> HostComputeObservation: ...
 
 
-class AgentRuntimeInterface(Protocol):
+class ResearchMaterialResolver(Protocol):
+    """Narrow RM Query seam used to validate and materialize accepted content."""
+
+    def query_asset_version(self, memory_ref: str) -> object | None: ...
+
+    def materialize_asset(self, memory_ref: str) -> object: ...
+
+
+class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
     """Whole public Interface for Run, Attempt, Session, Fence, and host facts."""
 
     def query_snapshot(self) -> OwnerSnapshot: ...
+
+    def query_safe_meaningful_runnable(
+        self, quest_ref: str, blocked_waiters: tuple[dict[str, object], ...]
+    ) -> tuple[dict[str, object], ...]: ...
+
+    def bind_research_material_resolver(
+        self, resolver: ResearchMaterialResolver
+    ) -> None: ...
 
     def observe_host_compute(self, idempotency_key: str) -> HostComputeObservation: ...
 
@@ -311,6 +333,8 @@ class AgentRuntimeInterface(Protocol):
         session_ref: str | None = None,
         quest_ref: str | None = None,
     ) -> AcquisitionSession | None: ...
+
+    def reconcile_human_request(self, request_ref: str) -> dict[str, object] | None: ...
 
     def acquire_literature(
         self,
@@ -412,7 +436,8 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "attempt_count, session_count, deepfetch_run_count, "
         "deepfetch_completed_run_count, deepfetch_attempt_count, "
         "deepfetch_session_count, acquisition_session_count, "
-        "acquisition_request_count, acquisition_active_slot_count "
+        "acquisition_request_count, acquisition_active_slot_count, "
+        "human_request_count "
         "FROM agent_runtime_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -428,6 +453,7 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "acquisition_session_count",
         "acquisition_request_count",
         "acquisition_active_slot_count",
+        "human_request_count",
     ),
 )
 
@@ -455,7 +481,7 @@ class SQLiteHostComputeObservationReader:
         return _observation_from_row(row)
 
 
-class SQLiteAgentRuntime:
+class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     """Agent Runtime owns durable host-capability observations and their integrity."""
 
     def __init__(
@@ -467,6 +493,7 @@ class SQLiteAgentRuntime:
         outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
         deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
         acquisition_private_root: Path | None = None,
+        human_response_verifier: HumanResponseVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -474,10 +501,15 @@ class SQLiteAgentRuntime:
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
         self._deepfetch_request_verifier = deepfetch_request_verifier
+        self._authorization_verifier = human_response_verifier
+        self._research_material_resolver: ResearchMaterialResolver | None = None
         self._acquisition_private_root = (
             acquisition_private_root
             if acquisition_private_root is not None
             else Path(".meta-research-acquisition")
+        )
+        self._configure_human_request_owner(
+            database, feed, AR_OWNER, human_response_verifier
         )
         self._acquisition_private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._receipt_verifier = SQLiteAgentRuntimeReceiptVerifier(
@@ -488,10 +520,107 @@ class SQLiteAgentRuntime:
         self._deepfetch_provider_lock = threading.Lock()
         self._deepfetch_providers: dict[str, DeepFetchProvider] = {}
         self._recover_interrupted_acquisition()
+        self._recover_acquisition_human_requests()
         self._recover_interrupted_deepfetch()
+
+    def bind_research_material_resolver(
+        self, resolver: ResearchMaterialResolver
+    ) -> None:
+        self._research_material_resolver = resolver
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
+
+    def query_safe_meaningful_runnable(
+        self, quest_ref: str, blocked_waiters: tuple[dict[str, object], ...]
+    ) -> tuple[dict[str, object], ...]:
+        """Return exact current AR work for this Quest that no waiter blocks."""
+
+        if not isinstance(quest_ref, str) or not quest_ref or len(quest_ref) > 64:
+            raise OwnerConflict("quest_ref_invalid")
+        if (
+            not isinstance(blocked_waiters, tuple)
+            or len(blocked_waiters) > 256
+            or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("waiter_ref"), str)
+                or not item["waiter_ref"]
+                or len(cast(str, item["waiter_ref"])) > 128
+                or not isinstance(item.get("target_assertion"), dict)
+                for item in blocked_waiters
+            )
+        ):
+            raise OwnerConflict("human_request_waiter_ref_invalid")
+        excluded = _blocked_runtime_work_aliases(blocked_waiters)
+        with self._database.read() as connection:
+            owner_revision = int(
+                connection.execute(
+                    text(
+                        "SELECT revision FROM agent_runtime_state WHERE singleton = "
+                        "'owner'"
+                    )
+                ).scalar_one()
+            )
+            stage_rows = connection.execute(
+                text(
+                    "SELECT runs.run_ref, runs.request_ref, runs.status FROM "
+                    "ar_stage_runs AS runs JOIN ae_stage_run_requests AS requests "
+                    "ON requests.request_ref = runs.request_ref WHERE "
+                    "requests.quest_ref = :quest_ref AND runs.status IN "
+                    "('running', 'awaiting_acceptance') ORDER BY runs.created_at, "
+                    "runs.run_ref"
+                ),
+                {"quest_ref": quest_ref},
+            ).all()
+            acquisition_rows = connection.execute(
+                text(
+                    "SELECT requests.request_id, requests.status FROM "
+                    "ar_acquisition_requests AS requests JOIN "
+                    "ar_acquisition_sessions AS sessions ON sessions.session_ref = "
+                    "requests.session_ref WHERE sessions.quest_ref = :quest_ref AND "
+                    "requests.status = 'running' ORDER BY requests.created_at, "
+                    "requests.request_id"
+                ),
+                {"quest_ref": quest_ref},
+            ).all()
+        basis: list[dict[str, object]] = []
+        for row in stage_rows:
+            aliases = {
+                str(row.run_ref),
+                str(row.request_ref),
+                f"stage_run:{row.run_ref}",
+                f"stage_request:{row.request_ref}",
+            }
+            if aliases & excluded:
+                continue
+            basis.append(
+                {
+                    "owner": AR_OWNER,
+                    "owner_revision": owner_revision,
+                    "quest_ref": quest_ref,
+                    "work_kind": "stage_run",
+                    "work_ref": str(row.run_ref),
+                    "status": str(row.status),
+                }
+            )
+        for row in acquisition_rows:
+            aliases = {
+                str(row.request_id),
+                f"acquisition_request:{row.request_id}",
+            }
+            if aliases & excluded:
+                continue
+            basis.append(
+                {
+                    "owner": AR_OWNER,
+                    "owner_revision": owner_revision,
+                    "quest_ref": quest_ref,
+                    "work_kind": "acquisition_request",
+                    "work_ref": str(row.request_id),
+                    "status": str(row.status),
+                }
+            )
+        return tuple(basis)
 
     def observe_host_compute(self, idempotency_key: str) -> HostComputeObservation:
         if not idempotency_key or len(idempotency_key) > 128:
@@ -878,6 +1007,18 @@ class SQLiteAgentRuntime:
         except AcquisitionUnavailable as error:
             raise OwnerConflict(error.code) from error
         runtime_binding_json = canonical_json(runtime_binding.as_dict())
+        existing_session = self.query_acquisition_session(
+            initialization_id=initialization_id
+        )
+        if (
+            existing_session is not None
+            and existing_session.config_hash == config_hash
+            and existing_session.runtime_binding_hash == runtime_binding_hash
+            and existing_session.status == "ready"
+        ):
+            self._reconcile_acquisition_human_requests(
+                existing_session.session_ref
+            )
         now = time.time()
         with self._database.write() as connection:
             row = connection.execute(
@@ -946,7 +1087,7 @@ class SQLiteAgentRuntime:
                         "runtime_binding_json = :runtime_binding_json, "
                         "runtime_binding_hash = :runtime_binding_hash, status = "
                         "'probing', preflight_generation = :generation, "
-                        "current_request_id = NULL, slot_held = 1, reason_code = NULL, "
+                        "slot_held = 1, reason_code = NULL, "
                         "evidence_json = NULL, evidence_hash = NULL, updated_at = :now "
                         "WHERE session_ref = :session_ref"
                     ),
@@ -1065,6 +1206,7 @@ class SQLiteAgentRuntime:
             )
         session = self.query_acquisition_session(session_ref=session_ref)
         assert session is not None
+        self._reconcile_acquisition_human_requests(session_ref)
         return session
 
     def query_acquisition_session(
@@ -1095,6 +1237,791 @@ class SQLiteAgentRuntime:
             ).first()
         return None if row is None else _acquisition_session_from_row(row)
 
+    def _current_acquisition_human_target(
+        self,
+        target: dict[str, object],
+        *,
+        require_reconnected_preflight: bool,
+    ):
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT requests.*, sessions.config_hash AS session_config_hash, "
+                    "sessions.status AS session_status, sessions.slot_held AS "
+                    "session_slot_held, sessions.current_request_id AS "
+                    "session_current_request_id, sessions.preflight_generation AS "
+                    "session_preflight_generation FROM ar_acquisition_requests AS "
+                    "requests JOIN ar_acquisition_sessions AS sessions ON "
+                    "sessions.session_ref = requests.session_ref WHERE "
+                    "requests.request_id = :request_id AND requests.session_ref = "
+                    ":session_ref"
+                ),
+                {
+                    "request_id": target["acquisition_request_id"],
+                    "session_ref": target["session_ref"],
+                },
+            ).first()
+        if (
+            row is None
+            or row.request_hash != target["acquisition_request_hash"]
+            or int(row.attempt_count) < target["attempt_count"]
+            or row.status != "waiting_user"
+            or row.session_config_hash != target["config_hash"]
+            or bool(row.session_slot_held)
+            or row.session_current_request_id != target["acquisition_request_id"]
+            or not _acquisition_target_matches_waiting_item(target, row)
+            or (
+                require_reconnected_preflight
+                and (
+                    row.session_status != "ready"
+                    or int(row.session_preflight_generation)
+                    <= target["blocked_preflight_generation"]
+                )
+            )
+            or (
+                not require_reconnected_preflight
+                and row.session_status not in {"ready", "waiting_user"}
+            )
+        ):
+            return None
+        return row
+
+    def _accepted_material_response_binding(
+        self,
+        response: dict[str, object],
+        acquisition_row,
+        *,
+        expected_paper_id: str,
+    ) -> dict[str, object] | None:
+        facts = response.get("facts")
+        resolver = self._research_material_resolver
+        if not isinstance(facts, dict) or resolver is None:
+            return None
+        required = {
+            "acquisition_paper_id",
+            "material_source_ref",
+            "material_version_ref",
+            "material_content_hash",
+            "material_manifest_hash",
+            "material_acceptance_receipt_ref",
+        }
+        if not required.issubset(facts) or any(
+            not isinstance(facts[name], str) or not facts[name]
+            for name in required
+        ):
+            return None
+        if facts["acquisition_paper_id"] != expected_paper_id:
+            return None
+        version_ref = cast(str, facts["material_version_ref"])
+        if facts["material_source_ref"] != version_ref:
+            return None
+        asset = resolver.query_asset_version(version_ref)
+        receipt = None if asset is None else getattr(asset, "receipt", None)
+        if (
+            asset is None
+            or getattr(asset, "memory_ref", None) != version_ref
+            or getattr(asset, "version_ref", None) != version_ref
+            or getattr(asset, "content_hash", None)
+            != facts["material_content_hash"]
+            or getattr(asset, "manifest_hash", None)
+            != facts["material_manifest_hash"]
+            or receipt is None
+            or getattr(receipt, "issuer", None) != "research_memory"
+            or getattr(receipt, "subject_ref", None) != version_ref
+            or getattr(receipt, "receipt_ref", None)
+            != facts["material_acceptance_receipt_ref"]
+        ):
+            return None
+        media_format = _acquisition_format_for_material(
+            str(getattr(asset, "media_type", "")),
+            str(getattr(asset, "display_name", "")),
+        )
+        if media_format is None:
+            return None
+        results = _acquisition_results_from_json(
+            acquisition_row.results_json, acquisition_row.results_hash
+        )
+        if not any(
+            result.paper_id == expected_paper_id and result.status == "waiting_user"
+            for result in results
+        ):
+            return None
+        return {
+            "route": "accepted_material",
+            "response_ref": response["response_ref"],
+            "paper_id": expected_paper_id,
+            "version_ref": version_ref,
+            "content_hash": facts["material_content_hash"],
+            "manifest_hash": facts["material_manifest_hash"],
+            "receipt_ref": facts["material_acceptance_receipt_ref"],
+            "format": media_format,
+        }
+
+    def _satisfy_acquisition_human_request(
+        self,
+        request: dict[str, object],
+        response: dict[str, object],
+        *,
+        reason_code: str,
+        evidence_refs: tuple[str, ...],
+    ) -> dict[str, object]:
+        request_ref = cast(str, request["request_ref"])
+        if request["status"] == "open":
+            request = self.evaluate_human_request(
+                request_ref,
+                response_refs=(cast(str, response["response_ref"]),),
+                decision="satisfied",
+                reason_code=reason_code,
+                accepted_evidence_refs=evidence_refs,
+                idempotency_key="ar-hr-eval:"
+                + canonical_hash(
+                    {
+                        "request_ref": request_ref,
+                        "response_ref": response["response_ref"],
+                        "reason_code": reason_code,
+                        "evidence_refs": evidence_refs,
+                    }
+                ),
+            )
+        waiters = cast(list[dict[str, object]], request["direct_waiters"])
+        if len(waiters) != 1:
+            raise OwnerConflict("acquisition_human_request_invalid")
+        waiter = waiters[0]
+        if waiter.get("status") in {"released", "consumed"}:
+            return request
+        validation = self.validate_human_request_waiter(
+            request_ref,
+            waiter_ref=cast(str, waiter["waiter_ref"]),
+            generation=cast(int, waiter["generation"]),
+            target_assertion=cast(dict[str, object], waiter["target_assertion"]),
+            other_blockers=(),
+            idempotency_key="ar-hr-resume:"
+            + canonical_hash(
+                {
+                    "request_ref": request_ref,
+                    "waiter_ref": waiter["waiter_ref"],
+                    "generation": waiter["generation"],
+                }
+            ),
+        )
+        if validation["status"] != "released":
+            raise OwnerConflict("acquisition_human_request_not_released")
+        current = self.query_human_request(request_ref)
+        if current is None:
+            raise OwnerConflict("acquisition_human_request_invalid")
+        return current
+
+    def _acquisition_resume_route(
+        self, human_request: dict[str, object], acquisition_row
+    ) -> dict[str, object]:
+        evaluation = human_request.get("evaluation")
+        responses = cast(list[dict[str, object]], human_request.get("responses", []))
+        if not isinstance(evaluation, dict) or evaluation.get("decision") != "satisfied":
+            raise OwnerConflict("acquisition_human_request_invalid")
+        response_refs = evaluation.get("response_refs")
+        if not isinstance(response_refs, list) or len(response_refs) != 1:
+            raise OwnerConflict("acquisition_human_request_invalid")
+        selected = next(
+            (
+                response
+                for response in responses
+                if response.get("response_ref") == response_refs[0]
+            ),
+            None,
+        )
+        if selected is None:
+            raise OwnerConflict("acquisition_human_request_invalid")
+        facts = selected.get("facts")
+        target = cast(dict[str, object], human_request["target_assertion"])
+        item_binding = {
+            "paper_id": target["acquisition_paper_id"],
+            "item_hash": target["acquisition_item_hash"],
+        }
+        if not isinstance(facts, dict):
+            raise OwnerConflict("acquisition_human_request_invalid")
+        if facts.get("route") == "institutional_browser_reconnected":
+            return {
+                "route": "institutional_browser_reconnected",
+                "response_ref": selected["response_ref"],
+                **item_binding,
+            }
+        if facts.get("route") == "oa_only":
+            return {
+                "route": "oa_only",
+                "response_ref": selected["response_ref"],
+                **item_binding,
+            }
+        material = self._accepted_material_response_binding(
+            selected,
+            acquisition_row,
+            expected_paper_id=cast(str, target["acquisition_paper_id"]),
+        )
+        if material is None:
+            raise OwnerConflict("acquisition_material_binding_invalid")
+        return {**material, "item_hash": target["acquisition_item_hash"]}
+
+    def _record_acquisition_resume_route(
+        self,
+        connection,
+        *,
+        request_id: str,
+        attempt_no: int,
+        session_ref: str,
+        request_hash: str,
+        human_request_ref: str,
+        evaluation_ref: str,
+        route: dict[str, object],
+        consumption: dict[str, object],
+    ) -> None:
+        effective_mode = _effective_acquisition_mode(route)
+        route_json = canonical_json(route)
+        route_hash = canonical_hash(route)
+        paper_id = cast(str, route["paper_id"])
+        item_hash = cast(str, route["item_hash"])
+        consumption_receipt = cast(dict[str, object], consumption["receipt"])
+        route_ref = new_ref("acquisition_resume_route")
+        payload = {
+            "schema_ref": "meta-research/acquisition-resume-route/v1",
+            "route_ref": route_ref,
+            "request_id": request_id,
+            "attempt_no": attempt_no,
+            "session_ref": session_ref,
+            "request_hash": request_hash,
+            "paper_id": paper_id,
+            "item_hash": item_hash,
+            "human_request_ref": human_request_ref,
+            "response_ref": route["response_ref"],
+            "evaluation_ref": evaluation_ref,
+            "consumption_ref": consumption["consumption_ref"],
+            "consumption_receipt_ref": consumption_receipt["receipt_ref"],
+            "consumption_receipt_hash": consumption_receipt["payload_hash"],
+            "effective_mode": effective_mode,
+            "route_hash": route_hash,
+        }
+        receipt_hash = canonical_hash(payload)
+        existing = connection.execute(
+            text(
+                "SELECT * FROM ar_acquisition_resume_routes WHERE request_id = "
+                ":request_id AND attempt_no = :attempt_no"
+            ),
+            {"request_id": request_id, "attempt_no": attempt_no},
+        ).first()
+        if existing is not None:
+            verified = self._verified_acquisition_resume_route_row(
+                connection, existing
+            )
+            if verified != route:
+                raise OwnerConflict("acquisition_resume_route_conflict")
+            return
+        connection.execute(
+            text(
+                "INSERT INTO ar_acquisition_resume_routes (route_ref, request_id, "
+                "attempt_no, session_ref, request_hash, paper_id, item_hash, "
+                "human_request_ref, response_ref, evaluation_ref, "
+                "consumption_ref, consumption_receipt_ref, "
+                "consumption_receipt_hash, effective_mode, route_json, route_hash, "
+                "receipt_ref, receipt_hash, created_at) VALUES (:route_ref, "
+                ":request_id, :attempt_no, :session_ref, :request_hash, :paper_id, "
+                ":item_hash, :human_request_ref, :response_ref, "
+                ":evaluation_ref, :consumption_ref, :consumption_receipt_ref, "
+                ":consumption_receipt_hash, :effective_mode, :route_json, "
+                ":route_hash, :receipt_ref, :receipt_hash, :created_at)"
+            ),
+            {
+                **payload,
+                "route_json": route_json,
+                "receipt_ref": new_ref("owner_receipt"),
+                "receipt_hash": receipt_hash,
+                "created_at": time.time(),
+            },
+        )
+
+    def _verified_acquisition_resume_route_row(
+        self, connection, row
+    ) -> dict[str, object]:
+        try:
+            route = decoded_object(row.route_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OwnerConflict("acquisition_resume_route_invalid") from error
+        consumption = connection.execute(
+            text(
+                "SELECT * FROM owner_human_request_resume_consumptions WHERE "
+                "consumption_ref = :consumption_ref"
+            ),
+            {"consumption_ref": row.consumption_ref},
+        ).first()
+        payload = {
+            "schema_ref": "meta-research/acquisition-resume-route/v1",
+            "route_ref": row.route_ref,
+            "request_id": row.request_id,
+            "attempt_no": int(row.attempt_no),
+            "session_ref": row.session_ref,
+            "request_hash": row.request_hash,
+            "paper_id": row.paper_id,
+            "item_hash": row.item_hash,
+            "human_request_ref": row.human_request_ref,
+            "response_ref": row.response_ref,
+            "evaluation_ref": row.evaluation_ref,
+            "consumption_ref": row.consumption_ref,
+            "consumption_receipt_ref": row.consumption_receipt_ref,
+            "consumption_receipt_hash": row.consumption_receipt_hash,
+            "effective_mode": row.effective_mode,
+            "route_hash": row.route_hash,
+        }
+        if (
+            canonical_json(route) != row.route_json
+            or canonical_hash(route) != row.route_hash
+            or not isinstance(route, dict)
+            or route.get("response_ref") != row.response_ref
+            or route.get("paper_id") != row.paper_id
+            or route.get("item_hash") != row.item_hash
+            or _effective_acquisition_mode(route) != row.effective_mode
+            or canonical_hash(payload) != row.receipt_hash
+            or consumption is None
+            or consumption.request_ref != row.human_request_ref
+            or consumption.work_ref
+            != "acquisition_item:"
+            + canonical_hash(
+                {
+                    "request_id": row.request_id,
+                    "attempt_no": int(row.attempt_no),
+                    "paper_id": row.paper_id,
+                }
+            )
+            or consumption.receipt_ref != row.consumption_receipt_ref
+            or consumption.receipt_hash != row.consumption_receipt_hash
+        ):
+            raise OwnerConflict("acquisition_resume_route_invalid")
+        return route
+
+    def _query_acquisition_resume_route(
+        self, request_id: str, attempt_no: int, session_ref: str, request_hash: str
+    ) -> dict[str, object] | None:
+        with self._database.read() as connection:
+            request_row = connection.execute(
+                text(
+                    "SELECT results_json, results_hash FROM "
+                    "ar_acquisition_requests WHERE request_id = :request_id "
+                    "AND session_ref = :session_ref AND request_hash = :request_hash"
+                ),
+                {
+                    "request_id": request_id,
+                    "session_ref": session_ref,
+                    "request_hash": request_hash,
+                },
+            ).first()
+            if request_row is None:
+                raise OwnerConflict("acquisition_resume_route_invalid")
+            reconciliation_ids = {
+                result.paper_id
+                for result in _acquisition_results_from_json(
+                    request_row.results_json, request_row.results_hash
+                )
+                if result.status == "waiting_user"
+                and result.failure is not None
+                and result.failure.get("code")
+                == "acquisition_reconciliation_required"
+            }
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_acquisition_resume_routes WHERE request_id = "
+                    ":request_id AND attempt_no <= :attempt_no ORDER BY attempt_no "
+                    "DESC"
+                ),
+                {"request_id": request_id, "attempt_no": attempt_no},
+            ).all()
+            for row in rows:
+                if row.session_ref != session_ref or row.request_hash != request_hash:
+                    raise OwnerConflict("acquisition_resume_route_invalid")
+                route = self._verified_acquisition_resume_route_row(connection, row)
+                if row.paper_id in reconciliation_ids:
+                    return route
+            return None
+
+    def _prepare_accepted_material_route(
+        self,
+        session_ref: str,
+        request_id: str,
+        route: dict[str, object],
+    ) -> tuple[object, Path]:
+        resolver = self._research_material_resolver
+        if resolver is None:
+            raise OwnerConflict("acquisition_material_resolver_unavailable")
+        materialized = resolver.materialize_asset(cast(str, route["version_ref"]))
+        content = getattr(materialized, "content", None)
+        if (
+            not isinstance(content, bytes)
+            or hashlib.sha256(content).hexdigest() != route["content_hash"]
+        ):
+            raise OwnerConflict("acquisition_material_binding_invalid")
+        target_dir = (
+            self._acquisition_private_root / session_ref / "requests" / request_id
+        )
+        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return materialized, _store_provided_material(target_dir, route, materialized)
+
+    def reconcile_human_request(
+        self, request_ref: str
+    ) -> dict[str, object] | None:
+        request = self.query_human_request(request_ref)
+        if (
+            request is None
+            or request.get("issuer") != AR_OWNER
+            or request.get("kind") != "library_reconnect"
+            or request.get("status") not in {"open", "satisfied"}
+        ):
+            return request
+        target = request.get("target_assertion")
+        if (
+            not isinstance(target, dict)
+            or target.get("schema_ref")
+            != "meta-research/acquisition-human-request-target/v1"
+            or target.get("operation") != "resume_acquisition_item"
+            or not isinstance(target.get("session_ref"), str)
+            or not isinstance(target.get("acquisition_request_id"), str)
+            or not isinstance(target.get("acquisition_request_hash"), str)
+            or not isinstance(target.get("acquisition_paper_id"), str)
+            or not isinstance(target.get("acquisition_item_hash"), str)
+            or not isinstance(target.get("config_hash"), str)
+            or not isinstance(target.get("blocked_preflight_generation"), int)
+            or not isinstance(target.get("attempt_count"), int)
+        ):
+            return request
+        responses = cast(list[dict[str, object]], request["responses"])
+        declined_refs = tuple(
+            cast(str, response["response_ref"])
+            for response in responses
+            if response.get("decision") == "declined"
+        )
+        if request["status"] == "open" and declined_refs:
+            return self.evaluate_human_request(
+                request_ref,
+                response_refs=declined_refs,
+                decision="declined",
+                reason_code="human_declined_institution_reconnect",
+                accepted_evidence_refs=(),
+                idempotency_key="ar-hr-decline:"
+                + canonical_hash(
+                    {"request_ref": request_ref, "responses": declined_refs}
+                ),
+            )
+        deferred_refs = tuple(
+            cast(str, response["response_ref"])
+            for response in responses
+            if response.get("decision") == "deferred"
+        )
+        if (
+            request["status"] == "open"
+            and deferred_refs
+            and not any(
+                response.get("decision") == "provided" for response in responses
+            )
+        ):
+            request = self.evaluate_human_request(
+                request_ref,
+                response_refs=deferred_refs,
+                decision="needs_input",
+                reason_code="human_deferred_institution_reconnect",
+                accepted_evidence_refs=(),
+                idempotency_key="ar-hr-defer:"
+                + canonical_hash(
+                    {"request_ref": request_ref, "responses": deferred_refs}
+                ),
+            )
+        provided = [
+            response
+            for response in responses
+            if response.get("decision") == "provided"
+        ]
+        provided_refs = tuple(
+            cast(str, response["response_ref"]) for response in provided
+        )
+        if not provided_refs:
+            return request
+        selected = provided[-1]
+        facts = selected.get("facts")
+        route = facts.get("route") if isinstance(facts, dict) else None
+        if route == "institutional_browser_reconnected":
+            acquisition_row = self._current_acquisition_human_target(
+                target, require_reconnected_preflight=True
+            )
+            if acquisition_row is None:
+                return request
+            session = self.query_acquisition_session(
+                session_ref=cast(str, target["session_ref"])
+            )
+            assert session is not None
+            evidence_ref = "acquisition_preflight:" + canonical_hash(
+                {
+                    "session_ref": session.session_ref,
+                    "generation": session.preflight_generation,
+                    "config_hash": session.config_hash,
+                    "evidence_hash": session.evidence_hash,
+                }
+            )
+            return self._satisfy_acquisition_human_request(
+                request,
+                selected,
+                reason_code="institution_route_verified",
+                evidence_refs=(evidence_ref,),
+            )
+        acquisition_row = self._current_acquisition_human_target(
+            target, require_reconnected_preflight=False
+        )
+        if route == "oa_only" and acquisition_row is not None:
+            binding_hash = canonical_hash(
+                {
+                    "route": "oa_only",
+                    "session_ref": target["session_ref"],
+                    "request_id": target["acquisition_request_id"],
+                    "request_hash": target["acquisition_request_hash"],
+                    "paper_id": target["acquisition_paper_id"],
+                    "item_hash": target["acquisition_item_hash"],
+                    "response_ref": selected["response_ref"],
+                }
+            )
+            return self._satisfy_acquisition_human_request(
+                request,
+                selected,
+                reason_code="oa_only_route_selected",
+                evidence_refs=("acquisition_route:" + binding_hash,),
+            )
+        material_binding = (
+            None
+            if acquisition_row is None
+            else self._accepted_material_response_binding(
+                selected,
+                acquisition_row,
+                expected_paper_id=cast(str, target["acquisition_paper_id"]),
+            )
+        )
+        if material_binding is not None:
+            return self._satisfy_acquisition_human_request(
+                request,
+                selected,
+                reason_code="accepted_material_bound",
+                evidence_refs=(
+                    cast(str, material_binding["receipt_ref"]),
+                    "acquisition_material:" + canonical_hash(material_binding),
+                ),
+            )
+        if request["status"] != "open":
+            return request
+        reason_code = (
+            "material_binding_validation_required"
+            if isinstance(facts, dict)
+            and (
+                "material_source_ref" in facts or "material_version_ref" in facts
+            )
+            else "institution_reconnect_evidence_required"
+        )
+        return self.evaluate_human_request(
+            request_ref,
+            response_refs=(cast(str, selected["response_ref"]),),
+            decision="needs_input",
+            reason_code=reason_code,
+            accepted_evidence_refs=(),
+            idempotency_key="ar-hr-needs-input:"
+            + canonical_hash(
+                {
+                    "request_ref": request_ref,
+                    "response_ref": selected["response_ref"],
+                    "reason_code": reason_code,
+                }
+            ),
+        )
+
+    def _reconcile_acquisition_human_requests(self, session_ref: str) -> None:
+        for request in self.query_human_requests(include_history=False):
+            target = request.get("target_assertion")
+            if (
+                isinstance(target, dict)
+                and target.get("schema_ref")
+                == "meta-research/acquisition-human-request-target/v1"
+                and target.get("session_ref") == session_ref
+            ):
+                self.reconcile_human_request(cast(str, request["request_ref"]))
+
+    def _ensure_acquisition_human_requests(
+        self,
+        *,
+        session_ref: str,
+        quest_ref: str | None,
+        config_hash: str,
+        preflight_generation: int,
+        request_id: str,
+        request_hash: str,
+        attempt_count: int,
+    ) -> tuple[dict[str, object], ...]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT request_json, request_hash, results_json, results_hash "
+                    "FROM ar_acquisition_requests WHERE request_id = :request_id "
+                    "AND session_ref = :session_ref AND status = 'waiting_user'"
+                ),
+                {"request_id": request_id, "session_ref": session_ref},
+            ).first()
+        if row is None or row.request_hash != request_hash:
+            raise OwnerConflict("acquisition_human_request_stale")
+        request = _acquisition_request_from_json(row.request_json)
+        papers = {paper.paper_id: paper for paper in request.papers}
+        waiting_items = _waiting_acquisition_item_bindings(
+            row.results_json, row.results_hash
+        )
+        if not waiting_items or any(
+            item["paper_id"] not in papers for item in waiting_items
+        ):
+            raise OwnerConflict("acquisition_human_request_invalid")
+        current = self.query_human_requests(include_history=False)
+        ensured: list[dict[str, object]] = []
+        for item in waiting_items:
+            paper_id = cast(str, item["paper_id"])
+            target = {
+                "schema_ref": "meta-research/acquisition-human-request-target/v1",
+                "operation": "resume_acquisition_item",
+                "session_ref": session_ref,
+                "acquisition_request_id": request_id,
+                "acquisition_request_hash": request_hash,
+                "acquisition_paper_id": paper_id,
+                "acquisition_item_hash": item["item_hash"],
+                "config_hash": config_hash,
+                "blocked_preflight_generation": preflight_generation,
+                "attempt_count": attempt_count,
+            }
+            waiter = {
+                "waiter_ref": "acquisition_item:"
+                + canonical_hash({"request_id": request_id, "paper_id": paper_id})[
+                    :32
+                ],
+                "generation": attempt_count,
+                "target_assertion": target,
+                "wait_scope": "local",
+                "other_blockers": [],
+            }
+            obligation = (
+                "Restore access or provide an accepted lawful copy for the exact "
+                f"literature item {paper_id}."
+            )
+            conditions = (
+                "A newer preflight verifies the exact session and config, or the "
+                "Owner accepts an OA-only route for this exact item.",
+                "Any provided material is an accepted Research Asset bound to this "
+                "exact acquisition item.",
+            )
+            candidates = [
+                candidate
+                for candidate in current
+                if (
+                    candidate.get("status") == "open"
+                    or (
+                        candidate.get("status") == "satisfied"
+                        and candidate.get("target_assertion", {}).get("config_hash")
+                        == config_hash
+                        and candidate.get("target_assertion", {}).get(
+                            "acquisition_item_hash"
+                        )
+                        == item["item_hash"]
+                    )
+                )
+                and isinstance(candidate.get("target_assertion"), dict)
+                and candidate["target_assertion"].get("schema_ref")
+                == "meta-research/acquisition-human-request-target/v1"
+                and candidate["target_assertion"].get("session_ref") == session_ref
+                and candidate["target_assertion"].get("acquisition_request_id")
+                == request_id
+                and candidate["target_assertion"].get("acquisition_paper_id")
+                == paper_id
+                and any(
+                    waiter.get("status") != "consumed"
+                    for waiter in candidate.get("direct_waiters", [])
+                    if isinstance(waiter, dict)
+                )
+            ]
+            if len(candidates) > 1:
+                raise OwnerConflict("acquisition_human_request_invalid")
+            if candidates and (
+                candidates[0]["target_assertion"] == target
+                or (
+                    candidates[0].get("status") == "satisfied"
+                    and candidates[0]["target_assertion"].get("config_hash")
+                    == config_hash
+                    and candidates[0]["target_assertion"].get(
+                        "acquisition_item_hash"
+                    )
+                    == item["item_hash"]
+                )
+            ):
+                ensured.append(candidates[0])
+                continue
+            command_binding = {
+                "session_ref": session_ref,
+                "request_id": request_id,
+                "paper_id": paper_id,
+                "target": target,
+            }
+            if candidates:
+                result = self.revise_human_request(
+                    cast(str, candidates[0]["request_ref"]),
+                    expected_revision=cast(int, candidates[0]["revision"]),
+                    obligation=obligation,
+                    target_assertion=target,
+                    acceptance_conditions=conditions,
+                    direct_waiters=(waiter,),
+                    idempotency_key="ar-acq-hr-revise:"
+                    + canonical_hash(command_binding),
+                )
+            else:
+                result = self.open_human_request(
+                    request_kind="library_reconnect",
+                    obligation=obligation,
+                    business_purpose=(
+                        "Resume only the exact blocked literature item without "
+                        "repeating already obtained material."
+                    ),
+                    target_assertion=target,
+                    acceptance_conditions=conditions,
+                    direct_waiter=waiter,
+                    idempotency_key="ar-acq-hr:"
+                    + canonical_hash(command_binding),
+                    quest_ref=quest_ref,
+                )
+            ensured.append(result)
+        return tuple(ensured)
+
+    def _recover_acquisition_human_requests(self) -> None:
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT requests.request_id, requests.request_hash, "
+                    "requests.attempt_count, sessions.session_ref, "
+                    "sessions.quest_ref, sessions.config_hash, "
+                    "sessions.preflight_generation, sessions.status AS "
+                    "session_status, sessions.reason_code AS session_reason_code, "
+                    "requests.results_json, requests.results_hash FROM "
+                    "ar_acquisition_requests AS requests "
+                    "JOIN ar_acquisition_sessions AS sessions ON "
+                    "sessions.session_ref = requests.session_ref WHERE "
+                    "requests.status = 'waiting_user'"
+                )
+            ).all()
+        for row in rows:
+            if _acquisition_reconciliation_pending(
+                row.results_json, row.results_hash
+            ):
+                continue
+            self._ensure_acquisition_human_requests(
+                session_ref=row.session_ref,
+                quest_ref=row.quest_ref,
+                config_hash=row.config_hash,
+                preflight_generation=int(row.preflight_generation),
+                request_id=row.request_id,
+                request_hash=row.request_hash,
+                attempt_count=int(row.attempt_count),
+            )
+            if row.session_status == "ready":
+                self._reconcile_acquisition_human_requests(row.session_ref)
+
     def acquire_literature(
         self,
         session_ref: str,
@@ -1109,6 +2036,108 @@ class SQLiteAgentRuntime:
             )
         except AcquisitionUnavailable as error:
             raise OwnerConflict(error.code) from error
+        resume_binding: tuple[str, str, int] | None = None
+        resume_target: dict[str, object] | None = None
+        resume_route: dict[str, object] | None = None
+        human_request: dict[str, object] | None = None
+        materialized_asset: object | None = None
+        material_path: Path | None = None
+        with self._database.read() as connection:
+            waiting = connection.execute(
+                text(
+                    "SELECT requests.status, requests.attempt_count, "
+                    "requests.request_json, requests.request_hash, "
+                    "requests.results_json, requests.results_hash, "
+                    "sessions.quest_ref, sessions.config_hash, "
+                    "sessions.preflight_generation, sessions.status AS "
+                    "session_status, sessions.reason_code AS session_reason_code "
+                    "FROM ar_acquisition_requests "
+                    "AS requests JOIN ar_acquisition_sessions AS sessions ON "
+                    "sessions.session_ref = requests.session_ref WHERE "
+                    "requests.request_id = :request_id AND requests.session_ref = "
+                    ":session_ref"
+                ),
+                {"request_id": request.request_id, "session_ref": session_ref},
+            ).first()
+        technical_reconciliation = (
+            waiting is not None
+            and waiting.status == "waiting_user"
+            and _acquisition_reconciliation_pending(
+                waiting.results_json, waiting.results_hash
+            )
+        )
+        if technical_reconciliation:
+            resume_route = self._query_acquisition_resume_route(
+                request.request_id,
+                int(waiting.attempt_count),
+                session_ref,
+                request_hash,
+            )
+            if (
+                resume_route is not None
+                and resume_route["route"] == "accepted_material"
+            ):
+                materialized_asset, material_path = (
+                    self._prepare_accepted_material_route(
+                        session_ref, request.request_id, resume_route
+                    )
+                )
+        if (
+            waiting is not None
+            and waiting.status == "waiting_user"
+            and not technical_reconciliation
+        ):
+            human_requests = self._ensure_acquisition_human_requests(
+                session_ref=session_ref,
+                quest_ref=waiting.quest_ref,
+                config_hash=waiting.config_hash,
+                preflight_generation=int(waiting.preflight_generation),
+                request_id=request.request_id,
+                request_hash=request_hash,
+                attempt_count=int(waiting.attempt_count),
+            )
+            resumable = []
+            for candidate in human_requests:
+                candidate_waiters = cast(
+                    list[dict[str, object]], candidate["direct_waiters"]
+                )
+                disposition = candidate.get("disposition")
+                if (
+                    candidate.get("status") == "satisfied"
+                    and isinstance(disposition, dict)
+                    and disposition.get("decision") == "satisfied"
+                    and len(candidate_waiters) == 1
+                    and candidate_waiters[0].get("status") == "released"
+                ):
+                    resumable.append((candidate, candidate_waiters[0]))
+            if not resumable:
+                raise OwnerConflict("acquisition_human_request_not_released")
+            human_request, waiter = sorted(
+                resumable,
+                key=lambda item: (
+                    str(
+                        item[0]["target_assertion"].get(
+                            "acquisition_paper_id"
+                        )
+                    ),
+                    str(item[0]["request_ref"]),
+                ),
+            )[0]
+            resume_binding = (
+                cast(str, human_request["request_ref"]),
+                cast(str, waiter["waiter_ref"]),
+                cast(int, waiter["generation"]),
+            )
+            resume_target = cast(
+                dict[str, object], human_request["target_assertion"]
+            )
+            resume_route = self._acquisition_resume_route(human_request, waiting)
+            if resume_route["route"] == "accepted_material":
+                materialized_asset, material_path = (
+                    self._prepare_accepted_material_route(
+                        session_ref, request.request_id, resume_route
+                    )
+                )
         now = time.time()
         previous_results: tuple[AcquisitionItemResult, ...] = ()
         reconcile_only = False
@@ -1183,16 +2212,53 @@ class SQLiteAgentRuntime:
                     for paper in request.papers
                 )
 
+            if resume_binding is not None:
+                assert resume_target is not None and resume_route is not None
+                if (
+                    new_request
+                    or existing is None
+                    or existing.status != "waiting_user"
+                    or int(existing.attempt_count) < resume_target["attempt_count"]
+                    or existing.request_hash
+                    != resume_target["acquisition_request_hash"]
+                    or not _acquisition_target_matches_waiting_item(
+                        resume_target, existing
+                    )
+                    or session_row.config_hash != resume_target["config_hash"]
+                    or session_row.current_request_id
+                    != resume_target["acquisition_request_id"]
+                    or (
+                        resume_route["route"]
+                        == "institutional_browser_reconnected"
+                        and (
+                            session_row.status != "ready"
+                            or int(session_row.preflight_generation)
+                            <= resume_target["blocked_preflight_generation"]
+                        )
+                    )
+                    or (
+                        resume_route["route"]
+                        != "institutional_browser_reconnected"
+                        and session_row.status not in {"ready", "waiting_user"}
+                    )
+                ):
+                    raise OwnerConflict("acquisition_human_request_stale")
+
             claimed = connection.execute(
                 text(
                     "UPDATE ar_acquisition_sessions SET status = 'acquiring', "
                     "current_request_id = :request_id, slot_held = 1, "
                     "reason_code = NULL, updated_at = :now WHERE session_ref = "
-                    ":session_ref AND status = 'ready' AND slot_held = 0"
+                    ":session_ref AND slot_held = 0 AND (status = 'ready' OR "
+                    "(:reconcile_only = 1 AND status = 'waiting_user' AND "
+                    "reason_code = 'acquisition_reconciliation_required') OR "
+                    "(:human_resume = 1 AND status = 'waiting_user'))"
                 ),
                 {
                     "session_ref": session_ref,
                     "request_id": request.request_id,
+                    "reconcile_only": 1 if reconcile_only else 0,
+                    "human_resume": 1 if resume_binding is not None else 0,
                     "now": now,
                 },
             )
@@ -1203,6 +2269,10 @@ class SQLiteAgentRuntime:
                 (
                     _reconciliation_acquisition_item(result.paper_id)
                     if result.status == "waiting_user"
+                    and (
+                        resume_route is None
+                        or result.paper_id == resume_route["paper_id"]
+                    )
                     else result
                 )
                 for result in previous_results
@@ -1245,6 +2315,41 @@ class SQLiteAgentRuntime:
                         "now": now,
                     },
                 )
+            if resume_binding is not None:
+                assert (
+                    resume_route is not None
+                    and resume_target is not None
+                    and human_request is not None
+                )
+                consumption = self._consume_human_request_waiter(
+                    connection,
+                    request_ref=resume_binding[0],
+                    waiter_ref=resume_binding[1],
+                    generation=resume_binding[2],
+                    work_ref="acquisition_item:"
+                    + canonical_hash(
+                        {
+                            "request_id": request.request_id,
+                            "attempt_no": attempt_count,
+                            "paper_id": resume_route["paper_id"],
+                        }
+                    ),
+                    work_hash=canonical_hash(
+                        {"request_hash": request_hash, "route": resume_route}
+                    ),
+                )
+                evaluation = cast(dict[str, object], human_request["evaluation"])
+                self._record_acquisition_resume_route(
+                    connection,
+                    request_id=request.request_id,
+                    attempt_no=attempt_count,
+                    session_ref=session_ref,
+                    request_hash=request_hash,
+                    human_request_ref=resume_binding[0],
+                    evaluation_ref=cast(str, evaluation["evaluation_ref"]),
+                    route=resume_route,
+                    consumption=consumption,
+                )
             connection.execute(
                 text(
                     "UPDATE agent_runtime_state SET revision = revision + 1, "
@@ -1266,6 +2371,11 @@ class SQLiteAgentRuntime:
             browser_context_ref = (
                 None
                 if session_row.browser_context_ref is None
+                or (
+                    resume_route is not None
+                    and resume_route["route"]
+                    in {"oa_only", "accepted_material"}
+                )
                 else str(session_row.browser_context_ref)
             )
 
@@ -1276,18 +2386,38 @@ class SQLiteAgentRuntime:
             / request.request_id
         )
         target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        effective_session_mode = str(session_row.mode)
+        if resume_route is not None and resume_route["route"] == "oa_only":
+            effective_session_mode = "oa_only"
+        elif (
+            resume_route is not None
+            and resume_route["route"] == "accepted_material"
+        ):
+            effective_session_mode = "provided_only"
         provider_request = request.bind_to_session(
             session_ref=session_ref,
-            session_mode=str(session_row.mode),
+            session_mode=effective_session_mode,
             browser_context_ref=browser_context_ref,
             provider_state_dir=self._acquisition_private_root / session_ref,
             target_dir=target_dir,
         )
-        affected_ids = {
-            result.paper_id
-            for result in previous_results
-            if result.status == "waiting_user"
-        }
+        if resume_route is not None:
+            affected_ids = {cast(str, resume_route["paper_id"])}
+        elif reconcile_only:
+            affected_ids = {
+                result.paper_id
+                for result in previous_results
+                if result.status == "waiting_user"
+                and result.failure is not None
+                and result.failure.get("code")
+                == "acquisition_reconciliation_required"
+            }
+        else:
+            affected_ids = {
+                result.paper_id
+                for result in previous_results
+                if result.status == "waiting_user"
+            }
         affected_papers = tuple(
             paper
             for paper in provider_request.papers
@@ -1296,7 +2426,22 @@ class SQLiteAgentRuntime:
         attempt_request = replace(provider_request, papers=affected_papers)
         try:
             reconcile = getattr(provider, "reconcile", None)
-            if reconcile_only:
+            if (
+                resume_route is not None
+                and resume_route["route"] == "accepted_material"
+            ):
+                if material_path is None:
+                    raise OwnerConflict("acquisition_material_binding_invalid")
+                attempted_results = (
+                    AcquisitionItemResult(
+                        paper_id=cast(str, resume_route["paper_id"]),
+                        status="obtained",
+                        path=str(material_path),
+                        format=cast(str, resume_route["format"]),
+                        failure=None,
+                    ),
+                )
+            elif reconcile_only:
                 if not callable(reconcile):
                     attempted_results = tuple(
                         _reconciliation_acquisition_item(paper.paper_id)
@@ -1315,7 +2460,7 @@ class SQLiteAgentRuntime:
             previous_by_id = {
                 result.paper_id: result
                 for result in previous_results
-                if result.status != "waiting_user"
+                if result.paper_id not in affected_ids
             }
             results = tuple(
                 attempted_by_id.get(paper.paper_id)
@@ -1333,7 +2478,7 @@ class SQLiteAgentRuntime:
             previous_by_id = {
                 result.paper_id: result
                 for result in previous_results
-                if result.status != "waiting_user"
+                if result.paper_id not in affected_ids
             }
             results = tuple(
                 attempted_by_id.get(paper.paper_id)
@@ -1422,6 +2567,18 @@ class SQLiteAgentRuntime:
                     "request_id": request.request_id,
                     "status": status,
                 },
+            )
+        if status == "waiting_user" and not _acquisition_reconciliation_pending(
+            results_json, results_hash
+        ):
+            self._ensure_acquisition_human_requests(
+                session_ref=session_ref,
+                quest_ref=session_row.quest_ref,
+                config_hash=session_row.config_hash,
+                preflight_generation=int(session_row.preflight_generation),
+                request_id=request.request_id,
+                request_hash=request_hash,
+                attempt_count=attempt_count,
             )
         return AcquisitionBatchExecution(
             request_id=request.request_id,
@@ -1529,7 +2686,76 @@ class SQLiteAgentRuntime:
             raise OwnerConflict("deepfetch_acquisition_binding_invalid")
         if require_ready and (session.status != "ready" or session.slot_held):
             raise OwnerConflict("deepfetch_acquisition_not_ready")
+        if require_ready and session.current_request_id is not None:
+            with self._database.read() as connection:
+                acquisition_request = connection.execute(
+                    text(
+                        "SELECT status, attempt_count, request_hash FROM "
+                        "ar_acquisition_requests "
+                        "WHERE request_id = :request_id AND session_ref = :session_ref"
+                    ),
+                    {
+                        "request_id": session.current_request_id,
+                        "session_ref": session.session_ref,
+                    },
+                ).first()
+            if (
+                acquisition_request is not None
+                and acquisition_request.status == "waiting_user"
+            ):
+                human_requests = self._find_acquisition_human_requests(
+                    session_ref=session.session_ref,
+                    request_id=session.current_request_id,
+                    attempt_count=int(acquisition_request.attempt_count),
+                    config_hash=session.config_hash,
+                    request_hash=str(acquisition_request.request_hash),
+                )
+                if not any(
+                    human_request.get("status") == "satisfied"
+                    and (human_request.get("disposition") or {}).get("decision")
+                    == "satisfied"
+                    and len(human_request.get("direct_waiters", [])) == 1
+                    and human_request["direct_waiters"][0].get("status")
+                    == "released"
+                    for human_request in human_requests
+                ):
+                    raise OwnerConflict("deepfetch_acquisition_not_ready")
         return session
+
+    def _find_acquisition_human_requests(
+        self,
+        *,
+        session_ref: str,
+        request_id: str,
+        attempt_count: int,
+        config_hash: str,
+        request_hash: str,
+    ) -> tuple[dict[str, object], ...]:
+        matches = []
+        for request in self.query_human_requests(include_history=False):
+            target = request.get("target_assertion")
+            if (
+                isinstance(target, dict)
+                and target.get("schema_ref")
+                == "meta-research/acquisition-human-request-target/v1"
+                and target.get("operation") == "resume_acquisition_item"
+                and target.get("session_ref") == session_ref
+                and target.get("acquisition_request_id") == request_id
+                and isinstance(target.get("attempt_count"), int)
+                and cast(int, target["attempt_count"]) <= attempt_count
+                and target.get("config_hash") == config_hash
+                and target.get("acquisition_request_hash") == request_hash
+            ):
+                matches.append(request)
+        return tuple(
+            sorted(
+                matches,
+                key=lambda item: (
+                    str(item["target_assertion"].get("acquisition_paper_id")),
+                    str(item["request_ref"]),
+                ),
+            )
+        )
 
     def execute_deepfetch(
         self,
@@ -2450,6 +3676,11 @@ class SQLiteAgentRuntime:
         runtime_binding: IdeaRuntimeBinding,
     ) -> IdeaStageRun:
         _validate_stage_idempotency_key(idempotency_key)
+        if self._authorization_verifier is None:
+            raise OwnerConflict("broad_research_authorization_verifier_unavailable")
+        self._authorization_verifier.verify_broad_research_authorization(
+            quest_ref=request.accepted_question.quest_ref
+        )
         runtime_binding, runtime_binding_json, runtime_binding_hash = (
             _validated_runtime_binding(runtime_binding)
         )
@@ -4105,6 +5336,121 @@ def _acquisition_request_from_json(value: str) -> AcquisitionBatchRequest:
         raise OwnerConflict("acquisition_request_invalid") from error
 
 
+def _acquisition_results_from_json(
+    results_json: str | None, results_hash: str | None
+) -> tuple[AcquisitionItemResult, ...]:
+    try:
+        raw_results = json.loads(results_json) if results_json is not None else None
+        if (
+            not isinstance(raw_results, list)
+            or canonical_json(raw_results) != results_json
+            or canonical_hash(raw_results) != results_hash
+        ):
+            raise TypeError("acquisition results")
+        return tuple(
+            AcquisitionItemResult(
+                paper_id=item["paper_id"],
+                status=item["status"],
+                path=item["path"],
+                format=item["format"],
+                failure=item["failure"],
+            )
+            for item in raw_results
+        )
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise OwnerConflict("acquisition_result_invalid") from error
+
+
+def _waiting_acquisition_item_bindings(
+    results_json: str | None, results_hash: str | None
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "paper_id": result.paper_id,
+            "item_hash": canonical_hash(result.as_dict()),
+        }
+        for result in _acquisition_results_from_json(results_json, results_hash)
+        if result.status == "waiting_user"
+    )
+
+
+def _acquisition_target_matches_waiting_item(
+    target: dict[str, object], row
+) -> bool:
+    paper_id = target.get("acquisition_paper_id")
+    item_hash = target.get("acquisition_item_hash")
+    if not isinstance(paper_id, str) or not isinstance(item_hash, str):
+        return False
+    return any(
+        item["paper_id"] == paper_id and item["item_hash"] == item_hash
+        for item in _waiting_acquisition_item_bindings(
+            row.results_json, row.results_hash
+        )
+    )
+
+
+def _acquisition_format_for_material(
+    media_type: str, display_name: str
+) -> str | None:
+    normalized = media_type.split(";", 1)[0].strip().lower()
+    suffix = Path(display_name).suffix.lower()
+    if normalized == "application/pdf" or suffix == ".pdf":
+        return "pdf"
+    if normalized in {"text/html", "application/xhtml+xml"} or suffix in {
+        ".html",
+        ".htm",
+    }:
+        return "html"
+    if normalized in {"application/xml", "text/xml"} or suffix == ".xml":
+        return "xml"
+    return None
+
+
+def _effective_acquisition_mode(route: dict[str, object]) -> str:
+    kind = route.get("route")
+    if kind == "institutional_browser_reconnected":
+        return "oa_then_institution"
+    if kind == "oa_only":
+        return "oa_only"
+    if kind == "accepted_material":
+        return "provided_only"
+    raise OwnerConflict("acquisition_resume_route_invalid")
+
+
+def _store_provided_material(
+    target_dir: Path, binding: dict[str, object], materialized_asset: object
+) -> Path:
+    content = getattr(materialized_asset, "content", None)
+    if (
+        not isinstance(content, bytes)
+        or hashlib.sha256(content).hexdigest() != binding["content_hash"]
+    ):
+        raise OwnerConflict("acquisition_material_binding_invalid")
+    target = target_dir / (
+        "accepted-"
+        + cast(str, binding["content_hash"])
+        + "."
+        + cast(str, binding["format"])
+    )
+    if target.is_symlink():
+        raise OwnerConflict("acquisition_material_binding_invalid")
+    if target.exists():
+        try:
+            existing = target.read_bytes()
+        except OSError as error:
+            raise OwnerConflict("acquisition_material_binding_invalid") from error
+        if hashlib.sha256(existing).hexdigest() != binding["content_hash"]:
+            raise OwnerConflict("acquisition_material_binding_invalid")
+        return target
+    try:
+        with target.open("xb") as stream:
+            stream.write(content)
+        target.chmod(0o600)
+    except (FileExistsError, OSError) as error:
+        raise OwnerConflict("acquisition_material_binding_invalid") from error
+    return target
+
+
 def _acquisition_execution_from_row(
     row,
     session_row,
@@ -4126,26 +5472,7 @@ def _acquisition_execution_from_row(
             / str(row.request_id)
         ),
     )
-    try:
-        raw_results = json.loads(row.results_json)
-        if (
-            not isinstance(raw_results, list)
-            or canonical_json(raw_results) != row.results_json
-            or canonical_hash(raw_results) != row.results_hash
-        ):
-            raise TypeError("acquisition results")
-        results = tuple(
-            AcquisitionItemResult(
-                paper_id=item["paper_id"],
-                status=item["status"],
-                path=item["path"],
-                format=item["format"],
-                failure=item["failure"],
-            )
-            for item in raw_results
-        )
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
-        raise OwnerConflict("acquisition_result_invalid") from error
+    results = _acquisition_results_from_json(row.results_json, row.results_hash)
     return AcquisitionBatchExecution(
         request_id=str(row.request_id),
         session_ref=str(row.session_ref),
@@ -4164,6 +5491,31 @@ def _failed_acquisition_item(
         path=None,
         format=None,
         failure={"code": code, "detail": "Nature Downloader 未形成可接纳正文。"},
+    )
+
+
+def _acquisition_reconciliation_pending(
+    results_json: str | None, results_hash: str | None
+) -> bool:
+    if results_json is None or results_hash is None:
+        raise OwnerConflict("acquisition_result_invalid")
+    try:
+        results = json.loads(results_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise OwnerConflict("acquisition_result_invalid") from error
+    if (
+        not isinstance(results, list)
+        or canonical_json(results) != results_json
+        or canonical_hash(results) != results_hash
+    ):
+        raise OwnerConflict("acquisition_result_invalid")
+    return any(
+        isinstance(item, dict)
+        and item.get("status") == "waiting_user"
+        and isinstance(item.get("failure"), dict)
+        and cast(dict[str, object], item["failure"]).get("code")
+        == "acquisition_reconciliation_required"
+        for item in results
     )
 
 
@@ -5186,6 +6538,47 @@ def _query_stage_command(
         )
 
 
+def _blocked_runtime_work_aliases(
+    blocked_waiters: tuple[dict[str, object], ...],
+) -> set[str]:
+    """Resolve exact Owner work identities from waiter assertions.
+
+    A waiter reference is an audit identity, not necessarily the identity of the
+    work it blocks.  Preserve it as a compatibility alias, but derive the
+    authoritative exclusions from the waiter target owned by the requester.
+    """
+
+    aliases: set[str] = set()
+    target_keys = {
+        "run_ref": "stage_run",
+        "stage_run_ref": "stage_run",
+        "request_ref": "stage_request",
+        "stage_request_ref": "stage_request",
+        "acquisition_request_id": "acquisition_request",
+    }
+    for waiter in blocked_waiters:
+        waiter_ref = cast(str, waiter["waiter_ref"])
+        aliases.add(waiter_ref)
+        target = cast(dict[str, object], waiter["target_assertion"])
+        for key, prefix in target_keys.items():
+            value = target.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value or len(value) > 128:
+                raise OwnerConflict("human_request_waiter_target_invalid")
+            aliases.add(value)
+            aliases.add(f"{prefix}:{value}")
+        work_ref = target.get("work_ref")
+        if work_ref is not None:
+            if not isinstance(work_ref, str) or not work_ref or len(work_ref) > 128:
+                raise OwnerConflict("human_request_waiter_target_invalid")
+            aliases.add(work_ref)
+            work_kind = target.get("work_kind")
+            if work_kind in {"stage_run", "stage_request", "acquisition_request"}:
+                aliases.add(f"{work_kind}:{work_ref}")
+    return aliases
+
+
 def _record_stage_command(
     connection,
     idempotency_key: str,
@@ -5278,6 +6671,7 @@ def create_agent_runtime_interface(
     outcome_verifier: IdeaOutcomeDecisionVerifier | None = None,
     deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
     acquisition_private_root: Path | None = None,
+    human_response_verifier: HumanResponseVerifier | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
         database,
@@ -5287,6 +6681,7 @@ def create_agent_runtime_interface(
         outcome_verifier,
         deepfetch_request_verifier,
         acquisition_private_root,
+        human_response_verifier,
     )
 
 

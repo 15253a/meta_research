@@ -45,6 +45,22 @@ from meta_research.owners.research_memory import (
     AcceptedLiteratureSnapshot,
     ResearchMemoryInterface,
 )
+from meta_research.owners.secret_detection import contains_secret
+from meta_research.owners.human_requests import (
+    HUMAN_RESPONSE_DECISIONS,
+    HumanResponseVerifier,
+    verify_human_request_response_target,
+)
+from meta_research.owners.human_collaboration_ladder import (
+    BROAD_RESEARCH_POLICY,
+    LEGACY_BROAD_RESEARCH_POLICY,
+    SQLiteHumanCollaborationLadder,
+    broad_research_target_assertion,
+    guidance_binding_from_row,
+    legacy_broad_research_target_assertion,
+    public_authorization_from_row,
+    verify_authorization_currentness,
+)
 from meta_research.quest_drafting import (
     DraftingUnavailable,
     INTENT_MESSAGE_MAX_LENGTH,
@@ -77,6 +93,7 @@ _COMPLETED_CUSTODY_AUDIT_SECONDS = 60
 _PREVIEW_REFRESH_RETRY_SECONDS = 60.0
 _PREVIEW_REFRESH_CACHE_LIMIT = 256
 MAX_ACCEPTED_MATERIAL_BINDINGS = 100
+HUMAN_RESPONSE_RECEIPT_SCHEMA = "meta-research/human-request-response/v1"
 
 
 def _proposal_provider_job_ref(generation_ref: str, attempt_count: int) -> str:
@@ -91,6 +108,105 @@ class HumanCollaborationInterface(Protocol):
     """Whole public Interface for intent, preview, confirmation, and recovery."""
 
     def query_snapshot(self) -> OwnerSnapshot: ...
+
+    def respond_to_human_request(
+        self,
+        request_ref: str,
+        *,
+        decision: str,
+        facts: dict[str, object],
+        note: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def send_companion_message(
+        self, scope_ref: str, message: str, idempotency_key: str
+    ) -> dict[str, object]: ...
+
+    def query_companion(self, scope_ref: str) -> dict[str, object]: ...
+
+    def query_collaboration_projection(
+        self, scope_refs: tuple[str, ...]
+    ) -> dict[str, list[dict[str, object]]]: ...
+
+    def record_agent_proposal(
+        self, scope_ref: str, proposal: dict[str, object], idempotency_key: str
+    ) -> dict[str, object]: ...
+
+    def convert_agent_proposal_to_soft_constraint(
+        self,
+        proposal_ref: str,
+        *,
+        expected_scope_ref: str,
+        expected_proposal_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def convert_agent_proposal_to_command_draft(
+        self,
+        proposal_ref: str,
+        *,
+        expected_scope_ref: str,
+        expected_proposal_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def record_soft_constraint(
+        self, scope_ref: str, guidance: dict[str, object], idempotency_key: str
+    ) -> dict[str, object]: ...
+
+    def withdraw_soft_constraint(
+        self, constraint_ref: str, expected_revision: int, idempotency_key: str
+    ) -> dict[str, object]: ...
+
+    def query_active_guidance_bindings(
+        self, scope_ref: str
+    ) -> list[dict[str, object]]: ...
+
+    def verify_guidance_binding(self, binding: dict[str, object]) -> None: ...
+
+    def create_command_draft(
+        self, scope_ref: str, command: dict[str, object], idempotency_key: str
+    ) -> dict[str, object]: ...
+
+    def revise_command_draft(
+        self,
+        intent_id: str,
+        expected_revision: int,
+        command: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def preview_command(
+        self,
+        intent_id: str,
+        draft_revision: int,
+        draft_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def confirm_command(
+        self,
+        intent_id: str,
+        draft_revision: int,
+        draft_hash: str,
+        preview_ref: str,
+        preview_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def query_command(self, intent_id: str) -> dict[str, object]: ...
+
+    def decide_capability_authorization(
+        self,
+        scope_ref: str,
+        decision: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]: ...
+
+    def query_broad_research_authorization(
+        self, quest_ref: str
+    ) -> dict[str, object] | None: ...
 
     def create_quest(
         self, draft: dict[str, object], idempotency_key: str
@@ -257,6 +373,8 @@ class HumanCollaborationInterface(Protocol):
         self, *, quest_ref: str, parent_question_ref: str
     ) -> dict[str, object] | None: ...
 
+    def query_collaboration_scope(self) -> str: ...
+
     def reconcile_once(self) -> bool: ...
 
     def process_drafting_once(self) -> bool: ...
@@ -289,7 +407,9 @@ _SNAPSHOT = OwnerSnapshotQuery(
     statement=text(
         "SELECT revision, pending_intent_count, authorization_count, "
         "manual_creation_count, active_manual_creation_count, "
-        "confirmed_manual_seed_count "
+        "confirmed_manual_seed_count, "
+        "human_response_count, companion_session_count, "
+        "pending_companion_turn_count, soft_constraint_count "
         "FROM human_collaboration_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -298,6 +418,10 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "manual_creation_count",
         "active_manual_creation_count",
         "confirmed_manual_seed_count",
+        "human_response_count",
+        "companion_session_count",
+        "pending_companion_turn_count",
+        "soft_constraint_count",
     ),
 )
 
@@ -487,6 +611,483 @@ class SQLiteBundleConfirmationVerifier:
             raise OwnerConflict("bundle_confirmation_receipt_invalid")
 
 
+class SQLiteHumanCollaborationFactVerifier(HumanResponseVerifier):
+    """Read-only verification seam for HC-issued response and authorization facts."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+        self._quest_receipt_verifier: ResearchGraphInterface | None = None
+
+    def bind_quest_receipt_verifier(
+        self, verifier: ResearchGraphInterface
+    ) -> None:
+        if (
+            self._quest_receipt_verifier is not None
+            and self._quest_receipt_verifier is not verifier
+        ):
+            raise OwnerConflict("quest_receipt_verifier_already_bound")
+        self._quest_receipt_verifier = verifier
+
+    def query_human_responses(
+        self, request_ref: str
+    ) -> tuple[dict[str, object], ...]:
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM hc_human_request_responses WHERE request_ref = "
+                    ":request_ref ORDER BY created_at, response_ref"
+                ),
+                {"request_ref": request_ref},
+            ).all()
+        return tuple(_public_human_response(row) for row in rows)
+
+    def verify_human_response(
+        self, *, request_ref: str, response_ref: str
+    ) -> dict[str, object]:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_human_request_responses WHERE response_ref = "
+                    ":response_ref AND request_ref = :request_ref"
+                ),
+                {"response_ref": response_ref, "request_ref": request_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("human_response_receipt_invalid")
+        return _public_human_response(row)
+
+    def verify_guidance_snapshot(
+        self,
+        *,
+        scope_ref: str,
+        bindings: list[dict[str, object]],
+    ) -> None:
+        if not isinstance(scope_ref, str) or not scope_ref:
+            raise OwnerConflict("guidance_bindings_stale")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM hc_soft_constraints WHERE scope_ref = "
+                    ":scope_ref AND status = 'active' ORDER BY scope_ref, "
+                    "constraint_ref, revision"
+                ),
+                {"scope_ref": scope_ref},
+            ).all()
+        try:
+            current = [guidance_binding_from_row(row) for row in rows]
+        except OwnerConflict as error:
+            raise OwnerConflict("guidance_bindings_stale") from error
+        if bindings != current:
+            raise OwnerConflict("guidance_bindings_stale")
+
+    def verify_capability_authorization(
+        self,
+        *,
+        requirement: dict[str, object],
+        receipt_ref: str,
+        _expected_decision: str = "granted",
+    ) -> None:
+        if _expected_decision not in {"granted", "denied", "revoked"}:
+            raise OwnerConflict("capability_authorization_receipt_invalid")
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_capability_authorizations WHERE receipt_ref = "
+                    ":receipt_ref"
+                ),
+                {"receipt_ref": receipt_ref},
+            ).first()
+            if row is not None:
+                verify_authorization_currentness(connection, row)
+            confirmation = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT confirmations.*, previews.owner_previews_json, "
+                        "previews.owner_previews_hash, "
+                        "previews.owner_revisions_json, "
+                        "previews.owner_revisions_hash FROM "
+                        "hc_command_confirmations "
+                        "AS confirmations JOIN hc_command_previews AS previews ON "
+                        "previews.preview_ref = confirmations.preview_ref WHERE "
+                        "confirmations.confirmation_ref = "
+                        ":basis_confirmation_ref"
+                    ),
+                    {"basis_confirmation_ref": row.basis_confirmation_ref},
+                ).first()
+            )
+            current_ref = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT receipt_ref FROM hc_capability_authorizations WHERE "
+                        "authorization_kind = 'capability' AND scope_ref = "
+                        ":scope_ref AND capability = :capability ORDER BY revision "
+                        "DESC LIMIT 1"
+                    ),
+                    {"scope_ref": row.scope_ref, "capability": row.capability},
+                ).scalar_one_or_none()
+            )
+        if row is None:
+            raise OwnerConflict("capability_authorization_receipt_invalid")
+        authorization = public_authorization_from_row(row)
+        try:
+            owner_previews = (
+                json.loads(confirmation.owner_previews_json)
+                if confirmation is not None
+                else None
+            )
+            owner_revisions = (
+                decoded_object(confirmation.owner_revisions_json)
+                if confirmation is not None
+                else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OwnerConflict(
+                "capability_authorization_receipt_invalid"
+            ) from error
+        preview_targets = [
+            item.get("target_assertion")
+            for item in owner_previews
+            if isinstance(item, dict)
+            and item.get("source_owner") == HC_OWNER
+        ] if isinstance(owner_previews, list) else []
+        target_assertion = (
+            preview_targets[0] if len(preview_targets) == 1 else None
+        )
+        requirement_scope = requirement.get("scope")
+        expected_preview_hash = (
+            canonical_hash(
+                {
+                    "intent_id": confirmation.intent_id,
+                    "draft_revision": int(confirmation.draft_revision),
+                    "draft_hash": confirmation.draft_hash,
+                    "owner_previews": owner_previews,
+                    "owner_revisions": owner_revisions,
+                }
+            )
+            if confirmation is not None
+            else None
+        )
+        expected_confirmation_hash = (
+            canonical_hash(
+                {
+                    "schema_ref": "meta-research/human-confirmation-receipt/v1",
+                    "issuer": HC_OWNER,
+                    "intent_id": confirmation.intent_id,
+                    "draft_revision": int(confirmation.draft_revision),
+                    "draft_hash": confirmation.draft_hash,
+                    "preview_ref": confirmation.preview_ref,
+                    "preview_hash": confirmation.preview_hash,
+                }
+            )
+            if confirmation is not None
+            else None
+        )
+        if (
+            authorization["authorization_kind"] != "capability"
+            or authorization["status"] != _expected_decision
+            or not authorization["is_current"]
+            or authorization["requirement"] != requirement
+            or current_ref != receipt_ref
+            or confirmation is None
+            or confirmation.receipt_hash != row.basis_confirmation_hash
+            or confirmation.preview_ref != row.basis_preview_ref
+            or confirmation.preview_hash != row.basis_preview_hash
+            or canonical_hash(owner_previews) != confirmation.owner_previews_hash
+            or canonical_hash(owner_revisions) != confirmation.owner_revisions_hash
+            or confirmation.preview_hash != expected_preview_hash
+            or confirmation.receipt_hash != expected_confirmation_hash
+            or preview_targets != [authorization["target_assertion"]]
+            or not isinstance(target_assertion, dict)
+            or target_assertion.get("operation")
+            != "decide_capability_authorization"
+            or target_assertion.get("intent_id") != confirmation.intent_id
+            or target_assertion.get("capability") != requirement.get("capability")
+            or target_assertion.get("decision") != _expected_decision
+            or target_assertion.get("scope_hash")
+            != canonical_hash(requirement_scope)
+            or target_assertion.get("authorization_head")
+            != owner_revisions.get(HC_OWNER)
+            or authorization["policy"]
+            != {
+                "schema_ref": "meta-research/narrow-capability-policy/v1",
+                "capability": requirement.get("capability"),
+                "scope": requirement_scope,
+                "decision": _expected_decision,
+            }
+        ):
+            raise OwnerConflict("capability_authorization_receipt_invalid")
+
+    def verify_broad_research_authorization(
+        self, *, quest_ref: str
+    ) -> dict[str, object]:
+        return self._verified_broad_research_authorization(
+            quest_ref=quest_ref, require_effective_grant=True
+        )
+
+    def inspect_broad_research_authorization(
+        self, *, quest_ref: str
+    ) -> dict[str, object]:
+        """Project the accepted issuance even when a later policy override denies it."""
+
+        return self._verified_broad_research_authorization(
+            quest_ref=quest_ref, require_effective_grant=False
+        )
+
+    def _verified_broad_research_authorization(
+        self, *, quest_ref: str, require_effective_grant: bool
+    ) -> dict[str, object]:
+        override_row = None
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM hc_capability_authorizations WHERE "
+                    "authorization_kind = 'broad_research' AND quest_ref = "
+                    ":quest_ref ORDER BY revision DESC LIMIT 1"
+                ),
+                {"quest_ref": quest_ref},
+            ).first()
+            if row is not None:
+                verify_authorization_currentness(connection, row)
+            initialization = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM hc_quest_initializations WHERE "
+                        "initialization_id = :initialization_id"
+                    ),
+                    {"initialization_id": row.initialization_id},
+                ).first()
+            )
+            preview = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM hc_confirmation_previews WHERE preview_ref = "
+                        ":preview_ref"
+                    ),
+                    {"preview_ref": row.basis_preview_ref},
+                ).first()
+            )
+            legacy_basis = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM hc_legacy_broad_authorization_bases WHERE "
+                        "initialization_id = :initialization_id"
+                    ),
+                    {"initialization_id": row.initialization_id},
+                ).first()
+            )
+            current_override = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT receipt_ref, decision FROM "
+                        "hc_capability_authorizations WHERE authorization_kind = "
+                        "'capability' AND scope_ref = :scope_ref AND capability = "
+                        "'broad_research' ORDER BY revision DESC LIMIT 1"
+                    ),
+                    {"scope_ref": f"quest:{quest_ref}"},
+                ).first()
+            )
+            if current_override is not None:
+                override_row = connection.execute(
+                    text(
+                        "SELECT * FROM hc_capability_authorizations WHERE "
+                        "receipt_ref = :receipt_ref"
+                    ),
+                    {"receipt_ref": current_override.receipt_ref},
+                ).one()
+                verify_authorization_currentness(connection, override_row)
+        if row is None:
+            raise OwnerConflict("broad_research_authorization_required")
+        authorization = public_authorization_from_row(row)
+        try:
+            assertions = json.loads(preview.assertions_json) if preview else None
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OwnerConflict(
+                "broad_research_authorization_receipt_invalid"
+            ) from error
+        matching = [
+            item
+            for item in assertions
+            if isinstance(item, dict)
+            and item.get("owner") == HC_OWNER
+            and item.get("operation")
+            == "issue_broad_research_authorization"
+        ] if isinstance(assertions, list) else []
+        policy_schema_ref = authorization["policy"].get("schema_ref")
+        if policy_schema_ref == LEGACY_BROAD_RESEARCH_POLICY["schema_ref"]:
+            try:
+                draft = (
+                    decoded_object(initialization.draft_json)
+                    if initialization is not None
+                    else None
+                )
+                with self._database.read() as connection:
+                    legacy_target_assertion = (
+                        _legacy_broad_research_target_assertion(
+                            connection,
+                            initialization_id=initialization.initialization_id,
+                            draft=draft,
+                        )
+                        if initialization is not None
+                        and isinstance(draft, dict)
+                        else None
+                    )
+            except (TypeError, ValueError, json.JSONDecodeError, OwnerConflict):
+                legacy_target_assertion = None
+            target_assertion = legacy_target_assertion
+            assertion_binding_valid = (
+                not matching
+                and authorization["target_assertion"] == target_assertion
+                and legacy_basis is not None
+                and legacy_basis.preview_ref == authorization["basis_preview_ref"]
+                and legacy_basis.preview_hash
+                == authorization["basis_preview_hash"]
+                and legacy_basis.confirmation_ref
+                == authorization["confirmation_receipt_ref"]
+                and legacy_basis.confirmation_hash
+                == authorization["confirmation_receipt_hash"]
+                and legacy_basis.basis_kind
+                == "legacy_implicit_quest_confirmation_policy"
+                and legacy_basis.policy_schema_ref
+                == LEGACY_BROAD_RESEARCH_POLICY["schema_ref"]
+            )
+        else:
+            target_assertion = matching[0] if len(matching) == 1 else None
+            assertion_binding_valid = matching == [authorization["target_assertion"]]
+        bindings = (
+            target_assertion.get("bindings")
+            if isinstance(target_assertion, dict)
+            else None
+        )
+        expected_requirement = (
+            {
+                "quest_ref": quest_ref,
+                "initialization_id": initialization.initialization_id,
+                "target_assertion_hash": target_assertion.get("target_hash"),
+                "policy_hash": bindings.get("policy_hash"),
+                "resource_envelope_ref": bindings.get("resource_envelope_ref"),
+                "resource_envelope_hash": bindings.get("resource_envelope_hash"),
+                "resource_hard_ceiling": bindings.get("hard_ceiling"),
+            }
+            if initialization is not None
+            and isinstance(target_assertion, dict)
+            and isinstance(bindings, dict)
+            else None
+        )
+        if (
+            authorization["authorization_kind"] != "broad_research"
+            or authorization["status"] != "granted"
+            or not authorization["is_current"]
+            or authorization["quest_ref"] != quest_ref
+            or authorization["scope_ref"] != f"quest:{quest_ref}"
+            or initialization is None
+            or initialization.confirmation_ref
+            != authorization["confirmation_receipt_ref"]
+            or initialization.confirmation_hash
+            != authorization["confirmation_receipt_hash"]
+            or initialization.confirmed_preview_ref
+            != authorization["basis_preview_ref"]
+            or initialization.confirmed_preview_hash
+            != authorization["basis_preview_hash"]
+            or initialization.confirmation_hash
+            != _confirmation_receipt_hash(
+                {
+                    "initialization_id": initialization.initialization_id,
+                    "quest_draft_revision": initialization.confirmed_draft_revision,
+                    "quest_draft_hash": initialization.confirmed_draft_hash,
+                    "proposal_ref": initialization.confirmed_proposal_ref,
+                    "proposal_hash": initialization.confirmed_proposal_hash,
+                    "preview_ref": initialization.confirmed_preview_ref,
+                    "preview_hash": initialization.confirmed_preview_hash,
+                }
+            )
+            or preview is None
+            or preview.preview_hash != authorization["basis_preview_hash"]
+            or canonical_hash(assertions) != preview.assertions_hash
+            or policy_schema_ref
+            not in {
+                BROAD_RESEARCH_POLICY["schema_ref"],
+                LEGACY_BROAD_RESEARCH_POLICY["schema_ref"],
+            }
+            or not assertion_binding_valid
+            or not isinstance(bindings, dict)
+            or bindings.get("basis_kind")
+            != (
+                "legacy_implicit_quest_confirmation_policy"
+                if policy_schema_ref
+                == LEGACY_BROAD_RESEARCH_POLICY["schema_ref"]
+                else "explicit_confirmation_preview"
+            )
+            or authorization["policy"] != bindings.get("policy")
+            or authorization["policy_hash"] != bindings.get("policy_hash")
+            or authorization["requirement"] != expected_requirement
+        ):
+            raise OwnerConflict(
+                "broad_research_authorization_receipt_invalid"
+            )
+        if self._quest_receipt_verifier is None:
+            raise OwnerConflict("broad_research_authorization_verifier_unavailable")
+        try:
+            self._quest_receipt_verifier.verify_quest_receipt(
+                initialization_id=initialization.initialization_id,
+                quest_ref=quest_ref,
+                proposal_ref=initialization.confirmed_proposal_ref,
+                proposal_hash=initialization.confirmed_proposal_hash,
+                confirmation_ref=initialization.confirmation_ref,
+                receipt=AcceptanceReceipt(
+                    issuer="research_graph",
+                    kind="quest_acceptance",
+                    receipt_ref=authorization["quest_receipt_ref"],
+                    subject_ref=quest_ref,
+                    payload_hash=authorization["quest_receipt_hash"],
+                ),
+            )
+        except OwnerConflict as error:
+            raise OwnerConflict(
+                "broad_research_authorization_receipt_invalid"
+            ) from error
+        if current_override is not None:
+            requirement = {
+                "capability": "broad_research",
+                "scope": {"quest_ref": quest_ref},
+            }
+            try:
+                self.verify_capability_authorization(
+                    requirement=requirement,
+                    receipt_ref=current_override.receipt_ref,
+                    _expected_decision=current_override.decision,
+                )
+            except OwnerConflict as error:
+                raise OwnerConflict(
+                    "broad_research_authorization_receipt_invalid"
+                ) from error
+            if (
+                require_effective_grant
+                and current_override.decision in {"denied", "revoked"}
+            ):
+                raise OwnerConflict("broad_research_authorization_revoked")
+        effective_authorization = (
+            authorization
+            if override_row is None
+            else public_authorization_from_row(override_row)
+        )
+        authorization = dict(authorization)
+        authorization["effective_decision"] = effective_authorization["decision"]
+        authorization["effective_authorization"] = dict(effective_authorization)
+        return authorization
+
+
 class SQLiteHumanCollaboration:
     def __init__(
         self,
@@ -518,14 +1119,442 @@ class SQLiteHumanCollaboration:
             acquisition_provider,
             intent_drafting_provider,
         )
+        self._fact_verifier = SQLiteHumanCollaborationFactVerifier(database)
+        self._fact_verifier.bind_quest_receipt_verifier(research_graph)
+        self._collaboration_ladder = SQLiteHumanCollaborationLadder(
+            database,
+            feed,
+            intent_drafting_provider,
+            self._resolve_companion_context,
+        )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._preview_refresh_lock = threading.Lock()
         self._preview_refresh_attempts: dict[str, tuple[str, float]] = {}
+        self._drafting_schedule_lock = threading.Lock()
+        self._prefer_companion_drafting = True
         self._upgrade_active_legacy_draft()
         self._recover_interrupted_drafting()
 
     def query_snapshot(self) -> OwnerSnapshot:
         return self._snapshot.query_snapshot()
+
+    def send_companion_message(
+        self, scope_ref: str, message: str, idempotency_key: str
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.send_companion_message(
+            scope_ref, message, idempotency_key
+        )
+
+    def query_companion(self, scope_ref: str) -> dict[str, object]:
+        return self._collaboration_ladder.query_companion(scope_ref)
+
+    def query_collaboration_projection(
+        self, scope_refs: tuple[str, ...]
+    ) -> dict[str, list[dict[str, object]]]:
+        projection = self._collaboration_ladder.query_projection(scope_refs)
+        authorizations: list[dict[str, object]] = []
+        for authorization in projection["authorizations"]:
+            if (
+                authorization.get("authorization_kind") == "broad_research"
+                and isinstance(authorization.get("quest_ref"), str)
+            ):
+                inspected = self._fact_verifier.inspect_broad_research_authorization(
+                    quest_ref=cast(str, authorization["quest_ref"])
+                )
+                if inspected is None:
+                    raise OwnerConflict(
+                        "broad_research_authorization_receipt_invalid"
+                    )
+                authorizations.append(inspected)
+            else:
+                authorizations.append(authorization)
+        return {**projection, "authorizations": authorizations}
+
+    def _resolve_companion_context(self, scope_ref: str) -> dict[str, object]:
+        """Resolve current public Owner facts without giving Companion write authority."""
+
+        owners = (
+            self._research_graph,
+            self._research_memory,
+            self._agent_runtime,
+            self._advancement_engine,
+        )
+        for owner in owners:
+            request = owner.query_human_request(scope_ref)
+            if request is not None:
+                return {
+                    "schema_ref": "meta-research/companion-context/v1",
+                    "scope_ref": scope_ref,
+                    "context_kind": "human_request",
+                    "human_request": _companion_human_request_context(request),
+                }
+        quest_ref = (
+            scope_ref.removeprefix("quest:")
+            if scope_ref.startswith("quest:")
+            else None
+        )
+        requests = (
+            []
+            if quest_ref is None
+            else [
+                request
+                for owner in owners
+                for request in owner.query_human_requests(quest_ref=quest_ref)
+                if request.get("status") == "open"
+            ][:20]
+        )
+        return {
+            "schema_ref": "meta-research/companion-context/v1",
+            "scope_ref": scope_ref,
+            "context_kind": "quest" if quest_ref is not None else "workspace",
+            "quest_ref": quest_ref,
+            "open_human_requests": [
+                _companion_human_request_context(request) for request in requests
+            ],
+        }
+
+    def record_agent_proposal(
+        self, scope_ref: str, proposal: dict[str, object], idempotency_key: str
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.record_agent_proposal(
+            scope_ref, proposal, idempotency_key
+        )
+
+    def convert_agent_proposal_to_soft_constraint(
+        self,
+        proposal_ref: str,
+        *,
+        expected_scope_ref: str,
+        expected_proposal_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.convert_agent_proposal_to_soft_constraint(
+            proposal_ref,
+            expected_scope_ref=expected_scope_ref,
+            expected_proposal_hash=expected_proposal_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def convert_agent_proposal_to_command_draft(
+        self,
+        proposal_ref: str,
+        *,
+        expected_scope_ref: str,
+        expected_proposal_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.convert_agent_proposal_to_command_draft(
+            proposal_ref,
+            expected_scope_ref=expected_scope_ref,
+            expected_proposal_hash=expected_proposal_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def record_soft_constraint(
+        self, scope_ref: str, guidance: dict[str, object], idempotency_key: str
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.record_soft_constraint(
+            scope_ref, guidance, idempotency_key
+        )
+
+    def withdraw_soft_constraint(
+        self, constraint_ref: str, expected_revision: int, idempotency_key: str
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.withdraw_soft_constraint(
+            constraint_ref, expected_revision, idempotency_key
+        )
+
+    def query_active_guidance_bindings(
+        self, scope_ref: str
+    ) -> list[dict[str, object]]:
+        return self._collaboration_ladder.query_active_guidance_bindings(scope_ref)
+
+    def verify_guidance_binding(self, binding: dict[str, object]) -> None:
+        self._collaboration_ladder.verify_guidance_binding(binding)
+
+    def create_command_draft(
+        self, scope_ref: str, command: dict[str, object], idempotency_key: str
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.create_command_draft(
+            scope_ref, command, idempotency_key
+        )
+
+    def revise_command_draft(
+        self,
+        intent_id: str,
+        expected_revision: int,
+        command: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.revise_command_draft(
+            intent_id, expected_revision, command, idempotency_key
+        )
+
+    def preview_command(
+        self,
+        intent_id: str,
+        draft_revision: int,
+        draft_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.preview_command(
+            intent_id, draft_revision, draft_hash, idempotency_key
+        )
+
+    def confirm_command(
+        self,
+        intent_id: str,
+        draft_revision: int,
+        draft_hash: str,
+        preview_ref: str,
+        preview_hash: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.confirm_command(
+            intent_id,
+            draft_revision,
+            draft_hash,
+            preview_ref,
+            preview_hash,
+            idempotency_key,
+        )
+
+    def query_command(self, intent_id: str) -> dict[str, object]:
+        return self._collaboration_ladder.query_command(intent_id)
+
+    def decide_capability_authorization(
+        self,
+        scope_ref: str,
+        decision: dict[str, object],
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._collaboration_ladder.decide_capability_authorization(
+            scope_ref, decision, idempotency_key
+        )
+
+    def query_broad_research_authorization(
+        self, quest_ref: str
+    ) -> dict[str, object] | None:
+        authorization = (
+            self._collaboration_ladder.query_broad_research_authorization(quest_ref)
+        )
+        if authorization is None:
+            return None
+        return self._fact_verifier.inspect_broad_research_authorization(
+            quest_ref=quest_ref
+        )
+
+    def respond_to_human_request(
+        self,
+        request_ref: str,
+        *,
+        decision: str,
+        facts: dict[str, object],
+        note: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        if decision not in HUMAN_RESPONSE_DECISIONS:
+            raise OwnerConflict("human_response_decision_invalid")
+        if not isinstance(facts, dict):
+            raise OwnerConflict("human_response_facts_invalid")
+        try:
+            facts = cast(dict[str, object], json.loads(canonical_json(facts)))
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("human_response_facts_invalid") from error
+        if len(canonical_json(facts).encode("utf-8")) > 64 * 1024:
+            raise OwnerConflict("human_response_facts_too_large")
+        if not isinstance(note, str) or len(note) > 4000:
+            raise OwnerConflict("human_response_note_invalid")
+        note = note.strip()
+        if contains_secret(facts) or contains_secret(note):
+            raise OwnerConflict("human_response_secret_forbidden")
+        if (
+            not idempotency_key
+            or len(idempotency_key) > 128
+            or contains_secret(idempotency_key)
+        ):
+            raise OwnerConflict("idempotency_key_invalid")
+        command = {
+            "command": "respond_to_human_request",
+            "request_ref": request_ref,
+            "decision": decision,
+            "facts": facts,
+            "note": note,
+        }
+        command_hash = canonical_hash(command)
+        with self._database.read() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM hc_human_request_responses WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+        if replay is not None:
+            if replay.command_hash != command_hash:
+                raise OwnerConflict("idempotency_conflict")
+            response = self._fact_verifier.verify_human_response(
+                request_ref=request_ref,
+                response_ref=replay.response_ref,
+            )
+            self._reconcile_issuing_owner_human_request(request_ref)
+            return response
+        request = self._query_issuing_owner_request(request_ref)
+        if not request["current"] or request["status"] != "open":
+            raise OwnerConflict("human_request_not_current")
+        with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM hc_human_request_responses WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if replay is not None:
+                if replay.command_hash != command_hash:
+                    raise OwnerConflict("idempotency_conflict")
+                response_ref = replay.response_ref
+            else:
+                verify_human_request_response_target(
+                    connection,
+                    request_ref=request_ref,
+                    issuer=cast(str, request["issuer"]),
+                    request_id=cast(str, request["request_id"]),
+                    revision=cast(int, request["revision"]),
+                )
+                response_ref = new_ref("human_response")
+                receipt_ref = new_ref("hc_receipt")
+                now = time.time()
+                payload = {
+                    "schema_ref": HUMAN_RESPONSE_RECEIPT_SCHEMA,
+                    "request_ref": request_ref,
+                    "issuer": request["issuer"],
+                    "request_id": request["request_id"],
+                    "request_revision": request["revision"],
+                    "response_ref": response_ref,
+                    "decision": decision,
+                    "facts_hash": canonical_hash(facts),
+                    "note": note,
+                }
+                receipt_hash = canonical_hash(payload)
+                connection.execute(
+                    text(
+                        "INSERT INTO hc_human_request_responses (response_ref, "
+                        "request_ref, issuer, request_id, request_revision, decision, "
+                        "facts_json, facts_hash, note, receipt_ref, receipt_hash, "
+                        "idempotency_key, command_hash, created_at) VALUES "
+                        "(:response_ref, :request_ref, :issuer, :request_id, "
+                        ":request_revision, :decision, :facts_json, :facts_hash, "
+                        ":note, :receipt_ref, :receipt_hash, :idempotency_key, "
+                        ":command_hash, :now)"
+                    ),
+                    {
+                        "response_ref": response_ref,
+                        "request_ref": request_ref,
+                        "issuer": request["issuer"],
+                        "request_id": request["request_id"],
+                        "request_revision": request["revision"],
+                        "decision": decision,
+                        "facts_json": canonical_json(facts),
+                        "facts_hash": canonical_hash(facts),
+                        "note": note,
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "idempotency_key": idempotency_key,
+                        "command_hash": command_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = revision + 1, "
+                        "human_response_count = human_response_count + 1 WHERE "
+                        "singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "human_collaboration.human_request_responded",
+                    {
+                        "request_ref": request_ref,
+                        "response_ref": response_ref,
+                        "issuer": request["issuer"],
+                        "decision": decision,
+                    },
+                )
+        response = self._fact_verifier.verify_human_response(
+            request_ref=request_ref, response_ref=response_ref
+        )
+        self._reconcile_issuing_owner_human_request(request_ref)
+        return response
+
+    def _query_issuing_owner_request(self, request_ref: str) -> dict[str, object]:
+        for owner in (
+            self._research_graph,
+            self._research_memory,
+            self._agent_runtime,
+            self._advancement_engine,
+        ):
+            request = owner.query_human_request(request_ref)
+            if request is not None:
+                return request
+        raise OwnerConflict("human_request_not_found")
+
+    def _reconcile_issuing_owner_human_request(self, request_ref: str) -> None:
+        for owner in (
+            self._research_graph,
+            self._research_memory,
+            self._agent_runtime,
+            self._advancement_engine,
+        ):
+            request = owner.query_human_request(request_ref)
+            if request is None:
+                continue
+            reconcile = getattr(owner, "reconcile_human_request", None)
+            if callable(reconcile):
+                reconcile(request_ref)
+            target = request.get("target_assertion")
+            responses = request.get("responses")
+            if (
+                owner is self._agent_runtime
+                and isinstance(target, dict)
+                and target.get("schema_ref")
+                == "meta-research/acquisition-human-request-target/v1"
+                and target.get("operation") == "resume_acquisition_item"
+                and isinstance(target.get("session_ref"), str)
+                and isinstance(responses, list)
+                and any(
+                    isinstance(response, dict)
+                    and response.get("decision") == "provided"
+                    and isinstance(response.get("facts"), dict)
+                    and cast(dict[str, object], response["facts"]).get("route")
+                    == "institutional_browser_reconnected"
+                    for response in responses
+                )
+            ):
+                session = self._agent_runtime.query_acquisition_session(
+                    session_ref=cast(str, target["session_ref"])
+                )
+                if session is not None and session.status == "waiting_user":
+                    creation = self.query_quest_creation(session.initialization_id)
+                    draft = cast(dict[str, object], creation["quest_draft"])
+                    draft_value = cast(dict[str, object], draft["value"])
+                    literature = cast(
+                        dict[str, object], draft_value["literature"]
+                    )
+                    self._agent_runtime.prepare_acquisition_session(
+                        initialization_id=session.initialization_id,
+                        draft_revision=cast(int, draft["revision"]),
+                        config={
+                            "mode": literature["mode"],
+                            "library_entry_url": literature[
+                                "library_entry_url"
+                            ],
+                        },
+                        provider=self._acquisition_provider,
+                    )
+            return
+        raise OwnerConflict("human_request_not_found")
 
     def _verify_material_bindings(self, draft: dict[str, object]) -> None:
         for binding in _accepted_material_bindings(draft):
@@ -1972,6 +3001,22 @@ class SQLiteHumanCollaboration:
         return self.query_quest_creation(initialization_id)
 
     def process_drafting_once(self) -> bool:
+        with self._drafting_schedule_lock:
+            prefer_companion = self._prefer_companion_drafting
+            self._prefer_companion_drafting = not prefer_companion
+        if (
+            prefer_companion
+            and self._collaboration_ladder.process_drafting_once()
+        ):
+            return True
+        if self._process_quest_drafting_once():
+            return True
+        return (
+            not prefer_companion
+            and self._collaboration_ladder.process_drafting_once()
+        )
+
+    def _process_quest_drafting_once(self) -> bool:
         self._recover_expired_drafting_claims()
         if self._process_proposal_generation_once():
             return True
@@ -2751,6 +3796,11 @@ class SQLiteHumanCollaboration:
                         draft_hash=quest_draft_hash,
                         proposal_ref=proposal_ref,
                         proposal_hash=proposal_hash,
+                    ),
+                    broad_research_target_assertion(
+                        initialization_id=initialization_id,
+                        draft=decoded_object(row.draft_json),
+                        resource_envelope=None,
                     ),
                     self._research_memory.preview_question_content_acceptance(
                         initialization_id=initialization_id,
@@ -3686,6 +4736,15 @@ class SQLiteHumanCollaboration:
         except OwnerConflict as error:
             quest = None
             quest_failure = error
+        broad_authorization: dict[str, object] | None = None
+        broad_authorization_failure: OwnerConflict | None = None
+        if quest is not None:
+            try:
+                broad_authorization = self.query_broad_research_authorization(
+                    quest.quest_ref
+                )
+            except OwnerConflict as error:
+                broad_authorization_failure = error
         material_bindings = _accepted_material_bindings(current_draft_value)
         material_roles = ()
         material_failure: OwnerConflict | None = None
@@ -3827,6 +4886,7 @@ class SQLiteHumanCollaboration:
         )
         live_failures = {
             "quest_goal": quest_failure,
+            "broad_research_authorization": broad_authorization_failure,
             "quest_source_material": material_failure,
             "question_content": content_failure,
             "question_identity": question_failure,
@@ -3842,6 +4902,8 @@ class SQLiteHumanCollaboration:
             status = (
                 "completed"
                 if live_failure_layer is None
+                and broad_authorization is not None
+                and broad_authorization.get("status") == "granted"
                 and material_complete
                 and all(
                     value is not None for value in (quest, content, question, cycle)
@@ -3913,14 +4975,32 @@ class SQLiteHumanCollaboration:
         else:
             human_receipt = _not_attempted()
 
+        broad_authorization_receipt = (
+            dict(cast(dict[str, object], broad_authorization["receipt"]))
+            if broad_authorization is not None
+            else _project_owner_receipt(None, broad_authorization_failure)
+        )
+        if broad_authorization is not None:
+            broad_authorization_receipt["effective_decision"] = (
+                broad_authorization.get("effective_decision", "granted")
+            )
+            effective_authorization = broad_authorization.get(
+                "effective_authorization"
+            )
+            if isinstance(effective_authorization, dict):
+                broad_authorization_receipt["effective_receipt_ref"] = (
+                    effective_authorization.get("receipt_ref")
+                )
+
         receipts: dict[str, dict[str, object]] = {
             "human_confirmation": human_receipt,
             "quest_goal": _project_owner_receipt(quest, quest_failure),
+            "broad_research_authorization": broad_authorization_receipt,
             "question_content": _project_owner_receipt(content, content_failure),
             "question_identity": _project_owner_receipt(question, question_failure),
             "cycle_activation": _project_owner_receipt(cycle, cycle_failure),
         }
-        ordered_layers = ["quest_goal"]
+        ordered_layers = ["quest_goal", "broad_research_authorization"]
         if material_bindings:
             ordered_layers.append("quest_source_material")
             receipts["quest_source_material"] = (
@@ -4326,6 +5406,37 @@ class SQLiteHumanCollaboration:
             parent_question_ref=parent_question_ref,
         )
 
+    def query_collaboration_scope(self) -> str:
+        """Resolve the durable active Quest independently of an unfinished form."""
+
+        with self._database.read() as connection:
+            completed_ids = tuple(
+                str(value)
+                for value in connection.execute(
+                    text(
+                        "SELECT initialization_id FROM hc_quest_initializations "
+                        "WHERE status = 'completed' ORDER BY updated_at DESC, "
+                        "initialization_id DESC"
+                    )
+                ).scalars()
+            )
+        for initialization_id in completed_ids:
+            try:
+                quest = self._research_graph.query_quest(initialization_id)
+            except OwnerConflict:
+                continue
+            if quest is not None:
+                return f"quest:{quest.quest_ref}"
+        current = self.query_current_quest_creation()
+        if current is not None:
+            quest_ref = current.get("quest_ref")
+            if isinstance(quest_ref, str) and quest_ref:
+                return f"quest:{quest_ref}"
+            initialization_id = current.get("initialization_id")
+            if isinstance(initialization_id, str) and initialization_id:
+                return f"quest-initialization:{initialization_id}"
+        return "workspace"
+
     def reconcile_once(self) -> bool:
         if self._manual_creation.reconcile_once():
             return True
@@ -4424,6 +5535,61 @@ class SQLiteHumanCollaboration:
             self._clear_dispatch_failure(initialization_id, "quest_goal")
             return True
         self._clear_dispatch_failure(initialization_id, "quest_goal")
+
+        try:
+            broad_authorization = self.query_broad_research_authorization(
+                quest.quest_ref
+            )
+        except (OwnerConflict, OSError) as error:
+            self._record_dispatch_failure(
+                initialization_id,
+                "broad_research_authorization",
+                _dispatch_failure_reason(
+                    error, "broad_research_authorization_unavailable"
+                ),
+            )
+            return False
+        if broad_authorization is None:
+            try:
+                with self._database.read() as connection:
+                    current = self._require_initialization(
+                        connection, initialization_id
+                    )
+                    target_assertion = _confirmed_broad_research_target_assertion(
+                        connection, current
+                    )
+                self._collaboration_ladder.ensure_broad_research_authorization(
+                    quest_ref=quest.quest_ref,
+                    initialization_id=initialization_id,
+                    target_assertion=target_assertion,
+                    preview_ref=cast(str, current.confirmed_preview_ref),
+                    preview_hash=cast(str, current.confirmed_preview_hash),
+                    confirmation_receipt_ref=confirmation.receipt_ref,
+                    confirmation_receipt_hash=confirmation.payload_hash,
+                    quest_receipt=quest.receipt,
+                )
+            except (OwnerConflict, OSError) as error:
+                self._record_dispatch_failure(
+                    initialization_id,
+                    "broad_research_authorization",
+                    _dispatch_failure_reason(
+                        error, "broad_research_authorization_unavailable"
+                    ),
+                )
+                return False
+            self._clear_dispatch_failure(
+                initialization_id, "broad_research_authorization"
+            )
+            return True
+        self._clear_dispatch_failure(
+            initialization_id, "broad_research_authorization"
+        )
+        if broad_authorization.get("effective_decision") != "granted":
+            # A later Human decision changes the capability gate, not the
+            # already accepted Quest or its immutable issuance receipt.  Stop
+            # dispatch here without converting intentional revocation into a
+            # recovery failure or re-issuing the original grant.
+            return False
 
         acquisition_session = self._agent_runtime.query_acquisition_session(
             initialization_id=initialization_id
@@ -5097,7 +6263,12 @@ class SQLiteHumanCollaboration:
                 draft_hash=cast(str, request["quest_draft_hash"]),
                 proposal_ref=cast(str, request["proposal_ref"]),
                 proposal_hash=cast(str, request["proposal_hash"]),
-            )
+            ),
+            broad_research_target_assertion(
+                initialization_id=initialization_id,
+                draft=draft,
+                resource_envelope=envelope_value,
+            ),
         ]
         if material_bindings:
             assertions.append(
@@ -5130,6 +6301,7 @@ class SQLiteHumanCollaboration:
         owner_revisions = self._public_owner_revisions()
         will_happen = [
             "记录一次 Human Collaboration 最终确认",
+            "在 Quest 接纳后独立签发精确默认策略的宽研究授权",
             "依次请求 Quest、Question 内容、根 Question 与初始 Cycle 的 Owner 接受",
             "按 Resource Envelope 使用时间预算 "
             f"{envelope_value['time_budget']} 与计算卡 "
@@ -5152,6 +6324,7 @@ class SQLiteHumanCollaboration:
             "will_not_happen": [
                 "不会在确认前创建 Quest、Question 或 Cycle",
                 "不会把草稿、预览或模型回复当作 Owner receipt",
+                "宽研究授权不会扩大 Resource Envelope 的 hard ceiling，也不替代后续 Owner receipt",
             ],
         }
         with self._database.write() as connection:
@@ -5692,6 +6865,13 @@ class SQLiteHumanCollaboration:
         command_kind: str,
         request_hash: str,
     ) -> str | None:
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or len(idempotency_key) > 128
+            or contains_secret(idempotency_key)
+        ):
+            raise OwnerConflict("idempotency_key_invalid")
         row = connection.execute(
             text(
                 "SELECT command_kind, request_hash, result_ref FROM "
@@ -5776,6 +6956,51 @@ def _confirmation_receipt_hash(request: dict[str, object]) -> str:
             "bindings": request,
         }
     )
+
+
+def _public_human_response(row) -> dict[str, object]:
+    try:
+        facts = decoded_object(row.facts_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict("human_response_receipt_invalid") from error
+    if (
+        canonical_hash(facts) != row.facts_hash
+        or contains_secret(facts)
+        or contains_secret(row.note)
+    ):
+        raise OwnerConflict("human_response_receipt_invalid")
+    payload = {
+        "schema_ref": HUMAN_RESPONSE_RECEIPT_SCHEMA,
+        "request_ref": row.request_ref,
+        "issuer": row.issuer,
+        "request_id": row.request_id,
+        "request_revision": int(row.request_revision),
+        "response_ref": row.response_ref,
+        "decision": row.decision,
+        "facts_hash": row.facts_hash,
+        "note": row.note,
+    }
+    if canonical_hash(payload) != row.receipt_hash:
+        raise OwnerConflict("human_response_receipt_invalid")
+    return {
+        "response_ref": row.response_ref,
+        "request_ref": row.request_ref,
+        "issuer": row.issuer,
+        "request_id": row.request_id,
+        "request_revision": int(row.request_revision),
+        "decision": row.decision,
+        "facts": facts,
+        "note": row.note,
+        "receipt_ref": row.receipt_ref,
+        "receipt": AcceptanceReceipt(
+            issuer=HC_OWNER,
+            kind="human_request_response",
+            receipt_ref=row.receipt_ref,
+            subject_ref=row.response_ref,
+            payload_hash=row.receipt_hash,
+        ).as_public_dict(),
+        "created_at": float(row.created_at),
+    }
 
 
 def _require_initialization_artifact_integrity(
@@ -6016,6 +7241,14 @@ def _validate_preview_artifact_integrity(
             "binding": binding,
         }
     )
+    broad_basis_valid = _broad_research_preview_basis_is_valid(
+        connection,
+        row=row,
+        preview=preview,
+        assertions=assertions,
+        draft=draft,
+        resource_envelope=envelope_value,
+    )
     if (
         preview.resource_envelope_ref != envelope_ref
         or preview.resource_envelope_hash != envelope_hash
@@ -6025,12 +7258,221 @@ def _validate_preview_artifact_integrity(
         )
         or not _resource_envelope_matches_draft(draft, envelope_value)
         or canonical_hash(assertions) != preview.assertions_hash
+        or not broad_basis_valid
         or canonical_hash(owner_revisions) != preview.owner_revisions_hash
         or canonical_hash(summary) != preview.summary_hash
         or preview.preview_hash != expected_preview_hash
         or request["preview_hash"] != expected_preview_hash
     ):
         raise OwnerConflict("bundle_confirmation_receipt_invalid")
+
+
+def _broad_research_preview_basis_is_valid(
+    connection: Connection,
+    *,
+    row: Row,
+    preview: Row,
+    assertions: object,
+    draft: dict[str, object],
+    resource_envelope: dict[str, object],
+) -> bool:
+    if not isinstance(assertions, list):
+        return False
+    hc_assertions = [
+        item
+        for item in assertions
+        if isinstance(item, dict) and item.get("owner") == HC_OWNER
+    ]
+    expected = broad_research_target_assertion(
+        initialization_id=row.initialization_id,
+        draft=draft,
+        resource_envelope=resource_envelope,
+    )
+    if hc_assertions == [expected]:
+        return True
+    if hc_assertions:
+        return False
+    legacy_basis = connection.execute(
+        text(
+            "SELECT * FROM hc_legacy_broad_authorization_bases WHERE "
+            "initialization_id = :initialization_id"
+        ),
+        {"initialization_id": row.initialization_id},
+    ).first()
+    return bool(
+        legacy_basis is not None
+        and legacy_basis.preview_ref == preview.preview_ref
+        and legacy_basis.preview_hash == preview.preview_hash
+        and legacy_basis.confirmation_ref == row.confirmation_ref
+        and legacy_basis.confirmation_hash == row.confirmation_hash
+        and legacy_basis.basis_kind
+        == "legacy_implicit_quest_confirmation_policy"
+        and legacy_basis.policy_schema_ref
+        == LEGACY_BROAD_RESEARCH_POLICY["schema_ref"]
+    )
+
+
+def _confirmed_broad_research_target_assertion(
+    connection: Connection, row: Row
+) -> dict[str, object]:
+    """Recover the exact HC policy assertion that the human confirmed."""
+
+    preview = connection.execute(
+        text(
+            "SELECT assertions_json, assertions_hash, preview_hash FROM "
+            "hc_confirmation_previews WHERE preview_ref = :preview_ref"
+        ),
+        {"preview_ref": row.confirmed_preview_ref},
+    ).first()
+    if (
+        preview is None
+        or preview.preview_hash != row.confirmed_preview_hash
+    ):
+        raise OwnerConflict("broad_research_authorization_basis_invalid")
+    try:
+        assertions = json.loads(preview.assertions_json)
+        draft = decoded_object(row.draft_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise OwnerConflict(
+            "broad_research_authorization_basis_invalid"
+        ) from error
+    if (
+        not isinstance(assertions, list)
+        or canonical_hash(assertions) != preview.assertions_hash
+    ):
+        raise OwnerConflict("broad_research_authorization_basis_invalid")
+    matches = [
+        assertion
+        for assertion in assertions
+        if isinstance(assertion, dict)
+        and assertion.get("owner") == HC_OWNER
+        and assertion.get("operation")
+        == "issue_broad_research_authorization"
+    ]
+    if len(matches) > 1:
+        raise OwnerConflict("broad_research_authorization_basis_invalid")
+    if not matches:
+        legacy_basis = connection.execute(
+            text(
+                "SELECT * FROM hc_legacy_broad_authorization_bases WHERE "
+                "initialization_id = :initialization_id"
+            ),
+            {"initialization_id": row.initialization_id},
+        ).first()
+        if (
+            legacy_basis is None
+            or legacy_basis.preview_ref != row.confirmed_preview_ref
+            or legacy_basis.preview_hash != row.confirmed_preview_hash
+            or legacy_basis.confirmation_ref != row.confirmation_ref
+            or legacy_basis.confirmation_hash != row.confirmation_hash
+            or legacy_basis.basis_kind
+            != "legacy_implicit_quest_confirmation_policy"
+            or legacy_basis.policy_schema_ref
+            != LEGACY_BROAD_RESEARCH_POLICY["schema_ref"]
+        ):
+            raise OwnerConflict("broad_research_authorization_basis_invalid")
+        return _legacy_broad_research_target_assertion(
+            connection,
+            initialization_id=row.initialization_id,
+            draft=draft,
+        )
+    assertion = cast(dict[str, object], matches[0])
+    bindings = assertion.get("bindings")
+    policy = bindings.get("policy") if isinstance(bindings, dict) else None
+    unsigned = {key: value for key, value in assertion.items() if key != "target_hash"}
+    resource_envelope = _authorization_basis_resource_envelope(
+        connection,
+        initialization_id=row.initialization_id,
+        draft=draft,
+    )
+    if (
+        assertion
+        != broad_research_target_assertion(
+            initialization_id=row.initialization_id,
+            draft=draft,
+            resource_envelope=resource_envelope,
+        )
+        or assertion.get("target_hash") != canonical_hash(unsigned)
+        or not isinstance(bindings, dict)
+        or bindings.get("initialization_id") != row.initialization_id
+        or not isinstance(policy, dict)
+        or policy.get("schema_ref") != BROAD_RESEARCH_POLICY["schema_ref"]
+        or bindings.get("basis_kind") != "explicit_confirmation_preview"
+        or bindings.get("policy_hash") != canonical_hash(policy)
+        or bindings.get("resource_envelope_ref")
+        != draft.get("resource_envelope_ref")
+        or bindings.get("resource_envelope_hash")
+        != draft.get("resource_envelope_hash")
+        or bindings.get("time_budget") != draft.get("time_budget")
+    ):
+        raise OwnerConflict("broad_research_authorization_basis_invalid")
+    return assertion
+
+
+def _legacy_broad_research_target_assertion(
+    connection: Connection,
+    *,
+    initialization_id: str,
+    draft: dict[str, object],
+) -> dict[str, object]:
+    """Derive the explicitly labelled compatibility basis for a 0008 preview."""
+
+    envelope_value = _authorization_basis_resource_envelope(
+        connection,
+        initialization_id=initialization_id,
+        draft=draft,
+    )
+    return legacy_broad_research_target_assertion(
+        initialization_id=initialization_id,
+        draft=draft,
+        resource_envelope=envelope_value,
+    )
+
+
+def _authorization_basis_resource_envelope(
+    connection: Connection,
+    *,
+    initialization_id: str,
+    draft: dict[str, object],
+) -> dict[str, object] | None:
+    """Read the immutable resource ceiling bound to a confirmed draft."""
+
+    envelope_ref = draft.get("resource_envelope_ref")
+    envelope_hash = draft.get("resource_envelope_hash")
+    if envelope_ref is None and envelope_hash is None:
+        envelope_value = None
+    elif isinstance(envelope_ref, str) and isinstance(envelope_hash, str):
+        envelope = connection.execute(
+            text(
+                "SELECT * FROM hc_resource_envelopes WHERE envelope_ref = "
+                ":envelope_ref AND initialization_id = :initialization_id"
+            ),
+            {
+                "envelope_ref": envelope_ref,
+                "initialization_id": initialization_id,
+            },
+        ).first()
+        try:
+            envelope_value = (
+                decoded_object(envelope.envelope_json)
+                if envelope is not None
+                else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise OwnerConflict(
+                "broad_research_authorization_basis_invalid"
+            ) from error
+        if (
+            envelope is None
+            or not isinstance(envelope_value, dict)
+            or envelope.envelope_hash != envelope_hash
+            or canonical_hash(envelope_value) != envelope_hash
+            or not _resource_envelope_matches_draft(draft, envelope_value)
+        ):
+            raise OwnerConflict("broad_research_authorization_basis_invalid")
+    else:
+        raise OwnerConflict("broad_research_authorization_basis_invalid")
+    return envelope_value
 
 
 _TIME_BUDGET_SECONDS: dict[str, int | None] = {
@@ -6555,6 +7997,40 @@ def _finite_json_value(value: object) -> bool:
     return False
 
 
+def _companion_human_request_context(
+    request: dict[str, object],
+) -> dict[str, object]:
+    """Keep provider context exact, bounded, and limited to public Owner facts."""
+
+    responses = request.get("responses")
+    waiters = request.get("direct_waiters")
+    return {
+        key: value
+        for key, value in {
+            "request_ref": request.get("request_ref"),
+            "revision": request.get("revision"),
+            "issuer": request.get("issuer"),
+            "quest_ref": request.get("quest_ref"),
+            "kind": request.get("kind"),
+            "status": request.get("status"),
+            "obligation": request.get("obligation"),
+            "business_purpose": request.get("business_purpose"),
+            "target_assertion": request.get("target_assertion"),
+            "acceptance_conditions": request.get("acceptance_conditions"),
+            "required_authorization": request.get("required_authorization"),
+            "direct_waiters": (
+                waiters[-20:] if isinstance(waiters, list) else []
+            ),
+            "responses": (
+                responses[-10:] if isinstance(responses, list) else []
+            ),
+            "evaluation": request.get("evaluation"),
+            "disposition": request.get("disposition"),
+        }.items()
+        if value is not None
+    }
+
+
 def _validated_material_binding_dict(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or set(value) != {
         "asset_ref",
@@ -6715,6 +8191,12 @@ def create_deepfetch_request_verifier(
     database: Database,
 ) -> SQLiteDeepFetchRunRequestVerifier:
     return SQLiteDeepFetchRunRequestVerifier(database)
+
+
+def create_human_response_verifier(
+    database: Database,
+) -> SQLiteHumanCollaborationFactVerifier:
+    return SQLiteHumanCollaborationFactVerifier(database)
 
 
 def create_human_collaboration_interface(

@@ -115,8 +115,12 @@ def test_unified_legacy_asset_tamper_fails_every_public_consumer_closed(
     rg = runtime.owners.research_graph
     try:
         created = _confirm_direct_quest(runtime, "legacy-asset")
-        assert hc.reconcile_once()
-        assert hc.reconcile_once()
+        assert hc.reconcile_once()  # RG Quest receipt.
+        assert hc.reconcile_once()  # Independent HC broad-research authorization.
+        assert hc.query_quest_creation(created["initialization_id"])["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
+        assert hc.reconcile_once()  # RM formal-question content receipt.
         content = rm.query_question_content(created["initialization_id"])
         assert content is not None
 
@@ -253,7 +257,11 @@ def test_each_downstream_owner_rejects_forged_upstream_receipts(
             )
         assert rm.query_snapshot().facts["formal_content_count"] == 0
 
-        assert hc.reconcile_once()
+        assert hc.reconcile_once()  # Independent HC broad-research authorization.
+        assert hc.query_quest_creation(created["initialization_id"])["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
+        assert hc.reconcile_once()  # RM formal-question content receipt.
         content = rm.query_question_content(created["initialization_id"])
         assert content is not None
         mirrored = rm.query_asset_version(content.content_ref)
@@ -457,8 +465,12 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
             preview_hash=preview["hash"],
             idempotency_key="partial-confirm",
         )
-        assert hc.reconcile_once()  # RG Quest
-        assert hc.reconcile_once()  # RM content
+        assert hc.reconcile_once()  # RG Quest receipt.
+        assert hc.reconcile_once()  # Independent HC broad-research authorization.
+        assert hc.query_quest_creation(created["initialization_id"])["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
+        assert hc.reconcile_once()  # RM formal-question content receipt.
 
         next(runtime.data_root.objects.glob("formal-question-content/*/*.json")).unlink()
         assert not hc.reconcile_once()
@@ -492,6 +504,7 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
             "asset_role_count": 0,
             "evidence_role_count": 0,
             "source_material_role_count": 0,
+            "human_request_count": 0,
         }
         assert runtime.owners.advancement_engine.query_snapshot().facts[
             "foreground_cycle_count"
@@ -507,8 +520,14 @@ def test_damaged_completed_quest_is_unavailable_without_reentering_active_queue(
     hc = runtime.owners.human_collaboration
     try:
         first = _confirm_direct_quest(runtime, "completed-custody-first")
-        for _step in range(4):
-            assert hc.reconcile_once()
+        assert hc.reconcile_once()  # RG Quest receipt.
+        assert hc.reconcile_once()  # Independent HC broad-research authorization.
+        assert hc.query_quest_creation(first["initialization_id"])["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
+        assert hc.reconcile_once()  # RM formal-question content receipt.
+        assert hc.reconcile_once()  # RG root-question receipt.
+        assert hc.reconcile_once()  # AE initial-cycle receipt and HC completion.
         assert hc.query_quest_creation(first["initialization_id"])["status"] == (
             "completed"
         )
@@ -565,8 +584,11 @@ def test_public_receipt_projection_fails_closed_when_owner_evidence_is_tampered(
     hc = runtime.owners.human_collaboration
     try:
         created = _confirm_direct_quest(runtime, "tamper")
-        for _step in range(4):
-            assert hc.reconcile_once()
+        assert hc.reconcile_once()  # RG Quest receipt.
+        assert hc.reconcile_once()  # Independent HC broad-research authorization.
+        assert hc.reconcile_once()  # RM formal-question content receipt.
+        assert hc.reconcile_once()  # RG root-question receipt.
+        assert hc.reconcile_once()  # AE initial-cycle receipt and HC completion.
         initialization_id = created["initialization_id"]
         cases = (
             (
@@ -576,6 +598,18 @@ def test_public_receipt_projection_fails_closed_when_owner_evidence_is_tampered(
                 "bundle_confirmation_receipt_invalid",
             ),
             ("rg_quests", "receipt_hash", "quest_goal", "quest_receipt_invalid"),
+            (
+                "hc_confirmation_previews",
+                "assertions_hash",
+                "broad_research_authorization",
+                "broad_research_authorization_receipt_invalid",
+            ),
+            (
+                "hc_capability_authorizations",
+                "receipt_hash",
+                "broad_research_authorization",
+                "capability_authorization_receipt_invalid",
+            ),
             (
                 "rm_formal_question_contents",
                 "receipt_hash",
@@ -620,6 +654,7 @@ def test_public_receipt_projection_fails_closed_when_owner_evidence_is_tampered(
             ordered_layers = (
                 "human_confirmation",
                 "quest_goal",
+                "broad_research_authorization",
                 "question_content",
                 "question_identity",
                 "cycle_activation",
@@ -646,6 +681,10 @@ def test_native_rm_io_failure_is_durable_and_recovers_from_the_same_layer(
     try:
         created = _confirm_direct_quest(runtime, "rm-io")
         assert hc.reconcile_once()  # RG Quest accepted.
+        assert hc.reconcile_once()  # Independent HC broad-research authorization.
+        assert hc.query_quest_creation(created["initialization_id"])["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
         blocked_directory = runtime.data_root.objects / "formal-question-content"
         blocked_directory.write_text("not a directory", encoding="utf-8")
 
@@ -684,6 +723,10 @@ def test_reconciliation_honors_backoff_and_counts_repeated_failures(
     try:
         created = _confirm_direct_quest(runtime, "backoff")
         assert hc.reconcile_once()  # RG Quest accepted.
+        assert hc.reconcile_once()  # Independent HC broad-research authorization.
+        assert hc.query_quest_creation(created["initialization_id"])["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
         blocked_directory = runtime.data_root.objects / "formal-question-content"
         blocked_directory.write_text("not a directory", encoding="utf-8")
 
@@ -729,9 +772,13 @@ def test_cycle_commit_is_not_publicly_complete_until_hc_completion_is_durable(
     hc = runtime.owners.human_collaboration
     try:
         created = _confirm_direct_quest(runtime, "completion-window")
-        assert hc.reconcile_once()  # RG Quest
-        assert hc.reconcile_once()  # RM content
-        assert hc.reconcile_once()  # RG Question
+        assert hc.reconcile_once()  # RG Quest receipt.
+        assert hc.reconcile_once()  # Independent HC broad-research authorization.
+        assert hc.query_quest_creation(created["initialization_id"])["receipts"][
+            "broad_research_authorization"
+        ]["status"] == "accepted"
+        assert hc.reconcile_once()  # RM formal-question content receipt.
+        assert hc.reconcile_once()  # RG root-question receipt.
         quest = runtime.owners.research_graph.query_quest(created["initialization_id"])
         question = runtime.owners.research_graph.query_question(
             created["initialization_id"]

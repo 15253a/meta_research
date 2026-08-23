@@ -379,21 +379,40 @@ def test_stage_request_verifier_requires_exact_question_and_context_binding(
 
 
 @pytest.mark.parametrize(
-    "forgery",
+    ("forgery", "expected_error"),
     (
-        {"schema_ref": "meta-research/idea-context-pack/forged"},
-        {"cycle_ref": "cycle_forged"},
-        {"accepted_question_binding": {"question_ref": "question_forged"}},
-        {"accepted_evidence_refs": ["evidence_without_owner_receipt"]},
-        {"literature_binding": {"asset_ref": "literature_without_owner_receipt"}},
-        {"prior_accepted_bindings": ["idea_without_owner_receipt"]},
-        {"active_guidance_bindings": ["guidance_without_owner_receipt"]},
-        {"unexpected": True},
+        (
+            {"schema_ref": "meta-research/idea-context-pack/forged"},
+            "idea_context_pack_invalid",
+        ),
+        ({"cycle_ref": "cycle_forged"}, "idea_context_pack_invalid"),
+        (
+            {"accepted_question_binding": {"question_ref": "question_forged"}},
+            "idea_context_pack_invalid",
+        ),
+        (
+            {"accepted_evidence_refs": ["evidence_without_owner_receipt"]},
+            "idea_context_pack_invalid",
+        ),
+        (
+            {"literature_binding": {"asset_ref": "literature_without_owner_receipt"}},
+            "idea_context_pack_invalid",
+        ),
+        (
+            {"prior_accepted_bindings": ["idea_without_owner_receipt"]},
+            "idea_context_pack_invalid",
+        ),
+        (
+            {"active_guidance_bindings": ["guidance_without_owner_receipt"]},
+            "idea_context_guidance_bindings_invalid",
+        ),
+        ({"unexpected": True}, "idea_context_pack_invalid"),
     ),
 )
 def test_advancement_engine_refuses_unverified_context_pack_bindings(
     tmp_path: Path,
     forgery: dict[str, object],
+    expected_error: str,
 ) -> None:
     runtime = _runtime(prepare_data_root(tmp_path / "forged-context"), _IdeaProvider())
     try:
@@ -414,7 +433,7 @@ def test_advancement_engine_refuses_unverified_context_pack_bindings(
         context_pack.update(forgery)
         before = runtime.owners.advancement_engine.query_snapshot()
 
-        with pytest.raises(OwnerConflict, match="idea_context_pack_invalid"):
+        with pytest.raises(OwnerConflict, match=expected_error):
             runtime.owners.advancement_engine.ensure_idea_stage_request(
                 cycle_ref=completed["cycle_ref"],
                 accepted_question=question.as_binding(),
