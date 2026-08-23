@@ -45,6 +45,10 @@ def test_interrupted_bundle_migration_rolls_back_and_restarts_cleanly(
             row[1]
             for row in connection.execute("PRAGMA table_info(research_graph_state)")
         }
+        experiment_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(ar_experiment_runs)")
+        }
         request_ddl = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
             "name = 'ae_stage_run_requests'"
@@ -53,6 +57,7 @@ def test_interrupted_bundle_migration_rolls_back_and_restarts_cleanly(
     assert "rg_targets" not in tables
     assert "ae_stage_run_requests_pre_bundle" not in tables
     assert "target_graph_count" not in graph_columns
+    assert "bundle_target_ref" not in experiment_columns
     assert "'bundle'" not in request_ddl
 
     monkeypatch.setattr(Operations, "create_table", original_create_table)
@@ -73,6 +78,10 @@ def test_interrupted_bundle_migration_rolls_back_and_restarts_cleanly(
             row[1]
             for row in connection.execute("PRAGMA table_info(research_graph_state)")
         }
+        experiment_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(ar_experiment_runs)")
+        }
         request_ddl = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
             "name = 'ae_stage_run_requests'"
@@ -92,6 +101,7 @@ def test_interrupted_bundle_migration_rolls_back_and_restarts_cleanly(
         "target_count",
         "target_commit_count",
     } <= graph_columns
+    assert "bundle_target_ref" in experiment_columns
     assert "'bundle'" in request_ddl
     assert foreign_key_failures == []
     assert integrity == ("ok",)

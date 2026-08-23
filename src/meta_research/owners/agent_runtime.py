@@ -307,6 +307,9 @@ class TargetRunAdmission:
     evaluation_attempt_ref: str
     execution_request_ref: str
     definition_hash: str
+    dispatch_decision_ref: str
+    dispatch_receipt_ref: str
+    dispatch_receipt_hash: str
     receipt: AcceptanceReceipt
     human_request_ref: str | None = None
     human_waiter_ref: str | None = None
@@ -5352,6 +5355,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         selected = [
             item for item in frontier if item.get("target_ref") == selected_target_ref
         ]
+        if action != "dispatch":
+            raise OwnerConflict("bundle_dispatch_authority_missing")
         if (
             action not in {"dispatch", "wait", "replan_required"}
             or (
@@ -6221,6 +6226,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 inputs_hash=binding.inputs_hash,
                 receipt=binding.receipt,
             )
+        bundle_target_ref = (
+            None
+            if self._target_graph_verifier is None
+            else self._target_graph_verifier.match_bundle_target_candidate(
+                quest_ref=execution_request.quest_ref,
+                evaluation_attempt_ref=identities.evaluation_attempt_ref,
+                execution_request_ref=execution_request.execution_request_ref,
+                definition_hash=execution_request.definition_hash,
+            )
+        )
 
         with self._database.write() as connection:
             connection.execute(
@@ -6277,6 +6292,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     and existing.runtime_binding_json
                     == canonical_json(runtime_document)
                     and existing.runtime_binding_hash == runtime_hash
+                    and existing.bundle_target_ref == bundle_target_ref
                 )
                 if not expected:
                     raise OwnerConflict("experiment_admission_conflict")
@@ -6321,6 +6337,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "measurement_input_binding_ref, measurement_input_hash, "
                         "measurement_input_receipt_ref, "
                         "measurement_input_receipt_hash, status, "
+                        "bundle_target_ref, "
                         "provider_operation_ref, provider_operation_generation, "
                         "provider_operation_retry_permitted, attempt_ref, "
                         "attempt_generation, root_session_ref, fence_ref, "
@@ -6341,6 +6358,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         ":measurement_input_binding_ref, :measurement_input_hash, "
                         ":measurement_input_receipt_ref, "
                         ":measurement_input_receipt_hash, 'admitted', "
+                        ":bundle_target_ref, "
                         ":provider_operation_ref, 1, 0, :attempt_ref, 1, "
                         ":root_session_ref, :fence_ref, "
                         ":runtime_binding_json, :runtime_binding_hash, :now, :now)"
@@ -6396,6 +6414,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "measurement_input_receipt_hash": (
                             measurement_binding.receipt.payload_hash
                         ),
+                        "bundle_target_ref": bundle_target_ref,
                         "attempt_ref": attempt_ref,
                         "provider_operation_ref": provider_operation,
                         "root_session_ref": root_session_ref,
@@ -6451,6 +6470,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "fence_ref": fence_ref,
                         "variant_run_ref": identities.variant_run_ref,
                         "evaluation_attempt_ref": identities.evaluation_attempt_ref,
+                        "bundle_target_ref": bundle_target_ref,
                     },
                 )
         admitted = self.query_experiment_run(identities.evaluation_attempt_ref)
@@ -6705,6 +6725,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         }
         request_hash = canonical_hash(command)
         with self._database.write() as connection:
+            replay = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_run_admissions WHERE "
+                    "idempotency_key = :idempotency_key"
+                ),
+                {"idempotency_key": idempotency_key},
+            ).first()
+            if replay is not None:
+                if replay.request_hash != request_hash:
+                    raise OwnerConflict("idempotency_conflict")
+                return _target_run_admission(replay)
             verifier = self._target_graph_verifier
             if verifier is None:
                 raise OwnerConflict("target_graph_verifier_unavailable")
@@ -6741,9 +6772,36 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     or experiment.evaluation_attempt_ref != evaluation_attempt_ref
                     or experiment.execution_request_ref != execution_request_ref
                     or experiment.definition_hash != definition_hash
-                    or experiment.status not in {"admitted", "running", "executed"}
+                    or experiment.bundle_target_ref != target_ref
+                    or experiment.status != "admitted"
                 ):
                     raise OwnerConflict("target_run_experiment_binding_invalid")
+                dispatch_row = connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_dispatch_decisions WHERE "
+                        "graph_ref = :graph_ref ORDER BY generation DESC LIMIT 1"
+                    ),
+                    {"graph_ref": graph_ref},
+                ).first()
+                if dispatch_row is None:
+                    raise OwnerConflict("target_run_dispatch_invalid")
+                dispatch = _bundle_dispatch_decision(dispatch_row)
+                stage_run = connection.execute(
+                    text(
+                        "SELECT request_ref, stage FROM ar_stage_runs WHERE "
+                        "run_ref = :run_ref"
+                    ),
+                    {"run_ref": dispatch.run_ref},
+                ).first()
+                if (
+                    dispatch.action != "dispatch"
+                    or dispatch.selected_target_ref != target_ref
+                    or dispatch.graph_ref != graph_ref
+                    or stage_run is None
+                    or stage_run.stage != "bundle"
+                    or stage_run.request_ref != stage_request_ref
+                ):
+                    raise OwnerConflict("target_run_dispatch_invalid")
                 duplicate = connection.execute(
                     text(
                         "SELECT * FROM ar_target_run_admissions WHERE target_ref = "
@@ -6847,7 +6905,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         work_hash=request_hash,
                     )
                 bindings = {
-                    key: value for key, value in command.items() if key != "command"
+                    **{
+                        key: value for key, value in command.items() if key != "command"
+                    },
+                    "dispatch_decision_ref": dispatch.decision_ref,
+                    "dispatch_receipt_ref": dispatch.receipt.receipt_ref,
+                    "dispatch_receipt_hash": dispatch.receipt.payload_hash,
                 }
                 receipt_ref = new_ref("ar_target_run_admission_receipt")
                 receipt_hash = _owner_receipt_hash(
@@ -6862,7 +6925,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "target_ref, target_spec_hash, graph_ref, "
                         "stage_request_ref, quest_ref, target_run_ref, "
                         "evaluation_attempt_ref, execution_request_ref, "
-                        "definition_hash, human_request_ref, human_waiter_ref, "
+                        "definition_hash, dispatch_decision_ref, "
+                        "dispatch_receipt_ref, dispatch_receipt_hash, "
+                        "human_request_ref, human_waiter_ref, "
                         "human_waiter_generation, "
                         "human_authorization_receipt_ref, idempotency_key, "
                         "request_hash, receipt_ref, receipt_hash, admitted_at) "
@@ -6870,6 +6935,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         ":graph_ref, :stage_request_ref, :quest_ref, "
                         ":target_run_ref, :evaluation_attempt_ref, "
                         ":execution_request_ref, :definition_hash, "
+                        ":dispatch_decision_ref, :dispatch_receipt_ref, "
+                        ":dispatch_receipt_hash, "
                         ":human_request_ref, :human_waiter_ref, "
                         ":human_waiter_generation, "
                         ":human_authorization_receipt_ref, :idempotency_key, "
@@ -6899,6 +6966,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "target_ref": target_ref,
                         "target_run_ref": target_run_ref,
                         "evaluation_attempt_ref": evaluation_attempt_ref,
+                        "dispatch_decision_ref": dispatch.decision_ref,
                         "receipt_ref": receipt_ref,
                     },
                 )
@@ -6997,8 +7065,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         with self._database.write() as connection:
             run = connection.execute(
                 text(
-                    "SELECT * FROM ar_experiment_runs WHERE status = 'admitted' "
-                    "ORDER BY updated_at, run_ref LIMIT 1"
+                    "SELECT r.* FROM ar_experiment_runs r WHERE r.status = "
+                    "'admitted' AND (r.bundle_target_ref IS NULL OR EXISTS "
+                    "(SELECT 1 FROM ar_target_run_admissions a WHERE "
+                    "a.target_ref = r.bundle_target_ref AND "
+                    "a.target_run_ref = r.run_ref)) ORDER BY r.updated_at, "
+                    "r.run_ref LIMIT 1"
                 )
             ).first()
             if run is None:
@@ -7731,9 +7803,21 @@ class SQLiteAgentRuntimeReceiptVerifier:
                 text("SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"),
                 {"run_ref": target_run_ref},
             ).first()
-        if row is None or experiment is None:
+            dispatch_row = (
+                None
+                if row is None
+                else connection.execute(
+                    text(
+                        "SELECT * FROM ar_bundle_dispatch_decisions WHERE "
+                        "decision_ref = :decision_ref"
+                    ),
+                    {"decision_ref": row.dispatch_decision_ref},
+                ).first()
+            )
+        if row is None or experiment is None or dispatch_row is None:
             raise OwnerConflict("target_run_admission_receipt_invalid")
         admission = _target_run_admission(row)
+        dispatch = _bundle_dispatch_decision(dispatch_row)
         if (
             receipt.subject_ref != admission.admission_ref
             or receipt != admission.receipt
@@ -7746,7 +7830,14 @@ class SQLiteAgentRuntimeReceiptVerifier:
             or admission.evaluation_attempt_ref != evaluation_attempt_ref
             or admission.execution_request_ref != execution_request_ref
             or admission.definition_hash != definition_hash
+            or admission.dispatch_decision_ref != dispatch.decision_ref
+            or admission.dispatch_receipt_ref != dispatch.receipt.receipt_ref
+            or admission.dispatch_receipt_hash != dispatch.receipt.payload_hash
+            or dispatch.action != "dispatch"
+            or dispatch.selected_target_ref != target_ref
+            or dispatch.graph_ref != graph_ref
             or experiment.quest_ref != quest_ref
+            or experiment.bundle_target_ref != target_ref
             or experiment.evaluation_attempt_ref != evaluation_attempt_ref
             or experiment.execution_request_ref != execution_request_ref
             or experiment.definition_hash != definition_hash
@@ -9674,6 +9765,9 @@ def _target_run_admission(row) -> TargetRunAdmission:
         "evaluation_attempt_ref": row.evaluation_attempt_ref,
         "execution_request_ref": row.execution_request_ref,
         "definition_hash": row.definition_hash,
+        "dispatch_decision_ref": row.dispatch_decision_ref,
+        "dispatch_receipt_ref": row.dispatch_receipt_ref,
+        "dispatch_receipt_hash": row.dispatch_receipt_hash,
         "human_request_ref": row.human_request_ref,
         "human_waiter_ref": row.human_waiter_ref,
         "human_waiter_generation": (
@@ -9683,7 +9777,16 @@ def _target_run_admission(row) -> TargetRunAdmission:
         ),
         "human_authorization_receipt_ref": row.human_authorization_receipt_ref,
     }
-    request_hash = canonical_hash({"command": "admit_target_run", **bindings})
+    request_hash = canonical_hash(
+        {
+            "command": "admit_target_run",
+            **{
+                key: value
+                for key, value in bindings.items()
+                if not key.startswith("dispatch_")
+            },
+        }
+    )
     if row.request_hash != request_hash or row.receipt_hash != _owner_receipt_hash(
         TARGET_RUN_ADMISSION_RECEIPT_KIND, row.admission_ref, bindings
     ):
@@ -9699,6 +9802,9 @@ def _target_run_admission(row) -> TargetRunAdmission:
         evaluation_attempt_ref=row.evaluation_attempt_ref,
         execution_request_ref=row.execution_request_ref,
         definition_hash=row.definition_hash,
+        dispatch_decision_ref=row.dispatch_decision_ref,
+        dispatch_receipt_ref=row.dispatch_receipt_ref,
+        dispatch_receipt_hash=row.dispatch_receipt_hash,
         human_request_ref=row.human_request_ref,
         human_waiter_ref=row.human_waiter_ref,
         human_waiter_generation=bindings["human_waiter_generation"],

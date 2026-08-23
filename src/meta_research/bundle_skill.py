@@ -138,6 +138,8 @@ def validate_bundle_dispatch_result(
         for item in request.frontier
         if item.get("target_ref") == result.selected_target_ref
     ]
+    if request.frontier and result.action != "dispatch":
+        raise BundleSkillContractError("bundle_dispatch_requires_authoritative_blocker")
     if (
         result.action not in {"dispatch", "wait", "replan_required"}
         or (

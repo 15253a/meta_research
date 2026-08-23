@@ -162,6 +162,22 @@ class _HighRiskBundleSkill(_DeterministicBundleSkill):
         return target_plan
 
 
+class _NonDispatchingBundleSkill(_DeterministicBundleSkill):
+    def __init__(self, action: str) -> None:
+        self.action = action
+        self.schedule_calls = 0
+
+    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+        self.schedule_calls += 1
+        return BundleDispatchResult(
+            action=self.action,
+            selected_target_ref=None,
+            rationale="Pause despite an executable Target.",
+            native_session_ref=request.native_session_ref,
+            adapter_kind="test_non_dispatching",
+        )
+
+
 class _FailAfterFirstTargetProvider(_DeterministicExperimentProvider):
     def execute(self, request, observe):
         if self.execute_calls >= 1:
@@ -654,6 +670,143 @@ def test_bundle_root_session_selects_from_the_durable_parallel_frontier(
         runtime.close()
 
 
+@pytest.mark.parametrize("action", ("wait", "replan_required"))
+def test_bundle_rejects_non_dispatch_decisions_for_an_executable_frontier(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    bundle_provider = _NonDispatchingBundleSkill(action)
+    runtime = _bundle_runtime(
+        tmp_path / f"bundle-invalid-{action}",
+        bundle_skill_provider=bundle_provider,
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(10):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            if current["target_graph"]["status"] == "accepted":
+                break
+        else:
+            raise AssertionError("Bundle did not accept TargetGraph")
+
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(
+            current["stage_run_request"]["request_ref"]
+        )
+        assert run is not None
+        assert current["target_graph"]["frontier"]
+        assert not runtime.bundle_stage.process_once()
+        assert bundle_provider.schedule_calls == 1
+        assert (
+            runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+            == ()
+        )
+
+        # An invalid free-text pause is not durable authority. The same root
+        # Session must re-evaluate instead of silently freezing the frontier.
+        assert not runtime.bundle_stage.process_once()
+        assert bundle_provider.schedule_calls == 2
+        after_retry = runtime.bundle_stage.query_current()
+        assert (
+            after_retry["target_graph"]["frontier"]
+            == current["target_graph"]["frontier"]
+        )
+        assert all(
+            target["target_run_ref"] is None
+            for target in after_retry["target_graph"]["targets"]
+        )
+    finally:
+        runtime.close()
+
+
+def test_target_run_admission_rejects_a_target_outside_the_live_frontier(
+    tmp_path: Path,
+) -> None:
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-dependent-target-frontier",
+        bundle_skill_provider=_TwoTargetBundleSkill(),
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(12):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            if current["target_graph"]["status"] != "accepted":
+                continue
+            run = runtime.owners.agent_runtime.query_bundle_stage_run(
+                current["stage_run_request"]["request_ref"]
+            )
+            if (
+                run is not None
+                and runtime.owners.agent_runtime.query_bundle_dispatch_decisions(
+                    run.run_ref
+                )
+            ):
+                break
+        else:
+            raise AssertionError("Bundle did not dispatch its live frontier")
+
+        graph = runtime.owners.research_graph.query_target_graph(
+            current["stage_run_request"]["request_ref"]
+        )
+        assert graph is not None
+        predecessor, dependent = graph.targets
+        assert dependent.dependency_refs == (predecessor.target_ref,)
+        assert runtime.owners.research_graph.query_target_commits(graph.graph_ref) == ()
+        assert current["target_graph"]["frontier"] == [predecessor.target_ref]
+
+        started = runtime.experiment.start(
+            ExperimentIntent(
+                execution_request_ref=f"bundle-target-{dependent.target_ref}",
+                quest_ref=graph.quest_ref,
+                title=str(dependent.spec["title"]),
+                hypothesis=str(dependent.spec["hypothesis"]),
+                variant_parameter=float(dependent.spec["variant_parameter"]),
+                sample_count=int(dependent.spec["sample_count"]),
+            ),
+            "bundle-dependent-target-preflight",
+        )
+        identities = started["identities"]
+        execution = started["execution"]
+        intent = started["intent"]
+        assert isinstance(identities, dict)
+        assert isinstance(execution, dict)
+        assert isinstance(intent, dict)
+        domain = runtime.owners.research_graph.query_experiment(
+            identities["evaluation_attempt_ref"]
+        )
+        assert domain is not None
+        with pytest.raises(OwnerConflict, match="target_run_frontier_invalid"):
+            runtime.owners.agent_runtime.admit_target_run(
+                target_ref=dependent.target_ref,
+                target_spec_hash=dependent.spec_hash,
+                graph_ref=graph.graph_ref,
+                stage_request_ref=graph.request_ref,
+                quest_ref=graph.quest_ref,
+                target_run_ref=execution["run_ref"],
+                evaluation_attempt_ref=identities["evaluation_attempt_ref"],
+                execution_request_ref=intent["execution_request_ref"],
+                definition_hash=domain.execution_request.definition_hash,
+                idempotency_key="bundle-dependent-target-admission",
+            )
+        assert (
+            runtime.owners.agent_runtime.query_target_run_admission(
+                dependent.target_ref
+            )
+            is None
+        )
+        assert (
+            runtime.owners.research_graph.query_target_run_binding(dependent.target_ref)
+            is None
+        )
+    finally:
+        runtime.close()
+
+
 def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
     tmp_path: Path,
 ) -> None:
@@ -717,6 +870,16 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
             identities["evaluation_attempt_ref"]
         )
         assert domain is not None
+        admitted_run = runtime.owners.agent_runtime.query_experiment_run(
+            identities["evaluation_attempt_ref"]
+        )
+        assert admitted_run is not None and admitted_run.status == "admitted"
+        assert not runtime.experiment.process_once()
+        still_admitted = runtime.owners.agent_runtime.query_experiment_run(
+            identities["evaluation_attempt_ref"]
+        )
+        assert still_admitted is not None and still_admitted.status == "admitted"
+        assert provider.execute_calls == 0
         with pytest.raises(OwnerConflict, match="target_run_authorization_invalid"):
             runtime.owners.agent_runtime.admit_target_run(
                 target_ref=accepted_target.target_ref,
@@ -753,6 +916,19 @@ def test_high_risk_target_waits_for_exact_human_confirmation_then_resumes(
         assert admission.human_request_ref == request["request_ref"]
         assert admission.human_waiter_ref == target["target_ref"]
         assert admission.human_authorization_receipt_ref == authorization["receipt_ref"]
+        bundle_run = runtime.owners.agent_runtime.query_bundle_stage_run(
+            current["stage_run_request"]["request_ref"]
+        )
+        assert bundle_run is not None
+        dispatches = runtime.owners.agent_runtime.query_bundle_dispatch_decisions(
+            bundle_run.run_ref
+        )
+        assert dispatches
+        dispatch = dispatches[-1]
+        assert dispatch.selected_target_ref == target["target_ref"]
+        assert admission.dispatch_decision_ref == dispatch.decision_ref
+        assert admission.dispatch_receipt_ref == dispatch.receipt.receipt_ref
+        assert admission.dispatch_receipt_hash == dispatch.receipt.payload_hash
         assert binding.admission_receipt == admission.receipt
         persisted = runtime.owners.agent_runtime.query_human_request(
             request["request_ref"]

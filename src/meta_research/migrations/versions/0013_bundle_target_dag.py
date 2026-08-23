@@ -284,6 +284,12 @@ def _rebuild_stage_authorities() -> None:
 
 
 def _create_target_authorities() -> None:
+    # Experiments that exactly implement a Bundle Target remain admitted but
+    # unclaimable until AR has issued the corresponding TargetRun admission.
+    op.add_column(
+        "ar_experiment_runs",
+        sa.Column("bundle_target_ref", sa.String(96), nullable=True),
+    )
     for name in ("target_graph_count", "target_count", "target_commit_count"):
         op.add_column(
             "research_graph_state",
@@ -417,6 +423,9 @@ def _create_target_authorities() -> None:
         sa.Column("evaluation_attempt_ref", sa.String(96), nullable=False, unique=True),
         sa.Column("execution_request_ref", sa.String(96), nullable=False, unique=True),
         sa.Column("definition_hash", sa.String(64), nullable=False),
+        sa.Column("dispatch_decision_ref", sa.String(96), nullable=False),
+        sa.Column("dispatch_receipt_ref", sa.String(96), nullable=False),
+        sa.Column("dispatch_receipt_hash", sa.String(64), nullable=False),
         sa.Column("human_request_ref", sa.String(96), nullable=True),
         sa.Column("human_waiter_ref", sa.String(128), nullable=True),
         sa.Column("human_waiter_generation", sa.Integer(), nullable=True),
@@ -439,6 +448,9 @@ def _create_target_authorities() -> None:
         sa.ForeignKeyConstraint(
             ["execution_request_ref"], ["rg_experiment_requests.execution_request_ref"]
         ),
+        sa.ForeignKeyConstraint(
+            ["dispatch_decision_ref"], ["ar_bundle_dispatch_decisions.decision_ref"]
+        ),
         sa.CheckConstraint(
             "(human_request_ref IS NULL AND human_waiter_ref IS NULL "
             "AND human_waiter_generation IS NULL "
@@ -449,6 +461,7 @@ def _create_target_authorities() -> None:
         ),
         _hash("target_spec_hash"),
         _hash("definition_hash"),
+        _hash("dispatch_receipt_hash"),
         _hash("request_hash"),
         _hash("receipt_hash"),
     )

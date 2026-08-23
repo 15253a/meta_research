@@ -1823,6 +1823,62 @@ class SQLiteResearchGraphReceiptVerifier:
             raise OwnerConflict("target_graph_receipt_invalid")
         _accepted_target_graph(row, target_rows)
 
+    def match_bundle_target_candidate(
+        self,
+        *,
+        quest_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+    ) -> str | None:
+        """Identify exact Bundle experiments before AR makes them claimable."""
+
+        with self._database.read() as connection:
+            target_row = connection.execute(
+                text(
+                    "SELECT t.*, g.quest_ref FROM rg_targets t JOIN "
+                    "rg_target_graphs g ON g.graph_ref = t.graph_ref WHERE "
+                    ":execution_request_ref = 'bundle-target-' || t.target_ref"
+                ),
+                {"execution_request_ref": execution_request_ref},
+            ).first()
+            experiment_row = connection.execute(
+                text(
+                    "SELECT * FROM rg_experiment_requests WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref AND "
+                    "execution_request_ref = :execution_request_ref"
+                ),
+                {
+                    "evaluation_attempt_ref": evaluation_attempt_ref,
+                    "execution_request_ref": execution_request_ref,
+                },
+            ).first()
+        if target_row is None:
+            return None
+        if experiment_row is None:
+            raise OwnerConflict("bundle_target_experiment_invalid")
+        target = _accepted_target(target_row)
+        expected_intent = ExperimentIntent(
+            execution_request_ref=f"bundle-target-{target.target_ref}",
+            quest_ref=target_row.quest_ref,
+            title=cast(str, target.spec["title"]),
+            hypothesis=cast(str, target.spec["hypothesis"]),
+            variant_parameter=float(target.spec["variant_parameter"]),
+            sample_count=cast(int, target.spec["sample_count"]),
+        )
+        try:
+            stored_intent = decoded_object(experiment_row.intent_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("bundle_target_experiment_invalid") from error
+        if (
+            target_row.quest_ref != quest_ref
+            or experiment_row.quest_ref != quest_ref
+            or experiment_row.definition_hash != definition_hash
+            or stored_intent != expected_intent.as_dict()
+        ):
+            raise OwnerConflict("bundle_target_experiment_invalid")
+        return target.target_ref
+
     def verify_target_run_candidate(
         self,
         *,
@@ -1853,6 +1909,24 @@ class SQLiteResearchGraphReceiptVerifier:
                 ),
                 {"execution_request_ref": execution_request_ref},
             ).first()
+            bound = connection.execute(
+                text(
+                    "SELECT 1 FROM rg_target_run_bindings WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            committed = {
+                row.target_ref
+                for row in connection.execute(
+                    text(
+                        "SELECT c.target_ref FROM rg_target_commits c JOIN "
+                        "rg_targets t ON t.target_ref = c.target_ref WHERE "
+                        "t.graph_ref = :graph_ref"
+                    ),
+                    {"graph_ref": graph_ref},
+                ).all()
+            }
         if target_row is None or experiment_row is None:
             raise OwnerConflict("target_run_candidate_invalid")
         target = _accepted_target(target_row)
@@ -1883,6 +1957,12 @@ class SQLiteResearchGraphReceiptVerifier:
         risk_class = target.spec.get("risk_class")
         if risk_class not in {"normal", "high"}:
             raise OwnerConflict("target_run_candidate_invalid")
+        if (
+            bound is not None
+            or target_ref in committed
+            or not set(target.dependency_refs) <= committed
+        ):
+            raise OwnerConflict("target_run_frontier_invalid")
         return cast(str, risk_class)
 
     def verify_bundle_dispatch_frontier(

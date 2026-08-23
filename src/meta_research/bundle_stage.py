@@ -305,9 +305,7 @@ class BundleStageWorker:
             in {target.target_ref for target in dispatchable}
             else None
         )
-        coordination_needed = bool(dispatchable) or bool(
-            cast(list[object], dispatch_state["blocked_targets"])
-        )
+        coordination_needed = bool(dispatchable)
         if pending_dispatch is None and coordination_needed and not same_input:
             if run.native_session_ref is None:
                 raise OwnerConflict("bundle_native_session_missing")

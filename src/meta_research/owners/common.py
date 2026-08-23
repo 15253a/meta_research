@@ -624,6 +624,15 @@ class TargetGraphReceiptVerifier(Protocol):
         definition_hash: str,
     ) -> str: ...
 
+    def match_bundle_target_candidate(
+        self,
+        *,
+        quest_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+    ) -> str | None: ...
+
     def verify_bundle_dispatch_frontier(
         self,
         *,
