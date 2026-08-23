@@ -266,6 +266,9 @@ class CodexIdeaSkillAdapter:
     _shell_environment_inherit: str | None = None
     _reconciliation_operation_names = ("primary", "review")
 
+    def _is_reconciliation_operation_name(self, operation_name: str) -> bool:
+        return operation_name in self._reconciliation_operation_names
+
     def __init__(
         self,
         workspace: Path,
@@ -345,10 +348,15 @@ class CodexIdeaSkillAdapter:
             return True
         try:
             _key_path, key = self._transport_key()
-            for operation_name in self._reconciliation_operation_names:
-                directory = operation_root / operation_name
-                if not directory.exists():
-                    continue
+            for directory in operation_root.iterdir():
+                operation_name = directory.name
+                if (
+                    not directory.is_dir()
+                    or not self._is_reconciliation_operation_name(operation_name)
+                ):
+                    raise ProviderSupervisorError(
+                        "provider_supervisor_spool_invalid"
+                    )
                 invocation_path = directory / "invocation.json"
                 if not invocation_path.is_file():
                     if any(directory.iterdir()):

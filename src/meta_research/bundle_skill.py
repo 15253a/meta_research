@@ -323,6 +323,15 @@ class CodexBundleSkillAdapter(CodexPlanSkillAdapter):
             process_runner=process_runner,
         )
 
+    def _is_reconciliation_operation_name(self, operation_name: str) -> bool:
+        dispatch_generation = operation_name.removeprefix("dispatch-")
+        return super()._is_reconciliation_operation_name(operation_name) or (
+            operation_name.startswith("dispatch-")
+            and dispatch_generation.isascii()
+            and dispatch_generation.isdigit()
+            and dispatch_generation[0] != "0"
+        )
+
     def runtime_binding(self) -> BundleRuntimeBinding:
         resources = _bundle_skill_resources()
         harness_ref, harness_artifacts = _codex_harness_manifest(self._executable)

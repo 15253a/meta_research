@@ -253,3 +253,25 @@ def test_target_plan_rejects_a_cycle_before_research_graph_acceptance() -> None:
             context_pack_hash=context_hash,
             plan_document=plan,
         )
+
+
+def test_cancel_reconciliation_inspects_dynamic_bundle_dispatch_phases(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "provider"
+    adapter = CodexBundleSkillAdapter(
+        workspace,
+        executable=str(_fake_codex(tmp_path / "codex")),
+        process_runner=_SequenceRunner([]),
+    )
+    job_ref = "bundle-job:cancel-reconciliation"
+    operation = (
+        workspace
+        / "provider-operations"
+        / canonical_hash({"job_ref": job_ref})
+        / "dispatch-1"
+    )
+    operation.mkdir(parents=True)
+    (operation / "partial-spool").write_text("unknown", encoding="utf-8")
+
+    assert adapter.reconcile_cancelled_job(job_ref) is False
