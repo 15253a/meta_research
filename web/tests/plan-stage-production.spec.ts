@@ -260,16 +260,40 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
 
   const committedSnapshot = await publicSnapshot(page);
   expect(committedSnapshot.plan_stage).toEqual(committed);
-  await expect(card).toHaveAttribute("data-plan-stage-state", "stage-commit");
-  await expect(card.locator('[data-state="done"]')).toHaveCount(5);
-  await expect(
-    card.locator('[data-plan-owner-layer="content"]'),
-  ).toContainText("accepted");
-  await expect(
-    card.locator('[data-plan-owner-layer="domain"]'),
-  ).toContainText("accepted");
+  await expect.poll(async () => (
+    await publicSnapshot(page)
+  ).bundle_stage?.stage_run_request?.accepted_formal_plan_binding, {
+    timeout: 30_000,
+  }).toMatchObject({
+    formal_plan_ref: committed.plan_acceptance.formal_plan_ref,
+    stage_commit_ref: committed.stage_commit?.stage_commit_ref,
+  });
+  const transitionedSnapshot = await publicSnapshot(page);
+  expect(transitionedSnapshot.plan_stage).toEqual(committed);
+  expect(
+    transitionedSnapshot.bundle_stage?.stage_run_request
+      ?.accepted_formal_plan_binding,
+  ).toMatchObject({
+    formal_plan_ref: committed.plan_acceptance.formal_plan_ref,
+    stage_commit_ref: committed.stage_commit?.stage_commit_ref,
+  });
 
-  await card.getByText("查看 Plan 运行身份与 receipt", { exact: true }).click();
+  // The main workspace always shows the highest current Stage. Plan remains a
+  // complete Snapshot fact while Bundle takes over the current Stage surface.
+  await expect(card).toHaveCount(0);
+  const bundleCard = page.getByTestId("bundle-stage-card");
+  await expect(bundleCard).toBeVisible();
+  await expect(page.getByTestId("current-question-card")).toContainText(
+    "Current StageBundle",
+  );
+  const stageStrip = page.getByRole("list", {
+    name: "当前研究周期的四个 Stage",
+  });
+  await expect(stageStrip.getByRole("listitem").filter({ hasText: "Plan" }))
+    .toContainText("COMMITTED");
+  await expect(stageStrip.getByRole("listitem").filter({ hasText: "Bundle" }))
+    .toContainText("NOW");
+
   const dynamicFacts = [
     committed.stage_run_request?.request_ref,
     receiptRef(committed.stage_run_request?.receipt),
@@ -285,7 +309,6 @@ test("Chrome observes the daemon execute a real Plan StageRun through every Owne
   ];
   for (const fact of dynamicFacts) {
     expect(typeof fact).toBe("string");
-    await expect(card.getByText(fact as string, { exact: true })).toBeVisible();
   }
 
   await expect(

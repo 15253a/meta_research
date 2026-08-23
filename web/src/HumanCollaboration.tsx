@@ -193,7 +193,9 @@ export function QuestCompanion({
   const commands = scopeRef
     ? collaboration?.commands.items.filter((item) =>
       item.scope_ref === scopeRef
-      && item.draft.command_kind === "capability_authorization"
+      && ["capability_authorization", "research_control"].includes(
+        item.draft.command_kind,
+      )
     ) ?? []
     : [];
   const broadAuthorizationHistory = scopeRef
