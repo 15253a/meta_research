@@ -9,6 +9,8 @@ from meta_research.acquisition import (
     NatureDownloaderAdapter,
 )
 from meta_research.auth import Authentication
+from meta_research.bundle_stage import BundleStageWorker
+from meta_research.bundle_skill import CodexBundleSkillAdapter, BundleSkillProvider
 from meta_research.database import Database
 from meta_research.deepfetch import (
     CodexDeepFetchAdapter,
@@ -48,6 +50,7 @@ from meta_research.owners.human_collaboration import (
 )
 from meta_research.owners.research_graph import (
     ResearchGraphInterface,
+    TargetCommitEvidenceAuthority,
     create_research_graph_interface,
     create_research_graph_receipt_verifier,
 )
@@ -67,6 +70,7 @@ from meta_research.quest_drafting import (
     NvidiaSmiProbe,
     ProposalDrafter,
 )
+from meta_research.target_commit_evidence import TargetCommitEvidenceCatalog
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,7 @@ class ProductionRuntime:
     projection: PublicProjection
     idea_stage: IdeaStageWorker
     plan_stage: PlanStageWorker
+    bundle_stage: BundleStageWorker
     deepfetch: FirstQuestionDeepFetchWorker
     experiment: ExperimentService
     _database: Database
@@ -138,6 +143,8 @@ def build_production_runtime(
     host_compute_probe: HostComputeProbe | None = None,
     idea_skill_provider: IdeaSkillProvider | None = None,
     plan_skill_provider: PlanSkillProvider | None = None,
+    bundle_skill_provider: BundleSkillProvider | None = None,
+    target_commit_evidence_authority: TargetCommitEvidenceAuthority | None = None,
     deepfetch_provider: DeepFetchProvider | None = None,
     acquisition_provider: AcquisitionProvider | None = None,
     experiment_provider: ExperimentProvider | None = None,
@@ -162,6 +169,9 @@ def build_production_runtime(
     plan_skill_provider = plan_skill_provider or CodexPlanSkillAdapter(
         data_root.root / "plan-skill-provider"
     )
+    bundle_skill_provider = bundle_skill_provider or CodexBundleSkillAdapter(
+        data_root.root / "bundle-skill-provider"
+    )
     acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
     experiment_provider = experiment_provider or BuiltinMicroExperimentProvider(
         data_root.run / "experiment-provider"
@@ -176,9 +186,7 @@ def build_production_runtime(
     stage_request_receipts = create_advancement_engine_receipt_verifier(
         database=database
     )
-    deepfetch_request_receipts = create_deepfetch_request_verifier(
-        database=database
-    )
+    deepfetch_request_receipts = create_deepfetch_request_verifier(database=database)
     attempt_receipts = create_agent_runtime_receipt_verifier(
         database=database,
         stage_request_verifier=stage_request_receipts,
@@ -203,9 +211,7 @@ def build_production_runtime(
         manual_confirmation_verifier=manual_question_confirmations,
         plan_content_verifier=research_memory_receipts,
     )
-    human_response_verifier.bind_quest_receipt_verifier(
-        research_graph_receipts
-    )
+    human_response_verifier.bind_quest_receipt_verifier(research_graph_receipts)
     agent_runtime = create_agent_runtime_interface(
         database=database,
         feed=feed,
@@ -213,6 +219,7 @@ def build_production_runtime(
         stage_request_verifier=stage_request_receipts,
         outcome_verifier=research_graph_receipts,
         formal_plan_verifier=research_graph_receipts,
+        target_graph_verifier=research_graph_receipts,
         deepfetch_request_verifier=deepfetch_request_receipts,
         acquisition_private_root=data_root.run / "acquisition-sessions",
         human_response_verifier=human_response_verifier,
@@ -252,6 +259,10 @@ def build_production_runtime(
         human_response_verifier=human_response_verifier,
         stage_request_verifier=stage_request_receipts,
     )
+    research_graph_receipts.bind_target_commit_evidence_authority(
+        target_commit_evidence_authority
+        or TargetCommitEvidenceCatalog(research_graph, research_memory)
+    )
     manual_question_confirmations.bind_research_memory_verifier(research_memory)
     agent_runtime.bind_research_material_resolver(research_memory)
     confirmation_verifier.bind_literature_snapshot_verifier(research_memory)
@@ -265,6 +276,9 @@ def build_production_runtime(
         run_completion_verifier=attempt_receipts,
         outcome_verifier=research_graph_receipts,
         formal_plan_verifier=research_graph_receipts,
+        accepted_formal_plan_verifier=research_graph_receipts,
+        target_graph_verifier=research_graph_receipts,
+        target_commit_verifier=research_graph_receipts,
         literature_snapshot_verifier=research_memory,
         human_response_verifier=human_response_verifier,
     )
@@ -315,6 +329,15 @@ def build_production_runtime(
         research_memory,
         experiment_provider,
     )
+    bundle_stage = BundleStageWorker(
+        feed,
+        owners.advancement_engine,
+        owners.agent_runtime,
+        owners.research_memory,
+        owners.research_graph,
+        bundle_skill_provider,
+        experiment,
+    )
     projection = PublicProjection(
         feed,
         data_root.objects,
@@ -325,6 +348,7 @@ def build_production_runtime(
         owners.human_collaboration,
         idea_stage=idea_stage,
         plan_stage=plan_stage,
+        bundle_stage=bundle_stage,
         experiment=experiment,
     )
     provider_lifecycles: list[object] = []
@@ -333,6 +357,7 @@ def build_production_runtime(
         intent_drafting_provider,
         idea_skill_provider,
         plan_skill_provider,
+        bundle_skill_provider,
         deepfetch_provider,
         acquisition_provider,
         experiment_provider,
@@ -349,6 +374,7 @@ def build_production_runtime(
         projection=projection,
         idea_stage=idea_stage,
         plan_stage=plan_stage,
+        bundle_stage=bundle_stage,
         deepfetch=deepfetch,
         experiment=experiment,
         _database=database,

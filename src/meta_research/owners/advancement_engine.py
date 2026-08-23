@@ -6,6 +6,10 @@ from typing import Protocol, cast
 
 from sqlalchemy import text
 
+from meta_research.bundle_contract import (
+    BundleContractError,
+    validate_bundle_context_pack,
+)
 from meta_research.database import Database
 from meta_research.feed import DurableFeed
 from meta_research.idea_contract import (
@@ -23,6 +27,8 @@ from meta_research.owners._sqlite_snapshot import (
     SQLiteOwnerSnapshot,
 )
 from meta_research.owners.common import (
+    AcceptedFormalPlanBinding,
+    AcceptedFormalPlanBindingVerifier,
     AcceptedIdeaSetBinding,
     AcceptedQuestionBinding,
     AcceptedQuestionBindingVerifier,
@@ -36,6 +42,8 @@ from meta_research.owners.common import (
     QuestReceiptVerifier,
     RootQuestionReceiptVerifier,
     RunCompletionReceiptVerifier,
+    TargetCommitReceiptVerifier,
+    TargetGraphReceiptVerifier,
     VerifiedStageRunRequestBinding,
     canonical_hash,
     canonical_json,
@@ -56,10 +64,14 @@ STAGE_REQUEST_RECEIPT_KIND = "stage_run_request"
 STAGE_COMMIT_RECEIPT_KIND = "stage_commit"
 IDEA_STAGE = "idea"
 PLAN_STAGE = "plan"
+BUNDLE_STAGE = "bundle"
 IDEA_SET_OUTCOME_KIND = "idea_set"
 NO_VIABLE_CANDIDATE_OUTCOME_KIND = "no_viable_candidate"
 FORMAL_PLAN_OUTCOME_KIND = "formal_plan"
+TARGET_GRAPH_OUTCOME_KIND = "target_graph"
+BUNDLE_SKIP_OUTCOME_KIND = "bundle_skip"
 COMPLETED_DISPOSITION = "completed"
+SKIPPED_DISPOSITION = "skipped"
 COMPLETABLE_IDEA_OUTCOME_KINDS = {
     IDEA_SET_OUTCOME_KIND,
     NO_VIABLE_CANDIDATE_OUTCOME_KIND,
@@ -85,6 +97,7 @@ class StageRunRequest:
     accepted_question: AcceptedQuestionBinding
     receipt: AcceptanceReceipt
     accepted_idea_set: AcceptedIdeaSetBinding | None = None
+    accepted_formal_plan: AcceptedFormalPlanBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -94,13 +107,14 @@ class StageCommit:
     cycle_ref: str
     stage: str
     epoch: int
-    run_ref: str
+    run_ref: str | None
     outcome_ref: str
     outcome_kind: str
     disposition: str
-    run_completion_receipt: AcceptanceReceipt
+    run_completion_receipt: AcceptanceReceipt | None
     outcome_receipt: AcceptanceReceipt
     receipt: AcceptanceReceipt
+    closure: dict[str, object] | None = None
 
 
 class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
@@ -149,6 +163,18 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
 
     def query_plan_stage_request(self, cycle_ref: str) -> StageRunRequest | None: ...
 
+    def ensure_bundle_stage_request(
+        self,
+        *,
+        cycle_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        accepted_formal_plan: AcceptedFormalPlanBinding,
+        context_pack: dict[str, object],
+        idempotency_key: str,
+    ) -> StageRunRequest: ...
+
+    def query_bundle_stage_request(self, cycle_ref: str) -> StageRunRequest | None: ...
+
     def commit_idea_stage(
         self,
         *,
@@ -175,6 +201,29 @@ class AdvancementEngineInterface(HumanRequestOwnerInterface, Protocol):
     ) -> StageCommit: ...
 
     def query_plan_stage_commit(self, request_ref: str) -> StageCommit | None: ...
+
+    def commit_bundle_stage(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        target_graph_ref: str,
+        target_commit_receipts: tuple[AcceptanceReceipt, ...],
+        run_completion_receipt: AcceptanceReceipt,
+        target_graph_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> StageCommit: ...
+
+    def skip_bundle_stage(
+        self,
+        *,
+        request_ref: str,
+        formal_plan_ref: str,
+        formal_plan_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> StageCommit: ...
+
+    def query_bundle_stage_commit(self, request_ref: str) -> StageCommit | None: ...
 
     def verify_stage_run_request(
         self,
@@ -218,6 +267,9 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         formal_plan_verifier: FormalPlanDecisionVerifier | None = None,
         literature_snapshot_verifier: LiteratureSnapshotVerifier | None = None,
         human_response_verifier: HumanResponseVerifier | None = None,
+        accepted_formal_plan_verifier: AcceptedFormalPlanBindingVerifier | None = None,
+        target_graph_verifier: TargetGraphReceiptVerifier | None = None,
+        target_commit_verifier: TargetCommitReceiptVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -228,6 +280,9 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         self._run_completion_verifier = run_completion_verifier
         self._outcome_verifier = outcome_verifier
         self._formal_plan_verifier = formal_plan_verifier
+        self._accepted_formal_plan_verifier = accepted_formal_plan_verifier
+        self._target_graph_verifier = target_graph_verifier
+        self._target_commit_verifier = target_commit_verifier
         self._literature_snapshot_verifier = literature_snapshot_verifier
         self._authorization_verifier = human_response_verifier
         self._configure_human_request_owner(
@@ -334,9 +389,9 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 {"initialization_id": initialization_id},
             ).first()
             if existing is not None:
-                if any(getattr(existing, key) != value for key, value in bindings.items()) or (
-                    existing.receipt_hash != _cycle_receipt_hash(existing)
-                ):
+                if any(
+                    getattr(existing, key) != value for key, value in bindings.items()
+                ) or (existing.receipt_hash != _cycle_receipt_hash(existing)):
                     raise OwnerConflict("cycle_activation_conflict")
                 return _activated_cycle(existing)
 
@@ -435,8 +490,7 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         with self._database.read() as connection:
             existing = connection.execute(
                 text(
-                    "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
-                    ":cycle_ref"
+                    "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = :cycle_ref"
                 ),
                 {"cycle_ref": cycle_ref},
             ).first()
@@ -521,18 +575,12 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                         version_refs=tuple(sorted(evidence_refs)),
                         expected_reference_revision=reference_revision,
                     )
-                    guidance_bindings = context_pack.get(
-                        "active_guidance_bindings"
-                    )
+                    guidance_bindings = context_pack.get("active_guidance_bindings")
                     if not isinstance(guidance_bindings, list):
-                        raise OwnerConflict(
-                            "idea_context_guidance_bindings_invalid"
-                        )
+                        raise OwnerConflict("idea_context_guidance_bindings_invalid")
                     self._authorization_verifier.verify_guidance_snapshot(
                         scope_ref=f"quest:{accepted_question.quest_ref}",
-                        bindings=cast(
-                            list[dict[str, object]], guidance_bindings
-                        ),
+                        bindings=cast(list[dict[str, object]], guidance_bindings),
                     )
                     request_ref = new_ref("stage_request")
                     context_pack_ref = new_ref("context_pack")
@@ -842,6 +890,185 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             return None
         return self._stage_request_from_row(row)
 
+    def ensure_bundle_stage_request(
+        self,
+        *,
+        cycle_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        accepted_formal_plan: AcceptedFormalPlanBinding,
+        context_pack: dict[str, object],
+        idempotency_key: str,
+    ) -> StageRunRequest:
+        """Freeze the exact accepted FormalPlan closure consumed by Bundle."""
+
+        _validate_idempotency_key(idempotency_key)
+        context_pack_json = canonical_json(context_pack)
+        context_pack_hash = canonical_hash(context_pack)
+        epoch = 1
+        command_kind = "ensure_bundle_stage_request"
+        request_input = {
+            "command": command_kind,
+            "cycle_ref": cycle_ref,
+            "stage": BUNDLE_STAGE,
+            "epoch": epoch,
+            "accepted_question": accepted_question.as_dict(),
+            "accepted_formal_plan": accepted_formal_plan.as_dict(),
+            "context_pack_hash": context_pack_hash,
+        }
+        request_hash = canonical_hash(request_input)
+        replay_ref = _query_ae_command(
+            self._database, idempotency_key, command_kind, request_hash
+        )
+        if replay_ref is not None:
+            return self._query_stage_request_ref(replay_ref)
+        try:
+            validate_bundle_context_pack(
+                context_pack,
+                cycle_ref=cycle_ref,
+                accepted_question_binding=accepted_question.as_dict(),
+                accepted_formal_plan_binding=accepted_formal_plan.as_dict(),
+            )
+        except BundleContractError as error:
+            raise OwnerConflict(str(error)) from error
+        self._verify_cycle_question(cycle_ref, accepted_question)
+        self._verify_bundle_formal_plan(cycle_ref, accepted_formal_plan)
+
+        with self._database.write() as connection:
+            replay_ref = _ae_command_replay(
+                connection, idempotency_key, command_kind, request_hash
+            )
+            if replay_ref is not None:
+                result_ref = replay_ref
+            else:
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                        ":cycle_ref AND stage = 'bundle'"
+                    ),
+                    {"cycle_ref": cycle_ref},
+                ).first()
+                if existing is not None:
+                    if existing.request_hash != request_hash:
+                        raise OwnerConflict("stage_run_request_conflict")
+                    result_ref = existing.request_ref
+                    _record_ae_command(
+                        connection,
+                        idempotency_key,
+                        command_kind,
+                        request_hash,
+                        result_ref,
+                    )
+                else:
+                    request_ref = new_ref("stage_request")
+                    context_pack_ref = new_ref("context_pack")
+                    receipt_ref = new_ref("ae_stage_request_receipt")
+                    bindings = {
+                        **_question_binding_columns(accepted_question),
+                        "cycle_ref": cycle_ref,
+                        "stage": BUNDLE_STAGE,
+                        "epoch": epoch,
+                        "context_pack_ref": context_pack_ref,
+                        "context_pack_hash": context_pack_hash,
+                    }
+                    receipt_hash = _receipt_hash(
+                        STAGE_REQUEST_RECEIPT_KIND, request_ref, bindings
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO ae_stage_run_requests (request_ref, "
+                            "cycle_ref, stage, epoch, initialization_id, quest_ref, "
+                            "question_ref, content_ref, content_hash, schema_ref, "
+                            "content_receipt_ref, content_receipt_hash, "
+                            "question_receipt_ref, question_receipt_hash, "
+                            "context_pack_ref, context_pack_json, context_pack_hash, "
+                            "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                            "created_at) VALUES (:request_ref, :cycle_ref, :stage, "
+                            ":epoch, :initialization_id, :quest_ref, :question_ref, "
+                            ":content_ref, :content_hash, :schema_ref, "
+                            ":content_receipt_ref, :content_receipt_hash, "
+                            ":question_receipt_ref, :question_receipt_hash, "
+                            ":context_pack_ref, :context_pack_json, "
+                            ":context_pack_hash, :idempotency_key, :request_hash, "
+                            ":receipt_ref, :receipt_hash, :created_at)"
+                        ),
+                        {
+                            **bindings,
+                            "request_ref": request_ref,
+                            "context_pack_json": context_pack_json,
+                            "idempotency_key": idempotency_key,
+                            "request_hash": request_hash,
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "created_at": time.time(),
+                        },
+                    )
+                    _record_ae_command(
+                        connection,
+                        idempotency_key,
+                        command_kind,
+                        request_hash,
+                        request_ref,
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE advancement_engine_state SET revision = "
+                            "revision + 1, stage_request_count = "
+                            "stage_request_count + 1 WHERE singleton = 'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "advancement_engine.stage_run_requested",
+                        {
+                            "request_ref": request_ref,
+                            "cycle_ref": cycle_ref,
+                            "stage": BUNDLE_STAGE,
+                            "epoch": epoch,
+                            "context_pack_ref": context_pack_ref,
+                            "context_pack_hash": context_pack_hash,
+                            "formal_plan_ref": accepted_formal_plan.formal_plan_ref,
+                            "receipt_ref": receipt_ref,
+                        },
+                    )
+                    result_ref = request_ref
+        return self._query_stage_request_ref(result_ref)
+
+    def query_bundle_stage_request(self, cycle_ref: str) -> StageRunRequest | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE cycle_ref = "
+                    ":cycle_ref AND stage = 'bundle'"
+                ),
+                {"cycle_ref": cycle_ref},
+            ).first()
+        return None if row is None else self._stage_request_from_row(row)
+
+    def _verify_bundle_formal_plan(
+        self, cycle_ref: str, binding: AcceptedFormalPlanBinding
+    ) -> None:
+        if self._accepted_formal_plan_verifier is None:
+            raise OwnerConflict("bundle_formal_plan_verifier_unavailable")
+        self._accepted_formal_plan_verifier.verify_accepted_formal_plan_binding(binding)
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_commits WHERE commit_ref = :commit_ref "
+                    "AND stage = 'plan'"
+                ),
+                {"commit_ref": binding.stage_commit_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("bundle_formal_plan_stage_commit_invalid")
+        commit = self._stage_commit_from_row(row)
+        if (
+            commit.cycle_ref != cycle_ref
+            or commit.outcome_ref != binding.formal_plan_ref
+            or commit.outcome_receipt != binding.formal_plan_receipt
+            or commit.receipt != binding.stage_commit_receipt
+        ):
+            raise OwnerConflict("bundle_formal_plan_stage_commit_invalid")
+
     def _query_stage_request_ref(self, request_ref: str) -> StageRunRequest:
         with self._database.read() as connection:
             row = connection.execute(
@@ -895,6 +1122,24 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 require_current=False,
                 require_complete=False,
             )
+        elif (
+            requested.stage == BUNDLE_STAGE
+            and requested.accepted_formal_plan is not None
+        ):
+            try:
+                validate_bundle_context_pack(
+                    requested.context_pack,
+                    cycle_ref=requested.cycle_ref,
+                    accepted_question_binding=requested.accepted_question.as_dict(),
+                    accepted_formal_plan_binding=(
+                        requested.accepted_formal_plan.as_dict()
+                    ),
+                )
+            except BundleContractError as error:
+                raise OwnerConflict(str(error)) from error
+            self._verify_bundle_formal_plan(
+                requested.cycle_ref, requested.accepted_formal_plan
+            )
         else:
             raise OwnerConflict("stage_run_request_invalid")
         self._stage_request_verifier.verify_stage_run_request(
@@ -917,9 +1162,7 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         self._outcome_verifier.verify_accepted_idea_set_binding(binding)
         with self._database.read() as connection:
             row = connection.execute(
-                text(
-                    "SELECT * FROM ae_stage_commits WHERE commit_ref = :commit_ref"
-                ),
+                text("SELECT * FROM ae_stage_commits WHERE commit_ref = :commit_ref"),
                 {"commit_ref": binding.stage_commit_ref},
             ).first()
         if row is None:
@@ -1104,8 +1347,7 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             if replay_ref is not None:
                 replay = connection.execute(
                     text(
-                        "SELECT * FROM ae_stage_commits WHERE commit_ref = "
-                        ":commit_ref"
+                        "SELECT * FROM ae_stage_commits WHERE commit_ref = :commit_ref"
                     ),
                     {"commit_ref": replay_ref},
                 ).first()
@@ -1145,7 +1387,9 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 "outcome_receipt_ref": outcome_receipt.receipt_ref,
                 "outcome_receipt_hash": outcome_receipt.payload_hash,
             }
-            receipt_hash = _receipt_hash(STAGE_COMMIT_RECEIPT_KIND, commit_ref, bindings)
+            receipt_hash = _receipt_hash(
+                STAGE_COMMIT_RECEIPT_KIND, commit_ref, bindings
+            )
             connection.execute(
                 text(
                     "INSERT INTO ae_stage_commits (commit_ref, request_ref, "
@@ -1250,10 +1494,7 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
         request = self._query_stage_request_by_ref(request_ref)
         if request.stage != PLAN_STAGE:
             raise OwnerConflict("plan_stage_request_invalid")
-        if (
-            self._run_completion_verifier is None
-            or self._formal_plan_verifier is None
-        ):
+        if self._run_completion_verifier is None or self._formal_plan_verifier is None:
             raise OwnerConflict("plan_stage_verifier_unavailable")
         self._run_completion_verifier.verify_run_completion_receipt(
             request_ref=request_ref,
@@ -1279,8 +1520,7 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             if replay_ref is not None:
                 replay = connection.execute(
                     text(
-                        "SELECT * FROM ae_stage_commits WHERE commit_ref = "
-                        ":commit_ref"
+                        "SELECT * FROM ae_stage_commits WHERE commit_ref = :commit_ref"
                     ),
                     {"commit_ref": replay_ref},
                 ).first()
@@ -1396,11 +1636,281 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
             return None
         return self._stage_commit_from_row(row)
 
+    def commit_bundle_stage(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        target_graph_ref: str,
+        target_commit_receipts: tuple[AcceptanceReceipt, ...],
+        run_completion_receipt: AcceptanceReceipt,
+        target_graph_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> StageCommit:
+        request = self._query_stage_request_by_ref(request_ref)
+        if request.stage != BUNDLE_STAGE or request.accepted_formal_plan is None:
+            raise OwnerConflict("bundle_stage_request_invalid")
+        if (
+            self._run_completion_verifier is None
+            or self._target_graph_verifier is None
+            or self._target_commit_verifier is None
+        ):
+            raise OwnerConflict("bundle_stage_verifier_unavailable")
+        self._run_completion_verifier.verify_run_completion_receipt(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            attempt_ref=None,
+            outcome_ref=target_graph_ref,
+            receipt=run_completion_receipt,
+        )
+        self._target_graph_verifier.verify_target_graph_receipt(
+            request_ref=request_ref,
+            run_ref=run_ref,
+            graph_ref=target_graph_ref,
+            receipt=target_graph_receipt,
+        )
+        self._target_commit_verifier.verify_target_commit_set(
+            graph_ref=target_graph_ref, receipts=target_commit_receipts
+        )
+        closure = {
+            "schema_ref": "meta-research/bundle-stage-closure/v1",
+            "formal_plan_ref": request.accepted_formal_plan.formal_plan_ref,
+            "target_graph_ref": target_graph_ref,
+            "target_graph_receipt": target_graph_receipt.as_public_dict(),
+            "target_commit_refs": [
+                receipt.subject_ref for receipt in target_commit_receipts
+            ],
+            "target_commit_receipts": [
+                receipt.as_public_dict() for receipt in target_commit_receipts
+            ],
+        }
+        return self._commit_bundle_disposition(
+            request=request,
+            run_ref=run_ref,
+            outcome_ref=target_graph_ref,
+            outcome_kind=TARGET_GRAPH_OUTCOME_KIND,
+            disposition=COMPLETED_DISPOSITION,
+            run_completion_receipt=run_completion_receipt,
+            outcome_receipt=target_graph_receipt,
+            closure=closure,
+            idempotency_key=idempotency_key,
+            command_kind="commit_bundle_stage",
+        )
+
+    def skip_bundle_stage(
+        self,
+        *,
+        request_ref: str,
+        formal_plan_ref: str,
+        formal_plan_receipt: AcceptanceReceipt,
+        idempotency_key: str,
+    ) -> StageCommit:
+        request = self._query_stage_request_by_ref(request_ref)
+        accepted = request.accepted_formal_plan
+        if (
+            request.stage != BUNDLE_STAGE
+            or accepted is None
+            or accepted.formal_plan_ref != formal_plan_ref
+            or accepted.formal_plan_receipt != formal_plan_receipt
+            or accepted.plan_document.get("gap_set") != []
+            or accepted.plan_document.get("bundle_disposition")
+            != "no_new_experiment_required"
+        ):
+            raise OwnerConflict("bundle_skip_disposition_invalid")
+        self._verify_bundle_formal_plan(request.cycle_ref, accepted)
+        closure = {
+            "schema_ref": "meta-research/bundle-stage-closure/v1",
+            "formal_plan_ref": formal_plan_ref,
+            "bundle_run_ref": None,
+            "target_graph_ref": None,
+            "target_commit_refs": [],
+            "reason": {"code": "no_bundle_run_required"},
+        }
+        return self._commit_bundle_disposition(
+            request=request,
+            run_ref=None,
+            outcome_ref=formal_plan_ref,
+            outcome_kind=BUNDLE_SKIP_OUTCOME_KIND,
+            disposition=SKIPPED_DISPOSITION,
+            run_completion_receipt=None,
+            outcome_receipt=formal_plan_receipt,
+            closure=closure,
+            idempotency_key=idempotency_key,
+            command_kind="skip_bundle_stage",
+        )
+
+    def _commit_bundle_disposition(
+        self,
+        *,
+        request: StageRunRequest,
+        run_ref: str | None,
+        outcome_ref: str,
+        outcome_kind: str,
+        disposition: str,
+        run_completion_receipt: AcceptanceReceipt | None,
+        outcome_receipt: AcceptanceReceipt,
+        closure: dict[str, object],
+        idempotency_key: str,
+        command_kind: str,
+    ) -> StageCommit:
+        _validate_idempotency_key(idempotency_key)
+        closure_json = canonical_json(closure)
+        closure_hash = canonical_hash(closure)
+        command_input = {
+            "command": command_kind,
+            "request_ref": request.request_ref,
+            "run_ref": run_ref,
+            "outcome_ref": outcome_ref,
+            "outcome_kind": outcome_kind,
+            "disposition": disposition,
+            "run_completion_receipt": (
+                None
+                if run_completion_receipt is None
+                else run_completion_receipt.as_public_dict()
+            ),
+            "outcome_receipt": outcome_receipt.as_public_dict(),
+            "closure_hash": closure_hash,
+        }
+        command_hash = canonical_hash(command_input)
+        _query_ae_command(self._database, idempotency_key, command_kind, command_hash)
+        with self._database.write() as connection:
+            replay_ref = _ae_command_replay(
+                connection, idempotency_key, command_kind, command_hash
+            )
+            if replay_ref is not None:
+                existing = connection.execute(
+                    text(
+                        "SELECT * FROM ae_stage_commits WHERE commit_ref = :commit_ref"
+                    ),
+                    {"commit_ref": replay_ref},
+                ).first()
+                if existing is None:
+                    raise OwnerConflict("stage_command_result_missing")
+                return self._stage_commit_from_row(existing)
+            existing = connection.execute(
+                text("SELECT * FROM ae_stage_commits WHERE request_ref = :request_ref"),
+                {"request_ref": request.request_ref},
+            ).first()
+            if existing is not None:
+                if existing.request_hash != command_hash:
+                    raise OwnerConflict("stage_commit_conflict")
+                _record_ae_command(
+                    connection,
+                    idempotency_key,
+                    command_kind,
+                    command_hash,
+                    existing.commit_ref,
+                )
+                return self._stage_commit_from_row(existing)
+            commit_ref = new_ref("stage_commit")
+            receipt_ref = new_ref("ae_stage_commit_receipt")
+            bindings = {
+                "request_ref": request.request_ref,
+                "cycle_ref": request.cycle_ref,
+                "stage": BUNDLE_STAGE,
+                "epoch": request.epoch,
+                "run_ref": run_ref,
+                "outcome_ref": outcome_ref,
+                "outcome_kind": outcome_kind,
+                "disposition": disposition,
+                "run_completion_receipt_ref": (
+                    None
+                    if run_completion_receipt is None
+                    else run_completion_receipt.receipt_ref
+                ),
+                "run_completion_receipt_hash": (
+                    None
+                    if run_completion_receipt is None
+                    else run_completion_receipt.payload_hash
+                ),
+                "outcome_receipt_ref": outcome_receipt.receipt_ref,
+                "outcome_receipt_hash": outcome_receipt.payload_hash,
+                "closure_hash": closure_hash,
+            }
+            receipt_hash = _receipt_hash(
+                STAGE_COMMIT_RECEIPT_KIND, commit_ref, bindings
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO ae_stage_commits (commit_ref, request_ref, "
+                    "cycle_ref, stage, epoch, run_ref, outcome_ref, outcome_kind, "
+                    "disposition, run_completion_receipt_ref, "
+                    "run_completion_receipt_hash, outcome_receipt_ref, "
+                    "outcome_receipt_hash, closure_json, closure_hash, "
+                    "idempotency_key, request_hash, receipt_ref, receipt_hash, "
+                    "committed_at) VALUES (:commit_ref, :request_ref, :cycle_ref, "
+                    ":stage, :epoch, :run_ref, :outcome_ref, :outcome_kind, "
+                    ":disposition, :run_completion_receipt_ref, "
+                    ":run_completion_receipt_hash, :outcome_receipt_ref, "
+                    ":outcome_receipt_hash, :closure_json, :closure_hash, "
+                    ":idempotency_key, :request_hash, :receipt_ref, :receipt_hash, "
+                    ":committed_at)"
+                ),
+                {
+                    **bindings,
+                    "commit_ref": commit_ref,
+                    "closure_json": closure_json,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": command_hash,
+                    "receipt_ref": receipt_ref,
+                    "receipt_hash": receipt_hash,
+                    "committed_at": time.time(),
+                },
+            )
+            _record_ae_command(
+                connection,
+                idempotency_key,
+                command_kind,
+                command_hash,
+                commit_ref,
+            )
+            connection.execute(
+                text(
+                    "UPDATE advancement_engine_state SET revision = revision + 1, "
+                    "stage_commit_count = stage_commit_count + 1 WHERE "
+                    "singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "advancement_engine.stage_committed",
+                {
+                    "commit_ref": commit_ref,
+                    "request_ref": request.request_ref,
+                    "run_ref": run_ref,
+                    "outcome_ref": outcome_ref,
+                    "outcome_kind": outcome_kind,
+                    "disposition": disposition,
+                    "stage": BUNDLE_STAGE,
+                    "epoch": request.epoch,
+                    "receipt_ref": receipt_ref,
+                },
+            )
+        committed = self.query_bundle_stage_commit(request.request_ref)
+        if committed is None:
+            raise OwnerConflict("stage_commit_missing_after_commit")
+        return committed
+
+    def query_bundle_stage_commit(self, request_ref: str) -> StageCommit | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_commits WHERE request_ref = "
+                    ":request_ref AND stage = 'bundle'"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        return None if row is None else self._stage_commit_from_row(row)
+
     def _stage_commit_from_row(self, row) -> StageCommit:
         committed = _stage_commit(row)
         if row.receipt_hash != _stage_commit_receipt_hash(row):
             raise OwnerConflict("stage_commit_receipt_invalid")
-        if self._run_completion_verifier is not None:
+        if (
+            self._run_completion_verifier is not None
+            and committed.run_completion_receipt is not None
+            and row.run_ref is not None
+        ):
             self._run_completion_verifier.verify_run_completion_receipt(
                 request_ref=row.request_ref,
                 run_ref=row.run_ref,
@@ -1425,12 +1935,53 @@ class SQLiteAdvancementEngine(HumanRequestOwnerMixin):
                 formal_plan_ref=row.outcome_ref,
                 receipt=committed.outcome_receipt,
             )
+        elif row.stage == BUNDLE_STAGE:
+            if row.disposition == COMPLETED_DISPOSITION:
+                if (
+                    self._target_graph_verifier is None
+                    or self._target_commit_verifier is None
+                    or row.run_ref is None
+                    or committed.closure is None
+                ):
+                    raise OwnerConflict("bundle_stage_verifier_unavailable")
+                self._target_graph_verifier.verify_target_graph_receipt(
+                    request_ref=row.request_ref,
+                    run_ref=row.run_ref,
+                    graph_ref=row.outcome_ref,
+                    receipt=committed.outcome_receipt,
+                )
+                receipts_value = committed.closure.get("target_commit_receipts")
+                if not isinstance(receipts_value, list):
+                    raise OwnerConflict("bundle_stage_closure_invalid")
+                try:
+                    receipts = tuple(
+                        _receipt_from_public(value) for value in receipts_value
+                    )
+                except TypeError as error:
+                    raise OwnerConflict("bundle_stage_closure_invalid") from error
+                self._target_commit_verifier.verify_target_commit_set(
+                    graph_ref=row.outcome_ref, receipts=receipts
+                )
+            elif row.disposition == SKIPPED_DISPOSITION:
+                request = self._query_stage_request_by_ref(row.request_ref)
+                if (
+                    request.accepted_formal_plan is None
+                    or request.accepted_formal_plan.formal_plan_receipt
+                    != committed.outcome_receipt
+                    or request.accepted_formal_plan.formal_plan_ref != row.outcome_ref
+                ):
+                    raise OwnerConflict("bundle_skip_disposition_invalid")
+                self._verify_bundle_formal_plan(
+                    row.cycle_ref, request.accepted_formal_plan
+                )
         return committed
 
     def _query_stage_request_by_ref(self, request_ref: str) -> StageRunRequest:
         with self._database.read() as connection:
             row = connection.execute(
-                text("SELECT * FROM ae_stage_run_requests WHERE request_ref = :request_ref"),
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE request_ref = :request_ref"
+                ),
                 {"request_ref": request_ref},
             ).first()
         if row is None:
@@ -1618,6 +2169,66 @@ class SQLiteAdvancementEngineReceiptVerifier:
             receipt=requested.receipt,
         )
 
+    def verify_bundle_stage_request_binding(
+        self,
+        *,
+        request_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        accepted_formal_plan: AcceptedFormalPlanBinding,
+        context_pack_ref: str,
+    ) -> VerifiedStageRunRequestBinding:
+        requested = self.query_verified_bundle_stage_request(
+            request_ref=request_ref, context_pack_ref=context_pack_ref
+        )
+        if (
+            requested.accepted_question != accepted_question
+            or requested.accepted_formal_plan != accepted_formal_plan
+        ):
+            raise OwnerConflict("stage_run_request_binding_invalid")
+        return requested
+
+    def query_verified_bundle_stage_request(
+        self,
+        *,
+        request_ref: str,
+        context_pack_ref: str,
+    ) -> VerifiedStageRunRequestBinding:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT * FROM ae_stage_run_requests WHERE request_ref = "
+                    ":request_ref AND stage = 'bundle'"
+                ),
+                {"request_ref": request_ref},
+            ).first()
+        if row is None:
+            raise OwnerConflict("stage_run_request_receipt_invalid")
+        requested = _stage_request(row)
+        if (
+            requested.context_pack_ref != context_pack_ref
+            or requested.accepted_formal_plan is None
+        ):
+            raise OwnerConflict("stage_run_request_binding_invalid")
+        self.verify_stage_run_request(
+            request_ref=requested.request_ref,
+            cycle_ref=requested.cycle_ref,
+            epoch=requested.epoch,
+            context_pack_ref=requested.context_pack_ref,
+            context_pack_hash=requested.context_pack_hash,
+            receipt=requested.receipt,
+        )
+        return VerifiedStageRunRequestBinding(
+            request_ref=requested.request_ref,
+            cycle_ref=requested.cycle_ref,
+            epoch=requested.epoch,
+            accepted_question=requested.accepted_question,
+            accepted_formal_plan=requested.accepted_formal_plan,
+            context_pack_ref=requested.context_pack_ref,
+            context_pack_hash=requested.context_pack_hash,
+            context_pack=requested.context_pack,
+            receipt=requested.receipt,
+        )
+
 
 def _receipt_hash(kind: str, subject_ref: str, bindings: dict[str, object]) -> str:
     return canonical_hash(
@@ -1736,20 +2347,35 @@ def _verify_stage_request_integrity(row) -> dict[str, object]:
                 cycle_ref=row.cycle_ref,
                 accepted_question_binding=binding.as_dict(),
             )
+        elif row.stage == BUNDLE_STAGE:
+            formal_plan = _formal_plan_binding_from_context(context_pack)
+            validate_bundle_context_pack(
+                context_pack,
+                cycle_ref=row.cycle_ref,
+                accepted_question_binding=binding.as_dict(),
+                accepted_formal_plan_binding=formal_plan.as_dict(),
+            )
         else:
             raise OwnerConflict("stage_run_request_invalid")
-    except (IdeaContractError, PlanContractError) as error:
+    except (IdeaContractError, PlanContractError, BundleContractError) as error:
         raise OwnerConflict(str(error)) from error
     accepted_idea_set = (
         None
-        if row.stage == IDEA_STAGE
+        if row.stage != PLAN_STAGE
         else _idea_set_binding_from_context(context_pack)
     )
-    command = (
-        "ensure_idea_stage_request"
-        if row.stage == IDEA_STAGE
-        else "ensure_plan_stage_request"
+    accepted_formal_plan = (
+        _formal_plan_binding_from_context(context_pack)
+        if row.stage == BUNDLE_STAGE
+        else None
     )
+    command = {
+        IDEA_STAGE: "ensure_idea_stage_request",
+        PLAN_STAGE: "ensure_plan_stage_request",
+        BUNDLE_STAGE: "ensure_bundle_stage_request",
+    }.get(row.stage)
+    if command is None:
+        raise OwnerConflict("stage_run_request_invalid")
     expected_request_hash = canonical_hash(
         {
             "command": command,
@@ -1762,11 +2388,16 @@ def _verify_stage_request_integrity(row) -> dict[str, object]:
                 if accepted_idea_set is None
                 else {"accepted_idea_set": accepted_idea_set.as_dict()}
             ),
+            **(
+                {}
+                if accepted_formal_plan is None
+                else {"accepted_formal_plan": accepted_formal_plan.as_dict()}
+            ),
             "context_pack_hash": row.context_pack_hash,
         }
     )
     if (
-        row.stage not in {IDEA_STAGE, PLAN_STAGE}
+        row.stage not in {IDEA_STAGE, PLAN_STAGE, BUNDLE_STAGE}
         or int(row.epoch) < 1
         or canonical_hash(context_pack) != row.context_pack_hash
         or canonical_json(context_pack) != row.context_pack_json
@@ -1797,8 +2428,13 @@ def _stage_request(row) -> StageRunRequest:
         ),
         accepted_idea_set=(
             None
-            if row.stage == IDEA_STAGE
+            if row.stage != PLAN_STAGE
             else _idea_set_binding_from_context(context_pack)
+        ),
+        accepted_formal_plan=(
+            _formal_plan_binding_from_context(context_pack)
+            if row.stage == BUNDLE_STAGE
+            else None
         ),
     )
 
@@ -1832,6 +2468,31 @@ def _idea_set_binding_from_context(
         raise OwnerConflict("plan_idea_set_binding_invalid") from error
 
 
+def _formal_plan_binding_from_context(
+    context_pack: dict[str, object],
+) -> AcceptedFormalPlanBinding:
+    value = context_pack.get("accepted_formal_plan_binding")
+    if not isinstance(value, dict):
+        raise OwnerConflict("bundle_formal_plan_binding_invalid")
+    try:
+        plan_document = value["plan_document"]
+        if not isinstance(plan_document, dict):
+            raise TypeError("plan_document")
+        return AcceptedFormalPlanBinding(
+            formal_plan_ref=str(value["formal_plan_ref"]),
+            content_ref=str(value["content_ref"]),
+            plan_document_hash=str(value["plan_document_hash"]),
+            answer_contract_hash=str(value["answer_contract_hash"]),
+            content_receipt=_receipt_from_public(value["content_receipt"]),
+            formal_plan_receipt=_receipt_from_public(value["formal_plan_receipt"]),
+            stage_commit_ref=str(value["stage_commit_ref"]),
+            stage_commit_receipt=_receipt_from_public(value["stage_commit_receipt"]),
+            plan_document=plan_document,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise OwnerConflict("bundle_formal_plan_binding_invalid") from error
+
+
 def _receipt_from_public(value: object) -> AcceptanceReceipt:
     if not isinstance(value, dict) or value.get("status") != "accepted":
         raise TypeError("receipt")
@@ -1845,7 +2506,7 @@ def _receipt_from_public(value: object) -> AcceptanceReceipt:
 
 
 def _stage_commit_bindings(row) -> dict[str, object]:
-    return {
+    bindings = {
         "request_ref": row.request_ref,
         "cycle_ref": row.cycle_ref,
         "stage": row.stage,
@@ -1859,6 +2520,9 @@ def _stage_commit_bindings(row) -> dict[str, object]:
         "outcome_receipt_ref": row.outcome_receipt_ref,
         "outcome_receipt_hash": row.outcome_receipt_hash,
     }
+    if row.stage == BUNDLE_STAGE:
+        bindings["closure_hash"] = row.closure_hash
+    return bindings
 
 
 def _stage_commit_receipt_hash(row) -> str:
@@ -1869,10 +2533,33 @@ def _stage_commit_receipt_hash(row) -> str:
 
 def _stage_commit(row) -> StageCommit:
     valid_kind = (
-        row.stage == IDEA_STAGE and row.outcome_kind in COMPLETABLE_IDEA_OUTCOME_KINDS
-    ) or (row.stage == PLAN_STAGE and row.outcome_kind == FORMAL_PLAN_OUTCOME_KIND)
-    if not valid_kind or row.disposition != COMPLETED_DISPOSITION:
+        (row.stage == IDEA_STAGE and row.outcome_kind in COMPLETABLE_IDEA_OUTCOME_KINDS)
+        or (row.stage == PLAN_STAGE and row.outcome_kind == FORMAL_PLAN_OUTCOME_KIND)
+        or (
+            row.stage == BUNDLE_STAGE
+            and (
+                row.outcome_kind == TARGET_GRAPH_OUTCOME_KIND
+                and row.disposition == COMPLETED_DISPOSITION
+                or row.outcome_kind == BUNDLE_SKIP_OUTCOME_KIND
+                and row.disposition == SKIPPED_DISPOSITION
+            )
+        )
+    )
+    if not valid_kind or (
+        row.stage != BUNDLE_STAGE and row.disposition != COMPLETED_DISPOSITION
+    ):
         raise OwnerConflict("stage_commit_disposition_invalid")
+    closure = None
+    if row.stage == BUNDLE_STAGE:
+        try:
+            closure = decoded_object(row.closure_json)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("bundle_stage_closure_invalid") from error
+        if (
+            canonical_json(closure) != row.closure_json
+            or canonical_hash(closure) != row.closure_hash
+        ):
+            raise OwnerConflict("bundle_stage_closure_invalid")
     return StageCommit(
         commit_ref=row.commit_ref,
         request_ref=row.request_ref,
@@ -1883,12 +2570,16 @@ def _stage_commit(row) -> StageCommit:
         outcome_ref=row.outcome_ref,
         outcome_kind=row.outcome_kind,
         disposition=row.disposition,
-        run_completion_receipt=AcceptanceReceipt(
-            issuer="agent_runtime",
-            kind="run_execution_completed",
-            receipt_ref=row.run_completion_receipt_ref,
-            subject_ref=row.run_ref,
-            payload_hash=row.run_completion_receipt_hash,
+        run_completion_receipt=(
+            None
+            if row.run_completion_receipt_ref is None
+            else AcceptanceReceipt(
+                issuer="agent_runtime",
+                kind="run_execution_completed",
+                receipt_ref=row.run_completion_receipt_ref,
+                subject_ref=row.run_ref,
+                payload_hash=row.run_completion_receipt_hash,
+            )
         ),
         outcome_receipt=AcceptanceReceipt(
             issuer="research_graph",
@@ -1896,6 +2587,8 @@ def _stage_commit(row) -> StageCommit:
                 "idea_outcome_accepted"
                 if row.stage == IDEA_STAGE
                 else "formal_plan_accepted"
+                if row.stage == PLAN_STAGE or row.disposition == SKIPPED_DISPOSITION
+                else "target_graph_accepted"
             ),
             receipt_ref=row.outcome_receipt_ref,
             subject_ref=row.outcome_ref,
@@ -1908,6 +2601,7 @@ def _stage_commit(row) -> StageCommit:
             subject_ref=row.commit_ref,
             payload_hash=row.receipt_hash,
         ),
+        closure=closure,
     )
 
 
@@ -1919,8 +2613,7 @@ def _ae_command_replay(
 ) -> str | None:
     row = connection.execute(
         text(
-            "SELECT * FROM ae_stage_commands WHERE idempotency_key = "
-            ":idempotency_key"
+            "SELECT * FROM ae_stage_commands WHERE idempotency_key = :idempotency_key"
         ),
         {"idempotency_key": idempotency_key},
     ).first()
@@ -1992,6 +2685,9 @@ def create_advancement_engine_interface(
     formal_plan_verifier: FormalPlanDecisionVerifier | None = None,
     literature_snapshot_verifier: LiteratureSnapshotVerifier | None = None,
     human_response_verifier: HumanResponseVerifier | None = None,
+    accepted_formal_plan_verifier: AcceptedFormalPlanBindingVerifier | None = None,
+    target_graph_verifier: TargetGraphReceiptVerifier | None = None,
+    target_commit_verifier: TargetCommitReceiptVerifier | None = None,
 ) -> AdvancementEngineInterface:
     return SQLiteAdvancementEngine(
         database,
@@ -2005,4 +2701,7 @@ def create_advancement_engine_interface(
         formal_plan_verifier,
         literature_snapshot_verifier,
         human_response_verifier,
+        accepted_formal_plan_verifier,
+        target_graph_verifier,
+        target_commit_verifier,
     )

@@ -99,6 +99,7 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
             "projection",
             "idea_stage_worker",
             "plan_stage_worker",
+            "bundle_stage_worker",
             "research_asset_intake_worker",
             "research_asset_verification_worker",
             "quest_drafting_worker",
@@ -153,9 +154,13 @@ def test_clean_start_exposes_only_authenticated_production_snapshots(
         refreshed.post(
             "/auth/bootstrap",
             headers={"Origin": base_url},
-            json={"token": str(run_cli_json(
-                "session", "--data-root", str(data_root), "--json"
-            )["bootstrap_token"])},
+            json={
+                "token": str(
+                    run_cli_json("session", "--data-root", str(data_root), "--json")[
+                        "bootstrap_token"
+                    ]
+                )
+            },
         ).raise_for_status()
         assert refreshed.get("/api/v1/snapshot").status_code == 200
 
@@ -191,9 +196,7 @@ def test_sse_resumes_by_revision_and_directs_gaps_to_the_snapshot(
             "event: projection.updated"
         )
         event_ids = [
-            int(line.removeprefix("id: "))
-            for line in lines
-            if line.startswith("id: ")
+            int(line.removeprefix("id: ")) for line in lines if line.startswith("id: ")
         ]
         assert len(event_ids) == 1
         assert event_ids[0] >= 1
