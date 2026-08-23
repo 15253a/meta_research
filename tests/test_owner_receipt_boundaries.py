@@ -507,6 +507,16 @@ def test_lost_rm_custody_preserves_the_accepted_empty_quest_and_blocks_downstrea
             "evidence_role_count": 0,
             "source_material_role_count": 0,
             "human_request_count": 0,
+            "experiment_baseline_count": 0,
+            "experiment_variant_count": 0,
+            "evaluation_protocol_count": 0,
+            "protocol_version_count": 0,
+            "evaluation_count": 0,
+            "variant_run_count": 0,
+            "evaluation_attempt_count": 0,
+            "experiment_input_binding_count": 0,
+            "experiment_asset_role_count": 0,
+            "formal_measurement_count": 0,
         }
         assert runtime.owners.advancement_engine.query_snapshot().facts[
             "foreground_cycle_count"

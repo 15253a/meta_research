@@ -40,6 +40,16 @@ from meta_research.deepfetch import (
     validate_runtime_binding,
 )
 from meta_research.feed import DurableFeed
+from meta_research.experiment_contract import (
+    EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS,
+    EXPERIMENT_RETRYABLE_PROVIDER_FAILURES,
+    AcceptedExperimentInputBinding,
+    ExperimentDomainAdmission,
+    ExperimentProviderResult,
+    ExperimentResultComponentManifest,
+    ExperimentRuntimeBinding,
+    experiment_result_component_manifest,
+)
 from meta_research.idea_contract import (
     IDEA_REVIEW_SCHEMA_REF,
     IDEA_REVIEW_SCHEMA_V1_REF,
@@ -54,9 +64,11 @@ from meta_research.owners._sqlite_snapshot import (
     SQLiteOwnerSnapshot,
 )
 from meta_research.owners.common import (
+    AcceptedAssetBinding,
     AcceptanceReceipt,
     DeepFetchRunRequestVerifier,
     FormalPlanDecisionVerifier,
+    ExperimentInputBindingVerifier,
     IdeaOutcomeDecisionVerifier,
     OwnerConflict,
     OwnerSnapshot,
@@ -72,6 +84,11 @@ from meta_research.owners.human_requests import (
     HumanResponseVerifier,
 )
 from meta_research.owners.advancement_engine import StageRunRequest
+from meta_research.provider_supervisor import (
+    ProviderSupervisorError,
+    TypedExecutionFence,
+    provider_operation_ref as typed_provider_operation_ref,
+)
 from meta_research.quest_drafting import (
     HostComputeDevice,
     HostComputeProbe,
@@ -103,6 +120,7 @@ PLAN_RUNTIME_BINDING_SCHEMA = "meta-research/plan-runtime-binding/v1"
 PLAN_ATTEMPT_EXECUTION_RECEIPT_KIND = "plan_attempt_execution"
 RUN_COMPLETION_RECEIPT_KIND = "run_execution_completed"
 DEEPFETCH_EXECUTION_RECEIPT_KIND = "deepfetch_execution_completed"
+EXPERIMENT_EXECUTION_RECEIPT_KIND = "experiment_execution_completed"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 DEEPFETCH_RECONCILIATION_BASE_SECONDS = 0.5
 DEEPFETCH_RECONCILIATION_MAX_SECONDS = 60.0
@@ -322,6 +340,88 @@ class DeepFetchRun:
         }
 
 
+@dataclass(frozen=True)
+class ExperimentRun:
+    run_ref: str
+    execution_request_ref: str
+    provider_operation_ref: str
+    provider_operation_generation: int
+    provider_operation_retry_permitted: bool
+    evaluation_attempt_ref: str
+    variant_run_ref: str
+    status: str
+    attempt_ref: str
+    attempt_generation: int
+    root_session_ref: str
+    fence_ref: str
+    runtime_binding: ExperimentRuntimeBinding
+    runtime_binding_hash: str
+    result: dict[str, object] | None
+    result_hash: str | None
+    execution_receipt: AcceptanceReceipt | None
+    failure_code: str | None
+    events: tuple[dict[str, object], ...] = ()
+    event_count: int = 0
+    stdout_event_count: int = 0
+
+    def as_public_dict(self, *, include_events: bool = False) -> dict[str, object]:
+        value: dict[str, object] = {
+            "run_ref": self.run_ref,
+            "execution_request_ref": self.execution_request_ref,
+            "provider_operation_ref": self.provider_operation_ref,
+            "provider_operation_generation": self.provider_operation_generation,
+            "status": self.status,
+            "attempt_ref": self.attempt_ref,
+            "attempt_generation": self.attempt_generation,
+            "root_session_ref": self.root_session_ref,
+            "fence_ref": self.fence_ref,
+            "fence_status": "current",
+            "runtime_binding_hash": self.runtime_binding_hash,
+            "execution_receipt": (
+                None
+                if self.execution_receipt is None
+                else self.execution_receipt.as_public_dict()
+            ),
+            "failure": (
+                None if self.failure_code is None else {"code": self.failure_code}
+            ),
+            "provider_operation_retry_permitted": (
+                self.provider_operation_retry_permitted
+            ),
+        }
+        stdout_events = tuple(
+            event for event in self.events if event["kind"] == "stdout"
+        )
+        projected_stdout_count = len(stdout_events)
+        dropped_stdout_count = max(
+            0, self.stdout_event_count - projected_stdout_count
+        )
+        capture_truncated = self.failure_code in {
+            "experiment_provider_output_limit",
+            "experiment_provider_output_invalid",
+        }
+        value["stdout_observation"] = {
+            "mode": "raw_stdout",
+            "complete": self.status == "executed",
+            "total": self.stdout_event_count,
+            "count": projected_stdout_count,
+            "truncated": capture_truncated or dropped_stdout_count > 0,
+            "dropped": dropped_stdout_count,
+            "first_sequence": (
+                None if not stdout_events else stdout_events[0]["sequence"]
+            ),
+            "last_sequence": (
+                None if not stdout_events else stdout_events[-1]["sequence"]
+            ),
+            "observed_at": (
+                None if not stdout_events else stdout_events[-1]["observed_at"]
+            ),
+        }
+        if include_events:
+            value["events"] = list(self.events)
+        return value
+
+
 class HostComputeObservationReader(Protocol):
     """Read-only AR seam for already persisted host observations."""
 
@@ -529,6 +629,89 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
 
     def verify_deepfetch_execution_receipt(self, **values) -> None: ...
 
+    def verify_experiment_execution_receipt(
+        self, **values
+    ) -> ExperimentResultComponentManifest: ...
+
+    def admit_experiment(
+        self,
+        *,
+        admission: ExperimentDomainAdmission,
+        runtime_binding: ExperimentRuntimeBinding,
+        require_idle: bool = False,
+    ) -> ExperimentRun: ...
+
+    def query_experiment_run(
+        self, evaluation_attempt_ref: str
+    ) -> ExperimentRun | None: ...
+
+    def query_active_experiment_run(self) -> ExperimentRun | None: ...
+
+    def query_experiment_events(
+        self,
+        evaluation_attempt_ref: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 256,
+    ) -> tuple[dict[str, object], ...]: ...
+
+    def claim_next_experiment(self) -> ExperimentRun | None: ...
+
+    def record_experiment_observation(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        kind: str,
+        payload: dict[str, object],
+        observed_at: float,
+    ) -> None: ...
+
+    def complete_experiment_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        result: dict[str, object],
+    ) -> ExperimentRun: ...
+
+    def fail_experiment_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+    ) -> ExperimentRun: ...
+
+    def retry_experiment_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+    ) -> ExperimentRun: ...
+
+    def defer_experiment_reconciliation(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        reason_code: str,
+    ) -> ExperimentRun: ...
+
+    def replace_experiment_execution(
+        self, evaluation_attempt_ref: str
+    ) -> ExperimentRun: ...
+
+    def query_executed_experiment_runs(
+        self, *, offset: int = 0, limit: int = 64
+    ) -> tuple[ExperimentRun, ...]: ...
+
 
 _SNAPSHOT = OwnerSnapshotQuery(
     owner=AR_OWNER,
@@ -538,7 +721,10 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "deepfetch_completed_run_count, deepfetch_attempt_count, "
         "deepfetch_session_count, acquisition_session_count, "
         "acquisition_request_count, acquisition_active_slot_count, "
-        "human_request_count "
+        "human_request_count, "
+        "experiment_run_count, experiment_completed_run_count, "
+        "experiment_attempt_count, experiment_session_count, "
+        "active_experiment_run_count "
         "FROM agent_runtime_state WHERE singleton = 'owner'"
     ),
     fact_names=(
@@ -555,6 +741,11 @@ _SNAPSHOT = OwnerSnapshotQuery(
         "acquisition_request_count",
         "acquisition_active_slot_count",
         "human_request_count",
+        "experiment_run_count",
+        "experiment_completed_run_count",
+        "experiment_attempt_count",
+        "experiment_session_count",
+        "active_experiment_run_count",
     ),
 )
 
@@ -596,6 +787,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
         acquisition_private_root: Path | None = None,
         human_response_verifier: HumanResponseVerifier | None = None,
+        experiment_binding_verifier: ExperimentInputBindingVerifier | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -606,6 +798,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self._deepfetch_request_verifier = deepfetch_request_verifier
         self._authorization_verifier = human_response_verifier
         self._research_material_resolver: ResearchMaterialResolver | None = None
+        self._experiment_binding_verifier = experiment_binding_verifier
         self._acquisition_private_root = (
             acquisition_private_root
             if acquisition_private_root is not None
@@ -625,6 +818,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self._recover_interrupted_acquisition()
         self._recover_acquisition_human_requests()
         self._recover_interrupted_deepfetch()
+        self._recover_interrupted_experiments()
 
     def bind_research_material_resolver(
         self, resolver: ResearchMaterialResolver
@@ -3312,8 +3506,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 reconciliation_attempt_count = int(run.reconciliation_attempt_count)
                 if was_failed and bool(run.provider_operation_retry_permitted):
                     provider_operation_generation += 1
-                    provider_operation_ref = (
-                        f"{run_ref}:deepfetch:{provider_operation_generation}"
+                    provider_operation_ref = typed_provider_operation_ref(
+                        run_ref,
+                        "deepfetch",
+                        provider_operation_generation,
                     )
                     reconciliation_attempt_count = 0
                 session = connection.execute(
@@ -3331,7 +3527,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             else:
                 run_ref = new_ref("deepfetch_run")
                 provider_operation_generation = 1
-                provider_operation_ref = f"{run_ref}:deepfetch:1"
+                provider_operation_ref = typed_provider_operation_ref(
+                    run_ref, "deepfetch", 1
+                )
                 reconciliation_attempt_count = 0
                 root_session_ref = new_ref("deepfetch_session")
                 native_session_ref = None
@@ -3377,6 +3575,16 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 )
             attempt_ref = new_ref("deepfetch_attempt")
             fence_ref = new_ref("deepfetch_fence")
+            try:
+                TypedExecutionFence(
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    generation=generation,
+                    root_session_ref=root_session_ref,
+                    fence_ref=fence_ref,
+                ).validate()
+            except ProviderSupervisorError as error:
+                raise OwnerConflict("deepfetch_attempt_identity_invalid") from error
             connection.execute(
                 text(
                     "INSERT INTO ar_deepfetch_attempts (attempt_ref, run_ref, "
@@ -5411,6 +5619,1264 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             return
         raise OwnerConflict("stage_run_integrity_invalid")
 
+    def _recover_interrupted_experiments(self) -> None:
+        """Fence interrupted local providers and retain the same domain identities."""
+
+        with self._database.write() as connection:
+            candidates = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_runs WHERE status IN "
+                    "('admitted', 'running') "
+                    "ORDER BY run_ref"
+                )
+            ).all()
+            runs = []
+            reconciliation_pending = {
+                "status": "reconciliation_pending",
+                "reason": {
+                    "code": "experiment_provider_reconciliation_pending"
+                },
+            }
+            for run in candidates:
+                if run.status == "running":
+                    runs.append(run)
+                    continue
+                last_status = connection.execute(
+                    text(
+                        "SELECT payload_json FROM ar_experiment_events WHERE "
+                        "run_ref = :run_ref AND attempt_ref = :attempt_ref AND "
+                        "kind = 'status' ORDER BY sequence DESC LIMIT 1"
+                    ),
+                    {
+                        "run_ref": run.run_ref,
+                        "attempt_ref": run.attempt_ref,
+                    },
+                ).first()
+                if (
+                    last_status is not None
+                    and last_status.payload_json
+                    == canonical_json(reconciliation_pending)
+                ):
+                    # The previous daemon already delivered part of this
+                    # provider ledger to the current Attempt. Its in-memory
+                    # cursor is gone, so fence the partial Attempt before a new
+                    # provider instance reconciles the same durable operation.
+                    runs.append(run)
+            for run in runs:
+                now = time.time()
+                retired_reason = (
+                    "daemon_restart"
+                    if run.status == "running"
+                    else "daemon_restart_reconciliation"
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_experiment_attempts SET status = 'retired', "
+                        "retired_reason = :retired_reason, completed_at = :now "
+                        "WHERE attempt_ref = :attempt_ref AND status = :status"
+                    ),
+                    {
+                        "now": now,
+                        "attempt_ref": run.attempt_ref,
+                        "retired_reason": retired_reason,
+                        "status": run.status,
+                    },
+                )
+                attempt_ref, fence_ref = _insert_replacement_attempt(
+                    connection,
+                    run.run_ref,
+                    int(run.attempt_generation) + 1,
+                    run.root_session_ref,
+                    now,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_experiment_runs SET status = 'admitted', "
+                        "attempt_ref = :attempt_ref, attempt_generation = "
+                        "attempt_generation + 1, fence_ref = :fence_ref, updated_at = "
+                        ":now WHERE run_ref = :run_ref AND status = :status"
+                    ),
+                    {
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "now": now,
+                        "run_ref": run.run_ref,
+                        "status": run.status,
+                    },
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.experiment_recovered",
+                    {
+                        "run_ref": run.run_ref,
+                        "retired_attempt_ref": run.attempt_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                    },
+                )
+            if runs:
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1, "
+                        "experiment_attempt_count = experiment_attempt_count + "
+                        ":count WHERE singleton = 'owner'"
+                    ),
+                    {"count": len(runs)},
+                )
+
+    def admit_experiment(
+        self,
+        *,
+        admission: ExperimentDomainAdmission,
+        runtime_binding: ExperimentRuntimeBinding,
+        require_idle: bool = False,
+    ) -> ExperimentRun:
+        if self._experiment_binding_verifier is None:
+            raise OwnerConflict("experiment_binding_verifier_unavailable")
+        runtime_document = runtime_binding.as_dict()
+        runtime_hash = canonical_hash(runtime_document)
+        identities = admission.identities
+        execution_request = admission.execution_request
+        variant_binding = admission.variant_run_binding
+        measurement_binding = admission.evaluation_attempt_binding
+        if (
+            execution_request.implementation_binding.content_hash
+            != runtime_binding.runner_bundle_hash
+        ):
+            raise OwnerConflict("experiment_implementation_binding_mismatch")
+        if (
+            variant_binding.subject_kind != "variant_run"
+            or variant_binding.subject_ref != identities.variant_run_ref
+            or measurement_binding.subject_kind != "evaluation_attempt"
+            or measurement_binding.subject_ref != identities.evaluation_attempt_ref
+            or variant_binding.binding_ref == measurement_binding.binding_ref
+            or variant_binding.receipt.receipt_ref
+            == measurement_binding.receipt.receipt_ref
+        ):
+            raise OwnerConflict("experiment_input_binding_invalid")
+        self._experiment_binding_verifier.verify_experiment_execution_request(
+            execution_request_ref=execution_request.execution_request_ref,
+            quest_ref=execution_request.quest_ref,
+            definition_hash=execution_request.definition_hash,
+            implementation_binding=execution_request.implementation_binding,
+            receipt=execution_request.receipt,
+        )
+        for binding in (variant_binding, measurement_binding):
+            self._experiment_binding_verifier.verify_experiment_input_binding(
+                binding_ref=binding.binding_ref,
+                subject_kind=binding.subject_kind,
+                subject_ref=binding.subject_ref,
+                inputs_hash=binding.inputs_hash,
+                receipt=binding.receipt,
+            )
+
+        with self._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision WHERE "
+                    "singleton = 'owner'"
+                )
+            )
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_runs WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref"
+                ),
+                {"evaluation_attempt_ref": identities.evaluation_attempt_ref},
+            ).first()
+            if existing is not None:
+                expected = (
+                    existing.execution_request_ref
+                    == execution_request.execution_request_ref
+                    and existing.quest_ref == execution_request.quest_ref
+                    and existing.definition_hash == execution_request.definition_hash
+                    and existing.execution_request_receipt_ref
+                    == execution_request.receipt.receipt_ref
+                    and existing.execution_request_receipt_hash
+                    == execution_request.receipt.payload_hash
+                    and existing.implementation_asset_ref
+                    == execution_request.implementation_binding.asset_ref
+                    and existing.implementation_version_ref
+                    == execution_request.implementation_binding.version_ref
+                    and existing.implementation_content_hash
+                    == execution_request.implementation_binding.content_hash
+                    and existing.implementation_manifest_hash
+                    == execution_request.implementation_binding.manifest_hash
+                    and existing.implementation_receipt_ref
+                    == execution_request.implementation_binding.receipt.receipt_ref
+                    and existing.implementation_receipt_hash
+                    == execution_request.implementation_binding.receipt.payload_hash
+                    and existing.variant_run_ref == identities.variant_run_ref
+                    and existing.variant_input_binding_ref
+                    == variant_binding.binding_ref
+                    and existing.variant_input_hash == variant_binding.inputs_hash
+                    and existing.variant_input_receipt_ref
+                    == variant_binding.receipt.receipt_ref
+                    and existing.variant_input_receipt_hash
+                    == variant_binding.receipt.payload_hash
+                    and existing.measurement_input_binding_ref
+                    == measurement_binding.binding_ref
+                    and existing.measurement_input_hash
+                    == measurement_binding.inputs_hash
+                    and existing.measurement_input_receipt_ref
+                    == measurement_binding.receipt.receipt_ref
+                    and existing.measurement_input_receipt_hash
+                    == measurement_binding.receipt.payload_hash
+                    and existing.runtime_binding_json == canonical_json(runtime_document)
+                    and existing.runtime_binding_hash == runtime_hash
+                )
+                if not expected:
+                    raise OwnerConflict("experiment_admission_conflict")
+            else:
+                if require_idle:
+                    active = connection.execute(
+                        text(
+                            "SELECT run_ref FROM ar_experiment_runs WHERE "
+                            "status IN ('admitted', 'running') ORDER BY "
+                            "created_at, run_ref LIMIT 1"
+                        )
+                    ).first()
+                    if active is not None:
+                        raise OwnerConflict("experiment_execution_busy")
+                run_ref = new_ref("experiment_run")
+                attempt_ref = new_ref("experiment_execution_attempt")
+                root_session_ref = new_ref("experiment_root_session")
+                fence_ref = new_ref("experiment_fence")
+                try:
+                    provider_operation = typed_provider_operation_ref(
+                        run_ref, "experiment", 1
+                    )
+                except ProviderSupervisorError as error:
+                    raise OwnerConflict(
+                        "experiment_provider_operation_invalid"
+                    ) from error
+                now = time.time()
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_experiment_runs (run_ref, "
+                        "execution_request_ref, quest_ref, definition_hash, "
+                        "execution_request_receipt_ref, "
+                        "execution_request_receipt_hash, "
+                        "implementation_asset_ref, implementation_version_ref, "
+                        "implementation_content_hash, "
+                        "implementation_manifest_hash, "
+                        "implementation_receipt_ref, "
+                        "implementation_receipt_hash, evaluation_attempt_ref, "
+                        "variant_run_ref, "
+                        "variant_input_binding_ref, variant_input_hash, "
+                        "variant_input_receipt_ref, variant_input_receipt_hash, "
+                        "measurement_input_binding_ref, measurement_input_hash, "
+                        "measurement_input_receipt_ref, "
+                        "measurement_input_receipt_hash, status, "
+                        "provider_operation_ref, provider_operation_generation, "
+                        "provider_operation_retry_permitted, attempt_ref, "
+                        "attempt_generation, root_session_ref, fence_ref, "
+                        "runtime_binding_json, runtime_binding_hash, created_at, "
+                        "updated_at) VALUES (:run_ref, :execution_request_ref, "
+                        ":quest_ref, :definition_hash, "
+                        ":execution_request_receipt_ref, "
+                        ":execution_request_receipt_hash, "
+                        ":implementation_asset_ref, :implementation_version_ref, "
+                        ":implementation_content_hash, "
+                        ":implementation_manifest_hash, "
+                        ":implementation_receipt_ref, "
+                        ":implementation_receipt_hash, "
+                        ":evaluation_attempt_ref, "
+                        ":variant_run_ref, :variant_input_binding_ref, "
+                        ":variant_input_hash, :variant_input_receipt_ref, "
+                        ":variant_input_receipt_hash, "
+                        ":measurement_input_binding_ref, :measurement_input_hash, "
+                        ":measurement_input_receipt_ref, "
+                        ":measurement_input_receipt_hash, 'admitted', "
+                        ":provider_operation_ref, 1, 0, :attempt_ref, 1, "
+                        ":root_session_ref, :fence_ref, "
+                        ":runtime_binding_json, :runtime_binding_hash, :now, :now)"
+                    ),
+                    {
+                        "run_ref": run_ref,
+                        "execution_request_ref": (
+                            execution_request.execution_request_ref
+                        ),
+                        "quest_ref": execution_request.quest_ref,
+                        "definition_hash": execution_request.definition_hash,
+                        "execution_request_receipt_ref": (
+                            execution_request.receipt.receipt_ref
+                        ),
+                        "execution_request_receipt_hash": (
+                            execution_request.receipt.payload_hash
+                        ),
+                        "implementation_asset_ref": (
+                            execution_request.implementation_binding.asset_ref
+                        ),
+                        "implementation_version_ref": (
+                            execution_request.implementation_binding.version_ref
+                        ),
+                        "implementation_content_hash": (
+                            execution_request.implementation_binding.content_hash
+                        ),
+                        "implementation_manifest_hash": (
+                            execution_request.implementation_binding.manifest_hash
+                        ),
+                        "implementation_receipt_ref": (
+                            execution_request.implementation_binding.receipt.receipt_ref
+                        ),
+                        "implementation_receipt_hash": (
+                            execution_request.implementation_binding.receipt.payload_hash
+                        ),
+                        "evaluation_attempt_ref": identities.evaluation_attempt_ref,
+                        "variant_run_ref": identities.variant_run_ref,
+                        "variant_input_binding_ref": variant_binding.binding_ref,
+                        "variant_input_hash": variant_binding.inputs_hash,
+                        "variant_input_receipt_ref": (
+                            variant_binding.receipt.receipt_ref
+                        ),
+                        "variant_input_receipt_hash": (
+                            variant_binding.receipt.payload_hash
+                        ),
+                        "measurement_input_binding_ref": (
+                            measurement_binding.binding_ref
+                        ),
+                        "measurement_input_hash": measurement_binding.inputs_hash,
+                        "measurement_input_receipt_ref": (
+                            measurement_binding.receipt.receipt_ref
+                        ),
+                        "measurement_input_receipt_hash": (
+                            measurement_binding.receipt.payload_hash
+                        ),
+                        "attempt_ref": attempt_ref,
+                        "provider_operation_ref": provider_operation,
+                        "root_session_ref": root_session_ref,
+                        "fence_ref": fence_ref,
+                        "runtime_binding_json": canonical_json(runtime_document),
+                        "runtime_binding_hash": runtime_hash,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_experiment_sessions (root_session_ref, "
+                        "run_ref, status, created_at, updated_at) VALUES "
+                        "(:root_session_ref, :run_ref, 'open', :now, :now)"
+                    ),
+                    {
+                        "root_session_ref": root_session_ref,
+                        "run_ref": run_ref,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO ar_experiment_attempts (attempt_ref, run_ref, "
+                        "generation, root_session_ref, fence_ref, status, "
+                        "created_at) VALUES (:attempt_ref, :run_ref, 1, "
+                        ":root_session_ref, :fence_ref, 'admitted', :created_at)"
+                    ),
+                    {
+                        "attempt_ref": attempt_ref,
+                        "run_ref": run_ref,
+                        "root_session_ref": root_session_ref,
+                        "fence_ref": fence_ref,
+                        "created_at": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1, "
+                        "experiment_run_count = experiment_run_count + 1, "
+                        "experiment_attempt_count = experiment_attempt_count + 1, "
+                        "experiment_session_count = experiment_session_count + 1, "
+                        "active_experiment_run_count = active_experiment_run_count + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.experiment_admitted",
+                    {
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "variant_run_ref": identities.variant_run_ref,
+                        "evaluation_attempt_ref": identities.evaluation_attempt_ref,
+                    },
+                )
+        admitted = self.query_experiment_run(identities.evaluation_attempt_ref)
+        if admitted is None:
+            raise OwnerConflict("experiment_run_missing_after_admission")
+        return admitted
+
+    def query_experiment_run(
+        self, evaluation_attempt_ref: str
+    ) -> ExperimentRun | None:
+        with self._database.read() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_runs WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref"
+                ),
+                {"evaluation_attempt_ref": evaluation_attempt_ref},
+            ).first()
+            if run is None:
+                return None
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_attempts WHERE attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {"attempt_ref": run.attempt_ref},
+            ).first()
+            session = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_sessions WHERE "
+                    "root_session_ref = :root_session_ref"
+                ),
+                {"root_session_ref": run.root_session_ref},
+            ).first()
+            event_summary = connection.execute(
+                text(
+                    "SELECT COUNT(*) AS event_count, COALESCE(SUM(CASE WHEN "
+                    "kind = 'stdout' THEN 1 ELSE 0 END), 0) AS "
+                    "stdout_event_count FROM ar_experiment_events WHERE "
+                    "run_ref = :run_ref AND attempt_ref = :attempt_ref"
+                ),
+                {"run_ref": run.run_ref, "attempt_ref": run.attempt_ref},
+            ).one()
+            tail_rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_events WHERE run_ref = "
+                    ":run_ref AND attempt_ref = :attempt_ref ORDER BY sequence "
+                    "DESC LIMIT 256"
+                ),
+                {"run_ref": run.run_ref, "attempt_ref": run.attempt_ref},
+            ).all()
+        try:
+            TypedExecutionFence(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                generation=int(run.attempt_generation),
+                root_session_ref=run.root_session_ref,
+                fence_ref=run.fence_ref,
+            ).validate()
+            expected_operation_ref = typed_provider_operation_ref(
+                run.run_ref,
+                "experiment",
+                int(run.provider_operation_generation),
+            )
+        except (ProviderSupervisorError, TypeError, ValueError) as error:
+            raise OwnerConflict("experiment_run_integrity_invalid") from error
+        if attempt is None or session is None or (
+            attempt.run_ref != run.run_ref
+            or int(attempt.generation) != int(run.attempt_generation)
+            or attempt.root_session_ref != run.root_session_ref
+            or attempt.fence_ref != run.fence_ref
+            or attempt.status != run.status
+            or session.run_ref != run.run_ref
+            or session.root_session_ref != run.root_session_ref
+            or session.status
+            != ("closed" if run.status in {"executed", "failed"} else "open")
+            or expected_operation_ref != run.provider_operation_ref
+        ):
+            raise OwnerConflict("experiment_run_integrity_invalid")
+        runtime_binding = _experiment_runtime_binding(run.runtime_binding_json)
+        if (
+            canonical_hash(runtime_binding.as_dict()) != run.runtime_binding_hash
+            or run.implementation_content_hash
+            != runtime_binding.runner_bundle_hash
+        ):
+            raise OwnerConflict("experiment_run_integrity_invalid")
+        if self._experiment_binding_verifier is not None:
+            self._experiment_binding_verifier.verify_experiment_execution_request(
+                execution_request_ref=run.execution_request_ref,
+                quest_ref=run.quest_ref,
+                definition_hash=run.definition_hash,
+                implementation_binding=AcceptedAssetBinding(
+                    asset_ref=run.implementation_asset_ref,
+                    version_ref=run.implementation_version_ref,
+                    content_hash=run.implementation_content_hash,
+                    manifest_hash=run.implementation_manifest_hash,
+                    receipt=AcceptanceReceipt(
+                        issuer="research_memory",
+                        kind="asset_acceptance",
+                        receipt_ref=run.implementation_receipt_ref,
+                        subject_ref=run.implementation_version_ref,
+                        payload_hash=run.implementation_receipt_hash,
+                    ),
+                ),
+                receipt=AcceptanceReceipt(
+                    issuer="research_graph",
+                    kind="experiment_execution_request_acceptance",
+                    receipt_ref=run.execution_request_receipt_ref,
+                    subject_ref=run.execution_request_ref,
+                    payload_hash=run.execution_request_receipt_hash,
+                ),
+            )
+            for subject_kind, subject_ref, prefix in (
+                ("variant_run", run.variant_run_ref, "variant"),
+                (
+                    "evaluation_attempt",
+                    run.evaluation_attempt_ref,
+                    "measurement",
+                ),
+            ):
+                self._experiment_binding_verifier.verify_experiment_input_binding(
+                    binding_ref=getattr(run, f"{prefix}_input_binding_ref"),
+                    subject_kind=subject_kind,
+                    subject_ref=subject_ref,
+                    inputs_hash=getattr(run, f"{prefix}_input_hash"),
+                    receipt=AcceptanceReceipt(
+                        issuer="research_graph",
+                        kind="experiment_input_binding_acceptance",
+                        receipt_ref=getattr(run, f"{prefix}_input_receipt_ref"),
+                        subject_ref=getattr(run, f"{prefix}_input_binding_ref"),
+                        payload_hash=getattr(run, f"{prefix}_input_receipt_hash"),
+                    ),
+                )
+        result: dict[str, object] | None = None
+        if run.result_json is not None:
+            try:
+                result = decoded_object(run.result_json)
+            except (TypeError, ValueError) as error:
+                raise OwnerConflict("experiment_run_integrity_invalid") from error
+            if (
+                canonical_json(result) != run.result_json
+                or canonical_hash(result) != run.result_hash
+            ):
+                raise OwnerConflict("experiment_run_integrity_invalid")
+        receipt = None
+        if attempt.receipt_ref is not None:
+            receipt = AcceptanceReceipt(
+                issuer=AR_OWNER,
+                kind=EXPERIMENT_EXECUTION_RECEIPT_KIND,
+                receipt_ref=attempt.receipt_ref,
+                subject_ref=run.attempt_ref,
+                payload_hash=attempt.receipt_hash,
+            )
+        event_values = tuple(
+            _experiment_event(row) for row in reversed(tail_rows)
+        )
+        return ExperimentRun(
+            run_ref=run.run_ref,
+            execution_request_ref=run.execution_request_ref,
+            provider_operation_ref=run.provider_operation_ref,
+            provider_operation_generation=int(
+                run.provider_operation_generation
+            ),
+            provider_operation_retry_permitted=bool(
+                run.provider_operation_retry_permitted
+            ),
+            evaluation_attempt_ref=run.evaluation_attempt_ref,
+            variant_run_ref=run.variant_run_ref,
+            status=run.status,
+            attempt_ref=run.attempt_ref,
+            attempt_generation=int(run.attempt_generation),
+            root_session_ref=run.root_session_ref,
+            fence_ref=run.fence_ref,
+            runtime_binding=runtime_binding,
+            runtime_binding_hash=run.runtime_binding_hash,
+            result=result,
+            result_hash=run.result_hash,
+            execution_receipt=receipt,
+            failure_code=run.failure_code,
+            events=event_values,
+            event_count=int(event_summary.event_count),
+            stdout_event_count=int(event_summary.stdout_event_count),
+        )
+
+    def query_experiment_events(
+        self,
+        evaluation_attempt_ref: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 256,
+    ) -> tuple[dict[str, object], ...]:
+        if isinstance(after_sequence, bool) or after_sequence < 0:
+            raise OwnerConflict("experiment_event_cursor_invalid")
+        if isinstance(limit, bool) or not 1 <= limit <= 512:
+            raise OwnerConflict("experiment_event_limit_invalid")
+        with self._database.read() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT run_ref, attempt_ref FROM ar_experiment_runs WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref"
+                ),
+                {"evaluation_attempt_ref": evaluation_attempt_ref},
+            ).first()
+            if run is None:
+                raise OwnerConflict("experiment_run_not_found")
+            rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_events WHERE run_ref = "
+                    ":run_ref AND attempt_ref = :attempt_ref AND sequence > "
+                    ":after_sequence ORDER BY sequence LIMIT :limit"
+                ),
+                {
+                    "run_ref": run.run_ref,
+                    "attempt_ref": run.attempt_ref,
+                    "after_sequence": after_sequence,
+                    "limit": limit,
+                },
+            ).all()
+        return tuple(_experiment_event(row) for row in rows)
+
+    def query_active_experiment_run(self) -> ExperimentRun | None:
+        with self._database.read() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT evaluation_attempt_ref FROM ar_experiment_runs "
+                    "WHERE status IN ('admitted', 'running') ORDER BY "
+                    "created_at, run_ref LIMIT 1"
+                )
+            ).first()
+        if row is None:
+            return None
+        active = self.query_experiment_run(row.evaluation_attempt_ref)
+        if active is None:
+            raise OwnerConflict("experiment_run_integrity_invalid")
+        return active
+
+    def query_executed_experiment_runs(
+        self, *, offset: int = 0, limit: int = 64
+    ) -> tuple[ExperimentRun, ...]:
+        if isinstance(offset, bool) or offset < 0:
+            raise OwnerConflict("experiment_run_cursor_invalid")
+        if isinstance(limit, bool) or not 1 <= limit <= 256:
+            raise OwnerConflict("experiment_run_limit_invalid")
+        with self._database.read() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT evaluation_attempt_ref FROM ar_experiment_runs WHERE "
+                    "status = 'executed' ORDER BY completed_at, run_ref "
+                    "LIMIT :limit OFFSET :offset"
+                ),
+                {"limit": limit, "offset": offset},
+            ).all()
+        runs = tuple(
+            self.query_experiment_run(row.evaluation_attempt_ref) for row in rows
+        )
+        if any(run is None for run in runs):
+            raise OwnerConflict("experiment_run_integrity_invalid")
+        return tuple(run for run in runs if run is not None)
+
+    def claim_next_experiment(self) -> ExperimentRun | None:
+        with self._database.write() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_runs WHERE status = 'admitted' "
+                    "ORDER BY updated_at, run_ref LIMIT 1"
+                )
+            ).first()
+            if run is None:
+                return None
+            now = time.time()
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET status = 'running', "
+                    "updated_at = :now WHERE run_ref = :run_ref AND status = "
+                    "'admitted'"
+                ),
+                {"run_ref": run.run_ref, "now": now},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_attempts SET status = 'running', "
+                    "started_at = :now WHERE attempt_ref = :attempt_ref AND "
+                    "status = 'admitted'"
+                ),
+                {"attempt_ref": run.attempt_ref, "now": now},
+            )
+            sequence = _append_experiment_event(
+                connection,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                kind="status",
+                payload={"status": "running"},
+                observed_at=now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.experiment_started",
+                {
+                    "run_ref": run.run_ref,
+                    "attempt_ref": run.attempt_ref,
+                    "fence_ref": run.fence_ref,
+                },
+            )
+            evaluation_attempt_ref = run.evaluation_attempt_ref
+        return self.query_experiment_run(evaluation_attempt_ref)
+
+    def record_experiment_observation(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        kind: str,
+        payload: dict[str, object],
+        observed_at: float,
+    ) -> None:
+        if kind not in {"stdout", "telemetry"}:
+            raise OwnerConflict("experiment_observation_kind_invalid")
+        if not math.isfinite(observed_at) or type(payload) is not dict:
+            raise OwnerConflict("experiment_observation_invalid")
+        try:
+            payload_json = canonical_json(payload)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("experiment_observation_invalid") from error
+        if len(payload_json.encode("utf-8")) > 64 * 1024:
+            raise OwnerConflict("experiment_observation_invalid")
+        if kind == "stdout":
+            line = payload.get("line")
+            if (
+                not isinstance(line, str)
+                or "\n" in line
+                or "\r" in line
+                or len(line) > 4000
+            ):
+                raise OwnerConflict("experiment_stdout_invalid")
+        with self._database.write() as connection:
+            run = _current_experiment_execution(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                required_status="running",
+            )
+            sequence = _append_experiment_event(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                kind=kind,
+                payload=payload,
+                observed_at=observed_at,
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET updated_at = :updated_at "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {"updated_at": observed_at, "run_ref": run.run_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.experiment_observed",
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "sequence": sequence,
+                    "kind": kind,
+                },
+            )
+
+    def complete_experiment_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        result: dict[str, object],
+    ) -> ExperimentRun:
+        if type(result) is not dict:
+            raise OwnerConflict("experiment_result_invalid")
+        try:
+            result_json = canonical_json(result)
+            result_hash = canonical_hash(result)
+        except (TypeError, ValueError) as error:
+            raise OwnerConflict("experiment_result_invalid") from error
+        if len(result_json.encode("utf-8")) > 16 * 1024 * 1024:
+            raise OwnerConflict("experiment_result_invalid")
+        with self._database.write() as connection:
+            existing = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            if existing is not None and existing.status == "executed":
+                if (
+                    existing.attempt_ref != attempt_ref
+                    or existing.fence_ref != fence_ref
+                    or existing.result_hash != result_hash
+                    or existing.result_json != result_json
+                ):
+                    raise OwnerConflict("experiment_completion_conflict")
+                evaluation_attempt_ref = existing.evaluation_attempt_ref
+            else:
+                run = _current_experiment_execution(
+                    connection,
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                    required_status="running",
+                )
+                provider_result = ExperimentProviderResult.from_document(result)
+                now = time.time()
+                receipt_ref = new_ref("ar_experiment_execution_receipt")
+                _append_experiment_event(
+                    connection,
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                    kind="status",
+                    payload={"status": "executed", "result_hash": result_hash},
+                    observed_at=now,
+                )
+                event_rows = connection.execute(
+                    text(
+                        "SELECT * FROM ar_experiment_events WHERE run_ref = "
+                        ":run_ref AND attempt_ref = :attempt_ref ORDER BY sequence"
+                    ),
+                    {"run_ref": run_ref, "attempt_ref": attempt_ref},
+                ).all()
+                result_manifest = experiment_result_component_manifest(
+                    provider_result,
+                    tuple(_experiment_event(row) for row in event_rows),
+                )
+                receipt_hash = _experiment_execution_receipt_hash(
+                    run,
+                    attempt_ref,
+                    fence_ref,
+                    result_hash,
+                    result_manifest,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_experiment_attempts SET status = 'executed', "
+                        "receipt_ref = :receipt_ref, receipt_hash = :receipt_hash, "
+                        "completed_at = :now WHERE attempt_ref = :attempt_ref"
+                    ),
+                    {
+                        "receipt_ref": receipt_ref,
+                        "receipt_hash": receipt_hash,
+                        "now": now,
+                        "attempt_ref": attempt_ref,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_experiment_runs SET status = 'executed', "
+                        "result_json = :result_json, result_hash = :result_hash, "
+                        "provider_operation_retry_permitted = 0, updated_at = "
+                        ":now, completed_at = :now WHERE run_ref = :run_ref"
+                    ),
+                    {
+                        "result_json": result_json,
+                        "result_hash": result_hash,
+                        "now": now,
+                        "run_ref": run_ref,
+                    },
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_experiment_sessions SET status = 'closed', "
+                        "updated_at = :now WHERE root_session_ref = "
+                        ":root_session_ref"
+                    ),
+                    {"root_session_ref": run.root_session_ref, "now": now},
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1, "
+                        "experiment_completed_run_count = "
+                        "experiment_completed_run_count + 1, "
+                        "active_experiment_run_count = "
+                        "active_experiment_run_count - 1 WHERE singleton = "
+                        "'owner' AND active_experiment_run_count > 0"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.experiment_completed",
+                    {
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "evaluation_attempt_ref": run.evaluation_attempt_ref,
+                        "receipt_ref": receipt_ref,
+                    },
+                )
+                evaluation_attempt_ref = run.evaluation_attempt_ref
+        completed = self.query_experiment_run(evaluation_attempt_ref)
+        if completed is None:
+            raise OwnerConflict("experiment_completion_missing_after_commit")
+        return completed
+
+    def retry_experiment_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+    ) -> ExperimentRun:
+        if failure_code not in EXPERIMENT_RETRYABLE_PROVIDER_FAILURES:
+            raise OwnerConflict("experiment_retry_not_permitted")
+        with self._database.write() as connection:
+            run = _current_experiment_execution(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                required_status="running",
+            )
+            operation_generation = int(run.provider_operation_generation) + 1
+            if (
+                operation_generation
+                > EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS
+            ):
+                raise OwnerConflict("experiment_retry_limit_reached")
+            try:
+                operation_ref = typed_provider_operation_ref(
+                    run_ref,
+                    "experiment",
+                    operation_generation,
+                )
+            except ProviderSupervisorError as error:
+                raise OwnerConflict(
+                    "experiment_provider_operation_invalid"
+                ) from error
+            now = time.time()
+            _append_experiment_event(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                kind="status",
+                payload={"status": "failed", "reason": {"code": failure_code}},
+                observed_at=now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_attempts SET status = 'failed', "
+                    "retired_reason = :failure_code, completed_at = :now WHERE "
+                    "attempt_ref = :attempt_ref"
+                ),
+                {
+                    "failure_code": failure_code,
+                    "now": now,
+                    "attempt_ref": attempt_ref,
+                },
+            )
+            replacement_ref, replacement_fence = _insert_replacement_attempt(
+                connection,
+                run_ref,
+                int(run.attempt_generation) + 1,
+                run.root_session_ref,
+                now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET status = 'admitted', "
+                    "provider_operation_ref = :provider_operation_ref, "
+                    "provider_operation_generation = :operation_generation, "
+                    "provider_operation_retry_permitted = 0, attempt_ref = "
+                    ":attempt_ref, attempt_generation = attempt_generation + 1, "
+                    "fence_ref = :fence_ref, failure_code = NULL, completed_at = "
+                    "NULL, updated_at = :now WHERE run_ref = :run_ref"
+                ),
+                {
+                    "provider_operation_ref": operation_ref,
+                    "operation_generation": operation_generation,
+                    "attempt_ref": replacement_ref,
+                    "fence_ref": replacement_fence,
+                    "now": now,
+                    "run_ref": run_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "experiment_attempt_count = experiment_attempt_count + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.experiment_replaced",
+                {
+                    "run_ref": run_ref,
+                    "retired_attempt_ref": attempt_ref,
+                    "attempt_ref": replacement_ref,
+                    "attempt_generation": int(run.attempt_generation) + 1,
+                    "root_session_ref": run.root_session_ref,
+                    "fence_ref": replacement_fence,
+                    "provider_operation_ref": operation_ref,
+                    "provider_operation_generation": operation_generation,
+                    "failure": {"code": failure_code},
+                },
+            )
+            evaluation_attempt_ref = run.evaluation_attempt_ref
+        replacement = self.query_experiment_run(evaluation_attempt_ref)
+        if replacement is None:
+            raise OwnerConflict("experiment_replacement_missing_after_commit")
+        return replacement
+
+    def fail_experiment_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+    ) -> ExperimentRun:
+        if not failure_code or len(failure_code) > 96:
+            raise OwnerConflict("experiment_failure_code_invalid")
+        with self._database.write() as connection:
+            run = _current_experiment_execution(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                required_status="running",
+            )
+            now = time.time()
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_attempts SET status = 'failed', "
+                    "retired_reason = :failure_code, completed_at = :now WHERE "
+                    "attempt_ref = :attempt_ref"
+                ),
+                {
+                    "failure_code": failure_code,
+                    "now": now,
+                    "attempt_ref": attempt_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET status = 'failed', "
+                    "provider_operation_retry_permitted = 0, failure_code = "
+                    ":failure_code, updated_at = :now, completed_at = :now "
+                    "WHERE run_ref = :run_ref"
+                ),
+                {"failure_code": failure_code, "now": now, "run_ref": run_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_sessions SET status = 'closed', "
+                    "updated_at = :now WHERE root_session_ref = "
+                    ":root_session_ref"
+                ),
+                {"root_session_ref": run.root_session_ref, "now": now},
+            )
+            _append_experiment_event(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                kind="status",
+                payload={"status": "failed", "reason": {"code": failure_code}},
+                observed_at=now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "active_experiment_run_count = active_experiment_run_count - 1 "
+                    "WHERE singleton = 'owner' AND active_experiment_run_count > 0"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.experiment_failed",
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "failure": {"code": failure_code},
+                },
+            )
+            evaluation_attempt_ref = run.evaluation_attempt_ref
+        failed = self.query_experiment_run(evaluation_attempt_ref)
+        if failed is None:
+            raise OwnerConflict("experiment_failure_missing_after_commit")
+        return failed
+
+    def defer_experiment_reconciliation(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        reason_code: str,
+    ) -> ExperimentRun:
+        if reason_code != "experiment_provider_reconciliation_pending":
+            raise OwnerConflict("experiment_reconciliation_reason_invalid")
+        with self._database.write() as connection:
+            run = _current_experiment_execution(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                required_status="running",
+            )
+            now = time.time()
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_attempts SET status = 'admitted' "
+                    "WHERE attempt_ref = :attempt_ref AND status = 'running'"
+                ),
+                {"attempt_ref": attempt_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET status = 'admitted', "
+                    "updated_at = :now WHERE run_ref = :run_ref AND status = "
+                    "'running'"
+                ),
+                {"now": now, "run_ref": run_ref},
+            )
+            _append_experiment_event(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                kind="status",
+                payload={
+                    "status": "reconciliation_pending",
+                    "reason": {"code": reason_code},
+                },
+                observed_at=now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.experiment_reconciliation_deferred",
+                {
+                    "run_ref": run.run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "provider_operation_ref": run.provider_operation_ref,
+                    "reason": {"code": reason_code},
+                },
+            )
+            evaluation_attempt_ref = run.evaluation_attempt_ref
+        deferred = self.query_experiment_run(evaluation_attempt_ref)
+        if deferred is None:
+            raise OwnerConflict("experiment_reconciliation_defer_missing")
+        return deferred
+
+    def replace_experiment_execution(
+        self, evaluation_attempt_ref: str
+    ) -> ExperimentRun:
+        with self._database.write() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_runs WHERE "
+                    "evaluation_attempt_ref = :evaluation_attempt_ref"
+                ),
+                {"evaluation_attempt_ref": evaluation_attempt_ref},
+            ).first()
+            if run is None:
+                raise OwnerConflict("experiment_run_not_found")
+            if run.status != "failed" or not bool(
+                run.provider_operation_retry_permitted
+            ):
+                raise OwnerConflict("experiment_replacement_not_allowed")
+            operation_generation = int(run.provider_operation_generation) + 1
+            if (
+                operation_generation
+                > EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS
+            ):
+                raise OwnerConflict("experiment_retry_limit_reached")
+            try:
+                operation_ref = typed_provider_operation_ref(
+                    run.run_ref,
+                    "experiment",
+                    operation_generation,
+                )
+            except ProviderSupervisorError as error:
+                raise OwnerConflict(
+                    "experiment_provider_operation_invalid"
+                ) from error
+            now = time.time()
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_attempts SET status = 'retired', "
+                    "retired_reason = COALESCE(retired_reason, "
+                    "'technical_replacement') WHERE attempt_ref = :attempt_ref"
+                ),
+                {"attempt_ref": run.attempt_ref},
+            )
+            attempt_ref, fence_ref = _insert_replacement_attempt(
+                connection,
+                run.run_ref,
+                int(run.attempt_generation) + 1,
+                run.root_session_ref,
+                now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET status = 'admitted', "
+                    "provider_operation_ref = :provider_operation_ref, "
+                    "provider_operation_generation = :operation_generation, "
+                    "provider_operation_retry_permitted = 0, "
+                    "attempt_ref = :attempt_ref, attempt_generation = "
+                    "attempt_generation + 1, fence_ref = :fence_ref, "
+                    "result_json = NULL, result_hash = "
+                    "NULL, failure_code = NULL, completed_at = NULL, updated_at = "
+                    ":now WHERE run_ref = :run_ref"
+                ),
+                {
+                    "provider_operation_ref": operation_ref,
+                    "operation_generation": operation_generation,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "now": now,
+                    "run_ref": run.run_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_sessions SET status = 'open', "
+                    "updated_at = :now WHERE root_session_ref = "
+                    ":root_session_ref"
+                ),
+                {"root_session_ref": run.root_session_ref, "now": now},
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "experiment_attempt_count = experiment_attempt_count + 1, "
+                    "active_experiment_run_count = active_experiment_run_count + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.experiment_replaced",
+                {
+                    "run_ref": run.run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "attempt_generation": int(run.attempt_generation) + 1,
+                    "provider_operation_ref": operation_ref,
+                    "provider_operation_generation": operation_generation,
+                },
+            )
+        replacement = self.query_experiment_run(evaluation_attempt_ref)
+        if replacement is None:
+            raise OwnerConflict("experiment_replacement_missing_after_commit")
+        return replacement
+
     def verify_attempt_execution_receipt(self, **values) -> None:
         self._receipt_verifier.verify_attempt_execution_receipt(**values)
 
@@ -5419,6 +6885,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
 
     def verify_deepfetch_execution_receipt(self, **values) -> None:
         self._receipt_verifier.verify_deepfetch_execution_receipt(**values)
+
+    def verify_experiment_execution_receipt(
+        self, **values
+    ) -> ExperimentResultComponentManifest:
+        return self._receipt_verifier.verify_experiment_execution_receipt(**values)
 
 
 class SQLiteAgentRuntimeReceiptVerifier:
@@ -5622,6 +7093,85 @@ class SQLiteAgentRuntimeReceiptVerifier:
             or receipt.payload_hash != expected_hash
         ):
             raise OwnerConflict("deepfetch_execution_receipt_invalid")
+
+    def verify_experiment_execution_receipt(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        evaluation_attempt_ref: str,
+        result_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> ExperimentResultComponentManifest:
+        if (
+            receipt.issuer != AR_OWNER
+            or receipt.kind != EXPERIMENT_EXECUTION_RECEIPT_KIND
+            or receipt.subject_ref != attempt_ref
+        ):
+            raise OwnerConflict("experiment_execution_receipt_issuer_invalid")
+        with self._database.read() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_attempts WHERE attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {"attempt_ref": attempt_ref},
+            ).first()
+            event_rows = connection.execute(
+                text(
+                    "SELECT * FROM ar_experiment_events WHERE run_ref = "
+                    ":run_ref AND attempt_ref = :attempt_ref ORDER BY sequence"
+                ),
+                {"run_ref": run_ref, "attempt_ref": attempt_ref},
+            ).all()
+        try:
+            runtime_binding = (
+                None
+                if run is None
+                else _experiment_runtime_binding(run.runtime_binding_json)
+            )
+            provider_result = ExperimentProviderResult.from_document(
+                decoded_object(run.result_json) if run is not None else {}
+            )
+            result_manifest = experiment_result_component_manifest(
+                provider_result,
+                tuple(_experiment_event(row) for row in event_rows),
+            )
+        except (OwnerConflict, TypeError, ValueError) as error:
+            raise OwnerConflict("experiment_execution_receipt_invalid") from error
+        if run is None or attempt is None or (
+            run.status != "executed"
+            or attempt.status != "executed"
+            or run.attempt_ref != attempt_ref
+            or run.fence_ref != fence_ref
+            or attempt.fence_ref != fence_ref
+            or run.evaluation_attempt_ref != evaluation_attempt_ref
+            or runtime_binding is None
+            or canonical_hash(runtime_binding.as_dict())
+            != run.runtime_binding_hash
+            or runtime_binding.runner_bundle_hash
+            != run.implementation_content_hash
+            or run.result_hash != result_hash
+            or attempt.receipt_ref != receipt.receipt_ref
+            or attempt.receipt_hash != receipt.payload_hash
+            or receipt.payload_hash
+            != _experiment_execution_receipt_hash(
+                run,
+                attempt_ref,
+                fence_ref,
+                result_hash,
+                result_manifest,
+            )
+        ):
+            raise OwnerConflict("experiment_execution_receipt_invalid")
+        return result_manifest
 
 
 def _acquisition_runtime_binding(value: str) -> AcquisitionRuntimeBinding:
@@ -7121,6 +8671,205 @@ def _observation_from_row(row) -> HostComputeObservation:
     )
 
 
+def _experiment_runtime_binding(value: str) -> ExperimentRuntimeBinding:
+    try:
+        document = decoded_object(value)
+        capabilities = document["capability_bindings"]
+        resources = document["resource_bindings"]
+        if not isinstance(capabilities, list) or not isinstance(resources, list):
+            raise TypeError("bindings")
+        binding = ExperimentRuntimeBinding(
+            schema_ref=str(document["schema_ref"]),
+            runner_bundle_hash=str(document["runner_bundle_hash"]),
+            adapter_ref=str(document["adapter_ref"]),
+            interpreter_ref=str(document["interpreter_ref"]),
+            capability_bindings=tuple(str(item) for item in capabilities),
+            resource_bindings=tuple(str(item) for item in resources),
+        )
+        if canonical_json(binding.as_dict()) != value:
+            raise TypeError("canonical binding")
+        return binding
+    except (KeyError, TypeError, ValueError) as error:
+        raise OwnerConflict("experiment_runtime_binding_invalid") from error
+
+
+def _current_experiment_execution(
+    connection,
+    *,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+    required_status: str,
+):
+    run = connection.execute(
+        text("SELECT * FROM ar_experiment_runs WHERE run_ref = :run_ref"),
+        {"run_ref": run_ref},
+    ).first()
+    if run is None:
+        raise OwnerConflict("experiment_run_not_found")
+    if run.attempt_ref != attempt_ref or run.fence_ref != fence_ref:
+        raise OwnerConflict("experiment_fence_stale")
+    if run.status != required_status:
+        raise OwnerConflict("experiment_execution_state_invalid")
+    attempt = connection.execute(
+        text(
+            "SELECT * FROM ar_experiment_attempts WHERE attempt_ref = :attempt_ref"
+        ),
+        {"attempt_ref": attempt_ref},
+    ).first()
+    if attempt is None or (
+        attempt.run_ref != run_ref
+        or attempt.fence_ref != fence_ref
+        or attempt.status != required_status
+    ):
+        raise OwnerConflict("experiment_execution_state_invalid")
+    return run
+
+
+def _append_experiment_event(
+    connection,
+    *,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+    kind: str,
+    payload: dict[str, object],
+    observed_at: float,
+) -> int:
+    last = connection.execute(
+        text(
+            "SELECT MAX(sequence) AS last_sequence FROM ar_experiment_events "
+            "WHERE run_ref = :run_ref AND attempt_ref = :attempt_ref"
+        ),
+        {"run_ref": run_ref, "attempt_ref": attempt_ref},
+    ).first()
+    sequence = 1 if last is None or last.last_sequence is None else int(last.last_sequence) + 1
+    payload_json = canonical_json(payload)
+    connection.execute(
+        text(
+            "INSERT INTO ar_experiment_events (event_ref, run_ref, attempt_ref, "
+            "fence_ref, sequence, kind, payload_json, payload_hash, observed_at) "
+            "VALUES (:event_ref, :run_ref, :attempt_ref, :fence_ref, :sequence, "
+            ":kind, :payload_json, :payload_hash, :observed_at)"
+        ),
+        {
+            "event_ref": new_ref("experiment_event"),
+            "run_ref": run_ref,
+            "attempt_ref": attempt_ref,
+            "fence_ref": fence_ref,
+            "sequence": sequence,
+            "kind": kind,
+            "payload_json": payload_json,
+            "payload_hash": canonical_hash(payload),
+            "observed_at": observed_at,
+        },
+    )
+    return sequence
+
+
+def _insert_replacement_attempt(
+    connection,
+    run_ref: str,
+    generation: int,
+    root_session_ref: str,
+    now: float,
+) -> tuple[str, str]:
+    attempt_ref = new_ref("experiment_execution_attempt")
+    fence_ref = new_ref("experiment_fence")
+    try:
+        TypedExecutionFence(
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            generation=generation,
+            root_session_ref=root_session_ref,
+            fence_ref=fence_ref,
+        ).validate()
+    except ProviderSupervisorError as error:
+        raise OwnerConflict("experiment_replacement_invalid") from error
+    connection.execute(
+        text(
+            "INSERT INTO ar_experiment_attempts (attempt_ref, run_ref, "
+            "generation, root_session_ref, fence_ref, status, created_at) VALUES "
+            "(:attempt_ref, :run_ref, :generation, :root_session_ref, "
+            ":fence_ref, 'admitted', :created_at)"
+        ),
+        {
+            "attempt_ref": attempt_ref,
+            "run_ref": run_ref,
+            "generation": generation,
+            "root_session_ref": root_session_ref,
+            "fence_ref": fence_ref,
+            "created_at": now,
+        },
+    )
+    return attempt_ref, fence_ref
+
+
+def _experiment_execution_receipt_hash(
+    run,
+    attempt_ref: str,
+    fence_ref: str,
+    result_hash: str,
+    result_manifest: ExperimentResultComponentManifest,
+) -> str:
+    return canonical_hash(
+        {
+            "schema_ref": RECEIPT_SCHEMA,
+            "issuer": AR_OWNER,
+            "kind": EXPERIMENT_EXECUTION_RECEIPT_KIND,
+            "subject_ref": attempt_ref,
+            "bindings": {
+                "run_ref": run.run_ref,
+                "attempt_ref": attempt_ref,
+                "attempt_generation": int(run.attempt_generation),
+                "root_session_ref": run.root_session_ref,
+                "fence_ref": fence_ref,
+                "execution_request_ref": run.execution_request_ref,
+                "provider_operation_ref": run.provider_operation_ref,
+                "provider_operation_generation": int(
+                    run.provider_operation_generation
+                ),
+                "execution_request_receipt_ref": run.execution_request_receipt_ref,
+                "execution_request_receipt_hash": run.execution_request_receipt_hash,
+                "implementation_version_ref": run.implementation_version_ref,
+                "implementation_content_hash": run.implementation_content_hash,
+                "evaluation_attempt_ref": run.evaluation_attempt_ref,
+                "variant_run_ref": run.variant_run_ref,
+                "variant_input_binding_ref": run.variant_input_binding_ref,
+                "variant_input_hash": run.variant_input_hash,
+                "measurement_input_binding_ref": run.measurement_input_binding_ref,
+                "measurement_input_hash": run.measurement_input_hash,
+                "runtime_binding_hash": run.runtime_binding_hash,
+                "result_hash": result_hash,
+                "result_component_manifest_hash": canonical_hash(
+                    result_manifest.as_dict()
+                ),
+            },
+        }
+    )
+
+
+def _experiment_event(row) -> dict[str, object]:
+    try:
+        payload = decoded_object(row.payload_json)
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("experiment_event_invalid") from error
+    if (
+        canonical_json(payload) != row.payload_json
+        or canonical_hash(payload) != row.payload_hash
+    ):
+        raise OwnerConflict("experiment_event_invalid")
+    return {
+        "event_ref": row.event_ref,
+        "sequence": int(row.sequence),
+        "attempt_ref": row.attempt_ref,
+        "fence_ref": row.fence_ref,
+        "kind": row.kind,
+        "payload": payload,
+        "observed_at": float(row.observed_at),
+    }
+
+
 def _validate_probe_snapshot(snapshot: HostComputeSnapshot) -> None:
     if snapshot.status not in {"ready", "unavailable"}:
         raise OwnerConflict("host_compute_snapshot_invalid")
@@ -7152,6 +8901,7 @@ def create_agent_runtime_interface(
     deepfetch_request_verifier: DeepFetchRunRequestVerifier | None = None,
     acquisition_private_root: Path | None = None,
     human_response_verifier: HumanResponseVerifier | None = None,
+    experiment_binding_verifier: ExperimentInputBindingVerifier | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
         database,
@@ -7163,6 +8913,7 @@ def create_agent_runtime_interface(
         deepfetch_request_verifier,
         acquisition_private_root,
         human_response_verifier,
+        experiment_binding_verifier,
     )
 
 

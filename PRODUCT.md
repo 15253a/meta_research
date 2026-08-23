@@ -137,6 +137,32 @@ context, and neither a failed nor a cancelled DeepFetch is treated as a waiver.
 The resulting stable QuestionAnchor does not activate a cycle or advance a
 Stage.
 
+An accepted Quest can also authorize the packaged micro-experiment vertical
+slice from the Web. Research Graph keeps Baseline, Variant, EvaluationProtocol,
+ProtocolVersion, Evaluation, VariantRun, and EvaluationAttempt as independent
+semantic identities and freezes separate state-formation and measurement input
+bindings. Agent Runtime alone owns the local Run, technical Attempt, root
+Session, current Execution Fence, observations, and execution receipt. A
+transport replay reconciles the same provider operation; a replacement keeps
+the Run and root Session while issuing only a successor Attempt/Fence. A new
+provider-operation generation is allowed only after a verified safe terminal
+failure, and it still preserves every experiment domain identity. An explicit
+retrain creates a VariantRun and EvaluationAttempt, while an explicit remeasure
+may reuse one VariantRun and select an ordered zero-to-many set of its accepted
+CheckpointArtifact roles.
+
+Experiment definitions, checkpoints, logs, analyses, and result bytes enter
+Research Memory as immutable AssetVersions before Research Graph accepts their
+semantic roles. Formal Measurement is a separate atomic Research Graph decision
+over exactly one EvaluationAttempt: the exact fenced execution and result asset
+must verify, and that Attempt must independently contain every required Metric.
+Complete negative and zero results remain valid; partial Attempts never combine
+and execution or asset existence alone never creates MetricResult. The Lumen Web
+therefore projects execution, asset acceptance, and Formal Measurement as three
+different facts. Its fixed Execution Fence window observes bounded durable raw
+stdout and scoped hardware telemetry, marks stale or historical data honestly,
+and never promotes live observations into RM or RG truth.
+
 The supported public host operations are exposed by the `meta-research`
 command. Research state is observed through the authenticated Snapshot and SSE
 interfaces; the Web client does not read persistence directly.

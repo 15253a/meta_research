@@ -16,6 +16,11 @@ from meta_research.deepfetch import (
     DeepFetchProvider,
 )
 from meta_research.feed import DurableFeed
+from meta_research.experiment import (
+    BuiltinMicroExperimentProvider,
+    ExperimentProvider,
+    ExperimentService,
+)
 from meta_research.first_question_deepfetch import FirstQuestionDeepFetchWorker
 from meta_research.idea_skill import CodexIdeaSkillAdapter, IdeaSkillProvider
 from meta_research.idea_stage import IdeaStageWorker
@@ -83,6 +88,7 @@ class ProductionRuntime:
     idea_stage: IdeaStageWorker
     plan_stage: PlanStageWorker
     deepfetch: FirstQuestionDeepFetchWorker
+    experiment: ExperimentService
     _database: Database
     _provider_lifecycles: tuple[object, ...] = ()
     _stop_requested: bool = False
@@ -134,6 +140,7 @@ def build_production_runtime(
     plan_skill_provider: PlanSkillProvider | None = None,
     deepfetch_provider: DeepFetchProvider | None = None,
     acquisition_provider: AcquisitionProvider | None = None,
+    experiment_provider: ExperimentProvider | None = None,
 ) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
@@ -156,6 +163,9 @@ def build_production_runtime(
         data_root.root / "plan-skill-provider"
     )
     acquisition_provider = acquisition_provider or NatureDownloaderAdapter()
+    experiment_provider = experiment_provider or BuiltinMicroExperimentProvider(
+        data_root.run / "experiment-provider"
+    )
 
     host_compute_reader = create_host_compute_observation_reader(database)
     human_response_verifier = create_human_response_verifier(database)
@@ -206,6 +216,7 @@ def build_production_runtime(
         deepfetch_request_verifier=deepfetch_request_receipts,
         acquisition_private_root=data_root.run / "acquisition-sessions",
         human_response_verifier=human_response_verifier,
+        experiment_binding_verifier=research_graph_receipts,
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
@@ -298,6 +309,12 @@ def build_production_runtime(
         research_memory,
         deepfetch_provider,
     )
+    experiment = ExperimentService(
+        research_graph,
+        agent_runtime,
+        research_memory,
+        experiment_provider,
+    )
     projection = PublicProjection(
         feed,
         data_root.objects,
@@ -308,6 +325,7 @@ def build_production_runtime(
         owners.human_collaboration,
         idea_stage=idea_stage,
         plan_stage=plan_stage,
+        experiment=experiment,
     )
     provider_lifecycles: list[object] = []
     for provider in (
@@ -317,6 +335,7 @@ def build_production_runtime(
         plan_skill_provider,
         deepfetch_provider,
         acquisition_provider,
+        experiment_provider,
     ):
         if callable(getattr(provider, "request_stop", None)) and not any(
             provider is lifecycle for lifecycle in provider_lifecycles
@@ -331,6 +350,7 @@ def build_production_runtime(
         idea_stage=idea_stage,
         plan_stage=plan_stage,
         deepfetch=deepfetch,
+        experiment=experiment,
         _database=database,
         _provider_lifecycles=tuple(provider_lifecycles),
     )
