@@ -216,6 +216,39 @@ class AcceptedIdeaSetBinding:
 
 
 @dataclass(frozen=True)
+class AcceptedFormalPlanBinding:
+    """Exact immutable FormalPlan closure consumed by Bundle.
+
+    RM content, RG acceptance, and AE advancement remain independent facts.
+    Carrying all three receipts prevents Bundle from silently switching to a
+    newer PlanDocument or treating one Owner's acceptance as another's.
+    """
+
+    formal_plan_ref: str
+    content_ref: str
+    plan_document_hash: str
+    answer_contract_hash: str
+    content_receipt: AcceptanceReceipt
+    formal_plan_receipt: AcceptanceReceipt
+    stage_commit_ref: str
+    stage_commit_receipt: AcceptanceReceipt
+    plan_document: dict[str, object]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "formal_plan_ref": self.formal_plan_ref,
+            "content_ref": self.content_ref,
+            "plan_document_hash": self.plan_document_hash,
+            "answer_contract_hash": self.answer_contract_hash,
+            "content_receipt": self.content_receipt.as_public_dict(),
+            "formal_plan_receipt": self.formal_plan_receipt.as_public_dict(),
+            "stage_commit_ref": self.stage_commit_ref,
+            "stage_commit_receipt": self.stage_commit_receipt.as_public_dict(),
+            "plan_document": self.plan_document,
+        }
+
+
+@dataclass(frozen=True)
 class VerifiedStageRunRequestBinding:
     request_ref: str
     cycle_ref: str
@@ -226,6 +259,7 @@ class VerifiedStageRunRequestBinding:
     context_pack: dict[str, object]
     receipt: AcceptanceReceipt
     accepted_idea_set: AcceptedIdeaSetBinding | None = None
+    accepted_formal_plan: AcceptedFormalPlanBinding | None = None
 
 
 class BundleConfirmationVerifier(Protocol):
@@ -376,6 +410,22 @@ class StageRunRequestVerifier(Protocol):
         context_pack_ref: str,
     ) -> VerifiedStageRunRequestBinding: ...
 
+    def verify_bundle_stage_request_binding(
+        self,
+        *,
+        request_ref: str,
+        accepted_question: AcceptedQuestionBinding,
+        accepted_formal_plan: AcceptedFormalPlanBinding,
+        context_pack_ref: str,
+    ) -> VerifiedStageRunRequestBinding: ...
+
+    def query_verified_bundle_stage_request(
+        self,
+        *,
+        request_ref: str,
+        context_pack_ref: str,
+    ) -> VerifiedStageRunRequestBinding: ...
+
 
 class DeepFetchRunRequestVerifier(Protocol):
     def verify_deepfetch_run_request(
@@ -415,6 +465,21 @@ class AttemptExecutionReceiptVerifier(Protocol):
         fence_ref: str,
         submission_ref: str,
         payload_hash: str,
+        receipt: AcceptanceReceipt,
+    ) -> str: ...
+
+    def verify_target_run_admission_receipt(
+        self,
+        *,
+        target_ref: str,
+        target_spec_hash: str,
+        graph_ref: str,
+        stage_request_ref: str,
+        quest_ref: str,
+        target_run_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
         receipt: AcceptanceReceipt,
     ) -> None: ...
 
@@ -527,6 +592,63 @@ class FormalPlanDecisionVerifier(Protocol):
         decision: str,
         formal_plan_ref: str | None,
         receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+
+class AcceptedFormalPlanBindingVerifier(Protocol):
+    def verify_accepted_formal_plan_binding(
+        self, binding: AcceptedFormalPlanBinding
+    ) -> None: ...
+
+
+class TargetGraphReceiptVerifier(Protocol):
+    def verify_target_graph_receipt(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        graph_ref: str,
+        receipt: AcceptanceReceipt,
+    ) -> None: ...
+
+    def verify_target_run_candidate(
+        self,
+        *,
+        target_ref: str,
+        target_spec_hash: str,
+        graph_ref: str,
+        stage_request_ref: str,
+        quest_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+    ) -> str: ...
+
+    def match_bundle_target_candidate(
+        self,
+        *,
+        quest_ref: str,
+        evaluation_attempt_ref: str,
+        execution_request_ref: str,
+        definition_hash: str,
+    ) -> str | None: ...
+
+    def verify_bundle_dispatch_frontier(
+        self,
+        *,
+        request_ref: str,
+        run_ref: str,
+        graph_ref: str,
+        frontier: tuple[dict[str, object], ...],
+    ) -> None: ...
+
+
+class TargetCommitReceiptVerifier(Protocol):
+    def verify_target_commit_set(
+        self,
+        *,
+        graph_ref: str,
+        receipts: tuple[AcceptanceReceipt, ...],
     ) -> None: ...
 
 

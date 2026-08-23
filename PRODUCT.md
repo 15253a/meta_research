@@ -89,9 +89,9 @@ before the Owner transaction is reconciled rather than being invoked again. An
 incomplete, unverifiable spool fails closed instead of guessing whether the
 external effect happened.
 
-The generic `stage_execution` capability remains unavailable until the later
-Plan, Bundle, and Reasoning execution slices are delivered; the Idea execution
-implemented here is reported only through the five explicit `idea_stage` facts.
+The generic `stage_execution` capability remains unavailable as a catch-all;
+the delivered Idea, Plan, and Bundle paths are reported only through their
+explicit Stage facts, while Reasoning remains a later slice.
 
 Research Asset is now a production vertical slice. The authenticated Web can
 submit text, uploaded files, directories, local paths, repositories, links,
@@ -166,3 +166,31 @@ and never promotes live observations into RM or RG truth.
 The supported public host operations are exposed by the `meta-research`
 command. Research state is observed through the authenticated Snapshot and SSE
 interfaces; the Web client does not read persistence directly.
+
+## 2026-08-23 Bundle production delta
+
+The Bundle behavior remains fixed to prototype commit
+`f2d3f3f0d77a6f50ab535d50d6d404a525c09757`. Production now turns the exact
+accepted FormalPlan GapSet into a reviewed TargetPlan, then lets Research Graph
+own stable Target identities, the dependency DAG, and the live frontier. The
+Bundle root Session schedules work, but its native child-agent tree is only
+Harness topology and never becomes the Target DAG.
+
+Each ordinary micro-experiment Target reuses the independently fenced
+Experiment Run/Attempt lifecycle instead of introducing a second execution
+system. A TargetCommit forms only after the exact EvaluationAttempt has an
+accepted Formal Measurement and freezes implementation, definition/protocol,
+input bindings, checkpoints, MetricResult, receipts, logs, analysis, and result
+content. Negative, zero, and non-significant results remain realized facts;
+execution, permission, resource, currentness, or receipt failures remain typed
+blockers. A high-risk Target is not auto-executed under ordinary Quest authority.
+
+Accepted TargetCommits are published into the future Plan Baseline Pool only
+through immutable RM content and an RG Evidence role whose provenance closes at
+that exact TargetCommit. Generic Evidence metadata cannot impersonate this
+lineage. With an empty GapSet, Advancement Engine records an exact Bundle skip
+without creating a Bundle Run or Target. With work present, StageCommit requires
+the current request/epoch, Bundle completion receipt, TargetGraph receipt, and
+the complete ordered set of TargetCommit receipts. The existing Lumen hierarchy
+is unchanged; its Bundle surface exposes these boundaries, partial success, and
+specific blockers at 390, 800, and 1440 pixel layouts.

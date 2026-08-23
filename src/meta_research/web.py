@@ -53,6 +53,7 @@ ASSET_ROUTE_WATCHDOG_SECONDS = 5.0
 DRAFTING_WORKER_WATCHDOG_SECONDS = 190.0
 IDEA_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 PLAN_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
+BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS = 910.0
 DEEPFETCH_WORKER_WATCHDOG_SECONDS = 1810.0
 EXPERIMENT_WORKER_WATCHDOG_SECONDS = 30.0
 _T = TypeVar("_T")
@@ -157,9 +158,7 @@ class QuestionContentRequest(BaseModel):
     unknown_statement: str = Field(
         max_length=QUESTION_FIELD_MAX_LENGTHS["unknown_statement"]
     )
-    answer_shape: str = Field(
-        max_length=QUESTION_FIELD_MAX_LENGTHS["answer_shape"]
-    )
+    answer_shape: str = Field(max_length=QUESTION_FIELD_MAX_LENGTHS["answer_shape"])
     applicability_scope: str = Field(
         max_length=QUESTION_FIELD_MAX_LENGTHS["applicability_scope"]
     )
@@ -468,6 +467,7 @@ def create_app(
     deepfetch_task: asyncio.Task[None] | None = None
     idea_stage_task: asyncio.Task[None] | None = None
     plan_stage_task: asyncio.Task[None] | None = None
+    bundle_stage_task: asyncio.Task[None] | None = None
     experiment_task: asyncio.Task[None] | None = None
     research_asset_task: asyncio.Task[None] | None = None
     research_asset_verification_task: asyncio.Task[None] | None = None
@@ -476,6 +476,7 @@ def create_app(
     deepfetch_health = ReconciliationHealth()
     idea_stage_health = ReconciliationHealth()
     plan_stage_health = ReconciliationHealth()
+    bundle_stage_health = ReconciliationHealth()
     experiment_health = ReconciliationHealth()
     research_asset_health = ReconciliationHealth()
     research_asset_verification_health = ReconciliationHealth()
@@ -488,7 +489,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         nonlocal reconciliation_task, drafting_task, deepfetch_task, idea_stage_task
-        nonlocal plan_stage_task, experiment_task
+        nonlocal plan_stage_task, bundle_stage_task, experiment_task
         nonlocal research_asset_task, research_asset_verification_task
         reconciliation_task = asyncio.create_task(
             _reconcile_quest_initializations(
@@ -530,6 +531,14 @@ def create_app(
             )
         )
         plan_stage_task.add_done_callback(_log_reconciliation_exit)
+        bundle_stage_task = asyncio.create_task(
+            _process_bundle_stage(
+                runtime,
+                bundle_stage_health,
+                worker_health_updates.publish,
+            )
+        )
+        bundle_stage_task.add_done_callback(_log_reconciliation_exit)
         experiment_task = asyncio.create_task(
             _process_experiments(
                 runtime,
@@ -565,6 +574,7 @@ def create_app(
                     deepfetch_task,
                     idea_stage_task,
                     plan_stage_task,
+                    bundle_stage_task,
                     experiment_task,
                     research_asset_task,
                     research_asset_verification_task,
@@ -630,6 +640,7 @@ def create_app(
             ),
             worker_check("idea_stage_worker", idea_stage_task, idea_stage_health),
             worker_check("plan_stage_worker", plan_stage_task, plan_stage_health),
+            worker_check("bundle_stage_worker", bundle_stage_task, bundle_stage_health),
             worker_check(
                 "experiment_worker",
                 experiment_task,
@@ -653,6 +664,7 @@ def create_app(
             not in {
                 "idea_stage_worker",
                 "plan_stage_worker",
+                "bundle_stage_worker",
                 "research_asset_intake_worker",
                 "research_asset_verification_worker",
             }
@@ -695,13 +707,14 @@ def create_app(
             "/auth/bootstrap",
             "/auth/logout",
         }
-        unsafe_api_route = (
-            path.startswith("/api/")
-            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
-        )
+        unsafe_api_route = path.startswith("/api/") and request.method in {
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        }
         is_asset_intake = (
-            request.method == "POST"
-            and path == "/api/v1/research-assets/intakes"
+            request.method == "POST" and path == "/api/v1/research-assets/intakes"
         )
         if json_auth_route or unsafe_api_route:
             content_type = (
@@ -739,10 +752,7 @@ def create_app(
                         declared_length = int(content_length)
                     except ValueError:
                         return _error(400, "content_length_invalid")
-                    if (
-                        declared_length < 0
-                        or declared_length > request_body_limit
-                    ):
+                    if declared_length < 0 or declared_length > request_body_limit:
                         return _error(413, "request_body_too_large")
                 body = bytearray()
                 async for chunk in request.stream():
@@ -835,9 +845,7 @@ def create_app(
             reconciliation_task,
             reconciliation_health,
         )
-        drafting = worker_check(
-            "quest_drafting_worker", drafting_task, drafting_health
-        )
+        drafting = worker_check("quest_drafting_worker", drafting_task, drafting_health)
         deepfetch = worker_check(
             "first_question_deepfetch_worker", deepfetch_task, deepfetch_health
         )
@@ -846,6 +854,9 @@ def create_app(
         )
         plan_stage = worker_check(
             "plan_stage_worker", plan_stage_task, plan_stage_health
+        )
+        bundle_stage = worker_check(
+            "bundle_stage_worker", bundle_stage_task, bundle_stage_health
         )
         research_assets = worker_check(
             "research_asset_intake_worker",
@@ -882,6 +893,10 @@ def create_app(
             "plan_stage": {
                 "status": plan_stage["status"],
                 "last_error": plan_stage_health.last_error,
+            },
+            "bundle_stage": {
+                "status": bundle_stage["status"],
+                "last_error": bundle_stage_health.last_error,
             },
             "experiment": {
                 "status": experiment["status"],
@@ -972,9 +987,7 @@ def create_app(
             _idempotency_key(request),
         )
 
-    @app.post(
-        "/api/v1/human-requests/{request_ref}/responses", status_code=201
-    )
+    @app.post("/api/v1/human-requests/{request_ref}/responses", status_code=201)
     def respond_to_human_request(
         request_ref: str,
         request: Request,
@@ -1023,11 +1036,13 @@ def create_app(
         request: Request,
         conversion: AgentProposalConversionRequest,
     ) -> dict[str, object]:
-        return runtime.owners.human_collaboration.convert_agent_proposal_to_command_draft(
-            proposal_ref,
-            expected_scope_ref=conversion.expected_scope_ref,
-            expected_proposal_hash=conversion.expected_proposal_hash,
-            idempotency_key=_idempotency_key(request),
+        return (
+            runtime.owners.human_collaboration.convert_agent_proposal_to_command_draft(
+                proposal_ref,
+                expected_scope_ref=conversion.expected_scope_ref,
+                expected_proposal_hash=conversion.expected_proposal_hash,
+                idempotency_key=_idempotency_key(request),
+            )
         )
 
     @app.post("/api/v1/human-collaboration/soft-constraints", status_code=201)
@@ -1127,8 +1142,7 @@ def create_app(
         receipt = command.get("confirmation_receipt")
         if (
             not isinstance(receipt, dict)
-            or receipt.get("receipt_ref")
-            != authorization.confirmation_receipt_ref
+            or receipt.get("receipt_ref") != authorization.confirmation_receipt_ref
         ):
             raise OwnerConflict("authorization_confirmation_invalid")
         return runtime.owners.human_collaboration.decide_capability_authorization(
@@ -1237,9 +1251,7 @@ def create_app(
             timeout_code="quest_material_io_timeout",
         )
 
-    @app.post(
-        "/api/v1/quest-initializations/{initialization_id}/compute-probe"
-    )
+    @app.post("/api/v1/quest-initializations/{initialization_id}/compute-probe")
     def observe_host_compute(
         initialization_id: str,
         request: Request,
@@ -1251,9 +1263,7 @@ def create_app(
             _idempotency_key(request),
         )
 
-    @app.post(
-        "/api/v1/quest-initializations/{initialization_id}/acquisition-session"
-    )
+    @app.post("/api/v1/quest-initializations/{initialization_id}/acquisition-session")
     def prepare_acquisition_session(
         initialization_id: str,
         request: Request,
@@ -1351,9 +1361,7 @@ def create_app(
             initialization_id
         )
 
-    @app.get(
-        "/api/v1/quest-initializations/{initialization_id}/intent-session"
-    )
+    @app.get("/api/v1/quest-initializations/{initialization_id}/intent-session")
     def query_intent_session(initialization_id: str) -> dict[str, object]:
         view = runtime.owners.human_collaboration.query_quest_creation(
             initialization_id
@@ -1544,9 +1552,7 @@ def create_app(
             if result is None:
                 raise error
         return JSONResponse(
-            status_code=(
-                202 if result.status in {"queued", "processing"} else 201
-            ),
+            status_code=(202 if result.status in {"queued", "processing"} else 201),
             content=result.as_public_dict(),
         )
 
@@ -1561,9 +1567,7 @@ def create_app(
         quest_ref: str | None = None,
         role: Literal["evidence", "quest_source_material"] | None = None,
         cursor: str | None = Query(default=None, max_length=512),
-        limit: int = Query(
-            default=50, ge=1, le=ASSET_ROLE_QUERY_MAX_PAGE_SIZE
-        ),
+        limit: int = Query(default=50, ge=1, le=ASSET_ROLE_QUERY_MAX_PAGE_SIZE),
     ) -> dict[str, object]:
         before_timestamp, before_ref = _decode_history_cursor(cursor)
         for _attempt in range(3):
@@ -1598,16 +1602,12 @@ def create_app(
             research_memory_revision = (
                 runtime.owners.research_memory.query_projection_snapshot().revision
             )
-            item = (
-                runtime.owners.research_memory.query_asset_projection_inventory_item(
-                    memory_ref
-                )
+            item = runtime.owners.research_memory.query_asset_projection_inventory_item(
+                memory_ref
             )
             if item is None:
                 raise OwnerConflict("asset_not_found")
-            custodies = runtime.owners.research_memory.query_asset_custodies(
-                memory_ref
-            )
+            custodies = runtime.owners.research_memory.query_asset_custodies(memory_ref)
             roles = runtime.owners.research_graph.query_asset_roles(
                 version_refs=(memory_ref,),
                 limit=ASSET_PROJECTION_HISTORY_PER_VERSION,
@@ -1647,9 +1647,7 @@ def create_app(
     def query_research_asset_role_history(
         memory_ref: str,
         cursor: str | None = Query(default=None, max_length=512),
-        limit: int = Query(
-            default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE
-        ),
+        limit: int = Query(default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE),
     ) -> dict[str, object]:
         before_timestamp, before_ref = _decode_history_cursor(cursor)
         rows = runtime.owners.research_graph.query_asset_roles(
@@ -1670,9 +1668,7 @@ def create_app(
     def query_research_asset_hold_history(
         memory_ref: str,
         cursor: str | None = Query(default=None, max_length=512),
-        limit: int = Query(
-            default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE
-        ),
+        limit: int = Query(default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE),
     ) -> dict[str, object]:
         before_timestamp, before_ref = _decode_history_cursor(cursor)
         rows = runtime.owners.research_memory.query_asset_holds(
@@ -1693,9 +1689,7 @@ def create_app(
     def query_research_asset_release_history(
         memory_ref: str,
         cursor: str | None = Query(default=None, max_length=512),
-        limit: int = Query(
-            default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE
-        ),
+        limit: int = Query(default=50, ge=1, le=ASSET_HISTORY_QUERY_MAX_PAGE_SIZE),
     ) -> dict[str, object]:
         before_timestamp, before_ref = _decode_history_cursor(cursor)
         rows = runtime.owners.research_memory.query_release_eligibility_assessments(
@@ -1810,9 +1804,7 @@ def create_app(
         result = await _await_bounded_asset_io(
             lambda: runtime.owners.research_memory.assess_release_eligibility(
                 memory_ref,
-                expected_reference_revision=(
-                    assessment.expected_reference_revision
-                ),
+                expected_reference_revision=(assessment.expected_reference_revision),
                 idempotency_key=idempotency_key,
             ),
             slots=asset_io_slots,
@@ -1865,9 +1857,7 @@ def create_app(
             "items": list(items),
             "after_sequence": after,
             "limit": limit,
-            "next_after_sequence": (
-                after if not items else items[-1]["sequence"]
-            ),
+            "next_after_sequence": (after if not items else items[-1]["sequence"]),
         }
 
     @app.get("/api/v1/idea-stage/current")
@@ -1877,6 +1867,10 @@ def create_app(
     @app.get("/api/v1/plan-stage/current")
     def query_current_plan_stage() -> dict[str, object]:
         return runtime.plan_stage.query_current()
+
+    @app.get("/api/v1/bundle-stage/current")
+    def query_current_bundle_stage() -> dict[str, object]:
+        return runtime.bundle_stage.query_current()
 
     @app.get("/api/v1/events")
     async def stream_events(request: Request) -> StreamingResponse:
@@ -1950,10 +1944,7 @@ async def _event_stream(
             },
             separators=(",", ":"),
         )
-        yield (
-            "event: snapshot.required\n"
-            f"data: {payload}\n\n"
-        )
+        yield (f"event: snapshot.required\ndata: {payload}\n\n")
     while True:
         if not await _sse_session_is_valid(runtime, request):
             return
@@ -1979,10 +1970,7 @@ async def _event_stream(
             if not await _sse_session_is_valid(runtime, request):
                 return
             payload = json.dumps(event.payload, separators=(",", ":"))
-            yield (
-                f"event: {event.event_type}\n"
-                f"data: {payload}\n\n"
-            )
+            yield (f"event: {event.event_type}\ndata: {payload}\n\n")
             if not await _sse_session_is_valid(runtime, request):
                 return
             projection_payload = json.dumps(
@@ -2024,15 +2012,10 @@ async def _event_stream(
             },
             separators=(",", ":"),
         )
-        yield (
-            "event: snapshot.required\n"
-            f"data: {payload}\n\n"
-        )
+        yield (f"event: snapshot.required\ndata: {payload}\n\n")
 
 
-async def _sse_session_is_valid(
-    runtime: ProductionRuntime, request: Request
-) -> bool:
+async def _sse_session_is_valid(runtime: ProductionRuntime, request: Request) -> bool:
     session_token = getattr(request.state, "session_token", None)
     return await asyncio.to_thread(
         runtime.authentication.session_is_valid, session_token
@@ -2092,13 +2075,9 @@ async def _reconcile_quest_initializations(
             if not isinstance(error, (OSError, OwnerConflict, SQLAlchemyError)):
                 LOGGER.exception("quest reconciliation attempt failed unexpectedly")
             error_code = (
-                error.code
-                if isinstance(error, OwnerConflict)
-                else type(error).__name__
+                error.code if isinstance(error, OwnerConflict) else type(error).__name__
             )
-            changed = (
-                health.status != "unavailable" or health.last_error != error_code
-            )
+            changed = health.status != "unavailable" or health.last_error != error_code
             health.status = "unavailable"
             health.last_error = error_code
             health.retry_count += 1
@@ -2343,10 +2322,7 @@ async def _await_monitored_worker_call(
         if timed_out:
             continue
         timed_out = True
-        changed = (
-            health.status != "unavailable"
-            or health.last_error != timeout_code
-        )
+        changed = health.status != "unavailable" or health.last_error != timeout_code
         health.status = "unavailable"
         health.last_error = timeout_code
         health.retry_count += 1
@@ -2586,6 +2562,59 @@ async def _process_plan_stage(
             await asyncio.sleep(0 if advanced else 0.2)
 
 
+async def _process_bundle_stage(
+    runtime: ProductionRuntime,
+    health: ReconciliationHealth,
+    on_health_change: Callable[[], None] | None = None,
+) -> None:
+    """Advance one verified Bundle boundary at a time under daemon ownership."""
+
+    while True:
+        try:
+            advanced = await _await_monitored_worker_call(
+                runtime.bundle_stage.process_once,
+                health=health,
+                timeout_code="bundle_stage_operation_timeout",
+                on_health_change=on_health_change,
+                timeout_seconds=BUNDLE_STAGE_WORKER_WATCHDOG_SECONDS,
+            )
+            transient_error = runtime.bundle_stage.transient_error
+            if transient_error is not None:
+                raise _BundleStageTransientError(transient_error)
+        except Exception as error:
+            if not isinstance(
+                error,
+                (
+                    OSError,
+                    OwnerConflict,
+                    SQLAlchemyError,
+                    _BundleStageTransientError,
+                ),
+            ):
+                LOGGER.exception("bundle stage attempt failed unexpectedly")
+            error_code = (
+                error.code
+                if isinstance(error, (OwnerConflict, _BundleStageTransientError))
+                else type(error).__name__
+            )
+            changed = health.status != "unavailable" or health.last_error != error_code
+            health.status = "unavailable"
+            health.last_error = error_code
+            health.retry_count += 1
+            if changed and on_health_change is not None:
+                on_health_change()
+            retry_delay = min(2.0, 0.2 * (2 ** min(health.retry_count - 1, 4)))
+            await asyncio.sleep(retry_delay)
+        else:
+            changed = health.status != "ready" or health.last_error is not None
+            health.status = "ready"
+            health.last_error = None
+            health.retry_count = 0
+            if changed and on_health_change is not None:
+                on_health_change()
+            await asyncio.sleep(0 if advanced else 0.2)
+
+
 class _IdeaStageTransientError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -2593,6 +2622,12 @@ class _IdeaStageTransientError(RuntimeError):
 
 
 class _PlanStageTransientError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _BundleStageTransientError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code

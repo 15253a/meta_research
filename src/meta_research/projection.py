@@ -18,6 +18,7 @@ from meta_research.owners.research_memory import (
 )
 
 if TYPE_CHECKING:
+    from meta_research.bundle_stage import BundleStageWorker
     from meta_research.experiment import ExperimentService
     from meta_research.idea_stage import IdeaStageWorker
     from meta_research.plan_stage import PlanStageWorker
@@ -49,6 +50,7 @@ class PublicProjection:
         idea_stage: IdeaStageWorker | None = None,
         plan_stage: PlanStageWorker | None = None,
         experiment: ExperimentService | None = None,
+        bundle_stage: BundleStageWorker | None = None,
     ) -> None:
         self._feed = feed
         self._object_store = object_store
@@ -59,6 +61,7 @@ class PublicProjection:
         self._agent_runtime = agent_runtime
         self._idea_stage = idea_stage
         self._plan_stage = plan_stage
+        self._bundle_stage = bundle_stage
         self._experiment = experiment
         self._interfaces = {
             "research_graph": research_graph,
@@ -104,10 +107,13 @@ class PublicProjection:
             plan_stage = (
                 None if self._plan_stage is None else self._plan_stage.query_current()
             )
-            current_experiment = (
+            bundle_stage = (
                 None
-                if self._experiment is None
-                else self._experiment.query_current()
+                if self._bundle_stage is None
+                else self._bundle_stage.query_current()
+            )
+            current_experiment = (
+                None if self._experiment is None else self._experiment.query_current()
             )
             current_question = (
                 None
@@ -131,15 +137,11 @@ class PublicProjection:
                                 "quest_ref": question.quest_ref,
                                 "parent_question_ref": question.parent_question_ref,
                                 "title": content.get("title"),
-                                "unknown_statement": content.get(
-                                    "unknown_statement"
-                                ),
+                                "unknown_statement": content.get("unknown_statement"),
                                 "content_ref": question.content_ref,
                                 "content_hash": question.content_hash,
                                 "schema_ref": question.schema_ref,
-                                "question_receipt_ref": (
-                                    question.receipt.receipt_ref
-                                ),
+                                "question_receipt_ref": (question.receipt.receipt_ref),
                             }
                         )
                 except OwnerConflict as error:
@@ -216,9 +218,7 @@ class PublicProjection:
                 parameter="version_refs",
                 limit_per_version=ASSET_PROJECTION_HISTORY_PER_VERSION,
             )
-            inventory_by_ref = {
-                item.version_ref: item for item in research_assets
-            }
+            inventory_by_ref = {item.version_ref: item for item in research_assets}
             for asset_role in asset_roles:
                 asset_item = inventory_by_ref.get(asset_role.version_ref)
                 if asset_item is None or (
@@ -262,9 +262,7 @@ class PublicProjection:
         checks = [
             {
                 "name": "database",
-                "status": (
-                    "ready" if feed_readiness.database_ready else "unavailable"
-                ),
+                "status": ("ready" if feed_readiness.database_ready else "unavailable"),
             },
             {
                 "name": "object_store",
@@ -305,7 +303,10 @@ class PublicProjection:
         snapshot: dict[str, object] = {
             "product": {"name": "meta-research-vnext", "version": __version__},
             "revision": revision,
-            "readiness": {"status": "ready" if ready else "unavailable", "checks": checks},
+            "readiness": {
+                "status": "ready" if ready else "unavailable",
+                "checks": checks,
+            },
             "research_space": research_space,
             "owners": {
                 name: snapshot.as_public_dict()
@@ -323,9 +324,7 @@ class PublicProjection:
                 },
             },
             "question_tree": {
-                "status": (
-                    "ready" if question_tree_reason is None else "unavailable"
-                ),
+                "status": ("ready" if question_tree_reason is None else "unavailable"),
                 "items": question_tree_items,
                 "reason": question_tree_reason,
             },
@@ -340,14 +339,11 @@ class PublicProjection:
                 "revision": revision,
                 "inventory_revision": research_memory.revision,
                 "items": [item.as_public_dict() for item in research_assets],
-                "custodies": [
-                    custody.as_public_dict() for custody in asset_custodies
-                ],
+                "custodies": [custody.as_public_dict() for custody in asset_custodies],
                 "roles": [role.as_public_dict() for role in asset_roles],
                 "holds": [hold.as_public_dict() for hold in asset_holds],
                 "release_assessments": [
-                    assessment.as_public_dict()
-                    for assessment in release_assessments
+                    assessment.as_public_dict() for assessment in release_assessments
                 ],
                 "reference_revision": asset_reference_revision,
                 "offset": asset_offset,
@@ -371,6 +367,8 @@ class PublicProjection:
             snapshot["idea_stage"] = idea_stage
         if plan_stage is not None and _plan_stage_is_public(plan_stage):
             snapshot["plan_stage"] = plan_stage
+        if bundle_stage is not None and _bundle_stage_is_public(bundle_stage):
+            snapshot["bundle_stage"] = bundle_stage
         return snapshot
 
 
@@ -389,17 +387,40 @@ def _plan_stage_is_public(projection: dict[str, object]) -> bool:
         "consumed",
     }:
         return True
-    if any(projection.get(field) is not None for field in (
-        "stage_run_request",
-        "run",
-        "stage_commit",
-    )):
+    if any(
+        projection.get(field) is not None
+        for field in (
+            "stage_run_request",
+            "run",
+            "stage_commit",
+        )
+    ):
         return True
     acceptance = projection.get("plan_acceptance")
     return isinstance(acceptance, dict) and acceptance.get("status") not in {
         None,
         "not_attempted",
     }
+
+
+def _bundle_stage_is_public(projection: dict[str, object]) -> bool:
+    """Publish Bundle once an accepted FormalPlan makes it actionable."""
+
+    eligibility = projection.get("eligibility")
+    if isinstance(eligibility, dict) and eligibility.get("status") == "eligible":
+        return True
+    target_graph = projection.get("target_graph")
+    return (
+        any(
+            projection.get(field) is not None
+            for field in ("stage_run_request", "run", "stage_commit")
+        )
+        or (
+            isinstance(target_graph, dict)
+            and target_graph.get("status") != "not_attempted"
+        )
+        or bool(projection.get("target_commits"))
+    )
 
 
 def _query_bounded_inventory(query, *, offset: int, limit: int):
@@ -522,9 +543,7 @@ def _human_collaboration_projection(
                     if quest_waiting or local_waiting
                     else "none"
                 ),
-                "safe_meaningful_runnable_exists": (
-                    safe_meaningful_runnable_exists
-                ),
+                "safe_meaningful_runnable_exists": (safe_meaningful_runnable_exists),
                 "safe_runnable_basis": safe_runnable_basis,
                 "other_blockers": blockers,
             },

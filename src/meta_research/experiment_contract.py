@@ -25,6 +25,9 @@ EXPERIMENT_REQUIRED_METRICS = (
     "variant_mean",
     "mean_delta",
 )
+EXPERIMENT_RESULT_DISPOSITIONS = frozenset(
+    {"positive", "negative", "zero", "nonsignificant", "denied", "uncertain"}
+)
 EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS = 2
 EXPERIMENT_RETRYABLE_PROVIDER_FAILURES = frozenset(
     {
@@ -74,9 +77,7 @@ class ExperimentIntent:
             "sample_count": self.sample_count,
             "request_kind": self.request_kind,
             "source_variant_run_ref": self.source_variant_run_ref,
-            "selected_checkpoint_role_refs": list(
-                self.selected_checkpoint_role_refs
-            ),
+            "selected_checkpoint_role_refs": list(self.selected_checkpoint_role_refs),
         }
 
     def validate(self) -> None:
@@ -103,9 +104,10 @@ class ExperimentIntent:
                 raise OwnerConflict("experiment_checkpoint_selection_forbidden")
         elif not self.source_variant_run_ref:
             raise OwnerConflict("experiment_source_variant_run_required")
-        if self.source_variant_run_ref is not None and len(
-            self.source_variant_run_ref
-        ) > 96:
+        if (
+            self.source_variant_run_ref is not None
+            and len(self.source_variant_run_ref) > 96
+        ):
             raise OwnerConflict("experiment_source_variant_run_invalid")
         checkpoints = self.selected_checkpoint_role_refs
         if (
@@ -191,9 +193,7 @@ class ExperimentDomainAdmission:
     variant_run_binding: AcceptedExperimentInputBinding
     evaluation_attempt_binding: AcceptedExperimentInputBinding
     required_metrics: tuple[str, ...]
-    formal_measurement_status: Literal[
-        "not_attempted", "accepted", "rejected"
-    ]
+    formal_measurement_status: Literal["not_attempted", "accepted", "rejected"]
     formal_rejection_code: str | None
     created_at: float
 
@@ -316,8 +316,7 @@ class MaterializedExperimentCheckpoint:
             or len(self.role_ref) > 96
             or not self.content
             or len(self.content) > 8 * 1024 * 1024
-            or hashlib.sha256(self.content).hexdigest()
-            != self.binding.content_hash
+            or hashlib.sha256(self.content).hexdigest() != self.binding.content_hash
             or self.role_receipt.issuer != "research_graph"
             or self.role_receipt.kind != "experiment_asset_role_acceptance"
             or self.role_receipt.subject_ref != self.role_ref
@@ -400,9 +399,7 @@ class ExperimentProviderResult:
         analysis = value.get("analysis")
         result_content = value.get("result_content")
         adapter_kind = value.get("adapter_kind")
-        additional_encoded = value.get(
-            "additional_checkpoint_contents_base64", []
-        )
+        additional_encoded = value.get("additional_checkpoint_contents_base64", [])
         if (
             (encoded is not None and not isinstance(encoded, str))
             or not isinstance(analysis, dict)
@@ -414,13 +411,10 @@ class ExperimentProviderResult:
             raise OwnerConflict("experiment_result_invalid")
         try:
             checkpoint = (
-                None
-                if encoded is None
-                else base64.b64decode(encoded, validate=True)
+                None if encoded is None else base64.b64decode(encoded, validate=True)
             )
             additional = tuple(
-                base64.b64decode(item, validate=True)
-                for item in additional_encoded
+                base64.b64decode(item, validate=True) for item in additional_encoded
             )
         except ValueError as error:
             raise OwnerConflict("experiment_result_invalid") from error
@@ -516,8 +510,7 @@ def experiment_result_component_manifest(
     )
     manifest = ExperimentResultComponentManifest(
         checkpoint_content_hashes=tuple(
-            hashlib.sha256(content).hexdigest()
-            for content in checkpoint_contents
+            hashlib.sha256(content).hexdigest() for content in checkpoint_contents
         ),
         analysis_content_hash=canonical_hash(result.analysis),
         result_content_hash=canonical_hash(result.result_content),
@@ -623,9 +616,14 @@ def validate_experiment_provider_result(
     if not result.adapter_kind or len(result.adapter_kind) > 128:
         raise OwnerConflict("experiment_result_invalid")
     metrics = result.result_content.get("metrics")
+    disposition = result.result_content.get("result_disposition")
     if (
         result.result_content.get("schema_ref") != EXPERIMENT_RESULT_SCHEMA
         or not isinstance(metrics, dict)
+        or (
+            disposition is not None
+            and disposition not in EXPERIMENT_RESULT_DISPOSITIONS
+        )
     ):
         raise OwnerConflict("experiment_result_invalid")
     for name, value in metrics.items():

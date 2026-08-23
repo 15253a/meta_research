@@ -861,6 +861,92 @@ export type PlanStageProjection = {
   [key: string]: unknown;
 };
 
+export type BundleTargetProjection = {
+  target_ref: string;
+  target_key: string;
+  target_type: string;
+  spec_hash: string;
+  dependency_refs: string[];
+  target_run_ref?: string | null;
+  status: string;
+  receipt?: IdeaReceipt | null;
+  blocker?: null | { code?: string; [key: string]: unknown };
+  [key: string]: unknown;
+};
+
+export type BundleTargetCommitProjection = {
+  status: "realized" | string;
+  commit_ref: string;
+  target_ref: string;
+  target_run_ref: string;
+  evaluation_attempt_ref: string;
+  target_spec_hash: string;
+  closure_hash: string;
+  closure: Record<string, unknown>;
+  result_disposition: string;
+  receipt?: IdeaReceipt | null;
+  [key: string]: unknown;
+};
+
+export type BundleStageProjection = {
+  eligibility: {
+    status: string;
+    cycle_ref?: string | null;
+    question_ref?: string | null;
+    formal_plan_ref?: string | null;
+    reason?: null | { code?: string; message?: string; [key: string]: unknown };
+    next_stage?: string | null;
+    [key: string]: unknown;
+  };
+  stage_run_request: null | {
+    status?: string;
+    request_ref?: string;
+    cycle_ref?: string;
+    stage?: string;
+    epoch?: number;
+    accepted_question_binding?: NonNullable<
+      IdeaStageProjection["stage_run_request"]
+    >["accepted_question_binding"];
+    accepted_formal_plan_binding?: Record<string, unknown> | null;
+    context_pack_ref?: string;
+    context_pack_hash?: string;
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  run: IdeaStageProjection["run"];
+  target_graph: {
+    status: string;
+    graph_ref?: string;
+    formal_plan_ref?: string;
+    target_plan_hash?: string;
+    targets: BundleTargetProjection[];
+    frontier: string[];
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  };
+  target_commits: BundleTargetCommitProjection[];
+  baseline_pool: Array<{
+    target_commit_ref: string;
+    target_ref: string;
+    result_disposition: string;
+    metric_result?: Record<string, unknown>;
+    receipt?: IdeaReceipt | null;
+    [key: string]: unknown;
+  }>;
+  disposition: {
+    status: string;
+    target_count?: number;
+    target_commit_count?: number;
+    reason?: { code?: string; [key: string]: unknown };
+    [key: string]: unknown;
+  };
+  stage_commit: null | (NonNullable<IdeaStageProjection["stage_commit"]> & {
+    target_commit_refs?: string[];
+    disposition?: string;
+  });
+  [key: string]: unknown;
+};
+
 export type ExperimentObservation = {
   event_ref: string;
   sequence: number;
@@ -954,6 +1040,7 @@ export type PublicSnapshot = {
   idea_stage?: IdeaStageProjection | null;
   human_collaboration?: HumanCollaborationProjection;
   plan_stage?: PlanStageProjection | null;
+  bundle_stage?: BundleStageProjection | null;
   experiment: PublicExperimentProjection;
   unavailable: UnavailableCapability[];
 };

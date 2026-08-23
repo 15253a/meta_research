@@ -1,0 +1,7 @@
+interface:
+  display_name: "Bundle Stage"
+  short_description: "Build a reviewed Target DAG from an accepted FormalPlan"
+  brand_color: "#596B5A"
+  default_prompt: "Use $bundle-stage to turn the frozen FormalPlan gaps into a reviewed Target DAG."
+policy:
+  allow_implicit_invocation: false

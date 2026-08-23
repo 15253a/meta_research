@@ -41,9 +41,7 @@ def _upgrade_to_revision(database: Path, revision: str) -> None:
     event.listen(engine, "connect", _configure_migration_sqlite)
     event.listen(engine, "begin", _begin_migration_transaction)
     config = Config()
-    config.set_main_option(
-        "script_location", str(files("meta_research.migrations"))
-    )
+    config.set_main_option("script_location", str(files("meta_research.migrations")))
     try:
         with engine.connect() as connection:
             config.attributes["connection"] = connection
@@ -59,9 +57,7 @@ def _downgrade_to_revision(database: Path, revision: str) -> None:
     event.listen(engine, "connect", _configure_migration_sqlite)
     event.listen(engine, "begin", _begin_migration_transaction)
     config = Config()
-    config.set_main_option(
-        "script_location", str(files("meta_research.migrations"))
-    )
+    config.set_main_option("script_location", str(files("meta_research.migrations")))
     try:
         with engine.connect() as connection:
             config.attributes["connection"] = connection
@@ -107,9 +103,7 @@ def _insert_completed_0008_quest(
                     "exact_human_confirmation",
                     "no_existing_quest_for_initialization",
                 ],
-                "risks": [
-                    "quest_may_remain_empty_if_downstream_acceptance_fails"
-                ],
+                "risks": ["quest_may_remain_empty_if_downstream_acceptance_fails"],
                 "stale_if": [
                     "quest_draft_revision_changes",
                     "proposal_changes",
@@ -190,9 +184,7 @@ def _insert_completed_0008_quest(
                     "exact_quest_receipt",
                     "exact_root_question_receipt",
                 ],
-                "risks": [
-                    "cycle_remains_not_attempted_if_question_receipt_is_stale"
-                ],
+                "risks": ["cycle_remains_not_attempted_if_question_receipt_is_stale"],
                 "stale_if": [
                     "quest_receipt_changes",
                     "root_question_receipt_changes",
@@ -690,7 +682,9 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
         if "research_memory_state" in tables_after_failure:
             columns = {
                 row[1]
-                for row in connection.execute("PRAGMA table_info(research_memory_state)")
+                for row in connection.execute(
+                    "PRAGMA table_info(research_memory_state)"
+                )
             }
             assert "formal_content_count" not in columns
         assert "hc_quest_initializations" not in tables_after_failure
@@ -713,7 +707,7 @@ def test_interrupted_sqlite_ddl_rolls_back_and_upgrade_can_restart(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert version == ("0012_experiment_measurement",)
+    assert version == ("0013_bundle_target_dag",)
     assert "formal_content_count" in columns
     assert "hc_quest_initializations" in tables
     assert "hc_proposal_generation_attempts" in tables
@@ -753,9 +747,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
         ).fetchone()
         initialization_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(hc_quest_initializations)"
-            )
+            for row in connection.execute("PRAGMA table_info(hc_quest_initializations)")
         }
         tables_after_failure = {
             row[0]
@@ -780,7 +772,7 @@ def test_interrupted_0003_ddl_rolls_back_the_whole_revision(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0013_bundle_target_dag",)
 
 
 def test_process_exit_mid_0003_ddl_recovers_on_the_next_upgrade(
@@ -822,9 +814,7 @@ upgrade_database(Path(sys.argv[1]))
         ).fetchone() == ("0002_quest_initialization",)
         columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(hc_quest_initializations)"
-            )
+            for row in connection.execute("PRAGMA table_info(hc_quest_initializations)")
         }
         tables = {
             row[0]
@@ -840,7 +830,7 @@ upgrade_database(Path(sys.argv[1]))
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0013_bundle_target_dag",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -962,7 +952,7 @@ def test_forward_only_0003_preserves_existing_data_and_is_repeatable(
                 ("d" * 64,),
             )
 
-    assert version == ("0012_experiment_measurement",)
+    assert version == ("0013_bundle_target_dag",)
     assert feed == ("legacy.event", '{"kept":true}', 17.0)
     assert auth == ("a" * 64, "b" * 64, 18.0, 1800.0, None)
     assert initialization == (
@@ -1033,9 +1023,7 @@ def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
         ).fetchone() == ("0003_quest_direct_web",)
         ae_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(advancement_engine_state)"
-            )
+            for row in connection.execute("PRAGMA table_info(advancement_engine_state)")
         }
         tables = {
             row[0]
@@ -1054,7 +1042,7 @@ def test_interrupted_0004_rolls_back_owner_counters_and_idea_tables(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0013_bundle_target_dag",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -1085,15 +1073,11 @@ def test_interrupted_0005_rolls_back_and_converges_on_retry(
         ).fetchone() == ("0004_idea_stage",)
         rm_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(research_memory_state)"
-            )
+            for row in connection.execute("PRAGMA table_info(research_memory_state)")
         }
         rg_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(research_graph_state)"
-            )
+            for row in connection.execute("PRAGMA table_info(research_graph_state)")
         }
         tables = {
             row[0]
@@ -1113,7 +1097,7 @@ def test_interrupted_0005_rolls_back_and_converges_on_retry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0013_bundle_target_dag",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
@@ -1189,7 +1173,7 @@ def test_0005_backfills_existing_rm_contents_without_changing_identity_or_receip
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0013_bundle_target_dag",)
         original_formal = connection.execute(
             "SELECT content_ref, content_hash, object_path, receipt_ref, "
             "receipt_hash FROM rm_formal_question_contents"
@@ -1323,10 +1307,13 @@ def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
         ).fetchone() == ("0005_research_assets",)
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'rm_managed_objects'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'rm_managed_objects'"
+            ).fetchone()
+            is None
+        )
         connection.execute(
             "INSERT INTO rm_assets (asset_ref, created_at) VALUES "
             "('asset_pre_0006', 51.0)"
@@ -1380,14 +1367,12 @@ def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0013_bundle_target_dag",)
         assert connection.execute(
-            "SELECT object_path, content_hash, byte_count FROM "
-            "rm_managed_objects"
+            "SELECT object_path, content_hash, byte_count FROM rm_managed_objects"
         ).fetchone() == (object_path, digest, len(payload))
         assert connection.execute(
-            "SELECT object_count FROM research_memory_state WHERE singleton = "
-            "'owner'"
+            "SELECT object_count FROM research_memory_state WHERE singleton = 'owner'"
         ).fetchone() == (1,)
         tables = {
             row[0]
@@ -1412,8 +1397,7 @@ def test_0006_upgrades_an_existing_0005_database_and_backfills_managed_registry(
             "'job_legacy_inline'"
         ).fetchone()
         assert inline_stored == (
-            '{"custody_mode":"managed","payload_scrubbed":true,'
-            '"source_kind":"file"}',
+            '{"custody_mode":"managed","payload_scrubbed":true,"source_kind":"file"}',
             "file",
             "managed",
             1,
@@ -1594,9 +1578,7 @@ def test_0006_preserves_0005_linked_and_nonportable_asset_facts_fail_closed(
             "1, 51.0, 50.0, 51.0)",
             (
                 legacy_linked_request_json,
-                hashlib.sha256(
-                    legacy_linked_request_json.encode("utf-8")
-                ).hexdigest(),
+                hashlib.sha256(legacy_linked_request_json.encode("utf-8")).hexdigest(),
                 linked["asset_ref"],
                 linked["version_ref"],
             ),
@@ -1636,17 +1618,16 @@ def test_0006_preserves_0005_linked_and_nonportable_asset_facts_fail_closed(
         assert linked_custody.receipt.kind == "asset_acceptance"
         assert linked_custody.established_at == 51.0
         assert linked_custody.locator_receipt is not None
-        assert linked_custody.locator_receipt.kind == (
-            "asset_custody_locator_migrated"
-        )
+        assert linked_custody.locator_receipt.kind == ("asset_custody_locator_migrated")
         assert linked_custody.locator_bound_at is not None
         assert linked_custody.locator_bound_at > linked_custody.established_at
-        assert runtime.owners.research_memory.materialize_asset(
-            str(linked["version_ref"])
-        ).content == linked_payload
-        with pytest.raises(
-            OwnerConflict, match="asset_materialization_unsupported"
-        ):
+        assert (
+            runtime.owners.research_memory.materialize_asset(
+                str(linked["version_ref"])
+            ).content
+            == linked_payload
+        )
+        with pytest.raises(OwnerConflict, match="asset_materialization_unsupported"):
             runtime.owners.research_memory.materialize_asset(
                 str(managed["version_ref"])
             )
@@ -1722,7 +1703,7 @@ def test_interrupted_0007_rolls_back_typed_runs_and_snapshot_bindings(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0013_bundle_target_dag",)
         tables = {
             row[0]
             for row in connection.execute(
@@ -1796,15 +1777,11 @@ def test_interrupted_0008_rolls_back_acquisition_sessions_and_converges(
         }
         runtime_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(agent_runtime_state)"
-            )
+            for row in connection.execute("PRAGMA table_info(agent_runtime_state)")
         }
         request_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(hc_deepfetch_requests)"
-            )
+            for row in connection.execute("PRAGMA table_info(hc_deepfetch_requests)")
         }
         preserved = connection.execute(
             "SELECT event_type, payload_json, recorded_at FROM durable_feed "
@@ -1837,15 +1814,11 @@ def test_interrupted_0008_rolls_back_acquisition_sessions_and_converges(
         ).fetchone()
         request_columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(hc_deepfetch_requests)"
-            )
+            for row in connection.execute("PRAGMA table_info(hc_deepfetch_requests)")
         }
-        foreign_key_failures = connection.execute(
-            "PRAGMA foreign_key_check"
-        ).fetchall()
+        foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
-    assert version == ("0012_experiment_measurement",)
+    assert version == ("0013_bundle_target_dag",)
     assert {
         "ar_acquisition_sessions",
         "ar_acquisition_requests",
@@ -1942,9 +1915,10 @@ def test_0009_completed_initialization_becomes_recoverable_without_fake_auth(
             "next_retry_at FROM hc_reconciliation_checkpoints WHERE "
             "initialization_id = 'completed_before_0009'"
         ).fetchone() == ("completed", None, 4, None, None)
-        assert connection.execute(
-            "SELECT step FROM hc_reconciliation_attempts"
-        ).fetchall() == []
+        assert (
+            connection.execute("SELECT step FROM hc_reconciliation_attempts").fetchall()
+            == []
+        )
         checkpoint_ddl = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND "
             "name = 'hc_reconciliation_checkpoints'"
@@ -2020,9 +1994,7 @@ def test_0009_first_reconcile_issues_one_marked_legacy_broad_authorization(
         human = runtime.owners.human_collaboration
         assert human.query_broad_research_authorization(legacy["quest_ref"]) is None
         assert human.reconcile_once()
-        authorization = human.query_broad_research_authorization(
-            legacy["quest_ref"]
-        )
+        authorization = human.query_broad_research_authorization(legacy["quest_ref"])
         assert authorization is not None
         assert authorization["policy"]["schema_ref"] == (
             "meta-research/trusted-local-broad/v1"
@@ -2033,16 +2005,12 @@ def test_0009_first_reconcile_issues_one_marked_legacy_broad_authorization(
         assert authorization["target_assertion"] not in stored_assertions
         assert authorization["basis_preview_ref"] == legacy["preview_ref"]
         assert authorization["basis_preview_hash"] == legacy["preview_hash"]
-        assert authorization["confirmation_receipt_ref"] == (
-            legacy["confirmation_ref"]
-        )
-        assert authorization["confirmation_receipt_hash"] == (
-            legacy["confirmation_hash"]
+        assert authorization["confirmation_receipt_ref"] == (legacy["confirmation_ref"])
+        assert (
+            authorization["confirmation_receipt_hash"] == (legacy["confirmation_hash"])
         )
         assert authorization["quest_receipt_ref"] == legacy["quest_receipt_ref"]
-        assert authorization["quest_receipt_hash"] == (
-            legacy["quest_receipt_hash"]
-        )
+        assert authorization["quest_receipt_hash"] == (legacy["quest_receipt_hash"])
         assert authorization["receipt_ref"] not in {
             legacy["confirmation_ref"],
             legacy["quest_receipt_ref"],
@@ -2083,9 +2051,10 @@ def test_0009_first_reconcile_issues_one_marked_legacy_broad_authorization(
         assert replay is not None
         assert replay["receipt_ref"] == authorization_receipt_ref
         human.reconcile_once()
-        assert human.query_broad_research_authorization(legacy["quest_ref"])[
-            "receipt_ref"
-        ] == authorization_receipt_ref
+        assert (
+            human.query_broad_research_authorization(legacy["quest_ref"])["receipt_ref"]
+            == authorization_receipt_ref
+        )
         assert human.query_snapshot().facts["authorization_count"] == 1
     finally:
         restarted.close()
@@ -2109,9 +2078,7 @@ def test_0009_first_reconcile_issues_one_marked_legacy_broad_authorization(
 
     downgrade_database = tmp_path / "human-collaboration-downgrade.sqlite3"
     _upgrade_to_revision(downgrade_database, "0010_human_collaboration")
-    _downgrade_to_revision(
-        downgrade_database, "0009_manual_question_creation"
-    )
+    _downgrade_to_revision(downgrade_database, "0009_manual_question_creation")
     with sqlite3.connect(downgrade_database) as connection:
         assert connection.execute(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND "
@@ -2202,9 +2169,7 @@ def test_interrupted_0009_rolls_back_whole_revision_and_converges(
             "SELECT event_type, payload_json, recorded_at FROM durable_feed "
             "WHERE revision = 1"
         ).fetchone()
-        foreign_key_failures = connection.execute(
-            "PRAGMA foreign_key_check"
-        ).fetchall()
+        foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA quick_check").fetchone()
 
     assert version_after_failure == ("0008_quest_acquisition_session",)
@@ -2212,9 +2177,7 @@ def test_interrupted_0009_rolls_back_whole_revision_and_converges(
     assert "hc_legacy_broad_authorization_bases" not in tables_after_failure
     assert "owner_human_requests" not in tables_after_failure
     reconciliation_tables = {
-        name
-        for name in tables_after_failure
-        if name.startswith("hc_reconciliation_")
+        name for name in tables_after_failure if name.startswith("hc_reconciliation_")
     }
     assert reconciliation_tables == {
         "hc_reconciliation_checkpoints",
@@ -2274,12 +2237,10 @@ def test_interrupted_0009_rolls_back_whole_revision_and_converges(
             "SELECT event_type, payload_json, recorded_at FROM durable_feed "
             "WHERE revision = 1"
         ).fetchone()
-        foreign_key_failures = connection.execute(
-            "PRAGMA foreign_key_check"
-        ).fetchall()
+        foreign_key_failures = connection.execute("PRAGMA foreign_key_check").fetchall()
         integrity = connection.execute("PRAGMA quick_check").fetchone()
 
-    assert version == ("0012_experiment_measurement",)
+    assert version == ("0013_bundle_target_dag",)
     assert {
         "owner_human_requests",
         "hc_command_previews",
@@ -2465,14 +2426,11 @@ def test_0003_refuses_to_guess_when_multiple_active_initializations_exist(
             "SELECT version_num FROM alembic_version"
         ).fetchone() == ("0002_quest_initialization",)
         assert connection.execute(
-            "SELECT count(*) FROM hc_quest_initializations "
-            "WHERE status = 'draft'"
+            "SELECT count(*) FROM hc_quest_initializations WHERE status = 'draft'"
         ).fetchone() == (2,)
         columns = {
             row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(hc_quest_initializations)"
-            )
+            for row in connection.execute("PRAGMA table_info(hc_quest_initializations)")
         }
     assert "draft_schema_ref" not in columns
 
@@ -2547,14 +2505,16 @@ def test_interrupted_0009_restores_literature_identity_and_converges(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0012_experiment_measurement",)
+        ).fetchone() == ("0013_bundle_target_dag",)
         backfilled = connection.execute(
             "SELECT creation_context_kind, creation_context_ref, quest_ref "
             "FROM rm_literature_snapshots WHERE snapshot_ref = 'snapshot_before_0009'"
         ).fetchone()
         counters = {
             row[1]
-            for row in connection.execute("PRAGMA table_info(human_collaboration_state)")
+            for row in connection.execute(
+                "PRAGMA table_info(human_collaboration_state)"
+            )
         }
         tables = {
             row[0]
@@ -2665,6 +2625,6 @@ def test_0009_preserves_multiple_historical_root_snapshots_per_quest(
         ("quest_initialization", "quest_init_historical_snapshots", 2),
     ]
     assert context_index is not None
-    assert "WHERE creation_context_kind = 'manual_question_creation'" in (
-        context_index[0]
+    assert (
+        "WHERE creation_context_kind = 'manual_question_creation'" in (context_index[0])
     )

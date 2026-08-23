@@ -30,6 +30,7 @@ import {
   type AssetIntakeRequest,
   type AssetIntakeResult,
   type AssetReceipt,
+  type BundleStageProjection,
   type ExperimentProjection,
   type IdeaQuestionSummary,
   type IdeaStageProjection,
@@ -350,6 +351,7 @@ function questCreationReady(snapshot: PublicSnapshot | null): boolean {
       ![
         "idea_stage_worker",
         "plan_stage_worker",
+        "bundle_stage_worker",
         "experiment_worker",
         "research_asset_intake_worker",
         "research_asset_verification_worker",
@@ -510,6 +512,7 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
   const creation = snapshot.quest_creation.current;
   const ideaStage = snapshot.idea_stage ?? null;
   const planStage = snapshot.plan_stage ?? null;
+  const bundleStage = snapshot.bundle_stage ?? null;
 
   if (!ready) {
     const failedChecks = snapshot.readiness.checks
@@ -556,6 +559,15 @@ function SnapshotHero({ snapshot }: { snapshot: PublicSnapshot }) {
           </div>
         </div>
       </>
+    );
+  }
+
+  if (bundleStage) {
+    return (
+      <BundleStageHero
+        bundleStage={bundleStage}
+        question={bundleQuestion(bundleStage, snapshot)}
+      />
     );
   }
 
@@ -657,6 +669,21 @@ function planQuestion(
     graph_revision: snapshot?.owners.research_graph?.revision,
     ...(creation?.proposal?.content ?? {}),
     ...(planStage.stage_run_request?.accepted_question_binding ?? {}),
+    ...(snapshot?.research_space.current_question ?? {}),
+  };
+}
+
+function bundleQuestion(
+  bundleStage: BundleStageProjection,
+  snapshot?: PublicSnapshot,
+): IdeaQuestionSummary {
+  const creation = snapshot?.quest_creation.current;
+  return {
+    quest_ref: creation?.quest_ref,
+    question_ref: bundleStage.eligibility.question_ref ?? creation?.question_ref,
+    graph_revision: snapshot?.owners.research_graph?.revision,
+    ...(creation?.proposal?.content ?? {}),
+    ...(bundleStage.stage_run_request?.accepted_question_binding ?? {}),
     ...(snapshot?.research_space.current_question ?? {}),
   };
 }
@@ -780,13 +807,68 @@ function PlanStageHero({
   );
 }
 
+function BundleStageHero({
+  bundleStage,
+  question,
+}: {
+  bundleStage: BundleStageProjection;
+  question: IdeaQuestionSummary;
+}) {
+  const committed = Boolean(bundleStage.stage_commit);
+  const skipped = bundleStage.disposition.status === "skipped";
+  const realized = bundleStage.target_commits.length;
+  const total = bundleStage.target_graph.targets.length;
+
+  return (
+    <>
+      <p className="lumen-eyebrow">Research cycle · Bundle Projection</p>
+      <h1 id="workspace-title">
+        {skipped
+          ? "Bundle 已按精确 basis 跳过。"
+          : committed
+            ? "Target closure 已形成正式交接。"
+            : "从 FormalPlan 的 GapSet 出发。"}<br />
+        <em>
+          {skipped
+            ? "没有空 Run、伪 Target 或伪 TargetCommit。"
+            : committed
+              ? "负面结果也是可复用的已实现事实。"
+              : `${realized}/${total || "—"} TargetCommit 已冻结。`}
+        </em>
+      </h1>
+      <p>
+        {question.unknown_statement
+          ?? "Bundle root Session 负责调度；Target DAG、TargetRun 和 TargetCommit 仍由各自 Owner 独立拥有。"}
+      </p>
+      <ol className="lumen-stage-strip" aria-label="当前研究周期的四个 Stage">
+        <li className="done"><small>01 · COMMITTED</small><b>Idea</b></li>
+        <li className="done"><small>02 · COMMITTED</small><b>Plan</b></li>
+        <li
+          className={committed ? "done" : "current"}
+          aria-current={committed ? undefined : "step"}
+        >
+          <small>{skipped ? "03 · SKIPPED" : committed ? "03 · COMMITTED" : "03 · NOW"}</small>
+          <b>Bundle</b>
+        </li>
+        <li
+          className={committed ? "current" : undefined}
+          aria-current={committed ? "step" : undefined}
+        >
+          <small>04 · {committed ? "NOW" : "REQUIRED"}</small>
+          <b>Reasoning</b>
+        </li>
+      </ol>
+    </>
+  );
+}
+
 function CurrentQuestionCard({
   stage,
   question,
   experiment,
   onOpenExperiment,
 }: {
-  stage: "Idea" | "Plan";
+  stage: "Idea" | "Plan" | "Bundle";
   question: IdeaQuestionSummary;
   experiment: ExperimentProjection | null;
   onOpenExperiment: (trigger: HTMLElement) => void;
@@ -1520,6 +1602,255 @@ function PlanStageCard({
   );
 }
 
+type BundleStageState =
+  | "eligibility"
+  | "stage-run-request"
+  | "root-run"
+  | "target-work"
+  | "stage-commit";
+
+function bundleStageHealthBlocker(
+  snapshot: PublicSnapshot | null,
+): IdeaStageHealthBlocker | null {
+  const worker = snapshot?.readiness.checks.find(
+    (check) => check.name === "bundle_stage_worker" && check.status !== "ready",
+  );
+  if (!worker) return null;
+  return { code: worker.reason?.code ?? `bundle_stage_worker_${worker.status}` };
+}
+
+function currentBundleStageState(
+  bundleStage: BundleStageProjection,
+): BundleStageState {
+  if (bundleStage.stage_commit) return "stage-commit";
+  if (bundleStage.target_graph.status !== "not_attempted") return "target-work";
+  if (bundleStage.run) return "root-run";
+  if (bundleStage.stage_run_request) return "stage-run-request";
+  return "eligibility";
+}
+
+function bundleFactRows(
+  bundleStage: BundleStageProjection,
+  phase: BundleStageState,
+): ReturnType<typeof ideaFactRows> {
+  const request = bundleStage.stage_run_request;
+  const run = bundleStage.run;
+  const graph = bundleStage.target_graph;
+  const commit = bundleStage.stage_commit;
+  const skipped = bundleStage.disposition.status === "skipped";
+  const targetCount = graph.targets.length;
+  const committedCount = bundleStage.target_commits.length;
+  const blockedTargets = graph.targets.filter((target) =>
+    ["blocked", "failed", "fenced", "replan_required"].includes(target.status)
+  );
+
+  return [
+    {
+      slot: "eligibility",
+      label: "Bundle eligibility",
+      owner: "AE",
+      state: bundleStage.eligibility.status === "eligible"
+        ? phase === "eligibility" ? "current" : "done"
+        : "blocked",
+      title: bundleStage.eligibility.status === "eligible"
+        ? "已接纳 FormalPlan 与精确 GapSet，Bundle 具备处理资格"
+        : `Bundle eligibility · ${bundleStage.eligibility.status}`,
+      status: bundleStage.eligibility.status,
+    },
+    {
+      slot: "stage-run-request",
+      label: "StageRunRequest",
+      owner: "AE",
+      state: request
+        ? phase === "stage-run-request" ? "current" : "done"
+        : "pending",
+      title: request
+        ? "已冻结 AcceptedFormalPlanBinding、request epoch 与 ContextPack"
+        : "等待 Advancement Engine 签发冻结请求",
+      status: request ? request.status ?? "issued" : "not_issued",
+    },
+    {
+      slot: "root-run",
+      label: "Bundle root Run",
+      owner: "AR",
+      state: skipped
+        ? "done"
+        : run
+          ? isRunBlocked(run.status)
+            ? "blocked"
+            : run.status === "completed" ? "done" : "current"
+          : "pending",
+      title: skipped
+        ? "GapSet 为空；未创建 Bundle Run"
+        : run
+          ? "一个 root/native Session 调度正式 Target；child agent 不进入 Target DAG"
+          : "等待 Agent Runtime admission",
+      status: skipped ? "not_created_by_design" : run?.status ?? "not_created",
+    },
+    {
+      slot: "target-dag",
+      label: "Target DAG / frontier",
+      owner: "RG",
+      state: skipped
+        ? "done"
+        : graph.status === "accepted"
+          ? blockedTargets.length ? "blocked" : "done"
+          : "pending",
+      title: skipped
+        ? "GapSet 为空；未制造伪 Target"
+        : graph.status === "accepted"
+          ? `${targetCount} Target · ${graph.frontier.length} frontier；身份与依赖由 RG 拥有`
+          : "等待 RG 接纳正式 Target identity/spec/DAG",
+      status: skipped ? "not_created_by_design" : graph.status,
+    },
+    {
+      slot: "target-closure",
+      label: "TargetRun → TargetCommit",
+      owner: "AR / RM / RG",
+      state: skipped
+        ? "done"
+        : blockedTargets.length
+          ? "blocked"
+          : targetCount > 0 && committedCount === targetCount
+            ? "done"
+            : graph.status === "accepted" ? "current" : "pending",
+      title: skipped
+        ? "没有 TargetRun 或 TargetCommit"
+        : `${committedCount}/${targetCount} closure 已冻结；已接纳的局部结果不会被其他失败抹掉`,
+      status: skipped
+        ? "not_attempted"
+        : blockedTargets.length
+          ? "partial_blocked"
+          : bundleStage.disposition.status,
+    },
+    {
+      slot: "stage-commit",
+      label: "Bundle StageCommit",
+      owner: "AE",
+      state: commit ? "done" : committedCount === targetCount && targetCount > 0
+        ? "current"
+        : "pending",
+      title: commit
+        ? `StageCommit(${commit.status}) 已验证全部 closure 与 Owner receipts`
+        : "尚无 StageCommit；Target Agent 与资产存在都不能提前推进",
+      status: commit?.status ?? "not_committed",
+    },
+  ];
+}
+
+function BundleStageCard({
+  bundleStage,
+  healthBlocker,
+}: {
+  bundleStage: BundleStageProjection;
+  healthBlocker: IdeaStageHealthBlocker | null;
+}) {
+  const phase = currentBundleStageState(bundleStage);
+  const rows = bundleFactRows(bundleStage, phase);
+  const request = bundleStage.stage_run_request;
+  const run = bundleStage.run;
+  const graph = bundleStage.target_graph;
+  const commit = bundleStage.stage_commit;
+  const formalPlan = request?.accepted_formal_plan_binding ?? {};
+
+  return (
+    <section
+      className="lumen-card lumen-idea-card lumen-plan-card lumen-bundle-card"
+      aria-labelledby="bundle-stage-title"
+      data-testid="bundle-stage-card"
+      data-bundle-stage-state={phase}
+    >
+      <header className="lumen-card-head">
+        <b id="bundle-stage-title">Bundle 的六层事实</b>
+        <small>root Session ≠ Target DAG ≠ TargetRun ≠ TargetCommit</small>
+      </header>
+      {healthBlocker ? (
+        <div
+          className="lumen-idea-health-blocker"
+          data-testid="bundle-stage-health-blocker"
+          role="status"
+        >
+          <span aria-hidden="true">!</span>
+          <div>
+            <b>Bundle 自动推进暂时不可用</b>
+            <small>已接纳的 TargetCommit 保持可见；worker 恢复后按 Target identity 继续。</small>
+          </div>
+          <code>{healthBlocker.code}</code>
+        </div>
+      ) : null}
+      <div className="lumen-idea-facts" role="list">
+        {rows.map((row) => (
+          <article
+            key={row.slot}
+            className="lumen-idea-fact"
+            data-bundle-slot={row.slot}
+            data-state={row.state}
+            role="listitem"
+          >
+            <span className="lumen-idea-fact-mark" aria-hidden="true">
+              {row.state === "done" ? "✓" : row.state === "blocked" ? "!" : "→"}
+            </span>
+            <div><small>{row.label}</small><b>{row.title}</b><code>{row.status}</code></div>
+            <span>{row.owner}</span>
+          </article>
+        ))}
+      </div>
+      {graph.targets.length ? (
+        <div className="lumen-bundle-targets" data-testid="bundle-target-list">
+          {graph.targets.map((target) => {
+            const targetCommit = bundleStage.target_commits.find(
+              (candidate) => candidate.target_ref === target.target_ref,
+            );
+            return (
+              <article key={target.target_ref} data-target-status={target.status}>
+                <span>{target.status === "committed" ? "✓" : target.status === "ready" ? "→" : "·"}</span>
+                <p>
+                  <b>{target.target_key}</b>
+                  <small>
+                    {target.target_ref} · {target.target_run_ref ?? "TargetRun pending"}
+                  </small>
+                </p>
+                <code>
+                  {targetCommit?.result_disposition
+                    ?? target.blocker?.code
+                    ?? target.status}
+                </code>
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
+      <details className="lumen-idea-details">
+        <summary>查看 Bundle、Target 与 receipt 身份</summary>
+        <dl>
+          <IdeaDetail label="Cycle" value={bundleStage.eligibility.cycle_ref} />
+          <IdeaDetail label="FormalPlan" value={bundleStage.eligibility.formal_plan_ref} />
+          <IdeaDetail label="StageRunRequest" value={request?.request_ref} />
+          <IdeaDetail label="StageRunRequest receipt" value={receiptRef(request?.receipt)} />
+          <IdeaDetail label="AcceptedFormalPlanBinding" value={recordText(formalPlan, "formal_plan_ref")} />
+          <IdeaDetail label="Plan StageCommit" value={recordText(formalPlan, "stage_commit_ref")} />
+          <IdeaDetail label="ContextPack" value={request?.context_pack_ref} />
+          <IdeaDetail label="Bundle Run" value={run?.run_ref} />
+          <IdeaDetail label="Root Session" value={run?.root_session_ref} />
+          <IdeaDetail label="Native Session" value={run?.native_session_ref} />
+          <IdeaDetail label="Attempt" value={run?.attempt_ref} />
+          <IdeaDetail label="Fence" value={run?.fence_ref} />
+          <IdeaDetail label="Child reviewer agent" value={run?.review?.reviewer_agent_ref} />
+          <IdeaDetail label="TargetGraph" value={graph.graph_ref} />
+          <IdeaDetail label="TargetGraph receipt" value={receiptRef(graph.receipt)} />
+          <IdeaDetail label="Target count" value={graph.targets.length} />
+          <IdeaDetail label="Frontier count" value={graph.frontier.length} />
+          <IdeaDetail label="TargetCommit count" value={bundleStage.target_commits.length} />
+          <IdeaDetail label="Baseline Pool count" value={bundleStage.baseline_pool.length} />
+          <IdeaDetail label="StageCommit" value={commit?.commit_ref ?? commit?.stage_commit_ref} />
+          <IdeaDetail label="StageCommit receipt" value={receiptRef(commit?.receipt)} />
+          <IdeaDetail label="Next Stage" value={commit?.next_stage} />
+        </dl>
+      </details>
+    </section>
+  );
+}
+
 function WorkspaceMain({
   snapshot,
   state,
@@ -1544,10 +1875,16 @@ function WorkspaceMain({
   const planStage = snapshot?.research_space.status === "active"
     ? snapshot.plan_stage ?? null
     : null;
+  const bundleStage = snapshot?.research_space.status === "active"
+    ? snapshot.bundle_stage ?? null
+    : null;
   const ideaHealthBlocker = ideaStageHealthBlocker(snapshot);
   const planHealthBlocker = planStageHealthBlocker(snapshot);
+  const bundleHealthBlocker = bundleStageHealthBlocker(snapshot);
   const experiment = snapshot?.experiment?.current ?? null;
-  const question = planStage
+  const question = bundleStage
+    ? bundleQuestion(bundleStage, snapshot ?? undefined)
+    : planStage
     ? planQuestion(planStage, snapshot ?? undefined)
     : ideaStage
       ? ideaQuestion(ideaStage, snapshot ?? undefined)
@@ -1583,7 +1920,14 @@ function WorkspaceMain({
       </section>
 
       <div className="lumen-lower">
-        {planStage ? (
+        {bundleStage ? (
+          <CurrentQuestionCard
+            stage="Bundle"
+            question={question!}
+            experiment={experiment}
+            onOpenExperiment={onOpenExperiment}
+          />
+        ) : planStage ? (
           <CurrentQuestionCard
             stage="Plan"
             question={question!}
@@ -1613,7 +1957,12 @@ function WorkspaceMain({
           </section>
         )}
 
-        {planStage ? (
+        {bundleStage ? (
+          <BundleStageCard
+            bundleStage={bundleStage}
+            healthBlocker={bundleHealthBlocker}
+          />
+        ) : planStage ? (
           <PlanStageCard
             planStage={planStage}
             healthBlocker={planHealthBlocker}
