@@ -1560,6 +1560,13 @@ class SQLiteHumanCollaborationLadder:
                 connection, idempotency_key, "command_confirm", command_hash
             )
             if replay is None:
+                if writing_snapshot is not None:
+                    if self._writing_snapshot_verifier is None:
+                        raise OwnerConflict("writing_snapshot_verifier_unavailable")
+                    # Close the verify-to-confirm race under the process-local
+                    # writer lock. A research-basis mutation that wins before
+                    # this transaction must make the frozen preview stale.
+                    self._writing_snapshot_verifier(writing_snapshot)
                 preview = connection.execute(
                     text(
                         "SELECT * FROM hc_command_previews WHERE preview_ref = "

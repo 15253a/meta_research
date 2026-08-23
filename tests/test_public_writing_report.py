@@ -1537,6 +1537,103 @@ def test_confirmation_fails_closed_when_frozen_research_snapshot_is_stale(
         runtime.close()
 
 
+def test_confirmation_rechecks_concurrent_basis_mutation_before_writer_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime(tmp_path / "writing-confirm-currentness-race")
+    basis_mutated = threading.Event()
+    confirmation_thread: threading.Thread | None = None
+    try:
+        quest = _confirm_direct_quest(runtime)
+        drafted = runtime.writing.create_report_intent(
+            quest_ref=quest["quest_ref"],
+            title="并发 Snapshot 报告",
+            audience="研究负责人",
+            purpose="验证确认时序保护",
+            instructions="不得确认已经过期的研究 basis。",
+            idempotency_key="writing-race-create",
+        )
+        previewed = runtime.writing.preview_report_intent(
+            drafted["intent_id"], idempotency_key="writing-race-preview"
+        )
+        preview = previewed["impact_preview"]
+
+        ladder = runtime.owners.human_collaboration._collaboration_ladder
+        verifier = ladder._writing_snapshot_verifier
+        assert verifier is not None
+        first_verification_finished = threading.Event()
+        verification_calls = 0
+        confirmation_outcome: list[object] = []
+
+        def coordinated_verifier(snapshot: dict[str, object]) -> None:
+            nonlocal verification_calls
+            verification_calls += 1
+            verifier(snapshot)
+            if verification_calls == 1:
+                first_verification_finished.set()
+                assert basis_mutated.wait(timeout=5)
+
+        monkeypatch.setattr(
+            ladder, "_writing_snapshot_verifier", coordinated_verifier
+        )
+
+        def confirm() -> None:
+            try:
+                confirmation_outcome.append(
+                    runtime.writing.confirm_report_intent(
+                        drafted["intent_id"],
+                        draft_revision=previewed["draft_revision"],
+                        draft_hash=previewed["draft_hash"],
+                        preview_ref=preview["preview_ref"],
+                        preview_hash=preview["preview_hash"],
+                        idempotency_key="writing-race-confirm",
+                    )
+                )
+            except BaseException as error:
+                confirmation_outcome.append(error)
+
+        confirmation_thread = threading.Thread(target=confirm, daemon=True)
+        confirmation_thread.start()
+        assert first_verification_finished.wait(timeout=5)
+
+        source = runtime.owners.research_memory.submit_asset_intake(
+            AssetIntakeRequest(
+                source_kind="text",
+                custody_mode="managed",
+                display_name="racing-evidence.txt",
+                content=b"accepted while confirmation is waiting\n",
+            ),
+            idempotency_key="writing-race-source",
+        )
+        assert source.asset is not None
+        runtime.owners.research_graph.accept_asset_role(
+            binding=source.asset.as_binding(),
+            role="evidence",
+            quest_ref=quest["quest_ref"],
+            idempotency_key="writing-race-role",
+        )
+        basis_mutated.set()
+
+        confirmation_thread.join(timeout=5)
+        assert not confirmation_thread.is_alive()
+        assert len(confirmation_outcome) == 1
+        error = confirmation_outcome[0]
+        assert isinstance(error, OwnerConflict)
+        assert error.code == "writing_snapshot_stale"
+        assert verification_calls == 2
+        assert runtime.owners.agent_runtime.query_writing_report_by_intent(
+            drafted["intent_id"]
+        ) is None
+        current = runtime.writing.query_report_intent(drafted["intent_id"])
+        assert current["status"] == "previewed"
+        assert current["confirmation_receipt"] is None
+    finally:
+        basis_mutated.set()
+        if confirmation_thread is not None:
+            confirmation_thread.join(timeout=5)
+        runtime.close()
+
+
 def test_confirmation_ignores_unrelated_owner_revision_bookkeeping(
     tmp_path: Path,
 ) -> None:
