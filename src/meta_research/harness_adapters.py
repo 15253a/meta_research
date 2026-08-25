@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -151,6 +152,7 @@ class HarnessInvocation:
     native_session_ref: str | None = None
     target_workspace_ref: str | None = None
     working_directory: str | None = None
+    provider_operation_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +235,8 @@ class HarnessAdapter(Protocol):
 
     def installation_profile(self) -> dict[str, object]: ...
 
+    def provider_operation_timeout_seconds(self, *, target_root: bool) -> float: ...
+
 
 class _NativeCliHarnessAdapter:
     family: HarnessFamily
@@ -272,6 +276,15 @@ class _NativeCliHarnessAdapter:
                     Path(codex_home)
                 )
 
+    def provider_operation_timeout_seconds(self, *, target_root: bool) -> float:
+        """Return the ceiling to freeze before a durable request is signed."""
+
+        return (
+            self._target_root_timeout_seconds
+            if target_root
+            else self._timeout_seconds
+        )
+
     def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
         self._validate_invocation(invocation)
         provider_version = self._provider_version()
@@ -280,8 +293,8 @@ class _NativeCliHarnessAdapter:
         evidence_scope_ref = _harness_evidence_scope_ref(invocation)
         observation_scope = _target_root_observation_scope(invocation)
         timeout_seconds = (
-            self._target_root_timeout_seconds
-            if invocation.target_workspace_ref is not None
+            invocation.provider_operation_timeout_seconds
+            if invocation.provider_operation_timeout_seconds is not None
             else self._timeout_seconds
         )
         environment = {
@@ -625,6 +638,24 @@ class _NativeCliHarnessAdapter:
             or invocation.attempt_generation < 1
             or not invocation.mcp_url.startswith("http://")
             or (
+                invocation.provider_operation_timeout_seconds is not None
+                and (
+                    not isinstance(
+                        invocation.provider_operation_timeout_seconds,
+                        (int, float),
+                    )
+                    or isinstance(
+                        invocation.provider_operation_timeout_seconds, bool
+                    )
+                    or not math.isfinite(
+                        float(invocation.provider_operation_timeout_seconds)
+                    )
+                    or not 0
+                    < float(invocation.provider_operation_timeout_seconds)
+                    <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+                )
+            )
+            or (
                 invocation.working_directory is not None
                 and (
                     invocation.target_workspace_ref is None
@@ -635,7 +666,10 @@ class _NativeCliHarnessAdapter:
             )
             or (
                 invocation.target_workspace_ref is not None
-                and invocation.working_directory is None
+                and (
+                    invocation.working_directory is None
+                    or invocation.provider_operation_timeout_seconds is None
+                )
             )
         ):
             raise HarnessAdapterUnavailable("harness_invocation_invalid")

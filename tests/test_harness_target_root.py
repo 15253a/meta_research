@@ -121,12 +121,17 @@ class _TargetRootAdapter:
         fail_first_code: str | None = None,
         missing_capabilities: frozenset[str] = frozenset(),
         evidence_free_capability: str | None = None,
+        target_root_timeout_seconds: float = 30 * 24 * 60 * 60,
     ) -> None:
         self.family = family
         self.fail_first_code = fail_first_code
         self.missing_capabilities = missing_capabilities
         self.evidence_free_capability = evidence_free_capability
+        self.target_root_timeout_seconds = target_root_timeout_seconds
         self.invocations: list[HarnessInvocation] = []
+
+    def provider_operation_timeout_seconds(self, *, target_root: bool) -> float:
+        return self.target_root_timeout_seconds if target_root else 300.0
 
     def installation_profile(self) -> dict[str, object]:
         return {
@@ -502,7 +507,9 @@ class _Owner:
         return self.observation_page
 
 
-def _target_request() -> TargetHarnessRequest:
+def _target_request(
+    *, provider_operation_timeout_seconds: float | None = 7 * 24 * 60 * 60
+) -> TargetHarnessRequest:
     full_conformance_binding = {"contract_ref": "test/full-conformance/v1"}
     return TargetHarnessRequest(
         request_ref="target-harness-request:test",
@@ -516,6 +523,7 @@ def _target_request() -> TargetHarnessRequest:
         full_conformance_binding=full_conformance_binding,
         full_conformance_binding_hash=canonical_hash(full_conformance_binding),
         target_scope_binding_hash="c" * 64,
+        provider_operation_timeout_seconds=provider_operation_timeout_seconds,
     )
 
 
@@ -926,6 +934,123 @@ def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
     assert protection.query_evidence()["inhibitor"]["active_count"] == 0
     protection.close()
     database.close()
+
+
+def test_target_root_reconciliation_keeps_the_admitted_operation_timeout(
+    tmp_path: Path,
+) -> None:
+    admitted_timeout_seconds = 7 * 24 * 60 * 60
+    request = _target_request(
+        provider_operation_timeout_seconds=admitted_timeout_seconds
+    )
+    owner = _Owner(request)
+    interrupted_adapter = _TargetRootAdapter(
+        "codex",
+        fail_first_code="provider_timeout",
+        target_root_timeout_seconds=admitted_timeout_seconds,
+    )
+    interrupted = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (interrupted_adapter, _TargetRootAdapter("claude")),
+    )
+    interrupted.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    prompt = "Own implementation through final training completion."
+
+    with pytest.raises(
+        HarnessAdmissionError, match="provider_timeout"
+    ):
+        interrupted.run_or_resume_target_root(
+            request.request_ref,
+            prompt=prompt,
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+    original_operation = owner.operations[0]
+
+    restarted_adapter = _TargetRootAdapter(
+        "codex", target_root_timeout_seconds=60.0
+    )
+    restarted = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (restarted_adapter, _TargetRootAdapter("claude")),
+    )
+    restarted.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    completed = restarted.run_or_resume_target_root(
+        request.request_ref,
+        prompt=prompt,
+        mcp_base_url="http://127.0.0.1:8765",
+    )
+
+    assert completed.status == "executed"
+    assert len(owner.operations) == 1
+    assert owner.operations[0].operation_ref == original_operation.operation_ref
+    assert owner.operations[0].invocation_hash == original_operation.invocation_hash
+    assert interrupted_adapter.invocations[0].provider_operation_timeout_seconds == (
+        admitted_timeout_seconds
+    )
+    assert restarted_adapter.invocations[0].provider_operation_timeout_seconds == (
+        admitted_timeout_seconds
+    )
+
+    changed_request = replace(
+        request, provider_operation_timeout_seconds=60.0
+    )
+    changed_owner = _Owner(changed_request)
+    changed_adapter = _TargetRootAdapter(
+        "codex",
+        fail_first_code="provider_timeout",
+        target_root_timeout_seconds=60.0,
+    )
+    changed_runtime = HarnessRuntime(
+        changed_owner,
+        _Gateway(),
+        (changed_adapter, _TargetRootAdapter("claude")),
+    )
+    changed_runtime.bind_target_workspace_resolver(
+        _WorkspaceResolver(tmp_path)
+    )
+    with pytest.raises(HarnessAdmissionError, match="provider_timeout"):
+        changed_runtime.run_or_resume_target_root(
+            changed_request.request_ref,
+            prompt=prompt,
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+    assert changed_owner.operations[0].operation_ref == (
+        original_operation.operation_ref
+    )
+    assert changed_owner.operations[0].invocation_hash != (
+        original_operation.invocation_hash
+    )
+
+
+def test_legacy_target_request_without_frozen_timeout_fails_closed(
+    tmp_path: Path,
+) -> None:
+    request = _target_request(provider_operation_timeout_seconds=None)
+    owner = _Owner(request)
+    restarted_adapter = _TargetRootAdapter(
+        "codex", target_root_timeout_seconds=60.0
+    )
+    runtime = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (restarted_adapter, _TargetRootAdapter("claude")),
+    )
+    runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+
+    with pytest.raises(
+        HarnessAdmissionError,
+        match="target_harness_runtime_binding_unavailable",
+    ):
+        runtime.run_or_resume_target_root(
+            request.request_ref,
+            prompt="Own implementation through final training completion.",
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+
+    assert "provider_operation_timeout_seconds" not in owner.run.request
+    assert restarted_adapter.invocations == []
 
 
 def test_target_root_repeated_unknown_reconciliation_keeps_one_operation_and_hold(

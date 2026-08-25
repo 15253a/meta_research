@@ -48,6 +48,9 @@ class _FullConformanceAdapter:
             "status": "ready",
         }
 
+    def provider_operation_timeout_seconds(self, *, target_root: bool) -> float:
+        return 30 * 24 * 60 * 60 if target_root else 300.0
+
     def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
         self.invocations.append(invocation)
         native_session_ref = (

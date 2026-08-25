@@ -63,6 +63,7 @@ def _owner_with_failed_admission(
         full_conformance_binding=full_conformance,
         full_conformance_binding_hash=canonical_hash(full_conformance),
         target_scope_binding_hash="c" * 64,
+        provider_operation_timeout_seconds=30 * 24 * 60 * 60,
     )
     reserved = owner.reserve_admission(
         request=request.as_dict(),
@@ -173,6 +174,7 @@ def _owner_with_active_root(
         full_conformance_binding=full_conformance,
         full_conformance_binding_hash=canonical_hash(full_conformance),
         target_scope_binding_hash="c" * 64,
+        provider_operation_timeout_seconds=30 * 24 * 60 * 60,
     )
     reserved = owner.reserve_admission(
         request=request.as_dict(),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import math
 import re
 import secrets
 from dataclasses import dataclass, replace
@@ -28,7 +29,10 @@ from meta_research.owners.agent_runtime_harness import (
     TargetRootObservationPage,
 )
 from meta_research.owners.common import canonical_hash
-from meta_research.provider_supervisor import provider_operation_ref
+from meta_research.provider_supervisor import (
+    PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS,
+    provider_operation_ref,
+)
 from meta_research.runtime_protection import (
     RuntimeBoundaryRecorder,
     RuntimeEffectIdentity,
@@ -245,9 +249,10 @@ class TargetHarnessRequest(HarnessProbeRequest):
     full_conformance_binding: dict[str, object]
     full_conformance_binding_hash: str
     target_scope_binding_hash: str
+    provider_operation_timeout_seconds: float | None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             **super().as_dict(),
             "target_ref": self.target_ref,
             "target_run_ref": self.target_run_ref,
@@ -255,6 +260,11 @@ class TargetHarnessRequest(HarnessProbeRequest):
             "full_conformance_binding_hash": self.full_conformance_binding_hash,
             "target_scope_binding_hash": self.target_scope_binding_hash,
         }
+        if self.provider_operation_timeout_seconds is not None:
+            value["provider_operation_timeout_seconds"] = (
+                self.provider_operation_timeout_seconds
+            )
+        return value
 
 
 @dataclass(frozen=True)
@@ -879,6 +889,9 @@ class HarnessRuntime:
         """
 
         full_conformance = self.require_full_conformance_binding()
+        provider_operation_timeout_seconds = (
+            self._target_provider_operation_timeout_seconds(harness_family)
+        )
         target_scope_binding_hash = canonical_hash(target_scope_binding)
         request_material = {
             "target_ref": target_ref,
@@ -890,6 +903,9 @@ class HarnessRuntime:
             "required_capabilities": list(HARNESS_CAPABILITIES),
             "full_conformance_binding_hash": full_conformance.binding_hash,
             "target_scope_binding_hash": target_scope_binding_hash,
+            "provider_operation_timeout_seconds": (
+                provider_operation_timeout_seconds
+            ),
         }
         request_ref = f"trh1:{canonical_hash(request_material)}"
         request = TargetHarnessRequest(
@@ -904,12 +920,43 @@ class HarnessRuntime:
             full_conformance_binding=full_conformance.as_dict(),
             full_conformance_binding_hash=full_conformance.binding_hash,
             target_scope_binding_hash=target_scope_binding_hash,
+            provider_operation_timeout_seconds=(
+                provider_operation_timeout_seconds
+            ),
         )
         return self._admit_request(
             request,
             idempotency_key=request_ref,
             authoritative_run_ref=target_run_ref,
         )
+
+    def _target_provider_operation_timeout_seconds(
+        self, harness_family: HarnessFamily
+    ) -> float:
+        adapter = self._adapters[harness_family]
+        binding_reader = getattr(
+            adapter, "provider_operation_timeout_seconds", None
+        )
+        if not callable(binding_reader):
+            raise HarnessAdmissionError(
+                "target_harness_runtime_binding_unavailable"
+            )
+        try:
+            value = binding_reader(target_root=True)
+        except Exception as error:
+            raise HarnessAdmissionError(
+                "target_harness_runtime_binding_unavailable"
+            ) from error
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or not 0 < float(value) <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+        ):
+            raise HarnessAdmissionError(
+                "target_harness_runtime_binding_invalid"
+            )
+        return float(value)
 
     def admit_target_run_from_current_conformance(
         self,
@@ -1803,6 +1850,11 @@ class HarnessRuntime:
                         if working_directory is None
                         else str(working_directory)
                     ),
+                    provider_operation_timeout_seconds=(
+                        request.provider_operation_timeout_seconds
+                        if isinstance(request, TargetHarnessRequest)
+                        else None
+                    ),
                 )
             )
         except HarnessAdapterUnavailable as error:
@@ -2440,6 +2492,9 @@ class HarnessRuntime:
                         request.full_conformance_binding_hash
                     ),
                     "target_scope_binding_hash": request.target_scope_binding_hash,
+                    "provider_operation_timeout_seconds": (
+                        request.provider_operation_timeout_seconds
+                    ),
                 }
             )
         return canonical_hash(material)
@@ -2484,19 +2539,35 @@ class HarnessRuntime:
             != len(set(request.required_capabilities))
         ):
             raise HarnessAdmissionError("harness_probe_request_invalid")
-        if isinstance(request, TargetHarnessRequest) and (
-            not request.target_ref
-            or len(request.target_ref) > 96
-            or not request.target_run_ref
-            or len(request.target_run_ref) > 96
-            or canonical_hash(request.full_conformance_binding)
-            != request.full_conformance_binding_hash
-            or len(request.full_conformance_binding_hash) != 64
-            or len(request.target_scope_binding_hash) != 64
-            or request.required_operation_ids != TARGET_RUN_SEMANTIC_OPERATION_IDS
-            or request.required_capabilities != HARNESS_CAPABILITIES
-        ):
-            raise HarnessAdmissionError("target_harness_request_invalid")
+        if isinstance(request, TargetHarnessRequest):
+            if request.provider_operation_timeout_seconds is None:
+                raise HarnessAdmissionError(
+                    "target_harness_runtime_binding_unavailable"
+                )
+            if (
+                not request.target_ref
+                or len(request.target_ref) > 96
+                or not request.target_run_ref
+                or len(request.target_run_ref) > 96
+                or canonical_hash(request.full_conformance_binding)
+                != request.full_conformance_binding_hash
+                or len(request.full_conformance_binding_hash) != 64
+                or len(request.target_scope_binding_hash) != 64
+                or request.required_operation_ids
+                != TARGET_RUN_SEMANTIC_OPERATION_IDS
+                or request.required_capabilities != HARNESS_CAPABILITIES
+                or not isinstance(
+                    request.provider_operation_timeout_seconds, (int, float)
+                )
+                or isinstance(request.provider_operation_timeout_seconds, bool)
+                or not math.isfinite(
+                    float(request.provider_operation_timeout_seconds)
+                )
+                or not 0
+                < float(request.provider_operation_timeout_seconds)
+                <= PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS
+            ):
+                raise HarnessAdmissionError("target_harness_request_invalid")
 
     def _begin_operation_reconciliation(self, operation_ref: str) -> int:
         try:
@@ -2711,6 +2782,9 @@ class HarnessRuntime:
                     target_scope_binding_hash=str(
                         value["target_scope_binding_hash"]
                     ),
+                    provider_operation_timeout_seconds=value.get(
+                        "provider_operation_timeout_seconds"
+                    ),
                 )
             else:
                 request = HarnessProbeRequest(**base)
@@ -2909,7 +2983,7 @@ def _turn_invocation_material(
     resume: bool,
     workspace_ref: str | None,
 ) -> dict[str, object]:
-    return {
+    material: dict[str, object] = {
         "schema_ref": "meta-research/harness-invocation/v1",
         "operation_ref": operation_ref,
         "generation": generation,
@@ -2929,6 +3003,11 @@ def _turn_invocation_material(
         "capability_binding_hash": admission.run.capability_binding_hash,
         "target_workspace_ref": workspace_ref,
     }
+    if isinstance(request, TargetHarnessRequest):
+        material["provider_operation_timeout_seconds"] = (
+            request.provider_operation_timeout_seconds
+        )
+    return material
 
 
 def _channel_scope(

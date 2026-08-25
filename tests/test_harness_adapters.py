@@ -852,7 +852,7 @@ def test_startup_provider_diagnostic_is_fresh_and_binary_identity_bound(
         runtime.close()
 
 
-def test_target_root_uses_configurable_long_task_timeout_not_interactive_watchdog(
+def test_target_root_uses_frozen_operation_timeout_not_adapter_restart_config(
     tmp_path: Path,
 ) -> None:
     class SlowRecordedRunner(_RecordedRunner):
@@ -895,11 +895,12 @@ def test_target_root_uses_configurable_long_task_timeout_not_interactive_watchdo
             _invocation("codex"),
             target_workspace_ref="target-workspace:long-root",
             working_directory=str(target_workspace),
+            provider_operation_timeout_seconds=0.4,
         )
     )
 
     assert evidence.native_session_ref == "long-root"
-    assert runner.turn_timeouts == [0.5]
+    assert runner.turn_timeouts == [0.4]
 
 
 def test_claude_adapter_derives_capabilities_without_model_self_report(
@@ -1923,6 +1924,7 @@ def test_codex_real_native_danger_sandbox_is_rejected_by_production_reader(
                 _invocation("codex"),
                 target_workspace_ref="target-workspace:real-native-probe",
                 working_directory=str(workspace),
+                provider_operation_timeout_seconds=300.0,
             ),
         )
     finally:
@@ -2008,6 +2010,7 @@ def test_codex_real_native_shape_accepts_workspace_write_fixture(
                 _invocation("codex"),
                 target_workspace_ref="target-workspace:real-native-fixture",
                 working_directory=str(workspace),
+                provider_operation_timeout_seconds=300.0,
             )
         )
     finally:
@@ -2271,6 +2274,7 @@ def test_target_codex_invocation_is_workspace_write_and_profiles_it(
         _invocation("codex"),
         target_workspace_ref="target-workspace:1",
         working_directory=str(tmp_path.resolve()),
+        provider_operation_timeout_seconds=300.0,
     )
     runner = _RecordedRunner(
         "codex",

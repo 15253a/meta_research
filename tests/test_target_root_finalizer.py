@@ -97,6 +97,14 @@ def _admit_independent_target_root(runtime):
         auth_profile_ref="harness-profile:codex-default",
         target_scope_binding=scope,
     )
+    durable_harness_request = (
+        runtime.owners.agent_runtime.harness_runs.query_request(
+            admission.run.run_ref
+        )
+    )
+    assert durable_harness_request["provider_operation_timeout_seconds"] == (
+        30 * 24 * 60 * 60
+    )
     accepted_input = (
         runtime.target_run_authorities.research_graph.accept_execution_input_binding(
             target_ref=target.target_ref,
