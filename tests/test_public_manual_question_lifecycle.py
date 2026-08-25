@@ -25,6 +25,7 @@ RG identity/parent/binding acceptance.
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -43,15 +44,21 @@ from meta_research.deepfetch import (
     DeepFetchRuntimeBinding,
     DeepFetchUnavailable,
 )
+from meta_research.manual_creation import _manual_drafting_runtime_effect
 from meta_research.owners.common import OwnerConflict, canonical_hash
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import (
+    DraftingUnavailable,
     HostComputeDevice,
     HostComputeSnapshot,
     IntentTurnRequest,
     IntentTurnResult,
     ProposalDraftRequest,
     ProposalDraftResult,
+)
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeProtectionUnavailable,
 )
 from meta_research.web import create_app
 
@@ -80,6 +87,81 @@ class DeterministicDraftingAdapter:
             request.native_session_ref or "manual-lifecycle-drafting-session",
             "test_deterministic",
         )
+
+    def cancel_job(self, job_ref: str) -> bool:
+        del job_ref
+        return True
+
+    def finish_job(self, job_ref: str) -> None:
+        del job_ref
+
+
+class RuntimeAwareDraftingAdapter(DeterministicDraftingAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reply_failure: str | None = None
+        self.cancelled_job_refs: list[str] = []
+        self.finished_job_refs: list[str] = []
+        self.finish_active_operations: list[tuple[str, ...]] = []
+        self.cancel_acknowledged = True
+        self.runtime = None
+
+    def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
+        self.intent_requests.append(request)
+        if self.reply_failure is not None:
+            code = self.reply_failure
+            if code == "codex_cli_stopped":
+                self.reply_failure = None
+            raise DraftingUnavailable(code)
+        return IntentTurnResult(
+            "先明确真正未知和答案边界。",
+            request.native_session_ref or "manual-lifecycle-drafting-session",
+            "test_deterministic",
+        )
+
+    def cancel_job(self, job_ref: str) -> bool:
+        self.cancelled_job_refs.append(job_ref)
+        return self.cancel_acknowledged
+
+    def finish_job(self, job_ref: str) -> None:
+        self.finished_job_refs.append(job_ref)
+        if self.runtime is None:
+            return
+        active = tuple(
+            str(item["operation_ref"])
+            for item in self.runtime.query_runtime_observability()[
+                "responsibilities"
+            ]
+            if item["operation_ref"] == job_ref
+        )
+        self.finish_active_operations.append(active)
+
+
+class SwitchablePowerInhibitor:
+    kind = "test_switchable"
+
+    def __init__(self) -> None:
+        self.available = True
+        self._active: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        if not self.available:
+            raise RuntimeProtectionUnavailable("power_inhibitor_test_unavailable")
+        self._active.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=time.time(),
+            native_holder_ref=f"test-native:{holder_ref}",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self._active
+
+    def release(self, lease: InhibitorLease) -> None:
+        self._active.discard(lease.holder_ref)
 
 
 def _authenticated_client(runtime) -> tuple[TestClient, dict[str, str]]:
@@ -191,6 +273,7 @@ def _build_runtime(
     deepfetch_provider=None,
     acquisition_provider=None,
     drafting=None,
+    power_inhibitor=None,
 ):
     drafting = drafting or DeterministicDraftingAdapter()
     return build_production_runtime(
@@ -200,6 +283,7 @@ def _build_runtime(
         host_compute_probe=DeterministicProbe(),
         deepfetch_provider=deepfetch_provider,
         acquisition_provider=acquisition_provider,
+        power_inhibitor=power_inhibitor,
     )
 
 
@@ -346,6 +430,26 @@ def _open_and_confirm_seed(
         seed=_seed_value(deepfetch_preference=deepfetch_preference),
         idempotency_key=f"{key_prefix}-seed-confirm",
     )
+
+
+def _queue_manual_drafting_turn(
+    runtime, *, key_prefix: str
+) -> tuple[dict[str, object], dict[str, object]]:
+    quest_ref, parent_question_ref = _accept_root_question(runtime, key_prefix)
+    human = runtime.owners.human_collaboration
+    seeded = _open_and_confirm_seed(
+        human,
+        quest_ref=quest_ref,
+        parent_question_ref=parent_question_ref,
+        key_prefix=key_prefix,
+    )
+    queued = human.send_manual_drafting_message(
+        seeded["context_ref"],
+        expected_basis_hash=seeded["seed"]["hash"],
+        message="请收紧后续问题的未知边界。",
+        idempotency_key=f"{key_prefix}-drafting-message",
+    )
+    return seeded, queued["drafting_session"]["turns"][-1]
 
 
 def _confirm_waived_manual_question(
@@ -681,6 +785,266 @@ def test_manual_drafting_turns_are_durably_claimed_recovered_and_serialized(
             human.query_manual_question_creation(seeded["context_ref"])
     finally:
         runtime.close()
+
+
+def test_manual_drafting_power_failure_finishes_the_waiting_responsibility(
+    tmp_path: Path,
+) -> None:
+    drafting = RuntimeAwareDraftingAdapter()
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = _build_runtime(
+        tmp_path / "manual-drafting-power-failure",
+        drafting=drafting,
+        power_inhibitor=inhibitor,
+    )
+    try:
+        seeded, turn = _queue_manual_drafting_turn(
+            runtime, key_prefix="manual-drafting-power-failure"
+        )
+        drafting.runtime = runtime
+        drafting.finished_job_refs.clear()
+        drafting.finish_active_operations.clear()
+        inhibitor.available = False
+
+        assert runtime.owners.human_collaboration.process_drafting_once()
+
+        settled = runtime.owners.human_collaboration.query_manual_question_creation(
+            seeded["context_ref"]
+        )["drafting_session"]["turns"][-1]
+        assert settled["ref"] == turn["ref"]
+        assert settled["assistant_status"] == "unavailable"
+        assert settled["reason"] == {
+            "code": "power_inhibitor_test_unavailable"
+        }
+        evidence = runtime.query_runtime_observability()
+        assert evidence["responsibilities"] == []
+        assert evidence["durable_waiting"] == []
+        assert drafting.intent_requests == []
+        assert drafting.finish_active_operations == [()]
+    finally:
+        runtime.close()
+
+
+def test_manual_drafting_stopped_process_is_fenced_before_spool_cleanup(
+    tmp_path: Path,
+) -> None:
+    drafting = RuntimeAwareDraftingAdapter()
+    drafting.reply_failure = "codex_cli_stopped"
+    runtime = _build_runtime(
+        tmp_path / "manual-drafting-stopped",
+        drafting=drafting,
+    )
+    try:
+        seeded, turn = _queue_manual_drafting_turn(
+            runtime, key_prefix="manual-drafting-stopped"
+        )
+        drafting.runtime = runtime
+        drafting.finished_job_refs.clear()
+        drafting.finish_active_operations.clear()
+
+        assert runtime.owners.human_collaboration.process_drafting_once()
+
+        requeued = runtime.owners.human_collaboration.query_manual_question_creation(
+            seeded["context_ref"]
+        )["drafting_session"]["turns"][-1]
+        first_job_ref = f"{turn['ref']}:claim:1"
+        assert requeued["assistant_status"] == "queued"
+        assert drafting.finished_job_refs == [first_job_ref]
+        assert drafting.finish_active_operations == [()]
+        assert runtime.query_runtime_observability()["responsibilities"] == []
+
+        assert runtime.owners.human_collaboration.process_drafting_once()
+        completed = runtime.owners.human_collaboration.query_manual_question_creation(
+            seeded["context_ref"]
+        )["drafting_session"]["turns"][-1]
+        assert completed["assistant_status"] == "completed"
+    finally:
+        runtime.close()
+
+
+def test_manual_drafting_unknown_outcome_keeps_hold_and_spool_for_reconciliation(
+    tmp_path: Path,
+) -> None:
+    drafting = RuntimeAwareDraftingAdapter()
+    drafting.reply_failure = "codex_job_outcome_unknown"
+    runtime = _build_runtime(
+        tmp_path / "manual-drafting-unknown-outcome",
+        drafting=drafting,
+    )
+    try:
+        seeded, turn = _queue_manual_drafting_turn(
+            runtime, key_prefix="manual-drafting-unknown-outcome"
+        )
+        drafting.runtime = runtime
+        drafting.finished_job_refs.clear()
+        drafting.finish_active_operations.clear()
+
+        assert runtime.owners.human_collaboration.process_drafting_once()
+
+        unresolved = runtime.owners.human_collaboration.query_manual_question_creation(
+            seeded["context_ref"]
+        )["drafting_session"]["turns"][-1]
+        job_ref = f"{turn['ref']}:claim:1"
+        assert unresolved["assistant_status"] == "running"
+        assert drafting.finished_job_refs == []
+        assert [
+            item["operation_ref"]
+            for item in runtime.query_runtime_observability()["responsibilities"]
+        ] == [job_ref]
+    finally:
+        runtime.close()
+
+
+def test_expired_manual_drafting_claim_is_cancelled_fenced_then_replaced(
+    tmp_path: Path,
+) -> None:
+    drafting = RuntimeAwareDraftingAdapter()
+    runtime = _build_runtime(
+        tmp_path / "manual-drafting-expired-protection",
+        drafting=drafting,
+    )
+    try:
+        seeded, turn = _queue_manual_drafting_turn(
+            runtime, key_prefix="manual-drafting-expired-protection"
+        )
+        job_ref = f"{turn['ref']}:claim:1"
+        effect = _manual_drafting_runtime_effect(
+            context_ref=str(seeded["context_ref"]),
+            turn_ref=str(turn["ref"]),
+            claim_attempt=1,
+            job_ref=job_ref,
+        )
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_manual_drafting_turns SET assistant_status = "
+                    "'running', assistant_attempt_count = 1, assistant_started_at = 0 "
+                    "WHERE turn_ref = :turn_ref"
+                ),
+                {"turn_ref": turn["ref"]},
+            )
+        runtime.runtime_protection.acquire(effect)
+        drafting.runtime = runtime
+        drafting.cancelled_job_refs.clear()
+        drafting.finished_job_refs.clear()
+        drafting.finish_active_operations.clear()
+
+        assert runtime.owners.human_collaboration.process_drafting_once()
+
+        completed = runtime.owners.human_collaboration.query_manual_question_creation(
+            seeded["context_ref"]
+        )["drafting_session"]["turns"][-1]
+        assert completed["assistant_status"] == "completed"
+        assert drafting.cancelled_job_refs == [job_ref]
+        assert drafting.finished_job_refs[0] == job_ref
+        assert drafting.finish_active_operations[0] == ()
+        assert runtime.query_runtime_observability()["responsibilities"] == []
+    finally:
+        runtime.close()
+
+
+def test_expired_manual_drafting_claim_stays_running_without_cancel_proof(
+    tmp_path: Path,
+) -> None:
+    drafting = RuntimeAwareDraftingAdapter()
+    runtime = _build_runtime(
+        tmp_path / "manual-drafting-expired-unresolved",
+        drafting=drafting,
+    )
+    try:
+        seeded, turn = _queue_manual_drafting_turn(
+            runtime, key_prefix="manual-drafting-expired-unresolved"
+        )
+        job_ref = f"{turn['ref']}:claim:1"
+        effect = _manual_drafting_runtime_effect(
+            context_ref=str(seeded["context_ref"]),
+            turn_ref=str(turn["ref"]),
+            claim_attempt=1,
+            job_ref=job_ref,
+        )
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_manual_drafting_turns SET assistant_status = "
+                    "'running', assistant_attempt_count = 1, assistant_started_at = 0 "
+                    "WHERE turn_ref = :turn_ref"
+                ),
+                {"turn_ref": turn["ref"]},
+            )
+        runtime.runtime_protection.acquire(effect)
+        drafting.runtime = runtime
+        drafting.cancel_acknowledged = False
+        drafting.finished_job_refs.clear()
+
+        assert not runtime.owners.human_collaboration.process_drafting_once()
+
+        unresolved = runtime.owners.human_collaboration.query_manual_question_creation(
+            seeded["context_ref"]
+        )["drafting_session"]["turns"][-1]
+        assert unresolved["assistant_status"] == "running"
+        assert drafting.finished_job_refs == []
+        assert [
+            item["operation_ref"]
+            for item in runtime.query_runtime_observability()["responsibilities"]
+        ] == [job_ref]
+    finally:
+        runtime.close()
+
+
+def test_startup_cancels_and_fences_interrupted_manual_drafting_claim(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "manual-drafting-startup-protection"
+    drafting = RuntimeAwareDraftingAdapter()
+    inhibitor = SwitchablePowerInhibitor()
+    original = _build_runtime(
+        data_root,
+        drafting=drafting,
+        power_inhibitor=inhibitor,
+    )
+    restarted = None
+    try:
+        seeded, turn = _queue_manual_drafting_turn(
+            original, key_prefix="manual-drafting-startup-protection"
+        )
+        job_ref = f"{turn['ref']}:claim:1"
+        effect = _manual_drafting_runtime_effect(
+            context_ref=str(seeded["context_ref"]),
+            turn_ref=str(turn["ref"]),
+            claim_attempt=1,
+            job_ref=job_ref,
+        )
+        with original._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_manual_drafting_turns SET assistant_status = "
+                    "'running', assistant_attempt_count = 1, "
+                    "assistant_started_at = :now WHERE turn_ref = :turn_ref"
+                ),
+                {"turn_ref": turn["ref"], "now": time.time()},
+            )
+        original.runtime_protection.acquire(effect)
+        drafting.cancelled_job_refs.clear()
+        drafting.finished_job_refs.clear()
+
+        restarted = _build_runtime(
+            data_root,
+            drafting=drafting,
+            power_inhibitor=inhibitor,
+        )
+        drafting.runtime = restarted
+
+        recovered = restarted.owners.human_collaboration.query_manual_question_creation(
+            seeded["context_ref"]
+        )["drafting_session"]["turns"][-1]
+        assert recovered["assistant_status"] == "queued"
+        assert drafting.cancelled_job_refs == [job_ref]
+        assert drafting.finished_job_refs == [job_ref]
+        assert restarted.query_runtime_observability()["responsibilities"] == []
+    finally:
+        if restarted is not None:
+            restarted.close()
+        original.close()
 
 
 def test_manual_deepfetch_state_artifact_is_fail_closed(

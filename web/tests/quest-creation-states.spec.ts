@@ -253,11 +253,12 @@ async function fillRequiredBasis(
 }
 
 async function selectReadyCompute(dialog: Locator) {
-  const probe = dialog.getByRole("button", {
+  const computeCard = dialog.getByLabel("本机计算卡");
+  const probe = computeCard.getByRole("button", {
     name: /^(检测本机计算卡|重新检测)$/,
   });
   await probe.click();
-  const device = dialog.getByRole("button", {
+  const device = computeCard.getByRole("button", {
     name: /Deterministic GPU.*GPU-deterministic-1/,
   });
   await expect(device).toBeVisible();

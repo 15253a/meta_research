@@ -682,7 +682,7 @@ def test_interrupted_target_launch_migration_is_atomic_and_retryable(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone() == ("0034_writing_delivery",)
+        ).fetchone() == ("0035_runtime_protection",)
         tables = {
             row[0]
             for row in connection.execute(

@@ -68,6 +68,13 @@ def test_0030_preserves_report_rows_and_widens_document_type(tmp_path: Path) -> 
             "ar_writing_delivery_observations",
             "ar_writing_delivery_receipts",
         } <= _tables(connection)
+        operation_columns = {
+            row[1]: row for row in connection.execute(
+                "PRAGMA table_info(ar_writing_delivery_operations)"
+            )
+        }
+        assert operation_columns["reconciliation_generation"][3] == 1
+        assert operation_columns["reconciliation_generation"][4] == "'0'"
         assert connection.execute(
             "SELECT run_ref, intent_id, document_type, intent_hash, snapshot_hash, "
             "confirmation_hash, runtime_binding_hash, created_at, updated_at FROM "

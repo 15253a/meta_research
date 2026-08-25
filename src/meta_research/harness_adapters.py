@@ -4,9 +4,11 @@ import json
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -116,9 +118,17 @@ HARNESS_CAPABILITIES = (
 
 
 class HarnessAdapterUnavailable(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        durable_outcome: Literal["terminal", "unknown"] = "terminal",
+        transport_receipt: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.durable_outcome = durable_outcome
+        self.transport_receipt = transport_receipt
 
 
 class HarnessRunnerOutcomeUnknown(RuntimeError):
@@ -253,6 +263,7 @@ class _NativeCliHarnessAdapter:
         self._timeout_seconds = timeout_seconds
         self._target_root_timeout_seconds = target_root_timeout_seconds
         self._cached_installation_profile: dict[str, object] | None = None
+        self._diagnostic_incarnation_ref: str | None = None
         self._codex_child_ledger_reader = codex_child_ledger_reader
         if self.family == "codex" and codex_child_ledger_reader is None:
             codex_home = os.environ.get("CODEX_HOME")
@@ -264,6 +275,7 @@ class _NativeCliHarnessAdapter:
     def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
         self._validate_invocation(invocation)
         provider_version = self._provider_version()
+        self._record_provider_capability(provider_version)
         argv = self._argv(invocation)
         evidence_scope_ref = _harness_evidence_scope_ref(invocation)
         observation_scope = _target_root_observation_scope(invocation)
@@ -296,19 +308,45 @@ class _NativeCliHarnessAdapter:
         except FileNotFoundError as error:
             raise HarnessAdapterUnavailable("provider_unavailable") from error
         except subprocess.TimeoutExpired as error:
-            raise HarnessAdapterUnavailable("provider_timeout") from error
+            raise HarnessAdapterUnavailable(
+                "provider_timeout", durable_outcome="unknown"
+            ) from error
         except HarnessRunnerOutcomeUnknown as error:
-            raise HarnessAdapterUnavailable("provider_outcome_unknown") from error
+            raise HarnessAdapterUnavailable(
+                "provider_outcome_unknown", durable_outcome="unknown"
+            ) from error
         except OSError as error:
-            raise HarnessAdapterUnavailable("provider_io_unavailable") from error
+            raise HarnessAdapterUnavailable(
+                "provider_io_unavailable", durable_outcome="unknown"
+            ) from error
         if completed.returncode != 0:
-            code = (
+            receipt = getattr(completed, "meta_research_transport_receipt", None)
+            reason = (
+                receipt.get("termination_reason")
+                if isinstance(receipt, dict)
+                else None
+            )
+            signed_code = {
+                "timeout": "provider_timeout",
+                "output_limit": "provider_output_limit",
+                "descendant_process": "provider_descendant_process",
+                "stopped": "provider_stopped",
+                "launch_failed": "provider_launch_failed",
+            }.get(reason)
+            code = signed_code or (
                 "provider_auth_revoked"
                 if _looks_like_auth_failure(completed.stderr)
                 or _stream_has_auth_failure(completed.stdout)
                 else "provider_failed"
             )
-            raise HarnessAdapterUnavailable(code)
+            raise HarnessAdapterUnavailable(
+                code,
+                transport_receipt=(
+                    cast(dict[str, object], receipt)
+                    if signed_code is not None
+                    else None
+                ),
+            )
         events = _parse_jsonl(completed.stdout)
         if not events:
             raise HarnessAdapterUnavailable("provider_stream_invalid")
@@ -338,26 +376,214 @@ class _NativeCliHarnessAdapter:
         )
 
     def installation_profile(self) -> dict[str, object]:
-        if self._cached_installation_profile is not None:
-            return dict(self._cached_installation_profile)
+        path = self._provider_capability_path()
         try:
-            observed_version = self._provider_version()
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 8192:
+                raise HarnessAdapterUnavailable("provider_capability_unverified")
+            encoded = path.read_text(encoding="utf-8")
+            document = json.loads(encoded)
+            if (
+                not isinstance(document, dict)
+                or canonical_json(document) != encoded
+            ):
+                raise HarnessAdapterUnavailable("provider_capability_invalid")
+            capability_hash = document.get("capability_hash")
+            material = {
+                key: value
+                for key, value in document.items()
+                if key != "capability_hash"
+            }
+            if (
+                document.get("schema_ref")
+                != "meta-research/harness-provider-diagnostic/v2"
+                or document.get("harness_family") != self.family
+                or document.get("locked_version") != self.locked_version
+                or not isinstance(document.get("daemon_incarnation_ref"), str)
+                or not document["daemon_incarnation_ref"]
+                or not isinstance(document.get("probed_at"), (int, float))
+                or isinstance(document.get("probed_at"), bool)
+                or capability_hash != canonical_hash(material)
+                or (
+                    self._diagnostic_incarnation_ref is not None
+                    and document["daemon_incarnation_ref"]
+                    != self._diagnostic_incarnation_ref
+                )
+            ):
+                raise HarnessAdapterUnavailable("provider_capability_invalid")
+            status = document.get("status")
+            if status == "capability_unavailable":
+                reason = document.get("reason")
+                if (
+                    set(document)
+                    != {
+                        "schema_ref",
+                        "harness_family",
+                        "locked_version",
+                        "daemon_incarnation_ref",
+                        "status",
+                        "reason",
+                        "probed_at",
+                        "capability_hash",
+                    }
+                    or not isinstance(reason, dict)
+                    or set(reason) != {"code"}
+                    or not isinstance(reason.get("code"), str)
+                    or not reason["code"]
+                ):
+                    raise HarnessAdapterUnavailable("provider_capability_invalid")
+                return {
+                    "harness_family": self.family,
+                    "locked_version": self.locked_version,
+                    "status": "capability_unavailable",
+                    "reason": {"code": str(reason["code"])},
+                }
+            if (
+                status != "ready"
+                or set(document)
+                != {
+                    "schema_ref",
+                    "harness_family",
+                    "locked_version",
+                    "provider_version",
+                    "daemon_incarnation_ref",
+                    "executable_identity",
+                    "status",
+                    "probed_at",
+                    "capability_hash",
+                }
+                or document.get("provider_version") != self.locked_version
+                or not isinstance(document.get("executable_identity"), dict)
+            ):
+                raise HarnessAdapterUnavailable("provider_capability_invalid")
+            if document["executable_identity"] != self._executable_identity():
+                raise HarnessAdapterUnavailable("provider_executable_changed")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HarnessAdapterUnavailable("provider_capability_invalid") from error
         except HarnessAdapterUnavailable as error:
-            profile: dict[str, object] = {
+            return {
                 "harness_family": self.family,
                 "locked_version": self.locked_version,
                 "status": "capability_unavailable",
                 "reason": {"code": error.code},
             }
-        else:
-            profile = {
-                "harness_family": self.family,
-                "locked_version": self.locked_version,
-                "provider_version": observed_version,
-                "status": "ready",
-            }
-        self._cached_installation_profile = profile
-        return dict(profile)
+        return {
+            "harness_family": self.family,
+            "locked_version": self.locked_version,
+            "provider_version": self.locked_version,
+            "status": "ready",
+        }
+
+    def _provider_capability_path(self) -> Path:
+        return self._workspace / "installation-capabilities" / f"{self.family}.json"
+
+    def prepare_installation_diagnostic(self, daemon_incarnation_ref: str) -> None:
+        if (
+            not isinstance(daemon_incarnation_ref, str)
+            or not daemon_incarnation_ref
+            or len(daemon_incarnation_ref) > 128
+        ):
+            raise HarnessAdapterUnavailable("provider_diagnostic_identity_invalid")
+        self._diagnostic_incarnation_ref = daemon_incarnation_ref
+
+    def run_installation_diagnostic(self, daemon_incarnation_ref: str) -> str:
+        self.prepare_installation_diagnostic(daemon_incarnation_ref)
+        before = self._executable_identity()
+        observed_version = self._provider_version()
+        after = self._executable_identity()
+        if before != after:
+            raise HarnessAdapterUnavailable("provider_executable_changed")
+        return self._record_provider_capability(
+            observed_version,
+            executable_identity=after,
+        )
+
+    def record_installation_diagnostic_failure(
+        self,
+        daemon_incarnation_ref: str,
+        code: str,
+    ) -> str:
+        self.prepare_installation_diagnostic(daemon_incarnation_ref)
+        if not isinstance(code, str) or not code or len(code) > 96:
+            code = "provider_diagnostic_failed"
+        material = {
+            "schema_ref": "meta-research/harness-provider-diagnostic/v2",
+            "harness_family": self.family,
+            "locked_version": self.locked_version,
+            "daemon_incarnation_ref": daemon_incarnation_ref,
+            "status": "capability_unavailable",
+            "reason": {"code": code},
+            "probed_at": time.time(),
+        }
+        return self._write_provider_diagnostic(material)
+
+    def _record_provider_capability(
+        self,
+        observed_version: str,
+        *,
+        executable_identity: dict[str, object] | None = None,
+    ) -> str:
+        daemon_incarnation_ref = (
+            self._diagnostic_incarnation_ref or "protected_harness_invocation"
+        )
+        material = {
+            "schema_ref": "meta-research/harness-provider-diagnostic/v2",
+            "harness_family": self.family,
+            "locked_version": self.locked_version,
+            "provider_version": observed_version,
+            "daemon_incarnation_ref": daemon_incarnation_ref,
+            "executable_identity": (
+                self._executable_identity()
+                if executable_identity is None
+                else executable_identity
+            ),
+            "status": "ready",
+            "probed_at": time.time(),
+        }
+        return self._write_provider_diagnostic(material)
+
+    def _write_provider_diagnostic(self, material: dict[str, object]) -> str:
+        capability_hash = canonical_hash(material)
+        document = {**material, "capability_hash": capability_hash}
+        path = self._provider_capability_path()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        encoded = canonical_json(document)
+        try:
+            _write_private(path, encoded)
+        except OSError as error:
+            raise HarnessAdapterUnavailable(
+                "provider_capability_unavailable"
+            ) from error
+        return capability_hash
+
+    def _executable_identity(self) -> dict[str, object]:
+        configured = Path(self.executable)
+        resolved_value = (
+            str(configured)
+            if configured.is_absolute() or configured.parent != Path(".")
+            else shutil.which(self.executable)
+        )
+        if resolved_value is None:
+            # Injected runners are intentionally usable in narrow adapter tests;
+            # the real supervisor still fails the subsequent version probe when
+            # a production command is absent.
+            return {"kind": "unresolved_command", "command": self.executable}
+        path = Path(resolved_value)
+        try:
+            resolved = path.resolve(strict=True)
+            stat = resolved.stat()
+        except OSError as error:
+            raise HarnessAdapterUnavailable("provider_executable_changed") from error
+        if not resolved.is_file():
+            raise HarnessAdapterUnavailable("provider_executable_changed")
+        return {
+            "kind": "file",
+            "command": self.executable,
+            "resolved_path": str(resolved),
+            "device": int(stat.st_dev),
+            "inode": int(stat.st_ino),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
 
     def _provider_version(self) -> str:
         try:

@@ -57,6 +57,78 @@ class DeterministicDraftingAdapter:
         )
 
 
+class CleanupTrackingDraftingAdapter(DeterministicDraftingAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finished_job_refs: list[str] = []
+
+    def finish_job(self, job_ref: str) -> None:
+        self.finished_job_refs.append(job_ref)
+
+
+class VerifiablyCancellableDraftingAdapter(DeterministicDraftingAdapter):
+    def cancel_job(self, job_ref: str) -> bool:
+        del job_ref
+        return True
+
+
+class DurableReconciliationDraftingAdapter(CleanupTrackingDraftingAdapter):
+    """Expose provider starts separately from same-operation reconciliation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sealed_job_refs: set[str] = set()
+        self.started_job_refs: set[str] = set()
+        self.provider_start_counts: dict[str, int] = {}
+        self.proposal_job_refs: list[str] = []
+        self.intent_job_refs: list[str] = []
+        self.cancel_verified = False
+        self.cancelled_job_refs: list[str] = []
+
+    def reconcile_job(self, job_ref: str) -> str:
+        return "terminal" if job_ref in self.sealed_job_refs else "pending"
+
+    def cancel_job(self, job_ref: str) -> bool:
+        self.cancelled_job_refs.append(job_ref)
+        return self.cancel_verified
+
+    def finish_job(self, job_ref: str) -> None:
+        super().finish_job(job_ref)
+        self.started_job_refs.discard(job_ref)
+
+    def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
+        assert request.job_ref is not None
+        self.proposal_job_refs.append(request.job_ref)
+        if request.job_ref not in self.started_job_refs:
+            self.started_job_refs.add(request.job_ref)
+            self.draft_calls += 1
+            self.provider_start_counts[request.job_ref] = (
+                self.provider_start_counts.get(request.job_ref, 0) + 1
+            )
+        if request.job_ref not in self.sealed_job_refs:
+            raise DraftingUnavailable("codex_job_outcome_unknown")
+        return ProposalDraftResult(
+            content=QUESTION, adapter_kind="test_durable_reconciliation"
+        )
+
+    def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
+        assert request.job_ref is not None
+        self.intent_requests.append(request)
+        self.intent_job_refs.append(request.job_ref)
+        if request.job_ref not in self.started_job_refs:
+            self.started_job_refs.add(request.job_ref)
+            self.provider_start_counts[request.job_ref] = (
+                self.provider_start_counts.get(request.job_ref, 0) + 1
+            )
+        if request.job_ref not in self.sealed_job_refs:
+            raise DraftingUnavailable("codex_job_outcome_unknown")
+        return IntentTurnResult(
+            reply="已从同一 durable operation 恢复。",
+            native_session_ref="durable-intent-session",
+            adapter_kind="test_durable_reconciliation",
+        )
+
+
 class DeterministicProbe:
     def observe(self) -> HostComputeSnapshot:
         return HostComputeSnapshot(
@@ -147,6 +219,14 @@ class ExpiringProposalAdapter(DeterministicDraftingAdapter):
             adapter_kind="test_lease_fence",
         )
 
+    def cancel_job(self, job_ref: str) -> bool:
+        del job_ref
+        with self._lock:
+            active_attempt = self.draft_calls - 1
+        if active_attempt >= 0:
+            self.release[active_attempt].set()
+        return True
+
 
 class ExpiringIntentAdapter(DeterministicDraftingAdapter):
     def __init__(self) -> None:
@@ -168,6 +248,14 @@ class ExpiringIntentAdapter(DeterministicDraftingAdapter):
             native_session_ref=f"lease-native-{attempt}",
             adapter_kind="test_lease_fence",
         )
+
+    def cancel_job(self, job_ref: str) -> bool:
+        del job_ref
+        with self._lock:
+            active_attempt = self._calls - 1
+        if active_attempt >= 0:
+            self.release[active_attempt].set()
+        return True
 
 
 class OversizedProposalAdapter(DeterministicDraftingAdapter):
@@ -206,6 +294,10 @@ class InterruptedOnceAdapter(DeterministicDraftingAdapter):
             self._interrupt_intent = False
             raise DraftingUnavailable("codex_cli_stopped")
         return super().reply(request)
+
+    def cancel_job(self, job_ref: str) -> bool:
+        del job_ref
+        return True
 
 
 class ClaimToSpawnBarrierRunner:
@@ -1166,7 +1258,7 @@ def test_late_generation_cannot_overwrite_a_newer_human_proposal_edit(
 def test_expired_running_generation_claim_is_released_without_a_restart(
     tmp_path: Path,
 ) -> None:
-    adapter = DeterministicDraftingAdapter()
+    adapter = VerifiablyCancellableDraftingAdapter()
     runtime = build_production_runtime(
         prepare_data_root(tmp_path / "expired-generation-lease"),
         proposal_drafter=adapter,
@@ -1214,6 +1306,95 @@ def test_expired_running_generation_claim_is_released_without_a_restart(
         assert settled["proposal_generation"]["status"] == "succeeded"
         assert settled["proposal_generation"]["attempt_count"] == 2
         assert adapter.draft_calls == 1
+    finally:
+        runtime.close()
+
+
+def test_expired_unknown_proposal_keeps_hold_until_cancellation_is_verified(
+    tmp_path: Path,
+) -> None:
+    adapter = DurableReconciliationDraftingAdapter()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "expired-unknown-proposal"),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    hc = runtime.owners.human_collaboration
+    try:
+        opened = hc.create_quest({}, "expired-unknown-open")
+        probed = hc.observe_host_compute(
+            opened["initialization_id"],
+            ["GPU-test-1"],
+            "expired-unknown-probe",
+        )
+        draft = {
+            **probed["quest_draft"]["value"],
+            "goal": "unknown effect 不得因 lease 到期重放。",
+            "completion_criteria": "未证明 cancel 时继续持有 responsibility。",
+        }
+        saved = hc.revise_quest_draft(
+            opened["initialization_id"],
+            draft,
+            probed["quest_draft"]["hash"],
+            "expired-unknown-save",
+            probed["quest_draft"]["revision"],
+        )
+        queued = hc.generate_question_proposal(
+            saved["initialization_id"],
+            saved["quest_draft"]["hash"],
+            "expired-unknown-generate",
+            saved["quest_draft"]["revision"],
+        )
+        assert not hc.process_drafting_once()
+        generation_ref = queued["proposal_generation"]["ref"]
+        operation_ref = f"{generation_ref}:proposal"
+        with runtime._database.write() as connection:
+            connection.execute(
+                text(
+                    "UPDATE hc_proposal_generation_attempts SET started_at = 0 "
+                    "WHERE generation_ref = :generation_ref"
+                ),
+                {"generation_ref": generation_ref},
+            )
+
+        assert not hc.process_drafting_once()
+
+        held = hc.query_quest_creation(saved["initialization_id"])
+        assert held["proposal_generation"]["status"] == "running"
+        assert held["proposal_generation"]["attempt_count"] == 1
+        assert adapter.draft_calls == 1
+        assert adapter.cancelled_job_refs == [operation_ref]
+        assert adapter.finished_job_refs == []
+        responsibilities = runtime.query_runtime_observability()[
+            "responsibilities"
+        ]
+        assert [item["operation_ref"] for item in responsibilities] == [
+            operation_ref
+        ]
+
+        adapter.cancel_verified = True
+        assert not hc.process_drafting_once()
+        replacement = hc.query_quest_creation(saved["initialization_id"])
+        assert replacement["proposal_generation"]["status"] == "running"
+        assert replacement["proposal_generation"]["attempt_count"] == 2
+        assert adapter.proposal_job_refs == [operation_ref, operation_ref]
+        assert adapter.provider_start_counts == {operation_ref: 2}
+        assert adapter.finished_job_refs == [operation_ref]
+        with runtime._database.read() as connection:
+            boundaries = connection.execute(
+                text(
+                    "SELECT boundary FROM ar_runtime_boundary_receipts WHERE "
+                    "operation_ref = :operation_ref ORDER BY recorded_at"
+                ),
+                {"operation_ref": operation_ref},
+            ).scalars().all()
+        assert boundaries == ["permanent_fence"]
+        replacement_responsibilities = runtime.query_runtime_observability()[
+            "responsibilities"
+        ]
+        assert len(replacement_responsibilities) == 1
+        assert replacement_responsibilities[0]["operation_ref"] == operation_ref
     finally:
         runtime.close()
 
@@ -1982,6 +2163,341 @@ def test_succeeded_intent_job_survives_preview_failure_without_provider_replay(
         assert len(adapter.intent_requests) == 1
     finally:
         runtime.close()
+
+
+def test_restart_reconciles_pending_proposal_on_one_stable_provider_operation(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "proposal-durable-reconciliation"
+    adapter = DurableReconciliationDraftingAdapter()
+    original = build_production_runtime(
+        prepare_data_root(data_root),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted = None
+    try:
+        hc = original.owners.human_collaboration
+        opened = hc.create_quest({}, "proposal-reconcile-open")
+        probed = hc.observe_host_compute(
+            opened["initialization_id"],
+            ["GPU-test-1"],
+            "proposal-reconcile-probe",
+        )
+        draft = dict(probed["quest_draft"]["value"])
+        draft.update(
+            {
+                "goal": "守住 unknown provider outcome。",
+                "completion_criteria": "重启只消费同一 operation 的 sealed result。",
+            }
+        )
+        saved = hc.revise_quest_draft(
+            opened["initialization_id"],
+            draft,
+            probed["quest_draft"]["hash"],
+            "proposal-reconcile-save",
+            probed["quest_draft"]["revision"],
+        )
+        queued = hc.generate_question_proposal(
+            saved["initialization_id"],
+            saved["quest_draft"]["hash"],
+            "proposal-reconcile-generate",
+            saved["quest_draft"]["revision"],
+        )
+
+        assert not hc.process_drafting_once()
+        pending = hc.query_quest_creation(saved["initialization_id"])
+        generation_ref = queued["proposal_generation"]["ref"]
+        operation_ref = f"{generation_ref}:proposal"
+        assert pending["proposal_generation"]["status"] == "running"
+        assert adapter.proposal_job_refs == [operation_ref]
+        assert adapter.draft_calls == 1
+        assert adapter.finished_job_refs == []
+
+        restarted = build_production_runtime(
+            prepare_data_root(data_root),
+            proposal_drafter=adapter,
+            intent_drafting_provider=adapter,
+            host_compute_probe=DeterministicProbe(),
+        )
+        assert not restarted.owners.human_collaboration.process_drafting_once()
+        still_pending = restarted.owners.human_collaboration.query_quest_creation(
+            saved["initialization_id"]
+        )
+        assert still_pending["proposal_generation"]["status"] == "running"
+        assert adapter.proposal_job_refs == [operation_ref]
+        assert adapter.draft_calls == 1
+        assert adapter.finished_job_refs == []
+
+        adapter.sealed_job_refs.add(operation_ref)
+        assert restarted.owners.human_collaboration.process_drafting_once()
+        recovered = restarted.owners.human_collaboration.query_quest_creation(
+            saved["initialization_id"]
+        )
+        assert recovered["proposal_generation"]["status"] == "succeeded"
+        assert adapter.proposal_job_refs == [operation_ref, operation_ref]
+        assert adapter.draft_calls == 1
+        assert adapter.finished_job_refs == [operation_ref]
+        assert restarted.query_runtime_observability()["responsibilities"] == []
+    finally:
+        if restarted is not None:
+            restarted.close()
+        original.close()
+
+
+def test_restart_reconciles_pending_intent_on_one_stable_provider_operation(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "intent-durable-reconciliation"
+    adapter = DurableReconciliationDraftingAdapter()
+    original = build_production_runtime(
+        prepare_data_root(data_root),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted = None
+    try:
+        hc = original.owners.human_collaboration
+        opened = hc.create_quest({}, "intent-reconcile-open")
+        queued = hc.send_intent_message(
+            opened["initialization_id"],
+            expected_draft_revision=opened["quest_draft"]["revision"],
+            expected_draft_hash=opened["quest_draft"]["hash"],
+            message="恢复同一 Intent operation。",
+            idempotency_key="intent-reconcile-message",
+        )
+
+        assert not hc.process_drafting_once()
+        pending = hc.query_quest_creation(opened["initialization_id"])
+        turn_ref = queued["intent_session"]["turns"][-1]["ref"]
+        operation_ref = f"{turn_ref}:intent-reply"
+        assert pending["intent_session"]["turns"][-1][
+            "assistant_status"
+        ] == "running"
+        assert adapter.intent_job_refs == [operation_ref]
+        assert adapter.started_job_refs == {operation_ref}
+        assert adapter.provider_start_counts == {operation_ref: 1}
+        assert adapter.finished_job_refs == []
+
+        restarted = build_production_runtime(
+            prepare_data_root(data_root),
+            proposal_drafter=adapter,
+            intent_drafting_provider=adapter,
+            host_compute_probe=DeterministicProbe(),
+        )
+        assert not restarted.owners.human_collaboration.process_drafting_once()
+        still_pending = restarted.owners.human_collaboration.query_quest_creation(
+            opened["initialization_id"]
+        )
+        assert still_pending["intent_session"]["turns"][-1][
+            "assistant_status"
+        ] == "running"
+        assert adapter.intent_job_refs == [operation_ref]
+        assert adapter.started_job_refs == {operation_ref}
+        assert adapter.provider_start_counts == {operation_ref: 1}
+        assert adapter.finished_job_refs == []
+
+        adapter.sealed_job_refs.add(operation_ref)
+        assert restarted.owners.human_collaboration.process_drafting_once()
+        recovered = restarted.owners.human_collaboration.query_quest_creation(
+            opened["initialization_id"]
+        )
+        assert recovered["intent_session"]["turns"][-1][
+            "assistant_status"
+        ] == "completed"
+        assert adapter.intent_job_refs == [operation_ref, operation_ref]
+        assert adapter.started_job_refs == set()
+        assert adapter.provider_start_counts == {operation_ref: 1}
+        assert adapter.finished_job_refs == [operation_ref]
+        assert restarted.query_runtime_observability()["responsibilities"] == []
+    finally:
+        if restarted is not None:
+            restarted.close()
+        original.close()
+
+
+def test_restart_finishes_proposal_responsibility_from_terminal_owner_fact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "proposal-runtime-boundary-ack-loss"
+    adapter = CleanupTrackingDraftingAdapter()
+    original = build_production_runtime(
+        prepare_data_root(data_root),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted = None
+    try:
+        hc = original.owners.human_collaboration
+        opened = hc.create_quest({}, "proposal-runtime-ack-open")
+        probed = hc.observe_host_compute(
+            opened["initialization_id"],
+            ["GPU-test-1"],
+            "proposal-runtime-ack-probe",
+        )
+        draft = dict(probed["quest_draft"]["value"])
+        draft.update(
+            {
+                "goal": "终态 Owner 事实必须能恢复 runtime release ACK。",
+                "completion_criteria": "重启后不重放 Proposal provider。",
+            }
+        )
+        saved = hc.revise_quest_draft(
+            opened["initialization_id"],
+            draft,
+            probed["quest_draft"]["hash"],
+            "proposal-runtime-ack-save",
+            probed["quest_draft"]["revision"],
+        )
+        queued = hc.generate_question_proposal(
+            saved["initialization_id"],
+            saved["quest_draft"]["hash"],
+            "proposal-runtime-ack-generate",
+            saved["quest_draft"]["revision"],
+        )
+        monkeypatch.setattr(
+            hc,
+            "_finish_drafting_protection",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("simulated crash before runtime boundary")
+            ),
+        )
+
+        with pytest.raises(
+            RuntimeError, match="simulated crash before runtime boundary"
+        ):
+            hc.process_drafting_once()
+
+        generation_ref = queued["proposal_generation"]["ref"]
+        job_ref = f"{generation_ref}:proposal"
+        terminal = hc.query_quest_creation(saved["initialization_id"])
+        assert terminal["proposal_generation"]["status"] == "succeeded"
+        assert adapter.draft_calls == 1
+        assert adapter.finished_job_refs == []
+        assert [
+            item["operation_ref"]
+            for item in original.query_runtime_observability()["responsibilities"]
+        ] == [job_ref]
+
+        restarted = build_production_runtime(
+            prepare_data_root(data_root),
+            proposal_drafter=adapter,
+            intent_drafting_provider=adapter,
+            host_compute_probe=DeterministicProbe(),
+        )
+
+        recovered = restarted.owners.human_collaboration.query_quest_creation(
+            saved["initialization_id"]
+        )
+        assert recovered["proposal_generation"]["status"] == "succeeded"
+        assert adapter.draft_calls == 1
+        assert adapter.finished_job_refs == [job_ref]
+        assert restarted.query_runtime_observability()["responsibilities"] == []
+        with restarted._database.read() as connection:
+            receipt = connection.execute(
+                text(
+                    "SELECT boundary, checkpoint_ref FROM "
+                    "ar_runtime_boundary_receipts WHERE operation_ref = "
+                    ":operation_ref"
+                ),
+                {"operation_ref": job_ref},
+            ).first()
+        assert receipt is not None
+        assert receipt.boundary == "checkpoint"
+        assert receipt.checkpoint_ref is not None
+        restarted.owners.human_collaboration.process_drafting_once()
+        assert adapter.draft_calls == 1
+    finally:
+        if restarted is not None:
+            restarted.close()
+        original.close()
+
+
+def test_restart_finishes_intent_responsibility_from_terminal_owner_fact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "intent-runtime-boundary-ack-loss"
+    adapter = CleanupTrackingDraftingAdapter()
+    original = build_production_runtime(
+        prepare_data_root(data_root),
+        proposal_drafter=adapter,
+        intent_drafting_provider=adapter,
+        host_compute_probe=DeterministicProbe(),
+    )
+    restarted = None
+    try:
+        hc = original.owners.human_collaboration
+        opened = hc.create_quest({}, "intent-runtime-ack-open")
+        queued = hc.send_intent_message(
+            opened["initialization_id"],
+            expected_draft_revision=opened["quest_draft"]["revision"],
+            expected_draft_hash=opened["quest_draft"]["hash"],
+            message="验证 terminal Intent Owner 事实可恢复 release ACK。",
+            idempotency_key="intent-runtime-ack-message",
+        )
+        monkeypatch.setattr(
+            hc,
+            "_finish_drafting_protection",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("simulated crash before runtime boundary")
+            ),
+        )
+
+        with pytest.raises(
+            RuntimeError, match="simulated crash before runtime boundary"
+        ):
+            hc.process_drafting_once()
+
+        turn_ref = queued["intent_session"]["turns"][-1]["ref"]
+        job_ref = f"{turn_ref}:intent-reply"
+        terminal = hc.query_quest_creation(opened["initialization_id"])
+        assert terminal["intent_session"]["turns"][-1][
+            "assistant_status"
+        ] == "completed"
+        assert len(adapter.intent_requests) == 1
+        assert adapter.finished_job_refs == []
+        assert [
+            item["operation_ref"]
+            for item in original.query_runtime_observability()["responsibilities"]
+        ] == [job_ref]
+
+        restarted = build_production_runtime(
+            prepare_data_root(data_root),
+            proposal_drafter=adapter,
+            intent_drafting_provider=adapter,
+            host_compute_probe=DeterministicProbe(),
+        )
+
+        recovered = restarted.owners.human_collaboration.query_quest_creation(
+            opened["initialization_id"]
+        )
+        assert recovered["intent_session"]["turns"][-1][
+            "assistant_status"
+        ] == "completed"
+        assert len(adapter.intent_requests) == 1
+        assert adapter.finished_job_refs == [job_ref]
+        assert restarted.query_runtime_observability()["responsibilities"] == []
+        with restarted._database.read() as connection:
+            receipt = connection.execute(
+                text(
+                    "SELECT boundary, checkpoint_ref FROM "
+                    "ar_runtime_boundary_receipts WHERE operation_ref = "
+                    ":operation_ref"
+                ),
+                {"operation_ref": job_ref},
+            ).first()
+        assert receipt is not None
+        assert receipt.boundary == "checkpoint"
+        assert receipt.checkpoint_ref is not None
+        restarted.owners.human_collaboration.process_drafting_once()
+        assert len(adapter.intent_requests) == 1
+    finally:
+        if restarted is not None:
+            restarted.close()
+        original.close()
 
 
 def test_corrected_blank_draft_gpu_envelope_async_proposal_and_intent_are_durable(

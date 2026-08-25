@@ -1,10 +1,12 @@
 import { expect, test } from "@playwright/test";
+import { createHash } from "node:crypto";
 import { PNG } from "pngjs";
 
 import {
   assertDiffGridSignature,
   assertReviewedProductionBaseline,
   normalizeReviewedRasterPixels,
+  normalizeReviewedRasterRegion,
 } from "./fixed-reference.js";
 
 
@@ -83,4 +85,36 @@ test("normalizes only an exact reviewed rounded-corner raster variant", () => {
       chromiumRgba: [227, 229, 236, 255],
     },
   ], "rounded-corner")).toThrow(/raster normalization pixel 1,2 changed/);
+});
+
+test("normalizes only an exact reviewed Chromium raster region", () => {
+  const reviewed = new PNG({ width: 2, height: 2 });
+  const chromium = new PNG({ width: 2, height: 2 });
+  reviewed.data.set([1, 2, 3, 255], 0);
+  chromium.data.set([4, 5, 6, 255], 0);
+  const hash = (bytes: Buffer) =>
+    createHash("sha256").update(bytes).digest("hex");
+  const normalization = {
+    viewport: { width: 2, height: 2 },
+    region: { x: 0, y: 0, width: 1, height: 1 },
+    reason: "test exact Chromium raster",
+    reviewedRgbaSha256: hash(Buffer.from([1, 2, 3, 255])),
+    chromiumRgbaSha256: hash(Buffer.from([4, 5, 6, 255])),
+  };
+
+  expect(normalizeReviewedRasterRegion(
+    chromium,
+    reviewed,
+    normalization,
+    "exact-region",
+  )).toBe(true);
+  expect(Array.from(chromium.data.subarray(0, 4))).toEqual([1, 2, 3, 255]);
+
+  chromium.data.set([7, 8, 9, 255], 0);
+  expect(() => normalizeReviewedRasterRegion(
+    chromium,
+    reviewed,
+    normalization,
+    "unexpected-region",
+  )).toThrow(/Chromium raster region changed/);
 });

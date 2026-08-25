@@ -110,9 +110,17 @@ DEFAULT_PROVIDER_TRANSPORT_LIMITS = ProviderTransportLimits(
 class IdeaSkillUnavailable(RuntimeError):
     """The production Skill Adapter could not return a verifiable result."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        recovery_checkpoint: dict[str, object] | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.recovery_checkpoint = (
+            None if recovery_checkpoint is None else dict(recovery_checkpoint)
+        )
 
 
 @dataclass(frozen=True)
@@ -1123,6 +1131,9 @@ class CodexIdeaSkillAdapter:
                 invocation_hash=invocation_hash,
             )
             effective_returncode = cast(int, exit_marker["returncode"])
+            hard_ceiling = _provider_hard_ceiling_error(exit_marker)
+            if hard_ceiling is not None:
+                raise hard_ceiling
         if effective_returncode != 0:
             raise IdeaSkillUnavailable("codex_cli_failed")
         try:
@@ -1420,9 +1431,46 @@ def _verified_success_exit(
     returncode = marker.get("returncode")
     if not isinstance(returncode, int) or isinstance(returncode, bool):
         raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+    hard_ceiling = _provider_hard_ceiling_error(marker)
+    if hard_ceiling is not None:
+        raise hard_ceiling
     if returncode != 0:
         raise IdeaSkillUnavailable("codex_operation_failed")
     return marker
+
+
+def _provider_hard_ceiling_error(
+    marker: dict[str, object],
+) -> IdeaSkillUnavailable | None:
+    termination_reason = marker.get("termination_reason")
+    failure_code = {
+        "timeout": "codex_operation_timeout",
+        "output_limit": "codex_operation_output_limit",
+    }.get(termination_reason)
+    if failure_code is None:
+        return None
+    evidence_fields = (
+        "invocation_hash",
+        "prompt_hash",
+        "output_schema_hash",
+        "stdout_hash",
+        "supervisor_receipt_hash",
+    )
+    if any(
+        not isinstance(marker.get(field), str) or not marker[field]
+        for field in evidence_fields
+    ):
+        raise IdeaSkillUnavailable("codex_operation_spool_invalid")
+    checkpoint = {
+        "schema_ref": "meta-research/provider-hard-ceiling/v1",
+        "termination_reason": termination_reason,
+        **{field: marker[field] for field in evidence_fields},
+        "result_file_hash": marker.get("result_file_hash"),
+    }
+    return IdeaSkillUnavailable(
+        failure_code,
+        recovery_checkpoint=checkpoint,
+    )
 
 
 def _verified_operation_inputs(
@@ -1763,22 +1811,8 @@ def _codex_harness_manifest(
     entry = Path(resolved).resolve()
     try:
         artifacts = _discover_harness_artifacts(entry)
-        version = subprocess.run(
-            [str(entry), "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except OSError as error:
         raise IdeaSkillUnavailable("codex_cli_identity_unavailable") from error
-    version_text = version.stdout.strip()
-    if (
-        version.returncode != 0
-        or not version_text
-        or len(version_text.encode("utf-8")) > 256
-    ):
-        raise IdeaSkillUnavailable("codex_cli_identity_unavailable")
     manifest = {
         str(path): _file_sha256(path)
         for path in sorted(artifacts, key=lambda item: str(item))
@@ -1786,7 +1820,7 @@ def _codex_harness_manifest(
     manifest_hash = canonical_hash(manifest)
     return (
         "codex-cli/exec-json-schema/v1;"
-        f"entry={entry};version={version_text};"
+        f"entry={entry};identity=artifact-manifest;"
         f"artifact_manifest_sha256={manifest_hash}",
         tuple(
             f"harness-artifact:{path}@sha256:{digest}"

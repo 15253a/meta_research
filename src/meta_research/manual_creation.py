@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from typing import cast
 
 from sqlalchemy import text
@@ -34,6 +35,13 @@ from meta_research.quest_drafting import (
     QUESTION_FIELD_MAX_LENGTHS,
     IntentDraftingProvider,
     IntentTurnRequest,
+)
+from meta_research.runtime_protection import (
+    RuntimeBoundary,
+    RuntimeEffectIdentity,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+    record_runtime_boundary,
 )
 
 
@@ -68,6 +76,63 @@ _ACTIVE_STATUSES = {
     "confirmed",
     "recovering",
 }
+_UNKNOWN_DRAFTING_OUTCOMES = frozenset(
+    {
+        "codex_job_outcome_unknown",
+        "codex_job_spool_conflict",
+        "codex_job_spool_invalid",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _DraftingBoundaryProof:
+    boundary: RuntimeBoundary
+    checkpoint_ref: str | None
+    responsibility_present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ManualDraftingClaim:
+    context_ref: str
+    turn_ref: str
+    claim_attempt: int
+    job_ref: str
+
+    @property
+    def effect(self) -> RuntimeEffectIdentity:
+        return _manual_drafting_runtime_effect(
+            context_ref=self.context_ref,
+            turn_ref=self.turn_ref,
+            claim_attempt=self.claim_attempt,
+            job_ref=self.job_ref,
+        )
+
+
+def _manual_drafting_runtime_effect(
+    *,
+    context_ref: str,
+    turn_ref: str,
+    claim_attempt: int,
+    job_ref: str,
+) -> RuntimeEffectIdentity:
+    return RuntimeEffectIdentity(
+        responsibility_ref="manual_drafting_responsibility_"
+        + canonical_hash(
+            {
+                "context_ref": context_ref,
+                "turn_ref": turn_ref,
+                "claim_attempt": claim_attempt,
+                "job_ref": job_ref,
+            }
+        ),
+        owner_scope="human_collaboration",
+        root_run_ref=context_ref,
+        attempt_ref=f"manual_drafting_attempt_{claim_attempt}",
+        fence_ref=None,
+        operation_ref=job_ref,
+        effect_kind="drafting_claim",
+    )
 
 
 def _receipt_hash(
@@ -476,6 +541,7 @@ class ManualQuestionCreation:
         agent_runtime: AgentRuntimeInterface,
         acquisition_provider: AcquisitionProvider,
         intent_drafting_provider: IntentDraftingProvider,
+        runtime_protection: RuntimeProtection | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -484,6 +550,8 @@ class ManualQuestionCreation:
         self._agent_runtime = agent_runtime
         self._acquisition_provider = acquisition_provider
         self._intent_drafting_provider = intent_drafting_provider
+        self._runtime_protection = runtime_protection
+        self._recover_drafting_claims(recover_all=True)
 
     def open(
         self,
@@ -1694,31 +1762,23 @@ class ManualQuestionCreation:
         return self._run_claimed_drafting_turn(turn, session, creation)
 
     def recover_expired_drafting_claims(self) -> None:
+        self._recover_drafting_claims(recover_all=False)
+
+    def _recover_drafting_claims(self, *, recover_all: bool) -> None:
+        """Recover only claims whose provider process is proven stopped.
+
+        A row becoming old is not itself a physical fence.  Cancellation is
+        therefore acknowledged before the Owner row is made claimable and
+        before the predecessor responsibility is released.
+        """
+
         cutoff = time.time() - MANUAL_DRAFTING_CLAIM_LEASE_SECONDS
-        cancelled_job_refs: list[str] = []
         with self._database.write() as connection:
-            terminal_running = connection.execute(
-                text(
-                    "SELECT turns.turn_ref, turns.assistant_attempt_count FROM "
-                    "hc_manual_drafting_turns AS turns JOIN "
-                    "hc_manual_drafting_sessions AS sessions ON sessions.session_ref "
-                    "= turns.session_ref JOIN hc_manual_question_creations AS "
-                    "creations ON creations.context_ref = sessions.context_ref WHERE "
-                    "turns.assistant_status = 'running' AND (sessions.status = "
-                    "'closed' OR creations.terminal_decision IS NOT NULL)"
-                )
-            ).all()
-            cancelled_job_refs.extend(
-                self._drafting_job_ref(
-                    str(row.turn_ref), int(row.assistant_attempt_count)
-                )
-                for row in terminal_running
-            )
-            terminal = connection.execute(
+            terminal_queued = connection.execute(
                 text(
                     "UPDATE hc_manual_drafting_turns SET assistant_status = 'failed', "
                     "reason_code = 'manual_creation_terminal', completed_at = :now "
-                    "WHERE assistant_status IN ('queued', 'running') AND session_ref "
+                    "WHERE assistant_status = 'queued' AND session_ref "
                     "IN (SELECT sessions.session_ref FROM "
                     "hc_manual_drafting_sessions AS sessions JOIN "
                     "hc_manual_question_creations AS creations ON "
@@ -1728,26 +1788,112 @@ class ManualQuestionCreation:
                 ),
                 {"now": time.time()},
             ).all()
-            expired = connection.execute(
+            rows = connection.execute(
                 text(
-                    "UPDATE hc_manual_drafting_turns SET assistant_status = 'queued', "
-                    "assistant_started_at = NULL WHERE assistant_status = 'running' "
-                    "AND assistant_started_at < :cutoff AND session_ref IN (SELECT "
-                    "sessions.session_ref FROM hc_manual_drafting_sessions AS sessions "
-                    "JOIN hc_manual_question_creations AS creations ON "
+                    "SELECT turns.turn_ref, turns.assistant_attempt_count, "
+                    "sessions.context_ref FROM hc_manual_drafting_turns AS turns "
+                    "JOIN hc_manual_drafting_sessions AS sessions ON "
+                    "sessions.session_ref = turns.session_ref JOIN "
+                    "hc_manual_question_creations AS creations ON "
                     "creations.context_ref = sessions.context_ref WHERE "
-                    "sessions.status = 'open' AND creations.terminal_decision IS NULL) "
-                    "RETURNING turn_ref, assistant_attempt_count"
+                    "turns.assistant_status = 'running' AND (:recover_all = 1 OR "
+                    "turns.assistant_started_at < :cutoff OR sessions.status = "
+                    "'closed' OR creations.terminal_decision IS NOT NULL) ORDER BY "
+                    "turns.created_at, turns.turn_ref"
                 ),
-                {"cutoff": cutoff},
+                {"recover_all": int(recover_all), "cutoff": cutoff},
             ).all()
-            cancelled_job_refs.extend(
-                self._drafting_job_ref(
-                    str(row.turn_ref), int(row.assistant_attempt_count)
+            if terminal_queued:
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
                 )
-                for row in expired
+                self._feed.record(
+                    connection,
+                    "human_collaboration.manual_drafting_claims_recovered",
+                    {
+                        "recovered_record_count": len(terminal_queued),
+                        "expired_claim_count": 0,
+                    },
+                )
+        candidates = tuple(
+            _ManualDraftingClaim(
+                context_ref=str(row.context_ref),
+                turn_ref=str(row.turn_ref),
+                claim_attempt=int(row.assistant_attempt_count),
+                job_ref=self._drafting_job_ref(
+                    str(row.turn_ref), int(row.assistant_attempt_count)
+                ),
             )
-            recovered_count = len(terminal) + len(expired)
+            for row in rows
+        )
+        cancelled = tuple(
+            claim for claim in candidates if self._cancel_drafting_job(claim.job_ref)
+        )
+        if not cancelled:
+            return
+
+        settled: list[tuple[_ManualDraftingClaim, _DraftingBoundaryProof]] = []
+        recovered_count = 0
+        expired_count = 0
+        with self._database.write() as connection:
+            now = time.time()
+            for claim in cancelled:
+                terminal = bool(
+                    connection.execute(
+                        text(
+                            "SELECT 1 FROM hc_manual_drafting_turns AS turns JOIN "
+                            "hc_manual_drafting_sessions AS sessions ON "
+                            "sessions.session_ref = turns.session_ref JOIN "
+                            "hc_manual_question_creations AS creations ON "
+                            "creations.context_ref = sessions.context_ref WHERE "
+                            "turns.turn_ref = :turn_ref AND (sessions.status = "
+                            "'closed' OR creations.terminal_decision IS NOT NULL)"
+                        ),
+                        {"turn_ref": claim.turn_ref},
+                    ).first()
+                )
+                if terminal:
+                    updated = connection.execute(
+                        text(
+                            "UPDATE hc_manual_drafting_turns SET assistant_status = "
+                            "'failed', reason_code = 'manual_creation_terminal', "
+                            "completed_at = :now WHERE turn_ref = :turn_ref AND "
+                            "assistant_status = 'running' AND "
+                            "assistant_attempt_count = :claim_attempt"
+                        ),
+                        {
+                            "turn_ref": claim.turn_ref,
+                            "claim_attempt": claim.claim_attempt,
+                            "now": now,
+                        },
+                    )
+                else:
+                    updated = connection.execute(
+                        text(
+                            "UPDATE hc_manual_drafting_turns SET assistant_status = "
+                            "'queued', assistant_started_at = NULL WHERE turn_ref = "
+                            ":turn_ref AND assistant_status = 'running' AND "
+                            "assistant_attempt_count = :claim_attempt"
+                        ),
+                        {
+                            "turn_ref": claim.turn_ref,
+                            "claim_attempt": claim.claim_attempt,
+                        },
+                    )
+                    if updated.rowcount:
+                        expired_count += 1
+                recovered_count += int(bool(updated.rowcount))
+                proof = self._record_drafting_boundary(
+                    connection,
+                    claim.effect,
+                    boundary="permanent_fence",
+                    status=("terminal" if terminal else "requeued"),
+                    allow_missing=True,
+                )
+                settled.append((claim, proof))
             if recovered_count:
                 connection.execute(
                     text(
@@ -1760,24 +1906,50 @@ class ManualQuestionCreation:
                     "human_collaboration.manual_drafting_claims_recovered",
                     {
                         "recovered_record_count": recovered_count,
-                        "expired_claim_count": len(expired),
+                        "expired_claim_count": expired_count,
                     },
                 )
-        self._cancel_drafting_jobs(cancelled_job_refs)
+        for claim, proof in settled:
+            self._finish_drafting_boundary(claim.effect, proof)
+            self._finish_drafting_job(claim.job_ref)
 
     def _run_claimed_drafting_turn(
         self, turn: Row, session: Row, creation: Row
     ) -> bool:
         claim_attempt = int(turn.assistant_attempt_count)
         job_ref = self._drafting_job_ref(str(turn.turn_ref), claim_attempt)
-        try:
-            return self._complete_claimed_drafting_turn(
-                turn, session, creation, claim_attempt, job_ref
-            )
-        finally:
-            finish_job = getattr(self._intent_drafting_provider, "finish_job", None)
-            if callable(finish_job):
-                finish_job(job_ref)
+        effect = _manual_drafting_runtime_effect(
+            context_ref=str(creation.context_ref),
+            turn_ref=str(turn.turn_ref),
+            claim_attempt=claim_attempt,
+            job_ref=job_ref,
+        )
+        if self._runtime_protection is not None:
+            try:
+                self._runtime_protection.acquire(effect)
+            except RuntimeProtectionUnavailable as error:
+                proof = self._fail_drafting_turn(
+                    str(turn.turn_ref),
+                    claim_attempt,
+                    str(creation.context_ref),
+                    error.code,
+                    status="unavailable",
+                    effect=effect,
+                    allow_missing_runtime=True,
+                )
+                self._finish_drafting_boundary(effect, proof)
+                self._finish_drafting_job(job_ref)
+                return True
+        proof = self._complete_claimed_drafting_turn(
+            turn, session, creation, claim_attempt, job_ref, effect
+        )
+        if proof is None:
+            # The provider spool is the only remaining source of truth.  Keep
+            # both it and the power responsibility until explicit recovery.
+            return True
+        self._finish_drafting_boundary(effect, proof)
+        self._finish_drafting_job(job_ref)
+        return True
 
     def _complete_claimed_drafting_turn(
         self,
@@ -1786,7 +1958,8 @@ class ManualQuestionCreation:
         creation: Row,
         claim_attempt: int,
         job_ref: str,
-    ) -> bool:
+        effect: RuntimeEffectIdentity,
+    ) -> _DraftingBoundaryProof | None:
         try:
             drafting_context = self._validated_drafting_context(
                 turn, creation, require_current=True
@@ -1800,13 +1973,13 @@ class ManualQuestionCreation:
             ):
                 raise OwnerConflict("manual_drafting_basis_stale")
         except OwnerConflict:
-            self._fail_drafting_turn(
+            return self._fail_drafting_turn(
                 str(turn.turn_ref),
                 claim_attempt,
                 str(creation.context_ref),
                 "manual_drafting_context_invalid",
+                effect=effect,
             )
-            return True
 
         try:
             result = self._intent_drafting_provider.reply(
@@ -1840,27 +2013,27 @@ class ManualQuestionCreation:
                 raise DraftingUnavailable("intent_session_ref_invalid")
         except DraftingUnavailable as error:
             if error.code == "codex_cli_stopped":
-                self._requeue_interrupted_drafting_turn(
-                    str(turn.turn_ref), claim_attempt, str(creation.context_ref)
+                return self._requeue_interrupted_drafting_turn(
+                    str(turn.turn_ref),
+                    claim_attempt,
+                    str(creation.context_ref),
+                    effect,
                 )
-                return True
+            if error.code in _UNKNOWN_DRAFTING_OUTCOMES:
+                return None
             status = "unavailable" if "unavailable" in error.code else "failed"
-            self._fail_drafting_turn(
+            return self._fail_drafting_turn(
                 str(turn.turn_ref),
                 claim_attempt,
                 str(creation.context_ref),
                 error.code,
                 status=status,
+                effect=effect,
             )
-            return True
         except Exception:
-            self._fail_drafting_turn(
-                str(turn.turn_ref),
-                claim_attempt,
-                str(creation.context_ref),
-                "manual_drafting_provider_error",
-            )
-            return True
+            # An arbitrary provider exception carries no physical termination
+            # attestation.  Preserve the hold and durable spool for recovery.
+            return None
 
         try:
             with self._database.read() as connection:
@@ -1870,13 +2043,13 @@ class ManualQuestionCreation:
             self._validated_drafting_context(turn, current, require_current=True)
             self._require_row_target_current(current)
         except OwnerConflict:
-            self._fail_drafting_turn(
+            return self._fail_drafting_turn(
                 str(turn.turn_ref),
                 claim_attempt,
                 str(creation.context_ref),
                 "manual_drafting_basis_stale",
+                effect=effect,
             )
-            return True
 
         with self._database.write() as connection:
             now = time.time()
@@ -1947,7 +2120,14 @@ class ManualQuestionCreation:
                             "reason_code": "manual_drafting_basis_stale",
                         },
                     )
-                return True
+                return self._record_drafting_boundary(
+                    connection,
+                    effect,
+                    boundary=(
+                        "checkpoint" if stale is not None else "permanent_fence"
+                    ),
+                    status=("failed" if stale is not None else "superseded"),
+                )
             connection.execute(
                 text(
                     "UPDATE hc_manual_drafting_sessions SET native_session_ref = "
@@ -1976,11 +2156,20 @@ class ManualQuestionCreation:
                     "adapter_kind": result.adapter_kind,
                 },
             )
-        return True
+            return self._record_drafting_boundary(
+                connection,
+                effect,
+                boundary="checkpoint",
+                status="completed",
+            )
 
     def _requeue_interrupted_drafting_turn(
-        self, turn_ref: str, claim_attempt: int, context_ref: str
-    ) -> None:
+        self,
+        turn_ref: str,
+        claim_attempt: int,
+        context_ref: str,
+        effect: RuntimeEffectIdentity,
+    ) -> _DraftingBoundaryProof:
         with self._database.write() as connection:
             updated = connection.execute(
                 text(
@@ -1995,22 +2184,27 @@ class ManualQuestionCreation:
                 ),
                 {"turn_ref": turn_ref, "claim_attempt": claim_attempt},
             )
-            if not updated.rowcount:
-                return
-            connection.execute(
-                text(
-                    "UPDATE human_collaboration_state SET revision = revision + 1 "
-                    "WHERE singleton = 'owner'"
+            if updated.rowcount:
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
                 )
-            )
-            self._feed.record(
+                self._feed.record(
+                    connection,
+                    "human_collaboration.manual_drafting_reply_requeued",
+                    {
+                        "context_ref": context_ref,
+                        "turn_ref": turn_ref,
+                        "reason_code": "provider_stopped",
+                    },
+                )
+            return self._record_drafting_boundary(
                 connection,
-                "human_collaboration.manual_drafting_reply_requeued",
-                {
-                    "context_ref": context_ref,
-                    "turn_ref": turn_ref,
-                    "reason_code": "provider_stopped",
-                },
+                effect,
+                boundary="permanent_fence",
+                status="requeued" if updated.rowcount else "superseded",
             )
 
     def _fail_drafting_turn(
@@ -2021,7 +2215,9 @@ class ManualQuestionCreation:
         code: str,
         *,
         status: str = "failed",
-    ) -> None:
+        effect: RuntimeEffectIdentity,
+        allow_missing_runtime: bool = False,
+    ) -> _DraftingBoundaryProof:
         reason_code = code[:96]
         with self._database.write() as connection:
             updated = connection.execute(
@@ -2039,35 +2235,153 @@ class ManualQuestionCreation:
                     "now": time.time(),
                 },
             )
-            if not updated.rowcount:
-                return
-            connection.execute(
-                text(
-                    "UPDATE human_collaboration_state SET revision = revision + 1 "
-                    "WHERE singleton = 'owner'"
+            if updated.rowcount:
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
                 )
-            )
-            self._feed.record(
+                self._feed.record(
+                    connection,
+                    "human_collaboration.manual_drafting_reply_failed",
+                    {
+                        "context_ref": context_ref,
+                        "turn_ref": turn_ref,
+                        "status": status,
+                        "reason_code": reason_code,
+                    },
+                )
+            return self._record_drafting_boundary(
                 connection,
-                "human_collaboration.manual_drafting_reply_failed",
-                {
-                    "context_ref": context_ref,
-                    "turn_ref": turn_ref,
-                    "status": status,
-                    "reason_code": reason_code,
-                },
+                effect,
+                boundary=(
+                    "checkpoint" if updated.rowcount else "permanent_fence"
+                ),
+                status=status if updated.rowcount else "superseded",
+                allow_missing=allow_missing_runtime,
             )
+
+    def _record_drafting_boundary(
+        self,
+        connection: Connection,
+        effect: RuntimeEffectIdentity,
+        *,
+        boundary: RuntimeBoundary,
+        status: str,
+        allow_missing: bool = False,
+    ) -> _DraftingBoundaryProof:
+        checkpoint_ref = (
+            "manual_drafting_checkpoint_"
+            + canonical_hash(
+                {
+                    "responsibility_ref": effect.responsibility_ref,
+                    "operation_ref": effect.operation_ref,
+                    "status": status,
+                }
+            )
+            if boundary == "checkpoint"
+            else None
+        )
+        if self._runtime_protection is None:
+            return _DraftingBoundaryProof(boundary, checkpoint_ref, False)
+        responsibility = connection.execute(
+            text(
+                "SELECT status FROM ar_execution_responsibilities WHERE "
+                "responsibility_ref = :responsibility_ref"
+            ),
+            {"responsibility_ref": effect.responsibility_ref},
+        ).first()
+        if responsibility is None:
+            if not allow_missing:
+                raise RuntimeProtectionUnavailable(
+                    "runtime_responsibility_not_found"
+                )
+            return _DraftingBoundaryProof(boundary, checkpoint_ref, False)
+        existing = connection.execute(
+            text(
+                "SELECT boundary, checkpoint_ref FROM "
+                "ar_runtime_boundary_receipts WHERE responsibility_ref = "
+                ":responsibility_ref"
+            ),
+            {"responsibility_ref": effect.responsibility_ref},
+        ).first()
+        if existing is not None:
+            return _DraftingBoundaryProof(
+                cast(RuntimeBoundary, str(existing.boundary)),
+                (
+                    None
+                    if existing.checkpoint_ref is None
+                    else str(existing.checkpoint_ref)
+                ),
+                True,
+            )
+        record_runtime_boundary(
+            connection,
+            identity=effect,
+            boundary=boundary,
+            checkpoint_ref=checkpoint_ref,
+            owner_evidence_ref="manual_drafting_boundary_"
+            + canonical_hash(
+                {
+                    "responsibility_ref": effect.responsibility_ref,
+                    "operation_ref": effect.operation_ref,
+                    "boundary": boundary,
+                    "status": status,
+                }
+            ),
+        )
+        return _DraftingBoundaryProof(boundary, checkpoint_ref, True)
+
+    def _finish_drafting_boundary(
+        self,
+        effect: RuntimeEffectIdentity,
+        proof: _DraftingBoundaryProof,
+    ) -> None:
+        if self._runtime_protection is None or not proof.responsibility_present:
+            return
+        self._runtime_protection.finish(
+            effect.responsibility_ref,
+            boundary=proof.boundary,
+            checkpoint_ref=proof.checkpoint_ref,
+        )
+
+    def _finish_drafting_job(self, job_ref: str) -> None:
+        finish_job = getattr(self._intent_drafting_provider, "finish_job", None)
+        if callable(finish_job):
+            finish_job(job_ref)
+
+    def _cancel_drafting_job(self, job_ref: str) -> bool:
+        cancel_job = getattr(self._intent_drafting_provider, "cancel_job", None)
+        if not callable(cancel_job):
+            return False
+        try:
+            return cancel_job(job_ref) is True
+        except Exception:
+            # Without a positive, synchronous cancellation acknowledgement the
+            # previous provider effect remains physically unresolved.
+            return False
+
+    def _settle_cancelled_drafting_claims(
+        self, claims: tuple[_ManualDraftingClaim, ...]
+    ) -> None:
+        for claim in claims:
+            if not self._cancel_drafting_job(claim.job_ref):
+                continue
+            with self._database.write() as connection:
+                proof = self._record_drafting_boundary(
+                    connection,
+                    claim.effect,
+                    boundary="permanent_fence",
+                    status="terminal_cancelled",
+                    allow_missing=True,
+                )
+            self._finish_drafting_boundary(claim.effect, proof)
+            self._finish_drafting_job(claim.job_ref)
 
     @staticmethod
     def _drafting_job_ref(turn_ref: str, attempt_count: int) -> str:
         return f"{turn_ref}:claim:{attempt_count}"
-
-    def _cancel_drafting_jobs(self, job_refs: list[str] | tuple[str, ...]) -> None:
-        cancel_job = getattr(self._intent_drafting_provider, "cancel_job", None)
-        if not callable(cancel_job):
-            return
-        for job_ref in job_refs:
-            cancel_job(job_ref)
 
     def _close_drafting_for_terminal(
         self,
@@ -2076,10 +2390,15 @@ class ManualQuestionCreation:
         *,
         reason_code: str,
         now: float,
-    ) -> tuple[str, ...]:
-        running_job_refs = tuple(
-            self._drafting_job_ref(
-                str(row.turn_ref), int(row.assistant_attempt_count)
+    ) -> tuple[_ManualDraftingClaim, ...]:
+        running_claims = tuple(
+            _ManualDraftingClaim(
+                context_ref=context_ref,
+                turn_ref=str(row.turn_ref),
+                claim_attempt=int(row.assistant_attempt_count),
+                job_ref=self._drafting_job_ref(
+                    str(row.turn_ref), int(row.assistant_attempt_count)
+                ),
             )
             for row in connection.execute(
                 text(
@@ -2114,7 +2433,7 @@ class ManualQuestionCreation:
                 "now": now,
             },
         )
-        return running_job_refs
+        return running_claims
 
     def save_proposal(
         self,
@@ -2196,7 +2515,7 @@ class ManualQuestionCreation:
         idempotency_key: str,
     ) -> dict[str, object]:
         _validate_idempotency_key(idempotency_key)
-        drafting_job_refs: tuple[str, ...] = ()
+        drafting_claims: tuple[_ManualDraftingClaim, ...] = ()
         request_hash = canonical_hash(
             {
                 "command": "confirm_manual_question_proposal",
@@ -2284,7 +2603,7 @@ class ManualQuestionCreation:
                     )
                     if result.rowcount != 1:
                         raise OwnerConflict("manual_creation_terminal_conflict")
-                    drafting_job_refs = self._close_drafting_for_terminal(
+                    drafting_claims = self._close_drafting_for_terminal(
                         connection,
                         context_ref,
                         reason_code="manual_proposal_confirmed",
@@ -2314,7 +2633,7 @@ class ManualQuestionCreation:
                     request_hash,
                     confirmation_ref,
                 )
-        self._cancel_drafting_jobs(drafting_job_refs)
+        self._settle_cancelled_drafting_claims(drafting_claims)
         return self.query(context_ref)
 
     def cancel(
@@ -2323,7 +2642,7 @@ class ManualQuestionCreation:
         _validate_idempotency_key(idempotency_key)
         terminal_transitioned = False
         deepfetch_request_refs: tuple[str, ...] = ()
-        drafting_job_refs: tuple[str, ...] = ()
+        drafting_claims: tuple[_ManualDraftingClaim, ...] = ()
         request_hash = canonical_hash(
             {
                 "command": "cancel_manual_question_creation",
@@ -2375,7 +2694,7 @@ class ManualQuestionCreation:
                     if result.rowcount != 1:
                         raise OwnerConflict("manual_creation_terminal_conflict")
                     terminal_transitioned = True
-                    drafting_job_refs = self._close_drafting_for_terminal(
+                    drafting_claims = self._close_drafting_for_terminal(
                         connection,
                         context_ref,
                         reason_code="manual_creation_cancelled",
@@ -2415,7 +2734,7 @@ class ManualQuestionCreation:
         if terminal_transitioned:
             for request_ref in deepfetch_request_refs:
                 self._agent_runtime.cancel_deepfetch(request_ref)
-            self._cancel_drafting_jobs(drafting_job_refs)
+            self._settle_cancelled_drafting_claims(drafting_claims)
         return self.query(context_ref)
 
     def reconcile_once(self) -> bool:

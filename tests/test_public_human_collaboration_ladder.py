@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 from typing import cast
 
@@ -15,8 +16,13 @@ from meta_research.quest_drafting import (
     CodexDraftingAdapter,
     HostComputeDevice,
     HostComputeSnapshot,
+    IntentTurnRequest,
     IntentTurnResult,
     ProposalDraftResult,
+)
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeProtectionUnavailable,
 )
 
 
@@ -34,7 +40,7 @@ class _DeterministicDraftingProvider:
     def __init__(
         self, agent_proposal: dict[str, object] | None = None
     ) -> None:
-        self.intent_requests: list[object] = []
+        self.intent_requests: list[IntentTurnRequest] = []
         self.agent_proposal = agent_proposal
 
     def draft(self, _request) -> ProposalDraftResult:
@@ -43,7 +49,7 @@ class _DeterministicDraftingProvider:
             adapter_kind="deterministic_test_adapter",
         )
 
-    def reply(self, request) -> IntentTurnResult:
+    def reply(self, request: IntentTurnRequest) -> IntentTurnResult:
         self.intent_requests.append(request)
         return IntentTurnResult(
             reply=f"assistant:{request.message}",
@@ -51,6 +57,44 @@ class _DeterministicDraftingProvider:
             adapter_kind="deterministic_test_adapter",
             agent_proposal=self.agent_proposal,
         )
+
+
+class _LifecycleDraftingProvider(_DeterministicDraftingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finished_jobs: list[str] = []
+
+    def finish_job(self, job_ref: str) -> None:
+        self.finished_jobs.append(job_ref)
+
+
+class _TogglePowerInhibitor:
+    kind = "test_toggle_inhibitor"
+
+    def __init__(self, *, available: bool) -> None:
+        self.available = available
+        self._active: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        if not self.available:
+            raise RuntimeProtectionUnavailable(
+                "power_inhibitor_acquisition_failed"
+            )
+        self._active.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=time.time(),
+            native_holder_ref=f"test-native:{holder_ref}",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self._active
+
+    def release(self, lease: InhibitorLease) -> None:
+        self._active.discard(lease.holder_ref)
 
 
 class _DeterministicProbe:
@@ -119,12 +163,25 @@ class _UnknownOutcomeCompanionJobRunner:
         raise OSError("provider transport ended after submission")
 
 
-def _runtime(path: Path, provider: _DeterministicDraftingProvider):
+def _drafting_spool_files(workspace: Path, name: str) -> list[Path]:
+    return [
+        *workspace.glob(f"provider-operations/*/drafting/{name}"),
+        *workspace.glob(f".provider-jobs/*/{name}"),
+    ]
+
+
+def _runtime(
+    path: Path,
+    provider: _DeterministicDraftingProvider,
+    *,
+    power_inhibitor: _TogglePowerInhibitor | None = None,
+):
     return build_production_runtime(
         prepare_data_root(path),
         proposal_drafter=provider,
         intent_drafting_provider=provider,
         host_compute_probe=_DeterministicProbe(),
+        power_inhibitor=power_inhibitor,
     )
 
 
@@ -492,6 +549,113 @@ def test_collaboration_projection_isolates_every_artifact_by_exact_scope(
         runtime.close()
 
 
+def test_companion_terminal_owner_commit_finishes_exact_runtime_responsibility(
+    tmp_path: Path,
+) -> None:
+    provider = _LifecycleDraftingProvider()
+    runtime = _runtime(tmp_path / "companion-runtime-terminal", provider)
+    human = runtime.owners.human_collaboration
+    scope_ref = "quest:quest_companion_runtime_terminal"
+    try:
+        queued = human.send_companion_message(
+            scope_ref,
+            "Finish the exact runtime responsibility after this Owner commit.",
+            "companion-runtime-terminal-message",
+        )
+        assert human.process_drafting_once()
+
+        assert len(provider.intent_requests) == 1
+        request = provider.intent_requests[0]
+        assert request.job_ref == queued["interaction_ref"]
+        assert provider.finished_jobs == [queued["interaction_ref"]]
+        settled = human.query_companion(scope_ref)["turns"][-1]
+        assert settled["assistant_status"] == "completed"
+        assert runtime.query_runtime_observability()["responsibilities"] == []
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT responsibility_ref, operation_ref, status, boundary, "
+                    "checkpoint_ref FROM ar_execution_responsibilities WHERE "
+                    "owner_scope = 'human_collaboration' AND root_run_ref = "
+                    ":scope_ref"
+                ),
+                {"scope_ref": scope_ref},
+            ).one()
+            receipt = connection.execute(
+                text(
+                    "SELECT boundary, checkpoint_ref, owner_evidence_ref FROM "
+                    "ar_runtime_boundary_receipts WHERE responsibility_ref = "
+                    ":responsibility_ref"
+                ),
+                {"responsibility_ref": responsibility.responsibility_ref},
+            ).one()
+        assert responsibility.operation_ref == queued["interaction_ref"]
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "terminal"
+        assert responsibility.checkpoint_ref is None
+        assert receipt.boundary == "terminal"
+        assert receipt.checkpoint_ref is None
+        assert receipt.owner_evidence_ref.startswith("companion_terminal_")
+    finally:
+        runtime.close()
+
+
+def test_companion_acquire_failure_is_terminal_no_effect_with_provider_zero_call(
+    tmp_path: Path,
+) -> None:
+    provider = _LifecycleDraftingProvider()
+    runtime = _runtime(
+        tmp_path / "companion-runtime-acquire-failure",
+        provider,
+        power_inhibitor=_TogglePowerInhibitor(available=False),
+    )
+    human = runtime.owners.human_collaboration
+    scope_ref = "quest:quest_companion_runtime_acquire_failure"
+    try:
+        queued = human.send_companion_message(
+            scope_ref,
+            "Never call the provider without a confirmed power hold.",
+            "companion-runtime-acquire-failure-message",
+        )
+        assert human.process_drafting_once()
+
+        assert provider.intent_requests == []
+        assert provider.finished_jobs == []
+        failed = human.query_companion(scope_ref)["turns"][-1]
+        assert failed["interaction_ref"] == queued["interaction_ref"]
+        assert failed["assistant_status"] == "failed"
+        assert failed["reason"] == {
+            "code": "power_inhibitor_acquisition_failed"
+        }
+        observability = runtime.query_runtime_observability()
+        assert observability["responsibilities"] == []
+        assert observability["durable_waiting"] == []
+        with runtime._database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT responsibility_ref, operation_ref, status, boundary "
+                    "FROM ar_execution_responsibilities WHERE owner_scope = "
+                    "'human_collaboration' AND root_run_ref = :scope_ref"
+                ),
+                {"scope_ref": scope_ref},
+            ).one()
+            receipt = connection.execute(
+                text(
+                    "SELECT boundary, owner_evidence_ref FROM "
+                    "ar_runtime_boundary_receipts WHERE responsibility_ref = "
+                    ":responsibility_ref"
+                ),
+                {"responsibility_ref": responsibility.responsibility_ref},
+            ).one()
+        assert responsibility.operation_ref == queued["interaction_ref"]
+        assert responsibility.status == "finished"
+        assert responsibility.boundary == "terminal"
+        assert receipt.boundary == "terminal"
+        assert receipt.owner_evidence_ref.startswith("companion_terminal_")
+    finally:
+        runtime.close()
+
+
 def test_companion_ack_loss_recovers_without_a_second_provider_job_or_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -512,7 +676,7 @@ def test_companion_ack_loss_recovers_without_a_second_provider_job_or_thread(
             "Recover this exact provider reply after an Owner ACK loss.",
             "companion-ack-loss-message",
         )
-        expected_job_ref = f"{queued['interaction_ref']}:claim:1"
+        expected_job_ref = queued["interaction_ref"]
 
         def crash_before_owner_commit(*_args, **_kwargs) -> None:
             raise RuntimeError("simulated companion Owner ACK loss")
@@ -553,13 +717,30 @@ def test_companion_ack_loss_recovers_without_a_second_provider_job_or_thread(
         assert settled["assistant_content"] == "sealed companion reply 1"
         assert settled["authoritative_effect"] is False
         assert not human.process_drafting_once()
+        assert restarted.query_runtime_observability()["responsibilities"] == []
+        with restarted._database.read() as connection:
+            boundaries = connection.execute(
+                text(
+                    "SELECT attempt_ref, operation_ref, status, boundary FROM "
+                    "ar_execution_responsibilities WHERE owner_scope = "
+                    "'human_collaboration' AND root_run_ref = :scope_ref ORDER BY "
+                    "attempt_ref"
+                ),
+                {"scope_ref": scope_ref},
+            ).all()
+        assert len(boundaries) == 2
+        assert {row.operation_ref for row in boundaries} == {expected_job_ref}
+        assert {row.status for row in boundaries} == {"finished"}
+        assert {row.boundary for row in boundaries} == {
+            "permanent_fence",
+            "terminal",
+        }
     finally:
         restarted.close()
 
 
-def test_companion_unknown_outcome_keeps_spool_until_owner_failure_commits(
+def test_companion_unknown_outcome_keeps_hold_and_spool_without_blind_replay(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data_path = tmp_path / "companion-unknown-outcome-data"
     provider_workspace = tmp_path / "companion-unknown-outcome-spool"
@@ -579,24 +760,21 @@ def test_companion_unknown_outcome_keeps_spool_until_owner_failure_commits(
             "Do not replay this provider job when its outcome is unknown.",
             "companion-unknown-outcome-message",
         )
-        expected_job_ref = f"{queued['interaction_ref']}:claim:1"
+        expected_job_ref = queued["interaction_ref"]
 
-        def crash_before_failure_commit(*_args, **_kwargs) -> None:
-            raise RuntimeError("simulated failed-turn Owner commit loss")
-
-        monkeypatch.setattr(
-            human._collaboration_ladder,
-            "_finish_companion_turn",
-            crash_before_failure_commit,
-        )
-        with pytest.raises(
-            RuntimeError, match="simulated failed-turn Owner commit loss"
-        ):
-            human.process_drafting_once()
+        assert human.process_drafting_once()
         assert external_calls == [expected_job_ref]
-        assert human.query_companion(scope_ref)["turns"][-1][
-            "assistant_status"
-        ] == "processing"
+        pending = human.query_companion(scope_ref)["turns"][-1]
+        assert pending["assistant_status"] == "processing"
+        assert pending["reason"] == {"code": "codex_cli_io_unavailable"}
+        assert not human.process_drafting_once()
+        assert external_calls == [expected_job_ref]
+        observability = runtime.query_runtime_observability()
+        assert len(observability["responsibilities"]) == 1
+        assert observability["responsibilities"][0]["operation_ref"] == (
+            expected_job_ref
+        )
+        assert len(_drafting_spool_files(provider_workspace, "invocation.json")) == 1
     finally:
         runtime.close()
 
@@ -611,10 +789,16 @@ def test_companion_unknown_outcome_keeps_spool_until_owner_failure_commits(
         human = restarted.owners.human_collaboration
         assert human.process_drafting_once()
         assert external_calls == [expected_job_ref]
-        failed = human.query_companion(scope_ref)["turns"][-1]
-        assert failed["assistant_status"] == "failed"
-        assert failed["reason"] == {"code": "codex_job_outcome_unknown"}
+        pending = human.query_companion(scope_ref)["turns"][-1]
+        assert pending["assistant_status"] == "processing"
+        assert pending["reason"] == {"code": "codex_job_outcome_unknown"}
         assert not human.process_drafting_once()
+        observability = restarted.query_runtime_observability()
+        assert len(observability["responsibilities"]) == 2
+        assert {
+            item["operation_ref"] for item in observability["responsibilities"]
+        } == {expected_job_ref}
+        assert len(_drafting_spool_files(provider_workspace, "invocation.json")) == 1
     finally:
         restarted.close()
 
@@ -655,7 +839,7 @@ def test_companion_rejects_tampered_sealed_provider_result(
     finally:
         runtime.close()
 
-    result_paths = list((provider_workspace / ".provider-jobs").glob("*/result.json"))
+    result_paths = _drafting_spool_files(provider_workspace, "result.json")
     assert len(result_paths) == 1
     sealed = json.loads(result_paths[0].read_text(encoding="utf-8"))
     sealed["raw"] = {"reply": "forged sealed reply"}

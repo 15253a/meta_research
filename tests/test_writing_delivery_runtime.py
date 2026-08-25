@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
 import meta_research.owners.writing_delivery_runtime as writing_delivery_runtime_module
 import meta_research.writing_delivery as writing_delivery_module
@@ -20,6 +21,12 @@ from meta_research.owners.common import (
     canonical_json,
 )
 from meta_research.owners.writing_delivery_runtime import SQLiteWritingDeliveryRuntime
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeEventLogger,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+)
 from meta_research.writing_delivery import (
     InMemoryWritingDeliveryProvider,
     LocalFilesystemWritingDeliveryProvider,
@@ -665,6 +672,75 @@ class _AckLostOnceProvider(InMemoryWritingDeliveryProvider):
         return super().reconcile(request)
 
 
+class _CompletedProvider(InMemoryWritingDeliveryProvider):
+    provider_ref = "local-filesystem"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.execute_calls = 0
+
+    def execute(self, request):
+        self.execute_calls += 1
+        return super().execute(request)
+
+
+class _UnknownReconciliationProvider(_AckLostOnceProvider):
+    def __init__(self, *, unknown_reconciliations: int) -> None:
+        super().__init__()
+        self._unknown_reconciliations = unknown_reconciliations
+
+    def reconcile(self, request):
+        self.reconcile_calls += 1
+        if self.reconcile_calls <= self._unknown_reconciliations:
+            raise WritingDeliveryOutcomeUnknown("provider_reconciliation_ack_lost")
+        return InMemoryWritingDeliveryProvider.reconcile(self, request)
+
+
+class _RecordingInhibitor:
+    kind = "test_writing_delivery_inhibitor"
+
+    def __init__(self, *, reject: bool = False) -> None:
+        self.reject = reject
+        self.active: set[str] = set()
+        self.acquire_calls = 0
+        self.release_calls = 0
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        self.acquire_calls += 1
+        if self.reject:
+            raise RuntimeProtectionUnavailable(
+                "power_inhibitor_acquisition_failed"
+            )
+        self.active.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=1.0,
+            native_holder_ref="test-native:" + holder_ref,
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self.active
+
+    def release(self, lease: InhibitorLease) -> None:
+        self.release_calls += 1
+        self.active.discard(lease.holder_ref)
+
+
+class _LoseFinishAck:
+    def __init__(self, protection: RuntimeProtection) -> None:
+        self._protection = protection
+
+    def acquire(self, identity):
+        return self._protection.acquire(identity)
+
+    def finish(self, responsibility_ref, *, boundary, checkpoint_ref=None):
+        del responsibility_ref, boundary, checkpoint_ref
+        raise RuntimeProtectionUnavailable("runtime_finish_ack_lost")
+
+
 class _ExplodingProvider(InMemoryWritingDeliveryProvider):
     provider_ref = "local-filesystem"
 
@@ -747,6 +823,442 @@ def _seed_writing_run(path: Path) -> None:
             ),
         )
         connection.commit()
+
+
+def _admit_test_delivery(
+    authority: SQLiteWritingDeliveryRuntime,
+    payload: dict[str, object],
+    *,
+    suffix: str,
+):
+    return authority.admit(
+        payload,
+        intent_id=f"writing-intent:{suffix}",
+        draft_revision=1,
+        draft_hash="9" * 64,
+        preview_ref=f"preview:{suffix}",
+        preview_hash="a" * 64,
+        confirmation=AcceptanceReceipt(
+            issuer="human_collaboration",
+            kind="command_confirmed",
+            receipt_ref=f"hc-confirmation:{suffix}",
+            subject_ref=f"writing-intent:{suffix}",
+            payload_hash="8" * 64,
+        ),
+        idempotency_key=f"delivery-admit-{suffix}",
+    )
+
+
+def _protected_delivery_runtime(
+    *,
+    path: Path,
+    payload: dict[str, object],
+    provider,
+    inhibitor: _RecordingInhibitor,
+    runtime_protection=None,
+):
+    database = Database(path)
+    feed = DurableFeed(database)
+    protection = runtime_protection or RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=inhibitor,
+        event_logger=RuntimeEventLogger(path.with_suffix(".runtime.jsonl")),
+    )
+    authority = SQLiteWritingDeliveryRuntime(
+        database,
+        feed,
+        _HumanConfirmationVerifier(payload),
+        WritingDeliveryProviderRegistry((provider,)),
+        production_mode=False,
+        runtime_protection=protection,
+    )
+    authority.bind_binding_verifier(_BindingVerifier())
+    return database, protection, authority
+
+
+def test_delivery_execute_is_fail_closed_when_power_hold_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery-protection-rejected.sqlite3"
+    upgrade_database(path)
+    _seed_writing_run(path)
+    payload = _payload(tmp_path, nonce="protected-rejected")
+    provider = _CompletedProvider()
+    inhibitor = _RecordingInhibitor(reject=True)
+    database, _protection, authority = _protected_delivery_runtime(
+        path=path,
+        payload=payload,
+        provider=provider,
+        inhibitor=inhibitor,
+    )
+    try:
+        operation = _admit_test_delivery(
+            authority, payload, suffix="protected-rejected"
+        )
+
+        with pytest.raises(
+            OwnerConflict, match="power_inhibitor_acquisition_failed"
+        ):
+            authority.execute_once(operation.operation_ref, artifact=b"rendered")
+
+        current = authority.query_operation(operation.operation_ref)
+        assert current is not None
+        assert current.status == "executing"
+        assert current.attempt_count == 1
+        assert current.reconciliation_generation == 0
+        assert provider.execute_calls == 0
+        with database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT status, effect_kind FROM "
+                    "ar_execution_responsibilities WHERE operation_ref = "
+                    ":operation_ref"
+                ),
+                {"operation_ref": operation.provider_operation_ref},
+            ).one()
+        assert responsibility.status == "waiting"
+        assert responsibility.effect_kind == "provider_unit"
+    finally:
+        database.close()
+
+
+def test_unknown_reconciliation_generations_stay_held_until_exact_success(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery-protection-reconciliation.sqlite3"
+    upgrade_database(path)
+    _seed_writing_run(path)
+    payload = _payload(tmp_path, nonce="protected-reconciliation")
+    provider = _UnknownReconciliationProvider(unknown_reconciliations=2)
+    inhibitor = _RecordingInhibitor()
+    database, _protection, authority = _protected_delivery_runtime(
+        path=path,
+        payload=payload,
+        provider=provider,
+        inhibitor=inhibitor,
+    )
+    try:
+        operation = _admit_test_delivery(
+            authority, payload, suffix="protected-reconciliation"
+        )
+        first = authority.execute_once(
+            operation.operation_ref, artifact=b"rendered"
+        )
+        assert first.status == "outcome_unknown"
+        assert first.reconciliation_generation == 0
+
+        first_unknown = authority.execute_once(
+            operation.operation_ref, artifact=b"rendered"
+        )
+        second_unknown = authority.execute_once(
+            operation.operation_ref, artifact=b"rendered"
+        )
+        assert first_unknown.status == second_unknown.status == "outcome_unknown"
+        assert first_unknown.reconciliation_generation == 1
+        assert second_unknown.reconciliation_generation == 2
+        assert provider.execute_calls == 1
+        assert provider.reconcile_calls == 2
+        assert len(inhibitor.active) == 1
+        with database.read() as connection:
+            unresolved = connection.execute(
+                text(
+                    "SELECT responsibility_ref, effect_kind, status FROM "
+                    "ar_execution_responsibilities WHERE operation_ref = "
+                    ":operation_ref ORDER BY created_at, responsibility_ref"
+                ),
+                {"operation_ref": operation.provider_operation_ref},
+            ).all()
+            boundary_count = connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM ar_runtime_boundary_receipts WHERE "
+                    "operation_ref = :operation_ref"
+                ),
+                {"operation_ref": operation.provider_operation_ref},
+            ).scalar_one()
+        assert len(unresolved) == 3
+        assert len({row.responsibility_ref for row in unresolved}) == 3
+        assert [row.effect_kind for row in unresolved] == [
+            "provider_unit",
+            "runtime_reconciliation",
+            "runtime_reconciliation",
+        ]
+        assert {row.status for row in unresolved} == {"active"}
+        assert boundary_count == 0
+
+        completed = authority.execute_once(
+            operation.operation_ref, artifact=b"rendered"
+        )
+        assert completed.status == "completed"
+        assert completed.reconciliation_generation == 3
+        assert provider.execute_calls == 1
+        assert provider.reconcile_calls == 3
+        assert inhibitor.active == set()
+        with database.read() as connection:
+            settled = connection.execute(
+                text(
+                    "SELECT responsibility.effect_kind, responsibility.status, "
+                    "receipt.boundary FROM ar_execution_responsibilities AS "
+                    "responsibility JOIN ar_runtime_boundary_receipts AS receipt "
+                    "ON receipt.responsibility_ref = "
+                    "responsibility.responsibility_ref WHERE "
+                    "responsibility.operation_ref = :operation_ref ORDER BY "
+                    "responsibility.created_at, responsibility.responsibility_ref"
+                ),
+                {"operation_ref": operation.provider_operation_ref},
+            ).all()
+        assert len(settled) == 4
+        assert {row.status for row in settled} == {"finished"}
+        assert [row.boundary for row in settled].count("permanent_fence") == 3
+        assert [row.boundary for row in settled].count("terminal") == 1
+    finally:
+        database.close()
+
+
+def test_stale_reconciliation_observation_cannot_fence_newer_acquired_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "delivery-protection-generation-race.sqlite3"
+    upgrade_database(path)
+    _seed_writing_run(path)
+    payload = _payload(tmp_path, nonce="protected-generation-race")
+    provider = _CompletedProvider()
+    inhibitor = _RecordingInhibitor()
+    database, _protection, authority = _protected_delivery_runtime(
+        path=path,
+        payload=payload,
+        provider=provider,
+        inhibitor=inhibitor,
+    )
+    try:
+        operation = _admit_test_delivery(
+            authority, payload, suffix="protected-generation-race"
+        )
+        request = provider.request(
+            operation_ref=operation.operation_ref,
+            action=str(payload["action"]),
+            target=payload["target"],
+            target_binding=payload["target_binding"],
+            artifact=b"rendered",
+            artifact_sha256=str(payload["renderer_artifact_sha256"]),
+        )
+        authority.claim(
+            operation.operation_ref,
+            provider_request_hash=request.request_hash,
+        )
+        first = authority._begin_reconciliation(
+            operation.operation_ref,
+            provider_request_hash=request.request_hash,
+        )
+        first_effect = authority._acquire_runtime_effect(
+            first,
+            provider_request_hash=request.request_hash,
+            reconciling=True,
+        )
+        second = authority._begin_reconciliation(
+            operation.operation_ref,
+            provider_request_hash=request.request_hash,
+        )
+        second_effect = authority._acquire_runtime_effect(
+            second,
+            provider_request_hash=request.request_hash,
+            reconciling=True,
+        )
+        assert first_effect is not None and second_effect is not None
+
+        # Deterministically reproduce the transaction race: generation one read
+        # itself as current immediately before generation two committed its claim.
+        original_query = authority.query_operation
+        query_count = 0
+
+        def stale_first_query(operation_ref: str):
+            nonlocal query_count
+            query_count += 1
+            if query_count == 1:
+                return first
+            return original_query(operation_ref)
+
+        monkeypatch.setattr(authority, "query_operation", stale_first_query)
+        observation = provider.reconcile(request)
+
+        with pytest.raises(
+            OwnerConflict,
+            match="writing_delivery_runtime_effect_stale",
+        ):
+            authority.record_provider_observation(
+                operation.operation_ref,
+                observation,
+                reconciliation=True,
+                runtime_effect=first_effect,
+            )
+
+        current = original_query(operation.operation_ref)
+        assert current is not None
+        assert current.status == "executing"
+        assert current.reconciliation_generation == 2
+        with database.read() as connection:
+            responsibilities = connection.execute(
+                text(
+                    "SELECT responsibility_ref, status, boundary FROM "
+                    "ar_execution_responsibilities WHERE operation_ref = "
+                    ":operation_ref ORDER BY created_at, responsibility_ref"
+                ),
+                {"operation_ref": operation.provider_operation_ref},
+            ).all()
+            boundary_count = connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM ar_runtime_boundary_receipts WHERE "
+                    "operation_ref = :operation_ref"
+                ),
+                {"operation_ref": operation.provider_operation_ref},
+            ).scalar_one()
+        assert len(responsibilities) == 2
+        assert {row.status for row in responsibilities} == {"active"}
+        assert {row.boundary for row in responsibilities} == {None}
+        assert boundary_count == 0
+        assert len(inhibitor.active) == 1
+    finally:
+        database.close()
+
+
+def test_execution_does_not_start_after_reconciliation_claims_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "delivery-protection-late-execution.sqlite3"
+    upgrade_database(path)
+    _seed_writing_run(path)
+    payload = _payload(tmp_path, nonce="protected-late-execution")
+    provider = _CompletedProvider()
+    inhibitor = _RecordingInhibitor()
+    database, _protection, authority = _protected_delivery_runtime(
+        path=path,
+        payload=payload,
+        provider=provider,
+        inhibitor=inhibitor,
+    )
+    try:
+        operation = _admit_test_delivery(
+            authority, payload, suffix="protected-late-execution"
+        )
+        original_claim = authority.claim
+
+        def claim_then_lose_generation(
+            operation_ref: str,
+            *,
+            provider_request_hash: str,
+        ):
+            original_claim(
+                operation_ref,
+                provider_request_hash=provider_request_hash,
+            )
+            return authority._begin_reconciliation(
+                operation_ref,
+                provider_request_hash=provider_request_hash,
+            )
+
+        monkeypatch.setattr(authority, "claim", claim_then_lose_generation)
+
+        with pytest.raises(
+            OwnerConflict,
+            match="writing_delivery_runtime_effect_stale",
+        ):
+            authority.execute_once(operation.operation_ref, artifact=b"rendered")
+
+        assert provider.execute_calls == 0
+        current = authority.query_operation(operation.operation_ref)
+        assert current is not None
+        assert current.status == "executing"
+        assert current.attempt_count == 1
+        assert current.reconciliation_generation == 1
+        with database.read() as connection:
+            responsibility_count = connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM ar_execution_responsibilities WHERE "
+                    "operation_ref = :operation_ref"
+                ),
+                {"operation_ref": operation.provider_operation_ref},
+            ).scalar_one()
+        assert responsibility_count == 0
+        assert inhibitor.active == set()
+    finally:
+        database.close()
+
+
+def test_completed_delivery_recovers_when_runtime_finish_ack_is_lost(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "delivery-protection-finish-ack.sqlite3"
+    upgrade_database(path)
+    _seed_writing_run(path)
+    payload = _payload(tmp_path, nonce="protected-finish-ack")
+    provider = _CompletedProvider()
+    inhibitor = _RecordingInhibitor()
+    database = Database(path)
+    feed = DurableFeed(database)
+    first_protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=inhibitor,
+        event_logger=RuntimeEventLogger(path.with_suffix(".runtime.jsonl")),
+    )
+    authority = SQLiteWritingDeliveryRuntime(
+        database,
+        feed,
+        _HumanConfirmationVerifier(payload),
+        WritingDeliveryProviderRegistry((provider,)),
+        production_mode=False,
+        runtime_protection=_LoseFinishAck(first_protection),  # type: ignore[arg-type]
+    )
+    authority.bind_binding_verifier(_BindingVerifier())
+    try:
+        operation = _admit_test_delivery(
+            authority, payload, suffix="protected-finish-ack"
+        )
+        with pytest.raises(OwnerConflict, match="runtime_finish_ack_lost"):
+            authority.execute_once(operation.operation_ref, artifact=b"rendered")
+
+        committed = authority.query_operation(operation.operation_ref)
+        assert committed is not None and committed.status == "completed"
+        assert provider.execute_calls == 1
+        assert len(inhibitor.active) == 1
+        with database.read() as connection:
+            responsibility = connection.execute(
+                text(
+                    "SELECT responsibility.status, receipt.boundary FROM "
+                    "ar_execution_responsibilities AS responsibility JOIN "
+                    "ar_runtime_boundary_receipts AS receipt ON "
+                    "receipt.responsibility_ref = responsibility.responsibility_ref "
+                    "WHERE responsibility.operation_ref = :operation_ref"
+                ),
+                {"operation_ref": operation.provider_operation_ref},
+            ).one()
+        assert responsibility.status == "active"
+        assert responsibility.boundary == "terminal"
+
+        restarted = RuntimeProtection(
+            database=database,
+            feed=feed,
+            inhibitor=inhibitor,
+            event_logger=RuntimeEventLogger(path.with_suffix(".runtime.jsonl")),
+        )
+        replay_authority = SQLiteWritingDeliveryRuntime(
+            database,
+            feed,
+            _HumanConfirmationVerifier(payload),
+            WritingDeliveryProviderRegistry((provider,)),
+            production_mode=False,
+            runtime_protection=restarted,
+        )
+        replay = replay_authority.execute_once(
+            operation.operation_ref, artifact=b"rendered"
+        )
+        assert replay.status == "completed"
+        assert provider.execute_calls == 1
+        assert inhibitor.active == set()
+    finally:
+        database.close()
 
 
 def test_runnable_selector_honors_backoff_exclusions_and_created_order(

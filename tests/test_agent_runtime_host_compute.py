@@ -13,6 +13,14 @@ from meta_research.owners.agent_runtime import create_agent_runtime_interface
 from meta_research.owners.common import OwnerConflict
 from meta_research.paths import prepare_data_root
 from meta_research.quest_drafting import HostComputeDevice, HostComputeSnapshot
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeEffectIdentity,
+    RuntimeEventLogger,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+    record_runtime_boundary,
+)
 
 
 class ReadyProbe:
@@ -66,6 +74,225 @@ class FailingOnceProbe(ReadyProbe):
             ),
             adapter_kind="test_probe",
         )
+
+
+class RejectingInhibitor:
+    kind = "test_rejecting_inhibitor"
+
+    def acquire(self, *, holder_ref: str, reason: str):
+        del holder_ref, reason
+        raise RuntimeProtectionUnavailable("power_inhibitor_acquisition_failed")
+
+    def is_confirmed(self, lease) -> bool:
+        del lease
+        return False
+
+    def release(self, lease) -> None:
+        del lease
+
+
+class RecordingInhibitor:
+    kind = "test_recording_inhibitor"
+
+    def __init__(self) -> None:
+        self.active: set[str] = set()
+        self.release_count = 0
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        self.active.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=1.0,
+            native_holder_ref="test-native:" + holder_ref,
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self.active
+
+    def release(self, lease: InhibitorLease) -> None:
+        self.active.discard(lease.holder_ref)
+        self.release_count += 1
+
+
+class ReleasePendingInhibitor(RecordingInhibitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_available = False
+
+    def release(self, lease: InhibitorLease) -> None:
+        self.release_count += 1
+        if not self.release_available:
+            raise RuntimeProtectionUnavailable("power_inhibitor_release_failed")
+        self.active.discard(lease.holder_ref)
+
+
+class LoseFinishAckOnce:
+    def __init__(self, protection: RuntimeProtection) -> None:
+        self._protection = protection
+
+    def acquire(self, identity):
+        return self._protection.acquire(identity)
+
+    def finish(self, responsibility_ref: str, *, boundary, checkpoint_ref=None) -> None:
+        del responsibility_ref, boundary, checkpoint_ref
+        raise RuntimeProtectionUnavailable("runtime_finish_ack_lost")
+
+
+def test_host_compute_probe_waits_for_confirmed_power_hold_and_persists_blocker(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "host-probe-power-blocker")
+    upgrade_database(data_root.database)
+    database = Database(data_root.database)
+    feed = DurableFeed(database)
+    feed.ensure_initialized()
+    probe = ReadyProbe(uuid="GPU-must-not-run")
+    protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=RejectingInhibitor(),
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    owner = create_agent_runtime_interface(
+        database,
+        feed,
+        probe,
+        runtime_protection=protection,
+    )
+    try:
+        observed = owner.observe_host_compute("protected-host-observation")
+        replayed = owner.reconcile_host_compute("protected-host-observation")
+
+        assert probe.calls == 0
+        assert observed.status == "unavailable"
+        assert observed.reason_code == "power_inhibitor_acquisition_failed"
+        assert replayed == observed
+    finally:
+        database.close()
+
+
+def test_host_compute_snapshot_replays_after_finish_ack_is_lost(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "host-probe-finish-ack")
+    upgrade_database(data_root.database)
+    database = Database(data_root.database)
+    feed = DurableFeed(database)
+    feed.ensure_initialized()
+    inhibitor = RecordingInhibitor()
+    first_protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=inhibitor,
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    first_probe = ReadyProbe(uuid="GPU-before-crash")
+    first_owner = create_agent_runtime_interface(
+        database,
+        feed,
+        first_probe,
+        runtime_protection=LoseFinishAckOnce(first_protection),  # type: ignore[arg-type]
+    )
+    try:
+        with pytest.raises(RuntimeProtectionUnavailable, match="runtime_finish_ack_lost"):
+            first_owner.observe_host_compute("host-finish-ack-replay")
+        assert first_probe.calls == 1
+        assert len(inhibitor.active) == 1
+
+        restarted_protection = RuntimeProtection(
+            database=database,
+            feed=feed,
+            inhibitor=inhibitor,
+            event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+        )
+        replay_probe = ReadyProbe(uuid="GPU-must-not-replay")
+        restarted_owner = create_agent_runtime_interface(
+            database,
+            feed,
+            replay_probe,
+            runtime_protection=restarted_protection,
+        )
+        replayed = restarted_owner.observe_host_compute("host-finish-ack-replay")
+
+        assert replayed.devices[0].uuid == "GPU-before-crash"
+        assert replay_probe.calls == 0
+        assert inhibitor.active == set()
+        assert inhibitor.release_count == 1
+    finally:
+        database.close()
+
+
+def test_host_compute_persists_unavailable_before_its_responsibility_is_prepared(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "host-probe-global-release-pending")
+    upgrade_database(data_root.database)
+    database = Database(data_root.database)
+    feed = DurableFeed(database)
+    feed.ensure_initialized()
+    inhibitor = ReleasePendingInhibitor()
+    protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=inhibitor,
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    predecessor = RuntimeEffectIdentity(
+        responsibility_ref="responsibility:release-pending-predecessor",
+        owner_scope="agent_runtime",
+        root_run_ref="run:release-pending-predecessor",
+        attempt_ref="attempt:release-pending-predecessor",
+        fence_ref="fence:release-pending-predecessor",
+        operation_ref="operation:release-pending-predecessor",
+        effect_kind="provider_unit",
+    )
+    protection.acquire(predecessor)
+    with database.write() as connection:
+        record_runtime_boundary(
+            connection,
+            identity=predecessor,
+            boundary="terminal",
+            owner_evidence_ref="owner-evidence:release-pending-predecessor",
+        )
+    protection.finish(predecessor.responsibility_ref, boundary="terminal")
+    assert protection.query_evidence()["inhibitor"]["status"] == "release_pending"
+
+    probe = ReadyProbe(uuid="GPU-after-release-recovery")
+    owner = create_agent_runtime_interface(
+        database,
+        feed,
+        probe,
+        runtime_protection=protection,
+    )
+    try:
+        blocked = owner.observe_host_compute("host-global-release-pending")
+        replayed = owner.reconcile_host_compute("host-global-release-pending")
+
+        assert probe.calls == 0
+        assert blocked.status == "unavailable"
+        assert blocked.reason_code == "power_inhibitor_release_pending"
+        assert replayed == blocked
+        with database.read() as connection:
+            responsibility_operations = connection.execute(
+                text(
+                    "SELECT operation_ref FROM ar_execution_responsibilities "
+                    "ORDER BY operation_ref"
+                )
+            ).scalars().all()
+        assert responsibility_operations == [predecessor.operation_ref]
+
+        inhibitor.release_available = True
+        recovered = owner.observe_host_compute("host-after-release-recovery")
+
+        assert recovered.status == "ready"
+        assert recovered.devices[0].uuid == "GPU-after-release-recovery"
+        assert probe.calls == 1
+        assert owner.observe_host_compute("host-global-release-pending") == blocked
+    finally:
+        database.close()
 
 
 def test_slow_host_probe_does_not_block_an_unrelated_observation(

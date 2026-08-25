@@ -76,6 +76,11 @@ type FixedDynamicMask = {
   reason: string;
   region?: "element" | "viewport-right-of-element";
 };
+type FixedDynamicText = {
+  selector: string;
+  canonicalText: string;
+  reason: string;
+};
 const FIXED_DYNAMIC_MASK_ALLOWLIST: Record<
   FixedReferenceSurface,
   FixedDynamicMask[]
@@ -115,6 +120,35 @@ const FIXED_DYNAMIC_MASK_ALLOWLIST: Record<
   "offline-operation": [],
   "permission-request": [],
 };
+const FIXED_DYNAMIC_TEXT_ALLOWLIST: Record<
+  FixedReferenceSurface,
+  FixedDynamicText[]
+> = {
+  shell: [
+    {
+      selector: ".lumen-connection code",
+      canonicalText: "rev 1",
+      reason: "durable feed revision must not change fixed-reference geometry",
+    },
+    {
+      selector: ".lumen-next-card .lumen-card-head small",
+      canonicalText: "rev 1",
+      reason: "monotonic Snapshot revision",
+    },
+  ],
+  "create-quest": [
+    {
+      selector: ".lumen-connection code",
+      canonicalText: "rev 1",
+      reason: "durable feed revision must not change fixed-reference geometry",
+    },
+  ],
+  "create-question": [],
+  "human-request": [],
+  "external-request": [],
+  "offline-operation": [],
+  "permission-request": [],
+};
 const FIXED_MASK_RGBA = [32, 42, 58, 255] as const;
 type RasterRgba = readonly [number, number, number, number];
 type ReviewedRasterPixel = {
@@ -128,6 +162,13 @@ type FixedRasterNormalization = {
   selector: string;
   reason: string;
   pixels: ReviewedRasterPixel[];
+};
+type FixedRasterRegionNormalization = {
+  viewport: { width: number; height: number };
+  region: { x: number; y: number; width: number; height: number };
+  reason: string;
+  reviewedRgbaSha256: string;
+  chromiumRgbaSha256: string;
 };
 const FIXED_RASTER_NORMALIZATION_ALLOWLIST: Record<
   FixedReferenceSurface,
@@ -153,6 +194,64 @@ const FIXED_RASTER_NORMALIZATION_ALLOWLIST: Record<
           chromiumRgba: [228, 232, 238, 255],
         },
       ],
+    },
+  ],
+  "create-question": [
+    {
+      viewport: { width: 1440, height: 900 },
+      selector: "body",
+      reason: "reviewed Chromium native dialog shadow channel rounding",
+      pixels: [
+        {
+          offsetX: 1385,
+          offsetY: 36,
+          reviewedRgba: [131, 135, 145, 255],
+          chromiumRgba: [131, 135, 144, 255],
+        },
+        {
+          offsetX: 1384,
+          offsetY: 55,
+          reviewedRgba: [122, 127, 136, 255],
+          chromiumRgba: [122, 127, 137, 255],
+        },
+        {
+          offsetX: 1389,
+          offsetY: 42,
+          reviewedRgba: [128, 133, 143, 255],
+          chromiumRgba: [129, 133, 143, 255],
+        },
+        {
+          offsetX: 1390,
+          offsetY: 42,
+          reviewedRgba: [128, 133, 143, 255],
+          chromiumRgba: [129, 133, 143, 255],
+        },
+        {
+          offsetX: 1389,
+          offsetY: 55,
+          reviewedRgba: [123, 126, 137, 255],
+          chromiumRgba: [123, 127, 138, 255],
+        },
+      ],
+    },
+  ],
+  "human-request": [],
+  "external-request": [],
+  "offline-operation": [],
+  "permission-request": [],
+};
+const FIXED_RASTER_REGION_NORMALIZATION_ALLOWLIST: Record<
+  FixedReferenceSurface,
+  FixedRasterRegionNormalization[]
+> = {
+  shell: [],
+  "create-quest": [
+    {
+      viewport: { width: 1440, height: 900 },
+      region: { x: 1389, y: 31, width: 32, height: 35 },
+      reason: "reviewed Chromium native dialog corner compositing",
+      reviewedRgbaSha256: "98fa65e99adb653e31815e1b08081cf1bbb3e9f0f700f5346a19b732ffa8dd16",
+      chromiumRgbaSha256: "17040ea141af7ac5dc9da81bb77d37b875a6a2bd16c245d96b2200e385edcd71",
     },
   ],
   "create-question": [],
@@ -377,6 +476,63 @@ export function normalizeReviewedRasterPixels(
   return normalizedPixelCount;
 }
 
+function rasterRegionBytes(
+  png: PNG,
+  region: FixedRasterRegionNormalization["region"],
+  label: string,
+): Buffer {
+  const { x, y, width, height } = region;
+  if (
+    ![x, y, width, height].every(Number.isInteger) ||
+    x < 0 ||
+    y < 0 ||
+    width <= 0 ||
+    height <= 0 ||
+    x + width > png.width ||
+    y + height > png.height
+  ) {
+    throw new Error(`${label} raster region is invalid`);
+  }
+  const rows: Buffer[] = [];
+  for (let row = y; row < y + height; row += 1) {
+    const start = (row * png.width + x) * 4;
+    rows.push(png.data.subarray(start, start + width * 4));
+  }
+  return Buffer.concat(rows);
+}
+
+export function normalizeReviewedRasterRegion(
+  png: PNG,
+  reviewed: PNG,
+  normalization: FixedRasterRegionNormalization,
+  label: string,
+): boolean {
+  if (png.width !== reviewed.width || png.height !== reviewed.height) {
+    throw new Error(`${label} reviewed raster dimensions changed`);
+  }
+  const reviewedBytes = rasterRegionBytes(reviewed, normalization.region, label);
+  const reviewedHash = sha256(reviewedBytes);
+  if (reviewedHash !== normalization.reviewedRgbaSha256) {
+    throw new Error(`${label} reviewed raster region changed`);
+  }
+  const actualBytes = rasterRegionBytes(png, normalization.region, label);
+  const actualHash = sha256(actualBytes);
+  if (actualHash === reviewedHash) return false;
+  if (actualHash !== normalization.chromiumRgbaSha256) {
+    throw new Error(`${label} Chromium raster region changed`);
+  }
+  const { x, y, width, height } = normalization.region;
+  for (let row = y; row < y + height; row += 1) {
+    const start = (row * png.width + x) * 4;
+    const reviewedStart = (row * reviewed.width + x) * 4;
+    png.data.set(
+      reviewed.data.subarray(reviewedStart, reviewedStart + width * 4),
+      start,
+    );
+  }
+  return true;
+}
+
 export async function captureFixedProductionScreenshot(
   page: Page,
   surface: FixedReferenceSurface,
@@ -390,7 +546,37 @@ export async function captureFixedProductionScreenshot(
     pixels: Array<{ x: number; y: number }>;
     normalizedPixelCount: number;
   }>;
+  canonicalizedTexts: FixedDynamicText[];
+  rasterRegionNormalizations: Array<{
+    reason: string;
+    region: FixedRasterRegionNormalization["region"];
+    normalized: boolean;
+  }>;
 }> {
+  const canonicalizedTexts = FIXED_DYNAMIC_TEXT_ALLOWLIST[surface];
+  const originalTexts: Array<{ locator: ReturnType<Page["locator"]>; text: string | null }> = [];
+  for (const dynamicText of canonicalizedTexts) {
+    const locator = page.locator(dynamicText.selector);
+    const count = await locator.count();
+    if (count === 0) {
+      throw new Error(
+        `fixed visual dynamic text selector is missing: ${dynamicText.selector}`,
+      );
+    }
+    for (let index = 0; index < count; index += 1) {
+      const item = locator.nth(index);
+      originalTexts.push({ locator: item, text: await item.textContent() });
+      await item.evaluate((element, text) => {
+        element.textContent = text;
+      }, dynamicText.canonicalText);
+    }
+  }
+  if (canonicalizedTexts.length > 0) {
+    await page.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+  }
+
   const masks = FIXED_DYNAMIC_MASK_ALLOWLIST[surface];
   const boxes: Array<{
     mask: FixedDynamicMask;
@@ -409,7 +595,16 @@ export async function captureFixedProductionScreenshot(
       if (box) boxes.push({ mask, box });
     }
   }
-  const raw = await page.screenshot({ animations: "disabled" });
+  let raw: Buffer;
+  try {
+    raw = await page.screenshot({ animations: "disabled" });
+  } finally {
+    for (const original of originalTexts) {
+      await original.locator.evaluate((element, text) => {
+        element.textContent = text;
+      }, original.text);
+    }
+  }
   const masked = PNG.sync.read(raw);
   for (const { mask, box } of boxes) {
     const masksRightBackdrop = mask.region === "viewport-right-of-element";
@@ -467,10 +662,37 @@ export async function captureFixedProductionScreenshot(
       normalizedPixelCount,
     });
   }
+  const rasterRegionNormalizations = [];
+  for (const normalization of FIXED_RASTER_REGION_NORMALIZATION_ALLOWLIST[surface]) {
+    if (
+      normalization.viewport.width !== viewport.width ||
+      normalization.viewport.height !== viewport.height
+    ) {
+      continue;
+    }
+    const reviewedFilename =
+      `reviewed-production-${surface}-${viewport.width}.png`;
+    const reviewed = PNG.sync.read(
+      readFileSync(resolve(referenceDirectory, reviewedFilename)),
+    );
+    const normalized = normalizeReviewedRasterRegion(
+      masked,
+      reviewed,
+      normalization,
+      `fixed visual ${surface}-${viewport.width}`,
+    );
+    rasterRegionNormalizations.push({
+      reason: normalization.reason,
+      region: normalization.region,
+      normalized,
+    });
+  }
   return {
     bytes: PNG.sync.write(masked),
     masks,
     rasterNormalizations,
+    canonicalizedTexts,
+    rasterRegionNormalizations,
   };
 }
 

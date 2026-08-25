@@ -114,7 +114,6 @@ from meta_research.deepfetch import (
 )
 from meta_research.feed import DurableFeed
 from meta_research.experiment_contract import (
-    EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS,
     EXPERIMENT_RETRYABLE_PROVIDER_FAILURES,
     AcceptedExperimentInputBinding,
     ExperimentDomainAdmission,
@@ -204,6 +203,13 @@ from meta_research.quest_drafting import (
     HostComputeProbe,
     HostComputeSnapshot,
 )
+from meta_research.runtime_protection import (
+    RuntimeBoundary,
+    RuntimeEffectIdentity,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+    record_runtime_boundary,
+)
 from meta_research.writing_contract import (
     WRITING_MAX_OUTPUT_BYTES,
     WritingCitationDecisionVerifier,
@@ -286,7 +292,6 @@ _BUNDLE_TARGET_EXECUTION_REQUEST_PREFIX = "bundle-target-"
 RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 DEEPFETCH_RECONCILIATION_BASE_SECONDS = 0.5
 DEEPFETCH_RECONCILIATION_MAX_SECONDS = 60.0
-MAX_DEEPFETCH_RECONCILIATION_ATTEMPTS = 40
 FORMAL_STAGES = frozenset({"idea", "plan", "bundle", "reasoning"})
 _IDEA_SAFE_CAPABILITIES = {
     "approval-policy-never",
@@ -715,6 +720,8 @@ class IdeaStageRun:
     technical_predecessor_attempt_ref: str | None
     rejection_receipt: AcceptanceReceipt | None
     completion: RunCompletion | None
+    failure_code: str | None
+    recovery_checkpoint: dict[str, object] | None
     autonomous_checkpoint: ReasoningAutonomousCheckpoint | None = None
 
     @property
@@ -940,6 +947,8 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
 
     def query_managed_runs(self, quest_ref: str) -> tuple[dict[str, object], ...]: ...
 
+    def query_runtime_observability(self) -> dict[str, object]: ...
+
     def query_runtime_control_receipt(
         self, operation_ref: str
     ) -> dict[str, object] | None: ...
@@ -1014,6 +1023,16 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         unit_kind: str,
     ) -> None: ...
 
+    def record_writing_provider_not_started(
+        self,
+        *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        reason_code: str,
+    ) -> None: ...
+
     def acknowledge_provider_safe_point(
         self,
         *,
@@ -1021,6 +1040,17 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         run_ref: str,
         attempt_ref: str | None,
         fence_ref: str | None,
+    ) -> None: ...
+
+    def record_stage_provider_hard_ceiling(
+        self,
+        *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+        provider_exit: dict[str, object],
     ) -> None: ...
 
     def reconcile_pending_provider_cleanup(
@@ -1849,6 +1879,32 @@ class AgentRuntimeInterface(HumanRequestOwnerInterface, Protocol):
         failure_code: str,
     ) -> ExperimentRun: ...
 
+    def suspend_experiment_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+    ) -> ExperimentRun: ...
+
+    def record_experiment_reconciliation_hold(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        reason_code: str,
+    ) -> ExperimentRun: ...
+
+    def acknowledge_experiment_provider_safe_point(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+    ) -> None: ...
+
     def defer_experiment_reconciliation(
         self,
         *,
@@ -2047,6 +2103,131 @@ _PROVIDER_UNIT_RUN_KINDS = {
     "writing_primary": "writing",
     "writing_review": "writing",
 }
+
+
+def _provider_runtime_effect(
+    *,
+    unit_ref: str,
+    operation_ref: str,
+    run_ref: str,
+    attempt_ref: str | None,
+    fence_ref: str | None,
+    claim_started_at: float,
+) -> RuntimeEffectIdentity:
+    return RuntimeEffectIdentity(
+        responsibility_ref="provider_responsibility_"
+        + canonical_hash(
+            {
+                "unit_ref": unit_ref,
+                "operation_ref": operation_ref,
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+                "claim_started_at": claim_started_at,
+            }
+        ),
+        owner_scope="agent_runtime",
+        root_run_ref=run_ref,
+        attempt_ref=attempt_ref,
+        fence_ref=fence_ref,
+        operation_ref=operation_ref,
+        effect_kind="provider_unit",
+    )
+
+
+def _bundle_rolling_provider_unit_ref(
+    *, operation_ref: str, operation_name: str, attempt_ref: str
+) -> str:
+    """Mirror Bundle's deterministic physical-unit identity at Owner recovery."""
+
+    return "provider_unit_" + canonical_hash(
+        {
+            "operation_ref": operation_ref,
+            "operation_name": operation_name,
+            "attempt_ref": attempt_ref,
+        }
+    )[:64]
+
+
+def _acquisition_runtime_effect(
+    *,
+    session_ref: str,
+    request_id: str,
+    attempt_count: int,
+) -> RuntimeEffectIdentity:
+    return RuntimeEffectIdentity(
+        responsibility_ref="acquisition_responsibility_"
+        + canonical_hash(
+            {
+                "session_ref": session_ref,
+                "request_id": request_id,
+                "attempt_count": attempt_count,
+            }
+        ),
+        owner_scope="agent_runtime",
+        root_run_ref=session_ref,
+        attempt_ref=f"acquisition_attempt_{attempt_count}",
+        fence_ref=None,
+        operation_ref=request_id,
+        effect_kind="acquisition",
+    )
+
+
+def _acquisition_preflight_runtime_effect(
+    *,
+    session_ref: str,
+    generation: int,
+) -> RuntimeEffectIdentity:
+    operation_ref = "acquisition_preflight_" + canonical_hash(
+        {"session_ref": session_ref, "generation": generation}
+    )
+    return RuntimeEffectIdentity(
+        responsibility_ref="acq_preflight_resp_"
+        + canonical_hash(
+            {
+                "session_ref": session_ref,
+                "generation": generation,
+                "operation_ref": operation_ref,
+            }
+        ),
+        owner_scope="agent_runtime",
+        root_run_ref=session_ref,
+        attempt_ref=f"acquisition_preflight_{generation}",
+        fence_ref=None,
+        operation_ref=operation_ref,
+        effect_kind="acquisition",
+    )
+
+
+def _host_compute_runtime_effect(
+    *,
+    idempotency_key: str,
+    request_hash: str,
+    claim_token: str,
+) -> RuntimeEffectIdentity:
+    root_run_ref = "host_compute_run_" + canonical_hash(
+        {"idempotency_key": idempotency_key, "request_hash": request_hash}
+    )
+    operation_ref = "host_compute_probe_" + canonical_hash(
+        {"root_run_ref": root_run_ref, "claim_token": claim_token}
+    )
+    return RuntimeEffectIdentity(
+        responsibility_ref="host_compute_responsibility_"
+        + canonical_hash(
+            {
+                "root_run_ref": root_run_ref,
+                "operation_ref": operation_ref,
+                "claim_token": claim_token,
+            }
+        ),
+        owner_scope="agent_runtime",
+        root_run_ref=root_run_ref,
+        attempt_ref=claim_token,
+        fence_ref="host_compute_fence_"
+        + canonical_hash({"claim_token": claim_token}),
+        operation_ref=operation_ref,
+        effect_kind="drafting_claim",
+    )
 
 
 class SQLiteHostComputeObservationReader:
@@ -4819,6 +5000,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 connection,
                 target_refs,
                 target_run_verifier=self._target_run_harness_verifier,
+                target_root_completion_reader=self._target_root_completion_reader,
+                target_graph_verifier=self._target_graph_verifier,
             )
             if missing or tuple(item.notice.notice_ref for item in evidence) != tuple(
                 notice.notice_ref for notice in batch.notices
@@ -5500,10 +5683,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         writing_delivery_provider_registry: (
             WritingDeliveryProviderRegistry | None
         ) = None,
+        runtime_protection: RuntimeProtection | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._host_compute_probe = host_compute_probe
+        self._runtime_protection = runtime_protection
         self._stage_request_verifier = stage_request_verifier
         self._outcome_verifier = outcome_verifier
         self._formal_plan_verifier = formal_plan_verifier
@@ -5540,6 +5725,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 writing_delivery_provider_registry
                 or default_writing_delivery_registry()
             ),
+            runtime_protection=runtime_protection,
         )
         self._acquisition_private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._receipt_verifier = SQLiteAgentRuntimeReceiptVerifier(
@@ -5562,6 +5748,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         self._provider_quiescence_lock = threading.Lock()
         self._provider_quiescence_drivers: dict[str, object] = {}
         self._recover_completed_writing_provider_units()
+        self._recover_completed_bundle_rolling_provider_units()
         self._recover_interrupted_provider_units()
         self._recover_interrupted_acquisition()
         self._recover_acquisition_human_requests()
@@ -5593,6 +5780,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         if current is not None and current is not reader:
             raise OwnerConflict("target_root_completion_reader_already_bound")
         self._target_root_completion_reader = reader
+        self._receipt_verifier.bind_target_root_completion_authorities(
+            reader,
+            self._target_graph_verifier,
+        )
 
     def bind_bundle_exhaustion_verifier(
         self, verifier: BundleExhaustionAcceptanceVerifier
@@ -5668,6 +5859,99 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 fence_ref=unit.fence_ref,
             )
 
+    def _recover_completed_bundle_rolling_provider_units(self) -> None:
+        """ACK only dynamic Bundle turns with an exact durable Owner result.
+
+        Rolling proposal/dispatch turns share the formal review's logical
+        provider operation, but each physical call has a distinct deterministic
+        unit.  Exact unit reconstruction prevents a completed formal review
+        invocation from being mistaken for an unknown rolling call.
+        """
+
+        with self._database.read() as connection:
+            units = connection.execute(
+                text(
+                    "SELECT unit.* FROM ar_provider_units AS unit JOIN "
+                    "ar_run_controls AS control ON control.run_ref = unit.run_ref "
+                    "WHERE control.run_kind = 'bundle_stage' AND unit.unit_kind = "
+                    "'bundle_review' AND unit.status IN ('active', "
+                    "'revocation_pending') AND unit.attempt_ref IS NOT NULL AND "
+                    "unit.fence_ref IS NOT NULL ORDER BY unit.started_at, "
+                    "unit.unit_ref"
+                )
+            ).all()
+            decisions = connection.execute(
+                text(
+                    "SELECT run_ref, attempt_ref, fence_ref, generation FROM "
+                    "ar_bundle_dispatch_decisions ORDER BY created_at, decision_ref"
+                )
+            ).all()
+            proposals = connection.execute(
+                text(
+                    "SELECT run_ref, attempt_ref, fence_ref, base_generation FROM "
+                    "ar_bundle_target_proposals ORDER BY created_at, proposal_ref"
+                )
+            ).all()
+        decision_keys = {
+            (
+                str(row.run_ref),
+                str(row.attempt_ref),
+                str(row.fence_ref),
+                int(row.generation),
+            )
+            for row in decisions
+        }
+        proposal_keys = {
+            (
+                str(row.run_ref),
+                str(row.attempt_ref),
+                str(row.fence_ref),
+                int(row.base_generation),
+            )
+            for row in proposals
+        }
+        for unit in units:
+            run_ref = str(unit.run_ref)
+            attempt_ref = str(unit.attempt_ref)
+            fence_ref = str(unit.fence_ref)
+            operation_ref = str(unit.operation_ref)
+            matched = any(
+                (run_ref, attempt_ref, fence_ref, generation) in decision_keys
+                and unit.unit_ref
+                == _bundle_rolling_provider_unit_ref(
+                    operation_ref=operation_ref,
+                    operation_name=f"dispatch-{generation}",
+                    attempt_ref=attempt_ref,
+                )
+                for generation in (
+                    row[3]
+                    for row in decision_keys
+                    if row[:3] == (run_ref, attempt_ref, fence_ref)
+                )
+            ) or any(
+                (run_ref, attempt_ref, fence_ref, base_generation)
+                in proposal_keys
+                and unit.unit_ref
+                == _bundle_rolling_provider_unit_ref(
+                    operation_ref=operation_ref,
+                    operation_name=f"target-batch-{base_generation + 1}",
+                    attempt_ref=attempt_ref,
+                )
+                for base_generation in (
+                    row[3]
+                    for row in proposal_keys
+                    if row[:3] == (run_ref, attempt_ref, fence_ref)
+                )
+            )
+            if not matched:
+                continue
+            self.acknowledge_provider_safe_point(
+                unit_ref=str(unit.unit_ref),
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+            )
+
     def _recover_interrupted_provider_units(self) -> None:
         """Permanently retire provider Fences left active by a dead daemon.
 
@@ -5678,6 +5962,11 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         """
 
         now = time.time()
+        resolved_operation_ref: str
+        claim_started_at: float
+        protected_boundaries: list[
+            tuple[RuntimeEffectIdentity, str, str | None]
+        ] = []
         with self._database.write() as connection:
             units = connection.execute(
                 text(
@@ -5705,7 +5994,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     {"unit_ref": unit.unit_ref, "run_ref": unit.run_ref},
                 ).scalar_one_or_none()
                 if (
-                    control is not None
+                    unit.status in {"completed", "revoked"}
+                    or control is not None
                     and control.status == "completed"
                     or invocation_status == "completed"
                 ):
@@ -5719,6 +6009,69 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         ),
                         {"now": now, "unit_ref": unit.unit_ref},
                     )
+                    if self._runtime_protection is not None:
+                        effect = _provider_runtime_effect(
+                            unit_ref=str(unit.unit_ref),
+                            operation_ref=str(unit.operation_ref),
+                            run_ref=str(unit.run_ref),
+                            attempt_ref=(
+                                None
+                                if unit.attempt_ref is None
+                                else str(unit.attempt_ref)
+                            ),
+                            fence_ref=(
+                                None
+                                if unit.fence_ref is None
+                                else str(unit.fence_ref)
+                            ),
+                            claim_started_at=float(unit.started_at),
+                        )
+                        boundary = (
+                            "permanent_fence"
+                            if unit.status == "revoked"
+                            else (
+                                "terminal"
+                                if control is not None
+                                and control.status == "completed"
+                                else "checkpoint"
+                            )
+                        )
+                        checkpoint_ref = (
+                            None
+                            if boundary != "checkpoint"
+                            else "provider_recovered_"
+                            + canonical_hash(
+                                {
+                                    "unit_ref": unit.unit_ref,
+                                    "operation_ref": unit.operation_ref,
+                                    "invocation_status": invocation_status,
+                                }
+                            )
+                        )
+                        try:
+                            record_runtime_boundary(
+                                connection,
+                                identity=effect,
+                                boundary=boundary,  # type: ignore[arg-type]
+                                checkpoint_ref=checkpoint_ref,
+                                owner_evidence_ref="provider_owner_commit_"
+                                + canonical_hash(
+                                    {
+                                        "unit_ref": unit.unit_ref,
+                                        "control_status": (
+                                            None if control is None else control.status
+                                        ),
+                                        "invocation_status": invocation_status,
+                                    }
+                                ),
+                            )
+                        except RuntimeProtectionUnavailable as error:
+                            if error.code != "runtime_responsibility_not_found":
+                                raise OwnerConflict(error.code) from error
+                        else:
+                            protected_boundaries.append(
+                                (effect, boundary, checkpoint_ref)
+                            )
                     continue
                 if control is not None and _prepared_control_affects_run(
                     connection, str(unit.run_ref)
@@ -5849,6 +6202,17 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "fenced_attempt_count": recovered,
                     },
                 )
+        if self._runtime_protection is not None:
+            for effect, boundary, checkpoint_ref in protected_boundaries:
+                try:
+                    self._runtime_protection.finish(
+                        effect.responsibility_ref,
+                        boundary=boundary,  # type: ignore[arg-type]
+                        checkpoint_ref=checkpoint_ref,
+                    )
+                except RuntimeProtectionUnavailable as error:
+                    raise OwnerConflict(error.code) from error
+
     def bind_writing_citation_verifier(
         self, verifier: WritingCitationDecisionVerifier
     ) -> None:
@@ -6195,14 +6559,28 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             or len(failure_code) > 128
         ):
             raise OwnerConflict("writing_failure_code_invalid")
+        timeout_interruption = failure_code == "writing_operation_timeout"
+        recover_timeout_without_provider = False
         with self._database.write() as connection:
             row = connection.execute(
                 text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
                 {"run_ref": run_ref},
             ).first()
+            control = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
             if (
                 row is not None
-                and row.status == "blocked"
+                and (
+                    row.status == "blocked"
+                    or (
+                        timeout_interruption
+                        and row.status == "active"
+                        and control is not None
+                        and control.status == "reconciliation_required"
+                    )
+                )
                 and row.attempt_ref == attempt_ref
                 and row.fence_ref == fence_ref
                 and row.failure_code == failure_code
@@ -6213,36 +6591,68 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     connection, run_ref, attempt_ref, fence_ref
                 )
                 now = time.time()
-                connection.execute(
-                    text(
-                        "UPDATE ar_writing_runs SET status = 'blocked', "
-                        "failure_code = :failure_code, updated_at = :now WHERE "
-                        "run_ref = :run_ref AND attempt_ref = :attempt_ref AND "
-                        "fence_ref = :fence_ref"
-                    ),
-                    {
-                        "failure_code": failure_code,
-                        "now": now,
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "fence_ref": fence_ref,
-                    },
-                )
-                connection.execute(
-                    text(
-                        "UPDATE ar_writing_attempts SET status = CASE WHEN status "
-                        "IN ('admitted', 'running', 'paused') THEN 'failed' ELSE "
-                        "status END, failure_code = :failure_code, completed_at = "
-                        "CASE WHEN status IN ('admitted', 'running', 'paused') THEN "
-                        "COALESCE(completed_at, :now) ELSE completed_at END WHERE "
-                        "attempt_ref = :attempt_ref"
-                    ),
-                    {
-                        "failure_code": failure_code,
-                        "now": now,
-                        "attempt_ref": attempt_ref,
-                    },
-                )
+                if timeout_interruption:
+                    # A watchdog only proves that this technical Attempt exceeded
+                    # its operation ceiling.  Keep the logical Writing Run alive;
+                    # revoke the Fence and wait for physical provider cleanup
+                    # before installing its successor Attempt.
+                    connection.execute(
+                        text(
+                            "UPDATE ar_writing_runs SET failure_code = "
+                            ":failure_code, updated_at = :now WHERE run_ref = "
+                            ":run_ref AND attempt_ref = :attempt_ref AND fence_ref "
+                            "= :fence_ref AND status = 'active'"
+                        ),
+                        {
+                            "failure_code": failure_code,
+                            "now": now,
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "fence_ref": fence_ref,
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE ar_writing_attempts SET failure_code = "
+                            ":failure_code WHERE attempt_ref = :attempt_ref AND "
+                            "status IN ('admitted', 'running')"
+                        ),
+                        {
+                            "failure_code": failure_code,
+                            "attempt_ref": attempt_ref,
+                        },
+                    )
+                else:
+                    connection.execute(
+                        text(
+                            "UPDATE ar_writing_runs SET status = 'blocked', "
+                            "failure_code = :failure_code, updated_at = :now WHERE "
+                            "run_ref = :run_ref AND attempt_ref = :attempt_ref AND "
+                            "fence_ref = :fence_ref"
+                        ),
+                        {
+                            "failure_code": failure_code,
+                            "now": now,
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "fence_ref": fence_ref,
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "UPDATE ar_writing_attempts SET status = CASE WHEN status "
+                            "IN ('admitted', 'running', 'paused') THEN 'failed' ELSE "
+                            "status END, failure_code = :failure_code, completed_at = "
+                            "CASE WHEN status IN ('admitted', 'running', 'paused') THEN "
+                            "COALESCE(completed_at, :now) ELSE completed_at END WHERE "
+                            "attempt_ref = :attempt_ref"
+                        ),
+                        {
+                            "failure_code": failure_code,
+                            "now": now,
+                            "attempt_ref": attempt_ref,
+                        },
+                    )
                 _retire_writing_managed_attempt(
                     connection,
                     run=row,
@@ -6250,22 +6660,45 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     reason_code=failure_code,
                     now=now,
                 )
+                if timeout_interruption:
+                    recover_timeout_without_provider = (
+                        connection.execute(
+                            text(
+                                "SELECT cleanup_status FROM ar_run_controls WHERE "
+                                "run_ref = :run_ref"
+                            ),
+                            {"run_ref": run_ref},
+                        ).scalar_one()
+                        != "pending"
+                    )
                 connection.execute(
                     text(
                         "UPDATE agent_runtime_state SET revision = revision + 1, "
-                        "active_writing_run_count = active_writing_run_count - 1 "
-                        "WHERE singleton = 'owner' AND active_writing_run_count > 0"
-                    )
+                        "active_writing_run_count = active_writing_run_count - "
+                        ":retired WHERE singleton = 'owner' AND "
+                        "active_writing_run_count >= :retired"
+                    ),
+                    {"retired": 0 if timeout_interruption else 1},
                 )
                 self._feed.record(
                     connection,
-                    "agent_runtime.writing_report_blocked",
+                    (
+                        "agent_runtime.writing_attempt_interrupted"
+                        if timeout_interruption
+                        else "agent_runtime.writing_report_blocked"
+                    ),
                     {
                         "run_ref": run_ref,
                         "attempt_ref": attempt_ref,
                         "failure_code": failure_code,
                     },
                 )
+        if recover_timeout_without_provider:
+            # The watchdog fenced an admitted technical Attempt before any
+            # provider unit existed.  There is no physical responsibility to
+            # reconcile, so install the successor immediately instead of
+            # leaving the logical Run stuck behind a fictional cleanup.
+            self._recover_interrupted_writing(run_ref=run_ref)
         result = self.query_writing_report(run_ref)
         if result is None:
             raise OwnerConflict("writing_run_not_found")
@@ -7554,6 +7987,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             )
         return values
 
+    def query_runtime_observability(self) -> dict[str, object]:
+        if self._runtime_protection is None:
+            return {
+                "schema_ref": "meta-research/runtime-observability/v1",
+                "status": "unavailable",
+                "reason": {"code": "runtime_protection_unavailable"},
+            }
+        return self._runtime_protection.query_evidence()
+
     def query_runtime_control_receipt(
         self, operation_ref: str
     ) -> dict[str, object] | None:
@@ -7615,6 +8057,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 )
             if not operation_ref or len(operation_ref) > 128:
                 raise OwnerConflict("runtime_provider_unit_invalid")
+            resolved_operation_ref = operation_ref
             if fence_ref is not None:
                 _assert_runtime_control_allows(connection, run_ref, fence_ref)
             existing = connection.execute(
@@ -7630,10 +8073,41 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     or existing.unit_kind != unit_kind
                 ):
                     raise OwnerConflict("runtime_provider_unit_conflict")
-                if existing.status == "active":
-                    return
                 if existing.status in {"revoked", "revocation_pending"}:
                     raise OwnerConflict("runtime_provider_unit_stale")
+                claim_started_at = float(existing.started_at)
+                if existing.status != "active":
+                    _assert_provider_derivation_not_quiescing(connection, run_ref)
+                    active = connection.execute(
+                        text(
+                            "SELECT unit_ref FROM ar_provider_units WHERE run_ref = "
+                            ":run_ref AND status = 'active' LIMIT 1"
+                        ),
+                        {"run_ref": run_ref},
+                    ).first()
+                    if active is not None:
+                        raise OwnerConflict("runtime_provider_unit_busy")
+                    connection.execute(
+                        text(
+                            "UPDATE ar_provider_units SET status = 'active', "
+                            "started_at = :now, completed_at = NULL WHERE unit_ref = "
+                            ":unit_ref AND status = 'completed'"
+                        ),
+                        {"now": now, "unit_ref": unit_ref},
+                    )
+                    claim_started_at = now
+                    self._feed.record(
+                        connection,
+                        "agent_runtime.provider_unit_restarted",
+                        {
+                            "unit_ref": unit_ref,
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "fence_ref": fence_ref,
+                            "unit_kind": unit_kind,
+                        },
+                    )
+            else:
                 _assert_provider_derivation_not_quiescing(connection, run_ref)
                 active = connection.execute(
                     text(
@@ -7646,15 +8120,26 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     raise OwnerConflict("runtime_provider_unit_busy")
                 connection.execute(
                     text(
-                        "UPDATE ar_provider_units SET status = 'active', started_at = "
-                        ":now, completed_at = NULL WHERE unit_ref = :unit_ref AND "
-                        "status = 'completed'"
+                        "INSERT INTO ar_provider_units (unit_ref, operation_ref, "
+                        "run_ref, attempt_ref, fence_ref, unit_kind, status, "
+                        "started_at, completed_at) VALUES (:unit_ref, "
+                        ":operation_ref, :run_ref, :attempt_ref, :fence_ref, "
+                        ":unit_kind, 'active', :now, NULL)"
                     ),
-                    {"now": now, "unit_ref": unit_ref},
+                    {
+                        "unit_ref": unit_ref,
+                        "operation_ref": resolved_operation_ref,
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "unit_kind": unit_kind,
+                        "now": now,
+                    },
                 )
+                claim_started_at = now
                 self._feed.record(
                     connection,
-                    "agent_runtime.provider_unit_restarted",
+                    "agent_runtime.provider_unit_started",
                     {
                         "unit_ref": unit_ref,
                         "run_ref": run_ref,
@@ -7663,45 +8148,367 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "unit_kind": unit_kind,
                     },
                 )
-                return
-            _assert_provider_derivation_not_quiescing(connection, run_ref)
-            active = connection.execute(
-                text(
-                    "SELECT unit_ref FROM ar_provider_units WHERE run_ref = :run_ref "
-                    "AND status = 'active' LIMIT 1"
-                ),
+        if self._runtime_protection is not None:
+            try:
+                self._runtime_protection.acquire(
+                    _provider_runtime_effect(
+                        unit_ref=unit_ref,
+                        operation_ref=resolved_operation_ref,
+                        run_ref=run_ref,
+                        attempt_ref=attempt_ref,
+                        fence_ref=fence_ref,
+                        claim_started_at=claim_started_at,
+                    )
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
+
+    def record_writing_provider_not_started(
+        self,
+        *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        reason_code: str,
+    ) -> None:
+        """Close an exact Writing claim whose OS hold failed before invocation."""
+
+        if not _is_runtime_protection_blocker(reason_code):
+            raise OwnerConflict("writing_runtime_protection_wait_invalid")
+        now = time.time()
+        effect: RuntimeEffectIdentity | None = None
+        checkpoint_ref: str | None = None
+        with self._database.write() as connection:
+            run = connection.execute(
+                text("SELECT * FROM ar_writing_runs WHERE run_ref = :run_ref"),
                 {"run_ref": run_ref},
             ).first()
-            if active is not None:
-                raise OwnerConflict("runtime_provider_unit_busy")
+            attempt = connection.execute(
+                text(
+                    "SELECT * FROM ar_writing_attempts WHERE attempt_ref = "
+                    ":attempt_ref"
+                ),
+                {"attempt_ref": attempt_ref},
+            ).first()
+            control = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            unit = connection.execute(
+                text("SELECT * FROM ar_provider_units WHERE unit_ref = :unit_ref"),
+                {"unit_ref": unit_ref},
+            ).first()
+            if (
+                run is None
+                or attempt is None
+                or control is None
+                or unit is None
+                or run.status != "active"
+                or run.attempt_ref != attempt_ref
+                or run.fence_ref != fence_ref
+                or attempt.run_ref != run_ref
+                or attempt.fence_ref != fence_ref
+                or attempt.status not in {"admitted", "running"}
+                or control.run_kind != "writing"
+                or control.status != "running"
+                or control.attempt_ref != attempt_ref
+                or control.fence_ref != fence_ref
+                or unit.run_ref != run_ref
+                or unit.attempt_ref != attempt_ref
+                or unit.fence_ref != fence_ref
+                or unit.unit_kind not in _PROVIDER_UNIT_KINDS
+                or _PROVIDER_UNIT_RUN_KINDS[unit.unit_kind] != "writing"
+                or unit.operation_ref != attempt.provider_job_ref
+                or unit.status != "active"
+            ):
+                raise OwnerConflict("writing_runtime_protection_wait_stale")
+            effect = _provider_runtime_effect(
+                unit_ref=str(unit.unit_ref),
+                operation_ref=str(unit.operation_ref),
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                claim_started_at=float(unit.started_at),
+            )
+            responsibility = connection.execute(
+                text(
+                    "SELECT status, reason_code FROM ar_execution_responsibilities "
+                    "WHERE responsibility_ref = :responsibility_ref"
+                ),
+                {"responsibility_ref": effect.responsibility_ref},
+            ).first()
+            if (
+                responsibility is None
+                or responsibility.status != "waiting"
+                or responsibility.reason_code != reason_code
+            ):
+                raise OwnerConflict("writing_runtime_protection_wait_unverified")
+            checkpoint_ref = "writing_not_started_" + canonical_hash(
+                {
+                    "unit_ref": unit.unit_ref,
+                    "operation_ref": unit.operation_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "claim_started_at": float(unit.started_at),
+                    "reason_code": reason_code,
+                }
+            )
             connection.execute(
                 text(
-                    "INSERT INTO ar_provider_units (unit_ref, operation_ref, run_ref, "
-                    "attempt_ref, fence_ref, unit_kind, status, started_at, "
-                    "completed_at) VALUES (:unit_ref, :operation_ref, :run_ref, "
-                    ":attempt_ref, :fence_ref, :unit_kind, 'active', :now, NULL)"
+                    "UPDATE ar_provider_units SET status = 'completed', "
+                    "completed_at = :now WHERE unit_ref = :unit_ref AND status = "
+                    "'active'"
                 ),
+                {"now": now, "unit_ref": unit_ref},
+            )
+            try:
+                record_runtime_boundary(
+                    connection,
+                    identity=effect,
+                    boundary="checkpoint",
+                    checkpoint_ref=checkpoint_ref,
+                    owner_evidence_ref="writing_provider_not_started_"
+                    + canonical_hash(
+                        {
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "fence_ref": fence_ref,
+                            "unit_ref": unit_ref,
+                            "reason_code": reason_code,
+                        }
+                    ),
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
+            self._feed.record(
+                connection,
+                "agent_runtime.writing_runtime_protection_waiting",
                 {
-                    "unit_ref": unit_ref,
-                    "operation_ref": operation_ref,
                     "run_ref": run_ref,
                     "attempt_ref": attempt_ref,
                     "fence_ref": fence_ref,
-                    "unit_kind": unit_kind,
+                    "unit_ref": unit_ref,
+                    "reason_code": reason_code,
+                },
+            )
+        assert effect is not None and checkpoint_ref is not None
+        if self._runtime_protection is None:
+            raise OwnerConflict("runtime_protection_unavailable")
+        try:
+            self._runtime_protection.finish(
+                effect.responsibility_ref,
+                boundary="checkpoint",
+                checkpoint_ref=checkpoint_ref,
+            )
+        except RuntimeProtectionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+
+    def record_stage_provider_hard_ceiling(
+        self,
+        *,
+        unit_ref: str,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+        provider_exit: dict[str, object],
+    ) -> None:
+        """Permanently fence one sealed Stage operation, not its logical Run."""
+
+        provider_exit = _validated_stage_provider_hard_ceiling(
+            failure_code=failure_code,
+            provider_exit=provider_exit,
+        )
+        if not unit_ref or len(unit_ref) > 96:
+            raise OwnerConflict("stage_provider_hard_ceiling_invalid")
+        now = time.time()
+        effect: RuntimeEffectIdentity | None = None
+        with self._database.write() as connection:
+            control = connection.execute(
+                text("SELECT * FROM ar_run_controls WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            stage_run = connection.execute(
+                text("SELECT * FROM ar_stage_runs WHERE run_ref = :run_ref"),
+                {"run_ref": run_ref},
+            ).first()
+            unit = connection.execute(
+                text("SELECT * FROM ar_provider_units WHERE unit_ref = :unit_ref"),
+                {"unit_ref": unit_ref},
+            ).first()
+            if (
+                control is None
+                or stage_run is None
+                or unit is None
+                or control.run_kind
+                not in {"idea_stage", "plan_stage", "reasoning_stage", "bundle_stage"}
+                or control.status != "running"
+                or control.attempt_ref != attempt_ref
+                or control.fence_ref != fence_ref
+                or stage_run.current_attempt_ref != attempt_ref
+                or stage_run.current_fence_ref != fence_ref
+                or stage_run.status not in {"running", "awaiting_acceptance"}
+                or unit.run_ref != run_ref
+                or unit.attempt_ref != attempt_ref
+                or unit.fence_ref != fence_ref
+                or unit.status != "active"
+                or _PROVIDER_UNIT_RUN_KINDS.get(unit.unit_kind) != control.run_kind
+            ):
+                raise OwnerConflict("stage_provider_hard_ceiling_stale")
+            effect = _provider_runtime_effect(
+                unit_ref=str(unit.unit_ref),
+                operation_ref=str(unit.operation_ref),
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                claim_started_at=float(unit.started_at),
+            )
+            safe_operation_ref = "stage_hard_ceiling_" + canonical_hash(
+                {
+                    "unit_ref": unit_ref,
+                    "operation_ref": unit.operation_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "failure_code": failure_code,
+                    "provider_exit": provider_exit,
+                }
+            )[:48]
+            checkpoint = {
+                "schema_ref": "meta-research/runtime-safe-point/v1",
+                "operation_ref": safe_operation_ref,
+                "action": "provider_hard_ceiling",
+                "run_ref": run_ref,
+                "run_kind": control.run_kind,
+                "quest_ref": control.quest_ref,
+                "cycle_ref": control.cycle_ref,
+                "epoch": None if control.epoch is None else int(control.epoch),
+                "run_status": control.status,
+                "attempt_ref": attempt_ref,
+                "root_session_ref": control.root_session_ref,
+                "fence_ref": fence_ref,
+                "control_revision": int(control.control_revision),
+                "provider_unit_ref": unit_ref,
+                "provider_operation_ref": unit.operation_ref,
+                "provider_operation_retry_permitted": False,
+                "failure": {"code": failure_code},
+                "provider_exit": provider_exit,
+            }
+            safe_point_ref = new_ref("safe_point")
+            checkpoint_hash = canonical_hash(checkpoint)
+            connection.execute(
+                text(
+                    "INSERT INTO ar_safe_points (safe_point_ref, operation_ref, "
+                    "run_ref, attempt_ref, root_session_ref, fence_ref, "
+                    "checkpoint_json, checkpoint_hash, created_at) VALUES "
+                    "(:safe_point_ref, :operation_ref, :run_ref, :attempt_ref, "
+                    ":root_session_ref, :fence_ref, :checkpoint_json, "
+                    ":checkpoint_hash, :now)"
+                ),
+                {
+                    "safe_point_ref": safe_point_ref,
+                    "operation_ref": safe_operation_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "root_session_ref": control.root_session_ref,
+                    "fence_ref": fence_ref,
+                    "checkpoint_json": canonical_json(checkpoint),
+                    "checkpoint_hash": checkpoint_hash,
                     "now": now,
                 },
             )
+            revoked = connection.execute(
+                text(
+                    "INSERT INTO ar_fence_revocations (fence_ref, operation_ref, "
+                    "run_ref, attempt_ref, reason_code, revoked_at) VALUES "
+                    "(:fence_ref, :operation_ref, :run_ref, :attempt_ref, "
+                    ":reason_code, :now) ON CONFLICT(fence_ref) DO NOTHING"
+                ),
+                {
+                    "fence_ref": fence_ref,
+                    "operation_ref": safe_operation_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "reason_code": failure_code,
+                    "now": now,
+                },
+            )
+            if not revoked.rowcount:
+                raise OwnerConflict("stage_provider_hard_ceiling_stale")
+            connection.execute(
+                text(
+                    "UPDATE ar_execution_fences SET status = 'rejected', "
+                    "closed_at = COALESCE(closed_at, :now) WHERE fence_ref = "
+                    ":fence_ref AND status IN ('current', 'submitted')"
+                ),
+                {"now": now, "fence_ref": fence_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_provider_units SET status = 'revoked', "
+                    "completed_at = :now WHERE unit_ref = :unit_ref AND status = "
+                    "'active'"
+                ),
+                {"now": now, "unit_ref": unit_ref},
+            )
+            try:
+                record_runtime_boundary(
+                    connection,
+                    identity=effect,
+                    boundary="permanent_fence",
+                    checkpoint_ref=None,
+                    owner_evidence_ref="stage_provider_hard_ceiling_"
+                    + canonical_hash(checkpoint),
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
+            connection.execute(
+                text(
+                    "UPDATE ar_run_controls SET status = 'suspended_fenced', "
+                    "control_revision = control_revision + 1, safe_point_ref = "
+                    ":safe_point_ref, terminal_reason = :failure_code, "
+                    "cleanup_status = 'completed', updated_at = :now WHERE "
+                    "run_ref = :run_ref"
+                ),
+                {
+                    "safe_point_ref": safe_point_ref,
+                    "failure_code": failure_code,
+                    "now": now,
+                    "run_ref": run_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "safe_point_count = safe_point_count + 1, "
+                    "fenced_attempt_count = fenced_attempt_count + 1 WHERE "
+                    "singleton = 'owner'"
+                )
+            )
             self._feed.record(
                 connection,
-                "agent_runtime.provider_unit_started",
+                "agent_runtime.stage_provider_hard_ceiling",
                 {
-                    "unit_ref": unit_ref,
                     "run_ref": run_ref,
                     "attempt_ref": attempt_ref,
                     "fence_ref": fence_ref,
-                    "unit_kind": unit_kind,
+                    "unit_ref": unit_ref,
+                    "operation_ref": unit.operation_ref,
+                    "safe_point_ref": safe_point_ref,
+                    "failure": {"code": failure_code},
                 },
             )
+        assert effect is not None
+        if self._runtime_protection is None:
+            raise OwnerConflict("runtime_protection_unavailable")
+        try:
+            self._runtime_protection.finish(
+                effect.responsibility_ref,
+                boundary="permanent_fence",
+            )
+        except RuntimeProtectionUnavailable as error:
+            raise OwnerConflict(error.code) from error
 
     def bind_provider_quiescence_driver(
         self, provider: object, *, unit_kinds: tuple[str, ...]
@@ -7740,6 +8547,10 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
     ) -> None:
         if unit_ref is not None and (not unit_ref or len(unit_ref) > 96):
             raise OwnerConflict("runtime_provider_unit_invalid")
+        protected_boundaries: list[
+            tuple[RuntimeEffectIdentity, str, str | None]
+        ] = []
+        recover_interrupted_writing = False
         with self._database.write() as connection:
             _assert_experiment_run_write_allowed(connection, run_ref)
             unit = connection.execute(
@@ -7761,7 +8572,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if unit is None:
                 terminal = connection.execute(
                     text(
-                        "SELECT unit_ref FROM ar_provider_units WHERE run_ref = "
+                        "SELECT * FROM ar_provider_units WHERE run_ref = "
                         ":run_ref AND attempt_ref IS :attempt_ref AND fence_ref IS "
                         ":fence_ref AND status IN ('completed', 'revoked') LIMIT 1"
                     ),
@@ -7772,8 +8583,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     },
                 ).first()
                 if terminal is not None:
-                    return
-                raise OwnerConflict("runtime_provider_unit_not_found")
+                    unit = terminal
+                else:
+                    raise OwnerConflict("runtime_provider_unit_not_found")
             if (
                 unit.run_ref != run_ref
                 or unit.attempt_ref != attempt_ref
@@ -7781,55 +8593,81 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ):
                 raise OwnerConflict("runtime_provider_unit_stale")
             unit_ref = unit.unit_ref
-            if unit.status not in {"active", "revocation_pending"}:
+            if unit.status not in {
+                "active",
+                "revocation_pending",
+                "completed",
+                "revoked",
+            }:
                 return
-            revoked = (
-                fence_ref is not None
-                and connection.execute(
-                    text(
-                        "SELECT fence_ref FROM ar_fence_revocations WHERE fence_ref = "
-                        ":fence_ref AND run_ref = :run_ref"
-                    ),
-                    {"fence_ref": fence_ref, "run_ref": run_ref},
-                ).first()
-                is not None
-            )
-            status = "revoked" if revoked else "completed"
             now = time.time()
-            connection.execute(
-                text(
-                    "UPDATE ar_provider_units SET status = :status, completed_at = "
-                    ":now WHERE unit_ref = :unit_ref AND status IN ('active', "
-                    "'revocation_pending')"
-                ),
-                {"status": status, "now": now, "unit_ref": unit_ref},
-            )
-            # Replacement Attempts reuse the external operation_ref.  A verified
-            # terminal response for that operation is also the missing safe ACK
-            # for any pre-restart physical unit left revocation_pending.
-            connection.execute(
-                text(
-                    "UPDATE ar_provider_units SET status = 'revoked', completed_at = "
-                    ":now WHERE run_ref = :run_ref AND operation_ref = "
-                    ":operation_ref AND unit_ref != :unit_ref AND status = "
-                    "'revocation_pending'"
-                ),
-                {
-                    "now": now,
-                    "run_ref": run_ref,
-                    "operation_ref": unit.operation_ref,
-                    "unit_ref": unit_ref,
-                },
-            )
-            self._feed.record(
-                connection,
-                "agent_runtime.provider_unit_safe",
-                {
-                    "unit_ref": unit_ref,
-                    "run_ref": run_ref,
-                    "status": status,
-                },
-            )
+            transitioned = unit.status in {"active", "revocation_pending"}
+            predecessor_units: tuple[Row, ...] = ()
+            if transitioned:
+                revoked = (
+                    fence_ref is not None
+                    and connection.execute(
+                        text(
+                            "SELECT fence_ref FROM ar_fence_revocations WHERE "
+                            "fence_ref = :fence_ref AND run_ref = :run_ref"
+                        ),
+                        {"fence_ref": fence_ref, "run_ref": run_ref},
+                    ).first()
+                    is not None
+                )
+                status = "revoked" if revoked else "completed"
+                predecessor_units = tuple(
+                    connection.execute(
+                        text(
+                            "SELECT * FROM ar_provider_units WHERE run_ref = "
+                            ":run_ref AND operation_ref = :operation_ref AND "
+                            "unit_ref != :unit_ref AND status IN "
+                            "('revocation_pending', 'revoked') ORDER BY "
+                            "started_at, unit_ref"
+                        ),
+                        {
+                            "run_ref": run_ref,
+                            "operation_ref": unit.operation_ref,
+                            "unit_ref": unit_ref,
+                        },
+                    ).all()
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_provider_units SET status = :status, "
+                        "completed_at = :now WHERE unit_ref = :unit_ref AND status "
+                        "IN ('active', 'revocation_pending')"
+                    ),
+                    {"status": status, "now": now, "unit_ref": unit_ref},
+                )
+                # Replacement Attempts reuse the external operation_ref.  A
+                # verified terminal response is also the missing safe ACK for
+                # any pre-restart physical unit left revocation_pending.
+                connection.execute(
+                    text(
+                        "UPDATE ar_provider_units SET status = 'revoked', "
+                        "completed_at = :now WHERE run_ref = :run_ref AND "
+                        "operation_ref = :operation_ref AND unit_ref != "
+                        ":unit_ref AND status = 'revocation_pending'"
+                    ),
+                    {
+                        "now": now,
+                        "run_ref": run_ref,
+                        "operation_ref": unit.operation_ref,
+                        "unit_ref": unit_ref,
+                    },
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.provider_unit_safe",
+                    {
+                        "unit_ref": unit_ref,
+                        "run_ref": run_ref,
+                        "status": status,
+                    },
+                )
+            else:
+                status = str(unit.status)
             cleanup_completed = connection.execute(
                 text(
                     "UPDATE ar_run_controls SET cleanup_status = 'completed', "
@@ -7847,6 +8685,159 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "agent_runtime.run_cleanup_completed",
                     {"run_ref": run_ref, "unit_ref": unit_ref},
                 )
+                control = connection.execute(
+                    text(
+                        "SELECT run_kind, status, terminal_reason FROM "
+                        "ar_run_controls WHERE run_ref = :run_ref"
+                    ),
+                    {"run_ref": run_ref},
+                ).first()
+                recover_interrupted_writing = bool(
+                    control is not None
+                    and control.run_kind == "writing"
+                    and control.status == "reconciliation_required"
+                    and control.terminal_reason == "writing_operation_timeout"
+                )
+            if self._runtime_protection is not None:
+                effect = _provider_runtime_effect(
+                    unit_ref=str(unit.unit_ref),
+                    operation_ref=str(unit.operation_ref),
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                    claim_started_at=float(unit.started_at),
+                )
+                existing_receipt = connection.execute(
+                    text(
+                        "SELECT boundary, checkpoint_ref FROM "
+                        "ar_runtime_boundary_receipts WHERE responsibility_ref = "
+                        ":responsibility_ref"
+                    ),
+                    {"responsibility_ref": effect.responsibility_ref},
+                ).first()
+                if existing_receipt is not None:
+                    protected_boundaries.append(
+                        (
+                            effect,
+                            str(existing_receipt.boundary),
+                            existing_receipt.checkpoint_ref,
+                        )
+                    )
+                else:
+                    boundary = (
+                        "permanent_fence" if status == "revoked" else "checkpoint"
+                    )
+                    checkpoint_ref = (
+                        None
+                        if boundary == "permanent_fence"
+                        else "provider_safe_"
+                        + canonical_hash(
+                            {
+                                "unit_ref": unit.unit_ref,
+                                "operation_ref": unit.operation_ref,
+                                "run_ref": run_ref,
+                                "claim_started_at": float(unit.started_at),
+                            }
+                        )
+                    )
+                    try:
+                        record_runtime_boundary(
+                            connection,
+                            identity=effect,
+                            boundary=boundary,
+                            checkpoint_ref=checkpoint_ref,
+                            owner_evidence_ref="provider_unit_"
+                            + canonical_hash(
+                                {
+                                    "unit_ref": unit.unit_ref,
+                                    "status": status,
+                                    "completed_at": (
+                                        now if transitioned else unit.completed_at
+                                    ),
+                                }
+                            ),
+                        )
+                    except RuntimeProtectionUnavailable as error:
+                        if (
+                            transitioned
+                            or error.code != "runtime_responsibility_not_found"
+                        ):
+                            raise OwnerConflict(error.code) from error
+                    else:
+                        protected_boundaries.append(
+                            (effect, boundary, checkpoint_ref)
+                        )
+                for predecessor in predecessor_units:
+                    predecessor_effect = _provider_runtime_effect(
+                        unit_ref=str(predecessor.unit_ref),
+                        operation_ref=str(predecessor.operation_ref),
+                        run_ref=str(predecessor.run_ref),
+                        attempt_ref=(
+                            None
+                            if predecessor.attempt_ref is None
+                            else str(predecessor.attempt_ref)
+                        ),
+                        fence_ref=(
+                            None
+                            if predecessor.fence_ref is None
+                            else str(predecessor.fence_ref)
+                        ),
+                        claim_started_at=float(predecessor.started_at),
+                    )
+                    existing_predecessor_receipt = connection.execute(
+                        text(
+                            "SELECT boundary, checkpoint_ref FROM "
+                            "ar_runtime_boundary_receipts WHERE "
+                            "responsibility_ref = :responsibility_ref"
+                        ),
+                        {
+                            "responsibility_ref": (
+                                predecessor_effect.responsibility_ref
+                            )
+                        },
+                    ).first()
+                    if existing_predecessor_receipt is not None:
+                        protected_boundaries.append(
+                            (
+                                predecessor_effect,
+                                str(existing_predecessor_receipt.boundary),
+                                existing_predecessor_receipt.checkpoint_ref,
+                            )
+                        )
+                    else:
+                        try:
+                            record_runtime_boundary(
+                                connection,
+                                identity=predecessor_effect,
+                                boundary="permanent_fence",
+                                owner_evidence_ref="provider_predecessor_fence_"
+                                + canonical_hash(
+                                    {
+                                        "unit_ref": predecessor.unit_ref,
+                                        "operation_ref": predecessor.operation_ref,
+                                        "replacement_unit_ref": unit.unit_ref,
+                                    }
+                                ),
+                            )
+                        except RuntimeProtectionUnavailable as error:
+                            if error.code != "runtime_responsibility_not_found":
+                                raise OwnerConflict(error.code) from error
+                        else:
+                            protected_boundaries.append(
+                                (predecessor_effect, "permanent_fence", None)
+                            )
+        if self._runtime_protection is not None:
+            for effect, boundary, checkpoint_ref in protected_boundaries:
+                try:
+                    self._runtime_protection.finish(
+                        effect.responsibility_ref,
+                        boundary=boundary,  # type: ignore[arg-type]
+                        checkpoint_ref=checkpoint_ref,
+                    )
+                except RuntimeProtectionUnavailable as error:
+                    raise OwnerConflict(error.code) from error
+        if recover_interrupted_writing:
+            self._recover_interrupted_writing(run_ref=run_ref)
 
     def reconcile_pending_provider_cleanup(
         self,
@@ -8568,7 +9559,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         "reconciliation_required",
                     }:
                         row = self._replace_fenced_managed_attempt(
-                            connection, row, now
+                            connection,
+                            row,
+                            now,
+                            reuse_checkpoint=(
+                                _stage_resume_reuses_checkpoint(connection, row)
+                                if _is_formal_stage_run_kind(row.run_kind)
+                                else True
+                            ),
                         )
                     next_status = "running"
                     cleanup_status = "none"
@@ -9277,21 +10275,68 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 time.sleep(_HOST_COMPUTE_CLAIM_POLL_SECONDS)
                 continue
 
+            protection_effect = _host_compute_runtime_effect(
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                claim_token=claim_token,
+            )
+            settlement_effect: RuntimeEffectIdentity | None = None
             try:
-                snapshot = self._host_compute_probe.observe()
+                if self._runtime_protection is not None:
+                    try:
+                        self._runtime_protection.acquire(protection_effect)
+                    except RuntimeProtectionUnavailable as error:
+                        snapshot = HostComputeSnapshot(
+                            status="unavailable",
+                            observed_at=time.time(),
+                            devices=(),
+                            adapter_kind="runtime_protection",
+                            reason_code=error.code,
+                        )
+                        with self._database.read() as connection:
+                            prepared = connection.execute(
+                                text(
+                                    "SELECT 1 FROM ar_execution_responsibilities "
+                                    "WHERE responsibility_ref = "
+                                    ":responsibility_ref"
+                                ),
+                                {
+                                    "responsibility_ref": (
+                                        protection_effect.responsibility_ref
+                                    )
+                                },
+                            ).first()
+                        if prepared is not None:
+                            settlement_effect = protection_effect
+                    else:
+                        settlement_effect = protection_effect
+                        snapshot = self._host_compute_probe.observe()
+                else:
+                    snapshot = self._host_compute_probe.observe()
                 _validate_probe_snapshot(snapshot)
                 capabilities = {
                     "devices": [device.as_dict() for device in snapshot.devices]
                 }
                 capabilities_hash = canonical_hash(capabilities)
-                observation = self._complete_claim(
+                observation, boundary, checkpoint_ref = self._complete_claim(
                     idempotency_key=idempotency_key,
                     request_hash=request_hash,
                     claim_token=claim_token,
                     snapshot=snapshot,
                     capabilities=capabilities,
                     capabilities_hash=capabilities_hash,
+                    protection_effect=settlement_effect,
                 )
+                if (
+                    self._runtime_protection is not None
+                    and settlement_effect is not None
+                    and boundary is not None
+                ):
+                    self._runtime_protection.finish(
+                        settlement_effect.responsibility_ref,
+                        boundary=boundary,
+                        checkpoint_ref=checkpoint_ref,
+                    )
             except BaseException:
                 self._release_claim(idempotency_key, claim_token)
                 raise
@@ -9428,7 +10473,12 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         snapshot: HostComputeSnapshot,
         capabilities: dict[str, object],
         capabilities_hash: str,
-    ) -> HostComputeObservation | None:
+        protection_effect: RuntimeEffectIdentity | None,
+    ) -> tuple[
+        HostComputeObservation | None,
+        RuntimeBoundary | None,
+        str | None,
+    ]:
         snapshot_ref = new_ref("host_snapshot")
         with self._database.write() as connection:
             # Avoid a cross-process SQLite read-to-write upgrade race between
@@ -9449,7 +10499,24 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if replay is not None:
                 if replay.request_hash != request_hash:
                     raise OwnerConflict("idempotency_conflict")
-                return _observation_from_row(replay)
+                if protection_effect is not None:
+                    record_runtime_boundary(
+                        connection,
+                        identity=protection_effect,
+                        boundary="permanent_fence",
+                        owner_evidence_ref="host_compute_replay_"
+                        + canonical_hash(
+                            {
+                                "snapshot_ref": replay.snapshot_ref,
+                                "claim_token": claim_token,
+                            }
+                        ),
+                    )
+                return (
+                    _observation_from_row(replay),
+                    "permanent_fence" if protection_effect is not None else None,
+                    None,
+                )
 
             claim = connection.execute(
                 text(
@@ -9459,7 +10526,24 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 {"idempotency_key": idempotency_key},
             ).first()
             if claim is None or claim.claim_token != claim_token:
-                return None
+                if protection_effect is not None:
+                    record_runtime_boundary(
+                        connection,
+                        identity=protection_effect,
+                        boundary="permanent_fence",
+                        owner_evidence_ref="host_compute_claim_fenced_"
+                        + canonical_hash(
+                            {
+                                "idempotency_key": idempotency_key,
+                                "claim_token": claim_token,
+                            }
+                        ),
+                    )
+                return (
+                    None,
+                    "permanent_fence" if protection_effect is not None else None,
+                    None,
+                )
             if claim.request_hash != request_hash:
                 raise OwnerConflict("idempotency_conflict")
 
@@ -9509,14 +10593,40 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "capabilities_hash": capabilities_hash,
                 },
             )
-        return HostComputeObservation(
-            snapshot_ref=snapshot_ref,
-            status=snapshot.status,
-            observed_at=snapshot.observed_at,
-            devices=snapshot.devices,
-            adapter_kind=snapshot.adapter_kind,
-            capabilities_hash=capabilities_hash,
-            reason_code=snapshot.reason_code,
+            checkpoint_ref = "host_compute_checkpoint_" + canonical_hash(
+                {
+                    "snapshot_ref": snapshot_ref,
+                    "claim_token": claim_token,
+                    "capabilities_hash": capabilities_hash,
+                }
+            )
+            if protection_effect is not None:
+                record_runtime_boundary(
+                    connection,
+                    identity=protection_effect,
+                    boundary="checkpoint",
+                    checkpoint_ref=checkpoint_ref,
+                    owner_evidence_ref="host_compute_snapshot_"
+                    + canonical_hash(
+                        {
+                            "snapshot_ref": snapshot_ref,
+                            "request_hash": request_hash,
+                            "capabilities_hash": capabilities_hash,
+                        }
+                    ),
+                )
+        return (
+            HostComputeObservation(
+                snapshot_ref=snapshot_ref,
+                status=snapshot.status,
+                observed_at=snapshot.observed_at,
+                devices=snapshot.devices,
+                adapter_kind=snapshot.adapter_kind,
+                capabilities_hash=capabilities_hash,
+                reason_code=snapshot.reason_code,
+            ),
+            "checkpoint" if protection_effect is not None else None,
+            checkpoint_ref if protection_effect is not None else None,
         )
 
     def _release_claim(self, idempotency_key: str, claim_token: str) -> None:
@@ -9629,6 +10739,33 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     {"recovered_record_count": recovered},
                 )
 
+    def _finish_recorded_acquisition_boundary(
+        self, effect: RuntimeEffectIdentity
+    ) -> None:
+        """Replay only an exact Owner receipt; never infer a safe boundary."""
+
+        if self._runtime_protection is None:
+            return
+        with self._database.read() as connection:
+            receipt = connection.execute(
+                text(
+                    "SELECT boundary, checkpoint_ref FROM "
+                    "ar_runtime_boundary_receipts WHERE responsibility_ref = "
+                    ":responsibility_ref"
+                ),
+                {"responsibility_ref": effect.responsibility_ref},
+            ).first()
+        if receipt is None:
+            return
+        try:
+            self._runtime_protection.finish(
+                effect.responsibility_ref,
+                boundary=cast(RuntimeBoundary, receipt.boundary),
+                checkpoint_ref=receipt.checkpoint_ref,
+            )
+        except RuntimeProtectionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+
     def prepare_acquisition_session(
         self,
         *,
@@ -9664,6 +10801,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         existing_session = self.query_acquisition_session(
             initialization_id=initialization_id
         )
+        if existing_session is not None:
+            self._finish_recorded_acquisition_boundary(
+                _acquisition_preflight_runtime_effect(
+                    session_ref=existing_session.session_ref,
+                    generation=existing_session.preflight_generation,
+                )
+            )
         if (
             existing_session is not None
             and existing_session.config_hash == config_hash
@@ -9726,6 +10870,24 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 if row.status == "cancelled":
                     raise OwnerConflict("acquisition_session_cancelled")
                 session_ref = str(row.session_ref)
+                predecessor_effect = _acquisition_preflight_runtime_effect(
+                    session_ref=session_ref,
+                    generation=int(row.preflight_generation),
+                )
+                unresolved_predecessor = connection.execute(
+                    text(
+                        "SELECT status FROM ar_execution_responsibilities WHERE "
+                        "responsibility_ref = :responsibility_ref AND status != "
+                        "'finished'"
+                    ),
+                    {
+                        "responsibility_ref": (
+                            predecessor_effect.responsibility_ref
+                        )
+                    },
+                ).first()
+                if unresolved_predecessor is not None:
+                    raise OwnerConflict("acquisition_reconciliation_required")
                 generation = int(row.preflight_generation) + 1
                 previous_browser_context_ref = (
                     None
@@ -9784,16 +10946,29 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             private_state_dir=str(private_state),
             previous_browser_context_ref=previous_browser_context_ref,
         )
-        try:
-            result = validate_preflight_result(
-                provider_request, provider.preflight(provider_request)
-            )
-        except AcquisitionUnavailable as error:
-            result = None
-            failure_code = error.code
-        except Exception:
-            result = None
-            failure_code = "acquisition_preflight_provider_error"
+        protection_effect = _acquisition_preflight_runtime_effect(
+            session_ref=session_ref,
+            generation=generation,
+        )
+        protection_ready = True
+        if self._runtime_protection is not None:
+            try:
+                self._runtime_protection.acquire(protection_effect)
+            except RuntimeProtectionUnavailable as error:
+                protection_ready = False
+                result = None
+                failure_code = error.code
+        if protection_ready:
+            try:
+                result = validate_preflight_result(
+                    provider_request, provider.preflight(provider_request)
+                )
+            except AcquisitionUnavailable as error:
+                result = None
+                failure_code = error.code
+            except Exception:
+                result = None
+                failure_code = "acquisition_preflight_provider_error"
 
         evidence = {} if result is None else result.evidence
         evidence_json = canonical_json(evidence)
@@ -9806,6 +10981,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             else result.browser_context_ref
         )
         completed_at = time.time()
+        protection_checkpoint_ref: str | None = None
         with self._database.write() as connection:
             current = connection.execute(
                 text(
@@ -9856,6 +11032,48 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "reason_code": reason_code,
                 },
             )
+            if self._runtime_protection is not None:
+                checkpoint_ref = "acquisition_preflight_checkpoint_" + canonical_hash(
+                    {
+                        "session_ref": session_ref,
+                        "generation": generation,
+                        "status": final_status,
+                        "reason_code": reason_code,
+                        "evidence_hash": evidence_hash,
+                    }
+                )
+                try:
+                    record_runtime_boundary(
+                        connection,
+                        identity=protection_effect,
+                        boundary="checkpoint",
+                        checkpoint_ref=checkpoint_ref,
+                        owner_evidence_ref="acquisition_preflight_state_"
+                        + canonical_hash(
+                            {
+                                "session_ref": session_ref,
+                                "generation": generation,
+                                "completed_at": completed_at,
+                            }
+                        ),
+                    )
+                except RuntimeProtectionUnavailable as error:
+                    if error.code != "runtime_responsibility_not_found":
+                        raise OwnerConflict(error.code) from error
+                else:
+                    protection_checkpoint_ref = checkpoint_ref
+        if (
+            self._runtime_protection is not None
+            and protection_checkpoint_ref is not None
+        ):
+            try:
+                self._runtime_protection.finish(
+                    protection_effect.responsibility_ref,
+                    boundary="checkpoint",
+                    checkpoint_ref=protection_checkpoint_ref,
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
         session = self.query_acquisition_session(session_ref=session_ref)
         assert session is not None
         self._reconcile_acquisition_human_requests(session_ref)
@@ -10673,6 +11891,110 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if row.session_status == "ready":
                 self._reconcile_acquisition_human_requests(row.session_ref)
 
+    def _record_acquisition_runtime_wait(
+        self,
+        *,
+        session_ref: str,
+        request: AcquisitionBatchRequest,
+        request_hash: str,
+        attempt_count: int,
+        reason_code: str,
+        effect: RuntimeEffectIdentity,
+    ) -> str | None:
+        results = tuple(
+            _runtime_protection_acquisition_item(paper.paper_id, reason_code)
+            for paper in request.papers
+        )
+        payload = [result.as_dict() for result in results]
+        now = time.time()
+        checkpoint_ref: str | None = None
+        with self._database.write() as connection:
+            current = connection.execute(
+                text(
+                    "SELECT session_ref, request_hash, status, attempt_count FROM "
+                    "ar_acquisition_requests WHERE request_id = :request_id"
+                ),
+                {"request_id": request.request_id},
+            ).first()
+            if (
+                current is None
+                or current.session_ref != session_ref
+                or current.request_hash != request_hash
+                or current.status != "running"
+                or int(current.attempt_count) != attempt_count
+            ):
+                raise OwnerConflict("acquisition_request_fence_stale")
+            connection.execute(
+                text(
+                    "UPDATE ar_acquisition_requests SET status = 'waiting_user', "
+                    "results_json = :results_json, results_hash = :results_hash, "
+                    "updated_at = :now, completed_at = :now WHERE request_id = "
+                    ":request_id AND status = 'running'"
+                ),
+                {
+                    "request_id": request.request_id,
+                    "results_json": canonical_json(payload),
+                    "results_hash": canonical_hash(payload),
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_acquisition_sessions SET status = 'waiting_user', "
+                    "slot_held = 0, current_request_id = :request_id, "
+                    "reason_code = :reason_code, updated_at = :now WHERE "
+                    "session_ref = :session_ref AND status = 'acquiring'"
+                ),
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                    "reason_code": reason_code,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "acquisition_active_slot_count = "
+                    "acquisition_active_slot_count - 1 WHERE singleton = "
+                    "'owner' AND acquisition_active_slot_count > 0"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.acquisition_runtime_waiting",
+                {
+                    "session_ref": session_ref,
+                    "request_id": request.request_id,
+                    "reason_code": reason_code,
+                },
+            )
+            if self._runtime_protection is not None:
+                candidate_checkpoint_ref = "acquisition_wait_checkpoint_" + canonical_hash(
+                    {
+                        "session_ref": session_ref,
+                        "request_id": request.request_id,
+                        "request_hash": request_hash,
+                        "attempt_count": attempt_count,
+                        "reason_code": reason_code,
+                    }
+                )
+                try:
+                    record_runtime_boundary(
+                        connection,
+                        identity=effect,
+                        boundary="checkpoint",
+                        checkpoint_ref=candidate_checkpoint_ref,
+                        owner_evidence_ref="acquisition_runtime_wait_"
+                        + canonical_hash(payload),
+                    )
+                except RuntimeProtectionUnavailable as error:
+                    if error.code != "runtime_responsibility_not_found":
+                        raise OwnerConflict(error.code) from error
+                else:
+                    checkpoint_ref = candidate_checkpoint_ref
+        return checkpoint_ref
+
     def acquire_literature(
         self,
         session_ref: str,
@@ -10708,11 +12030,27 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 ),
                 {"request_id": request.request_id, "session_ref": session_ref},
             ).first()
+        if waiting is not None:
+            self._finish_recorded_acquisition_boundary(
+                _acquisition_runtime_effect(
+                    session_ref=session_ref,
+                    request_id=request.request_id,
+                    attempt_count=int(waiting.attempt_count),
+                )
+            )
         technical_reconciliation = (
             waiting is not None
             and waiting.status == "waiting_user"
             and _acquisition_reconciliation_pending(
                 waiting.results_json, waiting.results_hash
+            )
+        )
+        protection_waiting = (
+            waiting is not None
+            and waiting.status == "waiting_user"
+            and _acquisition_runtime_protection_waiting(
+                waiting.results_json,
+                waiting.results_hash,
             )
         )
         if technical_reconciliation:
@@ -10735,6 +12073,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             waiting is not None
             and waiting.status == "waiting_user"
             and not technical_reconciliation
+            and not protection_waiting
         ):
             human_requests = self._ensure_acquisition_human_requests(
                 session_ref=session_ref,
@@ -10891,12 +12230,14 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     ":session_ref AND slot_held = 0 AND (status = 'ready' OR "
                     "(:reconcile_only = 1 AND status = 'waiting_user' AND "
                     "reason_code = 'acquisition_reconciliation_required') OR "
+                    "(:protection_retry = 1 AND status = 'waiting_user') OR "
                     "(:human_resume = 1 AND status = 'waiting_user'))"
                 ),
                 {
                     "session_ref": session_ref,
                     "request_id": request.request_id,
                     "reconcile_only": 1 if reconcile_only else 0,
+                    "protection_retry": 1 if protection_waiting else 0,
                     "human_resume": 1 if resume_binding is not None else 0,
                     "now": now,
                 },
@@ -11058,6 +12399,35 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if new_request or paper.paper_id in affected_ids
         )
         attempt_request = replace(provider_request, papers=affected_papers)
+        protection_effect = _acquisition_runtime_effect(
+            session_ref=session_ref,
+            request_id=request.request_id,
+            attempt_count=attempt_count,
+        )
+        if self._runtime_protection is not None:
+            try:
+                self._runtime_protection.acquire(protection_effect)
+            except RuntimeProtectionUnavailable as error:
+                checkpoint_ref = self._record_acquisition_runtime_wait(
+                    session_ref=session_ref,
+                    request=request,
+                    request_hash=request_hash,
+                    attempt_count=attempt_count,
+                    reason_code=error.code,
+                    effect=protection_effect,
+                )
+                if checkpoint_ref is not None:
+                    try:
+                        self._runtime_protection.finish(
+                            protection_effect.responsibility_ref,
+                            boundary="checkpoint",
+                            checkpoint_ref=checkpoint_ref,
+                        )
+                    except RuntimeProtectionUnavailable as finish_error:
+                        raise OwnerConflict(finish_error.code) from finish_error
+                raise OwnerConflict(error.code) from error
+        outcome_resolved = False
+        operation_terminal = False
         try:
             reconcile = getattr(provider, "reconcile", None)
             if (
@@ -11075,16 +12445,23 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                         failure=None,
                     ),
                 )
+                outcome_resolved = True
             elif reconcile_only:
                 if not callable(reconcile):
                     attempted_results = tuple(
                         _reconciliation_acquisition_item(paper.paper_id)
                         for paper in attempt_request.papers
                     )
+                    # The no-op reconciliation claim itself reached a safe
+                    # checkpoint, while the original operation remains
+                    # unresolved.
+                    outcome_resolved = True
                 else:
                     attempted_results = tuple(reconcile(attempt_request))
+                    outcome_resolved = True
             else:
                 attempted_results = tuple(provider.acquire(attempt_request))
+                outcome_resolved = True
             attempted_results = validate_item_results(
                 attempt_request, attempted_results
             )
@@ -11101,8 +12478,22 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 for paper in provider_request.papers
             )
             results = validate_item_results(provider_request, results)
+            operation_terminal = not any(
+                result.status == "waiting_user"
+                and result.failure is not None
+                and result.failure.get("code")
+                == "acquisition_reconciliation_required"
+                for result in results
+            )
+            if not reconcile_only and resume_route is None and not operation_terminal:
+                # An initial acquisition returning this typed item may have
+                # launched a subprocess without a trustworthy terminal
+                # envelope.  Its original responsibility stays held.
+                outcome_resolved = False
             status = aggregate_batch_status(results)
         except Exception:
+            outcome_resolved = False
+            operation_terminal = False
             attempted_by_id = {
                 paper.paper_id: _reconciliation_acquisition_item(paper.paper_id)
                 for paper in attempt_request.papers
@@ -11200,6 +12591,117 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "status": status,
                 },
             )
+            checkpoint_ref = "acquisition_checkpoint_" + canonical_hash(
+                {
+                    "request_id": request.request_id,
+                    "attempt_count": attempt_count,
+                    "status": status,
+                    "results_hash": results_hash,
+                }
+            )
+            predecessor_boundaries: list[
+                tuple[str, RuntimeBoundary, str | None]
+            ] = []
+            if self._runtime_protection is not None and outcome_resolved:
+                record_runtime_boundary(
+                    connection,
+                    identity=protection_effect,
+                    boundary="checkpoint",
+                    checkpoint_ref=checkpoint_ref,
+                    owner_evidence_ref="acquisition_result_" + results_hash,
+                )
+                if operation_terminal and attempt_count > 1:
+                    # Query the actual unresolved responsibility frontier in one
+                    # set operation.  Iterating every historical generation made
+                    # the terminal call grow with already-settled checkpoints and
+                    # turned a long-lived request into an implicit time ceiling.
+                    predecessors = connection.execute(
+                        text(
+                            "SELECT responsibility.*, receipt.boundary AS "
+                            "receipt_boundary, receipt.checkpoint_ref AS "
+                            "receipt_checkpoint_ref FROM "
+                            "ar_execution_responsibilities AS responsibility LEFT "
+                            "JOIN ar_runtime_boundary_receipts AS receipt ON "
+                            "receipt.responsibility_ref = "
+                            "responsibility.responsibility_ref WHERE "
+                            "responsibility.owner_scope = 'agent_runtime' AND "
+                            "responsibility.effect_kind = 'acquisition' AND "
+                            "responsibility.root_run_ref = :session_ref AND "
+                            "responsibility.operation_ref = :request_id AND "
+                            "responsibility.responsibility_ref != "
+                            ":current_responsibility_ref AND responsibility.status "
+                            "IN ('acquiring', 'active', 'waiting', 'interrupted') "
+                            "ORDER BY responsibility.created_at, "
+                            "responsibility.responsibility_ref"
+                        ),
+                        {
+                            "session_ref": session_ref,
+                            "request_id": request.request_id,
+                            "current_responsibility_ref": (
+                                protection_effect.responsibility_ref
+                            ),
+                        },
+                    ).mappings().all()
+                    for predecessor in predecessors:
+                        predecessor_effect = RuntimeEffectIdentity(
+                            responsibility_ref=str(
+                                predecessor["responsibility_ref"]
+                            ),
+                            owner_scope=str(predecessor["owner_scope"]),
+                            root_run_ref=str(predecessor["root_run_ref"]),
+                            attempt_ref=(
+                                None
+                                if predecessor["attempt_ref"] is None
+                                else str(predecessor["attempt_ref"])
+                            ),
+                            fence_ref=(
+                                None
+                                if predecessor["fence_ref"] is None
+                                else str(predecessor["fence_ref"])
+                            ),
+                            operation_ref=str(predecessor["operation_ref"]),
+                            effect_kind=str(predecessor["effect_kind"]),
+                        )
+                        receipt_boundary = predecessor["receipt_boundary"]
+                        if receipt_boundary is None:
+                            record_runtime_boundary(
+                                connection,
+                                identity=predecessor_effect,
+                                boundary="permanent_fence",
+                                owner_evidence_ref="acquisition_reconciled_"
+                                + results_hash,
+                            )
+                            predecessor_boundaries.append(
+                                (
+                                    predecessor_effect.responsibility_ref,
+                                    "permanent_fence",
+                                    None,
+                                )
+                            )
+                        else:
+                            predecessor_boundaries.append(
+                                (
+                                    predecessor_effect.responsibility_ref,
+                                    cast(RuntimeBoundary, receipt_boundary),
+                                    predecessor["receipt_checkpoint_ref"],
+                                )
+                            )
+        if self._runtime_protection is not None and outcome_resolved:
+            self._runtime_protection.finish(
+                protection_effect.responsibility_ref,
+                boundary="checkpoint",
+                checkpoint_ref=checkpoint_ref,
+            )
+            for (
+                predecessor_responsibility_ref,
+                predecessor_boundary,
+                predecessor_checkpoint_ref,
+            ) in predecessor_boundaries:
+                self._runtime_protection.finish(
+                    predecessor_responsibility_ref,
+                    boundary=predecessor_boundary,
+                    checkpoint_ref=predecessor_checkpoint_ref,
+                )
         if status == "waiting_user" and not _acquisition_reconciliation_pending(
             results_json, results_hash
         ):
@@ -11538,16 +13040,28 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             native_session_ref=native_ref,
             job_ref=job_ref,
         )
+        try:
+            self.begin_provider_unit(
+                unit_ref=provider_unit_ref,
+                operation_ref=job_ref,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                unit_kind="deepfetch",
+            )
+        except OwnerConflict as error:
+            if error.code.startswith("power_inhibitor_"):
+                self._defer_deepfetch_protection_wait(
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    generation=generation,
+                    fence_ref=fence_ref,
+                    provider_unit_ref=provider_unit_ref,
+                    reason_code=error.code,
+                )
+            raise
         with self._deepfetch_provider_lock:
             self._deepfetch_providers[request.request_ref] = provider
-        self.begin_provider_unit(
-            unit_ref=provider_unit_ref,
-            operation_ref=job_ref,
-            run_ref=run_ref,
-            attempt_ref=attempt_ref,
-            fence_ref=fence_ref,
-            unit_kind="deepfetch",
-        )
         provider_safe = True
         try:
             result = provider.execute(provider_request)
@@ -11655,6 +13169,155 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             if provider_safe and callable(finish_job):
                 finish_job(job_ref)
 
+    def _defer_deepfetch_protection_wait(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        generation: int,
+        fence_ref: str,
+        provider_unit_ref: str,
+        reason_code: str,
+    ) -> None:
+        """Return a no-effect claim to admitted after power acquisition fails."""
+
+        now = time.time()
+        effect: RuntimeEffectIdentity | None = None
+        boundary_recorded = False
+        with self._database.write() as connection:
+            run = connection.execute(
+                text(
+                    "SELECT status, current_attempt_ref, attempt_generation, "
+                    "request_ref FROM ar_deepfetch_runs WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref},
+            ).first()
+            attempt = connection.execute(
+                text(
+                    "SELECT status, fence_ref FROM ar_deepfetch_attempts WHERE "
+                    "attempt_ref = :attempt_ref"
+                ),
+                {"attempt_ref": attempt_ref},
+            ).first()
+            unit = connection.execute(
+                text(
+                    "SELECT * FROM ar_provider_units WHERE unit_ref = :unit_ref"
+                ),
+                {"unit_ref": provider_unit_ref},
+            ).first()
+            if (
+                run is None
+                or attempt is None
+                or unit is None
+                or run.status != "running"
+                or run.current_attempt_ref != attempt_ref
+                or int(run.attempt_generation) != generation
+                or attempt.status != "running"
+                or attempt.fence_ref != fence_ref
+                or unit.run_ref != run_ref
+                or unit.attempt_ref != attempt_ref
+                or unit.fence_ref != fence_ref
+                or unit.status != "active"
+            ):
+                return
+            connection.execute(
+                text(
+                    "UPDATE ar_provider_units SET status = 'completed', "
+                    "completed_at = :now WHERE unit_ref = :unit_ref AND status = "
+                    "'active'"
+                ),
+                {"now": now, "unit_ref": provider_unit_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_attempts SET status = 'superseded', "
+                    "failure_code = :reason_code, completed_at = :now WHERE "
+                    "attempt_ref = :attempt_ref AND status = 'running'"
+                ),
+                {
+                    "attempt_ref": attempt_ref,
+                    "reason_code": reason_code,
+                    "now": now,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_deepfetch_runs SET status = 'admitted', "
+                    "current_attempt_ref = NULL, failure_code = :reason_code, "
+                    "next_reconcile_at = NULL, completed_at = NULL, updated_at = "
+                    ":now WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref, "reason_code": reason_code, "now": now},
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_run_controls SET status = 'running', attempt_ref = "
+                    "NULL, fence_ref = NULL, control_revision = control_revision + "
+                    "1, terminal_reason = :reason_code, updated_at = :now WHERE "
+                    "run_ref = :run_ref"
+                ),
+                {"run_ref": run_ref, "reason_code": reason_code, "now": now},
+            )
+            effect = _provider_runtime_effect(
+                unit_ref=str(unit.unit_ref),
+                operation_ref=str(unit.operation_ref),
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                claim_started_at=float(unit.started_at),
+            )
+            try:
+                record_runtime_boundary(
+                    connection,
+                    identity=effect,
+                    boundary="checkpoint",
+                    checkpoint_ref="deepfetch_not_started_"
+                    + canonical_hash(
+                        {
+                            "provider_unit_ref": provider_unit_ref,
+                            "reason_code": reason_code,
+                        }
+                    ),
+                    owner_evidence_ref="deepfetch_power_wait_"
+                    + canonical_hash(
+                        {
+                            "run_ref": run_ref,
+                            "attempt_ref": attempt_ref,
+                            "provider_unit_ref": provider_unit_ref,
+                        }
+                    ),
+                )
+            except RuntimeProtectionUnavailable as error:
+                if error.code != "runtime_responsibility_not_found":
+                    raise OwnerConflict(error.code) from error
+            else:
+                boundary_recorded = True
+            self._feed.record(
+                connection,
+                "agent_runtime.deepfetch_power_waiting",
+                {
+                    "request_ref": run.request_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "reason_code": reason_code,
+                },
+            )
+        if boundary_recorded and effect is not None and self._runtime_protection:
+            try:
+                self._runtime_protection.finish(
+                    effect.responsibility_ref,
+                    boundary="checkpoint",
+                    checkpoint_ref="deepfetch_not_started_"
+                    + canonical_hash(
+                        {
+                            "provider_unit_ref": provider_unit_ref,
+                            "reason_code": reason_code,
+                        }
+                    ),
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
+
     def _interrupt_deepfetch_attempt(
         self,
         *,
@@ -11710,68 +13373,51 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 and str(session.native_session_ref) != native_session_ref
             ):
                 return "deepfetch_native_session_changed"
+            revocation_operation_ref = "deepfetch-interrupt-" + canonical_hash(
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "reason_code": reason_code,
+                }
+            )[:48]
+            connection.execute(
+                text(
+                    "INSERT INTO ar_fence_revocations (fence_ref, operation_ref, "
+                    "run_ref, attempt_ref, reason_code, revoked_at) VALUES "
+                    "(:fence_ref, :operation_ref, :run_ref, :attempt_ref, "
+                    ":reason_code, :now) ON CONFLICT(fence_ref) DO NOTHING"
+                ),
+                {
+                    "fence_ref": fence_ref,
+                    "operation_ref": revocation_operation_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "reason_code": reason_code[:96],
+                    "now": now,
+                },
+            )
+            # An interrupted provider result does not prove that the detached
+            # operation stopped.  Retire the old Fence but retain its physical
+            # responsibility until a successor response (or explicit provider
+            # exit acknowledgement) permanently fences this predecessor.
+            connection.execute(
+                text(
+                    "UPDATE ar_provider_units SET status = 'revocation_pending' "
+                    "WHERE run_ref = :run_ref AND attempt_ref IS :attempt_ref AND "
+                    "fence_ref IS :fence_ref AND status = 'active'"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                },
+            )
             pending_count = (
                 int(run.reconciliation_attempt_count) + 1
                 if reason_code == "deepfetch_provider_reconciliation_pending"
                 else 0
             )
-            if pending_count >= MAX_DEEPFETCH_RECONCILIATION_ATTEMPTS:
-                blocker = "deepfetch_provider_outcome_unknown"
-                connection.execute(
-                    text(
-                        "UPDATE ar_deepfetch_attempts SET status = 'failed', "
-                        "failure_code = :blocker, completed_at = :now WHERE "
-                        "attempt_ref = :attempt_ref"
-                    ),
-                    {
-                        "attempt_ref": attempt_ref,
-                        "blocker": blocker,
-                        "now": now,
-                    },
-                )
-                connection.execute(
-                    text(
-                        "UPDATE ar_deepfetch_runs SET status = 'failed', "
-                        "provider_operation_retry_permitted = 0, "
-                        "reconciliation_attempt_count = :pending_count, "
-                        "next_reconcile_at = NULL, failure_code = :blocker, "
-                        "completed_at = :now, updated_at = :now WHERE "
-                        "run_ref = :run_ref"
-                    ),
-                    {
-                        "run_ref": run_ref,
-                        "pending_count": pending_count,
-                        "blocker": blocker,
-                        "now": now,
-                    },
-                )
-                connection.execute(
-                    text(
-                        "UPDATE ar_run_controls SET status = "
-                        "'reconciliation_required', control_revision = "
-                        "control_revision + 1, terminal_reason = :blocker, "
-                        "updated_at = :now WHERE run_ref = :run_ref"
-                    ),
-                    {"blocker": blocker, "now": now, "run_ref": run_ref},
-                )
-                connection.execute(
-                    text(
-                        "UPDATE agent_runtime_state SET revision = revision + 1, "
-                        "active_run_count = active_run_count - 1 WHERE "
-                        "singleton = 'owner' AND active_run_count > 0"
-                    )
-                )
-                self._feed.record(
-                    connection,
-                    "agent_runtime.deepfetch_reconciliation_blocked",
-                    {
-                        "request_ref": run.request_ref,
-                        "run_ref": run_ref,
-                        "attempt_ref": attempt_ref,
-                        "reason_code": blocker,
-                    },
-                )
-                return blocker
             retry_delay = (
                 min(
                     DEEPFETCH_RECONCILIATION_MAX_SECONDS,
@@ -12597,6 +14243,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             self._database,
             verifier,
             target_run_verifier=self._target_run_harness_verifier,
+            target_root_completion_reader=self._target_root_completion_reader,
+            target_graph_verifier=self._target_graph_verifier,
             request_ref=run.request_ref,
             run_ref=run_ref,
             disposition=disposition,
@@ -12684,6 +14332,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             self._database,
             verifier,
             target_run_verifier=self._target_run_harness_verifier,
+            target_root_completion_reader=self._target_root_completion_reader,
+            target_graph_verifier=self._target_graph_verifier,
             request_ref=run.request_ref,
             run_ref=run_ref,
             disposition=report.disposition,
@@ -14528,7 +16178,9 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         with self._database.read() as connection:
             run = connection.execute(
                 text(
-                    "SELECT runs.*, controls.status AS managed_status FROM "
+                    "SELECT runs.*, controls.status AS managed_status, "
+                    "controls.terminal_reason AS managed_terminal_reason, "
+                    "controls.safe_point_ref AS managed_safe_point_ref FROM "
                     "ar_stage_runs runs JOIN ar_run_controls controls ON "
                     "controls.run_ref = runs.run_ref WHERE runs.request_ref = "
                     ":request_ref AND runs.stage = :stage"
@@ -14550,7 +16202,34 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
         if run.stage != expected_stage:
             raise OwnerConflict("stage_run_integrity_invalid")
         runtime_binding = _runtime_binding_from_row(run)
+        recovery_checkpoint = None
         with self._database.read() as connection:
+            managed_control = connection.execute(
+                text(
+                    "SELECT status, terminal_reason, safe_point_ref FROM "
+                    "ar_run_controls WHERE run_ref = :run_ref"
+                ),
+                {"run_ref": run.run_ref},
+            ).first()
+            if managed_control is None:
+                raise OwnerConflict("stage_run_integrity_invalid")
+            if managed_control.status not in {"running", "completed"}:
+                values = (
+                    dict(run._mapping)
+                    if hasattr(run, "_mapping")
+                    else dict(vars(run))
+                )
+                run = SimpleNamespace(
+                    **{**values, "status": managed_control.status}
+                )
+            if managed_control.safe_point_ref is not None:
+                recovery_checkpoint = _query_managed_safe_point(
+                    connection,
+                    SimpleNamespace(
+                        run_ref=run.run_ref,
+                        safe_point_ref=managed_control.safe_point_ref,
+                    ),
+                )
             session = connection.execute(
                 text(
                     "SELECT * FROM ar_stage_sessions WHERE session_ref = "
@@ -14790,6 +16469,15 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ),
             rejection_receipt=rejection_receipt,
             completion=completion,
+            failure_code=(
+                str(managed_control.terminal_reason)
+                if run.status == "suspended_fenced"
+                and managed_control.terminal_reason is not None
+                else None
+            ),
+            recovery_checkpoint=(
+                recovery_checkpoint if run.status == "suspended_fenced" else None
+            ),
             autonomous_checkpoint=autonomous_checkpoint,
         )
 
@@ -17054,7 +18742,7 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     {"count": len(runs)},
                 )
 
-    def _recover_interrupted_writing(self) -> None:
+    def _recover_interrupted_writing(self, *, run_ref: str | None = None) -> None:
         """Rotate a crashed Writing Fence while carrying its durable checkpoint."""
 
         with self._database.write() as connection:
@@ -17066,14 +18754,18 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "run.attempt_ref JOIN ar_run_controls AS control ON "
                     "control.run_ref = run.run_ref AND control.run_kind = 'writing' "
                     "WHERE run.status = 'active' AND attempt.status IN "
-                    "('admitted', 'running') AND (NOT EXISTS (SELECT 1 FROM "
+                    "('admitted', 'running') AND control.cleanup_status != 'pending' "
+                    "AND (NOT EXISTS (SELECT 1 FROM "
                     "ar_provider_units pending WHERE pending.run_ref = run.run_ref "
                     "AND pending.status = 'revocation_pending') OR EXISTS (SELECT 1 "
                     "FROM ar_provider_units pending WHERE pending.run_ref = "
                     "run.run_ref AND pending.attempt_ref IS run.attempt_ref AND "
                     "pending.fence_ref IS run.fence_ref AND pending.status = "
-                    "'revocation_pending')) ORDER BY run.run_ref"
+                    "'revocation_pending')) AND (:run_ref IS NULL OR run.run_ref = "
+                    ":run_ref) ORDER BY run.run_ref"
                 )
+                ,
+                {"run_ref": run_ref},
             ).all()
             for run in runs:
                 checkpoint = connection.execute(
@@ -17213,7 +18905,8 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     text(
                         "UPDATE ar_writing_runs SET attempt_ref = :attempt_ref, "
                         "attempt_generation = :generation, fence_ref = :fence_ref, "
-                        "updated_at = :now WHERE run_ref = :run_ref AND "
+                        "failure_code = NULL, updated_at = :now WHERE run_ref = "
+                        ":run_ref AND "
                         "attempt_ref = :retired_attempt_ref"
                     ),
                     {
@@ -17909,22 +19602,13 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 ),
                 {"attempt_ref": run.attempt_ref, "now": now},
             )
-            provider_unit_ref = new_ref("provider_unit")
-            connection.execute(
-                text(
-                    "INSERT INTO ar_provider_units (unit_ref, operation_ref, run_ref, "
-                    "attempt_ref, fence_ref, unit_kind, status, started_at, "
-                    "completed_at) VALUES (:unit_ref, :operation_ref, :run_ref, "
-                    ":attempt_ref, :fence_ref, 'experiment', 'active', :now, NULL)"
-                ),
+            provider_unit_ref = "provider_unit_" + canonical_hash(
                 {
-                    "unit_ref": provider_unit_ref,
-                    "operation_ref": run.provider_operation_ref,
                     "run_ref": run.run_ref,
                     "attempt_ref": run.attempt_ref,
                     "fence_ref": run.fence_ref,
-                    "now": now,
-                },
+                    "operation_ref": run.provider_operation_ref,
+                }
             )
             sequence = _append_experiment_event(
                 connection,
@@ -17951,6 +19635,116 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 },
             )
             evaluation_attempt_ref = run.evaluation_attempt_ref
+        try:
+            self.begin_provider_unit(
+                unit_ref=provider_unit_ref,
+                operation_ref=str(run.provider_operation_ref),
+                run_ref=str(run.run_ref),
+                attempt_ref=str(run.attempt_ref),
+                fence_ref=str(run.fence_ref),
+                unit_kind="experiment",
+            )
+        except OwnerConflict as error:
+            protected_terminal: RuntimeEffectIdentity | None = None
+            with self._database.write() as connection:
+                unit = connection.execute(
+                    text(
+                        "SELECT * FROM ar_provider_units WHERE unit_ref = :unit_ref"
+                    ),
+                    {"unit_ref": provider_unit_ref},
+                ).first()
+                now = time.time()
+                if unit is not None and unit.status == "active":
+                    connection.execute(
+                        text(
+                            "UPDATE ar_provider_units SET status = 'completed', "
+                            "completed_at = :now WHERE unit_ref = :unit_ref AND "
+                            "status = 'active'"
+                        ),
+                        {"now": now, "unit_ref": provider_unit_ref},
+                    )
+                connection.execute(
+                    text(
+                        "UPDATE ar_experiment_runs SET status = 'admitted', "
+                        "updated_at = :now WHERE run_ref = :run_ref AND status = "
+                        "'running'"
+                    ),
+                    {"now": now, "run_ref": run.run_ref},
+                )
+                connection.execute(
+                    text(
+                        "UPDATE ar_experiment_attempts SET status = 'admitted', "
+                        "started_at = NULL WHERE attempt_ref = :attempt_ref AND "
+                        "status = 'running'"
+                    ),
+                    {"attempt_ref": run.attempt_ref},
+                )
+                _append_experiment_event(
+                    connection,
+                    run_ref=str(run.run_ref),
+                    attempt_ref=str(run.attempt_ref),
+                    fence_ref=str(run.fence_ref),
+                    kind="status",
+                    payload={
+                        "status": "admitted",
+                        "reason_code": error.code,
+                    },
+                    observed_at=now,
+                )
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.experiment_runtime_protection_waiting",
+                    {
+                        "run_ref": run.run_ref,
+                        "attempt_ref": run.attempt_ref,
+                        "fence_ref": run.fence_ref,
+                        "reason_code": error.code,
+                    },
+                )
+                if self._runtime_protection is not None and unit is not None:
+                    effect = _provider_runtime_effect(
+                        unit_ref=str(unit.unit_ref),
+                        operation_ref=str(unit.operation_ref),
+                        run_ref=str(unit.run_ref),
+                        attempt_ref=str(unit.attempt_ref),
+                        fence_ref=str(unit.fence_ref),
+                        claim_started_at=float(unit.started_at),
+                    )
+                    try:
+                        record_runtime_boundary(
+                            connection,
+                            identity=effect,
+                            boundary="terminal",
+                            owner_evidence_ref="provider_not_started_"
+                            + canonical_hash(
+                                {
+                                    "unit_ref": unit.unit_ref,
+                                    "reason_code": error.code,
+                                }
+                            ),
+                        )
+                    except RuntimeProtectionUnavailable as boundary_error:
+                        if boundary_error.code != "runtime_responsibility_not_found":
+                            raise OwnerConflict(boundary_error.code) from boundary_error
+                    else:
+                        protected_terminal = effect
+            if self._runtime_protection is not None and protected_terminal is not None:
+                try:
+                    self._runtime_protection.finish(
+                        protected_terminal.responsibility_ref,
+                        boundary="terminal",
+                    )
+                except RuntimeProtectionUnavailable as finish_error:
+                    raise OwnerConflict(finish_error.code) from finish_error
+            if _is_runtime_protection_blocker(error.code):
+                return None
+            raise
         return self.query_experiment_run(evaluation_attempt_ref)
 
     def record_experiment_observation(
@@ -18024,6 +19818,186 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     "sequence": sequence,
                     "kind": kind,
                 },
+            )
+
+    def record_experiment_reconciliation_hold(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        reason_code: str,
+    ) -> ExperimentRun:
+        """Persist an unknown provider outcome without claiming a Safe Point."""
+
+        if not reason_code or len(reason_code) > 96:
+            raise OwnerConflict("experiment_reconciliation_reason_invalid")
+        with self._database.write() as connection:
+            _assert_experiment_run_write_allowed(connection, run_ref)
+            _assert_runtime_control_allows(connection, run_ref, fence_ref)
+            run = _current_experiment_execution(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                required_status="running",
+            )
+            now = time.time()
+            _append_experiment_event(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                kind="status",
+                payload={
+                    "status": "reconciliation_pending",
+                    "reason": {"code": reason_code},
+                },
+                observed_at=now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET updated_at = :now WHERE "
+                    "run_ref = :run_ref AND status = 'running'"
+                ),
+                {"now": now, "run_ref": run_ref},
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
+                )
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.experiment_reconciliation_waiting",
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "provider_operation_ref": run.provider_operation_ref,
+                    "reason": {"code": reason_code},
+                },
+            )
+            evaluation_attempt_ref = run.evaluation_attempt_ref
+        held = self.query_experiment_run(evaluation_attempt_ref)
+        if held is None:
+            raise OwnerConflict("experiment_reconciliation_hold_missing")
+        return held
+
+    def _record_experiment_provider_boundary(
+        self,
+        connection,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        boundary: RuntimeBoundary,
+        owner_evidence_ref: str,
+    ) -> None:
+        """Persist the exact protection receipt in the Owner state transaction."""
+
+        if self._runtime_protection is None:
+            return
+        unit = connection.execute(
+            text(
+                "SELECT * FROM ar_provider_units WHERE run_ref = :run_ref AND "
+                "attempt_ref IS :attempt_ref AND fence_ref IS :fence_ref AND "
+                "status IN ('active', 'revocation_pending') ORDER BY started_at "
+                "DESC LIMIT 1"
+            ),
+            {
+                "run_ref": run_ref,
+                "attempt_ref": attempt_ref,
+                "fence_ref": fence_ref,
+            },
+        ).first()
+        if unit is None:
+            return
+        effect = _provider_runtime_effect(
+            unit_ref=str(unit.unit_ref),
+            operation_ref=str(unit.operation_ref),
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+            claim_started_at=float(unit.started_at),
+        )
+        try:
+            record_runtime_boundary(
+                connection,
+                identity=effect,
+                boundary=boundary,
+                owner_evidence_ref=owner_evidence_ref,
+            )
+        except RuntimeProtectionUnavailable as error:
+            if error.code != "runtime_responsibility_not_found":
+                raise OwnerConflict(error.code) from error
+
+    def acknowledge_experiment_provider_safe_point(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+    ) -> None:
+        """Finish an exact Experiment unit and any fenced same-operation ancestor."""
+
+        with self._database.read() as connection:
+            unit = connection.execute(
+                text(
+                    "SELECT * FROM ar_provider_units WHERE run_ref = :run_ref AND "
+                    "attempt_ref IS :attempt_ref AND fence_ref IS :fence_ref ORDER BY "
+                    "started_at DESC LIMIT 1"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                },
+            ).first()
+        if unit is None:
+            raise OwnerConflict("runtime_provider_unit_not_found")
+        operation_ref = str(unit.operation_ref)
+        was_already_closed = unit.status in {"completed", "revoked"}
+        self.acknowledge_provider_safe_point(
+            unit_ref=str(unit.unit_ref),
+            run_ref=run_ref,
+            attempt_ref=attempt_ref,
+            fence_ref=fence_ref,
+        )
+        if not was_already_closed:
+            return
+        # Experiment Owner methods persist and close the current unit in their
+        # state transaction.  On restart, that close can also permanently fence
+        # an older physical unit for the same durable operation.  Finish those
+        # exact ancestors only after their terminal unit state is observable.
+        with self._database.read() as connection:
+            predecessors = connection.execute(
+                text(
+                    "SELECT * FROM ar_provider_units WHERE run_ref = :run_ref AND "
+                    "operation_ref = :operation_ref AND unit_ref != :unit_ref AND "
+                    "status IN ('completed', 'revoked') ORDER BY started_at, unit_ref"
+                ),
+                {
+                    "run_ref": run_ref,
+                    "operation_ref": operation_ref,
+                    "unit_ref": unit.unit_ref,
+                },
+            ).all()
+        for predecessor in predecessors:
+            self.acknowledge_provider_safe_point(
+                unit_ref=str(predecessor.unit_ref),
+                run_ref=str(predecessor.run_ref),
+                attempt_ref=(
+                    None
+                    if predecessor.attempt_ref is None
+                    else str(predecessor.attempt_ref)
+                ),
+                fence_ref=(
+                    None
+                    if predecessor.fence_ref is None
+                    else str(predecessor.fence_ref)
+                ),
             )
 
     def complete_experiment_execution(
@@ -18144,6 +20118,21 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                     ),
                     {"now": now, "run_ref": run_ref},
                 )
+                self._record_experiment_provider_boundary(
+                    connection,
+                    run_ref=run_ref,
+                    attempt_ref=attempt_ref,
+                    fence_ref=fence_ref,
+                    boundary="terminal",
+                    owner_evidence_ref="experiment_terminal_"
+                    + canonical_hash(
+                        {
+                            "receipt_ref": receipt_ref,
+                            "receipt_hash": receipt_hash,
+                            "result_hash": result_hash,
+                        }
+                    ),
+                )
                 _close_provider_unit(
                     connection,
                     run_ref=run_ref,
@@ -18177,6 +20166,194 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             raise OwnerConflict("experiment_completion_missing_after_commit")
         return completed
 
+    def suspend_experiment_execution(
+        self,
+        *,
+        run_ref: str,
+        attempt_ref: str,
+        fence_ref: str,
+        failure_code: str,
+    ) -> ExperimentRun:
+        """Fence one terminal provider operation without terminating its logical Run."""
+
+        if not failure_code or len(failure_code) > 96:
+            raise OwnerConflict("experiment_failure_code_invalid")
+        with self._database.write() as connection:
+            _assert_experiment_run_write_allowed(connection, run_ref)
+            _assert_runtime_control_allows(connection, run_ref, fence_ref)
+            run = _current_experiment_execution(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                required_status="running",
+            )
+            operation_generation = int(run.provider_operation_generation) + 1
+            try:
+                operation_ref = typed_provider_operation_ref(
+                    run_ref,
+                    "experiment",
+                    operation_generation,
+                )
+            except ProviderSupervisorError as error:
+                raise OwnerConflict("experiment_provider_operation_invalid") from error
+            self._record_experiment_provider_boundary(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                boundary="permanent_fence",
+                owner_evidence_ref="experiment_provider_blocker_"
+                + canonical_hash(
+                    {
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "provider_operation_ref": run.provider_operation_ref,
+                        "failure_code": failure_code,
+                    }
+                ),
+            )
+            now = time.time()
+            fence_operation_ref = "experiment_blocker_" + canonical_hash(
+                {
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "fence_ref": fence_ref,
+                    "failure_code": failure_code,
+                }
+            )[:48]
+            inserted = connection.execute(
+                text(
+                    "INSERT INTO ar_fence_revocations (fence_ref, operation_ref, "
+                    "run_ref, attempt_ref, reason_code, revoked_at) VALUES "
+                    "(:fence_ref, :operation_ref, :run_ref, :attempt_ref, "
+                    ":reason_code, :now) ON CONFLICT(fence_ref) DO NOTHING"
+                ),
+                {
+                    "fence_ref": fence_ref,
+                    "operation_ref": fence_operation_ref,
+                    "run_ref": run_ref,
+                    "attempt_ref": attempt_ref,
+                    "reason_code": failure_code,
+                    "now": now,
+                },
+            )
+            _append_experiment_event(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                kind="status",
+                payload={"status": "blocked", "reason": {"code": failure_code}},
+                observed_at=now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_attempts SET status = 'failed', "
+                    "retired_reason = :failure_code, completed_at = :now WHERE "
+                    "attempt_ref = :attempt_ref AND status = 'running'"
+                ),
+                {
+                    "failure_code": failure_code,
+                    "now": now,
+                    "attempt_ref": attempt_ref,
+                },
+            )
+            _close_provider_unit(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+            )
+            replacement_ref, replacement_fence = _insert_replacement_attempt(
+                connection,
+                run_ref,
+                int(run.attempt_generation) + 1,
+                run.root_session_ref,
+                now,
+            )
+            _append_experiment_event(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=replacement_ref,
+                fence_ref=replacement_fence,
+                kind="status",
+                payload={
+                    "status": "durable_waiting",
+                    "reason": {"code": failure_code},
+                    "predecessor": {
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "provider_operation_ref": run.provider_operation_ref,
+                    },
+                },
+                observed_at=now,
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_experiment_runs SET status = 'admitted', "
+                    "provider_operation_ref = :provider_operation_ref, "
+                    "provider_operation_generation = :operation_generation, "
+                    "provider_operation_retry_permitted = 0, attempt_ref = "
+                    ":attempt_ref, attempt_generation = attempt_generation + 1, "
+                    "fence_ref = :fence_ref, failure_code = NULL, completed_at = "
+                    "NULL, updated_at = :now WHERE run_ref = :run_ref"
+                ),
+                {
+                    "provider_operation_ref": operation_ref,
+                    "operation_generation": operation_generation,
+                    "attempt_ref": replacement_ref,
+                    "fence_ref": replacement_fence,
+                    "now": now,
+                    "run_ref": run_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE ar_run_controls SET status = 'suspended', attempt_ref = "
+                    ":attempt_ref, fence_ref = :fence_ref, control_revision = "
+                    "control_revision + 1, safe_point_ref = NULL, terminal_reason = "
+                    ":failure_code, cleanup_status = 'none', updated_at = :now WHERE "
+                    "run_ref = :run_ref"
+                ),
+                {
+                    "attempt_ref": replacement_ref,
+                    "fence_ref": replacement_fence,
+                    "failure_code": failure_code,
+                    "now": now,
+                    "run_ref": run_ref,
+                },
+            )
+            connection.execute(
+                text(
+                    "UPDATE agent_runtime_state SET revision = revision + 1, "
+                    "experiment_attempt_count = experiment_attempt_count + 1, "
+                    "fenced_attempt_count = fenced_attempt_count + :fenced_count "
+                    "WHERE singleton = 'owner'"
+                ),
+                {"fenced_count": int(inserted.rowcount or 0)},
+            )
+            self._feed.record(
+                connection,
+                "agent_runtime.experiment_provider_blocked",
+                {
+                    "run_ref": run_ref,
+                    "retired_attempt_ref": attempt_ref,
+                    "retired_fence_ref": fence_ref,
+                    "provider_operation_ref": run.provider_operation_ref,
+                    "attempt_ref": replacement_ref,
+                    "fence_ref": replacement_fence,
+                    "next_provider_operation_ref": operation_ref,
+                    "failure": {"code": failure_code},
+                },
+            )
+            evaluation_attempt_ref = run.evaluation_attempt_ref
+        suspended = self.query_experiment_run(evaluation_attempt_ref)
+        if suspended is None:
+            raise OwnerConflict("experiment_suspension_missing_after_commit")
+        return suspended
+
     def retry_experiment_execution(
         self,
         *,
@@ -18197,6 +20374,22 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 fence_ref=fence_ref,
                 required_status="running",
             )
+            self._record_experiment_provider_boundary(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                boundary="permanent_fence",
+                owner_evidence_ref="experiment_retry_fence_"
+                + canonical_hash(
+                    {
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "failure_code": failure_code,
+                    }
+                ),
+            )
             _close_provider_unit(
                 connection,
                 run_ref=run_ref,
@@ -18204,8 +20397,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 fence_ref=fence_ref,
             )
             operation_generation = int(run.provider_operation_generation) + 1
-            if operation_generation > EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS:
-                raise OwnerConflict("experiment_retry_limit_reached")
             try:
                 operation_ref = typed_provider_operation_ref(
                     run_ref,
@@ -18324,6 +20515,22 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
                 attempt_ref=attempt_ref,
                 fence_ref=fence_ref,
                 required_status="running",
+            )
+            self._record_experiment_provider_boundary(
+                connection,
+                run_ref=run_ref,
+                attempt_ref=attempt_ref,
+                fence_ref=fence_ref,
+                boundary="terminal",
+                owner_evidence_ref="experiment_failure_"
+                + canonical_hash(
+                    {
+                        "run_ref": run_ref,
+                        "attempt_ref": attempt_ref,
+                        "fence_ref": fence_ref,
+                        "failure_code": failure_code,
+                    }
+                ),
             )
             _close_provider_unit(
                 connection,
@@ -18496,8 +20703,6 @@ class SQLiteAgentRuntime(HumanRequestOwnerMixin):
             ):
                 raise OwnerConflict("experiment_replacement_not_allowed")
             operation_generation = int(run.provider_operation_generation) + 1
-            if operation_generation > EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS:
-                raise OwnerConflict("experiment_retry_limit_reached")
             try:
                 operation_ref = typed_provider_operation_ref(
                     run.run_ref,
@@ -18633,6 +20838,8 @@ class SQLiteAgentRuntimeReceiptVerifier:
             bundle_report_disposition_verifier
         )
         self._target_run_harness_verifier: TargetRunHarnessVerifier | None = None
+        self._target_root_completion_reader: TargetRootCompletionReader | None = None
+        self._target_graph_verifier: TargetGraphReceiptVerifier | None = None
 
     def bind_bundle_report_evidence_verifier(
         self, verifier: BundleReportEvidenceVerifier
@@ -18649,6 +20856,23 @@ class SQLiteAgentRuntimeReceiptVerifier:
         if current is not None and current is not verifier:
             raise OwnerConflict("target_run_harness_verifier_already_bound")
         self._target_run_harness_verifier = verifier
+
+    def bind_target_root_completion_authorities(
+        self,
+        reader: TargetRootCompletionReader,
+        graph_verifier: TargetGraphReceiptVerifier | None,
+    ) -> None:
+        current_reader = self._target_root_completion_reader
+        current_graph = self._target_graph_verifier
+        if (
+            current_reader is not None
+            and current_reader is not reader
+            or current_graph is not None
+            and current_graph is not graph_verifier
+        ):
+            raise OwnerConflict("target_root_completion_reader_already_bound")
+        self._target_root_completion_reader = reader
+        self._target_graph_verifier = graph_verifier
 
     def bind_bundle_exhaustion_verifier(
         self, verifier: BundleExhaustionAcceptanceVerifier
@@ -19274,6 +21498,8 @@ class SQLiteAgentRuntimeReceiptVerifier:
             self._database,
             verifier,
             target_run_verifier=self._target_run_harness_verifier,
+            target_root_completion_reader=self._target_root_completion_reader,
+            target_graph_verifier=self._target_graph_verifier,
             row=row,
             run=run,
             receipt=receipt,
@@ -20036,6 +22262,64 @@ def _acquisition_reconciliation_pending(
         and cast(dict[str, object], item["failure"]).get("code")
         == "acquisition_reconciliation_required"
         for item in results
+    )
+
+
+def _acquisition_runtime_protection_waiting(
+    results_json: str | None, results_hash: str | None
+) -> bool:
+    if results_json is None or results_hash is None:
+        return False
+    try:
+        results = json.loads(results_json)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(results, list)
+        or canonical_json(results) != results_json
+        or canonical_hash(results) != results_hash
+    ):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("status") == "waiting_user"
+        and isinstance(item.get("failure"), dict)
+        and isinstance(
+            code := cast(dict[str, object], item["failure"]).get("code"), str
+        )
+        and (
+            code.startswith("power_inhibitor_")
+            or code.startswith("runtime_protection_")
+        )
+        for item in results
+    )
+
+
+def _is_runtime_protection_blocker(code: str) -> bool:
+    return (
+        code.startswith("power_inhibitor_")
+        or code.startswith("runtime_protection_")
+        or code
+        in {
+            "runtime_reconciliation_required",
+            "runtime_responsibility_already_finished",
+            "runtime_incarnation_stale",
+        }
+    )
+
+
+def _runtime_protection_acquisition_item(
+    paper_id: str, code: str
+) -> AcquisitionItemResult:
+    return AcquisitionItemResult(
+        paper_id=paper_id,
+        status="waiting_user",
+        path=None,
+        format=None,
+        failure={
+            "code": code,
+            "detail": "运行保护尚未确认，未启动下载副作用；可安全重试。",
+        },
     )
 
 
@@ -23028,6 +25312,8 @@ def _bundle_report_target_evidence(
     target_refs: tuple[str, ...],
     *,
     target_run_verifier: TargetRunHarnessVerifier | None,
+    target_root_completion_reader: TargetRootCompletionReader | None = None,
+    target_graph_verifier: TargetGraphReceiptVerifier | None = None,
 ) -> tuple[tuple[_BundleReportTargetEvidence, ...], tuple[str, ...]]:
     evidence: list[_BundleReportTargetEvidence] = []
     missing: list[str] = []
@@ -23042,11 +25328,6 @@ def _bundle_report_target_evidence(
         if frontier_row is None:
             missing.append(target_ref)
             continue
-        context = _target_handoff_context(
-            connection,
-            target_ref,
-            verifier=target_run_verifier,
-        )
         notice_row = connection.execute(
             text(
                 "SELECT * FROM ar_target_work_notices WHERE target_ref = "
@@ -23074,6 +25355,83 @@ def _bundle_report_target_evidence(
             TargetRunHandoff,
             "bundle_report_handoff_invalid",
         )
+        root_completion = _is_target_root_completion_terminal(handoff.terminal)
+        if root_completion:
+            final_handle = handoff.handle_history[-1]
+            transition = _query_verified_target_commit_transition(
+                target_graph_verifier,
+                target_ref=target_ref,
+                handle=final_handle,
+            )
+            if transition is None:
+                raise OwnerConflict(
+                    "target_root_completion_publication_authority_invalid"
+                )
+            verified_root = _query_verified_target_root_publication(
+                completion_reader=target_root_completion_reader,
+                graph_verifier=target_graph_verifier,
+                target_ref=target_ref,
+                completion_ref=transition.target_execution_closure_ref,
+                target_commit_ref=handoff.terminal.target_commit_ref,
+            )
+            lifecycle_row = connection.execute(
+                text(
+                    "SELECT * FROM ar_target_root_lifecycles WHERE target_ref = "
+                    ":target_ref"
+                ),
+                {"target_ref": target_ref},
+            ).first()
+            if lifecycle_row is None:
+                raise OwnerConflict("bundle_report_handoff_invalid")
+            initial_handle = _stored_bundle_record(
+                lifecycle_row.initial_handle_json,
+                lifecycle_row.initial_handle_hash,
+                TargetWorkHandle,
+                "bundle_report_handoff_invalid",
+            )
+            candidate = _stored_bundle_record(
+                lifecycle_row.candidate_json,
+                lifecycle_row.candidate_hash,
+                TargetCandidate,
+                "bundle_report_handoff_invalid",
+            )
+            formal_plan = _stored_bundle_record(
+                lifecycle_row.formal_plan_json,
+                lifecycle_row.formal_plan_hash,
+                FormalPlan,
+                "bundle_report_handoff_invalid",
+            )
+            frontier, request = _target_frontier_and_request_for_local_write(
+                connection, target_ref
+            )
+            if (
+                initial_handle != verified_root.handle
+                or handoff.handle_history != (verified_root.handle,)
+                or handoff.terminal != verified_root.terminal
+                or lifecycle_row.completion_ref
+                != transition.target_execution_closure_ref
+                or lifecycle_row.status not in {"finalizing", "completed"}
+            ):
+                raise OwnerConflict("bundle_report_handoff_invalid")
+            context = SimpleNamespace(
+                request=request,
+                frontier=frontier,
+                monitor=SimpleNamespace(snapshot_required=0),
+                candidate=candidate,
+                formal_plan=formal_plan,
+                handles=(verified_root.handle,),
+                preflights=(),
+                review_scopes=(),
+                stop_decisions=(),
+                recovered_blockers=(),
+                recovery_evidence_refs=(),
+            )
+        else:
+            context = _target_handoff_context(
+                connection,
+                target_ref,
+                verifier=target_run_verifier,
+            )
         reconfirmed_frontier = _target_frontier_for_local_write(
             connection, target_ref
         )
@@ -23097,15 +25455,16 @@ def _bundle_report_target_evidence(
             )
         except (BundleProtocolError, TargetRunContractError, TypeError, ValueError) as error:
             raise OwnerConflict("bundle_report_handoff_invalid") from error
-        _validate_persisted_target_terminal(
-            handoff,
-            candidate=context.candidate,
-            formal_plan=context.formal_plan,
-            final_handle=context.handles[-1],
-            measurement_transition_verified=(
-                type(handoff.terminal) is AcceptedMeasurementClosure
-            ),
-        )
+        if not root_completion:
+            _validate_persisted_target_terminal(
+                handoff,
+                candidate=context.candidate,
+                formal_plan=context.formal_plan,
+                final_handle=context.handles[-1],
+                measurement_transition_verified=(
+                    type(handoff.terminal) is AcceptedMeasurementClosure
+                ),
+            )
         if (
             context.frontier.state != "terminal"
             or context.frontier.currentness_known is not True
@@ -23156,6 +25515,8 @@ def _prepare_bundle_report_material(
     verifier: BundleReportEvidenceVerifier,
     *,
     target_run_verifier: TargetRunHarnessVerifier | None,
+    target_root_completion_reader: TargetRootCompletionReader | None,
+    target_graph_verifier: TargetGraphReceiptVerifier | None,
     request_ref: str,
     run_ref: str,
     disposition: str,
@@ -23233,6 +25594,8 @@ def _prepare_bundle_report_material(
                 connection,
                 typed_target_refs,
                 target_run_verifier=target_run_verifier,
+                target_root_completion_reader=target_root_completion_reader,
+                target_graph_verifier=target_graph_verifier,
             )
 
         accepted: dict[str, AcceptedMeasurementClosure] = {}
@@ -23757,6 +26120,8 @@ def _verified_bundle_report_from_row(
     verifier: BundleReportEvidenceVerifier,
     *,
     target_run_verifier: TargetRunHarnessVerifier | None,
+    target_root_completion_reader: TargetRootCompletionReader | None,
+    target_graph_verifier: TargetGraphReceiptVerifier | None,
     row,
     run,
     receipt: AcceptanceReceipt,
@@ -23852,6 +26217,8 @@ def _verified_bundle_report_from_row(
         database,
         verifier,
         target_run_verifier=target_run_verifier,
+        target_root_completion_reader=target_root_completion_reader,
+        target_graph_verifier=target_graph_verifier,
         request_ref=row.request_ref,
         run_ref=row.run_ref,
         disposition=row.disposition,
@@ -25437,6 +27804,58 @@ def _managed_run_document(
     return value
 
 
+def _validated_stage_provider_hard_ceiling(
+    *, failure_code: str, provider_exit: dict[str, object]
+) -> dict[str, object]:
+    expected_reason = {
+        "codex_operation_timeout": "timeout",
+        "codex_operation_output_limit": "output_limit",
+    }.get(failure_code)
+    expected_fields = {
+        "schema_ref",
+        "termination_reason",
+        "invocation_hash",
+        "prompt_hash",
+        "output_schema_hash",
+        "stdout_hash",
+        "result_file_hash",
+        "supervisor_receipt_hash",
+    }
+    hash_fields = expected_fields - {
+        "schema_ref",
+        "termination_reason",
+        "result_file_hash",
+    }
+    result_hash = provider_exit.get("result_file_hash")
+    if (
+        expected_reason is None
+        or not isinstance(provider_exit, dict)
+        or set(provider_exit) != expected_fields
+        or provider_exit.get("schema_ref")
+        != "meta-research/provider-hard-ceiling/v1"
+        or provider_exit.get("termination_reason") != expected_reason
+        or any(
+            not isinstance(provider_exit.get(field), str)
+            or len(cast(str, provider_exit[field])) != 64
+            for field in hash_fields
+        )
+        or (
+            result_hash is not None
+            and (not isinstance(result_hash, str) or len(result_hash) != 64)
+        )
+    ):
+        raise OwnerConflict("stage_provider_hard_ceiling_invalid")
+    # Canonical round-trip rejects non-JSON values and prevents a caller from
+    # mutating the checkpoint after validation but before the Owner commit.
+    try:
+        value = decoded_object(canonical_json(provider_exit))
+    except (TypeError, ValueError) as error:
+        raise OwnerConflict("stage_provider_hard_ceiling_invalid") from error
+    if not isinstance(value, dict):
+        raise OwnerConflict("stage_provider_hard_ceiling_invalid")
+    return cast(dict[str, object], value)
+
+
 def _managed_run_reservation(row) -> dict[str, object]:
     """Freeze only AR-owned identities needed to close a control CAS."""
 
@@ -25542,6 +27961,28 @@ def _runtime_control_reservation_document(row) -> dict[str, object]:
         "affected_runs": affected,
         "affected_runs_hash": row.affected_runs_hash,
     }
+
+
+def _stage_resume_reuses_checkpoint(connection, row) -> bool:
+    safe_point = _query_managed_safe_point(connection, row)
+    if safe_point is None:
+        return True
+    checkpoint = safe_point["checkpoint"]
+    if checkpoint.get("action") != "provider_hard_ceiling":
+        return True
+    if (
+        checkpoint.get("schema_ref") != "meta-research/runtime-safe-point/v1"
+        or checkpoint.get("run_ref") != row.run_ref
+        or checkpoint.get("run_kind") != row.run_kind
+        or checkpoint.get("attempt_ref") != row.attempt_ref
+        or checkpoint.get("root_session_ref") != row.root_session_ref
+        or checkpoint.get("fence_ref") != row.fence_ref
+        or not isinstance(checkpoint.get("provider_operation_ref"), str)
+        or not checkpoint["provider_operation_ref"]
+        or type(checkpoint.get("provider_operation_retry_permitted")) is not bool
+    ):
+        raise OwnerConflict("runtime_safe_point_invalid")
+    return cast(bool, checkpoint["provider_operation_retry_permitted"])
 
 
 def _query_managed_safe_point(connection, row) -> dict[str, object] | None:
@@ -26029,24 +28470,26 @@ def create_agent_runtime_interface(
     bundle_exhaustion_verifier: BundleExhaustionAcceptanceVerifier | None = None,
     reasoning_outcome_verifier: ReasoningOutcomeDecisionVerifier | None = None,
     writing_delivery_provider_registry: WritingDeliveryProviderRegistry | None = None,
+    runtime_protection: RuntimeProtection | None = None,
 ) -> AgentRuntimeInterface:
     return SQLiteAgentRuntime(
-        database,
-        feed,
-        host_compute_probe,
-        stage_request_verifier,
-        outcome_verifier,
-        formal_plan_verifier,
-        deepfetch_request_verifier,
-        acquisition_private_root,
-        human_response_verifier,
-        experiment_binding_verifier,
-        target_graph_verifier,
-        bundle_report_evidence_verifier,
-        target_run_harness_verifier,
-        bundle_exhaustion_verifier,
+        database=database,
+        feed=feed,
+        host_compute_probe=host_compute_probe,
+        stage_request_verifier=stage_request_verifier,
+        outcome_verifier=outcome_verifier,
+        formal_plan_verifier=formal_plan_verifier,
+        deepfetch_request_verifier=deepfetch_request_verifier,
+        acquisition_private_root=acquisition_private_root,
+        human_response_verifier=human_response_verifier,
+        experiment_binding_verifier=experiment_binding_verifier,
+        target_graph_verifier=target_graph_verifier,
+        bundle_report_evidence_verifier=bundle_report_evidence_verifier,
+        target_run_harness_verifier=target_run_harness_verifier,
+        bundle_exhaustion_verifier=bundle_exhaustion_verifier,
         reasoning_outcome_verifier=reasoning_outcome_verifier,
         writing_delivery_provider_registry=writing_delivery_provider_registry,
+        runtime_protection=runtime_protection,
     )
 
 

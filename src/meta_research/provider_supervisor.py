@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import errno
 import hashlib
 import hmac
@@ -12,10 +11,11 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, BinaryIO, Protocol, cast
 
 
 TRANSPORT_KEY_BYTES = 32
@@ -47,6 +47,487 @@ PROVIDER_SUPERVISOR_MAX_TIMEOUT_SECONDS = 365 * 24 * 60 * 60
 
 class ProviderSupervisorError(RuntimeError):
     pass
+
+
+LockOperation = Callable[[int, bool, bool], None]
+
+
+class SupervisorFileLock:
+    """Cross-platform lock for one durable provider operation."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        platform_name: str | None = None,
+        lock_operation: LockOperation | None = None,
+    ) -> None:
+        self._path = path
+        self._platform_name = platform_name or os.name
+        self._lock_operation = lock_operation
+        self._handle: BinaryIO | None = None
+
+    def acquire(self, *, blocking: bool = True) -> bool:
+        if self._handle is not None:
+            raise RuntimeError("provider supervisor lock is already acquired")
+        operation = self._lock_operation or _platform_lock_operation(
+            self._platform_name
+        )
+        handle = self._path.open("a+b")
+        if self._platform_name == "nt":
+            try:
+                _ensure_windows_lock_byte(handle)
+            except Exception:
+                handle.close()
+                raise
+        while True:
+            try:
+                operation(handle.fileno(), True, blocking)
+            except OSError as error:
+                if error.errno not in {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    errno.EDEADLK,
+                }:
+                    handle.close()
+                    raise
+                if blocking:
+                    time.sleep(0.05)
+                    continue
+                handle.close()
+                return False
+            except Exception:
+                handle.close()
+                raise
+            self._handle = handle
+            return True
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        try:
+            operation = self._lock_operation or _platform_lock_operation(
+                self._platform_name
+            )
+            operation(handle.fileno(), False, False)
+        finally:
+            handle.close()
+
+    def __enter__(self) -> "SupervisorFileLock":
+        if not self.acquire():
+            raise RuntimeError("provider supervisor lock could not be acquired")
+        return self
+
+    def __exit__(self, *_error: object) -> None:
+        self.release()
+
+
+def _platform_lock_operation(platform_name: str) -> LockOperation:
+    if platform_name == "posix":
+        return _posix_lock_operation
+    if platform_name == "nt":
+        return _windows_lock_operation
+    raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
+
+
+def _posix_lock_operation(
+    descriptor: int, acquire: bool, blocking: bool
+) -> None:
+    import fcntl
+
+    operation = fcntl.LOCK_EX if acquire else fcntl.LOCK_UN
+    if acquire and not blocking:
+        operation |= fcntl.LOCK_NB
+    fcntl.flock(descriptor, operation)
+
+
+def _windows_lock_operation(
+    descriptor: int, acquire: bool, _blocking: bool
+) -> None:
+    import msvcrt
+
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    operation = msvcrt.LK_NBLCK if acquire else msvcrt.LK_UNLCK
+    msvcrt.locking(descriptor, operation, 1)
+
+
+def _ensure_windows_lock_byte(handle: BinaryIO) -> None:
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0, os.SEEK_SET)
+
+
+class ProviderProcessJob(Protocol):
+    """One provider process tree with an exact, queryable lifetime."""
+
+    def spawn(
+        self,
+        argv: list[str],
+        **options: object,
+    ) -> subprocess.Popen[bytes]: ...
+
+    def active_process_count(self) -> int: ...
+
+    def terminate(self, exit_code: int = 1) -> bool: ...
+
+    def close(self) -> None: ...
+
+
+ProviderProcessJobFactory = Callable[[], ProviderProcessJob]
+
+
+class WindowsProviderJob:
+    """Windows Job Object that owns the complete provider process tree."""
+
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _CREATE_SUSPENDED = 0x00000004
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise ProviderSupervisorError("provider_windows_job_unavailable")
+        import ctypes
+        from ctypes import wintypes
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        class BasicAccountingInformation(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_longlong),
+                ("TotalKernelTime", ctypes.c_longlong),
+                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        ]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+        ntdll.NtResumeProcess.restype = wintypes.LONG
+
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        information = ExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = (
+            self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        if not kernel32.SetInformationJobObject(
+            handle,
+            self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            kernel32.CloseHandle(handle)
+            raise error
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = kernel32
+        self._ntdll = ntdll
+        self._accounting_type = BasicAccountingInformation
+        self._handle = handle
+
+    def spawn(
+        self,
+        argv: list[str],
+        **options: object,
+    ) -> subprocess.Popen[bytes]:
+        if self._handle is None:
+            raise ProviderSupervisorError("provider_windows_job_closed")
+        popen_options = dict(options)
+        creationflags = int(popen_options.pop("creationflags", 0))
+        process = subprocess.Popen(
+            argv,
+            creationflags=creationflags | self._CREATE_SUSPENDED,
+            **cast(dict[str, Any], popen_options),
+        )
+        process_handle = self._wintypes.HANDLE(int(process._handle))
+        try:
+            if not self._kernel32.AssignProcessToJobObject(
+                self._handle,
+                process_handle,
+            ):
+                raise self._ctypes.WinError(self._ctypes.get_last_error())
+            if self._ntdll.NtResumeProcess(process_handle) != 0:
+                raise ProviderSupervisorError("provider_windows_resume_failed")
+        except BaseException:
+            self._kernel32.TerminateProcess(process_handle, 1)
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired as error:
+                raise ProviderSupervisorError(
+                    "provider_process_termination_unconfirmed"
+                ) from error
+            raise
+        return process
+
+    def active_process_count(self) -> int:
+        if self._handle is None:
+            raise ProviderSupervisorError("provider_windows_job_closed")
+        information = self._accounting_type()
+        if not self._kernel32.QueryInformationJobObject(
+            self._handle,
+            self._JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+            self._ctypes.byref(information),
+            self._ctypes.sizeof(information),
+            None,
+        ):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        return int(information.ActiveProcesses)
+
+    def terminate(self, exit_code: int = 1) -> bool:
+        if self._handle is None:
+            return False
+        if not self._kernel32.TerminateJobObject(self._handle, exit_code):
+            return False
+        deadline = time.monotonic() + 1.0
+        while self.active_process_count() > 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.active_process_count() == 0
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        if not self._kernel32.CloseHandle(handle):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        self._handle = None
+
+
+class ProviderProcessPlatform:
+    """Own platform-specific provider process identity and control."""
+
+    def __init__(
+        self,
+        *,
+        platform_name: str | None = None,
+        windows_pid_probe: Callable[[int], bool] | None = None,
+        create_new_process_group: int | None = None,
+        detached_process: int | None = None,
+    ) -> None:
+        self.platform_name = platform_name or os.name
+        self._windows_pid_probe = windows_pid_probe or _windows_pid_is_alive
+        self._create_new_process_group = (
+            create_new_process_group
+            if create_new_process_group is not None
+            else getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+        self._detached_process = (
+            detached_process
+            if detached_process is not None
+            else getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        )
+
+    def provider_spawn_options(self) -> dict[str, object]:
+        if self.platform_name == "posix":
+            return {"start_new_session": True}
+        if self.platform_name == "nt":
+            return {"creationflags": self._create_new_process_group}
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
+
+    def supervisor_spawn_options(self) -> dict[str, object]:
+        if self.platform_name == "posix":
+            return {"close_fds": True, "start_new_session": True}
+        if self.platform_name == "nt":
+            return {
+                "close_fds": True,
+                "creationflags": (
+                    self._create_new_process_group | self._detached_process
+                ),
+            }
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
+
+    def current_process_group(self) -> int:
+        if self.platform_name == "posix":
+            return os.getpgrp()
+        if self.platform_name == "nt":
+            return os.getpid()
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
+
+    def process_group_for_pid(self, process_id: int) -> int:
+        if self.platform_name == "posix":
+            return os.getpgid(process_id)
+        if self.platform_name == "nt":
+            return process_id
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
+
+    def process_group_running(self, process_group: int) -> bool:
+        if process_group <= 1:
+            return False
+        if self.platform_name == "nt":
+            return self._windows_pid_probe(process_group)
+        if self.platform_name != "posix":
+            return False
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def terminate_process_group(self, process_group: int) -> bool:
+        if process_group <= 1:
+            return False
+        if self.platform_name == "nt":
+            raise ProviderSupervisorError("provider_windows_job_required")
+        if self.platform_name != "posix":
+            return False
+        return _terminate_posix_process_group(process_group)
+
+
+def provider_spawn_options() -> dict[str, object]:
+    return ProviderProcessPlatform().provider_spawn_options()
+
+
+def supervisor_spawn_options() -> dict[str, object]:
+    return ProviderProcessPlatform().supervisor_spawn_options()
+
+
+def minimal_subprocess_environment(
+    *,
+    platform_name: str | None = None,
+    source_environment: Mapping[str, str] | None = None,
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Keep only host bootstrap variables required by an isolated subprocess."""
+
+    selected_platform = platform_name or os.name
+    source = os.environ if source_environment is None else source_environment
+    allowed = {"PATH"}
+    if selected_platform == "nt":
+        allowed.update(
+            {
+                "COMSPEC",
+                "PATHEXT",
+                "SYSTEMROOT",
+                "TEMP",
+                "TMP",
+                "WINDIR",
+            }
+        )
+    elif selected_platform != "posix":
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
+    environment = {
+        name: value
+        for name, value in source.items()
+        if name.upper() in allowed
+    }
+    if not any(name.upper() == "PATH" for name in environment):
+        environment["PATH"] = ""
+    if extra is not None:
+        environment.update(extra)
+    return environment
+
+
+def current_process_group() -> int:
+    return ProviderProcessPlatform().current_process_group()
+
+
+def process_group_for_pid(process_id: int) -> int:
+    return ProviderProcessPlatform().process_group_for_pid(process_id)
+
+
+def _windows_pid_is_alive(process_id: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    access_denied = 5
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(
+        process_query_limited_information,
+        False,
+        process_id,
+    )
+    if not handle:
+        return ctypes.get_last_error() == access_denied
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 @dataclass(frozen=True)
@@ -141,11 +622,11 @@ def transport_file_sha256(path: Path) -> str:
 
 
 def provider_process_group_running(process_group: int) -> bool:
-    return _process_group_running(process_group)
+    return ProviderProcessPlatform().process_group_running(process_group)
 
 
 def terminate_provider_process_group(process_group: int) -> bool:
-    return _terminate_process_group(process_group)
+    return ProviderProcessPlatform().terminate_process_group(process_group)
 
 
 def request_supervisor_stop(
@@ -155,12 +636,14 @@ def request_supervisor_stop(
     invocation_hash: str,
     ready_schema: str,
     wait_seconds: float = 2.0,
+    process_platform: ProviderProcessPlatform | None = None,
 ) -> bool:
     """Request a verified detached supervisor to reach a signed terminal boundary.
 
     The ready marker is sealed by the operation transport key and binds the PID to
-    the exact invocation.  We additionally verify the live command line before
-    signalling, so a stale/reused PID can never be treated as this provider job.
+    the exact invocation. POSIX verifies the live command line before signalling;
+    Windows uses only the sealed per-operation stop channel and never signals a
+    possibly reused PID from the marker.
     """
 
     receipt_path = operation_directory / "supervisor-exit.json"
@@ -191,41 +674,77 @@ def request_supervisor_stop(
         or process_group != process_id
     ):
         raise ProviderSupervisorError("provider_supervisor_ready_invalid")
+    platform = process_platform or ProviderProcessPlatform()
     request_path = (operation_directory / "supervisor-request.json").resolve()
-    try:
-        live_group = os.getpgid(process_id)
-        command_line = Path(f"/proc/{process_id}/cmdline").read_bytes().split(b"\0")
-    except ProcessLookupError:
-        live_group = None
-        command_line = []
-    except OSError as error:
-        raise ProviderSupervisorError("provider_supervisor_identity_invalid") from error
-    if live_group is not None:
-        if live_group != process_group or str(request_path).encode() not in command_line:
-            raise ProviderSupervisorError("provider_supervisor_identity_invalid")
+    supervisor_running = False
+    if platform.platform_name == "posix":
         try:
-            os.kill(process_id, signal.SIGTERM)
+            live_group = platform.process_group_for_pid(process_id)
+            command_line = Path(f"/proc/{process_id}/cmdline").read_bytes().split(
+                b"\0"
+            )
         except ProcessLookupError:
-            pass
+            live_group = None
+            command_line = []
+        except OSError as error:
+            raise ProviderSupervisorError(
+                "provider_supervisor_identity_invalid"
+            ) from error
+        if live_group is not None:
+            if (
+                live_group != process_group
+                or str(request_path).encode() not in command_line
+            ):
+                raise ProviderSupervisorError(
+                    "provider_supervisor_identity_invalid"
+                )
+            write_supervisor_stop_request(
+                operation_directory / "supervisor-stop.json",
+                key=key,
+                invocation_hash=invocation_hash,
+            )
+            supervisor_running = True
+            try:
+                os.kill(process_id, signal.SIGTERM)
+            except ProcessLookupError:
+                supervisor_running = False
+    elif platform.platform_name == "nt":
+        # The exact sealed operation file is the Windows control channel. Do
+        # not signal a possibly reused PID merely because its numeric value is
+        # present in an old marker.
+        write_supervisor_stop_request(
+            operation_directory / "supervisor-stop.json",
+            key=key,
+            invocation_hash=invocation_hash,
+        )
+        supervisor_running = platform.process_group_running(process_id)
+    else:
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
     deadline = time.monotonic() + wait_seconds
     while not receipt_path.is_file() and time.monotonic() < deadline:
         time.sleep(0.02)
     if receipt_path.is_file():
         return True
-    try:
-        supervisor_running = os.getpgid(process_id) == process_group
-    except ProcessLookupError:
-        supervisor_running = False
-    except OSError as error:
-        raise ProviderSupervisorError(
-            "provider_supervisor_identity_invalid"
-        ) from error
+    if platform.platform_name == "posix":
+        try:
+            supervisor_running = (
+                platform.process_group_for_pid(process_id) == process_group
+            )
+        except ProcessLookupError:
+            supervisor_running = False
+        except OSError as error:
+            raise ProviderSupervisorError(
+                "provider_supervisor_identity_invalid"
+            ) from error
+    else:
+        supervisor_running = platform.process_group_running(process_id)
     if supervisor_running:
         return False
     return _terminate_or_verify_bound_provider_absent(
         operation_directory,
         key=key,
         invocation_hash=invocation_hash,
+        process_platform=platform,
     )
 
 
@@ -236,6 +755,8 @@ def supervisor_request_never_started(
     invocation_hash: str,
     request_schema: str,
     now: float | None = None,
+    platform_name: str | None = None,
+    supervisor_lock_held: Callable[[Path], bool] | None = None,
 ) -> bool:
     """Prove that a durable request aged past its launch window without Popen.
 
@@ -270,7 +791,26 @@ def supervisor_request_never_started(
         < SUPERVISOR_STARTUP_GRACE_SECONDS
     ):
         return False
+    selected_platform = platform_name or os.name
+    if selected_platform == "nt":
+        lock_probe = supervisor_lock_held or (
+            lambda path: _supervisor_lock_is_held(
+                path,
+                platform_name=selected_platform,
+            )
+        )
+        return not lock_probe(operation_directory / "supervisor.lock")
+    if selected_platform != "posix":
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
     return not _supervisor_processes_for_request(request_path.resolve())
+
+
+def _supervisor_lock_is_held(path: Path, *, platform_name: str) -> bool:
+    lock = SupervisorFileLock(path, platform_name=platform_name)
+    if not lock.acquire(blocking=False):
+        return True
+    lock.release()
+    return False
 
 
 def _supervisor_processes_for_request(request_path: Path) -> set[int]:
@@ -318,9 +858,11 @@ def _terminate_or_verify_bound_provider_absent(
     *,
     key: bytes,
     invocation_hash: str,
+    process_platform: ProviderProcessPlatform | None = None,
 ) -> bool:
     """Terminate provider groups bound to this exact sealed operation path."""
 
+    platform = process_platform or ProviderProcessPlatform()
     request_path = (operation_directory / "supervisor-request.json").resolve()
     marker_path = operation_directory / "provider-started.json"
     marker_group: int | None = None
@@ -358,23 +900,38 @@ def _terminate_or_verify_bound_provider_absent(
             raise ProviderSupervisorError("provider_started_marker_invalid")
         marker_group = int(marker["provider_process_group"])
 
-    groups = _provider_groups_for_operation(request_path)
-    if marker_group is not None and _process_group_running(marker_group):
+    groups = _provider_groups_for_operation(
+        request_path,
+        platform_name=platform.platform_name,
+    )
+    if marker_group is not None and platform.process_group_running(marker_group):
         # A reused numeric PGID is never enough: at least one live group member
         # must still carry the exact operation token inherited at Popen.
         if marker_group not in groups:
             return False
         groups.add(marker_group)
     for group in groups:
-        if not _terminate_process_group(group):
+        if not platform.terminate_process_group(group):
             return False
-    remaining = _provider_groups_for_operation(request_path)
+    remaining = _provider_groups_for_operation(
+        request_path,
+        platform_name=platform.platform_name,
+    )
     if remaining:
         return False
-    return marker_group is None or not _process_group_running(marker_group)
+    return marker_group is None or not platform.process_group_running(marker_group)
 
 
-def _provider_groups_for_operation(request_path: Path) -> set[int]:
+def _provider_groups_for_operation(
+    request_path: Path,
+    *,
+    platform_name: str | None = None,
+) -> set[int]:
+    if (platform_name or os.name) != "posix":
+        # A Windows PID marker without a creation identity is not sufficient
+        # authority to terminate a possibly reused process. Keep reconciliation
+        # pending if the owning supervisor did not seal a receipt.
+        return set()
     token = f"{PROVIDER_OPERATION_ENV}={request_path}".encode("utf-8")
     groups: set[int] = set()
     for process_directory in Path("/proc").glob("[0-9]*"):
@@ -659,7 +1216,7 @@ def _publish_exclusive(path: Path, value: bytes) -> bool:
     )
     try:
         with temporary.open("xb") as destination:
-            os.fchmod(destination.fileno(), 0o600)
+            _make_private(temporary, destination.fileno())
             destination.write(value)
             destination.flush()
             os.fsync(destination.fileno())
@@ -674,6 +1231,10 @@ def _publish_exclusive(path: Path, value: bytes) -> bool:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # The file itself has been flushed. Python cannot portably open and
+        # fsync a Windows directory handle.
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -763,49 +1324,61 @@ def _validated_request_paths(
     )
 
 
-def _terminate_provider(process: subprocess.Popen[bytes]) -> int:
-    if process.poll() is None:
+def _terminate_provider(
+    process: subprocess.Popen[bytes],
+    *,
+    process_platform: ProviderProcessPlatform,
+    provider_job: ProviderProcessJob | None,
+) -> int:
+    if provider_job is not None:
+        if not provider_job.terminate():
+            raise ProviderSupervisorError("provider_job_termination_failed")
+    elif process_platform.platform_name == "posix":
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+    else:
+        raise ProviderSupervisorError("provider_windows_job_required")
+    if process.poll() is None:
         try:
-            process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired as error:
+            if process_platform.platform_name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=1.0)
+            else:
+                raise ProviderSupervisorError(
+                    "provider_process_termination_unconfirmed"
+                ) from error
     assert process.returncode is not None
     return process.returncode
 
 
-def _process_group_running(process_group: int) -> bool:
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def _terminate_process_group(process_group: int) -> bool:
+def _terminate_posix_process_group(process_group: int) -> bool:
+    platform = ProviderProcessPlatform(platform_name="posix")
     try:
         os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         return True
     deadline = time.monotonic() + 0.5
-    while _process_group_running(process_group) and time.monotonic() < deadline:
+    while platform.process_group_running(process_group) and time.monotonic() < deadline:
         time.sleep(0.01)
-    if _process_group_running(process_group):
+    if platform.process_group_running(process_group):
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             return True
         deadline = time.monotonic() + 0.5
-        while _process_group_running(process_group) and time.monotonic() < deadline:
+        while (
+            platform.process_group_running(process_group)
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.01)
-    return not _process_group_running(process_group)
+    return not platform.process_group_running(process_group)
 
 
 def _bounded_stdout_drain(
@@ -831,17 +1404,81 @@ def _bounded_stdout_drain(
         stream.close()
 
 
-def _provider_argv_with_result_pipe(
-    argv: list[str], result_write_fd: int
+def _close_descriptors(*descriptors: int | None) -> None:
+    for descriptor in descriptors:
+        if descriptor is None:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _file_exceeds(path: Path, maximum_bytes: int) -> bool:
+    try:
+        return path.stat().st_size > maximum_bytes
+    except FileNotFoundError:
+        return False
+
+
+def _seal_windows_result_file(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    exceeded: threading.Event,
+) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ProviderSupervisorError("provider_supervisor_spool_invalid")
+    if not path.exists():
+        with path.open("xb") as result:
+            _make_private(path, result.fileno())
+            result.flush()
+            os.fsync(result.fileno())
+        return
+    with path.open("r+b", buffering=0) as result:
+        _make_private(path, result.fileno())
+        if path.stat().st_size > maximum_bytes:
+            exceeded.set()
+            result.truncate(maximum_bytes)
+        os.fsync(result.fileno())
+
+
+def _make_private(path: Path, descriptor: int) -> None:
+    if hasattr(os, "fchmod"):
+        os.fchmod(descriptor, 0o600)
+    else:
+        path.chmod(0o600)
+
+
+def provider_result_argv(
+    argv: list[str],
+    *,
+    platform_name: str | None = None,
+    result_path: Path | None = None,
+    result_write_fd: int | None = None,
+    supervisor_process_id: int | None = None,
 ) -> list[str]:
     provider_argv = list(argv)
     try:
         result_index = provider_argv.index("--output-last-message") + 1
     except (ValueError, IndexError) as error:
         raise ProviderSupervisorError("provider_supervisor_request_invalid") from error
-    provider_argv[result_index] = (
-        f"/proc/{os.getpid()}/fd/{result_write_fd}"
-    )
+    selected_platform = platform_name or os.name
+    if selected_platform == "posix":
+        if result_write_fd is None:
+            raise ProviderSupervisorError("provider_supervisor_result_pipe_invalid")
+        owner_pid = (
+            os.getpid()
+            if supervisor_process_id is None
+            else supervisor_process_id
+        )
+        provider_argv[result_index] = f"/proc/{owner_pid}/fd/{result_write_fd}"
+    elif selected_platform == "nt":
+        if result_path is None:
+            raise ProviderSupervisorError("provider_supervisor_result_path_invalid")
+        provider_argv[result_index] = str(result_path)
+    else:
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
     return provider_argv
 
 
@@ -853,12 +1490,14 @@ def _write_phase_marker(
     key: bytes,
     provider_process: subprocess.Popen[bytes] | None = None,
     operation_path: Path | None = None,
+    process_platform: ProviderProcessPlatform | None = None,
 ) -> None:
+    platform = process_platform or ProviderProcessPlatform()
     payload: dict[str, object] = {
         "schema_ref": schema_ref,
         "invocation_hash": invocation_hash,
         "supervisor_process_id": os.getpid(),
-        "supervisor_process_group": os.getpgrp(),
+        "supervisor_process_group": platform.current_process_group(),
     }
     if provider_process is not None:
         if operation_path is None:
@@ -866,15 +1505,23 @@ def _write_phase_marker(
         payload.update(
             {
                 "provider_process_id": provider_process.pid,
-                "provider_process_group": os.getpgid(provider_process.pid),
+                "provider_process_group": platform.process_group_for_pid(
+                    provider_process.pid
+                ),
                 "provider_operation_path": str(operation_path.resolve()),
             }
         )
     _write_signed_envelope(path, payload, key)
 
 
-def supervise(request_path: Path) -> None:
+def supervise(
+    request_path: Path,
+    *,
+    process_platform: ProviderProcessPlatform | None = None,
+    provider_job_factory: ProviderProcessJobFactory | None = None,
+) -> None:
     request_path = request_path.resolve()
+    platform = process_platform or ProviderProcessPlatform()
     key = _read_transport_key(_operation_key_path(request_path.parent))
     payload = read_supervisor_request(request_path, key)
     generic_schema = payload.get("schema_ref") == SUPERVISOR_REQUEST_SCHEMA_V2
@@ -892,8 +1539,7 @@ def supervise(request_path: Path) -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    with paths["lock_path"].open("a+b") as lock_stream:
-        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+    with SupervisorFileLock(paths["lock_path"]):
         if paths["receipt_path"].exists():
             return
         if paths["started_path"].exists():
@@ -907,6 +1553,7 @@ def supervise(request_path: Path) -> None:
             ),
             invocation_hash=invocation_hash,
             key=key,
+            process_platform=platform,
         )
         _supervise_locked(
             argv=argv,
@@ -930,6 +1577,8 @@ def supervise(request_path: Path) -> None:
                 if generic_schema
                 else SUPERVISOR_EXIT_SCHEMA
             ),
+            process_platform=platform,
+            provider_job_factory=provider_job_factory,
         )
 
 
@@ -945,6 +1594,8 @@ def _supervise_locked(
     stop_requested: Callable[[], bool],
     started_schema_ref: str,
     exit_schema_ref: str,
+    process_platform: ProviderProcessPlatform,
+    provider_job_factory: ProviderProcessJobFactory | None,
 ) -> None:
     prompt_path = paths["prompt_path"]
     schema_path = paths["schema_path"]
@@ -964,15 +1615,45 @@ def _supervise_locked(
         or result_temporary.exists()
     ):
         raise ProviderSupervisorError("provider_supervisor_spool_invalid")
-    result_read_fd, result_write_fd = os.pipe()
-    provider_argv = _provider_argv_with_result_pipe(argv, result_write_fd)
-    with prompt_path.open("rb", buffering=0) as prompt_stream, stdout_path.open(
-        "xb", buffering=0
-    ) as stdout_stream, result_temporary.open("xb", buffering=0) as result_stream:
+    selected_platform = process_platform.platform_name
+    result_read_fd: int | None = None
+    result_write_fd: int | None = None
+    if selected_platform == "posix":
+        result_read_fd, result_write_fd = os.pipe()
+        provider_argv = provider_result_argv(
+            argv,
+            platform_name=selected_platform,
+            result_write_fd=result_write_fd,
+        )
+    elif selected_platform == "nt":
+        provider_argv = provider_result_argv(
+            argv,
+            platform_name=selected_platform,
+            result_path=result_temporary,
+        )
+    else:
+        raise ProviderSupervisorError("provider_supervisor_platform_unsupported")
+    with ExitStack() as stack:
+        provider_job: ProviderProcessJob | None = None
+        if selected_platform == "nt":
+            provider_job = (
+                provider_job_factory or WindowsProviderJob
+            )()
+            stack.callback(provider_job.close)
+        prompt_stream = stack.enter_context(
+            prompt_path.open("rb", buffering=0)
+        )
+        stdout_stream = stack.enter_context(
+            stdout_path.open("xb", buffering=0)
+        )
+        result_stream = (
+            stack.enter_context(result_temporary.open("xb", buffering=0))
+            if selected_platform == "posix"
+            else None
+        )
         if stop_requested():
             termination_reason = "stopped"
-            os.close(result_read_fd)
-            os.close(result_write_fd)
+            _close_descriptors(result_read_fd, result_write_fd)
         else:
             try:
                 operation_path = (
@@ -980,17 +1661,20 @@ def _supervise_locked(
                 ).resolve()
                 provider_environment = dict(os.environ)
                 provider_environment[PROVIDER_OPERATION_ENV] = str(operation_path)
-                process = subprocess.Popen(
-                    provider_argv,
-                    stdin=prompt_stream,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    env=provider_environment,
-                    start_new_session=True,
+                spawn_options: dict[str, object] = {
+                    "stdin": prompt_stream,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.DEVNULL,
+                    "env": provider_environment,
+                    **process_platform.provider_spawn_options(),
+                }
+                process = (
+                    provider_job.spawn(provider_argv, **spawn_options)
+                    if provider_job is not None
+                    else subprocess.Popen(provider_argv, **spawn_options)
                 )
             except OSError:
-                os.close(result_read_fd)
-                os.close(result_write_fd)
+                _close_descriptors(result_read_fd, result_write_fd)
                 termination_reason = "launch_failed"
                 returncode = 127
             else:
@@ -1001,6 +1685,7 @@ def _supervise_locked(
                     key=key,
                     provider_process=process,
                     operation_path=operation_path,
+                    process_platform=process_platform,
                 )
                 assert process.stdout is not None
                 stdout_drainer = threading.Thread(
@@ -1013,58 +1698,99 @@ def _supervise_locked(
                         stdout_errors,
                     ),
                 )
-                result_drainer = threading.Thread(
-                    target=_bounded_stdout_drain,
-                    args=(
-                        os.fdopen(result_read_fd, "rb", buffering=0),
-                        result_stream,
-                        result_max_bytes,
-                        result_exceeded,
-                        result_errors,
-                    ),
+                result_drainer = (
+                    threading.Thread(
+                        target=_bounded_stdout_drain,
+                        args=(
+                            os.fdopen(result_read_fd, "rb", buffering=0),
+                            result_stream,
+                            result_max_bytes,
+                            result_exceeded,
+                            result_errors,
+                        ),
+                    )
+                    if result_read_fd is not None and result_stream is not None
+                    else None
                 )
                 stdout_drainer.start()
-                result_drainer.start()
+                if result_drainer is not None:
+                    result_drainer.start()
                 deadline = time.monotonic() + timeout_seconds
-                while process.poll() is None:
+                while process.poll() is None or (
+                    provider_job is not None
+                    and provider_job.active_process_count() > 0
+                ):
                     if stop_requested():
                         termination_reason = "stopped"
-                        returncode = _terminate_provider(process)
+                        returncode = _terminate_provider(
+                            process,
+                            process_platform=process_platform,
+                            provider_job=provider_job,
+                        )
                         break
                     if time.monotonic() >= deadline:
                         termination_reason = "timeout"
-                        returncode = _terminate_provider(process)
+                        returncode = _terminate_provider(
+                            process,
+                            process_platform=process_platform,
+                            provider_job=provider_job,
+                        )
                         break
                     if stdout_exceeded.is_set() or result_exceeded.is_set():
                         termination_reason = "output_limit"
-                        returncode = _terminate_provider(process)
+                        returncode = _terminate_provider(
+                            process,
+                            process_platform=process_platform,
+                            provider_job=provider_job,
+                        )
                         break
-                    try:
-                        process.wait(timeout=0.05)
-                    except subprocess.TimeoutExpired:
+                    if (
+                        selected_platform == "nt"
+                        and _file_exceeds(result_temporary, result_max_bytes)
+                    ):
+                        result_exceeded.set()
                         continue
-                else:
-                    assert process.returncode is not None
-                    returncode = process.returncode
+                    if process.poll() is None:
+                        try:
+                            process.wait(timeout=0.05)
+                        except subprocess.TimeoutExpired:
+                            continue
+                    else:
+                        time.sleep(0.05)
                 if termination_reason == "completed":
                     assert process.returncode is not None
                     returncode = process.returncode
-                if _process_group_running(process.pid):
+                if provider_job is None and process_platform.process_group_running(
+                    process.pid
+                ):
                     termination_reason = "descendant_process"
-                    if not _terminate_process_group(process.pid):
+                    if not process_platform.terminate_process_group(process.pid):
                         raise ProviderSupervisorError(
                             "provider_descendant_cleanup_failed"
                         )
-                os.close(result_write_fd)
+                _close_descriptors(result_write_fd)
                 stdout_drainer.join(timeout=1.0)
-                result_drainer.join(timeout=1.0)
-                if stdout_drainer.is_alive() or result_drainer.is_alive():
-                    _terminate_process_group(process.pid)
-                    stdout_drainer.join(timeout=1.0)
+                if result_drainer is not None:
                     result_drainer.join(timeout=1.0)
+                if stdout_drainer.is_alive() or (
+                    result_drainer is not None and result_drainer.is_alive()
+                ):
+                    if provider_job is not None:
+                        if not provider_job.terminate():
+                            raise ProviderSupervisorError(
+                                "provider_job_termination_failed"
+                            )
+                    else:
+                        process_platform.terminate_process_group(process.pid)
+                    stdout_drainer.join(timeout=1.0)
+                    if result_drainer is not None:
+                        result_drainer.join(timeout=1.0)
                 if (
                     stdout_drainer.is_alive()
-                    or result_drainer.is_alive()
+                    or (
+                        result_drainer is not None
+                        and result_drainer.is_alive()
+                    )
                     or stdout_errors
                     or result_errors
                 ):
@@ -1073,9 +1799,23 @@ def _supervise_locked(
                     )
                 if stdout_exceeded.is_set() or result_exceeded.is_set():
                     termination_reason = "output_limit"
+        if (
+            provider_job is not None
+            and provider_job.active_process_count() != 0
+        ):
+            raise ProviderSupervisorError("provider_job_not_empty")
         os.fsync(stdout_stream.fileno())
-        os.fsync(result_stream.fileno())
+        if result_stream is not None:
+            os.fsync(result_stream.fileno())
         input_bytes = prompt_stream.tell()
+    if selected_platform == "nt":
+        _seal_windows_result_file(
+            result_temporary,
+            maximum_bytes=result_max_bytes,
+            exceeded=result_exceeded,
+        )
+        if result_exceeded.is_set():
+            termination_reason = "output_limit"
     os.replace(result_temporary, result_path)
     _fsync_directory(result_path.parent)
     if (

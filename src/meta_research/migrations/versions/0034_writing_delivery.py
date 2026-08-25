@@ -177,6 +177,12 @@ def upgrade() -> None:
         sa.Column("request_hash", sa.String(64), nullable=False),
         sa.Column("status", sa.String(24), nullable=False),
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column(
+            "reconciliation_generation",
+            sa.Integer(),
+            nullable=False,
+            server_default="0",
+        ),
         sa.Column("provider_request_hash", sa.String(64), nullable=True),
         sa.Column("operation_receipt_ref", sa.String(96), nullable=False, unique=True),
         sa.Column("execution_receipt_ref", sa.String(96), nullable=True, unique=True),
@@ -197,6 +203,7 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint("draft_revision >= 1"),
         sa.CheckConstraint("attempt_count >= 0"),
+        sa.CheckConstraint("reconciliation_generation >= 0"),
         sa.CheckConstraint(
             "(status = 'completed' AND completed_at IS NOT NULL) OR "
             "(status != 'completed' AND completed_at IS NULL)"

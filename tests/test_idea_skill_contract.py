@@ -207,7 +207,8 @@ def test_runtime_binding_fixes_harness_artifact_and_output_contract(
 
     assert first_binding.harness_adapter_ref != second_binding.harness_adapter_ref
     assert "entry=" in first_binding.harness_adapter_ref
-    assert "version=codex-test 1" in first_binding.harness_adapter_ref
+    assert "identity=artifact-manifest" in first_binding.harness_adapter_ref
+    assert "version=" not in first_binding.harness_adapter_ref
     assert "artifact_manifest_sha256=" in first_binding.harness_adapter_ref
     assert any(
         binding.startswith("harness-artifact:")
@@ -1364,8 +1365,13 @@ def test_supervisor_owns_deadline_after_daemon_response_loss(
         timeout_seconds=0.2,
         process_runner=forbidden_replay,
     )
-    with pytest.raises(IdeaSkillUnavailable, match="codex_operation_failed"):
+    with pytest.raises(
+        IdeaSkillUnavailable, match="codex_operation_timeout"
+    ) as blocked:
         restarted.generate_draft(request)
+    assert blocked.value.recovery_checkpoint is not None
+    assert blocked.value.recovery_checkpoint["termination_reason"] == "timeout"
+    assert blocked.value.recovery_checkpoint["supervisor_receipt_hash"]
     assert forbidden_replay.calls == []
 
 

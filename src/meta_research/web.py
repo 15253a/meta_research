@@ -41,6 +41,7 @@ from meta_research.quest_drafting import (
     INTENT_MESSAGE_MAX_LENGTH,
     QUESTION_FIELD_MAX_LENGTHS,
 )
+from meta_research.runtime_protection import RuntimeProtectionUnavailable
 from meta_research.semantic_mcp import MCP_PROTOCOL_VERSION
 
 
@@ -1287,15 +1288,26 @@ def create_app(
     def internal_doctor() -> dict[str, object]:
         harness = runtime.harnesses.query_status()
         target_root = runtime.query_target_root_readiness()
+        runtime_protection = runtime.query_runtime_observability()
+        inhibitor = runtime_protection.get("inhibitor")
+        capability = (
+            inhibitor.get("capability")
+            if isinstance(inhibitor, dict)
+            else None
+        )
         return {
             **harness,
             "status": (
                 "ready"
                 if harness.get("status") == "ready"
                 and target_root.get("status") == "ready"
+                and runtime_protection.get("status") == "ready"
+                and isinstance(capability, dict)
+                and capability.get("status") == "ready"
                 else "unavailable"
             ),
             "target_root": target_root,
+            "runtime_protection": runtime_protection,
         }
 
     @app.post("/internal/harness-conformance")
@@ -1580,11 +1592,31 @@ def create_app(
             or receipt.get("receipt_ref") != authorization.confirmation_receipt_ref
         ):
             raise OwnerConflict("authorization_confirmation_invalid")
-        return runtime.owners.human_collaboration.decide_capability_authorization(
+        decision = authorization.model_dump()
+        if decision.get("capability") == "opentelemetry_export":
+            scope = decision.get("scope")
+            if not isinstance(scope, dict):
+                raise OwnerConflict("telemetry_authorization_scope_invalid")
+            runtime.validate_telemetry_authorization_request(
+                scope_ref=str(command["scope_ref"]),
+                capability="opentelemetry_export",
+                decision=str(decision.get("decision")),
+                scope=scope,
+                confirmation_receipt_ref=authorization.confirmation_receipt_ref,
+            )
+        recorded = runtime.owners.human_collaboration.decide_capability_authorization(
             str(command["scope_ref"]),
-            authorization.model_dump(),
+            decision,
             _idempotency_key(request),
         )
+        if recorded.get("capability") == "opentelemetry_export":
+            try:
+                runtime.apply_telemetry_authorization(recorded)
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
+            except (OSError, ValueError) as error:
+                raise OwnerConflict("telemetry_provider_unavailable") from error
+        return recorded
 
     @app.post("/api/v1/quest-initializations", status_code=201)
     async def create_quest_initialization(

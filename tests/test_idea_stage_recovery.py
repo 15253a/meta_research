@@ -311,7 +311,18 @@ def test_restart_resumes_each_durable_boundary_without_provider_replay(
         ):
             before = runtime.feed.current_revision()
             assert runtime.idea_stage.process_once()
-            assert runtime.feed.current_revision() == before + expected_feed_delta
+            page = runtime.feed.read_after(before)
+            core_events = tuple(
+                event
+                for event in page.events
+                if not event.event_type.startswith(
+                    (
+                        "agent_runtime.power_inhibitor_",
+                        "agent_runtime.runtime_",
+                    )
+                )
+            )
+            assert len(core_events) == expected_feed_delta
             assert runtime.idea_stage.query_current()["outcome_acceptance"][
                 "status"
             ] == expected_status

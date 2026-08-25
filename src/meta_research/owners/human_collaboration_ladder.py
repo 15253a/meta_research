@@ -26,6 +26,13 @@ from meta_research.quest_drafting import (
     IntentDraftingProvider,
     IntentTurnRequest,
 )
+from meta_research.runtime_protection import (
+    RuntimeBoundary,
+    RuntimeEffectIdentity,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+    record_runtime_boundary,
+)
 from meta_research.writing_contract import (
     WRITING_DOCUMENT_TYPES,
     WRITING_RESEARCH_SNAPSHOT_SCHEMA,
@@ -81,6 +88,55 @@ _HARD_COMMAND_KINDS = {
     "writing_external_delivery",
 }
 _MAX_PENDING_COMPANION_TURNS = 64
+
+
+def _companion_operation_ref(interaction_ref: str) -> str:
+    """Return the logical provider job shared by every recovery Attempt."""
+
+    return interaction_ref
+
+
+def _companion_runtime_effect(
+    *,
+    scope_ref: str,
+    interaction_ref: str,
+    attempt_count: int,
+    job_ref: str,
+) -> RuntimeEffectIdentity:
+    reconciling = attempt_count > 1
+    return RuntimeEffectIdentity(
+        responsibility_ref=(
+            "companion_reconciliation_"
+            if reconciling
+            else "companion_responsibility_"
+        )
+        + canonical_hash(
+            {
+                "scope_ref": scope_ref,
+                "interaction_ref": interaction_ref,
+                "attempt_count": attempt_count,
+                "job_ref": job_ref,
+            }
+        ),
+        owner_scope="human_collaboration",
+        root_run_ref=scope_ref,
+        attempt_ref=f"companion_attempt_{attempt_count}",
+        fence_ref=None,
+        operation_ref=job_ref,
+        effect_kind=(
+            "runtime_reconciliation" if reconciling else "drafting_claim"
+        ),
+    )
+
+
+def _companion_provider_outcome_unknown(reason_code: str) -> bool:
+    return reason_code in {
+        "codex_cli_io_unavailable",
+        "codex_cli_stopped",
+        "codex_job_outcome_unknown",
+        "codex_operation_reconciliation_pending",
+        "provider_outcome_unknown",
+    }
 
 
 def broad_research_target_assertion(
@@ -186,6 +242,7 @@ class SQLiteHumanCollaborationLadder:
         writing_delivery_binding_validator: (
             Callable[[dict[str, object]], None] | None
         ) = None,
+        runtime_protection: RuntimeProtection | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -196,6 +253,7 @@ class SQLiteHumanCollaborationLadder:
         self._writing_delivery_binding_validator = (
             writing_delivery_binding_validator
         )
+        self._runtime_protection = runtime_protection
         with self._database.write() as connection:
             recovered = connection.execute(
                 text(
@@ -355,14 +413,55 @@ class SQLiteHumanCollaborationLadder:
             updated = connection.execute(
                 text(
                     "UPDATE hc_companion_turns SET assistant_status = 'processing', "
-                    "attempt_count = attempt_count + 1, updated_at = :now WHERE "
+                    "attempt_count = attempt_count + 1, reason_code = NULL, "
+                    "updated_at = :now WHERE "
                     "interaction_ref = :interaction_ref AND assistant_status = 'queued'"
                 ),
                 {"interaction_ref": row.interaction_ref, "now": time.time()},
             )
             if not updated.rowcount:
                 return False
-        job_ref = f"{row.interaction_ref}:claim:1"
+        job_ref = _companion_operation_ref(str(row.interaction_ref))
+        attempt_count = int(row.attempt_count) + 1
+        protection_effect = _companion_runtime_effect(
+            scope_ref=str(row.scope_ref),
+            interaction_ref=str(row.interaction_ref),
+            attempt_count=attempt_count,
+            job_ref=job_ref,
+        )
+        if self._runtime_protection is not None:
+            try:
+                self._runtime_protection.acquire(protection_effect)
+            except RuntimeProtectionUnavailable as error:
+                with self._database.write() as connection:
+                    failed = connection.execute(
+                        text(
+                            "UPDATE hc_companion_turns SET assistant_status = "
+                            "'failed', reason_code = :reason_code, updated_at = "
+                            ":now WHERE interaction_ref = :interaction_ref AND "
+                            "assistant_status = 'processing'"
+                        ),
+                        {
+                            "interaction_ref": row.interaction_ref,
+                            "reason_code": error.code,
+                            "now": time.time(),
+                        },
+                    )
+                    if not failed.rowcount:
+                        return False
+                    self._finish_companion_turn(
+                        connection,
+                        row.interaction_ref,
+                        "human_collaboration.companion_reply_unavailable",
+                    )
+                    boundary = self._record_companion_runtime_boundary(
+                        connection,
+                        effect=protection_effect,
+                        interaction_ref=str(row.interaction_ref),
+                        attempt_count=attempt_count,
+                    )
+                self._finish_companion_runtime_boundary(boundary)
+                return True
         try:
             context = (
                 {
@@ -422,27 +521,56 @@ class SQLiteHumanCollaborationLadder:
                 if isinstance(error, (DraftingUnavailable, OwnerConflict))
                 else "companion_provider_unavailable"
             )
+            outcome_unknown = _companion_provider_outcome_unknown(reason_code)
             with self._database.write() as connection:
-                connection.execute(
+                transitioned = connection.execute(
                     text(
-                        "UPDATE hc_companion_turns SET assistant_status = 'failed', "
-                        "reason_code = :reason_code, updated_at = :now WHERE "
+                        "UPDATE hc_companion_turns SET assistant_status = :status, "
+                        "reason_code = :stored_reason_code, updated_at = :now WHERE "
                         "interaction_ref = :interaction_ref AND assistant_status = "
                         "'processing'"
                     ),
                     {
                         "interaction_ref": row.interaction_ref,
-                        "reason_code": reason_code,
+                        "status": "processing" if outcome_unknown else "failed",
+                        "stored_reason_code": reason_code,
                         "now": time.time(),
                     },
                 )
-                self._finish_companion_turn(
-                    connection,
-                    row.interaction_ref,
-                    "human_collaboration.companion_reply_failed",
-                )
+                if not transitioned.rowcount:
+                    return False
+                if outcome_unknown:
+                    connection.execute(
+                        text(
+                            "UPDATE human_collaboration_state SET revision = "
+                            "revision + 1 WHERE singleton = 'owner'"
+                        )
+                    )
+                    self._feed.record(
+                        connection,
+                        "human_collaboration.companion_reply_reconciliation_required",
+                        {
+                            "interaction_ref": row.interaction_ref,
+                            "reason_code": reason_code,
+                        },
+                    )
+                    boundary = None
+                else:
+                    self._finish_companion_turn(
+                        connection,
+                        row.interaction_ref,
+                        "human_collaboration.companion_reply_failed",
+                    )
+                    boundary = self._record_companion_runtime_boundary(
+                        connection,
+                        effect=protection_effect,
+                        interaction_ref=str(row.interaction_ref),
+                        attempt_count=attempt_count,
+                    )
+            if boundary is not None:
+                self._finish_companion_runtime_boundary(boundary)
             finish_job = getattr(self._drafting_provider, "finish_job", None)
-            if callable(finish_job):
+            if callable(finish_job) and not outcome_unknown:
                 finish_job(job_ref)
             return True
         with self._database.write() as connection:
@@ -536,6 +664,13 @@ class SQLiteHumanCollaborationLadder:
                             "source_interaction_ref": row.interaction_ref,
                         },
                     )
+            boundary = self._record_companion_runtime_boundary(
+                connection,
+                effect=protection_effect,
+                interaction_ref=str(row.interaction_ref),
+                attempt_count=attempt_count,
+            )
+        self._finish_companion_runtime_boundary(boundary)
         finish_job = getattr(self._drafting_provider, "finish_job", None)
         if callable(finish_job):
             finish_job(job_ref)
@@ -555,6 +690,109 @@ class SQLiteHumanCollaborationLadder:
         self._feed.record(
             connection, event_type, {"interaction_ref": interaction_ref}
         )
+
+    def _record_companion_runtime_boundary(
+        self,
+        connection,
+        *,
+        effect: RuntimeEffectIdentity,
+        interaction_ref: str,
+        attempt_count: int,
+    ) -> tuple[tuple[str, RuntimeBoundary, str | None], ...]:
+        if self._runtime_protection is None:
+            return ()
+        turn = connection.execute(
+            text(
+                "SELECT * FROM hc_companion_turns WHERE interaction_ref = "
+                ":interaction_ref"
+            ),
+            {"interaction_ref": interaction_ref},
+        ).first()
+        if (
+            turn is None
+            or int(turn.attempt_count) != attempt_count
+            or turn.assistant_status not in {"completed", "failed"}
+        ):
+            raise OwnerConflict("companion_runtime_boundary_invalid")
+        terminal_evidence = {
+            "interaction_ref": interaction_ref,
+            "session_ref": str(turn.session_ref),
+            "attempt_count": attempt_count,
+            "assistant_status": str(turn.assistant_status),
+            "message_hash": str(turn.message_hash),
+            "assistant_content_hash": turn.assistant_content_hash,
+            "adapter_kind": turn.adapter_kind,
+            "reason_code": turn.reason_code,
+            "operation_ref": effect.operation_ref,
+        }
+        owner_evidence_ref = "companion_terminal_" + canonical_hash(
+            terminal_evidence
+        )
+        record_runtime_boundary(
+            connection,
+            identity=effect,
+            boundary="terminal",
+            owner_evidence_ref=owner_evidence_ref,
+        )
+        boundaries: list[tuple[str, RuntimeBoundary, str | None]] = [
+            (effect.responsibility_ref, "terminal", None)
+        ]
+        for predecessor_attempt in range(1, attempt_count):
+            predecessor = _companion_runtime_effect(
+                scope_ref=effect.root_run_ref,
+                interaction_ref=interaction_ref,
+                attempt_count=predecessor_attempt,
+                job_ref=effect.operation_ref,
+            )
+            predecessor_state = connection.execute(
+                text(
+                    "SELECT status, boundary FROM "
+                    "ar_execution_responsibilities WHERE responsibility_ref = "
+                    ":responsibility_ref"
+                ),
+                {"responsibility_ref": predecessor.responsibility_ref},
+            ).first()
+            if predecessor_state is None or predecessor_state.status == "finished":
+                continue
+            try:
+                record_runtime_boundary(
+                    connection,
+                    identity=predecessor,
+                    boundary="permanent_fence",
+                    owner_evidence_ref="companion_reconciled_"
+                    + canonical_hash(
+                        {
+                            "operation_ref": effect.operation_ref,
+                            "terminal_owner_evidence_ref": owner_evidence_ref,
+                            "predecessor_responsibility_ref": (
+                                predecessor.responsibility_ref
+                            ),
+                            "resolved_attempt": attempt_count,
+                            "predecessor_attempt": predecessor_attempt,
+                        }
+                    ),
+                )
+            except RuntimeProtectionUnavailable as error:
+                if error.code != "runtime_responsibility_not_found":
+                    raise
+            else:
+                boundaries.append(
+                    (predecessor.responsibility_ref, "permanent_fence", None)
+                )
+        return tuple(boundaries)
+
+    def _finish_companion_runtime_boundary(
+        self,
+        boundaries: tuple[tuple[str, RuntimeBoundary, str | None], ...],
+    ) -> None:
+        if self._runtime_protection is None:
+            return
+        for responsibility_ref, boundary, checkpoint_ref in boundaries:
+            self._runtime_protection.finish(
+                responsibility_ref,
+                boundary=boundary,
+                checkpoint_ref=checkpoint_ref,
+            )
 
     def query_companion(self, scope_ref: str) -> dict[str, object]:
         scope_ref = _scope_ref(scope_ref, "companion_scope_required")

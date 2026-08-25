@@ -162,6 +162,55 @@ def _intent(quest_ref: str, suffix: str) -> ExperimentIntent:
     )
 
 
+def _resume_managed_experiment(runtime, *, quest_ref: str, run_ref: str) -> None:
+    foreground = runtime.owners.advancement_engine.query_foreground(quest_ref)
+    assert foreground is not None
+    managed = runtime.owners.agent_runtime.query_managed_run(run_ref)
+    assert managed is not None
+    resume_key = "resume-experiment:" + hashlib.sha256(
+        f"{run_ref}:{managed['attempt_ref']}".encode("utf-8")
+    ).hexdigest()[:32]
+    payload = {
+        "action": "resume",
+        "target": {
+            "target_scope": "run",
+            "quest_ref": quest_ref,
+            "cycle_ref": foreground["cycle_ref"],
+            "question_ref": foreground["question_ref"],
+            "epoch": foreground["epoch"],
+            "run_ref": run_ref,
+        },
+        "reason": "operator_requested",
+    }
+    human = runtime.owners.human_collaboration
+    drafted = human.create_command_draft(
+        f"quest:{quest_ref}",
+        {"command_kind": "research_control", "payload": payload},
+        f"{resume_key}:draft",
+    )
+    previewed = human.preview_command(
+        drafted["intent_id"],
+        drafted["draft_revision"],
+        drafted["draft_hash"],
+        f"{resume_key}:preview",
+    )
+    preview = previewed["impact_preview"]
+    assert preview is not None
+    confirmed = human.confirm_command(
+        drafted["intent_id"],
+        drafted["draft_revision"],
+        drafted["draft_hash"],
+        preview["preview_ref"],
+        preview["preview_hash"],
+        f"{resume_key}:confirm",
+    )
+    human.execute_confirmed_command(
+        confirmed["intent_id"],
+        confirmed["confirmation_receipt"]["receipt_ref"],
+        f"{resume_key}:execute",
+    )
+
+
 def _provider_request(runtime, run) -> ExperimentProviderRequest:
     domain = runtime.owners.research_graph.query_experiment(
         run.evaluation_attempt_ref
@@ -412,6 +461,7 @@ def test_provider_terminal_spool_reconciles_after_lost_ar_ack_without_replay(
     # The provider completed and sealed its outcome, but AR never committed the ACK.
     first_provider.execute(_provider_request(first, running), lambda _event: None)
     assert runner.with_suffix(".count").read_text(encoding="utf-8") == "1"
+    assert first.query_runtime_observability()["inhibitor"]["active_count"] == 1
     first.close()
 
     restarted_provider = BuiltinMicroExperimentProvider(
@@ -445,6 +495,9 @@ def test_provider_terminal_spool_reconciles_after_lost_ar_ack_without_replay(
             for event in completed["execution"]["events"]
         )
         assert runner.with_suffix(".count").read_text(encoding="utf-8") == "1"
+        assert restarted.query_runtime_observability()["inhibitor"][
+            "active_count"
+        ] == 0
     finally:
         restarted.close()
 
@@ -494,6 +547,7 @@ def test_graceful_runtime_stop_detaches_active_provider_and_restart_reconciles(
     )
     assert interrupted["execution"]["status"] == "running"
     assert interrupted["execution"]["failure"] is None
+    assert first.query_runtime_observability()["inhibitor"]["active_count"] == 1
     operation_ref = interrupted["execution"]["provider_operation_ref"]
     attempt_ref = interrupted["execution"]["attempt_ref"]
     first.close()
@@ -535,6 +589,9 @@ def test_graceful_runtime_stop_detaches_active_provider_and_restart_reconciles(
 
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         assert receipt["payload"]["termination_reason"] == "completed"
+        assert restarted.query_runtime_observability()["inhibitor"][
+            "active_count"
+        ] == 0
     finally:
         restarted.close()
 
@@ -749,7 +806,7 @@ def test_reconciliation_pending_requeues_the_same_ar_attempt_without_failure(
         runtime.close()
 
 
-def test_verified_terminal_failure_retries_with_new_operation_and_same_domain(
+def test_verified_terminal_failure_waits_for_explicit_resume_with_same_domain(
     tmp_path: Path,
 ) -> None:
     runner = _write_runner(tmp_path / "retry-runner", mode="fail_once")
@@ -778,6 +835,7 @@ def test_verified_terminal_failure_retries_with_new_operation_and_same_domain(
         current = replacement["execution"]
         assert replacement["identities"] == identities
         assert current["status"] == "admitted"
+        assert current["managed_status"] == "suspended"
         assert current["run_ref"] == original["run_ref"]
         assert current["attempt_generation"] == 2
         assert current["attempt_ref"] != original["attempt_ref"]
@@ -790,6 +848,8 @@ def test_verified_terminal_failure_retries_with_new_operation_and_same_domain(
         assert current["provider_operation_retry_permitted"] is False
         assert replacement["assets"]["status"] == "not_attempted"
         assert replacement["formal_measurement"]["status"] == "not_attempted"
+        assert not runtime.experiment.process_once()
+        assert runner.with_suffix(".count").read_text(encoding="utf-8") == "1"
 
         with pytest.raises(OwnerConflict, match="experiment_fence_stale"):
             runtime.owners.agent_runtime.record_experiment_observation(
@@ -801,6 +861,11 @@ def test_verified_terminal_failure_retries_with_new_operation_and_same_domain(
                 observed_at=time.time(),
             )
 
+        _resume_managed_experiment(
+            runtime,
+            quest_ref=quest["quest_ref"],
+            run_ref=current["run_ref"],
+        )
         for _step in range(3):
             assert runtime.experiment.process_once()
         completed = runtime.experiment.query(identities["evaluation_attempt_ref"])
@@ -834,13 +899,15 @@ def test_unverified_provider_failure_cannot_authorize_a_second_operation(
             "provider-start-unverified-terminal",
         )
         assert runtime.experiment.process_once()
-        failed = runtime.experiment.query(
+        held = runtime.experiment.query(
             admitted["identities"]["evaluation_attempt_ref"]
         )
-        assert failed["execution"]["status"] == "failed"
-        assert failed["execution"]["attempt_generation"] == 1
-        assert failed["execution"]["provider_operation_generation"] == 1
-        assert failed["formal_measurement"]["status"] == "not_attempted"
+        assert held["execution"]["status"] == "running"
+        assert held["execution"]["managed_status"] == "running"
+        assert held["execution"]["failure"] is None
+        assert held["execution"]["attempt_generation"] == 1
+        assert held["execution"]["provider_operation_generation"] == 1
+        assert held["formal_measurement"]["status"] == "not_attempted"
         assert provider.calls == 1
         assert not runtime.experiment.process_once()
     finally:
@@ -1199,7 +1266,7 @@ def test_public_tail_is_bounded_but_log_asset_contains_all_durable_stdout(
         ("descendant", "experiment_provider_descendant_process"),
     ],
 )
-def test_provider_safety_failures_are_drained_and_never_form_metric_result(
+def test_provider_safety_failures_suspend_run_and_never_form_metric_result(
     tmp_path: Path,
     mode: str,
     expected_code: str,
@@ -1228,36 +1295,28 @@ def test_provider_safety_failures_are_drained_and_never_form_metric_result(
         assert runtime.experiment.process_once()
         assert time.monotonic() - started_at < 2.0
 
-        if mode == "timeout":
-            replacement = runtime.experiment.query(
-                admitted["identities"]["evaluation_attempt_ref"]
-            )["execution"]
-            assert replacement["status"] == "admitted"
-            assert replacement["attempt_generation"] == 2
-            assert replacement["root_session_ref"] == admitted["execution"][
-                "root_session_ref"
-            ]
-            assert replacement["provider_operation_generation"] == 2
-            assert runtime.experiment.process_once()
-
-        failed = runtime.experiment.query(
+        waiting = runtime.experiment.query(
             admitted["identities"]["evaluation_attempt_ref"]
         )
-        assert failed["execution"]["status"] == "failed"
-        assert failed["execution"]["failure"] == {"code": expected_code}
-        assert failed["execution"]["stdout_observation"]["complete"] is False
-        if expected_code in {
-            "experiment_provider_output_limit",
-            "experiment_provider_output_invalid",
-        }:
-            assert failed["execution"]["stdout_observation"]["complete"] is False
-            assert failed["execution"]["stdout_observation"]["truncated"] is True
-        assert failed["assets"]["status"] == "not_attempted"
-        assert failed["formal_measurement"] == {
+        execution = waiting["execution"]
+        assert execution["status"] == "admitted"
+        assert execution["managed_status"] == "suspended"
+        assert execution["attempt_generation"] == 2
+        assert execution["root_session_ref"] == admitted["execution"][
+            "root_session_ref"
+        ]
+        assert execution["provider_operation_generation"] == 2
+        assert execution["failure"] is None
+        assert execution["events"][-1]["payload"]["reason"] == {
+            "code": expected_code
+        }
+        assert waiting["assets"]["status"] == "not_attempted"
+        assert waiting["formal_measurement"] == {
             "status": "not_attempted",
             "metric_result": None,
         }
         assert not runtime.experiment.process_once()
+        assert runner.with_suffix(".count").read_text(encoding="utf-8") == "1"
 
         if mode == "descendant":
             assert child_pid_path.is_file()

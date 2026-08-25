@@ -81,6 +81,12 @@ def test_web_writing_report_runs_after_client_navigation_and_projects_four_layer
             projected = None
             while time.monotonic() < deadline:
                 snapshot = client.get("/api/v1/snapshot")
+                if snapshot.status_code == 503:
+                    assert snapshot.json()["detail"]["code"] == (
+                        "snapshot_consistency_unavailable"
+                    )
+                    time.sleep(0.02)
+                    continue
                 assert snapshot.status_code == 200
                 writing = snapshot.json()["writing"]
                 projected = next(

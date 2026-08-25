@@ -188,7 +188,176 @@ test("technical details expose Semantic MCP and both locked Harness profiles", a
   await expect(details.getByText("claude Harness", { exact: true })).toBeVisible();
   await expect(details).toContainText("lock 0.147.0");
   await expect(details).toContainText("lock 2.1.220");
-  await expect(details).toContainText("full_conformance_not_recorded");
+  for (const family of ["codex", "claude"]) {
+    const row = details.getByText(`${family} Harness`, { exact: true }).locator("..");
+    await expect(row).toContainText(
+      /(?:profile [a-z_]+|capability_unavailable · [a-z0-9_]+)/,
+    );
+    await expect(row).not.toContainText("reason_unavailable");
+  }
+});
+
+test("OpenTelemetry opt-in starts as an exact Web Command Draft", async ({ page }) => {
+  await openAuthenticatedProduct(page);
+
+  await page.getByText("查看运行详情", { exact: true }).click();
+  const details = page.locator(".lumen-technical-details");
+  const companion = page.getByRole("complementary", { name: "Quest Companion" });
+  const telemetry = details.locator(".lumen-telemetry-authorization");
+  await expect(telemetry).toContainText("OpenTelemetry export · local-only");
+  await telemetry.getByLabel("OpenTelemetry OTLP HTTP endpoint").fill(
+    "http://127.0.0.1:4318/v1/logs",
+  );
+  await telemetry.getByRole("button", { name: "建立 opt-in Command Draft" }).click();
+
+  await expect(telemetry).toContainText("Command Draft 已建立");
+  const command = companion.locator(".lumen-command").filter({
+    hasText: "granted · opentelemetry_export",
+  });
+  await expect(command).toBeVisible();
+  await expect(command).toContainText("http://127.0.0.1:4318/v1/logs");
+  await expect(command).toContainText("COMMAND DRAFT · NO AUTHORITY");
+});
+
+test("technical details expose only the runtime observability allowlist", async ({ page }) => {
+  await authenticateBrowser(page);
+  await page.route("**/api/v1/snapshot", async (route) => {
+    const response = await route.fetch();
+    const snapshot = await response.json() as Record<string, unknown>;
+    await route.fulfill({
+      response,
+      json: {
+        ...snapshot,
+        runtime_observability: {
+          status: "unavailable",
+          schema_ref: "schema-ref-secret",
+          correlation_ref: "runtime-correlation-secret",
+          inhibitor: {
+            status: "unavailable",
+            backend: "systemd-logind",
+            scope: "sleep",
+            holder_ref: "holder-secret",
+            active_count: 137,
+            reason: {
+              code: "power_inhibitor_release_failed",
+              raw: "inhibitor-raw-secret",
+            },
+          },
+          responsibilities: [{
+            responsibility_ref: "responsibility-secret",
+            correlation_ref: "responsibility-correlation-secret",
+            owner_scope: "agent_runtime",
+            root_run_ref: "root-run-secret",
+            attempt_ref: "active-attempt-secret",
+            fence_ref: "active-fence-secret",
+            operation_ref: "operation-secret",
+            effect_kind: "writing.generate",
+            holder_ref: "active-holder-secret",
+            raw_payload: "raw-payload-secret",
+          }, {
+            responsibility_ref: "duplicate-responsibility-secret",
+            owner_scope: "agent_runtime",
+            operation_ref: "duplicate-operation-secret",
+            effect_kind: "writing.generate",
+          }, {
+            responsibility_ref: "collaboration-responsibility-secret",
+            owner_scope: "human_collaboration",
+            operation_ref: "collaboration-operation-secret",
+            effect_kind: "companion.reply",
+          }],
+          durable_waiting: [{
+            responsibility_ref: "waiting-responsibility-secret",
+            operation_ref: "waiting-operation-secret",
+            effect_kind: "writing.generate",
+            reason: {
+              code: "power_inhibitor_acquisition_failed",
+              raw: "waiting-raw-secret",
+            },
+          }, {
+            responsibility_ref: "second-waiting-responsibility-secret",
+            operation_ref: "second-waiting-operation-secret",
+            effect_kind: "acquisition.fetch",
+            reason: {
+              code: "runtime_reconciliation_required",
+              raw: "second-waiting-raw-secret",
+            },
+          }],
+          durable_waiting_count: 145,
+          durable_waiting_page_truncated: true,
+          interruptions: [{
+            interruption_ref: "interruption-secret",
+            responsibility_ref: "responsibility-secret",
+            kind: "daemon",
+            reason: {
+              code: "daemon_restarted",
+              raw: "interruption-raw-secret",
+            },
+            old_attempt_ref: "attempt-secret",
+            old_fence_ref: "fence-secret",
+            checkpoint_ref: "/private/user/path",
+            evidence_ref: "evidence-secret",
+            first_missing_boundary: "boundary-ref-secret",
+            reconciliation_status: "protected",
+            recorded_at: 123,
+          }],
+          interruption_count: 173,
+          interruption_page_truncated: true,
+          log: {
+            status: "fresh",
+            last_recorded_at: 123,
+            age_seconds: 8,
+            path: "/private/runtime/events.jsonl",
+          },
+          telemetry: {
+            mode: "active",
+            provider: "otlp_http",
+            endpoint: "https://provider.example.invalid/v1",
+            updated_at: 123,
+            credentials: "credential-secret",
+          },
+        },
+      },
+    });
+  });
+  await page.goto(product.base_url, { waitUntil: "domcontentloaded" });
+
+  await page.getByText("查看运行详情", { exact: true }).click();
+  const details = page.locator(".lumen-technical-details");
+  await expect(details).toContainText("systemd-logind · unavailable · sleep");
+  await expect(details).toContainText("power_inhibitor_release_failed");
+  await expect(details).toContainText("137 项未结责任 · 当前样本 3 · owners agent_runtime, human_collaboration · effects writing.generate, companion.reply");
+  await expect(details).toContainText("145 · 当前样本 2 · effects writing.generate, acquisition.fetch · reasons power_inhibitor_acquisition_failed, runtime_reconciliation_required");
+  await expect(details).toContainText("173 · 当前样本 1 · kinds daemon · reasons daemon_restarted · reconciliation protected");
+  await expect(details).toContainText("fresh · 8s");
+  await expect(details).toContainText("opt-in · active");
+  await expect(details).not.toContainText("holder-secret");
+  await expect(details).not.toContainText("schema-ref-secret");
+  await expect(details).not.toContainText("runtime-correlation-secret");
+  await expect(details).not.toContainText("responsibility-secret");
+  await expect(details).not.toContainText("responsibility-correlation-secret");
+  await expect(details).not.toContainText("root-run-secret");
+  await expect(details).not.toContainText("active-attempt-secret");
+  await expect(details).not.toContainText("active-fence-secret");
+  await expect(details).not.toContainText("active-holder-secret");
+  await expect(details).not.toContainText("operation-secret");
+  await expect(details).not.toContainText("raw-payload-secret");
+  await expect(details).not.toContainText("inhibitor-raw-secret");
+  await expect(details).not.toContainText("interruption-secret");
+  await expect(details).not.toContainText("interruption-raw-secret");
+  await expect(details).not.toContainText("attempt-secret");
+  await expect(details).not.toContainText("evidence-secret");
+  await expect(details).not.toContainText("boundary-ref-secret");
+  await expect(details).not.toContainText("waiting-responsibility-secret");
+  await expect(details).not.toContainText("waiting-operation-secret");
+  await expect(details).not.toContainText("waiting-raw-secret");
+  await expect(details).not.toContainText("second-waiting-responsibility-secret");
+  await expect(details).not.toContainText("second-waiting-operation-secret");
+  await expect(details).not.toContainText("second-waiting-raw-secret");
+  await expect(details).not.toContainText("fence-secret");
+  await expect(details).not.toContainText("/private/");
+  await expect(details).not.toContainText("credential-secret");
+  await expect(details).not.toContainText("otlp_http");
+  await expect(details).not.toContainText("provider.example.invalid");
 });
 
 test("an SSE interruption warns over the last good snapshot without leaving the shell", async ({ page }) => {
@@ -406,7 +575,14 @@ test("a durable event burst stays monotonic and reconnects from the advanced SSE
   });
 
   const headerRevision = page.locator(".lumen-connection code");
-  await expect(headerRevision).toHaveText(`rev ${finalRevision}`);
+  const readHeaderRevision = async () => {
+    const label = (await headerRevision.textContent())?.trim() ?? "";
+    const match = /^rev (\d+)$/.exec(label);
+    if (!match) throw new Error(`invalid Projection revision label: ${label}`);
+    return Number(match[1]);
+  };
+  await expect.poll(readHeaderRevision).toBeGreaterThanOrEqual(finalRevision);
+  const revisionBeforeReconnect = await readHeaderRevision();
   expect(snapshotRequests - snapshotsBeforeBurst).toBeLessThan(30);
 
   const requestsBeforeReconnect = eventRequests.length;
@@ -418,8 +594,12 @@ test("a durable event burst stays monotonic and reconnects from the advanced SSE
   await expect.poll(() => eventRequests.length).toBeGreaterThan(requestsBeforeReconnect);
 
   const reconnectUrl = new URL(eventRequests.at(-1)!);
-  expect(Number(reconnectUrl.searchParams.get("after"))).toBeGreaterThanOrEqual(finalRevision);
-  await expect(headerRevision).toHaveText(`rev ${finalRevision}`);
+  expect(Number(reconnectUrl.searchParams.get("after"))).toBeGreaterThanOrEqual(
+    revisionBeforeReconnect,
+  );
+  await expect.poll(readHeaderRevision).toBeGreaterThanOrEqual(
+    revisionBeforeReconnect,
+  );
 });
 
 test("the fixed regions keep their 800px and 390px order without page overflow", async ({ page }) => {

@@ -22,9 +22,15 @@ from meta_research.deepfetch import (
     DeepFetchResult,
     DeepFetchRuntimeBinding,
     DeepFetchUnavailable,
+    canonical_hash,
     validate_deepfetch_result,
 )
 from meta_research.owners.common import AcceptanceReceipt
+from meta_research.provider_supervisor import (
+    ensure_transport_key,
+    read_transport_envelope,
+    write_exit_receipt,
+)
 
 RESULT = {
     "completion": "limited",
@@ -403,6 +409,101 @@ class SequencedPrototypeRunner(PrototypeRecordingRunner):
         return super().__call__(argv, prompt, timeout)
 
 
+class LifecycleSequencedPrototypeRunner(SequencedPrototypeRunner):
+    def __init__(self, outputs: list[dict[str, object]]) -> None:
+        super().__init__(outputs)
+        self.cancelled_jobs: list[str] = []
+        self.finished_jobs: list[str] = []
+
+    def cancel_job(self, job_ref: str) -> None:
+        self.cancelled_jobs.append(job_ref)
+
+    def finish_job(self, job_ref: str) -> None:
+        self.finished_jobs.append(job_ref)
+
+
+class DurableSegmentSequenceRunner:
+    def __init__(self, workspace: Path, *, stopped_segments: int) -> None:
+        self.workspace = workspace
+        self.stopped_segments = stopped_segments
+        self.calls: list[str] = []
+
+    def __call__(
+        self, argv: list[str], prompt: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:  # pragma: no cover - durable seam only
+        raise AssertionError("non-durable provider seam used")
+
+    def run_durable_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        prompt: str,
+        timeout: float,
+        stdout_path: Path,
+        pid_path: Path,
+        supervisor_request_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        del pid_path, supervisor_request_path, timeout
+        self.calls.append(job_ref)
+        thread_ref = "native-many-durable-segments"
+        events = [{"type": "thread.started", "thread_id": thread_ref}]
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        if len(self.calls) > self.stopped_segments:
+            events.extend(
+                [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "search-many-segments",
+                            "type": "web_search",
+                            "query": "verifiable paper",
+                            "action": {"type": "search"},
+                        },
+                    },
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "fetch-many-segments",
+                            "type": "web_search",
+                            "query": "https://example.org/paper",
+                            "action": {"type": "other"},
+                        },
+                    },
+                ]
+            )
+            _write_empty_v4_artifacts_if_needed(prompt)
+            result_path.write_text(
+                json.dumps(PROTOTYPE_EMPTY_FINAL), encoding="utf-8"
+            )
+            termination_reason = "completed"
+            returncode = 0
+        else:
+            termination_reason = "stopped"
+            returncode = -15
+        stdout_path.write_text(
+            "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+        )
+        _key_path, key = ensure_transport_key(self.workspace)
+        invocation = read_transport_envelope(
+            stdout_path.parent / "invocation.json", key
+        )
+        write_exit_receipt(
+            stdout_path.parent / "supervisor-exit.json",
+            key=key,
+            invocation_hash=canonical_hash(invocation),
+            prompt_path=stdout_path.parent / "prompt.txt",
+            schema_path=stdout_path.parent / "output-schema.json",
+            stdout_path=stdout_path,
+            result_path=result_path,
+            returncode=returncode,
+            input_bytes=len(prompt.encode("utf-8")),
+            termination_reason=termination_reason,
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode, stdout=stdout_path.read_text(encoding="utf-8"), stderr=""
+        )
+
+
 class RecordingAcquisitionClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, AcquisitionBatchRequest]] = []
@@ -577,6 +678,103 @@ def test_codex_deepfetch_routes_each_finite_batch_through_the_hosted_session(
     assert result.web_evidence["prototype"]["acquisition_request_ids"] == [
         "acq-v4-1"
     ]
+
+
+def test_codex_deepfetch_has_no_hidden_provider_turn_generation_limit_across_restart(
+    tmp_path: Path,
+) -> None:
+    acquisition_turns: list[dict[str, object]] = []
+    for generation in range(1, 13):
+        turn = copy.deepcopy(PROTOTYPE_ACQUIRE)
+        request = turn["acquisition_request"]
+        assert isinstance(request, dict)
+        request["request_id"] = f"acq-v4-{generation}"
+        acquisition_turns.append(turn)
+    runner = SequencedPrototypeRunner([*acquisition_turns, PROTOTYPE_FINAL])
+    acquisition = RecordingAcquisitionClient()
+    workspace = tmp_path / "provider"
+    adapter = CodexDeepFetchAdapter(
+        workspace,
+        model_ref="gpt-test",
+        acquisition_client=acquisition,
+        process_runner=runner,
+    )
+
+    result = adapter.execute(_request())
+
+    assert result.completion == "complete"
+    assert len(runner.calls) == 13
+    assert [call[1].request_id for call in acquisition.calls] == [
+        f"acq-v4-{generation}" for generation in range(1, 13)
+    ]
+
+    restarted = CodexDeepFetchAdapter(
+        workspace,
+        model_ref="gpt-test",
+        acquisition_client=acquisition,
+        process_runner=runner,
+    )
+    replayed = restarted.execute(_request())
+
+    assert replayed == result
+    assert len(runner.calls) == 13
+    assert len(acquisition.calls) == 12
+
+
+def test_codex_deepfetch_cleanup_uses_the_durable_child_operation_registry(
+    tmp_path: Path,
+) -> None:
+    acquisition_turns: list[dict[str, object]] = []
+    for generation in range(1, 13):
+        turn = copy.deepcopy(PROTOTYPE_ACQUIRE)
+        request = turn["acquisition_request"]
+        assert isinstance(request, dict)
+        request["request_id"] = f"acq-v4-{generation}"
+        acquisition_turns.append(turn)
+    runner = LifecycleSequencedPrototypeRunner(
+        [*acquisition_turns, PROTOTYPE_FINAL]
+    )
+    adapter = CodexDeepFetchAdapter(
+        tmp_path / "provider",
+        acquisition_client=RecordingAcquisitionClient(),
+        process_runner=runner,
+    )
+    root_job_ref = "deepfetch-logical-operation"
+
+    adapter.execute(replace(_request(), job_ref=root_job_ref))
+    adapter.cancel_job(root_job_ref)
+    adapter.finish_job(root_job_ref)
+
+    expected_jobs = {
+        root_job_ref,
+        *(f"{root_job_ref}:v4-turn:{turn}" for turn in range(13)),
+    }
+    assert set(runner.cancelled_jobs) == expected_jobs
+    assert set(runner.finished_jobs) == expected_jobs
+    assert adapter.reconcile_cancelled_job(root_job_ref) is True
+
+
+def test_codex_deepfetch_has_no_hidden_durable_segment_generation_limit(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "provider"
+    runner = DurableSegmentSequenceRunner(workspace, stopped_segments=8)
+    adapter = CodexDeepFetchAdapter(workspace, process_runner=runner)
+
+    result = adapter.execute(
+        replace(_request(), job_ref="deepfetch-many-segments")
+    )
+
+    assert result.completion == "honest_empty"
+    assert result.native_session_ref == "native-many-durable-segments"
+    assert len(runner.calls) == 9
+    assert len(
+        list(
+            workspace.glob(
+                "provider-operations/*/deepfetch-resume-8/supervisor-exit.json"
+            )
+        )
+    ) == 1
 
 
 def test_codex_deepfetch_replays_the_exact_pending_batch_after_user_login(

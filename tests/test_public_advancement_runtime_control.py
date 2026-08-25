@@ -3545,6 +3545,9 @@ def test_reconciliation_pending_provider_blocks_pause_until_terminal_ack(
                 {"run_ref": run.run_ref},
             ).scalars().all()
         assert statuses == ["revoked", "completed"]
+        observability = restarted.query_runtime_observability()
+        assert observability["inhibitor"]["active_count"] == 0
+        assert observability["responsibilities"] == []
     finally:
         restarted.close()
 

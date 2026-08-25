@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+import meta_research.owners.agent_runtime as agent_runtime_module
 from meta_research.acquisition import (
     AcquisitionBatchRequest,
     AcquisitionItemResult,
@@ -29,6 +30,10 @@ from meta_research.paths import prepare_data_root
 from meta_research.owners.common import OwnerConflict
 from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.quest_drafting import HostComputeDevice, HostComputeSnapshot
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeProtectionUnavailable,
+)
 from meta_research.web import create_app
 
 
@@ -108,6 +113,48 @@ class RecordingAcquisitionProvider:
             )
             for item in request.papers
         )
+
+
+class RejectingPowerInhibitor:
+    kind = "test_rejecting_inhibitor"
+
+    def acquire(self, *, holder_ref: str, reason: str):
+        del holder_ref, reason
+        raise RuntimeProtectionUnavailable("power_inhibitor_test_rejected")
+
+    def is_confirmed(self, lease) -> bool:
+        del lease
+        return False
+
+    def release(self, lease) -> None:
+        del lease
+
+
+class SwitchablePowerInhibitor:
+    kind = "test_switchable_inhibitor"
+
+    def __init__(self) -> None:
+        self.fail = False
+        self.live_holders: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        if self.fail:
+            raise RuntimeProtectionUnavailable("power_inhibitor_test_rejected")
+        self.live_holders.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=1_720_000_000.0,
+            native_holder_ref="test-switchable-holder",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self.live_holders
+
+    def release(self, lease: InhibitorLease) -> None:
+        self.live_holders.discard(lease.holder_ref)
 
 
 class PartialAcquisitionProvider(RecordingAcquisitionProvider):
@@ -206,6 +253,52 @@ class ReconcilingAcquisitionProvider(RecordingAcquisitionProvider):
                 failure={
                     "code": "route_exhausted",
                     "detail": "私有 manifest 已验证全部路线终止。",
+                },
+            )
+            for item in request.papers
+        )
+
+
+class RepeatedPendingAcquisitionProvider(RecordingAcquisitionProvider):
+    def __init__(self, *, pending_reconciliations: int = 1) -> None:
+        super().__init__()
+        self.pending_reconciliations = pending_reconciliations
+        self.acquire_calls = 0
+        self.reconcile_calls: list[AcquisitionBatchRequest] = []
+
+    @staticmethod
+    def _pending(request: AcquisitionBatchRequest):
+        return tuple(
+            AcquisitionItemResult(
+                paper_id=item.paper_id,
+                status="waiting_user",
+                path=None,
+                format=None,
+                failure={
+                    "code": "acquisition_reconciliation_required",
+                    "detail": "The existing operation has no terminal receipt yet.",
+                },
+            )
+            for item in request.papers
+        )
+
+    def acquire(self, request: AcquisitionBatchRequest):
+        self.acquire_calls += 1
+        return self._pending(request)
+
+    def reconcile(self, request: AcquisitionBatchRequest):
+        self.reconcile_calls.append(request)
+        if len(self.reconcile_calls) <= self.pending_reconciliations:
+            return self._pending(request)
+        return tuple(
+            AcquisitionItemResult(
+                paper_id=item.paper_id,
+                status="missing",
+                path=None,
+                format=None,
+                failure={
+                    "code": "route_exhausted",
+                    "detail": "The exact operation now has a terminal manifest.",
                 },
             )
             for item in request.papers
@@ -497,6 +590,101 @@ def _respond_with_accepted_material(
         note="Use this accepted copy for the exact blocked item.",
         idempotency_key=f"{key}-response",
     )
+
+
+def test_acquisition_preflight_never_starts_without_confirmed_power_hold(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "preflight-power-fail-closed"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=RejectingPowerInhibitor(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="preflight-power-fail-closed",
+        )
+
+        session = runtime.owners.agent_runtime.query_acquisition_session(
+            initialization_id=initialization_id
+        )
+        assert session is not None
+        assert session.session_ref == session_ref
+        assert session.status == "unavailable"
+        assert session.reason_code == "power_inhibitor_test_rejected"
+        assert provider.preflights == []
+        observability = runtime.query_runtime_observability()
+        assert observability["inhibitor"]["active_count"] == 0
+        assert observability["responsibilities"] == []
+    finally:
+        runtime.close()
+
+
+def test_acquisition_batch_retries_with_a_new_attempt_after_power_wait(
+    tmp_path: Path,
+) -> None:
+    provider = RecordingAcquisitionProvider()
+    inhibitor = SwitchablePowerInhibitor()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "batch-power-fail-closed"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+        power_inhibitor=inhibitor,
+    )
+    client, write_headers = _authenticated_client(runtime)
+    try:
+        _initialization_id, _saved, session_ref = _open_ready_acquisition(
+            client,
+            write_headers,
+            prefix="batch-power-fail-closed",
+        )
+        request = AcquisitionBatchRequest(
+            request_id="batch-power-fail-closed",
+            route_policy="oa_first_then_institution",
+            papers=(
+                AcquisitionPaper(
+                    paper_id="paper:power-fail-closed",
+                    title="Power fail closed",
+                    doi=None,
+                    arxiv_id=None,
+                    source_urls=(),
+                ),
+            ),
+        )
+
+        inhibitor.fail = True
+        with pytest.raises(OwnerConflict, match="power_inhibitor_test_rejected"):
+            runtime.owners.agent_runtime.acquire_literature(
+                session_ref, request, provider
+            )
+        assert provider.batches == []
+        observability = runtime.query_runtime_observability()
+        assert observability["inhibitor"]["active_count"] == 0
+        assert observability["responsibilities"] == []
+
+        inhibitor.fail = False
+        completed = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert completed.status == "missing"
+        assert [batch.request_id for batch in provider.batches] == [
+            "batch-power-fail-closed"
+        ]
+        with runtime._database.read() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT attempt_count FROM ar_acquisition_requests WHERE "
+                    "request_id = :request_id"
+                ),
+                {"request_id": request.request_id},
+            ).scalar_one() == 2
+    finally:
+        runtime.close()
 
 
 def test_quest_acquisition_session_reuses_identity_batches_and_browser_after_restart(
@@ -927,6 +1115,185 @@ def test_restart_reconciles_unknown_acquisition_without_replaying_provider(
     finally:
         restarted_client.close()
         restarted.close()
+
+
+def test_repeated_acquisition_reconciliation_keeps_original_hold_until_terminal(
+    tmp_path: Path,
+) -> None:
+    provider = RepeatedPendingAcquisitionProvider()
+    data_root = prepare_data_root(tmp_path / "repeated-reconciliation")
+    runtime = build_production_runtime(
+        data_root,
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    _, _, session_ref = _open_ready_acquisition(
+        client, write_headers, prefix="repeated-reconciliation"
+    )
+    request = AcquisitionBatchRequest(
+        request_id="repeated-reconciliation-batch",
+        route_policy="oa_first_then_institution",
+        papers=(
+            AcquisitionPaper(
+                paper_id="paper:repeated-reconciliation",
+                title="Repeated reconciliation",
+                doi="10.1000/repeated-reconciliation",
+                arxiv_id=None,
+                source_urls=(),
+            ),
+        ),
+    )
+    try:
+        first = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert first.status == "waiting_user"
+        assert runtime.query_runtime_observability()["inhibitor"]["active_count"] == 1
+
+        second = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert second.status == "waiting_user"
+        assert runtime.query_runtime_observability()["inhibitor"]["active_count"] == 1
+    finally:
+        client.close()
+        runtime.close()
+
+    restarted = build_production_runtime(
+        data_root,
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    try:
+        terminal = restarted.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert terminal.status == "missing"
+        assert provider.acquire_calls == 1
+        assert len(provider.reconcile_calls) == 2
+        evidence = restarted.query_runtime_observability()
+        assert evidence["inhibitor"]["active_count"] == 0
+        assert evidence["responsibilities"] == []
+    finally:
+        restarted.close()
+
+
+def test_acquisition_terminal_closes_only_the_unsettled_responsibility_frontier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = RepeatedPendingAcquisitionProvider(pending_reconciliations=64)
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "bounded-terminal-frontier"),
+        acquisition_provider=provider,
+        host_compute_probe=NoCompute(),
+    )
+    client, write_headers = _authenticated_client(runtime)
+    _, _, session_ref = _open_ready_acquisition(
+        client, write_headers, prefix="bounded-terminal-frontier"
+    )
+    request = AcquisitionBatchRequest(
+        request_id="bounded-terminal-frontier-batch",
+        route_policy="oa_first_then_institution",
+        papers=(
+            AcquisitionPaper(
+                paper_id="paper:bounded-terminal-frontier",
+                title="Bounded terminal responsibility frontier",
+                doi="10.1000/bounded-terminal-frontier",
+                arxiv_id=None,
+                source_urls=(),
+            ),
+        ),
+    )
+    try:
+        first = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+        assert first.status == "waiting_user"
+        original_finish = runtime.runtime_protection.finish
+        finish_ack_lost = True
+
+        def lose_one_checkpoint_finish(*args, **kwargs) -> None:
+            nonlocal finish_ack_lost
+            if finish_ack_lost:
+                finish_ack_lost = False
+                raise RuntimeProtectionUnavailable(
+                    "simulated_acquisition_finish_ack_loss"
+                )
+            original_finish(*args, **kwargs)
+
+        monkeypatch.setattr(
+            runtime.runtime_protection, "finish", lose_one_checkpoint_finish
+        )
+        with pytest.raises(
+            RuntimeProtectionUnavailable,
+            match="simulated_acquisition_finish_ack_loss",
+        ):
+            runtime.owners.agent_runtime.acquire_literature(
+                session_ref, request, provider
+            )
+        monkeypatch.setattr(runtime.runtime_protection, "finish", original_finish)
+
+        for _generation in range(63):
+            pending = runtime.owners.agent_runtime.acquire_literature(
+                session_ref, request, provider
+            )
+            assert pending.status == "waiting_user"
+        before_terminal = runtime.query_runtime_observability()
+        assert [
+            item["attempt_ref"] for item in before_terminal["responsibilities"]
+        ] == ["acquisition_attempt_1"]
+
+        recorded_boundaries: list[tuple[str, str]] = []
+        original_record_runtime_boundary = (
+            agent_runtime_module.record_runtime_boundary
+        )
+
+        def record_terminal_boundary(connection, **values) -> None:
+            identity = values["identity"]
+            recorded_boundaries.append(
+                (identity.responsibility_ref, values["boundary"])
+            )
+            original_record_runtime_boundary(connection, **values)
+
+        monkeypatch.setattr(
+            agent_runtime_module,
+            "record_runtime_boundary",
+            record_terminal_boundary,
+        )
+        terminal = runtime.owners.agent_runtime.acquire_literature(
+            session_ref, request, provider
+        )
+
+        assert terminal.status == "missing"
+        assert len(recorded_boundaries) == 2
+        assert {boundary for _ref, boundary in recorded_boundaries} == {
+            "checkpoint",
+            "permanent_fence",
+        }
+        evidence = runtime.query_runtime_observability()
+        assert evidence["responsibilities"] == []
+        assert evidence["durable_waiting"] == []
+        with runtime._database.read() as connection:
+            receipts = connection.execute(
+                text(
+                    "SELECT responsibility.attempt_ref, receipt.boundary FROM "
+                    "ar_execution_responsibilities AS responsibility JOIN "
+                    "ar_runtime_boundary_receipts AS receipt ON "
+                    "receipt.responsibility_ref = responsibility.responsibility_ref "
+                    "WHERE responsibility.root_run_ref = :session_ref AND "
+                    "responsibility.operation_ref = :request_id ORDER BY "
+                    "responsibility.created_at"
+                ),
+                {"session_ref": session_ref, "request_id": request.request_id},
+            ).all()
+        assert len(receipts) == 66
+        assert receipts[0] == ("acquisition_attempt_1", "permanent_fence")
+        assert all(boundary == "checkpoint" for _attempt, boundary in receipts[1:])
+    finally:
+        client.close()
+        runtime.close()
 
 
 def test_technical_reconciliation_without_provider_support_never_opens_a_human_request(

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
+
+from sqlalchemy import text
 
 from meta_research.acquisition import (
     AcquisitionBatchExecution,
@@ -63,6 +67,7 @@ from meta_research.owners.human_collaboration import (
     create_human_collaboration_interface,
     create_human_response_verifier,
 )
+from meta_research.owners.common import OwnerConflict
 from meta_research.owners.research_graph import (
     ResearchGraphInterface,
     TargetCommitEvidenceAuthority,
@@ -85,6 +90,7 @@ from meta_research.owners.target_root_lifecycle import (
 from meta_research.paths import DataRoot
 from meta_research.plan_skill import CodexPlanSkillAdapter, PlanSkillProvider
 from meta_research.plan_stage import PlanStageWorker
+from meta_research.power_inhibitors import ProductionPowerInhibitor
 from meta_research.projection import PublicProjection
 from meta_research.quest_drafting import (
     CodexDraftingAdapter,
@@ -106,6 +112,17 @@ from meta_research.reasoning_skill import (
 )
 from meta_research.reasoning_stage import ReasoningStageWorker
 from meta_research.quest_completion import QuestCompletionService
+from meta_research.runtime_protection import (
+    PowerInhibitor,
+    RuntimeBoundaryRecorder,
+    RuntimeEventLogger,
+    RuntimeProtection,
+    TelemetryExporter,
+)
+from meta_research.telemetry import (
+    OtlpHttpTelemetryExporter,
+    validate_otlp_http_endpoint,
+)
 from meta_research.writing import WritingReportService
 from meta_research.writing_delivery import WritingDeliveryProviderRegistry
 from meta_research.writing_renderer import WritingRendererRegistry
@@ -236,7 +253,9 @@ class ProductionRuntime:
     target_root_lifecycle: SQLiteTargetRootLifecycleAuthority
     target_run_finalizer: TargetRunFinalizer
     target_root_readiness: dict[str, object]
+    runtime_protection: RuntimeProtection
     _database: Database
+    _telemetry_exporter_factory: Callable[[str], TelemetryExporter]
     _provider_lifecycles: tuple[object, ...] = ()
     _stop_requested: bool = False
 
@@ -244,6 +263,10 @@ class ProductionRuntime:
         if self._stop_requested:
             return
         self._stop_requested = True
+        self.runtime_protection.interrupt_active(
+            interruption_kind="daemon",
+            reason_code="daemon_shutdown_requested",
+        )
         for lifecycle in self._provider_lifecycles:
             request_stop = getattr(lifecycle, "request_stop", None)
             if callable(request_stop):
@@ -252,11 +275,162 @@ class ProductionRuntime:
     def query_target_root_readiness(self) -> dict[str, object]:
         return dict(self.target_root_readiness)
 
+    def query_runtime_observability(self) -> dict[str, object]:
+        return self.runtime_protection.query_evidence()
+
+    def validate_telemetry_authorization_request(
+        self,
+        *,
+        scope_ref: str,
+        capability: str,
+        decision: str,
+        scope: dict[str, object],
+        confirmation_receipt_ref: str,
+    ) -> None:
+        """Validate an exact OTel command before moving the HC authority head."""
+
+        self._validate_telemetry_authorization_scope(
+            scope_ref=scope_ref,
+            capability=capability,
+            decision=decision,
+            scope=scope,
+        )
+        projection = self.owners.human_collaboration.query_collaboration_projection(
+            ("runtime:telemetry",)
+        )
+        current = [
+            authorization
+            for authorization in projection["authorizations"]
+            if authorization.get("authorization_kind") == "capability"
+            and authorization.get("capability") == "opentelemetry_export"
+            and authorization.get("scope_ref") == "runtime:telemetry"
+            and authorization.get("is_current") is not False
+        ]
+        if len(current) > 1:
+            raise OwnerConflict("telemetry_authorization_head_invalid")
+        if current and (
+            current[0].get("confirmation_receipt_ref")
+            == confirmation_receipt_ref
+            and current[0].get("decision") == decision
+            and isinstance(current[0].get("requirement"), dict)
+            and cast(dict[str, object], current[0]["requirement"]).get("scope")
+            == scope
+        ):
+            # Exact HTTP/idempotency replay of the already-applied command.
+            return
+
+        telemetry = self.runtime_protection.query_evidence()["telemetry"]
+        if not isinstance(telemetry, dict):
+            raise OwnerConflict("telemetry_authorization_state_invalid")
+        mode = telemetry.get("mode")
+        if decision == "granted" and mode in {"active", "revocation_pending"}:
+            raise OwnerConflict(
+                "telemetry_revocation_pending"
+                if mode == "revocation_pending"
+                else "telemetry_revoke_required"
+            )
+        if decision == "revoked" and mode == "revocation_pending":
+            raise OwnerConflict("telemetry_revocation_pending")
+
+    @staticmethod
+    def _validate_telemetry_authorization_scope(
+        *,
+        scope_ref: str,
+        capability: str,
+        decision: str,
+        scope: dict[str, object],
+    ) -> None:
+        """Validate the installed product's exact, non-secret OTel scope."""
+
+        if (
+            scope_ref != "runtime:telemetry"
+            or capability != "opentelemetry_export"
+            or decision not in {"granted", "revoked"}
+            or set(scope)
+            != {"schema_ref", "provider", "endpoint", "credential_ref"}
+            or scope.get("schema_ref")
+            != "meta-research/opentelemetry-export-scope/v1"
+            or scope.get("provider") != "otlp_http"
+            or scope.get("credential_ref") is not None
+            or not isinstance(scope.get("endpoint"), str)
+        ):
+            raise OwnerConflict("telemetry_authorization_scope_invalid")
+        try:
+            validate_otlp_http_endpoint(cast(str, scope["endpoint"]))
+        except ValueError as error:
+            raise OwnerConflict("telemetry_authorization_scope_invalid") from error
+
+    def apply_telemetry_authorization(
+        self, authorization: dict[str, object]
+    ) -> None:
+        """Apply only a current Human Collaboration authorization receipt."""
+
+        capability = authorization.get("capability")
+        decision = authorization.get("decision")
+        requirement = authorization.get("requirement")
+        receipt_ref = authorization.get("receipt_ref")
+        if (
+            authorization.get("authorization_kind") != "capability"
+            or not isinstance(requirement, dict)
+            or not isinstance(receipt_ref, str)
+            or not isinstance(capability, str)
+            or not isinstance(decision, str)
+            or authorization.get("scope_ref") != "runtime:telemetry"
+            or authorization.get("is_current") is False
+        ):
+            raise OwnerConflict("telemetry_authorization_receipt_invalid")
+        scope = requirement.get("scope")
+        if not isinstance(scope, dict):
+            raise OwnerConflict("telemetry_authorization_receipt_invalid")
+        self._validate_telemetry_authorization_scope(
+            scope_ref="runtime:telemetry",
+            capability=capability,
+            decision=decision,
+            scope=scope,
+        )
+        self.owners.human_collaboration.verify_capability_authorization(
+            requirement=requirement,
+            receipt_ref=receipt_ref,
+            _expected_decision=decision,
+        )
+        if decision == "granted":
+            exporter = self._telemetry_exporter_factory(cast(str, scope["endpoint"]))
+            self.runtime_protection.enable_telemetry(
+                exporter,
+                authorization_ref=receipt_ref,
+            )
+            return
+        self.runtime_protection.revoke_telemetry(
+            authorization_ref=receipt_ref,
+        )
+
+    def reconcile_telemetry_authorization(self) -> None:
+        """Restore a current explicit grant after a daemon incarnation change."""
+
+        projection = self.owners.human_collaboration.query_collaboration_projection(
+            ("runtime:telemetry",)
+        )
+        authorizations = [
+            authorization
+            for authorization in projection["authorizations"]
+            if authorization.get("authorization_kind") == "capability"
+            and authorization.get("capability") == "opentelemetry_export"
+            and authorization.get("scope_ref") == "runtime:telemetry"
+            and authorization.get("is_current") is not False
+        ]
+        if len(authorizations) > 1:
+            raise OwnerConflict("telemetry_authorization_head_invalid")
+        if authorizations:
+            self.apply_telemetry_authorization(authorizations[0])
+
     def close(self) -> None:
         try:
             self.request_stop()
         finally:
-            self._database.close()
+            try:
+                self.runtime_protection.close()
+            finally:
+                self._database.close()
 
 
 class _AgentRuntimeAcquisitionClient(DeepFetchAcquisitionClient):
@@ -299,14 +473,45 @@ def build_production_runtime(
     writing_renderer_registry: WritingRendererRegistry | None = None,
     harness_adapters: tuple[HarnessAdapter, ...] | None = None,
     target_root_timeout_seconds: float = TARGET_ROOT_DEFAULT_TIMEOUT_SECONDS,
+    power_inhibitor: PowerInhibitor | None = None,
+    startup_power_probe: bool | None = None,
+    startup_harness_diagnostics: bool = True,
+    telemetry_exporter_factory: Callable[[str], TelemetryExporter] | None = None,
 ) -> ProductionRuntime:
     upgrade_database(data_root.database)
     database = Database(data_root.database)
     feed = DurableFeed(database)
     feed.ensure_initialized()
+    runtime_protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=(
+            power_inhibitor
+            if power_inhibitor is not None
+            else ProductionPowerInhibitor(data_root.run / "power-inhibitor")
+        ),
+        event_logger=RuntimeEventLogger(data_root.daemon_log),
+        startup_probe=(
+            power_inhibitor is None
+            if startup_power_probe is None
+            else startup_power_probe
+        ),
+    )
+    with database.read() as connection:
+        daemon_incarnation_ref = str(
+            connection.execute(
+                text(
+                    "SELECT incarnation_ref FROM ar_runtime_instances WHERE "
+                    "status = 'active' ORDER BY started_at DESC LIMIT 1"
+                )
+            ).scalar_one()
+        )
     shared_provider_runner = _CancellableProcessRunner()
     codex_adapter = (
-        CodexDraftingAdapter(data_root.root / "drafting-provider")
+        CodexDraftingAdapter(
+            data_root.root / "drafting-provider",
+            process_runner=shared_provider_runner,
+        )
         if proposal_drafter is None or intent_drafting_provider is None
         else None
     )
@@ -400,6 +605,7 @@ def build_production_runtime(
         bundle_report_evidence_verifier=research_graph_receipts,
         reasoning_outcome_verifier=research_graph_receipts,
         writing_delivery_provider_registry=writing_delivery_provider_registry,
+        runtime_protection=runtime_protection,
     )
     deepfetch_provider = deepfetch_provider or CodexDeepFetchAdapter(
         data_root.root / "deepfetch-provider",
@@ -554,6 +760,7 @@ def build_production_runtime(
         proposal_drafter=proposal_drafter,
         intent_drafting_provider=intent_drafting_provider,
         acquisition_provider=acquisition_provider,
+        runtime_protection=runtime_protection,
     )
     bundle_exhaustion_owner_proofs = BundleExhaustionOwnerProofVerifier(
         agent_runtime,
@@ -651,9 +858,14 @@ def build_production_runtime(
         semantic_gateway,
         harness_adapters,
         operation_canceller=harness_operation_canceller,
+        runtime_protection=runtime_protection,
+        runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
+        daemon_incarnation_ref=daemon_incarnation_ref,
     )
     harnesses.bind_resident_mcp_scope_verifier(owners.agent_runtime)
     harnesses.bind_target_workspace_resolver(target_run_agent)
+    if startup_harness_diagnostics:
+        harnesses.run_startup_diagnostics()
     target_run_finalizer = TargetRunFinalizer(
         lifecycle=target_root_lifecycle,
         memory=target_root_memory,
@@ -790,7 +1002,7 @@ def build_production_runtime(
             provider is lifecycle for lifecycle in provider_lifecycles
         ):
             provider_lifecycles.append(provider)
-    return ProductionRuntime(
+    runtime = ProductionRuntime(
         data_root=data_root,
         owners=owners,
         authentication=Authentication(database),
@@ -818,6 +1030,13 @@ def build_production_runtime(
             "name": "target_root_lifecycle",
             "status": "ready",
         },
+        runtime_protection=runtime_protection,
         _database=database,
+        _telemetry_exporter_factory=(
+            telemetry_exporter_factory
+            or (lambda endpoint: OtlpHttpTelemetryExporter(endpoint=endpoint))
+        ),
         _provider_lifecycles=tuple(provider_lifecycles),
     )
+    runtime.reconcile_telemetry_authorization()
+    return runtime

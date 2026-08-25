@@ -80,6 +80,58 @@ path.write_text(
 )
 path.chmod(0o755)
 PY
+"$INSTALL_ROOT/bin/python" - \
+  "$PROVIDER_PATH/systemd-inhibit" \
+  "$PROVIDER_PATH/systemd-inhibit.registry" <<'PY'
+import pathlib
+import sys
+
+
+path = pathlib.Path(sys.argv[1])
+registry = pathlib.Path(sys.argv[2])
+path.write_text(
+    f"""#!{sys.executable}
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+registry = Path({str(registry)!r})
+arguments = sys.argv[1:]
+if "--list" in arguments:
+    if registry.exists():
+        print(registry.read_text(encoding="utf-8"), end="")
+    raise SystemExit(0)
+required = {{"--what=sleep", "--mode=block"}}
+if not required.issubset(arguments):
+    raise SystemExit(41)
+command_index = next(
+    index for index, argument in enumerate(arguments)
+    if not argument.startswith("--")
+)
+who = next(
+    argument.removeprefix("--who=")
+    for argument in arguments
+    if argument.startswith("--who=")
+)
+why = next(
+    argument.removeprefix("--why=")
+    for argument in arguments
+    if argument.startswith("--why=")
+)
+registry.write_text(
+    f"{{who}} 1000 installed {{os.getpid()}} python sleep {{why}} block\\n",
+    encoding="utf-8",
+)
+try:
+    raise SystemExit(subprocess.call(arguments[command_index:]))
+finally:
+    registry.unlink(missing_ok=True)
+""",
+    encoding="utf-8",
+)
+path.chmod(0o755)
+PY
 if PATH="$PROVIDER_PATH" command -v codex >/dev/null 2>&1; then
   echo "providerless verification PATH unexpectedly resolves codex" >&2
   exit 1

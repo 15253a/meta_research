@@ -31,6 +31,7 @@ from meta_research.provider_supervisor import (
     request_supervisor_stop,
     supervisor_request_never_started,
     write_supervisor_request,
+    write_transport_envelope,
 )
 from meta_research.quest_drafting import (
     PROVIDER_RESULT_MAX_BYTES,
@@ -56,6 +57,9 @@ DEEPFETCH_PROTOTYPE_EVIDENCE_SCHEMA = "meta-research/deepfetch-prototype-evidenc
 DEEPFETCH_PROTOCOL_CHECKPOINT_SCHEMA = (
     "meta-research/deepfetch-v4-protocol-checkpoint/v1"
 )
+DEEPFETCH_PROVIDER_OPERATION_REGISTRY_SCHEMA = (
+    "meta-research/deepfetch-provider-operation-registry/v1"
+)
 MAX_DEEPFETCH_PAPERS = 500
 MAX_DEEPFETCH_FULLTEXTS = 100
 MAX_DEEPFETCH_SUMMARY_LENGTH = 100_000
@@ -77,6 +81,13 @@ def canonical_json(value: object) -> str:
 
 def canonical_hash(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _provider_turn_marker_number(path: Path) -> int:
+    suffix = path.stem.removeprefix("turn-")
+    if not suffix.isdigit():
+        raise ValueError("deepfetch_provider_turn_marker_invalid")
+    return int(suffix)
 
 
 class DeepFetchUnavailable(RuntimeError):
@@ -442,89 +453,157 @@ class CodexDeepFetchAdapter:
     def cancel_job(self, job_ref: str) -> None:
         cancel_job = getattr(self._runner, "cancel_job", None)
         if callable(cancel_job):
-            cancel_job(job_ref)
-            for turn_number in range(12):
-                cancel_job(f"{job_ref}:v4-turn:{turn_number}")
+            for provider_job_ref in self._registered_provider_jobs(job_ref):
+                cancel_job(provider_job_ref)
 
     def finish_job(self, job_ref: str) -> None:
         finish_job = getattr(self._runner, "finish_job", None)
         if callable(finish_job):
-            finish_job(job_ref)
-            for turn_number in range(12):
-                finish_job(f"{job_ref}:v4-turn:{turn_number}")
+            for provider_job_ref in self._registered_provider_jobs(job_ref):
+                finish_job(provider_job_ref)
 
     def reconcile_cancelled_job(self, job_ref: str) -> bool:
         """Stop and verify all durable DeepFetch segments for a terminal Run."""
 
         self.cancel_job(job_ref)
-        operation_root = (
+        try:
+            _key_path, key = ensure_transport_key(self._workspace)
+            for provider_job_ref in self._registered_provider_jobs(job_ref):
+                operation_root = self._provider_operation_root(provider_job_ref)
+                if not operation_root.exists():
+                    continue
+                directories = sorted(
+                    path
+                    for path in operation_root.iterdir()
+                    if path.is_dir() and path.name.startswith("deepfetch-")
+                )
+                for directory in directories:
+                    invocation_path = directory / "invocation.json"
+                    if not invocation_path.is_file():
+                        if any(directory.iterdir()):
+                            raise ProviderSupervisorError(
+                                "provider_supervisor_spool_invalid"
+                            )
+                        continue
+                    invocation = read_transport_envelope(invocation_path, key)
+                    segment_name = directory.name.removeprefix("deepfetch-")
+                    if (
+                        invocation.get("schema_ref")
+                        != "meta-research/deepfetch-provider-operation/v1"
+                        or invocation.get("job_ref") != provider_job_ref
+                        or invocation.get("segment_name") != segment_name
+                    ):
+                        raise ProviderSupervisorError(
+                            "provider_supervisor_spool_invalid"
+                        )
+                    invocation_hash = canonical_hash(invocation)
+                    receipt_path = directory / "supervisor-exit.json"
+                    if not receipt_path.is_file():
+                        if not (directory / "supervisor-ready.json").is_file():
+                            if not supervisor_request_never_started(
+                                directory,
+                                key=key,
+                                invocation_hash=invocation_hash,
+                                request_schema=SUPERVISOR_REQUEST_SCHEMA,
+                            ):
+                                return False
+                            continue
+                        if not request_supervisor_stop(
+                            directory,
+                            key=key,
+                            invocation_hash=invocation_hash,
+                            ready_schema=(
+                                "meta-research/codex-provider-supervisor-ready/v1"
+                            ),
+                        ):
+                            return False
+                        if not receipt_path.is_file():
+                            continue
+                    read_verified_exit_receipt(
+                        receipt_path,
+                        key=key,
+                        invocation_hash=invocation_hash,
+                        prompt_path=directory / "prompt.txt",
+                        schema_path=directory / "output-schema.json",
+                        stdout_path=directory / "stdout.jsonl",
+                        result_path=directory / "last-message.json",
+                    )
+        except (OSError, ProviderSupervisorError, DeepFetchUnavailable):
+            return False
+        return True
+
+    def _provider_operation_root(self, job_ref: str) -> Path:
+        return (
             self._workspace
             / "provider-operations"
             / canonical_hash({"job_ref": job_ref})
         )
-        if not operation_root.exists():
-            return True
+
+    def _register_provider_turn(
+        self,
+        *,
+        root_job_ref: str,
+        turn_number: int,
+        provider_job_ref: str,
+    ) -> None:
+        operation_root = self._provider_operation_root(root_job_ref)
+        registry_root = operation_root / "registered-turns"
+        registry_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             _key_path, key = ensure_transport_key(self._workspace)
-            directories = sorted(
-                path
-                for path in operation_root.iterdir()
-                if path.is_dir() and path.name.startswith("deepfetch-")
+            write_transport_envelope(
+                registry_root / f"turn-{turn_number}.json",
+                {
+                    "schema_ref": DEEPFETCH_PROVIDER_OPERATION_REGISTRY_SCHEMA,
+                    "root_job_ref": root_job_ref,
+                    "turn_number": turn_number,
+                    "provider_job_ref": provider_job_ref,
+                },
+                key,
             )
-            for directory in directories:
-                invocation_path = directory / "invocation.json"
-                if not invocation_path.is_file():
-                    if any(directory.iterdir()):
-                        raise ProviderSupervisorError(
-                            "provider_supervisor_spool_invalid"
-                        )
-                    continue
-                invocation = read_transport_envelope(invocation_path, key)
-                segment_name = directory.name.removeprefix("deepfetch-")
-                if (
-                    invocation.get("schema_ref")
-                    != "meta-research/deepfetch-provider-operation/v1"
-                    or invocation.get("job_ref") != job_ref
-                    or invocation.get("segment_name") != segment_name
-                ):
+        except (OSError, ProviderSupervisorError) as error:
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_spool_invalid"
+            ) from error
+
+    def _registered_provider_jobs(self, root_job_ref: str) -> tuple[str, ...]:
+        # The fixed legacy entries are migration coverage for provider turns
+        # created by builds that predate the durable registry. New turns have
+        # no generation ceiling and are discovered only through signed facts.
+        job_refs = [
+            root_job_ref,
+            *(f"{root_job_ref}:v4-turn:{turn}" for turn in range(12)),
+        ]
+        registry_root = (
+            self._provider_operation_root(root_job_ref) / "registered-turns"
+        )
+        if not registry_root.exists():
+            return tuple(job_refs)
+        try:
+            _key_path, key = ensure_transport_key(self._workspace)
+            markers = sorted(
+                registry_root.glob("turn-*.json"),
+                key=_provider_turn_marker_number,
+            )
+            for marker in markers:
+                turn_number = _provider_turn_marker_number(marker)
+                payload = read_transport_envelope(marker, key)
+                provider_job_ref = f"{root_job_ref}:v4-turn:{turn_number}"
+                if payload != {
+                    "schema_ref": DEEPFETCH_PROVIDER_OPERATION_REGISTRY_SCHEMA,
+                    "root_job_ref": root_job_ref,
+                    "turn_number": turn_number,
+                    "provider_job_ref": provider_job_ref,
+                }:
                     raise ProviderSupervisorError(
                         "provider_supervisor_spool_invalid"
                     )
-                invocation_hash = canonical_hash(invocation)
-                receipt_path = directory / "supervisor-exit.json"
-                if not receipt_path.is_file():
-                    if not (directory / "supervisor-ready.json").is_file():
-                        if not supervisor_request_never_started(
-                            directory,
-                            key=key,
-                            invocation_hash=invocation_hash,
-                            request_schema=SUPERVISOR_REQUEST_SCHEMA,
-                        ):
-                            return False
-                        continue
-                    if not request_supervisor_stop(
-                        directory,
-                        key=key,
-                        invocation_hash=invocation_hash,
-                        ready_schema=(
-                            "meta-research/codex-provider-supervisor-ready/v1"
-                        ),
-                    ):
-                        return False
-                    if not receipt_path.is_file():
-                        continue
-                read_verified_exit_receipt(
-                    receipt_path,
-                    key=key,
-                    invocation_hash=invocation_hash,
-                    prompt_path=directory / "prompt.txt",
-                    schema_path=directory / "output-schema.json",
-                    stdout_path=directory / "stdout.jsonl",
-                    result_path=directory / "last-message.json",
-                )
-        except (OSError, ProviderSupervisorError, DeepFetchUnavailable):
-            return False
-        return True
+                job_refs.append(provider_job_ref)
+        except (OSError, ProviderSupervisorError, ValueError) as error:
+            raise DeepFetchUnavailable(
+                "deepfetch_provider_spool_invalid"
+            ) from error
+        return tuple(dict.fromkeys(job_refs))
 
     @property
     def requires_verified_terminal_retry(self) -> bool:
@@ -655,20 +734,23 @@ class CodexDeepFetchAdapter:
                 _write_protocol_checkpoint(checkpoint_path, checkpoint)
                 continue
 
-            if checkpoint.next_turn_number >= 12:
-                raise DeepFetchUnavailable(
-                    "deepfetch_protocol_turn_limit_exceeded"
-                )
             assert checkpoint.next_prompt is not None
             turn_number = checkpoint.next_turn_number
+            provider_job_ref = (
+                None
+                if request.job_ref is None
+                else f"{request.job_ref}:v4-turn:{turn_number}"
+            )
+            if provider_job_ref is not None:
+                self._register_provider_turn(
+                    root_job_ref=request.job_ref,
+                    turn_number=turn_number,
+                    provider_job_ref=provider_job_ref,
+                )
             turn_request = replace(
                 request,
                 native_session_ref=checkpoint.native_session_ref,
-                job_ref=(
-                    None
-                    if request.job_ref is None
-                    else f"{request.job_ref}:v4-turn:{turn_number}"
-                ),
+                job_ref=provider_job_ref,
             )
             raw, native_session_ref, turn_evidence = self._invoke(
                 turn_request,
@@ -913,7 +995,8 @@ class CodexDeepFetchAdapter:
             raise DeepFetchUnavailable("deepfetch_provider_spool_invalid") from error
         native_session_ref = request.native_session_ref
         trace_parts: list[str] = []
-        for segment_number in range(8):
+        segment_number = 0
+        while True:
             segment_name = (
                 "initial" if segment_number == 0 else f"resume-{segment_number}"
             )
@@ -951,7 +1034,7 @@ class CodexDeepFetchAdapter:
             ):
                 raise DeepFetchUnavailable("deepfetch_native_session_changed")
             native_session_ref = recovered_session
-        raise DeepFetchUnavailable("deepfetch_provider_recovery_exhausted")
+            segment_number += 1
 
     def _run_durable_segment(
         self,
@@ -1363,7 +1446,7 @@ def _read_protocol_checkpoint(
         and (not isinstance(native_session_ref, str) or not native_session_ref)
         or not isinstance(next_turn_number, int)
         or isinstance(next_turn_number, bool)
-        or not 0 <= next_turn_number <= 12
+        or next_turn_number < 0
         or not isinstance(evidence_parts, list)
         or len(evidence_parts) != next_turn_number
         or not isinstance(acquisition_request_ids, list)

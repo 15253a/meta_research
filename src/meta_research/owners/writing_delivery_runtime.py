@@ -20,6 +20,13 @@ from meta_research.owners.common import (
 )
 from meta_research.owners.human_requests import HumanResponseVerifier
 from meta_research.owners.secret_detection import contains_secret
+from meta_research.runtime_protection import (
+    RuntimeBoundary,
+    RuntimeEffectIdentity,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+    record_runtime_boundary,
+)
 from meta_research.writing_delivery import (
     WritingDeliveryOutcomeUnknown,
     WritingDeliveryProviderObservation,
@@ -33,6 +40,85 @@ _RECEIPT_SCHEMA = "meta-research/owner-acceptance-receipt/v1"
 _PROVIDER_OBSERVATION_REF = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\Z"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _AcquiredWritingDeliveryEffect:
+    identity: RuntimeEffectIdentity
+    provider_request_hash: str
+    attempt_count: int
+    reconciliation_generation: int
+    reconciling: bool
+
+
+def _writing_delivery_runtime_effect(
+    operation: "WritingDeliveryOperation",
+    *,
+    provider_request_hash: str,
+    reconciling: bool,
+) -> _AcquiredWritingDeliveryEffect:
+    if not reconciling and operation.reconciliation_generation != 0:
+        raise OwnerConflict("writing_delivery_runtime_effect_stale")
+    generation = operation.reconciliation_generation if reconciling else 0
+    return _writing_delivery_runtime_effect_from_values(
+        operation_ref=operation.operation_ref,
+        provider_operation_ref=operation.provider_operation_ref,
+        run_ref=cast(str, operation.payload["run_ref"]),
+        attempt_count=operation.attempt_count,
+        reconciliation_generation=generation,
+        provider_request_hash=provider_request_hash,
+        reconciling=reconciling,
+    )
+
+
+def _writing_delivery_runtime_effect_from_values(
+    *,
+    operation_ref: str,
+    provider_operation_ref: str,
+    run_ref: str,
+    attempt_count: int,
+    reconciliation_generation: int,
+    provider_request_hash: str,
+    reconciling: bool,
+) -> _AcquiredWritingDeliveryEffect:
+    generation = reconciliation_generation
+    if reconciling and generation < 1:
+        raise OwnerConflict("writing_delivery_reconciliation_generation_invalid")
+    if not reconciling and generation != 0:
+        raise OwnerConflict("writing_delivery_execution_generation_invalid")
+    material: dict[str, object] = {
+        "operation_ref": operation_ref,
+        "provider_operation_ref": provider_operation_ref,
+        "run_ref": run_ref,
+        "attempt_count": attempt_count,
+        "provider_request_hash": provider_request_hash,
+        "reconciling": reconciling,
+    }
+    if reconciling:
+        material["reconciliation_generation"] = generation
+    digest = canonical_hash(material)
+    return _AcquiredWritingDeliveryEffect(
+        identity=RuntimeEffectIdentity(
+            responsibility_ref=(
+                "writing_delivery_reconciliation_"
+                if reconciling
+                else "writing_delivery_responsibility_"
+            )
+            + digest,
+            owner_scope=AR_OWNER,
+            root_run_ref=run_ref,
+            attempt_ref="writing_delivery_attempt_" + digest[:64],
+            fence_ref="writing_delivery_fence_" + digest[:64],
+            operation_ref=provider_operation_ref,
+            effect_kind=(
+                "runtime_reconciliation" if reconciling else "provider_unit"
+            ),
+        ),
+        provider_request_hash=provider_request_hash,
+        attempt_count=attempt_count,
+        reconciliation_generation=generation,
+        reconciling=reconciling,
+    )
 
 
 class WritingDeliveryBindingVerifier(Protocol):
@@ -70,6 +156,7 @@ class WritingDeliveryOperation:
     payload_hash: str
     status: str
     attempt_count: int
+    reconciliation_generation: int
     provider_operation_ref: str
     provider_request_hash: str | None
     operation_receipt: AcceptanceReceipt
@@ -88,6 +175,7 @@ class WritingDeliveryOperation:
             "payload_hash": self.payload_hash,
             "status": self.status,
             "attempt_count": self.attempt_count,
+            "reconciliation_generation": self.reconciliation_generation,
             "provider_operation_ref": self.provider_operation_ref,
             "provider_request_hash": self.provider_request_hash,
             "operation_receipt": self.operation_receipt.as_public_dict(),
@@ -179,12 +267,14 @@ class SQLiteWritingDeliveryRuntime:
         provider_registry: WritingDeliveryProviderRegistry,
         *,
         production_mode: bool = True,
+        runtime_protection: RuntimeProtection | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
         self._human_response_verifier = human_response_verifier
         self._provider_registry = provider_registry
         self._production_mode = production_mode
+        self._runtime_protection = runtime_protection
         self._binding_verifier: WritingDeliveryBindingVerifier | None = None
 
     def bind_binding_verifier(self, verifier: WritingDeliveryBindingVerifier) -> None:
@@ -464,6 +554,7 @@ class SQLiteWritingDeliveryRuntime:
                     text(
                         "UPDATE ar_writing_delivery_operations SET status = "
                         "'executing', attempt_count = :attempt_count, "
+                        "reconciliation_generation = 0, "
                         "provider_request_hash = :provider_request_hash, "
                         "execution_receipt_ref = :receipt_ref, failure_code = NULL, "
                         "updated_at = :now WHERE operation_ref = :operation_ref"
@@ -544,6 +635,11 @@ class SQLiteWritingDeliveryRuntime:
             # only after the exact artifact bytes can be materialized again.
             return operation
         operation = self.claim(operation_ref, provider_request_hash=request.request_hash)
+        runtime_effect = self._acquire_runtime_effect(
+            operation,
+            provider_request_hash=request.request_hash,
+            reconciling=False,
+        )
         try:
             observation = provider.execute(request)
         except WritingDeliveryOutcomeUnknown as error:
@@ -569,7 +665,10 @@ class SQLiteWritingDeliveryRuntime:
                 operation_ref, reason_code=_exception_code(error)
             )
         return self.record_provider_observation(
-            operation_ref, observation, reconciliation=False
+            operation_ref,
+            observation,
+            reconciliation=False,
+            runtime_effect=runtime_effect,
         )
 
     def reconcile(
@@ -610,6 +709,15 @@ class SQLiteWritingDeliveryRuntime:
         return self._reconcile_request(operation, request, provider)
 
     def _reconcile_request(self, operation, request, provider) -> WritingDeliveryOperation:
+        operation = self._begin_reconciliation(
+            operation.operation_ref,
+            provider_request_hash=request.request_hash,
+        )
+        runtime_effect = self._acquire_runtime_effect(
+            operation,
+            provider_request_hash=request.request_hash,
+            reconciling=True,
+        )
         try:
             observation = provider.reconcile(request)
         except (WritingDeliveryOutcomeUnknown, ConnectionError, TimeoutError, OSError) as error:
@@ -635,8 +743,95 @@ class SQLiteWritingDeliveryRuntime:
                 reason_code=_exception_code(error),
             )
         return self.record_provider_observation(
-            operation.operation_ref, observation, reconciliation=True
+            operation.operation_ref,
+            observation,
+            reconciliation=True,
+            runtime_effect=runtime_effect,
         )
+
+    def _begin_reconciliation(
+        self,
+        operation_ref: str,
+        *,
+        provider_request_hash: str,
+    ) -> WritingDeliveryOperation:
+        _validate_operation_ref(operation_ref)
+        _validate_hash(
+            provider_request_hash,
+            "writing_delivery_provider_request_invalid",
+        )
+        with self._database.write() as connection:
+            row = _operation_row(connection, operation_ref)
+            if row.status == "completed":
+                pass
+            else:
+                if row.provider_request_hash not in {
+                    None,
+                    provider_request_hash,
+                }:
+                    raise OwnerConflict("writing_delivery_provider_request_drift")
+                generation = int(row.reconciliation_generation) + 1
+                now = time.time()
+                changed = connection.execute(
+                    text(
+                        "UPDATE ar_writing_delivery_operations SET "
+                        "reconciliation_generation = :generation, "
+                        "provider_request_hash = :provider_request_hash, updated_at = "
+                        ":now WHERE operation_ref = :operation_ref AND status != "
+                        "'completed' AND reconciliation_generation = "
+                        ":prior_generation"
+                    ),
+                    {
+                        "generation": generation,
+                        "provider_request_hash": provider_request_hash,
+                        "now": now,
+                        "operation_ref": operation_ref,
+                        "prior_generation": int(row.reconciliation_generation),
+                    },
+                )
+                if changed.rowcount != 1:
+                    raise OwnerConflict("writing_delivery_reconciliation_conflict")
+                connection.execute(
+                    text(
+                        "UPDATE agent_runtime_state SET revision = revision + 1 "
+                        "WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "agent_runtime.writing_delivery_reconciling",
+                    {
+                        "operation_ref": operation_ref,
+                        "provider_operation_ref": row.provider_operation_ref,
+                        "reconciliation_generation": generation,
+                    },
+                )
+        result = self.query_operation(operation_ref)
+        if result is None:
+            raise OwnerConflict("writing_delivery_operation_missing")
+        return result
+
+    def _acquire_runtime_effect(
+        self,
+        operation: WritingDeliveryOperation,
+        *,
+        provider_request_hash: str,
+        reconciling: bool,
+    ) -> _AcquiredWritingDeliveryEffect | None:
+        if self._runtime_protection is None:
+            if self._production_mode:
+                raise OwnerConflict("runtime_protection_unavailable")
+            return None
+        effect = _writing_delivery_runtime_effect(
+            operation,
+            provider_request_hash=provider_request_hash,
+            reconciling=reconciling,
+        )
+        try:
+            self._runtime_protection.acquire(effect.identity)
+        except RuntimeProtectionUnavailable as error:
+            raise OwnerConflict(error.code) from error
+        return effect
 
     def record_provider_observation(
         self,
@@ -644,6 +839,7 @@ class SQLiteWritingDeliveryRuntime:
         observation: WritingDeliveryProviderObservation,
         *,
         reconciliation: bool,
+        runtime_effect: _AcquiredWritingDeliveryEffect | None = None,
     ) -> WritingDeliveryOperation:
         _validate_operation_ref(operation_ref)
         if type(observation) is not WritingDeliveryProviderObservation:
@@ -682,8 +878,31 @@ class SQLiteWritingDeliveryRuntime:
                 "details": observation.details,
             }
         )
+        settlements: list[tuple[str, RuntimeBoundary, str | None]] = []
         with self._database.write() as connection:
             row = _operation_row(connection, operation_ref)
+            if runtime_effect is not None:
+                if (
+                    row.provider_request_hash is None
+                    or runtime_effect.reconciling is not reconciliation
+                    or runtime_effect.provider_request_hash
+                    != row.provider_request_hash
+                    or runtime_effect.attempt_count != int(row.attempt_count)
+                    or runtime_effect.reconciliation_generation
+                    != int(row.reconciliation_generation)
+                ):
+                    raise OwnerConflict("writing_delivery_runtime_effect_stale")
+                expected_effect = _writing_delivery_runtime_effect_from_values(
+                    operation_ref=str(row.operation_ref),
+                    provider_operation_ref=str(row.provider_operation_ref),
+                    run_ref=str(row.run_ref),
+                    attempt_count=int(row.attempt_count),
+                    reconciliation_generation=int(row.reconciliation_generation),
+                    provider_request_hash=str(row.provider_request_hash),
+                    reconciling=reconciliation,
+                )
+                if runtime_effect != expected_effect:
+                    raise OwnerConflict("writing_delivery_runtime_effect_stale")
             if (
                 observation.provider_ref != row.provider_ref
                 or observation.provider_operation_ref != row.provider_operation_ref
@@ -860,10 +1079,156 @@ class SQLiteWritingDeliveryRuntime:
                         "reconciliation": reconciliation,
                     },
                 )
+            if runtime_effect is not None and observation.outcome != "outcome_unknown":
+                try:
+                    settlements = self._record_runtime_observation_boundaries(
+                        connection,
+                        row=row,
+                        runtime_effect=runtime_effect,
+                        reconciliation=reconciliation,
+                        status=status,
+                        observation_hash=accepted_observation_hash,
+                    )
+                except RuntimeProtectionUnavailable as error:
+                    raise OwnerConflict(error.code) from error
+        self._finish_runtime_settlements(settlements)
         result = self.query_operation(operation_ref)
         if result is None:
             raise OwnerConflict("writing_delivery_operation_missing")
         return result
+
+    def _record_runtime_observation_boundaries(
+        self,
+        connection,
+        *,
+        row,
+        runtime_effect: _AcquiredWritingDeliveryEffect,
+        reconciliation: bool,
+        status: str,
+        observation_hash: str,
+    ) -> list[tuple[str, RuntimeBoundary, str | None]]:
+        identity = runtime_effect.identity
+        boundary: RuntimeBoundary = (
+            "terminal" if status == "completed" else "checkpoint"
+        )
+        checkpoint_ref = (
+            None
+            if boundary != "checkpoint"
+            else "writing_delivery_checkpoint_"
+            + canonical_hash(
+                {
+                    "responsibility_ref": identity.responsibility_ref,
+                    "operation_ref": row.operation_ref,
+                    "status": status,
+                    "observation_hash": observation_hash,
+                }
+            )
+        )
+        record_runtime_boundary(
+            connection,
+            identity=identity,
+            boundary=boundary,
+            checkpoint_ref=checkpoint_ref,
+            owner_evidence_ref="writing_delivery_observation_" + observation_hash,
+        )
+        settlements: list[tuple[str, RuntimeBoundary, str | None]] = [
+            (identity.responsibility_ref, boundary, checkpoint_ref)
+        ]
+        if not reconciliation:
+            return settlements
+
+        predecessors = connection.execute(
+            text(
+                "SELECT responsibility.*, receipt.boundary AS receipt_boundary, "
+                "receipt.checkpoint_ref AS receipt_checkpoint_ref FROM "
+                "ar_execution_responsibilities AS responsibility LEFT JOIN "
+                "ar_runtime_boundary_receipts AS receipt ON "
+                "receipt.responsibility_ref = responsibility.responsibility_ref "
+                "WHERE responsibility.owner_scope = 'agent_runtime' AND "
+                "responsibility.root_run_ref = :run_ref AND "
+                "responsibility.operation_ref = :operation_ref AND "
+                "responsibility.effect_kind IN "
+                "('provider_unit', 'runtime_reconciliation') AND "
+                "responsibility.responsibility_ref != :current_ref AND "
+                "responsibility.status IN "
+                "('acquiring', 'active', 'waiting', 'interrupted') ORDER BY "
+                "responsibility.created_at, responsibility.responsibility_ref"
+            ),
+            {
+                "run_ref": row.run_ref,
+                "operation_ref": row.provider_operation_ref,
+                "current_ref": identity.responsibility_ref,
+            },
+        ).mappings().all()
+        predecessor_evidence_ref = "writing_delivery_reconciled_" + canonical_hash(
+            {
+                "operation_ref": row.operation_ref,
+                "reconciliation_responsibility_ref": (
+                    identity.responsibility_ref
+                ),
+                "observation_hash": observation_hash,
+            }
+        )
+        for predecessor in predecessors:
+            receipt_boundary = predecessor["receipt_boundary"]
+            if receipt_boundary is None:
+                predecessor_effect = RuntimeEffectIdentity(
+                    responsibility_ref=str(predecessor["responsibility_ref"]),
+                    owner_scope=str(predecessor["owner_scope"]),
+                    root_run_ref=str(predecessor["root_run_ref"]),
+                    attempt_ref=(
+                        None
+                        if predecessor["attempt_ref"] is None
+                        else str(predecessor["attempt_ref"])
+                    ),
+                    fence_ref=(
+                        None
+                        if predecessor["fence_ref"] is None
+                        else str(predecessor["fence_ref"])
+                    ),
+                    operation_ref=str(predecessor["operation_ref"]),
+                    effect_kind=str(predecessor["effect_kind"]),
+                )
+                record_runtime_boundary(
+                    connection,
+                    identity=predecessor_effect,
+                    boundary="permanent_fence",
+                    owner_evidence_ref=predecessor_evidence_ref,
+                )
+                settlements.append(
+                    (predecessor_effect.responsibility_ref, "permanent_fence", None)
+                )
+            else:
+                settlements.append(
+                    (
+                        str(predecessor["responsibility_ref"]),
+                        cast(RuntimeBoundary, str(receipt_boundary)),
+                        (
+                            None
+                            if predecessor["receipt_checkpoint_ref"] is None
+                            else str(predecessor["receipt_checkpoint_ref"])
+                        ),
+                    )
+                )
+        return settlements
+
+    def _finish_runtime_settlements(
+        self,
+        settlements: list[tuple[str, RuntimeBoundary, str | None]],
+    ) -> None:
+        if not settlements:
+            return
+        if self._runtime_protection is None:
+            raise OwnerConflict("runtime_protection_unavailable")
+        for responsibility_ref, boundary, checkpoint_ref in settlements:
+            try:
+                self._runtime_protection.finish(
+                    responsibility_ref,
+                    boundary=boundary,
+                    checkpoint_ref=checkpoint_ref,
+                )
+            except RuntimeProtectionUnavailable as error:
+                raise OwnerConflict(error.code) from error
 
     def mark_outcome_unknown(
         self, operation_ref: str, *, reason_code: str
@@ -1061,6 +1426,7 @@ class SQLiteWritingDeliveryRuntime:
             payload_hash=row.payload_hash,
             status=row.status,
             attempt_count=int(row.attempt_count),
+            reconciliation_generation=int(row.reconciliation_generation),
             provider_operation_ref=row.provider_operation_ref,
             provider_request_hash=row.provider_request_hash,
             operation_receipt=operation_receipt,

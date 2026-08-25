@@ -81,6 +81,13 @@ from meta_research.reasoning_contract import (
     validate_autonomous_question_proposal,
     validate_autonomous_question_scope,
 )
+from meta_research.runtime_protection import (
+    RuntimeBoundary,
+    RuntimeEffectIdentity,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+    record_runtime_boundary,
+)
 from meta_research.writing_contract import validate_frozen_writing_snapshot
 
 
@@ -104,6 +111,14 @@ AUTONOMOUS_PROPOSAL_RECEIPT_KIND = "autonomous_question_proposal"
 AUTONOMOUS_SELECTION_RECEIPT_KIND = "autonomous_question_selection"
 QUEST_COMPLETION_CONFIRMATION_RECEIPT_KIND = "quest_completion_confirmation"
 _DRAFTING_CLAIM_LEASE_SECONDS = 5 * 60
+_DRAFTING_RECONCILIATION_CODES = frozenset(
+    {
+        "codex_job_outcome_unknown",
+        "codex_job_spool_invalid",
+        "codex_job_spool_conflict",
+        "codex_operation_reconciliation_pending",
+    }
+)
 _COMPLETED_CUSTODY_AUDIT_SECONDS = 60
 _PREVIEW_REFRESH_RETRY_SECONDS = 60.0
 _PREVIEW_REFRESH_CACHE_LIMIT = 256
@@ -164,11 +179,40 @@ def _switch_runtime_effect_requires_compensation(
 
 
 def _proposal_provider_job_ref(generation_ref: str, attempt_count: int) -> str:
-    return f"{generation_ref}:claim:{attempt_count}"
+    del attempt_count
+    return f"{generation_ref}:proposal"
 
 
 def _intent_provider_job_ref(turn_ref: str, attempt_count: int) -> str:
-    return f"{turn_ref}:claim:{attempt_count}"
+    del attempt_count
+    return f"{turn_ref}:intent-reply"
+
+
+def _drafting_runtime_effect(
+    *,
+    root_ref: str,
+    provider_job_ref: str,
+    claim_attempt: int,
+) -> RuntimeEffectIdentity:
+    return RuntimeEffectIdentity(
+        responsibility_ref="drafting_responsibility_"
+        + canonical_hash(
+            {
+                "root_ref": root_ref,
+                "provider_job_ref": provider_job_ref,
+                "claim_attempt": claim_attempt,
+            }
+        ),
+        owner_scope="human_collaboration",
+        root_run_ref=root_ref,
+        attempt_ref=f"drafting_attempt_{claim_attempt}",
+        fence_ref="drafting_fence_"
+        + canonical_hash(
+            {"provider_job_ref": provider_job_ref, "claim_attempt": claim_attempt}
+        ),
+        operation_ref=provider_job_ref,
+        effect_kind="drafting_claim",
+    )
 
 
 class HumanCollaborationInterface(Protocol):
@@ -302,6 +346,14 @@ class HumanCollaborationInterface(Protocol):
         decision: dict[str, object],
         idempotency_key: str,
     ) -> dict[str, object]: ...
+
+    def verify_capability_authorization(
+        self,
+        *,
+        requirement: dict[str, object],
+        receipt_ref: str,
+        _expected_decision: str = "granted",
+    ) -> None: ...
 
     def query_broad_research_authorization(
         self, quest_ref: str
@@ -1571,6 +1623,7 @@ class SQLiteHumanCollaboration:
         proposal_drafter: ProposalDrafter,
         intent_drafting_provider: IntentDraftingProvider,
         acquisition_provider: AcquisitionProvider,
+        runtime_protection: RuntimeProtection | None = None,
     ) -> None:
         self._database = database
         self._feed = feed
@@ -1581,6 +1634,7 @@ class SQLiteHumanCollaboration:
         self._proposal_drafter = proposal_drafter
         self._intent_drafting_provider = intent_drafting_provider
         self._acquisition_provider = acquisition_provider
+        self._runtime_protection = runtime_protection
         self._manual_creation = ManualQuestionCreation(
             database,
             feed,
@@ -1589,6 +1643,7 @@ class SQLiteHumanCollaboration:
             agent_runtime,
             acquisition_provider,
             intent_drafting_provider,
+            runtime_protection,
         )
         self._fact_verifier = SQLiteHumanCollaborationFactVerifier(database)
         self._fact_verifier.bind_quest_receipt_verifier(research_graph)
@@ -1599,6 +1654,7 @@ class SQLiteHumanCollaboration:
             context_resolver=self._resolve_companion_context,
             control_preview_resolver=self._resolve_control_preview,
             writing_snapshot_validator=validate_frozen_writing_snapshot,
+            runtime_protection=runtime_protection,
         )
         self._snapshot = SQLiteOwnerSnapshot(database, _SNAPSHOT)
         self._preview_refresh_lock = threading.Lock()
@@ -2619,6 +2675,19 @@ class SQLiteHumanCollaboration:
     ) -> dict[str, object]:
         return self._collaboration_ladder.decide_capability_authorization(
             scope_ref, decision, idempotency_key
+        )
+
+    def verify_capability_authorization(
+        self,
+        *,
+        requirement: dict[str, object],
+        receipt_ref: str,
+        _expected_decision: str = "granted",
+    ) -> None:
+        self._fact_verifier.verify_capability_authorization(
+            requirement=requirement,
+            receipt_ref=receipt_ref,
+            _expected_decision=_expected_decision,
         )
 
     def query_broad_research_authorization(
@@ -3726,9 +3795,11 @@ class SQLiteHumanCollaboration:
             )
 
     def _recover_interrupted_drafting(self) -> None:
-        """Return crash-interrupted provider work to a claimable durable state."""
+        """Preserve unknown work and finish terminal Owner-to-runtime ACK loss."""
 
         now = time.time()
+        terminal_proposal_rows: tuple[Row, ...] = ()
+        terminal_turn_rows: tuple[Row, ...] = ()
         with self._database.write() as connection:
             closed_sessions = connection.execute(
                 text(
@@ -3749,14 +3820,6 @@ class SQLiteHumanCollaboration:
                 ),
                 {"now": now},
             )
-            resumed_turns = connection.execute(
-                text(
-                    "UPDATE hc_intent_drafting_turns SET assistant_status = 'queued', "
-                    "assistant_started_at = NULL "
-                    "WHERE assistant_status = 'running' AND session_ref IN (SELECT "
-                    "session_ref FROM hc_intent_drafting_sessions WHERE status = 'open')"
-                )
-            )
             failed_generations = connection.execute(
                 text(
                     "UPDATE hc_proposal_generation_attempts SET status = 'failed', "
@@ -3767,20 +3830,58 @@ class SQLiteHumanCollaboration:
                 ),
                 {"now": now},
             )
-            resumed_generations = connection.execute(
-                text(
-                    "UPDATE hc_proposal_generation_attempts SET status = 'queued', "
-                    "started_at = NULL WHERE status = 'running'"
+            if self._runtime_protection is not None:
+                # Re-read after terminal-session recovery so work that was
+                # running at daemon loss is fenced only after its provider
+                # cancellation can be verified below.
+                terminal_proposal_rows = tuple(
+                    connection.execute(
+                        text(
+                            "SELECT attempts.generation_ref, "
+                            "attempts.initialization_id, attempts.attempt_count, "
+                            "attempts.status, attempts.failure_code FROM "
+                            "hc_proposal_generation_attempts AS attempts JOIN "
+                            "ar_execution_responsibilities AS responsibilities ON "
+                            "responsibilities.operation_ref = "
+                            "attempts.generation_ref || :proposal_suffix AND "
+                            "responsibilities.attempt_ref = 'drafting_attempt_' || "
+                            "CAST(attempts.attempt_count AS TEXT) WHERE "
+                            "attempts.status != 'running' AND "
+                            "responsibilities.owner_scope = 'human_collaboration' "
+                            "AND responsibilities.effect_kind = 'drafting_claim' "
+                            "AND responsibilities.status != 'finished'"
+                        ),
+                        {"proposal_suffix": ":proposal"},
+                    ).all()
                 )
-            )
+                terminal_turn_rows = tuple(
+                    connection.execute(
+                        text(
+                            "SELECT turns.turn_ref, "
+                            "turns.assistant_attempt_count, "
+                            "sessions.initialization_id, turns.assistant_status, "
+                            "turns.reason_code FROM hc_intent_drafting_turns AS "
+                            "turns JOIN hc_intent_drafting_sessions AS sessions ON "
+                            "sessions.session_ref = turns.session_ref JOIN "
+                            "ar_execution_responsibilities AS responsibilities ON "
+                            "responsibilities.operation_ref = turns.turn_ref || "
+                            ":intent_suffix AND responsibilities.attempt_ref = "
+                            "'drafting_attempt_' || "
+                            "CAST(turns.assistant_attempt_count AS TEXT) WHERE "
+                            "turns.assistant_status != 'running' AND "
+                            "responsibilities.owner_scope = 'human_collaboration' "
+                            "AND responsibilities.effect_kind = 'drafting_claim' "
+                            "AND responsibilities.status != 'finished'"
+                        ),
+                        {"intent_suffix": ":intent-reply"},
+                    ).all()
+                )
             recovered = sum(
                 result.rowcount or 0
                 for result in (
                     closed_sessions,
                     failed_turns,
-                    resumed_turns,
                     failed_generations,
-                    resumed_generations,
                 )
             )
             if recovered:
@@ -3795,6 +3896,118 @@ class SQLiteHumanCollaboration:
                     "human_collaboration.drafting_recovered",
                     {"recovered_record_count": recovered},
                 )
+        for row in terminal_proposal_rows:
+            provider_job_ref = _proposal_provider_job_ref(
+                str(row.generation_ref), int(row.attempt_count)
+            )
+            effect = _drafting_runtime_effect(
+                root_ref=str(row.initialization_id),
+                provider_job_ref=provider_job_ref,
+                claim_attempt=int(row.attempt_count),
+            )
+            try:
+                if row.failure_code == "initialization_terminal":
+                    boundary_finished = self._cancel_and_fence_drafting_job(
+                        provider=self._proposal_drafter,
+                        provider_job_ref=provider_job_ref,
+                        effect=effect,
+                        evidence_kind="initialization_terminal",
+                    )
+                else:
+                    boundary_finished = self._finish_drafting_protection(
+                        effect,
+                        table="hc_proposal_generation_attempts",
+                        ref_column="generation_ref",
+                        ref_value=str(row.generation_ref),
+                        attempt_column="attempt_count",
+                        attempt_value=int(row.attempt_count),
+                        status_column="status",
+                    )
+                if boundary_finished:
+                    self._finish_provider_job(
+                        self._proposal_drafter, provider_job_ref
+                    )
+            except (RuntimeProtectionUnavailable, ValueError) as error:
+                code = getattr(error, "code", str(error))
+                if code != "runtime_responsibility_not_found":
+                    raise
+        for row in terminal_turn_rows:
+            provider_job_ref = _intent_provider_job_ref(
+                str(row.turn_ref), int(row.assistant_attempt_count)
+            )
+            effect = _drafting_runtime_effect(
+                root_ref=str(row.initialization_id),
+                provider_job_ref=provider_job_ref,
+                claim_attempt=int(row.assistant_attempt_count),
+            )
+            try:
+                if row.reason_code == "intent_session_closed":
+                    boundary_finished = self._cancel_and_fence_drafting_job(
+                        provider=self._intent_drafting_provider,
+                        provider_job_ref=provider_job_ref,
+                        effect=effect,
+                        evidence_kind="intent_session_closed",
+                    )
+                else:
+                    boundary_finished = self._finish_drafting_protection(
+                        effect,
+                        table="hc_intent_drafting_turns",
+                        ref_column="turn_ref",
+                        ref_value=str(row.turn_ref),
+                        attempt_column="assistant_attempt_count",
+                        attempt_value=int(row.assistant_attempt_count),
+                        status_column="assistant_status",
+                    )
+                if boundary_finished:
+                    self._finish_provider_job(
+                        self._intent_drafting_provider, provider_job_ref
+                    )
+            except (RuntimeProtectionUnavailable, ValueError) as error:
+                code = getattr(error, "code", str(error))
+                if code != "runtime_responsibility_not_found":
+                    raise
+
+    def _cancel_and_fence_drafting_job(
+        self,
+        *,
+        provider: object,
+        provider_job_ref: str,
+        effect: RuntimeEffectIdentity,
+        evidence_kind: str,
+    ) -> bool:
+        cancel_job = getattr(provider, "cancel_job", None)
+        if not callable(cancel_job) or cancel_job(provider_job_ref) is not True:
+            return False
+        return self._finish_drafting_permanent_fence(
+            effect, evidence_kind=evidence_kind
+        )
+
+    def _finish_drafting_permanent_fence(
+        self,
+        effect: RuntimeEffectIdentity,
+        *,
+        evidence_kind: str,
+    ) -> bool:
+        if self._runtime_protection is None:
+            return True
+        with self._database.write() as connection:
+            record_runtime_boundary(
+                connection,
+                identity=effect,
+                boundary="permanent_fence",
+                owner_evidence_ref="drafting_cancel_"
+                + canonical_hash(
+                    {
+                        "responsibility_ref": effect.responsibility_ref,
+                        "evidence_kind": evidence_kind,
+                    }
+                ),
+            )
+        self._runtime_protection.finish(
+            effect.responsibility_ref,
+            boundary="permanent_fence",
+        )
+        return True
 
     def create_quest(
         self, draft: dict[str, object], idempotency_key: str
@@ -5061,6 +5274,9 @@ class SQLiteHumanCollaboration:
         )
 
     def _process_quest_drafting_once(self) -> bool:
+        reconciled = self._reconcile_running_drafting_once()
+        if reconciled is not None:
+            return reconciled
         self._recover_expired_drafting_claims()
         if self._process_proposal_generation_once():
             return True
@@ -5084,55 +5300,259 @@ class SQLiteHumanCollaboration:
             else False
         )
 
+    def _reconcile_running_drafting_once(self) -> bool | None:
+        proposal = self._reconcile_running_proposal_once()
+        if proposal is not None:
+            return proposal
+        return self._reconcile_running_intent_once()
+
+    def _reconcile_running_proposal_once(self) -> bool | None:
+        with self._database.read() as connection:
+            job = connection.execute(
+                text(
+                    "SELECT attempts.* FROM hc_proposal_generation_attempts AS "
+                    "attempts JOIN hc_quest_initializations AS initializations ON "
+                    "initializations.initialization_id = attempts.initialization_id "
+                    "WHERE attempts.status = 'running' AND initializations.status "
+                    "NOT IN ('confirmed', 'completed', 'cancelled') ORDER BY "
+                    "attempts.started_at LIMIT 1"
+                )
+            ).first()
+            if job is None:
+                return None
+            revision = connection.execute(
+                text(
+                    "SELECT draft_json, draft_hash FROM hc_quest_draft_revisions "
+                    "WHERE initialization_id = :initialization_id AND revision = "
+                    ":basis_revision"
+                ),
+                {
+                    "initialization_id": job.initialization_id,
+                    "basis_revision": int(job.basis_revision),
+                },
+            ).first()
+        provider_job_ref = _proposal_provider_job_ref(
+            str(job.generation_ref), int(job.attempt_count)
+        )
+        reconcile = getattr(self._proposal_drafter, "reconcile_job", None)
+        if not callable(reconcile) or reconcile(provider_job_ref) != "terminal":
+            return None
+        effect = _drafting_runtime_effect(
+            root_ref=str(job.initialization_id),
+            provider_job_ref=provider_job_ref,
+            claim_attempt=int(job.attempt_count),
+        )
+        return self._settle_claimed_proposal_job(
+            job, revision, effect, provider_job_ref
+        )
+
+    def _reconcile_running_intent_once(self) -> bool | None:
+        with self._database.read() as connection:
+            turn = connection.execute(
+                text(
+                    "SELECT turns.*, sessions.initialization_id FROM "
+                    "hc_intent_drafting_turns AS turns JOIN "
+                    "hc_intent_drafting_sessions AS sessions ON "
+                    "sessions.session_ref = turns.session_ref JOIN "
+                    "hc_quest_initializations AS initializations ON "
+                    "initializations.initialization_id = sessions.initialization_id "
+                    "WHERE turns.assistant_status = 'running' AND sessions.status "
+                    "= 'open' AND initializations.status NOT IN ('confirmed', "
+                    "'completed', 'cancelled') ORDER BY turns.assistant_started_at "
+                    "LIMIT 1"
+                )
+            ).first()
+            if turn is None:
+                return None
+            prior_metadata = connection.execute(
+                text(
+                    "SELECT adapter_metadata_json FROM hc_intent_drafting_turns "
+                    "WHERE session_ref = :session_ref AND ordinal < :ordinal AND "
+                    "assistant_status = 'completed' ORDER BY ordinal DESC LIMIT 1"
+                ),
+                {"session_ref": turn.session_ref, "ordinal": int(turn.ordinal)},
+            ).scalar_one_or_none()
+            turn_revision = connection.execute(
+                text(
+                    "SELECT draft_json, draft_hash FROM hc_quest_draft_revisions "
+                    "WHERE initialization_id = :initialization_id AND revision = "
+                    ":basis_revision"
+                ),
+                {
+                    "initialization_id": turn.initialization_id,
+                    "basis_revision": int(turn.basis_revision),
+                },
+            ).first()
+        provider_job_ref = _intent_provider_job_ref(
+            str(turn.turn_ref), int(turn.assistant_attempt_count)
+        )
+        reconcile = getattr(
+            self._intent_drafting_provider, "reconcile_job", None
+        )
+        if not callable(reconcile) or reconcile(provider_job_ref) != "terminal":
+            return None
+        effect = _drafting_runtime_effect(
+            root_ref=str(turn.initialization_id),
+            provider_job_ref=provider_job_ref,
+            claim_attempt=int(turn.assistant_attempt_count),
+        )
+        return self._settle_claimed_intent_turn(
+            turn,
+            str(turn.initialization_id),
+            prior_metadata,
+            turn_revision,
+            effect,
+            provider_job_ref,
+        )
+
     def _recover_expired_drafting_claims(self) -> None:
         cutoff = time.time() - _DRAFTING_CLAIM_LEASE_SECONDS
-        expired_generation_refs: tuple[str, ...] = ()
-        expired_turn_refs: tuple[str, ...] = ()
-        with self._database.write() as connection:
+        with self._database.read() as connection:
             generations = connection.execute(
                 text(
-                    "UPDATE hc_proposal_generation_attempts SET status = 'queued', "
-                    "started_at = NULL WHERE status = 'running' AND started_at < "
-                    ":cutoff RETURNING generation_ref, attempt_count"
+                    "SELECT generation_ref, initialization_id, attempt_count FROM "
+                    "hc_proposal_generation_attempts WHERE status = 'running' AND "
+                    "started_at < :cutoff ORDER BY started_at"
                 ),
                 {"cutoff": cutoff},
             ).all()
             turns = connection.execute(
                 text(
-                    "UPDATE hc_intent_drafting_turns SET assistant_status = 'queued', "
-                    "assistant_started_at = NULL WHERE assistant_status = 'running' "
-                    "AND assistant_started_at < :cutoff RETURNING turn_ref, "
-                    "assistant_attempt_count"
+                    "SELECT turns.turn_ref, turns.assistant_attempt_count, "
+                    "sessions.initialization_id FROM hc_intent_drafting_turns AS "
+                    "turns JOIN hc_intent_drafting_sessions AS sessions ON "
+                    "sessions.session_ref = turns.session_ref WHERE "
+                    "turns.assistant_status = 'running' AND "
+                    "turns.assistant_started_at < :cutoff ORDER BY "
+                    "turns.assistant_started_at"
                 ),
                 {"cutoff": cutoff},
             ).all()
-            expired_generation_refs = tuple(
-                _proposal_provider_job_ref(
+        for row in generations:
+            self._recover_expired_drafting_claim(
+                provider=self._proposal_drafter,
+                provider_job_ref=_proposal_provider_job_ref(
                     str(row.generation_ref), int(row.attempt_count)
-                )
-                for row in generations
+                ),
+                effect=_drafting_runtime_effect(
+                    root_ref=str(row.initialization_id),
+                    provider_job_ref=_proposal_provider_job_ref(
+                        str(row.generation_ref), int(row.attempt_count)
+                    ),
+                    claim_attempt=int(row.attempt_count),
+                ),
+                table="hc_proposal_generation_attempts",
+                ref_column="generation_ref",
+                ref_value=str(row.generation_ref),
+                attempt_column="attempt_count",
+                attempt_value=int(row.attempt_count),
+                status_column="status",
+                started_column="started_at",
             )
-            expired_turn_refs = tuple(
-                _intent_provider_job_ref(
+        for row in turns:
+            self._recover_expired_drafting_claim(
+                provider=self._intent_drafting_provider,
+                provider_job_ref=_intent_provider_job_ref(
                     str(row.turn_ref), int(row.assistant_attempt_count)
-                )
-                for row in turns
+                ),
+                effect=_drafting_runtime_effect(
+                    root_ref=str(row.initialization_id),
+                    provider_job_ref=_intent_provider_job_ref(
+                        str(row.turn_ref), int(row.assistant_attempt_count)
+                    ),
+                    claim_attempt=int(row.assistant_attempt_count),
+                ),
+                table="hc_intent_drafting_turns",
+                ref_column="turn_ref",
+                ref_value=str(row.turn_ref),
+                attempt_column="assistant_attempt_count",
+                attempt_value=int(row.assistant_attempt_count),
+                status_column="assistant_status",
+                started_column="assistant_started_at",
             )
-            recovered = len(generations) + len(turns)
-            if recovered:
-                connection.execute(
-                    text(
-                        "UPDATE human_collaboration_state SET revision = revision + 1 "
-                        "WHERE singleton = 'owner'"
-                    )
+
+    def _recover_expired_drafting_claim(
+        self,
+        *,
+        provider: object,
+        provider_job_ref: str,
+        effect: RuntimeEffectIdentity,
+        table: str,
+        ref_column: str,
+        ref_value: str,
+        attempt_column: str,
+        attempt_value: int,
+        status_column: str,
+        started_column: str,
+    ) -> None:
+        cancel_job = getattr(provider, "cancel_job", None)
+        if not callable(cancel_job) or cancel_job(provider_job_ref) is not True:
+            return
+        allowed = {
+            (
+                "hc_proposal_generation_attempts",
+                "generation_ref",
+                "attempt_count",
+                "status",
+                "started_at",
+            ),
+            (
+                "hc_intent_drafting_turns",
+                "turn_ref",
+                "assistant_attempt_count",
+                "assistant_status",
+                "assistant_started_at",
+            ),
+        }
+        if (
+            table,
+            ref_column,
+            attempt_column,
+            status_column,
+            started_column,
+        ) not in allowed:
+            raise AssertionError("expired drafting recovery query invalid")
+        with self._database.write() as connection:
+            updated = connection.execute(
+                text(
+                    f"UPDATE {table} SET {status_column} = 'queued', "
+                    f"{started_column} = NULL WHERE {ref_column} = :ref_value AND "
+                    f"{status_column} = 'running' AND {attempt_column} = "
+                    ":attempt_value"
+                ),
+                {"ref_value": ref_value, "attempt_value": attempt_value},
+            )
+            if not updated.rowcount:
+                return
+            connection.execute(
+                text(
+                    "UPDATE human_collaboration_state SET revision = revision + 1 "
+                    "WHERE singleton = 'owner'"
                 )
-                self._feed.record(
-                    connection,
-                    "human_collaboration.drafting_claims_expired",
-                    {"recovered_record_count": recovered},
-                )
-        if expired_generation_refs or expired_turn_refs:
-            self._cancel_provider_jobs(expired_generation_refs, expired_turn_refs)
+            )
+            self._feed.record(
+                connection,
+                "human_collaboration.drafting_claims_expired",
+                {"recovered_record_count": 1},
+            )
+        try:
+            boundary_finished = self._finish_drafting_protection(
+                effect,
+                table=table,
+                ref_column=ref_column,
+                ref_value=ref_value,
+                attempt_column=attempt_column,
+                attempt_value=attempt_value,
+                status_column=status_column,
+            )
+        except RuntimeProtectionUnavailable as error:
+            if error.code != "runtime_responsibility_not_found":
+                raise
+            # A pre-protection claim can be recovered from the durable Owner
+            # requeue once provider cancellation itself has been verified.
+            boundary_finished = True
+        if boundary_finished:
+            self._finish_provider_job(provider, provider_job_ref)
 
     def _process_proposal_generation_once(self) -> bool:
         with self._database.write() as connection:
@@ -5165,10 +5585,74 @@ class SQLiteHumanCollaboration:
         provider_job_ref = _proposal_provider_job_ref(
             str(job.generation_ref), int(job.attempt_count)
         )
-        try:
-            return self._complete_claimed_proposal_job(job, revision)
-        finally:
+        effect = _drafting_runtime_effect(
+            root_ref=str(job.initialization_id),
+            provider_job_ref=provider_job_ref,
+            claim_attempt=int(job.attempt_count),
+        )
+        if self._runtime_protection is not None:
+            try:
+                self._runtime_protection.acquire(effect)
+            except RuntimeProtectionUnavailable as error:
+                self._fail_proposal_job(
+                    job.generation_ref,
+                    int(job.attempt_count),
+                    error.code,
+                    status="capability_unavailable",
+                )
+                try:
+                    self._finish_drafting_protection(
+                        effect,
+                        table="hc_proposal_generation_attempts",
+                        ref_column="generation_ref",
+                        ref_value=str(job.generation_ref),
+                        attempt_column="attempt_count",
+                        attempt_value=int(job.attempt_count),
+                        status_column="status",
+                    )
+                except RuntimeProtectionUnavailable as boundary_error:
+                    if boundary_error.code != "runtime_responsibility_not_found":
+                        raise
+                self._finish_provider_job(self._proposal_drafter, provider_job_ref)
+                return True
+        return self._settle_claimed_proposal_job(
+            job, revision, effect, provider_job_ref
+        )
+
+    def _settle_claimed_proposal_job(
+        self,
+        job: Row,
+        revision: Row | None,
+        effect: RuntimeEffectIdentity,
+        provider_job_ref: str,
+    ) -> bool:
+        result = self._complete_claimed_proposal_job(job, revision)
+        boundary_finished = self._finish_drafting_protection(
+            effect,
+            table="hc_proposal_generation_attempts",
+            ref_column="generation_ref",
+            ref_value=str(job.generation_ref),
+            attempt_column="attempt_count",
+            attempt_value=int(job.attempt_count),
+            status_column="status",
+        )
+        if boundary_finished:
             self._finish_provider_job(self._proposal_drafter, provider_job_ref)
+            with self._database.read() as connection:
+                status = connection.execute(
+                    text(
+                        "SELECT status FROM hc_proposal_generation_attempts WHERE "
+                        "generation_ref = :generation_ref AND attempt_count = "
+                        ":attempt_count"
+                    ),
+                    {
+                        "generation_ref": job.generation_ref,
+                        "attempt_count": int(job.attempt_count),
+                    },
+                ).scalar_one_or_none()
+            if status == "succeeded":
+                self._auto_refresh_preview(str(job.initialization_id))
+        return result
 
     def _complete_claimed_proposal_job(self, job: Row, revision: Row | None) -> bool:
         claim_attempt = int(job.attempt_count)
@@ -5226,7 +5710,15 @@ class SQLiteHumanCollaboration:
             )
             content = _validate_question_content(result.content)
         except DraftingUnavailable as error:
+            if error.code in _DRAFTING_RECONCILIATION_CODES:
+                return False
             if error.code == "codex_cli_stopped":
+                cancel_job = getattr(self._proposal_drafter, "cancel_job", None)
+                if (
+                    not callable(cancel_job)
+                    or cancel_job(provider_job_ref) is not True
+                ):
+                    return False
                 self._requeue_interrupted_proposal_job(
                     job.generation_ref, claim_attempt
                 )
@@ -5256,7 +5748,6 @@ class SQLiteHumanCollaboration:
             )
             return True
 
-        recorded: tuple[str, str] | None = None
         with self._database.write() as connection:
             current_job = connection.execute(
                 text(
@@ -5349,9 +5840,6 @@ class SQLiteHumanCollaboration:
                         "now": time.time(),
                     },
                 )
-                recorded = (proposal_ref, proposal_hash)
-        if recorded is not None:
-            self._auto_refresh_preview(job.initialization_id)
         return True
 
     def _requeue_interrupted_proposal_job(
@@ -5535,12 +6023,87 @@ class SQLiteHumanCollaboration:
         provider_job_ref = _intent_provider_job_ref(
             str(turn.turn_ref), int(turn.assistant_attempt_count)
         )
-        try:
-            return self._complete_claimed_intent_turn(
-                turn, initialization_id, prior_metadata, turn_revision
+        effect = _drafting_runtime_effect(
+            root_ref=str(initialization_id),
+            provider_job_ref=provider_job_ref,
+            claim_attempt=int(turn.assistant_attempt_count),
+        )
+        if self._runtime_protection is not None:
+            try:
+                self._runtime_protection.acquire(effect)
+            except RuntimeProtectionUnavailable as error:
+                self._record_intent_protection_wait(
+                    turn_ref=str(turn.turn_ref),
+                    claim_attempt=int(turn.assistant_attempt_count),
+                    initialization_id=initialization_id,
+                    reason_code=error.code,
+                )
+                try:
+                    self._finish_drafting_protection(
+                        effect,
+                        table="hc_intent_drafting_turns",
+                        ref_column="turn_ref",
+                        ref_value=str(turn.turn_ref),
+                        attempt_column="assistant_attempt_count",
+                        attempt_value=int(turn.assistant_attempt_count),
+                        status_column="assistant_status",
+                    )
+                except RuntimeProtectionUnavailable as boundary_error:
+                    if boundary_error.code != "runtime_responsibility_not_found":
+                        raise
+                self._finish_provider_job(
+                    self._intent_drafting_provider, provider_job_ref
+                )
+                return True
+        return self._settle_claimed_intent_turn(
+            turn,
+            initialization_id,
+            prior_metadata,
+            turn_revision,
+            effect,
+            provider_job_ref,
+        )
+
+    def _settle_claimed_intent_turn(
+        self,
+        turn: Row,
+        initialization_id: str,
+        prior_metadata: str | None,
+        turn_revision: Row | None,
+        effect: RuntimeEffectIdentity,
+        provider_job_ref: str,
+    ) -> bool:
+        result = self._complete_claimed_intent_turn(
+            turn, initialization_id, prior_metadata, turn_revision
+        )
+        boundary_finished = self._finish_drafting_protection(
+            effect,
+            table="hc_intent_drafting_turns",
+            ref_column="turn_ref",
+            ref_value=str(turn.turn_ref),
+            attempt_column="assistant_attempt_count",
+            attempt_value=int(turn.assistant_attempt_count),
+            status_column="assistant_status",
+        )
+        if boundary_finished:
+            self._finish_provider_job(
+                self._intent_drafting_provider, provider_job_ref
             )
-        finally:
-            self._finish_provider_job(self._intent_drafting_provider, provider_job_ref)
+            with self._database.read() as connection:
+                status = connection.execute(
+                    text(
+                        "SELECT assistant_status FROM hc_intent_drafting_turns "
+                        "WHERE turn_ref = :turn_ref AND assistant_attempt_count = "
+                        ":attempt_count"
+                    ),
+                    {
+                        "turn_ref": turn.turn_ref,
+                        "attempt_count": int(turn.assistant_attempt_count),
+                    },
+                ).scalar_one_or_none()
+            if status == "completed":
+                self._auto_refresh_preview(str(initialization_id))
+        return result
 
     def _complete_claimed_intent_turn(
         self,
@@ -5585,6 +6148,7 @@ class SQLiteHumanCollaboration:
                         },
                     )
             return True
+
         native_session_ref: str | None = None
         if prior_metadata is not None:
             metadata = decoded_object(str(prior_metadata))
@@ -5609,7 +6173,17 @@ class SQLiteHumanCollaboration:
             if not reply or len(reply) > INTENT_REPLY_MAX_LENGTH:
                 raise DraftingUnavailable("intent_reply_invalid")
         except DraftingUnavailable as error:
+            if error.code in _DRAFTING_RECONCILIATION_CODES:
+                return False
             if error.code == "codex_cli_stopped":
+                cancel_job = getattr(
+                    self._intent_drafting_provider, "cancel_job", None
+                )
+                if (
+                    not callable(cancel_job)
+                    or cancel_job(provider_job_ref) is not True
+                ):
+                    return False
                 self._requeue_interrupted_intent_turn(
                     turn.turn_ref, claim_attempt, str(initialization_id)
                 )
@@ -5713,7 +6287,152 @@ class SQLiteHumanCollaboration:
                     "turn_ref": turn.turn_ref,
                 },
             )
-        self._auto_refresh_preview(str(initialization_id))
+        return True
+
+    def _record_intent_protection_wait(
+        self,
+        *,
+        turn_ref: str,
+        claim_attempt: int,
+        initialization_id: str,
+        reason_code: str,
+    ) -> None:
+        with self._database.write() as connection:
+            updated = connection.execute(
+                text(
+                    "UPDATE hc_intent_drafting_turns SET assistant_status = "
+                    "'unavailable', reason_code = :reason_code, completed_at = "
+                    ":now WHERE turn_ref = :turn_ref AND assistant_status = "
+                    "'running' AND assistant_attempt_count = :claim_attempt"
+                ),
+                {
+                    "reason_code": reason_code,
+                    "now": time.time(),
+                    "turn_ref": turn_ref,
+                    "claim_attempt": claim_attempt,
+                },
+            )
+            if updated.rowcount:
+                connection.execute(
+                    text(
+                        "UPDATE human_collaboration_state SET revision = revision + "
+                        "1 WHERE singleton = 'owner'"
+                    )
+                )
+                self._feed.record(
+                    connection,
+                    "human_collaboration.intent_reply_unavailable",
+                    {
+                        "initialization_id": initialization_id,
+                        "turn_ref": turn_ref,
+                        "reason_code": reason_code,
+                    },
+                )
+
+    def _finish_drafting_protection(
+        self,
+        effect: RuntimeEffectIdentity,
+        *,
+        table: str,
+        ref_column: str,
+        ref_value: str,
+        attempt_column: str,
+        attempt_value: int,
+        status_column: str,
+    ) -> bool:
+        if self._runtime_protection is None:
+            return True
+        allowed = {
+            (
+                "hc_proposal_generation_attempts",
+                "generation_ref",
+                "attempt_count",
+                "status",
+            ),
+            (
+                "hc_intent_drafting_turns",
+                "turn_ref",
+                "assistant_attempt_count",
+                "assistant_status",
+            ),
+        }
+        if (table, ref_column, attempt_column, status_column) not in allowed:
+            raise AssertionError("drafting protection boundary query invalid")
+        with self._database.write() as connection:
+            status = connection.execute(
+                text(
+                    f"SELECT {status_column} FROM {table} WHERE {ref_column} = "
+                    f":ref_value AND {attempt_column} = :attempt_value"
+                ),
+                {"ref_value": ref_value, "attempt_value": attempt_value},
+            ).scalar_one_or_none()
+            existing_boundary = connection.execute(
+                text(
+                    "SELECT boundary, checkpoint_ref FROM "
+                    "ar_runtime_boundary_receipts WHERE responsibility_ref = "
+                    ":responsibility_ref"
+                ),
+                {"responsibility_ref": effect.responsibility_ref},
+            ).first()
+        if existing_boundary is not None:
+            self._runtime_protection.finish(
+                effect.responsibility_ref,
+                boundary=cast(RuntimeBoundary, str(existing_boundary.boundary)),
+                checkpoint_ref=(
+                    None
+                    if existing_boundary.checkpoint_ref is None
+                    else str(existing_boundary.checkpoint_ref)
+                ),
+            )
+            return True
+        if status is None or status == "running":
+            return False
+        if status == "queued":
+            with self._database.write() as connection:
+                record_runtime_boundary(
+                    connection,
+                    identity=effect,
+                    boundary="permanent_fence",
+                    owner_evidence_ref="drafting_fence_"
+                    + canonical_hash(
+                        {
+                            "responsibility_ref": effect.responsibility_ref,
+                            "status": status,
+                            "attempt_value": attempt_value,
+                        }
+                    ),
+                )
+            self._runtime_protection.finish(
+                effect.responsibility_ref,
+                boundary="permanent_fence",
+            )
+            return True
+        checkpoint_ref = "drafting_checkpoint_" + canonical_hash(
+            {
+                "responsibility_ref": effect.responsibility_ref,
+                "status": status,
+                "attempt_value": attempt_value,
+            }
+        )
+        with self._database.write() as connection:
+            record_runtime_boundary(
+                connection,
+                identity=effect,
+                boundary="checkpoint",
+                checkpoint_ref=checkpoint_ref,
+                owner_evidence_ref="drafting_state_"
+                + canonical_hash(
+                    {
+                        "responsibility_ref": effect.responsibility_ref,
+                        "status": status,
+                    }
+                ),
+            )
+        self._runtime_protection.finish(
+            effect.responsibility_ref,
+            boundary="checkpoint",
+            checkpoint_ref=checkpoint_ref,
+        )
         return True
 
     def _requeue_interrupted_intent_turn(
@@ -6252,13 +6971,19 @@ class SQLiteHumanCollaboration:
         self, proposal_refs: tuple[str, ...], intent_refs: tuple[str, ...]
     ) -> None:
         fallback_providers: list[object] = []
-        for provider, job_refs in (
-            (self._proposal_drafter, proposal_refs),
-            (self._intent_drafting_provider, intent_refs),
+        for provider, job_refs, job_kind in (
+            (self._proposal_drafter, proposal_refs, "proposal"),
+            (self._intent_drafting_provider, intent_refs, "intent"),
         ):
             for job_ref in job_refs:
                 cancel_job = getattr(provider, "cancel_job", None)
                 handled = cancel_job(job_ref) if callable(cancel_job) else False
+                if handled is True:
+                    self._finish_cancelled_provider_job(
+                        provider=provider,
+                        provider_job_ref=job_ref,
+                        job_kind=job_kind,
+                    )
                 if handled is False and not any(
                     provider is existing for existing in fallback_providers
                 ):
@@ -6267,6 +6992,63 @@ class SQLiteHumanCollaboration:
             cancel_active = getattr(provider, "cancel_active", None)
             if callable(cancel_active):
                 cancel_active()
+
+    def _finish_cancelled_provider_job(
+        self,
+        *,
+        provider: object,
+        provider_job_ref: str,
+        job_kind: str,
+    ) -> None:
+        if job_kind == "proposal" and provider_job_ref.endswith(":proposal"):
+            ref_value = provider_job_ref.removesuffix(":proposal")
+            with self._database.read() as connection:
+                row = connection.execute(
+                    text(
+                        "SELECT generation_ref, initialization_id, attempt_count "
+                        "FROM hc_proposal_generation_attempts WHERE generation_ref "
+                        "= :ref_value AND status != 'running'"
+                    ),
+                    {"ref_value": ref_value},
+                ).first()
+            attempt_value = None if row is None else int(row.attempt_count)
+        elif job_kind == "intent" and provider_job_ref.endswith(":intent-reply"):
+            ref_value = provider_job_ref.removesuffix(":intent-reply")
+            with self._database.read() as connection:
+                row = connection.execute(
+                    text(
+                        "SELECT turns.turn_ref, sessions.initialization_id, "
+                        "turns.assistant_attempt_count FROM "
+                        "hc_intent_drafting_turns AS turns JOIN "
+                        "hc_intent_drafting_sessions AS sessions ON "
+                        "sessions.session_ref = turns.session_ref WHERE "
+                        "turns.turn_ref = :ref_value AND "
+                        "turns.assistant_status != 'running'"
+                    ),
+                    {"ref_value": ref_value},
+                ).first()
+            attempt_value = (
+                None if row is None else int(row.assistant_attempt_count)
+            )
+        else:
+            return
+        if row is None or attempt_value is None:
+            return
+        effect = _drafting_runtime_effect(
+            root_ref=str(row.initialization_id),
+            provider_job_ref=provider_job_ref,
+            claim_attempt=attempt_value,
+        )
+        try:
+            boundary_finished = self._finish_drafting_permanent_fence(
+                effect, evidence_kind="owner_terminal_transition"
+            )
+        except RuntimeProtectionUnavailable as error:
+            if error.code != "runtime_responsibility_not_found":
+                raise
+            boundary_finished = True
+        if boundary_finished:
+            self._finish_provider_job(provider, provider_job_ref)
 
     @staticmethod
     def _finish_provider_job(provider: object, job_ref: str) -> None:
@@ -10452,6 +11234,7 @@ def create_human_collaboration_interface(
     proposal_drafter: ProposalDrafter,
     intent_drafting_provider: IntentDraftingProvider,
     acquisition_provider: AcquisitionProvider,
+    runtime_protection: RuntimeProtection | None = None,
 ) -> HumanCollaborationInterface:
     return SQLiteHumanCollaboration(
         database,
@@ -10463,4 +11246,5 @@ def create_human_collaboration_interface(
         proposal_drafter,
         intent_drafting_provider,
         acquisition_provider,
+        runtime_protection,
     )

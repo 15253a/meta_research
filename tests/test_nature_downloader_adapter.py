@@ -22,10 +22,13 @@ class RecordingNatureRunner:
         login_page: bool = False,
         authorized_resource: bool = True,
         oa_missing: bool = False,
+        waiting_attempts_before_success: int = 0,
     ) -> None:
         self.login_page = login_page
         self.authorized_resource = authorized_resource
         self.oa_missing = oa_missing
+        self.waiting_attempts_before_success = waiting_attempts_before_success
+        self.batch_call_count = 0
         self.calls: list[tuple[list[str], Path, dict[str, str]]] = []
 
     def __call__(
@@ -64,16 +67,20 @@ class RecordingNatureRunner:
         elif "--check" in argv:
             payload = {"ok": True}
         elif "run_batch_download.py" in joined:
+            self.batch_call_count += 1
             output_root = Path(argv[argv.index("--out") + 1])
             output_root.mkdir(parents=True, exist_ok=True)
             institutional = "--api-fallback-web" in argv
             missing = self.oa_missing and not institutional
+            waiting = self.batch_call_count <= self.waiting_attempts_before_success
             fulltext = output_root / "PDFs" / "paper.pdf"
-            if not missing:
+            if not missing and not waiting:
                 fulltext.parent.mkdir(parents=True, exist_ok=True)
                 fulltext.write_bytes(b"%PDF-1.4\nverified body")
             raw_result = (
-                {"status": "no_authorized_pdf_found"}
+                {"status": "publisher_verification_waiting_user"}
+                if waiting
+                else {"status": "no_authorized_pdf_found"}
                 if missing
                 else {
                     "status": "open_access_downloaded",
@@ -85,7 +92,7 @@ class RecordingNatureRunner:
             payload = {
                 "summary": {
                     "total": 1,
-                    "downloaded": 0 if missing else 1,
+                    "downloaded": 0 if missing or waiting else 1,
                     "seconds": 0.1,
                 },
                 "manifest": str(output_root / "manifest.json"),
@@ -310,6 +317,66 @@ def test_nature_downloader_executes_each_exact_oa_batch_without_public_manifest(
     assert "--no-si" in command
     assert command[command.index("--cnki-format") + 1] == "pdf"
     assert "manifest.json" not in json.dumps([result.as_dict() for result in results])
+
+
+def test_nature_downloader_has_no_hidden_logical_retry_generation_ceiling(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingNatureRunner(waiting_attempts_before_success=99)
+    adapter = NatureDownloaderAdapter(
+        _provider_root(tmp_path), command_runner=runner
+    )
+    target = tmp_path / "private" / "session-1" / "requests" / "acq-long"
+    request = AcquisitionBatchRequest(
+        request_id="acq-long",
+        route_policy="oa_first_then_institution",
+        papers=(
+            AcquisitionPaper(
+                paper_id="provided:long-running",
+                title="Long-running authorized acquisition",
+                doi=None,
+                arxiv_id=None,
+                source_urls=("https://example.test/fulltext.pdf",),
+            ),
+        ),
+        session_ref="acquisition-session-1",
+        session_mode="provided_only",
+        provider_state_dir=str(tmp_path / "private" / "session-1"),
+        target_dir=str(target),
+    )
+
+    for expected_generation in range(1, 100):
+        result = adapter.acquire(request)
+        assert result[0].status == "waiting_user"
+        assert result[0].failure == {
+            "code": "publisher_verification_waiting_user",
+            "detail": "该条目的授权获取需要用户在既有浏览器上下文中处理。",
+        }
+        assert runner.batch_call_count == expected_generation
+
+    cursor_files = list(target.rglob("route-cursors/*.json"))
+    assert len(cursor_files) == 1
+    # Simulate an upgrade from the pre-cursor implementation after all 99
+    # generations that old code could represent.  Migration must continue at
+    # generation 100 instead of reviving the old ceiling.
+    cursor_files[0].unlink()
+    completed = adapter.acquire(request)
+
+    assert completed[0].status == "obtained"
+    assert completed[0].failure is None
+    assert runner.batch_call_count == 100
+    provider_commands = [
+        call[0]
+        for call in runner.calls
+        if "run_batch_download.py" in " ".join(call[0])
+    ]
+    assert len(provider_commands) == 100
+    assert len(
+        {command[command.index("--out") + 1] for command in provider_commands}
+    ) == 100
+    assert provider_commands[-1][provider_commands[-1].index("--out") + 1].endswith(
+        "provided-01-100"
+    )
 
 
 def test_nature_downloader_runs_oa_then_institutional_fallback(
