@@ -33,7 +33,6 @@ EXPERIMENT_REQUIRED_METRICS = (
 EXPERIMENT_RESULT_DISPOSITIONS = frozenset(
     {"positive", "negative", "zero", "nonsignificant", "denied", "uncertain"}
 )
-EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS = 2
 EXPERIMENT_RETRYABLE_PROVIDER_FAILURES = frozenset(
     {
         "experiment_provider_failed",

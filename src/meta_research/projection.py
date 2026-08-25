@@ -96,6 +96,18 @@ class PublicProjection:
                     if callable(projection_query)
                     else owner.query_snapshot()
                 )
+            runtime_observability_query = getattr(
+                self._agent_runtime, "query_runtime_observability", None
+            )
+            runtime_observability = (
+                runtime_observability_query()
+                if callable(runtime_observability_query)
+                else {
+                    "schema_ref": "meta-research/runtime-observability/v1",
+                    "status": "unavailable",
+                    "reason": {"code": "runtime_protection_unavailable"},
+                }
+            )
             current_quest_creation = (
                 self._human_collaboration.query_current_quest_creation()
             )
@@ -256,6 +268,7 @@ class PublicProjection:
                 dict.fromkeys(
                     [
                         collaboration_scope,
+                        "runtime:telemetry",
                         *(str(item["request_ref"]) for item in human_requests),
                     ]
                 )
@@ -459,6 +472,7 @@ class PublicProjection:
             },
             "writing": writing,
             "harnesses": harnesses,
+            "runtime_observability": runtime_observability,
             "unavailable": _release_capabilities(),
         }
         if idea_stage is not None:

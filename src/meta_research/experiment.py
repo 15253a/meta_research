@@ -13,8 +13,6 @@ from pathlib import Path
 from typing import Protocol
 
 from meta_research.experiment_contract import (
-    EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS,
-    EXPERIMENT_RETRYABLE_PROVIDER_FAILURES,
     ExperimentDomainAdmission,
     ExperimentIntent,
     ExperimentIntentLike,
@@ -54,7 +52,9 @@ from meta_research.owners.research_memory import (
 )
 from meta_research.provider_supervisor import (
     ProviderSupervisorError,
+    minimal_subprocess_environment,
     request_supervisor_stop,
+    supervisor_spawn_options,
     supervisor_request_never_started,
 )
 
@@ -240,9 +240,12 @@ class BuiltinMicroExperimentProvider:
         receipt = self._ensure_terminal_operation(operation, observe)
         output = self._verified_output(operation, receipt)
         try:
-            text_output = output.decode("utf-8", errors="strict")
+            output.decode("utf-8", errors="strict")
         except UnicodeDecodeError as error:
-            raise OwnerConflict("experiment_provider_output_invalid") from error
+            raise ExperimentProviderUnavailable(
+                "experiment_provider_output_invalid",
+                durable_outcome="terminal",
+            ) from error
         raw_lines: list[str] = []
         result_lines: list[str] = []
         records = output.split(b"\n")
@@ -251,7 +254,10 @@ class BuiltinMicroExperimentProvider:
         raw_size = 0
         for index, encoded_line in enumerate(records):
             if b"\r" in encoded_line or b"\x00" in encoded_line:
-                raise OwnerConflict("experiment_provider_output_invalid")
+                raise ExperimentProviderUnavailable(
+                    "experiment_provider_output_invalid",
+                    durable_outcome="terminal",
+                )
             line = encoded_line.decode("utf-8", errors="strict")
             if line.startswith("META_RESEARCH_RESULT\t"):
                 result_lines.append(line.split("\t", 1)[1])
@@ -273,16 +279,25 @@ class BuiltinMicroExperimentProvider:
                 or any(len(line) > 4000 for line in raw_lines)
                 else "experiment_result_missing"
             )
-            raise OwnerConflict(code)
+            raise ExperimentProviderUnavailable(code, durable_outcome="terminal")
         encoded_result = result_lines[0].encode("utf-8")
         if len(encoded_result) > self._result_max_bytes:
-            raise OwnerConflict("experiment_provider_output_limit")
+            raise ExperimentProviderUnavailable(
+                "experiment_provider_output_limit",
+                durable_outcome="terminal",
+            )
         try:
             result_document = json.loads(result_lines[0])
         except json.JSONDecodeError as error:
-            raise OwnerConflict("experiment_provider_output_invalid") from error
+            raise ExperimentProviderUnavailable(
+                "experiment_provider_output_invalid",
+                durable_outcome="terminal",
+            ) from error
         if not isinstance(result_document, dict):
-            raise OwnerConflict("experiment_result_invalid")
+            raise ExperimentProviderUnavailable(
+                "experiment_result_invalid",
+                durable_outcome="terminal",
+            )
         self._raise_if_shutdown_requested()
         checkpoint = result_document.get("checkpoint")
         analysis = result_document.get("analysis")
@@ -296,21 +311,35 @@ class BuiltinMicroExperimentProvider:
             or not isinstance(analysis, dict)
             or not isinstance(result_content, dict)
         ):
-            raise OwnerConflict("experiment_result_invalid")
-        result = ExperimentProviderResult(
-            checkpoint_content=(
-                None
-                if checkpoint is None
-                else canonical_json(checkpoint).encode("utf-8")
-            ),
-            analysis=analysis,
-            result_content=result_content,
-            adapter_kind="builtin_subprocess",
-        )
-        validate_experiment_provider_result(
-            result,
-            request_kind=request.request_kind,
-        )
+            raise ExperimentProviderUnavailable(
+                "experiment_result_invalid",
+                durable_outcome="terminal",
+            )
+        try:
+            result = ExperimentProviderResult(
+                checkpoint_content=(
+                    None
+                    if checkpoint is None
+                    else canonical_json(checkpoint).encode("utf-8")
+                ),
+                analysis=analysis,
+                result_content=result_content,
+                adapter_kind="builtin_subprocess",
+            )
+            validate_experiment_provider_result(
+                result,
+                request_kind=request.request_kind,
+            )
+        except OwnerConflict as error:
+            raise ExperimentProviderUnavailable(
+                error.code,
+                durable_outcome="terminal",
+            ) from error
+        except (TypeError, ValueError) as error:
+            raise ExperimentProviderUnavailable(
+                "experiment_result_invalid",
+                durable_outcome="terminal",
+            ) from error
         return result
 
     def request_stop(self) -> None:
@@ -523,8 +552,8 @@ class BuiltinMicroExperimentProvider:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    env={"PATH": os.environ.get("PATH", "")},
-                    start_new_session=True,
+                    env=minimal_subprocess_environment(),
+                    **supervisor_spawn_options(),
                 )
             except OSError as error:
                 raise ExperimentProviderUnavailable(
@@ -1024,8 +1053,15 @@ class ExperimentService:
                     fence_ref=run.fence_ref,
                     failure_code="experiment_domain_binding_missing",
                 )
+                self._agent_runtime.acknowledge_experiment_provider_safe_point(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                )
                 return True
-            provider_safe = True
+            provider_safe = False
+            provider_invoked = False
+            provider_returned = False
             try:
                 current_binding = self._provider.runtime_binding()
                 if canonical_hash(current_binding.as_dict()) != run.runtime_binding_hash:
@@ -1058,16 +1094,16 @@ class ExperimentService:
                             except Exception:
                                 pass
 
-                result = self._provider.execute(
-                    self._provider_request(
-                        domain=domain,
-                        provider_operation_ref=run.provider_operation_ref,
-                        provider_operation_generation=(
-                            run.provider_operation_generation
-                        ),
+                provider_request = self._provider_request(
+                    domain=domain,
+                    provider_operation_ref=run.provider_operation_ref,
+                    provider_operation_generation=(
+                        run.provider_operation_generation
                     ),
-                    observe,
                 )
+                provider_invoked = True
+                result = self._provider.execute(provider_request, observe)
+                provider_returned = True
                 validate_experiment_provider_result(
                     result,
                     request_kind=domain.intent.request_kind,
@@ -1080,6 +1116,7 @@ class ExperimentService:
                     fence_ref=run.fence_ref,
                     result=result.as_document(),
                 )
+                provider_safe = True
             except OwnerConflict as error:
                 managed = self._agent_runtime.query_managed_run(run.run_ref)
                 provider_terminal_after_control = (
@@ -1093,9 +1130,29 @@ class ExperimentService:
                     # running so startup recovery can replace only the technical
                     # Attempt and reconcile this same durable provider operation.
                     provider_safe = False
-                elif error.code == "experiment_provider_reconciliation_pending":
+                    self._agent_runtime.record_experiment_reconciliation_hold(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        reason_code=error.code,
+                    )
+                elif error.code == "experiment_provider_reconciliation_pending" or (
+                    isinstance(error, ExperimentProviderUnavailable)
+                    and error.durable_outcome == "pending"
+                ):
                     provider_safe = False
                     self._agent_runtime.defer_experiment_reconciliation(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        reason_code="experiment_provider_reconciliation_pending",
+                    )
+                elif (
+                    isinstance(error, ExperimentProviderUnavailable)
+                    and error.durable_outcome == "unknown"
+                ):
+                    provider_safe = False
+                    self._agent_runtime.record_experiment_reconciliation_hold(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
                         fence_ref=run.fence_ref,
@@ -1105,12 +1162,12 @@ class ExperimentService:
                     # A control command won the race after the provider reached a
                     # physical terminal boundary.  The revoked Fence owns the
                     # logical result; finally still acknowledges cleanup.
-                    pass
+                    provider_safe = True
                 elif self._agent_runtime.provider_quiescence_requested(run.run_ref):
                     # An operation-scoped pause/prune stop reached a real provider
                     # boundary. Keep the logical Run admitted for the control
                     # transaction, which will persist its Safe Point and suspension.
-                    pass
+                    provider_safe = True
                 elif provider_terminal_after_control:
                     # The stop reconciler can prove physical termination and let
                     # the control transaction commit before this worker receives
@@ -1119,20 +1176,40 @@ class ExperimentService:
                     # old Attempt lost the race.  Treat its late receipt as an ACK;
                     # retrying/failing through the revoked Fence would leak a
                     # spurious runtime_run_suspended error to the daemon.
-                    pass
+                    provider_safe = True
                 elif (
                     isinstance(error, ExperimentProviderUnavailable)
                     and error.durable_outcome == "terminal"
-                    and error.code in EXPERIMENT_RETRYABLE_PROVIDER_FAILURES
-                    and run.provider_operation_generation
-                    < EXPERIMENT_MAX_PROVIDER_OPERATION_GENERATIONS
                 ):
-                    self._agent_runtime.retry_experiment_execution(
+                    self._agent_runtime.suspend_experiment_execution(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
                         fence_ref=run.fence_ref,
                         failure_code=error.code,
                     )
+                    provider_safe = True
+                elif provider_invoked and not provider_returned:
+                    # An untyped adapter exception cannot prove whether an
+                    # external effect happened.  Preserve its operation/Fence
+                    # and hold the responsibility for restart reconciliation.
+                    provider_safe = False
+                    self._agent_runtime.record_experiment_reconciliation_hold(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        reason_code=error.code,
+                    )
+                elif provider_returned:
+                    # The adapter returned, but its in-memory result violated the
+                    # frozen measurement contract. This is an exact terminal
+                    # execution rejection, not an unknown external effect.
+                    self._agent_runtime.fail_experiment_execution(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        failure_code=error.code,
+                    )
+                    provider_safe = True
                 else:
                     self._agent_runtime.fail_experiment_execution(
                         run_ref=run.run_ref,
@@ -1140,17 +1217,37 @@ class ExperimentService:
                         fence_ref=run.fence_ref,
                         failure_code=error.code,
                     )
+                    provider_safe = True
             except Exception:
-                if not self._agent_runtime.provider_quiescence_requested(run.run_ref):
+                if self._agent_runtime.provider_quiescence_requested(run.run_ref):
+                    provider_safe = True
+                elif provider_invoked and not provider_returned:
+                    provider_safe = False
+                    self._agent_runtime.record_experiment_reconciliation_hold(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        reason_code="experiment_provider_outcome_unknown",
+                    )
+                elif provider_returned:
+                    self._agent_runtime.fail_experiment_execution(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        failure_code="experiment_provider_result_invalid",
+                    )
+                    provider_safe = True
+                else:
                     self._agent_runtime.fail_experiment_execution(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
                         fence_ref=run.fence_ref,
                         failure_code="experiment_provider_failed",
                     )
+                    provider_safe = True
             finally:
                 if provider_safe:
-                    self._agent_runtime.acknowledge_provider_safe_point(
+                    self._agent_runtime.acknowledge_experiment_provider_safe_point(
                         run_ref=run.run_ref,
                         attempt_ref=run.attempt_ref,
                         fence_ref=run.fence_ref,

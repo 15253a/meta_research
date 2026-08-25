@@ -16,6 +16,7 @@ from meta_research.owners.research_memory import (
     ResearchMemoryInterface,
 )
 from meta_research.owners.secret_detection import contains_secret
+from meta_research.runtime_protection import RuntimeProtectionUnavailable
 from meta_research.writing_contract import (
     WRITING_REPORT_INTENT_SCHEMA,
     WRITING_RESEARCH_SNAPSHOT_SCHEMA,
@@ -353,7 +354,10 @@ class WritingReportService:
                         return True
                     if not provider_safe:
                         raise
-                    self._block_if_still_current(run, error.code)
+                    if not self._defer_provider_start_if_protection_wait(
+                        run, "writing_primary", error
+                    ):
+                        self._block_if_still_current(run, error.code)
                 finally:
                     if unit_ref is not None and provider_safe:
                         self._acknowledge_provider_unit(run, unit_ref)
@@ -410,7 +414,10 @@ class WritingReportService:
                         return True
                     if not provider_safe:
                         raise
-                    self._block_if_still_current(run, error.code)
+                    if not self._defer_provider_start_if_protection_wait(
+                        run, "writing_review", error
+                    ):
+                        self._block_if_still_current(run, error.code)
                     return True
                 finally:
                     if unit_ref is not None and provider_safe:
@@ -549,6 +556,11 @@ class WritingReportService:
         except OwnerConflict:
             # A concurrent control or late completion already retired this
             # Fence; in either case the watchdog claim is no longer runnable.
+            return
+        if blocked.attempt_ref != attempt_ref or blocked.fence_ref != fence_ref:
+            # No provider unit was ever claimed.  AR fenced the timed-out
+            # technical Attempt and installed its retryable successor without
+            # inventing a physical cancellation effect.
             return
         cancel_job = getattr(self._provider, "cancel_job", None)
         if callable(cancel_job):
@@ -1356,6 +1368,26 @@ class WritingReportService:
             unit_kind=unit_kind,
         )
         return unit_ref
+
+    def _defer_provider_start_if_protection_wait(
+        self,
+        run: WritingRun,
+        unit_kind: str,
+        error: WritingSkillUnavailable | OwnerConflict,
+    ) -> bool:
+        if not (
+            isinstance(error, OwnerConflict)
+            and isinstance(error.__cause__, RuntimeProtectionUnavailable)
+        ):
+            return False
+        self._agent_runtime.record_writing_provider_not_started(
+            unit_ref=self._provider_unit_ref(run, unit_kind),
+            run_ref=run.run_ref,
+            attempt_ref=run.attempt_ref,
+            fence_ref=run.fence_ref,
+            reason_code=error.code,
+        )
+        return True
 
     def _acknowledge_provider_unit(self, run: WritingRun, unit_ref: str) -> None:
         self._agent_runtime.acknowledge_provider_safe_point(

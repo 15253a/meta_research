@@ -1318,7 +1318,44 @@ export type PublicSnapshot = {
   experiment: PublicExperimentProjection;
   writing: WritingOverview;
   harnesses: HarnessStatus;
+  runtime_observability?: RuntimeObservability;
   unavailable: UnavailableCapability[];
+};
+
+export type RuntimeObservability = {
+  status: "ready" | "unavailable";
+  reason?: { code: string } | null;
+  inhibitor?: {
+    status: string;
+    backend: string;
+    scope: string;
+    active_count: number;
+    reason?: { code: string } | null;
+  };
+  responsibilities?: Array<{
+    owner_scope: string;
+    effect_kind: string;
+  }>;
+  durable_waiting?: Array<{
+    effect_kind: string;
+    reason: { code: string };
+  }>;
+  durable_waiting_count?: number;
+  durable_waiting_page_truncated?: boolean;
+  interruptions?: Array<{
+    kind: string;
+    reason: { code: string };
+    reconciliation_status: string;
+  }>;
+  interruption_count?: number;
+  interruption_page_truncated?: boolean;
+  log?: {
+    status: "empty" | "fresh" | "stale";
+    age_seconds?: number;
+  };
+  telemetry?: {
+    mode: "disabled" | "active" | "revocation_pending" | "revoked";
+  };
 };
 
 function adaptManualReceipt(receipt: ManualRawReceiptState): ManualCreationReceiptState {

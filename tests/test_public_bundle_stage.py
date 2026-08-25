@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,7 @@ from meta_research.bundle_skill import (
     BundleSkillDraft,
     BundleSkillRequest,
     BundleSkillResult,
+    BundleSkillUnavailable,
     BundleTargetBatchRequest,
     BundleTargetBatchResult,
 )
@@ -33,9 +35,21 @@ from meta_research.experiment_contract import (
 )
 from meta_research.harness import HarnessProbeRequest
 from meta_research.owners.agent_runtime import BundleRuntimeBinding
-from meta_research.owners.common import OwnerConflict, canonical_hash
+from meta_research.owners.agent_runtime_harness import TargetRootCompletionEvidence
+from meta_research.owners.common import OwnerConflict, canonical_hash, canonical_json
 from meta_research.owners.research_memory import AssetIntakeRequest
 from meta_research.paths import prepare_data_root
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeProtectionUnavailable,
+)
+from meta_research.target_run_finalizer import (
+    SQLiteTargetRootCompletionMemoryAuthority,
+    TargetRunFinalizer,
+)
+from meta_research.target_run_runtime_contract import (
+    decode_target_completion_handoff,
+)
 from test_public_plan_stage import (
     _DeterministicDraftingAdapter,
     _DeterministicIdeaSkill,
@@ -600,6 +614,60 @@ class _NonDispatchingBundleSkill(_DeterministicBundleSkill):
         )
 
 
+class _TogglePowerInhibitor:
+    kind = "test_toggle_inhibitor"
+
+    def __init__(self) -> None:
+        self.available = True
+        self._active: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        if not self.available:
+            raise RuntimeProtectionUnavailable("power_inhibitor_acquisition_failed")
+        self._active.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=time.time(),
+            native_holder_ref=f"test-native:{holder_ref}",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self._active
+
+    def release(self, lease: InhibitorLease) -> None:
+        self._active.discard(lease.holder_ref)
+
+
+class _ProtectedRollingBundleSkill(_RollingBundleSkill):
+    def __init__(self) -> None:
+        super().__init__()
+        self.schedule_requests: list[BundleDispatchRequest] = []
+
+    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+        self.schedule_requests.append(request)
+        return super().schedule_target(request)
+
+
+class _UnknownDispatchBundleSkill(_ProtectedRollingBundleSkill):
+    def schedule_target(self, request: BundleDispatchRequest) -> BundleDispatchResult:
+        self.schedule_requests.append(request)
+        raise BundleSkillUnavailable("codex_operation_reconciliation_pending")
+
+
+class _ProtectedSealingBundleSkill(_DeterministicBundleSkill):
+    def __init__(self) -> None:
+        self.batch_requests: list[BundleTargetBatchRequest] = []
+
+    def propose_target_batch(
+        self, request: BundleTargetBatchRequest
+    ) -> BundleTargetBatchResult:
+        self.batch_requests.append(request)
+        return super().propose_target_batch(request)
+
+
 class _FailAfterFirstTargetProvider(_DeterministicExperimentProvider):
     def execute(self, request, observe):
         if self.execute_calls >= 1:
@@ -695,6 +763,7 @@ def _bundle_runtime(
     harness_ready: bool = True,
     verify_target_candidate_proofs: bool = True,
     target_execution_sandbox_config=None,
+    power_inhibitor=None,
 ):
     drafting = _DeterministicDraftingAdapter()
     runtime = build_production_runtime(
@@ -713,6 +782,7 @@ def _bundle_runtime(
             _FullConformanceAdapter("codex"),
             _FullConformanceAdapter("claude"),
         ),
+        power_inhibitor=power_inhibitor,
     )
     if verify_target_candidate_proofs:
         runtime.owners.research_graph._target_candidate_proof_verifier = (  # type: ignore[attr-defined]
@@ -727,6 +797,134 @@ def _bundle_runtime(
                 mcp_base_url="http://127.0.0.1:8765"
             )
     return runtime
+
+
+def _accept_real_target_root_commit(runtime):
+    # Import lazily because the shared target-root fixture imports this module
+    # for the production composition helper above.
+    from test_target_root_finalizer import (
+        _EvidenceReader,
+        _admit_independent_target_root,
+    )
+
+    target, candidate, formal_plan, admission, handle = (
+        _admit_independent_target_root(runtime)
+    )
+    launch = runtime.owners.agent_runtime.query_admitted_target_launch(
+        target.target_ref
+    )
+    assert launch is not None
+    lifecycle = runtime.target_root_lifecycle
+    lifecycle.activate(
+        launch_ref=launch.launch_ref,
+        handle=handle,
+        candidate=candidate,
+        formal_plan=formal_plan,
+        idempotency_key=f"activate-protected-bundle-root:{target.target_ref}",
+    )
+    memory = SQLiteTargetRootCompletionMemoryAuthority(
+        runtime._database,
+        runtime.feed,
+        runtime.owners.research_memory,
+        lifecycle,
+    )
+    authority = (
+        runtime.owners.research_graph.query_target_measurement_domain_authority(
+            target.target_ref
+        )
+    )
+    assert authority is not None
+    _workspace_ref, workspace = (
+        runtime.target_run_authorities.agent_runtime.resolve_target_workspace(
+            target_ref=handle.target_ref,
+            target_run_ref=handle.target_run_ref,
+            root_session_ref=handle.root_session_ref,
+            attempt_ref=handle.execution_attempt_ref,
+            fence_ref=handle.execution_fence_ref,
+        )
+    )
+    (workspace / "implementation" / "train.py").write_text(
+        "print('train')\n", encoding="utf-8"
+    )
+    (workspace / "outputs").mkdir()
+    (workspace / "logs").mkdir()
+    metrics = {
+        key: float(index + 1)
+        for index, key in enumerate(
+            authority.measurement_contract.protocol_version.required_metric_keys
+        )
+    }
+    result_document = {
+        "metrics": metrics,
+        "result_disposition": "positive",
+        "schema_ref": authority.measurement_contract.result_schema_ref,
+    }
+    (workspace / "outputs" / "metrics.json").write_text(
+        canonical_json(result_document), encoding="utf-8"
+    )
+    (workspace / "logs" / "train.log").write_text(
+        "epoch 1 complete\n", encoding="utf-8"
+    )
+    artifacts: list[dict[str, str]] = [
+        {"role": "implementation", "relative_path": "implementation"},
+        {"role": "result", "relative_path": "outputs/metrics.json"},
+        {"role": "log", "relative_path": "logs/train.log"},
+    ]
+    if authority.measurement_contract.checkpoint_policy == "required":
+        (workspace / "outputs" / "final.ckpt").write_bytes(b"checkpoint-v1")
+        artifacts.insert(
+            1,
+            {"role": "checkpoint", "relative_path": "outputs/final.ckpt"},
+        )
+    handoff = canonical_json(
+        {
+            "artifacts": artifacts,
+            "result_document_path": "outputs/metrics.json",
+            "schema_ref": "meta-research/target-completion-handoff/v1",
+            "status": "completed",
+            "summary": "Root finished implementation and training.",
+            "target_ref": handle.target_ref,
+            "target_run_ref": handle.target_run_ref,
+        }
+    )
+    evidence = TargetRootCompletionEvidence(
+        target_ref=handle.target_ref,
+        target_run_ref=handle.target_run_ref,
+        attempt_ref=handle.execution_attempt_ref,
+        attempt_generation=admission.run.attempt_generation,
+        root_session_ref=handle.root_session_ref,
+        native_session_ref="native_protected_bundle_root",
+        fence_ref=handle.execution_fence_ref,
+        operation_ref="harness_protected_bundle_root_final_turn",
+        operation_generation=1,
+        evidence_ref="harness_evidence_protected_bundle_root_final_turn",
+        evidence_sequence=10,
+        handoff=decode_target_completion_handoff(handoff),
+        observed_at=1.0,
+    )
+    result = TargetRunFinalizer(
+        lifecycle=lifecycle,
+        memory=memory,
+        workspace_resolver=runtime.target_run_authorities.agent_runtime,
+        evidence_reader=_EvidenceReader(evidence),
+        measurement_authority=runtime.owners.research_graph,
+        graph_authority=runtime.owners.research_graph,
+    ).finalize(handle=handle, evidence=evidence)
+    assert result.status == "completed"
+    assert result.target_commit_ref is not None
+    published = runtime.owners.agent_runtime.publish_target_root_completion(
+        target_ref=target.target_ref,
+        completion_ref=result.completion_ref,
+        target_commit_ref=result.target_commit_ref,
+    )
+    assert published.terminal is not None
+    lifecycle.mark_completed(
+        target_ref=target.target_ref,
+        completion_ref=result.completion_ref,
+    )
+    commits = runtime.owners.research_graph.query_target_commits(launch.graph_ref)
+    assert [commit.commit_ref for commit in commits] == [result.target_commit_ref]
+    return target, launch.graph_ref
 
 
 def _legacy_target_write_counts(runtime) -> dict[str, int]:
@@ -1665,6 +1863,453 @@ def test_bundle_rejects_non_dispatch_decisions_for_an_executable_frontier(
         )
     finally:
         runtime.close()
+
+
+def test_bundle_dispatch_is_fail_closed_until_runtime_protection_is_confirmed(
+    tmp_path: Path,
+) -> None:
+    inhibitor = _TogglePowerInhibitor()
+    provider = _ProtectedRollingBundleSkill()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-protected-dispatch",
+        bundle_skill_provider=provider,
+        power_inhibitor=inhibitor,
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(10):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            if current["target_graph"]["status"] == "accepted":
+                break
+        else:
+            raise AssertionError("Bundle did not accept TargetGraph")
+
+        request_ref = current["stage_run_request"]["request_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        assert run is not None
+        assert runtime.query_runtime_observability()["status"] == "ready"
+
+        inhibitor.available = False
+        for _step in range(4):
+            changed = runtime.bundle_stage.process_once()
+            if runtime.bundle_stage.transient_error == (
+                "power_inhibitor_acquisition_failed"
+            ):
+                assert not changed
+                break
+            assert changed
+        else:
+            raise AssertionError("Bundle dispatch did not reach protection acquire")
+
+        assert provider.schedule_requests == []
+        assert runtime.owners.agent_runtime.query_bundle_dispatch_decisions(
+            run.run_ref
+        ) == ()
+        waiting = runtime.query_runtime_observability()["durable_waiting"]
+        assert waiting == [
+            {
+                "responsibility_ref": waiting[0]["responsibility_ref"],
+                "operation_ref": run.review_invocation.operation_ref,
+                "effect_kind": "provider_unit",
+                "reason": {"code": "power_inhibitor_acquisition_failed"},
+            }
+        ]
+
+        inhibitor.available = True
+        assert runtime.bundle_stage.process_once()
+        assert len(provider.schedule_requests) == 1
+        assert (
+            provider.schedule_requests[0].job_ref
+            == run.review_invocation.operation_ref
+        )
+        assert len(
+            runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+        ) == 1
+        observability = runtime.query_runtime_observability()
+        assert observability["durable_waiting"] == []
+        assert observability["inhibitor"]["status"] == "idle"
+    finally:
+        runtime.close()
+
+
+def test_bundle_dispatch_recovers_owner_commit_before_runtime_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ProtectedRollingBundleSkill()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-dispatch-finish-recovery",
+        bundle_skill_provider=provider,
+    )
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(10):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            if current["target_graph"]["status"] == "accepted":
+                break
+        else:
+            raise AssertionError("Bundle did not accept TargetGraph")
+
+        request_ref = current["stage_run_request"]["request_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        assert run is not None
+        acknowledge = runtime.owners.agent_runtime.acknowledge_provider_safe_point
+
+        def lose_finish_ack(**_values) -> None:
+            raise OwnerConflict("injected_runtime_finish_ack_loss")
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            lose_finish_ack,
+        )
+        for _step in range(4):
+            try:
+                changed = runtime.bundle_stage.process_once()
+            except OwnerConflict as error:
+                assert error.code == "injected_runtime_finish_ack_loss"
+                break
+            assert changed
+        else:
+            raise AssertionError("Bundle dispatch did not reach the finish boundary")
+
+        assert len(provider.schedule_requests) == 1
+        assert len(
+            runtime.owners.agent_runtime.query_bundle_dispatch_decisions(run.run_ref)
+        ) == 1
+        assert len(runtime.query_runtime_observability()["responsibilities"]) == 1
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            acknowledge,
+        )
+        assert runtime.bundle_stage.process_once()
+        assert len(provider.schedule_requests) == 1
+        assert runtime.query_runtime_observability()["responsibilities"] == []
+        assert runtime.query_runtime_observability()["inhibitor"]["status"] == "idle"
+    finally:
+        runtime.close()
+
+
+def test_bundle_dispatch_restart_reuses_job_and_reconciles_committed_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "bundle-dispatch-restart-reconciliation"
+    provider = _ProtectedRollingBundleSkill()
+    runtime = _bundle_runtime(data_root, bundle_skill_provider=provider)
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(10):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            if current["target_graph"]["status"] == "accepted":
+                break
+        else:
+            raise AssertionError("Bundle did not accept TargetGraph")
+
+        request_ref = current["stage_run_request"]["request_ref"]
+        target_ref = current["target_graph"]["targets"][0]["target_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        assert run is not None
+
+        def lose_finish_ack(**_values) -> None:
+            raise OwnerConflict("injected_runtime_finish_ack_loss")
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            lose_finish_ack,
+        )
+        for _step in range(4):
+            try:
+                changed = runtime.bundle_stage.process_once()
+            except OwnerConflict as error:
+                assert error.code == "injected_runtime_finish_ack_loss"
+                break
+            assert changed
+        else:
+            raise AssertionError("Bundle dispatch did not reach the finish boundary")
+
+        assert len(provider.schedule_requests) == 1
+        stable_job_ref = run.review_invocation.operation_ref
+        assert provider.schedule_requests[0].job_ref == stable_job_ref
+        assert len(runtime.query_runtime_observability()["responsibilities"]) == 1
+    finally:
+        runtime.close()
+
+    restarted_provider = _ProtectedRollingBundleSkill()
+    restarted = _bundle_runtime(
+        data_root,
+        bundle_skill_provider=restarted_provider,
+    )
+    try:
+        recovered_run = restarted.owners.agent_runtime.query_bundle_stage_run(
+            request_ref
+        )
+        assert recovered_run is not None
+        assert recovered_run.review_invocation.operation_ref == stable_job_ref
+        for _step in range(6):
+            changed = restarted.bundle_stage.process_once()
+            if (
+                restarted.owners.agent_runtime.query_target_launch_ack(target_ref)
+                is not None
+            ):
+                break
+            assert changed
+        else:
+            raise AssertionError("Restart did not replay the committed dispatch")
+
+        assert restarted_provider.schedule_requests == []
+        assert len(
+            restarted.owners.agent_runtime.query_bundle_dispatch_decisions(
+                recovered_run.run_ref
+            )
+        ) == 1
+        observability = restarted.query_runtime_observability()
+        assert observability["responsibilities"] == []
+        assert observability["inhibitor"]["status"] == "idle"
+    finally:
+        restarted.close()
+
+
+def test_bundle_dispatch_restart_does_not_ack_unknown_turn_as_completed_review(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "bundle-dispatch-unknown-restart"
+    provider = _UnknownDispatchBundleSkill()
+    runtime = _bundle_runtime(data_root, bundle_skill_provider=provider)
+    try:
+        _confirm_direct_quest(runtime)
+        _finish_idea_stage(runtime)
+        _finish_plan_stage(runtime)
+        for _step in range(10):
+            assert runtime.bundle_stage.process_once()
+            current = runtime.bundle_stage.query_current()
+            if current["target_graph"]["status"] == "accepted":
+                break
+        else:
+            raise AssertionError("Bundle did not accept TargetGraph")
+
+        request_ref = current["stage_run_request"]["request_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        assert run is not None
+        for _step in range(4):
+            changed = runtime.bundle_stage.process_once()
+            if runtime.bundle_stage.transient_error == (
+                "codex_operation_reconciliation_pending"
+            ):
+                assert not changed
+                break
+            assert changed
+        else:
+            raise AssertionError("Bundle dispatch did not enter unknown outcome")
+
+        assert len(provider.schedule_requests) == 1
+        stable_job_ref = run.review_invocation.operation_ref
+        assert provider.schedule_requests[0].job_ref == stable_job_ref
+        with runtime._database.read() as connection:
+            old_unit = connection.execute(
+                text(
+                    "SELECT unit_ref, operation_ref, status FROM "
+                    "ar_provider_units WHERE run_ref = :run_ref AND status = "
+                    "'active'"
+                ),
+                {"run_ref": run.run_ref},
+            ).one()
+        assert old_unit.operation_ref == stable_job_ref
+        assert old_unit.unit_ref != run.review_invocation.invocation_ref
+        old_attempt_ref = run.attempt_ref
+        old_invocation_ref = run.review_invocation.invocation_ref
+    finally:
+        runtime.close()
+
+    restarted_provider = _UnknownDispatchBundleSkill()
+    restarted = _bundle_runtime(
+        data_root,
+        bundle_skill_provider=restarted_provider,
+    )
+    try:
+        recovered = restarted.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        assert recovered is not None
+        assert recovered.attempt_ref != old_attempt_ref
+        assert recovered.review_invocation.invocation_ref != old_invocation_ref
+        assert recovered.review_invocation.operation_ref == stable_job_ref
+        with restarted._database.read() as connection:
+            persisted_old_unit = connection.execute(
+                text(
+                    "SELECT operation_ref, status FROM ar_provider_units WHERE "
+                    "unit_ref = :unit_ref"
+                ),
+                {"unit_ref": old_unit.unit_ref},
+            ).one()
+        assert persisted_old_unit.operation_ref == stable_job_ref
+        assert persisted_old_unit.status == "revocation_pending"
+        responsibilities = restarted.query_runtime_observability()[
+            "responsibilities"
+        ]
+        assert len(responsibilities) == 1
+        assert responsibilities[0]["operation_ref"] == stable_job_ref
+        assert responsibilities[0]["status"] == "interrupted"
+        assert restarted_provider.schedule_requests == []
+    finally:
+        restarted.close()
+
+
+def test_bundle_target_batch_is_fail_closed_until_runtime_protection_is_confirmed(
+    tmp_path: Path,
+) -> None:
+    inhibitor = _TogglePowerInhibitor()
+    provider = _ProtectedSealingBundleSkill()
+    runtime = _bundle_runtime(
+        tmp_path / "bundle-protected-target-batch",
+        bundle_skill_provider=provider,
+        power_inhibitor=inhibitor,
+    )
+    try:
+        target, graph_ref = _accept_real_target_root_commit(runtime)
+        current = runtime.bundle_stage.query_current()
+        request_ref = current["stage_run_request"]["request_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        graph = runtime.owners.research_graph.query_target_graph(request_ref)
+        assert run is not None and graph is not None
+        assert graph.graph_ref == graph_ref
+        commits = runtime.owners.research_graph.query_target_commits(graph_ref)
+        assert len(commits) == 1
+        assert commits[0].target_ref == target.target_ref
+
+        inhibitor.available = False
+        for _step in range(4):
+            changed = runtime.bundle_stage.process_once()
+            if runtime.bundle_stage.transient_error == (
+                "power_inhibitor_acquisition_failed"
+            ):
+                assert not changed
+                break
+            assert changed
+        else:
+            raise AssertionError("Bundle target batch did not reach protection acquire")
+
+        assert provider.batch_requests == []
+        assert runtime.owners.agent_runtime.query_bundle_target_proposals(
+            run.run_ref
+        ) == ()
+        waiting = runtime.query_runtime_observability()["durable_waiting"]
+        assert waiting == [
+            {
+                "responsibility_ref": waiting[0]["responsibility_ref"],
+                "operation_ref": run.review_invocation.operation_ref,
+                "effect_kind": "provider_unit",
+                "reason": {"code": "power_inhibitor_acquisition_failed"},
+            }
+        ]
+
+        inhibitor.available = True
+        assert runtime.bundle_stage.process_once()
+        assert len(provider.batch_requests) == 1
+        assert provider.batch_requests[0].job_ref == (
+            run.review_invocation.operation_ref
+        )
+        assert len(
+            runtime.owners.agent_runtime.query_bundle_target_proposals(run.run_ref)
+        ) == 1
+        observability = runtime.query_runtime_observability()
+        assert observability["durable_waiting"] == []
+        assert observability["inhibitor"]["status"] == "idle"
+    finally:
+        runtime.close()
+
+
+def test_bundle_target_batch_restart_reconciles_committed_owner_proposal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "bundle-target-batch-restart-reconciliation"
+    provider = _ProtectedSealingBundleSkill()
+    runtime = _bundle_runtime(data_root, bundle_skill_provider=provider)
+    try:
+        _target, graph_ref = _accept_real_target_root_commit(runtime)
+        current = runtime.bundle_stage.query_current()
+        request_ref = current["stage_run_request"]["request_ref"]
+        run = runtime.owners.agent_runtime.query_bundle_stage_run(request_ref)
+        graph = runtime.owners.research_graph.query_target_graph(request_ref)
+        assert run is not None and graph is not None
+        assert graph.graph_ref == graph_ref
+        base_generation = graph.head_generation
+
+        def lose_finish_ack(**_values) -> None:
+            raise OwnerConflict("injected_runtime_finish_ack_loss")
+
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            lose_finish_ack,
+        )
+        for _step in range(4):
+            try:
+                changed = runtime.bundle_stage.process_once()
+            except OwnerConflict as error:
+                assert error.code == "injected_runtime_finish_ack_loss"
+                break
+            assert changed
+        else:
+            raise AssertionError(
+                "Bundle target batch did not reach the finish boundary"
+            )
+
+        assert len(provider.batch_requests) == 1
+        stable_job_ref = run.review_invocation.operation_ref
+        assert provider.batch_requests[0].job_ref == stable_job_ref
+        assert len(
+            runtime.owners.agent_runtime.query_bundle_target_proposals(run.run_ref)
+        ) == 1
+        assert len(runtime.query_runtime_observability()["responsibilities"]) == 1
+    finally:
+        runtime.close()
+
+    restarted_provider = _ProtectedSealingBundleSkill()
+    restarted = _bundle_runtime(
+        data_root,
+        bundle_skill_provider=restarted_provider,
+    )
+    try:
+        recovered_run = restarted.owners.agent_runtime.query_bundle_stage_run(
+            request_ref
+        )
+        assert recovered_run is not None
+        assert recovered_run.review_invocation.operation_ref == stable_job_ref
+        for _step in range(4):
+            changed = restarted.bundle_stage.process_once()
+            recovered_graph = restarted.owners.research_graph.query_target_graph(
+                request_ref
+            )
+            assert recovered_graph is not None
+            if recovered_graph.head_generation > base_generation:
+                break
+            assert changed
+        else:
+            raise AssertionError("Restart did not append the committed target batch")
+
+        assert restarted_provider.batch_requests == []
+        assert len(
+            restarted.owners.agent_runtime.query_bundle_target_proposals(
+                recovered_run.run_ref
+            )
+        ) == 1
+        observability = restarted.query_runtime_observability()
+        assert observability["responsibilities"] == []
+        assert observability["inhibitor"]["status"] == "idle"
+    finally:
+        restarted.close()
 
 
 def test_nonfrontier_formal_target_legacy_projection_fails_before_side_effect(

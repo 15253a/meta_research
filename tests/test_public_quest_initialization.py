@@ -202,7 +202,41 @@ def providerless_installed_product(tmp_path: Path):
         encoding="utf-8",
     )
     nvidia_smi.chmod(0o755)
-    daemon_env = {**os.environ, "PATH": str(provider_path)}
+    inhibit_registry = tmp_path / "systemd-inhibit-registry"
+    systemd_inhibit = provider_path / "systemd-inhibit"
+    systemd_inhibit.write_text(
+        "#!/bin/sh\n"
+        "registry=$FAKE_INHIBIT_REGISTRY\n"
+        "case \" $* \" in\n"
+        "  *\" --list \"*)\n"
+        "    test ! -f \"$registry\" || /bin/cat \"$registry\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n"
+        "who=\n"
+        "why=\n"
+        "while test $# -gt 0; do\n"
+        "  case \"$1\" in\n"
+        "    --who=*) who=${1#--who=} ;;\n"
+        "    --why=*) why=${1#--why=} ;;\n"
+        "    --*) ;;\n"
+        "    *) break ;;\n"
+        "  esac\n"
+        "  shift\n"
+        "done\n"
+        "printf '%s 1000 tester %s python sleep %s block\\n' \"$who\" \"$$\" \"$why\" > \"$registry\"\n"
+        "\"$@\"\n"
+        "status=$?\n"
+        "/bin/rm -f \"$registry\"\n"
+        "exit $status\n",
+        encoding="utf-8",
+    )
+    systemd_inhibit.chmod(0o755)
+    daemon_env = {
+        **os.environ,
+        "PATH": str(provider_path),
+        "FAKE_INHIBIT_REGISTRY": str(inhibit_registry),
+    }
 
     data_root = tmp_path / "installed-product-data"
     started = _run_cli_json(

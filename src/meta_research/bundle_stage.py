@@ -83,6 +83,7 @@ from meta_research.owners.research_memory import (
 from meta_research.target_commit_evidence import (
     TARGET_COMMIT_EVIDENCE_MEDIA_TYPE,
     target_commit_evidence_document,
+    target_commit_metric_result,
     target_commit_evidence_provenance,
 )
 
@@ -167,6 +168,11 @@ class BundleStageWorker:
     def process_once(self) -> bool:
         """Advance at most one durable Bundle boundary."""
 
+        if self._agent_runtime.reconcile_pending_provider_cleanup(
+            self._provider,
+            unit_kinds=("bundle_primary", "bundle_review"),
+        ):
+            return True
         current = self._discover_current_cycle()
         if current is None:
             return False
@@ -242,6 +248,9 @@ class BundleStageWorker:
             )
             self._transient_error = None
             return True
+        managed = self._agent_runtime.query_managed_run(run.run_ref)
+        if managed is not None and managed["status"] not in {"running", "completed"}:
+            return False
         if run.status in {"running", "awaiting_acceptance"}:
             self._drain_bundle_inbox(run)
         if _bundle_primary_output_kind(run) == "exhaustion_assessment":
@@ -388,6 +397,18 @@ class BundleStageWorker:
                 ),
                 None,
             )
+            batch_current_targets = tuple(
+                self._dispatch_target(target) for target in graph.targets
+            )
+            batch_target_commits = tuple(
+                self._target_commit_projection(commit) for commit in commits
+            )
+            batch_operation_ref = run.review_invocation.operation_ref
+            batch_unit_ref = _rolling_provider_unit_ref(
+                operation_ref=batch_operation_ref,
+                operation_name=f"target-batch-{graph.head_generation + 1}",
+                attempt_ref=run.attempt_ref,
+            )
             if pending is None:
                 if run.native_session_ref is None:
                     raise OwnerConflict("bundle_native_session_missing")
@@ -404,53 +425,85 @@ class BundleStageWorker:
                     initial_target_plan=graph.target_plan,
                     base_generation=graph.head_generation,
                     base_head_receipt=graph.head_receipt.as_public_dict(),
-                    current_targets=tuple(
-                        self._dispatch_target(target)
-                        for target in graph.targets
-                    ),
-                    target_commits=tuple(
-                        self._target_commit_projection(commit)
-                        for commit in commits
-                    ),
+                    current_targets=batch_current_targets,
+                    target_commits=batch_target_commits,
                     root_session_ref=run.root_session_ref,
                     native_session_ref=run.native_session_ref,
                     runtime_binding=cast(
                         BundleRuntimeBinding, run.runtime_binding
                     ),
                     inbox_checkpoint=inbox_checkpoint.as_public_dict(),
-                    job_ref=run.review_invocation.invocation_ref,
+                    job_ref=batch_operation_ref,
                 )
                 if not self._runtime_binding_is_current(run):
                     return False
                 try:
-                    result = self._provider.propose_target_batch(batch_request)
-                    validate_bundle_target_batch_result(batch_request, result)
-                except BundleSkillUnavailable as error:
+                    self._agent_runtime.begin_provider_unit(
+                        unit_ref=batch_unit_ref,
+                        operation_ref=batch_operation_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        unit_kind="bundle_review",
+                    )
+                except OwnerConflict as error:
                     self._transient_error = error.code
                     return False
-                except BundleSkillContractError as error:
-                    self._transient_error = str(error)
-                    return False
-                self._agent_runtime.record_bundle_target_proposal(
-                    run_ref=run.run_ref,
-                    attempt_ref=run.attempt_ref,
-                    fence_ref=run.fence_ref,
-                    native_session_ref=result.native_session_ref,
-                    graph_ref=graph.graph_ref,
-                    base_generation=graph.head_generation,
-                    base_head_receipt=graph.head_receipt,
-                    strategy_update=result.strategy_update,
-                    inbox_checkpoint=inbox_checkpoint,
-                    idempotency_key=_operation_key(
-                        "bundle-target-batch",
-                        run.run_ref,
-                        graph.head_receipt.receipt_ref,
-                        inbox_checkpoint.checkpoint_ref,
-                        inbox_checkpoint.checkpoint_hash,
-                    ),
-                )
-                self._transient_error = None
-                return True
+                provider_safe = True
+                try:
+                    try:
+                        result = self._provider.propose_target_batch(batch_request)
+                        validate_bundle_target_batch_result(batch_request, result)
+                    except BundleSkillUnavailable as error:
+                        if error.code == "codex_operation_reconciliation_pending":
+                            provider_safe = False
+                        elif error.recovery_checkpoint is not None:
+                            provider_safe = False
+                            self._agent_runtime.record_stage_provider_hard_ceiling(
+                                unit_ref=batch_unit_ref,
+                                run_ref=run.run_ref,
+                                attempt_ref=run.attempt_ref,
+                                fence_ref=run.fence_ref,
+                                failure_code=error.code,
+                                provider_exit=error.recovery_checkpoint,
+                            )
+                        self._transient_error = error.code
+                        return False
+                    except BundleSkillContractError as error:
+                        self._transient_error = str(error)
+                        return False
+                    self._agent_runtime.record_bundle_target_proposal(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        native_session_ref=result.native_session_ref,
+                        graph_ref=graph.graph_ref,
+                        base_generation=graph.head_generation,
+                        base_head_receipt=graph.head_receipt,
+                        strategy_update=result.strategy_update,
+                        inbox_checkpoint=inbox_checkpoint,
+                        idempotency_key=_operation_key(
+                            "bundle-target-batch",
+                            run.run_ref,
+                            graph.head_receipt.receipt_ref,
+                            inbox_checkpoint.checkpoint_ref,
+                            inbox_checkpoint.checkpoint_hash,
+                        ),
+                    )
+                    self._transient_error = None
+                    return True
+                finally:
+                    if provider_safe:
+                        self._agent_runtime.acknowledge_provider_safe_point(
+                            unit_ref=batch_unit_ref,
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                        )
+            self._acknowledge_rolling_provider_boundary(
+                run,
+                unit_ref=batch_unit_ref,
+            )
             try:
                 self._research_graph.append_target_batch(
                     graph_ref=graph.graph_ref,
@@ -511,6 +564,17 @@ class BundleStageWorker:
             else None
         )
         coordination_needed = bool(dispatchable)
+        dispatch_generation = (
+            pending_dispatch.generation
+            if pending_dispatch is not None
+            else len(decisions) + 1
+        )
+        dispatch_operation_ref = run.review_invocation.operation_ref
+        dispatch_unit_ref = _rolling_provider_unit_ref(
+            operation_ref=dispatch_operation_ref,
+            operation_name=f"dispatch-{dispatch_generation}",
+            attempt_ref=run.attempt_ref,
+        )
         if pending_dispatch is None and coordination_needed and not same_input:
             if run.native_session_ref is None:
                 raise OwnerConflict("bundle_native_session_missing")
@@ -520,52 +584,90 @@ class BundleStageWorker:
                 attempt_ref=run.attempt_ref,
                 fence_ref=run.fence_ref,
                 graph_ref=graph.graph_ref,
-                generation=len(decisions) + 1,
+                generation=dispatch_generation,
                 frontier=dispatch_frontier,
                 state=dispatch_state,
                 root_session_ref=run.root_session_ref,
                 native_session_ref=run.native_session_ref,
                 runtime_binding=cast(BundleRuntimeBinding, run.runtime_binding),
                 inbox_checkpoint=inbox_checkpoint.as_public_dict(),
-                job_ref=run.review_invocation.invocation_ref,
+                job_ref=dispatch_operation_ref,
             )
             if not self._runtime_binding_is_current(run):
                 return False
             try:
-                result = self._provider.schedule_target(dispatch_request)
-                validate_bundle_dispatch_result(dispatch_request, result)
-            except BundleSkillUnavailable as error:
+                self._agent_runtime.begin_provider_unit(
+                    unit_ref=dispatch_unit_ref,
+                    operation_ref=dispatch_operation_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    unit_kind="bundle_review",
+                )
+            except OwnerConflict as error:
                 self._transient_error = error.code
                 return False
-            except BundleSkillContractError as error:
-                self._transient_error = str(error)
-                return False
-            self._agent_runtime.record_bundle_dispatch_decision(
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                native_session_ref=result.native_session_ref,
-                graph_ref=graph.graph_ref,
-                generation=dispatch_request.generation,
-                frontier=dispatch_frontier,
-                state=dispatch_state,
-                action=result.action,
-                selected_target_ref=result.selected_target_ref,
-                rationale=result.rationale,
-                inbox_checkpoint=inbox_checkpoint,
-                idempotency_key=_operation_key(
-                    "bundle-dispatch", run.run_ref, str(len(decisions) + 1)
-                ),
-            )
-            self._transient_error = (
-                None
-                if result.action == "dispatch"
-                else "bundle_replan_required"
-                if result.action == "replan_required"
-                else "bundle_root_waiting"
-            )
-            return True
+            provider_safe = True
+            try:
+                try:
+                    result = self._provider.schedule_target(dispatch_request)
+                    validate_bundle_dispatch_result(dispatch_request, result)
+                except BundleSkillUnavailable as error:
+                    if error.code == "codex_operation_reconciliation_pending":
+                        provider_safe = False
+                    elif error.recovery_checkpoint is not None:
+                        provider_safe = False
+                        self._agent_runtime.record_stage_provider_hard_ceiling(
+                            unit_ref=dispatch_unit_ref,
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            failure_code=error.code,
+                            provider_exit=error.recovery_checkpoint,
+                        )
+                    self._transient_error = error.code
+                    return False
+                except BundleSkillContractError as error:
+                    self._transient_error = str(error)
+                    return False
+                self._agent_runtime.record_bundle_dispatch_decision(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    native_session_ref=result.native_session_ref,
+                    graph_ref=graph.graph_ref,
+                    generation=dispatch_request.generation,
+                    frontier=dispatch_frontier,
+                    state=dispatch_state,
+                    action=result.action,
+                    selected_target_ref=result.selected_target_ref,
+                    rationale=result.rationale,
+                    inbox_checkpoint=inbox_checkpoint,
+                    idempotency_key=_operation_key(
+                        "bundle-dispatch", run.run_ref, str(len(decisions) + 1)
+                    ),
+                )
+                self._transient_error = (
+                    None
+                    if result.action == "dispatch"
+                    else "bundle_replan_required"
+                    if result.action == "replan_required"
+                    else "bundle_root_waiting"
+                )
+                return True
+            finally:
+                if provider_safe:
+                    self._agent_runtime.acknowledge_provider_safe_point(
+                        unit_ref=dispatch_unit_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                    )
         if pending_dispatch is not None:
+            self._acknowledge_rolling_provider_boundary(
+                run,
+                unit_ref=dispatch_unit_ref,
+            )
             launch_checkpoint = self._drain_bundle_inbox(run)
             if not self._operation_uses_inbox_checkpoint(
                 operation_kind="dispatch",
@@ -1196,7 +1298,7 @@ class BundleStageWorker:
             "closure_hash": commit.closure_hash,
             "result_disposition": commit.result_disposition,
             "protocol": commit.closure["protocol"],
-            "metric_result": commit.closure["metric_result"],
+            "metric_result": target_commit_metric_result(commit),
             "receipt": commit.receipt.as_public_dict(),
         }
 
@@ -1334,12 +1436,13 @@ class BundleStageWorker:
                     target.target_ref
                 )
                 for target in graph.targets
+                if target.target_ref not in commit_by_target
             }
             target_rows: list[dict[str, object]] = []
             for target in graph.targets:
                 target_frontier = frontier_by_target[target.target_ref]
                 target_notice = notice_by_target[target.target_ref]
-                target_launch = launch_by_target[target.target_ref]
+                target_launch = launch_by_target.get(target.target_ref)
                 blocker = None
                 if target.target_ref in commit_by_target:
                     status = "committed"
@@ -1480,7 +1583,7 @@ class BundleStageWorker:
                     "target_commit_ref": commit.commit_ref,
                     "target_ref": commit.target_ref,
                     "result_disposition": commit.result_disposition,
-                    "metric_result": commit.closure["metric_result"],
+                    "metric_result": target_commit_metric_result(commit),
                     "receipt": commit.receipt.as_public_dict(),
                     "evidence_ref": evidence["evidence_ref"],
                     "asset_version_ref": evidence["asset_version_ref"],
@@ -1945,14 +2048,18 @@ class BundleStageWorker:
             ),
         )
         if run.primary_draft is None:
-            self._agent_runtime.begin_provider_unit(
-                unit_ref=unit_ref,
-                operation_ref=job_ref,
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                unit_kind="bundle_primary",
-            )
+            try:
+                self._agent_runtime.begin_provider_unit(
+                    unit_ref=unit_ref,
+                    operation_ref=job_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    unit_kind="bundle_primary",
+                )
+            except OwnerConflict as error:
+                self._transient_error = error.code
+                return False
             provider_safe = True
             try:
                 try:
@@ -1961,6 +2068,16 @@ class BundleStageWorker:
                 except BundleSkillUnavailable as error:
                     if error.code == "codex_operation_reconciliation_pending":
                         provider_safe = False
+                    elif error.recovery_checkpoint is not None:
+                        provider_safe = False
+                        self._agent_runtime.record_stage_provider_hard_ceiling(
+                            unit_ref=unit_ref,
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            failure_code=error.code,
+                            provider_exit=error.recovery_checkpoint,
+                        )
                     self._transient_error = error.code
                     return False
                 except BundleSkillContractError as error:
@@ -1996,14 +2113,18 @@ class BundleStageWorker:
             adapter_kind=run.primary_draft.adapter_kind,
             output_kind=cast(str, _bundle_primary_output_kind(run)),
         )
-        self._agent_runtime.begin_provider_unit(
-            unit_ref=unit_ref,
-            operation_ref=job_ref,
-            run_ref=run.run_ref,
-            attempt_ref=run.attempt_ref,
-            fence_ref=run.fence_ref,
-            unit_kind="bundle_review",
-        )
+        try:
+            self._agent_runtime.begin_provider_unit(
+                unit_ref=unit_ref,
+                operation_ref=job_ref,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                unit_kind="bundle_review",
+            )
+        except OwnerConflict as error:
+            self._transient_error = error.code
+            return False
         provider_safe = True
         try:
             try:
@@ -2024,6 +2145,16 @@ class BundleStageWorker:
             except BundleSkillUnavailable as error:
                 if error.code == "codex_operation_reconciliation_pending":
                     provider_safe = False
+                elif error.recovery_checkpoint is not None:
+                    provider_safe = False
+                    self._agent_runtime.record_stage_provider_hard_ceiling(
+                        unit_ref=unit_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        failure_code=error.code,
+                        provider_exit=error.recovery_checkpoint,
+                    )
                 self._transient_error = error.code
                 return False
             except BundleSkillContractError as error:
@@ -2244,6 +2375,26 @@ class BundleStageWorker:
         )
         return bound == checkpoint
 
+    def _acknowledge_rolling_provider_boundary(
+        self,
+        run: BundleStageRun,
+        *,
+        unit_ref: str,
+    ) -> None:
+        try:
+            self._agent_runtime.acknowledge_provider_safe_point(
+                unit_ref=unit_ref,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+            )
+        except OwnerConflict as error:
+            # Decisions created before rolling operations became managed units
+            # have no unit to settle. New decisions must replay their verified
+            # Owner boundary before any downstream launch or append.
+            if error.code != "runtime_provider_unit_not_found":
+                raise
+
     def _current_runtime_binding(self) -> BundleRuntimeBinding | None:
         if self._harnesses is None:
             self._transient_error = (
@@ -2456,6 +2607,23 @@ def _target_authorization_requirement(
         target_ref=target.target_ref,
         target_spec_hash=target_spec_hash,
     )
+
+
+def _rolling_provider_unit_ref(
+    *,
+    operation_ref: str,
+    operation_name: str,
+    attempt_ref: str,
+) -> str:
+    """Name one physical rolling turn without aliasing its logical job."""
+
+    return "provider_unit_" + canonical_hash(
+        {
+            "operation_ref": operation_ref,
+            "operation_name": operation_name,
+            "attempt_ref": attempt_ref,
+        }
+    )[:64]
 
 
 def _operation_key(*parts: str) -> str:

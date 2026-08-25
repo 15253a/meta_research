@@ -45,6 +45,40 @@ def target_commit_evidence_provenance(
     }
 
 
+def target_commit_metric_result(commit: TargetCommit) -> dict[str, object]:
+    """Project the metric leaf from either accepted TargetCommit closure."""
+
+    legacy = commit.closure.get("metric_result")
+    if type(legacy) is dict:
+        return cast(dict[str, object], legacy)
+    root = commit.closure.get("root_measurement")
+    if type(root) is not dict:
+        raise OwnerConflict("target_commit_metric_result_invalid")
+    root_value = cast(dict[str, object], root)
+    metric_result_ref = root_value.get("metric_result_ref")
+    metrics = root_value.get("metrics")
+    receipt = root_value.get("receipt")
+    if (
+        type(metric_result_ref) is not str
+        or not metric_result_ref
+        or type(metrics) is not dict
+        or not metrics
+        or any(
+            type(key) is not str
+            or not key
+            or type(value) not in {int, float}
+            for key, value in cast(dict[object, object], metrics).items()
+        )
+        or type(receipt) is not dict
+    ):
+        raise OwnerConflict("target_commit_metric_result_invalid")
+    return {
+        "metric_result_ref": metric_result_ref,
+        "metrics": metrics,
+        "receipt": receipt,
+    }
+
+
 def target_commit_evidence_document(
     commit: TargetCommit,
 ) -> dict[str, object]:
@@ -57,7 +91,7 @@ def target_commit_evidence_document(
         "target_spec_hash": commit.target_spec_hash,
         "target_commit_closure_hash": commit.closure_hash,
         "result_disposition": commit.result_disposition,
-        "metric_result": commit.closure["metric_result"],
+        "metric_result": target_commit_metric_result(commit),
         "result_content": commit.closure["result_content"],
         "target_commit_receipt": commit.receipt.as_public_dict(),
     }

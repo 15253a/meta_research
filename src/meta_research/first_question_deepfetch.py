@@ -59,6 +59,9 @@ class FirstQuestionDeepFetchWorker:
                     None if run is None else run.run_ref,
                 )
             except OwnerConflict as error:
+                if error.code.startswith("power_inhibitor_"):
+                    blocked_request_refs.add(request.request_ref)
+                    continue
                 if error.code == "deepfetch_run_busy":
                     blocked_request_refs.add(request.request_ref)
                     continue
@@ -75,6 +78,7 @@ class FirstQuestionDeepFetchWorker:
                     "runtime_run_suspended",
                     "runtime_fence_revoked",
                     "runtime_reconciliation_required",
+                    "runtime_incarnation_stale",
                     "terminal_run_cannot_reopen",
                 }:
                     # A predecessor Attempt is no longer authoritative.  Its late

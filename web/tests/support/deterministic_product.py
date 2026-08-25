@@ -41,6 +41,7 @@ from meta_research.quest_drafting import (
     ProposalDraftRequest,
     ProposalDraftResult,
 )
+from meta_research.runtime_protection import InhibitorLease
 from meta_research.web import create_app
 from meta_research.writing_contract import WritingRuntimeBinding
 from meta_research.writing_skill import (
@@ -59,6 +60,53 @@ QUESTION = {
     "background_context": "研究稀有细胞形态。",
     "requirements_constraints": "两周内，使用获准 GPU。",
 }
+
+
+class ConfirmedDeterministicPowerInhibitor:
+    """A recorded, idempotent OS-hold protocol fake for production E2E."""
+
+    def __init__(self) -> None:
+        self.acquire_calls: list[tuple[str, str]] = []
+        self.confirm_calls: list[str] = []
+        self.release_calls: list[str] = []
+        self.native_acquire_count = 0
+        self._live_holders: set[str] = set()
+        self._lock = threading.Lock()
+
+    @property
+    def kind(self) -> str:
+        return "chrome_deterministic_inhibitor"
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        with self._lock:
+            self.acquire_calls.append((holder_ref, reason))
+            if holder_ref not in self._live_holders:
+                self._live_holders.add(holder_ref)
+                self.native_acquire_count += 1
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=time.time(),
+            native_holder_ref=(
+                "chrome_guardian_"
+                + canonical_hash({"holder_ref": holder_ref})
+            ),
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        with self._lock:
+            self.confirm_calls.append(lease.holder_ref)
+            return (
+                lease.backend == self.kind
+                and lease.scope == "sleep"
+                and lease.holder_ref in self._live_holders
+            )
+
+    def release(self, lease: InhibitorLease) -> None:
+        with self._lock:
+            self.release_calls.append(lease.holder_ref)
+            self._live_holders.discard(lease.holder_ref)
 
 
 class DeterministicDraftingAdapter:
@@ -689,6 +737,7 @@ async def serve(
                 prepared_data_root.run / "chrome-provider-control"
             )
         )
+    power_inhibitor = ConfirmedDeterministicPowerInhibitor()
     runtime = build_production_runtime(
         prepared_data_root,
         proposal_drafter=adapter,
@@ -698,6 +747,8 @@ async def serve(
         plan_skill_provider=plan_skill,
         writing_skill_provider=DeterministicWritingSkill(),
         deepfetch_provider=DeterministicDeepFetchProvider(),
+        power_inhibitor=power_inhibitor,
+        startup_harness_diagnostics=False,
     )
     human_collaboration = runtime.owners.human_collaboration
     if manual_root:

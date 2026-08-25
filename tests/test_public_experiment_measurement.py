@@ -19,6 +19,7 @@ from meta_research.experiment import (
 )
 from meta_research.experiment_contract import (
     PROTOCOL_EXPERIMENT_RESULT_SCHEMA,
+    ExperimentProviderUnavailable,
     ProtocolExperimentIntent,
     experiment_definition_document,
     experiment_execution_log_document,
@@ -33,6 +34,10 @@ from meta_research.quest_drafting import (
     IntentTurnResult,
     ProposalDraftRequest,
     ProposalDraftResult,
+)
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeProtectionUnavailable,
 )
 
 
@@ -72,6 +77,33 @@ class _DeterministicProbe:
             ),
             adapter_kind="test_probe",
         )
+
+
+class _SwitchablePowerInhibitor:
+    kind = "test_switchable"
+
+    def __init__(self) -> None:
+        self.reject = False
+        self._held: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        if self.reject:
+            raise RuntimeProtectionUnavailable("power_inhibitor_test_rejected")
+        self._held.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=1_720_000_000.0,
+            native_holder_ref=f"native:{holder_ref}",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self._held
+
+    def release(self, lease: InhibitorLease) -> None:
+        self._held.discard(lease.holder_ref)
 
 
 class _DeterministicExperimentProvider:
@@ -229,6 +261,40 @@ class _SequenceMetricsProvider(_DeterministicExperimentProvider):
         )
 
 
+class _OutcomeOnceExperimentProvider(_DeterministicExperimentProvider):
+    def __init__(self, code: str, durable_outcome: str) -> None:
+        super().__init__()
+        self._code = code
+        self._durable_outcome = durable_outcome
+
+    def execute(self, request, observe) -> ExperimentProviderResult:
+        if self.execute_calls == 0:
+            self.execute_calls += 1
+            self.requests.append(request)
+            raise ExperimentProviderUnavailable(
+                self._code,
+                durable_outcome=self._durable_outcome,
+            )
+        return super().execute(request, observe)
+
+
+class _RepeatedTimeoutExperimentProvider(_DeterministicExperimentProvider):
+    def __init__(self, timeout_count: int) -> None:
+        super().__init__()
+        self._remaining_timeouts = timeout_count
+
+    def execute(self, request, observe) -> ExperimentProviderResult:
+        if self._remaining_timeouts:
+            self._remaining_timeouts -= 1
+            self.execute_calls += 1
+            self.requests.append(request)
+            raise ExperimentProviderUnavailable(
+                "experiment_provider_timeout",
+                durable_outcome="terminal",
+            )
+        return super().execute(request, observe)
+
+
 class _ProtocolEvaluationProvider(_DeterministicExperimentProvider):
     def __init__(self, metrics: dict[str, float]) -> None:
         super().__init__()
@@ -278,7 +344,7 @@ def _drain_experiments(runtime, *, limit: int = 20) -> int:
     return processed
 
 
-def _runtime(path: Path, experiment_provider=None):
+def _runtime(path: Path, experiment_provider=None, power_inhibitor=None):
     drafting = _DeterministicDraftingAdapter()
     return build_production_runtime(
         prepare_data_root(path),
@@ -286,6 +352,56 @@ def _runtime(path: Path, experiment_provider=None):
         intent_drafting_provider=drafting,
         host_compute_probe=_DeterministicProbe(),
         experiment_provider=experiment_provider or _DeterministicExperimentProvider(),
+        power_inhibitor=power_inhibitor,
+    )
+
+
+def _resume_managed_experiment(runtime, *, quest_ref: str, run_ref: str) -> None:
+    foreground = runtime.owners.advancement_engine.query_foreground(quest_ref)
+    assert foreground is not None
+    managed = runtime.owners.agent_runtime.query_managed_run(run_ref)
+    assert managed is not None
+    resume_key = "resume-experiment:" + hashlib.sha256(
+        f"{run_ref}:{managed['attempt_ref']}".encode("utf-8")
+    ).hexdigest()[:32]
+    payload = {
+        "action": "resume",
+        "target": {
+            "target_scope": "run",
+            "quest_ref": quest_ref,
+            "cycle_ref": foreground["cycle_ref"],
+            "question_ref": foreground["question_ref"],
+            "epoch": foreground["epoch"],
+            "run_ref": run_ref,
+        },
+        "reason": "operator_requested",
+    }
+    human = runtime.owners.human_collaboration
+    drafted = human.create_command_draft(
+        f"quest:{quest_ref}",
+        {"command_kind": "research_control", "payload": payload},
+        f"{resume_key}:draft",
+    )
+    previewed = human.preview_command(
+        drafted["intent_id"],
+        drafted["draft_revision"],
+        drafted["draft_hash"],
+        f"{resume_key}:preview",
+    )
+    preview = previewed["impact_preview"]
+    assert preview is not None
+    confirmed = human.confirm_command(
+        drafted["intent_id"],
+        drafted["draft_revision"],
+        drafted["draft_hash"],
+        preview["preview_ref"],
+        preview["preview_hash"],
+        f"{resume_key}:confirm",
+    )
+    human.execute_confirmed_command(
+        confirmed["intent_id"],
+        confirmed["confirmation_receipt"]["receipt_ref"],
+        f"{resume_key}:execute",
     )
 
 
@@ -479,6 +595,407 @@ def test_experiment_admission_keeps_domain_and_runtime_identities_independent(
         for new_identity in ("variant_run_ref", "evaluation_attempt_ref"):
             assert repeated["identities"][new_identity] != identities[new_identity]
         assert repeated["execution"]["run_ref"] != admitted["execution"]["run_ref"]
+    finally:
+        runtime.close()
+
+
+def test_experiment_provider_does_not_start_until_power_hold_is_confirmed(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicExperimentProvider()
+    inhibitor = _SwitchablePowerInhibitor()
+    runtime = _runtime(
+        tmp_path / "experiment-power-fail-closed",
+        provider,
+        inhibitor,
+    )
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = runtime.experiment.start(
+            ExperimentIntent(
+                execution_request_ref="experiment-power-fail-closed",
+                quest_ref=quest["quest_ref"],
+                title="电源保护必须先于实验执行",
+                hypothesis="未确认系统级 hold 时不得启动 provider。",
+                variant_parameter=-0.25,
+                sample_count=16,
+            ),
+            "experiment-power-fail-closed",
+        )
+        inhibitor.reject = True
+
+        assert runtime.experiment.process_once() is False
+        assert provider.execute_calls == 0
+        blocked = runtime.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )
+        assert blocked is not None
+        assert blocked["execution"]["status"] == "admitted"
+
+        inhibitor.reject = False
+        assert runtime.experiment.process_once()
+        assert provider.execute_calls == 1
+    finally:
+        runtime.close()
+
+
+def test_restart_releases_experiment_hold_after_owner_commit_ack_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "experiment-runtime-ack-loss"
+    provider = _DeterministicExperimentProvider()
+    runtime = _runtime(root, provider)
+    quest = _confirm_direct_quest(runtime)
+    admitted = runtime.experiment.start(
+        ExperimentIntent(
+            execution_request_ref="experiment-runtime-ack-loss",
+            quest_ref=quest["quest_ref"],
+            title="Owner 提交后恢复运行保护责任",
+            hypothesis="ACK 丢失不得重放已提交的实验执行。",
+            variant_parameter=-0.25,
+            sample_count=16,
+        ),
+        "experiment-runtime-ack-loss",
+    )
+    original_ack = runtime.owners.agent_runtime.acknowledge_provider_safe_point
+
+    def lose_safe_ack(**_values) -> None:
+        raise RuntimeError("simulated runtime safe ACK loss")
+
+    monkeypatch.setattr(
+        runtime.owners.agent_runtime,
+        "acknowledge_provider_safe_point",
+        lose_safe_ack,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="simulated runtime safe ACK loss"):
+            runtime.experiment.process_once()
+        assert provider.execute_calls == 1
+        assert runtime.query_runtime_observability()["inhibitor"][
+            "active_count"
+        ] == 1
+    finally:
+        monkeypatch.setattr(
+            runtime.owners.agent_runtime,
+            "acknowledge_provider_safe_point",
+            original_ack,
+        )
+        runtime.close()
+
+    restarted = _runtime(root, provider)
+    try:
+        recovered = restarted.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )
+        assert recovered is not None
+        assert recovered["execution"]["status"] == "executed"
+        assert provider.execute_calls == 1
+        evidence = restarted.query_runtime_observability()
+        assert evidence["inhibitor"]["active_count"] == 0
+        assert evidence["interruptions"][-1]["reconciliation_status"] in {
+            "completed",
+            "terminal",
+        }
+    finally:
+        restarted.close()
+
+
+def test_pending_experiment_effect_reconciles_same_operation_without_safe_ack(
+    tmp_path: Path,
+) -> None:
+    provider = _OutcomeOnceExperimentProvider(
+        "experiment_provider_waiting_for_receipt",
+        "pending",
+    )
+    runtime = _runtime(tmp_path / "experiment-pending-effect", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = runtime.experiment.start(
+            ExperimentIntent(
+                execution_request_ref="experiment-pending-effect",
+                quest_ref=quest["quest_ref"],
+                title="等待同一 provider operation 的 durable receipt",
+                hypothesis="Pending effect 不得伪造 Safe Point 或更换执行身份。",
+                variant_parameter=-0.25,
+                sample_count=16,
+            ),
+            "experiment-pending-effect",
+        )
+        original = admitted["execution"]
+
+        assert runtime.experiment.process_once()
+        pending = runtime.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )["execution"]
+        assert pending["status"] == "admitted"
+        assert pending["attempt_ref"] == original["attempt_ref"]
+        assert pending["fence_ref"] == original["fence_ref"]
+        assert pending["provider_operation_ref"] == original[
+            "provider_operation_ref"
+        ]
+        assert runtime.query_runtime_observability()["inhibitor"][
+            "active_count"
+        ] == 1
+
+        assert runtime.experiment.process_once()
+        executed = runtime.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )["execution"]
+        assert executed["status"] == "executed"
+        assert executed["attempt_ref"] == original["attempt_ref"]
+        assert executed["provider_operation_ref"] == original[
+            "provider_operation_ref"
+        ]
+        assert provider.execute_calls == 2
+        assert runtime.query_runtime_observability()["inhibitor"][
+            "active_count"
+        ] == 0
+    finally:
+        runtime.close()
+
+
+def test_unknown_experiment_effect_waits_for_restart_and_keeps_same_operation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "experiment-unknown-effect"
+    provider = _OutcomeOnceExperimentProvider(
+        "experiment_provider_outcome_unknown",
+        "unknown",
+    )
+    runtime = _runtime(root, provider)
+    quest = _confirm_direct_quest(runtime)
+    admitted = runtime.experiment.start(
+        ExperimentIntent(
+            execution_request_ref="experiment-unknown-effect",
+            quest_ref=quest["quest_ref"],
+            title="保留未知外部 effect",
+            hypothesis="未知结果必须由原 operation 对账，不能盲目重放。",
+            variant_parameter=-0.25,
+            sample_count=16,
+        ),
+        "experiment-unknown-effect",
+    )
+    original = admitted["execution"]
+    assert runtime.experiment.process_once()
+    held = runtime.experiment.query(
+        admitted["identities"]["evaluation_attempt_ref"]
+    )["execution"]
+    assert held["status"] == "running"
+    assert held["attempt_ref"] == original["attempt_ref"]
+    assert held["fence_ref"] == original["fence_ref"]
+    assert held["provider_operation_ref"] == original["provider_operation_ref"]
+    assert held["events"][-1]["payload"] == {
+        "status": "reconciliation_pending",
+        "reason": {"code": "experiment_provider_outcome_unknown"},
+    }
+    assert runtime.query_runtime_observability()["inhibitor"]["active_count"] == 1
+    assert runtime.experiment.process_once() is False
+    assert provider.execute_calls == 1
+    runtime.close()
+
+    restarted = _runtime(root, provider)
+    try:
+        recovered = restarted.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )["execution"]
+        assert recovered["status"] == "admitted"
+        assert recovered["attempt_generation"] == 2
+        assert recovered["attempt_ref"] != original["attempt_ref"]
+        assert recovered["fence_ref"] != original["fence_ref"]
+        assert recovered["provider_operation_ref"] == original[
+            "provider_operation_ref"
+        ]
+
+        assert restarted.experiment.process_once()
+        executed = restarted.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )["execution"]
+        assert executed["status"] == "executed"
+        assert executed["provider_operation_ref"] == original[
+            "provider_operation_ref"
+        ]
+        assert provider.execute_calls == 2
+        assert restarted.query_runtime_observability()["inhibitor"][
+            "active_count"
+        ] == 0
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    (
+        "experiment_provider_timeout",
+        "experiment_provider_output_limit",
+        "experiment_provider_descendant_process",
+    ),
+)
+def test_experiment_operation_ceiling_fences_attempt_without_terminalizing_run(
+    tmp_path: Path,
+    failure_code: str,
+) -> None:
+    root = tmp_path / failure_code
+    provider = _OutcomeOnceExperimentProvider(failure_code, "terminal")
+    runtime = _runtime(root, provider)
+    quest = _confirm_direct_quest(runtime)
+    admitted = runtime.experiment.start(
+        ExperimentIntent(
+            execution_request_ref=f"ceiling-{failure_code}",
+            quest_ref=quest["quest_ref"],
+            title="单次 operation ceiling 不终止长期 Run",
+            hypothesis="超限只永久 fence 当前 Attempt，并等待显式恢复。",
+            variant_parameter=-0.25,
+            sample_count=16,
+        ),
+        f"ceiling-{failure_code}",
+    )
+    original = admitted["execution"]
+
+    assert runtime.experiment.process_once()
+    blocked = runtime.experiment.query(
+        admitted["identities"]["evaluation_attempt_ref"]
+    )["execution"]
+    assert blocked["status"] == "admitted"
+    assert blocked["managed_status"] == "suspended"
+    assert blocked["failure"] is None
+    assert blocked["attempt_generation"] == 2
+    assert blocked["attempt_ref"] != original["attempt_ref"]
+    assert blocked["fence_ref"] != original["fence_ref"]
+    assert blocked["provider_operation_generation"] == 2
+    assert blocked["provider_operation_ref"] != original["provider_operation_ref"]
+    assert blocked["events"][-1]["payload"] == {
+        "status": "durable_waiting",
+        "reason": {"code": failure_code},
+        "predecessor": {
+            "attempt_ref": original["attempt_ref"],
+            "fence_ref": original["fence_ref"],
+            "provider_operation_ref": original["provider_operation_ref"],
+        },
+    }
+    assert runtime.query_runtime_observability()["inhibitor"]["active_count"] == 0
+    assert runtime.experiment.process_once() is False
+    assert provider.execute_calls == 1
+    runtime.close()
+
+    restarted = _runtime(root, provider)
+    try:
+        durable = restarted.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )["execution"]
+        assert durable == blocked
+        assert restarted.experiment.process_once() is False
+        assert provider.execute_calls == 1
+
+        _resume_managed_experiment(
+            restarted,
+            quest_ref=quest["quest_ref"],
+            run_ref=original["run_ref"],
+        )
+        assert restarted.experiment.process_once()
+        executed = restarted.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )["execution"]
+        assert executed["status"] == "executed"
+        assert executed["run_ref"] == original["run_ref"]
+        assert executed["provider_operation_ref"] == blocked[
+            "provider_operation_ref"
+        ]
+        assert provider.execute_calls == 2
+    finally:
+        restarted.close()
+
+
+def test_experiment_run_has_no_implicit_provider_operation_generation_ceiling(
+    tmp_path: Path,
+) -> None:
+    provider = _RepeatedTimeoutExperimentProvider(timeout_count=3)
+    runtime = _runtime(tmp_path / "experiment-unbounded-generations", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = runtime.experiment.start(
+            ExperimentIntent(
+                execution_request_ref="experiment-unbounded-generations",
+                quest_ref=quest["quest_ref"],
+                title="长期 Run 不绑定隐式 operation generation 上限",
+                hypothesis="压缩代次恢复不能在固定第 N 次伪造 terminal Run。",
+                variant_parameter=-0.25,
+                sample_count=16,
+            ),
+            "experiment-unbounded-generations",
+        )
+        run_ref = admitted["execution"]["run_ref"]
+
+        for expected_generation in (2, 3, 4):
+            assert runtime.experiment.process_once()
+            waiting = runtime.experiment.query(
+                admitted["identities"]["evaluation_attempt_ref"]
+            )["execution"]
+            assert waiting["status"] == "admitted"
+            assert waiting["managed_status"] == "suspended"
+            assert waiting["provider_operation_generation"] == expected_generation
+            assert waiting["failure"] is None
+            _resume_managed_experiment(
+                runtime,
+                quest_ref=quest["quest_ref"],
+                run_ref=run_ref,
+            )
+
+        assert runtime.experiment.process_once()
+        executed = runtime.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )["execution"]
+        assert executed["status"] == "executed"
+        assert executed["provider_operation_generation"] == 4
+        assert provider.execute_calls == 4
+        assert runtime.query_runtime_observability()["inhibitor"][
+            "active_count"
+        ] == 0
+    finally:
+        runtime.close()
+
+
+def test_missing_experiment_domain_finishes_exact_no_effect_responsibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _DeterministicExperimentProvider()
+    runtime = _runtime(tmp_path / "experiment-missing-domain", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = runtime.experiment.start(
+            ExperimentIntent(
+                execution_request_ref="experiment-missing-domain",
+                quest_ref=quest["quest_ref"],
+                title="缺失 domain binding 的 no-effect 收口",
+                hypothesis="Owner terminal receipt 后必须释放精确责任。",
+                variant_parameter=-0.25,
+                sample_count=16,
+            ),
+            "experiment-missing-domain",
+        )
+        query_experiment = runtime.owners.research_graph.query_experiment
+        monkeypatch.setattr(
+            runtime.owners.research_graph,
+            "query_experiment",
+            lambda _evaluation_attempt_ref: None,
+        )
+
+        assert runtime.experiment.process_once()
+        monkeypatch.setattr(
+            runtime.owners.research_graph,
+            "query_experiment",
+            query_experiment,
+        )
+        failed = runtime.experiment.query(
+            admitted["identities"]["evaluation_attempt_ref"]
+        )["execution"]
+        assert failed["status"] == "failed"
+        assert failed["failure"] == {"code": "experiment_domain_binding_missing"}
+        assert provider.execute_calls == 0
+        assert runtime.query_runtime_observability()["inhibitor"][
+            "active_count"
+        ] == 0
     finally:
         runtime.close()
 
@@ -2427,7 +2944,9 @@ def test_historical_bundle_target_experiment_rows_are_diagnostic_only(
 
     recovered = _runtime(root, provider)
     try:
-        assert _agent_runtime_experiment_storage(recovered) == before_restart
+        after_restart = _agent_runtime_experiment_storage(recovered)
+        for table in before_restart.keys() - {"durable_feed", "projection_offsets"}:
+            assert after_restart[table] == before_restart[table]
         with recovered._database.write() as connection:
             connection.execute(
                 text(

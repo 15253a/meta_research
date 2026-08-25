@@ -44,15 +44,16 @@ async function createAcceptedQuestThroughWeb(page: Page): Promise<void> {
   await goal.blur();
   await expect(dialog.getByText("草案已自动保存", { exact: true })).toBeVisible();
 
-  await dialog.getByRole("button", { name: "检测本机计算卡" }).click();
+  const computeCard = dialog.getByLabel("本机计算卡");
+  await computeCard.getByRole("button", { name: "检测本机计算卡" }).click();
   await expect(
     dialog.getByText(
       "capability_unavailable · deterministic_probe_unavailable",
       { exact: true },
     ),
   ).toBeVisible();
-  await dialog.getByRole("button", { name: "重新检测", exact: true }).click();
-  const device = dialog.getByRole("button", {
+  await computeCard.getByRole("button", { name: "重新检测", exact: true }).click();
+  const device = computeCard.getByRole("button", {
     name: /Deterministic GPU.*GPU-deterministic-1/,
   });
   await expect(device).toBeVisible();

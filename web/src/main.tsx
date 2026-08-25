@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
   type Ref,
 } from "react";
 import { createRoot } from "react-dom/client";
@@ -69,6 +70,7 @@ import { WritingReportWorkbench } from "./WritingReport";
 import {
   HumanRequestSurface,
   QuestCompanion,
+  TelemetryAuthorizationCard,
 } from "./HumanCollaboration";
 import "./shell.css";
 
@@ -91,6 +93,83 @@ const ownerLabels: Record<string, string> = {
 
 const MANUAL_MAX_MATERIALS = 100;
 const MANUAL_MAX_ASSET_BYTES = 64 * 1024 * 1024;
+
+function runtimeTypedReason(reason: { code: string } | null | undefined): string {
+  return reason?.code ?? "none";
+}
+
+function runtimeResponsibilitySummary(
+  responsibilities: NonNullable<PublicSnapshot["runtime_observability"]>["responsibilities"],
+  totalCount?: number,
+): string {
+  const exactCount = Number.isInteger(totalCount) && (totalCount ?? -1) >= 0
+    ? totalCount as number
+    : responsibilities?.length ?? 0;
+  if (!responsibilities?.length) {
+    return `${exactCount} 项未结责任 · owners none · effects none`;
+  }
+  const ownerScopes = [
+    ...new Set(responsibilities.map((item) => item.owner_scope)),
+  ].join(", ");
+  const effectKinds = [
+    ...new Set(responsibilities.map((item) => item.effect_kind)),
+  ].join(", ");
+  const sample = exactCount > responsibilities.length
+    ? ` · 当前样本 ${responsibilities.length}`
+    : "";
+  return `${exactCount} 项未结责任${sample} · owners ${ownerScopes} · effects ${effectKinds}`;
+}
+
+function runtimeDurableWaitingSummary(
+  durableWaiting: NonNullable<PublicSnapshot["runtime_observability"]>["durable_waiting"],
+  totalCount?: number,
+  pageTruncated?: boolean,
+): string {
+  const exactCount = Number.isInteger(totalCount) && (totalCount ?? -1) >= 0
+    ? totalCount as number
+    : durableWaiting?.length ?? 0;
+  if (!durableWaiting?.length) return `${exactCount} · none`;
+  const effectKinds = [
+    ...new Set(durableWaiting.map((item) => item.effect_kind)),
+  ].join(", ");
+  const reasons = [
+    ...new Set(durableWaiting.map((item) => item.reason.code)),
+  ].join(", ");
+  const sample = pageTruncated || exactCount > durableWaiting.length
+    ? ` · 当前样本 ${durableWaiting.length}`
+    : "";
+  return `${exactCount}${sample} · effects ${effectKinds} · reasons ${reasons}`;
+}
+
+function runtimeInterruptionSummary(
+  interruptions: NonNullable<PublicSnapshot["runtime_observability"]>["interruptions"],
+  totalCount?: number,
+  pageTruncated?: boolean,
+): string {
+  const exactCount = Number.isInteger(totalCount) && (totalCount ?? -1) >= 0
+    ? totalCount as number
+    : interruptions?.length ?? 0;
+  if (!interruptions?.length) return `${exactCount} · none · reconciled`;
+  const kinds = [...new Set(interruptions.map((item) => item.kind))].join(", ");
+  const reasons = [
+    ...new Set(interruptions.map((item) => item.reason.code)),
+  ].join(", ");
+  const reconciliation = [
+    ...new Set(interruptions.map((item) => item.reconciliation_status)),
+  ].join(", ");
+  const sample = pageTruncated || exactCount > interruptions.length
+    ? ` · 当前样本 ${interruptions.length}`
+    : "";
+  return `${exactCount}${sample} · kinds ${kinds} · reasons ${reasons} · reconciliation ${reconciliation}`;
+}
+
+function runtimeLogSummary(
+  log: NonNullable<PublicSnapshot["runtime_observability"]>["log"],
+): string {
+  if (!log) return "unavailable";
+  if (log.age_seconds === undefined) return log.status;
+  return `${log.status} · ${Math.max(0, Math.round(log.age_seconds))}s`;
+}
 
 type AcceptedAssetReceipt = AssetReceipt & { status: "accepted" };
 
@@ -1103,6 +1182,7 @@ function IdeaStageCard({
   questRef,
   onOpenExperiment,
   onExperimentStarted,
+  runtimeControl,
 }: {
   ideaStage: IdeaStageProjection;
   healthBlocker: IdeaStageHealthBlocker | null;
@@ -1110,6 +1190,7 @@ function IdeaStageCard({
   questRef: string | null;
   onOpenExperiment: (trigger: HTMLElement) => void;
   onExperimentStarted: (experiment: ExperimentProjection) => void;
+  runtimeControl: ReactNode;
 }) {
   const phase = currentIdeaStageState(ideaStage);
   const rows = ideaFactRows(ideaStage, phase);
@@ -1327,6 +1408,7 @@ function IdeaStageCard({
             value={receiptKind(commit?.receipt)}
           />
         </dl>
+        {runtimeControl}
       </details>
     </section>
   );
@@ -1481,9 +1563,11 @@ function recordText(
 function PlanStageCard({
   planStage,
   healthBlocker,
+  runtimeControl,
 }: {
   planStage: PlanStageProjection;
   healthBlocker: IdeaStageHealthBlocker | null;
+  runtimeControl: ReactNode;
 }) {
   const phase = currentPlanStageState(planStage);
   const rows = planFactRows(planStage, phase);
@@ -1626,6 +1710,7 @@ function PlanStageCard({
           <IdeaDetail label="StageCommit receipt" value={receiptRef(commit?.receipt)} />
           <IdeaDetail label="Next Stage" value={commit?.next_stage} />
         </dl>
+        {runtimeControl}
       </details>
     </section>
   );
@@ -2032,10 +2117,12 @@ function BundleStageCard({
   bundleStage,
   healthBlocker,
   observationPointers,
+  runtimeControl,
 }: {
   bundleStage: BundleStageProjection;
   healthBlocker: IdeaStageHealthBlocker | null;
   observationPointers: Record<string, TargetRootObservationPointer>;
+  runtimeControl: ReactNode;
 }) {
   const phase = currentBundleStageState(bundleStage);
   const rows = bundleFactRows(bundleStage, phase);
@@ -2132,6 +2219,7 @@ function BundleStageCard({
           <IdeaDetail label="StageCommit receipt" value={receiptRef(commit?.receipt)} />
           <IdeaDetail label="Next Stage" value={commit?.next_stage} />
         </dl>
+        {runtimeControl}
       </details>
     </section>
   );
@@ -2170,6 +2258,12 @@ function WorkspaceMain({
   const planHealthBlocker = planStageHealthBlocker(snapshot);
   const bundleHealthBlocker = bundleStageHealthBlocker(snapshot);
   const experiment = snapshot?.experiment?.current ?? null;
+  const runtimeControl = snapshot ? (
+    <TelemetryAuthorizationCard
+      collaboration={snapshot.human_collaboration}
+      onChanged={retry}
+    />
+  ) : null;
   const question = bundleStage
     ? bundleQuestion(bundleStage, snapshot ?? undefined)
     : planStage
@@ -2250,11 +2344,13 @@ function WorkspaceMain({
             bundleStage={bundleStage}
             healthBlocker={bundleHealthBlocker}
             observationPointers={targetRootObservationPointers}
+            runtimeControl={runtimeControl}
           />
         ) : planStage ? (
           <PlanStageCard
             planStage={planStage}
             healthBlocker={planHealthBlocker}
+            runtimeControl={runtimeControl}
           />
         ) : ideaStage ? (
           <IdeaStageCard
@@ -2264,6 +2360,7 @@ function WorkspaceMain({
             questRef={question?.quest_ref ?? null}
             onOpenExperiment={onOpenExperiment}
             onExperimentStarted={onExperimentStarted}
+            runtimeControl={runtimeControl}
           />
         ) : (
           <section className="lumen-card lumen-availability" aria-labelledby="availability-title">
@@ -2291,6 +2388,55 @@ function WorkspaceMain({
                 <dl>
                   <div><dt>版本</dt><dd>{snapshot.product.version}</dd></div>
                   <div><dt>Readiness</dt><dd>{snapshot.readiness.status}</dd></div>
+                  {snapshot.runtime_observability?.inhibitor ? (
+                    <>
+                      <div>
+                        <dt>Power inhibitor</dt>
+                        <dd>
+                          {snapshot.runtime_observability.inhibitor.backend} · {snapshot.runtime_observability.inhibitor.status} · {snapshot.runtime_observability.inhibitor.scope}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Inhibitor reason</dt>
+                        <dd>{runtimeTypedReason(snapshot.runtime_observability.inhibitor.reason)}</dd>
+                      </div>
+                      <div>
+                        <dt>执行责任</dt>
+                        <dd>{runtimeResponsibilitySummary(
+                          snapshot.runtime_observability.responsibilities,
+                          snapshot.runtime_observability.inhibitor.active_count,
+                        )}</dd>
+                      </div>
+                      <div>
+                        <dt>Durable waiting</dt>
+                        <dd>{runtimeDurableWaitingSummary(
+                          snapshot.runtime_observability.durable_waiting,
+                          snapshot.runtime_observability.durable_waiting_count,
+                          snapshot.runtime_observability.durable_waiting_page_truncated,
+                        )}</dd>
+                      </div>
+                      <div>
+                        <dt>中断 / Reconciliation</dt>
+                        <dd>{runtimeInterruptionSummary(
+                          snapshot.runtime_observability.interruptions,
+                          snapshot.runtime_observability.interruption_count,
+                          snapshot.runtime_observability.interruption_page_truncated,
+                        )}</dd>
+                      </div>
+                      <div>
+                        <dt>本地日志</dt>
+                        <dd>{runtimeLogSummary(snapshot.runtime_observability.log)}</dd>
+                      </div>
+                      <div>
+                        <dt>Telemetry</dt>
+                        <dd>
+                          {snapshot.runtime_observability.telemetry?.mode === "active" ? "opt-in" : "local-only"} · {snapshot.runtime_observability.telemetry?.mode ?? "unavailable"}
+                        </dd>
+                      </div>
+                    </>
+                  ) : snapshot.runtime_observability?.status === "unavailable" ? (
+                    <div><dt>Runtime protection</dt><dd>unavailable</dd></div>
+                  ) : null}
                   <div>
                     <dt>Semantic MCP</dt>
                     <dd>
@@ -2323,6 +2469,7 @@ function WorkspaceMain({
                     </div>
                   ))}
                 </dl>
+                {runtimeControl}
               </details>
             ) : null}
           </section>

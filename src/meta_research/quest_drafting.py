@@ -14,6 +14,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable, Literal, Protocol, cast
 
+from meta_research.provider_supervisor import (
+    CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
+    ProviderSupervisorError,
+    ensure_transport_key,
+    read_transport_key_for_operation,
+    read_verified_exit_receipt,
+    request_supervisor_stop,
+    supervisor_request_never_started,
+    write_supervisor_request,
+)
+
 QUESTION_FIELD_MAX_LENGTHS = {
     "title": 500,
     "unknown_statement": 8000,
@@ -604,6 +615,8 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         self._executable = executable
         self._timeout_seconds = timeout_seconds
         self._process_runner = process_runner or _CancellableProcessRunner()
+        self._verified_stopped_jobs: set[str] = set()
+        self._job_state_lock = threading.Lock()
 
     def request_stop(self) -> None:
         request_stop = getattr(self._process_runner, "request_stop", None)
@@ -619,13 +632,91 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         cancel_job = getattr(self._process_runner, "cancel_job", None)
         if not callable(cancel_job):
             return False
-        cancel_job(job_ref)
-        return True
+        with self._job_state_lock:
+            verified_stopped = job_ref in self._verified_stopped_jobs
+        if verified_stopped:
+            cancel_job(job_ref)
+            return True
+        directory = self._durable_job_directory(job_ref)
+        if not directory.exists():
+            cancel_job(job_ref)
+            return True
+        try:
+            invocation = _read_drafting_invocation(directory, job_ref=job_ref)
+        except DraftingUnavailable:
+            return False
+        if invocation.get("transport_mode") != "durable_supervisor":
+            return cancel_job(job_ref) is True
+        try:
+            _read_verified_supervisor_result(directory, invocation)
+        except DraftingUnavailable as error:
+            if error.code == "codex_job_spool_invalid":
+                return False
+            if error.code != "codex_job_outcome_unknown":
+                cancel_job(job_ref)
+                return True
+        else:
+            cancel_job(job_ref)
+            return True
+        request_path = directory / "supervisor-request.json"
+        if not request_path.is_file():
+            cancel_job(job_ref)
+            return True
+        invocation_hash = _drafting_invocation_hash(invocation)
+        try:
+            _key_path, key = read_transport_key_for_operation(directory)
+            if (directory / "supervisor-ready.json").is_file():
+                stopped = request_supervisor_stop(
+                    directory,
+                    key=key,
+                    invocation_hash=invocation_hash,
+                    ready_schema=(
+                        "meta-research/codex-provider-supervisor-ready/v1"
+                    ),
+                )
+            else:
+                stopped = supervisor_request_never_started(
+                    directory,
+                    key=key,
+                    invocation_hash=invocation_hash,
+                    request_schema=CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
+                )
+        except (OSError, ProviderSupervisorError):
+            return False
+        if stopped:
+            cancel_job(job_ref)
+        return stopped
+
+    def reconcile_job(self, job_ref: str) -> Literal["absent", "pending", "terminal"]:
+        """Observe a durable operation without launching its provider again."""
+
+        directory = self._durable_job_directory(job_ref)
+        if not directory.exists():
+            return "absent"
+        try:
+            invocation = _read_drafting_invocation(directory, job_ref=job_ref)
+            if (directory / "result.json").is_file():
+                _read_durable_job(directory, invocation)
+                return "terminal"
+            if invocation.get("transport_mode") != "durable_supervisor":
+                return "pending"
+            _read_verified_supervisor_result(directory, invocation)
+        except DraftingUnavailable as error:
+            if error.code in {
+                "codex_job_outcome_unknown",
+                "codex_job_spool_invalid",
+                "codex_job_spool_conflict",
+            }:
+                return "pending"
+            return "terminal"
+        return "terminal"
 
     def finish_job(self, job_ref: str) -> None:
         finish_job = getattr(self._process_runner, "finish_job", None)
         if callable(finish_job):
             finish_job(job_ref)
+        with self._job_state_lock:
+            self._verified_stopped_jobs.discard(job_ref)
         _remove_durable_job(self._durable_job_directory(job_ref))
 
     def draft(self, request: ProposalDraftRequest) -> ProposalDraftResult:
@@ -751,7 +842,14 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
                 native_session_ref=native_session_ref,
                 ephemeral=ephemeral,
                 job_ref=None,
+                durable_directory=None,
+                invocation=None,
             )
+        transport_mode = (
+            "durable_supervisor"
+            if callable(getattr(self._process_runner, "run_durable_job", None))
+            else "unreconciled_runner"
+        )
         invocation = {
             "schema_ref": "meta-research/codex-drafting-job/v1",
             "job_ref": job_ref,
@@ -761,6 +859,7 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             ).hexdigest(),
             "native_session_ref": native_session_ref,
             "ephemeral": ephemeral,
+            "transport_mode": transport_mode,
         }
         directory = self._durable_job_directory(job_ref)
         try:
@@ -775,28 +874,17 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
             native_session_ref=native_session_ref,
             ephemeral=ephemeral,
             job_ref=job_ref,
+            durable_directory=(
+                directory if transport_mode == "durable_supervisor" else None
+            ),
+            invocation=invocation,
         )
-        raw, thread_id = result
-        sealed = {
-            "schema_ref": "meta-research/codex-drafting-result/v1",
-            "job_ref": job_ref,
-            "invocation_hash": hashlib.sha256(
-                _canonical_json(invocation).encode("utf-8")
-            ).hexdigest(),
-            "raw": raw,
-            "thread_id": thread_id,
-            "result_hash": hashlib.sha256(
-                _canonical_json(
-                    {"raw": raw, "thread_id": thread_id}
-                ).encode("utf-8")
-            ).hexdigest(),
-        }
-        _write_durable_json(directory / "result.json", sealed)
+        _seal_durable_job(directory, invocation, result)
         return result
 
     def _durable_job_directory(self, job_ref: str) -> Path:
         digest = hashlib.sha256(job_ref.encode("utf-8")).hexdigest()
-        return self._workspace / ".provider-jobs" / digest
+        return self._workspace / "provider-operations" / digest / "drafting"
 
     def _invoke_once(
         self,
@@ -806,14 +894,26 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
         native_session_ref: str | None,
         ephemeral: bool,
         job_ref: str | None,
+        durable_directory: Path | None,
+        invocation: dict[str, object] | None,
     ) -> tuple[dict[str, object], str | None]:
-        with tempfile.TemporaryDirectory(
-            prefix="provider-", dir=self._workspace
-        ) as raw_directory:
+        directory_context: contextlib.AbstractContextManager[Path | str]
+        if durable_directory is None:
+            directory_context = tempfile.TemporaryDirectory(
+                prefix="provider-", dir=self._workspace
+            )
+        else:
+            directory_context = contextlib.nullcontext(durable_directory)
+        with directory_context as raw_directory:
             directory = Path(raw_directory)
             schema_path = directory / "output-schema.json"
             result_path = directory / "last-message.json"
-            schema_path.write_text(_canonical_json(schema), encoding="utf-8")
+            schema_json = _canonical_json(schema)
+            if durable_directory is None:
+                schema_path.write_text(schema_json, encoding="utf-8")
+            else:
+                _ensure_durable_text(schema_path, schema_json)
+                _ensure_durable_text(directory / "prompt.txt", prompt)
             argv = [
                 self._executable,
                 "exec",
@@ -836,7 +936,70 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
                 argv.append("-")
             try:
                 run_job = getattr(self._process_runner, "run_job", None)
-                if job_ref is not None and callable(run_job):
+                durable_job = getattr(
+                    self._process_runner, "run_durable_job", None
+                )
+                if (
+                    job_ref is not None
+                    and durable_directory is not None
+                    and invocation is not None
+                    and callable(durable_job)
+                ):
+                    invocation_hash = _drafting_invocation_hash(invocation)
+                    try:
+                        _key_path, key = ensure_transport_key(self._workspace)
+                        request_path = directory / "supervisor-request.json"
+                        write_supervisor_request(
+                            request_path,
+                            {
+                                "schema_ref": CODEX_SUPERVISOR_REQUEST_SCHEMA_V2,
+                                "invocation_hash": invocation_hash,
+                                "argv": argv,
+                                "timeout_seconds": self._timeout_seconds,
+                                "prompt_max_bytes": PROVIDER_STREAM_MAX_BYTES,
+                                "stream_max_bytes": PROVIDER_STREAM_MAX_BYTES,
+                                "result_max_bytes": PROVIDER_RESULT_MAX_BYTES,
+                                "prompt_path": str(directory / "prompt.txt"),
+                                "schema_path": str(schema_path),
+                                "stdout_path": str(directory / "stdout.jsonl"),
+                                "result_path": str(result_path),
+                                "lock_path": str(directory / "supervisor.lock"),
+                                "ready_path": str(
+                                    directory / "supervisor-ready.json"
+                                ),
+                                "started_path": str(
+                                    directory / "provider-started.json"
+                                ),
+                                "receipt_path": str(
+                                    directory / "supervisor-exit.json"
+                                ),
+                                "stop_path": str(
+                                    directory / "supervisor-stop.json"
+                                ),
+                            },
+                            key,
+                        )
+                    except (OSError, ProviderSupervisorError) as error:
+                        raise DraftingUnavailable(
+                            "codex_job_spool_invalid"
+                        ) from error
+                    durable_arguments: list[object] = [
+                        job_ref,
+                        argv,
+                        prompt,
+                        self._timeout_seconds,
+                        directory / "stdout.jsonl",
+                        directory / "pid.json",
+                        request_path,
+                    ]
+                    if isinstance(self._process_runner, _CancellableProcessRunner):
+                        completed = durable_job(
+                            *durable_arguments,
+                            stdout_max_bytes=PROVIDER_STREAM_MAX_BYTES,
+                        )
+                    else:
+                        completed = durable_job(*durable_arguments)
+                elif job_ref is not None and callable(run_job):
                     completed = run_job(
                         job_ref, argv, prompt, self._timeout_seconds
                     )
@@ -845,13 +1008,39 @@ class CodexDraftingAdapter(ProposalDrafter, IntentDraftingProvider):
                         argv, prompt, self._timeout_seconds
                     )
             except _ProcessStopped as error:
+                if durable_directory is not None and invocation is not None:
+                    try:
+                        return _read_verified_supervisor_result(
+                            durable_directory, invocation
+                        )
+                    except DraftingUnavailable as reconciliation_error:
+                        if (
+                            reconciliation_error.code
+                            != "codex_job_outcome_unknown"
+                        ):
+                            raise
+                    assert job_ref is not None
+                    with self._job_state_lock:
+                        self._verified_stopped_jobs.add(job_ref)
                 raise DraftingUnavailable("codex_cli_stopped") from error
             except FileNotFoundError as error:
                 raise DraftingUnavailable("codex_cli_unavailable") from error
             except subprocess.TimeoutExpired as error:
+                if durable_directory is not None and invocation is not None:
+                    return _read_verified_supervisor_result(
+                        durable_directory, invocation
+                    )
                 raise DraftingUnavailable("codex_cli_timeout") from error
             except OSError as error:
+                if durable_directory is not None and invocation is not None:
+                    return _read_verified_supervisor_result(
+                        durable_directory, invocation
+                    )
                 raise DraftingUnavailable("codex_cli_io_unavailable") from error
+            if durable_directory is not None and invocation is not None:
+                return _read_verified_supervisor_result(
+                    durable_directory, invocation
+                )
             if completed.returncode != 0:
                 raise DraftingUnavailable("codex_cli_failed")
             if _text_exceeds_limit(
@@ -892,30 +1081,159 @@ def _write_durable_json(path: Path, value: object) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _read_durable_job(
-    directory: Path,
-    expected_invocation: dict[str, object],
-) -> tuple[dict[str, object], str | None]:
+def _ensure_durable_text(path: Path, value: str) -> None:
+    if not path.exists():
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                stream.write(value)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return
+    try:
+        persisted = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise DraftingUnavailable("codex_job_spool_invalid") from error
+    if persisted != value:
+        raise DraftingUnavailable("codex_job_spool_conflict")
+
+
+def _drafting_invocation_hash(invocation: dict[str, object]) -> str:
+    return hashlib.sha256(
+        _canonical_json(invocation).encode("utf-8")
+    ).hexdigest()
+
+
+def _read_drafting_invocation(
+    directory: Path, *, job_ref: str
+) -> dict[str, object]:
     try:
         invocation = json.loads(
             _read_bounded_text(directory / "invocation.json", 64 * 1024)
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise DraftingUnavailable("codex_job_spool_invalid") from error
-    if invocation != expected_invocation:
+    if (
+        not isinstance(invocation, dict)
+        or invocation.get("schema_ref")
+        != "meta-research/codex-drafting-job/v1"
+        or invocation.get("job_ref") != job_ref
+        or invocation.get("transport_mode")
+        not in {"durable_supervisor", "unreconciled_runner"}
+    ):
+        raise DraftingUnavailable("codex_job_spool_invalid")
+    return cast(dict[str, object], invocation)
+
+
+def _read_verified_supervisor_result(
+    directory: Path,
+    invocation: dict[str, object],
+) -> tuple[dict[str, object], str | None]:
+    receipt_path = directory / "supervisor-exit.json"
+    if not receipt_path.is_file():
+        raise DraftingUnavailable("codex_job_outcome_unknown")
+    try:
+        _key_path, key = read_transport_key_for_operation(directory)
+        receipt, _envelope = read_verified_exit_receipt(
+            receipt_path,
+            key=key,
+            invocation_hash=_drafting_invocation_hash(invocation),
+            prompt_path=directory / "prompt.txt",
+            schema_path=directory / "output-schema.json",
+            stdout_path=directory / "stdout.jsonl",
+            result_path=directory / "last-message.json",
+        )
+    except (OSError, ProviderSupervisorError) as error:
+        raise DraftingUnavailable("codex_job_spool_invalid") from error
+    termination_reason = receipt.get("termination_reason")
+    returncode = receipt.get("returncode")
+    if termination_reason != "completed" or returncode != 0:
+        code = {
+            "stopped": "codex_cli_stopped",
+            "timeout": "codex_cli_timeout",
+            "output_limit": "codex_output_too_large",
+            "launch_failed": "codex_cli_unavailable",
+        }.get(cast(str, termination_reason), "codex_cli_failed")
+        raise DraftingUnavailable(code)
+    try:
+        stdout = _read_bounded_text(
+            directory / "stdout.jsonl", PROVIDER_STREAM_MAX_BYTES
+        )
+        decoded = json.loads(
+            _read_bounded_text(
+                directory / "last-message.json", PROVIDER_RESULT_MAX_BYTES
+            )
+        )
+    except DraftingUnavailable:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DraftingUnavailable("codex_job_spool_invalid") from error
+    if not isinstance(decoded, dict):
+        raise DraftingUnavailable("codex_job_spool_invalid")
+    native_session_ref = cast(str | None, invocation.get("native_session_ref"))
+    return cast(dict[str, object], decoded), (
+        native_session_ref or _thread_id(stdout)
+    )
+
+
+def _seal_durable_job(
+    directory: Path,
+    invocation: dict[str, object],
+    result: tuple[dict[str, object], str | None],
+) -> None:
+    raw, thread_id = result
+    sealed = {
+        "schema_ref": "meta-research/codex-drafting-result/v1",
+        "job_ref": invocation["job_ref"],
+        "invocation_hash": _drafting_invocation_hash(invocation),
+        "raw": raw,
+        "thread_id": thread_id,
+        "result_hash": hashlib.sha256(
+            _canonical_json({"raw": raw, "thread_id": thread_id}).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+    }
+    _write_durable_json(directory / "result.json", sealed)
+
+
+def _read_durable_job(
+    directory: Path,
+    expected_invocation: dict[str, object],
+) -> tuple[dict[str, object], str | None]:
+    invocation = _read_drafting_invocation(
+        directory, job_ref=cast(str, expected_invocation["job_ref"])
+    )
+    if any(
+        invocation.get(key) != value
+        for key, value in expected_invocation.items()
+        if key != "transport_mode"
+    ):
         raise DraftingUnavailable("codex_job_spool_conflict")
     result_path = directory / "result.json"
     if not result_path.is_file():
-        raise DraftingUnavailable("codex_job_outcome_unknown")
+        if invocation.get("transport_mode") != "durable_supervisor":
+            raise DraftingUnavailable("codex_job_outcome_unknown")
+        result = _read_verified_supervisor_result(directory, invocation)
+        _seal_durable_job(directory, invocation, result)
+        return result
     try:
         sealed = json.loads(
             _read_bounded_text(result_path, PROVIDER_RESULT_MAX_BYTES)
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise DraftingUnavailable("codex_job_spool_invalid") from error
-    expected_invocation_hash = hashlib.sha256(
-        _canonical_json(expected_invocation).encode("utf-8")
-    ).hexdigest()
+    expected_invocation_hash = _drafting_invocation_hash(invocation)
     if (
         not isinstance(sealed, dict)
         or set(sealed)
@@ -953,7 +1271,22 @@ def _read_durable_job(
 
 
 def _remove_durable_job(directory: Path) -> None:
-    for name in ("result.json", "invocation.json"):
+    for name in (
+        "result.json",
+        "invocation.json",
+        "prompt.txt",
+        "output-schema.json",
+        "stdout.jsonl",
+        "last-message.json",
+        ".last-message.supervisor.tmp",
+        "supervisor-request.json",
+        "supervisor-ready.json",
+        "provider-started.json",
+        "supervisor-exit.json",
+        "supervisor-stop.json",
+        "supervisor.lock",
+        "pid.json",
+    ):
         (directory / name).unlink(missing_ok=True)
     try:
         directory.rmdir()
@@ -961,10 +1294,11 @@ def _remove_durable_job(directory: Path) -> None:
         return
     except OSError:
         return
-    try:
-        directory.parent.rmdir()
-    except OSError:
-        pass
+    for parent in (directory.parent, directory.parent.parent):
+        try:
+            parent.rmdir()
+        except OSError:
+            break
 
 
 class NvidiaSmiProbe(HostComputeProbe):

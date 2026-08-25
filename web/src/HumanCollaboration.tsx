@@ -190,14 +190,12 @@ export function QuestCompanion({
   const agentProposals = scopeRef
     ? companion?.agent_proposals.filter((item) => item.scope_ref === scopeRef) ?? []
     : [];
-  const commands = scopeRef
-    ? collaboration?.commands.items.filter((item) =>
-      item.scope_ref === scopeRef
-      && ["capability_authorization", "research_control"].includes(
-        item.draft.command_kind,
-      )
-    ) ?? []
-    : [];
+  const commands = collaboration?.commands.items.filter((item) =>
+    (item.scope_ref === scopeRef || item.scope_ref === "runtime:telemetry")
+    && ["capability_authorization", "research_control"].includes(
+      item.draft.command_kind,
+    )
+  ) ?? [];
   const broadAuthorizationHistory = scopeRef
     ? collaboration?.commands.authorizations.filter((item) =>
       item.scope_ref === scopeRef
@@ -212,7 +210,6 @@ export function QuestCompanion({
     && currentBroadAuthorization.effective_decision !== "revoked"
     ? [currentBroadAuthorization]
     : [];
-
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const message = draft.trim();
@@ -352,6 +349,105 @@ export function QuestCompanion({
         <small>{error ? `发送失败 · ${error}` : "普通聊天不会被猜成硬命令"}</small>
       </form>
     </aside>
+  );
+}
+
+export function TelemetryAuthorizationCard({
+  collaboration,
+  onChanged,
+}: {
+  collaboration?: HumanCollaborationProjection;
+  onChanged: () => void;
+}) {
+  const authorization = collaboration?.commands.authorizations
+    .filter((item) =>
+      item.scope_ref === "runtime:telemetry"
+      && item.capability === "opentelemetry_export"
+      && item.is_current !== false,
+    )
+    .reduce<HumanCapabilityAuthorization | null>(
+      (latest, item) => !latest || item.created_at >= latest.created_at ? item : latest,
+      null,
+    ) ?? null;
+  const requirementScope = isRecord(authorization?.requirement.scope)
+    ? authorization.requirement.scope
+    : null;
+  const authorizedEndpoint = typeof requirementScope?.endpoint === "string"
+    ? requirementScope.endpoint
+    : "";
+  const active = authorization?.decision === "granted"
+    && authorization.effective_decision !== "revoked";
+  const [endpoint, setEndpoint] = useState(authorizedEndpoint);
+  const [pending, setPending] = useState(false);
+  const [created, setCreated] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEndpoint(authorizedEndpoint);
+    setCreated(false);
+  }, [authorization?.receipt_ref, authorizedEndpoint]);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const exactEndpoint = (active ? authorizedEndpoint : endpoint).trim();
+    if (pending || !exactEndpoint) return;
+    setPending(true);
+    setError(null);
+    try {
+      await createHumanCommand("runtime:telemetry", {
+        command_kind: "capability_authorization",
+        payload: {
+          capability: "opentelemetry_export",
+          decision: active ? "revoked" : "granted",
+          scope: {
+            schema_ref: "meta-research/opentelemetry-export-scope/v1",
+            provider: "otlp_http",
+            endpoint: exactEndpoint,
+            credential_ref: null,
+          },
+        },
+      });
+      setCreated(true);
+      onChanged();
+    } catch (caught) {
+      setError(reasonCode(caught));
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <article className="lumen-command lumen-telemetry-authorization">
+      <small>LOCAL OBSERVABILITY · EXPLICIT OPT-IN</small>
+      <b>OpenTelemetry export · {active ? "authorized" : "local-only"}</b>
+      <p>本地 durable facts 始终保留；远端只接收脱敏 allow-list event。</p>
+      <form onSubmit={(event) => void submit(event)}>
+        <label>
+          OTLP/HTTP endpoint
+          <input
+            aria-label="OpenTelemetry OTLP HTTP endpoint"
+            type="url"
+            required
+            disabled={active || pending || created}
+            placeholder="http://127.0.0.1:4318/v1/logs"
+            value={active ? authorizedEndpoint : endpoint}
+            onChange={(event) => setEndpoint(event.target.value)}
+          />
+        </label>
+        <button
+          type="submit"
+          disabled={pending || created || !(active ? authorizedEndpoint : endpoint).trim()}
+        >
+          {created
+            ? "Command Draft 已建立"
+            : active
+              ? "建立 revoke Command Draft"
+              : "建立 opt-in Command Draft"}
+        </button>
+      </form>
+      <span>草案仍须经过 current Impact Preview、human confirmation 与独立 authorization。</span>
+      {error ? <small role="alert">{error}</small> : null}
+    </article>
   );
 }
 

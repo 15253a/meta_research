@@ -6,10 +6,13 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 import httpx
 import pytest
+
+from meta_research import cli as cli_module
 
 
 def run_cli(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -318,11 +321,173 @@ def test_doctor_json_reports_locked_harness_versions_and_missing_reasons(
         "0.147.0",
         "2.1.220",
     ]
-    assert all(
-        item["capability_profile"] is not None
-        or item["missing_reason"]["code"] == "full_conformance_not_recorded"
-        for item in doctor["adapters"]
+    for item in doctor["adapters"]:
+        if item["capability_profile"] is not None:
+            continue
+        missing_reason = item["missing_reason"]
+        assert isinstance(missing_reason, dict)
+        assert set(missing_reason) == {"code"}
+        assert isinstance(missing_reason["code"], str)
+        assert missing_reason["code"]
+
+
+def test_doctor_human_output_allowlists_runtime_protection_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider_endpoint = "https://provider.example.invalid/v1"
+    monkeypatch.setattr(
+        cli_module,
+        "_require_running",
+        lambda _data_root: SimpleNamespace(
+            base_url="http://127.0.0.1:9876",
+        ),
     )
+    monkeypatch.setattr(
+        cli_module,
+        "_internal_request",
+        lambda *_args, **_kwargs: {
+            "status": "unavailable",
+            "runtime_protection": {
+                "status": "ready",
+                "schema_ref": "schema-secret",
+                "correlation_ref": "correlation-secret",
+                "inhibitor": {
+                    "backend": "ubuntu_logind",
+                    "status": "active",
+                    "scope": "sleep",
+                    "active_count": 3,
+                    "holder_ref": "holder-secret",
+                    "capability": {
+                        "status": "ready",
+                        "backend": "ubuntu_logind",
+                        "scope": "sleep",
+                        "reason": None,
+                        "probed_at": 1_720_000_000.0,
+                        "holder_ref": "probe-holder-secret",
+                    },
+                    "reason": {
+                        "code": "power_inhibitor_systemd_acquire_failed",
+                        "raw": "inhibitor-raw-secret",
+                    },
+                },
+                "responsibilities": [
+                    {
+                        "responsibility_ref": "responsibility-secret",
+                        "operation_ref": "operation-secret",
+                        "owner_scope": "agent_runtime",
+                        "effect_kind": "provider_unit",
+                        "raw_payload": "raw-payload-secret",
+                    },
+                    {
+                        "responsibility_ref": "draft-responsibility-secret",
+                        "operation_ref": "draft-operation-secret",
+                        "owner_scope": "human_collaboration",
+                        "effect_kind": "drafting_claim",
+                    },
+                    {
+                        "responsibility_ref": "unsafe-responsibility-secret",
+                        "operation_ref": "unsafe-operation-secret",
+                        "owner_scope": "credential-secret",
+                        "effect_kind": "provider_unit",
+                    },
+                ],
+                "durable_waiting": [
+                    {
+                        "responsibility_ref": "waiting-responsibility-secret",
+                        "operation_ref": "waiting-operation-secret",
+                        "reason": {
+                            "code": "runtime_reconciliation_required",
+                            "raw": "waiting-raw-secret",
+                        },
+                    }
+                ],
+                "durable_waiting_count": 7,
+                "durable_waiting_page_truncated": True,
+                "interruptions": [
+                    {
+                        "interruption_ref": "interruption-secret",
+                        "kind": "daemon",
+                        "old_fence_ref": "fence-secret",
+                        "checkpoint_ref": "/private/user/checkpoint",
+                        "reason": {
+                            "code": "daemon_restarted",
+                            "raw": "interruption-raw-secret",
+                        },
+                        "reconciliation_status": "protected",
+                    }
+                ],
+                "interruption_count": 9,
+                "interruption_page_truncated": True,
+                "log": {
+                    "status": "fresh",
+                    "age_seconds": 8.4,
+                    "path": "/private/runtime/events.jsonl",
+                },
+                "telemetry": {
+                    "mode": "active",
+                    "provider": "otlp_http",
+                    "credentials": "credential-secret",
+                    "endpoint": provider_endpoint,
+                },
+            },
+            "provider_endpoint": provider_endpoint,
+        },
+    )
+
+    assert (
+        cli_module.main(
+            ["doctor", "--data-root", str(tmp_path / "doctor-root")]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+
+    assert "Runtime protection: ready" in output
+    assert (
+        "Power inhibitor: backend=ubuntu_logind status=active "
+        "scope=sleep active_count=3 "
+        "reason=power_inhibitor_systemd_acquire_failed"
+    ) in output
+    assert (
+        "Capability probe: status=ready backend=ubuntu_logind scope=sleep "
+        "reason=none probed_at=1720000000"
+    ) in output
+    assert (
+        "Current owners: agent_runtime/provider_unit=1,"
+        "human_collaboration/drafting_claim=1"
+    ) in output
+    assert (
+        "Durable waiting: count=7 reasons=runtime_reconciliation_required"
+        in output
+    )
+    assert (
+        "Interruption: count=9 kinds=daemon reasons=daemon_restarted"
+        in output
+    )
+    assert "Reconciliation: protected" in output
+    assert "Log freshness: fresh age_seconds=8" in output
+    assert "Telemetry mode: active" in output
+    for forbidden in (
+        "http://127.0.0.1:9876",
+        provider_endpoint,
+        "schema-secret",
+        "correlation-secret",
+        "holder-secret",
+        "responsibility-secret",
+        "operation-secret",
+        "interruption-secret",
+        "fence-secret",
+        "/private/",
+        "raw-payload-secret",
+        "inhibitor-raw-secret",
+        "waiting-raw-secret",
+        "interruption-raw-secret",
+        "credential-secret",
+        "otlp_http",
+    ):
+        assert forbidden not in output
 
 
 def test_loopback_authentication_origin_content_type_and_csrf_fail_closed(

@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,19 @@ from meta_research.paths import (
     prepare_data_root,
     read_control_key,
     read_runtime_state,
+)
+
+
+_DOCTOR_OWNER_SCOPES = frozenset({"agent_runtime", "human_collaboration"})
+_DOCTOR_EFFECT_KINDS = frozenset(
+    {
+        "provider_unit",
+        "drafting_claim",
+        "acquisition",
+        "harness_root",
+        "harness_probe",
+        "runtime_reconciliation",
+    }
 )
 
 
@@ -146,10 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit(
                 result,
                 args.as_json,
-                human=(
-                    f"Harness gateway is {result['status']} at "
-                    f"{state.base_url}/mcp"
-                ),
+                human=_doctor_human(result),
             )
         if args.command == "conformance":
             state = _require_running(data_root)
@@ -260,23 +270,63 @@ def _ensure_daemon(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
+        **daemon_spawn_options(),
     )
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        if process.poll() is not None:
+        exit_code = process.poll()
+        if exit_code not in {None, 2}:
             raise CliError("daemon exited during startup; inspect the local daemon log")
         state = read_runtime_state(data_root)
-        if state and state.pid == process.pid and state.status == "running":
+        owns_state = state is not None and state.pid == process.pid
+        can_adopt_winner = exit_code == 2
+        if (
+            state is not None
+            and state.status == "running"
+            and (owns_state or can_adopt_winner)
+        ):
             try:
                 _internal_request(data_root, state, "/internal/readiness", method="GET")
-                return state, True
+                return state, owns_state
             except CliError:
                 pass
         time.sleep(0.05)
-    process.terminate()
+    if process.poll() is None:
+        process.terminate()
+    if process.poll() == 2:
+        raise CliError(
+            "another daemon acquired the data-root lock but did not become ready"
+        )
     raise CliError("daemon did not become ready within 15 seconds")
+
+
+def daemon_spawn_options(
+    *,
+    platform_name: str | None = None,
+    create_new_process_group: int | None = None,
+    detached_process: int | None = None,
+) -> dict[str, Any]:
+    """Return terminal-independent Popen options for the host platform."""
+
+    selected_platform = platform_name or os.name
+    if selected_platform == "posix":
+        return {"close_fds": True, "start_new_session": True}
+    if selected_platform == "nt":
+        process_group = (
+            create_new_process_group
+            if create_new_process_group is not None
+            else getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+        detached = (
+            detached_process
+            if detached_process is not None
+            else getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        )
+        return {
+            "close_fds": True,
+            "creationflags": process_group | detached,
+        }
+    raise CliError(f"daemon detachment is unsupported on platform {selected_platform}")
 
 
 def _choose_port(host: str, requested: int) -> int:
@@ -299,25 +349,141 @@ def _daemon_status(data_root: DataRoot) -> dict[str, Any]:
     return result
 
 
-def _running_state(data_root: DataRoot) -> RuntimeState | None:
+def _running_state(
+    data_root: DataRoot,
+    *,
+    platform_name: str | None = None,
+    pid_liveness: Callable[[int], bool] | None = None,
+    runtime_attestor: Callable[[], bool] | None = None,
+) -> RuntimeState | None:
     state = read_runtime_state(data_root)
     if state is None or state.status != "running":
         return None
-    return state if _process_matches(state.pid, data_root) else None
+    attestor = runtime_attestor or (
+        lambda: _runtime_is_attested(data_root, state)
+    )
+    return (
+        state
+        if daemon_process_matches(
+            state.pid,
+            data_root,
+            platform_name=platform_name,
+            pid_liveness=pid_liveness,
+            runtime_attestor=attestor,
+        )
+        else None
+    )
 
 
-def _process_matches(pid: int, data_root: DataRoot) -> bool:
+def pid_is_alive(
+    pid: int,
+    *,
+    platform_name: str | None = None,
+    windows_probe: Callable[[int], bool] | None = None,
+) -> bool:
+    """Probe PID liveness without importing a platform-only module eagerly."""
+
+    if pid <= 0:
+        return False
+    selected_platform = platform_name or os.name
+    if selected_platform == "nt":
+        probe = windows_probe or _windows_pid_is_alive
+        return probe(pid)
+    if selected_platform != "posix":
+        return False
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
+    except (OverflowError, ValueError):
         return False
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def daemon_process_matches(
+    pid: int,
+    data_root: DataRoot,
+    *,
+    platform_name: str | None = None,
+    pid_liveness: Callable[[int], bool] | None = None,
+    command_line_reader: Callable[[int], Sequence[str] | None] | None = None,
+    runtime_attestor: Callable[[], bool] | None = None,
+) -> bool:
+    """Confirm daemon identity before status reporting or process signalling."""
+
+    selected_platform = platform_name or os.name
+    is_alive = pid_liveness or (
+        lambda candidate: pid_is_alive(
+            candidate,
+            platform_name=selected_platform,
+        )
+    )
+    if not is_alive(pid):
+        return False
+    if selected_platform == "posix":
+        reader = command_line_reader or _read_proc_command_line
+        arguments = reader(pid)
+        if arguments is not None:
+            return (
+                "meta_research.daemon" in arguments
+                and str(data_root.root) in arguments
+            )
+    elif selected_platform != "nt":
+        return False
+    return runtime_attestor() if runtime_attestor is not None else False
+
+
+def _read_proc_command_line(pid: int) -> tuple[str, ...] | None:
     command_line = Path(f"/proc/{pid}/cmdline")
     try:
         arguments = command_line.read_bytes().split(b"\0")
     except OSError:
+        return None
+    return tuple(
+        argument.decode("utf-8", errors="replace")
+        for argument in arguments
+        if argument
+    )
+
+
+def _windows_pid_is_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    access_denied = 5
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == access_denied
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _runtime_is_attested(data_root: DataRoot, state: RuntimeState) -> bool:
+    try:
+        _internal_request(data_root, state, "/internal/readiness", method="GET")
+    except (CliError, OSError, ValueError):
         return False
-    decoded = [argument.decode("utf-8", errors="replace") for argument in arguments]
-    return "meta_research.daemon" in decoded and str(data_root.root) in decoded
+    return True
 
 
 def _require_running(data_root: DataRoot) -> RuntimeState:
@@ -332,12 +498,16 @@ def _stop_daemon(data_root: DataRoot) -> dict[str, object]:
     if state is None:
         return {"status": "stopped", "data_root": str(data_root.root)}
     pid = state.pid
-    if not _process_matches(pid, data_root):
+    if not daemon_process_matches(
+        pid,
+        data_root,
+        runtime_attestor=lambda: _runtime_is_attested(data_root, state),
+    ):
         raise CliError("refusing to signal a process that is not this data root's daemon")
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        if not _process_matches(pid, data_root):
+        if not pid_is_alive(pid):
             return {"status": "stopped", "data_root": str(data_root.root)}
         time.sleep(0.05)
     raise CliError("daemon did not stop within 15 seconds")
@@ -392,6 +562,166 @@ def _public_runtime_result(data_root: DataRoot, state: RuntimeState) -> dict[str
 def _emit(value: dict[str, object], as_json: bool, *, human: str) -> int:
     print(json.dumps(value, separators=(",", ":")) if as_json else human)
     return 0
+
+
+def _doctor_human(result: dict[str, object]) -> str:
+    """Render only bounded, non-identifying runtime diagnostics."""
+
+    runtime = _doctor_mapping(result.get("runtime_protection"))
+    inhibitor = _doctor_mapping(runtime.get("inhibitor"))
+    capability = _doctor_mapping(inhibitor.get("capability"))
+    capability_probed_at = _doctor_nonnegative_number(
+        capability.get("probed_at")
+    )
+    capability_probed_at_text = (
+        "unknown"
+        if capability_probed_at is None
+        else str(round(capability_probed_at))
+    )
+    current_owners = _doctor_current_owners(runtime.get("responsibilities"))
+    durable_waiting = runtime.get("durable_waiting")
+    waiting_items = durable_waiting if isinstance(durable_waiting, list) else []
+    waiting_count = _doctor_count(runtime.get("durable_waiting_count"))
+    interruptions = runtime.get("interruptions")
+    interruption_items = interruptions if isinstance(interruptions, list) else []
+    interruption_count = _doctor_count(runtime.get("interruption_count"))
+    kinds = _doctor_item_atoms(interruption_items, "kind", empty="none")
+    waiting_reasons = _doctor_item_reason_atoms(waiting_items, empty="none")
+    interruption_reasons = _doctor_item_reason_atoms(
+        interruption_items,
+        empty="none",
+    )
+    reconciliation = _doctor_item_atoms(
+        interruption_items,
+        "reconciliation_status",
+        empty="reconciled",
+    )
+    log = _doctor_mapping(runtime.get("log"))
+    telemetry = _doctor_mapping(runtime.get("telemetry"))
+    log_age = _doctor_nonnegative_number(log.get("age_seconds"))
+    log_age_suffix = (
+        "" if log_age is None else f" age_seconds={round(log_age)}"
+    )
+    return "\n".join(
+        (
+            f"Harness gateway: {_doctor_atom(result.get('status'))}",
+            f"Runtime protection: {_doctor_atom(runtime.get('status'))}",
+            "Power inhibitor: "
+            f"backend={_doctor_atom(inhibitor.get('backend'))} "
+            f"status={_doctor_atom(inhibitor.get('status'))} "
+            f"scope={_doctor_atom(inhibitor.get('scope'))} "
+            f"active_count={_doctor_count(inhibitor.get('active_count'))} "
+            f"reason={_doctor_reason(inhibitor.get('reason'))}",
+            "Capability probe: "
+            f"status={_doctor_atom(capability.get('status'))} "
+            f"backend={_doctor_atom(capability.get('backend'))} "
+            f"scope={_doctor_atom(capability.get('scope'))} "
+            f"reason={_doctor_reason(capability.get('reason'))} "
+            f"probed_at={capability_probed_at_text}",
+            f"Current owners: {current_owners}",
+            f"Durable waiting: count={waiting_count} reasons={waiting_reasons}",
+            "Interruption: "
+            f"count={interruption_count} kinds={kinds} "
+            f"reasons={interruption_reasons}",
+            f"Reconciliation: {reconciliation}",
+            f"Log freshness: {_doctor_atom(log.get('status'))}{log_age_suffix}",
+            f"Telemetry mode: {_doctor_atom(telemetry.get('mode'))}",
+        )
+    )
+
+
+def _doctor_mapping(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def _doctor_atom(value: object, *, maximum: int = 64) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= maximum:
+        return "unknown"
+    if not value[0].isascii() or not value[0].isalnum():
+        return "unknown"
+    if not all(
+        character.isascii()
+        and (character.isalnum() or character in {"_", "-", "."})
+        for character in value
+    ):
+        return "unknown"
+    return value
+
+
+def _doctor_reason(value: object) -> str:
+    if value is None:
+        return "none"
+    reason = _doctor_mapping(value)
+    if not reason:
+        return "unknown"
+    return _doctor_atom(reason.get("code"), maximum=96)
+
+
+def _doctor_count(value: object) -> str:
+    return (
+        str(value)
+        if type(value) is int and 0 <= value <= 2_147_483_647
+        else "unknown"
+    )
+
+
+def _doctor_nonnegative_number(value: object) -> int | float | None:
+    if type(value) not in {int, float}:
+        return None
+    return value if 0 <= value <= 2_147_483_647 else None
+
+
+def _doctor_item_atoms(
+    items: list[object],
+    field: str,
+    *,
+    empty: str,
+) -> str:
+    if not items:
+        return empty
+    values = {
+        _doctor_atom(item.get(field))
+        for item in items
+        if isinstance(item, dict)
+    }
+    return ",".join(sorted(values)) if values else "unknown"
+
+
+def _doctor_item_reason_atoms(items: list[object], *, empty: str) -> str:
+    if not items:
+        return empty
+    values = {
+        _doctor_reason(item.get("reason"))
+        for item in items
+        if isinstance(item, dict)
+    }
+    return ",".join(sorted(values)) if values else "unknown"
+
+
+def _doctor_current_owners(value: object) -> str:
+    if not isinstance(value, list):
+        return "unknown"
+    counts: dict[tuple[str, str], int] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        owner_scope = item.get("owner_scope")
+        effect_kind = item.get("effect_kind")
+        if (
+            not isinstance(owner_scope, str)
+            or not isinstance(effect_kind, str)
+            or owner_scope not in _DOCTOR_OWNER_SCOPES
+            or effect_kind not in _DOCTOR_EFFECT_KINDS
+        ):
+            continue
+        key = (str(owner_scope), str(effect_kind))
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return "none"
+    return ",".join(
+        f"{owner_scope}/{effect_kind}={count}"
+        for (owner_scope, effect_kind), count in sorted(counts.items())
+    )
 
 
 def _start_human(result: dict[str, object]) -> str:

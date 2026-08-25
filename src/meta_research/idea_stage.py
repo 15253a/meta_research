@@ -446,14 +446,18 @@ class IdeaStageWorker:
             job_ref=job_ref,
         )
         if run.primary_draft is None:
-            self._agent_runtime.begin_provider_unit(
-                unit_ref=unit_ref,
-                operation_ref=job_ref,
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                unit_kind="idea_primary",
-            )
+            try:
+                self._agent_runtime.begin_provider_unit(
+                    unit_ref=unit_ref,
+                    operation_ref=job_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    unit_kind="idea_primary",
+                )
+            except OwnerConflict as error:
+                self._transient_error = error.code
+                return _CycleStep(False, provider_boundary_attempted=True)
             provider_safe = True
             try:
                 try:
@@ -462,6 +466,16 @@ class IdeaStageWorker:
                 except IdeaSkillUnavailable as error:
                     if error.code == "codex_operation_reconciliation_pending":
                         provider_safe = False
+                    elif error.recovery_checkpoint is not None:
+                        provider_safe = False
+                        self._agent_runtime.record_stage_provider_hard_ceiling(
+                            unit_ref=unit_ref,
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            failure_code=error.code,
+                            provider_exit=error.recovery_checkpoint,
+                        )
                     self._transient_error = error.code
                     return _CycleStep(False, provider_boundary_attempted=True)
                 except IdeaSkillContractError as error:
@@ -498,14 +512,18 @@ class IdeaStageWorker:
             primary_session_ref=checkpoint.native_session_ref,
             adapter_kind=checkpoint.adapter_kind,
         )
-        self._agent_runtime.begin_provider_unit(
-            unit_ref=unit_ref,
-            operation_ref=job_ref,
-            run_ref=run.run_ref,
-            attempt_ref=run.attempt_ref,
-            fence_ref=run.fence_ref,
-            unit_kind="idea_review",
-        )
+        try:
+            self._agent_runtime.begin_provider_unit(
+                unit_ref=unit_ref,
+                operation_ref=job_ref,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                unit_kind="idea_review",
+            )
+        except OwnerConflict as error:
+            self._transient_error = error.code
+            return _CycleStep(False, provider_boundary_attempted=True)
         provider_safe = True
         try:
             try:
@@ -518,6 +536,16 @@ class IdeaStageWorker:
             except IdeaSkillUnavailable as error:
                 if error.code == "codex_operation_reconciliation_pending":
                     provider_safe = False
+                elif error.recovery_checkpoint is not None:
+                    provider_safe = False
+                    self._agent_runtime.record_stage_provider_hard_ceiling(
+                        unit_ref=unit_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        failure_code=error.code,
+                        provider_exit=error.recovery_checkpoint,
+                    )
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
             except IdeaSkillContractError as error:
@@ -783,6 +811,15 @@ def _public_run(run: IdeaStageRun) -> dict[str, object]:
         "runtime_binding": run.runtime_binding.as_dict(),
         "fence_ref": run.fence_ref,
         "fence_status": fence_status,
+        "blocker": (
+            None
+            if run.failure_code is None
+            else {
+                "status": "durable",
+                "reason": {"code": run.failure_code},
+            }
+        ),
+        "recovery_checkpoint": run.recovery_checkpoint,
         "submission_ref": None if execution is None else execution.submission_ref,
         "attempt_execution_receipt": (
             None if execution is None else execution.receipt.as_public_dict()

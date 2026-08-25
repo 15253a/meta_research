@@ -27,6 +27,10 @@ from meta_research.quest_drafting import (
     ProposalDraftRequest,
     ProposalDraftResult,
 )
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeProtectionUnavailable,
+)
 from meta_research.web import create_app
 
 QUESTION = {
@@ -150,6 +154,33 @@ class DeterministicProbe:
             ),
             adapter_kind="test_probe",
         )
+
+
+class SwitchablePowerInhibitor:
+    kind = "test_switchable_inhibitor"
+
+    def __init__(self) -> None:
+        self.fail = False
+        self.live_holders: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        if self.fail:
+            raise RuntimeProtectionUnavailable("power_inhibitor_test_rejected")
+        self.live_holders.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=1_720_000_000.0,
+            native_holder_ref=f"native:{holder_ref}",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self.live_holders
+
+    def release(self, lease: InhibitorLease) -> None:
+        self.live_holders.discard(lease.holder_ref)
 
 
 class DeterministicDeepFetchProvider:
@@ -848,6 +879,16 @@ def test_reconciliation_pending_uses_persisted_backoff_without_attempt_churn(
         assert int(before.attempt_generation) == 1
         assert int(before.reconciliation_attempt_count) == 1
         assert before.next_reconcile_at is not None
+        with runtime._database.read() as connection:
+            first_unit = connection.execute(
+                text(
+                    "SELECT status FROM ar_provider_units WHERE operation_ref = "
+                    ":operation_ref"
+                ),
+                {"operation_ref": before.provider_operation_ref},
+            ).one()
+        assert first_unit.status == "revocation_pending"
+        assert runtime.query_runtime_observability()["inhibitor"]["active_count"] == 1
     finally:
         client.close()
         runtime.close()
@@ -859,6 +900,10 @@ def test_reconciliation_pending_uses_persisted_backoff_without_attempt_churn(
         host_compute_probe=DeterministicProbe(),
     )
     try:
+        with restarted._database.read() as connection:
+            restarted_feed_count = connection.execute(
+                text("SELECT count(*) FROM durable_feed")
+            ).scalar_one()
         assert not restarted.deepfetch.process_once()
         with restarted._database.read() as connection:
             waiting = connection.execute(
@@ -875,7 +920,11 @@ def test_reconciliation_pending_uses_persisted_backoff_without_attempt_churn(
         assert int(waiting.attempt_generation) == 1
         assert int(waiting.reconciliation_attempt_count) == 1
         assert waiting.provider_operation_ref == before.provider_operation_ref
-        assert waiting_feed_count == feed_count
+        # RuntimeProtection records the daemon-incarnation interruption while
+        # constructing the restarted runtime.  The backoff poll itself remains
+        # read-only and does not add a second attempt or feed event.
+        assert restarted_feed_count >= feed_count
+        assert waiting_feed_count == restarted_feed_count
         assert len(provider.requests) == 1
 
         time.sleep(0.6)
@@ -886,11 +935,63 @@ def test_reconciliation_pending_uses_persisted_backoff_without_attempt_churn(
         assert completed["deepfetch"]["status"] == "succeeded"
         assert len(provider.requests) == 2
         assert provider.requests[1].job_ref == provider.requests[0].job_ref
+        with restarted._database.read() as connection:
+            provider_units = connection.execute(
+                text(
+                    "SELECT status FROM ar_provider_units WHERE operation_ref = "
+                    ":operation_ref ORDER BY started_at, unit_ref"
+                ),
+                {"operation_ref": before.provider_operation_ref},
+            ).all()
+        assert [unit.status for unit in provider_units] == ["revoked", "completed"]
+        observability = restarted.query_runtime_observability()
+        assert observability["inhibitor"]["active_count"] == 0
+        assert observability["responsibilities"] == []
     finally:
         restarted.close()
 
 
-def test_reconciliation_without_a_receipt_becomes_a_bounded_typed_blocker(
+def test_deepfetch_power_wait_is_retryable_without_restarting_daemon(
+    tmp_path: Path,
+) -> None:
+    inhibitor = SwitchablePowerInhibitor()
+    provider = DeterministicDeepFetchProvider()
+    runtime = build_production_runtime(
+        prepare_data_root(tmp_path / "data"),
+        proposal_drafter=SnapshotAwareProposalDrafter(),
+        deepfetch_provider=provider,
+        host_compute_probe=DeterministicProbe(),
+        power_inhibitor=inhibitor,
+    )
+    client, write_headers = _authenticate(runtime)
+    initialization_id, queued = _open_and_queue_deepfetch(
+        client, write_headers, key_prefix="deepfetch-power-wait"
+    )
+    request_ref = queued["deepfetch"]["request_ref"]
+    try:
+        inhibitor.fail = True
+        assert not runtime.deepfetch.process_once()
+        assert provider.requests == []
+        waiting = runtime.owners.agent_runtime.query_deepfetch_run(request_ref)
+        assert waiting is not None
+        assert waiting.status == "admitted"
+
+        inhibitor.fail = False
+        assert runtime.deepfetch.process_once()
+        completed = runtime.owners.human_collaboration.query_quest_creation(
+            initialization_id
+        )
+        assert completed["deepfetch"]["status"] == "succeeded"
+        assert len(provider.requests) == 1
+        evidence = runtime.query_runtime_observability()
+        assert evidence["inhibitor"]["active_count"] == 0
+        assert evidence["responsibilities"] == []
+    finally:
+        client.close()
+        runtime.close()
+
+
+def test_reconciliation_without_a_receipt_remains_durable_beyond_legacy_ceiling(
     tmp_path: Path,
 ) -> None:
     provider = AlwaysPendingDeepFetchProvider()
@@ -916,24 +1017,41 @@ def test_reconciliation_without_a_receipt_becomes_a_bounded_typed_blocker(
                 {"request_ref": request_ref},
             )
 
-        assert runtime.deepfetch.process_once()
-        blocked = client.get(
+        assert not runtime.deepfetch.process_once()
+        pending = client.get(
             f"/api/v1/quest-initializations/{initialization_id}"
         ).json()
-        assert blocked["deepfetch"]["status"] == "failed"
-        assert blocked["deepfetch"]["failure"] == {
-            "code": "deepfetch_provider_outcome_unknown"
-        }
+        assert pending["deepfetch"]["status"] == "queued"
+        assert pending["deepfetch"]["failure"] is None
         with runtime._database.read() as connection:
             run = connection.execute(
                 text(
-                    "SELECT provider_operation_retry_permitted, attempt_generation "
+                    "SELECT status, provider_operation_ref, "
+                    "provider_operation_retry_permitted, attempt_generation, "
+                    "reconciliation_attempt_count, next_reconcile_at "
                     "FROM ar_deepfetch_runs WHERE request_ref = :request_ref"
                 ),
                 {"request_ref": request_ref},
             ).one()
+            control_status = connection.execute(
+                text(
+                    "SELECT status FROM ar_run_controls WHERE run_ref = "
+                    "(SELECT run_ref FROM ar_deepfetch_runs WHERE request_ref = "
+                    ":request_ref)"
+                ),
+                {"request_ref": request_ref},
+            ).scalar_one()
+        assert run.status == "admitted"
         assert int(run.provider_operation_retry_permitted) == 0
         assert int(run.attempt_generation) == 2
+        assert int(run.reconciliation_attempt_count) == 40
+        assert run.next_reconcile_at is not None
+        assert control_status == "running"
+        assert len(provider.requests) == 2
+        assert provider.requests[1].job_ref == provider.requests[0].job_ref
+        evidence = runtime.query_runtime_observability()
+        assert evidence["inhibitor"]["active_count"] == 2
+        assert len(evidence["responsibilities"]) == 2
     finally:
         client.close()
         runtime.close()

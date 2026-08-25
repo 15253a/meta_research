@@ -18,6 +18,8 @@ ACQUISITION_RUNTIME_BINDING_SCHEMA = (
 ACQUISITION_ROUTE_POLICY = "oa_first_then_institution"
 DEEPFETCH_PROTOTYPE_COMMIT = "cb369c938da835bcd07202e03ccc770551984070"
 _CDP_PROXY = "http://127.0.0.1:3456"
+_NATURE_ROUTE_CURSOR_SCHEMA = "meta-research/nature-route-cursor/v1"
+_LEGACY_NATURE_ATTEMPT_GENERATIONS = 99
 
 
 class AcquisitionUnavailable(RuntimeError):
@@ -184,7 +186,9 @@ class AcquisitionSession:
 
 
 class AcquisitionProvider(Protocol):
-    def runtime_binding(self) -> AcquisitionRuntimeBinding: ...
+    def runtime_binding(self) -> AcquisitionRuntimeBinding:
+        """Return local immutable metadata without spawning or network I/O."""
+        ...
 
     def preflight(
         self, request: AcquisitionPreflightRequest
@@ -627,66 +631,201 @@ class NatureDownloaderAdapter:
         base_argv: list[str],
         allow_waiting_retry: bool,
     ) -> AcquisitionItemResult:
-        for generation in range(1, 100):
-            attempt_root = paper_root / "attempts" / f"{route_name}-{generation:02d}"
-            argv = [*base_argv, "--out", str(attempt_root)]
-            identity = {
-                "schema_ref": "meta-research/nature-attempt/v1",
-                "request_id": request_id,
-                "paper_id": paper.paper_id,
-                "route": route_name,
-                "generation": generation,
-                "argv_hash": canonical_hash(argv),
-            }
-            state_path = attempt_root / "operation.json"
-            state = _read_private_json(state_path)
-            if state is not None:
-                if any(state.get(key) != value for key, value in identity.items()):
-                    return _reconciliation_item(paper.paper_id)
-                if state.get("status") == "terminal":
-                    result = _item_result_from_private_state(state, paper.paper_id)
-                    if result is None:
-                        return _reconciliation_item(paper.paper_id)
-                    if result.status == "waiting_user" and allow_waiting_retry:
-                        continue
-                    return result
-                if state.get("status") == "running":
-                    reconciled = _result_from_manifest(
-                        paper.paper_id, attempt_root, target_root
-                    )
-                    if reconciled is None:
-                        return _reconciliation_item(paper.paper_id)
-                    _write_private_json(
-                        state_path,
-                        {**identity, "status": "terminal", "result": reconciled.as_dict()},
-                    )
-                    return reconciled
+        cursor_identity = {
+            "schema_ref": _NATURE_ROUTE_CURSOR_SCHEMA,
+            "request_id": request_id,
+            "paper_id": paper.paper_id,
+            "route": route_name,
+            "route_argv_hash": canonical_hash(base_argv),
+        }
+        cursor_path = (
+            paper_root
+            / "route-cursors"
+            / (canonical_hash({"route": route_name}) + ".json")
+        )
+        cursor = _read_private_json(cursor_path)
+        if cursor is None:
+            generation = self._legacy_route_generation(
+                request_id=request_id,
+                paper=paper,
+                paper_root=paper_root,
+                route_name=route_name,
+                base_argv=base_argv,
+                allow_waiting_retry=allow_waiting_retry,
+            )
+            _write_private_json(
+                cursor_path, {**cursor_identity, "generation": generation}
+            )
+        else:
+            generation = cursor.get("generation")
+            if (
+                any(cursor.get(key) != value for key, value in cursor_identity.items())
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+            ):
                 return _reconciliation_item(paper.paper_id)
 
-            attempt_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            _write_private_json(state_path, {**identity, "status": "running"})
-            try:
-                completed = self._command_runner(argv, root, environment, 300.0)
-                payload = _decode_json_object(completed.stdout)
-                raw_results = payload.get("results")
-                if not isinstance(raw_results, list) or len(raw_results) != 1:
-                    raise AcquisitionUnavailable("nature_downloader_result_invalid")
-                result = _map_nature_result(paper.paper_id, raw_results[0], target_root)
-            except (AcquisitionUnavailable, OSError, subprocess.SubprocessError):
-                # A launched operation without a trustworthy terminal envelope
-                # remains unknown.  Reconciliation may consume its durable
-                # provider manifest later, but this call never guesses/replays.
-                return _reconciliation_item(paper.paper_id)
-            _write_private_json(
-                state_path,
-                {**identity, "status": "terminal", "result": result.as_dict()},
-            )
-            return result
-        return _missing_item(
-            paper.paper_id,
-            "acquisition_retry_limit_reached",
-            "该条目的授权重试次数已达到安全上限。",
+        attempt_root, argv, identity, state_path = self._attempt_state(
+            request_id=request_id,
+            paper=paper,
+            paper_root=paper_root,
+            route_name=route_name,
+            base_argv=base_argv,
+            generation=generation,
         )
+        state = _read_private_json(state_path)
+        if state is not None:
+            if any(state.get(key) != value for key, value in identity.items()):
+                return _reconciliation_item(paper.paper_id)
+            if state.get("status") == "terminal":
+                result = _item_result_from_private_state(state, paper.paper_id)
+                if result is None:
+                    return _reconciliation_item(paper.paper_id)
+                if result.status != "waiting_user" or not allow_waiting_retry:
+                    return result
+                generation += 1
+                _write_private_json(
+                    cursor_path, {**cursor_identity, "generation": generation}
+                )
+                attempt_root, argv, identity, state_path = self._attempt_state(
+                    request_id=request_id,
+                    paper=paper,
+                    paper_root=paper_root,
+                    route_name=route_name,
+                    base_argv=base_argv,
+                    generation=generation,
+                )
+                state = _read_private_json(state_path)
+                if state is not None:
+                    # The cursor is written before a new provider claim.  Seeing
+                    # an existing generation here means a crash/restart, not a
+                    # license to skip over or duplicate that physical effect.
+                    return self._reconcile_attempt_state(
+                        state=state,
+                        identity=identity,
+                        state_path=state_path,
+                        attempt_root=attempt_root,
+                        paper=paper,
+                        target_root=target_root,
+                    )
+            elif state.get("status") == "running":
+                return self._reconcile_attempt_state(
+                    state=state,
+                    identity=identity,
+                    state_path=state_path,
+                    attempt_root=attempt_root,
+                    paper=paper,
+                    target_root=target_root,
+                )
+            else:
+                return _reconciliation_item(paper.paper_id)
+
+        attempt_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _write_private_json(state_path, {**identity, "status": "running"})
+        try:
+            completed = self._command_runner(argv, root, environment, 300.0)
+            payload = _decode_json_object(completed.stdout)
+            raw_results = payload.get("results")
+            if not isinstance(raw_results, list) or len(raw_results) != 1:
+                raise AcquisitionUnavailable("nature_downloader_result_invalid")
+            result = _map_nature_result(paper.paper_id, raw_results[0], target_root)
+        except (AcquisitionUnavailable, OSError, subprocess.SubprocessError):
+            # A launched operation without a trustworthy terminal envelope
+            # remains unknown.  Reconciliation may consume its durable
+            # provider manifest later, but this call never guesses/replays.
+            return _reconciliation_item(paper.paper_id)
+        _write_private_json(
+            state_path,
+            {**identity, "status": "terminal", "result": result.as_dict()},
+        )
+        return result
+
+    @staticmethod
+    def _attempt_state(
+        *,
+        request_id: str,
+        paper: AcquisitionPaper,
+        paper_root: Path,
+        route_name: str,
+        base_argv: list[str],
+        generation: int,
+    ) -> tuple[Path, list[str], dict[str, object], Path]:
+        attempt_root = paper_root / "attempts" / f"{route_name}-{generation:02d}"
+        argv = [*base_argv, "--out", str(attempt_root)]
+        identity: dict[str, object] = {
+            "schema_ref": "meta-research/nature-attempt/v1",
+            "request_id": request_id,
+            "paper_id": paper.paper_id,
+            "route": route_name,
+            "generation": generation,
+            "argv_hash": canonical_hash(argv),
+        }
+        return attempt_root, argv, identity, attempt_root / "operation.json"
+
+    @classmethod
+    def _legacy_route_generation(
+        cls,
+        *,
+        request_id: str,
+        paper: AcquisitionPaper,
+        paper_root: Path,
+        route_name: str,
+        base_argv: list[str],
+        allow_waiting_retry: bool,
+    ) -> int:
+        """Select a pre-cursor generation with one fixed compatibility scan."""
+
+        for generation in range(1, _LEGACY_NATURE_ATTEMPT_GENERATIONS + 1):
+            _root, _argv, identity, state_path = cls._attempt_state(
+                request_id=request_id,
+                paper=paper,
+                paper_root=paper_root,
+                route_name=route_name,
+                base_argv=base_argv,
+                generation=generation,
+            )
+            state = _read_private_json(state_path)
+            if state is None:
+                return generation
+            if any(state.get(key) != value for key, value in identity.items()):
+                return generation
+            if state.get("status") != "terminal":
+                return generation
+            result = _item_result_from_private_state(state, paper.paper_id)
+            if (
+                result is None
+                or result.status != "waiting_user"
+                or not allow_waiting_retry
+            ):
+                return generation
+        return _LEGACY_NATURE_ATTEMPT_GENERATIONS + 1
+
+    @staticmethod
+    def _reconcile_attempt_state(
+        *,
+        state: dict[str, object],
+        identity: dict[str, object],
+        state_path: Path,
+        attempt_root: Path,
+        paper: AcquisitionPaper,
+        target_root: Path,
+    ) -> AcquisitionItemResult:
+        if any(state.get(key) != value for key, value in identity.items()):
+            return _reconciliation_item(paper.paper_id)
+        if state.get("status") == "terminal":
+            result = _item_result_from_private_state(state, paper.paper_id)
+            return result or _reconciliation_item(paper.paper_id)
+        if state.get("status") != "running":
+            return _reconciliation_item(paper.paper_id)
+        reconciled = _result_from_manifest(paper.paper_id, attempt_root, target_root)
+        if reconciled is None:
+            return _reconciliation_item(paper.paper_id)
+        _write_private_json(
+            state_path,
+            {**identity, "status": "terminal", "result": reconciled.as_dict()},
+        )
+        return reconciled
 
     @staticmethod
     def _attempt_plans(

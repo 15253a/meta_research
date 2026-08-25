@@ -75,6 +75,92 @@ class OversizedProviderRunner:
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
 
+class DetachedDraftingSupervisorRunner:
+    """Simulate daemon response loss after the detached supervisor starts."""
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen[bytes] | None = None
+
+    def __call__(
+        self, argv: list[str], input_text: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("durable supervisor path required")
+
+    def run_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        input_text: str,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("durable supervisor path required")
+
+    def run_durable_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        input_text: str,
+        timeout: float,
+        stdout_path: Path,
+        pid_path: Path,
+        supervisor_request_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        del job_ref, argv, input_text, timeout, stdout_path, pid_path
+        self.process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "meta_research.provider_supervisor",
+                str(supervisor_request_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        raise OSError("simulated daemon loss after supervisor launch")
+
+
+class ForbiddenDraftingReplayRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(
+        self, argv: list[str], input_text: str, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls += 1
+        raise AssertionError("sealed durable result must not replay provider")
+
+    def run_job(
+        self,
+        job_ref: str,
+        argv: list[str],
+        input_text: str,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del job_ref
+        return self(argv, input_text, timeout)
+
+
+def _fake_drafting_codex(path: Path) -> Path:
+    encoded_question = repr(json.dumps(QUESTION, ensure_ascii=False))
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        "args = sys.argv[1:]\n"
+        "result_path = Path(args[args.index('--output-last-message') + 1])\n"
+        f"result_path.write_text({encoded_question}, encoding='utf-8')\n"
+        "print(json.dumps({'type': 'thread.started', "
+        "'thread_id': 'durable-drafting-session'}))\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+    return path
+
+
 def test_codex_adapter_generates_a_schema_checked_proposal_outside_domain_state(
     tmp_path: Path,
 ) -> None:
@@ -98,6 +184,42 @@ def test_codex_adapter_generates_a_schema_checked_proposal_outside_domain_state(
     assert "--sandbox" in argv and "read-only" in argv
     assert "quest_init_1" in prompt and "a" * 64 in prompt
     assert timeout > 0
+
+
+def test_durable_drafting_recovers_signed_result_without_provider_replay(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "durable-drafting-response-loss"
+    executable = _fake_drafting_codex(tmp_path / "fake-durable-codex")
+    detached = DetachedDraftingSupervisorRunner()
+    request = ProposalDraftRequest(
+        initialization_id="quest_init_durable_response_loss",
+        draft_revision=1,
+        draft_hash="a" * 64,
+        draft={"goal": "recover", "completion_criteria": "zero replay"},
+        job_ref="proposal_generation_stable:proposal",
+    )
+    first = CodexDraftingAdapter(
+        workspace,
+        executable=str(executable),
+        process_runner=detached,
+    )
+
+    with pytest.raises(DraftingUnavailable, match="codex_job_outcome_unknown"):
+        first.draft(request)
+    assert detached.process is not None
+    assert detached.process.wait(timeout=10) == 0
+
+    forbidden = ForbiddenDraftingReplayRunner()
+    restarted = CodexDraftingAdapter(
+        workspace,
+        executable=str(executable),
+        process_runner=forbidden,
+    )
+    recovered = restarted.draft(request)
+
+    assert recovered.content == QUESTION
+    assert forbidden.calls == 0
 
 
 def test_codex_adapter_rejects_a_title_over_the_public_field_limit(
@@ -337,6 +459,27 @@ def test_codex_adapter_fails_typed_instead_of_fabricating_a_reply(
                 draft_revision=1,
                 draft_hash="d" * 64,
                 draft={"goal": "x", "completion_criteria": "y"},
+            )
+        )
+
+
+def test_durable_drafting_reports_a_missing_provider_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    adapter = CodexDraftingAdapter(
+        tmp_path / "durable-missing-provider",
+        executable=str(tmp_path / "missing-codex"),
+        timeout_seconds=1.0,
+    )
+
+    with pytest.raises(DraftingUnavailable, match="codex_cli_unavailable"):
+        adapter.draft(
+            ProposalDraftRequest(
+                initialization_id="quest_init_durable_missing",
+                draft_revision=1,
+                draft_hash="d" * 64,
+                draft={"goal": "x", "completion_criteria": "y"},
+                job_ref="proposal_generation_durable_missing:proposal",
             )
         )
 
@@ -688,6 +831,7 @@ import json
 import sys
 from pathlib import Path
 
+sys.stdin.buffer.read()
 Path({str(spawn_marker)!r}).write_text("spawned", encoding="utf-8")
 output_path = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
 output_path.write_text({json.dumps(json.dumps(QUESTION, ensure_ascii=False))}, encoding="utf-8")

@@ -35,6 +35,39 @@ handled, but extremely unlikely theoretical tails do not justify an unbounded
 series of patches that makes normal progress slower or less reliable. Residual
 tail risk should be recorded and bounded instead.
 
+## Runtime continuity, power, and local observability
+
+Long-lived logical Runs have no implicit elapsed-time or generation limit. A
+frozen provider call still has concrete process, output, and timeout ceilings,
+but reaching one permanently fences only that technical Attempt and preserves
+its signed spool/checkpoint evidence. It does not invent a domain failure or
+silently terminate the logical Run.
+
+Every managed external effect is admitted only after Agent Runtime has a
+durable responsibility and has positively confirmed the shared host sleep
+inhibitor. Ubuntu uses the native logind/systemd inhibitor path. WSL uses a
+packaged Windows-side guardian that holds a native SystemRequired power
+request. Failure or uncertain ownership is a typed, fail-closed blocker: no
+provider process starts until the exact holder is reconciled. Shared physical
+holds are reference-counted from durable responsibilities and are released only
+after the owning module records an exact checkpoint, permanent fence, or
+terminal receipt.
+
+Daemon interruption preserves unresolved responsibility, sealed provider
+evidence, the first missing durable boundary, and reconciliation status. A
+restart consumes exact Owner receipts or permanently fences the predecessor
+before issuing a successor Attempt; it never treats process disappearance as
+proof that an effect did not happen.
+
+Runtime events are recorded locally as bounded, rotating, permission-restricted
+JSONL with an allow-listed schema that excludes prompts, raw provider output,
+credentials, and local paths. Remote telemetry is disabled by default.
+OpenTelemetry OTLP/HTTP export can be enabled or revoked only through the
+confirmed Human Collaboration Command Draft for `runtime:telemetry`; revocation
+stops new export admission before it reports success, and exporter failures do
+not block core execution. Web, Snapshot, and `doctor` expose only sanitized
+status, typed reasons, counts, freshness, and reconciliation state.
+
 ## 2026-08-21 Session-topology clarification
 
 Short-lived review, retrieval, and verification work stays inside the current

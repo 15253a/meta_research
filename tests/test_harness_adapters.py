@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
 from meta_research.composition import build_production_runtime
 from meta_research.harness import HarnessAdmissionError, HarnessProbeRequest
@@ -24,6 +25,7 @@ from meta_research.harness_adapters import (
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.paths import prepare_data_root
+from meta_research.runtime_protection import InhibitorLease
 
 
 _REAL_CODEX_CHILD_LEDGER = Path(
@@ -56,6 +58,31 @@ class _RecordedRunner:
             "\n".join(json.dumps(item) for item in self.stream) + "\n",
             "",
         )
+
+
+class _ConfirmedPowerInhibitor:
+    kind = "test"
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        assert reason
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=time.time(),
+            native_holder_ref=f"native:{holder_ref}",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return True
+
+    def release(self, lease: InhibitorLease) -> None:
+        return None
+
+
+class _FailingPowerInhibitor(_ConfirmedPowerInhibitor):
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        raise OSError("inhibitor unavailable")
 
 
 class _RecordedChildLedger:
@@ -493,6 +520,18 @@ def _real_native_child_details(
     return child_ref, root_ref, cwd, skill_path, terminal_message
 
 
+def _materialize_recorded_workspace(cwd: str) -> tuple[Path, bool]:
+    """Recreate only the ephemeral directory named by the fixed native ledger."""
+
+    workspace = Path(cwd)
+    if workspace.exists():
+        if not workspace.is_dir() or workspace.is_symlink():
+            pytest.skip("fixed native Codex workspace is not a safe directory")
+        return workspace, False
+    workspace.mkdir(mode=0o700)
+    return workspace, True
+
+
 def _real_native_parent_events(
     *, root_ref: str, child_ref: str, cwd: str, skill_path: str, terminal_message: str
 ) -> tuple[dict[str, object], ...]:
@@ -667,6 +706,150 @@ def test_codex_adapter_derives_native_identity_and_capabilities_from_jsonl(
     assert argv[:2] == ["codex", "exec"]
     assert "opaque-channel-token" not in " ".join(argv)
     assert environment["META_RESEARCH_MCP_TOKEN"] == "opaque-channel-token"
+
+
+def test_installation_profile_is_a_pure_read_of_durable_provider_capability(
+    tmp_path: Path,
+) -> None:
+    stream = (
+        {"type": "thread.started", "thread_id": "codex-thread-capability"},
+        {"type": "turn.completed"},
+    )
+    runner = _RecordedRunner("codex", stream)
+    workspace = tmp_path / "durable-installation-profile"
+    adapter = CodexHarnessAdapter(workspace, runner=runner)
+
+    assert adapter.installation_profile() == {
+        "harness_family": "codex",
+        "locked_version": "0.147.0",
+        "status": "capability_unavailable",
+        "reason": {"code": "provider_capability_unverified"},
+    }
+    assert runner.calls == []
+
+    adapter.invoke(_invocation("codex"))
+    assert runner.calls[0][0] == ["codex", "--version"]
+    assert runner.calls[1][0][:2] == ["codex", "exec"]
+    calls_after_protected_probe = len(runner.calls)
+
+    restarted = CodexHarnessAdapter(workspace, runner=runner)
+    assert restarted.installation_profile() == {
+        "harness_family": "codex",
+        "locked_version": "0.147.0",
+        "provider_version": "0.147.0",
+        "status": "ready",
+    }
+    assert len(runner.calls) == calls_after_protected_probe
+
+
+def test_startup_provider_diagnostic_acquire_failure_never_spawns_provider(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "startup-probe-acquire-failure")
+    codex_runner = _RecordedRunner("codex", ())
+    claude_runner = _RecordedRunner("claude", ())
+    runtime = build_production_runtime(
+        data_root,
+        harness_adapters=(
+            CodexHarnessAdapter(data_root.run / "harness", runner=codex_runner),
+            ClaudeHarnessAdapter(
+                data_root.run / "harness", runner=claude_runner
+            ),
+        ),
+        power_inhibitor=_FailingPowerInhibitor(),
+        startup_power_probe=False,
+    )
+    try:
+        first = runtime.harnesses.query_status()
+        second = runtime.harnesses.query_status()
+
+        assert codex_runner.calls == claude_runner.calls == []
+        assert first == second
+        assert {
+            item["harness_family"]: item["missing_reason"] for item in first["adapters"]
+        } == {
+            "codex": {"code": "power_inhibitor_acquisition_failed"},
+            "claude": {"code": "power_inhibitor_acquisition_failed"},
+        }
+        observability = runtime.query_runtime_observability()
+        assert observability["responsibilities"] == []
+        assert observability["durable_waiting"] == []
+        assert observability["durable_waiting_count"] == 0
+        with runtime._database.read() as connection:
+            responsibilities = connection.execute(
+                text(
+                    "SELECT status, boundary FROM "
+                    "ar_execution_responsibilities WHERE effect_kind = "
+                    "'harness_probe' ORDER BY responsibility_ref"
+                )
+            ).all()
+        assert responsibilities == [("finished", "checkpoint")] * 2
+    finally:
+        runtime.close()
+
+
+def test_startup_provider_diagnostic_is_fresh_and_binary_identity_bound(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "provider-cli"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o700)
+    data_root = prepare_data_root(tmp_path / "startup-provider-diagnostic")
+    codex_runner = _RecordedRunner("codex", ())
+    claude_runner = _RecordedRunner("claude", ())
+    codex = CodexHarnessAdapter(data_root.run / "harness", runner=codex_runner)
+    claude = ClaudeHarnessAdapter(
+        data_root.run / "harness", runner=claude_runner
+    )
+    codex.executable = str(executable)
+    claude.executable = str(executable)
+
+    runtime = build_production_runtime(
+        data_root,
+        harness_adapters=(codex, claude),
+        power_inhibitor=_ConfirmedPowerInhibitor(),
+        startup_power_probe=False,
+    )
+    try:
+        first = runtime.harnesses.query_status()
+        second = runtime.harnesses.query_status()
+        assert [item["installation_status"] for item in first["adapters"]] == [
+            "ready",
+            "ready",
+        ]
+        assert first == second
+        assert [call[0] for call in codex_runner.calls] == [
+            [str(executable), "--version"]
+        ]
+        assert [call[0] for call in claude_runner.calls] == [
+            [str(executable), "--version"]
+        ]
+
+        executable.unlink()
+        missing = runtime.harnesses.query_status()
+        assert [item["installation_status"] for item in missing["adapters"]] == [
+            "capability_unavailable",
+            "capability_unavailable",
+        ]
+        assert all(
+            item["missing_reason"] == {"code": "provider_executable_changed"}
+            for item in missing["adapters"]
+        )
+        assert len(codex_runner.calls) == len(claude_runner.calls) == 1
+
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+        replaced = runtime.harnesses.query_status()
+        assert all(
+            item["installation_status"] == "capability_unavailable"
+            and item["missing_reason"] == {
+                "code": "provider_executable_changed"
+            }
+            for item in replaced["adapters"]
+        )
+        assert len(codex_runner.calls) == len(claude_runner.calls) == 1
+    finally:
+        runtime.close()
 
 
 def test_target_root_uses_configurable_long_task_timeout_not_interactive_watchdog(
@@ -1721,25 +1904,30 @@ def test_codex_real_native_danger_sandbox_is_rejected_by_production_reader(
         "\n" + installed_package + "\n",
     }
     monkeypatch.setenv("CODEX_HOME", str(_REAL_CODEX_CHILD_LEDGER.parents[4]))
-    result = CodexHarnessAdapter(
-        tmp_path,
-        runner=_RecordedRunner(
-            "codex",
-            _real_native_parent_events(
-                root_ref=root_ref,
-                child_ref=child_ref,
-                cwd=cwd,
-                skill_path=skill_path,
-                terminal_message=terminal_message,
+    workspace, remove_workspace = _materialize_recorded_workspace(cwd)
+    try:
+        result = CodexHarnessAdapter(
+            tmp_path,
+            runner=_RecordedRunner(
+                "codex",
+                _real_native_parent_events(
+                    root_ref=root_ref,
+                    child_ref=child_ref,
+                    cwd=str(workspace),
+                    skill_path=skill_path,
+                    terminal_message=terminal_message,
+                ),
             ),
-        ),
-    ).invoke(
-        replace(
-            _invocation("codex"),
-            target_workspace_ref="target-workspace:real-native-probe",
-            working_directory=cwd,
+        ).invoke(
+            replace(
+                _invocation("codex"),
+                target_workspace_ref="target-workspace:real-native-probe",
+                working_directory=str(workspace),
+            ),
         )
-    )
+    finally:
+        if remove_workspace:
+            workspace.rmdir()
 
     evidence = result.profile["subagent_evidence"]
     assert result.profile["sandbox_mode"] == "workspace-write"
@@ -1798,26 +1986,33 @@ def test_codex_real_native_shape_accepts_workspace_write_fixture(
             policy = payload.get("sandbox_policy")
             assert isinstance(policy, dict)
             policy["type"] = "workspace-write"
-    result = CodexHarnessAdapter(
-        tmp_path,
-        codex_child_ledger_reader=_RecordedChildLedger(child_ref, tuple(selected)),
-        runner=_RecordedRunner(
-            "codex",
-            _real_native_parent_events(
-                root_ref=root_ref,
-                child_ref=child_ref,
-                cwd=cwd,
-                skill_path=skill_path,
-                terminal_message=terminal_message,
+    workspace, remove_workspace = _materialize_recorded_workspace(cwd)
+    try:
+        result = CodexHarnessAdapter(
+            tmp_path,
+            codex_child_ledger_reader=_RecordedChildLedger(
+                child_ref, tuple(selected)
             ),
-        ),
-    ).invoke(
-        replace(
-            _invocation("codex"),
-            target_workspace_ref="target-workspace:real-native-fixture",
-            working_directory=cwd,
+            runner=_RecordedRunner(
+                "codex",
+                _real_native_parent_events(
+                    root_ref=root_ref,
+                    child_ref=child_ref,
+                    cwd=str(workspace),
+                    skill_path=skill_path,
+                    terminal_message=terminal_message,
+                ),
+            ),
+        ).invoke(
+            replace(
+                _invocation("codex"),
+                target_workspace_ref="target-workspace:real-native-fixture",
+                working_directory=str(workspace),
+            )
         )
-    )
+    finally:
+        if remove_workspace:
+            workspace.rmdir()
 
     evidence = result.profile["subagent_evidence"]
     assert isinstance(evidence, list) and evidence[0]["skill_name"] == "code-review"
@@ -4023,6 +4218,124 @@ def test_unknown_provider_outcome_reconciles_receipt_before_any_replay(
         assert restored.harnesses.query_status()["adapters"][0][
             "provider_operation"
         ]["status"] == "executed"
+    finally:
+        restored.close()
+
+
+def test_signed_supervisor_ceiling_fences_attempt_until_explicit_recovery(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "signed-ceiling"
+    counter = tmp_path / "provider-count"
+    provider = tmp_path / "provider.py"
+    provider.write_text(
+        "import json, pathlib, sys, time\n"
+        f"counter = pathlib.Path({str(counter)!r})\n"
+        "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(count))\n"
+        "sys.stdin.read()\n"
+        "if count == 1:\n"
+        "    time.sleep(2)\n"
+        "else:\n"
+        "    print(json.dumps({'type':'thread.started',"
+        "'thread_id':'recovered-root'}), flush=True)\n"
+        "    print(json.dumps({'type':'turn.completed'}), flush=True)\n",
+        encoding="utf-8",
+    )
+
+    class CeilingCodexAdapter(CodexHarnessAdapter):
+        def _provider_version(self) -> str:
+            return self.locked_version
+
+        def _argv(self, invocation: HarnessInvocation) -> list[str]:
+            return [sys.executable, str(provider)]
+
+    def adapters() -> tuple[CodexHarnessAdapter, ClaudeHarnessAdapter]:
+        return (
+            CeilingCodexAdapter(
+                workspace / "codex",
+                runner=HarnessSupervisorTransport(workspace / "supervisor"),
+                timeout_seconds=0.1,
+            ),
+            ClaudeHarnessAdapter(
+                workspace / "claude",
+                runner=_RecordedRunner("claude", ()),
+            ),
+        )
+
+    data_root = prepare_data_root(tmp_path / "signed-ceiling-data")
+    runtime = build_production_runtime(
+        data_root,
+        harness_adapters=adapters(),
+        power_inhibitor=_ConfirmedPowerInhibitor(),
+        startup_power_probe=False,
+    )
+    admission = runtime.harnesses.admit_probe(
+        HarnessProbeRequest(
+            request_ref="signed-ceiling-probe",
+            harness_family="codex",
+            model_ref="model-test",
+            auth_profile_ref="harness-profile:codex-default",
+            required_operation_ids=("research_graph.snapshot.read",),
+            required_capabilities=("native_session", "stream"),
+        ),
+        idempotency_key="signed-ceiling-probe",
+    )
+    with pytest.raises(
+        HarnessAdmissionError, match="provider_descendant_process"
+    ):
+        runtime.harnesses.execute_probe(
+            admission.run.request_ref,
+            prompt="Run the protected provider operation.",
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+    blocked = runtime.harnesses.query_status()["adapters"][0]
+    assert blocked["provider_operation"]["status"] == "failed"
+    assert blocked["provider_operation"]["outcome_code"] == (
+        "provider_descendant_process"
+    )
+    assert runtime.query_runtime_observability()["inhibitor"]["active_count"] == 0
+    ceiling_events = runtime.feed.read_event_type(
+        "agent_runtime.harness_provider_ceiling"
+    )
+    assert ceiling_events[-1].payload["boundary"] == "permanent_fence"
+    original_attempt_ref = admission.run.attempt_ref
+    original_fence_ref = admission.run.fence_ref
+    runtime.close()
+
+    restored = build_production_runtime(
+        data_root,
+        harness_adapters=adapters(),
+        power_inhibitor=_ConfirmedPowerInhibitor(),
+        startup_power_probe=False,
+    )
+    try:
+        assert counter.read_text(encoding="utf-8") == "1"
+        with pytest.raises(
+            HarnessAdmissionError, match="provider_ceiling_recovery_required"
+        ):
+            restored.harnesses.execute_probe(
+                admission.run.request_ref,
+                prompt="Run the protected provider operation.",
+                mcp_base_url="http://127.0.0.1:8765",
+            )
+        assert counter.read_text(encoding="utf-8") == "1"
+
+        recovered = restored.harnesses.recover_fenced_provider_attempt(
+            admission.run.request_ref
+        )
+        assert recovered.run.run_ref == admission.run.run_ref
+        assert recovered.run.attempt_ref != original_attempt_ref
+        assert recovered.run.fence_ref != original_fence_ref
+        completed = restored.harnesses.execute_probe(
+            admission.run.request_ref,
+            prompt="Run the protected provider operation.",
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+        assert completed.status == "executed"
+        assert counter.read_text(encoding="utf-8") == "2"
+        operations = restored.harnesses.query_status()["adapters"][0]
+        assert operations["provider_operation"]["generation"] == 2
     finally:
         restored.close()
 

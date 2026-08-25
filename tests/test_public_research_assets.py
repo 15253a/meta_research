@@ -115,7 +115,32 @@ def test_healthy_managed_handoff_alias_keeps_projection_revision_atomic(
         after = runtime.projection.query_snapshot()
 
         assert custody.custody_mode == "managed"
-        assert after == before
+        assert after["revision"] == before["revision"]
+        assert {
+            key: value
+            for key, value in after.items()
+            if key != "runtime_observability"
+        } == {
+            key: value
+            for key, value in before.items()
+            if key != "runtime_observability"
+        }
+        before_runtime = before["runtime_observability"]
+        after_runtime = after["runtime_observability"]
+        assert isinstance(before_runtime, dict)
+        assert isinstance(after_runtime, dict)
+        assert {
+            key: value for key, value in after_runtime.items() if key != "log"
+        } == {
+            key: value for key, value in before_runtime.items() if key != "log"
+        }
+        before_log = before_runtime["log"]
+        after_log = after_runtime["log"]
+        assert isinstance(before_log, dict)
+        assert isinstance(after_log, dict)
+        assert after_log["status"] == before_log["status"]
+        assert after_log["last_recorded_at"] == before_log["last_recorded_at"]
+        assert after_log["age_seconds"] >= before_log["age_seconds"]
     finally:
         runtime.close()
 

@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from meta_research.database import Database
+from meta_research.feed import DurableFeed
 from meta_research.harness import (
     TARGET_ROOT_LIFECYCLE_PHASE,
     HarnessAdmissionError,
@@ -29,6 +31,15 @@ from meta_research.owners.agent_runtime_harness import (
     TargetRootObservationPage,
 )
 from meta_research.owners.common import canonical_hash
+from meta_research.migration import upgrade_database
+from meta_research.paths import prepare_data_root
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeBoundaryRecorder,
+    RuntimeEventLogger,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+)
 from meta_research.semantic_mcp import (
     McpConnection,
     ResidentMcpBinding,
@@ -60,6 +71,44 @@ _TARGET_ROOT_REQUIRED_EVIDENCE = frozenset(
 _TARGET_ROOT_OPTIONAL_CAPABILITIES = (
     _TARGET_ROOT_CAPABILITIES - _TARGET_ROOT_REQUIRED_EVIDENCE
 )
+
+
+class _TestPowerInhibitor:
+    kind = "test_inhibitor"
+
+    def __init__(self) -> None:
+        self.active: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        self.active.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=1.0,
+            native_holder_ref=f"native:{holder_ref}",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self.active
+
+    def release(self, lease: InhibitorLease) -> None:
+        self.active.discard(lease.holder_ref)
+
+
+class _FailOncePowerInhibitor(_TestPowerInhibitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        if not self.failed:
+            self.failed = True
+            raise RuntimeProtectionUnavailable(
+                "power_inhibitor_systemd_acquire_failed"
+            )
+        return super().acquire(holder_ref=holder_ref, reason=reason)
 
 
 class _TargetRootAdapter:
@@ -346,12 +395,17 @@ class _Owner:
         )
         self.run = replace(self.run, status="running", failure_code=None)
 
-    def begin_reconciliation(self, operation_ref: str) -> None:
+    def begin_reconciliation(self, operation_ref: str) -> int:
         operation = self.operations[-1]
         assert operation.operation_ref == operation_ref
+        reconciliation_generation = operation.reconciliation_generation + 1
         self.operations[-1] = replace(
-            operation, status="running", outcome_code=None
+            operation,
+            status="running",
+            outcome_code=None,
+            reconciliation_generation=reconciliation_generation,
         )
+        return reconciliation_generation
 
     def record_operation_failure(
         self, operation_ref: str, code: str
@@ -362,7 +416,7 @@ class _Owner:
             "provider_timeout",
             "provider_io_unavailable",
             "provider_outcome_unknown",
-        }
+        } or code.startswith(("power_inhibitor_", "runtime_"))
         self.operations[-1] = replace(
             operation,
             status="unknown_outcome" if unknown else "failed",
@@ -413,6 +467,14 @@ class _Owner:
     def query_profile(self, run_ref: str) -> dict[str, object] | None:
         assert run_ref == self.run.run_ref
         return self.profile
+
+    def query_status_records(
+        self,
+    ) -> tuple[
+        tuple[AgentRuntimeHarnessRun, ...],
+        tuple[AgentRuntimeHarnessOperation, ...],
+    ]:
+        return (self.run,), tuple(reversed(self.operations))
 
     def query_target_child_session(self, _operation_ref: str) -> None:
         return None
@@ -805,6 +867,18 @@ def test_target_root_lifecycle_resumes_native_session_after_runtime_restart(
 def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
     tmp_path: Path,
 ) -> None:
+    data_root = prepare_data_root(tmp_path / "runtime-protection")
+    upgrade_database(data_root.database)
+    database = Database(data_root.database)
+    feed = DurableFeed(database)
+    feed.ensure_initialized()
+    protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=_TestPowerInhibitor(),
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    boundary_recorder = RuntimeBoundaryRecorder(database)
     request = _target_request()
     owner = _Owner(request)
     interrupted_adapter = _TargetRootAdapter(
@@ -814,6 +888,8 @@ def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
         owner,
         _Gateway(),
         (interrupted_adapter, _TargetRootAdapter("claude")),
+        runtime_protection=protection,
+        runtime_boundary_recorder=boundary_recorder,
     )
     interrupted.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
     prompt = "Own implementation through final training completion."
@@ -827,12 +903,15 @@ def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
     operation_ref = interrupted_adapter.invocations[0].provider_operation_ref
     assert owner.run.status == "running"
     assert owner.operations[0].status == "unknown_outcome"
+    assert protection.query_evidence()["inhibitor"]["active_count"] == 1
 
     recovery_adapter = _TargetRootAdapter("codex")
     recovered = HarnessRuntime(
         owner,
         _Gateway(),
         (recovery_adapter, _TargetRootAdapter("claude")),
+        runtime_protection=protection,
+        runtime_boundary_recorder=boundary_recorder,
     )
     recovered.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
     completed = recovered.run_or_resume_target_root(
@@ -844,6 +923,203 @@ def test_target_root_lifecycle_reconciles_durable_unknown_after_restart(
     assert completed.status == "executed"
     assert len(owner.operations) == 1
     assert recovery_adapter.invocations[0].provider_operation_ref == operation_ref
+    assert protection.query_evidence()["inhibitor"]["active_count"] == 0
+    protection.close()
+    database.close()
+
+
+def test_target_root_repeated_unknown_reconciliation_keeps_one_operation_and_hold(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "runtime-protection-repeated")
+    upgrade_database(data_root.database)
+    database = Database(data_root.database)
+    feed = DurableFeed(database)
+    feed.ensure_initialized()
+    inhibitor = _TestPowerInhibitor()
+    request = _target_request()
+    owner = _Owner(request)
+    prompt = "Own implementation through final training completion."
+
+    class TwiceUnknownAdapter(_TargetRootAdapter):
+        def invoke(self, invocation: HarnessInvocation) -> HarnessTurnEvidence:
+            if len(self.invocations) < 3:
+                self.invocations.append(invocation)
+                raise HarnessAdapterUnavailable("provider_outcome_unknown")
+            return super().invoke(invocation)
+
+    adapter = TwiceUnknownAdapter("codex")
+
+    def build_restarted() -> tuple[RuntimeProtection, HarnessRuntime]:
+        protection = RuntimeProtection(
+            database=database,
+            feed=feed,
+            inhibitor=inhibitor,
+            event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+        )
+        runtime = HarnessRuntime(
+            owner,
+            _Gateway(),
+            (adapter, _TargetRootAdapter("claude")),
+            runtime_protection=protection,
+            runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
+        )
+        runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+        return protection, runtime
+
+    protection, runtime = build_restarted()
+    with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):
+        runtime.run_or_resume_target_root(
+            request.request_ref,
+            prompt=prompt,
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+    operation_ref = adapter.invocations[0].provider_operation_ref
+    protection.close()
+
+    protection, runtime = build_restarted()
+    with pytest.raises(HarnessAdmissionError, match="provider_outcome_unknown"):
+        runtime.run_or_resume_target_root(
+            request.request_ref,
+            prompt=prompt,
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+    assert protection.query_evidence()["inhibitor"]["active_count"] == 3
+    protection.close()
+
+    protection, runtime = build_restarted()
+    completed = runtime.run_or_resume_target_root(
+        request.request_ref,
+        prompt=prompt,
+        mcp_base_url="http://127.0.0.1:8765",
+    )
+
+    assert completed.status == "executed"
+    assert len(owner.operations) == 1
+    assert [item.provider_operation_ref for item in adapter.invocations] == [
+        operation_ref,
+        operation_ref,
+        operation_ref,
+        operation_ref,
+    ]
+    evidence = protection.query_evidence()
+    assert evidence["inhibitor"]["active_count"] == 0
+    assert evidence["responsibilities"] == []
+    protection.close()
+    database.close()
+
+
+def test_target_root_restart_replays_owner_commit_before_runtime_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "runtime-protection-owner-commit")
+    upgrade_database(data_root.database)
+    database = Database(data_root.database)
+    feed = DurableFeed(database)
+    feed.ensure_initialized()
+    inhibitor = _TestPowerInhibitor()
+    request = _target_request()
+    owner = _Owner(request)
+    protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=inhibitor,
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    interrupted = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (_TargetRootAdapter("codex"), _TargetRootAdapter("claude")),
+        runtime_protection=protection,
+        runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
+    )
+    interrupted.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    monkeypatch.setattr(interrupted, "_finish_runtime_effect", lambda *_a, **_k: None)
+
+    completed = interrupted.run_or_resume_target_root(
+        request.request_ref,
+        prompt="Own implementation through final training completion.",
+        mcp_base_url="http://127.0.0.1:8765",
+    )
+    assert completed.status == "executed"
+    assert protection.query_evidence()["inhibitor"]["active_count"] == 1
+    protection.close()
+
+    restarted_protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=inhibitor,
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    HarnessRuntime(
+        owner,
+        _Gateway(),
+        (_TargetRootAdapter("codex"), _TargetRootAdapter("claude")),
+        runtime_protection=restarted_protection,
+        runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
+    )
+
+    evidence = restarted_protection.query_evidence()
+    assert evidence["inhibitor"]["active_count"] == 0
+    assert evidence["responsibilities"] == []
+    restarted_protection.close()
+    database.close()
+
+
+def test_target_root_power_wait_never_calls_provider_and_can_reconcile(
+    tmp_path: Path,
+) -> None:
+    data_root = prepare_data_root(tmp_path / "runtime-protection-power-wait")
+    upgrade_database(data_root.database)
+    database = Database(data_root.database)
+    feed = DurableFeed(database)
+    feed.ensure_initialized()
+    request = _target_request()
+    owner = _Owner(request)
+    adapter = _TargetRootAdapter("codex")
+    protection = RuntimeProtection(
+        database=database,
+        feed=feed,
+        inhibitor=_FailOncePowerInhibitor(),
+        event_logger=RuntimeEventLogger(data_root.logs / "runtime.jsonl"),
+    )
+    runtime = HarnessRuntime(
+        owner,
+        _Gateway(),
+        (adapter, _TargetRootAdapter("claude")),
+        runtime_protection=protection,
+        runtime_boundary_recorder=RuntimeBoundaryRecorder(database),
+    )
+    runtime.bind_target_workspace_resolver(_WorkspaceResolver(tmp_path))
+    prompt = "Own implementation through final training completion."
+
+    with pytest.raises(
+        HarnessAdmissionError, match="power_inhibitor_systemd_acquire_failed"
+    ):
+        runtime.run_or_resume_target_root(
+            request.request_ref,
+            prompt=prompt,
+            mcp_base_url="http://127.0.0.1:8765",
+        )
+    assert adapter.invocations == []
+    assert owner.run.status == "running"
+    assert owner.operations[0].status == "unknown_outcome"
+    assert protection.query_evidence()["durable_waiting"]
+
+    completed = runtime.run_or_resume_target_root(
+        request.request_ref,
+        prompt=prompt,
+        mcp_base_url="http://127.0.0.1:8765",
+    )
+
+    assert completed.status == "executed"
+    assert len(adapter.invocations) == 1
+    evidence = protection.query_evidence()
+    assert evidence["responsibilities"] == []
+    assert evidence["inhibitor"]["active_count"] == 0
+    protection.close()
+    database.close()
 
 
 def test_target_root_cancel_delegates_exact_current_durable_operation() -> None:

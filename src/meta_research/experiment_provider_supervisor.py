@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import signal
@@ -8,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 # The supervisor is launched as an isolated, absolute script so it cannot import
@@ -18,12 +18,17 @@ if __package__ in {None, ""}:
 
 from meta_research.provider_supervisor import (
     PROVIDER_OPERATION_ENV,
+    ProviderProcessJob,
+    ProviderProcessJobFactory,
     ProviderSupervisorError,
+    ProviderProcessPlatform,
+    SupervisorFileLock,
+    WindowsProviderJob,
     ensure_transport_key as ensure_shared_transport_key,
-    provider_process_group_running,
+    minimal_subprocess_environment,
     read_transport_envelope,
     sealed_transport_envelope,
-    terminate_provider_process_group,
+    supervisor_stop_requested,
     transport_canonical_json,
     transport_file_sha256,
     verify_transport_envelope,
@@ -149,22 +154,39 @@ class _ObservationLedger:
             self._count = sequence
 
 
-def supervise(request_path: Path) -> None:
+def supervise(
+    request_path: Path,
+    *,
+    process_platform: ProviderProcessPlatform | None = None,
+    provider_job_factory: ProviderProcessJobFactory | None = None,
+) -> None:
     request_path = request_path.resolve()
+    platform = process_platform or ProviderProcessPlatform()
     directory = request_path.parent
     key = ensure_transport_key(directory.parents[1])
     payload = read_signed(request_path, key)
     values = _validate_request(directory, payload)
     lock_path = directory / "supervisor.lock"
-    with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with SupervisorFileLock(lock_path):
         receipt_path = directory / "supervisor-exit.json"
         if receipt_path.exists():
             return
         if (directory / "provider-started.json").exists():
             raise ExperimentSupervisorError("provider_outcome_unknown")
-        _phase_marker(directory / "supervisor-ready.json", "ready", values, key)
-        _supervise_locked(directory, values, key)
+        _phase_marker(
+            directory / "supervisor-ready.json",
+            "ready",
+            values,
+            key,
+            process_platform=platform,
+        )
+        _supervise_locked(
+            directory,
+            values,
+            key,
+            process_platform=platform,
+            provider_job_factory=provider_job_factory,
+        )
 
 
 def _validate_request(
@@ -248,7 +270,9 @@ def _phase_marker(
     *,
     provider_process: subprocess.Popen[bytes] | None = None,
     operation_path: Path | None = None,
+    process_platform: ProviderProcessPlatform | None = None,
 ) -> None:
+    platform = process_platform or ProviderProcessPlatform()
     payload: dict[str, object] = {
         "schema_ref": (
             MARKER_SCHEMA
@@ -258,7 +282,7 @@ def _phase_marker(
         "phase": phase,
         "invocation_hash": values["invocation_hash"],
         "supervisor_process_id": os.getpid(),
-        "supervisor_process_group": os.getpgrp(),
+        "supervisor_process_group": platform.current_process_group(),
     }
     if provider_process is not None:
         if operation_path is None:
@@ -266,7 +290,9 @@ def _phase_marker(
         payload.update(
             {
                 "provider_process_id": provider_process.pid,
-                "provider_process_group": os.getpgid(provider_process.pid),
+                "provider_process_group": platform.process_group_for_pid(
+                    provider_process.pid
+                ),
                 "provider_operation_path": str(operation_path.resolve()),
             }
         )
@@ -281,6 +307,9 @@ def _supervise_locked(
     directory: Path,
     values: dict[str, object],
     key: bytes,
+    *,
+    process_platform: ProviderProcessPlatform,
+    provider_job_factory: ProviderProcessJobFactory | None,
 ) -> None:
     stdout_path = directory / "stdout.bin"
     observation_path = directory / "observations.jsonl"
@@ -297,6 +326,13 @@ def _supervise_locked(
         nonlocal stop_requested
         stop_requested = True
 
+    def should_stop() -> bool:
+        return stop_requested or supervisor_stop_requested(
+            directory / "supervisor-stop.json",
+            key=key,
+            invocation_hash=str(values["invocation_hash"]),
+        )
+
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     maximum_bytes = (
@@ -305,36 +341,63 @@ def _supervise_locked(
         + 1024
     )
     stdin_path = directory / "stdin.json"
-    with stdin_path.open("rb", buffering=0) as stdin_stream, stdout_path.open(
-        "xb", buffering=0
-    ) as stdout_stream, observation_path.open(
-        "xb", buffering=0
-    ) as observation_stream:
-        os.fchmod(stdout_stream.fileno(), 0o600)
-        os.fchmod(observation_stream.fileno(), 0o600)
+    with ExitStack() as stack:
+        provider_job: ProviderProcessJob | None = None
+        if process_platform.platform_name == "nt":
+            provider_job = (
+                provider_job_factory or WindowsProviderJob
+            )()
+            stack.callback(provider_job.close)
+        elif process_platform.platform_name != "posix":
+            raise ExperimentSupervisorError("platform_unsupported")
+        stdin_stream = stack.enter_context(stdin_path.open("rb", buffering=0))
+        stdout_stream = stack.enter_context(stdout_path.open("xb", buffering=0))
+        observation_stream = stack.enter_context(
+            observation_path.open("xb", buffering=0)
+        )
+        _make_private(stdout_path, stdout_stream.fileno())
+        _make_private(observation_path, observation_stream.fileno())
         ledger = _ObservationLedger(
             observation_stream,
             key=key,
             invocation_hash=str(values["invocation_hash"]),
             maximum_count=int(values["observation_max_count"]),
         )
-        try:
-            process = subprocess.Popen(
-                list(values["argv"]),
-                stdin=stdin_stream,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env={
-                    "PATH": os.environ.get("PATH", ""),
-                    PROVIDER_OPERATION_ENV: str(
-                        (directory / "supervisor-request.json").resolve()
-                    ),
-                },
-                start_new_session=True,
-            )
-        except OSError:
+        if should_stop():
             process = None
-            termination_reason = "launch_failed"
+            termination_reason = "stopped"
+        else:
+            try:
+                spawn_options: dict[str, object] = {
+                    "stdin": stdin_stream,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "env": minimal_subprocess_environment(
+                        platform_name=process_platform.platform_name,
+                        extra={
+                            PROVIDER_OPERATION_ENV: str(
+                                (
+                                    directory / "supervisor-request.json"
+                                ).resolve()
+                            )
+                        },
+                    ),
+                    **process_platform.provider_spawn_options(),
+                }
+                process = (
+                    provider_job.spawn(
+                        list(values["argv"]),
+                        **spawn_options,
+                    )
+                    if provider_job is not None
+                    else subprocess.Popen(
+                        list(values["argv"]),
+                        **spawn_options,
+                    )
+                )
+            except OSError:
+                process = None
+                termination_reason = "launch_failed"
         if process is not None:
             _phase_marker(
                 directory / "provider-started.json",
@@ -343,6 +406,7 @@ def _supervise_locked(
                 key,
                 provider_process=process,
                 operation_path=directory / "supervisor-request.json",
+                process_platform=process_platform,
             )
             assert process.stdout is not None
             cadence = float(values["telemetry_cadence_seconds"])
@@ -374,21 +438,36 @@ def _supervise_locked(
             drainer.start()
             deadline = time.monotonic() + float(values["wall_timeout_seconds"])
             next_telemetry = time.monotonic() + cadence
-            while process.poll() is None:
+            while process.poll() is None or (
+                provider_job is not None
+                and provider_job.active_process_count() > 0
+            ):
                 now_monotonic = time.monotonic()
-                if stop_requested:
+                if should_stop():
                     termination_reason = "stopped"
-                    _terminate_process(process)
+                    _terminate_process(
+                        process,
+                        process_platform=process_platform,
+                        provider_job=provider_job,
+                    )
                     break
                 if exceeded.is_set() or ledger.exceeded.is_set():
                     termination_reason = "output_limit"
-                    _terminate_process(process)
+                    _terminate_process(
+                        process,
+                        process_platform=process_platform,
+                        provider_job=provider_job,
+                    )
                     break
                 if now_monotonic >= deadline:
                     termination_reason = "timeout"
-                    _terminate_process(process)
+                    _terminate_process(
+                        process,
+                        process_platform=process_platform,
+                        provider_job=provider_job,
+                    )
                     break
-                if now_monotonic >= next_telemetry:
+                if process.poll() is None and now_monotonic >= next_telemetry:
                     observed_at = time.time()
                     ledger.append(
                         "telemetry",
@@ -398,25 +477,45 @@ def _supervise_locked(
                         observed_at,
                     )
                     next_telemetry = now_monotonic + cadence
-                try:
-                    process.wait(timeout=0.02)
-                except subprocess.TimeoutExpired:
-                    pass
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=0.02)
+                    except subprocess.TimeoutExpired:
+                        pass
+                else:
+                    time.sleep(0.02)
             if process.poll() is None:
-                _terminate_process(process)
+                _terminate_process(
+                    process,
+                    process_platform=process_platform,
+                    provider_job=provider_job,
+                )
             assert process.returncode is not None
             returncode = process.returncode
-            if provider_process_group_running(process.pid):
+            if provider_job is None and process_platform.process_group_running(
+                process.pid
+            ):
                 termination_reason = "descendant_process"
-                terminate_provider_process_group(process.pid)
+                process_platform.terminate_process_group(process.pid)
             drainer.join(timeout=1.0)
             if drainer.is_alive():
-                terminate_provider_process_group(process.pid)
+                if provider_job is not None:
+                    if not provider_job.terminate():
+                        raise ExperimentSupervisorError(
+                            "provider_job_termination_failed"
+                        )
+                else:
+                    process_platform.terminate_process_group(process.pid)
                 drainer.join(timeout=1.0)
             if drainer.is_alive() or drain_errors:
                 raise ExperimentSupervisorError("stdout_capture_failed")
             if exceeded.is_set() or ledger.exceeded.is_set():
                 termination_reason = "output_limit"
+        if (
+            provider_job is not None
+            and provider_job.active_process_count() != 0
+        ):
+            raise ExperimentSupervisorError("provider_job_not_empty")
         stdout_stream.flush()
         os.fsync(stdout_stream.fileno())
         observation_stream.flush()
@@ -537,16 +636,7 @@ def _host_telemetry(
     cadence: float,
 ) -> dict[str, object]:
     load = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
-    memory_total_kib: int | None = None
-    memory_available_kib: int | None = None
-    try:
-        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
-            if line.startswith("MemTotal:"):
-                memory_total_kib = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                memory_available_kib = int(line.split()[1])
-    except (OSError, ValueError):
-        pass
+    memory_total_kib, memory_available_kib = _host_memory_kib()
     return {
         "collector": "builtin-host-telemetry-v1",
         "device": f"process:{process_id}",
@@ -581,14 +671,74 @@ def _host_telemetry(
     }
 
 
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
-    terminate_provider_process_group(process.pid)
+def _host_memory_kib() -> tuple[int | None, int | None]:
+    if os.name == "nt":
+        return _windows_host_memory_kib()
+    memory_total_kib: int | None = None
+    memory_available_kib: int | None = None
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                memory_total_kib = int(line.split()[1])
+            elif line.startswith("MemAvailable:"):
+                memory_available_kib = int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return memory_total_kib, memory_available_kib
+
+
+def _windows_host_memory_kib() -> tuple[int | None, int | None]:
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD),
+            ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatus()
+    status.dwLength = ctypes.sizeof(status)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MemoryStatus)]
+    kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None, None
+    return status.ullTotalPhys // 1024, status.ullAvailPhys // 1024
+
+
+def _terminate_process(
+    process: subprocess.Popen[bytes],
+    *,
+    process_platform: ProviderProcessPlatform,
+    provider_job: ProviderProcessJob | None,
+) -> None:
+    if provider_job is not None:
+        if not provider_job.terminate():
+            raise ExperimentSupervisorError("provider_job_termination_failed")
+    else:
+        process_platform.terminate_process_group(process.pid)
     if process.poll() is None:
         try:
             process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired as error:
+            raise ExperimentSupervisorError(
+                "provider_process_termination_unconfirmed"
+            ) from error
+
+
+def _make_private(path: Path, descriptor: int) -> None:
+    if hasattr(os, "fchmod"):
+        os.fchmod(descriptor, 0o600)
+    else:
+        path.chmod(0o600)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -195,8 +195,26 @@ def write_runtime_state(root: DataRoot, value: RuntimeState) -> None:
 
 
 def append_daemon_event(root: DataRoot, event: dict[str, Any]) -> None:
-    with root.daemon_log.open("a", encoding="utf-8") as log:
-        log.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+    # Keep the compatibility entry point narrow: callers cannot smuggle
+    # prompts, paths, stdout or exception text into ordinary daemon logs.
+    from meta_research.runtime_protection import RuntimeEventLogger
+
+    event_code = event.get("event")
+    RuntimeEventLogger(root.daemon_log).record(
+        event_code=(
+            event_code if isinstance(event_code, str) else "daemon.event.invalid"
+        ),
+        status=(
+            "starting"
+            if event_code == "daemon.starting"
+            else "ready"
+            if event_code == "daemon.ready"
+            else "stopped"
+            if event_code == "daemon.stopped"
+            else "unknown"
+        ),
+        component="daemon",
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any]:

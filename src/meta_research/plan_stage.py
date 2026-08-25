@@ -448,14 +448,18 @@ class PlanStageWorker:
             job_ref=job_ref,
         )
         if run.primary_draft is None:
-            self._agent_runtime.begin_provider_unit(
-                unit_ref=unit_ref,
-                operation_ref=job_ref,
-                run_ref=run.run_ref,
-                attempt_ref=run.attempt_ref,
-                fence_ref=run.fence_ref,
-                unit_kind="plan_primary",
-            )
+            try:
+                self._agent_runtime.begin_provider_unit(
+                    unit_ref=unit_ref,
+                    operation_ref=job_ref,
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    unit_kind="plan_primary",
+                )
+            except OwnerConflict as error:
+                self._transient_error = error.code
+                return _CycleStep(False, provider_boundary_attempted=True)
             provider_safe = True
             try:
                 try:
@@ -464,6 +468,16 @@ class PlanStageWorker:
                 except PlanSkillUnavailable as error:
                     if error.code == "codex_operation_reconciliation_pending":
                         provider_safe = False
+                    elif error.recovery_checkpoint is not None:
+                        provider_safe = False
+                        self._agent_runtime.record_stage_provider_hard_ceiling(
+                            unit_ref=unit_ref,
+                            run_ref=run.run_ref,
+                            attempt_ref=run.attempt_ref,
+                            fence_ref=run.fence_ref,
+                            failure_code=error.code,
+                            provider_exit=error.recovery_checkpoint,
+                        )
                     self._transient_error = error.code
                     return _CycleStep(False, provider_boundary_attempted=True)
                 except PlanSkillContractError as error:
@@ -500,14 +514,18 @@ class PlanStageWorker:
             primary_session_ref=checkpoint.native_session_ref,
             adapter_kind=checkpoint.adapter_kind,
         )
-        self._agent_runtime.begin_provider_unit(
-            unit_ref=unit_ref,
-            operation_ref=job_ref,
-            run_ref=run.run_ref,
-            attempt_ref=run.attempt_ref,
-            fence_ref=run.fence_ref,
-            unit_kind="plan_review",
-        )
+        try:
+            self._agent_runtime.begin_provider_unit(
+                unit_ref=unit_ref,
+                operation_ref=job_ref,
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                unit_kind="plan_review",
+            )
+        except OwnerConflict as error:
+            self._transient_error = error.code
+            return _CycleStep(False, provider_boundary_attempted=True)
         provider_safe = True
         try:
             try:
@@ -520,6 +538,16 @@ class PlanStageWorker:
             except PlanSkillUnavailable as error:
                 if error.code == "codex_operation_reconciliation_pending":
                     provider_safe = False
+                elif error.recovery_checkpoint is not None:
+                    provider_safe = False
+                    self._agent_runtime.record_stage_provider_hard_ceiling(
+                        unit_ref=unit_ref,
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        failure_code=error.code,
+                        provider_exit=error.recovery_checkpoint,
+                    )
                 self._transient_error = error.code
                 return _CycleStep(False, provider_boundary_attempted=True)
             except PlanSkillContractError as error:

@@ -480,8 +480,11 @@ def test_intake_timeout_recovery_query_has_its_own_event_loop_watchdog(
             )
             elapsed = time.monotonic() - started_at
 
-            assert prepare_started.is_set()
-            assert recovery_started.is_set()
+            # Either daemon-thread operation may still be waiting for a
+            # scheduler timeslice when its independent route watchdog returns.
+            # Both calls must nevertheless have been dispatched exactly once.
+            assert prepare_started.wait(timeout=1.0)
+            assert recovery_started.wait(timeout=1.0)
             assert elapsed < 0.3
             assert response.status_code == 503
             assert response.json()["detail"] == {

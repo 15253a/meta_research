@@ -36,6 +36,10 @@ from meta_research.quest_drafting import (
     ProposalDraftRequest,
     ProposalDraftResult,
 )
+from meta_research.runtime_protection import (
+    InhibitorLease,
+    RuntimeProtectionUnavailable,
+)
 from meta_research.writing_contract import (
     WritingRuntimeBinding,
     validate_writing_claim_inventory,
@@ -90,9 +94,38 @@ class _DeterministicProbe:
         )
 
 
+class _FailOncePowerInhibitor:
+    kind = "test_fail_once_power_inhibitor"
+
+    def __init__(self) -> None:
+        self.fail_next = False
+        self.live_holders: set[str] = set()
+
+    def acquire(self, *, holder_ref: str, reason: str) -> InhibitorLease:
+        del reason
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeProtectionUnavailable("power_inhibitor_test_rejected")
+        self.live_holders.add(holder_ref)
+        return InhibitorLease(
+            holder_ref=holder_ref,
+            backend=self.kind,
+            scope="sleep",
+            acquired_at=1_720_000_000.0,
+            native_holder_ref=f"native:{holder_ref}",
+        )
+
+    def is_confirmed(self, lease: InhibitorLease) -> bool:
+        return lease.holder_ref in self.live_holders
+
+    def release(self, lease: InhibitorLease) -> None:
+        self.live_holders.discard(lease.holder_ref)
+
+
 class _DeterministicWritingSkill(WritingSkillProvider):
     def __init__(self) -> None:
         self.draft_requests: list[WritingSkillRequest] = []
+        self.review_requests: list[WritingSkillRequest] = []
 
     def runtime_binding(self) -> WritingRuntimeBinding:
         return WritingRuntimeBinding(
@@ -119,6 +152,7 @@ class _DeterministicWritingSkill(WritingSkillProvider):
     def review_draft(
         self, request: WritingSkillRequest, draft: WritingSkillDraft
     ) -> WritingSkillResult:
+        self.review_requests.append(request)
         return WritingSkillResult(
             reviewed_markdown=draft.markdown,
             final_markdown=(
@@ -152,7 +186,11 @@ class _DeterministicWritingSkill(WritingSkillProvider):
         )
 
 
-def _runtime(path: Path, writing_skill: WritingSkillProvider | None = None):
+def _runtime(
+    path: Path,
+    writing_skill: WritingSkillProvider | None = None,
+    power_inhibitor=None,
+):
     drafting = _DeterministicDraftingAdapter()
     return build_production_runtime(
         prepare_data_root(path),
@@ -160,6 +198,7 @@ def _runtime(path: Path, writing_skill: WritingSkillProvider | None = None):
         intent_drafting_provider=drafting,
         host_compute_probe=_DeterministicProbe(),
         writing_skill_provider=writing_skill or _DeterministicWritingSkill(),
+        power_inhibitor=power_inhibitor,
     )
 
 
@@ -2614,6 +2653,194 @@ class _ControlledBlockingWritingSkill(_DeterministicWritingSkill):
         return self.release_terminal.is_set()
 
 
+class _UnknownTimeoutWritingSkill(_DeterministicWritingSkill):
+    def __init__(self, *, unknown_on_first_call: bool = True) -> None:
+        super().__init__()
+        self.unknown_on_first_call = unknown_on_first_call
+        self.started = threading.Event()
+        self.release_unknown = threading.Event()
+        self.terminal_verified = threading.Event()
+        self.cancelled_jobs: list[str] = []
+        self.reconciled_jobs: list[str] = []
+
+    def generate_draft(self, request: WritingSkillRequest) -> WritingSkillDraft:
+        if self.unknown_on_first_call and not self.draft_requests:
+            self.draft_requests.append(request)
+            self.started.set()
+            self.release_unknown.wait(timeout=5)
+            raise WritingSkillUnavailable("codex_operation_reconciliation_pending")
+        return super().generate_draft(request)
+
+    def cancel_job(self, job_ref: str) -> None:
+        self.cancelled_jobs.append(job_ref)
+
+    def reconcile_cancelled_job(self, job_ref: str) -> bool:
+        self.reconciled_jobs.append(job_ref)
+        return self.terminal_verified.is_set()
+
+
+def test_writing_power_wait_keeps_the_same_run_retryable_without_provider_effect(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicWritingSkill()
+    inhibitor = _FailOncePowerInhibitor()
+    runtime = _runtime(
+        tmp_path / "writing-power-wait",
+        provider,
+        power_inhibitor=inhibitor,
+    )
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            "writing-power-wait",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        attempt_ref = admitted["run"]["attempt_ref"]
+        fence_ref = admitted["run"]["fence_ref"]
+
+        inhibitor.fail_next = True
+        assert runtime.writing.process_once()
+        assert provider.draft_requests == []
+
+        waiting = runtime.writing.query_writing_report(run_ref)
+        assert waiting["status"] == "running"
+        assert waiting["run"]["status"] == "active"
+        assert waiting["run"]["attempt_ref"] == attempt_ref
+        assert waiting["run"]["fence_ref"] == fence_ref
+        assert waiting["run"]["blocker"] is None
+        assert waiting["execution"]["status"] == "admitted"
+        managed = runtime.owners.agent_runtime.query_managed_run(run_ref)
+        assert managed is not None
+        assert managed["status"] == "running"
+        assert managed["cleanup_status"] == "none"
+        evidence = runtime.query_runtime_observability()
+        assert evidence["inhibitor"]["active_count"] == 0
+        assert evidence["responsibilities"] == []
+        assert evidence["durable_waiting"] == []
+
+        assert runtime.writing.process_once()
+        checkpointed = runtime.writing.query_writing_report(run_ref)
+        assert checkpointed["status"] == "running"
+        assert checkpointed["run"]["attempt_ref"] == attempt_ref
+        assert checkpointed["run"]["fence_ref"] == fence_ref
+        assert checkpointed["run"]["blocker"] is None
+        assert checkpointed["execution"]["status"] == "running"
+        assert len(provider.draft_requests) == 1
+        completed_evidence = runtime.query_runtime_observability()
+        assert completed_evidence["inhibitor"]["active_count"] == 0
+        assert completed_evidence["responsibilities"] == []
+        assert completed_evidence["durable_waiting"] == []
+    finally:
+        runtime.close()
+
+
+def test_writing_review_power_wait_keeps_the_checkpoint_retryable(
+    tmp_path: Path,
+) -> None:
+    provider = _DeterministicWritingSkill()
+    inhibitor = _FailOncePowerInhibitor()
+    runtime = _runtime(
+        tmp_path / "writing-review-power-wait",
+        provider,
+        power_inhibitor=inhibitor,
+    )
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            "writing-review-power-wait",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        attempt_ref = admitted["run"]["attempt_ref"]
+        fence_ref = admitted["run"]["fence_ref"]
+        assert runtime.writing.process_once()
+        assert len(provider.draft_requests) == 1
+
+        inhibitor.fail_next = True
+        assert runtime.writing.process_once()
+        assert provider.review_requests == []
+        waiting = runtime.writing.query_writing_report(run_ref)
+        assert waiting["status"] == "running"
+        assert waiting["run"]["status"] == "active"
+        assert waiting["run"]["attempt_ref"] == attempt_ref
+        assert waiting["run"]["fence_ref"] == fence_ref
+        assert waiting["run"]["blocker"] is None
+        assert waiting["execution"]["status"] == "running"
+        evidence = runtime.query_runtime_observability()
+        assert evidence["inhibitor"]["active_count"] == 0
+        assert evidence["responsibilities"] == []
+        assert evidence["durable_waiting"] == []
+
+        assert runtime.writing.process_once()
+        completed = runtime.writing.query_writing_report(run_ref)
+        assert completed["status"] == "running"
+        assert completed["run"]["attempt_ref"] == attempt_ref
+        assert completed["run"]["fence_ref"] == fence_ref
+        assert completed["run"]["blocker"] is None
+        assert completed["execution"]["status"] == "completed"
+        assert len(provider.draft_requests) == 1
+        assert len(provider.review_requests) == 1
+    finally:
+        runtime.close()
+
+
+def test_writing_power_wait_restart_has_no_pending_provider_cleanup(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "writing-power-wait-restart"
+    provider = _DeterministicWritingSkill()
+    inhibitor = _FailOncePowerInhibitor()
+    runtime = _runtime(data_root, provider, power_inhibitor=inhibitor)
+    restarted = None
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            "writing-power-wait-restart",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        original_attempt_ref = admitted["run"]["attempt_ref"]
+
+        inhibitor.fail_next = True
+        assert runtime.writing.process_once()
+        assert provider.draft_requests == []
+        before_restart = runtime.owners.agent_runtime.query_managed_run(run_ref)
+        assert before_restart is not None
+        assert before_restart["status"] == "running"
+        assert before_restart["cleanup_status"] == "none"
+        runtime.close()
+        runtime = None
+
+        restarted = _runtime(data_root, provider, power_inhibitor=inhibitor)
+        recovered = restarted.writing.query_writing_report(run_ref)
+        assert recovered["status"] == "running"
+        assert recovered["run"]["status"] == "active"
+        assert recovered["run"]["attempt_ref"] != original_attempt_ref
+        assert recovered["run"]["blocker"] is None
+        managed = restarted.owners.agent_runtime.query_managed_run(run_ref)
+        assert managed is not None
+        assert managed["status"] == "running"
+        assert managed["cleanup_status"] == "none"
+
+        assert restarted.writing.process_once()
+        checkpointed = restarted.writing.query_writing_report(run_ref)
+        assert checkpointed["execution"]["status"] == "running"
+        assert len(provider.draft_requests) == 1
+        evidence = restarted.query_runtime_observability()
+        assert evidence["inhibitor"]["active_count"] == 0
+        assert evidence["responsibilities"] == []
+        assert evidence["durable_waiting"] == []
+    finally:
+        if runtime is not None:
+            runtime.close()
+        if restarted is not None:
+            restarted.close()
+
+
 def test_writing_admission_and_provider_phases_use_the_shared_managed_seam(
     tmp_path: Path,
 ) -> None:
@@ -2859,7 +3086,7 @@ def test_writing_control_waits_for_provider_exit_before_replacing_attempt(
                 attempt_ref=old_attempt_ref,
                 fence_ref=old_fence_ref,
             )
-            assert runtime.writing.query_writing_report(run_ref)["status"] == "blocked"
+            assert runtime.writing.query_writing_report(run_ref)["status"] == "running"
         assert provider.cancelled_jobs == [owner_before.provider_job_ref]
         managed = runtime.owners.agent_runtime.query_managed_run(run_ref)
         assert managed is not None
@@ -2889,26 +3116,189 @@ def test_writing_control_waits_for_provider_exit_before_replacing_attempt(
         assert errors == []
         cleaned = runtime.owners.agent_runtime.query_managed_run(run_ref)
         assert cleaned is not None
-        assert cleaned["cleanup_status"] == "completed"
+        assert cleaned["cleanup_status"] == (
+            "completed" if control_kind == "pause" else "none"
+        )
+        if control_kind == "timeout":
+            assert cleaned["status"] == "running"
         with runtime._database.read() as connection:
             assert connection.exec_driver_sql(
                 "SELECT status FROM ar_provider_units WHERE run_ref = ?",
                 (run_ref,),
             ).scalar_one() == "revoked"
 
-        resumed = runtime.writing.control_report(
-            run_ref,
-            action="resume",
-            idempotency_key=f"writing-provider-stop-{control_kind}-resume",
-        )
+        if control_kind == "pause":
+            resumed = runtime.writing.control_report(
+                run_ref,
+                action="resume",
+                idempotency_key=f"writing-provider-stop-{control_kind}-resume",
+            )
+        else:
+            resumed = runtime.writing.query_writing_report(run_ref)
         assert resumed["run"]["attempt_ref"] != old_attempt_ref
         assert resumed["run"]["fence_ref"] != old_fence_ref
         owner_after = runtime.owners.agent_runtime.query_writing_report(run_ref)
         assert owner_after is not None
-        assert owner_after.provider_job_ref != owner_before.provider_job_ref
+        if control_kind == "pause":
+            assert owner_after.provider_job_ref != owner_before.provider_job_ref
+        else:
+            assert owner_after.provider_job_ref == owner_before.provider_job_ref
     finally:
         provider.release_terminal.set()
         runtime.close()
+
+
+def test_writing_timeout_before_provider_start_installs_a_retryable_successor(
+    tmp_path: Path,
+) -> None:
+    provider = _UnknownTimeoutWritingSkill(unknown_on_first_call=False)
+    runtime = _runtime(tmp_path / "writing-timeout-before-provider", provider)
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            "writing-timeout-before-provider",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        old_attempt_ref = admitted["run"]["attempt_ref"]
+        old_fence_ref = admitted["run"]["fence_ref"]
+
+        runtime.writing.block_writing_claim(
+            run_ref=run_ref,
+            attempt_ref=old_attempt_ref,
+            fence_ref=old_fence_ref,
+        )
+
+        interrupted = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert interrupted is not None
+        assert interrupted.status == "active"
+        assert interrupted.attempt_ref != old_attempt_ref
+        assert interrupted.fence_ref != old_fence_ref
+        assert interrupted.failure_code is None
+        assert provider.draft_requests == []
+        assert provider.cancelled_jobs == []
+        with runtime._database.read() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT status FROM ar_writing_attempts WHERE attempt_ref = ?",
+                (old_attempt_ref,),
+            ).scalar_one() == "retired"
+            assert connection.exec_driver_sql(
+                "SELECT reason_code FROM ar_fence_revocations WHERE fence_ref = ?",
+                (old_fence_ref,),
+            ).scalar_one() == "writing_operation_timeout"
+
+        assert runtime.writing.process_once()
+        checkpointed = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert checkpointed is not None
+        assert checkpointed.status == "active"
+        assert checkpointed.checkpoint is not None
+        assert len(provider.draft_requests) == 1
+    finally:
+        runtime.close()
+
+
+def test_writing_timeout_restart_waits_for_terminal_proof_before_provider_retry(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "writing-timeout-unknown-restart"
+    provider = _UnknownTimeoutWritingSkill()
+    runtime = _runtime(root, provider)
+    reopened = None
+    try:
+        quest = _confirm_direct_quest(runtime)
+        admitted = _admit_report(
+            runtime,
+            quest["quest_ref"],
+            "writing-timeout-unknown-restart",
+        )
+        run_ref = admitted["run"]["run_ref"]
+        old_attempt_ref = admitted["run"]["attempt_ref"]
+        old_fence_ref = admitted["run"]["fence_ref"]
+        old_owner = runtime.owners.agent_runtime.query_writing_report(run_ref)
+        assert old_owner is not None
+        errors: list[BaseException] = []
+
+        def execute_provider() -> None:
+            try:
+                runtime.writing.process_once()
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        worker = threading.Thread(target=execute_provider, daemon=True)
+        worker.start()
+        assert provider.started.wait(timeout=2)
+        runtime.writing.block_writing_claim(
+            run_ref=run_ref,
+            attempt_ref=old_attempt_ref,
+            fence_ref=old_fence_ref,
+        )
+        provider.release_unknown.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert errors == []
+        assert provider.cancelled_jobs == [old_owner.provider_job_ref]
+        assert len(provider.draft_requests) == 1
+        pending = runtime.owners.agent_runtime.query_managed_run(run_ref)
+        assert pending is not None
+        assert pending["status"] == "reconciliation_required"
+        assert pending["cleanup_status"] == "pending"
+        runtime.close()
+        runtime = None
+
+        reopened = _runtime(root, provider)
+        waiting = reopened.owners.agent_runtime.query_writing_report(run_ref)
+        assert waiting is not None
+        assert waiting.status == "active"
+        assert waiting.attempt_ref == old_attempt_ref
+        assert waiting.fence_ref == old_fence_ref
+        assert waiting.failure_code == "writing_operation_timeout"
+        assert reopened.writing.next_runnable_claim() is None
+        assert len(provider.draft_requests) == 1
+        evidence = reopened.query_runtime_observability()
+        assert len(evidence["responsibilities"]) == 1
+        assert evidence["responsibilities"][0]["operation_ref"] == (
+            old_owner.provider_job_ref
+        )
+        assert len(evidence["durable_waiting"]) == 1
+        assert evidence["durable_waiting"][0]["responsibility_ref"] == (
+            evidence["responsibilities"][0]["responsibility_ref"]
+        )
+
+        provider.terminal_verified.set()
+        claim = reopened.writing.next_runnable_claim()
+        assert claim is not None
+        assert claim[0] == run_ref
+        assert claim[1] != old_attempt_ref
+        assert claim[2] != old_fence_ref
+        assert len(provider.draft_requests) == 1
+        settled_evidence = reopened.query_runtime_observability()
+        assert settled_evidence["responsibilities"] == []
+        assert settled_evidence["durable_waiting"] == []
+        assert any(
+            item["responsibility_ref"]
+            == evidence["responsibilities"][0]["responsibility_ref"]
+            and item["reconciliation_status"] == "completed"
+            for item in settled_evidence["interruptions"]
+        )
+
+        assert reopened.writing.process_once(
+            expected_run_ref=claim[0],
+            expected_attempt_ref=claim[1],
+            expected_fence_ref=claim[2],
+        )
+        recovered = reopened.owners.agent_runtime.query_writing_report(run_ref)
+        assert recovered is not None
+        assert recovered.status == "active"
+        assert recovered.failure_code is None
+        assert recovered.checkpoint is not None
+        assert len(provider.draft_requests) == 2
+    finally:
+        provider.release_unknown.set()
+        if runtime is not None:
+            runtime.close()
+        if reopened is not None:
+            reopened.close()
 
 
 def test_writing_restart_reuses_the_sealed_operation_without_attempt_churn(
@@ -3188,9 +3578,11 @@ def test_watchdog_retires_a_stuck_fence_and_allows_the_next_run_to_advance(
             attempt_ref=claim[1],
             fence_ref=claim[2],
         )
-        blocked = runtime.writing.query_writing_report(stuck["run"]["run_ref"])
-        assert blocked["status"] == "blocked"
-        assert blocked["run"]["blocker"] == {
+        interrupted = runtime.writing.query_writing_report(
+            stuck["run"]["run_ref"]
+        )
+        assert interrupted["status"] == "running"
+        assert interrupted["run"]["blocker"] == {
             "code": "writing_operation_timeout"
         }
 
@@ -3203,6 +3595,12 @@ def test_watchdog_retires_a_stuck_fence_and_allows_the_next_run_to_advance(
         provider.release.set()
         worker.join(timeout=1)
         assert not worker.is_alive()
+        recovered = runtime.writing.query_writing_report(
+            stuck["run"]["run_ref"]
+        )
+        assert recovered["status"] == "running"
+        assert recovered["run"]["attempt_ref"] != stuck["run"]["attempt_ref"]
+        assert recovered["run"]["fence_ref"] != stuck["run"]["fence_ref"]
         assert runtime.owners.research_graph.query_writing_citation_history(
             stuck["run"]["run_ref"]
         ) == ()

@@ -29,6 +29,12 @@ from meta_research.owners.agent_runtime_harness import (
 )
 from meta_research.owners.common import canonical_hash
 from meta_research.provider_supervisor import provider_operation_ref
+from meta_research.runtime_protection import (
+    RuntimeBoundaryRecorder,
+    RuntimeEffectIdentity,
+    RuntimeProtection,
+    RuntimeProtectionUnavailable,
+)
 from meta_research.semantic_mcp import (
     McpConnection,
     ResidentMcpBinding,
@@ -47,6 +53,13 @@ TargetTurnPhase = Literal["implementation_review", "execution", "result_review"]
 TARGET_ROOT_LIFECYCLE_PHASE = "target_root_lifecycle"
 _AUTH_PROFILE_REF = re.compile(r"^harness-profile:[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _CONFORMANCE_TOKEN = re.compile(r"^[0-9a-f]{16}$")
+_PROVIDER_CEILING_CODES = frozenset(
+    {
+        "provider_timeout",
+        "provider_output_limit",
+        "provider_descendant_process",
+    }
+)
 
 FULL_CONFORMANCE_V1 = "meta-research/harness-full-conformance/v1"
 FULL_CONFORMANCE_FAMILIES: tuple[HarnessFamily, ...] = ("codex", "claude")
@@ -66,6 +79,71 @@ FULL_CONFORMANCE_OPERATION_IDS = tuple(
         }
     )
 )
+
+
+def _harness_runtime_effect(
+    *,
+    run_ref: str,
+    attempt_ref: str,
+    fence_ref: str,
+    operation_ref: str,
+    target_root: bool,
+    reconciling: bool,
+    reconciliation_generation: int = 0,
+) -> RuntimeEffectIdentity:
+    material = {
+        "run_ref": run_ref,
+        "attempt_ref": attempt_ref,
+        "fence_ref": fence_ref,
+        "operation_ref": operation_ref,
+        "reconciling": reconciling,
+    }
+    if reconciling:
+        if reconciliation_generation < 1:
+            raise ValueError("harness_reconciliation_generation_invalid")
+        material["reconciliation_generation"] = reconciliation_generation
+    return RuntimeEffectIdentity(
+        responsibility_ref=(
+            "harness_reconciliation_" if reconciling else "harness_responsibility_"
+        )
+        + canonical_hash(material),
+        owner_scope="agent_runtime",
+        root_run_ref=run_ref,
+        attempt_ref=attempt_ref,
+        fence_ref=fence_ref,
+        operation_ref=operation_ref,
+        effect_kind=(
+            "runtime_reconciliation"
+            if reconciling
+            else "harness_root"
+            if target_root
+            else "harness_probe"
+        ),
+    )
+
+
+def _harness_provider_diagnostic_effect(
+    *,
+    family: HarnessFamily,
+    daemon_incarnation_ref: str,
+) -> RuntimeEffectIdentity:
+    digest = canonical_hash(
+        {
+            "family": family,
+            "daemon_incarnation_ref": daemon_incarnation_ref,
+        }
+    )
+    return RuntimeEffectIdentity(
+        responsibility_ref="harness_diagnostic_" + digest,
+        owner_scope="agent_runtime",
+        root_run_ref=daemon_incarnation_ref,
+        attempt_ref="harness_diagnostic_attempt_" + digest[:48],
+        fence_ref="harness_diagnostic_fence_" + digest[:48],
+        operation_ref=(
+            f"harness_provider_diagnostic_{family}_" + digest[:48]
+        ),
+        effect_kind="harness_probe",
+    )
 _FULL_CONFORMANCE_INITIAL_CAPABILITIES = tuple(
     capability for capability in HARNESS_CAPABILITIES if capability != "resume"
 )
@@ -314,6 +392,9 @@ class HarnessRuntime:
         adapters: tuple[HarnessAdapter, ...],
         *,
         operation_canceller: HarnessOperationCanceller | None = None,
+        runtime_protection: RuntimeProtection | None = None,
+        runtime_boundary_recorder: RuntimeBoundaryRecorder | None = None,
+        daemon_incarnation_ref: str | None = None,
     ) -> None:
         self._owner = owner
         self._gateway = gateway
@@ -354,8 +435,220 @@ class HarnessRuntime:
         self._resident_scope_verifier: ResidentMcpScopeVerifier | None = None
         self._target_workspace_resolver: TargetWorkspaceResolver | None = None
         self._operation_canceller = operation_canceller
+        self._runtime_protection = runtime_protection
+        self._runtime_boundary_recorder = runtime_boundary_recorder
+        self._daemon_incarnation_ref = daemon_incarnation_ref
+        self._startup_diagnostics_ran = False
+        if (runtime_protection is None) != (runtime_boundary_recorder is None):
+            raise HarnessAdmissionError("runtime_protection_binding_incomplete")
+        if daemon_incarnation_ref is not None and (
+            not isinstance(daemon_incarnation_ref, str)
+            or not daemon_incarnation_ref
+            or len(daemon_incarnation_ref) > 128
+            or re.fullmatch(r"[A-Za-z0-9._:-]+", daemon_incarnation_ref) is None
+        ):
+            raise HarnessAdmissionError("runtime_incarnation_binding_invalid")
         self._resident_channel_scopes: dict[str, _ResidentMcpScope] = {}
         self._recovered_target_requests: dict[str, int] = {}
+        if runtime_protection is not None:
+            self._recover_committed_runtime_boundaries()
+
+    def run_startup_diagnostics(self) -> None:
+        """Probe installed providers once for this protected daemon instance."""
+
+        if self._startup_diagnostics_ran:
+            return
+        protection = self._runtime_protection
+        recorder = self._runtime_boundary_recorder
+        incarnation_ref = self._daemon_incarnation_ref
+        if protection is None or recorder is None or incarnation_ref is None:
+            self._startup_diagnostics_ran = True
+            return
+        protection_evidence = protection.query_evidence()
+        inhibitor = protection_evidence.get("inhibitor")
+        capability = (
+            inhibitor.get("capability") if isinstance(inhibitor, dict) else None
+        )
+        known_power_failure = (
+            capability.get("reason", {}).get("code")
+            if isinstance(capability, dict)
+            and capability.get("status") == "unavailable"
+            and isinstance(capability.get("reason"), dict)
+            else None
+        )
+        for family in FULL_CONFORMANCE_FAMILIES:
+            adapter = self._adapters[family]
+            prepare = getattr(adapter, "prepare_installation_diagnostic", None)
+            probe = getattr(adapter, "run_installation_diagnostic", None)
+            record_failure = getattr(
+                adapter, "record_installation_diagnostic_failure", None
+            )
+            if not (
+                callable(prepare)
+                and callable(probe)
+                and callable(record_failure)
+            ):
+                continue
+            prepare(incarnation_ref)
+            if isinstance(known_power_failure, str) and known_power_failure:
+                record_failure(incarnation_ref, known_power_failure)
+                continue
+            effect = _harness_provider_diagnostic_effect(
+                family=family,
+                daemon_incarnation_ref=incarnation_ref,
+            )
+            try:
+                protection.acquire(effect)
+            except RuntimeProtectionUnavailable as error:
+                diagnostic_hash = record_failure(incarnation_ref, error.code)
+                self._finish_startup_diagnostic(
+                    effect=effect,
+                    family=family,
+                    incarnation_ref=incarnation_ref,
+                    diagnostic_hash=diagnostic_hash,
+                    outcome_code=error.code,
+                    allow_missing=True,
+                )
+                continue
+            try:
+                diagnostic_hash = probe(incarnation_ref)
+                outcome_code = "provider_diagnostic_ready"
+            except HarnessAdapterUnavailable as error:
+                diagnostic_hash = record_failure(incarnation_ref, error.code)
+                outcome_code = error.code
+            self._finish_startup_diagnostic(
+                effect=effect,
+                family=family,
+                incarnation_ref=incarnation_ref,
+                diagnostic_hash=diagnostic_hash,
+                outcome_code=outcome_code,
+            )
+        self._startup_diagnostics_ran = True
+
+    def _finish_startup_diagnostic(
+        self,
+        *,
+        effect: RuntimeEffectIdentity,
+        family: HarnessFamily,
+        incarnation_ref: str,
+        diagnostic_hash: str,
+        outcome_code: str,
+        allow_missing: bool = False,
+    ) -> None:
+        protection = self._runtime_protection
+        recorder = self._runtime_boundary_recorder
+        if protection is None or recorder is None:
+            return
+        checkpoint_ref = "harness_diagnostic_checkpoint_" + canonical_hash(
+            {
+                "responsibility_ref": effect.responsibility_ref,
+                "diagnostic_hash": diagnostic_hash,
+                "outcome_code": outcome_code,
+            }
+        )
+        try:
+            recorder.record(
+                identity=effect,
+                boundary="checkpoint",
+                checkpoint_ref=checkpoint_ref,
+                owner_evidence_ref="harness_provider_diagnostic_"
+                + canonical_hash(
+                    {
+                        "family": family,
+                        "daemon_incarnation_ref": incarnation_ref,
+                        "diagnostic_hash": diagnostic_hash,
+                    }
+                ),
+            )
+        except RuntimeProtectionUnavailable as error:
+            if allow_missing and error.code == "runtime_responsibility_not_found":
+                return
+            raise
+        try:
+            protection.finish(
+                effect.responsibility_ref,
+                boundary="checkpoint",
+                checkpoint_ref=checkpoint_ref,
+            )
+        except RuntimeProtectionUnavailable as error:
+            if error.code != "power_inhibitor_reconciliation_required":
+                raise
+            # The diagnostic Owner fact and exact no-effect receipt are durable,
+            # but absence of a possibly issued native hold is not yet proved.
+            # Keep reconciliation ownership and allow read-only runtime startup.
+
+    def _recover_committed_runtime_boundaries(self) -> None:
+        """Replay a lost protection ACK from durable Harness Owner state."""
+
+        try:
+            runs, operations = self._owner.query_status_records()
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+        runs_by_ref = {run.run_ref: run for run in runs}
+        for operation in operations:
+            if operation.status not in {"executed", "failed"}:
+                continue
+            # Signed ceilings write their exact permanent-fence receipt in the
+            # Owner transaction. RuntimeProtection consumes a lost finish ACK
+            # before Harness recovery runs; never rewrite it as a checkpoint.
+            if (
+                operation.status == "failed"
+                and operation.outcome_code in _PROVIDER_CEILING_CODES
+            ):
+                continue
+            run = runs_by_ref.get(operation.run_ref)
+            if run is None:
+                raise HarnessAdmissionError("harness_runtime_recovery_invalid")
+            target_root = isinstance(run.request, dict) and isinstance(
+                run.request.get("target_ref"), str
+            )
+            reconciliation_generation = operation.reconciliation_generation
+            effect = _harness_runtime_effect(
+                run_ref=run.run_ref,
+                attempt_ref=run.attempt_ref,
+                fence_ref=run.fence_ref,
+                operation_ref=operation.operation_ref,
+                target_root=target_root,
+                reconciling=reconciliation_generation > 0,
+                reconciliation_generation=reconciliation_generation,
+            )
+            predecessors = (
+                _harness_runtime_effect(
+                    run_ref=run.run_ref,
+                    attempt_ref=run.attempt_ref,
+                    fence_ref=run.fence_ref,
+                    operation_ref=operation.operation_ref,
+                    target_root=target_root,
+                    reconciling=False,
+                ),
+                *(
+                    _harness_runtime_effect(
+                        run_ref=run.run_ref,
+                        attempt_ref=run.attempt_ref,
+                        fence_ref=run.fence_ref,
+                        operation_ref=operation.operation_ref,
+                        target_root=target_root,
+                        reconciling=True,
+                        reconciliation_generation=generation,
+                    )
+                    for generation in range(1, reconciliation_generation)
+                ),
+            ) if reconciliation_generation else ()
+            self._finish_runtime_effect(
+                effect,
+                outcome_code=(
+                    "executed"
+                    if operation.status == "executed"
+                    else operation.outcome_code or "harness_operation_failed"
+                ),
+                native_session_ref=(
+                    run.native_session_ref
+                    if operation.status == "executed"
+                    else None
+                ),
+                predecessor_effects=predecessors,
+                allow_missing=True,
+            )
 
     def bind_target_workspace_resolver(
         self, resolver: TargetWorkspaceResolver
@@ -746,6 +1039,21 @@ class HarnessRuntime:
             raise HarnessAdmissionError(error.code) from error
         if record is None:
             raise HarnessAdmissionError("harness_run_not_found")
+        if record.status == "running" and record.failure_code in (
+            _PROVIDER_CEILING_CODES
+        ):
+            try:
+                latest = self._owner.latest_operation(record.run_ref)
+            except AgentRuntimeHarnessError as error:
+                raise HarnessAdmissionError(error.code) from error
+            if (
+                latest is not None
+                and latest.status == "failed"
+                and latest.outcome_code == record.failure_code
+            ):
+                raise HarnessAdmissionError(
+                    "provider_ceiling_recovery_required"
+                )
         if record.status not in {
             "admitting",
             "admitted",
@@ -948,6 +1256,84 @@ class HarnessRuntime:
         self._recovered_target_requests[request_ref] = (
             recovery.operation_generation
         )
+        return admission
+
+    def recover_fenced_provider_attempt(
+        self, request_ref: str
+    ) -> HarnessAdmission:
+        """Explicitly rotate a non-Target Attempt after a signed ceiling."""
+
+        try:
+            recovered = self._owner.reserve_provider_ceiling_successor(
+                request_ref
+            )
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+        self._drop_cached_target_admission(request_ref)
+        admission = self.resume_probe(request_ref)
+        if (
+            admission.run.run_ref != recovered.run_ref
+            or admission.run.attempt_ref != recovered.attempt_ref
+            or admission.run.fence_ref != recovered.fence_ref
+        ):
+            raise HarnessAdmissionError(
+                "provider_ceiling_recovery_conflict"
+            )
+        return admission
+
+    def recover_fenced_target_root(
+        self,
+        request_ref: str,
+        *,
+        old_handle: TargetWorkHandle,
+    ) -> HarnessAdmission:
+        """Explicitly reserve a new Target Attempt after a signed ceiling."""
+
+        self._require_target_request(request_ref)
+        try:
+            run = self._owner.query_run(request_ref)
+            operation = (
+                None
+                if run is None
+                else self._owner.latest_operation(run.run_ref)
+            )
+            if (
+                run is None
+                or run.status != "running"
+                or run.failure_code not in _PROVIDER_CEILING_CODES
+                or operation is None
+                or operation.status != "failed"
+                or operation.outcome_code != run.failure_code
+            ):
+                raise AgentRuntimeHarnessError(
+                    "provider_ceiling_recovery_required"
+                )
+            recovery_ref = "harness_ceiling_recovery_" + canonical_hash(
+                {
+                    "request_ref": request_ref,
+                    "run_ref": run.run_ref,
+                    "attempt_ref": run.attempt_ref,
+                    "fence_ref": run.fence_ref,
+                    "operation_ref": operation.operation_ref,
+                    "failure_code": run.failure_code,
+                }
+            )
+            recovered = self._owner.reserve_target_successor(
+                old_handle=old_handle,
+                recovery_ref=recovery_ref,
+            )
+        except AgentRuntimeHarnessError as error:
+            raise HarnessAdmissionError(error.code) from error
+        self._drop_cached_target_admission(request_ref)
+        admission = self.resume_probe(request_ref)
+        if (
+            admission.run.run_ref != recovered.run_ref
+            or admission.run.attempt_ref != recovered.attempt_ref
+            or admission.run.fence_ref != recovered.fence_ref
+        ):
+            raise HarnessAdmissionError(
+                "provider_ceiling_recovery_conflict"
+            )
         return admission
 
     def _drop_cached_target_admission(self, request_ref: str) -> None:
@@ -1294,7 +1680,9 @@ class HarnessRuntime:
         )
         if invocation_hash != operation.invocation_hash:
             raise HarnessAdmissionError("harness_operation_conflict")
-        self._begin_operation_reconciliation(operation_ref)
+        reconciliation_generation = self._begin_operation_reconciliation(
+            operation_ref
+        )
         return self._invoke_provider_turn(
             admission,
             request,
@@ -1303,6 +1691,7 @@ class HarnessRuntime:
             operation_ref=operation_ref,
             resume=resume,
             reconciling=True,
+            reconciliation_generation=reconciliation_generation,
             required_capabilities=required_capabilities,
             workspace_ref=workspace_ref,
             working_directory=working_directory,
@@ -1318,11 +1707,59 @@ class HarnessRuntime:
         operation_ref: str,
         resume: bool,
         reconciling: bool = False,
+        reconciliation_generation: int = 0,
         required_capabilities: tuple[str, ...] | None = None,
         workspace_ref: str | None = None,
         working_directory: Path | None = None,
     ) -> HarnessProbeRun:
         adapter = self._adapters[request.harness_family]
+        protection_effect = _harness_runtime_effect(
+            run_ref=admission.run.run_ref,
+            attempt_ref=admission.run.attempt_ref,
+            fence_ref=admission.run.fence_ref,
+            operation_ref=operation_ref,
+            target_root=isinstance(request, TargetHarnessRequest),
+            reconciling=reconciling,
+            reconciliation_generation=reconciliation_generation,
+        )
+        predecessor_effects = (
+            (
+                _harness_runtime_effect(
+                    run_ref=admission.run.run_ref,
+                    attempt_ref=admission.run.attempt_ref,
+                    fence_ref=admission.run.fence_ref,
+                    operation_ref=operation_ref,
+                    target_root=isinstance(request, TargetHarnessRequest),
+                    reconciling=False,
+                ),
+                *(
+                    _harness_runtime_effect(
+                        run_ref=admission.run.run_ref,
+                        attempt_ref=admission.run.attempt_ref,
+                        fence_ref=admission.run.fence_ref,
+                        operation_ref=operation_ref,
+                        target_root=isinstance(request, TargetHarnessRequest),
+                        reconciling=True,
+                        reconciliation_generation=generation,
+                    )
+                    for generation in range(1, reconciliation_generation)
+                ),
+            )
+            if reconciling
+            else ()
+        )
+        if self._runtime_protection is not None:
+            try:
+                self._runtime_protection.acquire(protection_effect)
+            except RuntimeProtectionUnavailable as error:
+                retry = self._record_operation_failure(operation_ref, error.code)
+                # No provider effect started.  Keep the typed waiting
+                # responsibility and logical operation reconcilable; a later
+                # confirmed hold may safely continue this exact operation.
+                raise HarnessAdmissionError(
+                    error.code,
+                    next_retry_at=(None if retry is None else retry.next_retry_at),
+                ) from error
         try:
             result = adapter.invoke(
                 HarnessInvocation(
@@ -1351,7 +1788,12 @@ class HarnessRuntime:
             )
         except HarnessAdapterUnavailable as error:
             code = error.code
-            if reconciling and code in {
+            terminal_ceiling = (
+                error.durable_outcome == "terminal"
+                and code in _PROVIDER_CEILING_CODES
+                and error.transport_receipt is not None
+            )
+            if not terminal_ceiling and reconciling and code in {
                 "provider_unavailable",
                 "provider_version_unavailable",
                 "provider_version_drift",
@@ -1360,7 +1802,43 @@ class HarnessRuntime:
                 "provider_outcome_unknown",
             }:
                 code = "provider_outcome_unknown"
-            retry = self._record_operation_failure(operation_ref, code)
+            retry = (
+                self._record_operation_failure(
+                    operation_ref,
+                    code,
+                    durable_outcome="terminal",
+                    transport_receipt=error.transport_receipt,
+                    runtime_effect=protection_effect,
+                    predecessor_effects=predecessor_effects,
+                )
+                if terminal_ceiling
+                else self._record_operation_failure(operation_ref, code)
+            )
+            if terminal_ceiling and self._runtime_protection is not None:
+                self._runtime_protection.finish(
+                    protection_effect.responsibility_ref,
+                    boundary="permanent_fence",
+                )
+                for predecessor_effect in predecessor_effects:
+                    self._runtime_protection.finish(
+                        predecessor_effect.responsibility_ref,
+                        boundary="permanent_fence",
+                    )
+            if (
+                self._runtime_protection is not None
+                and not terminal_ceiling
+                and code
+                not in {
+                    "provider_timeout",
+                    "provider_io_unavailable",
+                    "provider_outcome_unknown",
+                }
+            ):
+                self._finish_runtime_effect(
+                    protection_effect,
+                    outcome_code=code,
+                    predecessor_effects=predecessor_effects,
+                )
             raise HarnessAdmissionError(
                 code,
                 next_retry_at=(
@@ -1381,6 +1859,12 @@ class HarnessRuntime:
                 retry = self._record_operation_failure(
                     operation_ref, error.code
                 )
+                if self._runtime_protection is not None:
+                    self._finish_runtime_effect(
+                        protection_effect,
+                        outcome_code=error.code,
+                        predecessor_effects=predecessor_effects,
+                    )
                 raise HarnessAdmissionError(
                     error.code,
                     next_retry_at=(
@@ -1478,6 +1962,12 @@ class HarnessRuntime:
             retry = self._record_operation_failure(
                 operation_ref, "required_harness_capability_unavailable"
             )
+            if self._runtime_protection is not None:
+                self._finish_runtime_effect(
+                    protection_effect,
+                    outcome_code="required_harness_capability_unavailable",
+                    predecessor_effects=predecessor_effects,
+                )
             raise HarnessAdmissionError(
                 "required_harness_capability_unavailable",
                 next_retry_at=(
@@ -1491,6 +1981,13 @@ class HarnessRuntime:
             profile=profile,
             evidence_events=result.evidence_events,
         )
+        if self._runtime_protection is not None:
+            self._finish_runtime_effect(
+                protection_effect,
+                outcome_code="executed",
+                native_session_ref=result.native_session_ref,
+                predecessor_effects=predecessor_effects,
+            )
         completed = replace(
             admission.run,
             native_session_ref=result.native_session_ref,
@@ -1976,9 +2473,9 @@ class HarnessRuntime:
         ):
             raise HarnessAdmissionError("target_harness_request_invalid")
 
-    def _begin_operation_reconciliation(self, operation_ref: str) -> None:
+    def _begin_operation_reconciliation(self, operation_ref: str) -> int:
         try:
-            self._owner.begin_reconciliation(operation_ref)
+            return self._owner.begin_reconciliation(operation_ref)
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error
 
@@ -2015,12 +2512,109 @@ class HarnessRuntime:
             raise HarnessAdmissionError(error.code) from error
 
     def _record_operation_failure(
-        self, operation_ref: str, code: str
+        self,
+        operation_ref: str,
+        code: str,
+        *,
+        durable_outcome: Literal["terminal", "unknown"] | None = None,
+        transport_receipt: dict[str, object] | None = None,
+        runtime_effect: RuntimeEffectIdentity | None = None,
+        predecessor_effects: tuple[RuntimeEffectIdentity, ...] = (),
     ) -> AgentRuntimeHarnessRetry | None:
         try:
-            return self._owner.record_operation_failure(operation_ref, code)
+            if (
+                durable_outcome is None
+                and transport_receipt is None
+                and runtime_effect is None
+                and not predecessor_effects
+            ):
+                return self._owner.record_operation_failure(
+                    operation_ref, code
+                )
+            return self._owner.record_operation_failure(
+                operation_ref,
+                code,
+                durable_outcome=durable_outcome,
+                transport_receipt=transport_receipt,
+                runtime_effect=runtime_effect,
+                predecessor_effects=predecessor_effects,
+            )
         except AgentRuntimeHarnessError as error:
             raise HarnessAdmissionError(error.code) from error
+
+    def _finish_runtime_effect(
+        self,
+        effect: RuntimeEffectIdentity,
+        *,
+        outcome_code: str,
+        native_session_ref: str | None = None,
+        predecessor_effects: tuple[RuntimeEffectIdentity, ...] = (),
+        allow_missing: bool = False,
+    ) -> None:
+        protection = self._runtime_protection
+        recorder = self._runtime_boundary_recorder
+        if protection is None or recorder is None:
+            return
+        checkpoint_ref = "harness_checkpoint_" + canonical_hash(
+            {
+                "run_ref": effect.root_run_ref,
+                "operation_ref": effect.operation_ref,
+                "outcome_code": outcome_code,
+                "native_session_ref": native_session_ref,
+            }
+        )
+        try:
+            recorder.record(
+                identity=effect,
+                boundary="checkpoint",
+                checkpoint_ref=checkpoint_ref,
+                owner_evidence_ref="harness_operation_"
+                + canonical_hash(
+                    {
+                        "operation_ref": effect.operation_ref,
+                        "outcome_code": outcome_code,
+                    }
+                ),
+            )
+        except RuntimeProtectionUnavailable as error:
+            if allow_missing and error.code == "runtime_responsibility_not_found":
+                return
+            raise
+        recorded_predecessors: list[RuntimeEffectIdentity] = []
+        for predecessor_effect in predecessor_effects:
+            try:
+                recorder.record(
+                    identity=predecessor_effect,
+                    boundary="permanent_fence",
+                    owner_evidence_ref="harness_reconciled_"
+                    + canonical_hash(
+                        {
+                            "operation_ref": effect.operation_ref,
+                            "outcome_code": outcome_code,
+                            "reconciliation_responsibility_ref": (
+                                effect.responsibility_ref
+                            ),
+                        }
+                    ),
+                )
+            except RuntimeProtectionUnavailable as error:
+                if error.code not in {
+                    "runtime_responsibility_not_found",
+                    "runtime_boundary_evidence_conflict",
+                }:
+                    raise
+            else:
+                recorded_predecessors.append(predecessor_effect)
+        protection.finish(
+            effect.responsibility_ref,
+            boundary="checkpoint",
+            checkpoint_ref=checkpoint_ref,
+        )
+        for predecessor_effect in recorded_predecessors:
+            protection.finish(
+                predecessor_effect.responsibility_ref,
+                boundary="permanent_fence",
+            )
 
     def _complete_operation(
         self,
